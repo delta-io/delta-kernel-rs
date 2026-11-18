@@ -60,7 +60,7 @@ use crate::unit_test_utils::{geography_type, geometry_type};
 use crate::{
     EngineData, Error, FileDataReadResultIterator, FileMeta, FileSize, JsonHandler, KernelResult,
     KernelResultIterator, ParquetFooter, ParquetHandler, Predicate, PredicateRef, Result,
-    RowVisitor, Version,
+    RowVisitor, StorageHandler, Version,
 };
 
 /// Processes sidecar files for the given checkpoint batch.
@@ -109,7 +109,7 @@ fn delta_path_for_multipart_checkpoint(version: u64, part_num: u32, num_parts: u
 async fn build_log_with_paths_and_checkpoint(
     paths: &[Path],
     checkpoint_metadata: Option<&LastCheckpointHint>,
-) -> (Arc<SyncEngine>, Url) {
+) -> (Arc<dyn StorageHandler>, Url) {
     let store = Arc::new(InMemory::new());
 
     let data = bytes::Bytes::from("kernel-data");
@@ -133,10 +133,12 @@ async fn build_log_with_paths_and_checkpoint(
             .expect("Write _last_checkpoint");
     }
 
-    let engine = Arc::new(SyncEngine::new_with_store(store));
+    let engine = SyncEngine::new_with_store(store);
+    let storage = engine.storage_handler();
+
     let table_root = Url::parse("memory:///").expect("valid url");
     let log_root = table_root.join("_delta_log/").unwrap();
-    (engine, log_root)
+    (storage, log_root)
 }
 
 // Create an in-memory store and return the store and the URL for the store's _delta_log directory.
@@ -488,7 +490,7 @@ async fn get_file_size(store: &Arc<InMemory>, path: &str) -> u64 {
 
 #[tokio::test]
 async fn build_snapshot_with_uuid_checkpoint_parquet() {
-    let (engine, log_root) = build_log_with_paths_and_checkpoint(
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
             delta_path_for_version(1, "checkpoint.parquet"),
@@ -503,7 +505,6 @@ async fn build_snapshot_with_uuid_checkpoint_parquet() {
         None,
     )
     .await;
-    let storage = engine.storage_handler();
 
     let log_segment = LogSegment::for_snapshot_impl(
         storage.as_ref(),
@@ -526,7 +527,7 @@ async fn build_snapshot_with_uuid_checkpoint_parquet() {
 
 #[tokio::test]
 async fn build_snapshot_with_uuid_checkpoint_json() {
-    let (engine, log_root) = build_log_with_paths_and_checkpoint(
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
             delta_path_for_version(1, "checkpoint.parquet"),
@@ -541,7 +542,6 @@ async fn build_snapshot_with_uuid_checkpoint_json() {
         None,
     )
     .await;
-    let storage = engine.storage_handler();
 
     let log_segment = LogSegment::for_snapshot_impl(
         storage.as_ref(),
@@ -571,7 +571,7 @@ async fn build_snapshot_with_correct_last_uuid_checkpoint() {
         ..Default::default()
     };
 
-    let (engine, log_root) = build_log_with_paths_and_checkpoint(
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
             delta_path_for_version(1, "checkpoint.parquet"),
@@ -588,7 +588,6 @@ async fn build_snapshot_with_correct_last_uuid_checkpoint() {
         Some(&checkpoint_metadata),
     )
     .await;
-    let storage = engine.storage_handler();
 
     let log_segment = LogSegment::for_snapshot_impl(
         storage.as_ref(),
@@ -610,7 +609,7 @@ async fn build_snapshot_with_correct_last_uuid_checkpoint() {
 
 #[tokio::test]
 async fn build_snapshot_with_multiple_incomplete_multipart_checkpoints() {
-    let (engine, log_root) = build_log_with_paths_and_checkpoint(
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
             delta_path_for_multipart_checkpoint(1, 1, 3),
@@ -634,7 +633,6 @@ async fn build_snapshot_with_multiple_incomplete_multipart_checkpoints() {
         None,
     )
     .await;
-    let storage = engine.storage_handler();
 
     let log_segment = LogSegment::for_snapshot_impl(
         storage.as_ref(),
@@ -663,7 +661,7 @@ async fn build_snapshot_with_out_of_date_last_checkpoint() {
         ..Default::default()
     };
 
-    let (engine, log_root) = build_log_with_paths_and_checkpoint(
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
             delta_path_for_version(1, "checkpoint.parquet"),
@@ -677,7 +675,6 @@ async fn build_snapshot_with_out_of_date_last_checkpoint() {
         Some(&checkpoint_metadata),
     )
     .await;
-    let storage = engine.storage_handler();
 
     let log_segment = LogSegment::for_snapshot_impl(
         storage.as_ref(),
@@ -706,7 +703,7 @@ async fn build_snapshot_with_correct_last_multipart_checkpoint() {
         ..Default::default()
     };
 
-    let (engine, log_root) = build_log_with_paths_and_checkpoint(
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
             delta_path_for_version(1, "checkpoint.parquet"),
@@ -725,7 +722,6 @@ async fn build_snapshot_with_correct_last_multipart_checkpoint() {
         Some(&checkpoint_metadata),
     )
     .await;
-    let storage = engine.storage_handler();
 
     let log_segment = LogSegment::for_snapshot_impl(
         storage.as_ref(),
@@ -754,7 +750,7 @@ async fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
         ..Default::default()
     };
 
-    let (engine, log_root) = build_log_with_paths_and_checkpoint(
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
             delta_path_for_version(1, "checkpoint.parquet"),
@@ -773,7 +769,6 @@ async fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
         Some(&checkpoint_metadata),
     )
     .await;
-    let storage = engine.storage_handler();
 
     let log_segment = LogSegment::for_snapshot_impl(
         storage.as_ref(),
@@ -806,7 +801,7 @@ async fn build_snapshot_applies_checkpoint_hint_iff_it_names_the_selected_checkp
         ..Default::default()
     };
 
-    let (engine, log_root) = build_log_with_paths_and_checkpoint(
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
             delta_path_for_version(1, "checkpoint.parquet"),
@@ -828,7 +823,6 @@ async fn build_snapshot_applies_checkpoint_hint_iff_it_names_the_selected_checkp
         Some(&checkpoint_metadata),
     )
     .await;
-    let storage = engine.storage_handler();
 
     let log_segment = LogSegment::for_snapshot_impl(
         storage.as_ref(),
@@ -874,7 +868,7 @@ async fn build_snapshot_applies_checkpoint_hint_iff_it_names_the_selected_checkp
 async fn build_snapshot_with_missing_checkpoint_part_no_hint() {
     // Part 2 of 3 is missing from checkpoint 5. The Snapshot should be made of checkpoint
     // number 3 and commit files 4 to 7.
-    let (engine, log_root) = build_log_with_paths_and_checkpoint(
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
             delta_path_for_version(1, "checkpoint.parquet"),
@@ -893,7 +887,6 @@ async fn build_snapshot_with_missing_checkpoint_part_no_hint() {
         None,
     )
     .await;
-    let storage = engine.storage_handler();
 
     let log_segment = LogSegment::for_snapshot_impl(
         storage.as_ref(),
@@ -926,7 +919,7 @@ async fn build_snapshot_with_out_of_date_last_checkpoint_and_incomplete_recent_c
         ..Default::default()
     };
 
-    let (engine, log_root) = build_log_with_paths_and_checkpoint(
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
             delta_path_for_version(1, "checkpoint.parquet"),
@@ -943,7 +936,6 @@ async fn build_snapshot_with_out_of_date_last_checkpoint_and_incomplete_recent_c
         Some(&checkpoint_metadata),
     )
     .await;
-    let storage = engine.storage_handler();
 
     let log_segment = LogSegment::for_snapshot_impl(
         storage.as_ref(),
@@ -966,7 +958,7 @@ async fn build_snapshot_with_out_of_date_last_checkpoint_and_incomplete_recent_c
 
 #[tokio::test]
 async fn build_snapshot_without_checkpoints() {
-    let (engine, log_root) = build_log_with_paths_and_checkpoint(
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
             delta_path_for_version(1, "json"),
@@ -983,7 +975,6 @@ async fn build_snapshot_without_checkpoints() {
         None,
     )
     .await;
-    let storage = engine.storage_handler();
 
     ///////// Specify no checkpoint or end version /////////
     let log_segment = LogSegment::for_snapshot_impl(
@@ -1033,7 +1024,7 @@ async fn build_snapshot_with_checkpoint_greater_than_time_travel_version() {
         size: 10,
         ..Default::default()
     };
-    let (engine, log_root) = build_log_with_paths_and_checkpoint(
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
             delta_path_for_version(1, "json"),
@@ -1050,7 +1041,6 @@ async fn build_snapshot_with_checkpoint_greater_than_time_travel_version() {
         None,
     )
     .await;
-    let storage = engine.storage_handler();
 
     let log_segment = LogSegment::for_snapshot_impl(
         storage.as_ref(),
@@ -1078,7 +1068,7 @@ async fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
         ..Default::default()
     };
 
-    let (engine, log_root) = build_log_with_paths_and_checkpoint(
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
             delta_path_for_version(1, "checkpoint.parquet"),
@@ -1092,7 +1082,6 @@ async fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
         Some(&checkpoint_metadata),
     )
     .await;
-    let storage = engine.storage_handler();
 
     let log_segment = LogSegment::for_snapshot_impl(
         storage.as_ref(),
@@ -1120,8 +1109,7 @@ async fn build_snapshot_time_travel_no_checkpoint_falls_back_to_v0(
     #[case] hint: Option<LastCheckpointHint>,
 ) {
     let paths: Vec<Path> = (0..=5).map(|v| delta_path_for_version(v, "json")).collect();
-    let (engine, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
-    let storage = engine.storage_handler();
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
 
     let log_segment =
         LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], hint, Some(5)).unwrap();
@@ -1136,7 +1124,7 @@ async fn build_snapshot_time_travel_no_checkpoint_falls_back_to_v0(
 
 #[tokio::test]
 async fn build_snapshot_time_travel_no_hint_checkpoint_at_end_version_included() {
-    let (engine, log_root) = build_log_with_paths_and_checkpoint(
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
             delta_path_for_version(1, "json"),
@@ -1149,7 +1137,6 @@ async fn build_snapshot_time_travel_no_hint_checkpoint_at_end_version_included()
         None,
     )
     .await;
-    let storage = engine.storage_handler();
 
     let log_segment =
         LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, Some(5)).unwrap();
@@ -1163,7 +1150,7 @@ async fn build_snapshot_time_travel_no_hint_checkpoint_at_end_version_included()
 
 #[tokio::test]
 async fn build_table_changes_with_commit_versions() {
-    let (engine, log_root) = build_log_with_paths_and_checkpoint(
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
             delta_path_for_version(1, "json"),
@@ -1180,7 +1167,6 @@ async fn build_table_changes_with_commit_versions() {
         None,
     )
     .await;
-    let storage = engine.storage_handler();
 
     ///////// Specify start version and end version /////////
 
@@ -1227,7 +1213,7 @@ async fn build_table_changes_with_commit_versions() {
 #[tokio::test]
 async fn test_non_contiguous_log() {
     // Commit with version 1 is missing
-    let (engine, log_root) = build_log_with_paths_and_checkpoint(
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
             delta_path_for_version(2, "json"),
@@ -1235,7 +1221,6 @@ async fn test_non_contiguous_log() {
         None,
     )
     .await;
-    let storage = engine.storage_handler();
 
     let log_segment_res =
         LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 0, None);
@@ -1264,7 +1249,7 @@ async fn test_non_contiguous_log() {
 #[tokio::test]
 async fn table_changes_fails_with_larger_start_version_than_end() {
     // Commit with version 1 is missing
-    let (engine, log_root) = build_log_with_paths_and_checkpoint(
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
             delta_path_for_version(1, "json"),
@@ -1272,7 +1257,6 @@ async fn table_changes_fails_with_larger_start_version_than_end() {
         None,
     )
     .await;
-    let storage = engine.storage_handler();
     let log_segment_res = LogSegment::for_table_changes(storage.as_ref(), log_root, 1, Some(0));
     assert_result_error_with_message(
         log_segment_res,
@@ -2054,8 +2038,7 @@ async fn create_segment_for(segment: LogSegmentConfig<'_>) -> LogSegment {
             "checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
         ));
     }
-    let (engine, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
-    let storage = engine.storage_handler();
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
     let staged_commits_log_tail = staged_commit_log_paths(segment.staged_commit_versions);
     LogSegment::for_snapshot_impl(
         storage.as_ref(),
@@ -2069,7 +2052,7 @@ async fn create_segment_for(segment: LogSegmentConfig<'_>) -> LogSegment {
 
 #[tokio::test]
 async fn test_list_log_files_with_version() -> KernelResult<()> {
-    let (engine, log_root) = build_log_with_paths_and_checkpoint(
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
             delta_path_for_version(0, "crc"),
@@ -2080,7 +2063,6 @@ async fn test_list_log_files_with_version() -> KernelResult<()> {
         None,
     )
     .await;
-    let storage = engine.storage_handler();
     let result = LogSegmentFiles::list(
         storage.as_ref(),
         &log_root,
@@ -3294,8 +3276,7 @@ async fn for_timestamp_conversion_cases(#[case] case: TimestampConversionCase) {
             .iter()
             .map(|v| delta_path_for_version(*v, "checkpoint.parquet")),
     );
-    let (engine, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
-    let storage = engine.storage_handler();
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
 
     let log_segment = LogSegment::for_timestamp_conversion(
         storage.as_ref(),
@@ -3318,12 +3299,11 @@ async fn for_timestamp_conversion_cases(#[case] case: TimestampConversionCase) {
 
 #[tokio::test]
 async fn for_timestamp_conversion_no_commit_files() {
-    let (engine, log_root) = build_log_with_paths_and_checkpoint(
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[delta_path_for_version(5, "checkpoint.parquet")],
         None,
     )
     .await;
-    let storage = engine.storage_handler();
 
     let res =
         LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 0, None, vec![]);
@@ -3333,7 +3313,7 @@ async fn for_timestamp_conversion_no_commit_files() {
 #[tokio::test]
 async fn test_latest_commit_file_field_is_captured() {
     // Test that the latest commit is preserved even after checkpoint filtering
-    let (engine, log_root) = build_log_with_paths_and_checkpoint(
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
             delta_path_for_version(1, "json"),
@@ -3346,7 +3326,6 @@ async fn test_latest_commit_file_field_is_captured() {
         None,
     )
     .await;
-    let storage = engine.storage_handler();
 
     let log_segment = LogSegment::for_snapshot(
         storage.as_ref(),
@@ -3369,7 +3348,7 @@ async fn test_latest_commit_file_field_is_captured() {
 #[tokio::test]
 async fn test_latest_commit_file_with_checkpoint_filtering() {
     // Test when commits get filtered by checkpoint
-    let (engine, log_root) = build_log_with_paths_and_checkpoint(
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
             delta_path_for_version(1, "json"),
@@ -3380,7 +3359,6 @@ async fn test_latest_commit_file_with_checkpoint_filtering() {
         None,
     )
     .await;
-    let storage = engine.storage_handler();
 
     let log_segment = LogSegment::for_snapshot(
         storage.as_ref(),
@@ -3403,12 +3381,11 @@ async fn test_latest_commit_file_with_checkpoint_filtering() {
 async fn test_latest_commit_file_with_no_commits() {
     // Test when there are only checkpoints and no commits at all
     // This should now succeed with latest_commit_file as None
-    let (engine, log_root) = build_log_with_paths_and_checkpoint(
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[delta_path_for_version(2, "checkpoint.parquet")],
         None,
     )
     .await;
-    let storage = engine.storage_handler();
 
     let log_segment = LogSegment::for_snapshot(
         storage.as_ref(),
@@ -3430,7 +3407,7 @@ async fn test_latest_commit_file_with_no_commits() {
 async fn test_latest_commit_file_with_checkpoint_at_same_version() {
     // Test when checkpoint is at the same version as the latest commit
     // This tests: 0.json, 1.json, 1.checkpoint.parquet
-    let (engine, log_root) = build_log_with_paths_and_checkpoint(
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
             delta_path_for_version(1, "json"),
@@ -3439,7 +3416,6 @@ async fn test_latest_commit_file_with_checkpoint_at_same_version() {
         None,
     )
     .await;
-    let storage = engine.storage_handler();
 
     let log_segment = LogSegment::for_snapshot(
         storage.as_ref(),
@@ -3464,7 +3440,7 @@ async fn test_latest_commit_file_with_checkpoint_at_same_version() {
 async fn test_latest_commit_file_edge_case_commit_before_checkpoint() {
     // Test edge case: 0.json, 1.checkpoint.parquet
     // The latest_commit_file should NOT be set to version 0 since there's no commit at version 1
-    let (engine, log_root) = build_log_with_paths_and_checkpoint(
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
             delta_path_for_version(1, "checkpoint.parquet"),
@@ -3472,7 +3448,6 @@ async fn test_latest_commit_file_edge_case_commit_before_checkpoint() {
         None,
     )
     .await;
-    let storage = engine.storage_handler();
 
     let log_segment = LogSegment::for_snapshot(
         storage.as_ref(),
@@ -5388,8 +5363,7 @@ async fn test_new_as_published_uses_published_file_metadata(
         .filter(|version| published_through.is_some_and(|through| **version <= through))
         .map(|version| delta_path_for_version(*version, "json"))
         .collect();
-    let (engine, _) = build_log_with_paths_and_checkpoint(&paths, None).await;
-    let storage = engine.storage_handler();
+    let (storage, _) = build_log_with_paths_and_checkpoint(&paths, None).await;
     let engine = DelegatingEngine::new(Arc::new(PanicEngine)).with_storage_handler(storage.clone());
     for file in original
         .listed
@@ -5508,8 +5482,8 @@ async fn test_new_as_published_with_checkpoint_at_snapshot_version(
         original.listed.latest_commit_file = None;
     }
 
-    let (engine, _) = build_log_with_paths_and_checkpoint(&[delta_path_for_version(2, "json")], None).await;
-    let storage = engine.storage_handler();
+    let (storage, _) =
+        build_log_with_paths_and_checkpoint(&[delta_path_for_version(2, "json")], None).await;
     let engine = DelegatingEngine::new(Arc::new(PanicEngine)).with_storage_handler(storage.clone());
     let publish_engine: &dyn Engine = if retain_latest && published_through == Some(2) {
         &engine
@@ -5573,11 +5547,11 @@ async fn test_new_as_published_missing_destination_preserves_original(
     })
     .await;
     let source = original.clone();
-    let (engine, _) = build_log_with_paths_and_checkpoint(
+    let (storage, _) = build_log_with_paths_and_checkpoint(
         &[delta_path_for_version(present_version, "json")],
         None,
-    ).await;
-    let storage = engine.storage_handler();
+    )
+    .await;
     let engine = DelegatingEngine::new(Arc::new(PanicEngine)).with_storage_handler(storage);
 
     let result = original.new_as_published(&engine, Some(2));
@@ -5635,14 +5609,14 @@ async fn test_new_as_published_preserves_checkpoints_and_log_compactions() {
     assert!(!original.listed.ascending_compaction_files.is_empty());
     assert!(!original.listed.checkpoint_parts.is_empty());
 
-    let (engine, _) = build_log_with_paths_and_checkpoint(
+    let (storage, _) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(2, "json"),
             delta_path_for_version(3, "json"),
         ],
         None,
-    ).await;
-    let storage = engine.storage_handler();
+    )
+    .await;
     let engine = DelegatingEngine::new(Arc::new(PanicEngine)).with_storage_handler(storage);
     let published = original
         .new_as_published(&engine, Some(3))
@@ -6252,8 +6226,7 @@ async fn amt_last_checkpoint_hint_bounds_listing(
         .map(|v| delta_path_for_version(v, "json"))
         .chain(checkpoint_file.map(|v| delta_path_for_version(v, "checkpoint.parquet")))
         .collect_vec();
-    let (engine, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
-    let storage = engine.storage_handler();
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
 
     let log_segment = LogSegment::for_snapshot_impl(
         storage.as_ref(),
@@ -6325,7 +6298,7 @@ fn snapshot_with_amt_last_checkpoint_hint_skips_earlier_commits() -> Result<()> 
 #[case::beyond_observed_history(Some(8))]
 #[tokio::test]
 async fn snapshot_checkpoint_gap_preserves_replay_context(#[case] target: Option<Version>) {
-    let (engine, log_root) = build_log_with_paths_and_checkpoint(
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(4, "checkpoint.parquet"),
             delta_path_for_version(6, "json"),
@@ -6334,7 +6307,6 @@ async fn snapshot_checkpoint_gap_preserves_replay_context(#[case] target: Option
         None,
     )
     .await;
-    let storage = engine.storage_handler();
     let error =
         LogSegment::for_snapshot_impl(storage.as_ref(), log_root.clone(), vec![], None, target)
             .unwrap_err();
@@ -6421,8 +6393,7 @@ async fn snapshot_commit_gap_reports_full_replay_sequence(
     if let Some(checkpoint) = checkpoint {
         files.push(delta_path_for_version(checkpoint, "checkpoint.parquet"));
     }
-    let (engine, root) = build_log_with_paths_and_checkpoint(&files, None).await;
-    let storage = engine.storage_handler();
+    let (storage, root) = build_log_with_paths_and_checkpoint(&files, None).await;
     let error =
         LogSegment::for_snapshot_impl(storage.as_ref(), root, vec![], None, None).unwrap_err();
     let Error::Delta(error) = error else {

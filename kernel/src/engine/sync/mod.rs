@@ -111,6 +111,7 @@ impl SyncEngine {
     ///
     /// Panics if the engine was built with [`Self::new`], which has no explicit store.
     pub fn store(&self) -> &Arc<DynObjectStore> {
+        #[allow(clippy::expect_used)] // test-only code, panic is intentional
         self.storage_handler
             .store()
             .expect("This SyncEngine has no explicit store")
