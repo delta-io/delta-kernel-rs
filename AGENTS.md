@@ -319,10 +319,11 @@ and update this section in your PR. The same pattern works for
   compile-time segment rules as `column_name!` (string literals split on `.`; constants are
   single simple segments). Use `Expression::column([...])` for runtime or non-simple names.
   (`column_expr!` is a doc-hidden compatibility alias of `col!`.)
-- Inside `kernel/src`, prefer the `pub(crate)` `schema!` / `schema_ref!` macros for inline
-  declarative schema literals, `lazy_schema_ref!` for `LazyLock<SchemaRef>` statics, and
-  `try_schema!` when names of interpolated fields might collide. For Delta log action schemas,
-  reuse the canonical `*_FIELD` and `LOG_*_SCHEMA` statics from `actions` instead of re-declaring
+- Prefer the `schema!` / `schema_ref!` macros for inline declarative schema literals,
+  `lazy_schema_ref!` for `LazyLock<SchemaRef>` statics, and `try_schema!` when names of
+  interpolated fields might collide. Outside the kernel crate, these macros require the
+  `internal-api` feature. For Delta log action schemas, reuse the canonical `*_FIELD` and
+  `LOG_*_SCHEMA` statics from `actions` instead of re-declaring
   `StructField::nullable(ACTION_NAME, Action::to_schema())` or projecting from
   `get_commit_schema()`. Prefer `StructType::try_new` or schema builder/patch APIs for complex
   data-dependent schema manipulation.
