@@ -2581,23 +2581,21 @@ fn test_validate_listed_log_file_in_order_compaction_files() {
     let table_root = Url::parse("file:///test_table/").unwrap();
     let log_root = table_root.join("_delta_log/").unwrap();
     let commit_files = commits(&table_root, 0..=4);
-    assert!(
-        LogSegment::try_new(
-            LogSegmentFiles {
-                latest_commit_file: commit_files.last().cloned(),
-                ascending_commit_files: commit_files,
-                ascending_compaction_files: vec![
-                    compaction(&table_root, 0, 4),
-                    compaction(&table_root, 1, 2),
-                ],
-                ..Default::default()
-            },
-            log_root,
-            None,
-            None,
-        )
-        .is_ok()
-    );
+    LogSegment::try_new(
+        LogSegmentFiles {
+            latest_commit_file: commit_files.last().cloned(),
+            ascending_commit_files: commit_files,
+            ascending_compaction_files: vec![
+                compaction(&table_root, 0, 4),
+                compaction(&table_root, 1, 2),
+            ],
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    )
+    .unwrap();
 }
 
 #[test]
@@ -6347,6 +6345,7 @@ fn commits(table_root: &Url, versions: impl IntoIterator<Item = Version>) -> Vec
         .collect()
 }
 
+/// Builds a classic checkpoint path with synthetic file metadata.
 fn classic_checkpoint(table_root: &Url, version: Version) -> ParsedLogPath {
     let path = ParsedLogPath::new_classic_parquet_checkpoint(table_root, version)
         .unwrap_or_else(|error| panic!("checkpoint {version} under {table_root}: {error}"));
@@ -6354,6 +6353,7 @@ fn classic_checkpoint(table_root: &Url, version: Version) -> ParsedLogPath {
         .unwrap_or_else(|| panic!("invalid checkpoint {version} under {table_root}"))
 }
 
+/// Builds a compaction path with synthetic file metadata.
 fn compaction(table_root: &Url, lo: Version, hi: Version) -> ParsedLogPath {
     let path = ParsedLogPath::new_log_compaction(table_root, lo, hi)
         .unwrap_or_else(|error| panic!("compaction {lo}-{hi} under {table_root}: {error}"));
