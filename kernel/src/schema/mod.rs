@@ -1740,7 +1740,7 @@ impl ColumnNamesAndTypes {
     }
 }
 
-// Spark accepts omitted metadata, but defaults nullability only when both keys are omitted.
+// Spark 4.x accepts omitted metadata, but defaults nullability only when both keys are omitted.
 // These coupled defaults require custom deserialization for direct and nested schema fields.
 impl<'de> Deserialize<'de> for StructField {
     fn deserialize<D>(deserializer: D) -> KernelResult<Self, D::Error>
@@ -1762,7 +1762,8 @@ impl<'de> Deserialize<'de> for StructField {
     }
 }
 
-/// Retains key presence so a supplied empty metadata object still requires explicit nullability.
+/// Retains key presence: an explicit empty metadata object still requires `nullable`, while omitted
+/// metadata allows an omitted `nullable` to default to true.
 #[derive(Deserialize)]
 struct StructFieldDeHelper {
     name: String,
