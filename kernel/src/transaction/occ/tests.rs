@@ -1,5 +1,9 @@
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use ::test_utils::add_commit;
+use futures::executor::block_on;
 use rstest::rstest;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -8,13 +12,15 @@ use super::decision::{ConflictKind, WinnerRule};
 use super::occ_plan::{OccBranchVersions, OccCheck};
 use super::winner_check_plan::ROW_TRACKING_BACKFILL_OPERATION;
 use super::*;
+use crate::actions::{Add, CommitInfo, DomainMetadata, Metadata, Protocol, Remove, SetTransaction};
 use crate::engine::sync::SyncEngine;
 use crate::engine::sync::plan::{ScopedSyncPlanExecutor, SyncPlanExecutor};
 use crate::expressions::{Predicate, Scalar, StructData, col, lit};
-use crate::plans::{PlanBuilder, PlanExecutor};
-use crate::row_tracking::ROW_TRACKING_DOMAIN_NAME;
+use crate::object_store::local::LocalFileSystem;
+use crate::plans::{Plan, PlanBuilder, PlanExecutor, PlanResult};
+use crate::row_tracking::{ROW_TRACKING_DOMAIN_NAME, RowTrackingDomainMetadata};
 use crate::schema::{DataType, PrimitiveType, StructField, schema_ref};
-use crate::unit_test_utils::assert_result_error_with_message;
+use crate::unit_test_utils::{Action, assert_result_error_with_message};
 
 const READ_VERSION: Version = 6;
 const DELETED_DATE: &str = "2026-10-01";
@@ -22,80 +28,97 @@ const OTHER_DATE: &str = "2026-10-02";
 /// The file that T reads and removes.
 const DELETED_FILE: &str = "date=2026-10-01/part-a.parquet";
 
-// === Action JSON ===
+// === Actions ===
 
-fn commit_info(operation: &str) -> Value {
-    json!({"commitInfo": {"timestamp": 0, "operation": operation, "isBlindAppend": false}})
+/// One commit line, serialised from Kernel's action struct.
+fn line(action: Action) -> Value {
+    serde_json::to_value(action).unwrap()
 }
 
-fn blind_append_commit_info() -> Value {
-    json!({"commitInfo": {"timestamp": 0, "operation": "WRITE", "isBlindAppend": true}})
+/// The `commitInfo` of a commit that runs `operation` and isn't a blind append.
+fn base_commit_info(operation: &str) -> CommitInfo {
+    CommitInfo {
+        timestamp: Some(0),
+        operation: Some(operation.into()),
+        is_blind_append: Some(false),
+        ..Default::default()
+    }
+}
+
+fn commit_info(operation: &str) -> Value {
+    line(Action::CommitInfo(base_commit_info(operation)))
 }
 
 fn identity_only_commit_info(tag: &str) -> Value {
-    json!({"commitInfo": {
-        "timestamp": 0,
-        "operation": "UPDATE SCHEMA",
-        "isBlindAppend": false,
-        "tags": {"delta.identity.schemaUpdate": tag},
-    }})
+    let tags = HashMap::from([("delta.identity.schemaUpdate".into(), Some(tag.into()))]);
+    line(Action::CommitInfo(CommitInfo {
+        tags: Some(tags),
+        ..base_commit_info("UPDATE SCHEMA")
+    }))
+}
+
+/// An add of `path` with data change, in the partition given by `partition_values`.
+fn base_add(path: &str, partition_values: &[(&str, &str)]) -> Add {
+    let partition_values = partition_values.iter().map(|&(k, v)| (k.into(), v.into()));
+    Add {
+        path: path.into(),
+        partition_values: HashMap::from_iter(partition_values),
+        size: 1,
+        data_change: true,
+        ..Default::default()
+    }
 }
 
 fn add(path: &str, date: &str) -> Value {
-    add_with_partition_values(path, json!({"date": date}))
-}
-
-fn add_with_partition_values(path: &str, partition_values: Value) -> Value {
-    json!({"add": {
-        "path": path,
-        "partitionValues": partition_values,
-        "size": 1,
-        "modificationTime": 0,
-        "dataChange": true,
-    }})
+    line(Action::Add(base_add(path, &[("date", date)])))
 }
 
 fn remove(path: &str, data_change: bool) -> Value {
-    json!({"remove": {"path": path, "deletionTimestamp": 0, "dataChange": data_change}})
+    line(Action::Remove(Remove {
+        path: path.into(),
+        deletion_timestamp: Some(0),
+        data_change,
+        ..Default::default()
+    }))
 }
 
 fn protocol() -> Value {
-    json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}})
+    line(Action::Protocol(Protocol::try_new_legacy(1, 2).unwrap()))
 }
 
 fn metadata() -> Value {
-    json!({"metaData": {
-        "id": "test-table",
-        "format": {"provider": "parquet", "options": {}},
-        "schemaString": r#"{"type":"struct","fields":[]}"#,
-        "partitionColumns": ["date"],
-        "configuration": {},
-        "createdTime": 0,
-    }})
+    let schema = schema_ref! { nullable "date": DATE };
+    let metadata =
+        Metadata::try_new(None, None, schema, vec!["date".into()], 0, HashMap::new()).unwrap();
+    line(Action::Metadata(metadata))
 }
 
 fn domain(name: &str, configuration: &str) -> Value {
-    json!({"domainMetadata": {"domain": name, "configuration": configuration, "removed": false}})
+    line(Action::DomainMetadata(DomainMetadata::new(
+        name.into(),
+        configuration.into(),
+    )))
 }
 
 fn removed_domain(name: &str) -> Value {
-    json!({"domainMetadata": {"domain": name, "configuration": "{}", "removed": true}})
+    line(Action::DomainMetadata(DomainMetadata::remove(
+        name.into(),
+        "{}".into(),
+    )))
 }
 
 fn row_tracking(high_water_mark: i64) -> Value {
-    domain(
-        ROW_TRACKING_DOMAIN_NAME,
-        &format!(r#"{{"rowIdHighWaterMark":{high_water_mark}}}"#),
-    )
+    let domain = RowTrackingDomainMetadata::new(high_water_mark);
+    line(Action::DomainMetadata(domain.try_into().unwrap()))
 }
 
 fn txn(app_id: &str) -> Value {
-    json!({"txn": {"appId": app_id, "version": 3, "lastUpdated": 0}})
+    line(Action::Txn(SetTransaction::new(app_id.into(), 3, Some(0))))
 }
 
 // === Fixtures ===
 
-/// A table whose `_delta_log` holds only the given hand-written commits.
+/// A table whose `_delta_log` holds only the given commits.
 struct TestTable {
     _dir: TempDir,
     root: String,
@@ -104,15 +127,14 @@ struct TestTable {
 impl TestTable {
     fn new(commits: &[(Version, Vec<Value>)]) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join("_delta_log");
-        std::fs::create_dir(&log).unwrap();
-        for (version, actions) in commits {
-            let lines = Vec::from_iter(actions.iter().map(Value::to_string)).join("\n");
-            std::fs::write(log.join(format!("{version:020}.json")), lines).unwrap();
-        }
         let root = url::Url::from_directory_path(dir.path())
             .unwrap()
             .to_string();
+        let store = LocalFileSystem::new();
+        for (version, actions) in commits {
+            let body = Vec::from_iter(actions.iter().map(Value::to_string)).join("\n");
+            block_on(add_commit(&root, &store, *version, body)).unwrap();
+        }
         Self { _dir: dir, root }
     }
 
@@ -190,14 +212,17 @@ fn delete_facts(read_files: &RelationRef) -> LoserFacts {
 
 /// T's file actions and read files, retained in a fresh scoped executor.
 pub(super) struct LoserRelations {
-    executor: ScopedSyncPlanExecutor,
+    executor: CountingExecutor,
     file_actions: RelationRef,
     pub(super) read_files: RelationRef,
 }
 
 impl LoserRelations {
     pub(super) fn new(removed: &[&str], read: &[&str]) -> Self {
-        let executor = SyncPlanExecutor::default().get_scoped();
+        let executor = CountingExecutor {
+            inner: SyncPlanExecutor::default().get_scoped(),
+            plan_runs: AtomicUsize::new(0),
+        };
         let path_field = StructField::not_null("path", DataType::STRING);
         let removes = Vec::from_iter(removed.iter().map(|&path| {
             let remove = StructData::try_new(vec![path_field.clone()], vec![path.into()]).unwrap();
@@ -227,10 +252,36 @@ impl LoserRelations {
     ) -> ConflictDetection {
         detect_conflicts(&self.executor, facts, winners, &self.file_actions).unwrap()
     }
+
+    /// The number of query plans that conflict detection ran.
+    fn plan_runs(&self) -> usize {
+        self.executor.plan_runs.load(Ordering::Relaxed)
+    }
+}
+
+/// A scoped sync executor that counts the query plans it runs.
+struct CountingExecutor {
+    inner: ScopedSyncPlanExecutor,
+    plan_runs: AtomicUsize,
+}
+
+impl PlanExecutor for CountingExecutor {
+    fn execute_op(&self, op: Operation) -> KernelResult<PlanResult> {
+        if let Operation::QueryPlan(_) = op {
+            self.plan_runs.fetch_add(1, Ordering::Relaxed);
+        }
+        self.inner.execute_op(op)
+    }
+}
+
+impl ScopedPlanExecutor for CountingExecutor {
+    fn execute_and_retain(&self, name: &str, plan: Plan) -> KernelResult<RelationRef> {
+        self.inner.execute_and_retain(name, plan)
+    }
 }
 
 fn retain(
-    executor: &ScopedSyncPlanExecutor,
+    executor: &dyn ScopedPlanExecutor,
     name: &str,
     schema: SchemaRef,
     rows: Vec<Vec<Scalar>>,
@@ -330,8 +381,10 @@ fn partitioned_delete_passes_with_row_tracking_marks_of_each_winner() {
 #[case::add_in_deleted_partition_fails(true)]
 #[case::add_without_data_change_in_deleted_partition_fails(false)]
 fn partitioned_delete_read_append(#[case] data_change: bool) {
-    let mut deleted_partition_add = add("f7", DELETED_DATE);
-    deleted_partition_add["add"]["dataChange"] = json!(data_change);
+    let deleted_partition_add = line(Action::Add(Add {
+        data_change,
+        ..base_add("f7", &[("date", DELETED_DATE)])
+    }));
     let conflict = detect_delete(&[
         (7, vec![commit_info("WRITE"), deleted_partition_add]),
         (8, vec![commit_info("WRITE"), add("f8", DELETED_DATE)]),
@@ -435,6 +488,7 @@ fn identity_only_metadata_winner(
 
 #[test]
 fn metadata_without_canonical_required_fields_still_fails_metadata_changed() {
+    // `Metadata` can't leave out its required fields, so the test writes the JSON.
     let commits = [(7, vec![json!({"metaData": {"id": "test-table"}})])];
     let summaries = winner_summaries(&commits);
     let [summary] = summaries.as_slice() else {
@@ -518,7 +572,11 @@ fn blind_append_winner(
     #[case] isolation_level: IsolationLevel,
     #[case] expected: Option<(Version, ConflictKind)>,
 ) {
-    let winner = vec![blind_append_commit_info(), add("f7", DELETED_DATE)];
+    let info = CommitInfo {
+        is_blind_append: Some(true),
+        ..base_commit_info("WRITE")
+    };
+    let winner = vec![line(Action::CommitInfo(info)), add("f7", DELETED_DATE)];
     let conflict = detect_with(
         |facts| facts.isolation_level = isolation_level,
         &[DELETED_FILE],
@@ -530,10 +588,13 @@ fn blind_append_winner(
 
 #[test]
 fn winner_without_blind_append_flag_is_checked_under_write_serializable() {
-    let winner = vec![
-        json!({"commitInfo": {"timestamp": 0, "operation": "WRITE"}}),
-        add("f7", DELETED_DATE),
-    ];
+    // `CommitInfo` writes a missing flag as null, so the test removes the key from the JSON.
+    let mut info = commit_info("WRITE");
+    info["commitInfo"]
+        .as_object_mut()
+        .unwrap()
+        .remove("isBlindAppend");
+    let winner = vec![info, add("f7", DELETED_DATE)];
     assert_eq!(
         detect_delete(&[(7, winner)]),
         occ_check(7, OccCheck::ReadAppend)
@@ -669,6 +730,29 @@ fn no_plans_without_winners_or_branches() {
     assert!(plan.is_none());
 }
 
+#[rstest]
+#[case::winner_rule_skips_occ_plan(
+    vec![metadata()],
+    winner_rule(7, WinnerRule::MetadataChanged),
+    1
+)]
+#[case::no_winner_rule_runs_occ_plan(vec![], occ_check(7, OccCheck::ReadDelete), 2)]
+fn occ_plan_runs_only_if_no_winner_rule_fails(
+    #[case] actions: Vec<Value>,
+    #[case] expected: Option<(Version, ConflictKind)>,
+    #[case] plan_runs: usize,
+) {
+    // The winner removes a file that T read, so the OCC plan fails T whenever it runs. Kernel
+    // reports a winner rule first, so with a winner rule only the plan count shows the skip.
+    let mut winner = vec![commit_info("DELETE"), remove(DELETED_FILE, true)];
+    winner.extend(actions);
+    let table = TestTable::new(&[(7, winner)]);
+    let relations = LoserRelations::new(&[], &[DELETED_FILE]);
+    let detection = relations.detect(&relations.delete_facts(), &table.winners(READ_VERSION));
+    assert_eq!(conflict_of(detection), expected);
+    assert_eq!(relations.plan_runs(), plan_runs);
+}
+
 #[test]
 fn detect_conflicts_without_winners_has_no_conflict() {
     let relations = LoserRelations::new(&[DELETED_FILE], &[DELETED_FILE]);
@@ -677,19 +761,22 @@ fn detect_conflicts_without_winners_has_no_conflict() {
         panic!("expected no conflict");
     };
     assert!(summaries.is_empty());
+    assert_eq!(relations.plan_runs(), 0);
 }
 
 // === Winner rows ===
 
 #[test]
 fn winner_row_reads_commit_info_timestamp_and_blind_append() {
-    let info = json!({"commitInfo": {
-        "timestamp": 0,
-        "operation": "WRITE",
-        "isBlindAppend": true,
-        "inCommitTimestamp": 1_700_000_000_000i64,
-    }});
-    let summaries = winner_summaries(&[(7, vec![info, add("f7", OTHER_DATE)])]);
+    let info = CommitInfo {
+        is_blind_append: Some(true),
+        in_commit_timestamp: Some(1_700_000_000_000),
+        ..base_commit_info("WRITE")
+    };
+    let summaries = winner_summaries(&[(
+        7,
+        vec![line(Action::CommitInfo(info)), add("f7", OTHER_DATE)],
+    )]);
     let [summary] = summaries.as_slice() else {
         panic!("expected one winner row, got {summaries:?}");
     };
@@ -850,10 +937,10 @@ fn winner_rows_must_match_winners(
 
 #[test]
 fn null_partition_value_does_not_match_equality_predicate() {
-    let winner = vec![
-        commit_info("WRITE"),
-        add_with_partition_values("f7", json!({"date": null})),
-    ];
+    // `Add` can't hold a null partition value, so the test edits the add's JSON.
+    let mut null_partition_add = add("f7", DELETED_DATE);
+    null_partition_add["add"]["partitionValues"]["date"] = Value::Null;
+    let winner = vec![commit_info("WRITE"), null_partition_add];
     assert_eq!(detect_delete(&[(7, winner)]), None);
 }
 
@@ -879,7 +966,7 @@ fn timestamp_partition_is_read_in_connector_timezone(
         7,
         vec![
             commit_info("WRITE"),
-            add_with_partition_values("f7", json!({"ts": partition_value})),
+            line(Action::Add(base_add("f7", &[("ts", partition_value)]))),
         ],
     )]);
     let instant = PrimitiveType::Timestamp
@@ -963,10 +1050,7 @@ fn unpartitioned_table_ignores_partition_predicate() {
         &[DELETED_FILE],
         &[(
             7,
-            vec![
-                commit_info("WRITE"),
-                add_with_partition_values("f7", json!({})),
-            ],
+            vec![commit_info("WRITE"), line(Action::Add(base_add("f7", &[])))],
         )],
     );
     assert_eq!(conflict, occ_check(7, OccCheck::ReadAppend));
@@ -988,7 +1072,7 @@ fn partition_values_match_physical_column_names() {
         7,
         vec![
             commit_info("WRITE"),
-            add_with_partition_values("f7", json!({"col_7f3a": DELETED_DATE})),
+            line(Action::Add(base_add("f7", &[("col_7f3a", DELETED_DATE)]))),
         ],
     )]);
     let conflict = conflict_of(relations.detect(&facts, &table.winners(READ_VERSION)));
