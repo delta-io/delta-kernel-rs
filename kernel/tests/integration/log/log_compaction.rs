@@ -1,399 +1,373 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::io::Cursor;
+use std::sync::{Arc, LazyLock};
 
-use delta_kernel::Snapshot;
-use delta_kernel::engine::to_json_bytes;
+use delta_kernel::actions::{Metadata, Protocol, get_commit_schema};
+use delta_kernel::arrow::compute::{concat_batches, filter_record_batch, is_not_null};
+use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
+use delta_kernel::arrow::json::ReaderBuilder;
+use delta_kernel::arrow::util::pretty::pretty_format_batches;
+use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::object_store::path::Path;
-use delta_kernel::schema::schema_ref;
-use test_utils::{create_table, engine_store_setup};
+use delta_kernel::schema::{SchemaRef, schema_ref};
+use delta_kernel::table_features::TableFeature;
+use delta_kernel::{KernelError, Snapshot, Version};
+use itertools::Itertools as _;
+use rstest::rstest;
+use serde_json::Value;
+use test_utils::table_builder::{FeatureSet, TestTableBuilder, VersionTarget};
+use test_utils::{
+    add_commit, build_snapshot, engine_store_setup, load_test_data, read_actions_from_commit,
+};
 use url::Url;
 
-/// Convert a URL to a `delta_kernel::object_store::Path`
-fn url_to_object_store_path(url: &Url) -> Result<Path, Box<dyn std::error::Error>> {
-    let path_segments = url
-        .path_segments()
-        .ok_or_else(|| format!("URL has no path segments: {url}"))?;
+use crate::common::write_utils::write_log_compaction;
 
-    let path_string = path_segments.skip(1).collect::<Vec<_>>().join("/");
-
-    Ok(Path::from(path_string))
-}
-
-#[tokio::test]
-#[ignore = "log compaction disabled (#2337)"]
-async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Error>> {
-    let _ = tracing_subscriber::fmt::try_init();
-
-    // Create a simple table schema: one int column named 'id'
-    let schema = schema_ref! { nullable "id": INTEGER };
-
-    // Setup engine and storage - this creates a proper temporary table
-    let (store, engine, table_location) = engine_store_setup("test_compaction_table", None);
-
-    // Create table (this will be commit 0)
-    let table_url = create_table(
-        store.clone(),
-        table_location,
-        schema.clone(),
-        &[],
-        false,
-        vec![],
-        vec![],
-    )
-    .await?;
-
-    // Commit 1: Add two files
-    let commit1_content = r#"{"commitInfo":{"timestamp":1587968586000,"operation":"WRITE","operationParameters":{"mode":"Append"},"isBlindAppend":true}}
-{"add":{"path":"part-00000-file1.parquet","partitionValues":{},"size":1024,"modificationTime":1587968586000,"dataChange":true, "stats":"{\"numRecords\":10,\"nullCount\":{\"id\":0},\"minValues\":{\"id\": 1},\"maxValues\":{\"id\":10}}"}}
-{"add":{"path":"part-00001-file2.parquet","partitionValues":{},"size":2048,"modificationTime":1587968586000,"dataChange":true, "stats":"{\"numRecords\":20,\"nullCount\":{\"id\":0},\"minValues\":{\"id\": 11},\"maxValues\":{\"id\":30}}"}}
-"#;
-    store
-        .put(
-            &Path::from("test_compaction_table/_delta_log/00000000000000000001.json"),
-            commit1_content.as_bytes().into(),
-        )
-        .await?;
-
-    // Commit 2: Remove only the first file with a recent deletionTimestamp, keep the second file
-    let current_timestamp_millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+static COMPACTION_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    get_commit_schema()
+        .project(&[
+            "add",
+            "remove",
+            "metaData",
+            "protocol",
+            "txn",
+            "domainMetadata",
+        ])
         .unwrap()
-        .as_millis() as i64;
-    let commit2_content = format!(
-        r#"{{"commitInfo":{{"timestamp":{current_timestamp_millis},"operation":"DELETE","operationParameters":{{"predicate":"id <= 10"}},"isBlindAppend":false}}}}
-{{"remove":{{"path":"part-00000-file1.parquet","partitionValues":{{}},"size":1024,"modificationTime":1587968586000,"dataChange":true,"deletionTimestamp":{current_timestamp_millis}}}}}
-"#
-    );
-    store
-        .put(
-            &Path::from("test_compaction_table/_delta_log/00000000000000000002.json"),
-            commit2_content.clone().into_bytes().into(),
-        )
-        .await?;
+});
 
-    // Create snapshot and log compaction writer
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let mut writer = snapshot.log_compaction_writer(0, 2)?;
-
-    // Get compaction data iterator
-    let mut compaction_data = writer.compaction_data(&engine)?;
-    let compaction_path = writer.compaction_path().clone();
-
-    // Verify the compaction file name
-    let expected_filename = "00000000000000000000.00000000000000000002.compacted.json";
-    assert!(compaction_path.to_string().ends_with(expected_filename));
-
-    // Process compaction data batches and collect the actual compacted data
-    let mut batch_count = 0;
-    let mut compacted_data_batches = Vec::new();
-
-    // Log compaction should produce reconciled actions from the version range:
-    // - Protocol + metadata from table creation
-    // - Add action for file1 (first/newest add for this file path)
-    // - Add action for file2 (first/newest add for this file path)
-    // - Remove action for file1 (first/newest remove for this file path, non-expired tombstone)
-    // - CommitInfo actions should be excluded from compaction
-    //
-    // Note: Actions are processed in reverse chronological order (newest to oldest).
-    // The reconciliation keeps the first (newest) occurrence of each action type
-    // for each unique file path, so both add and remove actions for file1 are kept.
-    for batch_result in compaction_data.by_ref() {
-        let batch = batch_result?;
-        compacted_data_batches.push(batch);
-        batch_count += 1;
+#[rstest]
+#[case::stored_0_5("compacted-log-files-table", (0, 5), true,
+    &[(0, "metaData"), (0, "protocol"), (2, "remove"),
+      (3, "remove"), (4, "add"), (5, "add"), (5, "remove")])]
+#[case::stored_6_10("compacted-log-files-table", (6, 10), true,
+    &[(6, "remove"), (7, "add"), (8, "add"), (9, "remove"),
+      (10, "add"), (10, "remove")])]
+#[case::stored_6_15("compacted-log-files-table", (6, 15), true,
+    &[(6, "remove"), (9, "remove"), (10, "remove"),
+      (11, "remove"), (12, "remove"), (13, "add"),
+      (13, "remove"), (14, "add"), (15, "add")])]
+#[case::dv_full("log-replay-dv-key-cases", (0, 3), false,
+    &[(0, "metaData"), (0, "protocol"), (1, "remove"), (2, "remove"),
+      (3, "add"), (3, "remove")])]
+#[case::dv_tail("log-replay-dv-key-cases", (1, 3), false,
+    &[(1, "remove"), (2, "remove"), (3, "add"), (3, "remove")])]
+#[case::metadata_protocol("log-replay-latest-metadata-protocol", (0, 2), false,
+    &[(0, "add"), (1, "add"), (2, "metaData"), (2, "protocol")])]
+#[case::restore("basic-with-inserts-overwrite-restore", (0, 3), false,
+    &[(3, "add"), (3, "metaData"), (3, "protocol"),
+      (3, "remove")])]
+#[case::restore_tail("basic-with-inserts-overwrite-restore", (2, 3), false,
+    &[(3, "add"), (3, "metaData"), (3, "protocol"),
+      (3, "remove")])]
+#[case::delete_readd("delete-re-add-same-file-different-transactions", (0, 3), false,
+    &[(0, "metaData"), (0, "protocol"), (2, "add"), (3, "add")])]
+#[case::mapped_dv_tail("dv-with-columnmapping", (1, 15), false,
+    &[(1, "remove"), (2, "remove"), (3, "remove"),
+      (4, "remove"), (5, "remove"), (6, "remove"), (7, "remove"),
+      (8, "remove"), (9, "remove"), (10, "remove"), (11, "remove"),
+      (12, "remove"), (13, "remove"), (14, "add"), (14, "remove"),
+      (15, "add"), (15, "remove")])]
+#[case::evolving_stats("data-skipping-change-stats-collected-across-versions", (0, 4), false,
+    &[(0, "add"), (0, "protocol"), (2, "add"), (3, "metaData"),
+      (4, "add")])]
+#[case::partitioned_stats("data-skipping-partition-and-data-column", (0, 3), false,
+    &[(0, "add"), (0, "metaData"), (0, "protocol"), (1, "add"),
+      (2, "add"), (3, "add")])]
+#[cfg_attr(
+    not(feature = "declarative-plans"),
+    ignore = "log compaction disabled (#2337)"
+)]
+fn compaction_matches_existing_compaction_intervals(
+    #[case] table: &str,
+    #[case] interval: (Version, Version),
+    #[case] stored: bool,
+    #[case] expected_actions: &[(Version, &str)],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tempdir = load_test_data(
+        if stored {
+            "tests/data"
+        } else {
+            "tests/golden_data"
+        },
+        table,
+    )?;
+    let root = tempdir.path().join(table);
+    let root = Url::from_directory_path(if stored { root } else { root.join("delta") }).unwrap();
+    let log = root.join("_delta_log/")?.to_file_path().unwrap();
+    let (start, end) = interval;
+    if stored {
+        std::fs::remove_file(log.join(format!("{start:020}.{end:020}.compacted.json")))?;
     }
-
-    assert!(
-        batch_count > 0,
-        "Should have processed at least one compaction batch"
+    // Exercise the commit windows before checkpoint publication.
+    for entry in std::fs::read_dir(&log)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.contains(".checkpoint.") || name == "_last_checkpoint" {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    let (store, engine, _) = engine_store_setup("", Some(&root));
+    let snapshot = Snapshot::builder_for(root.clone()).build(&engine).unwrap();
+    let read_schema = COMPACTION_ACTIONS_SCHEMA.clone();
+    // Pin complete expected payloads to fixture commits; no replay computes them.
+    let mut expected = Vec::new();
+    for &(version, name) in expected_actions {
+        // Fixture tombstones are expired; only declarative compaction retains them.
+        if !cfg!(feature = "declarative-plans") && name == "remove" {
+            continue;
+        }
+        for mut action in read_actions_from_commit(&root, version, name).unwrap() {
+            if cfg!(feature = "declarative-plans") && (name == "add" || name == "remove") {
+                action["dataChange"] = Value::Bool(true);
+            }
+            expected.push(
+                Value::Object([(name.to_string(), action)].into_iter().collect()).to_string(),
+            );
+        }
+    }
+    let arrow_schema = Arc::<ArrowSchema>::new(read_schema.as_ref().try_into_arrow()?);
+    let expected = ReaderBuilder::new(arrow_schema.clone())
+        .build(Cursor::new(expected.join("\n")))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let path = root.join(&format!("_delta_log/{start:020}.{end:020}.compacted.json"))?;
+    assert_eq!(
+        write_log_compaction(&snapshot, &engine, store.clone(), start, end)?,
+        path,
     );
+    // Parse both sides through Value so map entries have the same display order.
+    let before = std::fs::read(path.to_file_path().unwrap())?;
+    let written = serde_json::Deserializer::from_slice(&before)
+        .into_iter::<Value>()
+        .map_ok(|row| row.to_string())
+        .collect::<serde_json::Result<Vec<_>>>()?;
+    let written = ReaderBuilder::new(arrow_schema)
+        .build(Cursor::new(written.join("\n")))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let expected = pretty_format_batches(&expected)?.to_string();
+    let mut expected = expected.lines().collect::<Vec<_>>();
+    sort_lines!(expected);
+    assert_batches_sorted_eq!(expected, &written);
 
-    // Convert the end-to-end flow of writing the JSON. We are going beyond the public
-    // log compaction APIs since the test is writing the compacted JSON and verifying it
-    // bu this is intentional, as most engines would be implementing something similar
-    let compaction_data_iter = compacted_data_batches.into_iter().map(Ok);
-    let json_bytes = to_json_bytes(compaction_data_iter)?;
-    let final_content = String::from_utf8(json_bytes)?;
-
-    let compaction_file_path = url_to_object_store_path(&compaction_path)?;
-
-    store
-        .put(&compaction_file_path, final_content.clone().into())
-        .await?;
-
-    // Verify the compacted file content that we just wrote
-    let compacted_content = store.get(&compaction_file_path).await?;
-    let compacted_bytes = compacted_content.bytes().await?;
-    let compacted_str = std::str::from_utf8(&compacted_bytes)?;
-
-    // Parse and verify the actions
-    let compacted_lines: Vec<&str> = compacted_str.trim().lines().collect();
-    assert!(
-        !compacted_lines.is_empty(),
-        "Compacted file should not be empty"
-    );
-
-    // Check for expected actions
-    let has_protocol = compacted_lines.iter().any(|line| line.contains("protocol"));
-    let has_metadata = compacted_lines.iter().any(|line| line.contains("metaData"));
-    let has_remove = compacted_lines.iter().any(|line| line.contains("remove"));
-    let has_add_file1 = compacted_lines
-        .iter()
-        .any(|line| line.contains("part-00000-file1.parquet") && line.contains("add"));
-    let has_add_file2 = compacted_lines
-        .iter()
-        .any(|line| line.contains("part-00001-file2.parquet") && line.contains("add"));
-    let has_commit_info = compacted_lines
-        .iter()
-        .any(|line| line.contains("commitInfo"));
-
-    assert!(
-        has_protocol,
-        "Compacted file should contain protocol action"
-    );
-    assert!(
-        has_metadata,
-        "Compacted file should contain metadata action"
-    );
-    assert!(
-        has_remove,
-        "Compacted file should contain remove action (non-expired tombstone)"
-    );
-    assert!(
-        !has_add_file1,
-        "Compacted file should not contain add action for removed file file1"
-    );
-    assert!(
-        has_add_file2,
-        "Compacted file should contain add action for file2 (it was not removed)"
-    );
-    assert!(
-        !has_commit_info,
-        "Compacted file should NOT contain commitInfo actions (they should be excluded)"
-    );
-
-    // Verify the remove action has the current timestamp
-    let remove_line = compacted_lines
-        .iter()
-        .find(|line| line.contains("remove"))
-        .ok_or("Remove action should be present in compacted content")?;
-    let parsed_remove: serde_json::Value = serde_json::from_str(remove_line)?;
-
-    let actual_deletion_timestamp = parsed_remove["remove"]["deletionTimestamp"]
-        .as_i64()
-        .ok_or_else(|| {
-            format!("deletionTimestamp should be present in remove action: {remove_line}")
-        })?;
-    assert_eq!(actual_deletion_timestamp, current_timestamp_millis);
-
+    assert!(matches!(
+        write_log_compaction(&snapshot, &engine, store.clone(), start, end),
+        Err(delta_kernel::Error::Kernel(KernelError::FileAlreadyExists(
+            _
+        )))
+    ));
+    assert_eq!(std::fs::read(path.to_file_path().unwrap())?, before);
     Ok(())
 }
 
-/// Test log compaction behavior with expired tombstones.
+#[rstest]
+#[case::full(0)]
+#[case::tail(1)]
+#[case::after_seed(2)]
 #[tokio::test]
-#[ignore = "log compaction disabled (#2337)"]
-async fn expired_tombstone_exclusion() -> Result<(), Box<dyn std::error::Error>> {
-    let _ = tracing_subscriber::fmt::try_init();
-
-    let schema = schema_ref! { nullable "id": INTEGER };
-
-    let (store, engine, table_location) = engine_store_setup("test_expired_tombstone_table", None);
-
-    // Create table (this will be commit 0)
-    let table_url = create_table(
-        store.clone(),
-        table_location,
-        schema.clone(),
-        &[],
-        false,
-        vec![],
-        vec![],
-    )
-    .await?;
-
-    // Commit 1: Add three files
-    let commit1_content = r#"{"commitInfo":{"timestamp":1587968586000,"operation":"WRITE","operationParameters":{"mode":"Append"},"isBlindAppend":true}}
-{"add":{"path":"part-00000-expired-file.parquet","partitionValues":{},"size":1024,"modificationTime":1587968586000,"dataChange":true, "stats":"{\"numRecords\":10,\"nullCount\":{\"id\":0},\"minValues\":{\"id\": 1},\"maxValues\":{\"id\":10}}"}}
-{"add":{"path":"part-00001-recent-file.parquet","partitionValues":{},"size":2048,"modificationTime":1587968586000,"dataChange":true, "stats":"{\"numRecords\":20,\"nullCount\":{\"id\":0},\"minValues\":{\"id\": 11},\"maxValues\":{\"id\":30}}"}}
-{"add":{"path":"part-00002-keep-file.parquet","partitionValues":{},"size":3072,"modificationTime":1587968586000,"dataChange":true, "stats":"{\"numRecords\":30,\"nullCount\":{\"id\":0},\"minValues\":{\"id\": 31},\"maxValues\":{\"id\":60}}"}}
-"#;
-    store
-        .put(
-            &Path::from("test_expired_tombstone_table/_delta_log/00000000000000000001.json"),
-            commit1_content.as_bytes().into(),
+#[cfg_attr(
+    not(feature = "declarative-plans"),
+    ignore = "log compaction disabled (#2337)"
+)]
+async fn action_reconciliation_round_trip(
+    #[case] start: Version,
+    #[values(None, Some(0), Some(i64::MAX))] deletion_timestamp: Option<i64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let end = 3;
+    let table = TestTableBuilder::new()
+        .with_schema(schema_ref! { nullable "id": LONG })
+        .with_features(
+            FeatureSet::new()
+                .domain_metadata()
+                .with_property(
+                    "delta.deletedFileRetentionDuration",
+                    "interval 1 milliseconds",
+                )
+                .with_property(
+                    "delta.setTransactionRetentionDuration",
+                    "interval 1 milliseconds",
+                ),
         )
-        .await?;
-
-    // Commit 2: Remove the first file with an expired (old) deletionTimestamp
-    // Use a timestamp from 30 days ago (older than default 7-day retention)
-    let expired_timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
-        - (30 * 24 * 60 * 60 * 1000); // 30 days ago
-
-    let commit2_content = format!(
-        r#"{{"commitInfo":{{"timestamp":{},"operation":"DELETE","operationParameters":{{"predicate":"id <= 10"}},"isBlindAppend":false}}}}
-{{"remove":{{"path":"part-00000-expired-file.parquet","partitionValues":{{}},"size":1024,"modificationTime":1587968586000,"dataChange":true,"deletionTimestamp":{}}}}}
-"#,
-        expired_timestamp + 1000,
-        expired_timestamp
-    );
-    store
-        .put(
-            &Path::from("test_expired_tombstone_table/_delta_log/00000000000000000002.json"),
-            commit2_content.into_bytes().into(),
-        )
-        .await?;
-
-    // Commit 3: Remove the second file with a recent (non-expired) deletionTimestamp
-    let recent_timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
-        - (24 * 60 * 60 * 1000); // 1 day ago
-
-    let commit3_content = format!(
-        r#"{{"commitInfo":{{"timestamp":{},"operation":"DELETE","operationParameters":{{"predicate":"id BETWEEN 11 AND 30"}},"isBlindAppend":false}}}}
-{{"remove":{{"path":"part-00001-recent-file.parquet","partitionValues":{{}},"size":2048,"modificationTime":1587968586000,"dataChange":true,"deletionTimestamp":{}}}}}
-"#,
-        recent_timestamp + 1000,
-        recent_timestamp
-    );
-    store
-        .put(
-            &Path::from("test_expired_tombstone_table/_delta_log/00000000000000000003.json"),
-            commit3_content.into_bytes().into(),
-        )
-        .await?;
-
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let mut writer = snapshot.log_compaction_writer(0, 3)?;
-
-    let mut compaction_data = writer.compaction_data(&engine)?;
-    let compaction_path = writer.compaction_path().clone();
-
-    // Verify the compaction file name
-    let expected_filename = "00000000000000000000.00000000000000000003.compacted.json";
-    assert!(compaction_path.to_string().ends_with(expected_filename));
-
-    let mut batch_count = 0;
-    let mut compacted_data_batches = Vec::new();
-
-    for batch_result in compaction_data.by_ref() {
-        let batch = batch_result?;
-        compacted_data_batches.push(batch);
-        batch_count += 1;
-    }
-
-    assert!(
-        batch_count > 0,
-        "Should have processed at least one compaction batch"
-    );
-
-    // Convert to JSON and write to storage for verification
-    let compaction_data_iter = compacted_data_batches.into_iter().map(Ok);
-    let json_bytes = to_json_bytes(compaction_data_iter)?;
-    let final_content = String::from_utf8(json_bytes)?;
-
-    let compaction_file_path = url_to_object_store_path(&compaction_path)?;
-
-    store
-        .put(&compaction_file_path, final_content.clone().into())
-        .await?;
-
-    // Verify the compacted file content
-    let compacted_content = store.get(&compaction_file_path).await?;
-    let compacted_bytes = compacted_content.bytes().await?;
-    let compacted_str = std::str::from_utf8(&compacted_bytes)?;
-
-    // Parse and verify the actions
-    let compacted_lines: Vec<&str> = compacted_str.trim().lines().collect();
-    assert!(
-        !compacted_lines.is_empty(),
-        "Compacted file should not be empty"
-    );
-
-    // Check for expected actions
-    let has_protocol = compacted_lines.iter().any(|line| line.contains("protocol"));
-    let has_metadata = compacted_lines.iter().any(|line| line.contains("metaData"));
-    let has_add_expired_file = compacted_lines
-        .iter()
-        .any(|line| line.contains("part-00000-expired-file.parquet") && line.contains("add"));
-    let has_add_recent_file = compacted_lines
-        .iter()
-        .any(|line| line.contains("part-00001-recent-file.parquet") && line.contains("add"));
-    let has_add_keep_file = compacted_lines
-        .iter()
-        .any(|line| line.contains("part-00002-keep-file.parquet") && line.contains("add"));
-    let has_remove_expired_file = compacted_lines
-        .iter()
-        .any(|line| line.contains("part-00000-expired-file.parquet") && line.contains("remove"));
-    let has_remove_recent_file = compacted_lines
-        .iter()
-        .any(|line| line.contains("part-00001-recent-file.parquet") && line.contains("remove"));
-    let has_commit_info = compacted_lines
-        .iter()
-        .any(|line| line.contains("commitInfo"));
-
-    assert!(
-        has_protocol,
-        "Compacted file should contain protocol action"
-    );
-    assert!(
-        has_metadata,
-        "Compacted file should contain metadata action"
-    );
-    assert!(
-        !has_add_expired_file,
-        "Compacted file should not contain add action for file that was removed by expired remove action"
-    );
-    assert!(
-        !has_add_recent_file,
-        "Compacted file should not contain add action for recent file that was removed"
-    );
-    assert!(
-        has_add_keep_file,
-        "Compacted file should contain add action for kept file (file that was never removed)"
-    );
-    assert!(
-        !has_commit_info,
-        "Compacted file should NOT contain commitInfo actions (they should be excluded)"
-    );
-    assert!(
-        !has_remove_expired_file,
-        "Compacted file should NOT contain remove action for expired file"
-    );
-    assert!(
-        has_remove_recent_file,
-        "Compacted file should contain remove action for recent file"
-    );
-
-    // Verify the recent remove action has the expected timestamp
-    let recent_remove_line = compacted_lines
-        .iter()
-        .find(|line| line.contains("part-00001-recent-file.parquet") && line.contains("remove"))
-        .ok_or("Recent remove action should be present in compacted content")?;
-    let parsed_remove: serde_json::Value = serde_json::from_str(recent_remove_line)?;
-
-    let actual_deletion_timestamp = parsed_remove["remove"]["deletionTimestamp"]
-        .as_i64()
-        .ok_or_else(|| {
+        .with_data(0, 0)
+        .build()?;
+    let engine = table.engine();
+    let initial = build_snapshot!(VersionTarget::Latest, table.table_root(), &engine);
+    let mut metadata = initial.table_configuration().metadata().clone();
+    let mut protocol = initial.table_configuration().protocol().clone();
+    for version in 1..=3 {
+        let features = [
+            TableFeature::DomainMetadata,
+            TableFeature::ChangeDataFeed,
+            TableFeature::DeletionVectors,
+        ];
+        protocol = Protocol::try_new(
+            3,
+            7,
+            Some(
+                features[..version]
+                    .iter()
+                    .filter(|feature| **feature == TableFeature::DeletionVectors)
+                    .cloned(),
+            ),
+            Some(features[..version].iter().cloned()),
+        )?;
+        metadata = metadata.with_configuration_entry("test", version.to_string());
+        let actions = match version {
+            1 => r#"{"add":{"path":"cancelled","size":0,"modificationTime":0,"partitionValues":{},"dataChange":true}}
+{"add":{"path":"restored","size":0,"modificationTime":0,"partitionValues":{},"dataChange":true}}
+{"txn":{"appId":"app","version":10,"lastUpdated":0}}
+{"txn":{"appId":"other","version":1}}
+{"domainMetadata":{"domain":"test","configuration":"old","removed":false}}
+{"domainMetadata":{"domain":"other","configuration":"keep","removed":false}}"#.to_string(),
+            2 => format!(r#"{{"remove":{{"path":"cancelled","dataChange":true,"deletionTimestamp":{}}}}}
+{{"remove":{{"path":"restored","dataChange":true,"deletionTimestamp":9223372036854775807}}}}
+{{"txn":{{"appId":"app","version":9,"lastUpdated":0}}}}
+{{"domainMetadata":{{"domain":"test","configuration":"deleted","removed":true}}}}"#,
+                serde_json::to_string(&deletion_timestamp)?),
+            _ => r#"{"add":{"path":"restored","size":0,"modificationTime":0,"partitionValues":{},"dataChange":true}}"#.to_string(),
+        };
+        add_commit(
+            table.table_root(),
+            table.store().as_ref(),
+            version as u64,
             format!(
-                "deletionTimestamp should be present in recent remove action: {recent_remove_line}"
-            )
-        })?;
-    assert_eq!(actual_deletion_timestamp, recent_timestamp);
-
-    let total_actions = compacted_lines
-        .iter()
-        .filter(|line| !line.trim().is_empty())
-        .count();
+                "{{\"protocol\":{}}}\n{{\"metaData\":{}}}\n{actions}",
+                serde_json::to_string(&protocol)?,
+                serde_json::to_string(&metadata)?
+            ),
+        )
+        .await?;
+    }
+    let snapshot = build_snapshot!(VersionTarget::Latest, table.table_root(), &engine);
+    for version in 0..start {
+        // Compaction must not need the earlier table state.
+        table
+            .store()
+            .delete(&Path::from(format!("_delta_log/{version:020}.json")))
+            .await?;
+    }
+    let path = write_log_compaction(&snapshot, &engine, table.store().clone(), start, end)?;
     assert!(
-        total_actions >= 4,
-        "Should have at least 4 actions: protocol, metadata, 1 add, 1 remove (recent). Found {total_actions}"
+        path.path()
+            .ends_with(&format!("{start:020}.{end:020}.compacted.json"))
     );
+    let bytes = table
+        .store()
+        .get(&Path::from_url_path(path.path())?)
+        .await?
+        .bytes()
+        .await?;
+    let actions = serde_json::Deserializer::from_slice(&bytes)
+        .into_iter::<Value>()
+        .collect::<serde_json::Result<Vec<_>>>()?;
+    assert_eq!(
+        actions
+            .iter()
+            .filter_map(|action| action.get("protocol").cloned())
+            .map(serde_json::from_value::<Protocol>)
+            .collect::<serde_json::Result<Vec<_>>>()?,
+        [protocol],
+    );
+    assert_eq!(
+        actions
+            .iter()
+            .filter_map(|action| action.get("metaData").cloned())
+            .map(serde_json::from_value::<Metadata>)
+            .collect::<serde_json::Result<Vec<_>>>()?,
+        [metadata],
+    );
+    let schema = Arc::<ArrowSchema>::new(COMPACTION_ACTIONS_SCHEMA.as_ref().try_into_arrow()?);
+    let batches = ReaderBuilder::new(schema.clone())
+        .build(Cursor::new(bytes))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let batch = concat_batches(&schema, &batches)?;
+    let actual = batch.normalize(".", Some(1))?;
+    let declarative = cfg!(feature = "declarative-plans");
+    let retains_remove = declarative || deletion_timestamp == Some(i64::MAX);
+    let timestamp = deletion_timestamp
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    #[rustfmt::skip]
+    let expected = [
+        (
+            &["add.path", "add.dataChange"][..],
+            r#"
+            +----------+----------------+
+            | add.path | add.dataChange |
+            +----------+----------------+
+            | restored | true           |
+            +----------+----------------+
+            "#.to_string(),
+        ),
+        (
+            &["remove.path", "remove.dataChange", "remove.deletionTimestamp"][..],
+            format!(
+                r#"
+                +-------------+-------------------+--------------------------+
+                | remove.path | remove.dataChange | remove.deletionTimestamp |
+                +-------------+-------------------+--------------------------+
+                | cancelled   | true              | {timestamp:<24} |
+                +-------------+-------------------+--------------------------+
+                "#
+            ),
+        ),
+        (
+            &["txn.appId", "txn.version", "txn.lastUpdated"][..],
+            r#"
+            +-----------+-------------+-----------------+
+            | txn.appId | txn.version | txn.lastUpdated |
+            +-----------+-------------+-----------------+
+            | app       | 9           | 0               |
+            | other     | 1           |                 |
+            +-----------+-------------+-----------------+
+            "#
+            .to_string(),
+        ),
+        (
+            &[
+                "domainMetadata.domain",
+                "domainMetadata.configuration",
+                "domainMetadata.removed",
+            ][..],
+            r#"
+            +-----------------------+------------------------------+------------------------+
+            | domainMetadata.domain | domainMetadata.configuration | domainMetadata.removed |
+            +-----------------------+------------------------------+------------------------+
+            | test                  | deleted                      | true                   |
+            | other                 | keep                         | false                  |
+            +-----------------------+------------------------------+------------------------+
+            "#
+            .to_string(),
+        ),
+    ];
+    let mut checked_rows = 2; // Protocol and metadata were compared in full above.
+    for (fields, expected) in expected {
+        let columns = fields
+            .iter()
+            .map(|field| actual.schema_ref().index_of(field))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let batch = filter_record_batch(
+            &actual.project(&columns)?,
+            &is_not_null(actual.column_by_name(fields[0]).unwrap())?,
+        )?;
+        checked_rows += batch.num_rows();
+        let mut expected = expected
+            .trim()
+            .lines()
+            .map(str::trim)
+            .filter(|line| start <= 1 || !line.starts_with("| other "))
+            .filter(|line| retains_remove || !line.starts_with("| cancelled "))
+            .filter(|line| {
+                declarative || !(line.starts_with("| app ") || line.starts_with("| test "))
+            })
+            .collect::<Vec<_>>();
+        if expected.iter().filter(|line| line.starts_with('|')).count() == 1 {
+            assert_eq!(batch.num_rows(), 0);
+        } else {
+            sort_lines!(expected);
+            assert_batches_sorted_eq!(expected, &[batch]);
+        }
+    }
+    assert_eq!(checked_rows, actual.num_rows());
     Ok(())
 }
-
-// TODO: Add e2e test that log compaction contains domain metadtaas (and not tombstoned ones)

@@ -13,7 +13,7 @@ use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt};
 use delta_kernel::schema::{MetadataColumnSpec, SchemaRef, StructField, schema_ref};
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::{KernelError, KernelResult, Snapshot};
+use delta_kernel::{KernelError, KernelResult, Snapshot, Version};
 use itertools::Itertools;
 use rstest::rstest;
 use serde_json::{Deserializer, Value};
@@ -32,6 +32,8 @@ use test_utils::{
 use url::Url;
 
 use crate::common::read_utils::read_row_tracking_scan;
+#[cfg(feature = "declarative-plans")]
+use crate::common::write_utils::write_log_compaction;
 use crate::common::write_utils::{
     create_dv_update_transaction, get_scan_files, set_table_properties,
     write_deletion_vector_to_store,
@@ -1648,14 +1650,21 @@ async fn test_read_row_ids_coexist_with_row_index() -> delta_kernel::Result<()> 
     Ok(())
 }
 
-/// After log compaction: row IDs are preserved in the compacted log and scan correctly.
+/// After log compaction, row IDs and original row commit versions are preserved.
 ///
-/// Writes data across two commits, creates a log compaction file covering all commits
-/// (versions 0..=2), loads a fresh snapshot, and verifies that row IDs still read back
+/// Writes data across two commits, compacts a version interval, loads a fresh snapshot,
+/// and verifies that row IDs still read back
 /// correctly through the scan path. This ensures that `baseRowId` and row-tracking domain
 /// metadata survive compaction without being dropped or corrupted.
+#[rstest]
+#[case::full_history(0, 2)]
+#[case::with_tail(0, 1)]
+#[case::with_base(1, 2)]
 #[tokio::test]
-async fn test_read_row_ids_after_log_compaction() -> delta_kernel::Result<()> {
+async fn test_read_row_ids_after_log_compaction(
+    #[case] start: Version,
+    #[case] end: Version,
+) -> delta_kernel::Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_dir = tempdir().map_err(KernelError::from)?;
     let (schema, table_url, engine, store) =
@@ -1677,20 +1686,36 @@ async fn test_read_row_ids_after_log_compaction() -> delta_kernel::Result<()> {
             .is_committed()
     );
 
-    write_compaction_from_commits(table_url.as_str(), store.as_ref(), 0, 2).await?;
+    #[cfg(feature = "declarative-plans")]
+    {
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+        write_log_compaction(&snapshot, engine.as_ref(), store.clone(), start, end)?;
+    }
+    #[cfg(not(feature = "declarative-plans"))]
+    write_compaction_from_commits(table_url.as_str(), store.as_ref(), start, end).await?;
 
-    // Load a fresh snapshot -- it should read Protocol and Metadata and file list from the
-    // compaction file.
     let fresh_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let scan_batches = read_row_id_scan(fresh_snapshot, engine)?;
-
-    let mut all_ids = collect_row_ids(&scan_batches);
-    all_ids.sort_unstable();
-    assert_eq!(
-        all_ids,
-        vec![0, 1, 2, 3, 4],
-        "Row IDs must be preserved and correct after log compaction"
-    );
+    let scan_batches = read_row_tracking_scan(
+        fresh_snapshot,
+        engine,
+        [
+            MetadataColumnSpec::RowId,
+            MetadataColumnSpec::RowCommitVersion,
+        ],
+    )?;
+    #[rustfmt::skip]
+    let expected = [
+        "+--------+--------+--------------------+",
+        "| number | row_id | row_commit_version |",
+        "+--------+--------+--------------------+",
+        "| 1      | 0      | 1                  |",
+        "| 2      | 1      | 1                  |",
+        "| 3      | 2      | 1                  |",
+        "| 4      | 3      | 2                  |",
+        "| 5      | 4      | 2                  |",
+        "+--------+--------+--------------------+",
+    ];
+    test_utils::assert_batches_sorted_eq!(expected.as_slice(), &scan_batches);
 
     Ok(())
 }

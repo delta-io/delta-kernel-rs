@@ -21,6 +21,10 @@ use delta_kernel::arrow::array::{Int32Array, StructArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
+#[cfg(feature = "declarative-plans")]
+use delta_kernel::engine::sync::plan::SyncPlanExecutor;
+#[cfg(feature = "declarative-plans")]
+use delta_kernel::engine::{DelegatingEngine, PanicEngine};
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStore, ObjectStoreExt};
@@ -544,4 +548,35 @@ pub fn create_dv_update_transaction(
             engine,
             Box::new(delta_kernel::committer::FileSystemCommitter::new()),
         )
+}
+
+/// Writes a log compaction with the declarative planner when enabled, otherwise the legacy writer.
+pub fn write_log_compaction(
+    snapshot: &Arc<Snapshot>,
+    engine: &dyn Engine,
+    store: Arc<DynObjectStore>,
+    start: Version,
+    end: Version,
+) -> delta_kernel::Result<Url> {
+    #[cfg(feature = "declarative-plans")]
+    {
+        let _ = engine;
+        // Use file URL handling to preserve Windows drive letters in listed paths.
+        let store = (snapshot.table_root().scheme() != "file").then_some(store);
+        let engine = DelegatingEngine::new(Arc::new(PanicEngine))
+            .with_plan_executor(Arc::new(SyncPlanExecutor::new(store)));
+        Ok(snapshot.compact_log(&engine, start, end)?.location)
+    }
+    #[cfg(not(feature = "declarative-plans"))]
+    {
+        let _ = store;
+        let mut writer = snapshot.clone().log_compaction_writer(start, end)?;
+        let path = writer.compaction_path().clone();
+        engine.json_handler().write_json_file(
+            &path,
+            Box::new(writer.compaction_data(engine)?),
+            false,
+        )?;
+        Ok(path)
+    }
 }

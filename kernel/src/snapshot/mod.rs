@@ -13,10 +13,18 @@ use delta_kernel_derive::internal_api;
 use tracing::{error, info, instrument, trace, warn};
 use url::Url;
 
+#[cfg(feature = "declarative-plans")]
+use crate::FileMeta;
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
+#[cfg(feature = "declarative-plans")]
+use crate::action_reconciliation::plan::action_set::ActionSet;
+#[cfg(feature = "declarative-plans")]
+use crate::action_reconciliation::plan::{MetadataPlanner, VERSION};
 use crate::actions::set_transaction::SetTransactionScanner;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::visitors::SetTransactionMap;
+#[cfg(feature = "declarative-plans")]
+use crate::actions::{ADD_NAME, REMOVE_NAME};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::{CheckpointAction, LastManifestCommit};
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX, LOG_DOMAIN_METADATA_SCHEMA};
@@ -33,6 +41,8 @@ use crate::crc::{
     try_write_crc_file,
 };
 use crate::expressions::ColumnName;
+#[cfg(feature = "declarative-plans")]
+use crate::expressions::lit;
 use crate::incremental_scan::IncrementalScanBuilder;
 use crate::log_replay::ActionsBatch;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -48,8 +58,12 @@ use crate::metrics::{
     SnapshotLoadMetricContext, emit_protocol_metadata_load, emit_protocol_metadata_load_failure,
 };
 use crate::path::ParsedLogPath;
+#[cfg(feature = "declarative-plans")]
+use crate::plans::{Operation as PlanOperation, PlanBuilder, file_meta_from_batches};
 use crate::row_tracking::{ROW_TRACKING_DOMAIN_NAME, parse_row_tracking_high_water_mark};
 use crate::scan::ScanBuilder;
+#[cfg(feature = "declarative-plans")]
+use crate::scan::StatsOptions;
 use crate::schema::{GeneratedColumn, SchemaRef};
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::{Operation, TableFeature, physical_to_logical_column_name_and_type};
@@ -1519,6 +1533,73 @@ impl Snapshot {
         end_version: Version,
     ) -> KernelResult<LogCompactionWriter> {
         LogCompactionWriter::try_new(self, start_version, end_version)
+    }
+
+    /// Atomically writes a minor log compaction and returns its file metadata.
+    ///
+    /// Requires a plan executor and a fresh latest snapshot built with checkpoint discovery.
+    /// Compacts published commits with `start_version < end_version <= self.version()`,
+    /// after the snapshot's checkpoint. Staged commit paths are unsupported.
+    /// Retains winning removes, transactions, and domain deletions regardless of age; includes
+    /// protocol and metadata only when present.
+    /// File actions have `dataChange=true`.
+    ///
+    /// Errors on existing destinations. Missing versions return `DELTA_VERSIONS_NOT_CONTIGUOUS`;
+    /// missing files return `DELTA_TRUNCATED_TRANSACTION_LOG`.
+    /// AMT and automatic compaction are unsupported.
+    #[cfg(feature = "declarative-plans")]
+    pub fn compact_log(
+        &self,
+        engine: &dyn Engine,
+        start_version: Version,
+        end_version: Version,
+    ) -> Result<FileMeta> {
+        let executor = engine.require_plan_executor()?;
+        self.table_configuration().ensure_read_write_supported()?;
+        if self
+            .table_configuration()
+            .is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
+        {
+            return Err(KernelError::unsupported(
+                "Declarative log compaction does not support adaptiveMetadata",
+            )
+            .into());
+        }
+        let segment = self.log_compaction_segment(start_version, end_version)?;
+        let actions = MetadataPlanner::new(&segment, ActionSet::ALL, false)
+            .with_stats(StatsOptions::json_only())
+            .replay()?
+            .project_patch(|patch| {
+                // Replay ignores dataChange in compacted state; use true for both file actions.
+                patch
+                    .replace_expr_at([ADD_NAME], "dataChange", lit(true))
+                    .replace_expr_at([REMOVE_NAME], "dataChange", lit(true))
+                    .drop(VERSION)
+            })?;
+        let path =
+            ParsedLogPath::new_log_compaction(self.table_root(), start_version, end_version)?;
+        let plan = PlanBuilder::write_json([actions], path.location, false, false)?.build()?;
+        match executor
+            .execute_op(PlanOperation::QueryPlan(plan))
+            .and_then(|result| file_meta_from_batches(result.into_data()?))
+        {
+            Ok(file_meta) => Ok(file_meta),
+            Err(error) => match error.without_backtrace() {
+                KernelError::FileNotFound(path) => {
+                    let config = self.table_configuration().metadata().configuration();
+                    Err(Error::Delta(DeltaError::truncated_transaction_log(
+                        path.clone(),
+                        end_version,
+                        config.get("delta.logRetentionDuration").map(String::as_str),
+                        config
+                            .get("delta.checkpointRetentionDuration")
+                            .map(String::as_str),
+                        Some(Box::new(error)),
+                    )))
+                }
+                _ => Err(Error::Kernel(error)),
+            },
+        }
     }
 
     // ============================================================================
