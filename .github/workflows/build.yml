@@ -115,19 +115,24 @@ jobs:
           components: rustfmt
       - name: format
         run: cargo +nightly fmt -- --check
-      # In a 200K-context session, Claude Code loads only the first 40,000 characters of a nested
-      # instruction file. Codex stops loading instruction files at 32 KiB. Rules past either limit
-      # may never reach the agent.
+      # Claude Code loads only the first 40,000 characters of a nested instruction file in a
+      # 200K-context session. Codex stops adding instruction files once their combined size from
+      # the repository root to the working directory reaches 32 KiB, so the root file alone must
+      # fit. Byte counts are used because they are never smaller than character counts.
       - name: check agent instruction file sizes
         run: |
           status=0
-          while IFS= read -r f; do
-            if [ "$(wc -m < "$f")" -gt 40000 ]; then
-              echo "::error file=$f::$f exceeds 40,000 characters."
+          # Nested files at any depth. The root AGENTS.md is checked separately below.
+          git ls-files -z '*/AGENTS.md' '*/CLAUDE.md' > "$RUNNER_TEMP/instruction-files"
+          while IFS= read -r -d '' f; do
+            bytes=$(wc -c < "$f")
+            if [ "$bytes" -gt 40000 ]; then
+              echo "::error file=$f::$f exceeds 40,000 bytes."
               status=1
             fi
-          done < <(git ls-files '*/AGENTS.md' '*/CLAUDE.md')
-          if [ "$(wc -c < AGENTS.md)" -gt 32768 ]; then
+          done < "$RUNNER_TEMP/instruction-files"
+          bytes=$(wc -c < AGENTS.md)
+          if [ "$bytes" -gt 32768 ]; then
             echo "::error file=AGENTS.md::AGENTS.md exceeds 32,768 bytes."
             status=1
           fi
