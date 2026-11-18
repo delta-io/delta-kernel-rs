@@ -6,11 +6,11 @@ use std::time::Instant;
 use tracing::{debug, error, trace};
 
 use crate::actions::visitors::SelectionVectorVisitor;
-use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
+use crate::actions::{COLLATION_STATS, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::expressions::{
-    BinaryPredicateOp, ColumnName, Expression as Expr, ExpressionRef, JunctionPredicateOp,
-    MapToStructOptions, OpaquePredicateOpRef, Predicate as Pred, PredicateRef, Scalar, col,
-    column_name, expr, lit,
+    BinaryPredicateOp, CollatedComparison, ColumnName, Expression as Expr, ExpressionRef,
+    JunctionPredicateOp, MapToStructOptions, OpaquePredicateOpRef, Predicate as Pred, PredicateRef,
+    Scalar, col, collated_comparison, column_name, expr, lit,
 };
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
@@ -18,7 +18,7 @@ use crate::kernel_predicates::{
 use crate::scan::data_skipping::stats_schema::is_skipping_eligible_datatype;
 use crate::scan::log_replay::PARTITION_VALUES_PARSED_NAME;
 use crate::scan::metrics::ScanMetrics;
-use crate::schema::{DataType, PrimitiveType, SchemaRef, lazy_schema_ref, schema_ref};
+use crate::schema::{DataType, PrimitiveType, SchemaRef, StructType, lazy_schema_ref, schema_ref};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
 use crate::{
@@ -81,6 +81,7 @@ fn as_sql_data_skipping_predicate(
 /// Like [`as_sql_data_skipping_predicate`] but only rewrites references to columns in
 /// `stats_columns`; other columns return `None` from the `get_*_stat` methods and
 /// junction-fold into NULL literals.
+#[cfg(any(test, feature = "declarative-plans"))]
 pub(crate) fn as_sql_data_skipping_predicate_with_stats_columns(
     pred: &Pred,
     partition_columns: &HashSet<ColumnName>,
@@ -113,8 +114,9 @@ impl DataSkippingFilter {
     /// # Parameters
     /// - `engine`: Engine for creating evaluators
     /// - `predicate`: Optional predicate for data skipping
-    /// - `stats_schema`: The data stats schema (numRecords, nullCount, minValues, maxValues). Pass
-    ///   `None` if no data stats are available.
+    /// - `stats_schema`: The data stats schema (numRecords, nullCount, minValues, maxValues, and
+    ///   any statsWithCollation bounds, over which collated comparisons are rewritten). Pass `None`
+    ///   if no data stats are available.
     /// - `stats_expr`: Expression to extract data stats from the batch, producing output matching
     ///   `stats_schema`. For example, `col!("stats_parsed")` for pre-parsed stats, or
     ///   `Expression::parse_json(col!("add.stats"), stats_schema)` for JSON parsing.
@@ -194,11 +196,11 @@ impl DataSkippingFilter {
             .evaluation_handler()
             .new_predicate_evaluator(
                 unified_schema.clone(),
-                Arc::new(as_sql_data_skipping_predicate_with_stats_columns(
-                    &predicate,
-                    &partition_columns,
-                    stats_columns,
-                )?),
+                Arc::new(
+                    DataSkippingPredicateCreator::new(&partition_columns, stats_columns)
+                        .with_collation_bounds(stats_schema.map(AsRef::as_ref))
+                        .eval_sql_where(&predicate)?,
+                ),
             )
             .inspect_err(|e| error!("Failed to create skipping evaluator: {e}"))
             .ok()?;
@@ -532,6 +534,7 @@ fn has_min_max_stats(data_type: &DataType) -> bool {
 }
 
 /// Column metadata shared by the data-skipping predicate creators.
+#[derive(Clone, Copy)]
 struct DataSkippingColumns<'a> {
     /// Physical names of partition columns (always single-segment: Delta partition columns are
     /// top-level). Stats for these come from `partitionValues_parsed.<col>` (exact values) instead
@@ -609,8 +612,16 @@ impl DataSkippingColumns<'_> {
 /// `stats_parsed.nullCount.*`.
 /// For partition columns, rewrites to `partitionValues_parsed.*` since the partition value is
 /// the exact value for every row in the file (serving as both min and max).
+/// For collated comparisons, rewrites to `stats_parsed.statsWithCollation.<collation>.*`.
+#[derive(Clone, Copy)]
 struct DataSkippingPredicateCreator<'a> {
     data_skipping_columns: DataSkippingColumns<'a>,
+    /// The stats schema whose `statsWithCollation` bounds collated comparisons are rewritten
+    /// over. `None` disables those rewrites.
+    stats_schema: Option<&'a StructType>,
+    /// The collation of the comparison being rewritten, if it has one. Its bounds then stand in
+    /// for the binary bounds, and the engine compares them under it.
+    collation: Option<&'a str>,
 }
 
 impl<'a> DataSkippingPredicateCreator<'a> {
@@ -623,6 +634,54 @@ impl<'a> DataSkippingPredicateCreator<'a> {
                 physical_partition_columns,
                 physical_stats_columns,
             },
+            stats_schema: None,
+            collation: None,
+        }
+    }
+
+    /// Enables rewrites over the collation bounds in `stats_schema`.
+    fn with_collation_bounds(mut self, stats_schema: Option<&'a StructType>) -> Self {
+        self.stats_schema = stats_schema;
+        self
+    }
+
+    /// The `stat` bound (`minValues` or `maxValues`) of `col` under `collation`, if the stats
+    /// schema records it as a STRING.
+    fn collation_bound(&self, collation: &str, stat: &str, col: &ColumnName) -> Option<Expr> {
+        let path = ColumnName::new([COLLATION_STATS, collation, stat]).join(col);
+        let field = self.stats_schema?.field_at(&path).ok()?;
+        (field.data_type() == &DataType::STRING)
+            .then(|| Expr::from(column_name!("stats_parsed").join(&path)))
+    }
+
+    /// Rewrites a comparison under a collation the way a binary comparison is rewritten, over the
+    /// bounds its column has under that collation.
+    fn collated_skipping_predicate(
+        &self,
+        collated: &CollatedComparison,
+        exprs: &[Expr],
+        inverted: bool,
+    ) -> Option<Pred> {
+        let compared = CollatedComparison::compared(exprs)?;
+        let Expr::Column(column) = compared.value else {
+            return None;
+        };
+        let creator = DataSkippingPredicateCreator {
+            collation: Some(collated.collation()),
+            ..*self
+        };
+        let literal = Scalar::from(compared.literal);
+        let inverted = inverted != compared.negated;
+        match compared.ordering {
+            Ordering::Less => {
+                DataSkippingPredicateEvaluator::eval_pred_lt(&creator, column, &literal, inverted)
+            }
+            Ordering::Equal => {
+                DataSkippingPredicateEvaluator::eval_pred_eq(&creator, column, &literal, inverted)
+            }
+            Ordering::Greater => {
+                DataSkippingPredicateEvaluator::eval_pred_gt(&creator, column, &literal, inverted)
+            }
         }
     }
 
@@ -641,11 +700,17 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
     type ColumnStat = Expr;
 
     fn get_min_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Expr> {
-        self.data_skipping_columns.min_stat(col, data_type)
+        match self.collation {
+            Some(collation) => self.collation_bound(collation, MIN_VALUES, col),
+            None => self.data_skipping_columns.min_stat(col, data_type),
+        }
     }
 
     fn get_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Expr> {
-        self.data_skipping_columns.max_stat(col, data_type)
+        match self.collation {
+            Some(collation) => self.collation_bound(collation, MAX_VALUES, col),
+            None => self.data_skipping_columns.max_stat(col, data_type),
+        }
     }
 
     fn partial_cmp_max_stat(
@@ -671,7 +736,8 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
     }
 
     /// For partition columns, wraps the comparison with `OR(NOT is_add, comparison)` so that
-    /// Remove rows (which have null add-side partition values) are never filtered.
+    /// Remove rows (which have null add-side partition values) are never filtered. Under a
+    /// collation, the comparison is one the engine evaluates.
     fn eval_partial_cmp(
         &self,
         ord: Ordering,
@@ -679,6 +745,10 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
         val: &Scalar,
         inverted: bool,
     ) -> Option<Pred> {
+        if let Some(collation) = self.collation {
+            let comparison = comparison_predicate(ord, col, val, inverted);
+            return Some(collated_comparison(collation, comparison));
+        }
         // Detect partition columns by the prefix set in get_min_stat/get_max_stat.
         let is_partition = is_partition_value_reference(&col);
         let cmp = comparison_predicate(ord, col, val, inverted);
@@ -746,13 +816,18 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
     /// callback behind FFI) that bypass kernel's null-stats folding, so kernel itself must
     /// guarantee that non-Add rows (Removes and other actions, which carry null stats) are never
     /// filtered -- dropping a Remove from log replay would resurrect a deleted file.
+    ///
+    /// A collated comparison is rewritten over its collation bounds instead, under the same guard.
     fn eval_pred_opaque(
         &self,
         op: &OpaquePredicateOpRef,
         exprs: &[Expr],
         inverted: bool,
     ) -> Option<Pred> {
-        let pred = op.as_data_skipping_predicate(self, exprs, inverted)?;
+        let pred = match op.any_ref().downcast_ref::<CollatedComparison>() {
+            Some(collated) => self.collated_skipping_predicate(collated, exprs, inverted)?,
+            None => op.as_data_skipping_predicate(self, exprs, inverted)?,
+        };
         Some(self.guard_for_removes(pred))
     }
 

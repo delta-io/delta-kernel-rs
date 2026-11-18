@@ -86,6 +86,7 @@ use crate::{
     SnapshotRef, Version,
 };
 
+mod collation_stats;
 pub(crate) mod data_skipping;
 pub(crate) mod field_classifiers;
 pub mod log_replay;
@@ -547,11 +548,11 @@ impl ScanBuilder {
     /// to the engine by default. Use [`with_stats`](Self::with_stats) if the engine
     /// also wants stats in the scan metadata output.
     ///
-    /// String comparisons use UTF-8 binary semantics, including on columns with `__COLLATIONS`.
-    /// Kernel's pruning ignores `statsWithCollation`. For collation-aware queries, the connector
-    /// must derive a conservative predicate whose TRUE rows include every match of the original
-    /// filter, and apply the original filter after reading. Unsupported comparisons must not
-    /// discard rows through Kernel or underlying-reader pushdown.
+    /// Ordinary string comparisons use UTF-8 binary semantics, including on columns with
+    /// `__COLLATIONS`. For a collation-aware comparison, pass a
+    /// [`collated_comparison`](crate::expressions::collated_comparison) to skip files using that
+    /// collation's bounds, or [`Predicate::unknown`] in its place to keep every file. Apply the
+    /// original filter after reading in both cases.
     ///
     /// [`StructType::add_metadata_column`]: crate::schema::StructType::add_metadata_column
     pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {

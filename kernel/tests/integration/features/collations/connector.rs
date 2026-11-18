@@ -2,6 +2,8 @@
 //!
 //! Covers exact provider/name/version matching, missing-bound fallback and conservative AND/OR/NOT
 //! pushdown followed by the original row filter, per the [collation RFC]'s reader requirements.
+//! Skipping is exercised both in the connector, from returned statistics, and in Kernel, from a
+//! collated comparison that the engine evaluates.
 //!
 //! [collation RFC]: https://github.com/delta-io/delta/blob/master/protocol_rfcs/collated-string-type.md
 
@@ -9,15 +11,42 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{Int32Array, RecordBatch, StringArray};
-use delta_kernel::expressions::{Predicate, col, column_name, lit};
+use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
+use delta_kernel::engine::DelegatingEngine;
+use delta_kernel::engine::arrow_expression::collation::{
+    AsciiCaseInsensitive, CollationEvaluationHandler,
+};
+use delta_kernel::expressions::{Predicate, col, collated_comparison, column_name, lit};
+use delta_kernel::scan::StatsOptions;
 use delta_kernel::schema::{DataType, schema_ref};
+use delta_kernel::{Engine, Snapshot};
 use rstest::rstest;
 use serde_json::{Value, json};
-use test_utils::{read_add_infos, read_scan, test_table_setup};
+use test_utils::{
+    assert_result_error_with_message, read_add_infos, read_scan, test_table_setup,
+    test_table_setup_mt,
+};
 
-use super::{CollationStats, CollationTable, annotated_field, create_fixture, simple_batch};
+use super::{
+    CollationStats, CollationTable, annotated_field, create_fixture, generated_table, simple_batch,
+};
+use crate::common::read_utils::collect_scan_paths;
 
 const SYNTHETIC_ID: &str = "test.ASCII_CI.1";
+
+/// Wraps `engine` so that it evaluates comparisons under `collation` ASCII case-insensitively.
+fn with_collator(engine: Arc<dyn Engine>, collation: &'static str) -> Arc<dyn Engine> {
+    let handler = CollationEvaluationHandler::new(
+        engine.evaluation_handler(),
+        Arc::new(AsciiCaseInsensitive(collation)),
+    );
+    Arc::new(DelegatingEngine::new(engine).with_evaluation_handler(Arc::new(handler)))
+}
+
+/// Wraps `engine` so that it evaluates comparisons under [`SYNTHETIC_ID`].
+fn with_collation(engine: Arc<dyn Engine>) -> Arc<dyn Engine> {
+    with_collator(engine, SYNTHETIC_ID)
+}
 
 #[derive(Clone, Copy, Debug)]
 enum Operation {
@@ -165,6 +194,15 @@ async fn connector_uses_only_exact_operation_collation_stats(
     Ok(())
 }
 
+/// How a [`Filter`] hands its case-insensitive comparison to Kernel.
+#[derive(Clone, Copy)]
+enum Comparison {
+    /// As a collated comparison, which Kernel skips files with.
+    Collated,
+    /// As an unknown predicate, which leaves the comparison to the connector.
+    Unknown,
+}
+
 #[derive(Clone, Debug)]
 enum Filter {
     CaseInsensitiveEqual(&'static str),
@@ -211,6 +249,28 @@ impl Filter {
             ),
         }
     }
+
+    /// The filter as a Kernel predicate with the same structure.
+    fn kernel_predicate(&self, comparison: Comparison) -> Predicate {
+        match self {
+            Self::CaseInsensitiveEqual(literal) => match comparison {
+                Comparison::Collated => {
+                    collated_comparison(SYNTHETIC_ID, col!("name").eq(lit(*literal)))
+                }
+                Comparison::Unknown => Predicate::unknown("collated comparison"),
+            },
+            Self::IdAtLeast(min) => col!("id").ge(lit(*min)),
+            Self::And(left, right) => Predicate::and(
+                left.kernel_predicate(comparison),
+                right.kernel_predicate(comparison),
+            ),
+            Self::Or(left, right) => Predicate::or(
+                left.kernel_predicate(comparison),
+                right.kernel_predicate(comparison),
+            ),
+            Self::Not(child) => Predicate::not(child.kernel_predicate(comparison)),
+        }
+    }
 }
 
 fn compound(and: bool) -> Filter {
@@ -235,11 +295,17 @@ fn compound(and: bool) -> Filter {
 async fn conservative_predicates_prune_files_without_losing_original_matches(
     #[case] original: Filter,
     #[case] expected_candidates: usize,
+    #[values(false, true)] unknown_comparison: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp, path, engine) = test_table_setup()?;
     let fixture = synthetic_fixture(Some(SYNTHETIC_ID), Operation::Equal);
     let snapshot = create_fixture(&path, engine.as_ref(), &fixture, &[]).await?;
-    let safe = original.conservative_predicate(false);
+    // Kernel relaxes an unknown comparison the way the connector would relax it by hand.
+    let safe = if unknown_comparison {
+        original.kernel_predicate(Comparison::Unknown)
+    } else {
+        original.conservative_predicate(false)
+    };
     assert!(!safe.references().contains(&column_name!("name")));
     let scan = snapshot
         .clone()
@@ -258,5 +324,185 @@ async fn conservative_predicates_prune_files_without_losing_original_matches(
         .filter(|(id, name)| original.matches(*id, name))
         .collect();
     assert_eq!(actual, oracle);
+    Ok(())
+}
+
+/// Kernel skips with the engine's comparison over the bounds of the predicate's exact collation,
+/// and only those (RFC: "Reader Requirements for Collations").
+#[rstest]
+#[case::commits("none", None, true, SYNTHETIC_ID)]
+#[case::json_stats_v1_checkpoint("none", Some(CheckpointSpec::V1), false, SYNTHETIC_ID)]
+#[case::name_mapped_v1_checkpoint("name", Some(CheckpointSpec::V1), true, SYNTHETIC_ID)]
+#[case::id_mapped_v2_sidecars(
+    "id",
+    Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+        file_actions_per_sidecar_hint: Some(1),
+    })),
+    true,
+    SYNTHETIC_ID
+)]
+#[case::bounds_under_another_version("none", None, true, "test.ASCII_CI.2")]
+#[case::checkpoint_bounds_under_another_version(
+    "none",
+    Some(CheckpointSpec::V1),
+    true,
+    "test.ASCII_CI.2"
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn collated_predicates_prune_files_without_losing_matches(
+    #[case] mapping: &str,
+    #[case] checkpoint: Option<CheckpointSpec>,
+    #[case] struct_stats: bool,
+    #[case] stats_id: &'static str,
+    #[values(StatsOptions::json_only(), StatsOptions::all_struct())] stats: StatsOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, path, engine) = test_table_setup_mt()?;
+    let mut fixture = synthetic_fixture(Some(stats_id), Operation::Equal);
+    // A file without collation bounds is kept by every collated comparison. It is the oldest
+    // file, because a checkpoint samples the collations of its struct stats from the newest.
+    fixture
+        .files
+        .insert(0, (simple_batch(vec![8], vec!["ALICE"]), None));
+    // Byte order sorts "carol" last, so this file's binary bounds exclude "Dave".
+    fixture.files.push((
+        simple_batch(vec![5, 6, 7], vec!["Carol", "carol", "Dave"]),
+        Some(CollationStats {
+            identifier: stats_id,
+            bounds: json!({
+                "minValues": { "name": "Carol" },
+                "maxValues": { "name": "Dave" },
+            }),
+        }),
+    ));
+    let (as_struct, as_json) = if struct_stats {
+        ("true", "false")
+    } else {
+        ("false", "true")
+    };
+    let mut properties = vec![
+        ("delta.columnMapping.mode", mapping),
+        ("delta.checkpoint.writeStatsAsStruct", as_struct),
+        ("delta.checkpoint.writeStatsAsJson", as_json),
+    ];
+    if matches!(checkpoint, Some(CheckpointSpec::V2(_))) {
+        properties.push(("delta.feature.v2Checkpoint", "supported"));
+    }
+    let snapshot = create_fixture(&path, engine.as_ref(), &fixture, &properties).await?;
+    if let Some(checkpoint) = &checkpoint {
+        snapshot.checkpoint(engine.as_ref(), Some(checkpoint))?;
+    }
+    let snapshot = Snapshot::builder_for(&path).build(engine.as_ref())?;
+    let engine = with_collation(engine);
+    let all_rows = rows(&read_scan(
+        &snapshot.clone().scan_builder().build()?,
+        engine.clone(),
+    )?);
+    let candidate_rows = |predicate: Predicate| -> Result<_, Box<dyn std::error::Error>> {
+        let scan = snapshot
+            .clone()
+            .scan_builder()
+            .with_stats(stats.clone())
+            .with_predicate(Arc::new(predicate))
+            .build()?;
+        Ok(rows(&read_scan(&scan, engine.clone())?))
+    };
+    let not = |filter| Filter::Not(Box::new(filter));
+    for (original, kept_rows) in [
+        (Filter::CaseInsensitiveEqual("alice"), 3),
+        (Filter::CaseInsensitiveEqual("dave"), 4),
+        (compound(true), 2),
+        (compound(false), 7),
+        (not(Filter::CaseInsensitiveEqual("alice")), 6),
+        (not(compound(true)), 7),
+        (not(compound(false)), 1),
+    ] {
+        let candidates = candidate_rows(original.kernel_predicate(Comparison::Collated))?;
+        // Bounds under another identifier leave only the binary `id` comparison to skip with.
+        let expected_candidates = if stats_id == SYNTHETIC_ID {
+            kept_rows
+        } else {
+            candidate_rows(original.conservative_predicate(false))?.len()
+        };
+        assert_eq!(candidates.len(), expected_candidates, "{original:?}");
+        let matching = |rows: &[(i32, String)]| -> Vec<_> {
+            rows.iter()
+                .filter(|(id, name)| original.matches(*id, name))
+                .cloned()
+                .collect()
+        };
+        assert_eq!(matching(&candidates), matching(&all_rows), "{original:?}");
+    }
+    Ok(())
+}
+
+/// Only the first file can hold `charlie` ignoring case. Its binary bounds end at `Charlie`, so
+/// they would skip it too.
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn collated_predicate_on_a_nested_column_prunes_files_by_its_nested_bounds(
+    #[values("none", "name", "id")] mapping: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const LCASE: &str = "spark.UTF8_LCASE.75.1";
+    let (_temp, path, engine) = test_table_setup_mt()?;
+    let fixture = generated_table(true, &["first", "last", "email"]);
+    let properties = [("delta.columnMapping.mode", mapping)];
+    let snapshot = create_fixture(&path, engine.as_ref(), &fixture, &properties).await?;
+    let predicate = collated_comparison(LCASE, col!("name.first").eq(lit("charlie")));
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .build()?;
+    let batches = read_scan(&scan, with_collator(engine, LCASE))?;
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+    Ok(())
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn collated_predicates_prune_sidecar_files_in_sequential_and_parallel_scan_metadata(
+    #[values(false, true)] parallel: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, path, engine) = test_table_setup_mt()?;
+    let fixture = synthetic_fixture(Some(SYNTHETIC_ID), Operation::Equal);
+    let properties = [("delta.feature.v2Checkpoint", "supported")];
+    let snapshot = create_fixture(&path, engine.as_ref(), &fixture, &properties).await?;
+    let sidecars = CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+        file_actions_per_sidecar_hint: Some(1),
+    });
+    snapshot.checkpoint(engine.as_ref(), Some(&sidecars))?;
+    let scan = Snapshot::builder_for(&path)
+        .build(engine.as_ref())?
+        .scan_builder()
+        .with_predicate(Arc::new(
+            Filter::CaseInsensitiveEqual("alice").kernel_predicate(Comparison::Collated),
+        ))
+        .build()?;
+    let kept = collect_scan_paths(&scan, with_collation(engine), parallel)?;
+    assert_eq!(kept.len(), 2);
+    Ok(())
+}
+
+#[rstest]
+#[case::no_collator(None, "Unsupported opaque predicate")]
+#[case::collator_rejects_the_collation(Some("test.ASCII_CI.2"), "Unknown collation")]
+#[tokio::test]
+async fn collated_predicate_fails_the_scan_when_the_engine_cannot_evaluate_it(
+    #[case] collation: Option<&'static str>,
+    #[case] message: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, path, engine) = test_table_setup()?;
+    let fixture = synthetic_fixture(Some(SYNTHETIC_ID), Operation::Equal);
+    let snapshot = create_fixture(&path, engine.as_ref(), &fixture, &[]).await?;
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(
+            Filter::CaseInsensitiveEqual("alice").kernel_predicate(Comparison::Collated),
+        ))
+        .build()?;
+    let engine: Arc<dyn Engine> = match collation {
+        Some(collation) => with_collator(engine, collation),
+        None => engine,
+    };
+    assert_result_error_with_message(read_scan(&scan, engine), message);
     Ok(())
 }

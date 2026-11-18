@@ -628,6 +628,11 @@ impl StateInfo {
             requested_physical_stats_columns_ref,
             table_configuration,
         )?;
+        let physical_stats_read_schema = super::collation_stats::extend_read_schema(
+            table_configuration,
+            physical_stats_read_schema,
+            &physical_predicate,
+        )?;
         let physical_stats_output_schema =
             super::build_stats_output_schemas(table_configuration, stats)?
                 .map(|schemas| schemas.physical);

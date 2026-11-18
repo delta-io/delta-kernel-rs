@@ -18,6 +18,7 @@ use crate::schema::{DataType, PrimitiveType, SchemaRef};
 use crate::utils::require;
 use crate::{EngineData, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator};
 
+pub mod collation;
 pub mod evaluate_expression;
 pub mod opaque;
 mod timestamp_timezone;

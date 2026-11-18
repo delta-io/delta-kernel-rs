@@ -167,6 +167,12 @@ impl OpaqueExpressionOp for ArrowOpaqueExpressionOpAdaptor {
 #[derive(Debug, Deref)]
 pub(crate) struct ArrowOpaquePredicateOpAdaptor(#[deref(forward)] Box<dyn ArrowOpaquePredicateOp>);
 
+impl ArrowOpaquePredicateOpAdaptor {
+    pub(crate) fn new(op: impl ArrowOpaquePredicateOp) -> Self {
+        Self(Box::new(op))
+    }
+}
+
 impl PartialEq for ArrowOpaquePredicateOpAdaptor {
     fn eq(&self, other: &Self) -> bool {
         (**self).dyn_eq(other.any_ref())
