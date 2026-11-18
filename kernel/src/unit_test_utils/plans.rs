@@ -21,6 +21,7 @@ impl PlanExecutor for IOOnlyPlanExecutor {
             let supported = match plan.nodes.as_slice() {
                 [node] if node.inputs.is_empty() => match &node.op {
                     Operator::ScanJson(_) | Operator::ScanParquet(_) => true,
+                    // A scan with no input files builds as an empty Values plan.
                     Operator::Values(values) => values.rows.is_empty(),
                     _ => false,
                 },

@@ -134,8 +134,8 @@ With `declarative-plans`, you can route file reads and storage operations throug
 while Kernel replays protocol and metadata imperatively. Create the executor with
 `get_plan_executor(context, callback, false)`, then pass its handle to `get_plan_based_engine`.
 Choose `true` if your executor also supports declarative protocol and metadata replay. See
-[`get_plan_executor`](https://docs.rs/delta_kernel_ffi/latest/delta_kernel_ffi/plans/fn.get_plan_executor.html)
-for the support and callback lifetime requirements.
+the `get_plan_executor` documentation in the generated `delta_kernel_ffi.h` header for the support
+and callback lifetime requirements.
 
 **Snapshots**
 
