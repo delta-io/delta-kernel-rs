@@ -1057,8 +1057,8 @@ mod tests {
         // Pass incomplete lists so the merge path must re-add existing features.
         let merged = protocol_with_features(
             &current,
-            vec![TableFeature::ChangeDataFeed],
-            vec![TableFeature::ChangeDataFeed],
+            vec![TableFeature::V2Checkpoint],
+            vec![TableFeature::V2Checkpoint, TableFeature::ChangeDataFeed],
         )
         .unwrap();
         let readers = merged.reader_features().unwrap();
@@ -1066,7 +1066,8 @@ mod tests {
         assert!(readers.contains(&TableFeature::DeletionVectors));
         assert!(writers.contains(&TableFeature::DeletionVectors));
         assert!(writers.contains(&TableFeature::AppendOnly));
-        assert!(readers.contains(&TableFeature::ChangeDataFeed));
+        assert!(readers.contains(&TableFeature::V2Checkpoint));
+        assert!(writers.contains(&TableFeature::V2Checkpoint));
         assert!(writers.contains(&TableFeature::ChangeDataFeed));
     }
 
