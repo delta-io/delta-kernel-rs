@@ -1668,6 +1668,18 @@ fn evaluator_rejects_incompatible_top_level_container_types(
     KernelDataType::TIMESTAMP_NANOS_NTZ,
     DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
 )]
+#[case::nanos_from_non_utc_tz(
+    KernelDataType::TIMESTAMP_NANOS,
+    DataType::Timestamp(TimeUnit::Nanosecond, Some("+08:00".into()))
+)]
+#[case::nanos_from_empty_tz(
+    KernelDataType::TIMESTAMP_NANOS,
+    DataType::Timestamp(TimeUnit::Nanosecond, Some("".into()))
+)]
+#[case::nanos_ntz_from_empty_tz(
+    KernelDataType::TIMESTAMP_NANOS_NTZ,
+    DataType::Timestamp(TimeUnit::Nanosecond, Some("".into()))
+)]
 fn evaluator_rejects_incompatible_timestamp_nanos_types(
     #[case] expected_type: KernelDataType,
     #[case] data_type: DataType,

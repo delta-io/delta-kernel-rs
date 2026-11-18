@@ -530,13 +530,15 @@ fn primitive_types_compatible(expected: &PrimitiveType, data_type: &ArrowDataTyp
             ),
         ) => true,
         #[cfg(feature = "nanosecond-timestamps")]
-        (PrimitiveType::TimestampNanos, ArrowDataType::Timestamp(TimeUnit::Nanosecond, tz)) => {
-            tz.as_deref().is_some_and(|tz| !tz.is_empty())
-        }
+        (
+            PrimitiveType::TimestampNanos,
+            ArrowDataType::Timestamp(TimeUnit::Nanosecond, Some(timezone)),
+        ) => timezone.eq_ignore_ascii_case("utc"),
         #[cfg(feature = "nanosecond-timestamps")]
-        (PrimitiveType::TimestampNanosNtz, ArrowDataType::Timestamp(TimeUnit::Nanosecond, tz)) => {
-            tz.as_deref().is_none_or(str::is_empty)
-        }
+        (
+            PrimitiveType::TimestampNanosNtz,
+            ArrowDataType::Timestamp(TimeUnit::Nanosecond, None),
+        ) => true,
         (PrimitiveType::Void, ArrowDataType::Null) => true,
         (PrimitiveType::IntervalYearMonth(_), ArrowDataType::Int32 | ArrowDataType::UInt32) => true,
         (PrimitiveType::IntervalDayTime(_), ArrowDataType::Int64 | ArrowDataType::UInt64) => true,
