@@ -1122,14 +1122,11 @@ mod tests {
 
             let partition_values = partition_value_map_new();
             let part_name = "part";
-            // NullTypeTag::Integer == 3.
             let _ = ok_or_panic(unsafe {
                 partition_value::partition_value_map_insert_null(
                     partition_values.shallow_copy(),
                     kernel_string_slice!(part_name),
-                    crate::expressions::kernel_visitor::NullTypeTag::Integer as u8,
-                    0,
-                    0,
+                    crate::NullableType::Integer,
                     engine.shallow_copy(),
                 )
             });

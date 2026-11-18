@@ -71,6 +71,7 @@ use error::{AllocateError, ErrorAllocators, ExternResult, IntoExternResult};
 #[cfg(feature = "delta-kernel-unity-catalog")]
 pub mod delta_kernel_unity_catalog;
 pub mod expressions;
+pub use expressions::kernel_visitor::NullableType;
 #[cfg(feature = "tracing")]
 pub mod ffi_metrics;
 #[cfg(feature = "tracing")]

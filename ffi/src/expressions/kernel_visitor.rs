@@ -464,197 +464,143 @@ fn visit_expression_literal_decimal_impl(
     Ok(wrap_expression(state, lit(decimal)))
 }
 
-/// Type tag for null literal construction via FFI. Identifies the data type of a typed null.
+/// C-compatible type descriptor for a typed null literal or clustering column.
 ///
-/// Most primitive types use fixed discriminants 0-14. Decimal uses 12 and requires additional
-/// precision/scale parameters. Non-primitive types (struct, array, map, variant) and the `void`
-/// primitive use the [`NonPrimitive`](Self::NonPrimitive) sentinel because they cannot be
-/// reconstructed from a type tag alone.
+/// The decimal variant carries its precision and scale. The interval variants identify only the
+/// year-month or day-time family; they do not preserve an individual qualifier. The C
+/// representation is a tagged union, so only the payload selected by `tag` is active.
+/// `NonPrimitive` reports a type that this descriptor cannot reconstruct.
 ///
-/// NOTE: These values are part of the FFI contract. Changing existing discriminants is a breaking
-/// change.
-#[repr(u8)]
+/// cbindgen:prefix-with-name=true
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NullTypeTag {
+pub enum NullableType {
     /// Null of type `boolean`.
-    Boolean = 0,
+    Boolean,
     /// Null of type `byte` (8-bit signed integer).
-    Byte = 1,
+    Byte,
     /// Null of type `short` (16-bit signed integer).
-    Short = 2,
+    Short,
     /// Null of type `integer` (32-bit signed integer).
-    Integer = 3,
+    Integer,
     /// Null of type `long` (64-bit signed integer).
-    Long = 4,
+    Long,
     /// Null of type `float` (32-bit IEEE 754).
-    Float = 5,
+    Float,
     /// Null of type `double` (64-bit IEEE 754).
-    Double = 6,
+    Double,
     /// Null of type `string`.
-    String = 7,
+    String,
     /// Null of type `binary`.
-    Binary = 8,
+    Binary,
     /// Null of type `date` (days since epoch).
-    Date = 9,
+    Date,
     /// Null of type `timestamp` (microseconds since epoch, UTC-adjusted).
-    Timestamp = 10,
+    Timestamp,
     /// Null of type `timestamp_ntz` (microseconds since epoch, no timezone).
-    TimestampNtz = 11,
-    /// Null of type `decimal`. Requires valid `precision` and `scale` parameters.
-    ///
-    /// WARNING: This variant MUST remain `= 12`. It is the only tag with special handling
-    /// (precision/scale parameters), and C consumers key on the value `12` directly.
-    Decimal = 12,
-    /// Null of type `interval year to month` (signed month count).
-    IntervalYearMonth = 13,
-    /// Null of type `interval day to second` (signed microsecond duration).
-    IntervalDayTime = 14,
-    /// Sentinel for non-primitive null types (struct, array, map, variant) and void. Emitted by
-    /// the kernel-to-engine visitor when the null's type cannot be reconstructed from a compact
-    /// tag. Engines that receive this tag should use opaque expressions or a schema visitor to
-    /// obtain full type details.
-    ///
-    /// Passing this tag to [`visit_expression_literal_null`] returns an error because the
-    /// original complex type cannot be reconstructed from a tag alone.
-    NonPrimitive = 255,
+    TimestampNtz,
+    /// Null of a decimal type with its precision and scale.
+    Decimal { precision: u8, scale: u8 },
+    /// Null of the year-month interval family.
+    IntervalYearMonth,
+    /// Null of the day-time interval family.
+    IntervalDayTime,
+    /// A type that this descriptor cannot reconstruct, such as a struct, array, map, variant,
+    /// void, geometry, or geography.
+    NonPrimitive,
 }
 
-impl TryFrom<u8> for NullTypeTag {
-    type Error = delta_kernel::KernelError;
-
-    fn try_from(value: u8) -> KernelResult<Self> {
-        match value {
-            0 => Ok(Self::Boolean),
-            1 => Ok(Self::Byte),
-            2 => Ok(Self::Short),
-            3 => Ok(Self::Integer),
-            4 => Ok(Self::Long),
-            5 => Ok(Self::Float),
-            6 => Ok(Self::Double),
-            7 => Ok(Self::String),
-            8 => Ok(Self::Binary),
-            9 => Ok(Self::Date),
-            10 => Ok(Self::Timestamp),
-            11 => Ok(Self::TimestampNtz),
-            12 => Ok(Self::Decimal),
-            13 => Ok(Self::IntervalYearMonth),
-            14 => Ok(Self::IntervalDayTime),
-            255 => Ok(Self::NonPrimitive),
-            other => Err(delta_kernel::KernelError::generic(format!(
-                "Unrecognized null type tag: {other}"
-            ))),
-        }
-    }
-}
-
-impl NullTypeTag {
-    /// Convert a [`DataType`] to its null type tag and decimal parameters.
-    ///
-    /// Returns `(tag, precision, scale)`. The `precision` and `scale` are only meaningful when
-    /// `tag` is [`NullTypeTag::Decimal`]; they are zero for all other types.
-    pub(crate) fn from_data_type(data_type: &DataType) -> (Self, u8, u8) {
+impl NullableType {
+    /// Convert a [`DataType`] to the descriptor used for its typed null.
+    pub(crate) fn from_data_type(data_type: &DataType) -> Self {
         match data_type {
-            DataType::Primitive(p) => match p {
-                PrimitiveType::Boolean => (Self::Boolean, 0, 0),
-                PrimitiveType::Byte => (Self::Byte, 0, 0),
-                PrimitiveType::Short => (Self::Short, 0, 0),
-                PrimitiveType::Integer => (Self::Integer, 0, 0),
-                PrimitiveType::Long => (Self::Long, 0, 0),
-                PrimitiveType::Float => (Self::Float, 0, 0),
-                PrimitiveType::Double => (Self::Double, 0, 0),
-                PrimitiveType::String => (Self::String, 0, 0),
-                PrimitiveType::Binary => (Self::Binary, 0, 0),
-                PrimitiveType::Date => (Self::Date, 0, 0),
-                PrimitiveType::Timestamp => (Self::Timestamp, 0, 0),
-                PrimitiveType::TimestampNtz => (Self::TimestampNtz, 0, 0),
-                PrimitiveType::IntervalYearMonth(_) => (Self::IntervalYearMonth, 0, 0),
-                PrimitiveType::IntervalDayTime(_) => (Self::IntervalDayTime, 0, 0),
-                PrimitiveType::Decimal(dt) => (Self::Decimal, dt.precision(), dt.scale()),
-                // Void has no dedicated FFI tag. The current predicate-construction path is
-                // not expected to produce a void-typed literal null; if one ever reaches this
-                // code we want it represented as a non-primitive null rather than a missing
-                // case, so this arm is a defensive fallback rather than part of the normal
-                // void-column path.
-                PrimitiveType::Void => (Self::NonPrimitive, 0, 0),
-                // A geometry/geography's coordinate reference system string doesn't fit the
-                // (tag, u8, u8) payload, so map to the NonPrimitive sentinel. See #2949 for
-                // real geo FFI support.
+            DataType::Primitive(primitive) => match primitive {
+                PrimitiveType::Boolean => Self::Boolean,
+                PrimitiveType::Byte => Self::Byte,
+                PrimitiveType::Short => Self::Short,
+                PrimitiveType::Integer => Self::Integer,
+                PrimitiveType::Long => Self::Long,
+                PrimitiveType::Float => Self::Float,
+                PrimitiveType::Double => Self::Double,
+                PrimitiveType::String => Self::String,
+                PrimitiveType::Binary => Self::Binary,
+                PrimitiveType::Date => Self::Date,
+                PrimitiveType::Timestamp => Self::Timestamp,
+                PrimitiveType::TimestampNtz => Self::TimestampNtz,
+                PrimitiveType::IntervalYearMonth(_) => Self::IntervalYearMonth,
+                PrimitiveType::IntervalDayTime(_) => Self::IntervalDayTime,
+                PrimitiveType::Decimal(decimal) => Self::Decimal {
+                    precision: decimal.precision(),
+                    scale: decimal.scale(),
+                },
+                PrimitiveType::Void => Self::NonPrimitive,
                 #[cfg(feature = "geo-type-in-dev")]
-                PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => {
-                    (Self::NonPrimitive, 0, 0)
-                }
+                PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => Self::NonPrimitive,
             },
-            _ => (Self::NonPrimitive, 0, 0),
+            _ => Self::NonPrimitive,
         }
     }
 
-    /// Convert a null type tag back to a [`DataType`].
+    /// Reconstruct the [`DataType`] described by this typed-null value.
     ///
-    /// For [`Decimal`](Self::Decimal), `precision` and `scale` specify the decimal parameters.
-    /// For all other primitive types, `precision` and `scale` are ignored (callers should
-    /// pass 0).
-    ///
-    /// Returns an error for [`NonPrimitive`](Self::NonPrimitive) since complex types cannot be
-    /// reconstructed from a type tag alone.
-    pub(crate) fn to_data_type(self, precision: u8, scale: u8) -> KernelResult<DataType> {
-        match self {
-            Self::Boolean => Ok(DataType::BOOLEAN),
-            Self::Byte => Ok(DataType::BYTE),
-            Self::Short => Ok(DataType::SHORT),
-            Self::Integer => Ok(DataType::INTEGER),
-            Self::Long => Ok(DataType::LONG),
-            Self::Float => Ok(DataType::FLOAT),
-            Self::Double => Ok(DataType::DOUBLE),
-            Self::String => Ok(DataType::STRING),
-            Self::Binary => Ok(DataType::BINARY),
-            Self::Date => Ok(DataType::DATE),
-            Self::Timestamp => Ok(DataType::TIMESTAMP),
-            Self::TimestampNtz => Ok(DataType::TIMESTAMP_NTZ),
-            Self::IntervalYearMonth => Ok(DataType::INTERVAL_YEAR_MONTH),
-            Self::IntervalDayTime => Ok(DataType::INTERVAL_DAY_TIME),
-            Self::Decimal => Ok(DataType::Primitive(PrimitiveType::decimal(
-                precision, scale,
-            )?)),
-            Self::NonPrimitive => Err(delta_kernel::KernelError::generic(
-                "Non-primitive null types (struct, array, map, variant) cannot be reconstructed \
-                 from a type tag. Use opaque expressions or a schema visitor instead.",
-            )),
-        }
+    /// Returns an error for [`NonPrimitive`](Self::NonPrimitive), which does not contain enough
+    /// information to reconstruct a complex type.
+    pub(crate) fn to_data_type(self) -> KernelResult<DataType> {
+        let data_type = match self {
+            Self::Boolean => DataType::BOOLEAN,
+            Self::Byte => DataType::BYTE,
+            Self::Short => DataType::SHORT,
+            Self::Integer => DataType::INTEGER,
+            Self::Long => DataType::LONG,
+            Self::Float => DataType::FLOAT,
+            Self::Double => DataType::DOUBLE,
+            Self::String => DataType::STRING,
+            Self::Binary => DataType::BINARY,
+            Self::Date => DataType::DATE,
+            Self::Timestamp => DataType::TIMESTAMP,
+            Self::TimestampNtz => DataType::TIMESTAMP_NTZ,
+            Self::Decimal { precision, scale } => {
+                DataType::Primitive(PrimitiveType::decimal(precision, scale)?)
+            }
+            Self::IntervalYearMonth => DataType::INTERVAL_YEAR_MONTH,
+            Self::IntervalDayTime => DataType::INTERVAL_DAY_TIME,
+            Self::NonPrimitive => {
+                return Err(delta_kernel::KernelError::generic(
+                    "Non-primitive null types cannot be reconstructed from NullableType. \
+                     Use opaque expressions or a schema visitor instead.",
+                ));
+            }
+        };
+        Ok(data_type)
     }
 }
 
 /// Visit a typed null literal expression.
 ///
-/// The `type_tag` identifies the data type using the `NullTypeTag` encoding. For decimal nulls
-/// (`type_tag == 12`), `precision` and `scale` specify the decimal type parameters; for all
-/// other types, callers should pass 0 for both.
+/// The `nullable_type` identifies the null's data type and carries decimal parameters when needed.
+/// Its interval variants identify the interval family without preserving an individual qualifier.
 ///
-/// Returns an error if the type tag is unrecognized, if the tag is `NonPrimitive` (255), or
-/// if the decimal precision/scale is invalid.
+/// Returns an error for [`NullableType::NonPrimitive`] or invalid decimal precision and scale.
 /// # Safety
 ///
 /// `error_allocators` must point to an initialized [`ErrorAllocators`] for this call. Its context
 /// and callbacks must remain valid for the call and support concurrency when shared.
+/// `nullable_type` must be a valid [`NullableType`] value with an initialized active payload.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_expression_literal_null(
     state: &mut KernelExpressionVisitorState,
-    type_tag: u8,
-    precision: u8,
-    scale: u8,
+    nullable_type: NullableType,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let result = visit_expression_literal_null_impl(state, type_tag, precision, scale);
+    let result = visit_expression_literal_null_impl(state, nullable_type);
     unsafe { result.into_extern_result(&*error_allocators) }
 }
 
 fn visit_expression_literal_null_impl(
     state: &mut KernelExpressionVisitorState,
-    type_tag: u8,
-    precision: u8,
-    scale: u8,
+    nullable_type: NullableType,
 ) -> KernelResult<usize> {
-    let tag = NullTypeTag::try_from(type_tag)?;
-    let data_type = tag.to_data_type(precision, scale)?;
+    let data_type = nullable_type.to_data_type()?;
     Ok(wrap_expression(state, null_lit(data_type)))
 }
 
@@ -964,236 +910,171 @@ mod tests {
     }
 
     // ============================================================================
-    // NullTypeTag::from_data_type
+    // NullableType conversion and null construction
     // ============================================================================
 
     #[rstest]
-    #[case(DataType::BOOLEAN, NullTypeTag::Boolean, 0, 0)]
-    #[case(DataType::BYTE, NullTypeTag::Byte, 0, 0)]
-    #[case(DataType::SHORT, NullTypeTag::Short, 0, 0)]
-    #[case(DataType::INTEGER, NullTypeTag::Integer, 0, 0)]
-    #[case(DataType::LONG, NullTypeTag::Long, 0, 0)]
-    #[case(DataType::FLOAT, NullTypeTag::Float, 0, 0)]
-    #[case(DataType::DOUBLE, NullTypeTag::Double, 0, 0)]
-    #[case(DataType::STRING, NullTypeTag::String, 0, 0)]
-    #[case(DataType::BINARY, NullTypeTag::Binary, 0, 0)]
-    #[case(DataType::DATE, NullTypeTag::Date, 0, 0)]
-    #[case(DataType::TIMESTAMP, NullTypeTag::Timestamp, 0, 0)]
-    #[case(DataType::TIMESTAMP_NTZ, NullTypeTag::TimestampNtz, 0, 0)]
-    #[case(DataType::INTERVAL_YEAR_MONTH, NullTypeTag::IntervalYearMonth, 0, 0)]
-    #[case(DataType::INTERVAL_DAY_TIME, NullTypeTag::IntervalDayTime, 0, 0)]
-    #[case(DataType::INTERVAL_DAY, NullTypeTag::IntervalDayTime, 0, 0)]
-    #[case(DataType::INTERVAL_HOUR_MINUTE, NullTypeTag::IntervalDayTime, 0, 0)]
-    fn from_data_type_primitive(
-        #[case] dt: DataType,
-        #[case] expected_tag: NullTypeTag,
-        #[case] expected_precision: u8,
-        #[case] expected_scale: u8,
+    #[case(DataType::BOOLEAN, NullableType::Boolean)]
+    #[case(DataType::BYTE, NullableType::Byte)]
+    #[case(DataType::SHORT, NullableType::Short)]
+    #[case(DataType::INTEGER, NullableType::Integer)]
+    #[case(DataType::LONG, NullableType::Long)]
+    #[case(DataType::FLOAT, NullableType::Float)]
+    #[case(DataType::DOUBLE, NullableType::Double)]
+    #[case(DataType::STRING, NullableType::String)]
+    #[case(DataType::BINARY, NullableType::Binary)]
+    #[case(DataType::DATE, NullableType::Date)]
+    #[case(DataType::TIMESTAMP, NullableType::Timestamp)]
+    #[case(DataType::TIMESTAMP_NTZ, NullableType::TimestampNtz)]
+    #[case(DataType::decimal(18, 5).unwrap(), NullableType::Decimal { precision: 18, scale: 5 })]
+    #[case(
+        DataType::Primitive(PrimitiveType::interval_year_month(
+            IntervalYearToMonthType::IntervalYear
+        )),
+        NullableType::IntervalYearMonth
+    )]
+    #[case(
+        DataType::Primitive(PrimitiveType::interval_year_month(
+            IntervalYearToMonthType::IntervalMonth
+        )),
+        NullableType::IntervalYearMonth
+    )]
+    #[case(
+        DataType::Primitive(PrimitiveType::interval_year_month(
+            IntervalYearToMonthType::IntervalYearToMonth
+        )),
+        NullableType::IntervalYearMonth
+    )]
+    #[case(
+        DataType::Primitive(PrimitiveType::interval_day_time(
+            IntervalDayToSecondType::IntervalDay
+        )),
+        NullableType::IntervalDayTime
+    )]
+    #[case(
+        DataType::Primitive(PrimitiveType::interval_day_time(
+            IntervalDayToSecondType::IntervalHour
+        )),
+        NullableType::IntervalDayTime
+    )]
+    #[case(
+        DataType::Primitive(PrimitiveType::interval_day_time(
+            IntervalDayToSecondType::IntervalMinute
+        )),
+        NullableType::IntervalDayTime
+    )]
+    #[case(
+        DataType::Primitive(PrimitiveType::interval_day_time(
+            IntervalDayToSecondType::IntervalSecond
+        )),
+        NullableType::IntervalDayTime
+    )]
+    #[case(
+        DataType::Primitive(PrimitiveType::interval_day_time(
+            IntervalDayToSecondType::IntervalDayToHour
+        )),
+        NullableType::IntervalDayTime
+    )]
+    #[case(
+        DataType::Primitive(PrimitiveType::interval_day_time(
+            IntervalDayToSecondType::IntervalDayToMinute
+        )),
+        NullableType::IntervalDayTime
+    )]
+    #[case(
+        DataType::Primitive(PrimitiveType::interval_day_time(
+            IntervalDayToSecondType::IntervalDayToSecond
+        )),
+        NullableType::IntervalDayTime
+    )]
+    #[case(
+        DataType::Primitive(PrimitiveType::interval_day_time(
+            IntervalDayToSecondType::IntervalHourToMinute
+        )),
+        NullableType::IntervalDayTime
+    )]
+    #[case(
+        DataType::Primitive(PrimitiveType::interval_day_time(
+            IntervalDayToSecondType::IntervalHourToSecond
+        )),
+        NullableType::IntervalDayTime
+    )]
+    #[case(
+        DataType::Primitive(PrimitiveType::interval_day_time(
+            IntervalDayToSecondType::IntervalMinuteToSecond
+        )),
+        NullableType::IntervalDayTime
+    )]
+    fn nullable_type_maps_to_data_type_family_and_null_expression(
+        #[case] data_type: DataType,
+        #[case] nullable_type: NullableType,
     ) {
-        let (tag, p, s) = NullTypeTag::from_data_type(&dt);
-        assert_eq!(tag, expected_tag);
-        assert_eq!(p, expected_precision);
-        assert_eq!(s, expected_scale);
+        assert_eq!(NullableType::from_data_type(&data_type), nullable_type);
+        let reconstructed_type = match nullable_type {
+            NullableType::IntervalYearMonth => DataType::INTERVAL_YEAR_MONTH,
+            NullableType::IntervalDayTime => DataType::INTERVAL_DAY_TIME,
+            _ => data_type,
+        };
+        assert_eq!(nullable_type.to_data_type().unwrap(), reconstructed_type);
+
+        let mut state = KernelExpressionVisitorState::default();
+        let id = visit_expression_literal_null_impl(&mut state, nullable_type).unwrap();
+        assert_eq!(
+            unwrap_kernel_expression(&mut state, id).unwrap(),
+            null_lit(reconstructed_type)
+        );
     }
 
     #[test]
-    fn from_data_type_decimal() {
-        let dt = DataType::decimal(18, 5).unwrap();
-        let (tag, p, s) = NullTypeTag::from_data_type(&dt);
-        assert_eq!(tag, NullTypeTag::Decimal);
-        assert_eq!(p, 18);
-        assert_eq!(s, 5);
-    }
-
-    #[test]
-    fn from_data_type_non_primitive_produces_sentinel() {
+    fn nullable_type_non_primitive_types_cannot_be_reconstructed() {
         let struct_type = DataType::from(schema! { not_null "a": INTEGER });
-        assert_eq!(
-            NullTypeTag::from_data_type(&struct_type),
-            (NullTypeTag::NonPrimitive, 0, 0)
-        );
-
         let array_type = DataType::from(ArrayType::new(DataType::INTEGER, false));
-        assert_eq!(
-            NullTypeTag::from_data_type(&array_type),
-            (NullTypeTag::NonPrimitive, 0, 0)
-        );
-
         let map_type = DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, false));
-        assert_eq!(
-            NullTypeTag::from_data_type(&map_type),
-            (NullTypeTag::NonPrimitive, 0, 0)
-        );
-
         let variant_type = DataType::unshredded_variant();
-        assert_eq!(
-            NullTypeTag::from_data_type(&variant_type),
-            (NullTypeTag::NonPrimitive, 0, 0)
-        );
-    }
+        let void_type = DataType::Primitive(PrimitiveType::Void);
 
-    // ============================================================================
-    // NullTypeTag::to_data_type
-    // ============================================================================
+        for data_type in [struct_type, array_type, map_type, variant_type, void_type] {
+            assert_eq!(
+                NullableType::from_data_type(&data_type),
+                NullableType::NonPrimitive
+            );
+        }
 
-    #[rstest]
-    #[case(NullTypeTag::Boolean, DataType::BOOLEAN)]
-    #[case(NullTypeTag::Byte, DataType::BYTE)]
-    #[case(NullTypeTag::Short, DataType::SHORT)]
-    #[case(NullTypeTag::Integer, DataType::INTEGER)]
-    #[case(NullTypeTag::Long, DataType::LONG)]
-    #[case(NullTypeTag::Float, DataType::FLOAT)]
-    #[case(NullTypeTag::Double, DataType::DOUBLE)]
-    #[case(NullTypeTag::String, DataType::STRING)]
-    #[case(NullTypeTag::Binary, DataType::BINARY)]
-    #[case(NullTypeTag::Date, DataType::DATE)]
-    #[case(NullTypeTag::Timestamp, DataType::TIMESTAMP)]
-    #[case(NullTypeTag::TimestampNtz, DataType::TIMESTAMP_NTZ)]
-    #[case(NullTypeTag::IntervalYearMonth, DataType::INTERVAL_YEAR_MONTH)]
-    #[case(NullTypeTag::IntervalDayTime, DataType::INTERVAL_DAY_TIME)]
-    fn to_data_type_primitive(#[case] tag: NullTypeTag, #[case] expected: DataType) {
-        assert_eq!(tag.to_data_type(0, 0).unwrap(), expected);
-    }
-
-    #[test]
-    fn interval_year_month_null_tag_reconstructs_full_range() {
-        assert_eq!(
-            NullTypeTag::IntervalYearMonth.to_data_type(0, 0).unwrap(),
-            DataType::INTERVAL_YEAR_MONTH
-        );
-    }
-
-    #[test]
-    fn interval_day_time_null_tag_reconstructs_full_range() {
-        assert_eq!(
-            NullTypeTag::IntervalDayTime.to_data_type(0, 0).unwrap(),
-            DataType::INTERVAL_DAY_TIME
-        );
-    }
-
-    #[test]
-    fn to_data_type_decimal() {
-        let dt = NullTypeTag::Decimal.to_data_type(10, 2).unwrap();
-        assert_eq!(dt, DataType::decimal(10, 2).unwrap());
-    }
-
-    #[test]
-    fn to_data_type_decimal_invalid_precision_returns_error() {
-        assert!(NullTypeTag::Decimal.to_data_type(0, 0).is_err());
-    }
-
-    #[test]
-    fn to_data_type_decimal_scale_exceeds_precision_returns_error() {
-        assert!(NullTypeTag::Decimal.to_data_type(5, 10).is_err());
-    }
-
-    #[test]
-    fn to_data_type_non_primitive_returns_error() {
-        let result = NullTypeTag::NonPrimitive.to_data_type(0, 0);
+        let result = NullableType::NonPrimitive.to_data_type();
         assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("Non-primitive"), "unexpected error: {msg}");
+        assert!(result.unwrap_err().to_string().contains("Non-primitive"));
     }
 
-    // ============================================================================
-    // TryFrom<u8>
-    // ============================================================================
-
-    #[rstest]
-    #[case(0, NullTypeTag::Boolean)]
-    #[case(1, NullTypeTag::Byte)]
-    #[case(2, NullTypeTag::Short)]
-    #[case(3, NullTypeTag::Integer)]
-    #[case(4, NullTypeTag::Long)]
-    #[case(5, NullTypeTag::Float)]
-    #[case(6, NullTypeTag::Double)]
-    #[case(7, NullTypeTag::String)]
-    #[case(8, NullTypeTag::Binary)]
-    #[case(9, NullTypeTag::Date)]
-    #[case(10, NullTypeTag::Timestamp)]
-    #[case(11, NullTypeTag::TimestampNtz)]
-    #[case(12, NullTypeTag::Decimal)]
-    #[case(13, NullTypeTag::IntervalYearMonth)]
-    #[case(14, NullTypeTag::IntervalDayTime)]
-    #[case(255, NullTypeTag::NonPrimitive)]
-    fn try_from_u8_valid(#[case] value: u8, #[case] expected: NullTypeTag) {
-        assert_eq!(NullTypeTag::try_from(value).unwrap(), expected);
-    }
-
-    #[rstest]
-    #[case(15)]
-    #[case(42)]
-    #[case(254)]
-    fn try_from_u8_invalid(#[case] value: u8) {
-        let result = NullTypeTag::try_from(value);
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
+    #[test]
+    fn nullable_type_decimal_rejects_invalid_parameters() {
         assert!(
-            msg.contains("Unrecognized null type tag"),
-            "unexpected error: {msg}"
+            NullableType::Decimal {
+                precision: 0,
+                scale: 0,
+            }
+            .to_data_type()
+            .is_err()
         );
-    }
+        assert!(
+            NullableType::Decimal {
+                precision: 5,
+                scale: 10,
+            }
+            .to_data_type()
+            .is_err()
+        );
 
-    // ============================================================================
-    // visit_expression_literal_null_impl (error paths)
-    // ============================================================================
-
-    #[test]
-    fn visit_null_decimal_invalid_precision_returns_error() {
         let mut state = KernelExpressionVisitorState::default();
-        assert!(visit_expression_literal_null_impl(&mut state, 12, 0, 0).is_err());
-    }
-
-    #[test]
-    fn visit_null_unrecognized_tag_returns_error() {
-        let mut state = KernelExpressionVisitorState::default();
-        assert!(visit_expression_literal_null_impl(&mut state, 15, 0, 0).is_err());
-    }
-
-    #[test]
-    fn visit_null_non_primitive_tag_returns_error() {
-        let mut state = KernelExpressionVisitorState::default();
-        assert!(visit_expression_literal_null_impl(&mut state, 255, 0, 0).is_err());
-    }
-
-    // ============================================================================
-    // Round-trip: from_data_type -> (tag as u8, p, s) -> visit_expression_literal_null_impl
-    // ============================================================================
-
-    #[rstest]
-    #[case(DataType::BOOLEAN)]
-    #[case(DataType::BYTE)]
-    #[case(DataType::SHORT)]
-    #[case(DataType::INTEGER)]
-    #[case(DataType::LONG)]
-    #[case(DataType::FLOAT)]
-    #[case(DataType::DOUBLE)]
-    #[case(DataType::STRING)]
-    #[case(DataType::BINARY)]
-    #[case(DataType::DATE)]
-    #[case(DataType::TIMESTAMP)]
-    #[case(DataType::TIMESTAMP_NTZ)]
-    #[case(DataType::INTERVAL_YEAR_MONTH)]
-    #[case(DataType::INTERVAL_DAY_TIME)]
-    fn null_type_round_trips_through_tag_encoding(#[case] data_type: DataType) {
-        let (tag, precision, scale) = NullTypeTag::from_data_type(&data_type);
-        let mut state = KernelExpressionVisitorState::default();
-        let id =
-            visit_expression_literal_null_impl(&mut state, tag as u8, precision, scale).unwrap();
-        let expr = unwrap_kernel_expression(&mut state, id).unwrap();
-        assert_eq!(expr, null_lit(data_type),);
-    }
-
-    #[test]
-    fn decimal_null_round_trips_through_tag_encoding() {
-        let dt = DataType::decimal(20, 3).unwrap();
-        let (tag, precision, scale) = NullTypeTag::from_data_type(&dt);
-        assert_eq!(tag, NullTypeTag::Decimal);
-        let mut state = KernelExpressionVisitorState::default();
-        let id =
-            visit_expression_literal_null_impl(&mut state, tag as u8, precision, scale).unwrap();
-        let expr = unwrap_kernel_expression(&mut state, id).unwrap();
-        assert_eq!(expr, null_lit(dt));
+        assert!(
+            visit_expression_literal_null_impl(
+                &mut state,
+                NullableType::Decimal {
+                    precision: 0,
+                    scale: 0,
+                }
+            )
+            .is_err()
+        );
     }
 
     #[rstest]

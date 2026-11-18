@@ -872,10 +872,11 @@ The C API signatures do not expose reader state or a cancellation token.
 Domain-metadata reads live in `ffi/src/domain_metadata.rs`: `get_domain_metadata` /
 `visit_domain_metadata` for user domains, and `visit_clustering_columns`, which reports one
 descriptor per clustering column -- logical name, physical name (what per-file stats are keyed on),
-and a type tag -- without exposing the guarded `delta.*` domain JSON directly. It returns
-`OptionalValue<usize>`: `None` means not clustered, `Some(0)` means clustered on no columns. The
-type tag reuses the `visit_expression_literal_null` encoding, with 255 for types that don't fit a
-compact tag (struct, array, map, variant, void, and geometry/geography).
+and a `NullableType` -- without exposing the guarded `delta.*` domain JSON directly. The callback
+uses the same type descriptor as `visit_expression_literal_null`, including decimal parameters and
+the interval family. Interval qualifiers are not preserved by this descriptor.
+`NullableType::NonPrimitive` marks types that need a schema visitor for their full details. It
+returns `OptionalValue<usize>`: `None` means not clustered, `Some(0)` means clustered on no columns.
 
 ## Commit Range Flow
 
