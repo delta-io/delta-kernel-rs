@@ -12,11 +12,14 @@ use delta_kernel::crc::Crc;
 use delta_kernel::engine::{DelegatingEngine, PanicEngine};
 use delta_kernel::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
 use delta_kernel::log_segment::LogSegment;
+use delta_kernel::metrics::{MetricEvent, SnapshotLoadType};
 use delta_kernel::path::{LogPathFileType, ParsedLogPath};
 use delta_kernel::snapshot::{IncrementalReplay, PublicationWatermark, Snapshot};
 use delta_kernel::{FileMeta, FileSlice, KernelResult, KernelResultIterator, StorageHandler};
 use test_utils::table_builder::{LogState, TestTableBuilder};
-use test_utils::{TestCatalogCommitter, compacted_log_path_for_versions, create_log_path};
+use test_utils::{
+    CapturingReporter, TestCatalogCommitter, compacted_log_path_for_versions, create_log_path,
+};
 use url::Url;
 
 use super::*;
@@ -24,15 +27,16 @@ use crate::delta_types::*;
 use crate::error::FFIKernelError;
 use crate::ffi_test_utils::{
     TEST_ERROR_ALLOCATORS, assert_extern_result_error_contains,
-    assert_extern_result_error_with_message, ok_or_panic,
+    assert_extern_result_error_with_message, install_thread_local_metrics_reporter, ok_or_panic,
 };
 use crate::log_path::FfiLogPath;
 use crate::{
     FfiFileStats, FfiIncrementalReplay, FfiLogSegmentStats, KernelI64Slice, KernelStringSlice,
     OptionalValue, SharedExternEngine, engine_to_handle, free_engine, free_snapshot,
     get_snapshot_builder, get_snapshot_builder_from, snapshot_builder_build,
-    snapshot_builder_with_incremental_crc_replay, snapshot_builder_with_max_catalog_version,
-    snapshot_builder_with_version, snapshot_log_segment_stats,
+    snapshot_builder_with_correlation_id, snapshot_builder_with_incremental_crc_replay,
+    snapshot_builder_with_max_catalog_version, snapshot_builder_with_version,
+    snapshot_log_segment_stats,
 };
 
 fn slice(value: &'static str) -> KernelStringSlice {
@@ -288,6 +292,38 @@ unsafe fn with_minimal_hint(
     unsafe { ok_or_panic(snapshot_builder_with_snapshot_hint(builder, &hint)) }
 }
 
+#[test]
+fn snapshot_hint_build_preserves_correlation_id() {
+    let engine = test_engine();
+    let builder = unsafe {
+        ok_or_panic(snapshot_builder_with_correlation_id(
+            with_minimal_hint(test_builder(&engine)),
+            slice("hint-request"),
+        ))
+    };
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+    let completions: Vec<_> = reporter
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            MetricEvent::SnapshotBuildSuccess(event) => Some(event),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0].load_type, SnapshotLoadType::SnapshotHint);
+    assert_eq!(
+        completions[0].correlation_id.as_deref(),
+        Some("hint-request")
+    );
+    unsafe {
+        free_snapshot(snapshot);
+        free_engine(engine);
+    }
+}
+
 fn read_snapshot_metadata(snapshot: &Handle<SharedSnapshot>) -> Metadata {
     extern "C" fn collect(context: NullableCvoid, metadata: *const FfiMetadata) {
         let result = unsafe {
@@ -417,7 +453,7 @@ extern "C" fn count_hint_visits(context: NullableCvoid, _hint: *const FfiSnapsho
 }
 
 #[test]
-fn snapshot_hint_export_rejects_compaction_without_calling_visitor() {
+fn snapshot_hint_export_round_trips_compaction_paths() {
     let engine = test_engine();
     let paths = [
         FfiLogPath::new(
@@ -462,26 +498,8 @@ fn snapshot_hint_export_rejects_compaction_without_calling_visitor() {
     let snapshot: Handle<SharedSnapshot> = Arc::new(snapshot).into();
     unsafe { free_snapshot(source) };
 
-    let mut visits = 0usize;
-    let result = unsafe {
-        snapshot_to_snapshot_hint(
-            snapshot.shallow_copy(),
-            engine.shallow_copy(),
-            Some(NonNull::from(&mut visits).cast()),
-            count_hint_visits,
-        )
-    };
-    assert_extern_result_error_contains(
-        result,
-        FFIKernelError::InvalidSnapshotHint,
-        "log compaction",
-    );
-    assert_eq!(visits, 0);
-    assert_eq!(unsafe { snapshot.as_ref() }.version(), 1);
-    unsafe {
-        free_snapshot(snapshot);
-        free_engine(engine);
-    }
+    assert_exported_paths_and_round_trip(snapshot);
+    unsafe { free_engine(engine) };
 }
 
 struct CopiedHintPaths {
@@ -513,6 +531,7 @@ fn assert_exported_paths_and_round_trip(snapshot: Handle<SharedSnapshot>) {
         .checkpoint_parts
         .iter()
         .chain(&files.ascending_commit_files)
+        .chain(&files.ascending_compaction_files)
         .chain(files.latest_commit_file.iter())
         .chain(files.latest_crc_file.iter())
         .map(|path| {
@@ -1573,12 +1592,9 @@ fn aggregate_with_log_compaction_requires_individual_commits(#[case] complete: b
     let source = unsafe { snapshot.as_ref() };
     assert_eq!(source.version(), 1);
     assert_eq!(source.log_segment().listed.ascending_commit_files.len(), 2);
-    assert!(
-        source
-            .log_segment()
-            .listed
-            .ascending_compaction_files
-            .is_empty()
+    assert_eq!(
+        source.log_segment().listed.ascending_compaction_files.len(),
+        1
     );
     assert_eq!(
         unsafe {

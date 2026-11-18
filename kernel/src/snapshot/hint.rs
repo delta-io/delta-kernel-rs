@@ -15,7 +15,7 @@ use crate::path::{DELTA_LOG_DIR_WITH_SLASH, ParsedLogPath};
 use crate::snapshot::{IncrementalReplay, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::{require, try_parse_uri};
-use crate::{KernelError, KernelResult, Snapshot, Version};
+use crate::{KernelError, KernelResult, Result, Snapshot, Version};
 
 /// The freshness claim for the version carried by a [`SnapshotHint`].
 ///
@@ -111,8 +111,8 @@ impl SnapshotHint {
     /// Returns an error if `table_root` is invalid,
     /// [`SnapshotHintError::LogPathOutsideRoot`] if any path is outside `table_root`'s `_delta_log`
     /// root. Returns an error when the supplied paths cannot be grouped into a valid log-segment
-    /// file set. Compacted paths are ignored, as in storage listing; callers must also supply the
-    /// individual commits required for replay.
+    /// file set. Compacted paths are retained; callers must also supply the individual commits
+    /// required for replay.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
@@ -227,10 +227,6 @@ impl SnapshotHint {
 
     pub(crate) fn from_snapshot(snapshot: &Snapshot) -> KernelResult<Self> {
         let segment = snapshot.log_segment();
-        require!(
-            segment.listed.ascending_compaction_files.is_empty(),
-            SnapshotHintError::LogCompaction.into()
-        );
         let last_checkpoint_hint = segment.checkpoint_hint();
         #[cfg(feature = "declarative-plans")]
         let last_checkpoint_hint = snapshot
@@ -263,28 +259,31 @@ impl SnapshotHint {
         log_tail: Vec<LogPath>,
         max_catalog_version: Option<Version>,
         incremental_replay: IncrementalReplay,
-    ) -> KernelResult<SnapshotRef> {
-        require!(log_tail.is_empty(), SnapshotHintError::LogTail.into());
+    ) -> Result<SnapshotRef> {
+        require!(
+            log_tail.is_empty(),
+            KernelError::from(SnapshotHintError::LogTail).into()
+        );
         require!(
             incremental_replay.is_disabled(),
-            SnapshotHintError::IncrementalReplay.into()
+            KernelError::from(SnapshotHintError::IncrementalReplay).into()
         );
         if let Some(version) = requested_version {
             require!(
                 version == self.version,
-                SnapshotHintError::VersionMismatch {
+                KernelError::from(SnapshotHintError::VersionMismatch {
                     requested: version,
                     hint: self.version,
-                }
+                })
                 .into()
             );
         } else if let Some(max_catalog_version) = max_catalog_version {
             require!(
                 max_catalog_version == self.version,
-                SnapshotHintError::MaxCatalogVersionMismatch {
+                KernelError::from(SnapshotHintError::MaxCatalogVersionMismatch {
                     max_catalog_version,
                     hint: self.version,
-                }
+                })
                 .into()
             );
         }
@@ -295,7 +294,9 @@ impl SnapshotHint {
             )
         })?;
         let table_url = try_parse_uri(table_root)?;
-        let log_root = table_url.join(DELTA_LOG_DIR_WITH_SLASH)?;
+        let log_root = table_url
+            .join(DELTA_LOG_DIR_WITH_SLASH)
+            .map_err(KernelError::from)?;
         let SnapshotHint {
             version,
             log_segment_files,
@@ -320,11 +321,6 @@ impl SnapshotHint {
             latest_commit_version,
         )?;
 
-        require!(
-            log_segment_files.ascending_compaction_files.is_empty(),
-            SnapshotHintError::LogCompaction.into()
-        );
-
         // Construction validates every path against one root, and grouping preserves locations.
         // One retained path suffices to reject a hint attached to a different table's builder.
         // LogSegment::try_new below rejects empty replay history.
@@ -337,7 +333,8 @@ impl SnapshotHint {
         )
         .map_err(|source| SnapshotHintError::LogSegment {
             source: Box::new(source),
-        })?;
+        })
+        .map_err(KernelError::from)?;
         // Regular construction derives this field from storage listing. A hint supplies it, so
         // only the hint path needs to validate it explicitly.
         require!(
@@ -345,7 +342,7 @@ impl SnapshotHint {
                 .listed
                 .max_published_version
                 .is_none_or(|published_version| published_version <= version),
-            SnapshotHintError::MaxPublishedVersion { hint: version }.into()
+            KernelError::from(SnapshotHintError::MaxPublishedVersion { hint: version }).into()
         );
         require!(
             log_segment.checkpoint_version.is_some()
@@ -354,26 +351,26 @@ impl SnapshotHint {
                     .ascending_commit_files
                     .first()
                     .is_some_and(|path| path.version == 0),
-            SnapshotHintError::MissingHistoryAnchor.into()
+            KernelError::from(SnapshotHintError::MissingHistoryAnchor).into()
         );
         let table_configuration =
             TableConfiguration::try_new(metadata, protocol, table_url, version)?;
         if let Some(crc) = crc.as_ref() {
             require!(
                 crc.version == version,
-                SnapshotHintError::CrcVersion {
+                KernelError::from(SnapshotHintError::CrcVersion {
                     crc: crc.version,
                     hint: version,
-                }
+                })
                 .into()
             );
             require!(
                 crc.protocol == *table_configuration.protocol(),
-                SnapshotHintError::CrcProtocol.into()
+                KernelError::from(SnapshotHintError::CrcProtocol).into()
             );
             require!(
                 crc.metadata == *table_configuration.metadata(),
-                SnapshotHintError::CrcMetadata.into()
+                KernelError::from(SnapshotHintError::CrcMetadata).into()
             );
         }
 
@@ -634,7 +631,7 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn snapshot_to_hint_rejects_log_compaction()
+    async fn snapshot_to_hint_preserves_log_compaction()
     -> KernelResult<(), Box<dyn std::error::Error>> {
         let (_engine, table_root, snapshot, mut hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
@@ -656,11 +653,11 @@ mod tests {
             false,
             false,
         )?;
-        assert!(matches!(
-            snapshot.to_snapshot_hint(),
-            Err(KernelError::SnapshotHint(source))
-                if matches!(*source, SnapshotHintError::LogCompaction)
-        ));
+        let exported = snapshot.to_snapshot_hint()?;
+        assert_eq!(
+            exported.log_segment_files.ascending_compaction_files,
+            snapshot.log_segment().listed.ascending_compaction_files,
+        );
         Ok(())
     }
 
@@ -737,7 +734,7 @@ mod tests {
                 .collect_vec(),
             vec![0, 1]
         );
-        assert!(hint.log_segment_files.ascending_compaction_files.is_empty());
+        assert_eq!(hint.log_segment_files.ascending_compaction_files.len(), 1);
     }
 
     #[test]
@@ -1365,12 +1362,10 @@ mod tests {
             .push(create_log_path(
                 "memory:///_delta_log/00000000000000000000.00000000000000000001.compacted.json",
             ));
-        assert_hint_error(
-            SnapshotBuilder::new_for(&table_root),
-            compacted,
-            engine.as_ref(),
-            "log compaction files are not supported",
-        );
+        let rebuilt = SnapshotBuilder::new_for(&table_root)
+            .with_snapshot_hint(compacted)
+            .build(engine.as_ref())?;
+        assert_eq!(rebuilt.version(), hint.version);
 
         let mut incompatible = hint;
         incompatible.metadata = incompatible

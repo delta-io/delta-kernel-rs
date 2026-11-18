@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
-use tracing::{debug, info, instrument, trace, warn};
+use tracing::{debug, info, instrument, warn};
 use url::Url;
 
 use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -307,8 +307,6 @@ struct ListingAccumulator {
     /// ends
     pending_checkpoint_parts: Vec<ParsedLogPath>,
     /// End-version bound used in process_file() to filter CompactedCommit files
-    // TODO(#2337): remove allow(dead_code) when log compaction is re-enabled
-    #[allow(dead_code)]
     end_version: Option<Version>,
     /// The version of the current group being accumulated
     group_version: Option<Version>,
@@ -322,17 +320,10 @@ impl ListingAccumulator {
         }
         match file.file_type {
             Commit | StagedCommit => self.output.ascending_commit_files.push(file),
-            // TODO(#2337): re-enable log compaction once testing is sufficient
-            // CompactedCommit { hi } if self.end_version.is_none_or(|end| hi <= end) => {
-            //     self.output.ascending_compaction_files.push(file);
-            // }
-            // CompactedCommit { .. } => (), // Failed the bounds check above
-            CompactedCommit { .. } => {
-                trace!(
-                    "Skipping unsupported log compaction file: {:?}",
-                    file.location
-                );
+            CompactedCommit { hi } if self.end_version.is_none_or(|end| hi <= end) => {
+                self.output.ascending_compaction_files.push(file);
             }
+            CompactedCommit { .. } => (), // Failed the bounds check above
             ClassicCheckpoint | UuidCheckpoint | MultiPartCheckpoint { .. } => {
                 self.pending_checkpoint_parts.push(file)
             }

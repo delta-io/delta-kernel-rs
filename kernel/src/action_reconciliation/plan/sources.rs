@@ -86,16 +86,20 @@ pub(crate) fn crc_arm(
 
 /// Build the commit JSON source with file versions in `version`.
 /// When `base_version` is set, only commits newer than that base are read.
+///
+/// Compaction actions carry the range's start version, not their original commit versions.
+/// Callers that need original commit versions must set `use_compactions` to false.
 pub(crate) fn commit_arm(
     log_segment: &LogSegment,
     base_version: Option<Version>,
     schema: SchemaRef,
+    use_compactions: bool,
 ) -> KernelResult<PlanBuilder> {
     let commit_files = match base_version {
         Some(version) => log_segment
             .segment_after_version(version)
-            .commit_cover_version_tagged_scan_files()?,
-        None => log_segment.commit_cover_version_tagged_scan_files()?,
+            .commit_cover_version_tagged_scan_files(use_compactions)?,
+        None => log_segment.commit_cover_version_tagged_scan_files(use_compactions)?,
     };
     PlanBuilder::scan_json(commit_files, &[VERSION], schema)
 }
@@ -155,7 +159,7 @@ mod tests {
             }), false),
         )]
         checkpoint: (CheckpointSpec, bool),
-    ) -> KernelResult<()> {
+    ) -> crate::Result<()> {
         // Given: a checkpoint containing file actions, tombstones, and non-file actions.
         let (spec, use_sidecar_hint) = checkpoint;
         let mut features = FeatureSet::new().domain_metadata();
@@ -275,12 +279,16 @@ mod tests {
             .flatten();
 
         // When: selected checkpoint actions are planned from the same resolved shape.
-        let plan = MetadataPlanner::new(snapshot.log_segment(), actions)
-            .with_stats(StatsOptions::json_only())
-            .with_checkpoint_shape(checkpoint_shape)
-            .checkpoint_actions()?
-            .project_patch(|patch| patch.drop(ACTION_KEY))?
-            .build()?;
+        let plan = MetadataPlanner::new(
+            snapshot.log_segment(),
+            actions,
+            !snapshot.has_adaptive_metadata(),
+        )
+        .with_stats(StatsOptions::json_only())
+        .with_checkpoint_shape(checkpoint_shape)
+        .checkpoint_actions()?
+        .project_patch(|patch| patch.drop(ACTION_KEY))?
+        .build()?;
         // Then: file-action reads always use a complete static sidecar list.
         assert!(
             plan.nodes
@@ -295,7 +303,9 @@ mod tests {
             names.iter().copied().chain([VERSION]).collect::<Vec<_>>(),
         );
         let actual = execute_plan(&engine, plan)?;
-        let expected = pretty_format_batches(&expected)?.to_string();
+        let expected = pretty_format_batches(&expected)
+            .map_err(KernelError::from)?
+            .to_string();
         let mut expected = expected.trim().lines().collect::<Vec<_>>();
         ::test_utils::sort_lines!(expected);
         assert_batches_sorted_eq!(expected, &actual);

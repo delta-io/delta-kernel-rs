@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
 
-use crate::KernelResult;
 use crate::error::KernelError;
 use crate::expressions::ColumnName;
 use crate::schema::validation::validate_schema;
@@ -20,6 +19,7 @@ use crate::table_features::{
 use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
 use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::utils::FoldWithOption as _;
+use crate::{KernelResult, Result};
 
 /// A schema evolution operation to be applied to a table.
 ///
@@ -258,7 +258,7 @@ pub(crate) fn apply_schema_operations(
 pub(crate) fn evolve_table_config(
     table_config: &TableConfiguration,
     operations: Vec<SchemaOperation>,
-) -> KernelResult<TableConfiguration> {
+) -> Result<TableConfiguration> {
     let schema = Arc::unwrap_or_clone(table_config.logical_schema());
     let column_mapping_mode = table_config.column_mapping_mode();
     let current_max_column_id = table_config.table_properties().column_mapping_max_column_id;

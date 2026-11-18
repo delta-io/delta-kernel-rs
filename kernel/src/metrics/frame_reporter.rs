@@ -93,6 +93,10 @@ mod tests {
     use super::*;
     use crate::Snapshot;
     use crate::engine::sync::SyncEngine;
+    use crate::history_manager::{
+        HistoryCommitType, first_version_after, get_earliest_commit, latest_version_as_of,
+        timestamp_range_to_versions,
+    };
     use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
     use crate::unit_test_utils::{copy_test_table, load_test_table};
 
@@ -343,6 +347,102 @@ mod tests {
                 "log_seg.load_p_m",
             ],
         );
+    }
+
+    #[rstest::rstest]
+    fn history_lookups_report_balanced_frames(#[values(false, true)] fail: bool) {
+        let events = capture(|| {
+            let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small").unwrap();
+            assert_eq!(
+                latest_version_as_of(
+                    &snapshot,
+                    engine.as_ref(),
+                    if fail { i64::MIN } else { i64::MAX },
+                    HistoryCommitType::Published,
+                )
+                .is_err(),
+                fail,
+            );
+            assert_eq!(
+                first_version_after(
+                    &snapshot,
+                    engine.as_ref(),
+                    if fail { i64::MAX } else { 0 },
+                    HistoryCommitType::Published,
+                )
+                .is_err(),
+                fail,
+            );
+            let log_root = snapshot
+                .table_root()
+                .join(if fail { "missing_log/" } else { "_delta_log/" })
+                .unwrap();
+            assert_eq!(
+                get_earliest_commit(
+                    engine.as_ref(),
+                    &log_root,
+                    None,
+                    HistoryCommitType::Published
+                )
+                .is_err(),
+                fail,
+            );
+        });
+        let callstacks = entered_callstacks(&events);
+        for name in [
+            "latest_version_as_of",
+            "first_version_after",
+            "get_earliest_commit",
+        ] {
+            assert_contains_callstack(&callstacks, &[name]);
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::bounded_success(
+        0,
+        Some(i64::MAX),
+        false,
+        &["first_version_after", "latest_version_as_of"]
+    )]
+    #[case::unbounded_success(0, None, false, &["first_version_after"])]
+    #[case::start_lookup_failure(i64::MAX, Some(i64::MAX), true, &["first_version_after"])]
+    #[case::end_lookup_failure(
+        i64::MIN,
+        Some(i64::MIN),
+        true,
+        &["first_version_after", "latest_version_as_of"]
+    )]
+    #[case::invalid_range(1, Some(0), true, &[])]
+    fn timestamp_range_lookup_reports_nested_balanced_frames(
+        #[case] start_timestamp: i64,
+        #[case] end_timestamp: Option<i64>,
+        #[case] fail: bool,
+        #[case] expected_children: &[&str],
+    ) {
+        let events = capture(|| {
+            let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small").unwrap();
+            assert_eq!(
+                timestamp_range_to_versions(
+                    &snapshot,
+                    engine.as_ref(),
+                    start_timestamp,
+                    end_timestamp,
+                )
+                .is_err(),
+                fail,
+            );
+        });
+        let callstacks = entered_callstacks(&events);
+        assert_contains_callstack(&callstacks, &["timestamp_range_to_versions"]);
+        let children: Vec<_> = callstacks
+            .iter()
+            .filter_map(|stack| match stack.as_slice() {
+                ["timestamp_range_to_versions", child] => Some(*child),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(children, expected_children);
     }
 
     #[test]

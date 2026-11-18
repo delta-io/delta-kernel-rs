@@ -93,11 +93,11 @@ fn stage_one_file(txn: &mut Transaction) -> KernelResult<()> {
 }
 
 /// Asserts `result` failed with the acknowledgement gate error.
-fn assert_gate_error<T: std::fmt::Debug>(result: KernelResult<T>) {
+fn assert_gate_error<T: std::fmt::Debug>(result: delta_kernel::Result<T>) {
     let err = result.expect_err("acknowledgement gate must reject this operation");
     let is_gate_error = matches!(
         &err,
-        KernelError::InvalidTransactionState(msg) if msg.contains("ack_generated_columns")
+        delta_kernel::Error::Kernel(KernelError::InvalidTransactionState(msg)) if msg.contains("ack_generated_columns")
     );
     assert!(
         is_gate_error,
@@ -177,7 +177,7 @@ async fn column_mapped_and_partitioned_tables_return_logical_names_and_require_a
     assert_eq!(from_snapshot, EVENT_YEAR);
 
     let txn = begin_transaction(snapshot, engine.as_ref())?;
-    assert_gate_error(txn.write_state());
+    assert_gate_error(txn.write_state().map_err(Into::into));
     Ok(())
 }
 
@@ -238,7 +238,9 @@ async fn write_state_and_commits_require_ack_only_on_tables_with_generated_colum
         GatedOp::MetadataOnlyCommit | GatedOp::WriteState => {}
     }
     let result = if op == GatedOp::WriteState {
-        txn.write_state().map(|_write_state| ())
+        txn.write_state()
+            .map(|_write_state| ())
+            .map_err(delta_kernel::Error::from)
     } else {
         txn.commit(engine.as_ref()).map(|committed| {
             let _committed = committed.unwrap_committed();
@@ -337,7 +339,7 @@ async fn schema_changes_fail_only_on_tables_with_generated_columns(
 
     if lists_feature && has_expression {
         let expected = "Schema changes are not yet supported on tables with generated columns";
-        let rejected = matches!(&result, Err(KernelError::Unsupported(msg)) if msg == expected);
+        let rejected = matches!(&result, Err(delta_kernel::Error::Kernel(KernelError::Unsupported(msg))) if msg == expected);
         assert!(rejected);
     } else {
         let _txn = result?;
@@ -383,7 +385,7 @@ async fn adding_a_column_with_a_generation_expression_fails(
     );
 
     let key = ColumnMetadataKey::GenerationExpression.as_ref();
-    let rejected = matches!(&result, Err(KernelError::Schema(msg)) if msg.contains(key));
+    let rejected = matches!(&result, Err(delta_kernel::Error::Kernel(KernelError::Schema(msg))) if msg.contains(key));
     assert!(rejected);
     Ok(())
 }

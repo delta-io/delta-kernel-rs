@@ -56,21 +56,15 @@ pub(crate) mod variant_utils;
 pub(crate) mod void_utils;
 
 /// Prefix of the error message the schema deserializers emit for an unsupported type.
-const UNSUPPORTED_DELTA_TYPE_ERROR_PREFIX: &str = "Unsupported Delta table type";
+pub(crate) const UNSUPPORTED_DELTA_TYPE_ERROR_PREFIX: &str = "Unsupported Delta table type";
 
-/// Builds the serde custom error for a Delta type the kernel does not support. Pairs with
-/// [`is_unsupported_delta_type_error`] for detecting whether a serde error is this kind.
+/// Prefix of the schema error for case-insensitive duplicate logical field names.
+pub(crate) const DUPLICATE_FIELD_NAME_ERROR_PREFIX: &str =
+    "Duplicate field name (case-insensitive)";
+
+/// Builds the serde custom error for a Delta type the kernel does not support.
 fn unsupported_delta_type_error<E: serde::de::Error>(name: &str) -> E {
     E::custom(format!("{UNSUPPORTED_DELTA_TYPE_ERROR_PREFIX}: '{name}'"))
-}
-
-/// Returns `true` if `error` is the "unsupported Delta type" failure produced by
-/// `unsupported_delta_type_error`.
-pub(crate) fn is_unsupported_delta_type_error(error: &serde_json::Error) -> bool {
-    error.is_data()
-        && error
-            .to_string()
-            .starts_with(UNSUPPORTED_DELTA_TYPE_ERROR_PREFIX)
 }
 
 pub type Schema = StructType;
@@ -982,7 +976,7 @@ impl StructType {
             let key = field.name.to_lowercase();
             if !seen_lowercase_names.insert(key) {
                 return Err(KernelError::schema(format!(
-                    "Duplicate field name (case-insensitive): '{}'",
+                    "{DUPLICATE_FIELD_NAME_ERROR_PREFIX}: '{}'",
                     field.name
                 )));
             }
@@ -3417,6 +3411,36 @@ mod tests {
                     "delta.identity.start": 2147483648
                 }
             }"#
+    }
+
+    /// A `file` array element or map value is serialized as the bare string `"file"`, like a
+    /// top-level `file` field and like `"variant"`. The RFC defines `file` as "serialized with a
+    /// single type-name string", and a schema type that is an object is an array, map or struct
+    /// type, so `{"type": "file"}` is not parsed. Spark and Kernel-Java parse schemas the same way.
+    /// The RFC's schema example shows the object form for an array element, which this test does
+    /// not follow.
+    #[test]
+    fn test_serde_file_in_array_and_map() {
+        let array: DataType = ArrayType::new(DataType::file_type(), true).into();
+        let json = r#"{"type":"array","elementType":"file","containsNull":true}"#;
+        assert_eq!(serde_json::to_string(&array).unwrap(), json);
+        assert_eq!(serde_json::from_str::<DataType>(json).unwrap(), array);
+
+        let map: DataType = MapType::new(DataType::STRING, DataType::file_type(), true).into();
+        let json =
+            r#"{"type":"map","keyType":"string","valueType":"file","valueContainsNull":true}"#;
+        assert_eq!(serde_json::to_string(&map).unwrap(), json);
+        assert_eq!(serde_json::from_str::<DataType>(json).unwrap(), map);
+
+        for json in [
+            r#"{"type":"file"}"#,
+            r#"{"type":"array","elementType":{"type":"file"},"containsNull":true}"#,
+        ] {
+            let err = serde_json::from_str::<DataType>(json)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("'file'"), "{json}: {err}");
+        }
     }
 
     #[test]

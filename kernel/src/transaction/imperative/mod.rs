@@ -49,7 +49,7 @@ use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::{
     DataType, Engine, EngineData, Expression, ExpressionEvaluator, KernelResult,
-    KernelResultIterator, RowVisitor, Version, create_row, version_as_i64,
+    KernelResultIterator, Result, RowVisitor, Version, create_row, version_as_i64,
 };
 
 mod update_table;
@@ -100,7 +100,7 @@ impl<STATE> Transaction<STATE, Imperative> {
         ),
         err
     )]
-    pub fn commit(self, engine: &dyn Engine) -> KernelResult<CommitResult<STATE>> {
+    pub fn commit(self, engine: &dyn Engine) -> Result<CommitResult<STATE>> {
         let commit_start = Instant::now();
 
         // === Pre-commit validation ===
@@ -223,7 +223,7 @@ impl<STATE> Transaction<STATE, Imperative> {
         post_commit_inputs: PostCommitInputs,
         prepare_duration: Duration,
         committer_duration: Duration,
-    ) -> KernelResult<CommitResult<STATE>> {
+    ) -> Result<CommitResult<STATE>> {
         match commit_response {
             Ok(CommitResponse::Committed { file_meta }) => {
                 let PostCommitInputs {
@@ -271,7 +271,7 @@ impl<STATE> Transaction<STATE, Imperative> {
                     .record("failure_reason", CommitFailureReason::RetryableIo.as_ref());
                 Ok(CommitResult::Retryable(self.into_retryable(e)))
             }
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -870,7 +870,9 @@ mod tests {
     use crate::transaction::create_table::create_table;
     use crate::transaction::operation::UpdateTableOperation;
     use crate::unit_test_utils::{copy_test_table, create_valid_add_file_batch, test_schema_flat};
-    use crate::{EvaluationHandler, ExpressionEvaluator, PredicateEvaluator, Result, Snapshot};
+    use crate::{
+        EvaluationHandler, ExpressionEvaluator, KernelError, PredicateEvaluator, Result, Snapshot,
+    };
 
     impl Transaction {
         /// Set clustering columns for testing purposes without needing a table
@@ -1097,7 +1099,7 @@ mod tests {
         DeletionVectorUpdate,
     }
 
-    fn set_append_only(txn: &mut Transaction, enabled: bool) -> KernelResult<()> {
+    fn set_append_only(txn: &mut Transaction, enabled: bool) -> Result<()> {
         let metadata = txn
             .effective_table_config
             .metadata()
@@ -1180,8 +1182,8 @@ mod tests {
     #[rstest]
     fn create_table_add_actions_preserve_data_change(
         #[values(false, true)] data_change: bool,
-    ) -> KernelResult<()> {
-        let tempdir = tempfile::tempdir()?;
+    ) -> Result<()> {
+        let tempdir = tempfile::tempdir().map_err(KernelError::from)?;
         let engine = SyncEngine::new();
         let mut transaction = create_table(
             tempdir.path().to_string_lossy(),

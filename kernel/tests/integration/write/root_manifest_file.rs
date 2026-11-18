@@ -7,7 +7,7 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{DataType, StructField, schema_ref};
 use delta_kernel::snapshot::{Snapshot, SnapshotRef};
 use delta_kernel::transaction::{Transaction, UpdateTableOperation, UpdateTableTransactionBuilder};
-use delta_kernel::{Engine, FileMeta, KernelError, KernelResult};
+use delta_kernel::{Engine, FileMeta, KernelError, Result};
 use rstest::rstest;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -36,7 +36,8 @@ const WRITER_FEATURES: &[&str] = &[
 /// for the table's lifetime.
 async fn setup_adaptive_metadata_table(
     table_name: &str,
-) -> Result<(impl Engine + use<>, TempDir, Url, SnapshotRef), Box<dyn std::error::Error>> {
+) -> std::result::Result<(impl Engine + use<>, TempDir, Url, SnapshotRef), Box<dyn std::error::Error>>
+{
     let temp_dir = tempfile::tempdir()?;
     let dir_url = Url::from_directory_path(temp_dir.path()).expect("valid directory url");
     let (store, engine, table_url) = engine_store_setup(table_name, Some(&dir_url));
@@ -60,7 +61,7 @@ async fn setup_adaptive_metadata_table(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_with_root_manifest_file_produces_a_self_contained_checkpoint_action()
--> Result<(), Box<dyn std::error::Error>> {
+-> std::result::Result<(), Box<dyn std::error::Error>> {
     let (engine, _temp_dir, table_url, snapshot) =
         setup_adaptive_metadata_table("root_manifest_file_checkpoint").await?;
 
@@ -119,7 +120,8 @@ async fn test_with_root_manifest_file_produces_a_self_contained_checkpoint_actio
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn alter_table_commit_rejects_root_manifest() -> Result<(), Box<dyn std::error::Error>> {
+async fn alter_table_commit_rejects_root_manifest()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
     let (engine, _temp_dir, table_url, before) =
         setup_adaptive_metadata_table("alter_table_root_manifest").await?;
     let file = FileMeta {
@@ -136,7 +138,7 @@ async fn alter_table_commit_rejects_root_manifest() -> Result<(), Box<dyn std::e
 
     let error = txn.commit(&engine).unwrap_err();
     assert!(
-        matches!(&error, KernelError::InvalidTransactionState(message)
+        matches!(&error, delta_kernel::Error::Kernel(KernelError::InvalidTransactionState(message))
         if message == "ALTER TABLE cannot include manifest writes")
     );
     let fresh = Snapshot::builder_for(table_url).build(&engine)?;
@@ -147,7 +149,7 @@ async fn alter_table_commit_rejects_root_manifest() -> Result<(), Box<dyn std::e
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_with_root_manifest_file_merges_domain_metadata_and_transactions()
--> Result<(), Box<dyn std::error::Error>> {
+-> std::result::Result<(), Box<dyn std::error::Error>> {
     let (engine, _temp_dir, table_url, snapshot) =
         setup_adaptive_metadata_table("root_manifest_file_merge").await?;
 
@@ -221,7 +223,7 @@ async fn test_with_root_manifest_file_merges_domain_metadata_and_transactions()
 
 #[tokio::test]
 async fn test_with_root_manifest_file_requires_the_feature()
--> Result<(), Box<dyn std::error::Error>> {
+-> std::result::Result<(), Box<dyn std::error::Error>> {
     let (store, engine, table_url) = engine_store_setup("root_manifest_file_no_feature", None);
     let schema = schema_ref! { nullable "id": INTEGER };
     create_table(store, table_url.clone(), schema, &[], true, vec![], vec![]).await?;
@@ -241,7 +243,10 @@ async fn test_with_root_manifest_file_requires_the_feature()
 }
 
 /// Returns the single `commitInfo` action written at `version`.
-fn commit_info_at(table_url: &Url, version: u64) -> Result<Value, Box<dyn std::error::Error>> {
+fn commit_info_at(
+    table_url: &Url,
+    version: u64,
+) -> std::result::Result<Value, Box<dyn std::error::Error>> {
     let mut commit_infos = read_actions_from_commit(table_url, version, "commitInfo")?;
     assert_eq!(
         commit_infos.len(),
@@ -255,7 +260,7 @@ fn begin_with_data_change(
     snapshot: SnapshotRef,
     engine: &dyn Engine,
     data_change: bool,
-) -> KernelResult<Transaction> {
+) -> Result<Transaction> {
     begin_transaction_with(
         snapshot,
         engine,
@@ -272,7 +277,7 @@ fn begin_with_data_change(
 async fn test_commit_info_data_change(
     #[values(false, true)] data_change: bool,
     #[values(false, true)] root_manifest: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (engine, _temp_dir, table_url, snapshot) =
         setup_adaptive_metadata_table("commit_info_data_change").await?;
 
@@ -307,12 +312,12 @@ async fn test_commit_info_data_change(
 async fn test_commit_info_records_data_change_and_last_manifest_commit(
     #[values(true, false)] data_change: bool,
     #[values(true, false)] crc_at_read_version: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (engine, _temp_dir, table_url, snapshot) =
         setup_adaptive_metadata_table("commit_info_last_manifest_commit").await?;
     let assert_commit_info = |version: u64,
                               expected_last_manifest_commit: &Value|
-     -> Result<(), Box<dyn std::error::Error>> {
+     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let commit_info = commit_info_at(&table_url, version)?;
         assert_eq!(commit_info["dataChange"], json!(data_change));
         assert_eq!(
@@ -324,7 +329,9 @@ async fn test_commit_info_records_data_change_and_last_manifest_commit(
         Ok(())
     };
     let commit_root_manifest =
-        |snapshot: SnapshotRef, version: u64| -> Result<SnapshotRef, Box<dyn std::error::Error>> {
+        |snapshot: SnapshotRef,
+         version: u64|
+         -> std::result::Result<SnapshotRef, Box<dyn std::error::Error>> {
             let file = FileMeta {
                 location: table_url.join(&format!("metadata/root-v{version}.parquet"))?,
                 last_modified: 0,
@@ -371,7 +378,7 @@ async fn test_commit_info_records_data_change_and_last_manifest_commit(
 
 #[tokio::test]
 async fn test_commit_info_omits_adaptive_metadata_fields_without_the_feature()
--> Result<(), Box<dyn std::error::Error>> {
+-> std::result::Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let dir_url = Url::from_directory_path(temp_dir.path()).expect("valid directory url");
     let (store, engine, table_url) =
@@ -401,7 +408,7 @@ fn commit_around_root_manifest(
     before: Configure,
     manifest: Configure,
     after: Configure,
-) -> Result<SnapshotRef, Box<dyn std::error::Error>> {
+) -> std::result::Result<SnapshotRef, Box<dyn std::error::Error>> {
     let commit = |snapshot, configure, root_manifest: Option<FileMeta>| {
         let mut txn = begin_transaction_with(
             snapshot,
@@ -429,7 +436,7 @@ fn commit_around_root_manifest(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_app_id_versions_read_across_a_root_manifest_commit()
--> Result<(), Box<dyn std::error::Error>> {
+-> std::result::Result<(), Box<dyn std::error::Error>> {
     let (engine, _temp_dir, table_url, snapshot) =
         setup_adaptive_metadata_table("root_manifest_file_app_id_versions").await?;
 
@@ -462,7 +469,7 @@ async fn test_app_id_versions_read_across_a_root_manifest_commit()
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_domain_metadata_read_across_a_root_manifest_commit()
--> Result<(), Box<dyn std::error::Error>> {
+-> std::result::Result<(), Box<dyn std::error::Error>> {
     let (engine, _temp_dir, table_url, snapshot) =
         setup_adaptive_metadata_table("root_manifest_file_domain_metadata").await?;
 
