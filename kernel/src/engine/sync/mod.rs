@@ -29,8 +29,10 @@ use crate::object_store::local::LocalFileSystem;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
-use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
-use crate::{FileMeta, KernelError, KernelResult, KernelResultIterator, PredicateRef, SchemaRef};
+use crate::{
+    Engine, EvaluationHandler, FileMeta, JsonHandler, KernelError, KernelResult,
+    KernelResultIterator, ParquetHandler, PredicateRef, SchemaRef, StorageHandler,
+};
 
 pub(crate) mod json;
 mod parquet;

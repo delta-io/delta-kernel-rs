@@ -4,23 +4,23 @@ use bytes::Bytes;
 use derive_more::Constructor;
 use url::Url;
 
-use super::get_bytes;
-use super::{put_bytes, read_files_arrow};
+use super::{get_bytes, put_bytes, read_files_arrow};
 use crate::engine::arrow_conversion::TryFromArrow as _;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
     RowIndexBuilder, fixup_parquet_read, ordering_needs_row_indexes, parquet_read_plan,
 };
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
-use crate::engine::reader_options;
-use crate::engine::writer_options;
+use crate::engine::{reader_options, writer_options};
 use crate::object_store::DynObjectStore;
 use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::schema::{SchemaRef, StructType};
 use crate::utils::FoldWithOption as _;
-use crate::{EngineData, FileDataReadResultIterator, FileSize, ParquetHandler};
-use crate::{FileMeta, KernelResult, KernelResultIterator, ParquetFooter, PredicateRef};
+use crate::{
+    EngineData, FileDataReadResultIterator, FileMeta, FileSize, KernelResult, KernelResultIterator,
+    ParquetFooter, ParquetHandler, PredicateRef,
+};
 
 #[derive(Constructor)]
 pub(crate) struct SyncParquetHandler {

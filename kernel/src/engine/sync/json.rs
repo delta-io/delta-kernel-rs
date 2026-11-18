@@ -8,13 +8,17 @@ use url::Url;
 use super::{put_bytes, read_files_arrow};
 use crate::arrow::json::ReaderBuilder;
 use crate::engine::arrow_data::ArrowEngineData;
-use crate::engine::arrow_utils::{build_json_reorder_indices, fixup_json_read, json_arrow_schema};
-use crate::engine::arrow_utils::{parse_json as arrow_parse_json, to_json_bytes};
+use crate::engine::arrow_utils::{
+    build_json_reorder_indices, fixup_json_read, json_arrow_schema, parse_json as arrow_parse_json,
+    to_json_bytes,
+};
 use crate::engine_data::FilteredEngineData;
 use crate::object_store::DynObjectStore;
 use crate::schema::SchemaRef;
-use crate::{EngineData, FileDataReadResultIterator, FileMeta, FileSize, JsonHandler};
-use crate::{KernelResult, KernelResultIterator, PredicateRef};
+use crate::{
+    EngineData, FileDataReadResultIterator, FileMeta, FileSize, JsonHandler, KernelResult,
+    KernelResultIterator, PredicateRef,
+};
 
 #[derive(Constructor)]
 pub(crate) struct SyncJsonHandler {
