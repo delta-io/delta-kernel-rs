@@ -1718,7 +1718,8 @@ impl Snapshot {
         {
             span.record("root", "content_tree");
             return Err(unresolved_crc(&format!(
-                "Compacted logs are not yet supported with AdaptiveMetadataPreview enabled. The log starts at version {}.",
+                "Compacted logs are not yet supported with AdaptiveMetadataPreview enabled. The log \
+                 starts at version {}.",
                 first.version
             )));
         }

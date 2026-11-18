@@ -42,7 +42,7 @@ use crate::unit_test_utils::adaptive_metadata_fixtures::{
 use crate::unit_test_utils::{
     adaptive_metadata_table_configuration, parse_json_batch, test_schema_flat_with_column_mapping,
 };
-use crate::{Engine, FileMeta, KernelError, KernelResult, Snapshot};
+use crate::{Engine, Error, FileMeta, KernelError, KernelResult, Snapshot};
 
 fn one_column_schema() -> SchemaRef {
     test_schema_flat_with_column_mapping()
@@ -1623,15 +1623,19 @@ async fn put_crc_with_pointer(store: &InMemory, version: u64, pointer: LastManif
 #[rstest]
 #[case::adaptive_metadata(
     checkpoint_commit(2, &[], one_column_schema()),
-    "the log starts at version 2 above an adaptiveMetadata content root"
+    true,
+    "Compacted logs are not yet supported with AdaptiveMetadataPreview enabled. The log starts at \
+     version 2."
 )]
 #[case::classic(
     format!("{}\n{}", protocol_commit(1, 2), classic_metadata_commit()),
+    false,
     "Table version 0 is missing"
 )]
 #[tokio::test]
 async fn write_checksum_on_log_starting_above_zero(
     #[case] commit_2: String,
+    #[case] expect_unsupported: bool,
     #[case] expected_error: &str,
 ) {
     let store = Arc::new(InMemory::new());
@@ -1641,7 +1645,14 @@ async fn write_checksum_on_log_starting_above_zero(
         .unwrap();
     let engine = non_plan_engine(store);
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
-    assert_result_error_with_message(snapshot.write_checksum(&engine), expected_error);
+    let result = snapshot.write_checksum(&engine);
+    let unsupported = matches!(
+        &result,
+        Err(Error::Kernel(error))
+            if matches!(error.without_backtrace(), KernelError::ChecksumWriteUnsupported(_))
+    );
+    assert_eq!(unsupported, expect_unsupported, "{result:?}");
+    assert_result_error_with_message(result, expected_error);
 }
 
 // Builds a top-level `metaData` commit line for a table with no adaptiveMetadata feature.
