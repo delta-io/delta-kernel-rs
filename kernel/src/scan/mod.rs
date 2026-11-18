@@ -436,8 +436,10 @@ impl PartitionValuesOptions {
     /// The provided timezone must match the timezone used to write those offset-less values.
     ///
     /// `timestamp_timezone` must be an IANA timezone identifier recognized by Kernel, a normalized
-    /// fixed offset in `+HH:MM[:SS]` or `-HH:MM[:SS]` form, or `Z` for UTC. An explicit offset in a
-    /// partition value takes precedence. This option applies to partition pruning in full and
+    /// fixed offset in `+HH:MM[:SS]` or `-HH:MM[:SS]` form, or `Z` for UTC. The exact uppercase IDs
+    /// `EST`, `MST`, and `HST` use fixed offsets `-05:00`, `-07:00`, and `-10:00`, respectively.
+    /// Full IANA region names preserve historical clock transitions. An explicit offset or timezone
+    /// in a partition value takes precedence. This option applies to partition pruning in full and
     /// incremental scans and to returned parsed partition values in full scans. It does not affect
     /// `TIMESTAMP_NTZ`.
     ///
