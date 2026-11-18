@@ -1,12 +1,17 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::panic::catch_unwind;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, from_slice, json};
 use tempfile::tempdir;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use test_utils::assert_result_error_with_message;
-use test_utils::{TestAction, actions_to_string, add_commit, delta_path_for_version};
+use test_utils::{
+    LogWriter, TestAction, actions_to_string, add_commit, delta_path_for_version,
+    ensure_metrics_compatible_global_subscriber,
+};
+use tracing_subscriber::prelude::*;
 use url::Url;
 
 use crate::action_reconciliation::{
@@ -28,6 +33,7 @@ use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::sync::SyncEngine;
 use crate::log_replay::HasSelectionVector;
+use crate::metrics::{MetricEvent, WithMetricsReporterLayer as _};
 use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
@@ -35,13 +41,13 @@ use crate::schema::{DataType as KernelDataType, StructField, schema_ref};
 use crate::table_features::TableFeature;
 use crate::transaction::UpdateTableOperation;
 use crate::transaction::create_table::create_table;
-use crate::unit_test_utils::Action;
+use crate::unit_test_utils::{Action, CapturingReporter};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::unit_test_utils::{
     adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
 };
 pub(super) use crate::unit_test_utils::{create_add_action, create_remove_action};
-use crate::{Error, FileMeta, KernelError, KernelResult, LogPath, Result, Snapshot};
+use crate::{Engine as _, Error, FileMeta, KernelError, KernelResult, LogPath, Result, Snapshot};
 
 #[rstest::rstest]
 #[case::default_retention(
@@ -473,6 +479,80 @@ async fn test_v1_checkpoint_specific_version() -> Result<()> {
     // - sizeInBytes: passed to finalize (10)
     assert_last_checkpoint_contents(&store, 0, 2, 0, size_in_bytes).await?;
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn poisoned_crc_mutex_does_not_block_checkpoint_write() -> Result<()> {
+    // === Given a table with a complete cached CRC ===
+    let (store, _) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+    let snapshot = create_table(
+        "memory:///",
+        schema_ref! { nullable "value": INTEGER },
+        "test",
+        true, /* data_change */
+    )
+    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .commit(&engine)?
+    .unwrap_post_commit_snapshot();
+    let (_, snapshot) = snapshot.write_checksum(&engine)?;
+    assert!(snapshot.get_file_stats_if_present().is_some());
+
+    let reporter = Arc::new(CapturingReporter::default());
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let log_writer = Arc::clone(&logs);
+    ensure_metrics_compatible_global_subscriber();
+    let guard = tracing_subscriber::registry()
+        .with_metrics_reporter_layer(reporter.clone())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || LogWriter(Arc::clone(&log_writer))),
+        )
+        .set_default();
+
+    // === When checkpoint replay uses a poisoned CRC mutex ===
+    let writer = snapshot.clone().create_checkpoint_writer(&engine)?;
+    let checkpoint_path = writer.checkpoint_path()?;
+    let data = writer.checkpoint_data(&engine)?;
+    let state = data.state();
+    let crc = state.crc.as_ref().unwrap();
+    assert!(
+        catch_unwind(|| {
+            let _guard = crc.lock().unwrap();
+            panic!("poison replay CRC");
+        })
+        .is_err()
+    );
+    assert!(crc.is_poisoned());
+    let data = data.map(|batch| batch?.apply_selection_vector());
+    let size = engine
+        .parquet_handler()
+        .write_parquet_file(checkpoint_path, Box::new(data))?;
+    let stats = LastCheckpointHintStats::from_reconciliation_state(
+        Arc::into_inner(state).unwrap(),
+        size,
+        0, /* num_sidecars */
+    )?;
+    writer.finalize(&engine, &stats)?;
+    drop(guard);
+
+    // === Then checkpoint writing succeeds and logs an error ===
+    assert!(
+        !reporter
+            .events()
+            .iter()
+            .any(|event| matches!(event, MetricEvent::CrcValidationFailure))
+    );
+    let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(logs.lines().any(|line| line.contains("WARN")
+        && line.contains("Cannot compute action reconciliation CRC: lock poisoned")));
+    assert!(logs.lines().any(|line| line.contains("ERROR")
+        && line.contains("Cannot validate checkpoint CRC: lock poisoned")));
+    let hint = read_last_checkpoint_file(&store).await?;
+    assert_eq!(hint["version"], json!(snapshot.version()));
     Ok(())
 }
 

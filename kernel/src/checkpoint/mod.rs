@@ -179,7 +179,6 @@ pub struct LastCheckpointHintStats {
     /// The number of Add-file actions in the checkpoint.
     pub(crate) num_of_add_files: i64,
     /// CRC computed during checkpoint writing to validate the cached in-memory CRC.
-    /// Tracks only `numFiles` and `tableSizeBytes`.
     // TODO(#3672): Track the remaining CRC fields.
     crc: Option<Arc<Mutex<Crc>>>,
 }
@@ -553,9 +552,8 @@ impl CheckpointWriter {
 
     /// Finalizes checkpoint creation by saving metadata about the checkpoint.
     ///
-    /// Compares the CRC computed during checkpoint writing with the cached in-memory CRC at the
-    /// snapshot's version, checking only `numFiles` and `tableSizeBytes` when both have complete
-    /// file stats. A mismatch emits a
+    /// If complete file statistics are available from both reconciliation and the snapshot's
+    /// at-version CRC, compares them. A mismatch emits a
     /// [`CrcValidationFailure`](crate::metrics::MetricEvent::CrcValidationFailure) metric and an
     /// error log without failing finalization.
     ///
@@ -580,7 +578,7 @@ impl CheckpointWriter {
         last_checkpoint_stats: &LastCheckpointHintStats,
     ) -> KernelResult<()> {
         if let Some(crc) = &last_checkpoint_stats.crc {
-            self.validate_at_version_crc_if_exist(crc);
+            self.report_crc_file_stats_mismatch(crc);
         }
 
         // Skip writing `_last_checkpoint` if the existing hint already points to a newer
@@ -778,11 +776,16 @@ impl CheckpointWriter {
         })
     }
 
-    fn validate_at_version_crc_if_exist(&self, crc_from_replay: &Mutex<Crc>) {
+    /// Compares file statistics from `replay_crc` with the snapshot's cached CRC.
+    ///
+    /// Mismatches emit a `CrcValidationFailure` metric and an error log.
+    /// Skips comparison if the cached CRC is absent, either side lacks complete
+    /// file statistics, or the replay CRC mutex is poisoned.
+    fn report_crc_file_stats_mismatch(&self, replay_crc: &Mutex<Crc>) {
         let Some(in_memory_crc) = self.snapshot.crc_at_version() else {
             return;
         };
-        let expected_crc = match crc_from_replay.lock() {
+        let expected_crc = match replay_crc.lock() {
             Ok(crc) => crc,
             Err(error) => {
                 error!(%error, "Cannot validate checkpoint CRC: lock poisoned");

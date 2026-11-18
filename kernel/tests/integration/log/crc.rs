@@ -48,34 +48,33 @@ use url::Url;
 // ============================================================================
 
 #[rstest]
-#[case::v1(CheckpointSpec::V1)]
-#[case::v2(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar))]
-#[case::sidecars(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
-    file_actions_per_sidecar_hint: Some(1),
-}))]
+#[case::matching(None, 0)]
+#[case::num_files(Some(("numFiles", json!(0))), 1)]
+#[case::table_size(Some(("tableSizeBytes", json!(0))), 1)]
+#[case::unvalidated_field(Some(("txnId", json!("different"))), 0)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn checkpoint_crc_mismatch_reports_without_blocking_write(
-    #[case] spec: CheckpointSpec,
-    #[values(None, Some("numFiles"), Some("tableSizeBytes"), Some("txnId"))] field: Option<&str>,
+    #[case] mutation: Option<(&str, Value)>,
+    #[case] expected_failures: usize,
+    #[values(
+        CheckpointSpec::V1,
+        CheckpointSpec::V2(V2CheckpointConfig::NoSidecar),
+        CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+            file_actions_per_sidecar_hint: Some(1),
+        })
+    )]
+    spec: CheckpointSpec,
 ) -> delta_kernel::Result<()> {
     let (_directory, table_path, engine) = test_table_setup_mt()?;
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let snapshot = create_table_with_crc(&table_path, &engine, &spec).await?;
-    if let Some(field) = field {
-        // Remove the optional histogram so modified file totals survive CRC loading and reach
-        // checkpoint validation.
-        strip_field_from_crc(&table_path, snapshot.version(), "fileSizeHistogram");
-        let value = if field == "txnId" {
-            json!("different")
-        } else {
-            json!(0)
-        };
-        modify_crc_on_disk(
-            &crc_file_path(&table_path, snapshot.version()),
-            field,
-            value,
-        )?;
+    if let Some((field, value)) = mutation {
+        modify_crc_on_disk(&crc_file_path(&table_path, snapshot.version()), |crc| {
+            // Remove the histogram so modified totals reach checkpoint validation.
+            crc.as_object_mut().unwrap().remove("fileSizeHistogram");
+            crc[field] = value;
+        })?;
     }
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     let cached_stats = snapshot.get_file_stats_if_present();
@@ -84,15 +83,7 @@ async fn checkpoint_crc_mismatch_reports_without_blocking_write(
 
     assert_eq!(result, CheckpointWriteResult::Written);
     assert_eq!(checkpointed.get_file_stats_if_present(), cached_stats);
-    let failures = reporter
-        .events()
-        .into_iter()
-        .filter(|event| matches!(event, MetricEvent::CrcValidationFailure))
-        .count();
-    assert_eq!(
-        failures,
-        usize::from(matches!(field, Some("numFiles" | "tableSizeBytes")))
-    );
+    assert_eq!(crc_validation_failures(&reporter), expected_failures);
     Ok(())
 }
 
@@ -112,12 +103,10 @@ async fn checkpoint_crc_validation_uses_in_memory_crc_after_commit(
     } else {
         stats.table_size_bytes()
     };
-    strip_field_from_crc(&table_path, snapshot.version(), "fileSizeHistogram");
-    modify_crc_on_disk(
-        &crc_file_path(&table_path, snapshot.version()),
-        field,
-        json!(value + 1),
-    )?;
+    modify_crc_on_disk(&crc_file_path(&table_path, snapshot.version()), |crc| {
+        crc.as_object_mut().unwrap().remove("fileSizeHistogram");
+        crc[field] = json!(value + 1);
+    })?;
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     // === When a commit advances to N + 1 without writing a CRC file ===
     let snapshot = insert_data(snapshot, &engine, vec![Arc::new(Int32Array::from(vec![3]))])
@@ -134,12 +123,7 @@ async fn checkpoint_crc_validation_uses_in_memory_crc_after_commit(
     let (result, _) = snapshot.checkpoint(engine.as_ref(), None)?;
 
     assert_eq!(result, CheckpointWriteResult::Written);
-    let failures = reporter
-        .events()
-        .into_iter()
-        .filter(|event| matches!(event, MetricEvent::CrcValidationFailure))
-        .count();
-    assert_eq!(failures, 1);
+    assert_eq!(crc_validation_failures(&reporter), 1);
     let hint: Value = serde_json::from_slice(
         &std::fs::read(directory.path().join("_delta_log/_last_checkpoint"))
             .map_err(KernelError::from)?,
@@ -164,13 +148,12 @@ async fn checkpoint_crc_validation_uses_in_memory_crc_after_commit(
 /// A custom checkpoint writer (i.e., one that does not use [`Snapshot::checkpoint`]) still
 /// validates the CRC at finalization.
 #[rstest]
-#[case::single_writer(false, 0)]
-#[case::double_writer_partial(true, 1)]
-#[case::double_writer_full(true, usize::MAX)]
+#[case::single_writer(None)]
+#[case::prior_partial_replay(Some(1))]
+#[case::prior_full_replay(Some(usize::MAX))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn custom_checkpoint_writer_validates_crc_at_finalize(
-    #[case] double_writer: bool,
-    #[case] replay_batches: usize,
+    #[case] prior_replay_batches: Option<usize>,
     #[values(false, true)] mismatch: bool,
 ) -> delta_kernel::Result<()> {
     let (directory, table_path, engine) = test_table_setup_mt()?;
@@ -190,25 +173,18 @@ async fn custom_checkpoint_writer_validates_crc_at_finalize(
     let snapshot = create_table_with_crc(&table_path, &engine, &CheckpointSpec::V1).await?;
     if mismatch {
         let stats = snapshot.get_file_stats_if_present().unwrap();
-        strip_field_from_crc(&table_path, snapshot.version(), "fileSizeHistogram");
-        modify_crc_on_disk(
-            &crc_file_path(&table_path, snapshot.version()),
-            "numFiles",
-            json!(stats.num_files() * 2),
-        )?;
-        modify_crc_on_disk(
-            &crc_file_path(&table_path, snapshot.version()),
-            "tableSizeBytes",
-            json!(stats.table_size_bytes() * 2),
-        )?;
+        let crc_path = crc_file_path(&table_path, snapshot.version());
+        modify_crc_on_disk(&crc_path, |crc| {
+            crc.as_object_mut().unwrap().remove("fileSizeHistogram");
+            crc["numFiles"] = json!(stats.num_files() * 2);
+            crc["tableSizeBytes"] = json!(stats.table_size_bytes() * 2);
+        })?;
     }
     let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     let writer = snapshot.create_checkpoint_writer(engine.as_ref())?;
-    // When `double_writer` is true, clone the writer and consume the first `replay_batches`.
-    // This verifies that multiple `checkpoint_data` calls do not interfere with each other.
-    if double_writer {
+    if let Some(batch_limit) = prior_replay_batches {
         let prior_data = writer.clone().checkpoint_data(engine.as_ref())?;
-        for batch in prior_data.take(replay_batches) {
+        for batch in prior_data.take(batch_limit) {
             batch?;
         }
     }
@@ -218,27 +194,17 @@ async fn custom_checkpoint_writer_validates_crc_at_finalize(
         writer.checkpoint_path()?,
         Box::new(data.map(|batch| batch?.apply_selection_vector())),
     )?;
-    assert!(
-        !reporter
-            .events()
-            .iter()
-            .any(|event| matches!(event, MetricEvent::CrcValidationFailure))
-    );
+    assert_eq!(crc_validation_failures(&reporter), 0);
     let stats = LastCheckpointHintStats::from_reconciliation_state(
         Arc::into_inner(state).unwrap(),
         bytes,
-        0,
+        0, /* num_sidecars */
     )?;
 
     writer.finalize(engine.as_ref(), &stats)?;
     drop(guard);
 
-    let failures = reporter
-        .events()
-        .into_iter()
-        .filter(|event| matches!(event, MetricEvent::CrcValidationFailure))
-        .count();
-    assert_eq!(failures, usize::from(mismatch));
+    assert_eq!(crc_validation_failures(&reporter), usize::from(mismatch));
     assert_eq!(
         std::fs::read_to_string(log_path)
             .map_err(KernelError::from)?
@@ -269,8 +235,10 @@ async fn checkpoint_crc_validation_skips_unavailable_totals(
     let snapshot = create_table_with_crc(&table_path, &engine, &CheckpointSpec::V1).await?;
     let crc_path = crc_file_path(&table_path, snapshot.version());
     if write_crc {
-        strip_field_from_crc(&table_path, snapshot.version(), "fileSizeHistogram");
-        modify_crc_on_disk(&crc_path, "numFiles", json!(100))?;
+        modify_crc_on_disk(&crc_path, |crc| {
+            crc.as_object_mut().unwrap().remove("fileSizeHistogram");
+            crc["numFiles"] = json!(100);
+        })?;
     } else {
         std::fs::remove_file(crc_path).map_err(KernelError::from)?;
     }
@@ -298,12 +266,7 @@ async fn checkpoint_crc_validation_skips_unavailable_totals(
     let (result, _) = snapshot.checkpoint(engine.as_ref(), None)?;
 
     assert_eq!(result, CheckpointWriteResult::Written);
-    assert!(
-        !reporter
-            .events()
-            .iter()
-            .any(|event| matches!(event, MetricEvent::CrcValidationFailure))
-    );
+    assert_eq!(crc_validation_failures(&reporter), 0);
     Ok(())
 }
 
@@ -368,12 +331,7 @@ async fn checkpoint_crc_validation_does_not_recount_readd(
     let (result, _) = snapshot.checkpoint(engine.as_ref(), Some(&spec))?;
 
     assert_eq!(result, CheckpointWriteResult::Written);
-    assert!(
-        !reporter
-            .events()
-            .iter()
-            .any(|event| matches!(event, MetricEvent::CrcValidationFailure))
-    );
+    assert_eq!(crc_validation_failures(&reporter), 0);
     let reloaded = Snapshot::builder_for(&table_root).build(engine.as_ref())?;
     let mut files = Vec::new();
     for batch in reloaded
@@ -2108,10 +2066,10 @@ fn read_crc_json(table_path: &str, version: Version) -> serde_json::Value {
 /// Rewrites the on-disk CRC at `version` to drop the named top-level field, leaving every
 /// other field intact.
 fn strip_field_from_crc(table_path: &str, version: Version, field: &str) {
-    let mut value = read_crc_json(table_path, version);
-    value.as_object_mut().unwrap().remove(field);
-    let path = crc_file_path(table_path, version);
-    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    modify_crc_on_disk(&crc_file_path(table_path, version), |crc| {
+        crc.as_object_mut().unwrap().remove(field);
+    })
+    .unwrap();
 }
 
 #[tokio::test]
@@ -3608,9 +3566,17 @@ async fn create_table_with_crc<E: TaskExecutor>(
     Ok(snapshot)
 }
 
-fn modify_crc_on_disk(path: &Path, field: &str, value: Value) -> KernelResult<()> {
+fn crc_validation_failures(reporter: &CapturingReporter) -> usize {
+    reporter
+        .events()
+        .into_iter()
+        .filter(|event| matches!(event, MetricEvent::CrcValidationFailure))
+        .count()
+}
+
+fn modify_crc_on_disk(path: &Path, modify: impl FnOnce(&mut Value)) -> KernelResult<()> {
     let mut crc: Value = serde_json::from_slice(&std::fs::read(path)?)?;
-    crc[field] = value;
+    modify(&mut crc);
     std::fs::write(path, serde_json::to_vec(&crc)?)?;
     Ok(())
 }

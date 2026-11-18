@@ -1746,9 +1746,8 @@ impl Snapshot {
     ///
     /// [`CheckpointSpec`]: crate::checkpoint::CheckpointSpec
     ///
-    /// After writing the checkpoint, compares the CRC computed by log replay with the cached
-    /// in-memory CRC at this snapshot's version, if available. Only `numFiles` and `tableSizeBytes`
-    /// are compared. Mismatches emit a
+    /// After writing the checkpoint, compares complete file statistics from log replay with the
+    /// cached in-memory CRC at this snapshot's version, if available. Mismatches emit a
     /// [`CrcValidationFailure`](crate::metrics::MetricEvent::CrcValidationFailure) metric and an
     /// error log without failing the checkpoint write.
     ///
