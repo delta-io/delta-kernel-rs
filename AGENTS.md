@@ -67,7 +67,7 @@ cargo nextest run --workspace --all-features test_name_here
 # Format, lint, and doc check (always run after code changes)
 cargo +nightly fmt \
   && cargo clippy --workspace --benches --tests --all-features -- -D warnings \
-  && cargo doc --workspace --all-features --no-deps
+  && RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
 
 # Split no-default-features CI checks (cargo aliases from .cargo/config.toml)
 cargo clippy-no-default-kernel-dependents
@@ -82,13 +82,17 @@ cargo xtask update-delta-error-catalog
 # --check fails if stale, writing nothing.
 cargo xtask generate-delta-error-conditions [--check]
 
-# Quick pre-push check (mimics CI)
+# Local pre-push check (a subset of CI)
 cargo +nightly fmt \
   && cargo clippy --workspace --benches --tests --all-features -- -D warnings \
-  && cargo doc --workspace --all-features --no-deps \
+  && RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps \
   && cargo nextest run --workspace --all-features \
   && cargo test --workspace --all-features --doc
 ```
+
+CI runs more than the pre-push check: it passes `--locked`, runs the no-default-features aliases
+above, verifies the MSRV, and runs the `ffi` tests under Miri. `.github/workflows/build.yml` is
+authoritative.
 
 Use `cargo metadata --no-deps` to discover current workspace package names. Read each crate's
 `Cargo.toml` for its feature flags; the manifests are the source of truth.
@@ -117,11 +121,13 @@ Use `cargo metadata --no-deps` to discover current workspace package names. Read
   (`LogState x FeatureSet x (DataLayoutConfig, TableConfig) x VersionTarget`: data layout and table
   config are bundled into one axis to avoid a cartesian explosion), or a per-axis template with
   your own `#[values]`, can help; see `kernel/tests/integration/cross_product/mod.rs`. Drop to
-  lower-level setup like `test_table_setup` (or hand-rolled `add_commit` / `LocalMockTable`) only
-  when necessary: e.g. for states the builder cannot express, such as corrupt or malformed logs.
+  lower-level setup like `test_table_setup` (or hand-rolled `add_commit`, or `LocalMockTable` in
+  kernel unit tests) only when necessary: e.g. for states the builder cannot express, such as
+  corrupt or malformed logs.
 - Consider how the feature interacts with Delta table features. Cross-check behavior against the
   Delta protocol spec.
-- Consider write paths: normal commits, checkpointing, CRC files, log compaction files.
+- Consider write paths: normal commits, checkpointing, and CRC files. Log compaction writes are
+  disabled (#2337), but kernel reads tables that contain compaction files.
 - When adding cloud-storage functionality to an engine, such as writing JSON files, make sure to
   test it against S3, Azure, and GCS.
 - Consider read paths: loading a snapshot from scratch at latest version, at a specific
@@ -154,10 +160,10 @@ Use `cargo metadata --no-deps` to discover current workspace package names. Read
   from `test_utils`: do NOT write local helpers that duplicate this.
 - **`add_commit` and table setup in tests:** `add_commit` takes a `table_root` string and
   resolves it to an absolute object-store path. The `table_root` must be a proper URL string
-  with a trailing slash (e.g. `"memory:///"`, `"file:///tmp/my_table/"`). Avoid using the
-  `Url` type directly: most test helpers and kernel APIs accept `impl AsRef<str>`, so pass
-  URL strings instead. When using local storage, use an un-prefixed store
-  (`LocalFileSystem::new()`) with a `file:///` URL string. Do NOT use
+  with a trailing slash (e.g. `"memory:///"`, `"file:///tmp/my_table/"`). Pass URL strings to
+  `add_commit` and `Snapshot::builder_for`, which accept `impl AsRef<str>`;
+  `read_actions_from_commit` and `test_read` take `&Url`. When using local storage, use an
+  un-prefixed store (`LocalFileSystem::new()`) with a `file:///` URL string. Do NOT use
   `LocalFileSystem::new_with_prefix()` with `add_commit`: `add_commit` already resolves the full
   path from the URL, so the prefix causes double-nesting. For in-memory tests, use
   `InMemory::new()` with `"memory:///"`. ALWAYS use the same `table_root` URL string for both
@@ -249,8 +255,8 @@ and update this section in your PR. The same pattern works for
 - **Tracing layer callbacks must not emit tracing events directly:** Calling `warn!()` or
   any tracing macro inside a `tracing_subscriber::Layer` callback (`on_event`, `on_record`,
   `on_close`) while holding a span's `extensions_mut()` write lock will re-enter the layer
-  and deadlock on the same lock. In `on_new_span`, no extension lock is held during
-  `attrs.record()`, so direct `warn!()` is safe there. In `on_record`, store warnings in a
+  and deadlock on the same lock. `on_new_span` builds its event with `from_attrs` before taking
+  the extension lock, so direct `warn!()` is safe there. In `on_record`, store warnings in a
   `pending_warnings: Vec<String>` field on the visitor, take them out after the extensions
   block closes, and emit via `warn!()` only then. (`on_event`'s visitor does no
   warning-eligible work, so it may run under the lock directly.) See
@@ -315,8 +321,9 @@ and update this section in your PR. The same pattern works for
   (`column_expr!` is a doc-hidden compatibility alias of `col!`.)
 - Prefer the `schema!` / `schema_ref!` macros for inline declarative schema literals,
   `lazy_schema_ref!` for `LazyLock<SchemaRef>` statics, and `try_schema!` when names of
-  interpolated fields might collide. For Delta log action schemas, reuse the canonical
-  `*_FIELD` and `LOG_*_SCHEMA` statics from `actions` instead of re-declaring
+  interpolated fields might collide. Outside the kernel crate, these macros require the
+  `internal-api` feature. For Delta log action schemas, reuse the canonical `*_FIELD` and
+  `LOG_*_SCHEMA` statics from `actions` instead of re-declaring
   `StructField::nullable(ACTION_NAME, Action::to_schema())` or projecting from
   `get_commit_schema()`. Prefer `StructType::try_new` or schema builder/patch APIs for complex
   data-dependent schema manipulation.
@@ -394,9 +401,12 @@ A separate "Returns an `Option<ColumnName>`" section would add nothing to the si
 
 ## Pull Requests
 
-**Title:** use conventional commit format, lowercase after prefix, no period at the end.
+**Title:** use conventional commit format, lowercase after prefix, no period at the end, and at
+most 72 characters after the prefix (CI rejects longer titles).
 Allowed types: `feat`, `fix`, `refactor`, `chore`, `docs`, `perf`, `test`, `ci`.
-If the pull request contains a breaking change, the type must have a `!` suffix.
+If the pull request contains a breaking change, the type must have a `!` suffix. CI adds the
+`breaking-change` label when its semver check finds one, and a labeled PR fails title validation
+without the `!`.
 Examples: `feat: add checkpoint stream support`, `fix: handle empty log segment`,
 `refactor: extract common log replay logic`
 Breaking change examples: `feat!: make_physical takes column mapping and sets parquet field ids`,
