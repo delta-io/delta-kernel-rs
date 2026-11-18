@@ -169,11 +169,10 @@ pub enum UnaryExpressionOp {
         /// Encode timestamps with all six microsecond digits instead of three.
         full_precision_timestamps: bool,
     },
-    /// Percent-encodes the path of a raw (unencoded) STRING URI reference the way kernel encodes
-    /// `add.path`. Characters that are not legal in a URI path, such as space, `#`, `%` and `?`,
-    /// become `%XX`. Path separators (`/`), `.` and `:` are kept. The exact set of encoded
-    /// characters follows kernel's `add.path` encoding and may change with it, for example in how
-    /// non-ASCII characters are written.
+    /// Percent-encodes the path of a raw (unencoded) STRING URI reference per [RFC 3986]. Each
+    /// character that may not appear literally in a path ([section 3.3]), such as space, `#`, `%`
+    /// and `?`, becomes `%XX` ([section 2.1]), and a non-ASCII character becomes one `%XX` per
+    /// byte of its UTF-8 encoding. All other characters, including `/`, `.`, `:` and `@`, are kept.
     ///
     /// When the reference begins with a scheme (see [`UnaryPredicateOp::HasUriScheme`]), its
     /// `scheme:` and any `//authority` (up to the next `/`) are kept verbatim. Existing `%XX`
@@ -183,11 +182,15 @@ pub enum UnaryExpressionOp {
     /// ```text
     /// URI_ENCODE_FILE_LOCATION('data/a b.parquet')         -- 'data/a%20b.parquet'
     /// URI_ENCODE_FILE_LOCATION('s3://bucket/a#1.parquet')  -- 's3://bucket/a%231.parquet'
+    /// URI_ENCODE_FILE_LOCATION('data/München')             -- 'data/M%C3%BCnchen'
     /// URI_ENCODE_FILE_LOCATION('data/a%20b.parquet')       -- 'data/a%2520b.parquet'
     /// ```
-    // TODO(#2423): non-ASCII is percent-encoded here, but Delta-Spark leaves it raw in `add.path`.
-    // This op must follow kernel's `add.path` encoding once it matches Delta-Spark's (see
-    // `HADOOP_URI_PATH_ENCODE_SET`).
+    ///
+    /// [RFC 3986]: https://datatracker.ietf.org/doc/html/rfc3986
+    /// [section 2.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-2.1
+    /// [section 3.3]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.3
+    // TODO(#2423): decide whether this keeps percent-encoding non-ASCII if `add.path` stops doing
+    // so.
     UriEncodeFileLocation,
 }
 

@@ -1,6 +1,17 @@
 //! RFC 3986 URI-reference syntax: whether a reference is absolute (has a scheme) or relative, and
 //! percent-encoding or decoding its path while keeping any `scheme:[//authority]` prefix.
 
+// The location helpers are only used by the arrow expression evaluator and the AMT path code, so
+// a build with neither feature leaves them unused. `scheme_len` is always used.
+// TODO: remove this allow once the location helpers are used outside those features.
+#![cfg_attr(
+    not(any(
+        feature = "adaptive-metadata-in-dev",
+        all(feature = "arrow-expression", feature = "default-engine-base")
+    )),
+    allow(dead_code)
+)]
+
 use std::borrow::Cow;
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -29,7 +40,7 @@ pub(crate) fn scheme_len(location: &str) -> Option<usize> {
 /// encoded whole. Returns [`Cow::Borrowed`] when nothing needs encoding.
 pub(crate) fn uri_encode_location(location: &str) -> Cow<'_, str> {
     let (prefix, path) = split_prefix(location);
-    with_prefix(location, prefix, uri_encode_path(path))
+    with_prefix(location, prefix, path, uri_encode_path(path))
 }
 
 /// The inverse of [`uri_encode_location`]: percent-decodes the path with [`uri_decode_path`],
@@ -38,7 +49,7 @@ pub(crate) fn uri_encode_location(location: &str) -> Cow<'_, str> {
 #[cfg(feature = "adaptive-metadata-in-dev")]
 pub(crate) fn uri_decode_location(location: &str) -> Option<Cow<'_, str>> {
     let (prefix, path) = split_prefix(location);
-    Some(with_prefix(location, prefix, uri_decode_path(path)?))
+    Some(with_prefix(location, prefix, path, uri_decode_path(path)?))
 }
 
 /// Splits `location` into its `scheme:[//authority]` prefix, empty for a relative reference, and
@@ -55,11 +66,20 @@ fn split_prefix(location: &str) -> (&str, &str) {
     location.split_at(prefix_len)
 }
 
-/// Rejoins `prefix` with a transformed `path`, borrowing `location` when the path is unchanged.
-fn with_prefix<'a>(location: &'a str, prefix: &str, path: Cow<'_, str>) -> Cow<'a, str> {
-    match path {
-        Cow::Borrowed(_) => Cow::Borrowed(location),
-        Cow::Owned(path) => Cow::Owned(format!("{prefix}{path}")),
+/// Rejoins `prefix` with `new_path`, the transformed `path`, borrowing `location` when the path
+/// is unchanged.
+fn with_prefix<'a>(
+    location: &'a str,
+    prefix: &str,
+    path: &str,
+    new_path: Cow<'_, str>,
+) -> Cow<'a, str> {
+    // percent-encoding can borrow a static escape (`%20` for a lone space), so a borrowed result
+    // is not necessarily the input.
+    if new_path == path {
+        Cow::Borrowed(location)
+    } else {
+        Cow::Owned(format!("{prefix}{new_path}"))
     }
 }
 
@@ -118,6 +138,10 @@ mod tests {
     #[case::authority_only("s3://bucket", "s3://bucket")]
     #[case::no_authority("C:/data dir/a", "C:/data%20dir/a")]
     #[case::non_ascii("data/M\u{fc}nchen", "data/M%C3%BCnchen")]
+    #[case::lone_space(" ", "%20")]
+    #[case::lone_hash("#", "%23")]
+    #[case::lone_percent("%", "%25")]
+    #[case::drive_letter_lone_space("C: ", "C:%20")]
     fn test_uri_encode_location_round_trips(#[case] raw: &str, #[case] encoded: &str) {
         let actual = uri_encode_location(raw);
         assert_eq!(matches!(actual, Cow::Borrowed(_)), raw == encoded);

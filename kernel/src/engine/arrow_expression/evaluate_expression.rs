@@ -2438,42 +2438,63 @@ mod tests {
         |l| Arc::new(StringViewArray::from(l)),
     ];
 
-    /// The output keeps the input's representation. The first row needing encoding comes after
-    /// unchanged and NULL rows, which are copied as they are.
+    /// The output keeps the input's representation. Rows before the first one needing encoding
+    /// are copied as they are. A slice whose preceding row needs encoding is read only within its
+    /// bounds.
     #[rstest]
-    fn test_uri_encode_path(
-        #[values(0, 1, 2)] representation: usize,
-        #[values(None, Some(&DataType::STRING))] result_type: Option<&'static DataType>,
-    ) {
-        let locations = vec![
+    #[case::mixed(
+        &[
             Some("data/a.parquet"),
             None,
             Some("data/a b.parquet"),
             Some("s3://bucket/a#1.parquet"),
             Some("s3://bucket/b.parquet"),
             None,
-        ];
-        let input = STRING_ARRAYS[representation](locations);
-        let batch = RecordBatch::try_from_iter([("l", input.clone())]).unwrap();
-        let expr = Expr::unary(UnaryExpressionOp::UriEncodeFileLocation, col!("l"));
-        let result = evaluate_expression(&expr, &batch, result_type).unwrap();
-        assert_eq!(result.data_type(), input.data_type());
-        let expected = StringArray::from(vec![
+        ],
+        &[
             Some("data/a.parquet"),
             None,
             Some("data/a%20b.parquet"),
             Some("s3://bucket/a%231.parquet"),
             Some("s3://bucket/b.parquet"),
             None,
-        ]);
+        ],
+    )]
+    #[case::only_a_lone_escape_changes(
+        &[Some("data/a.parquet"), None, Some(" ")],
+        &[Some("data/a.parquet"), None, Some("%20")],
+    )]
+    fn test_uri_encode_file_location(
+        #[case] locations: &[Option<&'static str>],
+        #[case] expected: &[Option<&'static str>],
+        #[values(0, 1, 2)] representation: usize,
+        #[values(None, Some(&DataType::STRING))] result_type: Option<&'static DataType>,
+        #[values(false, true)] sliced: bool,
+    ) {
+        let make_array = STRING_ARRAYS[representation];
+        let input = if sliced {
+            let rows = [Some("a b.parquet")]
+                .into_iter()
+                .chain(locations.iter().copied());
+            make_array(rows.collect()).slice(1, locations.len())
+        } else {
+            make_array(locations.to_vec())
+        };
+        let batch = RecordBatch::try_from_iter([("l", input.clone())]).unwrap();
+        let expr = Expr::unary(UnaryExpressionOp::UriEncodeFileLocation, col!("l"));
+        let result = evaluate_expression(&expr, &batch, result_type).unwrap();
+        assert_eq!(result.data_type(), input.data_type());
         let result = cast(&result, &ArrowDataType::Utf8).unwrap();
-        assert_eq!(result.as_string::<i32>(), &expected);
+        assert_eq!(
+            result.as_string::<i32>(),
+            &StringArray::from(expected.to_vec())
+        );
     }
 
     /// An input with nothing to encode is returned as is. A slice is checked only within its
     /// bounds, so a row before it that needs encoding does not matter.
     #[rstest]
-    fn test_uri_encode_path_returns_unchanged_input(
+    fn test_uri_encode_file_location_returns_unchanged_input(
         #[values(0, 1, 2)] representation: usize,
         #[values(false, true)] sliced: bool,
     ) {
@@ -2491,7 +2512,7 @@ mod tests {
     }
 
     #[test]
-    fn test_uri_encode_path_rejects_non_string_input() {
+    fn test_uri_encode_file_location_rejects_non_string_input() {
         let batch =
             RecordBatch::try_from_iter([("n", Arc::new(Int32Array::from(vec![1])) as ArrayRef)])
                 .unwrap();
