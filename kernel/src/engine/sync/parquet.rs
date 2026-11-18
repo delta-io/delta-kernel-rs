@@ -1,13 +1,10 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-#[cfg(any(test, feature = "test-utils"))]
 use derive_more::Constructor;
-#[cfg(any(test, feature = "test-utils"))]
 use url::Url;
 
 use super::get_bytes;
-#[cfg(any(test, feature = "test-utils"))]
 use super::{put_bytes, read_files_arrow};
 use crate::engine::arrow_conversion::TryFromArrow as _;
 use crate::engine::arrow_data::ArrowEngineData;
@@ -16,19 +13,15 @@ use crate::engine::arrow_utils::{
 };
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::reader_options;
-#[cfg(any(test, feature = "test-utils"))]
 use crate::engine::writer_options;
 use crate::object_store::DynObjectStore;
 use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
-#[cfg(any(test, feature = "test-utils"))]
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::schema::{SchemaRef, StructType};
 use crate::utils::FoldWithOption as _;
-#[cfg(any(test, feature = "test-utils"))]
 use crate::{EngineData, FileDataReadResultIterator, FileSize, ParquetHandler};
 use crate::{FileMeta, KernelResult, KernelResultIterator, ParquetFooter, PredicateRef};
 
-#[cfg(any(test, feature = "test-utils"))]
 #[derive(Constructor)]
 pub(crate) struct SyncParquetHandler {
     store: Option<Arc<DynObjectStore>>,
@@ -65,7 +58,6 @@ pub(super) fn try_create_from_parquet(
     }))
 }
 
-#[cfg(any(test, feature = "test-utils"))]
 impl ParquetHandler for SyncParquetHandler {
     fn read_parquet_files(
         &self,

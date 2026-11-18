@@ -23,14 +23,12 @@ use itertools::Itertools;
 use tracing::trace;
 use url::Url;
 
-#[cfg(any(test, feature = "test-utils"))]
 use super::arrow_expression::ArrowEvaluationHandler;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::object_store::local::LocalFileSystem;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
-#[cfg(any(test, feature = "test-utils"))]
 use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
 use crate::{FileMeta, KernelError, KernelResult, KernelResultIterator, PredicateRef, SchemaRef};
 
@@ -47,7 +45,7 @@ mod prefix_sum;
 #[cfg(feature = "declarative-plans")]
 pub mod plan;
 
-#[cfg(all(any(test, feature = "test-utils"), feature = "declarative-plans"))]
+#[cfg(feature = "declarative-plans")]
 use plan::SyncPlanExecutor;
 
 #[cfg(feature = "declarative-plans")]
@@ -76,7 +74,6 @@ fn extract_long_column<'a>(
 }
 
 /// A simple (test-only) implementation of [`Engine`]. See module docs for supported stores.
-#[cfg(any(test, feature = "test-utils"))]
 pub struct SyncEngine {
     storage_handler: Arc<storage::SyncStorageHandler>,
     json_handler: Arc<json::SyncJsonHandler>,
@@ -86,7 +83,6 @@ pub struct SyncEngine {
     plan_executor: Arc<SyncPlanExecutor>,
 }
 
-#[cfg(any(test, feature = "test-utils"))]
 impl SyncEngine {
     /// Create a SyncEngine that reads from the local filesystem via [`LocalFileSystem`].
     pub fn new() -> Self {
@@ -117,14 +113,12 @@ impl SyncEngine {
     }
 }
 
-#[cfg(any(test, feature = "test-utils"))]
 impl Default for SyncEngine {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(any(test, feature = "test-utils"))]
 impl Engine for SyncEngine {
     fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
         self.evaluation_handler.clone()
