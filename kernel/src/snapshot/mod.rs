@@ -2028,7 +2028,6 @@ mod tests {
     use crate::log_segment::LogSegment;
     use crate::log_segment_files::LogSegmentFiles;
     use crate::object_store::ObjectStoreExt as _;
-    use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::{LogPathFileType, ParsedLogPath};

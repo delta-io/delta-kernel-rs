@@ -1250,10 +1250,9 @@ pub(super) mod tests {
             LogPath::try_new(file_meta).expect("Failed to create LogPath")
         }
 
-        /// Creates an in-memory engine, store, and table root with an initial catalog-managed
+        /// Creates an in-memory engine and table root with an initial catalog-managed
         /// commit at version 0 (protocol + metadata).
-        pub(in crate::snapshot) async fn setup_catalog_managed_test()
-        -> (Arc<SyncEngine>, Arc<DynObjectStore>, String) {
+        pub(in crate::snapshot) async fn setup_catalog_managed_test() -> SyncEngine {
             let engine = SyncEngine::in_memory();
             let actions = vec![TestAction::Metadata];
             add_commit(

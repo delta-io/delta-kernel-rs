@@ -25,8 +25,7 @@ use crate::engine::DelegatingEngine;
 use crate::engine::sync::SyncEngine;
 #[cfg(feature = "declarative-plans")]
 use crate::expressions::Scalar;
-use crate::object_store::ObjectStoreExt as _;
-use crate::object_store::memory::InMemory;
+use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
 use crate::path::ParsedLogPath;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::Operator;
@@ -140,8 +139,8 @@ fn commit_info(last_manifest_commit: Option<LastManifestCommit>) -> String {
 }
 
 // Commits a root manifest commit at v0 (pointing at itself) followed by `later_commits`, and
-// returns the store and table root.
-async fn manifest_commit_table(later_commits: &[String]) -> (Arc<InMemory>, Url) {
+// returns an engine on the table's store and the table root.
+async fn manifest_commit_table(later_commits: &[String]) -> (SyncEngine, Url) {
     let manifest_commit = checkpoint_commit(0, &[], one_column_schema());
     let commits: Vec<String> = std::iter::once(manifest_commit)
         .chain(later_commits.iter().cloned())
@@ -151,7 +150,7 @@ async fn manifest_commit_table(later_commits: &[String]) -> (Arc<InMemory>, Url)
 
 // Commits `commits` as versions 0, 1, ... of an in-memory table, and returns the store and table
 // root.
-async fn commit_table(commits: &[String]) -> (Arc<InMemory>, Url) {
+async fn commit_table(commits: &[String]) -> (SyncEngine, Url) {
     let engine = SyncEngine::in_memory();
     let table_root = Url::parse("memory:///").unwrap();
     for (version, commit) in commits.iter().enumerate() {
@@ -164,7 +163,7 @@ async fn commit_table(commits: &[String]) -> (Arc<InMemory>, Url) {
         .await
         .unwrap();
     }
-    (store, table_root)
+    (engine, table_root)
 }
 
 // The log a replay test reads: `commits` at versions 0.., plus an optional P&M checkpoint and an
@@ -283,8 +282,7 @@ async fn assert_replay<E: Engine>(
 
 // Removes SyncEngine's plan executor so replay uses the non-plan path even when
 // `declarative-plans` is compiled in. Otherwise SyncEngine would use the plan path.
-fn non_plan_engine(store: Arc<InMemory>) -> impl Engine {
-    let engine = SyncEngine::new_with_store(store);
+fn non_plan_engine(engine: SyncEngine) -> impl Engine {
     #[cfg(feature = "declarative-plans")]
     let engine = DelegatingEngine::new(Arc::new(engine)).without_plan_executor();
     engine
@@ -441,7 +439,7 @@ async fn assert_lagging_checkpoint_loses_to_gap_commit<E: Engine>(
     if pointer_carried_forward {
         later_commits.push(commit_info(Some(pointer(2, 0))));
     }
-    let (store, table_root) = manifest_commit_table(&later_commits).await;
+    let (engine, table_root) = manifest_commit_table(&later_commits).await;
 
     let engine = map_engine(engine);
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
@@ -487,9 +485,10 @@ async fn assert_replay_captures_checkpoint_action<E: Engine>(
 // `latest_checkpoint_action` follows the commit's `lastManifestCommit` to it.
 #[tokio::test]
 async fn latest_checkpoint_action_without_replay_follows_commit_info_pointer() {
-    let (store, table_root) = commit_table(&[checkpoint_commit(0, &[], one_column_schema())]).await;
+    let (engine, table_root) =
+        commit_table(&[checkpoint_commit(0, &[], one_column_schema())]).await;
 
-    let engine = non_plan_engine(store);
+    let engine = non_plan_engine(engine);
     let log_segment = latest_log_segment(&table_root, &engine);
     let table_configuration = adaptive_metadata_table_configuration(one_column_schema(), &[]);
     let snapshot = Snapshot::new(log_segment, table_configuration).unwrap();
@@ -676,14 +675,15 @@ async fn plan_replay_bounded_by_crc_or_checkpoint_runs_one_plan(
         txn_commit()
     };
     let later_commits = [carrier.clone(), carrier, newest];
-    let (store, table_root) = manifest_commit_table(&later_commits).await;
+    let (engine, table_root) = manifest_commit_table(&later_commits).await;
     match bound {
-        ReplayBound::Crc => put_crc_with_pointer(&store, 1, pointer(0, 0)).await,
-        ReplayBound::Checkpoint => put_pm_checkpoint(&store, 1).await,
+        ReplayBound::Crc => put_crc_with_pointer(engine.store(), 1, pointer(0, 0)).await,
+        ReplayBound::Checkpoint => put_pm_checkpoint(engine.store(), 1).await,
     }
 
     let plans = Arc::new(Mutex::new(Vec::new()));
-    let engine = recording_plan_engine(store.clone(), plans.clone());
+    let store = engine.store().clone();
+    let engine = recording_plan_engine(engine, plans.clone());
     let log_segment = if compacted {
         segment_with_compaction(&store, &table_root, &engine, (2, 3), &txn_commit()).await
     } else {
@@ -986,7 +986,8 @@ async fn check_segment_ending_on_checkpoint<E: Engine>(map_engine: impl FnOnce(S
     );
     let checkpoint =
         delta_path_for_version(0, "checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json");
-    store
+    engine
+        .store()
         .put(&checkpoint, checkpoint_rows.into())
         .await
         .unwrap();
@@ -1109,11 +1110,11 @@ async fn latest_checkpoint_action_reads_commit_named_by_crc_pointer(
         v1,
         checkpoint_commit(2, &[], one_column_schema()),
     ];
-    let (store, table_root) = commit_table(&commits).await;
+    let (engine, table_root) = commit_table(&commits).await;
     let pointer = pointer(pointer_version, pointer_content_root_version);
-    put_crc_with_pointer(&store, 2, pointer).await;
+    put_crc_with_pointer(engine.store(), 2, pointer).await;
 
-    let engine = non_plan_engine(store);
+    let engine = non_plan_engine(engine);
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
 
     let result = snapshot.latest_checkpoint_action(&engine);
@@ -1128,10 +1129,11 @@ async fn latest_checkpoint_action_reads_commit_named_by_crc_pointer(
 // action. Such a log needs a classic checkpoint, which adaptiveMetadata forbids.
 #[tokio::test]
 async fn latest_checkpoint_action_fails_without_commit_or_crc_at_checkpoint_version() {
-    let (store, table_root) = commit_table(&[checkpoint_commit(0, &[], one_column_schema())]).await;
-    put_pm_checkpoint(&store, 1).await;
+    let (engine, table_root) =
+        commit_table(&[checkpoint_commit(0, &[], one_column_schema())]).await;
+    put_pm_checkpoint(engine.store(), 1).await;
 
-    let engine = non_plan_engine(store);
+    let engine = non_plan_engine(engine);
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
     assert_eq!(snapshot.version(), 1);
 
@@ -1163,9 +1165,9 @@ async fn latest_checkpoint_action_follows_commit_info_pointer(
             protocol_and_metadata_lines(one_column_schema(), &[])
         ),
     ];
-    let (store, table_root) = commit_table(&commits).await;
+    let (engine, table_root) = commit_table(&commits).await;
 
-    let engine = non_plan_engine(store);
+    let engine = non_plan_engine(engine);
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
 
     let action = snapshot.latest_checkpoint_action(&engine).unwrap();
@@ -1182,10 +1184,10 @@ async fn latest_checkpoint_action_follows_commit_info_pointer(
 async fn read_last_checkpoint_action_from_pointer_rejects_commit_outside_segment(
     #[case] pointer_version: i64,
 ) {
-    let (store, table_root) =
+    let (engine, table_root) =
         manifest_commit_table(&[checkpoint_commit(1, &[], one_column_schema())]).await;
 
-    let engine = non_plan_engine(store);
+    let engine = non_plan_engine(engine);
     let log_segment = latest_log_segment(&table_root, &engine).segment_after_version(0);
 
     let pointer = pointer(pointer_version, pointer_version);
@@ -1201,8 +1203,10 @@ async fn post_commit_snapshot_resolves_latest_checkpoint_action(
     #[case] write_root_manifest: bool,
     #[case] expected_version: i64,
 ) {
-    let (store, table_root) = commit_table(&[checkpoint_commit(0, &[], one_column_schema())]).await;
-    let engine = non_plan_engine(store.clone());
+    let (engine, table_root) =
+        commit_table(&[checkpoint_commit(0, &[], one_column_schema())]).await;
+    let store = engine.store().clone();
+    let engine = non_plan_engine(engine);
     let snapshot = Snapshot::builder_for(table_root.clone())
         .build(&engine)
         .unwrap();
@@ -1266,7 +1270,7 @@ async fn replay_resolves_last_manifest_commit_from_newest_commit(
         ReplayExpectation::default().last_manifest_commit(LastManifestCommitResolution::Unresolved);
     assert_replay(&log, crc, &non_plan, non_plan_engine).await;
     let plan = ReplayExpectation::default().last_manifest_commit(expected);
-    assert_replay(&log, crc, &plan, |store| SyncEngine::new_with_store(store)).await;
+    assert_replay(&log, crc, &plan, |engine| engine).await;
 }
 
 // A `lastManifestCommit` naming a version after the commit that carries it is invalid, so the plan
@@ -1463,9 +1467,11 @@ async fn assert_snapshot_serves_last_manifest_commit<E: Engine>(
 // deleted, only that pointer can name the manifest commit.
 #[tokio::test]
 async fn post_commit_snapshot_follows_transaction_last_manifest_commit() {
-    let (store, table_root) = commit_table(&[checkpoint_commit(0, &[], one_column_schema())]).await;
-    put_crc_with_pointer(&store, 0, pointer(0, 0)).await;
-    let engine = non_plan_engine(store.clone());
+    let (engine, table_root) =
+        commit_table(&[checkpoint_commit(0, &[], one_column_schema())]).await;
+    put_crc_with_pointer(engine.store(), 0, pointer(0, 0)).await;
+    let store = engine.store().clone();
+    let engine = non_plan_engine(engine);
     let snapshot = Snapshot::builder_for(table_root.clone())
         .build(&engine)
         .unwrap();
@@ -1499,8 +1505,9 @@ async fn post_commit_snapshot_follows_transaction_last_manifest_commit() {
 async fn snapshot_with_crc_at_version_serves_last_manifest_commit_from_crc(
     #[case] crc_pointer: Option<LastManifestCommit>,
 ) {
-    let (store, table_root) = manifest_commit_table(&[commit_info(Some(pointer(0, 0)))]).await;
-    let engine = non_plan_engine(store.clone());
+    let (engine, table_root) = manifest_commit_table(&[commit_info(Some(pointer(0, 0)))]).await;
+    let store = engine.store().clone();
+    let engine = non_plan_engine(engine);
     let loaded = Snapshot::builder_for(table_root).build(&engine).unwrap();
     let expected = crc_pointer;
     let crc = Crc {
@@ -1535,11 +1542,11 @@ async fn snapshot_with_crc_at_version_serves_last_manifest_commit_from_crc(
 async fn snapshot_on_checkpoint_reads_last_manifest_commit_from_commit_file(
     #[case] delete_commit_file: bool,
 ) {
-    let (store, table_root) = manifest_commit_table(&[]).await;
-    put_pm_checkpoint(&store, 0).await;
-    let engine = SyncEngine::new_with_store(store.clone());
+    let (engine, table_root) = manifest_commit_table(&[]).await;
+    put_pm_checkpoint(engine.store(), 0).await;
     if delete_commit_file {
-        store
+        engine
+            .store()
             .delete(&delta_path_for_version(0, "json"))
             .await
             .unwrap();

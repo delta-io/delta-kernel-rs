@@ -13,9 +13,9 @@ use crate::FileMeta;
 use crate::engine::sync::SyncEngine;
 use crate::log_path::LogPath;
 use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
-use crate::object_store::memory::InMemory;
+use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::path::Path;
-use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
+use crate::snapshot::builder::tests::TABLE_ROOT;
 use crate::utils::try_parse_uri;
 
 const FRESH_CONSTRUCTOR_SPAN: &str = "try_new_from_log_segment";
@@ -158,7 +158,7 @@ where
 }
 
 async fn create_table(
-    store: &Arc<DynObjectStore>,
+    engine: &SyncEngine,
     table_root: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     add_commit(
@@ -201,10 +201,10 @@ async fn snapshot_spans_avoid_heavy_context_and_constructors_capture_failure_arg
 
     let snapshot = SnapshotBuilder::new_for(TABLE_ROOT)
         .at_version(0)
-        .build(engine.as_ref())?;
-    let updated = SnapshotBuilder::new_from(snapshot).build(engine.as_ref())?;
+        .build(&engine)?;
+    let updated = SnapshotBuilder::new_from(snapshot).build(&engine)?;
     assert_eq!(updated.version(), 1);
-    assert_eq!(updated.get_in_commit_timestamp(engine.as_ref())?, None);
+    assert_eq!(updated.get_in_commit_timestamp(&engine)?, None);
     assert!(captured.error_events().is_empty());
 
     {

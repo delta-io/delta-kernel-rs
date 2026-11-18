@@ -447,10 +447,7 @@ mod tests {
 
     async fn snapshot_and_hint(
         freshness: SnapshotHintFreshness,
-    ) -> KernelResult<
-        (Arc<SyncEngine>, String, SnapshotRef, SnapshotHint),
-        Box<dyn std::error::Error>,
-    > {
+    ) -> KernelResult<(SyncEngine, SnapshotRef, SnapshotHint), Box<dyn std::error::Error>> {
         let engine = SyncEngine::in_memory();
         create_table(engine.store(), TABLE_ROOT).await?;
         let snapshot = SnapshotBuilder::new_for(TABLE_ROOT).build(&engine)?;
@@ -1090,7 +1087,7 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn snapshot_hint_build_rejects_a_log_path_outside_the_table_log_root()
     -> KernelResult<(), Box<dyn std::error::Error>> {
-        let (engine, table_root, _snapshot, mut hint) =
+        let (engine, _snapshot, mut hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         let path = hint
             .log_segment_files
@@ -1178,7 +1175,7 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn complete_snapshot_hint_without_crc_succeeds()
     -> KernelResult<(), Box<dyn std::error::Error>> {
-        let (engine, table_root, _snapshot, mut hint) =
+        let (engine, _snapshot, mut hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         hint.crc = None;
 
@@ -2051,7 +2048,7 @@ mod tests {
 
     async fn catalog_snapshot_with_checkpoint_and_crc(
         originally_latest: bool,
-    ) -> KernelResult<(Arc<SyncEngine>, String, SnapshotRef), Box<dyn std::error::Error>> {
+    ) -> KernelResult<(SyncEngine, SnapshotRef), Box<dyn std::error::Error>> {
         let engine = setup_catalog_managed_test().await;
         let base = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_max_catalog_version(0)
