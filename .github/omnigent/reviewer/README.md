@@ -11,3 +11,7 @@ Each published inline finding includes feedback instructions: react 👍 for hel
 unhelpful or incorrect, or 👀 for out of scope. Feedback remains
 on the comment for manual review and prompt tuning; the workflow does not automatically consume
 these ratings or learn from them. The footer is excluded from exact finding deduplication.
+
+For an offline audit of review patterns and feedback, see the
+[review audit tooling](../review-audit/README.md). It produces source-cited ideas for a later
+integration pass.

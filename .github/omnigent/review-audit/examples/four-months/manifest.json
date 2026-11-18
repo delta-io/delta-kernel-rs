@@ -1,0 +1,62 @@
+{
+  "repo": "delta-io/delta-kernel-rs",
+  "since": "2026-07-12T04:44:29Z",
+  "until": "2026-11-12T04:44:29Z",
+  "scope": "currently open or merged PRs; activity by creation/submission time",
+  "candidate_prs": 751,
+  "prs_with_activity": 697,
+  "event_counts": {
+    "inline": 8826,
+    "review": 6529,
+    "discussion": 1758
+  },
+  "inline_by_role": {
+    "reviewer": 3106,
+    "author": 3323,
+    "bot": 2397
+  },
+  "guidance_revision": "162190e02c9db824c6f360938b953c0e9f394915",
+  "guidance_sha256": [
+    {
+      "path": ".github/omnigent/reviewer/REVIEW.md",
+      "sha256": "631b8b7cc4a51637e1c813281f646100c2f9d25de5b34aa2bd40bea42d5aa828"
+    },
+    {
+      "path": ".github/omnigent/reviewer/agents/architecture-reviewer/REVIEW.md",
+      "sha256": "aecb761c3de6bf7ab5d7c84cee0927351aef2e9bcfc955c43c4e2ed291a7396c"
+    },
+    {
+      "path": ".github/omnigent/reviewer/agents/delta-protocol-reviewer/REVIEW.md",
+      "sha256": "3ebd8f204cfd948d96b001e0d2cb787cc03bfd36b8a596fd63a8e054d03794fa"
+    },
+    {
+      "path": ".github/omnigent/reviewer/agents/disprove-reviewer/REVIEW.md",
+      "sha256": "5a06255a20c0aebbd9590660c53f49940c44ae2395cb5b537b412b4baba931eb"
+    },
+    {
+      "path": ".github/omnigent/reviewer/agents/docs-reviewer/REVIEW.md",
+      "sha256": "3de4368e846e9c412287ac65fd91d2b15959e1b075cde82e536f003ba3ec8adc"
+    },
+    {
+      "path": ".github/omnigent/reviewer/agents/maintainer-claude-reviewer/REVIEW.md",
+      "sha256": "31aad89cdf489d67a08ff47958bf4b081c962aa7c3f81859395617d1a27626fb"
+    },
+    {
+      "path": ".github/omnigent/reviewer/agents/maintainer-codex-reviewer/REVIEW.md",
+      "sha256": "5e5a98bb2e269e48ea104c5aab2ba6ee400b0cc1e9e9fe4823c354e74d87ad0a"
+    },
+    {
+      "path": ".github/omnigent/reviewer/agents/test-coverage-reviewer/REVIEW.md",
+      "sha256": "a9f697fcfa596ca940fb4d19ad9cffd9a68ddf8590e66b6809d9ee1f130c5de1"
+    },
+    {
+      "path": "AGENTS.md",
+      "sha256": "5b9226df0befbf06dbd585a9a90547ba06b54556111c44f56ead323488854eb6"
+    },
+    {
+      "path": "ffi/AGENTS.md",
+      "sha256": "15364764499f6effc2e010451ff8cc5920af6efa25da0332cb3de124adc418ab"
+    }
+  ],
+  "semantic_coverage": "43 selected ideas, not exhaustive labeling; recurrence counts are cited lower bounds."
+}
