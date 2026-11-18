@@ -852,6 +852,7 @@ mod tests {
 
     use ::test_utils::get_column;
     use rstest::rstest;
+    use serde_json::json;
 
     use super::*;
     use crate::actions::{ADD_SCHEMA, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
@@ -874,7 +875,10 @@ mod tests {
     use crate::table_properties::APPEND_ONLY;
     use crate::transaction::create_table::create_table;
     use crate::transaction::operation::UpdateTableOperation;
-    use crate::unit_test_utils::{copy_test_table, create_valid_add_file_batch, test_schema_flat};
+    use crate::unit_test_utils::{
+        MICROSECOND_TIMESTAMP, assert_min_ts_in_stats_json, copy_test_table,
+        create_valid_add_file_batch, evaluate_on_json_rows, test_schema_flat,
+    };
     use crate::{
         EvaluationHandler, ExpressionEvaluator, KernelError, PredicateEvaluator, Result, Snapshot,
     };
@@ -1032,6 +1036,50 @@ mod tests {
             "created {created} evaluators for {} batches; expected at most {max_evaluators}",
             optional_columns.len()
         );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::millisecond(UnaryExpressionOp::TO_JSON, "2026-07-02T15:55:55.298Z")]
+    #[case::full_precision(
+        UnaryExpressionOp::ToJson { full_precision_timestamps: true },
+        MICROSECOND_TIMESTAMP
+    )]
+    fn test_remove_stats_fall_back_to_stats_parsed_with_stats_json_op(
+        #[case] stats_json_op: UnaryExpressionOp,
+        #[case] expected_bound: &str,
+    ) -> KernelResult<()> {
+        let patch = build_remove_struct_patch(
+            0,    /* commit_timestamp */
+            true, /* data_change */
+            &[],  /* columns_to_drop */
+            true, /* coalesce_stats_with_parsed */
+            stats_json_op,
+            false, /* adaptive_metadata_enabled */
+        )?;
+        let expr = Arc::new(Expression::struct_from([Expression::struct_patch(patch)?]));
+        let stats_parsed = StructField::nullable(
+            STATS_PARSED_NAME,
+            schema! { nullable MIN_VALUES: { nullable "ts": TIMESTAMP } },
+        );
+        let input_schema = Arc::new(StructType::try_new(
+            scan_row_schema().fields().cloned().chain([stats_parsed]),
+        )?);
+
+        let rows = evaluate_on_json_rows(
+            &SyncEngine::new(),
+            input_schema,
+            expr,
+            Arc::new(schema_with_all_fields_nullable(&LOG_REMOVE_SCHEMA)),
+            &[json!({
+                "path": "a",
+                "size": 1,
+                "stats": null,
+                FILE_CONSTANT_VALUES_NAME: { PARTITION_VALUES_NAME: {} },
+                STATS_PARSED_NAME: { MIN_VALUES: { "ts": MICROSECOND_TIMESTAMP } },
+            })],
+        )?;
+        assert_min_ts_in_stats_json(&rows[0]["remove"]["stats"], expected_bound);
         Ok(())
     }
 

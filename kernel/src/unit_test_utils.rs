@@ -20,7 +20,7 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 use url::Url;
 
 use crate::actions::{
-    Add, Cdc, CommitInfo, DomainMetadata, Metadata, Protocol, Remove, SetTransaction,
+    Add, Cdc, CommitInfo, DomainMetadata, MIN_VALUES, Metadata, Protocol, Remove, SetTransaction,
     get_all_actions_schema,
 };
 use crate::arrow::array::{
@@ -33,7 +33,9 @@ use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_conversion::{TryIntoArrow as _, parquet_field_id_metadata};
 use crate::engine::arrow_data::ArrowEngineData;
+use crate::engine::arrow_utils::to_json_bytes;
 use crate::engine::sync::SyncEngine;
+use crate::engine_data::FilteredEngineData;
 use crate::metrics::{MetricEvent, MetricsReporter, WithMetricsReporterLayer as _};
 use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::local::LocalFileSystem;
@@ -54,7 +56,8 @@ use crate::table_properties::{
 use crate::transaction::create_table::create_table;
 use crate::transaction::{BASE_ADD_FILES_SCHEMA, CreateTable, Transaction};
 use crate::{
-    Engine, EngineData, FileMeta, KernelError, KernelResult, Result, Snapshot, SnapshotRef, Version,
+    Engine, EngineData, ExpressionRef, FileMeta, KernelError, KernelResult, Result, Snapshot,
+    SnapshotRef, Version,
 };
 
 /// Parses `path` (a full URL string) into a [`ParsedLogPath`] with zero size, for building
@@ -366,6 +369,62 @@ pub(crate) fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn 
     let batch = RecordBatch::try_new(schema, vec![Arc::new(string_array)])
         .expect("Can't convert to record batch");
     Box::new(ArrowEngineData::new(batch))
+}
+
+/// Parses each of `rows` as one JSON object with `schema`.
+pub(crate) fn parse_actions(
+    engine: &dyn Engine,
+    schema: SchemaRef,
+    rows: &[serde_json::Value],
+) -> KernelResult<Box<dyn EngineData>> {
+    engine.json_handler().parse_json(
+        string_array_to_engine_data(StringArray::from_iter_values(
+            rows.iter().map(serde_json::Value::to_string),
+        )),
+        schema,
+    )
+}
+
+/// Serializes the selected rows of `batches` as JSON objects.
+pub(crate) fn json_rows(
+    batches: impl Iterator<Item = KernelResult<FilteredEngineData>> + Send,
+) -> KernelResult<Vec<serde_json::Value>> {
+    let bytes = to_json_bytes(batches)?;
+    serde_json::Deserializer::from_slice(&bytes)
+        .into_iter::<serde_json::Value>()
+        .map(|row| row.map_err(Into::into))
+        .collect()
+}
+
+/// Evaluates `expression` on `rows` parsed with `input_schema` and returns the output rows as
+/// JSON objects.
+pub(crate) fn evaluate_on_json_rows(
+    engine: &dyn Engine,
+    input_schema: SchemaRef,
+    expression: ExpressionRef,
+    output_schema: SchemaRef,
+    rows: &[serde_json::Value],
+) -> KernelResult<Vec<serde_json::Value>> {
+    let input = parse_actions(engine, input_schema.clone(), rows)?;
+    let output = engine
+        .evaluation_handler()
+        .new_expression_evaluator(input_schema, expression, output_schema.into())?
+        .evaluate(input.as_ref())?;
+    json_rows(std::iter::once(Ok(
+        FilteredEngineData::with_all_rows_selected(output),
+    )))
+}
+
+/// A timestamp with sub-millisecond digits, for checking how stats JSON encodes timestamps.
+pub(crate) const MICROSECOND_TIMESTAMP: &str = "2026-07-02T15:55:55.298677Z";
+
+/// Asserts that `stats`, a JSON-encoded stats string, has `expected` as its `minValues.ts`.
+pub(crate) fn assert_min_ts_in_stats_json(stats: &serde_json::Value, expected: &str) {
+    let stats = stats
+        .as_str()
+        .unwrap_or_else(|| panic!("expected a stats JSON string, got {stats}"));
+    let stats: serde_json::Value = serde_json::from_str(stats).unwrap();
+    assert_eq!(stats[MIN_VALUES]["ts"], expected, "{stats}");
 }
 
 pub(crate) fn parse_json_batch(json_strings: StringArray) -> Box<dyn EngineData> {

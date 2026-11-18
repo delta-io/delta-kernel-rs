@@ -229,9 +229,7 @@ mod tests {
     use crate::action_reconciliation::file_metadata::build_checkpoint_read_schema;
     use crate::action_reconciliation::log_replay::ActionReconciliationProcessor;
     use crate::actions::{LOG_ADD_SCHEMA, MIN_VALUES, Metadata, Protocol};
-    use crate::arrow::array::StringArray;
     use crate::checkpoint::{CHECKPOINT_ACTIONS_SCHEMA_V1, CheckpointWriter};
-    use crate::engine::arrow_utils::to_json_bytes;
     use crate::engine::sync::SyncEngine;
     use crate::engine_data::FilteredEngineData;
     use crate::log_segment::CheckpointReadOptions;
@@ -240,7 +238,11 @@ mod tests {
     use crate::scan::StatsOptions;
     use crate::schema::{ColumnMetadataKey, MetadataValue, schema, schema_ref};
     use crate::snapshot::SnapshotRef;
-    use crate::{Engine, EngineData, Result, version_as_i64};
+    use crate::unit_test_utils::{
+        MICROSECOND_TIMESTAMP, assert_min_ts_in_stats_json, evaluate_on_json_rows, json_rows,
+        parse_actions,
+    };
+    use crate::{Engine, Result, version_as_i64};
 
     #[rstest]
     #[case::missing(None, vec![])]
@@ -599,25 +601,15 @@ mod tests {
             build_collation_stats_read_transform(&requested, Some(&source), stats_json_op)?
                 .unwrap();
 
-        let engine = SyncEngine::new();
-        let parsed_stats = json!({ MIN_VALUES: { "ts": "2026-07-02T15:55:55.298677Z" } });
-        let input = parse_actions(
-            &engine,
-            transform.read_schema.clone(),
+        let parsed_stats = json!({ MIN_VALUES: { "ts": MICROSECOND_TIMESTAMP } });
+        let rows = evaluate_on_json_rows(
+            &SyncEngine::new(),
+            transform.read_schema,
+            transform.expression,
+            transform.output_schema,
             &[json!({ "add": { "stats": null, "stats_parsed": parsed_stats } })],
         )?;
-        let output = engine
-            .evaluation_handler()
-            .new_expression_evaluator(
-                transform.read_schema,
-                transform.expression,
-                transform.output_schema.as_ref().clone().into(),
-            )?
-            .evaluate(input.as_ref())?;
-        let rows = json_rows([Ok(FilteredEngineData::with_all_rows_selected(output))].into_iter())?;
-        let stats: Value = serde_json::from_str(rows[0]["add"]["stats"].as_str().unwrap())
-            .map_err(KernelError::from)?;
-        assert_eq!(stats[MIN_VALUES]["ts"], expected_bound, "{stats}");
+        assert_min_ts_in_stats_json(&rows[0]["add"]["stats"], expected_bound);
         Ok(())
     }
 
@@ -900,19 +892,6 @@ mod tests {
         .unwrap();
     }
 
-    fn parse_actions(
-        engine: &dyn Engine,
-        schema: SchemaRef,
-        actions: &[Value],
-    ) -> KernelResult<Box<dyn EngineData>> {
-        engine.json_handler().parse_json(
-            crate::unit_test_utils::string_array_to_engine_data(StringArray::from_iter_values(
-                actions.iter().map(Value::to_string),
-            )),
-            schema,
-        )
-    }
-
     fn write_checkpoint_rows(
         engine: &dyn Engine,
         stats: StructType,
@@ -949,16 +928,6 @@ mod tests {
             schema_context,
             read_schema,
         })
-    }
-
-    fn json_rows(
-        batches: impl Iterator<Item = KernelResult<FilteredEngineData>> + Send,
-    ) -> KernelResult<Vec<Value>> {
-        let bytes = to_json_bytes(batches)?;
-        serde_json::Deserializer::from_slice(&bytes)
-            .into_iter::<Value>()
-            .map(|row| row.map_err(Into::into))
-            .collect()
     }
 
     /// Indexes `rows` by `path`, expecting exactly one row per sample file.
