@@ -1994,7 +1994,7 @@ mod tests {
     fn test_add_files_schema(
         #[values(DataLayout::None, DataLayout::clustered(["id"]))] layout: DataLayout,
     ) -> Result<()> {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let txn = create_table(
             "memory:///t",
             schema_ref! { nullable "id": INTEGER },
@@ -2132,8 +2132,7 @@ mod tests {
 
     #[test]
     fn schema_set_nullable_is_persisted_on_commit() -> Result<()> {
-        let engine: Arc<dyn Engine> =
-            Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let engine: Arc<dyn Engine> = Arc::new(SyncEngine::in_memory());
         let schema = Arc::new(StructType::try_new([
             StructField::not_null("id", DataType::INTEGER),
             StructField::nullable("name", DataType::STRING),
@@ -2488,8 +2487,7 @@ mod tests {
             ColumnMappingMode::Name => "name",
             ColumnMappingMode::Id => "id",
         };
-        let engine: Arc<dyn Engine> =
-            Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let engine: Arc<dyn Engine> = Arc::new(SyncEngine::in_memory());
         // Logical order: [p1, p2, d1, v(void), p3, p4, d2]; partition cols = p1, p2, p3, p4.
         let schema = schema_ref! {
             nullable "p1": STRING,
@@ -3310,8 +3308,7 @@ mod tests {
             ColumnMappingMode::Name => "name",
             ColumnMappingMode::Id => "id",
         };
-        let engine: Arc<dyn Engine> =
-            Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let engine: Arc<dyn Engine> = Arc::new(SyncEngine::in_memory());
         let mut txn = create_table(
             "memory:///row_tracking_logical_to_physical",
             schema_ref! { nullable "value": INTEGER },

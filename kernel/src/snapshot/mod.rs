@@ -2138,7 +2138,7 @@ mod tests {
     }
 
     fn engine_with_published_commits() -> SyncEngine {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let storage = engine.storage_handler();
         for version in [1, 2] {
             let location = Url::parse(&format!(

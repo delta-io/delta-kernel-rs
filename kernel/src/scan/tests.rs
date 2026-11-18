@@ -733,7 +733,7 @@ fn scan_metadata_from_requires_timezone_support_only_for_timestamp_partitions(
     #[values(false, true)] timestamp_partition: bool,
 ) {
     let table_root = "memory:///test_table/";
-    let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+    let engine = SyncEngine::in_memory();
     let partition_type = if timestamp_partition {
         DataType::TIMESTAMP
     } else {

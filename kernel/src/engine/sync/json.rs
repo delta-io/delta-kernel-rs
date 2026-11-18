@@ -2,28 +2,28 @@ use std::io::{BufReader, Cursor};
 use std::sync::Arc;
 
 use bytes::Bytes;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 use derive_more::Constructor;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 use url::Url;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 use super::{put_bytes, read_files_arrow};
 use crate::arrow::json::ReaderBuilder;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{build_json_reorder_indices, fixup_json_read, json_arrow_schema};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 use crate::engine::arrow_utils::{parse_json as arrow_parse_json, to_json_bytes};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 use crate::engine_data::FilteredEngineData;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 use crate::object_store::DynObjectStore;
 use crate::schema::SchemaRef;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 use crate::{EngineData, FileDataReadResultIterator, FileMeta, FileSize, JsonHandler};
 use crate::{KernelResult, KernelResultIterator, PredicateRef};
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 #[derive(Constructor)]
 pub(crate) struct SyncJsonHandler {
     store: Option<Arc<DynObjectStore>>,
@@ -44,7 +44,7 @@ pub(super) fn try_create_from_json(
     Ok(json)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 impl JsonHandler for SyncJsonHandler {
     fn read_json_files(
         &self,

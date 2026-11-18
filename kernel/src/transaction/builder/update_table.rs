@@ -413,7 +413,6 @@ mod tests {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::expressions::ColumnName;
     use crate::expressions::column_name;
-    use crate::object_store::memory::InMemory;
     use crate::schema::{DataType, StructField, schema_ref};
     use crate::snapshot::Snapshot;
     use crate::table_features::TableFeature;
@@ -1194,7 +1193,7 @@ mod tests {
                     ],
                     Some(feature) => panic!("unsupported schema-validation fixture: {feature}"),
                 };
-                let engine = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+                let engine = Arc::new(SyncEngine::in_memory());
                 let snapshot = create_table("memory:///", test_schema_flat(), "test", true)
                     .with_table_properties(properties)
                     .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))

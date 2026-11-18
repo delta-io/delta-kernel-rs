@@ -924,7 +924,6 @@ mod tests {
     use crate::actions::{CommitInfo, Metadata, Protocol};
     use crate::engine::sync::SyncEngine;
     use crate::engine::{CancellableEngine, DelegatingEngine};
-    use crate::object_store::memory::InMemory;
     use crate::schema::{SchemaRef, schema_ref};
     use crate::snapshot::{Snapshot, SnapshotBuilder};
     use crate::table_features::TableFeature;
@@ -2075,7 +2074,7 @@ mod tests {
     /// an engine wired to it plus the corresponding `_delta_log/` URL. Paths listed in
     /// `empty_paths` are written as 0-byte files to exercise empty-file skipping.
     fn engine_with_log_files(paths: &[String], empty_paths: &HashSet<String>) -> (SyncEngine, Url) {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let storage = engine.storage_handler();
         for path in paths {
             let bytes = if empty_paths.contains(path) {
