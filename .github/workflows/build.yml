@@ -115,6 +115,23 @@ jobs:
           components: rustfmt
       - name: format
         run: cargo +nightly fmt -- --check
+      # In a 200K-context session, Claude Code loads only the first 40,000 characters of a nested
+      # instruction file. Codex stops loading instruction files at 32 KiB. Rules past either limit
+      # may never reach the agent.
+      - name: check agent instruction file sizes
+        run: |
+          status=0
+          while IFS= read -r f; do
+            if [ "$(wc -m < "$f")" -gt 40000 ]; then
+              echo "::error file=$f::$f exceeds 40,000 characters."
+              status=1
+            fi
+          done < <(git ls-files '*/AGENTS.md' '*/CLAUDE.md')
+          if [ "$(wc -c < AGENTS.md)" -gt 32768 ]; then
+            echo "::error file=AGENTS.md::AGENTS.md exceeds 32,768 bytes."
+            status=1
+          fi
+          exit "$status"
 
   msrv:
     runs-on: ubuntu-latest
