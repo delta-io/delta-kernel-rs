@@ -87,8 +87,6 @@ fn action_struct<'a>(schema: &'a StructType, action: &str) -> KernelResult<&'a S
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use rstest::rstest;
 
     use super::*;
@@ -96,7 +94,6 @@ mod tests {
     use crate::arrow::array::{AsArray as _, RecordBatch, StringArray};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
-    use crate::object_store::memory::InMemory;
     use crate::schema::schema_ref;
     use crate::unit_test_utils::{
         Action, assert_result_error_with_message, string_array_to_engine_data,
@@ -143,7 +140,7 @@ mod tests {
 
     #[test]
     fn projects_onto_read_schema_with_other_actions_null() {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let read_schema = add_without_stats_and_remove();
         let projector = ActionProjector::try_new(
             &engine,
@@ -205,7 +202,7 @@ mod tests {
         #[case] read_schema: SchemaRef,
         #[case] message: &str,
     ) {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         assert_result_error_with_message(
             ActionProjector::try_new(&engine, ADD_NAME, source, read_schema),
             message,

@@ -353,7 +353,8 @@ mod tests {
     ) -> Result<()> {
         let (_, engine, snapshot) = checkpoint_table(write_json, false).await?;
         let writer = checkpoint_writer(snapshot, &engine)?;
-        let (batches, output_schema) = writer.checkpoint_data_with_schema(&engine)?;
+        let (batches, output_schema) =
+            writer.checkpoint_data_with_schema(&engine, Default::default())?;
         let bound_schema = schema! {
             nullable "physical.with.dot": { nullable "a": STRING, nullable "b": STRING },
         };
@@ -410,9 +411,9 @@ mod tests {
             let snapshot = Snapshot::builder_for("memory:///").build(&engine)?;
             let writer = checkpoint_writer(snapshot, &engine)?;
             let written = if sidecars {
-                writer.write_v2_checkpoint_with_sidecars(&engine, 1)?
+                writer.write_v2_checkpoint_with_sidecars(&engine, 1, Default::default())?
             } else {
-                writer.write_checkpoint_without_sidecars(&engine)?
+                writer.write_checkpoint_without_sidecars(&engine, Default::default())?
             };
             writer.finalize(&engine, &written.last_checkpoint_stats)?;
             let reloaded = Snapshot::builder_for("memory:///").build(&engine)?;

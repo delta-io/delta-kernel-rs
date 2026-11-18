@@ -54,8 +54,8 @@ setup).
 ## Rust API checks
 
 Result alias and public signature changes need doctests and user-guide example compilation in
-addition to workspace checks. Root workspace commands exclude `datafusion-executor` and
-`integration-tests`. Validate those workspaces separately with their supported Arrow features.
+addition to workspace checks. Root workspace commands exclude `integration-tests`.
+Validate that workspace separately with its supported Arrow features.
 
 ## Action safety
 

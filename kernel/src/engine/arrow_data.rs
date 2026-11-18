@@ -292,6 +292,9 @@ impl EngineData for ArrowEngineData {
                 self.len()
             ))
         );
+        if !selection_vector.contains(&false) {
+            return Ok(self);
+        }
         selection_vector.resize(self.len(), true);
         let filtered = filter_record_batch(&self.data, &selection_vector.into())?;
         Ok(Box::new(Self::new(filtered)))
@@ -2038,6 +2041,22 @@ mod tests {
         let column = batch.column(0).as_string::<i32>();
         let values: Vec<_> = column.iter().flatten().collect();
         assert_eq!(values, ["b", "c"]);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::empty(vec![])]
+    #[case::shorter_all_true(vec![true])]
+    #[case::all_true(vec![true, true, true])]
+    fn test_apply_selection_vector_selecting_all_rows_returns_data_unfiltered(
+        #[case] selection_vector: Vec<bool>,
+    ) -> KernelResult<()> {
+        let data = string_array_to_engine_data(StringArray::from(vec!["a", "b", "c"]));
+        let column = extract_record_batch(data.as_ref())?.column(0).clone();
+        let filtered = data.apply_selection_vector(selection_vector)?;
+        let batch = extract_record_batch(filtered.as_ref())?;
+        assert_eq!(batch.num_rows(), 3);
+        assert!(Arc::ptr_eq(batch.column(0), &column));
         Ok(())
     }
 

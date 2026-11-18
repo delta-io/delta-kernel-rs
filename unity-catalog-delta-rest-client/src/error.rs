@@ -56,6 +56,8 @@ impl From<Error> for unity_catalog_delta_client_api::Error {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     #[test]
@@ -72,12 +74,23 @@ mod tests {
             unity_catalog_delta_client_api::Error::from(rest_err),
             unity_catalog_delta_client_api::Error::AuthenticationFailed
         ));
+    }
 
+    #[rstest]
+    #[case(Some(5), "Max unpublished commits exceeded (max: 5)")]
+    #[case(None, "Max unpublished commits exceeded")]
+    fn from_error_preserves_unpublished_commit_limit(
+        #[case] limit: Option<u16>,
+        #[case] message: &str,
+    ) {
         let rest_err =
-            Error::Api(unity_catalog_delta_client_api::Error::MaxUnpublishedCommitsExceeded(5));
+            Error::Api(unity_catalog_delta_client_api::Error::MaxUnpublishedCommitsExceeded(limit));
+        let api_err = unity_catalog_delta_client_api::Error::from(rest_err);
+        assert_eq!(api_err.to_string(), message);
         assert!(matches!(
-            unity_catalog_delta_client_api::Error::from(rest_err),
-            unity_catalog_delta_client_api::Error::MaxUnpublishedCommitsExceeded(5)
+            api_err,
+            unity_catalog_delta_client_api::Error::MaxUnpublishedCommitsExceeded(actual)
+                if actual == limit
         ));
     }
 

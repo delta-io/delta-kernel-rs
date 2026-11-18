@@ -89,6 +89,7 @@ pub enum FFIKernelError {
     TableAlreadyExistsAtPath = 54,
     CommitRangeError = 55,
     InvalidIntervalError = 56,
+    UnsupportedFileUriError = 57,
 }
 
 impl From<KernelError> for FFIKernelError {
@@ -147,6 +148,7 @@ impl From<&KernelError> for FFIKernelError {
             KernelError::InvalidTableLocation(_) => FFIKernelError::InvalidTableLocationError,
             KernelError::InvalidDecimal(_) => FFIKernelError::InvalidDecimalError,
             KernelError::InvalidInterval(_) => FFIKernelError::InvalidIntervalError,
+            KernelError::UnsupportedFileUri(_) => FFIKernelError::UnsupportedFileUriError,
             KernelError::InvalidGeoParams(_) => FFIKernelError::InvalidGeoParamsError,
             KernelError::InvalidStructData(_) => FFIKernelError::InvalidStructDataError,
             KernelError::InternalError(_) => FFIKernelError::InternalError,
@@ -344,6 +346,7 @@ impl From<EngineExecError> for KernelError {
             FFIKernelError::InvalidTableLocationError => KernelError::InvalidTableLocation(message),
             FFIKernelError::InvalidDecimalError => KernelError::InvalidDecimal(message),
             FFIKernelError::InvalidIntervalError => KernelError::InvalidInterval(message),
+            FFIKernelError::UnsupportedFileUriError => KernelError::UnsupportedFileUri(message),
             FFIKernelError::InvalidGeoParamsError => KernelError::InvalidGeoParams(message),
             FFIKernelError::InvalidStructDataError => KernelError::InvalidStructData(message),
             FFIKernelError::InvalidExpression => KernelError::InvalidExpressionEvaluation(message),
@@ -569,6 +572,19 @@ mod error_code_tests {
             err,
             KernelError::TableAlreadyExistsAtPath(path) if path == "memory:///table"
         ));
+    }
+
+    #[test]
+    fn unsupported_file_uri_error_has_stable_ffi_mapping() {
+        assert_eq!(
+            FFIKernelError::from(KernelError::UnsupportedFileUri("invalid".to_string())),
+            FFIKernelError::UnsupportedFileUriError
+        );
+        assert_eq!(FFIKernelError::UnsupportedFileUriError as i32, 57);
+
+        let err: KernelError =
+            exec_error(FFIKernelError::UnsupportedFileUriError, "invalid").into();
+        assert!(matches!(err, KernelError::UnsupportedFileUri(message) if message == "invalid"));
     }
 
     #[test]

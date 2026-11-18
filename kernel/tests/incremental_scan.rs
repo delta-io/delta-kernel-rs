@@ -32,12 +32,12 @@ use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::delta_kernel_default_engine::json::DefaultJsonHandler;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
+use test_utils::log_compaction::write_compaction_from_commits;
 use test_utils::{
     TestAction, actions_to_string, actions_to_string_catalog_managed,
     actions_to_string_partitioned, add_commit, add_staged_commit, assert_result_error_with_message,
-    compacted_log_path_for_versions, create_log_path, create_table_and_load_snapshot,
-    delta_path_for_version, get_column, into_record_batch, test_table_setup_mt,
-    write_batch_to_table,
+    create_log_path, create_table_and_load_snapshot, delta_path_for_version, get_column,
+    into_record_batch, test_table_setup_mt, write_batch_to_table,
 };
 use url::Url;
 
@@ -552,12 +552,7 @@ async fn compaction_file_in_range_is_ignored() -> Result<(), Box<dyn std::error:
     )
     .await?;
 
-    // Drop a compaction file covering 1-3 next to the commit JSONs. Body is irrelevant
-    // because the incremental scan never opens it.
-    let compaction_path: ObjectStorePath = compacted_log_path_for_versions(1, 3, "json");
-    storage
-        .put(&compaction_path, bytes::Bytes::new().into())
-        .await?;
+    write_compaction_from_commits(table_root, storage.as_ref(), 1, 3).await?;
 
     let target = Snapshot::builder_for(table_url)
         .at_version(3)

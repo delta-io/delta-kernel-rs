@@ -76,15 +76,13 @@ pub use self::arrow_utils::{parse_json, to_json_bytes};
 #[cfg(all(feature = "declarative-plans", feature = "default-engine-base"))]
 pub mod plans;
 
-#[cfg(any(
-    test,
-    all(
-        feature = "test-utils",
-        feature = "declarative-plans",
-        feature = "default-engine-base"
-    )
-))]
+#[cfg(any(test, all(feature = "test-utils", feature = "default-engine-base")))]
 pub mod sync;
+
+#[cfg(any(test, feature = "test-utils"))]
+mod relaxed_counter;
+#[cfg(any(test, feature = "test-utils"))]
+pub use relaxed_counter::RelaxedCounter;
 
 #[cfg(any(test, feature = "test-utils"))]
 mod test_delegating;

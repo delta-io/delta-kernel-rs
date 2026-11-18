@@ -462,7 +462,9 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
                 // The callback carries no qualifier, so narrowed types lose it here.
                 call!(visit_interval_year_month)
             }
-            &DataType::INTERVAL_DAY_TIME => call!(visit_interval_day_time),
+            DataType::Primitive(PrimitiveType::IntervalDayTime(_)) => {
+                call!(visit_interval_day_time)
+            }
             &DataType::VOID => call!(visit_void),
             #[cfg(feature = "geo-type-in-dev")]
             DataType::Primitive(PrimitiveType::Geometry(geometry)) => {
@@ -753,6 +755,8 @@ mod tests {
             nullable "narrow_year": INTERVAL_YEAR,
             nullable "narrow_month": INTERVAL_MONTH,
             not_null "dt": INTERVAL_DAY_TIME,
+            nullable "narrow_day": INTERVAL_DAY,
+            nullable "narrow_hour_minute": INTERVAL_HOUR_MINUTE,
             nullable "nested": {
                 nullable "inner_ym": INTERVAL_YEAR_MONTH,
             },
@@ -764,7 +768,7 @@ mod tests {
         let top_level_id = visit_schema_impl(&schema, &mut visitor);
 
         assert_eq!(top_level_id, 0);
-        assert_eq!(builder.lists[0].len(), 6);
+        assert_eq!(builder.lists[0].len(), 8);
         assert_eq!(
             builder.lists[0][0],
             VisitedField::new("ym", "interval year to month", true, None)
@@ -781,14 +785,22 @@ mod tests {
             builder.lists[0][3],
             VisitedField::new("dt", "interval day to second", false, None)
         );
+        assert_eq!(
+            builder.lists[0][4],
+            VisitedField::new("narrow_day", "interval day to second", true, None)
+        );
+        assert_eq!(
+            builder.lists[0][5],
+            VisitedField::new("narrow_hour_minute", "interval day to second", true, None)
+        );
 
-        let nested_child_list_id = builder.lists[0][4].children.unwrap();
+        let nested_child_list_id = builder.lists[0][6].children.unwrap();
         assert_eq!(
             builder.lists[nested_child_list_id][0],
             VisitedField::new("inner_ym", "interval year to month", true, None)
         );
 
-        let array_child_list_id = builder.lists[0][5].children.unwrap();
+        let array_child_list_id = builder.lists[0][7].children.unwrap();
         assert_eq!(
             builder.lists[array_child_list_id][0],
             VisitedField::new("array_element", "interval day to second", false, None)

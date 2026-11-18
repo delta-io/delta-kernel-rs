@@ -1,0 +1,11 @@
+Reading table at ../../../../acceptance/workloads/reads_byte_boundaries/delta/
+version: 1
+
+Schema:
+└─ b: byte
+
+b:  [
+  -128,
+  0,
+  127
+]

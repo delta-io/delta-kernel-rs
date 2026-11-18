@@ -311,3 +311,6 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(feature = "declarative-plans")]
+pub(crate) mod plan;

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::{ArrayRef, Int32Array};
 use delta_kernel::committer::{Committer, FileSystemCommitter};
-use delta_kernel::schema::{schema, schema_ref};
+use delta_kernel::schema::{DataType, schema, schema_ref};
 use delta_kernel::snapshot::{
     CheckpointWriteResult, ChecksumWriteResult, IncrementalReplay, SnapshotBuilder,
 };
@@ -54,7 +54,7 @@ async fn append_row<E: TaskExecutor>(
     engine: &Arc<DefaultEngine<E>>,
     kind: TableKind,
     value: i32,
-) -> KernelResult<Arc<Snapshot>> {
+) -> delta_kernel::Result<Arc<Snapshot>> {
     let column: ArrayRef = Arc::new(Int32Array::from(vec![value]));
     Ok(insert_data_with(
         snapshot,
@@ -103,9 +103,16 @@ async fn setup_multi_version_table<E: TaskExecutor>(
     Ok(())
 }
 
+#[rstest]
+#[case::formerly_rejected(42, false)]
+#[case::supported(331, false)]
+#[case::exceeded(332, true)]
 #[tokio::test]
-async fn deeply_nested_schema_snapshot_load_returns_schema_error() -> KernelResult<()> {
-    let deeply_nested_schema = (0..42).fold(
+async fn snapshot_schema_nesting_boundary(
+    #[case] depth: usize,
+    #[case] exceeds_limit: bool,
+) -> KernelResult<()> {
+    let deeply_nested_schema = (0..depth).fold(
         schema! { nullable "leaf": INTEGER },
         |nested, depth| schema! { nullable (format!("level_{depth}")): (nested) },
     );
@@ -128,12 +135,15 @@ async fn deeply_nested_schema_snapshot_load_returns_schema_error() -> KernelResu
     add_commit(table_url.as_str(), store.as_ref(), 0, commit).await?;
 
     let result = Snapshot::builder_for(table_url).build(&engine);
+    if !exceeds_limit {
+        assert_eq!(result.unwrap().schema().as_ref(), &deeply_nested_schema);
+        return Ok(());
+    }
     assert_result_error_with_message(
         result.as_ref(),
         concat!(
             "Schema error: Table schema is too deeply nested: decoding ",
-            "metaData.schemaString exceeded serde_json's ",
-            "recursion limit: recursion limit exceeded"
+            "metaData.schemaString reached the JSON recursion limit of 1000"
         ),
     );
     let delta_kernel::Error::Kernel(error) = result.unwrap_err() else {
@@ -144,6 +154,58 @@ async fn deeply_nested_schema_snapshot_load_returns_schema_error() -> KernelResu
         error => error,
     };
     assert!(matches!(error, KernelError::Schema(_)));
+    Ok(())
+}
+
+/// Persisted schemas use the field omission defaults while still requiring column-mapping
+/// annotations.
+#[rstest]
+#[case::no_mapping(None, None)]
+#[case::name_mapping(Some("name"), Some("delta.columnMapping.physicalName"))]
+#[case::id_mapping(Some("id"), Some("delta.columnMapping.physicalName"))]
+#[tokio::test]
+async fn snapshot_schema_without_field_metadata(
+    #[case] mapping_mode: Option<&str>,
+    #[case] expected_error: Option<&str>,
+    #[values(None, Some(false), Some(true))] nullable: Option<bool>,
+) -> delta_kernel::Result<()> {
+    let (store, engine, table_url) = engine_store_setup("schema_without_field_metadata", None);
+    let mut field = json!({"name": "value", "type": "long"});
+    if let Some(nullable) = nullable {
+        field["nullable"] = nullable.into();
+    }
+    let schema = json!({"type": "struct", "fields": [field]});
+    let configuration: HashMap<_, _> = mapping_mode
+        .map(|mode| ("delta.columnMapping.mode", mode))
+        .into_iter()
+        .collect();
+    let commit = [
+        json!({"protocol": {"minReaderVersion": 2, "minWriterVersion": 5}}),
+        json!({"metaData": {
+            "id": "schema-without-field-metadata",
+            "format": {"provider": "parquet", "options": {}},
+            "schemaString": schema.to_string(),
+            "partitionColumns": [],
+            "configuration": configuration,
+            "createdTime": 0
+        }}),
+    ]
+    .map(|action| action.to_string())
+    .join("\n");
+    add_commit(table_url.as_str(), store.as_ref(), 0, commit).await?;
+
+    let result = Snapshot::builder_for(table_url).build(&engine);
+    if let Some(expected_error) = expected_error {
+        assert_result_error_with_message(result, expected_error);
+    } else {
+        let snapshot = result?;
+        assert_eq!(snapshot.version(), 0);
+        let schema = snapshot.schema();
+        let field = schema.field("value").unwrap();
+        assert_eq!(field.data_type(), &DataType::LONG);
+        assert_eq!(field.is_nullable(), nullable.unwrap_or(true));
+        assert!(field.metadata().is_empty());
+    }
     Ok(())
 }
 

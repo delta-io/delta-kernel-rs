@@ -61,7 +61,6 @@ mod tests {
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::Scalar;
-    use crate::object_store::memory::InMemory;
     use crate::schema::StructType;
     use crate::unit_test_utils::adaptive_metadata_fixtures::write_sidecar;
     use crate::unit_test_utils::{TestCancellationToken, assert_result_error_with_message};
@@ -111,7 +110,7 @@ mod tests {
         #[case] row: fn(&str) -> Scalar,
         #[case] other_schema: SchemaRef,
     ) {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let write =
             |name, rows| write_sidecar(&engine, &table_root(), name, source_schema.clone(), rows);
         let sidecars = [
@@ -151,7 +150,7 @@ mod tests {
 
     #[test]
     fn no_sidecars_reads_nothing() {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let batches = read_sidecar_actions(
             &engine,
             &log_root(),
@@ -166,7 +165,7 @@ mod tests {
 
     #[test]
     fn cancelled_read_stops() {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let sidecar = write_sidecar(
             &engine,
             &table_root(),
@@ -188,7 +187,7 @@ mod tests {
 
     #[test]
     fn missing_sidecar_errors_with_its_path() {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let sidecar = Sidecar::new("missing.parquet".to_string(), 1, 0, None);
         let result = read_sidecar_actions(
             &engine,

@@ -264,7 +264,9 @@ mod tests {
 
     use super::*;
     use crate::expressions::Scalar;
-    use crate::schema::{ArrayType, DataType, IntervalYearToMonthType, MapType, schema};
+    use crate::schema::{
+        ArrayType, DataType, IntervalDayToSecondType, IntervalYearToMonthType, MapType, schema,
+    };
 
     fn assert_type_ok(data_type: DataType, value: Scalar) {
         let schema = schema! { not_null "p": (data_type) };
@@ -557,6 +559,24 @@ mod tests {
         assert!(err.contains("p"), "{err}");
     }
 
+    fn assert_interval_qualifier_matches_schema(
+        schema_type: DataType,
+        value: Scalar,
+        qualifiers_match: bool,
+    ) {
+        let schema = schema! { not_null "p": (schema_type) };
+        let values = HashMap::from([("p".to_string(), value)]);
+        let result = validate_types(&schema, &values);
+        if qualifiers_match {
+            result.unwrap();
+        } else {
+            assert!(matches!(
+                result,
+                Err(KernelError::InvalidPartitionValues(_))
+            ));
+        }
+    }
+
     #[rstest]
     fn test_validate_types_year_month_qualifier_matches_schema(
         #[values(
@@ -572,20 +592,47 @@ mod tests {
         )]
         value_qualifier: IntervalYearToMonthType,
     ) {
-        let schema = schema! {
-            not_null "p": (DataType::interval_year_month(schema_qualifier))
-        };
-        let value = Scalar::interval_year_month(24, value_qualifier).unwrap();
-        let values = HashMap::from([("p".to_string(), value)]);
-        let result = validate_types(&schema, &values);
-        if schema_qualifier == value_qualifier {
-            result.unwrap();
-        } else {
-            assert!(matches!(
-                result,
-                Err(KernelError::InvalidPartitionValues(_))
-            ));
-        }
+        assert_interval_qualifier_matches_schema(
+            DataType::interval_year_month(schema_qualifier),
+            Scalar::interval_year_month(24, value_qualifier).unwrap(),
+            schema_qualifier == value_qualifier,
+        );
+    }
+
+    #[rstest]
+    fn test_validate_types_day_time_qualifier_matches_schema(
+        #[values(
+            IntervalDayToSecondType::IntervalDay,
+            IntervalDayToSecondType::IntervalHour,
+            IntervalDayToSecondType::IntervalMinute,
+            IntervalDayToSecondType::IntervalSecond,
+            IntervalDayToSecondType::IntervalDayToHour,
+            IntervalDayToSecondType::IntervalDayToMinute,
+            IntervalDayToSecondType::IntervalDayToSecond,
+            IntervalDayToSecondType::IntervalHourToMinute,
+            IntervalDayToSecondType::IntervalHourToSecond,
+            IntervalDayToSecondType::IntervalMinuteToSecond
+        )]
+        schema_qualifier: IntervalDayToSecondType,
+        #[values(
+            IntervalDayToSecondType::IntervalDay,
+            IntervalDayToSecondType::IntervalHour,
+            IntervalDayToSecondType::IntervalMinute,
+            IntervalDayToSecondType::IntervalSecond,
+            IntervalDayToSecondType::IntervalDayToHour,
+            IntervalDayToSecondType::IntervalDayToMinute,
+            IntervalDayToSecondType::IntervalDayToSecond,
+            IntervalDayToSecondType::IntervalHourToMinute,
+            IntervalDayToSecondType::IntervalHourToSecond,
+            IntervalDayToSecondType::IntervalMinuteToSecond
+        )]
+        value_qualifier: IntervalDayToSecondType,
+    ) {
+        assert_interval_qualifier_matches_schema(
+            DataType::interval_day_time(schema_qualifier),
+            Scalar::interval_day_time(86_400_000_000, value_qualifier).unwrap(),
+            schema_qualifier == value_qualifier,
+        );
     }
 
     /// Complex types (struct, array, map) are rejected as partition column types.

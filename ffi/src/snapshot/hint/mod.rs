@@ -23,7 +23,6 @@ mod export;
 ///
 /// # Errors
 ///
-/// Returns `InvalidSnapshotHint` if the retained segment contains unsupported compaction files.
 /// Returns an error if checkpoint schema serialization fails. Returns `UnsupportedError` if the
 /// CRC contains experimental adaptive-metadata `lastManifestCommit` or Add `backReference` state
 /// when built with `adaptive-metadata-in-dev`, which the typed representation cannot preserve.
@@ -184,8 +183,8 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
 ///
 /// Returns `UnsupportedError` when the builder was created by
 /// [`get_snapshot_builder_from`](crate::get_snapshot_builder_from). Returns
-/// `InvalidSnapshotHint` when a supplied field cannot be decoded, a log path is outside the table
-/// log root, or a log path names an unsupported log compaction file.
+/// `InvalidSnapshotHint` when a supplied field cannot be decoded or a log path is outside the
+/// table log root. Compacted paths are retained; the individual commits must also be supplied.
 /// Structural log-segment and table-configuration errors are returned when the builder is built.
 /// A failed call drops the builder.
 ///

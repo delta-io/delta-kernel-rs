@@ -9,7 +9,7 @@ use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::{Committer, FileSystemCommitter};
 use delta_kernel::metrics::{MetricEvent, TableType};
 use delta_kernel::transaction::create_table::create_table;
-use delta_kernel::{Engine, KernelResult, Snapshot};
+use delta_kernel::{Engine, Snapshot};
 use rstest::rstest;
 use test_utils::{
     CapturingReporter, TestCatalogCommitter, add_commit, engine_store_setup, insert_data_with,
@@ -193,7 +193,7 @@ pub(super) fn create_simple_table(
     engine: &dyn Engine,
     table_path: &str,
     catalog_managed: bool,
-) -> KernelResult<()> {
+) -> delta_kernel::Result<()> {
     let builder = create_table(table_path, simple_schema(), "Test/1.0", true);
     let builder = if catalog_managed {
         builder.with_table_properties([

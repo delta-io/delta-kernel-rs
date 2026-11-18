@@ -4,7 +4,12 @@ use std::backtrace::Backtrace;
 use std::error::Error as StdError;
 use std::fmt;
 
-use super::DeltaErrorCondition;
+use super::{BoxedError, DeltaErrorCondition};
+use crate::Version;
+use crate::schema::StructType;
+use crate::table_properties::LOG_RETENTION_DURATION;
+#[cfg(any(test, feature = "test-utils"))]
+use crate::{KernelError, KernelResult};
 
 /// A catalog-defined Delta failure that terminates the current operation.
 ///
@@ -17,10 +22,13 @@ use super::DeltaErrorCondition;
 /// [`fmt::Display`] renders only the catalog message. The original cause is available through
 /// [`StdError::source`], and [`fmt::Debug`] includes every field and the rendered message.
 /// Diagnostic values are not redacted. Connectors are responsible for redacting telemetry.
+///
+/// Condition-specific constructors accept an optional diagnostic source. Passing `None` leaves
+/// the source chain empty; it does not affect the catalog condition or message parameters.
 pub struct DeltaError {
     condition: DeltaErrorCondition,
     parameters: Box<[DeltaErrorParameter]>,
-    source: Option<Box<dyn StdError + Send + Sync + 'static>>,
+    source: Option<BoxedError>,
     backtrace: Backtrace,
 }
 
@@ -43,11 +51,11 @@ impl DeltaError {
     pub fn for_test(
         condition: DeltaErrorCondition,
         values: &[&str],
-        source: Option<Box<dyn StdError + Send + Sync + 'static>>,
-    ) -> super::KernelResult<Self> {
+        source: Option<BoxedError>,
+    ) -> KernelResult<Self> {
         let names = condition.parameter_names();
         if names.len() != values.len() {
-            return Err(super::KernelError::generic(format!(
+            return Err(KernelError::generic(format!(
                 "{} requires {} parameters, got {}",
                 condition.name(),
                 names.len(),
@@ -100,8 +108,8 @@ impl DeltaError {
     /// Creates a `DELTA_PATH_DOES_NOT_EXIST` error for a table root that does not exist or has no
     /// Delta log.
     ///
-    /// `path` is the table root as the caller supplied it. `source` is the error that detected
-    /// the missing table and is preserved for downcasting through [`StdError::source`].
+    /// `path` is the table root as the caller supplied it. An optional `source` preserves the error
+    /// that detected the missing table for downcasting through [`StdError::source`].
     ///
     /// ```
     /// use delta_kernel::{DeltaError, DeltaErrorCondition};
@@ -109,18 +117,171 @@ impl DeltaError {
     /// use std::io;
     ///
     /// let source = io::Error::from(io::ErrorKind::NotFound);
-    /// let error = DeltaError::path_does_not_exist("/path/to/table", source);
+    /// let error = DeltaError::path_does_not_exist("/path/to/table", Some(Box::new(source)));
     /// assert_eq!(error.condition(), DeltaErrorCondition::DeltaPathDoesNotExist);
     /// assert_eq!(error.parameters()[0].value(), "/path/to/table");
     /// let source = error.source().unwrap().downcast_ref::<io::Error>().unwrap();
     /// assert_eq!(source.kind(), io::ErrorKind::NotFound);
     /// ```
-    pub fn path_does_not_exist(path: &str, source: impl StdError + Send + Sync + 'static) -> Self {
+    pub fn path_does_not_exist(path: &str, source: Option<BoxedError>) -> Self {
         Self::new(
             DeltaErrorCondition::DeltaPathDoesNotExist,
             vec![DeltaErrorParameter::new("path", path)],
-            Some(Box::new(source)),
+            source,
         )
+    }
+
+    /// Reports the observed `versions` and required bounds while loading `version_to_load`.
+    /// Bounds describe the commit interval being validated, not the table's retained history.
+    pub fn versions_not_contiguous(
+        versions: impl IntoIterator<Item = Version>,
+        start_version: Version,
+        end_version: Version,
+        version_to_load: Version,
+        source: Option<BoxedError>,
+    ) -> Self {
+        let versions = versions
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        Self::new(
+            DeltaErrorCondition::DeltaVersionsNotContiguous,
+            vec![
+                DeltaErrorParameter::new("versionList", versions),
+                DeltaErrorParameter::new("startVersion", start_version),
+                DeltaErrorParameter::new("endVersion", end_version),
+                DeltaErrorParameter::new("versionToLoad", version_to_load),
+            ],
+            source,
+        )
+    }
+
+    /// Reports a missing file encountered while replaying `version` after `checkpoint_version`.
+    /// `log_path` identifies the log directory. The original read failure remains as the source.
+    pub fn log_file_not_found(
+        version: Version,
+        checkpoint_version: Version,
+        log_path: impl ToString,
+        source: Option<BoxedError>,
+    ) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaLogFileNotFound,
+            vec![
+                DeltaErrorParameter::new("version", version),
+                DeltaErrorParameter::new("checkpointVersion", checkpoint_version),
+                DeltaErrorParameter::new("logPath", log_path),
+            ],
+            source,
+        )
+    }
+
+    /// Reports missing history at `path` needed to reconstruct the last observed commit `version`.
+    ///
+    /// `path` identifies the first missing commit. Retention values describe the table's configured
+    /// policies when known. Pass `None` when metadata is unavailable to report `unknown`.
+    pub fn truncated_transaction_log(
+        path: impl ToString,
+        version: Version,
+        log_retention: Option<&str>,
+        checkpoint_retention: Option<&str>,
+        source: Option<BoxedError>,
+    ) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaTruncatedTransactionLog,
+            vec![
+                DeltaErrorParameter::new("path", path),
+                DeltaErrorParameter::new("version", version),
+                DeltaErrorParameter::new("logRetentionKey", LOG_RETENTION_DURATION),
+                DeltaErrorParameter::new("logRetention", log_retention.unwrap_or("unknown")),
+                DeltaErrorParameter::new(
+                    "checkpointRetentionKey",
+                    "delta.checkpointRetentionDuration",
+                ),
+                DeltaErrorParameter::new(
+                    "checkpointRetention",
+                    checkpoint_retention.unwrap_or("unknown"),
+                ),
+            ],
+            source,
+        )
+    }
+
+    /// Reports an invalid signed version from a catalog response, retaining its validation cause.
+    pub fn invalid_version(version: i64, source: Option<BoxedError>) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaVersionInvalid,
+            vec![DeltaErrorParameter::new("version", version)],
+            source,
+        )
+    }
+
+    /// Reports the duplicate partition column `name` stored in table metadata.
+    pub fn duplicate_partition_column(name: &str, source: Option<BoxedError>) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaDuplicateColumnsFoundPartitionColumns,
+            vec![DeltaErrorParameter::new("duplicateCols", name)],
+            source,
+        )
+    }
+
+    /// Reports a declared partition `column` absent from the logical `schema`.
+    pub fn partition_column_not_found(
+        column: &str,
+        schema: &StructType,
+        source: Option<BoxedError>,
+    ) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaPartitionColumnNotFound,
+            vec![
+                DeltaErrorParameter::new("columnName", column),
+                DeltaErrorParameter::new("schemaMap", schema),
+            ],
+            source,
+        )
+    }
+
+    /// Reports the explicitly stored column-mapping `mode` incompatible with adaptive metadata.
+    /// Accepts a [`crate::table_features::ColumnMappingMode`] or an unrecognized stored value.
+    /// `source` retains the protocol validation failure for diagnostics.
+    pub fn adaptive_metadata_mapping_mode(mode: impl ToString, source: Option<BoxedError>) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaAdaptiveMetadataRequiresColumnMappingIdMode,
+            vec![
+                DeltaErrorParameter::new("feature", "adaptiveMetadata-preview"),
+                DeltaErrorParameter::new("prop", "delta.columnMapping.mode"),
+                DeltaErrorParameter::new("mode", mode),
+            ],
+            source,
+        )
+    }
+
+    /// Reports a duplicate logical field `name` in the persisted table schema.
+    /// `source` retains the schema decoder's original failure and location.
+    pub fn duplicate_schema_field(name: &str, source: Option<BoxedError>) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaDuplicateColumnsFoundExistingSchema,
+            vec![DeltaErrorParameter::new("duplicateCols", name)],
+            source,
+        )
+    }
+
+    /// Reports an unsupported persisted type token `name`, retaining the legacy schema `source`.
+    pub fn unsupported_schema_type(name: &str, source: Option<BoxedError>) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaParsingUnsupportedDataType,
+            vec![DeltaErrorParameter::new("dataType", name)],
+            source,
+        )
+    }
+
+    /// Adds diagnostic context ahead of the original source without changing catalog metadata.
+    pub(crate) fn with_context(mut self, context: String) -> Self {
+        self.source = Some(Box::new(DiagnosticContext {
+            context,
+            source: self.source.take(),
+        }));
+        self
     }
 
     /// Creates an error with an optional diagnostic cause and captures its backtrace.
@@ -130,7 +291,7 @@ impl DeltaError {
     fn new(
         condition: DeltaErrorCondition,
         parameters: Vec<DeltaErrorParameter>,
-        source: Option<Box<dyn StdError + Send + Sync + 'static>>,
+        source: Option<BoxedError>,
     ) -> Self {
         debug_assert!(
             parameters
@@ -152,6 +313,14 @@ impl DeltaError {
             backtrace: Backtrace::capture(),
         }
     }
+}
+
+/// Operation context retained in the diagnostic source chain, outside the catalog message.
+#[derive(Debug, thiserror::Error)]
+#[error("{context}")]
+struct DiagnosticContext {
+    context: String,
+    source: Option<BoxedError>,
 }
 
 /// Renders the catalog message, inserting parameter values verbatim.
@@ -237,7 +406,9 @@ mod tests {
     use rstest::rstest;
 
     use super::{DeltaError, DeltaErrorParameter, render_template};
-    use crate::{DeltaErrorCondition, Error, Result};
+    use crate::schema::StructType;
+    use crate::table_features::ColumnMappingMode;
+    use crate::{BoxedError, DeltaErrorCondition, Error, KernelError, Result};
 
     struct LimitedWriter {
         remaining_bytes: usize,
@@ -251,6 +422,83 @@ mod tests {
                 .ok_or(fmt::Error)?;
             Ok(())
         }
+    }
+
+    #[rstest]
+    #[case::missing_path(|source| DeltaError::path_does_not_exist("table", source))]
+    #[case::version_gap(|source| DeltaError::versions_not_contiguous([0, 2], 0, 2, 2, source))]
+    #[case::missing_log(|source| DeltaError::log_file_not_found(2, 0, "table/_delta_log", source))]
+    #[case::truncated_log(|source| DeltaError::truncated_transaction_log(
+        "table/_delta_log/00000000000000000001.json", 2, None, None, source
+    ))]
+    #[case::invalid_version(|source| DeltaError::invalid_version(-1, source))]
+    #[case::duplicate_partition(|source| DeltaError::duplicate_partition_column("p", source))]
+    #[case::missing_partition(|source| DeltaError::partition_column_not_found(
+        "p", &StructType::try_new([]).unwrap(), source
+    ))]
+    #[case::adaptive_metadata(|source| DeltaError::adaptive_metadata_mapping_mode(
+        ColumnMappingMode::Name, source
+    ))]
+    #[case::duplicate_schema_field(|source| DeltaError::duplicate_schema_field("a", source))]
+    #[case::unsupported_type(|source| DeltaError::unsupported_schema_type("unknown", source))]
+    fn constructors_preserve_metadata_with_optional_sources(
+        #[case] make_error: fn(Option<BoxedError>) -> DeltaError,
+        #[values("none", "kernel", "io")] source_kind: &str,
+    ) {
+        let without_source = make_error(None);
+        let source: Option<BoxedError> = match source_kind {
+            "none" => None,
+            "kernel" => Some(Box::new(KernelError::generic("original cause"))),
+            "io" => Some(Box::new(io::Error::from(io::ErrorKind::NotFound))),
+            _ => unreachable!(),
+        };
+        let error = make_error(source);
+        assert_eq!(error.condition(), without_source.condition());
+        assert_eq!(error.parameters(), without_source.parameters());
+        assert_eq!(error.message(), without_source.message());
+        match source_kind {
+            "kernel" => assert!(matches!(
+                error.source().unwrap().downcast_ref::<KernelError>(),
+                Some(KernelError::Generic(message)) if message == "original cause"
+            )),
+            "io" => assert_eq!(
+                error
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<io::Error>()
+                    .unwrap()
+                    .kind(),
+                io::ErrorKind::NotFound
+            ),
+            "none" => assert!(error.source().is_none()),
+            _ => unreachable!(),
+        }
+    }
+
+    #[rstest]
+    fn truncated_log_reports_known_or_unknown_retention(
+        #[values(None, Some("interval 30 days"))] log_retention: Option<&str>,
+        #[values(None, Some("interval 2 days"))] checkpoint_retention: Option<&str>,
+    ) {
+        let error = DeltaError::truncated_transaction_log(
+            "table/_delta_log/00000000000000000005.json",
+            7,
+            log_retention,
+            checkpoint_retention,
+            None,
+        );
+        let log_retention = log_retention.unwrap_or("unknown");
+        let checkpoint_retention = checkpoint_retention.unwrap_or("unknown");
+        assert_eq!(
+            error.message(),
+            format!(
+                "table/_delta_log/00000000000000000005.json: Unable to reconstruct state at \
+                 version 7 as the transaction log has been truncated due to manual deletion or \
+                 the log retention policy (delta.logRetentionDuration={log_retention}) and \
+                 checkpoint retention policy \
+                 (delta.checkpointRetentionDuration={checkpoint_retention})"
+            )
+        );
     }
 
     #[rstest]
@@ -419,10 +667,7 @@ mod tests {
         );
     }
 
-    fn version_gap_error(
-        version_list: &str,
-        source: Option<Box<dyn StdError + Send + Sync + 'static>>,
-    ) -> DeltaError {
+    fn version_gap_error(version_list: &str, source: Option<BoxedError>) -> DeltaError {
         DeltaError::new(
             DeltaErrorCondition::DeltaVersionsNotContiguous,
             vec![

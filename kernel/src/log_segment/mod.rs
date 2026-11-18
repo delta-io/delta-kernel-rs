@@ -24,6 +24,7 @@ use crate::actions::{
 use crate::checkpoint::collation_stats::{
     build_collation_stats_read_transform, source_collation_stats,
 };
+use crate::checkpoint::metrics::{CheckpointMetrics, CheckpointPhase};
 use crate::committer::CatalogCommit;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::content_tree::read_checkpoint_action;
@@ -48,8 +49,8 @@ use crate::schema::{
 };
 use crate::utils::require;
 use crate::{
-    Engine, FileMeta, KernelError, KernelResult, KernelResultIterator, Predicate, PredicateRef,
-    RowVisitor, StorageHandler, Version,
+    DeltaError, Engine, Error, FileMeta, KernelError, KernelResult, KernelResultIterator,
+    Predicate, PredicateRef, Result, RowVisitor, StorageHandler, Version,
 };
 
 mod crc_replay;
@@ -68,16 +69,16 @@ mod protocol_metadata_replay_amt_tests;
 #[cfg(test)]
 pub(crate) mod tests;
 
-/// Statistics for the commit files selected to replay a snapshot's log segment.
+/// Statistics for the original commit files in a snapshot's log segment.
 ///
-/// Includes published and staged commits, and selected log compactions in place of the commits
-/// they cover. Excludes checkpoints, sidecars, CRCs, and commits retained only for timestamp
-/// lookup.
+/// Includes published and staged commits after the checkpoint. Excludes log compactions, even
+/// when scans read them in place of the commits they cover, as well as checkpoints, sidecars,
+/// CRCs, and commits retained only for timestamp lookup.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LogSegmentStats {
-    /// Number of selected commit files, counting each selected compaction as one file.
+    /// Number of original commit files.
     pub num_commit_files: u64,
-    /// Sum of the selected commit file sizes in bytes.
+    /// Sum of the original commit file sizes in bytes.
     pub total_commit_file_bytes: u64,
 }
 
@@ -128,14 +129,16 @@ pub(crate) struct ActionsWithCheckpointInfo<A: KernelResultIterator<ActionsBatch
     pub checkpoint_info: CheckpointReadInfo,
 }
 
-/// A [`LogSegment`] represents a contiguous section of the log and is made of checkpoint files
-/// and commit files and guarantees the following:
+/// A [`LogSegment`] represents a contiguous section of the log and is made of checkpoint files,
+/// commit files, and log compaction files. It guarantees the following:
 ///     1. Commit file versions will not have any gaps between them.
 ///     2. If checkpoint(s) is/are present in the range, only commits with versions greater than the
 ///        most recent checkpoint version are retained. There will not be a gap between the
 ///        checkpoint version and the first commit version.
 ///     3. All checkpoint_parts must belong to the same checkpoint version, and must form a complete
 ///        version. Multi-part checkpoints must have all their parts.
+///     4. Each retained log compaction starts after the checkpoint version, if any, and ends at or
+///        before `end_version`.
 ///
 /// [`LogSegment`] is used in [`Snapshot`] when built with [`LogSegment::for_snapshot`], and
 /// in `TableChanges` when built with [`LogSegment::for_table_changes`].
@@ -336,19 +339,18 @@ fn augment_checkpoint_read_schema(
 }
 
 impl LogSegment {
-    /// Returns selected replay commit file statistics, failing if the byte sum overflows.
+    /// Returns original replay commit file statistics, failing if the byte sum overflows.
     pub(crate) fn stats(&self) -> KernelResult<LogSegmentStats> {
-        self.find_commit_cover_paths(None).iter().try_fold(
-            LogSegmentStats::default(),
-            |mut stats, path| {
+        self.original_commit_paths(None, self.end_version)
+            .iter()
+            .try_fold(LogSegmentStats::default(), |mut stats, path| {
                 stats.total_commit_file_bytes = stats
                     .total_commit_file_bytes
                     .checked_add(path.location.size)
                     .ok_or_else(|| KernelError::generic("Log segment commit file size overflow"))?;
                 stats.num_commit_files += 1;
                 Ok(stats)
-            },
-        )
+            })
     }
 
     /// Creates a LogSegment for a newly created table at version 0 from a single commit file.
@@ -392,6 +394,7 @@ impl LogSegment {
         })
     }
 
+    /// Validates the supplied files and constructs their replay segment.
     #[internal_api]
     pub(crate) fn try_new(
         mut listed_files: LogSegmentFiles,
@@ -399,49 +402,12 @@ impl LogSegment {
         end_version: Option<Version>,
         last_checkpoint_metadata: Option<LastCheckpointHint>,
     ) -> KernelResult<Self> {
-        validate_log_path_fields(&listed_files)?;
-        validate_compaction_files(&listed_files.ascending_compaction_files)?;
-        validate_checkpoint_parts(&listed_files.checkpoint_parts)?;
-        validate_commit_file_types(&listed_files.ascending_commit_files)?;
-        validate_commit_files_sorted(&listed_files.ascending_commit_files)?;
-
-        // Filter commits before/at checkpoint version
-        let checkpoint_version =
-            if let Some(checkpoint_file) = listed_files.checkpoint_parts.first() {
-                let version = checkpoint_file.version;
-                listed_files
-                    .ascending_commit_files
-                    .retain(|log_path| version < log_path.version);
-                Some(version)
-            } else {
-                None
-            };
-
-        validate_checkpoint_commit_gap(checkpoint_version, &listed_files.ascending_commit_files)?;
-        validate_commit_files_contiguous(&listed_files.ascending_commit_files)?;
-        let effective_version = validate_end_version(
-            &listed_files.ascending_commit_files,
-            &listed_files.checkpoint_parts,
-            end_version,
-        )?;
-        validate_latest_commit_file(&listed_files, effective_version)?;
-        validate_crc(
-            listed_files.latest_crc_file.as_ref(),
-            checkpoint_version,
-            effective_version,
-        )?;
-
-        let log_segment = LogSegment {
-            end_version: effective_version,
-            checkpoint_version,
+        Self::try_new_impl(
+            &mut listed_files,
             log_root,
+            end_version,
             last_checkpoint_metadata,
-            listed: listed_files,
-        };
-
-        info!(segment = %log_segment.summary());
-
-        Ok(log_segment)
+        )
     }
 
     /// Returns the checkpoint version from the `_last_checkpoint` hint
@@ -552,7 +518,7 @@ impl LogSegment {
         log_tail: Vec<ParsedLogPath>,
         time_travel_version: impl Into<Option<Version>>,
         metric_context: SnapshotLoadMetricContext,
-    ) -> KernelResult<Self> {
+    ) -> Result<Self> {
         let time_travel_version = time_travel_version.into();
         let start = std::time::Instant::now();
         let build = || {
@@ -565,8 +531,8 @@ impl LogSegment {
                 time_travel_version,
             )
         };
-        let log_segment =
-            build().inspect_err(|_| emit_log_segment_load_failure(&metric_context))?;
+        let log_segment = build()
+            .inspect_err(|_| emit_log_segment_load_failure(&metric_context, start.elapsed()))?;
 
         emit_log_segment_load(&metric_context, &log_segment, start.elapsed());
         Ok(log_segment)
@@ -590,7 +556,7 @@ impl LogSegment {
         log_tail: Vec<ParsedLogPath>,
         checkpoint_hint: Option<LastCheckpointHint>,
         time_travel_version: Option<Version>,
-    ) -> KernelResult<Self> {
+    ) -> Result<Self> {
         // The end_version is the time_travel_version, if present
         // TODO: When max catalog version is implemented, we would use that as end_version if
         // time_travel_version is not present
@@ -630,7 +596,61 @@ impl LogSegment {
             (None, None) => LogSegmentFiles::list(storage, &log_root, log_tail, None, None)?,
         };
 
-        LogSegment::try_new(listed_files, log_root, time_travel_version, checkpoint_hint)
+        Self::try_new_for_snapshot(listed_files, log_root, time_travel_version, checkpoint_hint)
+    }
+
+    /// Validates a snapshot's replay files with its selected checkpoint and target version.
+    /// Shared log consumers use `try_new` to retain their Kernel error contracts.
+    pub(crate) fn try_new_for_snapshot(
+        mut listed_files: LogSegmentFiles,
+        log_root: Url,
+        time_travel_version: Option<Version>,
+        checkpoint_hint: Option<LastCheckpointHint>,
+    ) -> Result<Self> {
+        // TODO(#3421): Move Delta error classification into the shared constructor when the
+        // remaining public APIs and their log-segment callers migrate to `Result`.
+        Self::try_new_impl(
+            &mut listed_files,
+            log_root.clone(),
+            time_travel_version,
+            checkpoint_hint,
+        )
+        .map_err(|error| {
+            let KernelError::MissingVersion(missing) = error.without_backtrace() else {
+                return Error::Kernel(error);
+            };
+            // MissingVersion is returned only after sorting and checkpoint filtering succeed.
+            let commits = &listed_files.ascending_commit_files;
+            let (Some(first), Some(last)) = (commits.first(), commits.last()) else {
+                return Error::Kernel(error);
+            };
+            let checkpoint_version = listed_files
+                .checkpoint_parts
+                .first()
+                .map(|file| file.version);
+            if checkpoint_version.and_then(|version| version.checked_add(1)) == Some(*missing)
+                && first.version > *missing
+            {
+                // Segment validation precedes metadata loading, so retention policies are unknown.
+                Error::Delta(DeltaError::truncated_transaction_log(
+                    format!("{log_root}{missing:020}.json"),
+                    last.version,
+                    None,
+                    None,
+                    Some(Box::new(error)),
+                ))
+            } else if *missing < last.version {
+                Error::Delta(DeltaError::versions_not_contiguous(
+                    commits.iter().map(|file| file.version),
+                    first.version,
+                    last.version,
+                    time_travel_version.unwrap_or(last.version),
+                    Some(Box::new(error)),
+                ))
+            } else {
+                Error::Kernel(error)
+            }
+        })
     }
 
     /// Constructs a [`LogSegment`] to be used for `TableChanges`. For a TableChanges between
@@ -868,10 +888,10 @@ impl LogSegment {
     }
 
     /// Replaces retained staged commit references through `max_published_version` with published
-    /// paths.
+    /// paths and their storage metadata.
     ///
-    /// The caller establishes which commits have been published; this method performs no storage
-    /// reads. Replaced commit references retain the staged file's size and modification time.
+    /// The caller establishes which commits have been published. This method reads each replacement
+    /// file's metadata with HEAD because publication can change its modification time.
     /// `max_published_version` cannot exceed `self.end_version` or be less than
     /// `self.listed.max_published_version`.
     ///
@@ -879,10 +899,11 @@ impl LogSegment {
     /// and no published version was recorded, including when a checkpoint covers the replay
     /// commits. It is a no-op if the recorded maximum is also `None`; otherwise it is an error.
     ///
-    /// Returns `Ok(None)` without cloning if neither the commit paths nor the recorded maximum
-    /// change.
+    /// Returns `Ok(None)` without cloning or accessing the engine if neither the commit paths nor
+    /// the recorded maximum change. Metadata read failures leave the original segment unchanged.
     pub(crate) fn new_as_published(
         &self,
+        engine: &dyn Engine,
         max_published_version: Option<Version>,
     ) -> KernelResult<Option<Self>> {
         require!(
@@ -920,11 +941,9 @@ impl LogSegment {
                 let location = self
                     .log_root
                     .join(&published_commit_file_name(file.version))?;
-                let metadata = FileMeta {
-                    location: location.clone(),
-                    last_modified: file.location.last_modified,
-                    size: file.location.size,
-                };
+                // We expect publication to need one file, so prefer HEAD for the common case.
+                // Use publication counts and timings (#3929) to evaluate HEAD versus LIST.
+                let metadata = engine.storage_handler().head(&location)?;
                 *file = ParsedLogPath::new(metadata)
                     .ok_or_else(|| KernelError::invalid_log_path(location))?;
             }
@@ -936,10 +955,21 @@ impl LogSegment {
         for file in &mut new_log_segment.listed.ascending_commit_files {
             replace_staged(file)?;
         }
-        // Loading a snapshot with a checkpoint at the same version leaves ascending_commit_files
-        // empty. latest_commit_file is still needed to read the in-commit timestamp.
-        if let Some(file) = &mut new_log_segment.listed.latest_commit_file {
-            replace_staged(file)?;
+        if let Some(file) = &mut new_log_segment.listed.latest_commit_file
+            && needs_published_path(file)
+        {
+            // Reuse the replay commit's metadata to avoid a second HEAD. A checkpoint can leave
+            // only latest_commit_file, which timestamp reads still need.
+            if let Some(commit) = new_log_segment
+                .listed
+                .ascending_commit_files
+                .last()
+                .filter(|commit| commit.version == file.version)
+            {
+                file.clone_from(commit);
+            } else {
+                replace_staged(file)?;
+            }
         }
         Ok(Some(new_log_segment))
     }
@@ -956,11 +986,12 @@ impl LogSegment {
             .collect()
     }
 
-    /// Read a stream of actions from this log segment. This returns an iterator of
-    /// [`ActionsBatch`]s which includes EngineData of actions + a boolean flag indicating whether
-    /// the data was read from a commit file (true) or a checkpoint file (false).
+    /// Reads scan actions from newest to oldest, using log compactions for commit reads when
+    /// `use_compactions` is true. Checkpoint reads are unaffected.
     ///
-    /// The log files will be read from most recent to oldest.
+    /// Returns an iterator of [`ActionsBatch`]s containing action data and an `is_log_batch` flag
+    /// that is true for commits and compactions, and false for checkpoints. Also returns
+    /// `CheckpointReadInfo` with stats_parsed compatibility and the checkpoint schema.
     ///
     /// `commit_read_schema` is the (physical) schema to read the commit files with, and
     /// `checkpoint_read_schema` is the (physical) schema to read checkpoint files with. This can be
@@ -968,15 +999,8 @@ impl LogSegment {
     /// schemas can be useful as a cheap way of doing additional filtering on the checkpoint files
     /// (e.g. filtering out remove actions).
     ///
-    ///  The engine data returned might have extra non-log actions (e.g. sidecar
-    ///  actions) that are not part of the schema but this is an implementation
-    ///  detail that should not be relied on and will likely change.
-    ///
-    /// Read a stream of actions from this log segment. This returns an iterator of
-    /// [`ActionsBatch`]s which includes EngineData of actions + a boolean flag indicating whether
-    /// the data was read from a commit file (true) or a checkpoint file (false).
-    ///
-    /// Also returns `CheckpointReadInfo` with stats_parsed compatibility and the checkpoint schema.
+    /// The returned engine data might have extra non-log actions (e.g. sidecar actions) outside
+    /// the schema; callers must not rely on their presence.
     ///
     /// `meta_predicate` is an optional conservative predicate for checkpoint reads, not the query's
     /// final data filter. When every projected action has a reliable presence witness, their
@@ -993,6 +1017,7 @@ impl LogSegment {
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
+        use_compactions: bool,
     ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
         // Combine the action-presence predicate with the caller's skipping predicate so readers
         // can omit checkpoint data that cannot contain a relevant action.
@@ -1002,7 +1027,8 @@ impl LogSegment {
 
         // `replay` expects commit files to be sorted in descending order, so the return value here
         // is correct
-        let commit_stream = self.read_commit_actions(engine, commit_read_schema)?;
+        let commit_stream =
+            self.read_scan_commit_actions(engine, commit_read_schema, use_compactions)?;
 
         let checkpoint_result = self.create_checkpoint_stream(
             engine,
@@ -1023,7 +1049,10 @@ impl LogSegment {
     /// by the actions it carries, and the commits and checkpoint files at or below that version are
     /// not read.
     ///
-    /// `table_root` resolves the action's manifest locations.
+    /// `table_root` resolves the action's manifest locations. When `stats_parsed` is set, the
+    /// checkpoint's adds carry `stats_schema` as `add.stats_parsed`, read from the content tree's
+    /// `content_stats`. Those are keyed by the checkpoint's schema, so the caller sets it only when
+    /// `stats_schema` is derived from that same schema; otherwise the tree's adds carry no stats.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn read_actions_with_checkpoint_action(
@@ -1034,6 +1063,7 @@ impl LogSegment {
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
         stats_schema: Option<&StructType>,
+        stats_parsed: bool,
     ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
         let version = Version::try_from(checkpoint.version())
             .ok()
@@ -1066,53 +1096,67 @@ impl LogSegment {
 
         let commits = Self::read_commit_files(
             engine,
-            &self.find_commit_cover_after(Some(version)),
+            &self
+                .original_commit_paths(Some(version), self.end_version)
+                .into_iter()
+                .map(|path| path.location.clone())
+                .collect::<Vec<_>>(),
             commit_read_schema,
         )?;
-        let stats_fallback =
-            needs_json_stats_fallback(&checkpoint_read_schema, stats_schema, false)
-                .then(|| StructField::nullable("stats", DataType::STRING));
-        let checkpoint_read_schema = augment_checkpoint_read_schema(
-            &checkpoint_read_schema,
-            stats_fallback.into_iter().collect(),
-            false,
-        )?;
+        let stats_parsed_schema = stats_schema.filter(|_| stats_parsed);
+        let has_stats_parsed = stats_parsed_schema.is_some();
+        let mut add_fields = Vec::new();
+        if needs_json_stats_fallback(&checkpoint_read_schema, stats_schema, has_stats_parsed) {
+            add_fields.push(StructField::nullable("stats", DataType::STRING));
+        }
+        if let Some(schema) = stats_parsed_schema {
+            add_fields.push(StructField::nullable("stats_parsed", schema.clone()));
+        }
+        let checkpoint_read_schema =
+            augment_checkpoint_read_schema(&checkpoint_read_schema, add_fields, false)?;
+        // TODO(#3421): propagate `Result` once replay's callers can return Delta errors.
         let checkpoint_actions = read_checkpoint_action(
             engine,
             checkpoint,
             &LogRoot::new(table_root.clone())?,
             checkpoint_read_schema.clone(),
-        )?;
+            stats_parsed_schema,
+        )
+        .map_err(KernelError::generic_err)?;
         Ok(ActionsWithCheckpointInfo {
             actions: Box::new(commits.chain(checkpoint_actions)),
-            // TODO(#2866): the content tree reader produces neither `stats_parsed` nor
-            // `partitionValues_parsed`, so replay parses the JSON stats.
+            // TODO(#3320): the content tree reader does not produce `partitionValues_parsed`.
             checkpoint_info: CheckpointReadInfo {
-                has_stats_parsed: false,
+                has_stats_parsed,
                 has_partition_values_parsed: false,
                 checkpoint_read_schema,
             },
         })
     }
 
-    /// Same as [`Self::read_actions_with_projected_checkpoint_actions`], but uses the same schema
-    /// for reading checkpoints and commits. IS NOT NULL predicates are automatically derived from
-    /// the schema, so callers do not need to supply them.
+    /// Reads original commits and checkpoint files with the same action schema, newest first.
     #[internal_api]
     pub(crate) fn read_actions(
         &self,
         engine: &dyn Engine,
         action_schema: SchemaRef,
     ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
-        let result = self.read_actions_with_projected_checkpoint_actions(
+        self.read_original_actions(engine, action_schema.clone(), action_schema)
+    }
+
+    /// Reads checkpoint-write input, timing each source before the streams are joined.
+    pub(crate) fn read_actions_for_checkpoint(
+        &self,
+        engine: &dyn Engine,
+        action_schema: SchemaRef,
+        metrics: CheckpointMetrics,
+    ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
+        self.read_original_actions_with_metrics(
             engine,
             action_schema.clone(),
             action_schema,
-            None,
-            None,
-            None,
-        )?;
-        Ok(result.actions)
+            metrics,
+        )
     }
 
     /// Read the AMT `checkpoint` action from the manifest commit that `pointer` (the snapshot's
@@ -1138,7 +1182,10 @@ impl LogSegment {
             engine
                 .json_handler()
                 .read_json_files(files, LOG_CHECKPOINT_SCHEMA.clone(), None)?;
-        require_pointed_checkpoint_action(pointer, first_checkpoint_action(batches)?)
+        let action = first_checkpoint_action(batches)?
+            .ok_or_else(|| missing_pointed_checkpoint_action(pointer))?;
+        require_pointed_checkpoint_action(pointer, &action)?;
+        Ok(action)
     }
 
     /// The listed commit at `pointer`'s version, or `None` when this segment does not list it.
@@ -1155,25 +1202,42 @@ impl LogSegment {
         commits.get(index)
     }
 
-    /// Read this segment's JSON commit/compaction cover as [`ActionsBatch`]es (`is_log_batch =
-    /// true`).
-    ///
-    /// Files are returned in descending version order, as log replay expects. Only the commit
-    /// cover is read; checkpoints and sidecars are not consulted.
+    /// Reads original JSON commits newest first, without checkpoints or log compactions.
     #[internal_api]
     pub(crate) fn read_commit_actions(
         &self,
         engine: &dyn Engine,
         schema: SchemaRef,
     ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
-        Self::read_commit_files(engine, &self.find_commit_cover(), schema)
+        let files = self
+            .original_commit_paths(None, self.end_version)
+            .into_iter()
+            .map(|path| path.location.clone())
+            .collect::<Vec<_>>();
+        Self::read_commit_files(engine, &files, schema)
     }
 
-    /// find a minimal set to cover the range of commits we want. This is greedy so not always
-    /// optimal, but we assume there are rarely overlapping compactions so this is okay. NB: This
-    /// returns files is DESCENDING ORDER, as that's what `replay` expects. This function assumes
-    /// that all files in `self.ascending_commit_files` and `self.ascending_compaction_files` are in
-    /// range for this log segment. This invariant is maintained by our listing code.
+    /// Reads scan commits newest first, using log compactions when `use_compactions` is true.
+    pub(crate) fn read_scan_commit_actions(
+        &self,
+        engine: &dyn Engine,
+        schema: SchemaRef,
+        use_compactions: bool,
+    ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
+        let files = if !use_compactions {
+            self.original_commit_paths(None, self.end_version)
+                .into_iter()
+                .map(|path| path.location.clone())
+                .collect()
+        } else {
+            self.find_commit_cover()
+        };
+        Self::read_commit_files(engine, &files, schema)
+    }
+
+    /// Returns commits and log compactions covering the segment's commits, newest first.
+    /// The greedy selection may not be minimal when compactions overlap. It relies on the file
+    /// range guarantees of [`LogSegment`].
     pub(crate) fn find_commit_cover(&self) -> Vec<FileMeta> {
         self.find_commit_cover_after(None)
     }
@@ -1256,6 +1320,67 @@ impl LogSegment {
         selected_files
     }
 
+    /// Reads original commits and checkpoint files with separate projections, newest first.
+    fn read_original_actions(
+        &self,
+        engine: &dyn Engine,
+        commit_schema: SchemaRef,
+        checkpoint_schema: SchemaRef,
+    ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
+        self.read_original_actions_with_metrics(
+            engine,
+            commit_schema,
+            checkpoint_schema,
+            CheckpointMetrics::disabled(),
+        )
+    }
+
+    fn read_original_actions_with_metrics(
+        &self,
+        engine: &dyn Engine,
+        commit_schema: SchemaRef,
+        checkpoint_schema: SchemaRef,
+        metrics: CheckpointMetrics,
+    ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
+        let commits = {
+            let _timer = metrics.start(CheckpointPhase::LogTailInput);
+            self.read_commit_actions(engine, commit_schema)?
+        };
+        let predicate = checkpoint_action_projection_predicate(&checkpoint_schema);
+        let checkpoint = {
+            let _timer = metrics.start(CheckpointPhase::CheckpointInput);
+            self.create_checkpoint_stream(engine, checkpoint_schema, predicate, None, None)?
+        };
+        let commits = metrics.input_iterator(CheckpointPhase::LogTailInput, commits);
+        let checkpoint =
+            metrics.input_iterator(CheckpointPhase::CheckpointInput, checkpoint.actions);
+        Ok(commits.chain(checkpoint))
+    }
+
+    /// Original published and staged commits in `(after, through]`, newest first.
+    fn original_commit_paths(
+        &self,
+        after: Option<Version>,
+        through: Version,
+    ) -> Vec<&ParsedLogPath> {
+        self.listed
+            .ascending_commit_files
+            .iter()
+            .rev()
+            .filter(|file| file.version <= through && after.is_none_or(|v| file.version > v))
+            .collect()
+    }
+
+    /// Selects scan commits, using log compactions when `use_compactions` is true.
+    #[cfg(feature = "declarative-plans")]
+    fn scan_commit_paths(&self, use_compactions: bool) -> Vec<&ParsedLogPath> {
+        if !use_compactions {
+            self.original_commit_paths(None, self.end_version)
+        } else {
+            self.find_commit_cover_paths(None)
+        }
+    }
+
     /// Reads `commit_files` as log batches (`is_log_batch = true`), in the order given.
     fn read_commit_files(
         engine: &dyn Engine,
@@ -1284,10 +1409,17 @@ impl LogSegment {
             .collect()
     }
 
-    /// Returns commit-cover files tagged with file-constant `version`.
+    /// Returns scan commit files tagged with file-constant `version`.
+    ///
+    /// Every action in a compaction is tagged with the range's start version, not its original
+    /// commit version. Callers that need original commit versions must set `use_compactions` to
+    /// false.
     #[cfg(feature = "declarative-plans")]
-    pub(crate) fn commit_cover_version_tagged_scan_files(&self) -> KernelResult<Vec<ScanFile>> {
-        Self::version_tagged_scan_files(self.find_commit_cover_paths(None))
+    pub(crate) fn commit_cover_version_tagged_scan_files(
+        &self,
+        use_compactions: bool,
+    ) -> KernelResult<Vec<ScanFile>> {
+        Self::version_tagged_scan_files(self.scan_commit_paths(use_compactions))
     }
 
     /// Returns the checkpoint parts tagged with file-constant `version`, paired with the single
@@ -1313,32 +1445,6 @@ impl LogSegment {
             FileType::Parquet
         };
         Ok(Some((file_type, Self::version_tagged_scan_files(parts)?)))
-    }
-
-    /// Returns sidecars from the applicable checkpoint hint, tagged with checkpoint version.
-    #[cfg(feature = "declarative-plans")]
-    pub(crate) fn checkpoint_hint_version_tagged_sidecar_scan_files(
-        &self,
-    ) -> KernelResult<Option<Vec<ScanFile>>> {
-        let Some(sidecars) = self.checkpoint_hint_sidecars() else {
-            return Ok(None);
-        };
-        let version = self.checkpoint_version.ok_or_else(|| {
-            KernelError::invalid_checkpoint(
-                "Checkpoint hint sidecars require a selected checkpoint version",
-            )
-        })?;
-        let version = crate::version_as_i64(version)?;
-        sidecars
-            .iter()
-            .map(|sidecar| {
-                Ok(ScanFile {
-                    meta: sidecar.to_filemeta(&self.log_root)?,
-                    file_constants: vec![Scalar::Long(version)],
-                })
-            })
-            .collect::<KernelResult<Vec<_>>>()
-            .map(Some)
     }
 
     /// Determines the file actions schema and extracts sidecar file references for checkpoints.
@@ -1909,6 +2015,70 @@ impl LogSegment {
         debug!("Checkpoint schema has compatible partitionValues_parsed for partition pruning");
         true
     }
+
+    /// Retains the files on failure so callers can classify errors using the validated state.
+    /// Commits at or before the checkpoint are filtered out before replay continuity checks.
+    /// Log compactions outside the range guaranteed by [`LogSegment`] are dropped.
+    fn try_new_impl(
+        listed_files: &mut LogSegmentFiles,
+        log_root: Url,
+        end_version: Option<Version>,
+        last_checkpoint_metadata: Option<LastCheckpointHint>,
+    ) -> KernelResult<Self> {
+        validate_log_path_fields(listed_files)?;
+        validate_compaction_files(&listed_files.ascending_compaction_files)?;
+        validate_checkpoint_parts(&listed_files.checkpoint_parts)?;
+        validate_commit_file_types(&listed_files.ascending_commit_files)?;
+        validate_commit_files_sorted(&listed_files.ascending_commit_files)?;
+
+        // Filter commits before/at checkpoint version
+        let checkpoint_version =
+            if let Some(checkpoint_file) = listed_files.checkpoint_parts.first() {
+                let version = checkpoint_file.version;
+                listed_files
+                    .ascending_commit_files
+                    .retain(|log_path| version < log_path.version);
+                Some(version)
+            } else {
+                None
+            };
+
+        validate_checkpoint_commit_gap(checkpoint_version, &listed_files.ascending_commit_files)?;
+        validate_commit_files_contiguous(&listed_files.ascending_commit_files)?;
+        let effective_version = validate_end_version(
+            &listed_files.ascending_commit_files,
+            &listed_files.checkpoint_parts,
+            end_version,
+        )?;
+        // Like commits, compactions must start after the checkpoint: replay should only read
+        // compactions ahead of the checkpoint.
+        listed_files.ascending_compaction_files.retain(|file| {
+            matches!(
+                file.file_type,
+                LogPathFileType::CompactedCommit { hi }
+                    if checkpoint_version.is_none_or(|cp| cp < file.version)
+                        && hi <= effective_version
+            )
+        });
+        validate_latest_commit_file(listed_files, effective_version)?;
+        validate_crc(
+            listed_files.latest_crc_file.as_ref(),
+            checkpoint_version,
+            effective_version,
+        )?;
+
+        let log_segment = LogSegment {
+            end_version: effective_version,
+            checkpoint_version,
+            log_root,
+            last_checkpoint_metadata,
+            listed: std::mem::take(listed_files),
+        };
+
+        info!(segment = %log_segment.summary());
+
+        Ok(log_segment)
+    }
 }
 
 /// The first checkpoint action in `batches`, or `None` when no batch carries one.
@@ -1924,16 +2094,13 @@ fn first_checkpoint_action(
     Ok(None)
 }
 
-/// Returns `action`, read from the manifest commit `pointer` names, after checking that it exists
-/// and has the pointer's content root version.
+/// Errors unless `action`, read from the manifest commit `pointer` names, has the pointer's content
+/// root version.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 fn require_pointed_checkpoint_action(
     pointer: &LastManifestCommit,
-    action: Option<CheckpointAction>,
-) -> KernelResult<CheckpointAction> {
-    let action = action.ok_or_else(|| {
-        last_manifest_commit_inconsistency(pointer, "that commit carries no checkpoint action")
-    })?;
+    action: &CheckpointAction,
+) -> KernelResult<()> {
     require!(
         action.content_root_version() == pointer.content_root_version,
         last_manifest_commit_inconsistency(
@@ -1944,7 +2111,13 @@ fn require_pointed_checkpoint_action(
             )
         )
     );
-    Ok(action)
+    Ok(())
+}
+
+/// The error for when the manifest commit that `pointer` names carries no checkpoint action.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn missing_pointed_checkpoint_action(pointer: &LastManifestCommit) -> KernelError {
+    last_manifest_commit_inconsistency(pointer, "that commit carries no checkpoint action")
 }
 
 /// The error for a `pointer` that the log contradicts, as explained by `detail`.

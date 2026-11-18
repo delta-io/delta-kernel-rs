@@ -1371,7 +1371,7 @@ mod tests {
     use crate::unit_test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use crate::{
         Engine, EngineData, Expression as Expr, ExpressionEvaluator, ExpressionRef, KernelError,
-        KernelResult,
+        KernelResult, Result,
     };
 
     /// Test evaluator that fails once before delegating, exposing both timed transform attempts.
@@ -1713,9 +1713,7 @@ mod tests {
     #[case::supported_not_enabled(RowTrackingState::SupportedNotEnabled)]
     #[case::enabled(RowTrackingState::Enabled)]
     #[case::suspended(RowTrackingState::Suspended)]
-    fn test_row_commit_version_patch(
-        #[case] row_tracking_state: RowTrackingState,
-    ) -> KernelResult<()> {
+    fn test_row_commit_version_patch(#[case] row_tracking_state: RowTrackingState) -> Result<()> {
         let schema: SchemaRef = schema_ref! { nullable "value": INTEGER };
         let state_info = get_state_info(
             schema,
@@ -1917,7 +1915,7 @@ mod tests {
     }
 
     #[test]
-    fn test_serialization_with_timezone() -> KernelResult<()> {
+    fn test_serialization_with_timezone() -> Result<()> {
         let engine = SyncEngine::new();
         let schema = schema_ref! {
             nullable "ts": TIMESTAMP,

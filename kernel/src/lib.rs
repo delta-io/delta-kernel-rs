@@ -7,6 +7,9 @@
 //! The [`delta_kernel_default_engine`](https://docs.rs/delta_kernel_default_engine) crate provides
 //! a ready-to-use implementation based on Arrow, `object_store`, and Tokio.
 //!
+//! The [Delta Kernel user guide](https://docs.delta.io/kernel/rust/) explains end-to-end connector
+//! workflows. This crate's rustdoc is the source of truth for exact API contracts.
+//!
 //! A full `rust` example for reading table data using the default engine can be found in the
 //! [read-table-single-threaded] example (and for a more complex multi-threaded reader see the
 //! [read-table-multi-threaded] example). An example for reading the table changes for a table
@@ -100,6 +103,7 @@ pub(crate) mod crc;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
+mod file_uri;
 pub mod incremental_scan;
 mod log_compaction;
 mod log_path;
@@ -195,11 +199,12 @@ pub use engine_data::{
     EngineData, FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
 };
 pub use error::{
-    DeltaError, DeltaErrorCondition, DeltaErrorParameter, Error, KernelError, KernelResult,
-    KernelResultIterator, Result,
+    BoxedError, DeltaError, DeltaErrorCondition, DeltaErrorParameter, Error, KernelError,
+    KernelResult, KernelResultIterator, Result,
 };
 use expressions::Scalar;
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
+pub use file_uri::resolve_file_uri;
 pub use log_compaction::{LogCompactionWriter, should_compact};
 #[cfg(feature = "declarative-plans")]
 pub use plans::{IoOperation, Operation, PlanBuilder, PlanExecutor, PlanResult};
@@ -1069,6 +1074,10 @@ pub trait ParquetHandler: AsAny {
 /// on Delta tables.
 ///
 /// Connectors pass an implementation of this trait to Delta Kernel operations.
+/// See the [Engine implementation guide] for the cross-API workflow.
+///
+/// [Engine implementation guide]:
+/// https://docs.delta.io/kernel/rust/connector/implementing_engine.html
 pub trait Engine: AsAny {
     /// Get the connector provided [`EvaluationHandler`].
     fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler>;
