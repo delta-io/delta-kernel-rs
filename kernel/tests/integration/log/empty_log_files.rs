@@ -44,7 +44,6 @@ async fn snapshot_loads_with_zero_byte_commit() -> Result<(), Box<dyn std::error
         .with_data(1, 1)
         .build()?;
 
-    // An empty commit remains in the listing and contributes no actions.
     table
         .store()
         .put(
