@@ -1878,8 +1878,8 @@ mod tests {
             assert_roundtrip(&expr);
         }
 
-        /// A safe cast serializes exactly as it did before casts had a mode, so older readers
-        /// still accept it.
+        /// A safe cast omits `mode` when serialized, so readers that predate the field still
+        /// accept it.
         #[test]
         fn test_safe_cast_serializes_without_mode() {
             let json =
