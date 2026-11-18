@@ -1,6 +1,8 @@
 //! Validation for TIMESTAMP_NANOS and TIMESTAMP_NANOS_NTZ feature support
 
 use super::TableFeature;
+#[cfg(feature = "udt-in-dev")]
+use crate::schema::UserDefinedType;
 use crate::schema::{PrimitiveType, Schema};
 use crate::table_configuration::TableConfiguration;
 use crate::transforms::{SchemaTransform, transform_output_type};
@@ -44,13 +46,24 @@ impl<'a> SchemaTransform<'a> for UsesTimestampNanos {
             _ => Ok(()),
         }
     }
+
+    // The features are required for any use of the types, including as a UDT's physical type.
+    #[cfg(feature = "udt-in-dev")]
+    fn transform_user_defined(&mut self, udt: &'a UserDefinedType) -> Result<(), ()> {
+        self.transform(udt.sql_type())
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "udt-in-dev")]
+    use std::collections::HashMap;
+
     use rstest::rstest;
 
     use crate::actions::Protocol;
+    #[cfg(feature = "udt-in-dev")]
+    use crate::schema::{ArrayType, MapType, UserDefinedType};
     use crate::schema::{DataType, schema};
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::assert_schema_feature_validation;
@@ -113,6 +126,51 @@ mod tests {
                 &map_value_schema_with,
             ],
             "Table contains TIMESTAMP_LTZ(9) or TIMESTAMP_NTZ(9) columns but does not have the required 'timestampNanos' and 'timestampNtz' features in reader and writer features",
+        );
+    }
+
+    #[cfg(feature = "udt-in-dev")]
+    #[rstest]
+    fn test_timestamp_nanos_feature_validation_inside_udt(
+        #[values(DataType::TIMESTAMP_NANOS, DataType::TIMESTAMP_NANOS_NTZ)] ts_type: DataType,
+    ) {
+        let udt = |sql_type: DataType| -> DataType {
+            UserDefinedType::try_new(sql_type, HashMap::new())
+                .unwrap()
+                .into()
+        };
+        let schema_with = schema! {
+            not_null "id": INTEGER,
+            nullable "ts": (udt(ts_type.clone())),
+        };
+        let schema_without = schema! {
+            not_null "id": INTEGER,
+            nullable "value": (udt(DataType::LONG)),
+        };
+        let struct_schema_with = schema! {
+            nullable "udt": (udt(schema! { nullable "inner_ts": (ts_type.clone()) }.into())),
+        };
+        let array_schema_with = schema! {
+            nullable "udt": (udt(ArrayType::new(ts_type.clone(), true).into())),
+        };
+        let map_schema_with = schema! {
+            nullable "udt": (udt(MapType::new(DataType::STRING, ts_type, true).into())),
+        };
+        let features_with = [
+            TableFeature::TimestampNanos,
+            TableFeature::TimestampWithoutTimezone,
+        ];
+        let protocol_with = Protocol::try_new_modern(features_with.clone(), features_with).unwrap();
+        let protocol_without =
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
+
+        assert_schema_feature_validation(
+            &schema_with,
+            &schema_without,
+            &protocol_with,
+            &protocol_without,
+            &[&struct_schema_with, &array_schema_with, &map_schema_with],
+            "does not have the required 'timestampNanos' and 'timestampNtz' features",
         );
     }
 }
