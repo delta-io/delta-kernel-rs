@@ -221,7 +221,6 @@ mod tests {
     use super::*;
     use crate::arrow::array::{Array as _, RecordBatch};
     use crate::arrow::compute::{cast, concat_batches};
-    use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::schema::{ColumnMetadataKey, MetadataValue};
