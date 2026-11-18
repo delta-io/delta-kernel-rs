@@ -1,7 +1,10 @@
 use std::collections::HashSet;
 
+use delta_kernel_derive::internal_api;
+
 use super::{ExecutionMode, Transaction};
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
+use crate::clustering::{CLUSTERING_DOMAIN_NAME, parse_clustering_columns};
 use crate::error::KernelError;
 use crate::row_tracking::{
     ROW_TRACKING_DOMAIN_NAME, ROW_TRACKING_INITIAL_HIGH_WATER_MARK, RowTrackingDomainMetadata,
@@ -10,6 +13,39 @@ use crate::table_features::TableFeature;
 use crate::{Engine, KernelResult};
 
 impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
+    /// Transforms a system-domain configuration already staged by Kernel.
+    ///
+    /// The callback receives the current serialized configuration. This does not add domains or
+    /// read them from an existing table. Clustering column paths must remain unchanged; feature
+    /// and duplicate-domain checks still apply at commit. If the callback or validation fails,
+    /// the configuration is unchanged.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[internal_api]
+    pub(crate) fn transform_system_domain_metadata(
+        &mut self,
+        domain: &str,
+        transform: impl FnOnce(&str) -> KernelResult<String>,
+    ) -> KernelResult<()> {
+        let metadata = self
+            .system_domain_metadata_additions
+            .iter_mut()
+            .find(|metadata| metadata.domain() == domain)
+            .ok_or_else(|| {
+                KernelError::generic(format!("System domain '{domain}' is not staged by Kernel"))
+            })?;
+        let configuration = transform(metadata.configuration())?;
+        if domain == CLUSTERING_DOMAIN_NAME
+            && parse_clustering_columns(&configuration)?
+                != parse_clustering_columns(metadata.configuration())?
+        {
+            return Err(KernelError::generic(
+                "System domain metadata transform cannot change clustering columns",
+            ));
+        }
+        *metadata = DomainMetadata::new(domain.to_owned(), configuration);
+        Ok(())
+    }
+
     /// Validate domain metadata operations for both create-table and existing-table transactions.
     ///
     /// Enforces the following rules:
@@ -132,8 +168,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         // Map domain to its required feature
         let required_feature = match domain {
             ROW_TRACKING_DOMAIN_NAME => Some(TableFeature::RowTracking),
-            // Will be changed to a constant in a follow up clustering create table feature PR
-            "delta.clustering" => Some(TableFeature::ClusteredTable),
+            CLUSTERING_DOMAIN_NAME => Some(TableFeature::ClusteredTable),
             _ => {
                 return Err(KernelError::generic(format!(
                     "Unknown system domain '{domain}'. Only known system domains are allowed."

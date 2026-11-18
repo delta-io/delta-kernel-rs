@@ -33,7 +33,8 @@ pub enum DataLayout {
     /// Both top-level and nested columns are supported. Each column's leaf field must
     /// have a stats-eligible primitive type.
     Clustered {
-        /// Columns to cluster by (in order).
+        /// Columns to cluster by (in order). An empty list enables clustering support
+        /// without selecting clustering columns.
         columns: Vec<ColumnName>,
     },
 
