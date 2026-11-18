@@ -850,6 +850,7 @@ jobs:
 
           sys.path.insert(0, ".github/omnigent")
           from inline_review import inline_prompt_instructions
+          from review_diff import truncate_diff
           from review_history import (
               DEFAULT_TRUSTED_BOT_LOGINS,
               attach_inline_comment_sides,
@@ -861,7 +862,10 @@ jobs:
               PR_DESCRIPTION_POLICY,
           )
 
+          # The orchestrator's copy of the diff must fit in max_prompt_bytes. The
+          # reviewers' copy goes in reviewer_context, which is not part of that prompt.
           max_diff_bytes = 80_000
+          max_reviewer_diff_bytes = 240_000
           max_prompt_bytes = 120_000
           output_mode = os.environ["OUTPUT_MODE"]
           review_marker = os.environ["REVIEW_MARKER"]
@@ -899,13 +903,27 @@ jobs:
                   "Do not report omissions based on unavailable text.]"
               )
           diff_bytes = pathlib.Path("/tmp/pr_diff.txt").read_bytes()
-          truncated = len(diff_bytes) > max_diff_bytes
-          diff = diff_bytes[:max_diff_bytes].decode("utf-8", errors="replace")
-          truncation_note = (
-              "\n\n[Diff truncated at 80000 bytes by the workflow. Use the "
-              "read-only PR source tools for additional context.]"
-              if truncated
-              else ""
+          diff, truncation_note = truncate_diff(diff_bytes, max_diff_bytes)
+          reviewer_diff, reviewer_truncation_note = truncate_diff(
+              diff_bytes, max_reviewer_diff_bytes
+          )
+          # The orchestrator consolidates findings in files that only reviewers
+          # receive, so tell it what the reviewers' copy of the diff contains.
+          if reviewer_truncation_note:
+              truncation_note += (
+                  "\n\n[Reviewers receive a longer copy of the diff, which is also "
+                  "truncated. Name the files missing from the reviewers' copy in the "
+                  f"Summary.]{reviewer_truncation_note}"
+              )
+          elif truncation_note:
+              truncation_note += (
+                  "\n\n[Reviewers receive the complete diff, so a finding in a file "
+                  "that is cut or missing here can be valid.]"
+              )
+          print(
+              f"PR diff is {len(diff_bytes)} bytes. Orchestrator copy truncated: "
+              f"{bool(truncation_note)}. Reviewer copy truncated: "
+              f"{bool(reviewer_truncation_note)}."
           )
           known_issue_policy = KNOWN_ISSUE_POLICY.strip()
           previous_review_policy = PREVIOUS_REVIEW_POLICY.strip()
@@ -943,8 +961,8 @@ jobs:
               f"{body}\n\n"
               "## PR Diff\n\n"
               "```diff\n"
-              f"{diff}\n"
-              f"```{truncation_note}\n"
+              f"{reviewer_diff}\n"
+              f"```{reviewer_truncation_note}\n"
           )
           pathlib.Path("/tmp/reviewer_context.txt").write_text(reviewer_context)
 
