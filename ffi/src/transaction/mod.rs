@@ -142,6 +142,7 @@ mod tests {
     use delta_kernel::{KernelError, KernelResult, Snapshot};
     use delta_kernel_ffi::delta_types::{
         FfiColumnNameArray, FfiNullableStringMap, FfiNullableStringMapEntry, FfiStringArray,
+        FfiStringMap, FfiStringMapEntry,
     };
     use delta_kernel_ffi::engine_data::{ArrowFFIData, get_engine_data};
     use delta_kernel_ffi::error::FFIKernelError;
@@ -3391,7 +3392,109 @@ mod tests {
         assert_extern_result_error_contains(
             unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) },
             FFIKernelError::InvalidTransactionStateError,
-            "ALTER TABLE requires at least one schema change",
+            "ALTER TABLE requires at least one table change",
+        );
+        unsafe {
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_table_builder_adds_table_properties_via_ffi() -> KernelResult<()> {
+        let (table_url, _store, engine) =
+            setup_domain_metadata_table("test_update_builder_add_property", false).await?;
+        let snapshot =
+            unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
+        let builder = unsafe {
+            ok_or_panic(new_update_table_txn_builder(
+                snapshot.shallow_copy(),
+                KernelUpdateTableOperation::AlterTable,
+                ffi_str("test-engine/1.0"),
+                false,
+                engine.shallow_copy(),
+            ))
+        };
+        let owner_key = "app.owner";
+        let owner_value = "kernel";
+        let interval_key = "DELTA.checkpointInterval";
+        let interval_value = "7";
+        let properties = [
+            FfiStringMapEntry {
+                key: kernel_string_slice!(owner_key),
+                value: kernel_string_slice!(owner_value),
+            },
+            FfiStringMapEntry {
+                key: kernel_string_slice!(interval_key),
+                value: kernel_string_slice!(interval_value),
+            },
+        ];
+        let properties = unsafe { FfiStringMap::new_unsafe(&properties) };
+        let builder = ok_or_panic(unsafe {
+            update_table_txn_builder_with_table_properties_added(
+                builder,
+                &properties,
+                engine.shallow_copy(),
+            )
+        });
+        let txn =
+            ok_or_panic(unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
+        assert_eq!(unsafe { version_and_free(committed) }, 1);
+
+        let reloaded =
+            unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
+        let props = unsafe { reloaded.as_ref() }.table_properties();
+        assert_eq!(
+            props
+                .unknown_properties
+                .get("app.owner")
+                .map(String::as_str),
+            Some("kernel")
+        );
+        assert_eq!(props.checkpoint_interval.map(|v| v.get()), Some(7));
+        unsafe {
+            free_snapshot(reloaded);
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_table_builder_rejects_feature_enabling_property_via_ffi() -> KernelResult<()> {
+        let (table_url, _store, engine) =
+            setup_domain_metadata_table("test_update_builder_reject_property", false).await?;
+        let snapshot =
+            unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
+        let builder = unsafe {
+            ok_or_panic(new_update_table_txn_builder(
+                snapshot.shallow_copy(),
+                KernelUpdateTableOperation::AlterTable,
+                ffi_str("test-engine/1.0"),
+                false,
+                engine.shallow_copy(),
+            ))
+        };
+        let key = "delta.enableChangeDataFeed";
+        let value = "true";
+        let properties = [FfiStringMapEntry {
+            key: kernel_string_slice!(key),
+            value: kernel_string_slice!(value),
+        }];
+        let properties = unsafe { FfiStringMap::new_unsafe(&properties) };
+        let builder = ok_or_panic(unsafe {
+            update_table_txn_builder_with_table_properties_added(
+                builder,
+                &properties,
+                engine.shallow_copy(),
+            )
+        });
+        assert_extern_result_error_contains(
+            unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) },
+            FFIKernelError::InvalidTransactionStateError,
+            "Cannot modify the table property",
         );
         unsafe {
             free_snapshot(snapshot);
