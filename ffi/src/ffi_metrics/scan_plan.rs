@@ -4,7 +4,7 @@ use delta_kernel::metrics as kernel;
 use delta_kernel::scan::StructStats;
 
 use super::{MetricEvent, MetricId, correlation_id_slice};
-use crate::checkpoint::{FfiCheckpointInfo, FfiSelectedCheckpointType, with_checkpoint_info};
+use crate::checkpoint::{FfiCheckpointInfo, FfiSelectedCheckpointType, visit};
 use crate::delta_types::{FfiColumnName, FfiColumnNameArray};
 use crate::scan::{FfiPartitionValuesOptions, FfiStatsOptions};
 use crate::{FfiSlice, KernelStringSlice, OptionalValue, kernel_string_slice};
@@ -21,7 +21,6 @@ pub enum ScanPlanOutcome {
     Plan,
     Empty,
     Error,
-    Unknown,
 }
 
 /// Starting state selected for metadata replay.
@@ -33,7 +32,6 @@ pub enum ReplayBase {
     Crc,
     Checkpoint,
     Empty,
-    Unknown,
 }
 
 /// Checkpoint selection, shared information, and discovery work for this planning attempt.
@@ -80,7 +78,7 @@ pub(super) fn with_event(event: &kernel::ScanPlanGenerationCompleted, f: impl Fn
         .checkpoint
         .as_ref()
         .and_then(|checkpoint| checkpoint.info.as_deref());
-    if let Err(error) = with_checkpoint_info(info, |info| {
+    if let Err(error) = visit(info, |info| {
         let columns = match event.stats.struct_stats() {
             StructStats::None => &[][..],
             StructStats::AllIndexed { extra_indexed } => extra_indexed.as_slice(),
@@ -134,7 +132,6 @@ pub(super) fn with_event(event: &kernel::ScanPlanGenerationCompleted, f: impl Fn
                 kernel::ScanPlanOutcome::Plan => ScanPlanOutcome::Plan,
                 kernel::ScanPlanOutcome::Empty => ScanPlanOutcome::Empty,
                 kernel::ScanPlanOutcome::Error => ScanPlanOutcome::Error,
-                _ => ScanPlanOutcome::Unknown,
             },
             duration_ns: event.duration_ns,
             stats,
@@ -165,7 +162,6 @@ pub(super) fn with_event(event: &kernel::ScanPlanGenerationCompleted, f: impl Fn
                     kernel::ReplayBase::Crc => ReplayBase::Crc,
                     kernel::ReplayBase::Checkpoint => ReplayBase::Checkpoint,
                     kernel::ReplayBase::Empty => ReplayBase::Empty,
-                    _ => ReplayBase::Unknown,
                 })
                 .into(),
             checkpoint: checkpoint

@@ -13,7 +13,6 @@ mod tests;
 
 /// Result of one scan-plan-generation attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum ScanPlanOutcome {
     /// A metadata plan was produced.
     Plan,
@@ -25,7 +24,6 @@ pub enum ScanPlanOutcome {
 
 /// Starting state selected before replaying newer commits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum ReplayBase {
     /// Complete live-file state from a CRC.
     Crc,
