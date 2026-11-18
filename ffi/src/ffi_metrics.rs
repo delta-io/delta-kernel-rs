@@ -267,6 +267,8 @@ pub struct LogSegmentLoadFailure {
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
     pub load_type: LogSegmentLoadType,
+    /// Elapsed wall-clock time before failure, in nanoseconds.
+    pub duration_ns: u64,
 }
 
 /// How a snapshot load resolved Protocol and Metadata.
@@ -311,6 +313,8 @@ pub struct ProtocolMetadataLoadFailure {
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
     pub load_type: LogSegmentLoadType,
+    /// Elapsed wall-clock time before failure, in nanoseconds.
+    pub duration_ns: u64,
 }
 
 /// A snapshot was built successfully.
@@ -331,6 +335,8 @@ pub struct SnapshotBuildFailure {
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
     pub load_type: SnapshotLoadType,
+    /// Elapsed wall-clock time before failure, in nanoseconds.
+    pub duration_ns: u64,
 }
 
 /// A transaction was committed successfully. `operation` and `correlation_id` are slices into
@@ -417,7 +423,7 @@ pub struct CheckpointWriteFailure {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct CheckpointProcessingStats {
-    /// Time setting up and consuming commit and log-compaction input, in nanoseconds.
+    /// Time setting up and consuming original commit input, in nanoseconds.
     /// Includes reads, decoding, waits, and final or failing iterator calls.
     pub log_tail_input_duration_ns: u64,
     /// Time setting up and consuming the previous checkpoint and its sidecars, in nanoseconds.
@@ -433,7 +439,7 @@ pub struct CheckpointProcessingStats {
     /// With sidecars, also includes projecting and filtering file and non-file actions into
     /// separate batches, and buffering non-file batches for the main checkpoint.
     pub output_preparation_duration_ns: u64,
-    /// Input Delta log actions from commit and log-compaction files after the previous checkpoint,
+    /// Input Delta log actions from original commit files after the previous checkpoint,
     /// or from version zero when there is no previous checkpoint.
     pub num_actions_from_log_tail: u64,
     /// Input Delta log actions from the previous checkpoint and its sidecars.
@@ -741,11 +747,13 @@ impl MetricEvent {
                 correlation_id,
                 table_type,
                 load_type,
+                duration,
             }) => Self::LogSegmentLoadFailure(LogSegmentLoadFailure {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
                 load_type: (*load_type).into(),
+                duration_ns: duration_ns(*duration),
             }),
             K::ProtocolMetadataLoadSuccess(kernel::ProtocolMetadataLoadSuccess {
                 operation_id,
@@ -767,11 +775,13 @@ impl MetricEvent {
                 correlation_id,
                 table_type,
                 load_type,
+                duration,
             }) => Self::ProtocolMetadataLoadFailure(ProtocolMetadataLoadFailure {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
                 load_type: (*load_type).into(),
+                duration_ns: duration_ns(*duration),
             }),
             K::SnapshotBuildSuccess(kernel::SnapshotBuildSuccess {
                 operation_id,
@@ -793,11 +803,13 @@ impl MetricEvent {
                 correlation_id,
                 table_type,
                 load_type,
+                duration,
             }) => Self::SnapshotBuildFailure(SnapshotBuildFailure {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
                 load_type: (*load_type).into(),
+                duration_ns: duration_ns(*duration),
             }),
             K::TransactionCommitSuccess(kernel::TransactionCommitSuccess {
                 operation_id,
@@ -1582,19 +1594,55 @@ mod tests {
         });
     }
 
-    #[test]
-    fn from_kernel_snapshot_hint_failure_maps_to_appended_ffi_variant() {
-        let event = kernel::MetricEvent::SnapshotBuildFailure(kernel::SnapshotBuildFailure {
-            operation_id: kernel::MetricId::new(),
+    #[rstest]
+    fn from_kernel_snapshot_lifecycle_failures_preserve_duration(
+        #[values(0u64, 53, u64::MAX)] duration_ns: u64,
+    ) {
+        let id = kernel::MetricId::new();
+        let duration = Duration::from_nanos(duration_ns);
+        let snapshot = kernel::MetricEvent::SnapshotBuildFailure(kernel::SnapshotBuildFailure {
+            operation_id: id,
             correlation_id: None,
             table_type: kernel::TableType::PathBased,
             load_type: kernel::SnapshotLoadType::SnapshotHint,
+            duration,
         });
-        with_ffi_event(&event, |ffi| {
-            let MetricEvent::SnapshotBuildFailure(e) = ffi else {
-                panic!("expected SnapshotBuildFailure");
-            };
-            assert_eq!(e.load_type, SnapshotLoadType::SnapshotHint);
+        with_ffi_event(&snapshot, |ffi| {
+            assert!(matches!(
+                ffi,
+                MetricEvent::SnapshotBuildFailure(e)
+                    if e.load_type == SnapshotLoadType::SnapshotHint && e.duration_ns == duration_ns
+            ));
+        });
+
+        let log_segment =
+            kernel::MetricEvent::LogSegmentLoadFailure(kernel::LogSegmentLoadFailure {
+                operation_id: id,
+                correlation_id: None,
+                table_type: kernel::TableType::PathBased,
+                load_type: kernel::LogSegmentLoadType::Full,
+                duration,
+            });
+        with_ffi_event(&log_segment, |ffi| {
+            assert!(matches!(
+                ffi,
+                MetricEvent::LogSegmentLoadFailure(e) if e.duration_ns == duration_ns
+            ));
+        });
+
+        let protocol_metadata =
+            kernel::MetricEvent::ProtocolMetadataLoadFailure(kernel::ProtocolMetadataLoadFailure {
+                operation_id: id,
+                correlation_id: None,
+                table_type: kernel::TableType::PathBased,
+                load_type: kernel::LogSegmentLoadType::Full,
+                duration,
+            });
+        with_ffi_event(&protocol_metadata, |ffi| {
+            assert!(matches!(
+                ffi,
+                MetricEvent::ProtocolMetadataLoadFailure(e) if e.duration_ns == duration_ns
+            ));
         });
     }
 

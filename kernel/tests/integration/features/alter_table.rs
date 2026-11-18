@@ -2055,3 +2055,118 @@ async fn add_column_on_stale_table_leaves_schema_untouched(
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn alter_table_property_only_round_trips_user_and_config_props() -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        simple_schema(),
+        engine.as_ref(),
+        &[("app.seed", "keep-me")],
+    )?;
+
+    snapshot
+        .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+        .with_table_properties_added([("app.owner", "kernel"), ("DELTA.checkpointInterval", "7")])
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let props = reloaded.table_properties();
+    assert_eq!(
+        props.unknown_properties.get("app.seed").map(String::as_str),
+        Some("keep-me")
+    );
+    assert_eq!(
+        props
+            .unknown_properties
+            .get("app.owner")
+            .map(String::as_str),
+        Some("kernel")
+    );
+    assert_eq!(props.checkpoint_interval.map(|v| v.get()), Some(7));
+    Ok(())
+}
+
+#[tokio::test]
+async fn alter_table_combines_add_column_and_property_add() -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
+
+    snapshot
+        .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+        .add_column(StructField::nullable("country", DataType::STRING))
+        .with_table_properties_added([("app.owner", "kernel")])
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert!(reloaded.schema().contains("country"));
+    assert_eq!(
+        reloaded
+            .table_properties()
+            .unknown_properties
+            .get("app.owner")
+            .map(String::as_str),
+        Some("kernel")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn write_with_property_add_emits_metadata() -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
+    let mut transaction = snapshot
+        .update_table(UpdateTableOperation::Write, "test-engine", true)
+        .with_table_properties_added([("app.owner", "kernel")])
+        .build(engine.as_ref(), committer())?;
+
+    let write_context = transaction.write_state()?.write_context_builder().build()?;
+    let batch = RecordBatch::try_new(
+        Arc::new(
+            write_context
+                .logical_data_schema()
+                .as_ref()
+                .try_into_arrow()
+                .map_err(KernelError::from)?,
+        ),
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(StringArray::from(vec!["a"])),
+        ],
+    )
+    .map_err(KernelError::from)?;
+    let add_metadata = engine
+        .write_parquet(&ArrowEngineData::new(batch), &write_context)
+        .await?;
+    transaction.add_files(add_metadata);
+    let post = transaction
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+
+    let metadata_actions = read_actions_from_commit(post.table_root(), 1, "metaData")?;
+    assert_eq!(metadata_actions.len(), 1);
+    assert_eq!(metadata_actions[0]["configuration"]["app.owner"], "kernel");
+    Ok(())
+}
+
+#[tokio::test]
+async fn alter_table_rejects_feature_enabling_property() -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
+
+    let result = snapshot
+        .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+        .with_table_properties_added([("delta.enableChangeDataFeed", "true")])
+        .build(engine.as_ref(), committer());
+
+    assert_result_error_with_message(result, "Cannot modify the table property");
+    Ok(())
+}

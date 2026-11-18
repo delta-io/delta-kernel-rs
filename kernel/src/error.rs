@@ -158,8 +158,10 @@ pub enum SnapshotHintError {
         /// The version described by the snapshot hint.
         hint: Version,
     },
-    /// The supplied log files contain log compaction files, which snapshot hints do not support.
-    #[error("Invalid snapshot hint: log compaction files are not supported")]
+    /// Retained for compatibility. Snapshot construction accepts log compaction files and does
+    /// not return this variant.
+    #[deprecated(note = "snapshot hints support log compaction; this error is not returned")]
+    #[error("Invalid snapshot hint: deprecated log compaction error")]
     LogCompaction,
     /// A supplied log file is not beneath the table's `_delta_log` root.
     #[error("Invalid snapshot hint: log path '{path}' is not beneath log root '{log_root}'")]
@@ -426,6 +428,11 @@ pub enum KernelError {
     #[error("Invalid interval: {0}")]
     InvalidInterval(String),
 
+    /// The `uri` of a `file` value has a form that kernel doesn't resolve; see
+    /// [`resolve_file_uri`](crate::resolve_file_uri).
+    #[error("Unsupported file uri: {0}")]
+    UnsupportedFileUri(String),
+
     /// Invalid CRS or other parameter for a Geometry / Geography type
     #[error("Invalid geo parameters: {0}")]
     InvalidGeoParams(String),
@@ -581,6 +588,11 @@ impl KernelError {
     /// represented by its qualifier.
     pub fn invalid_interval(msg: impl ToString) -> Self {
         Self::InvalidInterval(msg.to_string())
+    }
+    /// Creates an UnsupportedFileUri error. The message names the `uri` and why it is not
+    /// supported.
+    pub fn unsupported_file_uri(msg: impl ToString) -> Self {
+        Self::UnsupportedFileUri(msg.to_string())
     }
     #[cfg(feature = "geo-type-in-dev")]
     pub fn invalid_geo_params(msg: impl ToString) -> Self {

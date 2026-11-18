@@ -28,7 +28,7 @@
 //!                 println!("Snapshot completed: v{} in {:?}", e.version, e.duration);
 //!             }
 //!             MetricEvent::SnapshotBuildFailure(e) => {
-//!                 println!("Snapshot failed: {}", e.operation_id);
+//!                 println!("Snapshot {} failed after {:?}", e.operation_id, e.duration);
 //!             }
 //!             _ => {}
 //!         }

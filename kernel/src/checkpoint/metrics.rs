@@ -128,7 +128,7 @@ impl CheckpointMetrics {
 /// input consumed by collation sampling and the first sidecar peek.
 #[derive(Clone, Copy)]
 pub(crate) enum CheckpointPhase {
-    /// Constructing and advancing the commit/log-compaction stream in `LogSegment`, before it is
+    /// Constructing and advancing the original-commit stream in `LogSegment`, before it is
     /// chained with checkpoint input. Includes final and failing calls that produce no batch.
     LogTailInput,
     /// Constructing and advancing the previous-checkpoint stream in `LogSegment`, including schema
