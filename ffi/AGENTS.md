@@ -180,6 +180,8 @@ open_table(path);
 Only the two-word descriptor is copied. The string bytes remain borrowed from the caller for the
 call.
 
+#### Enums and choice sets
+
 Prefer `#[repr(C)]` enums for closed FFI choice sets instead of integer aliases and constants.
 Add `cbindgen:prefix-with-name=true` so generated variants remain unambiguous. Use an integer
 discriminator only when unknown values are intentionally recoverable, and validate them at the
