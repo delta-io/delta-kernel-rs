@@ -1,4 +1,4 @@
-//! Synchronous I/O support for kernel tests and the test plan executor.
+//! Synchronous, test-only [`Engine`] and plan executor.
 //!
 //! `SyncEngine` is compiled for kernel unit tests and for dependent crates that enable
 //! `test-utils` and `default-engine-base`. Its plan executor additionally requires
@@ -98,9 +98,21 @@ impl SyncEngine {
         Self::new_inner(Some(store))
     }
 
-    /// Create a SyncEngine backed by a fresh [`InMemory`] store.
+    /// Create a SyncEngine backed by a fresh [`InMemory`] store. Use [`Self::store`] to access it.
     pub fn in_memory() -> Self {
         Self::new_with_store(Arc::new(InMemory::new()))
+    }
+
+    /// The explicit store this engine was built with.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the engine was built with [`Self::new`], which has no explicit store.
+    pub fn store(&self) -> &Arc<DynObjectStore> {
+        #[allow(clippy::expect_used)] // test-only code, panic is intentional
+        self.storage_handler
+            .store()
+            .expect("This SyncEngine has no explicit store")
     }
 
     fn new_inner(store: Option<Arc<DynObjectStore>>) -> Self {

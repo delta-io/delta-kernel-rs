@@ -374,7 +374,6 @@ mod tests {
     use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::expr;
-    use crate::object_store::memory::InMemory;
     use crate::scan::PhysicalPredicate;
     use crate::scan::transform_spec::FieldTransformSpec;
     use crate::schema::{MetadataColumnSpec, schema_ref};
@@ -531,8 +530,7 @@ mod tests {
     #[test]
     fn cdf_predicate_on_unprojected_data_column_in_table_schema_succeeds() {
         let url_str = "memory:///test_table/";
-        let store = Arc::new(InMemory::new());
-        let engine = SyncEngine::new_with_store(store);
+        let engine = SyncEngine::in_memory();
 
         let schema = schema_ref! {
             nullable "id": INTEGER,

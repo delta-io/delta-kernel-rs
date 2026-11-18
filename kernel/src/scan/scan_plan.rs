@@ -838,14 +838,13 @@ mod tests {
                 "nullCount": {"x": 0},
             })
         };
-        let store = Arc::new(InMemory::new());
-        let engine = SyncEngine::new_with_store(store.clone());
+        let engine = SyncEngine::in_memory();
         let add = serde_json::json!({ "add": {
             "path": "a.parquet", "partitionValues": {}, "size": 1,
             "modificationTime": 1, "dataChange": true, "stats_parsed": stats(1.into()),
         }});
         let batch = parse_json_impl(&StringArray::from(vec![add.to_string()]), file_schema)?;
-        futures::executor::block_on(store.put(
+        futures::executor::block_on(engine.store().put(
             &Path::from("_delta_log/00000000000000000000.checkpoint.parquet"),
             record_batch_to_bytes(&batch).into(),
         ))
