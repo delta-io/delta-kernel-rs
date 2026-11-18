@@ -149,36 +149,38 @@ impl LogSegment {
         engine: &dyn Engine,
     ) -> KernelResult<PmCandidate> {
         #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
-        if let (reader @ PmReader::Plan(_), Some(_)) = (
-            PmReader::for_engine(engine),
-            self.newest_commit_after_checkpoint(),
-        ) {
-            let newest_pm_candidate = reader
-                .replay(engine, self, PmReplaySegment::NewestCommit)?
-                .validated_pointer(self.end_version)?;
-            if newest_pm_candidate.is_final_at(self.end_version)? {
-                return Ok(newest_pm_candidate);
+        {
+            let reader = PmReader::for_engine(engine);
+            if reader.reads_newest_commit_first(self) {
+                let newest_pm_candidate = reader
+                    .replay(engine, self, PmReplaySegment::NewestCommit)?
+                    .validated_pointer(self.end_version)?;
+                if newest_pm_candidate.is_final_at(self.end_version)? {
+                    return Ok(newest_pm_candidate);
+                }
+                let Some(older) = PmReplaySegment::older_commits(self, &newest_pm_candidate)?
+                else {
+                    // Nothing older to read: the segment has no older commits, or the newest
+                    // commit's own checkpoint action has the P&M as of the
+                    // commit before it. A P or M that is still missing is
+                    // reported upstream, by the snapshot build that consumes this
+                    // resolution.
+                    return Ok(newest_pm_candidate);
+                };
+                let resolved = newest_pm_candidate.merge(reader.replay(engine, self, older)?);
+                // The pointed action must exist when replay lacks Protocol or Metadata without it,
+                // and must match the pointer whenever it was read. The Protocol and
+                // Metadata checks keep this consistent with imperative reads, which
+                // error when the pointed commit carries no checkpoint action.
+                if older.checkpoint_action_version(self).is_some()
+                    && (resolved.checkpoint.is_some()
+                        || resolved.protocol.is_none()
+                        || resolved.metadata.is_none())
+                {
+                    return resolved.require_pointed_checkpoint();
+                }
+                return Ok(resolved);
             }
-            let Some(older) = PmReplaySegment::older_commits(self, &newest_pm_candidate)? else {
-                // Nothing older to read: the segment has no older commits, or the newest commit's
-                // own checkpoint action has the P&M as of the commit before it. A P or M that is
-                // still missing is reported upstream, by the snapshot build that consumes this
-                // resolution.
-                return Ok(newest_pm_candidate);
-            };
-            let resolved = newest_pm_candidate.merge(reader.replay(engine, self, older)?);
-            // The pointed action must exist when replay lacks Protocol or Metadata without it, and
-            // must match the pointer whenever it was read. The Protocol and Metadata checks keep
-            // this consistent with imperative reads, which error when the pointed commit carries no
-            // checkpoint action.
-            if older.checkpoint_action_version(self).is_some()
-                && (resolved.checkpoint.is_some()
-                    || resolved.protocol.is_none()
-                    || resolved.metadata.is_none())
-            {
-                return resolved.require_pointed_checkpoint();
-            }
-            return Ok(resolved);
         }
         self.replay_for_pm(engine)
     }
@@ -377,7 +379,7 @@ enum PmReader {
 }
 
 impl PmReader {
-    /// The reader `engine` supports: its plan executor when it has one.
+    /// Returns a plan reader when `engine` has a plan executor, otherwise a file reader.
     #[cfg_attr(not(feature = "declarative-plans"), allow(unused_variables))]
     fn for_engine(engine: &dyn Engine) -> Self {
         #[cfg(feature = "declarative-plans")]
@@ -430,9 +432,20 @@ impl PmReader {
             }
         })
     }
+
+    /// Whether replay must read the newest commit of `log_segment` before it can choose the older
+    /// files, because a plan fixes its files before it runs.
+    #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
+    fn reads_newest_commit_first(&self, log_segment: &LogSegment) -> bool {
+        log_segment.newest_commit_after_checkpoint().is_some()
+            && match self {
+                Self::Plan(_) => true,
+                Self::Files => false,
+            }
+    }
 }
 
-/// The part of the log one P&M plan reads.
+/// The part of the log one P&M replay reads.
 #[cfg(all(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum PmReplaySegment {
