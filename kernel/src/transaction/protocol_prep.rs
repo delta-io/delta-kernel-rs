@@ -714,3 +714,420 @@ fn reject_true_properties(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use rstest::rstest;
+
+    use super::*;
+    use crate::actions::Metadata;
+    use crate::schema::schema_ref;
+    use crate::table_features::{
+        SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE, TableFeature,
+    };
+    use crate::unit_test_utils::{
+        MockProtocolBuilder, MockTableConfigurationBuilder, assert_result_error_with_message,
+        test_schema_flat_with_column_mapping,
+    };
+
+    fn metadata_with(props: &[(&str, &str)]) -> Metadata {
+        Metadata::try_new(
+            None,
+            None,
+            schema_ref! { nullable "value": INTEGER },
+            vec![],
+            0,
+            props
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<HashMap<_, _>>(),
+        )
+        .unwrap()
+    }
+
+    #[rstest]
+    #[case::missing_prefix(
+        "delta.enableDeletionVectors",
+        SET_TABLE_FEATURE_SUPPORTED_VALUE,
+        "is not a feature signal"
+    )]
+    #[case::wrong_value("delta.feature.deletionVectors", "enabled", "Only 'supported'")]
+    #[case::unknown_feature(
+        "delta.feature.notAFeature",
+        SET_TABLE_FEATURE_SUPPORTED_VALUE,
+        "Enabling feature"
+    )]
+    #[case::not_allowlisted(
+        "delta.feature.identityColumns",
+        SET_TABLE_FEATURE_SUPPORTED_VALUE,
+        "during UPDATE TABLE"
+    )]
+    fn parse_feature_signal_rejects_invalid_inputs(
+        #[case] key: &str,
+        #[case] value: &str,
+        #[case] expected: &str,
+    ) {
+        assert_result_error_with_message(
+            parse_feature_signal(key, value, "UPDATE TABLE"),
+            expected,
+        );
+    }
+
+    #[test]
+    fn parse_feature_signal_accepts_allowlisted_feature() {
+        let feature = parse_feature_signal(
+            &format!("{SET_TABLE_FEATURE_SUPPORTED_PREFIX}deletionVectors"),
+            SET_TABLE_FEATURE_SUPPORTED_VALUE,
+            "UPDATE TABLE",
+        )
+        .unwrap();
+        assert_eq!(feature, TableFeature::DeletionVectors);
+    }
+
+    #[test]
+    fn protocol_with_timestamp_ntz_is_noop_when_feature_already_present() {
+        let protocol = MockProtocolBuilder::new()
+            .with_features([TableFeature::TimestampWithoutTimezone])
+            .build();
+        let schema = schema_ref! { nullable "ts": TIMESTAMP_NTZ };
+        let result = protocol_with_timestamp_ntz(&protocol, &schema).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn protocol_with_timestamp_ntz_returns_none_without_timestamp_ntz_columns() {
+        let protocol = MockProtocolBuilder::new().build();
+        let schema = schema_ref! { nullable "value": INTEGER };
+        let result = protocol_with_timestamp_ntz(&protocol, &schema).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn protocol_with_timestamp_ntz_upgrades_legacy_protocol() {
+        let protocol = MockProtocolBuilder::new().with_versions(1, 2).build();
+        let schema = schema_ref! { nullable "ts": TIMESTAMP_NTZ };
+        let upgraded = protocol_with_timestamp_ntz(&protocol, &schema)
+            .unwrap()
+            .expect("protocol should gain timestampNtz");
+        assert!(
+            upgraded
+                .reader_features()
+                .unwrap()
+                .contains(&TableFeature::TimestampWithoutTimezone)
+        );
+        assert!(
+            upgraded
+                .writer_features()
+                .unwrap()
+                .contains(&TableFeature::TimestampWithoutTimezone)
+        );
+    }
+
+    #[test]
+    fn validate_universal_format_rejects_both_iceberg_compat_versions() {
+        let config = MockTableConfigurationBuilder::new()
+            .with_schema(test_schema_flat_with_column_mapping())
+            .with_column_mapping(ColumnMappingMode::Name)
+            .with_properties([
+                (UNIVERSAL_FORMAT_ENABLED_FORMATS, "iceberg"),
+                (ENABLE_ICEBERG_COMPAT_V2, "true"),
+                (ENABLE_ICEBERG_COMPAT_V3, "true"),
+                (ENABLE_ROW_TRACKING, "true"),
+            ])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_reader_features([TableFeature::ColumnMapping])
+                    .with_writer_features([
+                        TableFeature::IcebergCompatV2,
+                        TableFeature::IcebergCompatV3,
+                        TableFeature::ColumnMapping,
+                        TableFeature::RowTracking,
+                        TableFeature::DomainMetadata,
+                    ])
+                    .build(),
+            )
+            .build();
+        assert_result_error_with_message(
+            validate_universal_format(&config),
+            "cannot be enabled at the same time",
+        );
+    }
+
+    #[test]
+    fn reject_column_mapping_mode_change_detects_mode_mismatch() {
+        let before = MockTableConfigurationBuilder::new().build();
+        let metadata = metadata_with(&[(COLUMN_MAPPING_MODE, "name")]);
+        assert_result_error_with_message(
+            reject_column_mapping_mode_change(&before, &metadata),
+            "Changing column mapping mode on an existing table is not supported",
+        );
+    }
+
+    #[test]
+    fn reject_column_mapping_mode_change_allows_unchanged_mode() {
+        let before = MockTableConfigurationBuilder::new().build();
+        let metadata = metadata_with(&[]);
+        reject_column_mapping_mode_change(&before, &metadata).unwrap();
+    }
+
+    #[rstest]
+    #[case::missing_mode(&[(ENABLE_ICEBERG_COMPAT_V2, "true")], "name' or 'id")]
+    #[case::invalid_mode(
+        &[(ENABLE_ICEBERG_COMPAT_V2, "true"), (COLUMN_MAPPING_MODE, "none")],
+        "got 'none'"
+    )]
+    #[case::v3_missing_row_tracking(
+        &[
+            (ENABLE_ICEBERG_COMPAT_V3, "true"),
+            (COLUMN_MAPPING_MODE, "name"),
+        ],
+        "requires 'delta.enableRowTracking' to be 'true'"
+    )]
+    #[case::v3_row_tracking_suspended(
+        &[
+            (ENABLE_ICEBERG_COMPAT_V3, "true"),
+            (COLUMN_MAPPING_MODE, "name"),
+            (ENABLE_ROW_TRACKING, "true"),
+            (ROW_TRACKING_SUSPENDED, "true"),
+        ],
+        "cannot be enabled while 'delta.rowTrackingSuspended' is 'true'"
+    )]
+    #[case::native_v4_missing_mode(&[(ENABLE_ICEBERG_NATIVE_V4, "true")], "to be 'id'")]
+    #[case::native_v4_wrong_mode(
+        &[(ENABLE_ICEBERG_NATIVE_V4, "true"), (COLUMN_MAPPING_MODE, "name")],
+        "got 'name'"
+    )]
+    #[case::native_v4_missing_row_tracking(
+        &[
+            (ENABLE_ICEBERG_NATIVE_V4, "true"),
+            (COLUMN_MAPPING_MODE, "id"),
+            (ENABLE_DELETION_VECTORS, "true"),
+            (ENABLE_IN_COMMIT_TIMESTAMPS, "true"),
+        ],
+        "IcebergNativeV4 requires 'delta.enableRowTracking' to be 'true'"
+    )]
+    #[case::native_v4_row_tracking_suspended(
+        &[
+            (ENABLE_ICEBERG_NATIVE_V4, "true"),
+            (COLUMN_MAPPING_MODE, "id"),
+            (ENABLE_DELETION_VECTORS, "true"),
+            (ENABLE_IN_COMMIT_TIMESTAMPS, "true"),
+            (ENABLE_ROW_TRACKING, "true"),
+            (ROW_TRACKING_SUSPENDED, "true"),
+        ],
+        "IcebergNativeV4 cannot be enabled while 'delta.rowTrackingSuspended' is 'true'"
+    )]
+    #[case::native_v4_dv_disabled(
+        &[
+            (ENABLE_ICEBERG_NATIVE_V4, "true"),
+            (COLUMN_MAPPING_MODE, "id"),
+            (ENABLE_DELETION_VECTORS, "false"),
+            (ENABLE_ROW_TRACKING, "true"),
+        ],
+        "requires 'delta.enableDeletionVectors' to be 'true', got 'false'"
+    )]
+    fn apply_iceberg_compat_property_dependencies_rejects_invalid_metadata(
+        #[case] props: &[(&str, &str)],
+        #[case] expected: &str,
+    ) {
+        let mut metadata = metadata_with(props);
+        assert_result_error_with_message(
+            apply_iceberg_compat_property_dependencies(&mut metadata),
+            expected,
+        );
+    }
+
+    #[test]
+    fn apply_iceberg_compat_property_dependencies_fills_native_v4_defaults() {
+        let mut metadata = metadata_with(&[
+            (ENABLE_ICEBERG_NATIVE_V4, "true"),
+            (COLUMN_MAPPING_MODE, "id"),
+            (ENABLE_ROW_TRACKING, "true"),
+        ]);
+        assert!(apply_iceberg_compat_property_dependencies(&mut metadata).unwrap());
+        assert_eq!(
+            metadata
+                .configuration()
+                .get(ENABLE_DELETION_VECTORS)
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            metadata
+                .configuration()
+                .get(ENABLE_IN_COMMIT_TIMESTAMPS)
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn apply_row_tracking_materialized_names_fills_missing_entries() {
+        let before = MockTableConfigurationBuilder::new()
+            .with_properties([(ENABLE_ROW_TRACKING, "true")])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::RowTracking, TableFeature::DomainMetadata])
+                    .build(),
+            )
+            .build();
+        assert!(before.is_feature_enabled(&TableFeature::RowTracking));
+
+        let mut metadata = before.metadata().clone();
+        assert!(
+            !metadata
+                .configuration()
+                .contains_key(MATERIALIZED_ROW_ID_COLUMN_NAME)
+        );
+        assert!(
+            !metadata
+                .configuration()
+                .contains_key(MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME)
+        );
+
+        assert!(apply_row_tracking_materialized_names(&before, &mut metadata).unwrap());
+        assert!(
+            metadata
+                .configuration()
+                .get(MATERIALIZED_ROW_ID_COLUMN_NAME)
+                .is_some_and(|v| v.starts_with("_row-id-col-"))
+        );
+        assert!(
+            metadata
+                .configuration()
+                .get(MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME)
+                .is_some_and(|v| v.starts_with("_row-commit-version-col-"))
+        );
+    }
+
+    #[test]
+    fn apply_row_tracking_materialized_names_fills_only_missing_id() {
+        let before = MockTableConfigurationBuilder::new()
+            .with_properties([
+                (ENABLE_ROW_TRACKING, "true"),
+                (
+                    MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
+                    "_existing-version",
+                ),
+            ])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::RowTracking, TableFeature::DomainMetadata])
+                    .build(),
+            )
+            .build();
+        let mut metadata = before.metadata().clone();
+        assert!(apply_row_tracking_materialized_names(&before, &mut metadata).unwrap());
+        assert!(
+            metadata
+                .configuration()
+                .contains_key(MATERIALIZED_ROW_ID_COLUMN_NAME)
+        );
+        assert_eq!(
+            metadata
+                .configuration()
+                .get(MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME)
+                .map(String::as_str),
+            Some("_existing-version")
+        );
+    }
+
+    #[test]
+    fn apply_row_tracking_materialized_names_noop_when_row_tracking_disabled() {
+        let before = MockTableConfigurationBuilder::new().build();
+        let mut metadata = before.metadata().clone();
+        assert!(!apply_row_tracking_materialized_names(&before, &mut metadata).unwrap());
+    }
+
+    #[test]
+    fn extract_enabled_writer_features_returns_empty_for_unknown_writer_version() {
+        // Writer version 8 is valid to construct but outside legacy (1..=6) and table-features (7).
+        let protocol =
+            Protocol::try_new(1, 8, None::<Vec<TableFeature>>, None::<Vec<TableFeature>>).unwrap();
+        assert!(extract_enabled_writer_features(&protocol).is_empty());
+    }
+
+    #[test]
+    fn protocol_with_features_preserves_existing_features_absent_from_input_lists() {
+        let current = MockProtocolBuilder::new()
+            .with_features([TableFeature::DeletionVectors, TableFeature::AppendOnly])
+            .build();
+        // Pass incomplete lists so the merge path must re-add existing features.
+        let merged = protocol_with_features(
+            &current,
+            vec![TableFeature::ChangeDataFeed],
+            vec![TableFeature::ChangeDataFeed],
+        )
+        .unwrap();
+        let readers = merged.reader_features().unwrap();
+        let writers = merged.writer_features().unwrap();
+        assert!(readers.contains(&TableFeature::DeletionVectors));
+        assert!(writers.contains(&TableFeature::DeletionVectors));
+        assert!(writers.contains(&TableFeature::AppendOnly));
+        assert!(readers.contains(&TableFeature::ChangeDataFeed));
+        assert!(writers.contains(&TableFeature::ChangeDataFeed));
+    }
+
+    #[test]
+    fn with_ict_enablement_info_stamps_version_and_timestamp() {
+        let stamped = with_ict_enablement_info(metadata_with(&[]), 7, 1_700_000_000_000);
+        assert_eq!(
+            stamped
+                .configuration()
+                .get(IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION)
+                .map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(
+            stamped
+                .configuration()
+                .get(IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP)
+                .map(String::as_str),
+            Some("1700000000000")
+        );
+    }
+
+    #[test]
+    fn transaction_enables_ict_requires_property_transition() {
+        let without = MockTableConfigurationBuilder::new().build();
+        let with_ict = MockTableConfigurationBuilder::new()
+            .with_properties([(ENABLE_IN_COMMIT_TIMESTAMPS, "true")])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::InCommitTimestamp])
+                    .build(),
+            )
+            .build();
+        assert!(transaction_enables_ict(&without, &with_ict));
+        assert!(!transaction_enables_ict(&with_ict, &with_ict));
+        assert!(!transaction_enables_ict(&without, &without));
+    }
+
+    #[test]
+    fn require_true_property_and_column_mapping_helpers_error_directly() {
+        let metadata = metadata_with(&[(COLUMN_MAPPING_MODE, "none")]);
+        assert_result_error_with_message(
+            require_true_property(&metadata, ENABLE_ROW_TRACKING, "IcebergCompatV3"),
+            "requires 'delta.enableRowTracking' to be 'true'",
+        );
+        assert_result_error_with_message(
+            require_column_mapping_mode_name_or_id(&metadata, "IcebergCompatV2"),
+            "got 'none'",
+        );
+        assert_result_error_with_message(
+            require_column_mapping_mode(&metadata, "id", "IcebergNativeV4"),
+            "got 'none'",
+        );
+        let empty = metadata_with(&[]);
+        assert_result_error_with_message(
+            require_column_mapping_mode_name_or_id(&empty, "IcebergCompatV2"),
+            "to be 'name' or 'id'",
+        );
+        assert_result_error_with_message(
+            require_column_mapping_mode(&empty, "id", "IcebergNativeV4"),
+            "to be 'id'",
+        );
+    }
+}
