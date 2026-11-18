@@ -45,10 +45,8 @@ API details.
 
 ## Build & Test Commands
 
-> **`datafusion-executor` and `integration-tests` are separate workspaces.** Root `--workspace`
-> commands do not include them. For `datafusion_executor` commands, see
-> `datafusion-executor/CLAUDE.md`. `integration-tests/test-all-arrow-versions.sh` tests each
-> supported Arrow version.
+> **`integration-tests` is a separate workspace.** Root `--workspace` commands do not
+> include it. `integration-tests/test-all-arrow-versions.sh` tests each supported Arrow version.
 
 ```bash
 # Build
@@ -419,6 +417,12 @@ Read these when relevant to the task at hand:
   contracts, and executable examples
 - Always cross-check protocol behavior against the
   [Delta protocol spec](https://raw.githubusercontent.com/delta-io/delta/master/PROTOCOL.md)
+- When changing anything under `kernel/src/content_tree/`, cross-check the behavior against the V4
+  sections of the
+  [Iceberg spec](https://raw.githubusercontent.com/apache/iceberg/refs/heads/main/format/spec.md)
+  and the
+  [Delta Iceberg V4 metadata RFC](https://raw.githubusercontent.com/delta-io/delta/refs/heads/master/protocol_rfcs/iceberg-v4-metadata.md).
+  Flag any divergence between the code and either document.
 
 **Keeping docs current:** Update the authoritative documentation for a changed fact, along with
 affected examples and cross-references. Use [Documentation Ownership](#documentation-ownership)

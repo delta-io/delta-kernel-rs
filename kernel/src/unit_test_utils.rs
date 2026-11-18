@@ -497,6 +497,12 @@ pub(crate) mod adaptive_metadata_fixtures {
         ))
     }
 
+    /// The `lastManifestCommit` naming the manifest commit at `version` whose content root is at
+    /// `content_root_version`.
+    pub(crate) fn pointer(version: i64, content_root_version: i64) -> LastManifestCommit {
+        LastManifestCommit::new(version, content_root_version).unwrap()
+    }
+
     /// Writes `rows` (each a value of `schema`'s single action field) as the checkpoint sidecar
     /// `name` of the table at `table_root`.
     pub(crate) fn write_sidecar(
@@ -687,6 +693,64 @@ pub(crate) mod adaptive_metadata_fixtures {
             .collect::<Vec<_>>()
             .into();
         write_commit(engine, table_root, version, parse_json_batch(lines)).unwrap();
+    }
+
+    /// One commit of a [`table_with_commits`] table.
+    pub(crate) struct TestCommit {
+        add: &'static str,
+        content_root_version: Option<Version>,
+    }
+
+    impl TestCommit {
+        /// A commit that adds the file `path`.
+        pub(crate) fn add(path: &'static str) -> Self {
+            Self {
+                add: path,
+                content_root_version: None,
+            }
+        }
+
+        /// Makes this commit a manifest commit whose content root is at `content_root_version`.
+        pub(crate) fn manifest_commit(self, content_root_version: Version) -> Self {
+            Self {
+                content_root_version: Some(content_root_version),
+                ..self
+            }
+        }
+    }
+
+    /// An adaptiveMetadata table with `commits` written as versions 1 onward. Every commit from a
+    /// manifest commit on carries its `lastManifestCommit` pointer, as AMT writers do.
+    pub(crate) fn table_with_commits(commits: &[TestCommit]) -> (SyncEngine, Url) {
+        let (engine, table_root) = setup_adaptive_metadata_table();
+        let mut pointer = None;
+        for (commit, version) in commits.iter().zip(1..) {
+            let add = serde_json::json!({ "add": {
+                "path": commit.add,
+                "partitionValues": {},
+                "size": 1,
+                "modificationTime": 0,
+                "dataChange": true,
+            } });
+            let mut actions = add.to_string();
+            if let Some(content_root_version) = commit.content_root_version {
+                pointer = Some(
+                    LastManifestCommit::new(
+                        version_as_i64(version).unwrap(),
+                        version_as_i64(content_root_version).unwrap(),
+                    )
+                    .unwrap(),
+                );
+                let checkpoint = minimal_checkpoint_action(
+                    "_delta_log/_manifests/root.avro",
+                    content_root_version,
+                )
+                .unwrap();
+                actions = format!("{actions}\n{}", checkpoint_line(&checkpoint));
+            }
+            write_ict_commit(&engine, &table_root, version, pointer.as_ref(), &actions);
+        }
+        (engine, table_root)
     }
 
     /// Creates an in-memory adaptiveMetadata table at version 0 and returns its engine and
