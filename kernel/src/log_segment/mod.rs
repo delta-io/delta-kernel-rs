@@ -1,5 +1,6 @@
 //! Represents a segment of a delta log. [`LogSegment`] wraps a set of checkpoint and commit
 //! files.
+use std::collections::BTreeMap;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use std::fmt::Display;
 use std::num::NonZero;
@@ -130,10 +131,11 @@ pub(crate) struct ActionsWithCheckpointInfo<A: KernelResultIterator<ActionsBatch
 
 /// A [`LogSegment`] represents a contiguous section of the log and is made of checkpoint files,
 /// commit files, and log compaction files. It guarantees the following:
-///     1. Commit file versions will not have any gaps between them.
+///     1. Replay files cover every version in the segment. Snapshot hints may use log compactions
+///        instead of individual commits; commit-range construction requires originals.
 ///     2. If checkpoint(s) is/are present in the range, only commits with versions greater than the
 ///        most recent checkpoint version are retained. There will not be a gap between the
-///        checkpoint version and the first commit version.
+///        checkpoint version and the first replay file.
 ///     3. All checkpoint_parts must belong to the same checkpoint version, and must form a complete
 ///        version. Multi-part checkpoints must have all their parts.
 ///     4. Each retained log compaction starts after the checkpoint version, if any, and ends at or
@@ -338,8 +340,10 @@ fn augment_checkpoint_read_schema(
 }
 
 impl LogSegment {
-    /// Returns original replay commit file statistics, failing if the byte sum overflows.
+    /// Returns original replay commit file statistics, failing if originals are unavailable
+    /// or the byte sum overflows.
     pub(crate) fn stats(&self) -> KernelResult<LogSegmentStats> {
+        self.require_original_commits()?;
         self.original_commit_paths(None, self.end_version)
             .iter()
             .try_fold(LogSegmentStats::default(), |mut stats, path| {
@@ -406,6 +410,23 @@ impl LogSegment {
             log_root,
             end_version,
             last_checkpoint_metadata,
+            false,
+        )
+    }
+
+    /// Constructs hint scan coverage that may replace original commits with compactions.
+    pub(crate) fn try_new_with_compactions(
+        mut listed_files: LogSegmentFiles,
+        log_root: Url,
+        end_version: Option<Version>,
+        last_checkpoint_metadata: Option<LastCheckpointHint>,
+    ) -> KernelResult<Self> {
+        Self::try_new_impl(
+            &mut listed_files,
+            log_root,
+            end_version,
+            last_checkpoint_metadata,
+            true,
         )
     }
 
@@ -613,6 +634,7 @@ impl LogSegment {
             log_root.clone(),
             time_travel_version,
             checkpoint_hint,
+            false,
         )
         .map_err(|error| {
             let KernelError::MissingVersion(missing) = error.without_backtrace() else {
@@ -1133,6 +1155,99 @@ impl LogSegment {
         })
     }
 
+    /// Whether every individual commit in `(after, through]` is retained.
+    /// `None` starts at version zero. Equal bounds form an empty, covered range; reversed bounds
+    /// are not covered.
+    pub(crate) fn has_original_commits(&self, after: Option<Version>, through: Version) -> bool {
+        let mut next = match after {
+            Some(v) if v >= through => return v == through,
+            Some(v) => v + 1,
+            None => 0,
+        };
+        for file in self
+            .listed
+            .ascending_commit_files
+            .iter()
+            .filter(|p| after.is_none_or(|v| p.version > v) && p.version <= through)
+        {
+            if next != file.version {
+                return false;
+            }
+            if file.version == through {
+                return true;
+            }
+            next = file.version + 1;
+        }
+        false
+    }
+
+    fn first_replay_version(&self) -> Option<Version> {
+        self.listed
+            .ascending_commit_files
+            .first()
+            .map(|p| p.version)
+            .into_iter()
+            .chain(
+                self.listed
+                    .ascending_compaction_files
+                    .first()
+                    .map(|p| p.version),
+            )
+            .min()
+    }
+
+    /// Whether the segment's entire replay range has individual commit metadata.
+    pub(crate) fn has_complete_original_commits(&self) -> bool {
+        if self.listed.ascending_compaction_files.is_empty() {
+            return true;
+        }
+        let after = self
+            .checkpoint_version
+            .or_else(|| self.first_replay_version()?.checked_sub(1));
+        self.has_original_commits(after, self.end_version)
+    }
+
+    /// Rejects original-commit replay when the hint omitted any required commits.
+    pub(crate) fn require_original_commits(&self) -> KernelResult<()> {
+        require!(
+            self.has_complete_original_commits(),
+            KernelError::unsupported(
+                "individual commit metadata is unavailable in this compacted snapshot hint"
+            )
+        );
+        Ok(())
+    }
+
+    /// Whether the tail can be replayed without slicing a compaction across `after`.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn has_replay_after(&self, after: Version) -> bool {
+        self.validate_replay_cover(Some(after)).is_ok()
+    }
+
+    fn validate_replay_cover(&self, after: Option<Version>) -> KernelResult<()> {
+        if after == Some(self.end_version) {
+            return Ok(());
+        }
+        let start = match after {
+            Some(v) => v.checked_add(1),
+            None => self.first_replay_version(),
+        }
+        .ok_or(KernelError::EmptyLog)?;
+        let mut next = start;
+        for path in self.find_commit_cover_paths(after).into_iter().rev() {
+            require!(next == path.version, KernelError::MissingVersion(next));
+            let end = match path.file_type {
+                LogPathFileType::CompactedCommit { hi } => hi,
+                _ => path.version,
+            };
+            if end == self.end_version {
+                return Ok(());
+            }
+            next = end + 1;
+        }
+        Err(KernelError::MissingVersion(next))
+    }
+
     /// Reads original commits and checkpoint files with the same action schema, newest first.
     #[internal_api]
     pub(crate) fn read_actions(
@@ -1193,6 +1308,7 @@ impl LogSegment {
         engine: &dyn Engine,
         schema: SchemaRef,
     ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
+        self.require_original_commits()?;
         let files = self
             .original_commit_paths(None, self.end_version)
             .into_iter()
@@ -1209,6 +1325,7 @@ impl LogSegment {
         use_compactions: bool,
     ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
         let files = if !use_compactions {
+            self.require_original_commits()?;
             self.original_commit_paths(None, self.end_version)
                 .into_iter()
                 .map(|path| path.location.clone())
@@ -1220,8 +1337,8 @@ impl LogSegment {
     }
 
     /// Returns commits and log compactions covering the segment's commits, newest first.
-    /// The greedy selection may not be minimal when compactions overlap. It relies on the file
-    /// range guarantees of [`LogSegment`].
+    /// Selection prefers wider compactions, but avoids choices that leave gaps when originals are
+    /// missing. The cover may not be minimal when compactions overlap.
     pub(crate) fn find_commit_cover(&self) -> Vec<FileMeta> {
         self.find_commit_cover_after(None)
     }
@@ -1276,6 +1393,13 @@ impl LogSegment {
         })
         .filter(|path| oldest_exclusive.is_none_or(|oldest| path.version > oldest));
 
+        if !self.has_complete_original_commits()
+            && let Some(cover) =
+                Self::complete_commit_cover(all_files.clone().collect(), newest_inclusive)
+        {
+            return cover;
+        }
+
         let mut last_pushed: Option<&ParsedLogPath> = None;
 
         let mut selected_files = vec![];
@@ -1302,6 +1426,39 @@ impl LogSegment {
         }
         selected_files.reverse();
         selected_files
+    }
+
+    /// Finds a contiguous cover when a greedy choice could strand missing originals.
+    fn complete_commit_cover(
+        files: Vec<&ParsedLogPath>,
+        end_version: Version,
+    ) -> Option<Vec<&ParsedLogPath>> {
+        let mut next = files.first()?.version;
+        let last_version = |path: &ParsedLogPath| match path.file_type {
+            LogPathFileType::CompactedCommit { hi } => hi,
+            _ => path.version,
+        };
+        // Work backwards so each retained choice has a complete suffix. Reverse ordering visits
+        // wider same-start compactions first; keep that preference only when the suffix is viable.
+        let mut choices = BTreeMap::new();
+        for path in files.into_iter().rev() {
+            let end = last_version(path);
+            if end == end_version || choices.contains_key(&(end + 1)) {
+                choices.entry(path.version).or_insert(path);
+            }
+        }
+
+        let mut selected = Vec::new();
+        loop {
+            let path = *choices.get(&next)?;
+            selected.push(path);
+            let end = last_version(path);
+            if end == end_version {
+                selected.reverse();
+                return Some(selected);
+            }
+            next = end + 1;
+        }
     }
 
     /// Reads original commits and checkpoint files with separate projections, newest first.
@@ -1380,6 +1537,9 @@ impl LogSegment {
         &self,
         use_compactions: bool,
     ) -> KernelResult<Vec<ScanFile>> {
+        if !use_compactions {
+            self.require_original_commits()?;
+        }
         Self::version_tagged_scan_files(self.scan_commit_paths(use_compactions))
     }
 
@@ -1687,7 +1847,8 @@ impl LogSegment {
     /// Creates a pruned LogSegment of only the commits and compactions in
     /// `(start_v_exclusive, end_version]`, dropping checkpoint files, CRC files, and
     /// last-checkpoint metadata.
-    pub(crate) fn segment_after_version(&self, start_v_exclusive: Version) -> Self {
+    /// Returns an error if the tail cannot be covered without slicing a compaction.
+    pub(crate) fn segment_after_version(&self, start_v_exclusive: Version) -> KernelResult<Self> {
         // A checkpoint above start_v_exclusive would drop the commits between them, since the
         // returned segment keeps only (start_v_exclusive, end] and no checkpoint.
         debug_assert!(
@@ -1696,9 +1857,10 @@ impl LogSegment {
             "segment_after_version: start_v_exclusive ({start_v_exclusive}) is below checkpoint {:?}",
             self.checkpoint_version,
         );
+        self.validate_replay_cover(Some(start_v_exclusive))?;
         let (commits, compactions) =
             self.filtered_commits_and_compactions(Some(start_v_exclusive), self.end_version);
-        LogSegment {
+        Ok(LogSegment {
             end_version: self.end_version,
             checkpoint_version: None,
             log_root: self.log_root.clone(),
@@ -1711,7 +1873,7 @@ impl LogSegment {
                 latest_commit_file: None,
                 max_published_version: None,
             },
-        }
+        })
     }
 
     /// Filters commits and compactions to those within `(lo_exclusive, hi_inclusive]`.
@@ -1985,7 +2147,10 @@ impl LogSegment {
         log_root: Url,
         end_version: Option<Version>,
         last_checkpoint_metadata: Option<LastCheckpointHint>,
+        allow_compacted_coverage: bool,
     ) -> KernelResult<Self> {
+        let allow_compacted_coverage =
+            allow_compacted_coverage && !listed_files.ascending_compaction_files.is_empty();
         validate_log_path_fields(listed_files)?;
         validate_compaction_files(&listed_files.ascending_compaction_files)?;
         validate_checkpoint_parts(&listed_files.checkpoint_parts)?;
@@ -2004,13 +2169,51 @@ impl LogSegment {
                 None
             };
 
-        validate_checkpoint_commit_gap(checkpoint_version, &listed_files.ascending_commit_files)?;
-        validate_commit_files_contiguous(&listed_files.ascending_commit_files)?;
-        let effective_version = validate_end_version(
-            &listed_files.ascending_commit_files,
-            &listed_files.checkpoint_parts,
-            end_version,
-        )?;
+        let effective_version = if allow_compacted_coverage {
+            let latest = listed_files
+                .ascending_commit_files
+                .last()
+                .map(|p| p.version)
+                .into_iter()
+                .chain(checkpoint_version)
+                .chain(
+                    listed_files
+                        .ascending_compaction_files
+                        .iter()
+                        .filter_map(|p| match p.file_type {
+                            LogPathFileType::CompactedCommit { hi }
+                                if checkpoint_version.is_none_or(|cp| p.version > cp)
+                                    && end_version.is_none_or(|end| hi <= end) =>
+                            {
+                                Some(hi)
+                            }
+                            _ => None,
+                        }),
+                )
+                .max()
+                .ok_or(KernelError::EmptyLog)?;
+            if let Some(end) = end_version {
+                require!(latest >= end, KernelError::MissingVersion(latest + 1));
+                require!(
+                    latest == end,
+                    KernelError::invalid_log_segment(format!(
+                        "effective version {latest} is newer than requested end version {end}"
+                    ))
+                );
+            }
+            latest
+        } else {
+            validate_checkpoint_commit_gap(
+                checkpoint_version,
+                &listed_files.ascending_commit_files,
+            )?;
+            validate_commit_files_contiguous(&listed_files.ascending_commit_files)?;
+            validate_end_version(
+                &listed_files.ascending_commit_files,
+                &listed_files.checkpoint_parts,
+                end_version,
+            )?
+        };
         // Like commits, compactions must start after the checkpoint: replay should only read
         // compactions ahead of the checkpoint.
         listed_files.ascending_compaction_files.retain(|file| {
@@ -2021,7 +2224,30 @@ impl LogSegment {
                         && hi <= effective_version
             )
         });
-        validate_latest_commit_file(listed_files, effective_version)?;
+        if allow_compacted_coverage
+            && listed_files
+                .latest_commit_file
+                .as_ref()
+                .is_some_and(|latest| {
+                    latest.version < effective_version
+                        && (Some(latest) == listed_files.ascending_commit_files.last()
+                            || Some(latest.version) == checkpoint_version)
+                })
+        {
+            // Grouping may retain the checkpoint-version original only for timestamp lookup.
+            // Neither it nor an older replay commit supplies the compacted target's timestamp.
+            listed_files.latest_commit_file = None;
+        }
+        if !allow_compacted_coverage
+            || listed_files.latest_commit_file.is_some()
+            || listed_files
+                .ascending_commit_files
+                .last()
+                .is_some_and(|p| p.version == effective_version)
+        {
+            validate_latest_commit_file(listed_files, effective_version)?;
+        }
+
         validate_crc(
             listed_files.latest_crc_file.as_ref(),
             checkpoint_version,
@@ -2036,6 +2262,9 @@ impl LogSegment {
             listed: std::mem::take(listed_files),
         };
 
+        if allow_compacted_coverage {
+            log_segment.validate_replay_cover(log_segment.checkpoint_version)?;
+        }
         info!(segment = %log_segment.summary());
 
         Ok(log_segment)

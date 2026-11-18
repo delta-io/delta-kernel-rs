@@ -2282,6 +2282,41 @@ enum ExpectedFile {
     Compaction(Version, Version),
 }
 
+#[rstest]
+#[case::absent(None, true)]
+#[case::checkpoint_original(Some(1), true)]
+#[case::target_original(Some(3), true)]
+#[case::before_checkpoint(Some(0), false)]
+#[case::unretained_original(Some(2), false)]
+#[case::after_target(Some(4), false)]
+fn compacted_hint_normalizes_only_valid_latest_commits(
+    #[case] latest_version: Option<Version>,
+    #[case] valid: bool,
+) {
+    let log_root = Url::parse("memory:///_delta_log/").unwrap();
+    let path = |name: String| create_log_path(log_root.join(&name).unwrap().as_str());
+    let result = LogSegment::try_new_with_compactions(
+        LogSegmentFiles {
+            checkpoint_parts: vec![path(format!("{:020}.checkpoint.parquet", 1))],
+            ascending_compaction_files: vec![path(format!("{:020}.{:020}.compacted.json", 2, 3))],
+            latest_commit_file: latest_version.map(|v| path(format!("{v:020}.json"))),
+            ..Default::default()
+        },
+        log_root.clone(),
+        Some(3),
+        None,
+    );
+    if valid {
+        let segment = result.unwrap();
+        assert_eq!(
+            segment.listed.latest_commit_file.map(|p| p.version),
+            latest_version.filter(|v| *v == 3)
+        );
+    } else {
+        assert_result_error_with_message(result, "latest_commit_file version");
+    }
+}
+
 async fn test_commit_cover(
     commit_versions: &[u64],
     compaction_versions: &[(u64, u64)],
@@ -5697,6 +5732,40 @@ async fn test_get_unpublished_catalog_commits() {
 // Tests: segment_after_version
 // ============================================================================
 
+#[rstest]
+#[case::from_zero(&[0, 1, 2], None, 2, true)]
+#[case::empty_from_zero(&[], None, 0, false)]
+#[case::missing_zero(&[1, 2], None, 2, false)]
+#[case::interior_gap(&[0, 2], None, 2, false)]
+#[case::missing_end(&[0, 1], None, 2, false)]
+#[case::bounded_range(&[0, 1, 2, 3], Some(0), 2, true)]
+#[case::gap_before_bound(&[0, 2], Some(1), 2, true)]
+#[case::gap_after_bound(&[0, 2], Some(0), 2, false)]
+#[case::empty_range(&[], Some(2), 2, true)]
+#[case::reversed_range(&[1, 2], Some(2), 1, false)]
+#[case::maximum_empty_range(&[], Some(Version::MAX), Version::MAX, true)]
+fn original_commit_coverage_respects_range_bounds(
+    #[case] commits: &[Version],
+    #[case] after: Option<Version>,
+    #[case] through: Version,
+    #[case] covered: bool,
+) {
+    let segment = LogSegment {
+        end_version: through,
+        checkpoint_version: None,
+        log_root: Url::parse("memory:///_delta_log/").unwrap(),
+        last_checkpoint_metadata: None,
+        listed: LogSegmentFiles {
+            ascending_commit_files: commits
+                .iter()
+                .map(|v| create_log_path(&format!("memory:///_delta_log/{v:020}.json")))
+                .collect(),
+            ..Default::default()
+        },
+    };
+    assert_eq!(segment.has_original_commits(after, through), covered);
+}
+
 fn extract_commit_versions(seg: &LogSegment) -> Vec<u64> {
     seg.listed
         .ascending_commit_files
@@ -5792,8 +5861,11 @@ struct CrcPruningCase {
     after_compactions: &[],
 })]
 #[tokio::test]
-async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
-    let seg = create_segment_for(LogSegmentConfig {
+async fn test_segment_crc_filtering(
+    #[case] case: CrcPruningCase,
+    #[values(false, true)] omit_covered_originals: bool,
+) {
+    let mut seg = create_segment_for(LogSegmentConfig {
         published_commit_versions: case.commits,
         compaction_versions: case.compactions,
         checkpoint_version: case.checkpoint,
@@ -5801,8 +5873,37 @@ async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
     })
     .await;
 
-    let after = seg.segment_after_version(case.crc_version);
-    assert_eq!(extract_commit_versions(&after), case.after_commits);
+    let keep_original = |v: &Version| {
+        !omit_covered_originals
+            || !case
+                .compactions
+                .iter()
+                .any(|&(lo, hi)| (lo..=hi).contains(v))
+    };
+    seg.listed
+        .ascending_commit_files
+        .retain(|p| keep_original(&p.version));
+    if omit_covered_originals
+        && case
+            .compactions
+            .iter()
+            .any(|&(lo, hi)| lo <= case.crc_version && case.crc_version < hi)
+    {
+        let error = seg.segment_after_version(case.crc_version).unwrap_err();
+        assert!(
+            matches!(error.without_backtrace(), KernelError::MissingVersion(v) if *v == case.crc_version + 1)
+        );
+        return;
+    }
+    let after = seg.segment_after_version(case.crc_version).unwrap();
+    assert_eq!(
+        extract_commit_versions(&after),
+        case.after_commits
+            .iter()
+            .copied()
+            .filter(keep_original)
+            .collect_vec()
+    );
     assert_eq!(extract_compaction_ranges(&after), case.after_compactions);
     assert!(after.checkpoint_version.is_none());
     assert!(after.listed.checkpoint_parts.is_empty());

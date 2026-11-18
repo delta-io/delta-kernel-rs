@@ -1205,7 +1205,9 @@ async fn read_last_checkpoint_action_from_pointer_rejects_commit_outside_segment
         manifest_commit_table(&[checkpoint_commit(1, &[], one_column_schema())]).await;
 
     let engine = non_plan_engine(store);
-    let log_segment = latest_log_segment(&table_root, &engine).segment_after_version(0);
+    let log_segment = latest_log_segment(&table_root, &engine)
+        .segment_after_version(0)
+        .unwrap();
 
     let pointer = pointer(pointer_version, pointer_version);
     let result = log_segment.read_last_checkpoint_action_from_pointer(&engine, &pointer);
