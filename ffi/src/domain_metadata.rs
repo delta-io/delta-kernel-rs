@@ -2,10 +2,9 @@ use delta_kernel::KernelResult;
 use delta_kernel::snapshot::Snapshot;
 
 use crate::error::{ExternResult, IntoExternResult};
-use crate::expressions::kernel_visitor::NullTypeTag;
 use crate::handle::Handle;
 use crate::{
-    AllocateStringFn, ExternEngine, KernelStringSlice, NullableCvoid, OptionalValue,
+    AllocateStringFn, ExternEngine, KernelStringSlice, NullableCvoid, NullableType, OptionalValue,
     SharedExternEngine, SharedSnapshot, TryFromStringSlice, kernel_string_slice,
 };
 
@@ -79,11 +78,9 @@ pub unsafe extern "C" fn snapshot_row_tracking_high_water_mark(
 ///     enabled this is the logical name, not the physical identifier stored in the domain.
 ///   - `physical_column`: the column path as stored in the domain. Use this to correlate a
 ///     clustering column with per-file statistics, which are keyed on physical names.
-///   - `type_tag`: the column's data type, encoded with the same tag values as
-///     `visit_expression_literal_null`. Complex types (struct, array, map, variant) and void report
-///     the non-primitive sentinel (255); use a schema visitor for their full details.
-///   - `precision` / `scale`: meaningful only when `type_tag` is the `decimal` tag (12); zero
-///     otherwise.
+///   - `nullable_type`: the column's data type, including decimal parameters. Interval values are
+///     reported by family without their individual qualifier. `NullableType::NonPrimitive` reports
+///     a type that needs a schema visitor for full details.
 ///
 /// Both column paths are dotted strings with individual fields backtick-escaped when they
 /// contain special characters, losslessly parseable back into a multi-part column reference.
@@ -97,9 +94,7 @@ pub type ClusteringColumnVisitor = extern "C" fn(
     engine_context: NullableCvoid,
     logical_column: KernelStringSlice,
     physical_column: KernelStringSlice,
-    type_tag: u8,
-    precision: u8,
-    scale: u8,
+    nullable_type: NullableType,
 );
 
 /// Visit the table's clustering columns, invoking `visitor` once per column. See
@@ -144,14 +139,11 @@ fn visit_clustering_columns_impl(
     for info in &infos {
         let logical = info.logical_column.to_string();
         let physical = info.physical_column.to_string();
-        let (tag, precision, scale) = NullTypeTag::from_data_type(&info.data_type);
         visitor(
             engine_context,
             kernel_string_slice!(logical),
             kernel_string_slice!(physical),
-            tag as u8,
-            precision,
-            scale,
+            NullableType::from_data_type(&info.data_type),
         );
     }
     Ok(OptionalValue::Some(infos.len()))
@@ -457,8 +449,8 @@ mod tests {
             .join("\n")
     }
 
-    /// One visited clustering column: `(logical, physical, type_tag, precision, scale)`.
-    type VisitedColumn = (String, String, u8, u8, u8);
+    /// One visited clustering column: `(logical, physical, nullable_type)`.
+    type VisitedColumn = (String, String, NullableType);
 
     /// Drive `visit_clustering_columns`, collecting every visited column. Returns the count the
     /// FFI symbol reported alongside the visited descriptors.
@@ -473,9 +465,7 @@ mod tests {
             state: NullableCvoid,
             logical_column: KernelStringSlice,
             physical_column: KernelStringSlice,
-            type_tag: u8,
-            precision: u8,
-            scale: u8,
+            nullable_type: NullableType,
         ) {
             let ptr: *mut Vec<VisitedColumn> = state.unwrap().as_ptr().cast();
             let columns = unsafe { &mut *ptr };
@@ -483,13 +473,7 @@ mod tests {
                 unsafe { TryFromStringSlice::try_from_slice(&logical_column) };
             let physical: KernelResult<String> =
                 unsafe { TryFromStringSlice::try_from_slice(&physical_column) };
-            columns.push((
-                logical.unwrap(),
-                physical.unwrap(),
-                type_tag,
-                precision,
-                scale,
-            ));
+            columns.push((logical.unwrap(), physical.unwrap(), nullable_type));
         }
 
         let count: Option<usize> = ok_or_panic(unsafe {
@@ -582,26 +566,25 @@ mod tests {
         Ok(())
     }
 
-    // Type tags mirror `visit_expression_literal_null`'s encoding.
-    const TAG_INTEGER: u8 = 3;
-    const TAG_STRING: u8 = 7;
+    const TYPE_INTEGER: NullableType = NullableType::Integer;
+    const TYPE_STRING: NullableType = NullableType::String;
 
     // `follow_up` is an optional second `delta.clustering` write `(config, removed)`, letting
     // one case exercise tombstone and latest-write-wins reconciliation. Expectations are
-    // `(logical, physical, type_tag)`; without column mapping logical == physical.
+    // `(logical, physical, nullable_type)`; without column mapping logical == physical.
     #[rstest]
     #[case::clustered_single_column(
         true,
         Some(r#"{"clusteringColumns":[["id"]]}"#),
         None,
-        Some(vec![("id", "id", TAG_INTEGER)]),
+        Some(vec![("id", "id", TYPE_INTEGER)]),
         "memory:///test_clustering_single/"
     )]
     #[case::clustered_multi_column(
         true,
         Some(r#"{"clusteringColumns":[["id"],["val"]]}"#),
         None,
-        Some(vec![("id", "id", TAG_INTEGER), ("val", "val", TAG_STRING)]),
+        Some(vec![("id", "id", TYPE_INTEGER), ("val", "val", TYPE_STRING)]),
         "memory:///test_clustering_multi/"
     )]
     // Nested paths render as dotted, backtick-escaped `ColumnName` strings.
@@ -609,7 +592,7 @@ mod tests {
         true,
         Some(r#"{"clusteringColumns":[["addr","city"]]}"#),
         None,
-        Some(vec![("addr.city", "addr.city", TAG_STRING)]),
+        Some(vec![("addr.city", "addr.city", TYPE_STRING)]),
         "memory:///test_clustering_nested/"
     )]
     // Domain entry present but lists no columns: clustered on nothing -- Some(0), no visits.
@@ -655,7 +638,7 @@ mod tests {
         true,
         Some(r#"{"clusteringColumns":[["id"]]}"#),
         Some((r#"{"clusteringColumns":[["val"]]}"#, false)),
-        Some(vec![("val", "val", TAG_STRING)]),
+        Some(vec![("val", "val", TYPE_STRING)]),
         "memory:///test_clustering_latest_wins/"
     )]
     #[tokio::test]
@@ -663,7 +646,7 @@ mod tests {
         #[case] clustering_feature: bool,
         #[case] domain_config: Option<&str>,
         #[case] follow_up: Option<(&str, bool)>,
-        #[case] expected: Option<Vec<(&str, &str, u8)>>,
+        #[case] expected: Option<Vec<(&str, &str, NullableType)>>,
         #[case] table_root: &str,
     ) -> KernelResult<()> {
         let follow_up_commits: Vec<serde_json::Value> = follow_up
@@ -682,11 +665,10 @@ mod tests {
 
         match expected {
             Some(want) => {
-                // Non-decimal types report zero precision/scale.
                 let want: Vec<VisitedColumn> = want
                     .into_iter()
-                    .map(|(logical, physical, tag)| {
-                        (logical.to_string(), physical.to_string(), tag, 0, 0)
+                    .map(|(logical, physical, nullable_type)| {
+                        (logical.to_string(), physical.to_string(), nullable_type)
                     })
                     .collect();
                 assert_eq!(count, Some(want.len()));
@@ -704,11 +686,14 @@ mod tests {
         Ok(())
     }
 
-    // Decimal is the only tag carrying a payload, so pin precision/scale explicitly.
+    // Decimal is the only non-interval nullable type with a payload, so pin its parameters.
     #[tokio::test]
     async fn test_visit_clustering_columns_decimal_reports_precision_and_scale() -> KernelResult<()>
     {
-        const TAG_DECIMAL: u8 = 12;
+        const TYPE_DECIMAL: NullableType = NullableType::Decimal {
+            precision: 12,
+            scale: 3,
+        };
         let storage = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
         let engine = engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS);
@@ -737,7 +722,7 @@ mod tests {
         assert_eq!(count, Some(1));
         assert_eq!(
             columns,
-            vec![("amt".to_string(), "amt".to_string(), TAG_DECIMAL, 12, 3)]
+            vec![("amt".to_string(), "amt".to_string(), TYPE_DECIMAL)]
         );
 
         unsafe { free_snapshot(snapshot) }
@@ -804,9 +789,7 @@ mod tests {
             vec![(
                 "region".to_string(),
                 "`col-region-phys`".to_string(),
-                TAG_STRING,
-                0,
-                0
+                TYPE_STRING
             )]
         );
 
@@ -834,9 +817,7 @@ mod tests {
             _: NullableCvoid,
             _: KernelStringSlice,
             _: KernelStringSlice,
-            _: u8,
-            _: u8,
-            _: u8,
+            _: NullableType,
         ) {
         }
         let res = unsafe {

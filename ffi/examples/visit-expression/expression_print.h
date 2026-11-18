@@ -208,19 +208,60 @@ void print_tree_helper(ExpressionItem ref, int depth) {
           break;
         }
         case Null: {
-          static const char* null_type_names[] = {
-            "Boolean", "Byte", "Short", "Integer", "Long", "Float",
-            "Double", "String", "Binary", "Date", "Timestamp", "TimestampNtz",
-            "Decimal", "IntervalYearMonth", "IntervalDayTime",
-          };
-          const size_t null_type_count = sizeof(null_type_names) / sizeof(null_type_names[0]);
           struct NullTypeInfo* nt = &lit->value.null_type;
-          if (nt->type_tag == 12) {
-            printf("Null(Decimal(%d,%d))\n", nt->precision, nt->scale);
-          } else if (nt->type_tag < null_type_count) {
-            printf("Null(%s)\n", null_type_names[nt->type_tag]);
-          } else {
-            printf("Null(tag=%d)\n", nt->type_tag);
+          const struct NullableType nullable_type = nt->nullable_type;
+          switch (nullable_type.tag) {
+            case NullableTypeBoolean:
+              printf("Null(Boolean)\n");
+              break;
+            case NullableTypeByte:
+              printf("Null(Byte)\n");
+              break;
+            case NullableTypeShort:
+              printf("Null(Short)\n");
+              break;
+            case NullableTypeInteger:
+              printf("Null(Integer)\n");
+              break;
+            case NullableTypeLong:
+              printf("Null(Long)\n");
+              break;
+            case NullableTypeFloat:
+              printf("Null(Float)\n");
+              break;
+            case NullableTypeDouble:
+              printf("Null(Double)\n");
+              break;
+            case NullableTypeString:
+              printf("Null(String)\n");
+              break;
+            case NullableTypeBinary:
+              printf("Null(Binary)\n");
+              break;
+            case NullableTypeDate:
+              printf("Null(Date)\n");
+              break;
+            case NullableTypeTimestamp:
+              printf("Null(Timestamp)\n");
+              break;
+            case NullableTypeTimestampNtz:
+              printf("Null(TimestampNtz)\n");
+              break;
+            case NullableTypeDecimal:
+              printf(
+                  "Null(Decimal(%u,%u))\n",
+                  (unsigned int)nullable_type.decimal.precision,
+                  (unsigned int)nullable_type.decimal.scale);
+              break;
+            case NullableTypeIntervalYearMonth:
+              printf("Null(IntervalYearMonth)\n");
+              break;
+            case NullableTypeIntervalDayTime:
+              printf("Null(IntervalDayTime)\n");
+              break;
+            case NullableTypeNonPrimitive:
+              printf("Null(NonPrimitive)\n");
+              break;
           }
           break;
         }

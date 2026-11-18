@@ -273,6 +273,8 @@ unpartitioned writes.
 |----------|---------|
 | `update_table_txn_write_state` | Borrow a transaction and return owned, immutable write state |
 | `write_state_encode` / `write_state_decode` | Transport write state between processes using the same Kernel version |
+| `partition_value_map_new` / `free_partition_value_map` | Allocate or release the logical partition values passed to a partitioned write |
+| `partition_value_map_insert_*` | Insert typed partition values; `partition_value_map_insert_null` accepts `NullableType` |
 | `write_context_builder` | Borrow write state and create a builder that retains its own state reference |
 | `write_context_builder_with_partition_values` / `write_context_builder_with_physical_partition_values` | Bind logical or physical partition values |
 | `write_context_builder_with_row_tracking_columns` / `write_context_builder_build` | Bind row-tracking columns and build the context |
@@ -291,6 +293,7 @@ unpartitioned writes.
 |----------|---------|
 | `get_domain_metadata` | Look up the configuration string for a specific domain on a snapshot |
 | `visit_domain_metadata` | Iterate all domain metadata entries on a snapshot |
+| `visit_clustering_columns` | Visit logical and physical clustering columns with their `NullableType` descriptors |
 
 **Table creation**
 
@@ -391,6 +394,35 @@ Kernel's expression system is exposed through two parallel surfaces:
   `visit_expression` / `visit_predicate`, supplying an `EngineExpressionVisitor`
   struct whose function pointers Kernel invokes as it traverses the tree.
 
+Typed nulls use `NullableType` in both directions: `visit_expression_literal_null` accepts it, and
+the `EngineExpressionVisitor.visit_literal_null` callback receives it. Its decimal variant carries
+precision and scale. Its interval variants identify only the year-month or day-time family and do
+not preserve an individual qualifier. The clustering-column callback uses the same descriptor. In
+C, `NullableType` is a tagged union; read or initialize only the payload selected by its tag.
+`NullableTypeNonPrimitive` indicates that a schema visitor or opaque expression is needed to
+reconstruct the type.
+
+For example, a decimal null carries its parameters in the decimal payload:
+
+```c
+NullableType decimal_null = {
+  .tag = NullableTypeDecimal,
+  .decimal = {.precision = 10, .scale = 2},
+};
+visit_expression_literal_null(state, decimal_null, &error_allocators);
+```
+
+Simple primitive and interval-family variants need only their tag:
+
+```c
+NullableType year_null = {
+  .tag = NullableTypeIntervalYearMonth,
+};
+NullableType day_null = {
+  .tag = NullableTypeIntervalDayTime,
+};
+```
+
 Most engines need only one of the two surfaces.
 
 | Function | Purpose |
@@ -398,7 +430,8 @@ Most engines need only one of the two surfaces.
 | `visit_engine_expression` / `visit_engine_predicate` | Build a Kernel `SharedExpression` / `SharedPredicate` from an engine-side AST (Build surface) |
 | `visit_expression` / `visit_predicate` | Walk a Kernel expression or predicate with an `EngineExpressionVisitor` (Walk surface) |
 | `visit_expression_ref` / `visit_predicate_ref` | Walk a pre-interned expression or predicate reference (Walk surface) |
-| `visit_expression_column` / `visit_expression_struct` / `visit_expression_plus` / `visit_expression_literal_*` / ... | Builder functions the engine calls from inside `visit_engine_expression` to construct Kernel expression nodes; see `delta_kernel_ffi.h` for the full list |
+| `visit_expression_literal_null` | Build a typed-null expression from `NullableType`, including decimal parameters or an interval family |
+| `visit_expression_column` / `visit_expression_struct` / `visit_expression_plus` / other `visit_expression_literal_*` | Builder functions the engine calls from inside `visit_engine_expression` to construct Kernel expression nodes; see `delta_kernel_ffi.h` for the full list |
 | `visit_predicate_eq` / `visit_predicate_and` / `visit_predicate_or` / ... | Builder functions the engine calls from inside `visit_engine_predicate` to construct Kernel predicate nodes |
 | `visit_expression_unknown` / `visit_predicate_unknown` | Builder helpers that bridge an opaque engine operator through Kernel unchanged |
 | `visit_kernel_opaque_expression_op_name` / `visit_kernel_opaque_predicate_op_name` | Inspect the name of an opaque op carried through by the above |

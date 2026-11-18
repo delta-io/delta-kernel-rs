@@ -165,9 +165,7 @@ struct MapData {
   ExpressionItemList vals;
 };
 struct NullTypeInfo {
-  uint8_t type_tag;
-  uint8_t precision;
-  uint8_t scale;
+  struct NullableType nullable_type;
 };
 struct Literal {
   enum LitType type;
@@ -313,14 +311,10 @@ void visit_expr_struct_literal(void* data,
 void visit_expr_null_literal(
     void* data,
     uintptr_t sibling_id_list,
-    uint8_t type_tag,
-    uint8_t precision,
-    uint8_t scale) {
+    struct NullableType nullable_type) {
   struct Literal* literal = malloc(sizeof(struct Literal));
   literal->type = Null;
-  literal->value.null_type.type_tag = type_tag;
-  literal->value.null_type.precision = precision;
-  literal->value.null_type.scale = scale;
+  literal->value.null_type.nullable_type = nullable_type;
   put_expr_item(data, sibling_id_list, literal, Literal);
 }
 

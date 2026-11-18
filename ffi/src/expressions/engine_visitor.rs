@@ -11,7 +11,7 @@ use delta_kernel::expressions::{
     VariadicExpression, VariadicExpressionOp,
 };
 
-use super::kernel_visitor::NullTypeTag;
+use super::kernel_visitor::NullableType;
 use crate::expressions::{
     FfiMapToStructOptions, SharedExpression, SharedOpaqueExpressionOp, SharedOpaquePredicateOp,
     SharedPredicate,
@@ -149,16 +149,12 @@ pub struct EngineExpressionVisitor {
     ),
     /// Visits a typed null value belonging to the list identified by `sibling_list_id`.
     ///
-    /// The `type_tag` identifies reconstructible primitive types with tags 0-14. Decimal nulls
-    /// use tag 12 with `precision` and `scale`; interval year-month and day-time nulls use tags
-    /// 13 and 14. Non-primitive types and `void` use the sentinel tag 255.
-    pub visit_literal_null: extern "C" fn(
-        data: *mut c_void,
-        sibling_list_id: usize,
-        type_tag: u8,
-        precision: u8,
-        scale: u8,
-    ),
+    /// `nullable_type` carries decimal parameters and identifies the interval family, but does not
+    /// preserve an individual interval qualifier.
+    /// `NullableType::NonPrimitive` reports types that require a schema visitor or opaque
+    /// expression for reconstruction.
+    pub visit_literal_null:
+        extern "C" fn(data: *mut c_void, sibling_list_id: usize, nullable_type: NullableType),
     /// Visits an `and` expression belonging to the list identified by `sibling_list_id`.
     /// The sub-expressions of the array are in a list identified by `child_list_id`
     pub visit_and: VisitJunctionFn,
@@ -619,15 +615,8 @@ fn visit_expression_scalar(
             )
         }
         Scalar::Null(data_type) => {
-            let (tag, precision, scale) = NullTypeTag::from_data_type(data_type);
-            call!(
-                visitor,
-                visit_literal_null,
-                sibling_list_id,
-                tag as u8,
-                precision,
-                scale
-            )
+            let nullable_type = NullableType::from_data_type(data_type);
+            call!(visitor, visit_literal_null, sibling_list_id, nullable_type)
         }
         Scalar::IntervalYearMonth(val) => {
             call!(
@@ -819,7 +808,9 @@ fn visit_predicate_internal(predicate: &Predicate, visitor: &mut EngineExpressio
 #[cfg(test)]
 mod tests {
     use delta_kernel::expressions::{Expression, MapToStructOptions, Scalar, lit};
-    use delta_kernel::schema::{IntervalDayToSecondType, IntervalYearToMonthType};
+    use delta_kernel::schema::{
+        DataType, IntervalDayToSecondType, IntervalYearToMonthType, PrimitiveType,
+    };
     use rstest::rstest;
 
     use super::*;
@@ -835,6 +826,10 @@ mod tests {
         IntervalDayTime {
             sibling_list_id: usize,
             value: i64,
+        },
+        Null {
+            sibling_list_id: usize,
+            nullable_type: NullableType,
         },
         Column {
             sibling_list_id: usize,
@@ -905,6 +900,18 @@ mod tests {
         });
     }
 
+    extern "C" fn visit_literal_null(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        nullable_type: NullableType,
+    ) {
+        let builder = unsafe { &mut *(data as *mut TestExpressionBuilder) };
+        builder.events.push(LiteralEvent::Null {
+            sibling_list_id,
+            nullable_type,
+        });
+    }
+
     extern "C" fn visit_column(
         data: *mut c_void,
         sibling_list_id: usize,
@@ -960,7 +967,6 @@ mod tests {
     ignore_fn!(ignore_child_list, usize);
     ignore_fn!(ignore_map_literal, usize, usize);
     ignore_fn!(ignore_case_when, usize, usize, usize);
-    ignore_fn!(ignore_null, u8, u8, u8);
     ignore_fn!(ignore_parse_json, usize, Handle<SharedSchema>);
     ignore_fn!(ignore_struct_patch, usize, usize, usize, usize);
     ignore_fn!(ignore_field_patch, KernelStringSlice, usize, bool, bool);
@@ -989,7 +995,7 @@ mod tests {
             visit_literal_struct: ignore_struct_literal,
             visit_literal_array: ignore_child_list,
             visit_literal_map: ignore_map_literal,
-            visit_literal_null: ignore_null,
+            visit_literal_null,
             visit_and: ignore_child_list,
             visit_or: ignore_child_list,
             visit_not: ignore_child_list,
@@ -1097,6 +1103,48 @@ mod tests {
 
         assert_eq!(top_level_id, 0);
         assert_eq!(builder.events, vec![expected]);
+    }
+
+    #[rstest]
+    #[case::integer(lit(Scalar::Null(DataType::INTEGER)), NullableType::Integer)]
+    #[case::long(lit(Scalar::Null(DataType::LONG)), NullableType::Long)]
+    #[case::decimal(
+        lit(Scalar::Null(DataType::decimal(10, 2).unwrap())),
+        NullableType::Decimal { precision: 10, scale: 2 }
+    )]
+    #[case::year_month_interval(
+        lit(Scalar::Null(DataType::Primitive(PrimitiveType::interval_year_month(
+            IntervalYearToMonthType::IntervalYear
+        )))),
+        NullableType::IntervalYearMonth
+    )]
+    #[case::day_time_interval(
+        lit(Scalar::Null(DataType::Primitive(PrimitiveType::interval_day_time(
+            IntervalDayToSecondType::IntervalHourToMinute
+        )))),
+        NullableType::IntervalDayTime
+    )]
+    #[case::variant(
+        lit(Scalar::Null(DataType::unshredded_variant())),
+        NullableType::NonPrimitive
+    )]
+    fn visit_expression_passes_nullable_type_to_null_callback(
+        #[case] expression: Expression,
+        #[case] expected: NullableType,
+    ) {
+        let mut builder = TestExpressionBuilder::default();
+        let mut visitor = test_visitor(&mut builder);
+
+        let top_level_id = visit_expression_internal(&expression, &mut visitor);
+
+        assert_eq!(top_level_id, 0);
+        assert_eq!(
+            builder.events,
+            vec![LiteralEvent::Null {
+                sibling_list_id: 0,
+                nullable_type: expected,
+            }]
+        );
     }
 
     #[rstest]

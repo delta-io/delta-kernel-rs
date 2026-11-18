@@ -14,9 +14,8 @@ use delta_kernel::expressions::Scalar;
 use delta_kernel_ffi_macros::handle_descriptor;
 
 use crate::error::{ExternResult, IntoExternResult};
-use crate::expressions::kernel_visitor::NullTypeTag;
 use crate::handle::Handle;
-use crate::{KernelStringSlice, SharedExternEngine, TryFromStringSlice};
+use crate::{KernelStringSlice, NullableType, SharedExternEngine, TryFromStringSlice};
 
 /// Owns a map from a partition column's logical name to its [`Scalar`] value. Engines build the
 /// map with the `partition_value_map_insert_*` functions and pass it to
@@ -101,6 +100,7 @@ pub unsafe extern "C" fn partition_value_map_insert_string(
 /// # Safety
 ///
 /// Caller must pass valid handles and a valid `name` slice.
+/// `nullable_type` must be a valid [`NullableType`] value with an initialized active payload.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn partition_value_map_insert_int(
     mut map: Handle<ExclusivePartitionValueMap>,
@@ -341,14 +341,11 @@ pub unsafe extern "C" fn partition_value_map_insert_decimal(
     unsafe { result.into_extern_result(&engine) }
 }
 
-/// Insert a typed `null` partition value under `name`. The `type_tag` identifies the column's
-/// data type using the same `NullTypeTag` encoding as `visit_expression_literal_null` in
-/// [`kernel_visitor`](crate::expressions::kernel_visitor). For the decimal tag, `precision` and
-/// `scale` specify the decimal parameters; for all other types, pass 0 for both.
+/// Insert a typed `null` partition value under `name`.
 ///
-/// Returns an error if the tag is unrecognized, is the non-primitive sentinel (255), or carries an
-/// invalid decimal precision/scale. A null partition value is only legal for a nullable partition
-/// column; the kernel rejects it otherwise when the write context is built.
+/// Returns an error for [`NullableType::NonPrimitive`] or invalid decimal precision and scale. A
+/// null partition value is only legal for a nullable partition column; the kernel rejects it
+/// otherwise when the write context is built.
 ///
 /// # Safety
 ///
@@ -357,17 +354,13 @@ pub unsafe extern "C" fn partition_value_map_insert_decimal(
 pub unsafe extern "C" fn partition_value_map_insert_null(
     mut map: Handle<ExclusivePartitionValueMap>,
     name: KernelStringSlice,
-    type_tag: u8,
-    precision: u8,
-    scale: u8,
+    nullable_type: NullableType,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<bool> {
     let map = unsafe { map.as_mut() };
     let engine = unsafe { engine.as_ref() };
     let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let scalar = NullTypeTag::try_from(type_tag)
-        .and_then(|tag| tag.to_data_type(precision, scale))
-        .map(Scalar::Null);
+    let scalar = nullable_type.to_data_type().map(Scalar::Null);
     let result = partition_value_map_insert_impl(map, name, scalar);
     unsafe { result.into_extern_result(&engine) }
 }
@@ -433,9 +426,7 @@ mod tests {
         let mut map = PartitionValueMap {
             inner: HashMap::new(),
         };
-        let scalar = NullTypeTag::try_from(NullTypeTag::Integer as u8)
-            .and_then(|tag| tag.to_data_type(0, 0))
-            .map(Scalar::Null);
+        let scalar = NullableType::Integer.to_data_type().map(Scalar::Null);
         partition_value_map_insert_impl(&mut map, Ok("p"), scalar).unwrap();
         assert_eq!(
             map.inner.get("p"),
@@ -446,7 +437,7 @@ mod tests {
     // The following tests drive the typed `extern "C"` wrappers through their real signatures
     // (which require an engine handle for error allocation), guarding against the easy
     // copy-paste hazards: a wrong `Scalar` variant in a wrapper, a botched decimal hi/lo
-    // recombination, or a mis-dispatched null type tag. They build a throwaway in-memory engine.
+    // recombination, or a mis-dispatched nullable type. They build a throwaway in-memory engine.
     #[cfg(feature = "default-engine-base")]
     mod ffi {
         use delta_kernel::schema::{DataType, PrimitiveType};
@@ -599,7 +590,7 @@ mod tests {
         }
 
         #[test]
-        fn null_wrapper_dispatches_type_tags_and_rejects_invalid() {
+        fn null_wrapper_dispatches_nullable_types_and_rejects_unsupported_types() {
             let engine = get_default_engine("memory:///partition_value_null_test/");
             let map = partition_value_map_new();
 
@@ -609,9 +600,10 @@ mod tests {
                 partition_value_map_insert_null(
                     map.shallow_copy(),
                     kernel_string_slice!(n),
-                    NullTypeTag::Decimal as u8,
-                    10,
-                    2,
+                    NullableType::Decimal {
+                        precision: 10,
+                        scale: 2,
+                    },
                     engine.shallow_copy(),
                 )
             });
@@ -622,7 +614,7 @@ mod tests {
                 Some(&expected)
             );
 
-            // The non-primitive sentinel and unrecognized tags are rejected.
+            // Types that the descriptor cannot reconstruct and invalid decimal parameters fail.
             let expect_err = |result: ExternResult<bool>| match result {
                 ExternResult::Err(e) => unsafe { recover_error(e) }.etype,
                 ExternResult::Ok(_) => panic!("expected error"),
@@ -632,9 +624,7 @@ mod tests {
                 partition_value_map_insert_null(
                     map.shallow_copy(),
                     kernel_string_slice!(n),
-                    NullTypeTag::NonPrimitive as u8,
-                    0,
-                    0,
+                    NullableType::NonPrimitive,
                     engine.shallow_copy(),
                 )
             });
@@ -643,13 +633,14 @@ mod tests {
                 partition_value_map_insert_null(
                     map.shallow_copy(),
                     kernel_string_slice!(n),
-                    200, // unrecognized tag
-                    0,
-                    0,
+                    NullableType::Decimal {
+                        precision: 5,
+                        scale: 10,
+                    },
                     engine.shallow_copy(),
                 )
             });
-            assert_eq!(err, FFIKernelError::GenericError);
+            assert_eq!(err, FFIKernelError::InvalidDecimalError);
             // Failed inserts did not add the "bad" key.
             assert!(!unsafe { map.as_ref() }.inner.contains_key("bad"));
 
