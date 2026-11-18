@@ -14,8 +14,7 @@ use crate::checkpoint::CheckpointWriter;
 use crate::checkpoint::sidecar::{SidecarSplitter, SingleSidecarDataIterator};
 use crate::checkpoint::tests::{
     create_add_action, create_metadata_action, create_metadata_with_stats_config_and_partitions,
-    create_remove_action, create_v2_checkpoint_protocol_action, new_in_memory_store,
-    write_commit_to_store,
+    create_remove_action, create_v2_checkpoint_protocol_action, write_commit_to_store,
 };
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::arrow_expression::ArrowEvaluationHandler;
@@ -275,9 +274,8 @@ fn verify_non_file_batches(batches: &[Box<dyn EngineData>], expected: &ExpectedN
 /// action counts correct.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_generate_sidecars_single_sidecar() -> Result<()> {
-    let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
-
+    let engine = SyncEngine::in_memory();
+    let store = engine.store();
     write_commit_to_store(
         &store,
         vec![
@@ -338,9 +336,7 @@ async fn test_generate_sidecars_single_sidecar() -> Result<()> {
 /// file and non-file batches is correct.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_generate_sidecars_multiple_chunks() -> Result<()> {
-    let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
-
+    let engine = SyncEngine::in_memory();
     // Commit 0: v2 protocol + metadata + 3 adds (mixed batch of file and non-file actions)
     write_commit_to_store(
         &store,
@@ -448,9 +444,7 @@ async fn test_generate_sidecars_multiple_chunks() -> Result<()> {
 /// Verifies: produces multiple sidecar files, splitter is exhausted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_generate_sidecars_hint_one_per_batch() -> Result<()> {
-    let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
-
+    let engine = SyncEngine::in_memory();
     write_commit_to_store(
         &store,
         vec![
@@ -518,9 +512,7 @@ async fn test_generate_sidecars_hint_one_per_batch() -> Result<()> {
 /// 5. Validate the actual values in `stats_parsed` and `partitionValues_parsed` match the input.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_generate_sidecars_stats_and_partition_values() -> Result<()> {
-    let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
-
+    let engine = SyncEngine::in_memory();
     write_commit_to_store(
         &store,
         vec![
@@ -629,9 +621,7 @@ async fn test_generate_sidecars_stats_and_partition_values() -> Result<()> {
 /// Verifies: SidecarSplitter yields no file-action rows and buffers all non-file actions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_splitter_no_file_actions() -> Result<()> {
-    let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
-
+    let engine = SyncEngine::in_memory();
     write_commit_to_store(
         &store,
         vec![

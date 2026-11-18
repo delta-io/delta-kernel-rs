@@ -89,9 +89,7 @@ fn test_verify_written_size(
 
 #[tokio::test]
 async fn test_create_checkpoint_metadata_batch() -> Result<()> {
-    let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
-
+    let engine = SyncEngine::in_memory();
     // 1st commit (version 0) - metadata and protocol actions
     // Protocol action includes the v2Checkpoint reader/writer feature.
     write_commit_to_store(
@@ -173,8 +171,7 @@ fn test_create_last_checkpoint_data() -> KernelResult<()> {
     let total_actions_counter = 100;
     let add_actions_counter = 75;
     let size_in_bytes: i64 = 1024 * 1024; // 1MB
-    let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = SyncEngine::in_memory();
 
     // Create last checkpoint metadata
     let last_checkpoint_batch = create_last_checkpoint_data(
@@ -211,18 +208,6 @@ fn test_create_last_checkpoint_data() -> KernelResult<()> {
 
     assert_eq!(*record_batch, expected);
     Ok(())
-}
-
-/// TODO(#855): Merge copies and move to `test_utils`
-/// Create an in-memory store and return the store and the URL for the store's _delta_log directory.
-pub(crate) fn new_in_memory_store() -> (Arc<InMemory>, Url) {
-    (
-        Arc::new(InMemory::new()),
-        Url::parse("memory:///")
-            .unwrap()
-            .join("_delta_log/")
-            .unwrap(),
-    )
 }
 
 /// TODO(#855): Merge copies and move to `test_utils`
@@ -333,9 +318,7 @@ async fn read_last_checkpoint_file(store: &Arc<InMemory>) -> KernelResult<Value>
 /// - No version specified (latest version is used)
 #[tokio::test]
 async fn test_v1_checkpoint_latest_version_by_default() -> Result<()> {
-    let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
-
+    let engine = SyncEngine::in_memory();
     // 1st commit: adds `fake_path_1`
     write_commit_to_store(
         &store,
@@ -412,9 +395,7 @@ async fn test_v1_checkpoint_latest_version_by_default() -> Result<()> {
 /// - A specific version specified (version 0)
 #[tokio::test]
 async fn test_v1_checkpoint_specific_version() -> Result<()> {
-    let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
-
+    let engine = SyncEngine::in_memory();
     // 1st commit (version 0) - metadata and protocol actions
     // Protocol action does not include the v2Checkpoint reader/writer feature.
     write_commit_to_store(
@@ -478,9 +459,7 @@ async fn test_v1_checkpoint_specific_version() -> Result<()> {
 
 #[tokio::test]
 async fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> Result<()> {
-    let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
-
+    let engine = SyncEngine::in_memory();
     // 1st commit (version 0) - metadata and protocol actions
     write_commit_to_store(
         &store,
@@ -569,9 +548,7 @@ fn test_last_checkpoint_hint_stats_rejects_invalid_input(
 /// - No version specified (latest version is used)
 #[tokio::test]
 async fn test_v2_checkpoint_supported_table() -> Result<()> {
-    let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
-
+    let engine = SyncEngine::in_memory();
     // 1st commit: adds `fake_path_2` & removes `fake_path_1`
     write_commit_to_store(
         &store,
@@ -645,9 +622,8 @@ async fn test_v2_checkpoint_supported_table() -> Result<()> {
 
 #[tokio::test]
 async fn test_no_checkpoint_on_unpublished_snapshot() -> Result<()> {
-    let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
-
+    let engine = SyncEngine::in_memory();
+    let store = engine.store();
     // normal commit with catalog-managed protocol
     write_commit_to_store(
         &store,
@@ -706,8 +682,7 @@ async fn test_no_standalone_checkpoint_on_adaptive_metadata_table(
     )]
     spec: Option<CheckpointSpec>,
 ) -> Result<()> {
-    let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = SyncEngine::in_memory();
     let config = adaptive_metadata_table_configuration(test_schema_flat_with_column_mapping(), &[]);
     let commit = [
         json!({ "commitInfo": { "timestamp": 1, "inCommitTimestamp": 1 } }),
@@ -743,9 +718,8 @@ fn create_add_action_with_stats(path: &str, num_records: i64) -> Action {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_snapshot_checkpoint() -> Result<()> {
-    let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
-
+    let engine = SyncEngine::in_memory();
+    let store = engine.store();
     // Version 0: metadata & protocol
     write_commit_to_store(
         &store,
@@ -1006,9 +980,7 @@ async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer() -> Result<()> {
-    let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
-
+    let engine = SyncEngine::in_memory();
     let table_root = Url::parse("memory:///").map_err(KernelError::from)?;
     let _ = create_table(
         table_root.as_str(),
@@ -1169,8 +1141,7 @@ async fn test_stats_config_round_trip(
     #[values(true, false)] json2: bool,
     #[values(true, false)] struct2: bool,
 ) -> Result<()> {
-    let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = SyncEngine::in_memory();
     let table_root = Url::parse("memory:///").map_err(KernelError::from)?;
 
     // Commit 0: protocol + metadata with initial settings
@@ -1236,8 +1207,7 @@ async fn test_stats_config_round_trip_partitioned(
     #[values(true, false)] json2: bool,
     #[values(true, false)] struct2: bool,
 ) -> Result<()> {
-    let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = SyncEngine::in_memory();
     let table_root = Url::parse("memory:///").map_err(KernelError::from)?;
 
     // Commit 0: protocol + partitioned metadata with initial settings
@@ -1348,9 +1318,7 @@ async fn test_stats_config_round_trip_partitioned(
 // causing an Arrow schema mismatch in the COALESCE expression.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_checkpoint_with_varchar_metadata_on_field() -> Result<()> {
-    let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
-
+    let engine = SyncEngine::in_memory();
     let config = HashMap::from([
         ("delta.checkpoint.writeStatsAsJson".into(), "true".into()),
         ("delta.checkpoint.writeStatsAsStruct".into(), "true".into()),

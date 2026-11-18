@@ -141,15 +141,9 @@ async fn build_log_with_paths_and_checkpoint(
     (storage, log_root)
 }
 
-// Create an in-memory store and return the store and the URL for the store's _delta_log directory.
-fn new_in_memory_store() -> (Arc<InMemory>, Url) {
-    (
-        Arc::new(InMemory::new()),
-        Url::parse("memory:///")
-            .unwrap()
-            .join("_delta_log/")
-            .unwrap(),
-    )
+// The `_delta_log/` root URL of the in-memory test tables. Also used by checkpoint-shape tests.
+pub(crate) fn memory_log_root() -> Url {
+    Url::parse("memory:///_delta_log/").unwrap()
 }
 
 // Writes a record batch obtained from engine data to the in-memory store at a given path.
@@ -357,7 +351,7 @@ fn log_segment_stats_counts_only_replay_commits(
     let segment = LogSegment {
         end_version: sizes.len().saturating_sub(1) as u64,
         checkpoint_version: checkpoint_only.then_some(0),
-        log_root: Url::parse("memory:///_delta_log/").unwrap(),
+        log_root: memory_log_root(),
         last_checkpoint_metadata: None,
         listed: LogSegmentFiles {
             ascending_commit_files: commits,
@@ -429,7 +423,7 @@ fn log_segment_stats_ignores_compactions(
     let segment = LogSegment {
         end_version: commit_sizes.len() as u64 - 1,
         checkpoint_version: None,
-        log_root: Url::parse("memory:///_delta_log/").unwrap(),
+        log_root: memory_log_root(),
         last_checkpoint_metadata: None,
         listed: LogSegmentFiles {
             ascending_commit_files: commit_sizes
@@ -1297,7 +1291,7 @@ fn test_sidecar_to_filemeta_valid_paths(
 
 #[test]
 fn test_checkpoint_batch_with_no_sidecars_returns_none() -> KernelResult<()> {
-    let (_, log_root) = new_in_memory_store();
+    let log_root = memory_log_root();
     let engine = Arc::new(SyncEngine::new());
     let checkpoint_batch = add_batch_simple(get_all_actions_schema().clone());
 
@@ -1319,8 +1313,8 @@ fn test_checkpoint_batch_with_no_sidecars_returns_none() -> KernelResult<()> {
 
 #[tokio::test]
 async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> KernelResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = SyncEngine::in_memory();
+    let log_root = memory_log_root();
     let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
     let sidecar1_size = add_sidecar_to_store(
@@ -1367,8 +1361,8 @@ async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> Kernel
 
 #[test]
 fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> KernelResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = SyncEngine::in_memory();
+    let log_root = memory_log_root();
 
     let checkpoint_batch = sidecar_batch_with_given_paths(
         vec!["sidecarfile1.parquet", "sidecarfile2.parquet"],
@@ -1397,8 +1391,8 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> KernelResult<
 
 #[tokio::test]
 async fn test_reading_sidecar_files_with_predicate() -> KernelResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = SyncEngine::in_memory();
+    let log_root = memory_log_root();
     let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
     // Add a sidecar file with only add actions
@@ -1438,8 +1432,8 @@ async fn test_reading_sidecar_files_with_predicate() -> KernelResult<()> {
 #[tokio::test]
 async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_no_file_actions()
 -> KernelResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = SyncEngine::in_memory();
+    let log_root = memory_log_root();
     add_checkpoint_to_store(
         &store,
         // Create a checkpoint batch with sidecar actions to verify that the sidecar actions are
@@ -1492,8 +1486,9 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
 #[tokio::test]
 async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_multi_part()
 -> KernelResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = SyncEngine::in_memory();
+    let store = engine.store();
+    let log_root = memory_log_root();
 
     // Multi-part checkpoints should never contain sidecar actions.
     // This test intentionally includes batches with sidecar actions in multi-part checkpoints
@@ -1570,8 +1565,9 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
 #[tokio::test]
 async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars()
 -> KernelResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = SyncEngine::in_memory();
+    let store = engine.store();
+    let log_root = memory_log_root();
 
     add_checkpoint_to_store(
         &store,
@@ -1654,8 +1650,9 @@ async fn test_scan_checkpoint_read_handles_all_remove_row_groups(
     #[case] expected_add_paths: &[&str],
     #[values(false, true)] ignore_predicate: bool,
 ) -> KernelResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let sync_engine = Arc::new(SyncEngine::new_with_store(store.clone()));
+    let sync_engine = Arc::new(SyncEngine::in_memory());
+    let store = sync_engine.store();
+    let log_root = memory_log_root();
     let ignore_predicate_engine = ignore_predicate_engine(&sync_engine);
     let engine: &dyn Engine = if ignore_predicate {
         &ignore_predicate_engine
@@ -1712,8 +1709,8 @@ async fn test_scan_checkpoint_read_handles_all_remove_row_groups(
 /// row while still surfacing the live Add.
 #[tokio::test]
 async fn test_scan_checkpoint_read_tolerates_unfiltered_json_rows() -> KernelResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = SyncEngine::in_memory();
+    let log_root = memory_log_root();
 
     let checkpoint_name =
         "00000000000000000001.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json";
@@ -1768,8 +1765,9 @@ async fn test_scan_checkpoint_read_handles_all_remove_sidecar_row_groups(
     #[case] ignore_predicate: bool,
     #[case] expected_materialized_rows: usize,
 ) -> KernelResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let sync_engine = Arc::new(SyncEngine::new_with_store(store.clone()));
+    let sync_engine = Arc::new(SyncEngine::in_memory());
+    let store = sync_engine.store();
+    let log_root = memory_log_root();
     let ignore_predicate_engine = ignore_predicate_engine(&sync_engine);
     let engine: &dyn Engine = if ignore_predicate {
         &ignore_predicate_engine
@@ -1836,8 +1834,8 @@ async fn test_scan_checkpoint_read_handles_all_remove_sidecar_row_groups(
 #[tokio::test]
 async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars()
 -> KernelResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = SyncEngine::in_memory();
+    let log_root = memory_log_root();
 
     let filename = "00000000000000000010.checkpoint.80a083e8-7026-4e79-81be-64bd76c43a11.json";
 
@@ -1899,8 +1897,9 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
 #[tokio::test]
 async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batches()
 -> KernelResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = SyncEngine::in_memory();
+    let store = engine.store();
+    let log_root = memory_log_root();
 
     // Write sidecars first so we can get their actual sizes
     let sidecar1_size = add_sidecar_to_store(
@@ -2348,7 +2347,7 @@ fn commit_cover_after_excludes_compaction_starting_at_or_before_bound(
     #[case] after: Option<Version>,
     #[case] expected_files: Vec<ExpectedFile>,
 ) {
-    let log_root = Url::parse("memory:///_delta_log/").unwrap();
+    let log_root = memory_log_root();
     let log_path = |name: String| create_log_path(log_root.join(&name).unwrap().as_str());
     let commits = (0..=end_version)
         .map(|v| log_path(format!("{v:020}.json")))
@@ -3580,7 +3579,7 @@ fn test_log_segment_checkpoint_gap_rejects_version_overflow() {
 /// only place it is exercised.
 #[test]
 fn checkpoint_sidecars_distinguishes_empty_from_absent() -> KernelResult<()> {
-    let (_store, log_root) = new_in_memory_store();
+    let log_root = memory_log_root();
     let selected = "00000000000000000001.checkpoint.11111111-1111-1111-1111-111111111111.parquet";
     let checkpoint_file = log_root.join(selected)?.to_string();
     let commit = create_log_path(log_root.join("00000000000000000002.json")?.as_str());
@@ -3651,7 +3650,7 @@ fn checkpoint_hint_sidecar_file_schema_resolution(
     #[case] expect_schema: bool,
 ) {
     // A hint that names a different same-version checkpoint does not apply to the selected one.
-    let (_store, log_root) = new_in_memory_store();
+    let log_root = memory_log_root();
     let selected = "00000000000000000001.checkpoint.11111111-1111-1111-1111-111111111111.parquet";
     let other = "00000000000000000001.checkpoint.22222222-2222-2222-2222-222222222222.parquet";
     let checkpoint_file = log_root.join(selected).unwrap().to_string();
@@ -3696,8 +3695,8 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
     #[case] hint_version: u64,
     #[case] expect_hint_schema_used: bool,
 ) -> KernelResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = SyncEngine::in_memory();
+    let log_root = memory_log_root();
 
     // Build a checkpoint with an initial v1 schema
     let v1_schema = COMMIT_READ_SCHEMA.clone();
@@ -3777,8 +3776,9 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
 async fn test_get_file_actions_schema_v2_identity_filter(
     #[case] identity_matches: bool,
 ) -> KernelResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = SyncEngine::in_memory();
+    let store = engine.store();
+    let log_root = memory_log_root();
 
     let selected = "00000000000000000001.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.parquet";
     let other = "00000000000000000001.checkpoint.016ae953-37a9-438e-8683-9a9a4a79a395.parquet";
@@ -3840,8 +3840,9 @@ async fn test_get_file_actions_schema_v2_identity_filter(
 #[case::without_hint(false)]
 #[tokio::test]
 async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> KernelResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = SyncEngine::in_memory();
+    let store = engine.store();
+    let log_root = memory_log_root();
 
     let checkpoint_part_1 = "00000000000000000001.checkpoint.0000000001.0000000002.parquet";
     let checkpoint_part_2 = "00000000000000000001.checkpoint.0000000002.0000000002.parquet";
@@ -4143,8 +4144,9 @@ async fn test_checkpoint_stream_resolves_stats_projection(
     #[case] expect_parsed_stats: bool,
     #[case] expect_json_stats: bool,
 ) -> KernelResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = SyncEngine::in_memory();
+    let store = engine.store();
+    let log_root = memory_log_root();
     let checkpoint_schema = if include_parsed_stats {
         create_checkpoint_file_schema_with_stats_parsed(
             vec![StructField::nullable("other", DataType::LONG)],
@@ -4828,8 +4830,9 @@ fn add_batch_with_partition_values_parsed(output_schema: SchemaRef) -> Box<Arrow
 
 #[tokio::test]
 async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> KernelResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = SyncEngine::in_memory();
+    let store = engine.store();
+    let log_root = memory_log_root();
 
     // Build a schema that includes add.partitionValues_parsed.id: integer
     let checkpoint_schema: SchemaRef = schema_ref! {
@@ -4920,8 +4923,9 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> KernelResu
 
 #[tokio::test]
 async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -> KernelResult<()> {
-    let (store, log_root) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = SyncEngine::in_memory();
+    let store = engine.store();
+    let log_root = memory_log_root();
 
     // Write a checkpoint WITHOUT partitionValues_parsed
     add_checkpoint_to_store(
@@ -5977,7 +5981,7 @@ async fn read_actions_with_null_map_values(
     use crate::arrow::array::{Array, AsArray, MapArray, StructArray};
 
     let store = Arc::new(InMemory::new());
-    let log_root = Url::parse("memory:///_delta_log/").unwrap();
+    let log_root = memory_log_root();
 
     // Write a single commit file with the action containing null map values.
     store
@@ -6043,7 +6047,7 @@ async fn read_actions_with_null_map_values(
 
 #[test]
 fn new_for_version_zero_creates_valid_log_segment() {
-    let log_root = Url::parse("memory:///_delta_log/").unwrap();
+    let log_root = memory_log_root();
     let commit_path = create_log_path("memory:///_delta_log/00000000000000000000.json");
     let segment = super::LogSegment::new_for_version_zero(log_root.clone(), commit_path).unwrap();
     assert_eq!(segment.end_version, 0);
@@ -6052,7 +6056,7 @@ fn new_for_version_zero_creates_valid_log_segment() {
 
 #[test]
 fn new_for_version_zero_rejects_non_zero_version() {
-    let log_root = Url::parse("memory:///_delta_log/").unwrap();
+    let log_root = memory_log_root();
     let commit_path = create_log_path("memory:///_delta_log/00000000000000000001.json");
     let err = super::LogSegment::new_for_version_zero(log_root, commit_path).unwrap_err();
     assert!(err.to_string().contains("version"));
@@ -6060,7 +6064,7 @@ fn new_for_version_zero_rejects_non_zero_version() {
 
 #[test]
 fn new_for_version_zero_rejects_non_commit_file() {
-    let log_root = Url::parse("memory:///_delta_log/").unwrap();
+    let log_root = memory_log_root();
     let checkpoint_path =
         create_log_path("memory:///_delta_log/00000000000000000000.checkpoint.parquet");
     let err = super::LogSegment::new_for_version_zero(log_root, checkpoint_path).unwrap_err();
