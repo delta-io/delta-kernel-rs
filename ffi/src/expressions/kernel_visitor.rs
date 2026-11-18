@@ -547,7 +547,7 @@ fn visit_expression_literal_decimal_impl(
 
 /// Type tag for null literal construction via FFI. Identifies the data type of a typed null.
 ///
-/// Most primitive types use fixed discriminants 0-14. Decimal uses 12 and requires additional
+/// Primitive types use fixed discriminants. Decimal uses 12 and requires additional
 /// precision/scale parameters. Non-primitive types (struct, array, map, variant) and the `void`
 /// primitive use the [`NonPrimitive`](Self::NonPrimitive) sentinel because they cannot be
 /// reconstructed from a type tag alone.
@@ -590,8 +590,9 @@ pub(crate) enum NullTypeTag {
     IntervalYearMonth = 13,
     /// Null of type `interval day to second` (signed microsecond duration).
     IntervalDayTime = 14,
-    // Deliberately not feature gated, so timestamp_nanos number allocations are there even
-    // if the feature is disabled.
+    // Not gated on `nanosecond-timestamps`, so these discriminants stay reserved and the C enum
+    // is identical with or without the feature. Without it, building a null from these tags
+    // returns an error.
     /// EXPERIMENTAL. Null of type `timestamp_ltz(9)` (nanoseconds since epoch, UTC-adjusted).
     TimestampNanos = 15,
     /// EXPERIMENTAL. Null of type `timestamp_ntz(9)` (nanoseconds since epoch, no timezone).
