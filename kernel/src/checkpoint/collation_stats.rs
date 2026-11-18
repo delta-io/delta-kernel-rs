@@ -540,7 +540,8 @@ mod tests {
                 },
             },
         };
-        let mut processor = ActionReconciliationProcessor::new(i64::MAX, None, None);
+        let mut processor =
+            ActionReconciliationProcessor::new(i64::MAX, None, None, None /* crc */);
         let mut batches = snapshot
             .log_segment()
             .read_actions(&engine, CHECKPOINT_ACTIONS_SCHEMA_V1.clone())?

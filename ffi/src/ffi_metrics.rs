@@ -599,6 +599,10 @@ pub enum MetricEvent {
     ChecksumWriteSuccess(ChecksumWriteSuccess),
     ChecksumWriteFailure(ChecksumWriteFailure),
     LastCheckpointReadCompleted(LastCheckpointReadCompleted),
+    /// The CRC computed by log replay disagrees with the in-memory CRC at the same version.
+    /// Only `numFiles` and `tableSizeBytes` are compared.
+    // TODO(#3672): Validate the remaining CRC fields.
+    CrcValidationFailure,
 }
 
 /// Borrow the caller-supplied correlation id as a [`KernelStringSlice`], or an empty slice when
@@ -813,6 +817,7 @@ impl MetricEvent {
                 resolution_mode: (*resolution_mode).into(),
                 duration_ns: ns(*duration),
             }),
+            K::CrcValidationFailure => Self::CrcValidationFailure,
             K::JsonReadCompleted(kernel::JsonReadCompleted {
                 num_files,
                 bytes_read,

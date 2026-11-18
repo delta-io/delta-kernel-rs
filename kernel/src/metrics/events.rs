@@ -117,6 +117,9 @@ pub enum MetricEvent {
     StorageListCompleted(StorageListCompleted),
     StorageReadCompleted(StorageReadCompleted),
     StorageCopyCompleted(StorageCopyCompleted),
+    /// The CRC computed by log replay disagrees with the in-memory CRC at the same version.
+    /// Only `numFiles` and `tableSizeBytes` are compared.
+    CrcValidationFailure,
 }
 
 impl MetricEvent {
@@ -151,7 +154,8 @@ impl MetricEvent {
             Self::TransactionCommitFailure(_)
             | Self::DomainMetadataLoadFailure
             | Self::SetTransactionLoadFailure
-            | Self::CrcReadFailure => {}
+            | Self::CrcReadFailure
+            | Self::CrcValidationFailure => {}
 
             // Read events have no duration field.
             Self::JsonReadCompleted(_) | Self::ParquetReadCompleted(_) => {}
@@ -189,6 +193,7 @@ impl MetricEvent {
             Self::CrcReadFailure => Err(CrcReadSuccess::SPAN_NAME),
             Self::CheckpointWriteFailure(_) => Err(CheckpointWriteSuccess::SPAN_NAME),
             Self::ChecksumWriteFailure(_) => Err(ChecksumWriteSuccess::SPAN_NAME),
+            Self::CrcValidationFailure => Err(CRC_VALIDATION_FAILED_SPAN),
         }
     }
 
@@ -224,6 +229,7 @@ impl MetricEvent {
             Self::CrcReadFailure => Err(CrcReadSuccess::SPAN_NAME),
             Self::CheckpointWriteFailure(_) => Err(CheckpointWriteSuccess::SPAN_NAME),
             Self::ChecksumWriteFailure(_) => Err(ChecksumWriteSuccess::SPAN_NAME),
+            Self::CrcValidationFailure => Err(CRC_VALIDATION_FAILED_SPAN),
         }
     }
 
@@ -321,6 +327,7 @@ impl MetricEvent {
             | Self::CrcReadFailure
             | Self::CheckpointWriteFailure(_)
             | Self::ChecksumWriteFailure(_)
+            | Self::CrcValidationFailure
             | Self::JsonReadCompleted(_)
             | Self::ParquetReadCompleted(_)
             | Self::ScanMetadataCompleted(_)
@@ -353,6 +360,7 @@ impl fmt::Display for MetricEvent {
             Self::CheckpointWriteFailure(e) => e.fmt(f),
             Self::ChecksumWriteSuccess(e) => e.fmt(f),
             Self::ChecksumWriteFailure(e) => e.fmt(f),
+            Self::CrcValidationFailure => f.write_str("CrcValidationFailure"),
             Self::JsonReadCompleted(e) => e.fmt(f),
             Self::ParquetReadCompleted(e) => e.fmt(f),
             Self::ScanMetadataCompleted(e) => e.fmt(f),
@@ -1293,6 +1301,7 @@ impl fmt::Display for SetTransactionLoadSuccess {
 // ====================================================================
 
 pub(crate) const CRC_READ_COMPLETED_SPAN: &str = "crc_read_completed";
+pub(crate) const CRC_VALIDATION_FAILED_SPAN: &str = "crc_validation_failed";
 
 /// A CRC file was read and parsed successfully. `bytes_read` is the raw byte count from storage.
 #[derive(Debug, Clone)]
@@ -2169,6 +2178,14 @@ pub fn emit_json_read_completed(num_files: u64, bytes_read: u64) {
         report = tracing::field::Empty,
         num_files,
         bytes_read,
+    );
+}
+
+pub(crate) fn emit_crc_validation_failure() {
+    let _span = tracing::span!(
+        tracing::Level::INFO,
+        CRC_VALIDATION_FAILED_SPAN,
+        report = tracing::field::Empty,
     );
 }
 

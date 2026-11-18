@@ -130,6 +130,7 @@ impl LogCompactionWriter {
             min_file_retention_timestamp_millis,
             self.get_transaction_expiration_timestamp()?,
             self.snapshot.table_configuration().dv_normalization_root(),
+            None, /* crc */
         );
 
         // Process actions using the same iterator pattern as checkpoints
@@ -139,6 +140,9 @@ impl LogCompactionWriter {
             .filter_ok(HasSelectionVector::has_selected_rows);
 
         // Wrap the iterator to track action counts lazily
-        Ok(ActionReconciliationIterator::new(Box::new(result_iter)))
+        Ok(ActionReconciliationIterator::new(
+            Box::new(result_iter),
+            None, /* crc */
+        ))
     }
 }

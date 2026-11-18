@@ -10,11 +10,11 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 
 use super::events::{
-    CheckpointWriteSuccess, ChecksumWriteSuccess, CrcReadSuccess, DomainMetadataLoadSuccess,
-    JsonReadCompleted, LastCheckpointReadCompleted, LogSegmentLoadSuccess, MetricEvent,
-    ParquetReadCompleted, ProtocolMetadataLoadSuccess, STORAGE_SPAN, ScanMetadataCompleted,
-    SetTransactionLoadSuccess, SnapshotBuildSuccess, TransactionCommitSuccess,
-    storage_metric_from_attrs,
+    CRC_VALIDATION_FAILED_SPAN, CheckpointWriteSuccess, ChecksumWriteSuccess, CrcReadSuccess,
+    DomainMetadataLoadSuccess, JsonReadCompleted, LastCheckpointReadCompleted,
+    LogSegmentLoadSuccess, MetricEvent, ParquetReadCompleted, ProtocolMetadataLoadSuccess,
+    STORAGE_SPAN, ScanMetadataCompleted, SetTransactionLoadSuccess, SnapshotBuildSuccess,
+    TransactionCommitSuccess, storage_metric_from_attrs,
 };
 
 // ====================================================================
@@ -141,6 +141,7 @@ where
             ChecksumWriteSuccess::SPAN_NAME => Some(MetricEvent::ChecksumWriteSuccess(
                 ChecksumWriteSuccess::from_attrs(attrs),
             )),
+            CRC_VALIDATION_FAILED_SPAN => Some(MetricEvent::CrcValidationFailure),
             JsonReadCompleted::SPAN_NAME => Some(MetricEvent::JsonReadCompleted(
                 JsonReadCompleted::from_attrs(attrs),
             )),
