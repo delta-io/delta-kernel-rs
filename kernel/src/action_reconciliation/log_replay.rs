@@ -524,15 +524,20 @@ impl ActionReconciliationVisitor<'_> {
             if let Some(crc) = self.crc.as_deref_mut()
                 && let FileStatsState::Complete(stats) = &mut crc.file_stats_state
             {
-                let num_files = stats.num_files.checked_add(1);
                 // Read the signed size directly because extract_file_action clamps
                 // negative sizes to zero.
                 // TODO(#3715): Like extract_file_action, warn on missing add.size. Revisit
                 // whether both paths should error instead.
-                let table_size_bytes = getters[Self::ADD_SIZE.index]
-                    .get_long(i, Self::ADD_SIZE.name)?
-                    .and_then(|bytes| stats.table_size_bytes.checked_add(bytes));
-                if let (Some(num_files), Some(table_size_bytes)) = (num_files, table_size_bytes) {
+                let file_size_bytes =
+                    getters[Self::ADD_SIZE.index].get_long(i, Self::ADD_SIZE.name)?;
+
+                let next_num_files = stats.num_files.checked_add(1);
+                let next_table_size_bytes =
+                    file_size_bytes.and_then(|size| stats.table_size_bytes.checked_add(size));
+
+                if let (Some(num_files), Some(table_size_bytes)) =
+                    (next_num_files, next_table_size_bytes)
+                {
                     stats.num_files = num_files;
                     stats.table_size_bytes = table_size_bytes;
                 } else {
@@ -904,9 +909,12 @@ mod tests {
                 .build(get_all_actions_schema())?,
         );
         let crc = Arc::new(Mutex::new(Crc::default()));
-        let mut processor =
-            ActionReconciliationProcessor::new(0, None, None, Some(Arc::clone(&crc)));
-        let mut add_actions_count = 0;
+        let mut processor = ActionReconciliationProcessor::new(
+            0,    /* minimum_file_retention_timestamp */
+            None, /* txn_expiration_timestamp */
+            None, /* dv_normalization_root */
+            Some(Arc::clone(&crc)),
+        );
         for (index, size_field) in sizes.into_iter().enumerate() {
             let action = format!(
                 r#"{{"add":{{"path":"file_{index}",{size_field}"partitionValues":{{}},
@@ -916,10 +924,9 @@ mod tests {
                 string_array_to_engine_data(StringArray::from(vec![action.as_str()])),
                 nullable_size_schema.clone(),
             )?;
-            let batch = ActionsBatch::new(actions, true);
-            add_actions_count += processor.process_actions_batch(batch)?.add_actions_count;
+            let batch = ActionsBatch::new(actions, true /* is_log_batch */);
+            assert_eq!(processor.process_actions_batch(batch)?.add_actions_count, 1);
         }
-        assert_eq!(add_actions_count, 2);
         let crc = crc.lock().unwrap().clone();
         Ok(crc)
     }
@@ -929,12 +936,11 @@ mod tests {
     fn run_action_reconciliation_test(
         input_batches: Vec<ActionsBatch>,
     ) -> KernelResult<(Vec<FilteredEngineData>, i64, i64)> {
-        let crc = Arc::new(Mutex::new(Crc::default()));
         let mut processor = ActionReconciliationProcessor::new(
             0,    /* minimum_file_retention_timestamp */
             None, /* txn_expiration_timestamp */
             None, /* dv_normalization_root */
-            Some(crc),
+            None, /* crc */
         );
         let processed_batches: Vec<_> = input_batches
             .into_iter()
