@@ -109,19 +109,18 @@ pub unsafe extern "C" fn snapshot_checkpoint_info(
     let result = snapshot
         .reader()
         .get_checkpoint_info(engine.engine().as_ref())
-        .and_then(|info| visit(info.as_deref(), context, visitor))
+        .and_then(|info| with_checkpoint_info(info.as_deref(), |info| visitor(context, info)))
         .map(|()| true);
     unsafe { result.into_extern_result(&engine) }
 }
 
-fn visit(
+/// Invoke a callback while the checkpoint record and all nested backing storage are alive.
+pub(crate) fn with_checkpoint_info<R>(
     info: Option<&CheckpointInfo>,
-    context: NullableCvoid,
-    visitor: CheckpointInfoVisitor,
-) -> KernelResult<()> {
+    visitor: impl FnOnce(*const FfiCheckpointInfo) -> R,
+) -> KernelResult<R> {
     let Some(info) = info else {
-        visitor(context, std::ptr::null());
-        return Ok(());
+        return Ok(visitor(std::ptr::null()));
     };
     let schema = serde_json::to_string(info.leaf_schema())?;
     let checkpoint = CheckpointBacking::try_new(info.last_checkpoint())?;
@@ -133,12 +132,11 @@ fn visit(
         last_checkpoint: checkpoint.as_ffi(),
         kind: info.kind().into(),
     };
-    visitor(context, &value);
-    Ok(())
+    Ok(visitor(&value))
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::ptr::NonNull;
     use std::sync::Arc;
 
@@ -350,7 +348,7 @@ mod tests {
     /// Builds handles from a snapshot hint, returning the checkpoint root's size. Every case runs
     /// without I/O except V1: discovery reads a classic-named checkpoint's footer, so that case
     /// writes a real checkpoint to in-memory storage.
-    async fn checkpoint_handles(
+    pub(crate) async fn checkpoint_handles(
         checkpoint: Option<FfiSelectedCheckpointType>,
         manifest: bool,
         invalid_size: bool,

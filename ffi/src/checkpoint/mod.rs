@@ -4,6 +4,10 @@
 mod info;
 mod types;
 
+#[cfg(all(test, feature = "declarative-plans", feature = "tracing"))]
+pub(crate) use info::tests::checkpoint_handles;
+#[cfg(all(feature = "declarative-plans", feature = "tracing"))]
+pub(crate) use info::with_checkpoint_info;
 #[cfg(feature = "declarative-plans")]
 pub use info::{
     CheckpointInfoVisitor, FfiCheckpointInfo, FfiCheckpointKind, snapshot_checkpoint_info,
