@@ -1378,12 +1378,11 @@ impl Scan {
             ));
         }
 
-        // If the current log segment contains a checkpoint newer than the hint version
-        // we disregard the existing data hint, and perform a full scan. The current log segment
-        // only has deltas after the checkpoint, so we cannot update from prior versions.
+        // Reusing cached state needs every intervening original commit. A newer checkpoint or
+        // compaction-only coverage can make that range unavailable, so perform a full scan.
         // TODO: we may be able to apply heuristics or other logic to try and fetch missing deltas
         // from the log.
-        if matches!(log_segment.checkpoint_version, Some(v) if v > existing_version) {
+        if !log_segment.has_original_commits(Some(existing_version), self.snapshot.version()) {
             return Ok(Box::new(self.scan_metadata_with_engine(engine)?));
         }
         // Likewise for an AMT checkpoint action: commits at or below its version may no longer be

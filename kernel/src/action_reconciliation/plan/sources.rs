@@ -110,7 +110,7 @@ pub(crate) fn commit_arm(
 ) -> KernelResult<PlanBuilder> {
     let commit_files = match base_version {
         Some(version) => log_segment
-            .segment_after_version(version)
+            .segment_after_version(version)?
             .commit_cover_version_tagged_scan_files(use_compactions)?,
         None => log_segment.commit_cover_version_tagged_scan_files(use_compactions)?,
     };

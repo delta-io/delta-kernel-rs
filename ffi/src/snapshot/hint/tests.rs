@@ -11,15 +11,12 @@ use delta_kernel::actions::{Add, LastManifestCommit};
 use delta_kernel::crc::Crc;
 use delta_kernel::engine::{DelegatingEngine, PanicEngine};
 use delta_kernel::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
-use delta_kernel::log_segment::LogSegment;
 use delta_kernel::metrics::{MetricEvent, SnapshotLoadType};
 use delta_kernel::path::{LogPathFileType, ParsedLogPath};
 use delta_kernel::snapshot::{IncrementalReplay, PublicationWatermark, Snapshot};
 use delta_kernel::{FileMeta, FileSlice, KernelResult, KernelResultIterator, StorageHandler};
 use test_utils::table_builder::{LogState, TestTableBuilder};
-use test_utils::{
-    CapturingReporter, TestCatalogCommitter, compacted_log_path_for_versions, create_log_path,
-};
+use test_utils::{CapturingReporter, TestCatalogCommitter};
 use url::Url;
 
 use super::*;
@@ -545,56 +542,6 @@ fn snapshot_hint_export_borrows_inputs_and_calls_visitor_once() {
 extern "C" fn count_hint_visits(context: NullableCvoid, _hint: *const FfiSnapshotHint) {
     let visits = unsafe { &mut *context.unwrap().as_ptr().cast::<usize>() };
     *visits += 1;
-}
-
-#[test]
-fn snapshot_hint_export_round_trips_compaction_paths() {
-    let engine = test_engine();
-    let paths = [
-        FfiLogPath::new(
-            slice("memory:///hinted-table/_delta_log/00000000000000000000.json"),
-            1,
-            1,
-        ),
-        FfiLogPath::new(
-            slice("memory:///hinted-table/_delta_log/00000000000000000001.json"),
-            2,
-            2,
-        ),
-    ];
-    let hint = test_snapshot_hint(&paths, 1, FfiSnapshotHintFreshness::Unverified);
-    let builder = unsafe {
-        ok_or_panic(snapshot_builder_with_snapshot_hint(
-            test_builder(&engine),
-            &hint,
-        ))
-    };
-    let source = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
-    let source_ref = unsafe { source.as_ref() };
-    let mut files = source_ref.log_segment().listed.clone();
-    files.ascending_compaction_files.push(
-        create_log_path(
-            source_ref.table_root(),
-            compacted_log_path_for_versions(0, 1, "json"),
-        )
-        .into(),
-    );
-    let snapshot = Snapshot::new(
-        LogSegment::try_new(
-            files,
-            source_ref.log_segment().log_root.clone(),
-            Some(1),
-            None,
-        )
-        .unwrap(),
-        source_ref.table_configuration().clone(),
-    )
-    .unwrap();
-    let snapshot: Handle<SharedSnapshot> = Arc::new(snapshot).into();
-    unsafe { free_snapshot(source) };
-
-    assert_exported_paths_and_round_trip(snapshot);
-    unsafe { free_engine(engine) };
 }
 
 struct CopiedHintPaths {
@@ -1647,9 +1594,14 @@ fn aggregate_with_rejects_null_nonempty_log_path_array() {
 }
 
 #[rstest::rstest]
-#[case::complete(true)]
-#[case::missing_commit(false)]
-fn aggregate_with_log_compaction_requires_individual_commits(#[case] complete: bool) {
+#[case::all_originals(2, 1)]
+#[case::latest_original_only(1, 1)]
+#[case::compaction_only(0, 1)]
+#[case::incomplete_coverage(0, 2)]
+fn aggregate_with_log_compaction_validates_replay_coverage(
+    #[case] original_commits: usize,
+    #[case] version: Version,
+) {
     let engine = test_engine();
     let builder = test_builder(&engine);
     let log_path = FfiLogPath::new(
@@ -1663,20 +1615,24 @@ fn aggregate_with_log_compaction_requires_individual_commits(#[case] complete: b
     let paths = [
         log_path,
         FfiLogPath::new(
-            slice("memory:///hinted-table/_delta_log/00000000000000000000.json"),
-            0,
-            0,
-        ),
-        FfiLogPath::new(
             slice("memory:///hinted-table/_delta_log/00000000000000000001.json"),
             1234,
             0,
         ),
+        FfiLogPath::new(
+            slice("memory:///hinted-table/_delta_log/00000000000000000000.json"),
+            0,
+            0,
+        ),
     ];
-    let supplied_paths = if complete { &paths[..] } else { &paths[..1] };
-    let hint = test_snapshot_hint(supplied_paths, 1, FfiSnapshotHintFreshness::Unverified);
+    let supplied_paths = &paths[..=original_commits];
+    let hint = test_snapshot_hint(
+        supplied_paths,
+        version,
+        FfiSnapshotHintFreshness::Unverified,
+    );
     let builder = unsafe { ok_or_panic(snapshot_builder_with_snapshot_hint(builder, &hint)) };
-    if !complete {
+    if version > 1 {
         assert_extern_result_error_contains(
             unsafe { snapshot_builder_build(builder) },
             FFIKernelError::InvalidSnapshotHint,
@@ -1687,26 +1643,29 @@ fn aggregate_with_log_compaction_requires_individual_commits(#[case] complete: b
     }
     let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
     let source = unsafe { snapshot.as_ref() };
-    assert_eq!(source.version(), 1);
-    assert_eq!(source.log_segment().listed.ascending_commit_files.len(), 2);
+    assert_eq!(source.version(), version);
+    assert_eq!(
+        source.log_segment().listed.ascending_commit_files.len(),
+        original_commits
+    );
     assert_eq!(
         source.log_segment().listed.ascending_compaction_files.len(),
         1
     );
-    assert_eq!(
-        unsafe {
-            ok_or_panic(crate::snapshot_timestamp(
-                snapshot.shallow_copy(),
-                engine.shallow_copy(),
-            ))
-        },
-        1234
-    );
-
-    unsafe {
-        free_snapshot(snapshot);
-        free_engine(engine);
+    let timestamp =
+        unsafe { crate::snapshot_timestamp(snapshot.shallow_copy(), engine.shallow_copy()) };
+    if original_commits > 0 {
+        assert_eq!(ok_or_panic(timestamp), 1234);
+    } else {
+        assert_extern_result_error_with_message(
+            timestamp,
+            FFIKernelError::MissingVersionError,
+            None,
+        );
     }
+
+    assert_exported_paths_and_round_trip(snapshot);
+    unsafe { free_engine(engine) };
 }
 
 #[test]

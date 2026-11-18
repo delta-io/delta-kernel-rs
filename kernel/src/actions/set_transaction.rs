@@ -54,7 +54,7 @@ impl SetTransactionScanner {
         engine: &dyn Engine,
     ) -> KernelResult<Option<SetTransaction>> {
         let actions = log_segment
-            .segment_after_version(base_version)
+            .segment_after_version(base_version)?
             .read_actions(engine, LOG_TXN_SCHEMA.clone())?;
         let mut tail = scan_application_transactions(actions, Some(application_id))?;
         Ok(tail
