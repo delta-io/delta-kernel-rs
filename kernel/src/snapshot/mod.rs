@@ -701,8 +701,6 @@ impl Snapshot {
     ///
     /// The hint preserves whether this snapshot was built as latest, not whether it is still
     /// latest. Missing checkpoint hints and CRCs at this snapshot's version remain absent.
-    /// The hint includes the selected checkpoint type when already known; export does not
-    /// trigger checkpoint discovery.
     /// Rebuild it with [`SnapshotBuilder::with_snapshot_hint`] for the same table root.
     ///
     /// Original commit and compaction paths are retained together.
@@ -2143,7 +2141,6 @@ mod tests {
                 size: 17,
                 ..Default::default()
             }),
-            None,
         )
         .unwrap();
         let configuration = MockTableConfigurationBuilder::new()
@@ -2619,7 +2616,6 @@ mod tests {
             listed_files,
             url.join("_delta_log/").map_err(KernelError::from)?,
             Some(0),
-            None,
             None,
         )?;
 

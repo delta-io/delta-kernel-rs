@@ -72,10 +72,6 @@ mod tests {
         let expected = Some(written_type);
         let early_type = (written_type == SelectedCheckpointType::V1).then_some(written_type);
         assert_eq!(snapshot.known_checkpoint_type(), early_type);
-        assert_eq!(
-            snapshot.to_snapshot_hint().unwrap().checkpoint_type(),
-            early_type
-        );
         assert!(snapshot.cached_checkpoint_info().is_none());
         if early_type.is_some() {
             assert_eq!(
@@ -106,9 +102,8 @@ mod tests {
         let cached = reader.get_checkpoint_info(&PanicEngine).unwrap().unwrap();
         assert!(Arc::ptr_eq(&info, &cached));
 
-        // When the snapshot loaded from storage is rebuilt from its resolved hint or advanced.
+        // When the snapshot loaded from storage is rebuilt from its hint or advanced.
         let hint = snapshot.to_snapshot_hint().unwrap();
-        assert_eq!(hint.checkpoint_type(), expected);
         let hinted = Snapshot::builder_for(table.table_root())
             .with_snapshot_hint(hint)
             .build(&PanicEngine)
@@ -116,11 +111,14 @@ mod tests {
         let updated = Snapshot::builder_from(snapshot.clone())
             .build(&engine)
             .unwrap();
-        // Then the resolved type survives without rediscovery.
+        // Then a rebuilt V1 type is re-inferred without I/O, while a classic-named V2 type is
+        // resolved again through discovery because hints do not carry the type.
+        assert_eq!(hinted.known_checkpoint_type(), early_type);
         assert_eq!(
-            hinted.reader().get_checkpoint_type(&PanicEngine).unwrap(),
+            hinted.reader().get_checkpoint_type(&engine).unwrap(),
             expected
         );
+        // And an incremental update reusing the same checkpoint keeps the resolved type.
         assert_eq!(updated.version(), 3);
         assert_eq!(
             updated.log_segment().checkpoint_version(),

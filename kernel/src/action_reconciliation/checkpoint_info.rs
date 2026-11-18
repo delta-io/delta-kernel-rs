@@ -13,7 +13,6 @@ use crate::actions::{
 };
 use crate::checkpoint::{CHECKPOINT_ACTIONS_SCHEMA_V2, CheckpointInfo, SelectedCheckpointType};
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::error::SnapshotHintError;
 use crate::expressions::{ColumnName, Predicate, col};
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
 use crate::log_segment::LogSegment;
@@ -81,15 +80,22 @@ impl CheckpointInfo {
                 "Checkpoint metadata version mismatch",
             ));
         }
-        // A hint can omit checkpointMetadata, so its absence does not disprove a retained V2 type.
-        let checkpoint_type = match (segment.checkpoint_type(), metadata.is_some()) {
-            (Some(SelectedCheckpointType::V1), true) => {
-                return Err(SnapshotHintError::CheckpointTypeConflict.into());
-            }
-            (_, true) => SelectedCheckpointType::V2,
-            (Some(retained), false) => retained,
-            (None, false) => SelectedCheckpointType::V1,
-        };
+        // UUID-named checkpoints follow the V2 spec even when a hint omits checkpointMetadata.
+        // Otherwise the checkpoint is V2 exactly when it contains checkpointMetadata.
+        let checkpoint_type =
+            if metadata.is_some() || root.file_type == LogPathFileType::UuidCheckpoint {
+                SelectedCheckpointType::V2
+            } else {
+                SelectedCheckpointType::V1
+            };
+        if segment
+            .checkpoint_type()
+            .is_some_and(|retained| retained != checkpoint_type)
+        {
+            return Err(KernelError::invalid_checkpoint(
+                "retained checkpoint type conflicts with the selected checkpoint",
+            ));
+        }
         let files = sidecars
             .iter()
             .map(|sidecar| sidecar.to_filemeta(&segment.log_root))
@@ -555,6 +561,40 @@ mod tests {
     }
 
     #[rstest]
+    #[case::retained_v2(Some(SelectedCheckpointType::V2))]
+    #[case::unresolved(None)]
+    fn classic_named_v1_checkpoint_is_v1_regardless_of_retained_type(
+        #[case] retained_type: Option<SelectedCheckpointType>,
+    ) {
+        // Given: a classic-named V1 checkpoint whose retained type is unresolved or conflicting.
+        let (engine, snapshot, _tempdir) =
+            load_test_table("v2-classic-parquet-struct-stats-only").unwrap();
+        let mut segment = snapshot.log_segment().clone();
+        segment.checkpoint.as_mut().unwrap().checkpoint_type = retained_type;
+        let snapshot = Snapshot::new(segment, snapshot.table_configuration().clone()).unwrap();
+
+        // When: discovery reads the checkpoint.
+        let result = snapshot.reader().get_checkpoint_info(engine.as_ref());
+
+        // Then: the file decides. A conflicting retained V2 type is rejected instead of reported.
+        match retained_type {
+            Some(_) => {
+                let error = result.unwrap_err();
+                assert!(matches!(
+                    error.without_backtrace(),
+                    KernelError::InvalidCheckpoint(message)
+                        if message.contains("checkpoint type conflicts")
+                ));
+                assert!(snapshot.cached_checkpoint_info().is_none());
+            }
+            None => {
+                let info = result.unwrap().unwrap();
+                assert_eq!(info.checkpoint_type(), SelectedCheckpointType::V1);
+            }
+        }
+    }
+
+    #[rstest]
     fn classic_named_manifest_retains_layout_and_validates_type(
         #[values(
             None,
@@ -575,13 +615,13 @@ mod tests {
         // When: the public getter resolves the selected checkpoint.
         let result = snapshot.reader().get_checkpoint_info(engine.as_ref());
 
-        // Then: a conflicting V1 claim fails without publishing checkpoint information.
+        // Then: a conflicting retained V1 type fails without publishing checkpoint information.
         if retained_type == Some(SelectedCheckpointType::V1) {
             let error = result.unwrap_err();
             assert!(matches!(
                 error.without_backtrace(),
-                KernelError::SnapshotHint(source)
-                    if matches!(source.as_ref(), SnapshotHintError::CheckpointTypeConflict)
+                KernelError::InvalidCheckpoint(message)
+                    if message.contains("checkpoint type conflicts")
             ));
             assert!(snapshot.cached_checkpoint_info().is_none());
             return;
@@ -810,7 +850,6 @@ mod tests {
                 }),
                 ..Default::default()
             }),
-            None,
         )
         .unwrap()
     }
@@ -959,7 +998,6 @@ mod tests {
                 }),
                 ..Default::default()
             }),
-            None,
         )
         .unwrap()
     }

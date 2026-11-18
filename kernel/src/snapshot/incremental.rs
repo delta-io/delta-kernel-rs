@@ -420,7 +420,6 @@ impl Snapshot {
             log_root.clone(),
             requested_version,
             None,
-            None,
         )?;
 
         let new_end_version = new_log_segment.end_version;
@@ -530,7 +529,7 @@ impl Snapshot {
                 existing_log_segment.last_checkpoint_metadata.clone(),
             )
         };
-        let combined_log_segment = LogSegment::try_new_for_snapshot(
+        let combined_log_segment = LogSegment::try_new_for_snapshot_with_checkpoint_type(
             LogSegmentFiles {
                 ascending_commit_files,
                 ascending_compaction_files,

@@ -62,9 +62,11 @@ impl<'a> SnapshotReader<'a> {
     /// Returns the selected checkpoint's V1 or V2 specification, or `None` if none was selected.
     ///
     /// Returns without I/O when the type is already known from checkpoint naming, loaded protocol,
-    /// matching hint evidence, the writer, or completed discovery. Otherwise, resolves it through
-    /// [`Self::get_checkpoint_info`], sharing that getter's I/O, caching, and cancellation
-    /// behavior. Adaptive-metadata tables are unsupported.
+    /// a matching `_last_checkpoint` schema, the writer, or completed discovery. Snapshot hints do
+    /// not carry the type, so a snapshot rebuilt from a hint may need discovery for a
+    /// classic-named checkpoint on a table that supports v2Checkpoint. Otherwise, resolves it
+    /// through [`Self::get_checkpoint_info`], sharing that getter's I/O, caching, and
+    /// cancellation behavior. Adaptive-metadata tables are unsupported.
     #[cfg(feature = "declarative-plans")]
     pub fn get_checkpoint_type(
         &self,

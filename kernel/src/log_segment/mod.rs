@@ -29,7 +29,6 @@ use crate::checkpoint::{SelectedCheckpoint, SelectedCheckpointType};
 use crate::committer::CatalogCommit;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::content_tree::read_checkpoint_action;
-use crate::error::SnapshotHintError;
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
 use crate::log_replay::ActionsBatch;
@@ -398,10 +397,26 @@ impl LogSegment {
         })
     }
 
-    /// Constructs a segment with a retained checkpoint type, rejecting conflicts with its paths
-    /// and matching checkpoint schema. The supplied type can resolve ambiguous classic paths.
+    /// Validates the supplied files and constructs their replay segment.
     #[internal_api]
     pub(crate) fn try_new(
+        mut listed_files: LogSegmentFiles,
+        log_root: Url,
+        end_version: Option<Version>,
+        last_checkpoint_metadata: Option<LastCheckpointHint>,
+    ) -> KernelResult<Self> {
+        Self::try_new_impl(
+            &mut listed_files,
+            log_root,
+            end_version,
+            last_checkpoint_metadata,
+            None,
+        )
+    }
+
+    /// Like [`Self::try_new`], retaining a checkpoint type for the selected checkpoint.
+    #[cfg(test)]
+    pub(crate) fn try_new_with_checkpoint_type(
         mut listed_files: LogSegmentFiles,
         log_root: Url,
         end_version: Option<Version>,
@@ -603,7 +618,18 @@ impl LogSegment {
             (None, None) => LogSegmentFiles::list(storage, &log_root, log_tail, None, None)?,
         };
 
-        Self::try_new_for_snapshot(
+        Self::try_new_for_snapshot(listed_files, log_root, time_travel_version, checkpoint_hint)
+    }
+
+    /// Validates a snapshot's replay files with its selected checkpoint and target version.
+    /// Shared log consumers use `try_new` to retain their Kernel error contracts.
+    pub(crate) fn try_new_for_snapshot(
+        listed_files: LogSegmentFiles,
+        log_root: Url,
+        time_travel_version: Option<Version>,
+        checkpoint_hint: Option<LastCheckpointHint>,
+    ) -> Result<Self> {
+        Self::try_new_for_snapshot_with_checkpoint_type(
             listed_files,
             log_root,
             time_travel_version,
@@ -612,9 +638,10 @@ impl LogSegment {
         )
     }
 
-    /// Validates a snapshot's replay files with its selected checkpoint and target version.
-    /// Shared log consumers use `try_new` to retain their Kernel error contracts.
-    pub(crate) fn try_new_for_snapshot(
+    /// Like [`Self::try_new_for_snapshot`], retaining a checkpoint type Kernel already observed
+    /// for the selected checkpoint. Rejects a type that conflicts with the selected path or its
+    /// matching checkpoint schema.
+    pub(crate) fn try_new_for_snapshot_with_checkpoint_type(
         mut listed_files: LogSegmentFiles,
         log_root: Url,
         time_travel_version: Option<Version>,
@@ -717,7 +744,7 @@ impl LogSegment {
             start_version,
             listed_files.ascending_commit_files().first(),
         )?;
-        LogSegment::try_new(listed_files, log_root, end_version, None, None)
+        LogSegment::try_new(listed_files, log_root, end_version, None)
     }
 
     #[allow(unused)]
@@ -768,7 +795,7 @@ impl LogSegment {
         }
         commits.drain(..start_idx);
 
-        LogSegment::try_new(listed_commits, log_root, Some(end_version), None, None)
+        LogSegment::try_new(listed_commits, log_root, Some(end_version), None)
     }
 
     /// Creates a new LogSegment with the given commit file added to the end.
@@ -2097,7 +2124,11 @@ impl LogSegment {
                 retained_type,
             )?),
             (None, None) => None,
-            (None, Some(_)) => return Err(SnapshotHintError::CheckpointTypeConflict.into()),
+            (None, Some(_)) => {
+                return Err(KernelError::invalid_checkpoint(
+                    "retained checkpoint type conflicts with the selected checkpoint",
+                ));
+            }
         };
         let log_segment = LogSegment {
             end_version: effective_version,

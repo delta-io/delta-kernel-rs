@@ -765,7 +765,6 @@ pub struct FfiSnapshotHint {
     pub last_checkpoint: *const FfiLastCheckpoint,
     pub crc: *const FfiCrc,
     pub publication_watermark: FfiPublicationWatermark,
-    pub checkpoint_type: OptionalValue<FfiSelectedCheckpointType>,
 }
 
 pub unsafe extern "C" fn snapshot_builder_with_snapshot_hint(
@@ -841,7 +840,7 @@ borrowed. The callback runs once on success and is not invoked on error. All nes
 when the callback returns; copy retained values during the callback. No hint handle is returned.
 Supply the copied values through `snapshot_builder_with_snapshot_hint` when rebuilding a snapshot.
 The hint preserves build-time freshness, not current freshness, and includes only a matching
-checkpoint hint, selected checkpoint type, and an at-version CRC. Compaction files are unsupported.
+checkpoint hint and an at-version CRC. Compaction files are unsupported.
 
 Export includes an explicit publication watermark,
 preserving absence even when published commits are not represented by the retained paths.
@@ -864,8 +863,8 @@ or establish freshness.
 `snapshot_checkpoint_type(snapshot, engine)` returns the selected checkpoint's V1/V2 specification,
 or absent when no checkpoint was selected. Known types return without I/O; ambiguous types resolve
 through the same snapshot cache as `snapshot_checkpoint_info` and declarative scan planning. The
-checkpoint-info summary also includes this resolved type. Typed hints preserve already-known types
-without triggering discovery and validate supplied claims against their paths.
+checkpoint-info summary also includes this resolved type. Typed hints do not carry the type; a
+rebuilt snapshot infers it from its paths and protocol or resolves it through discovery.
 
 Snapshot accessors (`ffi/src/lib.rs`) include no-I/O reads such as `version` and
 `snapshot_file_stats`, which returns `OptionalValue<FfiFileStats>` (scalar

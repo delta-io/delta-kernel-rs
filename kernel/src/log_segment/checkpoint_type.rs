@@ -1,11 +1,10 @@
 use super::LogSegment;
 use crate::actions::{CHECKPOINT_METADATA_NAME, Protocol};
 use crate::checkpoint::{SelectedCheckpoint, SelectedCheckpointType};
-use crate::error::SnapshotHintError;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::table_features::TableFeature;
-use crate::{KernelResult, Version};
+use crate::{KernelError, KernelResult, Version};
 
 impl LogSegment {
     /// Returns the selected checkpoint's version, or `None` when no checkpoint was selected.
@@ -76,7 +75,11 @@ impl SelectedCheckpoint {
             (inferred, None) => inferred,
             (None, retained) => retained,
             (Some(inferred), Some(retained)) if inferred == retained => Some(inferred),
-            _ => return Err(SnapshotHintError::CheckpointTypeConflict.into()),
+            _ => {
+                return Err(KernelError::invalid_checkpoint(
+                    "retained checkpoint type conflicts with the selected checkpoint",
+                ));
+            }
         };
         Ok(Self {
             version: path.version,
@@ -149,7 +152,7 @@ mod tests {
                 ..Default::default()
             }
         };
-        LogSegment::try_new(files, root, Some(0), hint, checkpoint_type)
+        LogSegment::try_new_with_checkpoint_type(files, root, Some(0), hint, checkpoint_type)
     }
 
     #[rstest::rstest]
@@ -245,7 +248,7 @@ mod tests {
         }
         // When a combined segment is constructed with the observation selected for the update.
         let checkpoint_type = derived.checkpoint_type_for_update(&source, source.checkpoint_type());
-        let combined = LogSegment::try_new(
+        let combined = LogSegment::try_new_with_checkpoint_type(
             derived.listed,
             derived.log_root,
             Some(derived.end_version),
@@ -293,8 +296,8 @@ mod tests {
         let error = result.unwrap_err();
         assert!(matches!(
             error.without_backtrace(),
-            KernelError::SnapshotHint(source)
-                if matches!(source.as_ref(), SnapshotHintError::CheckpointTypeConflict)
+            KernelError::InvalidCheckpoint(message)
+                if message.contains("checkpoint type conflicts")
         ));
     }
 }
