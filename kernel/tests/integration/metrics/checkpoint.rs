@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::engine::DelegatingEngine;
 use delta_kernel::expressions::PredicateRef;
 use delta_kernel::metrics::{
     CheckpointOutputStats, CheckpointProcessingStats, CheckpointWriteMode, CheckpointWriteOutcome,
@@ -19,8 +20,8 @@ use delta_kernel::schema::SchemaRef;
 use delta_kernel::snapshot::CheckpointWriteResult;
 use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::{
-    Engine, EngineData, EvaluationHandler, FileDataReadResultIterator, FileMeta, FileSize,
-    FileSlice, FilteredEngineData, JsonHandler, KernelError, KernelResult, KernelResultIterator,
+    Engine, EngineData, FileDataReadResultIterator, FileMeta, FileSize, FileSlice,
+    FilteredEngineData, JsonHandler, KernelError, KernelResult, KernelResultIterator,
     ParquetFooter, ParquetHandler, Snapshot, StorageHandler,
 };
 use futures::TryStreamExt;
@@ -285,10 +286,10 @@ async fn checkpoint_duration_includes_data_writes_and_excludes_hint_writes(
         Duration::from_millis(40),
         fail_hint,
     );
-    let snapshot = Snapshot::builder_for(table.table_root()).build(&engine)?;
+    let snapshot = Snapshot::builder_for(table.table_root()).build(&engine.engine())?;
 
     let started = Instant::now();
-    let result = snapshot.checkpoint(&engine, None);
+    let result = snapshot.checkpoint(&engine.engine(), None);
     let total_duration = started.elapsed();
 
     let events = checkpoint_events(&reporter);
@@ -368,7 +369,7 @@ async fn checkpoint_input_timing_includes_setup_sidecar_peek_and_failing_pulls(
         V2CheckpointConfig::NoSidecar
     });
 
-    let result = snapshot.checkpoint(&engine, Some(&spec));
+    let result = snapshot.checkpoint(&engine.engine(), Some(&spec));
 
     let events = checkpoint_events(&reporter);
     assert_eq!(events.len(), 1);
@@ -440,9 +441,9 @@ async fn checkpoint_write_errors_preserve_mode_and_duration(
         Duration::ZERO,
         false,
     );
-    let snapshot = Snapshot::builder_for(table.table_root()).build(&engine)?;
+    let snapshot = Snapshot::builder_for(table.table_root()).build(&engine.engine())?;
 
-    let result = snapshot.checkpoint(&engine, None);
+    let result = snapshot.checkpoint(&engine.engine(), None);
 
     let events = checkpoint_events(&reporter);
     assert_eq!(events.len(), 1);
@@ -486,9 +487,9 @@ async fn checkpoint_with_newer_hint_reports_written_without_publishing_hint()
     );
     let snapshot = Snapshot::builder_for(table.table_root())
         .at_version(1)
-        .build(&engine)?;
+        .build(&engine.engine())?;
 
-    let (result, _checkpointed) = snapshot.checkpoint(&engine, None)?;
+    let (result, _checkpointed) = snapshot.checkpoint(&engine.engine(), None)?;
 
     assert_eq!(result, CheckpointWriteResult::Written);
     assert!(engine.json.hint_duration.lock().unwrap().is_none());
@@ -543,7 +544,7 @@ async fn previous_checkpoint_input_timing_includes_setup_and_pulls(
     input.fail_setup = fail_setup;
     input.fail_after = fail_after;
 
-    let result = snapshot.checkpoint(&engine, None);
+    let result = snapshot.checkpoint(&engine.engine(), None);
 
     let events = checkpoint_events(&reporter);
     assert_eq!(events.len(), 1);
@@ -603,7 +604,7 @@ async fn checkpoint_retains_successful_sidecar_output_after_write_failure(
         .verification_delay = delay;
 
     let result = snapshot.checkpoint(
-        &engine,
+        &engine.engine(),
         Some(&CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
             file_actions_per_sidecar_hint: Some(1),
         })),
@@ -693,7 +694,7 @@ async fn checkpoint_output_includes_writes_before_verification_failure(
         V2CheckpointConfig::NoSidecar
     });
 
-    let result = snapshot.checkpoint(&engine, Some(&spec));
+    let result = snapshot.checkpoint(&engine.engine(), Some(&spec));
 
     let events = checkpoint_events(&reporter);
     assert_eq!(events.len(), 1);
@@ -766,7 +767,7 @@ async fn json_checkpoint_input_is_accounted_by_source_role(
     json.checkpoint_input.fail_setup = fail_setup;
     Arc::get_mut(&mut engine.parquet).unwrap().input.delay = Duration::from_millis(5);
 
-    let result = snapshot.checkpoint(&engine, None);
+    let result = snapshot.checkpoint(&engine.engine(), None);
 
     let events = checkpoint_events(&reporter);
     assert_eq!(events.len(), 1);
@@ -896,23 +897,13 @@ impl ControlledCheckpointEngine {
             inner,
         }
     }
-}
 
-impl Engine for ControlledCheckpointEngine {
-    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-        self.inner.evaluation_handler()
-    }
-
-    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-        self.storage.clone()
-    }
-
-    fn json_handler(&self) -> Arc<dyn JsonHandler> {
-        self.json.clone()
-    }
-
-    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-        self.parquet.clone()
+    fn engine(&self) -> DelegatingEngine {
+        DelegatingEngine::new(self.inner.clone())
+            .without_plan_executor()
+            .with_json_handler(self.json.clone())
+            .with_parquet_handler(self.parquet.clone())
+            .with_storage_handler(self.storage.clone())
     }
 }
 
