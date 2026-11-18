@@ -736,7 +736,7 @@ pub(super) mod tests {
 
         metadata["metaData"]["name"] = json!("updated-metadata");
         add_commit(TABLE_ROOT, store, 1, metadata.to_string()).await?;
-        let updated = Snapshot::builder_from(initial).build(engine.as_ref())?;
+        let updated = Snapshot::builder_from(initial).build(&engine)?;
         assert_eq!(updated.version(), 1);
         assert_eq!(
             updated.table_configuration.metadata().name(),
@@ -745,7 +745,7 @@ pub(super) mod tests {
         assert_eq!(updated.schema().as_ref(), &schema);
         let rebuilt = Snapshot::builder_for(TABLE_ROOT)
             .with_snapshot_hint(updated.to_snapshot_hint()?)
-            .build(engine.as_ref())?;
+            .build(&engine)?;
         assert_eq!(rebuilt.schema().as_ref(), &schema);
         Ok(())
     }
@@ -789,7 +789,7 @@ pub(super) mod tests {
             .join("\n");
 
         let path = Path::from("_delta_log/00000000000000000000.json");
-        store.put(&path, commit0_data.into()).await?;
+        engine.store().put(&path, commit0_data.into()).await?;
 
         let Error::Delta(error) = SnapshotBuilder::new_for(TABLE_ROOT)
             .build(engine)
@@ -836,7 +836,8 @@ pub(super) mod tests {
             .map(ToString::to_string)
             .collect_vec()
             .join("\n");
-        store
+        engine
+            .store()
             .put(
                 &Path::from("_delta_log/00000000000000000000.json"),
                 commit0_data.into(),
@@ -980,7 +981,7 @@ pub(super) mod tests {
                 max_catalog_version,
                 SnapshotBuilder::with_max_catalog_version,
             )
-            .build(engine.as_ref())
+            .build(&engine)
             .unwrap_err();
         assert!(
             matches!(error, Error::Kernel(KernelError::EmptyLog)),
@@ -993,7 +994,8 @@ pub(super) mod tests {
     #[tokio::test]
     async fn build_keeps_kernel_error_for_last_checkpoint_without_checkpoint() -> Result<()> {
         let engine = SyncEngine::in_memory();
-        store
+        engine
+            .store()
             .put(
                 &Path::from("_delta_log/_last_checkpoint"),
                 r#"{"version":1,"size":1}"#.into(),
@@ -1001,7 +1003,7 @@ pub(super) mod tests {
             .await
             .map_err(KernelError::from)?;
         let error = SnapshotBuilder::new_for(TABLE_ROOT)
-            .build(engine.as_ref())
+            .build(&engine)
             .unwrap_err();
         assert!(
             matches!(error, Error::Kernel(KernelError::InvalidCheckpoint(_))),
@@ -1079,12 +1081,12 @@ pub(super) mod tests {
         // Build v0 snapshot before installing the reporter so only the update is measured
         let snap_v0 = SnapshotBuilder::new_for(TABLE_ROOT)
             .at_version(0)
-            .build(engine.as_ref())?;
+            .build(&engine)?;
         assert_eq!(snap_v0.version(), 0);
 
         let (reporter, _guard) = measuring_reporter();
 
-        let snap_v1 = SnapshotBuilder::new_from(snap_v0).build(engine.as_ref())?;
+        let snap_v1 = SnapshotBuilder::new_from(snap_v0).build(&engine)?;
         assert_eq!(snap_v1.version(), 1);
 
         let events = reporter.events();
@@ -1114,7 +1116,7 @@ pub(super) mod tests {
 
         let result = SnapshotBuilder::new_from(snap_v1)
             .at_version(0)
-            .build(engine.as_ref());
+            .build(&engine);
         assert!(
             result.is_err(),
             "updating to an earlier version should fail"
@@ -1185,7 +1187,7 @@ pub(super) mod tests {
         let (reporter, _guard) = measuring_reporter();
         let _ = SnapshotBuilder::new_for(TABLE_ROOT)
             .fold_with(correlation_id, SnapshotBuilder::with_correlation_id)
-            .build(engine.as_ref())?;
+            .build(&engine)?;
 
         // The build event and its snapshot-load child events must all carry the id, since they
         // ride the same SnapshotLoadMetricContext.
@@ -1279,7 +1281,7 @@ pub(super) mod tests {
             let engine = setup_catalog_managed_test().await;
             let base = SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_max_catalog_version(0)
-                .build(engine.as_ref())?;
+                .build(&engine)?;
             let actions = if downgrade {
                 json!({"protocol": Protocol::try_new_modern(
                     std::iter::empty::<TableFeature>(),
@@ -1300,12 +1302,12 @@ pub(super) mod tests {
                 SnapshotBuilder::new_from(base)
                     .with_log_tail(log_tail)
                     .fold_with(requested_version, SnapshotBuilder::at_version)
-                    .build(engine.as_ref())
+                    .build(&engine)
             } else {
                 SnapshotBuilder::new_for(TABLE_ROOT)
                     .with_log_tail(log_tail)
                     .fold_with(requested_version, SnapshotBuilder::at_version)
-                    .build(engine.as_ref())
+                    .build(&engine)
             };
 
             assert!(matches!(
@@ -1323,7 +1325,7 @@ pub(super) mod tests {
             let result = SnapshotBuilder::new_for(TABLE_ROOT)
                 .at_version(5)
                 .with_max_catalog_version(3)
-                .build(engine.as_ref());
+                .build(&engine);
 
             assert!(matches!(
                 result,
@@ -1351,7 +1353,7 @@ pub(super) mod tests {
             let result = SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_log_tail(log_tail)
                 .with_max_catalog_version(3)
-                .build(engine.as_ref());
+                .build(&engine);
 
             assert!(matches!(
                 result,
@@ -1843,12 +1845,12 @@ pub(super) mod tests {
             let source = Snapshot::builder_for(TABLE_ROOT)
                 .with_log_tail(tail[..tail.len() - 1].to_vec())
                 .with_max_catalog_version(source_version)
-                .build(engine.as_ref())?;
+                .build(&engine)?;
             let source = if restore_hint {
                 Snapshot::builder_for(TABLE_ROOT)
                     .at_version(source_version)
                     .with_snapshot_hint(source.to_snapshot_hint()?)
-                    .build(engine.as_ref())?
+                    .build(&engine)?
             } else {
                 source
             };
@@ -1860,8 +1862,8 @@ pub(super) mod tests {
             if new_checkpoint {
                 Snapshot::builder_for(TABLE_ROOT)
                     .at_version(1)
-                    .build(engine.as_ref())?
-                    .checkpoint(engine.as_ref(), None)?;
+                    .build(&engine)?
+                    .checkpoint(&engine, None)?;
             }
             // When: refresh from the snapshot using the catalog tail, including cached versions.
             let updated = Snapshot::builder_from(source)
@@ -1871,11 +1873,11 @@ pub(super) mod tests {
                     explicit_version.then_some(target_version),
                     SnapshotBuilder::at_version,
                 )
-                .build(engine.as_ref())?;
+                .build(&engine)?;
             let fresh = Snapshot::builder_for(TABLE_ROOT)
                 .with_log_tail(tail)
                 .with_max_catalog_version(target_version)
-                .build(engine.as_ref())?;
+                .build(&engine)?;
             // Then: full, incremental, and hinted reads agree on the log and scanned files.
             assert_eq!(updated.version(), target_version);
             assert_eq!(updated.table_configuration(), fresh.table_configuration());
@@ -1887,10 +1889,10 @@ pub(super) mod tests {
             let hinted = Snapshot::builder_for(TABLE_ROOT)
                 .at_version(target_version)
                 .with_snapshot_hint(updated.to_snapshot_hint()?)
-                .build(engine.as_ref())?;
+                .build(&engine)?;
             for snapshot in [updated, fresh, hinted] {
                 assert_eq!(
-                    scan_paths(snapshot, engine.as_ref())?,
+                    scan_paths(snapshot, &engine)?,
                     (1..=target_version)
                         .map(|version| format!("file_{version}.parquet"))
                         .collect_vec()
@@ -1976,7 +1978,7 @@ pub(super) mod tests {
             let engine = setup_catalog_managed_test().await;
             let base = SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_max_catalog_version(0)
-                .build(engine.as_ref())?;
+                .build(&engine)?;
             let downgrade = json!({
                 "protocol": Protocol::try_new_modern(
                     std::iter::empty::<TableFeature>(),
@@ -1995,13 +1997,13 @@ pub(super) mod tests {
                     .at_version(1)
                     .with_log_tail(tail)
                     .with_max_catalog_version(max_catalog_version)
-                    .build(engine.as_ref())
+                    .build(&engine)
             } else {
                 SnapshotBuilder::new_for(TABLE_ROOT)
                     .at_version(1)
                     .with_log_tail(tail)
                     .with_max_catalog_version(max_catalog_version)
-                    .build(engine.as_ref())
+                    .build(&engine)
             };
             if max_catalog_version >= 1 {
                 assert_eq!(result?.version(), 1);
@@ -2153,7 +2155,7 @@ pub(super) mod tests {
             .await?;
             let mut snapshot = SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_max_catalog_version(0)
-                .build(engine.as_ref())?;
+                .build(&engine)?;
             let downgrade = json!({
                 "protocol": Protocol::try_new_modern(
                     std::iter::empty::<TableFeature>(),
@@ -2180,12 +2182,12 @@ pub(super) mod tests {
                     SnapshotBuilder::new_from(snapshot)
                         .with_log_tail(log_tail.clone())
                         .with_max_catalog_version(downgrade_version)
-                        .build(engine.as_ref())
+                        .build(&engine)
                 } else {
                     SnapshotBuilder::new_for(TABLE_ROOT)
                         .with_log_tail(log_tail.clone())
                         .with_max_catalog_version(downgrade_version)
-                        .build(engine.as_ref())
+                        .build(&engine)
                 }?;
                 assert_eq!(snapshot.version(), downgrade_version);
                 assert!(!snapshot.table_configuration().is_catalog_managed());
@@ -2196,12 +2198,12 @@ pub(super) mod tests {
                     SnapshotBuilder::new_from(snapshot.clone())
                         .with_log_tail(log_tail)
                         .with_max_catalog_version(downgrade_version)
-                        .build(engine.as_ref())
+                        .build(&engine)
                 } else {
                     SnapshotBuilder::new_for(TABLE_ROOT)
                         .with_log_tail(log_tail)
                         .with_max_catalog_version(downgrade_version)
-                        .build(engine.as_ref())
+                        .build(&engine)
                 }?;
                 assert_eq!(bounded.version(), downgrade_version);
                 assert!(!bounded.table_configuration().is_catalog_managed());
@@ -2209,17 +2211,17 @@ pub(super) mod tests {
                 snapshot = if incremental {
                     SnapshotBuilder::new_from(snapshot)
                         .with_max_catalog_version(upgrade_version)
-                        .build(engine.as_ref())
+                        .build(&engine)
                 } else {
                     SnapshotBuilder::new_for(TABLE_ROOT)
                         .with_max_catalog_version(upgrade_version)
-                        .build(engine.as_ref())
+                        .build(&engine)
                 }?;
                 assert_eq!(snapshot.version(), upgrade_version);
                 assert!(snapshot.table_configuration().is_catalog_managed());
                 // Then: a latest version request after re-upgrade still requires a bound.
                 let without_catalog_bound =
-                    SnapshotBuilder::new_from(snapshot.clone()).build(engine.as_ref());
+                    SnapshotBuilder::new_from(snapshot.clone()).build(&engine);
                 assert!(matches!(
                     without_catalog_bound,
                     Err(Error::Kernel(KernelError::MaxCatalogVersion(_)))
@@ -2251,7 +2253,7 @@ pub(super) mod tests {
             let snapshot = SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_log_tail(log_tail.clone())
                 .with_max_catalog_version(1)
-                .build(engine.as_ref())?;
+                .build(&engine)?;
             if let Some(replacement_commit) = replacement_commit {
                 store
                     .put(&staged, replacement_commit.to_string().into())
@@ -2262,12 +2264,12 @@ pub(super) mod tests {
             let reused = SnapshotBuilder::new_from(snapshot.clone())
                 .with_log_tail(log_tail.clone())
                 .with_max_catalog_version(1)
-                .build(engine.as_ref())?;
+                .build(&engine)?;
             assert!(Arc::ptr_eq(&snapshot, &reused));
             let error = SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_log_tail(log_tail)
                 .with_max_catalog_version(1)
-                .build(engine.as_ref())
+                .build(&engine)
                 .unwrap_err();
             if replacement_commit.is_some() {
                 assert!(
@@ -2300,7 +2302,7 @@ pub(super) mod tests {
                 .at_version(2)
                 .with_log_tail(log_tail)
                 .with_max_catalog_version(3)
-                .build(engine.as_ref());
+                .build(&engine);
 
             assert!(matches!(
                 result,
@@ -2322,7 +2324,7 @@ pub(super) mod tests {
             // max_catalog_version=1, no time-travel -> snapshot at v1
             let snapshot = SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_max_catalog_version(1)
-                .build(engine.as_ref())?;
+                .build(&engine)?;
             assert_eq!(snapshot.version(), 1);
 
             Ok(())
@@ -2339,7 +2341,7 @@ pub(super) mod tests {
             let snapshot = SnapshotBuilder::new_for(TABLE_ROOT)
                 .at_version(0)
                 .with_max_catalog_version(1)
-                .build(engine.as_ref())?;
+                .build(&engine)?;
             assert_eq!(snapshot.version(), 0);
 
             Ok(())
@@ -2431,7 +2433,7 @@ pub(super) mod tests {
             let result = SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_log_tail(log_tail)
                 .with_max_catalog_version(mcv)
-                .build(engine.as_ref());
+                .build(&engine);
 
             let error = result.unwrap_err();
             if log_tail_versions.windows(2).all(|pair| pair[0] < pair[1]) {
@@ -2477,7 +2479,7 @@ pub(super) mod tests {
             let result = SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_log_tail(log_tail)
                 .with_max_catalog_version(1)
-                .build(engine.as_ref());
+                .build(&engine);
 
             assert!(matches!(
                 result,

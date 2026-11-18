@@ -2696,12 +2696,11 @@ mod tests {
         let empty = "{}".as_bytes().to_vec();
         let invalid_path = Path::from("invalid/_last_checkpoint");
 
-        store
+        engine
+            .store()
             .put(&invalid_path, empty.into())
             .await
             .expect("put _last_checkpoint");
-
-        let engine = SyncEngine::new_with_store(store);
         let storage = engine.storage_handler();
         let url = Url::parse("memory:///invalid/").expect("valid url");
         let invalid =
@@ -2726,13 +2725,13 @@ mod tests {
         // Write all test files to the in memory file system
         for (path_prefix, data, _) in &test_cases {
             let path = Path::from(format!("{path_prefix}/_last_checkpoint"));
-            store
+            engine
+                .store()
                 .put(&path, data.clone().into())
                 .await
                 .expect("put _last_checkpoint");
         }
 
-        let engine = SyncEngine::new_with_store(store);
         let storage = engine.storage_handler();
 
         // Test reading all checkpoints from the in memory file system for cases where the data is

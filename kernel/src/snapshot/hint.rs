@@ -506,7 +506,7 @@ mod tests {
         if let Some(version) = version {
             builder = builder.at_version(version);
         }
-        let snapshot = builder.build(engine.as_ref())?;
+        let snapshot = builder.build(&engine)?;
         let hint = snapshot.to_snapshot_hint()?;
         assert_eq!(hint.freshness, expected);
         assert_eq!(hint.log_segment_files, snapshot.log_segment().listed);
@@ -548,7 +548,7 @@ mod tests {
         assert_eq!(exported.crc, snapshot.crc_at_version().cloned());
         let rebuilt = Snapshot::builder_for(TABLE_ROOT)
             .with_snapshot_hint(exported)
-            .build(engine.as_ref())?;
+            .build(&engine)?;
         assert_eq!(rebuilt.version(), snapshot.version());
         Ok(())
     }
@@ -763,7 +763,7 @@ mod tests {
         assert_log_segment_hint_error(
             SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_snapshot_hint(hint)
-                .build(engine.as_ref()),
+                .build(&engine),
             "Table version 1 is missing",
         );
         Ok(())
@@ -847,7 +847,7 @@ mod tests {
         .and_then(|hint| {
             SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_snapshot_hint(hint)
-                .build(engine.as_ref())
+                .build(&engine)
         });
 
         if foreign_table {
@@ -923,7 +923,7 @@ mod tests {
         let engine = SyncEngine::in_memory();
         let result = SnapshotBuilder::new_for(builder_table_root)
             .with_snapshot_hint(hint)
-            .build(engine.as_ref());
+            .build(&engine);
         if builder_table_root == TABLE_ROOT {
             let snapshot = result.unwrap();
             assert_eq!(snapshot.version(), version);
@@ -962,7 +962,7 @@ mod tests {
         assert_log_segment_hint_error(
             SnapshotBuilder::new_for(builder_table_root)
                 .with_snapshot_hint(hint)
-                .build(engine.as_ref()),
+                .build(&engine),
             "No table version found",
         );
     }
@@ -1103,7 +1103,7 @@ mod tests {
 
         let result = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_snapshot_hint(hint)
-            .build(engine.as_ref());
+            .build(&engine);
 
         let error = result.unwrap_err();
         assert!(matches!(
@@ -1135,7 +1135,7 @@ mod tests {
             .with_snapshot_hint(hint)
             .with_correlation_id("hint-request")
             .with_cancellation_token(token)
-            .build(engine.as_ref())?;
+            .build(&engine)?;
 
         assert_eq!(hinted_snapshot.version(), storage_snapshot.version());
         assert_eq!(hinted_snapshot.schema(), storage_snapshot.schema());
@@ -1184,7 +1184,7 @@ mod tests {
 
         let hinted = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_snapshot_hint(hint)
-            .build(engine.as_ref())?;
+            .build(&engine)?;
         assert!(hinted.crc_at_version().is_none());
         Ok(())
     }
@@ -1223,7 +1223,7 @@ mod tests {
 
         let result = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_snapshot_hint(hint)
-            .build(engine.as_ref());
+            .build(&engine);
         if let Some(expected_error) = expected_error {
             assert_result_error_with_message(result, expected_error);
         } else {
@@ -1259,7 +1259,7 @@ mod tests {
         hint.log_segment_files.latest_commit_file = None;
         let hinted_snapshot = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_snapshot_hint(hint)
-            .build(engine.as_ref())?;
+            .build(&engine)?;
         assert_eq!(
             hinted_snapshot.log_segment().checkpoint_version,
             storage_snapshot.log_segment().checkpoint_version
@@ -1306,7 +1306,7 @@ mod tests {
 
         let snapshot = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_snapshot_hint(hint.clone())
-            .build(engine.as_ref())?;
+            .build(&engine)?;
         assert_eq!(snapshot.version(), 0);
         assert_eq!(snapshot.log_segment().listed, hint.log_segment_files);
         Ok(())
@@ -1321,7 +1321,7 @@ mod tests {
 
         let err = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_snapshot_hint(hint)
-            .build(engine.as_ref())
+            .build(&engine)
             .unwrap_err();
         assert!(matches!(err, Error::Kernel(KernelError::SnapshotHint(_))));
         Ok(())
@@ -1351,7 +1351,7 @@ mod tests {
         assert_log_segment_hint_error(
             SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_snapshot_hint(inconsistent_path)
-                .build(engine.as_ref()),
+                .build(&engine),
             "Parsed log path fields do not match its location",
         );
 
@@ -1364,7 +1364,7 @@ mod tests {
             ));
         let rebuilt = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_snapshot_hint(compacted)
-            .build(engine.as_ref())?;
+            .build(&engine)?;
         assert_eq!(rebuilt.version(), hint.version);
 
         let mut incompatible = hint;
@@ -1374,7 +1374,7 @@ mod tests {
         assert_result_error_with_message(
             SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_snapshot_hint(incompatible)
-                .build(engine.as_ref()),
+                .build(&engine),
             "does not have the required 'timestampNtz' feature",
         );
         Ok(())
@@ -1391,7 +1391,7 @@ mod tests {
         assert_hint_error(
             SnapshotBuilder::new_for(TABLE_ROOT),
             hint,
-            engine.as_ref(),
+            &engine,
             "snapshot history does not start at version 0",
         );
         Ok(())
@@ -1412,7 +1412,7 @@ mod tests {
 
         let err = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_snapshot_hint(hint)
-            .build(engine.as_ref())
+            .build(&engine)
             .unwrap_err();
         let Error::Kernel(KernelError::SnapshotHint(source)) = err else {
             panic!("expected SnapshotHint")
@@ -1443,7 +1443,7 @@ mod tests {
         assert_hint_error(
             SnapshotBuilder::new_for(TABLE_ROOT),
             wrong_version,
-            engine.as_ref(),
+            &engine,
             "does not match snapshot hint version",
         );
 
@@ -1455,7 +1455,7 @@ mod tests {
         assert_hint_error(
             SnapshotBuilder::new_for(TABLE_ROOT),
             wrong_protocol,
-            engine.as_ref(),
+            &engine,
             "CRC protocol does not match",
         );
 
@@ -1467,7 +1467,7 @@ mod tests {
         assert_hint_error(
             SnapshotBuilder::new_for(TABLE_ROOT),
             wrong_metadata,
-            engine.as_ref(),
+            &engine,
             "CRC metadata does not match",
         );
 
@@ -1492,38 +1492,38 @@ mod tests {
         assert_hint_error(
             SnapshotBuilder::new_for(TABLE_ROOT).at_version(hint.version - 1),
             hint.clone(),
-            engine.as_ref(),
+            &engine,
             "does not match snapshot hint version",
         );
         assert_hint_error(
             SnapshotBuilder::new_for(TABLE_ROOT).with_log_tail(vec![log_path]),
             hint.clone(),
-            engine.as_ref(),
+            &engine,
             "cannot be combined with a log tail",
         );
         let zero_budget = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_incremental_crc_replay(IncrementalReplay::UpToCommits(0))
             .with_snapshot_hint(hint.clone())
-            .build(engine.as_ref())?;
+            .build(&engine)?;
         assert_eq!(zero_budget.version(), hint.version);
         assert_hint_error(
             SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_incremental_crc_replay(IncrementalReplay::UpToCommits(1)),
             hint.clone(),
-            engine.as_ref(),
+            &engine,
             "cannot be combined with incremental CRC replay",
         );
         let bounded = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_max_catalog_version(hint.version)
             .with_snapshot_hint(hint.clone())
-            .build(engine.as_ref())?;
+            .build(&engine)?;
         assert_eq!(bounded.version(), hint.version);
 
         let (reporter, _guard) = measuring_reporter();
         let result = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_max_catalog_version(hint.version + 1)
             .with_snapshot_hint(hint)
-            .build(engine.as_ref());
+            .build(&engine);
         assert!(matches!(
             &result,
             Err(Error::Kernel(KernelError::SnapshotHint(_)))
@@ -1549,7 +1549,7 @@ mod tests {
         assert_log_segment_hint_error(
             SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_snapshot_hint(hint)
-                .build(engine.as_ref()),
+                .build(&engine),
             "newer than requested end version",
         );
         Ok(())
@@ -1575,25 +1575,25 @@ mod tests {
         .await?;
         let snapshot = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_max_catalog_version(1)
-            .build(engine.as_ref())?;
+            .build(&engine)?;
         let hint = hint_from_snapshot(&snapshot, SnapshotHintFreshness::Unverified);
 
         assert_result_error_with_message(
             SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_snapshot_hint(hint.clone())
-                .build(engine.as_ref()),
+                .build(&engine),
             "Max catalog version is required",
         );
         assert_hint_error(
             SnapshotBuilder::new_for(TABLE_ROOT).with_max_catalog_version(2),
             hint.clone(),
-            engine.as_ref(),
+            &engine,
             "Max catalog version 2 does not match snapshot hint version 1",
         );
         let latest = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_max_catalog_version(1)
             .with_snapshot_hint(hint.clone())
-            .build(engine.as_ref())?;
+            .build(&engine)?;
         assert_eq!(latest.version(), 1);
         assert!(!latest.is_built_as_latest());
 
@@ -1603,7 +1603,7 @@ mod tests {
             .at_version(1)
             .with_max_catalog_version(0)
             .with_snapshot_hint(lower_bound_hint)
-            .build(engine.as_ref());
+            .build(&engine);
         assert!(matches!(
             result,
             Err(Error::Kernel(KernelError::MaxCatalogVersion(_)))
@@ -1613,7 +1613,7 @@ mod tests {
             .at_version(1)
             .with_max_catalog_version(2)
             .with_snapshot_hint(hint)
-            .build(engine.as_ref())?;
+            .build(&engine)?;
         assert_eq!(hinted.version(), 1);
         assert!(!hinted.is_built_as_latest());
 
@@ -1621,7 +1621,7 @@ mod tests {
             .at_version(1)
             .with_max_catalog_version(2)
             .with_snapshot_hint(snapshot.to_snapshot_hint()?)
-            .build(engine.as_ref())?;
+            .build(&engine)?;
         assert_eq!(originally_latest.version(), 1);
         assert!(!originally_latest.is_built_as_latest());
         Ok(())
@@ -2055,8 +2055,8 @@ mod tests {
         let engine = setup_catalog_managed_test().await;
         let base = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_max_catalog_version(0)
-            .build(engine.as_ref())?
-            .checkpoint(engine.as_ref(), None)?
+            .build(&engine)?
+            .checkpoint(&engine, None)?
             .1;
         add_commit(
             TABLE_ROOT,
@@ -2075,8 +2075,8 @@ mod tests {
             .at_version(1)
             .skip_new_checkpoints()
             .with_max_catalog_version(if originally_latest { 1 } else { 2 })
-            .build(engine.as_ref())?
-            .write_checksum(engine.as_ref())?
+            .build(&engine)?
+            .write_checksum(&engine)?
             .1;
         assert_eq!(source.is_built_as_latest(), originally_latest);
         assert!(source.skipped_new_checkpoints());

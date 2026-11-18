@@ -284,9 +284,9 @@ async fn snapshot_spans_avoid_heavy_context_and_constructors_capture_failure_arg
 
     let same_version = SnapshotBuilder::new_from(updated.clone())
         .at_version(1)
-        .build(engine.as_ref())?;
+        .build(&engine)?;
     assert!(Arc::ptr_eq(&updated, &same_version));
-    let unchanged = SnapshotBuilder::new_from(updated.clone()).build(engine.as_ref())?;
+    let unchanged = SnapshotBuilder::new_from(updated.clone()).build(&engine)?;
     assert!(Arc::ptr_eq(&updated, &unchanged));
     assert!(captured.error_events().is_empty());
 
@@ -294,7 +294,7 @@ async fn snapshot_spans_avoid_heavy_context_and_constructors_capture_failure_arg
         SnapshotBuilder::new_from(updated.clone())
             .at_version(0)
             .with_correlation_id("incremental-test")
-            .build(engine.as_ref())
+            .build(&engine)
             .is_err()
     );
 
@@ -322,7 +322,7 @@ async fn snapshot_spans_avoid_heavy_context_and_constructors_capture_failure_arg
     assert!(
         SnapshotBuilder::new_for(TABLE_ROOT)
             .with_correlation_id("fresh-test")
-            .build(invalid_engine.as_ref())
+            .build(&invalid_engine)
             .is_err()
     );
 
@@ -356,7 +356,7 @@ async fn snapshot_unsupported_reader_feature_emits_constructor_error()
     assert!(
         SnapshotBuilder::new_for(TABLE_ROOT)
             .with_correlation_id("unsupported-feature-test")
-            .build(engine.as_ref())
+            .build(&engine)
             .is_err()
     );
 
@@ -393,7 +393,7 @@ async fn incremental_failure_captures_assembled_log_segment()
                 commit_log_path(TABLE_ROOT, 0),
                 commit_log_path(TABLE_ROOT, 1),
             ])
-            .build(engine.as_ref())
+            .build(&engine)
             .is_err()
     );
 
@@ -416,9 +416,10 @@ async fn snapshot_rebuild_failure_emits_inner_and_outer_constructor_errors()
     create_table(&engine, TABLE_ROOT).await?;
     let snapshot = SnapshotBuilder::new_for(TABLE_ROOT)
         .at_version(0)
-        .build(engine.as_ref())?;
+        .build(&engine)?;
 
-    store
+    engine
+        .store()
         .put(
             &Path::from("_delta_log/00000000000000000001.checkpoint.parquet"),
             b"not parquet".to_vec().into(),
@@ -426,11 +427,7 @@ async fn snapshot_rebuild_failure_emits_inner_and_outer_constructor_errors()
         .await?;
 
     let (captured, _guard) = install_capture();
-    assert!(
-        SnapshotBuilder::new_from(snapshot)
-            .build(engine.as_ref())
-            .is_err()
-    );
+    assert!(SnapshotBuilder::new_from(snapshot).build(&engine).is_err());
 
     let error_events = captured.error_events();
     assert_eq!(error_events.len(), 2);
