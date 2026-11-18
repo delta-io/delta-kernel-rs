@@ -874,9 +874,9 @@ pub fn get_transform_for_row(
     transforms.get(row).cloned().flatten()
 }
 
-/// [`ScanMetadata`] contains (1) a batch of [`FilteredEngineData`] specifying data files to be
-/// scanned and (2) a vector of transforms (one transform per scan file) that must be applied to the
-/// data read from those files.
+/// [`ScanMetadata`] contains a batch of [`FilteredEngineData`] specifying data files to be scanned,
+/// the transforms (one per scan file) that must be applied to the data read from those files, and
+/// the source of the batch's parsed partition values (see [`Self::partition_values_source`]).
 pub struct ScanMetadata {
     /// Filtered engine data with one row per file to scan (and only selected rows should be
     /// scanned)
@@ -910,13 +910,14 @@ impl ScanMetadata {
     /// Where this batch's `partitionValues_parsed` column came from, or `None` when the batch has
     /// no such column.
     ///
-    /// Kernel emits the column when [`PartitionValuesOptions::with_struct`] is set, or when the
-    /// scan predicate references a partition column and stats are not skipped. A batch never mixes
-    /// sources: checkpoint batches report `Checkpoint` when the checkpoint has a compatible native
-    /// `partitionValues_parsed` column, and `Derived` otherwise; commit batches always report
-    /// `Derived`. `parallel_scan_metadata` always reports `Derived`. `Scan::scan_metadata_from`
-    /// reports `Derived` for the cached rows and later commits; when the checkpoint is newer than
-    /// `existing_version`, it falls back to a full scan that follows the rules above.
+    /// On partitioned tables, Kernel emits the column when [`PartitionValuesOptions::with_struct`]
+    /// is set, or when the scan predicate references a partition column and stats are not skipped.
+    /// A batch never mixes sources: checkpoint batches report `Checkpoint` when the checkpoint has
+    /// a compatible native `partitionValues_parsed` column, and `Derived` otherwise; commit
+    /// batches always report `Derived`. `parallel_scan_metadata` always reports `Derived`.
+    /// `Scan::scan_metadata_from` reports `Derived` for the cached rows and later commits; when the
+    /// checkpoint is newer than `existing_version`, it falls back to a full scan that follows the
+    /// rules above.
     ///
     /// The emitted field set and its source depend on this scan's configuration: a predicate-only
     /// scan can report `Checkpoint` for a file that a `with_struct` scan reports as `Derived`.

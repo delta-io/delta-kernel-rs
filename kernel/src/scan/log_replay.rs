@@ -533,7 +533,8 @@ impl ScanLogReplayProcessor {
     fn partition_values_source(&self, is_log_batch: bool) -> Option<ParsedColumnSource> {
         if is_log_batch {
             self.checkpoint_partition_values_source
-                .map(|_| ParsedColumnSource::Derived)
+                .is_some()
+                .then_some(ParsedColumnSource::Derived)
         } else {
             self.checkpoint_partition_values_source
         }
@@ -1336,8 +1337,8 @@ mod tests {
     use url::Url;
 
     use super::{
-        InternalScanState, ScanLogReplayProcessor, ScanPartitionValuesOptions, ScanStatsOptions,
-        SerializableScanState, get_add_transform_expr, scan_action_iter,
+        InternalScanState, ParsedColumnSource, ScanLogReplayProcessor, ScanPartitionValuesOptions,
+        ScanStatsOptions, SerializableScanState, get_add_transform_expr, scan_action_iter,
     };
     use crate::arrow::array::StringArray;
     use crate::arrow::array::cast::AsArray;
@@ -1359,13 +1360,15 @@ mod tests {
     use crate::scan::state_info::StateInfo;
     use crate::scan::state_info::tests::{
         ROW_TRACKING_FEATURES, RowTrackingState, assert_transform_spec, get_simple_state_info,
-        get_state_info, get_state_info_with_stats,
+        get_state_info, get_state_info_with_options, get_state_info_with_stats,
     };
     use crate::scan::test_utils::{
         add_batch_for_row_tracking, add_batch_simple, add_batch_with_partition_col,
         add_batch_with_remove, add_batch_with_remove_and_partition, run_with_validate_callback,
     };
-    use crate::scan::{COMMIT_READ_SCHEMA, PhysicalPredicate, StatsOptions};
+    use crate::scan::{
+        COMMIT_READ_SCHEMA, PartitionValuesOptions, PhysicalPredicate, StatsOptions,
+    };
     use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, schema_ref};
     use crate::table_features::ColumnMappingMode;
     use crate::unit_test_utils::{assert_result_error_with_message, string_array_to_engine_data};
@@ -1421,6 +1424,61 @@ mod tests {
 
     fn test_checkpoint_info() -> CheckpointReadInfo {
         CheckpointReadInfo::without_stats_parsed()
+    }
+
+    #[rstest]
+    #[case::native(true, ParsedColumnSource::Checkpoint)]
+    #[case::no_native(false, ParsedColumnSource::Derived)]
+    fn serialization_preserves_partition_values_source(
+        #[case] has_partition_values_parsed: bool,
+        #[case] expected_checkpoint_source: ParsedColumnSource,
+    ) {
+        let engine = SyncEngine::new();
+        let schema: SchemaRef = schema_ref! {
+            nullable "value": INTEGER,
+            nullable "date": DATE,
+        };
+        let state_info = get_state_info_with_options(
+            schema,
+            vec!["date".to_string()],
+            None,
+            &[],
+            HashMap::new(),
+            vec![],
+            StatsOptions::default(),
+            PartitionValuesOptions::with_struct(),
+        )
+        .unwrap();
+        let checkpoint_info = CheckpointReadInfo {
+            has_partition_values_parsed,
+            ..test_checkpoint_info()
+        };
+        let processor = ScanLogReplayProcessor::new(
+            &engine,
+            Arc::new(state_info),
+            checkpoint_info,
+            ScanStatsOptions::default(),
+            ScanPartitionValuesOptions {
+                parsed_struct: true,
+                timestamp_timezone: None,
+            },
+        )
+        .unwrap();
+
+        let deserialized = ScanLogReplayProcessor::from_serializable_state(
+            &engine,
+            processor.into_serializable_state().unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            deserialized.partition_values_source(false /* is_log_batch */),
+            Some(expected_checkpoint_source)
+        );
+        assert_eq!(
+            deserialized.partition_values_source(true /* is_log_batch */),
+            Some(ParsedColumnSource::Derived)
+        );
     }
 
     /// A minimal opaque predicate op for testing serialization behavior

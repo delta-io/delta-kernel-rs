@@ -19,7 +19,7 @@ use delta_kernel::parquet::arrow::ArrowWriter;
 use delta_kernel::scan::state::ScanFile;
 use delta_kernel::scan::{
     AfterSequentialScanMetadata, ParallelScanMetadata, ParsedColumnSource, PartitionValuesOptions,
-    ScanMetadata,
+    ScanMetadata, StatsOptions,
 };
 use delta_kernel::schema::{DataType, StructField, schema_ref};
 use delta_kernel::table_features::{ColumnMappingMode, get_any_level_column_physical_name};
@@ -234,13 +234,22 @@ fn scan_metadata_reports_partition_values_source(
 }
 
 #[rstest]
-#[case::predicate_only(partitioned(), false, true, Some(ParsedColumnSource::Checkpoint))]
-#[case::no_struct_no_predicate(partitioned(), false, false, None)]
-#[case::unpartitioned_with_struct(unpartitioned(), true, false, None)]
+#[case::predicate_only(
+    partitioned(),
+    false,
+    true,
+    false,
+    Some(ParsedColumnSource::Checkpoint)
+)]
+#[case::predicate_only_skip_stats(partitioned(), false, true, true, None)]
+#[case::struct_skip_stats(partitioned(), true, false, true, Some(ParsedColumnSource::Checkpoint))]
+#[case::no_struct_no_predicate(partitioned(), false, false, false, None)]
+#[case::unpartitioned_with_struct(unpartitioned(), true, false, false, None)]
 fn scan_metadata_partition_values_source_follows_emitted_column(
     #[case] data_layout: DataLayoutConfig,
     #[case] with_struct: bool,
     #[case] with_partition_predicate: bool,
+    #[case] skip_stats: bool,
     #[case] expected: Option<ParsedColumnSource>,
 ) {
     let (engine, snapshot, _table) = test_context!(
@@ -258,6 +267,9 @@ fn scan_metadata_partition_values_source_follows_emitted_column(
         builder = builder.with_predicate(Arc::new(Predicate::is_not_null(Expression::column([
             "part_int",
         ]))));
+    }
+    if skip_stats {
+        builder = builder.with_stats(StatsOptions::none());
     }
     let scan = builder.build().unwrap();
 

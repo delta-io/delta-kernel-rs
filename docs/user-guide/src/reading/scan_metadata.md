@@ -295,7 +295,8 @@ represents an integer number of microseconds since the Unix epoch; for example, 
 `1970-01-01T00:00:00Z` (UTC).
 
 To see whether a batch's `partitionValues_parsed` came from the checkpoint or from the string map,
-call `ScanMetadata::partition_values_source`. Checkpoint values are fixed instants; derived values of
+call `ScanMetadata::partition_values_source`. It returns `None` when the batch has no
+`partitionValues_parsed` column. Checkpoint values are fixed instants; derived values of
 offset-less `TIMESTAMP` strings change with the timezone. The source also depends on the scan
 configuration, because a predicate-only scan emits only the partition fields the predicate
 references. If you cache parsed partition values across scans that use different timezones, reuse a
