@@ -1,18 +1,16 @@
 //! Callback-scoped views of scan-plan metrics.
 
-use delta_kernel::checkpoint::CheckpointKind;
 use delta_kernel::metrics as kernel;
 use delta_kernel::scan::StructStats;
-use delta_kernel::schema::DataType;
 
 use super::{MetricEvent, MetricId, correlation_id_slice};
-use crate::checkpoint::{FfiCheckpointKind, FfiSelectedCheckpointType};
+use crate::checkpoint::{FfiCheckpointInfo, FfiSelectedCheckpointType, with_checkpoint_info};
 use crate::delta_types::{FfiColumnName, FfiColumnNameArray};
 use crate::scan::{FfiPartitionValuesOptions, FfiStatsOptions};
 use crate::{FfiSlice, KernelStringSlice, OptionalValue, kernel_string_slice};
 
 /// Layout version of the scan-plan metric and its nested records.
-pub const SCAN_PLAN_GENERATION_METRIC_VERSION: u32 = 3;
+pub const SCAN_PLAN_GENERATION_METRIC_VERSION: u32 = 4;
 
 /// Result of scan-plan generation.
 ///
@@ -38,67 +36,20 @@ pub enum ReplayBase {
     Unknown,
 }
 
-/// Bounded checkpoint fields projected from the shared native checkpoint objects.
-/// Fields describing resolved information must be ignored when `has_info` is false.
+/// Checkpoint selection, shared information, and discovery work for this planning attempt.
+/// The info pointer and all nested values are borrowed only for the metric callback.
 #[repr(C)]
 pub struct CheckpointMetrics {
+    /// Selected version, retained if discovery fails.
     pub version: u64,
+    /// Type known at selection time; the resolved type is available in `info`.
     pub checkpoint_type: OptionalValue<FfiSelectedCheckpointType>,
-    pub has_info: bool,
-    pub kind: FfiCheckpointKind,
-    pub root_file_count: u64,
-    pub sidecar_count: u64,
-    pub leaf_file_count: u64,
-    pub size_in_bytes: u64,
-    pub action_count: OptionalValue<u64>,
-    pub add_file_count: OptionalValue<u64>,
-    pub leaf_schema_has_json_stats: bool,
-    pub leaf_schema_has_parsed_stats: bool,
-    pub leaf_schema_has_parsed_partition_values: bool,
+    /// Null if discovery did not produce checkpoint information.
+    pub info: *const FfiCheckpointInfo,
     pub cache_hit: OptionalValue<bool>,
     pub root_footer_calls: u64,
     pub sidecar_footer_calls: u64,
     pub metadata_query_calls: u64,
-}
-
-impl From<&kernel::CheckpointMetrics> for CheckpointMetrics {
-    fn from(metrics: &kernel::CheckpointMetrics) -> Self {
-        let info = metrics.info.as_deref();
-        let hint = info.map(|info| info.last_checkpoint());
-        let add = info.and_then(|info| info.leaf_schema().field("add"));
-        let has_field = |name| match add.map(|field| field.data_type()) {
-            Some(DataType::Struct(schema)) => schema.contains(name),
-            _ => false,
-        };
-        Self {
-            version: metrics.selected.version,
-            checkpoint_type: info
-                .map(|info| info.checkpoint_type())
-                .or(metrics.selected.checkpoint_type)
-                .map(Into::into)
-                .into(),
-            has_info: info.is_some(),
-            kind: info.map_or(FfiCheckpointKind::Inline, |info| info.kind().into()),
-            root_file_count: hint.map_or(0, |hint| hint.parts().unwrap_or(1) as u64),
-            sidecar_count: info
-                .filter(|info| info.kind() == CheckpointKind::Manifest)
-                .map_or(0, |info| info.leaf_file_count() as u64),
-            leaf_file_count: info.map_or(0, |info| info.leaf_file_count() as u64),
-            size_in_bytes: info.map_or(0, |info| info.size_in_bytes()),
-            action_count: hint.and_then(|hint| u64::try_from(hint.size()).ok()).into(),
-            add_file_count: hint
-                .and_then(|hint| hint.num_of_add_files())
-                .and_then(|count| u64::try_from(count).ok())
-                .into(),
-            leaf_schema_has_json_stats: has_field("stats"),
-            leaf_schema_has_parsed_stats: has_field("stats_parsed"),
-            leaf_schema_has_parsed_partition_values: has_field("partitionValues_parsed"),
-            cache_hit: metrics.cache_hit.into(),
-            root_footer_calls: metrics.root_footer_calls,
-            sidecar_footer_calls: metrics.sidecar_footer_calls,
-            metadata_query_calls: metrics.metadata_query_calls,
-        }
-    }
 }
 
 /// A scan-plan-generation attempt. The record, checkpoint pointer, strings, and column paths are
@@ -124,95 +75,111 @@ pub struct ScanPlanGenerationCompleted {
     pub compaction_file_count: u64,
 }
 
-pub(super) fn with_event<R>(
-    event: &kernel::ScanPlanGenerationCompleted,
-    f: impl FnOnce(MetricEvent) -> R,
-) -> R {
-    let columns = match event.stats.struct_stats() {
-        StructStats::None => &[][..],
-        StructStats::AllIndexed { extra_indexed } => extra_indexed.as_slice(),
-        StructStats::Columns { requested } => requested.as_slice(),
-    };
-    let paths: Vec<Vec<_>> = columns
-        .iter()
-        .map(|column| {
-            column
-                .path()
-                .iter()
-                .map(|part| kernel_string_slice!(part))
-                .collect()
-        })
-        .collect();
-    let columns: Vec<_> = paths
-        .iter()
-        .map(|path| FfiColumnName {
-            // Safety: the paths and their borrowed strings outlive the callback.
-            path: unsafe { FfiSlice::new_unsafe(path) },
-        })
-        .collect();
-    // Safety: columns and all nested storage remain alive until the callback returns.
-    let columns = unsafe { FfiColumnNameArray::new_unsafe(&columns) };
-    let stats = match event.stats.struct_stats() {
-        StructStats::None if event.stats.synthesize_json() => FfiStatsOptions::JsonOnly,
-        StructStats::None => FfiStatsOptions::None,
-        StructStats::AllIndexed { .. } if event.stats.synthesize_json() => FfiStatsOptions::All,
-        StructStats::AllIndexed { extra_indexed } if extra_indexed.is_empty() => {
-            FfiStatsOptions::AllStruct
-        }
-        StructStats::AllIndexed { .. } => FfiStatsOptions::AllStructWithExtraIndexed(columns),
-        StructStats::Columns { .. } => FfiStatsOptions::StructColumns(columns),
-    };
-    let checkpoint = event.checkpoint.as_ref().map(CheckpointMetrics::from);
-    let record = ScanPlanGenerationCompleted {
-        operation_id: event.operation_id.into(),
-        correlation_id: correlation_id_slice(event.correlation_id.as_deref()),
-        outcome: match event.outcome {
-            kernel::ScanPlanOutcome::Plan => ScanPlanOutcome::Plan,
-            kernel::ScanPlanOutcome::Empty => ScanPlanOutcome::Empty,
-            kernel::ScanPlanOutcome::Error => ScanPlanOutcome::Error,
-            _ => ScanPlanOutcome::Unknown,
-        },
-        duration_ns: event.duration_ns,
-        stats,
-        variant_min_max: event.stats.variant_min_max(),
-        geometry_min_max: {
-            #[cfg(feature = "geo-type-in-dev")]
-            {
-                event.stats.geometry_min_max()
-            }
-            #[cfg(not(feature = "geo-type-in-dev"))]
-            {
-                false
-            }
-        },
-        partition_values: if event.partition_values.parsed_struct() {
-            FfiPartitionValuesOptions::WithStruct
-        } else {
-            FfiPartitionValuesOptions::StringMapOnly
-        },
-        partition_timezone: event
-            .partition_values
-            .timestamp_timezone()
-            .map(|timezone| kernel_string_slice!(timezone))
-            .into(),
-        replay_base: event
-            .replay_base
-            .map(|base| match base {
-                kernel::ReplayBase::Crc => ReplayBase::Crc,
-                kernel::ReplayBase::Checkpoint => ReplayBase::Checkpoint,
-                kernel::ReplayBase::Empty => ReplayBase::Empty,
-                _ => ReplayBase::Unknown,
+pub(super) fn with_event(event: &kernel::ScanPlanGenerationCompleted, f: impl FnOnce(MetricEvent)) {
+    let info = event
+        .checkpoint
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.info.as_deref());
+    if let Err(error) = with_checkpoint_info(info, |info| {
+        let columns = match event.stats.struct_stats() {
+            StructStats::None => &[][..],
+            StructStats::AllIndexed { extra_indexed } => extra_indexed.as_slice(),
+            StructStats::Columns { requested } => requested.as_slice(),
+        };
+        let paths: Vec<Vec<_>> = columns
+            .iter()
+            .map(|column| {
+                column
+                    .path()
+                    .iter()
+                    .map(|part| kernel_string_slice!(part))
+                    .collect()
             })
-            .into(),
-        checkpoint: checkpoint
+            .collect();
+        let columns: Vec<_> = paths
+            .iter()
+            .map(|path| FfiColumnName {
+                // Safety: the paths and their borrowed strings outlive the callback.
+                path: unsafe { FfiSlice::new_unsafe(path) },
+            })
+            .collect();
+        // Safety: columns and all nested storage remain alive until the callback returns.
+        let columns = unsafe { FfiColumnNameArray::new_unsafe(&columns) };
+        let stats = match event.stats.struct_stats() {
+            StructStats::None if event.stats.synthesize_json() => FfiStatsOptions::JsonOnly,
+            StructStats::None => FfiStatsOptions::None,
+            StructStats::AllIndexed { .. } if event.stats.synthesize_json() => FfiStatsOptions::All,
+            StructStats::AllIndexed { extra_indexed } if extra_indexed.is_empty() => {
+                FfiStatsOptions::AllStruct
+            }
+            StructStats::AllIndexed { .. } => FfiStatsOptions::AllStructWithExtraIndexed(columns),
+            StructStats::Columns { .. } => FfiStatsOptions::StructColumns(columns),
+        };
+        let checkpoint = event
+            .checkpoint
             .as_ref()
-            .map_or(std::ptr::null(), std::ptr::from_ref),
-        commit_start_version: event.commit_start_version.into(),
-        commit_end_version: event.commit_end_version.into(),
-        commit_total_size_bytes: event.commit_total_size_bytes,
-        compaction_file_count: event.compaction_file_count,
-    };
-    f(MetricEvent::ScanPlanGenerationCompleted(&record))
+            .map(|checkpoint| CheckpointMetrics {
+                version: checkpoint.selected.version,
+                checkpoint_type: checkpoint.selected.checkpoint_type.map(Into::into).into(),
+                info,
+                cache_hit: checkpoint.cache_hit.into(),
+                root_footer_calls: checkpoint.root_footer_calls,
+                sidecar_footer_calls: checkpoint.sidecar_footer_calls,
+                metadata_query_calls: checkpoint.metadata_query_calls,
+            });
+        let record = ScanPlanGenerationCompleted {
+            operation_id: event.operation_id.into(),
+            correlation_id: correlation_id_slice(event.correlation_id.as_deref()),
+            outcome: match event.outcome {
+                kernel::ScanPlanOutcome::Plan => ScanPlanOutcome::Plan,
+                kernel::ScanPlanOutcome::Empty => ScanPlanOutcome::Empty,
+                kernel::ScanPlanOutcome::Error => ScanPlanOutcome::Error,
+                _ => ScanPlanOutcome::Unknown,
+            },
+            duration_ns: event.duration_ns,
+            stats,
+            variant_min_max: event.stats.variant_min_max(),
+            geometry_min_max: {
+                #[cfg(feature = "geo-type-in-dev")]
+                {
+                    event.stats.geometry_min_max()
+                }
+                #[cfg(not(feature = "geo-type-in-dev"))]
+                {
+                    false
+                }
+            },
+            partition_values: if event.partition_values.parsed_struct() {
+                FfiPartitionValuesOptions::WithStruct
+            } else {
+                FfiPartitionValuesOptions::StringMapOnly
+            },
+            partition_timezone: event
+                .partition_values
+                .timestamp_timezone()
+                .map(|timezone| kernel_string_slice!(timezone))
+                .into(),
+            replay_base: event
+                .replay_base
+                .map(|base| match base {
+                    kernel::ReplayBase::Crc => ReplayBase::Crc,
+                    kernel::ReplayBase::Checkpoint => ReplayBase::Checkpoint,
+                    kernel::ReplayBase::Empty => ReplayBase::Empty,
+                    _ => ReplayBase::Unknown,
+                })
+                .into(),
+            checkpoint: checkpoint
+                .as_ref()
+                .map_or(std::ptr::null(), std::ptr::from_ref),
+            commit_start_version: event.commit_start_version.into(),
+            commit_end_version: event.commit_end_version.into(),
+            commit_total_size_bytes: event.commit_total_size_bytes,
+            compaction_file_count: event.compaction_file_count,
+        };
+        f(MetricEvent::ScanPlanGenerationCompleted(&record));
+    }) {
+        tracing::warn!(%error, "Failed to convert scan-plan metric checkpoint information");
+    }
 }
 
 #[cfg(test)]
@@ -223,8 +190,9 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::TryFromStringSlice as _;
+    use crate::checkpoint::checkpoint_handles;
     use crate::ffi_metrics::with_ffi_event;
+    use crate::{TryFromStringSlice as _, free_engine, free_snapshot};
 
     #[rstest]
     #[case::columns(StatsOptions::struct_columns(vec![column_name!("nested", "field.with.dot")]))]
@@ -232,8 +200,23 @@ mod tests {
     #[case::none(StatsOptions::none())]
     fn callback_preserves_borrowed_paths_and_optional_values(
         #[case] stats: StatsOptions,
-        #[values(false, true)] with_checkpoint: bool,
+        #[values(None, Some(false), Some(true))] resolved: Option<bool>,
     ) {
+        let with_checkpoint = resolved.is_some();
+        let info = resolved.filter(|resolved| *resolved).map(|_| {
+            let (snapshot, engine) =
+                checkpoint_handles(Some(FfiSelectedCheckpointType::V2), true, false);
+            let info = unsafe { snapshot.as_ref() }
+                .reader()
+                .get_checkpoint_info(unsafe { engine.as_ref() }.engine().as_ref())
+                .unwrap()
+                .unwrap();
+            unsafe {
+                free_snapshot(snapshot);
+                free_engine(engine);
+            }
+            info
+        });
         let event = kernel::ScanPlanGenerationCompleted {
             operation_id: kernel::MetricId::new(),
             correlation_id: Some("scan-test".into()),
@@ -247,7 +230,7 @@ mod tests {
                     version: 0,
                     checkpoint_type: None,
                 },
-                info: None,
+                info,
                 cache_hit: Some(false),
                 root_footer_calls: 1,
                 sidecar_footer_calls: 0,
@@ -311,7 +294,20 @@ mod tests {
             if with_checkpoint {
                 let checkpoint = unsafe { &*record.checkpoint };
                 assert_eq!(checkpoint.version, 0);
-                assert!(!checkpoint.has_info);
+                assert_eq!(checkpoint.info.is_null(), resolved != Some(true));
+                if let Some(info) = unsafe { checkpoint.info.as_ref() } {
+                    assert_eq!(info.checkpoint_type, FfiSelectedCheckpointType::V2);
+                    assert_eq!((info.leaf_file_count, info.size_in_bytes), (1, 30));
+                    assert_eq!(
+                        unsafe { String::try_from_slice(&info.leaf_schema) }.unwrap(),
+                        r#"{"type":"struct","fields":[]}"#
+                    );
+                    let hint = unsafe { info.last_checkpoint.try_to_kernel() }.unwrap();
+                    assert_eq!(
+                        hint.v2_checkpoint().unwrap().sidecar_files().unwrap().len(),
+                        1
+                    );
+                }
                 assert_eq!(checkpoint.checkpoint_type, OptionalValue::None);
                 assert_eq!(checkpoint.cache_hit, OptionalValue::Some(false));
                 assert_eq!(checkpoint.root_footer_calls, 1);
