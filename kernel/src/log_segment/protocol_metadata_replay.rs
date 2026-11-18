@@ -72,8 +72,9 @@ impl LogSegment {
     }
 
     /// [`Self::read_protocol_metadata_opt`] for a caller that already holds the Protocol and
-    /// Metadata as of `existing_version`, such as an incremental snapshot update. Replayed P&M at
-    /// or below that version are older, so the result leaves them out.
+    /// Metadata as of `existing_version`, such as an incremental snapshot update. The result leaves
+    /// out replayed P&M at or below that version, since the caller's are at least as new, and
+    /// ignores a `crc` at or below it.
     pub(crate) fn read_protocol_metadata_newer_than(
         &self,
         engine: &dyn Engine,
@@ -90,6 +91,10 @@ impl LogSegment {
         crc: Option<&Arc<Crc>>,
         existing_version: Option<Version>,
     ) -> KernelResult<PmResolution> {
+        // The caller's P&M are at least as new as a CRC at or below `existing_version`, and
+        // falling back to that CRC's P&M would roll them back.
+        let crc = crc.filter(|c| existing_version.is_none_or(|v| c.version > v));
+
         // Case 1: If CRC at target version, use it directly and exit early.
         if let Some(crc) = crc.filter(|c| c.version == self.end_version) {
             info!("P&M from CRC at target version {}", self.end_version);
@@ -155,8 +160,8 @@ impl LogSegment {
         };
         #[cfg(feature = "adaptive-metadata-in-dev")]
         let newest_commit_info_read = self.replay_read_newest_commit_info(&candidate)?;
-        // As with the CRC above, a lagging AMT checkpoint action can carry P&M at or below
-        // `existing_version`, which the caller holds at least as new.
+        // A lagging AMT checkpoint action can carry P&M at or below `existing_version`, which the
+        // caller holds at least as new.
         let floor = existing_version.map(version_as_i64).transpose()?;
         Ok(candidate
             .fold_with(floor, PmCandidate::newer_than)
