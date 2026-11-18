@@ -84,12 +84,20 @@ class ReviewDiffTest(unittest.TestCase):
         listed = self.review_diff.MAX_FILE_LIST_CHARS // len(f"`{paths[0]}`")
         self.assertIn(f"`{paths[listed]}`, {missing - listed} more.", note)
 
-    def test_truncated_diff_note_cannot_close_its_code_span_with_a_file_name(self) -> None:
-        diff = _file_diff("first.rs") + _file_diff("a`b.rs")
+    def test_truncated_diff_note_handles_unusual_file_headers(self) -> None:
+        cases = (
+            ("backtick in path", b"diff --git a/a`b.rs b/a`b.rs\n", "`a'b.rs`"),
+            (
+                "quoted paths",
+                b'diff --git "a/sp ace.rs" "b/sp ace.rs"\n',
+                '`"a/sp ace.rs" "b/sp ace.rs"`',
+            ),
+        )
+        for name, header, listed in cases:
+            with self.subTest(case=name):
+                _, note = self.review_diff.truncate_diff(FIRST + header, 1)
 
-        _, note = self.review_diff.truncate_diff(diff, 1)
-
-        self.assertIn("Missing: `a'b.rs`.", note)
+                self.assertIn(f"Missing: {listed}.", note)
 
     def test_truncation_replaces_a_split_multibyte_character(self) -> None:
         diff = "diff --git a/a.rs b/a.rs\n+\u00e9\n".encode()

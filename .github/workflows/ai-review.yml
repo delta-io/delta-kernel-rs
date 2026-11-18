@@ -909,16 +909,18 @@ jobs:
           )
           # The orchestrator consolidates findings in files that only reviewers
           # receive, so tell it what the reviewers' copy of the diff contains.
-          if reviewer_truncation_note:
-              truncation_note += (
-                  "\n\n[Reviewers receive a longer copy of the diff, which is also "
-                  "truncated. Name the files missing from the reviewers' copy in the "
-                  f"Summary.]{reviewer_truncation_note}"
+          if truncation_note:
+              reviewer_copy = (
+                  "a longer copy of the diff, described in the next note. Say in the "
+                  "Summary that reviewers received a truncated diff, and name the "
+                  "files it omits or give their count"
+                  if reviewer_truncation_note
+                  else "the complete diff"
               )
-          elif truncation_note:
               truncation_note += (
-                  "\n\n[Reviewers receive the complete diff, so a finding in a file "
-                  "that is cut or missing here can be valid.]"
+                  f"\n\n[Reviewers and the disprove gate receive {reviewer_copy}. Do "
+                  "not drop a finding only because its file is cut or missing from "
+                  f"this copy.]{reviewer_truncation_note}"
               )
           print(
               f"PR diff is {len(diff_bytes)} bytes. Orchestrator copy truncated: "
