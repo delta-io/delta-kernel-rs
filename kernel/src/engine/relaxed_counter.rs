@@ -2,8 +2,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// An atomic `u64` counter using [`Ordering::Relaxed`] throughout.
 ///
-/// Relaxed ordering is sufficient here: metrics are reported after the operations they
-/// describe have completed, so there are no inter-counter ordering dependencies.
+/// Relaxed ordering is enough because each counter is independent and is read only after the
+/// counted work has been synchronized with the reader. It does not order the counter with
+/// respect to any other memory.
 #[derive(Debug, Default)]
 pub struct RelaxedCounter(AtomicU64);
 

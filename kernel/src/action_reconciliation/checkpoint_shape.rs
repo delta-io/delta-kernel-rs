@@ -277,7 +277,7 @@ impl RowVisitor for CheckpointMetadataVisitor {
 mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::path::Path;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Mutex, mpsc};
     use std::time::Duration;
 
@@ -311,7 +311,7 @@ mod tests {
         inner: SyncPlanExecutor,
         query_scans: RelaxedCounter,
         footer_reads: RelaxedCounter,
-        batches_read: Arc<AtomicUsize>,
+        batches_read: Arc<RelaxedCounter>,
         rows_in_batch: Option<usize>,
         fail_query_once: AtomicBool,
         panic_once: AtomicBool,
@@ -324,7 +324,7 @@ mod tests {
                 inner: SyncPlanExecutor::default(),
                 query_scans: RelaxedCounter::default(),
                 footer_reads: RelaxedCounter::default(),
-                batches_read: Arc::new(AtomicUsize::new(0)),
+                batches_read: Arc::new(RelaxedCounter::default()),
                 rows_in_batch: Some(1),
                 fail_query_once: AtomicBool::new(false),
                 panic_once: AtomicBool::new(false),
@@ -397,7 +397,7 @@ mod tests {
                     let batches_read = self.batches_read.clone();
                     Ok(PlanResult::Data(Box::new(batches.into_iter().inspect(
                         move |_| {
-                            batches_read.fetch_add(1, Ordering::Relaxed);
+                            batches_read.inc();
                         },
                     ))))
                 }
@@ -695,7 +695,7 @@ mod tests {
         );
         let cached = snapshot.cached_checkpoint_info().unwrap().as_ref().unwrap();
         assert_eq!(exec.io_counts(), (1, root_footer_reads + 1));
-        let batches = exec.batches_read.load(Ordering::Relaxed);
+        let batches = exec.batches_read.get();
         assert!(batches > 1);
 
         // When: the getter and another scan request the same checkpoint metadata.
@@ -705,7 +705,7 @@ mod tests {
         // Then: the cached result is shared and no further discovery is performed.
         assert!(Arc::ptr_eq(&info, cached));
         assert_eq!(exec.io_counts(), (1, root_footer_reads + 1));
-        assert_eq!(exec.batches_read.load(Ordering::Relaxed), batches);
+        assert_eq!(exec.batches_read.get(), batches);
     }
 
     /// Builds a `LogSegment` whose applicable hint carries `v2Checkpoint.sidecarFiles == Some([])`
@@ -1470,7 +1470,7 @@ mod tests {
             .count();
         // Exercise metadata and sidecars together, separately, and across smaller mixed batches.
         assert_eq!(
-            exec.batches_read.load(Ordering::Relaxed),
+            exec.batches_read.get(),
             rows_in_batch.map_or(1, |rows| (expected_sidecars + 1).div_ceil(rows))
         );
         assert_eq!(info.leaf_file_count(), expected_sidecars);
@@ -1578,7 +1578,7 @@ mod tests {
 
         // Then: the partial result is discarded, so the getter can retry the complete read.
         assert!(error.to_string().contains("injected batch failure"));
-        assert_eq!(exec.batches_read.load(Ordering::Relaxed), 3);
+        assert_eq!(exec.batches_read.get(), 3);
         assert!(snapshot.cached_checkpoint_info().is_none());
         // When: a second getter retries discovery.
         let info = resolve_checkpoint_info(&snapshot, &engine);
