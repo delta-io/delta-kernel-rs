@@ -134,6 +134,10 @@ pub enum BinaryPredicateOp {
     /// reason the operands sit this way around rather than the more familiar
     /// column-on-the-left form.
     In,
+    /// `MAP_HAS_KEY(map, key)`: `true` when the map contains `key` and `false` otherwise. The
+    /// left operand is a map and the right operand is a value of the map's key type. A NULL map or
+    /// a NULL key yields NULL. An entry whose value is NULL still counts as present.
+    MapHasKey,
 }
 
 /// A unary expression operator.
@@ -192,6 +196,9 @@ pub enum UnaryExpressionOp {
     // TODO(#2423): decide whether this keeps percent-encoding non-ASCII if `add.path` stops doing
     // so.
     UriEncodeFileLocation,
+    /// `MAP_LEN(map)`: the number of entries in a map, as an INTEGER. A NULL map yields NULL. An
+    /// empty map yields `0`.
+    MapLen,
 }
 
 impl UnaryExpressionOp {
@@ -687,7 +694,7 @@ impl BinaryPredicateOp {
     pub(crate) fn is_null_intolerant(&self) -> bool {
         use BinaryPredicateOp::*;
         match self {
-            LessThan | GreaterThan | Equal => true,
+            LessThan | GreaterThan | Equal | MapHasKey => true,
             Distinct | In => false, // tolerates NULL input
         }
     }
@@ -1025,6 +1032,12 @@ impl Expression {
         Predicate::distinct(self, other)
     }
 
+    /// Create a new expression `MAP_LEN(self)`, the number of entries in a map.
+    /// See [`UnaryExpressionOp::MapLen`].
+    pub fn map_len(self) -> Self {
+        Self::unary(UnaryExpressionOp::MapLen, self)
+    }
+
     /// Creates a new unary expression
     pub fn unary(op: UnaryExpressionOp, expr: impl Into<Expression>) -> Self {
         Self::Unary(UnaryExpression::new(op, expr))
@@ -1204,6 +1217,12 @@ impl Predicate {
         Self::binary(BinaryPredicateOp::Distinct, a, b)
     }
 
+    /// Create a new predicate `MAP_HAS_KEY(map, key)`, true when `map` contains `key`.
+    /// See [`BinaryPredicateOp::MapHasKey`].
+    pub fn map_has_key(map: impl Into<Expression>, key: impl Into<Expression>) -> Self {
+        Self::binary(BinaryPredicateOp::MapHasKey, map, key)
+    }
+
     /// Create a new predicate `self AND other`
     pub fn and(a: impl Into<Self>, b: impl Into<Self>) -> Self {
         Self::and_from([a.into(), b.into()])
@@ -1298,6 +1317,7 @@ impl Display for UnaryExpressionOp {
         match self {
             ToJson { .. } => write!(f, "TO_JSON"),
             UriEncodeFileLocation => write!(f, "URI_ENCODE_FILE_LOCATION"),
+            MapLen => write!(f, "MAP_LEN"),
         }
     }
 }
@@ -1336,6 +1356,7 @@ impl Display for BinaryPredicateOp {
             // in our code we take care of this, but theirs might not ...
             Distinct => write!(f, "DISTINCT"),
             In => write!(f, "IN"),
+            MapHasKey => write!(f, "MAP_HAS_KEY"),
         }
     }
 }
@@ -1443,6 +1464,11 @@ impl Display for Predicate {
                 left,
                 right,
             }) => write!(f, "DISTINCT({left}, {right})"),
+            Binary(BinaryPredicate {
+                op: BinaryPredicateOp::MapHasKey,
+                left,
+                right,
+            }) => write!(f, "MAP_HAS_KEY({left}, {right})"),
             Binary(BinaryPredicate { op, left, right }) => write!(f, "{left} {op} {right}"),
             Unary(UnaryPredicate { op, expr }) => match op {
                 UnaryPredicateOp::IsNull => write!(f, "{expr} IS NULL"),
