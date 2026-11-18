@@ -104,7 +104,6 @@ mod tests {
     use crate::committer::FileSystemCommitter;
     use crate::crc::{Crc, DomainMetadataState, SetTransactionState};
     use crate::engine::sync::SyncEngine;
-    use crate::object_store::memory::InMemory;
     use crate::schema::schema_ref;
     use crate::snapshot::Snapshot;
     use crate::transaction::create_table::create_table;
@@ -434,7 +433,7 @@ mod tests {
 
     #[test]
     fn new_preserves_an_absolute_file_location() -> Result<()> {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let schema = schema_ref! { nullable "id": INTEGER };
         let _ = create_table("memory:///t/", schema, "test", true)
             .build(&engine, Box::new(FileSystemCommitter::new()))?
@@ -589,7 +588,7 @@ mod tests {
     // on, the `lastManifestCommit` that locates the checkpoint action, as an AMT writer does.
     #[test]
     fn scan_non_content_metadata_uses_crc_fast_path_with_existing_checkpoint() -> Result<()> {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let table_root = url::Url::parse("memory:///").map_err(KernelError::from)?;
         let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
         let commit_info = |ict: i64, last_manifest_commit: Option<i64>| {

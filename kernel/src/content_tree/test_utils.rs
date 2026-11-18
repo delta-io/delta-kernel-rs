@@ -207,7 +207,6 @@ mod tests {
     use crate::arrow::compute::{cast, concat_batches};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
-    use crate::object_store::memory::InMemory;
     use crate::schema::{ColumnMetadataKey, MetadataValue};
 
     /// Covers `tight_stats` as `Some(true)`, `Some(false)`, and `None`.
@@ -225,7 +224,7 @@ mod tests {
 
     /// Writes [`manifest_entries`] to an in-memory store and returns the engine and file.
     fn write_test_manifest() -> (SyncEngine, FileMeta) {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let location = Url::parse("memory:///metadata/manifest.parquet").unwrap();
         let file = write_manifest(&engine, location, &manifest_entries());
         (engine, file)
@@ -307,7 +306,7 @@ mod tests {
     /// Reading with narrowed `content_stats` reads only the requested stats, by field ID.
     #[test]
     fn manifest_read_projects_requested_content_stats() {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let location = Url::parse("memory:///metadata/manifest.parquet").unwrap();
         let entries = [added_data_entry("a.parquet", 1, 10, 0, 1)];
         let stats = vec![x_full_stats_value()];

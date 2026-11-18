@@ -86,11 +86,6 @@ fn generate_checkpoint_parts(
     })
 }
 
-/// Helper to build a SyncEngine backed by an in-memory store.
-fn new_sync_engine(store: Arc<InMemory>) -> impl Engine {
-    SyncEngine::new_with_store(store)
-}
-
 struct ExpectedNonFileContent<'a> {
     reader_version: i32,
     writer_version: i32,
@@ -279,7 +274,7 @@ fn verify_non_file_batches(batches: &[Box<dyn EngineData>], expected: &ExpectedN
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_generate_sidecars_single_sidecar() -> Result<()> {
     let (store, _) = new_in_memory_store();
-    let engine = new_sync_engine(store.clone());
+    let engine = SyncEngine::new_with_store(store.clone());
 
     write_commit_to_store(
         &store,
@@ -342,7 +337,7 @@ async fn test_generate_sidecars_single_sidecar() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_generate_sidecars_multiple_chunks() -> Result<()> {
     let (store, _) = new_in_memory_store();
-    let engine = new_sync_engine(store.clone());
+    let engine = SyncEngine::new_with_store(store.clone());
 
     // Commit 0: v2 protocol + metadata + 3 adds (mixed batch of file and non-file actions)
     write_commit_to_store(
@@ -452,7 +447,7 @@ async fn test_generate_sidecars_multiple_chunks() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_generate_sidecars_hint_one_per_batch() -> Result<()> {
     let (store, _) = new_in_memory_store();
-    let engine = new_sync_engine(store.clone());
+    let engine = SyncEngine::new_with_store(store.clone());
 
     write_commit_to_store(
         &store,
@@ -522,7 +517,7 @@ async fn test_generate_sidecars_hint_one_per_batch() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_generate_sidecars_stats_and_partition_values() -> Result<()> {
     let (store, _) = new_in_memory_store();
-    let engine = new_sync_engine(store.clone());
+    let engine = SyncEngine::new_with_store(store.clone());
 
     write_commit_to_store(
         &store,
@@ -633,7 +628,7 @@ async fn test_generate_sidecars_stats_and_partition_values() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_splitter_no_file_actions() -> Result<()> {
     let (store, _) = new_in_memory_store();
-    let engine = new_sync_engine(store.clone());
+    let engine = SyncEngine::new_with_store(store.clone());
 
     write_commit_to_store(
         &store,

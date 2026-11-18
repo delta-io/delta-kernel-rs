@@ -533,7 +533,7 @@ pub(crate) mod adaptive_metadata_fixtures {
 
     /// Creates an empty in-memory table and returns its engine and table-root URL.
     pub(crate) fn setup_table() -> Result<(SyncEngine, Url)> {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let schema = schema_ref! { nullable "id": INTEGER };
         let _ = create_table("memory:///", schema, "test", true)
             .build(&engine, Box::new(FileSystemCommitter::new()))?
@@ -756,7 +756,7 @@ pub(crate) mod adaptive_metadata_fixtures {
     /// Creates an in-memory adaptiveMetadata table at version 0 and returns its engine and
     /// table-root URL.
     pub(crate) fn setup_adaptive_metadata_table() -> (SyncEngine, Url) {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let table_root = Url::parse("memory:///").unwrap();
         create_adaptive_metadata_table(&engine, &table_root, &[]);
         (engine, table_root)
