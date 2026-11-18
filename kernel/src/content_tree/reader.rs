@@ -3151,7 +3151,10 @@ mod tests {
             .err()
             .unwrap();
         assert!(
-            matches!(&err, KernelError::InternalError(m) if m.contains("but it is entry")),
+            matches!(
+                err.without_backtrace(),
+                KernelError::InternalError(m) if m.contains("but it is entry")
+            ),
             "{err}"
         );
     }
