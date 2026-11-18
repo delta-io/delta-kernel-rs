@@ -93,7 +93,9 @@ impl LogSegment {
         if base.version == self.end_version {
             return Ok(Some((base.clone(), ProtocolMetadataSource::CrcAtTarget)));
         }
-        if !incremental_replay.should_advance(base.version, self.end_version)? {
+        if !self.has_original_commits(Some(base.version), self.end_version)
+            || !incremental_replay.should_advance(base.version, self.end_version)?
+        {
             return Ok(None);
         }
         // TODO(#3421): Classify required-commit gaps and replay-file failures during CRC
@@ -211,6 +213,7 @@ impl LogSegment {
                 "build_crc_from_version_zero called with a checkpoint present"
             )
         );
+        self.require_original_commits()?;
         let Some(first) = self.listed.ascending_commit_files.first() else {
             return Ok(None);
         };
@@ -229,8 +232,8 @@ impl LogSegment {
     /// log replay. `seed_histogram` is an empty histogram with the same bin boundaries as
     /// the downstream base CRC, or `None` to skip histogram tracking on the delta.
     ///
-    /// Errors if `base_version >= self.end_version` or if the segment is missing the
-    /// commit at `base_version + 1` (i.e. has a gap above `base_version`).
+    /// Errors if `base_version >= self.end_version`. Returns [`KernelError::Unsupported`] if
+    /// individual commits are missing anywhere in the range.
     pub(crate) fn build_crc_delta_from_base(
         &self,
         engine: &dyn Engine,
@@ -246,25 +249,18 @@ impl LogSegment {
             ))
         );
 
-        let deltas: Vec<_> = self
+        require!(
+            self.has_original_commits(Some(base_version), self.end_version),
+            KernelError::unsupported(
+                "CRC advancement requires individual commits throughout the range"
+            )
+        );
+        let deltas = self
             .listed
             .ascending_commit_files
             .iter()
-            .filter(|c| c.version > base_version)
-            .collect();
-
-        let first_above = deltas.first().map(|c| c.version);
-        require!(
-            first_above == Some(base_version + 1),
-            KernelError::internal_error(format!(
-                "build_crc_delta_from_base: segment is missing commit {} \
-                 (lowest commit above base_version is {:?})",
-                base_version + 1,
-                first_above,
-            ))
-        );
-
-        self.replay_commits_into_crc_delta(engine, deltas.into_iter(), seed_histogram)
+            .filter(|c| c.version > base_version);
+        self.replay_commits_into_crc_delta(engine, deltas, seed_histogram)
     }
 
     /// Replay the given commits into a [`CrcDelta`]. The shared core of

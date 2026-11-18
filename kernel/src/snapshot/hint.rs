@@ -63,6 +63,17 @@ pub(crate) enum PublicationWatermark {
 /// by themselves require the caller to supply `max_catalog_version`. Without an explicit target, a
 /// catalog-managed snapshot still requires that bound. Explicit targets must not exceed a supplied
 /// bound.
+///
+/// Log compactions may replace covered original commits when the selected files form a complete,
+/// non-overlapping replay cover from a checkpoint or version zero. Such hints support scans and
+/// preserve the supplied protocol and metadata without replay. Other state queries may use a
+/// current CRC, but log replay for protocol, metadata, transactions, domains, and checkpoints
+/// requires original commits. Advancing the snapshot also requires originals; callers can load a
+/// fresh snapshot from storage instead. Incremental scans fall back when their original commits are
+/// absent. Original-file statistics and CRC advancement require the corresponding originals.
+/// Timestamp lookup may require the original commit at the snapshot version because compactions do
+/// not preserve `commitInfo`. Compaction-only coverage is not supported for adaptive metadata
+/// tables.
 #[derive(Debug, Clone)]
 #[internal_api]
 pub(crate) struct SnapshotHint {
@@ -111,8 +122,8 @@ impl SnapshotHint {
     /// Returns an error if `table_root` is invalid,
     /// [`SnapshotHintError::LogPathOutsideRoot`] if any path is outside `table_root`'s `_delta_log`
     /// root. Returns an error when the supplied paths cannot be grouped into a valid log-segment
-    /// file set. Compacted paths are retained; callers must also supply the individual commits
-    /// required for replay.
+    /// file set. Snapshot construction checks that commits and compactions cover the replay range;
+    /// it rejects gaps and overlapping ranges that cannot be selected as a complete cover.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
@@ -323,9 +334,9 @@ impl SnapshotHint {
 
         // Construction validates every path against one root, and grouping preserves locations.
         // One retained path suffices to reject a hint attached to a different table's builder.
-        // LogSegment::try_new below rejects empty replay history.
+        // LogSegment construction below rejects empty replay history.
         validate_snapshot_hint_paths(log_segment_files.iter_all_paths().take(1), &log_root)?;
-        let log_segment = LogSegment::try_new(
+        let log_segment = LogSegment::try_new_with_compactions(
             log_segment_files,
             log_root,
             Some(version),
@@ -350,7 +361,12 @@ impl SnapshotHint {
                     .listed
                     .ascending_commit_files
                     .first()
-                    .is_some_and(|path| path.version == 0),
+                    .is_some_and(|p| p.version == 0)
+                || log_segment
+                    .listed
+                    .ascending_compaction_files
+                    .first()
+                    .is_some_and(|p| p.version == 0),
             KernelError::from(SnapshotHintError::MissingHistoryAnchor).into()
         );
         let table_configuration =
@@ -407,6 +423,10 @@ mod tests {
     use std::sync::Arc;
 
     use itertools::Itertools;
+    #[cfg(feature = "declarative-plans")]
+    use test_utils::log_compaction::write_compaction_from_commits;
+    #[cfg(feature = "declarative-plans")]
+    use test_utils::table_builder::{FeatureSet, LogState, TestTableBuilder};
     use test_utils::{
         TestAction, actions_to_string, actions_to_string_catalog_managed, add_commit,
         add_staged_commit, assert_result_error_with_message,
@@ -737,35 +757,351 @@ mod tests {
         assert_eq!(hint.log_segment_files.ascending_compaction_files.len(), 1);
     }
 
-    #[test]
-    fn snapshot_hint_compacted_paths_do_not_fill_commit_gaps() -> Result<()> {
-        const TABLE_ROOT: &str = "memory:///target/";
-        let log_paths = [
-            "memory:///target/_delta_log/00000000000000000000.json",
-            "memory:///target/_delta_log/00000000000000000000.00000000000000000002.compacted.json",
-            "memory:///target/_delta_log/00000000000000000002.json",
-        ]
-        .into_iter()
-        .map(|path| LogPath::try_new(create_log_path_with_size(path, 1).location))
-        .collect::<KernelResult<Vec<_>>>()?;
+    #[rstest::rstest]
+    #[case::prefix(&[], &[(0, 3)], None, 3, true)]
+    #[case::interior(&[0, 3], &[(1, 2)], None, 3, true)]
+    #[case::interior_with_overlapping_originals(&[0, 2], &[(0, 2)], None, 2, true)]
+    #[case::after_checkpoint(&[], &[(2, 3)], Some(1), 3, true)]
+    #[case::checkpoint_original(&[1], &[(2, 3)], Some(1), 3, true)]
+    #[case::adjacent(&[], &[(0, 1), (2, 3)], None, 3, true)]
+    #[case::shorter_compaction_completes_cover(&[], &[(0, 2), (0, 3), (3, 5)], None, 5, true)]
+    #[case::original_completes_cover(&[0], &[(0, 2), (1, 4)], None, 4, true)]
+    #[case::gap(&[0], &[(2, 3)], None, 3, false)]
+    #[case::checkpoint_gap(&[], &[(3, 4)], Some(1), 4, false)]
+    #[case::overlap_without_suffix(&[], &[(0, 2), (2, 4)], None, 4, false)]
+    #[case::overlap_with_suffix(&[3, 4], &[(0, 2), (2, 4)], None, 4, true)]
+    #[case::missing_anchor(&[], &[(1, 3)], None, 3, false)]
+    #[case::past_target(&[0], &[(1, 3)], None, 2, false)]
+    fn compacted_hint_requires_complete_replay_coverage(
+        #[case] commits: &[Version],
+        #[case] compactions: &[(Version, Version)],
+        #[case] checkpoint: Option<Version>,
+        #[case] version: Version,
+        #[case] valid: bool,
+    ) -> Result<()> {
+        let root = "memory:///target/";
+        let names = commits
+            .iter()
+            .map(|v| format!("{v:020}.json"))
+            .chain(
+                compactions
+                    .iter()
+                    .map(|(lo, hi)| format!("{lo:020}.{hi:020}.compacted.json")),
+            )
+            .chain(checkpoint.map(|v| format!("{v:020}.checkpoint.parquet")));
+        let paths = names
+            .map(|name| {
+                LogPath::try_new(
+                    create_log_path_with_size(&format!("{root}_delta_log/{name}"), 1).location,
+                )
+            })
+            .try_collect()?;
         let hint = SnapshotHint::try_new(
-            TABLE_ROOT,
-            2,
+            root,
+            version,
             PublicationWatermark::InferFromLogPaths,
-            log_paths,
+            paths,
             Protocol::try_new_legacy(1, 2)?,
             Metadata::default().with_schema(schema_ref! { nullable "id": INTEGER })?,
             None,
             None,
             SnapshotHintFreshness::Unverified,
         )?;
-        let (engine, _store, _table_root) = setup_test();
-        assert_log_segment_hint_error(
-            SnapshotBuilder::new_for(TABLE_ROOT)
-                .with_snapshot_hint(hint)
-                .build(engine.as_ref()),
-            "Table version 1 is missing",
+        let result = Snapshot::builder_for(root)
+            .with_snapshot_hint(hint)
+            .build(&crate::engine::PanicEngine);
+        assert_eq!(result.is_ok(), valid, "{result:?}");
+        if let Ok(snapshot) = result {
+            assert_eq!(snapshot.version(), version);
+            let rebuilt = Snapshot::builder_for(root)
+                .with_snapshot_hint(snapshot.to_snapshot_hint()?)
+                .build(&crate::engine::PanicEngine)?;
+            assert_eq!(rebuilt.log_segment(), snapshot.log_segment());
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest::rstest]
+    fn compacted_hint_amt_requires_original_commits(#[values(false, true)] originals: bool) {
+        let root = "memory:///target/";
+        let config = crate::unit_test_utils::adaptive_metadata_table_configuration(
+            crate::unit_test_utils::test_schema_flat_with_column_mapping(),
+            &[],
         );
+        let names =
+            std::iter::once("00000000000000000000.00000000000000000002.compacted.json".into())
+                .chain(
+                    (0..=2)
+                        .filter(|_| originals)
+                        .map(|v| format!("{v:020}.json")),
+                );
+        let paths = names
+            .map(|name| {
+                LogPath::try_new(
+                    create_log_path_with_size(&format!("{root}_delta_log/{name}"), 1).location,
+                )
+                .unwrap()
+            })
+            .collect();
+        let hint = SnapshotHint::try_new(
+            root,
+            2,
+            PublicationWatermark::InferFromLogPaths,
+            paths,
+            config.protocol().clone(),
+            config.metadata().clone(),
+            None,
+            None,
+            SnapshotHintFreshness::Unverified,
+        )
+        .unwrap();
+        let result = Snapshot::builder_for(root)
+            .with_snapshot_hint(hint)
+            .build(&crate::engine::PanicEngine);
+        if originals {
+            assert!(result.is_ok(), "{result:?}");
+        } else {
+            assert_result_error_with_message(result, "compaction-only hints for adaptive metadata");
+        }
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    #[rstest::rstest]
+    #[case::prefix(&[(0, 3)], false, false)]
+    #[case::suffix(&[(2, 3)], false, false)]
+    #[case::after_checkpoint(&[(2, 3)], true, false)]
+    #[case::adjacent(&[(0, 1), (2, 3)], false, false)]
+    #[case::overlapping_alternatives(&[(0, 1), (0, 2), (2, 3)], false, false)]
+    #[case::ict(&[(0, 3)], false, true)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compacted_hint_scans_with_seeded_pm_and_guards_original_only_operations(
+        #[case] compactions: &[(Version, Version)],
+        #[case] checkpoint: bool,
+        #[case] ict: bool,
+        #[values(false, true)] use_plan: bool,
+        #[values(false, true)] retain_latest_commit: bool,
+        #[values(None, Some(2), Some(3))] crc_version: Option<Version>,
+    ) -> KernelResult<(), Box<dyn std::error::Error>> {
+        let table = TestTableBuilder::new()
+            .with_log_state(
+                LogState::with_latest_version(1).maybe_with_checkpoint_at(checkpoint.then_some(1)),
+            )
+            .with_features(if ict {
+                FeatureSet::new().domain_metadata().ict()
+            } else {
+                FeatureSet::new().domain_metadata()
+            })
+            .build()?;
+        let timestamp = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis(),
+        )? + 100;
+        for version in [2, 3] {
+            let actions = [
+                serde_json::json!({"commitInfo": {
+                    "operation": "WRITE", "inCommitTimestamp": timestamp + version as i64
+                }})
+                .to_string(),
+                actions_to_string(if version == 3 {
+                    vec![
+                        TestAction::Add("probe-3.parquet".into()),
+                        TestAction::Remove("probe-2.parquet".into()),
+                    ]
+                } else {
+                    vec![TestAction::Add("probe-2.parquet".into())]
+                }),
+                serde_json::json!({"txn": {"appId": "probe", "version": version}}).to_string(),
+                serde_json::json!({"domainMetadata": {
+                    "domain": "probe", "configuration": version.to_string(), "removed": false
+                }})
+                .to_string(),
+            ];
+            add_commit(
+                table.table_root(),
+                table.store().as_ref(),
+                version,
+                actions.join("\n"),
+            )
+            .await?;
+        }
+        for &(start, end) in compactions {
+            write_compaction_from_commits(table.table_root(), table.store().as_ref(), start, end)
+                .await?;
+        }
+        let inner = Arc::new(SyncEngine::new_with_store(table.store().clone()));
+        let engine: Arc<dyn Engine> = if use_plan {
+            inner
+        } else {
+            Arc::new(DelegatingEngine::new(inner).without_plan_executor())
+        };
+        let original = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
+        let mut hint = original.to_snapshot_hint()?;
+        hint.crc = None;
+        hint.log_segment_files
+            .ascending_commit_files
+            .retain(|file| {
+                !compactions
+                    .iter()
+                    .any(|&(start, end)| (start..=end).contains(&file.version))
+            });
+        if !retain_latest_commit {
+            hint.log_segment_files.latest_commit_file = None;
+        }
+        let hinted = Snapshot::builder_for(table.table_root())
+            .with_snapshot_hint(hint)
+            .build(&crate::engine::PanicEngine)?;
+        assert_eq!(hinted.version(), 3);
+        assert_eq!(hinted.table_configuration(), original.table_configuration());
+        let restored = Snapshot::builder_for(table.table_root())
+            .with_snapshot_hint(hinted.to_snapshot_hint()?)
+            .build(&crate::engine::PanicEngine)?;
+        assert_eq!(
+            restored.table_configuration(),
+            original.table_configuration()
+        );
+
+        let hinted = if let Some(version) = crc_version {
+            let base = Snapshot::builder_for(table.table_root())
+                .at_version(version)
+                .build(engine.as_ref())?
+                .write_checksum(engine.as_ref())?
+                .1;
+            Arc::new(Snapshot::new_with_crc(
+                hinted.log_segment().clone(),
+                hinted.table_configuration().clone(),
+                base.crc_at_version().cloned(),
+                false,
+                false,
+            )?)
+        } else {
+            hinted
+        };
+        let expected_paths = scan_paths(original.clone(), engine.as_ref())?;
+        assert!(expected_paths.contains(&"probe-3.parquet".to_owned()));
+        assert!(!expected_paths.contains(&"probe-2.parquet".to_owned()));
+        assert_eq!(scan_paths(hinted.clone(), engine.as_ref())?, expected_paths);
+
+        let previous = Snapshot::builder_for(table.table_root())
+            .at_version(1)
+            .build(engine.as_ref())?;
+        let cached = previous
+            .scan_builder()
+            .build()?
+            .scan_metadata(engine.as_ref())?
+            .map(|batch| batch?.scan_files.apply_selection_vector())
+            .collect::<KernelResult<Vec<_>>>()?;
+        let scan = hinted.clone().scan_builder().build()?;
+        let mut from_cached = Vec::new();
+        for batch in scan.scan_metadata_from(engine.as_ref(), 1, cached, None)? {
+            from_cached =
+                batch?.visit_scan_files(from_cached, |paths, file| paths.push(file.path))?;
+        }
+        from_cached.sort();
+        assert_eq!(from_cached, expected_paths);
+        assert!(
+            hinted
+                .clone()
+                .incremental_scan_builder(1)
+                .build(engine.as_ref())?
+                .is_none()
+        );
+
+        let segment = hinted.log_segment();
+        if crc_version == Some(3) {
+            let pm = segment
+                .read_protocol_metadata_opt(&crate::engine::PanicEngine, hinted.base_crc())?;
+            assert_eq!(
+                pm.protocol.as_ref(),
+                Some(original.table_configuration().protocol())
+            );
+            assert_eq!(
+                pm.metadata.as_ref(),
+                Some(original.table_configuration().metadata())
+            );
+            assert_eq!(
+                hinted
+                    .reader()
+                    .get_app_id_version("probe", &crate::engine::PanicEngine)?,
+                Some(3)
+            );
+            assert_eq!(
+                hinted
+                    .reader()
+                    .get_domain_metadata("probe", &crate::engine::PanicEngine)?,
+                Some("3".to_owned())
+            );
+        } else {
+            assert_result_error_with_message(
+                segment.read_protocol_metadata_opt(&crate::engine::PanicEngine, hinted.base_crc()),
+                "individual commit metadata is unavailable",
+            );
+            assert_result_error_with_message(
+                hinted.reader().get_app_id_version("probe", engine.as_ref()),
+                "individual commit metadata is unavailable",
+            );
+            assert_result_error_with_message(
+                hinted
+                    .reader()
+                    .get_domain_metadata("probe", engine.as_ref()),
+                "individual commit metadata is unavailable",
+            );
+            assert!(
+                segment
+                    .try_build_crc_within_budget(
+                        engine.as_ref(),
+                        hinted.base_crc(),
+                        crate::snapshot::IncrementalReplay::Unlimited,
+                    )?
+                    .is_none()
+            );
+            assert_result_error_with_message(
+                hinted.write_checksum(engine.as_ref()),
+                if crc_version.is_some() || checkpoint {
+                    "CRC advancement requires individual commits throughout the range"
+                } else {
+                    "individual commit metadata is unavailable"
+                },
+            );
+        }
+        assert_result_error_with_message(
+            hinted.log_segment_stats(),
+            "individual commit metadata is unavailable",
+        );
+        assert_result_error_with_message(
+            hinted.checkpoint(engine.as_ref(), None),
+            "individual commit metadata is unavailable",
+        );
+        if retain_latest_commit || (ict && crc_version == Some(3)) {
+            assert_eq!(
+                hinted.reader().get_timestamp(engine.as_ref())?,
+                original.reader().get_timestamp(engine.as_ref())?
+            );
+        } else {
+            assert!(hinted.reader().get_timestamp(engine.as_ref()).is_err());
+        }
+        let reused = Snapshot::builder_from(hinted.clone())
+            .at_version(3)
+            .build(&crate::engine::PanicEngine)?;
+        assert_eq!(reused.table_configuration(), original.table_configuration());
+        let (reporter, _guard) = measuring_reporter();
+        for (index, version) in [None, Some(4)].into_iter().enumerate() {
+            assert_result_error_with_message(
+                Snapshot::builder_from(hinted.clone())
+                    .fold_with(version, |builder, version| builder.at_version(version))
+                    .build(&crate::engine::PanicEngine),
+                "individual commit metadata is unavailable",
+            );
+            assert_eq!(
+                reporter
+                    .events()
+                    .iter()
+                    .filter(|event| matches!(event, MetricEvent::LogSegmentLoadFailure(_)))
+                    .count(),
+                index + 1,
+            );
+        }
         Ok(())
     }
 

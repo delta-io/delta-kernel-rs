@@ -177,6 +177,14 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
 /// [`snapshot_builder_with_max_catalog_version`]. Without an explicit target, a catalog-managed
 /// snapshot still requires that bound. An explicit target must not exceed a supplied bound.
 ///
+/// Log compactions may replace covered original commits when the files provide a complete,
+/// non-overlapping replay range from a checkpoint or version zero through the hint version.
+/// The connector must supply valid compaction files containing the reconciled actions for their
+/// named ranges; building a hint performs no I/O to verify their contents. These hints support
+/// scans and preserve the supplied protocol and metadata. Protocol/metadata, transaction,
+/// domain-metadata and checkpoint replay still require originals; matching CRC-backed state
+/// queries remain available. Hints missing originals are unsupported for adaptive metadata tables.
+///
 /// [`snapshot_builder_with_max_catalog_version`]: crate::snapshot_builder_with_max_catalog_version
 ///
 /// # Errors
@@ -184,8 +192,9 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
 /// Returns `UnsupportedError` when the builder was created by
 /// [`get_snapshot_builder_from`](crate::get_snapshot_builder_from). Returns
 /// `InvalidSnapshotHint` when a supplied field cannot be decoded or a log path is outside the
-/// table log root. Compacted paths are retained; the individual commits must also be supplied.
-/// Structural log-segment and table-configuration errors are returned when the builder is built.
+/// table log root. Build returns `InvalidSnapshotHint` if the replay range cannot be covered and
+/// `UnsupportedError` for adaptive metadata hints missing originals. Other structural log-segment
+/// and table-configuration errors are also returned when the builder is built.
 /// A failed call drops the builder.
 ///
 /// # Safety

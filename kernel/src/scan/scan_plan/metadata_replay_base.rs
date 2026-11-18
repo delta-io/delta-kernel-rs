@@ -25,6 +25,7 @@ impl MetadataReplayBase {
             .and_then(|crc| Some((crc.version, crc.all_files()?)))
             .filter(|(version, _)| {
                 checkpoint_version.is_none_or(|checkpoint| *version >= checkpoint)
+                    && snapshot.log_segment().has_replay_after(*version)
             })
         {
             return Ok(Self::Crc {
@@ -103,6 +104,52 @@ mod tests {
             scan.snapshot.cached_checkpoint_info().is_some(),
             !has_all_files
         );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::crc_before_compaction(3, true)]
+    #[case::crc_inside_compaction(4, false)]
+    fn compacted_hint_crc_base_requires_a_replayable_tail(
+        #[case] crc_version: Version,
+        #[case] use_crc: bool,
+    ) -> Result<()> {
+        let (engine, latest, _tempdir) =
+            load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
+        let base = Snapshot::builder_for(latest.table_root())
+            .at_version(crc_version)
+            .build(engine.as_ref())?;
+        let crc = base.crc_at_version().expect("fixture CRC").clone();
+        assert!(crc.all_files().is_some());
+        let log_root = latest.log_segment().log_root.clone();
+        let commits: Vec<_> = (0..=5).map(|v| format!("{log_root}{v:020}.json")).collect();
+        let paths: Vec<_> = commits.iter().map(String::as_str).collect();
+        let compacted = format!("{log_root}{:020}.{:020}.compacted.json", 4, 5);
+        let mut segment = log_segment(log_root.clone(), &paths, None);
+        segment.listed.ascending_compaction_files =
+            vec![crate::unit_test_utils::create_log_path(&compacted)];
+        segment
+            .listed
+            .ascending_commit_files
+            .retain(|p| p.version < 4);
+        let segment = crate::log_segment::LogSegment::try_new_with_compactions(
+            segment.listed,
+            log_root,
+            Some(5),
+            None,
+        )?;
+        let target = Snapshot::builder_for(latest.table_root())
+            .at_version(5)
+            .build(engine.as_ref())?;
+        let snapshot = Snapshot::new_with_crc(
+            segment,
+            target.table_configuration().clone(),
+            Some(crc),
+            false,
+            false,
+        )?;
+        let selected = MetadataReplayBase::try_new(&snapshot, engine.as_ref())?;
+        assert_eq!(matches!(selected, MetadataReplayBase::Crc { .. }), use_crc);
         Ok(())
     }
 

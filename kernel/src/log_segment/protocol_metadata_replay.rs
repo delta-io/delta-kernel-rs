@@ -74,6 +74,8 @@ impl LogSegment {
             ));
         }
 
+        self.require_original_commits()?;
+
         // We didn't return above, so we need to do log replay to find P&M.
         //
         // Case 2: CRC exists at an earlier version => Prune the log segment to only replay
@@ -89,7 +91,7 @@ impl LogSegment {
                 "Pruning log segment to commits after CRC version {}",
                 crc.version
             );
-            let pruned = self.segment_after_version(crc.version);
+            let pruned = self.segment_after_version(crc.version)?;
             // Ignore pruned P&M at or below the CRC version: a lagging AMT checkpoint action can
             // carry it, and the CRC's P&M is at least as new. A captured checkpoint action is still
             // the latest: any action at or below the CRC is older.

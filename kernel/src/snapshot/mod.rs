@@ -214,6 +214,11 @@ impl Snapshot {
 
     /// Create a new [`IncrementalSnapshotBuilder`] to incrementally update an existing [`Snapshot`]
     /// to a more recent version.
+    ///
+    /// If a snapshot hint omitted original commits in favor of log compactions, building from that
+    /// snapshot returns [`KernelError::Unsupported`] unless the same version is explicitly
+    /// requested. This also applies to a refresh without a target version, even if the table has
+    /// not changed. Load a fresh snapshot with [`Self::builder_for`] to refresh it.
     pub fn builder_from(existing_snapshot: SnapshotRef) -> IncrementalSnapshotBuilder {
         SnapshotBuilder::new_from(existing_snapshot)
     }
@@ -281,6 +286,11 @@ impl Snapshot {
         crc: Option<Arc<Crc>>,
     ) -> Result<SnapshotCrc> {
         table_configuration.ensure_operation_supported(Operation::SnapshotLoad)?;
+        require!(
+            !table_configuration.is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
+                || log_segment.has_complete_original_commits(),
+            KernelError::unsupported("compaction-only hints for adaptive metadata tables").into()
+        );
         Ok(SnapshotCrc::try_new(
             crc,
             table_configuration.version(),
@@ -681,7 +691,8 @@ impl Snapshot {
     ///
     /// # Errors
     ///
-    /// Returns an error if the total commit file size exceeds [`u64::MAX`].
+    /// Returns an error if the hint omits original commits covered by compactions, or if the
+    /// total commit file size exceeds [`u64::MAX`].
     pub fn log_segment_stats(&self) -> KernelResult<LogSegmentStats> {
         self.log_segment.stats()
     }
@@ -967,6 +978,9 @@ impl Snapshot {
         // `setTransactions` field) has no authoritative transaction set, so it cannot root the
         // scan and falls through to the full replay below.
         if let Some(base) = self.tail_replay_base_crc(engine)?
+            && self
+                .log_segment()
+                .has_original_commits(Some(base.version), self.version())
             && let SetTransactionState::Complete(base_active) = &base.set_transaction_state
         {
             let txn = SetTransactionScanner::get_one_rooted_in_crc(
@@ -1185,6 +1199,9 @@ impl Snapshot {
         // `domainMetadata` field) has no authoritative active-domain set, so it cannot root the
         // scan and falls through to the full replay below.
         if let Some(base) = self.tail_replay_base_crc(engine)?
+            && self
+                .log_segment()
+                .has_original_commits(Some(base.version), self.version())
             && let DomainMetadataState::Complete(base_active) = &base.domain_metadata_state
         {
             let rooted = self.log_segment().scan_domain_metadatas_rooted_in_crc(
