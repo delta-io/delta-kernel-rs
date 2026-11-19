@@ -705,14 +705,14 @@ impl NullTypeTag {
             Self::Timestamp => Ok(DataType::TIMESTAMP),
             Self::TimestampNtz => Ok(DataType::TIMESTAMP_NTZ),
             #[cfg(not(feature = "nanosecond-timestamps"))]
-            Self::TimestampNanos => Err(delta_kernel::KernelError::generic(
-                "`nanosecond-timestamps` Cargo feature not enabled",
+            Self::TimestampNanos => Err(delta_kernel::KernelError::unsupported(
+                "`nanosecond-timestamps` feature not enabled in delta-kernel",
             )),
             #[cfg(feature = "nanosecond-timestamps")]
             Self::TimestampNanos => Ok(DataType::TIMESTAMP_NANOS),
             #[cfg(not(feature = "nanosecond-timestamps"))]
-            Self::TimestampNanosNtz => Err(delta_kernel::KernelError::generic(
-                "`nanosecond-timestamps` Cargo feature not enabled",
+            Self::TimestampNanosNtz => Err(delta_kernel::KernelError::unsupported(
+                "`nanosecond-timestamps` feature not enabled in delta-kernel",
             )),
             #[cfg(feature = "nanosecond-timestamps")]
             Self::TimestampNanosNtz => Ok(DataType::TIMESTAMP_NANOS_NTZ),
