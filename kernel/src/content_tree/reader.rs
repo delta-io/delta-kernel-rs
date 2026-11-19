@@ -25,7 +25,6 @@ use crate::amt_path_util::{amt_location_to_add_path, amt_manifest_filemeta};
 use crate::cancellation::CancellationTokenRef;
 use crate::content_tree::dv_conversion::{
     ADD_DV_HELPER_SCHEMA, AddDeletionVectorColumns, add_deletion_vector_expression,
-    kept_deletion_vector,
 };
 use crate::content_tree::mumbling::MumblingBitmap;
 use crate::content_tree::stats::{parsed_stats_expression, projected_stats_schema};
@@ -531,7 +530,12 @@ impl EntryConverter {
             visitor.encoded_paths,
         )?);
         let augmented = entries.append_columns(ADD_HELPER_SCHEMA.clone(), helper_columns)?;
-        let actions = self.evaluator.evaluate(augmented.as_ref())?;
+        let actions = self.evaluator.evaluate(augmented.as_ref()).map_err(|e| {
+            KernelError::generic(format!(
+                "Failed to convert AMT entries to Add actions (deletion vector offset and size \
+                 must fit in an i32): {e}"
+            ))
+        })?;
         FilteredEngineData::try_new(actions, visitor.selection)
     }
 }
@@ -946,9 +950,7 @@ fn build_entry_to_add_expression(
             // The AMT entry carries neither of these; both come from the caller's `ReadContext`.
             n if n == MODIFICATION_TIME_NAME => lit(ctx.modification_time),
             n if n == DATA_CHANGE_NAME => lit(ctx.data_change),
-            n if n == DELETION_VECTOR_NAME => {
-                add_deletion_vector_expression(kept_deletion_vector())
-            }
+            n if n == DELETION_VECTOR_NAME => add_deletion_vector_expression(),
             n if n == BASE_ROW_ID_NAME => sources.base_row_id.clone(),
             n if n == DEFAULT_ROW_COMMIT_VERSION_NAME => sources.default_row_commit_version.clone(),
             n if n == STATS_PARSED => ctx.stats.as_ref()?.expression.as_ref().clone(),
@@ -2862,16 +2864,22 @@ mod tests {
         assert_result_error_with_message(convert(&[entry]), "not a valid Iceberg blob size");
     }
 
-    #[test]
-    fn dropped_entry_with_out_of_range_deletion_vector_does_not_error() {
-        let mut deleted = added_data_entry("deleted.parquet", 10, 5, 0, 1);
-        deleted.tracking.status = TrackingStatus::Deleted;
-        deleted.deletion_vector = Some(DeletionVectorInfo {
+    #[rstest]
+    fn out_of_range_deletion_vector_errors_even_when_dropped(
+        #[values(TrackingStatus::Added, TrackingStatus::Deleted)] status: TrackingStatus,
+    ) {
+        let mut entry = added_data_entry("data.parquet", 10, 5, 0, 1);
+        entry.tracking.status = status;
+        entry.deletion_vector = Some(DeletionVectorInfo {
             offset: i64::from(i32::MAX) + 1,
             ..test_dv_info()
         });
         let live = added_data_entry("live.parquet", 10, 5, 5, 1);
-        assert_eq!(selection_of(&[deleted, live]), [false, true]);
+        assert_result_error_with_message(
+            convert(&[entry, live]),
+            "deletion vector offset and size must fit in an i32): Invalid expression evaluation: \
+             Strict cast of Int64 to integer failed: Cast error: Can't cast value 2147483648",
+        );
     }
 
     #[test]
