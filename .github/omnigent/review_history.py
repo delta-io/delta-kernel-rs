@@ -6,7 +6,7 @@ import re
 from collections.abc import Collection
 from typing import Any
 
-from review_publish import BOT_MARKER, INLINE_FEEDBACK_FOOTER, strip_review_body
+from review_publish import BOT_MARKER, INLINE_FEEDBACK_FOOTER, REVISION_MARKER, strip_review_body
 
 MAX_HISTORY_CHARS = 12_000
 MAX_ENTRY_CHARS = 6_000
@@ -95,10 +95,16 @@ def is_duplicate_review(
 ) -> bool:
     """Return whether the same complete review was already published by the bot."""
     current = _normalize(_clean_published_body(review))
-    return bool(current) and any(
-        _normalize(entry) == current
-        for entry in _bot_review_bodies(document, trusted_bot_logins)
-    )
+    revisions = REVISION_MARKER.findall(review)
+    for entry in [*_issue_comment_nodes(document), *_review_nodes(document)]:
+        if not _is_marked_bot_entry(entry, trusted_bot_logins):
+            continue
+        # Publish identical prose once per reviewed revision so the next run can advance.
+        if revisions and REVISION_MARKER.findall(entry["body"]) != revisions:
+            continue
+        if current and _normalize(_clean_published_body(entry["body"])) == current:
+            return True
+    return False
 
 
 def canonical_finding_body(body: str) -> str:
