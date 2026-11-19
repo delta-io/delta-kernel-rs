@@ -169,10 +169,23 @@ pub(crate) struct LogSegment {
 pub(crate) struct AmtBase<'a> {
     /// The version of the checkpoint action's content root. The segment's commits follow it.
     pub(crate) version: Version,
+    /// The version of the manifest commit that added the checkpoint action.
+    pub(crate) manifest_commit_version: Version,
     /// The checkpoint action, when the `_last_checkpoint` hint embeds it. Otherwise the manifest
     /// commit that added it is in the segment and replay reads it from there. The snapshot's
     /// `lastManifestCommit`, when it has one, takes precedence over this action.
     pub(crate) checkpoint_action: Option<&'a CheckpointAction>,
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl<'a> AmtBase<'a> {
+    /// The embedded checkpoint action, if `pointer` names the manifest commit that added it.
+    fn action_named_by(&self, pointer: &LastManifestCommit) -> Option<&'a CheckpointAction> {
+        self.checkpoint_action.filter(|action| {
+            Version::try_from(pointer.version).ok() == Some(self.manifest_commit_version)
+                && pointer.content_root_version == action.content_root_version()
+        })
+    }
 }
 
 /// Validate the invariants shared by catalog-managed snapshot and commit-range log tails.
@@ -449,11 +462,13 @@ impl LogSegment {
         let hint = self.last_checkpoint_metadata.as_ref()?;
         // A hint after the end version was ignored by listing. Listing that does not start from the
         // hint drops it from the segment (see `Self::for_snapshot_with_engine`).
-        if hint.amt_manifest_commit_version().is_none() || hint.version > self.end_version {
+        let manifest_commit_version = hint.amt_manifest_commit_version()?;
+        if hint.version > self.end_version {
             return None;
         }
         Some(AmtBase {
             version: hint.version,
+            manifest_commit_version,
             checkpoint_action: hint.amt_checkpoint_action(),
         })
     }
@@ -1297,6 +1312,28 @@ impl LogSegment {
             action_schema,
             metrics,
         )
+    }
+
+    /// The latest AMT `checkpoint` action of a snapshot of this segment whose `lastManifestCommit`
+    /// is `pointer`. The action embedded in the `_last_checkpoint` hint stands in for the manifest
+    /// commit `pointer` names; any other pointed commit is read (see
+    /// [`Self::read_last_checkpoint_action_from_pointer`]). Without a pointer, no manifest commit
+    /// precedes the snapshot, so the embedded action, if any, is the latest.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn latest_checkpoint_action(
+        &self,
+        engine: &dyn Engine,
+        pointer: Option<&LastManifestCommit>,
+    ) -> KernelResult<Option<CheckpointAction>> {
+        let base = self.amt_base();
+        let Some(pointer) = pointer else {
+            return Ok(base.and_then(|base| base.checkpoint_action).cloned());
+        };
+        if let Some(action) = base.and_then(|base| base.action_named_by(pointer)) {
+            return Ok(Some(action.clone()));
+        }
+        self.read_last_checkpoint_action_from_pointer(engine, pointer)
+            .map(Some)
     }
 
     /// Read the AMT `checkpoint` action from the manifest commit that `pointer` (the snapshot's

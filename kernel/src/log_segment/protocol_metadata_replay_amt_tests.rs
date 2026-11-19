@@ -2134,6 +2134,58 @@ async fn incremental_update_before_manifest_commit_keeps_hint_checkpoint_action(
     assert_eq!(action.version(), 2);
 }
 
+// A snapshot at 4 loaded from a CRC, so the build does no replay, on a log listed from an AMT
+// `_last_checkpoint` hint at content root 2 added by manifest commit 3. Commit 3 is deleted after
+// the build, so only the hint's embedded action can answer when the CRC's `lastManifestCommit`
+// names commit 3; a pointer naming another manifest commit reads that commit.
+#[rstest]
+#[case::pointer_names_hint_manifest_commit(
+    commit_info(Some(pointer(3, 2))),
+    pointer(3, 2),
+    "metadata/root.parquet"
+)]
+#[case::pointer_names_other_manifest_commit(
+    carrying_pointer(
+        pointer(4, 2),
+        checkpoint_action_at_path(2, "metadata/v4.parquet", &[], one_column_schema()),
+    ),
+    pointer(4, 2),
+    "metadata/v4.parquet"
+)]
+#[tokio::test]
+async fn latest_checkpoint_action_uses_hint_action_named_by_pointer(
+    #[case] commit_4: String,
+    #[case] crc_pointer: LastManifestCommit,
+    #[case] expected_path: &str,
+) {
+    let store = Arc::new(InMemory::new());
+    let table_root = Url::parse("memory:///").unwrap();
+    for (version, commit) in [
+        (2, commit_info(None)),
+        (3, manifest_commit(3, 2, one_column_schema())),
+        (4, commit_4),
+    ] {
+        add_commit(table_root.as_str(), store.as_ref(), version, commit)
+            .await
+            .unwrap();
+    }
+    put_amt_last_checkpoint_hint(&store, 2, 3, true).await;
+    put_crc_with_pointer(&store, 4, crc_pointer).await;
+    let engine = non_plan_engine(store.clone());
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+    store
+        .delete(&delta_path_for_version(3, "json"))
+        .await
+        .unwrap();
+
+    let action = snapshot
+        .latest_checkpoint_action(&engine)
+        .unwrap()
+        .expect("checkpoint action present");
+    assert_eq!(action.version(), 2);
+    assert_eq!(action.path(), expected_path);
+}
+
 // Writes an AMT `_last_checkpoint` hint at `version` naming `manifest_commit_version` as the
 // manifest commit that added its checkpoint action, embedding that action if `embeds_action`.
 async fn put_amt_last_checkpoint_hint(
