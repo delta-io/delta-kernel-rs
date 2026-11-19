@@ -1840,32 +1840,36 @@ mod tests {
     }
 
     #[rstest]
-    fn from_unary_expression(#[values(false, true)] full_precision_timestamps: bool) {
-        let op = UnaryExpressionOp::ToJson {
-            full_precision_timestamps,
-        };
+    #[case::to_json_millis(
+        UnaryExpressionOp::TO_JSON,
+        proto_expr::UnaryExpressionOp::ToJson,
+        false
+    )]
+    #[case::to_json_micros(
+        UnaryExpressionOp::ToJson { full_precision_timestamps: true },
+        proto_expr::UnaryExpressionOp::ToJson,
+        true
+    )]
+    #[case::map_len(
+        UnaryExpressionOp::MapLen,
+        proto_expr::UnaryExpressionOp::MapLen,
+        false
+    )]
+    fn from_unary_expression(
+        #[case] op: UnaryExpressionOp,
+        #[case] expected_op: proto_expr::UnaryExpressionOp,
+        #[case] expected_full_precision_timestamps: bool,
+    ) {
         let proto_expr::expression::Kind::Unary(unary) =
             expr_kind_of(Expression::unary(op, lit(1)))
         else {
             panic!("expected a unary expression");
         };
-        assert_eq!(unary.op, proto_expr::UnaryExpressionOp::ToJson as i32);
+        assert_eq!(unary.op, expected_op as i32);
         assert_eq!(
             unary.to_json_full_precision_timestamps,
-            full_precision_timestamps
+            expected_full_precision_timestamps
         );
-        assert!(unary.expr.is_some());
-    }
-
-    #[test]
-    fn from_map_len_expression() {
-        let proto_expr::expression::Kind::Unary(unary) =
-            expr_kind_of(Expression::column(["m"]).map_len())
-        else {
-            panic!("expected a unary expression");
-        };
-        assert_eq!(unary.op, proto_expr::UnaryExpressionOp::MapLen as i32);
-        assert!(!unary.to_json_full_precision_timestamps);
         assert!(unary.expr.is_some());
     }
 
