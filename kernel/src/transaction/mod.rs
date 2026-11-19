@@ -22,7 +22,7 @@ pub use crate::scan::log_replay::{CLUSTERING_PROVIDER_NAME, TAGS_NAME};
 use crate::schema::void_utils::validate_schema_for_write;
 use crate::schema::{
     ColumnDefault, GeneratedColumn, MapType, SchemaRef, SchemaStructPatchBuilder, StructField,
-    lazy_schema_ref,
+    StructType, lazy_schema_ref,
 };
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
@@ -156,28 +156,32 @@ static ADD_FILE_TAGS_FIELD: LazyLock<StructField> = LazyLock::new(|| {
 static ADD_FILE_CLUSTERING_PROVIDER_FIELD: LazyLock<StructField> =
     LazyLock::new(|| StructField::nullable(CLUSTERING_PROVIDER_NAME, DataType::STRING));
 
-static TAGS_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
-    ..(BASE_ADD_FILES_SCHEMA.fields().cloned()),
-    (&ADD_FILE_TAGS_FIELD),
-};
-static CLUSTERING_PROVIDER_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
-    ..(BASE_ADD_FILES_SCHEMA.fields().cloned()),
-    (&ADD_FILE_CLUSTERING_PROVIDER_FIELD),
-};
-static TAGS_AND_CLUSTERING_PROVIDER_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
-    ..(BASE_ADD_FILES_SCHEMA.fields().cloned()),
-    (&ADD_FILE_TAGS_FIELD),
-    (&ADD_FILE_CLUSTERING_PROVIDER_FIELD),
-};
+/// Every add-files schema, indexed by `[tags][clustering_provider]` (see
+/// [`add_files_schema_with`]).
+static ADD_FILES_SCHEMAS: LazyLock<[[SchemaRef; 2]; 2]> = LazyLock::new(|| {
+    [false, true].map(|tags| {
+        [false, true].map(|clustering_provider| build_add_files_schema(tags, clustering_provider))
+    })
+});
 
 /// The add-files schema with the optional columns present in a batch.
 fn add_files_schema_with(tags: bool, clustering_provider: bool) -> &'static SchemaRef {
-    match (tags, clustering_provider) {
-        (false, false) => &BASE_ADD_FILES_SCHEMA,
-        (true, false) => &TAGS_ADD_FILES_SCHEMA,
-        (false, true) => &CLUSTERING_PROVIDER_ADD_FILES_SCHEMA,
-        (true, true) => &TAGS_AND_CLUSTERING_PROVIDER_ADD_FILES_SCHEMA,
-    }
+    &ADD_FILES_SCHEMAS[usize::from(tags)][usize::from(clustering_provider)]
+}
+
+/// [`BASE_ADD_FILES_SCHEMA`] followed by the selected optional columns, in their documented order.
+fn build_add_files_schema(tags: bool, clustering_provider: bool) -> SchemaRef {
+    let optional = [
+        (tags, &ADD_FILE_TAGS_FIELD),
+        (clustering_provider, &ADD_FILE_CLUSTERING_PROVIDER_FIELD),
+    ];
+    let optional = optional
+        .into_iter()
+        .filter(|(present, _)| *present)
+        .map(|(_, field)| StructField::clone(field));
+    Arc::new(StructType::new_unchecked(
+        BASE_ADD_FILES_SCHEMA.fields().cloned().chain(optional),
+    ))
 }
 
 /// Extend a schema with row tracking columns and return a new SchemaRef.
