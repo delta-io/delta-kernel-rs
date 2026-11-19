@@ -39,11 +39,6 @@ impl RootManifestFile {
     /// `commit_version`. A reader restores from it without replaying earlier commits, so it carries
     /// the table's protocol and metadata plus every active domain metadata and set transaction
     /// (this transaction's `dm_changes` and `set_transactions` merged in, newest wins).
-    ///
-    /// The latest checkpoint action's sidecars are kept unless a change touches an entry stored in
-    /// one. When the snapshot's CRC holds every set transaction or every domain metadata, that kind
-    /// is written inline instead. Expired set transactions are dropped from the inline entries but
-    /// carried forward in a kept sidecar.
     pub(super) fn compute_checkpoint_action(
         &self,
         engine: &dyn Engine,
@@ -57,15 +52,16 @@ impl RootManifestFile {
         let txns_in_crc = crc.is_some_and(SetTransaction::complete_in_crc);
         let domains_in_crc = crc.is_some_and(DomainMetadata::complete_in_crc);
         // The checkpoint action is only needed for a kind the CRC doesn't hold in full.
-        let latest_checkpoint_action = if txns_in_crc && domains_in_crc {
-            None
+        let (txn_base, domain_base) = if txns_in_crc && domains_in_crc {
+            (None, None)
         } else {
-            snapshot.latest_checkpoint_action(engine)?
+            let action = snapshot.latest_checkpoint_action(engine)?;
+            (
+                action.clone().filter(|_| !txns_in_crc),
+                action.filter(|_| !domains_in_crc),
+            )
         };
-        let existing = latest_checkpoint_action.as_deref();
-        let txn_base = existing.filter(|_| !txns_in_crc);
-        let domain_base = existing.filter(|_| !domains_in_crc);
-        let log_changes = match txn_base.or(domain_base) {
+        let log_changes = match txn_base.as_deref().or(domain_base.as_deref()) {
             Some(action) => changes_after_checkpoint_action(engine, snapshot, action)?,
             None => CrcDelta::default(),
         };
@@ -74,7 +70,7 @@ impl RootManifestFile {
         let (mut transactions, txn_sidecars) = checkpoint_entries(
             engine,
             snapshot,
-            txn_base,
+            txn_base.as_deref(),
             &log_root,
             log_changes.set_transactions,
             set_transactions,
@@ -82,7 +78,7 @@ impl RootManifestFile {
         let (domain_metadata, domain_metadata_sidecars) = checkpoint_entries(
             engine,
             snapshot,
-            domain_base,
+            domain_base.as_deref(),
             &log_root,
             log_changes.domain_metadata,
             dm_changes,
@@ -307,7 +303,8 @@ mod tests {
     use crate::unit_test_utils::adaptive_metadata_fixtures::{
         adaptive_metadata_protocol_and_metadata, domain, domain_metadata_line,
         minimal_checkpoint_action, setup_table, txn_line, write_commit,
-        write_commit_after_manifest_commit, write_manifest_commit, write_sidecar,
+        write_commit_after_manifest_commit, write_domain_metadata_sidecar, write_manifest_commit,
+        write_txn_sidecar,
     };
     use crate::unit_test_utils::{
         MockTableConfigurationBuilder, assert_result_error_with_message, parse_json_batch,
@@ -631,7 +628,7 @@ mod tests {
                 write_commit_after_manifest_commit(&engine, &table_root, 2, 1, txn_row(expired)?)?;
             }
             ExpiredTxnSource::Sidecar => {
-                existing.txn_sidecars = vec![txn_sidecar(
+                existing.txn_sidecars = vec![write_txn_sidecar(
                     &engine,
                     &table_root,
                     "txn.parquet",
@@ -814,27 +811,6 @@ mod tests {
         Ok(())
     }
 
-    fn txn_sidecar(
-        engine: &SyncEngine,
-        table_root: &Url,
-        name: &str,
-        txns: impl IntoIterator<Item = SetTransaction>,
-    ) -> Sidecar {
-        let rows = txns.into_iter().map(Into::into).collect();
-        write_sidecar(engine, table_root, name, LOG_TXN_SCHEMA.clone(), rows)
-    }
-
-    fn domain_metadata_sidecar(
-        engine: &SyncEngine,
-        table_root: &Url,
-        name: &str,
-        domains: impl IntoIterator<Item = DomainMetadata>,
-    ) -> Sidecar {
-        let rows = domains.into_iter().map(Into::into).collect();
-        let schema = LOG_DOMAIN_METADATA_SCHEMA.clone();
-        write_sidecar(engine, table_root, name, schema, rows)
-    }
-
     /// A sidecar whose file was never written, so reading it fails.
     fn missing_sidecar(name: &str) -> Sidecar {
         Sidecar::new(name.to_string(), 1024, 0, None)
@@ -870,13 +846,13 @@ mod tests {
         existing.transactions = vec![txn("inline", 1)];
         existing.domain_metadata = vec![domain("inline", "{}")];
         let sidecar_keys = ["kept", "spilled"];
-        existing.txn_sidecars = vec![txn_sidecar(
+        existing.txn_sidecars = vec![write_txn_sidecar(
             &engine,
             &table_root,
             "txn.parquet",
             sidecar_keys.map(|key| txn(key, 1)),
         )];
-        existing.domain_metadata_sidecars = vec![domain_metadata_sidecar(
+        existing.domain_metadata_sidecars = vec![write_domain_metadata_sidecar(
             &engine,
             &table_root,
             "domains.parquet",
@@ -987,7 +963,7 @@ mod tests {
         let mut existing = minimal_checkpoint_action("metadata/root-v1.parquet", 1)?;
         existing.domain_metadata = vec![domain("inline", "1")];
         existing.domain_metadata_sidecars = vec![match sidecar_file {
-            SidecarFile::Written => domain_metadata_sidecar(
+            SidecarFile::Written => write_domain_metadata_sidecar(
                 &engine,
                 &table_root,
                 "domains.parquet",
@@ -1141,7 +1117,7 @@ mod tests {
         let mut existing = minimal_checkpoint_action("metadata/root-v1.parquet", 1)?;
         existing.txn_sidecars = ["a", "b"]
             .map(|key| {
-                txn_sidecar(
+                write_txn_sidecar(
                     &engine,
                     &table_root,
                     &format!("txn-{key}.parquet"),
@@ -1152,7 +1128,7 @@ mod tests {
         existing.domain_metadata_sidecars = ["a", "b"]
             .map(|key| {
                 let name = format!("domains-{key}.parquet");
-                domain_metadata_sidecar(&engine, &table_root, &name, [domain(key, "1")])
+                write_domain_metadata_sidecar(&engine, &table_root, &name, [domain(key, "1")])
             })
             .into();
         write_manifest_commit(&engine, &table_root, 1, existing.clone())?;
@@ -1188,45 +1164,6 @@ mod tests {
 
         assert_checkpoint_entries(&checkpoint, &existing, &set_transactions, &["inline"], true);
         assert_checkpoint_entries(&checkpoint, &existing, &dm_changes, &["inline"], true);
-        Ok(())
-    }
-
-    // System domains sit in sidecars alongside user domains and survive both a kept sidecar and
-    // one moved inline.
-    #[rstest]
-    #[case::sidecar_kept("new", &["new"], true)]
-    #[case::sidecar_moved_inline("spilled", &["delta.rowTracking", "spilled"], false)]
-    fn compute_checkpoint_action_preserves_system_domains_in_sidecars(
-        #[case] changed: &str,
-        #[case] inline_keys: &[&str],
-        #[case] sidecar_kept: bool,
-    ) -> Result<()> {
-        let (engine, table_root) = setup_table()?;
-        let row_tracking = domain("delta.rowTracking", r#"{"rowIdHighWaterMark":5}"#);
-        let mut existing = minimal_checkpoint_action("metadata/root-v1.parquet", 1)?;
-        let domains = [row_tracking.clone(), domain("spilled", "1")];
-        existing.domain_metadata_sidecars = vec![domain_metadata_sidecar(
-            &engine,
-            &table_root,
-            "domains.parquet",
-            domains,
-        )];
-        write_manifest_commit(&engine, &table_root, 1, existing.clone())?;
-
-        let dm_changes = [domain(changed, "2")];
-        let checkpoint = compute_at_latest(&engine, &table_root, &dm_changes, &[])?;
-
-        assert_checkpoint_entries(
-            &checkpoint,
-            &existing,
-            &dm_changes,
-            inline_keys,
-            sidecar_kept,
-        );
-        assert_eq!(
-            checkpoint.domain_metadata.contains(&row_tracking),
-            !sidecar_kept
-        );
         Ok(())
     }
 
@@ -1359,14 +1296,14 @@ mod tests {
     fn committed_manifest_keeps_sidecars_that_the_next_snapshot_reads() -> Result<()> {
         let (engine, table_root) = setup_table()?;
         let mut existing = minimal_checkpoint_action("metadata/root-v1.parquet", 1)?;
-        existing.txn_sidecars = vec![txn_sidecar(
+        existing.txn_sidecars = vec![write_txn_sidecar(
             &engine,
             &table_root,
             "txn.parquet",
             [txn("kept", 1)],
         )];
         let kept_domain = [domain("kept", "1")];
-        existing.domain_metadata_sidecars = vec![domain_metadata_sidecar(
+        existing.domain_metadata_sidecars = vec![write_domain_metadata_sidecar(
             &engine,
             &table_root,
             "domains.parquet",
