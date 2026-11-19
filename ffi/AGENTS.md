@@ -804,7 +804,8 @@ FFI-specific ownership, conversion, and engine support code can use its own modu
 ## Read Flow
 
 ```
-get_default_engine() -> get_snapshot_builder() -> snapshot_builder_build() -> scan() -> scan_metadata() -> read + transform
+get_default_engine() -> get_snapshot_builder() -> snapshot_builder_build() -> scan()
+  -> scan_metadata_iter_init() -> scan_metadata_next() -> read + transform
 ```
 
 Snapshot builder API (`ffi/src/snapshot/builder.rs` and `ffi/src/snapshot/hint/mod.rs`):
@@ -873,9 +874,9 @@ Domain-metadata reads live in `ffi/src/domain_metadata.rs`: `get_domain_metadata
 `visit_domain_metadata` for user domains, and `visit_clustering_columns`, which reports one
 descriptor per clustering column -- logical name, physical name (what per-file stats are keyed on),
 and a type tag -- without exposing the guarded `delta.*` domain JSON directly. It returns
-`OptionalValue<usize>`: `None` means not clustered, `Some(0)` means clustered on no columns. The
-type tag reuses the `visit_expression_literal_null` encoding, with 255 for types that don't fit a
-compact tag (struct, array, map, variant, void, and geometry/geography).
+`ExternResult<OptionalValue<usize>>`: `None` means not clustered, `Some(0)` means clustered on no
+columns. The type tag reuses the `visit_expression_literal_null` encoding, with 255 for types that
+don't fit a compact tag (struct, array, map, variant, void, and geometry/geography).
 
 ## Commit Range Flow
 
@@ -1069,16 +1070,7 @@ cargo build -p delta_kernel_ffi --release
 # Headers written to target/ffi-headers/
 ```
 
-Feature flags:
-- `default-engine-rustls` (default)
-- `default-engine-native-tls`
-- `arrow` (default; currently maps to `arrow-60`)
-- `arrow-60`, `arrow-59`
-- `delta-kernel-unity-catalog`
-- `tracing`
-- `alloc-tracking` -- installs `peak_alloc` as the tracking global allocator; enables meaningful
-  `*_native_bytes` / `alloc_tracking_enabled` getters (cdylib only; conflicts with
-  another `#[global_allocator]` if linked as an rlib)
+Feature flags are defined in `ffi/Cargo.toml`.
 
 ## Testing under Miri
 

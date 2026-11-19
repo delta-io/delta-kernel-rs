@@ -168,6 +168,33 @@ use crate::schema::{
 #[cfg(feature = "geo-type-in-dev")]
 use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType, PrimitiveType};
 
+/// Serializes actions in order as newline-delimited JSON without a trailing newline.
+///
+/// An empty iterator produces an empty string. Serialization failures panic as invalid test setup.
+pub(crate) fn serialize_actions(actions: impl IntoIterator<Item = Action>) -> String {
+    actions
+        .into_iter()
+        .map(|action| serde_json::to_string(&action).expect("serialize test log action"))
+        .join("\n")
+}
+
+/// Builds unpartitioned Parquet metadata with the supplied table ID, schema, and creation time.
+///
+/// Leaves the name and description absent, and the format options and configuration empty.
+pub(crate) fn metadata_action(id: &str, schema: &StructType, created_time: i64) -> Action {
+    Action::Metadata(Metadata::from_parts(
+        id.into(),
+        None,
+        None,
+        "parquet".into(),
+        HashMap::new(),
+        serde_json::to_string(schema).expect("serialize test metadata schema"),
+        vec![],
+        Some(created_time),
+        HashMap::new(),
+    ))
+}
+
 /// Create a simple Add action with the specified path (no stats)
 pub(crate) fn create_add_action(path: &str) -> Action {
     Action::Add(Add {
@@ -210,10 +237,7 @@ impl LocalMockTable {
     }
     /// Writes all `actions` to a new commit in the log
     pub(crate) async fn commit(&mut self, actions: impl IntoIterator<Item = Action>) {
-        let data = actions
-            .into_iter()
-            .map(|action| serde_json::to_string(&action).unwrap())
-            .join("\n");
+        let data = serialize_actions(actions);
 
         let path = delta_path_for_version(self.commit_num, "json");
         self.commit_num += 1;
