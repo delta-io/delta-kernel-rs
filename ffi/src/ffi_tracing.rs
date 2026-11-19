@@ -25,6 +25,7 @@ use delta_kernel::{KernelError, KernelResult};
 use tracing::field::{Field as TracingField, Visit};
 use tracing::{Event as TracingEvent, Subscriber, error};
 use tracing_core::Dispatch;
+use tracing_core::span::{Attributes, Id, Record};
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::{Context, Identity, SubscriberExt};
@@ -91,7 +92,9 @@ impl From<Level> for LevelFilter {
 /// that an engine can generate a log message in its format
 #[repr(C)]
 pub struct Event {
-    /// The log message associated with the event
+    /// The log message with `name=value` fields from enabled enclosing spans and the event.
+    /// Event fields override span fields with the same name. Messages exceeding 16 KiB are
+    /// truncated at a UTF-8 boundary with a ` [truncated]` suffix, included in that limit.
     message: KernelStringSlice,
     /// Level that the event was emitted at
     level: Level,
@@ -255,21 +258,70 @@ fn set_global_default(dispatch: tracing_core::Dispatch) -> KernelResult<()> {
     })
 }
 
+#[derive(Default)]
 struct MessageFieldVisitor {
     message: Option<String>,
+    parts: Vec<String>,
+}
+
+impl MessageFieldVisitor {
+    fn record_value(&mut self, name: &str, value: String) {
+        if name == "enable_call_frame" || name == "report" {
+            return;
+        }
+        if name == "message" {
+            self.message = Some(value);
+        } else {
+            let prefix = format!("{name}=");
+            self.parts.retain(|part| !part.starts_with(&prefix));
+            self.parts.push(format!("{prefix}{value}"));
+        }
+    }
+
+    fn extend(&mut self, fields: &Self) {
+        if let Some(message) = &fields.message {
+            self.message = Some(message.clone());
+        }
+        for part in &fields.parts {
+            if let Some((name, value)) = part.split_once('=') {
+                self.record_value(name, value.to_owned());
+            }
+        }
+    }
+
+    fn into_message(self) -> String {
+        let mut parts = Vec::with_capacity(self.parts.len() + 1);
+        if let Some(message) = self.message {
+            parts.push(message);
+        }
+        parts.extend(self.parts);
+        let mut message = parts.join(" ");
+        const MAX_MESSAGE_BYTES: usize = 16 * 1024;
+        const TRUNCATION_SUFFIX: &str = " [truncated]";
+        if message.len() > MAX_MESSAGE_BYTES {
+            let mut end = MAX_MESSAGE_BYTES - TRUNCATION_SUFFIX.len();
+            while !message.is_char_boundary(end) {
+                end -= 1;
+            }
+            message.truncate(end);
+            message.push_str(TRUNCATION_SUFFIX);
+        }
+        message
+    }
 }
 
 impl Visit for MessageFieldVisitor {
     fn record_debug(&mut self, field: &TracingField, value: &dyn fmt::Debug) {
-        if field.name() == "message" {
-            self.message = Some(format!("{value:?}"));
-        }
+        self.record_value(field.name(), format!("{value:?}"));
     }
 
     fn record_str(&mut self, field: &TracingField, value: &str) {
-        if field.name() == "message" {
-            self.message = Some(value.to_string());
-        }
+        let value = if field.name() == "message" {
+            value.to_owned()
+        } else {
+            format!("{value:?}")
+        };
+        self.record_value(field.name(), value);
     }
 }
 
@@ -281,16 +333,42 @@ impl<S> Layer<S> for EventLayer
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
-    fn on_event(&self, event: &TracingEvent<'_>, _context: Context<'_, S>) {
+    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, context: Context<'_, S>) {
+        let mut fields = MessageFieldVisitor::default();
+        attrs.record(&mut fields);
+        if let Some(span) = context.span(id) {
+            span.extensions_mut().insert(fields);
+        }
+    }
+
+    fn on_record(&self, id: &Id, values: &Record<'_>, context: Context<'_, S>) {
+        let mut fields = MessageFieldVisitor::default();
+        values.record(&mut fields);
+        if let Some(span) = context.span(id) {
+            let mut extensions = span.extensions_mut();
+            if let Some(existing) = extensions.get_mut::<MessageFieldVisitor>() {
+                existing.extend(&fields);
+            }
+        }
+    }
+
+    fn on_event(&self, event: &TracingEvent<'_>, context: Context<'_, S>) {
         // it would be tempting to `impl TryFrom` to convert the `TracingEvent` into an `Event`, but
         // we want to use a KernelStringSlice, so we need the extracted string to live long enough
         // for the callback which won't happen if we convert inside a `try_from` call
         let metadata = event.metadata();
         let target = metadata.target();
-        let mut message_visitor = MessageFieldVisitor { message: None };
+        let mut message_visitor = MessageFieldVisitor::default();
+        if let Some(scope) = context.event_scope(event) {
+            for span in scope.from_root() {
+                if let Some(fields) = span.extensions().get::<MessageFieldVisitor>() {
+                    message_visitor.extend(fields);
+                }
+            }
+        }
         event.record(&mut message_visitor);
-        if let Some(message) = message_visitor.message {
-            // we ignore events without a message
+        let message = message_visitor.into_message();
+        if !message.is_empty() {
             let file = metadata.file().unwrap_or("");
             let event = Event {
                 message: kernel_string_slice!(message),
@@ -723,6 +801,16 @@ pub unsafe extern "C" fn enable_frame_reporting(callback: FrameEventFn) -> bool 
 mod tests {
     use std::cell::RefCell;
 
+    #[cfg(feature = "declarative-plans")]
+    use delta_kernel::Snapshot;
+    #[cfg(feature = "declarative-plans")]
+    use delta_kernel::engine::DelegatingEngine;
+    #[cfg(feature = "declarative-plans")]
+    use delta_kernel::engine::sync::SyncEngine;
+    #[cfg(feature = "declarative-plans")]
+    use delta_kernel::expressions::Predicate;
+    #[cfg(feature = "declarative-plans")]
+    use rstest::rstest;
     use tracing::field::Empty;
     use tracing::{debug, info, trace};
     use tracing_subscriber::fmt::time::FormatTime;
@@ -1027,6 +1115,213 @@ mod tests {
 
     extern "C" fn event_callback_with_filter_2(event: Event) {
         event_callback_with_filter(event, vec!["Testing 2", "Yet another line"])
+    }
+
+    extern "C" fn capture_event(event: Event) {
+        let message: &str = unsafe { TryFromStringSlice::try_from_slice(&event.message).unwrap() };
+        EVENTS_OK.with(|events| {
+            if let Some(events) = events.borrow_mut().as_mut() {
+                events.push((message.to_owned(), convert_level(event.level)));
+            }
+        });
+    }
+
+    #[test]
+    fn event_fields_and_error_only_events_reach_callback() {
+        setup_events();
+        let dispatch = create_event_dispatch(capture_event, Level::INFO);
+        tracing_core::dispatcher::with_default(&dispatch, || {
+            let error = KernelError::generic_with_source(
+                "Reading manifest",
+                KernelError::file_not_found("checkpoint.json"),
+            );
+            info!(
+                rows = 42u64,
+                pruned = true,
+                table = "memory:///table/",
+                "Scan planned"
+            );
+            error!(%error);
+            info!(rows = 0u64);
+        });
+        with_events(|events| {
+            let events = events.unwrap();
+            assert_eq!(events.len(), 3);
+            assert_eq!(
+                events[0],
+                (
+                    "Scan planned rows=42 pruned=true table=\"memory:///table/\"".to_owned(),
+                    tracing::Level::INFO,
+                )
+            );
+            assert_eq!(events[1].1, tracing::Level::ERROR);
+            assert!(
+                events[1].0.starts_with("error=Reading manifest:"),
+                "{:?}",
+                events[1]
+            );
+            assert!(events[1].0.contains("checkpoint.json"));
+            assert_eq!(events[2].0, "rows=0");
+        });
+    }
+
+    #[test]
+    fn instrumented_error_reaches_error_only_callback() {
+        #[tracing::instrument(err)]
+        fn failing_operation() -> KernelResult<()> {
+            Err(KernelError::generic("injected failure"))
+        }
+
+        setup_events();
+        let dispatch = create_event_dispatch(capture_event, Level::ERROR);
+        tracing_core::dispatcher::with_default(&dispatch, || {
+            assert!(failing_operation().is_err());
+        });
+        with_events(|events| {
+            let events = events.unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].1, tracing::Level::ERROR);
+            assert!(events[0].0.contains("error="));
+            assert!(events[0].0.contains("injected failure"));
+        });
+    }
+
+    #[test]
+    fn event_fields_override_updated_span_fields() {
+        setup_events();
+        let dispatch = create_event_dispatch(capture_event, Level::INFO);
+        tracing_core::dispatcher::with_default(&dispatch, || {
+            let parent = tracing::info_span!("request", request_id = "request-1", version = 1u64);
+            let _parent = parent.enter();
+            let span = tracing::info_span!(
+                "scan",
+                version = 2u64,
+                rows = Empty,
+                enable_call_frame = true,
+                report = true,
+            );
+            span.record("rows", 5u64);
+            span.record("version", 3u64);
+            let _span = span.enter();
+            info!("Inherited fields");
+            info!(version = 4u64, "Event fields");
+        });
+        with_events(|events| {
+            let events = events.unwrap();
+            assert_eq!(events.len(), 2);
+            assert_eq!(
+                events[0].0,
+                "Inherited fields request_id=\"request-1\" rows=5 version=3"
+            );
+            assert_eq!(
+                events[1].0,
+                "Event fields request_id=\"request-1\" rows=5 version=4"
+            );
+        });
+    }
+
+    #[test]
+    fn event_messages_are_truncated_at_utf8_boundary() {
+        setup_events();
+        let dispatch = create_event_dispatch(capture_event, Level::INFO);
+        tracing_core::dispatcher::with_default(&dispatch, || {
+            info!("{}", "\u{20ac}".repeat(6000));
+        });
+        with_events(|events| {
+            let events = events.unwrap();
+            assert_eq!(events.len(), 1);
+            let message = &events[0].0;
+            assert!(message.len() <= 16 * 1024);
+            let content = message.strip_suffix(" [truncated]").unwrap();
+            assert!(content.chars().all(|c| c == '\u{20ac}'));
+            assert!(content.len() > 16 * 1024 - 16);
+        });
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    #[rstest]
+    #[cfg_attr(
+        miri,
+        ignore = "callback covered by event_fields_and_error_only_events_reach_callback; \
+                  scan planning only adds safe work"
+    )]
+    #[case::failure(Level::ERROR, false)]
+    #[case::success(Level::INFO, false)]
+    #[case::statically_empty(Level::INFO, true)]
+    fn metadata_scan_reports_context_at_production_log_levels(
+        #[case] level: Level,
+        #[case] statically_empty: bool,
+    ) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../kernel/tests/data/with_checkpoint_no_last_checkpoint")
+            .canonicalize()
+            .unwrap();
+        let table = url::Url::from_directory_path(path).unwrap();
+        let engine = Arc::new(SyncEngine::new());
+        let snapshot = Snapshot::builder_for(&table)
+            .build(engine.as_ref())
+            .unwrap();
+        let version = snapshot.version();
+        let scan = snapshot
+            .scan_builder()
+            .with_correlation_id("request-123")
+            .with_predicate(statically_empty.then(|| Arc::new(Predicate::FALSE)))
+            .build()
+            .unwrap();
+        let engine = if level == Level::ERROR {
+            DelegatingEngine::new(engine).without_plan_executor()
+        } else {
+            DelegatingEngine::new(engine)
+        };
+        setup_events();
+        let dispatch = create_event_dispatch(capture_event, level);
+        let result = tracing_core::dispatcher::with_default(&dispatch, || {
+            scan.declarative_metadata_scan_plan(&engine)
+        });
+        with_events(|events| {
+            let events = events.unwrap();
+            if level == Level::ERROR {
+                let error = result.unwrap_err().to_string();
+                assert_eq!(events.len(), 1, "{events:?}");
+                assert_eq!(events[0].1, tracing::Level::ERROR);
+                assert!(events[0].0.contains("Metadata scan planning failed"));
+                assert!(events[0].0.contains(&error), "{events:?}");
+            } else {
+                assert_eq!(result.unwrap().is_none(), statically_empty);
+                assert!(
+                    events
+                        .iter()
+                        .all(|(_, level)| *level == tracing::Level::INFO)
+                );
+                let summaries: Vec<_> = events
+                    .iter()
+                    .filter(|(message, _)| message.starts_with("Metadata scan planned"))
+                    .collect();
+                assert_eq!(summaries.len(), 1, "{events:?}");
+                let message = &summaries[0].0;
+                if statically_empty {
+                    assert!(message.contains("statically_empty=true"), "{message}");
+                } else {
+                    assert!(message.contains("replay_base=\"checkpoint\""), "{message}");
+                    assert!(message.contains("plan_nodes="), "{message}");
+                }
+            }
+            let message = events
+                .iter()
+                .find(|(message, _)| message.starts_with("Metadata scan plan"))
+                .unwrap()
+                .0
+                .as_str();
+            assert!(message.contains(table.as_str()), "{message}");
+            assert!(
+                message.contains(&format!("snapshot_version={version}")),
+                "{message}"
+            );
+            assert!(
+                message.contains("correlation_id=\"request-123\""),
+                "{message}"
+            );
+        });
     }
 
     fn check_events(expected_level: tracing::Level, expected_messages: Vec<&str>) {

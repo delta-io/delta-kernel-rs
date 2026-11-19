@@ -1475,8 +1475,7 @@ impl Scan {
     #[tracing::instrument(
         name = "scan.declarative_metadata_scan_plan",
         skip_all,
-        fields(report, enable_call_frame),
-        err
+        fields(report, enable_call_frame)
     )]
     pub fn declarative_metadata_scan_plan(
         &self,
@@ -1487,7 +1486,28 @@ impl Scan {
             event.stats = self.stats.clone();
             event.partition_values = self.partition_values_options.clone();
         });
-        let result = self.declarative_metadata_scan_plan_inner(engine);
+        let result = self.declarative_metadata_scan_plan_inner(engine)
+            .map_err(|error| {
+                if matches!(error.without_backtrace(), KernelError::Cancelled) {
+                    return error;
+                }
+                let error = KernelError::generic_with_source(
+                    format!(
+                        "Failed to plan metadata scan for table '{}' at snapshot {}",
+                        self.table_root(),
+                        self.snapshot.version(),
+                    ),
+                    error,
+                );
+                tracing::error!(
+                    %error,
+                    table = %self.table_root(),
+                    snapshot_version = self.snapshot.version(),
+                    correlation_id = self.correlation_id.as_deref().unwrap_or(""),
+                    "Metadata scan planning failed"
+                );
+                error
+            });
         crate::metrics::ScanPlanGenerationCompleted::update(|event| {
             event.outcome = match &result {
                 Ok(Some(_)) => crate::metrics::ScanPlanOutcome::Plan,
@@ -1520,12 +1540,54 @@ impl Scan {
 
         // A statically-unsatisfiable predicate (e.g. `x > 10 AND FALSE`) skips the whole table.
         if self.state_info.physical_predicate == PhysicalPredicate::StaticSkipAll {
+            info!(
+                table = %self.table_root(),
+                snapshot_version = self.snapshot.version(),
+                correlation_id = self.correlation_id.as_deref().unwrap_or(""),
+                statically_empty = true,
+                "Metadata scan planned"
+            );
             return Ok(None);
         }
 
-        let planner = scan_plan::MetadataPlanner::try_from_scan(self)?;
-        let base = scan_plan::MetadataReplayBase::try_new(&self.snapshot, engine)?;
-        self.build_metadata_scan_plan_with(base, planner)
+        let planner = scan_plan::MetadataPlanner::try_from_scan(self).map_err(|error| {
+            KernelError::generic_with_source("Configuring metadata projection and pruning", error)
+        })?;
+        let base =
+            scan_plan::MetadataReplayBase::try_new(&self.snapshot, engine).map_err(|error| {
+                if matches!(error.without_backtrace(), KernelError::Cancelled) {
+                    return error;
+                }
+                KernelError::generic_with_source("Resolving metadata replay base", error)
+            })?;
+        let (replay_base, base_version, sidecar_files) = match &base {
+            scan_plan::MetadataReplayBase::Crc { version, .. } => ("crc", Some(*version), 0),
+            scan_plan::MetadataReplayBase::Checkpoint { version, info } => (
+                if version.is_some() {
+                    "checkpoint"
+                } else {
+                    "none"
+                },
+                *version,
+                info.as_ref().map_or(0, |info| info.sidecars.len()),
+            ),
+        };
+        let metadata_pruning = planner.stats_filter.is_some();
+        let result = self.build_metadata_scan_plan_with(base, planner);
+        if let Ok(plan) = &result {
+            info!(
+                table = %self.table_root(),
+                snapshot_version = self.snapshot.version(),
+                correlation_id = self.correlation_id.as_deref().unwrap_or(""),
+                replay_base,
+                base_version = ?base_version,
+                sidecar_files,
+                metadata_pruning,
+                plan_nodes = plan.as_ref().map_or(0, |plan| plan.nodes.len()),
+                "Metadata scan planned"
+            );
+        }
+        result
     }
 
     #[cfg(feature = "declarative-plans")]

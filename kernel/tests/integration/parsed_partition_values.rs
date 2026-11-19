@@ -735,14 +735,20 @@ fn different_scans_require_timezone_support_only_for_timestamp_partitions(
         .unwrap();
 
     #[cfg(feature = "declarative-plans")]
-    assert_result_error_with_message(
-        scan.declarative_metadata_scan_plan(engine.as_ref()),
-        if timestamp_partitioned {
-            "with_timestamp_timezone in declarative_metadata_scan_plan"
-        } else {
-            "this engine does not provide a PlanExecutor"
-        },
-    );
+    {
+        let result = scan.declarative_metadata_scan_plan(engine.as_ref());
+        let message = result.as_ref().unwrap_err().to_string();
+        assert!(message.contains(table.table_root()), "{message}");
+        assert!(message.contains("snapshot 1"), "{message}");
+        assert_result_error_with_message(
+            result,
+            if timestamp_partitioned {
+                "with_timestamp_timezone in declarative_metadata_scan_plan"
+            } else {
+                "this engine does not provide a PlanExecutor"
+            },
+        );
+    }
     let parallel_result = scan.parallel_scan_metadata(engine.clone());
     let execute_result = scan.execute(engine);
     if timestamp_partitioned {

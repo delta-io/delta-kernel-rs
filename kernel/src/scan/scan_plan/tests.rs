@@ -1,3 +1,4 @@
+use std::error::Error as _;
 use std::sync::Arc;
 
 use ::test_utils::table_builder::{
@@ -1447,7 +1448,23 @@ fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> Resu
         .declarative_metadata_scan_plan(&no_plan_engine)
         .unwrap_err();
 
-    assert!(matches!(err, KernelError::Unsupported(_)));
+    let message = err.to_string();
+    assert!(message.contains(table.table_root()), "{message}");
+    assert!(message.contains("snapshot 4"), "{message}");
+    assert!(
+        message.contains("Resolving metadata replay base"),
+        "{message}"
+    );
+    let cause = err
+        .source()
+        .unwrap()
+        .downcast_ref::<KernelError>()
+        .unwrap()
+        .source()
+        .unwrap()
+        .downcast_ref::<KernelError>()
+        .unwrap();
+    assert!(matches!(cause, KernelError::Unsupported(_)));
 
     let scan = snapshot
         .scan_builder()
