@@ -116,36 +116,13 @@ pub(super) fn select_read_append_versions(
                     .operation
                     .as_deref()
                     .is_some_and(is_row_tracking_backfill_operation);
-                let counts_blind_append = isolation_level != IsolationLevel::WriteSerializable
-                    || facts.changes_metadata
-                    || summary.is_blind_append != Some(true);
-                !is_backfill && counts_blind_append
+                let skipped_as_blind_append = isolation_level == IsolationLevel::WriteSerializable
+                    && !facts.changes_metadata
+                    && summary.is_blind_append == Some(true);
+                !is_backfill && !skipped_as_blind_append
             })
             .map(|summary| summary.version),
     )
-}
-
-/// Returns the isolation level that the `read_append` check uses.
-///
-/// T drops to SnapshotIsolation when no file action has `dataChange=true` and T writes no action
-/// other than file actions, `delta.rowTracking` domain metadata and `commitInfo`. Under
-/// WriteSerializable, T's operation must also change no data.
-fn effective_isolation_level(facts: &LoserFacts) -> IsolationLevel {
-    let blocks_downgrade = facts.has_other_actions
-        || facts.changes_metadata
-        || facts.written_domains_except_row_tracking().next().is_some();
-    let can_downgrade = !facts.has_data_change
-        && !blocks_downgrade
-        && match facts.isolation_level {
-            IsolationLevel::Serializable => true,
-            IsolationLevel::WriteSerializable => !facts.operation_changes_data,
-            IsolationLevel::SnapshotIsolation => false,
-        };
-    if can_downgrade {
-        IsolationLevel::SnapshotIsolation
-    } else {
-        facts.isolation_level
-    }
 }
 
 /// Reads the OCC plan output.
@@ -181,7 +158,7 @@ pub(super) fn ensure_winner_rows(
     let versions = winner_versions(winners);
     if let Some(missing) = versions.iter().find(|version| !rows.contains(version)) {
         return Err(KernelError::generic(format!(
-            "The winner check plan read no action from the commit file of version {missing}"
+            "Conflict detection read no action from the commit file of version {missing}"
         )));
     }
     if rows != versions {
@@ -288,11 +265,11 @@ impl RowVisitor for WinnerSummaryVisitor {
             ),
         ];
         for row in 0..row_count {
-            let mut first_violation = None;
+            let mut violated_rules = Vec::new();
             for (rule, getter, name) in &rules {
                 let violated: bool = getter.get(row, name)?;
-                if violated && first_violation.is_none() {
-                    first_violation = Some(*rule);
+                if violated {
+                    violated_rules.push(*rule);
                 }
             }
             self.0.push(WinnerSummary {
@@ -305,7 +282,7 @@ impl RowVisitor for WinnerSummaryVisitor {
                     .get_opt(row, ROW_ID_HIGH_WATER_MARK)?,
                 writes_row_tracking: writes_row_tracking.get(row, WRITES_ROW_TRACKING)?,
                 removes_row_tracking: removes_row_tracking.get(row, REMOVES_ROW_TRACKING)?,
-                first_violation,
+                first_violation: violated_rules.into_iter().min(),
             });
         }
         Ok(())
@@ -340,6 +317,29 @@ impl RowVisitor for OccViolationVisitor {
             });
         }
         Ok(())
+    }
+}
+
+/// Returns the isolation level that the `read_append` check uses.
+///
+/// T drops to SnapshotIsolation when no file action has `dataChange=true` and T writes no action
+/// other than file actions, `delta.rowTracking` domain metadata and `commitInfo`. Under
+/// WriteSerializable, T's operation must also change no data.
+fn effective_isolation_level(facts: &LoserFacts) -> IsolationLevel {
+    let blocks_downgrade = facts.has_other_actions
+        || facts.changes_metadata
+        || facts.written_domains_except_row_tracking().next().is_some();
+    let can_downgrade = !facts.has_data_change
+        && !blocks_downgrade
+        && match facts.isolation_level {
+            IsolationLevel::Serializable => true,
+            IsolationLevel::WriteSerializable => !facts.operation_changes_data,
+            IsolationLevel::SnapshotIsolation => false,
+        };
+    if can_downgrade {
+        IsolationLevel::SnapshotIsolation
+    } else {
+        facts.isolation_level
     }
 }
 

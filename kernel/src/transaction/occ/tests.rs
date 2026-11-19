@@ -508,6 +508,11 @@ fn assert_error<T>(result: KernelResult<T>, kind: ErrorKind, message: &str) {
     |_: &mut LoserFacts| {},
     conflict(7, Some("WRITE"), winner(WinnerRule::ProtocolChanged)),
 )]
+#[case::metadata_reported_before_txn_listed_first(
+    vec![txn("app-a"), metadata()],
+    |facts: &mut LoserFacts| facts.read_app_ids = vec!["app-a".into()],
+    conflict(7, Some("WRITE"), winner(WinnerRule::MetadataChanged)),
+)]
 #[case::domain_conflict_reported_before_txn_conflict(
     vec![domain("app.x", "{}"), txn("app-a")],
     |facts: &mut LoserFacts| {
@@ -555,16 +560,6 @@ fn identity_only_metadata_winner(
         &[(7, winner_actions)],
     );
     assert_eq!(result, expected);
-}
-
-#[test]
-fn metadata_without_canonical_required_fields_still_fails_metadata_changed() {
-    // `Metadata` can't leave out its required fields, so the test writes the JSON.
-    let commits = [(7, vec![json!({"metaData": {"id": "test-table"}})])];
-    assert_eq!(
-        detect_delete(&commits),
-        conflict(7, None, winner(WinnerRule::MetadataChanged))
-    );
 }
 
 #[rstest]
@@ -618,23 +613,32 @@ fn winner_remove_conflicts_whatever_its_data_change(
     #[case] read: &[&str],
     #[case] check: OccCheck,
     #[values(true, false)] data_change: bool,
+    #[values(true, false)] rewrites_files: bool,
 ) {
     let winner_actions = vec![commit_info("OPTIMIZE"), remove(DELETED_FILE, data_change)];
-    let result = detect_delete_with_files(|_| {}, removed, read, &[(7, winner_actions)]);
+    let result = detect_delete_with_files(
+        |facts| facts.rewrites_files = rewrites_files,
+        removed,
+        read,
+        &[(7, winner_actions)],
+    );
     assert_eq!(result, conflict(7, Some("OPTIMIZE"), occ(check)));
 }
 
-#[test]
-fn winner_without_commit_info_gets_file_checks() {
-    let commits = [(7, vec![remove(DELETED_FILE, true)])];
+#[rstest]
+#[case::remove_gets_file_checks(remove(DELETED_FILE, true), occ(OccCheck::ReadDelete))]
+// `Metadata` can't leave out its required fields, so the case writes the JSON.
+#[case::metadata_without_required_fields_fails_metadata_changed(
+    json!({"metaData": {"id": "test-table"}}),
+    winner(WinnerRule::MetadataChanged),
+)]
+fn winner_without_commit_info(#[case] action: Value, #[case] kind: ConflictKind) {
+    let commits = [(7, vec![action])];
     let summaries = winner_summaries(&commits);
     let summary = only_summary(&summaries);
     assert_eq!((summary.version, summary.operation.as_deref()), (7, None));
     assert_eq!(summary.is_blind_append, None);
-    assert_eq!(
-        detect_delete(&commits),
-        conflict(7, None, occ(OccCheck::ReadDelete))
-    );
+    assert_eq!(detect_delete(&commits), conflict(7, None, kind));
 }
 
 #[test]
@@ -816,7 +820,7 @@ fn detect_conflicts_without_winners_has_no_conflict() {
 #[rstest]
 #[case::add_in_read_partition(add("f7", DELETED_DATE))]
 #[case::remove_of_any_file(remove(DELETED_FILE, true))]
-fn loser_that_read_nothing_passes_without_occ_plan(#[case] action: Value) {
+fn loser_that_read_nothing_passes(#[case] action: Value) {
     let table = TestTable::new(&[(7, vec![commit_info("WRITE"), action])]);
     let relations = LoserRelations::new(&[], &[]);
     let mut facts = deleted_date_facts(&relations.read_files);
@@ -824,7 +828,7 @@ fn loser_that_read_nothing_passes_without_occ_plan(#[case] action: Value) {
     facts.rewrites_files = false;
     let detection = relations.detect(&facts, &table.winners(READ_VERSION));
     assert_eq!(outcome(detection), None);
-    assert_eq!(relations.plan_runs(), 1);
+    assert_eq!(relations.plan_runs(), 2);
 }
 
 // === Winner rows ===
@@ -915,7 +919,7 @@ fn row_tracking_mark_comes_only_from_live_row_tracking_domain(#[case] configurat
 #[case::commit_without_actions(
     vec![(7, vec![])],
     ErrorKind::Generic,
-    "The winner check plan read no action from the commit file of version 7",
+    "Conflict detection read no action from the commit file of version 7",
 )]
 fn winner_that_kernel_cannot_check_fails_detection(
     #[case] commits: Vec<(Version, Vec<Value>)>,

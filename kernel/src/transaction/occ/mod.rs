@@ -3,8 +3,8 @@
 //! T is the losing transaction. The winners are the commits after T's read version. Kernel checks
 //! T against the winners with declarative plans:
 //!
-//! 1. The winner check plan ([`winner_check_plan()`]) returns one row for each winner. Each row
-//!    holds the winner's commit facts and one flag for each winner rule.
+//! 1. The winner check plan ([`winner_check_plan()`]) returns one row for each winner that has an
+//!    action. Each row holds the winner's commit facts and one flag for each winner rule.
 //! 2. If no winner breaks a winner rule, the OCC plan ([`occ_plan()`]) checks the winners' file
 //!    actions. It returns one row for each check and version with a violation.
 //!
@@ -19,14 +19,19 @@
 //! - Kernel matches the identity-only tag `true` exactly. Delta Spark accepts `true` in any letter
 //!   case. Delta Spark also accepts a winner metadata change whose configuration keys are all on an
 //!   allow-list, such as enabling row tracking or deletion vectors, while T changes no metadata.
-//! - The backfill rule fails T whatever the paths of the files that T rewrites.
+//! - A row-tracking backfill or unbackfill winner fails a T that removes or re-adds any file. Delta
+//!   Spark resolves only the files that both touch.
 //! - Kernel can report a later winner, or a different rule, than Delta Spark reports, because of
 //!   the order of the checks.
 //! - An empty winner commit fails detection with an error. Delta Spark reads no action from it and
 //!   finds no conflict.
+//! - A T that passes `ReadScope::Nothing` and only re-adds files fails detection. Delta Spark
+//!   treats such a T as a blind append.
 //! - These inputs fail detection with an `unsupported` error, at the step that
 //!   [`detect_conflicts()`] lists: a table-level SnapshotIsolation, a T that is a manifest commit,
-//!   a manifest-commit winner and a `delta.rowTracking` tombstone.
+//!   a manifest-commit winner and a `delta.rowTracking` tombstone. OSS Delta doesn't let a writer
+//!   set SnapshotIsolation as a table level, because its config validation accepts only
+//!   Serializable on write. Kernel rejects such a table, which is stricter than Delta Spark.
 //!
 //! T's facts don't depend on the winners, because Kernel never rebases T between winners.
 
@@ -84,21 +89,7 @@ pub(crate) fn detect_conflicts(
     winners: &[WinningCommit],
     file_actions: &RelationRef,
 ) -> KernelResult<ConflictDetection> {
-    if facts.isolation_level == IsolationLevel::SnapshotIsolation {
-        return Err(KernelError::unsupported(
-            "Conflict detection does not support the table isolation level SnapshotIsolation",
-        ));
-    }
-    if facts.is_manifest_commit {
-        return Err(KernelError::unsupported(
-            "Conflict detection does not support a transaction that writes a manifest commit",
-        ));
-    }
-    if matches!(facts.read_scope, ReadScope::Nothing) && facts.rewrites_files {
-        return Err(KernelError::internal_error(
-            "A transaction that removes or re-adds files must pass the files that it read",
-        ));
-    }
+    ensure_supported_loser(facts)?;
     ensure_winners_follow_checked_version(facts.checked_version, winners)?;
     let summaries = match winner_check_plan(facts, winners)? {
         Some(plan) => read_winner_summaries(executor.execute_op(Operation::QueryPlan(plan))?)?,
@@ -155,12 +146,17 @@ pub(crate) struct LoserFacts {
     /// The last version that T was checked against: T's read version on the first check, then the
     /// last winner that the previous check covered.
     pub(crate) checked_version: Version,
-    /// The table's isolation level. Kernel accepts Serializable and WriteSerializable. OSS Delta
-    /// accepts only Serializable as a table value. Other writers set WriteSerializable. Parse the
-    /// raw `delta.isolationLevel` value case-insensitively, as Delta Spark does.
-    /// `TableProperties::isolation_level` is `None` both when the property is unset and when it
-    /// doesn't parse. When the raw value is unset, pass Serializable, the Delta default. When it
-    /// doesn't parse, fail T. [`decision::effective_isolation_level`] applies the downgrade.
+    /// The table's isolation level.
+    ///
+    /// - Kernel supports Serializable and WriteSerializable. OSS Delta writes only Serializable.
+    ///   Kernel also accepts WriteSerializable, which some writers set.
+    /// - Parse the raw `delta.isolationLevel` value case-insensitively, as Delta Spark does.
+    ///   `TableProperties::isolation_level` is `None` both when the property is unset and when it
+    ///   doesn't parse.
+    /// - When the raw value is unset, pass Serializable, the Delta default.
+    /// - When it doesn't parse, fail T.
+    ///
+    /// [`decision::effective_isolation_level`] applies the downgrade.
     pub(crate) isolation_level: IsolationLevel,
     /// T writes a root manifest file, so its commit is an adaptiveMetadata manifest commit. Its
     /// `checkpoint` action states the table's txns and domains, so a retry would drop a winner's
@@ -174,7 +170,7 @@ pub(crate) struct LoserFacts {
     /// T writes a `metaData` action.
     pub(crate) changes_metadata: bool,
     /// T writes an action that no other field describes, for example `protocol` or `txn`. A
-    /// `commitInfo` action does not count.
+    /// `commitInfo` action does not count, and a `cdc` action counts as a file action.
     pub(crate) has_other_actions: bool,
     /// T removes a file or adds a file again.
     pub(crate) rewrites_files: bool,
@@ -218,7 +214,7 @@ pub(crate) enum ReadScope {
         ///   conflicts, as in Delta Spark.
         partition_predicate: Option<PredicateRef>,
         /// Parses offset-less TIMESTAMP partition values in `partition_schema`. Use the options of
-        /// T's scan.
+        /// T's scan. All of T's scans must use the same options.
         map_to_struct_options: MapToStructOptions,
     },
     /// T read no table state and only adds files: a blind append. If T removes or re-adds a file,
@@ -228,10 +224,35 @@ pub(crate) enum ReadScope {
 
 // === Helpers ===
 
+/// Returns an error for a T that Kernel can't check: a table-level SnapshotIsolation, a T that
+/// writes a manifest commit, or a T that read nothing but rewrites files.
+///
+/// OSS Delta doesn't let a writer set SnapshotIsolation as a table level, because its config
+/// validation accepts only Serializable on write. Kernel rejects such a table, which is stricter
+/// than Delta Spark.
+fn ensure_supported_loser(facts: &LoserFacts) -> KernelResult<()> {
+    if facts.isolation_level == IsolationLevel::SnapshotIsolation {
+        return Err(KernelError::unsupported(
+            "Conflict detection does not support the table isolation level SnapshotIsolation",
+        ));
+    }
+    if facts.is_manifest_commit {
+        return Err(KernelError::unsupported(
+            "Conflict detection does not support a transaction that writes a manifest commit",
+        ));
+    }
+    if matches!(facts.read_scope, ReadScope::Nothing) && facts.rewrites_files {
+        return Err(KernelError::internal_error(
+            "A transaction that removes or re-adds files must pass the files that it read",
+        ));
+    }
+    Ok(())
+}
+
 /// Returns an internal error unless the winners start at `checked_version + 1` and their versions
 /// ascend with no gap.
 ///
-/// Runs before any plan, so a bad winner list fails before any I/O.
+/// It reads only the winner list, so it needs no I/O.
 fn ensure_winners_follow_checked_version(
     checked_version: Version,
     winners: &[WinningCommit],

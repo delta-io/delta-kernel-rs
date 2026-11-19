@@ -9,7 +9,7 @@
 //!
 //! Project(part) and Filter(predicate) run only for a partitioned `ReadScope::Files` with a
 //! predicate. `WholeTable` has no SemiJoin(read_files). `Nothing` leaves out read_append and
-//! read_delete. delete_delete runs only when T rewrites files.
+//! read_delete.
 
 use std::sync::LazyLock;
 
@@ -56,8 +56,8 @@ pub(super) static VIOLATION_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 /// Builds the OCC plan, or returns `None` when no check has a winner to scan.
 ///
 /// The plan returns one row for each check and version with a violation. `read_append` scans the
-/// winners at `read_append_versions`. `read_delete` scans every winner, and so does
-/// `delete_delete` when T rewrites files. `file_actions` must have a `remove.path` column.
+/// winners at `read_append_versions`. The delete checks scan every winner. `file_actions` must have
+/// a `remove.path` column.
 pub(super) fn occ_plan(
     facts: &LoserFacts,
     winners: &[WinningCommit],
@@ -67,21 +67,17 @@ pub(super) fn occ_plan(
     let read_append = read_append_branch(&facts.read_scope, winners, read_append_versions)?;
     let removes = winner_removes(winners)?;
     let read_delete = read_delete_branch(&facts.read_scope, removes.clone())?;
-    let mut branches = vec![
+    let delete_delete = delete_delete_branch(removes, file_actions)?;
+    PlanBuilder::union_all([
         violations(read_append, OccCheck::ReadAppend)?,
         violations(read_delete, OccCheck::ReadDelete)?,
-    ];
-    // T has no remove that a winner remove can match unless T rewrites files.
-    if facts.rewrites_files {
-        let delete_delete = delete_delete_branch(removes, file_actions)?;
-        branches.push(violations(delete_delete, OccCheck::DeleteDelete)?);
-    }
-    PlanBuilder::union_all(branches)?
-        // The aggregate gives one row for each (check, version). Nothing reads the count.
-        .aggregate_by([column_name!(CHECK), column_name!(VERSION)], |aggs| {
-            aggs.count_star()
-        })?
-        .build_opt()
+        violations(delete_delete, OccCheck::DeleteDelete)?,
+    ])?
+    // The aggregate gives one row for each (check, version). Nothing reads the count.
+    .aggregate_by([column_name!(CHECK), column_name!(VERSION)], |aggs| {
+        aggs.count_star()
+    })?
+    .build_opt()
 }
 
 /// A file-level check of the OCC plan.
