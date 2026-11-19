@@ -538,8 +538,10 @@ pub enum Expression {
     /// validated against the schema, so building a struct takes both. The expression count must
     /// equal the output field count.
     ///
-    /// The optional nullability predicate says when to *keep* the struct: a row survives only
-    /// where it is true, and nulls entirely where it is false or null.
+    /// The optional nullability predicate keeps the struct where it is true and makes the
+    /// entire struct null where it is false or null. See
+    /// [`ExpressionEvaluator::evaluate`](crate::ExpressionEvaluator::evaluate) for how a null
+    /// struct expands into output columns.
     ///
     /// ```sql
     /// CASE WHEN keep_pred THEN struct(expr1, expr2, ...) END

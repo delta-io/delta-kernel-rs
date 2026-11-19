@@ -462,11 +462,16 @@ impl<T: PartialEq + AsAny> DynPartialEq for T {
 /// Connectors can implement this trait to optimize the evaluation using the
 /// connector specific capabilities.
 pub trait ExpressionEvaluator: AsAny {
-    /// Evaluate the expression on a given EngineData.
+    /// Evaluates the expression on `batch`.
     ///
-    /// Produces one value for each row of the input.
-    /// The data type of the output is same as the type output of the expression this evaluator is
-    /// using.
+    /// Produces one value for each input row using the evaluator's output type. If the output is a
+    /// struct, its fields become output columns. A NULL struct row produces NULL in every output
+    /// column without changing the row count.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if evaluation fails, including when a NULL struct row would put NULL in a
+    /// non-nullable output column.
     fn evaluate(&self, batch: &dyn EngineData) -> KernelResult<Box<dyn EngineData>>;
 }
 
