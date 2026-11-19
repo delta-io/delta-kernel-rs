@@ -703,6 +703,8 @@ pub struct CheckpointActionComputed {
     pub num_log_commits_replayed: u64,
     pub num_txn_sidecars_kept: u64,
     pub num_domain_metadata_sidecars_kept: u64,
+    pub num_txn_sidecars_read: u64,
+    pub num_domain_metadata_sidecars_read: u64,
     pub duration_ns: u64,
 }
 
@@ -1067,6 +1069,8 @@ impl MetricEvent {
                 num_log_commits_replayed,
                 num_txn_sidecars_kept,
                 num_domain_metadata_sidecars_kept,
+                num_txn_sidecars_read,
+                num_domain_metadata_sidecars_read,
                 duration,
             }) => Self::CheckpointActionComputed(CheckpointActionComputed {
                 operation_id: (*operation_id).into(),
@@ -1078,6 +1082,8 @@ impl MetricEvent {
                 num_log_commits_replayed: *num_log_commits_replayed,
                 num_txn_sidecars_kept: *num_txn_sidecars_kept,
                 num_domain_metadata_sidecars_kept: *num_domain_metadata_sidecars_kept,
+                num_txn_sidecars_read: *num_txn_sidecars_read,
+                num_domain_metadata_sidecars_read: *num_domain_metadata_sidecars_read,
                 duration_ns: duration_ns(*duration),
             }),
         }
@@ -1592,6 +1598,8 @@ mod tests {
                 num_log_commits_replayed: 3,
                 num_txn_sidecars_kept: 2,
                 num_domain_metadata_sidecars_kept: 5,
+                num_txn_sidecars_read: 4,
+                num_domain_metadata_sidecars_read: 6,
                 duration: Duration::from_nanos(11),
             });
         with_ffi_event(&event, |ffi| {
@@ -1612,6 +1620,8 @@ mod tests {
             assert_eq!(e.num_log_commits_replayed, 3);
             assert_eq!(e.num_txn_sidecars_kept, 2);
             assert_eq!(e.num_domain_metadata_sidecars_kept, 5);
+            assert_eq!(e.num_txn_sidecars_read, 4);
+            assert_eq!(e.num_domain_metadata_sidecars_read, 6);
             assert_eq!(e.duration_ns, 11);
         });
     }

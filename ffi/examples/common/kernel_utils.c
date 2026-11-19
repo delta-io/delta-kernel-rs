@@ -711,6 +711,8 @@ void print_metric(MetricEvent event) {
     PM_U64(cac, num_log_commits_replayed);
     PM_U64(cac, num_txn_sidecars_kept);
     PM_U64(cac, num_domain_metadata_sidecars_kept);
+    PM_U64(cac, num_txn_sidecars_read);
+    PM_U64(cac, num_domain_metadata_sidecars_read);
     PM_U64(cac, duration_ns);
     PM_END;
     return;
