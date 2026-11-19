@@ -38,8 +38,8 @@ use crate::engine::data_file_writer_options;
 use crate::expressions::{ArrayData, ColumnName, PredicateRef, Scalar};
 use crate::object_store::DynObjectStore;
 use crate::plans::ir::nodes::{
-    DynamicScan, FILE_META_SCHEMA, FileType, Operator, Project, RelationId, RelationRef, ScanFile,
-    ScanJson, ScanParquet, SemiJoin, Values, WriteJson, WriteParquet,
+    Aggregate, DynamicScan, FILE_META_SCHEMA, FileType, Operator, Project, RelationId, RelationRef,
+    ScanFile, ScanJson, ScanParquet, SemiJoin, Values, WriteJson, WriteParquet,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult, ScopedPlanExecutor};
@@ -325,40 +325,41 @@ impl SyncPlanExecutor {
         input: impl Iterator<Item = &'a RecordBatch>,
     ) -> KernelResult<Vec<RecordBatch>> {
         let input = input.cloned().collect::<Vec<_>>();
-        let first = input
-            .iter()
-            .find(|batch| batch.num_rows() != 0)
-            .ok_or_else(|| KernelError::generic("Write requires at least one input row"))?;
-        let (output_schema, stats) = if write.stats_agg.is_empty() {
-            (FILE_META_SCHEMA.clone(), vec![])
+        if input.iter().all(|batch| batch.num_rows() == 0) {
+            return Err(KernelError::generic(
+                "Write requires at least one input row",
+            ));
+        }
+        let stats = if write.stats_agg.is_empty() {
+            vec![]
         } else {
-            let input_schema = Arc::new(StructType::try_from_arrow(first.schema().as_ref())?);
-            let aggregate = write.stats_aggregate(input_schema)?;
-            let stats = eval_aggregate(&aggregate, &input)?;
-            let output_schema = WriteParquet::output_schema(&aggregate.schema)?;
-            (output_schema, stats)
+            let names = write
+                .stats_agg
+                .iter()
+                .map(|stats| stats.name.as_str())
+                .collect::<Vec<_>>();
+            let aggregate = Aggregate {
+                group_by: vec![],
+                aggs: write
+                    .stats_agg
+                    .iter()
+                    .map(|stats| stats.agg.clone())
+                    .collect(),
+                schema: write.schema.project(&names)?,
+            };
+            eval_aggregate(&aggregate, &input)?
         };
-        let output_schema = Arc::new(output_schema.as_ref().try_into_arrow()?);
+        let output_schema = Arc::new(write.schema.as_ref().try_into_arrow()?);
         let schema: Arc<ArrowSchema> = Arc::new(write.write_schema.as_ref().try_into_arrow()?);
-        let physical_schema = StructType::try_from_arrow(schema.as_ref())?;
         let options = data_file_writer_options(&schema, &write.write_schema)?;
+        let columns = (0..write.write_schema.num_fields()).collect::<Vec<_>>();
         // Input order is preserved even when `ordered` is false.
         let batches = input.iter().map(|batch| {
-            WriteParquet::validate_input(
-                &StructType::try_from_arrow(batch.schema_ref().as_ref())?,
-                &physical_schema,
-            )?;
-            let columns = batch
-                .columns()
-                .get(..schema.fields().len())
-                .ok_or_else(|| KernelError::schema("WriteParquet schema exceeds its input"))?;
-            // Rebind metadata on list/map child fields without changing their value types.
-            let columns = coerce_columns_to_schema(columns.to_vec(), &schema)?;
-            let batch = RecordBatch::try_new(schema.clone(), columns)?;
+            let batch = batch.project(&columns)?;
             validate_file_values_for_write(&batch, &write.write_schema)?;
             Ok(batch)
         });
-        let bytes = to_parquet_bytes(schema.clone(), options, batches)?;
+        let bytes = to_parquet_bytes(schema, options, batches)?;
         let meta = self.write_file_result(&write.file_path, bytes.into(), write.overwrite)?;
         Ok(vec![RecordBatch::try_new(
             output_schema,
@@ -790,6 +791,8 @@ mod tests {
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::arrow::array::{AsArray, StructArray};
     use crate::arrow::buffer::{BooleanBuffer, NullBuffer};
+    #[cfg(feature = "arrow-60")]
+    use crate::arrow::compute::concat_batches;
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Int64Type};
     #[cfg(feature = "arrow-60")]
     use crate::engine::file_groups;
@@ -837,11 +840,9 @@ mod tests {
         file_type: FileType,
     ) -> KernelResult<Vec<RecordBatch>> {
         assert_eq!(plan.schema, *FILE_META_SCHEMA);
-        let meta = file_meta_from_batches(
-            executor
-                .execute_op(Operation::QueryPlan(plan))?
-                .into_data()?,
-        )?;
+        let result = executor.execute_op(Operation::QueryPlan(plan))?;
+        let data = result.into_data()?;
+        let meta = file_meta_from_batches(data)?;
         assert_eq!(meta, executor.storage.head(path)?);
         assert_eq!(
             meta.size,
@@ -990,10 +991,9 @@ mod tests {
     #[case::wrong_type(schema_ref! { not_null "id": STRING }, "bad".into())]
     #[case::missing_field(schema_ref! { not_null "other": LONG }, 1i64.into())]
     #[case::wrong_nullability(schema_ref! { nullable "id": LONG }, 1i64.into())]
-    fn write_rejects_mismatched_batch_without_writing(
+    fn write_json_rejects_mismatched_batch_without_writing(
         #[case] schema: SchemaRef,
         #[case] value: Scalar,
-        #[values(FileType::Json, FileType::Parquet)] file_type: FileType,
         #[values(false, true)] valid_prefix: bool,
     ) -> KernelResult<()> {
         let executor = SyncPlanExecutor::new(Some(Arc::new(InMemory::new())));
@@ -1005,7 +1005,7 @@ mod tests {
                 PlanBuilder::values(schema_ref! { not_null "id": LONG }, vec![vec![1i64.into()]])
             })
             .collect::<KernelResult<Vec<_>>>()?;
-        let mut plan = write_plan(inputs, &path, true, false, file_type)?;
+        let mut plan = write_plan(inputs, &path, true, false, FileType::Json)?;
         let last_input = *plan.nodes.last().unwrap().inputs.last().unwrap();
         let Operator::Values(values) = &mut plan.nodes[last_input].op else {
             panic!("expected Values");
@@ -1074,6 +1074,7 @@ mod tests {
                     StatsAgg::new("amount_count", Agg::count(column_name!("amount"))),
                     StatsAgg::new("amount_sum", Agg::sum(column_name!("amount"))),
                     StatsAgg::new("region_count", Agg::count(column_name!("region"))),
+                    StatsAgg::new("first_stats", Agg::first_non_null(column_name!("stats"))),
                 ]
             } else {
                 vec![]
@@ -1084,14 +1085,14 @@ mod tests {
         let result = executor.eval_plan(plan, None)?;
         assert_eq!(result[0].schema().as_ref(), &output_schema);
         if with_stats {
-            let actual = result[0].project(&[3, 4, 5, 6])?;
+            let actual = result[0].project(&[3, 4, 5, 6, 7])?;
             #[rustfmt::skip]
             let expected: &[&str] = &[
-                "+-------+--------------+------------+--------------+",
-                "| count | amount_count | amount_sum | region_count |",
-                "+-------+--------------+------------+--------------+",
-                "| 4     | 2            | 20         | 4            |",
-                "+-------+--------------+------------+--------------+",
+                "+-------+--------------+------------+--------------+-----------------+",
+                "| count | amount_count | amount_sum | region_count | first_stats     |",
+                "+-------+--------------+------------+--------------+-----------------+",
+                "| 4     | 2            | 20         | 4            | {numRecords: 2} |",
+                "+-------+--------------+------------+--------------+-----------------+",
             ];
             assert_batches_sorted_eq!(expected, &[actual]);
         }
@@ -1160,34 +1161,6 @@ mod tests {
     }
 
     #[rstest]
-    #[case::unsupported_sum(Agg::sum(column_name!("id")))]
-    #[case::missing_operand(Agg::count(column_name!("missing")))]
-    fn write_parquet_rejects_invalid_statistics_without_writing(
-        #[case] agg: Agg,
-    ) -> KernelResult<()> {
-        let executor = SyncPlanExecutor::new(Some(Arc::new(InMemory::new())));
-        let path = Url::parse("memory:///output")?;
-        let original = Bytes::from_static(b"original contents");
-        executor.storage.put(&path, original.clone(), false)?;
-        let schema = schema_ref! { nullable "id": STRING };
-        let input = PlanBuilder::values(schema.clone(), vec![vec!["x".into()]])?;
-        let mut plan = PlanBuilder::write_parquet(
-            [input],
-            WriteParquet::new(schema, path.clone())
-                .with_overwrite(true)
-                .with_stats_agg([StatsAgg::new("count", Agg::CountStar)]),
-        )?
-        .build()?;
-        let Operator::WriteParquet(write) = &mut plan.nodes.last_mut().unwrap().op else {
-            panic!("expected WriteParquet");
-        };
-        write.stats_agg = vec![StatsAgg::new("count", agg)];
-        assert!(executor.eval_plan(plan, None).is_err());
-        assert_eq!(get_bytes(executor.storage.store(), &path)?, original);
-        Ok(())
-    }
-
-    #[rstest]
     #[case::valid(Some((Some("data.bin"), 3, Some("CRC32:12345678"))), None)]
     #[case::null(None, None)]
     #[case::missing_locator(Some((None, 0, None)), Some("neither `uri` nor `inline` is set"))]
@@ -1199,6 +1172,7 @@ mod tests {
     fn write_parquet_validates_file_values_and_preserves_annotation(
         #[case] file: Option<(Option<&str>, i64, Option<&str>)>,
         #[case] problem: Option<&str>,
+        #[values(false, true)] valid_prefix: bool,
     ) -> KernelResult<()> {
         let executor = SyncPlanExecutor::new(Some(Arc::new(InMemory::new())));
         let path = Url::parse("memory:///output.parquet")?;
@@ -1233,8 +1207,21 @@ mod tests {
             schema.clone(),
             batch.clone(),
         )?);
+        let prefix = RecordBatch::try_new(
+            batch.schema(),
+            vec![Scalar::Null(DataType::file_type()).to_array(1)?],
+        )?;
+        let mut inputs = Vec::new();
+        if valid_prefix {
+            inputs.push(PlanBuilder::relation_source(scoped.create_ref(
+                "prefix",
+                schema.clone(),
+                prefix.clone(),
+            )?));
+        }
+        inputs.push(input);
         let write = PlanBuilder::write_parquet(
-            [input],
+            inputs,
             WriteParquet::new(schema.clone(), path.clone()).with_overwrite(true),
         )?
         .build()?;
@@ -1266,54 +1253,13 @@ mod tests {
                 (11..17).map(Some).collect::<Vec<_>>()
             );
             let scan = PlanBuilder::scan_parquet([file], &[], schema)?.build()?;
-            assert_eq!(executor.eval_plan(scan, None)?, vec![batch]);
+            let expected = if valid_prefix {
+                concat_batches(&batch.schema(), [&prefix, &batch])?
+            } else {
+                batch
+            };
+            assert_eq!(executor.eval_plan(scan, None)?, vec![expected]);
         }
-        Ok(())
-    }
-
-    #[rstest]
-    #[case::top_level(|schema| schema)]
-    #[case::struct_field(|schema| schema! { nullable "value": (schema) })]
-    #[case::array_element(|schema| schema! { nullable "value": (ArrayType::new(schema, true)) })]
-    #[case::map_key(|schema| schema! { nullable "value": (MapType::new(schema, DataType::LONG, true)) })]
-    #[case::map_value(|schema| schema! { nullable "value": (MapType::new(DataType::STRING, schema, true)) })]
-    fn write_parquet_rejects_incompatible_fields(
-        #[case] wrap: fn(StructType) -> StructType,
-        #[values(
-            schema! { nullable "b": LONG, nullable "a": LONG },
-            schema! { nullable "a": LONG, nullable "b": LONG, nullable "c": LONG },
-            schema! { nullable "a": STRING, nullable "b": LONG },
-            schema! { not_null "a": LONG, nullable "b": LONG }
-        )]
-        target: StructType,
-    ) -> KernelResult<()> {
-        let executor = SyncPlanExecutor::new(Some(Arc::new(InMemory::new())));
-        let base = Url::parse("memory:///")?;
-        let source = Arc::new(wrap(schema! { nullable "a": LONG, nullable "b": LONG }));
-        let target = Arc::new(wrap(target));
-        let row = source
-            .fields()
-            .map(|field| Scalar::Null(field.data_type().clone()))
-            .collect();
-        let input = PlanBuilder::values(source.clone(), vec![row])?;
-        let write = |schema| {
-            PlanBuilder::write_parquet(
-                [input.clone()],
-                WriteParquet::new(schema, base.join("output.parquet")?),
-            )
-        };
-        assert!(matches!(write(target.clone()), Err(KernelError::Schema(_))));
-        // Plans received by an executor need the same validation as locally built plans.
-        let mut plan = write(source)?.build()?;
-        let Operator::WriteParquet(write) = &mut plan.nodes.last_mut().unwrap().op else {
-            panic!("expected WriteParquet");
-        };
-        write.write_schema = target;
-        assert!(matches!(
-            executor.eval_plan(plan, None),
-            Err(KernelError::Schema(_))
-        ));
-        assert_eq!(executor.storage.list_from(&base)?.count(), 0);
         Ok(())
     }
 

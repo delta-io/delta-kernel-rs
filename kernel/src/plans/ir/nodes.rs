@@ -14,7 +14,6 @@ use url::Url;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::error::add_scalar_path_context;
 use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar, StructData};
-use crate::schema::compare::data_types_equal_for_write;
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema, lazy_schema_ref};
 use crate::utils::CollectInto;
 use crate::{FileMeta, KernelError, KernelResult};
@@ -131,10 +130,15 @@ pub struct WriteJson {
 /// usual [`Agg`] null semantics. Inputs must bind identical statistics schemas, including metadata.
 ///
 /// The atomic-create, overwrite, input ordering, nonempty input, and duplicate-destination
-/// contracts of [`WriteJson`] also apply. Executors must reject invalid inputs before creating
-/// or replacing the destination.
+/// contracts of [`WriteJson`] also apply.
+/// [`PlanBuilder::write_parquet`](crate::PlanBuilder::write_parquet) validates input schemas and
+/// resolves the output schema. Executors must reject invalid `FILE` values before creating or
+/// replacing the destination.
 #[derive(Debug, Clone)]
 pub struct WriteParquet {
+    /// Output schema resolved by
+    /// [`PlanBuilder::write_parquet`](crate::PlanBuilder::write_parquet).
+    pub schema: SchemaRef,
     /// Named aggregate statistics over all input rows, in output-column order.
     pub stats_agg: Vec<StatsAgg>,
     /// Physical schema of the fields to write, including file metadata.
@@ -151,6 +155,7 @@ impl WriteParquet {
     /// Configures a single-file write with no statistics, overwrite, or input ordering.
     pub fn new(write_schema: SchemaRef, file_path: Url) -> Self {
         Self {
+            schema: FILE_META_SCHEMA.clone(),
             stats_agg: Vec::new(),
             write_schema,
             file_path,
@@ -175,52 +180,6 @@ impl WriteParquet {
     pub fn with_ordered(mut self, ordered: bool) -> Self {
         self.ordered = ordered;
         self
-    }
-
-    /// Binds statistics against the full input schema.
-    pub(crate) fn stats_aggregate(&self, input_schema: SchemaRef) -> KernelResult<Aggregate> {
-        self.stats_agg
-            .iter()
-            .fold(Aggregate::ungrouped(input_schema), |builder, stats| {
-                builder.aggregate_as(stats.agg.clone(), &stats.name)
-            })
-            .build()
-    }
-
-    /// Validates the input prefix while allowing writer-supplied field metadata.
-    pub(crate) fn validate_input(
-        input_schema: &StructType,
-        write_schema: &StructType,
-    ) -> KernelResult<()> {
-        if write_schema.num_fields() == 0 {
-            return Err(KernelError::schema(
-                "WriteParquet requires at least one field",
-            ));
-        }
-        if input_schema.num_fields() < write_schema.num_fields() {
-            return Err(KernelError::schema("WriteParquet schema exceeds its input"));
-        }
-        for (source, field) in input_schema.fields().zip(write_schema.fields()) {
-            if source.name() != field.name()
-                || source.is_nullable() != field.is_nullable()
-                || !data_types_equal_for_write(source.data_type(), field.data_type())
-            {
-                return Err(KernelError::schema(format!(
-                    "WriteParquet field {} must match its input prefix",
-                    field.name()
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    /// Appends the bound statistics to the returned file metadata.
-    pub(crate) fn output_schema(stats_schema: &StructType) -> KernelResult<SchemaRef> {
-        let fields = FILE_META_SCHEMA
-            .fields()
-            .chain(stats_schema.fields())
-            .cloned();
-        Ok(Arc::new(StructType::try_new(fields)?))
     }
 }
 
@@ -1130,7 +1089,12 @@ impl Agg {
             Agg::Min(value) | Agg::Max(value) | Agg::FirstNonNull(value) => {
                 resolve(value, None, true)
             }
-            Agg::Sum(value) => resolve(value, Some(DataType::LONG), true),
+            Agg::Sum(value) => {
+                if input_schema.field_at(value)?.data_type() != &DataType::LONG {
+                    return Err(KernelError::schema("SUM requires a LONG operand"));
+                }
+                resolve(value, Some(DataType::LONG), true)
+            }
             Agg::Count(value) => resolve(value, Some(DataType::LONG), false),
             Agg::CountStar => Ok(StructField::not_null(
                 alias.unwrap_or_else(|| "count".to_string()),
@@ -1232,7 +1196,8 @@ impl AggregateBuilder {
     /// # Errors
     ///
     /// Returns an error if a group key or an aggregate's operand column is not found in the input
-    /// schema, or if two output columns would share a name (case-insensitive).
+    /// schema, if a sum operand is not LONG, or if two output columns would share a name
+    /// (case-insensitive).
     pub fn build(self) -> KernelResult<Aggregate> {
         let mut fields = Vec::with_capacity(self.group_by.len() + self.aggs.len());
         for key in &self.group_by {

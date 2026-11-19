@@ -91,6 +91,8 @@ message WriteParquetNode {
   }
   // Named aggregates over all input rows; output columns follow file metadata.
   repeated StatsAgg stats_agg = 5;
+  // Resolved output schema: file metadata followed by statistics.
+  delta.kernel.schema.StructType schema = 6;
 }
 
 enum FileType {

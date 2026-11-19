@@ -49,7 +49,7 @@ use super::ir::nodes::{
 };
 use super::ir::plan::{Plan, PlanNode};
 use crate::expressions::{ColumnName, Expression, ExpressionRef, PredicateRef, Scalar, StructData};
-use crate::schema::compare::data_types_equal_ordered;
+use crate::schema::compare::{data_types_equal_for_write, data_types_equal_ordered};
 use crate::schema::{SchemaRef, ToSchema};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::utils::CollectInto;
@@ -339,11 +339,29 @@ impl PlanBuilder {
     /// errors. See [`WriteParquet`] for the execution contract.
     pub fn write_parquet(
         inputs: impl IntoIterator<Item = PlanBuilder>,
-        write: WriteParquet,
+        mut write: WriteParquet,
     ) -> KernelResult<Self> {
+        if write.write_schema.num_fields() == 0 {
+            return Err(KernelError::schema(
+                "WriteParquet requires at least one field",
+            ));
+        }
         let mut present = Vec::new();
         for input in inputs {
-            WriteParquet::validate_input(input.schema(), &write.write_schema)?;
+            if input.schema().num_fields() < write.write_schema.num_fields() {
+                return Err(KernelError::schema("WriteParquet schema exceeds its input"));
+            }
+            for (source, field) in input.schema().fields().zip(write.write_schema.fields()) {
+                if source.name() != field.name()
+                    || source.is_nullable() != field.is_nullable()
+                    || !data_types_equal_for_write(source.data_type(), field.data_type())
+                {
+                    return Err(KernelError::schema(format!(
+                        "WriteParquet field {} must match its input prefix",
+                        field.name()
+                    )));
+                }
+            }
             if let PlanBuilderRoot::Present(node) = input.0 {
                 present.push(node);
             }
@@ -353,9 +371,18 @@ impl PlanBuilder {
                 "WriteParquet requires at least one input row",
             ));
         }
-        let stats_schema = write.stats_aggregate(present[0].schema.clone())?.schema;
+        let bind_stats = |input_schema| {
+            write
+                .stats_agg
+                .iter()
+                .fold(Aggregate::ungrouped(input_schema), |builder, stats| {
+                    builder.aggregate_as(stats.agg.clone(), &stats.name)
+                })
+                .build()
+        };
+        let stats_schema = bind_stats(present[0].schema.clone())?.schema;
         for input in &present[1..] {
-            let rebound = write.stats_aggregate(input.schema.clone())?;
+            let rebound = bind_stats(input.schema.clone())?;
             if !stats_schema
                 .fields()
                 .zip(rebound.schema.fields())
@@ -368,8 +395,8 @@ impl PlanBuilder {
                 ));
             }
         }
-        let output_schema = WriteParquet::output_schema(&stats_schema)?;
-        Ok(Self::present(output_schema, write, present))
+        write.schema = Arc::new(FILE_META_SCHEMA.add(stats_schema.fields().cloned())?);
+        Ok(Self::present(write.schema.clone(), write, present))
     }
 
     /// Keep rows where `predicate` holds. Output schema is unchanged. See [`Filter`].
@@ -836,7 +863,8 @@ mod tests {
     use crate::expressions::{Expression, Predicate, col, column_name, expr, lit};
     use crate::plans::ir::nodes::{Agg, FileType, StatsAgg};
     use crate::schema::{
-        DataType, MetadataColumnSpec, StructField, StructType, schema, schema_ref,
+        ArrayType, DataType, MapType, MetadataColumnSpec, StructField, StructType, schema,
+        schema_ref,
     };
 
     /// A single-file scan (present), no file-constant columns -- the trivial scan fixture.
@@ -1154,6 +1182,7 @@ mod tests {
 
     #[rstest::rstest]
     #[case::missing_operand(id_schema(), vec![StatsAgg::new("count", Agg::count(column_name!("missing")))])]
+    #[case::unsupported_sum(id_schema(), vec![StatsAgg::new("sum", Agg::sum(column_name!("id")))])]
     #[case::duplicate_alias(id_schema(), vec![StatsAgg::new("count", Agg::CountStar); 2])]
     #[case::file_column_collision(id_schema(), vec![StatsAgg::new("SIZE", Agg::CountStar)])]
     #[case::later_missing_operand(id_schema(), vec![StatsAgg::new("min", Agg::min(column_name!("n")))])]
@@ -1172,6 +1201,34 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::top_level(|schema| schema)]
+    #[case::struct_field(|schema| schema! { nullable "value": (schema) })]
+    #[case::array_element(|schema| schema! { nullable "value": (ArrayType::new(schema, true)) })]
+    #[case::map_key(|schema| schema! { nullable "value": (MapType::new(schema, DataType::LONG, true)) })]
+    #[case::map_value(|schema| schema! { nullable "value": (MapType::new(DataType::STRING, schema, true)) })]
+    fn write_parquet_rejects_incompatible_fields(
+        #[case] wrap: fn(StructType) -> StructType,
+        #[values(
+            schema! { nullable "b": LONG, nullable "a": LONG },
+            schema! { nullable "a": LONG, nullable "b": LONG, nullable "c": LONG },
+            schema! { nullable "a": STRING, nullable "b": LONG },
+            schema! { not_null "a": LONG, nullable "b": LONG }
+        )]
+        target: StructType,
+    ) -> KernelResult<()> {
+        let source = Arc::new(wrap(schema! { nullable "a": LONG, nullable "b": LONG }));
+        let result = PlanBuilder::write_parquet(
+            [vals(source)],
+            WriteParquet::new(
+                Arc::new(wrap(target)),
+                Url::parse("memory:///output.parquet")?,
+            ),
+        );
+        assert!(matches!(result, Err(KernelError::Schema(_))));
         Ok(())
     }
 
