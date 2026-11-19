@@ -11,7 +11,9 @@ use crate::log_path::LogPath;
 use crate::log_segment::{LogSegment, validate_catalog_managed_log_tail};
 use crate::log_segment_files::CheckpointHandling;
 use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
-use crate::metrics::{MetricId, SnapshotLoadMetricContext, SnapshotLoadType};
+use crate::metrics::{
+    MetricContext, MetricId, SnapshotLoadMetricContext, SnapshotLoadType, TableType,
+};
 use crate::path::DELTA_LOG_DIR_WITH_SLASH;
 use crate::snapshot::{SnapshotHint, SnapshotRef};
 use crate::utils::{PhantomType, is_absent_local_path, require, try_parse_uri};
@@ -328,9 +330,9 @@ impl<Mode> SnapshotBuilder<Mode> {
     /// returning a reference to an existing snapshot if the request to build a new snapshot
     /// matches the version of an existing snapshot.
     ///
-    /// Reports metrics: [`MetricEvent::SnapshotBuildSuccess`] or
-    /// [`MetricEvent::SnapshotBuildFailure`]. Events include `load_type`; hinted builds use
-    /// `snapshot_hint` and emit no child log-load events because they perform no engine I/O.
+    /// Reports one [`MetricEvent::SnapshotBuildCompleted`] event. Events include `load_type`;
+    /// hinted builds use `snapshot_hint` and emit no child log-load events because they perform
+    /// no engine I/O.
     ///
     /// # Parameters
     ///
@@ -351,8 +353,7 @@ impl<Mode> SnapshotBuilder<Mode> {
     /// table whose earlier history was removed also has no log files up to that version.
     ///
     /// [`DeltaPathDoesNotExist`]: crate::DeltaErrorCondition::DeltaPathDoesNotExist
-    /// [`MetricEvent::SnapshotBuildSuccess`]: crate::metrics::MetricEvent::SnapshotBuildSuccess
-    /// [`MetricEvent::SnapshotBuildFailure`]: crate::metrics::MetricEvent::SnapshotBuildFailure
+    /// [`MetricEvent::SnapshotBuildCompleted`]: crate::metrics::MetricEvent::SnapshotBuildCompleted
     // `is_catalog_managed` is the requested load mode, not the confirmed protocol
     // (see `IS_CATALOG_MANAGED_FIELD`).
     #[instrument(
@@ -364,7 +365,7 @@ impl<Mode> SnapshotBuilder<Mode> {
     pub fn build(self, engine: &dyn Engine) -> Result<SnapshotRef> {
         // Fold the context into the message string rather than passing structured fields: this
         // `info!` fires inside the `snap.build` metrics span, where any field the
-        // `SnapshotBuildSuccess` event doesn't recognize would trip a spurious "Invalid field"
+        // `SnapshotBuildCompleted` event doesn't recognize would trip a spurious "Invalid field"
         // warning from the metrics layer.
         info!(
             "building snapshot: target={}, from_version={:?}, log_tail_len={}, \
@@ -394,9 +395,11 @@ impl<Mode> SnapshotBuilder<Mode> {
         } = self;
 
         let metric_context = SnapshotLoadMetricContext {
-            operation_id,
-            is_catalog_managed: max_catalog_version.is_some(),
-            correlation_id,
+            context: MetricContext {
+                operation_id,
+                correlation_id,
+                table_type: TableType::from_catalog_managed(max_catalog_version.is_some()),
+            },
             load_type,
         };
 
@@ -650,7 +653,11 @@ pub(super) mod tests {
 
     use super::*;
     use crate::engine::sync::SyncEngine;
-    use crate::metrics::{LogSegmentLoadType, MetricEvent};
+    use crate::metrics::{
+        LogSegmentLoadCompleted, LogSegmentLoadOutcome, LogSegmentLoadType, MetricEvent,
+        ProtocolMetadataLoadCompleted, ProtocolMetadataLoadOutcome, SnapshotBuildCompleted,
+        SnapshotBuildOutcome,
+    };
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
@@ -880,16 +887,24 @@ pub(super) mod tests {
 
         let events = reporter.events();
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, MetricEvent::SnapshotBuildFailure(_))),
-            "expected SnapshotBuildFailure event on build failure"
+            events.iter().any(|e| matches!(
+                e,
+                MetricEvent::SnapshotBuildCompleted(SnapshotBuildCompleted {
+                    outcome: SnapshotBuildOutcome::Error,
+                    ..
+                })
+            )),
+            "expected SnapshotBuildCompleted event on build failure"
         );
         assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, MetricEvent::SnapshotBuildSuccess(_))),
-            "should not emit SnapshotBuildSuccess on failure"
+            !events.iter().any(|e| matches!(
+                e,
+                MetricEvent::SnapshotBuildCompleted(SnapshotBuildCompleted {
+                    outcome: SnapshotBuildOutcome::Success { .. },
+                    ..
+                })
+            )),
+            "should not emit SnapshotBuildCompleted on failure"
         );
         Ok(())
     }
@@ -908,16 +923,25 @@ pub(super) mod tests {
         let failure = events
             .iter()
             .find_map(|e| match e {
-                MetricEvent::LogSegmentLoadFailure(f) => Some(f),
+                MetricEvent::LogSegmentLoadCompleted(
+                    f @ LogSegmentLoadCompleted {
+                        outcome: LogSegmentLoadOutcome::Error,
+                        ..
+                    },
+                ) => Some(f),
                 _ => None,
             })
-            .expect("expected LogSegmentLoadFailure when the log has no commits");
+            .expect("expected LogSegmentLoadCompleted when the log has no commits");
         assert_eq!(failure.load_type, LogSegmentLoadType::Full);
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, MetricEvent::SnapshotBuildFailure(_))),
-            "a Delta error must still report SnapshotBuildFailure"
+            events.iter().any(|e| matches!(
+                e,
+                MetricEvent::SnapshotBuildCompleted(SnapshotBuildCompleted {
+                    outcome: SnapshotBuildOutcome::Error,
+                    ..
+                })
+            )),
+            "a Delta error must still report SnapshotBuildCompleted"
         );
         Ok(())
     }
@@ -1091,16 +1115,24 @@ pub(super) mod tests {
 
         let events = reporter.events();
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, MetricEvent::ProtocolMetadataLoadFailure(_))),
-            "expected ProtocolMetadataLoadFailure when protocol/metadata are absent"
+            events.iter().any(|e| matches!(
+                e,
+                MetricEvent::ProtocolMetadataLoadCompleted(ProtocolMetadataLoadCompleted {
+                    outcome: ProtocolMetadataLoadOutcome::Error,
+                    ..
+                })
+            )),
+            "expected ProtocolMetadataLoadCompleted when protocol/metadata are absent"
         );
         assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, MetricEvent::ProtocolMetadataLoadSuccess(_))),
-            "must not emit ProtocolMetadataLoadSuccess when the load fails"
+            !events.iter().any(|e| matches!(
+                e,
+                MetricEvent::ProtocolMetadataLoadCompleted(ProtocolMetadataLoadCompleted {
+                    outcome: ProtocolMetadataLoadOutcome::Success { .. },
+                    ..
+                })
+            )),
+            "must not emit ProtocolMetadataLoadCompleted when the load fails"
         );
         Ok(())
     }
@@ -1126,10 +1158,23 @@ pub(super) mod tests {
         let (version, duration) = events
             .iter()
             .find_map(|e| match e {
-                MetricEvent::SnapshotBuildSuccess(s) => Some((s.version, s.duration)),
+                MetricEvent::SnapshotBuildCompleted(
+                    s @ SnapshotBuildCompleted {
+                        outcome: SnapshotBuildOutcome::Success { .. },
+                        ..
+                    },
+                ) => {
+                    let SnapshotBuildOutcome::Success {
+                        version: s_version, ..
+                    } = &s.outcome
+                    else {
+                        panic!("unexpected metric outcome");
+                    };
+                    Some(((*s_version), s.duration))
+                }
                 _ => None,
             })
-            .expect("expected SnapshotBuildSuccess event");
+            .expect("expected SnapshotBuildCompleted event");
         assert_eq!(version, 1, "version should match the updated snapshot");
         assert!(duration > Duration::ZERO, "duration should be non-zero");
         Ok(())
@@ -1157,16 +1202,24 @@ pub(super) mod tests {
 
         let events = reporter.events();
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, MetricEvent::SnapshotBuildFailure(_))),
-            "expected SnapshotBuildFailure when version update goes backwards"
+            events.iter().any(|e| matches!(
+                e,
+                MetricEvent::SnapshotBuildCompleted(SnapshotBuildCompleted {
+                    outcome: SnapshotBuildOutcome::Error,
+                    ..
+                })
+            )),
+            "expected SnapshotBuildCompleted when version update goes backwards"
         );
         assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, MetricEvent::SnapshotBuildSuccess(_))),
-            "should not emit SnapshotBuildSuccess when version update fails"
+            !events.iter().any(|e| matches!(
+                e,
+                MetricEvent::SnapshotBuildCompleted(SnapshotBuildCompleted {
+                    outcome: SnapshotBuildOutcome::Success { .. },
+                    ..
+                })
+            )),
+            "should not emit SnapshotBuildCompleted when version update fails"
         );
         Ok(())
     }
@@ -1184,17 +1237,27 @@ pub(super) mod tests {
         let snap_duration = events
             .iter()
             .find_map(|e| match e {
-                MetricEvent::SnapshotBuildSuccess(s) => Some(s.duration),
+                MetricEvent::SnapshotBuildCompleted(
+                    s @ SnapshotBuildCompleted {
+                        outcome: SnapshotBuildOutcome::Success { .. },
+                        ..
+                    },
+                ) => Some(s.duration),
                 _ => None,
             })
-            .expect("expected SnapshotBuildSuccess event");
+            .expect("expected SnapshotBuildCompleted event");
         let segment_duration = events
             .iter()
             .find_map(|e| match e {
-                MetricEvent::LogSegmentLoadSuccess(s) => Some(s.duration),
+                MetricEvent::LogSegmentLoadCompleted(
+                    s @ LogSegmentLoadCompleted {
+                        outcome: LogSegmentLoadOutcome::Success { .. },
+                        ..
+                    },
+                ) => Some(s.duration),
                 _ => None,
             })
-            .expect("expected LogSegmentLoadSuccess event");
+            .expect("expected LogSegmentLoadCompleted event");
 
         assert!(
             snap_duration > Duration::ZERO,
@@ -1202,7 +1265,7 @@ pub(super) mod tests {
         );
         assert!(
             snap_duration >= segment_duration,
-            "SnapshotBuildSuccess.duration ({snap_duration:?}) should be >= LogSegmentLoadSuccess.duration ({segment_duration:?})"
+            "SnapshotBuildCompleted.duration ({snap_duration:?}) should be >= LogSegmentLoadCompleted.duration ({segment_duration:?})"
         );
         Ok(())
     }
@@ -1234,15 +1297,30 @@ pub(super) mod tests {
                 .map(str::to_string)
         };
         let build_id = id_of(|e| match e {
-            MetricEvent::SnapshotBuildSuccess(s) => Some(&s.correlation_id),
+            MetricEvent::SnapshotBuildCompleted(
+                s @ SnapshotBuildCompleted {
+                    outcome: SnapshotBuildOutcome::Success { .. },
+                    ..
+                },
+            ) => Some(&s.context.correlation_id),
             _ => None,
         });
         let segment_id = id_of(|e| match e {
-            MetricEvent::LogSegmentLoadSuccess(s) => Some(&s.correlation_id),
+            MetricEvent::LogSegmentLoadCompleted(
+                s @ LogSegmentLoadCompleted {
+                    outcome: LogSegmentLoadOutcome::Success { .. },
+                    ..
+                },
+            ) => Some(&s.context.correlation_id),
             _ => None,
         });
         let metadata_id = id_of(|e| match e {
-            MetricEvent::ProtocolMetadataLoadSuccess(s) => Some(&s.correlation_id),
+            MetricEvent::ProtocolMetadataLoadCompleted(
+                s @ ProtocolMetadataLoadCompleted {
+                    outcome: ProtocolMetadataLoadOutcome::Success { .. },
+                    ..
+                },
+            ) => Some(&s.context.correlation_id),
             _ => None,
         });
         let expected = correlation_id.map(str::to_string);

@@ -402,179 +402,146 @@ void print_log_segment_load_type(LogSegmentLoadType lt) {
 #define PM_BOOL(s, f)  printf("  " #f ": %s,\n", (s).f ? "true" : "false")
 #define PM_SLICE(s, f) (s.f.len>0?printf("  " #f ": %.*s,\n", (int)(s).f.len, (s).f.ptr):printf("  " #f ": \"\",\n"))
 
+static void print_metric_context(MetricContext context) {
+  PM_ID(context, operation_id);
+  PM_SLICE(context, correlation_id);
+  print_table_type(context.table_type);
+}
+
 // print out metrics as json(ish) objects
 void print_metric(MetricEvent event) {
   switch (event.tag) {
-  case MetricEventLogSegmentLoadSuccess:
-    PM_START(LogSegmentLoadSuccess);
-    LogSegmentLoadSuccess lsls = event.log_segment_load_success;
-    PM_ID(lsls, operation_id);
-    PM_SLICE(lsls, correlation_id);
-    print_table_type(lsls.table_type);
-    print_log_segment_load_type(lsls.load_type);
-    PM_U64(lsls, duration_ns);
-    PM_U64(lsls, num_commit_files);
-    PM_U64(lsls, num_checkpoint_files);
-    PM_U64(lsls, num_compaction_files);
-    PM_BOOL(lsls, has_crc);
-    PM_U64(lsls, crc_versions_behind);
-    PM_END;
-    return;
-
-  case MetricEventLogSegmentLoadFailure:
-    PM_START(LogSegmentLoadFailure);
-    LogSegmentLoadFailure lslf = event.log_segment_load_failure;
-    PM_ID(lslf, operation_id);
-    PM_SLICE(lslf, correlation_id);
-    print_table_type(lslf.table_type);
-    print_log_segment_load_type(lslf.load_type);
-    PM_U64(lslf, duration_ns);
-    PM_END;
-    return;
-
-  case MetricEventProtocolMetadataLoadSuccess:
-    PM_START(ProtocolMetadataLoadSuccess);
-    ProtocolMetadataLoadSuccess pmls = event.protocol_metadata_load_success;
-    PM_ID(pmls, operation_id);
-    PM_SLICE(pmls, correlation_id);
-    print_table_type(pmls.table_type);
-    print_log_segment_load_type(pmls.load_type);
-    PM_U64(pmls, duration_ns);
-    PM_END;
-    return;
-
-  case MetricEventProtocolMetadataLoadFailure:
-    PM_START(ProtocolMetadataLoadFailure);
-    ProtocolMetadataLoadFailure pmlf = event.protocol_metadata_load_failure;
-    PM_ID(pmlf, operation_id);
-    PM_SLICE(pmlf, correlation_id);
-    print_table_type(pmlf.table_type);
-    print_log_segment_load_type(pmlf.load_type);
-    PM_U64(pmlf, duration_ns);
-    PM_END;
-    return;
-
-  case MetricEventSnapshotBuildSuccess:
-    PM_START(SnapshotBuildSuccess);
-    SnapshotBuildSuccess sbs = event.snapshot_build_success;
-    PM_ID(sbs, operation_id);
-    PM_SLICE(sbs, correlation_id);
-    print_table_type(sbs.table_type);
-    print_load_type(sbs.load_type);
-    PM_U64(sbs, version);
-    PM_U64(sbs, duration_ns);
-    PM_END;
-    return;
-
-  case MetricEventSnapshotBuildFailure:
-    PM_START(SnapshotBuildFailure);
-    SnapshotBuildFailure slf = event.snapshot_build_failure;
-    PM_ID(slf, operation_id);
-    PM_SLICE(slf, correlation_id);
-    print_table_type(slf.table_type);
-    print_load_type(slf.load_type);
-    PM_U64(slf, duration_ns);
-    PM_END;
-    return;
-
-  case MetricEventTransactionCommitSuccess:
-    PM_START(TransactionCommitSuccess);
-    TransactionCommitSuccess tcs = event.transaction_commit_success;
-    PM_ID(tcs, operation_id);
-    PM_SLICE(tcs, correlation_id);
-    print_table_type(tcs.table_type);
-    PM_U64(tcs, commit_version);
-    PM_U64(tcs, num_add_files);
-    PM_U64(tcs, num_remove_files);
-    PM_U64(tcs, num_dv_updates);
-    PM_U64(tcs, add_files_bytes);
-    PM_U64(tcs, remove_files_bytes);
-    PM_BOOL(tcs, is_blind_append);
-    PM_BOOL(tcs, data_change);
-    printf("operation: %.*s,\n", (int)tcs.operation.len, tcs.operation.ptr);
-    PM_U64(tcs, prepare_duration_ns);
-    PM_U64(tcs, committer_duration_ns);
-    PM_U64(tcs, total_duration_ns);
-    PM_END;
-    return;
-
-  case MetricEventTransactionCommitFailure:
-    PM_START(TransactionCommitFailure);
-    TransactionCommitFailure tcf = event.transaction_commit_failure;
-    PM_ID(tcf, operation_id);
-    PM_SLICE(tcf, correlation_id);
-    print_table_type(tcf.table_type);
-    printf("  reason:");
-    switch (tcf.reason) {
-    case CommitFailureReasonConflict: printf(" Conflict,\n"); break;
-    case CommitFailureReasonRetryableIo: printf(" Retryable IO,\n"); break;
-    case CommitFailureReasonError: printf(" Error,\n"); break;
+  case MetricEventLogSegmentLoadCompleted: {
+    PM_START(LogSegmentLoadCompleted);
+    LogSegmentLoadCompleted value = event.log_segment_load_completed;
+    print_metric_context(value.context);
+    print_log_segment_load_type(value.load_type);
+    PM_U64(value, duration_ns);
+    printf("  outcome: %d,\n", value.outcome.tag);
+    if (value.outcome.tag == LogSegmentLoadOutcomeSuccess) {
+      PM_U64(value.outcome.success.stats, num_commit_files);
+      PM_U64(value.outcome.success.stats, num_checkpoint_files);
+      PM_U64(value.outcome.success.stats, num_compaction_files);
+      PM_BOOL(value.outcome.success.stats, has_crc);
+      PM_U64(value.outcome.success.stats, crc_versions_behind);
     }
     PM_END;
     return;
+  }
 
-  case MetricEventDomainMetadataLoadSuccess:
-    PM_START(DomainMetadataLoadSuccess);
-    DomainMetadataLoadSuccess dmls = event.domain_metadata_load_success;
-    PM_BOOL(dmls, from_cache);
-    PM_U64(dmls, num_domains_returned);
-    PM_U64(dmls, duration_ns);
+  case MetricEventProtocolMetadataLoadCompleted: {
+    PM_START(ProtocolMetadataLoadCompleted);
+    ProtocolMetadataLoadCompleted value = event.protocol_metadata_load_completed;
+    print_metric_context(value.context);
+    print_log_segment_load_type(value.load_type);
+    PM_U64(value, duration_ns);
+    printf("  outcome: %d,\n", value.outcome.tag);
+    if (value.outcome.tag == ProtocolMetadataLoadOutcomeSuccess) {
+      PM_U64(value.outcome.success, source);
+    }
     PM_END;
     return;
+  }
 
-  case MetricEventDomainMetadataLoadFailure:
-    PM_START(DomainMetadataLoadFailure);
+  case MetricEventSnapshotBuildCompleted: {
+    PM_START(SnapshotBuildCompleted);
+    SnapshotBuildCompleted value = event.snapshot_build_completed;
+    print_metric_context(value.context);
+    print_load_type(value.load_type);
+    PM_U64(value, duration_ns);
+    printf("  outcome: %d,\n", value.outcome.tag);
+    if (value.outcome.tag == SnapshotBuildOutcomeSuccess) {
+      PM_U64(value.outcome.success, version);
+    }
     PM_END;
     return;
+  }
 
-  case MetricEventSetTransactionLoadSuccess:
-    PM_START(SetTransactionLoadSuccess);
-    SetTransactionLoadSuccess stls = event.set_transaction_load_success;
-    PM_BOOL(stls, from_cache);
-    PM_BOOL(stls, found);
-    PM_U64(stls, duration_ns);
+  case MetricEventTransactionCommitCompleted: {
+    PM_START(TransactionCommitCompleted);
+    TransactionCommitCompleted value = event.transaction_commit_completed;
+    print_metric_context(value.context);
+    PM_U64(value, duration_ns);
+    printf("  outcome: %d,\n", value.outcome.tag);
+    if (value.outcome.tag == TransactionCommitOutcomeSuccess) {
+      PM_U64(value.outcome.success.stats, commit_version);
+      PM_U64(value.outcome.success.stats, num_add_files);
+      PM_U64(value.outcome.success.stats, num_remove_files);
+      PM_U64(value.outcome.success.stats, num_dv_updates);
+      PM_U64(value.outcome.success.stats, add_files_bytes);
+      PM_U64(value.outcome.success.stats, remove_files_bytes);
+      PM_BOOL(value.outcome.success.stats, is_blind_append);
+      PM_BOOL(value.outcome.success.stats, data_change);
+      PM_SLICE(value.outcome.success.stats, operation);
+      PM_U64(value.outcome.success.stats, prepare_duration_ns);
+      PM_U64(value.outcome.success.stats, committer_duration_ns);
+    }
+    if (value.outcome.tag == TransactionCommitOutcomeFailure) {
+      PM_U64(value.outcome.failure, reason);
+    }
     PM_END;
     return;
+  }
 
-  case MetricEventSetTransactionLoadFailure:
-    PM_START(SetTransactionLoadFailure);
+  case MetricEventDomainMetadataLoadCompleted: {
+    PM_START(DomainMetadataLoadCompleted);
+    DomainMetadataLoadCompleted value = event.domain_metadata_load_completed;
+    PM_U64(value, duration_ns);
+    printf("  outcome: %d,\n", value.outcome.tag);
+    if (value.outcome.tag == DomainMetadataLoadOutcomeSuccess) {
+      PM_BOOL(value.outcome.success, from_cache);
+      PM_U64(value.outcome.success, num_domains_returned);
+    }
     PM_END;
     return;
+  }
 
-  case MetricEventCrcReadSuccess:
-    PM_START(CrcReadSuccess);
-    CrcReadSuccess crs = event.crc_read_success;
-    PM_U64(crs, bytes_read);
-    PM_U64(crs, duration_ns);
+  case MetricEventSetTransactionLoadCompleted: {
+    PM_START(SetTransactionLoadCompleted);
+    SetTransactionLoadCompleted value = event.set_transaction_load_completed;
+    PM_U64(value, duration_ns);
+    printf("  outcome: %d,\n", value.outcome.tag);
+    if (value.outcome.tag == SetTransactionLoadOutcomeSuccess) {
+      PM_BOOL(value.outcome.success, from_cache);
+      PM_BOOL(value.outcome.success, found);
+    }
     PM_END;
     return;
+  }
 
-  case MetricEventCrcReadFailure:
-    PM_START(CrcReadFailure);
+  case MetricEventCrcReadCompleted: {
+    PM_START(CrcReadCompleted);
+    CrcReadCompleted value = event.crc_read_completed;
+    PM_U64(value, duration_ns);
+    printf("  outcome: %d,\n", value.outcome.tag);
+    if (value.outcome.tag == CrcReadOutcomeSuccess) {
+      PM_U64(value.outcome.success, bytes_read);
+    }
     PM_END;
     return;
+  }
 
-  case MetricEventCheckpointWriteSuccess:
-    PM_START(CheckpointWriteSuccess);
-    CheckpointWriteSuccess cps = event.checkpoint_write_success;
-    PM_ID(cps, operation_id);
-    PM_U64(cps, version);
-    printf("  outcome: %d,\n", cps.outcome.tag);
-    PM_U64(cps, mode);
-    PM_U64(cps, duration_ns);
-    PM_U64(cps.processing_stats, log_tail_input_duration_ns);
-    PM_U64(cps.processing_stats, checkpoint_input_duration_ns);
-    PM_U64(cps.processing_stats, reconciliation_duration_ns);
-    PM_U64(cps.processing_stats, stats_transform_duration_ns);
-    PM_U64(cps.processing_stats, output_preparation_duration_ns);
-    PM_U64(cps.processing_stats, num_actions_from_log_tail);
-    PM_U64(cps.processing_stats, num_actions_from_checkpoint);
-    PM_U64(cps.output_stats, parquet_write_duration_ns);
-    PM_U64(cps.output_stats, verification_duration_ns);
-    PM_U64(cps.output_stats, bytes_written);
-    PM_U64(cps.output_stats, num_sidecars_written);
-    if (cps.outcome.tag == CheckpointWriteOutcomeWritten) {
-      CheckpointWriteStats stats = cps.outcome.written.stats;
+  case MetricEventCheckpointWriteCompleted: {
+    PM_START(CheckpointWriteCompleted);
+    CheckpointWriteCompleted value = event.checkpoint_write_completed;
+    PM_ID(value, operation_id);
+    PM_U64(value, version);
+    PM_U64(value, mode);
+    PM_U64(value.processing_stats, log_tail_input_duration_ns);
+    PM_U64(value.processing_stats, checkpoint_input_duration_ns);
+    PM_U64(value.processing_stats, reconciliation_duration_ns);
+    PM_U64(value.processing_stats, stats_transform_duration_ns);
+    PM_U64(value.processing_stats, output_preparation_duration_ns);
+    PM_U64(value.processing_stats, num_actions_from_log_tail);
+    PM_U64(value.processing_stats, num_actions_from_checkpoint);
+    PM_U64(value.output_stats, parquet_write_duration_ns);
+    PM_U64(value.output_stats, verification_duration_ns);
+    PM_U64(value.output_stats, bytes_written);
+    PM_U64(value.output_stats, num_sidecars_written);
+    PM_U64(value, duration_ns);
+    printf("  outcome: %d,\n", value.outcome.tag);
+    if (value.outcome.tag == CheckpointWriteOutcomeWritten) {
+      CheckpointWriteStats stats = value.outcome.written.stats;
       PM_U64(stats, size_in_bytes);
       PM_U64(stats, num_add_files);
       PM_U64(stats, num_remove_files);
@@ -583,27 +550,19 @@ void print_metric(MetricEvent event) {
     }
     PM_END;
     return;
+  }
 
-  case MetricEventCheckpointWriteFailure:
-    PM_START(CheckpointWriteFailure);
-    CheckpointWriteFailure cpf = event.checkpoint_write_failure;
-    PM_ID(cpf, operation_id);
-    PM_U64(cpf, version);
-    PM_U64(cpf, mode);
-    PM_U64(cpf, duration_ns);
-    PM_U64(cpf.processing_stats, log_tail_input_duration_ns);
-    PM_U64(cpf.processing_stats, checkpoint_input_duration_ns);
-    PM_U64(cpf.processing_stats, reconciliation_duration_ns);
-    PM_U64(cpf.processing_stats, stats_transform_duration_ns);
-    PM_U64(cpf.processing_stats, output_preparation_duration_ns);
-    PM_U64(cpf.processing_stats, num_actions_from_log_tail);
-    PM_U64(cpf.processing_stats, num_actions_from_checkpoint);
-    PM_U64(cpf.output_stats, parquet_write_duration_ns);
-    PM_U64(cpf.output_stats, verification_duration_ns);
-    PM_U64(cpf.output_stats, bytes_written);
-    PM_U64(cpf.output_stats, num_sidecars_written);
+  case MetricEventChecksumWriteCompleted: {
+    PM_START(ChecksumWriteCompleted);
+    ChecksumWriteCompleted value = event.checksum_write_completed;
+    PM_U64(value, resolution_mode);
+    PM_U64(value, duration_ns);
+    printf("  outcome: %d,\n", value.outcome.tag);
+    if (value.outcome.tag == ChecksumWriteOutcomeWritten) {
+    }
     PM_END;
     return;
+  }
 
   case MetricEventJsonReadCompleted:
     PM_START(MetricEventJsonReadCompleted);
@@ -624,9 +583,7 @@ void print_metric(MetricEvent event) {
   case MetricEventScanMetadataCompleted:
     PM_START(ScanMetadataCompleted);
     ScanMetadataCompleted smc = event.scan_metadata_completed;
-    PM_ID(smc, operation_id);
-    PM_SLICE(smc, correlation_id);
-    print_table_type(smc.table_type);
+    print_metric_context(smc.context);
     printf("  scan_type:");
     switch (smc.scan_type) {
     case ScanTypeSequentialPhase: printf(" Sequential Phase,\n"); break;

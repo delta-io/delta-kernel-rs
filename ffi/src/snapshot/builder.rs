@@ -416,7 +416,10 @@ fn snapshot_builder_build_impl(
 mod tests {
     use std::ffi::c_char;
 
-    use delta_kernel::metrics::MetricEvent;
+    use delta_kernel::metrics::{
+        LogSegmentLoadCompleted, LogSegmentLoadOutcome, MetricEvent, ProtocolMetadataLoadCompleted,
+        ProtocolMetadataLoadOutcome, SnapshotBuildCompleted, SnapshotBuildOutcome,
+    };
     use rstest::rstest;
     use test_utils::{CapturingReporter, TestAction, actions_to_string};
 
@@ -534,20 +537,50 @@ mod tests {
         let mut completions = 0;
         for event in reporter.events() {
             let correlation_id = match event {
-                MetricEvent::SnapshotBuildSuccess(event) => {
+                MetricEvent::SnapshotBuildCompleted(
+                    event @ SnapshotBuildCompleted {
+                        outcome: SnapshotBuildOutcome::Success { .. },
+                        ..
+                    },
+                ) => {
                     completions += 1;
                     assert!(!fail);
-                    event.correlation_id
+                    event.context.correlation_id
                 }
-                MetricEvent::SnapshotBuildFailure(event) => {
+                MetricEvent::SnapshotBuildCompleted(
+                    event @ SnapshotBuildCompleted {
+                        outcome: SnapshotBuildOutcome::Error,
+                        ..
+                    },
+                ) => {
                     completions += 1;
                     assert!(fail);
-                    event.correlation_id
+                    event.context.correlation_id
                 }
-                MetricEvent::LogSegmentLoadSuccess(event) => event.correlation_id,
-                MetricEvent::LogSegmentLoadFailure(event) => event.correlation_id,
-                MetricEvent::ProtocolMetadataLoadSuccess(event) => event.correlation_id,
-                MetricEvent::ProtocolMetadataLoadFailure(event) => event.correlation_id,
+                MetricEvent::LogSegmentLoadCompleted(
+                    event @ LogSegmentLoadCompleted {
+                        outcome: LogSegmentLoadOutcome::Success { .. },
+                        ..
+                    },
+                ) => event.context.correlation_id,
+                MetricEvent::LogSegmentLoadCompleted(
+                    event @ LogSegmentLoadCompleted {
+                        outcome: LogSegmentLoadOutcome::Error,
+                        ..
+                    },
+                ) => event.context.correlation_id,
+                MetricEvent::ProtocolMetadataLoadCompleted(
+                    event @ ProtocolMetadataLoadCompleted {
+                        outcome: ProtocolMetadataLoadOutcome::Success { .. },
+                        ..
+                    },
+                ) => event.context.correlation_id,
+                MetricEvent::ProtocolMetadataLoadCompleted(
+                    event @ ProtocolMetadataLoadCompleted {
+                        outcome: ProtocolMetadataLoadOutcome::Error,
+                        ..
+                    },
+                ) => event.context.correlation_id,
                 _ => continue,
             };
             assert_eq!(correlation_id.as_deref(), Some("snapshot-request"));

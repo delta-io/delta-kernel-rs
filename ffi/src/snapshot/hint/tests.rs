@@ -12,7 +12,9 @@ use delta_kernel::crc::Crc;
 use delta_kernel::engine::{DelegatingEngine, PanicEngine};
 use delta_kernel::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
 use delta_kernel::log_segment::LogSegment;
-use delta_kernel::metrics::{MetricEvent, SnapshotLoadType};
+use delta_kernel::metrics::{
+    MetricEvent, SnapshotBuildCompleted, SnapshotBuildOutcome, SnapshotLoadType,
+};
 use delta_kernel::path::{LogPathFileType, ParsedLogPath};
 use delta_kernel::snapshot::{IncrementalReplay, PublicationWatermark, Snapshot};
 use delta_kernel::{FileMeta, FileSlice, KernelResult, KernelResultIterator, StorageHandler};
@@ -308,14 +310,19 @@ fn snapshot_hint_build_preserves_correlation_id() {
         .events()
         .into_iter()
         .filter_map(|event| match event {
-            MetricEvent::SnapshotBuildSuccess(event) => Some(event),
+            MetricEvent::SnapshotBuildCompleted(
+                event @ SnapshotBuildCompleted {
+                    outcome: SnapshotBuildOutcome::Success { .. },
+                    ..
+                },
+            ) => Some(event),
             _ => None,
         })
         .collect();
     assert_eq!(completions.len(), 1);
     assert_eq!(completions[0].load_type, SnapshotLoadType::SnapshotHint);
     assert_eq!(
-        completions[0].correlation_id.as_deref(),
+        completions[0].context.correlation_id.as_deref(),
         Some("hint-request")
     );
     unsafe {

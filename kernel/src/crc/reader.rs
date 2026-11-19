@@ -17,7 +17,7 @@ use crate::{Engine, KernelError, KernelResult};
 /// missing required fields). Cancellation must propagate; other failures may fall back to log
 /// replay.
 ///
-/// Reports metrics: `CrcReadSuccess` or `CrcReadFailure`.
+/// Reports metrics: `CrcReadCompleted`.
 #[instrument(name = CRC_READ_COMPLETED_SPAN, err(level = "warn"), skip_all, fields(report, enable_call_frame, bytes_read, path = ?crc_path.location.location))]
 pub(crate) fn try_read_crc_file(
     engine: &dyn Engine,
@@ -60,7 +60,7 @@ mod tests {
     use crate::actions::{Format, Metadata, Protocol};
     use crate::engine::CancellableEngine;
     use crate::engine::sync::SyncEngine;
-    use crate::metrics::MetricEvent;
+    use crate::metrics::{CrcReadCompleted, CrcReadOutcome, MetricEvent};
     use crate::path::ParsedLogPath;
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::{
@@ -217,10 +217,23 @@ mod tests {
         let crc_events: Vec<_> = reporter
             .events()
             .into_iter()
-            .filter(|e| matches!(e, MetricEvent::CrcReadSuccess(_)))
+            .filter(|e| {
+                matches!(
+                    e,
+                    MetricEvent::CrcReadCompleted(CrcReadCompleted {
+                        outcome: CrcReadOutcome::Success { .. },
+                        ..
+                    })
+                )
+            })
             .collect();
         assert_eq!(crc_events.len(), 1);
-        assert!(matches!(&crc_events[0], MetricEvent::CrcReadSuccess(e) if e.bytes_read > 0));
+
+        assert!(
+            matches!(&crc_events[0], MetricEvent::CrcReadCompleted(CrcReadCompleted {
+                outcome: CrcReadOutcome::Success { bytes_read }, ..
+            }) if *bytes_read > 0)
+        );
     }
 
     #[test]
@@ -236,16 +249,24 @@ mod tests {
 
         let events = reporter.events();
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, MetricEvent::CrcReadFailure)),
-            "expected CrcReadFailure when JSON parse fails"
+            events.iter().any(|e| matches!(
+                e,
+                MetricEvent::CrcReadCompleted(CrcReadCompleted {
+                    outcome: CrcReadOutcome::Error,
+                    ..
+                })
+            )),
+            "expected CrcReadCompleted when JSON parse fails"
         );
         assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, MetricEvent::CrcReadSuccess(_))),
-            "should not emit CrcReadSuccess when JSON parse fails"
+            !events.iter().any(|e| matches!(
+                e,
+                MetricEvent::CrcReadCompleted(CrcReadCompleted {
+                    outcome: CrcReadOutcome::Success { .. },
+                    ..
+                })
+            )),
+            "should not emit CrcReadCompleted when JSON parse fails"
         );
     }
 }

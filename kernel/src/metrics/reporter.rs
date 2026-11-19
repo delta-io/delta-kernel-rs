@@ -10,11 +10,11 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 
 use super::events::{
-    CheckpointWriteSuccess, ChecksumWriteSuccess, CrcReadSuccess, DomainMetadataLoadSuccess,
-    JsonReadCompleted, LastCheckpointReadCompleted, LogSegmentLoadSuccess, MetricEvent,
-    ParquetReadCompleted, ProtocolMetadataLoadSuccess, STORAGE_SPAN, ScanMetadataCompleted,
-    SetTransactionLoadSuccess, SnapshotBuildSuccess, TransactionCommitSuccess,
-    storage_metric_from_attrs,
+    CheckpointWriteCompleted, ChecksumWriteCompleted, CrcReadCompleted,
+    DomainMetadataLoadCompleted, JsonReadCompleted, LastCheckpointReadCompleted,
+    LogSegmentLoadCompleted, MetricEvent, ParquetReadCompleted, ProtocolMetadataLoadCompleted,
+    STORAGE_SPAN, ScanMetadataCompleted, SetTransactionLoadCompleted, SnapshotBuildCompleted,
+    TransactionCommitCompleted, storage_metric_from_attrs,
 };
 
 // ====================================================================
@@ -107,39 +107,43 @@ where
             return;
         };
         let event = match metadata.name() {
-            CheckpointWriteSuccess::SPAN_NAME => Some(MetricEvent::CheckpointWriteSuccess(
-                CheckpointWriteSuccess::from_attrs(attrs),
+            CheckpointWriteCompleted::SPAN_NAME => Some(MetricEvent::CheckpointWriteCompleted(
+                CheckpointWriteCompleted::from_attrs(attrs),
             )),
-            LogSegmentLoadSuccess::SPAN_NAME => Some(MetricEvent::LogSegmentLoadSuccess(
-                LogSegmentLoadSuccess::from_attrs(attrs),
+            LogSegmentLoadCompleted::SPAN_NAME => Some(MetricEvent::LogSegmentLoadCompleted(
+                LogSegmentLoadCompleted::from_attrs(attrs),
             )),
-            ProtocolMetadataLoadSuccess::SPAN_NAME => {
-                Some(MetricEvent::ProtocolMetadataLoadSuccess(
-                    ProtocolMetadataLoadSuccess::from_attrs(attrs),
+            ProtocolMetadataLoadCompleted::SPAN_NAME => {
+                Some(MetricEvent::ProtocolMetadataLoadCompleted(
+                    ProtocolMetadataLoadCompleted::from_attrs(attrs),
                 ))
             }
-            SnapshotBuildSuccess::SPAN_NAME => Some(MetricEvent::SnapshotBuildSuccess(
-                SnapshotBuildSuccess::from_attrs(attrs),
+            SnapshotBuildCompleted::SPAN_NAME => Some(MetricEvent::SnapshotBuildCompleted(
+                SnapshotBuildCompleted::from_attrs(attrs),
             )),
-            TransactionCommitSuccess::SPAN_NAME => Some(MetricEvent::TransactionCommitSuccess(
-                TransactionCommitSuccess::from_attrs(attrs),
+            TransactionCommitCompleted::SPAN_NAME => Some(MetricEvent::TransactionCommitCompleted(
+                TransactionCommitCompleted::from_attrs(attrs),
             )),
-            DomainMetadataLoadSuccess::SPAN_NAME => Some(MetricEvent::DomainMetadataLoadSuccess(
-                DomainMetadataLoadSuccess::from_attrs(attrs),
-            )),
-            SetTransactionLoadSuccess::SPAN_NAME => Some(MetricEvent::SetTransactionLoadSuccess(
-                SetTransactionLoadSuccess::from_attrs(attrs),
-            )),
-            CrcReadSuccess::SPAN_NAME => Some(MetricEvent::CrcReadSuccess(
-                CrcReadSuccess::from_attrs(attrs),
+            DomainMetadataLoadCompleted::SPAN_NAME => {
+                Some(MetricEvent::DomainMetadataLoadCompleted(
+                    DomainMetadataLoadCompleted::from_attrs(attrs),
+                ))
+            }
+            SetTransactionLoadCompleted::SPAN_NAME => {
+                Some(MetricEvent::SetTransactionLoadCompleted(
+                    SetTransactionLoadCompleted::from_attrs(attrs),
+                ))
+            }
+            CrcReadCompleted::SPAN_NAME => Some(MetricEvent::CrcReadCompleted(
+                CrcReadCompleted::from_attrs(attrs),
             )),
             LastCheckpointReadCompleted::SPAN_NAME => {
                 Some(MetricEvent::LastCheckpointReadCompleted(
                     LastCheckpointReadCompleted::from_attrs(attrs),
                 ))
             }
-            ChecksumWriteSuccess::SPAN_NAME => Some(MetricEvent::ChecksumWriteSuccess(
-                ChecksumWriteSuccess::from_attrs(attrs),
+            ChecksumWriteCompleted::SPAN_NAME => Some(MetricEvent::ChecksumWriteCompleted(
+                ChecksumWriteCompleted::from_attrs(attrs),
             )),
             JsonReadCompleted::SPAN_NAME => Some(MetricEvent::JsonReadCompleted(
                 JsonReadCompleted::from_attrs(attrs),
@@ -161,14 +165,14 @@ where
     }
 
     // RUNTIME CHANNEL. on_event carries log lines, not metric writes; its only metric effect is the
-    // `#[instrument(err)]` failure signal, handled by FailureFlipVisitor.
+    // `#[instrument(err)]` failure signal, handled by ErrorVisitor.
     fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
         let Some(span) = ctx.event_span(event) else {
             return;
         };
         let mut extensions = span.extensions_mut();
         if let Some(visitor) = extensions.get_mut::<EventVisitor>() {
-            event.record(&mut FailureFlipVisitor {
+            event.record(&mut ErrorVisitor {
                 event: &mut visitor.event,
             });
         }
@@ -291,24 +295,26 @@ impl Visit for EventVisitor {
 }
 
 // ====================================================================
-// FailureFlipVisitor: the event channel's only metric effect
+// ErrorVisitor: the event channel's only metric effect
 // ====================================================================
 
 /// Event-path visitor for the synthetic event `#[instrument(err)]` emits on `Err` return.
 ///
 /// Marks the span's in-flight metric as failed and ignores every other field, so arbitrary
 /// log-line fields never reach the metric allowlist.
-struct FailureFlipVisitor<'a> {
+struct ErrorVisitor<'a> {
     event: &'a mut Option<MetricEvent>,
 }
 
-impl Visit for FailureFlipVisitor<'_> {
+impl Visit for ErrorVisitor<'_> {
     fn record_debug(&mut self, field: &Field, _value: &dyn std::fmt::Debug) {
         // `#[instrument(err)]` emits a synthetic event with an `error` field (via Display, hence
         // record_debug) when the wrapped fn returns Err. That field name is a tracing convention,
         // not kernel's.
-        if field.name() == "error" {
-            *self.event = self.event.take().map(MetricEvent::into_failure);
+        if field.name() == "error"
+            && let Some(event) = self.event.as_mut()
+        {
+            event.mark_error();
         }
     }
 }
@@ -329,13 +335,17 @@ mod tests {
     use uuid::Uuid;
 
     use crate::metrics::events::{
-        SNAPSHOT_COMPLETED_SPAN, SnapshotLoadMetricContext, emit_log_segment_load_failure,
-        emit_protocol_metadata_load_failure,
+        SNAPSHOT_COMPLETED_SPAN, SnapshotLoadMetricContext, emit_log_segment_load,
+        emit_protocol_metadata_load,
     };
     use crate::metrics::{
-        CheckpointOutputStats, CheckpointProcessingStats, CheckpointWriteMode,
-        CheckpointWriteOutcome, CheckpointWriteStats, LastCheckpointReadOutcome, MetricEvent,
-        MetricId, WithMetricsReporterLayer as _,
+        CheckpointOutputStats, CheckpointProcessingStats, CheckpointWriteCompleted,
+        CheckpointWriteMode, CheckpointWriteOutcome, CheckpointWriteStats, ChecksumWriteOutcome,
+        CrcReadOutcome, DomainMetadataLoadOutcome, LastCheckpointReadOutcome,
+        LogSegmentLoadCompleted, LogSegmentLoadOutcome, MetricEvent, MetricId,
+        ProtocolMetadataLoadCompleted, ProtocolMetadataLoadOutcome, SetTransactionLoadOutcome,
+        SnapshotBuildCompleted, SnapshotBuildOutcome, TransactionCommitOutcome,
+        WithMetricsReporterLayer as _,
     };
     use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
 
@@ -512,7 +522,15 @@ mod tests {
         let events = reporter.events();
         assert_eq!(events.len(), 1);
         let (mode, duration, id, version, processing, output) = match (&events[0], fail) {
-            (MetricEvent::CheckpointWriteFailure(event), true) => (
+            (
+                MetricEvent::CheckpointWriteCompleted(
+                    event @ CheckpointWriteCompleted {
+                        outcome: CheckpointWriteOutcome::Error,
+                        ..
+                    },
+                ),
+                true,
+            ) => (
                 event.mode,
                 event.duration,
                 event.operation_id,
@@ -520,7 +538,17 @@ mod tests {
                 event.processing_stats,
                 event.output_stats,
             ),
-            (MetricEvent::CheckpointWriteSuccess(event), false) => {
+            (
+                MetricEvent::CheckpointWriteCompleted(
+                    event @ CheckpointWriteCompleted {
+                        outcome:
+                            CheckpointWriteOutcome::Written { .. }
+                            | CheckpointWriteOutcome::AlreadyExists,
+                        ..
+                    },
+                ),
+                false,
+            ) => {
                 assert_eq!(
                     event.outcome,
                     CheckpointWriteOutcome::Written {
@@ -589,7 +617,7 @@ mod tests {
 
     // A log line whose field name collides with a real metric field must NOT overwrite the value a
     // genuine `span.record` wrote -- the core guarantee of narrowing on_event to
-    // FailureFlipVisitor. capture_logs discards the reporter, so this test installs a
+    // ErrorVisitor. capture_logs discards the reporter, so this test installs a
     // CapturingReporter to inspect the reported event.
     #[test]
     fn log_event_reusing_a_metric_field_name_does_not_overwrite_recorded_metric() {
@@ -608,14 +636,34 @@ mod tests {
             info!(version = 999u64, "noise"); // log line reusing the metric field name (on_event)
         } // span close -> report
         let events = reporter.events();
-        let Some(MetricEvent::SnapshotBuildSuccess(success)) = events
-            .iter()
-            .find(|e| matches!(e, MetricEvent::SnapshotBuildSuccess(_)))
+        let Some(MetricEvent::SnapshotBuildCompleted(
+            success @ SnapshotBuildCompleted {
+                outcome: SnapshotBuildOutcome::Success { .. },
+                ..
+            },
+        )) = events.iter().find(|e| {
+            matches!(
+                e,
+                MetricEvent::SnapshotBuildCompleted(SnapshotBuildCompleted {
+                    outcome: SnapshotBuildOutcome::Success { .. },
+                    ..
+                })
+            )
+        })
         else {
             panic!("expected a snapshot build success event; got: {events:?}");
         };
+
+        let SnapshotBuildOutcome::Success {
+            version: metric_success_version,
+            ..
+        } = &success.outcome
+        else {
+            panic!("unexpected metric outcome");
+        };
         assert_eq!(
-            success.version, 7,
+            (*metric_success_version),
+            7,
             "an on_event log field must not overwrite a span.record metric"
         );
     }
@@ -639,7 +687,8 @@ mod tests {
         let _ = failing_build(delay);
         let events = reporter.events();
         assert!(
-            matches!(events.as_slice(), [MetricEvent::SnapshotBuildFailure(event)] if event.duration >= delay),
+            matches!(events.as_slice(), [MetricEvent::SnapshotBuildCompleted(event)]
+                if event.outcome == SnapshotBuildOutcome::Error && event.duration >= delay),
             "expected one snapshot build failure with duration >= {delay:?}; got: {events:?}"
         );
     }
@@ -651,13 +700,23 @@ mod tests {
         let context = SnapshotLoadMetricContext::for_test();
         let duration = Duration::from_nanos(duration_ns);
 
-        emit_log_segment_load_failure(&context, duration);
-        emit_protocol_metadata_load_failure(&context, duration);
+        emit_log_segment_load(&context, LogSegmentLoadOutcome::Error, duration);
+        emit_protocol_metadata_load(&context, ProtocolMetadataLoadOutcome::Error, duration);
 
         let events = reporter.events();
         let [
-            MetricEvent::LogSegmentLoadFailure(segment),
-            MetricEvent::ProtocolMetadataLoadFailure(pm),
+            MetricEvent::LogSegmentLoadCompleted(
+                segment @ LogSegmentLoadCompleted {
+                    outcome: LogSegmentLoadOutcome::Error,
+                    ..
+                },
+            ),
+            MetricEvent::ProtocolMetadataLoadCompleted(
+                pm @ ProtocolMetadataLoadCompleted {
+                    outcome: ProtocolMetadataLoadOutcome::Error,
+                    ..
+                },
+            ),
         ] = events.as_slice()
         else {
             panic!("expected log-segment and protocol/metadata failures; got: {events:?}");
@@ -678,16 +737,87 @@ mod tests {
         let _ = succeeding_build();
         let events = reporter.events();
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, MetricEvent::SnapshotBuildSuccess(_))),
+            events.iter().any(|e| matches!(
+                e,
+                MetricEvent::SnapshotBuildCompleted(SnapshotBuildCompleted {
+                    outcome: SnapshotBuildOutcome::Success { .. },
+                    ..
+                })
+            )),
             "#[instrument(ret)]'s `return` field must NOT flip success to failure; got: {events:?}"
         );
         assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, MetricEvent::SnapshotBuildFailure(_))),
+            !events.iter().any(|e| matches!(
+                e,
+                MetricEvent::SnapshotBuildCompleted(SnapshotBuildCompleted {
+                    outcome: SnapshotBuildOutcome::Error,
+                    ..
+                })
+            )),
             "a successful #[instrument(ret)] must not emit a failure event; got: {events:?}"
         );
+    }
+    #[rstest::rstest]
+    #[case::snapshot(|| info_span!("snap.build", report = Empty))]
+    #[case::commit(|| info_span!("txn.commit", report = Empty))]
+    #[case::domain(|| info_span!("snap.get_domain_metadata", report = Empty))]
+    #[case::set_transaction(|| info_span!("snap.get_app_id_version", report = Empty))]
+    #[case::crc(|| info_span!("crc_read_completed", report = Empty))]
+    #[case::checkpoint(|| info_span!("snap.checkpoint", report = Empty))]
+    #[case::checksum(|| info_span!("snap.write_checksum", report = Empty))]
+    fn lifecycle_errors_report_elapsed_time(#[case] make_span: fn() -> tracing::Span) {
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        {
+            let span = make_span();
+            let _entered = span.enter();
+            info!(error = tracing::field::display("injected failure"));
+        }
+        let events = reporter.events();
+        assert_eq!(events.len(), 1);
+        let (duration, failed) = match &events[0] {
+            MetricEvent::SnapshotBuildCompleted(e) => {
+                (e.duration, matches!(e.outcome, SnapshotBuildOutcome::Error))
+            }
+            MetricEvent::TransactionCommitCompleted(e) => (
+                e.duration,
+                matches!(
+                    e.outcome,
+                    TransactionCommitOutcome::Failure {
+                        reason: crate::metrics::CommitFailureReason::Error
+                    }
+                ),
+            ),
+            MetricEvent::DomainMetadataLoadCompleted(e) => (
+                e.duration,
+                matches!(e.outcome, DomainMetadataLoadOutcome::Error),
+            ),
+            MetricEvent::SetTransactionLoadCompleted(e) => (
+                e.duration,
+                matches!(e.outcome, SetTransactionLoadOutcome::Error),
+            ),
+            MetricEvent::CrcReadCompleted(e) => {
+                (e.duration, matches!(e.outcome, CrcReadOutcome::Error))
+            }
+            MetricEvent::CheckpointWriteCompleted(e) => {
+                (e.duration, e.outcome == CheckpointWriteOutcome::Error)
+            }
+            MetricEvent::ChecksumWriteCompleted(e) => {
+                (e.duration, e.outcome == ChecksumWriteOutcome::Error)
+            }
+            other => panic!("unexpected metric: {other:?}"),
+        };
+        assert!(failed);
+        assert!(duration > Duration::ZERO);
+    }
+
+    #[test]
+    fn invalid_commit_failure_reason_warns_after_releasing_span_lock() {
+        let logs = capture_logs(|| {
+            let span = info_span!("txn.commit", report = Empty, failure_reason = Empty);
+            let _entered = span.enter();
+            span.record("failure_reason", "invalid_reason");
+        });
+        assert!(logs.contains("Invalid field 'failure_reason' recorded on txn.commit span"));
     }
 }

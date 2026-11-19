@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Breaking changes
+
+- Replace Success/Failure metric-event pairs with operation-specific `*Completed` events and
+  tagged outcome enums in Rust and C FFI. Result fields move into their applicable outcome variant.
+  Shared identity and table labels move into `context: metrics::MetricContext`, including scan events.
+  Transaction `total_duration` becomes `duration`; completed events report timing on errors too.
+
 ## [v0.30.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.30.1/) (2026-10-23)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.30.0...v0.30.1)

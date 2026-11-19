@@ -84,7 +84,7 @@ the event onto a channel and drain it from a worker.
 
 Filename: src/reporter.rs
 
-```rust,ignore
+```rust
 use delta_kernel::metrics::{MetricEvent, MetricsReporter};
 
 #[derive(Debug)]
@@ -114,9 +114,9 @@ tracing_subscriber::registry()
 When a snapshot loads, you'll see output like:
 
 ```text
-[kernel-metrics] LogSegmentLoadSuccess(id=a1b2c3d4-..., duration=12.34ms, commits=5, checkpoints=1, compactions=0, has_latest_crc=true)
-[kernel-metrics] ProtocolMetadataLoadSuccess(id=a1b2c3d4-..., duration=3.21ms)
-[kernel-metrics] SnapshotBuildSuccess(id=a1b2c3d4-..., version=5, duration=15.55ms)
+[kernel-metrics] LogSegmentLoadCompleted(id=a1b2c3d4-..., table_type=path_based, correlation_id=None, load_type=full, duration=12.34ms, outcome=Success { stats: LogSegmentLoadStats { num_commit_files: 5, num_checkpoint_files: 1, num_compaction_files: 0, crc_versions_behind: None } })
+[kernel-metrics] ProtocolMetadataLoadCompleted(id=a1b2c3d4-..., table_type=path_based, correlation_id=None, load_type=full, duration=3.21ms, outcome=Success { source: FullReplay })
+[kernel-metrics] SnapshotBuildCompleted(id=a1b2c3d4-..., table_type=path_based, correlation_id=None, load_type=full, duration=15.55ms, outcome=Success { version: 5 })
 ```
 
 ## Metric events
@@ -127,17 +127,19 @@ categories: snapshot lifecycle, scan metadata, and storage/file I/O.
 ### Snapshot lifecycle events
 
 These events track the process of loading a [Snapshot](../concepts/architecture.md)
-from the Delta log. Each carries an `operation_id` (`MetricId`) that ties all
-events from the same snapshot load together.
+from the Delta log. Their `context.operation_id` (`MetricId`) ties all events from the same
+snapshot load together.
 
-| Event | Fields | What it measures |
-|-------|--------|------------------|
-| `LogSegmentLoadSuccess` | `operation_id`, `duration`, `num_commit_files`, `num_checkpoint_files`, `num_compaction_files`, `has_latest_crc_file` | Time to list and organize log files into a log segment. |
-| `LogSegmentLoadFailure` | `operation_id`, `duration` | Time spent before log segment loading failed. |
-| `ProtocolMetadataLoadSuccess` | `operation_id`, `duration` | Time to read protocol and metadata actions from the log. |
-| `ProtocolMetadataLoadFailure` | `operation_id`, `duration` | Time spent before protocol/metadata loading failed. |
-| `SnapshotBuildSuccess` | `operation_id`, `version`, `duration` | End-to-end snapshot creation, including the table version that was loaded. |
-| `SnapshotBuildFailure` | `operation_id`, `duration` | Time spent before snapshot creation failed. Use this to track error rates. |
+| Event | What it measures |
+|-------|------------------|
+| `LogSegmentLoadCompleted` | Listing and organizing log files, including failed attempts. |
+| `ProtocolMetadataLoadCompleted` | Resolving protocol and metadata from the log or a CRC. |
+| `SnapshotBuildCompleted` | The complete snapshot build, including its final outcome. |
+
+Each event carries `context` and `duration`. Match its operation-specific `outcome` to access
+result fields, such as `SnapshotBuildOutcome::Success { version }`. Error outcomes carry no
+successful-result fields. See the [metrics API](https://docs.rs/delta_kernel/latest/delta_kernel/metrics/)
+for the event and outcome contracts.
 
 ### Scan metadata events
 
@@ -146,7 +148,7 @@ parallel scan. It describes the corresponding log replay work:
 
 | Field | Meaning |
 |-------|---------|
-| `operation_id` | Unique ID for this scan, useful for correlation. |
+| `context.operation_id` | Unique ID for this scan, useful for correlation. |
 | `scan_type` | Which scan path produced the event (see below). |
 | `duration` | Wall-clock time from scan start to iterator exhaustion. |
 | `num_add_files_seen` | Add actions in replay input before predicate filtering and deduplication. Includes checkpoint and delta files. |
@@ -175,7 +177,7 @@ For `parallel_scan_metadata`, `finish()` emits the sequential-phase event. If it
 returns parallel work, call `state.log_metrics()` exactly once after all workers
 complete to emit the parallel-phase event. Action counts and timings are phase-local;
 `peak_hash_set_size` is the whole-scan high-water mark and should not be combined.
-Join the two events by `operation_id` to obtain whole-scan metrics.
+Join the two events by `context.operation_id` to obtain whole-scan metrics.
 
 ### Storage and file I/O events
 
@@ -191,8 +193,7 @@ storage call may serve multiple higher-level operations.
 | `StorageCopyCompleted` | `duration` | A storage copy/rename call. |
 | `JsonReadCompleted` | `num_files`, `bytes_read` | One `JsonHandler::read_json_files` call completed. `bytes_read` is the sum of on-disk file sizes. |
 | `ParquetReadCompleted` | `num_files`, `bytes_read` | One `ParquetHandler::read_parquet_files` call completed. `bytes_read` is the sum of on-disk file sizes. |
-| `CrcReadSuccess` | `duration`, `bytes_read` | One CRC file read and parsed successfully. `bytes_read` is the raw byte count from storage. |
-| `CrcReadFailure` | none | A CRC file read or parse failed. Non-cancellation failures allow log replay. |
+| `CrcReadCompleted` | `duration`, `outcome` | A CRC read and parse attempt. `CrcReadOutcome::Success` carries the raw `bytes_read`; errors normally allow log replay. |
 
 > [!NOTE]
 > If you implement a custom `JsonHandler` or `ParquetHandler`, call
@@ -212,26 +213,26 @@ outcome and timing semantics.
 ### Checksum write events
 
 To track checksum write latency and errors, use
-[ChecksumWriteSuccess](https://docs.rs/delta_kernel/latest/delta_kernel/metrics/struct.ChecksumWriteSuccess.html)
-and [ChecksumWriteFailure](https://docs.rs/delta_kernel/latest/delta_kernel/metrics/struct.ChecksumWriteFailure.html).
+[ChecksumWriteCompleted](https://docs.rs/delta_kernel/latest/delta_kernel/metrics/struct.ChecksumWriteCompleted.html)
+and [ChecksumWriteOutcome](https://docs.rs/delta_kernel/latest/delta_kernel/metrics/enum.ChecksumWriteOutcome.html).
 A checksum that already exists produces a success event. See
 [Snapshot::write_checksum](https://docs.rs/delta_kernel/latest/delta_kernel/struct.Snapshot.html#method.write_checksum)
 for the call's behavior.
 
 ## Correlating events with MetricId
 
-Several events include an `operation_id` field of type `MetricId`. This is a
+Several events include a `context.operation_id` field of type `MetricId`. This is a
 UUID that uniquely identifies an operation instance. All events from the same
 snapshot load share the same `MetricId`, so you can group them to reconstruct
 a timeline:
 
-1. `LogSegmentLoadSuccess` or `LogSegmentLoadFailure` (listing the log segment)
-2. `ProtocolMetadataLoadSuccess` or `ProtocolMetadataLoadFailure` (reading protocol and metadata)
-3. `SnapshotBuildSuccess` or `SnapshotBuildFailure` (final outcome and total duration)
+1. `LogSegmentLoadCompleted` (listing the log segment)
+2. `ProtocolMetadataLoadCompleted` (reading protocol and metadata)
+3. `SnapshotBuildCompleted` (final outcome and total duration)
 
-Each step emits a success or failure variant carrying the shared `operation_id`. When a
-step fails, the snapshot build fails too, so the terminal `SnapshotBuildFailure` carries
-the same id and you can see which step broke from the buffered group.
+Each step emits a completed event carrying the shared `context.operation_id`. When a
+step fails, the snapshot build fails too. The terminal `SnapshotBuildCompleted` has an error
+outcome and carries the same ID, so the buffered group shows which step failed.
 
 You can store the `MetricId` in your monitoring system as a trace ID or
 correlation key. Because everything flows through `tracing`, you can also
@@ -245,10 +246,10 @@ To aggregate timing data per operation, store intermediate events keyed by
 
 Filename: src/correlating_reporter.rs
 
-```rust,ignore
+```rust
 use std::collections::HashMap;
 use std::sync::Mutex;
-use delta_kernel::metrics::{MetricEvent, MetricId, MetricsReporter};
+use delta_kernel::metrics::{MetricEvent, MetricId, MetricsReporter, SnapshotBuildOutcome};
 
 #[derive(Debug)]
 struct CorrelatingReporter {
@@ -276,31 +277,34 @@ impl MetricsReporter for CorrelatingReporter {
         match event {
             // 1. Buffer each intermediate step, success OR failure, under its operation_id.
             //    `ref e` borrows the id so `event` can still move into the buffer.
-            MetricEvent::LogSegmentLoadSuccess(ref e) => self.buffer(e.operation_id, event),
-            MetricEvent::LogSegmentLoadFailure(ref e) => self.buffer(e.operation_id, event),
-            MetricEvent::ProtocolMetadataLoadSuccess(ref e) => self.buffer(e.operation_id, event),
-            MetricEvent::ProtocolMetadataLoadFailure(ref e) => self.buffer(e.operation_id, event),
+            MetricEvent::LogSegmentLoadCompleted(ref e) => self.buffer(e.context.operation_id, event),
+            MetricEvent::ProtocolMetadataLoadCompleted(ref e) => {
+                self.buffer(e.context.operation_id, event)
+            }
 
             // 2. The terminal event drains the group. The buffered steps reconstruct the
             //    timeline; on failure, the last step shows where the build broke.
-            MetricEvent::SnapshotBuildSuccess(e) => {
-                let steps = self.drain(e.operation_id);
-                println!(
-                    "Snapshot v{} completed in {:?} ({} sub-events)",
-                    e.version,
-                    e.duration,
-                    steps.len()
-                );
-            }
-            MetricEvent::SnapshotBuildFailure(e) => {
-                let steps = self.drain(e.operation_id);
-                println!(
-                    "Snapshot {} failed after {:?} ({} sub-events); last step: {:?}",
-                    e.operation_id,
-                    e.duration,
-                    steps.len(),
-                    steps.last()
-                );
+            MetricEvent::SnapshotBuildCompleted(e) => {
+                let steps = self.drain(e.context.operation_id);
+                match e.outcome {
+                    SnapshotBuildOutcome::Success { version } => {
+                        println!(
+                            "Snapshot v{} completed in {:?} ({} sub-events)",
+                            version,
+                            e.duration,
+                            steps.len()
+                        );
+                    }
+                    SnapshotBuildOutcome::Error => {
+                        println!(
+                            "Snapshot {} failed after {:?} ({} sub-events); last step: {:?}",
+                            e.context.operation_id,
+                            e.duration,
+                            steps.len(),
+                            steps.last()
+                        );
+                    }
+                }
             }
             // Storage, scan, and post-build loads don't participate in snapshot correlation.
             _ => {}

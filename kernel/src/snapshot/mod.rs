@@ -45,8 +45,7 @@ use crate::metrics::events::{
 };
 use crate::metrics::{
     CheckpointWriteMode, CheckpointWriteOutcome, ChecksumWriteOutcome, ChecksumWriteResolutionMode,
-    MetricId, SnapshotLoadMetricContext, emit_protocol_metadata_load,
-    emit_protocol_metadata_load_failure,
+    MetricId, ProtocolMetadataLoadOutcome, SnapshotLoadMetricContext, emit_protocol_metadata_load,
 };
 use crate::path::ParsedLogPath;
 use crate::row_tracking::{ROW_TRACKING_DOMAIN_NAME, parse_row_tracking_high_water_mark};
@@ -474,7 +473,7 @@ impl Snapshot {
         ))
     }
 
-    #[instrument(name = "try_new_from_log_segment", skip_all, fields(path = %location, enable_call_frame, version = log_segment.end_version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or(""), incremental_replay = ?incremental_replay, built_as_latest = built_as_latest))]
+    #[instrument(name = "try_new_from_log_segment", skip_all, fields(path = %location, enable_call_frame, version = log_segment.end_version, operation_id = %metric_context.context.operation_id, correlation_id = metric_context.context.correlation_id.as_deref().unwrap_or(""), incremental_replay = ?incremental_replay, built_as_latest = built_as_latest))]
     fn prepare_new_from_log_segment(
         location: &Url,
         log_segment: &LogSegment,
@@ -515,12 +514,20 @@ impl Snapshot {
         // Step 1: read the latest on-disk CRC and, if usable, advance it to the end version
         //         (or use it as-is when already there) per `incremental_replay`.
         let base_crc = log_segment.read_latest_crc(engine).inspect_err(|_| {
-            emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
+            emit_protocol_metadata_load(
+                metric_context,
+                ProtocolMetadataLoadOutcome::Error,
+                pm_start.elapsed(),
+            )
         })?;
         let crc_at_version = log_segment
             .try_build_crc_within_budget(engine, base_crc.as_ref(), incremental_replay)
             .inspect_err(|_| {
-                emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
+                emit_protocol_metadata_load(
+                    metric_context,
+                    ProtocolMetadataLoadOutcome::Error,
+                    pm_start.elapsed(),
+                )
             })?;
 
         // Step 2: P&M from that CRC, else log replay rooted at the base CRC, checkpoint, or
@@ -552,13 +559,21 @@ impl Snapshot {
                     }
                 })
                 .inspect_err(|_| {
-                    emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
+                    emit_protocol_metadata_load(
+                        metric_context,
+                        ProtocolMetadataLoadOutcome::Error,
+                        pm_start.elapsed(),
+                    )
                 })?,
         };
 
         // Fresh snapshot creation requires both Protocol and Metadata to be present.
         let fail = |e| {
-            emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed());
+            emit_protocol_metadata_load(
+                metric_context,
+                ProtocolMetadataLoadOutcome::Error,
+                pm_start.elapsed(),
+            );
             Err(Error::Kernel(e))
         };
         let (metadata, protocol) = match (metadata, protocol) {
@@ -567,7 +582,11 @@ impl Snapshot {
             (Some(_), None) => return fail(KernelError::MissingProtocol),
             (None, None) => return fail(KernelError::MissingMetadataAndProtocol),
         };
-        emit_protocol_metadata_load(metric_context, source, pm_start.elapsed());
+        emit_protocol_metadata_load(
+            metric_context,
+            ProtocolMetadataLoadOutcome::Success { source },
+            pm_start.elapsed(),
+        );
         debug!(
             ?source,
             base_crc_version = ?base_crc.as_ref().map(|crc| crc.version),
@@ -931,7 +950,7 @@ impl Snapshot {
     /// roots a tail-only scan in a stale but `Complete` CRC, skipping the checkpoint; else full log
     /// replay.
     ///
-    /// Reports metrics: `SetTransactionLoadSuccess` or `SetTransactionLoadFailure`.
+    /// Reports metrics: `SetTransactionLoadCompleted`.
     #[instrument(
         parent = &self.span,
         name = SET_TRANSACTION_LOADED_SPAN,
@@ -1142,7 +1161,7 @@ impl Snapshot {
     /// CRC no older than an AMT checkpoint action is held, scan only the commits after it and
     /// reconcile against its map; else full log replay. `domains == None` means load all.
     ///
-    /// Reports metrics: `DomainMetadataLoadSuccess` or `DomainMetadataLoadFailure`.
+    /// Reports metrics: `DomainMetadataLoadCompleted`.
     #[instrument(
         parent = &self.span,
         name = DOMAIN_METADATA_LOADED_SPAN,
@@ -1561,8 +1580,8 @@ impl Snapshot {
     /// its log segment. On [`ChecksumWriteResult::AlreadyExists`], the original snapshot is
     /// returned unchanged.
     ///
-    /// Reports one [`crate::metrics::MetricEvent::ChecksumWriteSuccess`] or
-    /// [`crate::metrics::MetricEvent::ChecksumWriteFailure`] event when the call returns.
+    /// Reports one [`crate::metrics::MetricEvent::ChecksumWriteCompleted`] event when the call
+    /// returns.
     ///
     /// # Errors
     ///
