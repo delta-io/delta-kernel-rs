@@ -1,15 +1,12 @@
 //! Builds the winner check plan.
 //!
 //! ```text
-//! ScanJson -+-> Project(action rows) -------------------+
-//!           |                                           |
-//!           +-> Filter(delta.rowTracking) ->            +-> UnionAll -> Aggregate(version)
-//!               Project(row tracking rows) -------------+        -> Project(rules)
+//! ScanJson -> Project(action rows) -> Aggregate(version) -> Project(rules)
 //! ```
 
 use std::sync::LazyLock;
 
-use super::{LoserFacts, VERSION, WinningCommit};
+use super::{LoserFacts, VERSION, WinningCommit, scan_files};
 use crate::KernelResult;
 use crate::actions::{
     COMMIT_INFO_NAME, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, SET_TRANSACTION_NAME,
@@ -33,8 +30,10 @@ const IDENTITY_ONLY_METADATA_UPDATE_TAG_VALUE: &str = "true";
 pub(crate) const OPERATION: &str = "operation";
 pub(crate) const IS_BLIND_APPEND: &str = "is_blind_append";
 pub(crate) const IN_COMMIT_TIMESTAMP: &str = "in_commit_timestamp";
+pub(crate) const IS_MANIFEST_COMMIT: &str = "is_manifest_commit";
 pub(crate) const ROW_ID_HIGH_WATER_MARK: &str = "row_id_high_water_mark";
 pub(crate) const ROW_TRACKING_COUNT: &str = "row_tracking_count";
+pub(crate) const REMOVES_ROW_TRACKING: &str = "removes_row_tracking";
 pub(crate) const PROTOCOL_CHANGED: &str = "protocol_changed";
 pub(crate) const METADATA_CHANGED: &str = "metadata_changed";
 pub(crate) const DOMAIN_CONFLICT: &str = "domain_conflict";
@@ -48,7 +47,9 @@ const PROTOCOL_MARKER: &str = "protocol_marker";
 const METADATA_MARKER: &str = "metadata_marker";
 const DOMAIN_CONFLICT_MARKER: &str = "domain_conflict_marker";
 const TXN_CONFLICT_MARKER: &str = "txn_conflict_marker";
+const CHECKPOINT_MARKER: &str = "checkpoint_marker";
 const ROW_TRACKING_MARKER: &str = "row_tracking_marker";
+const ROW_TRACKING_TOMBSTONE_MARKER: &str = "row_tracking_tombstone_marker";
 const ROW_TRACKING: &str = "row_tracking";
 
 // === Aggregated count columns ===
@@ -56,9 +57,14 @@ const PROTOCOL_COUNT: &str = "protocol_count";
 const METADATA_COUNT: &str = "metadata_count";
 const DOMAIN_CONFLICT_COUNT: &str = "domain_conflict_count";
 const TXN_CONFLICT_COUNT: &str = "txn_conflict_count";
+const CHECKPOINT_COUNT: &str = "checkpoint_count";
+const ROW_TRACKING_TOMBSTONE_COUNT: &str = "row_tracking_tombstone_count";
 
 // === JSON keys ===
 const ROW_ID_HIGH_WATER_MARK_FIELD: &str = "rowIdHighWaterMark";
+/// The adaptiveMetadata action of a manifest commit. `actions::CHECKPOINT_ACTION_NAME` exists only
+/// with the `adaptive-metadata-in-dev` feature.
+const CHECKPOINT: &str = "checkpoint";
 
 /// The schema of the plan output: one row for each winner. Every rule column and the row-tracking
 /// count are not null, so a rule expression that yields NULL fails the plan.
@@ -67,8 +73,10 @@ pub(crate) static WINNER_CHECK_OUTPUT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_
     nullable (OPERATION): STRING,
     nullable (IS_BLIND_APPEND): BOOLEAN,
     nullable (IN_COMMIT_TIMESTAMP): LONG,
+    not_null (IS_MANIFEST_COMMIT): BOOLEAN,
     nullable (ROW_ID_HIGH_WATER_MARK): LONG,
     not_null (ROW_TRACKING_COUNT): LONG,
+    not_null (REMOVES_ROW_TRACKING): BOOLEAN,
     not_null (PROTOCOL_CHANGED): BOOLEAN,
     not_null (METADATA_CHANGED): BOOLEAN,
     not_null (DOMAIN_CONFLICT): BOOLEAN,
@@ -98,10 +106,12 @@ static WINNER_ACTIONS_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     nullable (DOMAIN_METADATA_NAME): {
         nullable "domain": STRING,
         nullable "configuration": STRING,
+        nullable "removed": BOOLEAN,
     },
     nullable (SET_TRANSACTION_NAME): {
         nullable "appId": STRING,
     },
+    nullable (CHECKPOINT): [ nullable {} ],
 };
 
 static ROW_TRACKING_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
@@ -118,7 +128,9 @@ static ACTION_ROW_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     nullable (METADATA_MARKER): LONG,
     nullable (DOMAIN_CONFLICT_MARKER): LONG,
     nullable (TXN_CONFLICT_MARKER): LONG,
+    nullable (CHECKPOINT_MARKER): LONG,
     nullable (ROW_TRACKING_MARKER): LONG,
+    nullable (ROW_TRACKING_TOMBSTONE_MARKER): LONG,
     nullable (ROW_TRACKING): (ROW_TRACKING_SCHEMA.as_ref().clone()),
 };
 
@@ -131,23 +143,9 @@ pub(crate) fn winner_check_plan(
     facts: &LoserFacts,
     winners: &[WinningCommit],
 ) -> KernelResult<Option<Plan>> {
-    if winners.is_empty() {
-        return Ok(None);
-    }
-    let files = winners
-        .iter()
-        .map(WinningCommit::scan_file)
-        .collect::<KernelResult<Vec<_>>>()?;
-    let actions = PlanBuilder::scan_json(files, &[VERSION], WINNER_ACTIONS_SCHEMA.clone())?;
-
-    let action_rows = actions
-        .clone()
-        .project(action_row_expr(facts), ACTION_ROW_SCHEMA.clone())?;
-    let row_tracking_rows = actions
-        .filter(col!(DOMAIN_METADATA_NAME, "domain").eq(lit(ROW_TRACKING_DOMAIN_NAME)))?
-        .project(row_tracking_row_expr(), ACTION_ROW_SCHEMA.clone())?;
-
-    PlanBuilder::union_all([action_rows, row_tracking_rows])?
+    let files = scan_files(winners, winners.iter().map(|winner| winner.version))?;
+    PlanBuilder::scan_json(files, &[VERSION], WINNER_ACTIONS_SCHEMA.clone())?
+        .project(action_row_expr(facts), ACTION_ROW_SCHEMA.clone())?
         .aggregate_by([column_name!(VERSION)], |aggs| {
             aggs.first_non_null(column_name!(OPERATION))
                 .first_non_null(column_name!(IS_BLIND_APPEND))
@@ -164,8 +162,16 @@ pub(crate) fn winner_check_plan(
                     TXN_CONFLICT_COUNT,
                 )
                 .aggregate_as(
+                    Agg::count(column_name!(CHECKPOINT_MARKER)),
+                    CHECKPOINT_COUNT,
+                )
+                .aggregate_as(
                     Agg::count(column_name!(ROW_TRACKING_MARKER)),
                     ROW_TRACKING_COUNT,
+                )
+                .aggregate_as(
+                    Agg::count(column_name!(ROW_TRACKING_TOMBSTONE_MARKER)),
+                    ROW_TRACKING_TOMBSTONE_COUNT,
                 )
                 .aggregate_as(
                     Agg::max(column_name!(ROW_TRACKING, ROW_ID_HIGH_WATER_MARK_FIELD)),
@@ -187,6 +193,19 @@ fn action_row_expr(facts: &LoserFacts) -> Expression {
         .read_app_ids
         .iter()
         .map(|app_id| col!(SET_TRANSACTION_NAME, "appId").eq(lit(app_id.as_str())));
+    let is_row_tracking = col!(DOMAIN_METADATA_NAME, "domain").eq(lit(ROW_TRACKING_DOMAIN_NAME));
+    let is_removed = Predicate::not(col!(DOMAIN_METADATA_NAME, "removed").distinct(lit(true)));
+    let live_row_tracking =
+        Predicate::and(is_row_tracking.clone(), Predicate::not(is_removed.clone()));
+    // Only a live `delta.rowTracking` action passes its configuration to the parser, so a
+    // malformed configuration of another domain can't null the marks.
+    let row_tracking_configuration = Expression::case_when(
+        [(
+            live_row_tracking.clone(),
+            col!(DOMAIN_METADATA_NAME, "configuration"),
+        )],
+        null_lit(DataType::STRING),
+    );
     Expression::struct_from([
         col!(VERSION),
         col!(COMMIT_INFO_NAME, "operation"),
@@ -197,56 +216,30 @@ fn action_row_expr(facts: &LoserFacts) -> Expression {
         marker(col!(METADATA_NAME).is_not_null()),
         marker(Predicate::or_from(conflicting_domains)),
         marker(Predicate::or_from(conflicting_app_ids)),
-        null_lit(DataType::LONG),
-        null_lit(ROW_TRACKING_SCHEMA.as_ref().clone()),
-    ])
-}
-
-/// One row for each `delta.rowTracking` domain action, with its row ID high-water mark.
-fn row_tracking_row_expr() -> Expression {
-    Expression::struct_from([
-        col!(VERSION),
-        null_lit(DataType::STRING),
-        null_lit(DataType::BOOLEAN),
-        null_lit(DataType::LONG),
-        null_lit(DataType::STRING),
-        null_lit(DataType::LONG),
-        null_lit(DataType::LONG),
-        null_lit(DataType::LONG),
-        null_lit(DataType::LONG),
-        lit(1i64),
-        Expression::parse_json(
-            col!(DOMAIN_METADATA_NAME, "configuration"),
-            ROW_TRACKING_SCHEMA.clone(),
-        ),
+        marker(col!(CHECKPOINT).is_not_null()),
+        marker(live_row_tracking),
+        marker(Predicate::and(is_row_tracking, is_removed)),
+        Expression::parse_json(row_tracking_configuration, ROW_TRACKING_SCHEMA.clone()),
     ])
 }
 
 /// Passes the summary columns through, then adds one boolean column for each winner rule. A rule
 /// column is true when the winner breaks that rule.
 fn rule_expr(facts: &LoserFacts) -> Expression {
-    let identity_only = Expression::coalesce([
-        Expression::from_pred(
-            col!(IDENTITY_ONLY_TAG).eq(lit(IDENTITY_ONLY_METADATA_UPDATE_TAG_VALUE)),
-        ),
-        lit(false),
-    ]);
+    let identity_only = Predicate::not(
+        col!(IDENTITY_ONLY_TAG).distinct(lit(IDENTITY_ONLY_METADATA_UPDATE_TAG_VALUE)),
+    );
     let has_metadata = col!(METADATA_COUNT).gt(lit(0i64));
     // Delta Spark's ConflictChecker accepts an identity-only metadata update when T changes no
     // metadata.
     let metadata_changed = match facts.changes_metadata {
         true => has_metadata,
-        false => Predicate::and(
-            has_metadata,
-            Predicate::not(Predicate::from_expr(identity_only)),
-        ),
+        false => Predicate::and(has_metadata, Predicate::not(identity_only)),
     };
-    let is_backfill = Expression::coalesce([
-        Expression::from_pred(col!(OPERATION).eq(lit(ROW_TRACKING_BACKFILL_OPERATION))),
-        lit(false),
-    ]);
+    let is_backfill =
+        Predicate::not(col!(OPERATION).distinct(lit(ROW_TRACKING_BACKFILL_OPERATION)));
     let backfill_conflict = match facts.rewrites_files {
-        true => Predicate::from_expr(is_backfill),
+        true => is_backfill,
         false => Predicate::FALSE,
     };
     Expression::struct_from([
@@ -254,8 +247,10 @@ fn rule_expr(facts: &LoserFacts) -> Expression {
         col!(OPERATION),
         col!(IS_BLIND_APPEND),
         col!(IN_COMMIT_TIMESTAMP),
+        Expression::from_pred(col!(CHECKPOINT_COUNT).gt(lit(0i64))),
         col!(ROW_ID_HIGH_WATER_MARK),
         col!(ROW_TRACKING_COUNT),
+        Expression::from_pred(col!(ROW_TRACKING_TOMBSTONE_COUNT).gt(lit(0i64))),
         Expression::from_pred(col!(PROTOCOL_COUNT).gt(lit(0i64))),
         Expression::from_pred(metadata_changed),
         Expression::from_pred(col!(DOMAIN_CONFLICT_COUNT).gt(lit(0i64))),

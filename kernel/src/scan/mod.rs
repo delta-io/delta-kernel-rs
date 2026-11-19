@@ -867,7 +867,7 @@ pub(crate) struct PrefixColumns {
 }
 
 impl PrefixColumns {
-    /// Creates a transform that prefixes every column reference with `prefix`.
+    /// Creates the transform for `prefix`.
     pub(crate) fn new(prefix: ColumnName) -> Self {
         Self { prefix }
     }

@@ -4,9 +4,9 @@ use std::sync::LazyLock;
 
 use super::occ_plan::{CHECK, OccBranchVersions, OccCheck};
 use super::winner_check_plan::{
-    BACKFILL_CONFLICT, DOMAIN_CONFLICT, IN_COMMIT_TIMESTAMP, IS_BLIND_APPEND, METADATA_CHANGED,
-    OPERATION, PROTOCOL_CHANGED, ROW_ID_HIGH_WATER_MARK, ROW_TRACKING_BACKFILL_OPERATION,
-    ROW_TRACKING_COUNT, TXN_CONFLICT, WINNER_CHECK_OUTPUT_SCHEMA,
+    BACKFILL_CONFLICT, DOMAIN_CONFLICT, IN_COMMIT_TIMESTAMP, IS_BLIND_APPEND, IS_MANIFEST_COMMIT,
+    METADATA_CHANGED, OPERATION, PROTOCOL_CHANGED, REMOVES_ROW_TRACKING, ROW_ID_HIGH_WATER_MARK,
+    ROW_TRACKING_BACKFILL_OPERATION, ROW_TRACKING_COUNT, TXN_CONFLICT, WINNER_CHECK_OUTPUT_SCHEMA,
 };
 use super::{LoserFacts, VERSION};
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
@@ -58,10 +58,16 @@ pub(crate) struct WinnerSummary {
     /// `None` when the winner has no `commitInfo.isBlindAppend`.
     pub(crate) is_blind_append: Option<bool>,
     pub(crate) in_commit_timestamp: Option<i64>,
+    /// The winner has a top-level `checkpoint` action, so it is an adaptiveMetadata manifest
+    /// commit.
+    pub(crate) is_manifest_commit: bool,
     /// The winner's `delta.rowTracking` high-water mark, if the winner writes one.
     pub(crate) row_id_high_water_mark: Option<i64>,
-    /// The number of `delta.rowTracking` domain actions in the winner.
+    /// The number of live `delta.rowTracking` domain actions in the winner. A tombstone does not
+    /// count.
     pub(crate) row_tracking_count: i64,
+    /// The winner removes the `delta.rowTracking` domain.
+    pub(crate) removes_row_tracking: bool,
     /// The rules that the winner breaks, in [`WinnerRule`] order.
     pub(crate) violations: Vec<WinnerRule>,
 }
@@ -81,21 +87,18 @@ pub(crate) struct OccViolation {
 
 /// Reads the winner check plan output, in ascending version order.
 pub(crate) fn read_winner_summaries(result: PlanResult) -> KernelResult<Vec<WinnerSummary>> {
-    let mut visitor = WinnerSummaryVisitor::default();
-    for batch in result.into_data()? {
-        visitor.visit_rows_of(batch?.as_ref())?;
-    }
-    let mut summaries = visitor.0;
+    let mut summaries = visit_batches::<WinnerSummaryVisitor>(result)?.0;
     summaries.sort_by_key(|summary| summary.version);
     Ok(summaries)
 }
 
-/// Returns the earliest winner that breaks a winner rule.
+/// Returns the earliest winner that breaks a winner rule. Within one winner, [`WinnerRule`] order
+/// decides.
 ///
 /// `summaries` must be in ascending version order.
 pub(crate) fn first_winner_conflict(summaries: &[WinnerSummary]) -> Option<Conflict> {
     summaries.iter().find_map(|summary| {
-        let rule = summary.violations.first()?;
+        let rule = summary.violations.iter().min()?;
         Some(Conflict {
             version: summary.version,
             operation: summary.operation.clone(),
@@ -104,17 +107,21 @@ pub(crate) fn first_winner_conflict(summaries: &[WinnerSummary]) -> Option<Confl
     })
 }
 
-/// Picks the winner versions that each OCC branch checks.
+/// Picks the winner versions that each OCC check scans.
 ///
-/// A violation at any checked version fails T. `read_delete` and `delete_delete` check every
-/// winner. `read_append` checks no winner when T is a blind append, T is a row-tracking backfill,
-/// or T runs at SnapshotIsolation. It also skips backfill winners. Under WriteSerializable, it
-/// skips blind-append winners unless T changes metadata.
+/// A violation at any checked version fails T. The delete checks scan every winner, unless T is a
+/// blind append, which reads and removes no file. `read_append` checks no winner when:
+///
+/// - T is a blind append;
+/// - T is a row-tracking backfill;
+/// - T runs at SnapshotIsolation.
+///
+/// `read_append` also skips backfill winners. Under WriteSerializable, it skips blind-append
+/// winners unless T changes metadata.
 pub(crate) fn select_occ_branch_versions(
     facts: &LoserFacts,
     summaries: &[WinnerSummary],
 ) -> OccBranchVersions {
-    let all = Vec::from_iter(summaries.iter().map(|summary| summary.version));
     let isolation_level = facts.effective_isolation_level();
     let check_read_append = !facts.is_blind_append
         && !facts.is_row_tracking_backfill
@@ -133,20 +140,19 @@ pub(crate) fn select_occ_branch_versions(
                 .map(|summary| summary.version),
         ),
     };
+    let delete_checks = match facts.is_blind_append {
+        true => Vec::new(),
+        false => Vec::from_iter(summaries.iter().map(|summary| summary.version)),
+    };
     OccBranchVersions {
         read_append,
-        read_delete: all.clone(),
-        delete_delete: all,
+        delete_checks,
     }
 }
 
 /// Reads the OCC plan output.
 pub(crate) fn read_occ_violations(result: PlanResult) -> KernelResult<Vec<OccViolation>> {
-    let mut visitor = OccViolationVisitor::default();
-    for batch in result.into_data()? {
-        visitor.visit_rows_of(batch?.as_ref())?;
-    }
-    Ok(visitor.0)
+    Ok(visit_batches::<OccViolationVisitor>(result)?.0)
 }
 
 /// Returns the earliest violation. Within one version, [`OccCheck`] order decides.
@@ -186,8 +192,10 @@ impl RowVisitor for WinnerSummaryVisitor {
             operation,
             is_blind_append,
             in_commit_timestamp,
+            is_manifest_commit,
             row_id_high_water_mark,
             row_tracking_count,
+            removes_row_tracking,
             protocol_changed,
             metadata_changed,
             domain_conflict,
@@ -232,9 +240,11 @@ impl RowVisitor for WinnerSummaryVisitor {
                 operation: operation.get_opt(row, OPERATION)?,
                 is_blind_append: is_blind_append.get_opt(row, IS_BLIND_APPEND)?,
                 in_commit_timestamp: in_commit_timestamp.get_opt(row, IN_COMMIT_TIMESTAMP)?,
+                is_manifest_commit: is_manifest_commit.get(row, IS_MANIFEST_COMMIT)?,
                 row_id_high_water_mark: row_id_high_water_mark
                     .get_opt(row, ROW_ID_HIGH_WATER_MARK)?,
                 row_tracking_count: row_tracking_count.get(row, ROW_TRACKING_COUNT)?,
+                removes_row_tracking: removes_row_tracking.get(row, REMOVES_ROW_TRACKING)?,
                 violations,
             });
         }
@@ -273,6 +283,15 @@ impl RowVisitor for OccViolationVisitor {
         }
         Ok(())
     }
+}
+
+/// Visits every batch of `result` with a new `V`.
+fn visit_batches<V: RowVisitor + Default>(result: PlanResult) -> KernelResult<V> {
+    let mut visitor = V::default();
+    for batch in result.into_data()? {
+        visitor.visit_rows_of(batch?.as_ref())?;
+    }
+    Ok(visitor)
 }
 
 fn to_version(version: i64) -> KernelResult<Version> {

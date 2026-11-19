@@ -11,6 +11,18 @@
 //! The plan builders only describe the plans. [`decision`] reads the rows and decides the result.
 //! [`detect_conflicts()`] runs the two plans in order. Kernel reports the earliest winner-rule
 //! violation before any OCC violation.
+//!
+//! # Differences from Delta Spark
+//!
+//! - Any winner protocol action fails T.
+//! - A winner metadata action fails T, except an identity-only update whose tag is exactly `true`
+//!   while T changes no metadata.
+//! - A row-tracking backfill winner fails any T that removes or adds a file again, whatever its
+//!   paths.
+//! - Kernel checks every winner rule before any file check, so it can report a later winner or
+//!   another rule than Delta Spark. T fails either way.
+//! - Manifest-commit winners, `delta.rowTracking` tombstones and a table-level SnapshotIsolation
+//!   fail detection with an error.
 
 mod decision;
 mod occ_plan;
@@ -39,32 +51,41 @@ use crate::{FileMeta, KernelError, KernelResult, PredicateRef, Version, version_
 
 /// Decides whether T conflicts with any of `winners`.
 ///
-/// `file_actions` holds T's file actions with a `remove.path` column. Retain it in the same
-/// `ScopedPlanExecutor` scope that `executor` belongs to. Each `path` must be exactly as written in
-/// the log.
+/// `file_actions` holds T's file actions with a `remove.path` column. Each `path` in
+/// `file_actions` and in the `read_files` of [`ReadScope::Files`] must be exactly as written in
+/// the log. Retain both relations in the same `ScopedPlanExecutor` scope that `executor` belongs
+/// to.
 pub(crate) fn detect_conflicts(
     executor: &dyn ScopedPlanExecutor,
     facts: &LoserFacts,
     winners: &[WinningCommit],
     file_actions: &RelationRef,
 ) -> KernelResult<ConflictDetection> {
+    if facts.isolation_level == IsolationLevel::SnapshotIsolation {
+        return Err(KernelError::unsupported(
+            "Conflict detection does not support the table isolation level SnapshotIsolation",
+        ));
+    }
     check_winners_follow_read_version(facts.read_version, winners)?;
     let summaries = match winner_check_plan(facts, winners)? {
         Some(plan) => read_winner_summaries(executor.execute_op(Operation::QueryPlan(plan))?)?,
         None => Vec::new(),
     };
-    check_winner_rows(winners, &summaries)?;
-    let conflict = match first_winner_conflict(&summaries) {
-        Some(conflict) => Some(conflict),
-        None => occ_conflict(executor, facts, winners, &summaries, file_actions)?,
-    };
-    match conflict {
-        Some(conflict) => Ok(ConflictDetection::Conflict(conflict)),
-        None => {
-            check_row_tracking_marks(&summaries)?;
-            Ok(ConflictDetection::NoConflict(summaries))
+    check_winner_rows(facts.read_version, winners, &summaries)?;
+    check_no_manifest_commit(&summaries)?;
+    if let Some(conflict) = first_winner_conflict(&summaries) {
+        return Ok(ConflictDetection::Conflict(conflict));
+    }
+    let branches = select_occ_branch_versions(facts, &summaries);
+    if let Some(plan) = occ_plan(facts, winners, &branches, file_actions)? {
+        let violations = read_occ_violations(executor.execute_op(Operation::QueryPlan(plan))?)?;
+        if let Some(conflict) = first_occ_conflict(&violations, &summaries) {
+            return Ok(ConflictDetection::Conflict(conflict));
         }
     }
+    check_no_row_tracking_tombstone(&summaries)?;
+    check_row_tracking_marks(&summaries)?;
+    Ok(ConflictDetection::NoConflict(summaries))
 }
 
 /// The result of conflict detection.
@@ -112,11 +133,10 @@ impl WinningCommit {
 pub(crate) struct LoserFacts {
     /// T's read version. The winners start at `read_version + 1`.
     pub(crate) read_version: Version,
-    /// The table's isolation level. [`LoserFacts::effective_isolation_level`] applies the
-    /// downgrade.
+    /// The table's isolation level. It must be Serializable or WriteSerializable.
+    /// [`LoserFacts::effective_isolation_level`] applies the downgrade.
     pub(crate) isolation_level: IsolationLevel,
-    /// T only adds files, so it reads nothing. Pass `ReadScope::Files` with an empty `read_files`,
-    /// not `WholeTable`.
+    /// T only adds files, so it reads nothing.
     pub(crate) is_blind_append: bool,
     /// At least one file action of T has `dataChange=true`.
     pub(crate) has_data_change: bool,
@@ -125,8 +145,8 @@ pub(crate) struct LoserFacts {
     pub(crate) operation_changes_data: bool,
     /// T writes a `metaData` action.
     pub(crate) changes_metadata: bool,
-    /// T writes an action other than a file action or `delta.rowTracking` domain metadata.
-    /// A `commitInfo` action does not count.
+    /// T writes an action that no other field describes, for example `protocol` or `txn`. A
+    /// `commitInfo` action does not count.
     pub(crate) has_other_actions: bool,
     /// T's operation is a row-tracking backfill.
     pub(crate) is_row_tracking_backfill: bool,
@@ -134,7 +154,8 @@ pub(crate) struct LoserFacts {
     pub(crate) rewrites_files: bool,
     /// The domains that T writes. A removal tombstone (`removed: true`) counts as a write.
     pub(crate) written_domains: Vec<String>,
-    /// The app IDs whose `txn` version T read.
+    /// The app IDs whose `txn` version T read. Include every app ID that T writes in a `txn`
+    /// action, because a writer reads the app's version before it writes the next one.
     pub(crate) read_app_ids: Vec<String>,
     /// The part of the table that T read.
     pub(crate) read_scope: ReadScope,
@@ -144,9 +165,8 @@ impl LoserFacts {
     /// Returns the isolation level that the `read_append` check uses.
     ///
     /// T drops to SnapshotIsolation when no file action has `dataChange=true` and T writes no
-    /// other action. A metadata change or a domain other than `delta.rowTracking` is another
-    /// action, even when `has_other_actions` is false. Under WriteSerializable, T's operation must
-    /// also change no data.
+    /// action other than file actions, `delta.rowTracking` domain metadata and `commitInfo`. Under
+    /// WriteSerializable, T's operation must also change no data.
     pub(crate) fn effective_isolation_level(&self) -> IsolationLevel {
         let has_other_actions = self.has_other_actions
             || self.changes_metadata
@@ -174,19 +194,20 @@ pub(crate) enum ReadScope {
     WholeTable,
     /// T read the files in `read_files`.
     Files {
-        /// The files that T's scans returned, with a `path` column. Each `path` must be exactly
-        /// as written in the log. Retain it in the same `ScopedPlanExecutor` scope that
-        /// `detect_conflicts` receives.
+        /// The files that T's scans returned, with a `path` column. Include every file that T adds
+        /// again, for example in a row-tracking backfill, so that a winner's remove of that file
+        /// fails T with `read_delete`.
         read_files: RelationRef,
         /// T's read-time partition schema, keyed by physical names.
         partition_schema: SchemaRef,
         /// The partition conjuncts of T's read predicate, over the physical partition columns.
         ///
-        /// `None` matches every partition. A scan without a filter reads every partition, so it
-        /// passes `None`. With several scans, pass the OR of their partition conjuncts, or `None`
-        /// when any scan has none. On a partitioned table, a T that read no data passes
-        /// `Some(Predicate::FALSE)`, because Delta Spark finds no append conflict then. On an
-        /// unpartitioned table, the predicate is ignored and every add matches.
+        /// - `None` matches every add. Pass `None` for a scan without a partition filter, or when
+        ///   any of several scans has none.
+        /// - With several filtered scans, pass the OR of their partition conjuncts.
+        /// - A T that read no data passes `Some(Predicate::FALSE)`. Then no add conflicts, as in
+        ///   Delta Spark.
+        /// - On an unpartitioned table, the predicate can only be a constant.
         partition_predicate: Option<PredicateRef>,
         /// Parses offset-less TIMESTAMP partition values in `partition_schema`. Use the options of
         /// T's scan.
@@ -196,7 +217,7 @@ pub(crate) enum ReadScope {
 
 // === Output columns ===
 
-/// The winner version column, shared by the winner check plan and the OCC plan.
+/// The column that holds the winner version. Each scan of a winner commit adds it as a constant.
 pub(crate) const VERSION: &str = "version";
 
 // === Helpers ===
@@ -209,17 +230,16 @@ fn check_winners_follow_read_version(
     read_version: Version,
     winners: &[WinningCommit],
 ) -> KernelResult<()> {
-    let starts_after_read_version = match winners.first() {
-        Some(first) => read_version.checked_add(1) == Some(first.version),
-        None => true,
-    };
-    let contiguous = winners.windows(2).all(|pair| {
-        matches!(pair, [previous, next] if previous.version.checked_add(1) == Some(next.version))
-    });
-    if !(starts_after_read_version && contiguous) {
-        return Err(KernelError::internal_error(
-            "Winning commits must start at the read version + 1 with no version gap",
-        ));
+    let follows_read_version = winners
+        .iter()
+        .zip(1..)
+        .all(|(winner, offset)| read_version.checked_add(offset) == Some(winner.version));
+    if !follows_read_version {
+        return Err(KernelError::internal_error(format!(
+            "Winning commits {:?} must start at read version {read_version} + 1 with no version \
+             gap",
+            winner_versions(winners),
+        )));
     }
     Ok(())
 }
@@ -228,14 +248,47 @@ fn check_winners_follow_read_version(
 ///
 /// A winner gets no row when the executor reads no action from its commit file, for example an
 /// empty file. Kernel fails then, because it can't check that winner.
-fn check_winner_rows(winners: &[WinningCommit], summaries: &[WinnerSummary]) -> KernelResult<()> {
-    let rows = summaries.iter().map(|summary| summary.version);
-    if !rows.eq(winners.iter().map(|winner| winner.version)) {
-        return Err(KernelError::internal_error(
-            "Winner check rows do not match the winning commits",
-        ));
+fn check_winner_rows(
+    read_version: Version,
+    winners: &[WinningCommit],
+    summaries: &[WinnerSummary],
+) -> KernelResult<()> {
+    let rows = Vec::from_iter(summaries.iter().map(|summary| summary.version));
+    let versions = winner_versions(winners);
+    if rows != versions {
+        return Err(KernelError::internal_error(format!(
+            "Winner check rows {rows:?} do not match the winning commits {versions:?} after read \
+             version {read_version}"
+        )));
     }
     Ok(())
+}
+
+/// Returns an error when a winner is a manifest commit, because the plans don't read the actions
+/// nested in its `checkpoint` action.
+fn check_no_manifest_commit(summaries: &[WinnerSummary]) -> KernelResult<()> {
+    match summaries.iter().find(|summary| summary.is_manifest_commit) {
+        Some(summary) => Err(KernelError::unsupported(format!(
+            "Conflict detection does not support the manifest commit at version {}",
+            summary.version
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Returns an error when a winner removes the `delta.rowTracking` domain. Runs only when no winner
+/// conflicts, so a conflict is reported first.
+fn check_no_row_tracking_tombstone(summaries: &[WinnerSummary]) -> KernelResult<()> {
+    match summaries
+        .iter()
+        .find(|summary| summary.removes_row_tracking)
+    {
+        Some(summary) => Err(KernelError::generic(format!(
+            "The winning commit at version {} removes the `delta.rowTracking` domain",
+            summary.version
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Returns an error when a winner writes `delta.rowTracking` without a readable high-water mark.
@@ -257,18 +310,27 @@ fn check_row_tracking_marks(summaries: &[WinnerSummary]) -> KernelResult<()> {
     Ok(())
 }
 
-/// Returns the earliest OCC violation, or `None` when no OCC check fails T.
-fn occ_conflict(
-    executor: &dyn ScopedPlanExecutor,
-    facts: &LoserFacts,
+/// The commit files of the winners at `versions`, as scan inputs. `winners` must be in ascending
+/// version order.
+fn scan_files(
     winners: &[WinningCommit],
-    summaries: &[WinnerSummary],
-    file_actions: &RelationRef,
-) -> KernelResult<Option<Conflict>> {
-    let branches = select_occ_branch_versions(facts, summaries);
-    let Some(plan) = occ_plan(facts, winners, &branches, file_actions)? else {
-        return Ok(None);
-    };
-    let violations = read_occ_violations(executor.execute_op(Operation::QueryPlan(plan))?)?;
-    Ok(first_occ_conflict(&violations, summaries))
+    versions: impl IntoIterator<Item = Version>,
+) -> KernelResult<Vec<ScanFile>> {
+    versions
+        .into_iter()
+        .map(|version| {
+            winners
+                .binary_search_by_key(&version, |winner| winner.version)
+                .ok()
+                .and_then(|index| winners.get(index))
+                .ok_or_else(|| {
+                    KernelError::internal_error(format!("No winning commit at version {version}"))
+                })?
+                .scan_file()
+        })
+        .collect()
+}
+
+fn winner_versions(winners: &[WinningCommit]) -> Vec<Version> {
+    Vec::from_iter(winners.iter().map(|winner| winner.version))
 }
