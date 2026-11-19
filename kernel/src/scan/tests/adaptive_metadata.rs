@@ -212,7 +212,7 @@ fn declarative_scan_without_checkpoint_action_does_not_require_checkpoint_info_s
         )
         .unwrap(),
     );
-    assert!(snapshot.base_crc().is_none());
+    assert!(snapshot.retained_crc().is_none());
     assert!(
         snapshot
             .latest_checkpoint_action(&engine)

@@ -290,15 +290,40 @@ impl Snapshot {
         // matching the fresh path.
         let pm_start = std::time::Instant::now();
         let base_crc = combined_log_segment
-            .pick_latest_base_crc(engine, existing_snapshot.base_crc())
+            .pick_latest_base_crc(engine, existing_snapshot.retained_crc())
             .inspect_err(|_| {
                 emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
             })?;
-        let crc_at_version = combined_log_segment
-            .try_build_crc_within_budget(engine, base_crc.as_ref(), incremental_replay)
-            .inspect_err(|_| {
-                emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
-            })?;
+        let crc_at_version = (|| {
+            if let Some(base) = base_crc
+                .as_ref()
+                .filter(|crc| crc.version <= existing_snapshot_version)
+            {
+                if base.version == existing_snapshot_version {
+                    existing_snapshot.validate_crc_configuration(base)?;
+                } else if incremental_replay.should_advance(base.version, new_end_version)? {
+                    // Validate at the existing snapshot before newer P&M actions can mask an
+                    // inconsistent hinted baseline. Charge the original base-to-target distance.
+                    let validated_base = Arc::new(
+                        existing_snapshot
+                            .log_segment()
+                            .build_crc_from_base(engine, base)?,
+                    );
+                    existing_snapshot.validate_crc_configuration(&validated_base)?;
+                    return combined_log_segment.try_build_crc_within_budget(
+                        engine,
+                        Some(&validated_base),
+                        IncrementalReplay::Unlimited,
+                    );
+                }
+            }
+            combined_log_segment.try_build_crc_within_budget(
+                engine,
+                base_crc.as_ref(),
+                incremental_replay,
+            )
+        })()
+        .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed()))?;
 
         let existing_table_config = existing_snapshot.table_configuration();
         let resolution = match &crc_at_version {
@@ -350,10 +375,18 @@ impl Snapshot {
         )?;
 
         tracing::Span::current().record("version", table_configuration.version());
+        let crc_provenance = super::snapshot_crc::SnapshotCrc::resolved_provenance(
+            base_crc.as_ref(),
+            Some(&existing_snapshot.crc),
+            crc_at_version.as_ref().map(|(crc, _)| crc),
+            new_end_version,
+            combined_log_segment.listed.latest_crc_file.is_some(),
+        );
         let crc = Self::validate_configuration_and_crc(
             combined_log_segment,
             &table_configuration,
             crc_at_version.map(|(crc, _)| crc).or(base_crc),
+            crc_provenance,
         )?;
         let log_segment = current_segment
             .take()
@@ -682,7 +715,7 @@ mod tests {
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::LogPathFileType;
     use crate::schema::schema;
-    use crate::snapshot::{CheckpointWriteResult, commit};
+    use crate::snapshot::{CheckpointWriteResult, CrcProvenance, CrcSource, commit};
     use crate::unit_test_utils::{
         Action, CapturingReporter, install_thread_local_metrics_reporter, serialize_actions,
         string_array_to_engine_data,
@@ -1905,17 +1938,23 @@ mod tests {
     }
 
     #[rstest]
-    #[case::disabled(IncrementalReplay::Disabled, None)]
-    #[case::unlimited(IncrementalReplay::Unlimited, Some(5))]
-    #[case::budget_exact(IncrementalReplay::UpToCommits(2), Some(5))]
-    #[case::budget_more_than_enough(IncrementalReplay::UpToCommits(5), Some(5))]
-    #[case::budget_too_small(IncrementalReplay::UpToCommits(1), None)]
+    #[case::disabled(IncrementalReplay::Disabled, None, None, 1)]
+    #[case::unlimited(IncrementalReplay::Unlimited, Some(5), None, 1)]
+    #[case::budget_exact(IncrementalReplay::UpToCommits(2), Some(5), None, 1)]
+    #[case::budget_more_than_enough(IncrementalReplay::UpToCommits(5), Some(5), None, 1)]
+    #[case::budget_too_small(IncrementalReplay::UpToCommits(1), None, None, 1)]
+    #[case::newer_disk_crc(IncrementalReplay::Unlimited, Some(5), Some(false), 4)]
+    #[case::corrupt_newer_disk_crc(IncrementalReplay::Unlimited, Some(5), Some(true), 1)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_incremental_update_advances_in_memory_crc_within_budget(
         #[case] mode: IncrementalReplay,
         #[case] expected_crc_v: Option<u64>,
+        #[case] new_disk_crc: Option<bool>,
+        #[case] expected_base_version: Version,
         #[values(false, true)] skip_new_checkpoints: bool,
+        #[values(false, true)] known_provenance: bool,
     ) -> Result<()> {
+        // Given an in-memory checksum reconstructed from disk version 1 through version 3.
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 6).await?;
         ctx.store
@@ -1931,8 +1970,36 @@ mod tests {
             .with_incremental_crc_replay(IncrementalReplay::Unlimited)
             .build(ctx.engine.as_ref())?;
         assert_eq!(snapshot_a.crc_at_version().map(|c| c.version), Some(3));
+        assert_eq!(
+            snapshot_a.crc_provenance().source,
+            CrcSource::Reconstructed { num_commits: 2 }
+        );
+        let snapshot_a = if known_provenance {
+            snapshot_a
+        } else {
+            Arc::new(Snapshot::new_with_crc(
+                snapshot_a.log_segment().clone(),
+                snapshot_a.table_configuration().clone(),
+                snapshot_a.retained_crc().cloned(),
+                CrcProvenance::default(),
+                false, /* built_as_latest */
+                false, /* skipped_new_checkpoints */
+            )?)
+        };
 
-        // Advance with each CRC budget under both checkpoint-listing policies.
+        if let Some(corrupt) = new_disk_crc {
+            let content = if corrupt {
+                "invalid".to_owned()
+            } else {
+                make_test_crc_json(500, 5).to_string()
+            };
+            ctx.store
+                .put(&delta_path_for_version(4, "crc"), content.into())
+                .await
+                .map_err(KernelError::from)?;
+        }
+
+        // When the snapshot advances under each replay budget and checkpoint-listing policy.
         let builder = Snapshot::builder_from(snapshot_a).with_incremental_crc_replay(mode);
         let builder = if skip_new_checkpoints {
             builder.skip_new_checkpoints()
@@ -1941,9 +2008,27 @@ mod tests {
         };
         let updated = builder.build(ctx.engine.as_ref())?;
 
-        // Checkpoint retention must not change whether the configured CRC budget can advance.
+        // Then a usable newer disk checksum establishes provenance; otherwise the retained
+        // baseline's provenance, including Unknown, survives.
         assert_eq!(updated.version(), 5);
         assert_eq!(updated.crc_at_version().map(|c| c.version), expected_crc_v);
+        assert_eq!(
+            updated.crc_provenance(),
+            if known_provenance || new_disk_crc == Some(false) {
+                CrcProvenance::new(
+                    if expected_crc_v.is_some() {
+                        CrcSource::Reconstructed {
+                            num_commits: updated.version() - expected_base_version,
+                        }
+                    } else {
+                        CrcSource::Stale
+                    },
+                    Some(expected_base_version),
+                )
+            } else {
+                CrcProvenance::default()
+            }
+        );
         assert_eq!(
             updated
                 .log_segment
@@ -1951,7 +2036,7 @@ mod tests {
                 .latest_crc_file
                 .as_ref()
                 .map(|f| f.version),
-            Some(1)
+            Some(if new_disk_crc.is_some() { 4 } else { 1 })
         );
 
         Ok(())

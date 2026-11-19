@@ -105,7 +105,7 @@ mod tests {
     use crate::crc::{Crc, DomainMetadataState, SetTransactionState};
     use crate::engine::sync::SyncEngine;
     use crate::schema::schema_ref;
-    use crate::snapshot::Snapshot;
+    use crate::snapshot::{CrcProvenance, Snapshot};
     use crate::transaction::create_table::create_table;
     use crate::unit_test_utils::adaptive_metadata_fixtures::{
         adaptive_metadata_protocol_and_metadata, domain, domain_metadata_line,
@@ -756,6 +756,7 @@ mod tests {
             built.log_segment().clone(),
             built.table_configuration().clone(),
             Some(crc),
+            CrcProvenance::default(),
             true,
             false,
         )?;
