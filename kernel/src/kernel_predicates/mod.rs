@@ -338,21 +338,25 @@ pub trait KernelPredicateEvaluator {
                 In => None, // arg order is semantically important
             },
             // Only safe casts are evaluated: `eval_pred_cast` assumes a failed cast is NULL.
-            (Cast(c), Literal(val)) if c.mode == CastMode::Safe => match c.expr.as_ref() {
-                Column(col) => self.eval_pred_cast(op, col, &c.target, val, inverted),
-                _ => None,
-            },
-            (Literal(val), Cast(c)) if c.mode == CastMode::Safe => match c.expr.as_ref() {
-                // Commute so the cast column is on the left.
-                Column(col) => match op {
-                    LessThan => self.eval_pred_cast(GreaterThan, col, &c.target, val, inverted),
-                    GreaterThan => self.eval_pred_cast(LessThan, col, &c.target, val, inverted),
-                    Equal => self.eval_pred_cast(Equal, col, &c.target, val, inverted),
-                    Distinct => self.eval_pred_cast(Distinct, col, &c.target, val, inverted),
-                    In => None, // arg order is semantically important
-                },
-                _ => None,
-            },
+            (Cast(c), Literal(val)) if c.options.mode() == CastMode::Safe => {
+                match c.expr.as_ref() {
+                    Column(col) => self.eval_pred_cast(op, col, &c.target, val, inverted),
+                    _ => None,
+                }
+            }
+            (Literal(val), Cast(c)) if c.options.mode() == CastMode::Safe => {
+                match c.expr.as_ref() {
+                    // Commute so the cast column is on the left.
+                    Column(col) => match op {
+                        LessThan => self.eval_pred_cast(GreaterThan, col, &c.target, val, inverted),
+                        GreaterThan => self.eval_pred_cast(LessThan, col, &c.target, val, inverted),
+                        Equal => self.eval_pred_cast(Equal, col, &c.target, val, inverted),
+                        Distinct => self.eval_pred_cast(Distinct, col, &c.target, val, inverted),
+                        In => None, // arg order is semantically important
+                    },
+                    _ => None,
+                }
+            }
             _ => {
                 trace!("Unsupported binary operand(s): {left:?} {op:?} {right:?}");
                 None
@@ -712,7 +716,7 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
                 })
                 .ok(),
             // Only safe casts are evaluated: a strict cast fails rather than yielding NULL.
-            Expr::Cast(c) if c.mode == CastMode::Strict => None,
+            Expr::Cast(c) if c.options.mode() == CastMode::Strict => None,
             Expr::Cast(c) => cast_scalar(self.eval_expr(&c.expr)?, &c.target),
             // ParseJson and MapToStruct produce structured output, not scalar values
             Expr::ParseJson(_) | Expr::MapToStruct(_) => None,

@@ -476,9 +476,17 @@ pub struct CastExpression {
     pub expr: Box<Expression>,
     /// The type the value is cast to.
     pub target: DataType,
-    /// See [`CastMode`].
+    /// How the cast behaves; see [`CastOptions`].
+    // Omitted when default so readers without `options` still accept safe casts.
+    #[serde(default, skip_serializing_if = "CastOptions::is_default")]
+    pub options: CastOptions,
+}
+
+/// Options that control how a [`CastExpression`] casts its input.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CastOptions {
     #[serde(default, skip_serializing_if = "CastMode::is_safe")]
-    pub mode: CastMode,
+    mode: CastMode,
 }
 
 /// How a [`CastExpression`] handles a value that cannot be represented in the target type, such as
@@ -489,6 +497,9 @@ pub enum CastMode {
     #[default]
     Safe,
     /// Evaluation fails, like ANSI SQL `CAST`. A type pair the evaluator cannot cast also fails.
+    /// Nested and dictionary-encoded inputs are checked value by value as stored, so a value under
+    /// a NULL struct or list entry, outside an array slice, or unreferenced in a dictionary can
+    /// also fail the cast.
     Strict,
 }
 
@@ -917,7 +928,7 @@ impl CastExpression {
         Self {
             expr: Box::new(expr.into()),
             target,
-            mode,
+            options: CastOptions::default().with_mode(mode),
         }
     }
 
@@ -926,11 +937,29 @@ impl CastExpression {
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn unknown_name(&self) -> String {
-        let prefix = match self.mode {
+        let prefix = match self.options.mode() {
             CastMode::Safe => "cast_to",
             CastMode::Strict => "strict_cast_to",
         };
         format!("{prefix}_{}", self.target)
+    }
+}
+
+impl CastOptions {
+    /// Sets how the cast handles a value it cannot represent.
+    pub fn with_mode(mut self, mode: CastMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Returns how the cast handles a value it cannot represent.
+    pub fn mode(&self) -> CastMode {
+        self.mode
+    }
+
+    /// Returns whether no cast options are configured.
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
     }
 }
 
@@ -1466,7 +1495,7 @@ impl Display for Expression {
                 }
                 None => write!(f, "MAP_TO_STRUCT({})", m.map_expr),
             },
-            Cast(c) => match c.mode {
+            Cast(c) => match c.options.mode() {
                 CastMode::Safe => write!(f, "CAST({} AS {})", c.expr, c.target),
                 CastMode::Strict => write!(f, "STRICT_CAST({} AS {})", c.expr, c.target),
             },
@@ -1875,13 +1904,11 @@ mod tests {
             assert_roundtrip(&expr);
         }
 
-        /// A safe cast omits `mode` when serialized, so readers that predate the field still
-        /// accept it.
         #[test]
-        fn test_safe_cast_serializes_without_mode() {
+        fn test_safe_cast_serializes_without_options() {
             let json =
                 serde_json::to_value(Expression::cast(col!("n"), DataType::INTEGER)).unwrap();
-            assert_eq!(json["Cast"].get("mode"), None);
+            assert_eq!(json["Cast"].get("options"), None);
         }
 
         #[rstest::rstest]
