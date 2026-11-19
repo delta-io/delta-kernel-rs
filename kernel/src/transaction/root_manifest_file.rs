@@ -19,8 +19,8 @@ use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::{Engine, FileMeta, KernelResult, Version, version_as_i64};
 
-/// A `checkpoint` action computed by [`RootManifestFile::compute_checkpoint_action`], with where
-/// its set transactions and domain metadata came from and how many sidecars of each were read.
+/// A `checkpoint` action computed by [`RootManifestFile::compute_checkpoint_action`], with the
+/// `CheckpointActionComputed` metrics only the computation knows.
 pub(super) struct ComputedCheckpointAction {
     pub(super) action: CheckpointAction,
     pub(super) txn_source: CheckpointEntrySource,
@@ -284,7 +284,7 @@ struct CheckpointEntries<T> {
     num_sidecars_read: u64,
 }
 
-/// Returns the `T` entries for the new checkpoint action.
+/// Returns the new checkpoint action's `T` entries, the sidecars it keeps, and their source.
 ///
 /// From a [`CheckpointEntryBase::Action`] base, `log_changes` (the log commits after the action)
 /// and then `txn_changes` are applied to it. Otherwise `txn_changes` apply to the snapshot's state.
@@ -335,10 +335,12 @@ fn fold_into_checkpoint_action<T: CheckpointActionEntry>(
     // the sidecars and moving them inline.
     // TODO(#2866): rewrite only the affected sidecars.
     let not_inline = || changes.keys().filter(|key| !inline.contains_key(*key));
-    let mut num_sidecars_read = 0;
-    if !sidecars.is_empty() && not_inline().next().is_some() {
+    let num_sidecars_read = match not_inline().next() {
+        Some(_) => sidecars.len() as u64,
+        None => 0,
+    };
+    if num_sidecars_read > 0 {
         let mut action_entries = T::read_from_action(engine, action, log_root)?;
-        num_sidecars_read = sidecars.len() as u64;
         if not_inline().any(|key| action_entries.contains_key(key)) {
             T::apply(&mut action_entries, changes);
             return Ok(CheckpointEntries {
@@ -629,6 +631,14 @@ mod tests {
         let num_log_commits = (log_domains.len() + log_txns.len()) as u64;
         let computed = checkpoint_action_after(log_domains, log_txns, &[])?;
         assert_eq!(computed.num_log_commits_replayed, num_log_commits);
+        // The action has no sidecars, so even changes to keys that aren't inline read none.
+        assert_eq!(
+            (
+                computed.num_txn_sidecars_read,
+                computed.num_domain_metadata_sidecars_read
+            ),
+            (0, 0)
+        );
         let mut checkpoint = computed.action;
         checkpoint
             .domain_metadata
@@ -1045,6 +1055,22 @@ mod tests {
                 kept_or_empty(&setup.sidecars, self.sidecars_kept)
             );
         }
+
+        fn expected_source(&self) -> CheckpointEntrySource {
+            if self.sidecars_kept {
+                CheckpointEntrySource::CheckpointAction
+            } else {
+                CheckpointEntrySource::SidecarsInlined
+            }
+        }
+
+        fn expected_sidecars_read(&self) -> u64 {
+            if self.sidecars_read {
+                self.sidecars.len() as u64
+            } else {
+                0
+            }
+        }
     }
 
     // A change is this transaction's change or a log commit after the action. Existing sidecars
@@ -1151,21 +1177,19 @@ mod tests {
 
         txn_row.assert_entries(&computed.action, &txns);
         domain_row.assert_entries(&computed.action, &domains);
-        let source = |row: SidecarRow| match row.sidecars_kept {
-            true => CheckpointEntrySource::CheckpointAction,
-            false => CheckpointEntrySource::SidecarsInlined,
-        };
-        assert_eq!(computed.txn_source, source(txn_row));
-        assert_eq!(computed.domain_metadata_source, source(domain_row));
+        assert_eq!(computed.txn_source, txn_row.expected_source());
+        assert_eq!(
+            computed.domain_metadata_source,
+            domain_row.expected_source()
+        );
         assert_eq!(computed.num_log_commits_replayed, num_logged);
-        let num_read = |changes_kind| match changes_kind && row.sidecars_read {
-            true => row.sidecars.len() as u64,
-            false => 0,
-        };
-        assert_eq!(computed.num_txn_sidecars_read, num_read(txns_change));
+        assert_eq!(
+            computed.num_txn_sidecars_read,
+            txn_row.expected_sidecars_read()
+        );
         assert_eq!(
             computed.num_domain_metadata_sidecars_read,
-            num_read(domains_change)
+            domain_row.expected_sidecars_read()
         );
         Ok(())
     }
