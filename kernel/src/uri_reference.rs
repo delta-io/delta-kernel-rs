@@ -3,7 +3,6 @@
 
 // The location helpers are only used by the arrow expression evaluator and the AMT path code, so
 // a build with neither feature leaves them unused. `scheme_len` is always used.
-// TODO: remove this allow once the location helpers are used outside those features.
 #![cfg_attr(
     not(any(
         feature = "adaptive-metadata-in-dev",
