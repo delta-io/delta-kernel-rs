@@ -6,11 +6,58 @@
 //! actions of the leaf manifests they reference (minus the leaf entries removed by the root entry's
 //! manifest deletion vector), and every other root entry is dropped. A leaf manifest may contain
 //! only `Data` entries and errors otherwise. JSON statistics, partition values, and tags are not
-//! yet carried across (see the per-field TODOs); the entry data that flows into the action is the
-//! file location, size, row-tracking numbers, deletion vector, and, when the caller requests them,
-//! the Delta stats as `Add.stats_parsed` (see [`StatsRead`]).
-//! `modificationTime` and `dataChange` have no AMT source and are supplied by the caller via
-//! [`ReadContext`].
+//! yet carried across (see the per-field TODOs).
+//!
+//! Each batch is converted in two steps. [`RowVisitor`]s select and check entries and compute
+//! per-entry values, which are appended to the batch as helper columns. An expression evaluator
+//! then translates the batch column-wise into `Add` actions. The visitors run first because an
+//! evaluator can neither reject rows nor carry state from one row to the next.
+//!
+//! # Selecting entries
+//!
+//! [`AddSelectionVisitor`] runs on root and leaf batches. An entry becomes an `Add` only if it is
+//! a live `Data` entry that no manifest deletion vector removes. Every other entry is dropped:
+//! - `DataManifest` entries point at leaf manifests, which are expanded through a
+//!   [`LeafReadContext`].
+//! - `Deleted` and `Replaced` entries are no longer part of the table.
+//! - A `DeleteManifest` entry is dropped only when it is not live. A live one is an error: it masks
+//!   rows in other data files, so dropping it would read those rows back as live.
+//!
+//! A selected entry is rejected, rather than translated lossily, when it carries something an
+//! `Add` cannot represent yet: a non-Parquet file, a non-zero partition spec, column files, a
+//! `modifiedSnapshotId` without a deletion vector, or a deletion vector with no `Add` equivalent.
+//! A selected root entry must also carry its own `firstRowId` and `sequenceNumber`: a root has no
+//! parent to inherit them from, and an `Add` without them would lose row tracking. Dropped entries
+//! are not checked, so an unsupported entry that no longer contributes rows does not fail the
+//! read.
+//!
+//! # Resolving leaf row tracking
+//!
+//! A leaf entry may leave `firstRowId` and `sequenceNumber` null to inherit them from the root
+//! `DataManifest` entry that references the leaf, so that parent must carry both. Before
+//! selection, [`LeafEntryVisitor`] checks every leaf entry and resolves its `firstRowId`:
+//! - A leaf may contain only `Data` entries, whatever their status.
+//! - An entry that already has a `firstRowId` keeps it.
+//! - An `Added` entry without one gets the next unused ID. IDs start at the parent's `firstRowId`
+//!   and advance by each assigned entry's `recordCount`, in manifest order across batches. Entries
+//!   the manifest deletion vector removes take part too, so removing an entry does not shift the
+//!   row IDs of the entries after it.
+//! - Only newly added files inherit, so a live non-`Added` entry must carry both values itself. A
+//!   removed entry never becomes an `Add`, so it may lack a `firstRowId`.
+//!
+//! # Translating to `Add`
+//!
+//! The expression maps each entry field by field:
+//! - `path` from `location`, encoded into the RFC 2396 form `Add.path` uses, and `size` from
+//!   `fileSizeInBytes`.
+//! - `deletionVector` from the entry's deletion vector.
+//! - `baseRowId` from `firstRowId` (root) or the resolved value (leaf).
+//! - `defaultRowCommitVersion` from `sequenceNumber`, falling back to the parent's for a leaf.
+//! - `stats_parsed` from the entry's content stats, when the caller requests them (see
+//!   [`StatsRead`]).
+//! - `modificationTime` and `dataChange` from [`ReadContext`], since the entry has no source for
+//!   them.
+//! - `partitionValues` is empty, and every other `Add` field is null.
 
 use std::borrow::Cow;
 use std::collections::{HashSet, VecDeque};
@@ -332,15 +379,19 @@ struct AddFieldSources {
     base_row_id: Expression,
     /// Expression producing `Add.defaultRowCommitVersion`.
     default_row_commit_version: Expression,
+    /// Whether a selected entry must carry its own non-null `tracking.firstRowId` and
+    /// `tracking.sequenceNumber`.
+    requires_entry_tracking: bool,
 }
 
 impl AddFieldSources {
     /// Root-manifest sources: read `tracking.firstRowId` / `tracking.sequenceNumber` straight off
-    /// the entry (a root entry carries both).
+    /// the entry. Both are required, since a root entry has no parent to inherit them from.
     fn root() -> Self {
         Self {
             base_row_id: Expression::column([TRACKING, FIRST_ROW_ID]),
             default_row_commit_version: Expression::column([TRACKING, SEQUENCE_NUMBER]),
+            requires_entry_tracking: true,
         }
     }
 }
@@ -375,6 +426,7 @@ static ADD_HELPER_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 struct EntryConverter {
     /// Evaluates a batch plus the [`ADD_HELPER_SCHEMA`] columns.
     evaluator: Arc<dyn ExpressionEvaluator>,
+    requires_entry_tracking: bool,
 }
 
 impl EntryConverter {
@@ -403,8 +455,9 @@ impl EntryConverter {
     /// delete manifest entry is live, if a selected (live `Data`) entry is not Parquet, has a
     /// non-zero partition spec id, carries column files, a `modifiedSnapshotId`, or a deletion
     /// vector with no `Add` equivalent, if a selected entry's `location` cannot be encoded as an
-    /// `Add.path` (see [`amt_location_to_add_path`]), if the evaluator fails to evaluate, or if the
-    /// selection vector length exceeds the batch.
+    /// `Add.path` (see [`amt_location_to_add_path`]), if a selected root entry has a null
+    /// `tracking.firstRowId` or `tracking.sequenceNumber`, if the evaluator fails to evaluate, or
+    /// if the selection vector length exceeds the batch.
     fn convert(
         &self,
         entries: &dyn EngineData,
@@ -412,6 +465,7 @@ impl EntryConverter {
     ) -> KernelResult<FilteredEngineData> {
         let mut visitor = AddSelectionVisitor {
             removed,
+            requires_entry_tracking: self.requires_entry_tracking,
             selection: Vec::new(),
             deletion_vectors: AddDeletionVectorColumns::default(),
             encoded_paths: Vec::new(),
@@ -497,6 +551,7 @@ impl LeafReadContext {
                 path(TRACKING, SEQUENCE_NUMBER),
                 lit(parent_sequence_number),
             )),
+            requires_entry_tracking: false,
         };
         let input_schema = schema_with_helpers(
             &ContentTreeNodeEntry::to_schema_with_content_stats(ctx.content_stats()),
@@ -781,7 +836,10 @@ fn make_entry_converter(
         Arc::new(expr),
         output_type,
     )?;
-    Ok(EntryConverter { evaluator })
+    Ok(EntryConverter {
+        evaluator,
+        requires_entry_tracking: sources.requires_entry_tracking,
+    })
 }
 
 /// Validates each leaf entry and resolves its `firstRowId`, starting from `seed`. Returns the
@@ -882,8 +940,12 @@ fn partition_values_map_type() -> KernelResult<MapType> {
 ///
 /// Alongside, it encodes each selected entry's raw `location` (see [`amt_location_to_add_path`])
 /// into [`ENCODED_PATH_HELPER`] values: the encoded path when encoding changes it, else null.
+///
+/// When `requires_entry_tracking` is set, a selected entry with a null `tracking.firstRowId` or
+/// `tracking.sequenceNumber` is rejected too, rather than becoming an `Add` without row tracking.
 struct AddSelectionVisitor<'r> {
     removed: RemovedEntries<'r>,
+    requires_entry_tracking: bool,
     selection: Vec<bool>,
     /// The helper columns `Add.deletionVector` is built from, with a row for every entry: only a
     /// selected entry's deletion vector is kept.
@@ -893,7 +955,7 @@ struct AddSelectionVisitor<'r> {
 
 /// Index of the first [`DV_INFO_COLUMNS`] getter in [`AddSelectionVisitor`]'s getters, which end
 /// with them.
-const ADD_SELECTION_DV_START: usize = 7;
+const ADD_SELECTION_DV_START: usize = 9;
 
 impl RowVisitor for AddSelectionVisitor<'_> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
@@ -906,6 +968,8 @@ impl RowVisitor for AddSelectionVisitor<'_> {
                 ColumnName::new([PARTITION_SPEC_ID]),
                 ColumnName::new([TRACKING, MODIFIED_SNAPSHOT_ID]),
                 ColumnName::new([COLUMN_FILES]),
+                ColumnName::new([TRACKING, FIRST_ROW_ID]),
+                ColumnName::new([TRACKING, SEQUENCE_NUMBER]),
             ];
             let types: [DataType; ADD_SELECTION_DV_START] = [
                 DataType::INTEGER,
@@ -915,6 +979,8 @@ impl RowVisitor for AddSelectionVisitor<'_> {
                 DataType::INTEGER,
                 DataType::LONG,
                 ArrayType::new(ColumnFile::to_schema(), false).into(),
+                DataType::LONG,
+                DataType::LONG,
             ];
             let (dv_names, dv_types) = DV_INFO_COLUMNS.as_ref();
             let names = names.into_iter().chain(dv_names.iter().cloned());
@@ -953,6 +1019,9 @@ impl RowVisitor for AddSelectionVisitor<'_> {
             };
             let encoded_path = if selected {
                 check_selected_entry(row, location, getters, &mut self.deletion_vectors)?;
+                if self.requires_entry_tracking {
+                    check_entry_tracking(row, location, getters)?;
+                }
                 match amt_location_to_add_path(location)? {
                     Cow::Owned(path) => Some(path),
                     Cow::Borrowed(_) => None,
@@ -1057,6 +1126,29 @@ fn check_selected_entry<'a>(
     let modified_snapshot_id: Option<i64> = getters[5].get_opt(row, MODIFIED_SNAPSHOT_ID)?;
     if modified_snapshot_id.is_some() && !has_deletion_vector {
         return Err(unsupported_modification(MODIFIED_SNAPSHOT_ID));
+    }
+    Ok(())
+}
+
+/// Rejects a selected entry whose `tracking.firstRowId` or `tracking.sequenceNumber` is null.
+/// `getters` is [`AddSelectionVisitor`]'s column order.
+fn check_entry_tracking<'a>(
+    row: usize,
+    location: &str,
+    getters: &[&'a dyn GetData<'a>],
+) -> KernelResult<()> {
+    let first_row_id: Option<i64> = getters[7].get_opt(row, FIRST_ROW_ID)?;
+    let sequence_number: Option<i64> = getters[8].get_opt(row, SEQUENCE_NUMBER)?;
+    let missing = [
+        (FIRST_ROW_ID, first_row_id),
+        (SEQUENCE_NUMBER, sequence_number),
+    ]
+    .into_iter()
+    .find_map(|(field, value)| value.is_none().then_some(field));
+    if let Some(field) = missing {
+        return Err(KernelError::missing_data(format!(
+            "AMT root manifest entry '{location}' is missing required tracking field '{field}'"
+        )));
     }
     Ok(())
 }
@@ -2519,8 +2611,8 @@ mod tests {
         assert_result_error_with_message(result, "live DeleteManifest entry");
     }
 
-    /// A dropped entry is not validated: an unsupported file format, partition spec, or deletion
-    /// vector on it must not fail the read.
+    /// A dropped entry is not validated: an unsupported file format, partition spec, deletion
+    /// vector, or null tracking values on it must not fail the read.
     #[rstest]
     fn dropped_entry_with_unsupported_fields_is_not_rejected(
         #[values(
@@ -2538,9 +2630,36 @@ mod tests {
         entry.deletion_vector = Some(test_dv_info());
         entry.tracking.modified_snapshot_id = Some(1);
         entry.column_files = Some(vec![test_column_file()]);
+        entry.tracking.first_row_id = None;
+        entry.tracking.sequence_number = None;
         let entry = with_field(&entry.into(), &[FILE_FORMAT], Scalar::from("orc"));
         let selection = convert_struct(entry).unwrap().selection_vector().to_vec();
         assert_eq!(selection, [false]);
+    }
+
+    #[rstest]
+    fn live_root_entry_with_null_tracking_field_errors(
+        #[values(FIRST_ROW_ID, SEQUENCE_NUMBER)] field: &str,
+        #[values(
+            TrackingStatus::Existing,
+            TrackingStatus::Added,
+            TrackingStatus::Modified
+        )]
+        status: TrackingStatus,
+    ) {
+        let mut entry = added_data_entry("f.parquet", 10, 5, 0, 1);
+        entry.tracking.status = status;
+        match field {
+            FIRST_ROW_ID => entry.tracking.first_row_id = None,
+            _ => entry.tracking.sequence_number = None,
+        }
+        let result = convert(&[entry]);
+        assert_result_error_with_message(
+            result,
+            &format!(
+                "AMT root manifest entry 'f.parquet' is missing required tracking field '{field}'"
+            ),
+        );
     }
 
     #[rstest]
