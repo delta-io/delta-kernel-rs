@@ -13,7 +13,8 @@ use crate::arrow::array::types::*;
 use crate::arrow::array::{
     self as arrow_array, Array, ArrayBuilder, ArrayData, ArrayRef, AsArray, BooleanArray, Datum,
     LargeStringBuilder, ListArray, MapArray, MutableArrayData, NullBufferBuilder, RecordBatch,
-    StringArray, StringArrayType, StringViewBuilder, StructArray, make_array, new_null_array,
+    StringArray, StringArrayType, StringViewBuilder, StructArray, UInt32Array, make_array,
+    new_null_array,
 };
 use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
 use crate::arrow::compute::kernels::cast_utils::{Parser, string_to_datetime};
@@ -23,6 +24,7 @@ use crate::arrow::compute::kernels::interleave::interleave;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
 use crate::arrow::compute::{
     and_kleene, can_cast_types, cast, filter_record_batch, is_not_null, is_null, not, or_kleene,
+    take,
 };
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields, IntervalUnit,
@@ -738,20 +740,24 @@ fn map_has_key(map: &ArrayRef, key: &ArrayRef) -> KernelResult<BooleanArray> {
             key.data_type()
         )));
     };
+    // Repeat each row's key once per entry of that row, so a single `eq` compares all entries.
     let offsets = map.value_offsets();
-    let mut has_key = Vec::with_capacity(map.len());
-    for row in 0..map.len() {
+    let first = offsets[0] as usize;
+    let entry_len = |row: usize| (offsets[row + 1] - offsets[row]) as usize;
+    let entry_rows: UInt32Array = (0..map.len())
+        .flat_map(|row| std::iter::repeat_n(row as u32, entry_len(row)))
+        .collect();
+    let entry_keys = map_keys.slice(first, entry_rows.len());
+    let row_keys = take(key.as_ref(), &entry_rows, None)?;
+    let matches = eq(&entry_keys, &row_keys)?;
+    let has_key = (0..map.len()).map(|row| {
         if map.is_null(row) || key.is_null(row) {
-            has_key.push(None);
-            continue;
+            return None;
         }
-        let (start, end) = (offsets[row] as usize, offsets[row + 1] as usize);
-        let candidates = map_keys.slice(start, end - start);
-        let needle = arrow_array::Scalar::new(key.slice(row, 1));
-        let matches = eq(&candidates, &needle)?;
-        has_key.push(Some(matches.true_count() > 0));
-    }
-    Ok(BooleanArray::from(has_key))
+        let start = offsets[row] as usize - first;
+        Some(matches.slice(start, entry_len(row)).true_count() > 0)
+    });
+    Ok(has_key.collect())
 }
 
 fn same_kernel_type(a: &ArrowDataType, b: &ArrowDataType) -> bool {
@@ -3447,15 +3453,21 @@ mod tests {
         assert_eq!(result, expected);
     }
 
-    #[test]
-    fn test_map_has_key_utf8_key_against_utf8_view_map_keys() {
-        let keys = Arc::new(crate::arrow::array::StringViewArray::from(vec!["a", "b"]));
+    #[rstest]
+    #[case::utf8_view_present_key(ArrowDataType::Utf8View, lit("b"), vec![Some(true), Some(false)])]
+    #[case::utf8_view_null_key(ArrowDataType::Utf8View, null_lit(DataType::STRING), vec![None, None])]
+    #[case::large_utf8_present_key(ArrowDataType::LargeUtf8, lit("b"), vec![Some(true), Some(false)])]
+    #[case::large_utf8_null_key(ArrowDataType::LargeUtf8, null_lit(DataType::STRING), vec![None, None])]
+    fn test_map_has_key_utf8_key_against_other_string_map_keys(
+        #[case] key_type: ArrowDataType,
+        #[case] key: Expr,
+        #[case] expected: Vec<Option<bool>>,
+    ) {
+        let keys: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
+        let keys = cast(&keys, &key_type).unwrap();
         let values = Arc::new(Int32Array::from(vec![1, 2]));
         let entries = StructArray::from(vec![
-            (
-                Arc::new(ArrowField::new("key", ArrowDataType::Utf8View, false)),
-                keys as ArrayRef,
-            ),
+            (Arc::new(ArrowField::new("key", key_type, false)), keys),
             (
                 Arc::new(ArrowField::new("value", ArrowDataType::Int32, true)),
                 values as ArrayRef,
@@ -3471,9 +3483,9 @@ mod tests {
         let schema = ArrowSchema::new(vec![ArrowField::new("m", map.data_type().clone(), true)]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map)]).unwrap();
 
-        let pred = Pred::map_has_key(col!("m"), lit("b"));
+        let pred = Pred::map_has_key(col!("m"), key);
         let result = evaluate_predicate(&pred, &batch, false).unwrap();
-        let expected = BooleanArray::from(vec![Some(true), Some(false)]);
+        let expected = BooleanArray::from(expected);
         assert_eq!(result, expected);
     }
 
