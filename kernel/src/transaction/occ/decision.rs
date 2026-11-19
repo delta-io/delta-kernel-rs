@@ -69,8 +69,8 @@ pub(crate) struct WinnerSummary {
     pub(crate) writes_row_tracking: bool,
     /// The winner removes the `delta.rowTracking` domain.
     pub(crate) removes_row_tracking: bool,
-    /// The rules that the winner breaks.
-    pub(crate) violations: Vec<WinnerRule>,
+    /// The first rule in [`WinnerRule`] order that the winner breaks.
+    pub(crate) first_violation: Option<WinnerRule>,
 }
 
 /// One row of the OCC plan.
@@ -92,10 +92,9 @@ pub(super) fn read_winner_summaries(result: PlanResult) -> KernelResult<Vec<Winn
 ///
 /// `summaries` must be in ascending version order.
 pub(super) fn first_winner_conflict(summaries: &[WinnerSummary]) -> Option<Conflict> {
-    let (version, rule) = summaries.iter().find_map(|summary| {
-        let rule = summary.violations.iter().min()?;
-        Some((summary.version, *rule))
-    })?;
+    let (version, rule) = summaries
+        .iter()
+        .find_map(|summary| Some((summary.version, summary.first_violation?)))?;
     Some(conflict_at(summaries, version, ConflictKind::Winner(rule)))
 }
 
@@ -104,7 +103,7 @@ pub(super) fn select_read_append_versions(
     facts: &LoserFacts,
     summaries: &[WinnerSummary],
 ) -> Vec<Version> {
-    let isolation_level = facts.effective_isolation_level();
+    let isolation_level = effective_isolation_level(facts);
     let read_nothing = matches!(facts.read_scope, ReadScope::Nothing);
     if read_nothing || isolation_level == IsolationLevel::SnapshotIsolation {
         return Vec::new();
@@ -113,18 +112,40 @@ pub(super) fn select_read_append_versions(
         summaries
             .iter()
             .filter(|summary| {
-                !summary
+                let is_backfill = summary
                     .operation
                     .as_deref()
-                    .is_some_and(is_row_tracking_backfill_operation)
-            })
-            .filter(|summary| {
-                isolation_level != IsolationLevel::WriteSerializable
+                    .is_some_and(is_row_tracking_backfill_operation);
+                let counts_blind_append = isolation_level != IsolationLevel::WriteSerializable
                     || facts.changes_metadata
-                    || summary.is_blind_append != Some(true)
+                    || summary.is_blind_append != Some(true);
+                !is_backfill && counts_blind_append
             })
             .map(|summary| summary.version),
     )
+}
+
+/// Returns the isolation level that the `read_append` check uses.
+///
+/// T drops to SnapshotIsolation when no file action has `dataChange=true` and T writes no action
+/// other than file actions, `delta.rowTracking` domain metadata and `commitInfo`. Under
+/// WriteSerializable, T's operation must also change no data.
+fn effective_isolation_level(facts: &LoserFacts) -> IsolationLevel {
+    let blocks_downgrade = facts.has_other_actions
+        || facts.changes_metadata
+        || facts.written_domains_except_row_tracking().next().is_some();
+    let can_downgrade = !facts.has_data_change
+        && !blocks_downgrade
+        && match facts.isolation_level {
+            IsolationLevel::Serializable => true,
+            IsolationLevel::WriteSerializable => !facts.operation_changes_data,
+            IsolationLevel::SnapshotIsolation => false,
+        };
+    if can_downgrade {
+        IsolationLevel::SnapshotIsolation
+    } else {
+        facts.isolation_level
+    }
 }
 
 /// Reads the OCC plan output.
@@ -152,7 +173,7 @@ pub(super) fn first_occ_conflict(
 /// A winner gets no row when the plan reads no action from its commit file, for example an empty
 /// file. Kernel fails then, because it can't check that winner.
 pub(super) fn ensure_winner_rows(
-    read_version: Version,
+    checked_version: Version,
     winners: &[WinningCommit],
     summaries: &[WinnerSummary],
 ) -> KernelResult<()> {
@@ -165,8 +186,8 @@ pub(super) fn ensure_winner_rows(
     }
     if rows != versions {
         return Err(KernelError::internal_error(format!(
-            "Winner check rows {rows:?} do not match the winning commits {versions:?} after read \
-             version {read_version}"
+            "Winner check rows {rows:?} do not match the winning commits {versions:?} after \
+             checked version {checked_version}"
         )));
     }
     Ok(())
@@ -175,8 +196,8 @@ pub(super) fn ensure_winner_rows(
 /// Returns an error when a winner is a manifest commit.
 ///
 /// A manifest commit's file changes can live in its content tree, which the plans don't read. T's
-/// references to the table state also go stale. The `checkpoint` array holds the full table state,
-/// not the commit's changes.
+/// backreferences to the table state also go stale. The `checkpoint` array holds the full table
+/// state, not the commit's changes.
 pub(super) fn ensure_no_manifest_commit(summaries: &[WinnerSummary]) -> KernelResult<()> {
     if let Some(summary) = summaries.iter().find(|summary| summary.is_manifest_commit) {
         return Err(KernelError::unsupported(format!(
@@ -267,11 +288,11 @@ impl RowVisitor for WinnerSummaryVisitor {
             ),
         ];
         for row in 0..row_count {
-            let mut violations = Vec::new();
+            let mut first_violation = None;
             for (rule, getter, name) in &rules {
                 let violated: bool = getter.get(row, name)?;
-                if violated {
-                    violations.push(*rule);
+                if violated && first_violation.is_none() {
+                    first_violation = Some(*rule);
                 }
             }
             self.0.push(WinnerSummary {
@@ -284,7 +305,7 @@ impl RowVisitor for WinnerSummaryVisitor {
                     .get_opt(row, ROW_ID_HIGH_WATER_MARK)?,
                 writes_row_tracking: writes_row_tracking.get(row, WRITES_ROW_TRACKING)?,
                 removes_row_tracking: removes_row_tracking.get(row, REMOVES_ROW_TRACKING)?,
-                violations,
+                first_violation,
             });
         }
         Ok(())

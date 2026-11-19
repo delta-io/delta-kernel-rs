@@ -9,13 +9,13 @@
 //!
 //! Project(part) and Filter(predicate) run only for a partitioned `ReadScope::Files` with a
 //! predicate. `WholeTable` has no SemiJoin(read_files). `Nothing` leaves out read_append and
-//! read_delete.
+//! read_delete. delete_delete runs only when T rewrites files.
 
 use std::sync::LazyLock;
 
 use strum::{EnumString, IntoStaticStr};
 
-use super::{LoserFacts, ReadScope, WinningCommit};
+use super::{LoserFacts, ReadScope, WinningCommit, scan_winners};
 use crate::action_reconciliation::file_metadata::PARTITION_VALUES_FIELD;
 use crate::action_reconciliation::plan::VERSION;
 use crate::actions::{ADD_NAME, REMOVE_NAME};
@@ -56,8 +56,8 @@ pub(super) static VIOLATION_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 /// Builds the OCC plan, or returns `None` when no check has a winner to scan.
 ///
 /// The plan returns one row for each check and version with a violation. `read_append` scans the
-/// winners at `read_append_versions`. The delete checks scan every winner. `file_actions` must have
-/// a `remove.path` column.
+/// winners at `read_append_versions`. `read_delete` scans every winner, and so does
+/// `delete_delete` when T rewrites files. `file_actions` must have a `remove.path` column.
 pub(super) fn occ_plan(
     facts: &LoserFacts,
     winners: &[WinningCommit],
@@ -67,17 +67,21 @@ pub(super) fn occ_plan(
     let read_append = read_append_branch(&facts.read_scope, winners, read_append_versions)?;
     let removes = winner_removes(winners)?;
     let read_delete = read_delete_branch(&facts.read_scope, removes.clone())?;
-    let delete_delete = delete_delete_branch(removes, file_actions)?;
-    PlanBuilder::union_all([
+    let mut branches = vec![
         violations(read_append, OccCheck::ReadAppend)?,
         violations(read_delete, OccCheck::ReadDelete)?,
-        violations(delete_delete, OccCheck::DeleteDelete)?,
-    ])?
-    // The aggregate gives one row for each (check, version). Nothing reads the count.
-    .aggregate_by([column_name!(CHECK), column_name!(VERSION)], |aggs| {
-        aggs.count_star()
-    })?
-    .build_opt()
+    ];
+    // T has no remove that a winner remove can match unless T rewrites files.
+    if facts.rewrites_files {
+        let delete_delete = delete_delete_branch(removes, file_actions)?;
+        branches.push(violations(delete_delete, OccCheck::DeleteDelete)?);
+    }
+    PlanBuilder::union_all(branches)?
+        // The aggregate gives one row for each (check, version). Nothing reads the count.
+        .aggregate_by([column_name!(CHECK), column_name!(VERSION)], |aggs| {
+            aggs.count_star()
+        })?
+        .build_opt()
 }
 
 /// A file-level check of the OCC plan.
@@ -100,12 +104,10 @@ fn read_append_branch(
     winners: &[WinningCommit],
     versions: &[Version],
 ) -> KernelResult<PlanBuilder> {
-    let files = winners
+    let checked_winners = winners
         .iter()
-        .filter(|winner| versions.contains(&winner.version))
-        .map(WinningCommit::scan_file)
-        .collect::<KernelResult<Vec<_>>>()?;
-    let adds = PlanBuilder::scan_json(files, &[VERSION], WINNER_ADDS_SCHEMA.clone())?
+        .filter(|winner| versions.contains(&winner.version));
+    let adds = scan_winners(checked_winners, WINNER_ADDS_SCHEMA.clone())?
         .filter(col!(ADD_NAME).is_not_null())?;
     let ReadScope::Files {
         partition_schema,
@@ -144,14 +146,13 @@ fn read_append_branch(
 /// Winner removes of files that T read. Every remove counts, including `dataChange=false`.
 fn read_delete_branch(read_scope: &ReadScope, removes: PlanBuilder) -> KernelResult<PlanBuilder> {
     match read_scope {
-        // T read every file, so any winner remove fails T.
         ReadScope::WholeTable => Ok(removes),
         ReadScope::Files { read_files, .. } => removes.semi_join(
             PlanBuilder::relation_source(read_files.clone()),
             [column_name!(REMOVE_NAME, PATH)],
             [column_name!(PATH)],
         ),
-        // T read nothing, so no winner remove is of a file that T read.
+        // T read nothing, so no winner remove can match a file that T read.
         ReadScope::Nothing => PlanBuilder::values(WINNER_REMOVES_SCHEMA.clone(), vec![]),
     }
 }
@@ -172,15 +173,7 @@ fn delete_delete_branch(
 }
 
 fn winner_removes(winners: &[WinningCommit]) -> KernelResult<PlanBuilder> {
-    PlanBuilder::scan_json(
-        winners
-            .iter()
-            .map(WinningCommit::scan_file)
-            .collect::<KernelResult<Vec<_>>>()?,
-        &[VERSION],
-        WINNER_REMOVES_SCHEMA.clone(),
-    )?
-    .filter(col!(REMOVE_NAME).is_not_null())
+    scan_winners(winners, WINNER_REMOVES_SCHEMA.clone())?.filter(col!(REMOVE_NAME).is_not_null())
 }
 
 fn violations(branch: PlanBuilder, check: OccCheck) -> KernelResult<PlanBuilder> {

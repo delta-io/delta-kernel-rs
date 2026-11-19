@@ -205,10 +205,6 @@ fn scan_paths(snapshot: &SnapshotRef, predicate: Option<PredicateRef>) -> Vec<St
     paths
 }
 
-fn as_strs(paths: &[String]) -> Vec<&str> {
-    Vec::from_iter(paths.iter().map(String::as_str))
-}
-
 /// Relations and facts of a DELETE that reads and removes the files that `partition_predicate`
 /// selects. With no predicate, the DELETE reads and removes every file.
 fn delete_selecting(
@@ -217,7 +213,7 @@ fn delete_selecting(
     partition_predicate: Option<PredicateRef>,
 ) -> (LoserRelations, LoserFacts) {
     let paths = scan_paths(snapshot, partition_predicate.clone());
-    let read = as_strs(&paths);
+    let read = Vec::from_iter(paths.iter().map(String::as_str));
     let relations = LoserRelations::new(&read, &read);
     let facts = partitioned_delete_facts(
         snapshot.version(),
@@ -245,7 +241,7 @@ fn delete_partition_a(url: &str) -> (LoserRelations, LoserFacts) {
 /// Runs conflict detection for T against the winners after T's read version in the table at
 /// `url`.
 fn detect_in_table(relations: &LoserRelations, facts: &LoserFacts, url: &str) -> Option<Conflict> {
-    outcome(relations.detect(facts, &winners_after(url, facts.read_version)))
+    outcome(relations.detect(facts, &winners_after(url, facts.checked_version)))
 }
 
 // === Kernel-written winners ===

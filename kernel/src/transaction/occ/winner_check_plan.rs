@@ -6,7 +6,7 @@
 
 use std::sync::LazyLock;
 
-use super::{LoserFacts, WinningCommit};
+use super::{LoserFacts, WinningCommit, scan_winners};
 use crate::KernelResult;
 use crate::action_reconciliation::plan::VERSION;
 use crate::actions::{
@@ -14,8 +14,8 @@ use crate::actions::{
     SET_TRANSACTION_NAME,
 };
 use crate::expressions::{Expression, Predicate, col, column_name, lit, null_lit};
+use crate::plans::Plan;
 use crate::plans::ir::nodes::Agg;
-use crate::plans::{Plan, PlanBuilder};
 use crate::row_tracking::ROW_TRACKING_DOMAIN_NAME;
 use crate::schema::{DataType, SchemaRef, lazy_schema_ref};
 
@@ -28,10 +28,9 @@ const ROW_TRACKING_BACKFILL_OPERATIONS: [&str; 2] = [
     ROW_TRACKING_BACKFILL_OPERATION,
     ROW_TRACKING_UNBACKFILL_OPERATION,
 ];
-/// The `commitInfo.tags` key of an identity-only metadata update. Delta Spark uses the same key as
-/// `DeltaSourceUtils.IDENTITY_COMMITINFO_TAG`.
+/// The `commitInfo.tags` key of an identity-only metadata update.
 const IDENTITY_ONLY_METADATA_UPDATE_TAG: &str = "delta.identity.schemaUpdate";
-/// The tag value that marks an identity-only metadata update. Kernel matches it exactly.
+/// The tag value that marks an identity-only metadata update.
 const IDENTITY_ONLY_METADATA_UPDATE_TAG_VALUE: &str = "true";
 
 // === Output columns ===
@@ -151,11 +150,7 @@ pub(super) fn winner_check_plan(
     facts: &LoserFacts,
     winners: &[WinningCommit],
 ) -> KernelResult<Option<Plan>> {
-    let files = winners
-        .iter()
-        .map(WinningCommit::scan_file)
-        .collect::<KernelResult<Vec<_>>>()?;
-    PlanBuilder::scan_json(files, &[VERSION], WINNER_ACTIONS_SCHEMA.clone())?
+    scan_winners(winners, WINNER_ACTIONS_SCHEMA.clone())?
         .project(action_row_expr(facts), ACTION_ROW_SCHEMA.clone())?
         .aggregate_by([column_name!(VERSION)], |aggs| {
             aggs.first_non_null(column_name!(OPERATION))
@@ -204,10 +199,8 @@ pub(super) fn is_row_tracking_backfill_operation(operation: &str) -> bool {
 /// One row for each action. Columns that do not apply to the action are NULL.
 fn action_row_expr(facts: &LoserFacts) -> Expression {
     let conflicting_domains = facts
-        .written_domains
-        .iter()
-        .filter(|domain| domain.as_str() != ROW_TRACKING_DOMAIN_NAME)
-        .map(|domain| col!(DOMAIN_METADATA_NAME, "domain").eq(lit(domain.as_str())));
+        .written_domains_except_row_tracking()
+        .map(|domain| col!(DOMAIN_METADATA_NAME, "domain").eq(lit(domain)));
     let conflicting_app_ids = facts
         .read_app_ids
         .iter()
@@ -245,8 +238,6 @@ fn action_row_expr(facts: &LoserFacts) -> Expression {
 /// column is true when the winner breaks that rule.
 fn rule_expr(facts: &LoserFacts) -> Expression {
     let has_metadata = has_matches(METADATA_COUNT);
-    // Delta Spark's ConflictChecker accepts an identity-only metadata update when T changes no
-    // metadata.
     let metadata_changed = if facts.changes_metadata {
         has_metadata
     } else {

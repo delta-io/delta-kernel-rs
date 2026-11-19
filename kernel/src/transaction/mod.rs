@@ -62,7 +62,6 @@ mod declarative;
 mod domain_metadata;
 mod exec_mode;
 mod imperative;
-// Nothing in the commit path calls conflict detection, so non-test builds allow dead code.
 #[cfg(feature = "declarative-plans")]
 #[cfg_attr(not(test), allow(dead_code))]
 mod occ;

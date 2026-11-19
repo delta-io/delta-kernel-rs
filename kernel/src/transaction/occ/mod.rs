@@ -16,18 +16,17 @@
 //!   the client can't read or write that protocol, when T also writes a protocol, when the winner
 //!   drops a feature, or when the winner adds a feature that fails concurrent transactions and an
 //!   opt-in conf is on.
-//! - A winner metadata action fails T, except an identity-only update whose tag is exactly `true`
-//!   while T changes no metadata. Delta Spark also accepts the tag `TRUE`. It also accepts a winner
-//!   that only enables some features, such as row tracking, while T changes no metadata.
-//! - A row-tracking backfill or unbackfill winner fails any T that removes or adds a file again,
-//!   whatever its paths.
+//! - Kernel matches the identity-only tag `true` exactly. Delta Spark accepts `true` in any letter
+//!   case. Delta Spark also accepts a winner metadata change whose configuration keys are all on an
+//!   allow-list, such as enabling row tracking or deletion vectors, while T changes no metadata.
+//! - The backfill rule fails T whatever the paths of the files that T rewrites.
 //! - Kernel can report a later winner, or a different rule, than Delta Spark reports, because of
 //!   the order of the checks.
 //! - An empty winner commit fails detection with an error. Delta Spark reads no action from it and
 //!   finds no conflict.
 //! - These inputs fail detection with an `unsupported` error, at the step that
-//!   [`detect_conflicts()`] lists: a table-level SnapshotIsolation, a T that is a manifest
-//!   commit, a manifest-commit winner and a `delta.rowTracking` tombstone.
+//!   [`detect_conflicts()`] lists: a table-level SnapshotIsolation, a T that is a manifest commit,
+//!   a manifest-commit winner and a `delta.rowTracking` tombstone.
 //!
 //! T's facts don't depend on the winners, because Kernel never rebases T between winners.
 
@@ -48,9 +47,10 @@ use decision::{
 use occ_plan::occ_plan;
 use winner_check_plan::winner_check_plan;
 
+use crate::action_reconciliation::plan::VERSION;
 use crate::expressions::MapToStructOptions;
 use crate::plans::ir::nodes::ScanFile;
-use crate::plans::{Operation, RelationRef, ScopedPlanExecutor};
+use crate::plans::{Operation, PlanBuilder, RelationRef, ScopedPlanExecutor};
 use crate::row_tracking::ROW_TRACKING_DOMAIN_NAME;
 use crate::schema::SchemaRef;
 use crate::table_properties::IsolationLevel;
@@ -60,8 +60,8 @@ use crate::{FileMeta, KernelError, KernelResult, PredicateRef, Version, version_
 ///
 /// Detection runs these steps in order:
 ///
-/// 1. the input checks: the table isolation level, whether T is a manifest commit, and the winner
-///    list;
+/// 1. the input checks: the table isolation level, whether T is a manifest commit, whether a T that
+///    read nothing rewrites files, and the winner list;
 /// 2. the winner check plan;
 /// 3. the winner-row check;
 /// 4. the winner rules;
@@ -94,12 +94,17 @@ pub(crate) fn detect_conflicts(
             "Conflict detection does not support a transaction that writes a manifest commit",
         ));
     }
-    ensure_winners_follow_read_version(facts.read_version, winners)?;
+    if matches!(facts.read_scope, ReadScope::Nothing) && facts.rewrites_files {
+        return Err(KernelError::internal_error(
+            "A transaction that removes or re-adds files must pass the files that it read",
+        ));
+    }
+    ensure_winners_follow_checked_version(facts.checked_version, winners)?;
     let summaries = match winner_check_plan(facts, winners)? {
         Some(plan) => read_winner_summaries(executor.execute_op(Operation::QueryPlan(plan))?)?,
         None => Vec::new(),
     };
-    ensure_winner_rows(facts.read_version, winners, &summaries)?;
+    ensure_winner_rows(facts.checked_version, winners, &summaries)?;
     if let Some(conflict) = first_winner_conflict(&summaries) {
         return Ok(ConflictDetection::Conflict(conflict));
     }
@@ -147,18 +152,19 @@ impl WinningCommit {
 /// T is never a row-tracking backfill or unbackfill, because Kernel reserves those operation names.
 #[derive(Debug, Clone)]
 pub(crate) struct LoserFacts {
-    /// The version before the first winner to check: T's read version on the first conflict, then
-    /// the last winner that the previous check covered.
-    pub(crate) read_version: Version,
+    /// The last version that T was checked against: T's read version on the first check, then the
+    /// last winner that the previous check covered.
+    pub(crate) checked_version: Version,
     /// The table's isolation level. Kernel accepts Serializable and WriteSerializable. OSS Delta
-    /// accepts only Serializable as a table value, and other writers set WriteSerializable. When
-    /// `delta.isolationLevel` is unset, pass Serializable, the Delta default. When it is set but
-    /// doesn't parse, fail T: don't guess a level. [`LoserFacts::effective_isolation_level`]
-    /// applies the downgrade.
+    /// accepts only Serializable as a table value. Other writers set WriteSerializable. Parse the
+    /// raw `delta.isolationLevel` value case-insensitively, as Delta Spark does.
+    /// `TableProperties::isolation_level` is `None` both when the property is unset and when it
+    /// doesn't parse. When the raw value is unset, pass Serializable, the Delta default. When it
+    /// doesn't parse, fail T. [`decision::effective_isolation_level`] applies the downgrade.
     pub(crate) isolation_level: IsolationLevel,
     /// T writes a root manifest file, so its commit is an adaptiveMetadata manifest commit. Its
     /// `checkpoint` action states the table's txns and domains, so a retry would drop a winner's
-    /// changes.
+    /// changes. Detection fails with an `unsupported` error.
     pub(crate) is_manifest_commit: bool,
     /// At least one file action of T has `dataChange=true`.
     pub(crate) has_data_change: bool,
@@ -182,30 +188,12 @@ pub(crate) struct LoserFacts {
 }
 
 impl LoserFacts {
-    /// Returns the isolation level that the `read_append` check uses.
-    ///
-    /// T drops to SnapshotIsolation when no file action has `dataChange=true` and T writes no
-    /// action other than file actions, `delta.rowTracking` domain metadata and `commitInfo`. Under
-    /// WriteSerializable, T's operation must also change no data.
-    pub(crate) fn effective_isolation_level(&self) -> IsolationLevel {
-        let blocks_downgrade = self.has_other_actions
-            || self.changes_metadata
-            || self
-                .written_domains
-                .iter()
-                .any(|domain| domain != ROW_TRACKING_DOMAIN_NAME);
-        let can_downgrade = !self.has_data_change
-            && !blocks_downgrade
-            && match self.isolation_level {
-                IsolationLevel::Serializable => true,
-                IsolationLevel::WriteSerializable => !self.operation_changes_data,
-                IsolationLevel::SnapshotIsolation => false,
-            };
-        if can_downgrade {
-            IsolationLevel::SnapshotIsolation
-        } else {
-            self.isolation_level
-        }
+    /// The domains that T writes, except `delta.rowTracking`.
+    fn written_domains_except_row_tracking(&self) -> impl Iterator<Item = &str> {
+        self.written_domains
+            .iter()
+            .map(String::as_str)
+            .filter(|domain| *domain != ROW_TRACKING_DOMAIN_NAME)
     }
 }
 
@@ -233,32 +221,46 @@ pub(crate) enum ReadScope {
         /// T's scan.
         map_to_struct_options: MapToStructOptions,
     },
-    /// T read no table state. A blind append passes it.
+    /// T read no table state and only adds files: a blind append. If T removes or re-adds a file,
+    /// pass the files that T read.
     Nothing,
 }
 
 // === Helpers ===
 
-/// Returns an internal error unless the winners start at `read_version + 1` and their versions
+/// Returns an internal error unless the winners start at `checked_version + 1` and their versions
 /// ascend with no gap.
 ///
 /// Runs before any plan, so a bad winner list fails before any I/O.
-fn ensure_winners_follow_read_version(
-    read_version: Version,
+fn ensure_winners_follow_checked_version(
+    checked_version: Version,
     winners: &[WinningCommit],
 ) -> KernelResult<()> {
-    let follows_read_version = winners
+    let follows_checked_version = winners
         .iter()
         .zip(1..)
-        .all(|(winner, offset)| read_version.checked_add(offset) == Some(winner.version));
-    if !follows_read_version {
+        .all(|(winner, offset)| checked_version.checked_add(offset) == Some(winner.version));
+    if !follows_checked_version {
         return Err(KernelError::internal_error(format!(
-            "Winning commits {:?} must start at read version {read_version} + 1 with no version \
-             gap",
+            "Winning commits {:?} must start at checked version {checked_version} + 1 with no \
+             version gap",
             winner_versions(winners),
         )));
     }
     Ok(())
+}
+
+/// A JSON scan of the commit files of `winners` with `schema`. Each row has its winner's version
+/// in the `VERSION` column.
+fn scan_winners<'a>(
+    winners: impl IntoIterator<Item = &'a WinningCommit>,
+    schema: SchemaRef,
+) -> KernelResult<PlanBuilder> {
+    let files = winners
+        .into_iter()
+        .map(WinningCommit::scan_file)
+        .collect::<KernelResult<Vec<_>>>()?;
+    PlanBuilder::scan_json(files, &[VERSION], schema)
 }
 
 fn winner_versions(winners: &[WinningCommit]) -> Vec<Version> {
