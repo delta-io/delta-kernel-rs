@@ -82,8 +82,6 @@ pub static FILE_META_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 ///   checkpoints, should never be empty). It is recommended that implementors reject such inputs
 ///   with an error, however kernel does not rely on such behavior and will perform its own
 ///   pre-write validations to ensure this does not happen.
-/// - Input evaluation or serialization failures must leave the destination untouched. Publish only
-///   after all input streams have completed successfully.
 /// - Behavior can be undefined if a single plan contains multiple writes to the same destination,
 ///   because execution order is unspecified and executors may optimize away common table
 ///   expressions.
