@@ -2191,6 +2191,9 @@ impl CheckpointEntrySource {
 }
 
 /// A root manifest commit computed the `checkpoint` action it writes.
+///
+/// Shares its `operation_id` with the commit's [`TransactionCommitSuccess`] or
+/// [`TransactionCommitFailure`] event. Not reported when computing the action fails.
 #[derive(Debug, Clone)]
 pub struct CheckpointActionComputed {
     /// The committing transaction's operation id.
@@ -2542,6 +2545,28 @@ pub(crate) fn emit_scan_metadata_completed(e: &ScanMetadataCompleted) {
         dedup_visitor_time_ns = e.dedup_visitor_time.as_nanos() as u64,
         action_transform_time_ns = e.action_transform_time.as_nanos() as u64,
         predicate_eval_time_ns = e.predicate_eval_time.as_nanos() as u64,
+    );
+}
+
+/// Emit a [`MetricEvent::CheckpointActionComputed`] via a tracing span.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) fn emit_checkpoint_action_computed(e: &CheckpointActionComputed) {
+    let _span = tracing::span!(
+        tracing::Level::INFO,
+        CheckpointActionComputed::SPAN_NAME,
+        report = tracing::field::Empty,
+        operation_id = %e.operation_id,
+        correlation_id = e.correlation_id.as_deref().unwrap_or(""),
+        is_catalog_managed = e.table_type.is_catalog_managed(),
+        commit_version = e.commit_version,
+        txn_source = e.txn_source.as_ref(),
+        domain_metadata_source = e.domain_metadata_source.as_ref(),
+        num_log_commits_replayed = e.num_log_commits_replayed,
+        num_txn_sidecars_kept = e.num_txn_sidecars_kept,
+        num_domain_metadata_sidecars_kept = e.num_domain_metadata_sidecars_kept,
+        num_txn_sidecars_read = e.num_txn_sidecars_read,
+        num_domain_metadata_sidecars_read = e.num_domain_metadata_sidecars_read,
+        duration_ns = e.duration.as_nanos() as u64,
     );
 }
 

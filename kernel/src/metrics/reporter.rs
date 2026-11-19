@@ -331,14 +331,18 @@ mod tests {
     use tracing_subscriber::registry;
     use uuid::Uuid;
 
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::metrics::events::emit_checkpoint_action_computed;
     use crate::metrics::events::{
         SNAPSHOT_COMPLETED_SPAN, SnapshotLoadMetricContext, emit_log_segment_load_failure,
         emit_protocol_metadata_load_failure,
     };
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::metrics::{CheckpointActionComputed, CheckpointEntrySource, TableType};
     use crate::metrics::{
-        CheckpointEntrySource, CheckpointOutputStats, CheckpointProcessingStats,
-        CheckpointWriteMode, CheckpointWriteOutcome, CheckpointWriteStats,
-        LastCheckpointReadOutcome, MetricEvent, MetricId, TableType, WithMetricsReporterLayer as _,
+        CheckpointOutputStats, CheckpointProcessingStats, CheckpointWriteMode,
+        CheckpointWriteOutcome, CheckpointWriteStats, LastCheckpointReadOutcome, MetricEvent,
+        MetricId, WithMetricsReporterLayer as _,
     };
     use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
 
@@ -404,39 +408,35 @@ mod tests {
         assert!(event.duration > Duration::ZERO);
     }
 
+    #[cfg(feature = "adaptive-metadata-in-dev")]
     #[rstest::rstest]
-    #[case::set("req", Some("req"))]
-    #[case::empty_is_none("", None)]
-    fn checkpoint_action_computed_decodes_span_fields(
-        #[case] correlation_id: &str,
-        #[case] expected_correlation_id: Option<&str>,
-    ) {
+    #[case::set(Some("req"))]
+    #[case::unset(None)]
+    fn checkpoint_action_computed_decodes_span_fields(#[case] correlation_id: Option<&str>) {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
         let id = MetricId::new();
-        drop(info_span!(
-            "txn.checkpoint_action_computed",
-            report = Empty,
-            operation_id = %id,
-            correlation_id,
-            is_catalog_managed = true,
-            commit_version = 7u64,
-            txn_source = CheckpointEntrySource::Crc.as_ref(),
-            domain_metadata_source = CheckpointEntrySource::SidecarsInlined.as_ref(),
-            num_log_commits_replayed = 3u64,
-            num_txn_sidecars_kept = 2u64,
-            num_domain_metadata_sidecars_kept = 5u64,
-            num_txn_sidecars_read = 4u64,
-            num_domain_metadata_sidecars_read = 6u64,
-            duration_ns = 11u64,
-        ));
+        emit_checkpoint_action_computed(&CheckpointActionComputed {
+            operation_id: id,
+            correlation_id: correlation_id.map(Into::into),
+            table_type: TableType::CatalogManaged,
+            commit_version: 7,
+            txn_source: CheckpointEntrySource::Crc,
+            domain_metadata_source: CheckpointEntrySource::SidecarsInlined,
+            num_log_commits_replayed: 3,
+            num_txn_sidecars_kept: 2,
+            num_domain_metadata_sidecars_kept: 5,
+            num_txn_sidecars_read: 4,
+            num_domain_metadata_sidecars_read: 6,
+            duration: Duration::from_nanos(11),
+        });
 
         let events = reporter.events();
         let [MetricEvent::CheckpointActionComputed(event)] = events.as_slice() else {
             panic!("expected one checkpoint action computed metric: {events:?}");
         };
         assert_eq!(event.operation_id, id);
-        assert_eq!(event.correlation_id.as_deref(), expected_correlation_id);
+        assert_eq!(event.correlation_id.as_deref(), correlation_id);
         assert_eq!(event.table_type, TableType::CatalogManaged);
         assert_eq!(event.commit_version, 7);
         assert_eq!(event.txn_source, CheckpointEntrySource::Crc);
