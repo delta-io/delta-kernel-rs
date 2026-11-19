@@ -589,11 +589,11 @@ pub trait StorageHandler: AsAny {
     /// - Otherwise, the parent is the directory containing `path`, and only files (at any depth
     ///   under that parent) whose full path sorts strictly greater than `path` are returned.
     ///
-    /// When `end` is present, every yielded location must sort strictly before it. Stream errors
+    /// When `end` is present, every yielded location must sort strictly before it by
+    /// percent-decoded URL path (UTF-8 byte order). That is the same space engines use for the
+    /// listing offset derived from `path`, so a bound built with `Url::join` still matches listed
+    /// locations even when the caller's URL percent-encodes unreserved characters. Stream errors
     /// are preserved and are not a stop signal.
-    ///
-    /// `path` and `end` are compared as URL strings (`Url::as_str`), so callers must pass bounds
-    /// that share the same serialization as listed locations.
     fn list_from(
         &self,
         path: &Url,
@@ -668,14 +668,88 @@ pub trait StorageHandler: AsAny {
 /// Whether a listing item should be yielded given an exclusive URL upper bound.
 ///
 /// Errors are never a stop signal. When `end` is `Some`, an `Ok` item is kept only if its
-/// location sorts strictly before `end`. Engines that list and then filter can use this as the
-/// `take_while` / `filter` predicate when implementing [`StorageHandler::list_from`].
-#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-#[delta_kernel_derive::internal_api]
-pub(crate) fn keep_listing(item: &KernelResult<FileMeta>, end: Option<&Url>) -> bool {
+/// percent-decoded path sorts strictly before `end`'s. This helper percent-decodes both paths
+/// itself; pass URLs as produced by listing or `Url::join`, not pre-decoded strings.
+///
+/// Engines that list and then filter can use this as the `take_while` / `filter` predicate when
+/// implementing [`StorageHandler::list_from`]. `take_while` is valid only when the stream is
+/// already sorted in that same decoded-path order.
+pub fn keep_listing(item: &KernelResult<FileMeta>, end: Option<&Url>) -> bool {
     match item {
-        Ok(meta) => end.is_none_or(|end| &meta.location < end),
+        Ok(meta) => end.is_none_or(|end| {
+            path_encoding::uri_decode_path(meta.location.path())
+                .zip(path_encoding::uri_decode_path(end.path()))
+                .is_none_or(|(location, end)| location.as_ref() < end.as_ref())
+        }),
         Err(_) => true,
+    }
+}
+
+#[cfg(test)]
+mod keep_listing_tests {
+    use super::*;
+
+    fn meta(url: &str) -> FileMeta {
+        FileMeta::new(Url::parse(url).unwrap(), 0, 0)
+    }
+
+    #[test]
+    fn keeps_errors_and_unbounded_listings() {
+        let err = Err(KernelError::generic("boom"));
+        assert!(keep_listing(&err, None));
+        assert!(keep_listing(
+            &err,
+            Some(&Url::parse("s3://bucket/table/_delta_log/:").unwrap())
+        ));
+        assert!(keep_listing(
+            &Ok(meta("s3://bucket/table/_delta_log/1.json")),
+            None
+        ));
+    }
+
+    #[test]
+    fn compares_percent_decoded_paths() {
+        let end = Url::parse("s3://bucket/t%61ble/_delta_log/:").unwrap();
+        // Listed locations rebuild the object key with path_segments_mut, so unreserved escapes
+        // become literal characters while the caller-built bound may still contain %61.
+        assert!(keep_listing(
+            &Ok(meta(
+                "s3://bucket/table/_delta_log/00000000000000000000.json"
+            )),
+            Some(&end)
+        ));
+        assert!(!keep_listing(
+            &Ok(meta("s3://bucket/table/_delta_log/_staged_commits/x.json")),
+            Some(&end)
+        ));
+        assert!(!keep_listing(
+            &Ok(meta("s3://bucket/table/_delta_log/:")),
+            Some(&end)
+        ));
+    }
+
+    #[test]
+    fn compares_unicode_by_decoded_utf8_order() {
+        // Native/object-store order is z then é. URL-string order puts %C3%A9 before m and z.
+        let end_m = Url::parse("s3://bucket/dir/m").unwrap();
+        assert!(!keep_listing(
+            &Ok(meta("s3://bucket/dir/z.json")),
+            Some(&end_m)
+        ));
+        assert!(!keep_listing(
+            &Ok(meta("s3://bucket/dir/%C3%A9.json")),
+            Some(&end_m)
+        ));
+
+        let end_tilde = Url::parse("s3://bucket/dir/~").unwrap();
+        assert!(keep_listing(
+            &Ok(meta("s3://bucket/dir/z.json")),
+            Some(&end_tilde)
+        ));
+        assert!(!keep_listing(
+            &Ok(meta("s3://bucket/dir/%C3%A9.json")),
+            Some(&end_tilde)
+        ));
     }
 }
 

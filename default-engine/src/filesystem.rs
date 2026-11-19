@@ -324,12 +324,14 @@ mod tests {
     use std::ops::Range;
     use std::time::Duration;
 
-    use delta_kernel::Engine as _;
+    use delta_kernel::object_store::ObjectStore as _;
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel::schema::schema_ref;
+    use delta_kernel::{Engine as _, Snapshot};
     use delta_kernel_default_engine_test_utils::current_time_duration;
     use itertools::Itertools;
-    use test_utils::delta_path_for_version;
+    use test_utils::{create_table_and_load_snapshot, delta_path_for_version};
 
     use super::*;
     use crate::DefaultEngineBuilder;
@@ -885,5 +887,117 @@ mod tests {
 
         let read = handler.read_files_with_cancellation(vec![(url, None)], Some(token));
         assert!(matches!(read, Err(KernelError::Cancelled)));
+    }
+
+    // Upper-bound comparison uses percent-decoded paths, so a caller-built bound that still
+    // contains unreserved escapes (t%61ble) matches listed locations rebuilt from object keys.
+    #[rstest::rstest]
+    #[case::ordered("s3://bucket/")]
+    #[case::unordered("file:///")]
+    #[tokio::test]
+    async fn list_from_upper_bound_preserves_commits_under_encoded_roots(
+        #[case] origin: &str,
+        #[values("table/", "t%61ble/")] table_dir: &str,
+        #[values(":", "00000000000000000001")] upper: &str,
+    ) {
+        let store = Arc::new(InMemory::new());
+        let commit = "table/_delta_log/00000000000000000000.json";
+        store
+            .put(&Path::from(commit), Bytes::new().into())
+            .await
+            .unwrap();
+
+        let origin = Url::parse(origin).unwrap();
+        let log_root = origin.join(table_dir).unwrap().join("_delta_log/").unwrap();
+        let start = log_root.join("00000000000000000000").unwrap();
+        let expected = vec![origin.join(commit).unwrap()];
+        let unbounded: Vec<_> = list_from_impl(store.clone(), start.clone(), None)
+            .await
+            .unwrap()
+            .map_ok(|meta| meta.location)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(unbounded, expected);
+
+        let bounded: Vec<_> = list_from_impl(store, start, Some(log_root.join(upper).unwrap()))
+            .await
+            .unwrap()
+            .map_ok(|meta| meta.location)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(bounded, expected);
+    }
+
+    #[rstest::rstest]
+    fn snapshot_upper_bound_preserves_tables_under_encoded_roots(
+        #[values("s3://bucket/table/", "s3://bucket/t%61ble/")] table_root: &str,
+    ) {
+        let engine = DefaultEngineBuilder::new(Arc::new(InMemory::new())).build();
+        let created = create_table_and_load_snapshot(
+            "s3://bucket/table/",
+            schema_ref! { nullable "id": LONG },
+            &engine,
+            &[],
+        )
+        .unwrap();
+
+        let loaded = Snapshot::builder_for(table_root).build(&engine).unwrap();
+        assert_eq!(loaded.version(), created.version());
+        assert_eq!(loaded.schema(), created.schema());
+    }
+
+    // Ordered stores stream in native/object-key order. Comparing the bound in that same
+    // percent-decoded space keeps take_while from stopping early on URL-string reorderings.
+    #[rstest::rstest]
+    #[case::ascii("a.json", ["a.json", "z.json"], "m", &["a.json"])]
+    #[case::unicode_after_bound("é.json", ["z.json", "é.json"], "m", &[])]
+    #[case::unicode_stops_after_z("é.json", ["z.json", "é.json"], "~", &["z.json"])]
+    #[tokio::test]
+    async fn list_from_upper_bound_follows_decoded_path_order(
+        #[case] filename: &str,
+        #[case] native_order: [&str; 2],
+        #[case] upper: &str,
+        #[case] expected_names: &[&str],
+        #[values("s3://bucket/", "file:///")] origin: &str,
+    ) {
+        let store = Arc::new(InMemory::new());
+        for name in ["z.json", filename] {
+            store
+                .put(
+                    &Path::parse(format!("dir/{name}")).unwrap(),
+                    Bytes::new().into(),
+                )
+                .await
+                .unwrap();
+        }
+        // InMemory preserves native key order, like an ordinary S3 bucket.
+        let native: Vec<_> = store
+            .list(Some(&Path::from("dir")))
+            .map_ok(|meta| meta.location)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            native,
+            native_order.map(|name| Path::parse(format!("dir/{name}")).unwrap())
+        );
+
+        let start = Url::parse(origin).unwrap().join("dir/").unwrap();
+        let end = start.join(upper).unwrap();
+        let expected: Vec<_> = expected_names
+            .iter()
+            .map(|name| start.join(name).unwrap())
+            .collect();
+
+        let bounded: Vec<_> = list_from_impl(store, start, Some(end))
+            .await
+            .unwrap()
+            .map_ok(|meta| meta.location)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(bounded, expected);
     }
 }

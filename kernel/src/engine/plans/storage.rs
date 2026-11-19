@@ -8,7 +8,10 @@ use itertools::Itertools as _;
 use url::Url;
 
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult};
-use crate::{FileMeta, FileSlice, KernelError, KernelResult, KernelResultIterator, StorageHandler};
+use crate::{
+    FileMeta, FileSlice, KernelError, KernelResult, KernelResultIterator, StorageHandler,
+    keep_listing,
+};
 
 /// A [`StorageHandler`] that delegates to a [`PlanExecutor`].
 #[derive(Constructor)]
@@ -28,11 +31,13 @@ impl StorageHandler for PlanBasedStorageHandler {
         path: &Url,
         end: Option<&Url>,
     ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+        // Pass `end` into the plan so conforming executors can stop early. Keep the local
+        // predicate so older executors that ignore the field still honor the bound.
         let end = end.cloned();
         let iter = self
-            .execute_io(IoOperation::file_listing(path.clone()))?
+            .execute_io(IoOperation::file_listing(path.clone(), end.clone()))?
             .into_file_meta()?
-            .take_while(move |item| crate::keep_listing(item, end.as_ref()));
+            .take_while(move |item| keep_listing(item, end.as_ref()));
         Ok(Box::new(iter))
     }
 
@@ -122,6 +127,17 @@ mod tests {
             .try_collect()
             .unwrap();
         assert_eq!(all.len(), 3);
+
+        // Exclusive end equal to the middle file drops that file and everything after it.
+        let end = Url::from_file_path(tmp.path().join("00000000000000000001.json")).unwrap();
+        let bounded: Vec<_> = storage
+            .list_from(&dir, Some(&end))
+            .unwrap()
+            .try_collect()
+            .unwrap();
+        assert_eq!(bounded.len(), 1);
+        let expected = Url::from_file_path(tmp.path().join("00000000000000000000.json")).unwrap();
+        assert_eq!(bounded[0].location, expected);
     }
 
     #[test]

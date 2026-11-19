@@ -66,8 +66,9 @@ impl From<&IoOperation> for proto_op::IoOperation {
     fn from(io: &IoOperation) -> Self {
         use proto_op::io_operation::Op;
         let op = match io {
-            IoOperation::FileListing { url } => Op::FileListing(proto_op::FileListing {
+            IoOperation::FileListing { url, end } => Op::FileListing(proto_op::FileListing {
                 url: url.to_string(),
+                end: end.as_ref().map(ToString::to_string),
             }),
             IoOperation::ReadBytes { files } => Op::ReadBytes(proto_op::ReadBytes {
                 files: convert_vec(files),
@@ -1231,11 +1232,16 @@ mod tests {
     #[test]
     fn from_io_operation_file_listing() {
         let url = "memory:///table/";
-        let op = Operation::IoOperation(IoOperation::file_listing(Url::parse(url).unwrap()));
+        let end = "memory:///table/:";
+        let op = Operation::IoOperation(IoOperation::file_listing(
+            Url::parse(url).unwrap(),
+            Some(Url::parse(end).unwrap()),
+        ));
         let proto_op::io_operation::Op::FileListing(file_listing) = io_op(&op) else {
             panic!("expected FileListing");
         };
         assert_eq!(file_listing.url, url);
+        assert_eq!(file_listing.end.as_deref(), Some(end));
     }
 
     #[test]

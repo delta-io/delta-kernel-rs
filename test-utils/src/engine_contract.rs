@@ -473,6 +473,19 @@ fn test_list_from_should_sort_and_filter(
     for (file, expected) in files.iter().zip(expected_names.iter()) {
         assert_eq!(file.location, base_url.join(expected.as_ref()).unwrap());
     }
+
+    // Exclusive end equal to an existing name drops that name and everything after it.
+    let end = base_url.join(expected_names[1].as_ref()).unwrap();
+    let bounded: Vec<_> = storage
+        .list_from(&test_url, Some(&end))
+        .unwrap()
+        .try_collect()
+        .unwrap();
+    assert_eq!(bounded.len(), 1);
+    assert_eq!(
+        bounded[0].location,
+        base_url.join(expected_names[0].as_ref()).unwrap()
+    );
 }
 
 fn get_arrow_data() -> Box<dyn EngineData> {

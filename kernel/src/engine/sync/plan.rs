@@ -154,12 +154,12 @@ impl SyncPlanExecutor {
 
     fn execute_io(&self, op: IoOperation) -> KernelResult<PlanResult> {
         match op {
-            IoOperation::FileListing { url } => {
+            IoOperation::FileListing { url, end } => {
                 // `StorageHandler::list_from` returns a non-`Send` iterator, so we collect into
                 // a `Vec` first to convert into a `Send` iterator.
                 // TODO(#2619): Evaluate whether StorageHandler should just return `Send` iterators
                 let metas: Vec<KernelResult<FileMeta>> =
-                    self.storage.list_from(&url, None)?.collect();
+                    self.storage.list_from(&url, end.as_ref())?.collect();
                 Ok(PlanResult::FileMeta(Box::new(metas.into_iter())))
             }
             IoOperation::ReadBytes { files } => {

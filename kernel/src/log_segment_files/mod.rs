@@ -87,14 +87,12 @@ pub(crate) fn list_delta_log_from_storage(
     Ok(files)
 }
 
-/// Exclusive listing URL just past the version-named files that can belong to
-/// `[start_version, end_version]`.
+/// Exclusive listing URL just past the version-named files for `[start_version, end_version]`.
 ///
-/// When `end_version` is unbounded, `':'` is the UTF-8 successor of `'9'`. Version-named log
-/// files start with a digit, so this bound stops after that region without putting protocol
-/// directory names into [`StorageHandler`]. A finite `end_version` uses the zero-padded
-/// `end_version + 1` path with no extension: `{end:020}.json` sorts before `{end+1:020}`, and
-/// `{end+1:020}.json` sorts after it.
+/// `Version::MAX` is treated as unbounded: the bound is `':'` (UTF-8 successor of `'9'`), so
+/// listing stops after the version-named region without naming protocol directories. A finite
+/// `end_version` uses the zero-padded `end_version + 1` path with no extension:
+/// `{end:020}.json` sorts before `{end+1:020}`, and `{end+1:020}.json` sorts after it.
 fn delta_log_listing_end(log_root: &Url, end_version: Version) -> KernelResult<Url> {
     if end_version == Version::MAX {
         Ok(log_root.join(":")?)

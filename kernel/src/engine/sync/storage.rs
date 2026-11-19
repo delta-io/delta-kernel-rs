@@ -27,18 +27,23 @@ impl SyncStorageHandler {
     pub(super) fn store(&self) -> Option<&Arc<DynObjectStore>> {
         self.store.as_ref()
     }
+}
 
-    fn list_from_impl(
+// This handler collects eagerly under `block_on`, so it cannot interrupt that I/O after it starts.
+// It relies on the default `*_with_cancellation` methods to check before delegation and before
+// pulling the resulting in-memory iterator.
+impl StorageHandler for SyncStorageHandler {
+    fn list_from(
         &self,
-        url_path: &Url,
+        path: &Url,
         end: Option<&Url>,
     ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
-        let (store, base_url, offset) = resolve_scope(self.store.as_ref(), url_path)?;
+        let (store, base_url, offset) = resolve_scope(self.store.as_ref(), path)?;
 
         // For directory URLs, prefix == offset and the offset acts as a lower bound that still
         // includes everything underneath (since `dir/a` > `dir` lexicographically). For file
         // URLs, the prefix is the parent directory and the offset filters out files at-or-below.
-        let prefix = if url_path.path().ends_with('/') {
+        let prefix = if path.path().ends_with('/') {
             offset.clone()
         } else {
             let mut parts: Vec<_> = offset.parts().collect();
@@ -67,19 +72,6 @@ impl SyncStorageHandler {
         )?;
         items.sort_unstable();
         Ok(Box::new(items.into_iter().map(Ok)))
-    }
-}
-
-// This handler collects eagerly under `block_on`, so it cannot interrupt that I/O after it starts.
-// It relies on the default `*_with_cancellation` methods to check before delegation and before
-// pulling the resulting in-memory iterator.
-impl StorageHandler for SyncStorageHandler {
-    fn list_from(
-        &self,
-        path: &Url,
-        end: Option<&Url>,
-    ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
-        self.list_from_impl(path, end)
     }
 
     fn read_files(

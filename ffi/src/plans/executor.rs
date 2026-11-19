@@ -152,7 +152,7 @@ mod tests {
 
         // Construct a dummy op because we don't actually care about the plan bytes here.
         let url = Url::parse("memory:///table/").unwrap();
-        let op = Operation::IoOperation(delta_kernel::IoOperation::file_listing(url));
+        let op = Operation::IoOperation(delta_kernel::IoOperation::file_listing(url, None));
 
         plan_executor.execute_op(op)
     }
@@ -192,7 +192,7 @@ mod tests {
         let plan_executor: Arc<dyn PlanExecutor> = unsafe { executor.into_inner() };
 
         let url = Url::parse("memory:///table/").unwrap();
-        let op = Operation::IoOperation(delta_kernel::IoOperation::file_listing(url));
+        let op = Operation::IoOperation(delta_kernel::IoOperation::file_listing(url, None));
 
         let Err(err) = plan_executor.execute_op(op) else {
             panic!("execute_op should surface the engine failure");
@@ -217,7 +217,7 @@ mod tests {
         let plan_executor: Arc<dyn PlanExecutor> = unsafe { executor.into_inner() };
 
         let url = Url::parse("memory:///table/").unwrap();
-        let op = Operation::IoOperation(delta_kernel::IoOperation::file_listing(url));
+        let op = Operation::IoOperation(delta_kernel::IoOperation::file_listing(url, None));
 
         let Err(err) = plan_executor.execute_op(op) else {
             panic!("execute_op should surface an error when the engine does not write the result");
@@ -337,6 +337,7 @@ mod tests {
                 panic!("expected a FileListing");
             };
             assert_eq!(file_listing.url, "memory:///table/");
+            assert!(file_listing.end.is_none());
             unsafe { out.write(EngineExecResult::Success(CPlanResult::Unit)) };
         }
 
@@ -344,7 +345,7 @@ mod tests {
         let plan_executor: Arc<dyn PlanExecutor> = unsafe { executor.into_inner() };
 
         let url = Url::parse("memory:///table/").unwrap();
-        let op = Operation::IoOperation(delta_kernel::IoOperation::file_listing(url));
+        let op = Operation::IoOperation(delta_kernel::IoOperation::file_listing(url, None));
 
         plan_executor
             .execute_op(op)
