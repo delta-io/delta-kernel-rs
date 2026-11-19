@@ -711,6 +711,7 @@ fn test_eval_binary_commutes_literal_and_cast_column(
 }
 
 #[rstest::rstest]
+#[case::column_and_literal(col!("m"), lit("a"))]
 #[case::literal_and_column(lit("a"), col!("m"))]
 #[case::cast_and_literal(Expr::cast(col!("m"), DataType::STRING), lit("a"))]
 #[case::literal_and_cast(lit("a"), Expr::cast(col!("m"), DataType::STRING))]
