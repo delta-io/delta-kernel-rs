@@ -172,12 +172,13 @@ pub unsafe extern "C" fn commit_range_builder_with_commit_range_validation(
 }
 
 /// Set whether [`commit_range_commit_files_next`] fails on missing versions. This is by default
-/// `true` when you construct a builder.
+/// `true` when you construct a builder. Only affects ranges built with commit range validation
+/// disabled.
 ///
-/// When `true`, a missing start version or any gap through the range's end version, including one
-/// after the last listed file, surfaces as an error when the commit-files iterator reaches it.
-/// Without an explicit end version, the range ends at the last listed commit, so a trailing gap
-/// cannot be detected. When `false`, available commit files are yielded across gaps.
+/// When `true`, a missing start version or a gap through the range's end version surfaces as an
+/// error when the commit-files iterator reaches it, provided an observed later commit proves the
+/// gap. Listing exhaustion without a later commit ends iteration normally. When `false`,
+/// available commit files are yielded across gaps.
 ///
 /// # Safety
 ///
@@ -196,9 +197,10 @@ pub unsafe extern "C" fn commit_range_builder_with_fail_on_data_loss(
 /// Consume the builder and return a [`CommitRange`]. After calling, the builder pointer is no
 /// longer valid. The builder is always freed by this call, whether or not it succeeds.
 ///
-/// Returns an error if the resolved version range is invalid (start > end), the listed commits
-/// are non-contiguous, or the requested start version is unavailable. With commit range
-/// validation disabled, contiguity and start-version availability are not checked.
+/// With commit range validation enabled, returns an error if the resolved version range is invalid
+/// (start > end), no commits are available, the listed commits are non-contiguous, or the requested
+/// start version is unavailable. Disabling validation allows empty and reversed ranges and defers
+/// gap checks to [`commit_range_commit_files_next`].
 ///
 /// # Safety
 ///

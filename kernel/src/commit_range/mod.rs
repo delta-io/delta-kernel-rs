@@ -6,8 +6,7 @@
 //! By default, [`CommitRangeBuilder::build`] validates that the range's commits are present and
 //! contiguous. With the `internal-api` feature, a path-based builder may disable that build-time
 //! validation to allow empty or reversed ranges; `CommitRange::commit_files` then detects proven
-//! version gaps lazily, and
-//! [`CommitRange::commits`] returns [`KernelError::CommitRange`].
+//! version gaps lazily, and [`CommitRange::commits`] returns [`KernelError::CommitRange`].
 //!
 //! Two construction paths, differing only in how `_delta_log/` is listed at build time:
 //! - [`CommitRange::builder_for`]: lists `_delta_log/` for the requested range.

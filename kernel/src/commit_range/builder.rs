@@ -10,7 +10,7 @@ use crate::log_segment::{
 use crate::log_segment_files::{
     LogSegmentFiles, list_delta_log_from_storage, should_process_log_file,
 };
-use crate::path::ParsedLogPath;
+use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::SnapshotRef;
 use crate::utils::require;
 use crate::{Engine, KernelError, KernelResult, LogPath, Version};
@@ -129,12 +129,12 @@ impl CommitRangeBuilder {
     ///
     /// With commit range validation enabled, returns [`KernelError::MissingVersion`] if a
     /// snapshot-derived range requires a commit beyond what is available from the snapshot's log
-    /// segment and the supplied catalog tail, or if the listed commits are non-contiguous.
-    /// Returns [`KernelError::StartVersionNotFound`] (carrying
-    /// the earliest still-available version) if the requested start is unavailable but later
-    /// versions exist, [`KernelError::EmptyLog`] if nothing is available in the requested range at
-    /// all, and [`KernelError::CommitRange`] if the resolved version range is invalid
-    /// (start > end).
+    /// segment and the supplied catalog tail, or if the listed commits are non-contiguous;
+    /// [`KernelError::StartVersionNotFound`] (carrying the earliest still-available version) if the
+    /// requested start is unavailable but later versions exist; [`KernelError::EmptyLog`] if
+    /// nothing is available in the requested range; and [`KernelError::CommitRange`] if the
+    /// resolved version range is invalid (start > end). Disabling validation allows empty and
+    /// reversed ranges and defers gap checks to `CommitRange::commit_files`.
     pub fn build(self, engine: &dyn Engine) -> KernelResult<CommitRange> {
         self.validate_supported_modes()?;
 
@@ -298,7 +298,7 @@ impl CommitRangeBuilder {
             Err(_) => true,
         })
         .filter_map(|file| match file {
-            Ok(file) if file.file_type == crate::path::LogPathFileType::Commit => {
+            Ok(file) if file.file_type == LogPathFileType::Commit => {
                 should_process_log_file(&file);
                 Some(Ok(file))
             }
