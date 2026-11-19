@@ -133,8 +133,8 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     ///
     /// Blind appends add new files without depending on existing table state. Commit validation
     /// requires staged Add metadata and rejects staged Remove metadata or deletion-vector batches.
-    /// Blind append is also invalid for `ALTER TABLE`, schema changes, property changes, or
-    /// `dataChange = false`.
+    /// Blind append is also invalid for `ALTER TABLE`, schema changes, property changes,
+    /// description changes, or `dataChange = false`.
     pub fn with_blind_append(mut self) -> Self {
         self.local_state.is_blind_append = true;
         self
@@ -336,6 +336,11 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         if self.local_state.is_blind_append && self.local_state.has_property_changes() {
             return Err(KernelError::invalid_transaction_state(
                 "blind append cannot include property changes",
+            ));
+        }
+        if self.local_state.is_blind_append && self.local_state.description.is_some() {
+            return Err(KernelError::invalid_transaction_state(
+                "blind append cannot include description changes",
             ));
         }
 
@@ -1040,6 +1045,24 @@ mod tests {
             &error,
             Error::Kernel(KernelError::InvalidTransactionState(message))
             if message == "blind append cannot include property changes"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn blind_append_rejects_description_changes() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let error = snapshot
+            .update_table(UpdateTableOperation::Write, "test-engine", true)
+            .with_blind_append()
+            .with_description("table description")
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            Error::Kernel(KernelError::InvalidTransactionState(message))
+            if message == "blind append cannot include description changes"
         ));
         Ok(())
     }
