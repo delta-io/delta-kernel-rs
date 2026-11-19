@@ -1565,7 +1565,10 @@ impl Snapshot {
     ///   the resolved CRC's `file_stats_state` is `Indeterminate` (a non-incremental operation like
     ///   Manual Update, or a counted file action with a missing size; recoverable with a full state
     ///   reconstruction in the future), or if `delta.enableInCommitTimestamps` is `true` but
-    ///   `inCommitTimestampOpt` is absent.
+    ///   `inCommitTimestampOpt` is absent. On an adaptiveMetadata table, kernel cannot count the
+    ///   files in a manifest tree, so this also fails once the table has a manifest commit, unless
+    ///   a CRC at or after the newest manifest commit exists to build on. Such a CRC must come from
+    ///   a writer that knows the tree's files.
     /// - The underlying read error if in-commit timestamps are enabled but the timestamp cannot be
     ///   read from the commit file.
     /// - I/O errors from the engine's storage handler if the write fails.
@@ -1636,8 +1639,9 @@ impl Snapshot {
     /// 4. A full reverse replay of the commit history.
     ///
     /// Returns [`KernelError::ChecksumWriteUnsupported`] when a root is reached but cannot yield a
-    /// writable CRC (missing protocol or metadata, or a non-incremental tail that dooms file
-    /// stats).
+    /// writable CRC (missing protocol or metadata, a non-incremental tail that dooms file stats,
+    /// or a checkpoint on a table with a manifest commit, which may not list the manifest tree's
+    /// files).
     ///
     /// The `root` span field records the selected root. `write_span` records its resolution mode.
     #[instrument(parent = &self.span, name = "snap.resolve_crc_for_write", skip_all, err, fields(root))]

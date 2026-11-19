@@ -390,15 +390,23 @@ async fn test_commit_info_records_data_change_and_last_manifest_commit(
 
 /// A manifest commit records its files in the manifest rather than as add/remove actions, so
 /// kernel cannot count them: file stats are unknown from the manifest commit onward and no
-/// checksum can be written, whether it is resolved from the post-commit snapshot or by replaying
-/// the log.
+/// checksum can be written. This holds whether the post-commit CRC comes from the commit itself
+/// (a checksum exists before the manifest commit) or from replaying the log.
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_no_checksum_after_manifest_commit(
+    #[values(true, false)] checksum_before_manifest_commit: bool,
     #[values(true, false)] reload_snapshot: bool,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (engine, _temp_dir, table_url, snapshot) =
         setup_adaptive_metadata_table("no_checksum_after_manifest_commit").await?;
+    let snapshot = if checksum_before_manifest_commit {
+        let (_, snapshot) = snapshot.write_checksum(&engine)?;
+        assert!(snapshot.get_file_stats_if_present().is_some());
+        snapshot
+    } else {
+        snapshot
+    };
     let file = FileMeta {
         location: table_url.join("metadata/root-v1.parquet")?,
         last_modified: 0,
@@ -414,7 +422,12 @@ async fn test_no_checksum_after_manifest_commit(
         snapshot
     };
     assert!(snapshot.get_file_stats_if_present().is_none());
-    assert_result_error_with_message(snapshot.write_checksum(&engine), "Indeterminate file stats");
+    let error = snapshot.write_checksum(&engine).unwrap_err();
+    assert!(
+        matches!(&error, delta_kernel::Error::Kernel(KernelError::ChecksumWriteUnsupported(message))
+        if message.contains("Indeterminate file stats")),
+        "unexpected error: {error}"
+    );
     Ok(())
 }
 
@@ -463,7 +476,8 @@ async fn test_last_manifest_commit_carried_through_crc()
 }
 
 /// Writes the CRC at manifest commit `version`: the CRC at `version - 1` with that commit's
-/// `lastManifestCommit` and in-commit timestamp.
+/// `lastManifestCommit` and in-commit timestamp. The file stats carry over unchanged only because
+/// the stand-in manifest tree has no files; a real writer must count the tree's files.
 fn write_updated_crc_for_manifest_commit(
     table_url: &Url,
     version: u64,

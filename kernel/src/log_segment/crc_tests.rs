@@ -1421,6 +1421,14 @@ async fn test_replay_rejects_last_manifest_commit_newer_than_newest_commit() {
     vec![vec![write_with_last_manifest_commit(1, 0), add("a", 100)]],
     Some(1)
 )]
+#[case::manifest_commit_inside_replay_range(
+    vec![
+        vec![commit_info("WRITE", None), add("a", 100)],
+        vec![last_manifest_commit_info(2, 2)],
+        vec![write_with_last_manifest_commit(2, 2), add("b", 100)],
+    ],
+    None
+)]
 #[case::manifest_commit_hidden_behind_newer_one(
     vec![
         vec![last_manifest_commit_info(1, 1)],

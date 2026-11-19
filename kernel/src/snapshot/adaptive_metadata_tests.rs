@@ -91,7 +91,8 @@ fn table_with_checkpoint_action(
 }
 
 /// Writes the CRC at manifest commit `version`: the CRC before it, with that commit's in-commit
-/// timestamp and `lastManifestCommit`. Like kernel's CRC writer, it ignores the `txn` entries in
+/// timestamp and `lastManifestCommit`. The file stats carry over unchanged only because the
+/// stand-in manifest tree has no files. Like kernel's CRC writer, it ignores the `txn` entries in
 /// the commit's checkpoint action (TODO(#2866)).
 fn write_manifest_commit_crc(engine: &SyncEngine, table_root: &Url, version: Version) {
     let snapshot_at = |version| {
