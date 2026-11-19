@@ -2249,11 +2249,10 @@ mod tests {
         assert_eq!(source.log_segment(), &original_segment);
 
         // Publishing the returned snapshot again must neither copy files nor create a new snapshot.
-        let counting = CountingEngine::new(Arc::new(SyncEngine::new()));
+        let counting = CountingEngine::new_no_io(Arc::new(SyncEngine::new()));
         let repeated = published.publish(&counting, &committer).unwrap();
         assert!(Arc::ptr_eq(&published, &repeated));
         assert_eq!(*committer.calls.borrow(), expected_calls);
-        counting.assert_no_io();
     }
 
     /// At version 2, checkpoint 2 supplies all log actions, leaving `ascending_commit_files` empty.
@@ -2420,7 +2419,7 @@ mod tests {
         } else {
             &filesystem
         };
-        let engine = CountingEngine::new(Arc::new(SyncEngine::new()));
+        let engine = CountingEngine::new_no_io(Arc::new(SyncEngine::new()));
 
         // WHEN: attempt to publish the snapshot.
         let result = source.publish(&engine, committer);
@@ -2428,7 +2427,6 @@ mod tests {
         // THEN: reject the unsupported table or committer before copying any files.
         assert_result_error_with_message(result, error);
         assert!(recording.calls.borrow().is_empty());
-        engine.assert_no_io();
     }
 
     #[rstest]
@@ -2451,7 +2449,7 @@ mod tests {
             files.pop();
         }
         let committer = RecordingPublishCommitter::default();
-        let engine = CountingEngine::new(Arc::new(SyncEngine::new()));
+        let engine = CountingEngine::new_no_io(Arc::new(SyncEngine::new()));
 
         // WHEN: attempt to publish with a missing version or missing final commit.
         let result = source.publish(&engine, &committer);
@@ -2459,7 +2457,6 @@ mod tests {
         // THEN: reject the incomplete commit list before calling the committer.
         assert_result_error_with_message(result, error);
         assert!(committer.calls.borrow().is_empty());
-        engine.assert_no_io();
     }
 
     #[test]
@@ -2477,7 +2474,7 @@ mod tests {
             .new_as_published(&engine, Some(2))
             .unwrap()
             .unwrap();
-        let engine = CountingEngine::new(Arc::new(SyncEngine::new()));
+        let engine = CountingEngine::new_no_io(Arc::new(SyncEngine::new()));
 
         // WHEN: call publish without any catalog commits to copy.
         let result = source
@@ -2486,7 +2483,6 @@ mod tests {
 
         // THEN: return the original snapshot.
         assert!(Arc::ptr_eq(&source, &result));
-        engine.assert_no_io();
     }
 
     /// Helper function to create a commitInfo action with optional ICT

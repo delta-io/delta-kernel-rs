@@ -162,7 +162,7 @@ mod tests {
         let storage_handler = base_engine.storage_handler();
         let json_handler = base_engine.json_handler();
         let parquet_handler = base_engine.parquet_handler();
-        let inner = Arc::new(CountingEngine::new(base_engine));
+        let inner = Arc::new(CountingEngine::new_no_io(base_engine));
         let engine = DelegatingEngine::new(inner.clone())
             .with_evaluation_handler(evaluation_handler.clone())
             .with_storage_handler(storage_handler.clone())
@@ -178,7 +178,6 @@ mod tests {
         assert!(Arc::ptr_eq(&engine.json_handler(), &json_handler));
         assert!(Arc::ptr_eq(&engine.parquet_handler(), &parquet_handler));
         run_one_operation_per_handler(&engine);
-        inner.assert_no_io();
     }
 
     #[test]

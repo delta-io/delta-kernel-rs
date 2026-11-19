@@ -37,13 +37,6 @@ impl<T: ?Sized> CountingHandler<T> {
     }
 }
 
-// Prints only the operation count: the inner handler is not required to implement `Debug`.
-impl<T: ?Sized> fmt::Debug for CountingHandler<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.op_count(), f)
-    }
-}
-
 /// Counts on deref. The handler trait impls take advantage of that by reaching the inner handler
 /// through this path, so every forwarded method call increments the counter.
 impl<T: ?Sized> Deref for CountingHandler<T> {
@@ -58,7 +51,6 @@ impl<T: ?Sized> Deref for CountingHandler<T> {
 /// An [`Engine`] decorator that counts handler operations and delegates them to an inner engine.
 ///
 /// Fetching a handler is not an operation; only calls on the handler's methods are counted.
-#[derive(Clone, Debug)]
 pub struct CountingEngine {
     /// Evaluation-handler operations.
     pub evaluation: Arc<CountingHandler<dyn EvaluationHandler>>,
@@ -71,11 +63,49 @@ pub struct CountingEngine {
     /// Plan-executor operations, or `None` if the inner engine provides no executor.
     #[cfg(feature = "declarative-plans")]
     pub plans: Option<Arc<CountingHandler<dyn PlanExecutor>>>,
+    /// Assertion run on drop.
+    drop_check: DropCheck,
+}
+
+/// Operation-count assertion enforced when a [`CountingEngine`] is dropped.
+#[derive(Debug)]
+enum DropCheck {
+    None,
+    NoIo,
+    OnlyStorageIo,
+}
+
+// Prints each handler's operation count.
+impl fmt::Debug for CountingEngine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CountingEngine")
+            .field("drop_check", &self.drop_check)
+            .field("evaluation", &self.evaluation.op_count())
+            .field("storage", &self.storage.op_count())
+            .field("json", &self.json.op_count())
+            .field("parquet", &self.parquet.op_count())
+            .field("plans", &self.plan_op_count())
+            .finish()
+    }
 }
 
 impl CountingEngine {
-    /// Wraps `inner` with zeroed operation counters.
+    /// Wraps `inner` with zeroed operation counters and no drop-time assertion.
     pub fn new(inner: Arc<dyn Engine>) -> Self {
+        Self::with_drop_check(inner, DropCheck::None)
+    }
+
+    /// Wraps `inner` and asserts on drop that no handler operations ran.
+    pub fn new_no_io(inner: Arc<dyn Engine>) -> Self {
+        Self::with_drop_check(inner, DropCheck::NoIo)
+    }
+
+    /// Wraps `inner` and asserts on drop that every handler operation was a storage operation.
+    pub fn new_only_storage_io(inner: Arc<dyn Engine>) -> Self {
+        Self::with_drop_check(inner, DropCheck::OnlyStorageIo)
+    }
+
+    fn with_drop_check(inner: Arc<dyn Engine>, drop_check: DropCheck) -> Self {
         Self {
             evaluation: Arc::new(CountingHandler::new(inner.evaluation_handler())),
             storage: Arc::new(CountingHandler::new(inner.storage_handler())),
@@ -85,22 +115,25 @@ impl CountingEngine {
             plans: inner
                 .plan_executor()
                 .map(|executor| Arc::new(CountingHandler::new(executor))),
+            drop_check,
+        }
+    }
+
+    /// Returns the plan-executor operation count, or `None` if there is no plan executor.
+    pub fn plan_op_count(&self) -> Option<u64> {
+        cfg_select! {
+            feature = "declarative-plans" => self.plans.as_ref().map(|handler| handler.op_count()),
+            _ => None,
         }
     }
 
     /// Returns the number of delegated operations across all handlers.
     pub fn total_op_count(&self) -> u64 {
-        let plan_ops = cfg_select! {
-            feature = "declarative-plans" => {
-                self.plans.as_ref().map_or(0, |handler| handler.op_count())
-            }
-            _ => 0,
-        };
         self.evaluation.op_count()
             + self.storage.op_count()
             + self.json.op_count()
             + self.parquet.op_count()
-            + plan_ops
+            + self.plan_op_count().unwrap_or(0)
     }
 
     /// Asserts that no delegated handler operations have run.
@@ -115,6 +148,20 @@ impl CountingEngine {
             self.storage.op_count(),
             "expected only storage I/O: {self:?}"
         );
+    }
+}
+
+impl Drop for CountingEngine {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            // Skip the check to avoid aborting the process with a double fault
+            return;
+        }
+        match self.drop_check {
+            DropCheck::None => {}
+            DropCheck::NoIo => self.assert_no_io(),
+            DropCheck::OnlyStorageIo => self.assert_only_storage_io(),
+        }
     }
 }
 
@@ -256,34 +303,55 @@ forward_counting_handler! {
 mod tests {
     use super::*;
     use crate::engine::sync::SyncEngine;
+    use crate::schema::StructType;
 
     #[test]
     fn handler_access_does_not_count_as_an_operation() {
-        let inner = Arc::new(SyncEngine::new());
-        let engine = CountingEngine::new(inner);
-
+        let engine = CountingEngine::new_no_io(Arc::new(SyncEngine::new()));
         let _ = engine.evaluation_handler();
         let _ = engine.storage_handler();
         let _ = engine.json_handler();
         let _ = engine.parquet_handler();
-
-        assert_eq!(engine.evaluation.op_count(), 0);
-        assert_eq!(engine.storage.op_count(), 0);
-        assert_eq!(engine.json.op_count(), 0);
-        assert_eq!(engine.parquet.op_count(), 0);
     }
 
     #[test]
-    fn handler_operation_increments_its_counter() {
-        let inner = Arc::new(SyncEngine::in_memory());
-        let engine = CountingEngine::new(inner);
-
-        let result = engine
+    fn drop_check_for_storage_head() {
+        let missing = Url::parse("memory:///missing").unwrap();
+        let _ = CountingEngine::new_only_storage_io(Arc::new(SyncEngine::in_memory()))
             .storage_handler()
-            .head(&Url::parse("memory:///missing").unwrap());
+            .head(&missing);
 
-        assert!(result.is_err());
-        assert_eq!(engine.storage.op_count(), 1);
-        assert_eq!(engine.json.op_count(), 0);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = CountingEngine::new_no_io(Arc::new(SyncEngine::in_memory()))
+                    .storage_handler()
+                    .head(&missing);
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn drop_check_for_json_read() {
+        let empty_schema = Arc::new(StructType::new_unchecked(std::iter::empty()));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = CountingEngine::new_only_storage_io(Arc::new(SyncEngine::in_memory()))
+                    .json_handler()
+                    .read_json_files(&[], empty_schema.clone(), None);
+            }))
+            .is_err()
+        );
+
+        // Double fault: if Drop asserted during unwind, the process would abort.
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let engine = CountingEngine::new_no_io(Arc::new(SyncEngine::in_memory()));
+            let _ = engine
+                .json_handler()
+                .read_json_files(&[], empty_schema, None);
+            panic!("expected test panic");
+        }))
+        .unwrap_err();
+        assert_eq!(err.downcast_ref::<&str>(), Some(&"expected test panic"));
     }
 }

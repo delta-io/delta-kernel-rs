@@ -104,6 +104,7 @@ fn delta_path_for_multipart_checkpoint(version: u64, part_num: u32, num_parts: u
     Path::from(format!("_delta_log/{name}").as_str())
 }
 
+// Builds a log and returns the underlying engine so callers can wrap it in an engine decorator.
 async fn build_log_with_paths_and_checkpoint_impl(
     paths: &[Path],
     checkpoint_metadata: Option<&LastCheckpointHint>,
@@ -5289,7 +5290,11 @@ async fn test_new_as_published_uses_published_file_metadata(
         .collect();
     let (engine, _) = build_log_with_paths_and_checkpoint_impl(&paths, None).await;
     let storage = engine.storage_handler();
-    let engine = CountingEngine::new(engine);
+    let engine = if expect_updated {
+        CountingEngine::new_only_storage_io(engine)
+    } else {
+        CountingEngine::new_no_io(engine)
+    };
     for file in original
         .listed
         .ascending_commit_files
@@ -5316,11 +5321,6 @@ async fn test_new_as_published_uses_published_file_metadata(
 
     // THEN: use destination metadata only for eligible references.
     assert_eq!(updated.is_some(), expect_updated);
-    if expect_updated {
-        engine.assert_only_storage_io();
-    } else {
-        engine.assert_no_io();
-    }
     let published = updated.as_ref().unwrap_or(&original);
 
     let assert_reference = |before: &ParsedLogPath, after: &ParsedLogPath| {
@@ -5367,14 +5367,13 @@ async fn test_new_as_published_uses_published_file_metadata(
     assert_eq!(published.end_version, original.end_version);
     assert_eq!(published.log_root, original.log_root);
     assert_eq!(original, source);
-    let counting = CountingEngine::new(Arc::new(SyncEngine::new()));
+    let counting = CountingEngine::new_no_io(Arc::new(SyncEngine::new()));
     assert!(
         published
             .new_as_published(&counting, published_through)
             .unwrap()
             .is_none()
     );
-    counting.assert_no_io();
 }
 
 /// A checkpoint at version 2 supplies all log actions, so `ascending_commit_files` is empty.
@@ -5412,17 +5411,16 @@ async fn test_new_as_published_with_checkpoint_at_snapshot_version(
     let (engine, _) =
         build_log_with_paths_and_checkpoint_impl(&[delta_path_for_version(2, "json")], None).await;
     let storage = engine.storage_handler();
-    let engine = CountingEngine::new(engine);
+    let engine = if retain_latest && published_through == Some(2) {
+        CountingEngine::new_only_storage_io(engine)
+    } else {
+        CountingEngine::new_no_io(engine)
+    };
     let updated = original
         .new_as_published(&engine, published_through)
         .unwrap();
 
     assert_eq!(updated.is_some(), expected_updated);
-    if retain_latest && published_through == Some(2) {
-        engine.assert_only_storage_io();
-    } else {
-        engine.assert_no_io();
-    }
     let published = updated.as_ref().unwrap_or(&original);
 
     assert!(published.listed.ascending_commit_files.is_empty());
@@ -5481,11 +5479,10 @@ async fn test_new_as_published_missing_destination_preserves_original(
     )
     .await;
 
-    let engine = CountingEngine::new(engine);
+    let engine = CountingEngine::new_only_storage_io(engine);
     let result = original.new_as_published(&engine, Some(2));
     assert!(matches!(result, Err(KernelError::FileNotFound(_))));
     assert_eq!(original, source);
-    engine.assert_only_storage_io();
 }
 
 #[rstest]
@@ -5505,12 +5502,11 @@ async fn test_new_as_published_rejects_invalid_published_version(
     .await;
 
     // WHEN: publication would exceed version 2 or forget that version 1 is already published.
-    let counting = CountingEngine::new(Arc::new(SyncEngine::new()));
+    let counting = CountingEngine::new_no_io(Arc::new(SyncEngine::new()));
     let result = original.new_as_published(&counting, published_through);
 
     // THEN: reject the invalid published version.
     assert!(matches!(result, Err(KernelError::InvalidLogSegment(_))));
-    counting.assert_no_io();
 }
 
 #[tokio::test]
@@ -5547,12 +5543,11 @@ async fn test_new_as_published_preserves_checkpoints_and_log_compactions() {
         None,
     )
     .await;
-    let engine = CountingEngine::new(engine);
+    let engine = CountingEngine::new_only_storage_io(engine);
     let published = original
         .new_as_published(&engine, Some(3))
         .unwrap()
         .unwrap();
-    engine.assert_only_storage_io();
 
     // THEN: the checkpoint and log compaction files are unchanged.
     assert_eq!(

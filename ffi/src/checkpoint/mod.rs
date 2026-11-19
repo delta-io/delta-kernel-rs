@@ -124,7 +124,7 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::ffi_test_utils::{TEST_ERROR_ALLOCATORS, assert_no_io, ok_or_panic};
+    use crate::ffi_test_utils::{TEST_ERROR_ALLOCATORS, ok_or_panic};
     use crate::{TryFromStringSlice, engine_to_handle, free_engine, free_snapshot};
 
     #[derive(Default)]
@@ -185,7 +185,6 @@ mod tests {
             }
             assert_eq!(unsafe { snapshot.as_ref() }.version(), 0);
         }
-        assert_no_io(unsafe { engine.as_ref() });
         unsafe {
             free_snapshot(snapshot);
             free_engine(engine);
@@ -275,7 +274,6 @@ mod tests {
         assert!(ok_or_panic(result));
         assert_eq!(state.visits, 1);
         assert_eq!(unsafe { state.snapshot.as_ref() }.version(), 0);
-        assert_no_io(unsafe { state.engine.as_ref() });
         unsafe {
             free_snapshot(state.snapshot);
             free_engine(state.engine);
@@ -283,14 +281,13 @@ mod tests {
     }
 
     /// Builds a snapshot and engine handle for a hinted checkpoint. Resolving the checkpoint from
-    /// the hint must not perform I/O; callers downcast the engine handle to assert that.
+    /// the hint must not perform I/O; the engine asserts that when it is dropped.
     fn checkpoint_handles(
         checkpoint: bool,
         manifest: bool,
         invalid_size: bool,
     ) -> (Handle<SharedSnapshot>, Handle<SharedExternEngine>) {
-        let engine = SyncEngine::in_memory();
-        let engine = Arc::new(CountingEngine::new(Arc::new(engine)));
+        let engine = Arc::new(CountingEngine::new_no_io(Arc::new(SyncEngine::in_memory())));
         let schema = r#"{"type":"struct","fields":[]}"#;
         let filename = "00000000000000000000.checkpoint.11111111-1111-1111-1111-111111111111.json";
         let last_checkpoint = checkpoint.then(|| serde_json::from_value::<LastCheckpointHint>(

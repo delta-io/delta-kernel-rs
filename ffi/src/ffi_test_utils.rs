@@ -5,8 +5,6 @@ use std::ptr::NonNull;
 #[cfg(test)]
 use std::sync::Arc;
 
-#[cfg(test)]
-use delta_kernel::engine::CountingEngine;
 use delta_kernel::metrics::{MetricsReporter, ReportGeneratorLayer};
 #[cfg(test)]
 use delta_kernel::{Engine, KernelResult, object_store::memory::InMemory};
@@ -197,18 +195,6 @@ pub(crate) fn engine_handle_for_store(
 ) -> crate::handle::Handle<SharedExternEngine> {
     let engine = DefaultEngineBuilder::new(store).build();
     engine_to_handle(Arc::new(engine), TEST_ERROR_ALLOCATORS)
-}
-
-/// Asserts that `engine`, which must wrap a [`CountingEngine`], has run no handler operations.
-#[cfg(test)]
-pub(crate) fn assert_no_io(engine: &dyn ExternEngine) {
-    engine
-        .engine()
-        .as_ref()
-        .any_ref()
-        .downcast_ref::<CountingEngine>()
-        .expect("engine must be a CountingEngine")
-        .assert_no_io();
 }
 
 /// Create an in-memory engine and snapshot from the given commit data. Returns

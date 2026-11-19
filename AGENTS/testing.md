@@ -52,9 +52,11 @@ This list is non-exhaustive: when in doubt, browse the source files directly
 **Handler access and overrides (from `delta_kernel::engine`, with `test-utils`)**
 
 - `CountingEngine`: delegates to an inner engine and counts actual handler operations without
-  counting handler access. Use it to assert that a fast path avoids I/O or evaluation. An
-  `Engine`-based entry point fetches every handler once per drive, so a test engine that panics or
-  counts on handler accessors sees those calls even when no I/O follows.
+  counting handler access. Choose `new_no_io` / `new_only_storage_io` / `new` based on what the
+  final assertion would be (if any); the first two assert on drop. Midpoint checks can still call
+  `assert_no_io` / `assert_only_storage_io` on a `new` engine. Some `Engine`-based entry points
+  fetch handlers even when they perform no I/O, so assert on operation counts rather than handler
+  access.
 - `DelegatingEngine`: override selected handlers while delegating the rest to an inner engine.
   See the type's rustdoc for override and executor selection behavior.
 

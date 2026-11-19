@@ -1724,9 +1724,8 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> delta_kernel::R
     //         Counting engine proves no log replay occurs.
     let post_commit_snapshot = committed.post_commit_snapshot().unwrap();
     assert!(post_commit_snapshot.crc_at_version().is_some());
-    let counting_engine = CountingEngine::new(engine.clone());
+    let counting_engine = CountingEngine::new_no_io(engine.clone());
     assert_domain_metadata(post_commit_snapshot, &counting_engine);
-    counting_engine.assert_no_io();
 
     // Case 2: Fresh snapshot loaded from disk, no CRC file => DM loaded via log replay (slow path)
     let fresh_snapshot_no_crc = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -1739,9 +1738,8 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> delta_kernel::R
 
     let fresh_snapshot_with_crc = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert!(fresh_snapshot_with_crc.crc_at_version().is_some());
-    let counting_engine = CountingEngine::new(engine.clone());
+    let counting_engine = CountingEngine::new_no_io(engine.clone());
     assert_domain_metadata(&fresh_snapshot_with_crc, &counting_engine);
-    counting_engine.assert_no_io();
 
     Ok(())
 }
@@ -1864,7 +1862,7 @@ async fn test_partial_dm_serves_hits_and_falls_through_for_misses() -> delta_ker
 #[tokio::test]
 async fn test_set_transaction_crc_tracking_and_fast_path() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let counting_engine = CountingEngine::new(engine.clone());
+    let counting_engine = CountingEngine::new_no_io(engine.clone());
 
     // -- v0: CREATE TABLE (no set transactions) --
     let committed = create_table_and_commit(&table_path, engine.as_ref())?;
@@ -1985,7 +1983,6 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> delta_kernel::Resu
             .unwrap(),
         Some(1)
     );
-    counting_engine.assert_no_io();
 
     Ok(())
 }
@@ -2090,7 +2087,6 @@ async fn test_set_txn_expiration_via_crc_fast_path(
     #[case] expected: Option<i64>,
 ) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let counting_engine = CountingEngine::new(engine.clone());
     let schema = schema_ref! { nullable "id": INTEGER };
 
     // v0: create the table with optional retention property
@@ -2126,11 +2122,10 @@ async fn test_set_txn_expiration_via_crc_fast_path(
     assert_eq!(
         snapshot
             .reader()
-            .get_app_id_version("my-app", &counting_engine)
+            .get_app_id_version("my-app", &CountingEngine::new_no_io(engine.clone()))
             .unwrap(),
         expected
     );
-    counting_engine.assert_no_io();
 
     Ok(())
 }
@@ -2141,7 +2136,6 @@ async fn test_set_txn_expiration_via_crc_fast_path(
 #[tokio::test]
 async fn test_partial_set_txn_expired_hit_returns_none_via_fast_path() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let counting_engine = CountingEngine::new(engine.clone());
     let schema = schema_ref! { nullable "id": INTEGER };
 
     // v0: create the table with zero-second retention so any past lastUpdated expires.
@@ -2192,10 +2186,9 @@ async fn test_partial_set_txn_expired_hit_returns_none_via_fast_path() -> delta_
     assert_eq!(
         snapshot_v2
             .reader()
-            .get_app_id_version("my-app", &counting_engine)?,
+            .get_app_id_version("my-app", &CountingEngine::new_no_io(engine.clone()))?,
         None
     );
-    counting_engine.assert_no_io();
 
     Ok(())
 }
