@@ -37,7 +37,6 @@ use crate::engine::sync::SyncEngine;
 use crate::metrics::{MetricEvent, MetricsReporter, WithMetricsReporterLayer as _};
 use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::local::LocalFileSystem;
-use crate::object_store::memory::InMemory;
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::path::ParsedLogPath;
 use crate::table_configuration::TableConfiguration;
@@ -1716,8 +1715,7 @@ pub(crate) fn setup_column_mapping_txn(
         ColumnMappingMode::Id => "id",
         ColumnMappingMode::None => "none",
     };
-    let store = Arc::new(InMemory::new());
-    let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new_with_store(store));
+    let engine: Arc<dyn Engine> = Arc::new(SyncEngine::in_memory());
 
     let txn = create_table("memory:///test_table", schema, "DefaultEngine", true)
         .with_table_properties([("delta.columnMapping.mode", mode_str)])

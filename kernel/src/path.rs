@@ -614,14 +614,12 @@ impl LogRoot {
 #[cfg(test)]
 pub(crate) mod tests {
     use std::path::PathBuf;
-    use std::sync::Arc;
 
     use test_utils::add_commit;
 
     use super::LogPathFileType::*;
     use super::*;
     use crate::engine::sync::SyncEngine;
-    use crate::object_store::memory::InMemory;
     use crate::unit_test_utils::assert_result_error_with_message;
 
     /// Builds a `ParsedLogPath` by parsing a real log file name, so `filename`, `extension` and
@@ -929,10 +927,9 @@ pub(crate) mod tests {
         #[case] commit_content: &str,
         #[case] expected: Result<i64, &str>,
     ) {
-        let store = Arc::new(InMemory::new());
-        let engine = SyncEngine::new_with_store(store.clone());
+        let engine = SyncEngine::in_memory();
         let table_root = "memory://test/";
-        add_commit(table_root, store.as_ref(), 0, commit_content.to_string())
+        add_commit(table_root, engine.store(), 0, commit_content.to_string())
             .await
             .unwrap();
         let parsed_path =
@@ -1025,13 +1022,12 @@ pub(crate) mod tests {
         #[case] commit_content: &str,
         #[case] expected: Result<Option<(i64, i64)>, &str>,
     ) {
-        let store = Arc::new(InMemory::new());
-        let engine = SyncEngine::new_with_store(store.clone());
+        let engine = SyncEngine::in_memory();
         let table_root = "memory://test/";
         let commit_version = 5;
         add_commit(
             table_root,
-            store.as_ref(),
+            engine.store(),
             commit_version,
             commit_content.to_string(),
         )

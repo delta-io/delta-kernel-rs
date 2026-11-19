@@ -424,7 +424,7 @@ mod tests {
         create_log_path as create_catalog_log_path, setup_catalog_managed_test,
     };
     use crate::snapshot::builder::tests::{
-        create_table, measuring_reporter, scan_paths, setup_test,
+        TABLE_ROOT, create_table, measuring_reporter, scan_paths,
     };
     use crate::snapshot::{FromTableRoot, SnapshotBuilder};
     use crate::table_features::TableFeature;
@@ -447,17 +447,14 @@ mod tests {
 
     async fn snapshot_and_hint(
         freshness: SnapshotHintFreshness,
-    ) -> KernelResult<
-        (Arc<SyncEngine>, String, SnapshotRef, SnapshotHint),
-        Box<dyn std::error::Error>,
-    > {
-        let (engine, store, table_root) = setup_test();
-        create_table(&store, &table_root).await?;
-        let snapshot = SnapshotBuilder::new_for(&table_root).build(engine.as_ref())?;
-        let _ = snapshot.write_checksum(engine.as_ref())?;
-        let snapshot = SnapshotBuilder::new_for(&table_root).build(engine.as_ref())?;
+    ) -> KernelResult<(SyncEngine, SnapshotRef, SnapshotHint), Box<dyn std::error::Error>> {
+        let engine = SyncEngine::in_memory();
+        create_table(engine.store(), TABLE_ROOT).await?;
+        let snapshot = SnapshotBuilder::new_for(TABLE_ROOT).build(&engine)?;
+        let _ = snapshot.write_checksum(&engine)?;
+        let snapshot = SnapshotBuilder::new_for(TABLE_ROOT).build(&engine)?;
         let hint = hint_from_snapshot(&snapshot, freshness);
-        Ok((engine, table_root, snapshot, hint))
+        Ok((engine, snapshot, hint))
     }
 
     fn assert_hint_error(
@@ -500,13 +497,13 @@ mod tests {
         #[case] version: Option<Version>,
         #[case] expected: SnapshotHintFreshness,
     ) -> KernelResult<(), Box<dyn std::error::Error>> {
-        let (engine, store, table_root) = setup_test();
-        create_table(&store, &table_root).await?;
-        let mut builder = Snapshot::builder_for(&table_root);
+        let engine = SyncEngine::in_memory();
+        create_table(engine.store(), TABLE_ROOT).await?;
+        let mut builder = Snapshot::builder_for(TABLE_ROOT);
         if let Some(version) = version {
             builder = builder.at_version(version);
         }
-        let snapshot = builder.build(engine.as_ref())?;
+        let snapshot = builder.build(&engine)?;
         let hint = snapshot.to_snapshot_hint()?;
         assert_eq!(hint.freshness, expected);
         assert_eq!(hint.log_segment_files, snapshot.log_segment().listed);
@@ -522,10 +519,10 @@ mod tests {
         #[case] hint_version: Version,
         #[case] expected_present: bool,
     ) -> KernelResult<(), Box<dyn std::error::Error>> {
-        let (engine, table_root, snapshot, mut hint) =
+        let (engine, snapshot, mut hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         hint.log_segment_files.checkpoint_parts = vec![create_log_path(&format!(
-            "{table_root}_delta_log/00000000000000000001.checkpoint.parquet"
+            "{TABLE_ROOT}_delta_log/00000000000000000001.checkpoint.parquet"
         ))];
         hint.last_checkpoint_hint = Some(LastCheckpointHint {
             version: hint_version,
@@ -546,9 +543,9 @@ mod tests {
         let exported = snapshot.to_snapshot_hint()?;
         assert_eq!(exported.last_checkpoint_hint.is_some(), expected_present);
         assert_eq!(exported.crc, snapshot.crc_at_version().cloned());
-        let rebuilt = Snapshot::builder_for(table_root)
+        let rebuilt = Snapshot::builder_for(TABLE_ROOT)
             .with_snapshot_hint(exported)
-            .build(engine.as_ref())?;
+            .build(&engine)?;
         assert_eq!(rebuilt.version(), snapshot.version());
         Ok(())
     }
@@ -633,12 +630,12 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn snapshot_to_hint_preserves_log_compaction()
     -> KernelResult<(), Box<dyn std::error::Error>> {
-        let (_engine, table_root, snapshot, mut hint) =
+        let (_engine, snapshot, mut hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         hint.log_segment_files
             .ascending_compaction_files
             .push(create_log_path(&format!(
-                "{table_root}_delta_log/00000000000000000000.\
+                "{TABLE_ROOT}_delta_log/00000000000000000000.\
                  00000000000000000001.compacted.json"
             )));
         let snapshot = Snapshot::new_with_crc(
@@ -759,11 +756,11 @@ mod tests {
             None,
             SnapshotHintFreshness::Unverified,
         )?;
-        let (engine, _store, _table_root) = setup_test();
+        let engine = SyncEngine::in_memory();
         assert_log_segment_hint_error(
             SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_snapshot_hint(hint)
-                .build(engine.as_ref()),
+                .build(&engine),
             "Table version 1 is missing",
         );
         Ok(())
@@ -831,7 +828,7 @@ mod tests {
         if reverse_paths {
             log_paths.reverse();
         }
-        let (engine, _store, _table_root) = setup_test();
+        let engine = SyncEngine::in_memory();
         let result = SnapshotHint::try_new(
             TABLE_ROOT,
             10,
@@ -847,7 +844,7 @@ mod tests {
         .and_then(|hint| {
             SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_snapshot_hint(hint)
-                .build(engine.as_ref())
+                .build(&engine)
         });
 
         if foreign_table {
@@ -920,10 +917,10 @@ mod tests {
             .location
             .location
             .to_string();
-        let (engine, _store, _table_root) = setup_test();
+        let engine = SyncEngine::in_memory();
         let result = SnapshotBuilder::new_for(builder_table_root)
             .with_snapshot_hint(hint)
-            .build(engine.as_ref());
+            .build(&engine);
         if builder_table_root == TABLE_ROOT {
             let snapshot = result.unwrap();
             assert_eq!(snapshot.version(), version);
@@ -958,11 +955,11 @@ mod tests {
             SnapshotHintFreshness::Unverified,
         )
         .unwrap();
-        let (engine, _store, _table_root) = setup_test();
+        let engine = SyncEngine::in_memory();
         assert_log_segment_hint_error(
             SnapshotBuilder::new_for(builder_table_root)
                 .with_snapshot_hint(hint)
-                .build(engine.as_ref()),
+                .build(&engine),
             "No table version found",
         );
     }
@@ -1090,7 +1087,7 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn snapshot_hint_build_rejects_a_log_path_outside_the_table_log_root()
     -> KernelResult<(), Box<dyn std::error::Error>> {
-        let (engine, table_root, _snapshot, mut hint) =
+        let (engine, _snapshot, mut hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         let path = hint
             .log_segment_files
@@ -1099,11 +1096,11 @@ mod tests {
             .unwrap();
         let supplied = format!("memory:///other/_delta_log/{}", path.filename);
         path.location.location = url::Url::parse(&supplied)?;
-        let expected_log_root = format!("{table_root}_delta_log/");
+        let expected_log_root = format!("{TABLE_ROOT}_delta_log/");
 
-        let result = SnapshotBuilder::new_for(&table_root)
+        let result = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_snapshot_hint(hint)
-            .build(engine.as_ref());
+            .build(&engine);
 
         let error = result.unwrap_err();
         assert!(matches!(
@@ -1126,16 +1123,16 @@ mod tests {
         #[case] freshness: SnapshotHintFreshness,
         #[case] expected_built_as_latest: bool,
     ) -> KernelResult<(), Box<dyn std::error::Error>> {
-        let (engine, table_root, storage_snapshot, hint) = snapshot_and_hint(freshness).await?;
+        let (engine, storage_snapshot, hint) = snapshot_and_hint(freshness).await?;
         assert!(storage_snapshot.crc_at_version().is_some());
 
         let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
         let (reporter, _guard) = measuring_reporter();
-        let hinted_snapshot = SnapshotBuilder::new_for(&table_root)
+        let hinted_snapshot = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_snapshot_hint(hint)
             .with_correlation_id("hint-request")
             .with_cancellation_token(token)
-            .build(engine.as_ref())?;
+            .build(&engine)?;
 
         assert_eq!(hinted_snapshot.version(), storage_snapshot.version());
         assert_eq!(hinted_snapshot.schema(), storage_snapshot.schema());
@@ -1178,13 +1175,13 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn complete_snapshot_hint_without_crc_succeeds()
     -> KernelResult<(), Box<dyn std::error::Error>> {
-        let (engine, table_root, _snapshot, mut hint) =
+        let (engine, _snapshot, mut hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         hint.crc = None;
 
-        let hinted = SnapshotBuilder::new_for(table_root)
+        let hinted = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_snapshot_hint(hint)
-            .build(engine.as_ref())?;
+            .build(&engine)?;
         assert!(hinted.crc_at_version().is_none());
         Ok(())
     }
@@ -1212,7 +1209,7 @@ mod tests {
         #[case] expected_error: Option<&str>,
         #[values(false, true)] with_crc: bool,
     ) -> KernelResult<(), Box<dyn std::error::Error>> {
-        let (engine, table_root, snapshot, mut hint) =
+        let (engine, snapshot, mut hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         hint.protocol = protocol.clone();
         if with_crc {
@@ -1221,9 +1218,9 @@ mod tests {
             hint.crc = None;
         }
 
-        let result = SnapshotBuilder::new_for(table_root)
+        let result = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_snapshot_hint(hint)
-            .build(engine.as_ref());
+            .build(&engine);
         if let Some(expected_error) = expected_error {
             assert_result_error_with_message(result, expected_error);
         } else {
@@ -1235,11 +1232,11 @@ mod tests {
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn complete_snapshot_hint_preserves_checkpoint_state()
     -> KernelResult<(), Box<dyn std::error::Error>> {
-        let (engine, store, table_root) = setup_test();
-        create_table(&store, &table_root).await?;
-        let snapshot = SnapshotBuilder::new_for(&table_root).build(engine.as_ref())?;
-        let _ = snapshot.checkpoint(engine.as_ref(), None)?;
-        let storage_snapshot = SnapshotBuilder::new_for(&table_root).build(engine.as_ref())?;
+        let engine = SyncEngine::in_memory();
+        create_table(engine.store(), TABLE_ROOT).await?;
+        let snapshot = SnapshotBuilder::new_for(TABLE_ROOT).build(&engine)?;
+        let _ = snapshot.checkpoint(&engine, None)?;
+        let storage_snapshot = SnapshotBuilder::new_for(TABLE_ROOT).build(&engine)?;
         assert!(
             !storage_snapshot
                 .log_segment()
@@ -1257,9 +1254,9 @@ mod tests {
         let mut hint = hint_from_snapshot(&storage_snapshot, SnapshotHintFreshness::Unverified);
         hint.log_segment_files.ascending_commit_files.clear();
         hint.log_segment_files.latest_commit_file = None;
-        let hinted_snapshot = SnapshotBuilder::new_for(table_root)
+        let hinted_snapshot = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_snapshot_hint(hint)
-            .build(engine.as_ref())?;
+            .build(&engine)?;
         assert_eq!(
             hinted_snapshot.log_segment().checkpoint_version,
             storage_snapshot.log_segment().checkpoint_version
@@ -1278,7 +1275,7 @@ mod tests {
     async fn snapshot_hint_trusts_retained_staged_ratification_without_catalog_version(
         #[case] include_replay_commit: bool,
     ) -> KernelResult<(), Box<dyn std::error::Error>> {
-        let (engine, table_root, _snapshot, mut hint) =
+        let (engine, _snapshot, mut hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         let staged = create_log_path(concat!(
             "memory:///_delta_log/_staged_commits/00000000000000000000.",
@@ -1304,9 +1301,9 @@ mod tests {
             ..Default::default()
         };
 
-        let snapshot = SnapshotBuilder::new_for(table_root)
+        let snapshot = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_snapshot_hint(hint.clone())
-            .build(engine.as_ref())?;
+            .build(&engine)?;
         assert_eq!(snapshot.version(), 0);
         assert_eq!(snapshot.log_segment().listed, hint.log_segment_files);
         Ok(())
@@ -1315,13 +1312,13 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn snapshot_hint_rejects_published_version_after_hint_version()
     -> KernelResult<(), Box<dyn std::error::Error>> {
-        let (engine, table_root, _snapshot, mut hint) =
+        let (engine, _snapshot, mut hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         hint.log_segment_files.max_published_version = Some(Version::MAX);
 
-        let err = SnapshotBuilder::new_for(table_root)
+        let err = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_snapshot_hint(hint)
-            .build(engine.as_ref())
+            .build(&engine)
             .unwrap_err();
         assert!(matches!(err, Error::Kernel(KernelError::SnapshotHint(_))));
         Ok(())
@@ -1330,7 +1327,7 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn snapshot_hint_rejects_malformed_log_segment_and_incompatible_table_state()
     -> KernelResult<(), Box<dyn std::error::Error>> {
-        let (engine, table_root, _snapshot, hint) =
+        let (engine, _snapshot, hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
 
         let mut gapped = hint.clone();
@@ -1340,18 +1337,18 @@ mod tests {
             "memory:///_delta_log/00000000000000000003.json",
         ));
         assert_log_segment_hint_error(
-            SnapshotBuilder::new_for(&table_root)
+            SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_snapshot_hint(gapped)
-                .build(engine.as_ref()),
+                .build(&engine),
             "Table version 1 is missing",
         );
 
         let mut inconsistent_path = hint.clone();
         inconsistent_path.log_segment_files.ascending_commit_files[0].version = 1;
         assert_log_segment_hint_error(
-            SnapshotBuilder::new_for(&table_root)
+            SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_snapshot_hint(inconsistent_path)
-                .build(engine.as_ref()),
+                .build(&engine),
             "Parsed log path fields do not match its location",
         );
 
@@ -1362,9 +1359,9 @@ mod tests {
             .push(create_log_path(
                 "memory:///_delta_log/00000000000000000000.00000000000000000001.compacted.json",
             ));
-        let rebuilt = SnapshotBuilder::new_for(&table_root)
+        let rebuilt = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_snapshot_hint(compacted)
-            .build(engine.as_ref())?;
+            .build(&engine)?;
         assert_eq!(rebuilt.version(), hint.version);
 
         let mut incompatible = hint;
@@ -1372,9 +1369,9 @@ mod tests {
             .metadata
             .with_schema(schema_ref! { nullable "ts": TIMESTAMP_NTZ })?;
         assert_result_error_with_message(
-            SnapshotBuilder::new_for(&table_root)
+            SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_snapshot_hint(incompatible)
-                .build(engine.as_ref()),
+                .build(&engine),
             "does not have the required 'timestampNtz' feature",
         );
         Ok(())
@@ -1383,15 +1380,15 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn snapshot_hint_rejects_checkpoint_free_history_not_starting_at_version_zero()
     -> KernelResult<(), Box<dyn std::error::Error>> {
-        let (engine, table_root, _snapshot, mut hint) =
+        let (engine, _snapshot, mut hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         hint.crc = None;
         hint.log_segment_files.ascending_commit_files.remove(0);
 
         assert_hint_error(
-            SnapshotBuilder::new_for(table_root),
+            SnapshotBuilder::new_for(TABLE_ROOT),
             hint,
-            engine.as_ref(),
+            &engine,
             "snapshot history does not start at version 0",
         );
         Ok(())
@@ -1400,19 +1397,19 @@ mod tests {
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn snapshot_hint_internal_log_invariant_preserves_source()
     -> KernelResult<(), Box<dyn std::error::Error>> {
-        let (engine, store, table_root) = setup_test();
-        create_table(&store, &table_root).await?;
-        let snapshot = SnapshotBuilder::new_for(&table_root).build(engine.as_ref())?;
-        let _ = snapshot.checkpoint(engine.as_ref(), None)?;
-        let snapshot = SnapshotBuilder::new_for(&table_root).build(engine.as_ref())?;
+        let engine = SyncEngine::in_memory();
+        create_table(engine.store(), TABLE_ROOT).await?;
+        let snapshot = SnapshotBuilder::new_for(TABLE_ROOT).build(&engine)?;
+        let _ = snapshot.checkpoint(&engine, None)?;
+        let snapshot = SnapshotBuilder::new_for(TABLE_ROOT).build(&engine)?;
         let mut hint = hint_from_snapshot(&snapshot, SnapshotHintFreshness::Unverified);
         hint.log_segment_files.latest_commit_file = Some(create_log_path(
             "memory:///_delta_log/00000000000000000000.json",
         ));
 
-        let err = SnapshotBuilder::new_for(table_root)
+        let err = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_snapshot_hint(hint)
-            .build(engine.as_ref())
+            .build(&engine)
             .unwrap_err();
         let Error::Kernel(KernelError::SnapshotHint(source)) = err else {
             panic!("expected SnapshotHint")
@@ -1431,7 +1428,7 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn snapshot_hint_rejects_mismatched_crc_state()
     -> KernelResult<(), Box<dyn std::error::Error>> {
-        let (engine, table_root, _snapshot, hint) =
+        let (engine, _snapshot, hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         let matching_crc = hint.crc.as_ref().unwrap().as_ref().clone();
 
@@ -1441,9 +1438,9 @@ mod tests {
             ..matching_crc.clone()
         }));
         assert_hint_error(
-            SnapshotBuilder::new_for(&table_root),
+            SnapshotBuilder::new_for(TABLE_ROOT),
             wrong_version,
-            engine.as_ref(),
+            &engine,
             "does not match snapshot hint version",
         );
 
@@ -1453,9 +1450,9 @@ mod tests {
             ..matching_crc.clone()
         }));
         assert_hint_error(
-            SnapshotBuilder::new_for(&table_root),
+            SnapshotBuilder::new_for(TABLE_ROOT),
             wrong_protocol,
-            engine.as_ref(),
+            &engine,
             "CRC protocol does not match",
         );
 
@@ -1465,9 +1462,9 @@ mod tests {
             ..matching_crc.clone()
         }));
         assert_hint_error(
-            SnapshotBuilder::new_for(&table_root),
+            SnapshotBuilder::new_for(TABLE_ROOT),
             wrong_metadata,
-            engine.as_ref(),
+            &engine,
             "CRC metadata does not match",
         );
 
@@ -1477,8 +1474,7 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn snapshot_hint_rejects_conflicting_builder_options_and_reports_failure()
     -> KernelResult<(), Box<dyn std::error::Error>> {
-        let (engine, table_root, snapshot, hint) =
-            snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
+        let (engine, snapshot, hint) = snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         let log_path = LogPath::try_new(
             snapshot
                 .log_segment()
@@ -1491,40 +1487,40 @@ mod tests {
         )?;
 
         assert_hint_error(
-            SnapshotBuilder::new_for(&table_root).at_version(hint.version - 1),
+            SnapshotBuilder::new_for(TABLE_ROOT).at_version(hint.version - 1),
             hint.clone(),
-            engine.as_ref(),
+            &engine,
             "does not match snapshot hint version",
         );
         assert_hint_error(
-            SnapshotBuilder::new_for(&table_root).with_log_tail(vec![log_path]),
+            SnapshotBuilder::new_for(TABLE_ROOT).with_log_tail(vec![log_path]),
             hint.clone(),
-            engine.as_ref(),
+            &engine,
             "cannot be combined with a log tail",
         );
-        let zero_budget = SnapshotBuilder::new_for(&table_root)
+        let zero_budget = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_incremental_crc_replay(IncrementalReplay::UpToCommits(0))
             .with_snapshot_hint(hint.clone())
-            .build(engine.as_ref())?;
+            .build(&engine)?;
         assert_eq!(zero_budget.version(), hint.version);
         assert_hint_error(
-            SnapshotBuilder::new_for(&table_root)
+            SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_incremental_crc_replay(IncrementalReplay::UpToCommits(1)),
             hint.clone(),
-            engine.as_ref(),
+            &engine,
             "cannot be combined with incremental CRC replay",
         );
-        let bounded = SnapshotBuilder::new_for(&table_root)
+        let bounded = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_max_catalog_version(hint.version)
             .with_snapshot_hint(hint.clone())
-            .build(engine.as_ref())?;
+            .build(&engine)?;
         assert_eq!(bounded.version(), hint.version);
 
         let (reporter, _guard) = measuring_reporter();
-        let result = SnapshotBuilder::new_for(table_root)
+        let result = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_max_catalog_version(hint.version + 1)
             .with_snapshot_hint(hint)
-            .build(engine.as_ref());
+            .build(&engine);
         assert!(matches!(
             &result,
             Err(Error::Kernel(KernelError::SnapshotHint(_)))
@@ -1542,15 +1538,15 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn snapshot_hint_version_must_match_log_segment_end_version()
     -> KernelResult<(), Box<dyn std::error::Error>> {
-        let (engine, table_root, _snapshot, mut hint) =
+        let (engine, _snapshot, mut hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         hint.version -= 1;
         hint.crc = None;
 
         assert_log_segment_hint_error(
-            SnapshotBuilder::new_for(table_root)
+            SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_snapshot_hint(hint)
-                .build(engine.as_ref()),
+                .build(&engine),
             "newer than requested end version",
         );
         Ok(())
@@ -1559,70 +1555,70 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn time_travel_snapshot_hint_accepts_later_max_catalog_version()
     -> KernelResult<(), Box<dyn std::error::Error>> {
-        let (engine, store, table_root) = setup_test();
+        let engine = SyncEngine::in_memory();
         add_commit(
-            &table_root,
-            store.as_ref(),
+            TABLE_ROOT,
+            engine.store(),
             0,
             actions_to_string_catalog_managed(vec![TestAction::Metadata]),
         )
         .await?;
         add_commit(
-            &table_root,
-            store.as_ref(),
+            TABLE_ROOT,
+            engine.store(),
             1,
             actions_to_string(vec![TestAction::Add("part-00000-test.parquet".into())]),
         )
         .await?;
-        let snapshot = SnapshotBuilder::new_for(&table_root)
+        let snapshot = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_max_catalog_version(1)
-            .build(engine.as_ref())?;
+            .build(&engine)?;
         let hint = hint_from_snapshot(&snapshot, SnapshotHintFreshness::Unverified);
 
         assert_result_error_with_message(
-            SnapshotBuilder::new_for(&table_root)
+            SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_snapshot_hint(hint.clone())
-                .build(engine.as_ref()),
+                .build(&engine),
             "Max catalog version is required",
         );
         assert_hint_error(
-            SnapshotBuilder::new_for(&table_root).with_max_catalog_version(2),
+            SnapshotBuilder::new_for(TABLE_ROOT).with_max_catalog_version(2),
             hint.clone(),
-            engine.as_ref(),
+            &engine,
             "Max catalog version 2 does not match snapshot hint version 1",
         );
-        let latest = SnapshotBuilder::new_for(&table_root)
+        let latest = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_max_catalog_version(1)
             .with_snapshot_hint(hint.clone())
-            .build(engine.as_ref())?;
+            .build(&engine)?;
         assert_eq!(latest.version(), 1);
         assert!(!latest.is_built_as_latest());
 
         let mut lower_bound_hint = hint.clone();
         lower_bound_hint.freshness = SnapshotHintFreshness::Latest;
-        let result = SnapshotBuilder::new_for(&table_root)
+        let result = SnapshotBuilder::new_for(TABLE_ROOT)
             .at_version(1)
             .with_max_catalog_version(0)
             .with_snapshot_hint(lower_bound_hint)
-            .build(engine.as_ref());
+            .build(&engine);
         assert!(matches!(
             result,
             Err(Error::Kernel(KernelError::MaxCatalogVersion(_)))
         ));
 
-        let hinted = SnapshotBuilder::new_for(&table_root)
+        let hinted = SnapshotBuilder::new_for(TABLE_ROOT)
             .at_version(1)
             .with_max_catalog_version(2)
             .with_snapshot_hint(hint)
-            .build(engine.as_ref())?;
+            .build(&engine)?;
         assert_eq!(hinted.version(), 1);
         assert!(!hinted.is_built_as_latest());
 
-        let originally_latest = SnapshotBuilder::new_for(&table_root)
+        let originally_latest = SnapshotBuilder::new_for(TABLE_ROOT)
             .at_version(1)
             .with_max_catalog_version(2)
             .with_snapshot_hint(snapshot.to_snapshot_hint()?)
-            .build(engine.as_ref())?;
+            .build(&engine)?;
         assert_eq!(originally_latest.version(), 1);
         assert!(!originally_latest.is_built_as_latest());
         Ok(())
@@ -1641,8 +1637,9 @@ mod tests {
         #[values(IncrementalReplay::Disabled, IncrementalReplay::Unlimited)]
         replay: IncrementalReplay,
     ) -> KernelResult<(), Box<dyn std::error::Error>> {
-        let (engine, store, table_root) = setup_catalog_managed_test().await;
-        let engine = Arc::new(MeteredDeltaEngine::new(engine));
+        let engine = setup_catalog_managed_test().await;
+        let store = engine.store().clone();
+        let engine = Arc::new(MeteredDeltaEngine::new(Arc::new(engine)));
         let downgrade_protocol = Protocol::try_new_modern(
             std::iter::empty::<TableFeature>(),
             [TableFeature::InCommitTimestamp],
@@ -1668,41 +1665,29 @@ mod tests {
         };
         let staged_version = downgrade_version.min(4);
         for version in 1..staged_version {
-            add_commit(
-                &table_root,
-                store.as_ref(),
-                version,
-                commit_actions(version),
-            )
-            .await?;
+            add_commit(TABLE_ROOT, &store, version, commit_actions(version)).await?;
         }
         if checkpoint_version == Some(2) {
-            Snapshot::builder_for(&table_root)
+            Snapshot::builder_for(TABLE_ROOT)
                 .at_version(2)
                 .with_max_catalog_version(2)
                 .build(engine.as_ref())?
                 .checkpoint(engine.as_ref(), None)?;
         }
         let staged_path = add_staged_commit(
-            &table_root,
-            store.as_ref(),
+            TABLE_ROOT,
+            &store,
             staged_version,
             commit_actions(staged_version),
         )
         .await?;
-        let staged = create_catalog_log_path(&table_root, staged_path);
-        let mut cached = Snapshot::builder_for(&table_root)
+        let staged = create_catalog_log_path(TABLE_ROOT, staged_path);
+        let mut cached = Snapshot::builder_for(TABLE_ROOT)
             .with_log_tail(vec![staged])
             .with_max_catalog_version(staged_version)
             .build(engine.as_ref())?;
         for version in staged_version..=4 {
-            add_commit(
-                &table_root,
-                store.as_ref(),
-                version,
-                commit_actions(version),
-            )
-            .await?;
+            add_commit(TABLE_ROOT, &store, version, commit_actions(version)).await?;
         }
         if cached.version() < 4 {
             cached = Snapshot::builder_from(cached)
@@ -1721,16 +1706,10 @@ mod tests {
         }));
 
         for version in 5..=6 {
-            add_commit(
-                &table_root,
-                store.as_ref(),
-                version,
-                commit_actions(version),
-            )
-            .await?;
+            add_commit(TABLE_ROOT, &store, version, commit_actions(version)).await?;
         }
         if checkpoint_version == Some(5) {
-            Snapshot::builder_for(&table_root)
+            Snapshot::builder_for(TABLE_ROOT)
                 .at_version(5)
                 .build(engine.as_ref())?
                 .checkpoint(engine.as_ref(), None)?;
@@ -1778,7 +1757,7 @@ mod tests {
                 for watermark in [None, Some(staged_version - 1)] {
                     let mut unpublished_hint = hint.clone();
                     unpublished_hint.log_segment_files.max_published_version = watermark;
-                    let retained = Snapshot::builder_for(&table_root)
+                    let retained = Snapshot::builder_for(TABLE_ROOT)
                         .with_snapshot_hint(unpublished_hint)
                         .build(engine.as_ref())?;
                     assert_eq!(retained.version(), 6);
@@ -1788,10 +1767,10 @@ mod tests {
                     );
                 }
             }
-            let hinted = Snapshot::builder_for(&table_root)
+            let hinted = Snapshot::builder_for(TABLE_ROOT)
                 .with_snapshot_hint(hint.clone())
                 .build(engine.as_ref())?;
-            let bounded = Snapshot::builder_for(&table_root)
+            let bounded = Snapshot::builder_for(TABLE_ROOT)
                 .with_max_catalog_version(6)
                 .with_snapshot_hint(hint)
                 .build(engine.as_ref())?;
@@ -1802,7 +1781,7 @@ mod tests {
         assert_eq!(hinted.version(), updated.version());
         assert_eq!(hinted.log_segment().listed, updated.log_segment().listed);
         assert_eq!(hinted.crc_at_version(), updated.crc_at_version());
-        let fresh = Snapshot::builder_for(&table_root)
+        let fresh = Snapshot::builder_for(TABLE_ROOT)
             .fold_with(explicit_version.then_some(6), SnapshotBuilder::at_version)
             .build(engine.as_ref())?;
         assert_eq!(fresh.version(), 6);
@@ -1816,12 +1795,12 @@ mod tests {
             );
         }
 
-        add_commit(&table_root, store.as_ref(), 7, commit_actions(7)).await?;
+        add_commit(TABLE_ROOT, &store, 7, commit_actions(7)).await?;
         let advanced = Snapshot::builder_from(hinted)
             .at_version(7)
             .with_incremental_crc_replay(replay)
             .build(engine.as_ref())?;
-        let rebuilt = Snapshot::builder_for(&table_root)
+        let rebuilt = Snapshot::builder_for(TABLE_ROOT)
             .with_snapshot_hint(advanced.to_snapshot_hint()?)
             .build(engine.as_ref())?;
         assert_eq!(rebuilt.version(), 7);
@@ -1833,20 +1812,20 @@ mod tests {
             [TableFeature::CatalogManaged, TableFeature::InCommitTimestamp],
         )?});
         add_commit(
-            &table_root,
-            store.as_ref(),
+            TABLE_ROOT,
+            &store,
             8,
             format!("{}\n{upgrade}", commit_actions(8)),
         )
         .await?;
-        let staged = add_staged_commit(&table_root, store.as_ref(), 9, commit_actions(9)).await?;
-        let tail = vec![create_catalog_log_path(&table_root, staged)];
+        let staged = add_staged_commit(TABLE_ROOT, &store, 9, commit_actions(9)).await?;
+        let tail = vec![create_catalog_log_path(TABLE_ROOT, staged)];
         let updated = Snapshot::builder_from(rebuilt)
             .with_log_tail(tail.clone())
             .with_max_catalog_version(9)
             .with_incremental_crc_replay(replay)
             .build(engine.as_ref())?;
-        let fresh = Snapshot::builder_for(&table_root)
+        let fresh = Snapshot::builder_for(TABLE_ROOT)
             .with_log_tail(tail)
             .with_max_catalog_version(9)
             .build(engine.as_ref())?;
@@ -1855,12 +1834,12 @@ mod tests {
         assert_eq!(updated.table_configuration(), fresh.table_configuration());
         let hint = updated.to_snapshot_hint()?;
         assert!(matches!(
-            Snapshot::builder_for(&table_root)
+            Snapshot::builder_for(TABLE_ROOT)
                 .with_snapshot_hint(hint.clone())
                 .build(engine.as_ref()),
             Err(Error::Kernel(KernelError::MaxCatalogVersion(_)))
         ));
-        let hinted = Snapshot::builder_for(&table_root)
+        let hinted = Snapshot::builder_for(TABLE_ROOT)
             .at_version(9)
             .with_snapshot_hint(hint)
             .build(engine.as_ref())?;
@@ -1883,10 +1862,11 @@ mod tests {
         #[values(false, true)] checkpointed: bool,
     ) -> KernelResult<(), Box<dyn std::error::Error>> {
         // GIVEN a latest snapshot retaining a ratified catalog commit or downgrade.
-        let (engine, store, table_root) = setup_catalog_managed_test().await;
-        let engine = Arc::new(MeteredDeltaEngine::new(engine));
+        let engine = setup_catalog_managed_test().await;
+        let store = engine.store().clone();
+        let engine = Arc::new(MeteredDeltaEngine::new(Arc::new(engine)));
         if checkpointed {
-            SnapshotBuilder::new_for(&table_root)
+            SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_max_catalog_version(0)
                 .build(engine.as_ref())?
                 .checkpoint(engine.as_ref(), None)?;
@@ -1902,20 +1882,19 @@ mod tests {
         } else {
             actions_to_string(vec![TestAction::Add("file_1.parquet".to_string())])
         };
-        let staged_path =
-            add_staged_commit(&table_root, store.as_ref(), 1, actions.clone()).await?;
+        let staged_path = add_staged_commit(TABLE_ROOT, &store, 1, actions.clone()).await?;
         if published {
-            add_commit(&table_root, store.as_ref(), 1, actions.clone()).await?;
+            add_commit(TABLE_ROOT, &store, 1, actions.clone()).await?;
         }
-        let source = SnapshotBuilder::new_for(&table_root)
-            .with_log_tail(vec![create_catalog_log_path(&table_root, staged_path)])
+        let source = SnapshotBuilder::new_for(TABLE_ROOT)
+            .with_log_tail(vec![create_catalog_log_path(TABLE_ROOT, staged_path)])
             .with_max_catalog_version(1)
             .build(engine.as_ref())?;
         let (reporter, _guard) = measuring_reporter();
         let hint = source.to_snapshot_hint()?;
         assert_eq!(hint.log_segment_files, source.log_segment().listed);
 
-        let without_catalog_version = SnapshotBuilder::new_for(&table_root)
+        let without_catalog_version = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_snapshot_hint(hint.clone())
             .build(engine.as_ref());
         if downgrade {
@@ -1931,7 +1910,7 @@ mod tests {
         }
         for max_catalog_version in [0, 2] {
             assert_hint_error(
-                SnapshotBuilder::new_for(&table_root).with_max_catalog_version(max_catalog_version),
+                SnapshotBuilder::new_for(TABLE_ROOT).with_max_catalog_version(max_catalog_version),
                 hint.clone(),
                 engine.as_ref(),
                 &format!(
@@ -1941,7 +1920,7 @@ mod tests {
         }
         // WHEN its version is requested from the snapshot or hint with each catalog bound.
         for max_catalog_version in [None, Some(1), Some(2)] {
-            let mut builder = SnapshotBuilder::new_for(&table_root)
+            let mut builder = SnapshotBuilder::new_for(TABLE_ROOT)
                 .at_version(1)
                 .with_snapshot_hint(hint.clone());
             let mut cached_builder = SnapshotBuilder::new_from(source.clone()).at_version(1);
@@ -1960,7 +1939,7 @@ mod tests {
             assert!(source.is_built_as_latest());
         }
         if !published {
-            add_commit(&table_root, store.as_ref(), 1, actions).await?;
+            add_commit(TABLE_ROOT, &store, 1, actions).await?;
         }
         let upgrade = serde_json::json!({
             "protocol": Protocol::try_new_modern(
@@ -1969,15 +1948,15 @@ mod tests {
             )?
         })
         .to_string();
-        add_commit(&table_root, store.as_ref(), 2, upgrade).await?;
-        let historical = SnapshotBuilder::new_for(&table_root)
+        add_commit(TABLE_ROOT, &store, 2, upgrade).await?;
+        let historical = SnapshotBuilder::new_for(TABLE_ROOT)
             .at_version(1)
             .with_max_catalog_version(2)
             .with_snapshot_hint(hint.clone())
             .build(engine.as_ref())?;
         assert_eq!(historical.log_segment().listed, source.log_segment().listed);
         assert!(!historical.is_built_as_latest());
-        let hinted = SnapshotBuilder::new_for(table_root)
+        let hinted = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_max_catalog_version(1)
             .with_snapshot_hint(hint)
             .build(engine.as_ref())?;
@@ -2004,21 +1983,21 @@ mod tests {
         #[values(false, true)] use_hint: bool,
     ) -> KernelResult<(), Box<dyn std::error::Error>> {
         // GIVEN a CM snapshot marked latest and a fresh build at the requested version below MCV 3.
-        let (engine, store, table_root) = setup_catalog_managed_test().await;
+        let engine = setup_catalog_managed_test().await;
         for version in 1..=2 {
             add_commit(
-                &table_root,
-                store.as_ref(),
+                TABLE_ROOT,
+                engine.store(),
                 version,
                 actions_to_string(vec![TestAction::Add(format!("file_{version}.parquet"))]),
             )
             .await?;
         }
-        let engine = MeteredDeltaEngine::new(engine);
-        let source = SnapshotBuilder::new_for(&table_root)
+        let engine = MeteredDeltaEngine::new(Arc::new(engine));
+        let source = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_max_catalog_version(source_version)
             .build(&engine)?;
-        let fresh = SnapshotBuilder::new_for(&table_root)
+        let fresh = SnapshotBuilder::new_for(TABLE_ROOT)
             .at_version(requested_version)
             .with_max_catalog_version(3)
             .build(&engine)?;
@@ -2028,7 +2007,7 @@ mod tests {
         // WHEN a different version is requested from the cached snapshot or its complete hint.
         let (reporter, _guard) = measuring_reporter();
         let rebuilt = if use_hint {
-            SnapshotBuilder::new_for(&table_root)
+            SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_snapshot_hint(source.to_snapshot_hint()?)
                 .at_version(requested_version)
                 .with_max_catalog_version(3)
@@ -2069,16 +2048,16 @@ mod tests {
 
     async fn catalog_snapshot_with_checkpoint_and_crc(
         originally_latest: bool,
-    ) -> KernelResult<(Arc<SyncEngine>, String, SnapshotRef), Box<dyn std::error::Error>> {
-        let (engine, store, table_root) = setup_catalog_managed_test().await;
-        let base = SnapshotBuilder::new_for(&table_root)
+    ) -> KernelResult<(SyncEngine, SnapshotRef), Box<dyn std::error::Error>> {
+        let engine = setup_catalog_managed_test().await;
+        let base = SnapshotBuilder::new_for(TABLE_ROOT)
             .with_max_catalog_version(0)
-            .build(engine.as_ref())?
-            .checkpoint(engine.as_ref(), None)?
+            .build(&engine)?
+            .checkpoint(&engine, None)?
             .1;
         add_commit(
-            &table_root,
-            store.as_ref(),
+            TABLE_ROOT,
+            engine.store(),
             1,
             serde_json::json!({"commitInfo": {
                 "timestamp": 1_587_968_586_155_u64,
@@ -2093,8 +2072,8 @@ mod tests {
             .at_version(1)
             .skip_new_checkpoints()
             .with_max_catalog_version(if originally_latest { 1 } else { 2 })
-            .build(engine.as_ref())?
-            .write_checksum(engine.as_ref())?
+            .build(&engine)?
+            .write_checksum(&engine)?
             .1;
         assert_eq!(source.is_built_as_latest(), originally_latest);
         assert!(source.skipped_new_checkpoints());
@@ -2104,7 +2083,7 @@ mod tests {
             let _ = source.checkpoint_action.set(None);
             let _ = source.last_manifest_commit.set(None);
         }
-        Ok((engine, table_root, source))
+        Ok((engine, source))
     }
 
     #[rstest::rstest]
@@ -2117,10 +2096,9 @@ mod tests {
         #[values(None, Some(0), Some(1), Some(2))] bound: Option<Version>,
     ) -> KernelResult<(), Box<dyn std::error::Error>> {
         // GIVEN version 1 with checkpoint 0, CRC 1, and the requested source freshness.
-        let (engine, table_root, source) =
-            catalog_snapshot_with_checkpoint_and_crc(originally_latest).await?;
-        let engine = MeteredDeltaEngine::new(engine);
-        let fresh = SnapshotBuilder::new_for(&table_root)
+        let (engine, source) = catalog_snapshot_with_checkpoint_and_crc(originally_latest).await?;
+        let engine = MeteredDeltaEngine::new(Arc::new(engine));
+        let fresh = SnapshotBuilder::new_for(TABLE_ROOT)
             .at_version(1)
             .fold_with(bound, SnapshotBuilder::with_max_catalog_version)
             .build(&engine);
@@ -2136,7 +2114,7 @@ mod tests {
         // WHEN the same version is rebuilt from the snapshot or its hint with this bound.
         let (reporter, _guard) = measuring_reporter();
         let rebuilt = if use_hint {
-            SnapshotBuilder::new_for(&table_root)
+            SnapshotBuilder::new_for(TABLE_ROOT)
                 .with_snapshot_hint(source.to_snapshot_hint()?)
                 .at_version(1)
                 .fold_with(bound, SnapshotBuilder::with_max_catalog_version)
@@ -2179,7 +2157,7 @@ mod tests {
             exported.freshness == SnapshotHintFreshness::Latest,
             expected_latest
         );
-        let round_trip = SnapshotBuilder::new_for(&table_root)
+        let round_trip = SnapshotBuilder::new_for(TABLE_ROOT)
             .at_version(1)
             .with_max_catalog_version(1)
             .with_snapshot_hint(exported)

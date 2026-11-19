@@ -295,6 +295,7 @@ mod tests {
     use crate::engine::{DelegatingEngine, RelaxedCounter};
     use crate::expressions::Predicate;
     use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
+    use crate::log_segment::tests::memory_log_root;
     use crate::log_segment_files::LogSegmentFiles;
     use crate::path::LogPathFileType;
     use crate::plans::ir::nodes::Operator;
@@ -713,7 +714,7 @@ mod tests {
     /// empty sidecar list, so this synthetic segment is the only way to exercise the leaf fast
     /// path.
     fn segment_with_empty_sidecars_hint(extension: &str, include_metadata: bool) -> LogSegment {
-        let (_store, log_root) = crate::checkpoint::tests::new_in_memory_store();
+        let log_root = memory_log_root();
         let selected = format!(
             "00000000000000000001.checkpoint.11111111-1111-1111-1111-111111111111.{extension}"
         );
@@ -857,7 +858,7 @@ mod tests {
             sidecar_file_schema,
         )]);
 
-        let (_store, log_root) = crate::checkpoint::tests::new_in_memory_store();
+        let log_root = memory_log_root();
         let selected = format!(
             "00000000000000000001.checkpoint.11111111-1111-1111-1111-111111111111.{extension}"
         );

@@ -389,8 +389,7 @@ fn test_physical_predicate_case_insensitive_unknown_column() {
 #[test]
 fn test_scan_builder_accepts_predicate_on_unprojected_data_column() {
     let url = "memory:///test_table/";
-    let store = Arc::new(InMemory::new());
-    let engine = SyncEngine::new_with_store(store);
+    let engine = SyncEngine::in_memory();
 
     let schema = schema_ref! {
         nullable "number": LONG,
@@ -423,8 +422,7 @@ fn test_scan_builder_accepts_predicate_on_unprojected_data_column() {
 #[test]
 fn test_scan_builder_rejects_predicate_on_projection_only_metadata_column() {
     let url = "memory:///test_table/";
-    let store = Arc::new(InMemory::new());
-    let engine = SyncEngine::new_with_store(store);
+    let engine = SyncEngine::in_memory();
 
     let schema = schema_ref! { nullable "id": LONG };
     create_table(url, schema, "DefaultEngine", true)
@@ -2530,8 +2528,7 @@ fn scan_builder_tolerates_nonexistent_extra_indexed_column() {
 #[case::id_column_mapping(Some("id"))]
 fn scan_builder_stats_output_schemas_match_scan_output(#[case] column_mapping_mode: Option<&str>) {
     let table_root = "memory:///expected-stats-schemas/";
-    let store = Arc::new(InMemory::new());
-    let engine = SyncEngine::new_with_store(store);
+    let engine = SyncEngine::in_memory();
     let schema = schema_ref! {
         nullable "id": LONG,
         nullable "value": LONG,
@@ -2609,8 +2606,7 @@ fn scan_builder_stats_output_schemas_returns_none_without_data_columns(
         "memory:///expected-stats-schemas-empty-{}/",
         column_mapping_mode.unwrap_or("none")
     );
-    let store = Arc::new(InMemory::new());
-    let engine = SyncEngine::new_with_store(store);
+    let engine = SyncEngine::in_memory();
     let mut create_builder = create_table(
         &table_root,
         schema_ref! { nullable "id": LONG },
@@ -2647,8 +2643,7 @@ fn scan_builder_stats_output_schemas_respect_explicit_columns_and_partitions(
     #[case] column_mapping_mode: Option<&str>,
 ) {
     let table_root = "memory:///expected-stats-schemas-explicit/";
-    let store = Arc::new(InMemory::new());
-    let engine = SyncEngine::new_with_store(store);
+    let engine = SyncEngine::in_memory();
     let schema = schema_ref! {
         nullable "id": LONG,
         nullable "info": {
@@ -2702,8 +2697,7 @@ fn scan_builder_stats_output_schemas_respect_explicit_columns_and_partitions(
 #[test]
 fn scan_builder_stats_output_schemas_handle_extra_column_shapes() {
     let table_root = "memory:///expected-stats-schemas-extra-shapes/";
-    let store = Arc::new(InMemory::new());
-    let engine = SyncEngine::new_with_store(store);
+    let engine = SyncEngine::in_memory();
     let schema = schema_ref! {
         nullable "id": LONG,
         nullable "info": {
@@ -2755,8 +2749,7 @@ fn scan_builder_stats_output_schemas_handle_extra_column_shapes() {
 #[test]
 fn scan_builder_stats_output_schemas_validate_selected_columns() {
     let table_root = "memory:///expected-stats-schemas-selected-columns/";
-    let store = Arc::new(InMemory::new());
-    let engine = SyncEngine::new_with_store(store);
+    let engine = SyncEngine::in_memory();
     let schema = schema_ref! {
         nullable "info": {
             nullable "name": STRING,
@@ -2811,8 +2804,7 @@ fn scan_builder_stats_output_schemas_follow_struct_columns(
         "memory:///selected-stats-schemas-{}/",
         column_mapping_mode.unwrap_or("none")
     );
-    let store = Arc::new(InMemory::new());
-    let engine = SyncEngine::new_with_store(store);
+    let engine = SyncEngine::in_memory();
     let schema = schema_ref! {
         nullable "id": LONG,
         nullable "name": STRING,

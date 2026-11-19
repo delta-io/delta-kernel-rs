@@ -802,14 +802,12 @@ impl RowVisitor for CheckpointCrcVisitor<'_> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Arc;
 
     use test_utils::{LoggingTest, add_commit, assert_result_error_with_message};
 
     use super::*;
     use crate::crc::{DomainMetadataState, FileStats, FileStatsState, SetTransactionState};
     use crate::engine::sync::SyncEngine;
-    use crate::object_store::memory::InMemory;
     use crate::table_features::TableFeature;
 
     impl CrcReplayAccumulator {
@@ -1309,14 +1307,13 @@ mod tests {
 
     #[tokio::test]
     async fn end_to_end_smoke_full_coverage() {
-        let store = Arc::new(InMemory::new());
-        let engine = SyncEngine::new_with_store(store.clone());
+        let engine = SyncEngine::in_memory();
         let root = "memory:///t/";
 
         // v0: bootstrap. Protocol already supports `domainMetadata` and `inCommitTimestamp`
         // so the v1 DM action and v2 commitInfo with ICT are well-formed. v0 is outside
         // the replay range; the segment covers (0, 2].
-        add_commit(root, store.as_ref(), 0, r#"
+        add_commit(root, engine.store(), 0, r#"
 {"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":[],"writerFeatures":["domainMetadata","inCommitTimestamp"]}}
 {"metaData":{"id":"id-0","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{},"createdTime":0}}
 "#.to_string()).await.unwrap();
@@ -1325,7 +1322,7 @@ mod tests {
         // 1 (size 10000), and 2 (size 20000).
         add_commit(
             root,
-            store.as_ref(),
+            engine.store(),
             1,
             r#"
 {"add":{"path":"a","partitionValues":{},"size":100,"modificationTime":1,"dataChange":true}}
@@ -1343,7 +1340,7 @@ mod tests {
 
         // v2 (newest): protocol upgrade that adds `rowTracking` on top of v0's features,
         // new metadata, DM tombstone, second txn, one remove (bin 0), commitInfo with ICT.
-        add_commit(root, store.as_ref(), 2, r#"
+        add_commit(root, engine.store(), 2, r#"
 {"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":[],"writerFeatures":["domainMetadata","inCommitTimestamp","rowTracking"]}}
 {"metaData":{"id":"id-2","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{"delta.enableRowTracking":"true"},"createdTime":2}}
 {"remove":{"path":"a","deletionTimestamp":2,"dataChange":true,"size":100}}
@@ -1420,12 +1417,11 @@ mod tests {
 
     #[tokio::test]
     async fn build_crc_delta_from_base_errors_when_base_version_geq_end_version() {
-        let store = Arc::new(InMemory::new());
-        let engine = SyncEngine::new_with_store(store.clone());
+        let engine = SyncEngine::in_memory();
         let root = "memory:///t/";
         add_commit(
             root,
-            store.as_ref(),
+            engine.store(),
             0,
             r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":1}}"#.to_string(),
         )
@@ -1450,12 +1446,11 @@ mod tests {
 
     #[tokio::test]
     async fn build_crc_from_version_zero_no_checkpoint_first_commit_nonzero_errors() {
-        let store = Arc::new(InMemory::new());
-        let engine = SyncEngine::new_with_store(store.clone());
+        let engine = SyncEngine::in_memory();
         let root = "memory:///t/";
         add_commit(
             root,
-            store.as_ref(),
+            engine.store(),
             1,
             r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":1}}"#.to_string(),
         )

@@ -135,7 +135,6 @@ fn visit_domain_metadata_actions(
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::sync::Arc;
 
     use url::Url;
 
@@ -143,7 +142,6 @@ mod tests {
     use crate::actions::visitors::DomainMetadataVisitor;
     use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
-    use crate::object_store::memory::InMemory;
     use crate::schema::schema_ref;
     use crate::transaction::UpdateTableOperation;
     use crate::transaction::create_table::create_table as create_table_txn;
@@ -156,8 +154,7 @@ mod tests {
     /// Log replay visits commits newest-first, so commit 1 is the first batch and commit 0
     /// is the second batch.
     fn build_two_commit_log() -> (impl crate::Engine, std::sync::Arc<Snapshot>) {
-        let store = Arc::new(InMemory::new());
-        let engine = SyncEngine::new_with_store(store);
+        let engine = SyncEngine::in_memory();
         let url = Url::parse("memory:///").unwrap();
 
         // Commit 0: CREATE TABLE (protocol + metadata) with "domainC" in the same commit.

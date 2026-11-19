@@ -14,15 +14,13 @@ use crate::checkpoint::CheckpointWriter;
 use crate::checkpoint::sidecar::{SidecarSplitter, SingleSidecarDataIterator};
 use crate::checkpoint::tests::{
     create_add_action, create_metadata_action, create_metadata_with_stats_config_and_partitions,
-    create_remove_action, create_v2_checkpoint_protocol_action, new_in_memory_store,
-    write_commit_to_store,
+    create_remove_action, create_v2_checkpoint_protocol_action, write_commit_to_store,
 };
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::arrow_expression::ArrowEvaluationHandler;
 use crate::engine::sync::SyncEngine;
-use crate::object_store::ObjectStoreExt as _;
-use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
+use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::schema::{DataType, StructType, schema, schema_ref};
 use crate::unit_test_utils::Action;
@@ -96,7 +94,7 @@ struct ExpectedNonFileContent<'a> {
 }
 
 /// Reads sidecar parquet files from storage and returns all record batches.
-async fn read_sidecar_batches(store: &Arc<InMemory>, sidecar_urls: &[Url]) -> Vec<RecordBatch> {
+async fn read_sidecar_batches(store: &DynObjectStore, sidecar_urls: &[Url]) -> Vec<RecordBatch> {
     let mut batches = Vec::new();
     for url in sidecar_urls {
         let obj_path = Path::from(url.path().strip_prefix('/').unwrap_or(url.path()));
@@ -275,11 +273,10 @@ fn verify_non_file_batches(batches: &[Box<dyn EngineData>], expected: &ExpectedN
 /// action counts correct.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_generate_sidecars_single_sidecar() -> Result<()> {
-    let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
-
+    let engine = SyncEngine::in_memory();
+    let store = engine.store();
     write_commit_to_store(
-        &store,
+        store,
         vec![
             create_v2_checkpoint_protocol_action(),
             create_metadata_action(),
@@ -289,7 +286,7 @@ async fn test_generate_sidecars_single_sidecar() -> Result<()> {
     .await?;
 
     write_commit_to_store(
-        &store,
+        store,
         vec![
             create_add_action("file1.parquet"),
             create_add_action("file2.parquet"),
@@ -299,7 +296,7 @@ async fn test_generate_sidecars_single_sidecar() -> Result<()> {
     )
     .await?;
 
-    write_commit_to_store(&store, vec![create_remove_action("file1.parquet")], 2).await?;
+    write_commit_to_store(store, vec![create_remove_action("file1.parquet")], 2).await?;
 
     let table_root = Url::parse("memory:///").map_err(KernelError::from)?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
@@ -324,7 +321,7 @@ async fn test_generate_sidecars_single_sidecar() -> Result<()> {
     // 1 protocol + 1 metadata + 2 adds (file1 removed) + 1 remove + 1 checkpointMetadata = 6
     assert_eq!(result.iter_state.actions_count(), 6);
 
-    let batches = read_sidecar_batches(&store, &result.sidecar_files).await;
+    let batches = read_sidecar_batches(store, &result.sidecar_files).await;
     let (adds, removes) = collect_file_action_paths(&batches);
     assert_eq!(adds, vec!["file2.parquet", "file3.parquet"]);
     assert_eq!(removes, vec!["file1.parquet"]);
@@ -338,12 +335,10 @@ async fn test_generate_sidecars_single_sidecar() -> Result<()> {
 /// file and non-file batches is correct.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_generate_sidecars_multiple_chunks() -> Result<()> {
-    let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
-
+    let engine = SyncEngine::in_memory();
     // Commit 0: v2 protocol + metadata + 3 adds (mixed batch of file and non-file actions)
     write_commit_to_store(
-        &store,
+        engine.store(),
         vec![
             create_v2_checkpoint_protocol_action(),
             create_metadata_action(),
@@ -358,7 +353,7 @@ async fn test_generate_sidecars_multiple_chunks() -> Result<()> {
     // Spread adds and removes across commits so the hint=3 causes chunking at batch
     // boundaries, with removes landing in multiple sidecars.
     write_commit_to_store(
-        &store,
+        engine.store(),
         vec![
             create_add_action("file1.parquet"),
             create_add_action("file2.parquet"),
@@ -368,7 +363,7 @@ async fn test_generate_sidecars_multiple_chunks() -> Result<()> {
     )
     .await?;
     write_commit_to_store(
-        &store,
+        engine.store(),
         vec![
             create_add_action("file3.parquet"),
             create_add_action("file4.parquet"),
@@ -377,7 +372,7 @@ async fn test_generate_sidecars_multiple_chunks() -> Result<()> {
         2,
     )
     .await?;
-    write_commit_to_store(&store, vec![create_add_action("file5.parquet")], 3).await?;
+    write_commit_to_store(engine.store(), vec![create_add_action("file5.parquet")], 3).await?;
 
     let table_root = Url::parse("memory:///").map_err(KernelError::from)?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
@@ -415,7 +410,7 @@ async fn test_generate_sidecars_multiple_chunks() -> Result<()> {
     );
 
     // Sidecar 1: file5 (add) from commit 3, file3+file4 (add) + file0b (remove) from commit 2
-    let s1 = read_sidecar_batches(&store, &result.sidecar_files[..1]).await;
+    let s1 = read_sidecar_batches(engine.store(), &result.sidecar_files[..1]).await;
     let s1_rows: usize = s1.iter().map(|b| b.num_rows()).sum();
     assert_eq!(s1_rows, 4);
     let (s1_adds, s1_removes) = collect_file_action_paths(&s1);
@@ -426,7 +421,7 @@ async fn test_generate_sidecars_multiple_chunks() -> Result<()> {
     assert_eq!(s1_removes, vec!["file0b.parquet"]);
 
     // Sidecar 2: file1+file2 (add) + file0a (remove) from commit 1
-    let s2 = read_sidecar_batches(&store, &result.sidecar_files[1..2]).await;
+    let s2 = read_sidecar_batches(engine.store(), &result.sidecar_files[1..2]).await;
     let s2_rows: usize = s2.iter().map(|b| b.num_rows()).sum();
     assert_eq!(s2_rows, 3);
     let (s2_adds, s2_removes) = collect_file_action_paths(&s2);
@@ -434,7 +429,7 @@ async fn test_generate_sidecars_multiple_chunks() -> Result<()> {
     assert_eq!(s2_removes, vec!["file0a.parquet"]);
 
     // Sidecar 3: file0c (add) from commit 0 (file0a and file0b reconciled away)
-    let s3 = read_sidecar_batches(&store, &result.sidecar_files[2..]).await;
+    let s3 = read_sidecar_batches(engine.store(), &result.sidecar_files[2..]).await;
     let s3_rows: usize = s3.iter().map(|b| b.num_rows()).sum();
     assert_eq!(s3_rows, 1);
     let (s3_adds, s3_removes) = collect_file_action_paths(&s3);
@@ -448,11 +443,9 @@ async fn test_generate_sidecars_multiple_chunks() -> Result<()> {
 /// Verifies: produces multiple sidecar files, splitter is exhausted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_generate_sidecars_hint_one_per_batch() -> Result<()> {
-    let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
-
+    let engine = SyncEngine::in_memory();
     write_commit_to_store(
-        &store,
+        engine.store(),
         vec![
             create_v2_checkpoint_protocol_action(),
             create_metadata_action(),
@@ -462,7 +455,7 @@ async fn test_generate_sidecars_hint_one_per_batch() -> Result<()> {
     .await?;
 
     write_commit_to_store(
-        &store,
+        engine.store(),
         vec![
             create_add_action("file1.parquet"),
             create_add_action("file2.parquet"),
@@ -472,7 +465,7 @@ async fn test_generate_sidecars_hint_one_per_batch() -> Result<()> {
     .await?;
 
     write_commit_to_store(
-        &store,
+        engine.store(),
         vec![
             create_add_action("file3.parquet"),
             create_add_action("file4.parquet"),
@@ -496,13 +489,13 @@ async fn test_generate_sidecars_hint_one_per_batch() -> Result<()> {
     );
 
     // sidecar_1: commit 2 (reverse replay order)
-    let s1 = read_sidecar_batches(&store, &result.sidecar_files[..1]).await;
+    let s1 = read_sidecar_batches(engine.store(), &result.sidecar_files[..1]).await;
     let (s1_adds, s1_removes) = collect_file_action_paths(&s1);
     assert_eq!(s1_adds, vec!["file3.parquet", "file4.parquet"]);
     assert!(s1_removes.is_empty());
 
     // sidecar_2: commit 1
-    let s2 = read_sidecar_batches(&store, &result.sidecar_files[1..]).await;
+    let s2 = read_sidecar_batches(engine.store(), &result.sidecar_files[1..]).await;
     let (s2_adds, s2_removes) = collect_file_action_paths(&s2);
     assert_eq!(s2_adds, vec!["file1.parquet", "file2.parquet"]);
     assert!(s2_removes.is_empty());
@@ -518,11 +511,9 @@ async fn test_generate_sidecars_hint_one_per_batch() -> Result<()> {
 /// 5. Validate the actual values in `stats_parsed` and `partitionValues_parsed` match the input.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_generate_sidecars_stats_and_partition_values() -> Result<()> {
-    let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
-
+    let engine = SyncEngine::in_memory();
     write_commit_to_store(
-        &store,
+        engine.store(),
         vec![
             create_v2_checkpoint_protocol_action(),
             create_metadata_with_stats_config_and_partitions(true, true, vec!["category".into()]),
@@ -547,7 +538,7 @@ async fn test_generate_sidecars_stats_and_partition_values() -> Result<()> {
     };
     add.partition_values
         .insert("category".into(), "books".into());
-    write_commit_to_store(&store, vec![Action::Add(add)], 1).await?;
+    write_commit_to_store(engine.store(), vec![Action::Add(add)], 1).await?;
 
     let table_root = Url::parse("memory:///").map_err(KernelError::from)?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
@@ -629,11 +620,9 @@ async fn test_generate_sidecars_stats_and_partition_values() -> Result<()> {
 /// Verifies: SidecarSplitter yields no file-action rows and buffers all non-file actions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_splitter_no_file_actions() -> Result<()> {
-    let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
-
+    let engine = SyncEngine::in_memory();
     write_commit_to_store(
-        &store,
+        engine.store(),
         vec![
             create_v2_checkpoint_protocol_action(),
             create_metadata_action(),

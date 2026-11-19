@@ -25,8 +25,7 @@ use crate::engine::DelegatingEngine;
 use crate::engine::sync::SyncEngine;
 #[cfg(feature = "declarative-plans")]
 use crate::expressions::Scalar;
-use crate::object_store::ObjectStoreExt as _;
-use crate::object_store::memory::InMemory;
+use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
 use crate::path::ParsedLogPath;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::Operator;
@@ -140,8 +139,8 @@ fn commit_info(last_manifest_commit: Option<LastManifestCommit>) -> String {
 }
 
 // Commits a root manifest commit at v0 (pointing at itself) followed by `later_commits`, and
-// returns the store and table root.
-async fn manifest_commit_table(later_commits: &[String]) -> (Arc<InMemory>, Url) {
+// returns an engine on the table's store and the table root.
+async fn manifest_commit_table(later_commits: &[String]) -> (SyncEngine, Url) {
     let manifest_commit = checkpoint_commit(0, &[], one_column_schema());
     let commits: Vec<String> = std::iter::once(manifest_commit)
         .chain(later_commits.iter().cloned())
@@ -149,22 +148,22 @@ async fn manifest_commit_table(later_commits: &[String]) -> (Arc<InMemory>, Url)
     commit_table(&commits).await
 }
 
-// Commits `commits` as versions 0, 1, ... of an in-memory table, and returns the store and table
-// root.
-async fn commit_table(commits: &[String]) -> (Arc<InMemory>, Url) {
-    let store = Arc::new(InMemory::new());
+// Commits `commits` as versions 0, 1, ... of an in-memory table, and returns an engine on the
+// table's store and the table root.
+async fn commit_table(commits: &[String]) -> (SyncEngine, Url) {
+    let engine = SyncEngine::in_memory();
     let table_root = Url::parse("memory:///").unwrap();
     for (version, commit) in commits.iter().enumerate() {
         add_commit(
             table_root.as_str(),
-            store.as_ref(),
+            engine.store(),
             version as u64,
             commit.clone(),
         )
         .await
         .unwrap();
     }
-    (store, table_root)
+    (engine, table_root)
 }
 
 // The log a replay test reads: `commits` at versions 0.., plus an optional P&M checkpoint and an
@@ -255,13 +254,14 @@ impl ReplayExpectation {
 async fn replay<E: Engine>(
     log: &ReplayLog,
     crc: Option<&Arc<Crc>>,
-    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+    map_engine: impl FnOnce(SyncEngine) -> E,
 ) -> KernelResult<PmResolution> {
-    let (store, table_root) = commit_table(&log.commits).await;
+    let (engine, table_root) = commit_table(&log.commits).await;
     if let Some(version) = log.checkpoint_at {
-        put_pm_checkpoint(&store, version).await;
+        put_pm_checkpoint(engine.store(), version).await;
     }
-    let engine = make_engine(store.clone());
+    let store = engine.store().clone();
+    let engine = map_engine(engine);
     let log_segment = match &log.compaction {
         Some((range, contents)) => {
             segment_with_compaction(&store, &table_root, &engine, *range, contents).await
@@ -275,15 +275,14 @@ async fn assert_replay<E: Engine>(
     log: &ReplayLog,
     crc: Option<&Arc<Crc>>,
     expected: &ReplayExpectation,
-    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+    map_engine: impl FnOnce(SyncEngine) -> E,
 ) {
-    expected.check(replay(log, crc, make_engine).await.unwrap());
+    expected.check(replay(log, crc, map_engine).await.unwrap());
 }
 
 // Removes SyncEngine's plan executor so replay uses the non-plan path even when
 // `declarative-plans` is compiled in. Otherwise SyncEngine would use the plan path.
-fn non_plan_engine(store: Arc<InMemory>) -> impl Engine {
-    let engine = SyncEngine::new_with_store(store);
+fn non_plan_engine(engine: SyncEngine) -> impl Engine {
     #[cfg(feature = "declarative-plans")]
     let engine = DelegatingEngine::new(Arc::new(engine)).without_plan_executor();
     engine
@@ -293,15 +292,15 @@ fn non_plan_engine(store: Arc<InMemory>) -> impl Engine {
 async fn test_load_resolves_pm_from_manifest_commit_checkpoint_action() {
     check_manifest_commit_checkpoint(non_plan_engine).await;
     #[cfg(feature = "declarative-plans")]
-    check_manifest_commit_checkpoint(|store| SyncEngine::new_with_store(store)).await;
+    check_manifest_commit_checkpoint(|engine| engine).await;
 }
 
 // A single commit whose only P&M is a checkpoint action. The build succeeds only if P&M came from
 // that action, and the `id` column confirms it used the embedded metaData.
-async fn check_manifest_commit_checkpoint<E: Engine>(make_engine: impl FnOnce(Arc<InMemory>) -> E) {
-    let (store, table_root) = manifest_commit_table(&[]).await;
+async fn check_manifest_commit_checkpoint<E: Engine>(map_engine: impl FnOnce(SyncEngine) -> E) {
+    let (engine, table_root) = manifest_commit_table(&[]).await;
 
-    let engine = make_engine(store);
+    let engine = map_engine(engine);
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
     assert_eq!(snapshot.version(), 0);
     assert!(snapshot.schema().field("id").is_some());
@@ -371,23 +370,23 @@ async fn assert_newest_pm_wins(
         &v1,
         expected_fields,
         expected_reader_features,
-        |store| SyncEngine::new_with_store(store),
+        |engine| engine,
     )
     .await;
 }
 
-// Commits v0 then v1 with `make_engine`, then checks the resolved metaData column count and the
+// Commits v0 then v1 with `map_engine`, then checks the resolved metaData column count and the
 // resolved protocol's reader-feature count.
 async fn build_and_check_pm<E: Engine>(
     v0: &str,
     v1: &str,
     expected_fields: usize,
     expected_reader_features: usize,
-    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+    map_engine: impl FnOnce(SyncEngine) -> E,
 ) {
-    let (store, table_root) = commit_table(&[v0.to_string(), v1.to_string()]).await;
+    let (engine, table_root) = commit_table(&[v0.to_string(), v1.to_string()]).await;
 
-    let engine = make_engine(store);
+    let engine = map_engine(engine);
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
 
     assert_eq!(snapshot.version(), 1);
@@ -419,15 +418,12 @@ async fn test_lagging_checkpoint_ranks_by_checkpoint_version(
 ) {
     assert_lagging_checkpoint_loses_to_gap_commit(pointer_carried_forward, non_plan_engine).await;
     #[cfg(feature = "declarative-plans")]
-    assert_lagging_checkpoint_loses_to_gap_commit(pointer_carried_forward, |store| {
-        SyncEngine::new_with_store(store)
-    })
-    .await;
+    assert_lagging_checkpoint_loses_to_gap_commit(pointer_carried_forward, |engine| engine).await;
 }
 
 async fn assert_lagging_checkpoint_loses_to_gap_commit<E: Engine>(
     pointer_carried_forward: bool,
-    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+    map_engine: impl FnOnce(SyncEngine) -> E,
 ) {
     let mut later_commits = vec![
         carrying_pointer(
@@ -443,9 +439,9 @@ async fn assert_lagging_checkpoint_loses_to_gap_commit<E: Engine>(
     if pointer_carried_forward {
         later_commits.push(commit_info(Some(pointer(2, 0))));
     }
-    let (store, table_root) = manifest_commit_table(&later_commits).await;
+    let (engine, table_root) = manifest_commit_table(&later_commits).await;
 
-    let engine = make_engine(store);
+    let engine = map_engine(engine);
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
 
     assert_eq!(snapshot.version(), later_commits.len() as u64);
@@ -464,15 +460,17 @@ async fn assert_lagging_checkpoint_loses_to_gap_commit<E: Engine>(
 async fn replay_captures_latest_checkpoint_action() {
     assert_replay_captures_checkpoint_action(non_plan_engine).await;
     #[cfg(feature = "declarative-plans")]
-    assert_replay_captures_checkpoint_action(|store| SyncEngine::new_with_store(store)).await;
+    assert_replay_captures_checkpoint_action(|engine| engine).await;
 }
 
 async fn assert_replay_captures_checkpoint_action<E: Engine>(
-    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+    map_engine: impl FnOnce(SyncEngine) -> E,
 ) {
-    let (store, table_root) = commit_table(&[checkpoint_commit(0, &[], one_column_schema())]).await;
+    let (engine, table_root) =
+        commit_table(&[checkpoint_commit(0, &[], one_column_schema())]).await;
 
-    let engine = make_engine(store.clone());
+    let store = engine.store().clone();
+    let engine = map_engine(engine);
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
     store
         .delete(&delta_path_for_version(0, "json"))
@@ -487,9 +485,10 @@ async fn assert_replay_captures_checkpoint_action<E: Engine>(
 // `latest_checkpoint_action` follows the commit's `lastManifestCommit` to it.
 #[tokio::test]
 async fn latest_checkpoint_action_without_replay_follows_commit_info_pointer() {
-    let (store, table_root) = commit_table(&[checkpoint_commit(0, &[], one_column_schema())]).await;
+    let (engine, table_root) =
+        commit_table(&[checkpoint_commit(0, &[], one_column_schema())]).await;
 
-    let engine = non_plan_engine(store);
+    let engine = non_plan_engine(engine);
     let log_segment = latest_log_segment(&table_root, &engine);
     let table_configuration = adaptive_metadata_table_configuration(one_column_schema(), &[]);
     let snapshot = Snapshot::new(log_segment, table_configuration).unwrap();
@@ -551,10 +550,7 @@ async fn replay_ignores_checkpoint_actions_it_does_not_need(
     #[case] expected: ReplayExpectation,
 ) {
     let log = ReplayLog::new(commits);
-    assert_replay(&log, None, &expected, |store| {
-        SyncEngine::new_with_store(store)
-    })
-    .await;
+    assert_replay(&log, None, &expected, |engine| engine).await;
 }
 
 // Replay fails the build when the checkpoint action it needs is missing or does not match the
@@ -597,10 +593,7 @@ async fn replay_errors_on_invalid_pointer(
     #[case] commits: Vec<String>,
     #[case] expected_error: &str,
 ) {
-    assert_replay_errors(&commits, None, expected_error, |store| {
-        SyncEngine::new_with_store(store)
-    })
-    .await;
+    assert_replay_errors(&commits, None, expected_error, |engine| engine).await;
 }
 
 // Replay fails the build when the newest commit's checkpoint action contradicts its own pointer.
@@ -643,10 +636,7 @@ async fn replay_errors_on_newest_commit_contradicting_its_pointer(
     #[case] commits: Vec<String>,
     #[case] expected_error: &str,
 ) {
-    assert_replay_errors(&commits, None, expected_error, |store| {
-        SyncEngine::new_with_store(store)
-    })
-    .await;
+    assert_replay_errors(&commits, None, expected_error, |engine| engine).await;
 }
 
 #[cfg(feature = "declarative-plans")]
@@ -654,9 +644,9 @@ async fn assert_replay_errors<E: Engine>(
     commits: &[String],
     crc: Option<&Arc<Crc>>,
     expected_error: &str,
-    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+    map_engine: impl FnOnce(SyncEngine) -> E,
 ) {
-    let result = replay(&ReplayLog::new(commits.to_vec()), crc, make_engine).await;
+    let result = replay(&ReplayLog::new(commits.to_vec()), crc, map_engine).await;
     assert!(matches!(&result, Err(KernelError::InvalidLogSegment(_))));
     assert_result_error_with_message(result, expected_error);
 }
@@ -685,14 +675,15 @@ async fn plan_replay_bounded_by_crc_or_checkpoint_runs_one_plan(
         txn_commit()
     };
     let later_commits = [carrier.clone(), carrier, newest];
-    let (store, table_root) = manifest_commit_table(&later_commits).await;
+    let (engine, table_root) = manifest_commit_table(&later_commits).await;
     match bound {
-        ReplayBound::Crc => put_crc_with_pointer(&store, 1, pointer(0, 0)).await,
-        ReplayBound::Checkpoint => put_pm_checkpoint(&store, 1).await,
+        ReplayBound::Crc => put_crc_with_pointer(engine.store(), 1, pointer(0, 0)).await,
+        ReplayBound::Checkpoint => put_pm_checkpoint(engine.store(), 1).await,
     }
 
     let plans = Arc::new(Mutex::new(Vec::new()));
-    let engine = recording_plan_engine(store.clone(), plans.clone());
+    let store = engine.store().clone();
+    let engine = recording_plan_engine(engine, plans.clone());
     let log_segment = if compacted {
         segment_with_compaction(&store, &table_root, &engine, (2, 3), &txn_commit()).await
     } else {
@@ -799,8 +790,8 @@ async fn plan_replay_runs_one_plan_beyond_the_newest_commit_only_when_needed(
     assert_replay(&log, None, &expected, non_plan_engine).await;
     let plans = Arc::new(Mutex::new(Vec::new()));
     let recorded = plans.clone();
-    assert_replay(&log, None, &expected, move |store| {
-        recording_plan_engine(store, recorded)
+    assert_replay(&log, None, &expected, move |engine| {
+        recording_plan_engine(engine, recorded)
     })
     .await;
     assert_eq!(*plans.lock().unwrap(), expected_plans);
@@ -815,13 +806,13 @@ async fn replay_reads_all_older_commits_when_pointed_commit_is_unlisted() {
     {
         let plans = Arc::new(Mutex::new(Vec::new()));
         let recorded = plans.clone();
-        check_unlisted_pointed_commit(move |store| recording_plan_engine(store, recorded)).await;
+        check_unlisted_pointed_commit(move |engine| recording_plan_engine(engine, recorded)).await;
         assert_eq!(*plans.lock().unwrap(), vec![vec![2], vec![1]]);
     }
 }
 
-async fn check_unlisted_pointed_commit<E: Engine>(make_engine: impl FnOnce(Arc<InMemory>) -> E) {
-    let (store, table_root) = manifest_commit_table(&[
+async fn check_unlisted_pointed_commit<E: Engine>(map_engine: impl FnOnce(SyncEngine) -> E) {
+    let (engine, table_root) = manifest_commit_table(&[
         carrying_pointer(
             pointer(0, 0),
             protocol_and_metadata_lines(one_column_schema(), &[]),
@@ -829,7 +820,7 @@ async fn check_unlisted_pointed_commit<E: Engine>(make_engine: impl FnOnce(Arc<I
         commit_info(Some(pointer(0, 0))),
     ])
     .await;
-    let engine = make_engine(store);
+    let engine = map_engine(engine);
     let mut log_segment = latest_log_segment(&table_root, &engine);
     log_segment.listed.ascending_commit_files.remove(0);
 
@@ -854,10 +845,7 @@ async fn replay_skips_commits_below_pointed_content_root() {
     let expected = ReplayExpectation::default().captured(Some(1));
     assert_replay(&log, None, &expected, non_plan_engine).await;
     #[cfg(feature = "declarative-plans")]
-    assert_replay(&log, None, &expected, |store| {
-        SyncEngine::new_with_store(store)
-    })
-    .await;
+    assert_replay(&log, None, &expected, |engine| engine).await;
 }
 
 // The pointed manifest commit is newer than the segment's checkpoint, but its content root is not.
@@ -885,14 +873,14 @@ async fn replay_resolves_pointed_action_above_segment_checkpoint() {
             .captured(None)
             .schema(one_column_schema())
             .last_manifest_commit(resolved_pointer(2, 1));
-        assert_replay(&log, None, &plan, |store| SyncEngine::new_with_store(store)).await;
+        assert_replay(&log, None, &plan, |engine| engine).await;
     }
 }
 
-// A plan-path engine over `store` that records into `plans` the log versions each plan scans.
+// A plan-path engine over `engine` that records into `plans` the log versions each plan scans.
 #[cfg(feature = "declarative-plans")]
-fn recording_plan_engine(store: Arc<InMemory>, plans: Arc<Mutex<Vec<Vec<i64>>>>) -> impl Engine {
-    let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new_with_store(store));
+fn recording_plan_engine(engine: SyncEngine, plans: Arc<Mutex<Vec<Vec<i64>>>>) -> impl Engine {
+    let engine: Arc<dyn Engine> = Arc::new(engine);
     let executor = Arc::new(RecordingPlanExecutor {
         inner: engine.plan_executor().unwrap(),
         plans,
@@ -944,26 +932,23 @@ async fn standalone_checkpoint_above_pointed_commit_fails_to_read_its_action() {
     )
     .await;
     #[cfg(feature = "declarative-plans")]
-    check_standalone_checkpoint_above_pointed_commit(
-        |store| SyncEngine::new_with_store(store),
-        resolved_pointer(0, 0),
-    )
-    .await;
+    check_standalone_checkpoint_above_pointed_commit(|engine| engine, resolved_pointer(0, 0)).await;
 }
 
 async fn check_standalone_checkpoint_above_pointed_commit<E: Engine>(
-    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+    map_engine: impl FnOnce(SyncEngine) -> E,
     expected_last_manifest_commit: LastManifestCommitResolution,
 ) {
     let carrier = commit_info(Some(pointer(0, 0)));
-    let (store, table_root) = manifest_commit_table(&[carrier.clone(), carrier]).await;
-    put_pm_checkpoint(&store, 1).await;
-    store
+    let (engine, table_root) = manifest_commit_table(&[carrier.clone(), carrier]).await;
+    put_pm_checkpoint(engine.store(), 1).await;
+    engine
+        .store()
         .delete(&delta_path_for_version(0, "json"))
         .await
         .unwrap();
 
-    let engine = make_engine(store);
+    let engine = map_engine(engine);
     let log_segment = latest_log_segment(&table_root, &engine);
     assert_eq!(log_segment.checkpoint_version, Some(1));
     let resolution = log_segment
@@ -988,13 +973,11 @@ async fn check_standalone_checkpoint_above_pointed_commit<E: Engine>(
 async fn segment_ending_on_checkpoint_ignores_its_checkpoint_action_rows() {
     check_segment_ending_on_checkpoint(non_plan_engine).await;
     #[cfg(feature = "declarative-plans")]
-    check_segment_ending_on_checkpoint(|store| SyncEngine::new_with_store(store)).await;
+    check_segment_ending_on_checkpoint(|engine| engine).await;
 }
 
-async fn check_segment_ending_on_checkpoint<E: Engine>(
-    make_engine: impl FnOnce(Arc<InMemory>) -> E,
-) {
-    let (store, table_root) = manifest_commit_table(&[]).await;
+async fn check_segment_ending_on_checkpoint<E: Engine>(map_engine: impl FnOnce(SyncEngine) -> E) {
+    let (engine, table_root) = manifest_commit_table(&[]).await;
     let checkpoint_rows = format!(
         "{}\n{}\n{}",
         serde_json::json!({ "checkpointMetadata": { "version": 0 } }),
@@ -1003,12 +986,13 @@ async fn check_segment_ending_on_checkpoint<E: Engine>(
     );
     let checkpoint =
         delta_path_for_version(0, "checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json");
-    store
+    engine
+        .store()
         .put(&checkpoint, checkpoint_rows.into())
         .await
         .unwrap();
 
-    let engine = make_engine(store);
+    let engine = map_engine(engine);
     let log_segment = latest_log_segment(&table_root, &engine);
     assert_eq!(log_segment.checkpoint_version, Some(0));
     let resolution = log_segment
@@ -1035,20 +1019,18 @@ async fn incremental_update_resolves_latest_checkpoint_action(
 ) {
     assert_incremental_update_action(&new_commit, expected_version, non_plan_engine).await;
     #[cfg(feature = "declarative-plans")]
-    assert_incremental_update_action(&new_commit, expected_version, |store| {
-        SyncEngine::new_with_store(store)
-    })
-    .await;
+    assert_incremental_update_action(&new_commit, expected_version, |engine| engine).await;
 }
 
 async fn assert_incremental_update_action<E: Engine>(
     new_commit: &str,
     expected_version: i64,
-    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+    map_engine: impl FnOnce(SyncEngine) -> E,
 ) {
-    let (store, table_root) = manifest_commit_table(&[]).await;
+    let (engine, table_root) = manifest_commit_table(&[]).await;
 
-    let engine = make_engine(store.clone());
+    let store = engine.store().clone();
+    let engine = map_engine(engine);
     let base = Snapshot::builder_for(table_root.clone())
         .at_version(0)
         .build(&engine)
@@ -1128,11 +1110,11 @@ async fn latest_checkpoint_action_reads_commit_named_by_crc_pointer(
         v1,
         checkpoint_commit(2, &[], one_column_schema()),
     ];
-    let (store, table_root) = commit_table(&commits).await;
+    let (engine, table_root) = commit_table(&commits).await;
     let pointer = pointer(pointer_version, pointer_content_root_version);
-    put_crc_with_pointer(&store, 2, pointer).await;
+    put_crc_with_pointer(engine.store(), 2, pointer).await;
 
-    let engine = non_plan_engine(store);
+    let engine = non_plan_engine(engine);
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
 
     let result = snapshot.latest_checkpoint_action(&engine);
@@ -1147,10 +1129,11 @@ async fn latest_checkpoint_action_reads_commit_named_by_crc_pointer(
 // action. Such a log needs a classic checkpoint, which adaptiveMetadata forbids.
 #[tokio::test]
 async fn latest_checkpoint_action_fails_without_commit_or_crc_at_checkpoint_version() {
-    let (store, table_root) = commit_table(&[checkpoint_commit(0, &[], one_column_schema())]).await;
-    put_pm_checkpoint(&store, 1).await;
+    let (engine, table_root) =
+        commit_table(&[checkpoint_commit(0, &[], one_column_schema())]).await;
+    put_pm_checkpoint(engine.store(), 1).await;
 
-    let engine = non_plan_engine(store);
+    let engine = non_plan_engine(engine);
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
     assert_eq!(snapshot.version(), 1);
 
@@ -1182,9 +1165,9 @@ async fn latest_checkpoint_action_follows_commit_info_pointer(
             protocol_and_metadata_lines(one_column_schema(), &[])
         ),
     ];
-    let (store, table_root) = commit_table(&commits).await;
+    let (engine, table_root) = commit_table(&commits).await;
 
-    let engine = non_plan_engine(store);
+    let engine = non_plan_engine(engine);
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
 
     let action = snapshot.latest_checkpoint_action(&engine).unwrap();
@@ -1201,10 +1184,10 @@ async fn latest_checkpoint_action_follows_commit_info_pointer(
 async fn read_last_checkpoint_action_from_pointer_rejects_commit_outside_segment(
     #[case] pointer_version: i64,
 ) {
-    let (store, table_root) =
+    let (engine, table_root) =
         manifest_commit_table(&[checkpoint_commit(1, &[], one_column_schema())]).await;
 
-    let engine = non_plan_engine(store);
+    let engine = non_plan_engine(engine);
     let log_segment = latest_log_segment(&table_root, &engine).segment_after_version(0);
 
     let pointer = pointer(pointer_version, pointer_version);
@@ -1220,8 +1203,10 @@ async fn post_commit_snapshot_resolves_latest_checkpoint_action(
     #[case] write_root_manifest: bool,
     #[case] expected_version: i64,
 ) {
-    let (store, table_root) = commit_table(&[checkpoint_commit(0, &[], one_column_schema())]).await;
-    let engine = non_plan_engine(store.clone());
+    let (engine, table_root) =
+        commit_table(&[checkpoint_commit(0, &[], one_column_schema())]).await;
+    let store = engine.store().clone();
+    let engine = non_plan_engine(engine);
     let snapshot = Snapshot::builder_for(table_root.clone())
         .build(&engine)
         .unwrap();
@@ -1285,7 +1270,7 @@ async fn replay_resolves_last_manifest_commit_from_newest_commit(
         ReplayExpectation::default().last_manifest_commit(LastManifestCommitResolution::Unresolved);
     assert_replay(&log, crc, &non_plan, non_plan_engine).await;
     let plan = ReplayExpectation::default().last_manifest_commit(expected);
-    assert_replay(&log, crc, &plan, |store| SyncEngine::new_with_store(store)).await;
+    assert_replay(&log, crc, &plan, |engine| engine).await;
 }
 
 // A `lastManifestCommit` naming a version after the commit that carries it is invalid, so the plan
@@ -1295,24 +1280,23 @@ async fn replay_resolves_last_manifest_commit_from_newest_commit(
 #[rstest]
 #[tokio::test]
 async fn replay_rejects_pointer_after_newest_commit(#[values(false, true)] checkpointed: bool) {
-    check_pointer_after_newest_commit(checkpointed, |store| SyncEngine::new_with_store(store))
-        .await;
+    check_pointer_after_newest_commit(checkpointed, |engine| engine).await;
 }
 
 #[cfg(feature = "declarative-plans")]
 async fn check_pointer_after_newest_commit<E: Engine>(
     checkpointed: bool,
-    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+    map_engine: impl FnOnce(SyncEngine) -> E,
 ) {
     let later_commits = [
         commit_info(Some(pointer(0, 0))),
         commit_info(Some(pointer(5, 5))),
     ];
-    let (store, table_root) = manifest_commit_table(&later_commits).await;
+    let (engine, table_root) = manifest_commit_table(&later_commits).await;
     if checkpointed {
-        put_pm_checkpoint(&store, 1).await;
+        put_pm_checkpoint(engine.store(), 1).await;
     }
-    let engine = make_engine(store);
+    let engine = map_engine(engine);
     assert_result_error_with_message(
         Snapshot::builder_for(table_root).build(&engine),
         "lastManifestCommit version 5 exceeds commit version 2",
@@ -1419,16 +1403,13 @@ async fn replay_reads_the_files_a_compaction_hides(
     #[case] log: ReplayLog,
     #[case] expected: ReplayExpectation,
 ) {
-    assert_replay(&log, None, &expected, |store| {
-        SyncEngine::new_with_store(store)
-    })
-    .await;
+    assert_replay(&log, None, &expected, |engine| engine).await;
 }
 
 // Writes `contents` as a log compaction over versions `lo..=hi` and returns a segment that uses it.
 // Compaction listing is disabled, so the compaction is added to the segment by hand.
 async fn segment_with_compaction(
-    store: &InMemory,
+    store: &DynObjectStore,
     table_root: &Url,
     engine: &impl Engine,
     (lo, hi): (u64, u64),
@@ -1460,20 +1441,18 @@ async fn replayed_snapshot_serves_last_manifest_commit_without_reading_the_log(
     #[case] newest_commit: String,
     #[case] expected: Option<LastManifestCommit>,
 ) {
-    assert_snapshot_serves_last_manifest_commit(&newest_commit, expected, |store| {
-        SyncEngine::new_with_store(store)
-    })
-    .await;
+    assert_snapshot_serves_last_manifest_commit(&newest_commit, expected, |engine| engine).await;
 }
 
 #[cfg(feature = "declarative-plans")]
 async fn assert_snapshot_serves_last_manifest_commit<E: Engine>(
     newest_commit: &str,
     expected: Option<LastManifestCommit>,
-    make_engine: impl FnOnce(Arc<InMemory>) -> E,
+    map_engine: impl FnOnce(SyncEngine) -> E,
 ) {
-    let (store, table_root) = manifest_commit_table(&[newest_commit.to_string()]).await;
-    let engine = make_engine(store.clone());
+    let (engine, table_root) = manifest_commit_table(&[newest_commit.to_string()]).await;
+    let store = engine.store().clone();
+    let engine = map_engine(engine);
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
 
     store
@@ -1488,9 +1467,11 @@ async fn assert_snapshot_serves_last_manifest_commit<E: Engine>(
 // deleted, only that pointer can name the manifest commit.
 #[tokio::test]
 async fn post_commit_snapshot_follows_transaction_last_manifest_commit() {
-    let (store, table_root) = commit_table(&[checkpoint_commit(0, &[], one_column_schema())]).await;
-    put_crc_with_pointer(&store, 0, pointer(0, 0)).await;
-    let engine = non_plan_engine(store.clone());
+    let (engine, table_root) =
+        commit_table(&[checkpoint_commit(0, &[], one_column_schema())]).await;
+    put_crc_with_pointer(engine.store(), 0, pointer(0, 0)).await;
+    let store = engine.store().clone();
+    let engine = non_plan_engine(engine);
     let snapshot = Snapshot::builder_for(table_root.clone())
         .build(&engine)
         .unwrap();
@@ -1524,8 +1505,9 @@ async fn post_commit_snapshot_follows_transaction_last_manifest_commit() {
 async fn snapshot_with_crc_at_version_serves_last_manifest_commit_from_crc(
     #[case] crc_pointer: Option<LastManifestCommit>,
 ) {
-    let (store, table_root) = manifest_commit_table(&[commit_info(Some(pointer(0, 0)))]).await;
-    let engine = non_plan_engine(store.clone());
+    let (engine, table_root) = manifest_commit_table(&[commit_info(Some(pointer(0, 0)))]).await;
+    let store = engine.store().clone();
+    let engine = non_plan_engine(engine);
     let loaded = Snapshot::builder_for(table_root).build(&engine).unwrap();
     let expected = crc_pointer;
     let crc = Crc {
@@ -1560,11 +1542,11 @@ async fn snapshot_with_crc_at_version_serves_last_manifest_commit_from_crc(
 async fn snapshot_on_checkpoint_reads_last_manifest_commit_from_commit_file(
     #[case] delete_commit_file: bool,
 ) {
-    let (store, table_root) = manifest_commit_table(&[]).await;
-    put_pm_checkpoint(&store, 0).await;
-    let engine = SyncEngine::new_with_store(store.clone());
+    let (engine, table_root) = manifest_commit_table(&[]).await;
+    put_pm_checkpoint(engine.store(), 0).await;
     if delete_commit_file {
-        store
+        engine
+            .store()
             .delete(&delta_path_for_version(0, "json"))
             .await
             .unwrap();
@@ -1584,7 +1566,7 @@ async fn snapshot_on_checkpoint_reads_last_manifest_commit_from_commit_file(
 
 // Writes a parquet checkpoint at `version` holding only top-level protocol and metaData. Kernel
 // refuses to write a classic checkpoint on an adaptiveMetadata table, so it is written by hand.
-async fn put_pm_checkpoint(store: &Arc<InMemory>, version: u64) {
+async fn put_pm_checkpoint(store: &DynObjectStore, version: u64) {
     let rows = protocol_and_metadata_lines(one_column_schema(), &[]);
     add_checkpoint_to_store(
         store,
@@ -1596,7 +1578,7 @@ async fn put_pm_checkpoint(store: &Arc<InMemory>, version: u64) {
 }
 
 // Writes a CRC at `version` carrying `pointer` as its `lastManifestCommit`.
-async fn put_crc_with_pointer(store: &InMemory, version: u64, pointer: LastManifestCommit) {
+async fn put_crc_with_pointer(store: &DynObjectStore, version: u64, pointer: LastManifestCommit) {
     let config = adaptive_metadata_table_configuration(one_column_schema(), &[]);
     let crc = Crc {
         version,
