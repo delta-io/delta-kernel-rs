@@ -96,6 +96,9 @@ impl LogSegment {
         if !incremental_replay.should_advance(base.version, self.end_version)? {
             return Ok(None);
         }
+        // TODO(#3421): Classify required-commit gaps and replay-file failures during CRC
+        // advancement as Delta errors using the base and target versions, preserving the
+        // original error sources.
         let advanced = self.build_crc_from_base(engine, base)?;
         Ok(Some((
             Arc::new(advanced),

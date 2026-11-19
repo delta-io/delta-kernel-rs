@@ -5243,9 +5243,9 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "trybuild"
-version = "1.0.116"
+version = "1.0.119"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47c635f0191bd3a2941013e5062667100969f8c4e9cd787c14f977265d73616e"
+checksum = "4c5c9f7b7b1a048dd2bebdb7260b0cc71ec5587b19352fa5c3cd9e1c067103f0"
 dependencies = [
  "glob",
  "serde",
@@ -5308,6 +5308,7 @@ version = "0.1.0"
 dependencies = [
  "percent-encoding",
  "reqwest 0.13.2",
+ "rstest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -5315,6 +5316,7 @@ dependencies = [
  "tracing",
  "unity-catalog-delta-client-api",
  "url",
+ "wiremock",
 ]
 
 [[package]]

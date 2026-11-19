@@ -20,8 +20,8 @@
 //!
 //! ```no_run
 //! # use std::sync::Arc;
-//! # use delta_kernel::{Engine, KernelResult, SnapshotRef};
-//! # fn read(snapshot: SnapshotRef, engine: Arc<dyn Engine>) -> KernelResult<()> {
+//! # use delta_kernel::{Engine, Result, SnapshotRef};
+//! # fn read(snapshot: SnapshotRef, engine: Arc<dyn Engine>) -> Result<()> {
 //! let scan = snapshot.scan_builder().build()?;
 //! for batch in scan.execute(engine)? {
 //!     let batch = batch?;
@@ -82,8 +82,8 @@ use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{ExpressionTransform, SchemaTransform, transform_output_type};
 use crate::utils::{FoldWithOption as _, IteratorExt, require};
 use crate::{
-    Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator, SnapshotRef,
-    Version,
+    Engine, EngineData, Error, FileMeta, KernelError, KernelResult, KernelResultIterator, Result,
+    SnapshotRef, Version,
 };
 
 pub(crate) mod data_skipping;
@@ -398,6 +398,20 @@ impl StatsOptions {
     }
 }
 
+/// Where Kernel got a typed column in a [`ScanMetadata`] batch.
+///
+/// See [`ScanMetadata::partition_values_source`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParsedColumnSource {
+    /// Read from the checkpoint's own typed column. `TIMESTAMP` values are fixed instants that the
+    /// timezone setting does not change.
+    Checkpoint,
+    /// Built by Kernel from the raw action field. For partition values this is the
+    /// `add.partitionValues` string map, so offset-less `TIMESTAMP` values depend on
+    /// [`PartitionValuesOptions::with_timestamp_timezone`].
+    Derived,
+}
+
 /// Engine-facing partition value options. Pass to scan builders, such as [`ScanBuilder`] and
 /// [`crate::incremental_scan::IncrementalScanBuilder`], to control partition-column related
 /// behavior.
@@ -423,7 +437,7 @@ impl PartitionValuesOptions {
     /// `partitionColumns`.
     /// On non-partitioned tables the column is omitted. Values come directly from the checkpoint's
     /// native `partitionValues_parsed` column when present and compatible, otherwise from parsing
-    /// the string map.
+    /// the string map. [`ScanMetadata::partition_values_source`] reports which one a batch used.
     pub fn with_struct() -> Self {
         Self {
             parsed_struct: true,
@@ -436,8 +450,10 @@ impl PartitionValuesOptions {
     /// The provided timezone must match the timezone used to write those offset-less values.
     ///
     /// `timestamp_timezone` must be an IANA timezone identifier recognized by Kernel, a normalized
-    /// fixed offset in `+HH:MM[:SS]` or `-HH:MM[:SS]` form, or `Z` for UTC. An explicit offset in a
-    /// partition value takes precedence. This option applies to partition pruning in full and
+    /// fixed offset in `+HH:MM[:SS]` or `-HH:MM[:SS]` form, or `Z` for UTC. The exact uppercase IDs
+    /// `EST`, `MST`, and `HST` use fixed offsets `-05:00`, `-07:00`, and `-10:00`, respectively.
+    /// Full IANA region names preserve historical clock transitions. An explicit offset or timezone
+    /// in a partition value takes precedence. This option applies to partition pruning in full and
     /// incremental scans and to returned parsed partition values in full scans. It does not affect
     /// `TIMESTAMP_NTZ`.
     ///
@@ -656,7 +672,7 @@ impl ScanBuilder {
     /// [`Scan`] type itself can be used to fetch the files and associated metadata required to
     /// perform actual data reads.
     #[tracing::instrument(name = "scan_builder.build", skip_all, fields(enable_call_frame), err)]
-    pub fn build(self) -> KernelResult<Scan> {
+    pub fn build(self) -> Result<Scan> {
         // Predicates may reference columns outside self.logical_read_schema, so resolve against the
         // full table schema
         let table_schema = self.snapshot.schema();
@@ -665,10 +681,10 @@ impl ScanBuilder {
         // counts downstream and panics in the arrow layer. Users must populate the
         // schema with ALTER TABLE ADD COLUMN before scanning.
         if table_schema.num_fields() == 0 {
-            return Err(KernelError::generic(
+            return Err(Error::Kernel(KernelError::generic(
                 "Cannot scan Delta table with empty schema; use ALTER TABLE ADD COLUMN \
                  to add at least one column before scanning",
-            ));
+            )));
         }
 
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
@@ -919,9 +935,9 @@ pub fn get_transform_for_row(
     transforms.get(row).cloned().flatten()
 }
 
-/// [`ScanMetadata`] contains (1) a batch of [`FilteredEngineData`] specifying data files to be
-/// scanned and (2) a vector of transforms (one transform per scan file) that must be applied to the
-/// data read from those files.
+/// [`ScanMetadata`] contains a batch of [`FilteredEngineData`] specifying data files to be scanned,
+/// the transforms (one per scan file) that must be applied to the data read from those files, and
+/// the source of the batch's parsed partition values (see [`Self::partition_values_source`]).
 pub struct ScanMetadata {
     /// Filtered engine data with one row per file to scan (and only selected rows should be
     /// scanned)
@@ -945,17 +961,46 @@ pub struct ScanMetadata {
     /// Note: This vector can be indexed by row number, as rows masked by the selection vector will
     /// have corresponding entries that will be `None`.
     pub scan_file_transforms: Vec<Option<ExpressionRef>>,
+
+    /// Set by log replay from the evaluator that produced `scan_files`. See
+    /// [`Self::partition_values_source`].
+    partition_values_source: Option<ParsedColumnSource>,
 }
 
 impl ScanMetadata {
+    /// Where this batch's `partitionValues_parsed` column came from, or `None` when the batch has
+    /// no such column.
+    ///
+    /// On partitioned tables, Kernel emits the column when [`PartitionValuesOptions::with_struct`]
+    /// is set, or when the scan predicate references a partition column and stats are not skipped.
+    /// A batch never mixes sources: checkpoint batches report `Checkpoint` when the checkpoint has
+    /// a compatible native `partitionValues_parsed` column, and `Derived` otherwise; commit
+    /// batches always report `Derived`. `parallel_scan_metadata` always reports `Derived`.
+    /// `Scan::scan_metadata_from` reports `Derived` for the cached rows and later commits; when the
+    /// checkpoint is newer than `existing_version`, it falls back to a full scan that follows the
+    /// rules above.
+    ///
+    /// The emitted field set and its source depend on this scan's configuration: a predicate-only
+    /// scan can report `Checkpoint` for a file that a `with_struct` scan reports as `Derived`.
+    /// [`ParsedColumnSource::Checkpoint`] values are fixed instants;
+    /// [`ParsedColumnSource::Derived`] values of offset-less `TIMESTAMP` strings depend on
+    /// [`PartitionValuesOptions::with_timestamp_timezone`]. A connector that caches values across
+    /// timezones can reuse a cached `Checkpoint` value only when the current batch also reports
+    /// `Checkpoint` for the same emitted field set.
+    pub fn partition_values_source(&self) -> Option<ParsedColumnSource> {
+        self.partition_values_source
+    }
+
     fn try_new(
         data: Box<dyn EngineData>,
         selection_vector: Vec<bool>,
         scan_file_transforms: Vec<Option<ExpressionRef>>,
+        partition_values_source: Option<ParsedColumnSource>,
     ) -> KernelResult<Self> {
         Ok(Self {
             scan_files: FilteredEngineData::try_new(data, selection_vector)?,
             scan_file_transforms,
+            partition_values_source,
         })
     }
 }
@@ -1339,6 +1384,7 @@ impl Scan {
             meta_predicate,
             physical_stats_read_schema,
             None,
+            !self.snapshot.has_adaptive_metadata(),
         )?;
         // Only the cached suffix needs a kernel-side check. The engine owns cancellation for the
         // newly read action prefix.
@@ -1421,9 +1467,12 @@ impl Scan {
     #[cfg(feature = "declarative-plans")]
     /// Builds a declarative plan that produces the scan's live `add` actions.
     ///
-    /// `engine` supplies the plan executor used to inspect checkpoint shape unless a CRC at least
-    /// as new as the checkpoint provides `allFiles`. Returns `None` when no Delta metadata matches
-    /// this scan.
+    /// Planning shares cached checkpoint metadata with
+    /// [`crate::snapshot::SnapshotReader::get_checkpoint_info`], resolving the complete layout and
+    /// leaf schema on first use or waiting for in-progress resolution. Manifest plans use the
+    /// resolved sidecar list. A CRC at least as new as the checkpoint with `allFiles`, or a
+    /// statically empty scan, skips checkpoint discovery. Returns `None` when no Delta metadata
+    /// matches this scan.
     ///
     /// This method returns the metadata plan without executing it. A connector that consumes the
     /// resulting live `add` rows may run the plan through the generic
@@ -1468,8 +1517,8 @@ impl Scan {
         }
 
         let planner = scan_plan::MetadataPlanner::try_from_scan(self)?;
-        let base = scan_plan::MetadataReplayBase::try_new(&self.snapshot, engine, &planner)?;
-        self.build_metadata_scan_plan_with(base, &planner)
+        let base = scan_plan::MetadataReplayBase::try_new(&self.snapshot, engine)?;
+        self.build_metadata_scan_plan_with(base, planner)
     }
 
     #[cfg(feature = "declarative-plans")]
@@ -1487,6 +1536,14 @@ impl Scan {
             self.checkpoint_read_options();
         #[cfg(feature = "adaptive-metadata-in-dev")]
         if let Some(checkpoint) = self.snapshot.latest_checkpoint_action(engine)? {
+            // The scan's stats schema follows the snapshot's schema, which a later commit may have
+            // changed since the checkpoint's `content_stats` were written.
+            let stats_parsed = checkpoint.metadata().schema_string()
+                == self
+                    .snapshot
+                    .table_configuration()
+                    .metadata()
+                    .schema_string();
             return self
                 .snapshot
                 .log_segment()
@@ -1497,6 +1554,7 @@ impl Scan {
                     COMMIT_READ_SCHEMA.clone(),
                     checkpoint_schema,
                     physical_stats_read_schema,
+                    stats_parsed,
                 );
         }
         // Checkpoints already represent reconciled state, so scans project only Add actions. This
@@ -1513,6 +1571,7 @@ impl Scan {
                     .physical_partition_schema
                     .as_ref()
                     .map(|s| s.as_ref()),
+                !self.snapshot.has_adaptive_metadata(),
             )
     }
 
@@ -1705,6 +1764,7 @@ impl Scan {
             self.snapshot.log_segment(),
             engine.clone(),
             checkpoint_read_schema,
+            !self.snapshot.has_adaptive_metadata(),
         )?;
 
         Ok(SequentialScanMetadata::new(
@@ -1831,7 +1891,7 @@ impl Scan {
             // Iterator<Result<Iterator<Result<Box<dyn EngineData>>>>> to Iterator<Result<Result<Box<dyn EngineData>>>>
             .flatten_ok()
             // Iterator<Result<Result<Box<dyn EngineData>>>> to Iterator<Result<Box<dyn EngineData>>>
-            .map(Result::flatten);
+            .map(KernelResult::flatten);
         Ok(result)
     }
 }

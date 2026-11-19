@@ -428,6 +428,7 @@ void print_metric(MetricEvent event) {
     PM_SLICE(lslf, correlation_id);
     print_table_type(lslf.table_type);
     print_log_segment_load_type(lslf.load_type);
+    PM_U64(lslf, duration_ns);
     PM_END;
     return;
 
@@ -449,6 +450,7 @@ void print_metric(MetricEvent event) {
     PM_SLICE(pmlf, correlation_id);
     print_table_type(pmlf.table_type);
     print_log_segment_load_type(pmlf.load_type);
+    PM_U64(pmlf, duration_ns);
     PM_END;
     return;
 
@@ -471,6 +473,7 @@ void print_metric(MetricEvent event) {
     PM_SLICE(slf, correlation_id);
     print_table_type(slf.table_type);
     print_load_type(slf.load_type);
+    PM_U64(slf, duration_ns);
     PM_END;
     return;
 
@@ -554,12 +557,25 @@ void print_metric(MetricEvent event) {
   case MetricEventCheckpointWriteSuccess:
     PM_START(CheckpointWriteSuccess);
     CheckpointWriteSuccess cps = event.checkpoint_write_success;
+    PM_ID(cps, operation_id);
+    PM_U64(cps, version);
     printf("  outcome: %d,\n", cps.outcome.tag);
     PM_U64(cps, mode);
     PM_U64(cps, duration_ns);
+    PM_U64(cps.processing_stats, log_tail_input_duration_ns);
+    PM_U64(cps.processing_stats, checkpoint_input_duration_ns);
+    PM_U64(cps.processing_stats, reconciliation_duration_ns);
+    PM_U64(cps.processing_stats, stats_transform_duration_ns);
+    PM_U64(cps.processing_stats, output_preparation_duration_ns);
+    PM_U64(cps.processing_stats, num_actions_from_log_tail);
+    PM_U64(cps.processing_stats, num_actions_from_checkpoint);
+    PM_U64(cps.output_stats, parquet_write_duration_ns);
+    PM_U64(cps.output_stats, verification_duration_ns);
+    PM_U64(cps.output_stats, bytes_written);
+    PM_U64(cps.output_stats, num_sidecars_written);
     if (cps.outcome.tag == CheckpointWriteOutcomeWritten) {
       CheckpointWriteStats stats = cps.outcome.written.stats;
-      PM_U64(stats, bytes_written);
+      PM_U64(stats, size_in_bytes);
       PM_U64(stats, num_add_files);
       PM_U64(stats, num_remove_files);
       PM_U64(stats, num_actions);
@@ -571,8 +587,21 @@ void print_metric(MetricEvent event) {
   case MetricEventCheckpointWriteFailure:
     PM_START(CheckpointWriteFailure);
     CheckpointWriteFailure cpf = event.checkpoint_write_failure;
+    PM_ID(cpf, operation_id);
+    PM_U64(cpf, version);
     PM_U64(cpf, mode);
     PM_U64(cpf, duration_ns);
+    PM_U64(cpf.processing_stats, log_tail_input_duration_ns);
+    PM_U64(cpf.processing_stats, checkpoint_input_duration_ns);
+    PM_U64(cpf.processing_stats, reconciliation_duration_ns);
+    PM_U64(cpf.processing_stats, stats_transform_duration_ns);
+    PM_U64(cpf.processing_stats, output_preparation_duration_ns);
+    PM_U64(cpf.processing_stats, num_actions_from_log_tail);
+    PM_U64(cpf.processing_stats, num_actions_from_checkpoint);
+    PM_U64(cpf.output_stats, parquet_write_duration_ns);
+    PM_U64(cpf.output_stats, verification_duration_ns);
+    PM_U64(cpf.output_stats, bytes_written);
+    PM_U64(cpf.output_stats, num_sidecars_written);
     PM_END;
     return;
 
@@ -640,6 +669,21 @@ void print_metric(MetricEvent event) {
     PM_START(MetricEventStorageCopyCompleted);
     StorageCopyCompleted scc = event.storage_copy_completed;
     PM_U64(scc, duration_ns);
+    PM_END;
+    return;
+
+  case MetricEventLastCheckpointReadCompleted:
+    PM_START(LastCheckpointReadCompleted);
+    LastCheckpointReadCompleted hint = event.last_checkpoint_read_completed;
+    printf("  outcome:");
+    switch (hint.outcome) {
+    case LastCheckpointReadOutcomeSuccess: printf(" Success,\n"); break;
+    case LastCheckpointReadOutcomeNotFound: printf(" NotFound,\n"); break;
+    case LastCheckpointReadOutcomeInvalid: printf(" Invalid,\n"); break;
+    case LastCheckpointReadOutcomeError: printf(" Error,\n"); break;
+    case LastCheckpointReadOutcomeUnknown: printf(" Unknown,\n"); break;
+    }
+    PM_U64(hint, duration_ns);
     PM_END;
     return;
 

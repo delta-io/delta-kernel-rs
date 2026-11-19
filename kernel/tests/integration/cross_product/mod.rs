@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use delta_kernel::schema::MetadataColumnSpec;
 use delta_kernel::snapshot::ChecksumWriteResult;
-use delta_kernel::{Engine, KernelResult, Snapshot};
+use delta_kernel::{Engine, Result, Snapshot};
 use rstest::rstest;
 use rstest_reuse::apply;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
@@ -13,9 +13,10 @@ use test_utils::table_builder::{
     checkpoint_at_end_post_cleanup, checkpoint_mid, checkpoint_mid_crc_above_mid_post_cleanup,
     checkpoint_mid_crc_at_end_post_cleanup, checkpoint_mid_crc_at_mid_post_cleanup,
     checkpoint_mid_no_hint, checkpoint_mid_no_hint_post_cleanup, checkpoint_mid_post_cleanup,
-    clustered, commits_only, crc_at_end, crc_at_mid, no_checkpoint_stats, no_features,
-    num_indexed_cols_all, num_indexed_cols_narrow, num_indexed_cols_zero, partitioned,
-    stats_columns_empty, stats_columns_reordered, test_table, two_checkpoints_stale_hint,
+    clustered, commits_only, compaction_after_checkpoint, compaction_at_end, crc_at_end,
+    crc_at_mid, interior_compactions, no_checkpoint_stats, no_features, num_indexed_cols_all,
+    num_indexed_cols_narrow, num_indexed_cols_zero, partitioned, stats_columns_empty,
+    stats_columns_reordered, test_table, two_checkpoints_stale_hint,
     two_checkpoints_stale_hint_post_cleanup, unpartitioned, version_at_mid,
     version_at_timestamp_max, version_incremental_from_mid_to_latest,
     version_incremental_from_mid_to_pre_latest, version_latest, with_json_stats, with_struct_stats,
@@ -39,7 +40,7 @@ fn test_cross_product_read_write(
     feature_set: FeatureSet,
     layout_config: (DataLayoutConfig, TableConfig),
     version_target: VersionTarget,
-) -> KernelResult<()> {
+) -> Result<()> {
     let (data_layout, table_config) = layout_config;
     let table = test_table(log_state.clone(), feature_set, data_layout, table_config);
     let engine: Arc<dyn Engine> =
@@ -94,7 +95,7 @@ fn write_and_assert_checksum(
     log_state: &LogState,
     version: u64,
     engine: &dyn Engine,
-) -> KernelResult<()> {
+) -> Result<()> {
     let expected_result = if log_state.crcs_at().contains(&version) {
         ChecksumWriteResult::AlreadyExists
     } else {

@@ -116,6 +116,7 @@ pub(crate) fn is_io_event(event: &MetricEvent) -> bool {
         | MetricEvent::SetTransactionLoadFailure
         | MetricEvent::CrcReadSuccess(_)
         | MetricEvent::CrcReadFailure
+        | MetricEvent::LastCheckpointReadCompleted(_)
         | MetricEvent::ChecksumWriteSuccess(_)
         | MetricEvent::ChecksumWriteFailure(_)
         | MetricEvent::ScanMetadataCompleted(_) => false,
@@ -168,6 +169,55 @@ use crate::schema::{
 #[cfg(feature = "geo-type-in-dev")]
 use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType, PrimitiveType};
 
+/// Serializes actions in order as newline-delimited JSON without a trailing newline.
+///
+/// An empty iterator produces an empty string. Serialization failures panic as invalid test setup.
+pub(crate) fn serialize_actions(actions: impl IntoIterator<Item = Action>) -> String {
+    actions
+        .into_iter()
+        .map(|action| serde_json::to_string(&action).expect("serialize test log action"))
+        .join("\n")
+}
+
+/// Builds unpartitioned Parquet metadata with the supplied table ID, schema, and creation time.
+///
+/// Leaves the name and description absent, and the format options and configuration empty.
+pub(crate) fn metadata_action(id: &str, schema: &StructType, created_time: i64) -> Action {
+    Action::Metadata(Metadata::from_parts(
+        id.into(),
+        None,
+        None,
+        "parquet".into(),
+        HashMap::new(),
+        serde_json::to_string(schema).expect("serialize test metadata schema"),
+        vec![],
+        Some(created_time),
+        HashMap::new(),
+    ))
+}
+
+/// Create a simple Add action with the specified path (no stats)
+pub(crate) fn create_add_action(path: &str) -> Action {
+    Action::Add(Add {
+        path: path.into(),
+        data_change: true,
+        ..Default::default()
+    })
+}
+
+/// Create a Remove action with the specified path
+///
+/// The remove action has deletion_timestamp set to i64::MAX to ensure the
+/// remove action is not considered expired during testing.
+pub(crate) fn create_remove_action(path: &str) -> Action {
+    Action::Remove(Remove {
+        path: path.into(),
+        data_change: true,
+        deletion_timestamp: Some(i64::MAX), // Ensure the remove action is not expired
+        ..Default::default()
+    })
+}
+
 /// A mock table that writes commits to a local temporary delta log. This can be used to
 /// construct a delta log used for testing.
 pub(crate) struct LocalMockTable {
@@ -188,10 +238,7 @@ impl LocalMockTable {
     }
     /// Writes all `actions` to a new commit in the log
     pub(crate) async fn commit(&mut self, actions: impl IntoIterator<Item = Action>) {
-        let data = actions
-            .into_iter()
-            .map(|action| serde_json::to_string(&action).unwrap())
-            .join("\n");
+        let data = serialize_actions(actions);
 
         let path = delta_path_for_version(self.commit_num, "json");
         self.commit_num += 1;
@@ -474,6 +521,12 @@ pub(crate) mod adaptive_metadata_fixtures {
         ))
     }
 
+    /// The `lastManifestCommit` naming the manifest commit at `version` whose content root is at
+    /// `content_root_version`.
+    pub(crate) fn pointer(version: i64, content_root_version: i64) -> LastManifestCommit {
+        LastManifestCommit::new(version, content_root_version).unwrap()
+    }
+
     /// Writes `rows` (each a value of `schema`'s single action field) as the checkpoint sidecar
     /// `name` of the table at `table_root`.
     pub(crate) fn write_sidecar(
@@ -504,7 +557,7 @@ pub(crate) mod adaptive_metadata_fixtures {
 
     /// Creates an empty in-memory table and returns its engine and table-root URL.
     pub(crate) fn setup_table() -> Result<(SyncEngine, Url)> {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let schema = schema_ref! { nullable "id": INTEGER };
         let _ = create_table("memory:///", schema, "test", true)
             .build(&engine, Box::new(FileSystemCommitter::new()))?
@@ -666,10 +719,68 @@ pub(crate) mod adaptive_metadata_fixtures {
         write_commit(engine, table_root, version, parse_json_batch(lines)).unwrap();
     }
 
+    /// One commit of a [`table_with_commits`] table.
+    pub(crate) struct TestCommit {
+        add: &'static str,
+        content_root_version: Option<Version>,
+    }
+
+    impl TestCommit {
+        /// A commit that adds the file `path`.
+        pub(crate) fn add(path: &'static str) -> Self {
+            Self {
+                add: path,
+                content_root_version: None,
+            }
+        }
+
+        /// Makes this commit a manifest commit whose content root is at `content_root_version`.
+        pub(crate) fn manifest_commit(self, content_root_version: Version) -> Self {
+            Self {
+                content_root_version: Some(content_root_version),
+                ..self
+            }
+        }
+    }
+
+    /// An adaptiveMetadata table with `commits` written as versions 1 onward. Every commit from a
+    /// manifest commit on carries its `lastManifestCommit` pointer, as AMT writers do.
+    pub(crate) fn table_with_commits(commits: &[TestCommit]) -> (SyncEngine, Url) {
+        let (engine, table_root) = setup_adaptive_metadata_table();
+        let mut pointer = None;
+        for (commit, version) in commits.iter().zip(1..) {
+            let add = serde_json::json!({ "add": {
+                "path": commit.add,
+                "partitionValues": {},
+                "size": 1,
+                "modificationTime": 0,
+                "dataChange": true,
+            } });
+            let mut actions = add.to_string();
+            if let Some(content_root_version) = commit.content_root_version {
+                pointer = Some(
+                    LastManifestCommit::new(
+                        version_as_i64(version).unwrap(),
+                        version_as_i64(content_root_version).unwrap(),
+                    )
+                    .unwrap(),
+                );
+                let checkpoint = minimal_checkpoint_action(
+                    "_delta_log/_manifests/root.avro",
+                    content_root_version,
+                )
+                .unwrap();
+                actions = format!("{actions}\n{}", checkpoint_line(&checkpoint));
+            }
+            write_ict_commit(&engine, &table_root, version, pointer.as_ref(), &actions);
+        }
+        (engine, table_root)
+    }
+
     /// Creates an in-memory adaptiveMetadata table at version 0 and returns its engine and
     /// table-root URL.
     pub(crate) fn setup_adaptive_metadata_table() -> (SyncEngine, Url) {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let table_root = Url::parse("memory:///").unwrap();
         create_adaptive_metadata_table(&engine, &table_root, &[]);
         (engine, table_root)
@@ -940,7 +1051,7 @@ impl MockTableConfigurationBuilder {
         self.try_build().unwrap()
     }
 
-    pub(crate) fn try_build(self) -> KernelResult<TableConfiguration> {
+    pub(crate) fn try_build(self) -> Result<TableConfiguration> {
         let schema = self
             .schema
             .unwrap_or_else(|| schema_ref! { nullable "value": INTEGER });
@@ -1599,7 +1710,7 @@ pub(crate) fn test_deep_nested_schema_missing_leaf_cm() -> StructType {
 pub(crate) fn setup_column_mapping_txn(
     schema: SchemaRef,
     mode: ColumnMappingMode,
-) -> KernelResult<(Arc<dyn Engine>, Transaction<CreateTable>)> {
+) -> Result<(Arc<dyn Engine>, Transaction<CreateTable>)> {
     let mode_str = match mode {
         ColumnMappingMode::Name => "name",
         ColumnMappingMode::Id => "id",

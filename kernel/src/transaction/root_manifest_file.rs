@@ -3,12 +3,11 @@
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::visitors::SetTransactionMap;
 use crate::actions::{CheckpointAction, ContentRoot, DomainMetadata, SetTransaction};
-use crate::crc::{DomainMetadataState, SetTransactionState, merge_domain_metadata};
+use crate::crc::merge_domain_metadata;
 use crate::error::KernelError;
 use crate::log_segment::DomainMetadataMap;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
-use crate::utils::require;
 use crate::{Engine, FileMeta, KernelResult, Version, version_as_i64};
 
 /// A pointer to an on-disk root manifest file to be committed as the table's content root via a
@@ -82,69 +81,10 @@ impl RootManifestFile {
         engine: &dyn Engine,
     ) -> KernelResult<(DomainMetadataMap, SetTransactionMap)> {
         let snapshot = self.read_snapshot.as_ref();
-        let crc = snapshot.crc_at_version();
-        let domain_metadata_complete_in_crc = matches!(
-            crc.map(|crc| &crc.domain_metadata_state),
-            Some(DomainMetadataState::Complete(_))
-        );
-        let transactions_complete_in_crc = matches!(
-            crc.map(|crc| &crc.set_transaction_state),
-            Some(SetTransactionState::Complete(_))
-        );
-
-        let checkpoint_action = snapshot.latest_checkpoint_action(engine)?;
-
-        // Reject a checkpoint that spilled txns/domain metadata to sidecars, since sidecars aren't
-        // read yet and that state would be lost.
-        if let Some(checkpoint) = &checkpoint_action {
-            require!(
-                checkpoint.txn_sidecars.is_empty()
-                    && checkpoint.domain_metadata_sidecars.is_empty(),
-                KernelError::generic(
-                    "root manifest file commit cannot yet replace a checkpoint that spills txns \
-                     or domain metadata to sidecars"
-                )
-            );
-        }
-
-        let read_snapshot_version = version_as_i64(snapshot.version())?;
-        let no_log_commits_since_checkpoint = checkpoint_action
-            .as_ref()
-            .is_some_and(|c| c.version() == read_snapshot_version);
-
-        let domain_metadata = match &checkpoint_action {
-            Some(checkpoint)
-                if no_log_commits_since_checkpoint && !domain_metadata_complete_in_crc =>
-            {
-                let mut domain_metadata = DomainMetadataMap::new();
-                merge_domain_metadata(
-                    &mut domain_metadata,
-                    checkpoint
-                        .domain_metadata
-                        .iter()
-                        .cloned()
-                        .map(|dm| (dm.domain().to_string(), dm)),
-                );
-                domain_metadata
-            }
-            _ => snapshot
-                .reader()
-                .get_domain_metadatas_internal(engine, None)?,
-        };
-        let transactions = match &checkpoint_action {
-            Some(checkpoint)
-                if no_log_commits_since_checkpoint && !transactions_complete_in_crc =>
-            {
-                checkpoint
-                    .transactions
-                    .iter()
-                    .cloned()
-                    .map(|txn| (txn.app_id.clone(), txn))
-                    .collect()
-            }
-            _ => snapshot.get_app_id_versions(engine)?,
-        };
-
+        let domain_metadata = snapshot
+            .reader()
+            .get_domain_metadatas_internal(engine, None)?;
+        let transactions = snapshot.get_app_id_versions(engine)?;
         Ok((domain_metadata, transactions))
     }
 }
@@ -159,20 +99,18 @@ mod tests {
 
     use super::*;
     use crate::actions::{
-        LOG_DOMAIN_METADATA_SCHEMA, LOG_TXN_SCHEMA, METADATA_NAME, PROTOCOL_NAME, Sidecar,
-        get_commit_schema,
+        LOG_DOMAIN_METADATA_SCHEMA, LOG_TXN_SCHEMA, METADATA_NAME, PROTOCOL_NAME, get_commit_schema,
     };
     use crate::committer::FileSystemCommitter;
     use crate::crc::{Crc, DomainMetadataState, SetTransactionState};
     use crate::engine::sync::SyncEngine;
-    use crate::object_store::memory::InMemory;
     use crate::schema::schema_ref;
     use crate::snapshot::Snapshot;
     use crate::transaction::create_table::create_table;
     use crate::unit_test_utils::adaptive_metadata_fixtures::{
         adaptive_metadata_protocol_and_metadata, domain, domain_metadata_line,
         minimal_checkpoint_action, setup_table, txn_line, write_commit,
-        write_commit_after_manifest_commit, write_manifest_commit,
+        write_commit_after_manifest_commit, write_manifest_commit, write_sidecar,
     };
     use crate::unit_test_utils::{
         MockTableConfigurationBuilder, assert_result_error_with_message, parse_json_batch,
@@ -495,7 +433,7 @@ mod tests {
 
     #[test]
     fn new_preserves_an_absolute_file_location() -> Result<()> {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let schema = schema_ref! { nullable "id": INTEGER };
         let _ = create_table("memory:///t/", schema, "test", true)
             .build(&engine, Box::new(FileSystemCommitter::new()))?
@@ -508,10 +446,9 @@ mod tests {
         Ok(())
     }
 
-    // A checkpoint holds complete state, so its inline entries win and stale top-level entries
-    // from before it are ignored.
+    // A checkpoint holds complete state, so top-level entries from commits before it are ignored.
     #[test]
-    fn scan_non_content_metadata_prefers_checkpoint_inline_over_stale_top_level() -> Result<()> {
+    fn scan_non_content_metadata_ignores_top_level_entries_before_checkpoint() -> Result<()> {
         let (engine, table_root) = setup_table()?;
         let write = |version, data| write_commit(&engine, &table_root, version, data);
 
@@ -592,10 +529,10 @@ mod tests {
         Ok(())
     }
 
-    // The existing checkpoint spilled txns/domain metadata into sidecar files that can't be read
-    // yet; replacing it would drop that state, so the commit is refused.
+    // The existing checkpoint's txns and domain metadata spilled to sidecars are carried into the
+    // replacing checkpoint inline.
     #[test]
-    fn compute_checkpoint_action_rejects_a_checkpoint_that_spills_to_sidecars() -> Result<()> {
+    fn compute_checkpoint_action_folds_a_checkpoint_that_spills_to_sidecars() -> Result<()> {
         let (engine, table_root) = setup_table()?;
         let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
         let mut existing = CheckpointAction::new(
@@ -606,14 +543,22 @@ mod tests {
             vec![],
             vec![],
         );
-        let sidecar = || Sidecar {
-            path: "sidecar.parquet".to_string(),
-            size_in_bytes: 1024,
-            modification_time: 0,
-            tags: None,
-        };
-        existing.txn_sidecars = vec![sidecar()];
-        existing.domain_metadata_sidecars = vec![sidecar()];
+        let transaction = SetTransaction::new("app-1".to_string(), 5, None);
+        let domain = DomainMetadata::new("test.domain".to_string(), "{}".to_string());
+        existing.txn_sidecars = vec![write_sidecar(
+            &engine,
+            &table_root,
+            "txn.parquet",
+            LOG_TXN_SCHEMA.clone(),
+            vec![transaction.clone().into()],
+        )];
+        existing.domain_metadata_sidecars = vec![write_sidecar(
+            &engine,
+            &table_root,
+            "domains.parquet",
+            LOG_DOMAIN_METADATA_SCHEMA.clone(),
+            vec![domain.clone().into()],
+        )];
         write_manifest_commit(&engine, &table_root, 1, existing)?;
 
         let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
@@ -624,14 +569,17 @@ mod tests {
             snapshot.clone(),
         );
 
-        let result = manifest.compute_checkpoint_action(
+        let checkpoint = manifest.compute_checkpoint_action(
             &engine,
             2,
             snapshot.table_configuration(),
             &[],
             &[],
-        );
-        assert_result_error_with_message(result, "spills txns or domain metadata to sidecars");
+        )?;
+        assert_eq!(checkpoint.transactions, [transaction]);
+        assert_eq!(checkpoint.domain_metadata, [domain]);
+        assert!(checkpoint.txn_sidecars.is_empty());
+        assert!(checkpoint.domain_metadata_sidecars.is_empty());
         Ok(())
     }
 
@@ -640,7 +588,7 @@ mod tests {
     // on, the `lastManifestCommit` that locates the checkpoint action, as an AMT writer does.
     #[test]
     fn scan_non_content_metadata_uses_crc_fast_path_with_existing_checkpoint() -> Result<()> {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let table_root = url::Url::parse("memory:///").map_err(KernelError::from)?;
         let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
         let commit_info = |ict: i64, last_manifest_commit: Option<i64>| {

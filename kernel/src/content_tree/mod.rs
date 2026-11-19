@@ -41,6 +41,8 @@ pub(crate) const SORT_ORDER_ID: &str = "sortOrderId";
 pub(crate) const RECORD_COUNT: &str = "recordCount";
 pub(crate) const FILE_SIZE_IN_BYTES: &str = "fileSizeInBytes";
 pub(crate) const CONTENT_STATS_FIELD_NAME: &str = "content_stats";
+/// Parquet field ID of [`ContentTreeNodeEntry::content_stats`], matching its `#[field_id]`.
+const CONTENT_STATS_FIELD_ID: i32 = 146;
 pub(crate) const TIGHT_STATS: &str = "tightStats";
 pub(crate) const MANIFEST_INFO: &str = "manifestInfo";
 pub(crate) const KEY_METADATA: &str = "keyMetadata";
@@ -263,7 +265,7 @@ pub(super) struct ContentTreeNodeEntry {
 
     /// Partition data tuple, schema based on the partition spec. Required (non-nullable)
     /// when present in the schema. The schema is dynamically generated based on the
-    /// partition spec via [`Self::to_schema_with_content_stats`]. When `None` in Rust,
+    /// partition spec. When `None` in Rust,
     /// a struct with null-valued fields is produced during serialization.
     #[skip_schema]
     #[field_id = 102]
@@ -333,6 +335,22 @@ pub(super) struct ContentTreeNodeEntry {
     /// TODO: assign a Parquet field ID dynamically based on Iceberg expressions once they are
     /// supported in the AMF spec.
     pub(crate) tags: Option<HashMap<String, Option<String>>>,
+}
+
+impl ContentTreeNodeEntry {
+    /// The entry schema ([`Self::to_schema`]) followed by the nullable `content_stats` column when
+    /// `content_stats` (the per-leaf stats struct, see [`stats`]) is given.
+    pub(crate) fn to_schema_with_content_stats(content_stats: Option<StructType>) -> StructType {
+        let content_stats = content_stats.map(|stats| {
+            stats::field_with_id(
+                CONTENT_STATS_FIELD_NAME,
+                stats.into(),
+                true,
+                CONTENT_STATS_FIELD_ID,
+            )
+        });
+        StructType::new_unchecked(Self::to_schema().into_fields().chain(content_stats))
+    }
 }
 
 /// A file storing the values of some fields for each row of another file, used by column updates.
@@ -700,7 +718,7 @@ mod tests {
     /// The AMT struct Parquet field IDs and nullability are a protocol contract with the Iceberg v4
     /// spec. This pins the name, field ID, and nullability of every field in each `to_schema()`, in
     /// order, so an accidental change fails loudly. `partition` and `content_stats` are
-    /// `#[skip_schema]` and only appear in `to_schema_with_content_stats`, so they are absent here.
+    /// `#[skip_schema]`, so they are absent here.
     /// `tags` is a Delta extension with no field ID (matched by name).
     #[rstest]
     #[case::content_tree_node_entry(ContentTreeNodeEntry::to_schema(), &[
@@ -783,5 +801,26 @@ mod tests {
                 "field id mismatch for {name}",
             );
         }
+    }
+
+    /// Like [`amt_schema_field_contract`], pins the `content_stats` column appended to the entry
+    /// schema.
+    #[rstest]
+    fn to_schema_with_content_stats_appends_content_stats(#[values(false, true)] with_stats: bool) {
+        let stats = StructType::new_unchecked([StructField::nullable("x", DataType::LONG)]);
+        let schema =
+            ContentTreeNodeEntry::to_schema_with_content_stats(with_stats.then(|| stats.clone()));
+
+        let entry = ContentTreeNodeEntry::to_schema();
+        let fields: Vec<_> = schema.fields().collect();
+        let (entry_fields, content_stats) = fields.split_at(entry.num_fields());
+        assert_eq!(entry_fields, entry.fields().collect::<Vec<_>>());
+        let expected = with_stats.then(|| {
+            StructField::nullable(CONTENT_STATS_FIELD_NAME, stats).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(146),
+            )])
+        });
+        assert_eq!(content_stats.first().copied(), expected.as_ref());
     }
 }

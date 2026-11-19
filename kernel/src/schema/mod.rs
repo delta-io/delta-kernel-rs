@@ -56,21 +56,15 @@ pub(crate) mod variant_utils;
 pub(crate) mod void_utils;
 
 /// Prefix of the error message the schema deserializers emit for an unsupported type.
-const UNSUPPORTED_DELTA_TYPE_ERROR_PREFIX: &str = "Unsupported Delta table type";
+pub(crate) const UNSUPPORTED_DELTA_TYPE_ERROR_PREFIX: &str = "Unsupported Delta table type";
 
-/// Builds the serde custom error for a Delta type the kernel does not support. Pairs with
-/// [`is_unsupported_delta_type_error`] for detecting whether a serde error is this kind.
+/// Prefix of the schema error for case-insensitive duplicate logical field names.
+pub(crate) const DUPLICATE_FIELD_NAME_ERROR_PREFIX: &str =
+    "Duplicate field name (case-insensitive)";
+
+/// Builds the serde custom error for a Delta type the kernel does not support.
 fn unsupported_delta_type_error<E: serde::de::Error>(name: &str) -> E {
     E::custom(format!("{UNSUPPORTED_DELTA_TYPE_ERROR_PREFIX}: '{name}'"))
-}
-
-/// Returns `true` if `error` is the "unsupported Delta type" failure produced by
-/// `unsupported_delta_type_error`.
-pub(crate) fn is_unsupported_delta_type_error(error: &serde_json::Error) -> bool {
-    error.is_data()
-        && error
-            .to_string()
-            .starts_with(UNSUPPORTED_DELTA_TYPE_ERROR_PREFIX)
 }
 
 pub type Schema = StructType;
@@ -369,16 +363,17 @@ impl FromStr for MetadataColumnSpec {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
+/// A schema field with its data type, nullability, and column annotations.
+#[derive(Debug, Serialize, PartialEq, Clone, Eq)]
 pub struct StructField {
     /// Name of this (possibly nested) column
     pub name: String,
     /// The data type of this field
     #[serde(rename = "type")]
     pub data_type: DataType,
-    /// Denotes whether this Field can be null
+    /// Whether values may be null. Defaults to true when both this key and metadata are omitted.
     pub nullable: bool,
-    /// A JSON map containing information about this column
+    /// Column annotations, defaulting to an empty map when omitted from JSON.
     pub metadata: HashMap<MetadataKey, MetadataValue>,
 }
 
@@ -855,14 +850,14 @@ impl Display for StructField {
 
 /// A struct is used to represent both the top-level schema of the table
 /// as well as struct columns that contain nested columns.
-#[derive(Debug, PartialEq, Clone, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct StructType {
     type_name: String,
-    /// The fields stored in this struct
+    /// Fields are Arc-wrapped so schema subsets can share them.
     // We use indexmap to preserve the order of fields as they are defined in the schema
     // while also allowing for fast lookup by name. The alternative is to do a linear search
     // for each field by name would be potentially quite expensive for large schemas.
-    fields: IndexMap<String, StructField>,
+    fields: IndexMap<String, Arc<StructField>>,
     /// The metadata columns in this struct
     // We use a dedicated map for metadata columns to allow for fast lookup without having to
     // iterate over all fields.
@@ -871,6 +866,21 @@ pub struct StructType {
 
 pub struct StructTypeBuilder {
     fields: IndexMap<String, StructField>,
+}
+
+impl Clone for StructType {
+    // Preserve deep-copy behavior; only share_selected_fields shares fields between schemas.
+    fn clone(&self) -> Self {
+        Self {
+            type_name: self.type_name.clone(),
+            fields: self
+                .fields
+                .iter()
+                .map(|(name, field)| (name.clone(), Arc::new(field.as_ref().clone())))
+                .collect(),
+            metadata_columns: self.metadata_columns.clone(),
+        }
+    }
 }
 
 impl Default for StructTypeBuilder {
@@ -888,7 +898,10 @@ impl StructTypeBuilder {
 
     pub fn from_schema(schema: &StructType) -> Self {
         Self {
-            fields: schema.fields.clone(),
+            fields: schema
+                .fields()
+                .map(|field| (field.name.clone(), field.clone()))
+                .collect(),
         }
     }
 
@@ -907,6 +920,30 @@ impl StructTypeBuilder {
 }
 
 impl StructType {
+    /// Returns a subset whose retained fields share storage with this already-valid schema.
+    ///
+    /// Calls `keep` once per field in schema order, preserves that order, and rebuilds metadata
+    /// column indexes without revalidating fields. Mutable access must use copy-on-write to avoid
+    /// changing fields in the source schema.
+    pub(crate) fn share_selected_fields(&self, mut keep: impl FnMut(&StructField) -> bool) -> Self {
+        let fields: IndexMap<_, _> = self
+            .fields
+            .iter()
+            .filter(|(_, field)| keep(field))
+            .map(|(name, field)| (name.clone(), field.clone()))
+            .collect();
+        let metadata_columns = fields
+            .values()
+            .enumerate()
+            .filter_map(|(index, field)| field.get_metadata_column_spec().map(|spec| (spec, index)))
+            .collect();
+        Self {
+            type_name: self.type_name.clone(),
+            fields,
+            metadata_columns,
+        }
+    }
+
     /// Creates a new [`StructType`] from the given fields.
     ///
     /// Returns an error if:
@@ -940,12 +977,12 @@ impl StructType {
             let key = field.name.to_lowercase();
             if !seen_lowercase_names.insert(key) {
                 return Err(KernelError::schema(format!(
-                    "Duplicate field name (case-insensitive): '{}'",
+                    "{DUPLICATE_FIELD_NAME_ERROR_PREFIX}: '{}'",
                     field.name
                 )));
             }
 
-            field_map.insert(field.name.clone(), field);
+            field_map.insert(field.name.clone(), Arc::new(field));
         }
 
         Ok(Self {
@@ -985,7 +1022,7 @@ impl StructType {
             if let Some(metadata_column_spec) = field.get_metadata_column_spec() {
                 metadata_columns.insert(metadata_column_spec, i);
             }
-            field_map.insert(field.name.clone(), field);
+            field_map.insert(field.name.clone(), Arc::new(field));
         }
 
         Self {
@@ -1002,7 +1039,7 @@ impl StructType {
         let fields = names.iter().map(|name| {
             self.fields
                 .get(name.as_ref())
-                .cloned()
+                .map(|field| field.as_ref().clone())
                 .ok_or_else(|| KernelError::missing_column(name.as_ref()))
         });
         Self::try_from_results(fields)
@@ -1018,7 +1055,7 @@ impl StructType {
 
     /// Adds fields to this [`StructType`], returning a new [`StructType`].
     pub fn add(&self, fields: impl IntoIterator<Item = StructField>) -> KernelResult<Self> {
-        Self::try_new(self.fields.values().cloned().chain(fields))
+        Self::try_new(self.fields().cloned().chain(fields))
     }
 
     /// Adds a predefined metadata column to this [`StructType`], returning a new [`StructType`].
@@ -1052,7 +1089,7 @@ impl StructType {
 
     /// Gets the field with the given name.
     pub fn field(&self, name: impl AsRef<str>) -> Option<&StructField> {
-        self.fields.get(name.as_ref())
+        self.fields.get(name.as_ref()).map(Arc::as_ref)
     }
 
     /// Retrieves the nested field named by the given column path.
@@ -1146,31 +1183,33 @@ impl StructType {
     pub fn field_with_index(&self, name: impl AsRef<str>) -> Option<(usize, &StructField)> {
         self.fields
             .get_full(name.as_ref())
-            .map(|(index, _, field)| (index, field))
+            .map(|(index, _, field)| (index, field.as_ref()))
     }
 
     /// Gets the field at the given index.
     pub fn field_at_index(&self, index: usize) -> Option<&StructField> {
-        self.fields.get_index(index).map(|(_, field)| field)
+        self.fields
+            .get_index(index)
+            .map(|(_, field)| field.as_ref())
     }
 
     /// Gets a reference to all the fields in this struct type.
     pub fn fields(
         &self,
     ) -> impl ExactSizeIterator<Item = &StructField> + DoubleEndedIterator + FusedIterator {
-        self.fields.values()
+        self.fields.values().map(Arc::as_ref)
     }
 
     /// Gets an iterator over all the fields in this struct type.
     pub fn into_fields(
         self,
     ) -> impl ExactSizeIterator<Item = StructField> + DoubleEndedIterator + FusedIterator {
-        self.fields.into_values()
+        self.fields.into_values().map(Arc::unwrap_or_clone)
     }
 
     /// Gets a mutable reference to the underlying field map.
     #[internal_api]
-    pub(crate) fn field_map_mut(&mut self) -> &mut IndexMap<String, StructField> {
+    pub(crate) fn field_map_mut(&mut self) -> &mut IndexMap<String, Arc<StructField>> {
         &mut self.fields
     }
 
@@ -1258,14 +1297,14 @@ impl StructType {
     pub fn metadata_column(&self, spec: &MetadataColumnSpec) -> Option<&StructField> {
         self.metadata_columns
             .get(spec)
-            .and_then(|index| self.fields.get_index(*index).map(|(_, field)| field))
+            .and_then(|index| self.field_at_index(*index))
     }
 
     /// Gets an iterator over all the metadata columns in this struct type.
     pub fn metadata_columns(&self) -> impl Iterator<Item = &StructField> {
         self.metadata_columns
             .values()
-            .filter_map(|index| self.fields.get_index(*index).map(|(_, field)| field))
+            .filter_map(|index| self.field_at_index(*index))
     }
 
     /// Extracts the name and type of all leaf columns, in schema order. Caller should pass Some
@@ -1288,6 +1327,7 @@ impl StructType {
     ///
     /// Uses a single transformer so duplicate column mapping IDs are detected across all
     /// fields in this struct, not just within each field's subtree.
+    #[allow(unused)]
     #[internal_api]
     pub(crate) fn make_physical(
         &self,
@@ -1295,6 +1335,16 @@ impl StructType {
     ) -> KernelResult<Self> {
         let mut transformer = MakePhysical::new(column_mapping_mode);
         transformer.transform_struct(self).map(|s| s.into_owned())
+    }
+
+    /// Materialize physical names and metadata after read-path column mapping validation.
+    ///
+    /// [`MakePhysical::validate_read_column_mapping`] must have succeeded for this schema and
+    /// `mode`, and both must remain unchanged after validation.
+    pub(crate) fn make_validated_physical(&self, mode: ColumnMappingMode) -> Self {
+        MaterializePhysical(mode)
+            .transform_struct(self)
+            .into_owned()
     }
 
     /// Validates that there are no metadata columns in the given fields.
@@ -1468,14 +1518,14 @@ impl<'a> IntoIterator for &'a StructType {
 /// [`IndexMap`]: indexmap::IndexMap
 #[derive(Debug)]
 pub struct StructFieldIntoIter {
-    inner: indexmap::map::IntoValues<String, StructField>,
+    inner: indexmap::map::IntoValues<String, Arc<StructField>>,
 }
 
 impl Iterator for StructFieldIntoIter {
     type Item = StructField;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
+        self.inner.next().map(Arc::unwrap_or_clone)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -1487,11 +1537,11 @@ impl Iterator for StructFieldIntoIter {
     }
 
     fn last(self) -> Option<Self::Item> {
-        self.inner.last()
+        self.inner.last().map(Arc::unwrap_or_clone)
     }
 
     fn nth(&mut self, n: usize) -> Option<Self::Item> {
-        self.inner.nth(n)
+        self.inner.nth(n).map(Arc::unwrap_or_clone)
     }
 }
 
@@ -1505,7 +1555,7 @@ impl FusedIterator for StructFieldIntoIter {}
 
 impl DoubleEndedIterator for StructFieldIntoIter {
     fn next_back(&mut self) -> Option<Self::Item> {
-        self.inner.next_back()
+        self.inner.next_back().map(Arc::unwrap_or_clone)
     }
 }
 
@@ -1550,14 +1600,14 @@ impl DoubleEndedIterator for StructFieldIntoIter {
 /// [`IndexMap`]: indexmap::IndexMap
 #[derive(Debug, Clone)]
 pub struct StructFieldRefIter<'a> {
-    inner: indexmap::map::Values<'a, String, StructField>,
+    inner: indexmap::map::Values<'a, String, Arc<StructField>>,
 }
 
 impl<'a> Iterator for StructFieldRefIter<'a> {
     type Item = &'a StructField;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
+        self.inner.next().map(Arc::as_ref)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -1575,7 +1625,7 @@ impl FusedIterator for StructFieldRefIter<'_> {}
 
 impl DoubleEndedIterator for StructFieldRefIter<'_> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        self.inner.next_back()
+        self.inner.next_back().map(Arc::as_ref)
     }
 }
 
@@ -1690,6 +1740,53 @@ impl ColumnNamesAndTypes {
     }
 }
 
+// Spark 4.x accepts omitted metadata, but defaults nullability only when both keys are omitted.
+// These coupled defaults require custom deserialization for direct and nested schema fields.
+impl<'de> Deserialize<'de> for StructField {
+    fn deserialize<D>(deserializer: D) -> KernelResult<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let field = StructFieldDeHelper::deserialize(deserializer)?;
+        let nullable = match field.nullable {
+            Some(nullable) => nullable,
+            None if field.metadata.is_none() => true,
+            None => return Err(serde::de::Error::missing_field("nullable")),
+        };
+        Ok(Self {
+            name: field.name,
+            data_type: field.data_type,
+            nullable,
+            metadata: field.metadata.unwrap_or_default(),
+        })
+    }
+}
+
+/// Retains key presence: an explicit empty metadata object still requires `nullable`, while omitted
+/// metadata allows an omitted `nullable` to default to true.
+#[derive(Deserialize)]
+struct StructFieldDeHelper {
+    name: String,
+    #[serde(rename = "type")]
+    data_type: DataType,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    nullable: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    metadata: Option<HashMap<MetadataKey, MetadataValue>>,
+}
+
+/// Keeps omission distinct from explicit null by deserializing supplied values as their concrete
+/// type.
+///
+/// Option's default deserializer would let null booleans or maps take the omission defaults.
+fn deserialize_present<'de, D, T>(deserializer: D) -> KernelResult<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StructTypeSerDeHelper {
@@ -1705,7 +1802,7 @@ impl Serialize for StructType {
     {
         StructTypeSerDeHelper {
             type_name: self.type_name.clone(),
-            fields: self.fields.values().cloned().collect(),
+            fields: self.fields().cloned().collect(),
         }
         .serialize(serializer)
     }
@@ -2687,14 +2784,16 @@ impl DataType {
                 ("value", DataType::Map(map)) => &mut map.value_type,
                 (name, DataType::Struct(parent)) => {
                     let lowered = name.to_lowercase();
-                    &mut parent
-                        .field_map_mut()
-                        .values_mut()
-                        .find(|field| field.name().to_lowercase() == lowered)
-                        .ok_or_else(|| {
-                            KernelError::schema(format!("field '{name}' does not exist"))
-                        })?
-                        .data_type
+                    &mut Arc::make_mut(
+                        parent
+                            .field_map_mut()
+                            .values_mut()
+                            .find(|field| field.name().to_lowercase() == lowered)
+                            .ok_or_else(|| {
+                                KernelError::schema(format!("field '{name}' does not exist"))
+                            })?,
+                    )
+                    .data_type
                 }
                 (segment, data_type) => {
                     return Err(KernelError::schema(format!(
@@ -2903,7 +3002,7 @@ impl<'a> SchemaTransform<'a> for GetSchemaLeaves {
     }
 }
 
-/// What a [`MakePhysical`] walk does with each field. The two modes bundle the physical-rewrite
+/// What a [`MakePhysical`] walk does with each field. The modes bundle the physical-rewrite
 /// behavior with the matching treatment of a stale `delta.columnMapping.*` annotation left over on
 /// a mapping-disabled table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2912,6 +3011,8 @@ enum MakePhysicalMode {
     /// annotation in `None` mode is tolerated: resolved by logical name and dropped from the
     /// physical metadata.
     Rewrite,
+    /// Validate read-path annotations without constructing a physical schema.
+    ValidateRead,
     /// Validate annotations only, without rewriting (the strict write-path check). A stale
     /// annotation in `None` mode is rejected.
     ValidateStrict,
@@ -2920,7 +3021,7 @@ enum MakePhysicalMode {
 impl MakePhysicalMode {
     fn stale_annotation_policy(self) -> StaleAnnotationPolicy {
         match self {
-            Self::Rewrite => StaleAnnotationPolicy::Ignore,
+            Self::Rewrite | Self::ValidateRead => StaleAnnotationPolicy::Ignore,
             Self::ValidateStrict => StaleAnnotationPolicy::Reject,
         }
     }
@@ -2953,6 +3054,18 @@ impl<'a> MakePhysical<'a> {
         }
     }
 
+    /// Apply the same annotation checks as physical rewriting, without copying the schema.
+    pub(crate) fn validate_read_column_mapping(
+        mode: ColumnMappingMode,
+        schema: &'a StructType,
+    ) -> KernelResult<()> {
+        let mut walker = Self {
+            mode: MakePhysicalMode::ValidateRead,
+            ..Self::new(mode)
+        };
+        walker.transform_struct(schema).map(|_| ())
+    }
+
     /// Walks `schema` and validates its column-mapping annotations, rejecting stale annotations
     /// left over on a column-mapping-disabled table.
     pub(crate) fn validate_schema_column_mapping(
@@ -2982,7 +3095,14 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
 
     fn transform_struct(&mut self, stype: &'a StructType) -> KernelResult<Cow<'a, StructType>> {
         self.sibling_names_stack.push(HashMap::new());
-        let result = self.recurse_into_struct(stype);
+        let result = if self.mode == MakePhysicalMode::Rewrite {
+            self.recurse_into_struct(stype)
+        } else {
+            stype
+                .fields()
+                .try_for_each(|field| self.transform_struct_field(field).map(|_| ()))
+                .map(|()| Cow::Borrowed(stype))
+        };
         self.sibling_names_stack.pop();
         result
     }
@@ -3014,7 +3134,7 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
         }
 
         self.transform_inner(field.name(), |this| {
-            if this.mode == MakePhysicalMode::ValidateStrict {
+            if this.mode != MakePhysicalMode::Rewrite {
                 return this.recurse_into_struct_field(field);
             }
             let data_type = this.transform(field.data_type())?.into_owned();
@@ -3042,6 +3162,35 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
     }
 }
 
+/// Rewrites immutable fields whose annotations have already passed read-path validation.
+struct MaterializePhysical(ColumnMappingMode);
+
+impl<'a> SchemaTransform<'a> for MaterializePhysical {
+    transform_output_type!(|'a, T| Cow<'a, T>);
+
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Cow<'a, StructField> {
+        if field.is_metadata_column() {
+            return Cow::Borrowed(field);
+        }
+        let data_type = self.transform(field.data_type()).into_owned();
+        let metadata = field.logical_to_physical_metadata(self.0);
+        Cow::Owned(StructField {
+            name: field.physical_name(self.0).to_owned(),
+            data_type,
+            nullable: field.nullable,
+            metadata,
+        })
+    }
+
+    fn transform_variant(&mut self, stype: &'a StructType) -> Cow<'a, StructType> {
+        Cow::Borrowed(stype)
+    }
+
+    fn transform_file(&mut self, stype: &'a StructType) -> Cow<'a, StructType> {
+        Cow::Borrowed(stype)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -3053,6 +3202,83 @@ mod tests {
         assert_result_error_with_message, column_mapping_physical_name_dedup_fixtures as fixtures,
         test_deep_nested_schema_missing_leaf_cm,
     };
+
+    #[test]
+    fn subset_shares_fields_and_preserves_serialization() {
+        let schema = StructType::try_new([
+            StructField::nullable("partition", DataType::STRING),
+            StructField::not_null(
+                "data",
+                StructType::try_new([StructField::nullable("nested", DataType::LONG)
+                    .with_metadata([("custom", MetadataValue::String("kept".into()))])])
+                .unwrap(),
+            ),
+        ])
+        .unwrap();
+        let subset = schema.share_selected_fields(|field| field.name() == "data");
+        assert!(Arc::ptr_eq(&schema.fields["data"], &subset.fields["data"]));
+        let expected = StructType::try_new([schema.field("data").unwrap().clone()]).unwrap();
+        assert_eq!(subset, expected);
+        assert_eq!(
+            serde_json::to_value(&subset).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+    }
+
+    #[test]
+    fn subset_owned_fields_do_not_mutate_source() {
+        let schema = schema! { nullable "data": LONG };
+        let shared = schema.share_selected_fields(|_| true);
+        assert!(Arc::ptr_eq(&schema.fields["data"], &shared.fields["data"]));
+        let mut owned = shared.into_fields().next().unwrap();
+        owned
+            .metadata
+            .insert("added".into(), MetadataValue::Boolean(true));
+        assert!(!schema.field("data").unwrap().metadata.contains_key("added"));
+    }
+
+    #[test]
+    fn clone_deep_copies_nested_fields() {
+        let schema = schema! {
+            nullable "data": {
+                nullable "nested": LONG,
+            },
+        };
+        let cloned = schema.clone();
+        assert_eq!(schema, cloned);
+        assert!(!Arc::ptr_eq(&schema.fields["data"], &cloned.fields["data"]));
+        let path = ["data".into(), "nested".into()];
+        assert!(!std::ptr::eq(
+            schema.field_at_path(&path),
+            cloned.field_at_path(&path)
+        ));
+    }
+
+    #[test]
+    fn subset_reindexes_metadata_columns() {
+        let schema = StructType::try_new([
+            StructField::nullable("partition", DataType::STRING),
+            StructField::create_metadata_column("row_index", MetadataColumnSpec::RowIndex),
+            StructField::nullable("value", DataType::LONG),
+        ])
+        .unwrap();
+        let subset = schema.share_selected_fields(|field| field.name() != "partition");
+        assert_eq!(
+            subset
+                .fields()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["row_index", "value"]
+        );
+        assert_eq!(
+            subset.index_of_metadata_column(&MetadataColumnSpec::RowIndex),
+            Some(&0)
+        );
+        assert!(Arc::ptr_eq(
+            &schema.fields["row_index"],
+            &subset.fields["row_index"]
+        ));
+    }
 
     #[cfg(feature = "geo-type-in-dev")]
     fn geography(crs: &str, algorithm: EdgeInterpolationAlgorithm) -> PrimitiveType {
@@ -3207,6 +3433,36 @@ mod tests {
             }"#
     }
 
+    /// A `file` array element or map value is serialized as the bare string `"file"`, like a
+    /// top-level `file` field and like `"variant"`. The RFC defines `file` as "serialized with a
+    /// single type-name string", and a schema type that is an object is an array, map or struct
+    /// type, so `{"type": "file"}` is not parsed. Spark and Kernel-Java parse schemas the same way.
+    /// The RFC's schema example shows the object form for an array element, which this test does
+    /// not follow.
+    #[test]
+    fn test_serde_file_in_array_and_map() {
+        let array: DataType = ArrayType::new(DataType::file_type(), true).into();
+        let json = r#"{"type":"array","elementType":"file","containsNull":true}"#;
+        assert_eq!(serde_json::to_string(&array).unwrap(), json);
+        assert_eq!(serde_json::from_str::<DataType>(json).unwrap(), array);
+
+        let map: DataType = MapType::new(DataType::STRING, DataType::file_type(), true).into();
+        let json =
+            r#"{"type":"map","keyType":"string","valueType":"file","valueContainsNull":true}"#;
+        assert_eq!(serde_json::to_string(&map).unwrap(), json);
+        assert_eq!(serde_json::from_str::<DataType>(json).unwrap(), map);
+
+        for json in [
+            r#"{"type":"file"}"#,
+            r#"{"type":"array","elementType":{"type":"file"},"containsNull":true}"#,
+        ] {
+            let err = serde_json::from_str::<DataType>(json)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("'file'"), "{json}: {err}");
+        }
+    }
+
     #[test]
     fn test_serde_file_type() {
         let file = DataType::file_type();
@@ -3230,6 +3486,125 @@ mod tests {
             ]
         );
         assert!(fields.fields().all(|f| f.is_nullable()));
+    }
+
+    /// Accepts Spark's omission forms while preserving explicit values across serialization.
+    #[rstest]
+    #[case::non_nullable_without_metadata(Some(false), None)]
+    #[case::nullable_without_metadata(Some(true), None)]
+    #[case::non_nullable_empty_metadata(Some(false), Some("{}"))]
+    #[case::nullable_empty_metadata(Some(true), Some("{}"))]
+    #[case::non_nullable_populated_metadata(Some(false), Some(r#"{"comment":"keep"}"#))]
+    #[case::nullable_populated_metadata(Some(true), Some(r#"{"comment":"keep"}"#))]
+    #[case::both_absent(None, None)]
+    fn test_struct_field_metadata_deserialization(
+        #[case] nullable: Option<bool>,
+        #[case] metadata: Option<&str>,
+    ) {
+        let mut json = serde_json::json!({"name": "value", "type": "long"});
+        if let Some(nullable) = nullable {
+            json["nullable"] = nullable.into();
+        }
+        if let Some(metadata) = metadata {
+            json["metadata"] = serde_json::from_str(metadata).unwrap();
+        }
+        let expected = StructField {
+            metadata: serde_json::from_str(metadata.unwrap_or("{}")).unwrap(),
+            ..StructField::new("value", DataType::LONG, nullable.unwrap_or(true))
+        };
+
+        let field: StructField = serde_json::from_value(json).unwrap();
+        assert_eq!(field, expected);
+        let serialized = serde_json::to_value(&field).unwrap();
+        assert_eq!(
+            serialized["metadata"],
+            serde_json::to_value(&expected.metadata).unwrap()
+        );
+        assert_eq!(serialized["nullable"], expected.nullable);
+        assert_eq!(
+            serde_json::from_value::<StructField>(serialized).unwrap(),
+            expected
+        );
+    }
+
+    /// Struct fields use the same omission defaults inside structs, array elements, and maps.
+    /// Explicit false nullability must survive at each nesting position.
+    #[rstest]
+    #[case::struct_type("/fields/0", |schema: StructType| schema.into())]
+    #[case::array(
+        "/elementType/fields/0",
+        |schema: StructType| ArrayType::new(schema, true).into()
+    )]
+    #[case::map_key(
+        "/keyType/fields/0",
+        |schema: StructType| MapType::new(schema, DataType::LONG, false).into()
+    )]
+    #[case::map_value(
+        "/valueType/fields/0",
+        |schema: StructType| MapType::new(DataType::LONG, schema, true).into()
+    )]
+    fn test_nested_struct_field_without_metadata(
+        #[case] field_path: &str,
+        #[case] wrap: fn(StructType) -> DataType,
+        #[values(None, Some(false), Some(true))] nullable: Option<bool>,
+    ) {
+        let expected = wrap(
+            StructType::try_new([StructField::new(
+                "inner",
+                DataType::LONG,
+                nullable.unwrap_or(true),
+            )])
+            .unwrap(),
+        );
+        let mut json = serde_json::to_value(&expected).unwrap();
+        let field = json
+            .pointer_mut(field_path)
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        field.remove("metadata");
+        if nullable.is_none() {
+            field.remove("nullable");
+        }
+        assert_eq!(serde_json::from_value::<DataType>(json).unwrap(), expected);
+    }
+
+    /// Defaults apply only to omitted keys; nulls and invalid types must remain errors.
+    /// Supplying metadata keeps nullability required, even for an empty object.
+    #[rstest]
+    #[case::null_metadata(r#""nullable":true,"metadata":null"#, "expected a map")]
+    #[case::string_metadata(r#""nullable":true,"metadata":"bad""#, "expected a map")]
+    #[case::array_metadata(r#""nullable":true,"metadata":[]"#, "expected a map")]
+    #[case::boolean_metadata(r#""nullable":true,"metadata":false"#, "expected a map")]
+    #[case::number_metadata(r#""nullable":true,"metadata":0"#, "expected a map")]
+    #[case::null_metadata_without_nullable(r#""metadata":null"#, "expected a map")]
+    #[case::missing_nullable(r#""metadata":{}"#, "missing field `nullable`")]
+    #[case::missing_nullable_populated_metadata(
+        r#""metadata":{"comment":"keep"}"#,
+        "missing field `nullable`"
+    )]
+    #[case::null_nullable(r#""nullable":null,"metadata":{}"#, "expected a boolean")]
+    #[case::string_nullable(r#""nullable":"true","metadata":{}"#, "expected a boolean")]
+    #[case::null_nullable_without_metadata(r#""nullable":null"#, "expected a boolean")]
+    #[case::string_nullable_without_metadata(r#""nullable":"true""#, "expected a boolean")]
+    #[case::number_nullable_without_metadata(r#""nullable":1"#, "expected a boolean")]
+    #[case::array_nullable_without_metadata(r#""nullable":[]"#, "expected a boolean")]
+    #[case::object_nullable_without_metadata(r#""nullable":{}"#, "expected a boolean")]
+    #[case::duplicate_nullable(r#""nullable":true,"nullable":false"#, "duplicate field `nullable`")]
+    #[case::duplicate_metadata(
+        r#""nullable":true,"metadata":{},"metadata":{}"#,
+        "duplicate field `metadata`"
+    )]
+    fn test_struct_field_rejects_invalid_metadata_or_nullability(
+        #[case] fields: &str,
+        #[case] expected_error: &str,
+    ) {
+        // Raw JSON preserves duplicate keys so the deserializer can reject them.
+        let json = format!(r#"{{"name":"value","type":"long",{fields}}}"#);
+        assert_result_error_with_message(
+            serde_json::from_str::<StructField>(&json),
+            expected_error,
+        );
     }
 
     #[test]
@@ -3794,6 +4169,11 @@ mod tests {
         // physical metadata, leaving a schema indistinguishable from a table that never had them.
         let data = example_schema_metadata();
         let field: StructField = serde_json::from_str(data).unwrap();
+        let schema = schema! { (field.clone()) };
+        MakePhysical::validate_read_column_mapping(ColumnMappingMode::None, &schema).unwrap();
+        assert!(
+            MakePhysical::validate_schema_column_mapping(ColumnMappingMode::None, &schema).is_err()
+        );
         let physical = field.make_physical(ColumnMappingMode::None).unwrap();
 
         assert_eq!(physical.name, "e");
@@ -3875,6 +4255,10 @@ mod tests {
             schema.make_physical(ColumnMappingMode::Id),
             "Duplicate column mapping ID",
         );
+        assert_result_error_with_message(
+            MakePhysical::validate_read_column_mapping(ColumnMappingMode::Id, &schema),
+            "Duplicate column mapping ID",
+        );
     }
 
     #[rstest]
@@ -3894,10 +4278,26 @@ mod tests {
     fn test_make_physical_dup_physical_name(
         #[case] schema: StructType,
         #[case] expected_error_substring: Option<String>,
+        #[values(MakePhysicalMode::ValidateRead, MakePhysicalMode::ValidateStrict)]
+        validation_mode: MakePhysicalMode,
     ) {
         // The same dedup rules should apply under both CM modes.
         for mode in [ColumnMappingMode::Name, ColumnMappingMode::Id] {
             let result = schema.make_physical(mode);
+            let mut walker = MakePhysical {
+                mode: validation_mode,
+                ..MakePhysical::new(mode)
+            };
+            let validation = walker.transform_struct(&schema);
+            assert_eq!(
+                result.as_ref().map(|_| ()).map_err(ToString::to_string),
+                validation.as_ref().map(|_| ()).map_err(ToString::to_string),
+            );
+            assert!(walker.sibling_names_stack.is_empty());
+            assert!(walker.logical_path.is_empty());
+            if let Ok(validated) = validation {
+                assert!(matches!(validated, Cow::Borrowed(_)));
+            }
             match &expected_error_substring {
                 None => {
                     result.expect("The input schema should be valid");
@@ -4799,7 +5199,7 @@ mod tests {
             type_name: "struct".into(),
             fields: [(
                 nested_field_with_metadata.name.clone(),
-                nested_field_with_metadata,
+                Arc::new(nested_field_with_metadata),
             )]
             .into_iter()
             .collect(),
@@ -4824,7 +5224,7 @@ mod tests {
             type_name: "struct".into(),
             fields: [(
                 nested_field_with_metadata.name.clone(),
-                nested_field_with_metadata,
+                Arc::new(nested_field_with_metadata),
             )]
             .into_iter()
             .collect(),
@@ -4850,7 +5250,7 @@ mod tests {
             type_name: "struct".into(),
             fields: [(
                 nested_field_with_metadata.name.clone(),
-                nested_field_with_metadata,
+                Arc::new(nested_field_with_metadata),
             )]
             .into_iter()
             .collect(),

@@ -133,7 +133,12 @@ pub(crate) fn field_id_to_statistics_base(field_id: i32) -> Option<i32> {
 /// [`ColumnMetadataKey::ParquetFieldId`] -- the same annotation the `#[field_id = N]` derive macro
 /// attaches to the other `content_tree` structs. It carries no `delta.columnMapping.*` logical
 /// annotations, which are consumed by (not produced from) logical->physical conversion.
-fn field_with_id(name: &str, data_type: DataType, nullable: bool, field_id: i32) -> StructField {
+pub(crate) fn field_with_id(
+    name: &str,
+    data_type: DataType,
+    nullable: bool,
+    field_id: i32,
+) -> StructField {
     StructField::new(name, data_type, nullable).with_metadata([(
         ColumnMetadataKey::ParquetFieldId.as_ref(),
         MetadataValue::Number(field_id as i64),
@@ -148,8 +153,55 @@ fn get_field_id(field: &StructField) -> Option<i32> {
     }
 }
 
+/// A sub-field of a leaf's stats struct. Per-stat properties are exhaustive matches on this enum,
+/// so a new stat must decide each of them explicitly.
+#[derive(Clone, Copy)]
+enum Stat {
+    LowerBound,
+    UpperBound,
+    ValueCount,
+    NullValueCount,
+    NanValueCount,
+    TotalBytes,
+}
+
+impl Stat {
+    /// Every stat, in field order.
+    const ALL: [Stat; 6] = [
+        Stat::LowerBound,
+        Stat::UpperBound,
+        Stat::ValueCount,
+        Stat::NullValueCount,
+        Stat::NanValueCount,
+        Stat::TotalBytes,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Stat::LowerBound => LOWER_BOUND,
+            Stat::UpperBound => UPPER_BOUND,
+            Stat::ValueCount => VALUE_COUNT,
+            Stat::NullValueCount => NULL_VALUE_COUNT,
+            Stat::NanValueCount => NAN_VALUE_COUNT,
+            Stat::TotalBytes => TOTAL_BYTES,
+        }
+    }
+
+    /// The field ID offset from the leaf's stats base.
+    fn offset(self) -> i32 {
+        match self {
+            Stat::LowerBound => STATS_OFFSET_LOWER_BOUND,
+            Stat::UpperBound => STATS_OFFSET_UPPER_BOUND,
+            Stat::ValueCount => STATS_OFFSET_VALUE_COUNT,
+            Stat::NullValueCount => STATS_OFFSET_NULL_VALUE_COUNT,
+            Stat::NanValueCount => STATS_OFFSET_NAN_VALUE_COUNT,
+            Stat::TotalBytes => STATS_OFFSET_TOTAL_BYTES,
+        }
+    }
+}
+
 /// Which Delta JSON stat categories a leaf appears in. Selects which sub-fields
-/// [`build_stats_struct`] emits under the projection (see there).
+/// [`build_stats_struct`] emits under the projection (see [`Self::backs`]).
 #[derive(Clone, Copy)]
 struct StatCategories {
     /// Present in `nullCount` -- backs `value_count`/`null_value_count`.
@@ -161,16 +213,26 @@ struct StatCategories {
 }
 
 impl StatCategories {
-    /// All three categories present: the unprojected case, keeping every type-eligible sub-field.
-    const ALL: StatCategories = StatCategories {
-        null_count: true,
-        min_values: true,
-        max_values: true,
-    };
-
     /// Whether the leaf appears in at least one category (i.e. survives the projection).
     fn any(&self) -> bool {
         self.null_count || self.min_values || self.max_values
+    }
+
+    /// Whether a leaf in these categories keeps `stat` under a projection:
+    /// `lower_bound`<-`minValues`, `upper_bound`<-`maxValues`,
+    /// `value_count`/`null_value_count`<-`nullCount`, `nan_value_count`<-either bound category.
+    /// `total_bytes` has no backing category, so it is never kept.
+    fn backs(&self, stat: Stat) -> bool {
+        match stat {
+            Stat::LowerBound => self.min_values,
+            Stat::UpperBound => self.max_values,
+            Stat::ValueCount | Stat::NullValueCount => self.null_count,
+            // The spec forbids NaN bounds, so float/double bounds cover only non-NaN values. Kernel
+            // orders NaN above every number (a NaN row matches `x > 5`), so `upper_bound` is only
+            // safe to skip on when `nan_value_count` is known to be zero.
+            Stat::NanValueCount => self.min_values || self.max_values,
+            Stat::TotalBytes => false,
+        }
     }
 
     /// The `content_stats` sub-field backing each present category, in [`STAT_CATEGORIES`] order.
@@ -184,10 +246,11 @@ impl StatCategories {
 }
 
 /// Builds a single column's stats struct, with each stat sub-field's ID an offset from
-/// `base_field_id`:
+/// `base_field_id`, per the Iceberg v4 spec's Field Statistics table:
 /// - offset 1/2: `lower_bound` / `upper_bound` (typed as `bounds_type`)
 /// - offset 3: `value_count` (long)
-/// - offset 4: `null_value_count` (long) - emitted regardless of the column's nullability
+/// - offset 4: `null_value_count` (long) - emitted regardless of the column's nullability, since a
+///   required leaf is null wherever an optional ancestor is null
 /// - offset 5: `nan_value_count` (long) - only for float/double `bounds_type`
 /// - offset 6: `total_bytes` (long) - total uncompressed size of the column's values; for
 ///   string/binary `bounds_type`, or any variant
@@ -195,13 +258,9 @@ impl StatCategories {
 /// `bounds_type` is the type the bounds are recorded at: the column's own type for primitives, or
 /// an unshredded variant type for variant columns.
 ///
-/// `categories` restricts the sub-fields to the Delta stat categories the leaf appears in. `None`
-/// (the unprojected path) keeps every type-eligible sub-field. When `Some`, a sub-field is kept
-/// only when a category backing it is present: `lower_bound`<-`minValues`,
-/// `upper_bound`<-`maxValues`, `value_count`/`null_value_count`<-`nullCount`,
-/// `nan_value_count`<-either bound category. `total_bytes` has no
-/// backing category and is dropped whenever projecting -- so `null_value_count`, though independent
-/// of nullability, is still dropped when the leaf is absent from `nullCount`.
+/// `categories` restricts the sub-fields to those backed by the Delta stat categories the leaf
+/// appears in (see [`StatCategories::backs`]). `None` (the unprojected path) keeps every
+/// type-eligible sub-field.
 fn build_stats_struct(
     base_field_id: i32,
     bounds_type: &DataType,
@@ -216,57 +275,15 @@ fn build_stats_struct(
         _ => (false, false),
     };
 
-    // With no projection (`None`), `StatCategories::ALL` makes every category check below `true`,
-    // keeping every type-eligible sub-field.
-    let projecting = categories.is_some();
-    let StatCategories {
-        null_count: has_null,
-        min_values: has_min,
-        max_values: has_max,
-    } = categories.unwrap_or(StatCategories::ALL);
-    let has_bounds = has_min || has_max;
-
-    // (name, type, offset, include) -- kept in declaration order to preserve field ordering.
-    let specs = [
-        (
-            LOWER_BOUND,
-            bounds_type.clone(),
-            STATS_OFFSET_LOWER_BOUND,
-            has_min,
-        ),
-        (
-            UPPER_BOUND,
-            bounds_type.clone(),
-            STATS_OFFSET_UPPER_BOUND,
-            has_max,
-        ),
-        (
-            VALUE_COUNT,
-            DataType::LONG,
-            STATS_OFFSET_VALUE_COUNT,
-            has_null,
-        ),
-        (
-            NULL_VALUE_COUNT,
-            DataType::LONG,
-            STATS_OFFSET_NULL_VALUE_COUNT,
-            has_null,
-        ),
-        (
-            NAN_VALUE_COUNT,
-            DataType::LONG,
-            STATS_OFFSET_NAN_VALUE_COUNT,
-            has_nan_count && has_bounds,
-        ),
-        (
-            TOTAL_BYTES,
-            DataType::LONG,
-            STATS_OFFSET_TOTAL_BYTES,
-            has_size_stats && !projecting,
-        ),
-    ];
-    let fields = specs.into_iter().filter_map(|(name, ty, offset, include)| {
-        include.then(|| field_with_id(name, ty, true, base_field_id + offset))
+    let fields = Stat::ALL.into_iter().filter_map(|stat| {
+        let (data_type, type_eligible) = match stat {
+            Stat::LowerBound | Stat::UpperBound => (bounds_type.clone(), true),
+            Stat::ValueCount | Stat::NullValueCount => (DataType::LONG, true),
+            Stat::NanValueCount => (DataType::LONG, has_nan_count),
+            Stat::TotalBytes => (DataType::LONG, has_size_stats),
+        };
+        let include = type_eligible && categories.is_none_or(|c| c.backs(stat));
+        include.then(|| field_with_id(stat.name(), data_type, true, base_field_id + stat.offset()))
     });
 
     StructType::new_unchecked(fields)
@@ -279,7 +296,7 @@ fn build_stats_struct(
 /// sub-fields).
 ///
 /// Errors if the leaf is missing its field-id metadata, or is an (as-yet unimplemented) geospatial
-/// column.
+/// column on the unprojected path. A projected read skips a geospatial leaf instead.
 ///
 /// `categories` is forwarded to [`build_stats_struct`] to restrict the sub-fields (see there);
 /// `None` emits the full stats struct.
@@ -300,16 +317,20 @@ fn leaf_stats_field(
         ))
     })?;
 
-    // Geospatial stats generation is not implemented yet. Error (rather than silently dropping the
-    // column) so this is not forgotten once geospatial support lands -- checked before the range
-    // check below so an out-of-range geo field ID still errors. Reachable only with the
-    // `geo-type-in-dev` feature enabled.
-    // TODO: emit proper stats for geospatial columns.
+    // Geospatial stats generation is not implemented yet. The unprojected path errors (rather than
+    // silently dropping the column) so this is not forgotten once geospatial support lands --
+    // checked before the range check below so an out-of-range geo field ID still errors. A
+    // projected read only narrows the stats a scan reads, and stats are optional there, so it skips
+    // the leaf rather than failing the scan. Reachable only with the `geo-type-in-dev` feature.
+    // TODO(#3926): emit proper stats for geospatial columns.
     #[cfg(feature = "geo-type-in-dev")]
     if matches!(
         field.data_type(),
         DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_))
     ) {
+        if categories.is_some() {
+            return Ok(None);
+        }
         return Err(KernelError::unsupported(format!(
             "AMT stats schema generation is not yet implemented for geospatial column '{}' (type {})",
             field.name(),
@@ -669,19 +690,8 @@ impl<'a> StatsLeafVisitor<'a> for StatsSchemaCollector {
 // == AMT content_stats -> parsed Delta stats ==
 
 /// Replaces [`CONTENT_STATS_FIELD_NAME`] in `input_schema` with a nullable [`STATS_PARSED`] column
-/// of type `delta_stats_schema`. Other columns pass through. Returns `(output_schema, expression)`.
-///
-/// ```text
-/// numRecords:  long               <- recordCount
-/// nullCount:   {<table nesting>}  <- content_stats.<leaf>.null_value_count
-/// minValues:   {<table nesting>}  <- content_stats.<leaf>.lower_bound
-/// maxValues:   {<table nesting>}  <- content_stats.<leaf>.upper_bound
-/// tightBounds: boolean            <- false
-/// ```
-///
-/// `content_stats` must have been read with [`projected_stats_schema`] for the same `table_schema`
-/// and `delta_stats_schema`. A leaf without a `content_stats` entry (array/map columns,
-/// out-of-range field IDs) yields null.
+/// of type `delta_stats_schema` (see [`parsed_stats_expression`]). Other columns pass through.
+/// Returns `(output_schema, expression)`.
 pub(crate) fn build_parsed_stats_expression(
     table_schema: &StructType,
     delta_stats_schema: &StructType,
@@ -705,14 +715,37 @@ pub(crate) fn build_parsed_stats_expression(
         )));
     }
 
-    let scopes = CategoryScopes::from_delta_stats_schema(delta_stats_schema)?;
-    let root = StatsLeafWalker::walk(table_schema, Some(scopes), &ParsedStatsExprBuilder)?;
-    let stats_expr = assemble_parsed_stats_expr(root, delta_stats_schema, &scopes)?;
-
+    let stats_expr = parsed_stats_expression(table_schema, delta_stats_schema)?;
     let output_field = StructField::nullable(STATS_PARSED, delta_stats_schema.clone());
     ProjectionStructPatchBuilder::new(input_schema)
         .replace(CONTENT_STATS_FIELD_NAME, output_field, Arc::new(stats_expr))
         .build()
+}
+
+/// Builds the expression evaluating an AMT entry row to its Delta stats, a struct of type
+/// `delta_stats_schema`:
+///
+/// ```text
+/// numRecords:  long               <- recordCount
+/// nullCount:   {<table nesting>}  <- content_stats.<leaf>.null_value_count
+/// minValues:   {<table nesting>}  <- content_stats.<leaf>.lower_bound
+/// maxValues:   {<table nesting>}  <- content_stats.<leaf>.upper_bound
+/// tightBounds: boolean            <- false
+/// ```
+///
+/// `content_stats` must have been read with [`projected_stats_schema`] for the same `table_schema`
+/// and `delta_stats_schema`. A leaf without a `content_stats` entry (array/map columns,
+/// out-of-range field IDs) yields null, so the expression reads no `content_stats` when none of
+/// the requested stats are recorded there.
+///
+/// Every column of `delta_stats_schema` must be a column of `table_schema`, in table order.
+pub(crate) fn parsed_stats_expression(
+    table_schema: &StructType,
+    delta_stats_schema: &StructType,
+) -> KernelResult<Expression> {
+    let scopes = CategoryScopes::from_delta_stats_schema(delta_stats_schema)?;
+    let root = StatsLeafWalker::walk(table_schema, Some(scopes), &ParsedStatsExprBuilder)?;
+    assemble_parsed_stats_expr(root, delta_stats_schema, &scopes)
 }
 
 /// A built child expression and the name of the output field it fills.
@@ -1266,12 +1299,14 @@ mod tests {
     }
 
     /// `null_value_count` is always emitted, independent of the leaf's or any ancestor's
-    /// nullability. Covers plain and variant leaves, at top level and nested under a not-null
-    /// struct (a not-null leaf under a not-null ancestor must still carry it).
+    /// nullability: a required leaf is still null wherever an optional ancestor is null. Covers
+    /// plain and variant leaves, at top level and nested.
     #[rstest]
     #[case::top_level_not_null_int(DataType::INTEGER, false, None)]
     #[case::top_level_nullable_variant(DataType::unshredded_variant(), true, None)]
     #[case::not_null_int_under_not_null_struct(DataType::INTEGER, false, Some(false))]
+    #[case::not_null_int_under_nullable_struct(DataType::INTEGER, false, Some(true))]
+    #[case::nullable_int_under_not_null_struct(DataType::INTEGER, true, Some(false))]
     #[case::not_null_variant_under_not_null_struct(
         DataType::unshredded_variant(),
         false,
@@ -1335,6 +1370,20 @@ mod tests {
             err.to_string().contains("geospatial"),
             "unexpected error: {err}"
         );
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[test]
+    fn projected_stats_schema_skips_geospatial_column() {
+        let geometry = GeometryType::try_new("EPSG:4326").expect("valid crs");
+        let schema = StructType::new_unchecked([
+            field_with_id("g", geometry.into(), true, 1),
+            field_with_id("x", DataType::LONG, true, 2),
+        ]);
+        let delta = delta_stats(Some(stat_cols(["g", "x"])), None, None);
+        let projected = projected_stats_schema(&schema, &delta).expect("should succeed");
+        let names: Vec<_> = projected.fields().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, ["x"]);
     }
 
     #[test]
@@ -1666,7 +1715,8 @@ mod tests {
     /// projected tests (which build expectations via `build_stats_struct`), the expected sub-field
     /// names here are spelled out per case, so a wrong condition in `build_stats_struct` is caught.
     /// The leaf type varies to exercise the type-specific conditions (`nan_value_count`,
-    /// `total_bytes`). Column `c` is always field id 1.
+    /// `total_bytes`), and each case runs for a required `c` too, which keeps `null_value_count`.
+    /// Column `c` is always field id 1.
     #[rstest]
     // Int: lower<-minValues, upper<-maxValues, value/null_value_count<-nullCount.
     #[case::int_null_count(
@@ -1694,11 +1744,21 @@ mod tests {
         delta_stats(Some(stat_cols(["c"])), Some(stat_cols(["c"])), Some(stat_cols(["c"]))),
         &[LOWER_BOUND, UPPER_BOUND, VALUE_COUNT, NULL_VALUE_COUNT],
     )]
-    // Double: nan_value_count rides along with the bounds ...
+    // Float/double: bounds exclude NaN, so nan_value_count rides along with either bound ...
     #[case::double_min_keeps_nan(
         DataType::DOUBLE,
         delta_stats(None, Some(stat_cols(["c"])), None),
         &[LOWER_BOUND, NAN_VALUE_COUNT],
+    )]
+    #[case::double_max_keeps_nan(
+        DataType::DOUBLE,
+        delta_stats(None, None, Some(stat_cols(["c"]))),
+        &[UPPER_BOUND, NAN_VALUE_COUNT],
+    )]
+    #[case::float_max_keeps_nan(
+        DataType::FLOAT,
+        delta_stats(None, None, Some(stat_cols(["c"]))),
+        &[UPPER_BOUND, NAN_VALUE_COUNT],
     )]
     // ... but is pruned when the leaf carries no bounds (nullCount only).
     #[case::double_null_count_drops_nan(
@@ -1722,8 +1782,9 @@ mod tests {
         #[case] leaf_type: DataType,
         #[case] delta: StructType,
         #[case] expected_subfields: &[&str],
+        #[values(true, false)] nullable: bool,
     ) {
-        let table = StructType::new_unchecked([field_with_id("c", leaf_type, false, 1)]);
+        let table = StructType::new_unchecked([field_with_id("c", leaf_type, nullable, 1)]);
         let projected = projected_stats_schema(&table, &delta).expect("should succeed");
         let stats = stats_struct_for_name("c", &projected);
         let names: Vec<&str> = stats.fields().map(|f| f.name().as_str()).collect();

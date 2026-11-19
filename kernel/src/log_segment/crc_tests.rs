@@ -496,7 +496,7 @@ impl BuiltCrcTest {
         let storage = self.engine.storage_handler();
         let log_root = self.url.join("_delta_log/").unwrap();
         let log_segment =
-            LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None)?;
+            LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
         log_segment.build_crc_from_base(&self.engine, base)
     }
 
@@ -509,7 +509,7 @@ impl BuiltCrcTest {
         let storage = self.engine.storage_handler();
         let log_root = self.url.join("_delta_log/").unwrap();
         let log_segment =
-            LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None)?;
+            LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
         Ok(log_segment
             .pick_latest_base_crc(engine, in_memory_base)?
             .map(|c| c.version))
@@ -867,9 +867,8 @@ async fn test_lagging_checkpoint_action_defers_to_crc_pm() {
         .assert_p_m(None, crc_config.protocol(), crc_config.metadata());
 }
 
-// A CRC-seeded pruned replay captures the latest checkpoint action only when it reads the pointed
-// manifest commit: that commit must be after the CRC, and only the non-plan replay reads checkpoint
-// actions once a CRC bounds the replay. Otherwise the snapshot follows the newest commit's pointer.
+// A CRC bounds P&M replay. A checkpoint action outside that replay, or omitted by its projection,
+// is resolved by following the newest commit's pointer.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[rstest]
 #[case::pointed_commit_after_crc(pm_commit_actions(), self_pointing_manifest_commit(1), 1)]
@@ -897,13 +896,14 @@ async fn test_crc_seeded_replay_follows_pointer_to_checkpoint_action(
         .build()
         .await;
     test.assert_p_m(None, config.protocol(), config.metadata());
-    let captured = test
-        .captured_checkpoint_action()
-        .map(|action| action.version);
-    let replay_reads_pointed_action = pointed_version == 1 && !cfg!(feature = "declarative-plans");
+    // Imperative replay projects checkpoint actions from commits after the CRC; the declarative
+    // P&M plan only projects the top-level P&M actions.
+    let expected_captured_version =
+        (pointed_version > 0 && !cfg!(feature = "declarative-plans")).then_some(pointed_version);
     assert_eq!(
-        captured,
-        replay_reads_pointed_action.then_some(pointed_version)
+        test.captured_checkpoint_action()
+            .map(|action| action.version),
+        expected_captured_version,
     );
     let (snapshot, _) = test.snapshot_at(None);
     let action = snapshot.latest_checkpoint_action(&test.engine).unwrap();

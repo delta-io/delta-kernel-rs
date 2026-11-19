@@ -1,4 +1,5 @@
 KERNEL_PATH := ../..
+USER_GUIDE_TARGET_DIR ?= $(KERNEL_PATH)/target/user-guide
 
 .PHONY: test check-version serve build clean
 
@@ -11,15 +12,22 @@ serve:
 	mdbook serve
 
 # Test that code examples compile. Build both crates in one cargo invocation so the
-# resulting target/debug/deps contains a single delta_kernel rmeta with the unified
+# resulting artifacts contain a single delta_kernel rmeta with the unified
 # feature set. Two separate cargo builds would leave two rmetas behind and mdbook test
-# cannot pick one (E0464).
+# cannot pick one (E0464). The clean enforces the single rmeta. It and the build use a private
+# directory, passed as --target-dir (which overrides any CARGO_TARGET_DIR), so that the clean
+# cannot delete other builds that share the workspace target directory.
 test: check-version
-	cargo clean --manifest-path $(KERNEL_PATH)/kernel/Cargo.toml
+	cargo clean --manifest-path $(KERNEL_PATH)/kernel/Cargo.toml \
+	  --target-dir $(USER_GUIDE_TARGET_DIR)
+	@artifacts=$$(mktemp); \
+	trap 'rm -f "$$artifacts"' EXIT; \
 	cargo build --locked --manifest-path $(KERNEL_PATH)/Cargo.toml \
+	  --target-dir $(USER_GUIDE_TARGET_DIR) \
+	  --message-format=json-render-diagnostics \
 	  -p delta_kernel -p delta_kernel_default_engine \
-	  --features "delta_kernel/internal-api,delta_kernel/prettyprint,delta_kernel/check-constraints-in-dev,delta_kernel_default_engine/rustls,delta_kernel_default_engine/arrow"
-	mdbook test -L $(KERNEL_PATH)/target/debug/deps
+	  --features "delta_kernel/internal-api,delta_kernel/prettyprint,delta_kernel/check-constraints-in-dev,delta_kernel_default_engine/rustls,delta_kernel_default_engine/arrow" \
+	  > "$$artifacts" && python3 test.py "$$artifacts"
 
 # Keep published dependency snippets aligned with the workspace release version.
 check-version:
