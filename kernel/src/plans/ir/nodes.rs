@@ -181,6 +181,20 @@ impl WriteParquet {
         self.ordered = ordered;
         self
     }
+
+    /// Builds an ungrouped aggregate from the statistics and resolved output schema.
+    pub fn stats_aggregate(&self) -> KernelResult<Aggregate> {
+        let (names, aggs): (Vec<_>, Vec<_>) = self
+            .stats_agg
+            .iter()
+            .map(|stats| (stats.name.as_str(), stats.agg.clone()))
+            .unzip();
+        Ok(Aggregate {
+            group_by: vec![],
+            aggs,
+            schema: self.schema.project(&names)?,
+        })
+    }
 }
 
 /// A named aggregate statistic produced by [`WriteParquet`].
@@ -199,20 +213,6 @@ impl StatsAgg {
             name: name.into(),
             agg,
         }
-    }
-
-    /// Creates an ungrouped aggregate from statistics and their resolved output fields.
-    /// `output_schema` must contain the resolved fields under their statistics names.
-    pub fn to_aggregate(stats: &[Self], output_schema: &StructType) -> KernelResult<Aggregate> {
-        let (names, aggs): (Vec<_>, Vec<_>) = stats
-            .iter()
-            .map(|stats| (stats.name.as_str(), stats.agg.clone()))
-            .unzip();
-        Ok(Aggregate {
-            group_by: vec![],
-            aggs,
-            schema: output_schema.project(&names)?,
-        })
     }
 }
 

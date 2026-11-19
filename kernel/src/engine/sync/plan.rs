@@ -39,7 +39,7 @@ use crate::expressions::{ArrayData, ColumnName, PredicateRef, Scalar};
 use crate::object_store::DynObjectStore;
 use crate::plans::ir::nodes::{
     DynamicScan, FILE_META_SCHEMA, FileType, Operator, Project, RelationId, RelationRef, ScanFile,
-    ScanJson, ScanParquet, SemiJoin, StatsAgg, Values, WriteJson, WriteParquet,
+    ScanJson, ScanParquet, SemiJoin, Values, WriteJson, WriteParquet,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult, ScopedPlanExecutor};
@@ -333,10 +333,7 @@ impl SyncPlanExecutor {
         let stats = if write.stats_agg.is_empty() {
             vec![]
         } else {
-            eval_aggregate(
-                &StatsAgg::to_aggregate(&write.stats_agg, &write.schema)?,
-                &input,
-            )?
+            eval_aggregate(&write.stats_aggregate()?, &input)?
         };
         let output_schema = Arc::new(write.schema.as_ref().try_into_arrow()?);
         let schema: Arc<ArrowSchema> = Arc::new(write.write_schema.as_ref().try_into_arrow()?);
