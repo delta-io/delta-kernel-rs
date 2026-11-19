@@ -2,6 +2,8 @@ spec_version: 1
 name: maintainer-claude-reviewer
 description: 'Claude maintainer-level Rust + Delta protocol review.'
 skills: none
+tool_groups:
+  projects: false
 executor:
   type: omnigent
   model: maintainer-claude

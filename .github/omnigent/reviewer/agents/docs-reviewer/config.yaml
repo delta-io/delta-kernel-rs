@@ -2,6 +2,8 @@ spec_version: 1
 name: docs-reviewer
 description: 'Checks docs/comments are accurate and consistent with code.'
 skills: none
+tool_groups:
+  projects: false
 executor:
   type: omnigent
   model: default

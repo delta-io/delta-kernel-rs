@@ -225,10 +225,9 @@ class InlineReviewTest(unittest.TestCase):
         for config_path in reviewer_dir.rglob("config.yaml"):
             with self.subTest(config=config_path.parent.name):
                 executor = yaml.safe_load(config_path.read_text())["executor"]
-                self.assertIn(
-                    executor.get("reasoning_effort"),
-                    valid_efforts[executor["config"]["harness"]],
-                )
+                harness = executor["config"]["harness"]
+                self.assertIn(harness, valid_efforts)
+                self.assertIn(executor.get("reasoning_effort"), valid_efforts[harness])
 
     def test_markdown_prompts_preserve_source_safety(self) -> None:
         reviewer_dir = Path(__file__).parents[1] / "reviewer"
