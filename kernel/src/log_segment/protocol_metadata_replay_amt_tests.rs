@@ -36,6 +36,7 @@ use crate::plans::ir::nodes::Operator;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::{Operation, PlanExecutor, PlanExecutorCapabilities, PlanResult};
 use crate::schema::SchemaRef;
+use crate::snapshot::ChecksumWriteResult;
 use crate::table_features::TableFeature;
 use crate::transaction::UpdateTableOperation;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
@@ -1721,31 +1722,38 @@ async fn snapshot_with_crc_at_version_serves_last_manifest_commit_from_crc(
 
 // A checkpoint at or after a manifest commit lists only the files added after the manifest tree, so
 // a checksum counted from it would miss the tree's files. Kernel refuses to write such a
-// checkpoint, so it is written by hand, standing in for another writer's.
+// checkpoint, so it is written by hand, standing in for another writer's. Each case lists the
+// commits from version 0; the checkpoint is at version 0.
 #[rstest]
-#[case::checkpoint(vec![])]
-#[case::checkpoint_with_tail(vec![commit_info(Some(pointer(0, 0)))])]
+#[case::checkpoint_at_manifest_commit(
+    vec![checkpoint_commit(0, &[], one_column_schema())],
+    Some("checkpoint 0 may not list the files of adaptiveMetadata manifest commit 0")
+)]
+#[case::checkpoint_at_manifest_commit_with_tail(
+    vec![checkpoint_commit(0, &[], one_column_schema()), commit_info(Some(pointer(0, 0)))],
+    Some("checkpoint 0 may not list the files of adaptiveMetadata manifest commit 0")
+)]
+#[case::manifest_commit_after_checkpoint(
+    vec![pointerless_pm_commit(), commit_info(Some(pointer(1, 1)))],
+    Some("commits after the checkpoint are not incremental-safe")
+)]
+#[case::no_manifest_commit(vec![pointerless_pm_commit()], None)]
+#[case::no_manifest_commit_with_tail(vec![pointerless_pm_commit(), commit_info(None)], None)]
 #[tokio::test]
-async fn no_checksum_from_checkpoint_after_manifest_commit(#[case] later_commits: Vec<String>) {
-    let (store, table_root) = manifest_commit_table(&[]).await;
+async fn checksum_from_checkpoint_on_adaptive_metadata_table(
+    #[case] commits: Vec<String>,
+    #[case] expected_error: Option<&str>,
+) {
+    let (store, table_root) = commit_table(&commits).await;
     put_pm_checkpoint(&store, 0).await;
-    for (version, commit) in later_commits.into_iter().enumerate() {
-        add_commit(
-            table_root.as_str(),
-            store.as_ref(),
-            version as u64 + 1,
-            commit,
-        )
-        .await
-        .unwrap();
-    }
     let engine = SyncEngine::new_with_store(store);
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
     assert_eq!(snapshot.log_segment().checkpoint_version, Some(0));
-    assert_result_error_with_message(
-        snapshot.write_checksum(&engine),
-        "checkpoint 0 may not list the files of adaptiveMetadata manifest commit 0",
-    );
+    let result = snapshot.write_checksum(&engine);
+    match expected_error {
+        Some(message) => assert_result_error_with_message(result, message),
+        None => assert_eq!(result.unwrap().0, ChecksumWriteResult::Written),
+    }
 }
 
 // A snapshot that sits on a checkpoint (no CRC, no later commits) cannot read commitInfo during

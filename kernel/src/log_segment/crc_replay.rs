@@ -276,23 +276,20 @@ impl LogSegment {
     fn replay_commits_into_crc_delta<'a>(
         &self,
         engine: &dyn Engine,
-        mut ascending_commits: impl DoubleEndedIterator<Item = &'a ParsedLogPath>,
+        ascending_commits: impl DoubleEndedIterator<Item = &'a ParsedLogPath>,
         seed_histogram: Option<FileSizeHistogram>,
     ) -> KernelResult<CrcDelta> {
-        // Replay newest-first: ICT capture reads from the newest commit only. Hold the oldest
-        // commit aside so adaptiveMetadata replay knows which manifest commits it crosses. The
-        // split runs for every table and changes nothing else: chaining it back last still reads
-        // each commit once, newest first, including a single commit (taken by `next()`, leaving
-        // `newer` empty).
-        let oldest = ascending_commits.next();
-        let newer = ascending_commits.next_back();
-        let locations: Vec<FileMeta> = newer
-            .into_iter()
-            .chain(ascending_commits.rev())
-            .chain(oldest)
+        // Replay newest-first: ICT capture reads from the newest commit only.
+        let descending_commits: Vec<&ParsedLogPath> = ascending_commits.rev().collect();
+        let locations: Vec<FileMeta> = descending_commits
+            .iter()
             .map(|c| c.location.clone())
             .collect();
         let mut acc = CrcReplayAccumulator::new(seed_histogram);
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if let Some(oldest) = descending_commits.last() {
+            acc.first_replayed_version = oldest.version;
+        }
         let batches =
             engine
                 .json_handler()
@@ -309,28 +306,12 @@ impl LogSegment {
         // will trigger it.
         acc.process_commit_file_end();
 
+        let delta = acc.into_crc_delta();
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        let newest_files_only_in_manifest = acc.newest_files_only_in_manifest;
-        #[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_mut))]
-        let mut delta = acc.into_crc_delta();
-        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if let (Some(newest), Some(last_manifest_commit)) =
+            (descending_commits.first(), &delta.last_manifest_commit)
         {
-            if let (Some(newest), Some(last_manifest_commit)) =
-                (newer.or(oldest), &delta.last_manifest_commit)
-            {
-                last_manifest_commit.ensure_at_or_before(newest.version)?;
-            }
-            // Replay misses file changes only for a replayed manifest commit whose tree covers its
-            // own version.
-            if let (Some(oldest), Some(version)) = (oldest, newest_files_only_in_manifest)
-                && u64::try_from(version).is_ok_and(|v| v >= oldest.version)
-            {
-                debug!(
-                    "CRC reverse-replay: manifest commit at {version} may record files only in \
-                     its manifest; defaulting to non-incremental-safe"
-                );
-                delta.is_incremental_safe = false;
-            }
+            last_manifest_commit.ensure_at_or_before(newest.version)?;
         }
         Ok(delta)
     }
@@ -353,10 +334,10 @@ struct CrcReplayAccumulator {
     /// `Some` but we're still on the newest commit until a transition.
     is_first_commit: bool,
 
-    /// Newest manifest commit named by any replayed commit's `lastManifestCommit` whose own file
-    /// changes may be recorded only in its manifest.
+    /// Version of the oldest replayed commit. A manifest commit below it is already reflected in
+    /// the base. Defaults to 0, which treats every manifest commit as replayed.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    newest_files_only_in_manifest: Option<i64>,
+    first_replayed_version: Version,
 
     /// URL of the commit file currently being processed. Drives commit-boundary detection:
     /// a different URL on a later batch means we've moved to an older commit.
@@ -398,7 +379,7 @@ impl CrcReplayAccumulator {
             },
             is_first_commit: true,
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            newest_files_only_in_manifest: None,
+            first_replayed_version: 0,
             current_file_url: None,
             current_commit_saw_file_action: false,
             current_commit_operation: None,
@@ -498,16 +479,21 @@ impl CrcReplayAccumulator {
         }
         self.current_commit_operation = operation.map(str::to_owned);
         self.current_commit_saw_commit_info = true;
-        // Every commit from a manifest commit onward carries its pointer, so checking all of them
-        // finds one hidden behind a newer manifest commit.
+        // Replay misses file changes only for a replayed manifest commit whose tree covers its own
+        // version. Every commit from a manifest commit onward carries its pointer, so checking each
+        // one finds a replayed manifest commit hidden behind a newer one.
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        if let Some(pointer) = last_manifest_commit
-            .as_ref()
-            .filter(|pointer| pointer.files_only_in_manifest())
+        if self.delta.is_incremental_safe
+            && let Some(pointer) = &last_manifest_commit
+            && pointer.files_only_in_manifest()
+            && u64::try_from(pointer.version).is_ok_and(|v| v >= self.first_replayed_version)
         {
-            self.newest_files_only_in_manifest = self
-                .newest_files_only_in_manifest
-                .max(Some(pointer.version));
+            debug!(
+                "CRC reverse-replay: manifest commit at {} records files only in its manifest; \
+                 defaulting to non-incremental-safe",
+                pointer.version
+            );
+            self.delta.is_incremental_safe = false;
         }
         if self.is_first_commit {
             self.delta.in_commit_timestamp = ict;
