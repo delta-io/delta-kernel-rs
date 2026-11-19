@@ -227,13 +227,13 @@ impl ArrowOpaquePredicateOp for BoundCollatedComparison {
         inverted: bool,
     ) -> KernelResult<BooleanArray> {
         let compared = compared(args)?;
-        let values = evaluate_expression(compared.value, batch, Some(&DataType::STRING))?;
+        let values = evaluate_expression(compared.value(), batch, Some(&DataType::STRING))?;
         let values = cast(&values, &ArrowDataType::Utf8)?;
         let values = values.as_string_opt().ok_or_else(|| {
             KernelError::internal_error("Casting to Utf8 did not produce a string array")
         })?;
-        let result = self.compare(compared.ordering, values, compared.literal)?;
-        Ok(if inverted != compared.negated {
+        let result = self.compare(compared.ordering(), values, compared.literal())?;
+        Ok(if inverted != compared.negated() {
             not(&result)?
         } else {
             result
@@ -252,14 +252,14 @@ impl ArrowOpaquePredicateOp for BoundCollatedComparison {
         inverted: bool,
     ) -> KernelResult<Option<bool>> {
         let compared = compared(exprs)?;
-        let Some(Scalar::String(value)) = eval_expr(compared.value) else {
+        let Some(Scalar::String(value)) = eval_expr(compared.value()) else {
             return Ok(None);
         };
         let values = StringArray::from(vec![value]);
-        let result = self.compare(compared.ordering, &values, compared.literal)?;
+        let result = self.compare(compared.ordering(), &values, compared.literal())?;
         Ok(result
             .is_valid(0)
-            .then(|| result.value(0) != (inverted != compared.negated)))
+            .then(|| result.value(0) != (inverted != compared.negated())))
     }
 
     // A bound comparison exists only inside an evaluator, after any data skipping rewrite, so

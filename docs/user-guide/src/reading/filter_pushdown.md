@@ -203,19 +203,27 @@ let scan = snapshot
 # }
 ```
 
-Kernel skips a file only when it records bounds under that exact identifier, and keeps a file
-without them. Only `Scan::scan_metadata`, `Scan::parallel_scan_metadata`, and the scans built on
-them skip files this way. Your Engine compares the bounds to the literal. If it evaluates with
+Kernel skips a file only when its bounds under that exact identifier exclude a match, or when the
+compared column is entirely null. Otherwise it keeps the file, including when the file records no
+bounds under that identifier. The comparison must be on a non-partition STRING column. On a
+partition column or any other expression, Kernel keeps every file, and partition pruning doesn't
+apply. Only `Scan::scan_metadata`, `Scan::parallel_scan_metadata`, and the scans built on them
+skip files this way.
+
+Your Engine compares the bounds to the literal. If it evaluates with
 Kernel's `ArrowEvaluationHandler`, implement [`ArrowCollator`] over your collation library and
 return a [`CollationEvaluationHandler`] for it from your Engine's `evaluation_handler`. The
 [collation module rustdoc](https://docs.rs/delta_kernel/latest/delta_kernel/engine/arrow_expression/collation/index.html)
 has a complete example. `DefaultEngine` can't take a custom evaluation handler, so
 [assemble](../connector/implementing_engine.md#assemble-the-engine) an Engine that reuses
-`DefaultEngine`'s other handlers. If your Engine can't evaluate collated comparisons, don't pass
-one: the scan fails, or skips no files when the handler rejects the predicate up front. Skip
-files in your connector or derive a conservative predicate instead, as described below.
+`DefaultEngine`'s other handlers. If your Engine evaluates predicates itself, read the collation
+and the comparison from the predicate's [`CollatedComparison`]. If your Engine can't evaluate
+collated comparisons, don't pass one: the scan fails, or skips no files when the handler rejects
+the predicate up front. Skip files in your connector or derive a conservative predicate instead,
+as described below.
 
 [`collated_comparison`]: https://docs.rs/delta_kernel/latest/delta_kernel/expressions/fn.collated_comparison.html
+[`CollatedComparison`]: https://docs.rs/delta_kernel/latest/delta_kernel/expressions/struct.CollatedComparison.html
 [`ArrowCollator`]: https://docs.rs/delta_kernel/latest/delta_kernel/engine/arrow_expression/collation/trait.ArrowCollator.html
 [`CollationEvaluationHandler`]: https://docs.rs/delta_kernel/latest/delta_kernel/engine/arrow_expression/collation/struct.CollationEvaluationHandler.html
 

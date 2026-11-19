@@ -10,7 +10,8 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::{Int32Array, RecordBatch, StringArray};
+use delta_kernel::arrow::array::{Int32Array, RecordBatch, StringArray, new_null_array};
+use delta_kernel::arrow::datatypes::DataType as ArrowDataType;
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::engine::DelegatingEngine;
 use delta_kernel::engine::arrow_expression::collation::{
@@ -19,12 +20,13 @@ use delta_kernel::engine::arrow_expression::collation::{
 use delta_kernel::expressions::{Predicate, col, collated_comparison, column_name, lit};
 use delta_kernel::scan::StatsOptions;
 use delta_kernel::schema::{DataType, schema_ref};
+use delta_kernel::table_changes::TableChanges;
 use delta_kernel::{Engine, Snapshot};
 use rstest::rstest;
 use serde_json::{Value, json};
 use test_utils::{
-    assert_result_error_with_message, read_add_infos, read_scan, test_table_setup,
-    test_table_setup_mt,
+    IntoArray as _, assert_result_error_with_message, generate_batch, read_add_infos, read_scan,
+    test_table_setup, test_table_setup_mt,
 };
 
 use super::{
@@ -429,6 +431,35 @@ async fn collated_predicate_on_a_nested_column_prunes_files_by_its_nested_bounds
 }
 
 #[rstest]
+#[tokio::test]
+async fn collated_predicate_skips_a_file_whose_column_holds_only_nulls(
+    #[values(false, true)] negated: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, path, engine) = test_table_setup()?;
+    let mut fixture = synthetic_fixture(Some(SYNTHETIC_ID), Operation::Equal);
+    let null_names = generate_batch(vec![
+        ("id", vec![5].into_arrow_array()),
+        ("name", new_null_array(&ArrowDataType::Utf8, 1)),
+    ])?;
+    fixture.files.push((null_names, None));
+    let snapshot = create_fixture(&path, engine.as_ref(), &fixture, &[]).await?;
+    let filter = Filter::CaseInsensitiveEqual("alice");
+    let filter = if negated {
+        Filter::Not(Box::new(filter))
+    } else {
+        filter
+    };
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(filter.kernel_predicate()))
+        .build()?;
+    // Two of the four named files match either way, and a null matches neither.
+    let kept = collect_scan_paths(&scan, with_collator(engine, SYNTHETIC_ID), false)?;
+    assert_eq!(kept.len(), 2);
+    Ok(())
+}
+
+#[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn collated_predicates_prune_sidecar_files_in_sequential_and_parallel_scan_metadata(
     #[values(false, true)] parallel: bool,
@@ -450,6 +481,45 @@ async fn collated_predicates_prune_sidecar_files_in_sequential_and_parallel_scan
         .build()?;
     let kept = collect_scan_paths(&scan, with_collator(engine, SYNTHETIC_ID), parallel)?;
     assert_eq!(kept.len(), 2);
+    Ok(())
+}
+
+/// These scans read no collation bounds, so they never hand the engine a collated comparison.
+#[rstest]
+#[tokio::test]
+async fn collated_predicate_keeps_every_file_in_table_changes_and_incremental_scans(
+    #[values(false, true)] collator: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, path, engine) = test_table_setup()?;
+    let fixture = synthetic_fixture(Some(SYNTHETIC_ID), Operation::Equal);
+    let properties = [("delta.enableChangeDataFeed", "true")];
+    let snapshot = create_fixture(&path, engine.as_ref(), &fixture, &properties).await?;
+    let engine: Arc<dyn Engine> = if collator {
+        with_collator(engine, SYNTHETIC_ID)
+    } else {
+        engine
+    };
+    // A table scan skips two of the four files for this predicate.
+    let predicate = Arc::new(Filter::CaseInsensitiveEqual("alice").kernel_predicate());
+
+    let changes = TableChanges::try_new(&path, engine.as_ref(), 0, None)?
+        .into_scan_builder()
+        .with_predicate(predicate.clone())
+        .build()?
+        .execute(engine.clone())?;
+    let mut changed_rows = 0;
+    for batch in changes {
+        changed_rows += batch?.len();
+    }
+    assert_eq!(changed_rows, fixture.files.len());
+
+    let listing = snapshot
+        .incremental_scan_builder(0)
+        .with_predicate(predicate)
+        .build(engine.as_ref())?
+        .ok_or("the snapshot does not list every commit")?
+        .into_listing()?;
+    assert_eq!(listing.summary.live_adds.len(), fixture.files.len());
     Ok(())
 }
 

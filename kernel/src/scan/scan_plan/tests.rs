@@ -1031,6 +1031,7 @@ fn declarative_metadata_data_skipping(
 #[rstest]
 fn declarative_metadata_keeps_every_file_for_a_collated_comparison(
     #[values(
+        StatsOptions::none(),
         StatsOptions::json_only(),
         StatsOptions::all_struct(),
         StatsOptions::all()

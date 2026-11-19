@@ -658,16 +658,16 @@ impl<'a> DataSkippingPredicateCreator<'a> {
         inverted: bool,
     ) -> Option<Pred> {
         let compared = CollatedComparison::compared(exprs)?;
-        let Expr::Column(column) = compared.value else {
+        let Expr::Column(column) = compared.value() else {
             return None;
         };
         let creator = DataSkippingPredicateCreator {
             collation: Some(collated.collation()),
             ..*self
         };
-        let literal = Scalar::from(compared.literal);
-        let inverted = inverted != compared.negated;
-        match compared.ordering {
+        let literal = Scalar::from(compared.literal());
+        let inverted = inverted != compared.negated();
+        let comparison = match compared.ordering() {
             Ordering::Less => {
                 DataSkippingPredicateEvaluator::eval_pred_lt(&creator, column, &literal, inverted)
             }
@@ -677,7 +677,14 @@ impl<'a> DataSkippingPredicateCreator<'a> {
             Ordering::Greater => {
                 DataSkippingPredicateEvaluator::eval_pred_gt(&creator, column, &literal, inverted)
             }
-        }
+        }?;
+        // An opaque predicate gets no SQL WHERE null check, so skip an all-null column here. A
+        // comparison to NULL is NULL under every collation, negated or not.
+        let not_all_null = DataSkippingPredicateEvaluator::eval_pred_is_null(self, column, true);
+        Some(match not_all_null {
+            Some(not_all_null) => Pred::and(not_all_null, comparison),
+            None => comparison,
+        })
     }
 
     /// Wraps a predicate with `OR(NOT is_add, pred)` to protect Remove rows from being

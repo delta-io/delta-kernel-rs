@@ -75,7 +75,7 @@ impl<'a> ExpressionTransform<'a> for CollatedColumns<'a> {
     fn transform_pred_opaque(&mut self, predicate: &'a OpaquePredicate) {
         if let Some(collated) = predicate.op.any_ref().downcast_ref::<CollatedComparison>()
             && let Some(compared) = CollatedComparison::compared(&predicate.exprs)
-            && let Expression::Column(column) = compared.value
+            && let Expression::Column(column) = compared.value()
         {
             self.0
                 .entry(collated.collation())

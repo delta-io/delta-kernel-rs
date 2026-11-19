@@ -19,17 +19,21 @@ use crate::kernel_predicates::{
 ///
 /// `comparison` must compare a value to a STRING literal, in either order, with
 /// [`Predicate::eq`], `ne`, `lt`, `le`, `gt`, or `ge`, or be the [`Predicate::not`] of one. Any
-/// other predicate skips no files, and evaluating it fails.
+/// other predicate skips no files, and evaluating it fails. A valid comparison skips files only
+/// when its value is a direct reference to a non-partition STRING column. On a partition column
+/// or any other expression it skips no files, but can still be evaluated.
 ///
 /// `collation` is the exact `provider.name.version` identifier that writers record bounds under,
 /// such as `icu.UNICODE_CI.75.1`. [`Scan::scan_metadata`](crate::scan::Scan::scan_metadata),
 /// [`Scan::parallel_scan_metadata`](crate::scan::Scan::parallel_scan_metadata), and the scans
 /// built on them skip a file when its bounds for the compared column under that identifier
-/// exclude a match, trusting those bounds to enclose the file's values. Kernel never substitutes
-/// binary bounds or another version's, and every other scan keeps every file.
+/// exclude a match, trusting those bounds to enclose the file's values, or when its null count
+/// shows that the column holds only nulls. Kernel never substitutes binary bounds or another
+/// version's, and every other scan keeps every file.
 ///
-/// Only an `engine::arrow_expression::collation::CollationEvaluationHandler` can evaluate the
-/// comparison: no other [`EvaluationHandler`](crate::EvaluationHandler) can read its collation.
+/// An [`EvaluationHandler`](crate::EvaluationHandler) evaluates the comparison by reading its
+/// [`CollatedComparison`]. `engine::arrow_expression::collation::CollationEvaluationHandler`
+/// does so over Arrow data.
 ///
 /// ```
 /// # use delta_kernel::expressions::{col, collated_comparison, lit};
@@ -44,20 +48,44 @@ pub fn collated_comparison(collation: impl Into<String>, comparison: Predicate) 
 }
 
 /// The [`OpaquePredicateOp`] of a [`collated_comparison`], holding its collation identifier.
+///
+/// An engine that evaluates the predicate itself downcasts the op of an
+/// [`OpaquePredicate`](super::OpaquePredicate) to this type and reads the comparison from the
+/// predicate's arguments:
+///
+/// ```
+/// # use std::cmp::Ordering;
+/// # use delta_kernel::expressions::{
+/// #     CollatedComparison, Predicate, col, collated_comparison, lit,
+/// # };
+/// let predicate = collated_comparison("icu.UNICODE_CI.75.1", lit("alice").ge(col!("name")));
+/// let Predicate::Opaque(opaque) = &predicate else {
+///     panic!("a collated comparison is an opaque predicate");
+/// };
+/// let collated = opaque.op.as_ref().any_ref().downcast_ref::<CollatedComparison>().unwrap();
+/// assert_eq!(collated.collation(), "icu.UNICODE_CI.75.1");
+///
+/// // `'alice' >= name` reads as `NOT (name > 'alice')`.
+/// let compared = CollatedComparison::compared(&opaque.exprs).unwrap();
+/// assert_eq!(compared.value(), &col!("name"));
+/// assert_eq!(compared.ordering(), Ordering::Greater);
+/// assert_eq!(compared.literal(), "alice");
+/// assert!(compared.negated());
+/// ```
 #[derive(Debug, PartialEq)]
-pub(crate) struct CollatedComparison {
+pub struct CollatedComparison {
     collation: String,
 }
 
 impl CollatedComparison {
     /// The exact `provider.name.version` identifier of the collation.
-    pub(crate) fn collation(&self) -> &str {
+    pub fn collation(&self) -> &str {
         &self.collation
     }
 
     /// Reads the arguments of a collated comparison. Returns `None` unless they are the one
     /// comparison that [`collated_comparison`] accepts.
-    pub(crate) fn compared(exprs: &[Expression]) -> Option<Compared<'_>> {
+    pub fn compared(exprs: &[Expression]) -> Option<Compared<'_>> {
         let [Expression::Predicate(comparison)] = exprs else {
             return None;
         };
@@ -93,12 +121,36 @@ impl CollatedComparison {
 }
 
 /// The comparison a [`collated_comparison`] wraps, read as `value <ordering> literal` and negated
-/// if `negated`.
-pub(crate) struct Compared<'a> {
-    pub(crate) ordering: Ordering,
-    pub(crate) value: &'a Expression,
-    pub(crate) literal: &'a str,
-    pub(crate) negated: bool,
+/// if [`negated`](Self::negated).
+#[derive(Clone, Copy, Debug)]
+pub struct Compared<'a> {
+    ordering: Ordering,
+    value: &'a Expression,
+    literal: &'a str,
+    negated: bool,
+}
+
+impl<'a> Compared<'a> {
+    /// How the value compares to the literal: [`Ordering::Less`] reads `value < literal`.
+    pub fn ordering(&self) -> Ordering {
+        self.ordering
+    }
+
+    /// The value compared to the literal.
+    pub fn value(&self) -> &'a Expression {
+        self.value
+    }
+
+    /// The STRING literal the value is compared to.
+    pub fn literal(&self) -> &'a str {
+        self.literal
+    }
+
+    /// Whether the comparison is negated: `value >= literal` reads as a negated
+    /// [`Ordering::Less`].
+    pub fn negated(&self) -> bool {
+        self.negated
+    }
 }
 
 impl OpaquePredicateOp for CollatedComparison {
