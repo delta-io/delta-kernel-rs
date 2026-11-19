@@ -4639,41 +4639,52 @@ mod tests {
     #[case::overflow(
         Arc::new(Int64Array::from(vec![Some(1), Some(i64::from(i32::MAX) + 1)])),
         DataType::INTEGER,
+        1,
         "Strict cast of Int64 to integer failed",
         "2147483648"
     )]
     #[case::underflow(
         Arc::new(Int64Array::from(vec![i64::from(i32::MIN) - 1])),
         DataType::INTEGER,
+        1,
         "Strict cast of Int64 to integer failed",
         "-2147483649"
     )]
     #[case::unparseable_string(
         Arc::new(StringArray::from(vec![Some("2025-04-11"), Some("not-a-date")])),
         DataType::DATE,
+        1,
         "Strict cast of Utf8 to date failed",
         "not-a-date"
     )]
     #[case::empty_string(
         Arc::new(StringArray::from(vec![""])),
         DataType::INTEGER,
+        1,
         "Strict cast of Utf8 to integer failed",
         "''"
     )]
     #[case::unsupported_pair(
         Arc::new(BooleanArray::from(vec![Some(true), Some(false)])),
         DataType::DATE,
+        2,
         "Strict cast of Boolean to date failed",
         "Boolean"
     )]
     fn test_cast_of_unrepresentable_value(
         #[case] values: ArrayRef,
         #[case] target: DataType,
+        #[case] safe_null_count: usize,
         #[case] strict_error: &str,
         #[case] bad_value: &str,
     ) {
         let safe = cast_column(values.clone(), target.clone(), CastMode::Safe).unwrap();
-        assert!(safe.null_count() > 0);
+        assert_eq!(safe.len(), values.len());
+        assert_eq!(safe.null_count(), safe_null_count);
+        assert_eq!(
+            safe.data_type(),
+            &ArrowDataType::try_from_kernel(&target).unwrap()
+        );
         let err = cast_column(values, target, CastMode::Strict)
             .unwrap_err()
             .to_string();
