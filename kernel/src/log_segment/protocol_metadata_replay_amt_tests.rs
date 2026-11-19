@@ -148,8 +148,8 @@ async fn manifest_commit_table(later_commits: &[String]) -> (SyncEngine, Url) {
     commit_table(&commits).await
 }
 
-// Commits `commits` as versions 0, 1, ... of an in-memory table, and returns the store and table
-// root.
+// Commits `commits` as versions 0, 1, ... of an in-memory table, and returns an engine on the
+// table's store and the table root.
 async fn commit_table(commits: &[String]) -> (SyncEngine, Url) {
     let engine = SyncEngine::in_memory();
     let table_root = Url::parse("memory:///").unwrap();
