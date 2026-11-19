@@ -5409,7 +5409,8 @@ async fn test_new_as_published_with_checkpoint_at_snapshot_version(
         original.listed.latest_commit_file = None;
     }
 
-    let (engine, _) = build_log_with_paths_and_checkpoint_impl(&[delta_path_for_version(2, "json")], None).await;
+    let (engine, _) =
+        build_log_with_paths_and_checkpoint_impl(&[delta_path_for_version(2, "json")], None).await;
     let storage = engine.storage_handler();
     let engine = CountingEngine::new(engine);
     let updated = original
@@ -5477,7 +5478,8 @@ async fn test_new_as_published_missing_destination_preserves_original(
     let (engine, _) = build_log_with_paths_and_checkpoint_impl(
         &[delta_path_for_version(present_version, "json")],
         None,
-    ).await;
+    )
+    .await;
 
     let engine = CountingEngine::new(engine);
     let result = original.new_as_published(&engine, Some(2));
@@ -5543,7 +5545,8 @@ async fn test_new_as_published_preserves_checkpoints_and_log_compactions() {
             delta_path_for_version(3, "json"),
         ],
         None,
-    ).await;
+    )
+    .await;
     let engine = CountingEngine::new(engine);
     let published = original
         .new_as_published(&engine, Some(3))

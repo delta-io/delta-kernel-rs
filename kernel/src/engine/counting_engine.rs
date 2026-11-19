@@ -90,16 +90,17 @@ impl CountingEngine {
 
     /// Returns the number of delegated operations across all handlers.
     pub fn total_op_count(&self) -> u64 {
+        let plan_ops = cfg_select! {
+            feature = "declarative-plans" => {
+                self.plans.as_ref().map_or(0, |handler| handler.op_count())
+            }
+            _ => 0,
+        };
         self.evaluation.op_count()
             + self.storage.op_count()
             + self.json.op_count()
             + self.parquet.op_count()
-            + cfg_select! {
-                feature = "declarative-plans" => {
-                    self.plans.as_ref().map_or(0, |handler| handler.op_count())
-                }
-                _ => 0,
-            }
+            + plan_ops
     }
 
     /// Asserts that no delegated handler operations have run.
