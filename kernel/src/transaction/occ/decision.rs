@@ -166,9 +166,7 @@ pub(super) fn ensure_winner_rows(
 ///
 /// A manifest commit's file changes can live in its content tree, which the plans don't read. T's
 /// backreferences to the table state also go stale. The `checkpoint` array holds the full table
-/// state, not the commit's changes. A T that is a manifest commit can't be checked either: its
-/// `checkpoint` action states the table's txns and domains, so a retry would drop a winner's
-/// changes.
+/// state, not the commit's changes.
 pub(super) fn ensure_no_manifest_commit(summaries: &[WinnerSummary]) -> KernelResult<()> {
     if let Some(summary) = summaries.iter().find(|summary| summary.is_manifest_commit) {
         return Err(KernelError::unsupported(format!(

@@ -8,7 +8,8 @@
 //! 2. The OCC plan ([`occ_plan()`]) checks the winners' file actions. It returns one row for each
 //!    check and version with a violation.
 //!
-//! [`detect_conflicts()`] lists the order of the checks.
+//! The OCC plan runs only when no winner rule fails. [`detect_conflicts()`] lists the order of the
+//! checks.
 //!
 //! # Differences from Delta Spark
 //!
@@ -146,6 +147,9 @@ impl WinningCommit {
 /// The facts about T that conflict detection needs.
 ///
 /// T is never a row-tracking backfill or unbackfill, because Kernel reserves those operation names.
+/// T never drops a table feature, because Kernel reserves the `DROP FEATURE` operation name. Delta
+/// Spark checks a feature removal again against the winner's snapshot, so conflict detection must
+/// reject such a T before Kernel can write one.
 #[derive(Debug, Clone)]
 pub(crate) struct LoserFacts {
     /// The last version that T was checked against: T's read version on the first check, then the
@@ -164,8 +168,7 @@ pub(crate) struct LoserFacts {
     /// [`decision::effective_isolation_level`] applies the downgrade.
     pub(crate) isolation_level: IsolationLevel,
     /// T writes a root manifest file, so its commit is an adaptiveMetadata manifest commit.
-    /// Detection fails with an `unsupported` error, for the reasons on
-    /// [`decision::ensure_no_manifest_commit`].
+    /// Detection fails with an `unsupported` error, for the reason on [`ensure_supported_loser`].
     pub(crate) is_manifest_commit: bool,
     /// At least one file action of T has `dataChange=true`.
     pub(crate) has_data_change: bool,
@@ -177,9 +180,9 @@ pub(crate) struct LoserFacts {
     /// T writes an action that no other field describes, for example `protocol` or `txn`. A
     /// `commitInfo` action does not count, and a `cdc` action counts as a file action.
     pub(crate) has_other_actions: bool,
-    /// Kernel derives it from T's staged actions: true when T removes a file, updates a deletion
-    /// vector, or adds a file again. It must be true whenever `file_actions` holds a remove. The
-    /// backfill rule and the read-nothing check depend on it.
+    /// The commit path must derive it from T's staged actions: true when T removes a file, updates
+    /// a deletion vector, or adds a file again. It must be true whenever `file_actions` holds a
+    /// remove. The backfill rule and the read-nothing check depend on it.
     pub(crate) rewrites_files: bool,
     /// The domains that T writes. A removal tombstone (`removed: true`) counts as a write.
     pub(crate) written_domains: Vec<String>,
@@ -245,7 +248,8 @@ pub(crate) enum ReadScope {
 ///
 /// OSS Delta doesn't let a writer set SnapshotIsolation as a table level, because its config
 /// validation accepts only Serializable on write. Kernel rejects such a table, which is stricter
-/// than Delta Spark.
+/// than Delta Spark. A T that is a manifest commit can't be checked: its `checkpoint` action states
+/// the table's txns and domains, so a retry would drop a winner's changes.
 fn ensure_supported_loser(facts: &LoserFacts) -> KernelResult<()> {
     if facts.isolation_level == IsolationLevel::SnapshotIsolation {
         return Err(KernelError::unsupported(
