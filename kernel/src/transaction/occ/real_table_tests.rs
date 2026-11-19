@@ -12,8 +12,6 @@ use rstest::rstest;
 use tempfile::TempDir;
 use url::Url;
 
-use super::decision::{Conflict, WinnerRule};
-use super::occ_plan::OccCheck;
 use super::tests::{
     LoserRelations, conflict, equals, make_optimize, no_conflict_summaries, occ, only_summary,
     outcome, partitioned_delete_facts, winner, winners_after,
@@ -538,6 +536,14 @@ fn winners_in_other_partitions_give_no_conflict() {
     |facts: &mut LoserFacts| facts.isolation_level = IsolationLevel::Serializable,
     conflict(4, Some("WRITE"), occ(OccCheck::ReadAppend))
 )]
+// Version 1 adds a file that conflicts with T, and version 2 writes `new_app_2`, which T read.
+// Kernel checks every winner rule first, so it reports version 2. Delta Spark reports version 1.
+#[case::winner_rule_is_reported_before_add_check_of_earlier_winner(
+    "app-txn-with-last-updated",
+    0,
+    |facts: &mut LoserFacts| facts.read_app_ids = vec!["new_app_2".to_string()],
+    conflict(2, Some("WRITE"), winner(WinnerRule::TxnConflict))
+)]
 fn fixture_loser_that_read_every_file(
     #[case] table: &str,
     #[case] read_version: Version,
@@ -620,18 +626,4 @@ fn fixture_txn_winner_of_read_app_id(
     );
     facts.read_app_ids = vec![read_app_id.to_string()];
     assert_eq!(detect_in_table(&relations, &facts, &url), expected);
-}
-
-#[test]
-fn winner_rule_is_reported_before_add_check_of_earlier_winner() {
-    // Version 1 adds a file that conflicts with T, and version 2 writes `new_app_2`, which T read.
-    // Kernel reports version 2, because it checks every winner rule first. Delta Spark reports
-    // version 1.
-    let (url, _tmp) = fixture_table("app-txn-with-last-updated");
-    let (relations, mut facts) = delete_all(&snapshot_at(&url, 0));
-    facts.read_app_ids = vec!["new_app_2".to_string()];
-    assert_eq!(
-        detect_in_table(&relations, &facts, &url),
-        conflict(2, Some("WRITE"), winner(WinnerRule::TxnConflict))
-    );
 }

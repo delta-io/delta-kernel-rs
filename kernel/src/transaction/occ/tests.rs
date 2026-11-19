@@ -8,8 +8,6 @@ use rstest::rstest;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-use super::decision::{Conflict, ConflictKind, WinnerRule};
-use super::occ_plan::OccCheck;
 use super::winner_check_plan::{
     ROW_TRACKING_BACKFILL_OPERATION, ROW_TRACKING_UNBACKFILL_OPERATION,
 };
@@ -364,9 +362,7 @@ fn detect_delete_with_files(
 fn winner_summaries(commits: &[(Version, Vec<Value>)]) -> Vec<WinnerSummary> {
     let table = TestTable::new(commits);
     let facts = deleted_date_facts(&no_read_files());
-    let plan = winner_check_plan(&facts, &table.winners(READ_VERSION))
-        .unwrap()
-        .unwrap();
+    let plan = winner_check_plan(&facts, &table.winners(READ_VERSION)).unwrap();
     let executor = SyncPlanExecutor::default();
     read_winner_summaries(executor.execute_op(Operation::QueryPlan(plan)).unwrap()).unwrap()
 }
@@ -539,7 +535,7 @@ fn winner_rule_with_write_commit(
     true,
     conflict(7, Some("UPDATE SCHEMA"), winner(WinnerRule::MetadataChanged))
 )]
-#[case::uppercase_tag_fails_though_delta_spark_accepts_it(
+#[case::non_canonical_case_tag_is_not_identity_only(
     "TRUE",
     false,
     conflict(7, Some("UPDATE SCHEMA"), winner(WinnerRule::MetadataChanged))
@@ -558,6 +554,24 @@ fn identity_only_metadata_winner(
     let result = detect_delete_with(
         |facts| facts.changes_metadata = changes_metadata,
         &[(7, winner_actions)],
+    );
+    assert_eq!(result, expected);
+}
+
+#[test]
+fn domain_conflict_reported_before_backfill_conflict() {
+    let winner_actions = vec![
+        commit_info(ROW_TRACKING_BACKFILL_OPERATION),
+        domain("app.x", "{}"),
+    ];
+    let result = detect_delete_with(
+        |facts| facts.written_domains = vec!["app.x".into()],
+        &[(7, winner_actions)],
+    );
+    let expected = conflict(
+        7,
+        Some(ROW_TRACKING_BACKFILL_OPERATION),
+        winner(WinnerRule::DomainConflict),
     );
     assert_eq!(result, expected);
 }
@@ -626,7 +640,10 @@ fn winner_remove_conflicts_whatever_its_data_change(
 }
 
 #[rstest]
-#[case::remove_gets_file_checks(remove(DELETED_FILE, true), occ(OccCheck::ReadDelete))]
+#[case::remove_of_read_file_fails_read_delete(
+    remove(DELETED_FILE, true),
+    occ(OccCheck::ReadDelete)
+)]
 // `Metadata` can't leave out its required fields, so the case writes the JSON.
 #[case::metadata_without_required_fields_fails_metadata_changed(
     json!({"metaData": {"id": "test-table"}}),
@@ -796,7 +813,6 @@ fn delete_checks_share_one_scan_of_winner_removes() {
         &[7],
         &relations.file_actions,
     )
-    .unwrap()
     .unwrap();
     let scans = plan
         .nodes
@@ -818,16 +834,27 @@ fn detect_conflicts_without_winners_has_no_conflict() {
 // === Read scope ===
 
 #[rstest]
-#[case::add_in_read_partition(add("f7", DELETED_DATE))]
-#[case::remove_of_any_file(remove(DELETED_FILE, true))]
-fn loser_that_read_nothing_passes(#[case] action: Value) {
+#[case::add_in_read_partition_passes(&[], add("f7", DELETED_DATE), None)]
+#[case::remove_of_unremoved_file_passes(&[], remove(DELETED_FILE, true), None)]
+// The flag is wrong for a T whose `file_actions` holds a remove, but `delete_delete` doesn't read
+// it.
+#[case::remove_of_removed_file_fails_without_rewrite_flag(
+    &[DELETED_FILE],
+    remove(DELETED_FILE, true),
+    conflict(7, Some("WRITE"), occ(OccCheck::DeleteDelete)),
+)]
+fn loser_that_read_nothing(
+    #[case] removed: &[&str],
+    #[case] action: Value,
+    #[case] expected: Option<Conflict>,
+) {
     let table = TestTable::new(&[(7, vec![commit_info("WRITE"), action])]);
-    let relations = LoserRelations::new(&[], &[]);
+    let relations = LoserRelations::new(removed, &[]);
     let mut facts = deleted_date_facts(&relations.read_files);
     facts.read_scope = ReadScope::Nothing;
     facts.rewrites_files = false;
     let detection = relations.detect(&facts, &table.winners(READ_VERSION));
-    assert_eq!(outcome(detection), None);
+    assert_eq!(outcome(detection), expected);
     assert_eq!(relations.plan_runs(), 2);
 }
 
@@ -1007,7 +1034,10 @@ fn summary_row(version: Version, operation: &str, is_blind_append: bool) -> Winn
     vec![7, 8, 9],
 )]
 #[case::loser_that_read_nothing_skips_all(
-    |facts: &mut LoserFacts| facts.read_scope = ReadScope::Nothing,
+    |facts: &mut LoserFacts| {
+        facts.read_scope = ReadScope::Nothing;
+        facts.rewrites_files = false;
+    },
     vec![],
 )]
 #[case::optimize_drops_to_snapshot_isolation(make_optimize, vec![])]
@@ -1159,22 +1189,16 @@ fn timestamp_partition_is_read_in_connector_timezone(
     assert_eq!(outcome(detection), expected);
 }
 
-/// The partition schema and partition predicate of a files-scoped T.
-fn partition_filter_mut(facts: &mut LoserFacts) -> (&mut SchemaRef, &mut Option<PredicateRef>) {
+/// Sets the partition predicate of a files-scoped T.
+fn set_partition_predicate(facts: &mut LoserFacts, predicate: Option<PredicateRef>) {
     let ReadScope::Files {
-        partition_schema,
         partition_predicate,
         ..
     } = &mut facts.read_scope
     else {
         panic!("expected a files-scoped read");
     };
-    (partition_schema, partition_predicate)
-}
-
-/// Sets the partition predicate of a files-scoped T.
-fn set_partition_predicate(facts: &mut LoserFacts, predicate: Option<PredicateRef>) {
-    *partition_filter_mut(facts).1 = predicate;
+    *partition_predicate = predicate;
 }
 
 /// Makes a files-scoped T read only the adds whose `date` is null.
@@ -1233,14 +1257,24 @@ fn add_with_partition_values(partition_values: Value) -> Value {
 #[case::not_null_partition_field_reads_null_value_as_null(
     |facts: &mut LoserFacts| {
         set_is_null_predicate(facts);
-        *partition_filter_mut(facts).0 = schema_ref! { not_null "date": DATE };
+        let ReadScope::Files { partition_schema, .. } = &mut facts.read_scope else {
+            panic!("expected a files-scoped read");
+        };
+        *partition_schema = schema_ref! { not_null "date": DATE };
     },
     add_with_partition_values(json!({"date": null})),
     conflict(7, Some("WRITE"), occ(OccCheck::ReadAppend)),
 )]
 #[case::unpartitioned_table_ignores_false_predicate(
     |facts: &mut LoserFacts| {
-        let (partition_schema, partition_predicate) = partition_filter_mut(facts);
+        let ReadScope::Files {
+            partition_schema,
+            partition_predicate,
+            ..
+        } = &mut facts.read_scope
+        else {
+            panic!("expected a files-scoped read");
+        };
         *partition_schema = schema_ref! {};
         *partition_predicate = Some(Arc::new(Predicate::FALSE));
     },

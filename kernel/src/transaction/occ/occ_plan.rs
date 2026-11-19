@@ -36,7 +36,6 @@ const PATH: &str = "path";
 static WINNER_ADDS_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     not_null (VERSION): LONG,
     nullable (ADD_NAME): {
-        not_null (PATH): STRING,
         not_null (PARTITION_VALUES_FIELD): { STRING => nullable STRING },
     },
 };
@@ -53,7 +52,7 @@ pub(super) static VIOLATION_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     not_null (CHECK): STRING,
 };
 
-/// Builds the OCC plan, or returns `None` when no check has a winner to scan.
+/// Builds the OCC plan over `winners`, which must not be empty.
 ///
 /// The plan returns one row for each check and version with a violation. `read_append` scans the
 /// winners at `read_append_versions`. The delete checks scan every winner. `file_actions` must have
@@ -63,7 +62,7 @@ pub(super) fn occ_plan(
     winners: &[WinningCommit],
     read_append_versions: &[Version],
     file_actions: &RelationRef,
-) -> KernelResult<Option<Plan>> {
+) -> KernelResult<Plan> {
     let read_append = read_append_branch(&facts.read_scope, winners, read_append_versions)?;
     let removes = winner_removes(winners)?;
     let read_delete = read_delete_branch(&facts.read_scope, removes.clone())?;
@@ -77,7 +76,7 @@ pub(super) fn occ_plan(
     .aggregate_by([column_name!(CHECK), column_name!(VERSION)], |aggs| {
         aggs.count_star()
     })?
-    .build_opt()
+    .build()
 }
 
 /// A file-level check of the OCC plan.
@@ -105,18 +104,17 @@ fn read_append_branch(
         .filter(|winner| versions.contains(&winner.version));
     let adds = scan_winners(checked_winners, WINNER_ADDS_SCHEMA.clone())?
         .filter(col!(ADD_NAME).is_not_null())?;
-    let ReadScope::Files {
-        partition_schema,
-        partition_predicate: Some(partition_predicate),
-        map_to_struct_options,
-        ..
-    } = read_scope
-    else {
-        return Ok(adds);
+    let (partition_schema, partition_predicate, map_to_struct_options) = match read_scope {
+        ReadScope::Files {
+            partition_schema,
+            partition_predicate: Some(partition_predicate),
+            map_to_struct_options,
+            ..
+        } if partition_schema.num_fields() > 0 => {
+            (partition_schema, partition_predicate, map_to_struct_options)
+        }
+        _ => return Ok(adds),
     };
-    if partition_schema.num_fields() == 0 {
-        return Ok(adds);
-    }
     // A winner add can hold a null or no value for any partition column.
     let part_type = StructType::try_new(
         partition_schema

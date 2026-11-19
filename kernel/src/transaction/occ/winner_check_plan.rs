@@ -10,8 +10,8 @@ use super::{LoserFacts, WinningCommit, scan_winners};
 use crate::KernelResult;
 use crate::action_reconciliation::plan::VERSION;
 use crate::actions::{
-    CHECKPOINT_ACTION_NAME, COMMIT_INFO_NAME, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME,
-    SET_TRANSACTION_NAME,
+    CHECKPOINT_ACTION_NAME, CHECKPOINT_METADATA_NAME, COMMIT_INFO_NAME, DOMAIN_METADATA_NAME,
+    METADATA_NAME, PROTOCOL_NAME, SET_TRANSACTION_NAME,
 };
 use crate::expressions::{Expression, Predicate, col, column_name, lit, null_lit};
 use crate::plans::Plan;
@@ -117,7 +117,7 @@ static WINNER_ACTIONS_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
         nullable "appId": STRING,
     },
     nullable (CHECKPOINT_ACTION_NAME): [ nullable {
-        nullable "checkpointMetadata": { nullable "version": LONG },
+        nullable (CHECKPOINT_METADATA_NAME): { nullable "version": LONG },
     } ],
 };
 
@@ -141,7 +141,7 @@ static ACTION_ROW_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     nullable (ROW_TRACKING_STATE): (ROW_TRACKING_SCHEMA.as_ref().clone()),
 };
 
-/// Builds the winner check plan over `winners`, or returns `None` when there are no winners.
+/// Builds the winner check plan over `winners`, which must not be empty.
 ///
 /// The plan output follows [`WINNER_CHECK_OUTPUT_SCHEMA`], with one row for each winner that has
 /// at least one action. T's domains and app IDs enter the plan as literals. T's `changes_metadata`
@@ -149,7 +149,7 @@ static ACTION_ROW_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 pub(super) fn winner_check_plan(
     facts: &LoserFacts,
     winners: &[WinningCommit],
-) -> KernelResult<Option<Plan>> {
+) -> KernelResult<Plan> {
     scan_winners(winners, WINNER_ACTIONS_SCHEMA.clone())?
         .project(action_row_expr(facts), ACTION_ROW_SCHEMA.clone())?
         .aggregate_by([column_name!(VERSION)], |aggs| {
@@ -188,7 +188,7 @@ pub(super) fn winner_check_plan(
                 )
         })?
         .project(rule_expr(facts), WINNER_CHECK_OUTPUT_SCHEMA.clone())?
-        .build_opt()
+        .build()
 }
 
 /// Returns true when `operation` is a row-tracking backfill or unbackfill.
@@ -208,8 +208,9 @@ fn action_row_expr(facts: &LoserFacts) -> Expression {
     let is_row_tracking = col!(DOMAIN_METADATA_NAME, "domain").eq(lit(ROW_TRACKING_DOMAIN_NAME));
     let not_removed = col!(DOMAIN_METADATA_NAME, "removed").distinct(lit(true));
     let live_row_tracking = Predicate::and(is_row_tracking.clone(), not_removed.clone());
-    // Only a live `delta.rowTracking` action passes its configuration to the parser. A malformed
-    // configuration of another domain then can't null the marks.
+    // Only a live `delta.rowTracking` action passes its configuration to the parser. Otherwise a
+    // malformed configuration of another domain would fail the parse and null the marks of its
+    // whole batch.
     let row_tracking_configuration = Expression::case_when(
         [(
             live_row_tracking.clone(),

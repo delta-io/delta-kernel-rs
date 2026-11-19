@@ -9,7 +9,7 @@ use super::winner_check_plan::{
     TXN_CONFLICT, WINNER_CHECK_OUTPUT_SCHEMA, WRITES_ROW_TRACKING,
     is_row_tracking_backfill_operation,
 };
-use super::{LoserFacts, ReadScope, WinningCommit, winner_versions};
+use super::{LoserFacts, WinningCommit, winner_versions};
 use crate::action_reconciliation::plan::VERSION;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::ColumnName;
@@ -75,9 +75,9 @@ pub(crate) struct WinnerSummary {
 
 /// One row of the OCC plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct OccViolation {
-    pub(super) version: Version,
-    pub(super) check: OccCheck,
+struct OccViolation {
+    version: Version,
+    check: OccCheck,
 }
 
 /// Reads the winner check plan output, in ascending version order.
@@ -104,8 +104,7 @@ pub(super) fn select_read_append_versions(
     summaries: &[WinnerSummary],
 ) -> Vec<Version> {
     let isolation_level = effective_isolation_level(facts);
-    let read_nothing = matches!(facts.read_scope, ReadScope::Nothing);
-    if read_nothing || isolation_level == IsolationLevel::SnapshotIsolation {
+    if facts.read_scope.is_nothing() || isolation_level == IsolationLevel::SnapshotIsolation {
         return Vec::new();
     }
     Vec::from_iter(
@@ -125,24 +124,17 @@ pub(super) fn select_read_append_versions(
     )
 }
 
-/// Reads the OCC plan output.
-pub(super) fn read_occ_violations(result: PlanResult) -> KernelResult<Vec<OccViolation>> {
-    Ok(visit_batches::<OccViolationVisitor>(result)?.0)
-}
-
-/// Returns the earliest violation. Within one version, [`OccCheck`] order decides.
+/// Reads the OCC plan output and returns the earliest violation. Within one version, [`OccCheck`]
+/// order decides.
 pub(super) fn first_occ_conflict(
-    violations: &[OccViolation],
+    result: PlanResult,
     summaries: &[WinnerSummary],
-) -> Option<Conflict> {
+) -> KernelResult<Option<Conflict>> {
+    let violations = visit_batches::<OccViolationVisitor>(result)?.0;
     let first = violations
         .iter()
-        .min_by_key(|violation| (violation.version, violation.check))?;
-    Some(conflict_at(
-        summaries,
-        first.version,
-        ConflictKind::Occ(first.check),
-    ))
+        .min_by_key(|violation| (violation.version, violation.check));
+    Ok(first.map(|first| conflict_at(summaries, first.version, ConflictKind::Occ(first.check))))
 }
 
 /// Returns an error unless `summaries` has one row for each winner, in order.
@@ -174,7 +166,9 @@ pub(super) fn ensure_winner_rows(
 ///
 /// A manifest commit's file changes can live in its content tree, which the plans don't read. T's
 /// backreferences to the table state also go stale. The `checkpoint` array holds the full table
-/// state, not the commit's changes.
+/// state, not the commit's changes. A T that is a manifest commit can't be checked either: its
+/// `checkpoint` action states the table's txns and domains, so a retry would drop a winner's
+/// changes.
 pub(super) fn ensure_no_manifest_commit(summaries: &[WinnerSummary]) -> KernelResult<()> {
     if let Some(summary) = summaries.iter().find(|summary| summary.is_manifest_commit) {
         return Err(KernelError::unsupported(format!(
@@ -265,11 +259,11 @@ impl RowVisitor for WinnerSummaryVisitor {
             ),
         ];
         for row in 0..row_count {
-            let mut violated_rules = Vec::new();
+            let mut first_violation: Option<WinnerRule> = None;
             for (rule, getter, name) in &rules {
                 let violated: bool = getter.get(row, name)?;
                 if violated {
-                    violated_rules.push(*rule);
+                    first_violation = Some(first_violation.map_or(*rule, |first| first.min(*rule)));
                 }
             }
             self.0.push(WinnerSummary {
@@ -282,7 +276,7 @@ impl RowVisitor for WinnerSummaryVisitor {
                     .get_opt(row, ROW_ID_HIGH_WATER_MARK)?,
                 writes_row_tracking: writes_row_tracking.get(row, WRITES_ROW_TRACKING)?,
                 removes_row_tracking: removes_row_tracking.get(row, REMOVES_ROW_TRACKING)?,
-                first_violation: violated_rules.into_iter().min(),
+                first_violation,
             });
         }
         Ok(())
