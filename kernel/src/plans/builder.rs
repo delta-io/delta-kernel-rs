@@ -49,7 +49,7 @@ use super::ir::nodes::{
 };
 use super::ir::plan::{Plan, PlanNode};
 use crate::expressions::{ColumnName, Expression, ExpressionRef, PredicateRef, Scalar, StructData};
-use crate::schema::compare::{data_types_equal_ignoring_metadata, data_types_equal_ordered};
+use crate::schema::compare::{data_types_equal_ordered, fields_equal_ignoring_metadata};
 use crate::schema::{SchemaRef, ToSchema};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::utils::CollectInto;
@@ -352,10 +352,7 @@ impl PlanBuilder {
                 return Err(KernelError::schema("WriteParquet schema exceeds its input"));
             }
             for (source, field) in input.schema().fields().zip(write.write_schema.fields()) {
-                if source.name() != field.name()
-                    || source.is_nullable() != field.is_nullable()
-                    || !data_types_equal_ignoring_metadata(source.data_type(), field.data_type())
-                {
+                if !fields_equal_ignoring_metadata(source, field) {
                     return Err(KernelError::schema(format!(
                         "WriteParquet field {} must match its input prefix",
                         field.name()
@@ -371,28 +368,29 @@ impl PlanBuilder {
                 "WriteParquet requires at least one input row",
             ));
         }
-        let bind_stats = |input_schema| {
-            write
-                .stats_agg
-                .iter()
-                .fold(Aggregate::ungrouped(input_schema), |builder, stats| {
-                    builder.aggregate_as(stats.agg.clone(), &stats.name)
-                })
-                .build()
-        };
-        let stats_schema = bind_stats(present[0].schema.clone())?.schema;
+        let stats_schema = write
+            .stats_agg
+            .iter()
+            .fold(
+                Aggregate::ungrouped(present[0].schema.clone()),
+                |builder, stats| builder.aggregate_as(stats.agg.clone(), &stats.name),
+            )
+            .build()?
+            .schema;
+        // Statistics may reference unwritten columns, whose derived fields must match across
+        // inputs.
         for input in &present[1..] {
-            let rebound = bind_stats(input.schema.clone())?;
-            if !stats_schema
-                .fields()
-                .zip(rebound.schema.fields())
-                .all(|(left, right)| {
-                    left == right && data_types_equal_ordered(left.data_type(), right.data_type())
-                })
-            {
-                return Err(KernelError::schema(
-                    "WriteParquet statistics must match every input",
-                ));
+            for (stats, output) in write.stats_agg.iter().zip(stats_schema.fields()) {
+                let field = stats
+                    .agg
+                    .output_field(&input.schema, Some(stats.name.clone()))?;
+                if &field != output
+                    || !data_types_equal_ordered(field.data_type(), output.data_type())
+                {
+                    return Err(KernelError::schema(
+                        "WriteParquet statistics must match every input",
+                    ));
+                }
             }
         }
         write.schema = Arc::new(FILE_META_SCHEMA.add(stats_schema.fields().cloned())?);

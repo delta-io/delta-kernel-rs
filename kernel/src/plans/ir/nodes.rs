@@ -183,7 +183,7 @@ impl WriteParquet {
     }
 
     /// Builds an ungrouped aggregate from the statistics and resolved output schema.
-    pub fn stats_aggregate(&self) -> KernelResult<Aggregate> {
+    pub fn to_aggregate(&self) -> KernelResult<Aggregate> {
         let (names, aggs): (Vec<_>, Vec<_>) = self
             .stats_agg
             .iter()
@@ -1078,7 +1078,7 @@ impl Agg {
 
     /// Derives this aggregate's output [`StructField`] over `input_schema`, validating that every
     /// operand column resolves.
-    fn output_field(
+    pub(crate) fn output_field(
         &self,
         input_schema: &StructType,
         alias: Option<String>,

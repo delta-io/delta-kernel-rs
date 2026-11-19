@@ -333,7 +333,7 @@ impl SyncPlanExecutor {
         let stats = if write.stats_agg.is_empty() {
             vec![]
         } else {
-            eval_aggregate(&write.stats_aggregate()?, &input)?
+            eval_aggregate(&write.to_aggregate()?, &input)?
         };
         let output_schema = Arc::new(write.schema.as_ref().try_into_arrow()?);
         let schema: Arc<ArrowSchema> = Arc::new(write.write_schema.as_ref().try_into_arrow()?);

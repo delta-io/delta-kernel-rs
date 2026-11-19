@@ -31,6 +31,14 @@ pub(crate) fn data_types_equal_ordered(left: &DataType, right: &DataType) -> boo
     left == right && data_types_equal_ignoring_metadata(left, right)
 }
 
+/// Compares field names, nullability, and ordered types, ignoring field metadata recursively.
+#[cfg(feature = "declarative-plans")]
+pub(crate) fn fields_equal_ignoring_metadata(left: &StructField, right: &StructField) -> bool {
+    left.name() == right.name()
+        && left.is_nullable() == right.is_nullable()
+        && data_types_equal_ignoring_metadata(left.data_type(), right.data_type())
+}
+
 /// Compares types recursively, ignoring struct-field metadata.
 ///
 /// Field order, names, nullability, and type identity must match, including the distinction between
@@ -43,11 +51,10 @@ pub(crate) fn data_types_equal_ignoring_metadata(left: &DataType, right: &DataTy
         | (DataType::Variant(left), DataType::Variant(right))
         | (DataType::File(left), DataType::File(right)) => {
             left.num_fields() == right.num_fields()
-                && left.fields().zip(right.fields()).all(|(left, right)| {
-                    left.name() == right.name()
-                        && left.is_nullable() == right.is_nullable()
-                        && data_types_equal_ignoring_metadata(left.data_type(), right.data_type())
-                })
+                && left
+                    .fields()
+                    .zip(right.fields())
+                    .all(|(left, right)| fields_equal_ignoring_metadata(left, right))
         }
         (DataType::Array(left), DataType::Array(right)) => {
             left.contains_null() == right.contains_null()
