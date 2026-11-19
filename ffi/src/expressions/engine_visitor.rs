@@ -284,8 +284,10 @@ pub struct EngineExpressionVisitor {
         op: Handle<SharedOpaquePredicateOp>,
         child_list_id: usize,
     ),
-    /// Visits the name of an `Expression::Unknown` or `Predicate::Unknown` belonging to the
-    /// list identified by `sibling_list_id`.
+    /// Visits the name of an expression or predicate that has no dedicated callback, belonging to
+    /// the list identified by `sibling_list_id`. This covers `Expression::Unknown`,
+    /// `Predicate::Unknown` and operators such as `MAP_LEN` and `MAP_HAS_KEY`. The callback
+    /// receives only the name.
     pub visit_unknown:
         extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
     /// Visits a CASE WHEN expression belonging to the list identified by `sibling_list_id`.
