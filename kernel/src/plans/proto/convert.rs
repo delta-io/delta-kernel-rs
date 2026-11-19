@@ -1126,6 +1126,8 @@ mod tests {
     #[cfg(feature = "geo-type-in-dev")]
     use super::EdgeAlgo;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::content_tree::mumbling::tests::encode_positions;
     use crate::expressions::{
         ArrayData, BinaryExpressionOp, BinaryPredicateOp, ColumnName, DecimalData, Expression,
         ExpressionStructPatchBuilder, JunctionPredicateOp, MapData, MapToStructOptions,
@@ -1937,7 +1939,8 @@ mod tests {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
     fn from_mumbling_bitmap_contains_lowers_to_unknown() {
-        let pred = Predicate::mumbling_bitmap_contains(col!("bitmap"), col!("value"));
+        let pred =
+            Predicate::try_mumbling_bitmap_contains(encode_positions(&[1]), col!("value")).unwrap();
         assert_eq!(
             proto_expr::Predicate::from(&pred).kind,
             Some(PredKind::Unknown("mumbling_bitmap_contains".to_string()))

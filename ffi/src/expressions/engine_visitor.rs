@@ -1060,7 +1060,9 @@ mod tests {
     fn visit_predicate_lowers_mumbling_bitmap_contains_to_unknown() {
         let mut builder = TestExpressionBuilder::default();
         let mut visitor = test_visitor(&mut builder);
-        let pred = Predicate::mumbling_bitmap_contains(lit(Scalar::Binary(vec![])), col!("pos"));
+        // A serialized empty bitmap is just its header: version 1, no set bits, no containers.
+        let empty_bitmap = vec![1, 0, 0, 0, 0, 0];
+        let pred = Predicate::try_mumbling_bitmap_contains(empty_bitmap, col!("pos")).unwrap();
         visit_predicate_internal(&pred, &mut visitor);
         assert_eq!(
             builder.events,
