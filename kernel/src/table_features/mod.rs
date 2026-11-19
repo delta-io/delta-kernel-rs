@@ -504,8 +504,8 @@ static ICEBERG_COMPAT_V1_INFO: FeatureInfo = FeatureInfo {
 /// - REPLACE TABLE: when supported, partition columns must not change across the replace.
 /// - Timestamp parquet encoding: if/when kernel can write INT96 or INT64, IcebergCompatV2 tables
 ///   must always use INT64; INT96 is forbidden.
-/// - ALTER TABLE SET/UNSET TBLPROPERTIES: when supported, reject any property change that would
-///   disable IcebergCompatV2 on an existing table.
+/// - ALTER TABLE SET/UNSET TBLPROPERTIES: reject any property change that would disable
+///   IcebergCompatV2 on an existing table.
 ///
 /// Tracking issue: <https://github.com/delta-io/delta-kernel-rs/issues/1125>
 static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
@@ -536,8 +536,8 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
 /// - REPLACE TABLE: when supported, partition columns must not change across the replace.
 /// - Timestamp parquet encoding: when kernel can write INT96 or INT64, IcebergCompatV3 tables must
 ///   always use INT64; INT96 is forbidden.
-/// - ALTER TABLE SET/UNSET TBLPROPERTIES: when supported, reject any property change that would
-///   disable IcebergCompatV3 on an existing table.
+/// - ALTER TABLE SET/UNSET TBLPROPERTIES: reject any property change that would disable
+///   IcebergCompatV3 on an existing table.
 /// - Void type: when delta-spark supports VOID type on icebergCompatV3 tables, add it to V3's type
 ///   allowlist (`is_v3_supported_type` in `iceberg_compat::v3`).
 ///

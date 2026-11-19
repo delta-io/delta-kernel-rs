@@ -24,6 +24,7 @@ use crate::actions::{
 use crate::checkpoint::collation_stats::{
     build_collation_stats_read_transform, source_collation_stats,
 };
+use crate::checkpoint::metrics::{CheckpointMetrics, CheckpointPhase};
 use crate::committer::CatalogCommit;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::content_tree::read_checkpoint_action;
@@ -1143,6 +1144,21 @@ impl LogSegment {
         self.read_original_actions(engine, action_schema.clone(), action_schema)
     }
 
+    /// Reads checkpoint-write input, timing each source before the streams are joined.
+    pub(crate) fn read_actions_for_checkpoint(
+        &self,
+        engine: &dyn Engine,
+        action_schema: SchemaRef,
+        metrics: CheckpointMetrics,
+    ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
+        self.read_original_actions_with_metrics(
+            engine,
+            action_schema.clone(),
+            action_schema,
+            metrics,
+        )
+    }
+
     /// Read the AMT `checkpoint` action from the manifest commit that `pointer` (the snapshot's
     /// `lastManifestCommit`) refers to.
     ///
@@ -1311,11 +1327,34 @@ impl LogSegment {
         commit_schema: SchemaRef,
         checkpoint_schema: SchemaRef,
     ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
-        let commits = self.read_commit_actions(engine, commit_schema)?;
+        self.read_original_actions_with_metrics(
+            engine,
+            commit_schema,
+            checkpoint_schema,
+            CheckpointMetrics::disabled(),
+        )
+    }
+
+    fn read_original_actions_with_metrics(
+        &self,
+        engine: &dyn Engine,
+        commit_schema: SchemaRef,
+        checkpoint_schema: SchemaRef,
+        metrics: CheckpointMetrics,
+    ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
+        let commits = {
+            let _timer = metrics.start(CheckpointPhase::LogTailInput);
+            self.read_commit_actions(engine, commit_schema)?
+        };
         let predicate = checkpoint_action_projection_predicate(&checkpoint_schema);
+        let checkpoint = {
+            let _timer = metrics.start(CheckpointPhase::CheckpointInput);
+            self.create_checkpoint_stream(engine, checkpoint_schema, predicate, None, None)?
+        };
+        let commits = metrics.input_iterator(CheckpointPhase::LogTailInput, commits);
         let checkpoint =
-            self.create_checkpoint_stream(engine, checkpoint_schema, predicate, None, None)?;
-        Ok(commits.chain(checkpoint.actions))
+            metrics.input_iterator(CheckpointPhase::CheckpointInput, checkpoint.actions);
+        Ok(commits.chain(checkpoint))
     }
 
     /// Original published and staged commits in `(after, through]`, newest first.

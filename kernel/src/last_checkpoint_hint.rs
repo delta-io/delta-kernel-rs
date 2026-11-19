@@ -588,8 +588,6 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::engine::{CancellableEngine, DelegatingEngine};
     use crate::metrics::MetricEvent;
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    use crate::object_store::memory::InMemory;
     use crate::schema::schema;
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::{
@@ -905,7 +903,7 @@ mod tests {
         #[case] retained: bool,
     ) {
         let log_root = Url::parse("memory:///_delta_log/").unwrap();
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let storage = engine.storage_handler();
         storage
             .put(

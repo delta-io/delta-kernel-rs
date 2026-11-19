@@ -9,6 +9,7 @@
 //!
 //! An Internet Assigned Numbers Authority (IANA) timezone is a named region such as
 //! `America/Los_Angeles`. Its UTC offset is resolved for each timestamp, including clock changes.
+//! The reader IDs `EST`, `MST`, and `HST` are fixed offsets, not named regions.
 
 use std::str::FromStr;
 
@@ -43,6 +44,14 @@ impl FromStr for TimestampTimezone {
     type Err = KernelError;
 
     fn from_str(value: &str) -> KernelResult<Self> {
+        // Java `ZoneId.SHORT_IDS`, which Spark readers use, maps only these IDs to fixed offsets.
+        // chrono-tz resolves them to region histories (Panama, Phoenix, Honolulu) instead.
+        let value = match value {
+            "EST" => "-05:00",
+            "MST" => "-07:00",
+            "HST" => "-10:00",
+            _ => value,
+        };
         // `Z` is the normalized id of the zero offset, and it is not an IANA name.
         if value == "Z" {
             return Ok(Self::default());

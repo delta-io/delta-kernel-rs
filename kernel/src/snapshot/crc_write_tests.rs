@@ -12,7 +12,6 @@ use crate::crc::FileStatsState;
 use crate::engine::DelegatingEngine;
 use crate::engine::sync::SyncEngine;
 use crate::metrics::{ChecksumWriteOutcome, ChecksumWriteResolutionMode, MetricEvent};
-use crate::object_store::memory::InMemory;
 use crate::path::ParsedLogPath;
 use crate::schema::{DataType, StructField, StructType};
 use crate::transaction::UpdateTableOperation;
@@ -87,7 +86,7 @@ fn crc_write_reports_utf8_bytes_and_completes_while_snapshot_is_alive(
 ) -> Result<()> {
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
-    let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+    let engine = SyncEngine::in_memory();
     let snapshot = snapshot_for_root(&engine, root)?;
     let initial_write_count = write_events(&reporter).len();
 
@@ -133,7 +132,7 @@ fn crc_write_already_exists_reports_no_bytes(
 ) -> Result<()> {
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
-    let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+    let engine = SyncEngine::in_memory();
     let original = create_snapshot(&engine)?;
     let (_, updated) = original.write_checksum(&engine)?;
     let snapshot = if use_original_snapshot {
@@ -170,7 +169,7 @@ fn crc_write_resolution_or_validation_error_retains_mode_and_duration(
 ) -> Result<()> {
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
-    let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+    let engine = SyncEngine::in_memory();
     let mut snapshot = snapshot_for_root(&engine, root)?;
     if let CrcRoot::Cached = root {
         let mut crc = snapshot.crc_at_version().unwrap().as_ref().clone();
@@ -209,7 +208,7 @@ fn crc_write_resolution_or_validation_error_retains_mode_and_duration(
 fn crc_write_snapshot_update_error_reports_failure_after_successful_put() -> Result<()> {
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
-    let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+    let engine = SyncEngine::in_memory();
     let mut snapshot = create_snapshot(&engine)?;
     // Force log-segment construction to fail after the CRC reaches storage.
     Arc::get_mut(&mut snapshot).unwrap().log_segment.end_version += 1;
@@ -278,7 +277,7 @@ fn crc_write_duration_includes_storage_even_on_error(
 ) -> Result<()> {
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
-    let engine = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+    let engine = Arc::new(SyncEngine::in_memory());
     let snapshot = snapshot_for_root(engine.as_ref(), root)?;
     let delay = Duration::from_millis(10);
     let storage = Arc::new(PutStorage {

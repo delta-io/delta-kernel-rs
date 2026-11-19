@@ -14,7 +14,6 @@ use crate::engine::arrow_data::EngineDataArrowExt;
 use crate::engine::sync::SyncEngine;
 use crate::engine::{CancellableEngine, DelegatingEngine};
 use crate::metrics::{MeteredDeltaEngine, MetricEvent};
-use crate::object_store::memory::InMemory;
 use crate::schema::{ColumnName, schema_ref};
 use crate::transaction::create_table::create_table;
 use crate::transaction::data_layout::DataLayout;
@@ -594,7 +593,7 @@ fn post_build_metadata_reads_inherit_operation_token(
     read: MetadataRead,
     #[values(false, true)] cancelled: bool,
 ) {
-    let original = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+    let original = SyncEngine::in_memory();
     create_table(
         "memory:///",
         schema_ref! { nullable "id": INTEGER },

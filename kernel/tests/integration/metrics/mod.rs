@@ -11,23 +11,17 @@
 //! - [`scan`]: scan execution scenarios (`scan.execute()` parquet data-file reads)
 //! - [`commit`]: `Transaction::commit()` success / conflict metrics
 //!
-//! Where possible, tests use [`TestTableBuilder`] for table setup. Tests that need
-//! checkpoint, CRC, or log compaction features still use manual helpers until those
-//! [`LogState`] variants land.
+//! Where possible, tests use [`TestTableBuilder`] for table setup and install the measuring
+//! reporter after the history has been written.
 
 use std::sync::Arc;
 
 use delta_kernel::Snapshot;
 use delta_kernel::arrow::array::Int32Array;
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{SchemaRef, schema_ref};
-use delta_kernel::transaction::create_table::create_table;
-use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::table_builder::{LogState, TestTableBuilder};
-use test_utils::{
-    CountingReporter, insert_data, install_thread_local_metrics_reporter, test_table_setup_mt,
-};
+use test_utils::{CountingReporter, insert_data, install_thread_local_metrics_reporter};
 use url::Url;
 
 mod checkpoint;
@@ -85,42 +79,4 @@ async fn insert_rows(
             .clone();
     }
     Ok(())
-}
-
-// TODO: migrate to TestTableBuilder when checkpoint LogState variants land (#2284)
-/// Create a table at v0, insert one row, and write a v1 parquet checkpoint.
-///
-/// Returns `(table_url, setup_engine, _temp_dir)` where `_temp_dir` must be kept
-/// alive for the duration of the test to prevent early cleanup. Callers can add
-/// further commits via `insert_data` or directly build the measuring snapshot.
-///
-/// Uses `TokioMultiThreadExecutor` because `snapshot.checkpoint()` issues nested
-/// `block_on` calls; `TokioBackgroundExecutor` deadlocks in that pattern.
-async fn setup_table_with_v1_checkpoint() -> delta_kernel::Result<(
-    Url,
-    Arc<DefaultEngine<TokioMultiThreadExecutor>>,
-    tempfile::TempDir,
-)> {
-    let (temp_dir, table_path, setup_engine) = test_table_setup_mt()?;
-    let table_url = delta_kernel::try_parse_uri(&table_path)?;
-
-    let _ = create_table(&table_path, simple_schema(), "Test/1.0", true)
-        .build(setup_engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(setup_engine.as_ref())?;
-
-    let snap0 = Snapshot::builder_for(table_url.clone()).build(setup_engine.as_ref())?;
-    let committed = insert_data(
-        snap0,
-        &setup_engine,
-        vec![Arc::new(Int32Array::from(vec![1]))],
-    )
-    .await?
-    .unwrap_committed();
-    committed
-        .post_commit_snapshot()
-        .expect("post-commit snapshot")
-        .clone()
-        .checkpoint(setup_engine.as_ref(), None)?;
-
-    Ok((table_url, setup_engine, temp_dir))
 }

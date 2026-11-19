@@ -632,10 +632,11 @@ mod tests {
     use rstest::rstest;
     use serde_json::json;
     use test_utils::table_builder::TestTableBuilder;
-    use test_utils::{LoggingTest, delta_path_for_version};
+    use test_utils::{LoggingTest, add_commit, delta_path_for_version};
     use url::Url;
 
     use super::*;
+    use crate::actions::Protocol;
     use crate::arrow::array::StringArray;
     use crate::arrow::record_batch::RecordBatch;
     use crate::commit_range::CommitRange;
@@ -649,9 +650,11 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::LogPathFileType;
+    use crate::schema::schema;
     use crate::snapshot::{CheckpointWriteResult, commit};
     use crate::unit_test_utils::{
-        CapturingReporter, install_thread_local_metrics_reporter, string_array_to_engine_data,
+        Action, CapturingReporter, install_thread_local_metrics_reporter, serialize_actions,
+        string_array_to_engine_data,
     };
     use crate::{DeltaErrorCondition, Engine, Error, KernelResult, Result};
 
@@ -851,22 +854,20 @@ mod tests {
         let url = Url::parse("memory:///").map_err(KernelError::from)?;
         let engine = SyncEngine::new_with_store(store.clone());
 
-        // Create commits 0-2
-        let base_commit = vec![
-            json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}),
-            json!({
-                "metaData": {
-                    "id": "test-id",
-                    "format": {"provider": "parquet", "options": {}},
-                    "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
-                    "partitionColumns": [],
-                    "configuration": {},
-                    "createdTime": 1587968585495i64
-                }
-            }),
+        let base_commit = [
+            Action::Protocol(Protocol::try_new_legacy(1, 2)?),
+            crate::unit_test_utils::metadata_action("test-id", &schema! {}, 1587968585495),
         ];
+        add_commit(
+            url.as_str(),
+            store.as_ref(),
+            0,
+            serialize_actions(base_commit),
+        )
+        .await
+        .unwrap();
 
-        commit(url.as_str(), store.as_ref(), 0, base_commit.clone()).await;
+        // Use raw JSON to keep these actions timestamp-only; typed CommitInfo adds other fields.
         commit(
             url.as_str(),
             store.as_ref(),
@@ -886,7 +887,6 @@ mod tests {
             .at_version(1)
             .build(&engine)?;
 
-        // Verify base snapshot has latest_commit_file at version 1
         assert_eq!(
             base_snapshot
                 .log_segment
@@ -897,7 +897,6 @@ mod tests {
             Some(1)
         );
 
-        // Create log_tail with FileMeta for version 2
         let commit_2_url = url
             .join("_delta_log/")
             .map_err(KernelError::from)?
@@ -912,7 +911,6 @@ mod tests {
             .ok_or_else(|| KernelError::Generic("Failed to parse log path".to_string()))?;
         let log_tail = vec![parsed_path];
 
-        // Create new snapshot from base to version 2 using try_new_from directly
         let new_snapshot = Snapshot::try_new_from(
             base_snapshot.clone(),
             log_tail,
@@ -925,7 +923,6 @@ mod tests {
             false, /* built_as_latest */
         )?;
 
-        // Latest commit should now be version 2
         assert_eq!(
             new_snapshot
                 .log_segment
@@ -1240,6 +1237,9 @@ mod tests {
         #[values(false, true)] skip_new_checkpoints: bool,
     ) -> Result<()> {
         // ===== GIVEN =====
+        // Install before building the snapshot so its span and the scans' child spans share a
+        // subscriber; otherwise a global subscriber set by a concurrent test owns the parent span.
+        let logging = LoggingTest::new();
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 3).await?;
         let base = Snapshot::builder_for(ctx.url.as_str())
@@ -1255,7 +1255,6 @@ mod tests {
 
         // ===== WHEN =====
         // Build an incremental scan, which consumes exactly the caller-selected commit range.
-        let logging = LoggingTest::new();
         let _incremental_scan = snapshot
             .clone()
             .incremental_scan_builder(0)

@@ -43,7 +43,7 @@ Review all documentation touched by or relevant to recent code changes in the PR
 - Inline code comments (`//`)
 - README.md files
 - CLAUDE.md files (project instructions)
-- Architecture docs (e.g., `CLAUDE/architecture.md`)
+- Architecture docs (e.g., `AGENTS/architecture.md`)
 - PR descriptions
 - Any other markdown or documentation files
 

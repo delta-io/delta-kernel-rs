@@ -79,9 +79,12 @@ impl IncrementalScanBuilder {
         self
     }
 
-    /// Build the incremental scan stream, or `None` if the target snapshot's commit list
-    /// cannot serve `(base_version, target_version]` (consumers should fall back to a full
-    /// scan via [`crate::Snapshot::scan_builder`]).
+    /// Build the incremental scan stream, or `None` if the range cannot be served from commit
+    /// JSONs (consumers should fall back to a full scan via [`crate::Snapshot::scan_builder`]).
+    /// That happens when the target snapshot's commit list does not cover
+    /// `(base_version, target_version]`, or when some commit in the range may record file actions
+    /// outside its commit JSON (e.g. adaptiveMetadata manifest commits). TODO(#2866): serve such
+    /// ranges by reading their file actions from the metadata tree instead of returning `None`.
     ///
     /// Does not re-list `_delta_log/`: walks the target snapshot's already-validated commit
     /// list and clips it to `(base_version, target_version]`. For catalog-managed tables
@@ -103,7 +106,7 @@ impl IncrementalScanBuilder {
     /// - [`KernelError::MissingColumn`] if a [`with_predicate`](Self::with_predicate) predicate
     ///   references a column absent from the table schema.
     /// - `Err` if the target snapshot's protocol contains an unsupported reader feature.
-    /// - `Err` if the engine fails to open the commit stream.
+    /// - `Err` if the engine fails to read the log.
     pub fn build(self, engine: &dyn Engine) -> Result<Option<IncrementalScanStream>> {
         // TODO(#2493): the version validation, the snapshot-commit-list extraction and
         // clipping below, and the "snapshot covers the range" check should all be replaced
@@ -156,6 +159,17 @@ impl IncrementalScanBuilder {
         // `CommitRange::build` (e.g. `KernelError::CommitsUnavailable { missing: Range<Version>
         // }`), pattern-matched here to return `None`.
         if snapshot_first_version.is_none_or(|v| v > start_version) {
+            return Ok(None);
+        }
+
+        // TODO(#2866): derive in-range manifest commits' file changes from the metadata tree
+        // instead of falling back.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if self
+            .target_snapshot
+            .last_manifest_commit(engine)?
+            .is_some_and(|last| last.may_have_tree_only_file_actions_after(self.base_version))
+        {
             return Ok(None);
         }
 
@@ -747,3 +761,6 @@ impl RowVisitor for IncrementalDedupVisitor<'_, '_> {
         Ok(())
     }
 }
+
+#[cfg(all(test, feature = "adaptive-metadata-in-dev"))]
+mod amt_tests;
