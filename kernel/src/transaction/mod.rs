@@ -943,6 +943,8 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
             txn_source,
             domain_metadata_source,
             num_log_commits_replayed,
+            num_txn_sidecars_read,
+            num_domain_metadata_sidecars_read,
         } = root_manifest_file.compute_checkpoint_action(
             engine,
             commit_version,
@@ -962,8 +964,8 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
             num_log_commits_replayed,
             num_txn_sidecars_kept: action.txn_sidecars.len() as u64,
             num_domain_metadata_sidecars_kept: action.domain_metadata_sidecars.len() as u64,
-            num_txn_sidecars_read: 0,
-            num_domain_metadata_sidecars_read: 0,
+            num_txn_sidecars_read,
+            num_domain_metadata_sidecars_read,
             duration: start.elapsed(),
         });
         Ok(Some(action))

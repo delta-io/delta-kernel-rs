@@ -20,12 +20,14 @@ use crate::table_configuration::TableConfiguration;
 use crate::{Engine, FileMeta, KernelResult, Version, version_as_i64};
 
 /// A `checkpoint` action computed by [`RootManifestFile::compute_checkpoint_action`], with where
-/// its set transactions and domain metadata came from.
+/// its set transactions and domain metadata came from and how many sidecars of each were read.
 pub(super) struct ComputedCheckpointAction {
     pub(super) action: CheckpointAction,
     pub(super) txn_source: CheckpointEntrySource,
     pub(super) domain_metadata_source: CheckpointEntrySource,
     pub(super) num_log_commits_replayed: u64,
+    pub(super) num_txn_sidecars_read: u64,
+    pub(super) num_domain_metadata_sidecars_read: u64,
 }
 
 /// A pointer to an on-disk root manifest file to be committed as the table's content root via a
@@ -121,6 +123,8 @@ impl RootManifestFile {
             txn_source: transactions.source,
             domain_metadata_source: domain_metadata.source,
             num_log_commits_replayed,
+            num_txn_sidecars_read: transactions.num_sidecars_read,
+            num_domain_metadata_sidecars_read: domain_metadata.num_sidecars_read,
         })
     }
 }
@@ -271,11 +275,13 @@ impl<'a> CheckpointEntryBase<'a> {
     }
 }
 
-/// The `T` entries for a new checkpoint action, the sidecars it keeps, and where they came from.
+/// The `T` entries for a new checkpoint action, the sidecars it keeps, where they came from, and
+/// how many of the checkpoint action's sidecars were read to compute them.
 struct CheckpointEntries<T> {
     entries: HashMap<String, T>,
     sidecars: Vec<Sidecar>,
     source: CheckpointEntrySource,
+    num_sidecars_read: u64,
 }
 
 /// Returns the `T` entries for the new checkpoint action.
@@ -307,6 +313,7 @@ fn checkpoint_entries<T: CheckpointActionEntry>(
         entries,
         sidecars: Vec::new(),
         source,
+        num_sidecars_read: 0,
     })
 }
 
@@ -328,14 +335,17 @@ fn fold_into_checkpoint_action<T: CheckpointActionEntry>(
     // the sidecars and moving them inline.
     // TODO(#2866): rewrite only the affected sidecars.
     let not_inline = || changes.keys().filter(|key| !inline.contains_key(*key));
+    let mut num_sidecars_read = 0;
     if !sidecars.is_empty() && not_inline().next().is_some() {
         let mut action_entries = T::read_from_action(engine, action, log_root)?;
+        num_sidecars_read = sidecars.len() as u64;
         if not_inline().any(|key| action_entries.contains_key(key)) {
             T::apply(&mut action_entries, changes);
             return Ok(CheckpointEntries {
                 entries: action_entries,
                 sidecars: Vec::new(),
                 source: CheckpointEntrySource::SidecarsInlined,
+                num_sidecars_read,
             });
         }
     }
@@ -344,6 +354,7 @@ fn fold_into_checkpoint_action<T: CheckpointActionEntry>(
         entries: inline,
         sidecars: sidecars.to_vec(),
         source: CheckpointEntrySource::CheckpointAction,
+        num_sidecars_read,
     })
 }
 
@@ -1147,6 +1158,15 @@ mod tests {
         assert_eq!(computed.txn_source, source(txn_row));
         assert_eq!(computed.domain_metadata_source, source(domain_row));
         assert_eq!(computed.num_log_commits_replayed, num_logged);
+        let num_read = |changes_kind| match changes_kind && row.sidecars_read {
+            true => row.sidecars.len() as u64,
+            false => 0,
+        };
+        assert_eq!(computed.num_txn_sidecars_read, num_read(txns_change));
+        assert_eq!(
+            computed.num_domain_metadata_sidecars_read,
+            num_read(domains_change)
+        );
         Ok(())
     }
 
@@ -1511,6 +1531,9 @@ mod tests {
         assert_eq!(computed.table_type, TableType::PathBased);
         assert_eq!(computed.num_txn_sidecars_kept, 2);
         assert_eq!(computed.num_domain_metadata_sidecars_kept, 1);
+        // `new` isn't inline, so every sidecar is read to check whether it holds `new`.
+        assert_eq!(computed.num_txn_sidecars_read, 2);
+        assert_eq!(computed.num_domain_metadata_sidecars_read, 1);
 
         let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
         let checkpoint = snapshot
