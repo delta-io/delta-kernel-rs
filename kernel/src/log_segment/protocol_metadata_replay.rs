@@ -487,7 +487,7 @@ impl PmReplaySegment {
             // Without a listed commit containing the pointed action, the newest commit's own
             // action (if any) bounds the range; otherwise every older commit is read.
             None => match &newest.checkpoint {
-                Some((_, action)) => (Some(as_version(action.version())?), None),
+                Some((_, action)) => (Some(action.version()), None),
                 None => (None, None),
             },
         };
@@ -841,7 +841,8 @@ fn is_final<T>(winner: &Option<(i64, T)>, batch_version: Option<i64>) -> bool {
 /// `checkpointMetadata.version`.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 fn checkpoint_pm(checkpoint: &CheckpointAction) -> ((i64, Protocol), (i64, Metadata)) {
-    let version = checkpoint.version();
+    // Only actions parsed from the log reach replay, and parsing read the version from an i64.
+    let version = i64::try_from(checkpoint.version()).unwrap_or(i64::MAX);
     (
         (version, checkpoint.protocol().clone()),
         (version, checkpoint.metadata().clone()),

@@ -1065,20 +1065,18 @@ impl LogSegment {
         stats_schema: Option<&StructType>,
         stats_parsed: bool,
     ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
-        let version = Version::try_from(checkpoint.version())
-            .ok()
-            .filter(|v| *v <= self.end_version)
-            .ok_or_else(|| {
-                KernelError::invalid_checkpoint(format!(
-                    "checkpoint action version {} is outside the log segment's versions 0..={}",
-                    checkpoint.version(),
-                    self.end_version
-                ))
-            })?;
+        let version = checkpoint.version();
+        require!(
+            version <= self.end_version,
+            KernelError::invalid_checkpoint(format!(
+                "checkpoint action version {version} is outside the log segment's versions 0..={}",
+                self.end_version
+            ))
+        );
         // A manifest commit's checkpoint action covers its version with the tree alone; an older
         // root needs the inline file actions only a standalone checkpoint carries.
         require!(
-            checkpoint.content_root_version() == checkpoint.version(),
+            Version::try_from(checkpoint.content_root_version()) == Ok(version),
             KernelError::unsupported(format!(
                 "reading a checkpoint action whose content root version {} is older than its \
                  version {version} is not yet supported",

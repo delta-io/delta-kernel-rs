@@ -522,11 +522,10 @@ mod tests {
     }
 
     #[rstest]
-    #[case::negative(-1, -1, "version -1 is outside the log segment's versions 0..=3")]
     #[case::after_segment_end(4, 4, "version 4 is outside the log segment's versions 0..=3")]
     #[case::older_content_root(2, 1, "content root version 1 is older than its version 2")]
     fn rejects_checkpoint_action_versions_it_cannot_read(
-        #[case] version: i64,
+        #[case] version: Version,
         #[case] content_root_version: i64,
         #[case] message: &str,
     ) {

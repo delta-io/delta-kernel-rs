@@ -89,12 +89,13 @@ impl RootManifestFile {
             calculate_transaction_expiration_timestamp(table_config.table_properties())?;
         transactions.retain(|_, txn| !txn.is_expired(expiration_timestamp));
 
-        let version = version_as_i64(commit_version)?;
+        let content_root_version = version_as_i64(commit_version)?;
         let size = i64::try_from(self.file.size)
             .map_err(|_| KernelError::generic("root manifest file size exceeds i64::MAX"))?;
+        let path = self.file.location.to_string();
         Ok(CheckpointAction {
-            version,
-            content_root: ContentRoot::new(self.file.location.to_string(), size, version),
+            version: commit_version,
+            content_root: ContentRoot::new(path, size, content_root_version),
             protocol: table_config.protocol().clone(),
             metadata: table_config.metadata().clone(),
             transactions: transactions.into_values().collect(),
@@ -214,7 +215,7 @@ fn changes_after_checkpoint_action(
     snapshot: &Snapshot,
     action: &CheckpointAction,
 ) -> KernelResult<CrcDelta> {
-    let base = action.checkpoint_version()?;
+    let base = action.version();
     if base == snapshot.version() {
         return Ok(CrcDelta::default());
     }

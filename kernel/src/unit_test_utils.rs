@@ -503,10 +503,10 @@ pub(crate) mod adaptive_metadata_fixtures {
         version: Version,
     ) -> KernelResult<CheckpointAction> {
         let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
-        let version = version_as_i64(version)?;
+        let content_root_version = version_as_i64(version)?;
         Ok(CheckpointAction::new(
             version,
-            ContentRoot::new(path.to_string(), size_in_bytes, version),
+            ContentRoot::new(path.to_string(), size_in_bytes, content_root_version),
             protocol,
             metadata,
             vec![],
