@@ -377,6 +377,17 @@ void print_table_type(TableType tt) {
   }
 }
 
+void print_checkpoint_entry_source(const char* name, CheckpointEntrySource source) {
+  printf("  %s:", name);
+  switch (source) {
+  case CheckpointEntrySourceCrc: printf(" Crc,\n"); break;
+  case CheckpointEntrySourceSnapshot: printf(" Snapshot,\n"); break;
+  case CheckpointEntrySourceCheckpointAction: printf(" CheckpointAction,\n"); break;
+  case CheckpointEntrySourceSidecarsInlined: printf(" SidecarsInlined,\n"); break;
+  case CheckpointEntrySourceUnknown: printf(" Unknown,\n"); break;
+  }
+}
+
 void print_load_type(SnapshotLoadType lt) {
   printf("  load_type:");
   switch (lt) {
@@ -685,6 +696,22 @@ void print_metric(MetricEvent event) {
     case LastCheckpointReadOutcomeUnknown: printf(" Unknown,\n"); break;
     }
     PM_U64(hint, duration_ns);
+    PM_END;
+    return;
+
+  case MetricEventCheckpointActionComputed:
+    PM_START(CheckpointActionComputed);
+    CheckpointActionComputed cac = event.checkpoint_action_computed;
+    PM_ID(cac, operation_id);
+    PM_SLICE(cac, correlation_id);
+    print_table_type(cac.table_type);
+    PM_U64(cac, commit_version);
+    print_checkpoint_entry_source("txn_source", cac.txn_source);
+    print_checkpoint_entry_source("domain_metadata_source", cac.domain_metadata_source);
+    PM_U64(cac, num_log_commits_replayed);
+    PM_U64(cac, num_txn_sidecars_kept);
+    PM_U64(cac, num_domain_metadata_sidecars_kept);
+    PM_U64(cac, duration_ns);
     PM_END;
     return;
 

@@ -52,6 +52,32 @@ impl From<kernel::ScanType> for ScanType {
     }
 }
 
+/// Where a [`CheckpointActionComputed`] event's entries came from. See
+/// [`delta_kernel::metrics::CheckpointEntrySource`].
+///
+/// cbindgen:prefix-with-name=true
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum CheckpointEntrySource {
+    Crc,
+    Snapshot,
+    CheckpointAction,
+    SidecarsInlined,
+    Unknown,
+}
+
+impl From<kernel::CheckpointEntrySource> for CheckpointEntrySource {
+    fn from(source: kernel::CheckpointEntrySource) -> Self {
+        match source {
+            kernel::CheckpointEntrySource::Crc => Self::Crc,
+            kernel::CheckpointEntrySource::Snapshot => Self::Snapshot,
+            kernel::CheckpointEntrySource::CheckpointAction => Self::CheckpointAction,
+            kernel::CheckpointEntrySource::SidecarsInlined => Self::SidecarsInlined,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 /// Why a transaction commit did not succeed.
 ///
 /// cbindgen:prefix-with-name=true
@@ -664,6 +690,22 @@ pub struct StorageCopyCompleted {
     pub duration_ns: u64,
 }
 
+/// A root manifest commit computed its `checkpoint` action. See
+/// [`delta_kernel::metrics::CheckpointActionComputed`] for field semantics.
+#[repr(C)]
+pub struct CheckpointActionComputed {
+    pub operation_id: MetricId,
+    pub correlation_id: KernelStringSlice,
+    pub table_type: TableType,
+    pub commit_version: u64,
+    pub txn_source: CheckpointEntrySource,
+    pub domain_metadata_source: CheckpointEntrySource,
+    pub num_log_commits_replayed: u64,
+    pub num_txn_sidecars_kept: u64,
+    pub num_domain_metadata_sidecars_kept: u64,
+    pub duration_ns: u64,
+}
+
 /// C version of [`delta_kernel::metrics::MetricEvent`]. Passed by value to a callback registered
 /// via [`crate::ffi_tracing::enable_metrics_reporting`].
 ///
@@ -695,6 +737,7 @@ pub enum MetricEvent {
     ChecksumWriteSuccess(ChecksumWriteSuccess),
     ChecksumWriteFailure(ChecksumWriteFailure),
     LastCheckpointReadCompleted(LastCheckpointReadCompleted),
+    CheckpointActionComputed(CheckpointActionComputed),
 }
 
 fn duration_ns(duration: std::time::Duration) -> u64 {
@@ -1013,6 +1056,29 @@ impl MetricEvent {
                 duration_ns: duration_ns(*duration),
                 processing_stats: (*processing_stats).into(),
                 output_stats: (*output_stats).into(),
+            }),
+            K::CheckpointActionComputed(kernel::CheckpointActionComputed {
+                operation_id,
+                correlation_id,
+                table_type,
+                commit_version,
+                txn_source,
+                domain_metadata_source,
+                num_log_commits_replayed,
+                num_txn_sidecars_kept,
+                num_domain_metadata_sidecars_kept,
+                duration,
+            }) => Self::CheckpointActionComputed(CheckpointActionComputed {
+                operation_id: (*operation_id).into(),
+                correlation_id: correlation_id_slice(correlation_id.as_deref()),
+                table_type: (*table_type).into(),
+                commit_version: *commit_version,
+                txn_source: (*txn_source).into(),
+                domain_metadata_source: (*domain_metadata_source).into(),
+                num_log_commits_replayed: *num_log_commits_replayed,
+                num_txn_sidecars_kept: *num_txn_sidecars_kept,
+                num_domain_metadata_sidecars_kept: *num_domain_metadata_sidecars_kept,
+                duration_ns: duration_ns(*duration),
             }),
         }
     }
@@ -1513,6 +1579,44 @@ mod tests {
     }
 
     #[test]
+    fn from_kernel_checkpoint_action_computed_maps_all_fields() {
+        let id = kernel::MetricId::new();
+        let event =
+            kernel::MetricEvent::CheckpointActionComputed(kernel::CheckpointActionComputed {
+                operation_id: id,
+                correlation_id: Some("commit-req".into()),
+                table_type: kernel::TableType::CatalogManaged,
+                commit_version: 7,
+                txn_source: kernel::CheckpointEntrySource::Crc,
+                domain_metadata_source: kernel::CheckpointEntrySource::SidecarsInlined,
+                num_log_commits_replayed: 3,
+                num_txn_sidecars_kept: 2,
+                num_domain_metadata_sidecars_kept: 5,
+                duration: Duration::from_nanos(11),
+            });
+        with_ffi_event(&event, |ffi| {
+            let MetricEvent::CheckpointActionComputed(e) = ffi else {
+                panic!("expected CheckpointActionComputed");
+            };
+            assert_eq!(e.operation_id.bytes, id.as_bytes());
+            let cid: &str =
+                unsafe { TryFromStringSlice::try_from_slice(&e.correlation_id).unwrap() };
+            assert_eq!(cid, "commit-req");
+            assert!(matches!(e.table_type, TableType::CatalogManaged));
+            assert_eq!(e.commit_version, 7);
+            assert_eq!(e.txn_source, CheckpointEntrySource::Crc);
+            assert_eq!(
+                e.domain_metadata_source,
+                CheckpointEntrySource::SidecarsInlined
+            );
+            assert_eq!(e.num_log_commits_replayed, 3);
+            assert_eq!(e.num_txn_sidecars_kept, 2);
+            assert_eq!(e.num_domain_metadata_sidecars_kept, 5);
+            assert_eq!(e.duration_ns, 11);
+        });
+    }
+
+    #[test]
     fn from_kernel_protocol_metadata_load_success_maps_source() {
         let id = kernel::MetricId::new();
         let event =
@@ -1656,6 +1760,28 @@ mod tests {
         #[case] expected: SnapshotLoadType,
     ) {
         assert_eq!(SnapshotLoadType::from(source), expected);
+    }
+
+    #[rstest]
+    #[case::crc(kernel::CheckpointEntrySource::Crc, CheckpointEntrySource::Crc)]
+    #[case::snapshot(
+        kernel::CheckpointEntrySource::Snapshot,
+        CheckpointEntrySource::Snapshot
+    )]
+    #[case::checkpoint_action(
+        kernel::CheckpointEntrySource::CheckpointAction,
+        CheckpointEntrySource::CheckpointAction
+    )]
+    #[case::sidecars_inlined(
+        kernel::CheckpointEntrySource::SidecarsInlined,
+        CheckpointEntrySource::SidecarsInlined
+    )]
+    #[case::unknown(kernel::CheckpointEntrySource::Unknown, CheckpointEntrySource::Unknown)]
+    fn kernel_checkpoint_entry_source_maps_to_ffi_variant(
+        #[case] source: kernel::CheckpointEntrySource,
+        #[case] expected: CheckpointEntrySource,
+    ) {
+        assert_eq!(CheckpointEntrySource::from(source), expected);
     }
 
     #[test]
