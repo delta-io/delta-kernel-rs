@@ -888,7 +888,7 @@ impl<'a> CrcBacking<'a> {
     /// while using the view, which may point to its inline histogram records.
     pub(crate) fn as_ffi(&self) -> FfiCrc {
         let file_stats_state = match self.source.file_stats_state() {
-            FileStatsState::Indeterminate => FfiFileStatsState {
+            FileStatsState::Indeterminate { .. } => FfiFileStatsState {
                 kind: FfiFileStatsStateKind::Indeterminate,
                 file_stats: FfiFileStats {
                     num_files: 0,
@@ -1336,7 +1336,9 @@ impl FfiFileStatsState {
                     .map(|value| unsafe { value.try_to_kernel() })
                     .transpose()?,
             )?)),
-            FfiFileStatsStateKind::Indeterminate => Ok(FileStatsState::Indeterminate),
+            FfiFileStatsStateKind::Indeterminate => Ok(FileStatsState::Indeterminate {
+                unsupported_operation: None,
+            }),
         }
     }
 }

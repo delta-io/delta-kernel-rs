@@ -158,8 +158,9 @@ message ParseJsonExpression {
 message MapToStructOptions {
   // Optional connector-supplied IANA timezone, normalized fixed offset (`+HH:MM[:SS]` or
   // `-HH:MM[:SS]`), or `Z` (UTC) for offset-less TIMESTAMP values. Kernel never infers this from
-  // the host or table metadata. A timezone or offset in a value takes precedence; absence means
-  // UTC.
+  // the host or table metadata. Exact uppercase EST, MST, and HST use fixed offsets -05:00,
+  // -07:00, and -10:00, respectively. Full IANA region names preserve historical clock transitions.
+  // A timezone or offset in a value takes precedence; absence means UTC.
   optional string timestamp_timezone = 1;
 }
 

@@ -145,7 +145,9 @@ pub trait SchemaTransform<'a> {
     /// General entry point for a recursive traversal over any data type. Also invoked internally to
     /// dispatch on nested data types encountered during the traversal.
     fn transform(&mut self, data_type: &'a DataType) -> Self::Output<DataType> {
-        match data_type {
+        // Decoding accepts schemas whose traversal can exhaust the caller's stack.
+        // Match serde_stacker's defaults: keep 64 KiB in reserve and use 2 MiB stack segments.
+        stacker::maybe_grow(64 * 1024, 2 * 1024 * 1024, || match data_type {
             DataType::Primitive(ptype) => {
                 let child = self.transform_primitive(ptype);
                 map_owned_or_else(data_type, child, DataType::from)
@@ -175,7 +177,7 @@ pub trait SchemaTransform<'a> {
                 let child = self.transform_file(stype);
                 map_owned_or_else(data_type, child, |s| DataType::File(Box::new(s)))
             }
-        }
+        })
     }
 
     /// Recursively transforms a struct field's data type (unary).

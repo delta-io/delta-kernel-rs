@@ -392,7 +392,7 @@ async fn test_insert_without_publish_hits_limit() -> Result<(), TestError> {
         .commit(&engine)
         .unwrap_err();
     assert!(
-        matches!(err, delta_kernel::KernelError::Generic(msg) if msg.contains("Max unpublished commits"))
+        matches!(err, delta_kernel::Error::Kernel(delta_kernel::KernelError::Generic(msg)) if msg.contains("Max unpublished commits"))
     );
     Ok(())
 }
@@ -476,6 +476,23 @@ async fn test_published_snapshot_reads_after_staged_files_are_deleted(
         std::fs::remove_dir_all(&staged_dir)?;
     }
 
+    // THEN: every retained commit reference carries its published file's storage metadata.
+    let listed = &published.log_segment().listed;
+    let storage = engine.storage_handler();
+    for file in listed
+        .ascending_commit_files
+        .iter()
+        .chain(listed.latest_commit_file.iter())
+    {
+        assert_eq!(file.file_type, LogPathFileType::Commit);
+        assert_eq!(
+            file.location,
+            storage.head(&file.location.location)?,
+            "commit {}",
+            file.version
+        );
+    }
+
     let latest = published
         .log_segment()
         .listed
@@ -484,9 +501,7 @@ async fn test_published_snapshot_reads_after_staged_files_are_deleted(
         .unwrap();
     let ict = 1749830881799;
 
-    // THEN: read the in-commit timestamp, scan 200 rows, and create a checkpoint without staged
-    // files. With no CRC at version 2, get_timestamp() must read commitInfo from the published
-    // commit file.
+    // With no CRC at version 2, get_timestamp() must read commitInfo from the published file.
     assert_ne!(latest.location.last_modified, ict);
     assert!(published.crc_at_version().is_none());
     assert_eq!(published.reader().get_timestamp(engine.as_ref())?, ict);
@@ -573,7 +588,10 @@ async fn test_publish_retries_after_partial_copy_failure() -> Result<(), TestErr
     let error = snapshot
         .publish(engine.as_ref(), &uc_committer(&update_table_client))
         .unwrap_err();
-    assert!(matches!(error, KernelError::FileNotFound(_)));
+    assert!(matches!(
+        error,
+        delta_kernel::Error::Kernel(KernelError::FileNotFound(_))
+    ));
 
     // THEN: commit 1's published file exists, but commit 2's does not.
     let log_dir = tmp_dir.path().join("_delta_log");
@@ -609,7 +627,7 @@ async fn test_cannot_checkpoint_unpublished_snapshot() -> Result<(), TestError> 
     let err = snapshot.checkpoint(&engine, None).unwrap_err();
     assert!(matches!(
         err,
-        delta_kernel::KernelError::UnpublishedVersion(1)
+        delta_kernel::Error::Kernel(delta_kernel::KernelError::UnpublishedVersion(1))
     ));
     Ok(())
 }

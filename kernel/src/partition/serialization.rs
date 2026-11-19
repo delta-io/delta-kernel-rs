@@ -14,8 +14,10 @@
 
 use chrono::{DateTime, NaiveDate, Utc};
 
-use crate::expressions::{DecimalData, IntervalYearMonthData, MONTHS_PER_YEAR, Scalar};
-use crate::schema::IntervalYearToMonthType;
+use crate::expressions::{
+    DecimalData, IntervalDayTimeData, IntervalYearMonthData, MONTHS_PER_YEAR, Scalar,
+};
+use crate::schema::{IntervalDayToSecondType, IntervalYearToMonthType};
 use crate::{KernelError, KernelResult};
 
 /// The UNIX epoch (1970-01-01) expressed as a CE day number for chrono's
@@ -95,7 +97,7 @@ pub fn serialize_partition_value(value: &Scalar) -> KernelResult<Option<String>>
         Scalar::Timestamp(us) => Ok(Some(format_timestamp(*us)?)),
         Scalar::TimestampNtz(us) => Ok(Some(format_timestamp_ntz(*us)?)),
         Scalar::IntervalYearMonth(data) => Ok(Some(format_year_month_interval(data)?)),
-        Scalar::IntervalDayTime(micros) => Ok(Some(format_day_time_interval(*micros))),
+        Scalar::IntervalDayTime(data) => Ok(Some(format_day_time_interval(data)?)),
         Scalar::Decimal(d) => Ok(Some(format_decimal(d))),
         Scalar::Binary(b) if b.is_empty() => Ok(None),
         Scalar::Binary(b) => Ok(Some(format_binary(b)?)),
@@ -218,7 +220,15 @@ fn format_year_month_interval(data: &IntervalYearMonthData) -> KernelResult<Stri
     }
 }
 
-fn format_day_time_interval(micros: i64) -> String {
+fn format_day_time_interval(data: &IntervalDayTimeData) -> KernelResult<String> {
+    let micros = data.micros();
+    let unit = data.ty().unit_micros();
+    if micros % unit != 0 {
+        return Err(KernelError::invalid_partition_values(format!(
+            "{0} partition value {micros} microseconds is not divisible by {unit}",
+            data.ty()
+        )));
+    }
     let sign = if micros < 0 { "-" } else { "" };
     let abs = micros.unsigned_abs();
     let fraction = format!("{:06}", abs % 1_000_000);
@@ -228,9 +238,26 @@ fn format_day_time_interval(micros: i64) -> String {
     let (secs, total_mins) = (total_secs % 60, total_secs / 60);
     let (mins, total_hours) = (total_mins % 60, total_mins / 60);
     let (hours, days) = (total_hours % 24, total_hours / 24);
-    format!(
-        "INTERVAL '{sign}{days} {hours:02}:{mins:02}:{secs:02}{separator}{fraction}' DAY TO SECOND"
-    )
+    use IntervalDayToSecondType::*;
+    let body = match data.ty() {
+        IntervalDay => format!("{days}"),
+        IntervalHour => format!("{total_hours}"),
+        IntervalMinute => format!("{total_mins}"),
+        IntervalSecond => format!("{total_secs}{separator}{fraction}"),
+        IntervalDayToHour => format!("{days} {hours:02}"),
+        IntervalDayToMinute => format!("{days} {hours:02}:{mins:02}"),
+        IntervalDayToSecond => {
+            format!("{days} {hours:02}:{mins:02}:{secs:02}{separator}{fraction}")
+        }
+        IntervalHourToMinute => format!("{total_hours}:{mins:02}"),
+        IntervalHourToSecond => format!("{total_hours}:{mins:02}:{secs:02}{separator}{fraction}"),
+        IntervalMinuteToSecond => format!("{total_mins}:{secs:02}{separator}{fraction}"),
+    };
+    let qualifier = data.ty().to_string();
+    let qualifier = qualifier
+        .trim_start_matches("interval ")
+        .to_ascii_uppercase();
+    Ok(format!("INTERVAL '{sign}{body}' {qualifier}"))
 }
 
 /// Formats a decimal value preserving scale (trailing zeros).
@@ -594,12 +621,21 @@ mod tests {
         PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth)
     )]
     #[case::interval_dt(
-        Scalar::IntervalDayTime(131_445_000_000),
-        PrimitiveType::IntervalDayTime
+        Scalar::interval_day_time(131_445_000_000, IntervalDayToSecondType::IntervalDayToSecond).unwrap(),
+        PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalDayToSecond)
     )]
-    #[case::interval_dt_neg(Scalar::IntervalDayTime(-5), PrimitiveType::IntervalDayTime)]
-    #[case::interval_dt_min(Scalar::IntervalDayTime(i64::MIN), PrimitiveType::IntervalDayTime)]
-    #[case::interval_dt_max(Scalar::IntervalDayTime(i64::MAX), PrimitiveType::IntervalDayTime)]
+    #[case::interval_dt_neg(Scalar::interval_day_time(-5, IntervalDayToSecondType::IntervalDayToSecond).unwrap(), PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalDayToSecond))]
+    #[case::interval_dt_min(Scalar::interval_day_time(i64::MIN, IntervalDayToSecondType::IntervalDayToSecond).unwrap(), PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalDayToSecond))]
+    #[case::interval_dt_max(Scalar::interval_day_time(i64::MAX, IntervalDayToSecondType::IntervalDayToSecond).unwrap(), PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalDayToSecond))]
+    #[case::interval_day(Scalar::interval_day_time(86_400_000_000, IntervalDayToSecondType::IntervalDay).unwrap(), PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalDay))]
+    #[case::interval_hour(Scalar::interval_day_time(93_600_000_000, IntervalDayToSecondType::IntervalHour).unwrap(), PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalHour))]
+    #[case::interval_minute(Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalMinute).unwrap(), PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalMinute))]
+    #[case::interval_second(Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalSecond).unwrap(), PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalSecond))]
+    #[case::interval_day_hour(Scalar::interval_day_time(93_600_000_000, IntervalDayToSecondType::IntervalDayToHour).unwrap(), PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalDayToHour))]
+    #[case::interval_day_minute(Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalDayToMinute).unwrap(), PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalDayToMinute))]
+    #[case::interval_hour_minute(Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalHourToMinute).unwrap(), PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalHourToMinute))]
+    #[case::interval_hour_second(Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalHourToSecond).unwrap(), PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalHourToSecond))]
+    #[case::interval_minute_second(Scalar::interval_day_time(93_784_500_000, IntervalDayToSecondType::IntervalMinuteToSecond).unwrap(), PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalMinuteToSecond))]
     fn test_roundtrip(#[case] input: Scalar, #[case] ptype: PrimitiveType) {
         let serialized = serialize_partition_value(&input).unwrap().unwrap();
         let parsed = ptype.parse_scalar(&serialized).unwrap();
@@ -618,7 +654,7 @@ mod tests {
         "INTERVAL '2-6' YEAR TO MONTH"
     )]
     #[case(
-        Scalar::IntervalDayTime(131_445_000_000),
+        Scalar::interval_day_time(131_445_000_000, IntervalDayToSecondType::IntervalDayToSecond).unwrap(),
         "INTERVAL '1 12:30:45' DAY TO SECOND"
     )]
     fn test_spark_ref_interval(#[case] input: Scalar, #[case] expected: &str) {
@@ -688,6 +724,87 @@ mod tests {
         assert_eq!(
             serialize_partition_value(&input).unwrap().as_deref(),
             Some(expected)
+        );
+    }
+
+    #[rstest]
+    #[case(0, IntervalDayToSecondType::IntervalDay, "INTERVAL '0' DAY")]
+    #[case(
+        86_400_000_000,
+        IntervalDayToSecondType::IntervalDay,
+        "INTERVAL '1' DAY"
+    )]
+    #[case(-86_400_000_000, IntervalDayToSecondType::IntervalDay, "INTERVAL '-1' DAY")]
+    #[case(
+        93_600_000_000,
+        IntervalDayToSecondType::IntervalHour,
+        "INTERVAL '26' HOUR"
+    )]
+    #[case(
+        93_780_000_000,
+        IntervalDayToSecondType::IntervalMinute,
+        "INTERVAL '1563' MINUTE"
+    )]
+    #[case(
+        93_784_500_000,
+        IntervalDayToSecondType::IntervalSecond,
+        "INTERVAL '93784.5' SECOND"
+    )]
+    #[case(
+        93_600_000_000,
+        IntervalDayToSecondType::IntervalDayToHour,
+        "INTERVAL '1 02' DAY TO HOUR"
+    )]
+    #[case(
+        93_780_000_000,
+        IntervalDayToSecondType::IntervalDayToMinute,
+        "INTERVAL '1 02:03' DAY TO MINUTE"
+    )]
+    #[case(
+        93_784_500_000,
+        IntervalDayToSecondType::IntervalDayToSecond,
+        "INTERVAL '1 02:03:04.5' DAY TO SECOND"
+    )]
+    #[case(
+        93_780_000_000,
+        IntervalDayToSecondType::IntervalHourToMinute,
+        "INTERVAL '26:03' HOUR TO MINUTE"
+    )]
+    #[case(
+        93_784_500_000,
+        IntervalDayToSecondType::IntervalHourToSecond,
+        "INTERVAL '26:03:04.5' HOUR TO SECOND"
+    )]
+    #[case(
+        93_784_500_000,
+        IntervalDayToSecondType::IntervalMinuteToSecond,
+        "INTERVAL '1563:04.5' MINUTE TO SECOND"
+    )]
+    #[case(
+        i64::MIN,
+        IntervalDayToSecondType::IntervalSecond,
+        "INTERVAL '-9223372036854.775808' SECOND"
+    )]
+    #[case(
+        i64::MAX,
+        IntervalDayToSecondType::IntervalSecond,
+        "INTERVAL '9223372036854.775807' SECOND"
+    )]
+    fn test_day_time_interval_formats_by_qualifier(
+        #[case] micros: i64,
+        #[case] qualifier: IntervalDayToSecondType,
+        #[case] expected: &str,
+    ) {
+        let input = Scalar::interval_day_time(micros, qualifier).unwrap();
+        assert_eq!(
+            serialize_partition_value(&input).unwrap().as_deref(),
+            Some(expected)
+        );
+        assert_eq!(
+            PrimitiveType::interval_day_time(qualifier)
+                .parse_scalar(expected)
+                .unwrap(),
+            input
         );
     }
 

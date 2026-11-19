@@ -451,13 +451,12 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::Engine;
     use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
-    use crate::object_store::memory::InMemory;
     use crate::schema::{MetadataValue, schema_ref};
     use crate::transaction::create_table::create_table;
     use crate::transaction::data_layout::DataLayout;
+    use crate::{Engine, Result};
 
     fn partitioned_write_state(
         column_mapping_mode: ColumnMappingMode,
@@ -485,8 +484,7 @@ mod tests {
             );
         }
 
-        let engine: Arc<dyn Engine> =
-            Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let engine: Arc<dyn Engine> = Arc::new(SyncEngine::in_memory());
         let txn = create_table(
             "memory:///table",
             schema_ref! {
@@ -716,7 +714,7 @@ mod tests {
     fn physical_partition_names_differing_only_by_case_bind_separately(
         #[case] column_mapping_mode: ColumnMappingMode,
         #[case] mode_property: &str,
-    ) -> KernelResult<()> {
+    ) -> Result<()> {
         let physical_field = |logical_name: &str, physical_name: &str, id: i64| {
             StructField::not_null(logical_name, DataType::INTEGER).with_metadata([
                 ("delta.columnMapping.id", MetadataValue::Number(id)),
@@ -731,8 +729,7 @@ mod tests {
             physical_field("second", "part", 2),
             StructField::nullable("value", DataType::INTEGER),
         ])?);
-        let engine: Arc<dyn Engine> =
-            Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let engine: Arc<dyn Engine> = Arc::new(SyncEngine::in_memory());
         let txn = create_table("memory:///case_sensitive_partitions", schema, "test", true)
             .with_data_layout(DataLayout::partitioned(["first", "second"]))
             .with_table_properties([("delta.columnMapping.mode", mode_property)])

@@ -114,7 +114,7 @@ pub fn transform_to_logical(
             .new_expression_evaluator(
                 physical_schema.clone(),
                 transform,
-                logical_schema.clone().into(), // TODO: expensive deep clone!
+                logical_schema.share_selected_fields(|_| true).into(),
             )?
             .evaluate(physical_data.as_ref()),
         None => Ok(physical_data),

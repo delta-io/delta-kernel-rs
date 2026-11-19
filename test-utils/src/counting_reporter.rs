@@ -6,11 +6,11 @@
 
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
+pub use delta_kernel::engine::RelaxedCounter;
 use delta_kernel::metrics::{
-    CommitFailureReason, MetricEvent, MetricsReporter, SnapshotLoadType,
+    CommitFailureReason, LastCheckpointReadOutcome, MetricEvent, MetricsReporter, SnapshotLoadType,
     WithMetricsReporterLayer as _,
 };
 use tracing::subscriber::DefaultGuard;
@@ -86,35 +86,6 @@ pub fn ensure_metrics_compatible_global_subscriber() {
             tracing::callsite::rebuild_interest_cache();
         }
     });
-}
-
-/// An atomic `u64` counter using [`Ordering::Relaxed`] throughout.
-///
-/// Relaxed ordering is sufficient here: metrics are reported after the operations they
-/// describe have completed, so there are no inter-counter ordering dependencies.
-#[derive(Debug, Default)]
-pub struct RelaxedCounter(AtomicU64);
-
-impl RelaxedCounter {
-    /// Increment the counter by one.
-    pub fn inc(&self) {
-        self.0.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Add `n` to the counter.
-    pub fn add(&self, n: u64) {
-        self.0.fetch_add(n, Ordering::Relaxed);
-    }
-
-    /// Read the current value.
-    pub fn get(&self) -> u64 {
-        self.0.load(Ordering::Relaxed)
-    }
-
-    /// Reset the counter to zero.
-    pub fn reset(&self) {
-        self.0.store(0, Ordering::Relaxed);
-    }
 }
 
 /// Status label for a snapshot completion.
@@ -220,6 +191,20 @@ pub struct CountingReporter {
     /// Total number of bytes read from CRC files, across all CRC read calls.
     pub crc_bytes_read: RelaxedCounter,
 
+    // _last_checkpoint reader counters
+    /// Number of `_last_checkpoint` read attempts.
+    pub last_checkpoint_reads: RelaxedCounter,
+    /// Number of hints parsed and retained.
+    pub last_checkpoint_read_successes: RelaxedCounter,
+    /// Number of read attempts where storage reported the hint absent.
+    pub last_checkpoint_read_not_found: RelaxedCounter,
+    /// Number of read attempts that produced an invalid hint.
+    pub last_checkpoint_read_invalid: RelaxedCounter,
+    /// Number of read attempts that returned another error.
+    pub last_checkpoint_read_errors: RelaxedCounter,
+    /// Number of read attempts with an unrecorded or unrecognized outcome.
+    pub last_checkpoint_read_unknown: RelaxedCounter,
+
     // Domain metadata load counters (Snapshot::get_domain_metadatas_internal)
     pub domain_metadata_loads: RelaxedCounter,
     pub domain_metadata_load_failures: RelaxedCounter,
@@ -282,6 +267,12 @@ impl CountingReporter {
         self.latest_crc_files_found.reset();
         self.crc_read_calls.reset();
         self.crc_bytes_read.reset();
+        self.last_checkpoint_reads.reset();
+        self.last_checkpoint_read_successes.reset();
+        self.last_checkpoint_read_not_found.reset();
+        self.last_checkpoint_read_invalid.reset();
+        self.last_checkpoint_read_errors.reset();
+        self.last_checkpoint_read_unknown.reset();
         self.domain_metadata_loads.reset();
         self.domain_metadata_load_failures.reset();
         self.domain_metadata_cache_hits.reset();
@@ -380,6 +371,18 @@ impl MetricsReporter for CountingReporter {
                 self.crc_read_calls.inc();
                 self.crc_bytes_read.add(e.bytes_read);
             }
+            MetricEvent::LastCheckpointReadCompleted(e) => {
+                self.last_checkpoint_reads.inc();
+                match e.outcome {
+                    LastCheckpointReadOutcome::Success => self.last_checkpoint_read_successes.inc(),
+                    LastCheckpointReadOutcome::NotFound => {
+                        self.last_checkpoint_read_not_found.inc()
+                    }
+                    LastCheckpointReadOutcome::Invalid => self.last_checkpoint_read_invalid.inc(),
+                    LastCheckpointReadOutcome::Error => self.last_checkpoint_read_errors.inc(),
+                    LastCheckpointReadOutcome::Unknown => self.last_checkpoint_read_unknown.inc(),
+                }
+            }
             MetricEvent::DomainMetadataLoadSuccess(e) => {
                 self.domain_metadata_loads.inc();
                 if e.from_cache {
@@ -426,6 +429,8 @@ impl MetricsReporter for CountingReporter {
             | MetricEvent::CrcReadFailure
             | MetricEvent::CheckpointWriteSuccess(_)
             | MetricEvent::CheckpointWriteFailure(_)
+            | MetricEvent::ChecksumWriteSuccess(_)
+            | MetricEvent::ChecksumWriteFailure(_)
             | MetricEvent::ScanMetadataCompleted(_) => {}
         }
     }
@@ -469,6 +474,55 @@ mod tests {
 
     fn dur() -> Duration {
         Duration::from_millis(1)
+    }
+
+    #[rstest]
+    #[case(LastCheckpointReadOutcome::Success)]
+    #[case(LastCheckpointReadOutcome::NotFound)]
+    #[case(LastCheckpointReadOutcome::Invalid)]
+    #[case(LastCheckpointReadOutcome::Error)]
+    #[case(LastCheckpointReadOutcome::Unknown)]
+    fn last_checkpoint_read_counts_one_attempt_and_outcome_then_resets(
+        #[case] outcome: LastCheckpointReadOutcome,
+    ) {
+        let reporter = CountingReporter::new();
+        reporter.report(MetricEvent::LastCheckpointReadCompleted(
+            delta_kernel::metrics::LastCheckpointReadCompleted {
+                outcome,
+                duration: dur(),
+            },
+        ));
+        assert_eq!(reporter.last_checkpoint_reads.get(), 1);
+        let counters = [
+            (
+                &reporter.last_checkpoint_read_successes,
+                LastCheckpointReadOutcome::Success,
+            ),
+            (
+                &reporter.last_checkpoint_read_not_found,
+                LastCheckpointReadOutcome::NotFound,
+            ),
+            (
+                &reporter.last_checkpoint_read_invalid,
+                LastCheckpointReadOutcome::Invalid,
+            ),
+            (
+                &reporter.last_checkpoint_read_errors,
+                LastCheckpointReadOutcome::Error,
+            ),
+            (
+                &reporter.last_checkpoint_read_unknown,
+                LastCheckpointReadOutcome::Unknown,
+            ),
+        ];
+        for (counter, expected) in counters {
+            assert_eq!(counter.get(), u64::from(outcome == expected));
+        }
+        reporter.reset();
+        assert_eq!(reporter.last_checkpoint_reads.get(), 0);
+        for (counter, _) in counters {
+            assert_eq!(counter.get(), 0);
+        }
     }
 
     #[test]
@@ -537,6 +591,7 @@ mod tests {
                         table_type: TableType::PathBased,
                         correlation_id: None,
                         load_type,
+                        duration: dur(),
                     }));
                 }
             }
@@ -788,6 +843,7 @@ mod tests {
             table_type: TableType::PathBased,
             correlation_id: None,
             load_type: SnapshotLoadType::SnapshotHint,
+            duration: dur(),
         }));
 
         reporter.reset();

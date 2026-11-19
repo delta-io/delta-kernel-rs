@@ -1,6 +1,7 @@
 //! Snapshot cancellation, CRC fallback, and unscoped read regressions.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use rstest::rstest;
 use tempfile::TempDir;
@@ -124,9 +125,12 @@ fn only_cancelled_crc_read_blocks_incremental_snapshot_build(
     )
     .unwrap();
 
+    let delay = Duration::from_millis(1);
     let mut reads = RecordingReads::new(cancel_crc.then_some(Read::Crc));
     let token = bind_token.then(|| reads.token.clone() as CancellationTokenRef);
-    Arc::get_mut(&mut reads).unwrap().expected_token = token.clone();
+    let handler = Arc::get_mut(&mut reads).unwrap();
+    handler.expected_token = token.clone();
+    handler.cancel_delay = delay;
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let result = Snapshot::builder_from(base)
@@ -172,20 +176,69 @@ fn only_cancelled_crc_read_blocks_incremental_snapshot_build(
     assert_eq!(pm.correlation_id, build.correlation_id);
     assert_eq!(pm.load_type, LogSegmentLoadType::Incremental);
     assert_eq!(build.load_type, SnapshotLoadType::Incremental);
+    assert!(pm.duration >= delay);
+    assert!(build.duration >= pm.duration);
     assert!(!events.iter().any(|event| matches!(
         event,
         MetricEvent::ProtocolMetadataLoadSuccess(_) | MetricEvent::SnapshotBuildSuccess(_)
     )));
 }
 
-/// Propagates an engine-reported CRC cancellation even without a caller-supplied token.
-#[test]
-fn engine_reported_crc_cancellation_is_not_optional() {
-    let mut reads = RecordingReads::new(Some(Read::Crc));
-    Arc::get_mut(&mut reads).unwrap().expected_token = None;
-    let result = Snapshot::builder_for("tests/data/crc-full").build(&reads.engine());
+#[rstest]
+#[case::fresh_log_segment(Read::List, false)]
+#[case::incremental_log_segment(Read::List, true)]
+#[case::protocol_metadata(Read::Crc, false)]
+fn engine_reported_cancellation_without_token_preserves_failure_duration(
+    #[case] failed_read: Read,
+    #[case] incremental: bool,
+) {
+    let (url, _temp) = stale_crc_table();
+    let delay = Duration::from_millis(1);
+    let mut reads = RecordingReads::new(Some(failed_read));
+    let handler = Arc::get_mut(&mut reads).unwrap();
+    handler.expected_token = None;
+    handler.cancel_delay = delay;
+    let base = incremental.then(|| {
+        Snapshot::builder_for(&url)
+            .at_version(0)
+            .build(reads.inner.as_ref())
+            .unwrap()
+    });
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    let result = if let Some(base) = base {
+        Snapshot::builder_from(base).build(&reads.engine())
+    } else {
+        Snapshot::builder_for(url).build(&reads.engine())
+    };
     assert!(matches!(result, Err(Error::Kernel(KernelError::Cancelled))));
-    assert_eq!(reads.events.lock().unwrap().last(), Some(&Read::Crc));
+    assert_eq!(reads.events.lock().unwrap().last(), Some(&failed_read));
+    let events = reporter.events();
+    let (duration, load_type) = events
+        .iter()
+        .find_map(|event| match (failed_read, event) {
+            (Read::List, MetricEvent::LogSegmentLoadFailure(event)) => {
+                Some((event.duration, event.load_type))
+            }
+            (Read::Crc, MetricEvent::ProtocolMetadataLoadFailure(event)) => {
+                Some((event.duration, event.load_type))
+            }
+            _ => None,
+        })
+        .expect("expected a metric for the failed operation");
+    assert!(duration >= delay);
+    assert_eq!(
+        load_type,
+        if incremental {
+            LogSegmentLoadType::Incremental
+        } else {
+            LogSegmentLoadType::Full
+        }
+    );
+    assert!(matches!(
+        events.last(),
+        Some(MetricEvent::SnapshotBuildFailure(event)) if event.duration >= duration
+    ));
 }
 
 #[rstest]

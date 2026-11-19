@@ -37,8 +37,8 @@ First-time setup (matches CI):
 cargo install --locked mdbook mdbook-mermaid mdbook-linkcheck2
 ```
 
-CI runs `make test` and `mdbook build` (with linkcheck) on every push, PR,
-and merge group event. See `.github/workflows/user-guide.yml`.
+CI runs `make test` and `mdbook build` (with linkcheck). See
+`.github/workflows/user-guide.yml` for when it runs.
 
 ## Purpose and scope
 

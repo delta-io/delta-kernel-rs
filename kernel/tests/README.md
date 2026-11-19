@@ -20,7 +20,7 @@ Test tables organized by feature area. Tables live in two locations:
 
 | Table | Location | Schema | Protocol (R/W) | Features | Description | Tests |
 |-------|----------|--------|----------|----------|-------------|-------|
-| `table-with-cdf` | data/ | `part: int, id: int` | v1/v4 | `enableChangeDataFeed=true` | Fake file paths for CDF validation logic | `table_changes/mod.rs::test_table_changes_errors/test_cdf_start_end_version/test_cdf_no_end_version`, `table_changes/scan.rs::test_table_changes_scan_errors/test_create_cdf_scan_batches_errors` |
+| `table-with-cdf` | data/ | `part: int, id: int` | v1/v4 | `enableChangeDataFeed=true` | Fake file paths for CDF validation logic | `table_changes/mod.rs` and `table_changes/scan.rs` (unit tests and doctests), `scan/tests.rs`, `engine/cancellable_engine/tests.rs` |
 | `cdf-table` | data/cdf-table.tar.zst | `id: int, name: string, birthday: date` partitioned by `birthday` | v1/v4 | `enableChangeDataFeed=true` | Base CDF table | `features::cdf::basic_cdf` |
 | `cdf-table-simple` | data/cdf-table-simple.tar.zst | `id: long` | v1/v7 | w:`changeDataFeed,appendOnly,invariants`, `enableChangeDataFeed=true` | Version range queries and validation | `features::cdf::simple_cdf_version_ranges/invalid_range_end_before_start/invalid_range_start_after_last_version_of_table` |
 | `cdf-table-non-partitioned` | data/cdf-table-non-partitioned.tar.zst | `id: int, name: string, birthday: date, long_field: long, boolean_field: boolean, double_field: double, smallint_field: short` | v1/v4 | `enableChangeDataFeed=true` | Non-partitioned CDF table | `features::cdf::cdf_non_partitioned` |
@@ -137,7 +137,7 @@ The golden V2 checkpoint tables have a different protocol (v1/v2, no table featu
 
 | Table | Location | Schema | Protocol (R/W) | Description | Tests |
 |-------|----------|--------|----------|-------------|-------|
-| `type-widening` | data/ | 13 columns named by widening path (e.g. `byte_long`, `float_double`, `date_timestamp_ntz`) | v1/v2 (at v0) | Commit 0 = narrow types, commit 1 = widened | `read.rs::type_widening_basic/type_widening_decimal` |
+| `type-widening` | data/ | 13 columns named by widening path (e.g. `byte_long`, `float_double`, `date_timestamp_ntz`) | v1/v2 (at v0) | Commit 0 = narrow types, commit 1 = enables type widening, commit 2 = widened | `read.rs::type_widening_basic/type_widening_decimal/type_widening_decimal_predicate_keeps_older_scale_file` |
 | `unshredded-variant` | data/unshredded-variant.tar.zst | `id: long, v: variant, array_of_variants: array<variant>, struct_of_variants: struct{v: variant}, map_of_variants: map<string,variant>, array_of_struct_of_variants: array<struct{v: variant}>, struct_of_array_of_variants: struct{v: array<variant>}` | v3/v7 | r:`variantType-preview` w:`variantType-preview,appendOnly,invariants`, `checkpointInterval=2` | Unshredded variant type column | `read.rs::unshredded_variant_table` |
 
 ## Application Transactions

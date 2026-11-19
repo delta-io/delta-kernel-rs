@@ -8,7 +8,7 @@ use delta_kernel::{
     KernelError, KernelResult,
 };
 use delta_kernel_ffi_macros::handle_descriptor;
-use tracing::debug;
+use tracing::trace;
 use url::Url;
 
 use super::handle::Handle;
@@ -41,7 +41,7 @@ pub struct ExclusiveFileReadResultIterator;
 
 impl Drop for FileReadResultIterator {
     fn drop(&mut self) {
-        debug!("dropping FileReadResultIterator");
+        trace!("dropping FileReadResultIterator");
     }
 }
 
@@ -196,7 +196,7 @@ fn new_expression_evaluator_impl(
 /// Caller is responsible for passing a valid handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_expression_evaluator(evaluator: Handle<SharedExpressionEvaluator>) {
-    debug!("engine released expression evaluator");
+    trace!("engine released expression evaluator");
     unsafe { evaluator.drop_handle() }
 }
 

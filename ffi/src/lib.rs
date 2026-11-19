@@ -25,7 +25,7 @@ use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::{CheckpointWriteResult, LogSegmentStats, Snapshot, SnapshotRef};
 use delta_kernel::{Engine, EngineData, FileStats, KernelResult, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
-use tracing::debug;
+use tracing::trace;
 use url::Url;
 #[cfg(feature = "default-engine-base")]
 use {
@@ -50,6 +50,8 @@ extern crate self as delta_kernel_ffi;
 
 mod alloc_stats;
 
+#[cfg(feature = "declarative-plans")]
+pub mod checkpoint;
 pub mod column_default;
 pub mod commit_range;
 pub mod delta_types;
@@ -88,8 +90,9 @@ pub use snapshot::hint as snapshot_hint;
 pub use snapshot::{
     ExclusiveSnapshotBuilder, FfiIncrementalReplay, FfiSnapshotBuilder, free_snapshot_builder,
     get_snapshot_builder, get_snapshot_builder_from, snapshot_builder_build,
-    snapshot_builder_with_incremental_crc_replay, snapshot_builder_with_log_tail,
-    snapshot_builder_with_max_catalog_version, snapshot_builder_with_version,
+    snapshot_builder_with_correlation_id, snapshot_builder_with_incremental_crc_replay,
+    snapshot_builder_with_log_tail, snapshot_builder_with_max_catalog_version,
+    snapshot_builder_with_version,
 };
 
 #[cfg(test)]
@@ -714,7 +717,7 @@ pub use private::{KernelBoolSlice, KernelRowIndexArray};
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_bool_slice(slice: KernelBoolSlice) {
     let vec = unsafe { slice.into_vec() };
-    debug!("Dropping bool slice. It is {vec:#?}");
+    trace!("Dropping bool slice. It is {vec:#?}");
 }
 
 /// # Safety
@@ -778,7 +781,7 @@ struct ExternEngineVtable {
 #[cfg(feature = "default-engine-base")]
 impl Drop for ExternEngineVtable {
     fn drop(&mut self) {
-        debug!("dropping engine interface");
+        trace!("dropping engine interface");
     }
 }
 
@@ -1209,7 +1212,7 @@ pub(crate) fn build_engine_from_store(
 /// Caller is responsible for passing a valid handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_engine(engine: Handle<SharedExternEngine>) {
-    debug!("engine released engine");
+    trace!("engine released engine");
     unsafe { engine.drop_handle() }
 }
 
@@ -1297,7 +1300,7 @@ pub struct SharedProtocol;
 /// Caller is responsible for passing a valid handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_snapshot(snapshot: Handle<SharedSnapshot>) {
-    debug!("engine released snapshot");
+    trace!("engine released snapshot");
     unsafe { snapshot.drop_handle() }
 }
 
@@ -1399,16 +1402,17 @@ pub unsafe extern "C" fn snapshot_timestamp(
     unsafe { result.into_extern_result(&engine_ref) }
 }
 
-/// Statistics for the commit files selected to replay a snapshot's log segment.
+/// Statistics for the original commit files in a snapshot's log segment.
 ///
-/// Includes published and staged commits, and selected compactions in place of covered commits.
-/// Excludes checkpoints, sidecars, CRCs, and commits retained only for timestamp lookup.
+/// Includes published and staged commits after the checkpoint. Excludes log compactions, even
+/// when scans read them in place of the commits they cover, as well as checkpoints, sidecars,
+/// CRCs, and commits retained only for timestamp lookup.
 #[derive(Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct FfiLogSegmentStats {
-    /// Number of selected commit files, counting each selected compaction as one file.
+    /// Number of original commit files.
     pub num_commit_files: u64,
-    /// Sum of the selected commit file sizes in bytes.
+    /// Sum of the original commit file sizes in bytes.
     pub total_commit_file_bytes: u64,
 }
 
@@ -1421,7 +1425,7 @@ impl From<LogSegmentStats> for FfiLogSegmentStats {
     }
 }
 
-/// Returns selected replay commit file statistics from `snapshot` without I/O.
+/// Returns original commit file statistics from `snapshot` without I/O.
 ///
 /// Borrows both handles. Uses `engine` only to allocate errors. The returned value needs no
 /// release. Returns zero counts and bytes when a checkpoint covers the entire snapshot.

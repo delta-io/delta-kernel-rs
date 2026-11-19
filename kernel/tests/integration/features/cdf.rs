@@ -8,7 +8,7 @@ use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::expressions::{Predicate as Pred, expr};
 use delta_kernel::schema::schema_ref;
 use delta_kernel::table_changes::TableChanges;
-use delta_kernel::{KernelError, KernelResult, PredicateRef, Version};
+use delta_kernel::{KernelError, PredicateRef, Version};
 use itertools::Itertools;
 use test_utils::{
     add_commit, create_default_engine, create_default_engine_with_batch, create_table,
@@ -61,7 +61,7 @@ fn read_cdf_for_table_with_batch_size(
         ArrowSchema::try_from_kernel(scan.logical_schema().as_ref()).unwrap();
     let batches: Vec<RecordBatch> = scan
         .execute(engine)?
-        .map(|data| -> KernelResult<_> {
+        .map(|data| -> delta_kernel::Result<_> {
             let record_batch = data?.try_into_record_batch()?;
             // Verify that the arrow record batches match the expected schema
             assert_eq!(record_batch.schema().as_ref(), &scan_schema_as_arrow);
@@ -680,7 +680,7 @@ async fn cdf_per_cell_null_on_malformed_stats() -> delta_kernel::Result<()> {
     // the predicate pruned the file before reading.
     let batches: Vec<RecordBatch> = scan
         .execute(engine)?
-        .map(|data| -> KernelResult<_> { data?.try_into_record_batch() })
+        .map(|data| -> delta_kernel::Result<_> { Ok(data?.try_into_record_batch()?) })
         .try_collect()?;
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(

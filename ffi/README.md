@@ -170,6 +170,10 @@ The examples include comprehensive testing capabilities:
 
 ### Running Tests
 
+The read-table and read-table-changes tests use tables from the modern DAT corpus. Run
+`cargo build -p acceptance` from the repository root to download the pinned corpus into
+`acceptance/workloads/` before running these tests.
+
 After building an example, you can run the associated tests:
 
 ```sh

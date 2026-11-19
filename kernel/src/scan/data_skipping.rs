@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
-use tracing::{debug, error};
+use tracing::{debug, error, trace};
 
 use crate::actions::visitors::SelectionVectorVisitor;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
@@ -409,7 +409,7 @@ impl DataSkippingFilter {
         visitor.visit_rows_of(selection_vector.as_ref())?;
 
         if visitor.num_filtered > 0 {
-            debug!(
+            trace!(
                 "data skipping filtered {}/{batch_len} rows from batch",
                 visitor.num_filtered
             );

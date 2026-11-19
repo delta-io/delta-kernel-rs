@@ -16,7 +16,7 @@ use crate::metrics::{
 };
 use crate::path::ParsedLogPath;
 use crate::table_configuration::TableConfiguration;
-use crate::{Engine, KernelError, KernelResult, Version};
+use crate::{Engine, KernelError, Result, Version};
 
 /// The assembled outcome of the listing phase of an incremental update. Listing/assembly
 /// failures surface as `Err` from [`Snapshot::build_new_segment`], not a variant here.
@@ -116,7 +116,7 @@ impl Snapshot {
         incremental_replay: IncrementalReplay,
         checkpoint_handling: CheckpointHandling,
         built_as_latest: bool,
-    ) -> KernelResult<Arc<Self>> {
+    ) -> Result<Arc<Self>> {
         let requested_version = target_version.into();
         let mut current_segment = None;
         let result = Self::try_new_from_impl(
@@ -157,7 +157,7 @@ impl Snapshot {
         checkpoint_handling: CheckpointHandling,
         built_as_latest: bool,
         current_segment: &mut Option<LogSegment>,
-    ) -> KernelResult<Arc<Self>> {
+    ) -> Result<Arc<Self>> {
         let existing_snapshot_version = existing_snapshot.version();
         if let Some(requested_version) = requested_version {
             tracing::Span::current().record("version", requested_version);
@@ -178,7 +178,8 @@ impl Snapshot {
                 return Err(KernelError::Generic(format!(
                     "Requested snapshot version {requested_version} is older than snapshot \
                     hint version {existing_snapshot_version}"
-                )));
+                ))
+                .into());
             }
         } else {
             tracing::Span::current().record("version", existing_snapshot_version);
@@ -198,8 +199,9 @@ impl Snapshot {
             requested_version,
             checkpoint_handling,
         )
-        .inspect_err(|_| emit_log_segment_load_failure(metric_context))?
-        {
+        .inspect_err(|_| {
+            emit_log_segment_load_failure(metric_context, segment_load_start.elapsed())
+        })? {
             NewSegment::Unchanged => {
                 // The builder reaches this branch without an effective target: neither an
                 // explicit version nor a catalog bound can contradict the latest claim.
@@ -269,10 +271,14 @@ impl Snapshot {
         let pm_start = std::time::Instant::now();
         let base_crc = combined_log_segment
             .pick_latest_base_crc(engine, existing_snapshot.base_crc())
-            .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;
+            .inspect_err(|_| {
+                emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
+            })?;
         let crc_at_version = combined_log_segment
             .try_build_crc_within_budget(engine, base_crc.as_ref(), incremental_replay)
-            .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?;
+            .inspect_err(|_| {
+                emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
+            })?;
 
         let existing_table_config = existing_snapshot.table_configuration();
         let resolution = match &crc_at_version {
@@ -296,10 +302,14 @@ impl Snapshot {
                 let newer_base = base_crc
                     .as_ref()
                     .filter(|c| c.version > existing_snapshot_version);
+                // TODO(#3421): Classify missing replay-file failures as Delta errors using the
+                // incremental replay context, preserving the original error sources.
                 combined_log_segment
                     .segment_after_version(existing_snapshot_version)
                     .read_protocol_metadata_opt(engine, newer_base)
-                    .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context))?
+                    .inspect_err(|_| {
+                        emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
+                    })?
             }
         };
         emit_protocol_metadata_load(metric_context, resolution.source, pm_start.elapsed());
@@ -348,7 +358,7 @@ impl Snapshot {
         log_tail: Vec<ParsedLogPath>,
         requested_version: Option<Version>,
         checkpoint_handling: CheckpointHandling,
-    ) -> KernelResult<NewSegment> {
+    ) -> Result<NewSegment> {
         let log_root = existing_log_segment.log_root.clone();
         let storage = engine.storage_handler();
 
@@ -388,7 +398,7 @@ impl Snapshot {
                 // Case C.1: caller requested a specific version (necessarily >
                 // existing_snapshot_version since cases A and B were handled above), but
                 // no such commit exists in the log.
-                Some(_) => Err(KernelError::MissingVersion(existing_snapshot_version + 1)),
+                Some(_) => Err(KernelError::MissingVersion(existing_snapshot_version + 1).into()),
                 // Case C.2: no new commits and no explicit target; latest is existing.
                 // TODO(#3845): Define publication refresh when cached versions are not listed.
                 None => Ok(NewSegment::Unchanged),
@@ -406,15 +416,20 @@ impl Snapshot {
         // hint. If the new segment has a checkpoint, we will return it as is. Otherwise, we
         // will preserve last_checkpoint_metadata when merging the new log segment with the
         // old one.
-        let mut new_log_segment =
-            LogSegment::try_new(new_listed_files, log_root.clone(), requested_version, None)?;
+        let mut new_log_segment = LogSegment::try_new_for_snapshot(
+            new_listed_files,
+            log_root.clone(),
+            requested_version,
+            None,
+        )?;
 
         let new_end_version = new_log_segment.end_version;
         if new_end_version < existing_snapshot_version {
             return Err(KernelError::invalid_log_segment(format!(
                 "Unexpected state: the newest version in the log {new_end_version} is \
                  older than the existing snapshot version {existing_snapshot_version}"
-            )));
+            ))
+            .into());
         }
         if let Some(new_checkpoint_version) = new_log_segment.checkpoint_version
             && new_checkpoint_version > existing_snapshot_version
@@ -511,7 +526,7 @@ impl Snapshot {
                 existing_log_segment.last_checkpoint_metadata.clone(),
             )
         };
-        let combined_log_segment = LogSegment::try_new(
+        let combined_log_segment = LogSegment::try_new_for_snapshot(
             LogSegmentFiles {
                 ascending_commit_files,
                 ascending_compaction_files,
@@ -555,6 +570,10 @@ impl Snapshot {
             crc: existing.crc.clone(),
             built_as_latest,
             skipped_new_checkpoints,
+            #[cfg(feature = "declarative-plans")]
+            checkpoint_info: existing.checkpoint_info.clone(),
+            #[cfg(feature = "declarative-plans")]
+            checkpoint_info_init: Default::default(),
             #[cfg(feature = "adaptive-metadata-in-dev")]
             checkpoint_action: existing.checkpoint_action.clone(),
             #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -613,10 +632,11 @@ mod tests {
     use rstest::rstest;
     use serde_json::json;
     use test_utils::table_builder::TestTableBuilder;
-    use test_utils::{LoggingTest, delta_path_for_version};
+    use test_utils::{LoggingTest, add_commit, delta_path_for_version};
     use url::Url;
 
     use super::*;
+    use crate::actions::Protocol;
     use crate::arrow::array::StringArray;
     use crate::arrow::record_batch::RecordBatch;
     use crate::commit_range::CommitRange;
@@ -630,11 +650,51 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::LogPathFileType;
+    use crate::schema::schema;
     use crate::snapshot::{CheckpointWriteResult, commit};
     use crate::unit_test_utils::{
-        CapturingReporter, install_thread_local_metrics_reporter, string_array_to_engine_data,
+        Action, CapturingReporter, install_thread_local_metrics_reporter, serialize_actions,
+        string_array_to_engine_data,
     };
-    use crate::{Engine, Error, KernelResult, Result};
+    use crate::{DeltaErrorCondition, Engine, Error, KernelResult, Result};
+
+    #[cfg(feature = "declarative-plans")]
+    #[rstest]
+    fn checkpoint_cache_survives_build_metadata_changes(
+        #[values(false, true)] initialized: bool,
+    ) -> Result<()> {
+        // Given: a latest snapshot with either a completed or an empty checkpoint cache.
+        let (engine, snapshot, _tempdir) =
+            crate::unit_test_utils::load_test_table("v1-multi-part-struct-stats-only")?;
+        let before = if initialized {
+            snapshot.reader().get_checkpoint_info(engine.as_ref())?
+        } else {
+            None
+        };
+        assert_eq!(before.is_some(), initialized);
+        let no_executor =
+            crate::engine::DelegatingEngine::new(engine.clone()).without_plan_executor();
+
+        // When: a refresh changes only build policy, then its getter runs without an executor.
+        let refreshed = Snapshot::builder_from(snapshot.clone())
+            .skip_new_checkpoints()
+            .build(engine.as_ref())?;
+        let cached = refreshed.reader().get_checkpoint_info(&no_executor);
+
+        // Then: the copied view retains completed metadata while keeping empty caches independent.
+        assert!(!Arc::ptr_eq(&snapshot, &refreshed));
+        assert!(!snapshot.skipped_new_checkpoints());
+        assert!(refreshed.skipped_new_checkpoints());
+        if let Some(before) = before {
+            assert!(Arc::ptr_eq(&before, &cached?.unwrap()));
+        } else {
+            assert!(cached.is_err());
+            // When / Then: initializing the copy leaves the original unresolved.
+            refreshed.reader().get_checkpoint_info(engine.as_ref())?;
+            assert!(snapshot.cached_checkpoint_info().is_none());
+        }
+        Ok(())
+    }
 
     // ============================================================================
     // Helpers
@@ -794,22 +854,20 @@ mod tests {
         let url = Url::parse("memory:///").map_err(KernelError::from)?;
         let engine = SyncEngine::new_with_store(store.clone());
 
-        // Create commits 0-2
-        let base_commit = vec![
-            json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}),
-            json!({
-                "metaData": {
-                    "id": "test-id",
-                    "format": {"provider": "parquet", "options": {}},
-                    "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
-                    "partitionColumns": [],
-                    "configuration": {},
-                    "createdTime": 1587968585495i64
-                }
-            }),
+        let base_commit = [
+            Action::Protocol(Protocol::try_new_legacy(1, 2)?),
+            crate::unit_test_utils::metadata_action("test-id", &schema! {}, 1587968585495),
         ];
+        add_commit(
+            url.as_str(),
+            store.as_ref(),
+            0,
+            serialize_actions(base_commit),
+        )
+        .await
+        .unwrap();
 
-        commit(url.as_str(), store.as_ref(), 0, base_commit.clone()).await;
+        // Use raw JSON to keep these actions timestamp-only; typed CommitInfo adds other fields.
         commit(
             url.as_str(),
             store.as_ref(),
@@ -829,7 +887,6 @@ mod tests {
             .at_version(1)
             .build(&engine)?;
 
-        // Verify base snapshot has latest_commit_file at version 1
         assert_eq!(
             base_snapshot
                 .log_segment
@@ -840,7 +897,6 @@ mod tests {
             Some(1)
         );
 
-        // Create log_tail with FileMeta for version 2
         let commit_2_url = url
             .join("_delta_log/")
             .map_err(KernelError::from)?
@@ -855,7 +911,6 @@ mod tests {
             .ok_or_else(|| KernelError::Generic("Failed to parse log path".to_string()))?;
         let log_tail = vec![parsed_path];
 
-        // Create new snapshot from base to version 2 using try_new_from directly
         let new_snapshot = Snapshot::try_new_from(
             base_snapshot.clone(),
             log_tail,
@@ -868,7 +923,6 @@ mod tests {
             false, /* built_as_latest */
         )?;
 
-        // Latest commit should now be version 2
         assert_eq!(
             new_snapshot
                 .log_segment
@@ -944,7 +998,7 @@ mod tests {
         );
         assert!(matches!(
             older_version,
-            Err(KernelError::Generic(msg)) if msg.contains("older than snapshot hint version")
+            Err(Error::Kernel(KernelError::Generic(msg))) if msg.contains("older than snapshot hint version")
         ));
 
         Ok(())
@@ -1183,6 +1237,9 @@ mod tests {
         #[values(false, true)] skip_new_checkpoints: bool,
     ) -> Result<()> {
         // ===== GIVEN =====
+        // Install before building the snapshot so its span and the scans' child spans share a
+        // subscriber; otherwise a global subscriber set by a concurrent test owns the parent span.
+        let logging = LoggingTest::new();
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 3).await?;
         let base = Snapshot::builder_for(ctx.url.as_str())
@@ -1198,7 +1255,6 @@ mod tests {
 
         // ===== WHEN =====
         // Build an incremental scan, which consumes exactly the caller-selected commit range.
-        let logging = LoggingTest::new();
         let _incremental_scan = snapshot
             .clone()
             .incremental_scan_builder(0)
@@ -1292,10 +1348,20 @@ mod tests {
             .build(ctx.engine.as_ref());
 
         // ===== THEN =====
-        let error = updated.expect_err("the missing commit must not be hidden by the checkpoint");
+        let Error::Delta(error) = updated.unwrap_err() else {
+            panic!("expected Delta error")
+        };
+        assert_eq!(
+            error.condition(),
+            DeltaErrorCondition::DeltaVersionsNotContiguous
+        );
+        let source = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<KernelError>()
+            .unwrap();
         assert!(matches!(
-            error,
-            Error::Kernel(KernelError::MissingVersion(3))
+            source.without_backtrace(),
+            KernelError::MissingVersion(3)
         ));
 
         Ok(())
@@ -2223,87 +2289,10 @@ mod tests {
     // Tests: compaction-file handling on the incremental path
     // ============================================================================
 
-    // TODO(#2337): remove this test when log compaction is re-enabled.
-    #[tokio::test]
-    async fn test_compaction_files_ignored_on_read() -> Result<()> {
-        let store = Arc::new(InMemory::new());
-        let table_root = "memory:///";
-        let engine = SyncEngine::new_with_store(store.clone());
-
-        // Create commits 0-2 and write compaction files to storage
-        setup_test_table_with_commits(table_root, &store, 3).await?;
-        write_compaction_file(&store, 0, 1).await?;
-        write_compaction_file(&store, 0, 2).await?;
-
-        // Compaction files exist on disk but should be skipped during listing
-        let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-        assert!(
-            snapshot
-                .log_segment
-                .listed
-                .ascending_compaction_files
-                .is_empty(),
-            "Compaction files should be ignored when log compaction is disabled"
-        );
-
-        Ok(())
-    }
-
-    // TODO(#2337): remove this test when log compaction is re-enabled.
-    #[tokio::test]
-    async fn test_incremental_snapshot_ignores_compaction_files() -> Result<()> {
-        let store = Arc::new(InMemory::new());
-        let table_root = "memory:///";
-        let engine = SyncEngine::new_with_store(store.clone());
-
-        // Create commits 0-2 with compaction files in storage
-        setup_test_table_with_commits(table_root, &store, 3).await?;
-        write_compaction_file(&store, 0, 1).await?;
-        write_compaction_file(&store, 0, 2).await?;
-
-        // Build base snapshot at v2
-        let snapshot_v2 = Snapshot::builder_for(table_root)
-            .at_version(2)
-            .build(&engine)?;
-        assert_eq!(snapshot_v2.version(), 2);
-        assert!(
-            snapshot_v2
-                .log_segment
-                .listed
-                .ascending_compaction_files
-                .is_empty()
-        );
-
-        // Add commit 3
-        commit(
-            table_root,
-            &store,
-            3,
-            vec![json!({"add": {"path": "file4.parquet", "partitionValues": {}, "size": 400, "modificationTime": 4000, "dataChange": true}})],
-        )
-        .await;
-
-        // Build v3 incrementally -- compaction files should still be skipped
-        let snapshot_v3 = Snapshot::builder_from(snapshot_v2)
-            .at_version(3)
-            .build(&engine)?;
-        assert_eq!(snapshot_v3.version(), 3);
-        assert!(
-            snapshot_v3
-                .log_segment
-                .listed
-                .ascending_compaction_files
-                .is_empty()
-        );
-
-        Ok(())
-    }
-
     /// The incremental snapshot path (`try_new_from_impl`) re-lists files from the checkpoint
     /// version onwards. We must ensure that it deduplicates compaction files, since producing
     /// duplicates violated the sort invariant in LogSegmentFilesBuilder::build().
     #[tokio::test]
-    #[ignore = "log compaction disabled (#2337)"]
     async fn test_incremental_snapshot_with_compaction_files() -> Result<()> {
         let store = Arc::new(InMemory::new());
         let table_root = "memory:///";
@@ -2359,7 +2348,6 @@ mod tests {
     /// added after building the base snapshot at v2 gets filtered out because its start version
     /// (1) <= existing_snapshot_version (2).
     #[tokio::test]
-    #[ignore = "log compaction disabled (#2337)"]
     async fn test_incremental_snapshot_with_new_compaction_files() -> Result<()> {
         let store = Arc::new(InMemory::new());
         let table_root = "memory:///";

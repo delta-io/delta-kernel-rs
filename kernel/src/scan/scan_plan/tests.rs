@@ -20,11 +20,21 @@ use crate::engine::arrow_conversion::TryIntoArrow as _;
 use crate::engine::arrow_data::EngineDataArrowExt as _;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{Predicate as Pred, column_name, expr};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::object_store::ObjectStoreExt as _;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::object_store::memory::InMemory;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::object_store::path::Path;
 use crate::plans::Operation as PlanOperation;
 use crate::plans::ir::nodes::Operator;
 use crate::scan::{PartitionValuesOptions, Scan, StatsOptions, StructStats};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::unit_test_utils::adaptive_metadata_fixtures::{
+    commit_files, create_adaptive_metadata_table,
+};
 use crate::unit_test_utils::load_test_table;
-use crate::{Engine, KernelResult, PredicateRef, Result, Snapshot, Version};
+use crate::{Engine, Error, KernelResult, PredicateRef, Result, Snapshot, Version};
 
 // Normalizes metadata for comparison: the imperative path splits fields between the data batch
 // and fileConstantValues, while the declarative path returns them in an add struct.
@@ -269,27 +279,66 @@ fn declarative_metadata_matches_imperative_scan(
 #[rstest]
 #[case::parquet_manifest("v2-checkpoints-parquet-with-sidecars")]
 #[case::json_manifest("v2-checkpoints-json-with-sidecars")]
-fn declarative_metadata_scans_sidecars_from_checkpoint_hint(#[case] table: &str) -> Result<()> {
+#[case::single_json_sidecar("v2-json-sidecars-struct-stats-only")]
+#[case::single_parquet_sidecar("v2-parquet-sidecars-struct-stats-only")]
+#[case::classic_named_manifest("v2-classic-checkpoint-parquet")]
+fn declarative_metadata_resolves_complete_sidecar_lists(
+    #[case] table: &str,
+    #[values(false, true)] remove_hint: bool,
+) -> Result<()> {
+    // Given: an unresolved manifest with or without writer hints.
     let (engine, snapshot, _tempdir) = crate::unit_test_utils::load_test_table(table)?;
-    let plan = snapshot
+    let mut segment = snapshot.log_segment().clone();
+    if remove_hint {
+        segment.last_checkpoint_metadata = None;
+    }
+    // Exercise checkpoint planning independently of any eligible CRC in the fixture.
+    let snapshot = Arc::new(Snapshot::new(
+        segment,
+        snapshot.table_configuration().clone(),
+    )?);
+    let scan = snapshot
+        .clone()
         .scan_builder()
-        .build()?
+        .with_stats(StatsOptions::none())
+        .build()?;
+
+    // When: scan planning resolves the checkpoint.
+    let plan = scan
         .declarative_metadata_scan_plan(engine.as_ref())?
         .expect("metadata plan");
 
+    // Then: static files match the cached complete sidecar list.
     assert!(
         plan.nodes
             .iter()
             .all(|node| !matches!(&node.op, Operator::DynamicScan(_)))
     );
-    assert!(plan.nodes.iter().any(|node| {
-        let Operator::ScanParquet(scan) = &node.op else {
-            return false;
-        };
-        scan.files
-            .iter()
-            .any(|file| file.meta.location.path().contains("/_sidecars/"))
-    }));
+    let resolved = snapshot
+        .cached_checkpoint_info()
+        .expect("scan populated checkpoint cache")
+        .as_ref()
+        .unwrap();
+    let actual: Vec<_> = plan
+        .nodes
+        .iter()
+        .flat_map(|node| match &node.op {
+            Operator::ScanParquet(scan) => {
+                scan.files.iter().map(|file| file.meta.clone()).collect()
+            }
+            _ => vec![],
+        })
+        .collect();
+    assert_eq!(actual.as_slice(), resolved.sidecars.as_ref());
+
+    // Then: executing the plan agrees with independent imperative replay.
+    let actual_metadata = declarative_metadata(&scan, engine.as_ref())?;
+    let expected_metadata = imperative_metadata(snapshot.scan_builder().build()?, engine.as_ref())?;
+    assert_metadata_eq(
+        &actual_metadata,
+        &without_columns(&expected_metadata, &[STATS])?,
+        table,
+    )?;
     Ok(())
 }
 
@@ -686,7 +735,7 @@ fn declarative_json_only_disables_metadata_pruning(
             .with_partition_values(partitions.clone())
             .with_predicate(predicate)
             .build()?;
-        declarative_metadata(&scan, &engine)
+        Ok::<_, Error>(declarative_metadata(&scan, &engine)?)
     };
     let baseline = metadata(StatsOptions::json_only(), None)?;
     assert_eq!(metadata_row_count(&baseline), 4);
@@ -757,6 +806,19 @@ fn declarative_json_only_disables_metadata_pruning(
         .with_sidecars_if_enabled(None),
     FeatureSet::new().v2_checkpoint(),
     no_checkpoint_stats(),
+    StatsOptions::all_struct()
+)]
+#[case::compaction(
+    LogState::with_latest_version(3).with_compaction_ranges([(0, 2)]),
+    FeatureSet::new(),
+    checkpoint_json_stats(),
+    StatsOptions::all()
+)]
+#[case::compaction_after_sidecars(
+    LogState::with_latest_version(4).with_checkpoint_at([2])
+        .with_sidecars_if_enabled(Some(1)).with_compaction_ranges([(3, 4)]),
+    FeatureSet::new().v2_checkpoint().column_mapping("name"),
+    checkpoint_struct_stats(),
     StatsOptions::all_struct()
 )]
 fn declarative_metadata_output_options_across_log_shapes(
@@ -1128,10 +1190,98 @@ fn expected_stats_row(id: i64, partition: i32) -> String {
     )
 }
 
-#[test]
-fn declarative_metadata_reconciles_checkpoint_with_later_commits() -> Result<()> {
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[rstest]
+#[tokio::test]
+async fn scan_compaction_selection_uses_snapshot_table_feature(
+    #[values(false, true)] adaptive_metadata: bool,
+    #[values(false, true)] use_plan: bool,
+) -> Result<()> {
+    let table = (!adaptive_metadata).then(|| {
+        TestTableBuilder::new()
+            .with_log_state(LogState::with_latest_version(2))
+            .build()
+            .unwrap()
+    });
+    let store = table
+        .as_ref()
+        .map(|table| table.store().clone())
+        .unwrap_or_else(|| Arc::new(InMemory::new()));
+    let table_root = table
+        .as_ref()
+        .map(|table| table.table_root())
+        .unwrap_or("memory:///");
+    let engine = Arc::new(SyncEngine::new_with_store(store.clone()));
+    if adaptive_metadata {
+        let root = url::Url::parse(table_root).unwrap();
+        create_adaptive_metadata_table(engine.as_ref(), &root, &[]);
+        commit_files(engine.as_ref(), &root, &["a.parquet"], &[]);
+        commit_files(engine.as_ref(), &root, &["b.parquet"], &[]);
+    }
+    // A corrupt compaction makes accidental reads observable in every execution path.
+    let path = Path::from_url_path(
+        url::Url::parse(table_root)
+            .unwrap()
+            .join("_delta_log/00000000000000000001.00000000000000000002.compacted.json")
+            .unwrap()
+            .path(),
+    )
+    .unwrap();
+    store.put(&path, "{".into()).await.unwrap();
+    let loader = DelegatingEngine::new(engine.clone());
+    let loader = if use_plan {
+        loader
+    } else {
+        loader.without_plan_executor()
+    };
+    let snapshot = Snapshot::builder_for(table_root).build(&loader)?;
+    assert_eq!(snapshot.has_adaptive_metadata(), adaptive_metadata);
+    let hinted = Snapshot::builder_for(table_root)
+        .with_snapshot_hint(snapshot.to_snapshot_hint()?)
+        .build(&loader)?;
+    for snapshot in [snapshot, hinted] {
+        let scan = snapshot.clone().scan_builder().build()?;
+        assert_eq!(
+            imperative_metadata(snapshot.scan_builder().build()?, engine.as_ref()).is_err(),
+            !adaptive_metadata
+        );
+        let plan = scan
+            .declarative_metadata_scan_plan(engine.as_ref())?
+            .unwrap();
+        assert_eq!(
+            plan.nodes.iter().any(|node| match &node.op {
+                Operator::ScanJson(scan) => scan.files.iter().any(|file| file
+                    .meta
+                    .location
+                    .path()
+                    .ends_with(".compacted.json")),
+                _ => false,
+            }),
+            !adaptive_metadata
+        );
+        assert_eq!(
+            declarative_metadata(&scan, engine.as_ref()).is_err(),
+            !adaptive_metadata
+        );
+        let mut parallel = scan.parallel_scan_metadata(engine.clone())?;
+        assert_eq!(
+            parallel.by_ref().collect::<KernelResult<Vec<_>>>().is_err(),
+            !adaptive_metadata
+        );
+    }
+    Ok(())
+}
+
+#[rstest]
+fn declarative_metadata_reconciles_checkpoint_with_later_commits(
+    #[values(false, true)] compact: bool,
+) -> Result<()> {
+    let mut state = LogState::with_latest_version(4).with_checkpoint_at([2]);
+    if compact {
+        state = state.with_compaction_ranges([(3, 4)]);
+    }
     let table = TestTableBuilder::new()
-        .with_log_state(LogState::with_latest_version(4).with_checkpoint_at([2]))
+        .with_log_state(state)
         .build()
         .expect("build checkpoint-plus-commits table");
     let engine = SyncEngine::new_with_store(table.store().clone());
@@ -1153,6 +1303,17 @@ fn declarative_metadata_reconciles_checkpoint_with_later_commits() -> Result<()>
         .with_stats(StatsOptions::all())
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()?;
+    let plan = scan.declarative_metadata_scan_plan(&engine)?.unwrap();
+    assert_eq!(
+        plan.nodes.iter().any(|node| match &node.op {
+            Operator::ScanJson(scan) =>
+                scan.files
+                    .iter()
+                    .any(|f| f.meta.location.path().ends_with(".compacted.json")),
+            _ => false,
+        }),
+        compact
+    );
     let actual = declarative_metadata(&scan, &engine)?;
 
     assert_metadata_eq(&actual, &expected, "checkpoint with later commits")?;
@@ -1286,7 +1447,7 @@ fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> Resu
         .declarative_metadata_scan_plan(&no_plan_engine)
         .unwrap_err();
 
-    assert!(matches!(err, crate::KernelError::Unsupported(_)));
+    assert!(matches!(err, KernelError::Unsupported(_)));
 
     let scan = snapshot
         .scan_builder()
@@ -1296,5 +1457,6 @@ fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> Resu
         scan.declarative_metadata_scan_plan(&no_plan_engine)?
             .is_none()
     );
+    assert!(scan.snapshot.cached_checkpoint_info().is_none());
     Ok(())
 }

@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
 use derive_more::Constructor;
-use tracing::{debug, warn};
+use tracing::{trace, warn};
 use url::Url;
 
 use crate::engine_data::GetData;
@@ -130,13 +130,13 @@ impl Deduplicator for FileActionDeduplicator<'_> {
         // https://github.com/delta-io/delta/blob/master/spark/src/test/resources/delta/table-with-dv-large/_delta_log/00000000000000000001.json
 
         if self.seen_file_keys.contains(&key) {
-            debug!(
+            trace!(
                 "Ignoring duplicate ({}, {:?}) in scan, is log {}",
                 key.path, key.dv_unique_id, self.is_log_batch
             );
             true
         } else {
-            debug!(
+            trace!(
                 "Including ({}, {:?}) in scan, is log {}",
                 key.path, key.dv_unique_id, self.is_log_batch
             );

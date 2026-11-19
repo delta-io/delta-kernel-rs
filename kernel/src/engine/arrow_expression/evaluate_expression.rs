@@ -3186,6 +3186,49 @@ mod tests {
         "2024-10-05T15:45:00Z"
     )]
     #[case::skipped_day(Some("Pacific/Apia"), "2011-12-30 12:00:00", "2011-12-30T22:00:00Z")]
+    #[case::hst_historical(Some("HST"), "1940-01-01 00:00:00", "1940-01-01T10:00:00Z")]
+    #[case::mst_historical(Some("MST"), "1943-07-01 00:00:00", "1943-07-01T07:00:00Z")]
+    #[case::est_historical(Some("EST"), "1900-01-01 00:00:00", "1900-01-01T05:00:00Z")]
+    #[case::honolulu_historical(
+        Some("Pacific/Honolulu"),
+        "1940-01-01 00:00:00",
+        "1940-01-01T10:30:00Z"
+    )]
+    #[case::phoenix_historical(
+        Some("America/Phoenix"),
+        "1943-07-01 00:00:00",
+        "1943-07-01T06:00:00Z"
+    )]
+    #[case::panama_historical(
+        Some("America/Panama"),
+        "1900-01-01 00:00:00",
+        "1900-01-01T05:19:36Z"
+    )]
+    #[case::hst_modern(Some("HST"), "2024-07-01 00:00:00", "2024-07-01T10:00:00Z")]
+    #[case::hst_embedded_offset(Some("HST"), "1940-01-01 00:00:00+02:00", "1939-12-31T22:00:00Z")]
+    #[case::hst_embedded_name(
+        Some("HST"),
+        "1940-01-01 00:00:00 Pacific/Honolulu",
+        "1940-01-01T10:30:00Z"
+    )]
+    // The remap applies only to the configured reader ID; an embedded short ID uses chrono-tz.
+    #[case::hst_embedded_short_id(None, "1940-01-01 00:00:00 HST", "1940-01-01T10:30:00Z")]
+    #[case::est5edt_keeps_dst(Some("EST5EDT"), "2024-07-01 00:00:00", "2024-07-01T04:00:00Z")]
+    #[case::mst7mdt_keeps_dst(Some("MST7MDT"), "2024-07-01 00:00:00", "2024-07-01T06:00:00Z")]
+    #[case::mst_modern(Some("MST"), "2024-07-01 00:00:00", "2024-07-01T07:00:00Z")]
+    #[case::mst_embedded_offset(Some("MST"), "1940-01-01 00:00:00+02:00", "1939-12-31T22:00:00Z")]
+    #[case::mst_embedded_name(
+        Some("MST"),
+        "1940-01-01 00:00:00 Pacific/Honolulu",
+        "1940-01-01T10:30:00Z"
+    )]
+    #[case::est_modern(Some("EST"), "2024-07-01 00:00:00", "2024-07-01T05:00:00Z")]
+    #[case::est_embedded_offset(Some("EST"), "1940-01-01 00:00:00+02:00", "1939-12-31T22:00:00Z")]
+    #[case::est_embedded_name(
+        Some("EST"),
+        "1940-01-01 00:00:00 Pacific/Honolulu",
+        "1940-01-01T10:30:00Z"
+    )]
     fn test_map_to_struct_timestamp_timezone(
         #[case] timestamp_timezone: Option<&str>,
         #[case] raw: &str,
@@ -3197,16 +3240,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_map_to_struct_timestamp_timezone_does_not_affect_timestamp_ntz() {
+    #[rstest]
+    fn test_map_to_struct_timestamp_timezone_does_not_affect_timestamp_ntz(
+        #[values("America/Los_Angeles", "EST", "MST", "HST")] timezone: &str,
+    ) {
         let raw = "2024-01-15 12:30:45.123456";
         assert_eq!(
-            evaluate_map_timestamp_timezone(
-                raw,
-                DataType::TIMESTAMP_NTZ,
-                Some("America/Los_Angeles")
-            )
-            .unwrap(),
+            evaluate_map_timestamp_timezone(raw, DataType::TIMESTAMP_NTZ, Some(timezone)).unwrap(),
             Some(expected_timestamp_micros("2024-01-15T12:30:45.123456Z"))
         );
     }

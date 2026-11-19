@@ -18,7 +18,7 @@ pub use self::column_names::{
 pub use self::macros::expr;
 pub(crate) use self::scalars::MONTHS_PER_YEAR;
 pub use self::scalars::{
-    ArrayData, DecimalData, IntervalYearMonthData, MapData, Scalar, StructData,
+    ArrayData, DecimalData, IntervalDayTimeData, IntervalYearMonthData, MapData, Scalar, StructData,
 };
 use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -733,16 +733,17 @@ impl MapToStructOptions {
     /// Interpret offset-less `TIMESTAMP` values in `timestamp_timezone`.
     ///
     /// Accepts an IANA timezone identifier, a fixed offset in `+HH:MM[:SS]` or `-HH:MM[:SS]` form,
-    /// or `Z` for UTC. Named zones preserve their clock-transition rules; fixed offsets apply when
-    /// the reader configuration itself is fixed. Use [`MapToStructOptions::default`] for UTC.
+    /// or `Z` for UTC. The exact uppercase IDs `EST`, `MST`, and `HST` use fixed offsets `-05:00`,
+    /// `-07:00`, and `-10:00`, respectively. Full IANA region names preserve historical clock
+    /// transitions. Use [`MapToStructOptions::default`] for UTC.
     pub fn with_timestamp_timezone(mut self, timestamp_timezone: impl Into<String>) -> Self {
         self.timestamp_timezone = Some(timestamp_timezone.into());
         self
     }
 
-    /// Returns the configured IANA timezone or fixed offset, or `None` when UTC applies.
+    /// Returns the timezone string as configured, or `None` when UTC applies.
     ///
-    /// Fixed offsets use `+HH:MM[:SS]` or `-HH:MM[:SS]` form, or `Z` for UTC.
+    /// See [`Self::with_timestamp_timezone`] for accepted IDs and offsets.
     pub fn timestamp_timezone(&self) -> Option<&str> {
         self.timestamp_timezone.as_deref()
     }

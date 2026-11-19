@@ -145,7 +145,7 @@ async fn test_clustering_with_explicit_feature_signal_no_duplicates() -> delta_k
 }
 
 #[tokio::test]
-async fn test_clustering_stats_columns_within_limit() -> KernelResult<()> {
+async fn test_clustering_stats_columns_within_limit() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Build schema with 10 columns (cluster on column 5, within default 32 limit)
@@ -170,7 +170,7 @@ async fn test_clustering_stats_columns_within_limit() -> KernelResult<()> {
 }
 
 #[tokio::test]
-async fn test_clustering_stats_columns_beyond_limit() -> KernelResult<()> {
+async fn test_clustering_stats_columns_beyond_limit() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // Build schema with 40 columns (cluster on column 35, beyond default 32 limit)

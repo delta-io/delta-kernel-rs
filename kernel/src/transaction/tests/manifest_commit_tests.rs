@@ -19,7 +19,7 @@ use crate::unit_test_utils::{
     MockProtocolBuilder, MockTableConfigurationBuilder, assert_result_error_with_message,
     create_valid_add_file_batch,
 };
-use crate::{FileMeta, KernelError, Result, create_row};
+use crate::{Error, FileMeta, KernelError, Result, create_row};
 
 fn adaptive_table_config() -> TableConfiguration {
     MockTableConfigurationBuilder::new()
@@ -229,7 +229,7 @@ fn manifest_commit_after_schema_change_uses_evolved_schema(
     if is_alter {
         let error = txn.commit(&engine).unwrap_err();
         assert!(
-            matches!(&error, KernelError::InvalidTransactionState(message)
+            matches!(&error, Error::Kernel(KernelError::InvalidTransactionState(message))
             if message == "ALTER TABLE cannot include manifest writes")
         );
     }
