@@ -216,13 +216,20 @@ class ReviewHistoryTest(unittest.TestCase):
             module.canonical_finding_body("**Blocker1** Repeated finding."),
         )
 
-    def test_finding_normalization_ignores_doubled_id_prefix(self) -> None:
+    def test_finding_normalization_ignores_id_label_repeated_after_prefix(self) -> None:
         module = _load_module()
 
-        self.assertEqual(
-            module.canonical_finding_body("**Blocker1** **Blocker1** Repeated finding."),
-            module.canonical_finding_body("**Blocker2** Repeated finding."),
-        )
+        for published in (
+            "**Blocker1** **Blocker1** Repeated finding.",
+            "**Blocker1** **Blocker1:** Repeated finding.",
+            "**Blocker1** **Blocker1**: Repeated finding.",
+            "**Blocker1** Blocker1: Repeated finding.",
+        ):
+            with self.subTest(published=published):
+                self.assertEqual(
+                    module.canonical_finding_body(published),
+                    module.canonical_finding_body("Repeated finding."),
+                )
 
     def test_complete_review_deduplication_round_trips_publication_wrapper(self) -> None:
         module = _load_module()
