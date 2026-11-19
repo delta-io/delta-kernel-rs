@@ -1082,6 +1082,32 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
+    #[case::to_json(
+        Expression::unary(UnaryExpressionOp::TO_JSON, Expression::column(["a"])),
+        vec!["a"]
+    )]
+    #[case::less_than(
+        Expression::from_pred(Predicate::lt(Expression::column(["a"]), Expression::column(["b"]))),
+        vec!["a", "b"]
+    )]
+    fn visit_operator_children(#[case] expr: Expression, #[case] expected_columns: Vec<&str>) {
+        let mut builder = TestExpressionBuilder::default();
+        let mut visitor = test_visitor(&mut builder);
+
+        let top_level_id = visit_expression_internal(&expr, &mut visitor);
+
+        assert_eq!(top_level_id, 0);
+        let expected: Vec<_> = expected_columns
+            .into_iter()
+            .map(|column| LiteralEvent::Column {
+                sibling_list_id: 1,
+                parts: vec![column.to_string()],
+            })
+            .collect();
+        assert_eq!(builder.events, expected);
+    }
+
     #[test]
     fn visit_expression_column_uses_structured_parts() {
         let mut builder = TestExpressionBuilder::default();

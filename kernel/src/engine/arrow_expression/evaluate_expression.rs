@@ -3546,6 +3546,16 @@ mod tests {
         assert!(is_invalid_expression, "{result:?}");
     }
 
+    #[rstest]
+    #[case::map_len_missing_map(Expr::map_len(col!("missing")))]
+    #[case::map_has_key_missing_map(Expr::from_pred(Pred::map_has_key(col!("missing"), lit("a"))))]
+    #[case::map_has_key_missing_key(Expr::from_pred(Pred::map_has_key(col!("m"), col!("missing"))))]
+    fn test_map_accessors_propagate_input_errors(#[case] expr: Expr) {
+        let batch = create_accessor_map_batch();
+        let result = evaluate_expression(&expr, &batch, None);
+        assert!(result.is_err(), "{result:?}");
+    }
+
     #[test]
     fn test_map_has_key_rejects_key_length_mismatch() {
         let batch = create_accessor_map_batch();
