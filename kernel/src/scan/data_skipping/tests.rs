@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use rstest::rstest;
 
 use super::*;
-use crate::expressions::{col, column_expr_ref, column_name, expr, lit};
+use crate::expressions::{col, column_expr_ref, column_name, expr, lit, null_lit};
 use crate::kernel_predicates::{
     DefaultKernelPredicateEvaluator, EmptyColumnResolver, UnimplementedColumnResolver,
 };
@@ -410,6 +410,40 @@ fn test_all_null_pruning_all_comparison_ops(#[case] pred: Pred) {
         NULL,
         "{pred:#?} became {bare_pred:#?} (bare eval -> keep)"
     );
+}
+
+#[rstest]
+#[case::all_null_maps(lit("a"), Some(2), FALSE)]
+#[case::some_null_maps(lit("a"), Some(1), NULL)]
+#[case::missing_null_count(lit("a"), None, NULL)]
+#[case::null_key(null_lit(DataType::STRING), Some(0), FALSE)]
+fn test_map_has_key_pruning_by_null_count(
+    #[case] key: Expr,
+    #[case] null_count: Option<i64>,
+    #[case] expected: Option<bool>,
+    #[values(false, true)] inverted: bool,
+) {
+    let mut resolver =
+        HashMap::from_iter([(column_name!("stats_parsed.numRecords"), Scalar::from(2i64))]);
+    if let Some(null_count) = null_count {
+        resolver.insert(
+            column_name!("stats_parsed.nullCount.m"),
+            Scalar::from(null_count),
+        );
+    }
+    let filter = DefaultKernelPredicateEvaluator::from(resolver);
+    let stats_columns = stats_cols(&["m"]);
+    let pred = Pred::map_has_key(col!("m"), key);
+    let pred = if inverted { Pred::not(pred) } else { pred };
+
+    let sql_pred = as_sql_data_skipping_predicate_with_stats_columns(
+        &pred,
+        &Default::default(),
+        &stats_columns,
+    )
+    .unwrap();
+    let result = filter.eval(&sql_pred);
+    assert_eq!(result, expected, "{sql_pred}");
 }
 
 #[test]

@@ -723,6 +723,7 @@ fn test_has_uri_scheme_is_never_evaluated_for_skipping(
 }
 
 #[rstest::rstest]
+#[case::column_and_literal(col!("m"), lit("a"))]
 #[case::literal_and_column(lit("a"), col!("m"))]
 #[case::cast_and_literal(Expr::cast(col!("m"), DataType::STRING), lit("a"))]
 #[case::literal_and_cast(lit("a"), Expr::cast(col!("m"), DataType::STRING))]
