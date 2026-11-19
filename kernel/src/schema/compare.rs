@@ -28,31 +28,39 @@ use crate::utils::require;
 /// Exact type equality, including nested field order.
 #[cfg(feature = "declarative-plans")]
 pub(crate) fn data_types_equal_ordered(left: &DataType, right: &DataType) -> bool {
-    fn same_order(left: &DataType, right: &DataType) -> bool {
-        match (left, right) {
-            (DataType::Struct(left), DataType::Struct(right))
-            | (DataType::Variant(left), DataType::Variant(right))
-            | (DataType::File(left), DataType::File(right)) => {
-                left.fields().zip(right.fields()).all(|(left, right)| {
-                    left.name() == right.name() && same_order(left.data_type(), right.data_type())
-                })
-            }
-            (DataType::Array(left), DataType::Array(right)) => {
-                same_order(left.element_type(), right.element_type())
-            }
-            (DataType::Map(left), DataType::Map(right)) => {
-                same_order(left.key_type(), right.key_type())
-                    && same_order(left.value_type(), right.value_type())
-            }
-            #[cfg(feature = "udt-in-dev")]
-            (DataType::UserDefined(left), DataType::UserDefined(right)) => {
-                same_order(left.sql_type(), right.sql_type())
-            }
-            _ => true,
-        }
-    }
+    left == right && data_types_equal_for_write(left, right)
+}
 
-    left == right && same_order(left, right)
+/// Matches ordered value types while allowing the writer to supply field metadata.
+#[cfg(feature = "declarative-plans")]
+pub(crate) fn data_types_equal_for_write(left: &DataType, right: &DataType) -> bool {
+    match (left, right) {
+        (DataType::Struct(left), DataType::Struct(right))
+        | (DataType::Variant(left), DataType::Variant(right))
+        | (DataType::File(left), DataType::File(right)) => {
+            left.num_fields() == right.num_fields()
+                && left.fields().zip(right.fields()).all(|(left, right)| {
+                    left.name() == right.name()
+                        && left.is_nullable() == right.is_nullable()
+                        && data_types_equal_for_write(left.data_type(), right.data_type())
+                })
+        }
+        (DataType::Array(left), DataType::Array(right)) => {
+            left.contains_null() == right.contains_null()
+                && data_types_equal_for_write(left.element_type(), right.element_type())
+        }
+        (DataType::Map(left), DataType::Map(right)) => {
+            left.value_contains_null() == right.value_contains_null()
+                && data_types_equal_for_write(left.key_type(), right.key_type())
+                && data_types_equal_for_write(left.value_type(), right.value_type())
+        }
+        #[cfg(feature = "udt-in-dev")]
+        (DataType::UserDefined(left), DataType::UserDefined(right)) => {
+            left.annotation() == right.annotation()
+                && data_types_equal_for_write(left.sql_type(), right.sql_type())
+        }
+        _ => left == right,
+    }
 }
 
 /// The nullability flag of a schema's field. This can be compared with a read schema field's

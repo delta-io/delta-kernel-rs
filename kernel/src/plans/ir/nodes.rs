@@ -14,6 +14,7 @@ use url::Url;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::error::add_scalar_path_context;
 use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar, StructData};
+use crate::schema::compare::data_types_equal_for_write;
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema, lazy_schema_ref};
 use crate::utils::CollectInto;
 use crate::{FileMeta, KernelError, KernelResult};
@@ -26,7 +27,8 @@ use crate::{FileMeta, KernelError, KernelResult};
 /// documenting that operator's semantics, invariants, and output shape.
 ///
 /// An operator that reshapes its rows (a source, projection, aggregation, or file scan) carries a
-/// caller-declared `schema` field holding its output schema. File writes emit [`FILE_META_SCHEMA`].
+/// caller-declared `schema` field holding its output schema. File writes emit [`FILE_META_SCHEMA`]
+/// followed by any configured statistics; see [`WriteParquet`].
 /// The remaining operators inherit an input's schema; each payload's docs name which input.
 #[derive(Debug, Clone, Display, From)]
 #[strum(serialize_all = "snake_case")]
@@ -126,7 +128,7 @@ pub struct WriteJson {
 /// input fields are omitted from the file. The engine chooses compression and row-group sizing.
 /// The output is [`FILE_META_SCHEMA`] followed by the named `stats_agg` results in list order.
 /// Statistics cover all input rows, including fields omitted from `write_schema`, using the
-/// usual [`Agg`] null semantics.
+/// usual [`Agg`] null semantics. Inputs must bind identical statistics schemas, including metadata.
 ///
 /// The atomic-create, overwrite, input ordering, nonempty input, and duplicate-destination
 /// contracts of [`WriteJson`] also apply. Executors must reject invalid inputs before creating
@@ -183,6 +185,42 @@ impl WriteParquet {
                 builder.aggregate_as(stats.agg.clone(), &stats.name)
             })
             .build()
+    }
+
+    /// Validates the input prefix while allowing writer-supplied field metadata.
+    pub(crate) fn validate_input(
+        input_schema: &StructType,
+        write_schema: &StructType,
+    ) -> KernelResult<()> {
+        if write_schema.num_fields() == 0 {
+            return Err(KernelError::schema(
+                "WriteParquet requires at least one field",
+            ));
+        }
+        if input_schema.num_fields() < write_schema.num_fields() {
+            return Err(KernelError::schema("WriteParquet schema exceeds its input"));
+        }
+        for (source, field) in input_schema.fields().zip(write_schema.fields()) {
+            if source.name() != field.name()
+                || source.is_nullable() != field.is_nullable()
+                || !data_types_equal_for_write(source.data_type(), field.data_type())
+            {
+                return Err(KernelError::schema(format!(
+                    "WriteParquet field {} must match its input prefix",
+                    field.name()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Appends the bound statistics to the returned file metadata.
+    pub(crate) fn output_schema(stats_schema: &StructType) -> KernelResult<SchemaRef> {
+        let fields = FILE_META_SCHEMA
+            .fields()
+            .chain(stats_schema.fields())
+            .cloned();
+        Ok(Arc::new(StructType::try_new(fields)?))
     }
 }
 

@@ -50,7 +50,7 @@ use super::ir::nodes::{
 use super::ir::plan::{Plan, PlanNode};
 use crate::expressions::{ColumnName, Expression, ExpressionRef, PredicateRef, Scalar, StructData};
 use crate::schema::compare::data_types_equal_ordered;
-use crate::schema::{SchemaRef, StructType, ToSchema};
+use crate::schema::{SchemaRef, ToSchema};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::utils::CollectInto;
 use crate::{KernelError, KernelResult};
@@ -335,13 +335,19 @@ impl PlanBuilder {
     /// The write schema must match the input prefix, but may supply different file metadata.
     /// Absent inputs are dropped; no remaining inputs is an error. Returns one row of
     /// [`FILE_META_SCHEMA`] followed by the named statistics, which may reference unwritten input
-    /// fields. Missing operands, inconsistent output types, and duplicate output names are errors.
-    /// See [`WriteParquet`] for the execution contract.
+    /// fields. Missing operands, inconsistent statistics schemas, and duplicate output names are
+    /// errors. See [`WriteParquet`] for the execution contract.
     pub fn write_parquet(
         inputs: impl IntoIterator<Item = PlanBuilder>,
         write: WriteParquet,
     ) -> KernelResult<Self> {
-        let present = parquet_inputs(inputs, &write.write_schema)?;
+        let mut present = Vec::new();
+        for input in inputs {
+            WriteParquet::validate_input(input.schema(), &write.write_schema)?;
+            if let PlanBuilderRoot::Present(node) = input.0 {
+                present.push(node);
+            }
+        }
         if present.is_empty() {
             return Err(KernelError::generic(
                 "WriteParquet requires at least one input row",
@@ -353,19 +359,16 @@ impl PlanBuilder {
             if !stats_schema
                 .fields()
                 .zip(rebound.schema.fields())
-                .all(|(left, right)| data_types_equal_ordered(left.data_type(), right.data_type()))
+                .all(|(left, right)| {
+                    left == right && data_types_equal_ordered(left.data_type(), right.data_type())
+                })
             {
                 return Err(KernelError::schema(
                     "WriteParquet statistics must match every input",
                 ));
             }
         }
-        let output_schema = Arc::new(StructType::try_new(
-            FILE_META_SCHEMA
-                .fields()
-                .chain(stats_schema.fields())
-                .cloned(),
-        )?);
+        let output_schema = WriteParquet::output_schema(&stats_schema)?;
         Ok(Self::present(output_schema, write, present))
     }
 
@@ -795,38 +798,6 @@ fn check_columns_resolve<'a>(
         })?;
     }
     Ok(())
-}
-
-fn parquet_inputs(
-    inputs: impl IntoIterator<Item = PlanBuilder>,
-    write_schema: &SchemaRef,
-) -> KernelResult<Vec<BuilderNodeRef>> {
-    if write_schema.fields().next().is_none() {
-        return Err(KernelError::schema(
-            "WriteParquet requires at least one field",
-        ));
-    }
-    let mut present = Vec::new();
-    for input in inputs {
-        if input.schema().num_fields() < write_schema.num_fields() {
-            return Err(KernelError::schema("WriteParquet schema exceeds its input"));
-        }
-        for (source, field) in input.schema().fields().zip(write_schema.fields()) {
-            if source.name() != field.name()
-                || !data_types_equal_ordered(source.data_type(), field.data_type())
-                || source.is_nullable() != field.is_nullable()
-            {
-                return Err(KernelError::schema(format!(
-                    "WriteParquet field {} must match its input prefix",
-                    field.name()
-                )));
-            }
-        }
-        if let PlanBuilderRoot::Present(node) = input.0 {
-            present.push(node);
-        }
-    }
-    Ok(present)
 }
 
 /// Error unless each of `names` is a top-level, non-metadata field of `schema`. A file-constant is
