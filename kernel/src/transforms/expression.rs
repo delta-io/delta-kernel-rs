@@ -429,16 +429,14 @@ pub trait ExpressionTransform<'a> {
         map_owned_pair_or_else(b, left, right, f)
     }
 
-    /// Recursively transforms the children of a Mumbling bitmap lookup (binary).
+    /// Recursively transforms the looked-up value of a Mumbling bitmap lookup (unary).
     #[cfg(feature = "adaptive-metadata-in-dev")]
     fn recurse_into_pred_mumbling_bitmap_contains(
         &mut self,
         m: &'a MumblingBitmapContainsPredicate,
     ) -> Self::Output<MumblingBitmapContainsPredicate> {
-        let bitmap = self.transform_expr(m.bitmap());
         let value = self.transform_expr(m.value());
-        let f = |(bitmap, value)| MumblingBitmapContainsPredicate::new(bitmap, value);
-        map_owned_pair_or_else(m, bitmap, value, f)
+        map_owned_or_else(m, value, |value| m.with_value(value))
     }
 
     /// Recursively transforms a unary expression's child (unary).
@@ -661,6 +659,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::content_tree::mumbling::tests::encode_positions;
     use crate::expressions::VariadicExpressionOp::Coalesce;
     use crate::expressions::{
         Expression, Expression as Expr, MapToStructOptions, OpaqueExpressionOp, OpaquePredicateOp,
@@ -852,17 +852,17 @@ mod tests {
     }
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[test]
-    fn test_transform_pred_mumbling_bitmap_contains_rewrites_both_children() {
-        let pred = Pred::mumbling_bitmap_contains(col!("old_col"), col!("old_col"));
-        let result = ColumnReplacer(Some("new_col")).transform_pred(&pred);
-        assert_eq!(
-            result.as_deref(),
-            Some(&Pred::mumbling_bitmap_contains(
-                col!("new_col"),
-                col!("new_col")
-            ))
-        );
+    #[rstest::rstest]
+    fn test_transform_pred_mumbling_bitmap_contains_keeps_bitmap(
+        #[values(Some("new_col"), None)] replacement: Option<&'static str>,
+    ) {
+        let lookup = |name: &str| {
+            Pred::try_mumbling_bitmap_contains(encode_positions(&[1]), Expr::column([name]))
+                .unwrap()
+        };
+        let input = lookup("old_col");
+        let result = ColumnReplacer(replacement).transform_pred(&input);
+        assert_eq!(result.as_deref(), replacement.map(lookup).as_ref());
     }
 
     #[test]

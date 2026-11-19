@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
 use super::*;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::content_tree::mumbling::tests::encode_positions;
 use crate::expressions::{
     ArrayData, Expression as Expr, OpaqueExpressionOp, OpaquePredicateOp, Predicate as Pred,
     ScalarExpressionEvaluator, StructData, col, column_name, column_pred, expr, lit, null_lit,
@@ -755,7 +757,7 @@ fn test_eval_expr_evaluates_only_safe_casts(#[case] expr: Expr, #[case] expected
 #[test]
 fn test_mumbling_bitmap_contains_is_never_evaluated_for_skipping() {
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::Long(1));
-    let pred = Pred::mumbling_bitmap_contains(lit(Scalar::Binary(vec![])), col!("pos"));
+    let pred = Pred::try_mumbling_bitmap_contains(encode_positions(&[1]), col!("pos")).unwrap();
     assert_eq!(filter.eval(&pred), None);
 }
 
