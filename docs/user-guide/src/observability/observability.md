@@ -85,6 +85,7 @@ the event onto a channel and drain it from a worker.
 Filename: src/reporter.rs
 
 ```rust
+# extern crate delta_kernel;
 use delta_kernel::metrics::{MetricEvent, MetricsReporter};
 
 #[derive(Debug)]
@@ -247,6 +248,7 @@ To aggregate timing data per operation, store intermediate events keyed by
 Filename: src/correlating_reporter.rs
 
 ```rust
+# extern crate delta_kernel;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use delta_kernel::metrics::{MetricEvent, MetricId, MetricsReporter, SnapshotBuildOutcome};

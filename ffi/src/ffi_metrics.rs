@@ -1854,6 +1854,50 @@ mod tests {
         });
     }
     #[rstest]
+    fn domain_metadata_success_preserves_cache_status_and_count(
+        #[values(false, true)] from_cache: bool,
+        #[values(0, 37, u64::MAX)] num_domains_returned: u64,
+    ) {
+        let event =
+            kernel::MetricEvent::DomainMetadataLoadCompleted(kernel::DomainMetadataLoadCompleted {
+                duration: Duration::from_nanos(53),
+                outcome: kernel::DomainMetadataLoadOutcome::Success {
+                    from_cache,
+                    num_domains_returned,
+                },
+            });
+        with_ffi_event(&event, |ffi| {
+            assert!(matches!(
+                ffi,
+                MetricEvent::DomainMetadataLoadCompleted(DomainMetadataLoadCompleted {
+                    duration_ns: 53,
+                    outcome: DomainMetadataLoadOutcome::Success {
+                        from_cache: actual_cache,
+                        num_domains_returned: actual_count,
+                    },
+                }) if actual_cache == from_cache && actual_count == num_domains_returned
+            ));
+        });
+    }
+
+    #[rstest]
+    fn crc_success_preserves_byte_count(#[values(0, 37, u64::MAX)] bytes_read: u64) {
+        let event = kernel::MetricEvent::CrcReadCompleted(kernel::CrcReadCompleted {
+            duration: Duration::from_nanos(71),
+            outcome: kernel::CrcReadOutcome::Success { bytes_read },
+        });
+        with_ffi_event(&event, |ffi| {
+            assert!(matches!(
+                ffi,
+                MetricEvent::CrcReadCompleted(CrcReadCompleted {
+                    duration_ns: 71,
+                    outcome: CrcReadOutcome::Success { bytes_read: actual },
+                }) if actual == bytes_read
+            ));
+        });
+    }
+
+    #[rstest]
     #[case::crc(kernel::MetricEvent::CrcReadCompleted(kernel::CrcReadCompleted {
         duration: Duration::from_nanos(29), outcome: kernel::CrcReadOutcome::Error,
     }))]

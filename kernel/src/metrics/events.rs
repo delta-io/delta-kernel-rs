@@ -2773,6 +2773,66 @@ mod tests {
     }
 
     #[rstest]
+    #[case::snapshot(
+        MetricEvent::SnapshotBuildCompleted(SnapshotBuildCompleted {
+            context: MetricContext::empty(), load_type: SnapshotLoadType::Full,
+            duration: Duration::ZERO, outcome: SnapshotBuildOutcome::Success { version: 0 },
+        }),
+        Some("version"), &[],
+    )]
+    #[case::domain(
+        MetricEvent::DomainMetadataLoadCompleted(DomainMetadataLoadCompleted {
+            duration: Duration::ZERO,
+            outcome: DomainMetadataLoadOutcome::Success { from_cache: false, num_domains_returned: 0 },
+        }),
+        Some("num_domains_returned"), &["from_cache"],
+    )]
+    #[case::set_transaction(
+        MetricEvent::SetTransactionLoadCompleted(SetTransactionLoadCompleted {
+            duration: Duration::ZERO,
+            outcome: SetTransactionLoadOutcome::Success { from_cache: false, found: false },
+        }),
+        None, &["from_cache", "found"],
+    )]
+    #[case::crc(
+        MetricEvent::CrcReadCompleted(CrcReadCompleted {
+            duration: Duration::ZERO, outcome: CrcReadOutcome::Success { bytes_read: 0 },
+        }),
+        Some("bytes_read"), &[],
+    )]
+    fn late_read_measurements_preserve_error_and_receive_elapsed_time(
+        #[case] mut event: MetricEvent,
+        #[case] count_field: Option<&str>,
+        #[case] bool_fields: &[&str],
+    ) {
+        event.mark_error();
+        if let Some(field) = count_field {
+            event.record_u64(field, 37).unwrap();
+        }
+        for field in bool_fields {
+            event.record_bool(field, true).unwrap();
+        }
+        event.mark_error();
+        let elapsed = Duration::from_nanos(53);
+        event.set_duration_if_applicable(elapsed);
+        assert!(matches!(
+            event,
+            MetricEvent::SnapshotBuildCompleted(SnapshotBuildCompleted {
+                duration, outcome: SnapshotBuildOutcome::Error, ..
+            })
+            | MetricEvent::DomainMetadataLoadCompleted(DomainMetadataLoadCompleted {
+                duration, outcome: DomainMetadataLoadOutcome::Error,
+            })
+            | MetricEvent::SetTransactionLoadCompleted(SetTransactionLoadCompleted {
+                duration, outcome: SetTransactionLoadOutcome::Error,
+            })
+            | MetricEvent::CrcReadCompleted(CrcReadCompleted {
+                duration, outcome: CrcReadOutcome::Error,
+            }) if duration == elapsed
+        ));
+    }
+
+    #[rstest]
     #[case::checkpoint(MetricEvent::CheckpointWriteCompleted(CheckpointWriteCompleted {
         operation_id: MetricId::new(), version: 3,
         mode: CheckpointWriteMode::V1, duration: Duration::from_nanos(19),
