@@ -154,8 +154,8 @@ pub unsafe extern "C" fn commit_range_builder_with_max_catalog_version(
 /// When `false`, [`commit_range_builder_build`] lists the available commits without validating the
 /// start version or contiguity; [`commit_range_commit_files_next`] then reports gaps lazily
 /// according to [`commit_range_builder_with_fail_on_data_loss`]. Such a relaxed range cannot be
-/// read with [`commit_range_commits`], which returns a `CommitRangeError`. Even when `false`,
-/// build fails with `EmptyLogError` if no commits are listed in the range.
+/// read with [`commit_range_commits`], which returns a `CommitRangeError`. Empty and reversed
+/// ranges are allowed when validation is disabled.
 ///
 /// # Safety
 ///
@@ -613,8 +613,9 @@ fn commit_range_commit_files_impl(
 
 /// Call `engine_visitor` once with the next commit file, returning `true` if a file was yielded
 /// and `false` once the iterator is exhausted. When the range was built with `fail_on_data_loss`
-/// enabled, a missing start version or a gap through the range's end version surfaces as an error
-/// from this call. Iteration is fused after the first error: later calls return `false`.
+/// enabled, an observed later commit proving a missing start or a gap through the range's end
+/// surfaces as an error from this call. Listing exhaustion ends iteration normally. Iteration is
+/// fused after the first error: later calls return `false`.
 ///
 /// The [`FfiCommitFile`] pointer and the location string it references are valid only until the
 /// visitor returns. The visitor must not retain them.
@@ -1233,8 +1234,9 @@ mod tests {
         &[0, 1],
         Some("Table version 2 is missing or unavailable for this log operation.")
     )]
-    #[case::fail_on_data_loss_reports_missing_end_version(
-        vec![0, 1],
+    #[case::fail_on_data_loss_ends_without_proven_gap(vec![0, 1], Some(2), true, &[0, 1], None)]
+    #[case::fail_on_data_loss_reports_proven_missing_end_version(
+        vec![0, 1, 3],
         Some(2),
         true,
         &[0, 1],
