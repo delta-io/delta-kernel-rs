@@ -436,9 +436,8 @@ async fn test_app_id_versions_read_across_a_root_manifest_commit(
     let (engine, _temp_dir, table_url, snapshot) =
         setup_adaptive_metadata_table("root_manifest_file_app_id_versions").await?;
 
-    // End-to-end consistency with the real writer, which also writes each `txn` to its commit: the
-    // manifest commit's checkpoint action holds `app-1` and `app-2`, and the commit after it
-    // overrides `app-1`. A second manifest commit has to fold that override in.
+    // The manifest commit's checkpoint action holds `app-1` and `app-2`, and the commit after it
+    // overrides `app-1`. With `remanifest_after`, a second manifest commit has to fold that in.
     let v1 = commit(
         &engine,
         &table_url,
@@ -489,7 +488,8 @@ async fn test_domain_metadata_read_across_a_root_manifest_commit(
         setup_adaptive_metadata_table("root_manifest_file_domain_metadata").await?;
 
     // The manifest commit's checkpoint action holds `domain.a` and `domain.b`; the commit after it
-    // updates `domain.a` and removes `domain.b`. A second manifest commit has to fold those in.
+    // updates `domain.a` and removes `domain.b`. With `remanifest_after`, a second manifest commit
+    // has to fold those in.
     let v1 = commit(
         &engine,
         &table_url,
