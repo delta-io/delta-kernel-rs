@@ -12,8 +12,10 @@
 //!
 //! # Differences from Delta Spark
 //!
-//! - Any winner protocol action fails T. Delta Spark takes the winner's protocol, and fails T only
-//!   when T also writes a protocol, the winner drops a feature, or an opt-in conf applies.
+//! - Any winner protocol action fails T. Delta Spark takes the winner's protocol. It fails T when
+//!   the client can't read or write that protocol, when T also writes a protocol, when the winner
+//!   drops a feature, or when the winner adds a feature that fails concurrent transactions and an
+//!   opt-in conf is on.
 //! - A winner metadata action fails T, except an identity-only update whose tag is exactly `true`
 //!   while T changes no metadata. Delta Spark also accepts the tag `TRUE`. It also accepts a winner
 //!   that only enables some features, such as row tracking, while T changes no metadata.
@@ -24,8 +26,8 @@
 //! - An empty winner commit fails detection with an error. Delta Spark reads no action from it and
 //!   finds no conflict.
 //! - These inputs fail detection with an `unsupported` error, at the step that
-//!   [`detect_conflicts()`] lists: a table-level SnapshotIsolation, a manifest-commit winner and a
-//!   `delta.rowTracking` tombstone.
+//!   [`detect_conflicts()`] lists: a table-level SnapshotIsolation, a T that is a manifest
+//!   commit, a manifest-commit winner and a `delta.rowTracking` tombstone.
 //!
 //! T's facts don't depend on the winners, because Kernel never rebases T between winners.
 
@@ -46,7 +48,6 @@ use decision::{
 use occ_plan::occ_plan;
 use winner_check_plan::winner_check_plan;
 
-use crate::commit_range::CommitRange;
 use crate::expressions::MapToStructOptions;
 use crate::plans::ir::nodes::ScanFile;
 use crate::plans::{Operation, RelationRef, ScopedPlanExecutor};
@@ -57,16 +58,21 @@ use crate::{FileMeta, KernelError, KernelResult, PredicateRef, Version, version_
 
 /// Decides whether T conflicts with any of `winners`.
 ///
-/// Detection runs in this order:
+/// Detection runs these steps in order:
 ///
-/// 1. the table isolation level and the winner list;
-/// 2. the winner rules;
-/// 3. the manifest commits;
-/// 4. the OCC checks;
-/// 5. the row-tracking checks.
+/// 1. the input checks: the table isolation level, whether T is a manifest commit, and the winner
+///    list;
+/// 2. the winner check plan;
+/// 3. the winner-row check;
+/// 4. the winner rules;
+/// 5. the manifest-commit winners;
+/// 6. the OCC checks;
+/// 7. the row-tracking checks.
 ///
-/// An error from these checks means that Kernel can't check T against the winners, and the caller
-/// must fail T. Other errors come from the executor, for example a failed read.
+/// The winner rules and the OCC checks return the first conflict. The other checks return an
+/// error when they fail. An error from these checks means that Kernel can't check T against the
+/// winners, and the caller must fail T. Other errors come from the executor, for example a failed
+/// read.
 ///
 /// `file_actions` holds T's file actions with a `remove.path` column. Each `path` in
 /// `file_actions` and in the `read_files` of [`ReadScope::Files`] must be exactly as written in
@@ -81,6 +87,11 @@ pub(crate) fn detect_conflicts(
     if facts.isolation_level == IsolationLevel::SnapshotIsolation {
         return Err(KernelError::unsupported(
             "Conflict detection does not support the table isolation level SnapshotIsolation",
+        ));
+    }
+    if facts.is_manifest_commit {
+        return Err(KernelError::unsupported(
+            "Conflict detection does not support a transaction that writes a manifest commit",
         ));
     }
     ensure_winners_follow_read_version(facts.read_version, winners)?;
@@ -131,31 +142,24 @@ impl WinningCommit {
     }
 }
 
-/// Returns the commit files of `range` as winners, in ascending version order.
-pub(crate) fn winning_commits(range: &CommitRange) -> KernelResult<Vec<WinningCommit>> {
-    range
-        .commit_files()?
-        .map(|result| {
-            result.map(|commit| WinningCommit {
-                version: commit.version,
-                file: commit.location,
-            })
-        })
-        .collect()
-}
-
 /// The facts about T that conflict detection needs.
+///
+/// T is never a row-tracking backfill or unbackfill, because Kernel reserves those operation names.
 #[derive(Debug, Clone)]
 pub(crate) struct LoserFacts {
-    /// T's read version. The winners start at `read_version + 1`.
+    /// The version before the first winner to check: T's read version on the first conflict, then
+    /// the last winner that the previous check covered.
     pub(crate) read_version: Version,
-    /// The table's isolation level. It must be Serializable or WriteSerializable. When
-    /// `delta.isolationLevel` is unset or doesn't parse, pass Serializable, the Delta default.
-    /// [`LoserFacts::effective_isolation_level`] applies the downgrade.
+    /// The table's isolation level. Kernel accepts Serializable and WriteSerializable. OSS Delta
+    /// accepts only Serializable as a table value, and other writers set WriteSerializable. When
+    /// `delta.isolationLevel` is unset, pass Serializable, the Delta default. When it is set but
+    /// doesn't parse, fail T: don't guess a level. [`LoserFacts::effective_isolation_level`]
+    /// applies the downgrade.
     pub(crate) isolation_level: IsolationLevel,
-    /// T is a blind append: it only adds files and depends on no table state that it read. This is
-    /// the value of T's `commitInfo.isBlindAppend`.
-    pub(crate) is_blind_append: bool,
+    /// T writes a root manifest file, so its commit is an adaptiveMetadata manifest commit. Its
+    /// `checkpoint` action states the table's txns and domains, so a retry would drop a winner's
+    /// changes.
+    pub(crate) is_manifest_commit: bool,
     /// At least one file action of T has `dataChange=true`.
     pub(crate) has_data_change: bool,
     /// T's operation changes table data. This matches Delta Spark's
@@ -222,19 +226,16 @@ pub(crate) enum ReadScope {
         /// - `None` matches every add. Pass `None` for a scan without a partition filter, or when
         ///   any of several scans has none.
         /// - With several filtered scans, pass the OR of their partition conjuncts.
-        /// - On a partitioned table, a T that read no data passes `Some(Predicate::FALSE)`. Then
-        ///   no add conflicts.
-        /// - On an unpartitioned table, Kernel ignores the predicate, and every add conflicts, as
-        ///   in Delta Spark.
+        /// - On an unpartitioned table, Kernel ignores the predicate, and every checked add
+        ///   conflicts, as in Delta Spark.
         partition_predicate: Option<PredicateRef>,
         /// Parses offset-less TIMESTAMP partition values in `partition_schema`. Use the options of
         /// T's scan.
         map_to_struct_options: MapToStructOptions,
     },
+    /// T read no table state. A blind append passes it.
+    Nothing,
 }
-
-/// The column that holds the winner version. Each scan of a winner commit adds it as a constant.
-pub(crate) const VERSION: &str = "version";
 
 // === Helpers ===
 
@@ -258,27 +259,6 @@ fn ensure_winners_follow_read_version(
         )));
     }
     Ok(())
-}
-
-/// The commit files of the winners at `versions`, as scan inputs. `winners` must be in ascending
-/// version order.
-fn scan_files(
-    winners: &[WinningCommit],
-    versions: impl IntoIterator<Item = Version>,
-) -> KernelResult<Vec<ScanFile>> {
-    versions
-        .into_iter()
-        .map(|version| {
-            winners
-                .binary_search_by_key(&version, |winner| winner.version)
-                .ok()
-                .and_then(|index| winners.get(index))
-                .ok_or_else(|| {
-                    KernelError::internal_error(format!("No winning commit at version {version}"))
-                })?
-                .scan_file()
-        })
-        .collect()
 }
 
 fn winner_versions(winners: &[WinningCommit]) -> Vec<Version> {

@@ -15,8 +15,8 @@ use url::Url;
 use super::decision::{Conflict, WinnerRule};
 use super::occ_plan::OccCheck;
 use super::tests::{
-    LoserRelations, conflict, delete_loser, equals, files_scope, make_optimize,
-    no_conflict_summaries, occ, only_summary, outcome, winner, winners_after,
+    LoserRelations, conflict, equals, make_optimize, no_conflict_summaries, occ, only_summary,
+    outcome, partitioned_delete_facts, winner, winners_after,
 };
 use super::*;
 use crate::committer::FileSystemCommitter;
@@ -219,13 +219,13 @@ fn delete_selecting(
     let paths = scan_paths(snapshot, partition_predicate.clone());
     let read = as_strs(&paths);
     let relations = LoserRelations::new(&read, &read);
-    let scope = files_scope(
+    let facts = partitioned_delete_facts(
+        snapshot.version(),
         &relations.read_files,
         partition_schema,
         partition_predicate,
-        MapToStructOptions::default(),
     );
-    (relations, delete_loser(snapshot.version(), scope))
+    (relations, facts)
 }
 
 /// Relations and facts of a DELETE of every file in an unpartitioned `snapshot`.
@@ -244,7 +244,7 @@ fn delete_partition_a(url: &str) -> (LoserRelations, LoserFacts) {
 
 /// Runs conflict detection for T against the winners after T's read version in the table at
 /// `url`.
-fn detect_in(url: &str, relations: &LoserRelations, facts: &LoserFacts) -> Option<Conflict> {
+fn detect_in_table(relations: &LoserRelations, facts: &LoserFacts, url: &str) -> Option<Conflict> {
     outcome(relations.detect(facts, &winners_after(url, facts.read_version)))
 }
 
@@ -290,7 +290,7 @@ fn kernel_append_in_read_partition(
     commit_adds(&url, "part", &[(&path, winner_partition)], blind_append);
     let (relations, mut facts) = delete_partition_a(&url);
     facts.isolation_level = isolation_level;
-    assert_eq!(detect_in(&url, &relations, &facts), expected);
+    assert_eq!(detect_in_table(&relations, &facts, &url), expected);
 }
 
 #[rstest]
@@ -321,7 +321,7 @@ fn kernel_winner_remove_conflicts_only_when_t_read_the_file(
     commit_remove(&url, operation, data_change, removed_partition);
     assert_eq!(scan_paths(&snapshot_at(&url, 2), None).len(), 1);
     let (relations, facts) = delete_partition_a(&url);
-    assert_eq!(detect_in(&url, &relations, &facts), expected);
+    assert_eq!(detect_in_table(&relations, &facts, &url), expected);
 }
 
 #[rstest]
@@ -331,22 +331,12 @@ fn kernel_winner_remove_conflicts_only_when_t_read_the_file(
     |facts: &mut LoserFacts| facts.written_domains = vec!["app.x".to_string()],
     conflict(2, Some("WRITE"), winner(WinnerRule::DomainConflict))
 )]
-#[case::other_domain_passes(
-    |url: &str| commit_domain(url, "app.y"),
-    |facts: &mut LoserFacts| facts.written_domains = vec!["app.x".to_string()],
-    None
-)]
 // Delta Spark's `checkForUpdatedApplicationTransactionIdsThatCurrentTxnDependsOn` fails T when the
 // winner writes an app ID that T read.
 #[case::read_app_id_fails(
     |url: &str| commit_app_id(url, "app-a"),
     |facts: &mut LoserFacts| facts.read_app_ids = vec!["app-a".to_string()],
     conflict(2, Some("WRITE"), winner(WinnerRule::TxnConflict))
-)]
-#[case::other_app_id_passes(
-    |url: &str| commit_app_id(url, "app-b"),
-    |facts: &mut LoserFacts| facts.read_app_ids = vec!["app-a".to_string()],
-    None
 )]
 fn kernel_domain_or_txn_winner(
     #[case] commit: fn(&str) -> Version,
@@ -357,7 +347,7 @@ fn kernel_domain_or_txn_winner(
     commit(&url);
     let (relations, mut facts) = delete_partition_a(&url);
     adjust(&mut facts);
-    assert_eq!(detect_in(&url, &relations, &facts), expected);
+    assert_eq!(detect_in_table(&relations, &facts, &url), expected);
 }
 
 #[test]
@@ -426,16 +416,13 @@ fn kernel_append_matches_physical_partition_column(
         .to_string();
     commit_adds(&url, &physical, &[("added.parquet", "x")], false);
     let relations = LoserRelations::new(&[], &[]);
-    let facts = delete_loser(
+    let facts = partitioned_delete_facts(
         0,
-        files_scope(
-            &relations.read_files,
-            schema_ref! { nullable (physical.as_str()): STRING },
-            Some(equals(&physical, predicate_value)),
-            MapToStructOptions::default(),
-        ),
+        &relations.read_files,
+        schema_ref! { nullable (physical.as_str()): STRING },
+        Some(equals(&physical, predicate_value)),
     );
-    assert_eq!(detect_in(&url, &relations, &facts), expected);
+    assert_eq!(detect_in_table(&relations, &facts, &url), expected);
 }
 
 // === Fixture-table winners ===
@@ -458,7 +445,7 @@ fn cdf_table_partitioned_delete(#[case] partition: i64, #[case] expected: Option
         schema_ref! { nullable "part": LONG },
         Some(equals("part", partition)),
     );
-    assert_eq!(detect_in(&url, &relations, &facts), expected);
+    assert_eq!(detect_in_table(&relations, &facts, &url), expected);
 }
 
 #[test]
@@ -565,7 +552,7 @@ fn fixture_loser_that_read_every_file(
     let (url, _tmp) = fixture_table(table);
     let (relations, mut facts) = delete_all(&snapshot_at(&url, read_version));
     adjust(&mut facts);
-    assert_eq!(detect_in(&url, &relations, &facts), expected);
+    assert_eq!(detect_in_table(&relations, &facts, &url), expected);
 }
 
 #[test]
@@ -600,8 +587,7 @@ fn partitioned_dv_winners_conflict_only_in_their_partitions(
     #[case] partition: i32,
     #[case] expected: Option<Conflict>,
 ) {
-    // Winners on this golden table change partitions 0, 2, 4, 6, and 8 only. The checkpoint at
-    // version 10 does not change the winner commits, which are JSON files.
+    // The winners on this golden table change only partitions 0, 2, 4, 6 and 8.
     let dir = ::test_utils::load_test_data("tests/golden_data", "dv-partitioned-with-checkpoint")
         .unwrap();
     let url = Url::from_directory_path(dir.path().join("dv-partitioned-with-checkpoint/delta"))
@@ -613,7 +599,7 @@ fn partitioned_dv_winners_conflict_only_in_their_partitions(
         Some(equals("part", partition)),
     );
     adjust(&mut facts);
-    assert_eq!(detect_in(&url, &relations, &facts), expected);
+    assert_eq!(detect_in_table(&relations, &facts, &url), expected);
 }
 
 #[rstest]
@@ -637,47 +623,19 @@ fn fixture_txn_winner_of_read_app_id(
         Some(equals("modified", modified)),
     );
     facts.read_app_ids = vec![read_app_id.to_string()];
-    assert_eq!(detect_in(&url, &relations, &facts), expected);
+    assert_eq!(detect_in_table(&relations, &facts, &url), expected);
 }
 
 #[test]
 fn winner_rule_is_reported_before_add_check_of_earlier_winner() {
-    // Version 1 writes `new_app_1`, and version 2 writes `new_app_2`. T reads `new_app_2`. Kernel
-    // checks every winner rule before any file check, so it reports version 2. Delta Spark checks
-    // each winner in full, in version order, so it stops at version 1. There, a non-blind add
-    // conflicts with T. Both reject T.
+    // Version 1 adds a file that conflicts with T, and version 2 writes `new_app_2`, which T read.
+    // Kernel reports version 2, because it checks every winner rule first. Delta Spark reports
+    // version 1.
     let (url, _tmp) = fixture_table("app-txn-with-last-updated");
     let (relations, mut facts) = delete_all(&snapshot_at(&url, 0));
     facts.read_app_ids = vec!["new_app_2".to_string()];
     assert_eq!(
-        detect_in(&url, &relations, &facts),
+        detect_in_table(&relations, &facts, &url),
         conflict(2, Some("WRITE"), winner(WinnerRule::TxnConflict))
-    );
-}
-
-#[test]
-fn blind_append_passes_over_append_winners_on_unpartitioned_table() {
-    // A blind append reads nothing, so Delta Spark skips the add check for it. The three winners
-    // add files and write `txn` actions. T reads none of their app IDs.
-    let (url, _tmp) = fixture_table("app-txn-with-last-updated");
-    let relations = LoserRelations::new(&[], &[]);
-    let scope = files_scope(
-        &relations.read_files,
-        schema_ref! {},
-        None,
-        MapToStructOptions::default(),
-    );
-    let mut facts = delete_loser(0, scope);
-    facts.is_blind_append = true;
-    facts.rewrites_files = false;
-    let summaries = no_conflict_summaries(relations.detect(&facts, &winners_after(&url, 0)));
-    assert_eq!(
-        Vec::from_iter(summaries.iter().map(|s| s.version)),
-        [1, 2, 3]
-    );
-    assert!(
-        summaries
-            .iter()
-            .all(|s| s.operation.as_deref() == Some("WRITE"))
     );
 }

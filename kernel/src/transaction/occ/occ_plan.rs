@@ -8,23 +8,26 @@
 //! ```
 //!
 //! Project(part) and Filter(predicate) run only for a partitioned `ReadScope::Files` with a
-//! predicate. `WholeTable` has no SemiJoin(read_files).
+//! predicate. `WholeTable` has no SemiJoin(read_files). `Nothing` leaves out read_append and
+//! read_delete.
 
 use std::sync::LazyLock;
 
 use strum::{EnumString, IntoStaticStr};
 
-use super::{LoserFacts, ReadScope, VERSION, WinningCommit, scan_files};
+use super::{LoserFacts, ReadScope, WinningCommit};
+use crate::action_reconciliation::file_metadata::PARTITION_VALUES_FIELD;
+use crate::action_reconciliation::plan::VERSION;
 use crate::actions::{ADD_NAME, REMOVE_NAME};
 use crate::expressions::{Expression, col, column_name, lit};
 use crate::plans::{Plan, PlanBuilder, RelationRef};
 use crate::scan::PrefixColumns;
 use crate::schema::{SchemaRef, StructField, StructType, lazy_schema_ref, try_schema};
 use crate::transforms::ExpressionTransform as _;
-use crate::{KernelError, KernelResult, Version};
+use crate::{KernelResult, Version};
 
 // === Output columns ===
-pub(crate) const CHECK: &str = "check";
+pub(super) const CHECK: &str = "check";
 
 // === Input and intermediate columns ===
 const PART: &str = "part";
@@ -34,7 +37,7 @@ static WINNER_ADDS_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     not_null (VERSION): LONG,
     nullable (ADD_NAME): {
         not_null (PATH): STRING,
-        not_null "partitionValues": { STRING => nullable STRING },
+        not_null (PARTITION_VALUES_FIELD): { STRING => nullable STRING },
     },
 };
 
@@ -45,7 +48,7 @@ static WINNER_REMOVES_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     },
 };
 
-pub(crate) static VIOLATION_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+pub(super) static VIOLATION_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     not_null (VERSION): LONG,
     not_null (CHECK): STRING,
 };
@@ -55,7 +58,7 @@ pub(crate) static VIOLATION_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 /// The plan returns one row for each check and version with a violation. `read_append` scans the
 /// winners at `read_append_versions`. The delete checks scan every winner. `file_actions` must have
 /// a `remove.path` column.
-pub(crate) fn occ_plan(
+pub(super) fn occ_plan(
     facts: &LoserFacts,
     winners: &[WinningCommit],
     read_append_versions: &[Version],
@@ -91,27 +94,19 @@ pub(crate) enum OccCheck {
     DeleteDelete,
 }
 
-impl OccCheck {
-    /// Parses a `check` value from the plan output.
-    pub(crate) fn parse(value: &str) -> KernelResult<Self> {
-        value
-            .parse()
-            .map_err(|_| KernelError::internal_error(format!("Unknown OCC check {value:?}")))
-    }
-}
-
 /// Winner adds that T should have read. Every add counts, whatever its `dataChange`.
 fn read_append_branch(
     read_scope: &ReadScope,
     winners: &[WinningCommit],
     versions: &[Version],
 ) -> KernelResult<PlanBuilder> {
-    let adds = PlanBuilder::scan_json(
-        scan_files(winners, versions.iter().copied())?,
-        &[VERSION],
-        WINNER_ADDS_SCHEMA.clone(),
-    )?
-    .filter(col!(ADD_NAME).is_not_null())?;
+    let files = winners
+        .iter()
+        .filter(|winner| versions.contains(&winner.version))
+        .map(WinningCommit::scan_file)
+        .collect::<KernelResult<Vec<_>>>()?;
+    let adds = PlanBuilder::scan_json(files, &[VERSION], WINNER_ADDS_SCHEMA.clone())?
+        .filter(col!(ADD_NAME).is_not_null())?;
     let ReadScope::Files {
         partition_schema,
         partition_predicate: Some(partition_predicate),
@@ -137,7 +132,7 @@ fn read_append_branch(
     let part = Expression::struct_from([
         col!(VERSION),
         Expression::map_to_struct(
-            col!(ADD_NAME, "partitionValues"),
+            col!(ADD_NAME, PARTITION_VALUES_FIELD),
             map_to_struct_options.clone(),
         ),
     ]);
@@ -156,6 +151,8 @@ fn read_delete_branch(read_scope: &ReadScope, removes: PlanBuilder) -> KernelRes
             [column_name!(REMOVE_NAME, PATH)],
             [column_name!(PATH)],
         ),
+        // T read nothing, so no winner remove is of a file that T read.
+        ReadScope::Nothing => PlanBuilder::values(WINNER_REMOVES_SCHEMA.clone(), vec![]),
     }
 }
 

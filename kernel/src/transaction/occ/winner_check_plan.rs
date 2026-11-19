@@ -6,8 +6,9 @@
 
 use std::sync::LazyLock;
 
-use super::{LoserFacts, VERSION, WinningCommit};
+use super::{LoserFacts, WinningCommit};
 use crate::KernelResult;
+use crate::action_reconciliation::plan::VERSION;
 use crate::actions::{
     CHECKPOINT_ACTION_NAME, COMMIT_INFO_NAME, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME,
     SET_TRANSACTION_NAME,
@@ -19,10 +20,10 @@ use crate::row_tracking::ROW_TRACKING_DOMAIN_NAME;
 use crate::schema::{DataType, SchemaRef, lazy_schema_ref};
 
 /// The `commitInfo.operation` value of a row-tracking backfill.
-pub(crate) const ROW_TRACKING_BACKFILL_OPERATION: &str = "ROW TRACKING BACKFILL";
+pub(super) const ROW_TRACKING_BACKFILL_OPERATION: &str = "ROW TRACKING BACKFILL";
 /// The `commitInfo.operation` value of a row-tracking unbackfill.
-pub(crate) const ROW_TRACKING_UNBACKFILL_OPERATION: &str = "ROW TRACKING UNBACKFILL";
-/// The operations that conflict detection handles as a row-tracking backfill.
+pub(super) const ROW_TRACKING_UNBACKFILL_OPERATION: &str = "ROW TRACKING UNBACKFILL";
+/// The operations that conflict detection handles as a row-tracking backfill or unbackfill.
 const ROW_TRACKING_BACKFILL_OPERATIONS: [&str; 2] = [
     ROW_TRACKING_BACKFILL_OPERATION,
     ROW_TRACKING_UNBACKFILL_OPERATION,
@@ -34,18 +35,18 @@ const IDENTITY_ONLY_METADATA_UPDATE_TAG: &str = "delta.identity.schemaUpdate";
 const IDENTITY_ONLY_METADATA_UPDATE_TAG_VALUE: &str = "true";
 
 // === Output columns ===
-pub(crate) const OPERATION: &str = "operation";
-pub(crate) const IS_BLIND_APPEND: &str = "is_blind_append";
-pub(crate) const IN_COMMIT_TIMESTAMP: &str = "in_commit_timestamp";
-pub(crate) const IS_MANIFEST_COMMIT: &str = "is_manifest_commit";
-pub(crate) const ROW_ID_HIGH_WATER_MARK: &str = "row_id_high_water_mark";
-pub(crate) const WRITES_ROW_TRACKING: &str = "writes_row_tracking";
-pub(crate) const REMOVES_ROW_TRACKING: &str = "removes_row_tracking";
-pub(crate) const PROTOCOL_CHANGED: &str = "protocol_changed";
-pub(crate) const METADATA_CHANGED: &str = "metadata_changed";
-pub(crate) const DOMAIN_CONFLICT: &str = "domain_conflict";
-pub(crate) const TXN_CONFLICT: &str = "txn_conflict";
-pub(crate) const BACKFILL_CONFLICT: &str = "backfill_conflict";
+pub(super) const OPERATION: &str = "operation";
+pub(super) const IS_BLIND_APPEND: &str = "is_blind_append";
+pub(super) const IN_COMMIT_TIMESTAMP: &str = "in_commit_timestamp";
+pub(super) const IS_MANIFEST_COMMIT: &str = "is_manifest_commit";
+pub(super) const ROW_ID_HIGH_WATER_MARK: &str = "row_id_high_water_mark";
+pub(super) const WRITES_ROW_TRACKING: &str = "writes_row_tracking";
+pub(super) const REMOVES_ROW_TRACKING: &str = "removes_row_tracking";
+pub(super) const PROTOCOL_CHANGED: &str = "protocol_changed";
+pub(super) const METADATA_CHANGED: &str = "metadata_changed";
+pub(super) const DOMAIN_CONFLICT: &str = "domain_conflict";
+pub(super) const TXN_CONFLICT: &str = "txn_conflict";
+pub(super) const BACKFILL_CONFLICT: &str = "backfill_conflict";
 
 // === Per-action columns ===
 const IDENTITY_ONLY_TAG: &str = "identity_only_tag";
@@ -72,7 +73,7 @@ const ROW_ID_HIGH_WATER_MARK_FIELD: &str = "rowIdHighWaterMark";
 
 /// The schema of the plan output: one row for each winner. Every boolean column except
 /// `is_blind_append` is not null, so an expression that yields NULL fails the plan.
-pub(crate) static WINNER_CHECK_OUTPUT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+pub(super) static WINNER_CHECK_OUTPUT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     not_null (VERSION): LONG,
     nullable (OPERATION): STRING,
     nullable (IS_BLIND_APPEND): BOOLEAN,
@@ -146,7 +147,7 @@ static ACTION_ROW_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 /// The plan output follows [`WINNER_CHECK_OUTPUT_SCHEMA`], with one row for each winner that has
 /// at least one action. T's domains and app IDs enter the plan as literals. T's `changes_metadata`
 /// and `rewrites_files` select the rule expressions in Rust.
-pub(crate) fn winner_check_plan(
+pub(super) fn winner_check_plan(
     facts: &LoserFacts,
     winners: &[WinningCommit],
 ) -> KernelResult<Option<Plan>> {
@@ -196,7 +197,7 @@ pub(crate) fn winner_check_plan(
 }
 
 /// Returns true when `operation` is a row-tracking backfill or unbackfill.
-pub(crate) fn is_row_tracking_backfill_operation(operation: &str) -> bool {
+pub(super) fn is_row_tracking_backfill_operation(operation: &str) -> bool {
     ROW_TRACKING_BACKFILL_OPERATIONS.contains(&operation)
 }
 
@@ -278,7 +279,7 @@ fn rule_expr(facts: &LoserFacts) -> Expression {
     ])
 }
 
-/// True when the count column `count` is above 0.
+/// True when `count` is above 0.
 fn has_matches(count: &str) -> Predicate {
     Expression::column([count]).gt(lit(0i64))
 }

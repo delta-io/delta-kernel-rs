@@ -9,7 +9,8 @@ use super::winner_check_plan::{
     TXN_CONFLICT, WINNER_CHECK_OUTPUT_SCHEMA, WRITES_ROW_TRACKING,
     is_row_tracking_backfill_operation,
 };
-use super::{LoserFacts, VERSION, WinningCommit, winner_versions};
+use super::{LoserFacts, ReadScope, WinningCommit, winner_versions};
+use crate::action_reconciliation::plan::VERSION;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::ColumnName;
 use crate::plans::PlanResult;
@@ -24,7 +25,8 @@ use crate::{KernelError, KernelResult, Version};
 pub(crate) enum WinnerRule {
     /// The winner has a protocol action.
     ProtocolChanged,
-    /// The winner has a `metaData` action that isn't an identity-only update that T accepts.
+    /// The winner has a `metaData` action. An identity-only update doesn't count when T changes no
+    /// metadata.
     MetadataChanged,
     /// The winner writes a domain that T writes, other than `delta.rowTracking`.
     DomainConflict,
@@ -71,23 +73,15 @@ pub(crate) struct WinnerSummary {
     pub(crate) violations: Vec<WinnerRule>,
 }
 
-impl WinnerSummary {
-    fn is_row_tracking_backfill_or_unbackfill(&self) -> bool {
-        self.operation
-            .as_deref()
-            .is_some_and(is_row_tracking_backfill_operation)
-    }
-}
-
 /// One row of the OCC plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct OccViolation {
-    pub(crate) version: Version,
-    pub(crate) check: OccCheck,
+pub(super) struct OccViolation {
+    pub(super) version: Version,
+    pub(super) check: OccCheck,
 }
 
 /// Reads the winner check plan output, in ascending version order.
-pub(crate) fn read_winner_summaries(result: PlanResult) -> KernelResult<Vec<WinnerSummary>> {
+pub(super) fn read_winner_summaries(result: PlanResult) -> KernelResult<Vec<WinnerSummary>> {
     let mut summaries = visit_batches::<WinnerSummaryVisitor>(result)?.0;
     summaries.sort_by_key(|summary| summary.version);
     Ok(summaries)
@@ -97,30 +91,33 @@ pub(crate) fn read_winner_summaries(result: PlanResult) -> KernelResult<Vec<Winn
 /// decides.
 ///
 /// `summaries` must be in ascending version order.
-pub(crate) fn first_winner_conflict(summaries: &[WinnerSummary]) -> Option<Conflict> {
-    summaries.iter().find_map(|summary| {
+pub(super) fn first_winner_conflict(summaries: &[WinnerSummary]) -> Option<Conflict> {
+    let (version, rule) = summaries.iter().find_map(|summary| {
         let rule = summary.violations.iter().min()?;
-        Some(Conflict {
-            version: summary.version,
-            operation: summary.operation.clone(),
-            kind: ConflictKind::Winner(*rule),
-        })
-    })
+        Some((summary.version, *rule))
+    })?;
+    Some(conflict_at(summaries, version, ConflictKind::Winner(rule)))
 }
 
 /// Returns the winner versions that `read_append` checks.
-pub(crate) fn select_read_append_versions(
+pub(super) fn select_read_append_versions(
     facts: &LoserFacts,
     summaries: &[WinnerSummary],
 ) -> Vec<Version> {
     let isolation_level = facts.effective_isolation_level();
-    if facts.is_blind_append || isolation_level == IsolationLevel::SnapshotIsolation {
+    let read_nothing = matches!(facts.read_scope, ReadScope::Nothing);
+    if read_nothing || isolation_level == IsolationLevel::SnapshotIsolation {
         return Vec::new();
     }
     Vec::from_iter(
         summaries
             .iter()
-            .filter(|summary| !summary.is_row_tracking_backfill_or_unbackfill())
+            .filter(|summary| {
+                !summary
+                    .operation
+                    .as_deref()
+                    .is_some_and(is_row_tracking_backfill_operation)
+            })
             .filter(|summary| {
                 isolation_level != IsolationLevel::WriteSerializable
                     || facts.changes_metadata
@@ -131,40 +128,41 @@ pub(crate) fn select_read_append_versions(
 }
 
 /// Reads the OCC plan output.
-pub(crate) fn read_occ_violations(result: PlanResult) -> KernelResult<Vec<OccViolation>> {
+pub(super) fn read_occ_violations(result: PlanResult) -> KernelResult<Vec<OccViolation>> {
     Ok(visit_batches::<OccViolationVisitor>(result)?.0)
 }
 
 /// Returns the earliest violation. Within one version, [`OccCheck`] order decides.
-pub(crate) fn first_occ_conflict(
+pub(super) fn first_occ_conflict(
     violations: &[OccViolation],
     summaries: &[WinnerSummary],
 ) -> Option<Conflict> {
     let first = violations
         .iter()
         .min_by_key(|violation| (violation.version, violation.check))?;
-    let operation = summaries
-        .iter()
-        .find(|summary| summary.version == first.version)
-        .and_then(|summary| summary.operation.clone());
-    Some(Conflict {
-        version: first.version,
-        operation,
-        kind: ConflictKind::Occ(first.check),
-    })
+    Some(conflict_at(
+        summaries,
+        first.version,
+        ConflictKind::Occ(first.check),
+    ))
 }
 
-/// Returns an internal error unless `summaries` has one row for each winner, in order.
+/// Returns an error unless `summaries` has one row for each winner, in order.
 ///
-/// A winner gets no row when the executor reads no action from its commit file, for example an
-/// empty file. Kernel fails then, because it can't check that winner.
-pub(crate) fn ensure_winner_rows(
+/// A winner gets no row when the plan reads no action from its commit file, for example an empty
+/// file. Kernel fails then, because it can't check that winner.
+pub(super) fn ensure_winner_rows(
     read_version: Version,
     winners: &[WinningCommit],
     summaries: &[WinnerSummary],
 ) -> KernelResult<()> {
     let rows = Vec::from_iter(summaries.iter().map(|summary| summary.version));
     let versions = winner_versions(winners);
+    if let Some(missing) = versions.iter().find(|version| !rows.contains(version)) {
+        return Err(KernelError::generic(format!(
+            "The winner check plan read no action from the commit file of version {missing}"
+        )));
+    }
     if rows != versions {
         return Err(KernelError::internal_error(format!(
             "Winner check rows {rows:?} do not match the winning commits {versions:?} after read \
@@ -174,27 +172,26 @@ pub(crate) fn ensure_winner_rows(
     Ok(())
 }
 
-/// Returns an error when a winner is a manifest commit, because the plans don't read the actions
-/// nested in its `checkpoint` action.
-pub(crate) fn ensure_no_manifest_commit(summaries: &[WinnerSummary]) -> KernelResult<()> {
-    match summaries.iter().find(|summary| summary.is_manifest_commit) {
-        Some(summary) => Err(KernelError::unsupported(format!(
+/// Returns an error when a winner is a manifest commit.
+///
+/// A manifest commit's file changes can live in its content tree, which the plans don't read. T's
+/// references to the table state also go stale. The `checkpoint` array holds the full table state,
+/// not the commit's changes.
+pub(super) fn ensure_no_manifest_commit(summaries: &[WinnerSummary]) -> KernelResult<()> {
+    if let Some(summary) = summaries.iter().find(|summary| summary.is_manifest_commit) {
+        return Err(KernelError::unsupported(format!(
             "Conflict detection does not support the manifest commit at version {}",
             summary.version
-        ))),
-        None => Ok(()),
+        )));
     }
+    Ok(())
 }
 
 /// Returns an error when a winner removes the `delta.rowTracking` domain, or writes it without a
 /// readable high-water mark.
 ///
-/// The next attempt needs a row ID high-water mark. A removed `delta.rowTracking` domain gives
-/// none, so Kernel can't tell how T's row IDs continue. A written domain gives no mark when its
-/// `configuration` fails to parse or has no `rowIdHighWaterMark`. Kernel fails then, because the
-/// next attempt would otherwise use an older mark. The missing-mark error omits the version,
-/// because a parse failure can null the marks of other winners in the same batch.
-pub(crate) fn ensure_row_tracking_marks(summaries: &[WinnerSummary]) -> KernelResult<()> {
+/// The next attempt needs a row ID high-water mark to continue T's row IDs.
+pub(super) fn ensure_row_tracking_marks(summaries: &[WinnerSummary]) -> KernelResult<()> {
     if let Some(summary) = summaries
         .iter()
         .find(|summary| summary.removes_row_tracking)
@@ -313,12 +310,28 @@ impl RowVisitor for OccViolationVisitor {
         };
         for row in 0..row_count {
             let check: &str = check_getter.get(row, CHECK)?;
+            let check = check
+                .parse()
+                .map_err(|_| KernelError::internal_error(format!("Unknown OCC check {check:?}")))?;
             self.0.push(OccViolation {
                 version: to_version(version_getter.get(row, VERSION)?)?,
-                check: OccCheck::parse(check)?,
+                check,
             });
         }
         Ok(())
+    }
+}
+
+/// The conflict of the winner at `version`, with that winner's `commitInfo.operation`.
+fn conflict_at(summaries: &[WinnerSummary], version: Version, kind: ConflictKind) -> Conflict {
+    let operation = summaries
+        .iter()
+        .find(|summary| summary.version == version)
+        .and_then(|summary| summary.operation.clone());
+    Conflict {
+        version,
+        operation,
+        kind,
     }
 }
 
