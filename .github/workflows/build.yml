@@ -106,6 +106,9 @@ jobs:
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.12"
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.13.9"
       - name: Install AI reviewer config test dependencies
         run: python3 -m pip install --no-deps PyYAML==6.0.3
       - name: Validate AI reviewer config
@@ -113,6 +116,30 @@ jobs:
           python3 -m unittest discover
           --start-directory .github/omnigent/tests
           --pattern 'test_*.py'
+      # uv keeps the pins already in each lock, so this fails only when a lock and its .in file
+      # disagree, not when a dependency publishes a new release.
+      - name: Check AI reviewer locks match their inputs
+        run: |
+          set -euo pipefail
+          uv pip compile .github/omnigent/requirements-build.in --python-version 3.12 \
+            --generate-hashes --output-file .github/omnigent/requirements-build.txt -q
+          uv pip compile .github/omnigent/requirements.in --python-version 3.12 --universal \
+            --generate-hashes --output-file .github/omnigent/requirements.txt -q
+          if ! git diff --exit-code -- .github/omnigent/requirements-build.txt \
+              .github/omnigent/requirements.txt; then
+            echo "::error::A lock under .github/omnigent does not match its .in file." \
+              "Rerun the command in the lock's header and commit the result."
+            exit 1
+          fi
+      # Recompiling reuses the hashes in each lock, so only an install verifies them.
+      - name: Install AI reviewer locks
+        run: |
+          set -euo pipefail
+          uv venv "$RUNNER_TEMP/omnigent-venv" --python 3.12
+          uv pip install --python "$RUNNER_TEMP/omnigent-venv/bin/python" --require-hashes \
+            -r .github/omnigent/requirements-build.txt
+          uv pip install --python "$RUNNER_TEMP/omnigent-venv/bin/python" --require-hashes \
+            --no-build-isolation -r .github/omnigent/requirements.txt
 
   format:
     runs-on: ubuntu-latest

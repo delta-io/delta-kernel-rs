@@ -36,10 +36,11 @@ To change a version:
 
 1. Edit `requirements.in` or `requirements-build.in`.
 2. From the repository root, run the command in the header of the matching `.txt` file with the
-   uv version that `ai-review.yml` installs. uv keeps every existing pin that the new input
-   allows, so the diff shows only what the change requires. Add `--upgrade` to refresh every
-   pin, in a pull request of its own.
-3. Commit the `.in` and `.txt` files together.
+   uv version that `build.yml` sets for the `ai-review-config` job. uv keeps every existing pin
+   that the new input allows, so the diff shows only what the change requires. Add `--upgrade`
+   to refresh every pin, in a pull request of its own.
+3. Commit the `.in` and `.txt` files together. The `ai-review-config` job fails when they
+   disagree or when a lock does not install.
 4. Run a review from the branch before merging. Automatic reviews use the reviewer on `main`,
    so a pull request does not exercise its own lock. Push the branch to this repository, then
    run `gh workflow run ai-review.yml --ref <branch> -f pr=<number> -f output_mode=artifact`.
