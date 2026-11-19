@@ -426,6 +426,8 @@ mod tests {
             num_log_commits_replayed = 3u64,
             num_txn_sidecars_kept = 2u64,
             num_domain_metadata_sidecars_kept = 5u64,
+            num_txn_sidecars_read = 4u64,
+            num_domain_metadata_sidecars_read = 6u64,
             duration_ns = 11u64,
         ));
 
@@ -445,6 +447,8 @@ mod tests {
         assert_eq!(event.num_log_commits_replayed, 3);
         assert_eq!(event.num_txn_sidecars_kept, 2);
         assert_eq!(event.num_domain_metadata_sidecars_kept, 5);
+        assert_eq!(event.num_txn_sidecars_read, 4);
+        assert_eq!(event.num_domain_metadata_sidecars_read, 6);
         assert_eq!(event.duration, Duration::from_nanos(11));
     }
 

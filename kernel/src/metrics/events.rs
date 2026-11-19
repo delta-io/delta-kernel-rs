@@ -2214,6 +2214,14 @@ pub struct CheckpointActionComputed {
     /// Domain metadata sidecars carried over from the latest `checkpoint` action. 0 unless
     /// `domain_metadata_source` is `CheckpointAction`.
     pub num_domain_metadata_sidecars_kept: u64,
+    /// Set transaction sidecars read to compute the action, whether they were then kept or moved
+    /// inline. 0 unless they were read: sidecars are read only when a change touches an entry that
+    /// isn't inline.
+    pub num_txn_sidecars_read: u64,
+    /// Domain metadata sidecars read to compute the action, whether they were then kept or moved
+    /// inline. 0 unless they were read: sidecars are read only when a change touches an entry that
+    /// isn't inline.
+    pub num_domain_metadata_sidecars_read: u64,
     /// Time spent computing the action.
     pub duration: Duration,
 }
@@ -2234,6 +2242,8 @@ impl CheckpointActionComputed {
             num_log_commits_replayed: 0,
             num_txn_sidecars_kept: 0,
             num_domain_metadata_sidecars_kept: 0,
+            num_txn_sidecars_read: 0,
+            num_domain_metadata_sidecars_read: 0,
             duration: Duration::ZERO,
         }
     }
@@ -2269,6 +2279,8 @@ impl Visit for CheckpointActionComputed {
             "num_log_commits_replayed" => self.num_log_commits_replayed = value,
             "num_txn_sidecars_kept" => self.num_txn_sidecars_kept = value,
             "num_domain_metadata_sidecars_kept" => self.num_domain_metadata_sidecars_kept = value,
+            "num_txn_sidecars_read" => self.num_txn_sidecars_read = value,
+            "num_domain_metadata_sidecars_read" => self.num_domain_metadata_sidecars_read = value,
             "duration_ns" => self.duration = Duration::from_nanos(value),
             _ => {}
         }
@@ -2293,6 +2305,8 @@ impl fmt::Display for CheckpointActionComputed {
             num_log_commits_replayed,
             num_txn_sidecars_kept,
             num_domain_metadata_sidecars_kept,
+            num_txn_sidecars_read,
+            num_domain_metadata_sidecars_read,
             duration,
         } = self;
         write!(
@@ -2303,6 +2317,8 @@ impl fmt::Display for CheckpointActionComputed {
              log_commits_replayed={num_log_commits_replayed}, \
              txn_sidecars_kept={num_txn_sidecars_kept}, \
              domain_metadata_sidecars_kept={num_domain_metadata_sidecars_kept}, \
+             txn_sidecars_read={num_txn_sidecars_read}, \
+             domain_metadata_sidecars_read={num_domain_metadata_sidecars_read}, \
              duration={duration:?})"
         )
     }
