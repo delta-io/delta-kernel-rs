@@ -3360,8 +3360,6 @@ mod tests {
         assert_eq!(result.null_count(), len);
     }
 
-    // ==================== Map accessor Tests ====================
-
     fn create_accessor_map_batch() -> RecordBatch {
         let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         builder.keys().append_value("a");
