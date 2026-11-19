@@ -4,8 +4,6 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::sync::Arc;
 
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use bytes::Bytes;
 use chrono::Utc;
 use itertools::Itertools;
 use tracing::warn;
@@ -34,8 +32,6 @@ use crate::arrow::datatypes::{
 use crate::arrow::error::ArrowError;
 use crate::arrow::json::StructMode;
 use crate::arrow::json::writer::{EncoderOptions, make_encoder};
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::content_tree::mumbling::MumblingBitmap;
 use crate::delta_kernel_derive::internal_api;
 use crate::engine::arrow_conversion::{LIST_ARRAY_ROOT, TryFromKernel, TryIntoArrow};
 use crate::engine::arrow_expression::opaque::{
@@ -1015,46 +1011,21 @@ fn map_string_rows<'a, T>(
     }
 }
 
-/// Evaluates [`MumblingBitmapContainsPredicate`], parsing its literal bitmap on first use and
-/// reusing the parse for later batches.
+/// Evaluates [`MumblingBitmapContainsPredicate`] for each row of `batch`.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 fn evaluate_mumbling_bitmap_contains(
     pred: &MumblingBitmapContainsPredicate,
     batch: &RecordBatch,
 ) -> KernelResult<BooleanArray> {
-    let bitmap = match pred.bitmap() {
-        Expression::Literal(Scalar::Binary(bytes)) => match pred.parsed_bitmap().get() {
-            Some(bitmap) => bitmap.clone(),
-            None => {
-                let bitmap =
-                    MumblingBitmap::deserialize(Bytes::copy_from_slice(bytes)).map_err(|e| {
-                        KernelError::invalid_expression(format!(
-                            "MUMBLING_BITMAP_CONTAINS bitmap does not parse: {e}"
-                        ))
-                    })?;
-                // A concurrent evaluation may have stored a parse of the same bytes first.
-                pred.parsed_bitmap()
-                    .get_or_init(|| Arc::new(bitmap))
-                    .clone()
-            }
-        },
-        Expression::Literal(Scalar::Null(DataType::BINARY)) => {
-            return Ok(BooleanArray::new_null(batch.num_rows()));
-        }
-        other => {
-            return Err(KernelError::invalid_expression(format!(
-                "MUMBLING_BITMAP_CONTAINS bitmap must be a BINARY literal, got {other}"
-            )));
-        }
-    };
-    let values = evaluate_expression(pred.value(), batch, Some(&DataType::LONG))?;
-    let values = values.as_primitive_opt::<Int64Type>().ok_or_else(|| {
+    let value_array = evaluate_expression(pred.value(), batch, Some(&DataType::LONG))?;
+    let values = value_array.as_primitive_opt::<Int64Type>().ok_or_else(|| {
         KernelError::invalid_expression(format!(
             "MUMBLING_BITMAP_CONTAINS value must be LONG, got {}",
-            values.data_type()
+            value_array.data_type()
         ))
     })?;
-    let contains = |value: i64| u32::try_from(value).is_ok_and(|value| bitmap.contains(value));
+    let bitmap = pred.bitmap();
+    let contains = |value: i64| u32::try_from(value).is_ok_and(|pos| bitmap.contains(pos));
     Ok(values.iter().map(|value| value.map(contains)).collect())
 }
 
@@ -2502,73 +2473,51 @@ mod tests {
         RecordBatch::try_from_iter([("pos", Arc::new(positions) as ArrayRef)]).unwrap()
     }
 
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn bitmap_lookup(positions: &[u32], value: Expr) -> Pred {
+        Pred::try_mumbling_bitmap_contains(encode_positions(positions), value).unwrap()
+    }
+
     /// NULL values stay NULL; values no bitmap can hold are never contained.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[rstest]
     #[case::contains_one(
-        lit(Scalar::Binary(encode_positions(&[1]).to_vec())),
         false,
         &[Some(false), Some(true), Some(false), None, Some(false), Some(false)]
     )]
-    #[case::inverted(
-        lit(Scalar::Binary(encode_positions(&[1]).to_vec())),
-        true,
-        &[Some(true), Some(false), Some(true), None, Some(true), Some(true)]
-    )]
-    #[case::null_bitmap_is_null(null_lit(DataType::BINARY), false, &[None; 6])]
-    #[case::null_bitmap_inverted_is_null(null_lit(DataType::BINARY), true, &[None; 6])]
-    fn test_mumbling_bitmap_contains(
-        #[case] bitmap: Expr,
-        #[case] inverted: bool,
+    #[case::inverted(true, &[Some(true), Some(false), Some(true), None, Some(true), Some(true)])]
+    fn test_mumbling_bitmap_contains(#[case] inverted: bool, #[case] expected: &[Option<bool>]) {
+        let pred = bitmap_lookup(&[1], col!("pos"));
+        let result = evaluate_predicate(&pred, &bitmap_values_batch(), inverted).unwrap();
+        assert_eq!(result, BooleanArray::from(expected.to_vec()));
+    }
+
+    /// The largest position a bitmap can hold is found; positions beyond it are never contained.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::max_position_set(&[2_097_151], &[Some(true), Some(false), Some(false)])]
+    #[case::empty_bitmap(&[], &[Some(false); 3])]
+    fn test_mumbling_bitmap_contains_range_edges(
+        #[case] positions: &[u32],
         #[case] expected: &[Option<bool>],
     ) {
-        let pred = Pred::mumbling_bitmap_contains(bitmap, col!("pos"));
-        let result = evaluate_predicate(&pred, &bitmap_values_batch(), inverted).unwrap();
+        let values = Int64Array::from(vec![2_097_151, 2_097_152, i64::from(u32::MAX)]);
+        let batch = RecordBatch::try_from_iter([("pos", Arc::new(values) as ArrayRef)]).unwrap();
+        let pred = bitmap_lookup(positions, col!("pos"));
+        let result = evaluate_predicate(&pred, &batch, false).unwrap();
         assert_eq!(result, BooleanArray::from(expected.to_vec()));
     }
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_mumbling_bitmap_contains_parses_bitmap_once() {
-        let bitmap = lit(Scalar::Binary(encode_positions(&[1]).to_vec()));
-        let pred = Pred::mumbling_bitmap_contains(bitmap, col!("pos"));
-        let Pred::MumblingBitmapContains(lookup) = &pred else {
-            panic!("expected a Mumbling bitmap lookup, got {pred}");
-        };
-        let batch = bitmap_values_batch();
-        assert!(lookup.parsed_bitmap().get().is_none());
-
-        let first = evaluate_predicate(&pred, &batch, false).unwrap();
-        let parsed = lookup.parsed_bitmap().get().unwrap().clone();
-        let second = evaluate_predicate(&pred, &batch, false).unwrap();
-
-        assert_eq!(first, second);
-        assert!(Arc::ptr_eq(&parsed, lookup.parsed_bitmap().get().unwrap()));
-    }
-
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[rstest]
-    #[case::malformed_bitmap(
-        lit(Scalar::Binary(vec![1, 2, 3])),
-        col!("pos"),
-        "Invalid expression evaluation: MUMBLING_BITMAP_CONTAINS bitmap does not parse"
-    )]
-    #[case::non_binary_bitmap(lit(7), col!("pos"), "bitmap must be a BINARY literal")]
-    #[case::column_bitmap(col!("pos"), col!("pos"), "bitmap must be a BINARY literal")]
-    #[case::non_long_value(
-        lit(Scalar::Binary(encode_positions(&[1]).to_vec())),
-        lit(1i32),
-        "value must be LONG"
-    )]
-    fn test_mumbling_bitmap_contains_rejects_bad_input(
-        #[case] bitmap: Expr,
-        #[case] value: Expr,
-        #[case] expected_error: &str,
-    ) {
-        let pred = Pred::mumbling_bitmap_contains(bitmap, value);
+    fn test_mumbling_bitmap_contains_rejects_non_long_value() {
         assert_result_error_with_message(
-            evaluate_predicate(&pred, &bitmap_values_batch(), false),
-            expected_error,
+            evaluate_predicate(
+                &bitmap_lookup(&[1], lit(1i32)),
+                &bitmap_values_batch(),
+                false,
+            ),
+            "value must be LONG",
         );
     }
 
