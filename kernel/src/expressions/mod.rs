@@ -1597,6 +1597,7 @@ mod tests {
                 ),
                 "TO_JSON(Column(x), full_precision_timestamps)",
             ),
+            (Expr::map_len(col!("m")), "MAP_LEN(Column(m))"),
             (
                 Expr::unary(UnaryExpressionOp::UriEncodeFileLocation, col!("x")),
                 "URI_ENCODE_FILE_LOCATION(Column(x))",
@@ -1683,6 +1684,14 @@ mod tests {
             (
                 Pred::not(Pred::has_uri_scheme(col!("x"))),
                 "NOT(HAS_URI_SCHEME(Column(x)))",
+            ),
+            (
+                Pred::map_has_key(col!("m"), lit("a")),
+                "MAP_HAS_KEY(Column(m), 'a')",
+            ),
+            (
+                Pred::not(Pred::map_has_key(col!("m"), lit("a"))),
+                "NOT(MAP_HAS_KEY(Column(m), 'a'))",
             ),
         ];
 
