@@ -131,7 +131,9 @@ fn compaction_matches_existing_compaction_intervals(
     let expected = ReaderBuilder::new(arrow_schema.clone())
         .build(Cursor::new(expected.join("\n")))?
         .collect::<Result<Vec<_>, _>>()?;
-    let path = root.join(&format!("_delta_log/{start:020}.{end:020}.compacted.json"))?;
+    let path = snapshot
+        .table_root()
+        .join(&format!("_delta_log/{start:020}.{end:020}.compacted.json"))?;
     assert_eq!(
         write_log_compaction(&snapshot, &engine, store.clone(), start, end)?,
         path,
