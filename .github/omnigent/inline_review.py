@@ -24,10 +24,14 @@ INLINE_FINDING_FIELDS = ("id", "path", "line", "side", "body")
 INLINE_FINDING_SIDES = ("LEFT", "RIGHT")
 _FINDING_HEADING_MARKER = "###"
 _FINDING_HEADING_TEMPLATE = f"{_FINDING_HEADING_MARKER} <ID>"
-_REVIEW_SECTION_NAMES = ("Blocking issues", "Non-blocking notes", "Summary")
+_OUT_OF_SCOPE_SECTION = "Out of scope / existing issues"
+_REVIEW_SECTION_NAMES = (
+    "Blocking issues", "Non-blocking notes", _OUT_OF_SCOPE_SECTION, "Summary"
+)
 _FINDING_ID = re.compile(r"(?:Blocker|Nit)[1-9][0-9]*")
+_REPORT_FINDING_ID = re.compile(r"(?:Blocker|Nit|OutOfScope)[1-9][0-9]*")
 _FINDING_HEADING = re.compile(
-    rf"^{re.escape(_FINDING_HEADING_MARKER)}\s+({_FINDING_ID.pattern})\b"
+    rf"^{re.escape(_FINDING_HEADING_MARKER)}\s+({_REPORT_FINDING_ID.pattern})\b"
 )
 _SECTION_NAME_PATTERN = "|".join(re.escape(name) for name in _REVIEW_SECTION_NAMES)
 _SECTION_HEADING = re.compile(
@@ -37,7 +41,7 @@ _SECTION_HEADING = re.compile(
     re.IGNORECASE,
 )
 _FINDING_GROUP_NAME_PATTERN = "|".join(
-    re.escape(name) for name in _REVIEW_SECTION_NAMES[:2]
+    re.escape(name) for name in _REVIEW_SECTION_NAMES[:-1]
 )
 _FINDING_GROUP_HEADING = re.compile(
     rf"^(?:(?:##\s+)(?:{_FINDING_GROUP_NAME_PATTERN})\s*:?|"
@@ -114,7 +118,7 @@ review, use this complete response layout, with both the human-readable review
 and the machine-readable block inside the outer review markers:
 
 {review_start}
-<human-readable review, including ### <ID> findings and Summary>
+<human-readable review grouped under the section headings below, with ### <ID> findings>
 {start}
 {example}
 {end}
@@ -123,8 +127,14 @@ and the machine-readable block inside the outer review markers:
 Do not close the outer review before the machine-readable block. For a completed
 review, the outer review end marker must be the final line of your response.
 
+Use `## Blocking issues`, `## Non-blocking notes`, and
+`## Out of scope / existing issues` for the nonempty finding groups, followed by `## Summary`.
+Keep out-of-scope findings under their own section even when in-scope findings move inline.
+
 Include entries for up to {MAX_INLINE_FINDINGS} Blocker/Nit findings, prioritizing
-blockers and then the most useful notes. Findings omitted from this block remain
+blockers and then the most useful in-scope notes. OutOfScope findings stay in the
+"Out of scope / existing issues" section and must not appear in this block.
+Findings omitted from this block remain
 in the collapsed review. Start every human-readable finding on its own Markdown
 heading matching `{_FINDING_HEADING_TEMPLATE}`, using the same ID in this block.
 Keep the Summary to an overall assessment rather than repeating finding details.
@@ -215,6 +225,7 @@ def build_review_payload(
         for _, line in headings
         if (finding := _FINDING_HEADING.match(line)) is not None
     }
+    out_of_scope_ids = _out_of_scope_ids(headings)
     prior_comments = {
         (
             comment["path"],
@@ -237,6 +248,9 @@ def build_review_payload(
             continue
         seen_ids.add(finding_id)
 
+        if finding_id in out_of_scope_ids:
+            unmapped.append(finding_id)
+            continue
         if (path, line, side) not in allowed_positions:
             unmapped.append(finding_id)
             continue
@@ -270,6 +284,18 @@ def build_review_payload(
         unmapped,
         duplicates,
     )
+
+
+def _out_of_scope_ids(headings: list[tuple[int, str]]) -> set[str]:
+    """Keep findings in the out-of-scope section in the review body, even if misnumbered."""
+    result: set[str] = set()
+    out_of_scope = False
+    for _, line in headings:
+        if _SECTION_HEADING.match(line):
+            out_of_scope = _OUT_OF_SCOPE_SECTION.casefold() in line.casefold()
+        elif out_of_scope and (finding := _FINDING_HEADING.match(line)):
+            result.add(finding.group(1))
+    return result
 
 
 def _remove_finding_sections(review: str, finding_ids: set[str]) -> str:
