@@ -1141,6 +1141,25 @@ fn test_sql_where() {
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 }
 
+#[rstest::rstest]
+fn test_eval_map_has_key(#[values(false, true)] inverted: bool) {
+    let null_filter = DefaultKernelPredicateEvaluator::from(NullColumnResolver);
+    let empty_filter = DefaultKernelPredicateEvaluator::from(EmptyColumnResolver);
+    let maybe_not = |pred: Pred| if inverted { Pred::not(pred) } else { pred };
+
+    let pred = maybe_not(Pred::map_has_key(col!("m"), lit("a")));
+    let null_eval = null_filter.eval(&pred);
+    assert_eq!(null_eval, None, "{pred}");
+    let null_sql_where = null_filter.eval_sql_where(&pred);
+    assert_eq!(null_sql_where, Some(false), "{pred}");
+    let empty_sql_where = empty_filter.eval_sql_where(&pred);
+    assert_eq!(empty_sql_where, None, "{pred}");
+
+    let pred = maybe_not(Pred::map_has_key(col!("m"), null_lit(DataType::STRING)));
+    let empty_sql_where = empty_filter.eval_sql_where(&pred);
+    assert_eq!(empty_sql_where, Some(false), "{pred}");
+}
+
 // A NULL or unresolved WHEN leaves the whole CASE unknown during pruning.
 #[rstest::rstest]
 #[case::literal_true(Pred::TRUE, Some(true), Some(true))]

@@ -1551,6 +1551,7 @@ mod tests {
                 ),
                 "TO_JSON(Column(x), full_precision_timestamps)",
             ),
+            (Expr::map_len(col!("m")), "MAP_LEN(Column(m))"),
             (
                 Expr::case_when([(col!("x").is_null(), lit(0))], col!("x")),
                 "CASE WHEN Column(x) IS NULL THEN 0 ELSE Column(x) END",
@@ -1629,6 +1630,14 @@ mod tests {
             (
                 Pred::from_expr(expr!(col("x") == "foo")),
                 "Column(x) = 'foo'",
+            ),
+            (
+                Pred::map_has_key(col!("m"), lit("a")),
+                "MAP_HAS_KEY(Column(m), 'a')",
+            ),
+            (
+                Pred::not(Pred::map_has_key(col!("m"), lit("a"))),
+                "NOT(MAP_HAS_KEY(Column(m), 'a'))",
             ),
         ];
 
