@@ -435,8 +435,8 @@ pub trait ExpressionTransform<'a> {
         &mut self,
         m: &'a MumblingBitmapContainsPredicate,
     ) -> Self::Output<MumblingBitmapContainsPredicate> {
-        let bitmap = self.transform_expr(&m.bitmap);
-        let value = self.transform_expr(&m.value);
+        let bitmap = self.transform_expr(m.bitmap());
+        let value = self.transform_expr(m.value());
         let f = |(bitmap, value)| MumblingBitmapContainsPredicate::new(bitmap, value);
         map_owned_pair_or_else(m, bitmap, value, f)
     }

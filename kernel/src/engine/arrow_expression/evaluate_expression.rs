@@ -1015,20 +1015,29 @@ fn map_string_rows<'a, T>(
     }
 }
 
-/// Evaluates [`MumblingBitmapContainsPredicate`], parsing its literal bitmap once per batch.
+/// Evaluates [`MumblingBitmapContainsPredicate`], parsing its literal bitmap on first use and
+/// reusing the parse for later batches.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 fn evaluate_mumbling_bitmap_contains(
     pred: &MumblingBitmapContainsPredicate,
     batch: &RecordBatch,
 ) -> KernelResult<BooleanArray> {
-    let bitmap = match pred.bitmap.as_ref() {
-        Expression::Literal(Scalar::Binary(bytes)) => {
-            MumblingBitmap::deserialize(Bytes::copy_from_slice(bytes)).map_err(|e| {
-                KernelError::invalid_expression(format!(
-                    "MUMBLING_BITMAP_CONTAINS bitmap does not parse: {e}"
-                ))
-            })?
-        }
+    let bitmap = match pred.bitmap() {
+        Expression::Literal(Scalar::Binary(bytes)) => match pred.parsed_bitmap().get() {
+            Some(bitmap) => bitmap.clone(),
+            None => {
+                let bitmap =
+                    MumblingBitmap::deserialize(Bytes::copy_from_slice(bytes)).map_err(|e| {
+                        KernelError::invalid_expression(format!(
+                            "MUMBLING_BITMAP_CONTAINS bitmap does not parse: {e}"
+                        ))
+                    })?;
+                // A concurrent evaluation may have stored a parse of the same bytes first.
+                pred.parsed_bitmap()
+                    .get_or_init(|| Arc::new(bitmap))
+                    .clone()
+            }
+        },
         Expression::Literal(Scalar::Null(DataType::BINARY)) => {
             return Ok(BooleanArray::new_null(batch.num_rows()));
         }
@@ -1038,7 +1047,7 @@ fn evaluate_mumbling_bitmap_contains(
             )));
         }
     };
-    let values = evaluate_expression(&pred.value, batch, Some(&DataType::LONG))?;
+    let values = evaluate_expression(pred.value(), batch, Some(&DataType::LONG))?;
     let values = values.as_primitive_opt::<Int64Type>().ok_or_else(|| {
         KernelError::invalid_expression(format!(
             "MUMBLING_BITMAP_CONTAINS value must be LONG, got {}",
@@ -2516,6 +2525,25 @@ mod tests {
         let pred = Pred::mumbling_bitmap_contains(bitmap, col!("pos"));
         let result = evaluate_predicate(&pred, &bitmap_values_batch(), inverted).unwrap();
         assert_eq!(result, BooleanArray::from(expected.to_vec()));
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_mumbling_bitmap_contains_parses_bitmap_once() {
+        let bitmap = lit(Scalar::Binary(encode_positions(&[1]).to_vec()));
+        let pred = Pred::mumbling_bitmap_contains(bitmap, col!("pos"));
+        let Pred::MumblingBitmapContains(lookup) = &pred else {
+            panic!("expected a Mumbling bitmap lookup, got {pred}");
+        };
+        let batch = bitmap_values_batch();
+        assert!(lookup.parsed_bitmap().get().is_none());
+
+        let first = evaluate_predicate(&pred, &batch, false).unwrap();
+        let parsed = lookup.parsed_bitmap().get().unwrap().clone();
+        let second = evaluate_predicate(&pred, &batch, false).unwrap();
+
+        assert_eq!(first, second);
+        assert!(Arc::ptr_eq(&parsed, lookup.parsed_bitmap().get().unwrap()));
     }
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
