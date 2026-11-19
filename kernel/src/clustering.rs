@@ -336,6 +336,30 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "nanosecond-timestamps")]
+    #[rstest::rstest]
+    fn test_validate_clustering_columns_accepts_timestamp_nanos(
+        #[values(DataType::TIMESTAMP_NANOS, DataType::TIMESTAMP_NANOS_NTZ)] data_type: DataType,
+    ) {
+        let schema = schema! { nullable "ts": (data_type) };
+        validate_clustering_columns(&schema, &[column_name!("ts")]).unwrap();
+    }
+
+    // The supported-types list in the error names the nanosecond types only when they exist.
+    #[test]
+    fn test_validate_clustering_unsupported_type_error_lists_supported_types() {
+        let schema = schema! { nullable "b": BOOLEAN };
+        let error = validate_clustering_columns(&schema, &[column_name!("b")])
+            .unwrap_err()
+            .to_string();
+        let expected = if cfg!(feature = "nanosecond-timestamps") {
+            "TimestampNtz, TimestampNanos, TimestampNanosNtz, String"
+        } else {
+            "TimestampNtz, String"
+        };
+        assert!(error.contains(expected), "{error}");
+    }
+
     #[test]
     fn test_validate_clustering_columns_unsupported_primitive_types() {
         // Boolean and Binary are primitives but not supported for clustering

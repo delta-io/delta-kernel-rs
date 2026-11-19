@@ -1024,6 +1024,8 @@ mod tests {
 
     use super::*;
     use crate::expressions::FfiMapToStructOptions;
+    #[cfg(not(feature = "nanosecond-timestamps"))]
+    use crate::ffi_test_utils::assert_extern_result_error_contains;
 
     #[rstest]
     #[case::default(None)]
@@ -1157,8 +1159,72 @@ mod tests {
     #[case(NullTypeTag::TimestampNtz, DataType::TIMESTAMP_NTZ)]
     #[case(NullTypeTag::IntervalYearMonth, DataType::INTERVAL_YEAR_MONTH)]
     #[case(NullTypeTag::IntervalDayTime, DataType::INTERVAL_DAY_TIME)]
+    #[cfg_attr(
+        feature = "nanosecond-timestamps",
+        case(NullTypeTag::TimestampNanos, DataType::TIMESTAMP_NANOS)
+    )]
+    #[cfg_attr(
+        feature = "nanosecond-timestamps",
+        case(NullTypeTag::TimestampNanosNtz, DataType::TIMESTAMP_NANOS_NTZ)
+    )]
     fn to_data_type_primitive(#[case] tag: NullTypeTag, #[case] expected: DataType) {
         assert_eq!(tag.to_data_type(0, 0).unwrap(), expected);
+    }
+
+    #[cfg(not(feature = "nanosecond-timestamps"))]
+    #[rstest]
+    fn to_data_type_timestamp_nanos_requires_feature(
+        #[values(NullTypeTag::TimestampNanos, NullTypeTag::TimestampNanosNtz)] tag: NullTypeTag,
+    ) {
+        let error = tag.to_data_type(0, 0).unwrap_err();
+        assert!(
+            matches!(
+                error.without_backtrace(),
+                delta_kernel::KernelError::Unsupported(_)
+            ),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("nanosecond-timestamps"),
+            "{error}"
+        );
+    }
+
+    type VisitTimestampNanosFn = unsafe extern "C" fn(
+        &mut KernelExpressionVisitorState,
+        i64,
+        *const ErrorAllocators,
+    ) -> ExternResult<usize>;
+
+    #[cfg(feature = "nanosecond-timestamps")]
+    #[rstest]
+    #[case(visit_expression_literal_timestamp_nanos, Scalar::TimestampNanos(-123))]
+    #[case(visit_expression_literal_timestamp_nanos_ntz, Scalar::TimestampNanosNtz(-123))]
+    fn timestamp_nanos_literal_visitors_build_nanos_scalars(
+        #[case] visit: VisitTimestampNanosFn,
+        #[case] expected: Scalar,
+    ) {
+        let mut state = KernelExpressionVisitorState::default();
+        let id = ok_or_panic(unsafe { visit(&mut state, -123, &TEST_ERROR_ALLOCATORS) });
+        let expr = unwrap_kernel_expression(&mut state, id).unwrap();
+        assert_eq!(expr, lit(expected));
+    }
+
+    #[cfg(not(feature = "nanosecond-timestamps"))]
+    #[rstest]
+    fn timestamp_nanos_literal_visitors_require_feature(
+        #[values(
+            visit_expression_literal_timestamp_nanos,
+            visit_expression_literal_timestamp_nanos_ntz
+        )]
+        visit: VisitTimestampNanosFn,
+    ) {
+        let mut state = KernelExpressionVisitorState::default();
+        assert_extern_result_error_contains(
+            unsafe { visit(&mut state, -123, &TEST_ERROR_ALLOCATORS) },
+            FFIKernelError::UnsupportedError,
+            "nanosecond-timestamps",
+        );
     }
 
     #[test]

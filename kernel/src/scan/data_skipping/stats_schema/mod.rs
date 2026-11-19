@@ -553,6 +553,30 @@ mod tests {
         assert_eq!(&expected, &stats_schema);
     }
 
+    #[cfg(feature = "nanosecond-timestamps")]
+    #[test]
+    fn test_stats_schema_includes_timestamp_nanos_min_max() {
+        let properties: TableProperties = [("key", "value")].into();
+        let file_schema = schema! {
+            nullable "ts": TIMESTAMP_NANOS,
+            nullable "ts_ntz": TIMESTAMP_NANOS_NTZ,
+        };
+
+        let stats_schema = expected_stats_schema(
+            &file_schema,
+            &stats_config_from_table_properties(&properties),
+            None,
+            None,
+        )
+        .unwrap();
+        let null_count = schema! {
+            nullable "ts": LONG,
+            nullable "ts_ntz": LONG,
+        };
+
+        assert_eq!(stats_schema, expected_stats(null_count, file_schema));
+    }
+
     #[test]
     fn test_stats_schema_with_non_eligible_field() {
         let properties: TableProperties = [("key", "value")].into();

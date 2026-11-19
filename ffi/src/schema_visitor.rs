@@ -1169,6 +1169,39 @@ mod tests {
     use crate::scan::visit_metadata_map;
     use crate::{KernelStringSlice, NullableCvoid};
 
+    #[cfg(not(feature = "nanosecond-timestamps"))]
+    type VisitTimestampNanosFieldFn = unsafe extern "C" fn(
+        &mut KernelSchemaVisitorState,
+        KernelStringSlice,
+        bool,
+        *const EngineMetadata,
+        *const ErrorAllocators,
+    ) -> ExternResult<usize>;
+
+    #[cfg(not(feature = "nanosecond-timestamps"))]
+    #[rstest]
+    fn timestamp_nanos_field_visitors_require_feature(
+        #[values(visit_field_timestamp_nanos, visit_field_timestamp_nanos_ntz)]
+        visit: VisitTimestampNanosFieldFn,
+    ) {
+        let mut state = KernelSchemaVisitorState::default();
+        let result = unsafe {
+            visit(
+                &mut state,
+                KernelStringSlice::new_unsafe("ts"),
+                true,
+                null(),
+                &TEST_ERROR_ALLOCATORS,
+            )
+        };
+        assert_extern_result_error_contains(
+            result,
+            FFIKernelError::UnsupportedError,
+            "nanosecond-timestamps",
+        );
+        assert!(state.elements.is_empty());
+    }
+
     /// Verifies annotation validation and ownership of parent and physical-field attributes.
     #[cfg(feature = "udt-in-dev")]
     #[rstest]
