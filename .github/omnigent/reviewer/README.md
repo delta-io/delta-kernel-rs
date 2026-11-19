@@ -25,3 +25,24 @@ on another: `sys_session_message` puts a message into another agent's session, a
 
 A new reviewer config needs the same `tool_groups` block. The "Validate AI reviewer runtime"
 step in `ai-review.yml` owns the list of removed tools and fails when one is exposed.
+
+## Dependencies
+
+The review workflow installs Omnigent from `../requirements.txt` and its build backend from
+`../requirements-build.txt`. `uv pip compile` generates both files, and each pins every package
+by version and hash. Edit only the `.in` files.
+
+To change a version:
+
+1. Edit `requirements.in` or `requirements-build.in`.
+2. From the repository root, run the command in the header of the matching `.txt` file with the
+   uv version that `ai-review.yml` installs. uv keeps every existing pin that the new input
+   allows, so the diff shows only what the change requires. Add `--upgrade` to refresh every
+   pin, in a pull request of its own.
+3. Commit the `.in` and `.txt` files together.
+4. Run a review from the branch before merging. Automatic reviews use the reviewer on `main`,
+   so a pull request does not exercise its own lock. Push the branch to this repository, then
+   run `gh workflow run ai-review.yml --ref <branch> -f pr=<number> -f output_mode=artifact`.
+5. List the packages the lock adds and drops in the pull request description.
+
+`../package.json` and `../package-lock.json` pin the Claude Code and Codex CLIs.
