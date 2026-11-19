@@ -665,6 +665,13 @@ fn test_checkpoint_skipping_floating_partition_cast_rewrites_exact_value() {
     ),
     None,
 )]
+#[case::map_has_key(
+    Pred::map_has_key(
+        Expr::cast(col!("part_col"), DataType::DATE),
+        Scalar::Date(20_641),
+    ),
+    None,
+)]
 fn test_checkpoint_skipping_partition_date_cast_comparisons(
     #[case] pred: Pred,
     #[case] expected: Option<&str>,
