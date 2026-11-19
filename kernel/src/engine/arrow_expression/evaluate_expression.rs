@@ -638,7 +638,7 @@ enum ViewCast {
 /// Casts `input` to `cast_expr.target`, following its [`CastMode`].
 fn evaluate_cast(cast_expr: &CastExpression, input: &ArrayRef) -> KernelResult<ArrayRef> {
     let target = ArrowDataType::try_from_kernel(&cast_expr.target)?;
-    match cast_expr.mode {
+    match cast_expr.options.mode() {
         // Arrow errors (rather than nulls per-value) on a type pair it cannot cast; degrade
         // that to an all-NULL column so an unsupported cast keeps the file.
         CastMode::Safe if !can_cast_types(input.data_type(), &target) => {
@@ -1373,8 +1373,8 @@ mod tests {
     use super::*;
     use crate::arrow::array::{
         ArrayData as ArrowArrayData, ArrayRef, BinaryArray, BooleanArray, Date32Array,
-        Float32Array, Float64Array, Int32Array, Int64Array, LargeStringArray, ListArray,
-        MapBuilder, StringArray, StringBuilder, StringViewArray, StructArray,
+        DictionaryArray, Float32Array, Float64Array, Int32Array, Int64Array, LargeStringArray,
+        ListArray, MapBuilder, StringArray, StringBuilder, StringViewArray, StructArray,
         TimestampMicrosecondArray,
     };
     use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
@@ -4715,44 +4715,39 @@ mod tests {
         Arc::new(Int64Array::from(vec![Some(1), Some(i64::from(i32::MAX) + 1)])),
         DataType::INTEGER,
         1,
-        "Strict cast of Int64 to integer failed",
-        "2147483648"
+        Some("2147483648")
     )]
     #[case::underflow(
         Arc::new(Int64Array::from(vec![i64::from(i32::MIN) - 1])),
         DataType::INTEGER,
         1,
-        "Strict cast of Int64 to integer failed",
-        "-2147483649"
+        Some("-2147483649")
     )]
     #[case::unparseable_string(
         Arc::new(StringArray::from(vec![Some("2025-04-11"), Some("not-a-date")])),
         DataType::DATE,
         1,
-        "Strict cast of Utf8 to date failed",
-        "not-a-date"
+        Some("not-a-date")
     )]
     #[case::empty_string(
         Arc::new(StringArray::from(vec![""])),
         DataType::INTEGER,
         1,
-        "Strict cast of Utf8 to integer failed",
-        "''"
+        Some("''")
     )]
     #[case::unsupported_pair(
         Arc::new(BooleanArray::from(vec![Some(true), Some(false)])),
         DataType::DATE,
         2,
-        "Strict cast of Boolean to date failed",
-        "Boolean"
+        None
     )]
     fn test_cast_of_unrepresentable_value(
         #[case] values: ArrayRef,
         #[case] target: DataType,
         #[case] safe_null_count: usize,
-        #[case] strict_error: &str,
-        #[case] bad_value: &str,
+        #[case] bad_value: Option<&str>,
     ) {
+        let strict_error = format!("Strict cast of {} to {target} failed", values.data_type());
         let safe = cast_column(values.clone(), target.clone(), CastMode::Safe).unwrap();
         assert_eq!(safe.len(), values.len());
         assert_eq!(safe.null_count(), safe_null_count);
@@ -4760,11 +4755,62 @@ mod tests {
             safe.data_type(),
             &ArrowDataType::try_from_kernel(&target).unwrap()
         );
-        let err = cast_column(values, target, CastMode::Strict)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains(strict_error), "{err}");
-        assert!(err.contains(bad_value), "{err}");
+        let err = cast_column(values, target, CastMode::Strict).unwrap_err();
+        assert!(
+            matches!(
+                err.without_backtrace(),
+                KernelError::InvalidExpressionEvaluation(_)
+            ),
+            "{err}"
+        );
+        let message = err.to_string();
+        assert!(message.contains(&strict_error), "{message}");
+        if let Some(bad_value) = bad_value {
+            assert!(message.contains(bad_value), "{message}");
+        }
+    }
+
+    const HIDDEN_OVERFLOW: i64 = i32::MAX as i64 + 1;
+
+    /// A struct whose second row is NULL but still stores an unrepresentable child value.
+    fn null_struct_row_over_overflow() -> ArrayRef {
+        let child: ArrayRef = Arc::new(Int64Array::from(vec![7, HIDDEN_OVERFLOW]));
+        let fields = Fields::from(vec![ArrowField::new("a", ArrowDataType::Int64, true)]);
+        let nulls = NullBuffer::from(vec![true, false]);
+        Arc::new(StructArray::try_new(fields, vec![child], Some(nulls)).unwrap())
+    }
+
+    /// A list sliced past the entry that holds an unrepresentable element.
+    fn list_sliced_past_overflow() -> ArrayRef {
+        let lists = [Some(vec![Some(HIDDEN_OVERFLOW)]), Some(vec![Some(1)])];
+        Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(lists).slice(1, 1))
+    }
+
+    /// A dictionary whose values include an unrepresentable one that no key references.
+    fn dictionary_with_unreferenced_overflow() -> ArrayRef {
+        let values = Arc::new(Int64Array::from(vec![1, HIDDEN_OVERFLOW]));
+        Arc::new(DictionaryArray::<Int32Type>::try_new(Int32Array::from(vec![0]), values).unwrap())
+    }
+
+    #[rstest]
+    #[case::under_null_struct_row(
+        null_struct_row_over_overflow(),
+        StructType::new_unchecked([StructField::nullable("a", DataType::INTEGER)]).into()
+    )]
+    #[case::outside_list_slice(
+        list_sliced_past_overflow(),
+        ArrayType::new(DataType::INTEGER, true).into()
+    )]
+    #[case::unreferenced_dictionary_value(
+        dictionary_with_unreferenced_overflow(),
+        DataType::INTEGER
+    )]
+    fn test_strict_cast_checks_stored_values(#[case] values: ArrayRef, #[case] target: DataType) {
+        assert!(cast_column(values.clone(), target.clone(), CastMode::Safe).is_ok());
+        assert_result_error_with_message(
+            cast_column(values, target, CastMode::Strict),
+            "2147483648",
+        );
     }
 
     /// A strict cast checks values inside a struct, and its error names the offending value.
