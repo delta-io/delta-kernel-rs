@@ -840,6 +840,21 @@ mod tests {
         Ok(())
     }
 
+    // Without `nanosecond-timestamps`, nanosecond Arrow timestamps map to the microsecond types,
+    // so tables created from such schemas do not require the `timestampNanos` feature.
+    #[cfg(not(feature = "nanosecond-timestamps"))]
+    #[rstest]
+    #[case::utc(Some("UTC"), DataType::TIMESTAMP)]
+    #[case::ntz(None, DataType::TIMESTAMP_NTZ)]
+    fn test_nanosecond_timestamp_converts_to_microsecond_type_without_feature(
+        #[case] timezone: Option<&str>,
+        #[case] expected: DataType,
+    ) -> KernelResult<()> {
+        let arrow_type = ArrowDataType::Timestamp(TimeUnit::Nanosecond, timezone.map(Into::into));
+        assert_eq!(DataType::try_from_arrow(&arrow_type)?, expected);
+        Ok(())
+    }
+
     // Timestamp stats are serialized with a hardcoded `Z` suffix, which is only correct when the
     // Arrow timezone is UTC, so any other timezone must be rejected.
     #[rstest]
