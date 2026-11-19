@@ -103,8 +103,10 @@ impl Visit for MetricContext {
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
-        if field.name() == CORRELATION_ID_FIELD && !value.is_empty() {
-            self.correlation_id = Some(value.into());
+        match field.name() {
+            CORRELATION_ID_FIELD if !value.is_empty() => self.correlation_id = Some(value.into()),
+            "operation_id" => self.record_debug(field, &tracing::field::display(value)),
+            _ => {}
         }
     }
 

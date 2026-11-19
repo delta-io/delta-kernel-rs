@@ -459,6 +459,28 @@ mod tests {
     }
 
     #[rstest::rstest]
+    #[case::valid("83a8692a-3a42-4a85-9424-b82d9c2dbf13")]
+    #[case::invalid("not-a-uuid")]
+    #[case::empty("")]
+    fn string_operation_ids_decode_or_fall_back_to_nil(#[case] value: &str) {
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        {
+            let _span = info_span!("snap.build", report = Empty, operation_id = value);
+        }
+        let parsed = value.parse::<Uuid>();
+        let expected = parsed
+            .as_ref()
+            .copied()
+            .map(MetricId)
+            .unwrap_or_else(|_| MetricId::nil());
+        assert!(matches!(
+            reporter.events().as_slice(),
+            [MetricEvent::SnapshotBuildCompleted(event)] if event.context.operation_id == expected
+        ));
+    }
+
+    #[rstest::rstest]
     fn checkpoint_recorded_duration_survives_span_close_and_errors(
         #[values(0u64, 17)] duration_ns: u64,
         #[values(false, true)] fail: bool,
