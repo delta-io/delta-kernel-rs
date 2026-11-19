@@ -1084,7 +1084,8 @@ impl LogSegment {
     /// physical stats schema the caller replays with. `amt_stats_request` reads it from the
     /// content tree's `content_stats` as `add.stats_parsed` (see
     /// [`AmtStatsRequest::for_checkpoint`]); without it, the tree's adds carry no stats.
-    /// `options.meta_predicate` and `options.partition_schema` are not used.
+    /// `options.meta_predicate`, `options.partition_schema`, and `options.stats_json_op` are not
+    /// used.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn read_actions_with_checkpoint_action(
@@ -1097,12 +1098,14 @@ impl LogSegment {
         options: CheckpointReadOptions<'_>,
         amt_stats_request: Option<AmtStatsRequest<'_>>,
     ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
-        // The content tree reader takes no skipping predicate and does not produce
-        // `partitionValues_parsed` (TODO(#3320)).
+        // The content tree reader takes no skipping predicate, does not produce
+        // `partitionValues_parsed` (TODO(#3320)), and does not rebuild `add.stats` from parsed
+        // stats.
         let CheckpointReadOptions {
             meta_predicate: _,
             stats_schema,
             partition_schema: _,
+            stats_json_op: _,
         } = options;
         let version = Version::try_from(checkpoint.version())
             .ok()
