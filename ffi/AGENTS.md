@@ -3,6 +3,13 @@
 The `delta_kernel_ffi` crate exposes the kernel to C/C++ via a stable FFI boundary using
 cbindgen-generated headers (`.h` and `.hpp`).
 
+These files are not loaded automatically:
+
+- `ffi/AGENTS/flows.md`: key files and call sequences for the snapshot, scan, commit-range,
+  incremental-scan, write, and tracing exports. Read it before changing one of those exports.
+- `ffi/AGENTS/design-notes.md`: worked examples and benchmark evidence behind the conventions
+  below. Read it before designing a callback, metadata ABI, or event API.
+
 ## FFI boundary conventions
 
 Memory ownership drives every choice below. Function inputs can usually borrow memory for the call.
@@ -180,6 +187,13 @@ open_table(path);
 Only the two-word descriptor is copied. The string bytes remain borrowed from the caller for the
 call.
 
+#### Enums and choice sets
+
+Prefer `#[repr(C)]` enums for closed FFI choice sets instead of integer aliases and constants.
+Add `cbindgen:prefix-with-name=true` so generated variants remain unambiguous. Use an integer
+discriminator only when unknown values are intentionally recoverable, and validate them at the
+boundary. Invalid enum tags are undefined behavior, so unsafe FFI APIs must require valid tags.
+
 #### Optional values
 
 `OptionalValue<T>` is the tagged by-value representation for optional data:
@@ -248,11 +262,11 @@ The pointer avoids requiring a large by-value marshalling contract and keeps the
 small. It is also easier for JNR and libffi than a large struct-by-value argument, whose register
 and stack classification varies by platform ABI.
 
-The event benchmark below supports a borrowed pointer for large Rust-to-Java callback payloads. It
-does not measure arbitrary C/C++ downcalls; a native compiler may already lower a large by-value
-argument to a hidden pointer. Small values remain better by value. All FFI records must be
-C-compatible; "copy" here means copying outer bytes, not invoking a C++ copy constructor or Rust
-Clone implementation.
+The event benchmark in `ffi/AGENTS/design-notes.md` supports a borrowed pointer for large
+Rust-to-Java callback payloads. It does not measure arbitrary C/C++ downcalls; a native compiler
+may already lower a large by-value argument to a hidden pointer. Small values remain better by
+value. All FFI records must be C-compatible; "copy" here means copying outer bytes, not invoking a
+C++ copy constructor or Rust Clone implementation.
 The tradeoffs are real:
 
 * Rust must validate nullability before creating a reference.
@@ -557,76 +571,6 @@ error channels and often reduces a precise failure to a generic "visitor failed"
 iterators, each next call may return its own error. After a terminal error, the API must state
 whether the iterator can be retried or is poisoned. No callback may unwind across the C ABI.
 
-### Schema metadata design example
-
-Projected schemas can lose field metadata while round-tripping through the host schema
-representation.
-For a column-mapped table, the logical field name is not sufficient to read Parquet data. Kernel
-needs typed field metadata such as:
-
-* delta.columnMapping.physicalName as a string;
-* delta.columnMapping.id as a number.
-
-`scan_builder_with_schema` treats the supplied schema as the authoritative logical read schema.
-During scan construction, Kernel converts each selected logical field into its physical form. If the
-host reconstructs the projection from names, types, and nullability only, the mapping metadata is
-missing.
-
-#### Existing Kernel-to-host path
-
-The schema visitor passes `&CMetadataMap` with each field callback. `CMetadataMap` contains a Rust
-`HashMap`, so the host cannot dereference it. The host must call `get_from_metadata_map` for known
-keys or `visit_metadata_map` to enumerate it:
-
-```c
-host -> visit_schema
-Rust -> host field callback with opaque CMetadataMap
-host -> visit_metadata_map
-Rust -> host callback once per entry
-```
-
-Passing the map pointer identifies the map; it does not expose a C-readable layout.
-
-#### Visitor-based alternative
-
-A visitor-based alternative mirrors that indirection in reverse. Every non-null field metadata
-descriptor causes another upcall, and each metadata value causes another downcall:
-
-```c
-host -> visit_field_*
-Rust -> EngineMetadata visitor
-host -> visit_metadata_value once per entry
-Rust -> return to field construction
-```
-
-This is symmetric with the existing path, but it makes flat, materialized metadata re-entrant and
-splits errors across nested calls.
-
-#### Preferred design order
-
-1. For projected scans, determine whether Kernel can resolve selected logical paths against the
-   snapshot schema and copy the canonical fields. If so, the host should not have to return Delta's
-   own mapping metadata.
-2. For genuinely host-authored schemas, such as table creation, pass metadata as a borrowed typed
-   entry slice.
-3. On the Kernel-to-host schema path, pass the same entry slice with each field callback instead of
-   an opaque map that requires `visit_metadata_map`.
-4. Preserve existing APIs as compatibility shims where necessary.
-
-#### Direct metadata ABI
-
-Use the `CMetadataEntry` and `CMetadataEntries` layout from the error propagation example above.
-Pass `CMetadataEntries` by value because it is a two-word borrowed view. The empty value is
-`{ ptr: NULL, len: 0 }`. All entries and their key/value bytes remain valid until the enclosing
-field call returns. Kernel validates UTF-8, parses values according to kind, rejects duplicate keys,
-and copies the resulting metadata before returning. The kind tag is required: treating every value
-as a string would change `delta.columnMapping.id = 7` into `delta.columnMapping.id = "7"`, which
-fails Kernel's typed column mapping validation. A single JSON object is another valid
-representation because Delta metadata is defined as JSON, but it trades the entry ABI for JSON
-encoding, parsing, and escaping at every boundary. The same entry type can be used in both
-directions. The producer owns the backing array regardless of whether the producer is Rust or the
-host.
-
 ### Review checklist for new FFI APIs
 
 Before approving a new boundary type or function, answer:
@@ -654,414 +598,12 @@ Before approving a new boundary type or function, answer:
 17. Does the C header communicate the same ownership, nullability, and mutation semantics as the
     Rust documentation?
 
-### Event callback examples and performance evidence
-
-A Kernel Java logs, metrics, and frames benchmark compared three ways to deliver one event per
-Rust-to-Java upcall. These abridged snippets show the difference.
-
-#### 1. Flatten by value, then build a Java record
-
-Rust expands the event into callback arguments:
-
-```rust
-type EmitMetric = unsafe extern "C" fn(
-    context: *mut c_void,
-    kind: u32,
-    value: i64,
-    name: KernelStringSlice,
-);
-
-let event = FfiMetricEvent::from(metric);
-emit(context, event.kind, event.value, event.name);
-```
-
-Java copies those arguments into its semantic type:
-
-```java
-public void invoke(
-    Pointer context, int kind, long value, Pointer namePtr, long nameLen) {
-  consumer.accept(new MetricEvent(kind, value, readUtf8(namePtr, nameLen)));
-}
-```
-
-The Java consumer sees a safe record, but every field expands the callback ABI. Adding fields makes
-the signature larger.
-
-#### 2. Borrow a native pointer, then build a Java record
-
-Rust keeps the event alive for the callback:
-
-```rust
-type EmitMetric = unsafe extern "C" fn(
-    context: *mut c_void,
-    event: *const FfiMetricEvent,
-);
-
-let event = FfiMetricEvent::from(metric);
-emit(context, &event);
-// `event` may be dropped after the callback returns.
-```
-
-Java reads native memory and copies the data it keeps:
-
-```java
-public void invoke(Pointer context, Pointer eventPtr) {
-  NativeMetricEvent event = NativeMetricEvent.view(eventPtr);
-  consumer.accept(new MetricEvent(
-      event.kind(), event.value(), event.nameAsJavaString()));
-}
-```
-
-This keeps one small callback signature and avoids copying the outer event across the ABI. The
-pointer and every nested slice expire when invoke returns; the Java record does not.
-
-#### 3. Pass the borrowed pointer to the final synchronous consumer
-
-The Rust side has the same borrowed-pointer contract:
-
-```rust
-let event = FfiMetricEvent::from(metric);
-emit(context, &event);
-// Neither the callback nor its consumer may retain `&event`.
-```
-
-Java forwards the pointer-backed view without building a record:
-
-```java
-public void invoke(Pointer context, Pointer eventPtr) {
-  consumer.accept(NativeMetricEvent.view(eventPtr));
-  // The consumer must finish reading before this method returns.
-}
-```
-
-This can save one Java allocation, but it exposes native layout and lifetime rules to every
-consumer.
-
-#### Recommendation
-
-Use approach 2 for general event APIs. It captured nearly all the performance of approach 3 while
-keeping unsafe memory access in the binding layer. Storage metric decoding fell from 317.4 ns/event
-with approach 1 to 95.0 ns/event with approach 2. With a Prometheus update, it fell from 433.7
-ns/event to 208.1 ns/event. Approach 3 was effectively tied at 207.4 ns/event. For large strings,
-decoding and allocation dominate. At 16 KiB, all three log paths took about 16.4-16.7 microseconds
-per event. Use approach 3 only for a measured hot path where avoiding the Java record materially
-helps. This experiment kept one upcall per event. It does not justify one callback per field or
-collection entry. For a finite map or list, pass one borrowed record or a two-word `{ ptr, len }`
-descriptor and read it during that call.
-
-#### Example: snapshot hint input
-
-A snapshot hint is a complete value when its setter call begins, so one borrowed aggregate is the
-appropriate input. The exported Rust API is:
-
-```rust
-#[repr(C)]
-pub struct FfiSnapshotHint {
-    pub version: Version,
-    pub freshness: FfiSnapshotHintFreshness,
-    pub log_paths: LogPathArray,
-    pub protocol: FfiProtocol,
-    pub metadata: FfiMetadata,
-    pub last_checkpoint: *const FfiLastCheckpoint,
-    pub crc: *const FfiCrc,
-    pub publication_watermark: FfiPublicationWatermark,
-}
-
-pub unsafe extern "C" fn snapshot_builder_with_snapshot_hint(
-    builder: Handle<ExclusiveSnapshotBuilder>,
-    value: &FfiSnapshotHint,
-) -> ExternResult<Handle<ExclusiveSnapshotBuilder>>;
-```
-
-The host keeps `hint` and all reachable memory alive for the call. Rust validates and copies the
-full graph before changing the builder. One call avoids partial state and callback choreography.
-The setter consumes the builder on both success and error, returning its replacement on success.
-
 ## Source layout
 
 Prefer mirroring the `kernel/src/` module hierarchy in `ffi/src/` for corresponding APIs.
 Snapshot hints live under `src/snapshot/hint/`, matching `kernel/src/snapshot/hint.rs`.
 Snapshot builders live in `src/snapshot/builder.rs`; snapshot accessors live in `src/lib.rs`.
 FFI-specific ownership, conversion, and engine support code can use its own modules.
-
-## Key Files
-
-- `src/lib.rs` -- main FFI entry points and type definitions
-- `src/delta_types.rs` -- reusable borrowed C representations of Delta state and actions,
-  with their backing storage and conversions colocated
-- `src/snapshot/builder.rs` -- snapshot builders and their configuration
-- `src/snapshot/hint/` -- typed snapshot-hint input and callback export
-- `src/handle.rs` -- opaque handle system for passing Rust objects across FFI
-- `src/column_default.rs` -- column-default (`allowColumnDefaults`) reads and the write-path ack
-- `src/scan.rs` -- scan FFI interface
-- `src/schema_visitor.rs` -- visitor pattern for schema traversal
-- `src/ffi_tracing.rs` -- log, metrics, and frame callback registration
-  (`#[cfg(feature = "tracing")]`)
-- `src/ffi_metrics.rs` -- `repr(C)` mirror of kernel `MetricEvent` types (`#[cfg(feature = "tracing")]`)
-- `src/alloc_stats.rs` -- `peak_alloc` global allocator and native-heap FFI getters
-  (`alloc-tracking`)
-
-## Read Flow
-
-```
-get_default_engine() -> get_snapshot_builder() -> snapshot_builder_build() -> scan()
-  -> scan_metadata_iter_init() -> scan_metadata_next() -> read + transform
-```
-
-Snapshot builder API (`ffi/src/snapshot/builder.rs` and `ffi/src/snapshot/hint/mod.rs`):
-- `get_snapshot_builder(path, engine)` -- fresh snapshot from a table path
-- `get_snapshot_builder_from(old_snapshot, engine)` -- incremental update reusing an existing snapshot (avoids re-reading the log)
-- `snapshot_builder_with_version(builder, version)` -- optional: pin to a specific version
-- `snapshot_builder_with_incremental_crc_replay(builder, mode)` -- optional: advance a stale CRC
-  within a commit limit or without a limit; defaults to disabled for fresh and incremental builds
-- `snapshot_builder_with_log_tail(builder, log_tail)` -- optional: set log tail (for catalog-managed tables)
-- `snapshot_builder_with_max_catalog_version(builder, version)` -- optional: set max catalog version (for catalog-managed tables)
-- `snapshot_builder_with_snapshot_hint(builder, hint)` -- optional: validate and copy a complete
-  typed snapshot hint into the builder. Log paths may name published or staged commits, checkpoint
-  files, or CRC files; log compaction paths are rejected. Kernel validates every supplied path beneath
-  the builder's `_delta_log` root before grouping and checkpoint selection, preserving supplied
-  locations. The connector must canonicalize paths into the same URL form as the table root.
-  A failed call consumes and drops the builder
-- `snapshot_builder_build(builder)` -- consume the builder and produce a `SharedSnapshot`
-- `free_snapshot_builder(builder)` -- discard without building (e.g. on error paths)
-
-Each `snapshot_builder_with_*` call consumes its input handle and returns the updated handle on
-success. The caller must replace the input handle with that result. On error, the builder is
-dropped. Snapshot-hint inputs and all nested pointers are borrowed only for the call and copied
-into the builder. Cross-component and table validation occurs when the builder is built. The caller
-must eventually pass the final returned handle to either `snapshot_builder_build` or
-`free_snapshot_builder`.
-
-`snapshot_to_snapshot_hint(snapshot, engine, context, visitor)` exports retained state without
-engine I/O through one callback with a complete borrowed `FfiSnapshotHint`. Both input handles are
-borrowed. The callback runs once on success and is not invoked on error. All nested pointers expire
-when the callback returns; copy retained values during the callback. No hint handle is returned.
-Supply the copied values through `snapshot_builder_with_snapshot_hint` when rebuilding a snapshot.
-The hint preserves build-time freshness, not current freshness, and includes only a matching
-checkpoint hint and an at-version CRC. Compaction files are unsupported.
-
-Export includes an explicit publication watermark,
-preserving absence even when published commits are not represented by the retained paths.
-`FfiSnapshotHint.publication_watermark` is a tagged `FfiPublicationWatermark`:
-`InferFromLogPaths` derives publication from supplied published commit paths,
-`NoPublishedCommits` explicitly preserves absence without inference, and `PublishedThrough(version)`
-preserves the observed highest published version independently of the retained paths. Export
-always uses an explicit variant. Neither the snapshot version nor its freshness claim is a
-publication watermark.
-When built with `adaptive-metadata-in-dev`, typed export rejects CRCs containing experimental
-adaptive-metadata `lastManifestCommit` or Add `backReference` state.
-
-`snapshot_log_segment(snapshot, context, visitor)` exposes the existing retained segment without
-I/O through one borrowed `FfiLogSegment` callback. It includes commit, compaction, and top-level
-checkpoint files, optional latest commit/CRC metadata, checkpoint version, and the known publication
-watermark. It preserves staged paths independently of that watermark. The snapshot is borrowed;
-copy all retained values before the callback returns. It does not implement snapshot equivalence
-or establish freshness.
-
-Snapshot accessors (`ffi/src/lib.rs`) include no-I/O reads such as `version` and
-`snapshot_file_stats`, which returns `OptionalValue<FfiFileStats>` (scalar
-`num_files` / `table_size_bytes` from the CRC; `None` when the snapshot has no CRC, or its CRC lacks
-complete file stats). `visit_file_size_histogram` exposes the optional variable-length histogram in
-the same file stats: it invokes one callback with borrowed `i64` slices for bin boundaries, file
-counts, and total bytes; callers must copy values they retain after the callback.
-
-`snapshot_timestamp` uses a synchronous `SnapshotReader` and may read commit JSON when the
-In-Commit Timestamp is unavailable from retained CRC state. Domain-metadata and transaction-version
-FFI reads also use an unscoped reader, preserving the engine's cancellation and timeout behavior.
-The C API signatures do not expose reader state or a cancellation token.
-
-Domain-metadata reads live in `ffi/src/domain_metadata.rs`: `get_domain_metadata` /
-`visit_domain_metadata` for user domains, and `visit_clustering_columns`, which reports one
-descriptor per clustering column -- logical name, physical name (what per-file stats are keyed on),
-and a type tag -- without exposing the guarded `delta.*` domain JSON directly. It returns
-`ExternResult<OptionalValue<usize>>`: `None` means not clustered, `Some(0)` means clustered on no
-columns. The type tag reuses the `visit_expression_literal_null` encoding, with 255 for types that
-don't fit a compact tag (struct, array, map, variant, void, and geometry/geography).
-
-## Commit Range Flow
-
-A `CommitRange` describes a contiguous range of a table's commits. Build one via the commit range
-builder (`ffi/src/commit_range.rs`):
-
-```
-commit_range_builder_for(path, start_version, engine)
-  -> builder = commit_range_builder_with_end_version(builder, end_version) // optional
-  -> builder = commit_range_builder_with_log_tail(builder, log_tail, max)  // optional
-  -> builder = commit_range_builder_with_max_catalog_version(builder, max) // optional
-  -> commit_range_builder_build(builder)                         // -> SharedCommitRange, always consume builder
-  -> commit_range_commits(range, engine, actions, actions_len)   // -> SharedCommitActionsIterator
-       // or commit_range_commits_with_snapshot(range, engine, start_snapshot, actions, actions_len)
-  -> commit_range_commits_next(iter, ctx, visitor)               // visitor receives a SharedCommitAction
-       // in the visitor: commit_action_version / commit_action_timestamp
-       //                  commit_action_get_actions(action, engine) -> ExclusiveFileReadResultIterator
-       //                    -> read_result_next(...) -> free_read_result_iter(...)
-```
-
-Each `commit_range_builder_with_*` call consumes its input handle and returns the updated handle on
-success; on error, it drops the builder. The caller must pass the final returned handle to either
-`commit_range_builder_build` or `free_commit_range_builder`. Release the range with
-`free_commit_range` and the commits iterator with `free_commit_actions_iter`. Each
-`SharedCommitAction` handed to the visitor must be released with `free_commit_action`.
-
-## Incremental Scan Flow
-
-An incremental scan streams the file-action diff between a base version and a target snapshot
-(`ffi/src/incremental_scan.rs`):
-
-```
-snapshot_incremental_scan_builder(snapshot, base_version, engine)
-  -> incremental_scan_builder_with_predicate(builder, engine, predicate)  // optional; prunes live Adds
-  -> incremental_scan_builder_build(builder)      // -> OptionalValue<stream>; None => full-scan fallback
-  -> incremental_scan_stream_next_arrow(stream)*  // optional: pull live-Add batches as Arrow
-  -> incremental_scan_stream_into_summary(stream) // live-Add / Remove key sets; consumes the stream
-```
-
-The module-level docs in `incremental_scan.rs` are the source of truth for the error contract
-(any `next_arrow` error kills the stream), the `OptionalValue::None` full-scan-fallback signal,
-the pass-through-field version caveat (kernel issue #2552), and handle release. The Arrow batch
-reuses `ScanMetadataArrowResult` with null `transforms`.
-
-## Write Flow
-
-Rust builders are aliases for `TransactionBuilder<CreateTable>` and
-`TransactionBuilder<UpdateTable>`, both using the default `Imperative` execution mode. Rust callers
-can select another mode on the builder; the FFI descriptors expose imperative transactions.
-Keep their concrete opaque FFI descriptors and explicit
-`create_table_txn_builder_*` / `update_table_txn_builder_*` exports. Shared Rust setters do not imply
-a universal C handle; custom setters are exposed only for their applicable builder descriptor.
-Rust-only builder aliases carry `cbindgen:ignore` so header generation uses the descriptors rather
-than monomorphizing builder state.
-
-```
-get_default_engine() -> get_snapshot_builder() -> snapshot_builder_build()
-  -> new_update_table_txn_builder(snapshot, operation, engine_info, data_change, engine)
-  -> update_table_txn_builder_build()
-  -> update_table_txn_add_files() -> update_table_txn_commit()
-                    |
-                    v
-              committed_transaction_version / committed_transaction_post_commit_snapshot
-                                                                                  |
-                                                                                  v
-                                                                  free_committed_transaction
-```
-
-Update operations, engine info, and `data_change` are required at construction and cannot be changed.
-`new_update_table_txn_builder` accepts a typed operation;
-`new_update_table_txn_builder_with_custom_operation` accepts a connector-defined name.
-Both borrow all inputs and use the engine for UTF-8 errors. They retain a snapshot reference only
-after decoding the strings. Custom-name restrictions are validated at build. Create-table
-constructors likewise require engine info and `data_change`, with the operation fixed to
-`CREATE TABLE`.
-
-`update_table_txn_commit()` and `create_table_txn_commit()` return a `Handle<ExclusiveCommittedTransaction>` that the caller can read via `committed_transaction_version` and `committed_transaction_post_commit_snapshot`, then must release with `free_committed_transaction`. The post-commit snapshot, when present, is a separate `SharedSnapshot` handle that must be freed with `free_snapshot`.
-
-Transaction identifiers can be added before build with the `*_txn_builder_with_transaction_id`
-setters, or after build with `update_table_txn_with_transaction_id` /
-`create_table_txn_with_transaction_id`. The post-build setters consume the transaction on success
-or error and return its replacement on success. Duplicate application ids among builder ids are
-rejected at build. Duplicates involving ids added after build, including collisions with builder
-ids, are rejected at commit.
-
-Write context: `update_table_txn_get_unpartitioned_write_context` covers unpartitioned tables. For partitioned tables, build a `PartitionValueMap` (`partition_value_map_new` + the typed `partition_value_map_insert_*` functions, one entry per partition column keyed by logical name) and pass it to `update_table_txn_get_partitioned_write_context` (consumes the map). Then use `get_write_dir` for the partition's target directory (Hive-style prefix or random prefix), `visit_partition_values` to read the physical `partitionValues` to record in each Add action, and `resolve_file_path` to turn a written file's URL into its relative `add.path`. The `create_table_*` variants apply the same flow to a create-table transaction whose partition columns were declared with `create_table_txn_builder_with_partition_columns`.
-
-Catalog-managed publish flow (after a catalog committer stages commits):
-
-```
-committed_transaction_post_commit_snapshot()
-  -> snapshot_publish_with_committer(snapshot, committer, engine)
-     // borrows snapshot; consumes committer (do not free)
-  -> use returned snapshot for a subsequent update_table_txn_builder_build_with_committer / checkpoint
-     // mint a fresh get_uc_committer for that transaction -- it also consumes
-  -> free_snapshot (returned snapshot) when done
-  -> free_snapshot (post-commit input snapshot)
-```
-
-`snapshot_publish_with_committer` mirrors kernel `Snapshot::publish`: it copies ratified staged
-commits into `_delta_log/` via the catalog committer's `publish()` implementation. The input
-snapshot is borrowed; the committer is consumed (do not free). The caller owns the returned
-snapshot handle. The returned snapshot carries the published watermark (`max_published_version`)
-needed for the next catalog commit; do not continue from the pre-publish post-commit snapshot.
-
-Column defaults (`allowColumnDefaults`) live in `ffi/src/column_default.rs`. The kernel reports
-defaults but never materializes them, so the connector fills every omitted column itself:
-
-```
-new_update_table_txn_builder(snapshot, operation, engine_info, data_change, engine)
-  -> update_table_txn_builder_build()
-  -> update_table_txn_visit_top_level_column_defaults(txn, engine, ctx, visitor)
-  -> update_table_txn_ack_column_defaults(txn)   // REQUIRED, else the write context errors with
-                                            // FFIKernelError::InvalidTransactionStateError
-  -> update_table_txn_get_unpartitioned_write_context(txn, engine)
-  -> update_table_txn_add_files(txn, metadata)
-  -> update_table_txn_commit(txn, engine)
-```
-
-Deletion vector update flow:
-
-```
-new_update_table_txn_builder(snapshot, operation, engine_info, data_change, engine)
-  -> update_table_txn_builder_build()
-  -> dv_descriptor_map_new()
-  -> dv_descriptor_new()
-  -> dv_descriptor_map_insert()
-  -> scan() -> scan_metadata_iter_init()
-  -> update_table_txn_update_deletion_vectors()
-  -> update_table_txn_commit()
-```
-
-The engine authors the DV file and passes descriptor fields to `dv_descriptor_new`. The
-descriptor map and scan iterator are both consumed by `update_table_txn_update_deletion_vectors`.
-Descriptor handles are consumed by `dv_descriptor_map_insert` regardless of the result. DV
-updates require both the `deletionVectors` reader/writer feature and
-`delta.enableDeletionVectors=true`.
-
-For distributed writes, `update_table_txn_write_state` returns an owned state handle that outlives the
-transaction. `write_state_encode` returns opaque bytes to copy to workers. Decode them once on each
-worker with `write_state_decode`. Local writers can skip this round trip.
-Create-table writes use the `create_table_txn_get_*_write_context` functions and do not expose
-transportable write state.
-Create a builder for each output partition with `write_context_builder`. Partitioned writers set
-values keyed by logical names with `write_context_builder_with_partition_values` or exact physical
-names with `write_context_builder_with_physical_partition_values`; writers that provide materialized
-row-tracking columns also call `write_context_builder_with_row_tracking_columns`. Finish with
-`write_context_builder_build`. Builders and bound contexts hold their own state reference, so they
-remain valid after `free_write_state`. Drop an unused builder with `free_write_context_builder` and
-a bound context with `free_write_context`. Driver and workers must use the same kernel version.
-`get_write_state_stats_columns` passes every physical statistics column path to one allocation
-callback as a borrowed `FfiSlice<FfiColumnName>`. `snapshot_physical_schema` returns the full
-physical table schema, which may contain fields that are not stored in data files.
-
-## Tracing & Metrics
-
-Gated behind the `tracing` feature. A single global `tracing` subscriber backs logging, metrics,
-and frame lifecycle reporting; it is installed lazily the first time any `enable_*` function below
-is called. The subscriber has three reloadable slots: a logging layer (swapped wholesale between
-event-based and log-line formats), a metrics layer (a fixed `ReportGeneratorLayer` toggled on/off
-via a reloadable level filter), and a frame layer (a fixed `FrameReporterLayer` toggled on/off via
-a reloadable level filter).
-
-Logging registration (each re-callable to replace the active callback, format, and level):
-- `enable_event_tracing(callback, max_level)` -- structured `Event`s; the engine formats them
-- `enable_log_line_tracing(callback, max_level)` -- pre-formatted log lines, default options
-- `enable_formatted_log_line_tracing(callback, max_level, format, ansi, with_time, with_level, with_target)`
-  -- pre-formatted log lines with explicit formatting options
-
-Metrics registration:
-- `enable_metrics_reporting(callback)` -- forwards each kernel `MetricEvent` to the callback as a
-  `repr(C)` `MetricEvent` (see `src/ffi_metrics.rs`). Re-calling replaces the callback.
-
-Frame lifecycle registration:
-- `enable_frame_reporting(callback)` -- forwards OPEN/CLOSE for each dynamic activation of a span
-  declaring the static `enable_call_frame` field. The callback runs synchronously on the entering
-  or exiting thread and receives a tagged `FrameEvent` union. OPEN includes the span id and a
-  borrowed UTF-8 name; CLOSE includes the matching id. Calls may overlap across threads; callback
-  state must be thread-safe, and profile consumers must maintain a separate event stack for each
-  callback thread. Registration is one-shot so a callback cannot be replaced between a span's OPEN
-  and CLOSE events; another call fails and leaves the existing callback active.
-
-The `MetricEvent` and any `KernelStringSlice` it carries are only valid for the duration of the
-callback. Durations are `u64`, suffixed `_ns` (nanoseconds) or `_ms` (milliseconds). Operation ids
-are the raw 16 bytes of the kernel UUID (`MetricId`).
 
 ## Building
 
