@@ -32,7 +32,7 @@ pub(crate) const IS_BLIND_APPEND: &str = "is_blind_append";
 pub(crate) const IN_COMMIT_TIMESTAMP: &str = "in_commit_timestamp";
 pub(crate) const IS_MANIFEST_COMMIT: &str = "is_manifest_commit";
 pub(crate) const ROW_ID_HIGH_WATER_MARK: &str = "row_id_high_water_mark";
-pub(crate) const ROW_TRACKING_COUNT: &str = "row_tracking_count";
+pub(crate) const WRITES_ROW_TRACKING: &str = "writes_row_tracking";
 pub(crate) const REMOVES_ROW_TRACKING: &str = "removes_row_tracking";
 pub(crate) const PROTOCOL_CHANGED: &str = "protocol_changed";
 pub(crate) const METADATA_CHANGED: &str = "metadata_changed";
@@ -41,7 +41,6 @@ pub(crate) const TXN_CONFLICT: &str = "txn_conflict";
 pub(crate) const BACKFILL_CONFLICT: &str = "backfill_conflict";
 
 // === Per-action columns ===
-// A marker is 1 when the action matches and NULL otherwise, so `count` gives the matches.
 const IDENTITY_ONLY_TAG: &str = "identity_only_tag";
 const PROTOCOL_MARKER: &str = "protocol_marker";
 const METADATA_MARKER: &str = "metadata_marker";
@@ -50,7 +49,7 @@ const TXN_CONFLICT_MARKER: &str = "txn_conflict_marker";
 const CHECKPOINT_MARKER: &str = "checkpoint_marker";
 const ROW_TRACKING_MARKER: &str = "row_tracking_marker";
 const ROW_TRACKING_TOMBSTONE_MARKER: &str = "row_tracking_tombstone_marker";
-const ROW_TRACKING: &str = "row_tracking";
+const ROW_TRACKING_STATE: &str = "row_tracking_state";
 
 // === Aggregated count columns ===
 const PROTOCOL_COUNT: &str = "protocol_count";
@@ -58,6 +57,7 @@ const METADATA_COUNT: &str = "metadata_count";
 const DOMAIN_CONFLICT_COUNT: &str = "domain_conflict_count";
 const TXN_CONFLICT_COUNT: &str = "txn_conflict_count";
 const CHECKPOINT_COUNT: &str = "checkpoint_count";
+const ROW_TRACKING_COUNT: &str = "row_tracking_count";
 const ROW_TRACKING_TOMBSTONE_COUNT: &str = "row_tracking_tombstone_count";
 
 // === JSON keys ===
@@ -66,8 +66,8 @@ const ROW_ID_HIGH_WATER_MARK_FIELD: &str = "rowIdHighWaterMark";
 /// with the `adaptive-metadata-in-dev` feature.
 const CHECKPOINT: &str = "checkpoint";
 
-/// The schema of the plan output: one row for each winner. Every rule column and the row-tracking
-/// count are not null, so a rule expression that yields NULL fails the plan.
+/// The schema of the plan output: one row for each winner. Every boolean column except
+/// `is_blind_append` is not null, so an expression that yields NULL fails the plan.
 pub(crate) static WINNER_CHECK_OUTPUT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     not_null (VERSION): LONG,
     nullable (OPERATION): STRING,
@@ -75,7 +75,7 @@ pub(crate) static WINNER_CHECK_OUTPUT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_
     nullable (IN_COMMIT_TIMESTAMP): LONG,
     not_null (IS_MANIFEST_COMMIT): BOOLEAN,
     nullable (ROW_ID_HIGH_WATER_MARK): LONG,
-    not_null (ROW_TRACKING_COUNT): LONG,
+    not_null (WRITES_ROW_TRACKING): BOOLEAN,
     not_null (REMOVES_ROW_TRACKING): BOOLEAN,
     not_null (PROTOCOL_CHANGED): BOOLEAN,
     not_null (METADATA_CHANGED): BOOLEAN,
@@ -86,7 +86,8 @@ pub(crate) static WINNER_CHECK_OUTPUT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_
 
 /// The winner action fields. All are nullable, so an action that lacks a canonical field still
 /// gets a row. `protocol.minReaderVersion` and `metaData.id` exist only to give each struct a
-/// field. The rules test the whole struct with `is_not_null`.
+/// field. The rules test the whole struct with `is_not_null`. `checkpoint` likewise reads only
+/// whether the array is present, with `checkpointMetadata.version` as its placeholder field.
 static WINNER_ACTIONS_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     not_null (VERSION): LONG,
     nullable (COMMIT_INFO_NAME): {
@@ -111,7 +112,9 @@ static WINNER_ACTIONS_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     nullable (SET_TRANSACTION_NAME): {
         nullable "appId": STRING,
     },
-    nullable (CHECKPOINT): [ nullable {} ],
+    nullable (CHECKPOINT): [ nullable {
+        nullable "checkpointMetadata": { nullable "version": LONG },
+    } ],
 };
 
 static ROW_TRACKING_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
@@ -131,7 +134,7 @@ static ACTION_ROW_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     nullable (CHECKPOINT_MARKER): LONG,
     nullable (ROW_TRACKING_MARKER): LONG,
     nullable (ROW_TRACKING_TOMBSTONE_MARKER): LONG,
-    nullable (ROW_TRACKING): (ROW_TRACKING_SCHEMA.as_ref().clone()),
+    nullable (ROW_TRACKING_STATE): (ROW_TRACKING_SCHEMA.as_ref().clone()),
 };
 
 /// Builds the winner check plan over `winners`, or returns `None` when there are no winners.
@@ -174,7 +177,10 @@ pub(crate) fn winner_check_plan(
                     ROW_TRACKING_TOMBSTONE_COUNT,
                 )
                 .aggregate_as(
-                    Agg::max(column_name!(ROW_TRACKING, ROW_ID_HIGH_WATER_MARK_FIELD)),
+                    Agg::max(column_name!(
+                        ROW_TRACKING_STATE,
+                        ROW_ID_HIGH_WATER_MARK_FIELD
+                    )),
                     ROW_ID_HIGH_WATER_MARK,
                 )
         })?
@@ -194,11 +200,10 @@ fn action_row_expr(facts: &LoserFacts) -> Expression {
         .iter()
         .map(|app_id| col!(SET_TRANSACTION_NAME, "appId").eq(lit(app_id.as_str())));
     let is_row_tracking = col!(DOMAIN_METADATA_NAME, "domain").eq(lit(ROW_TRACKING_DOMAIN_NAME));
-    let is_removed = Predicate::not(col!(DOMAIN_METADATA_NAME, "removed").distinct(lit(true)));
-    let live_row_tracking =
-        Predicate::and(is_row_tracking.clone(), Predicate::not(is_removed.clone()));
-    // Only a live `delta.rowTracking` action passes its configuration to the parser, so a
-    // malformed configuration of another domain can't null the marks.
+    let not_removed = col!(DOMAIN_METADATA_NAME, "removed").distinct(lit(true));
+    let live_row_tracking = Predicate::and(is_row_tracking.clone(), not_removed.clone());
+    // Only a live `delta.rowTracking` action passes its configuration to the parser. A malformed
+    // configuration of another domain then can't null the marks.
     let row_tracking_configuration = Expression::case_when(
         [(
             live_row_tracking.clone(),
@@ -218,7 +223,7 @@ fn action_row_expr(facts: &LoserFacts) -> Expression {
         marker(Predicate::or_from(conflicting_app_ids)),
         marker(col!(CHECKPOINT).is_not_null()),
         marker(live_row_tracking),
-        marker(Predicate::and(is_row_tracking, is_removed)),
+        marker(Predicate::and(is_row_tracking, Predicate::not(not_removed))),
         Expression::parse_json(row_tracking_configuration, ROW_TRACKING_SCHEMA.clone()),
     ])
 }
@@ -226,15 +231,16 @@ fn action_row_expr(facts: &LoserFacts) -> Expression {
 /// Passes the summary columns through, then adds one boolean column for each winner rule. A rule
 /// column is true when the winner breaks that rule.
 fn rule_expr(facts: &LoserFacts) -> Expression {
-    let identity_only = Predicate::not(
-        col!(IDENTITY_ONLY_TAG).distinct(lit(IDENTITY_ONLY_METADATA_UPDATE_TAG_VALUE)),
-    );
     let has_metadata = col!(METADATA_COUNT).gt(lit(0i64));
     // Delta Spark's ConflictChecker accepts an identity-only metadata update when T changes no
     // metadata.
     let metadata_changed = match facts.changes_metadata {
         true => has_metadata,
-        false => Predicate::and(has_metadata, Predicate::not(identity_only)),
+        false => {
+            let not_identity_only =
+                col!(IDENTITY_ONLY_TAG).distinct(lit(IDENTITY_ONLY_METADATA_UPDATE_TAG_VALUE));
+            Predicate::and(has_metadata, not_identity_only)
+        }
     };
     let is_backfill =
         Predicate::not(col!(OPERATION).distinct(lit(ROW_TRACKING_BACKFILL_OPERATION)));
@@ -249,7 +255,7 @@ fn rule_expr(facts: &LoserFacts) -> Expression {
         col!(IN_COMMIT_TIMESTAMP),
         Expression::from_pred(col!(CHECKPOINT_COUNT).gt(lit(0i64))),
         col!(ROW_ID_HIGH_WATER_MARK),
-        col!(ROW_TRACKING_COUNT),
+        Expression::from_pred(col!(ROW_TRACKING_COUNT).gt(lit(0i64))),
         Expression::from_pred(col!(ROW_TRACKING_TOMBSTONE_COUNT).gt(lit(0i64))),
         Expression::from_pred(col!(PROTOCOL_COUNT).gt(lit(0i64))),
         Expression::from_pred(metadata_changed),
@@ -259,7 +265,7 @@ fn rule_expr(facts: &LoserFacts) -> Expression {
     ])
 }
 
-/// 1 when `predicate` holds, NULL otherwise.
+/// 1 when `predicate` holds, NULL otherwise, so `count` over a marker column gives the matches.
 fn marker(predicate: Predicate) -> Expression {
     Expression::case_when([(predicate, lit(1i64))], null_lit(DataType::LONG))
 }

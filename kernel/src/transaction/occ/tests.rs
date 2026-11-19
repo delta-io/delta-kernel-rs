@@ -15,8 +15,9 @@ use super::*;
 use crate::actions::{Add, CommitInfo, DomainMetadata, Metadata, Protocol, Remove, SetTransaction};
 use crate::engine::sync::SyncEngine;
 use crate::engine::sync::plan::{ScopedSyncPlanExecutor, SyncPlanExecutor};
-use crate::expressions::{Predicate, Scalar, StructData, col, lit};
+use crate::expressions::{Expression, Predicate, Scalar, StructData, col, lit};
 use crate::object_store::local::LocalFileSystem;
+use crate::plans::ir::nodes::Operator;
 use crate::plans::{Plan, PlanBuilder, PlanExecutor, PlanResult};
 use crate::row_tracking::{ROW_TRACKING_DOMAIN_NAME, RowTrackingDomainMetadata};
 use crate::schema::{DataType, PrimitiveType, StructField, schema, schema_ref};
@@ -116,6 +117,11 @@ fn txn(app_id: &str) -> Value {
     line(Action::Txn(SetTransaction::new(app_id.into(), 3, Some(0))))
 }
 
+/// The `checkpoint` action of an adaptiveMetadata manifest commit, with only its version element.
+fn manifest_checkpoint(version: Version) -> Value {
+    json!({"checkpoint": [{"checkpointMetadata": {"version": version}}]})
+}
+
 // === Fixtures ===
 
 /// A table whose `_delta_log` holds only the given commits.
@@ -198,16 +204,24 @@ pub(super) fn make_optimize(facts: &mut LoserFacts) {
 
 /// A partitioned DELETE of `DELETED_DATE` that reads the files in `read_files`.
 fn delete_facts(read_files: &RelationRef) -> LoserFacts {
-    let deleted_date = lit(PrimitiveType::Date.parse_scalar(DELETED_DATE).unwrap());
     delete_loser(
         READ_VERSION,
         files_scope(
             read_files,
             schema_ref! { nullable "date": DATE },
-            Some(Arc::new(col!("date").eq(deleted_date))),
+            Some(equals("date", date(DELETED_DATE))),
             MapToStructOptions::default(),
         ),
     )
+}
+
+/// The predicate `column = value`.
+pub(super) fn equals(column: &str, value: impl Into<Scalar>) -> PredicateRef {
+    Arc::new(Expression::column([column]).eq(lit(value)))
+}
+
+fn date(value: &str) -> Scalar {
+    PrimitiveType::Date.parse_scalar(value).unwrap()
 }
 
 /// T's file actions and read files, retained in a fresh scoped executor.
@@ -262,7 +276,15 @@ impl LoserRelations {
         facts: &LoserFacts,
         winners: &[WinningCommit],
     ) -> ConflictDetection {
-        detect_conflicts(&self.executor, facts, winners, &self.file_actions).unwrap()
+        self.try_detect(facts, winners).unwrap()
+    }
+
+    fn try_detect(
+        &self,
+        facts: &LoserFacts,
+        winners: &[WinningCommit],
+    ) -> KernelResult<ConflictDetection> {
+        detect_conflicts(&self.executor, facts, winners, &self.file_actions)
     }
 
     /// The number of query plans that conflict detection ran.
@@ -491,15 +513,28 @@ fn partitioned_delete_read_append(#[case] data_change: bool) {
     |_: &mut LoserFacts| {},
     conflict(7, Some("WRITE"), winner(WinnerRule::ProtocolChanged)),
 )]
+#[case::domain_conflict_reported_before_txn_conflict(
+    vec![domain("app.x", "{}"), txn("app-a")],
+    |facts: &mut LoserFacts| {
+        facts.written_domains = vec!["app.x".into()];
+        facts.read_app_ids = vec!["app-a".into()];
+    },
+    conflict(7, Some("WRITE"), winner(WinnerRule::DomainConflict)),
+)]
 fn winner_rule_with_write_commit(
     #[case] actions: Vec<Value>,
     #[case] adjust: fn(&mut LoserFacts),
     #[case] expected: Option<Conflict>,
 ) {
-    let mut winner = vec![commit_info("WRITE")];
-    winner.extend(actions);
-    let conflict = detect_with(adjust, &[DELETED_FILE], &[DELETED_FILE], &[(7, winner)]);
-    assert_eq!(conflict, expected);
+    let mut winner_actions = vec![commit_info("WRITE")];
+    winner_actions.extend(actions);
+    let result = detect_with(
+        adjust,
+        &[DELETED_FILE],
+        &[DELETED_FILE],
+        &[(7, winner_actions)],
+    );
+    assert_eq!(result, expected);
 }
 
 #[rstest]
@@ -524,14 +559,14 @@ fn identity_only_metadata_winner(
     #[case] changes_metadata: bool,
     #[case] expected: Option<Conflict>,
 ) {
-    let winner = vec![identity_only_commit_info(tag), metadata()];
-    let conflict = detect_with(
+    let winner_actions = vec![identity_only_commit_info(tag), metadata()];
+    let result = detect_with(
         |facts| facts.changes_metadata = changes_metadata,
         &[DELETED_FILE],
         &[DELETED_FILE],
-        &[(7, winner)],
+        &[(7, winner_actions)],
     );
-    assert_eq!(conflict, expected);
+    assert_eq!(result, expected);
 }
 
 #[test]
@@ -567,17 +602,42 @@ fn row_tracking_backfill_winner(#[case] rewrites_files: bool, #[case] expected: 
     };
     // The backfill adds a file in the deleted partition. `read_append` skips backfill winners, so
     // only the backfill rule can fail T.
-    let winner = vec![
+    let winner_actions = vec![
         commit_info(ROW_TRACKING_BACKFILL_OPERATION),
         add("date=2026-10-01/part-c.parquet", DELETED_DATE),
     ];
-    let conflict = detect_with(
+    let result = detect_with(
         |facts| facts.rewrites_files = rewrites_files,
         removed,
         &[DELETED_FILE],
-        &[(7, winner)],
+        &[(7, winner_actions)],
     );
-    assert_eq!(conflict, expected);
+    assert_eq!(result, expected);
+}
+
+#[rstest]
+#[case::winner_remove_of_read_file_fails(
+    vec![commit_info("DELETE"), remove(DELETED_FILE, true)],
+    conflict(7, Some("DELETE"), occ(OccCheck::ReadDelete)),
+)]
+// Kernel finds no conflict with a winner that adds T's file again without removing it. The retry
+// must drop T's re-add of that file, as Delta Spark does.
+#[case::winner_add_again_without_remove_passes(
+    vec![commit_info("WRITE"), add(DELETED_FILE, DELETED_DATE)],
+    None,
+)]
+fn row_tracking_backfill_loser(
+    #[case] winner_actions: Vec<Value>,
+    #[case] expected: Option<Conflict>,
+) {
+    // T adds `DELETED_FILE` again, so it reads that file and removes none.
+    let result = detect_with(
+        |facts| facts.is_row_tracking_backfill = true,
+        &[],
+        &[DELETED_FILE],
+        &[(7, winner_actions)],
+    );
+    assert_eq!(result, expected);
 }
 
 // === OCC checks ===
@@ -591,18 +651,18 @@ fn winner_remove_conflicts_whatever_its_data_change(
     #[case] check: OccCheck,
     #[values(true, false)] data_change: bool,
 ) {
-    let winner = vec![commit_info("OPTIMIZE"), remove(DELETED_FILE, data_change)];
-    let result = detect_with(|_| {}, removed, read, &[(7, winner)]);
+    let winner_actions = vec![commit_info("OPTIMIZE"), remove(DELETED_FILE, data_change)];
+    let result = detect_with(|_| {}, removed, read, &[(7, winner_actions)]);
     assert_eq!(result, conflict(7, Some("OPTIMIZE"), occ(check)));
 }
 
 #[test]
 fn remove_of_unrelated_file_passes() {
-    let winner = vec![
+    let winner_actions = vec![
         commit_info("DELETE"),
         remove("date=2026-10-02/part-b.parquet", true),
     ];
-    assert_eq!(detect_delete(&[(7, winner)]), None);
+    assert_eq!(detect_delete(&[(7, winner_actions)]), None);
 }
 
 #[test]
@@ -628,32 +688,30 @@ fn winner_without_blind_append_flag_is_checked_under_write_serializable() {
         .as_object_mut()
         .unwrap()
         .remove("isBlindAppend");
-    let winner = vec![info, add("f7", DELETED_DATE)];
+    let winner_actions = vec![info, add("f7", DELETED_DATE)];
     assert_eq!(
-        detect_delete(&[(7, winner)]),
+        detect_delete(&[(7, winner_actions)]),
         conflict(7, Some("WRITE"), occ(OccCheck::ReadAppend))
     );
 }
 
 #[test]
-fn optimize_loser_drops_to_snapshot_isolation_and_passes_read_append() {
-    let mut facts = delete_facts(&no_read_files());
-    make_optimize(&mut facts);
-    assert_eq!(
-        facts.effective_isolation_level(),
-        IsolationLevel::SnapshotIsolation
-    );
-    let winner = vec![commit_info("WRITE"), add("f7", DELETED_DATE)];
-    let conflict = detect_with(
+fn optimize_loser_passes_read_append() {
+    let winner_actions = vec![commit_info("WRITE"), add("f7", DELETED_DATE)];
+    let result = detect_with(
         make_optimize,
         &[DELETED_FILE],
         &[DELETED_FILE],
-        &[(7, winner)],
+        &[(7, winner_actions)],
     );
-    assert_eq!(conflict, None);
+    assert_eq!(result, None);
 }
 
 #[rstest]
+#[case::optimize_drops_to_snapshot_isolation(
+    |_: &mut LoserFacts| {},
+    IsolationLevel::SnapshotIsolation,
+)]
 #[case::metadata_change_keeps_write_serializable(
     |facts: &mut LoserFacts| facts.changes_metadata = true,
     IsolationLevel::WriteSerializable,
@@ -680,12 +738,12 @@ fn effective_isolation_level_without_data_change(
 #[case::add_in_other_partition(add("f7", OTHER_DATE), OccCheck::ReadAppend)]
 #[case::remove_of_unread_file(remove("date=2026-10-02/part-b.parquet", true), OccCheck::ReadDelete)]
 fn whole_table_read_conflicts_with_any_file_change(#[case] action: Value, #[case] check: OccCheck) {
-    let winner = vec![commit_info("WRITE"), action];
+    let winner_actions = vec![commit_info("WRITE"), action];
     let result = detect_with(
         |facts| facts.read_scope = ReadScope::WholeTable,
         &[DELETED_FILE],
         &[],
-        &[(7, winner)],
+        &[(7, winner_actions)],
     );
     assert_eq!(result, conflict(7, Some("WRITE"), occ(check)));
 }
@@ -714,7 +772,36 @@ fn whole_table_read_conflicts_with_any_file_change(#[case] action: Value, #[case
     ],
     conflict(7, Some("WRITE"), winner(WinnerRule::MetadataChanged)),
 )]
-fn winner_rule_is_reported_first(
+#[case::winner_rule_before_later_manifest_commit(
+    vec![
+        (7, vec![commit_info("WRITE"), metadata()]),
+        (8, vec![commit_info("WRITE"), manifest_checkpoint(8)]),
+    ],
+    conflict(7, Some("WRITE"), winner(WinnerRule::MetadataChanged)),
+)]
+#[case::occ_violation_before_row_tracking_tombstone(
+    vec![(
+        7,
+        vec![
+            commit_info("DELETE"),
+            remove(DELETED_FILE, true),
+            removed_domain(ROW_TRACKING_DOMAIN_NAME),
+        ],
+    )],
+    conflict(7, Some("DELETE"), occ(OccCheck::ReadDelete)),
+)]
+#[case::read_append_before_other_checks_of_one_version(
+    vec![(
+        7,
+        vec![
+            commit_info("WRITE"),
+            remove(DELETED_FILE, true),
+            add("f7", DELETED_DATE),
+        ],
+    )],
+    conflict(7, Some("WRITE"), occ(OccCheck::ReadAppend)),
+)]
+fn reporting_order(
     #[case] commits: Vec<(Version, Vec<Value>)>,
     #[case] expected: Option<Conflict>,
 ) {
@@ -738,22 +825,6 @@ fn earliest_occ_version_then_check_order_is_reported() {
     );
 }
 
-#[test]
-fn checks_of_one_version_report_read_append_first() {
-    let result = detect_delete(&[(
-        7,
-        vec![
-            commit_info("WRITE"),
-            remove(DELETED_FILE, true),
-            add("f7", DELETED_DATE),
-        ],
-    )]);
-    assert_eq!(
-        result,
-        conflict(7, Some("WRITE"), occ(OccCheck::ReadAppend))
-    );
-}
-
 // === Plan presence ===
 
 #[rstest]
@@ -773,10 +844,11 @@ fn occ_plan_runs_only_if_no_winner_rule_fails(
     #[case] plan_runs: usize,
 ) {
     // The winner removes a file that T read, so the OCC plan fails T whenever it runs. Kernel
-    // reports a winner rule first, so with a winner rule only the plan count shows the skip.
-    let mut winner = vec![commit_info("DELETE"), remove(DELETED_FILE, true)];
-    winner.extend(actions);
-    let table = TestTable::new(&[(7, winner)]);
+    // reports a winner rule first, so with a winner rule only the plan count shows that the OCC
+    // plan didn't run.
+    let mut winner_actions = vec![commit_info("DELETE"), remove(DELETED_FILE, true)];
+    winner_actions.extend(actions);
+    let table = TestTable::new(&[(7, winner_actions)]);
     let relations = LoserRelations::new(&[], &[DELETED_FILE]);
     let facts = delete_facts(&relations.read_files);
     let detection = relations.detect(&facts, &table.winners(READ_VERSION));
@@ -803,6 +875,27 @@ fn blind_append_loser_runs_only_the_winner_check_plan() {
     let detection = relations.detect(&facts, &table.winners(READ_VERSION));
     assert_eq!(outcome(detection), None);
     assert_eq!(relations.plan_runs(), 1);
+}
+
+#[test]
+fn delete_checks_share_one_scan_of_winner_removes() {
+    let table = TestTable::new(&[(7, vec![commit_info("WRITE"), add("f7", DELETED_DATE)])]);
+    let relations = LoserRelations::new(&[DELETED_FILE], &[DELETED_FILE]);
+    let facts = delete_facts(&relations.read_files);
+    let plan = occ_plan(
+        &facts,
+        &table.winners(READ_VERSION),
+        &[7],
+        &relations.file_actions,
+    )
+    .unwrap()
+    .unwrap();
+    let scans = plan
+        .nodes
+        .iter()
+        .filter(|node| matches!(node.op, Operator::ScanJson(_)))
+        .count();
+    assert_eq!(scans, 2);
 }
 
 #[test]
@@ -835,46 +928,73 @@ fn winner_row_reads_commit_info_timestamp_and_blind_append() {
 }
 
 #[rstest]
+#[case::malformed_configuration_of_other_domain("{not json")]
+#[case::mark_in_configuration_of_other_domain(r#"{"rowIdHighWaterMark":5000}"#)]
+fn row_tracking_mark_comes_only_from_live_row_tracking_domain(#[case] configuration: &str) {
+    let summaries = winner_summaries(&[(
+        7,
+        vec![
+            commit_info("WRITE"),
+            domain("app.x", configuration),
+            row_tracking(1099),
+        ],
+    )]);
+    let [summary] = summaries.as_slice() else {
+        panic!("expected one winner row, got {summaries:?}");
+    };
+    assert_eq!(summary.row_id_high_water_mark, Some(1099));
+}
+
+#[rstest]
 #[case::malformed_row_tracking_configuration(
-    vec![
-        commit_info("WRITE"),
-        add("f7", OTHER_DATE),
-        domain(ROW_TRACKING_DOMAIN_NAME, "{not json"),
-    ],
+    vec![(
+        7,
+        vec![
+            commit_info("WRITE"),
+            add("f7", OTHER_DATE),
+            domain(ROW_TRACKING_DOMAIN_NAME, "{not json"),
+        ],
+    )],
     "without a readable rowIdHighWaterMark",
 )]
 #[case::row_tracking_configuration_without_mark(
+    vec![(
+        7,
+        vec![
+            commit_info("WRITE"),
+            add("f7", OTHER_DATE),
+            domain(ROW_TRACKING_DOMAIN_NAME, "{}"),
+        ],
+    )],
+    "without a readable rowIdHighWaterMark",
+)]
+#[case::malformed_row_tracking_configuration_of_one_winner(
     vec![
-        commit_info("WRITE"),
-        add("f7", OTHER_DATE),
-        domain(ROW_TRACKING_DOMAIN_NAME, "{}"),
+        (7, vec![commit_info("WRITE"), row_tracking(1099)]),
+        (8, vec![commit_info("WRITE"), domain(ROW_TRACKING_DOMAIN_NAME, "{not json")]),
     ],
     "without a readable rowIdHighWaterMark",
 )]
 #[case::row_tracking_tombstone(
-    vec![commit_info("WRITE"), removed_domain(ROW_TRACKING_DOMAIN_NAME)],
+    vec![(7, vec![commit_info("WRITE"), removed_domain(ROW_TRACKING_DOMAIN_NAME)])],
     "The winning commit at version 7 removes the `delta.rowTracking` domain",
 )]
 #[case::manifest_commit(
-    vec![
-        commit_info("WRITE"),
-        json!({"checkpoint": [{"checkpointMetadata": {"version": 7}}]}),
-    ],
+    vec![(7, vec![commit_info("WRITE"), manifest_checkpoint(7)])],
     "Conflict detection does not support the manifest commit at version 7",
 )]
-#[case::commit_without_actions(vec![], "Winner check rows [] do not match the winning commits [7]")]
+#[case::commit_without_actions(
+    vec![(7, vec![])],
+    "Winner check rows [] do not match the winning commits [7]",
+)]
 fn winner_that_kernel_cannot_check_fails_detection(
-    #[case] actions: Vec<Value>,
+    #[case] commits: Vec<(Version, Vec<Value>)>,
     #[case] message: &str,
 ) {
-    let table = TestTable::new(&[(7, actions)]);
+    let table = TestTable::new(&commits);
     let relations = LoserRelations::new(&[DELETED_FILE], &[DELETED_FILE]);
-    let result = detect_conflicts(
-        &relations.executor,
-        &delete_facts(&relations.read_files),
-        &table.winners(READ_VERSION),
-        &relations.file_actions,
-    );
+    let facts = delete_facts(&relations.read_files);
+    let result = relations.try_detect(&facts, &table.winners(READ_VERSION));
     assert_result_error_with_message(result, message);
 }
 
@@ -884,12 +1004,7 @@ fn table_snapshot_isolation_fails_detection_before_any_plan() {
     let relations = LoserRelations::new(&[DELETED_FILE], &[DELETED_FILE]);
     let mut facts = delete_facts(&relations.read_files);
     facts.isolation_level = IsolationLevel::SnapshotIsolation;
-    let result = detect_conflicts(
-        &relations.executor,
-        &facts,
-        &table.winners(READ_VERSION),
-        &relations.file_actions,
-    );
+    let result = relations.try_detect(&facts, &table.winners(READ_VERSION));
     assert_result_error_with_message(
         result,
         "Conflict detection does not support the table isolation level SnapshotIsolation",
@@ -897,7 +1012,7 @@ fn table_snapshot_isolation_fails_detection_before_any_plan() {
     assert_eq!(relations.plan_runs(), 0);
 }
 
-// === Branch version selection ===
+// === Read-append version selection ===
 
 fn summary(version: Version, operation: &str, is_blind_append: bool) -> WinnerSummary {
     WinnerSummary {
@@ -907,7 +1022,7 @@ fn summary(version: Version, operation: &str, is_blind_append: bool) -> WinnerSu
         in_commit_timestamp: None,
         is_manifest_commit: false,
         row_id_high_water_mark: None,
-        row_tracking_count: 0,
+        writes_row_tracking: false,
         removes_row_tracking: false,
         violations: vec![],
     }
@@ -917,27 +1032,22 @@ fn summary(version: Version, operation: &str, is_blind_append: bool) -> WinnerSu
 #[case::write_serializable_skips_blind_append_winner(
     |_: &mut LoserFacts| {},
     vec![7, 9],
-    vec![7, 8, 9, 10],
 )]
 #[case::write_serializable_metadata_change_checks_blind_append(
     |facts: &mut LoserFacts| facts.changes_metadata = true,
     vec![7, 8, 9],
-    vec![7, 8, 9, 10],
 )]
 #[case::serializable_checks_blind_append(
     |facts: &mut LoserFacts| facts.isolation_level = IsolationLevel::Serializable,
     vec![7, 8, 9],
-    vec![7, 8, 9, 10],
 )]
 #[case::blind_append_loser_skips_all(
     |facts: &mut LoserFacts| facts.is_blind_append = true,
     vec![],
-    vec![],
 )]
-#[case::backfill_loser_skips_all(
+#[case::backfill_loser_skips_read_append(
     |facts: &mut LoserFacts| facts.is_row_tracking_backfill = true,
     vec![],
-    vec![7, 8, 9, 10],
 )]
 #[case::other_actions_keep_isolation(
     |facts: &mut LoserFacts| {
@@ -945,12 +1055,10 @@ fn summary(version: Version, operation: &str, is_blind_append: bool) -> WinnerSu
         facts.has_other_actions = true;
     },
     vec![7, 9],
-    vec![7, 8, 9, 10],
 )]
 #[case::write_serializable_data_changing_operation_keeps_isolation(
     |facts: &mut LoserFacts| facts.has_data_change = false,
     vec![7, 9],
-    vec![7, 8, 9, 10],
 )]
 #[case::serializable_without_data_change_drops_isolation(
     |facts: &mut LoserFacts| {
@@ -958,13 +1066,8 @@ fn summary(version: Version, operation: &str, is_blind_append: bool) -> WinnerSu
         facts.has_data_change = false;
     },
     vec![],
-    vec![7, 8, 9, 10],
 )]
-fn read_append_versions(
-    #[case] adjust: fn(&mut LoserFacts),
-    #[case] read_append: Vec<Version>,
-    #[case] delete_checks: Vec<Version>,
-) {
+fn read_append_versions(#[case] adjust: fn(&mut LoserFacts), #[case] expected: Vec<Version>) {
     let mut facts = delete_facts(&no_read_files());
     adjust(&mut facts);
     let summaries = [
@@ -973,9 +1076,7 @@ fn read_append_versions(
         summary(9, "MERGE", false),
         summary(10, ROW_TRACKING_BACKFILL_OPERATION, false),
     ];
-    let branches = select_occ_branch_versions(&facts, &summaries);
-    assert_eq!(branches.read_append, read_append);
-    assert_eq!(branches.delete_checks, delete_checks);
+    assert_eq!(select_read_append_versions(&facts, &summaries), expected);
 }
 
 // === Winner coverage ===
@@ -999,7 +1100,7 @@ fn winning_commit(version: Version) -> WinningCommit {
 #[case::gap_between_winners_fails(&[READ_VERSION + 1, READ_VERSION + 3], false)]
 fn winners_must_follow_read_version(#[case] winners: &[Version], #[case] valid: bool) {
     let winners = Vec::from_iter(winners.iter().map(|&version| winning_commit(version)));
-    let result = check_winners_follow_read_version(READ_VERSION, &winners);
+    let result = ensure_winners_follow_read_version(READ_VERSION, &winners);
     assert_eq!(result.is_ok(), valid, "{result:?}");
 }
 
@@ -1015,7 +1116,7 @@ fn winner_rows_must_match_winners(
 ) {
     let winners = Vec::from_iter(winners.iter().map(|&version| winning_commit(version)));
     let summaries = Vec::from_iter(rows.iter().map(|&version| summary(version, "WRITE", false)));
-    let result = check_winner_rows(READ_VERSION, &winners, &summaries);
+    let result = ensure_winner_rows(READ_VERSION, &winners, &summaries);
     assert_eq!(result.is_ok(), valid, "{result:?}");
 }
 
@@ -1026,8 +1127,27 @@ fn null_partition_value_does_not_match_equality_predicate() {
     // `Add` can't hold a null partition value, so the test edits the add's JSON.
     let mut null_partition_add = add("f7", DELETED_DATE);
     null_partition_add["add"]["partitionValues"]["date"] = Value::Null;
-    let winner = vec![commit_info("WRITE"), null_partition_add];
-    assert_eq!(detect_delete(&[(7, winner)]), None);
+    let winner_actions = vec![commit_info("WRITE"), null_partition_add];
+    assert_eq!(detect_delete(&[(7, winner_actions)]), None);
+}
+
+#[rstest]
+#[case::null_value(json!({"date": null}))]
+#[case::missing_key(json!({}))]
+fn is_null_predicate_matches_null_partition_value(#[case] partition_values: Value) {
+    // `Add` can't hold a null partition value, so the test edits the add's JSON.
+    let mut null_partition_add = add("f7", DELETED_DATE);
+    null_partition_add["add"]["partitionValues"] = partition_values;
+    let result = detect_with(
+        |facts| set_partition_predicate(facts, Some(Arc::new(col!("date").is_null()))),
+        &[DELETED_FILE],
+        &[DELETED_FILE],
+        &[(7, vec![commit_info("WRITE"), null_partition_add])],
+    );
+    assert_eq!(
+        result,
+        conflict(7, Some("WRITE"), occ(OccCheck::ReadAppend))
+    );
 }
 
 #[rstest]
@@ -1067,23 +1187,29 @@ fn timestamp_partition_is_read_in_connector_timezone(
     facts.read_scope = files_scope(
         &relations.read_files,
         schema_ref! { nullable "ts": TIMESTAMP },
-        Some(Arc::new(col!("ts").eq(lit(instant)))),
+        Some(equals("ts", instant)),
         options,
     );
     let detection = relations.detect(&facts, &table.winners(READ_VERSION));
     assert_eq!(outcome(detection), expected);
 }
 
-/// Sets the partition predicate of a files-scoped T.
-fn set_partition_predicate(facts: &mut LoserFacts, predicate: Option<PredicateRef>) {
+/// The partition schema and partition predicate of a files-scoped T.
+fn partition_filter_mut(facts: &mut LoserFacts) -> (&mut SchemaRef, &mut Option<PredicateRef>) {
     let ReadScope::Files {
+        partition_schema,
         partition_predicate,
         ..
     } = &mut facts.read_scope
     else {
         panic!("expected a files-scoped read");
     };
-    *partition_predicate = predicate;
+    (partition_schema, partition_predicate)
+}
+
+/// Sets the partition predicate of a files-scoped T.
+fn set_partition_predicate(facts: &mut LoserFacts, predicate: Option<PredicateRef>) {
+    *partition_filter_mut(facts).1 = predicate;
 }
 
 #[rstest]
@@ -1103,37 +1229,36 @@ fn set_partition_predicate(facts: &mut LoserFacts, predicate: Option<PredicateRe
     DELETED_DATE,
     None,
 )]
+#[case::or_of_scan_predicates_matches_either_partition(
+    |facts: &mut LoserFacts| {
+        let read_partition = |value| col!("date").eq(lit(date(value)));
+        let predicate = Predicate::or(read_partition(DELETED_DATE), read_partition(OTHER_DATE));
+        set_partition_predicate(facts, Some(Arc::new(predicate)));
+    },
+    OTHER_DATE,
+    conflict(7, Some("WRITE"), occ(OccCheck::ReadAppend)),
+)]
 fn partition_predicate_selects_adds(
     #[case] adjust: fn(&mut LoserFacts),
-    #[case] date: &str,
+    #[case] add_date: &str,
     #[case] expected: Option<Conflict>,
 ) {
-    let conflict = detect_with(
+    let result = detect_with(
         adjust,
         &[DELETED_FILE],
         &[DELETED_FILE],
-        &[(7, vec![commit_info("WRITE"), add("f7", date)])],
+        &[(7, vec![commit_info("WRITE"), add("f7", add_date)])],
     );
-    assert_eq!(conflict, expected);
+    assert_eq!(result, expected);
 }
 
 #[rstest]
-#[case::none_matches_every_add(None, conflict(7, Some("WRITE"), occ(OccCheck::ReadAppend)))]
-#[case::false_matches_no_add(Some(Arc::new(Predicate::FALSE)), None)]
-fn unpartitioned_table_applies_constant_partition_predicate(
-    #[case] predicate: Option<PredicateRef>,
-    #[case] expected: Option<Conflict>,
-) {
-    let conflict = detect_with(
+#[case::none(None)]
+#[case::false_predicate(Some(Arc::new(Predicate::FALSE)))]
+fn unpartitioned_table_ignores_partition_predicate(#[case] predicate: Option<PredicateRef>) {
+    let result = detect_with(
         |facts| {
-            let ReadScope::Files {
-                partition_schema,
-                partition_predicate,
-                ..
-            } = &mut facts.read_scope
-            else {
-                panic!("expected a files-scoped read");
-            };
+            let (partition_schema, partition_predicate) = partition_filter_mut(facts);
             *partition_schema = schema_ref! {};
             *partition_predicate = predicate;
         },
@@ -1144,5 +1269,8 @@ fn unpartitioned_table_applies_constant_partition_predicate(
             vec![commit_info("WRITE"), line(Action::Add(base_add("f7", &[])))],
         )],
     );
-    assert_eq!(conflict, expected);
+    assert_eq!(
+        result,
+        conflict(7, Some("WRITE"), occ(OccCheck::ReadAppend))
+    );
 }

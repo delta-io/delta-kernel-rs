@@ -1,13 +1,11 @@
 //! Conflict detection with winners from real tables.
 //!
-//! T is the loser transaction. Each test builds T's facts by hand. T's read and remove sets come
+//! T is the losing transaction. Each test builds T's facts by hand. T's read and remove sets come
 //! from a scan of T's snapshot. Kernel-written winners come from Kernel transactions on a table
 //! that each test creates, or on the `partition_cm/name` fixture. The other winners come from
 //! fixture tables that Delta Spark, Databricks Runtime and delta-rs wrote. Each expected result
 //! matches the Delta Spark `ConflictChecker` outcome. Where Kernel reports a different rule or
 //! version, the test comment says so.
-
-use std::sync::Arc;
 
 use ::test_utils::{AddFilePartitionKeyModify, modify_add_file_partition_keys, replace_column};
 use rstest::rstest;
@@ -17,15 +15,14 @@ use url::Url;
 use super::decision::{Conflict, WinnerRule};
 use super::occ_plan::OccCheck;
 use super::tests::{
-    LoserRelations, conflict, delete_loser, files_scope, make_optimize, no_conflict_summaries, occ,
-    outcome, winner, winners_after,
+    LoserRelations, conflict, delete_loser, equals, files_scope, make_optimize,
+    no_conflict_summaries, occ, outcome, winner, winners_after,
 };
 use super::*;
 use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::sync::SyncEngine;
-use crate::expressions::{Expression, Scalar, lit};
-use crate::scan::state::ScanFile;
+use crate::scan::state::ScanFile as ScanStateFile;
 use crate::schema::{SchemaRef, schema_ref};
 use crate::table_features::ColumnMappingMode;
 use crate::transaction::create_table::create_table;
@@ -169,6 +166,12 @@ fn commit_app_id(url: &str, app_id: &str) -> Version {
     )
 }
 
+/// Copies the fixture `name` from `kernel/tests/data` into a temporary directory.
+fn fixture_table(name: &str) -> (String, TempDir) {
+    let (url, dir) = copy_test_table(name).unwrap();
+    (url.to_string(), dir)
+}
+
 // === Read-side helpers ===
 
 fn snapshot_at(url: &str, version: Version) -> SnapshotRef {
@@ -191,7 +194,7 @@ fn scan_paths(snapshot: &SnapshotRef, predicate: Option<PredicateRef>) -> Vec<St
     for metadata in scan.scan_metadata(&engine).unwrap() {
         paths = metadata
             .unwrap()
-            .visit_scan_files(paths, |paths: &mut Vec<String>, file: ScanFile| {
+            .visit_scan_files(paths, |paths: &mut Vec<String>, file: ScanStateFile| {
                 paths.push(file.path)
             })
             .unwrap();
@@ -201,11 +204,6 @@ fn scan_paths(snapshot: &SnapshotRef, predicate: Option<PredicateRef>) -> Vec<St
 
 fn as_strs(paths: &[String]) -> Vec<&str> {
     Vec::from_iter(paths.iter().map(String::as_str))
-}
-
-/// The predicate `column = value`.
-fn equals(column: &str, value: impl Into<Scalar>) -> PredicateRef {
-    Arc::new(Expression::column([column]).eq(lit(value)))
 }
 
 /// Relations and facts of a DELETE that reads and removes the files that `partition_predicate`
@@ -245,23 +243,6 @@ fn delete_partition_a(url: &str) -> (LoserRelations, LoserFacts) {
 /// `url`.
 fn detect_in(url: &str, relations: &LoserRelations, facts: &LoserFacts) -> Option<Conflict> {
     outcome(relations.detect(facts, &winners_after(url, facts.read_version)))
-}
-
-/// The kind of the loser transaction in a fixture test.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Loser {
-    Delete,
-    Optimize,
-}
-
-impl Loser {
-    /// Returns `facts` for this kind of loser.
-    fn facts(self, mut facts: LoserFacts) -> LoserFacts {
-        if self == Loser::Optimize {
-            make_optimize(&mut facts);
-        }
-        facts
-    }
 }
 
 // === Kernel-written winners ===
@@ -345,57 +326,39 @@ fn kernel_winner_remove_conflicts_only_when_t_read_the_file(
     assert_eq!(detect_in(&url, &relations, &facts), expected);
 }
 
-#[test]
-fn kernel_delete_of_unread_file_reports_delete_delete() {
-    // The winner removes `FILE_A`, and T also removes it without reading it. Only the
-    // delete-delete check applies. A real DELETE reads the files it removes, so this T is
-    // synthetic.
-    let (url, _dir) = kernel_table(&[]);
-    commit_remove(&url, UpdateTableOperation::Delete, true, "a");
-    let relations = LoserRelations::new(&[FILE_A], &[]);
-    let facts = delete_loser(
-        1,
-        files_scope(
-            &relations.read_files,
-            schema_ref! { nullable "part": STRING },
-            Some(equals("part", "a")),
-            MapToStructOptions::default(),
-        ),
-    );
-    assert_eq!(
-        detect_in(&url, &relations, &facts),
-        conflict(2, Some("DELETE"), occ(OccCheck::DeleteDelete))
-    );
-}
-
 #[rstest]
+// Delta Spark's `checkIfDomainMetadataConflict` fails T when both sides write one user domain.
 #[case::same_domain_fails(
-    "app.x",
+    |url: &str| commit_domain(url, "app.x"),
+    |facts: &mut LoserFacts| facts.written_domains = vec!["app.x".to_string()],
     conflict(2, Some("WRITE"), winner(WinnerRule::DomainConflict))
 )]
-#[case::other_domain_passes("app.y", None)]
-fn kernel_domain_written_by_both(#[case] winner_domain: &str, #[case] expected: Option<Conflict>) {
-    // Delta Spark's `checkIfDomainMetadataConflict` fails T when both sides write one user domain.
-    let (url, _dir) = kernel_table(&[]);
-    commit_domain(&url, winner_domain);
-    let (relations, mut facts) = delete_partition_a(&url);
-    facts.written_domains = vec!["app.x".to_string()];
-    assert_eq!(detect_in(&url, &relations, &facts), expected);
-}
-
-#[rstest]
-#[case::read_app_id_fails("app-a", conflict(2, Some("WRITE"), winner(WinnerRule::TxnConflict)))]
-#[case::other_app_id_passes("app-b", None)]
-fn kernel_txn_winner_of_read_app_id(
-    #[case] winner_app_id: &str,
+#[case::other_domain_passes(
+    |url: &str| commit_domain(url, "app.y"),
+    |facts: &mut LoserFacts| facts.written_domains = vec!["app.x".to_string()],
+    None
+)]
+// Delta Spark's `checkForUpdatedApplicationTransactionIdsThatCurrentTxnDependsOn` fails T when the
+// winner writes an app ID that T read.
+#[case::read_app_id_fails(
+    |url: &str| commit_app_id(url, "app-a"),
+    |facts: &mut LoserFacts| facts.read_app_ids = vec!["app-a".to_string()],
+    conflict(2, Some("WRITE"), winner(WinnerRule::TxnConflict))
+)]
+#[case::other_app_id_passes(
+    |url: &str| commit_app_id(url, "app-b"),
+    |facts: &mut LoserFacts| facts.read_app_ids = vec!["app-a".to_string()],
+    None
+)]
+fn kernel_domain_or_txn_winner(
+    #[case] commit: fn(&str) -> Version,
+    #[case] adjust: fn(&mut LoserFacts),
     #[case] expected: Option<Conflict>,
 ) {
-    // Delta Spark's `checkForUpdatedApplicationTransactionIdsThatCurrentTxnDependsOn` fails T when
-    // the winner writes an app ID that T read.
     let (url, _dir) = kernel_table(&[]);
-    commit_app_id(&url, winner_app_id);
+    commit(&url);
     let (relations, mut facts) = delete_partition_a(&url);
-    facts.read_app_ids = vec!["app-a".to_string()];
+    adjust(&mut facts);
     assert_eq!(detect_in(&url, &relations, &facts), expected);
 }
 
@@ -479,12 +442,6 @@ fn kernel_append_matches_physical_partition_column(
 
 // === Fixture-table winners ===
 
-/// Copies the fixture `name` from `kernel/tests/data` into a temporary directory.
-fn fixture_table(name: &str) -> (String, TempDir) {
-    let (url, dir) = copy_test_table(name).unwrap();
-    (url.to_string(), dir)
-}
-
 #[rstest]
 #[case::delete_of_partition_zero_conflicts_with_winner_delete(
     0,
@@ -507,7 +464,7 @@ fn cdf_table_partitioned_delete(#[case] partition: i64, #[case] expected: Option
 }
 
 #[test]
-fn cdf_table_partitioned_winners_in_other_partitions_leave_summaries() {
+fn winners_in_other_partitions_give_no_conflict() {
     // Version 2 is the only winner of T at version 1. It is a DELETE with no added files. Delta
     // Spark's checks find no overlap with T's files, so T passes.
     let (url, _tmp) = fixture_table("cdf-table-partitioned");
@@ -528,10 +485,17 @@ fn cdf_table_partitioned_winners_in_other_partitions_leave_summaries() {
 #[rstest]
 #[case::delete_conflicts_with_delete_removing_its_files(
     "cdf-table-delete-unconditional",
+    0,
+    |_: &mut LoserFacts| {},
     conflict(1, Some("DELETE"), occ(OccCheck::ReadDelete))
 )]
+// Under WriteSerializable, a non-blind add conflicts on an unpartitioned table. Delta Spark has no
+// partition predicate to filter it. A removed file that T read also conflicts. When both checks
+// fire, the add check reports first.
 #[case::delete_conflicts_with_non_blind_add_on_unpartitioned_table(
     "cdf-table-delete-conditional-two-rows",
+    0,
+    |_: &mut LoserFacts| {},
     conflict(1, Some("DELETE"), occ(OccCheck::ReadAppend))
 )]
 // Version 1 of `type-widening` sets a table property. It upgrades the protocol and changes the
@@ -539,17 +503,72 @@ fn cdf_table_partitioned_winners_in_other_partitions_leave_summaries() {
 // version, but reports the protocol rule, because `WinnerRule` lists it first.
 #[case::winner_that_changes_protocol_and_metadata_fails_at_that_version(
     "type-widening",
+    0,
+    |_: &mut LoserFacts| {},
     conflict(1, Some("SET TBLPROPERTIES"), winner(WinnerRule::ProtocolChanged))
 )]
-fn fixture_delete_of_every_file_at_version_zero(
+// A DV update removes a file and adds it back with the same path. The re-added file is a non-blind
+// add, so a DELETE conflicts on the add. An OPTIMIZE drops to SnapshotIsolation, so only the
+// removal conflicts.
+#[case::dv_update_with_commit_info_removes_read_file_for_optimize(
+    "table-with-dv-small",
+    0,
+    make_optimize,
+    conflict(1, Some("DELETE"), occ(OccCheck::ReadDelete))
+)]
+#[case::dv_update_with_commit_info_appends_for_delete(
+    "table-with-dv-small",
+    0,
+    |_: &mut LoserFacts| {},
+    conflict(1, Some("DELETE"), occ(OccCheck::ReadAppend))
+)]
+#[case::dv_update_without_commit_info_removes_read_file_for_optimize(
+    "cdf-table-with-dv",
+    0,
+    make_optimize,
+    conflict(1, None, occ(OccCheck::ReadDelete))
+)]
+#[case::dv_update_without_commit_info_appends_for_delete(
+    "cdf-table-with-dv",
+    0,
+    |_: &mut LoserFacts| {},
+    conflict(1, None, occ(OccCheck::ReadAppend))
+)]
+// Version 3 is an OPTIMIZE with `dataChange=false`. It removes both files that T read at version 2.
+// Delta Spark's read-delete check does not depend on `dataChange`, and an OPTIMIZE loser skips the
+// add check.
+#[case::optimize_removes_read_files_under_snapshot_isolation(
+    "cdf-table-with-cdc-and-dvs",
+    2,
+    make_optimize,
+    conflict(3, Some("OPTIMIZE"), occ(OccCheck::ReadDelete))
+)]
+// T reads the single file at version 3. Version 4 is a blind-append WRITE that adds a file. Under
+// WriteSerializable, Delta Spark skips that add, so version 5 reports first. Version 5 is a
+// non-blind DELETE that adds a file, which conflicts with T. Under Serializable, the blind add at
+// version 4 counts.
+#[case::write_serializable_skips_blind_append_winner(
+    "cdf-table-with-cdc-and-dvs",
+    3,
+    |facts: &mut LoserFacts| facts.isolation_level = IsolationLevel::WriteSerializable,
+    conflict(5, Some("DELETE"), occ(OccCheck::ReadAppend))
+)]
+#[case::serializable_counts_blind_append_winner(
+    "cdf-table-with-cdc-and-dvs",
+    3,
+    |facts: &mut LoserFacts| facts.isolation_level = IsolationLevel::Serializable,
+    conflict(4, Some("WRITE"), occ(OccCheck::ReadAppend))
+)]
+fn fixture_loser_that_read_every_file(
     #[case] table: &str,
+    #[case] read_version: Version,
+    #[case] adjust: fn(&mut LoserFacts),
     #[case] expected: Option<Conflict>,
 ) {
-    // T reads every file at version 0. Under WriteSerializable, a non-blind add conflicts on an
-    // unpartitioned table, because Delta Spark has no partition predicate to filter it. A removed
-    // file that T read also conflicts. When both checks fire, the add check reports first.
+    // T reads and removes every file at `read_version`.
     let (url, _tmp) = fixture_table(table);
-    let (relations, facts) = delete_all(&snapshot_at(&url, 0));
+    let (relations, mut facts) = delete_all(&snapshot_at(&url, read_version));
+    adjust(&mut facts);
     assert_eq!(detect_in(&url, &relations, &facts), expected);
 }
 
@@ -565,54 +584,23 @@ fn cdc_only_winners_pass_and_keep_their_operations() {
 }
 
 #[rstest]
-#[case::dv_update_with_commit_info_removes_read_file_for_optimize(
-    "table-with-dv-small",
-    Loser::Optimize,
-    conflict(1, Some("DELETE"), occ(OccCheck::ReadDelete))
-)]
-#[case::dv_update_with_commit_info_appends_for_delete(
-    "table-with-dv-small",
-    Loser::Delete,
-    conflict(1, Some("DELETE"), occ(OccCheck::ReadAppend))
-)]
-#[case::dv_update_without_commit_info_removes_read_file_for_optimize(
-    "cdf-table-with-dv",
-    Loser::Optimize,
-    conflict(1, None, occ(OccCheck::ReadDelete))
-)]
-#[case::dv_update_without_commit_info_appends_for_delete(
-    "cdf-table-with-dv",
-    Loser::Delete,
-    conflict(1, None, occ(OccCheck::ReadAppend))
-)]
-fn dv_update_winner_removes_and_adds_one_path(
-    #[case] table: &str,
-    #[case] loser: Loser,
-    #[case] expected: Option<Conflict>,
-) {
-    // A DV update removes a file and adds it back with the same path. The re-added file is a
-    // non-blind add, so a DELETE conflicts on the add. An OPTIMIZE drops to SnapshotIsolation, so
-    // only the removal conflicts.
-    let (url, _tmp) = fixture_table(table);
-    let (relations, facts) = delete_all(&snapshot_at(&url, 0));
-    let facts = loser.facts(facts);
-    assert_eq!(detect_in(&url, &relations, &facts), expected);
-}
-
-#[rstest]
 #[case::optimize_of_partition_zero_conflicts_with_dv_update(
-    Loser::Optimize,
+    make_optimize,
     0,
     conflict(1, Some("DELETE"), occ(OccCheck::ReadDelete))
 )]
 #[case::delete_of_partition_two_conflicts_with_dv_append(
-    Loser::Delete,
+    |_: &mut LoserFacts| {},
     2,
     conflict(2, Some("DELETE"), occ(OccCheck::ReadAppend))
 )]
-#[case::delete_of_partition_one_passes_because_no_winner_touches_it(Loser::Delete, 1, None)]
+#[case::delete_of_partition_one_passes_because_no_winner_touches_it(
+    |_: &mut LoserFacts| {},
+    1,
+    None
+)]
 fn partitioned_dv_winners_conflict_only_in_their_partitions(
-    #[case] loser: Loser,
+    #[case] adjust: fn(&mut LoserFacts),
     #[case] partition: i32,
     #[case] expected: Option<Conflict>,
 ) {
@@ -623,12 +611,12 @@ fn partitioned_dv_winners_conflict_only_in_their_partitions(
     let url = Url::from_directory_path(dir.path().join("dv-partitioned-with-checkpoint/delta"))
         .unwrap()
         .to_string();
-    let (relations, facts) = delete_selecting(
+    let (relations, mut facts) = delete_selecting(
         &snapshot_at(&url, 0),
         schema_ref! { nullable "part": INTEGER },
         Some(equals("part", partition)),
     );
-    let facts = loser.facts(facts);
+    adjust(&mut facts);
     assert_eq!(detect_in(&url, &relations, &facts), expected);
 }
 
@@ -674,7 +662,7 @@ fn winner_rule_is_reported_before_add_check_of_earlier_winner() {
 #[test]
 fn blind_append_passes_over_append_winners_on_unpartitioned_table() {
     // A blind append reads nothing, so Delta Spark skips the add check for it. The three winners
-    // add files and write `txn` actions, but none of their app IDs is read by T.
+    // add files and write `txn` actions. T reads none of their app IDs.
     let (url, _tmp) = fixture_table("app-txn-with-last-updated");
     let relations = LoserRelations::new(&[], &[]);
     let scope = files_scope(
@@ -696,41 +684,4 @@ fn blind_append_passes_over_append_winners_on_unpartitioned_table() {
             .iter()
             .all(|s| s.operation.as_deref() == Some("WRITE"))
     );
-}
-
-#[test]
-fn optimize_removes_read_files_under_snapshot_isolation() {
-    // Version 3 is an OPTIMIZE with `dataChange=false`. It removes both files that T read at
-    // version 2. Delta Spark's read-delete check does not depend on `dataChange`, and an
-    // OPTIMIZE loser skips the add check.
-    let (url, _tmp) = fixture_table("cdf-table-with-cdc-and-dvs");
-    let (relations, facts) = delete_all(&snapshot_at(&url, 2));
-    let facts = Loser::Optimize.facts(facts);
-    assert_eq!(
-        detect_in(&url, &relations, &facts),
-        conflict(3, Some("OPTIMIZE"), occ(OccCheck::ReadDelete))
-    );
-}
-
-#[rstest]
-#[case::write_serializable_skips_blind_append_winner(
-    IsolationLevel::WriteSerializable,
-    conflict(5, Some("DELETE"), occ(OccCheck::ReadAppend))
-)]
-#[case::serializable_counts_blind_append_winner(
-    IsolationLevel::Serializable,
-    conflict(4, Some("WRITE"), occ(OccCheck::ReadAppend))
-)]
-fn blind_append_winner_under_isolation_level(
-    #[case] isolation_level: IsolationLevel,
-    #[case] expected: Option<Conflict>,
-) {
-    // T reads the single file at version 3. Version 4 is a blind-append WRITE that adds a file.
-    // Under WriteSerializable, Delta Spark skips that add, so version 5 reports first. Version 5 is
-    // a non-blind DELETE that adds a file, which conflicts with T. Under Serializable, the blind
-    // add at version 4 counts.
-    let (url, _tmp) = fixture_table("cdf-table-with-cdc-and-dvs");
-    let (relations, mut facts) = delete_all(&snapshot_at(&url, 3));
-    facts.isolation_level = isolation_level;
-    assert_eq!(detect_in(&url, &relations, &facts), expected);
 }

@@ -2,11 +2,11 @@
 
 use std::sync::LazyLock;
 
-use super::occ_plan::{CHECK, OccBranchVersions, OccCheck};
+use super::occ_plan::{CHECK, OccCheck};
 use super::winner_check_plan::{
     BACKFILL_CONFLICT, DOMAIN_CONFLICT, IN_COMMIT_TIMESTAMP, IS_BLIND_APPEND, IS_MANIFEST_COMMIT,
     METADATA_CHANGED, OPERATION, PROTOCOL_CHANGED, REMOVES_ROW_TRACKING, ROW_ID_HIGH_WATER_MARK,
-    ROW_TRACKING_BACKFILL_OPERATION, ROW_TRACKING_COUNT, TXN_CONFLICT, WINNER_CHECK_OUTPUT_SCHEMA,
+    ROW_TRACKING_BACKFILL_OPERATION, TXN_CONFLICT, WINNER_CHECK_OUTPUT_SCHEMA, WRITES_ROW_TRACKING,
 };
 use super::{LoserFacts, VERSION};
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
@@ -63,12 +63,11 @@ pub(crate) struct WinnerSummary {
     pub(crate) is_manifest_commit: bool,
     /// The winner's `delta.rowTracking` high-water mark, if the winner writes one.
     pub(crate) row_id_high_water_mark: Option<i64>,
-    /// The number of live `delta.rowTracking` domain actions in the winner. A tombstone does not
-    /// count.
-    pub(crate) row_tracking_count: i64,
+    /// The winner writes a live `delta.rowTracking` domain action. A tombstone does not count.
+    pub(crate) writes_row_tracking: bool,
     /// The winner removes the `delta.rowTracking` domain.
     pub(crate) removes_row_tracking: bool,
-    /// The rules that the winner breaks, in [`WinnerRule`] order.
+    /// The rules that the winner breaks.
     pub(crate) violations: Vec<WinnerRule>,
 }
 
@@ -107,26 +106,16 @@ pub(crate) fn first_winner_conflict(summaries: &[WinnerSummary]) -> Option<Confl
     })
 }
 
-/// Picks the winner versions that each OCC check scans.
-///
-/// A violation at any checked version fails T. The delete checks scan every winner, unless T is a
-/// blind append, which reads and removes no file. `read_append` checks no winner when:
-///
-/// - T is a blind append;
-/// - T is a row-tracking backfill;
-/// - T runs at SnapshotIsolation.
-///
-/// `read_append` also skips backfill winners. Under WriteSerializable, it skips blind-append
-/// winners unless T changes metadata.
-pub(crate) fn select_occ_branch_versions(
+/// Returns the winner versions that `read_append` checks.
+pub(crate) fn select_read_append_versions(
     facts: &LoserFacts,
     summaries: &[WinnerSummary],
-) -> OccBranchVersions {
+) -> Vec<Version> {
     let isolation_level = facts.effective_isolation_level();
     let check_read_append = !facts.is_blind_append
         && !facts.is_row_tracking_backfill
         && isolation_level != IsolationLevel::SnapshotIsolation;
-    let read_append = match check_read_append {
+    match check_read_append {
         false => Vec::new(),
         true => Vec::from_iter(
             summaries
@@ -139,14 +128,6 @@ pub(crate) fn select_occ_branch_versions(
                 })
                 .map(|summary| summary.version),
         ),
-    };
-    let delete_checks = match facts.is_blind_append {
-        true => Vec::new(),
-        false => Vec::from_iter(summaries.iter().map(|summary| summary.version)),
-    };
-    OccBranchVersions {
-        read_append,
-        delete_checks,
     }
 }
 
@@ -194,7 +175,7 @@ impl RowVisitor for WinnerSummaryVisitor {
             in_commit_timestamp,
             is_manifest_commit,
             row_id_high_water_mark,
-            row_tracking_count,
+            writes_row_tracking,
             removes_row_tracking,
             protocol_changed,
             metadata_changed,
@@ -243,7 +224,7 @@ impl RowVisitor for WinnerSummaryVisitor {
                 is_manifest_commit: is_manifest_commit.get(row, IS_MANIFEST_COMMIT)?,
                 row_id_high_water_mark: row_id_high_water_mark
                     .get_opt(row, ROW_ID_HIGH_WATER_MARK)?,
-                row_tracking_count: row_tracking_count.get(row, ROW_TRACKING_COUNT)?,
+                writes_row_tracking: writes_row_tracking.get(row, WRITES_ROW_TRACKING)?,
                 removes_row_tracking: removes_row_tracking.get(row, REMOVES_ROW_TRACKING)?,
                 violations,
             });

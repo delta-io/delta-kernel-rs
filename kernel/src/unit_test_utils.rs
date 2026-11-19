@@ -305,6 +305,7 @@ pub(crate) fn nullable_add_files(paths: &[&str]) -> RecordBatch {
 }
 
 /// A `stats` column for `batch` recording one record per file, which row tracking requires.
+#[cfg(any(feature = "declarative-plans", feature = "adaptive-metadata-in-dev"))]
 pub(crate) fn one_record_stats(batch: &RecordBatch) -> ArrayRef {
     let schema = batch.schema();
     let DataType::Struct(fields) = schema.field_with_name("stats").unwrap().data_type() else {
