@@ -38,8 +38,8 @@ use crate::engine::data_file_writer_options;
 use crate::expressions::{ArrayData, ColumnName, PredicateRef, Scalar};
 use crate::object_store::DynObjectStore;
 use crate::plans::ir::nodes::{
-    Aggregate, DynamicScan, FILE_META_SCHEMA, FileType, Operator, Project, RelationId, RelationRef,
-    ScanFile, ScanJson, ScanParquet, SemiJoin, Values, WriteJson, WriteParquet,
+    DynamicScan, FILE_META_SCHEMA, FileType, Operator, Project, RelationId, RelationRef, ScanFile,
+    ScanJson, ScanParquet, SemiJoin, StatsAgg, Values, WriteJson, WriteParquet,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult, ScopedPlanExecutor};
@@ -333,26 +333,15 @@ impl SyncPlanExecutor {
         let stats = if write.stats_agg.is_empty() {
             vec![]
         } else {
-            let names = write
-                .stats_agg
-                .iter()
-                .map(|stats| stats.name.as_str())
-                .collect::<Vec<_>>();
-            let aggregate = Aggregate {
-                group_by: vec![],
-                aggs: write
-                    .stats_agg
-                    .iter()
-                    .map(|stats| stats.agg.clone())
-                    .collect(),
-                schema: write.schema.project(&names)?,
-            };
-            eval_aggregate(&aggregate, &input)?
+            eval_aggregate(
+                &StatsAgg::to_aggregate(&write.stats_agg, &write.schema)?,
+                &input,
+            )?
         };
         let output_schema = Arc::new(write.schema.as_ref().try_into_arrow()?);
         let schema: Arc<ArrowSchema> = Arc::new(write.write_schema.as_ref().try_into_arrow()?);
         let options = data_file_writer_options(&schema, &write.write_schema)?;
-        let columns = (0..write.write_schema.num_fields()).collect::<Vec<_>>();
+        let columns = (0..write.write_schema.num_fields()).collect_vec();
         // Input order is preserved even when `ordered` is false.
         let batches = input.iter().map(|batch| {
             let batch = batch.project(&columns)?;

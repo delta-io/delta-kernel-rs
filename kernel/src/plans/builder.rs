@@ -49,7 +49,7 @@ use super::ir::nodes::{
 };
 use super::ir::plan::{Plan, PlanNode};
 use crate::expressions::{ColumnName, Expression, ExpressionRef, PredicateRef, Scalar, StructData};
-use crate::schema::compare::{data_types_equal_for_write, data_types_equal_ordered};
+use crate::schema::compare::{data_types_equal_ignoring_metadata, data_types_equal_ordered};
 use crate::schema::{SchemaRef, ToSchema};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::utils::CollectInto;
@@ -354,7 +354,7 @@ impl PlanBuilder {
             for (source, field) in input.schema().fields().zip(write.write_schema.fields()) {
                 if source.name() != field.name()
                     || source.is_nullable() != field.is_nullable()
-                    || !data_types_equal_for_write(source.data_type(), field.data_type())
+                    || !data_types_equal_ignoring_metadata(source.data_type(), field.data_type())
                 {
                     return Err(KernelError::schema(format!(
                         "WriteParquet field {} must match its input prefix",

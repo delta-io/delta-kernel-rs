@@ -28,12 +28,16 @@ use crate::utils::require;
 /// Exact type equality, including nested field order.
 #[cfg(feature = "declarative-plans")]
 pub(crate) fn data_types_equal_ordered(left: &DataType, right: &DataType) -> bool {
-    left == right && data_types_equal_for_write(left, right)
+    left == right && data_types_equal_ignoring_metadata(left, right)
 }
 
-/// Matches ordered value types while allowing the writer to supply field metadata.
+/// Compares types recursively, ignoring struct-field metadata.
+///
+/// Field order, names, nullability, and type identity must match, including the distinction between
+/// structs, FILE, and Variant. UDT annotations must match; metadata within their SQL types is
+/// ignored.
 #[cfg(feature = "declarative-plans")]
-pub(crate) fn data_types_equal_for_write(left: &DataType, right: &DataType) -> bool {
+pub(crate) fn data_types_equal_ignoring_metadata(left: &DataType, right: &DataType) -> bool {
     match (left, right) {
         (DataType::Struct(left), DataType::Struct(right))
         | (DataType::Variant(left), DataType::Variant(right))
@@ -42,22 +46,22 @@ pub(crate) fn data_types_equal_for_write(left: &DataType, right: &DataType) -> b
                 && left.fields().zip(right.fields()).all(|(left, right)| {
                     left.name() == right.name()
                         && left.is_nullable() == right.is_nullable()
-                        && data_types_equal_for_write(left.data_type(), right.data_type())
+                        && data_types_equal_ignoring_metadata(left.data_type(), right.data_type())
                 })
         }
         (DataType::Array(left), DataType::Array(right)) => {
             left.contains_null() == right.contains_null()
-                && data_types_equal_for_write(left.element_type(), right.element_type())
+                && data_types_equal_ignoring_metadata(left.element_type(), right.element_type())
         }
         (DataType::Map(left), DataType::Map(right)) => {
             left.value_contains_null() == right.value_contains_null()
-                && data_types_equal_for_write(left.key_type(), right.key_type())
-                && data_types_equal_for_write(left.value_type(), right.value_type())
+                && data_types_equal_ignoring_metadata(left.key_type(), right.key_type())
+                && data_types_equal_ignoring_metadata(left.value_type(), right.value_type())
         }
         #[cfg(feature = "udt-in-dev")]
         (DataType::UserDefined(left), DataType::UserDefined(right)) => {
             left.annotation() == right.annotation()
-                && data_types_equal_for_write(left.sql_type(), right.sql_type())
+                && data_types_equal_ignoring_metadata(left.sql_type(), right.sql_type())
         }
         _ => left == right,
     }

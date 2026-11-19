@@ -200,6 +200,20 @@ impl StatsAgg {
             agg,
         }
     }
+
+    /// Creates an ungrouped aggregate from statistics and their resolved output fields.
+    /// `output_schema` must contain the resolved fields under their statistics names.
+    pub fn to_aggregate(stats: &[Self], output_schema: &StructType) -> KernelResult<Aggregate> {
+        let (names, aggs): (Vec<_>, Vec<_>) = stats
+            .iter()
+            .map(|stats| (stats.name.as_str(), stats.agg.clone()))
+            .unzip();
+        Ok(Aggregate {
+            group_by: vec![],
+            aggs,
+            schema: output_schema.project(&names)?,
+        })
+    }
 }
 
 /// An engine-assigned identifier for a relation retained by a
