@@ -3533,6 +3533,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_table_builder_removes_description_via_ffi() -> KernelResult<()> {
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_update_builder_remove_description", None);
+        let (_table_path, engine, builder) = create_table_txn_builder(
+            false,
+            &store,
+            &table_url,
+            vec![StructField::nullable("id", DataType::INTEGER)],
+        );
+        let builder = ok_or_panic(unsafe {
+            create_table_txn_builder_with_description(
+                builder,
+                ffi_str("table description"),
+                engine.shallow_copy(),
+            )
+        });
+        build_and_commit(builder, &engine);
+
+        let snapshot =
+            unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
+        let builder = unsafe {
+            ok_or_panic(new_update_table_txn_builder(
+                snapshot.shallow_copy(),
+                KernelUpdateTableOperation::AlterTable,
+                ffi_str("test-engine/1.0"),
+                false,
+                engine.shallow_copy(),
+            ))
+        };
+        let builder = unsafe { update_table_txn_builder_with_description_removed(builder) };
+        let txn =
+            ok_or_panic(unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
+        assert_eq!(unsafe { version_and_free(committed) }, 1);
+
+        let updated = unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
+        let description = unsafe { updated.as_ref() }
+            .table_configuration()
+            .metadata()
+            .description();
+        assert_eq!(description, None);
+        unsafe {
+            free_snapshot(updated);
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn update_table_commit_conflict_is_reported_through_ffi() -> KernelResult<()> {
         let (table_url, _store, engine) =
             setup_domain_metadata_table("test_update_commit_conflict", false).await?;

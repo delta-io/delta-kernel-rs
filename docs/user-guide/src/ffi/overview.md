@@ -236,7 +236,7 @@ feature is enabled; the rest are always available.
 | `update_table_txn_builder_with_commit_info` / `update_table_txn_with_commit_info` | Set connector commit information before writing or before commit |
 | `update_table_txn_builder_with_transaction_id` | Add an `(app_id, version)` pair for idempotent writes (see [Idempotent Writes](../writing/idempotent_writes.md)) |
 | `update_table_txn_builder_with_blind_append` | Assert blind-append semantics before `build()` |
-| `update_table_txn_builder_with_description` | Set a new table description |
+| `update_table_txn_builder_with_description` / `update_table_txn_builder_with_description_removed` | Set or remove the table description |
 | `update_table_txn_builder_add_column` / `update_table_txn_builder_add_column_at` / `update_table_txn_builder_set_nullable` | Configure schema evolution before `build()` |
 | `update_table_txn_builder_with_domain_metadata` / `update_table_txn_builder_with_domain_metadata_removed` | Add or remove user domain metadata |
 | `update_table_txn_builder_build` / `update_table_txn_builder_build_with_committer` | Consume the builder and produce a transaction |

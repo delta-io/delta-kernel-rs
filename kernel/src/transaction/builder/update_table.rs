@@ -68,7 +68,9 @@ pub struct UpdateTableBuilderState {
     /// [`with_table_properties_added`](UpdateTableTransactionBuilder::with_table_properties_added)
     /// call; later calls override earlier values for the same canonical key at build.
     properties_added: Vec<Vec<(String, String)>>,
-    description: Option<String>,
+    /// Set by the last call to `with_description` or `with_description_removed`. `Some(None)`
+    /// removes the description.
+    description: Option<Option<String>>,
     domain_metadata_removals: Vec<String>,
     is_blind_append: bool,
 }
@@ -258,9 +260,20 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     ///
     /// For `ALTER TABLE`, a requested description always emits Metadata, including when the table
     /// already has it. Data operations emit Metadata for it only when it differs from the current
-    /// description. Calling this method again replaces the previous description.
+    /// description. A later call to this method or to
+    /// [`with_description_removed`](Self::with_description_removed) replaces it.
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
-        self.local_state.description = Some(description.into());
+        self.local_state.description = Some(Some(description.into()));
+        self
+    }
+
+    /// Removes the table description.
+    ///
+    /// For `ALTER TABLE`, the removal always emits Metadata, including when the table has no
+    /// description. Data operations emit Metadata for it only when the table has a description. A
+    /// later call to this method or to [`with_description`](Self::with_description) replaces it.
+    pub fn with_description_removed(mut self) -> Self {
+        self.local_state.description = Some(None);
         self
     }
 
@@ -459,7 +472,7 @@ fn try_new_update_table<MODE: ExecutionMode>(
     // drop it when it equals the current one.
     let description = description.filter(|description| {
         operation == UpdateTableOperation::AlterTable
-            || effective_table_config.metadata().description() != Some(description.as_str())
+            || effective_table_config.metadata().description() != description.as_deref()
     });
     let should_emit_metadata = has_schema_changes || has_property_changes || description.is_some();
     let effective_table_config = if has_property_changes {
@@ -548,7 +561,7 @@ fn apply_table_properties_added(
 
 fn apply_description(
     table_config: TableConfiguration,
-    description: String,
+    description: Option<String>,
 ) -> Result<TableConfiguration> {
     let metadata = table_config
         .metadata()
@@ -1049,13 +1062,19 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn blind_append_rejects_description_changes() -> Result<()> {
+    #[rstest]
+    #[case::set_description(Some("table description"))]
+    #[case::remove_description(None)]
+    fn blind_append_rejects_description_changes(#[case] description: Option<&str>) -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
-        let error = snapshot
+        let builder = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
-            .with_blind_append()
-            .with_description("table description")
+            .with_blind_append();
+        let builder = match description {
+            Some(description) => builder.with_description(description),
+            None => builder.with_description_removed(),
+        };
+        let error = builder
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
             .unwrap_err();
 

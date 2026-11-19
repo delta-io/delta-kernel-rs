@@ -546,11 +546,12 @@ impl Metadata {
         self
     }
 
-    /// Returns a new Metadata with the description replaced, preserving all other fields.
+    /// Returns a new Metadata with the description replaced, preserving all other fields. `None`
+    /// removes the description.
     #[internal_api]
-    pub(crate) fn with_description(self, description: impl Into<String>) -> Self {
+    pub(crate) fn with_description(self, description: Option<String>) -> Self {
         Self {
-            description: Some(description.into()),
+            description,
             ..self
         }
     }

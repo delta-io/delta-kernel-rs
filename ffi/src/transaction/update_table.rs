@@ -580,7 +580,8 @@ pub unsafe extern "C" fn update_table_txn_builder_with_domain_metadata_removed(
 
 /// Sets a new description for the table.
 ///
-/// Repeated calls replace the previous description.
+/// The last call to this function or to [`update_table_txn_builder_with_description_removed`]
+/// wins.
 ///
 /// # Safety
 ///
@@ -599,6 +600,21 @@ pub unsafe extern "C" fn update_table_txn_builder_with_description(
     let result =
         description.map(|description| Box::new(builder.with_description(description)).into());
     unsafe { result.into_extern_result(&engine) }
+}
+
+/// Removes the table description.
+///
+/// The last call to this function or to [`update_table_txn_builder_with_description`] wins.
+///
+/// # Safety
+///
+/// `builder` must be valid and is consumed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn update_table_txn_builder_with_description_removed(
+    builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
+) -> Handle<ExclusiveUpdateTableTransactionBuilder> {
+    let builder = unsafe { *builder.into_inner() };
+    Box::new(builder.with_description_removed()).into()
 }
 
 /// Set an explicit row-tracking high-water mark for this transaction.
