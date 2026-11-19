@@ -2,15 +2,16 @@
 
 use std::sync::LazyLock;
 
-use super::occ_plan::{CHECK, OccCheck};
+use super::occ_plan::{CHECK, OccCheck, VIOLATION_SCHEMA};
 use super::winner_check_plan::{
     BACKFILL_CONFLICT, DOMAIN_CONFLICT, IN_COMMIT_TIMESTAMP, IS_BLIND_APPEND, IS_MANIFEST_COMMIT,
     METADATA_CHANGED, OPERATION, PROTOCOL_CHANGED, REMOVES_ROW_TRACKING, ROW_ID_HIGH_WATER_MARK,
-    ROW_TRACKING_BACKFILL_OPERATION, TXN_CONFLICT, WINNER_CHECK_OUTPUT_SCHEMA, WRITES_ROW_TRACKING,
+    TXN_CONFLICT, WINNER_CHECK_OUTPUT_SCHEMA, WRITES_ROW_TRACKING,
+    is_row_tracking_backfill_operation,
 };
-use super::{LoserFacts, VERSION};
+use super::{LoserFacts, VERSION, WinningCommit, winner_versions};
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::expressions::{ColumnName, column_name};
+use crate::expressions::ColumnName;
 use crate::plans::PlanResult;
 use crate::schema::{ColumnNamesAndTypes, DataType};
 use crate::table_properties::IsolationLevel;
@@ -23,14 +24,13 @@ use crate::{KernelError, KernelResult, Version};
 pub(crate) enum WinnerRule {
     /// The winner has a protocol action.
     ProtocolChanged,
-    /// The winner has a `metaData` action. The rule does not apply when T changes no metadata and
-    /// the winner's commit tags mark an identity-only update.
+    /// The winner has a `metaData` action that isn't an identity-only update that T accepts.
     MetadataChanged,
     /// The winner writes a domain that T writes, other than `delta.rowTracking`.
     DomainConflict,
     /// The winner writes a `txn` for an app ID that T read.
     TxnConflict,
-    /// The winner is a row-tracking backfill, and T removes or adds a file again.
+    /// The winner is a row-tracking backfill or unbackfill, and T removes or adds a file again.
     BackfillConflict,
 }
 
@@ -72,8 +72,10 @@ pub(crate) struct WinnerSummary {
 }
 
 impl WinnerSummary {
-    fn is_row_tracking_backfill(&self) -> bool {
-        self.operation.as_deref() == Some(ROW_TRACKING_BACKFILL_OPERATION)
+    fn is_row_tracking_backfill_or_unbackfill(&self) -> bool {
+        self.operation
+            .as_deref()
+            .is_some_and(is_row_tracking_backfill_operation)
     }
 }
 
@@ -112,23 +114,20 @@ pub(crate) fn select_read_append_versions(
     summaries: &[WinnerSummary],
 ) -> Vec<Version> {
     let isolation_level = facts.effective_isolation_level();
-    let check_read_append = !facts.is_blind_append
-        && !facts.is_row_tracking_backfill
-        && isolation_level != IsolationLevel::SnapshotIsolation;
-    match check_read_append {
-        false => Vec::new(),
-        true => Vec::from_iter(
-            summaries
-                .iter()
-                .filter(|summary| !summary.is_row_tracking_backfill())
-                .filter(|summary| {
-                    isolation_level != IsolationLevel::WriteSerializable
-                        || facts.changes_metadata
-                        || summary.is_blind_append != Some(true)
-                })
-                .map(|summary| summary.version),
-        ),
+    if facts.is_blind_append || isolation_level == IsolationLevel::SnapshotIsolation {
+        return Vec::new();
     }
+    Vec::from_iter(
+        summaries
+            .iter()
+            .filter(|summary| !summary.is_row_tracking_backfill_or_unbackfill())
+            .filter(|summary| {
+                isolation_level != IsolationLevel::WriteSerializable
+                    || facts.changes_metadata
+                    || summary.is_blind_append != Some(true)
+            })
+            .map(|summary| summary.version),
+    )
 }
 
 /// Reads the OCC plan output.
@@ -153,6 +152,68 @@ pub(crate) fn first_occ_conflict(
         operation,
         kind: ConflictKind::Occ(first.check),
     })
+}
+
+/// Returns an internal error unless `summaries` has one row for each winner, in order.
+///
+/// A winner gets no row when the executor reads no action from its commit file, for example an
+/// empty file. Kernel fails then, because it can't check that winner.
+pub(crate) fn ensure_winner_rows(
+    read_version: Version,
+    winners: &[WinningCommit],
+    summaries: &[WinnerSummary],
+) -> KernelResult<()> {
+    let rows = Vec::from_iter(summaries.iter().map(|summary| summary.version));
+    let versions = winner_versions(winners);
+    if rows != versions {
+        return Err(KernelError::internal_error(format!(
+            "Winner check rows {rows:?} do not match the winning commits {versions:?} after read \
+             version {read_version}"
+        )));
+    }
+    Ok(())
+}
+
+/// Returns an error when a winner is a manifest commit, because the plans don't read the actions
+/// nested in its `checkpoint` action.
+pub(crate) fn ensure_no_manifest_commit(summaries: &[WinnerSummary]) -> KernelResult<()> {
+    match summaries.iter().find(|summary| summary.is_manifest_commit) {
+        Some(summary) => Err(KernelError::unsupported(format!(
+            "Conflict detection does not support the manifest commit at version {}",
+            summary.version
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Returns an error when a winner removes the `delta.rowTracking` domain, or writes it without a
+/// readable high-water mark.
+///
+/// The next attempt needs a row ID high-water mark. A removed `delta.rowTracking` domain gives
+/// none, so Kernel can't tell how T's row IDs continue. A written domain gives no mark when its
+/// `configuration` fails to parse or has no `rowIdHighWaterMark`. Kernel fails then, because the
+/// next attempt would otherwise use an older mark. The missing-mark error omits the version,
+/// because a parse failure can null the marks of other winners in the same batch.
+pub(crate) fn ensure_row_tracking_marks(summaries: &[WinnerSummary]) -> KernelResult<()> {
+    if let Some(summary) = summaries
+        .iter()
+        .find(|summary| summary.removes_row_tracking)
+    {
+        return Err(KernelError::unsupported(format!(
+            "The winning commit at version {} removes the `delta.rowTracking` domain",
+            summary.version
+        )));
+    }
+    let missing = summaries
+        .iter()
+        .any(|summary| summary.writes_row_tracking && summary.row_id_high_water_mark.is_none());
+    if missing {
+        return Err(KernelError::generic(
+            "A winning commit has a `delta.rowTracking` domain without a readable \
+             rowIdHighWaterMark",
+        ));
+    }
+    Ok(())
 }
 
 // === Row visitors ===
@@ -238,18 +299,13 @@ struct OccViolationVisitor(Vec<OccViolation>);
 
 impl RowVisitor for OccViolationVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        static COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-            (
-                vec![column_name!(CHECK), column_name!(VERSION)],
-                vec![DataType::STRING, DataType::LONG],
-            )
-                .into()
-        });
+        static COLUMNS: LazyLock<ColumnNamesAndTypes> =
+            LazyLock::new(|| VIOLATION_SCHEMA.leaves(None));
         COLUMNS.as_ref()
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
-        let [check_getter, version_getter] = getters else {
+        let [version_getter, check_getter] = getters else {
             return Err(KernelError::internal_error(format!(
                 "Unexpected OCC getter count {}",
                 getters.len()

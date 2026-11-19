@@ -8,26 +8,24 @@
 //! 2. If no winner breaks a winner rule, the OCC plan ([`occ_plan()`]) checks the winners' file
 //!    actions. It returns one row for each check and version with a violation.
 //!
-//! The plan builders only describe the plans. [`decision`] reads the rows and decides the result.
-//! [`detect_conflicts()`] runs the two plans in order. Kernel reports the earliest winner-rule
-//! violation before any OCC violation.
+//! [`detect_conflicts()`] lists the order of the checks.
 //!
 //! # Differences from Delta Spark
 //!
-//! - Any winner protocol action fails T.
+//! - Any winner protocol action fails T. Delta Spark takes the winner's protocol, and fails T only
+//!   when T also writes a protocol, the winner drops a feature, or an opt-in conf applies.
 //! - A winner metadata action fails T, except an identity-only update whose tag is exactly `true`
-//!   while T changes no metadata. Delta Spark also accepts a winner that only enables some
-//!   features, such as row tracking, while T changes no metadata.
-//! - A row-tracking backfill winner fails any T that removes or adds a file again, whatever its
-//!   paths.
-//! - A winner's remove of a file that a row-tracking backfill T adds again fails T. Delta Spark
-//!   drops that file from the backfill.
-//! - For a row-tracking backfill T, Kernel doesn't check a winner that adds a file again without
-//!   removing it. The retry must drop T's re-add of that file, as Delta Spark does.
-//! - Kernel checks every winner rule before any file check. So it can report a later winner, or a
-//!   different rule, than Delta Spark reports.
-//! - A table-level SnapshotIsolation and, when no winner rule fails, a manifest-commit winner or a
-//!   `delta.rowTracking` tombstone fail detection with an `unsupported` error.
+//!   while T changes no metadata. Delta Spark also accepts the tag `TRUE`. It also accepts a winner
+//!   that only enables some features, such as row tracking, while T changes no metadata.
+//! - A row-tracking backfill or unbackfill winner fails any T that removes or adds a file again,
+//!   whatever its paths.
+//! - Kernel can report a later winner, or a different rule, than Delta Spark reports, because of
+//!   the order of the checks.
+//! - An empty winner commit fails detection with an error. Delta Spark reads no action from it and
+//!   finds no conflict.
+//! - These inputs fail detection with an `unsupported` error, at the step that
+//!   [`detect_conflicts()`] lists: a table-level SnapshotIsolation, a manifest-commit winner and a
+//!   `delta.rowTracking` tombstone.
 //!
 //! T's facts don't depend on the winners, because Kernel never rebases T between winners.
 
@@ -41,11 +39,11 @@ mod real_table_tests;
 mod tests;
 
 use decision::{
-    Conflict, WinnerSummary, first_occ_conflict, first_winner_conflict, read_occ_violations,
+    Conflict, WinnerSummary, ensure_no_manifest_commit, ensure_row_tracking_marks,
+    ensure_winner_rows, first_occ_conflict, first_winner_conflict, read_occ_violations,
     read_winner_summaries, select_read_append_versions,
 };
 use occ_plan::occ_plan;
-use serde::de::Error as _;
 use winner_check_plan::winner_check_plan;
 
 use crate::commit_range::CommitRange;
@@ -67,8 +65,8 @@ use crate::{FileMeta, KernelError, KernelResult, PredicateRef, Version, version_
 /// 4. the OCC checks;
 /// 5. the row-tracking checks.
 ///
-/// An error means that Kernel can't check T against the winners. The caller must fail T and not
-/// retry.
+/// An error from these checks means that Kernel can't check T against the winners, and the caller
+/// must fail T. Other errors come from the executor, for example a failed read.
 ///
 /// `file_actions` holds T's file actions with a `remove.path` column. Each `path` in
 /// `file_actions` and in the `read_files` of [`ReadScope::Files`] must be exactly as written in
@@ -124,19 +122,6 @@ pub(crate) struct WinningCommit {
 }
 
 impl WinningCommit {
-    /// Returns the commit files of `range` in ascending version order.
-    pub(crate) fn from_commit_range(range: &CommitRange) -> KernelResult<Vec<Self>> {
-        range
-            .commit_files()?
-            .map(|result| {
-                result.map(|commit| Self {
-                    version: commit.version,
-                    file: commit.location,
-                })
-            })
-            .collect()
-    }
-
     /// Returns the commit file as a scan input, with `version` as a constant on every row.
     pub(crate) fn scan_file(&self) -> KernelResult<ScanFile> {
         Ok(ScanFile {
@@ -146,16 +131,30 @@ impl WinningCommit {
     }
 }
 
+/// Returns the commit files of `range` as winners, in ascending version order.
+pub(crate) fn winning_commits(range: &CommitRange) -> KernelResult<Vec<WinningCommit>> {
+    range
+        .commit_files()?
+        .map(|result| {
+            result.map(|commit| WinningCommit {
+                version: commit.version,
+                file: commit.location,
+            })
+        })
+        .collect()
+}
+
 /// The facts about T that conflict detection needs.
 #[derive(Debug, Clone)]
 pub(crate) struct LoserFacts {
     /// T's read version. The winners start at `read_version + 1`.
     pub(crate) read_version: Version,
     /// The table's isolation level. It must be Serializable or WriteSerializable. When
-    /// `delta.isolationLevel` is unset, pass Serializable, the Delta default.
+    /// `delta.isolationLevel` is unset or doesn't parse, pass Serializable, the Delta default.
     /// [`LoserFacts::effective_isolation_level`] applies the downgrade.
     pub(crate) isolation_level: IsolationLevel,
-    /// T only adds files, so it reads nothing.
+    /// T is a blind append: it only adds files and depends on no table state that it read. This is
+    /// the value of T's `commitInfo.isBlindAppend`.
     pub(crate) is_blind_append: bool,
     /// At least one file action of T has `dataChange=true`.
     pub(crate) has_data_change: bool,
@@ -167,8 +166,6 @@ pub(crate) struct LoserFacts {
     /// T writes an action that no other field describes, for example `protocol` or `txn`. A
     /// `commitInfo` action does not count.
     pub(crate) has_other_actions: bool,
-    /// T's operation is a row-tracking backfill.
-    pub(crate) is_row_tracking_backfill: bool,
     /// T removes a file or adds a file again.
     pub(crate) rewrites_files: bool,
     /// The domains that T writes. A removal tombstone (`removed: true`) counts as a write.
@@ -196,12 +193,14 @@ impl LoserFacts {
         let can_downgrade = !self.has_data_change
             && !blocks_downgrade
             && match self.isolation_level {
+                IsolationLevel::Serializable => true,
                 IsolationLevel::WriteSerializable => !self.operation_changes_data,
-                _ => true,
+                IsolationLevel::SnapshotIsolation => false,
             };
-        match can_downgrade {
-            true => IsolationLevel::SnapshotIsolation,
-            false => self.isolation_level,
+        if can_downgrade {
+            IsolationLevel::SnapshotIsolation
+        } else {
+            self.isolation_level
         }
     }
 }
@@ -214,8 +213,7 @@ pub(crate) enum ReadScope {
     /// T read the files in `read_files`.
     Files {
         /// The files that T's scans returned, with a `path` column. Include every file that T adds
-        /// again, for example in a row-tracking backfill. Then a winner's remove of that file
-        /// fails T with `read_delete`.
+        /// again. Then a winner's remove of that file fails T with `read_delete`.
         read_files: RelationRef,
         /// T's read-time partition schema, keyed by physical names.
         partition_schema: SchemaRef,
@@ -234,8 +232,6 @@ pub(crate) enum ReadScope {
         map_to_struct_options: MapToStructOptions,
     },
 }
-
-// === Columns ===
 
 /// The column that holds the winner version. Each scan of a winner commit adds it as a constant.
 pub(crate) const VERSION: &str = "version";
@@ -259,68 +255,6 @@ fn ensure_winners_follow_read_version(
             "Winning commits {:?} must start at read version {read_version} + 1 with no version \
              gap",
             winner_versions(winners),
-        )));
-    }
-    Ok(())
-}
-
-/// Returns an internal error unless `summaries` has one row for each winner, in order.
-///
-/// A winner gets no row when the executor reads no action from its commit file, for example an
-/// empty file. Kernel fails then, because it can't check that winner.
-fn ensure_winner_rows(
-    read_version: Version,
-    winners: &[WinningCommit],
-    summaries: &[WinnerSummary],
-) -> KernelResult<()> {
-    let rows = Vec::from_iter(summaries.iter().map(|summary| summary.version));
-    let versions = winner_versions(winners);
-    if rows != versions {
-        return Err(KernelError::internal_error(format!(
-            "Winner check rows {rows:?} do not match the winning commits {versions:?} after read \
-             version {read_version}"
-        )));
-    }
-    Ok(())
-}
-
-/// Returns an error when a winner is a manifest commit, because the plans don't read the actions
-/// nested in its `checkpoint` action.
-fn ensure_no_manifest_commit(summaries: &[WinnerSummary]) -> KernelResult<()> {
-    match summaries.iter().find(|summary| summary.is_manifest_commit) {
-        Some(summary) => Err(KernelError::unsupported(format!(
-            "Conflict detection does not support the manifest commit at version {}",
-            summary.version
-        ))),
-        None => Ok(()),
-    }
-}
-
-/// Returns an error when a winner removes the `delta.rowTracking` domain, or writes it without a
-/// readable high-water mark.
-///
-/// The next attempt needs a row ID high-water mark. A removed `delta.rowTracking` domain gives
-/// none, so Kernel can't tell how T's row IDs continue. A `configuration` that fails to parse also
-/// yields no mark. Kernel fails then, because the next attempt would otherwise use an older mark.
-/// The missing-mark error omits the version, because a parse failure can null the marks of other
-/// winners in the same batch.
-fn ensure_row_tracking_marks(summaries: &[WinnerSummary]) -> KernelResult<()> {
-    if let Some(summary) = summaries
-        .iter()
-        .find(|summary| summary.removes_row_tracking)
-    {
-        return Err(KernelError::unsupported(format!(
-            "The winning commit at version {} removes the `delta.rowTracking` domain",
-            summary.version
-        )));
-    }
-    let missing = summaries
-        .iter()
-        .any(|summary| summary.writes_row_tracking && summary.row_id_high_water_mark.is_none());
-    if missing {
-        return Err(KernelError::MalformedJson(serde_json::Error::custom(
-            "A winning commit has a `delta.rowTracking` domain without a readable \
-             rowIdHighWaterMark",
         )));
     }
     Ok(())

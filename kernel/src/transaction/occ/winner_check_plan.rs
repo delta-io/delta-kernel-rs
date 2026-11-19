@@ -6,10 +6,11 @@
 
 use std::sync::LazyLock;
 
-use super::{LoserFacts, VERSION, WinningCommit, scan_files};
+use super::{LoserFacts, VERSION, WinningCommit};
 use crate::KernelResult;
 use crate::actions::{
-    COMMIT_INFO_NAME, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, SET_TRANSACTION_NAME,
+    CHECKPOINT_ACTION_NAME, COMMIT_INFO_NAME, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME,
+    SET_TRANSACTION_NAME,
 };
 use crate::expressions::{Expression, Predicate, col, column_name, lit, null_lit};
 use crate::plans::ir::nodes::Agg;
@@ -19,11 +20,17 @@ use crate::schema::{DataType, SchemaRef, lazy_schema_ref};
 
 /// The `commitInfo.operation` value of a row-tracking backfill.
 pub(crate) const ROW_TRACKING_BACKFILL_OPERATION: &str = "ROW TRACKING BACKFILL";
+/// The `commitInfo.operation` value of a row-tracking unbackfill.
+pub(crate) const ROW_TRACKING_UNBACKFILL_OPERATION: &str = "ROW TRACKING UNBACKFILL";
+/// The operations that conflict detection handles as a row-tracking backfill.
+const ROW_TRACKING_BACKFILL_OPERATIONS: [&str; 2] = [
+    ROW_TRACKING_BACKFILL_OPERATION,
+    ROW_TRACKING_UNBACKFILL_OPERATION,
+];
 /// The `commitInfo.tags` key of an identity-only metadata update. Delta Spark uses the same key as
 /// `DeltaSourceUtils.IDENTITY_COMMITINFO_TAG`.
 const IDENTITY_ONLY_METADATA_UPDATE_TAG: &str = "delta.identity.schemaUpdate";
-/// The tag value that marks an identity-only metadata update. Kernel matches it exactly. Delta
-/// Spark also accepts `TRUE`, so Kernel fails some commits that Delta Spark accepts.
+/// The tag value that marks an identity-only metadata update. Kernel matches it exactly.
 const IDENTITY_ONLY_METADATA_UPDATE_TAG_VALUE: &str = "true";
 
 // === Output columns ===
@@ -62,9 +69,6 @@ const ROW_TRACKING_TOMBSTONE_COUNT: &str = "row_tracking_tombstone_count";
 
 // === JSON keys ===
 const ROW_ID_HIGH_WATER_MARK_FIELD: &str = "rowIdHighWaterMark";
-/// The adaptiveMetadata action of a manifest commit. `actions::CHECKPOINT_ACTION_NAME` exists only
-/// with the `adaptive-metadata-in-dev` feature.
-const CHECKPOINT: &str = "checkpoint";
 
 /// The schema of the plan output: one row for each winner. Every boolean column except
 /// `is_blind_append` is not null, so an expression that yields NULL fails the plan.
@@ -112,7 +116,7 @@ static WINNER_ACTIONS_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     nullable (SET_TRANSACTION_NAME): {
         nullable "appId": STRING,
     },
-    nullable (CHECKPOINT): [ nullable {
+    nullable (CHECKPOINT_ACTION_NAME): [ nullable {
         nullable "checkpointMetadata": { nullable "version": LONG },
     } ],
 };
@@ -146,7 +150,10 @@ pub(crate) fn winner_check_plan(
     facts: &LoserFacts,
     winners: &[WinningCommit],
 ) -> KernelResult<Option<Plan>> {
-    let files = scan_files(winners, winners.iter().map(|winner| winner.version))?;
+    let files = winners
+        .iter()
+        .map(WinningCommit::scan_file)
+        .collect::<KernelResult<Vec<_>>>()?;
     PlanBuilder::scan_json(files, &[VERSION], WINNER_ACTIONS_SCHEMA.clone())?
         .project(action_row_expr(facts), ACTION_ROW_SCHEMA.clone())?
         .aggregate_by([column_name!(VERSION)], |aggs| {
@@ -188,6 +195,11 @@ pub(crate) fn winner_check_plan(
         .build_opt()
 }
 
+/// Returns true when `operation` is a row-tracking backfill or unbackfill.
+pub(crate) fn is_row_tracking_backfill_operation(operation: &str) -> bool {
+    ROW_TRACKING_BACKFILL_OPERATIONS.contains(&operation)
+}
+
 /// One row for each action. Columns that do not apply to the action are NULL.
 fn action_row_expr(facts: &LoserFacts) -> Expression {
     let conflicting_domains = facts
@@ -221,7 +233,7 @@ fn action_row_expr(facts: &LoserFacts) -> Expression {
         marker(col!(METADATA_NAME).is_not_null()),
         marker(Predicate::or_from(conflicting_domains)),
         marker(Predicate::or_from(conflicting_app_ids)),
-        marker(col!(CHECKPOINT).is_not_null()),
+        marker(col!(CHECKPOINT_ACTION_NAME).is_not_null()),
         marker(live_row_tracking),
         marker(Predicate::and(is_row_tracking, Predicate::not(not_removed))),
         Expression::parse_json(row_tracking_configuration, ROW_TRACKING_SCHEMA.clone()),
@@ -231,38 +243,44 @@ fn action_row_expr(facts: &LoserFacts) -> Expression {
 /// Passes the summary columns through, then adds one boolean column for each winner rule. A rule
 /// column is true when the winner breaks that rule.
 fn rule_expr(facts: &LoserFacts) -> Expression {
-    let has_metadata = col!(METADATA_COUNT).gt(lit(0i64));
+    let has_metadata = has_matches(METADATA_COUNT);
     // Delta Spark's ConflictChecker accepts an identity-only metadata update when T changes no
     // metadata.
-    let metadata_changed = match facts.changes_metadata {
-        true => has_metadata,
-        false => {
-            let not_identity_only =
-                col!(IDENTITY_ONLY_TAG).distinct(lit(IDENTITY_ONLY_METADATA_UPDATE_TAG_VALUE));
-            Predicate::and(has_metadata, not_identity_only)
-        }
+    let metadata_changed = if facts.changes_metadata {
+        has_metadata
+    } else {
+        let not_identity_only =
+            col!(IDENTITY_ONLY_TAG).distinct(lit(IDENTITY_ONLY_METADATA_UPDATE_TAG_VALUE));
+        Predicate::and(has_metadata, not_identity_only)
     };
-    let is_backfill =
-        Predicate::not(col!(OPERATION).distinct(lit(ROW_TRACKING_BACKFILL_OPERATION)));
-    let backfill_conflict = match facts.rewrites_files {
-        true => is_backfill,
-        false => Predicate::FALSE,
+    let backfill_conflict = if facts.rewrites_files {
+        Predicate::or_from(
+            ROW_TRACKING_BACKFILL_OPERATIONS
+                .map(|operation| Predicate::not(col!(OPERATION).distinct(lit(operation)))),
+        )
+    } else {
+        Predicate::FALSE
     };
     Expression::struct_from([
         col!(VERSION),
         col!(OPERATION),
         col!(IS_BLIND_APPEND),
         col!(IN_COMMIT_TIMESTAMP),
-        Expression::from_pred(col!(CHECKPOINT_COUNT).gt(lit(0i64))),
+        Expression::from_pred(has_matches(CHECKPOINT_COUNT)),
         col!(ROW_ID_HIGH_WATER_MARK),
-        Expression::from_pred(col!(ROW_TRACKING_COUNT).gt(lit(0i64))),
-        Expression::from_pred(col!(ROW_TRACKING_TOMBSTONE_COUNT).gt(lit(0i64))),
-        Expression::from_pred(col!(PROTOCOL_COUNT).gt(lit(0i64))),
+        Expression::from_pred(has_matches(ROW_TRACKING_COUNT)),
+        Expression::from_pred(has_matches(ROW_TRACKING_TOMBSTONE_COUNT)),
+        Expression::from_pred(has_matches(PROTOCOL_COUNT)),
         Expression::from_pred(metadata_changed),
-        Expression::from_pred(col!(DOMAIN_CONFLICT_COUNT).gt(lit(0i64))),
-        Expression::from_pred(col!(TXN_CONFLICT_COUNT).gt(lit(0i64))),
+        Expression::from_pred(has_matches(DOMAIN_CONFLICT_COUNT)),
+        Expression::from_pred(has_matches(TXN_CONFLICT_COUNT)),
         Expression::from_pred(backfill_conflict),
     ])
+}
+
+/// True when the count column `count` is above 0.
+fn has_matches(count: &str) -> Predicate {
+    Expression::column([count]).gt(lit(0i64))
 }
 
 /// 1 when `predicate` holds, NULL otherwise, so `count` over a marker column gives the matches.

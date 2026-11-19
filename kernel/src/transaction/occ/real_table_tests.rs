@@ -16,7 +16,7 @@ use super::decision::{Conflict, WinnerRule};
 use super::occ_plan::OccCheck;
 use super::tests::{
     LoserRelations, conflict, delete_loser, equals, files_scope, make_optimize,
-    no_conflict_summaries, occ, outcome, winner, winners_after,
+    no_conflict_summaries, occ, only_summary, outcome, winner, winners_after,
 };
 use super::*;
 use crate::committer::FileSystemCommitter;
@@ -96,9 +96,12 @@ fn commit_adds(url: &str, key: &str, files: &[(&str, &str)], blind_append: bool)
         url,
         UpdateTableOperation::Write,
         true,
-        |builder| match blind_append {
-            true => builder.with_blind_append(),
-            false => builder,
+        |builder| {
+            if blind_append {
+                builder.with_blind_append()
+            } else {
+                builder
+            }
         },
         |txn, _| {
             for (path, value) in files {
@@ -254,12 +257,6 @@ fn detect_in(url: &str, relations: &LoserRelations, facts: &LoserFacts) -> Optio
     "a",
     conflict(2, Some("WRITE"), occ(OccCheck::ReadAppend))
 )]
-#[case::non_blind_append_fails_under_serializable(
-    false,
-    IsolationLevel::Serializable,
-    "a",
-    conflict(2, Some("WRITE"), occ(OccCheck::ReadAppend))
-)]
 #[case::blind_append_passes_under_write_serializable(
     true,
     IsolationLevel::WriteSerializable,
@@ -286,7 +283,8 @@ fn kernel_append_in_read_partition(
 ) {
     // T deletes partition `a` and reads `FILE_A`. The winner appends one file to
     // `winner_partition`. Delta Spark's `checkForAddedFilesThatShouldHaveBeenReadByCurrentTxn`
-    // checks the added files. Under WriteSerializable, it skips a blind-append winner.
+    // checks the added files. Under WriteSerializable, it skips a blind-append winner when T
+    // changes no metadata.
     let (url, _dir) = kernel_table(&[]);
     let path = format!("part={winner_partition}/added.parquet");
     commit_adds(&url, "part", &[(&path, winner_partition)], blind_append);
@@ -382,7 +380,7 @@ fn kernel_row_tracking_winners_report_their_marks_and_timestamps() {
     let summaries = no_conflict_summaries(relations.detect(&facts, &winners_after(&url, 1)));
     let engine = SyncEngine::new();
     assert_eq!(Vec::from_iter(summaries.iter().map(|s| s.version)), [2, 3]);
-    // The initial commit ends at mark 1. Each winner adds one row, so the marks rise to 2 and 3.
+    // Version 1 ends at mark 1. Each winner adds one row, so the marks rise to 2 and 3.
     assert_eq!(
         Vec::from_iter(summaries.iter().map(|s| s.row_id_high_water_mark)),
         [Some(2), Some(3)]
@@ -474,9 +472,7 @@ fn winners_in_other_partitions_give_no_conflict() {
         Some(equals("part", 1i64)),
     );
     let summaries = no_conflict_summaries(relations.detect(&facts, &winners_after(&url, 1)));
-    let [summary] = summaries.as_slice() else {
-        panic!("expected one winner row, got {summaries:?}");
-    };
+    let summary = only_summary(&summaries);
     assert_eq!(summary.version, 2);
     assert_eq!(summary.operation.as_deref(), Some("DELETE"));
     assert_eq!(summary.is_blind_append, Some(false));

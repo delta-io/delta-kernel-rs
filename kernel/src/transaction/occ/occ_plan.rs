@@ -6,6 +6,9 @@
 //! delete_delete:                             +-> SemiJoin(file_actions) -> Project --------+
 //!                                                          UnionAll -> Aggregate(check, version)
 //! ```
+//!
+//! Project(part) and Filter(predicate) run only for a partitioned `ReadScope::Files` with a
+//! predicate. `WholeTable` has no SemiJoin(read_files).
 
 use std::sync::LazyLock;
 
@@ -16,7 +19,7 @@ use crate::actions::{ADD_NAME, REMOVE_NAME};
 use crate::expressions::{Expression, col, column_name, lit};
 use crate::plans::{Plan, PlanBuilder, RelationRef};
 use crate::scan::PrefixColumns;
-use crate::schema::{SchemaRef, lazy_schema_ref, try_schema};
+use crate::schema::{SchemaRef, StructField, StructType, lazy_schema_ref, try_schema};
 use crate::transforms::ExpressionTransform as _;
 use crate::{KernelError, KernelResult, Version};
 
@@ -42,7 +45,7 @@ static WINNER_REMOVES_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     },
 };
 
-static VIOLATION_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+pub(crate) static VIOLATION_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     not_null (VERSION): LONG,
     not_null (CHECK): STRING,
 };
@@ -50,8 +53,8 @@ static VIOLATION_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 /// Builds the OCC plan, or returns `None` when no check has a winner to scan.
 ///
 /// The plan returns one row for each check and version with a violation. `read_append` scans the
-/// winners at `read_append_versions`. The delete checks scan every winner, unless T is a blind
-/// append. `file_actions` must have a `remove.path` column.
+/// winners at `read_append_versions`. The delete checks scan every winner. `file_actions` must have
+/// a `remove.path` column.
 pub(crate) fn occ_plan(
     facts: &LoserFacts,
     winners: &[WinningCommit],
@@ -59,21 +62,19 @@ pub(crate) fn occ_plan(
     file_actions: &RelationRef,
 ) -> KernelResult<Option<Plan>> {
     let read_append = read_append_branch(&facts.read_scope, winners, read_append_versions)?;
-    let mut branches = vec![violations(read_append, OccCheck::ReadAppend)?];
-    // A blind append reads and removes no file, so neither delete check can fail it.
-    if !facts.is_blind_append {
-        let removes = winner_removes(winners)?;
-        let read_delete = read_delete_branch(&facts.read_scope, removes.clone())?;
-        let delete_delete = delete_delete_branch(removes, file_actions)?;
-        branches.push(violations(read_delete, OccCheck::ReadDelete)?);
-        branches.push(violations(delete_delete, OccCheck::DeleteDelete)?);
-    }
-    PlanBuilder::union_all(branches)?
-        // The aggregate gives one row for each (check, version). Nothing reads the count.
-        .aggregate_by([column_name!(CHECK), column_name!(VERSION)], |aggs| {
-            aggs.count_star()
-        })?
-        .build_opt()
+    let removes = winner_removes(winners)?;
+    let read_delete = read_delete_branch(&facts.read_scope, removes.clone())?;
+    let delete_delete = delete_delete_branch(removes, file_actions)?;
+    PlanBuilder::union_all([
+        violations(read_append, OccCheck::ReadAppend)?,
+        violations(read_delete, OccCheck::ReadDelete)?,
+        violations(delete_delete, OccCheck::DeleteDelete)?,
+    ])?
+    // The aggregate gives one row for each (check, version). Nothing reads the count.
+    .aggregate_by([column_name!(CHECK), column_name!(VERSION)], |aggs| {
+        aggs.count_star()
+    })?
+    .build_opt()
 }
 
 /// A file-level check of the OCC plan.
@@ -123,9 +124,15 @@ fn read_append_branch(
     if partition_schema.num_fields() == 0 {
         return Ok(adds);
     }
+    // A winner add can hold a null or no value for any partition column.
+    let part_type = StructType::try_new(
+        partition_schema
+            .fields()
+            .map(|field| StructField::nullable(field.name(), field.data_type().clone())),
+    )?;
     let part_schema = try_schema! {
         not_null (VERSION): LONG,
-        nullable (PART): (partition_schema.as_ref().clone()),
+        nullable (PART): (part_type),
     }?;
     let part = Expression::struct_from([
         col!(VERSION),
@@ -169,7 +176,10 @@ fn delete_delete_branch(
 
 fn winner_removes(winners: &[WinningCommit]) -> KernelResult<PlanBuilder> {
     PlanBuilder::scan_json(
-        scan_files(winners, winners.iter().map(|winner| winner.version))?,
+        winners
+            .iter()
+            .map(WinningCommit::scan_file)
+            .collect::<KernelResult<Vec<_>>>()?,
         &[VERSION],
         WINNER_REMOVES_SCHEMA.clone(),
     )?
