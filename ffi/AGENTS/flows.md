@@ -10,6 +10,7 @@ Key files and call sequences for the exported FFI flows. The boundary rules are 
   with their backing storage and conversions colocated
 - `src/snapshot/builder.rs` -- snapshot builders and their configuration
 - `src/snapshot/hint/` -- typed snapshot-hint input and callback export
+- `src/snapshot/snapshot_crc.rs` -- retained checksum provenance getter and value types
 - `src/handle.rs` -- opaque handle system for passing Rust objects across FFI
 - `src/column_default.rs` -- column-default (`allowColumnDefaults`) reads and the write-path ack
 - `src/scan.rs` -- scan FFI interface
@@ -56,9 +57,15 @@ engine I/O through one callback with a complete borrowed `FfiSnapshotHint`. Both
 borrowed. The callback runs once on success and is not invoked on error. All nested pointers expire
 when the callback returns; copy retained values during the callback. No hint handle is returned.
 Supply the copied values through `snapshot_builder_with_snapshot_hint` when rebuilding a snapshot.
-The hint preserves build-time freshness, not current freshness, and includes only a matching
-checkpoint hint, an at-version CRC, and the selected checkpoint's type when known. Compaction files
-are unsupported.
+The hint preserves build-time freshness, not current freshness, a matching checkpoint hint,
+the selected checkpoint type when known, retained CRC state (including stale baselines), and
+checksum provenance.
+`crc` is null only when no checksum is retained. Exports always include checksum provenance,
+preserving `Missing`/`Unusable` with a null CRC. Input hints may omit it: the snapshot then reports
+`Unknown`, and any supplied CRC must be at the hint version. Claims of a usable checksum require a
+non-null CRC. Any supplied CRC must be at or after the hint's selected checkpoint; an older CRC is
+rejected when the snapshot is built. Later updates that select a newer checkpoint can discard it.
+Compaction files are unsupported.
 
 `FfiSnapshotHint.checkpoint_type` is an `OptionalValue<FfiSelectedCheckpointType>` for the
 checkpoint selected from the hint's log paths. `None` means unknown, not that no checkpoint was
@@ -88,6 +95,11 @@ or absent when no checkpoint was selected, under `declarative-plans`. It returns
 the type is known from the checkpoint's naming, the table protocol, the snapshot hint, or completed
 discovery. Otherwise it resolves the type through the same snapshot cache as
 `snapshot_checkpoint_info` and declarative scan planning.
+
+`snapshot_crc_provenance(snapshot, out)` writes the retained `FfiCrcProvenance` without I/O. Its
+`FfiCrcSource` records what construction observed about checksum files (`AtVersion`,
+`Reconstructed { num_commits }`, `Stale`, `Missing`, `Unusable`, or `Unknown`), independently of
+whether file stats are available. Observations stay fixed after construction.
 
 Snapshot accessors (`ffi/src/lib.rs`) include no-I/O reads such as `version` and
 `snapshot_file_stats`, which returns `OptionalValue<FfiFileStats>` (scalar

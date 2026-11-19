@@ -12,6 +12,7 @@ use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::log_path::LogPathArray;
 use crate::panic::catch_panic;
+use crate::snapshot::snapshot_crc::FfiCrcProvenance;
 use crate::{NullableCvoid, OptionalValue, SharedExternEngine, SharedSnapshot};
 
 mod export;
@@ -88,7 +89,11 @@ pub struct FfiSnapshotHint {
     pub metadata: FfiMetadata,
     /// Optional `_last_checkpoint` state. Null means absent.
     pub last_checkpoint: *const FfiLastCheckpoint,
-    /// Optional CRC state. Null means absent.
+    /// Optional retained CRC state at or before `version`. Null means absent.
+    /// It may have been advanced in memory without a corresponding CRC file. It must be at or
+    /// after the hint's selected checkpoint; an older CRC is rejected when the snapshot is built.
+    /// Later updates that select a newer checkpoint can discard it.
+    /// A CRC older than `version` requires `crc_provenance`.
     pub crc: *const FfiCrc,
     /// Whether to infer publication from paths or preserve an explicit observation.
     ///
@@ -101,6 +106,14 @@ pub struct FfiSnapshotHint {
     /// C callers must set the tag explicitly, using `NoneFfiSelectedCheckpointType` when absent:
     /// a zero-initialized field is an invalid `Some` payload.
     pub checkpoint_type: OptionalValue<FfiSelectedCheckpointType>,
+    /// Optional retained checksum observation. Absent supplies no claim: the snapshot reports
+    /// `Unknown`, and a non-null `crc` must be at `version`. Export always includes the
+    /// observation, even when `crc` is null.
+    /// `Missing` and `Unusable` require a null `crc` and no base version. `AtVersion`,
+    /// `Reconstructed`, and `Stale` require a non-null `crc` and a compatible base version.
+    /// Validated against `crc` and `version`, not against CRC entries in `log_paths`.
+    /// C callers must explicitly set the tag to `NoneFfiCrcProvenance` when absent.
+    pub crc_provenance: OptionalValue<FfiCrcProvenance>,
 }
 
 fn invalid_with_source(message: impl Into<String>, source: KernelError) -> KernelError {
@@ -170,6 +183,7 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
         Option::<&FfiSelectedCheckpointType>::from(&value.checkpoint_type)
             .copied()
             .map(Into::into),
+        Option::<&FfiCrcProvenance>::from(&value.crc_provenance).map(FfiCrcProvenance::to_kernel),
     )?;
     builder.snapshot_hint = Some(Box::new(snapshot_hint));
     Ok(())
@@ -181,10 +195,10 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
 /// The input is converted and validated before replacing any previously installed hint. Every
 /// supplied log location must be beneath the builder's table log root, including paths discarded by
 /// checkpoint selection. Kernel preserves the locations; the connector must canonicalize them into
-/// the same URL form as the table root. Build performs the remaining structural and
-/// table-configuration validation. `Latest` makes `is_built_as_latest()` true unless a supplied
-/// catalog bound is newer than the hint version. Kernel otherwise trusts that caller claim.
-/// `Unverified` makes it false.
+/// the same URL form as the table root. Build performs the remaining structural,
+/// table-configuration, and checksum-provenance validation. `Latest` makes `is_built_as_latest()`
+/// true unless a supplied catalog bound is newer than the hint version. Kernel otherwise trusts
+/// that caller claim. `Unverified` makes it false.
 /// The caller must ensure the protocol and metadata came from the supplied files and all staged
 /// commits were catalog-ratified. Staged paths in a hint do not by themselves require
 /// [`snapshot_builder_with_max_catalog_version`]. Without an explicit target, a catalog-managed
