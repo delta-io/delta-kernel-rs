@@ -52,7 +52,8 @@ fn table_with_checkpoint_action(
     // The manifest commit and every later commit point at the manifest commit, as an AMT writer
     // records them; a CRC carries the pointer forward. [`checkpoint_action`]'s content root is at
     // the action's version.
-    let pointer = LastManifestCommit::new(checkpoint.version(), checkpoint.version()).unwrap();
+    let version = i64::try_from(checkpoint.version()).unwrap();
+    let pointer = LastManifestCommit::new(version, version).unwrap();
     write_ict_commit(
         &engine,
         &table_root,
@@ -87,10 +88,10 @@ fn table_with_checkpoint_action(
 /// which CRC validation checks for continuity.
 fn checkpoint_action(snapshot: &Snapshot) -> CheckpointAction {
     let config = snapshot.table_configuration();
-    let version = CHECKPOINT_VERSION as i64;
+    let content_root_version = i64::try_from(CHECKPOINT_VERSION).unwrap();
     CheckpointAction::new(
-        version,
-        ContentRoot::new("metadata/root.parquet".to_string(), 1, version),
+        CHECKPOINT_VERSION,
+        ContentRoot::new("metadata/root.parquet".to_string(), 1, content_root_version),
         config.protocol().clone(),
         config.metadata().clone(),
         vec![],

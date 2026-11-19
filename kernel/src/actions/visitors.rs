@@ -941,7 +941,7 @@ static CHECKPOINT_ELEMENT_RANGES: LazyLock<CheckpointElementRanges> = LazyLock::
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[derive(Default)]
 struct CheckpointElementVisitor {
-    version: Option<i64>,
+    version: Option<Version>,
     content_root: Option<ContentRoot>,
     protocol: Option<Protocol>,
     metadata: Option<Metadata>,
@@ -994,6 +994,7 @@ impl RowVisitor for CheckpointElementVisitor {
             if let Some(version) =
                 getters[r.checkpoint_metadata.start].get_opt(i, "checkpointMetadata.version")?
             {
+                let version = CheckpointAction::version_from_wire(version)?;
                 set_once(&mut self.version, version, "checkpointMetadata")?;
             } else if let Some(content_root) =
                 visit_content_root_at(i, &getters[r.content_root.clone()])?
@@ -1424,6 +1425,15 @@ mod tests {
         r#"{"contentRoot":{"path":"p","sizeInBytes":1,"version":99}}"#,
         checkpoint_elements::PROTOCOL, checkpoint_elements::METADATA,
     ], "checkpoint contentRoot.version 99 exceeds checkpointMetadata.version 42")]
+    #[case::negative_version(&[
+        r#"{"checkpointMetadata":{"version":-1}}"#, checkpoint_elements::CONTENT_ROOT,
+        checkpoint_elements::PROTOCOL, checkpoint_elements::METADATA,
+    ], "checkpoint action version -1 is negative")]
+    #[case::negative_content_root_version(&[
+        checkpoint_elements::CHECKPOINT_METADATA,
+        r#"{"contentRoot":{"path":"p","sizeInBytes":1,"version":-1}}"#,
+        checkpoint_elements::PROTOCOL, checkpoint_elements::METADATA,
+    ], "checkpoint contentRoot.version -1 must be non-negative")]
     fn test_parse_checkpoint_action_errors(#[case] elements: &[&str], #[case] expected_msg: &str) {
         let err = CheckpointAction::try_new_from_data(checkpoint_commit(elements).as_ref())
             .expect_err("checkpoint action should fail to parse");

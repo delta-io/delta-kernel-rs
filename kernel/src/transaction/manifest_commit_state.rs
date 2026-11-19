@@ -9,7 +9,7 @@ use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::utils::require;
-use crate::{Engine, KernelResult, Version, version_as_i64};
+use crate::{Engine, KernelResult, Version};
 
 /// State for an in-progress manifest (content-tree) commit.
 #[internal_api]
@@ -49,7 +49,7 @@ impl ManifestCommitState {
         // the precise "since the last manifest commit" semantics) once the manifest-commit write
         // path lands.
         if let Some(checkpoint) = read_snapshot.latest_checkpoint_action(engine)? {
-            let snapshot_version = version_as_i64(read_snapshot.version())?;
+            let snapshot_version = read_snapshot.version();
             require!(
                 checkpoint.version() >= snapshot_version,
                 KernelError::unsupported(format!(
