@@ -99,6 +99,24 @@ class InlineReviewTest(unittest.TestCase):
 
         self.assertEqual(review, "Corrected review.")
 
+    def test_extract_marked_review_ignores_truncated_copy_before_complete_review(self) -> None:
+        marker = "a" * 32
+        start = f"<!-- AI_REVIEW_START_{marker} -->"
+        end = f"<!-- AI_REVIEW_END_{marker} -->"
+        complete_copy = f"{start}\n## Summary\nThe change is correct.\n{end}"
+        truncated_copies = {
+            "cut inside the review text": complete_copy[: complete_copy.index("correct") + 3],
+            "cut inside the end marker": complete_copy[: complete_copy.index(end) + 4],
+        }
+
+        for cut, truncated_copy in truncated_copies.items():
+            with self.subTest(cut):
+                review = self.review_publish.extract_marked_review(
+                    f"{truncated_copy}\n\n{complete_copy}", marker
+                )
+
+                self.assertEqual(review, "## Summary\nThe change is correct.")
+
     def test_extract_marked_review_rejects_nested_markers(self) -> None:
         marker = "a" * 32
         start = f"<!-- AI_REVIEW_START_{marker} -->"
@@ -213,6 +231,24 @@ class InlineReviewTest(unittest.TestCase):
         self.assertIn(self.inline_review._FINDING_HEADING_TEMPLATE, contract)
         for section in self.inline_review._REVIEW_SECTION_NAMES:
             self.assertIn(section, contract)
+
+    def test_every_reviewer_config_sets_reasoning_effort_valid_for_its_harness(
+        self,
+    ) -> None:
+        # Copied from `omnigent.util.reasoning_effort`, which CI does not install for these tests.
+        valid_efforts = {
+            "claude-sdk": {"low", "medium", "high", "xhigh", "max"},
+            "codex": {"none", "minimal", "low", "medium", "high", "xhigh"},
+        }
+        reviewer_dir = Path(__file__).parents[1] / "reviewer"
+        config_paths = sorted(reviewer_dir.rglob("config.yaml"))
+        self.assertTrue(config_paths)
+        for config_path in config_paths:
+            with self.subTest(config=config_path.parent.name):
+                executor = yaml.safe_load(config_path.read_text())["executor"]
+                harness = executor["config"]["harness"]
+                self.assertIn(harness, valid_efforts)
+                self.assertIn(executor.get("reasoning_effort"), valid_efforts[harness])
 
     def test_markdown_prompts_preserve_source_safety(self) -> None:
         reviewer_dir = Path(__file__).parents[1] / "reviewer"

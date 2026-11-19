@@ -7,10 +7,15 @@ from pathlib import Path
 from typing import Any, Callable
 
 _CONTEXT_HEADER = "## Canonical PR context (workflow supplied)"
+_CONFIG_OWNED_ARGS = ("model", "reasoning_effort")
 
 
 def inject_review_context(*, context_path: str) -> Callable[[dict[str, Any]], dict[str, Any]]:
-    """Append canonical PR context to every named reviewer dispatch."""
+    """Append canonical PR context to every named reviewer dispatch.
+
+    Also removes the dispatch's model and reasoning effort overrides, so each reviewer runs with
+    the values in its own config.
+    """
     path = Path(context_path)
 
     def _evaluate(event: dict[str, Any]) -> dict[str, Any]:
@@ -45,7 +50,10 @@ def inject_review_context(*, context_path: str) -> Callable[[dict[str, Any]], di
             }
 
         transformed = copy.deepcopy(arguments)
-        transformed["args"]["input"] = (
+        transformed_args = transformed["args"]
+        for name in _CONFIG_OWNED_ARGS:
+            transformed_args.pop(name, None)
+        transformed_args["input"] = (
             f"{child_input.rstrip()}\n\n{_CONTEXT_HEADER}\n\n{context.rstrip()}"
         )
         return {"result": "ALLOW", "data": transformed}

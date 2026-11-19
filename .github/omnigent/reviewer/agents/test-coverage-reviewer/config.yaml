@@ -2,9 +2,12 @@ spec_version: 1
 name: test-coverage-reviewer
 description: 'Assesses whether tests cover new/changed logic paths.'
 skills: none
+tool_groups:
+  projects: false
 executor:
   type: omnigent
   model: default
+  reasoning_effort: medium
   config:
     harness: claude-sdk
 instructions: REVIEW.md
