@@ -104,8 +104,9 @@ pub enum UnaryPredicateOp {
 /// A binary predicate operator.
 ///
 /// The ordering and equality comparisons follow SQL three-valued logic, so a NULL operand yields
-/// NULL rather than `false`. [`Distinct`](Self::Distinct) and [`In`](Self::In) instead tolerate
-/// NULL and always answer `true` or `false`.
+/// NULL rather than `false`. [`MapHasKey`](Self::MapHasKey) also yields NULL for a NULL operand.
+/// [`Distinct`](Self::Distinct) and [`In`](Self::In) instead tolerate NULL and always answer
+/// `true` or `false`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BinaryPredicateOp {
     /// `left < right`.
@@ -137,6 +138,9 @@ pub enum BinaryPredicateOp {
     /// `MAP_HAS_KEY(map, key)`: `true` when the map contains `key` and `false` otherwise. The
     /// left operand is a map and the right operand is a value of the map's key type. A NULL map or
     /// a NULL key yields NULL. An entry whose value is NULL still counts as present.
+    ///
+    /// Map keys must have a non-nested type. Keys compare with the same equality as
+    /// [`Equal`](Self::Equal).
     MapHasKey,
 }
 
@@ -690,7 +694,7 @@ pub enum Predicate {
 ////////////////////////////////////////////////////////////////////////
 
 impl BinaryPredicateOp {
-    /// True if this is a comparison for which NULL input always produces NULL output
+    /// True if this operator always produces NULL output for NULL input.
     pub(crate) fn is_null_intolerant(&self) -> bool {
         use BinaryPredicateOp::*;
         match self {
@@ -1460,15 +1464,10 @@ impl Display for Predicate {
             BooleanExpression(expr) => write!(f, "{expr}"),
             Not(pred) => write!(f, "NOT({pred})"),
             Binary(BinaryPredicate {
-                op: BinaryPredicateOp::Distinct,
+                op: op @ (BinaryPredicateOp::Distinct | BinaryPredicateOp::MapHasKey),
                 left,
                 right,
-            }) => write!(f, "DISTINCT({left}, {right})"),
-            Binary(BinaryPredicate {
-                op: BinaryPredicateOp::MapHasKey,
-                left,
-                right,
-            }) => write!(f, "MAP_HAS_KEY({left}, {right})"),
+            }) => write!(f, "{op}({left}, {right})"),
             Binary(BinaryPredicate { op, left, right }) => write!(f, "{left} {op} {right}"),
             Unary(UnaryPredicate { op, expr }) => match op {
                 UnaryPredicateOp::IsNull => write!(f, "{expr} IS NULL"),
