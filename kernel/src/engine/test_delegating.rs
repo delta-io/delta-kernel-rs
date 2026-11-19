@@ -8,9 +8,7 @@ use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandl
 
 /// A test [`Engine`] that returns supplied handler overrides and delegates other accessors.
 ///
-/// Construction and setters never request an inner handler. Each accessor clones its override's
-/// `Arc`, or requests the inner handler only when no override is set. Use [`PanicEngine`] as the
-/// inner engine to reject access to handlers a test has not configured.
+/// Each accessor returns its override if one is set, and the inner engine's handler otherwise.
 ///
 /// With `declarative-plans`, the plan executor is inherited unless explicitly replaced or disabled.
 pub struct DelegatingEngine {
@@ -128,70 +126,44 @@ impl Engine for DelegatingEngine {
     }
 }
 
-/// A test [`Engine`] whose required handler accessors panic with the accessor's name.
-///
-/// Use this engine to assert that an operation requests no evaluation, storage, JSON, or Parquet
-/// handler. To allow selected handlers, wrap it in [`DelegatingEngine`] and supply overrides.
-/// With `declarative-plans`, `plan_executor()` returns `None` and `require_plan_executor()` returns
-/// the trait's unsupported error.
-pub struct PanicEngine;
-
-// Downstream tests use this assertion engine without compiling kernel under `cfg(test)`.
-#[allow(clippy::panic)]
-impl Engine for PanicEngine {
-    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-        panic!("PanicEngine::evaluation_handler called")
-    }
-
-    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-        panic!("PanicEngine::storage_handler called")
-    }
-
-    fn json_handler(&self) -> Arc<dyn JsonHandler> {
-        panic!("PanicEngine::json_handler called")
-    }
-
-    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-        panic!("PanicEngine::parquet_handler called")
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "declarative-plans")]
     use rstest::rstest;
+    use url::Url;
 
     use super::*;
     #[cfg(feature = "declarative-plans")]
     use crate::KernelError;
+    use crate::engine::CountingEngine;
     use crate::engine::sync::SyncEngine;
+    use crate::schema::StructType;
 
-    #[rstest]
-    #[case::evaluation(|engine: &dyn Engine| drop(engine.evaluation_handler()))]
-    #[case::storage(|engine: &dyn Engine| drop(engine.storage_handler()))]
-    #[case::json(|engine: &dyn Engine| drop(engine.json_handler()))]
-    #[case::parquet(|engine: &dyn Engine| drop(engine.parquet_handler()))]
-    #[should_panic(expected = "PanicEngine::")]
-    fn required_handler_access_panics(
-        #[case] access: fn(&dyn Engine),
-        #[values(false, true)] delegated: bool,
-    ) {
-        let engine: Arc<dyn Engine> = Arc::new(PanicEngine);
-        let engine: Arc<dyn Engine> = if delegated {
-            Arc::new(DelegatingEngine::new(engine))
-        } else {
-            engine
-        };
-        access(engine.as_ref());
+    /// Runs one operation through each required handler of `engine`, ignoring the results.
+    fn run_one_operation_per_handler(engine: &dyn Engine) {
+        let schema = Arc::new(StructType::new_unchecked([]));
+        let url = Url::parse("memory:///missing").unwrap();
+        let _ = engine
+            .evaluation_handler()
+            .create_many(schema.clone(), vec![]);
+        let _ = engine.storage_handler().head(&url);
+        let _ = engine
+            .json_handler()
+            .read_json_files(&[], schema.clone(), None);
+        let _ = engine
+            .parquet_handler()
+            .read_parquet_files(&[], schema, None);
     }
 
     #[test]
-    fn overrides_are_lazy_and_retain_handler_allocations() {
-        let base_engine = SyncEngine::new();
+    fn overrides_bypass_inner_and_retain_handler_allocations() {
+        let base_engine = Arc::new(SyncEngine::in_memory());
         let evaluation_handler = base_engine.evaluation_handler();
         let storage_handler = base_engine.storage_handler();
         let json_handler = base_engine.json_handler();
         let parquet_handler = base_engine.parquet_handler();
-        let engine = DelegatingEngine::new(Arc::new(PanicEngine))
+        let inner = Arc::new(CountingEngine::new(base_engine));
+        let engine = DelegatingEngine::new(inner.clone())
             .with_evaluation_handler(evaluation_handler.clone())
             .with_storage_handler(storage_handler.clone())
             .with_json_handler(json_handler.clone())
@@ -205,6 +177,21 @@ mod tests {
         assert!(Arc::ptr_eq(&engine.storage_handler(), &storage_handler));
         assert!(Arc::ptr_eq(&engine.json_handler(), &json_handler));
         assert!(Arc::ptr_eq(&engine.parquet_handler(), &parquet_handler));
+        run_one_operation_per_handler(&engine);
+        inner.assert_no_io();
+    }
+
+    #[test]
+    fn unconfigured_handlers_delegate_operations_to_inner() {
+        let inner = Arc::new(CountingEngine::new(Arc::new(SyncEngine::in_memory())));
+        let engine = DelegatingEngine::new(inner.clone());
+
+        run_one_operation_per_handler(&engine);
+
+        assert_eq!(inner.evaluation.op_count(), 1);
+        assert_eq!(inner.storage.op_count(), 1);
+        assert_eq!(inner.json.op_count(), 1);
+        assert_eq!(inner.parquet.op_count(), 1);
     }
 
     #[test]
@@ -229,7 +216,9 @@ mod tests {
     #[cfg(feature = "declarative-plans")]
     #[rstest]
     #[case::present(Arc::new(SyncEngine::new()))]
-    #[case::absent(Arc::new(PanicEngine))]
+    #[case::absent(Arc::new(
+        DelegatingEngine::new(Arc::new(SyncEngine::new())).without_plan_executor()
+    ))]
     fn executor_is_inherited(#[case] inner: Arc<dyn Engine>) {
         let expected = inner.plan_executor();
         let engine = DelegatingEngine::new(inner);

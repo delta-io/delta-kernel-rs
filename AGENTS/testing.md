@@ -51,9 +51,12 @@ This list is non-exhaustive: when in doubt, browse the source files directly
 
 **Handler access and overrides (from `delta_kernel::engine`, with `test-utils`)**
 
-- `PanicEngine`: assert that an operation requests no required engine handler.
+- `CountingEngine`: delegates to an inner engine and counts actual handler operations without
+  counting handler access. Use it to assert that a fast path avoids I/O or evaluation. An
+  `Engine`-based entry point fetches every handler once per drive, so a test engine that panics or
+  counts on handler accessors sees those calls even when no I/O follows.
 - `DelegatingEngine`: override selected handlers while delegating the rest to an inner engine.
-  See the types' rustdoc for override and executor selection behavior.
+  See the type's rustdoc for override and executor selection behavior.
 
 **Engine + table setup (from `test_utils`)**
 

@@ -113,18 +113,18 @@ mod tests {
     use std::ptr::NonNull;
     use std::sync::Arc;
 
-    use delta_kernel::engine::{DelegatingEngine, PanicEngine};
+    use delta_kernel::engine::CountingEngine;
+    use delta_kernel::engine::sync::SyncEngine;
     use delta_kernel::last_checkpoint_hint::LastCheckpointHint;
-    use delta_kernel::plans::{Operation, PlanExecutor, PlanResult};
     use delta_kernel::snapshot::{
         PublicationWatermark, Snapshot, SnapshotHint, SnapshotHintFreshness,
     };
-    use delta_kernel::{FileMeta, KernelResult, LogPath};
+    use delta_kernel::{FileMeta, LogPath};
     use rstest::rstest;
     use url::Url;
 
     use super::*;
-    use crate::ffi_test_utils::{TEST_ERROR_ALLOCATORS, ok_or_panic};
+    use crate::ffi_test_utils::{TEST_ERROR_ALLOCATORS, assert_no_io, ok_or_panic};
     use crate::{TryFromStringSlice, engine_to_handle, free_engine, free_snapshot};
 
     #[derive(Default)]
@@ -185,6 +185,7 @@ mod tests {
             }
             assert_eq!(unsafe { snapshot.as_ref() }.version(), 0);
         }
+        assert_no_io(unsafe { engine.as_ref() });
         unsafe {
             free_snapshot(snapshot);
             free_engine(engine);
@@ -274,28 +275,22 @@ mod tests {
         assert!(ok_or_panic(result));
         assert_eq!(state.visits, 1);
         assert_eq!(unsafe { state.snapshot.as_ref() }.version(), 0);
+        assert_no_io(unsafe { state.engine.as_ref() });
         unsafe {
             free_snapshot(state.snapshot);
             free_engine(state.engine);
         }
     }
 
-    struct NoIoExecutor;
-
-    impl PlanExecutor for NoIoExecutor {
-        fn execute_op(&self, _op: Operation) -> KernelResult<PlanResult> {
-            panic!("unexpected declarative execution")
-        }
-    }
-
+    /// Builds a snapshot and engine handle for a hinted checkpoint. Resolving the checkpoint from
+    /// the hint must not perform I/O; callers downcast the engine handle to assert that.
     fn checkpoint_handles(
         checkpoint: bool,
         manifest: bool,
         invalid_size: bool,
     ) -> (Handle<SharedSnapshot>, Handle<SharedExternEngine>) {
-        let engine = Arc::new(
-            DelegatingEngine::new(Arc::new(PanicEngine)).with_plan_executor(Arc::new(NoIoExecutor)),
-        );
+        let engine = SyncEngine::in_memory();
+        let engine = Arc::new(CountingEngine::new(Arc::new(engine)));
         let schema = r#"{"type":"struct","fields":[]}"#;
         let filename = "00000000000000000000.checkpoint.11111111-1111-1111-1111-111111111111.json";
         let last_checkpoint = checkpoint.then(|| serde_json::from_value::<LastCheckpointHint>(
