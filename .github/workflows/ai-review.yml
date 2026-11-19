@@ -1244,8 +1244,8 @@ jobs:
 
           if start_count > end_count:
               print(
-                  f"::notice::Ignored {start_count - end_count} truncated review copies "
-                  "in the reviewer output."
+                  "::notice::Truncated review copies ignored in the reviewer output: "
+                  f"{start_count - end_count}."
               )
           if len(body) > 60_000:
               print("::error::AI review exceeded the 60000-character publication limit.")
