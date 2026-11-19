@@ -391,8 +391,9 @@ impl LeafRef {
     }
 }
 
-/// A non-empty manifest deletion vector: serialized for [`Predicate::mumbling_bitmap_contains`],
-/// plus the largest position it removes, which [`LeafReadContext::finish`] checks against the leaf.
+/// A non-empty manifest deletion vector: serialized for
+/// [`Predicate::try_mumbling_bitmap_contains`], plus the largest position it removes, which
+/// [`LeafReadContext::finish`] checks against the leaf.
 struct ManifestDv {
     bytes: Vec<u8>,
     last_position: u32,
@@ -637,10 +638,10 @@ impl LeafReadContext {
         let next_first_row_id = require(parent.first_row_id, FIRST_ROW_ID)?;
         let last_removed_position = manifest_dv.as_ref().map(|dv| dv.last_position);
         let removed = match manifest_dv {
-            Some(dv) => Predicate::mumbling_bitmap_contains(
-                lit(Scalar::Binary(dv.bytes)),
+            Some(dv) => Predicate::try_mumbling_bitmap_contains(
+                dv.bytes,
                 Expression::column([LEAF_ROW_INDEX_COLUMN]),
-            ),
+            )?,
             None => Predicate::FALSE,
         };
         let sources = AddFieldSources {
