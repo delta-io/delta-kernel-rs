@@ -850,7 +850,7 @@ jobs:
 
           sys.path.insert(0, ".github/omnigent")
           from inline_review import inline_prompt_instructions
-          from review_diff import truncate_diff
+          from review_diff import MAX_NOTE_BYTES, truncate_diff
           from review_history import (
               DEFAULT_TRUSTED_BOT_LOGINS,
               attach_inline_comment_sides,
@@ -862,9 +862,11 @@ jobs:
               PR_DESCRIPTION_POLICY,
           )
 
-          # The orchestrator's copy of the diff must fit in max_prompt_bytes. The
-          # reviewers' copy goes in reviewer_context, which is not part of that prompt.
-          max_diff_bytes = 80_000
+          # The orchestrator prompt is passed to `omnigent run -p` as one command-line
+          # argument, which Linux caps at 131,072 bytes, so the orchestrator's copy of
+          # the diff is small. Reviewers get a larger copy in reviewer_context, which
+          # the inject_review_context policy reads from a file.
+          max_orchestrator_diff_bytes = 80_000
           max_reviewer_diff_bytes = 240_000
           max_prompt_bytes = 120_000
           output_mode = os.environ["OUTPUT_MODE"]
@@ -903,29 +905,8 @@ jobs:
                   "Do not report omissions based on unavailable text.]"
               )
           diff_bytes = pathlib.Path("/tmp/pr_diff.txt").read_bytes()
-          diff, truncation_note = truncate_diff(diff_bytes, max_diff_bytes)
           reviewer_diff, reviewer_truncation_note = truncate_diff(
               diff_bytes, max_reviewer_diff_bytes
-          )
-          # The orchestrator consolidates findings in files that only reviewers
-          # receive, so tell it what the reviewers' copy of the diff contains.
-          if truncation_note:
-              reviewer_copy = (
-                  "a longer copy of the diff, described in the next note. Say in the "
-                  "Summary that reviewers received a truncated diff, and name the "
-                  "files it omits or give their count"
-                  if reviewer_truncation_note
-                  else "the complete diff"
-              )
-              truncation_note += (
-                  f"\n\n[Reviewers and the disprove gate receive {reviewer_copy}. Do "
-                  "not drop a finding only because its file is cut or missing from "
-                  f"this copy.]{reviewer_truncation_note}"
-              )
-          print(
-              f"PR diff is {len(diff_bytes)} bytes. Orchestrator copy truncated: "
-              f"{bool(truncation_note)}. Reviewer copy truncated: "
-              f"{bool(reviewer_truncation_note)}."
           )
           known_issue_policy = KNOWN_ISSUE_POLICY.strip()
           previous_review_policy = PREVIOUS_REVIEW_POLICY.strip()
@@ -968,7 +949,7 @@ jobs:
           )
           pathlib.Path("/tmp/reviewer_context.txt").write_text(reviewer_context)
 
-          prompt = f"""Orchestrate a review of this pull request.
+          prompt_before_diff = f"""Orchestrate a review of this pull request.
 
           ## PR Metadata
           - **Title:** {meta['title']}
@@ -1038,9 +1019,43 @@ jobs:
           ## PR Diff
 
           ```diff
-          {diff}
-          ```{truncation_note}
           """
+
+          def build_prompt(diff, truncation_note):
+              return f"{prompt_before_diff}{diff}\n```{truncation_note}\n"
+
+          # The orchestrator consolidates findings in files that only reviewers
+          # receive, so a truncated copy also says what the reviewers' copy contains.
+          reviewer_copy = (
+              "a longer copy of the diff, described in the next note. Say in the "
+              "Summary that reviewers received a truncated diff, and name the files "
+              "it omits or give their count"
+              if reviewer_truncation_note
+              else "the complete diff"
+          )
+          reviewer_copy_note = (
+              f"\n\n[Reviewers and the disprove gate receive {reviewer_copy}. Do not "
+              "drop a finding only because its file is cut or missing from this "
+              f"copy.]{reviewer_truncation_note}"
+          )
+          # Give the diff the bytes left after the rest of the prompt and the largest
+          # truncation note. A long PR description or review history then shrinks the
+          # diff instead of failing the run.
+          reserved_bytes = (
+              len(build_prompt("", reviewer_copy_note).encode("utf-8")) + MAX_NOTE_BYTES
+          )
+          diff, truncation_note = truncate_diff(
+              diff_bytes,
+              max(0, min(max_orchestrator_diff_bytes, max_prompt_bytes - reserved_bytes)),
+          )
+          if truncation_note:
+              truncation_note += reviewer_copy_note
+          print(
+              f"PR diff is {len(diff_bytes)} bytes. Orchestrator copy truncated: "
+              f"{bool(truncation_note)}. Reviewer copy truncated: "
+              f"{bool(reviewer_truncation_note)}."
+          )
+          prompt = build_prompt(diff, truncation_note)
           if len(prompt.encode("utf-8")) > max_prompt_bytes:
               raise SystemExit("Review prompt exceeds the 120000-byte execution limit.")
           pathlib.Path("/tmp/review_prompt.txt").write_text(prompt)
