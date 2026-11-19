@@ -2214,13 +2214,13 @@ pub struct CheckpointActionComputed {
     /// Domain metadata sidecars carried over from the latest `checkpoint` action. 0 unless
     /// `domain_metadata_source` is `CheckpointAction`.
     pub num_domain_metadata_sidecars_kept: u64,
-    /// Set transaction sidecars read to compute the action, whether they were then kept or moved
-    /// inline. 0 unless they were read: sidecars are read only when a change touches an entry that
-    /// isn't inline.
+    /// Set transaction sidecars of the latest `checkpoint` action that were read. Sidecars are
+    /// read when a changed key is not among the action's inline entries, and are counted
+    /// whether they were then kept or moved inline.
     pub num_txn_sidecars_read: u64,
-    /// Domain metadata sidecars read to compute the action, whether they were then kept or moved
-    /// inline. 0 unless they were read: sidecars are read only when a change touches an entry that
-    /// isn't inline.
+    /// Domain metadata sidecars of the latest `checkpoint` action that were read. Sidecars are
+    /// read when a changed key is not among the action's inline entries, and are counted
+    /// whether they were then kept or moved inline.
     pub num_domain_metadata_sidecars_read: u64,
     /// Time spent computing the action.
     pub duration: Duration,
