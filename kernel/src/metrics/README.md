@@ -28,11 +28,12 @@ Snapshot-build failures receive elapsed time when the lifecycle span closes. Log
 protocol/metadata failures preserve the operation duration passed to their emit helper; timing the
 helper span itself would omit the failed work.
 
-`CheckpointWriteSuccess` reports `Written` with statistics or `AlreadyExists` without statistics.
-`CheckpointWriteFailure` retains the selected mode and duration without write statistics. Both durations
-stop after checkpoint data writes and verification, before hint publication. Recording `duration_ns`
-preserves that boundary when the reporting span closes after the final API result is known. Calls
-that return before data completion use span-close timing.
+`CheckpointWriteOutcome::Written` carries completed-checkpoint contents in `CheckpointWriteStats`.
+Both checkpoint events retain the attempt's processing and output metrics, including work performed
+before an error or an `AlreadyExists` return. Both durations stop after checkpoint data writes and
+verification, before hint publication. Recording `duration_ns` preserves that boundary when the
+reporting span closes after the final API result is known. Calls that return before data completion
+use span-close timing.
 
 ## Completion outcomes
 
@@ -49,6 +50,18 @@ Use a flat outcome enum when every outcome has the same payload. When payloads d
 variants can carry success-only statistics or a failure-only reason without optional fields.
 Existing success/failure event pairs also express that distinction; changing them requires an
 explicit compatibility decision.
+
+## Warnings inside layer callbacks
+
+Tracing layer callbacks must not emit tracing events directly. Calling `warn!()` or
+any tracing macro inside a `tracing_subscriber::Layer` callback (`on_event`, `on_record`,
+`on_close`) while holding a span's `extensions_mut()` write lock will re-enter the layer
+and deadlock on the same lock. `on_new_span` builds its event with `from_attrs` before taking
+the extension lock, so direct `warn!()` is safe there. In `on_record`, store warnings in a
+`pending_warnings: Vec<String>` field on the visitor, take them out after the extensions
+block closes, and emit via `warn!()` only then. (`on_event`'s visitor does no
+warning-eligible work, so it may run under the lock directly.) See
+`reporter.rs` for the canonical pattern.
 
 ## Adding an event
 

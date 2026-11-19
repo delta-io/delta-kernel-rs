@@ -55,7 +55,6 @@ pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Arc;
 
     use rstest::rstest;
 
@@ -66,12 +65,11 @@ mod tests {
         DomainMetadataState, FileSizeHistogram, FileStats, FileStatsState, SetTransactionState,
     };
     use crate::engine::sync::SyncEngine;
-    use crate::object_store::memory::InMemory;
     use crate::path::{AsUrl, ParsedLogPath};
     use crate::table_features::TableFeature;
 
     fn writer_test_env(version: u64) -> (SyncEngine, ParsedLogPath) {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let table_root = Url::parse("memory:///test_table/").unwrap();
         let crc_path = ParsedLogPath::create_parsed_crc(&table_root, version);
         (engine, crc_path)

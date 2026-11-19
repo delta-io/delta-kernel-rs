@@ -391,7 +391,7 @@ mod tests {
 
     #[test]
     fn tree_adds_have_constant_modification_time_and_no_data_change() {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let checkpoint =
             checkpoint_with_tree(&engine, &[added_data_entry("a.parquet", 1, 1, 0, 0)], 1);
 
@@ -418,7 +418,7 @@ mod tests {
 
     #[test]
     fn tree_adds_read_null_stats_and_stats_parsed() {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let checkpoint =
             checkpoint_with_tree(&engine, &[added_data_entry("a.parquet", 1, 5, 0, 0)], 1);
         let read_schema = schema_ref! {
@@ -528,7 +528,7 @@ mod tests {
 
     #[test]
     fn tree_adds_project_onto_a_subset_read_schema_with_removes() {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let checkpoint = checkpoint_with_tree(&engine, &tree_with_deleted_entry(), 1);
         let read_schema = schema_ref! {
             nullable ADD_NAME: { ..(ADD_SCHEMA.fields().filter(|f| f.name() != "stats")) },
@@ -561,7 +561,7 @@ mod tests {
 
     #[test]
     fn cancelled_read_stops() {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let checkpoint = checkpoint_with_tree(&engine, &tree_with_deleted_entry(), 1);
         let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
         let result = read_checkpoint_action(
@@ -576,7 +576,7 @@ mod tests {
 
     #[test]
     fn partitioned_checkpoint_action_rejects_add_reads() {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let (_, metadata) = adaptive_metadata_pm(test_schema_flat_with_column_mapping(), &["id"]);
         let checkpoint = CheckpointAction {
             metadata,
@@ -597,7 +597,7 @@ mod tests {
 
     #[test]
     fn protocol_and_metadata_come_from_the_checkpoint_action() {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         // The root manifest does not exist, so reading it would fail.
         let checkpoint = checkpoint_action_with_root(ROOT_PATH, 1, 1).unwrap();
         let read_schema = get_commit_schema()
@@ -687,7 +687,7 @@ mod tests {
         #[case] set_actions: SetActions,
         #[case] sidecar_row: fn(&str) -> Scalar,
     ) {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         // The root manifest does not exist, so reading it would fail.
         let mut checkpoint = checkpoint_action_with_root(ROOT_PATH, 1, 1).unwrap();
         let sidecar = write_sidecar(
@@ -714,7 +714,7 @@ mod tests {
 
     #[test]
     fn unsupported_action_kind_errors() {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let checkpoint = checkpoint_action_with_root(ROOT_PATH, 1, 1).unwrap();
         let schema = get_commit_schema()
             .project(&[ADD_NAME, COMMIT_INFO_NAME])

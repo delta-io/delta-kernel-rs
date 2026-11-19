@@ -400,6 +400,20 @@ impl StatsOptions {
     }
 }
 
+/// Where Kernel got a typed column in a [`ScanMetadata`] batch.
+///
+/// See [`ScanMetadata::partition_values_source`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParsedColumnSource {
+    /// Read from the checkpoint's own typed column. `TIMESTAMP` values are fixed instants that the
+    /// timezone setting does not change.
+    Checkpoint,
+    /// Built by Kernel from the raw action field. For partition values this is the
+    /// `add.partitionValues` string map, so offset-less `TIMESTAMP` values depend on
+    /// [`PartitionValuesOptions::with_timestamp_timezone`].
+    Derived,
+}
+
 /// Engine-facing partition value options. Pass to scan builders, such as [`ScanBuilder`] and
 /// [`crate::incremental_scan::IncrementalScanBuilder`], to control partition-column related
 /// behavior.
@@ -425,7 +439,7 @@ impl PartitionValuesOptions {
     /// `partitionColumns`.
     /// On non-partitioned tables the column is omitted. Values come directly from the checkpoint's
     /// native `partitionValues_parsed` column when present and compatible, otherwise from parsing
-    /// the string map.
+    /// the string map. [`ScanMetadata::partition_values_source`] reports which one a batch used.
     pub fn with_struct() -> Self {
         Self {
             parsed_struct: true,
@@ -438,8 +452,10 @@ impl PartitionValuesOptions {
     /// The provided timezone must match the timezone used to write those offset-less values.
     ///
     /// `timestamp_timezone` must be an IANA timezone identifier recognized by Kernel, a normalized
-    /// fixed offset in `+HH:MM[:SS]` or `-HH:MM[:SS]` form, or `Z` for UTC. An explicit offset in a
-    /// partition value takes precedence. This option applies to partition pruning in full and
+    /// fixed offset in `+HH:MM[:SS]` or `-HH:MM[:SS]` form, or `Z` for UTC. The exact uppercase IDs
+    /// `EST`, `MST`, and `HST` use fixed offsets `-05:00`, `-07:00`, and `-10:00`, respectively.
+    /// Full IANA region names preserve historical clock transitions. An explicit offset or timezone
+    /// in a partition value takes precedence. This option applies to partition pruning in full and
     /// incremental scans and to returned parsed partition values in full scans. It does not affect
     /// `TIMESTAMP_NTZ`.
     ///
@@ -921,9 +937,9 @@ pub fn get_transform_for_row(
     transforms.get(row).cloned().flatten()
 }
 
-/// [`ScanMetadata`] contains (1) a batch of [`FilteredEngineData`] specifying data files to be
-/// scanned and (2) a vector of transforms (one transform per scan file) that must be applied to the
-/// data read from those files.
+/// [`ScanMetadata`] contains a batch of [`FilteredEngineData`] specifying data files to be scanned,
+/// the transforms (one per scan file) that must be applied to the data read from those files, and
+/// the source of the batch's parsed partition values (see [`Self::partition_values_source`]).
 pub struct ScanMetadata {
     /// Filtered engine data with one row per file to scan (and only selected rows should be
     /// scanned)
@@ -947,17 +963,46 @@ pub struct ScanMetadata {
     /// Note: This vector can be indexed by row number, as rows masked by the selection vector will
     /// have corresponding entries that will be `None`.
     pub scan_file_transforms: Vec<Option<ExpressionRef>>,
+
+    /// Set by log replay from the evaluator that produced `scan_files`. See
+    /// [`Self::partition_values_source`].
+    partition_values_source: Option<ParsedColumnSource>,
 }
 
 impl ScanMetadata {
+    /// Where this batch's `partitionValues_parsed` column came from, or `None` when the batch has
+    /// no such column.
+    ///
+    /// On partitioned tables, Kernel emits the column when [`PartitionValuesOptions::with_struct`]
+    /// is set, or when the scan predicate references a partition column and stats are not skipped.
+    /// A batch never mixes sources: checkpoint batches report `Checkpoint` when the checkpoint has
+    /// a compatible native `partitionValues_parsed` column, and `Derived` otherwise; commit
+    /// batches always report `Derived`. `parallel_scan_metadata` always reports `Derived`.
+    /// `Scan::scan_metadata_from` reports `Derived` for the cached rows and later commits; when the
+    /// checkpoint is newer than `existing_version`, it falls back to a full scan that follows the
+    /// rules above.
+    ///
+    /// The emitted field set and its source depend on this scan's configuration: a predicate-only
+    /// scan can report `Checkpoint` for a file that a `with_struct` scan reports as `Derived`.
+    /// [`ParsedColumnSource::Checkpoint`] values are fixed instants;
+    /// [`ParsedColumnSource::Derived`] values of offset-less `TIMESTAMP` strings depend on
+    /// [`PartitionValuesOptions::with_timestamp_timezone`]. A connector that caches values across
+    /// timezones can reuse a cached `Checkpoint` value only when the current batch also reports
+    /// `Checkpoint` for the same emitted field set.
+    pub fn partition_values_source(&self) -> Option<ParsedColumnSource> {
+        self.partition_values_source
+    }
+
     fn try_new(
         data: Box<dyn EngineData>,
         selection_vector: Vec<bool>,
         scan_file_transforms: Vec<Option<ExpressionRef>>,
+        partition_values_source: Option<ParsedColumnSource>,
     ) -> KernelResult<Self> {
         Ok(Self {
             scan_files: FilteredEngineData::try_new(data, selection_vector)?,
             scan_file_transforms,
+            partition_values_source,
         })
     }
 }
@@ -1499,10 +1544,8 @@ impl Scan {
                 PhysicalPredicate::Some(predicate, _) => Some(predicate.clone()),
                 PhysicalPredicate::StaticSkipAll | PhysicalPredicate::None => None,
             };
-            let amt_stats_request = physical_stats_read_schema.and_then(|schema| {
-                AmtStatsRequest::for_checkpoint(
-                    &checkpoint,
-                    self.snapshot.table_configuration().metadata(),
+            let amt_stats_request = physical_stats_read_schema.map(|schema| {
+                AmtStatsRequest::new(
                     schema,
                     predicate,
                     &self.state_info.eligible_physical_stats_columns,

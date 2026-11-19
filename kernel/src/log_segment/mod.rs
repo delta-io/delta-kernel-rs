@@ -24,6 +24,7 @@ use crate::actions::{
 use crate::checkpoint::collation_stats::{
     build_collation_stats_read_transform, source_collation_stats,
 };
+use crate::checkpoint::metrics::{CheckpointMetrics, CheckpointPhase};
 use crate::committer::CatalogCommit;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::content_tree::{AmtStatsRequest, read_checkpoint_action};
@@ -128,14 +129,16 @@ pub(crate) struct ActionsWithCheckpointInfo<A: KernelResultIterator<ActionsBatch
     pub checkpoint_info: CheckpointReadInfo,
 }
 
-/// A [`LogSegment`] represents a contiguous section of the log and is made of checkpoint files
-/// and commit files and guarantees the following:
+/// A [`LogSegment`] represents a contiguous section of the log and is made of checkpoint files,
+/// commit files, and log compaction files. It guarantees the following:
 ///     1. Commit file versions will not have any gaps between them.
 ///     2. If checkpoint(s) is/are present in the range, only commits with versions greater than the
 ///        most recent checkpoint version are retained. There will not be a gap between the
 ///        checkpoint version and the first commit version.
 ///     3. All checkpoint_parts must belong to the same checkpoint version, and must form a complete
 ///        version. Multi-part checkpoints must have all their parts.
+///     4. Each retained log compaction starts after the checkpoint version, if any, and ends at or
+///        before `end_version`.
 ///
 /// [`LogSegment`] is used in [`Snapshot`] when built with [`LogSegment::for_snapshot`], and
 /// in `TableChanges` when built with [`LogSegment::for_table_changes`].
@@ -1143,6 +1146,21 @@ impl LogSegment {
         self.read_original_actions(engine, action_schema.clone(), action_schema)
     }
 
+    /// Reads checkpoint-write input, timing each source before the streams are joined.
+    pub(crate) fn read_actions_for_checkpoint(
+        &self,
+        engine: &dyn Engine,
+        action_schema: SchemaRef,
+        metrics: CheckpointMetrics,
+    ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
+        self.read_original_actions_with_metrics(
+            engine,
+            action_schema.clone(),
+            action_schema,
+            metrics,
+        )
+    }
+
     /// Read the AMT `checkpoint` action from the manifest commit that `pointer` (the snapshot's
     /// `lastManifestCommit`) refers to.
     ///
@@ -1166,7 +1184,10 @@ impl LogSegment {
             engine
                 .json_handler()
                 .read_json_files(files, LOG_CHECKPOINT_SCHEMA.clone(), None)?;
-        require_pointed_checkpoint_action(pointer, first_checkpoint_action(batches)?)
+        let action = first_checkpoint_action(batches)?
+            .ok_or_else(|| missing_pointed_checkpoint_action(pointer))?;
+        require_pointed_checkpoint_action(pointer, &action)?;
+        Ok(action)
     }
 
     /// The listed commit at `pointer`'s version, or `None` when this segment does not list it.
@@ -1216,11 +1237,9 @@ impl LogSegment {
         Self::read_commit_files(engine, &files, schema)
     }
 
-    /// find a minimal set to cover the range of commits we want. This is greedy so not always
-    /// optimal, but we assume there are rarely overlapping compactions so this is okay. NB: This
-    /// returns files is DESCENDING ORDER, as that's what `replay` expects. This function assumes
-    /// that all files in `self.ascending_commit_files` and `self.ascending_compaction_files` are in
-    /// range for this log segment. This invariant is maintained by our listing code.
+    /// Returns commits and log compactions covering the segment's commits, newest first.
+    /// The greedy selection may not be minimal when compactions overlap. It relies on the file
+    /// range guarantees of [`LogSegment`].
     pub(crate) fn find_commit_cover(&self) -> Vec<FileMeta> {
         self.find_commit_cover_after(None)
     }
@@ -1310,11 +1329,34 @@ impl LogSegment {
         commit_schema: SchemaRef,
         checkpoint_schema: SchemaRef,
     ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
-        let commits = self.read_commit_actions(engine, commit_schema)?;
+        self.read_original_actions_with_metrics(
+            engine,
+            commit_schema,
+            checkpoint_schema,
+            CheckpointMetrics::disabled(),
+        )
+    }
+
+    fn read_original_actions_with_metrics(
+        &self,
+        engine: &dyn Engine,
+        commit_schema: SchemaRef,
+        checkpoint_schema: SchemaRef,
+        metrics: CheckpointMetrics,
+    ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
+        let commits = {
+            let _timer = metrics.start(CheckpointPhase::LogTailInput);
+            self.read_commit_actions(engine, commit_schema)?
+        };
         let predicate = checkpoint_action_projection_predicate(&checkpoint_schema);
+        let checkpoint = {
+            let _timer = metrics.start(CheckpointPhase::CheckpointInput);
+            self.create_checkpoint_stream(engine, checkpoint_schema, predicate, None, None)?
+        };
+        let commits = metrics.input_iterator(CheckpointPhase::LogTailInput, commits);
         let checkpoint =
-            self.create_checkpoint_stream(engine, checkpoint_schema, predicate, None, None)?;
-        Ok(commits.chain(checkpoint.actions))
+            metrics.input_iterator(CheckpointPhase::CheckpointInput, checkpoint.actions);
+        Ok(commits.chain(checkpoint))
     }
 
     /// Original published and staged commits in `(after, through]`, newest first.
@@ -1978,6 +2020,7 @@ impl LogSegment {
 
     /// Retains the files on failure so callers can classify errors using the validated state.
     /// Commits at or before the checkpoint are filtered out before replay continuity checks.
+    /// Log compactions outside the range guaranteed by [`LogSegment`] are dropped.
     fn try_new_impl(
         listed_files: &mut LogSegmentFiles,
         log_root: Url,
@@ -2009,9 +2052,15 @@ impl LogSegment {
             &listed_files.checkpoint_parts,
             end_version,
         )?;
-        // Future compactions cannot bound replay or post-commit statistics.
+        // Like commits, compactions must start after the checkpoint: replay should only read
+        // compactions ahead of the checkpoint.
         listed_files.ascending_compaction_files.retain(|file| {
-            matches!(file.file_type, LogPathFileType::CompactedCommit { hi } if hi <= effective_version)
+            matches!(
+                file.file_type,
+                LogPathFileType::CompactedCommit { hi }
+                    if checkpoint_version.is_none_or(|cp| cp < file.version)
+                        && hi <= effective_version
+            )
         });
         validate_latest_commit_file(listed_files, effective_version)?;
         validate_crc(
@@ -2047,16 +2096,13 @@ fn first_checkpoint_action(
     Ok(None)
 }
 
-/// Returns `action`, read from the manifest commit `pointer` names, after checking that it exists
-/// and has the pointer's content root version.
+/// Errors unless `action`, read from the manifest commit `pointer` names, has the pointer's content
+/// root version.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 fn require_pointed_checkpoint_action(
     pointer: &LastManifestCommit,
-    action: Option<CheckpointAction>,
-) -> KernelResult<CheckpointAction> {
-    let action = action.ok_or_else(|| {
-        last_manifest_commit_inconsistency(pointer, "that commit carries no checkpoint action")
-    })?;
+    action: &CheckpointAction,
+) -> KernelResult<()> {
     require!(
         action.content_root_version() == pointer.content_root_version,
         last_manifest_commit_inconsistency(
@@ -2067,7 +2113,13 @@ fn require_pointed_checkpoint_action(
             )
         )
     );
-    Ok(action)
+    Ok(())
+}
+
+/// The error for when the manifest commit that `pointer` names carries no checkpoint action.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn missing_pointed_checkpoint_action(pointer: &LastManifestCommit) -> KernelError {
+    last_manifest_commit_inconsistency(pointer, "that commit carries no checkpoint action")
 }
 
 /// The error for a `pointer` that the log contradicts, as explained by `detail`.
