@@ -601,6 +601,16 @@ async fn empty_string_partition_pruning(#[values(false, true)] native_checkpoint
     "2024-03-10 02:30:00",
     "2024-03-10T10:30:00Z"
 )]
+#[case::hst_historical(Some("HST"), "1940-01-01 00:00:00", "1940-01-01T10:00:00Z")]
+#[case::mst_historical(Some("MST"), "1943-07-01 00:00:00", "1943-07-01T07:00:00Z")]
+#[case::est_historical(Some("EST"), "1900-01-01 00:00:00", "1900-01-01T05:00:00Z")]
+#[case::honolulu_historical(
+    Some("Pacific/Honolulu"),
+    "1940-01-01 00:00:00",
+    "1940-01-01T10:30:00Z"
+)]
+#[case::phoenix_historical(Some("America/Phoenix"), "1943-07-01 00:00:00", "1943-07-01T06:00:00Z")]
+#[case::panama_historical(Some("America/Panama"), "1900-01-01 00:00:00", "1900-01-01T05:19:36Z")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn offset_less_timestamp_partition_read_with_json_and_checkpoint(
     #[case] tz: Option<&str>,
@@ -734,6 +744,7 @@ async fn offset_less_timestamp_partition_read_with_json_and_checkpoint(
         col("p_ts") < lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))
     )),
     None,
+    ("2024-01-15 12:30:45.123456", "2024-01-15T18:30:45.123456Z"),
     &[
         ("offset-less-in-checkpoint.parquet", "2024-01-15T12:30:45.123456Z"),
         ("offset-less-in-json.parquet", "2024-01-15T12:30:45.123456Z"),
@@ -745,6 +756,7 @@ async fn offset_less_timestamp_partition_read_with_json_and_checkpoint(
         col("p_ts") > lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))
     )),
     None,
+    ("2024-01-15 12:30:45.123456", "2024-01-15T18:30:45.123456Z"),
     &[
         ("utc-in-checkpoint.parquet", "2024-01-15T18:30:45.123456Z"),
         ("utc-in-json.parquet", "2024-01-15T18:30:45.123456Z"),
@@ -756,6 +768,7 @@ async fn offset_less_timestamp_partition_read_with_json_and_checkpoint(
         col("p_ts") < lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))
     )),
     Some("America/Los_Angeles"),
+    ("2024-01-15 12:30:45.123456", "2024-01-15T18:30:45.123456Z"),
     &[("offset-less-in-checkpoint.parquet", "2024-01-15T12:30:45.123456Z")],
     true /* write_parsed_partition */
 )]
@@ -764,6 +777,7 @@ async fn offset_less_timestamp_partition_read_with_json_and_checkpoint(
         col("p_ts") > lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))
     )),
     Some("America/Los_Angeles"),
+    ("2024-01-15 12:30:45.123456", "2024-01-15T18:30:45.123456Z"),
     &[
         ("offset-less-in-json.parquet", "2024-01-15T20:30:45.123456Z"),
         ("utc-in-checkpoint.parquet", "2024-01-15T18:30:45.123456Z"),
@@ -776,13 +790,51 @@ async fn offset_less_timestamp_partition_read_with_json_and_checkpoint(
         col("p_ts") < lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))
     )),
     Some("America/Los_Angeles"),
+    ("2024-01-15 12:30:45.123456", "2024-01-15T18:30:45.123456Z"),
     &[],
+    false /* write_parsed_partition */
+)]
+#[case::hst_historical(
+    Predicate::from_expr(expr!(
+        col("p_ts") == lit(Scalar::Timestamp(timestamp_micros("1940-01-01T10:00:00Z")))
+    )),
+    Some("HST"),
+    ("1940-01-01 00:00:00", "1940-01-01T10:30:00Z"),
+    &[
+        ("offset-less-in-checkpoint.parquet", "1940-01-01T10:00:00Z"),
+        ("offset-less-in-json.parquet", "1940-01-01T10:00:00Z"),
+    ],
+    false /* write_parsed_partition */
+)]
+#[case::mst_historical(
+    Predicate::from_expr(expr!(
+        col("p_ts") == lit(Scalar::Timestamp(timestamp_micros("1943-07-01T07:00:00Z")))
+    )),
+    Some("MST"),
+    ("1943-07-01 00:00:00", "1943-07-01T06:00:00Z"),
+    &[
+        ("offset-less-in-checkpoint.parquet", "1943-07-01T07:00:00Z"),
+        ("offset-less-in-json.parquet", "1943-07-01T07:00:00Z"),
+    ],
+    false /* write_parsed_partition */
+)]
+#[case::est_historical(
+    Predicate::from_expr(expr!(
+        col("p_ts") == lit(Scalar::Timestamp(timestamp_micros("1900-01-01T05:00:00Z")))
+    )),
+    Some("EST"),
+    ("1900-01-01 00:00:00", "1900-01-01T05:19:36Z"),
+    &[
+        ("offset-less-in-checkpoint.parquet", "1900-01-01T05:00:00Z"),
+        ("offset-less-in-json.parquet", "1900-01-01T05:00:00Z"),
+    ],
     false /* write_parsed_partition */
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn offset_less_timestamp_partition_predicates_with_json_and_checkpoint(
     #[case] predicate: Predicate,
     #[case] tz: Option<&str>,
+    #[case] timestamps: (&str, &str),
     #[case] expected_files_and_timestamps: &[(&str, &str)],
     #[case] write_parsed_partition: bool,
     #[values(false, true)] parsed_struct_on_scan: bool,
@@ -801,11 +853,11 @@ async fn offset_less_timestamp_partition_predicates_with_json_and_checkpoint(
         &[
             TimestampPartitionFile {
                 filename: "offset-less-in-checkpoint.parquet",
-                timestamp: "2024-01-15 12:30:45.123456",
+                timestamp: timestamps.0,
             },
             TimestampPartitionFile {
                 filename: "utc-in-checkpoint.parquet",
-                timestamp: "2024-01-15T18:30:45.123456Z",
+                timestamp: timestamps.1,
             },
         ],
     )
@@ -820,11 +872,11 @@ async fn offset_less_timestamp_partition_predicates_with_json_and_checkpoint(
         &[
             TimestampPartitionFile {
                 filename: "offset-less-in-json.parquet",
-                timestamp: "2024-01-15 12:30:45.123456",
+                timestamp: timestamps.0,
             },
             TimestampPartitionFile {
                 filename: "utc-in-json.parquet",
-                timestamp: "2024-01-15T18:30:45.123456Z",
+                timestamp: timestamps.1,
             },
         ],
     )
