@@ -45,7 +45,7 @@ use crate::engine::arrow_utils::{list_type_with_element, parse_json_impl, prim_a
 use crate::engine::ensure_data_types::{ValidationMode, ensure_data_types};
 use crate::error::{KernelError, KernelResult};
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::expressions::ManifestDvContainsPredicate;
+use crate::expressions::MumblingBitmapContainsPredicate;
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, CaseWhenExpression,
     CastExpression, CastMode, Expression, ExpressionRef, ExpressionStructPatch, JunctionPredicate,
@@ -908,8 +908,8 @@ pub fn evaluate_predicate(
                 .unwrap_or_else(|| Ok(BooleanArray::from(vec![default; batch.num_rows()])))
         }
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        ManifestDvContains(pred) => {
-            let contains = evaluate_manifest_dv_contains(pred, batch)?;
+        MumblingBitmapContains(pred) => {
+            let contains = evaluate_mumbling_bitmap_contains(pred, batch)?;
             Ok(if inverted { not(&contains)? } else { contains })
         }
         Opaque(OpaquePredicate { op, exprs }) => {
@@ -1015,40 +1015,38 @@ fn map_string_rows<'a, T>(
     }
 }
 
-/// Evaluates [`ManifestDvContainsPredicate`], parsing its literal deletion vector once per batch.
+/// Evaluates [`MumblingBitmapContainsPredicate`], parsing its literal bitmap once per batch.
 #[cfg(feature = "adaptive-metadata-in-dev")]
-fn evaluate_manifest_dv_contains(
-    pred: &ManifestDvContainsPredicate,
+fn evaluate_mumbling_bitmap_contains(
+    pred: &MumblingBitmapContainsPredicate,
     batch: &RecordBatch,
 ) -> KernelResult<BooleanArray> {
-    let dv = match pred.dv.as_ref() {
-        Expression::Literal(Scalar::Binary(bytes)) => Some(
+    let bitmap = match pred.bitmap.as_ref() {
+        Expression::Literal(Scalar::Binary(bytes)) => {
             MumblingBitmap::deserialize(Bytes::copy_from_slice(bytes)).map_err(|e| {
-                KernelError::invalid_checkpoint(format!("Malformed manifest deletion vector: {e}"))
-            })?,
-        ),
-        Expression::Literal(Scalar::Null(DataType::BINARY)) => None,
+                KernelError::invalid_expression(format!(
+                    "MUMBLING_BITMAP_CONTAINS bitmap does not parse: {e}"
+                ))
+            })?
+        }
+        Expression::Literal(Scalar::Null(DataType::BINARY)) => {
+            return Ok(BooleanArray::new_null(batch.num_rows()));
+        }
         other => {
             return Err(KernelError::invalid_expression(format!(
-                "MANIFEST_DV_CONTAINS deletion vector must be a BINARY literal, got {other}"
+                "MUMBLING_BITMAP_CONTAINS bitmap must be a BINARY literal, got {other}"
             )));
         }
     };
-    let positions = evaluate_expression(&pred.position, batch, Some(&DataType::LONG))?;
-    let positions = positions.as_primitive_opt::<Int64Type>().ok_or_else(|| {
+    let values = evaluate_expression(&pred.value, batch, Some(&DataType::LONG))?;
+    let values = values.as_primitive_opt::<Int64Type>().ok_or_else(|| {
         KernelError::invalid_expression(format!(
-            "MANIFEST_DV_CONTAINS position must be LONG, got {}",
-            positions.data_type()
+            "MUMBLING_BITMAP_CONTAINS value must be LONG, got {}",
+            values.data_type()
         ))
     })?;
-    let contains = |position: i64| {
-        dv.as_ref()
-            .is_some_and(|dv| u32::try_from(position).is_ok_and(|pos| dv.contains(pos)))
-    };
-    Ok(positions
-        .iter()
-        .map(|position| position.map(contains))
-        .collect())
+    let contains = |value: i64| u32::try_from(value).is_ok_and(|value| bitmap.contains(value));
+    Ok(values.iter().map(|value| value.map(contains)).collect())
 }
 
 /// `chrono` formats for `TIMESTAMP_NTZ` and `TIMESTAMP` values in JSON stats.
@@ -2483,7 +2481,7 @@ mod tests {
     }
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn manifest_dv_batch() -> RecordBatch {
+    fn bitmap_values_batch() -> RecordBatch {
         let positions = Int64Array::from(vec![
             Some(0),
             Some(1),
@@ -2495,11 +2493,10 @@ mod tests {
         RecordBatch::try_from_iter([("pos", Arc::new(positions) as ArrayRef)]).unwrap()
     }
 
-    /// Positions that are NULL stay NULL; positions no manifest deletion vector can hold are
-    /// never removed.
+    /// NULL values stay NULL; values no bitmap can hold are never contained.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[rstest]
-    #[case::removes_position_one(
+    #[case::contains_one(
         lit(Scalar::Binary(encode_positions(&[1]).to_vec())),
         false,
         &[Some(false), Some(true), Some(false), None, Some(false), Some(false)]
@@ -2509,43 +2506,40 @@ mod tests {
         true,
         &[Some(true), Some(false), Some(true), None, Some(true), Some(true)]
     )]
-    #[case::null_dv_removes_nothing(
-        null_lit(DataType::BINARY),
-        false,
-        &[Some(false), Some(false), Some(false), None, Some(false), Some(false)]
-    )]
-    fn test_manifest_dv_contains(
-        #[case] dv: Expr,
+    #[case::null_bitmap_is_null(null_lit(DataType::BINARY), false, &[None; 6])]
+    #[case::null_bitmap_inverted_is_null(null_lit(DataType::BINARY), true, &[None; 6])]
+    fn test_mumbling_bitmap_contains(
+        #[case] bitmap: Expr,
         #[case] inverted: bool,
         #[case] expected: &[Option<bool>],
     ) {
-        let pred = Pred::manifest_dv_contains(dv, col!("pos"));
-        let result = evaluate_predicate(&pred, &manifest_dv_batch(), inverted).unwrap();
+        let pred = Pred::mumbling_bitmap_contains(bitmap, col!("pos"));
+        let result = evaluate_predicate(&pred, &bitmap_values_batch(), inverted).unwrap();
         assert_eq!(result, BooleanArray::from(expected.to_vec()));
     }
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[rstest]
-    #[case::malformed_dv(
+    #[case::malformed_bitmap(
         lit(Scalar::Binary(vec![1, 2, 3])),
         col!("pos"),
-        "Malformed manifest deletion vector"
+        "Invalid expression evaluation: MUMBLING_BITMAP_CONTAINS bitmap does not parse"
     )]
-    #[case::non_binary_dv(lit(7), col!("pos"), "deletion vector must be a BINARY literal")]
-    #[case::column_dv(col!("pos"), col!("pos"), "deletion vector must be a BINARY literal")]
-    #[case::non_long_position(
+    #[case::non_binary_bitmap(lit(7), col!("pos"), "bitmap must be a BINARY literal")]
+    #[case::column_bitmap(col!("pos"), col!("pos"), "bitmap must be a BINARY literal")]
+    #[case::non_long_value(
         lit(Scalar::Binary(encode_positions(&[1]).to_vec())),
         lit(1i32),
-        "position must be LONG"
+        "value must be LONG"
     )]
-    fn test_manifest_dv_contains_rejects_bad_input(
-        #[case] dv: Expr,
-        #[case] position: Expr,
+    fn test_mumbling_bitmap_contains_rejects_bad_input(
+        #[case] bitmap: Expr,
+        #[case] value: Expr,
         #[case] expected_error: &str,
     ) {
-        let pred = Pred::manifest_dv_contains(dv, position);
+        let pred = Pred::mumbling_bitmap_contains(bitmap, value);
         assert_result_error_with_message(
-            evaluate_predicate(&pred, &manifest_dv_batch(), false),
+            evaluate_predicate(&pred, &bitmap_values_batch(), false),
             expected_error,
         );
     }

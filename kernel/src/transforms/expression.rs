@@ -2,7 +2,7 @@ use std::borrow::{Cow, ToOwned};
 use std::sync::Arc;
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::expressions::ManifestDvContainsPredicate;
+use crate::expressions::MumblingBitmapContainsPredicate;
 use crate::expressions::{
     BinaryExpression, BinaryPredicate, CaseWhenExpression, CastExpression, ColumnName, Expression,
     ExpressionRef, ExpressionStructPatch, JunctionPredicate, MapToStructExpression,
@@ -219,14 +219,15 @@ pub trait ExpressionTransform<'a> {
         self.recurse_into_pred_junction(pred)
     }
 
-    /// Called for each manifest deletion vector lookup encountered during the traversal. The
-    /// provided implementation just forwards to [`Self::recurse_into_pred_manifest_dv_contains`].
+    /// Called for each Mumbling bitmap lookup encountered during the traversal. The
+    /// provided implementation just forwards to
+    /// [`Self::recurse_into_pred_mumbling_bitmap_contains`].
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn transform_pred_manifest_dv_contains(
+    fn transform_pred_mumbling_bitmap_contains(
         &mut self,
-        pred: &'a ManifestDvContainsPredicate,
-    ) -> Self::Output<ManifestDvContainsPredicate> {
-        self.recurse_into_pred_manifest_dv_contains(pred)
+        pred: &'a MumblingBitmapContainsPredicate,
+    ) -> Self::Output<MumblingBitmapContainsPredicate> {
+        self.recurse_into_pred_mumbling_bitmap_contains(pred)
     }
 
     /// Called for each opaque predicate encountered during the traversal. The provided
@@ -336,9 +337,9 @@ pub trait ExpressionTransform<'a> {
                 map_owned_or_else(pred, child, |j| Predicate::junction(j.op, j.preds))
             }
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            Predicate::ManifestDvContains(m) => {
-                let child = self.transform_pred_manifest_dv_contains(m);
-                map_owned_or_else(pred, child, Predicate::ManifestDvContains)
+            Predicate::MumblingBitmapContains(m) => {
+                let child = self.transform_pred_mumbling_bitmap_contains(m);
+                map_owned_or_else(pred, child, Predicate::MumblingBitmapContains)
             }
             Predicate::Opaque(o) => {
                 let child = self.transform_pred_opaque(o);
@@ -428,16 +429,16 @@ pub trait ExpressionTransform<'a> {
         map_owned_pair_or_else(b, left, right, f)
     }
 
-    /// Recursively transforms the children of a manifest deletion vector lookup (binary).
+    /// Recursively transforms the children of a Mumbling bitmap lookup (binary).
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn recurse_into_pred_manifest_dv_contains(
+    fn recurse_into_pred_mumbling_bitmap_contains(
         &mut self,
-        m: &'a ManifestDvContainsPredicate,
-    ) -> Self::Output<ManifestDvContainsPredicate> {
-        let dv = self.transform_expr(&m.dv);
-        let position = self.transform_expr(&m.position);
-        let f = |(dv, position)| ManifestDvContainsPredicate::new(dv, position);
-        map_owned_pair_or_else(m, dv, position, f)
+        m: &'a MumblingBitmapContainsPredicate,
+    ) -> Self::Output<MumblingBitmapContainsPredicate> {
+        let bitmap = self.transform_expr(&m.bitmap);
+        let value = self.transform_expr(&m.value);
+        let f = |(bitmap, value)| MumblingBitmapContainsPredicate::new(bitmap, value);
+        map_owned_pair_or_else(m, bitmap, value, f)
     }
 
     /// Recursively transforms a unary expression's child (unary).
@@ -627,11 +628,11 @@ impl<'a> ExpressionTransform<'a> for ExpressionDepthChecker {
     }
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn transform_pred_manifest_dv_contains(
+    fn transform_pred_mumbling_bitmap_contains(
         &mut self,
-        pred: &'a ManifestDvContainsPredicate,
+        pred: &'a MumblingBitmapContainsPredicate,
     ) -> KernelResult<()> {
-        self.depth_limited(Self::recurse_into_pred_manifest_dv_contains, pred)
+        self.depth_limited(Self::recurse_into_pred_mumbling_bitmap_contains, pred)
     }
 
     fn transform_pred_junction(&mut self, pred: &'a JunctionPredicate) -> KernelResult<()> {
@@ -852,12 +853,12 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn test_transform_pred_manifest_dv_contains_rewrites_both_children() {
-        let pred = Pred::manifest_dv_contains(col!("old_col"), col!("old_col"));
+    fn test_transform_pred_mumbling_bitmap_contains_rewrites_both_children() {
+        let pred = Pred::mumbling_bitmap_contains(col!("old_col"), col!("old_col"));
         let result = ColumnReplacer(Some("new_col")).transform_pred(&pred);
         assert_eq!(
             result.as_deref(),
-            Some(&Pred::manifest_dv_contains(
+            Some(&Pred::mumbling_bitmap_contains(
                 col!("new_col"),
                 col!("new_col")
             ))

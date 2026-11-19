@@ -753,9 +753,9 @@ fn test_eval_expr_evaluates_only_safe_casts(#[case] expr: Expr, #[case] expected
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[test]
-fn test_manifest_dv_contains_is_never_evaluated_for_skipping() {
+fn test_mumbling_bitmap_contains_is_never_evaluated_for_skipping() {
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::Long(1));
-    let pred = Pred::manifest_dv_contains(lit(Scalar::Binary(vec![])), col!("pos"));
+    let pred = Pred::mumbling_bitmap_contains(lit(Scalar::Binary(vec![])), col!("pos"));
     assert_eq!(filter.eval(&pred), None);
 }
 

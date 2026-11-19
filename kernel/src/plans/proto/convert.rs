@@ -11,7 +11,7 @@ use super::{
     expressions as proto_expr, operation as proto_op, plan as proto_plan, schema as proto_schema,
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::expressions::MANIFEST_DV_CONTAINS_NAME;
+use crate::expressions::MUMBLING_BITMAP_CONTAINS_NAME;
 use crate::expressions::{
     ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
     ColumnName, DecimalData, Expression, ExpressionFieldPatch, ExpressionStructPatch,
@@ -398,10 +398,10 @@ impl From<&Predicate> for proto_expr::Predicate {
             Predicate::Binary(binary) => Kind::Binary(Box::new(binary.into())),
             Predicate::Junction(junction) => Kind::Junction(junction.into()),
             Predicate::Opaque(opaque) => Kind::Opaque(opaque.into()),
-            // No proto node for manifest deletion vector lookups; serialize as an opaque unknown.
+            // No proto node for Mumbling bitmap lookups; serialize as an opaque unknown.
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            Predicate::ManifestDvContains(_) => {
-                Kind::Unknown(MANIFEST_DV_CONTAINS_NAME.to_string())
+            Predicate::MumblingBitmapContains(_) => {
+                Kind::Unknown(MUMBLING_BITMAP_CONTAINS_NAME.to_string())
             }
             Predicate::Unknown(name) => Kind::Unknown(name.clone()),
         };
@@ -1850,11 +1850,11 @@ mod tests {
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
-    fn from_manifest_dv_contains_lowers_to_unknown() {
-        let pred = Predicate::manifest_dv_contains(col!("dv"), col!("pos"));
+    fn from_mumbling_bitmap_contains_lowers_to_unknown() {
+        let pred = Predicate::mumbling_bitmap_contains(col!("bitmap"), col!("value"));
         assert_eq!(
             proto_expr::Predicate::from(&pred).kind,
-            Some(PredKind::Unknown("manifest_dv_contains".to_string()))
+            Some(PredKind::Unknown("mumbling_bitmap_contains".to_string()))
         );
     }
 
