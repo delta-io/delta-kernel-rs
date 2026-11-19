@@ -1869,6 +1869,18 @@ mod tests {
     }
 
     #[test]
+    fn from_map_len_expression() {
+        let proto_expr::expression::Kind::Unary(unary) =
+            expr_kind_of(Expression::column(["m"]).map_len())
+        else {
+            panic!("expected a unary expression");
+        };
+        assert_eq!(unary.op, proto_expr::UnaryExpressionOp::MapLen as i32);
+        assert!(!unary.to_json_full_precision_timestamps);
+        assert!(unary.expr.is_some());
+    }
+
+    #[test]
     fn from_binary_expression() {
         let proto_expr::expression::Kind::Binary(binary) =
             expr_kind_of(Expression::binary(BinaryExpressionOp::Plus, lit(1), lit(2)))

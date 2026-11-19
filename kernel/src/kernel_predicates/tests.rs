@@ -722,6 +722,21 @@ fn test_has_uri_scheme_is_never_evaluated_for_skipping(
     );
 }
 
+#[rstest::rstest]
+#[case::literal_and_column(lit("a"), col!("m"))]
+#[case::cast_and_literal(Expr::cast(col!("m"), DataType::STRING), lit("a"))]
+#[case::literal_and_cast(lit("a"), Expr::cast(col!("m"), DataType::STRING))]
+#[case::literals(lit("a"), lit("a"))]
+fn test_eval_map_has_key_operand_shapes(
+    #[case] left: Expr,
+    #[case] right: Expr,
+    #[values(false, true)] inverted: bool,
+) {
+    let filter = DefaultKernelPredicateEvaluator::from(Scalar::String("1".to_string()));
+    let result = filter.eval_pred_binary(BinaryPredicateOp::MapHasKey, &left, &right, inverted);
+    assert_eq!(result, None);
+}
+
 #[derive(Debug, PartialEq)]
 struct OpaqueLessThanOp;
 impl OpaqueLessThanOp {
