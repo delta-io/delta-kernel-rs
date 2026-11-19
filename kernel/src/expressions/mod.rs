@@ -503,21 +503,19 @@ pub enum CastMode {
     Strict,
 }
 
-/// A predicate that is TRUE when an adaptiveMetadata manifest deletion vector removes the manifest
-/// entry at `position`.
+/// A predicate that is TRUE when a serialized Iceberg Mumbling bitmap contains `value`.
 ///
-/// `dv` is a BINARY literal holding a manifest deletion vector in the serialized form of a
-/// DataManifest entry's `manifestInfo.dv`, and `position` is a LONG entry position within the
-/// manifest it applies to. The predicate is NULL when `position` is NULL, and otherwise FALSE when
-/// `dv` is NULL or `position` lies outside the positions a manifest deletion vector can hold.
-/// Evaluation fails if `dv` is not a literal or does not parse.
+/// `bitmap` is a BINARY literal holding a bitmap in the Mumbling serialized form (for example an
+/// adaptiveMetadata manifest deletion vector), and `value` is a LONG. The predicate is NULL when
+/// either input is NULL, and FALSE when `value` lies outside the values a bitmap can hold. Use NOT
+/// for the complement. Evaluation fails if `bitmap` is not a literal or does not parse.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ManifestDvContainsPredicate {
-    /// The manifest deletion vector, a BINARY literal.
-    pub dv: Box<Expression>,
-    /// The manifest entry position to look up.
-    pub position: Box<Expression>,
+pub struct MumblingBitmapContainsPredicate {
+    /// The serialized bitmap, a BINARY literal.
+    pub bitmap: Box<Expression>,
+    /// The value to look up.
+    pub value: Box<Expression>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -704,10 +702,10 @@ pub enum Predicate {
     Binary(BinaryPredicate),
     /// A junction operation (AND/OR).
     Junction(JunctionPredicate),
-    /// Whether a manifest deletion vector removes a manifest entry. See
-    /// [`ManifestDvContainsPredicate`].
+    /// Whether a serialized Mumbling bitmap contains a value. See
+    /// [`MumblingBitmapContainsPredicate`].
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    ManifestDvContains(ManifestDvContainsPredicate),
+    MumblingBitmapContains(MumblingBitmapContainsPredicate),
     /// A predicate that the engine defines and implements. Kernel interacts with the predicate
     /// only through methods provided by the [`OpaquePredicateOp`] trait.
     #[serde(serialize_with = "fail_serialize_opaque_predicate")]
@@ -991,20 +989,20 @@ impl CastMode {
 }
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
-impl ManifestDvContainsPredicate {
-    pub(crate) fn new(dv: impl Into<Expression>, position: impl Into<Expression>) -> Self {
+impl MumblingBitmapContainsPredicate {
+    pub(crate) fn new(bitmap: impl Into<Expression>, value: impl Into<Expression>) -> Self {
         Self {
-            dv: Box::new(dv.into()),
-            position: Box::new(position.into()),
+            bitmap: Box::new(bitmap.into()),
+            value: Box::new(value.into()),
         }
     }
 }
 
-/// The name a [`Predicate::ManifestDvContains`] is lowered to where a boundary has no node for it
-/// and must pass it as [`Predicate::Unknown`].
+/// The name a [`Predicate::MumblingBitmapContains`] is lowered to where a boundary has no node for
+/// it and must pass it as [`Predicate::Unknown`].
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[internal_api]
-pub(crate) const MANIFEST_DV_CONTAINS_NAME: &str = "manifest_dv_contains";
+pub(crate) const MUMBLING_BITMAP_CONTAINS_NAME: &str = "mumbling_bitmap_contains";
 
 impl JunctionPredicate {
     pub(crate) fn new(op: JunctionPredicateOp, preds: Vec<Predicate>) -> Self {
@@ -1309,14 +1307,14 @@ impl Predicate {
         Self::binary(BinaryPredicateOp::Distinct, a, b)
     }
 
-    /// Creates a predicate that is TRUE when the manifest deletion vector `dv` removes the entry at
-    /// `position`. See [`ManifestDvContainsPredicate`].
+    /// Creates a predicate that is TRUE when the serialized Mumbling bitmap `bitmap` contains
+    /// `value`. See [`MumblingBitmapContainsPredicate`].
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    pub fn manifest_dv_contains(
-        dv: impl Into<Expression>,
-        position: impl Into<Expression>,
+    pub fn mumbling_bitmap_contains(
+        bitmap: impl Into<Expression>,
+        value: impl Into<Expression>,
     ) -> Self {
-        Self::ManifestDvContains(ManifestDvContainsPredicate::new(dv, position))
+        Self::MumblingBitmapContains(MumblingBitmapContainsPredicate::new(bitmap, value))
     }
 
     /// Create a new predicate `self AND other`
@@ -1574,8 +1572,8 @@ impl Display for Predicate {
                 write!(f, "{op}({})", format_child_list(preds))
             }
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            ManifestDvContains(ManifestDvContainsPredicate { dv, position }) => {
-                write!(f, "MANIFEST_DV_CONTAINS({dv}, {position})")
+            MumblingBitmapContains(MumblingBitmapContainsPredicate { bitmap, value }) => {
+                write!(f, "MUMBLING_BITMAP_CONTAINS({bitmap}, {value})")
             }
             Opaque(OpaquePredicate { op, exprs }) => {
                 write!(f, "{op:?}({})", format_child_list(exprs))
@@ -1939,12 +1937,12 @@ mod tests {
 
         #[cfg(feature = "adaptive-metadata-in-dev")]
         #[test]
-        fn test_manifest_dv_contains_roundtrip_and_display() {
-            let pred = Predicate::manifest_dv_contains(col!("dv"), col!("pos"));
+        fn test_mumbling_bitmap_contains_roundtrip_and_display() {
+            let pred = Predicate::mumbling_bitmap_contains(col!("bitmap"), col!("value"));
             assert_roundtrip(&pred);
             assert_eq!(
                 pred.to_string(),
-                "MANIFEST_DV_CONTAINS(Column(dv), Column(pos))"
+                "MUMBLING_BITMAP_CONTAINS(Column(bitmap), Column(value))"
             );
         }
 
