@@ -10,7 +10,7 @@ use crate::content_tree::{
     DeletionVectorInfo, KEY_METADATA, LOCATION,
 };
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::expressions::{ArrayData, Expression, Predicate, Scalar, lit, null_lit};
+use crate::expressions::{ArrayData, Expression, Scalar, lit, null_lit};
 use crate::schema::{
     ArrayType, ColumnName, DataType, SchemaRef, ToSchema as _, column_name, lazy_schema_ref,
 };
@@ -88,41 +88,42 @@ pub(crate) static ADD_DV_HELPER_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 /// entry's `deletionVector` column plus the [`ADD_DV_HELPER_SCHEMA`] columns: the inverse of
 /// [`extract_deletion_vector_content`].
 ///
-/// The descriptor is null wherever `kept` is not TRUE, such as [`kept_deletion_vector`]. A kept
-/// entry must have been validated by [`AddDeletionVectorColumns::try_push`], and evaluation fails
-/// if its offset or Delta size does not fit the descriptor's i32 fields. A relative location
-/// becomes a `PersistedUnencodedRelative` (`'r'`) descriptor; an absolute one becomes
-/// `PersistedAbsolute` (`'p'`).
-pub(crate) fn add_deletion_vector_expression(kept: Predicate) -> Expression {
+/// The descriptor is null for every entry [`AddDeletionVectorColumns`] pushed as null, and is
+/// otherwise built from the entry validated by [`AddDeletionVectorColumns::try_push`]. Evaluation
+/// fails if any entry with a deletion vector, including one the caller drops, has an offset or
+/// Delta size that does not fit the descriptor's i32 fields. A relative location becomes a
+/// `PersistedUnencodedRelative` (`'r'`) descriptor; an absolute one becomes `PersistedAbsolute`
+/// (`'p'`).
+pub(crate) fn add_deletion_vector_expression() -> Expression {
     let dv_field = |field: &str| Expression::column([DV_INFO, field]);
     // Only the storage type and an absolute location's percent-encoding need per-row work, so only
     // they come from helper columns; every other field passes through.
-    let descriptor = Expression::struct_from([
-        Expression::column([DV_STORAGE_TYPE_HELPER]),
-        Expression::coalesce([
-            Expression::column([DV_ABSOLUTE_PATH_HELPER]),
-            dv_field(LOCATION),
-        ]),
-        Expression::cast_strict(dv_field(DV_INFO_OFFSET), DataType::INTEGER),
-        // Undo the +8 framing of `extract_deletion_vector_content`.
-        Expression::cast_strict(
-            dv_field(DV_INFO_SIZE_IN_BYTES) - lit(8i64),
-            DataType::INTEGER,
-        ),
-        dv_field(DV_INFO_CARDINALITY),
-    ]);
-    // A dropped entry is never validated, so only kept entries may reach the strict casts. Row
-    // visitors read leaves without the parent's null mask, and the null struct has null leaves.
+    let descriptor = Expression::struct_with_nullability_from(
+        [
+            Expression::column([DV_STORAGE_TYPE_HELPER]),
+            Expression::coalesce([
+                Expression::column([DV_ABSOLUTE_PATH_HELPER]),
+                dv_field(LOCATION),
+            ]),
+            Expression::cast_strict(dv_field(DV_INFO_OFFSET), DataType::INTEGER),
+            // Undo the +8 framing of `extract_deletion_vector_content`.
+            Expression::cast_strict(
+                dv_field(DV_INFO_SIZE_IN_BYTES) - lit(8i64),
+                DataType::INTEGER,
+            ),
+            dv_field(DV_INFO_CARDINALITY),
+        ],
+        // Keyed off the storage type helper, not `deletionVector`: row visitors read leaves
+        // without the parent's null mask, so the descriptor must be null exactly where its
+        // `storageType` leaf is, including for entries the caller drops.
+        Expression::from(Expression::column([DV_STORAGE_TYPE_HELPER]).is_not_null()),
+    );
+    // Engines need not null out the leaves of a null `deletionVector` struct, and CASE evaluates a
+    // branch only on the rows it selects, so the strict casts see only real deletion vectors.
     Expression::case_when(
-        [(kept, descriptor)],
+        [(Expression::column([DV_INFO]).is_not_null(), descriptor)],
         null_lit(DeletionVectorDescriptor::to_schema()),
     )
-}
-
-/// The entries whose deletion vector [`AddDeletionVectorColumns`] kept: the `kept` predicate of
-/// [`add_deletion_vector_expression`] for a batch carrying those helper columns.
-pub(crate) fn kept_deletion_vector() -> Predicate {
-    Expression::column([DV_STORAGE_TYPE_HELPER]).is_not_null()
 }
 
 /// Accumulates the [`ADD_DV_HELPER_SCHEMA`] columns for one entry batch, one row per entry: the
@@ -880,9 +881,7 @@ mod tests {
         let output = handler
             .new_expression_evaluator(
                 Arc::new(input_schema),
-                Arc::new(Expression::struct_from([add_deletion_vector_expression(
-                    kept_deletion_vector(),
-                )])),
+                Arc::new(Expression::struct_from([add_deletion_vector_expression()])),
                 output_type.into(),
             )?
             .evaluate(entries.as_ref())?;
@@ -1010,7 +1009,7 @@ mod tests {
     )]
     #[case::size_overflow(
         DeletionVectorInfo { size_in_bytes: i64::from(i32::MAX) + 10, ..test_dv_info() },
-        "2147483649"
+        "Strict cast of Int64 to integer failed: Cast error: Can't cast value 2147483649"
     )]
     #[case::negative_offset(
         DeletionVectorInfo { offset: -1, ..test_dv_info() },
@@ -1018,7 +1017,7 @@ mod tests {
     )]
     #[case::offset_overflow(
         DeletionVectorInfo { offset: i64::from(i32::MAX) + 1, ..test_dv_info() },
-        "2147483648"
+        "Strict cast of Int64 to integer failed: Cast error: Can't cast value 2147483648"
     )]
     #[case::negative_cardinality(
         DeletionVectorInfo { cardinality: -1, ..test_dv_info() },
