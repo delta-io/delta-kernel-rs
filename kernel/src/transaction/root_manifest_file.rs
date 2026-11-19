@@ -810,6 +810,7 @@ mod tests {
     }
 
     /// One row of [`compute_checkpoint_action_reuses_or_inlines_sidecars`], as keys per source.
+    #[derive(Clone, Copy)]
     struct SidecarRow {
         before: &'static [&'static str],
         inline: &'static [&'static str],
@@ -821,16 +822,15 @@ mod tests {
         sidecars_read: bool,
     }
 
-    // Entry values tell the sources apart: 0 logged before the action, 1 in the action, 2 logged
-    // after it, 3 set by this transaction.
+    // Each source writes a distinct value, so the assertions show which one won.
     const BEFORE: i64 = 0;
     const EXISTING: i64 = 1;
     const LOGGED: i64 = 2;
     const CHANGED: i64 = 3;
 
-    /// The `T` side of `row`: the action's sidecars, the lines logged before and after the action,
-    /// and this transaction's changes. A kind the row doesn't change logs and changes nothing.
-    /// Sidecars that must not be read point at files that were never written.
+    /// The `T` side of a row: the action's sidecars, the lines logged before and after the action,
+    /// and this transaction's changes. Sidecars that must not be read point at files that were
+    /// never written.
     struct KindSetup<T> {
         sidecars: Vec<Sidecar>,
         before: Vec<String>,
@@ -839,70 +839,76 @@ mod tests {
     }
 
     impl SidecarRow {
+        /// The row as seen by a kind it doesn't change: nothing logged or changed, and the inline
+        /// entries and sidecars come through as-is without being read.
+        fn for_kind(self, changes_kind: bool) -> Self {
+            if changes_kind {
+                return self;
+            }
+            SidecarRow {
+                before: &[],
+                logged: &[],
+                changed: &[],
+                expected_inline: self.inline,
+                sidecars_kept: true,
+                sidecars_read: false,
+                ..self
+            }
+        }
+
         fn setup<T: TestEntry>(
             &self,
             engine: &SyncEngine,
             table_root: &Url,
             checkpoint: &mut CheckpointAction,
-            changes_kind: bool,
         ) -> KindSetup<T> {
             let at = |keys: &[&str], value| keys.iter().map(|key| T::at(key, value)).collect_vec();
-            let read = changes_kind && self.sidecars_read;
             let sidecars = (self.sidecars.iter().enumerate())
                 .map(|(i, keys)| {
                     let name = format!("{}-{i}.parquet", T::NAME);
-                    match read {
-                        true => T::write_sidecar(engine, table_root, &name, at(keys, EXISTING)),
-                        false => missing_sidecar(&name),
+                    if self.sidecars_read {
+                        T::write_sidecar(engine, table_root, &name, at(keys, EXISTING))
+                    } else {
+                        missing_sidecar(&name)
                     }
                 })
                 .collect_vec();
             T::set(checkpoint, at(self.inline, EXISTING), sidecars.clone());
-            let lines = |keys, value| match changes_kind {
-                true => at(keys, value).iter().map(T::line).collect(),
-                false => vec![],
-            };
+            let lines = |keys, value| at(keys, value).iter().map(T::line).collect();
             KindSetup {
                 sidecars,
                 before: lines(self.before, BEFORE),
                 logged: lines(self.logged, LOGGED),
-                changes: if changes_kind {
-                    at(self.changed, CHANGED)
-                } else {
-                    vec![]
-                },
+                changes: at(self.changed, CHANGED),
             }
         }
 
         /// Asserts `checkpoint`'s `T` entries: the newest value of each expected key inline, and
-        /// the sidecars kept or dropped. A kind the row doesn't change comes through as-is.
+        /// the sidecars kept or dropped.
         fn assert_entries<T: TestEntry>(
             &self,
             checkpoint: &CheckpointAction,
             setup: &KindSetup<T>,
-            changes_kind: bool,
         ) {
-            let (keys, kept) = match changes_kind {
-                true => (self.expected_inline, self.sidecars_kept),
-                false => (self.inline, true),
-            };
             let newest = |key: &&str| {
-                if changes_kind && self.changed.contains(key) {
+                if self.changed.contains(key) {
                     CHANGED
-                } else if changes_kind && self.logged.contains(key) {
+                } else if self.logged.contains(key) {
                     LOGGED
                 } else {
                     EXISTING
                 }
             };
-            let expected = keys.iter().map(|key| T::at(key, newest(key))).collect_vec();
+            let expected = (self.expected_inline.iter())
+                .map(|key| T::at(key, newest(key)))
+                .collect_vec();
             let inline = T::inline(checkpoint)
                 .iter()
                 .sorted_by_key(|entry| entry.key());
             assert_eq!(inline.collect_vec(), expected.iter().collect_vec());
             assert_eq!(
                 T::sidecars(checkpoint),
-                kept_or_empty(&setup.sidecars, kept)
+                kept_or_empty(&setup.sidecars, self.sidecars_kept)
             );
         }
     }
@@ -961,6 +967,14 @@ mod tests {
         changed: &[], expected_inline: &["inline", "logged"], sidecars_kept: true,
         sidecars_read: true,
     })]
+    #[case::logged_before_action_at_tip(SidecarRow {
+        before: &["stale"], inline: &["inline"], sidecars: &[&["kept"]], logged: &[],
+        changed: &[], expected_inline: &["inline"], sidecars_kept: true, sidecars_read: false,
+    })]
+    #[case::empty_action_ignores_entries_before_it(SidecarRow {
+        before: &["dropped"], inline: &[], sidecars: &[], logged: &[], changed: &[],
+        expected_inline: &[], sidecars_kept: true, sidecars_read: false,
+    })]
     fn compute_checkpoint_action_reuses_or_inlines_sidecars(
         #[case] row: SidecarRow,
         #[values(Changed::Txns, Changed::Domains, Changed::Both)] changed: Changed,
@@ -971,17 +985,13 @@ mod tests {
         let manifest_version = if row.before.is_empty() { 1 } else { 2 };
         let path = format!("metadata/root-v{manifest_version}.parquet");
         let mut existing = minimal_checkpoint_action(&path, manifest_version)?;
-        let txns: KindSetup<SetTransaction> =
-            row.setup(&engine, &table_root, &mut existing, txns_change);
+        let (txn_row, domain_row) = (row.for_kind(txns_change), row.for_kind(domains_change));
+        let txns: KindSetup<SetTransaction> = txn_row.setup(&engine, &table_root, &mut existing);
         let domains: KindSetup<DomainMetadata> =
-            row.setup(&engine, &table_root, &mut existing, domains_change);
-        let before = txns
-            .before
-            .iter()
-            .chain(&domains.before)
-            .map(String::as_str);
+            domain_row.setup(&engine, &table_root, &mut existing);
         if !row.before.is_empty() {
-            let data = parse_json_batch(before.collect_vec().into());
+            let before = txns.before.iter().chain(&domains.before);
+            let data = parse_json_batch(before.map(String::as_str).collect_vec().into());
             write_commit(&engine, &table_root, 1, data)?;
         }
         write_manifest_commit(&engine, &table_root, manifest_version, existing)?;
@@ -990,8 +1000,8 @@ mod tests {
 
         let checkpoint = compute_at_latest(&engine, &table_root, &domains.changes, &txns.changes)?;
 
-        row.assert_entries(&checkpoint, &txns, txns_change);
-        row.assert_entries(&checkpoint, &domains, domains_change);
+        txn_row.assert_entries(&checkpoint, &txns);
+        domain_row.assert_entries(&checkpoint, &domains);
         Ok(())
     }
 
