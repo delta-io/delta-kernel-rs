@@ -863,7 +863,7 @@ impl PmCandidate {
         let version = version_as_i64(version)?;
         // Actions from commits before the pointed one are stale, so the filter drops them. `merge`
         // keeps the newest action replay read, so an older one is left only when the pointed commit
-        // has none of its own.
+        // has none of its own, or a log compaction hides it.
         let checkpoint = self
             .checkpoint
             .take()
