@@ -11,3 +11,7 @@ Each published inline finding includes feedback instructions: react 👍 for hel
 unhelpful or incorrect, or 👀 for out of scope. Feedback remains
 on the comment for manual review and prompt tuning; the workflow does not automatically consume
 these ratings or learn from them. The footer is excluded from exact finding deduplication.
+
+For repeatable gate-only and full-pipeline behavioral checks, use the
+[review replay pilot](../evaluations/README.md). It keeps frozen inputs separate from adjudicated
+labels and saves raw evidence without publishing to GitHub.
