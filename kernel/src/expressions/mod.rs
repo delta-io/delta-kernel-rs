@@ -1,8 +1,12 @@
 //! Definitions and functions to create and manipulate kernel expressions
 
 use std::collections::HashSet;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use std::fmt::Debug;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use std::sync::OnceLock;
 
 use delta_kernel_derive::internal_api;
 use derive_more::From;
@@ -21,6 +25,8 @@ pub(crate) use self::scalars::MONTHS_PER_YEAR;
 pub use self::scalars::{
     ArrayData, DecimalData, IntervalDayTimeData, IntervalYearMonthData, MapData, Scalar, StructData,
 };
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::content_tree::mumbling::MumblingBitmap;
 use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator,
@@ -507,16 +513,23 @@ pub enum CastMode {
 ///
 /// `bitmap` is a BINARY literal holding a bitmap in the Mumbling serialized form (for example an
 /// adaptiveMetadata manifest deletion vector), and `value` is a LONG. The predicate is NULL when
-/// either input is NULL, and FALSE when `value` lies outside the values a bitmap can hold. Use NOT
-/// for the complement. Evaluation fails if `bitmap` is not a literal or does not parse.
+/// either input is NULL. A Mumbling bitmap has at most 8,192 containers of 256 values each, so it
+/// can hold only values from 0 to 2,097,151, and the predicate is FALSE for any other `value`. Use
+/// NOT for the complement. Evaluation fails if `bitmap` is not a literal or does not parse.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MumblingBitmapContainsPredicate {
-    /// The serialized bitmap, a BINARY literal.
-    pub bitmap: Box<Expression>,
-    /// The value to look up.
-    pub value: Box<Expression>,
+    bitmap: Box<Expression>,
+    value: Box<Expression>,
+    #[serde(skip)]
+    parsed: MumblingBitmapCache,
 }
+
+/// The parsed form of a [`MumblingBitmapContainsPredicate`]'s bitmap, filled on first evaluation so
+/// later batches skip the parse. It never affects equality, serialization, or debug output.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Clone, Default)]
+struct MumblingBitmapCache(OnceLock<Arc<MumblingBitmap>>);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct JunctionPredicate {
@@ -994,7 +1007,42 @@ impl MumblingBitmapContainsPredicate {
         Self {
             bitmap: Box::new(bitmap.into()),
             value: Box::new(value.into()),
+            parsed: MumblingBitmapCache::default(),
         }
+    }
+
+    /// The serialized bitmap, a BINARY literal.
+    pub(crate) fn bitmap(&self) -> &Expression {
+        &self.bitmap
+    }
+
+    /// The value to look up.
+    pub(crate) fn value(&self) -> &Expression {
+        &self.value
+    }
+
+    /// The parsed bitmap, set by the evaluator the first time it parses [`Self::bitmap`].
+    pub(crate) fn parsed_bitmap(&self) -> &OnceLock<Arc<MumblingBitmap>> {
+        &self.parsed.0
+    }
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl PartialEq for MumblingBitmapCache {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl Debug for MumblingBitmapCache {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let state = if self.0.get().is_some() {
+            "parsed"
+        } else {
+            "empty"
+        };
+        f.write_str(state)
     }
 }
 
@@ -1572,7 +1620,7 @@ impl Display for Predicate {
                 write!(f, "{op}({})", format_child_list(preds))
             }
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            MumblingBitmapContains(MumblingBitmapContainsPredicate { bitmap, value }) => {
+            MumblingBitmapContains(MumblingBitmapContainsPredicate { bitmap, value, .. }) => {
                 write!(f, "MUMBLING_BITMAP_CONTAINS({bitmap}, {value})")
             }
             Opaque(OpaquePredicate { op, exprs }) => {
@@ -1796,6 +1844,12 @@ mod tests {
         use std::sync::Arc;
 
         use super::assert_roundtrip;
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        use crate::content_tree::mumbling::MumblingBitmap;
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        use crate::content_tree::mumbling::tests::encode_positions;
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        use crate::expressions::MumblingBitmapContainsPredicate;
         use crate::expressions::scalars::{ArrayData, DecimalData, MapData, StructData};
         use crate::expressions::{
             BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression,
@@ -1944,6 +1998,28 @@ mod tests {
                 pred.to_string(),
                 "MUMBLING_BITMAP_CONTAINS(Column(bitmap), Column(value))"
             );
+        }
+
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        #[test]
+        fn test_mumbling_bitmap_contains_parsed_bitmap_ignored_by_eq_and_serde() {
+            let bytes = encode_positions(&[1]);
+            let new_pred = || {
+                MumblingBitmapContainsPredicate::new(
+                    lit(Scalar::Binary(bytes.to_vec())),
+                    col!("value"),
+                )
+            };
+            let parsed_pred = new_pred();
+            let bitmap = MumblingBitmap::deserialize(bytes.clone()).unwrap();
+            parsed_pred.parsed_bitmap().set(Arc::new(bitmap)).unwrap();
+
+            assert_eq!(parsed_pred, new_pred());
+            let json = serde_json::to_string(&parsed_pred).unwrap();
+            let deserialized: MumblingBitmapContainsPredicate =
+                serde_json::from_str(&json).unwrap();
+            assert_eq!(deserialized, parsed_pred);
+            assert!(deserialized.parsed_bitmap().get().is_none());
         }
 
         #[test]

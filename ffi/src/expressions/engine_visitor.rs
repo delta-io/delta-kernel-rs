@@ -849,7 +849,9 @@ fn visit_predicate_internal(predicate: &Predicate, visitor: &mut EngineExpressio
 
 #[cfg(test)]
 mod tests {
-    use delta_kernel::expressions::{Expression, MapToStructOptions, Scalar, col, lit};
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use delta_kernel::expressions::col;
+    use delta_kernel::expressions::{Expression, MapToStructOptions, Scalar, lit};
     use delta_kernel::schema::{IntervalDayToSecondType, IntervalYearToMonthType};
     use rstest::rstest;
 
