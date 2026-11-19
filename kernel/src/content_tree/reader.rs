@@ -1895,7 +1895,7 @@ mod tests {
     /// A root or leaf entry's `tags` are carried into `Add.tags`, including null tag values.
     #[rstest]
     fn read_add_actions_from_amt_carries_tags_into_add(#[values(false, true)] in_leaf: bool) {
-        let engine = memory_engine();
+        let engine = SyncEngine::in_memory();
         let tags = [
             Some(HashMap::from([
                 (
@@ -1935,7 +1935,7 @@ mod tests {
 
     #[test]
     fn read_add_actions_from_amt_reads_missing_tags_column_as_null_tags() {
-        let engine = memory_engine();
+        let engine = SyncEngine::in_memory();
         let location = table_root().join(ROOT_PATH).unwrap();
         let entries = [added_data_entry("a.parquet", 100, 10, 0, 5)];
         let root = write_manifest_without_tags(&engine, location, &entries);
