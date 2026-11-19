@@ -99,6 +99,24 @@ class InlineReviewTest(unittest.TestCase):
 
         self.assertEqual(review, "Corrected review.")
 
+    def test_extract_marked_review_ignores_truncated_copy_before_complete_review(self) -> None:
+        marker = "a" * 32
+        start = f"<!-- AI_REVIEW_START_{marker} -->"
+        end = f"<!-- AI_REVIEW_END_{marker} -->"
+        complete_copy = f"{start}\n## Summary\nThe change is correct.\n{end}"
+        truncated_copies = {
+            "cut inside the review text": complete_copy[: complete_copy.index("correct") + 3],
+            "cut inside the end marker": complete_copy[: complete_copy.index(end) + 4],
+        }
+
+        for cut, truncated_copy in truncated_copies.items():
+            with self.subTest(cut):
+                review = self.review_publish.extract_marked_review(
+                    f"{truncated_copy}\n\n{complete_copy}", marker
+                )
+
+                self.assertEqual(review, "## Summary\nThe change is correct.")
+
     def test_extract_marked_review_rejects_nested_markers(self) -> None:
         marker = "a" * 32
         start = f"<!-- AI_REVIEW_START_{marker} -->"

@@ -1242,6 +1242,11 @@ jobs:
               print(f"::error::AI review is not publishable: {detail}.")
               sys.exit(1)
 
+          if start_count > end_count:
+              print(
+                  f"::notice::Ignored {start_count - end_count} truncated review copies "
+                  "in the reviewer output."
+              )
           if len(body) > 60_000:
               print("::error::AI review exceeded the 60000-character publication limit.")
               sys.exit(1)
