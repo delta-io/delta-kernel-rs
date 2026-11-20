@@ -122,12 +122,12 @@ pub struct WriteJson {
 
 /// Writes all input rows to one Parquet file and returns file metadata and aggregate statistics.
 ///
-/// `write_schema` is a prefix of every input schema and supplies file metadata, including Parquet
-/// field IDs. Field names, types (including nested fields), and nullability must match. Trailing
-/// input fields are omitted from the file. The engine chooses compression and row-group sizing.
+/// `write_schema` covers every input column and supplies file metadata, including Parquet field
+/// IDs. Field order, names, types (including nested fields), and nullability must match. The
+/// engine chooses compression and row-group sizing.
 /// The output is [`FILE_META_SCHEMA`] followed by the named `stats_agg` results in list order.
-/// Statistics cover all input rows, including fields omitted from `write_schema`, using the
-/// usual [`Agg`] null semantics. Inputs must bind identical statistics schemas, including metadata.
+/// Statistics cover all input rows using the usual [`Agg`] null semantics. Inputs must bind
+/// identical statistics schemas, including metadata.
 ///
 /// The atomic-create, overwrite, input ordering, nonempty input, and duplicate-destination
 /// contracts of [`WriteJson`] also apply.
@@ -141,7 +141,7 @@ pub struct WriteParquet {
     pub schema: SchemaRef,
     /// Named aggregate statistics over all input rows, in output-column order.
     pub stats_agg: Vec<StatsAgg>,
-    /// Physical schema of the fields to write, including file metadata.
+    /// Physical schema of all input columns, including file metadata.
     pub write_schema: SchemaRef,
     /// Fully qualified URL of the destination file.
     pub file_path: Url,

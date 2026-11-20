@@ -81,7 +81,7 @@ message WriteJsonNode {
 
 message WriteParquetNode {
   string file_path = 1;
-  // Prefix of the input schema, including file metadata.
+  // All input columns in order, with matching names, types and nullability; supplies file metadata.
   delta.kernel.schema.StructType write_schema = 2;
   bool overwrite = 3;
   bool ordered = 4;

@@ -332,11 +332,11 @@ impl PlanBuilder {
 
     /// Writes `inputs` to one Parquet file with the supplied configuration.
     ///
-    /// The write schema must match the input prefix, but may supply different file metadata.
+    /// The write schema must match every input column, but may supply different file metadata.
     /// Absent inputs are dropped; no remaining inputs is an error. Returns one row of
-    /// [`FILE_META_SCHEMA`] followed by the named statistics, which may reference unwritten input
-    /// fields. Missing operands, inconsistent statistics schemas, and duplicate output names are
-    /// errors. See [`WriteParquet`] for the execution contract.
+    /// [`FILE_META_SCHEMA`] followed by the named statistics. Missing operands, inconsistent
+    /// statistics schemas, and duplicate output names are errors. See [`WriteParquet`] for the
+    /// execution contract.
     pub fn write_parquet(
         inputs: impl IntoIterator<Item = PlanBuilder>,
         mut write: WriteParquet,
@@ -348,13 +348,15 @@ impl PlanBuilder {
         }
         let mut present = Vec::new();
         for input in inputs {
-            if input.schema().num_fields() < write.write_schema.num_fields() {
-                return Err(KernelError::schema("WriteParquet schema exceeds its input"));
+            if input.schema().num_fields() != write.write_schema.num_fields() {
+                return Err(KernelError::schema(
+                    "WriteParquet must write every input column",
+                ));
             }
             for (source, field) in input.schema().fields().zip(write.write_schema.fields()) {
                 if !fields_equal_ignoring_metadata(source, field) {
                     return Err(KernelError::schema(format!(
-                        "WriteParquet field {} must match its input prefix",
+                        "WriteParquet field {} must match its input",
                         field.name()
                     )));
                 }
@@ -377,8 +379,7 @@ impl PlanBuilder {
             )
             .build()?
             .schema;
-        // Statistics may reference unwritten columns, whose derived fields must match across
-        // inputs.
+        // Input field metadata may differ, but statistics must have identical output metadata.
         for input in &present[1..] {
             for (stats, output) in write.stats_agg.iter().zip(stats_schema.fields()) {
                 let field = stats
@@ -1162,6 +1163,8 @@ mod tests {
     #[case::wrong_nullability(vals(schema_ref! { not_null "id": STRING }))]
     #[case::skipped_field(vals(schema_ref! { nullable "extra": LONG, nullable "id": STRING }))]
     #[case::absent_skipped_field(absent_over(schema_ref! { nullable "extra": LONG, nullable "id": STRING }))]
+    #[case::unwritten_field(vals(schema_ref! { nullable "id": STRING, nullable "extra": LONG }))]
+    #[case::absent_unwritten_field(absent_over(schema_ref! { nullable "id": STRING, nullable "extra": LONG }))]
     fn write_rejects_mismatched_input_schema(
         #[case] other: PlanBuilder,
         #[values(FileType::Json, FileType::Parquet)] file_type: FileType,
@@ -1183,17 +1186,15 @@ mod tests {
     #[case::unsupported_sum(id_schema(), vec![StatsAgg::new("sum", Agg::sum(column_name!("id")))])]
     #[case::duplicate_alias(id_schema(), vec![StatsAgg::new("count", Agg::CountStar); 2])]
     #[case::file_column_collision(id_schema(), vec![StatsAgg::new("SIZE", Agg::CountStar)])]
-    #[case::later_missing_operand(id_schema(), vec![StatsAgg::new("min", Agg::min(column_name!("n")))])]
-    #[case::later_wrong_type(schema_ref! { nullable "id": STRING, nullable "n": STRING },
+    #[case::unwritten_operand(schema_ref! { nullable "id": STRING, nullable "n": LONG },
         vec![StatsAgg::new("min", Agg::min(column_name!("n")))])]
     fn write_parquet_rejects_invalid_statistics(
-        #[case] other: SchemaRef,
+        #[case] input_schema: SchemaRef,
         #[case] stats: Vec<StatsAgg>,
     ) -> KernelResult<()> {
-        let first = schema_ref! { nullable "id": STRING, nullable "n": LONG };
         assert!(
             PlanBuilder::write_parquet(
-                [vals(first), vals(other)],
+                [vals(input_schema)],
                 WriteParquet::new(id_schema(), Url::parse("memory:///output")?)
                     .with_stats_agg(stats),
             )

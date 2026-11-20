@@ -338,10 +338,8 @@ impl SyncPlanExecutor {
         let output_schema = Arc::new(write.schema.as_ref().try_into_arrow()?);
         let schema: Arc<ArrowSchema> = Arc::new(write.write_schema.as_ref().try_into_arrow()?);
         let options = data_file_writer_options(&schema, &write.write_schema)?;
-        let columns = (0..write.write_schema.num_fields()).collect_vec();
         // Input order is preserved even when `ordered` is false.
-        let batches = input.iter().map(|batch| {
-            let batch = batch.project(&columns)?;
+        let batches = input.into_iter().map(|batch| {
             validate_file_values_for_write(&batch, &write.write_schema)?;
             Ok(batch)
         });
@@ -1021,7 +1019,7 @@ mod tests {
 
     #[rustfmt::skip]
     #[rstest]
-    #[case::narrow_without_stats(
+    #[case::scalar_without_stats(
         &["amount"], vec![],
         &[
             "+--------+",
@@ -1035,7 +1033,7 @@ mod tests {
         ],
         &[],
     )]
-    #[case::struct_prefix_with_count(
+    #[case::struct_with_count(
         &["amount", "stats"], vec![StatsAgg::new("count", Agg::CountStar)],
         &[
             "+--------+-----------------+",
@@ -1055,8 +1053,8 @@ mod tests {
             "+-------+",
         ],
     )]
-    #[case::nested_prefix_with_scalar_and_struct_stats(
-        &["amount", "stats", "items"],
+    #[case::nested_with_scalar_and_struct_stats(
+        &["amount", "stats", "items", "region"],
         vec![
             StatsAgg::new("count", Agg::CountStar),
             StatsAgg::new("amount_count", Agg::count(column_name!("amount"))),
@@ -1065,14 +1063,14 @@ mod tests {
             StatsAgg::new("first_stats", Agg::first_non_null(column_name!("stats"))),
         ],
         &[
-            "+--------+-----------------+----------------------+",
-            "| amount | stats           | items                |",
-            "+--------+-----------------+----------------------+",
-            "|        |                 |                      |",
-            "|        |                 |                      |",
-            "| 10     | {numRecords: 2} | {x: [{number: 1}, ]} |",
-            "| 10     | {numRecords: 2} | {x: [{number: 1}, ]} |",
-            "+--------+-----------------+----------------------+",
+            "+--------+-----------------+----------------------+--------+",
+            "| amount | stats           | items                | region |",
+            "+--------+-----------------+----------------------+--------+",
+            "|        |                 |                      | FR     |",
+            "|        |                 |                      | FR     |",
+            "| 10     | {numRecords: 2} | {x: [{number: 1}, ]} | US     |",
+            "| 10     | {numRecords: 2} | {x: [{number: 1}, ]} | US     |",
+            "+--------+-----------------+----------------------+--------+",
         ],
         &[
             "+-------+--------------+------------+--------------+-----------------+",
@@ -1082,8 +1080,8 @@ mod tests {
             "+-------+--------------+------------+--------------+-----------------+",
         ],
     )]
-    fn write_parquet_writes_prefix_and_preserves_struct_stats(
-        #[case] write_fields: &[&str],
+    fn write_parquet_writes_all_columns_and_preserves_struct_stats(
+        #[case] schema_fields: &[&str],
         #[case] stats_agg: Vec<StatsAgg>,
         #[case] expected_write: &[&str],
         #[case] expected_stats: &[&str],
@@ -1105,7 +1103,7 @@ mod tests {
             nullable "stats": (stats_type(input_has_field_ids)),
             nullable "items": (items_type(input_has_field_ids)),
             nullable "region": STRING,
-        };
+        }.project(schema_fields)?;
         let write_schema = schema_ref! {
             (StructField::nullable("amount", DataType::LONG)
                 .with_metadata([("parquet.field.id", 1i64)])),
@@ -1116,7 +1114,8 @@ mod tests {
                     "items.key": 4, "items.value": 5, "items.value.element": 6,
                 })),
             )])),
-        }.project(write_fields)?;
+            nullable "region": STRING,
+        }.project(schema_fields)?;
         let batch = parse_json_impl(&StringArray::from(vec![
             r#"{"amount":10,"stats":{"numRecords":2},"items":{"x":[{"number":1},null]},"region":"US"}"#,
             r#"{"region":"FR"}"#,
@@ -1132,7 +1131,7 @@ mod tests {
         let reader =
             ParquetRecordBatchReaderBuilder::try_new(get_bytes(executor.storage.store(), &path)?)?;
         let fields = reader.parquet_schema().root_schema().get_fields();
-        assert_eq!(fields.len(), write_fields.len());
+        assert_eq!(fields.len(), schema_fields.len());
         assert_eq!(fields[0].get_basic_info().id(), 1);
         if let Some(stats) = fields.get(1) {
             assert_eq!(stats.get_basic_info().id(), 3);
@@ -1152,19 +1151,19 @@ mod tests {
     #[rustfmt::skip]
     #[rstest]
     #[case::populated_first(false, &[
-        "+----+",
-        "| id |",
-        "+----+",
-        "| 1  |",
-        "| 1  |",
-        "+----+",
+        "+----+-------+",
+        "| id | score |",
+        "+----+-------+",
+        "| 1  | 7     |",
+        "| 1  | 7     |",
+        "+----+-------+",
     ])]
     #[case::empty_first(true, &[
-        "+----+",
-        "| id |",
-        "+----+",
-        "| 1  |",
-        "+----+",
+        "+----+-------+",
+        "| id | score |",
+        "+----+-------+",
+        "| 1  | 7     |",
+        "+----+-------+",
     ])]
     fn write_parquet_statistics_match_the_declared_schema(
         #[case] empty_first: bool,
@@ -1189,7 +1188,7 @@ mod tests {
         })?;
         let write = PlanBuilder::write_parquet(
             [first, input(if different_metadata { "B" } else { "A" })?],
-            WriteParquet::new(schema_ref! { nullable "id": LONG }, path.clone())
+            WriteParquet::new(schema_ref! { nullable "id": LONG, nullable "score": LONG }, path.clone())
                 .with_stats_agg([StatsAgg::new("peak", Agg::max(column_name!("score")))]),
         );
         if different_metadata {
