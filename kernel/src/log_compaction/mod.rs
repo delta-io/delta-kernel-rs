@@ -90,6 +90,14 @@ impl Snapshot {
             .into()
         );
         require!(
+            self.is_built_as_latest(),
+            KernelError::generic(format!(
+                "Log compaction requires a snapshot built as latest (snapshot version {})",
+                self.version()
+            ))
+            .into()
+        );
+        require!(
             !self.skipped_new_checkpoints(),
             KernelError::generic("Log compaction requires checkpoint discovery").into()
         );
@@ -106,21 +114,22 @@ impl Snapshot {
             KernelError::generic("Log compaction must start after the latest checkpoint").into()
         );
         let commits = &source.listed.ascending_commit_files;
-        let commits = &commits[commits.partition_point(|file| file.version < start_version)
+        let commits_to_compact = &commits[commits
+            .partition_point(|file| file.version < start_version)
             ..commits.partition_point(|file| file.version <= end_version)];
         require!(
-            commits
+            commits_to_compact
                 .iter()
                 .all(|file| file.file_type == LogPathFileType::Commit),
             KernelError::unsupported("Log compaction requires published commits").into()
         );
-        validate_start_version_available(start_version, commits.first())
+        validate_start_version_available(start_version, commits_to_compact.first())
             .and_then(|()| {
                 LogSegment::try_new(
                     LogSegmentFiles {
-                        ascending_commit_files: commits.to_vec(),
-                        latest_commit_file: commits.last().cloned(),
-                        max_published_version: commits.last().map(|file| file.version),
+                        ascending_commit_files: commits_to_compact.to_vec(),
+                        latest_commit_file: commits_to_compact.last().cloned(),
+                        max_published_version: commits_to_compact.last().map(|file| file.version),
                         ..Default::default()
                     },
                     source.log_root.clone(),
@@ -133,7 +142,7 @@ impl Snapshot {
                 | KernelError::StartVersionNotFound { .. }
                 | KernelError::MissingVersion(_) => {
                     Error::Delta(DeltaError::versions_not_contiguous(
-                        commits.iter().map(|file| file.version),
+                        commits_to_compact.iter().map(|file| file.version),
                         start_version,
                         end_version,
                         self.version(),

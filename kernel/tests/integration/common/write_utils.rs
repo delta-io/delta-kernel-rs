@@ -550,7 +550,8 @@ pub fn create_dv_update_transaction(
         )
 }
 
-/// Writes a log compaction with the declarative planner when enabled, otherwise the legacy writer.
+/// Writes a log compaction with the declarative planner when enabled, otherwise
+/// [`LogCompactionWriter`](delta_kernel::LogCompactionWriter).
 pub fn write_log_compaction(
     snapshot: &Arc<Snapshot>,
     engine: &dyn Engine,

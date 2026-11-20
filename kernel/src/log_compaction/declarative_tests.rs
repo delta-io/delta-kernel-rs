@@ -33,6 +33,20 @@ use crate::{Engine as _, Error, KernelResult};
     "stats":" { \"numRecords\": 2, \"unindexed\": 7 }"}}"#
 )]
 #[case::remove(r#"{"remove":{"path":"data.parquet","deletionTimestamp":1,"dataChange":false}}"#)]
+#[case::full_add(
+    r#"{"add":{"path":"data.parquet","partitionValues":{"long_col":"1"},
+    "size":10,"modificationTime":1,"dataChange":false,"stats":"{\"numRecords\":2}",
+    "tags":{"keep":"yes","missing":null},"deletionVector":{"storageType":"p",
+    "pathOrInlineDv":"file:///dv.bin","offset":4,"sizeInBytes":8,"cardinality":1},
+    "baseRowId":10,"defaultRowCommitVersion":1,"clusteringProvider":"liquid"}}"#
+)]
+#[case::full_remove(
+    r#"{"remove":{"path":"data.parquet","deletionTimestamp":1,"dataChange":false,
+    "extendedFileMetadata":true,"partitionValues":{"long_col":"1"},"size":10,
+    "stats":"{\"numRecords\":2}","tags":{"keep":"yes"},"deletionVector":{"storageType":"p",
+    "pathOrInlineDv":"file:///dv.bin","offset":4,"sizeInBytes":8,"cardinality":1},
+    "baseRowId":10,"defaultRowCommitVersion":1}}"#
+)]
 #[case::domain_deletion(
     r#"{"domainMetadata":{"domain":"test","configuration":"old","removed":true}}"#
 )]
@@ -43,10 +57,16 @@ fn compaction_preserves_action_payloads(
 ) -> Result<()> {
     let mut action: Value = serde_json::from_str(action).map_err(KernelError::from)?;
     let table = TestTableBuilder::new()
-        .with_features(FeatureSet::new().domain_metadata().with_property(
-            "delta.setTransactionRetentionDuration",
-            "interval 1 milliseconds",
-        ))
+        .with_features(
+            FeatureSet::new()
+                .deletion_vectors()
+                .row_tracking()
+                .domain_metadata()
+                .with_property(
+                    "delta.setTransactionRetentionDuration",
+                    "interval 1 milliseconds",
+                ),
+        )
         .with_partition_columns(["long_col"])
         .with_data(0, 0)
         .build()
@@ -81,6 +101,35 @@ fn compaction_preserves_action_payloads(
         }
     }
     assert_eq!(rows, [action]);
+    Ok(())
+}
+
+#[rstest]
+#[case::latest(VersionTarget::Latest, true)]
+#[case::at_version(VersionTarget::AtVersion(3), false)]
+fn compaction_requires_snapshot_built_as_latest(
+    #[case] target: VersionTarget,
+    #[case] latest: bool,
+) -> Result<()> {
+    let table = TestTableBuilder::new()
+        .with_log_state(LogState::with_latest_version(3))
+        .build()
+        .unwrap();
+    let engine = SyncEngine::new_with_store(table.store().clone());
+    let snapshot = build_snapshot!(target, table.table_root(), &engine);
+    assert_eq!(snapshot.version(), 3);
+    assert_eq!(snapshot.is_built_as_latest(), latest);
+    let path = ParsedLogPath::new_log_compaction(snapshot.table_root(), 0, 3)?.location;
+    let result = snapshot.compact_log(&engine, 0, 3);
+    if latest {
+        assert_eq!(result?, engine.storage_handler().head(&path)?);
+    } else {
+        assert!(result.unwrap_err().to_string().contains(&format!(
+            "Log compaction requires a snapshot built as latest (snapshot version {})",
+            snapshot.version()
+        )));
+        assert!(engine.storage_handler().head(&path).is_err());
+    }
     Ok(())
 }
 
