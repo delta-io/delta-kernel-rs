@@ -32,7 +32,7 @@ use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{Layer, Registry, reload};
 
 use crate::ffi_metrics::{MetricEvent, with_ffi_event};
-use crate::{KernelStringSlice, kernel_string_slice};
+use crate::{KernelStringSlice, OptionalValue, kernel_string_slice};
 
 /// A type-erased logging layer that lives in the reloadable logging slot of the global subscriber.
 /// cbindgen:ignore
@@ -129,28 +129,25 @@ pub unsafe extern "C" fn enable_event_tracing(callback: TracingEventFn, max_leve
 
 /// Changes the shared logging filter without replacing its callback or format.
 ///
-/// When `enabled` is false, logging is disabled and `max_level` is ignored. Metrics and call-frame
-/// reporting retain their own filters. Returns false if the subscriber has not been initialized
-/// or the filter cannot be updated. This function does not install a logging callback.
+/// Pass `Some(level)` to enable logging up to that level, or `None` to disable it. Metrics and
+/// call-frame reporting retain their own filters. Returns false if the subscriber has not been
+/// initialized or the filter cannot be updated. This function does not install a logging callback.
 ///
 /// A call to [`enable_event_tracing`], [`enable_log_line_tracing`], or
 /// [`enable_formatted_log_line_tracing`] replaces this level with its own `max_level`.
 ///
 /// Concurrent calls are serialized. Do not call this synchronously from a tracing callback.
-///
-/// `max_level` must be a valid [`Level`], including when logging is disabled.
 #[unsafe(no_mangle)]
-pub extern "C" fn set_event_tracing_level(enabled: bool, max_level: Level) -> bool {
+pub extern "C" fn set_event_tracing_level(max_level: OptionalValue<Level>) -> bool {
     let Ok(state) = TRACING_STATE.lock() else {
         return false;
     };
     let Some(filter) = &state.logging_filter else {
         return false;
     };
-    let level = if enabled {
-        LevelFilter::from(max_level)
-    } else {
-        LevelFilter::OFF
+    let level = match max_level {
+        OptionalValue::Some(level) => LevelFilter::from(level),
+        OptionalValue::None => LevelFilter::OFF,
     };
     filter.reload(level).is_ok()
 }
@@ -1251,7 +1248,7 @@ mod tests {
             return;
         }
 
-        assert!(!set_event_tracing_level(true, Level::TRACE));
+        assert!(!set_event_tracing_level(OptionalValue::Some(Level::TRACE)));
         setup_event_subscriber(event_callback_with_filter_1, Level::ERROR).unwrap();
         setup_metrics_reporter(capture_metric_event).unwrap();
         TRACING_STATE
@@ -1259,16 +1256,16 @@ mod tests {
             .unwrap()
             .register_frame_callback(capture_frame_event)
             .unwrap();
-        for (enabled, level, expected) in [
-            (false, Level::ERROR, 0),
-            (true, Level::WARN, 2),
-            (true, Level::DEBUG, 4),
-            (true, Level::TRACE, 5),
-            (true, Level::ERROR, 1),
-            (false, Level::TRACE, 0),
-            (true, Level::INFO, 3),
+        for (level, expected) in [
+            (OptionalValue::None, 0),
+            (OptionalValue::Some(Level::WARN), 2),
+            (OptionalValue::Some(Level::DEBUG), 4),
+            (OptionalValue::Some(Level::TRACE), 5),
+            (OptionalValue::Some(Level::ERROR), 1),
+            (OptionalValue::None, 0),
+            (OptionalValue::Some(Level::INFO), 3),
         ] {
-            assert!(set_event_tracing_level(enabled, level));
+            assert!(set_event_tracing_level(level));
             setup_events();
             tracing::error!("Testing 1");
             tracing::warn!("Testing 1");
