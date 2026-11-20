@@ -322,22 +322,19 @@ pub(crate) fn validate_and_normalize_property_for_update(
 /// Rejects a merged configuration where log retention is shorter than deleted-file retention.
 ///
 /// Absent keys use the protocol defaults (`interval 30 days` and `interval 1 week`). Matches
-/// Spark's `validateTombstoneAndLogRetentionDurationCompatibility`.
+/// Spark's `validateTombstoneAndLogRetentionDurationCompatibility`. Present but unparseable values
+/// are rejected.
 pub(crate) fn validate_log_and_deleted_file_retention(
     configuration: &HashMap<String, String>,
 ) -> KernelResult<()> {
-    check_log_and_deleted_file_retention(
-        configuration,
-        /* require_parse_log= */ true,
-        /* require_parse_deleted= */ true,
-    )
+    check_log_and_deleted_file_retention(configuration, KernelError::generic)
 }
 
 /// Retention cross-check for UPDATE after property adds have been validated.
 ///
-/// Runs only when `validated_adds` sets a retention key (Spark checks only then). Existing values
-/// that this crate's interval parser cannot read are treated as the protocol default for the
-/// untouched side, so legacy spellings do not block every property update.
+/// Runs only when `validated_adds` sets a retention key (Spark checks only then). Absent keys use
+/// the protocol defaults. A stored value that this crate's interval parser cannot read is rejected
+/// with an error that names that stored value.
 pub(crate) fn validate_retention_for_property_adds(
     existing: &HashMap<String, String>,
     validated_adds: &HashMap<String, String>,
@@ -354,25 +351,24 @@ pub(crate) fn validate_retention_for_property_adds(
             .iter()
             .map(|(key, value)| (key.clone(), value.clone())),
     );
-    check_log_and_deleted_file_retention(&merged, sets_log, sets_deleted)
+    check_log_and_deleted_file_retention(&merged, KernelError::invalid_transaction_state)
 }
 
 fn check_log_and_deleted_file_retention(
     configuration: &HashMap<String, String>,
-    require_parse_log: bool,
-    require_parse_deleted: bool,
+    make_error: fn(String) -> KernelError,
 ) -> KernelResult<()> {
     let (log_raw, log) = retention_duration_for_comparison(
         configuration,
         LOG_RETENTION_DURATION,
         DEFAULT_LOG_RETENTION_DURATION,
-        require_parse_log,
+        make_error,
     )?;
     let (deleted_raw, deleted) = retention_duration_for_comparison(
         configuration,
         DELETED_FILE_RETENTION_DURATION,
         DEFAULT_DELETED_FILE_RETENTION_DURATION,
-        require_parse_deleted,
+        make_error,
     )?;
 
     if log < deleted {
@@ -388,7 +384,7 @@ fn check_log_and_deleted_file_retention(
                  less than or equal to {LOG_RETENTION_DURATION}({log_raw})."
             )
         };
-        return Err(KernelError::invalid_transaction_state(message));
+        return Err(make_error(message));
     }
     Ok(())
 }
@@ -397,7 +393,7 @@ fn retention_duration_for_comparison(
     configuration: &HashMap<String, String>,
     key: &str,
     default: &str,
-    require_parse: bool,
+    make_error: fn(String) -> KernelError,
 ) -> KernelResult<(String, std::time::Duration)> {
     let parsed_default = || {
         parse_interval(default).ok_or_else(|| {
@@ -410,12 +406,61 @@ fn retention_duration_for_comparison(
     if let Some(duration) = parse_interval(raw) {
         return Ok((raw.to_string(), duration));
     }
-    if require_parse {
-        return Err(KernelError::invalid_transaction_state(format!(
-            "Invalid value '{raw}' for table property '{key}'"
-        )));
+    Err(make_error(format!(
+        "Invalid value '{raw}' for table property '{key}'"
+    )))
+}
+
+/// Validates and normalizes properties for CREATE, rejecting conflicting spellings of the same
+/// canonical key (including exact duplicates).
+pub(crate) fn validate_and_normalize_properties_for_create(
+    properties: impl IntoIterator<Item = (String, String)>,
+) -> KernelResult<HashMap<String, String>> {
+    insert_normalized_properties(
+        properties,
+        PropertySetOperation::Create,
+        KernelError::generic,
+        /* reject_non_delta_conflicts= */ true,
+    )
+}
+
+/// Validates and normalizes one UPDATE property batch.
+///
+/// Conflicting `delta.*` spellings (including exact duplicates) are rejected. Non-`delta.*`
+/// duplicates keep the last value. Callers merge batches so a later batch can overwrite an earlier
+/// one for the same canonical key.
+pub(crate) fn validate_and_normalize_property_batch_for_update(
+    batch: impl IntoIterator<Item = (String, String)>,
+) -> KernelResult<HashMap<String, String>> {
+    insert_normalized_properties(
+        batch,
+        PropertySetOperation::Update,
+        KernelError::invalid_transaction_state,
+        /* reject_non_delta_conflicts= */ false,
+    )
+}
+
+fn insert_normalized_properties(
+    properties: impl IntoIterator<Item = (String, String)>,
+    operation: PropertySetOperation,
+    conflict_error: fn(String) -> KernelError,
+    reject_non_delta_conflicts: bool,
+) -> KernelResult<HashMap<String, String>> {
+    let mut normalized = HashMap::new();
+    for (key, value) in properties {
+        let (canonical, value) = match operation {
+            PropertySetOperation::Create => validate_and_normalize_property_for_create(key, value)?,
+            PropertySetOperation::Update => validate_and_normalize_property_for_update(key, value)?,
+        };
+        if let Some(_prev) = normalized.insert(canonical.clone(), value)
+            && (reject_non_delta_conflicts || is_delta_property_key(&canonical))
+        {
+            return Err(conflict_error(format!(
+                "Conflicting spellings of table property '{canonical}' in the same request"
+            )));
+        }
     }
-    Ok((default.to_string(), parsed_default()?))
+    Ok(normalized)
 }
 
 #[cfg(test)]
@@ -727,16 +772,35 @@ mod tests {
         validate_retention_for_property_adds(&existing, &adds).unwrap();
     }
 
-    #[test]
-    fn update_retention_check_defaults_unparseable_existing_untouched_side() {
-        let existing = HashMap::from([(LOG_RETENTION_DURATION.to_string(), "2 weeks".to_string())]);
-        // deleted=1 day vs default log=30 days is compatible; unparseable existing log must not
-        // fail.
-        let adds = HashMap::from([(
-            DELETED_FILE_RETENTION_DURATION.to_string(),
-            "interval 1 days".to_string(),
-        )]);
-        validate_retention_for_property_adds(&existing, &adds).unwrap();
+    #[rstest]
+    #[case::spark_weeks_log("2 weeks", DELETED_FILE_RETENTION_DURATION, "interval 20 days")]
+    #[case::spark_upper_interval_deleted(
+        "INTERVAL 60 DAYS",
+        LOG_RETENTION_DURATION,
+        "interval 30 days"
+    )]
+    #[case::bare_days_log("60 days", DELETED_FILE_RETENTION_DURATION, "interval 40 days")]
+    fn update_retention_check_rejects_unparseable_existing_untouched_side(
+        #[case] existing_value: &str,
+        #[case] key_being_set: &str,
+        #[case] new_value: &str,
+    ) {
+        let existing_key = if key_being_set == LOG_RETENTION_DURATION {
+            DELETED_FILE_RETENTION_DURATION
+        } else {
+            LOG_RETENTION_DURATION
+        };
+        let existing = HashMap::from([(existing_key.to_string(), existing_value.to_string())]);
+        let adds = HashMap::from([(key_being_set.to_string(), new_value.to_string())]);
+        let error = validate_retention_for_property_adds(&existing, &adds).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                KernelError::InvalidTransactionState(message)
+                if message.contains(&format!("Invalid value '{existing_value}' for table property '{existing_key}'"))
+            ),
+            "error={error}"
+        );
     }
 
     #[test]
@@ -751,9 +815,34 @@ mod tests {
         )]);
         let error = validate_retention_for_property_adds(&existing, &adds).unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("needs to be greater than or equal to"),
+            matches!(
+                &error,
+                KernelError::InvalidTransactionState(message)
+                if message.contains("needs to be greater than or equal to")
+            ),
+            "error={error}"
+        );
+    }
+
+    #[test]
+    fn create_retention_check_uses_generic_error() {
+        let error = validate_log_and_deleted_file_retention(&HashMap::from([
+            (
+                LOG_RETENTION_DURATION.to_string(),
+                "interval 1 days".to_string(),
+            ),
+            (
+                DELETED_FILE_RETENTION_DURATION.to_string(),
+                "interval 7 days".to_string(),
+            ),
+        ]))
+        .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                KernelError::Generic(message)
+                if message.contains("needs to be greater than or equal to")
+            ),
             "error={error}"
         );
     }

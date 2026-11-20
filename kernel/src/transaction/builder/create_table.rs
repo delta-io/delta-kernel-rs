@@ -45,7 +45,7 @@ use crate::table_properties::{
     ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
     MATERIALIZED_ROW_ID_COLUMN_NAME, ROW_TRACKING_SUSPENDED, TableProperties,
     is_table_feature_signal_key, strip_table_feature_signal_prefix,
-    validate_and_normalize_property_for_create, validate_log_and_deleted_file_retention,
+    validate_and_normalize_properties_for_create, validate_log_and_deleted_file_retention,
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
@@ -820,16 +820,7 @@ fn validate_extract_table_features_and_properties(
         add_feature_to_lists(feature, &mut reader_features, &mut writer_features);
     }
 
-    let mut normalized = HashMap::with_capacity(properties.len());
-    for (key, value) in properties {
-        let (canonical, value) = validate_and_normalize_property_for_create(key, value)?;
-        if normalized.insert(canonical.clone(), value).is_some() {
-            return Err(KernelError::generic(format!(
-                "Conflicting spellings of table property '{canonical}' in the same request"
-            )));
-        }
-    }
-
+    let normalized = validate_and_normalize_properties_for_create(properties)?;
     validate_log_and_deleted_file_retention(&normalized)?;
 
     Ok(ValidatedTableProperties {
@@ -1674,18 +1665,26 @@ mod tests {
 
     #[test]
     fn test_create_rejects_incompatible_retention_durations() {
-        assert_result_error_with_message(
-            validate_extract_table_features_and_properties(HashMap::from([
-                (
-                    LOG_RETENTION_DURATION.to_string(),
-                    "interval 1 days".to_string(),
-                ),
-                (
-                    DELETED_FILE_RETENTION_DURATION.to_string(),
-                    "interval 7 days".to_string(),
-                ),
-            ])),
-            "needs to be greater than or equal to",
+        let result = validate_extract_table_features_and_properties(HashMap::from([
+            (
+                LOG_RETENTION_DURATION.to_string(),
+                "interval 1 days".to_string(),
+            ),
+            (
+                DELETED_FILE_RETENTION_DURATION.to_string(),
+                "interval 7 days".to_string(),
+            ),
+        ]));
+        let Err(error) = result else {
+            panic!("expected retention compatibility error");
+        };
+        assert!(
+            matches!(
+                &error,
+                KernelError::Generic(message)
+                if message.contains("needs to be greater than or equal to")
+            ),
+            "error={error}"
         );
     }
 
@@ -2378,6 +2377,53 @@ mod tests {
             validated.properties.contains_key(ENABLE_ROW_TRACKING),
             expect_enablement_property,
             "delta.enableRowTracking presence mismatch"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::deletion_vectors(
+        "DELTA.enableDeletionVectors",
+        "true",
+        ENABLE_DELETION_VECTORS,
+        TableFeature::DeletionVectors
+    )]
+    #[case::column_mapping(
+        "DELTA.columnMapping.mode",
+        "name",
+        COLUMN_MAPPING_MODE,
+        TableFeature::ColumnMapping
+    )]
+    #[case::row_tracking(
+        "DELTA.enableRowTracking",
+        "true",
+        ENABLE_ROW_TRACKING,
+        TableFeature::RowTracking
+    )]
+    fn test_create_mixed_case_enablement_adds_protocol_feature(
+        #[case] input_key: &str,
+        #[case] value: &str,
+        #[case] canonical_key: &str,
+        #[case] feature: TableFeature,
+    ) {
+        let mut validated = validate_extract_table_features_and_properties(HashMap::from([(
+            input_key.to_string(),
+            value.to_string(),
+        )]))
+        .unwrap();
+        maybe_auto_enable_property_driven_features(&mut validated);
+
+        assert!(
+            validated.reader_features.contains(&feature)
+                || validated.writer_features.contains(&feature),
+            "expected {feature:?} after mixed-case enablement"
+        );
+        assert_eq!(
+            validated.properties.get(canonical_key).map(String::as_str),
+            Some(value)
+        );
+        assert!(
+            !validated.properties.contains_key(input_key),
+            "non-canonical key must not be stored"
         );
     }
 
