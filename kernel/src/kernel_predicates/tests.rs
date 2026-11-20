@@ -710,6 +710,22 @@ fn test_eval_binary_commutes_literal_and_cast_column(
     );
 }
 
+#[rstest::rstest]
+#[case::column_and_literal(col!("m"), lit("a"))]
+#[case::literal_and_column(lit("a"), col!("m"))]
+#[case::cast_and_literal(Expr::cast(col!("m"), DataType::STRING), lit("a"))]
+#[case::literal_and_cast(lit("a"), Expr::cast(col!("m"), DataType::STRING))]
+#[case::literals(lit("a"), lit("a"))]
+fn test_eval_map_has_key_operand_shapes(
+    #[case] left: Expr,
+    #[case] right: Expr,
+    #[values(false, true)] inverted: bool,
+) {
+    let filter = DefaultKernelPredicateEvaluator::from(Scalar::String("1".to_string()));
+    let result = filter.eval_pred_binary(BinaryPredicateOp::MapHasKey, &left, &right, inverted);
+    assert_eq!(result, None);
+}
+
 #[derive(Debug, PartialEq)]
 struct OpaqueLessThanOp;
 impl OpaqueLessThanOp {
@@ -1139,6 +1155,25 @@ fn test_sql_where() {
     expect_eq!(null_filter.eval(pred), None, "{pred}");
     expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
+}
+
+#[rstest::rstest]
+fn test_eval_map_has_key(#[values(false, true)] inverted: bool) {
+    let null_filter = DefaultKernelPredicateEvaluator::from(NullColumnResolver);
+    let empty_filter = DefaultKernelPredicateEvaluator::from(EmptyColumnResolver);
+    let maybe_not = |pred: Pred| if inverted { Pred::not(pred) } else { pred };
+
+    let pred = maybe_not(Pred::map_has_key(col!("m"), lit("a")));
+    let null_eval = null_filter.eval(&pred);
+    assert_eq!(null_eval, None, "{pred}");
+    let null_sql_where = null_filter.eval_sql_where(&pred);
+    assert_eq!(null_sql_where, Some(false), "{pred}");
+    let empty_sql_where = empty_filter.eval_sql_where(&pred);
+    assert_eq!(empty_sql_where, None, "{pred}");
+
+    let pred = maybe_not(Pred::map_has_key(col!("m"), null_lit(DataType::STRING)));
+    let empty_sql_where = empty_filter.eval_sql_where(&pred);
+    assert_eq!(empty_sql_where, Some(false), "{pred}");
 }
 
 // A NULL or unresolved WHEN leaves the whole CASE unknown during pruning.

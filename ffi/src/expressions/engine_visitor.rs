@@ -284,8 +284,10 @@ pub struct EngineExpressionVisitor {
         op: Handle<SharedOpaquePredicateOp>,
         child_list_id: usize,
     ),
-    /// Visits the name of an `Expression::Unknown` or `Predicate::Unknown` belonging to the
-    /// list identified by `sibling_list_id`.
+    /// Visits the name of an expression or predicate that has no dedicated callback, belonging to
+    /// the list identified by `sibling_list_id`. This covers `Expression::Unknown`,
+    /// `Predicate::Unknown` and operators such as `MAP_LEN` and `MAP_HAS_KEY`. The callback
+    /// receives only the name.
     pub visit_unknown:
         extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
     /// Visits a CASE WHEN expression belonging to the list identified by `sibling_list_id`.
@@ -673,20 +675,21 @@ fn visit_expression_impl(
             visit_expression_struct_patch(visitor, patch, sibling_list_id)
         }
         Expression::Predicate(pred) => visit_predicate_impl(visitor, pred, sibling_list_id),
-        Expression::Unary(UnaryExpression { op, expr }) => {
-            let child_list_id = call!(visitor, make_field_list, 1);
-            visit_expression_impl(visitor, expr, child_list_id);
-            match op {
-                UnaryExpressionOp::ToJson {
-                    full_precision_timestamps,
-                } => (visitor.visit_to_json)(
+        Expression::Unary(UnaryExpression { op, expr }) => match op {
+            UnaryExpressionOp::ToJson {
+                full_precision_timestamps,
+            } => {
+                let child_list_id = call!(visitor, make_field_list, 1);
+                visit_expression_impl(visitor, expr, child_list_id);
+                (visitor.visit_to_json)(
                     visitor.data,
                     sibling_list_id,
                     child_list_id,
                     *full_precision_timestamps,
-                ),
+                )
             }
-        }
+            UnaryExpressionOp::MapLen => visit_unknown(visitor, sibling_list_id, "MAP_LEN"),
+        },
         Expression::Binary(BinaryExpression { op, left, right }) => {
             let child_list_id = call!(visitor, make_field_list, 2);
             visit_expression_impl(visitor, left, child_list_id);
@@ -792,16 +795,19 @@ fn visit_predicate_impl(
             visit_fn(visitor.data, sibling_list_id, child_list_id);
         }
         Predicate::Binary(BinaryPredicate { op, left, right }) => {
-            let child_list_id = call!(visitor, make_field_list, 2);
-            visit_expression_impl(visitor, left, child_list_id);
-            visit_expression_impl(visitor, right, child_list_id);
             let visit_fn = match op {
                 BinaryPredicateOp::LessThan => visitor.visit_lt,
                 BinaryPredicateOp::GreaterThan => visitor.visit_gt,
                 BinaryPredicateOp::Equal => visitor.visit_eq,
                 BinaryPredicateOp::Distinct => visitor.visit_distinct,
                 BinaryPredicateOp::In => visitor.visit_in,
+                BinaryPredicateOp::MapHasKey => {
+                    return visit_unknown(visitor, sibling_list_id, "MAP_HAS_KEY");
+                }
             };
+            let child_list_id = call!(visitor, make_field_list, 2);
+            visit_expression_impl(visitor, left, child_list_id);
+            visit_expression_impl(visitor, right, child_list_id);
             visit_fn(visitor.data, sibling_list_id, child_list_id);
         }
         Predicate::Junction(JunctionPredicate { op, preds }) => {
@@ -1031,6 +1037,54 @@ mod tests {
             visit_unknown: visit_unknown_name,
             visit_case_when: ignore_case_when,
         }
+    }
+
+    #[rstest::rstest]
+    #[case::map_len(Expression::column(["m"]).map_len(), "MAP_LEN")]
+    #[case::map_has_key(
+        Expression::from_pred(Predicate::map_has_key(Expression::column(["m"]), Expression::literal("k"))),
+        "MAP_HAS_KEY"
+    )]
+    fn visit_map_accessors_as_unknown(#[case] expr: Expression, #[case] expected_name: &str) {
+        let mut builder = TestExpressionBuilder::default();
+        let mut visitor = test_visitor(&mut builder);
+
+        let top_level_id = visit_expression_internal(&expr, &mut visitor);
+
+        assert_eq!(top_level_id, 0);
+        assert_eq!(
+            builder.events,
+            vec![LiteralEvent::Unknown {
+                sibling_list_id: 0,
+                name: expected_name.to_string(),
+            }]
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::to_json(
+        Expression::unary(UnaryExpressionOp::TO_JSON, Expression::column(["a"])),
+        vec!["a"]
+    )]
+    #[case::less_than(
+        Expression::from_pred(Predicate::lt(Expression::column(["a"]), Expression::column(["b"]))),
+        vec!["a", "b"]
+    )]
+    fn visit_operator_children(#[case] expr: Expression, #[case] expected_columns: Vec<&str>) {
+        let mut builder = TestExpressionBuilder::default();
+        let mut visitor = test_visitor(&mut builder);
+
+        let top_level_id = visit_expression_internal(&expr, &mut visitor);
+
+        assert_eq!(top_level_id, 0);
+        let expected: Vec<_> = expected_columns
+            .into_iter()
+            .map(|column| LiteralEvent::Column {
+                sibling_list_id: 1,
+                parts: vec![column.to_string()],
+            })
+            .collect();
+        assert_eq!(builder.events, expected);
     }
 
     #[test]
