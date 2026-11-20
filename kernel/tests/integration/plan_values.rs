@@ -377,6 +377,9 @@ fn string_map(entries: &[(&str, Option<&str>)]) -> KernelResult<ArrayRef> {
 
 #[rstest]
 #[case::required(|attrs| StringMap { attrs })]
+#[case::nullable(|attrs: HashMap<String, String>| NullableMap {
+    value: attrs.into_iter().map(|(key, value)| (key, Some(value))).collect(),
+})]
 fn maps_ignore_null_values<T>(
     #[case] expected_row: fn(HashMap<String, String>) -> T,
     #[values(vec![], vec![("key", Some("value"))], vec![("null", None)],
@@ -460,7 +463,7 @@ fn string_lists_reject_null_elements_with_hidden_bytes(
 #[case::nested_map(execute_rows::<Vec<NestedMap>>, None)]
 #[case::nullable_list_elements(execute_rows::<Vec<NullableList>>, None)]
 #[case::nullable_struct(execute_rows::<Vec<NestedStruct>>, Some(empty_batch::<NestedStruct> as fn() -> _))]
-#[case::nullable_map_values(execute_rows::<Vec<NullableMap>>, None)]
+#[case::nullable_map_values(execute_rows::<Vec<NullableMap>>, Some(empty_batch::<NullableMap> as fn() -> _))]
 #[case::unsupported_descendant(execute_rows::<Vec<nested::UnsupportedDescendant>>, None)]
 fn schema_support_controls_empty_results_and_stream_errors<T: Debug>(
     #[case] convert: fn(Vec<KernelResult<RecordBatch>>) -> KernelResult<Vec<T>>,

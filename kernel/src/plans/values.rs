@@ -125,9 +125,7 @@ pub(super) fn ensure_supported(field: &StructField) -> KernelResult<()> {
             array.element_type() == &DataType::STRING && !array.contains_null()
         }
         DataType::Map(map) => {
-            map.key_type() == &DataType::STRING
-                && map.value_type() == &DataType::STRING
-                && !map.value_contains_null()
+            map.key_type() == &DataType::STRING && map.value_type() == &DataType::STRING
         }
         DataType::Struct(fields) => {
             for field in fields.fields() {
