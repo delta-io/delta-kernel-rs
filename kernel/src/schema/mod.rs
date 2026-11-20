@@ -199,6 +199,10 @@ pub type SchemaStructPatchBuilder = crate::struct_patch::StructPatchBuilder<Stru
 /// [`delta_kernel_derive::ToSchema`] derive macro.
 #[internal_api]
 pub(crate) trait ToSchema {
+    /// Whether each row must contain exactly one non-null enum variant.
+    #[cfg_attr(not(feature = "declarative-plans"), allow(dead_code))]
+    const VARIANT_ROWS: bool = false;
+
     fn to_schema() -> StructType {
         Self::schema_ref().as_ref().clone()
     }

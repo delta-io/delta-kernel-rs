@@ -152,7 +152,8 @@ pub trait PlanExecutorExt: PlanExecutor {
     /// Executes a plan and decodes its requested output, checking schema and row counts.
     ///
     /// A row requires exactly one result; an optional row allows at most one; vectors accept any
-    /// count. All batches are materialized before cardinality checks or Rust decoding. The plan's
+    /// count. Derived collections apply these counts independently to each named payload field.
+    /// All batches are materialized before cardinality checks or Rust decoding. The plan's
     /// schema must equal the requested schema, including field nullability and metadata.
     ///
     /// Supports numbers, booleans, strings, binary, dates, string lists, string maps, and nested

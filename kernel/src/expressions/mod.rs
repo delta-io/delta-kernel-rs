@@ -37,6 +37,9 @@ mod scalars;
 pub(crate) mod struct_rows;
 #[cfg(feature = "internal-api")]
 pub use struct_rows::TryFromStructRows;
+#[cfg(feature = "internal-api")]
+#[doc(hidden)]
+pub use struct_rows::group_struct_rows;
 mod sql;
 pub(crate) use self::sql::parse_sql;
 
