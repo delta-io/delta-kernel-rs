@@ -30,8 +30,9 @@ pub enum UpdateTableOperation {
     /// `UNSET TBLPROPERTIES`, and so on). Connectors that need Spark-matching history names for
     /// property changes can pass [`Custom`](Self::Custom) with `SET TBLPROPERTIES` or
     /// `UNSET TBLPROPERTIES`. Schema-change Spark names such as `ADD COLUMNS` are reserved and
-    /// rejected as custom names. Prefer this variant when you need the metadata-only checks above;
-    /// `Custom` only records the history name.
+    /// rejected as custom names. Prefer this variant when you need the metadata-only checks above.
+    /// A `Custom` name with the same history string skips those checks and uses the data-operation
+    /// rules for property updates.
     AlterTable,
     /// A row deletion.
     Delete,
