@@ -138,14 +138,14 @@ use crate::{
 };
 
 pub(crate) mod collation_stats;
-pub(crate) mod metrics;
 #[cfg(feature = "declarative-plans")]
-mod shape;
+mod info;
+pub(crate) mod metrics;
 mod sidecar;
 
-use metrics::{CheckpointMetrics, CheckpointPhase};
 #[cfg(feature = "declarative-plans")]
-pub use shape::{CheckpointKind, CheckpointShape};
+pub use info::{CheckpointInfo, CheckpointKind};
+use metrics::{CheckpointMetrics, CheckpointPhase};
 use sidecar::{SidecarSplitter, SingleSidecarDataIterator, create_sidecar_action_batch};
 #[cfg(test)]
 pub(crate) mod tests;
