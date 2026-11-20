@@ -578,40 +578,14 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
         let snapshot = Snapshot::builder_for(latest.table_root().clone())
             .at_version(version)
             .build(engine.as_ref())?;
-        let snapshot = Arc::new(Snapshot::new(
-            snapshot.log_segment().clone(),
-            snapshot.table_configuration().clone(),
-        )?);
         let scan = snapshot
             .scan_builder()
-            .with_stats(stats.clone())
-            .with_partition_values(partition_values.clone())
-            .with_correlation_id("scan-plan-test")
+            .with_stats(stats)
+            .with_partition_values(partition_values)
             .build()?;
-        let plan = assert_scan_plan_metrics(
-            || scan.declarative_metadata_scan_plan(engine.as_ref()),
-            |event| {
-                assert_eq!(event.outcome, ScanPlanOutcome::Plan);
-                assert_eq!(event.stats, stats);
-                assert_eq!(event.partition_values, partition_values);
-                assert_eq!(event.correlation_id.as_deref(), Some("scan-plan-test"));
-                assert_eq!(
-                    event.replay_base,
-                    Some(if version == 4 {
-                        ReplayBase::Empty
-                    } else {
-                        ReplayBase::Checkpoint
-                    })
-                );
-                assert_eq!(
-                    event.commit_start_version.zip(event.commit_end_version),
-                    (version == 4).then_some((0, 4))
-                );
-                assert_eq!(event.commit_total_size_bytes == 0, version != 4);
-                assert_eq!(event.checkpoint.is_some(), version == 5);
-            },
-        )?
-        .expect("metadata plan");
+        let plan = scan
+            .declarative_metadata_scan_plan(engine.as_ref())?
+            .expect("metadata plan");
         let actual = engine
             .plan_executor()
             .unwrap()
@@ -783,25 +757,29 @@ fn declarative_json_only_disables_metadata_pruning(
     LogState::with_latest_version(2),
     FeatureSet::new(),
     checkpoint_json_stats(),
-    StatsOptions::all()
+    StatsOptions::all(),
+    (None, &[(0, 0), (1, 1), (2, 2)])
 )]
 #[case::v1_checkpoint_json(
     LogState::with_latest_version(2).with_checkpoint_at([2]),
     FeatureSet::new(),
     checkpoint_json_stats(),
-    StatsOptions::all()
+    StatsOptions::all(),
+    (Some(2), &[])
 )]
 #[case::v1_checkpoint_struct(
     LogState::with_latest_version(2).with_checkpoint_at([2]),
     FeatureSet::new(),
     checkpoint_struct_stats(),
-    StatsOptions::all_struct()
+    StatsOptions::all_struct(),
+    (Some(2), &[])
 )]
 #[case::v1_mixed_struct_only(
     LogState::with_latest_version(2).with_checkpoint_at([1]),
     FeatureSet::new(),
     checkpoint_struct_stats(),
-    StatsOptions::all()
+    StatsOptions::all(),
+    (Some(1), &[(2, 2)])
 )]
 #[case::v2_checkpoint_json(
     LogState::with_latest_version(2)
@@ -809,7 +787,8 @@ fn declarative_json_only_disables_metadata_pruning(
         .with_sidecars_if_enabled(None),
     FeatureSet::new().v2_checkpoint(),
     checkpoint_json_stats(),
-    StatsOptions::all()
+    StatsOptions::all(),
+    (Some(2), &[])
 )]
 #[case::v2_mixed_struct(
     LogState::with_latest_version(2)
@@ -817,7 +796,8 @@ fn declarative_json_only_disables_metadata_pruning(
         .with_sidecars_if_enabled(None),
     FeatureSet::new().v2_checkpoint(),
     checkpoint_struct_stats(),
-    StatsOptions::all_struct()
+    StatsOptions::all_struct(),
+    (Some(1), &[(2, 2)])
 )]
 #[case::v2_mixed_struct_only(
     LogState::with_latest_version(2)
@@ -825,7 +805,8 @@ fn declarative_json_only_disables_metadata_pruning(
         .with_sidecars_if_enabled(None),
     FeatureSet::new().v2_checkpoint(),
     checkpoint_struct_stats(),
-    StatsOptions::all()
+    StatsOptions::all(),
+    (Some(1), &[(2, 2)])
 )]
 #[case::v2_checkpoint_without_stats(
     LogState::with_latest_version(2)
@@ -833,33 +814,44 @@ fn declarative_json_only_disables_metadata_pruning(
         .with_sidecars_if_enabled(None),
     FeatureSet::new().v2_checkpoint(),
     no_checkpoint_stats(),
-    StatsOptions::all_struct()
+    StatsOptions::all_struct(),
+    (Some(2), &[])
 )]
 #[case::compaction(
     LogState::with_latest_version(3).with_compaction_ranges([(0, 2)]),
     FeatureSet::new(),
     checkpoint_json_stats(),
-    StatsOptions::all()
+    StatsOptions::all(),
+    (None, &[(0, 2), (3, 3)])
 )]
 #[case::compaction_after_sidecars(
     LogState::with_latest_version(4).with_checkpoint_at([2])
         .with_sidecars_if_enabled(Some(1)).with_compaction_ranges([(3, 4)]),
     FeatureSet::new().v2_checkpoint().column_mapping("name"),
     checkpoint_struct_stats(),
-    StatsOptions::all_struct()
+    StatsOptions::all_struct(),
+    (Some(2), &[(3, 4)])
 )]
 fn declarative_metadata_output_options_across_log_shapes(
     #[case] log_state: LogState,
     #[case] features: FeatureSet,
     #[case] table_config: TableConfig,
     #[case] stats: StatsOptions,
+    #[case] metrics: (Option<Version>, &[(Version, Version)]),
     #[values(
         PartitionValuesOptions::default(),
         PartitionValuesOptions::with_struct()
     )]
     partitions: PartitionValuesOptions,
 ) -> Result<()> {
-    assert_metadata_output_options(log_state, features, table_config, stats, partitions)
+    assert_metadata_output_options(
+        log_state,
+        features,
+        table_config,
+        stats,
+        partitions,
+        metrics,
+    )
 }
 
 #[rstest]
@@ -884,6 +876,7 @@ fn declarative_metadata_synthesizes_json_for_struct_only_checkpoints(
         checkpoint_struct_stats(),
         stats,
         PartitionValuesOptions::with_struct(),
+        (Some(2), &[]),
     )
     .unwrap();
 }
@@ -941,6 +934,7 @@ fn assert_metadata_output_options(
     table_config: TableConfig,
     stats: StatsOptions,
     partitions: PartitionValuesOptions,
+    (checkpoint_version, files): (Option<Version>, &[(Version, Version)]),
 ) -> Result<()> {
     let json_requested = stats.synthesize_json;
     let parsed_partitions_requested = partitions.parsed_struct;
@@ -966,8 +960,28 @@ fn assert_metadata_output_options(
         .scan_builder()
         .with_stats(stats)
         .with_partition_values(partitions)
+        .with_correlation_id("scan-plan-test")
         .build()?;
-    let actual = declarative_metadata(&scan, &engine)?;
+    let actual = assert_scan_plan_metrics(
+        || declarative_metadata(&scan, &engine),
+        |event| {
+            assert_eq!(event.outcome, ScanPlanOutcome::Plan);
+            assert_eq!(event.stats, scan.stats);
+            assert_eq!(event.partition_values, scan.partition_values_options);
+            assert_eq!(event.correlation_id.as_deref(), Some("scan-plan-test"));
+            let replay_base =
+                checkpoint_version.map_or(ReplayBase::Empty, |_| ReplayBase::Checkpoint);
+            assert_eq!(event.replay_base, Some(replay_base));
+            assert_eq!(event.checkpoint.is_some(), checkpoint_version.is_some());
+            assert_eq!(event.commit_start_version, files.first().map(|(lo, _)| *lo));
+            assert_eq!(event.commit_end_version, files.last().map(|(_, hi)| *hi));
+            assert_eq!(event.commit_total_size_bytes == 0, files.is_empty());
+            assert_eq!(
+                event.compaction_file_count,
+                files.iter().filter(|(lo, hi)| lo != hi).count() as u64
+            );
+        },
+    )?;
 
     for batches in [&actual, &expected] {
         assert!(
@@ -1272,11 +1286,9 @@ async fn scan_compaction_selection_uses_snapshot_table_feature(
             imperative_metadata(snapshot.scan_builder().build()?, engine.as_ref()).is_err(),
             !adaptive_metadata
         );
-        let plan = assert_scan_plan_metrics(
-            || scan.declarative_metadata_scan_plan(engine.as_ref()),
-            |event| assert_eq!(event.compaction_file_count, u64::from(!adaptive_metadata)),
-        )?
-        .unwrap();
+        let plan = scan
+            .declarative_metadata_scan_plan(engine.as_ref())?
+            .unwrap();
         assert_eq!(
             plan.nodes.iter().any(|node| match &node.op {
                 Operator::ScanJson(scan) => scan.files.iter().any(|file| file
@@ -1327,31 +1339,12 @@ fn declarative_metadata_reconciles_checkpoint_with_later_commits(
     )?;
     assert_eq!(metadata_row_count(&expected), 4);
 
-    let segment = snapshot.log_segment();
-    let expected_bytes: u64 = if compact {
-        &segment.listed.ascending_compaction_files
-    } else {
-        &segment.listed.ascending_commit_files
-    }
-    .iter()
-    .filter(|file| file.version > 2)
-    .map(|file| file.location.size)
-    .sum();
     let scan = snapshot
         .scan_builder()
         .with_stats(StatsOptions::all())
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()?;
-    let plan = assert_scan_plan_metrics(
-        || scan.declarative_metadata_scan_plan(&engine),
-        |event| {
-            assert_eq!(event.commit_start_version, Some(3));
-            assert_eq!(event.commit_end_version, Some(4));
-            assert_eq!(event.commit_total_size_bytes, expected_bytes);
-            assert_eq!(event.compaction_file_count, u64::from(compact));
-        },
-    )?
-    .unwrap();
+    let plan = scan.declarative_metadata_scan_plan(&engine)?.unwrap();
     assert_eq!(
         plan.nodes.iter().any(|node| match &node.op {
             Operator::ScanJson(scan) =>
