@@ -11,7 +11,7 @@ use crate::{KernelError, KernelResult};
 #[internal_api]
 pub(crate) trait TryFromStructRows: Sized {
     /// The input row type whose schema is used for materialization.
-    type Row: ToSchema;
+    type Row: ToSchema + TryFrom<StructData, Error = KernelError>;
 
     /// Collects rows using the output's cardinality policy.
     fn collect_into(rows: Vec<StructData>) -> KernelResult<Self>;
