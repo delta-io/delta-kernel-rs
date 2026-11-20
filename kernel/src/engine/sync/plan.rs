@@ -1107,7 +1107,7 @@ mod tests {
         let entries = fields[2].get_fields()[0].get_fields();
         assert_eq!(entries[0].get_basic_info().id(), 4);
         assert_eq!(entries[1].get_basic_info().id(), 5);
-        let element = &entries[1].get_fields()[0];
+        let element = &entries[1].get_fields()[0].get_fields()[0];
         assert_eq!(element.get_basic_info().id(), 6);
         assert_eq!(element.get_fields()[0].get_basic_info().id(), 7);
         let read_schema = input_schema.project(&["amount", "stats", "items"])?;
