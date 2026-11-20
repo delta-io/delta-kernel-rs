@@ -287,7 +287,7 @@ fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
         let (_, bytes) = write_checkpoint(&writer, &engine, format)?;
         std::fs::write(&hint_path, &bytes)?;
         predecessor_hint = Some(bytes);
-        for file in storage.list_from(&log)? {
+        for file in storage.list_from(&log, None)? {
             let file = file?;
             if file.location.path().ends_with(".json")
                 && !file.location.path().contains(".checkpoint.")
@@ -329,7 +329,7 @@ fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
         .collect::<Result<_, _>>()?;
     sidecars.sort_by(|a, b| a.path.cmp(&b.path));
     let actual_sidecars = storage
-        .list_from(&log.join("_sidecars/")?)?
+        .list_from(&log.join("_sidecars/")?, None)?
         .collect::<KernelResult<Vec<_>>>()?
         .into_iter()
         .filter(|file| !predecessor_files.contains(&file.location))
@@ -443,7 +443,7 @@ fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
     // Keep the target commit as a publication watermark; all older history is dispensable.
     std::fs::write(hint_path, bytes)?;
     let target_commit = log.join(&format!("{:020}.json", snapshot.version()))?;
-    for file in storage.list_from(&log)? {
+    for file in storage.list_from(&log, None)? {
         let file = file?;
         if (file.location.path().ends_with(".json")
             && !file.location.path().contains(".checkpoint.")
