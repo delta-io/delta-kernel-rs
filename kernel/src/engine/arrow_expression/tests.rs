@@ -2115,7 +2115,7 @@ fn deletion_vector_path_resolves_absolute_and_inline_descriptors() {
 
     let relative = DeletionVectorDescriptor::try_new(
         DeletionVectorStorageType::PersistedRelative,
-        "ab^-aqEH.-t@S}K{vb[*k^",
+        "a#b^-aqEH.-t@S}K{vb[*k^",
         Some(0),
         4,
         1,
@@ -2145,11 +2145,11 @@ fn deletion_vector_path_resolves_absolute_and_inline_descriptors() {
         .unwrap();
     assert_eq!(
         absolute_path.value(0),
-        "s3://bucket/table/ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
+        "s3://bucket/table/a%23b/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
     );
     assert_eq!(
         relative_path.value(0),
-        "ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
+        "a%23b/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
     );
 
     let inline = DeletionVectorDescriptor::try_new(
