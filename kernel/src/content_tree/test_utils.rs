@@ -51,6 +51,7 @@ pub(crate) fn added_data_entry(
             first_row_id: Some(base_row_id),
             deleted_positions: None,
             replaced_positions: None,
+            snapshot_timestamp: None,
         },
         deletion_vector: None,
         spec_id: Some(0),
@@ -218,7 +219,11 @@ fn x_table() -> StructType {
 }
 
 /// Writes `data` as a single-batch parquet file at `location` and returns its [`FileMeta`].
-fn write_batch(engine: &dyn Engine, location: Url, data: Box<dyn EngineData>) -> FileMeta {
+pub(crate) fn write_batch(
+    engine: &dyn Engine,
+    location: Url,
+    data: Box<dyn EngineData>,
+) -> FileMeta {
     let size = engine
         .parquet_handler()
         .write_parquet_file(location.clone(), Box::new(iter::once(Ok(data))))
