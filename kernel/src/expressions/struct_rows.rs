@@ -4,14 +4,14 @@ use delta_kernel_derive::internal_api;
 
 use super::StructData;
 use crate::error::add_scalar_path_context;
-use crate::schema::{SchemaRef, ToSchema};
+use crate::schema::ToSchema;
 use crate::{KernelError, KernelResult};
 
 /// Collects struct rows into a row, optional row, or vector.
 #[internal_api]
 pub(crate) trait TryFromStructRows: Sized {
-    /// Returns the output schema.
-    fn schema_info() -> KernelResult<SchemaRef>;
+    /// The input row type whose schema is used for materialization.
+    type Row: ToSchema;
 
     /// Collects rows using the output's cardinality policy.
     fn collect_into(rows: Vec<StructData>) -> KernelResult<Self>;
@@ -20,9 +20,7 @@ pub(crate) trait TryFromStructRows: Sized {
 macro_rules! impl_row_result {
     ($target:ty, $counts:expr, |$rows:ident| $finish:expr) => {
         impl<T: ToSchema + TryFrom<StructData, Error = KernelError>> TryFromStructRows for $target {
-            fn schema_info() -> KernelResult<SchemaRef> {
-                Ok(<T as ToSchema>::schema_ref().clone())
-            }
+            type Row = T;
 
             fn collect_into(rows: Vec<StructData>) -> KernelResult<Self> {
                 if !($counts).contains(&rows.len()) {

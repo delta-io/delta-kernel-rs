@@ -120,7 +120,7 @@ use itertools::Itertools;
 
 use crate::engine_data::TypedGetData as _;
 use crate::expressions::{ColumnName, TryFromStructRows, column_name};
-use crate::schema::DataType;
+use crate::schema::{DataType, ToSchema};
 use crate::{
     AsAny, EngineData, FileMeta, GetData, KernelError, KernelResult, KernelResultIterator,
     ParquetFooter, RowVisitor as _,
@@ -161,11 +161,11 @@ pub trait PlanExecutorExt: PlanExecutor {
     /// duplicate-key results are unspecified. Other collections, decimals, and timestamps are
     /// unsupported, including for empty streams.
     fn execute_plan_into<T: TryFromStructRows>(&self, plan: Plan) -> KernelResult<T> {
-        let schema = T::schema_info()?;
+        let schema = <T::Row as ToSchema>::schema_ref();
         for field in schema.fields() {
             values::ensure_supported(field)?;
         }
-        if plan.schema != schema {
+        if &plan.schema != schema {
             return Err(KernelError::invalid_struct_data(format!(
                 "Plan output schema does not match requested schema.\nExpected:\n{schema}\nActual:\n{}",
                 plan.schema
@@ -174,7 +174,7 @@ pub trait PlanExecutorExt: PlanExecutor {
         let rows = self
             .execute_plan(plan)?
             .into_data()?
-            .map(|batch| values::read_struct(batch?.as_ref(), &schema))
+            .map(|batch| values::read_struct(batch?.as_ref(), schema))
             .flatten_ok()
             .collect::<KernelResult<_>>()?;
         T::collect_into(rows)

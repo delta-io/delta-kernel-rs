@@ -19,7 +19,9 @@ use delta_kernel::engine::sync::plan::SyncPlanExecutor;
 use delta_kernel::expressions::{StructData, TryFromStructRows};
 use delta_kernel::plans::Operation;
 use delta_kernel::plans::ir::nodes::Values;
-use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType, ToSchema, lazy_schema_ref, schema};
+use delta_kernel::schema::{
+    DataType, SchemaRef, StructField, StructType, ToSchema, lazy_schema_ref, schema,
+};
 use delta_kernel::{
     EngineData, KernelError, KernelResult, PlanBuilder, PlanExecutor, PlanExecutorExt, PlanResult,
 };
@@ -123,7 +125,7 @@ fn execute_rows<T: TryFromStructRows>(batches: Vec<KernelResult<RecordBatch>>) -
             let schema: StructType = batch.schema().as_ref().try_into_kernel()?;
             Ok(Arc::new(schema))
         })
-        .unwrap_or_else(T::schema_info)?;
+        .unwrap_or_else(|| Ok(<T::Row as ToSchema>::schema_ref().clone()))?;
     execute_result(data(batches), &schema)
 }
 
