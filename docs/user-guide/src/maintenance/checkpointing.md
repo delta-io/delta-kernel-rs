@@ -179,9 +179,13 @@ when the table does not enable adaptive metadata. Snapshot reconstruction always
 commits and checkpoints. Empty compactions are skipped in favor of the original commits.
 
 Keep the original commits: commit-level APIs such as Change Data Feed and timestamp lookup
-still need them. Compaction writing remains disabled. `Snapshot::log_compaction_writer()`
-returns an error, and `should_compact()` returns `false`.
-See [issue #2337](https://github.com/delta-io/delta-kernel-rs/issues/2337) for tracking.
+still need them.
+
+> [!NOTE]
+> Writes are supported only with `declarative-plans`, via `Snapshot::compact_log()`,
+> and require an engine with a plan executor. `Snapshot::log_compaction_writer()` still
+> returns an error, and `should_compact()` returns `false`.
+> See [issue #2337](https://github.com/delta-io/delta-kernel-rs/issues/2337) for tracking.
 
 ## What's next
 
