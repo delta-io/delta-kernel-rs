@@ -183,7 +183,9 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// Only non-`delta.*` application properties may be removed. Removing a key that is not present
     /// is not an error. Repeated calls accumulate keys. Adding and removing the same key in one
     /// transaction is rejected during [`build`](Self::build). Removals are applied during
-    /// [`build`](Self::build) and cause a Metadata action to be emitted.
+    /// [`build`](Self::build). For `ALTER TABLE`, requested removals always emit Metadata,
+    /// including when every key is already absent. Data operations drop absent keys so Metadata is
+    /// emitted only when at least one removed key actually exists.
     pub fn with_table_properties_removed<I, K>(mut self, keys: I) -> Self
     where
         I: IntoIterator<Item = K>,
@@ -447,7 +449,6 @@ fn try_new_update_table<MODE: ExecutionMode>(
         IcebergCompatValidationContext::Write,
     )?;
 
-    let has_property_removes = !properties_removed.is_empty();
     let has_schema_changes = schema_changes.is_some();
     let effective_table_config = match schema_changes {
         Some(changes) => apply_schema_changes(effective_table_config, changes)?,
@@ -470,6 +471,19 @@ fn try_new_update_table<MODE: ExecutionMode>(
         }
     };
     let has_property_adds = !properties_added.is_empty();
+    // ALTER TABLE always keeps requested removals (Spark always rewrites Metadata for UNSET
+    // TBLPROPERTIES). Data operations drop absent keys so Metadata is emitted only when a key
+    // actually exists.
+    let properties_removed =
+        if properties_removed.is_empty() || operation == UpdateTableOperation::AlterTable {
+            properties_removed
+        } else {
+            filter_absent_property_removals(
+                effective_table_config.metadata().configuration(),
+                properties_removed,
+            )
+        };
+    let has_property_removes = !properties_removed.is_empty();
     let should_emit_metadata = has_schema_changes || has_property_adds || has_property_removes;
     let effective_table_config = if has_property_adds {
         apply_table_properties_added(effective_table_config, properties_added)?
@@ -541,6 +555,20 @@ fn filter_out_unchanged_properties(
         .collect()
 }
 
+/// Drops removal keys that are not present in `current`.
+///
+/// Used for data operations so Metadata is emitted only when a key actually exists. ALTER TABLE
+/// keeps requested removals even when the key is already absent.
+fn filter_absent_property_removals(
+    current: &HashMap<String, String>,
+    properties_removed: HashSet<String>,
+) -> HashSet<String> {
+    properties_removed
+        .into_iter()
+        .filter(|key| current.contains_key(key))
+        .collect()
+}
+
 /// Merges already-validated, changed `properties_added` into `table_config`'s metadata.
 ///
 /// Callers must validate/canonicalize and drop unchanged entries first.
@@ -595,7 +623,7 @@ fn validate_properties_removed_keys(properties_removed: &HashSet<String>) -> Ker
         .iter()
         .find(|key| is_delta_property_key(key))
     {
-        return Err(KernelError::generic(format!(
+        return Err(KernelError::unsupported(format!(
             "Unsetting '{DELTA_PROPERTY_PREFIX}' table properties is currently unsupported \
              (requested '{key}')"
         )));
@@ -621,7 +649,7 @@ fn validate_properties_added_removed_no_overlap(
         return Ok(());
     }
     overlapping.sort_unstable();
-    Err(KernelError::generic(format!(
+    Err(KernelError::invalid_transaction_state(format!(
         "Cannot set and unset the same table property in the same transaction. \
          Properties set and unset: {overlapping:?}"
     )))
@@ -1110,7 +1138,7 @@ mod tests {
     }
 
     #[test]
-    fn with_table_properties_removed_missing_key_still_emits_metadata() -> Result<()> {
+    fn with_table_properties_removed_missing_key_still_emits_metadata_on_alter() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let transaction = snapshot
             .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
@@ -1128,35 +1156,125 @@ mod tests {
         Ok(())
     }
 
-    #[rstest]
-    #[case::delta_property("delta.checkpointInterval", "Unsetting 'delta.' table properties")]
-    #[case::feature_enabling_delta_property(
-        "delta.enableTypeWidening",
-        "Unsetting 'delta.' table properties"
-    )]
-    #[case::delta_property_mixed_case(
-        "DELTA.enableTypeWidening",
-        "Unsetting 'delta.' table properties"
-    )]
-    #[case::overlap_with_add("app.owner", "Cannot set and unset the same table property")]
-    fn with_table_properties_removed_rejects_invalid_keys(
-        #[case] key: &str,
-        #[case] expected: &str,
-    ) -> Result<()> {
-        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
-        let mut builder = snapshot
+    #[test]
+    fn with_table_properties_removed_skips_absent_keys_on_write() -> Result<()> {
+        let engine = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let snapshot = create_table("memory:///", test_schema_flat(), "test-engine", true)
+            .with_table_properties([("app.owner", "kernel"), ("app.team", "delta")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+
+        let absent_only = snapshot
+            .clone()
+            .update_table(UpdateTableOperation::Write, "test-engine", true)
+            .with_table_properties_removed(["app.missing"])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        assert!(!absent_only.should_emit_metadata);
+
+        let present = snapshot
+            .clone()
+            .update_table(UpdateTableOperation::Write, "test-engine", true)
+            .with_table_properties_removed(["app.owner"])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        assert!(present.should_emit_metadata);
+        assert!(
+            !present
+                .effective_table_config
+                .metadata()
+                .configuration()
+                .contains_key("app.owner")
+        );
+        assert_eq!(
+            present
+                .effective_table_config
+                .metadata()
+                .configuration()
+                .get("app.team")
+                .map(String::as_str),
+            Some("delta")
+        );
+
+        let mixed = snapshot
+            .update_table(UpdateTableOperation::Write, "test-engine", true)
+            .with_table_properties_removed(["app.owner", "app.missing"])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        assert!(mixed.should_emit_metadata);
+        assert!(
+            !mixed
+                .effective_table_config
+                .metadata()
+                .configuration()
+                .contains_key("app.owner")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn with_table_properties_removed_accumulates_across_calls() -> Result<()> {
+        let engine = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let snapshot = create_table("memory:///", test_schema_flat(), "test-engine", true)
+            .with_table_properties([
+                ("app.owner", "kernel"),
+                ("app.team", "delta"),
+                ("app.region", "eu"),
+            ])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+
+        let transaction = snapshot
             .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
-            .with_table_properties_removed([key]);
-        if key == "app.owner" {
-            builder = builder.with_table_properties_added([("app.owner", "kernel")]);
-        }
-        let error = builder
+            .with_table_properties_removed(["app.owner"])
+            .with_table_properties_removed(["app.team"])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+        let after = transaction
+            .effective_table_config
+            .metadata()
+            .configuration();
+        assert!(transaction.should_emit_metadata);
+        assert!(!after.contains_key("app.owner"));
+        assert!(!after.contains_key("app.team"));
+        assert_eq!(after.get("app.region").map(String::as_str), Some("eu"));
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::delta_property("delta.checkpointInterval")]
+    #[case::feature_enabling_delta_property("delta.enableTypeWidening")]
+    #[case::delta_property_mixed_case("DELTA.enableTypeWidening")]
+    fn with_table_properties_removed_rejects_delta_keys(#[case] key: &str) -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let error = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_removed([key])
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
             .unwrap_err();
         assert!(
-            error.to_string().contains(expected),
-            "error={error}, expected={expected}"
+            error
+                .to_string()
+                .contains("Unsetting 'delta.' table properties"),
+            "error={error}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn with_table_properties_removed_rejects_overlap_with_later_add_batch() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let error = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_removed(["app.owner"])
+            .with_table_properties_added([("app.region", "eu")])
+            .with_table_properties_added([("app.owner", "kernel")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            Error::Kernel(KernelError::InvalidTransactionState(message))
+            if message.contains("Cannot set and unset the same table property")
+        ));
         Ok(())
     }
 

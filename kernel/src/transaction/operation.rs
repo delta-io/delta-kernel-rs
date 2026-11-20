@@ -27,9 +27,11 @@ pub enum UpdateTableOperation {
     ///
     /// Writes `commitInfo.operation = "ALTER TABLE"`. Delta Spark records finer-grained names for
     /// the same kinds of change (`ADD COLUMNS`, `CHANGE COLUMN`, `SET TBLPROPERTIES`,
-    /// `UNSET TBLPROPERTIES`, and so on). Connectors that need Spark-matching history names can
-    /// pass [`Custom`](Self::Custom) with that string instead; Kernel still applies the same
-    /// metadata-change rules when the builder stages schema or property updates.
+    /// `UNSET TBLPROPERTIES`, and so on). Connectors that need Spark-matching history names for
+    /// property changes can pass [`Custom`](Self::Custom) with `SET TBLPROPERTIES` or
+    /// `UNSET TBLPROPERTIES`. Schema-change Spark names such as `ADD COLUMNS` are reserved and
+    /// rejected as custom names. Prefer this variant when you need the metadata-only checks above;
+    /// `Custom` only records the history name.
     AlterTable,
     /// A row deletion.
     Delete,
