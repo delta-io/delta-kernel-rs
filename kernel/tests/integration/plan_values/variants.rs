@@ -23,6 +23,14 @@ result_row! { pub(super) struct Add { pub(super) id: i32 } }
 result_row! { pub(super) struct Remove { pub(super) id: i32 } }
 result_row! { struct NullableRow { id: Option<i32> } }
 
+impl TryFrom<Scalar> for CustomRow {
+    type Error = KernelError;
+
+    fn try_from(value: Scalar) -> KernelResult<Self> {
+        Self::try_from(StructData::try_from(value)?)
+    }
+}
+
 macro_rules! action_collectors {
     ($($name:ident($add:ty, $remove:ty)),* $(,)?) => {$(
         #[derive(Debug, PartialEq, DeriveStructRows)]
@@ -42,6 +50,7 @@ action_collectors! {
     CustomAddAndRemoves(CustomRow, Vec<Remove>),
     OptionalCustomAddAndRemoves(Option<CustomRow>, Vec<Remove>),
     CustomActions(Vec<CustomRow>, Vec<Remove>),
+    ReusedPayload(Add, Option<Add>),
 }
 
 #[derive(Debug, PartialEq, DeriveStructRows)]
@@ -211,7 +220,7 @@ fn named_collections_use_manual_decoders_and_enforce_cardinality(
 
 #[rstest]
 #[case::reused_payload(
-    variant_batches(1, 1), Actions { add: Add { id: 0 }, remove: Some(Add { id: 100 }) }
+    variant_batches(1, 1), ReusedPayload { add: Add { id: 0 }, remove: Some(Add { id: 100 }) }
 )]
 #[case::renamed_variant(
     vec![Ok(batch(&[None], &[Some(8)]))], RenamedAction::Deleted(Remove { id: 8 })
