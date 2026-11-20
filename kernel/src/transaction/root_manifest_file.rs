@@ -549,7 +549,13 @@ mod tests {
             self.domain()
         }
         fn value(&self) -> i64 {
-            self.configuration().parse().unwrap()
+            let configuration = self.configuration();
+            configuration.parse().unwrap_or_else(|_| {
+                panic!(
+                    "domain {} has non-integer configuration {configuration:?}",
+                    self.domain()
+                )
+            })
         }
         fn line(&self) -> String {
             domain_metadata_line(self.clone())
@@ -574,7 +580,8 @@ mod tests {
         }
     }
 
-    /// One row of [`compute_checkpoint_action_inlines_sidecar_entries`], as keys per source.
+    /// One row of [`compute_checkpoint_action_inlines_sidecar_entries`]: keys per source, and the
+    /// inline entries expected after it.
     #[derive(Clone, Copy)]
     struct SidecarRow {
         before: &'static [&'static str],
@@ -582,6 +589,8 @@ mod tests {
         sidecars: &'static [&'static [&'static str]],
         logged: &'static [&'static str],
         changed: &'static [&'static str],
+        /// The (key, value) pairs the new checkpoint action holds inline.
+        expected_inline: &'static [(&'static str, i64)],
     }
 
     // Each source writes a distinct value, so the assertions show which one won.
@@ -589,6 +598,17 @@ mod tests {
     const EXISTING: i64 = 1;
     const LOGGED: i64 = 2;
     const CHANGED: i64 = 3;
+
+    /// The row a kind runs when the case doesn't change it: existing entries only, nothing logged
+    /// or changed.
+    const UNTOUCHED: SidecarRow = SidecarRow {
+        before: &[],
+        inline: &["untouched"],
+        sidecars: &[&["untouched-spilled"]],
+        logged: &[],
+        changed: &[],
+        expected_inline: &[("untouched", EXISTING), ("untouched-spilled", EXISTING)],
+    };
 
     /// The `T` side of a row: the lines logged before the action, the entries logged after it,
     /// and this transaction's changes.
@@ -599,19 +619,6 @@ mod tests {
     }
 
     impl SidecarRow {
-        /// The row as seen by a kind it doesn't change: nothing logged or changed.
-        fn for_kind(self, changes_kind: bool) -> Self {
-            if changes_kind {
-                return self;
-            }
-            SidecarRow {
-                before: &[],
-                logged: &[],
-                changed: &[],
-                ..self
-            }
-        }
-
         fn setup<T: TestEntry>(
             &self,
             engine: &SyncEngine,
@@ -633,80 +640,81 @@ mod tests {
             }
         }
 
-        /// Asserts `checkpoint` holds every `T` entry inline at its newest value, and no sidecars.
+        /// Asserts `checkpoint` holds exactly the row's expected `T` entries inline, and no
+        /// sidecars.
         fn assert_entries<T: TestEntry>(&self, checkpoint: &CheckpointAction) {
-            let newest = |key: &str| {
-                if self.changed.contains(&key) {
-                    CHANGED
-                } else if self.logged.contains(&key) {
-                    LOGGED
-                } else {
-                    EXISTING
-                }
-            };
-            let sidecar_keys = self.sidecars.iter().copied().flatten();
-            let expected = (self.inline.iter().chain(sidecar_keys))
-                .chain(self.logged)
-                .chain(self.changed)
-                .copied()
-                .sorted()
-                .dedup()
-                .map(|key| (key, newest(key)))
-                .collect_vec();
             let inline = T::inline(checkpoint)
                 .iter()
                 .map(|entry| (entry.key(), entry.value()))
                 .sorted();
-            assert_eq!(inline.collect_vec(), expected);
+            let expected = self.expected_inline.iter().copied().sorted();
+            assert_eq!(inline.collect_vec(), expected.collect_vec());
             assert!(T::sidecars(checkpoint).is_empty());
         }
     }
 
-    // Each row runs with its changes applied to txns, domains, or both; the other kind must come
-    // through untouched.
+    // `compute_checkpoint_action` writes every live entry inline and no sidecars. Each entry takes
+    // its newest value: this transaction's change, then a commit after the action, then the action
+    // itself; commits before the action are ignored. Each row runs for txns, domains, or both; a
+    // kind the row doesn't change runs `UNTOUCHED`.
     #[rstest]
     #[case::unchanged(SidecarRow {
         before: &[], inline: &["inline"], sidecars: &[&["kept", "spilled"]], logged: &[],
         changed: &[],
+        expected_inline: &[("inline", EXISTING), ("kept", EXISTING), ("spilled", EXISTING)],
     })]
     #[case::inline_changed(SidecarRow {
         before: &[], inline: &["inline"], sidecars: &[&["kept", "spilled"]], logged: &[],
         changed: &["inline"],
+        expected_inline: &[("inline", CHANGED), ("kept", EXISTING), ("spilled", EXISTING)],
     })]
     #[case::inline_logged(SidecarRow {
         before: &[], inline: &["inline"], sidecars: &[&["kept", "spilled"]], logged: &["inline"],
         changed: &[],
+        expected_inline: &[("inline", LOGGED), ("kept", EXISTING), ("spilled", EXISTING)],
     })]
     #[case::transaction_overrides_log_commit(SidecarRow {
         before: &[], inline: &["inline"], sidecars: &[&["kept", "spilled"]], logged: &["inline"],
         changed: &["inline"],
+        expected_inline: &[("inline", CHANGED), ("kept", EXISTING), ("spilled", EXISTING)],
     })]
     #[case::new_entry(SidecarRow {
         before: &[], inline: &["inline"], sidecars: &[&["kept", "spilled"]], logged: &[],
         changed: &["new"],
+        expected_inline: &[
+            ("inline", EXISTING), ("kept", EXISTING), ("new", CHANGED), ("spilled", EXISTING),
+        ],
     })]
     #[case::logged_new_entry(SidecarRow {
         before: &[], inline: &["inline"], sidecars: &[&["kept", "spilled"]], logged: &["new"],
         changed: &[],
+        expected_inline: &[
+            ("inline", EXISTING), ("kept", EXISTING), ("new", LOGGED), ("spilled", EXISTING),
+        ],
     })]
     #[case::sidecar_entry(SidecarRow {
         before: &[], inline: &["inline"], sidecars: &[&["kept", "spilled"]], logged: &[],
         changed: &["spilled"],
+        expected_inline: &[("inline", EXISTING), ("kept", EXISTING), ("spilled", CHANGED)],
     })]
     #[case::logged_sidecar_entry(SidecarRow {
         before: &[], inline: &["inline"], sidecars: &[&["kept", "spilled"]], logged: &["spilled"],
         changed: &[],
+        expected_inline: &[("inline", EXISTING), ("kept", EXISTING), ("spilled", LOGGED)],
     })]
     #[case::logged_before_action(SidecarRow {
         before: &["stale"], inline: &["inline"], sidecars: &[&["kept"]], logged: &["logged"],
         changed: &[],
+        expected_inline: &[("inline", EXISTING), ("kept", EXISTING), ("logged", LOGGED)],
     })]
     #[case::logged_before_action_at_tip(SidecarRow {
         before: &["stale"], inline: &["inline"], sidecars: &[&["kept"]], logged: &[],
         changed: &[],
+        expected_inline: &[("inline", EXISTING), ("kept", EXISTING)],
     })]
     #[case::empty_action_ignores_entries_before_it(SidecarRow {
         before: &["dropped"], inline: &[], sidecars: &[], logged: &[], changed: &[],
+        expected_inline: &[],
     })]
     fn compute_checkpoint_action_inlines_sidecar_entries(
         #[case] row: SidecarRow,
@@ -718,7 +726,8 @@ mod tests {
         let manifest_version = if row.before.is_empty() { 1 } else { 2 };
         let path = format!("metadata/root-v{manifest_version}.parquet");
         let mut existing = minimal_checkpoint_action(&path, manifest_version)?;
-        let (txn_row, domain_row) = (row.for_kind(txns_change), row.for_kind(domains_change));
+        let txn_row = if txns_change { row } else { UNTOUCHED };
+        let domain_row = if domains_change { row } else { UNTOUCHED };
         let txns: KindSetup<SetTransaction> = txn_row.setup(&engine, &table_root, &mut existing);
         let domains: KindSetup<DomainMetadata> =
             domain_row.setup(&engine, &table_root, &mut existing);
