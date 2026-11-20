@@ -1795,10 +1795,7 @@ impl Snapshot {
                         "CheckpointSpec::V2 requires the v2Checkpoint table feature to be supported",
                     )));
                 }
-                if let V2CheckpointConfig::WithSidecar {
-                    file_actions_per_sidecar_hint: Some(0),
-                } = cfg
-                {
+                if cfg.file_actions_per_sidecar_hint() == Some(0) {
                     return Err(Error::Kernel(KernelError::checkpoint_write(
                         "file_actions_per_sidecar_hint must be greater than 0",
                     )));
@@ -1815,7 +1812,7 @@ impl Snapshot {
         }
 
         let mode = match spec {
-            Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar { .. })) => {
+            Some(CheckpointSpec::V2(cfg)) if cfg.file_actions_per_sidecar_hint().is_some() => {
                 CheckpointWriteMode::V2WithSidecars
             }
             _ if v2_supported => CheckpointWriteMode::V2WithoutSidecars,
@@ -1828,6 +1825,14 @@ impl Snapshot {
         let writer = Arc::clone(self).create_checkpoint_writer(engine)?;
 
         let write_result = match spec {
+            #[cfg(feature = "incremental-checkpoints-in-dev")]
+            Some(CheckpointSpec::V2(V2CheckpointConfig::ReuseEligibleSidecars {
+                file_actions_per_sidecar_hint,
+            })) => writer.write_v2_checkpoint_reusing_eligible_sidecars(
+                engine,
+                file_actions_per_sidecar_hint.unwrap_or(DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT),
+                metrics.clone(),
+            ),
             Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
                 file_actions_per_sidecar_hint,
             })) => {

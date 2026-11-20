@@ -6,10 +6,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+#[cfg(feature = "incremental-checkpoints-in-dev")]
+use delta_kernel::RowVisitor;
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::DelegatingEngine;
 use delta_kernel::expressions::PredicateRef;
+#[cfg(feature = "incremental-checkpoints-in-dev")]
+use delta_kernel::expressions::{ArrayData, ColumnName};
 use delta_kernel::metrics::{
     CheckpointOutputStats, CheckpointProcessingStats, CheckpointWriteMode, CheckpointWriteOutcome,
     MetricEvent,
@@ -573,6 +577,235 @@ async fn previous_checkpoint_input_timing_includes_setup_and_pulls(
     Ok(())
 }
 
+#[cfg(feature = "incremental-checkpoints-in-dev")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReuseInputCase {
+    Reuse,
+    InlineFallback,
+    LateRejection,
+    FooterFailure,
+    PartialValidationFailure,
+    RootVisitorFailure,
+}
+
+#[cfg(feature = "incremental-checkpoints-in-dev")]
+#[rstest]
+#[case::reuse(ReuseInputCase::Reuse)]
+#[case::inline_fallback(ReuseInputCase::InlineFallback)]
+#[case::late_rejection(ReuseInputCase::LateRejection)]
+#[case::footer_failure(ReuseInputCase::FooterFailure)]
+#[case::partial_validation_failure(ReuseInputCase::PartialValidationFailure)]
+#[case::root_visitor_failure(ReuseInputCase::RootVisitorFailure)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reuse_checkpoint_accounts_for_preflight_replay_and_failures(
+    #[case] case: ReuseInputCase,
+) -> delta_kernel::Result<()> {
+    let mut log_state = LogState::with_latest_version(3).with_checkpoint_at([2]);
+    if case != ReuseInputCase::InlineFallback {
+        log_state = log_state.with_sidecars_if_enabled(Some(1));
+    }
+    let table = TestTableBuilder::new()
+        .with_features(FeatureSet::new().v2_checkpoint())
+        .with_log_state(log_state)
+        .with_data(1, 1)
+        .build()?;
+    let inner = checkpoint_engine(&table, 1);
+    let mut snapshot = Snapshot::builder_for(table.table_root()).build(inner.as_ref())?;
+    if case == ReuseInputCase::LateRejection {
+        // The base writes the newer Add first. Remove the older Add to reject after that prefix.
+        let oldest = Snapshot::builder_for(table.table_root())
+            .at_version(1)
+            .build(inner.as_ref())?;
+        let mut transaction = snapshot
+            .update_table(UpdateTableOperation::Write, "checkpoint-metrics-test", true)
+            .build(inner.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        for files in get_scan_files(oldest, inner.as_ref())? {
+            transaction.remove_files(files);
+        }
+        snapshot = transaction
+            .commit(inner.as_ref())?
+            .unwrap_post_commit_snapshot();
+    }
+    let hint_path = "_delta_log/_last_checkpoint".into();
+    let old_hint = table
+        .store()
+        .get(&hint_path)
+        .await
+        .map_err(KernelError::from)?
+        .bytes()
+        .await
+        .map_err(KernelError::from)?;
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    let delay = Duration::from_millis(10);
+    let mut engine = ControlledCheckpointEngine::new(inner, delay, None, Duration::ZERO, false);
+    Arc::get_mut(&mut engine.json).unwrap().input.delay = delay;
+    let parquet = Arc::get_mut(&mut engine.parquet).unwrap();
+    parquet.input.delay = delay;
+    parquet.reuse_input = Some(ReuseInputControl {
+        root: ControlledInput {
+            delay,
+            ..Default::default()
+        },
+        footer: ControlledInput {
+            delay,
+            fail_setup: case == ReuseInputCase::FooterFailure,
+            ..Default::default()
+        },
+        validation: ControlledInput {
+            delay,
+            fail_after: (case == ReuseInputCase::PartialValidationFailure).then_some(1),
+            ..Default::default()
+        },
+        visitor: ControlledInput {
+            delay,
+            fail_setup: case == ReuseInputCase::RootVisitorFailure,
+            ..Default::default()
+        },
+        validation_batches: Arc::default(),
+    });
+    let controls = engine.parquet.reuse_input.as_ref().unwrap();
+    let result = snapshot.checkpoint(
+        &engine.engine(),
+        Some(&CheckpointSpec::V2(
+            V2CheckpointConfig::ReuseEligibleSidecars {
+                file_actions_per_sidecar_hint: Some(1),
+            },
+        )),
+    );
+
+    let events = checkpoint_events(&reporter);
+    assert_eq!(events.len(), 1);
+    let failed = matches!(
+        case,
+        ReuseInputCase::FooterFailure
+            | ReuseInputCase::PartialValidationFailure
+            | ReuseInputCase::RootVisitorFailure
+    );
+    let (processing, output, duration) = if failed {
+        let expected = match case {
+            ReuseInputCase::FooterFailure => "injected input setup failure",
+            ReuseInputCase::PartialValidationFailure => "injected input failure",
+            ReuseInputCase::RootVisitorFailure => "injected root visitor failure",
+            _ => unreachable!(),
+        };
+        assert!(result.unwrap_err().to_string().contains(expected));
+        let MetricEvent::CheckpointWriteFailure(event) = &events[0] else {
+            panic!("expected CheckpointWriteFailure");
+        };
+        assert_eq!(event.mode, CheckpointWriteMode::V2WithSidecars);
+        assert_eq!(event.output_stats.bytes_written, 0);
+        assert_eq!(event.output_stats.num_sidecars_written, 0);
+        assert!(engine.parquet.written_files.lock().unwrap().is_empty());
+        let hint = table
+            .store()
+            .get(&hint_path)
+            .await
+            .map_err(KernelError::from)?
+            .bytes()
+            .await
+            .map_err(KernelError::from)?;
+        assert_eq!(hint, old_hint);
+        let files: Vec<_> = table
+            .store()
+            .list(None)
+            .try_collect()
+            .await
+            .map_err(KernelError::from)?;
+        let target = format!("_delta_log/{:020}.checkpoint", snapshot.version());
+        assert!(
+            files
+                .iter()
+                .all(|file| !file.location.as_ref().starts_with(&target))
+        );
+        (&event.processing_stats, &event.output_stats, event.duration)
+    } else {
+        assert_eq!(result?.0, CheckpointWriteResult::Written);
+        let MetricEvent::CheckpointWriteSuccess(event) = &events[0] else {
+            panic!("expected CheckpointWriteSuccess");
+        };
+        assert_eq!(event.mode, CheckpointWriteMode::V2WithSidecars);
+        let CheckpointWriteOutcome::Written { stats } = event.outcome else {
+            panic!("expected Written");
+        };
+        assert_eq!(
+            stats.num_add_files,
+            if case == ReuseInputCase::LateRejection {
+                2
+            } else {
+                3
+            }
+        );
+        assert_eq!(
+            stats.num_remove_files,
+            u64::from(case == ReuseInputCase::LateRejection)
+        );
+        assert_eq!(stats.num_sidecars, 3);
+        assert_eq!(
+            event.output_stats.num_sidecars_written,
+            match case {
+                ReuseInputCase::Reuse => 1,
+                ReuseInputCase::LateRejection => 2,
+                _ => 3,
+            }
+        );
+        assert!(
+            event.output_stats.parquet_write_duration
+                >= delay * engine.parquet.write_calls.load(Ordering::Relaxed) as u32
+        );
+        (&event.processing_stats, &event.output_stats, event.duration)
+    };
+    assert_eq!(
+        engine.json.input.setups.load(Ordering::Relaxed),
+        if failed { 1 } else { 2 }
+    );
+    assert!(processing.num_actions_from_log_tail > 0);
+    assert!(processing.num_actions_from_checkpoint > 0);
+    assert!(processing.log_tail_input_duration >= engine.json.input.minimum_duration());
+    assert!(
+        processing.checkpoint_input_duration
+            >= controls.root.minimum_duration()
+                + controls.footer.minimum_duration()
+                + controls.validation.minimum_duration()
+                + controls.visitor.minimum_duration()
+                + engine.parquet.input.minimum_duration()
+    );
+    match case {
+        ReuseInputCase::InlineFallback => {
+            assert!(controls.root.setups.load(Ordering::Relaxed) > 1);
+            assert_eq!(controls.footer.waits.load(Ordering::Relaxed), 0);
+            assert_eq!(controls.validation_batches.load(Ordering::Relaxed), 0);
+        }
+        ReuseInputCase::RootVisitorFailure => {
+            assert_eq!(controls.visitor.waits.load(Ordering::Relaxed), 1);
+            assert_eq!(controls.footer.waits.load(Ordering::Relaxed), 0);
+        }
+        ReuseInputCase::FooterFailure => {
+            assert_eq!(controls.footer.waits.load(Ordering::Relaxed), 1);
+            assert_eq!(controls.validation.setups.load(Ordering::Relaxed), 0);
+        }
+        _ => {
+            assert_eq!(controls.root.setups.load(Ordering::Relaxed), 1);
+            assert_eq!(controls.footer.setups.load(Ordering::Relaxed), 2);
+            assert_eq!(controls.validation.setups.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                controls.validation_batches.load(Ordering::Relaxed),
+                if case == ReuseInputCase::PartialValidationFailure {
+                    1
+                } else {
+                    2
+                }
+            );
+            assert_eq!(
+                engine.parquet.input.setups.load(Ordering::Relaxed),
+                usize::from(case == ReuseInputCase::LateRejection)
+            );
+        }
+    }
+    assert_accounted_within_duration(processing, output, duration);
+    Ok(())
+}
+
 #[rstest]
 #[case::fourth_sidecar(4, InjectedWriteError::Generic, false)]
 #[case::uploaded_but_failed(4, InjectedWriteError::Generic, true)]
@@ -885,6 +1118,8 @@ impl ControlledCheckpointEngine {
                 write_calls: AtomicUsize::default(),
                 written_files: written_files.clone(),
                 input: ControlledInput::default(),
+                #[cfg(feature = "incremental-checkpoints-in-dev")]
+                reuse_input: None,
             }),
             storage: Arc::new(ControlledStorageHandler {
                 inner: inner.storage_handler(),
@@ -976,10 +1211,19 @@ struct ControlledParquetHandler {
     write_calls: AtomicUsize,
     written_files: Arc<Mutex<Vec<(Url, FileSize)>>>,
     input: ControlledInput,
+    #[cfg(feature = "incremental-checkpoints-in-dev")]
+    reuse_input: Option<ReuseInputControl>,
 }
 
 impl ParquetHandler for ControlledParquetHandler {
     fn read_parquet_footer(&self, file: &FileMeta) -> KernelResult<ParquetFooter> {
+        #[cfg(feature = "incremental-checkpoints-in-dev")]
+        if let Some(controls) = &self.reuse_input
+            && file.location.path().contains("/_sidecars/")
+        {
+            controls.footer.setup()?;
+            return self.inner.read_parquet_footer(file);
+        }
         self.input.setup()?;
         self.inner.read_parquet_footer(file)
     }
@@ -990,6 +1234,43 @@ impl ParquetHandler for ControlledParquetHandler {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> KernelResult<FileDataReadResultIterator> {
+        #[cfg(feature = "incremental-checkpoints-in-dev")]
+        if let Some(controls) = &self.reuse_input {
+            if files.first().is_some_and(|file| {
+                file.location.path().contains(".checkpoint.")
+                    && !file.location.path().contains("/_sidecars/")
+            }) {
+                let batches = controls.root.read(|| {
+                    self.inner
+                        .read_parquet_files(files, physical_schema, predicate)
+                })?;
+                if controls.visitor.fail_setup && controls.root.setups.load(Ordering::Relaxed) == 1
+                {
+                    let visitor = controls.visitor.clone();
+                    return Ok(Box::new(batches.map(move |batch| {
+                        batch.map(|data| {
+                            Box::new(FailingRootVisitorData {
+                                data,
+                                control: visitor.clone(),
+                            }) as Box<dyn EngineData>
+                        })
+                    })));
+                }
+                return Ok(batches);
+            }
+            if !physical_schema.contains_col(["add", "partitionValues"]) {
+                let batches = controls.validation.read(|| {
+                    self.inner
+                        .read_parquet_files(files, physical_schema, predicate)
+                })?;
+                let validation_batches = controls.validation_batches.clone();
+                return Ok(Box::new(batches.inspect(move |batch| {
+                    if batch.is_ok() {
+                        validation_batches.fetch_add(1, Ordering::Relaxed);
+                    }
+                })));
+            }
+        }
         self.input.read(|| {
             self.inner
                 .read_parquet_files(files, physical_schema, predicate)
@@ -1031,6 +1312,7 @@ struct ControlledInput {
     fail_setup: bool,
     fail_after: Option<usize>,
     waits: Arc<AtomicUsize>,
+    setups: Arc<AtomicUsize>,
 }
 
 impl ControlledInput {
@@ -1044,6 +1326,7 @@ impl ControlledInput {
     }
 
     fn setup(&self) -> KernelResult<()> {
+        self.setups.fetch_add(1, Ordering::Relaxed);
         self.pause();
         if self.fail_setup {
             return Err(KernelError::generic("injected input setup failure"));
@@ -1069,6 +1352,53 @@ impl ControlledInput {
                 input.next()
             }
         })))
+    }
+}
+
+#[cfg(feature = "incremental-checkpoints-in-dev")]
+struct ReuseInputControl {
+    root: ControlledInput,
+    footer: ControlledInput,
+    validation: ControlledInput,
+    visitor: ControlledInput,
+    validation_batches: Arc<AtomicUsize>,
+}
+
+// This probe fails during preflight so its wrapper never reaches Arrow evaluation or output.
+#[cfg(feature = "incremental-checkpoints-in-dev")]
+struct FailingRootVisitorData {
+    data: Box<dyn EngineData>,
+    control: ControlledInput,
+}
+
+#[cfg(feature = "incremental-checkpoints-in-dev")]
+impl EngineData for FailingRootVisitorData {
+    fn visit_rows(&self, _: &[ColumnName], _: &mut dyn RowVisitor) -> KernelResult<()> {
+        self.control.pause();
+        Err(KernelError::generic("injected root visitor failure"))
+    }
+
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    fn append_columns(
+        &self,
+        schema: SchemaRef,
+        columns: Vec<ArrayData>,
+    ) -> KernelResult<Box<dyn EngineData>> {
+        self.data.append_columns(schema, columns)
+    }
+
+    fn apply_selection_vector(
+        self: Box<Self>,
+        selection: Vec<bool>,
+    ) -> KernelResult<Box<dyn EngineData>> {
+        self.data.apply_selection_vector(selection)
+    }
+
+    fn has_field(&self, name: &ColumnName) -> bool {
+        self.data.has_field(name)
     }
 }
 

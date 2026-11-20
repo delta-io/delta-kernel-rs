@@ -134,6 +134,8 @@ checkpoint-protection = []
 # Experimental, temporary, test-only feature flag guarding the in-progress adaptiveMetadata
 # (Iceberg V4 adaptive metadata tree) work. TODO(#2866): remove once full support ships.
 adaptive-metadata-in-dev = []
+# Experimental sidecar reuse for isolated checkpoint experiments. Requires cleanup coordination.
+incremental-checkpoints-in-dev = []
 # Experimental, temporary, test-only feature flag guarding the in-progress geospatial
 # (geometry/geography) type work. TODO(#2949): remove once full geo support ships.
 geo-type-in-dev = []

@@ -115,7 +115,7 @@ use crate::action_reconciliation::log_replay::{
     ActionReconciliationBatch, ActionReconciliationProcessor,
 };
 use crate::action_reconciliation::{
-    ActionReconciliationIterator, ActionReconciliationIteratorState, RetentionCalculator,
+    ActionReconciliationIterator, ActionReconciliationIteratorState,
 };
 use crate::actions::{
     ADD_FIELD, CHECKPOINT_METADATA_FIELD, CHECKPOINT_METADATA_NAME, CheckpointMetadata,
@@ -125,19 +125,20 @@ use crate::actions::{
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::Scalar;
 use crate::last_checkpoint_hint::LastCheckpointHint;
-use crate::log_replay::HasSelectionVector;
+use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::path::{self, ParsedLogPath};
 use crate::schema::{SchemaRef, StructField, lazy_schema_ref};
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
-use crate::table_properties::TableProperties;
 use crate::{
     Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator, Result, Version,
     version_as_i64,
 };
 
 pub(crate) mod collation_stats;
+#[cfg(feature = "incremental-checkpoints-in-dev")]
+mod incremental;
 pub(crate) mod metrics;
 #[cfg(feature = "declarative-plans")]
 mod shape;
@@ -146,7 +147,9 @@ mod sidecar;
 use metrics::{CheckpointMetrics, CheckpointPhase};
 #[cfg(feature = "declarative-plans")]
 pub use shape::{CheckpointKind, CheckpointShape};
-use sidecar::{SidecarSplitter, SingleSidecarDataIterator, create_sidecar_action_batch};
+use sidecar::{
+    SidecarReference, SidecarSplitter, SingleSidecarDataIterator, create_sidecar_action_batch,
+};
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -238,7 +241,7 @@ pub(crate) struct WrittenCheckpointInfo {
     pub(crate) last_checkpoint_stats: LastCheckpointHintStats,
     /// Retained Remove actions selected by reconciliation.
     pub(crate) num_remove_files: u64,
-    /// Actual sidecar files written, excluding the main checkpoint file.
+    /// Sidecars referenced by the new checkpoint, including reused files.
     pub(crate) num_sidecars: u64,
 }
 
@@ -283,6 +286,23 @@ pub enum CheckpointSpec {
 pub enum V2CheckpointConfig {
     /// Write a V2 checkpoint without sidecar files.
     NoSidecar,
+    /// Reuse unchanged sidecars of the snapshot's base checkpoint and rewrite affected sidecars.
+    /// Validation scans inherited sidecars to reduce writes. Unsupported base layouts or table
+    /// configuration changes fall back to a full checkpoint.
+    /// Read and decoding errors propagate, including from
+    /// [`crate::ParquetHandler::read_parquet_footer`].
+    ///
+    /// Callers must prevent concurrent checkpoint replacement and log/sidecar cleanup for the
+    /// entire call. An in-memory snapshot does not protect an old sidecar from garbage collection.
+    /// Intended for isolated experiments, not production use.
+    #[cfg(feature = "incremental-checkpoints-in-dev")]
+    ReuseEligibleSidecars {
+        /// Suggested file-action count for newly written sidecars, with the same batching
+        /// behavior and default as [`Self::WithSidecar::file_actions_per_sidecar_hint`].
+        /// Reused sidecars keep their existing sizes. On full fallback, this applies to all
+        /// output sidecars.
+        file_actions_per_sidecar_hint: Option<usize>,
+    },
     /// Write a V2 checkpoint with file actions split into [Sidecar Files]. A main
     /// checkpoint file is written, with one `sidecar` action pointing to each sidecar file.
     ///
@@ -307,6 +327,22 @@ pub enum V2CheckpointConfig {
         /// default.
         file_actions_per_sidecar_hint: Option<usize>,
     },
+}
+
+impl V2CheckpointConfig {
+    pub(crate) fn file_actions_per_sidecar_hint(&self) -> Option<usize> {
+        let configured_hint = match self {
+            Self::NoSidecar => return None,
+            Self::WithSidecar {
+                file_actions_per_sidecar_hint,
+            } => file_actions_per_sidecar_hint,
+            #[cfg(feature = "incremental-checkpoints-in-dev")]
+            Self::ReuseEligibleSidecars {
+                file_actions_per_sidecar_hint,
+            } => file_actions_per_sidecar_hint,
+        };
+        Some(configured_hint.unwrap_or(DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT))
+    }
 }
 
 /// Schema of the `_last_checkpoint` file
@@ -350,6 +386,9 @@ pub(crate) static CHECKPOINT_ACTIONS_SCHEMA_V2: LazyLock<SchemaRef> = lazy_schem
 /// It automatically selects the appropriate checkpoint format (V1/V2) based on whether the table
 /// supports the `v2Checkpoints` reader/writer feature.
 ///
+/// Retention cutoffs are fixed when the writer is created. Create a fresh writer for each
+/// checkpoint attempt so expired tombstones and transactions can be discarded.
+///
 /// # Warning
 /// The checkpoint data must be fully written to storage before calling
 /// [`CheckpointWriter::finalize`]. Failing to do so may result in data loss or corruption.
@@ -368,12 +407,9 @@ pub struct CheckpointWriter {
 
     schema_context: CheckpointSchemaContext,
     read_schema: SchemaRef,
-}
-
-impl RetentionCalculator for CheckpointWriter {
-    fn table_properties(&self) -> &TableProperties {
-        self.snapshot.table_properties()
-    }
+    // Both preflight and output (including fallback) must use the same retention cutoffs.
+    minimum_file_retention_timestamp: i64,
+    txn_expiration_timestamp: Option<i64>,
 }
 
 impl CheckpointWriter {
@@ -395,11 +431,22 @@ impl CheckpointWriter {
             &schema_context.stats_schema,
             schema_context.partition_schema.as_deref(),
         )?;
+        let minimum_file_retention_timestamp =
+            crate::action_reconciliation::deleted_file_retention_timestamp_with_time(
+                snapshot.table_properties().deleted_file_retention_duration,
+                crate::utils::current_time_duration()?,
+            )?;
+        let txn_expiration_timestamp =
+            crate::action_reconciliation::calculate_transaction_expiration_timestamp(
+                snapshot.table_properties(),
+            )?;
         Ok(Self {
             version: version_as_i64(snapshot.version())?,
             snapshot,
             schema_context,
             read_schema,
+            minimum_file_retention_timestamp,
+            txn_expiration_timestamp,
         })
     }
 
@@ -475,10 +522,19 @@ impl CheckpointWriter {
             metrics.clone(),
         )?;
 
+        self.reconcile_checkpoint_actions(engine, actions, metrics)
+    }
+
+    fn reconcile_checkpoint_actions(
+        &self,
+        engine: &dyn Engine,
+        actions: impl KernelResultIterator<ActionsBatch> + 'static,
+        metrics: CheckpointMetrics,
+    ) -> KernelResult<(ActionReconciliationIterator, SchemaRef)> {
         // Process actions through reconciliation
         let mut processor = ActionReconciliationProcessor::new(
-            self.deleted_file_retention_timestamp()?,
-            self.get_transaction_expiration_timestamp()?,
+            self.minimum_file_retention_timestamp,
+            self.txn_expiration_timestamp,
             self.snapshot.table_configuration().dv_normalization_root(),
         );
         let reconciliation_metrics = metrics.clone();
@@ -608,8 +664,24 @@ impl CheckpointWriter {
         file_actions_per_sidecar_hint: usize,
         metrics: CheckpointMetrics,
     ) -> KernelResult<WrittenCheckpointInfo> {
-        let (data_iter, output_schema) =
-            self.checkpoint_data_with_schema(engine, metrics.clone())?;
+        let reconciled_data = self.checkpoint_data_with_schema(engine, metrics.clone())?;
+        self.write_sidecar_checkpoint(
+            engine,
+            file_actions_per_sidecar_hint,
+            metrics,
+            reconciled_data,
+            ReusedSidecars::default(),
+        )
+    }
+
+    fn write_sidecar_checkpoint(
+        &self,
+        engine: &dyn Engine,
+        file_actions_per_sidecar_hint: usize,
+        metrics: CheckpointMetrics,
+        (data_iter, output_schema): (ActionReconciliationIterator, SchemaRef),
+        reused_sidecars: ReusedSidecars,
+    ) -> KernelResult<WrittenCheckpointInfo> {
         let iter_state = data_iter.state();
 
         let splitter = SidecarSplitter::new_mut_shared(
@@ -620,9 +692,9 @@ impl CheckpointWriter {
         )?;
 
         // Write sidecar files
-        let mut sidecar_metas: Vec<(String, FileMeta)> = Vec::new();
+        let mut sidecar_references = reused_sidecars.references;
         loop {
-            if let Some(entry) = write_single_sidecar(
+            if let Some((path, file_meta)) = write_single_sidecar(
                 engine,
                 &splitter,
                 file_actions_per_sidecar_hint,
@@ -630,7 +702,11 @@ impl CheckpointWriter {
                 self.snapshot.version(),
                 &metrics,
             )? {
-                sidecar_metas.push(entry);
+                sidecar_references.push(SidecarReference {
+                    path,
+                    file_meta,
+                    tags: None,
+                });
             }
             let is_exhausted = splitter
                 .lock()
@@ -654,38 +730,44 @@ impl CheckpointWriter {
             })?
             .into_non_file_batches();
 
-        // Create sidecar action rows for the main checkpoint file. Each row populates only
-        // the `sidecar` column, e.g. `sidecar: { path: "<sidecar_filename>.parquet", sizeInBytes:
-        // <size>, modificationTime: <time>, tags: null }`, with all other action columns
-        // left null.
-        let sidecar_batch = create_sidecar_action_batch(engine, &output_schema, &sidecar_metas)?;
-
-        // Write main checkpoint file: non-file actions + sidecar references
+        let sidecar_batch =
+            create_sidecar_action_batch(engine, &output_schema, &sidecar_references)?;
         let checkpoint_path = self.checkpoint_path()?;
-        let main_data: Box<dyn KernelResultIterator<Box<dyn EngineData>>> =
-            Box::new(non_file_batches.into_iter().chain(sidecar_batch).map(Ok));
+        let main_data = Box::new(non_file_batches.into_iter().chain(sidecar_batch).map(Ok));
         let main_size = metrics.write_parquet_file(
             engine.parquet_handler().as_ref(),
             checkpoint_path.clone(),
             main_data,
             false,
         )?;
-
-        // size_in_bytes covers the main checkpoint file plus all sidecar files.
-        let sidecar_sizes_sum = sidecar_metas
+        let sidecar_sizes_sum = sidecar_references
             .iter()
-            .try_fold(0u64, |acc, (_, m)| acc.checked_add(m.size))
+            .try_fold(0u64, |acc, reference| {
+                acc.checked_add(reference.file_meta.size)
+            })
             .ok_or_else(|| KernelError::internal_error("sidecar sizes sum overflowed u64"))?;
-        let sidecar_count = sidecar_metas.len() as u64;
-        build_written_checkpoint_info(
+        let mut checkpoint_info = build_written_checkpoint_info(
             engine,
             &checkpoint_path,
             iter_state,
             main_size,
             sidecar_sizes_sum,
-            sidecar_count,
+            sidecar_references.len() as u64,
             &metrics,
-        )
+        )?;
+        // Reused rows bypass the output iterator but contribute to the logical checkpoint totals.
+        let checkpoint_stats = &mut checkpoint_info.last_checkpoint_stats;
+        checkpoint_stats.num_actions = checked_sum_action_counts(
+            checkpoint_stats.num_actions,
+            checked_sum_action_counts(reused_sidecars.num_adds, reused_sidecars.num_removes)?,
+        )?;
+        checkpoint_stats.num_of_add_files =
+            checked_sum_action_counts(checkpoint_stats.num_of_add_files, reused_sidecars.num_adds)?;
+        checkpoint_info.num_remove_files = checkpoint_info
+            .num_remove_files
+            .checked_add(reused_sidecars.num_removes as u64)
+            .ok_or_else(|| KernelError::checkpoint_write("remove count overflow"))?;
+        Ok(checkpoint_info)
     }
 
     /// Writes a checkpoint without sidecars, will automatically choose V1 or V2
@@ -748,8 +830,7 @@ impl CheckpointWriter {
         engine: &dyn Engine,
         schema: &SchemaRef,
     ) -> KernelResult<ActionReconciliationBatch> {
-        // Build the checkpointMetadata struct value. `tags` is left unset (null) since kernel
-        // does not currently emit checkpoint tags.
+        // Build the checkpointMetadata struct value. Kernel does not emit checkpoint tags.
         let checkpoint_metadata_value: Scalar = CheckpointMetadata {
             version: self.version,
             tags: None,
@@ -899,6 +980,19 @@ fn write_single_sidecar(
     )?;
     let meta = verify_written_file(engine, &sidecar_url, written_size, metrics)?;
     Ok(Some((filename, meta)))
+}
+
+/// File actions already stored in immutable sidecars. Counts are verified during preflight.
+#[derive(Default)]
+struct ReusedSidecars {
+    references: Vec<SidecarReference>,
+    num_adds: i64,
+    num_removes: i64,
+}
+
+fn checked_sum_action_counts(left: i64, right: i64) -> KernelResult<i64> {
+    left.checked_add(right)
+        .ok_or_else(|| KernelError::checkpoint_write("action count overflow"))
 }
 
 /// Verifies that the size the parquet writer reported matches the size the storage layer reports

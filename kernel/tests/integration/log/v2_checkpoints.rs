@@ -29,8 +29,8 @@ use test_utils::{
 
 use crate::common::read_utils::read_parquet_file;
 use crate::common::write_utils::{
-    get_simple_schema, load_existing_single_file_checkpoint_path, resolve_struct_field,
-    simple_id_batch,
+    get_scan_files, get_simple_schema, load_existing_single_file_checkpoint_path,
+    resolve_struct_field, simple_id_batch,
 };
 
 fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> delta_kernel::Result<Vec<RecordBatch>> {
@@ -1341,9 +1341,18 @@ async fn test_v2_sidecar_checkpoint_cross_feature(
 /// Two consecutive V2 sidecar checkpoints with writes in between. After the second
 /// checkpoint, `_last_checkpoint` advances to the latest version, the fresh snapshot
 /// loads from that checkpoint with no trailing commits, and the scan returns the union
-/// of both write phases.
+/// of both write phases, excluding any file removed across the first checkpoint boundary.
+#[rstest::rstest]
+#[case::full(V2CheckpointConfig::WithSidecar { file_actions_per_sidecar_hint: Some(1) }, [6, 6])]
+#[cfg_attr(feature = "incremental-checkpoints-in-dev", case::reuse(
+    V2CheckpointConfig::ReuseEligibleSidecars { file_actions_per_sidecar_hint: Some(1) }, [4, 5]
+))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_v2_sidecar_consecutive_checkpoints() -> delta_kernel::Result<()> {
+async fn test_v2_sidecar_consecutive_checkpoints(
+    #[case] config: V2CheckpointConfig,
+    #[case] expected_sidecars_on_disk: [usize; 2],
+    #[values(false, true)] remove_first: bool,
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
@@ -1355,9 +1364,7 @@ async fn test_v2_sidecar_consecutive_checkpoints() -> delta_kernel::Result<()> {
         &[("delta.feature.v2Checkpoint", "supported")],
     )?;
 
-    let spec = CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
-        file_actions_per_sidecar_hint: Some(1),
-    });
+    let spec = CheckpointSpec::V2(config);
 
     // === Phase 1: write [1, 2] and [3, 4], then checkpoint. ===
     let snapshot = write_batch_to_table(
@@ -1367,6 +1374,7 @@ async fn test_v2_sidecar_consecutive_checkpoints() -> delta_kernel::Result<()> {
         HashMap::new(),
     )
     .await?;
+    let snapshot_after_first_write = snapshot.clone();
     let snapshot = write_batch_to_table(
         &snapshot,
         engine.as_ref(),
@@ -1383,7 +1391,22 @@ async fn test_v2_sidecar_consecutive_checkpoints() -> delta_kernel::Result<()> {
     );
 
     // === Phase 2: write [5, 6] and [7, 8] from a fresh snapshot, then checkpoint again. ===
-    let after_first_ckpt = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut after_first_ckpt = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    if remove_first {
+        let mut transaction = after_first_ckpt
+            .update_table(
+                delta_kernel::transaction::UpdateTableOperation::Delete,
+                "selective-checkpoint-test",
+                true,
+            )
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        for files in get_scan_files(snapshot_after_first_write, engine.as_ref())? {
+            transaction.remove_files(files);
+        }
+        after_first_ckpt = transaction
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+    }
     let snapshot = write_batch_to_table(
         &after_first_ckpt,
         engine.as_ref(),
@@ -1401,10 +1424,19 @@ async fn test_v2_sidecar_consecutive_checkpoints() -> delta_kernel::Result<()> {
     let v_second = snapshot.version();
     snapshot.checkpoint(engine.as_ref(), Some(&spec))?;
 
-    // === Validate _last_checkpoint advanced and reflects all 4 add files. ===
+    let sidecars_dir = std::path::Path::new(&table_path).join("_delta_log/_sidecars");
+    assert_eq!(
+        list_sidecar_parquet_files(&sidecars_dir).len(),
+        expected_sidecars_on_disk[usize::from(remove_first)]
+    );
+
+    // === Validate _last_checkpoint and the surviving active file count. ===
     let last = read_last_checkpoint(&table_path);
     assert_eq!(last["version"].as_u64(), Some(v_second));
-    assert_eq!(last["numOfAddFiles"].as_i64(), Some(4));
+    assert_eq!(
+        last["numOfAddFiles"].as_i64(),
+        Some(4 - i64::from(remove_first))
+    );
 
     // === Fresh snapshot loads from the second checkpoint with no trailing commits. ===
     let fresh = Snapshot::builder_for(table_url).build(engine.as_ref())?;
@@ -1416,11 +1448,11 @@ async fn test_v2_sidecar_consecutive_checkpoints() -> delta_kernel::Result<()> {
         "no commit files should remain after the second checkpoint"
     );
 
-    // === Scan returns all 8 ids written across both phases. ===
+    // === Scan returns the surviving rows across both write phases. ===
     let scan = fresh.scan_builder().build()?;
     let batches = read_scan(&scan, engine.clone() as Arc<dyn delta_kernel::Engine>)?;
     #[rustfmt::skip]
-    let expected = vec![
+    let mut expected = vec![
         "+----+",
         "| id |",
         "+----+",
@@ -1434,6 +1466,9 @@ async fn test_v2_sidecar_consecutive_checkpoints() -> delta_kernel::Result<()> {
         "| 8  |",
         "+----+",
     ];
+    if remove_first {
+        expected.retain(|row| !["| 1  |", "| 2  |"].contains(row));
+    }
     assert_batches_sorted_eq!(expected, &batches);
 
     Ok(())
