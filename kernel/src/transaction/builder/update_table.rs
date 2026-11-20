@@ -1019,7 +1019,7 @@ mod tests {
 
     #[test]
     fn with_table_properties_added_checks_retention_against_existing_log_value() -> Result<()> {
-        let engine = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let engine = Arc::new(SyncEngine::in_memory());
         let snapshot = create_table("memory:///", test_schema_flat(), "test-engine", true)
             .with_table_properties([
                 (LOG_RETENTION_DURATION, "interval 3 days"),
