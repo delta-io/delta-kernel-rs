@@ -1396,18 +1396,18 @@ impl LogSegment {
         Ok(actions)
     }
 
-    /// Scan files for `paths`, each tagged with file-constant `version` set to `version(path)`.
+    /// Scan files for `paths`, each tagged with file-constant `version` set to `version_of(path)`.
     #[cfg(feature = "declarative-plans")]
     fn version_tagged_scan_files<'a>(
         paths: impl IntoIterator<Item = &'a ParsedLogPath>,
-        version: impl Fn(&ParsedLogPath) -> KernelResult<i64>,
+        version_of: impl Fn(&ParsedLogPath) -> KernelResult<i64>,
     ) -> KernelResult<Vec<ScanFile>> {
         paths
             .into_iter()
             .map(|path| {
                 Ok(ScanFile {
                     meta: path.location.clone(),
-                    file_constants: vec![Scalar::Long(version(path)?)],
+                    file_constants: vec![Scalar::Long(version_of(path)?)],
                 })
             })
             .collect()

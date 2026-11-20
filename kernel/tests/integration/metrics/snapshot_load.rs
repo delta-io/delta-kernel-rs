@@ -369,8 +369,8 @@ async fn snapshot_with_log_compaction_emits_expected_metrics() -> delta_kernel::
     assert_eq!(reporter.checkpoint_files.get(), 0);
     assert_eq!(reporter.compaction_files.get(), 1);
 
-    // With adaptiveMetadata support, the newest commit is read first on its own, so a compaction
-    // cannot hide its `lastManifestCommit`.
+    // With adaptiveMetadata support, a cover containing a compaction makes replay read the newest
+    // commit on its own before the older files.
     let expected_json_read_calls = if cfg!(feature = "adaptive-metadata-in-dev") {
         2
     } else {

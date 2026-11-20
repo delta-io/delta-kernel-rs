@@ -330,9 +330,9 @@ impl LogSegment {
         Ok(batches)
     }
 
-    /// Reads the commit files in `segment` and the checkpoint, tagging each batch with its
-    /// version. Each commit file projects its checkpoint action, so replay captures the pointed one
-    /// if it reaches that row before it stops.
+    /// Reads the commit cover of `segment` and the checkpoint, tagging each batch with the version
+    /// it ranks at. Each commit file projects its checkpoint action, so replay captures the pointed
+    /// one if it reaches that row before it stops.
     fn read_pm_batches(
         &self,
         engine: &dyn Engine,
@@ -367,14 +367,13 @@ impl LogSegment {
         Ok(batches.map(move |batch| {
             let batch = batch?;
             // A log file's versions are parsed from its `_file`; a checkpoint batch uses the
-            // constant. A log compaction holds the P&M in effect at its last version, so it ranks
-            // there.
+            // constant.
             let log_path = batch
                 .is_log_batch
                 .then(|| batch_log_path(batch.actions.as_ref()))
                 .transpose()?;
             let rank_version = match &log_path {
-                Some(path) => path.last_version() as i64,
+                Some(path) => version_as_i64(path.last_version())?,
                 None => checkpoint_version.ok_or_else(|| {
                     KernelError::internal_error("checkpoint batch without a version")
                 })?,
@@ -384,7 +383,8 @@ impl LogSegment {
             #[cfg(feature = "adaptive-metadata-in-dev")]
             let commit_version = log_path
                 .filter(|path| path.is_commit())
-                .map(|path| path.version as i64);
+                .map(|path| version_as_i64(path.version))
+                .transpose()?;
             Ok(VersionedBatch {
                 protocol_version: Some(rank_version),
                 metadata_version: Some(rank_version),
@@ -398,14 +398,12 @@ impl LogSegment {
     }
 
     /// The commit cover, newest first. When a log compaction covers the newest commit, that commit
-    /// is also read as its own file: compactions drop `commitInfo`, and with it the newest
-    /// `lastManifestCommit`. Only that `commitInfo` is needed from the newest commit; the
-    /// compaction is still generally cheaper to read than the commits it replaces.
+    /// is also read as its own file, since compactions drop `commitInfo` and checkpoint actions.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     fn pm_commit_cover_paths(&self) -> Vec<&ParsedLogPath> {
         let mut paths = self.find_commit_cover_paths(None);
         if let Some(newest_commit) = self.newest_commit_after_checkpoint()
-            && !paths.contains(&newest_commit)
+            && paths.first() != Some(&newest_commit)
         {
             // Put it first so replay reads the pointer even if it stops early.
             paths.insert(0, newest_commit);
@@ -537,7 +535,8 @@ enum PmReplaySegment {
     NewestCommit,
     /// The commits after `oldest_exclusive` (all when `None`), except the newest. The manifest
     /// commit at `manifest_commit` is read as its own file, so a log compaction cannot hide its
-    /// checkpoint action.
+    /// checkpoint action. Unlike the newest commit, it splits its compaction instead of being read
+    /// next to it: read ahead of a newer compaction, it would let replay stop before that one.
     OlderCommits {
         oldest_exclusive: Option<Version>,
         manifest_commit: Option<Version>,
@@ -800,8 +799,8 @@ impl PmCandidate {
             return false;
         }
         // A checkpoint action's P&M can be older than its commit, so check version, not presence.
-        // A compaction ranks at its last version; stopping there is safe, since every file left to
-        // read is older than its first.
+        // Stopping at a compaction is safe: every file left to read is older than its first
+        // version.
         let version = batch.protocol_version.max(batch.metadata_version);
         is_final(&self.protocol, version) && is_final(&self.metadata, version)
     }

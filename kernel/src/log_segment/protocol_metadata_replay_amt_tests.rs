@@ -173,8 +173,7 @@ async fn commit_table(commits: &[String]) -> (Arc<InMemory>, Url) {
 }
 
 // The log a replay test reads: `commits` at versions 0.., plus an optional P&M checkpoint and an
-// optional log compaction, which is added to the listing by hand since compaction listing is
-// disabled.
+// optional log compaction.
 #[derive(Default)]
 struct ReplayLog {
     commits: Vec<String>,
@@ -1487,8 +1486,7 @@ async fn check_pointer_after_newest_commit<E: Engine>(
         .schema(test_schema_flat_with_column_mapping())
         .last_manifest_commit(resolved_pointer(1, 1))
 )]
-// A log compaction holds the P&M in effect at its last version, so replay ranks it there. A
-// checkpoint file bounds these replays, so they read the whole cover: the compaction of v1..=3
+// A checkpoint file bounds these replays, so they read the whole cover: the compaction of v1..=3
 // holds v3's Metadata and spans v2, where the newest commit's checkpoint action lags. Ranked at its
 // start version, the compaction would lose to the action's older nested Metadata. Padding puts the
 // Metadata in a later JSON read batch than the compaction's first.

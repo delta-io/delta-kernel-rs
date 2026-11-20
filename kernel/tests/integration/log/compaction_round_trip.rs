@@ -66,6 +66,17 @@ async fn snapshot_replay_and_non_amt_scans_use_compactions(
             .at_version(version)
             .with_incremental_crc_replay(replay)
             .build(engine.as_ref())?;
+        // P&M replay reads the compaction unless a CRC advanced to v4 answers P&M without it.
+        let pm_replayed = !(crc && replay == IncrementalReplay::Unlimited);
+        if version == 4 && !use_plan && pm_replayed {
+            assert!(
+                reads
+                    .requested_paths()
+                    .iter()
+                    .any(|path| path.path().ends_with(".compacted.json")),
+                "fresh P&M replay at v4 should read the (2, 3) compaction"
+            );
+        }
         let updated = Snapshot::builder_from(prefix.clone())
             .at_version(version)
             .with_incremental_crc_replay(replay)
@@ -185,7 +196,6 @@ async fn partial_compaction_preserves_suppression(
 
     let path =
         write_compaction_from_commits(table.table_root(), table.store().as_ref(), 3, 4).await?;
-    reads.clear();
     let compacted = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
     assert_eq!(
         compacted
@@ -259,7 +269,6 @@ async fn compaction_reads_match_commits(
         );
     }
     for (baseline, expected) in &baselines {
-        reads.clear();
         let fresh = Snapshot::builder_for(table.table_root())
             .at_version(baseline.version())
             .with_incremental_crc_replay(IncrementalReplay::Unlimited)
@@ -352,7 +361,7 @@ async fn malformed_compaction_fails_snapshot_load() -> Result<(), Box<dyn std::e
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(3))
         .build()?;
-    let (engine, _) = test_engine(table.store().clone(), 1);
+    let (engine, reads) = test_engine(table.store().clone(), 1);
     table
         .store()
         .put(
@@ -364,6 +373,12 @@ async fn malformed_compaction_fails_snapshot_load() -> Result<(), Box<dyn std::e
         Snapshot::builder_for(table.table_root())
             .build(engine.as_ref())
             .is_err()
+    );
+    assert!(
+        reads
+            .requested_paths()
+            .iter()
+            .any(|path| path.path().ends_with(".compacted.json"))
     );
     Ok(())
 }
