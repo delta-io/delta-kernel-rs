@@ -2018,6 +2018,11 @@ impl Snapshot {
             Err(error) => return Err(error),
         };
 
+        #[cfg(feature = "declarative-plans")]
+        if legacy_counts.is_none() {
+            span.record("bytes_written", statistics.size_in_bytes as u64);
+        }
+
         // Freeze duration before hint publication. ReportGeneratorLayer waits for the final API
         // result, so hint and snapshot errors retain the checkpoint data duration.
         span.record(
@@ -2065,10 +2070,6 @@ impl Snapshot {
             false, /* skipped_new_checkpoints */
         )?);
         span.record("size_in_bytes", statistics.size_in_bytes as u64);
-        #[cfg(feature = "declarative-plans")]
-        if legacy_counts.is_none() {
-            span.record("bytes_written", statistics.size_in_bytes as u64);
-        }
         span.record("num_add_files", statistics.num_of_add_files as u64);
         span.record("num_actions", statistics.num_actions as u64);
         if let Some((num_remove_files, num_sidecars)) = legacy_counts {
