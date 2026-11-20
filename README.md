@@ -180,7 +180,7 @@ Some design principles which should be considered:
   `rust-analyzer`. [rustic](https://github.com/brotzeit/rustic) is a nice mode as well.
 - When also developing in VS Code it's convenient to add rust-analyzer to your workspace.
 
-- The crate's documentation can be easily reviewed with: `cargo docs --open`
+- The crate's documentation can be easily reviewed with: `cargo doc --open`
 - Code coverage is available on codecov via [cargo-llvm-cov]. See their docs for instructions to install/run locally.
 
 [delta]: https://delta.io
