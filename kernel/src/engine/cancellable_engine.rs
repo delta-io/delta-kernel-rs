@@ -162,6 +162,12 @@ impl StorageHandler for ReadHandler<dyn StorageHandler> {
             -> KernelResult<Box<dyn KernelResultIterator<Bytes>>>;
     }
 
+    cancellable_read_pair! {
+        /// Reads one complete file using a per-call token or the default token.
+        fn read_small_file, read_small_file_with_cancellation(file: FileSlice)
+            -> KernelResult<Option<Bytes>>;
+    }
+
     /// Returns file metadata after checking the default token for cancellation.
     ///
     /// `StorageHandler::head` accepts no cancellation token, so this wrapper cannot

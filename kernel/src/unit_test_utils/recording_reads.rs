@@ -111,6 +111,10 @@ impl StorageHandler for RecordingReads {
         /// Records an unscoped byte-range read.
         fn read_files, read_files_with_cancellation(files: Vec<FileSlice>)
             -> KernelResult<Box<dyn KernelResultIterator<Bytes>>>;
+
+        /// Records a single-file read.
+        fn read_small_file, read_small_file_with_cancellation(file: FileSlice)
+            -> KernelResult<Option<Bytes>>;
     }
 
     fn list_from_with_cancellation(
@@ -139,6 +143,22 @@ impl StorageHandler for RecordingReads {
         self.inner
             .storage_handler()
             .read_files_with_cancellation(files, token)
+    }
+
+    fn read_small_file_with_cancellation(
+        &self,
+        file: FileSlice,
+        token: Option<CancellationTokenRef>,
+    ) -> KernelResult<Option<Bytes>> {
+        let read = if file.0.path().ends_with(".crc") {
+            Read::Crc
+        } else {
+            Read::Hint
+        };
+        self.record(read, &token)?;
+        self.inner
+            .storage_handler()
+            .read_small_file_with_cancellation(file, token)
     }
 
     fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> KernelResult<()> {

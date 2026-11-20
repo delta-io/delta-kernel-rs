@@ -648,14 +648,14 @@ pub trait StorageHandler: AsAny {
         Ok(Box::new(CancellableIterator::new(iter, cancellation_token)))
     }
 
-    /// Reads one complete file or byte range, returning `None` if the handler produces no result.
+    /// Reads one complete file or byte range, returning `None` for an existing but empty file.
     ///
-    /// The default implementation delegates to [`read_files`]. Override it if your storage has a
-    /// cheaper single-object read.
+    /// If the file does not exist, this must fail with [`KernelError::FileNotFound`].
     ///
-    /// [`read_files`]: Self::read_files
+    /// The default implementation delegates to [`read_files`](Self::read_files), and fails if that
+    /// call returns more than one byte range.
     fn read_small_file(&self, file: FileSlice) -> KernelResult<Option<Bytes>> {
-        let mut reads = self.read_files(vec![file])?;
+        let mut reads = self.read_files(vec![file])?.fuse();
         let data = reads.next().transpose()?;
         if reads.next().transpose()?.is_some() {
             return Err(KernelError::internal_error(
@@ -663,6 +663,23 @@ pub trait StorageHandler: AsAny {
             ));
         }
         Ok(data)
+    }
+
+    /// Cancellation-aware variant of [`read_small_file`].
+    ///
+    /// Implementations must follow the [Engine operation cancellation contract]. The provided
+    /// implementation checks before delegating to [`read_small_file`] but cannot interrupt the read
+    /// after it starts.
+    ///
+    /// [`read_small_file`]: Self::read_small_file
+    /// [Engine operation cancellation contract]: crate::cancellation#engine-operation-contract
+    fn read_small_file_with_cancellation(
+        &self,
+        file: FileSlice,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> KernelResult<Option<Bytes>> {
+        check_cancelled(cancellation_token.as_ref())?;
+        self.read_small_file(file)
     }
 
     /// Copy a file atomically from source to destination. If the destination file already exists,
