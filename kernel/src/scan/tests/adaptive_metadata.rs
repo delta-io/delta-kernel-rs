@@ -20,15 +20,16 @@ use crate::content_tree::{ContentTreeNodeEntry, TrackingInfo, TrackingStatus};
 use crate::engine::arrow_data::EngineDataArrowExt as _;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{Predicate as Pred, Scalar, col, lit};
+use crate::scan::state::ScanFile;
 use crate::scan::{Scan, ScanMetadata};
 use crate::schema::{SchemaRef, StructType, schema_ref};
 use crate::table_features::ColumnMappingMode;
 use crate::transaction::BASE_ADD_FILES_SCHEMA;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
-    checkpoint_action_with_root, commit_file_changes, commit_files, commit_root_manifest,
-    commit_root_manifest_file, create_adaptive_metadata_table, protocol_and_metadata_lines,
-    setup_adaptive_metadata_table, write_commit_after_manifest_commit,
-    write_manifest_commit_keeping_pm,
+    checkpoint_action_with_root, commit_file_changes, commit_files, commit_info_line,
+    commit_root_manifest, commit_root_manifest_file, create_adaptive_metadata_table,
+    protocol_and_metadata_lines, setup_adaptive_metadata_table, write_commit,
+    write_commit_after_manifest_commit, write_manifest_commit_keeping_pm,
 };
 use crate::unit_test_utils::{
     assert_result_error_with_message, parse_json_batch, string_array_to_engine_data,
@@ -97,6 +98,66 @@ fn scan_paths(engine: &SyncEngine, snapshot: Arc<Snapshot>) -> Vec<String> {
 
 fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|v| v.to_string()).collect()
+}
+
+/// The `(path, modification_time)` of every file a scan of `snapshot` reads, sorted by path.
+fn scan_modification_times(engine: &SyncEngine, snapshot: Arc<Snapshot>) -> Vec<(String, i64)> {
+    let scan = snapshot.scan_builder().build().unwrap();
+    let mut files = vec![];
+    for scan_metadata in scan.scan_metadata(engine).unwrap() {
+        files = scan_metadata
+            .unwrap()
+            .visit_scan_files(files, |files: &mut Vec<_>, file: ScanFile| {
+                files.push((file.path.to_string(), file.modification_time));
+            })
+            .unwrap();
+    }
+    files.sort();
+    files
+}
+
+/// A log add on an adaptiveMetadata table carries its own commit's In-Commit Timestamp in place of
+/// the connector's `modificationTime` (the fixture's `1`), including after a manifest commit. A
+/// previous commit with a future In-Commit Timestamp makes that value differ from the wall clock.
+#[rstest]
+fn log_adds_report_their_commit_timestamp(
+    #[values(false, true)] after_manifest_commit: bool,
+    #[values(false, true)] future_previous_ict: bool,
+) {
+    const FUTURE_ICT: i64 = 4_000_000_000_000;
+    let (engine, _) = setup_adaptive_metadata_table();
+    if after_manifest_commit {
+        let tree = [added_data_entry("a.parquet", 1, 1, 0, 0)];
+        commit_root_manifest(&engine, &table_root(), "metadata/root.parquet", &tree);
+    }
+    if future_previous_ict {
+        let latest = Snapshot::builder_for(TABLE_ROOT).build(&engine).unwrap();
+        let commit_info = commit_info_line(FUTURE_ICT, None);
+        let lines = StringArray::from(vec![commit_info.as_str()]);
+        write_commit(
+            &engine,
+            &table_root(),
+            latest.version() + 1,
+            parse_json_batch(lines),
+        )
+        .unwrap();
+    }
+    let version = commit_files(&engine, &table_root(), &["c.parquet"], &[]);
+    let snapshot = snapshot_at(&engine, version);
+    let ict = snapshot
+        .reader()
+        .get_in_commit_timestamp(&engine)
+        .unwrap()
+        .expect("adaptiveMetadata tables record an In-Commit Timestamp");
+    if future_previous_ict {
+        assert_eq!(ict, FUTURE_ICT + 1);
+    }
+
+    let log_adds: Vec<_> = scan_modification_times(&engine, snapshot)
+        .into_iter()
+        .filter(|(path, _)| path == "c.parquet")
+        .collect();
+    assert_eq!(log_adds, vec![("c.parquet".to_string(), ict)]);
 }
 
 #[rstest]

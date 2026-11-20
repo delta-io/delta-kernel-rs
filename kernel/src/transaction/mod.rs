@@ -1630,6 +1630,7 @@ mod tests {
     use crate::object_store::ObjectStoreExt as _;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
+    use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::RowTrackingState;
     use crate::schema::{ArrayType, MapType, StructType, column_name, schema, schema_ref};
     use crate::table_features::{ColumnMappingMode, TableFeature};
@@ -2018,6 +2019,46 @@ mod tests {
             },
         };
         assert_eq!(txn.add_files_schema().as_ref(), &expected);
+        Ok(())
+    }
+
+    #[test]
+    fn non_adaptive_metadata_commit_keeps_connector_modification_time() -> Result<()> {
+        let engine = SyncEngine::in_memory();
+        let table_root = "memory:///t/";
+        create_table(
+            table_root,
+            schema_ref! { nullable "id": INTEGER },
+            "test",
+            true,
+        )
+        .with_table_properties([("delta.enableInCommitTimestamps", "true")])
+        .build(&engine, Box::new(FileSystemCommitter::new()))?
+        .commit(&engine)?
+        .unwrap_committed();
+        let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+        let mut txn = snapshot
+            .update_table(UpdateTableOperation::Write, "test", true)
+            .build(&engine, Box::new(FileSystemCommitter::new()))?;
+        add_dummy_file(&mut txn);
+        let snapshot = txn.commit(&engine)?.unwrap_post_commit_snapshot();
+        assert!(
+            snapshot
+                .reader()
+                .get_in_commit_timestamp(&engine)?
+                .is_some()
+        );
+
+        let scan = snapshot.scan_builder().build()?;
+        let mut modification_times = vec![];
+        for scan_metadata in scan.scan_metadata(&engine)? {
+            modification_times = scan_metadata?.visit_scan_files(
+                modification_times,
+                |times: &mut Vec<i64>, file: ScanFile| times.push(file.modification_time),
+            )?;
+        }
+        // `create_valid_add_file_batch` records a `modificationTime` of 1.
+        assert_eq!(modification_times, vec![1]);
         Ok(())
     }
 
