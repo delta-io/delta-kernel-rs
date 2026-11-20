@@ -18,7 +18,7 @@ pub enum CheckpointKind {
 
 /// Complete layout and portable metadata for the checkpoint selected by a snapshot.
 ///
-/// Scan planning and [`crate::snapshot::SnapshotReader::get_checkpoint_info`] share discovery of
+/// Scan planning and [`crate::snapshot::SnapshotReader`] share discovery of
 /// the checkpoint type, complete sidecar list, leaf schema, and portable hint. This type is not
 /// serialized; [`LastCheckpointHint`] describes the portable fields. Layout discovery does not
 /// validate every required checkpoint action.

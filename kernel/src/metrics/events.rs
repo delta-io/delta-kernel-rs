@@ -114,7 +114,6 @@ pub enum MetricEvent {
     JsonReadCompleted(JsonReadCompleted),
     ParquetReadCompleted(ParquetReadCompleted),
     ScanMetadataCompleted(ScanMetadataCompleted),
-    #[cfg(feature = "declarative-plans")]
     ScanPlanGenerationCompleted(super::ScanPlanGenerationCompleted),
     StorageListCompleted(StorageListCompleted),
     StorageReadCompleted(StorageReadCompleted),
@@ -125,7 +124,6 @@ impl MetricEvent {
     /// Set the wall-clock duration on lifecycle events.
     pub(crate) fn set_duration_if_applicable(&mut self, d: Duration) {
         match self {
-            #[cfg(feature = "declarative-plans")]
             Self::ScanPlanGenerationCompleted(e) => {
                 e.duration_ns = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
             }
@@ -178,7 +176,6 @@ impl MetricEvent {
             Self::ProtocolMetadataLoadSuccess(_) => Err(ProtocolMetadataLoadSuccess::SPAN_NAME),
             Self::SetTransactionLoadSuccess(_) => Err(SetTransactionLoadSuccess::SPAN_NAME),
             Self::LastCheckpointReadCompleted(_) => Err(LastCheckpointReadCompleted::SPAN_NAME),
-            #[cfg(feature = "declarative-plans")]
             Self::ScanPlanGenerationCompleted(_) => {
                 Err(super::ScanPlanGenerationCompleted::SPAN_NAME)
             }
@@ -217,7 +214,6 @@ impl MetricEvent {
             Self::LastCheckpointReadCompleted(_) => Err(LastCheckpointReadCompleted::SPAN_NAME),
             Self::CheckpointWriteSuccess(_) => Err(CheckpointWriteSuccess::SPAN_NAME),
             Self::ChecksumWriteSuccess(_) => Err(ChecksumWriteSuccess::SPAN_NAME),
-            #[cfg(feature = "declarative-plans")]
             Self::ScanPlanGenerationCompleted(_) => {
                 Err(super::ScanPlanGenerationCompleted::SPAN_NAME)
             }
@@ -273,7 +269,6 @@ impl MetricEvent {
     /// Marks a lifecycle event as failed when its span errors.
     pub(crate) fn into_failure(self) -> Self {
         match self {
-            #[cfg(feature = "declarative-plans")]
             Self::ScanPlanGenerationCompleted(mut e) => {
                 e.outcome = super::ScanPlanOutcome::Error;
                 Self::ScanPlanGenerationCompleted(e)
@@ -379,7 +374,6 @@ impl fmt::Display for MetricEvent {
             Self::JsonReadCompleted(e) => e.fmt(f),
             Self::ParquetReadCompleted(e) => e.fmt(f),
             Self::ScanMetadataCompleted(e) => e.fmt(f),
-            #[cfg(feature = "declarative-plans")]
             Self::ScanPlanGenerationCompleted(e) => e.fmt(f),
             Self::StorageListCompleted(e) => e.fmt(f),
             Self::StorageReadCompleted(e) => e.fmt(f),

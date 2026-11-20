@@ -8,7 +8,7 @@ use crate::Version;
 use crate::checkpoint::{CheckpointInfo, SelectedCheckpointType};
 use crate::scan::{PartitionValuesOptions, StatsOptions};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "declarative-plans"))]
 mod tests;
 
 /// Result of one scan-plan-generation attempt.
@@ -53,6 +53,7 @@ pub struct CheckpointMetrics {
 }
 
 impl CheckpointMetrics {
+    #[allow(dead_code, reason = "Used by scan planning.")]
     pub(crate) fn update(update: impl FnOnce(&mut Self)) {
         ScanPlanGenerationCompleted::update(|event| {
             if let Some(checkpoint) = &mut event.checkpoint {

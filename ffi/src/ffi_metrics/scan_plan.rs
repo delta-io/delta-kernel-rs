@@ -196,7 +196,7 @@ pub(super) fn with_event<F: FnOnce(MetricEvent)>(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "declarative-plans"))]
 mod tests {
     use delta_kernel::expressions::column_name;
     use delta_kernel::scan::{PartitionValuesOptions, StatsOptions};
@@ -204,6 +204,7 @@ mod tests {
 
     use super::*;
     use crate::checkpoint::checkpoint_handles;
+    use crate::ffi_metrics::with_ffi_event;
     use crate::{TryFromStringSlice as _, free_engine, free_snapshot};
 
     #[rstest]
@@ -256,7 +257,7 @@ mod tests {
         };
         let source = kernel::MetricEvent::ScanPlanGenerationCompleted(event.clone());
         let mut visits = 0;
-        MetricEvent::with_kernel_event(&source, |ffi| {
+        with_ffi_event(&source, |ffi| {
             visits += 1;
             let MetricEvent::ScanPlanGenerationCompleted(record) = ffi else {
                 panic!("expected scan-plan metric");

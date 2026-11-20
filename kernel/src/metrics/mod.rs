@@ -75,9 +75,7 @@
 //! [`Engine`]: crate::Engine
 
 pub(crate) mod events;
-#[cfg(feature = "declarative-plans")]
 mod scan_plan;
-#[cfg(feature = "declarative-plans")]
 pub use scan_plan::{CheckpointMetrics, ReplayBase, ScanPlanGenerationCompleted, ScanPlanOutcome};
 mod frame_reporter;
 mod metered_engine;
