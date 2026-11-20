@@ -926,14 +926,22 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         &self,
         engine: &dyn Engine,
         commit_version: Version,
+        in_commit_timestamp: Option<i64>,
         dm_changes: &[DomainMetadata],
     ) -> KernelResult<Option<CheckpointAction>> {
         let Some(ManifestWrite::RootFile(root_manifest_file)) = &self.manifest_write else {
             return Ok(None);
         };
+        let in_commit_timestamp = in_commit_timestamp.ok_or_else(|| {
+            KernelError::invalid_transaction_state(format!(
+                "adaptiveMetadata manifest commit at version {commit_version} has no In-Commit \
+                 Timestamp"
+            ))
+        })?;
         let action = root_manifest_file.compute_checkpoint_action(
             engine,
             commit_version,
+            in_commit_timestamp,
             &self.effective_table_config,
             dm_changes,
             &self.set_transactions,

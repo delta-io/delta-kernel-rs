@@ -1399,7 +1399,8 @@ impl SetTransaction {
 
 /// Reference to a root of an adaptive metadata tree.
 ///
-/// Contains the path, size, and version of the root manifest file.
+/// Contains the path, size, and version of the root manifest file, and the In-Commit Timestamp of
+/// the commit at that version.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1423,6 +1424,10 @@ pub(crate) struct ContentRoot {
     /// version). Distinct from [`CheckpointAction::version`], which is
     /// `checkpointMetadata.version`.
     version: i64,
+    /// The In-Commit Timestamp, in milliseconds since the Unix epoch, of the commit at
+    /// [`Self::version`]. Absent from roots whose writer did not record it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commit_timestamp: Option<i64>,
 }
 
 /// Identifies the latest manifest commit up to a given table version.
@@ -1767,6 +1772,15 @@ impl ContentRoot {
             path,
             size_in_bytes,
             version,
+            commit_timestamp: None,
+        }
+    }
+
+    /// Sets when the root manifest was committed, in milliseconds since the Unix epoch.
+    pub(crate) fn with_commit_timestamp(self, commit_timestamp: i64) -> Self {
+        ContentRoot {
+            commit_timestamp: Some(commit_timestamp),
+            ..self
         }
     }
 }
@@ -3654,6 +3668,7 @@ mod tests {
                 path: path.to_string(),
                 size_in_bytes,
                 version: 1,
+                commit_timestamp: None,
             },
             protocol: Protocol::new_unchecked(1, 2, None, None),
             metadata: Metadata::default(),
@@ -3689,6 +3704,7 @@ mod tests {
                 path: "s3://bucket/manifest".to_string(),
                 size_in_bytes: 1024,
                 version: 40,
+                commit_timestamp: Some(1_700_000_000_000),
             },
             protocol: Protocol::new_unchecked(1, 2, None, None),
             metadata: Metadata::default(),
@@ -3756,7 +3772,7 @@ mod tests {
             json,
             json!({ "checkpoint": [
                 { "checkpointMetadata": { "version": 42 } },
-                { "contentRoot": { "path": "s3://bucket/manifest", "sizeInBytes": 1024, "version": 40 } },
+                { "contentRoot": { "path": "s3://bucket/manifest", "sizeInBytes": 1024, "version": 40, "commitTimestamp": 1_700_000_000_000_i64 } },
                 { "protocol": { "minReaderVersion": 1, "minWriterVersion": 2 } },
                 { "metaData": {
                     "id": "",
@@ -3801,6 +3817,7 @@ mod tests {
                 path: "s3://bucket/manifest".to_string(),
                 size_in_bytes: 8,
                 version: 8,
+                commit_timestamp: None,
             },
             protocol: Protocol::new_unchecked(1, 2, None, None),
             metadata: Metadata::default(),
