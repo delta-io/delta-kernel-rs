@@ -642,7 +642,9 @@ fn try_from_struct_data_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
 /// Field names become camelCase schema names. Each field is collected independently:
 /// `T` requires exactly one row, `Option<T>` allows at most one, and `Vec<T>` accepts any count.
 /// Every input row must contain exactly one non-null payload.
-#[proc_macro_derive(TryFromStructRows)]
+///
+/// `#[row_type(InputRow)]` selects the input schema through `InputRow`'s `ToSchema` implementation.
+#[proc_macro_derive(TryFromStructRows, attributes(row_type))]
 pub fn try_from_struct_rows_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     try_from_struct_rows_impl(&input)
@@ -659,6 +661,19 @@ fn try_from_struct_rows_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
         .iter()
         .map(|field| field.ident.as_ref().map(get_schema_name))
         .collect();
+
+    let row_type: Type = input
+        .attrs
+        .iter()
+        .find(|attr| attr.path().is_ident("row_type"))
+        .ok_or_else(|| {
+            Error::new(
+                name.span(),
+                "TryFromStructRows requires #[row_type(InputRow)]",
+            )
+        })?
+        .parse_args()?;
+
     let (impl_generics, ty_generics, _) = input.generics.split_for_impl();
     let bounds = input
         .generics
@@ -672,20 +687,17 @@ fn try_from_struct_rows_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
         where
             #(#bounds,)*
             #(#types: delta_kernel::expressions::TryFromStructRows,)*
+            #row_type: delta_kernel::schema::ToSchema,
         {
-            fn schema_info() -> delta_kernel::KernelResult<delta_kernel::schema::SchemaRef> {
-                Ok(::std::sync::Arc::new(delta_kernel::schema::StructType::try_new([
-                    #(delta_kernel::schema::StructField::nullable(
-                        stringify!(#names), <#types as delta_kernel::expressions::TryFromStructRows>::schema_info()?,
-                    )),*
-                ])?))
-            }
+            type Row = #row_type;
 
             fn collect_into(rows: ::std::vec::Vec<delta_kernel::expressions::StructData>)
                 -> delta_kernel::KernelResult<Self>
             {
                 let [#(#idents),*] = delta_kernel::expressions::group_struct_rows(
-                    rows, &<Self as delta_kernel::expressions::TryFromStructRows>::schema_info()?,
+                    rows,
+                    <Self::Row as delta_kernel::schema::ToSchema>::schema_ref(),
+                    [#(stringify!(#names)),*],
                 )?;
                 Ok(Self {
                     #(#idents: <#types as delta_kernel::expressions::TryFromStructRows>::collect_into(#idents)

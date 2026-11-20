@@ -7,7 +7,7 @@ use delta_kernel::delta_kernel_derive::{
     TryFromStructRows as DeriveStructRows,
 };
 use delta_kernel::expressions::{Scalar, StructData, TryFromStructRows};
-use delta_kernel::schema::{SchemaRef, ToSchema as _, schema};
+use delta_kernel::schema::{SchemaRef, ToSchema, schema};
 use delta_kernel::{KernelError, KernelResult};
 use rstest::rstest;
 use test_utils::IntoArray;
@@ -16,7 +16,7 @@ use super::nested::{EmptyRow, nested_array};
 use super::{CustomRow, data, execute_result, optional, singleton};
 
 fn execute_rows<T: TryFromStructRows>(batches: Vec<KernelResult<RecordBatch>>) -> KernelResult<T> {
-    execute_result(data(batches), &T::schema_info()?)
+    execute_result(data(batches), <T::Row as ToSchema>::schema_ref())
 }
 
 result_row! { pub(super) struct Add { pub(super) id: i32 } }
@@ -24,12 +24,14 @@ result_row! { pub(super) struct Remove { pub(super) id: i32 } }
 result_row! { struct NullableRow { id: Option<i32> } }
 
 #[derive(Debug, PartialEq, DeriveStructRows)]
+#[row_type(Action)]
 struct Actions<A, B> {
     add: A,
     remove: B,
 }
 
 #[derive(Debug, PartialEq, DeriveStructRows)]
+#[row_type(NullableAction)]
 struct NullableRows {
     nullable_row: Option<NullableRow>,
     empty_row: Option<EmptyRow>,
