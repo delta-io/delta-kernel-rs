@@ -48,6 +48,8 @@ pub mod deletion_vector;
 pub mod deletion_vector_writer;
 pub mod set_transaction;
 
+#[cfg(all(test, feature = "declarative-plans", feature = "arrow-expression"))]
+mod plan_results;
 mod schema_deserializer;
 
 // see comment in ../lib.rs for the path module for why we include this way
@@ -1007,7 +1009,7 @@ impl CommitInfo {
 ///
 /// [Iceberg V4 metadata RFC]: https://github.com/delta-io/delta/blob/master/protocol_rfcs/iceberg-v4-metadata.md#backreferences
 #[cfg(feature = "adaptive-metadata-in-dev")]
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, TryFromStructData, Deserialize)]
 #[cfg_attr(test, derive(Serialize))]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
@@ -1020,7 +1022,7 @@ pub(crate) struct BackReference {
     pub(crate) pos: i32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, TryFromStructData, Deserialize)]
 #[cfg_attr(test, derive(Serialize, Default))]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
@@ -1229,7 +1231,7 @@ impl Add {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, TryFromStructData)]
 #[internal_api]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
 pub(crate) struct Remove {
@@ -1682,27 +1684,28 @@ impl<'de> Deserialize<'de> for CheckpointAction {
 fn content_sidecar_element(type_str: &str, sidecar: Sidecar) -> KernelResult<Scalar> {
     let sidecar: StructData = sidecar.into();
     let fields = std::iter::once(StructField::not_null("type", DataType::STRING))
-        .chain(sidecar.fields().iter().cloned());
+        .chain(sidecar.fields().cloned());
     let values = std::iter::once(Scalar::from(type_str))
         .chain(sidecar.values().iter().cloned())
         .collect();
-    let fields = StructType::try_new(fields)?.into_fields().collect();
-    Ok(Scalar::Struct(StructData::try_new(fields, values)?))
+    let schema = Arc::new(StructType::try_new(fields)?);
+    Ok(Scalar::Struct(StructData::try_new(schema, values)?))
 }
 
 /// Wrap a single element `value` into a full union struct matching the checkpoint array's element
 /// type: the field named `field_name` holds `value`, every other field is a typed null.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 fn checkpoint_action_union_element(field_name: &str, value: Scalar) -> KernelResult<Scalar> {
-    let fields: Vec<StructField> = CHECKPOINT_ACTION_ELEMENT_SCHEMA.fields().cloned().collect();
     require!(
-        fields.iter().any(|f| f.name() == field_name),
+        CHECKPOINT_ACTION_ELEMENT_SCHEMA
+            .fields()
+            .any(|f| f.name() == field_name),
         KernelError::generic(format!(
             "checkpoint union element field {field_name:?} not found in element schema"
         ))
     );
-    let values = fields
-        .iter()
+    let values = CHECKPOINT_ACTION_ELEMENT_SCHEMA
+        .fields()
         .map(|field| {
             if field.name() == field_name {
                 value.clone()
@@ -1711,7 +1714,10 @@ fn checkpoint_action_union_element(field_name: &str, value: Scalar) -> KernelRes
             }
         })
         .collect();
-    Ok(Scalar::Struct(StructData::try_new(fields, values)?))
+    Ok(Scalar::Struct(StructData::try_new(
+        CHECKPOINT_ACTION_ELEMENT_SCHEMA.clone(),
+        values,
+    )?))
 }
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1957,7 +1963,9 @@ impl CheckpointAction {
 /// file actions. This action is only allowed in checkpoints following the V2 spec.
 ///
 /// [More info]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#sidecar-file-information
-#[derive(ToSchema, IntoStructData, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    ToSchema, IntoStructData, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TryFromStructData,
+)]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct Sidecar {
@@ -2019,7 +2027,7 @@ impl Sidecar {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
-#[derive(Constructor, IntoStructData, ToSchema)]
+#[derive(Constructor, IntoStructData, ToSchema, TryFromStructData)]
 pub(crate) struct CheckpointMetadata {
     /// The version of the V2 spec checkpoint.
     ///
@@ -3257,7 +3265,7 @@ mod tests {
         let Scalar::Struct(struct_data) = &scalar else {
             panic!("Expected struct scalar, got {scalar}");
         };
-        let field_names: Vec<_> = struct_data.fields().iter().map(|f| f.name()).collect();
+        let field_names: Vec<_> = struct_data.fields().map(|f| f.name()).collect();
         assert_eq!(field_names, ["provider", "options"]);
         assert_eq!(struct_data.values()[0], Scalar::from("parquet"));
 
@@ -3517,7 +3525,7 @@ mod tests {
 
         let add: Add = serde_json::from_str(json).unwrap();
         let data: StructData = add.clone().into();
-        StructData::try_new(data.fields().to_vec(), data.values().to_vec())
+        StructData::try_new(data.schema().clone(), data.values().to_vec())
             .expect("complete add must match its derived schema");
         assert_eq!(
             add.partition_values,

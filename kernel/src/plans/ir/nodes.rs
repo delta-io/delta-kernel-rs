@@ -7,12 +7,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use derive_more::From;
-use itertools::Itertools;
 use strum::Display;
 use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
-use crate::error::add_scalar_path_context;
 use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar, StructData};
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema, lazy_schema_ref};
 use crate::utils::CollectInto;
@@ -373,7 +371,7 @@ impl Values {
 impl<T: Into<StructData> + ToSchema> FromIterator<T> for Values {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         let rows = iter.into_iter().map(|row| row.into().into_parts().1);
-        Self::new(Arc::new(T::to_schema()), rows.collect())
+        Self::new(T::schema_ref().clone(), rows.collect())
     }
 }
 
@@ -381,19 +379,15 @@ impl<T: Into<StructData> + ToSchema> FromIterator<T> for Values {
 /// [`TryFrom`].
 impl<T> TryFrom<Values> for Vec<T>
 where
-    T: TryFrom<StructData, Error = KernelError> + ToSchema,
+    T: TryFrom<StructData, Error = KernelError>,
 {
     type Error = KernelError;
 
     fn try_from(Values { schema, rows }: Values) -> KernelResult<Self> {
-        rows.into_iter()
-            .enumerate()
-            .map(|(index, row)| {
-                let schema = schema.as_ref().clone();
-                T::try_from(StructData::from_values_unchecked(schema, row))
-                    .map_err(|error| add_scalar_path_context(error, format!("[{index}]")))
-            })
-            .try_collect()
+        let rows = rows
+            .into_iter()
+            .map(|row| StructData::from_values_unchecked(Arc::clone(&schema), row));
+        crate::expressions::struct_rows::decode_rows::<T>(rows).collect()
     }
 }
 

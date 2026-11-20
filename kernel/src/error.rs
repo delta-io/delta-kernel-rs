@@ -91,6 +91,7 @@ impl std::error::Error for ScalarConversionError {}
 ///
 /// Other error variants are returned unchanged: a field's `TryFrom<Scalar>` implementation may
 /// report a failure unrelated to scalar shape, and this helper must not reclassify it.
+#[delta_kernel_derive::internal_api]
 pub(crate) fn add_scalar_path_context(
     error: KernelError,
     element: impl Into<String>,
