@@ -347,14 +347,13 @@ impl SyncPlanExecutor {
         });
         let bytes = to_parquet_bytes(schema, options, batches)?;
         let meta = self.write_file_result(&write.file_path, bytes.into(), write.overwrite)?;
-        Ok(vec![RecordBatch::try_new(
-            output_schema,
-            meta.columns()
-                .iter()
-                .chain(stats.iter().flat_map(|batch| batch.columns()))
-                .cloned()
-                .collect(),
-        )?])
+        let columns = meta
+            .columns()
+            .iter()
+            .chain(stats.iter().flat_map(|batch| batch.columns()))
+            .cloned()
+            .collect_vec();
+        Ok(vec![RecordBatch::try_new(output_schema, columns)?])
     }
 
     fn write_file_result(
