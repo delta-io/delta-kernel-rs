@@ -1322,11 +1322,14 @@ async fn post_commit_snapshot_resolves_latest_checkpoint_action(
     // snapshot's action forward.
     if write_root_manifest {
         txn = txn
-            .with_root_manifest_file(FileMeta {
-                location: table_root.join("metadata/root-v1.parquet").unwrap(),
-                last_modified: 0,
-                size: 1024,
-            })
+            .with_root_manifest_file(
+                FileMeta {
+                    location: table_root.join("metadata/root-v1.parquet").unwrap(),
+                    last_modified: 0,
+                    size: 1024,
+                },
+                None,
+            )
             .unwrap();
     }
     let post_commit = txn.commit(&engine).unwrap().unwrap_post_commit_snapshot();

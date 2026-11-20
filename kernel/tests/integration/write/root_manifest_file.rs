@@ -78,8 +78,12 @@ async fn test_with_root_manifest_file_produces_a_self_contained_checkpoint_actio
         true,
         |builder| builder,
     )?
-    .with_root_manifest_file(file.clone())?;
-    txn.commit(&engine)?.unwrap_committed();
+    .with_root_manifest_file(file.clone(), None)?;
+    let snapshot = txn.commit(&engine)?.unwrap_post_commit_snapshot();
+    let ict = snapshot
+        .reader()
+        .get_in_commit_timestamp(&engine)?
+        .expect("adaptiveMetadata tables record an In-Commit Timestamp");
 
     let checkpoint_actions = read_actions_from_commit(&table_url, 1, "checkpoint")?;
     assert_eq!(checkpoint_actions.len(), 1);
@@ -93,6 +97,7 @@ async fn test_with_root_manifest_file_produces_a_self_contained_checkpoint_actio
         .expect("contentRoot entry");
     assert_eq!(content_root["path"], json!(file.location.to_string()));
     assert_eq!(content_root["sizeInBytes"], json!(1024));
+    assert_eq!(content_root["commitTimestamp"], json!(ict));
 
     let protocol = entries
         .iter()
@@ -119,6 +124,58 @@ async fn test_with_root_manifest_file_produces_a_self_contained_checkpoint_actio
     Ok(())
 }
 
+#[rstest]
+// Far enough ahead that kernel would not pick the same value on its own.
+#[case::later_than_previous(1_000_000, true)]
+#[case::equal_to_previous(0, false)]
+#[case::before_previous(-1, false)]
+#[tokio::test(flavor = "multi_thread")]
+async fn root_manifest_commit_uses_the_provided_commit_timestamp(
+    #[case] offset_from_previous: i64,
+    #[case] accepted: bool,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let (engine, _temp_dir, table_url, snapshot) =
+        setup_adaptive_metadata_table("root_manifest_commit_timestamp").await?;
+    let previous_ict = snapshot
+        .reader()
+        .get_in_commit_timestamp(&engine)?
+        .expect("adaptiveMetadata tables record an In-Commit Timestamp");
+    let commit_timestamp = previous_ict + offset_from_previous;
+    let file = FileMeta {
+        location: table_url.join("metadata/root-v1.parquet")?,
+        last_modified: 0,
+        size: 1024,
+    };
+    let txn = begin_transaction_with(
+        snapshot,
+        &engine,
+        UpdateTableOperation::Write,
+        "test-engine",
+        true,
+        |builder| builder,
+    )?
+    .with_root_manifest_file(file, Some(commit_timestamp))?;
+
+    if !accepted {
+        assert_result_error_with_message(txn.commit(&engine), "is not later than the previous");
+        return Ok(());
+    }
+    let snapshot = txn.commit(&engine)?.unwrap_post_commit_snapshot();
+    assert_eq!(
+        snapshot.reader().get_in_commit_timestamp(&engine)?,
+        Some(commit_timestamp)
+    );
+    let checkpoint_actions = read_actions_from_commit(&table_url, 1, "checkpoint")?;
+    let content_root = checkpoint_actions[0]
+        .as_array()
+        .expect("checkpoint is an array")
+        .iter()
+        .find_map(|e| e.get("contentRoot"))
+        .expect("contentRoot entry");
+    assert_eq!(content_root["commitTimestamp"], json!(commit_timestamp));
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn alter_table_commit_rejects_root_manifest()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -134,7 +191,7 @@ async fn alter_table_commit_rejects_root_manifest()
         .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .add_column(StructField::nullable("fresh_column", DataType::INTEGER))
         .build(&engine, Box::new(FileSystemCommitter::new()))?
-        .with_root_manifest_file(file)?;
+        .with_root_manifest_file(file, None)?;
 
     let error = txn.commit(&engine).unwrap_err();
     assert!(
@@ -184,7 +241,7 @@ async fn test_with_root_manifest_file_merges_domain_metadata_and_transactions()
                 .with_domain_metadata("my.domain", "v2")
         },
     )?
-    .with_root_manifest_file(file)?;
+    .with_root_manifest_file(file, None)?;
     txn.commit(&engine)?.unwrap_committed();
 
     let checkpoint_actions = read_actions_from_commit(&table_url, 2, "checkpoint")?;
@@ -234,7 +291,7 @@ async fn test_with_root_manifest_file_requires_the_feature()
         size: 1024,
     };
     let result = test_utils::load_and_begin_transaction(table_url.as_str(), &engine)?
-        .with_root_manifest_file(file);
+        .with_root_manifest_file(file, None);
     assert_result_error_with_message(
         result,
         "root manifest file commit requires the adaptiveMetadata-preview feature",
@@ -290,11 +347,14 @@ async fn test_commit_info_data_change(
         |builder| builder,
     )?;
     if root_manifest {
-        txn = txn.with_root_manifest_file(FileMeta {
-            location: table_url.join("metadata/root-v1.parquet")?,
-            last_modified: 0,
-            size: 1024,
-        })?;
+        txn = txn.with_root_manifest_file(
+            FileMeta {
+                location: table_url.join("metadata/root-v1.parquet")?,
+                last_modified: 0,
+                size: 1024,
+            },
+            None,
+        )?;
     }
     txn.commit(&engine)?.unwrap_committed();
     let commit_info = commit_info_at(&table_url, 1)?;
@@ -338,7 +398,7 @@ async fn test_commit_info_records_data_change_and_last_manifest_commit(
                 size: 1024,
             };
             Ok(begin_with_data_change(snapshot, &engine, data_change)?
-                .with_root_manifest_file(file)?
+                .with_root_manifest_file(file, None)?
                 .commit(&engine)?
                 .unwrap_post_commit_snapshot())
         };
@@ -419,7 +479,7 @@ fn commit_around_root_manifest(
             configure,
         )?;
         if let Some(file) = root_manifest {
-            txn = txn.with_root_manifest_file(file)?;
+            txn = txn.with_root_manifest_file(file, None)?;
         }
         Ok::<_, Box<dyn std::error::Error>>(txn.commit(engine)?.unwrap_post_commit_snapshot())
     };

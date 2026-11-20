@@ -16,25 +16,34 @@ pub(super) struct RootManifestFile {
     pub(super) file: FileMeta,
     /// The snapshot being updated, whose active content the checkpoint action folds in.
     pub(super) read_snapshot: SnapshotRef,
+    /// The commit's In-Commit Timestamp, when the caller provides it.
+    pub(super) in_commit_timestamp: Option<i64>,
 }
 
 impl RootManifestFile {
     /// Constructs a `RootManifestFile` for the snapshot being updated.
-    pub(super) fn new(file: FileMeta, read_snapshot: SnapshotRef) -> Self {
+    pub(super) fn new(
+        file: FileMeta,
+        read_snapshot: SnapshotRef,
+        in_commit_timestamp: Option<i64>,
+    ) -> Self {
         RootManifestFile {
             file,
             read_snapshot,
+            in_commit_timestamp,
         }
     }
 
     /// Builds the self-contained `checkpoint` action committing this root manifest at
-    /// `commit_version`. A reader restores from it without replaying earlier commits, so it carries
-    /// the table's protocol and metadata plus every active domain metadata and set transaction
-    /// (this transaction's `dm_changes` and `set_transactions` merged in, newest wins).
+    /// `commit_version`, whose In-Commit Timestamp is `in_commit_timestamp`. A reader restores from
+    /// it without replaying earlier commits, so it carries the table's protocol and metadata plus
+    /// every active domain metadata and set transaction (this transaction's `dm_changes` and
+    /// `set_transactions` merged in, newest wins).
     pub(super) fn compute_checkpoint_action(
         &self,
         engine: &dyn Engine,
         commit_version: Version,
+        in_commit_timestamp: i64,
         table_config: &TableConfiguration,
         dm_changes: &[DomainMetadata],
         set_transactions: &[SetTransaction],
@@ -63,7 +72,8 @@ impl RootManifestFile {
         let version = version_as_i64(commit_version)?;
         let size = i64::try_from(self.file.size)
             .map_err(|_| KernelError::generic("root manifest file size exceeds i64::MAX"))?;
-        let content_root = ContentRoot::new(self.file.location.to_string(), size, version);
+        let content_root = ContentRoot::new(self.file.location.to_string(), size, version)
+            .with_commit_timestamp(in_commit_timestamp);
 
         Ok(CheckpointAction::new(
             version,
@@ -118,6 +128,9 @@ mod tests {
     };
     use crate::{KernelResult, Result, create_row};
 
+    /// The In-Commit Timestamp the tests commit their root manifests at.
+    const COMMIT_TIMESTAMP: i64 = 1_000;
+
     fn manifest_file(location: &str, size: u64) -> KernelResult<FileMeta> {
         Ok(FileMeta {
             location: url::Url::parse(location)?,
@@ -132,14 +145,12 @@ mod tests {
         size: u64,
         snapshot: SnapshotRef,
     ) -> RootManifestFile {
-        RootManifestFile {
-            file: FileMeta {
-                location: table_root.join(name).unwrap(),
-                last_modified: 0,
-                size,
-            },
-            read_snapshot: snapshot,
-        }
+        let file = FileMeta {
+            location: table_root.join(name).unwrap(),
+            last_modified: 0,
+            size,
+        };
+        RootManifestFile::new(file, snapshot, None)
     }
 
     #[test]
@@ -161,6 +172,7 @@ mod tests {
         let checkpoint = manifest.compute_checkpoint_action(
             &engine,
             1,
+            COMMIT_TIMESTAMP,
             snapshot.table_configuration(),
             &dm_changes,
             &set_transactions,
@@ -200,6 +212,7 @@ mod tests {
         let checkpoint = manifest.compute_checkpoint_action(
             &engine,
             2,
+            COMMIT_TIMESTAMP,
             snapshot.table_configuration(),
             &[],
             &[],
@@ -243,6 +256,7 @@ mod tests {
         Ok(manifest.compute_checkpoint_action(
             engine,
             snapshot.version() + 1,
+            COMMIT_TIMESTAMP,
             snapshot.table_configuration(),
             &[],
             &[],
@@ -383,7 +397,14 @@ mod tests {
             )])
             .build();
 
-        let checkpoint = manifest.compute_checkpoint_action(&engine, 2, &table_config, &[], &[])?;
+        let checkpoint = manifest.compute_checkpoint_action(
+            &engine,
+            2,
+            COMMIT_TIMESTAMP,
+            &table_config,
+            &[],
+            &[],
+        )?;
         assert!(checkpoint.transactions.is_empty());
         Ok(())
     }
@@ -421,6 +442,7 @@ mod tests {
         let checkpoint = manifest.compute_checkpoint_action(
             &engine,
             3,
+            COMMIT_TIMESTAMP,
             snapshot.table_configuration(),
             std::slice::from_ref(&new_domain_metadata),
             std::slice::from_ref(&new_transaction),
@@ -441,7 +463,7 @@ mod tests {
         let snapshot = Snapshot::builder_for("memory:///t/").build(&engine)?;
 
         let file = manifest_file("s3://bucket/metadata/root-v1.parquet", 1024)?;
-        let manifest = RootManifestFile::new(file.clone(), snapshot);
+        let manifest = RootManifestFile::new(file.clone(), snapshot, None);
         assert_eq!(manifest.file, file);
         Ok(())
     }
@@ -520,6 +542,7 @@ mod tests {
         let checkpoint = manifest.compute_checkpoint_action(
             &engine,
             4,
+            COMMIT_TIMESTAMP,
             snapshot.table_configuration(),
             &[],
             &[],
@@ -572,6 +595,7 @@ mod tests {
         let checkpoint = manifest.compute_checkpoint_action(
             &engine,
             2,
+            COMMIT_TIMESTAMP,
             snapshot.table_configuration(),
             &[],
             &[],
@@ -716,6 +740,7 @@ mod tests {
         let checkpoint = manifest.compute_checkpoint_action(
             &engine,
             2,
+            COMMIT_TIMESTAMP,
             snapshot.table_configuration(),
             &dm_changes,
             &[],
