@@ -580,6 +580,7 @@ void print_metric(MetricEvent event) {
       PM_U64(stats, num_remove_files);
       PM_U64(stats, num_actions);
       PM_U64(stats, num_sidecars);
+      PM_U64(stats, num_reused_sidecars);
     }
     PM_END;
     return;

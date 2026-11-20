@@ -95,6 +95,7 @@ features = ["async", "object_store"]
 optional = true
 
 [features]
+incremental-checkpoints-in-dev = []
 # no default features
 default = []
 # internal-api will make everything marked #[internal_api] public.
