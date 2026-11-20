@@ -342,6 +342,8 @@ impl TryFrom<&str> for DataSkippingNumIndexedCols {
 }
 
 /// The isolation level applied during transaction
+///
+/// Parsing ignores ASCII letter case.
 #[derive(Debug, EnumString, Default, Copy, Clone, PartialEq, Eq)]
 #[strum(serialize_all = "camelCase", ascii_case_insensitive)]
 pub enum IsolationLevel {

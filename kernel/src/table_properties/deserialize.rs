@@ -475,12 +475,12 @@ mod tests {
 
     #[rstest]
     #[case::pascal_case_serializable("Serializable", Some(IsolationLevel::Serializable))]
-    #[case::upper_case_serializable("SERIALIZABLE", Some(IsolationLevel::Serializable))]
+    #[case::uppercase_serializable("SERIALIZABLE", Some(IsolationLevel::Serializable))]
     #[case::pascal_case_write_serializable(
         "WriteSerializable",
         Some(IsolationLevel::WriteSerializable)
     )]
-    #[case::lower_case_write_serializable(
+    #[case::lowercase_write_serializable(
         "writeserializable",
         Some(IsolationLevel::WriteSerializable)
     )]
@@ -489,7 +489,7 @@ mod tests {
         Some(IsolationLevel::SnapshotIsolation)
     )]
     #[case::misspelled("Serializabel", None)]
-    fn test_parse_isolation_level_ignores_letter_case(
+    fn test_parse_isolation_level_ignores_only_letter_case(
         #[case] value: &str,
         #[case] expected: Option<IsolationLevel>,
     ) {
