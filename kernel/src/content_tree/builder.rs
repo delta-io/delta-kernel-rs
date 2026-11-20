@@ -375,6 +375,7 @@ mod tests {
                 first_row_id: Some(base_row_id),
                 deleted_positions: None,
                 replaced_positions: None,
+                snapshot_timestamp: None,
             },
             deletion_vector: None,
             spec_id: Some(0),

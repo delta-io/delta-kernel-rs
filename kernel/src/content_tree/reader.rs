@@ -2680,6 +2680,7 @@ mod tests {
             first_row_id,
             deleted_positions: None,
             replaced_positions: None,
+            snapshot_timestamp: None,
         }
     }
 
