@@ -3,6 +3,7 @@
 
 mod detect_conflicts;
 mod occ_plan;
+mod real_table;
 mod winner_check_plan;
 
 use std::collections::HashMap;
