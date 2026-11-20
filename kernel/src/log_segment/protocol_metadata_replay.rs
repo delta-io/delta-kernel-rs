@@ -38,7 +38,7 @@ use crate::plans::ir::nodes::FileType;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::plan::Plan;
 #[cfg(feature = "declarative-plans")]
-use crate::plans::{Operation, PlanBuilder, PlanExecutor};
+use crate::plans::{Operation, PlanBuilder, PlanExecutor, PlanExecutorCapabilities};
 #[cfg(feature = "declarative-plans")]
 use crate::schema::SchemaRef;
 use crate::schema::{
@@ -385,13 +385,12 @@ enum PmReader {
 }
 
 impl PmReader {
-    /// Returns a plan reader when the executor supports query plans, otherwise a file reader.
+    /// Returns a plan reader for a fully capable executor, otherwise a file reader.
     #[cfg_attr(not(feature = "declarative-plans"), allow(unused_variables))]
     fn for_engine(engine: &dyn Engine) -> Self {
         #[cfg(feature = "declarative-plans")]
-        if let Some(executor) = engine
-            .plan_executor()
-            .filter(|executor| executor.support_query_plans())
+        if let Some(executor) = engine.plan_executor()
+            && executor.capabilities() == PlanExecutorCapabilities::Full
         {
             return Self::Plan(executor);
         }

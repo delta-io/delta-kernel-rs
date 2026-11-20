@@ -2,7 +2,7 @@ use crate::arrow::record_batch::RecordBatch;
 use crate::engine::arrow_data::EngineDataArrowExt as _;
 use crate::engine::sync::plan::SyncPlanExecutor;
 use crate::plans::ir::nodes::Operator;
-use crate::plans::{Operation, Plan, PlanExecutor, PlanResult};
+use crate::plans::{Operation, Plan, PlanExecutor, PlanExecutorCapabilities, PlanResult};
 use crate::{Engine, KernelError, KernelResult};
 
 /// Executes I/O operations and file-scan plans through [`SyncPlanExecutor`].
@@ -12,8 +12,8 @@ use crate::{Engine, KernelError, KernelResult};
 pub(crate) struct IOOnlyPlanExecutor(pub SyncPlanExecutor);
 
 impl PlanExecutor for IOOnlyPlanExecutor {
-    fn support_query_plans(&self) -> bool {
-        false
+    fn capabilities(&self) -> PlanExecutorCapabilities {
+        PlanExecutorCapabilities::IoOnly
     }
 
     fn execute_op(&self, op: Operation) -> KernelResult<PlanResult> {
@@ -21,7 +21,7 @@ impl PlanExecutor for IOOnlyPlanExecutor {
             let supported = match plan.nodes.as_slice() {
                 [node] if node.inputs.is_empty() => match &node.op {
                     Operator::ScanJson(_) | Operator::ScanParquet(_) => true,
-                    // A scan with no input files builds as an empty Values plan.
+                    // Handler reads use build(), which turns empty scans into empty Values plans.
                     Operator::Values(values) => values.rows.is_empty(),
                     _ => false,
                 },

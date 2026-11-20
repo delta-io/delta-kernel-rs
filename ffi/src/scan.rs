@@ -2482,7 +2482,7 @@ mod tests {
         use crate::ffi_test_utils::{TEST_ERROR_ALLOCATORS, ok_or_panic, setup_snapshot};
         use crate::handle::Handle;
         use crate::plans::result::CPlanResult;
-        use crate::plans::{get_plan_based_engine, get_plan_executor};
+        use crate::plans::{FfiPlanExecutorCapabilities, get_plan_based_engine, get_plan_executor};
         use crate::{
             KernelBytesSlice, NullableCvoid, OptionalValue, SharedExternEngine, free_engine,
             free_snapshot,
@@ -2507,7 +2507,13 @@ mod tests {
         unsafe fn plan_based_engine(
             fallback: &Handle<SharedExternEngine>,
         ) -> Handle<SharedExternEngine> {
-            let executor = unsafe { get_plan_executor(None, unreachable_executor, true) };
+            let executor = unsafe {
+                get_plan_executor(
+                    None,
+                    unreachable_executor,
+                    FfiPlanExecutorCapabilities::Full,
+                )
+            };
             unsafe {
                 get_plan_based_engine(
                     executor,

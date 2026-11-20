@@ -107,6 +107,7 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::engine_data::FilteredEngineData;
+    use crate::plans::PlanExecutorCapabilities;
     use crate::unit_test_utils::load_test_table;
     use crate::unit_test_utils::plans::IOOnlyPlanExecutor;
     use crate::{Engine as _, EngineData, KernelError, Snapshot};
@@ -126,7 +127,7 @@ mod tests {
             Arc::new(IOOnlyPlanExecutor(SyncPlanExecutor::default())),
         );
         let executor = engine.require_plan_executor().unwrap();
-        assert!(!executor.support_query_plans());
+        assert_eq!(executor.capabilities(), PlanExecutorCapabilities::IoOnly);
 
         let actual = Snapshot::builder_for(expected.table_root().clone())
             .build(&engine)

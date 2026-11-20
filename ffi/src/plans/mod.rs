@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use delta_kernel::engine::plans::PlanBasedEngine;
+use delta_kernel::plans::PlanExecutorCapabilities;
 use delta_kernel::{Engine, PlanExecutor};
 
 use crate::handle::Handle;
@@ -14,13 +15,33 @@ pub mod executor;
 pub mod iter;
 pub mod result;
 
+/// Execution capabilities declared by an engine-provided plan executor.
+///
+/// See [`PlanExecutorCapabilities`] for the support contract.
+///
+/// cbindgen:prefix-with-name=true
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum FfiPlanExecutorCapabilities {
+    /// Supports I/O operations and general relational plans.
+    Full,
+    /// Supports only I/O operations and file scans.
+    IoOnly,
+}
+
+impl From<FfiPlanExecutorCapabilities> for PlanExecutorCapabilities {
+    fn from(capabilities: FfiPlanExecutorCapabilities) -> Self {
+        match capabilities {
+            FfiPlanExecutorCapabilities::Full => Self::Full,
+            FfiPlanExecutorCapabilities::IoOnly => Self::IoOnly,
+        }
+    }
+}
+
 /// Build a [`PlanExecutor`] backed by an engine-provided C callback.
 ///
-/// Pass `true` for `support_query_plans` if the callback supports query plans beyond file scans.
-/// Pass `false` for an executor limited to I/O operations and file scans; Kernel then replays
-/// protocol and metadata through engine handlers. This choice is fixed for the executor's lifetime.
-/// Handler I/O and explicitly requested plans still use the executor. See
-/// [`PlanExecutor::support_query_plans`] for the support contract.
+/// `capabilities` declares what the callback can execute and is fixed for the executor's lifetime.
+/// See [`FfiPlanExecutorCapabilities`] for the available profiles.
 ///
 /// The returned handle can be consumed by [`get_plan_based_engine`] or released with
 /// [`free_plan_executor`].
@@ -29,14 +50,15 @@ pub mod result;
 /// The `context` pointer MUST be thread-safe (Send + Sync) and MUST remain valid for as long as the
 /// executor is used. It is valid to pass NULL as the context. The callback MUST remain callable
 /// for the executor's lifetime and support concurrent calls.
+/// `capabilities` MUST be a valid [`FfiPlanExecutorCapabilities`] discriminant.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_plan_executor(
     context: NullableCvoid,
     callback: CExecuteOpFn,
-    support_query_plans: bool,
+    capabilities: FfiPlanExecutorCapabilities,
 ) -> Handle<SharedPlanExecutor> {
     let executor: Arc<dyn PlanExecutor> =
-        Arc::new(FfiPlanExecutor::new(context, callback, support_query_plans));
+        Arc::new(FfiPlanExecutor::new(context, callback, capabilities.into()));
     executor.into()
 }
 
@@ -123,21 +145,21 @@ mod tests {
     }
 
     #[rstest]
-    #[case::enabled(true)]
-    #[case::disabled(false)]
-    fn plan_executor_query_plan_support_survives_engine_construction(#[case] support: bool) {
-        let executor = unsafe { get_plan_executor(None, unit_callback, support) };
-        assert_eq!(unsafe { executor.as_ref() }.support_query_plans(), support);
+    #[case::full(FfiPlanExecutorCapabilities::Full, PlanExecutorCapabilities::Full)]
+    #[case::io_only(FfiPlanExecutorCapabilities::IoOnly, PlanExecutorCapabilities::IoOnly)]
+    fn plan_executor_capabilities_survive_engine_construction(
+        #[case] capabilities: FfiPlanExecutorCapabilities,
+        #[case] expected: PlanExecutorCapabilities,
+    ) {
+        let executor = unsafe { get_plan_executor(None, unit_callback, capabilities) };
+        assert_eq!(unsafe { executor.as_ref() }.capabilities(), expected);
 
         let engine_handle =
             unsafe { get_plan_based_engine(executor, OptionalValue::None, &TEST_ERROR_ALLOCATORS) };
         let engine = unsafe { engine_handle.as_ref() }.engine();
         assert_eq!(
-            engine
-                .require_plan_executor()
-                .unwrap()
-                .support_query_plans(),
-            support
+            engine.require_plan_executor().unwrap().capabilities(),
+            expected
         );
         engine
             .storage_handler()
@@ -163,7 +185,13 @@ mod tests {
 
     #[test]
     fn plan_based_engine_works_after_fallback_handle_is_freed() {
-        let executor = unsafe { get_plan_executor(None, unreachable_callback, true) };
+        let executor = unsafe {
+            get_plan_executor(
+                None,
+                unreachable_callback,
+                FfiPlanExecutorCapabilities::Full,
+            )
+        };
 
         // The caller retains ownership of the fallback engine handle. `shallow_copy` mimics C
         // passing the pointer by value, so we can still free our own handle afterward.
@@ -206,7 +234,13 @@ mod tests {
 
     #[test]
     fn get_plan_based_engine_without_fallback_returns_plan_based_engine() {
-        let executor = unsafe { get_plan_executor(None, unreachable_callback, true) };
+        let executor = unsafe {
+            get_plan_executor(
+                None,
+                unreachable_callback,
+                FfiPlanExecutorCapabilities::Full,
+            )
+        };
 
         let engine_handle =
             unsafe { get_plan_based_engine(executor, OptionalValue::None, &TEST_ERROR_ALLOCATORS) };
@@ -220,7 +254,13 @@ mod tests {
     /// rather than delegating.
     #[test]
     fn without_fallback_unimplemented_operations_are_unsupported() {
-        let executor = unsafe { get_plan_executor(None, unreachable_callback, true) };
+        let executor = unsafe {
+            get_plan_executor(
+                None,
+                unreachable_callback,
+                FfiPlanExecutorCapabilities::Full,
+            )
+        };
         let engine_handle =
             unsafe { get_plan_based_engine(executor, OptionalValue::None, &TEST_ERROR_ALLOCATORS) };
 

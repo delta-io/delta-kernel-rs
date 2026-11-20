@@ -35,7 +35,7 @@ use crate::path::ParsedLogPath;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::Operator;
 #[cfg(feature = "declarative-plans")]
-use crate::plans::{Operation, PlanExecutor, PlanResult};
+use crate::plans::{Operation, PlanExecutor, PlanExecutorCapabilities, PlanResult};
 use crate::schema::SchemaRef;
 use crate::table_features::TableFeature;
 use crate::transaction::UpdateTableOperation;
@@ -296,7 +296,7 @@ fn non_plan_engine(store: Arc<InMemory>) -> impl Engine {
 }
 
 #[cfg(feature = "declarative-plans")]
-fn hybrid_engine(store: Arc<InMemory>) -> PlanBasedEngine {
+fn io_only_engine(store: Arc<InMemory>) -> PlanBasedEngine {
     PlanBasedEngine::new(
         None,
         Arc::new(IOOnlyPlanExecutor(SyncPlanExecutor::new(Some(store)))),
@@ -309,7 +309,7 @@ async fn test_load_resolves_pm_from_manifest_commit_checkpoint_action() {
     #[cfg(feature = "declarative-plans")]
     check_manifest_commit_checkpoint(|store| SyncEngine::new_with_store(store)).await;
     #[cfg(feature = "declarative-plans")]
-    check_manifest_commit_checkpoint(hybrid_engine).await;
+    check_manifest_commit_checkpoint(io_only_engine).await;
 }
 
 // A single commit whose only P&M is a checkpoint action. The build succeeds only if P&M came from
@@ -925,23 +925,26 @@ struct RecordingPlanExecutor {
 
 #[cfg(feature = "declarative-plans")]
 #[rstest]
-#[case::enabled(Arc::new(SyncPlanExecutor::default()), true)]
-#[case::disabled(Arc::new(IOOnlyPlanExecutor(SyncPlanExecutor::default())), false)]
-fn recording_executor_preserves_query_plan_support(
+#[case::full(Arc::new(SyncPlanExecutor::default()), PlanExecutorCapabilities::Full)]
+#[case::io_only(
+    Arc::new(IOOnlyPlanExecutor(SyncPlanExecutor::default())),
+    PlanExecutorCapabilities::IoOnly
+)]
+fn recording_executor_preserves_capabilities(
     #[case] inner: Arc<dyn PlanExecutor>,
-    #[case] expected: bool,
+    #[case] expected: PlanExecutorCapabilities,
 ) {
     let executor = RecordingPlanExecutor {
         inner,
         plans: Arc::default(),
     };
-    assert_eq!(executor.support_query_plans(), expected);
+    assert_eq!(executor.capabilities(), expected);
 }
 
 #[cfg(feature = "declarative-plans")]
 impl PlanExecutor for RecordingPlanExecutor {
-    fn support_query_plans(&self) -> bool {
-        self.inner.support_query_plans()
+    fn capabilities(&self) -> PlanExecutorCapabilities {
+        self.inner.capabilities()
     }
 
     fn execute_op(&self, op: Operation) -> KernelResult<PlanResult> {
@@ -1025,7 +1028,7 @@ async fn segment_ending_on_checkpoint_ignores_its_checkpoint_action_rows() {
     #[cfg(feature = "declarative-plans")]
     check_segment_ending_on_checkpoint(|store| SyncEngine::new_with_store(store)).await;
     #[cfg(feature = "declarative-plans")]
-    check_segment_ending_on_checkpoint(hybrid_engine).await;
+    check_segment_ending_on_checkpoint(io_only_engine).await;
 }
 
 async fn check_segment_ending_on_checkpoint<E: Engine>(
@@ -1072,7 +1075,7 @@ async fn incremental_update_resolves_latest_checkpoint_action(
 ) {
     assert_incremental_update_action(&new_commit, expected_version, non_plan_engine).await;
     #[cfg(feature = "declarative-plans")]
-    assert_incremental_update_action(&new_commit, expected_version, hybrid_engine).await;
+    assert_incremental_update_action(&new_commit, expected_version, io_only_engine).await;
     #[cfg(feature = "declarative-plans")]
     assert_incremental_update_action(&new_commit, expected_version, |store| {
         SyncEngine::new_with_store(store)
