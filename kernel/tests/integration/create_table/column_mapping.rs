@@ -273,7 +273,8 @@ fn test_column_mapping_invalid_mode_rejected() {
         result
             .unwrap_err()
             .to_string()
-            .contains("Invalid column mapping mode")
+            .contains("Invalid value 'invalid' for 'delta.columnMapping.mode'"),
+        "error should come from shared property validation"
     );
 }
 

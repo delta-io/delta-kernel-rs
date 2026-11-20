@@ -1,16 +1,21 @@
-//! Registry of known `delta.*` table properties: canonical names, editability on
-//! existing-table updates, and value validators for property-set APIs.
+//! Shared registry of known `delta.*` table properties for CREATE and UPDATE.
+//!
+//! Canonical names, create/update access, and value validators live here so both builders share
+//! case-insensitive key matching and value checks. Feature signals (`delta.feature.*`) are handled
+//! by create-table separately and are rejected on update.
+
+use std::collections::HashMap;
 
 use super::deserialize::{parse_bool, parse_column_names, parse_interval, parse_positive_int};
 use super::{
     APPEND_ONLY, AUTO_COMPACT, CHECKPOINT_INTERVAL, CHECKPOINT_POLICY,
     CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT, COLUMN_MAPPING_MAX_COLUMN_ID,
-    COLUMN_MAPPING_MODE, DATA_SKIPPING_NUM_INDEXED_COLS, DATA_SKIPPING_STATS_COLUMNS,
-    DELETED_FILE_RETENTION_DURATION, DELTA_PROPERTY_PREFIX, DataSkippingNumIndexedCols,
-    ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS, ENABLE_EXPIRED_LOG_CLEANUP,
-    ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3,
-    ENABLE_ICEBERG_NATIVE_V4, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
-    ENABLE_TYPE_WIDENING, IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP,
+    COLUMN_MAPPING_MODE, CheckpointPolicy, DATA_SKIPPING_NUM_INDEXED_COLS,
+    DATA_SKIPPING_STATS_COLUMNS, DELETED_FILE_RETENTION_DURATION, DELTA_PROPERTY_PREFIX,
+    DataSkippingNumIndexedCols, ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS,
+    ENABLE_EXPIRED_LOG_CLEANUP, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
+    ENABLE_ICEBERG_COMPAT_V3, ENABLE_ICEBERG_NATIVE_V4, ENABLE_IN_COMMIT_TIMESTAMPS,
+    ENABLE_ROW_TRACKING, ENABLE_TYPE_WIDENING, IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP,
     IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION, ISOLATION_LEVEL, LOG_RETENTION_DURATION,
     MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME, OPTIMIZE_WRITE,
     PARQUET_COMPRESSION_CODEC, PARQUET_FORMAT_VERSION, ParquetCompressionCodec,
@@ -18,29 +23,49 @@ use super::{
     SET_TRANSACTION_RETENTION_DURATION, TARGET_FILE_SIZE, TUNE_FILE_SIZES_FOR_REWRITES,
     strip_check_constraint_prefix,
 };
-use crate::table_features::SET_TABLE_FEATURE_SUPPORTED_PREFIX;
+use crate::table_features::{ColumnMappingMode, SET_TABLE_FEATURE_SUPPORTED_PREFIX};
 use crate::{KernelError, KernelResult};
+
+/// Spark / protocol defaults used when a retention key is absent from the merged configuration.
+pub(crate) const DEFAULT_LOG_RETENTION_DURATION: &str = "interval 30 days";
+pub(crate) const DEFAULT_DELETED_FILE_RETENTION_DURATION: &str = "interval 1 week";
+
+/// Where a recognized property may be set.
+#[derive(Clone, Copy)]
+enum PropertyAccess {
+    /// Accepted on CREATE and UPDATE with value validation.
+    Editable(fn(&str) -> bool),
+    /// Accepted on CREATE with value validation; rejected on UPDATE until protocol prep exists.
+    CreateOnly(fn(&str) -> bool),
+    /// Known but never settable by connectors through property APIs.
+    Recognized,
+}
 
 /// Definition of one recognized `delta.*` table property.
 #[derive(Clone, Copy)]
 struct TablePropertyDef {
     key: &'static str,
-    /// Returns `true` when `value` is syntactically valid. `None` means the property is
-    /// recognized but not editable, so values are never validated.
-    validate: Option<fn(&str) -> bool>,
+    access: PropertyAccess,
 }
 
 const fn editable(key: &'static str, validate: fn(&str) -> bool) -> TablePropertyDef {
     TablePropertyDef {
         key,
-        validate: Some(validate),
+        access: PropertyAccess::Editable(validate),
+    }
+}
+
+const fn create_only(key: &'static str, validate: fn(&str) -> bool) -> TablePropertyDef {
+    TablePropertyDef {
+        key,
+        access: PropertyAccess::CreateOnly(validate),
     }
 }
 
 const fn recognized(key: &'static str) -> TablePropertyDef {
     TablePropertyDef {
         key,
-        validate: None,
+        access: PropertyAccess::Recognized,
     }
 }
 
@@ -85,6 +110,14 @@ fn validate_parquet_format_version(value: &str) -> bool {
     }
 }
 
+fn validate_column_mapping_mode(value: &str) -> bool {
+    value.parse::<ColumnMappingMode>().is_ok()
+}
+
+fn validate_checkpoint_policy(value: &str) -> bool {
+    value.parse::<CheckpointPolicy>().is_ok()
+}
+
 const EDITABLE_CONFIG_PROPERTIES: &[TablePropertyDef] = &[
     editable(CHECKPOINT_WRITE_STATS_AS_JSON, validate_bool),
     editable(CHECKPOINT_WRITE_STATS_AS_STRUCT, validate_bool),
@@ -102,23 +135,28 @@ const EDITABLE_CONFIG_PROPERTIES: &[TablePropertyDef] = &[
     editable(PARQUET_FORMAT_VERSION, validate_parquet_format_version),
 ];
 
-/// TODO: change these to editable once protocol-preparation code is added
+/// Feature-enablement properties accepted on CREATE. UPDATE rejects them until protocol
+/// preparation can upgrade the table.
 const FEATURE_ENABLEMENT_PROPERTIES: &[TablePropertyDef] = &[
-    recognized(APPEND_ONLY),
-    recognized(COLUMN_MAPPING_MODE),
-    recognized(ENABLE_CHANGE_DATA_FEED),
-    recognized(ENABLE_DELETION_VECTORS),
-    recognized(ENABLE_TYPE_WIDENING),
+    create_only(APPEND_ONLY, validate_bool),
+    create_only(COLUMN_MAPPING_MODE, validate_column_mapping_mode),
+    create_only(ENABLE_CHANGE_DATA_FEED, validate_bool),
+    create_only(ENABLE_DELETION_VECTORS, validate_bool),
+    create_only(ENABLE_TYPE_WIDENING, validate_bool),
+    create_only(ENABLE_ICEBERG_COMPAT_V2, validate_bool),
+    create_only(ENABLE_ICEBERG_COMPAT_V3, validate_bool),
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    create_only(ENABLE_ICEBERG_NATIVE_V4, validate_bool),
+    create_only(CHECKPOINT_POLICY, validate_checkpoint_policy),
+    create_only(ENABLE_ROW_TRACKING, validate_bool),
+    create_only(ENABLE_IN_COMMIT_TIMESTAMPS, validate_bool),
+    // Known enablement keys that CREATE does not accept today.
     recognized(ENABLE_ICEBERG_COMPAT_V1),
-    recognized(ENABLE_ICEBERG_COMPAT_V2),
-    recognized(ENABLE_ICEBERG_COMPAT_V3),
+    #[cfg(not(feature = "adaptive-metadata-in-dev"))]
     recognized(ENABLE_ICEBERG_NATIVE_V4),
-    recognized(CHECKPOINT_POLICY),
-    recognized(ENABLE_ROW_TRACKING),
-    recognized(ENABLE_IN_COMMIT_TIMESTAMPS),
 ];
 
-/// TODO: ICT version/timestamp remain non-editable here until ICT protocol-preparation is added
+/// Kernel-managed keys. Writers must not set these directly.
 const KERNEL_MANAGED_PROPERTIES: &[TablePropertyDef] = &[
     recognized(COLUMN_MAPPING_MAX_COLUMN_ID),
     recognized(MATERIALIZED_ROW_ID_COLUMN_NAME),
@@ -138,7 +176,7 @@ const OTHER_RECOGNIZED_PROPERTIES: &[TablePropertyDef] = &[
     recognized(TUNE_FILE_SIZES_FOR_REWRITES),
 ];
 
-/// All known `delta.*` properties, grouped by editability / ownership.
+/// All known `delta.*` properties, grouped by ownership.
 const KNOWN_DELTA_PROPERTY_GROUPS: &[&[TablePropertyDef]] = &[
     EDITABLE_CONFIG_PROPERTIES,
     FEATURE_ENABLEMENT_PROPERTIES,
@@ -158,9 +196,114 @@ pub(crate) fn is_delta_property_key(key: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(DELTA_PROPERTY_PREFIX))
 }
 
-fn is_table_feature_signal_key(key: &str) -> bool {
+/// Returns `true` when `key` is a `delta.feature.*` signal (case-insensitive prefix).
+pub(crate) fn is_table_feature_signal_key(key: &str) -> bool {
     key.get(..SET_TABLE_FEATURE_SUPPORTED_PREFIX.len())
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(SET_TABLE_FEATURE_SUPPORTED_PREFIX))
+}
+
+/// Strips a case-insensitive `delta.feature.` prefix, returning the feature name.
+pub(crate) fn strip_table_feature_signal_prefix(key: &str) -> Option<&str> {
+    is_table_feature_signal_key(key).then(|| &key[SET_TABLE_FEATURE_SUPPORTED_PREFIX.len()..])
+}
+
+#[derive(Clone, Copy)]
+enum PropertySetOperation {
+    Create,
+    Update,
+}
+
+fn validate_and_normalize_property(
+    key: impl Into<String>,
+    value: impl Into<String>,
+    operation: PropertySetOperation,
+) -> KernelResult<(String, String)> {
+    let key = key.into();
+    let value = value.into();
+
+    if !is_delta_property_key(&key) {
+        return Ok((key, value));
+    }
+
+    if strip_check_constraint_prefix(&key.to_ascii_lowercase()).is_some() {
+        return Err(match operation {
+            PropertySetOperation::Create => KernelError::generic(format!(
+                "Setting CHECK constraint property '{key}' is not supported during CREATE TABLE"
+            )),
+            PropertySetOperation::Update => KernelError::invalid_transaction_state(format!(
+                "Cannot modify the table property '{key}'"
+            )),
+        });
+    }
+
+    if is_table_feature_signal_key(&key) {
+        return Err(match operation {
+            PropertySetOperation::Create => KernelError::generic(format!(
+                "Feature signal '{key}' must be handled before property normalization"
+            )),
+            PropertySetOperation::Update => KernelError::invalid_transaction_state(format!(
+                "Protocol changes via '{key}' are not supported on existing tables"
+            )),
+        });
+    }
+
+    let Some(def) = find_property_def(&key) else {
+        return Err(match operation {
+            PropertySetOperation::Create => KernelError::generic(format!(
+                "Setting delta property '{key}' is not supported during CREATE TABLE"
+            )),
+            PropertySetOperation::Update => {
+                KernelError::invalid_transaction_state(format!("Unknown configuration key '{key}'"))
+            }
+        });
+    };
+
+    let validate = match (operation, def.access) {
+        (
+            PropertySetOperation::Create,
+            PropertyAccess::Editable(validate) | PropertyAccess::CreateOnly(validate),
+        )
+        | (PropertySetOperation::Update, PropertyAccess::Editable(validate)) => validate,
+        _ => {
+            return Err(match operation {
+                PropertySetOperation::Create => KernelError::generic(format!(
+                    "Setting delta property '{}' is not supported during CREATE TABLE",
+                    def.key
+                )),
+                PropertySetOperation::Update => KernelError::invalid_transaction_state(format!(
+                    "Cannot modify the table property '{}'",
+                    def.key
+                )),
+            });
+        }
+    };
+
+    if !validate(&value) {
+        return Err(match operation {
+            PropertySetOperation::Create => {
+                KernelError::generic(format!("Invalid value '{value}' for '{}'", def.key))
+            }
+            PropertySetOperation::Update => KernelError::invalid_transaction_state(format!(
+                "Invalid value '{value}' for table property '{}'",
+                def.key
+            )),
+        });
+    }
+
+    Ok((def.key.to_string(), value))
+}
+
+/// Validates and normalizes a single property for CREATE TABLE.
+///
+/// Non-`delta.*` application properties pass through with their original key casing. Allowed
+/// `delta.*` keys (config and feature-enablement) are rewritten to their canonical form and
+/// value-validated. Unknown `delta.*` keys, kernel-managed keys, CHECK constraints, and malformed
+/// values are rejected. Feature signals must be partitioned out before calling this.
+pub(crate) fn validate_and_normalize_property_for_create(
+    key: impl Into<String>,
+    value: impl Into<String>,
+) -> KernelResult<(String, String)> {
+    validate_and_normalize_property(key, value, PropertySetOperation::Create)
 }
 
 /// Validates and normalizes a single property for an existing-table update.
@@ -173,46 +316,151 @@ pub(crate) fn validate_and_normalize_property_for_update(
     key: impl Into<String>,
     value: impl Into<String>,
 ) -> KernelResult<(String, String)> {
-    let key = key.into();
-    let value = value.into();
+    validate_and_normalize_property(key, value, PropertySetOperation::Update)
+}
 
-    if !is_delta_property_key(&key) {
-        return Ok((key, value));
+/// Rejects a merged configuration where log retention is shorter than deleted-file retention.
+///
+/// Absent keys use the protocol defaults (`interval 30 days` and `interval 1 week`). Matches
+/// Spark's `validateTombstoneAndLogRetentionDurationCompatibility`. Present but unparseable values
+/// are rejected.
+pub(crate) fn validate_log_and_deleted_file_retention(
+    configuration: &HashMap<String, String>,
+) -> KernelResult<()> {
+    check_log_and_deleted_file_retention(configuration, KernelError::generic)
+}
+
+/// Retention cross-check for UPDATE after property adds have been validated.
+///
+/// Runs only when `validated_adds` sets a retention key (Spark checks only then). Absent keys use
+/// the protocol defaults. A stored value that this crate's interval parser cannot read is rejected
+/// with an error that names that stored value.
+pub(crate) fn validate_retention_for_property_adds(
+    existing: &HashMap<String, String>,
+    validated_adds: &HashMap<String, String>,
+) -> KernelResult<()> {
+    let sets_log = validated_adds.contains_key(LOG_RETENTION_DURATION);
+    let sets_deleted = validated_adds.contains_key(DELETED_FILE_RETENTION_DURATION);
+    if !sets_log && !sets_deleted {
+        return Ok(());
     }
 
-    if strip_check_constraint_prefix(&key.to_ascii_lowercase()).is_some() {
-        return Err(KernelError::invalid_transaction_state(format!(
-            "Cannot modify the table property '{key}'"
-        )));
-    }
+    let mut merged = existing.clone();
+    merged.extend(
+        validated_adds
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    check_log_and_deleted_file_retention(&merged, KernelError::invalid_transaction_state)
+}
 
-    if is_table_feature_signal_key(&key) {
-        return Err(KernelError::invalid_transaction_state(format!(
-            "Protocol changes via '{key}' are not supported on existing tables"
-        )));
-    }
+fn check_log_and_deleted_file_retention(
+    configuration: &HashMap<String, String>,
+    make_error: fn(String) -> KernelError,
+) -> KernelResult<()> {
+    let (log_raw, log) = retention_duration_for_comparison(
+        configuration,
+        LOG_RETENTION_DURATION,
+        DEFAULT_LOG_RETENTION_DURATION,
+        make_error,
+    )?;
+    let (deleted_raw, deleted) = retention_duration_for_comparison(
+        configuration,
+        DELETED_FILE_RETENTION_DURATION,
+        DEFAULT_DELETED_FILE_RETENTION_DURATION,
+        make_error,
+    )?;
 
-    let Some(def) = find_property_def(&key) else {
-        return Err(KernelError::invalid_transaction_state(format!(
-            "Unknown configuration key '{key}'"
-        )));
+    if log < deleted {
+        let log_present = configuration.contains_key(LOG_RETENTION_DURATION);
+        let message = if log_present {
+            format!(
+                "The table property {LOG_RETENTION_DURATION}({log_raw}) needs to be greater than \
+                 or equal to {DELETED_FILE_RETENTION_DURATION}({deleted_raw})."
+            )
+        } else {
+            format!(
+                "The table property {DELETED_FILE_RETENTION_DURATION}({deleted_raw}) needs to be \
+                 less than or equal to {LOG_RETENTION_DURATION}({log_raw})."
+            )
+        };
+        return Err(make_error(message));
+    }
+    Ok(())
+}
+
+fn retention_duration_for_comparison(
+    configuration: &HashMap<String, String>,
+    key: &str,
+    default: &str,
+    make_error: fn(String) -> KernelError,
+) -> KernelResult<(String, std::time::Duration)> {
+    let parsed_default = || {
+        parse_interval(default).ok_or_else(|| {
+            KernelError::internal_error(format!("invalid built-in retention default '{default}'"))
+        })
     };
-
-    let Some(validate) = def.validate else {
-        return Err(KernelError::invalid_transaction_state(format!(
-            "Cannot modify the table property '{}'",
-            def.key
-        )));
+    let Some(raw) = configuration.get(key).map(String::as_str) else {
+        return Ok((default.to_string(), parsed_default()?));
     };
-
-    if !validate(&value) {
-        return Err(KernelError::invalid_transaction_state(format!(
-            "Invalid value '{value}' for table property '{}'",
-            def.key
-        )));
+    if let Some(duration) = parse_interval(raw) {
+        return Ok((raw.to_string(), duration));
     }
+    Err(make_error(format!(
+        "Invalid value '{raw}' for table property '{key}'"
+    )))
+}
 
-    Ok((def.key.to_string(), value))
+/// Validates and normalizes properties for CREATE, rejecting conflicting spellings of the same
+/// canonical key (including exact duplicates).
+pub(crate) fn validate_and_normalize_properties_for_create(
+    properties: impl IntoIterator<Item = (String, String)>,
+) -> KernelResult<HashMap<String, String>> {
+    insert_normalized_properties(
+        properties,
+        PropertySetOperation::Create,
+        KernelError::generic,
+        /* reject_non_delta_conflicts= */ true,
+    )
+}
+
+/// Validates and normalizes one UPDATE property batch.
+///
+/// Conflicting `delta.*` spellings (including exact duplicates) are rejected. Non-`delta.*`
+/// duplicates keep the last value. Callers merge batches so a later batch can overwrite an earlier
+/// one for the same canonical key.
+pub(crate) fn validate_and_normalize_property_batch_for_update(
+    batch: impl IntoIterator<Item = (String, String)>,
+) -> KernelResult<HashMap<String, String>> {
+    insert_normalized_properties(
+        batch,
+        PropertySetOperation::Update,
+        KernelError::invalid_transaction_state,
+        /* reject_non_delta_conflicts= */ false,
+    )
+}
+
+fn insert_normalized_properties(
+    properties: impl IntoIterator<Item = (String, String)>,
+    operation: PropertySetOperation,
+    conflict_error: fn(String) -> KernelError,
+    reject_non_delta_conflicts: bool,
+) -> KernelResult<HashMap<String, String>> {
+    let mut normalized = HashMap::new();
+    for (key, value) in properties {
+        let (canonical, value) = match operation {
+            PropertySetOperation::Create => validate_and_normalize_property_for_create(key, value)?,
+            PropertySetOperation::Update => validate_and_normalize_property_for_update(key, value)?,
+        };
+        if let Some(_prev) = normalized.insert(canonical.clone(), value)
+            && (reject_non_delta_conflicts || is_delta_property_key(&canonical))
+        {
+            return Err(conflict_error(format!(
+                "Conflicting spellings of table property '{canonical}' in the same request"
+            )));
+        }
+    }
+    Ok(normalized)
 }
 
 #[cfg(test)]
@@ -255,13 +503,34 @@ mod tests {
         "2.12.0",
         "delta.parquet.format.version"
     )]
-    fn accepts_editable_and_user_properties(
+    fn update_accepts_editable_and_user_properties(
         #[case] key: &str,
         #[case] value: &str,
         #[case] expected_key: &str,
     ) {
         let (canonical, out_value) =
             validate_and_normalize_property_for_update(key, value).unwrap();
+        assert_eq!(canonical, expected_key);
+        assert_eq!(out_value, value);
+    }
+
+    #[rstest]
+    #[case::user_prop("app.owner", "kernel", "app.owner")]
+    #[case::case_insensitive("DELTA.checkpointInterval", "10", "delta.checkpointInterval")]
+    #[case::feature_enablement(
+        "DELTA.enableDeletionVectors",
+        "true",
+        "delta.enableDeletionVectors"
+    )]
+    #[case::column_mapping("delta.columnMapping.mode", "id", "delta.columnMapping.mode")]
+    #[case::checkpoint_policy("delta.checkpointPolicy", "v2", "delta.checkpointPolicy")]
+    fn create_accepts_allowed_and_user_properties(
+        #[case] key: &str,
+        #[case] value: &str,
+        #[case] expected_key: &str,
+    ) {
+        let (canonical, out_value) =
+            validate_and_normalize_property_for_create(key, value).unwrap();
         assert_eq!(canonical, expected_key);
         assert_eq!(out_value, value);
     }
@@ -319,7 +588,7 @@ mod tests {
         "many",
         "Invalid value 'many' for table property"
     )]
-    fn rejects_unsupported_or_invalid(
+    fn update_rejects_unsupported_or_invalid(
         #[case] key: &str,
         #[case] value: &str,
         #[case] expected: &str,
@@ -331,24 +600,42 @@ mod tests {
         );
     }
 
-    /// Config-only keys that `create_table` accepts without protocol enablement. Keep these
-    /// editable on update so create and update do not drift on shared configuration keys.
-    const CREATE_TABLE_CONFIG_ONLY_PROPERTIES: &[&str] = &[
-        CHECKPOINT_WRITE_STATS_AS_JSON,
-        CHECKPOINT_WRITE_STATS_AS_STRUCT,
-        DATA_SKIPPING_NUM_INDEXED_COLS,
-        DATA_SKIPPING_STATS_COLUMNS,
-        SET_TRANSACTION_RETENTION_DURATION,
-        PARQUET_FORMAT_VERSION,
-        PARQUET_COMPRESSION_CODEC,
-        LOG_RETENTION_DURATION,
-        DELETED_FILE_RETENTION_DURATION,
-        ENABLE_EXPIRED_LOG_CLEANUP,
-        CHECKPOINT_INTERVAL,
-    ];
+    #[rstest]
+    #[case::unknown(
+        "delta.unknownProperty",
+        "true",
+        "Setting delta property 'delta.unknownProperty' is not supported during CREATE TABLE"
+    )]
+    #[case::kernel_managed(
+        "delta.columnMapping.maxColumnId",
+        "20",
+        "Setting delta property 'delta.columnMapping.maxColumnId' is not supported during CREATE TABLE"
+    )]
+    #[case::invalid_bool("delta.enableDeletionVectors", "yes", "Invalid value 'yes' for")]
+    #[case::invalid_interval(
+        "delta.checkpointInterval",
+        "abc",
+        "Invalid value 'abc' for 'delta.checkpointInterval'"
+    )]
+    #[case::constraint(
+        "delta.constraints.positive_id",
+        "id > 0",
+        "Setting CHECK constraint property"
+    )]
+    fn create_rejects_unsupported_or_invalid(
+        #[case] key: &str,
+        #[case] value: &str,
+        #[case] expected: &str,
+    ) {
+        let error = validate_and_normalize_property_for_create(key, value).unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "error={error}, expected substring={expected}"
+        );
+    }
 
     #[test]
-    fn editable_keys_include_create_table_config_only_properties() {
+    fn create_and_update_agree_on_config_only_keys() {
         let mut editable: Vec<&str> = EDITABLE_CONFIG_PROPERTIES
             .iter()
             .map(|def| def.key)
@@ -371,30 +658,40 @@ mod tests {
             ]
         );
 
-        for key in CREATE_TABLE_CONFIG_ONLY_PROPERTIES {
-            assert!(
-                EDITABLE_CONFIG_PROPERTIES.iter().any(|def| def.key == *key),
-                "{key} is accepted by create_table as config-only but is not editable on update"
-            );
+        for def in EDITABLE_CONFIG_PROPERTIES {
+            assert!(matches!(def.access, PropertyAccess::Editable(_)));
+            let (canonical, _) =
+                validate_and_normalize_property_for_create(def.key, sample_value(def)).unwrap();
+            assert_eq!(canonical, def.key);
+            let (canonical, _) =
+                validate_and_normalize_property_for_update(def.key, sample_value(def)).unwrap();
+            assert_eq!(canonical, def.key);
         }
     }
 
-    /// Every recognized non-editable key must resolve through `find_property_def` and reject with
-    /// "Cannot modify" (not "Unknown"), including case-insensitive spellings.
+    fn sample_value(def: &TablePropertyDef) -> &'static str {
+        match def.key {
+            PARQUET_FORMAT_VERSION => "1.0.0",
+            PARQUET_COMPRESSION_CODEC => "zstd",
+            DATA_SKIPPING_NUM_INDEXED_COLS => "-1",
+            DATA_SKIPPING_STATS_COLUMNS => "a",
+            LOG_RETENTION_DURATION
+            | DELETED_FILE_RETENTION_DURATION
+            | SET_TRANSACTION_RETENTION_DURATION => "interval 1 days",
+            CHECKPOINT_INTERVAL => "10",
+            _ => "true",
+        }
+    }
+
     #[test]
-    fn rejects_every_non_editable_recognized_key() {
+    fn update_rejects_every_non_editable_recognized_key() {
         let non_editable = FEATURE_ENABLEMENT_PROPERTIES
             .iter()
             .chain(KERNEL_MANAGED_PROPERTIES.iter())
-            .chain(OTHER_RECOGNIZED_PROPERTIES.iter());
+            .chain(OTHER_RECOGNIZED_PROPERTIES.iter())
+            .filter(|def| !matches!(def.access, PropertyAccess::Editable(_)));
 
         for def in non_editable {
-            assert!(
-                def.validate.is_none(),
-                "expected non-editable registry entry for {}",
-                def.key
-            );
-
             for key in [def.key.to_string(), def.key.to_ascii_uppercase()] {
                 let error = validate_and_normalize_property_for_update(&key, "true").unwrap_err();
                 let message = error.to_string();
@@ -408,5 +705,145 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn retention_check_accepts_defaults_and_valid_pairs() {
+        validate_log_and_deleted_file_retention(&HashMap::new()).unwrap();
+        validate_log_and_deleted_file_retention(&HashMap::from([
+            (
+                LOG_RETENTION_DURATION.to_string(),
+                "interval 30 days".to_string(),
+            ),
+            (
+                DELETED_FILE_RETENTION_DURATION.to_string(),
+                "interval 7 days".to_string(),
+            ),
+        ]))
+        .unwrap();
+    }
+
+    #[test]
+    fn retention_check_rejects_log_shorter_than_deleted_files() {
+        let error = validate_log_and_deleted_file_retention(&HashMap::from([
+            (
+                LOG_RETENTION_DURATION.to_string(),
+                "interval 1 days".to_string(),
+            ),
+            (
+                DELETED_FILE_RETENTION_DURATION.to_string(),
+                "interval 7 days".to_string(),
+            ),
+        ]))
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("needs to be greater than or equal to"),
+            "error={error}"
+        );
+    }
+
+    #[test]
+    fn retention_check_rejects_deleted_longer_than_default_log() {
+        let error = validate_log_and_deleted_file_retention(&HashMap::from([(
+            DELETED_FILE_RETENTION_DURATION.to_string(),
+            "interval 60 days".to_string(),
+        )]))
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("needs to be less than or equal to"),
+            "error={error}"
+        );
+    }
+
+    #[test]
+    fn update_retention_check_skips_when_no_retention_key_is_set() {
+        let existing = HashMap::from([
+            (LOG_RETENTION_DURATION.to_string(), "2 weeks".to_string()),
+            (
+                DELETED_FILE_RETENTION_DURATION.to_string(),
+                "INTERVAL 30 DAYS".to_string(),
+            ),
+        ]);
+        let adds = HashMap::from([("app.owner".to_string(), "kernel".to_string())]);
+        validate_retention_for_property_adds(&existing, &adds).unwrap();
+    }
+
+    #[rstest]
+    #[case::spark_weeks_log("2 weeks", DELETED_FILE_RETENTION_DURATION, "interval 20 days")]
+    #[case::spark_upper_interval_deleted(
+        "INTERVAL 60 DAYS",
+        LOG_RETENTION_DURATION,
+        "interval 30 days"
+    )]
+    #[case::bare_days_log("60 days", DELETED_FILE_RETENTION_DURATION, "interval 40 days")]
+    fn update_retention_check_rejects_unparseable_existing_untouched_side(
+        #[case] existing_value: &str,
+        #[case] key_being_set: &str,
+        #[case] new_value: &str,
+    ) {
+        let existing_key = if key_being_set == LOG_RETENTION_DURATION {
+            DELETED_FILE_RETENTION_DURATION
+        } else {
+            LOG_RETENTION_DURATION
+        };
+        let existing = HashMap::from([(existing_key.to_string(), existing_value.to_string())]);
+        let adds = HashMap::from([(key_being_set.to_string(), new_value.to_string())]);
+        let error = validate_retention_for_property_adds(&existing, &adds).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                KernelError::InvalidTransactionState(message)
+                if message.contains(&format!("Invalid value '{existing_value}' for table property '{existing_key}'"))
+            ),
+            "error={error}"
+        );
+    }
+
+    #[test]
+    fn update_retention_check_uses_existing_log_when_only_deleted_is_set() {
+        let existing = HashMap::from([(
+            LOG_RETENTION_DURATION.to_string(),
+            "interval 3 days".to_string(),
+        )]);
+        let adds = HashMap::from([(
+            DELETED_FILE_RETENTION_DURATION.to_string(),
+            "interval 7 days".to_string(),
+        )]);
+        let error = validate_retention_for_property_adds(&existing, &adds).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                KernelError::InvalidTransactionState(message)
+                if message.contains("needs to be greater than or equal to")
+            ),
+            "error={error}"
+        );
+    }
+
+    #[test]
+    fn create_retention_check_uses_generic_error() {
+        let error = validate_log_and_deleted_file_retention(&HashMap::from([
+            (
+                LOG_RETENTION_DURATION.to_string(),
+                "interval 1 days".to_string(),
+            ),
+            (
+                DELETED_FILE_RETENTION_DURATION.to_string(),
+                "interval 7 days".to_string(),
+            ),
+        ]))
+        .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                KernelError::Generic(message)
+                if message.contains("needs to be greater than or equal to")
+            ),
+            "error={error}"
+        );
     }
 }

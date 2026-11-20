@@ -1,6 +1,6 @@
 //! Builder for transactions against an existing table.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use delta_kernel_derive::internal_api;
@@ -16,7 +16,9 @@ use crate::table_features::{
     IcebergCompatValidationContext, Operation, TableFeature, V2_VALIDATOR, V3_VALIDATOR,
     validate_iceberg_compat_if_needed,
 };
-use crate::table_properties::{is_delta_property_key, validate_and_normalize_property_for_update};
+use crate::table_properties::{
+    validate_and_normalize_property_batch_for_update, validate_retention_for_property_adds,
+};
 use crate::transaction::domain_metadata::validate_unique_domains;
 use crate::transaction::schema_evolution::{SchemaOperation, evolve_table_config};
 use crate::transaction::{
@@ -348,9 +350,19 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         }
         // Duplicate additions are validated by the shared builder state.
         self.common_state.validate()?;
-        // Property key/value validation does not need the engine; reject before any I/O in build.
+        // Property key/value and retention checks do not need the engine; reject before I/O.
+        // Retention is checked only when a retention key is being set (Spark parity).
         if self.local_state.has_property_changes() {
-            let _ = validate_and_canonicalize_properties_added(&self.local_state.properties_added)?;
+            let validated =
+                validate_and_canonicalize_properties_added(&self.local_state.properties_added)?;
+            validate_retention_for_property_adds(
+                self.local_state
+                    .snapshot
+                    .table_configuration()
+                    .metadata()
+                    .configuration(),
+                &validated,
+            )?;
         }
         Ok(())
     }
@@ -523,19 +535,8 @@ fn validate_and_canonicalize_properties_added(
 ) -> KernelResult<HashMap<String, String>> {
     let mut validated = HashMap::new();
     for batch in properties_added {
-        let mut seen_delta_keys = HashSet::new();
-        for (key, _) in batch {
-            if is_delta_property_key(key) && !seen_delta_keys.insert(key.to_ascii_lowercase()) {
-                return Err(KernelError::invalid_transaction_state(format!(
-                    "Conflicting spellings of table property '{key}' in the same request"
-                )));
-            }
-        }
-        for (key, value) in batch {
-            let (canonical_key, value) =
-                validate_and_normalize_property_for_update(key.clone(), value.clone())?;
-            validated.insert(canonical_key, value);
-        }
+        let batch = validate_and_normalize_property_batch_for_update(batch.iter().cloned())?;
+        validated.extend(batch);
     }
     Ok(validated)
 }
@@ -561,7 +562,10 @@ mod tests {
     use crate::schema::{DataType, StructField, schema_ref};
     use crate::snapshot::Snapshot;
     use crate::table_features::TableFeature;
-    use crate::table_properties::{ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3};
+    use crate::table_properties::{
+        DELETED_FILE_RETENTION_DURATION, ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3,
+        LOG_RETENTION_DURATION,
+    };
     use crate::transaction::create_table::create_table;
     use crate::transaction::{SchemaOperation, UpdateTableOperation};
     use crate::unit_test_utils::{copy_test_table, load_test_table, test_schema_flat};
@@ -988,6 +992,54 @@ mod tests {
         assert!(
             error.to_string().contains(expected),
             "error={error}, expected={expected}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn with_table_properties_added_rejects_incompatible_retention_durations() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let error = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([
+                ("delta.logRetentionDuration", "interval 1 days"),
+                ("delta.deletedFileRetentionDuration", "interval 7 days"),
+            ])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("needs to be greater than or equal to"),
+            "error={error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn with_table_properties_added_checks_retention_against_existing_log_value() -> Result<()> {
+        let engine = Arc::new(SyncEngine::in_memory());
+        let snapshot = create_table("memory:///", test_schema_flat(), "test-engine", true)
+            .with_table_properties([
+                (LOG_RETENTION_DURATION, "interval 3 days"),
+                (DELETED_FILE_RETENTION_DURATION, "interval 1 days"),
+            ])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+
+        let error = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([(DELETED_FILE_RETENTION_DURATION, "interval 7 days")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("needs to be greater than or equal to"),
+            "error={error}"
         );
         Ok(())
     }
