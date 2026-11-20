@@ -489,6 +489,8 @@ mod tests {
         Some(IsolationLevel::SnapshotIsolation)
     )]
     #[case::misspelled("Serializabel", None)]
+    #[case::snake_case("write_serializable", None)]
+    #[case::padded(" Serializable", None)]
     fn test_parse_isolation_level_ignores_only_letter_case(
         #[case] value: &str,
         #[case] expected: Option<IsolationLevel>,
