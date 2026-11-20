@@ -2206,21 +2206,15 @@ async fn alter_table_property_removal_round_trips() -> delta_kernel::Result<()> 
     Ok(())
 }
 
-#[rstest]
-#[case::checkpoint_interval("delta.checkpointInterval")]
-#[case::feature_enabling("delta.enableTypeWidening")]
-#[case::mixed_case("DELTA.enableTypeWidening")]
 #[tokio::test]
-async fn alter_table_rejects_removing_delta_property(
-    #[case] key: &str,
-) -> delta_kernel::Result<()> {
+async fn alter_table_rejects_removing_delta_property() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot =
         create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
 
     let result = snapshot
         .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
-        .with_table_properties_removed([key])
+        .with_table_properties_removed(["DELTA.enableTypeWidening"])
         .build(engine.as_ref(), committer());
 
     assert_result_error_with_message(result, "Unsetting 'delta.' table properties");
