@@ -8,7 +8,6 @@ use tracing::span::{Attributes, Id, Record};
 use tracing::{Level, Span, Subscriber, event, warn};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
-#[cfg(feature = "declarative-plans")]
 use tracing_subscriber::registry::LookupSpan as _;
 
 use super::events::{
@@ -221,7 +220,6 @@ where
 
 /// Updates the nearest scan-plan event in the current tracing scope. Disabled reporting does
 /// not evaluate the update. Subscriber wrappers must expose their underlying tracing registry.
-#[cfg(feature = "declarative-plans")]
 pub(super) fn update_scan_plan(update: impl FnOnce(&mut super::ScanPlanGenerationCompleted)) {
     Span::current().with_subscriber(|(id, dispatch)| {
         let registry = dispatch.downcast_ref::<tracing_subscriber::Registry>()?;
