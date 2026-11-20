@@ -119,6 +119,15 @@ impl CheckpointMetrics {
         };
         rows.fetch_add(batch.actions.len() as u64, Ordering::Relaxed);
     }
+
+    #[cfg(feature = "incremental-checkpoints-in-dev")]
+    pub(crate) fn record_checkpoint_rows(&self, rows: usize) {
+        if let Some(counters) = &self.0 {
+            counters
+                .num_actions_from_checkpoint
+                .fetch_add(rows as u64, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Timed sections of checkpoint input, processing, and verification.

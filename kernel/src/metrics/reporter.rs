@@ -471,6 +471,7 @@ mod tests {
                 num_remove_files = Empty,
                 num_actions = Empty,
                 num_sidecars = Empty,
+                num_reused_sidecars = Empty,
                 log_tail_input_duration_ns = Empty,
                 checkpoint_input_duration_ns = Empty,
                 reconciliation_duration_ns = Empty,
@@ -490,6 +491,7 @@ mod tests {
             span.record("num_remove_files", 0u64);
             span.record("num_actions", 5u64);
             span.record("num_sidecars", 1u64);
+            span.record("num_reused_sidecars", 0u64);
             for (name, value) in [
                 ("log_tail_input_duration_ns", 1u64),
                 ("reconciliation_duration_ns", 2),
@@ -530,6 +532,7 @@ mod tests {
                             num_remove_files: 0,
                             num_actions: 5,
                             num_sidecars: 1,
+                            num_reused_sidecars: 0,
                         }
                     }
                 );

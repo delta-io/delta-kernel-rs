@@ -112,6 +112,10 @@ pub enum CheckpointWriteMode {
     V2WithoutSidecars,
     /// V2 sidecar-writing path, which can produce zero sidecars if there are no file actions.
     V2WithSidecars,
+    /// V2 checkpoint attempted reuse of all inherited sidecars.
+    V2ReusingSidecarsAllOrNothing,
+    /// Benchmark-only reuse under a fresh-Add-path assumption.
+    V2ReusingSidecarsAssumeFreshAddsForBenchmark,
 }
 
 impl From<kernel::CheckpointWriteMode> for CheckpointWriteMode {
@@ -121,6 +125,12 @@ impl From<kernel::CheckpointWriteMode> for CheckpointWriteMode {
             kernel::CheckpointWriteMode::V1 => Self::V1,
             kernel::CheckpointWriteMode::V2WithoutSidecars => Self::V2WithoutSidecars,
             kernel::CheckpointWriteMode::V2WithSidecars => Self::V2WithSidecars,
+            kernel::CheckpointWriteMode::V2ReusingSidecarsAllOrNothing => {
+                Self::V2ReusingSidecarsAllOrNothing
+            }
+            kernel::CheckpointWriteMode::V2ReusingSidecarsAssumeFreshAddsForBenchmark => {
+                Self::V2ReusingSidecarsAssumeFreshAddsForBenchmark
+            }
         }
     }
 }
@@ -503,6 +513,8 @@ pub struct CheckpointWriteStats {
     pub num_actions: u64,
     /// Total sidecars referenced by the completed checkpoint.
     pub num_sidecars: u64,
+    /// Inherited sidecar files referenced without being rewritten.
+    pub num_reused_sidecars: u64,
 }
 
 impl From<kernel::CheckpointWriteStats> for CheckpointWriteStats {
@@ -513,6 +525,7 @@ impl From<kernel::CheckpointWriteStats> for CheckpointWriteStats {
             num_remove_files: stats.num_remove_files,
             num_actions: stats.num_actions,
             num_sidecars: stats.num_sidecars,
+            num_reused_sidecars: stats.num_reused_sidecars,
         }
     }
 }
@@ -1104,6 +1117,7 @@ mod tests {
             let sidecars = u64::from(mode == kernel::CheckpointWriteMode::V2WithSidecars) * 2;
             (101, 3, 5, 11 + sidecars, sidecars)
         };
+        let reused_sidecars = sidecars / 2;
         let event = kernel::MetricEvent::CheckpointWriteSuccess(kernel::CheckpointWriteSuccess {
             operation_id,
             version: 42,
@@ -1114,6 +1128,7 @@ mod tests {
                     num_remove_files: removes,
                     num_actions: actions,
                     num_sidecars: sidecars,
+                    num_reused_sidecars: reused_sidecars,
                 },
             },
             mode,
@@ -1149,6 +1164,7 @@ mod tests {
                         num_remove_files: removes,
                         num_actions: actions,
                         num_sidecars: sidecars,
+                        num_reused_sidecars: reused_sidecars,
                     },
                 }
             );
