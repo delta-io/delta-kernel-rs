@@ -219,7 +219,7 @@ impl CheckpointWriter {
             v2.visit_rows_of(batch?.as_ref())?;
         }
         self.serialize_checkpoint_hint(
-            stats,
+            &stats,
             root_file,
             checkpoint_schema_json(checkpoint_schema)?.map(|_| checkpoint_schema.clone()),
             v2,
@@ -228,7 +228,7 @@ impl CheckpointWriter {
 
     fn serialize_checkpoint_hint(
         &self,
-        stats: LastCheckpointHintStats,
+        stats: &LastCheckpointHintStats,
         root_file: &FileMeta,
         checkpoint_schema: Option<SchemaRef>,
         mut v2: LastCheckpointV2,

@@ -108,6 +108,14 @@ impl CheckpointWriter {
     /// is the caller's final step. A complete CRC at this snapshot's version validates the Add
     /// count; a mismatch returns `DELTA_TXN_LOG_FAILED_INTEGRITY` before hint bytes are generated.
     pub fn last_checkpoint_bytes_from_result(&self, result: PlanResult) -> Result<Vec<u8>> {
+        let (_, _, bytes) = self.checkpoint_info_from_result(result)?;
+        Ok(bytes)
+    }
+
+    pub(crate) fn checkpoint_info_from_result(
+        &self,
+        result: PlanResult,
+    ) -> Result<(FileMeta, LastCheckpointHintStats, Vec<u8>)> {
         let mut rows = CheckpointResult {
             statistics: None,
             root: None,
@@ -140,14 +148,12 @@ impl CheckpointWriter {
             )
             .into());
         }
-        Ok(self.serialize_checkpoint_hint(
-            statistics,
-            &rows
-                .root
-                .ok_or_else(|| KernelError::checkpoint_write("Missing checkpoint root"))?,
-            rows.schema,
-            rows.prefetch,
-        )?)
+        let root = rows
+            .root
+            .ok_or_else(|| KernelError::checkpoint_write("Missing checkpoint root"))?;
+        let bytes =
+            self.serialize_checkpoint_hint(&statistics, &root, rows.schema, rows.prefetch)?;
+        Ok((root, statistics, bytes))
     }
 }
 

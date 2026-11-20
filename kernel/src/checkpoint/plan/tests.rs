@@ -18,6 +18,7 @@ use crate::arrow::compute::{cast, filter_record_batch, is_not_null, is_null, or}
 use crate::arrow::datatypes::Int64Type;
 use crate::arrow::record_batch::RecordBatch;
 use crate::checkpoint::{CheckpointSpec, V2CheckpointConfig};
+use crate::engine::DelegatingEngine;
 use crate::engine::arrow_conversion::TryFromArrow as _;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use crate::engine::arrow_utils::parse_json_impl;
@@ -465,10 +466,14 @@ async fn checkpoint_plan_reconciles_all_groups_and_retains_after_replay(
         .await
         .unwrap();
         if version == 1 {
+            // Preserve inline and sidecar source fixtures independently of the executor route.
+            let checkpoint_engine =
+                DelegatingEngine::new(Arc::new(SyncEngine::new_with_store(store.clone())))
+                    .without_plan_executor();
             Snapshot::builder_for(table.table_root())
                 .build(&engine)
                 .unwrap()
-                .checkpoint(&engine, Some(&spec))?;
+                .checkpoint(&checkpoint_engine, Some(&spec))?;
         }
     }
     let snapshot = Snapshot::builder_for(table.table_root())

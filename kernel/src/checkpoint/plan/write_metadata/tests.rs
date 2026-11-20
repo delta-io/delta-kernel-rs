@@ -6,7 +6,9 @@ use url::Url;
 use super::*;
 use crate::actions::{CheckpointMetadata, SET_TRANSACTION_FIELD, SetTransaction};
 use crate::arrow::array::StringArray;
+use crate::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use crate::crc::{Crc, FileStats, FileStatsState};
+use crate::engine::DelegatingEngine;
 use crate::engine::arrow_conversion::TryFromArrow as _;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use crate::engine::arrow_utils::parse_json_impl;
@@ -15,8 +17,9 @@ use crate::expressions::Predicate;
 use crate::last_checkpoint_hint::HintAction;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::plans::ir::nodes::{FileType, Operator};
-use crate::plans::{Operation, Plan, PlanResult};
+use crate::plans::{IoOperation, Operation, Plan, PlanExecutor, PlanResult};
 use crate::schema::{SchemaStructPatchBuilder, schema_ref};
+use crate::snapshot::CheckpointWriteResult;
 use crate::unit_test_utils::plans::{execute_plan as execute, json_rows};
 use crate::{DeltaErrorCondition, Engine, EngineData, Error, Snapshot, SnapshotRef, Version};
 
@@ -268,12 +271,15 @@ async fn checkpoint_preserves_native_timestamp_partitions(
 }
 
 #[rstest]
-#[case::v1(false, FileType::Parquet)]
-#[case::v2_json(true, FileType::Json)]
-#[case::v2_parquet(true, FileType::Parquet)]
+#[case::v1(false, FileType::Parquet, false)]
+#[case::v2_json(true, FileType::Json, false)]
+#[case::v2_parquet(true, FileType::Parquet, false)]
+#[case::snapshot_v1(false, FileType::Parquet, true)]
+#[case::snapshot_v2(true, FileType::Parquet, true)]
 fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
     #[case] v2: bool,
     #[case] format: FileType,
+    #[case] public_api: bool,
     #[values("empty", "mixed", "predecessor")] state: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_dir, mut snapshot, engine) = checkpoint_table(v2, state != "empty")?;
@@ -311,8 +317,32 @@ fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
     let writer = snapshot.clone().create_checkpoint_writer(&engine)?;
     let (expected_actions, legacy_count) = reconciled_rows(&writer, &engine)?;
     assert_eq!(expected_actions.len(), if state == "empty" { 2 } else { 6 });
-    let (plan, bytes) = write_checkpoint(&writer, &engine, format)?;
-    assert_eq!(std::fs::read(&hint_path).ok(), predecessor_hint);
+    let (plan, bytes) = if public_api {
+        let (outcome, checkpointed) = snapshot.checkpoint(&engine, None)?;
+        assert_eq!(outcome, CheckpointWriteResult::Written);
+        assert!(!Arc::ptr_eq(&snapshot, &checkpointed));
+        assert_eq!(checkpointed.version(), snapshot.version());
+        assert_eq!(
+            checkpointed.log_segment().checkpoint_version,
+            Some(snapshot.version())
+        );
+        assert_eq!(
+            reconciled_rows(
+                &checkpointed.clone().create_checkpoint_writer(&engine)?,
+                &engine
+            )?
+            .0,
+            expected_actions
+        );
+        let (outcome, unchanged) = checkpointed.checkpoint(&engine, None)?;
+        assert_eq!(outcome, CheckpointWriteResult::AlreadyExists);
+        assert!(Arc::ptr_eq(&checkpointed, &unchanged));
+        (None, std::fs::read(&hint_path)?)
+    } else {
+        let (plan, bytes) = write_checkpoint(&writer, &engine, format)?;
+        assert_eq!(std::fs::read(&hint_path).ok(), predecessor_hint);
+        (Some(plan), bytes)
+    };
     let hint: LastCheckpointHint = serde_json::from_slice(&bytes)?;
     let root_url = match &hint.v2_checkpoint {
         Some(locator) => log.join(&locator.path)?,
@@ -432,16 +462,32 @@ fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
     assert!(hint.applies_to(&[ParsedLogPath::new(root.clone()).unwrap()]));
     let root_file = root_url.to_file_path().unwrap();
     let completed_root = std::fs::read(&root_file)?;
-    assert!(
-        engine
-            .require_plan_executor()?
-            .execute_op(Operation::QueryPlan(plan))
-            .is_err()
-    );
+    if let Some(plan) = plan {
+        assert!(
+            engine
+                .require_plan_executor()?
+                .execute_op(Operation::QueryPlan(plan))
+                .is_err()
+        );
+    } else if !v2 {
+        // The original snapshot has not discovered the newly persisted checkpoint.
+        let (outcome, unchanged) = snapshot.checkpoint(&engine, None)?;
+        assert_eq!(outcome, CheckpointWriteResult::AlreadyExists);
+        assert!(Arc::ptr_eq(&snapshot, &unchanged));
+    }
     assert_eq!(std::fs::read(&root_file)?, completed_root);
-    assert_eq!(std::fs::read(&hint_path).ok(), predecessor_hint);
+    assert_eq!(
+        std::fs::read(&hint_path).ok(),
+        if public_api {
+            Some(bytes.clone())
+        } else {
+            predecessor_hint
+        }
+    );
     // Keep the target commit as a publication watermark; all older history is dispensable.
-    std::fs::write(hint_path, bytes)?;
+    if !public_api {
+        std::fs::write(hint_path, bytes)?;
+    }
     let target_commit = log.join(&format!("{:020}.json", snapshot.version()))?;
     for file in storage.list_from(&log, None)? {
         let file = file?;
@@ -484,10 +530,16 @@ fn checkpoint_validates_add_count_against_crc(
     #[case] crc_version: Option<Version>,
     #[case] expected_adds: Option<i64>,
     #[case] succeeds: bool,
-    #[values((false, FileType::Parquet), (true, FileType::Json), (true, FileType::Parquet))]
-    checkpoint: (bool, FileType),
+    #[values(
+        (false, FileType::Parquet, false),
+        (true, FileType::Json, false),
+        (true, FileType::Parquet, false),
+        (false, FileType::Parquet, true),
+        (true, FileType::Parquet, true)
+    )]
+    checkpoint: (bool, FileType, bool),
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (v2, format) = checkpoint;
+    let (v2, format, public_api) = checkpoint;
     let (_dir, snapshot, engine) = checkpoint_table(v2, true)?;
     let crc = crc_version.map(|version| {
         Arc::new(Crc {
@@ -517,13 +569,23 @@ fn checkpoint_validates_add_count_against_crc(
         true,
     )?);
     let hint = snapshot.log_segment().log_root.join("_last_checkpoint")?;
-    let writer = snapshot.create_checkpoint_writer(&engine)?;
-    let result = engine
-        .require_plan_executor()?
-        .execute_op(Operation::QueryPlan(
-            writer.declarative_checkpoint_plan(&engine, format)?,
-        ))?;
-    let result = writer.last_checkpoint_bytes_from_result(result);
+    let result = if public_api {
+        snapshot
+            .checkpoint(&engine, None)
+            .and_then(|(outcome, checkpointed)| {
+                assert_eq!(outcome, CheckpointWriteResult::Written);
+                assert_eq!(checkpointed.crc_at_version(), snapshot.crc_at_version());
+                Ok(std::fs::read(hint.to_file_path().unwrap()).map_err(KernelError::from)?)
+            })
+    } else {
+        let writer = snapshot.create_checkpoint_writer(&engine)?;
+        let result = engine
+            .require_plan_executor()?
+            .execute_op(Operation::QueryPlan(
+                writer.declarative_checkpoint_plan(&engine, format)?,
+            ))?;
+        writer.last_checkpoint_bytes_from_result(result)
+    };
     if succeeds {
         let hint: LastCheckpointHint = serde_json::from_slice(&result?)?;
         assert_eq!(hint.num_of_add_files, Some(1));
@@ -540,7 +602,145 @@ fn checkpoint_validates_add_count_against_crc(
             expected_adds.unwrap(),
         )));
     }
-    assert!(engine.storage_handler().head(&hint).is_err());
+    assert_eq!(
+        engine.storage_handler().head(&hint).is_ok(),
+        public_api && succeeds
+    );
+    Ok(())
+}
+
+#[rstest]
+#[case::inline(V2CheckpointConfig::NoSidecar)]
+#[case::sidecars(V2CheckpointConfig::WithSidecar {
+    file_actions_per_sidecar_hint: None,
+})]
+#[case::small_hint(V2CheckpointConfig::WithSidecar {
+    file_actions_per_sidecar_hint: Some(1),
+})]
+fn snapshot_checkpoint_selects_declarative_sidecars(
+    #[case] config: V2CheckpointConfig,
+    #[values(false, true)] declarative: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_dir, snapshot, engine) = checkpoint_table(true, true)?;
+    let hint_path = snapshot.log_segment().log_root.join("_last_checkpoint")?;
+    let engine = DelegatingEngine::new(Arc::new(engine));
+    let engine = if declarative {
+        engine
+    } else {
+        engine.without_plan_executor()
+    };
+    let inline = matches!(&config, V2CheckpointConfig::NoSidecar);
+    let result = snapshot.checkpoint(&engine, Some(&CheckpointSpec::V2(config)));
+    if declarative && inline {
+        assert!(result.unwrap_err().to_string().contains("require sidecars"));
+        assert!(!hint_path.to_file_path().unwrap().exists());
+    } else {
+        assert_eq!(result?.0, CheckpointWriteResult::Written);
+        let hint: LastCheckpointHint =
+            serde_json::from_slice(&std::fs::read(hint_path.to_file_path().unwrap())?)?;
+        assert_eq!(hint.v2_checkpoint.is_some(), declarative);
+    }
+    Ok(())
+}
+
+struct FailingCheckpointExecutor {
+    inner: Arc<dyn PlanExecutor>,
+    failure: &'static str,
+}
+
+impl PlanExecutor for FailingCheckpointExecutor {
+    fn execute_op(&self, op: Operation) -> KernelResult<PlanResult> {
+        match op {
+            Operation::QueryPlan(plan) => {
+                let result = self.inner.execute_op(Operation::QueryPlan(plan))?;
+                let error = match self.failure {
+                    "late" => Some(KernelError::generic("late checkpoint result error")),
+                    "data_exists" => Some(KernelError::Backtraced {
+                        source: Box::new(KernelError::FileAlreadyExists("checkpoint".into())),
+                        backtrace: Box::new(std::backtrace::Backtrace::force_capture()),
+                    }),
+                    _ => None,
+                };
+                Ok(PlanResult::Data(Box::new(
+                    result.into_data()?.chain(error.map(Err)),
+                )))
+            }
+            Operation::IoOperation(IoOperation::WriteBytes { .. }) => match self.failure {
+                "hint_exists" => Err(KernelError::FileAlreadyExists("hint publication".into())),
+                "unit" => Ok(PlanResult::Bytes(Box::new(std::iter::empty()))),
+                _ => Err(KernelError::generic("hint publication failed")),
+            },
+            other => self.inner.execute_op(other),
+        }
+    }
+}
+
+#[rstest]
+#[case::late("late", false)]
+#[case::newer_hint_still_validates("late", true)]
+#[case::newer_hint_skips_publication("hint_io", true)]
+#[case::data_exists("data_exists", false)]
+#[case::hint_io("hint_io", false)]
+#[case::hint_exists("hint_exists", false)]
+#[case::unit("unit", false)]
+fn snapshot_checkpoint_preserves_hint_on_failure_or_newer_hint(
+    #[case] failure: &'static str,
+    #[case] newer_hint: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_dir, snapshot, engine) = checkpoint_table(false, true)?;
+    snapshot.checkpoint(&engine, None)?;
+    let hint = snapshot
+        .log_segment()
+        .log_root
+        .join("_last_checkpoint")?
+        .to_file_path()
+        .unwrap();
+    let previous = std::fs::read(&hint)?;
+    if !newer_hint {
+        std::fs::write(
+            snapshot
+                .log_segment()
+                .log_root
+                .join("00000000000000000002.json")?
+                .to_file_path()
+                .unwrap(),
+            json!({"txn":{"appId":"app","version":2}}).to_string(),
+        )?;
+    }
+    let target = Snapshot::builder_for(snapshot.table_root())
+        .at_version(if newer_hint { 0 } else { 2 })
+        .build(&engine)?;
+    let engine = DelegatingEngine::new(Arc::new(engine)).with_plan_executor(Arc::new(
+        FailingCheckpointExecutor {
+            inner: SyncEngine::new().require_plan_executor()?,
+            failure,
+        },
+    ));
+    let result = target.checkpoint(&engine, None);
+    if failure == "data_exists" {
+        let (outcome, unchanged) = result?;
+        assert_eq!(outcome, CheckpointWriteResult::AlreadyExists);
+        assert!(Arc::ptr_eq(&target, &unchanged));
+    } else if newer_hint && failure == "hint_io" {
+        let (outcome, checkpointed) = result?;
+        assert_eq!(outcome, CheckpointWriteResult::Written);
+        assert_eq!(
+            checkpointed.log_segment().checkpoint_version,
+            Some(target.version())
+        );
+    } else {
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains(match failure {
+                "late" => "late checkpoint result error",
+                "hint_exists" | "hint_io" => "hint publication",
+                "unit" => "Unit",
+                _ => unreachable!(),
+            }),
+            "{error}"
+        );
+    }
+    assert_eq!(std::fs::read(hint)?, previous);
     Ok(())
 }
 
