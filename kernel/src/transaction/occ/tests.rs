@@ -903,7 +903,7 @@ fn row_tracking_mark_comes_only_from_live_row_tracking_domain(#[case] configurat
         ],
     )],
     ErrorKind::Generic,
-    "without a readable rowIdHighWaterMark",
+    "domain in the winning commits at versions [7]",
 )]
 #[case::row_tracking_configuration_without_mark(
     vec![(
@@ -915,7 +915,7 @@ fn row_tracking_mark_comes_only_from_live_row_tracking_domain(#[case] configurat
         ],
     )],
     ErrorKind::Generic,
-    "without a readable rowIdHighWaterMark",
+    "domain in the winning commits at versions [7]",
 )]
 #[case::malformed_row_tracking_configuration_of_one_winner(
     vec![
@@ -923,7 +923,15 @@ fn row_tracking_mark_comes_only_from_live_row_tracking_domain(#[case] configurat
         (8, vec![commit_info("WRITE"), domain(ROW_TRACKING_DOMAIN_NAME, "{not json")]),
     ],
     ErrorKind::Generic,
-    "without a readable rowIdHighWaterMark",
+    "domain in the winning commits at versions [8]",
+)]
+#[case::row_tracking_configurations_without_mark_in_two_winners(
+    vec![
+        (7, vec![commit_info("WRITE"), domain(ROW_TRACKING_DOMAIN_NAME, "{}")]),
+        (8, vec![commit_info("WRITE"), domain(ROW_TRACKING_DOMAIN_NAME, "{not json")]),
+    ],
+    ErrorKind::Generic,
+    "domain in the winning commits at versions [7, 8]",
 )]
 #[case::row_tracking_tombstone(
     vec![(7, vec![commit_info("WRITE"), removed_domain(ROW_TRACKING_DOMAIN_NAME)])],

@@ -181,6 +181,9 @@ pub(super) fn ensure_no_manifest_commit(summaries: &[WinnerSummary]) -> KernelRe
 /// readable high-water mark.
 ///
 /// The next attempt needs a row ID high-water mark to continue T's row IDs.
+///
+/// The error lists every winner without a mark. A malformed configuration nulls the marks of all
+/// rows in its batch, and a batch can hold rows of several winners.
 pub(super) fn ensure_row_tracking_marks(summaries: &[WinnerSummary]) -> KernelResult<()> {
     if let Some(summary) = summaries
         .iter()
@@ -191,14 +194,16 @@ pub(super) fn ensure_row_tracking_marks(summaries: &[WinnerSummary]) -> KernelRe
             summary.version
         )));
     }
-    let missing = summaries
+    let versions: Vec<Version> = summaries
         .iter()
-        .any(|summary| summary.writes_row_tracking && summary.row_id_high_water_mark.is_none());
-    if missing {
-        return Err(KernelError::generic(
-            "A winning commit has a `delta.rowTracking` domain without a readable \
-             rowIdHighWaterMark",
-        ));
+        .filter(|summary| summary.writes_row_tracking && summary.row_id_high_water_mark.is_none())
+        .map(|summary| summary.version)
+        .collect();
+    if !versions.is_empty() {
+        return Err(KernelError::generic(format!(
+            "Conflict detection could not read the rowIdHighWaterMark of the `delta.rowTracking` \
+             domain in the winning commits at versions {versions:?}"
+        )));
     }
     Ok(())
 }
