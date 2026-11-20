@@ -11,7 +11,6 @@ use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
-#[cfg(not(feature = "declarative-plans"))]
 use delta_kernel::snapshot::CheckpointWriteResult;
 #[cfg(not(feature = "declarative-plans"))]
 use delta_kernel::table_features::TableFeature;
@@ -22,7 +21,6 @@ use delta_kernel::{
     engine::arrow_data::ArrowEngineData,
     engine::{plans::PlanBasedEngine, sync::plan::SyncPlanExecutor},
     expressions::{ColumnName, lit, null_lit},
-    plans::{Operation, PlanExecutor as _, ir::nodes::FileType},
     schema::StructType,
     struct_patch::ProjectionStructPatchBuilder,
 };
@@ -171,12 +169,14 @@ fn write_checkpoint(
     #[cfg(feature = "declarative-plans")]
     {
         let executor = Arc::new(SyncPlanExecutor::new(None));
-        let planning_engine = PlanBasedEngine::new(Some(engine.clone()), executor.clone());
-        let writer = snapshot.create_checkpoint_writer(&planning_engine)?;
-        let plan = writer.declarative_checkpoint_plan(&planning_engine, FileType::Parquet)?;
-        let bytes = writer
-            .last_checkpoint_bytes_from_result(executor.execute_op(Operation::QueryPlan(plan))?)?;
-        std::fs::write(log.join("_last_checkpoint"), bytes)?;
+        let planning_engine = PlanBasedEngine::new(Some(engine), executor);
+        let (result, checkpointed) = snapshot.checkpoint(&planning_engine, None)?;
+        assert_eq!(result, CheckpointWriteResult::Written);
+        assert_eq!(
+            checkpointed.log_segment().checkpoint_version,
+            Some(snapshot.version())
+        );
+        assert!(log.join("_last_checkpoint").is_file());
         Ok(())
     }
     #[cfg(not(feature = "declarative-plans"))]
