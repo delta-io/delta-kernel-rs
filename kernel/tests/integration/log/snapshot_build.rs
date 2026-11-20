@@ -188,21 +188,31 @@ async fn snapshot_schema_nesting_boundary(
     writer_features: &["deletionVectors", "identityColumns"],
     expected_error: None,
 })]
+#[case::iceberg_native_v4_writer_only(SnapshotLoadProtocolCase {
+    min_reader_version: 3,
+    reader_features: &["deletionVectors"],
+    writer_features: &["deletionVectors", "icebergNativeV4"],
+    expected_error: None,
+})]
+#[case::iceberg_native_v4_dev_writer_only(SnapshotLoadProtocolCase {
+    min_reader_version: 3,
+    reader_features: &["deletionVectors"],
+    writer_features: &["deletionVectors", "icebergNativeV4-dev"],
+    expected_error: None,
+})]
 #[case::future_reader_version(SnapshotLoadProtocolCase {
     min_reader_version: 4,
     reader_features: &[],
     writer_features: &[],
     expected_error: Some("Unsupported minimum reader version 4"),
 })]
-#[cfg_attr(
-    not(feature = "adaptive-metadata-in-dev"),
-    case::adaptive_metadata(SnapshotLoadProtocolCase {
-        min_reader_version: 3,
-        reader_features: &["adaptiveMetadata-preview"],
-        writer_features: &["adaptiveMetadata-preview"],
-        expected_error: Some("Feature 'adaptiveMetadata-preview' is not supported"),
-    })
-)]
+// Adaptive metadata tables load, so a bare declaration fails the feature's requirements instead.
+#[case::adaptive_metadata(SnapshotLoadProtocolCase {
+    min_reader_version: 3,
+    reader_features: &["adaptiveMetadata"],
+    writer_features: &["adaptiveMetadata"],
+    expected_error: Some("Feature 'adaptiveMetadata' requires 'columnMapping' to be enabled"),
+})]
 #[tokio::test]
 async fn snapshot_load_validates_reader_protocol(
     #[case] case: SnapshotLoadProtocolCase,
@@ -253,6 +263,54 @@ async fn snapshot_load_validates_reader_protocol(
         .at_version(0)
         .build(&engine)?;
     assert_eq!(original.version(), 0);
+    Ok(())
+}
+
+#[rstest]
+#[case::iceberg_native_v4("icebergNativeV4")]
+#[case::iceberg_native_v4_dev("icebergNativeV4-dev")]
+#[tokio::test]
+async fn load_only_snapshot_rejects_metadata_reads_and_log_maintenance(
+    #[case] feature: &str,
+) -> delta_kernel::Result<()> {
+    let (store, engine, table_url) = engine_store_setup("load_only_snapshot", None);
+    create_table(
+        table_url.as_str(),
+        schema_ref! { nullable "id": INTEGER },
+        "test_engine",
+        true,
+    )
+    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .commit(&engine)?
+    .unwrap_committed();
+    let commit = json!({
+        "protocol": {
+            "minReaderVersion": 3,
+            "minWriterVersion": 7,
+            "readerFeatures": ["deletionVectors"],
+            "writerFeatures": ["deletionVectors", feature],
+        }
+    });
+    add_commit(table_url.as_str(), store.as_ref(), 1, commit.to_string()).await?;
+    let snapshot = Snapshot::builder_for(table_url.as_str()).build(&engine)?;
+
+    let unsupported = format!("Feature '{feature}' is not supported");
+    let reader = snapshot.reader();
+    assert_result_error_with_message(
+        reader.get_domain_metadata("app.domain", &engine),
+        &unsupported,
+    );
+    assert_result_error_with_message(reader.get_app_id_version("app", &engine), &unsupported);
+    assert_result_error_with_message(reader.get_timestamp(&engine), &unsupported);
+    assert_result_error_with_message(
+        snapshot.publish(&engine, &FileSystemCommitter::new()),
+        &unsupported,
+    );
+    assert_result_error_with_message(snapshot.clone().log_compaction_writer(0, 1), &unsupported);
+    assert_result_error_with_message(
+        snapshot.checkpoint(&engine, None),
+        &format!("{unsupported} for writes"),
+    );
     Ok(())
 }
 

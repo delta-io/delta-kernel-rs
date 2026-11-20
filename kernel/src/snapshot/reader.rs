@@ -272,6 +272,11 @@ impl<'a> SnapshotReader<'a> {
         engine: &dyn Engine,
         operation: impl FnOnce(&Snapshot, &dyn Engine) -> KernelResult<T>,
     ) -> KernelResult<T> {
+        // Log replay ignores the adaptive metadata `checkpoint` action, so these getters could
+        // return stale state for load-only tables.
+        self.snapshot
+            .table_configuration()
+            .ensure_no_load_only_features()?;
         let scoped_engine = self
             .cancellation_token
             .as_ref()
