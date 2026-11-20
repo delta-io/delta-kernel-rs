@@ -339,6 +339,7 @@ void compile_snapshot_hint_abi(void)
     .metadata = metadata,
     .last_checkpoint = &last_checkpoint,
     .crc = &crc,
+    .checkpoint_type = { .tag = NoneFfiSelectedCheckpointType },
   };
   ExternResultHandleExclusiveSnapshotBuilder (*with_snapshot_hint)(
       HandleExclusiveSnapshotBuilder, const FfiSnapshotHint*) =

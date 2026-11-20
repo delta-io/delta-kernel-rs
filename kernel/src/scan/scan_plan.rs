@@ -296,6 +296,7 @@ mod tests {
 
     fn shape(kind: CheckpointKind, parsed_stats: Option<SchemaRef>) -> CheckpointInfo {
         CheckpointInfo {
+            checkpoint_type: crate::checkpoint::SelectedCheckpointType::V2,
             leaf_checkpoint_schema: parquet_read_schema(parsed_stats.as_ref(), None).unwrap(),
             sidecars: if kind == CheckpointKind::Manifest {
                 Arc::from([crate::FileMeta {
