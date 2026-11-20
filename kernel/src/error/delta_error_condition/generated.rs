@@ -28,6 +28,8 @@ pub enum DeltaErrorCondition {
     DeltaPathDoesNotExist,
     /// `DELTA_TRUNCATED_TRANSACTION_LOG` (SQLSTATE `42K03`).
     DeltaTruncatedTransactionLog,
+    /// `DELTA_TXN_LOG_FAILED_INTEGRITY` (SQLSTATE `XXKDS`).
+    DeltaTxnLogFailedIntegrity,
     /// `DELTA_VERSIONS_NOT_CONTIGUOUS` (SQLSTATE `KD00C`).
     DeltaVersionsNotContiguous,
     /// `DELTA_VERSION_INVALID` (SQLSTATE `42815`).
@@ -84,6 +86,12 @@ impl DeltaErrorCondition {
                 sql_state: Some("42K03"),
                 parameter_names: &["path", "version", "logRetentionKey", "logRetention", "checkpointRetentionKey", "checkpointRetention"],
                 message_template: "<path>: Unable to reconstruct state at version <version> as the transaction log has been truncated due to manual deletion or the log retention policy (<logRetentionKey>=<logRetention>) and checkpoint retention policy (<checkpointRetentionKey>=<checkpointRetention>)",
+            },
+            Self::DeltaTxnLogFailedIntegrity => ConditionMetadata {
+                name: "DELTA_TXN_LOG_FAILED_INTEGRITY",
+                sql_state: Some("XXKDS"),
+                parameter_names: &["version", "mismatchStringOpt"],
+                message_template: "The transaction log has failed integrity checks. Failed verification at version <version> of:\n<mismatchStringOpt>",
             },
             Self::DeltaVersionsNotContiguous => ConditionMetadata {
                 name: "DELTA_VERSIONS_NOT_CONTIGUOUS",
