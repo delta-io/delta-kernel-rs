@@ -101,6 +101,13 @@ In-Commit Timestamp is unavailable from retained CRC state. Domain-metadata and 
 FFI reads also use an unscoped reader, preserving the engine's cancellation and timeout behavior.
 The C API signatures do not expose reader state or a cancellation token.
 
+`snapshot_data_files_to_delete_plan(snapshot, engine, mode, now_ms, retention_ms, anchor_version)`
+returns `OptionalValue<KernelOwnedBytes>` containing a serialized `Operation::QueryPlan`, or `None`
+when the candidate source is empty. `Full` requires `anchor_version=None`; `Lite` accepts an
+optional anchor version. An anchor after V_cut produces an empty result. The caller frees returned
+bytes with `free_kernel_bytes`, executes the plan, applies connector-specific filtering and
+protection, and owns deletion. The FFI does not delete files.
+
 Domain-metadata reads live in `ffi/src/domain_metadata.rs`: `get_domain_metadata` /
 `visit_domain_metadata` for user domains, and `visit_clustering_columns`, which reports one
 descriptor per clustering column -- logical name, physical name (what per-file stats are keyed on),

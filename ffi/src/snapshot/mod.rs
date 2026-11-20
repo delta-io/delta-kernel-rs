@@ -1,6 +1,8 @@
 //! FFI interfaces for snapshot construction and metadata access.
 
 mod builder;
+#[cfg(feature = "declarative-plans")]
+mod data_files_to_delete;
 pub mod hint;
 
 pub use builder::{
@@ -10,3 +12,5 @@ pub use builder::{
     snapshot_builder_with_log_tail, snapshot_builder_with_max_catalog_version,
     snapshot_builder_with_version,
 };
+#[cfg(feature = "declarative-plans")]
+pub use data_files_to_delete::{FfiDataFilesToDeleteMode, snapshot_data_files_to_delete_plan};

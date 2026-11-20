@@ -155,6 +155,19 @@ pub enum UnaryExpressionOp {
         /// Encode timestamps with all six microsecond digits instead of three.
         full_precision_timestamps: bool,
     },
+    /// Resolve a file path against its table root.
+    ///
+    /// The input is a struct containing `table_root: STRING` and `path: STRING`. The result is a
+    /// struct with `location: STRING` (the absolute URL) and `relative_path: STRING`, nullable when
+    /// the absolute path is outside `table_root`. Relative Delta action paths are resolved against
+    /// the root; absolute URLs are preserved.
+    ResolveFilePath,
+    /// Resolve a deletion-vector descriptor against its table root.
+    ///
+    /// The input is a struct containing `table_root: STRING` and
+    /// `deletionVector: DeletionVectorDescriptor`. The result is the same path-info struct as
+    /// [`Self::ResolveFilePath`]. Inline or null descriptors produce null path fields.
+    DeletionVectorPath,
 }
 
 impl UnaryExpressionOp {
@@ -1255,6 +1268,8 @@ impl Display for UnaryExpressionOp {
         use UnaryExpressionOp::*;
         match self {
             ToJson { .. } => write!(f, "TO_JSON"),
+            ResolveFilePath => write!(f, "RESOLVE_FILE_PATH"),
+            DeletionVectorPath => write!(f, "DELETION_VECTOR_PATH"),
         }
     }
 }

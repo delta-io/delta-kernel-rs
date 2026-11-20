@@ -85,6 +85,8 @@ mod builder;
 mod cancellation_tests;
 #[cfg(test)]
 mod crc_write_tests;
+#[cfg(feature = "declarative-plans")]
+mod data_files_to_delete;
 mod hint;
 mod incremental;
 mod reader;
@@ -94,6 +96,8 @@ mod tracing_tests;
 #[doc(hidden)]
 pub use builder::{FromSnapshot, FromTableRoot};
 pub use builder::{IncrementalReplay, IncrementalSnapshotBuilder, SnapshotBuilder};
+#[cfg(feature = "declarative-plans")]
+pub use data_files_to_delete::{DataFilesToDeleteMode, DataFilesToDeleteOptions};
 #[allow(unused_imports)]
 #[internal_api]
 pub(crate) use hint::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness};

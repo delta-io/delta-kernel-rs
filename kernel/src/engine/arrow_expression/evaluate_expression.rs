@@ -6,8 +6,10 @@ use std::sync::Arc;
 use chrono::Utc;
 use itertools::Itertools;
 use tracing::warn;
+use url::Url;
 
 use super::timestamp_timezone::TimestampTimezone;
+use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
     self as arrow_array, Array, ArrayBuilder, ArrayData, ArrayRef, AsArray, BooleanArray, Datum,
@@ -44,7 +46,8 @@ use crate::expressions::{
     OpaqueExpression, OpaquePredicate, Predicate, Scalar, UnaryExpression, UnaryExpressionOp,
     UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
-use crate::schema::{DataType, PrimitiveType, StructField, StructType};
+use crate::path_encoding::{scheme_len, uri_decode_path, uri_encode_path};
+use crate::schema::{DataType, PrimitiveType, StructField, StructType, ToSchema as _};
 
 #[internal_api]
 pub(crate) trait ProvidesColumnByName {
@@ -282,6 +285,200 @@ fn evaluate_struct_patch_expression(
     Ok(Arc::new(data))
 }
 
+fn evaluate_path_info_expression(
+    expr: &Expression,
+    batch: &RecordBatch,
+    output_schema: &StructType,
+    deletion_vector: bool,
+) -> KernelResult<ArrayRef> {
+    let output_fields: Vec<_> = output_schema.fields().collect();
+    if output_fields.len() != 2
+        || output_fields[0].name() != "location"
+        || output_fields[1].name() != "relative_path"
+        || output_fields
+            .iter()
+            .any(|field| field.data_type() != &DataType::STRING)
+    {
+        return Err(KernelError::schema(
+            "Path resolution expression requires {location, relative_path} STRING output",
+        ));
+    }
+
+    let payload_field = if deletion_vector {
+        StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema())
+    } else {
+        StructField::nullable("path", DataType::STRING)
+    };
+    let input_schema = StructType::try_new([
+        StructField::not_null("table_root", DataType::STRING),
+        payload_field,
+    ])?;
+    let input_type = DataType::Struct(Box::new(input_schema));
+    let input = evaluate_expression(expr, batch, Some(&input_type))?;
+    let input = input
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| KernelError::schema("Path resolution input must be a struct"))?;
+    let root_array = input
+        .column_by_name("table_root")
+        .and_then(|array| array.as_any().downcast_ref::<StringArray>())
+        .ok_or_else(|| KernelError::schema("Path resolution input is missing table_root"))?;
+
+    let mut locations = Vec::with_capacity(input.len());
+    let mut relative_paths = Vec::with_capacity(input.len());
+    if deletion_vector {
+        let descriptors = input
+            .column_by_name("deletionVector")
+            .and_then(|array| array.as_any().downcast_ref::<StructArray>())
+            .ok_or_else(|| {
+                KernelError::schema("DeletionVectorPath input is missing a descriptor struct")
+            })?;
+        for row in 0..input.len() {
+            if input.is_null(row) || root_array.is_null(row) || descriptors.is_null(row) {
+                locations.push(None);
+                relative_paths.push(None);
+                continue;
+            }
+            let root = parse_table_root(root_array.value(row))?;
+            let descriptor = deletion_vector_descriptor_at(descriptors, row)?;
+            let location = descriptor.absolute_path(&root)?;
+            let path_info = location
+                .map(|location| path_info_from_url(&root, location))
+                .transpose()?;
+            match path_info {
+                Some((location, relative_path)) => {
+                    locations.push(Some(location));
+                    relative_paths.push(relative_path);
+                }
+                None => {
+                    locations.push(None);
+                    relative_paths.push(None);
+                }
+            }
+        }
+    } else {
+        let paths = input
+            .column_by_name("path")
+            .and_then(|array| array.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| KernelError::schema("ResolveFilePath input is missing path"))?;
+        for row in 0..input.len() {
+            if input.is_null(row) || root_array.is_null(row) || paths.is_null(row) {
+                locations.push(None);
+                relative_paths.push(None);
+                continue;
+            }
+            let root = parse_table_root(root_array.value(row))?;
+            let location = resolve_delta_file_path(paths.value(row), &root)?;
+            let (location, relative_path) = path_info_from_url(&root, location)?;
+            locations.push(Some(location));
+            relative_paths.push(relative_path);
+        }
+    }
+
+    let arrow_schema: ArrowSchema = output_schema.try_into_arrow()?;
+    let locations = Arc::new(StringArray::from(locations)) as ArrayRef;
+    let relative_paths = Arc::new(StringArray::from(relative_paths)) as ArrayRef;
+    let path_info = StructArray::try_new(
+        arrow_schema.fields().clone(),
+        vec![locations, relative_paths],
+        None,
+    )?;
+    validate_array_type(
+        Arc::new(path_info),
+        Some(&DataType::Struct(Box::new(output_schema.clone()))),
+    )
+}
+
+fn deletion_vector_descriptor_at(
+    descriptor: &StructArray,
+    row: usize,
+) -> KernelResult<DeletionVectorDescriptor> {
+    let string_field = |name: &str| -> KernelResult<&StringArray> {
+        descriptor
+            .column_by_name(name)
+            .and_then(|array| array.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| KernelError::schema(format!("deletion vector is missing {name}")))
+    };
+    let int32_field = |name: &str| -> KernelResult<&arrow_array::Int32Array> {
+        descriptor
+            .column_by_name(name)
+            .and_then(|array| array.as_any().downcast_ref::<arrow_array::Int32Array>())
+            .ok_or_else(|| KernelError::schema(format!("deletion vector is missing {name}")))
+    };
+    let int64_field = |name: &str| -> KernelResult<&arrow_array::Int64Array> {
+        descriptor
+            .column_by_name(name)
+            .and_then(|array| array.as_any().downcast_ref::<arrow_array::Int64Array>())
+            .ok_or_else(|| KernelError::schema(format!("deletion vector is missing {name}")))
+    };
+
+    let storage_type = string_field("storageType")?
+        .value(row)
+        .parse::<DeletionVectorStorageType>()?;
+    let path = string_field("pathOrInlineDv")?.value(row);
+    let offset = int32_field("offset")?;
+    let offset = (!offset.is_null(row)).then(|| offset.value(row));
+    let size_in_bytes = int32_field("sizeInBytes")?.value(row);
+    let cardinality = int64_field("cardinality")?.value(row);
+    DeletionVectorDescriptor::try_new(storage_type, path, offset, size_in_bytes, cardinality)
+}
+
+fn parse_table_root(root: &str) -> KernelResult<Url> {
+    let root = Url::parse(root).map_err(|error| KernelError::generic(error.to_string()))?;
+    if root.cannot_be_a_base()
+        || !root.path().ends_with('/')
+        || root.query().is_some()
+        || root.fragment().is_some()
+    {
+        return Err(KernelError::generic(
+            "path resolution requires a hierarchical table-root URL ending in `/`",
+        ));
+    }
+    Ok(root)
+}
+
+fn resolve_delta_file_path(path: &str, root: &Url) -> KernelResult<Url> {
+    let location = if scheme_len(path).is_some() {
+        Url::parse(path).map_err(|error| KernelError::generic(error.to_string()))?
+    } else {
+        let decoded = uri_decode_path(path)
+            .ok_or_else(|| KernelError::generic("Delta action path is not valid UTF-8"))?;
+        if decoded.starts_with('/') {
+            return Err(KernelError::generic(format!(
+                "Delta action path must be table-relative: {path}"
+            )));
+        }
+        let encoded = uri_encode_path(&decoded);
+        root.join(encoded.as_ref())
+            .map_err(|error| KernelError::generic(error.to_string()))?
+    };
+    if location.query().is_some() || location.fragment().is_some() {
+        return Err(KernelError::generic(format!(
+            "Delta action path must not contain a query or fragment: {path}"
+        )));
+    }
+    Ok(location)
+}
+
+fn path_info_from_url(root: &Url, location: Url) -> KernelResult<(String, Option<String>)> {
+    let same_authority = root.scheme() == location.scheme()
+        && root.username() == location.username()
+        && root.password() == location.password()
+        && root.host_str() == location.host_str()
+        && root.port_or_known_default() == location.port_or_known_default();
+    let relative = same_authority
+        .then(|| location.path().strip_prefix(root.path()))
+        .flatten();
+    let relative_path = relative
+        .map(|relative| {
+            let decoded = uri_decode_path(relative)
+                .ok_or_else(|| KernelError::generic("relative URL path is not valid UTF-8"))?;
+            Ok::<String, KernelError>(uri_encode_path(&decoded).into_owned())
+        })
+        .transpose()?;
+    Ok((location.to_string(), relative_path))
+}
+
 /// Evaluates a kernel expression over a record batch
 pub fn evaluate_expression(
     expression: &Expression,
@@ -338,6 +535,29 @@ pub fn evaluate_expression(
                 "{op} operator requires STRING output, but got {data_type:?}"
             ))),
         },
+        (
+            Unary(UnaryExpression {
+                op: ResolveFilePath,
+                expr,
+            }),
+            Some(DataType::Struct(output_schema)),
+        ) => evaluate_path_info_expression(expr, batch, output_schema, false),
+        (
+            Unary(UnaryExpression {
+                op: DeletionVectorPath,
+                expr,
+            }),
+            Some(DataType::Struct(output_schema)),
+        ) => evaluate_path_info_expression(expr, batch, output_schema, true),
+        (
+            Unary(UnaryExpression {
+                op: ResolveFilePath | DeletionVectorPath,
+                ..
+            }),
+            result_type,
+        ) => Err(KernelError::generic(format!(
+            "Path resolution requires a struct output schema, but got {result_type:?}"
+        ))),
         (Binary(BinaryExpression { op, left, right }), _) => {
             let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
             let right_arr = evaluate_expression(right.as_ref(), batch, None)?;

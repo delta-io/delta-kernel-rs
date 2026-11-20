@@ -209,6 +209,8 @@ pub use log_compaction::{LogCompactionWriter, should_compact};
 #[cfg(feature = "declarative-plans")]
 pub use plans::{IoOperation, Operation, PlanBuilder, PlanExecutor, PlanResult};
 use schema::StructField;
+#[cfg(feature = "declarative-plans")]
+pub use snapshot::{DataFilesToDeleteMode, DataFilesToDeleteOptions};
 pub use snapshot::{Snapshot, SnapshotReader, SnapshotRef};
 
 // `test-utils` exposes the test engines without requiring Arrow or declarative plans.

@@ -93,6 +93,8 @@ pub use snapshot::{
     snapshot_builder_with_log_tail, snapshot_builder_with_max_catalog_version,
     snapshot_builder_with_version,
 };
+#[cfg(feature = "declarative-plans")]
+pub use snapshot::{FfiDataFilesToDeleteMode, snapshot_data_files_to_delete_plan};
 
 #[cfg(test)]
 mod ffi_test_utils;

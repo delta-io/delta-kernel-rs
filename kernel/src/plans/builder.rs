@@ -43,9 +43,9 @@ use delta_kernel_derive::internal_api;
 use url::Url;
 
 use super::ir::nodes::{
-    Aggregate, AggregateBuilder, DynamicScan, FILE_META_SCHEMA, FileType, Filter, Operator,
-    PrefixSum, Project, RelationRef, ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values,
-    WriteJson,
+    Aggregate, AggregateBuilder, DynamicScan, FILE_META_SCHEMA, FileType, Filter,
+    LIST_FILES_SCHEMA, ListFiles, Operator, PrefixSum, Project, RelationRef, ScanFile, ScanJson,
+    ScanParquet, SemiJoin, UnionAll, Values, WriteJson,
 };
 use super::ir::plan::{Plan, PlanNode};
 use crate::expressions::{ColumnName, Expression, ExpressionRef, PredicateRef, Scalar, StructData};
@@ -133,6 +133,29 @@ impl PlanBuilder {
         schema: impl Into<SchemaRef>,
     ) -> KernelResult<Self> {
         Self::scan_source(FileType::Json, files, file_constant_columns, schema)
+    }
+
+    /// Recursively lists files beneath a table-root directory URL.
+    ///
+    /// The engine performs the listing and emits the fixed [`LIST_FILES_SCHEMA`]. The root URL must
+    /// be hierarchical and end in `/`. The source is present even when the directory is empty; its
+    /// executor returns zero rows in that case.
+    pub fn list_files(base_url: Url) -> KernelResult<Self> {
+        if base_url.cannot_be_a_base()
+            || !base_url.path().ends_with('/')
+            || base_url.query().is_some()
+            || base_url.fragment().is_some()
+        {
+            return Err(KernelError::generic(
+                "list_files base_url must be a hierarchical directory URL ending in `/`",
+            ));
+        }
+        let schema = Arc::clone(&LIST_FILES_SCHEMA);
+        Ok(Self::present(
+            Arc::clone(&schema),
+            Operator::ListFiles(ListFiles { base_url, schema }),
+            vec![],
+        ))
     }
 
     /// Shared body of [`Self::scan_parquet`] / [`Self::scan_json`]. Normalizes and validates the
@@ -859,6 +882,36 @@ mod tests {
         let src = scan(id_schema());
         assert_eq!(src.schema(), &id_schema());
         assert_plan(src, &[(&[], "scan_parquet")]);
+    }
+
+    /// `list_files` records the root and declared schema on a single source node.
+    #[test]
+    fn list_files_builds_single_source_node() {
+        let base_url = url::Url::parse("memory:///table/").unwrap();
+        let source = PlanBuilder::list_files(base_url.clone()).unwrap();
+        assert_eq!(source.schema(), &*LIST_FILES_SCHEMA);
+        let plan = assert_plan(source, &[(&[], "list_files")]);
+        let Operator::ListFiles(list_files) = &plan.nodes[0].op else {
+            panic!("expected ListFiles");
+        };
+        assert_eq!(list_files.base_url, base_url);
+        assert_eq!(list_files.schema, *LIST_FILES_SCHEMA);
+    }
+
+    #[test]
+    fn list_files_requires_a_hierarchical_directory_url() {
+        for invalid_url in [
+            "memory:///table",
+            "mailto:user@example.com",
+            "memory:///table/?query=1",
+            "memory:///table/#fragment",
+        ] {
+            let url = url::Url::parse(invalid_url).unwrap();
+            assert_result_error_with_message(
+                PlanBuilder::list_files(url),
+                "list_files base_url must be a hierarchical directory URL ending in `/`",
+            );
+        }
     }
 
     /// `relation_source` records the handle's id and schema and builds to a single source node.

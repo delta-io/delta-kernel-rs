@@ -19,8 +19,8 @@ use crate::expressions::{
     VariadicExpressionOp,
 };
 use crate::plans::ir::nodes::{
-    Agg, Aggregate, DynamicScan, FileType, Filter, Operator, PrefixSum, Project, RelationRef,
-    ScanFile, ScanJson, ScanParquet, SemiJoin, Values, WriteJson,
+    Agg, Aggregate, DynamicScan, FileType, Filter, ListFiles, Operator, PrefixSum, Project,
+    RelationRef, ScanFile, ScanJson, ScanParquet, SemiJoin, Values, WriteJson,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation};
@@ -148,6 +148,7 @@ impl From<&Operator> for proto_plan::Operator {
         let op = match op {
             Operator::ScanParquet(n) => Op::ScanParquet(n.into()),
             Operator::ScanJson(n) => Op::ScanJson(n.into()),
+            Operator::ListFiles(n) => Op::ListFiles(n.into()),
             Operator::Values(n) => Op::Values(n.into()),
             Operator::RelationSource(n) => Op::RelationSource(n.into()),
             Operator::Project(n) => Op::Project(n.into()),
@@ -187,6 +188,15 @@ impl From<&ScanJson> for proto_plan::ScanJsonNode {
         proto_plan::ScanJsonNode {
             files: convert_vec(&node.files),
             file_constant_columns: node.file_constant_columns.clone(),
+            schema: Some(node.schema.as_ref().into()),
+        }
+    }
+}
+
+impl From<&ListFiles> for proto_plan::ListFilesNode {
+    fn from(node: &ListFiles) -> Self {
+        proto_plan::ListFilesNode {
+            base_url: node.base_url.to_string(),
             schema: Some(node.schema.as_ref().into()),
         }
     }
@@ -419,6 +429,7 @@ impl From<&UnaryExpression> for proto_expr::UnaryExpression {
                 UnaryExpressionOp::ToJson {
                     full_precision_timestamps,
                 } => full_precision_timestamps,
+                UnaryExpressionOp::ResolveFilePath | UnaryExpressionOp::DeletionVectorPath => false,
             },
         }
     }
@@ -547,6 +558,10 @@ impl From<UnaryExpressionOp> for proto_expr::UnaryExpressionOp {
     fn from(op: UnaryExpressionOp) -> Self {
         match op {
             UnaryExpressionOp::ToJson { .. } => proto_expr::UnaryExpressionOp::ToJson,
+            UnaryExpressionOp::ResolveFilePath => proto_expr::UnaryExpressionOp::ResolveFilePath,
+            UnaryExpressionOp::DeletionVectorPath => {
+                proto_expr::UnaryExpressionOp::DeletionVectorPath
+            }
         }
     }
 }
@@ -1105,8 +1120,9 @@ mod tests {
         IndirectDataSkippingPredicateEvaluator,
     };
     use crate::plans::ir::nodes::{
-        Agg, Aggregate, DynamicScan, FileType, Filter, Operator, PrefixSum, Project, RelationRef,
-        ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values, WriteJson,
+        Agg, Aggregate, DynamicScan, FileType, Filter, LIST_FILES_SCHEMA, ListFiles, Operator,
+        PrefixSum, Project, RelationRef, ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll,
+        Values, WriteJson,
     };
     use crate::plans::ir::plan::{Plan, PlanNode};
     use crate::plans::proto::{
@@ -1417,6 +1433,13 @@ mod tests {
         }),
         "scan_json"
     )]
+    #[case(
+        Operator::ListFiles(ListFiles {
+            base_url: Url::parse("memory:///table/").unwrap(),
+            schema: (*LIST_FILES_SCHEMA).clone(),
+        }),
+        "list_files"
+    )]
     #[case(Operator::Values(Values { schema: sample_schema(), rows: vec![] }), "values")]
     #[case(
         Operator::RelationSource(RelationRef::new("relation-7", sample_schema())),
@@ -1473,6 +1496,7 @@ mod tests {
         let kind = match proto_plan::Operator::from(&op).op.unwrap() {
             Op::ScanParquet(_) => "scan_parquet",
             Op::ScanJson(_) => "scan_json",
+            Op::ListFiles(_) => "list_files",
             Op::Values(_) => "values",
             Op::RelationSource(_) => "relation_source",
             Op::Project(_) => "project",
@@ -1540,6 +1564,17 @@ mod tests {
         assert_eq!(proto.files.len(), 1);
         assert_eq!(proto.file_constant_columns.len(), 1);
         assert!(proto.schema.is_some());
+    }
+
+    #[test]
+    fn from_list_files() {
+        let node = ListFiles {
+            base_url: Url::parse("memory:///table/").unwrap(),
+            schema: (*LIST_FILES_SCHEMA).clone(),
+        };
+        let proto = proto_plan::ListFilesNode::from(&node);
+        assert_eq!(proto.base_url, node.base_url.as_str());
+        assert_eq!(proto.schema, Some(node.schema.as_ref().into()));
     }
 
     #[test]
@@ -2011,6 +2046,14 @@ mod tests {
 
     #[rstest]
     #[case(UnaryExpressionOp::TO_JSON, proto_expr::UnaryExpressionOp::ToJson)]
+    #[case(
+        UnaryExpressionOp::ResolveFilePath,
+        proto_expr::UnaryExpressionOp::ResolveFilePath
+    )]
+    #[case(
+        UnaryExpressionOp::DeletionVectorPath,
+        proto_expr::UnaryExpressionOp::DeletionVectorPath
+    )]
     fn from_unary_expression_op(
         #[case] op: UnaryExpressionOp,
         #[case] expected: proto_expr::UnaryExpressionOp,
