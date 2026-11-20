@@ -121,7 +121,7 @@ fn execute_rows<T: TryFromStructRows>(batches: Vec<KernelResult<RecordBatch>>) -
     let schema = batches
         .iter()
         .find_map(|batch| batch.as_ref().ok())
-        .map(|batch| {
+        .map(|batch| -> KernelResult<SchemaRef> {
             let schema: StructType = batch.schema().as_ref().try_into_kernel()?;
             Ok(Arc::new(schema))
         })
