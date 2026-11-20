@@ -429,6 +429,7 @@ impl From<&UnaryExpression> for proto_expr::UnaryExpression {
                 UnaryExpressionOp::ToJson {
                     full_precision_timestamps,
                 } => full_precision_timestamps,
+                UnaryExpressionOp::DeletionVectorPath => false,
             },
         }
     }

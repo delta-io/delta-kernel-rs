@@ -325,7 +325,7 @@ impl SyncPlanExecutor {
     fn eval_list_files(&self, list_files: ListFiles) -> KernelResult<Vec<RecordBatch>> {
         let metas: Vec<FileMeta> = self
             .storage
-            .list_from(&list_files.base_url)?
+            .list_from(&list_files.base_url, None)?
             .collect::<KernelResult<_>>()?;
         let rows = metas
             .into_iter()
