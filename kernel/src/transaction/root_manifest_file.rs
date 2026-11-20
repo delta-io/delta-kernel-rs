@@ -298,8 +298,8 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::schema::schema_ref;
     use crate::snapshot::Snapshot;
-    use crate::transaction::UpdateTableOperation;
     use crate::transaction::create_table::create_table;
+    use crate::transaction::{Transaction, UpdateTableOperation};
     use crate::unit_test_utils::adaptive_metadata_fixtures::{
         adaptive_metadata_protocol_and_metadata, domain, domain_metadata_line,
         minimal_checkpoint_action, setup_table, txn_line, write_commit,
@@ -449,16 +449,13 @@ mod tests {
         )?)
     }
 
-    /// Commits `txns` and `domains` in one transaction on the latest snapshot, if there are any.
-    fn commit_transaction(
+    /// A write transaction on the latest snapshot that sets `txns` and `domains`.
+    fn transaction(
         engine: &SyncEngine,
         table_root: &Url,
         txns: &[SetTransaction],
         domains: &[DomainMetadata],
-    ) -> Result<()> {
-        if txns.is_empty() && domains.is_empty() {
-            return Ok(());
-        }
+    ) -> Result<Transaction> {
         let snapshot = Snapshot::builder_for(table_root.clone()).build(engine)?;
         let mut txn = snapshot
             .update_table(UpdateTableOperation::Write, "test", true)
@@ -474,7 +471,22 @@ mod tests {
                 txn.with_domain_metadata(name, dm.configuration().to_string())
             };
         }
-        txn.commit(engine)?.unwrap_committed();
+        Ok(txn)
+    }
+
+    /// Commits `txns` and `domains` in one transaction on the latest snapshot, if there are any.
+    fn commit_transaction(
+        engine: &SyncEngine,
+        table_root: &Url,
+        txns: &[SetTransaction],
+        domains: &[DomainMetadata],
+    ) -> Result<()> {
+        if txns.is_empty() && domains.is_empty() {
+            return Ok(());
+        }
+        transaction(engine, table_root, txns, domains)?
+            .commit(engine)?
+            .unwrap_committed();
         Ok(())
     }
 
@@ -1336,25 +1348,24 @@ mod tests {
             "txn.parquet",
             [txn("kept", 1)],
         )];
-        let kept_domain = [domain("kept", "1")];
         existing.domain_metadata_sidecars = vec![write_domain_metadata_sidecar(
             &engine,
             &table_root,
             "domains.parquet",
-            kept_domain,
+            [domain("kept", "1")],
         )];
         write_manifest_commit(&engine, &table_root, 1, existing.clone())?;
 
         let root_manifest = manifest_file(&format!("{table_root}metadata/root-v2.parquet"), 1024)?;
-        Snapshot::builder_for(table_root.clone())
-            .build(&engine)?
-            .update_table(UpdateTableOperation::Write, "test", true)
-            .build(&engine, Box::new(FileSystemCommitter::new()))?
-            .with_transaction_id("new".to_string(), 2)
-            .with_domain_metadata("new".to_string(), "2".to_string())
-            .with_root_manifest_file(root_manifest)?
-            .commit(&engine)?
-            .unwrap_committed();
+        transaction(
+            &engine,
+            &table_root,
+            &[txn("new", 2)],
+            &[domain("new", "2")],
+        )?
+        .with_root_manifest_file(root_manifest)?
+        .commit(&engine)?
+        .unwrap_committed();
 
         let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
         let checkpoint = snapshot
