@@ -16,6 +16,8 @@ use delta_kernel::{KernelResult, Result, SnapshotRef};
 use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel_default_engine::storage::store_from_url_opts;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 use url::Url;
@@ -140,17 +142,26 @@ where
 
 /// Initialize logging from RUST_LOG using the supplied options.
 ///
-/// Returns success without installing a subscriber when `args.no_log` is set.
+/// Returns success without installing a subscriber when `args.no_log` is set. When
+/// `args.log_metrics` is set and RUST_LOG has no valid directives, logs at INFO so the metrics are
+/// visible.
 ///
 /// # Errors
 /// Returns an error if a global subscriber or logger is already installed.
-pub fn init_logging(args: &LoggingArgs) -> DeltaResult<()> {
+pub fn init_logging(args: &LoggingArgs) -> KernelResult<()> {
     if args.no_log {
         return Ok(());
     }
     let subscriber = tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr));
-    let filter = tracing_subscriber::EnvFilter::from_default_env();
+    let default_level = if args.log_metrics {
+        LevelFilter::INFO
+    } else {
+        LevelFilter::ERROR
+    };
+    let filter = EnvFilter::builder()
+        .with_default_directive(default_level.into())
+        .from_env_lossy();
 
     let result = if args.log_metrics {
         subscriber

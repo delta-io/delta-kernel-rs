@@ -8,6 +8,7 @@ use rstest::rstest;
 #[case::unset_filter(&[], None, false, false)]
 #[case::disabled(&["--no-log"], Some("trace"), false, false)]
 #[case::metrics(&["--log-metrics"], Some("info"), true, true)]
+#[case::metrics_unset_filter(&["--log-metrics"], None, true, true)]
 #[case::filtered_metrics(&["--log-metrics"], Some("off"), false, false)]
 fn logging_options_preserve_table_output(
     #[case] args: &[&str],
