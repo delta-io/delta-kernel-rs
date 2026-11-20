@@ -1448,6 +1448,60 @@ mod tests {
         }
     }
 
+    // Each commit after version 0 sets the shared `app` / `d` and its own per-version entries, so
+    // the delta shows both which commits were replayed and that the newest one wins.
+    #[tokio::test]
+    async fn build_crc_delta_from_base_replays_only_commits_after_the_base() {
+        let store = Arc::new(InMemory::new());
+        let engine = SyncEngine::new_with_store(store.clone());
+        let root = "memory:///t/";
+        add_commit(root, store.as_ref(), 0, r#"
+{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":[],"writerFeatures":["domainMetadata"]}}
+{"metaData":{"id":"id-0","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{},"createdTime":0}}
+"#.to_string()).await.unwrap();
+        for version in 1..=3 {
+            let actions = [
+                format!(r#"{{"txn":{{"appId":"app","version":{version}}}}}"#),
+                format!(r#"{{"txn":{{"appId":"app-v{version}","version":{version}}}}}"#),
+                format!(
+                    r#"{{"domainMetadata":{{"domain":"d","configuration":"{version}","removed":false}}}}"#
+                ),
+                format!(
+                    r#"{{"domainMetadata":{{"domain":"d-v{version}","configuration":"{version}","removed":false}}}}"#
+                ),
+            ];
+            add_commit(root, store.as_ref(), version, actions.join("\n"))
+                .await
+                .unwrap();
+        }
+        let log_root = url::Url::parse(root).unwrap().join("_delta_log/").unwrap();
+        let segment = LogSegment::for_snapshot_impl(
+            engine.storage_handler().as_ref(),
+            log_root,
+            vec![],
+            None,
+            Some(3),
+        )
+        .unwrap();
+
+        let delta = segment.build_crc_delta_from_base(&engine, 1, None).unwrap();
+
+        let txns: HashMap<_, _> = (delta.set_transactions.iter())
+            .map(|(app_id, txn)| (app_id.as_str(), txn.version))
+            .collect();
+        assert_eq!(
+            txns,
+            HashMap::from([("app", 3), ("app-v2", 2), ("app-v3", 3)])
+        );
+        let domains: HashMap<_, _> = (delta.domain_metadata.iter())
+            .map(|(domain, dm)| (domain.as_str(), dm.configuration()))
+            .collect();
+        assert_eq!(
+            domains,
+            HashMap::from([("d", "3"), ("d-v2", "2"), ("d-v3", "3")])
+        );
+    }
+
     #[tokio::test]
     async fn build_crc_from_version_zero_no_checkpoint_first_commit_nonzero_errors() {
         let store = Arc::new(InMemory::new());

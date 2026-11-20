@@ -392,8 +392,9 @@ pub(crate) mod adaptive_metadata_fixtures {
 
     use super::*;
     use crate::actions::{
-        CheckpointAction, ContentRoot, DomainMetadata, LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA,
-        LastManifestCommit, Sidecar,
+        CheckpointAction, ContentRoot, DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA,
+        LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA, LOG_TXN_SCHEMA, LastManifestCommit,
+        SetTransaction, Sidecar,
     };
     use crate::arrow::array::{Array as _, AsArray as _};
     use crate::content_tree::ContentTreeNodeEntry;
@@ -529,6 +530,29 @@ pub(crate) mod adaptive_metadata_fixtures {
             .write_parquet_file(location, Box::new(iter::once(Ok(data))))
             .unwrap();
         Sidecar::new(name.to_string(), size as i64, 0, None)
+    }
+
+    /// Writes `txns` as the `txn` sidecar `name` of the table at `table_root`.
+    pub(crate) fn write_txn_sidecar(
+        engine: &SyncEngine,
+        table_root: &Url,
+        name: &str,
+        txns: impl IntoIterator<Item = SetTransaction>,
+    ) -> Sidecar {
+        let rows = txns.into_iter().map(Into::into).collect();
+        write_sidecar(engine, table_root, name, LOG_TXN_SCHEMA.clone(), rows)
+    }
+
+    /// Writes `domains` as the `domainMetadata` sidecar `name` of the table at `table_root`.
+    pub(crate) fn write_domain_metadata_sidecar(
+        engine: &SyncEngine,
+        table_root: &Url,
+        name: &str,
+        domains: impl IntoIterator<Item = DomainMetadata>,
+    ) -> Sidecar {
+        let rows = domains.into_iter().map(Into::into).collect();
+        let schema = LOG_DOMAIN_METADATA_SCHEMA.clone();
+        write_sidecar(engine, table_root, name, schema, rows)
     }
 
     /// Creates an empty in-memory table and returns its engine and table-root URL.
