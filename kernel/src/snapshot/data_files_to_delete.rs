@@ -56,8 +56,10 @@ static DATA_FILES_TO_DELETE_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 pub enum DataFilesToDeleteMode {
     /// Recursively list the table root and retain old, unprotected files.
     Full,
-    /// Derive candidates from log commits after `anchor_version` and no newer than the retention
-    /// cutoff. `None` means that no LITE anchor has been recorded yet.
+    /// Derive candidates from commits in `(anchor_version, V_cut]`. `None` means to start at
+    /// version 0. The anchor is exclusive. Because CDC files at `V_cut` remain reachable, a
+    /// connector persisting LITE progress must leave its anchor below `V_cut` until a later run
+    /// advances the cutoff past it, or those CDC files will be skipped.
     Lite { anchor_version: Option<Version> },
 }
 
@@ -94,16 +96,22 @@ impl Snapshot {
     /// from Remove, deletion-vector, and CDC actions after the supplied anchor version. The caller
     /// supplies the clock; Kernel never deletes files or tracks live transactions. FULL's mtime
     /// cutoff protects uncommitted files under the assumption that transactions do not outlive the
-    /// retention period. LITE may return absolute paths outside the table root; it does not
-    /// classify shallow-clone references. A present plan has one non-null STRING `path` column;
-    /// `None` denotes an empty LITE candidate range. Connectors must apply their own hidden-path,
-    /// table-kind, clone, and other policy filters before deleting the returned paths.
+    /// retention period. `V_cut` is the latest snapshot-visible version at or before the cutoff;
+    /// catalog-ratified staged commits in the snapshot's log tail count as visible. The caller must
+    /// build a fresh latest snapshot before planning; this method
+    /// rejects explicitly version-pinned snapshots but cannot detect later commits after the
+    /// snapshot was built. For catalog-managed tables, use the latest catalog-ratified log tail.
+    /// LITE may return absolute paths outside the table root; it does not classify shallow-clone
+    /// references. A present plan has one non-null STRING `path` column; `None` denotes an empty
+    /// LITE candidate range. Connectors must apply their own hidden-path, table-kind, clone, and
+    /// other policy filters before deleting the returned paths.
     ///
     /// # Errors
     ///
     /// Returns an error if the engine cannot plan the required metadata scans, if the table has an
     /// unsupported writer feature, if adaptive metadata prevents a complete reachable-file set, or
-    /// if required log history is unavailable.
+    /// if required log history is unavailable. Kernel fails closed rather than treating unknown
+    /// paths as unreachable.
     #[tracing::instrument(
         name = "snapshot.get_data_files_to_delete",
         skip_all,
@@ -116,6 +124,12 @@ impl Snapshot {
         options: &DataFilesToDeleteOptions,
     ) -> Result<Option<Plan>> {
         ensure_cleanup_supported(self)?;
+        if !self.built_as_latest {
+            return Err(KernelError::generic(
+                "data-file cleanup requires a snapshot built at the latest version",
+            )
+            .into());
+        }
         let retention = options
             .deleted_file_retention
             .or(self.table_properties().deleted_file_retention_duration)
@@ -547,6 +561,15 @@ mod tests {
                 snapshot.get_data_files_to_delete(&engine, &after_cutoff)?,
             )?,
             vec![orphan.to_string()]
+        );
+
+        let historical = Snapshot::builder_for(table.table_root())
+            .at_version(0)
+            .build(&engine)?;
+        assert!(
+            historical
+                .get_data_files_to_delete(&engine, &after_cutoff)
+                .is_err()
         );
         Ok(())
     }

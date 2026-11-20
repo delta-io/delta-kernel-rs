@@ -103,10 +103,13 @@ The C API signatures do not expose reader state or a cancellation token.
 
 `snapshot_data_files_to_delete_plan(snapshot, engine, mode, now_ms, retention_ms, anchor_version)`
 returns `OptionalValue<KernelOwnedBytes>` containing a serialized `Operation::QueryPlan`, or `None`
-when the candidate source is empty. `Full` requires `anchor_version=None`; `Lite` accepts an
-optional anchor version. An anchor after V_cut produces an empty result. The caller frees returned
-bytes with `free_kernel_bytes`, executes the plan, applies connector-specific filtering and
-protection, and owns deletion. The FFI does not delete files.
+when the LITE range is statically empty; a present plan can still yield zero rows. `Full` requires
+`anchor_version=None`; `Lite` accepts an exclusive anchor. An anchor at or after V_cut produces an
+empty range. Keep a persisted LITE anchor below V_cut while its CDC files remain protected.
+The caller must supply a fresh latest snapshot and, for catalog-managed tables, its latest
+catalog-ratified tail. Kernel rejects explicitly pinned snapshots but cannot observe later commits.
+The caller frees returned bytes with `free_kernel_bytes`, executes the plan, applies connector
+filtering and protection, and owns deletion. The FFI does not delete files.
 
 Domain-metadata reads live in `ffi/src/domain_metadata.rs`: `get_domain_metadata` /
 `visit_domain_metadata` for user domains, and `visit_clustering_columns`, which reports one

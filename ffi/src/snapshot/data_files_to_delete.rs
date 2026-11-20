@@ -25,9 +25,13 @@ pub enum FfiDataFilesToDeleteMode {
 
 /// Build a Snapshot data-file cleanup plan and return proto-serialized QueryPlan bytes.
 ///
-/// The returned paths are absolute URLs. Kernel does not delete them; the caller must apply
-/// connector-specific protection and path filters before deletion. When no plan exists, returns
-/// [`OptionalValue::None`]. Free returned bytes with [`crate::free_kernel_bytes`].
+/// Pass a fresh latest snapshot. Explicitly version-pinned snapshots are rejected, but Kernel
+/// cannot detect commits or catalog updates after the snapshot was built. For catalog-managed
+/// tables, use the latest catalog-ratified log tail. Returned paths are absolute URLs. Kernel does
+/// not delete files; the caller applies connector-specific protection and path filters. `Lite`
+/// anchors are exclusive; keep a persisted anchor below `V_cut` while its CDC files remain
+/// protected. `None` means a statically empty LITE range; a present plan may still yield zero rows.
+/// Free returned bytes with [`crate::free_kernel_bytes`].
 ///
 /// # Safety
 ///
