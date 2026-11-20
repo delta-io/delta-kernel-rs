@@ -17,6 +17,7 @@ use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
 use crate::arrow::datatypes::{
     DataType, Field, Fields, Schema, TimeUnit, TimestampMicrosecondType,
 };
+use crate::arrow::error::ArrowError;
 use crate::engine::arrow_conversion::TryIntoKernel as _;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use crate::engine::arrow_expression::evaluate_expression::to_json;
@@ -1273,8 +1274,112 @@ fn test_evaluator_output_schema_honors_timestamp_cast(
     }
 }
 
+/// A NULL output struct expands to NULL columns without removing rows. For example,
+/// `CASE WHEN keep THEN named_struct('value', value, 'keep', keep) END` expands `(false, 8)`
+/// and `(NULL, 9)` to `(NULL, NULL)`. Extracting or identity-patching a nullable struct has
+/// the same contract. The sliced input also exercises nonzero array offsets.
+#[rstest]
+#[case::guarded_struct(Expr::struct_with_nullability_from(
+    [col!("value"), col!("keep")], col!("keep"),
+))]
+#[case::nullable_column(col!("payload"))]
+#[case::empty_nested_patch(Expr::struct_patch(
+    ExpressionStructPatchBuilder::new_nested(["payload"]),
+).unwrap())]
+fn public_evaluator_struct_root_nulls_reach_output_columns(#[case] expression: Expression) {
+    let value: ArrayRef = Arc::new(Int64Array::from(vec![
+        Some(99),
+        Some(7),
+        Some(8),
+        Some(9),
+        None,
+    ]));
+    let keep: ArrayRef = Arc::new(BooleanArray::from(vec![
+        Some(true),
+        Some(true),
+        Some(false),
+        None,
+        Some(true),
+    ]));
+    let payload = StructArray::new(
+        vec![
+            Field::new("value", DataType::Int64, true),
+            Field::new("keep", DataType::Boolean, true),
+        ]
+        .into(),
+        vec![value.clone(), keep.clone()],
+        Some(NullBuffer::from(vec![true, true, false, false, true])),
+    );
+    let batch = RecordBatch::try_from_iter([
+        ("value", value),
+        ("keep", keep),
+        ("payload", Arc::new(payload) as ArrayRef),
+    ])
+    .unwrap()
+    .slice(1, 4);
+    let input_schema = schema_ref! {
+        nullable "value": LONG,
+        nullable "keep": BOOLEAN,
+        nullable "payload": { nullable "value": LONG, nullable "keep": BOOLEAN },
+    };
+    let output_schema = schema! { nullable "value": LONG, nullable "keep": BOOLEAN };
+    let output = ArrowEvaluationHandler
+        .new_expression_evaluator(
+            input_schema,
+            Arc::new(expression),
+            output_schema.clone().into(),
+        )
+        .unwrap()
+        .evaluate(&ArrowEngineData::new(batch))
+        .try_into_record_batch()
+        .unwrap();
+
+    assert_eq!(output.num_rows(), 4);
+    assert_eq!(
+        output.schema().as_ref(),
+        &(&output_schema).try_into_arrow().unwrap()
+    );
+    assert_eq!(
+        output.column(0).as_ref(),
+        &Int64Array::from(vec![Some(7), None, None, None])
+    );
+    assert_eq!(
+        output.column(1).as_ref(),
+        &BooleanArray::from(vec![Some(true), None, None, Some(true)])
+    );
+}
+
+#[test]
+fn public_evaluator_root_nulls_reject_non_nullable_void_output() {
+    let batch = RecordBatch::try_from_iter([(
+        "input",
+        Arc::new(BooleanArray::from(vec![true])) as ArrayRef,
+    )])
+    .unwrap();
+    let evaluator = ArrowEvaluationHandler
+        .new_expression_evaluator(
+            schema_ref! { not_null "input": BOOLEAN },
+            Arc::new(Expr::struct_with_nullability_from(
+                [null_lit(KernelDataType::VOID)],
+                lit(false),
+            )),
+            KernelDataType::from(schema! { not_null "v": VOID }),
+        )
+        .unwrap();
+    let Err(error) = evaluator.evaluate(&ArrowEngineData::new(batch)) else {
+        panic!("expected non-nullable output to reject root nulls");
+    };
+    assert!(matches!(
+        error.without_backtrace(),
+        KernelError::Arrow(ArrowError::InvalidArgumentError(_))
+    ));
+}
+
+/// Expanding an empty struct preserves its input row count even when its guard is FALSE or
+/// NULL; there are no output fields on which to represent the struct's absence.
 #[rstest]
 #[case::empty(expr!(make_struct()))]
+#[case::guarded(expr!(guarded_struct(col("keep"))))]
 #[case::coalesced(expr!(coalesce(guarded_struct(col("keep")), make_struct())))]
 fn public_evaluator_empty_struct_output_preserves_row_count(
     #[case] expression: Expression,
