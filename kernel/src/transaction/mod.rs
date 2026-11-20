@@ -62,6 +62,10 @@ mod declarative;
 mod domain_metadata;
 mod exec_mode;
 mod imperative;
+#[cfg(feature = "declarative-plans")]
+// Remove when a caller outside tests uses conflict detection.
+#[cfg_attr(not(test), allow(dead_code))]
+mod occ;
 mod operation;
 pub(crate) use operation::CommitOperation;
 pub use operation::UpdateTableOperation;
