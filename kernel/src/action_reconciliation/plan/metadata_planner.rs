@@ -483,7 +483,7 @@ impl<'a> MetadataPlanner<'a> {
                             if self.read_collations && output.contains(COLLATION_STATS) {
                                 // Parse to the sampled shape without relabeling source identifiers.
                                 let json = Expr::unary(
-                                    UnaryExpressionOp::ToJson,
+                                    UnaryExpressionOp::TO_JSON,
                                     col!(ADD_NAME, STATS_PARSED),
                                 );
                                 patch.replace_at(
