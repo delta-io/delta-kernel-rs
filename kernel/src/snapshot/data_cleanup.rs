@@ -1,11 +1,11 @@
 //! Declarative plans for data cleanup (VACUUM): which files under the table root may be deleted.
 //!
 //! A file may be deleted when no table version inside the deleted-file retention window can read
-//! it and it is older than that window. The connector supplies the files it found under the table
-//! root as a retained relation; kernel subtracts every file the window can read and keeps only
-//! files last modified before the retention cutoff. The age check protects files that in-flight
-//! transactions have written but not yet committed. Kernel only builds the plan; the connector
-//! executes it and deletes the returned files.
+//! it and it is older than that window. The plan lists files under the table root, subtracts every
+//! file the window can read, and keeps only files last modified before the retention cutoff. The
+//! age check protects recently written files; it assumes an uncommitted transaction does not keep
+//! its files longer than the retention period. Kernel builds the plan; the connector executes it
+//! and deletes the returned files.
 
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -18,21 +18,20 @@ use crate::history_manager::error::LogHistoryError;
 use crate::history_manager::search::Bound;
 use crate::history_manager::{HistoryCommitType, get_earliest_commit, timestamp_to_version};
 use crate::log_segment::LogSegment;
-use crate::plans::ir::nodes::RelationRef;
 use crate::plans::ir::plan::Plan;
-use crate::schema::{DataType, SchemaRef, ToSchema, lazy_schema_ref};
+use crate::schema::{SchemaRef, ToSchema, lazy_schema_ref};
 use crate::table_features::{Operation, TableFeature};
 use crate::utils::require;
 use crate::{
     Engine, Error, KernelError, KernelResult, PlanBuilder, Result, Version, version_as_i64,
 };
 
-/// Candidate column: the file's fully qualified location, as the connector lists it.
+/// Output column containing each file's fully qualified location.
 pub const DATA_CLEANUP_LOCATION: &str = "location";
-/// Candidate column: the file's path relative to the table root, percent-encoded the way Delta
-/// actions encode relative paths (for example `part=a%20b/f.parquet`).
+/// Output column containing each file's table-relative, URI-encoded path.
 pub const DATA_CLEANUP_RELATIVE_PATH: &str = "relative_path";
-/// Candidate column: the file's last modification time, in milliseconds since the Unix epoch.
+/// Output column containing each file's last modification time in milliseconds since the Unix
+/// epoch.
 pub const DATA_CLEANUP_LAST_MODIFIED: &str = "last_modified";
 
 /// The Delta default for `delta.deletedFileRetentionDuration`.
@@ -90,32 +89,28 @@ impl DataCleanupOptions {
 }
 
 impl Snapshot {
-    /// Builds a plan producing the rows of `candidates` whose files data cleanup may delete.
+    /// Builds a plan that lists table files data cleanup may delete.
     ///
-    /// `candidates` is a relation the connector retained in its
-    /// [`ScopedPlanExecutor`](crate::plans::ScopedPlanExecutor), typically a listing of the files
-    /// under the table root. It must have the columns [`DATA_CLEANUP_LOCATION`] (STRING),
-    /// [`DATA_CLEANUP_RELATIVE_PATH`] (STRING), and [`DATA_CLEANUP_LAST_MODIFIED`] (LONG), none
-    /// NULL; any other columns pass through to the output unchanged.
-    ///
-    /// A candidate is eligible when all of these hold:
+    /// The plan recursively lists files under the table root. A listed file is eligible when all of
+    /// these hold:
     ///
     /// - It was last modified before the retention cutoff: `now - retention`, where retention is
     ///   [`DataCleanupOptions::with_deleted_file_retention`], else
-    ///   `delta.deletedFileRetentionDuration`, else seven days. Newer files may belong to
-    ///   transactions that have not committed yet.
+    ///   `delta.deletedFileRetentionDuration`, else seven days. This protects recently written
+    ///   files; it assumes uncommitted transactions do not keep files longer than the retention
+    ///   period.
     /// - No table version a reader at or after the cutoff can see reads it: no data file, deletion
     ///   vector file, or change data file of those versions has its location or relative path.
     /// - It is not under `_delta_log/`.
     ///
-    /// Every candidate is treated as a file. A connector that also lists directories decides which
-    /// of them to delete.
+    /// The output follows [`crate::plans::ir::nodes::LIST_FILES_SCHEMA`]. Kernel builds the plan;
+    /// the connector executes it and deletes the returned files.
     ///
     /// # Errors
     ///
     /// Returns an error if kernel cannot write to the table, if the table supports
-    /// `adaptiveMetadata`, if `candidates` lacks a required column, or if a commit the window reads
-    /// is missing from the log. Kernel never narrows the window to the commits it finds.
+    /// `adaptiveMetadata`, or if a commit the window reads is missing from the log. Kernel never
+    /// narrows the window to the commits it finds.
     #[tracing::instrument(
         name = "snapshot.eligible_data_files_to_be_deleted",
         skip_all,
@@ -125,7 +120,6 @@ impl Snapshot {
     pub fn eligible_data_files_to_be_deleted(
         self: &SnapshotRef,
         engine: &dyn Engine,
-        candidates: RelationRef,
         options: &DataCleanupOptions,
     ) -> Result<Plan> {
         let config = self.table_configuration();
@@ -138,8 +132,6 @@ impl Snapshot {
                 "eligible_data_files_to_be_deleted does not support adaptiveMetadata tables"
             ))
         );
-        validate_candidate_schema(candidates.schema())?;
-
         let retention = options
             .deleted_file_retention
             .or(self.table_properties().deleted_file_retention_duration)
@@ -150,6 +142,11 @@ impl Snapshot {
         let cutoff_ms = options.now_ms.saturating_sub(retention_ms);
         let window = self.retention_window(engine, cutoff_ms)?;
         let reachable = self.reachable_data_files(engine, window)?;
+        let table_root = self
+            .log_segment()
+            .log_root
+            .join("../")
+            .map_err(KernelError::from)?;
 
         let in_log = Predicate::and(
             col!(DATA_CLEANUP_RELATIVE_PATH).ge(lit(DELTA_LOG_PREFIX)),
@@ -157,7 +154,7 @@ impl Snapshot {
         );
         // A reachable path is relative when the action names a file under the table root and
         // absolute otherwise, so a candidate is reachable if either of its forms matches.
-        Ok(PlanBuilder::relation_source(candidates)
+        Ok(PlanBuilder::list_files(table_root)?
             .filter(Predicate::and(
                 col!(DATA_CLEANUP_LAST_MODIFIED).lt(lit(cutoff_ms)),
                 Predicate::not(in_log),
@@ -269,27 +266,6 @@ pub(crate) struct RetentionWindow {
     first_remove: Version,
 }
 
-/// Fails unless `schema` has every column [`Snapshot::eligible_data_files_to_be_deleted`] reads.
-fn validate_candidate_schema(schema: &SchemaRef) -> KernelResult<()> {
-    for (name, data_type) in [
-        (DATA_CLEANUP_LOCATION, DataType::STRING),
-        (DATA_CLEANUP_RELATIVE_PATH, DataType::STRING),
-        (DATA_CLEANUP_LAST_MODIFIED, DataType::LONG),
-    ] {
-        let field = schema.field(name).ok_or_else(|| {
-            KernelError::generic(format!("data cleanup candidates lack column `{name}`"))
-        })?;
-        require!(
-            field.data_type() == &data_type,
-            KernelError::generic(format!(
-                "data cleanup candidate column `{name}` must be {data_type}, got {}",
-                field.data_type()
-            ))
-        );
-    }
-    Ok(())
-}
-
 /// Projects the file named by each row's `action` struct.
 fn action_files(plan: PlanBuilder, action: &str) -> KernelResult<PlanBuilder> {
     plan.project(
@@ -317,24 +293,26 @@ fn deletion_vector_files(plan: PlanBuilder, action: &str) -> KernelResult<PlanBu
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use bytes::Bytes;
     use rstest::rstest;
     use test_utils::add_commit;
+    use url::Url;
 
     use super::*;
     use crate::Snapshot;
     use crate::arrow::array::AsArray as _;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
-    use crate::engine::sync::plan::{ScopedSyncPlanExecutor, SyncPlanExecutor};
-    use crate::expressions::Scalar;
+    use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::object_store::DynObjectStore;
     use crate::object_store::memory::InMemory;
-    use crate::plans::{Operation, PlanExecutor as _, ScopedPlanExecutor as _};
-    use crate::schema::schema_ref;
+    use crate::plans::{Operation, PlanExecutor as _};
     use crate::unit_test_utils::assert_result_error_with_message;
 
     const TABLE_ROOT: &str = "memory:///";
+    const COMMIT_TIMESTAMP_BASE_MS: i64 = 4_000_000_000_000;
     const DV_FILE: &str = "ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin";
     const CDC_FILE: &str = "_change_data/cdc-2.parquet";
     const ABSOLUTE_FILE: &str = "memory:///e.parquet";
@@ -359,10 +337,11 @@ mod tests {
         )
     }
 
-    /// In-commit timestamps fix commit `v` at `(v + 1) * 1000` ms, with deleted-file retention one
-    /// second. v0 adds `a`; v1 adds `b` with a UUID DV; v2 removes `a`, adds `c`, and writes a CDC
-    /// file; v3 removes `b`, adds `d` with an inline DV, and adds `e` by absolute path. With
-    /// `checkpoint`, v2 is checkpointed, so windows starting before it read pre-checkpoint commits.
+    /// In-commit timestamps place commit `v` at `COMMIT_TIMESTAMP_BASE_MS + (v + 1) * 1000`, with
+    /// deleted-file retention one second. v0 adds `a`; v1 adds `b` with a UUID DV; v2 removes `a`,
+    /// adds `c`, and writes a CDC file; v3 removes `b`, adds `d` with an inline DV, and adds `e` by
+    /// absolute path. With `checkpoint`, v2 is checkpointed, so windows starting before it read
+    /// pre-checkpoint commits.
     async fn table(checkpoint: bool) -> (Arc<DynObjectStore>, Arc<dyn Engine>, SnapshotRef) {
         let metadata = [
             r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors","inCommitTimestamp"]}}"#,
@@ -388,7 +367,7 @@ mod tests {
         ];
         let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
         for (version, actions) in commits.into_iter().enumerate() {
-            let timestamp = (version as i64 + 1) * 1000;
+            let timestamp = COMMIT_TIMESTAMP_BASE_MS + (version as i64 + 1) * 1000;
             let body = std::iter::once(commit_info(timestamp))
                 .chain(actions)
                 .collect::<Vec<_>>()
@@ -398,6 +377,23 @@ mod tests {
                 .unwrap();
         }
         let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new_with_store(Arc::clone(&store)));
+        for path in [
+            "a.parquet",
+            "b.parquet",
+            "c.parquet",
+            "d.parquet",
+            "e.parquet",
+            DV_FILE,
+            CDC_FILE,
+            "orphan.parquet",
+            "part=a%20b/orphan.parquet",
+        ] {
+            let url = Url::parse(&format!("{TABLE_ROOT}{path}")).unwrap();
+            engine
+                .storage_handler()
+                .put(&url, Bytes::new(), true)
+                .unwrap();
+        }
         if checkpoint {
             Snapshot::builder_for(TABLE_ROOT)
                 .at_version(2)
@@ -412,47 +408,6 @@ mod tests {
         (store, engine, snapshot)
     }
 
-    fn candidate_schema() -> SchemaRef {
-        schema_ref! {
-            not_null DATA_CLEANUP_LOCATION: STRING,
-            not_null DATA_CLEANUP_RELATIVE_PATH: STRING,
-            not_null DATA_CLEANUP_LAST_MODIFIED: LONG,
-        }
-    }
-
-    /// Retains a listing of every file the table names, plus an orphan, a recently written file,
-    /// and a commit file. All but `recent.parquet` were last modified at time 0.
-    fn candidates(scoped: &ScopedSyncPlanExecutor) -> RelationRef {
-        let relative = [
-            "a.parquet",
-            "b.parquet",
-            "c.parquet",
-            "d.parquet",
-            "e.parquet",
-            DV_FILE,
-            CDC_FILE,
-            "orphan.parquet",
-            "recent.parquet",
-            "_delta_log/00000000000000000000.json",
-        ];
-        let rows = relative
-            .into_iter()
-            .map(|path| {
-                let last_modified = if path == "recent.parquet" { 4_000 } else { 0 };
-                vec![
-                    Scalar::from(format!("{TABLE_ROOT}{path}")),
-                    Scalar::from(path),
-                    Scalar::Long(last_modified),
-                ]
-            })
-            .collect();
-        let listing = PlanBuilder::values(candidate_schema(), rows)
-            .unwrap()
-            .build()
-            .unwrap();
-        scoped.execute_and_retain("candidates", listing).unwrap()
-    }
-
     /// Plans and executes data cleanup, returning the eligible relative paths.
     fn eligible(
         store: &Arc<DynObjectStore>,
@@ -460,11 +415,13 @@ mod tests {
         snapshot: &SnapshotRef,
         options: &DataCleanupOptions,
     ) -> Result<BTreeSet<String>> {
-        let scoped = SyncPlanExecutor::new(Some(Arc::clone(store))).get_scoped();
-        let plan =
-            snapshot.eligible_data_files_to_be_deleted(engine, candidates(&scoped), options)?;
+        let executor = SyncPlanExecutor::new(Some(Arc::clone(store)));
+        let plan = snapshot.eligible_data_files_to_be_deleted(engine, options)?;
         let mut paths = BTreeSet::new();
-        for batch in scoped.execute_op(Operation::QueryPlan(plan))?.into_data()? {
+        for batch in executor
+            .execute_op(Operation::QueryPlan(plan))?
+            .into_data()?
+        {
             let batch = batch?.try_into_record_batch()?;
             let column = batch
                 .column_by_name(DATA_CLEANUP_RELATIVE_PATH)
@@ -477,24 +434,42 @@ mod tests {
 
     #[rstest]
     // Cutoff 2500: a reader sees v1, so v2's CDC file and every later remove stay protected.
-    #[case::window_starts_at_v1(3_500, None, vec!["orphan.parquet"])]
+    #[case::window_starts_at_v1(
+        COMMIT_TIMESTAMP_BASE_MS + 3_500,
+        None,
+        vec!["orphan.parquet", "part=a%20b/orphan.parquet"],
+    )]
     // Cutoff 3500: v2 is the oldest readable version, so `a` (removed by v2) can go, but the CDC
     // file v2 wrote cannot.
-    #[case::window_starts_at_v2(4_500, None, vec!["a.parquet", "orphan.parquet"])]
-    // Cutoff 9000: only v3 is readable, so every removed or CDC file is eligible, and so is
-    // `recent.parquet` once it is older than the cutoff.
-    #[case::window_at_latest(
-        10_000,
+    #[case::window_starts_at_v2(
+        COMMIT_TIMESTAMP_BASE_MS + 4_500,
         None,
-        vec!["a.parquet", "b.parquet", CDC_FILE, DV_FILE, "orphan.parquet", "recent.parquet"],
+        vec!["a.parquet", "orphan.parquet", "part=a%20b/orphan.parquet"],
+    )]
+    // Cutoff 9000: only v3 is readable, so every removed or CDC file is eligible.
+    #[case::window_at_latest(
+        COMMIT_TIMESTAMP_BASE_MS + 10_000,
+        None,
+        vec![
+            "a.parquet",
+            "b.parquet",
+            CDC_FILE,
+            DV_FILE,
+            "orphan.parquet",
+            "part=a%20b/orphan.parquet",
+        ],
     )]
     // Cutoff 500 precedes every commit, so every commit's files stay protected.
-    #[case::cutoff_before_first_commit(1_500, None, vec!["orphan.parquet"])]
+    #[case::cutoff_before_first_commit(
+        COMMIT_TIMESTAMP_BASE_MS + 1_500,
+        None,
+        vec!["orphan.parquet", "part=a%20b/orphan.parquet"],
+    )]
     // A longer retention override moves the cutoff from 9000 back to 2500.
     #[case::retention_override(
-        10_000,
+        COMMIT_TIMESTAMP_BASE_MS + 10_000,
         Some(Duration::from_millis(7_500)),
-        vec!["orphan.parquet"],
+        vec!["orphan.parquet", "part=a%20b/orphan.parquet"],
     )]
     #[tokio::test]
     async fn eligible_files_exclude_files_the_retention_window_reads(
@@ -524,38 +499,31 @@ mod tests {
             &store,
             engine.as_ref(),
             &snapshot,
-            &DataCleanupOptions::new(3_500),
+            &DataCleanupOptions::new(COMMIT_TIMESTAMP_BASE_MS + 3_500),
         );
         assert_result_error_with_message(result, "Table version 1 is missing");
     }
 
-    #[rstest]
-    #[case::missing_column(
-        schema_ref! {
-            not_null DATA_CLEANUP_LOCATION: STRING,
-            not_null DATA_CLEANUP_LAST_MODIFIED: LONG,
-        },
-        "lack column `relative_path`",
-    )]
-    #[case::wrong_type(
-        schema_ref! {
-            not_null DATA_CLEANUP_LOCATION: STRING,
-            not_null DATA_CLEANUP_RELATIVE_PATH: STRING,
-            not_null DATA_CLEANUP_LAST_MODIFIED: INTEGER,
-        },
-        "`last_modified` must be long",
-    )]
     #[tokio::test]
-    async fn eligible_files_reject_candidates_without_required_columns(
-        #[case] schema: SchemaRef,
-        #[case] message: &str,
-    ) {
-        let (_, engine, snapshot) = table(false).await;
-        let result = snapshot.eligible_data_files_to_be_deleted(
+    async fn eligible_files_exclude_recently_written_files() {
+        let (store, engine, snapshot) = table(false).await;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let recent = Url::parse(&format!("{TABLE_ROOT}recent.parquet")).unwrap();
+        engine
+            .storage_handler()
+            .put(&recent, Bytes::new(), true)
+            .unwrap();
+
+        let eligible = eligible(
+            &store,
             engine.as_ref(),
-            RelationRef::new("candidates", schema),
-            &DataCleanupOptions::new(10_000),
-        );
-        assert_result_error_with_message(result, message);
+            &snapshot,
+            &DataCleanupOptions::new(now_ms).with_deleted_file_retention(Duration::ZERO),
+        )
+        .unwrap();
+        assert!(!eligible.contains("recent.parquet"));
     }
 }

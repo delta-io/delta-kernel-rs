@@ -39,6 +39,8 @@ pub enum Operator {
     /// Reads all rows of a relation previously retained by the engine. The [`RelationRef`]'s
     /// schema is this node's output schema.
     RelationSource(RelationRef),
+    /// Recursively lists files under the URL and emits [`LIST_FILES_SCHEMA`] rows.
+    ListFiles(ListFiles),
 
     // === Unary operators (1 input) ===========================================
     Project(Project),
@@ -59,6 +61,15 @@ pub enum Operator {
 /// `size` in bytes, and `last_modified` in milliseconds since the Unix epoch.
 pub static FILE_META_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     not_null "location": STRING,
+    not_null "size": LONG,
+    not_null "last_modified": LONG,
+};
+
+/// Output schema of [`ListFiles`]: absolute location, root-relative path, size, and modification
+/// time.
+pub static LIST_FILES_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    not_null "location": STRING,
+    not_null "relative_path": STRING,
     not_null "size": LONG,
     not_null "last_modified": LONG,
 };
@@ -121,6 +132,18 @@ pub struct WriteJson {
 /// An engine-assigned identifier for a relation retained by a
 /// [`PlanExecutor`](crate::plans::PlanExecutor). Opaque to kernel.
 pub type RelationId = String;
+
+/// Recursively lists files under a directory URL, returning one row per file.
+///
+/// The output follows [`LIST_FILES_SCHEMA`]. `relative_path` is relative to `base_url` and is
+/// percent-encoded as a URL path, matching the encoding used by Delta file actions.
+#[derive(Debug, Clone)]
+pub struct ListFiles {
+    /// Hierarchical directory URL ending in `/`.
+    pub base_url: Url,
+    /// Declared output schema.
+    pub schema: SchemaRef,
+}
 
 /// An opaque handle to a relation retained by the engine's
 /// [`PlanExecutor`](crate::plans::PlanExecutor). See [`Operator::RelationSource`].
