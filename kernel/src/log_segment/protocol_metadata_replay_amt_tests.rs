@@ -1344,8 +1344,8 @@ async fn post_commit_snapshot_resolves_latest_checkpoint_action(
 
 // Replay takes `lastManifestCommit` from the newest commit only: a manifest commit records itself,
 // a later log commit carries it forward, and a newest commit without one is not back-filled from an
-// older commit. Replay always reads the newest commit, so it resolves that miss as
-// `Resolved(None)`. The same holds when a CRC at v0 seeds the replay.
+// older commit. The newest commit has no P&M, so replay reads its `commitInfo` and resolves that
+// miss as `Resolved(None)`. The same holds when a CRC at v0 seeds the replay.
 #[rstest]
 #[case::manifest_commit_records_itself(vec![], false, Some(pointer(0, 0)))]
 #[case::log_commit_carries_it_forward(vec![commit_info(Some(pointer(0, 0)))], false, Some(pointer(0, 0)))]
@@ -1506,9 +1506,7 @@ async fn segment_with_compaction(
     log_segment
 }
 
-// Replay stops inside a newest commit that has both P&M, so it read that commit's `commitInfo` only
-// if In-Commit Timestamps put it first; only then is a missing pointer `Resolved(None)`. Without
-// them, the `commitInfo` after the P&M may be unread.
+// Without In-Commit Timestamps, replay can stop at the P&M before the `commitInfo` after them.
 #[rstest]
 #[case::in_commit_timestamps(pointerless_pm_commit(), LastManifestCommitResolution::Resolved(None))]
 #[case::no_in_commit_timestamps(
@@ -1522,12 +1520,7 @@ async fn replay_resolves_missing_pointer_in_newest_commit_with_pm(
 ) {
     let log = ReplayLog::after_manifest_commit(vec![newest_commit]);
     let expected = ReplayExpectation::default().last_manifest_commit(expected);
-    assert_replay(&log, None, &expected, non_plan_engine).await;
-    #[cfg(feature = "declarative-plans")]
-    assert_replay(&log, None, &expected, |store| {
-        SyncEngine::new_with_store(store)
-    })
-    .await;
+    on_both_paths!(assert_replay(&log, None, &expected));
 }
 
 // A replayed snapshot serves `lastManifestCommit` from build-time state: it still resolves after

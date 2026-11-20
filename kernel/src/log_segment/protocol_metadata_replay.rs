@@ -98,13 +98,13 @@ impl LogSegment {
             // the latest: any action at or below the CRC is older.
             let replayed = pruned.replay_for_pm(engine)?;
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            let newest_commit_read = pruned.read_newest_commit_info(&replayed)?;
+            let newest_commit_info_read = pruned.replay_read_newest_commit_info(&replayed)?;
             let mut resolution = replayed
                 .newer_than(version_as_i64(crc.version)?)
                 .into_resolution(
                     ProtocolMetadataSource::CrcSeededPmOnlyReplay,
                     #[cfg(feature = "adaptive-metadata-in-dev")]
-                    newest_commit_read,
+                    newest_commit_info_read,
                 );
             if resolution.metadata.is_some() && resolution.protocol.is_some() {
                 info!("Found P&M from pruned log replay");
@@ -132,20 +132,19 @@ impl LogSegment {
             None => self.replay_for_pm_with_unbounded_segment(engine)?,
         };
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        let newest_commit_read = self.read_newest_commit_info(&candidate)?;
+        let newest_commit_info_read = self.replay_read_newest_commit_info(&candidate)?;
         Ok(candidate.into_resolution(
             ProtocolMetadataSource::FullReplay,
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            newest_commit_read,
+            newest_commit_info_read,
         ))
     }
 
-    /// Whether replaying this segment for `candidate` read its newest commit's `commitInfo`. Replay
-    /// always reads that commit first, and stops inside it only once the commit has both P&M. With
-    /// In-Commit Timestamps, `commitInfo` is the commit's first action, so replay read it even
-    /// then.
+    /// Whether replay of this segment read its newest commit's `commitInfo`. Replay stops inside
+    /// that commit only once it has both P&M, and with In-Commit Timestamps `commitInfo` comes
+    /// first.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn read_newest_commit_info(&self, candidate: &PmCandidate) -> KernelResult<bool> {
+    fn replay_read_newest_commit_info(&self, candidate: &PmCandidate) -> KernelResult<bool> {
         Ok(self.newest_commit_after_checkpoint().is_some()
             && (candidate.enables_in_commit_timestamps()
                 || !candidate.is_final_at(version_as_i64(self.end_version)?)))
@@ -646,13 +645,13 @@ impl LastManifestCommitResolution {
     /// Resolves the `lastManifestCommit` that P&M replay captured from the snapshot version's
     /// commit.
     ///
-    /// `newest_commit_read` says whether replay read that commit's `commitInfo`. If so, a missing
-    /// `captured` pointer resolves to `Resolved(None)`. Otherwise it is `Unresolved` and is read
-    /// from the commit file on first use.
-    fn from_replay(captured: Option<LastManifestCommit>, newest_commit_read: bool) -> Self {
+    /// `newest_commit_info_read` says whether replay read that commit's `commitInfo`. If so, a
+    /// missing `captured` pointer resolves to `Resolved(None)`. Otherwise it is `Unresolved`
+    /// and is read from the commit file on first use.
+    fn from_replay(captured: Option<LastManifestCommit>, newest_commit_info_read: bool) -> Self {
         match captured {
             Some(pointer) => Self::Resolved(Some(pointer)),
-            None if newest_commit_read => Self::Resolved(None),
+            None if newest_commit_info_read => Self::Resolved(None),
             None => Self::Unresolved,
         }
     }
@@ -715,11 +714,11 @@ impl PmCandidate {
     }
 
     /// The resolution this replay result gives the snapshot, resolved through `source`.
-    /// `newest_commit_read` is as for [`LastManifestCommitResolution::from_replay`].
+    /// `newest_commit_info_read` is as for [`LastManifestCommitResolution::from_replay`].
     fn into_resolution(
         self,
         source: ProtocolMetadataSource,
-        #[cfg(feature = "adaptive-metadata-in-dev")] newest_commit_read: bool,
+        #[cfg(feature = "adaptive-metadata-in-dev")] newest_commit_info_read: bool,
     ) -> PmResolution {
         PmResolution {
             metadata: self.metadata.map(|(_, m)| m),
@@ -730,7 +729,7 @@ impl PmCandidate {
             #[cfg(feature = "adaptive-metadata-in-dev")]
             last_manifest_commit: LastManifestCommitResolution::from_replay(
                 self.last_manifest_commit,
-                newest_commit_read,
+                newest_commit_info_read,
             ),
         }
     }
