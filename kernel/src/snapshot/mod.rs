@@ -99,6 +99,7 @@ pub use builder::{IncrementalReplay, IncrementalSnapshotBuilder, SnapshotBuilder
 pub(crate) use hint::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness};
 pub use reader::SnapshotReader;
 use snapshot_crc::SnapshotCrc;
+pub use snapshot_crc::{CrcProvenance, CrcSource};
 
 pub use crate::error::SnapshotHintError;
 pub use crate::log_segment::LogSegmentStats;
@@ -140,7 +141,7 @@ pub struct Snapshot {
     table_configuration: TableConfiguration,
     /// The newest CRC resolved at construction, kept so later queries and CRC writes reuse it
     /// instead of re-reading from disk. Queried via [`Snapshot::crc_at_version`] (authoritative,
-    /// zero-I/O) or [`Snapshot::base_crc`] (possibly stale). See [`SnapshotCrc`].
+    /// zero-I/O) or [`Snapshot::retained_crc`] (possibly stale). See [`SnapshotCrc`].
     crc: SnapshotCrc,
     /// Best-effort "confirmed latest at build time" flag. See [`Snapshot::built_as_latest`].
     built_as_latest: bool,
@@ -259,13 +260,15 @@ impl Snapshot {
         Self::new_with_crc(
             log_segment,
             table_configuration,
-            None,  /* crc */
+            None, /* crc */
+            CrcProvenance::default(),
             false, /* built_as_latest */
             false, /* skipped_new_checkpoints */
         )
     }
 
-    /// Internal constructor that accepts an explicit pre-resolved CRC.
+    /// Internal constructor that accepts an explicit pre-resolved CRC and its provenance.
+    /// `CrcSource::Unknown` means the caller has not established its disk provenance.
     ///
     /// `built_as_latest` records whether the build confirmed this is the latest version
     /// (best-effort). See [`Snapshot::built_as_latest`]. `skipped_new_checkpoints` records the last
@@ -274,10 +277,16 @@ impl Snapshot {
         log_segment: LogSegment,
         table_configuration: TableConfiguration,
         crc: Option<Arc<Crc>>,
+        crc_provenance: CrcProvenance,
         built_as_latest: bool,
         skipped_new_checkpoints: bool,
     ) -> Result<Self> {
-        let crc = Self::validate_configuration_and_crc(&log_segment, &table_configuration, crc)?;
+        let crc = Self::validate_configuration_and_crc(
+            &log_segment,
+            &table_configuration,
+            crc,
+            crc_provenance,
+        )?;
         Ok(Self::new_with_validated_crc(
             log_segment,
             table_configuration,
@@ -297,12 +306,14 @@ impl Snapshot {
         log_segment: &LogSegment,
         table_configuration: &TableConfiguration,
         crc: Option<Arc<Crc>>,
+        crc_provenance: CrcProvenance,
     ) -> Result<SnapshotCrc> {
         table_configuration.ensure_operation_supported(Operation::SnapshotLoad)?;
         Ok(SnapshotCrc::try_new(
             crc,
             table_configuration.version(),
             log_segment.checkpoint_version,
+            crc_provenance,
         )?)
     }
 
@@ -601,8 +612,20 @@ impl Snapshot {
             log_segment.end_version,
         )?;
 
+        let crc_provenance = SnapshotCrc::resolved_provenance(
+            base_crc.as_ref(),
+            None,
+            crc_at_version.as_ref().map(|(crc, _)| crc),
+            log_segment.end_version,
+            log_segment.listed.latest_crc_file.is_some(),
+        );
         let crc = crc_at_version.map(|(crc, _)| crc).or(base_crc);
-        let crc = Self::validate_configuration_and_crc(log_segment, &table_configuration, crc)?;
+        let crc = Self::validate_configuration_and_crc(
+            log_segment,
+            &table_configuration,
+            crc,
+            crc_provenance,
+        )?;
         Ok(PreparedSnapshot {
             table_configuration,
             crc,
@@ -672,19 +695,21 @@ impl Snapshot {
             Some(base) => Some(Arc::new(
                 base.as_ref().clone().apply(crc_delta, new_version),
             )),
-            None => self.base_crc().cloned(),
+            None => self.retained_crc().cloned(),
         };
 
+        let crc_provenance = self.crc.updated_provenance(new_crc.as_ref(), new_version);
         let new_crc = Self::validate_configuration_and_crc(
             &new_log_segment,
             &new_table_configuration,
             new_crc,
+            crc_provenance,
         )?;
         debug!(
             parent: &self.span,
             from_version = read_version,
             to_version = new_version,
-            crc_version = ?new_crc.base().map(|crc| crc.version),
+            crc_version = ?new_crc.retained().map(|crc| crc.version),
             "Constructed post-commit snapshot state"
         );
         // A successful commit means the post-commit snapshot is the latest version.
@@ -745,10 +770,20 @@ impl Snapshot {
         same_files.then(|| self.known_checkpoint_type()).flatten()
     }
 
+    /// Returns retained checksum provenance without performing engine I/O.
+    ///
+    /// The value records what snapshot construction observed about checksum files; it does not
+    /// depend on whether the checksum carries complete file statistics.
+    pub fn crc_provenance(&self) -> CrcProvenance {
+        self.crc.provenance()
+    }
+
     /// Captures retained snapshot state as an owned hint without engine I/O.
     ///
     /// The hint preserves whether this snapshot was built as latest, not whether it is still
-    /// latest. Missing checkpoint hints and CRCs at this snapshot's version remain absent.
+    /// latest. It retains checksum provenance, including any stale checksum baseline through
+    /// [`SnapshotHint::retained_crc`]. Missing checkpoint hints and checksum state are not loaded
+    /// or reconstructed.
     /// Rebuild it with [`SnapshotBuilder::with_snapshot_hint`] for the same table root.
     ///
     /// Original commit and compaction paths are retained together.
@@ -779,18 +814,20 @@ impl Snapshot {
         self.crc.at_version()
     }
 
-    /// The held CRC regardless of version, for reuse that does not require an at-version CRC
-    /// (e.g. checksum writes). Prefer [`Self::crc_at_version`] for authoritative queries.
+    /// Returns the CRC kept in memory, which may be older than [`Self::version`].
+    /// It may have been advanced by replaying commits; a CRC file at its version need not exist.
+    ///
+    /// Prefer [`Self::crc_at_version`] for authoritative queries.
     /// Replaying `allFiles` from this CRC requires applying commits newer than its version.
-    pub(crate) fn base_crc(&self) -> Option<&Arc<Crc>> {
-        self.crc.base()
+    pub(crate) fn retained_crc(&self) -> Option<&Arc<Crc>> {
+        self.crc.retained()
     }
 
-    /// The stale CRC a tail-only replay can start from: [`Self::base_crc`], unless an AMT
+    /// The stale CRC a tail-only replay can start from: [`Self::retained_crc`], unless an AMT
     /// `checkpoint` action is newer. That action stands in for the commits at or below its
     /// version, which may no longer be listed, so replay must read it instead.
     fn tail_replay_base_crc(&self, engine: &dyn Engine) -> KernelResult<Option<&Arc<Crc>>> {
-        let Some(base) = self.base_crc() else {
+        let Some(base) = self.retained_crc() else {
             return Ok(None);
         };
         #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1681,6 +1718,7 @@ impl Snapshot {
     /// # Errors
     ///
     /// - If Kernel does not support reading or writing the table.
+    /// - If the resolved CRC's protocol or metadata disagrees with this snapshot's configuration.
     /// - [`KernelError::ChecksumWriteUnsupported`] if no CRC can be resolved for this version, if
     ///   the resolved CRC's `file_stats_state` is `Indeterminate` (a non-incremental operation like
     ///   Manual Update, or a counted file action with a missing size; recoverable with a full state
@@ -1715,6 +1753,7 @@ impl Snapshot {
         self.table_configuration().ensure_read_write_supported()?;
 
         let crc = self.resolve_crc_for_write(engine, &tracing::Span::current())?;
+        self.validate_crc_configuration(&crc)?;
 
         let crc_path = ParsedLogPath::new_crc(self.table_root(), self.version())?;
 
@@ -1726,6 +1765,7 @@ impl Snapshot {
                     new_log_segment,
                     self.table_configuration().clone(),
                     Some(crc),
+                    CrcProvenance::new(CrcSource::AtVersion, Some(self.version())),
                     self.built_as_latest,
                     self.skipped_new_checkpoints,
                 )?);
@@ -1791,7 +1831,7 @@ impl Snapshot {
 
         // Case 2: a stale base CRC, older than this version. Advance the retained base over the
         // tail commits (a held base is always at or above the checkpoint, so a tail exists).
-        if let Some(base) = self.base_crc() {
+        if let Some(base) = self.retained_crc() {
             record_root("stale_crc", ChecksumWriteResolutionMode::Incremental);
             let crc = log_segment.build_crc_from_base(engine, base)?;
             return Ok(Arc::new(crc));
@@ -1848,6 +1888,29 @@ impl Snapshot {
             .build_crc_from_version_zero(engine)?
             .ok_or_else(|| unresolved_crc("commit history is missing protocol or metadata"))?;
         Ok(Arc::new(crc))
+    }
+
+    /// Checks a resolved CRC against the independently known state at this snapshot's version.
+    fn validate_crc_configuration(&self, crc: &Crc) -> KernelResult<()> {
+        require!(
+            crc.version == self.version(),
+            KernelError::internal_error("CRC configuration validation requires matching versions")
+        );
+        require!(
+            crc.protocol == *self.table_configuration().protocol(),
+            KernelError::generic(format!(
+                "CRC protocol does not match snapshot at version {}",
+                self.version()
+            ))
+        );
+        require!(
+            crc.metadata == *self.table_configuration().metadata(),
+            KernelError::generic(format!(
+                "CRC metadata does not match snapshot at version {}",
+                self.version()
+            ))
+        );
+        Ok(())
     }
 
     /// Performs a complete checkpoint of this snapshot using the provided engine.
@@ -2025,11 +2088,15 @@ impl Snapshot {
             .log_segment
             .try_new_with_checkpoint(checkpoint_log_path)?;
         // Carry only an at-version CRC forward: the checkpoint drops the commits below it, so a
-        // stale base could no longer be advanced over them.
+        // stale base could no longer be advanced over them. Dropping it leaves the checksum
+        // provenance unknown.
+        let crc = self.crc_at_version().cloned();
+        let crc_provenance = self.crc.updated_provenance(crc.as_ref(), self.version());
         let mut new_snapshot = Snapshot::new_with_crc(
             new_log_segment,
             self.table_configuration().clone(),
-            self.crc_at_version().cloned(),
+            crc,
+            crc_provenance,
             self.built_as_latest,
             false, /* skipped_new_checkpoints */
         )?;
@@ -2133,7 +2200,8 @@ impl Snapshot {
         Ok(Arc::new(Snapshot::new_with_crc(
             log_segment,
             self.table_configuration().clone(),
-            self.base_crc().cloned(),
+            self.retained_crc().cloned(),
+            self.crc.provenance(),
             self.built_as_latest,
             self.skipped_new_checkpoints,
         )?))
@@ -2298,7 +2366,17 @@ mod tests {
                 ..Default::default()
             })
         });
-        Arc::new(Snapshot::new_with_crc(segment, configuration, crc, true, true).unwrap())
+        Arc::new(
+            Snapshot::new_with_crc(
+                segment,
+                configuration,
+                crc,
+                CrcProvenance::default(),
+                true,
+                true,
+            )
+            .unwrap(),
+        )
     }
 
     fn engine_with_published_commits() -> SyncEngine {
@@ -2355,6 +2433,7 @@ mod tests {
         // THEN: request publication only for unpublished commits; keep version, metadata, and CRC.
         assert_eq!(*committer.calls.borrow(), expected_calls);
         assert_eq!(published.version(), source.version());
+        assert_eq!(published.crc_provenance(), source.crc_provenance());
         assert_eq!(
             published.table_configuration(),
             source.table_configuration()
@@ -2396,7 +2475,7 @@ mod tests {
             actual.listed.ascending_commit_files.last()
         );
         assert_published_references_match_storage(&published, &engine);
-        match (published.base_crc(), source.base_crc()) {
+        match (published.retained_crc(), source.retained_crc()) {
             (Some(actual), Some(expected)) => assert!(Arc::ptr_eq(actual, expected)),
             (None, None) => {}
             _ => panic!("publication changed the retained CRC"),
@@ -2432,6 +2511,7 @@ mod tests {
                 segment,
                 source.table_configuration().clone(),
                 None,
+                CrcProvenance::default(),
                 false,
                 false,
             )
@@ -2753,7 +2833,8 @@ mod tests {
         Snapshot::new_with_crc(
             log_segment,
             table_cfg,
-            None,  /* crc */
+            None, /* crc */
+            CrcProvenance::default(),
             false, /* built_as_latest */
             false, /* skipped_new_checkpoints */
         )
@@ -3506,6 +3587,7 @@ mod tests {
             loaded_snapshot.log_segment().clone(),
             loaded_snapshot.table_configuration().clone(),
             None,
+            CrcProvenance::default(),
             false,
             false, /* skipped_new_checkpoints */
         )?;
@@ -3567,62 +3649,34 @@ mod tests {
         assert_eq!(snap.version(), 2);
     }
 
-    #[test]
-    fn test_new_post_commit_simple() {
-        // GIVEN
-        let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
-        let url = url::Url::from_directory_path(path).unwrap();
-        let engine = SyncEngine::new();
-        let base_snapshot = Snapshot::builder_for(url.clone()).build(&engine).unwrap();
-        let next_version = base_snapshot.version() + 1;
-
-        // WHEN
-        let fake_new_commit = ParsedLogPath::create_parsed_published_commit(&url, next_version);
-        let post_commit_snapshot = base_snapshot
-            .new_post_commit(
-                fake_new_commit,
-                CrcDelta::default(),
-                #[cfg(feature = "adaptive-metadata-in-dev")]
-                None,
-            )
-            .unwrap();
-
-        // THEN
-        assert_eq!(post_commit_snapshot.version(), next_version);
-        assert_eq!(post_commit_snapshot.log_segment().end_version, next_version);
-    }
-
-    // A post-commit snapshot built from a parent holding a stale base (not an at-version CRC)
-    // keeps that base rather than dropping it: the single-commit delta can't advance it, but
-    // retaining it lets a later write reuse the parsed CRC.
-    #[test]
-    fn test_new_post_commit_from_stale_base_keeps_base() {
-        let path =
-            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
-        let url = url::Url::from_directory_path(path).unwrap();
-        let engine = SyncEngine::new();
-
-        // Rebuild the v1 snapshot so it holds a stale CRC@0 (base only, not at-version).
-        let built = Snapshot::builder_for(url.clone())
-            .at_version(1)
-            .build(&engine)
-            .unwrap();
-        let stale_crc = Arc::new(Crc {
-            version: 0,
-            ..Default::default()
-        });
+    #[rstest]
+    #[case::at_version(Some(2), CrcSource::AtVersion, Some(2), CrcSource::Reconstructed { num_commits: 1 })]
+    #[case::reconstructed(Some(2), CrcSource::Reconstructed { num_commits: 2 }, Some(0), CrcSource::Reconstructed { num_commits: 3 })]
+    #[case::stale(Some(0), CrcSource::Stale, Some(0), CrcSource::Stale)]
+    #[case::unknown_stale(Some(0), CrcSource::Unknown, None, CrcSource::Unknown)]
+    #[case::missing(None, CrcSource::Missing, None, CrcSource::Missing)]
+    #[case::unusable(None, CrcSource::Unusable, None, CrcSource::Unusable)]
+    #[case::unknown(None, CrcSource::Unknown, None, CrcSource::Unknown)]
+    fn test_new_post_commit_preserves_provenance(
+        #[case] crc_version: Option<Version>,
+        #[case] source: CrcSource,
+        #[case] base_version: Option<Version>,
+        #[case] expected_source: CrcSource,
+    ) {
+        // Given a snapshot with an optional retained checksum and its provenance.
+        let built = snapshot_with_staged_commits(Some(2), crc_version, false);
         let parent = Snapshot::new_with_crc(
             built.log_segment().clone(),
             built.table_configuration().clone(),
-            Some(stale_crc),
+            built.retained_crc().cloned(),
+            CrcProvenance::new(source, base_version),
             false, /* built_as_latest */
             false, /* skipped_new_checkpoints */
         )
         .unwrap();
-        assert!(parent.crc_at_version().is_none());
-        assert_eq!(parent.base_crc().map(|c| c.version), Some(0));
 
-        let commit = ParsedLogPath::create_parsed_published_commit(&url, 2);
+        // When a committed action advances the snapshot without storage I/O.
+        let commit = ParsedLogPath::create_parsed_published_commit(parent.table_root(), 3);
         let post = parent
             .new_post_commit(
                 commit,
@@ -3632,13 +3686,24 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(post.version(), 2);
-        assert!(post.crc_at_version().is_none());
+        // Then at-version CRCs advance and stale or absent state is retained.
+        assert_eq!(post.version(), 3);
+        assert_eq!(post.log_segment().end_version, 3);
         assert_eq!(
-            post.base_crc().map(|c| c.version),
-            Some(0),
-            "the stale base must be carried forward, not dropped"
+            post.crc_provenance(),
+            CrcProvenance::new(expected_source, base_version)
         );
+        assert_eq!(
+            post.retained_crc().map(|crc| crc.version),
+            crc_version.map(|version| {
+                if version == parent.version() {
+                    3
+                } else {
+                    version
+                }
+            })
+        );
+        assert_eq!(parent.retained_crc().map(|crc| crc.version), crc_version);
     }
 
     #[test]

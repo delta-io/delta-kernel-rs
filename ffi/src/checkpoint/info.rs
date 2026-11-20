@@ -431,6 +431,7 @@ mod tests {
             None,
             SnapshotHintFreshness::Unverified,
             None,
+            None,
         )
         .unwrap();
         let engine: Arc<dyn Engine> = if checkpoint == Some(FfiSelectedCheckpointType::V1) {
