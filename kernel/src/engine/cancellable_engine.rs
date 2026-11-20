@@ -152,7 +152,7 @@ macro_rules! forward_methods {
 impl StorageHandler for ReadHandler<dyn StorageHandler> {
     cancellable_read_pair! {
         /// Lists files using a per-call token or the default token.
-        fn list_from, list_from_with_cancellation(path: &Url)
+        fn list_from, list_from_with_cancellation(path: &Url, end: Option<&Url>)
             -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>>;
     }
 

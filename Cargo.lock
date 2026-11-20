@@ -5308,6 +5308,7 @@ version = "0.1.0"
 dependencies = [
  "percent-encoding",
  "reqwest 0.13.2",
+ "rstest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -5315,6 +5316,7 @@ dependencies = [
  "tracing",
  "unity-catalog-delta-client-api",
  "url",
+ "wiremock",
 ]
 
 [[package]]

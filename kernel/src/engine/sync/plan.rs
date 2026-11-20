@@ -154,11 +154,12 @@ impl SyncPlanExecutor {
 
     fn execute_io(&self, op: IoOperation) -> KernelResult<PlanResult> {
         match op {
-            IoOperation::FileListing { url } => {
+            IoOperation::FileListing { url, end } => {
                 // `StorageHandler::list_from` returns a non-`Send` iterator, so we collect into
                 // a `Vec` first to convert into a `Send` iterator.
                 // TODO(#2619): Evaluate whether StorageHandler should just return `Send` iterators
-                let metas: Vec<KernelResult<FileMeta>> = self.storage.list_from(&url)?.collect();
+                let metas: Vec<KernelResult<FileMeta>> =
+                    self.storage.list_from(&url, end.as_ref())?.collect();
                 Ok(PlanResult::FileMeta(Box::new(metas.into_iter())))
             }
             IoOperation::ReadBytes { files } => {
@@ -722,7 +723,9 @@ mod tests {
     use crate::arrow::buffer::{BooleanBuffer, NullBuffer};
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field};
     use crate::engine::sync::get_bytes;
-    use crate::expressions::{Expression, Predicate, StructData, col, column_name, expr, lit};
+    use crate::expressions::{
+        Expression, Predicate, StructData, col, column_name, expr, lit, null_lit,
+    };
     use crate::object_store::memory::InMemory;
     use crate::plans::PlanBuilder;
     use crate::plans::ir::nodes::Agg;
@@ -1065,6 +1068,82 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(values.iter().collect::<Vec<_>>(), [Some(7)]);
+        Ok(())
+    }
+
+    /// A top-level CASE guard nulls every output field while a nested CASE guard nulls only
+    /// its own struct. For `(keep, nested_keep, value) = (true, false, 10)`, the result is
+    /// `(10, true, NULL, NULL)`; a FALSE or NULL `keep` produces an all-NULL row.
+    #[test]
+    fn project_preserves_root_nulls_and_nested_guard_scope() -> KernelResult<()> {
+        let output_schema = schema_ref! {
+            nullable "value": LONG,
+            nullable "keep": BOOLEAN,
+            nullable "nested": { nullable "value": LONG },
+            nullable "nothing": VOID,
+        };
+        let nested = Expression::struct_with_nullability_from([col!("value")], col!("nested_keep"));
+        let plan = PlanBuilder::values(
+            schema_ref! {
+                nullable "keep": BOOLEAN,
+                nullable "nested_keep": BOOLEAN,
+                not_null "value": LONG,
+            },
+            vec![
+                vec![true.into(), true.into(), 7i64.into()],
+                vec![false.into(), true.into(), 8i64.into()],
+                vec![Scalar::null(DataType::BOOLEAN), true.into(), 9i64.into()],
+                vec![true.into(), false.into(), 10i64.into()],
+                vec![true.into(), Scalar::null(DataType::BOOLEAN), 11i64.into()],
+            ],
+        )?
+        .project(
+            Expression::struct_with_nullability_from(
+                [
+                    col!("value"),
+                    col!("keep"),
+                    nested,
+                    null_lit(DataType::VOID),
+                ],
+                col!("keep"),
+            ),
+            output_schema.clone(),
+        )?
+        .build()?;
+        let batches = SyncPlanExecutor::default()
+            .execute_op(Operation::QueryPlan(plan))?
+            .into_data()?
+            .map(|data| data.try_into_record_batch())
+            .collect::<KernelResult<Vec<_>>>()?;
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 5);
+        assert_eq!(
+            batch.schema().as_ref(),
+            &output_schema.as_ref().try_into_arrow()?
+        );
+        assert_eq!(
+            batch.column(0).as_ref(),
+            &Int64Array::from(vec![Some(7), None, None, Some(10), Some(11)])
+        );
+        assert_eq!(
+            batch.column(1).as_ref(),
+            &BooleanArray::from(vec![Some(true), None, None, Some(true), Some(true)])
+        );
+        let nested = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(
+            (0..5).map(|row| nested.is_valid(row)).collect::<Vec<_>>(),
+            [true, false, false, false, false]
+        );
+        assert_eq!(
+            nested.column(0).as_ref(),
+            &Int64Array::from(vec![Some(7), None, None, None, None])
+        );
+        assert_eq!(batch.column(3).logical_null_count(), 5);
         Ok(())
     }
 

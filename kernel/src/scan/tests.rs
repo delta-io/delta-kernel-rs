@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use ::test_utils::table_builder::{DataLayoutConfig, LogState, TableConfig, TestTableBuilder};
 use ::test_utils::{assert_result_error_with_message, get_column, load_test_data};
 use bytes::Bytes;
 use rstest::rstest;
@@ -706,15 +707,7 @@ fn test_scan_metadata_from_same_version() {
     let files: Vec<_> = scan
         .scan_metadata(engine.as_ref())
         .unwrap()
-        .map_ok(|ScanMetadata { scan_files, .. }| {
-            let (underlying_data, selection_vector) = scan_files.into_parts();
-            let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
-                .unwrap()
-                .into();
-            let filtered_batch =
-                filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
-            Box::new(ArrowEngineData::from(filtered_batch)) as Box<dyn EngineData>
-        })
+        .map_ok(selected_scan_files)
         .try_collect()
         .unwrap();
     let new_files: Vec<_> = scan
@@ -726,6 +719,95 @@ fn test_scan_metadata_from_same_version() {
     assert_eq!(new_files.len(), 1);
 }
 
+/// `scan_metadata_from` derives `partitionValues_parsed` from the string map, both for cached
+/// metadata at the same version and for cached metadata plus newer commits. Cached metadata from
+/// before the checkpoint falls back to a full scan, where the checkpoint batch reports its native
+/// column. Each case returns the same files as a full latest scan.
+#[rstest]
+#[case::before_checkpoint(0, &[ParsedColumnSource::Checkpoint, ParsedColumnSource::Derived])]
+#[case::at_checkpoint(1, &[ParsedColumnSource::Derived])]
+#[case::at_latest(2, &[ParsedColumnSource::Derived])]
+fn scan_metadata_from_reports_partition_values_source(
+    #[case] existing_version: Version,
+    #[case] expected_sources: &[ParsedColumnSource],
+) {
+    let table = TestTableBuilder::new()
+        .with_log_state(LogState::with_latest_version(2).with_checkpoint_at([1]))
+        .with_table_config(TableConfig::new().write_stats_as_struct(true))
+        .with_data_layout(DataLayoutConfig::PartitionedAllTypes)
+        .build()
+        .unwrap();
+    let engine = SyncEngine::new_with_store(table.store().clone());
+    let cached: Vec<_> = Snapshot::builder_for(table.table_root())
+        .at_version(existing_version)
+        .build(&engine)
+        .unwrap()
+        .scan_builder()
+        .build()
+        .unwrap()
+        .scan_metadata(&engine)
+        .unwrap()
+        .map_ok(selected_scan_files)
+        .try_collect()
+        .unwrap();
+    let scan = Snapshot::builder_for(table.table_root())
+        .build(&engine)
+        .unwrap()
+        .scan_builder()
+        .with_partition_values(PartitionValuesOptions::with_struct())
+        .build()
+        .unwrap();
+
+    let batches: Vec<_> = scan
+        .scan_metadata_from(&engine, existing_version, cached, None)
+        .unwrap()
+        .try_collect()
+        .unwrap();
+
+    let mut actual_sources = Vec::new();
+    let mut actual_paths = Vec::new();
+    for batch in batches {
+        if batch.scan_files.selection_vector().contains(&true) {
+            let source = batch.partition_values_source().unwrap();
+            if !actual_sources.contains(&source) {
+                actual_sources.push(source);
+            }
+        }
+        actual_paths = batch
+            .visit_scan_files(actual_paths, |paths, file| {
+                paths.push(file.path.to_string())
+            })
+            .unwrap();
+    }
+    assert_eq!(
+        actual_sources.len(),
+        expected_sources.len(),
+        "{actual_sources:?}"
+    );
+    assert!(
+        expected_sources.iter().all(|s| actual_sources.contains(s)),
+        "{actual_sources:?}"
+    );
+
+    let mut expected_paths = get_files_for_scan(scan, &engine).unwrap();
+    assert!(!expected_paths.is_empty());
+    actual_paths.sort();
+    expected_paths.sort();
+    assert_eq!(actual_paths, expected_paths);
+}
+
+/// Keeps only the selected rows of a batch, in the form `scan_metadata_from` accepts as cached
+/// metadata.
+fn selected_scan_files(ScanMetadata { scan_files, .. }: ScanMetadata) -> Box<dyn EngineData> {
+    let (underlying_data, selection_vector) = scan_files.into_parts();
+    let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
+        .unwrap()
+        .into();
+    let filtered_batch =
+        filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
+    Box::new(ArrowEngineData::from(filtered_batch))
+}
+
 #[rstest]
 fn scan_metadata_from_requires_timezone_support_only_for_timestamp_partitions(
     #[values("UTC", "America/Los_Angeles", "+05:30")] timezone: &str,
@@ -733,7 +815,7 @@ fn scan_metadata_from_requires_timezone_support_only_for_timestamp_partitions(
     #[values(false, true)] timestamp_partition: bool,
 ) {
     let table_root = "memory:///test_table/";
-    let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+    let engine = SyncEngine::in_memory();
     let partition_type = if timestamp_partition {
         DataType::TIMESTAMP
     } else {

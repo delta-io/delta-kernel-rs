@@ -462,11 +462,16 @@ impl<T: PartialEq + AsAny> DynPartialEq for T {
 /// Connectors can implement this trait to optimize the evaluation using the
 /// connector specific capabilities.
 pub trait ExpressionEvaluator: AsAny {
-    /// Evaluate the expression on a given EngineData.
+    /// Evaluates the expression on `batch`.
     ///
-    /// Produces one value for each row of the input.
-    /// The data type of the output is same as the type output of the expression this evaluator is
-    /// using.
+    /// Produces one value for each input row using the evaluator's output type. If the output is a
+    /// struct, its fields become output columns. A NULL struct row produces NULL in every output
+    /// column without changing the row count.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if evaluation fails, including when a NULL struct row would put NULL in a
+    /// non-nullable output column.
     fn evaluate(&self, batch: &dyn EngineData) -> KernelResult<Box<dyn EngineData>>;
 }
 
@@ -588,7 +593,17 @@ pub trait StorageHandler: AsAny {
     ///   contains all files at or below that directory.
     /// - Otherwise, the parent is the directory containing `path`, and only files (at any depth
     ///   under that parent) whose full path sorts strictly greater than `path` are returned.
-    fn list_from(&self, path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>>;
+    ///
+    /// When `end` is present, every yielded location must sort strictly before it by
+    /// percent-decoded URL path (UTF-8 byte order). That is the same space engines use for the
+    /// listing offset derived from `path`, so a bound built with `Url::join` still matches listed
+    /// locations even when the caller's URL percent-encodes unreserved characters. Stream errors
+    /// are preserved and are not a stop signal.
+    fn list_from(
+        &self,
+        path: &Url,
+        end: Option<&Url>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>>;
 
     /// Cancellation-aware variant of [`list_from`].
     ///
@@ -601,10 +616,11 @@ pub trait StorageHandler: AsAny {
     fn list_from_with_cancellation(
         &self,
         path: &Url,
+        end: Option<&Url>,
         cancellation_token: Option<CancellationTokenRef>,
     ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
         check_cancelled(cancellation_token.as_ref())?;
-        let iter = self.list_from(path)?;
+        let iter = self.list_from(path, end)?;
         Ok(Box::new(CancellableIterator::new(iter, cancellation_token)))
     }
 
@@ -652,6 +668,94 @@ pub trait StorageHandler: AsAny {
     /// This operation is idempotent: deleting a path that does not exist should return `Ok(())`.
     /// For any other error, this must propagate the corresponding error.
     fn delete(&self, path: &Url) -> KernelResult<()>;
+}
+
+/// Whether a listing item should be yielded given an exclusive URL upper bound.
+///
+/// Errors are never a stop signal. When `end` is `Some`, an `Ok` item is kept only if its
+/// percent-decoded path sorts strictly before `end`'s. This helper percent-decodes both paths
+/// itself; pass URLs as produced by listing or `Url::join`, not pre-decoded strings.
+///
+/// Engines that list and then filter can use this as the `take_while` / `filter` predicate when
+/// implementing [`StorageHandler::list_from`]. `take_while` is valid only when the stream is
+/// already sorted in that same decoded-path order.
+pub fn keep_listing(item: &KernelResult<FileMeta>, end: Option<&Url>) -> bool {
+    match item {
+        Ok(meta) => end.is_none_or(|end| {
+            path_encoding::uri_decode_path(meta.location.path())
+                .zip(path_encoding::uri_decode_path(end.path()))
+                .is_none_or(|(location, end)| location.as_ref() < end.as_ref())
+        }),
+        Err(_) => true,
+    }
+}
+
+#[cfg(test)]
+mod keep_listing_tests {
+    use super::*;
+
+    fn meta(url: &str) -> FileMeta {
+        FileMeta::new(Url::parse(url).unwrap(), 0, 0)
+    }
+
+    #[test]
+    fn keeps_errors_and_unbounded_listings() {
+        let err = Err(KernelError::generic("boom"));
+        assert!(keep_listing(&err, None));
+        assert!(keep_listing(
+            &err,
+            Some(&Url::parse("s3://bucket/table/_delta_log/:").unwrap())
+        ));
+        assert!(keep_listing(
+            &Ok(meta("s3://bucket/table/_delta_log/1.json")),
+            None
+        ));
+    }
+
+    #[test]
+    fn compares_percent_decoded_paths() {
+        let end = Url::parse("s3://bucket/t%61ble/_delta_log/:").unwrap();
+        // Listed locations rebuild the object key with path_segments_mut, so unreserved escapes
+        // become literal characters while the caller-built bound may still contain %61.
+        assert!(keep_listing(
+            &Ok(meta(
+                "s3://bucket/table/_delta_log/00000000000000000000.json"
+            )),
+            Some(&end)
+        ));
+        assert!(!keep_listing(
+            &Ok(meta("s3://bucket/table/_delta_log/_staged_commits/x.json")),
+            Some(&end)
+        ));
+        assert!(!keep_listing(
+            &Ok(meta("s3://bucket/table/_delta_log/:")),
+            Some(&end)
+        ));
+    }
+
+    #[test]
+    fn compares_unicode_by_decoded_utf8_order() {
+        // Native/object-store order is z then é. URL-string order puts %C3%A9 before m and z.
+        let end_m = Url::parse("s3://bucket/dir/m").unwrap();
+        assert!(!keep_listing(
+            &Ok(meta("s3://bucket/dir/z.json")),
+            Some(&end_m)
+        ));
+        assert!(!keep_listing(
+            &Ok(meta("s3://bucket/dir/%C3%A9.json")),
+            Some(&end_m)
+        ));
+
+        let end_tilde = Url::parse("s3://bucket/dir/~").unwrap();
+        assert!(keep_listing(
+            &Ok(meta("s3://bucket/dir/z.json")),
+            Some(&end_tilde)
+        ));
+        assert!(!keep_listing(
+            &Ok(meta("s3://bucket/dir/%C3%A9.json")),
+            Some(&end_tilde)
+        ));
+    }
 }
 
 /// Provides JSON handling functionality to Delta Kernel.
