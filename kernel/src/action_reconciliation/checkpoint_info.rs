@@ -7,8 +7,8 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::actions::{
-    CHECKPOINT_METADATA_FIELD, CHECKPOINT_METADATA_NAME, CHECKPOINT_NUM_ADD_FILES_TAG,
-    CheckpointMetadata, SIDECAR_FIELD, SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME, Sidecar,
+    CHECKPOINT_METADATA_NAME, CHECKPOINT_NUM_ADD_FILES_TAG, CheckpointMetadata,
+    SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME, Sidecar,
 };
 use crate::checkpoint::{CHECKPOINT_ACTIONS_SCHEMA_V2, CheckpointInfo};
 use crate::expressions::{Predicate, col};
@@ -17,7 +17,7 @@ use crate::log_segment::LogSegment;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::plans::ir::nodes::FileType;
 use crate::plans::{PlanBuilder, PlanExecutor, PlanExecutorExt as _};
-use crate::schema::{SchemaRef, StructType, schema_ref};
+use crate::schema::{SchemaRef, StructType, ToSchema};
 use crate::{FileMeta, KernelError, KernelResult};
 
 impl CheckpointInfo {
@@ -214,7 +214,18 @@ fn collect_checkpoint_metadata(
     file: &FileMeta,
     file_type: FileType,
 ) -> KernelResult<(Vec<Sidecar>, Option<CheckpointMetadata>)> {
-    let schema = schema_ref! { (&SIDECAR_FIELD), (&CHECKPOINT_METADATA_FIELD) };
+    #[derive(delta_kernel_derive::ToSchema, delta_kernel_derive::TryFromStructData)]
+    enum CheckpointRow {
+        Sidecar(Sidecar),
+        CheckpointMetadata(CheckpointMetadata),
+    }
+    #[derive(delta_kernel_derive::TryFromStructRows)]
+    #[row_type(CheckpointRow)]
+    struct CheckpointRows {
+        sidecar: Vec<Sidecar>,
+        checkpoint_metadata: Option<CheckpointMetadata>,
+    }
+    let schema = CheckpointRow::schema_ref().clone();
     let predicate = Predicate::or(
         col!(SIDECAR_NAME, "path").is_not_null(),
         col!(CHECKPOINT_METADATA_NAME, "version").is_not_null(),
@@ -225,11 +236,6 @@ fn collect_checkpoint_metadata(
     }?
     .filter(predicate)?
     .build()?;
-    #[derive(delta_kernel_derive::TryFromStructRows)]
-    struct CheckpointRows {
-        sidecar: Vec<Sidecar>,
-        checkpoint_metadata: Option<CheckpointMetadata>,
-    }
     let rows: CheckpointRows = exec.execute_plan_into(plan)?;
     Ok((rows.sidecar, rows.checkpoint_metadata))
 }
