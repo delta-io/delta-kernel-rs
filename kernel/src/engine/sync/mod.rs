@@ -252,7 +252,7 @@ pub(super) fn put_bytes(
             crate::object_store::Error::AlreadyExists { .. } => {
                 KernelError::FileAlreadyExists(location.to_string())
             }
-            other => KernelError::generic(other.to_string()),
+            other => KernelError::from(other),
         }
     })?;
     Ok(())

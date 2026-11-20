@@ -4,7 +4,7 @@
 //!
 //! **Statistics** (controlled by `delta.checkpoint.writeStatsAsStruct` / `writeStatsAsJson`):
 //! - `stats`: JSON string format (default: enabled)
-//! - `stats_parsed`: Native struct format (default: disabled)
+//! - `stats_parsed`: Native struct format (default: enabled)
 //!
 //! **Partition values** (controlled by `delta.checkpoint.writeStatsAsStruct`):
 //! - `partitionValues`: String-valued map (always present)
@@ -296,24 +296,18 @@ mod tests {
     use crate::expressions::ExpressionStructPatch;
     use crate::schema::{MapType, schema, schema_ref};
 
-    #[test]
-    fn test_config_defaults() {
-        // Default: writeStatsAsJson=true, writeStatsAsStruct=false (per protocol)
-        let props = TableProperties::default();
-        let config = StatsTransformConfig::from_table_properties(&props);
-        assert!(config.write_stats_as_json);
-        assert!(!config.write_stats_as_struct);
-    }
-
-    #[test]
-    fn test_config_with_struct_enabled() {
+    #[rstest]
+    #[case::default(None, true)]
+    #[case::enabled(Some(true), true)]
+    #[case::disabled(Some(false), false)]
+    fn test_config_stats_as_struct(#[case] configured: Option<bool>, #[case] expected: bool) {
         let props = TableProperties {
-            checkpoint_write_stats_as_struct: Some(true),
+            checkpoint_write_stats_as_struct: configured,
             ..Default::default()
         };
         let config = StatsTransformConfig::from_table_properties(&props);
         assert!(config.write_stats_as_json);
-        assert!(config.write_stats_as_struct);
+        assert_eq!(config.write_stats_as_struct, expected);
     }
 
     /// Helper to extract the outer and inner patches from a stats transform expression.
@@ -404,7 +398,7 @@ mod tests {
 
     #[test]
     fn test_build_transform_with_json_only() {
-        // writeStatsAsJson=true, writeStatsAsStruct=false (default)
+        // writeStatsAsJson=true, writeStatsAsStruct=false
         // Inner patch: stats=COALESCE, stats_parsed=drop
         let config = StatsTransformConfig {
             write_stats_as_json: true,
