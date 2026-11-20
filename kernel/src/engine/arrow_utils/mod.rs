@@ -1356,6 +1356,27 @@ pub(crate) fn parse_json_impl(
     }
 }
 
+/// Parses JSON strings into a struct array whose root validity matches the input.
+///
+/// When decoding succeeds, NULL input strings produce NULL structs. Non-NULL strings follow
+/// [`parse_json_impl`]'s permissive leaf-parsing behavior.
+///
+/// # Errors
+///
+/// Returns an error if decoding fails or the decoded columns cannot form a struct array.
+pub(crate) fn parse_json_to_struct(
+    json_strings: &dyn ArrowArray,
+    schema: SchemaRef,
+) -> KernelResult<StructArray> {
+    let (schema, columns, num_rows) = parse_json_impl(json_strings, schema)?.into_parts();
+    Ok(StructArray::try_new_with_length(
+        schema.fields().clone(),
+        columns,
+        json_strings.nulls().cloned(),
+        num_rows,
+    )?)
+}
+
 fn parse_json_inner<'a>(
     json_strings: impl Iterator<Item = Option<&'a str>>,
     num_rows: usize,
@@ -1380,7 +1401,7 @@ fn parse_json_inner<'a>(
 
 /// Runs arrow-json's typed `Decoder` against the given schema and returns the resulting
 /// `RecordBatch`. Each input string must contain exactly one JSON object; missing inputs
-/// (`None`) decode as `{}` so the row stays present with all-NULL fields.
+/// (`None`) decode as `{}` to keep the row. [`parse_json_to_struct`] restores their root validity.
 fn decode_with_arrow_json<'a>(
     json_strings: impl Iterator<Item = Option<&'a str>>,
     num_rows: usize,
