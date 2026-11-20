@@ -130,9 +130,9 @@ pub(crate) struct CheckpointReadOptions<'a> {
     /// Partition schema the caller can consume. When the checkpoint has compatible
     /// `partitionValues_parsed`, batches carry it so callers need not parse partition strings.
     pub partition_schema: Option<&'a StructType>,
-    /// Operator that encodes the table's file stats as JSON when a checkpoint's `add.stats` must
-    /// be rebuilt from its parsed stats. Callers that read `add.stats` pass the table
-    /// configuration's `stats_json_op`.
+    /// Operator that rebuilds `add.stats` from parsed stats when the checkpoint carries collation
+    /// stats. Callers that project `add.stats_parsed` pass the table configuration's
+    /// `stats_json_op`.
     pub stats_json_op: UnaryExpressionOp,
 }
 
@@ -1177,7 +1177,6 @@ impl LogSegment {
     }
 
     /// Reads original commits and checkpoint files with the same action schema, newest first.
-    /// Checkpoint `add.stats` rebuilt from parsed stats uses [`UnaryExpressionOp::ToJson`].
     #[internal_api]
     pub(crate) fn read_actions(
         &self,
@@ -1400,6 +1399,10 @@ impl LogSegment {
             self.create_checkpoint_stream(
                 engine,
                 checkpoint_schema,
+                // Without a stats schema, `add.stats` is only rebuilt from collation stats, which
+                // hold no timestamps, so `read_actions`' millisecond operator is safe. Passing a
+                // stats schema would need the table's operator to keep adaptiveMetadata
+                // `tightStats` timestamp bounds untruncated.
                 CheckpointReadOptions {
                     meta_predicate: predicate,
                     stats_json_op,
