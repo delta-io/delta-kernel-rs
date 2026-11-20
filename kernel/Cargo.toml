@@ -38,6 +38,7 @@ redundant_field_names = "allow"
 
 [dependencies]
 delta_kernel_derive = { path = "../derive-macros", version = "0.30.1" }
+anyhow = "1"
 bytes = "1.10"
 chrono = "0.4.41"
 chrono-tz = { version = "0.10.4", optional = true }

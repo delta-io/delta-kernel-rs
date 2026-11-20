@@ -548,6 +548,36 @@ impl KernelError {
             source: source.into(),
         }
     }
+
+    /// Wraps this failure with diagnostic context, retaining the original error in its source
+    /// chain.
+    ///
+    /// Display includes the context and the complete cause report. Cancellation passes through
+    /// unchanged, and existing backtraces are preserved. Context is stored in
+    /// [`KernelError::GenericError`]; inspect the source chain to recover the original typed error.
+    pub fn wrap_with_context(self, message: impl Into<String>) -> Self {
+        if matches!(self.without_backtrace(), Self::Cancelled) {
+            return self;
+        }
+
+        let message = message.into();
+        let error = match self {
+            Self::Backtraced { source, backtrace } => {
+                return Self::Backtraced {
+                    source: Box::new((*source).wrap_with_context(message)),
+                    backtrace,
+                };
+            }
+            Self::GenericError { source } => match source.downcast::<AnyhowSource>() {
+                Ok(error) => error.0,
+                Err(source) => anyhow::Error::new(Self::GenericError { source }),
+            },
+            error => anyhow::Error::new(error),
+        };
+
+        Self::generic_err(AnyhowSource(error.context(message)))
+    }
+
     pub fn generic(msg: impl ToString) -> Self {
         Self::Generic(msg.to_string())
     }
@@ -739,3 +769,7 @@ impl From<Infallible> for KernelError {
         match value {}
     }
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0:?}")]
+struct AnyhowSource(#[source] anyhow::Error);

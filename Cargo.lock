@@ -1532,6 +1532,7 @@ dependencies = [
 name = "delta_kernel"
 version = "0.30.1"
 dependencies = [
+ "anyhow",
  "arrow 59.3.0",
  "arrow 60.0.0",
  "async-trait",
