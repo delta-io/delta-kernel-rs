@@ -9,7 +9,8 @@ use delta_kernel::actions::Metadata;
 use delta_kernel::actions::{Add, LastManifestCommit};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use delta_kernel::crc::Crc;
-use delta_kernel::engine::{DelegatingEngine, PanicEngine};
+use delta_kernel::engine::DelegatingEngine;
+use delta_kernel::engine::sync::SyncEngine;
 use delta_kernel::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
 use delta_kernel::log_segment::LogSegment;
 use delta_kernel::metrics::{MetricEvent, SnapshotLoadType};
@@ -18,7 +19,8 @@ use delta_kernel::snapshot::{IncrementalReplay, PublicationWatermark, Snapshot};
 use delta_kernel::{FileMeta, FileSlice, KernelResult, KernelResultIterator, StorageHandler};
 use test_utils::table_builder::{LogState, TestTableBuilder};
 use test_utils::{
-    CapturingReporter, TestCatalogCommitter, compacted_log_path_for_versions, create_log_path,
+    CapturingReporter, CountingEngine, TestCatalogCommitter, compacted_log_path_for_versions,
+    create_log_path,
 };
 use url::Url;
 
@@ -145,7 +147,10 @@ fn empty_crc() -> FfiCrc {
 }
 
 fn test_engine() -> Handle<SharedExternEngine> {
-    engine_to_handle(Arc::new(PanicEngine), TEST_ERROR_ALLOCATORS)
+    engine_to_handle(
+        Arc::new(CountingEngine::new_no_io(Arc::new(SyncEngine::in_memory()))),
+        TEST_ERROR_ALLOCATORS,
+    )
 }
 
 struct SingleHeadStorage(Mutex<Option<FileMeta>>);
@@ -1039,12 +1044,11 @@ fn visited_hint_preserves_commit_paths_and_watermark_for_explicit_version(
             23,
             19,
         );
-        let publish_engine = DelegatingEngine::new(Arc::new(PanicEngine)).with_storage_handler(
-            Arc::new(SingleHeadStorage(Mutex::new(Some(published_meta)))),
-        );
-        source_ref
-            .publish(&publish_engine, &TestCatalogCommitter)
-            .unwrap()
+        let storage = Arc::new(SingleHeadStorage(Mutex::new(Some(published_meta))));
+        let engine =
+            DelegatingEngine::new(Arc::new(SyncEngine::new())).with_storage_handler(storage);
+        let engine = CountingEngine::new_only_storage_io(Arc::new(engine));
+        source_ref.publish(&engine, &TestCatalogCommitter).unwrap()
     } else {
         source_ref.clone()
     };

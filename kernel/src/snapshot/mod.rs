@@ -2049,7 +2049,7 @@ mod tests {
     use crate::arrow::array::StringArray;
     use crate::arrow::record_batch::RecordBatch;
     use crate::committer::{CommitMetadata, CommitResponse, FileSystemCommitter};
-    use crate::engine::PanicEngine;
+    use crate::engine::CountingEngine;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -2277,7 +2277,8 @@ mod tests {
         assert_eq!(source.log_segment(), &original_segment);
 
         // Publishing the returned snapshot again must neither copy files nor create a new snapshot.
-        let repeated = published.publish(&PanicEngine, &committer).unwrap();
+        let counting = CountingEngine::new_no_io(Arc::new(SyncEngine::new()));
+        let repeated = published.publish(&counting, &committer).unwrap();
         assert!(Arc::ptr_eq(&published, &repeated));
         assert_eq!(*committer.calls.borrow(), expected_calls);
     }
@@ -2310,16 +2311,15 @@ mod tests {
             .unwrap(),
         );
         let original_segment = source.log_segment().clone();
+        let engine = CountingEngine::new(Arc::new(engine));
 
         // WHEN: publish with nothing left in ascending_commit_files to copy.
-        let publish_engine: &dyn Engine = if published_through == Some(2) {
-            &engine
-        } else {
-            &PanicEngine
-        };
         let result = source
-            .publish(publish_engine, &FileSystemCommitter::new())
+            .publish(&engine, &FileSystemCommitter::new())
             .unwrap();
+        if published_through != Some(2) {
+            engine.assert_no_io();
+        }
 
         // THEN: replace latest_commit_file only if version 2 is known to be published.
         assert!(
@@ -2354,7 +2354,7 @@ mod tests {
     fn test_publish_retry_after_committer_failure() {
         // GIVEN: commit 1 is published, and the committer fails its first attempt to publish 2.
         let source = snapshot_with_staged_commits(Some(1), Some(0), true);
-        let engine = engine_with_published_commits();
+        let engine = CountingEngine::new(Arc::new(engine_with_published_commits()));
         let original_segment = source.log_segment().clone();
         let committer = RecordingPublishCommitter {
             fail_once: Cell::new(true),
@@ -2362,11 +2362,12 @@ mod tests {
         };
 
         // WHEN: publication fails.
-        let result = source.publish(&PanicEngine, &committer);
+        let result = source.publish(&engine, &committer);
 
         // THEN: report the failure and leave the input snapshot unchanged.
         assert_result_error_with_message(result, "injected publication failure");
         assert_eq!(source.log_segment(), &original_segment);
+        engine.assert_no_io();
 
         // WHEN: retry publication from the same input snapshot.
         let result = source.publish(&engine, &committer).unwrap();
@@ -2446,9 +2447,10 @@ mod tests {
         } else {
             &filesystem
         };
+        let engine = CountingEngine::new_no_io(Arc::new(SyncEngine::new()));
 
         // WHEN: attempt to publish the snapshot.
-        let result = source.publish(&PanicEngine, committer);
+        let result = source.publish(&engine, committer);
 
         // THEN: reject the unsupported table or committer before copying any files.
         assert_result_error_with_message(result, error);
@@ -2475,9 +2477,10 @@ mod tests {
             files.pop();
         }
         let committer = RecordingPublishCommitter::default();
+        let engine = CountingEngine::new_no_io(Arc::new(SyncEngine::new()));
 
         // WHEN: attempt to publish with a missing version or missing final commit.
-        let result = source.publish(&PanicEngine, &committer);
+        let result = source.publish(&engine, &committer);
 
         // THEN: reject the incomplete commit list before calling the committer.
         assert_result_error_with_message(result, error);
@@ -2499,10 +2502,11 @@ mod tests {
             .new_as_published(&engine, Some(2))
             .unwrap()
             .unwrap();
+        let engine = CountingEngine::new_no_io(Arc::new(SyncEngine::new()));
 
         // WHEN: call publish without any catalog commits to copy.
         let result = source
-            .publish(&PanicEngine, &FileSystemCommitter::new())
+            .publish(&engine, &FileSystemCommitter::new())
             .unwrap();
 
         // THEN: return the original snapshot.

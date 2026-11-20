@@ -224,6 +224,7 @@ use delta_kernel::committer::{
 use delta_kernel::engine::DelegatingEngine;
 use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow};
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
+pub use delta_kernel::engine::{CountingEngine, CountingHandler};
 use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::memory::InMemory;

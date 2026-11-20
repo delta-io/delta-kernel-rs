@@ -11,9 +11,9 @@ use delta_kernel::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray}
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::crc::{Crc, DomainMetadataState, SetTransactionState};
+use delta_kernel::engine::DelegatingEngine;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::{DelegatingEngine, PanicEngine};
 use delta_kernel::metrics::{ChecksumWriteResolutionMode, MetricEvent};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::path::ParsedLogPath;
@@ -32,9 +32,10 @@ use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::{
-    CapturingReporter, add_commit, assert_result_error_with_message, begin_transaction_with,
-    copy_directory, insert_data, insert_data_with, install_thread_local_metrics_reporter,
-    read_actions_from_commit, read_scan, test_table_setup, test_table_setup_mt,
+    CapturingReporter, CountingEngine, add_commit, assert_result_error_with_message,
+    begin_transaction_with, copy_directory, insert_data, insert_data_with,
+    install_thread_local_metrics_reporter, read_actions_from_commit, read_scan, test_table_setup,
+    test_table_setup_mt,
 };
 use url::Url;
 
@@ -1720,10 +1721,11 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> delta_kernel::R
     };
 
     // Case 1: Post-commit snapshot with in-memory CRC => DM loaded from CRC (fast path).
-    //         Use PanicEngine to prove no log replay occurs.
+    //         Counting engine proves no log replay occurs.
     let post_commit_snapshot = committed.post_commit_snapshot().unwrap();
     assert!(post_commit_snapshot.crc_at_version().is_some());
-    assert_domain_metadata(post_commit_snapshot, &PanicEngine);
+    let counting_engine = CountingEngine::new_no_io(engine.clone());
+    assert_domain_metadata(post_commit_snapshot, &counting_engine);
 
     // Case 2: Fresh snapshot loaded from disk, no CRC file => DM loaded via log replay (slow path)
     let fresh_snapshot_no_crc = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -1731,12 +1733,13 @@ async fn test_get_domain_metadata_with_crc_skips_log_replay() -> delta_kernel::R
     assert_domain_metadata(&fresh_snapshot_no_crc, engine.as_ref());
 
     // Case 3: Write CRC to disk, then reload fresh snapshot => DM loaded from CRC (fast path)
-    //         Use PanicEngine to prove no log replay occurs.
+    //         Counting engine proves no log replay occurs.
     let _ = post_commit_snapshot.write_checksum(engine.as_ref())?;
 
     let fresh_snapshot_with_crc = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert!(fresh_snapshot_with_crc.crc_at_version().is_some());
-    assert_domain_metadata(&fresh_snapshot_with_crc, &PanicEngine);
+    let counting_engine = CountingEngine::new_no_io(engine.clone());
+    assert_domain_metadata(&fresh_snapshot_with_crc, &counting_engine);
 
     Ok(())
 }
@@ -1800,29 +1803,23 @@ async fn test_partial_dm_serves_hits_and_falls_through_for_misses() -> delta_ker
     assert!(map.contains_key("foo"));
 
     // Hit: "foo" is in the Partial cache, so served without log replay.
+    let counting_engine = CountingEngine::new(engine.clone());
     assert_eq!(
         snapshot_v1
             .reader()
-            .get_domain_metadata("foo", &PanicEngine)?,
+            .get_domain_metadata("foo", &counting_engine)?,
         Some("bar".to_string())
     );
+    counting_engine.assert_no_io();
 
-    // Miss: "zip" is not in this Partial cache; PanicEngine panics, real engine finds it.
-    assert!(
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            snapshot_v1
-                .reader()
-                .get_domain_metadata("zip", &PanicEngine)
-                .ok()
-        }))
-        .is_err()
-    );
+    // Miss: "zip" is not in this Partial cache, so it is read from the log.
     assert_eq!(
         snapshot_v1
             .reader()
-            .get_domain_metadata("zip", engine.as_ref())?,
+            .get_domain_metadata("zip", &counting_engine)?,
         Some("zap0".to_string())
     );
+    assert!(counting_engine.json.op_count() > 0);
 
     // Miss on a nonexistent domain falls through and returns None.
     assert_eq!(
@@ -1865,6 +1862,7 @@ async fn test_partial_dm_serves_hits_and_falls_through_for_misses() -> delta_ker
 #[tokio::test]
 async fn test_set_transaction_crc_tracking_and_fast_path() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let counting_engine = CountingEngine::new_no_io(engine.clone());
 
     // -- v0: CREATE TABLE (no set transactions) --
     let committed = create_table_and_commit(&table_path, engine.as_ref())?;
@@ -1883,7 +1881,7 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> delta_kernel::Resu
     assert_eq!(
         fresh_v0
             .reader()
-            .get_app_id_version("my-app", &PanicEngine)
+            .get_app_id_version("my-app", &counting_engine)
             .unwrap(),
         None
     );
@@ -1902,14 +1900,14 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> delta_kernel::Resu
     assert_eq!(
         snapshot_v1
             .reader()
-            .get_app_id_version("my-app", &PanicEngine)
+            .get_app_id_version("my-app", &counting_engine)
             .unwrap(),
         Some(1)
     );
     assert_eq!(
         snapshot_v1
             .reader()
-            .get_app_id_version("nonexistent", &PanicEngine)
+            .get_app_id_version("nonexistent", &counting_engine)
             .unwrap(),
         None
     );
@@ -1925,14 +1923,14 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> delta_kernel::Resu
     assert_eq!(
         fresh_v1
             .reader()
-            .get_app_id_version("my-app", &PanicEngine)
+            .get_app_id_version("my-app", &counting_engine)
             .unwrap(),
         Some(1)
     );
     assert_eq!(
         fresh_v1
             .reader()
-            .get_app_id_version("nonexistent", &PanicEngine)
+            .get_app_id_version("nonexistent", &counting_engine)
             .unwrap(),
         None
     );
@@ -1952,14 +1950,14 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> delta_kernel::Resu
     assert_eq!(
         snapshot_v2
             .reader()
-            .get_app_id_version("my-app", &PanicEngine)
+            .get_app_id_version("my-app", &counting_engine)
             .unwrap(),
         Some(2)
     );
     assert_eq!(
         snapshot_v2
             .reader()
-            .get_app_id_version("other-app", &PanicEngine)
+            .get_app_id_version("other-app", &counting_engine)
             .unwrap(),
         Some(1)
     );
@@ -1974,14 +1972,14 @@ async fn test_set_transaction_crc_tracking_and_fast_path() -> delta_kernel::Resu
     assert_eq!(
         fresh_v2
             .reader()
-            .get_app_id_version("my-app", &PanicEngine)
+            .get_app_id_version("my-app", &counting_engine)
             .unwrap(),
         Some(2)
     );
     assert_eq!(
         fresh_v2
             .reader()
-            .get_app_id_version("other-app", &PanicEngine)
+            .get_app_id_version("other-app", &counting_engine)
             .unwrap(),
         Some(1)
     );
@@ -2038,29 +2036,23 @@ async fn test_partial_set_txn_serves_hits_and_falls_through_for_misses() -> delt
     assert!(!map.contains_key("v1-app"));
 
     // Hit: "my-app" is in the Partial cache -- served without log replay.
+    let counting_engine = CountingEngine::new(engine.clone());
     assert_eq!(
         snapshot_v2
             .reader()
-            .get_app_id_version("my-app", &PanicEngine)?,
+            .get_app_id_version("my-app", &counting_engine)?,
         Some(1)
     );
+    counting_engine.assert_no_io();
 
-    // Miss: "v1-app" is NOT in the Partial cache; PanicEngine panics, real engine finds it.
-    assert!(
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            snapshot_v2
-                .reader()
-                .get_app_id_version("v1-app", &PanicEngine)
-                .ok()
-        }))
-        .is_err()
-    );
+    // Miss: "v1-app" is NOT in the Partial cache, so it is read from the log.
     assert_eq!(
         snapshot_v2
             .reader()
-            .get_app_id_version("v1-app", engine.as_ref())?,
+            .get_app_id_version("v1-app", &counting_engine)?,
         Some(1)
     );
+    assert!(counting_engine.json.op_count() > 0);
 
     // Miss: completely absent app_id falls through and returns None.
     assert_eq!(
@@ -2126,11 +2118,11 @@ async fn test_set_txn_expiration_via_crc_fast_path(
     // Verify CRC was loaded from disk
     assert!(snapshot.crc_at_version().is_some());
 
-    // PanicEngine proves the CRC fast path is used (no log replay)
+    // The counting engine proves the CRC fast path is used (no log replay)
     assert_eq!(
         snapshot
             .reader()
-            .get_app_id_version("my-app", &PanicEngine)
+            .get_app_id_version("my-app", &CountingEngine::new_no_io(engine.clone()))
             .unwrap(),
         expected
     );
@@ -2189,11 +2181,12 @@ async fn test_partial_set_txn_expired_hit_returns_none_via_fast_path() -> delta_
         .expect_partial();
     assert!(map.contains_key("my-app"));
 
-    // PanicEngine proves the Partial fast path is used; the expiration filter drops the txn.
+    // The counting engine proves the Partial fast path is used; the expiration filter drops the
+    // txn.
     assert_eq!(
         snapshot_v2
             .reader()
-            .get_app_id_version("my-app", &PanicEngine)?,
+            .get_app_id_version("my-app", &CountingEngine::new_no_io(engine.clone()))?,
         None
     );
 
@@ -2780,18 +2773,8 @@ async fn test_stale_crc_fresh_build_advance_matrix(
 
     let expect_crc_present = crc_staleness != CrcStaleness::Absent;
 
-    // Define our engines that will be used below.
-    let real_engine_iff_crc_missing: &dyn Engine = if expect_crc_present {
-        &PanicEngine
-    } else {
-        engine.as_ref()
-    };
-    let real_engine_iff_crc_missing_or_crc_missing_opt_fields: &dyn Engine =
-        if expect_crc_present && !crc_missing_opt_fields {
-            &PanicEngine
-        } else {
-            engine.as_ref()
-        };
+    let crc_cached_engine = CountingEngine::new(engine.clone());
+    let optional_fields_cached_engine = CountingEngine::new(engine.clone());
 
     // === Check: CRC presence ===
     assert_eq!(
@@ -2818,7 +2801,7 @@ async fn test_stale_crc_fresh_build_advance_matrix(
     assert!(
         fresh
             .reader()
-            .get_in_commit_timestamp(real_engine_iff_crc_missing)?
+            .get_in_commit_timestamp(&crc_cached_engine)?
             .is_some()
     );
 
@@ -2835,10 +2818,7 @@ async fn test_stale_crc_fresh_build_advance_matrix(
         assert!(
             fresh
                 .reader()
-                .get_domain_metadata_internal(
-                    domain,
-                    real_engine_iff_crc_missing_or_crc_missing_opt_fields
-                )?
+                .get_domain_metadata_internal(domain, &optional_fields_cached_engine)?
                 .is_some()
         );
     }
@@ -2848,17 +2828,16 @@ async fn test_stale_crc_fresh_build_advance_matrix(
         assert!(
             fresh
                 .reader()
-                .get_domain_metadata_internal(domain, real_engine_iff_crc_missing)?
+                .get_domain_metadata_internal(domain, &crc_cached_engine)?
                 .is_some()
         );
     }
 
     // === Check: set transactions written *before* the CRC ===
     assert_eq!(
-        fresh.reader().get_app_id_version(
-            "app_before_crc",
-            real_engine_iff_crc_missing_or_crc_missing_opt_fields
-        )?,
+        fresh
+            .reader()
+            .get_app_id_version("app_before_crc", &optional_fields_cached_engine)?,
         Some(0)
     );
 
@@ -2866,8 +2845,14 @@ async fn test_stale_crc_fresh_build_advance_matrix(
     assert_eq!(
         fresh
             .reader()
-            .get_app_id_version("app", real_engine_iff_crc_missing)?,
+            .get_app_id_version("app", &crc_cached_engine)?,
         Some(LATEST_VERSION)
+    );
+
+    assert_eq!(crc_cached_engine.total_op_count() == 0, expect_crc_present);
+    assert_eq!(
+        optional_fields_cached_engine.total_op_count() == 0,
+        expect_crc_present && !crc_missing_opt_fields
     );
 
     Ok(())

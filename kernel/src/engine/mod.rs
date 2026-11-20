@@ -80,6 +80,8 @@ pub mod plans;
 pub mod sync;
 
 #[cfg(any(test, feature = "test-utils"))]
+mod counting_engine;
+#[cfg(any(test, feature = "test-utils"))]
 mod relaxed_counter;
 #[cfg(any(test, feature = "test-utils"))]
 pub use relaxed_counter::RelaxedCounter;
@@ -88,7 +90,9 @@ pub use relaxed_counter::RelaxedCounter;
 mod test_delegating;
 
 #[cfg(any(test, feature = "test-utils"))]
-pub use test_delegating::{DelegatingEngine, PanicEngine};
+pub use counting_engine::{CountingEngine, CountingHandler};
+#[cfg(any(test, feature = "test-utils"))]
+pub use test_delegating::DelegatingEngine;
 
 #[cfg(feature = "default-engine-base")]
 pub mod arrow_data;

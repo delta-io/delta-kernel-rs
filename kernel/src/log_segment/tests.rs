@@ -22,7 +22,7 @@ use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use crate::engine::arrow_expression::evaluate_expression::extract_column_ref;
 use crate::engine::sync::SyncEngine;
 use crate::engine::sync::json::SyncJsonHandler;
-use crate::engine::{DelegatingEngine, PanicEngine};
+use crate::engine::{CountingEngine, DelegatingEngine};
 use crate::expressions::{col, column_name};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::last_checkpoint_hint::{AmtCheckpoint, CheckpointType};
@@ -104,12 +104,11 @@ fn delta_path_for_multipart_checkpoint(version: u64, part_num: u32, num_parts: u
     Path::from(format!("_delta_log/{name}").as_str())
 }
 
-// Utility method to build a log using a list of log paths and an optional checkpoint hint. The
-// LastCheckpointHint is written to `_delta_log/_last_checkpoint`.
-async fn build_log_with_paths_and_checkpoint(
+// Builds a log and returns the underlying engine so callers can wrap it in an engine decorator.
+async fn build_log_with_paths_and_checkpoint_impl(
     paths: &[Path],
     checkpoint_metadata: Option<&LastCheckpointHint>,
-) -> (Arc<dyn StorageHandler>, Url) {
+) -> (Arc<SyncEngine>, Url) {
     let store = Arc::new(InMemory::new());
 
     let data = bytes::Bytes::from("kernel-data");
@@ -133,12 +132,21 @@ async fn build_log_with_paths_and_checkpoint(
             .expect("Write _last_checkpoint");
     }
 
-    let engine = SyncEngine::new_with_store(store);
-    let storage = engine.storage_handler();
-
+    let engine = Arc::new(SyncEngine::new_with_store(store));
     let table_root = Url::parse("memory:///").expect("valid url");
     let log_root = table_root.join("_delta_log/").unwrap();
-    (storage, log_root)
+    (engine, log_root)
+}
+
+// Utility method to build a log using a list of log paths and an optional checkpoint hint. The
+// LastCheckpointHint is written to `_delta_log/_last_checkpoint`.
+async fn build_log_with_paths_and_checkpoint(
+    paths: &[Path],
+    checkpoint_metadata: Option<&LastCheckpointHint>,
+) -> (Arc<dyn StorageHandler>, Url) {
+    let (engine, log_root) =
+        build_log_with_paths_and_checkpoint_impl(paths, checkpoint_metadata).await;
+    (engine.storage_handler(), log_root)
 }
 
 // Create an in-memory store and return the store and the URL for the store's _delta_log directory.
@@ -5280,8 +5288,13 @@ async fn test_new_as_published_uses_published_file_metadata(
         .filter(|version| published_through.is_some_and(|through| **version <= through))
         .map(|version| delta_path_for_version(*version, "json"))
         .collect();
-    let (storage, _) = build_log_with_paths_and_checkpoint(&paths, None).await;
-    let engine = DelegatingEngine::new(Arc::new(PanicEngine)).with_storage_handler(storage.clone());
+    let (engine, _) = build_log_with_paths_and_checkpoint_impl(&paths, None).await;
+    let storage = engine.storage_handler();
+    let engine = if expect_updated {
+        CountingEngine::new_only_storage_io(engine)
+    } else {
+        CountingEngine::new_no_io(engine)
+    };
     for file in original
         .listed
         .ascending_commit_files
@@ -5300,15 +5313,10 @@ async fn test_new_as_published_uses_published_file_metadata(
         }
     }
     let source = original.clone();
-    let publish_engine: &dyn Engine = if expect_updated {
-        &engine
-    } else {
-        &PanicEngine
-    };
 
     // WHEN: replace staged references through the published version.
     let updated = original
-        .new_as_published(publish_engine, published_through)
+        .new_as_published(&engine, published_through)
         .unwrap();
 
     // THEN: use destination metadata only for eligible references.
@@ -5359,9 +5367,10 @@ async fn test_new_as_published_uses_published_file_metadata(
     assert_eq!(published.end_version, original.end_version);
     assert_eq!(published.log_root, original.log_root);
     assert_eq!(original, source);
+    let counting = CountingEngine::new_no_io(Arc::new(SyncEngine::new()));
     assert!(
         published
-            .new_as_published(&PanicEngine, published_through)
+            .new_as_published(&counting, published_through)
             .unwrap()
             .is_none()
     );
@@ -5399,16 +5408,16 @@ async fn test_new_as_published_with_checkpoint_at_snapshot_version(
         original.listed.latest_commit_file = None;
     }
 
-    let (storage, _) =
-        build_log_with_paths_and_checkpoint(&[delta_path_for_version(2, "json")], None).await;
-    let engine = DelegatingEngine::new(Arc::new(PanicEngine)).with_storage_handler(storage.clone());
-    let publish_engine: &dyn Engine = if retain_latest && published_through == Some(2) {
-        &engine
+    let (engine, _) =
+        build_log_with_paths_and_checkpoint_impl(&[delta_path_for_version(2, "json")], None).await;
+    let storage = engine.storage_handler();
+    let engine = if retain_latest && published_through == Some(2) {
+        CountingEngine::new_only_storage_io(engine)
     } else {
-        &PanicEngine
+        CountingEngine::new_no_io(engine)
     };
     let updated = original
-        .new_as_published(publish_engine, published_through)
+        .new_as_published(&engine, published_through)
         .unwrap();
 
     assert_eq!(updated.is_some(), expected_updated);
@@ -5464,15 +5473,14 @@ async fn test_new_as_published_missing_destination_preserves_original(
     })
     .await;
     let source = original.clone();
-    let (storage, _) = build_log_with_paths_and_checkpoint(
+    let (engine, _) = build_log_with_paths_and_checkpoint_impl(
         &[delta_path_for_version(present_version, "json")],
         None,
     )
     .await;
-    let engine = DelegatingEngine::new(Arc::new(PanicEngine)).with_storage_handler(storage);
 
+    let engine = CountingEngine::new_only_storage_io(engine);
     let result = original.new_as_published(&engine, Some(2));
-
     assert!(matches!(result, Err(KernelError::FileNotFound(_))));
     assert_eq!(original, source);
 }
@@ -5494,7 +5502,8 @@ async fn test_new_as_published_rejects_invalid_published_version(
     .await;
 
     // WHEN: publication would exceed version 2 or forget that version 1 is already published.
-    let result = original.new_as_published(&PanicEngine, published_through);
+    let counting = CountingEngine::new_no_io(Arc::new(SyncEngine::new()));
+    let result = original.new_as_published(&counting, published_through);
 
     // THEN: reject the invalid published version.
     assert!(matches!(result, Err(KernelError::InvalidLogSegment(_))));
@@ -5526,7 +5535,7 @@ async fn test_new_as_published_preserves_checkpoints_and_log_compactions() {
     assert!(!original.listed.ascending_compaction_files.is_empty());
     assert!(!original.listed.checkpoint_parts.is_empty());
 
-    let (storage, _) = build_log_with_paths_and_checkpoint(
+    let (engine, _) = build_log_with_paths_and_checkpoint_impl(
         &[
             delta_path_for_version(2, "json"),
             delta_path_for_version(3, "json"),
@@ -5534,7 +5543,7 @@ async fn test_new_as_published_preserves_checkpoints_and_log_compactions() {
         None,
     )
     .await;
-    let engine = DelegatingEngine::new(Arc::new(PanicEngine)).with_storage_handler(storage);
+    let engine = CountingEngine::new_only_storage_io(engine);
     let published = original
         .new_as_published(&engine, Some(3))
         .unwrap()

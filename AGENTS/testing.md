@@ -51,9 +51,14 @@ This list is non-exhaustive: when in doubt, browse the source files directly
 
 **Handler access and overrides (from `delta_kernel::engine`, with `test-utils`)**
 
-- `PanicEngine`: assert that an operation requests no required engine handler.
+- `CountingEngine`: delegates to an inner engine and counts actual handler operations without
+  counting handler access. Choose `new_no_io` / `new_only_storage_io` / `new` based on what the
+  final assertion would be (if any); the first two assert on drop. Midpoint checks can still call
+  `assert_no_io` / `assert_only_storage_io` on a `new` engine. Some `Engine`-based entry points
+  fetch handlers even when they perform no I/O, so assert on operation counts rather than handler
+  access.
 - `DelegatingEngine`: override selected handlers while delegating the rest to an inner engine.
-  See the types' rustdoc for override and executor selection behavior.
+  See the type's rustdoc for override and executor selection behavior.
 
 **Engine + table setup (from `test_utils`)**
 

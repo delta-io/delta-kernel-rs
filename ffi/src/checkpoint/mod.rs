@@ -113,13 +113,13 @@ mod tests {
     use std::ptr::NonNull;
     use std::sync::Arc;
 
-    use delta_kernel::engine::{DelegatingEngine, PanicEngine};
+    use delta_kernel::engine::CountingEngine;
+    use delta_kernel::engine::sync::SyncEngine;
     use delta_kernel::last_checkpoint_hint::LastCheckpointHint;
-    use delta_kernel::plans::{Operation, PlanExecutor, PlanResult};
     use delta_kernel::snapshot::{
         PublicationWatermark, Snapshot, SnapshotHint, SnapshotHintFreshness,
     };
-    use delta_kernel::{FileMeta, KernelResult, LogPath};
+    use delta_kernel::{FileMeta, LogPath};
     use rstest::rstest;
     use url::Url;
 
@@ -280,22 +280,14 @@ mod tests {
         }
     }
 
-    struct NoIoExecutor;
-
-    impl PlanExecutor for NoIoExecutor {
-        fn execute_op(&self, _op: Operation) -> KernelResult<PlanResult> {
-            panic!("unexpected declarative execution")
-        }
-    }
-
+    /// Builds a snapshot and engine handle for a hinted checkpoint. Resolving the checkpoint from
+    /// the hint must not perform I/O; the engine asserts that when it is dropped.
     fn checkpoint_handles(
         checkpoint: bool,
         manifest: bool,
         invalid_size: bool,
     ) -> (Handle<SharedSnapshot>, Handle<SharedExternEngine>) {
-        let engine = Arc::new(
-            DelegatingEngine::new(Arc::new(PanicEngine)).with_plan_executor(Arc::new(NoIoExecutor)),
-        );
+        let engine = Arc::new(CountingEngine::new_no_io(Arc::new(SyncEngine::in_memory())));
         let schema = r#"{"type":"struct","fields":[]}"#;
         let filename = "00000000000000000000.checkpoint.11111111-1111-1111-1111-111111111111.json";
         let last_checkpoint = checkpoint.then(|| serde_json::from_value::<LastCheckpointHint>(
