@@ -23,15 +23,28 @@ result_row! { pub(super) struct Add { pub(super) id: i32 } }
 result_row! { pub(super) struct Remove { pub(super) id: i32 } }
 result_row! { struct NullableRow { id: Option<i32> } }
 
-#[derive(Debug, PartialEq, DeriveStructRows)]
-#[row_type(Action)]
-struct Actions<A, B> {
-    add: A,
-    remove: B,
+macro_rules! action_collectors {
+    ($($name:ident($add:ty, $remove:ty)),* $(,)?) => {$(
+        #[derive(Debug, PartialEq, DeriveStructRows)]
+        struct $name {
+            add: $add,
+            remove: $remove,
+        }
+    )*};
+}
+
+action_collectors! {
+    Actions(Vec<Add>, Vec<Remove>),
+    RequiredActions(Add, Remove),
+    OptionalActions(Option<Add>, Option<Remove>),
+    AddAndRemoves(Add, Vec<Remove>),
+    OptionalAddAndRemoves(Option<Add>, Vec<Remove>),
+    CustomAddAndRemoves(CustomRow, Vec<Remove>),
+    OptionalCustomAddAndRemoves(Option<CustomRow>, Vec<Remove>),
+    CustomActions(Vec<CustomRow>, Vec<Remove>),
 }
 
 #[derive(Debug, PartialEq, DeriveStructRows)]
-#[row_type(NullableAction)]
 struct NullableRows {
     nullable_row: Option<NullableRow>,
     empty_row: Option<EmptyRow>,
@@ -103,8 +116,7 @@ fn variants_preserve_row_and_group_order_and_hidden_children() -> KernelResult<(
             Action::Add(Add { id: 4 })
         ]
     );
-    let groups: Actions<Vec<Add>, Vec<Remove>> =
-        execute_rows(batches.into_iter().map(Ok).collect())?;
+    let groups: Actions = execute_rows(batches.into_iter().map(Ok).collect())?;
     assert_eq!(
         groups,
         Actions {
@@ -123,14 +135,15 @@ fn variants_preserve_row_and_group_order_and_hidden_children() -> KernelResult<(
 }
 
 #[rstest]
-#[case::required(singleton::<Add>, singleton::<Remove>)]
-#[case::optional(optional::<Add>, optional::<Remove>)]
-#[case::vector(Some::<Vec<Add>>, Some::<Vec<Remove>>)]
-#[case::required_vector(singleton::<Add>, Some::<Vec<Remove>>)]
-#[case::optional_vector(optional::<Add>, Some::<Vec<Remove>>)]
+#[case::required(singleton::<Add>, singleton::<Remove>, |rows| execute_rows::<RequiredActions>(rows).map(|rows| (rows.add, rows.remove)))]
+#[case::optional(optional::<Add>, optional::<Remove>, |rows| execute_rows::<OptionalActions>(rows).map(|rows| (rows.add, rows.remove)))]
+#[case::vector(Some::<Vec<Add>>, Some::<Vec<Remove>>, |rows| execute_rows::<Actions>(rows).map(|rows| (rows.add, rows.remove)))]
+#[case::required_vector(singleton::<Add>, Some::<Vec<Remove>>, |rows| execute_rows::<AddAndRemoves>(rows).map(|rows| (rows.add, rows.remove)))]
+#[case::optional_vector(optional::<Add>, Some::<Vec<Remove>>, |rows| execute_rows::<OptionalAddAndRemoves>(rows).map(|rows| (rows.add, rows.remove)))]
 fn named_components_enforce_their_own_cardinality<A, B>(
     #[case] add: fn(Vec<Add>) -> Option<A>,
     #[case] remove: fn(Vec<Remove>) -> Option<B>,
+    #[case] collect: fn(Vec<KernelResult<RecordBatch>>) -> KernelResult<(A, B)>,
     #[values(0, 1, 2)] adds: usize,
     #[values(0, 1, 2)] removes: usize,
 ) -> KernelResult<()>
@@ -142,10 +155,8 @@ where
     let remove_rows = (100..100 + removes as i32)
         .map(|id| Remove { id })
         .collect();
-    let expected = add(add_rows)
-        .zip(remove(remove_rows))
-        .map(|(add, remove)| Actions { add, remove });
-    let actual = execute_rows::<Actions<A, B>>(variant_batches(adds, removes));
+    let expected = add(add_rows).zip(remove(remove_rows));
+    let actual = collect(variant_batches(adds, removes));
     match expected {
         Some(expected) => assert_eq!(actual?, expected),
         None => assert!(matches!(
@@ -158,15 +169,15 @@ where
 
 #[rstest]
 #[case::required(
-    |rows| execute_rows::<Actions<CustomRow, Vec<Remove>>>(rows).map(drop),
+    |rows| execute_rows::<CustomAddAndRemoves>(rows).map(drop),
     "exactly one row"
 )]
 #[case::optional(
-    |rows| execute_rows::<Actions<Option<CustomRow>, Vec<Remove>>>(rows).map(drop),
+    |rows| execute_rows::<OptionalCustomAddAndRemoves>(rows).map(drop),
     "at most one row"
 )]
 #[case::vector(
-    |rows| execute_rows::<Actions<Vec<CustomRow>, Vec<Remove>>>(rows).map(drop),
+    |rows| execute_rows::<CustomActions>(rows).map(drop),
     ""
 )]
 fn named_collections_use_manual_decoders_and_enforce_cardinality(
@@ -217,7 +228,7 @@ where
 }
 
 #[rstest]
-#[case::named_collection(execute_rows::<Actions<Add, Remove>>)]
+#[case::named_collection(execute_rows::<RequiredActions>)]
 #[case::named_enum(execute_rows::<Action>)]
 fn late_errors_precede_variant_and_component_cardinality<T: Debug>(
     #[case] convert: fn(Vec<KernelResult<RecordBatch>>) -> KernelResult<T>,

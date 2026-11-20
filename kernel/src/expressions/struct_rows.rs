@@ -67,17 +67,7 @@ pub(crate) fn decode_rows<T: TryFrom<StructData, Error = KernelError>>(
 pub(crate) fn group_struct_rows<const N: usize>(
     rows: Vec<StructData>,
     schema: &SchemaRef,
-    names: [&str; N],
 ) -> KernelResult<[Vec<StructData>; N]> {
-    if schema.num_fields() != N
-        || schema
-            .fields()
-            .any(|field| !names.contains(&field.name().as_str()))
-    {
-        return Err(KernelError::invalid_struct_data(
-            "Input row schema does not match collector fields",
-        ));
-    }
     let mut groups: [Vec<StructData>; N] = std::array::from_fn(|_| Vec::new());
     for (row_index, row) in rows.into_iter().enumerate() {
         let (actual, values) = row.into_parts();
@@ -93,9 +83,8 @@ pub(crate) fn group_struct_rows<const N: usize>(
             .zip(values)
             .filter(|(_, value)| !value.is_null())
         {
-            let group = names
-                .iter()
-                .position(|name| *name == field.name())
+            let group = schema
+                .index_of(field.name())
                 .and_then(|index| groups.get_mut(index))
                 .ok_or_else(|| KernelError::internal_error("Missing payload group"))?;
             group.push(value.try_into()?);
@@ -138,14 +127,7 @@ mod tests {
         }
     }
 
-    #[derive(ToSchema, IntoStructData, TryFromStructData)]
-    enum Change {
-        Removed(Added),
-        Added(Added),
-    }
-
     #[derive(Debug, PartialEq, TryFromStructRows)]
-    #[row_type(Change)]
     struct Changes {
         added: Added,
         removed: Vec<Added>,
