@@ -25,6 +25,7 @@ use tracing::span::Attributes;
 use tracing::warn;
 use uuid::Uuid;
 
+use super::{ScanPlanGenerationCompleted, ScanPlanOutcome};
 use crate::log_segment::LogSegment;
 
 // ====================================================================
@@ -114,7 +115,7 @@ pub enum MetricEvent {
     JsonReadCompleted(JsonReadCompleted),
     ParquetReadCompleted(ParquetReadCompleted),
     ScanMetadataCompleted(ScanMetadataCompleted),
-    ScanPlanGenerationCompleted(super::ScanPlanGenerationCompleted),
+    ScanPlanGenerationCompleted(ScanPlanGenerationCompleted),
     StorageListCompleted(StorageListCompleted),
     StorageReadCompleted(StorageReadCompleted),
     StorageCopyCompleted(StorageCopyCompleted),
@@ -176,9 +177,7 @@ impl MetricEvent {
             Self::ProtocolMetadataLoadSuccess(_) => Err(ProtocolMetadataLoadSuccess::SPAN_NAME),
             Self::SetTransactionLoadSuccess(_) => Err(SetTransactionLoadSuccess::SPAN_NAME),
             Self::LastCheckpointReadCompleted(_) => Err(LastCheckpointReadCompleted::SPAN_NAME),
-            Self::ScanPlanGenerationCompleted(_) => {
-                Err(super::ScanPlanGenerationCompleted::SPAN_NAME)
-            }
+            Self::ScanPlanGenerationCompleted(_) => Err(ScanPlanGenerationCompleted::SPAN_NAME),
             Self::ScanMetadataCompleted(_) => Err(ScanMetadataCompleted::SPAN_NAME),
             Self::JsonReadCompleted(_) => Err(JsonReadCompleted::SPAN_NAME),
             Self::ParquetReadCompleted(_) => Err(ParquetReadCompleted::SPAN_NAME),
@@ -214,9 +213,7 @@ impl MetricEvent {
             Self::LastCheckpointReadCompleted(_) => Err(LastCheckpointReadCompleted::SPAN_NAME),
             Self::CheckpointWriteSuccess(_) => Err(CheckpointWriteSuccess::SPAN_NAME),
             Self::ChecksumWriteSuccess(_) => Err(ChecksumWriteSuccess::SPAN_NAME),
-            Self::ScanPlanGenerationCompleted(_) => {
-                Err(super::ScanPlanGenerationCompleted::SPAN_NAME)
-            }
+            Self::ScanPlanGenerationCompleted(_) => Err(ScanPlanGenerationCompleted::SPAN_NAME),
             Self::ScanMetadataCompleted(_) => Err(ScanMetadataCompleted::SPAN_NAME),
             Self::JsonReadCompleted(_) => Err(JsonReadCompleted::SPAN_NAME),
             Self::ParquetReadCompleted(_) => Err(ParquetReadCompleted::SPAN_NAME),
@@ -277,7 +274,7 @@ impl MetricEvent {
     pub(crate) fn into_failure(self) -> Self {
         match self {
             Self::ScanPlanGenerationCompleted(mut e) => {
-                e.outcome = super::ScanPlanOutcome::Error;
+                e.outcome = ScanPlanOutcome::Error;
                 Self::ScanPlanGenerationCompleted(e)
             }
             Self::LogSegmentLoadSuccess(e) => Self::LogSegmentLoadFailure(LogSegmentLoadFailure {

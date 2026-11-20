@@ -10,6 +10,7 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan as _;
 
+use super::ScanPlanGenerationCompleted;
 use super::events::{
     CheckpointWriteSuccess, ChecksumWriteSuccess, CrcReadSuccess, DomainMetadataLoadSuccess,
     JsonReadCompleted, LastCheckpointReadCompleted, LogSegmentLoadSuccess, MetricEvent,
@@ -151,8 +152,8 @@ where
             ScanMetadataCompleted::SPAN_NAME => Some(MetricEvent::ScanMetadataCompleted(
                 ScanMetadataCompleted::from_attrs(attrs),
             )),
-            super::ScanPlanGenerationCompleted::SPAN_NAME => Some(
-                MetricEvent::ScanPlanGenerationCompleted(super::ScanPlanGenerationCompleted::new()),
+            ScanPlanGenerationCompleted::SPAN_NAME => Some(
+                MetricEvent::ScanPlanGenerationCompleted(ScanPlanGenerationCompleted::new()),
             ),
             STORAGE_SPAN => storage_metric_from_attrs(attrs),
             _ => None,
@@ -223,7 +224,7 @@ where
 
 /// Updates the nearest scan-plan event in the current tracing scope. Disabled reporting does
 /// not evaluate the update. Subscriber wrappers must expose their underlying tracing registry.
-pub(super) fn update_scan_plan(update: impl FnOnce(&mut super::ScanPlanGenerationCompleted)) {
+pub(super) fn update_scan_plan(update: impl FnOnce(&mut ScanPlanGenerationCompleted)) {
     Span::current().with_subscriber(|(id, dispatch)| {
         let registry = dispatch.downcast_ref::<tracing_subscriber::Registry>()?;
         for span in registry.span(id)?.scope() {
