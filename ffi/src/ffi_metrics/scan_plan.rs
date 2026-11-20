@@ -1,5 +1,7 @@
 //! Callback-scoped views of scan-plan metrics.
 
+use std::ptr::NonNull;
+
 use delta_kernel::metrics as kernel;
 use delta_kernel::scan::StructStats;
 
@@ -7,7 +9,7 @@ use super::{MetricEvent, MetricId, correlation_id_slice};
 use crate::checkpoint::{FfiCheckpointInfo, FfiSelectedCheckpointType, visit};
 use crate::delta_types::{FfiColumnName, FfiColumnNameArray};
 use crate::scan::{FfiPartitionValuesOptions, FfiStatsOptions};
-use crate::{FfiSlice, KernelStringSlice, OptionalValue, kernel_string_slice};
+use crate::{FfiSlice, KernelStringSlice, NullableCvoid, OptionalValue, kernel_string_slice};
 
 /// Layout version of the scan-plan metric and its nested records.
 pub const SCAN_PLAN_GENERATION_METRIC_VERSION: u32 = 4;
@@ -73,12 +75,22 @@ pub struct ScanPlanGenerationCompleted {
     pub compaction_file_count: u64,
 }
 
-pub(super) fn with_event(event: &kernel::ScanPlanGenerationCompleted, f: impl FnOnce(MetricEvent)) {
-    let info = event
-        .checkpoint
-        .as_ref()
-        .and_then(|checkpoint| checkpoint.info.as_deref());
-    if let Err(error) = visit(info, |info| {
+pub(super) fn with_event<F: FnOnce(MetricEvent)>(
+    event: &kernel::ScanPlanGenerationCompleted,
+    f: F,
+) {
+    extern "C" fn accept<F: FnOnce(MetricEvent)>(
+        context: NullableCvoid,
+        info: *const FfiCheckpointInfo,
+    ) {
+        let Some(context) = context else { return };
+        // Safety: visit invokes this callback synchronously with the live context below.
+        let (event, callback) = unsafe {
+            &mut *context
+                .cast::<(&kernel::ScanPlanGenerationCompleted, Option<F>)>()
+                .as_ptr()
+        };
+        let Some(f) = callback.take() else { return };
         let columns = match event.stats.struct_stats() {
             StructStats::None => &[][..],
             StructStats::AllIndexed { extra_indexed } => extra_indexed.as_slice(),
@@ -173,7 +185,13 @@ pub(super) fn with_event(event: &kernel::ScanPlanGenerationCompleted, f: impl Fn
             compaction_file_count: event.compaction_file_count,
         };
         f(MetricEvent::ScanPlanGenerationCompleted(&record));
-    }) {
+    }
+    let info = event
+        .checkpoint
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.info.as_deref());
+    let mut context = (event, Some(f));
+    if let Err(error) = visit(info, Some(NonNull::from(&mut context).cast()), accept::<F>) {
         tracing::warn!(%error, "Failed to convert scan-plan metric checkpoint information");
     }
 }
@@ -237,7 +255,9 @@ mod tests {
             compaction_file_count: 0,
         };
         let source = kernel::MetricEvent::ScanPlanGenerationCompleted(event.clone());
+        let mut visits = 0;
         MetricEvent::with_kernel_event(&source, |ffi| {
+            visits += 1;
             let MetricEvent::ScanPlanGenerationCompleted(record) = ffi else {
                 panic!("expected scan-plan metric");
             };
@@ -310,5 +330,6 @@ mod tests {
                 assert_eq!(checkpoint.sidecar_footer_calls, 0);
             }
         });
+        assert_eq!(visits, 1);
     }
 }
