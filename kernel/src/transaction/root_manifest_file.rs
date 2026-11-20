@@ -1076,7 +1076,8 @@ mod tests {
     // A change is this transaction's change or a log commit after the action. Existing sidecars
     // are kept unless a change touches a key stored in one; then every sidecar of that kind is
     // read and its entries move inline. Sidecars are read only when a change touches a key that
-    // isn't inline. Each entry takes its newest value: this transaction's change, then a commit
+    // isn't inline. A kind reads all of its sidecars or none, and reports `SidecarsInlined` when
+    // it drops them. Each entry takes its newest value: this transaction's change, then a commit
     // after the action, then the action itself; commits before the action are ignored. Each row
     // runs for txns, domains, or both; a kind the row doesn't change runs `UNTOUCHED`.
     #[rstest]
