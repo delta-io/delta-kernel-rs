@@ -44,6 +44,8 @@ use crate::expressions::ColumnName;
 #[cfg(feature = "declarative-plans")]
 use crate::expressions::lit;
 use crate::incremental_scan::IncrementalScanBuilder;
+#[cfg(feature = "declarative-plans")]
+use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::ActionsBatch;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::log_segment::LastManifestCommitResolution;
@@ -60,7 +62,9 @@ use crate::metrics::{
 };
 use crate::path::ParsedLogPath;
 #[cfg(feature = "declarative-plans")]
-use crate::plans::{Operation as PlanOperation, PlanBuilder, file_meta_from_batches};
+use crate::plans::ir::nodes::FileType;
+#[cfg(feature = "declarative-plans")]
+use crate::plans::{IoOperation, Operation as PlanOperation, PlanBuilder, file_meta_from_batches};
 use crate::row_tracking::{ROW_TRACKING_DOMAIN_NAME, parse_row_tracking_high_water_mark};
 use crate::scan::ScanBuilder;
 #[cfg(feature = "declarative-plans")]
@@ -1884,11 +1888,20 @@ impl Snapshot {
     /// reflects the new checkpoint. Commits and compaction files subsumed by the checkpoint are
     /// dropped from the returned snapshot.
     ///
+    /// With `declarative-plans`, an engine providing a plan executor uses one plan for all
+    /// checkpoint files and counts, followed by atomic publication of Kernel-generated
+    /// `_last_checkpoint` bytes. Errors on this route never fall back to handlers. V2 always
+    /// uses sidecars: `NoSidecar` is unsupported and the executor chooses sidecar grouping,
+    /// regardless of `file_actions_per_sidecar_hint`. Engines without an executor retain the
+    /// handler-based behavior, including inline V2 checkpoints and the sidecar-size hint.
+    /// Detailed processing, Remove, and sidecar metrics are available only on the handler-based
+    /// route; both routes report total bytes, Add actions, and checkpoint actions.
+    ///
     /// # Parameters
     /// - `engine`: Engine for data processing and I/O
     /// - `spec`: Checkpoint format specification. `None` uses the default checkpoint settings
-    ///   (auto-detecting V1/V2 from table features). For V2 checkpoints, the default is to not
-    ///   write sidecar files.
+    ///   (auto-detecting V1/V2 from table features). V2 defaults to sidecars on the declarative
+    ///   route and to inline file actions on the handler-based route.
     ///
     /// # Errors
     /// - If Kernel does not support reading or writing the table.
@@ -1907,7 +1920,7 @@ impl Snapshot {
     /// Note:
     ///     - It is still possible that an existing checkpoint gets overwritten if that checkpoint
     ///       was written by a concurrent writer.
-    ///     - This function uses [`crate::ParquetHandler::write_parquet_file`] and
+    ///     - The handler-based route uses [`crate::ParquetHandler::write_parquet_file`] and
     ///       [`crate::StorageHandler::head`], which may not be implemented by all engines. If you
     ///       are using the default engine, make sure to build it with the multi-threaded executor
     ///       if you want to use this method.
@@ -1981,44 +1994,85 @@ impl Snapshot {
             _ => {}
         }
 
+        #[cfg(feature = "declarative-plans")]
+        let executor = engine.plan_executor();
+        #[cfg(feature = "declarative-plans")]
+        if executor.is_some()
+            && matches!(
+                spec,
+                Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar))
+            )
+        {
+            return Err(
+                KernelError::unsupported("Declarative V2 checkpoints require sidecars").into(),
+            );
+        }
+
         let mode = match spec {
             Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar { .. })) => {
                 CheckpointWriteMode::V2WithSidecars
             }
+            #[cfg(feature = "declarative-plans")]
+            _ if v2_supported && executor.is_some() => CheckpointWriteMode::V2WithSidecars,
             _ if v2_supported => CheckpointWriteMode::V2WithoutSidecars,
             _ => CheckpointWriteMode::V1,
         };
         span.record("mode", mode.as_ref());
 
         let metrics = crate::checkpoint::metrics::CheckpointMetrics::new(&span);
+        #[cfg(feature = "declarative-plans")]
+        let metrics = if executor.is_some() {
+            crate::checkpoint::metrics::CheckpointMetrics::disabled()
+        } else {
+            metrics
+        };
         let _metrics_report = metrics.report_on_drop(span.clone());
         let writer = Arc::clone(self).create_checkpoint_writer(engine)?;
 
-        let write_result = match spec {
-            Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
-                file_actions_per_sidecar_hint,
-            })) => {
-                let hint =
-                    file_actions_per_sidecar_hint.unwrap_or(DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT);
-                writer.write_v2_checkpoint_with_sidecars(engine, hint, metrics.clone())
+        #[cfg(feature = "declarative-plans")]
+        let mut hint_bytes = Vec::new();
+        let write_result: Result<_> = (|| {
+            #[cfg(feature = "declarative-plans")]
+            if let Some(executor) = &executor {
+                let plan = writer.declarative_checkpoint_plan(engine, FileType::Parquet)?;
+                let result = executor.execute_op(PlanOperation::QueryPlan(plan))?;
+                let (file_meta, statistics, bytes) = writer.checkpoint_info_from_result(result)?;
+                hint_bytes = bytes;
+                return Ok((file_meta, statistics, None));
             }
-            _ => writer.write_checkpoint_without_sidecars(engine, metrics.clone()),
-        };
+            let info = match spec {
+                Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+                    file_actions_per_sidecar_hint,
+                })) => {
+                    let hint = file_actions_per_sidecar_hint
+                        .unwrap_or(DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT);
+                    writer.write_v2_checkpoint_with_sidecars(engine, hint, metrics.clone())
+                }
+                _ => writer.write_checkpoint_without_sidecars(engine, metrics.clone()),
+            }?;
+            Ok((
+                info.file_meta,
+                info.last_checkpoint_stats,
+                Some((info.num_remove_files, info.num_sidecars)),
+            ))
+        })();
 
-        let info = match write_result {
+        let (file_meta, statistics, legacy_counts) = match write_result {
             Ok(info) => info,
-            Err(KernelError::FileAlreadyExists(_)) => {
-                // NOTE: Per write_parquet_file's documentation, it should silently overwrite
-                // existing files, so we log a warning but still return the correct result.
+            Err(Error::Kernel(ref error))
+                if matches!(error.without_backtrace(), KernelError::FileAlreadyExists(_)) =>
+            {
+                // NOTE: Per write_parquet_file's documentation, handler writes should silently
+                // overwrite existing files, so we log a warning but still return the correct
+                // result.
                 warn!(
-                    "ParquetHandler::write_parquet_file unexpectedly failed on \
-                    FileAlreadyExists for version {}",
+                    "Checkpoint file already exists for version {}",
                     self.version()
                 );
                 span.record("outcome", CheckpointWriteOutcome::AlreadyExists.as_ref());
                 return Ok((CheckpointWriteResult::AlreadyExists, Arc::clone(self)));
             }
-            Err(e) => return Err(Error::Kernel(e)),
+            Err(error) => return Err(error),
         };
 
         // Freeze duration before hint publication. ReportGeneratorLayer waits for the final API
@@ -2029,9 +2083,30 @@ impl Snapshot {
         );
         // TODO(#3828): Report separate outcome and duration metrics for `_last_checkpoint`
         // publication.
-        writer.finalize(engine, &info.last_checkpoint_stats)?;
+        #[cfg(feature = "declarative-plans")]
+        if let Some(executor) = executor {
+            if let Some(hint_version) = self.log_segment.last_checkpoint_version()
+                && hint_version > self.version()
+            {
+                info!(
+                    hint_version,
+                    checkpoint_version = self.version(),
+                    "Skipping _last_checkpoint write: existing hint is newer than checkpoint"
+                );
+            } else {
+                let path = LastCheckpointHint::path(&self.log_segment.log_root)?;
+                let result = executor.execute_op(PlanOperation::IoOperation(
+                    IoOperation::write_bytes(path, hint_bytes.into(), true),
+                ))?;
+                result.into_unit()?;
+            }
+        } else {
+            writer.finalize(engine, &statistics)?;
+        }
+        #[cfg(not(feature = "declarative-plans"))]
+        writer.finalize(engine, &statistics)?;
 
-        let checkpoint_log_path = ParsedLogPath::new(info.file_meta).ok_or_else(|| {
+        let checkpoint_log_path = ParsedLogPath::new(file_meta).ok_or_else(|| {
             KernelError::internal_error("Checkpoint path could not be parsed as a log path")
         })?;
         let checkpoint_type = match mode {
@@ -2060,17 +2135,17 @@ impl Snapshot {
         )?;
         new_snapshot.retained_checkpoint_type = Some(checkpoint_type);
         let new_snapshot = Arc::new(new_snapshot);
-        span.record(
-            "size_in_bytes",
-            info.last_checkpoint_stats.size_in_bytes as u64,
-        );
-        span.record(
-            "num_add_files",
-            info.last_checkpoint_stats.num_of_add_files as u64,
-        );
-        span.record("num_remove_files", info.num_remove_files);
-        span.record("num_actions", info.last_checkpoint_stats.num_actions as u64);
-        span.record("num_sidecars", info.num_sidecars);
+        span.record("size_in_bytes", statistics.size_in_bytes as u64);
+        #[cfg(feature = "declarative-plans")]
+        if legacy_counts.is_none() {
+            span.record("bytes_written", statistics.size_in_bytes as u64);
+        }
+        span.record("num_add_files", statistics.num_of_add_files as u64);
+        span.record("num_actions", statistics.num_actions as u64);
+        if let Some((num_remove_files, num_sidecars)) = legacy_counts {
+            span.record("num_remove_files", num_remove_files);
+            span.record("num_sidecars", num_sidecars);
+        }
         Ok((CheckpointWriteResult::Written, new_snapshot))
     }
 
