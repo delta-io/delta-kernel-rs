@@ -34,7 +34,14 @@ use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_conversion::{TryIntoArrow as _, parquet_field_id_metadata};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::sync::SyncEngine;
-use crate::metrics::{MetricEvent, MetricsReporter, WithMetricsReporterLayer as _};
+use crate::metrics::{
+    CheckpointWriteCompleted, CheckpointWriteOutcome, ChecksumWriteCompleted, ChecksumWriteOutcome,
+    CrcReadCompleted, CrcReadOutcome, DomainMetadataLoadCompleted, DomainMetadataLoadOutcome,
+    LogSegmentLoadCompleted, LogSegmentLoadOutcome, MetricEvent, MetricsReporter,
+    ProtocolMetadataLoadCompleted, ProtocolMetadataLoadOutcome, SetTransactionLoadCompleted,
+    SetTransactionLoadOutcome, SnapshotBuildCompleted, SnapshotBuildOutcome,
+    TransactionCommitCompleted, TransactionCommitOutcome, WithMetricsReporterLayer as _,
+};
 use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::local::LocalFileSystem;
 use crate::object_store::memory::InMemory;
@@ -100,25 +107,79 @@ pub(crate) fn is_io_event(event: &MetricEvent) -> bool {
         | MetricEvent::StorageCopyCompleted(_)
         | MetricEvent::JsonReadCompleted(_)
         | MetricEvent::ParquetReadCompleted(_) => true,
-        MetricEvent::LogSegmentLoadSuccess(_)
-        | MetricEvent::LogSegmentLoadFailure(_)
-        | MetricEvent::ProtocolMetadataLoadSuccess(_)
-        | MetricEvent::ProtocolMetadataLoadFailure(_)
-        | MetricEvent::SnapshotBuildSuccess(_)
-        | MetricEvent::SnapshotBuildFailure(_)
-        | MetricEvent::TransactionCommitSuccess(_)
-        | MetricEvent::TransactionCommitFailure(_)
-        | MetricEvent::CheckpointWriteSuccess(_)
-        | MetricEvent::CheckpointWriteFailure(_)
-        | MetricEvent::DomainMetadataLoadSuccess(_)
-        | MetricEvent::DomainMetadataLoadFailure
-        | MetricEvent::SetTransactionLoadSuccess(_)
-        | MetricEvent::SetTransactionLoadFailure
-        | MetricEvent::CrcReadSuccess(_)
-        | MetricEvent::CrcReadFailure
+        MetricEvent::LogSegmentLoadCompleted(LogSegmentLoadCompleted {
+            outcome: LogSegmentLoadOutcome::Success { .. },
+            ..
+        })
+        | MetricEvent::LogSegmentLoadCompleted(LogSegmentLoadCompleted {
+            outcome: LogSegmentLoadOutcome::Error,
+            ..
+        })
+        | MetricEvent::ProtocolMetadataLoadCompleted(ProtocolMetadataLoadCompleted {
+            outcome: ProtocolMetadataLoadOutcome::Success { .. },
+            ..
+        })
+        | MetricEvent::ProtocolMetadataLoadCompleted(ProtocolMetadataLoadCompleted {
+            outcome: ProtocolMetadataLoadOutcome::Error,
+            ..
+        })
+        | MetricEvent::SnapshotBuildCompleted(SnapshotBuildCompleted {
+            outcome: SnapshotBuildOutcome::Success { .. },
+            ..
+        })
+        | MetricEvent::SnapshotBuildCompleted(SnapshotBuildCompleted {
+            outcome: SnapshotBuildOutcome::Error,
+            ..
+        })
+        | MetricEvent::TransactionCommitCompleted(TransactionCommitCompleted {
+            outcome: TransactionCommitOutcome::Success { .. },
+            ..
+        })
+        | MetricEvent::TransactionCommitCompleted(TransactionCommitCompleted {
+            outcome: TransactionCommitOutcome::Failure { .. },
+            ..
+        })
+        | MetricEvent::CheckpointWriteCompleted(CheckpointWriteCompleted {
+            outcome: CheckpointWriteOutcome::Written { .. } | CheckpointWriteOutcome::AlreadyExists,
+            ..
+        })
+        | MetricEvent::CheckpointWriteCompleted(CheckpointWriteCompleted {
+            outcome: CheckpointWriteOutcome::Error,
+            ..
+        })
+        | MetricEvent::DomainMetadataLoadCompleted(DomainMetadataLoadCompleted {
+            outcome: DomainMetadataLoadOutcome::Success { .. },
+            ..
+        })
+        | MetricEvent::DomainMetadataLoadCompleted(DomainMetadataLoadCompleted {
+            outcome: DomainMetadataLoadOutcome::Error,
+            ..
+        })
+        | MetricEvent::SetTransactionLoadCompleted(SetTransactionLoadCompleted {
+            outcome: SetTransactionLoadOutcome::Success { .. },
+            ..
+        })
+        | MetricEvent::SetTransactionLoadCompleted(SetTransactionLoadCompleted {
+            outcome: SetTransactionLoadOutcome::Error,
+            ..
+        })
+        | MetricEvent::CrcReadCompleted(CrcReadCompleted {
+            outcome: CrcReadOutcome::Success { .. },
+            ..
+        })
+        | MetricEvent::CrcReadCompleted(CrcReadCompleted {
+            outcome: CrcReadOutcome::Error,
+            ..
+        })
         | MetricEvent::LastCheckpointReadCompleted(_)
-        | MetricEvent::ChecksumWriteSuccess(_)
-        | MetricEvent::ChecksumWriteFailure(_)
+        | MetricEvent::ChecksumWriteCompleted(ChecksumWriteCompleted {
+            outcome: ChecksumWriteOutcome::Written { .. } | ChecksumWriteOutcome::AlreadyExists,
+            ..
+        })
+        | MetricEvent::ChecksumWriteCompleted(ChecksumWriteCompleted {
+            outcome: ChecksumWriteOutcome::Error,
+            ..
+        })
         | MetricEvent::ScanMetadataCompleted(_) => false,
     }
 }

@@ -56,27 +56,6 @@ impl MetricId {
     pub fn as_bytes(&self) -> [u8; 16] {
         *self.0.as_bytes()
     }
-
-    /// Extract the `operation_id` field from span attributes. Returns a nil id if the field is
-    /// absent, or warns and returns nil if the value is present but malformed.
-    pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
-        #[derive(Default)]
-        struct V(Uuid);
-        impl Visit for V {
-            fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-                if field.name() == "operation_id" {
-                    let s = format!("{value:?}");
-                    match Uuid::from_str(&s) {
-                        Ok(u) => self.0 = u,
-                        Err(e) => warn!("Invalid uuid '{s}' on span: {e}. Using default."),
-                    }
-                }
-            }
-        }
-        let mut v = V::default();
-        attrs.record(&mut v);
-        Self(v.0)
-    }
 }
 
 impl fmt::Display for MetricId {
@@ -89,28 +68,78 @@ impl fmt::Display for MetricId {
 // MetricEvent
 // ====================================================================
 
+/// Identity and table labels shared by metrics from the same operation.
+#[derive(Debug, Clone)]
+pub struct MetricContext {
+    /// Unique identifier assigned by Kernel to this operation.
+    pub operation_id: MetricId,
+    /// Opaque caller-supplied identifier for joining metrics to the caller's request.
+    pub correlation_id: Option<Arc<str>>,
+    /// Table mode used by the operation. Snapshot loading uses the requested mode.
+    pub table_type: TableType,
+}
+
+impl MetricContext {
+    fn empty() -> Self {
+        Self {
+            operation_id: MetricId::nil(),
+            correlation_id: None,
+            table_type: TableType::PathBased,
+        }
+    }
+
+    pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
+        let mut context = Self::empty();
+        attrs.record(&mut context);
+        context
+    }
+}
+
+impl Visit for MetricContext {
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        if field.name() == IS_CATALOG_MANAGED_FIELD {
+            self.table_type = TableType::from_catalog_managed(value);
+        }
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        match field.name() {
+            CORRELATION_ID_FIELD if !value.is_empty() => self.correlation_id = Some(value.into()),
+            "operation_id" => self.record_debug(field, &tracing::field::display(value)),
+            _ => {}
+        }
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        if let Some(id) = record_operation_id(field, value, "metric context") {
+            self.operation_id = id;
+        }
+    }
+}
+
+impl fmt::Display for MetricContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "id={}, table_type={}, correlation_id={:?}",
+            self.operation_id, self.table_type, self.correlation_id
+        )
+    }
+}
+
 /// Metric events emitted during Delta Kernel operations.
 #[derive(Debug, Clone)]
 pub enum MetricEvent {
-    LogSegmentLoadSuccess(LogSegmentLoadSuccess),
-    LogSegmentLoadFailure(LogSegmentLoadFailure),
-    ProtocolMetadataLoadSuccess(ProtocolMetadataLoadSuccess),
-    ProtocolMetadataLoadFailure(ProtocolMetadataLoadFailure),
-    SnapshotBuildSuccess(SnapshotBuildSuccess),
-    SnapshotBuildFailure(SnapshotBuildFailure),
-    TransactionCommitSuccess(TransactionCommitSuccess),
-    TransactionCommitFailure(TransactionCommitFailure),
-    DomainMetadataLoadSuccess(DomainMetadataLoadSuccess),
-    DomainMetadataLoadFailure,
-    SetTransactionLoadSuccess(SetTransactionLoadSuccess),
-    SetTransactionLoadFailure,
-    CrcReadSuccess(CrcReadSuccess),
-    CrcReadFailure,
+    LogSegmentLoadCompleted(LogSegmentLoadCompleted),
+    ProtocolMetadataLoadCompleted(ProtocolMetadataLoadCompleted),
+    SnapshotBuildCompleted(SnapshotBuildCompleted),
+    TransactionCommitCompleted(TransactionCommitCompleted),
+    DomainMetadataLoadCompleted(DomainMetadataLoadCompleted),
+    SetTransactionLoadCompleted(SetTransactionLoadCompleted),
+    CrcReadCompleted(CrcReadCompleted),
     LastCheckpointReadCompleted(LastCheckpointReadCompleted),
-    CheckpointWriteSuccess(CheckpointWriteSuccess),
-    CheckpointWriteFailure(CheckpointWriteFailure),
-    ChecksumWriteSuccess(ChecksumWriteSuccess),
-    ChecksumWriteFailure(ChecksumWriteFailure),
+    CheckpointWriteCompleted(CheckpointWriteCompleted),
+    ChecksumWriteCompleted(ChecksumWriteCompleted),
     JsonReadCompleted(JsonReadCompleted),
     ParquetReadCompleted(ParquetReadCompleted),
     ScanMetadataCompleted(ScanMetadataCompleted),
@@ -120,217 +149,107 @@ pub enum MetricEvent {
 }
 
 impl MetricEvent {
-    /// Set the wall-clock duration on lifecycle events.
+    /// Set elapsed time on operations timed by the lifecycle span.
     pub(crate) fn set_duration_if_applicable(&mut self, d: Duration) {
         match self {
-            // Lifecycle events receive elapsed time from the tracing layer.
-            Self::SnapshotBuildSuccess(e) => e.set_duration(d),
-            Self::SnapshotBuildFailure(e) => e.duration = d,
-            Self::TransactionCommitSuccess(e) => e.set_duration(d),
-            Self::DomainMetadataLoadSuccess(e) => e.set_duration(d),
-            Self::SetTransactionLoadSuccess(e) => e.set_duration(d),
-            Self::CrcReadSuccess(e) => e.set_duration(d),
+            Self::SnapshotBuildCompleted(e) => e.duration = d,
+            Self::TransactionCommitCompleted(e) => e.duration = d,
+            Self::DomainMetadataLoadCompleted(e) => e.duration = d,
+            Self::SetTransactionLoadCompleted(e) => e.duration = d,
+            Self::CrcReadCompleted(e) => e.duration = d,
             Self::LastCheckpointReadCompleted(e) => e.duration = d,
-            Self::CheckpointWriteSuccess(e) => e.duration = d,
-            Self::CheckpointWriteFailure(e) => e.duration = d,
-            Self::ChecksumWriteSuccess(e) => e.duration = d,
-            Self::ChecksumWriteFailure(e) => e.duration = d,
-
-            // Emit-based events set their duration as a creation attribute, so the
-            // span-close hook must not overwrite it.
-            Self::LogSegmentLoadSuccess(_)
-            | Self::LogSegmentLoadFailure(_)
-            | Self::ProtocolMetadataLoadSuccess(_)
-            | Self::ProtocolMetadataLoadFailure(_)
-            | Self::ScanMetadataCompleted(_)
-            | Self::StorageListCompleted(_)
-            | Self::StorageReadCompleted(_)
-            | Self::StorageCopyCompleted(_) => {}
-
-            // These failure events carry no duration.
-            Self::TransactionCommitFailure(_)
-            | Self::DomainMetadataLoadFailure
-            | Self::SetTransactionLoadFailure
-            | Self::CrcReadFailure => {}
-
-            // Read events have no duration field.
-            Self::JsonReadCompleted(_) | Self::ParquetReadCompleted(_) => {}
-        }
-    }
-
-    pub(crate) fn record_u64(&mut self, name: &str, value: u64) -> Result<(), &'static str> {
-        match self {
-            // Variants with u64 fields set during span lifetime.
-            Self::SnapshotBuildSuccess(e) => e.record_u64(name, value),
-            Self::TransactionCommitSuccess(e) => e.record_u64(name, value),
-            Self::DomainMetadataLoadSuccess(e) => e.record_u64(name, value),
-            Self::CrcReadSuccess(e) => e.record_u64(name, value),
-            Self::CheckpointWriteSuccess(e) => e.record_u64(name, value),
-            Self::ChecksumWriteSuccess(e) => e.record_u64(name, value),
-
-            Self::LogSegmentLoadSuccess(_) => Err(LogSegmentLoadSuccess::SPAN_NAME),
-            Self::ProtocolMetadataLoadSuccess(_) => Err(ProtocolMetadataLoadSuccess::SPAN_NAME),
-            Self::SetTransactionLoadSuccess(_) => Err(SetTransactionLoadSuccess::SPAN_NAME),
-            Self::LastCheckpointReadCompleted(_) => Err(LastCheckpointReadCompleted::SPAN_NAME),
-            Self::ScanMetadataCompleted(_) => Err(ScanMetadataCompleted::SPAN_NAME),
-            Self::JsonReadCompleted(_) => Err(JsonReadCompleted::SPAN_NAME),
-            Self::ParquetReadCompleted(_) => Err(ParquetReadCompleted::SPAN_NAME),
-            Self::StorageListCompleted(_)
-            | Self::StorageReadCompleted(_)
-            | Self::StorageCopyCompleted(_) => Err(STORAGE_SPAN),
-
-            // Failure events do not record numeric fields.
-            Self::LogSegmentLoadFailure(_) => Err(LogSegmentLoadSuccess::SPAN_NAME),
-            Self::ProtocolMetadataLoadFailure(_) => Err(ProtocolMetadataLoadSuccess::SPAN_NAME),
-            Self::SnapshotBuildFailure(_) => Err(SnapshotBuildSuccess::SPAN_NAME),
-            Self::TransactionCommitFailure(_) => Err(TransactionCommitSuccess::SPAN_NAME),
-            Self::DomainMetadataLoadFailure => Err(DomainMetadataLoadSuccess::SPAN_NAME),
-            Self::SetTransactionLoadFailure => Err(SetTransactionLoadSuccess::SPAN_NAME),
-            Self::CrcReadFailure => Err(CrcReadSuccess::SPAN_NAME),
-            Self::CheckpointWriteFailure(_) => Err(CheckpointWriteSuccess::SPAN_NAME),
-            Self::ChecksumWriteFailure(_) => Err(ChecksumWriteSuccess::SPAN_NAME),
-        }
-    }
-
-    pub(crate) fn record_bool(&mut self, name: &str, value: bool) -> Result<(), &'static str> {
-        match self {
-            // Variants with bool fields set during span lifetime.
-            Self::TransactionCommitSuccess(e) => e.record_bool(name, value),
-            Self::DomainMetadataLoadSuccess(e) => e.record_bool(name, value),
-            Self::SetTransactionLoadSuccess(e) => e.record_bool(name, value),
-
-            // No bool fields set during span lifetime — a runtime record() on these is a bug.
-            Self::LogSegmentLoadSuccess(_) => Err(LogSegmentLoadSuccess::SPAN_NAME),
-            Self::ProtocolMetadataLoadSuccess(_) => Err(ProtocolMetadataLoadSuccess::SPAN_NAME),
-            Self::SnapshotBuildSuccess(_) => Err(SnapshotBuildSuccess::SPAN_NAME),
-            Self::CrcReadSuccess(_) => Err(CrcReadSuccess::SPAN_NAME),
-            Self::LastCheckpointReadCompleted(_) => Err(LastCheckpointReadCompleted::SPAN_NAME),
-            Self::CheckpointWriteSuccess(_) => Err(CheckpointWriteSuccess::SPAN_NAME),
-            Self::ChecksumWriteSuccess(_) => Err(ChecksumWriteSuccess::SPAN_NAME),
-            Self::ScanMetadataCompleted(_) => Err(ScanMetadataCompleted::SPAN_NAME),
-            Self::JsonReadCompleted(_) => Err(JsonReadCompleted::SPAN_NAME),
-            Self::ParquetReadCompleted(_) => Err(ParquetReadCompleted::SPAN_NAME),
-            Self::StorageListCompleted(_)
-            | Self::StorageReadCompleted(_)
-            | Self::StorageCopyCompleted(_) => Err(STORAGE_SPAN),
-
-            // Failure events do not record bool fields.
-            Self::LogSegmentLoadFailure(_) => Err(LogSegmentLoadSuccess::SPAN_NAME),
-            Self::ProtocolMetadataLoadFailure(_) => Err(ProtocolMetadataLoadSuccess::SPAN_NAME),
-            Self::SnapshotBuildFailure(_) => Err(SnapshotBuildSuccess::SPAN_NAME),
-            Self::TransactionCommitFailure(_) => Err(TransactionCommitSuccess::SPAN_NAME),
-            Self::DomainMetadataLoadFailure => Err(DomainMetadataLoadSuccess::SPAN_NAME),
-            Self::SetTransactionLoadFailure => Err(SetTransactionLoadSuccess::SPAN_NAME),
-            Self::CrcReadFailure => Err(CrcReadSuccess::SPAN_NAME),
-            Self::CheckpointWriteFailure(_) => Err(CheckpointWriteSuccess::SPAN_NAME),
-            Self::ChecksumWriteFailure(_) => Err(ChecksumWriteSuccess::SPAN_NAME),
-        }
-    }
-
-    pub(crate) fn record_str(&mut self, name: &str, value: &str) -> Result<(), &'static str> {
-        if let Self::LastCheckpointReadCompleted(e) = self {
-            return e.record_str(name, value);
-        }
-        if name == "failure_reason" {
-            if let Self::TransactionCommitSuccess(e) = self {
-                let operation_id = e.operation_id;
-                let table_type = e.table_type;
-                let correlation_id = e.correlation_id.take();
-                *self = Self::TransactionCommitFailure(TransactionCommitFailure {
-                    operation_id,
-                    table_type,
-                    correlation_id,
-                    reason: value.parse().unwrap_or_else(|e| {
-                        warn!("Invalid failure_reason '{value}' on span: {e}. Using Error.");
-                        CommitFailureReason::Error
-                    }),
-                });
-            }
-            return Ok(());
-        }
-        match self {
-            Self::TransactionCommitSuccess(e) => e.record_str(name, value),
-            Self::CheckpointWriteSuccess(e) => e.record_str(name, value),
-            Self::ChecksumWriteSuccess(e) => e.record_str(name, value),
-            _ => Ok(()),
-        }
-    }
-
-    /// Marks a lifecycle event as failed when its span errors.
-    pub(crate) fn into_failure(self) -> Self {
-        match self {
-            Self::LogSegmentLoadSuccess(e) => Self::LogSegmentLoadFailure(LogSegmentLoadFailure {
-                operation_id: e.operation_id,
-                table_type: e.table_type,
-                correlation_id: e.correlation_id,
-                load_type: e.load_type,
-                duration: e.duration,
-            }),
-            Self::ProtocolMetadataLoadSuccess(e) => {
-                Self::ProtocolMetadataLoadFailure(ProtocolMetadataLoadFailure {
-                    operation_id: e.operation_id,
-                    table_type: e.table_type,
-                    correlation_id: e.correlation_id,
-                    load_type: e.load_type,
-                    duration: e.duration,
-                })
-            }
-            Self::SnapshotBuildSuccess(e) => Self::SnapshotBuildFailure(SnapshotBuildFailure {
-                operation_id: e.operation_id,
-                table_type: e.table_type,
-                correlation_id: e.correlation_id,
-                load_type: e.load_type,
-                duration: e.duration,
-            }),
-            Self::TransactionCommitSuccess(e) => {
-                Self::TransactionCommitFailure(TransactionCommitFailure {
-                    operation_id: e.operation_id,
-                    table_type: e.table_type,
-                    correlation_id: e.correlation_id,
-                    reason: CommitFailureReason::Error,
-                })
-            }
-            Self::DomainMetadataLoadSuccess(_) => Self::DomainMetadataLoadFailure,
-            Self::SetTransactionLoadSuccess(_) => Self::SetTransactionLoadFailure,
-            Self::CrcReadSuccess(_) => Self::CrcReadFailure,
-            Self::LastCheckpointReadCompleted(mut e) => {
-                if e.outcome == LastCheckpointReadOutcome::Unknown {
-                    e.outcome = LastCheckpointReadOutcome::Error;
-                }
-                Self::LastCheckpointReadCompleted(e)
-            }
-            Self::CheckpointWriteSuccess(e) => {
-                Self::CheckpointWriteFailure(CheckpointWriteFailure {
-                    operation_id: e.operation_id,
-                    version: e.version,
-                    mode: e.mode,
-                    duration: e.duration,
-                    processing_stats: e.processing_stats,
-                    output_stats: e.output_stats,
-                })
-            }
-            Self::ChecksumWriteSuccess(e) => Self::ChecksumWriteFailure(ChecksumWriteFailure {
-                resolution_mode: e.resolution_mode,
-                duration: e.duration,
-            }),
-            // Events with no failure form pass through unchanged.
-            // Note: here we list explicitly so adding a lifecycle event without a failure mapping
-            //       fails to compile.
-            e @ (Self::LogSegmentLoadFailure(_)
-            | Self::ProtocolMetadataLoadFailure(_)
-            | Self::SnapshotBuildFailure(_)
-            | Self::TransactionCommitFailure(_)
-            | Self::DomainMetadataLoadFailure
-            | Self::SetTransactionLoadFailure
-            | Self::CrcReadFailure
-            | Self::CheckpointWriteFailure(_)
-            | Self::ChecksumWriteFailure(_)
+            Self::CheckpointWriteCompleted(e) => e.duration = d,
+            Self::ChecksumWriteCompleted(e) => e.duration = d,
+            Self::LogSegmentLoadCompleted(_)
+            | Self::ProtocolMetadataLoadCompleted(_)
             | Self::JsonReadCompleted(_)
             | Self::ParquetReadCompleted(_)
             | Self::ScanMetadataCompleted(_)
             | Self::StorageListCompleted(_)
             | Self::StorageReadCompleted(_)
-            | Self::StorageCopyCompleted(_)) => e,
+            | Self::StorageCopyCompleted(_) => {}
+        }
+    }
+    pub(crate) fn record_u64(&mut self, name: &str, value: u64) -> Result<(), &'static str> {
+        match self {
+            Self::SnapshotBuildCompleted(e) => e.record_u64(name, value),
+            Self::TransactionCommitCompleted(e) => e.record_u64(name, value),
+            Self::DomainMetadataLoadCompleted(e) => e.record_u64(name, value),
+            Self::CrcReadCompleted(e) => e.record_u64(name, value),
+            Self::CheckpointWriteCompleted(e) => e.record_u64(name, value),
+            Self::ChecksumWriteCompleted(e) => e.record_u64(name, value),
+            _ => Err(self.span_name()),
+        }
+    }
+    pub(crate) fn record_bool(&mut self, name: &str, value: bool) -> Result<(), &'static str> {
+        match self {
+            Self::TransactionCommitCompleted(e) => e.record_bool(name, value),
+            Self::DomainMetadataLoadCompleted(e) => e.record_bool(name, value),
+            Self::SetTransactionLoadCompleted(e) => e.record_bool(name, value),
+            _ => Err(self.span_name()),
+        }
+    }
+    pub(crate) fn record_str(&mut self, name: &str, value: &str) -> Result<(), &'static str> {
+        match self {
+            Self::TransactionCommitCompleted(e) => e.record_str(name, value),
+            Self::CheckpointWriteCompleted(e) => e.record_str(name, value),
+            Self::ChecksumWriteCompleted(e) => e.record_str(name, value),
+            Self::LastCheckpointReadCompleted(e) => e.record_str(name, value),
+            _ => Err(self.span_name()),
+        }
+    }
+    /// Change only the outcome, preserving the attempt's context and measurements.
+    pub(crate) fn mark_error(&mut self) {
+        match self {
+            Self::LogSegmentLoadCompleted(e) => e.outcome = LogSegmentLoadOutcome::Error,
+            Self::ProtocolMetadataLoadCompleted(e) => {
+                e.outcome = ProtocolMetadataLoadOutcome::Error
+            }
+            Self::SnapshotBuildCompleted(e) => e.outcome = SnapshotBuildOutcome::Error,
+            Self::TransactionCommitCompleted(e) => {
+                if let TransactionCommitOutcome::Success { .. } = e.outcome {
+                    e.outcome = TransactionCommitOutcome::Failure {
+                        reason: CommitFailureReason::Error,
+                    };
+                }
+            }
+            Self::DomainMetadataLoadCompleted(e) => e.outcome = DomainMetadataLoadOutcome::Error,
+            Self::SetTransactionLoadCompleted(e) => e.outcome = SetTransactionLoadOutcome::Error,
+            Self::CrcReadCompleted(e) => e.outcome = CrcReadOutcome::Error,
+            Self::CheckpointWriteCompleted(e) => e.outcome = CheckpointWriteOutcome::Error,
+            Self::ChecksumWriteCompleted(e) => e.outcome = ChecksumWriteOutcome::Error,
+            Self::LastCheckpointReadCompleted(e) => {
+                if e.outcome == LastCheckpointReadOutcome::Unknown {
+                    e.outcome = LastCheckpointReadOutcome::Error;
+                }
+            }
+            Self::JsonReadCompleted(_)
+            | Self::ParquetReadCompleted(_)
+            | Self::ScanMetadataCompleted(_)
+            | Self::StorageListCompleted(_)
+            | Self::StorageReadCompleted(_)
+            | Self::StorageCopyCompleted(_) => {}
+        }
+    }
+
+    fn span_name(&self) -> &'static str {
+        match self {
+            Self::LogSegmentLoadCompleted(_) => LogSegmentLoadCompleted::SPAN_NAME,
+            Self::ProtocolMetadataLoadCompleted(_) => ProtocolMetadataLoadCompleted::SPAN_NAME,
+            Self::SnapshotBuildCompleted(_) => SnapshotBuildCompleted::SPAN_NAME,
+            Self::TransactionCommitCompleted(_) => TransactionCommitCompleted::SPAN_NAME,
+            Self::DomainMetadataLoadCompleted(_) => DomainMetadataLoadCompleted::SPAN_NAME,
+            Self::SetTransactionLoadCompleted(_) => SetTransactionLoadCompleted::SPAN_NAME,
+            Self::CrcReadCompleted(_) => CrcReadCompleted::SPAN_NAME,
+            Self::LastCheckpointReadCompleted(_) => LastCheckpointReadCompleted::SPAN_NAME,
+            Self::CheckpointWriteCompleted(_) => CheckpointWriteCompleted::SPAN_NAME,
+            Self::ChecksumWriteCompleted(_) => ChecksumWriteCompleted::SPAN_NAME,
+            Self::JsonReadCompleted(_) => JsonReadCompleted::SPAN_NAME,
+            Self::ParquetReadCompleted(_) => ParquetReadCompleted::SPAN_NAME,
+            Self::ScanMetadataCompleted(_) => ScanMetadataCompleted::SPAN_NAME,
+            Self::StorageListCompleted(_) => STORAGE_SPAN,
+            Self::StorageReadCompleted(_) => STORAGE_SPAN,
+            Self::StorageCopyCompleted(_) => STORAGE_SPAN,
         }
     }
 }
@@ -338,25 +257,16 @@ impl MetricEvent {
 impl fmt::Display for MetricEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::LogSegmentLoadSuccess(e) => e.fmt(f),
-            Self::LogSegmentLoadFailure(e) => e.fmt(f),
-            Self::ProtocolMetadataLoadSuccess(e) => e.fmt(f),
-            Self::ProtocolMetadataLoadFailure(e) => e.fmt(f),
-            Self::SnapshotBuildSuccess(e) => e.fmt(f),
-            Self::SnapshotBuildFailure(e) => e.fmt(f),
-            Self::TransactionCommitSuccess(e) => e.fmt(f),
-            Self::TransactionCommitFailure(e) => e.fmt(f),
-            Self::DomainMetadataLoadSuccess(e) => e.fmt(f),
-            Self::DomainMetadataLoadFailure => f.write_str("DomainMetadataLoadFailure"),
-            Self::SetTransactionLoadSuccess(e) => e.fmt(f),
-            Self::SetTransactionLoadFailure => f.write_str("SetTransactionLoadFailure"),
-            Self::CrcReadSuccess(e) => e.fmt(f),
-            Self::CrcReadFailure => f.write_str("CrcReadFailure"),
+            Self::LogSegmentLoadCompleted(e) => e.fmt(f),
+            Self::ProtocolMetadataLoadCompleted(e) => e.fmt(f),
+            Self::SnapshotBuildCompleted(e) => e.fmt(f),
+            Self::TransactionCommitCompleted(e) => e.fmt(f),
+            Self::DomainMetadataLoadCompleted(e) => e.fmt(f),
+            Self::SetTransactionLoadCompleted(e) => e.fmt(f),
+            Self::CrcReadCompleted(e) => e.fmt(f),
             Self::LastCheckpointReadCompleted(e) => e.fmt(f),
-            Self::CheckpointWriteSuccess(e) => e.fmt(f),
-            Self::CheckpointWriteFailure(e) => e.fmt(f),
-            Self::ChecksumWriteSuccess(e) => e.fmt(f),
-            Self::ChecksumWriteFailure(e) => e.fmt(f),
+            Self::CheckpointWriteCompleted(e) => e.fmt(f),
+            Self::ChecksumWriteCompleted(e) => e.fmt(f),
             Self::JsonReadCompleted(e) => e.fmt(f),
             Self::ParquetReadCompleted(e) => e.fmt(f),
             Self::ScanMetadataCompleted(e) => e.fmt(f),
@@ -367,7 +277,7 @@ impl fmt::Display for MetricEvent {
     }
 }
 
-/// Result of a successful [`crate::Snapshot::checkpoint`] call.
+/// Result of a [`crate::Snapshot::checkpoint`] call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, StrumDisplay, AsRefStr, IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum CheckpointWriteOutcome {
@@ -378,6 +288,8 @@ pub enum CheckpointWriteOutcome {
     },
     /// The API returned [`crate::snapshot::CheckpointWriteResult::AlreadyExists`].
     AlreadyExists,
+    /// The operation returned an error.
+    Error,
 }
 
 /// Checkpoint format and sidecar-writing mode selected during a checkpoint call.
@@ -398,18 +310,19 @@ pub enum CheckpointWriteMode {
     V2WithSidecars,
 }
 
-/// A [`crate::Snapshot::checkpoint`] call wrote a checkpoint or reported that one already exists.
+/// A checkpoint write attempt completed.
 ///
-/// [`CheckpointWriteOutcome::Written`] reports completed processing and output. An early
-/// [`CheckpointWriteOutcome::AlreadyExists`] reports zero processing and output values;
-/// an `AlreadyExists` return after processing starts retains the work performed.
+/// Processing and output statistics retain work performed before any outcome, including an error
+/// or `AlreadyExists`. Only [`CheckpointWriteOutcome::Written`] carries completed-checkpoint
+/// contents. An error can occur after data writes, during hint publication or snapshot
+/// construction.
 #[derive(Debug, Clone)]
-pub struct CheckpointWriteSuccess {
+pub struct CheckpointWriteCompleted {
     /// Unique identifier for this checkpoint attempt.
     pub operation_id: MetricId,
     /// Snapshot version being checkpointed.
     pub version: u64,
-    /// Whether the call wrote checkpoint data or reported that a checkpoint already exists.
+    /// Whether the call wrote a checkpoint, found one already present, or returned an error.
     pub outcome: CheckpointWriteOutcome,
     /// Selected write mode, or [`CheckpointWriteMode::NotAttempted`] for an early return.
     pub mode: CheckpointWriteMode,
@@ -421,30 +334,6 @@ pub struct CheckpointWriteSuccess {
     /// Work performed while producing checkpoint batches, including on an AlreadyExists return.
     pub processing_stats: CheckpointProcessingStats,
     /// Output work performed, including on an AlreadyExists return after writing starts.
-    pub output_stats: CheckpointOutputStats,
-}
-
-/// A [`crate::Snapshot::checkpoint`] call returned an error.
-///
-/// Processing and output metrics retain work performed before the error and are zero for
-/// preflight failures. If hint publication or returned snapshot construction fails after checkpoint
-/// data completion, the failure event retains the completed processing and output metrics.
-#[derive(Debug, Clone)]
-pub struct CheckpointWriteFailure {
-    /// Unique identifier for this checkpoint attempt.
-    pub operation_id: MetricId,
-    /// Snapshot version being checkpointed.
-    pub version: u64,
-    /// Selected write mode, preserved through the failure.
-    pub mode: CheckpointWriteMode,
-    /// Elapsed time through checkpoint data completion or an earlier error.
-    ///
-    /// Uses the same timing boundary as [`CheckpointWriteSuccess::duration`].
-    pub duration: Duration,
-    /// Work performed before the error.
-    pub processing_stats: CheckpointProcessingStats,
-    /// Output work performed before the error, including successful writes before verification
-    /// fails.
     pub output_stats: CheckpointOutputStats,
 }
 
@@ -528,7 +417,7 @@ pub struct CheckpointWriteStats {
     pub num_sidecars: u64,
 }
 
-impl CheckpointWriteSuccess {
+impl CheckpointWriteCompleted {
     pub(crate) const SPAN_NAME: &'static str = "snap.checkpoint";
 
     pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
@@ -584,9 +473,8 @@ impl CheckpointWriteSuccess {
     }
 
     fn record_write_stats(&mut self, name: &str, value: u64) -> Result<(), &'static str> {
-        let mut stats = match self.outcome {
-            CheckpointWriteOutcome::Written { stats } => stats,
-            _ => CheckpointWriteStats::default(),
+        let CheckpointWriteOutcome::Written { stats } = &mut self.outcome else {
+            return Ok(());
         };
         match name {
             "size_in_bytes" => stats.size_in_bytes = value,
@@ -596,14 +484,15 @@ impl CheckpointWriteSuccess {
             "num_sidecars" => stats.num_sidecars = value,
             _ => return Err(Self::SPAN_NAME),
         }
-        self.outcome = CheckpointWriteOutcome::Written { stats };
         Ok(())
     }
 
     fn record_str(&mut self, name: &str, value: &str) -> Result<(), &'static str> {
         match name {
             "outcome" if value == CheckpointWriteOutcome::AlreadyExists.as_ref() => {
-                self.outcome = CheckpointWriteOutcome::AlreadyExists;
+                if self.outcome != CheckpointWriteOutcome::Error {
+                    self.outcome = CheckpointWriteOutcome::AlreadyExists;
+                }
             }
             "mode" => self.mode = value.parse().map_err(|_| Self::SPAN_NAME)?,
             _ => return Err(Self::SPAN_NAME),
@@ -612,7 +501,7 @@ impl CheckpointWriteSuccess {
     }
 }
 
-impl Visit for CheckpointWriteSuccess {
+impl Visit for CheckpointWriteCompleted {
     fn record_u64(&mut self, field: &Field, value: u64) {
         if field.name() == "version" {
             self.version = value;
@@ -626,11 +515,11 @@ impl Visit for CheckpointWriteSuccess {
     }
 }
 
-impl fmt::Display for CheckpointWriteSuccess {
+impl fmt::Display for CheckpointWriteCompleted {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "CheckpointWriteSuccess(id={}, version={}, outcome={}, mode={}, \
+            "CheckpointWriteCompleted(id={}, version={}, outcome={}, mode={}, \
              duration={:?}, processing_stats={:?}, output_stats={:?}",
             self.operation_id,
             self.version,
@@ -644,22 +533,6 @@ impl fmt::Display for CheckpointWriteSuccess {
             write!(f, ", stats={stats:?}")?;
         }
         f.write_str(")")
-    }
-}
-
-impl fmt::Display for CheckpointWriteFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "CheckpointWriteFailure(id={}, version={}, mode={}, \
-             duration={:?}, processing_stats={:?}, output_stats={:?})",
-            self.operation_id,
-            self.version,
-            self.mode,
-            self.duration,
-            self.processing_stats,
-            self.output_stats,
-        )
     }
 }
 
@@ -747,27 +620,60 @@ where
     })
 }
 
-/// A log segment was listed and assembled for a snapshot.
-///
-/// All fields are set at emit time (creation attrs).
+/// A log-segment load attempt completed.
 #[derive(Debug, Clone)]
-pub struct LogSegmentLoadSuccess {
-    pub operation_id: MetricId,
-    /// Opaque, caller-supplied id for joining this operation's metric events to the caller's
-    /// own request or operation id.
-    pub correlation_id: Option<Arc<str>>,
-    pub table_type: TableType,
+pub struct LogSegmentLoadCompleted {
+    /// Identity and table labels shared by this operation's events.
+    pub context: MetricContext,
+    /// How this operation loaded its state.
     pub load_type: LogSegmentLoadType,
+    /// Elapsed time through the operation's return.
+    pub duration: Duration,
+    /// The operation result and its applicable measurements.
+    pub outcome: LogSegmentLoadOutcome,
+}
+
+/// Result of a log segment load operation.
+#[derive(Debug, Clone, PartialEq, Eq, StrumDisplay, AsRefStr, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum LogSegmentLoadOutcome {
+    /// The operation succeeded.
+    Success {
+        /// Measurements from the successful operation.
+        stats: LogSegmentLoadStats,
+    },
+    /// The operation returned an error.
+    Error,
+}
+
+/// Measurements from a successful log segment load.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogSegmentLoadStats {
+    /// Commit files in the assembled log segment.
     pub num_commit_files: u64,
+    /// Parts of the segment's checkpoint.
     pub num_checkpoint_files: u64,
+    /// Log compaction files in the assembled segment.
     pub num_compaction_files: u64,
     /// How many versions behind the segment's end version the latest on-disk CRC file is, or
     /// `None` if there is no CRC file.
     pub crc_versions_behind: Option<u64>,
-    pub duration: Duration,
 }
 
-impl LogSegmentLoadSuccess {
+impl LogSegmentLoadOutcome {
+    pub(crate) fn success(segment: &LogSegment) -> Self {
+        Self::Success {
+            stats: LogSegmentLoadStats {
+                num_commit_files: segment.listed.ascending_commit_files.len() as u64,
+                num_checkpoint_files: segment.listed.checkpoint_parts.len() as u64,
+                num_compaction_files: segment.listed.ascending_compaction_files.len() as u64,
+                crc_versions_behind: segment.crc_versions_behind(),
+            },
+        }
+    }
+}
+
+impl LogSegmentLoadCompleted {
     pub(crate) const SPAN_NAME: &'static str = LOG_SEGMENT_LOADED_SPAN;
 
     /// Span field for CRC staleness. `None` (no CRC file) encodes as `-1`.
@@ -784,107 +690,82 @@ impl LogSegmentLoadSuccess {
     /// The default seed [`Self::from_attrs`] populates from span fields.
     fn empty() -> Self {
         Self {
-            operation_id: MetricId::nil(),
-            correlation_id: None,
-            table_type: TableType::from_catalog_managed(false),
+            context: MetricContext::empty(),
             load_type: LogSegmentLoadType::default(),
-            num_commit_files: 0,
-            num_checkpoint_files: 0,
-            num_compaction_files: 0,
-            crc_versions_behind: None,
             duration: Duration::ZERO,
+            outcome: LogSegmentLoadOutcome::Success {
+                stats: LogSegmentLoadStats {
+                    num_commit_files: 0,
+                    num_checkpoint_files: 0,
+                    num_compaction_files: 0,
+                    crc_versions_behind: None,
+                },
+            },
         }
     }
 
     pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
         let mut event = Self::empty();
         attrs.record(&mut event);
+        if has_error_outcome(attrs) {
+            event.outcome = LogSegmentLoadOutcome::Error;
+        }
         event
     }
 }
 
-impl Visit for LogSegmentLoadSuccess {
+impl Visit for LogSegmentLoadCompleted {
     fn record_bool(&mut self, field: &Field, value: bool) {
-        if field.name() == IS_CATALOG_MANAGED_FIELD {
-            self.table_type = TableType::from_catalog_managed(value);
-        }
+        self.context.record_bool(field, value);
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
-        match field.name() {
-            CORRELATION_ID_FIELD if !value.is_empty() => self.correlation_id = Some(value.into()),
-            "load_type" => self.load_type = LogSegmentLoadType::parse_or_unknown(value),
-            _ => {}
+        self.context.record_str(field, value);
+        if field.name() == "load_type" {
+            self.load_type = LogSegmentLoadType::parse_or_unknown(value);
         }
     }
 
     fn record_u64(&mut self, field: &Field, value: u64) {
+        if field.name() == "duration_ns" {
+            self.duration = Duration::from_nanos(value);
+            return;
+        }
+
+        let LogSegmentLoadOutcome::Success { stats } = &mut self.outcome else {
+            return;
+        };
+
         match field.name() {
-            "duration_ns" => self.duration = Duration::from_nanos(value),
-            "num_commit_files" => self.num_commit_files = value,
-            "num_checkpoint_files" => self.num_checkpoint_files = value,
-            "num_compaction_files" => self.num_compaction_files = value,
+            "num_commit_files" => stats.num_commit_files = value,
+            "num_checkpoint_files" => stats.num_checkpoint_files = value,
+            "num_compaction_files" => stats.num_compaction_files = value,
             _ => {}
         }
     }
 
     fn record_i64(&mut self, field: &Field, value: i64) {
+        let LogSegmentLoadOutcome::Success { stats } = &mut self.outcome else {
+            return;
+        };
+
         if field.name() == Self::CRC_VERSIONS_BEHIND_FIELD {
-            self.crc_versions_behind = Self::decode_crc_versions_behind(value);
+            stats.crc_versions_behind = Self::decode_crc_versions_behind(value);
         }
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-        if let Some(id) = record_operation_id(field, value, Self::SPAN_NAME) {
-            self.operation_id = id;
-        }
+        self.context.record_debug(field, value);
     }
 }
 
-impl fmt::Display for LogSegmentLoadSuccess {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self {
-            operation_id,
-            table_type,
-            correlation_id,
-            load_type,
-            duration,
-            num_commit_files,
-            num_checkpoint_files,
-            num_compaction_files,
-            crc_versions_behind,
-        } = self;
-        write!(
-            f,
-            "LogSegmentLoadSuccess(id={operation_id}, table_type={table_type}, \
-             correlation_id={correlation_id:?}, load_type={load_type}, \
-             duration={duration:?}, commits={num_commit_files}, \
-             checkpoints={num_checkpoint_files}, compactions={num_compaction_files}, \
-             crc_versions_behind={crc_versions_behind:?})"
-        )
-    }
-}
-
-/// Listing the log segment for a snapshot failed.
-#[derive(Debug, Clone)]
-pub struct LogSegmentLoadFailure {
-    pub operation_id: MetricId,
-    /// Opaque, caller-supplied id for joining this operation's metric events to the caller's
-    /// own request or operation id.
-    pub correlation_id: Option<Arc<str>>,
-    pub table_type: TableType,
-    pub load_type: LogSegmentLoadType,
-    /// Elapsed wall-clock time before the operation failed.
-    pub duration: Duration,
-}
-
-impl fmt::Display for LogSegmentLoadFailure {
+impl fmt::Display for LogSegmentLoadCompleted {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "LogSegmentLoadFailure(id={}, table_type={}, correlation_id={:?}, \
-             load_type={}, duration={:?})",
-            self.operation_id, self.table_type, self.correlation_id, self.load_type, self.duration
+            "LogSegmentLoadCompleted({}, load_type={}, duration={:?}, \
+             outcome={:?})",
+            self.context, self.load_type, self.duration, self.outcome
         )
     }
 }
@@ -927,56 +808,69 @@ impl ProtocolMetadataSource {
     }
 }
 
-/// Protocol and metadata actions were resolved for a snapshot.
-///
-/// All fields are set at emit time (creation attrs).
+/// A protocol and metadata load attempt completed.
 #[derive(Debug, Clone)]
-pub struct ProtocolMetadataLoadSuccess {
-    pub operation_id: MetricId,
-    /// Opaque, caller-supplied id for joining this operation's metric events to the caller's
-    /// own request or operation id.
-    pub correlation_id: Option<Arc<str>>,
-    pub table_type: TableType,
+pub struct ProtocolMetadataLoadCompleted {
+    /// Identity and table labels shared by this operation's events.
+    pub context: MetricContext,
+    /// How this operation loaded its state.
     pub load_type: LogSegmentLoadType,
-    pub source: ProtocolMetadataSource,
+    /// Elapsed time through the operation's return.
     pub duration: Duration,
+    /// The operation result and its applicable measurements.
+    pub outcome: ProtocolMetadataLoadOutcome,
 }
 
-impl ProtocolMetadataLoadSuccess {
+/// Result of a protocol and metadata load operation.
+#[derive(Debug, Clone, PartialEq, Eq, StrumDisplay, AsRefStr, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum ProtocolMetadataLoadOutcome {
+    /// The operation succeeded.
+    Success { source: ProtocolMetadataSource },
+    /// The operation returned an error.
+    Error,
+}
+
+impl ProtocolMetadataLoadCompleted {
     pub(crate) const SPAN_NAME: &'static str = PROTOCOL_METADATA_LOADED_SPAN;
 
     /// The all-unset seed that [`Self::from_attrs`] fills in as span fields arrive. Each field
     /// here is the value used when its span field is absent.
     fn empty() -> Self {
         Self {
-            operation_id: MetricId::nil(),
-            correlation_id: None,
-            table_type: TableType::from_catalog_managed(false),
+            context: MetricContext::empty(),
             load_type: LogSegmentLoadType::default(),
-            source: ProtocolMetadataSource::Unknown,
             duration: Duration::ZERO,
+            outcome: ProtocolMetadataLoadOutcome::Success {
+                source: ProtocolMetadataSource::Unknown,
+            },
         }
     }
 
     pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
         let mut event = Self::empty();
         attrs.record(&mut event);
+        if has_error_outcome(attrs) {
+            event.outcome = ProtocolMetadataLoadOutcome::Error;
+        }
         event
     }
 }
 
-impl Visit for ProtocolMetadataLoadSuccess {
+impl Visit for ProtocolMetadataLoadCompleted {
     fn record_bool(&mut self, field: &Field, value: bool) {
-        if field.name() == IS_CATALOG_MANAGED_FIELD {
-            self.table_type = TableType::from_catalog_managed(value);
-        }
+        self.context.record_bool(field, value);
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
+        self.context.record_str(field, value);
         match field.name() {
-            CORRELATION_ID_FIELD if !value.is_empty() => self.correlation_id = Some(value.into()),
             "load_type" => self.load_type = LogSegmentLoadType::parse_or_unknown(value),
-            "pm_source" => self.source = ProtocolMetadataSource::parse_or_unknown(value),
+            "pm_source" => {
+                if let ProtocolMetadataLoadOutcome::Success { source } = &mut self.outcome {
+                    *source = ProtocolMetadataSource::parse_or_unknown(value);
+                }
+            }
             _ => {}
         }
     }
@@ -988,51 +882,17 @@ impl Visit for ProtocolMetadataLoadSuccess {
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-        if let Some(id) = record_operation_id(field, value, Self::SPAN_NAME) {
-            self.operation_id = id;
-        }
+        self.context.record_debug(field, value);
     }
 }
 
-impl fmt::Display for ProtocolMetadataLoadSuccess {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self {
-            operation_id,
-            table_type,
-            correlation_id,
-            load_type,
-            source,
-            duration,
-        } = self;
-        write!(
-            f,
-            "ProtocolMetadataLoadSuccess(id={operation_id}, table_type={table_type}, \
-             correlation_id={correlation_id:?}, load_type={load_type}, source={source}, \
-             duration={duration:?})"
-        )
-    }
-}
-
-/// Reading protocol and metadata from the log failed.
-#[derive(Debug, Clone)]
-pub struct ProtocolMetadataLoadFailure {
-    pub operation_id: MetricId,
-    /// Opaque, caller-supplied id for joining this operation's metric events to the caller's
-    /// own request or operation id.
-    pub correlation_id: Option<Arc<str>>,
-    pub table_type: TableType,
-    pub load_type: LogSegmentLoadType,
-    /// Elapsed wall-clock time before the operation failed.
-    pub duration: Duration,
-}
-
-impl fmt::Display for ProtocolMetadataLoadFailure {
+impl fmt::Display for ProtocolMetadataLoadCompleted {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "ProtocolMetadataLoadFailure(id={}, table_type={}, correlation_id={:?}, \
-             load_type={}, duration={:?})",
-            self.operation_id, self.table_type, self.correlation_id, self.load_type, self.duration
+            "ProtocolMetadataLoadCompleted({}, load_type={}, duration={:?}, \
+             outcome={:?})",
+            self.context, self.load_type, self.duration, self.outcome
         )
     }
 }
@@ -1043,94 +903,61 @@ impl fmt::Display for ProtocolMetadataLoadFailure {
 
 pub(crate) const SNAPSHOT_COMPLETED_SPAN: &str = "snap.build";
 
-/// A snapshot was built successfully.
+/// A snapshot build attempt completed.
 #[derive(Debug, Clone)]
-pub struct SnapshotBuildSuccess {
-    // === Set on span creation ===
-    pub operation_id: MetricId,
-    /// Opaque, caller-supplied id for joining this operation's metric events to the caller's
-    /// own request or operation id.
-    pub correlation_id: Option<Arc<str>>,
-    pub table_type: TableType,
+pub struct SnapshotBuildCompleted {
+    /// Identity and table labels shared by this operation's events.
+    pub context: MetricContext,
+    /// How this operation loaded its state.
     pub load_type: SnapshotLoadType,
-
-    // === Set during span lifetime ===
-    pub version: u64,
-
-    // === Set on span close ===
+    /// Elapsed time through the operation's return.
     pub duration: Duration,
+    /// The operation result and its applicable measurements.
+    pub outcome: SnapshotBuildOutcome,
 }
 
-impl SnapshotBuildSuccess {
+/// Result of a snapshot build operation.
+#[derive(Debug, Clone, PartialEq, Eq, StrumDisplay, AsRefStr, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum SnapshotBuildOutcome {
+    /// The operation succeeded.
+    Success { version: u64 },
+    /// The operation returned an error.
+    Error,
+}
+
+impl SnapshotBuildCompleted {
     pub(crate) const SPAN_NAME: &'static str = SNAPSHOT_COMPLETED_SPAN;
 
     pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
         Self {
-            operation_id: MetricId::from_attrs(attrs),
-            table_type: TableType::from_catalog_managed(read_is_catalog_managed(attrs)),
-            correlation_id: correlation_id_from_attrs(attrs),
+            context: MetricContext::from_attrs(attrs),
             load_type: load_type_from_attrs(attrs),
-            version: 0,
             duration: Duration::default(),
+            outcome: SnapshotBuildOutcome::Success { version: 0 },
         }
     }
 
     pub(crate) fn record_u64(&mut self, name: &str, value: u64) -> Result<(), &'static str> {
+        let SnapshotBuildOutcome::Success { version, .. } = &mut self.outcome else {
+            return Ok(());
+        };
+
         match name {
-            "version" => self.version = value,
+            "version" => (*version) = value,
             _ => return Err(Self::SPAN_NAME),
         }
         Ok(())
     }
-
-    pub(crate) fn set_duration(&mut self, d: Duration) {
-        self.duration = d;
-    }
 }
 
-impl fmt::Display for SnapshotBuildSuccess {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self {
-            operation_id,
-            table_type,
-            correlation_id,
-            load_type,
-            version,
-            duration,
-        } = self;
-        write!(
-            f,
-            "SnapshotBuildSuccess(id={operation_id}, table_type={table_type}, \
-             correlation_id={correlation_id:?}, load_type={load_type}, version={version}, \
-             duration={duration:?})"
-        )
-    }
-}
-
-// ====================================================================
-// SnapshotBuildFailure
-// ====================================================================
-
-/// Building a snapshot failed.
-#[derive(Debug, Clone)]
-pub struct SnapshotBuildFailure {
-    pub operation_id: MetricId,
-    /// Opaque, caller-supplied id for joining this operation's metric events to the caller's
-    /// own request or operation id.
-    pub correlation_id: Option<Arc<str>>,
-    pub table_type: TableType,
-    pub load_type: SnapshotLoadType,
-    /// Elapsed wall-clock time before the operation failed.
-    pub duration: Duration,
-}
-
-impl fmt::Display for SnapshotBuildFailure {
+impl fmt::Display for SnapshotBuildCompleted {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "SnapshotBuildFailure(id={}, table_type={}, correlation_id={:?}, \
-             load_type={}, duration={:?})",
-            self.operation_id, self.table_type, self.correlation_id, self.load_type, self.duration
+            "SnapshotBuildCompleted({}, load_type={}, duration={:?}, \
+             outcome={:?})",
+            self.context, self.load_type, self.duration, self.outcome
         )
     }
 }
@@ -1141,123 +968,150 @@ impl fmt::Display for SnapshotBuildFailure {
 
 pub(crate) const TRANSACTION_COMMIT_SPAN: &str = "txn.commit";
 
-/// A transaction was committed successfully.
+/// A transaction commit attempt completed.
 #[derive(Debug, Clone)]
-pub struct TransactionCommitSuccess {
-    // === Set on span creation ===
-    pub operation_id: MetricId,
-    /// Opaque, caller-supplied id for joining this operation's metric events to the caller's
-    /// own request or operation id.
-    pub correlation_id: Option<Arc<str>>,
-    pub table_type: TableType,
-    pub commit_version: u64,
+pub struct TransactionCommitCompleted {
+    /// Identity and table labels shared by this operation's events.
+    pub context: MetricContext,
+    /// Elapsed time through the operation's return.
+    pub duration: Duration,
+    /// The operation result and its applicable measurements.
+    pub outcome: TransactionCommitOutcome,
+}
 
-    // === Set during span lifetime ===
+/// Result of a transaction commit operation.
+#[derive(Debug, Clone, PartialEq, Eq, StrumDisplay, AsRefStr, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum TransactionCommitOutcome {
+    /// The operation succeeded.
+    Success {
+        /// Measurements from the successful operation.
+        stats: TransactionCommitStats,
+    },
+    /// The commit conflicted, encountered retryable I/O, or returned an error.
+    Failure {
+        /// Why the commit did not succeed.
+        reason: CommitFailureReason,
+    },
+}
+
+/// Measurements from a successful transaction commit.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TransactionCommitStats {
+    /// Version committed by this transaction.
+    pub commit_version: u64,
+    /// Add-file actions written by the commit.
     pub num_add_files: u64,
+    /// Remove-file actions written by the commit.
     pub num_remove_files: u64,
+    /// Files whose deletion vectors were updated.
     pub num_dv_updates: u64,
+    /// Total bytes represented by the Add-file actions.
     pub add_files_bytes: u64,
+    /// Total bytes represented by the Remove-file actions.
     pub remove_files_bytes: u64,
+    /// Whether the transaction used blind-append semantics.
     pub is_blind_append: bool,
+    /// Whether the commit changes table data.
     pub data_change: bool,
+    /// Operation recorded in the commit information, when available.
     pub operation: Option<String>,
     /// Time assembling and validating the commit, before the committer call.
     pub prepare_duration: Duration,
     /// Time in the committer's `commit()` call.
     pub committer_duration: Duration,
-
-    // === Set on span close ===
-    pub total_duration: Duration,
 }
 
-impl TransactionCommitSuccess {
+impl TransactionCommitCompleted {
     pub(crate) const SPAN_NAME: &'static str = TRANSACTION_COMMIT_SPAN;
 
     pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
         let mut v = TransactionCommitAttrs::default();
         attrs.record(&mut v);
         Self {
-            operation_id: MetricId::from_attrs(attrs),
-            table_type: TableType::from_catalog_managed(read_is_catalog_managed(attrs)),
-            correlation_id: correlation_id_from_attrs(attrs),
-            commit_version: v.commit_version,
-            num_add_files: 0,
-            num_remove_files: 0,
-            num_dv_updates: 0,
-            add_files_bytes: 0,
-            remove_files_bytes: 0,
-            is_blind_append: false,
-            data_change: false,
-            operation: None,
-            prepare_duration: Duration::default(),
-            committer_duration: Duration::default(),
-            total_duration: Duration::default(),
+            context: MetricContext::from_attrs(attrs),
+            duration: Duration::default(),
+            outcome: TransactionCommitOutcome::Success {
+                stats: TransactionCommitStats {
+                    commit_version: v.commit_version,
+                    num_add_files: 0,
+                    num_remove_files: 0,
+                    num_dv_updates: 0,
+                    add_files_bytes: 0,
+                    remove_files_bytes: 0,
+                    is_blind_append: false,
+                    data_change: false,
+                    operation: None,
+                    prepare_duration: Duration::default(),
+                    committer_duration: Duration::default(),
+                },
+            },
         }
     }
 
     pub(crate) fn record_u64(&mut self, name: &str, value: u64) -> Result<(), &'static str> {
+        let TransactionCommitOutcome::Success { stats } = &mut self.outcome else {
+            return Ok(());
+        };
+
         match name {
-            "num_add_files" => self.num_add_files = value,
-            "num_remove_files" => self.num_remove_files = value,
-            "num_dv_updates" => self.num_dv_updates = value,
-            "add_files_bytes" => self.add_files_bytes = value,
-            "remove_files_bytes" => self.remove_files_bytes = value,
-            "prepare_duration_ns" => self.prepare_duration = Duration::from_nanos(value),
-            "committer_duration_ns" => self.committer_duration = Duration::from_nanos(value),
+            "num_add_files" => stats.num_add_files = value,
+            "num_remove_files" => stats.num_remove_files = value,
+            "num_dv_updates" => stats.num_dv_updates = value,
+            "add_files_bytes" => stats.add_files_bytes = value,
+            "remove_files_bytes" => stats.remove_files_bytes = value,
+            "prepare_duration_ns" => stats.prepare_duration = Duration::from_nanos(value),
+            "committer_duration_ns" => stats.committer_duration = Duration::from_nanos(value),
             _ => return Err(Self::SPAN_NAME),
         }
         Ok(())
     }
 
     pub(crate) fn record_bool(&mut self, name: &str, value: bool) -> Result<(), &'static str> {
+        let TransactionCommitOutcome::Success { stats } = &mut self.outcome else {
+            return Ok(());
+        };
+
         match name {
-            "is_blind_append" => self.is_blind_append = value,
-            "data_change" => self.data_change = value,
+            "is_blind_append" => stats.is_blind_append = value,
+            "data_change" => stats.data_change = value,
             _ => return Err(Self::SPAN_NAME),
         }
         Ok(())
     }
 
     pub(crate) fn record_str(&mut self, name: &str, value: &str) -> Result<(), &'static str> {
+        if name == "failure_reason" {
+            let parsed = value.parse();
+            self.outcome = TransactionCommitOutcome::Failure {
+                reason: parsed
+                    .as_ref()
+                    .copied()
+                    .unwrap_or(CommitFailureReason::Error),
+            };
+            return parsed
+                .map(|_: CommitFailureReason| ())
+                .map_err(|_| Self::SPAN_NAME);
+        }
+
+        let TransactionCommitOutcome::Success { stats } = &mut self.outcome else {
+            return Ok(());
+        };
+
         match name {
-            "operation" => self.operation = Some(value.to_string()),
+            "operation" => stats.operation = Some(value.to_string()),
             _ => return Err(Self::SPAN_NAME),
         }
         Ok(())
     }
-
-    pub(crate) fn set_duration(&mut self, d: Duration) {
-        self.total_duration = d;
-    }
 }
 
-impl fmt::Display for TransactionCommitSuccess {
+impl fmt::Display for TransactionCommitCompleted {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self {
-            operation_id,
-            table_type,
-            correlation_id,
-            commit_version,
-            num_add_files,
-            num_remove_files,
-            num_dv_updates,
-            add_files_bytes,
-            remove_files_bytes,
-            is_blind_append,
-            data_change,
-            operation,
-            prepare_duration,
-            committer_duration,
-            total_duration,
-        } = self;
         write!(
             f,
-            "TransactionCommitSuccess(id={operation_id}, table_type={table_type}, \
-             correlation_id={correlation_id:?}, version={commit_version}, \
-             total_duration={total_duration:?}, prepare={prepare_duration:?}, committer={committer_duration:?}, \
-             add_files={num_add_files}, remove_files={num_remove_files}, dv_updates={num_dv_updates}, \
-             add_bytes={add_files_bytes}, remove_bytes={remove_files_bytes}, \
-             is_blind_append={is_blind_append}, data_change={data_change}, operation={operation:?})"
+            "TransactionCommitCompleted({}, duration={:?}, outcome={:?})",
+            self.context, self.duration, self.outcome
         )
     }
 }
@@ -1275,34 +1129,6 @@ pub enum CommitFailureReason {
     RetryableIo,
     /// A terminal (non-retryable) error occurred.
     Error,
-}
-
-/// A transaction commit did not succeed; `reason` distinguishes conflict, retryable IO, and
-/// terminal errors.
-#[derive(Debug, Clone)]
-pub struct TransactionCommitFailure {
-    pub operation_id: MetricId,
-    /// Opaque, caller-supplied id for joining this operation's metric events to the caller's
-    /// own request or operation id.
-    pub correlation_id: Option<Arc<str>>,
-    pub table_type: TableType,
-    pub reason: CommitFailureReason,
-}
-
-impl fmt::Display for TransactionCommitFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self {
-            operation_id,
-            table_type,
-            correlation_id,
-            reason,
-        } = self;
-        write!(
-            f,
-            "TransactionCommitFailure(id={operation_id}, table_type={table_type}, \
-             correlation_id={correlation_id:?}, reason={reason})"
-        )
-    }
 }
 
 #[derive(Default)]
@@ -1330,58 +1156,74 @@ pub(crate) const DOMAIN_METADATA_LOADED_SPAN: &str = "snap.get_domain_metadata";
 /// from a log replay. Covers connector-issued loads of user domains and kernel-internal loads of
 /// system (`delta.*`) domains such as clustering or row tracking.
 #[derive(Debug, Clone)]
-pub struct DomainMetadataLoadSuccess {
-    // === Set during span lifetime ===
-    pub from_cache: bool,
-    pub num_domains_returned: u64,
-
-    // === Set on span close ===
+pub struct DomainMetadataLoadCompleted {
+    /// Elapsed time through the operation's return.
     pub duration: Duration,
+    /// The operation result and its applicable measurements.
+    pub outcome: DomainMetadataLoadOutcome,
 }
 
-impl DomainMetadataLoadSuccess {
+/// Result of a domain metadata load operation.
+#[derive(Debug, Clone, PartialEq, Eq, StrumDisplay, AsRefStr, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum DomainMetadataLoadOutcome {
+    /// The operation succeeded.
+    Success {
+        from_cache: bool,
+        num_domains_returned: u64,
+    },
+    /// The operation returned an error.
+    Error,
+}
+
+impl DomainMetadataLoadCompleted {
     pub(crate) const SPAN_NAME: &'static str = DOMAIN_METADATA_LOADED_SPAN;
 
     pub(crate) fn from_attrs(_attrs: &Attributes<'_>) -> Self {
         Self {
-            from_cache: false,
-            num_domains_returned: 0,
             duration: Duration::default(),
+            outcome: DomainMetadataLoadOutcome::Success {
+                from_cache: false,
+                num_domains_returned: 0,
+            },
         }
     }
 
     pub(crate) fn record_u64(&mut self, name: &str, value: u64) -> Result<(), &'static str> {
+        let DomainMetadataLoadOutcome::Success {
+            num_domains_returned,
+            ..
+        } = &mut self.outcome
+        else {
+            return Ok(());
+        };
+
         match name {
-            "num_domains_returned" => self.num_domains_returned = value,
+            "num_domains_returned" => (*num_domains_returned) = value,
             _ => return Err(Self::SPAN_NAME),
         }
         Ok(())
     }
 
     pub(crate) fn record_bool(&mut self, name: &str, value: bool) -> Result<(), &'static str> {
+        let DomainMetadataLoadOutcome::Success { from_cache, .. } = &mut self.outcome else {
+            return Ok(());
+        };
+
         match name {
-            "from_cache" => self.from_cache = value,
+            "from_cache" => (*from_cache) = value,
             _ => return Err(Self::SPAN_NAME),
         }
         Ok(())
     }
-
-    pub(crate) fn set_duration(&mut self, d: Duration) {
-        self.duration = d;
-    }
 }
 
-impl fmt::Display for DomainMetadataLoadSuccess {
+impl fmt::Display for DomainMetadataLoadCompleted {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self {
-            from_cache,
-            num_domains_returned,
-            duration,
-        } = self;
         write!(
             f,
-            "DomainMetadataLoadSuccess(duration={duration:?}, from_cache={from_cache}, \
-             num_domains_returned={num_domains_returned})"
+            "DomainMetadataLoadCompleted(duration={:?}, outcome={:?})",
+            self.duration, self.outcome
         )
     }
 }
@@ -1396,50 +1238,59 @@ pub(crate) const SET_TRANSACTION_LOADED_SPAN: &str = "snap.get_app_id_version";
 /// (`from_cache`) or from a log replay. `found` is true when the app id has a committed
 /// transaction version, false when none exists or the existing one is expired.
 #[derive(Debug, Clone)]
-pub struct SetTransactionLoadSuccess {
-    // === Set during span lifetime ===
-    pub from_cache: bool,
-    pub found: bool,
-
-    // === Set on span close ===
+pub struct SetTransactionLoadCompleted {
+    /// Elapsed time through the operation's return.
     pub duration: Duration,
+    /// The operation result and its applicable measurements.
+    pub outcome: SetTransactionLoadOutcome,
 }
 
-impl SetTransactionLoadSuccess {
+/// Result of a set transaction load operation.
+#[derive(Debug, Clone, PartialEq, Eq, StrumDisplay, AsRefStr, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum SetTransactionLoadOutcome {
+    /// The operation succeeded.
+    Success { from_cache: bool, found: bool },
+    /// The operation returned an error.
+    Error,
+}
+
+impl SetTransactionLoadCompleted {
     pub(crate) const SPAN_NAME: &'static str = SET_TRANSACTION_LOADED_SPAN;
 
     pub(crate) fn from_attrs(_attrs: &Attributes<'_>) -> Self {
         Self {
-            from_cache: false,
-            found: false,
             duration: Duration::default(),
+            outcome: SetTransactionLoadOutcome::Success {
+                from_cache: false,
+                found: false,
+            },
         }
     }
 
     pub(crate) fn record_bool(&mut self, name: &str, value: bool) -> Result<(), &'static str> {
+        let SetTransactionLoadOutcome::Success {
+            from_cache, found, ..
+        } = &mut self.outcome
+        else {
+            return Ok(());
+        };
+
         match name {
-            "from_cache" => self.from_cache = value,
-            "found" => self.found = value,
+            "from_cache" => (*from_cache) = value,
+            "found" => (*found) = value,
             _ => return Err(Self::SPAN_NAME),
         }
         Ok(())
     }
-
-    pub(crate) fn set_duration(&mut self, d: Duration) {
-        self.duration = d;
-    }
 }
 
-impl fmt::Display for SetTransactionLoadSuccess {
+impl fmt::Display for SetTransactionLoadCompleted {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self {
-            from_cache,
-            found,
-            duration,
-        } = self;
         write!(
             f,
-            "SetTransactionLoadSuccess(duration={duration:?}, from_cache={from_cache}, found={found})"
+            "SetTransactionLoadCompleted(duration={:?}, outcome={:?})",
+            self.duration, self.outcome
         )
     }
 }
@@ -1450,48 +1301,54 @@ impl fmt::Display for SetTransactionLoadSuccess {
 
 pub(crate) const CRC_READ_COMPLETED_SPAN: &str = "crc_read_completed";
 
-/// A CRC file was read and parsed successfully. `bytes_read` is the raw byte count from storage.
+/// A CRC read and parse attempt completed.
 #[derive(Debug, Clone)]
-pub struct CrcReadSuccess {
-    // === Set during span lifetime ===
-    pub bytes_read: u64,
-
-    // === Set on span close ===
+pub struct CrcReadCompleted {
+    /// Elapsed time through the operation's return.
     pub duration: Duration,
+    /// The operation result and its applicable measurements.
+    pub outcome: CrcReadOutcome,
 }
 
-impl CrcReadSuccess {
+/// Result of a CRC read and parse operation.
+#[derive(Debug, Clone, PartialEq, Eq, StrumDisplay, AsRefStr, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum CrcReadOutcome {
+    /// The operation succeeded.
+    Success { bytes_read: u64 },
+    /// The operation returned an error.
+    Error,
+}
+
+impl CrcReadCompleted {
     pub(crate) const SPAN_NAME: &'static str = CRC_READ_COMPLETED_SPAN;
 
     pub(crate) fn from_attrs(_attrs: &Attributes<'_>) -> Self {
         Self {
-            bytes_read: 0,
             duration: Duration::default(),
+            outcome: CrcReadOutcome::Success { bytes_read: 0 },
         }
     }
 
     pub(crate) fn record_u64(&mut self, name: &str, value: u64) -> Result<(), &'static str> {
+        let CrcReadOutcome::Success { bytes_read, .. } = &mut self.outcome else {
+            return Ok(());
+        };
+
         match name {
-            "bytes_read" => self.bytes_read = value,
+            "bytes_read" => (*bytes_read) = value,
             _ => return Err(Self::SPAN_NAME),
         }
         Ok(())
     }
-
-    pub(crate) fn set_duration(&mut self, d: Duration) {
-        self.duration = d;
-    }
 }
 
-impl fmt::Display for CrcReadSuccess {
+impl fmt::Display for CrcReadCompleted {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self {
-            duration,
-            bytes_read,
-        } = self;
         write!(
             f,
-            "CrcReadSuccess(duration={duration:?}, bytes={bytes_read})"
+            "CrcReadCompleted(duration={:?}, outcome={:?})",
+            self.duration, self.outcome
         )
     }
 }
@@ -1581,7 +1438,7 @@ impl fmt::Display for LastCheckpointReadCompleted {
 
 pub(crate) const CHECKSUM_WRITE_SPAN: &str = "snap.write_checksum";
 
-/// Outcome of a successful [`crate::Snapshot::write_checksum`] call.
+/// Result of a [`crate::Snapshot::write_checksum`] call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, AsRefStr, StrumDisplay)]
 #[strum(serialize_all = "snake_case")]
 pub enum ChecksumWriteOutcome {
@@ -1592,6 +1449,8 @@ pub enum ChecksumWriteOutcome {
     },
     /// The CRC already existed, including a concurrent writer winning the storage race.
     AlreadyExists,
+    /// The operation returned an error.
+    Error,
 }
 
 /// CRC construction path selected during [`crate::Snapshot::write_checksum`].
@@ -1611,10 +1470,9 @@ pub enum ChecksumWriteResolutionMode {
     NotAttempted,
 }
 
-/// A [`crate::Snapshot::write_checksum`] call succeeded, writing a CRC or finding one already
-/// present.
+/// A checksum write attempt completed.
 #[derive(Debug, Clone)]
-pub struct ChecksumWriteSuccess {
+pub struct ChecksumWriteCompleted {
     /// Final result returned by the API.
     pub outcome: ChecksumWriteOutcome,
     /// CRC construction path selected during this call.
@@ -1623,7 +1481,7 @@ pub struct ChecksumWriteSuccess {
     pub duration: Duration,
 }
 
-impl ChecksumWriteSuccess {
+impl ChecksumWriteCompleted {
     pub(crate) const SPAN_NAME: &'static str = CHECKSUM_WRITE_SPAN;
 
     pub(crate) fn from_attrs(_attrs: &Attributes<'_>) -> Self {
@@ -1637,8 +1495,8 @@ impl ChecksumWriteSuccess {
     fn record_u64(&mut self, name: &str, value: u64) -> Result<(), &'static str> {
         match name {
             "bytes_written" => {
-                self.outcome = ChecksumWriteOutcome::Written {
-                    bytes_written: value,
+                if let ChecksumWriteOutcome::Written { bytes_written } = &mut self.outcome {
+                    *bytes_written = value;
                 }
             }
             _ => return Err(Self::SPAN_NAME),
@@ -1649,7 +1507,9 @@ impl ChecksumWriteSuccess {
     fn record_str(&mut self, name: &str, value: &str) -> Result<(), &'static str> {
         match name {
             "outcome" if value == ChecksumWriteOutcome::AlreadyExists.as_ref() => {
-                self.outcome = ChecksumWriteOutcome::AlreadyExists;
+                if self.outcome != ChecksumWriteOutcome::Error {
+                    self.outcome = ChecksumWriteOutcome::AlreadyExists;
+                }
             }
             "resolution_mode" => {
                 self.resolution_mode = value.parse().map_err(|_| Self::SPAN_NAME)?;
@@ -1660,7 +1520,7 @@ impl ChecksumWriteSuccess {
     }
 }
 
-impl fmt::Display for ChecksumWriteSuccess {
+impl fmt::Display for ChecksumWriteCompleted {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
             outcome,
@@ -1669,37 +1529,13 @@ impl fmt::Display for ChecksumWriteSuccess {
         } = self;
         write!(
             f,
-            "ChecksumWriteSuccess(outcome={outcome}, resolution_mode={resolution_mode}, \
+            "ChecksumWriteCompleted(outcome={outcome}, resolution_mode={resolution_mode}, \
              duration={duration:?}"
         )?;
         if let ChecksumWriteOutcome::Written { bytes_written } = outcome {
             write!(f, ", bytes_written={bytes_written}")?;
         }
         f.write_str(")")
-    }
-}
-
-/// A [`crate::Snapshot::write_checksum`] call failed.
-///
-/// The CRC may have been written before construction of the returned snapshot failed.
-#[derive(Debug, Clone)]
-pub struct ChecksumWriteFailure {
-    /// CRC construction path selected before the error.
-    pub resolution_mode: ChecksumWriteResolutionMode,
-    /// Wall-clock time from API entry to return.
-    pub duration: Duration,
-}
-
-impl fmt::Display for ChecksumWriteFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self {
-            resolution_mode,
-            duration,
-        } = self;
-        write!(
-            f,
-            "ChecksumWriteFailure(resolution_mode={resolution_mode}, duration={duration:?})"
-        )
     }
 }
 
@@ -1877,9 +1713,7 @@ impl fmt::Display for TableType {
 /// Operation-scoped values threaded through the snapshot-load chain to label its metric events.
 #[derive(Debug, Clone)]
 pub struct SnapshotLoadMetricContext {
-    pub(crate) operation_id: MetricId,
-    pub(crate) correlation_id: Option<Arc<str>>,
-    pub(crate) is_catalog_managed: bool,
+    pub(crate) context: MetricContext,
     pub(crate) load_type: SnapshotLoadType,
 }
 
@@ -1889,9 +1723,7 @@ impl SnapshotLoadMetricContext {
     /// asserting on the id.
     pub(crate) fn for_test() -> Self {
         Self {
-            operation_id: MetricId::nil(),
-            correlation_id: None,
-            is_catalog_managed: false,
+            context: MetricContext::empty(),
             load_type: SnapshotLoadType::default(),
         }
     }
@@ -1914,43 +1746,9 @@ pub(crate) fn record_operation_id(
     })
 }
 
-pub(crate) fn read_is_catalog_managed(attrs: &Attributes<'_>) -> bool {
-    #[derive(Default)]
-    struct V(bool);
-    impl Visit for V {
-        fn record_bool(&mut self, field: &Field, value: bool) {
-            if field.name() == IS_CATALOG_MANAGED_FIELD {
-                self.0 = value;
-            }
-        }
-        fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
-    }
-    let mut v = V::default();
-    attrs.record(&mut v);
-    v.0
-}
-
 /// The `correlation_id` string span field carried by every event that records it. Empty means the
 /// caller did not supply one.
 pub(crate) const CORRELATION_ID_FIELD: &str = "correlation_id";
-
-/// Extract the optional caller-supplied correlation id from span attributes; empty or absent
-/// yields `None`.
-pub(crate) fn correlation_id_from_attrs(attrs: &Attributes<'_>) -> Option<Arc<str>> {
-    #[derive(Default)]
-    struct CorrelationIdVisitor(Option<Arc<str>>);
-    impl Visit for CorrelationIdVisitor {
-        fn record_str(&mut self, field: &Field, value: &str) {
-            if field.name() == CORRELATION_ID_FIELD && !value.is_empty() {
-                self.0 = Some(value.into());
-            }
-        }
-        fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
-    }
-    let mut v = CorrelationIdVisitor::default();
-    attrs.record(&mut v);
-    v.0
-}
 
 pub(crate) fn load_type_from_attrs(attrs: &Attributes<'_>) -> SnapshotLoadType {
     #[derive(Default)]
@@ -1977,14 +1775,8 @@ pub(crate) fn load_type_from_attrs(attrs: &Attributes<'_>) -> SnapshotLoadType {
 /// phase-local, while `peak_hash_set_size` is the whole-scan high-water mark.
 #[derive(Debug, Clone)]
 pub struct ScanMetadataCompleted {
-    // === Set on span creation ===
-    /// Unique ID to correlate this scan with other events.
-    pub operation_id: MetricId,
-    /// Opaque, caller-supplied id for joining this operation's metric events to the caller's
-    /// own request or operation id.
-    pub correlation_id: Option<Arc<str>>,
-    /// Whether the scanned table is path-based or catalog-managed.
-    pub table_type: TableType,
+    /// Identity and table labels shared by this scan's metric events.
+    pub context: MetricContext,
     /// Which scan execution path produced this event.
     pub scan_type: ScanType,
     /// Wall-clock time from scan start to iterator exhaustion.
@@ -2025,9 +1817,7 @@ impl ScanMetadataCompleted {
         let mut v = ScanMetadataCompletedAttrs::default();
         attrs.record(&mut v);
         Self {
-            operation_id: MetricId(v.operation_id),
-            table_type: TableType::from_catalog_managed(v.is_catalog_managed),
-            correlation_id: v.correlation_id,
+            context: MetricContext::from_attrs(attrs),
             scan_type: ScanType::parse_lenient(&v.scan_type),
             duration: Duration::from_nanos(v.duration_ns),
             num_add_files_seen: v.num_add_files_seen,
@@ -2048,9 +1838,12 @@ impl ScanMetadataCompleted {
 impl fmt::Display for ScanMetadataCompleted {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
-            operation_id,
-            table_type,
-            correlation_id,
+            context:
+                MetricContext {
+                    operation_id,
+                    table_type,
+                    correlation_id,
+                },
             scan_type,
             duration,
             num_add_files_seen,
@@ -2085,9 +1878,6 @@ impl fmt::Display for ScanMetadataCompleted {
 
 #[derive(Default)]
 struct ScanMetadataCompletedAttrs {
-    operation_id: Uuid,
-    is_catalog_managed: bool,
-    correlation_id: Option<Arc<str>>,
     scan_type: String,
     duration_ns: u64,
     num_add_files_seen: u64,
@@ -2104,18 +1894,6 @@ struct ScanMetadataCompletedAttrs {
 }
 
 impl Visit for ScanMetadataCompletedAttrs {
-    fn record_bool(&mut self, field: &Field, value: bool) {
-        if field.name() == IS_CATALOG_MANAGED_FIELD {
-            self.is_catalog_managed = value;
-        }
-    }
-
-    fn record_str(&mut self, field: &Field, value: &str) {
-        if field.name() == CORRELATION_ID_FIELD && !value.is_empty() {
-            self.correlation_id = Some(value.into());
-        }
-    }
-
     fn record_u64(&mut self, field: &Field, value: u64) {
         match field.name() {
             "duration_ns" => self.duration_ns = value,
@@ -2139,9 +1917,7 @@ impl Visit for ScanMetadataCompletedAttrs {
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-        if let Some(id) = record_operation_id(field, value, ScanMetadataCompleted::SPAN_NAME) {
-            self.operation_id = id.0;
-        } else if field.name() == "scan_type" {
+        if field.name() == "scan_type" {
             self.scan_type = format!("{value:?}");
         }
     }
@@ -2349,9 +2125,9 @@ pub(crate) fn emit_scan_metadata_completed(e: &ScanMetadataCompleted) {
         tracing::Level::INFO,
         ScanMetadataCompleted::SPAN_NAME,
         report = tracing::field::Empty,
-        operation_id = %e.operation_id,
-        is_catalog_managed = e.table_type.is_catalog_managed(),
-        correlation_id = e.correlation_id.as_deref().unwrap_or(""),
+        operation_id = %e.context.operation_id,
+        is_catalog_managed = e.context.table_type.is_catalog_managed(),
+        correlation_id = e.context.correlation_id.as_deref().unwrap_or(""),
         scan_type = %e.scan_type,
         duration_ns = e.duration.as_nanos() as u64,
         num_add_files_seen = e.num_add_files_seen,
@@ -2368,114 +2144,182 @@ pub(crate) fn emit_scan_metadata_completed(e: &ScanMetadataCompleted) {
     );
 }
 
-/// Emit a [`MetricEvent::LogSegmentLoadSuccess`] for `segment`, reporting its file counts and CRC
-/// staleness. Call once per log-segment load, on success; callers time the load and pass
-/// `duration`.
+/// Emit the result and elapsed time of one log-segment load.
 pub(crate) fn emit_log_segment_load(
     ctx: &SnapshotLoadMetricContext,
-    segment: &LogSegment,
+    outcome: LogSegmentLoadOutcome,
     duration: Duration,
 ) {
-    tracing::span!(
-        tracing::Level::INFO,
-        LogSegmentLoadSuccess::SPAN_NAME,
-        report = tracing::field::Empty,
-        operation_id = %ctx.operation_id,
-        is_catalog_managed = ctx.is_catalog_managed,
-        correlation_id = ctx.correlation_id.as_deref().unwrap_or(""),
-        load_type = ctx.load_type.as_ref(),
-        num_commit_files = segment.listed.ascending_commit_files.len() as u64,
-        num_checkpoint_files = segment.listed.checkpoint_parts.len() as u64,
-        num_compaction_files = segment.listed.ascending_compaction_files.len() as u64,
-        crc_versions_behind =
-            LogSegmentLoadSuccess::encode_crc_versions_behind(segment.crc_versions_behind()),
-        duration_ns = duration.as_nanos() as u64,
-    );
-}
-
-/// Emit a [`MetricEvent::LogSegmentLoadFailure`]. Call once per log-segment load, on failure.
-///
-/// Pass the elapsed time of the failed operation; it is preserved when the helper span closes.
-pub(crate) fn emit_log_segment_load_failure(ctx: &SnapshotLoadMetricContext, duration: Duration) {
-    let span = tracing::span!(
-        tracing::Level::INFO,
-        LogSegmentLoadSuccess::SPAN_NAME,
-        report = tracing::field::Empty,
-        operation_id = %ctx.operation_id,
-        is_catalog_managed = ctx.is_catalog_managed,
-        correlation_id = ctx.correlation_id.as_deref().unwrap_or(""),
-        load_type = ctx.load_type.as_ref(),
-        duration_ns = duration.as_nanos() as u64,
-    );
-    let _enter = span.enter();
-    tracing::info!(error = tracing::field::debug("log segment load failed"));
-}
-
-/// Emit a [`MetricEvent::ProtocolMetadataLoadSuccess`]. Call once per snapshot load on the P&M
-/// resolution path, on success.
-pub(crate) fn emit_protocol_metadata_load(
-    ctx: &SnapshotLoadMetricContext,
-    source: ProtocolMetadataSource,
-    duration: Duration,
-) {
+    let (commits, checkpoints, compactions, crc_versions_behind) = match &outcome {
+        LogSegmentLoadOutcome::Success {
+            stats:
+                LogSegmentLoadStats {
+                    num_commit_files,
+                    num_checkpoint_files,
+                    num_compaction_files,
+                    crc_versions_behind,
+                },
+        } => (
+            *num_commit_files,
+            *num_checkpoint_files,
+            *num_compaction_files,
+            *crc_versions_behind,
+        ),
+        LogSegmentLoadOutcome::Error => (0, 0, 0, None),
+    };
     let _span = tracing::span!(
         tracing::Level::INFO,
-        ProtocolMetadataLoadSuccess::SPAN_NAME,
+        LogSegmentLoadCompleted::SPAN_NAME,
         report = tracing::field::Empty,
-        operation_id = %ctx.operation_id,
-        is_catalog_managed = ctx.is_catalog_managed,
-        correlation_id = ctx.correlation_id.as_deref().unwrap_or(""),
+        operation_id = %ctx.context.operation_id,
+        is_catalog_managed = ctx.context.table_type.is_catalog_managed(),
+        correlation_id = ctx.context.correlation_id.as_deref().unwrap_or(""),
         load_type = ctx.load_type.as_ref(),
+        outcome = outcome.as_ref(),
+        num_commit_files = commits,
+        num_checkpoint_files = checkpoints,
+        num_compaction_files = compactions,
+        crc_versions_behind = LogSegmentLoadCompleted::encode_crc_versions_behind(crc_versions_behind),
+        duration_ns = duration.as_nanos() as u64,
+    );
+}
+
+/// Emit the result and elapsed time of one protocol/metadata resolution.
+pub(crate) fn emit_protocol_metadata_load(
+    ctx: &SnapshotLoadMetricContext,
+    outcome: ProtocolMetadataLoadOutcome,
+    duration: Duration,
+) {
+    let source = match &outcome {
+        ProtocolMetadataLoadOutcome::Success { source } => *source,
+        ProtocolMetadataLoadOutcome::Error => ProtocolMetadataSource::Unknown,
+    };
+    let _span = tracing::span!(
+        tracing::Level::INFO,
+        ProtocolMetadataLoadCompleted::SPAN_NAME,
+        report = tracing::field::Empty,
+        operation_id = %ctx.context.operation_id,
+        is_catalog_managed = ctx.context.table_type.is_catalog_managed(),
+        correlation_id = ctx.context.correlation_id.as_deref().unwrap_or(""),
+        load_type = ctx.load_type.as_ref(),
+        outcome = outcome.as_ref(),
         pm_source = source.as_ref(),
         duration_ns = duration.as_nanos() as u64,
     );
 }
 
-/// Emit a [`MetricEvent::ProtocolMetadataLoadFailure`]. Call once per snapshot load on the P&M
-/// resolution path, on failure.
-///
-/// Pass the elapsed time of the failed operation; it is preserved when the helper span closes.
-pub(crate) fn emit_protocol_metadata_load_failure(
-    ctx: &SnapshotLoadMetricContext,
-    duration: Duration,
-) {
-    let span = tracing::span!(
-        tracing::Level::INFO,
-        ProtocolMetadataLoadSuccess::SPAN_NAME,
-        report = tracing::field::Empty,
-        operation_id = %ctx.operation_id,
-        is_catalog_managed = ctx.is_catalog_managed,
-        correlation_id = ctx.correlation_id.as_deref().unwrap_or(""),
-        load_type = ctx.load_type.as_ref(),
-        duration_ns = duration.as_nanos() as u64,
-    );
-    let _enter = span.enter();
-    tracing::info!(error = tracing::field::debug("protocol/metadata load failed"));
+/// Read the final classification after all creation fields have been decoded.
+fn has_error_outcome(attrs: &Attributes<'_>) -> bool {
+    struct Outcome(bool);
+    impl Visit for Outcome {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "outcome" {
+                match value {
+                    "error" => self.0 = true,
+                    "success" => {}
+                    _ => warn!("Invalid outcome '{value}' on metric span. Using success."),
+                }
+            }
+        }
+        fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
+    }
+    let mut outcome = Outcome(false);
+    attrs.record(&mut outcome);
+    outcome.0
 }
 
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use tracing::Callsite;
 
     use super::*;
 
-    fn commit_success(operation_id: MetricId) -> TransactionCommitSuccess {
-        TransactionCommitSuccess {
-            operation_id,
-            table_type: TableType::PathBased,
-            correlation_id: None,
-            commit_version: 1,
-            num_add_files: 0,
-            num_remove_files: 0,
-            num_dv_updates: 0,
-            add_files_bytes: 0,
-            remove_files_bytes: 0,
-            is_blind_append: false,
-            data_change: false,
-            operation: None,
-            prepare_duration: Duration::default(),
-            committer_duration: Duration::default(),
-            total_duration: Duration::default(),
+    #[test]
+    fn load_visitors_record_shared_fields_after_error() {
+        let callsite = tracing::callsite! {
+            name: "load_fields",
+            kind: tracing::metadata::Kind::SPAN,
+            fields: operation_id, correlation_id, is_catalog_managed, load_type, duration_ns,
+                num_commit_files, num_checkpoint_files, num_compaction_files, crc_versions_behind,
+                pm_source,
+        };
+        let fields = callsite.metadata().fields();
+        let field = |name| fields.field(name).unwrap();
+        let id = MetricId::new();
+        let mut log_segment = LogSegmentLoadCompleted {
+            outcome: LogSegmentLoadOutcome::Error,
+            ..LogSegmentLoadCompleted::empty()
+        };
+        let mut protocol_metadata = ProtocolMetadataLoadCompleted {
+            outcome: ProtocolMetadataLoadOutcome::Error,
+            ..ProtocolMetadataLoadCompleted::empty()
+        };
+
+        for visitor in [
+            &mut log_segment as &mut dyn Visit,
+            &mut protocol_metadata as &mut dyn Visit,
+        ] {
+            visitor.record_str(&field("operation_id"), &id.to_string());
+            visitor.record_str(&field("correlation_id"), "request-1");
+            visitor.record_bool(&field("is_catalog_managed"), true);
+            visitor.record_str(&field("load_type"), "incremental");
+            visitor.record_u64(&field("duration_ns"), 53);
+        }
+        log_segment.record_u64(&field("num_commit_files"), 3);
+        log_segment.record_u64(&field("num_checkpoint_files"), 1);
+        log_segment.record_u64(&field("num_compaction_files"), 2);
+        log_segment.record_i64(&field("crc_versions_behind"), 4);
+        protocol_metadata.record_str(&field("pm_source"), "full_replay");
+
+        for (context, load_type, duration) in [
+            (
+                &log_segment.context,
+                log_segment.load_type,
+                log_segment.duration,
+            ),
+            (
+                &protocol_metadata.context,
+                protocol_metadata.load_type,
+                protocol_metadata.duration,
+            ),
+        ] {
+            assert_eq!(context.operation_id, id);
+            assert_eq!(context.correlation_id.as_deref(), Some("request-1"));
+            assert_eq!(context.table_type, TableType::CatalogManaged);
+            assert_eq!(load_type, LogSegmentLoadType::Incremental);
+            assert_eq!(duration, Duration::from_nanos(53));
+        }
+        assert_eq!(log_segment.outcome, LogSegmentLoadOutcome::Error);
+        assert_eq!(
+            protocol_metadata.outcome,
+            ProtocolMetadataLoadOutcome::Error
+        );
+    }
+
+    fn commit_success(operation_id: MetricId) -> TransactionCommitCompleted {
+        TransactionCommitCompleted {
+            context: MetricContext {
+                operation_id,
+                table_type: TableType::PathBased,
+                correlation_id: None,
+            },
+            duration: Duration::default(),
+            outcome: TransactionCommitOutcome::Success {
+                stats: TransactionCommitStats {
+                    commit_version: 1,
+                    num_add_files: 0,
+                    num_remove_files: 0,
+                    num_dv_updates: 0,
+                    add_files_bytes: 0,
+                    remove_files_bytes: 0,
+                    is_blind_append: false,
+                    data_change: false,
+                    operation: None,
+                    prepare_duration: Duration::default(),
+                    committer_duration: Duration::default(),
+                },
+            },
         }
     }
 
@@ -2489,13 +2333,28 @@ mod tests {
         #[case] expected: CommitFailureReason,
     ) {
         let id = MetricId::new();
-        let mut event = MetricEvent::TransactionCommitSuccess(commit_success(id));
-        event.record_str("failure_reason", value).unwrap();
-        let MetricEvent::TransactionCommitFailure(failure) = event else {
-            panic!("expected TransactionCommitFailure");
+        let mut event = MetricEvent::TransactionCommitCompleted(commit_success(id));
+        let recorded = event.record_str("failure_reason", value);
+        assert_eq!(recorded.is_err(), value == "totally_unknown");
+        let MetricEvent::TransactionCommitCompleted(
+            failure @ TransactionCommitCompleted {
+                outcome: TransactionCommitOutcome::Failure { .. },
+                ..
+            },
+        ) = event
+        else {
+            panic!("expected TransactionCommitCompleted");
         };
-        assert_eq!(failure.operation_id, id);
-        assert_eq!(failure.reason, expected);
+        assert_eq!(failure.context.operation_id, id);
+
+        let TransactionCommitOutcome::Failure {
+            reason: metric_failure_reason,
+            ..
+        } = &failure.outcome
+        else {
+            panic!("unexpected metric outcome");
+        };
+        assert_eq!((*metric_failure_reason), expected);
     }
 
     #[rstest]
@@ -2536,22 +2395,42 @@ mod tests {
 
     #[test]
     fn record_str_operation_sets_field_without_flipping() {
-        let mut event = MetricEvent::TransactionCommitSuccess(commit_success(MetricId::new()));
+        let mut event = MetricEvent::TransactionCommitCompleted(commit_success(MetricId::new()));
         event.record_str("operation", "WRITE").unwrap();
-        let MetricEvent::TransactionCommitSuccess(success) = event else {
-            panic!("expected TransactionCommitSuccess");
+        let MetricEvent::TransactionCommitCompleted(
+            success @ TransactionCommitCompleted {
+                outcome: TransactionCommitOutcome::Success { .. },
+                ..
+            },
+        ) = event
+        else {
+            panic!("expected TransactionCommitCompleted");
         };
-        assert_eq!(success.operation.as_deref(), Some("WRITE"));
+
+        let TransactionCommitOutcome::Success { stats } = &success.outcome else {
+            panic!("unexpected metric outcome");
+        };
+        assert_eq!(stats.operation.as_deref(), Some("WRITE"));
     }
 
     #[test]
     fn record_u64_num_dv_updates_sets_field() {
-        let mut event = MetricEvent::TransactionCommitSuccess(commit_success(MetricId::new()));
+        let mut event = MetricEvent::TransactionCommitCompleted(commit_success(MetricId::new()));
         event.record_u64("num_dv_updates", 7).unwrap();
-        let MetricEvent::TransactionCommitSuccess(success) = event else {
-            panic!("expected TransactionCommitSuccess");
+        let MetricEvent::TransactionCommitCompleted(
+            success @ TransactionCommitCompleted {
+                outcome: TransactionCommitOutcome::Success { .. },
+                ..
+            },
+        ) = event
+        else {
+            panic!("expected TransactionCommitCompleted");
         };
-        assert_eq!(success.num_dv_updates, 7);
+
+        let TransactionCommitOutcome::Success { stats } = &success.outcome else {
+            panic!("unexpected metric outcome");
+        };
+        assert_eq!(stats.num_dv_updates, 7);
     }
 
     #[rstest]
@@ -2585,6 +2464,7 @@ mod tests {
         "written"
     )]
     #[case::already_exists(CheckpointWriteOutcome::AlreadyExists, "already_exists")]
+    #[case::error(CheckpointWriteOutcome::Error, "error")]
     fn checkpoint_write_outcome_serializes_to_wire_name(
         #[case] outcome: CheckpointWriteOutcome,
         #[case] wire: &str,
@@ -2688,9 +2568,9 @@ mod tests {
     #[case::zero(Some(0))]
     #[case::some(Some(7))]
     fn crc_versions_behind_sentinel_round_trips(#[case] v: Option<u64>) {
-        let encoded = LogSegmentLoadSuccess::encode_crc_versions_behind(v);
+        let encoded = LogSegmentLoadCompleted::encode_crc_versions_behind(v);
         assert_eq!(
-            LogSegmentLoadSuccess::decode_crc_versions_behind(encoded),
+            LogSegmentLoadCompleted::decode_crc_versions_behind(encoded),
             v
         );
     }
@@ -2734,33 +2614,42 @@ mod tests {
         let table_type = TableType::CatalogManaged;
         let events = [
             (
-                "LogSegmentLoadFailure",
-                MetricEvent::LogSegmentLoadFailure(LogSegmentLoadFailure {
-                    operation_id,
-                    correlation_id: correlation_id.clone(),
-                    table_type,
+                "LogSegmentLoadCompleted",
+                MetricEvent::LogSegmentLoadCompleted(LogSegmentLoadCompleted {
+                    context: MetricContext {
+                        operation_id,
+                        correlation_id: correlation_id.clone(),
+                        table_type,
+                    },
                     load_type: LogSegmentLoadType::Incremental,
                     duration,
+                    outcome: LogSegmentLoadOutcome::Error,
                 }),
             ),
             (
-                "ProtocolMetadataLoadFailure",
-                MetricEvent::ProtocolMetadataLoadFailure(ProtocolMetadataLoadFailure {
-                    operation_id,
-                    correlation_id: correlation_id.clone(),
-                    table_type,
+                "ProtocolMetadataLoadCompleted",
+                MetricEvent::ProtocolMetadataLoadCompleted(ProtocolMetadataLoadCompleted {
+                    context: MetricContext {
+                        operation_id,
+                        correlation_id: correlation_id.clone(),
+                        table_type,
+                    },
                     load_type: LogSegmentLoadType::Incremental,
                     duration,
+                    outcome: ProtocolMetadataLoadOutcome::Error,
                 }),
             ),
             (
-                "SnapshotBuildFailure",
-                MetricEvent::SnapshotBuildFailure(SnapshotBuildFailure {
-                    operation_id,
-                    correlation_id: correlation_id.clone(),
-                    table_type,
+                "SnapshotBuildCompleted",
+                MetricEvent::SnapshotBuildCompleted(SnapshotBuildCompleted {
+                    context: MetricContext {
+                        operation_id,
+                        correlation_id: correlation_id.clone(),
+                        table_type,
+                    },
                     load_type: SnapshotLoadType::Incremental,
                     duration,
+                    outcome: SnapshotBuildOutcome::Error,
                 }),
             ),
         ];
@@ -2769,60 +2658,104 @@ mod tests {
                 event.to_string(),
                 format!(
                     "{name}(id={operation_id}, table_type=catalog_managed, \
-                     correlation_id={correlation_id:?}, load_type=incremental, duration={duration:?})"
+                     correlation_id={correlation_id:?}, load_type=incremental, duration={duration:?}, outcome=Error)"
                 )
             );
         }
     }
 
     #[test]
-    fn into_failure_maps_commit_success_to_error_reason() {
+    fn mark_error_maps_commit_success_to_error_reason() {
         let id = MetricId::new();
-        let failure = MetricEvent::TransactionCommitSuccess(commit_success(id)).into_failure();
-        let MetricEvent::TransactionCommitFailure(failure) = failure else {
-            panic!("expected TransactionCommitFailure");
+        let mut failure = MetricEvent::TransactionCommitCompleted(commit_success(id));
+        failure.mark_error();
+        let MetricEvent::TransactionCommitCompleted(
+            failure @ TransactionCommitCompleted {
+                outcome: TransactionCommitOutcome::Failure { .. },
+                ..
+            },
+        ) = failure
+        else {
+            panic!("expected TransactionCommitCompleted");
         };
-        assert_eq!(failure.operation_id, id);
-        assert_eq!(failure.reason, CommitFailureReason::Error);
+        assert_eq!(failure.context.operation_id, id);
+
+        let TransactionCommitOutcome::Failure {
+            reason: metric_failure_reason,
+            ..
+        } = &failure.outcome
+        else {
+            panic!("unexpected metric outcome");
+        };
+        assert_eq!((*metric_failure_reason), CommitFailureReason::Error);
     }
 
     #[test]
     fn record_str_failure_reason_flip_preserves_correlation_id() {
         let mut success = commit_success(MetricId::new());
-        success.correlation_id = Some("commit-req-1".into());
-        let mut event = MetricEvent::TransactionCommitSuccess(success);
+        success.context.correlation_id = Some("commit-req-1".into());
+        let mut event = MetricEvent::TransactionCommitCompleted(success);
         event.record_str("failure_reason", "conflict").unwrap();
-        let MetricEvent::TransactionCommitFailure(failure) = event else {
-            panic!("expected TransactionCommitFailure");
+        let MetricEvent::TransactionCommitCompleted(
+            failure @ TransactionCommitCompleted {
+                outcome: TransactionCommitOutcome::Failure { .. },
+                ..
+            },
+        ) = event
+        else {
+            panic!("expected TransactionCommitCompleted");
         };
-        assert_eq!(failure.correlation_id.as_deref(), Some("commit-req-1"));
+        assert_eq!(
+            failure.context.correlation_id.as_deref(),
+            Some("commit-req-1")
+        );
     }
 
     #[test]
-    fn into_failure_preserves_correlation_id() {
+    fn mark_error_preserves_correlation_id() {
         let mut success = commit_success(MetricId::new());
-        success.correlation_id = Some("commit-req-2".into());
-        let MetricEvent::TransactionCommitFailure(failure) =
-            MetricEvent::TransactionCommitSuccess(success).into_failure()
+        success.context.correlation_id = Some("commit-req-2".into());
+        let mut event = MetricEvent::TransactionCommitCompleted(success);
+        event.mark_error();
+        let MetricEvent::TransactionCommitCompleted(
+            failure @ TransactionCommitCompleted {
+                outcome: TransactionCommitOutcome::Failure { .. },
+                ..
+            },
+        ) = event
         else {
-            panic!("expected TransactionCommitFailure");
+            panic!("expected TransactionCommitCompleted");
         };
-        assert_eq!(failure.correlation_id.as_deref(), Some("commit-req-2"));
+        assert_eq!(
+            failure.context.correlation_id.as_deref(),
+            Some("commit-req-2")
+        );
 
-        let snapshot = SnapshotBuildSuccess {
-            operation_id: MetricId::new(),
-            table_type: TableType::PathBased,
-            correlation_id: Some("snap-req-3".into()),
+        let snapshot = SnapshotBuildCompleted {
+            context: MetricContext {
+                operation_id: MetricId::new(),
+                table_type: TableType::PathBased,
+                correlation_id: Some("snap-req-3".into()),
+            },
             load_type: SnapshotLoadType::Incremental,
-            version: 0,
             duration: Duration::from_nanos(37),
+            outcome: SnapshotBuildOutcome::Success { version: 0 },
         };
-        let MetricEvent::SnapshotBuildFailure(failure) =
-            MetricEvent::SnapshotBuildSuccess(snapshot).into_failure()
+        let mut event = MetricEvent::SnapshotBuildCompleted(snapshot);
+        event.mark_error();
+        let MetricEvent::SnapshotBuildCompleted(
+            failure @ SnapshotBuildCompleted {
+                outcome: SnapshotBuildOutcome::Error,
+                ..
+            },
+        ) = event
         else {
-            panic!("expected SnapshotBuildFailure");
+            panic!("expected SnapshotBuildCompleted");
         };
-        assert_eq!(failure.correlation_id.as_deref(), Some("snap-req-3"));
+        assert_eq!(
+            failure.context.correlation_id.as_deref(),
+            Some("snap-req-3")
+        );
         assert_eq!(failure.load_type, SnapshotLoadType::Incremental);
         assert_eq!(failure.duration, Duration::from_nanos(37));
     }
@@ -2831,6 +2764,7 @@ mod tests {
     #[case(ChecksumWriteOutcome::Written { bytes_written: 0 }, "written")]
     #[case(ChecksumWriteOutcome::Written { bytes_written: 100 }, "written")]
     #[case(ChecksumWriteOutcome::AlreadyExists, "already_exists")]
+    #[case(ChecksumWriteOutcome::Error, "error")]
     fn crc_write_outcome_has_stable_label(
         #[case] outcome: ChecksumWriteOutcome,
         #[case] label: &str,
@@ -2864,15 +2798,158 @@ mod tests {
         mode: ChecksumWriteResolutionMode,
     ) {
         let duration = Duration::from_millis(42);
-        let event = MetricEvent::ChecksumWriteSuccess(ChecksumWriteSuccess {
+        let mut event = MetricEvent::ChecksumWriteCompleted(ChecksumWriteCompleted {
             outcome: ChecksumWriteOutcome::Written { bytes_written: 100 },
             resolution_mode: mode,
             duration,
         });
-        let MetricEvent::ChecksumWriteFailure(event) = event.into_failure() else {
-            panic!("expected ChecksumWriteFailure");
+        event.mark_error();
+        let MetricEvent::ChecksumWriteCompleted(
+            event @ ChecksumWriteCompleted {
+                outcome: ChecksumWriteOutcome::Error,
+                ..
+            },
+        ) = event
+        else {
+            panic!("expected ChecksumWriteCompleted");
         };
         assert_eq!(event.resolution_mode, mode);
         assert_eq!(event.duration, duration);
+    }
+    #[rstest]
+    #[case(CommitFailureReason::Conflict)]
+    #[case(CommitFailureReason::RetryableIo)]
+    #[case(CommitFailureReason::Error)]
+    fn commit_failure_reason_survives_generic_error_and_late_success_fields(
+        #[case] reason: CommitFailureReason,
+    ) {
+        let mut event = MetricEvent::TransactionCommitCompleted(commit_success(MetricId::new()));
+        event.record_str("failure_reason", reason.as_ref()).unwrap();
+        event.mark_error();
+        event.mark_error();
+        event.record_u64("num_add_files", 7).unwrap();
+        event.record_bool("data_change", true).unwrap();
+        event.record_str("operation", "WRITE").unwrap();
+        assert!(matches!(
+            event,
+            MetricEvent::TransactionCommitCompleted(TransactionCommitCompleted {
+                outcome: TransactionCommitOutcome::Failure {
+                    reason: actual
+                },
+                ..
+            }) if actual == reason
+        ));
+    }
+
+    #[rstest]
+    #[case::snapshot(
+        MetricEvent::SnapshotBuildCompleted(SnapshotBuildCompleted {
+            context: MetricContext::empty(), load_type: SnapshotLoadType::Full,
+            duration: Duration::ZERO, outcome: SnapshotBuildOutcome::Success { version: 0 },
+        }),
+        Some("version"), &[],
+    )]
+    #[case::domain(
+        MetricEvent::DomainMetadataLoadCompleted(DomainMetadataLoadCompleted {
+            duration: Duration::ZERO,
+            outcome: DomainMetadataLoadOutcome::Success { from_cache: false, num_domains_returned: 0 },
+        }),
+        Some("num_domains_returned"), &["from_cache"],
+    )]
+    #[case::set_transaction(
+        MetricEvent::SetTransactionLoadCompleted(SetTransactionLoadCompleted {
+            duration: Duration::ZERO,
+            outcome: SetTransactionLoadOutcome::Success { from_cache: false, found: false },
+        }),
+        None, &["from_cache", "found"],
+    )]
+    #[case::crc(
+        MetricEvent::CrcReadCompleted(CrcReadCompleted {
+            duration: Duration::ZERO, outcome: CrcReadOutcome::Success { bytes_read: 0 },
+        }),
+        Some("bytes_read"), &[],
+    )]
+    fn late_read_measurements_preserve_error_and_receive_elapsed_time(
+        #[case] mut event: MetricEvent,
+        #[case] count_field: Option<&str>,
+        #[case] bool_fields: &[&str],
+    ) {
+        event.mark_error();
+        if let Some(field) = count_field {
+            event.record_u64(field, 37).unwrap();
+        }
+        for field in bool_fields {
+            event.record_bool(field, true).unwrap();
+        }
+        event.mark_error();
+        let elapsed = Duration::from_nanos(53);
+        event.set_duration_if_applicable(elapsed);
+        assert!(matches!(
+            event,
+            MetricEvent::SnapshotBuildCompleted(SnapshotBuildCompleted {
+                duration, outcome: SnapshotBuildOutcome::Error, ..
+            })
+            | MetricEvent::DomainMetadataLoadCompleted(DomainMetadataLoadCompleted {
+                duration, outcome: DomainMetadataLoadOutcome::Error,
+            })
+            | MetricEvent::SetTransactionLoadCompleted(SetTransactionLoadCompleted {
+                duration, outcome: SetTransactionLoadOutcome::Error,
+            })
+            | MetricEvent::CrcReadCompleted(CrcReadCompleted {
+                duration, outcome: CrcReadOutcome::Error,
+            }) if duration == elapsed
+        ));
+    }
+
+    #[rstest]
+    #[case::checkpoint(MetricEvent::CheckpointWriteCompleted(CheckpointWriteCompleted {
+        operation_id: MetricId::new(), version: 3,
+        mode: CheckpointWriteMode::V1, duration: Duration::from_nanos(19),
+        processing_stats: CheckpointProcessingStats::default(),
+        output_stats: CheckpointOutputStats::default(),
+        outcome: CheckpointWriteOutcome::Written { stats: CheckpointWriteStats::default() },
+    }))]
+    #[case::checksum(MetricEvent::ChecksumWriteCompleted(ChecksumWriteCompleted {
+        resolution_mode: ChecksumWriteResolutionMode::Full,
+        duration: Duration::from_nanos(19),
+        outcome: ChecksumWriteOutcome::Written { bytes_written: 0 },
+    }))]
+    fn late_write_measurements_preserve_terminal_outcome(
+        #[case] mut event: MetricEvent,
+        #[values(false, true)] failed: bool,
+    ) {
+        if failed {
+            event.mark_error();
+        } else {
+            event.record_str("outcome", "already_exists").unwrap();
+        }
+        event.record_u64("bytes_written", 31).unwrap();
+        event.record_str("outcome", "already_exists").unwrap();
+        match event {
+            MetricEvent::CheckpointWriteCompleted(e) => {
+                assert_eq!(
+                    e.outcome,
+                    if failed {
+                        CheckpointWriteOutcome::Error
+                    } else {
+                        CheckpointWriteOutcome::AlreadyExists
+                    }
+                );
+                assert_eq!(e.output_stats.bytes_written, 31);
+                assert_eq!(e.duration, Duration::from_nanos(19));
+            }
+            MetricEvent::ChecksumWriteCompleted(e) => {
+                assert_eq!(
+                    e.outcome,
+                    if failed {
+                        ChecksumWriteOutcome::Error
+                    } else {
+                        ChecksumWriteOutcome::AlreadyExists
+                    }
+                );
+                assert_eq!(e.duration, Duration::from_nanos(19));
+            }
+            _ => panic!("unexpected metric"),
+        }
     }
 }

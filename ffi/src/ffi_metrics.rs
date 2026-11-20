@@ -11,7 +11,7 @@
 
 use delta_kernel::metrics as kernel;
 
-use crate::{KernelStringSlice, kernel_string_slice};
+use crate::KernelStringSlice;
 
 /// The 16 raw bytes of an operation's UUID, used to correlate events from the same operation.
 #[repr(C)]
@@ -23,6 +23,26 @@ impl From<kernel::MetricId> for MetricId {
     fn from(id: kernel::MetricId) -> Self {
         Self {
             bytes: id.as_bytes(),
+        }
+    }
+}
+
+/// Identity and table labels borrowed from a kernel metric event.
+///
+/// `correlation_id` remains valid for the duration of the metrics callback.
+#[repr(C)]
+pub struct MetricContext {
+    pub operation_id: MetricId,
+    pub correlation_id: KernelStringSlice,
+    pub table_type: TableType,
+}
+
+impl From<&kernel::MetricContext> for MetricContext {
+    fn from(context: &kernel::MetricContext) -> Self {
+        Self {
+            operation_id: context.operation_id.into(),
+            correlation_id: correlation_id_slice(context.correlation_id.as_deref()),
+            table_type: context.table_type.into(),
         }
     }
 }
@@ -72,7 +92,7 @@ impl From<kernel::CommitFailureReason> for CommitFailureReason {
     }
 }
 
-/// The result of a successful [`delta_kernel::Snapshot::checkpoint`] call.
+/// The result of a [`delta_kernel::Snapshot::checkpoint`] call.
 ///
 /// cbindgen:prefix-with-name=true
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +105,8 @@ pub enum CheckpointWriteOutcome {
     },
     /// The API returned that a checkpoint already exists at this version.
     AlreadyExists,
+    /// The call returned an error.
+    Error,
 }
 
 impl From<kernel::CheckpointWriteOutcome> for CheckpointWriteOutcome {
@@ -94,6 +116,7 @@ impl From<kernel::CheckpointWriteOutcome> for CheckpointWriteOutcome {
                 stats: stats.into(),
             },
             kernel::CheckpointWriteOutcome::AlreadyExists => Self::AlreadyExists,
+            kernel::CheckpointWriteOutcome::Error => Self::Error,
         }
     }
 }
@@ -125,7 +148,7 @@ impl From<kernel::CheckpointWriteMode> for CheckpointWriteMode {
     }
 }
 
-/// Outcome of a successful [`delta_kernel::Snapshot::write_checksum`] call.
+/// Outcome of a [`delta_kernel::Snapshot::write_checksum`] call.
 ///
 /// cbindgen:prefix-with-name=true
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +161,8 @@ pub enum ChecksumWriteOutcome {
     },
     /// The CRC already existed, including a concurrent writer winning the storage race.
     AlreadyExists,
+    /// The call returned an error.
+    Error,
 }
 
 impl From<kernel::ChecksumWriteOutcome> for ChecksumWriteOutcome {
@@ -147,6 +172,7 @@ impl From<kernel::ChecksumWriteOutcome> for ChecksumWriteOutcome {
                 Self::Written { bytes_written }
             }
             kernel::ChecksumWriteOutcome::AlreadyExists => Self::AlreadyExists,
+            kernel::ChecksumWriteOutcome::Error => Self::Error,
         }
     }
 }
@@ -242,33 +268,60 @@ impl From<kernel::SnapshotLoadType> for SnapshotLoadType {
     }
 }
 
-/// A log segment was loaded.
+/// A log segment load attempt completed.
 #[repr(C)]
-pub struct LogSegmentLoadSuccess {
-    pub operation_id: MetricId,
-    pub correlation_id: KernelStringSlice,
-    pub table_type: TableType,
+pub struct LogSegmentLoadCompleted {
+    pub context: MetricContext,
     pub load_type: LogSegmentLoadType,
     pub duration_ns: u64,
+    pub outcome: LogSegmentLoadOutcome,
+}
+
+/// C representation of [`kernel::LogSegmentLoadOutcome`].
+///
+/// cbindgen:prefix-with-name=true
+#[repr(C)]
+pub enum LogSegmentLoadOutcome {
+    Success {
+        /// Measurements from the successful operation.
+        stats: LogSegmentLoadStats,
+    },
+    Error,
+}
+
+/// Measurements from a successful log segment load.
+#[repr(C)]
+pub struct LogSegmentLoadStats {
     pub num_commit_files: u64,
     pub num_checkpoint_files: u64,
     pub num_compaction_files: u64,
-    /// Whether the segment had a CRC file. When false, `crc_versions_behind` is 0 and meaningless.
+    /// Whether the segment has a CRC. When false, `crc_versions_behind` is meaningless.
     pub has_crc: bool,
-    /// Versions the latest CRC file is behind the loaded version (0 when at the loaded version).
-    /// Only meaningful when `has_crc` is true.
+    /// CRC staleness in versions; zero when at the target version or `has_crc` is false.
     pub crc_versions_behind: u64,
 }
 
-/// Listing the log segment failed.
-#[repr(C)]
-pub struct LogSegmentLoadFailure {
-    pub operation_id: MetricId,
-    pub correlation_id: KernelStringSlice,
-    pub table_type: TableType,
-    pub load_type: LogSegmentLoadType,
-    /// Elapsed wall-clock time before failure, in nanoseconds.
-    pub duration_ns: u64,
+impl From<&kernel::LogSegmentLoadStats> for LogSegmentLoadStats {
+    fn from(stats: &kernel::LogSegmentLoadStats) -> Self {
+        Self {
+            num_commit_files: stats.num_commit_files,
+            num_checkpoint_files: stats.num_checkpoint_files,
+            num_compaction_files: stats.num_compaction_files,
+            has_crc: stats.crc_versions_behind.is_some(),
+            crc_versions_behind: stats.crc_versions_behind.unwrap_or(0),
+        }
+    }
+}
+
+impl From<&kernel::LogSegmentLoadOutcome> for LogSegmentLoadOutcome {
+    fn from(outcome: &kernel::LogSegmentLoadOutcome) -> Self {
+        match outcome {
+            kernel::LogSegmentLoadOutcome::Success { stats } => Self::Success {
+                stats: stats.into(),
+            },
+            kernel::LogSegmentLoadOutcome::Error => Self::Error,
+        }
+    }
 }
 
 /// How a snapshot load resolved Protocol and Metadata.
@@ -295,58 +348,91 @@ impl From<kernel::ProtocolMetadataSource> for ProtocolMetadataSource {
     }
 }
 
-/// Protocol and metadata actions were read from the log.
+/// A protocol and metadata resolution attempt completed.
 #[repr(C)]
-pub struct ProtocolMetadataLoadSuccess {
-    pub operation_id: MetricId,
-    pub correlation_id: KernelStringSlice,
-    pub table_type: TableType,
+pub struct ProtocolMetadataLoadCompleted {
+    pub context: MetricContext,
     pub load_type: LogSegmentLoadType,
-    pub source: ProtocolMetadataSource,
     pub duration_ns: u64,
+    pub outcome: ProtocolMetadataLoadOutcome,
 }
 
-/// Reading protocol and metadata from the log failed.
+/// C representation of [`kernel::ProtocolMetadataLoadOutcome`].
+///
+/// cbindgen:prefix-with-name=true
 #[repr(C)]
-pub struct ProtocolMetadataLoadFailure {
-    pub operation_id: MetricId,
-    pub correlation_id: KernelStringSlice,
-    pub table_type: TableType,
-    pub load_type: LogSegmentLoadType,
-    /// Elapsed wall-clock time before failure, in nanoseconds.
-    pub duration_ns: u64,
+pub enum ProtocolMetadataLoadOutcome {
+    Success { source: ProtocolMetadataSource },
+    Error,
 }
 
-/// A snapshot was built successfully.
+impl From<&kernel::ProtocolMetadataLoadOutcome> for ProtocolMetadataLoadOutcome {
+    fn from(outcome: &kernel::ProtocolMetadataLoadOutcome) -> Self {
+        match outcome {
+            kernel::ProtocolMetadataLoadOutcome::Success { source } => Self::Success {
+                source: (*source).into(),
+            },
+            kernel::ProtocolMetadataLoadOutcome::Error => Self::Error,
+        }
+    }
+}
+
+/// A snapshot build attempt completed.
 #[repr(C)]
-pub struct SnapshotBuildSuccess {
-    pub operation_id: MetricId,
-    pub correlation_id: KernelStringSlice,
-    pub table_type: TableType,
+pub struct SnapshotBuildCompleted {
+    pub context: MetricContext,
     pub load_type: SnapshotLoadType,
-    pub version: u64,
     pub duration_ns: u64,
+    pub outcome: SnapshotBuildOutcome,
 }
 
-/// Building a snapshot failed.
+/// C representation of [`kernel::SnapshotBuildOutcome`].
+///
+/// cbindgen:prefix-with-name=true
 #[repr(C)]
-pub struct SnapshotBuildFailure {
-    pub operation_id: MetricId,
-    pub correlation_id: KernelStringSlice,
-    pub table_type: TableType,
-    pub load_type: SnapshotLoadType,
-    /// Elapsed wall-clock time before failure, in nanoseconds.
-    pub duration_ns: u64,
+pub enum SnapshotBuildOutcome {
+    Success { version: u64 },
+    Error,
 }
 
-/// A transaction was committed successfully. `operation` and `correlation_id` are slices into
-/// engine-supplied data that are only valid for the duration of the callback; an empty slice means
-/// the value was unset.
+impl From<&kernel::SnapshotBuildOutcome> for SnapshotBuildOutcome {
+    fn from(outcome: &kernel::SnapshotBuildOutcome) -> Self {
+        match outcome {
+            kernel::SnapshotBuildOutcome::Success { version } => {
+                Self::Success { version: *version }
+            }
+            kernel::SnapshotBuildOutcome::Error => Self::Error,
+        }
+    }
+}
+
+/// A transaction commit attempt completed.
+///
+/// Strings in the context and successful outcome are borrowed for the metrics callback.
 #[repr(C)]
-pub struct TransactionCommitSuccess {
-    pub operation_id: MetricId,
-    pub correlation_id: KernelStringSlice,
-    pub table_type: TableType,
+pub struct TransactionCommitCompleted {
+    pub context: MetricContext,
+    pub duration_ns: u64,
+    pub outcome: TransactionCommitOutcome,
+}
+
+/// C representation of [`kernel::TransactionCommitOutcome`].
+///
+/// cbindgen:prefix-with-name=true
+#[repr(C)]
+pub enum TransactionCommitOutcome {
+    Success {
+        /// Measurements from the successful operation.
+        stats: TransactionCommitStats,
+    },
+    Failure {
+        reason: CommitFailureReason,
+    },
+}
+
+/// Measurements from a successful transaction commit.
+#[repr(C)]
+pub struct TransactionCommitStats {
     pub commit_version: u64,
     pub num_add_files: u64,
     pub num_remove_files: u64,
@@ -358,30 +444,52 @@ pub struct TransactionCommitSuccess {
     pub operation: KernelStringSlice,
     pub prepare_duration_ns: u64,
     pub committer_duration_ns: u64,
-    pub total_duration_ns: u64,
 }
 
-/// A transaction commit did not succeed; `reason` distinguishes conflict, retryable IO, and
-/// terminal errors.
-#[repr(C)]
-pub struct TransactionCommitFailure {
-    pub operation_id: MetricId,
-    pub correlation_id: KernelStringSlice,
-    pub table_type: TableType,
-    pub reason: CommitFailureReason,
+impl From<&kernel::TransactionCommitStats> for TransactionCommitStats {
+    fn from(stats: &kernel::TransactionCommitStats) -> Self {
+        Self {
+            commit_version: stats.commit_version,
+            num_add_files: stats.num_add_files,
+            num_remove_files: stats.num_remove_files,
+            num_dv_updates: stats.num_dv_updates,
+            add_files_bytes: stats.add_files_bytes,
+            remove_files_bytes: stats.remove_files_bytes,
+            is_blind_append: stats.is_blind_append,
+            data_change: stats.data_change,
+            operation: correlation_id_slice(stats.operation.as_deref()),
+            prepare_duration_ns: duration_ns(stats.prepare_duration),
+            committer_duration_ns: duration_ns(stats.committer_duration),
+        }
+    }
 }
 
-/// A [`delta_kernel::Snapshot::checkpoint`] call returned successfully.
+impl From<&kernel::TransactionCommitOutcome> for TransactionCommitOutcome {
+    fn from(outcome: &kernel::TransactionCommitOutcome) -> Self {
+        match outcome {
+            kernel::TransactionCommitOutcome::Success { stats } => Self::Success {
+                stats: stats.into(),
+            },
+            kernel::TransactionCommitOutcome::Failure { reason } => Self::Failure {
+                reason: (*reason).into(),
+            },
+        }
+    }
+}
+
+/// A [`delta_kernel::Snapshot::checkpoint`] attempt completed.
 ///
-/// Written checkpoints report completed processing and output. An early AlreadyExists reports zero
-/// processing and output values; later AlreadyExists returns retain the work performed.
+/// Processing and output statistics retain work performed before any outcome, including an error
+/// or `AlreadyExists`. Unreached stages report zero, including preflight failures. Only
+/// [`CheckpointWriteOutcome::Written`] carries completed-checkpoint contents. An error can occur
+/// after data writes, during hint publication or snapshot construction.
 #[repr(C)]
-pub struct CheckpointWriteSuccess {
+pub struct CheckpointWriteCompleted {
     /// Unique identifier for this checkpoint attempt.
     pub operation_id: MetricId,
     /// Snapshot version being checkpointed.
     pub version: u64,
-    /// Whether the call wrote a checkpoint or found one already present.
+    /// Whether the call wrote a checkpoint, found one already present, or returned an error.
     pub outcome: CheckpointWriteOutcome,
     /// Selected checkpoint write mode.
     pub mode: CheckpointWriteMode,
@@ -391,28 +499,6 @@ pub struct CheckpointWriteSuccess {
     /// Work performed while producing checkpoint batches, including on an AlreadyExists return.
     pub processing_stats: CheckpointProcessingStats,
     /// Output work performed, including on an AlreadyExists return after writing starts.
-    pub output_stats: CheckpointOutputStats,
-}
-
-/// A [`delta_kernel::Snapshot::checkpoint`] call returned an error, including after data writes.
-///
-/// Processing and output metrics retain work performed before the error. Preflight failures report
-/// zero values. Hint publication or snapshot construction failures retain completed measurements.
-#[repr(C)]
-pub struct CheckpointWriteFailure {
-    /// Unique identifier for this checkpoint attempt.
-    pub operation_id: MetricId,
-    /// Snapshot version being checkpointed.
-    pub version: u64,
-    /// Selected write mode, preserved when the call fails.
-    pub mode: CheckpointWriteMode,
-    /// API entry through checkpoint data completion, or an earlier error, in nanoseconds.
-    /// Excludes `_last_checkpoint` publication and returned snapshot construction.
-    pub duration_ns: u64,
-    /// Work performed before the error.
-    pub processing_stats: CheckpointProcessingStats,
-    /// Output work performed before the error, including successful writes before verification
-    /// fails.
     pub output_stats: CheckpointOutputStats,
 }
 
@@ -519,44 +605,101 @@ impl From<kernel::CheckpointWriteStats> for CheckpointWriteStats {
 
 /// A domain metadata load completed.
 #[repr(C)]
-pub struct DomainMetadataLoadSuccess {
-    pub from_cache: bool,
-    pub num_domains_returned: u64,
+pub struct DomainMetadataLoadCompleted {
     pub duration_ns: u64,
+    pub outcome: DomainMetadataLoadOutcome,
+}
+
+/// C representation of [`kernel::DomainMetadataLoadOutcome`].
+///
+/// cbindgen:prefix-with-name=true
+#[repr(C)]
+pub enum DomainMetadataLoadOutcome {
+    Success {
+        from_cache: bool,
+        num_domains_returned: u64,
+    },
+    Error,
+}
+
+impl From<&kernel::DomainMetadataLoadOutcome> for DomainMetadataLoadOutcome {
+    fn from(outcome: &kernel::DomainMetadataLoadOutcome) -> Self {
+        match outcome {
+            kernel::DomainMetadataLoadOutcome::Success {
+                from_cache,
+                num_domains_returned,
+            } => Self::Success {
+                from_cache: *from_cache,
+                num_domains_returned: *num_domains_returned,
+            },
+            kernel::DomainMetadataLoadOutcome::Error => Self::Error,
+        }
+    }
 }
 
 /// A `SetTransaction` (app id) load completed.
 #[repr(C)]
-pub struct SetTransactionLoadSuccess {
-    pub from_cache: bool,
-    pub found: bool,
+pub struct SetTransactionLoadCompleted {
     pub duration_ns: u64,
+    pub outcome: SetTransactionLoadOutcome,
 }
 
-/// A CRC file was read and parsed successfully.
+/// C representation of [`kernel::SetTransactionLoadOutcome`].
+///
+/// cbindgen:prefix-with-name=true
 #[repr(C)]
-pub struct CrcReadSuccess {
-    pub bytes_read: u64,
-    pub duration_ns: u64,
+pub enum SetTransactionLoadOutcome {
+    Success { from_cache: bool, found: bool },
+    Error,
 }
 
-/// A [`delta_kernel::Snapshot::write_checksum`] call succeeded.
+impl From<&kernel::SetTransactionLoadOutcome> for SetTransactionLoadOutcome {
+    fn from(outcome: &kernel::SetTransactionLoadOutcome) -> Self {
+        match outcome {
+            kernel::SetTransactionLoadOutcome::Success { from_cache, found } => Self::Success {
+                from_cache: *from_cache,
+                found: *found,
+            },
+            kernel::SetTransactionLoadOutcome::Error => Self::Error,
+        }
+    }
+}
+
+/// A CRC read and parse attempt completed.
 #[repr(C)]
-pub struct ChecksumWriteSuccess {
-    /// Whether this call wrote a new CRC or the CRC already existed.
-    pub outcome: ChecksumWriteOutcome,
-    /// CRC construction path selected during this call.
-    pub resolution_mode: ChecksumWriteResolutionMode,
-    /// Wall-clock time from API entry to return.
+pub struct CrcReadCompleted {
     pub duration_ns: u64,
+    pub outcome: CrcReadOutcome,
 }
 
-/// A [`delta_kernel::Snapshot::write_checksum`] call failed.
+/// C representation of [`kernel::CrcReadOutcome`].
+///
+/// cbindgen:prefix-with-name=true
+#[repr(C)]
+pub enum CrcReadOutcome {
+    Success { bytes_read: u64 },
+    Error,
+}
+
+impl From<&kernel::CrcReadOutcome> for CrcReadOutcome {
+    fn from(outcome: &kernel::CrcReadOutcome) -> Self {
+        match outcome {
+            kernel::CrcReadOutcome::Success { bytes_read } => Self::Success {
+                bytes_read: *bytes_read,
+            },
+            kernel::CrcReadOutcome::Error => Self::Error,
+        }
+    }
+}
+
+/// A [`delta_kernel::Snapshot::write_checksum`] attempt completed.
 ///
 /// Storage may already contain the CRC if constructing the returned snapshot failed.
 #[repr(C)]
-pub struct ChecksumWriteFailure {
-    /// CRC construction path selected before the error.
+pub struct ChecksumWriteCompleted {
+    /// Whether the call wrote a new CRC, found one already present, or returned an error.
+    pub outcome: ChecksumWriteOutcome,
+    /// CRC construction path selected during this call.
     pub resolution_mode: ChecksumWriteResolutionMode,
     /// Wall-clock time from API entry to return.
     pub duration_ns: u64,
@@ -625,9 +768,7 @@ pub struct ParquetReadCompleted {
 /// field semantics.
 #[repr(C)]
 pub struct ScanMetadataCompleted {
-    pub operation_id: MetricId,
-    pub correlation_id: KernelStringSlice,
-    pub table_type: TableType,
+    pub context: MetricContext,
     pub scan_type: ScanType,
     pub duration_ns: u64,
     pub num_add_files_seen: u64,
@@ -670,31 +811,22 @@ pub struct StorageCopyCompleted {
 /// cbindgen:prefix-with-name=true
 #[repr(C)]
 pub enum MetricEvent {
-    LogSegmentLoadSuccess(LogSegmentLoadSuccess),
-    LogSegmentLoadFailure(LogSegmentLoadFailure),
-    ProtocolMetadataLoadSuccess(ProtocolMetadataLoadSuccess),
-    ProtocolMetadataLoadFailure(ProtocolMetadataLoadFailure),
-    SnapshotBuildSuccess(SnapshotBuildSuccess),
-    SnapshotBuildFailure(SnapshotBuildFailure),
-    TransactionCommitSuccess(TransactionCommitSuccess),
-    TransactionCommitFailure(TransactionCommitFailure),
-    DomainMetadataLoadSuccess(DomainMetadataLoadSuccess),
-    DomainMetadataLoadFailure,
-    SetTransactionLoadSuccess(SetTransactionLoadSuccess),
-    SetTransactionLoadFailure,
-    CrcReadSuccess(CrcReadSuccess),
-    CrcReadFailure,
+    LogSegmentLoadCompleted(LogSegmentLoadCompleted),
+    ProtocolMetadataLoadCompleted(ProtocolMetadataLoadCompleted),
+    SnapshotBuildCompleted(SnapshotBuildCompleted),
+    TransactionCommitCompleted(TransactionCommitCompleted),
+    DomainMetadataLoadCompleted(DomainMetadataLoadCompleted),
+    SetTransactionLoadCompleted(SetTransactionLoadCompleted),
+    CrcReadCompleted(CrcReadCompleted),
+    LastCheckpointReadCompleted(LastCheckpointReadCompleted),
+    CheckpointWriteCompleted(CheckpointWriteCompleted),
+    ChecksumWriteCompleted(ChecksumWriteCompleted),
     JsonReadCompleted(JsonReadCompleted),
     ParquetReadCompleted(ParquetReadCompleted),
     ScanMetadataCompleted(ScanMetadataCompleted),
     StorageListCompleted(StorageListCompleted),
     StorageReadCompleted(StorageReadCompleted),
     StorageCopyCompleted(StorageCopyCompleted),
-    CheckpointWriteSuccess(CheckpointWriteSuccess),
-    CheckpointWriteFailure(CheckpointWriteFailure),
-    ChecksumWriteSuccess(ChecksumWriteSuccess),
-    ChecksumWriteFailure(ChecksumWriteFailure),
-    LastCheckpointReadCompleted(LastCheckpointReadCompleted),
 }
 
 fn duration_ns(duration: std::time::Duration) -> u64 {
@@ -713,205 +845,77 @@ fn correlation_id_slice(correlation_id: Option<&str>) -> KernelStringSlice {
 }
 
 impl MetricEvent {
-    /// Build an FFI event from a kernel event. Note that this event is only valid as long as the
-    /// passed argument is still alive, since we might make `KernelStringSlices` out of some
-    /// fields.
+    /// Borrow a kernel event for the duration of the metrics callback.
     pub(crate) fn from_kernel(event: &kernel::MetricEvent) -> Self {
         use kernel::MetricEvent as K;
         match event {
-            K::LogSegmentLoadSuccess(kernel::LogSegmentLoadSuccess {
-                operation_id,
-                correlation_id,
-                table_type,
-                load_type,
-                num_commit_files,
-                num_checkpoint_files,
-                num_compaction_files,
-                crc_versions_behind,
-                duration,
-            }) => Self::LogSegmentLoadSuccess(LogSegmentLoadSuccess {
-                operation_id: (*operation_id).into(),
-                correlation_id: correlation_id_slice(correlation_id.as_deref()),
-                table_type: (*table_type).into(),
-                load_type: (*load_type).into(),
-                duration_ns: duration_ns(*duration),
-                num_commit_files: *num_commit_files,
-                num_checkpoint_files: *num_checkpoint_files,
-                num_compaction_files: *num_compaction_files,
-                // C has no Option: `has_crc` gates `crc_versions_behind` (0 when absent).
-                has_crc: crc_versions_behind.is_some(),
-                crc_versions_behind: crc_versions_behind.unwrap_or(0),
-            }),
-            K::LogSegmentLoadFailure(kernel::LogSegmentLoadFailure {
-                operation_id,
-                correlation_id,
-                table_type,
-                load_type,
-                duration,
-            }) => Self::LogSegmentLoadFailure(LogSegmentLoadFailure {
-                operation_id: (*operation_id).into(),
-                correlation_id: correlation_id_slice(correlation_id.as_deref()),
-                table_type: (*table_type).into(),
-                load_type: (*load_type).into(),
-                duration_ns: duration_ns(*duration),
-            }),
-            K::ProtocolMetadataLoadSuccess(kernel::ProtocolMetadataLoadSuccess {
-                operation_id,
-                correlation_id,
-                table_type,
-                load_type,
-                source,
-                duration,
-            }) => Self::ProtocolMetadataLoadSuccess(ProtocolMetadataLoadSuccess {
-                operation_id: (*operation_id).into(),
-                correlation_id: correlation_id_slice(correlation_id.as_deref()),
-                table_type: (*table_type).into(),
-                load_type: (*load_type).into(),
-                source: (*source).into(),
-                duration_ns: duration_ns(*duration),
-            }),
-            K::ProtocolMetadataLoadFailure(kernel::ProtocolMetadataLoadFailure {
-                operation_id,
-                correlation_id,
-                table_type,
-                load_type,
-                duration,
-            }) => Self::ProtocolMetadataLoadFailure(ProtocolMetadataLoadFailure {
-                operation_id: (*operation_id).into(),
-                correlation_id: correlation_id_slice(correlation_id.as_deref()),
-                table_type: (*table_type).into(),
-                load_type: (*load_type).into(),
-                duration_ns: duration_ns(*duration),
-            }),
-            K::SnapshotBuildSuccess(kernel::SnapshotBuildSuccess {
-                operation_id,
-                correlation_id,
-                table_type,
-                load_type,
-                version,
-                duration,
-            }) => Self::SnapshotBuildSuccess(SnapshotBuildSuccess {
-                operation_id: (*operation_id).into(),
-                correlation_id: correlation_id_slice(correlation_id.as_deref()),
-                table_type: (*table_type).into(),
-                load_type: (*load_type).into(),
-                version: *version,
-                duration_ns: duration_ns(*duration),
-            }),
-            K::SnapshotBuildFailure(kernel::SnapshotBuildFailure {
-                operation_id,
-                correlation_id,
-                table_type,
-                load_type,
-                duration,
-            }) => Self::SnapshotBuildFailure(SnapshotBuildFailure {
-                operation_id: (*operation_id).into(),
-                correlation_id: correlation_id_slice(correlation_id.as_deref()),
-                table_type: (*table_type).into(),
-                load_type: (*load_type).into(),
-                duration_ns: duration_ns(*duration),
-            }),
-            K::TransactionCommitSuccess(kernel::TransactionCommitSuccess {
-                operation_id,
-                correlation_id,
-                table_type,
-                commit_version,
-                num_add_files,
-                num_remove_files,
-                num_dv_updates,
-                add_files_bytes,
-                remove_files_bytes,
-                is_blind_append,
-                data_change,
-                operation,
-                prepare_duration,
-                committer_duration,
-                total_duration,
-            }) => {
-                let operation = match operation.as_ref() {
-                    Some(o) => kernel_string_slice!(o),
-                    None => KernelStringSlice::empty(),
-                };
-                Self::TransactionCommitSuccess(TransactionCommitSuccess {
-                    operation_id: (*operation_id).into(),
-                    correlation_id: correlation_id_slice(correlation_id.as_deref()),
-                    table_type: (*table_type).into(),
-                    commit_version: *commit_version,
-                    num_add_files: *num_add_files,
-                    num_remove_files: *num_remove_files,
-                    num_dv_updates: *num_dv_updates,
-                    add_files_bytes: *add_files_bytes,
-                    remove_files_bytes: *remove_files_bytes,
-                    is_blind_append: *is_blind_append,
-                    data_change: *data_change,
-                    operation,
-                    prepare_duration_ns: duration_ns(*prepare_duration),
-                    committer_duration_ns: duration_ns(*committer_duration),
-                    total_duration_ns: duration_ns(*total_duration),
+            K::LogSegmentLoadCompleted(e) => {
+                Self::LogSegmentLoadCompleted(LogSegmentLoadCompleted {
+                    context: (&e.context).into(),
+                    load_type: e.load_type.into(),
+                    duration_ns: duration_ns(e.duration),
+                    outcome: (&e.outcome).into(),
                 })
             }
-            K::TransactionCommitFailure(kernel::TransactionCommitFailure {
-                operation_id,
-                correlation_id,
-                table_type,
-                reason,
-            }) => Self::TransactionCommitFailure(TransactionCommitFailure {
-                operation_id: (*operation_id).into(),
-                correlation_id: correlation_id_slice(correlation_id.as_deref()),
-                table_type: (*table_type).into(),
-                reason: (*reason).into(),
+            K::ProtocolMetadataLoadCompleted(e) => {
+                Self::ProtocolMetadataLoadCompleted(ProtocolMetadataLoadCompleted {
+                    context: (&e.context).into(),
+                    load_type: e.load_type.into(),
+                    duration_ns: duration_ns(e.duration),
+                    outcome: (&e.outcome).into(),
+                })
+            }
+            K::SnapshotBuildCompleted(e) => Self::SnapshotBuildCompleted(SnapshotBuildCompleted {
+                context: (&e.context).into(),
+                load_type: e.load_type.into(),
+                duration_ns: duration_ns(e.duration),
+                outcome: (&e.outcome).into(),
             }),
-            K::DomainMetadataLoadSuccess(kernel::DomainMetadataLoadSuccess {
-                from_cache,
-                num_domains_returned,
-                duration,
-            }) => Self::DomainMetadataLoadSuccess(DomainMetadataLoadSuccess {
-                from_cache: *from_cache,
-                num_domains_returned: *num_domains_returned,
-                duration_ns: duration_ns(*duration),
+            K::TransactionCommitCompleted(e) => {
+                Self::TransactionCommitCompleted(TransactionCommitCompleted {
+                    context: (&e.context).into(),
+                    duration_ns: duration_ns(e.duration),
+                    outcome: (&e.outcome).into(),
+                })
+            }
+            K::DomainMetadataLoadCompleted(e) => {
+                Self::DomainMetadataLoadCompleted(DomainMetadataLoadCompleted {
+                    duration_ns: duration_ns(e.duration),
+                    outcome: (&e.outcome).into(),
+                })
+            }
+            K::SetTransactionLoadCompleted(e) => {
+                Self::SetTransactionLoadCompleted(SetTransactionLoadCompleted {
+                    duration_ns: duration_ns(e.duration),
+                    outcome: (&e.outcome).into(),
+                })
+            }
+            K::CrcReadCompleted(e) => Self::CrcReadCompleted(CrcReadCompleted {
+                duration_ns: duration_ns(e.duration),
+                outcome: (&e.outcome).into(),
             }),
-            K::DomainMetadataLoadFailure => Self::DomainMetadataLoadFailure,
-            K::SetTransactionLoadSuccess(kernel::SetTransactionLoadSuccess {
-                from_cache,
-                found,
-                duration,
-            }) => Self::SetTransactionLoadSuccess(SetTransactionLoadSuccess {
-                from_cache: *from_cache,
-                found: *found,
-                duration_ns: duration_ns(*duration),
+            K::CheckpointWriteCompleted(e) => {
+                Self::CheckpointWriteCompleted(CheckpointWriteCompleted {
+                    operation_id: e.operation_id.into(),
+                    version: e.version,
+                    outcome: e.outcome.into(),
+                    mode: e.mode.into(),
+                    duration_ns: duration_ns(e.duration),
+                    processing_stats: e.processing_stats.into(),
+                    output_stats: e.output_stats.into(),
+                })
+            }
+            K::ChecksumWriteCompleted(e) => Self::ChecksumWriteCompleted(ChecksumWriteCompleted {
+                outcome: e.outcome.into(),
+                resolution_mode: e.resolution_mode.into(),
+                duration_ns: duration_ns(e.duration),
             }),
-            K::SetTransactionLoadFailure => Self::SetTransactionLoadFailure,
-            K::CrcReadSuccess(kernel::CrcReadSuccess {
-                bytes_read,
-                duration,
-            }) => Self::CrcReadSuccess(CrcReadSuccess {
-                bytes_read: *bytes_read,
-                duration_ns: duration_ns(*duration),
-            }),
-            K::CrcReadFailure => Self::CrcReadFailure,
-            K::LastCheckpointReadCompleted(kernel::LastCheckpointReadCompleted {
-                outcome,
-                duration,
-            }) => Self::LastCheckpointReadCompleted(LastCheckpointReadCompleted {
-                outcome: (*outcome).into(),
-                duration_ns: duration_ns(*duration),
-            }),
-            K::ChecksumWriteSuccess(kernel::ChecksumWriteSuccess {
-                outcome,
-                resolution_mode,
-                duration,
-            }) => Self::ChecksumWriteSuccess(ChecksumWriteSuccess {
-                outcome: (*outcome).into(),
-                resolution_mode: (*resolution_mode).into(),
-                duration_ns: duration_ns(*duration),
-            }),
-            K::ChecksumWriteFailure(kernel::ChecksumWriteFailure {
-                resolution_mode,
-                duration,
-            }) => Self::ChecksumWriteFailure(ChecksumWriteFailure {
-                resolution_mode: (*resolution_mode).into(),
-                duration_ns: duration_ns(*duration),
-            }),
+            K::LastCheckpointReadCompleted(e) => {
+                Self::LastCheckpointReadCompleted(LastCheckpointReadCompleted {
+                    duration_ns: duration_ns(e.duration),
+                    outcome: e.outcome.into(),
+                })
+            }
             K::JsonReadCompleted(kernel::JsonReadCompleted {
                 num_files,
                 bytes_read,
@@ -927,9 +931,7 @@ impl MetricEvent {
                 bytes_read: *bytes_read,
             }),
             K::ScanMetadataCompleted(kernel::ScanMetadataCompleted {
-                operation_id,
-                correlation_id,
-                table_type,
+                context,
                 scan_type,
                 duration,
                 num_add_files_seen,
@@ -944,9 +946,7 @@ impl MetricEvent {
                 action_transform_time,
                 predicate_eval_time,
             }) => Self::ScanMetadataCompleted(ScanMetadataCompleted {
-                operation_id: (*operation_id).into(),
-                correlation_id: correlation_id_slice(correlation_id.as_deref()),
-                table_type: (*table_type).into(),
+                context: context.into(),
                 scan_type: (*scan_type).into(),
                 duration_ns: duration_ns(*duration),
                 num_add_files_seen: *num_add_files_seen,
@@ -956,7 +956,7 @@ impl MetricEvent {
                 num_remove_files_seen_from_delta_files: *num_remove_files_seen_from_delta_files,
                 num_non_file_actions: *num_non_file_actions,
                 num_predicate_filtered: *num_predicate_filtered,
-                peak_hash_set_size: *peak_hash_set_size as u64, // note usize -> u64 cast
+                peak_hash_set_size: *peak_hash_set_size as u64,
                 dedup_visitor_time_ns: duration_ns(*dedup_visitor_time),
                 action_transform_time_ns: duration_ns(*action_transform_time),
                 predicate_eval_time_ns: duration_ns(*predicate_eval_time),
@@ -982,38 +982,6 @@ impl MetricEvent {
                     duration_ns: duration_ns(*duration),
                 })
             }
-            K::CheckpointWriteSuccess(kernel::CheckpointWriteSuccess {
-                operation_id,
-                version,
-                outcome,
-                mode,
-                duration,
-                processing_stats,
-                output_stats,
-            }) => Self::CheckpointWriteSuccess(CheckpointWriteSuccess {
-                operation_id: (*operation_id).into(),
-                version: *version,
-                outcome: (*outcome).into(),
-                mode: (*mode).into(),
-                duration_ns: duration_ns(*duration),
-                processing_stats: (*processing_stats).into(),
-                output_stats: (*output_stats).into(),
-            }),
-            K::CheckpointWriteFailure(kernel::CheckpointWriteFailure {
-                operation_id,
-                version,
-                mode,
-                duration,
-                processing_stats,
-                output_stats,
-            }) => Self::CheckpointWriteFailure(CheckpointWriteFailure {
-                operation_id: (*operation_id).into(),
-                version: *version,
-                mode: (*mode).into(),
-                duration_ns: duration_ns(*duration),
-                processing_stats: (*processing_stats).into(),
-                output_stats: (*output_stats).into(),
-            }),
         }
     }
 }
@@ -1104,27 +1072,28 @@ mod tests {
             let sidecars = u64::from(mode == kernel::CheckpointWriteMode::V2WithSidecars) * 2;
             (101, 3, 5, 11 + sidecars, sidecars)
         };
-        let event = kernel::MetricEvent::CheckpointWriteSuccess(kernel::CheckpointWriteSuccess {
-            operation_id,
-            version: 42,
-            outcome: kernel::CheckpointWriteOutcome::Written {
-                stats: kernel::CheckpointWriteStats {
-                    size_in_bytes: bytes,
-                    num_add_files: adds,
-                    num_remove_files: removes,
-                    num_actions: actions,
-                    num_sidecars: sidecars,
+        let event =
+            kernel::MetricEvent::CheckpointWriteCompleted(kernel::CheckpointWriteCompleted {
+                operation_id,
+                version: 42,
+                outcome: kernel::CheckpointWriteOutcome::Written {
+                    stats: kernel::CheckpointWriteStats {
+                        size_in_bytes: bytes,
+                        num_add_files: adds,
+                        num_remove_files: removes,
+                        num_actions: actions,
+                        num_sidecars: sidecars,
+                    },
                 },
-            },
-            mode,
-            duration: Duration::from_nanos(123),
-            processing_stats,
-            output_stats,
-        });
+                mode,
+                duration: Duration::from_nanos(123),
+                processing_stats,
+                output_stats,
+            });
 
         with_ffi_event(&event, |ffi| {
-            let MetricEvent::CheckpointWriteSuccess(e) = ffi else {
-                panic!("expected CheckpointWriteSuccess");
+            let MetricEvent::CheckpointWriteCompleted(e) = ffi else {
+                panic!("expected CheckpointWriteCompleted");
             };
             assert_eq!(e.mode, expected_mode);
             assert_eq!(e.operation_id.bytes, operation_id.as_bytes());
@@ -1186,16 +1155,17 @@ mod tests {
             num_sidecars_written: 10,
         };
         let event = if failed {
-            kernel::MetricEvent::CheckpointWriteFailure(kernel::CheckpointWriteFailure {
+            kernel::MetricEvent::CheckpointWriteCompleted(kernel::CheckpointWriteCompleted {
                 operation_id,
                 version: 42,
                 mode,
                 duration,
                 processing_stats,
                 output_stats,
+                outcome: kernel::CheckpointWriteOutcome::Error,
             })
         } else {
-            kernel::MetricEvent::CheckpointWriteSuccess(kernel::CheckpointWriteSuccess {
+            kernel::MetricEvent::CheckpointWriteCompleted(kernel::CheckpointWriteCompleted {
                 operation_id,
                 version: 42,
                 outcome: kernel::CheckpointWriteOutcome::AlreadyExists,
@@ -1208,7 +1178,12 @@ mod tests {
 
         with_ffi_event(&event, |ffi| {
             let (mode, duration, id, version, processing_stats, output_stats) = match ffi {
-                MetricEvent::CheckpointWriteFailure(e) if failed => (
+                MetricEvent::CheckpointWriteCompleted(
+                    e @ CheckpointWriteCompleted {
+                        outcome: CheckpointWriteOutcome::Error,
+                        ..
+                    },
+                ) if failed => (
                     e.mode,
                     e.duration_ns,
                     e.operation_id,
@@ -1216,7 +1191,7 @@ mod tests {
                     e.processing_stats,
                     e.output_stats,
                 ),
-                MetricEvent::CheckpointWriteSuccess(e) if !failed => {
+                MetricEvent::CheckpointWriteCompleted(e) if !failed => {
                     assert_eq!(e.outcome, CheckpointWriteOutcome::AlreadyExists);
                     (
                         e.mode,
@@ -1274,39 +1249,66 @@ mod tests {
     fn from_kernel_transaction_commit_success_carries_operation_and_id() {
         let id = kernel::MetricId::new();
         let event =
-            kernel::MetricEvent::TransactionCommitSuccess(kernel::TransactionCommitSuccess {
-                operation_id: id,
-                correlation_id: Some("req-7".into()),
-                table_type: kernel::TableType::CatalogManaged,
-                commit_version: 7,
-                num_add_files: 2,
-                num_remove_files: 1,
-                num_dv_updates: 4,
-                add_files_bytes: 100,
-                remove_files_bytes: 50,
-                is_blind_append: true,
-                data_change: false,
-                operation: Some("WRITE".to_string()),
-                prepare_duration: Duration::from_nanos(10),
-                committer_duration: Duration::from_nanos(20),
-                total_duration: Duration::from_nanos(30),
+            kernel::MetricEvent::TransactionCommitCompleted(kernel::TransactionCommitCompleted {
+                context: kernel::MetricContext {
+                    operation_id: id,
+                    correlation_id: Some("req-7".into()),
+                    table_type: kernel::TableType::CatalogManaged,
+                },
+                duration: Duration::from_nanos(30),
+                outcome: kernel::TransactionCommitOutcome::Success {
+                    stats: kernel::TransactionCommitStats {
+                        commit_version: 7,
+                        num_add_files: 2,
+                        num_remove_files: 1,
+                        num_dv_updates: 4,
+                        add_files_bytes: 100,
+                        remove_files_bytes: 50,
+                        is_blind_append: true,
+                        data_change: false,
+                        operation: Some("WRITE".to_string()),
+                        prepare_duration: Duration::from_nanos(10),
+                        committer_duration: Duration::from_nanos(20),
+                    },
+                },
             });
         with_ffi_event(&event, |ffi| {
-            let MetricEvent::TransactionCommitSuccess(e) = ffi else {
-                panic!("expected TransactionCommitSuccess");
+            let MetricEvent::TransactionCommitCompleted(
+                e @ TransactionCommitCompleted {
+                    outcome: TransactionCommitOutcome::Success { .. },
+                    ..
+                },
+            ) = ffi
+            else {
+                panic!("expected TransactionCommitCompleted");
             };
-            assert_eq!(e.operation_id.bytes, id.as_bytes());
-            assert!(matches!(e.table_type, TableType::CatalogManaged));
-            assert_eq!(e.commit_version, 7);
-            assert_eq!(e.num_dv_updates, 4);
-            assert_eq!(e.add_files_bytes, 100);
-            assert!(e.is_blind_append);
-            assert_eq!(e.prepare_duration_ns, 10);
-            assert_eq!(e.total_duration_ns, 30);
-            let op: &str = unsafe { TryFromStringSlice::try_from_slice(&e.operation).unwrap() };
+            let TransactionCommitOutcome::Success {
+                stats:
+                    TransactionCommitStats {
+                        operation: e_operation,
+                        ..
+                    },
+            } = &e.outcome
+            else {
+                panic!("unexpected metric outcome");
+            };
+
+            assert_eq!(e.context.operation_id.bytes, id.as_bytes());
+            assert!(matches!(e.context.table_type, TableType::CatalogManaged));
+
+            let TransactionCommitOutcome::Success { stats } = &e.outcome else {
+                panic!("unexpected metric outcome");
+            };
+            assert_eq!(stats.commit_version, 7);
+            assert_eq!(stats.num_dv_updates, 4);
+            assert_eq!(stats.add_files_bytes, 100);
+            assert!(stats.is_blind_append);
+            assert_eq!(stats.prepare_duration_ns, 10);
+            assert_eq!(e.duration_ns, 30);
+            let op: &str = unsafe { TryFromStringSlice::try_from_slice(e_operation).unwrap() };
             assert_eq!(op, "WRITE");
             let cid: &str =
-                unsafe { TryFromStringSlice::try_from_slice(&e.correlation_id).unwrap() };
+                unsafe { TryFromStringSlice::try_from_slice(&e.context.correlation_id).unwrap() };
             assert_eq!(cid, "req-7");
         });
     }
@@ -1314,32 +1316,55 @@ mod tests {
     #[test]
     fn from_kernel_transaction_commit_success_unset_operation_is_empty_slice() {
         let event =
-            kernel::MetricEvent::TransactionCommitSuccess(kernel::TransactionCommitSuccess {
-                operation_id: kernel::MetricId::new(),
-                correlation_id: None,
-                table_type: kernel::TableType::PathBased,
-                commit_version: 1,
-                num_add_files: 0,
-                num_remove_files: 0,
-                num_dv_updates: 0,
-                add_files_bytes: 0,
-                remove_files_bytes: 0,
-                is_blind_append: false,
-                data_change: true,
-                operation: None,
-                prepare_duration: Duration::from_nanos(0),
-                committer_duration: Duration::from_nanos(0),
-                total_duration: Duration::from_nanos(0),
+            kernel::MetricEvent::TransactionCommitCompleted(kernel::TransactionCommitCompleted {
+                context: kernel::MetricContext {
+                    operation_id: kernel::MetricId::new(),
+                    correlation_id: None,
+                    table_type: kernel::TableType::PathBased,
+                },
+                duration: Duration::from_nanos(0),
+                outcome: kernel::TransactionCommitOutcome::Success {
+                    stats: kernel::TransactionCommitStats {
+                        commit_version: 1,
+                        num_add_files: 0,
+                        num_remove_files: 0,
+                        num_dv_updates: 0,
+                        add_files_bytes: 0,
+                        remove_files_bytes: 0,
+                        is_blind_append: false,
+                        data_change: true,
+                        operation: None,
+                        prepare_duration: Duration::from_nanos(0),
+                        committer_duration: Duration::from_nanos(0),
+                    },
+                },
             });
         with_ffi_event(&event, |ffi| {
-            let MetricEvent::TransactionCommitSuccess(e) = ffi else {
-                panic!("expected TransactionCommitSuccess");
+            let MetricEvent::TransactionCommitCompleted(
+                e @ TransactionCommitCompleted {
+                    outcome: TransactionCommitOutcome::Success { .. },
+                    ..
+                },
+            ) = ffi
+            else {
+                panic!("expected TransactionCommitCompleted");
             };
-            assert!(matches!(e.table_type, TableType::PathBased));
-            let op: &str = unsafe { TryFromStringSlice::try_from_slice(&e.operation).unwrap() };
+            let TransactionCommitOutcome::Success {
+                stats:
+                    TransactionCommitStats {
+                        operation: e_operation,
+                        ..
+                    },
+            } = &e.outcome
+            else {
+                panic!("unexpected metric outcome");
+            };
+
+            assert!(matches!(e.context.table_type, TableType::PathBased));
+            let op: &str = unsafe { TryFromStringSlice::try_from_slice(e_operation).unwrap() };
             assert_eq!(op, "");
             let cid: &str =
-                unsafe { TryFromStringSlice::try_from_slice(&e.correlation_id).unwrap() };
+                unsafe { TryFromStringSlice::try_from_slice(&e.context.correlation_id).unwrap() };
             assert_eq!(cid, "");
         });
     }
@@ -1348,21 +1373,40 @@ mod tests {
     fn from_kernel_maps_failure_reason() {
         let id = kernel::MetricId::new();
         let failure =
-            kernel::MetricEvent::TransactionCommitFailure(kernel::TransactionCommitFailure {
-                operation_id: id,
-                correlation_id: Some("req-fail".into()),
-                table_type: kernel::TableType::CatalogManaged,
-                reason: kernel::CommitFailureReason::Conflict,
+            kernel::MetricEvent::TransactionCommitCompleted(kernel::TransactionCommitCompleted {
+                context: kernel::MetricContext {
+                    operation_id: id,
+                    correlation_id: Some("req-fail".into()),
+                    table_type: kernel::TableType::CatalogManaged,
+                },
+                duration: std::time::Duration::ZERO,
+                outcome: kernel::TransactionCommitOutcome::Failure {
+                    reason: kernel::CommitFailureReason::Conflict,
+                },
             });
         with_ffi_event(&failure, |ffi| {
-            let MetricEvent::TransactionCommitFailure(e) = ffi else {
-                panic!("expected TransactionCommitFailure");
+            let MetricEvent::TransactionCommitCompleted(
+                e @ TransactionCommitCompleted {
+                    outcome: TransactionCommitOutcome::Failure { .. },
+                    ..
+                },
+            ) = ffi
+            else {
+                panic!("expected TransactionCommitCompleted");
             };
-            assert!(matches!(e.reason, CommitFailureReason::Conflict));
-            assert!(matches!(e.table_type, TableType::CatalogManaged));
-            assert_eq!(e.operation_id.bytes, id.as_bytes());
+
+            let TransactionCommitOutcome::Failure {
+                reason: metric_e_reason,
+                ..
+            } = &e.outcome
+            else {
+                panic!("unexpected metric outcome");
+            };
+            assert!(matches!(*metric_e_reason, CommitFailureReason::Conflict));
+            assert!(matches!(e.context.table_type, TableType::CatalogManaged));
+            assert_eq!(e.context.operation_id.bytes, id.as_bytes());
             let cid: &str =
-                unsafe { TryFromStringSlice::try_from_slice(&e.correlation_id).unwrap() };
+                unsafe { TryFromStringSlice::try_from_slice(&e.context.correlation_id).unwrap() };
             assert_eq!(cid, "req-fail");
         });
     }
@@ -1408,14 +1452,14 @@ mod tests {
     ) {
         let (mode, expected_mode) = modes;
         let (duration, expected_duration_ns) = durations;
-        let event = kernel::MetricEvent::ChecksumWriteSuccess(kernel::ChecksumWriteSuccess {
+        let event = kernel::MetricEvent::ChecksumWriteCompleted(kernel::ChecksumWriteCompleted {
             outcome,
             resolution_mode: mode,
             duration,
         });
         with_ffi_event(&event, |ffi| {
-            let MetricEvent::ChecksumWriteSuccess(event) = ffi else {
-                panic!("expected ChecksumWriteSuccess");
+            let MetricEvent::ChecksumWriteCompleted(event) = ffi else {
+                panic!("expected ChecksumWriteCompleted");
             };
             assert_eq!(event.outcome, expected_outcome);
             assert_eq!(event.resolution_mode, expected_mode);
@@ -1450,13 +1494,20 @@ mod tests {
     ) {
         let (mode, expected_mode) = modes;
         let (duration, expected_duration_ns) = durations;
-        let event = kernel::MetricEvent::ChecksumWriteFailure(kernel::ChecksumWriteFailure {
+        let event = kernel::MetricEvent::ChecksumWriteCompleted(kernel::ChecksumWriteCompleted {
             resolution_mode: mode,
             duration,
+            outcome: kernel::ChecksumWriteOutcome::Error,
         });
         with_ffi_event(&event, |ffi| {
-            let MetricEvent::ChecksumWriteFailure(event) = ffi else {
-                panic!("expected ChecksumWriteFailure");
+            let MetricEvent::ChecksumWriteCompleted(
+                event @ ChecksumWriteCompleted {
+                    outcome: ChecksumWriteOutcome::Error,
+                    ..
+                },
+            ) = ffi
+            else {
+                panic!("expected ChecksumWriteCompleted");
             };
             assert_eq!(event.resolution_mode, expected_mode);
             assert_eq!(event.duration_ns, expected_duration_ns);
@@ -1467,9 +1518,11 @@ mod tests {
     fn from_kernel_scan_metadata_completed_maps_all_fields() {
         let id = kernel::MetricId::new();
         let event = kernel::MetricEvent::ScanMetadataCompleted(kernel::ScanMetadataCompleted {
-            operation_id: id,
-            correlation_id: Some("scan-req".into()),
-            table_type: kernel::TableType::CatalogManaged,
+            context: kernel::MetricContext {
+                operation_id: id,
+                correlation_id: Some("scan-req".into()),
+                table_type: kernel::TableType::CatalogManaged,
+            },
             scan_type: kernel::ScanType::ParallelPhase,
             duration: Duration::from_nanos(13),
             num_add_files_seen: 17,
@@ -1488,10 +1541,10 @@ mod tests {
             let MetricEvent::ScanMetadataCompleted(e) = ffi else {
                 panic!("expected ScanMetadataCompleted");
             };
-            assert_eq!(e.operation_id.bytes, id.as_bytes());
-            assert!(matches!(e.table_type, TableType::CatalogManaged));
+            assert_eq!(e.context.operation_id.bytes, id.as_bytes());
+            assert!(matches!(e.context.table_type, TableType::CatalogManaged));
             let cid: &str =
-                unsafe { TryFromStringSlice::try_from_slice(&e.correlation_id).unwrap() };
+                unsafe { TryFromStringSlice::try_from_slice(&e.context.correlation_id).unwrap() };
             assert_eq!(cid, "scan-req");
             assert_eq!(
                 discriminant(&e.scan_type),
@@ -1515,27 +1568,46 @@ mod tests {
     #[test]
     fn from_kernel_protocol_metadata_load_success_maps_source() {
         let id = kernel::MetricId::new();
-        let event =
-            kernel::MetricEvent::ProtocolMetadataLoadSuccess(kernel::ProtocolMetadataLoadSuccess {
-                operation_id: id,
-                correlation_id: Some("pm-req".into()),
-                table_type: kernel::TableType::CatalogManaged,
+        let event = kernel::MetricEvent::ProtocolMetadataLoadCompleted(
+            kernel::ProtocolMetadataLoadCompleted {
+                context: kernel::MetricContext {
+                    operation_id: id,
+                    correlation_id: Some("pm-req".into()),
+                    table_type: kernel::TableType::CatalogManaged,
+                },
                 load_type: kernel::LogSegmentLoadType::Incremental,
-                source: kernel::ProtocolMetadataSource::CrcAdvancedByReplay,
                 duration: Duration::from_nanos(53),
-            });
+                outcome: kernel::ProtocolMetadataLoadOutcome::Success {
+                    source: kernel::ProtocolMetadataSource::CrcAdvancedByReplay,
+                },
+            },
+        );
         with_ffi_event(&event, |ffi| {
-            let MetricEvent::ProtocolMetadataLoadSuccess(e) = ffi else {
-                panic!("expected ProtocolMetadataLoadSuccess");
+            let MetricEvent::ProtocolMetadataLoadCompleted(
+                e @ ProtocolMetadataLoadCompleted {
+                    outcome: ProtocolMetadataLoadOutcome::Success { .. },
+                    ..
+                },
+            ) = ffi
+            else {
+                panic!("expected ProtocolMetadataLoadCompleted");
             };
-            assert_eq!(e.operation_id.bytes, id.as_bytes());
-            assert_eq!(e.table_type, TableType::CatalogManaged);
+            assert_eq!(e.context.operation_id.bytes, id.as_bytes());
+            assert_eq!(e.context.table_type, TableType::CatalogManaged);
             assert_eq!(e.load_type, LogSegmentLoadType::Incremental);
             let cid: &str =
-                unsafe { TryFromStringSlice::try_from_slice(&e.correlation_id).unwrap() };
+                unsafe { TryFromStringSlice::try_from_slice(&e.context.correlation_id).unwrap() };
             assert_eq!(cid, "pm-req");
+
+            let ProtocolMetadataLoadOutcome::Success {
+                source: metric_e_source,
+                ..
+            } = &e.outcome
+            else {
+                panic!("unexpected metric outcome");
+            };
             assert_eq!(
-                discriminant(&e.source),
+                discriminant(metric_e_source),
                 discriminant(&ProtocolMetadataSource::CrcAdvancedByReplay)
             );
             assert_eq!(e.duration_ns, 53);
@@ -1545,52 +1617,84 @@ mod tests {
     #[test]
     fn from_kernel_log_segment_load_success_carries_correlation_id_and_table_type() {
         let id = kernel::MetricId::new();
-        let event = kernel::MetricEvent::LogSegmentLoadSuccess(kernel::LogSegmentLoadSuccess {
-            operation_id: id,
-            correlation_id: Some("req-42".into()),
-            table_type: kernel::TableType::CatalogManaged,
+        let event = kernel::MetricEvent::LogSegmentLoadCompleted(kernel::LogSegmentLoadCompleted {
+            context: kernel::MetricContext {
+                operation_id: id,
+                correlation_id: Some("req-42".into()),
+                table_type: kernel::TableType::CatalogManaged,
+            },
             load_type: kernel::LogSegmentLoadType::Full,
-            num_commit_files: 3,
-            num_checkpoint_files: 1,
-            num_compaction_files: 2,
-            crc_versions_behind: Some(5),
             duration: Duration::from_nanos(61),
+            outcome: kernel::LogSegmentLoadOutcome::Success {
+                stats: kernel::LogSegmentLoadStats {
+                    num_commit_files: 3,
+                    num_checkpoint_files: 1,
+                    num_compaction_files: 2,
+                    crc_versions_behind: Some(5),
+                },
+            },
         });
         with_ffi_event(&event, |ffi| {
-            let MetricEvent::LogSegmentLoadSuccess(e) = ffi else {
-                panic!("expected LogSegmentLoadSuccess");
+            let MetricEvent::LogSegmentLoadCompleted(
+                e @ LogSegmentLoadCompleted {
+                    outcome: LogSegmentLoadOutcome::Success { .. },
+                    ..
+                },
+            ) = ffi
+            else {
+                panic!("expected LogSegmentLoadCompleted");
             };
-            assert_eq!(e.operation_id.bytes, id.as_bytes());
-            assert_eq!(e.table_type, TableType::CatalogManaged);
+            assert_eq!(e.context.operation_id.bytes, id.as_bytes());
+            assert_eq!(e.context.table_type, TableType::CatalogManaged);
             assert_eq!(e.duration_ns, 61);
             assert_eq!(e.load_type, LogSegmentLoadType::Full);
-            assert_eq!(e.num_commit_files, 3);
-            assert_eq!(e.num_checkpoint_files, 1);
-            assert_eq!(e.num_compaction_files, 2);
-            assert!(e.has_crc);
-            assert_eq!(e.crc_versions_behind, 5);
+
+            let LogSegmentLoadOutcome::Success { stats } = &e.outcome else {
+                panic!("unexpected metric outcome");
+            };
+            assert_eq!(stats.num_commit_files, 3);
+            assert_eq!(stats.num_checkpoint_files, 1);
+            assert_eq!(stats.num_compaction_files, 2);
+            assert!(stats.has_crc);
+            assert_eq!(stats.crc_versions_behind, 5);
             let cid: &str =
-                unsafe { TryFromStringSlice::try_from_slice(&e.correlation_id).unwrap() };
+                unsafe { TryFromStringSlice::try_from_slice(&e.context.correlation_id).unwrap() };
             assert_eq!(cid, "req-42");
         });
     }
 
     #[test]
     fn from_kernel_snapshot_hint_load_type_maps_to_appended_ffi_variant() {
-        let event = kernel::MetricEvent::SnapshotBuildSuccess(kernel::SnapshotBuildSuccess {
-            operation_id: kernel::MetricId::new(),
-            correlation_id: None,
-            table_type: kernel::TableType::PathBased,
+        let event = kernel::MetricEvent::SnapshotBuildCompleted(kernel::SnapshotBuildCompleted {
+            context: kernel::MetricContext {
+                operation_id: kernel::MetricId::new(),
+                correlation_id: None,
+                table_type: kernel::TableType::PathBased,
+            },
             load_type: kernel::SnapshotLoadType::SnapshotHint,
-            version: 7,
             duration: Duration::from_nanos(11),
+            outcome: kernel::SnapshotBuildOutcome::Success { version: 7 },
         });
         with_ffi_event(&event, |ffi| {
-            let MetricEvent::SnapshotBuildSuccess(e) = ffi else {
-                panic!("expected SnapshotBuildSuccess");
+            let MetricEvent::SnapshotBuildCompleted(
+                e @ SnapshotBuildCompleted {
+                    outcome: SnapshotBuildOutcome::Success { .. },
+                    ..
+                },
+            ) = ffi
+            else {
+                panic!("expected SnapshotBuildCompleted");
             };
             assert_eq!(e.load_type, SnapshotLoadType::SnapshotHint);
-            assert_eq!(e.version, 7);
+
+            let SnapshotBuildOutcome::Success {
+                version: metric_e_version,
+                ..
+            } = &e.outcome
+            else {
+                panic!("unexpected metric outcome");
+            };
+            assert_eq!((*metric_e_version), 7);
         });
     }
 
@@ -1600,48 +1704,73 @@ mod tests {
     ) {
         let id = kernel::MetricId::new();
         let duration = Duration::from_nanos(duration_ns);
-        let snapshot = kernel::MetricEvent::SnapshotBuildFailure(kernel::SnapshotBuildFailure {
-            operation_id: id,
-            correlation_id: None,
-            table_type: kernel::TableType::PathBased,
-            load_type: kernel::SnapshotLoadType::SnapshotHint,
-            duration,
-        });
+        let snapshot =
+            kernel::MetricEvent::SnapshotBuildCompleted(kernel::SnapshotBuildCompleted {
+                context: kernel::MetricContext {
+                    operation_id: id,
+                    correlation_id: None,
+                    table_type: kernel::TableType::PathBased,
+                },
+                load_type: kernel::SnapshotLoadType::SnapshotHint,
+                duration,
+                outcome: kernel::SnapshotBuildOutcome::Error,
+            });
         with_ffi_event(&snapshot, |ffi| {
             assert!(matches!(
                 ffi,
-                MetricEvent::SnapshotBuildFailure(e)
-                    if e.load_type == SnapshotLoadType::SnapshotHint && e.duration_ns == duration_ns
+                MetricEvent::SnapshotBuildCompleted(SnapshotBuildCompleted {
+                    load_type: SnapshotLoadType::SnapshotHint,
+                    outcome: SnapshotBuildOutcome::Error,
+                    duration_ns: actual_duration,
+                    ..
+                }) if actual_duration == duration_ns
             ));
         });
 
         let log_segment =
-            kernel::MetricEvent::LogSegmentLoadFailure(kernel::LogSegmentLoadFailure {
-                operation_id: id,
-                correlation_id: None,
-                table_type: kernel::TableType::PathBased,
+            kernel::MetricEvent::LogSegmentLoadCompleted(kernel::LogSegmentLoadCompleted {
+                context: kernel::MetricContext {
+                    operation_id: id,
+                    correlation_id: None,
+                    table_type: kernel::TableType::PathBased,
+                },
                 load_type: kernel::LogSegmentLoadType::Full,
                 duration,
+                outcome: kernel::LogSegmentLoadOutcome::Error,
             });
         with_ffi_event(&log_segment, |ffi| {
             assert!(matches!(
                 ffi,
-                MetricEvent::LogSegmentLoadFailure(e) if e.duration_ns == duration_ns
+                MetricEvent::LogSegmentLoadCompleted(LogSegmentLoadCompleted {
+                    load_type: LogSegmentLoadType::Full,
+                    outcome: LogSegmentLoadOutcome::Error,
+                    duration_ns: actual_duration,
+                    ..
+                }) if actual_duration == duration_ns
             ));
         });
 
-        let protocol_metadata =
-            kernel::MetricEvent::ProtocolMetadataLoadFailure(kernel::ProtocolMetadataLoadFailure {
-                operation_id: id,
-                correlation_id: None,
-                table_type: kernel::TableType::PathBased,
+        let protocol_metadata = kernel::MetricEvent::ProtocolMetadataLoadCompleted(
+            kernel::ProtocolMetadataLoadCompleted {
+                context: kernel::MetricContext {
+                    operation_id: id,
+                    correlation_id: None,
+                    table_type: kernel::TableType::PathBased,
+                },
                 load_type: kernel::LogSegmentLoadType::Full,
                 duration,
-            });
+                outcome: kernel::ProtocolMetadataLoadOutcome::Error,
+            },
+        );
         with_ffi_event(&protocol_metadata, |ffi| {
             assert!(matches!(
                 ffi,
-                MetricEvent::ProtocolMetadataLoadFailure(e) if e.duration_ns == duration_ns
+                MetricEvent::ProtocolMetadataLoadCompleted(ProtocolMetadataLoadCompleted {
+                    load_type: LogSegmentLoadType::Full,
+                    outcome: ProtocolMetadataLoadOutcome::Error,
+                    duration_ns: actual_duration,
+                    ..
+                }) if actual_duration == duration_ns
             ));
         });
     }
@@ -1668,25 +1797,41 @@ mod tests {
 
     #[test]
     fn from_kernel_log_segment_load_success_unset_correlation_id_is_empty_slice() {
-        let event = kernel::MetricEvent::LogSegmentLoadSuccess(kernel::LogSegmentLoadSuccess {
-            operation_id: kernel::MetricId::new(),
-            correlation_id: None,
-            table_type: kernel::TableType::PathBased,
+        let event = kernel::MetricEvent::LogSegmentLoadCompleted(kernel::LogSegmentLoadCompleted {
+            context: kernel::MetricContext {
+                operation_id: kernel::MetricId::new(),
+                correlation_id: None,
+                table_type: kernel::TableType::PathBased,
+            },
             load_type: kernel::LogSegmentLoadType::Full,
-            num_commit_files: 0,
-            num_checkpoint_files: 0,
-            num_compaction_files: 0,
-            crc_versions_behind: None,
             duration: Duration::from_nanos(0),
+            outcome: kernel::LogSegmentLoadOutcome::Success {
+                stats: kernel::LogSegmentLoadStats {
+                    num_commit_files: 0,
+                    num_checkpoint_files: 0,
+                    num_compaction_files: 0,
+                    crc_versions_behind: None,
+                },
+            },
         });
         with_ffi_event(&event, |ffi| {
-            let MetricEvent::LogSegmentLoadSuccess(e) = ffi else {
-                panic!("expected LogSegmentLoadSuccess");
+            let MetricEvent::LogSegmentLoadCompleted(
+                e @ LogSegmentLoadCompleted {
+                    outcome: LogSegmentLoadOutcome::Success { .. },
+                    ..
+                },
+            ) = ffi
+            else {
+                panic!("expected LogSegmentLoadCompleted");
             };
-            assert_eq!(e.table_type, TableType::PathBased);
-            assert!(!e.has_crc);
+            assert_eq!(e.context.table_type, TableType::PathBased);
+
+            let LogSegmentLoadOutcome::Success { stats } = &e.outcome else {
+                panic!("unexpected metric outcome");
+            };
+            assert!(!stats.has_crc);
             let cid: &str =
-                unsafe { TryFromStringSlice::try_from_slice(&e.correlation_id).unwrap() };
+                unsafe { TryFromStringSlice::try_from_slice(&e.context.correlation_id).unwrap() };
             assert_eq!(cid, "");
         });
     }
@@ -1695,18 +1840,106 @@ mod tests {
     fn from_kernel_set_transaction_load_success_distinguishes_bools() {
         // from_cache and found are adjacent bools that are trivial to swap; assert distinct values.
         let event =
-            kernel::MetricEvent::SetTransactionLoadSuccess(kernel::SetTransactionLoadSuccess {
-                from_cache: true,
-                found: false,
+            kernel::MetricEvent::SetTransactionLoadCompleted(kernel::SetTransactionLoadCompleted {
                 duration: Duration::from_nanos(53),
+                outcome: kernel::SetTransactionLoadOutcome::Success {
+                    from_cache: true,
+                    found: false,
+                },
             });
         with_ffi_event(&event, |ffi| {
-            let MetricEvent::SetTransactionLoadSuccess(e) = ffi else {
-                panic!("expected SetTransactionLoadSuccess");
+            let MetricEvent::SetTransactionLoadCompleted(
+                e @ SetTransactionLoadCompleted {
+                    outcome: SetTransactionLoadOutcome::Success { .. },
+                    ..
+                },
+            ) = ffi
+            else {
+                panic!("expected SetTransactionLoadCompleted");
             };
-            assert!(e.from_cache);
-            assert!(!e.found);
+
+            let SetTransactionLoadOutcome::Success {
+                from_cache: metric_e_from_cache,
+                found: metric_e_found,
+                ..
+            } = &e.outcome
+            else {
+                panic!("unexpected metric outcome");
+            };
+            assert!((*metric_e_from_cache));
+            assert!(!(*metric_e_found));
             assert_eq!(e.duration_ns, 53);
+        });
+    }
+    #[rstest]
+    fn domain_metadata_success_preserves_cache_status_and_count(
+        #[values(false, true)] from_cache: bool,
+        #[values(0, 37, u64::MAX)] num_domains_returned: u64,
+    ) {
+        let event =
+            kernel::MetricEvent::DomainMetadataLoadCompleted(kernel::DomainMetadataLoadCompleted {
+                duration: Duration::from_nanos(53),
+                outcome: kernel::DomainMetadataLoadOutcome::Success {
+                    from_cache,
+                    num_domains_returned,
+                },
+            });
+        with_ffi_event(&event, |ffi| {
+            assert!(matches!(
+                ffi,
+                MetricEvent::DomainMetadataLoadCompleted(DomainMetadataLoadCompleted {
+                    duration_ns: 53,
+                    outcome: DomainMetadataLoadOutcome::Success {
+                        from_cache: actual_cache,
+                        num_domains_returned: actual_count,
+                    },
+                }) if actual_cache == from_cache && actual_count == num_domains_returned
+            ));
+        });
+    }
+
+    #[rstest]
+    fn crc_success_preserves_byte_count(#[values(0, 37, u64::MAX)] bytes_read: u64) {
+        let event = kernel::MetricEvent::CrcReadCompleted(kernel::CrcReadCompleted {
+            duration: Duration::from_nanos(71),
+            outcome: kernel::CrcReadOutcome::Success { bytes_read },
+        });
+        with_ffi_event(&event, |ffi| {
+            assert!(matches!(
+                ffi,
+                MetricEvent::CrcReadCompleted(CrcReadCompleted {
+                    duration_ns: 71,
+                    outcome: CrcReadOutcome::Success { bytes_read: actual },
+                }) if actual == bytes_read
+            ));
+        });
+    }
+
+    #[rstest]
+    #[case::crc(kernel::MetricEvent::CrcReadCompleted(kernel::CrcReadCompleted {
+        duration: Duration::from_nanos(29), outcome: kernel::CrcReadOutcome::Error,
+    }))]
+    #[case::domain(kernel::MetricEvent::DomainMetadataLoadCompleted(kernel::DomainMetadataLoadCompleted {
+        duration: Duration::from_nanos(29), outcome: kernel::DomainMetadataLoadOutcome::Error,
+    }))]
+    #[case::set_transaction(kernel::MetricEvent::SetTransactionLoadCompleted(kernel::SetTransactionLoadCompleted {
+        duration: Duration::from_nanos(29), outcome: kernel::SetTransactionLoadOutcome::Error,
+    }))]
+    fn error_outcomes_preserve_duration_in_ffi(#[case] event: kernel::MetricEvent) {
+        with_ffi_event(&event, |ffi| match ffi {
+            MetricEvent::CrcReadCompleted(CrcReadCompleted {
+                duration_ns,
+                outcome: CrcReadOutcome::Error,
+            })
+            | MetricEvent::DomainMetadataLoadCompleted(DomainMetadataLoadCompleted {
+                duration_ns,
+                outcome: DomainMetadataLoadOutcome::Error,
+            })
+            | MetricEvent::SetTransactionLoadCompleted(SetTransactionLoadCompleted {
+                duration_ns,
+                outcome: SetTransactionLoadOutcome::Error,
+            }) => assert_eq!(duration_ns, 29),
+            _ => panic!("unexpected metric outcome"),
         });
     }
 }

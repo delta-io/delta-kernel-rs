@@ -1262,7 +1262,7 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{ColumnName, column_name};
-    use crate::metrics::MetricEvent;
+    use crate::metrics::{MetricEvent, TransactionCommitCompleted, TransactionCommitOutcome};
     use crate::scan::data_skipping::stats_schema::StripFieldMetadataTransform;
     use crate::schema::{
         ColumnMetadataKey, DataType, MetadataValue, StructField, schema, schema_ref, try_schema,
@@ -1347,13 +1347,22 @@ mod tests {
             .events()
             .into_iter()
             .find_map(|event| match event {
-                MetricEvent::TransactionCommitSuccess(metrics) => Some(metrics),
+                MetricEvent::TransactionCommitCompleted(
+                    metrics @ TransactionCommitCompleted {
+                        outcome: TransactionCommitOutcome::Success { .. },
+                        ..
+                    },
+                ) => Some(metrics),
                 _ => None,
             })
             .expect("create-table commit metrics");
-        assert_eq!(metrics.data_change, expected_data_change);
-        assert_eq!(metrics.num_add_files, 0);
-        assert_eq!(metrics.num_remove_files, 0);
+
+        let TransactionCommitOutcome::Success { stats } = &metrics.outcome else {
+            panic!("unexpected metric outcome");
+        };
+        assert_eq!(stats.data_change, expected_data_change);
+        assert_eq!(stats.num_add_files, 0);
+        assert_eq!(stats.num_remove_files, 0);
         Ok(())
     }
 

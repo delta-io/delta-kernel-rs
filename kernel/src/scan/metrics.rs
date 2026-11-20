@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use tracing::info;
 
-use crate::metrics::{MetricId, ScanMetadataCompleted, ScanType, TableType};
+use crate::metrics::{MetricContext, MetricId, ScanMetadataCompleted, ScanType, TableType};
 
 /// Metrics collected during scan log replay. Metrics are updated and read using relaxed ordering
 /// to keep updates fast across parallel executing threads.
@@ -137,9 +137,11 @@ impl ScanMetrics {
         duration: Duration,
     ) -> ScanMetadataCompleted {
         ScanMetadataCompleted {
-            operation_id,
-            table_type: TableType::from_catalog_managed(is_catalog_managed),
-            correlation_id,
+            context: MetricContext {
+                operation_id,
+                correlation_id,
+                table_type: TableType::from_catalog_managed(is_catalog_managed),
+            },
             scan_type,
             duration,
             num_add_files_seen: self.num_add_files_seen.load(Ordering::Relaxed),

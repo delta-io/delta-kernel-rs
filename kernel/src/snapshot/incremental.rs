@@ -11,8 +11,8 @@ use super::{IncrementalReplay, PreparedSnapshot, Snapshot};
 use crate::log_segment::{LogSegment, PmResolution};
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::metrics::{
-    SnapshotLoadMetricContext, emit_log_segment_load, emit_log_segment_load_failure,
-    emit_protocol_metadata_load, emit_protocol_metadata_load_failure,
+    LogSegmentLoadOutcome, ProtocolMetadataLoadOutcome, SnapshotLoadMetricContext,
+    emit_log_segment_load, emit_protocol_metadata_load,
 };
 use crate::path::ParsedLogPath;
 use crate::table_configuration::TableConfiguration;
@@ -105,7 +105,7 @@ impl Snapshot {
     /// [`SnapshotBuilder::with_max_catalog_version`]: crate::snapshot::SnapshotBuilder::with_max_catalog_version
     /// [`SnapshotBuilder::build`]: crate::snapshot::SnapshotBuilder::build
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip_all, fields(path = %existing_snapshot.table_root(), enable_call_frame, version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or(""), incremental_replay = ?incremental_replay, built_as_latest = built_as_latest))]
+    #[instrument(skip_all, fields(path = %existing_snapshot.table_root(), enable_call_frame, version, operation_id = %metric_context.context.operation_id, correlation_id = metric_context.context.correlation_id.as_deref().unwrap_or(""), incremental_replay = ?incremental_replay, built_as_latest = built_as_latest))]
     pub(super) fn try_new_from(
         existing_snapshot: Arc<Snapshot>,
         log_tail: Vec<ParsedLogPath>,
@@ -204,7 +204,11 @@ impl Snapshot {
             checkpoint_handling,
         )
         .inspect_err(|_| {
-            emit_log_segment_load_failure(metric_context, segment_load_start.elapsed())
+            emit_log_segment_load(
+                metric_context,
+                LogSegmentLoadOutcome::Error,
+                segment_load_start.elapsed(),
+            )
         })? {
             NewSegment::Unchanged => {
                 // The builder reaches this branch without an effective target: neither an
@@ -229,7 +233,7 @@ impl Snapshot {
                 );
                 emit_log_segment_load(
                     metric_context,
-                    &new_log_segment,
+                    LogSegmentLoadOutcome::success(&new_log_segment),
                     segment_load_start.elapsed(),
                 );
                 // The nested constructor reports the rebuild failure; this span also reports the
@@ -275,7 +279,7 @@ impl Snapshot {
                 );
                 emit_log_segment_load(
                     metric_context,
-                    &combined_log_segment,
+                    LogSegmentLoadOutcome::success(&combined_log_segment),
                     segment_load_start.elapsed(),
                 );
                 let new_end_version = combined_log_segment.end_version;
@@ -292,12 +296,20 @@ impl Snapshot {
         let base_crc = combined_log_segment
             .pick_latest_base_crc(engine, existing_snapshot.base_crc())
             .inspect_err(|_| {
-                emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
+                emit_protocol_metadata_load(
+                    metric_context,
+                    ProtocolMetadataLoadOutcome::Error,
+                    pm_start.elapsed(),
+                )
             })?;
         let crc_at_version = combined_log_segment
             .try_build_crc_within_budget(engine, base_crc.as_ref(), incremental_replay)
             .inspect_err(|_| {
-                emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
+                emit_protocol_metadata_load(
+                    metric_context,
+                    ProtocolMetadataLoadOutcome::Error,
+                    pm_start.elapsed(),
+                )
             })?;
 
         let existing_table_config = existing_snapshot.table_configuration();
@@ -328,11 +340,21 @@ impl Snapshot {
                     .segment_after_version(existing_snapshot_version)
                     .read_protocol_metadata_opt(engine, newer_base)
                     .inspect_err(|_| {
-                        emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
+                        emit_protocol_metadata_load(
+                            metric_context,
+                            ProtocolMetadataLoadOutcome::Error,
+                            pm_start.elapsed(),
+                        )
                     })?
             }
         };
-        emit_protocol_metadata_load(metric_context, resolution.source, pm_start.elapsed());
+        emit_protocol_metadata_load(
+            metric_context,
+            ProtocolMetadataLoadOutcome::Success {
+                source: resolution.source,
+            },
+            pm_start.elapsed(),
+        );
         debug!(
             source = ?resolution.source,
             base_crc_version = ?base_crc.as_ref().map(|crc| crc.version),
@@ -674,8 +696,8 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::metrics::{
-        LogSegmentLoadSuccess, LogSegmentLoadType, MetricEvent, MetricId,
-        ProtocolMetadataLoadSuccess, ProtocolMetadataSource,
+        LogSegmentLoadCompleted, LogSegmentLoadOutcome, LogSegmentLoadType, MetricEvent, MetricId,
+        ProtocolMetadataLoadCompleted, ProtocolMetadataLoadOutcome, ProtocolMetadataSource,
     };
     use crate::object_store::ObjectStoreExt as _;
     use crate::object_store::memory::InMemory;
@@ -2452,16 +2474,26 @@ mod tests {
         found.clone()
     }
 
-    fn protocol_metadata_load(events: &[MetricEvent]) -> ProtocolMetadataLoadSuccess {
+    fn protocol_metadata_load(events: &[MetricEvent]) -> ProtocolMetadataLoadCompleted {
         single_event(events, |e| match e {
-            MetricEvent::ProtocolMetadataLoadSuccess(s) => Some(s),
+            MetricEvent::ProtocolMetadataLoadCompleted(
+                s @ ProtocolMetadataLoadCompleted {
+                    outcome: ProtocolMetadataLoadOutcome::Success { .. },
+                    ..
+                },
+            ) => Some(s),
             _ => None,
         })
     }
 
-    fn log_segment_load(events: &[MetricEvent]) -> LogSegmentLoadSuccess {
+    fn log_segment_load(events: &[MetricEvent]) -> LogSegmentLoadCompleted {
         single_event(events, |e| match e {
-            MetricEvent::LogSegmentLoadSuccess(s) => Some(s),
+            MetricEvent::LogSegmentLoadCompleted(
+                s @ LogSegmentLoadCompleted {
+                    outcome: LogSegmentLoadOutcome::Success { .. },
+                    ..
+                },
+            ) => Some(s),
             _ => None,
         })
     }
@@ -2513,24 +2545,39 @@ mod tests {
 
         let events = reporter.events();
         let pm = protocol_metadata_load(&events);
-        assert_eq!(pm.source, expected_source);
+
+        let ProtocolMetadataLoadOutcome::Success {
+            source: metric_pm_source,
+            ..
+        } = &pm.outcome
+        else {
+            panic!("unexpected metric outcome");
+        };
+        assert_eq!((*metric_pm_source), expected_source);
         assert_eq!(pm.load_type, LogSegmentLoadType::Full);
 
         let seg = log_segment_load(&events);
         assert_eq!(seg.load_type, LogSegmentLoadType::Full);
         // The v0-v3 table has 4 commits, no checkpoint or compaction.
-        assert_eq!(seg.num_commit_files, 4);
-        assert_eq!(seg.num_checkpoint_files, 0);
-        assert_eq!(seg.num_compaction_files, 0);
+
+        let LogSegmentLoadOutcome::Success { stats } = &seg.outcome else {
+            panic!("unexpected metric outcome");
+        };
+        assert_eq!(stats.num_commit_files, 4);
+        assert_eq!(stats.num_checkpoint_files, 0);
+        assert_eq!(stats.num_compaction_files, 0);
         // No CRC decodes to None; a CRC planted at version v is `3 - v` versions behind the
         // loaded version 3.
-        assert_eq!(seg.crc_versions_behind, planted_crc_version.map(|v| 3 - v));
+        assert_eq!(
+            stats.crc_versions_behind,
+            planted_crc_version.map(|v| 3 - v)
+        );
 
         // The operation_id and correlation_id survive the emit->decode round-trip and one
         // operation_id joins both events.
-        assert_eq!(seg.correlation_id.as_deref(), Some(corr));
-        assert_ne!(seg.operation_id, MetricId::nil());
-        assert_eq!(seg.operation_id, pm.operation_id);
+        assert_eq!(seg.context.correlation_id.as_deref(), Some(corr));
+        assert_ne!(seg.context.operation_id, MetricId::nil());
+        assert_eq!(seg.context.operation_id, pm.context.operation_id);
 
         // The CRC-advance replay cost is folded into the P&M duration on the advanced case.
         if expected_source == ProtocolMetadataSource::CrcAdvancedByReplay {
@@ -2590,7 +2637,15 @@ mod tests {
 
         let events = reporter.events();
         let pm = protocol_metadata_load(&events);
-        assert_eq!(pm.source, expected_source);
+
+        let ProtocolMetadataLoadOutcome::Success {
+            source: metric_pm_source,
+            ..
+        } = &pm.outcome
+        else {
+            panic!("unexpected metric outcome");
+        };
+        assert_eq!((*metric_pm_source), expected_source);
         assert_eq!(pm.load_type, LogSegmentLoadType::Incremental);
         let seg = log_segment_load(&events);
         assert_eq!(seg.load_type, LogSegmentLoadType::Incremental);
@@ -2615,7 +2670,15 @@ mod tests {
         // No P&M change in the new commits, no newer CRC: the replay finds nothing above the
         // existing snapshot, so the source is the not-CRC-rooted `FullReplay`.
         let pm = protocol_metadata_load(&reporter.events());
-        assert_eq!(pm.source, ProtocolMetadataSource::FullReplay);
+
+        let ProtocolMetadataLoadOutcome::Success {
+            source: metric_pm_source,
+            ..
+        } = &pm.outcome
+        else {
+            panic!("unexpected metric outcome");
+        };
+        assert_eq!((*metric_pm_source), ProtocolMetadataSource::FullReplay);
         Ok(())
     }
 
@@ -2641,15 +2704,25 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|e| matches!(e, MetricEvent::ProtocolMetadataLoadFailure(_)))
+                .filter(|e| matches!(
+                    e,
+                    MetricEvent::ProtocolMetadataLoadCompleted(ProtocolMetadataLoadCompleted {
+                        outcome: ProtocolMetadataLoadOutcome::Error,
+                        ..
+                    })
+                ))
                 .count(),
             1,
-            "expected exactly one ProtocolMetadataLoadFailure"
+            "expected exactly one ProtocolMetadataLoadCompleted"
         );
         assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, MetricEvent::ProtocolMetadataLoadSuccess(_))),
+            !events.iter().any(|e| matches!(
+                e,
+                MetricEvent::ProtocolMetadataLoadCompleted(ProtocolMetadataLoadCompleted {
+                    outcome: ProtocolMetadataLoadOutcome::Success { .. },
+                    ..
+                })
+            )),
             "no success event should fire on the failure path"
         );
         Ok(())
@@ -2681,15 +2754,25 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|e| matches!(e, MetricEvent::ProtocolMetadataLoadFailure(_)))
+                .filter(|e| matches!(
+                    e,
+                    MetricEvent::ProtocolMetadataLoadCompleted(ProtocolMetadataLoadCompleted {
+                        outcome: ProtocolMetadataLoadOutcome::Error,
+                        ..
+                    })
+                ))
                 .count(),
             1,
-            "expected exactly one ProtocolMetadataLoadFailure"
+            "expected exactly one ProtocolMetadataLoadCompleted"
         );
         assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, MetricEvent::ProtocolMetadataLoadSuccess(_))),
+            !events.iter().any(|e| matches!(
+                e,
+                MetricEvent::ProtocolMetadataLoadCompleted(ProtocolMetadataLoadCompleted {
+                    outcome: ProtocolMetadataLoadOutcome::Success { .. },
+                    ..
+                })
+            )),
             "no success event should fire on the failure path"
         );
         Ok(())
@@ -2727,21 +2810,30 @@ mod tests {
         let failure = events
             .iter()
             .find_map(|e| match e {
-                MetricEvent::LogSegmentLoadFailure(f) => Some(f),
+                MetricEvent::LogSegmentLoadCompleted(
+                    f @ LogSegmentLoadCompleted {
+                        outcome: LogSegmentLoadOutcome::Error,
+                        ..
+                    },
+                ) => Some(f),
                 _ => None,
             })
-            .expect("expected a LogSegmentLoadFailure");
+            .expect("expected a LogSegmentLoadCompleted");
         assert_eq!(failure.load_type, LogSegmentLoadType::Incremental);
         assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, MetricEvent::LogSegmentLoadSuccess(_))),
+            !events.iter().any(|e| matches!(
+                e,
+                MetricEvent::LogSegmentLoadCompleted(LogSegmentLoadCompleted {
+                    outcome: LogSegmentLoadOutcome::Success { .. },
+                    ..
+                })
+            )),
             "no success event should fire on the failure path"
         );
         Ok(())
     }
 
-    // Case C.1: requesting a version beyond the log errors and emits a LogSegmentLoadFailure,
+    // Case C.1: requesting a version beyond the log errors and emits a LogSegmentLoadCompleted,
     // matching the fresh path (which also fails a request for an unavailable version).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_incremental_unavailable_version_emits_log_segment_load_failure() -> Result<()> {
@@ -2767,15 +2859,24 @@ mod tests {
         let failure = events
             .iter()
             .find_map(|e| match e {
-                MetricEvent::LogSegmentLoadFailure(f) => Some(f),
+                MetricEvent::LogSegmentLoadCompleted(
+                    f @ LogSegmentLoadCompleted {
+                        outcome: LogSegmentLoadOutcome::Error,
+                        ..
+                    },
+                ) => Some(f),
                 _ => None,
             })
-            .expect("expected a LogSegmentLoadFailure");
+            .expect("expected a LogSegmentLoadCompleted");
         assert_eq!(failure.load_type, LogSegmentLoadType::Incremental);
         assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, MetricEvent::LogSegmentLoadSuccess(_))),
+            !events.iter().any(|e| matches!(
+                e,
+                MetricEvent::LogSegmentLoadCompleted(LogSegmentLoadCompleted {
+                    outcome: LogSegmentLoadOutcome::Success { .. },
+                    ..
+                })
+            )),
             "no success event should fire on the failure path"
         );
         Ok(())

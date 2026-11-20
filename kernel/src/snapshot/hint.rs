@@ -447,7 +447,10 @@ mod tests {
     #[cfg(feature = "declarative-plans")]
     use crate::engine::DelegatingEngine;
     use crate::engine::sync::SyncEngine;
-    use crate::metrics::{MeteredDeltaEngine, MetricEvent, SnapshotLoadType};
+    use crate::metrics::{
+        MeteredDeltaEngine, MetricEvent, SnapshotBuildCompleted, SnapshotBuildOutcome,
+        SnapshotLoadType,
+    };
     use crate::path::LogPathFileType;
     use crate::schema::schema_ref;
     use crate::snapshot::builder::tests::catalog_managed_tests::{
@@ -1204,11 +1207,20 @@ mod tests {
             1,
             "hint build must emit only its completion event"
         );
-        let MetricEvent::SnapshotBuildSuccess(success) = &events[0] else {
-            panic!("expected SnapshotBuildSuccess");
+        let MetricEvent::SnapshotBuildCompleted(
+            success @ SnapshotBuildCompleted {
+                outcome: SnapshotBuildOutcome::Success { .. },
+                ..
+            },
+        ) = &events[0]
+        else {
+            panic!("expected SnapshotBuildCompleted");
         };
         assert_eq!(success.load_type, SnapshotLoadType::SnapshotHint);
-        assert_eq!(success.correlation_id.as_deref(), Some("hint-request"));
+        assert_eq!(
+            success.context.correlation_id.as_deref(),
+            Some("hint-request")
+        );
         Ok(())
     }
 
@@ -1569,8 +1581,14 @@ mod tests {
         assert_result_error_with_message(result, "does not match snapshot hint version");
         let events = reporter.events();
         assert_eq!(events.len(), 1);
-        let MetricEvent::SnapshotBuildFailure(failure) = &events[0] else {
-            panic!("expected SnapshotBuildFailure");
+        let MetricEvent::SnapshotBuildCompleted(
+            failure @ SnapshotBuildCompleted {
+                outcome: SnapshotBuildOutcome::Error,
+                ..
+            },
+        ) = &events[0]
+        else {
+            panic!("expected SnapshotBuildCompleted");
         };
         assert_eq!(failure.load_type, SnapshotLoadType::SnapshotHint);
         Ok(())

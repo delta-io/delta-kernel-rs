@@ -1592,6 +1592,8 @@ pub struct RetryableTransaction<STATE = UpdateTable, MODE: ExecutionMode = Imper
 
 #[cfg(test)]
 mod tests {
+    use crate::metrics::TransactionCommitOutcome;
+
     // Manifest-commit and root-manifest tests live in their own file
     // (tests/manifest_commit_tests.rs) but as a submodule of `tests`, so they reuse this
     // module's private helpers (e.g. `create_existing_table_txn`) without widening their
@@ -1626,7 +1628,7 @@ mod tests {
     use crate::expressions::{
         ArrayData, ExpressionStructPatchBuilder, MapData, Scalar, StructData,
     };
-    use crate::metrics::{CommitFailureReason, MetricEvent, TableType, TransactionCommitFailure};
+    use crate::metrics::{CommitFailureReason, MetricEvent, TableType, TransactionCommitCompleted};
     use crate::object_store::ObjectStoreExt as _;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
@@ -3583,9 +3585,14 @@ mod tests {
 
     // ===== Commit failure-metric tests =====
 
-    fn commit_failure_event(reporter: &CapturingReporter) -> Option<TransactionCommitFailure> {
+    fn commit_failure_event(reporter: &CapturingReporter) -> Option<TransactionCommitCompleted> {
         reporter.events().into_iter().find_map(|event| match event {
-            MetricEvent::TransactionCommitFailure(f) => Some(f),
+            MetricEvent::TransactionCommitCompleted(
+                f @ TransactionCommitCompleted {
+                    outcome: TransactionCommitOutcome::Failure { .. },
+                    ..
+                },
+            ) => Some(f),
             _ => None,
         })
     }
@@ -3602,8 +3609,16 @@ mod tests {
         let result = txn.commit(engine.as_ref())?;
         assert!(matches!(result, CommitResult::Retryable(_)));
         let failure = commit_failure_event(&reporter).expect("commit failure event");
-        assert_eq!(failure.reason, CommitFailureReason::RetryableIo);
-        assert_eq!(failure.table_type, TableType::PathBased);
+
+        let TransactionCommitOutcome::Failure {
+            reason: metric_failure_reason,
+            ..
+        } = &failure.outcome
+        else {
+            panic!("unexpected metric outcome");
+        };
+        assert_eq!((*metric_failure_reason), CommitFailureReason::RetryableIo);
+        assert_eq!(failure.context.table_type, TableType::PathBased);
         Ok(())
     }
 
@@ -3618,8 +3633,16 @@ mod tests {
         add_dummy_file(&mut txn);
         assert!(txn.commit(engine.as_ref()).is_err());
         let failure = commit_failure_event(&reporter).expect("commit failure event");
-        assert_eq!(failure.reason, CommitFailureReason::Error);
-        assert_eq!(failure.table_type, TableType::PathBased);
+
+        let TransactionCommitOutcome::Failure {
+            reason: metric_failure_reason,
+            ..
+        } = &failure.outcome
+        else {
+            panic!("unexpected metric outcome");
+        };
+        assert_eq!((*metric_failure_reason), CommitFailureReason::Error);
+        assert_eq!(failure.context.table_type, TableType::PathBased);
         Ok(())
     }
 }

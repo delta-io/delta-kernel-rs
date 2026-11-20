@@ -15,41 +15,29 @@ The difference is *when a metric's values are known*:
 
 `from_attrs` builds the event from a span's fields. It reads them with a `Visit` (the trait whose
 `record_*` methods receive one field at a time). Emit events run one `Visit` over the whole struct;
-span-based events reuse small per-field helpers like `MetricId::from_attrs`, each a `Visit` inside.
-
-## Failure events
-
-Operations with separate success and failure variants emit the success span, then fire `error`
-on it (`#[instrument(err)]` does this on `Err`; an emit helper calls
-`tracing::info!(error = ...)`). The layer sees `error` and flips the event via
-`MetricEvent::into_failure`.
-
-Snapshot-build failures receive elapsed time when the lifecycle span closes. Log-segment and
-protocol/metadata failures preserve the operation duration passed to their emit helper; timing the
-helper span itself would omit the failed work.
-
-`CheckpointWriteOutcome::Written` carries completed-checkpoint contents in `CheckpointWriteStats`.
-Both checkpoint events retain the attempt's processing and output metrics, including work performed
-before an error or an `AlreadyExists` return. Both durations stop after checkpoint data writes and
-verification, before hint publication. Recording `duration_ns` preserves that boundary when the
-reporting span closes after the final API result is known. Calls that return before data completion
-use span-close timing.
+span-based events decode shared labels through `MetricContext::from_attrs`.
 
 ## Completion outcomes
 
-`LastCheckpointReadCompleted` reports every `_last_checkpoint` read attempt with an outcome and
-elapsed time through storage access, parsing, and validation. Its outcome describes the hint read,
-not the enclosing snapshot build. `Success` means a parsed hint was retained; it does not guarantee
-that the caller can use the checkpoint it names. See the type's rustdoc for outcome semantics.
+Each operation emits one `*Completed` event. Attempt-wide fields stay on the event, while its
+operation-specific outcome carries only the fields applicable to that result. `MetricContext` owns
+operation ID, caller correlation ID, and table type wherever those labels travel together.
 
-The span records `outcome` explicitly. The error channel fills an unrecorded outcome with `Error`
-without overwriting an explicit classification, such as `NotFound` on a top-level storage error.
-Malformed outcome labels decode to `Unknown` and defer warnings until the extension lock is released.
+Lifecycle spans start with a success payload. `#[instrument(err)]` marks the outcome as an error
+without reconstructing the event or copying shared fields. An explicit commit failure reason
+survives the generic error signal. Fields recorded after an error must not restore success.
 
-Use a flat outcome enum when every outcome has the same payload. When payloads differ, tagged
-variants can carry success-only statistics or a failure-only reason without optional fields.
-Existing success/failure event pairs also express that distinction; changing them requires an
-explicit compatibility decision.
+Emit-based log-segment and protocol/metadata reports carry their outcome and duration in creation
+attributes. Decode the outcome after other creation attributes so attribute order cannot discard
+shared fields. The helper span's lifetime does not measure the operation's work.
+
+`LastCheckpointReadCompleted` records its outcome explicitly. The error channel fills an unrecorded
+outcome with `Error` without overwriting an explicit classification such as `NotFound`.
+
+Checkpoint processing and output statistics describe attempted work across outcomes. Completed
+checkpoint contents belong to `Written`. Preserve an explicitly recorded checkpoint duration:
+its boundary excludes hint publication and returned snapshot construction. Other lifecycle events
+receive elapsed time when their span closes, including errors.
 
 ## Warnings inside layer callbacks
 
@@ -66,7 +54,7 @@ warning-eligible work, so it may run under the lock directly.) See
 ## Adding an event
 
 1. Define the struct + `SPAN_NAME` in `events.rs`; add a `MetricEvent` variant and its
-   `into_failure` arm.
+   error-outcome arm.
 2. For emit, add an `emit_*` helper and a `from_attrs`; register the span name in `on_new_span`
    (`reporter.rs`).
 3. Make each label a strum enum (`serialize_all = "snake_case"`).
