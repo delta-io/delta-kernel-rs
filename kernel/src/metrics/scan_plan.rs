@@ -8,9 +8,6 @@ use crate::Version;
 use crate::checkpoint::{CheckpointInfo, SelectedCheckpointType};
 use crate::scan::{PartitionValuesOptions, StatsOptions};
 
-#[cfg(all(test, feature = "declarative-plans"))]
-mod tests;
-
 /// Result of one scan-plan-generation attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanPlanOutcome {

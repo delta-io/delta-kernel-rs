@@ -151,6 +151,9 @@ where
             ScanMetadataCompleted::SPAN_NAME => Some(MetricEvent::ScanMetadataCompleted(
                 ScanMetadataCompleted::from_attrs(attrs),
             )),
+            super::ScanPlanGenerationCompleted::SPAN_NAME => Some(
+                MetricEvent::ScanPlanGenerationCompleted(super::ScanPlanGenerationCompleted::new()),
+            ),
             STORAGE_SPAN => storage_metric_from_attrs(attrs),
             _ => None,
         };
@@ -224,21 +227,14 @@ pub(super) fn update_scan_plan(update: impl FnOnce(&mut super::ScanPlanGeneratio
     Span::current().with_subscriber(|(id, dispatch)| {
         let registry = dispatch.downcast_ref::<tracing_subscriber::Registry>()?;
         for span in registry.span(id)?.scope() {
-            if span.name() != super::ScanPlanGenerationCompleted::SPAN_NAME {
-                continue;
-            }
-            let mut extensions = span.extensions_mut();
-            let visitor = extensions.get_mut::<EventVisitor>()?;
-            if let MetricEvent::ScanPlanGenerationCompleted(event) =
-                visitor.event.get_or_insert_with(|| {
-                    MetricEvent::ScanPlanGenerationCompleted(
-                        super::ScanPlanGenerationCompleted::new(),
-                    )
-                })
+            if let Some(EventVisitor {
+                event: Some(MetricEvent::ScanPlanGenerationCompleted(event)),
+                ..
+            }) = span.extensions_mut().get_mut::<EventVisitor>()
             {
                 update(event);
+                break;
             }
-            break;
         }
         Some(())
     });
@@ -362,7 +358,7 @@ mod tests {
     use crate::metrics::{
         CheckpointOutputStats, CheckpointProcessingStats, CheckpointWriteMode,
         CheckpointWriteOutcome, CheckpointWriteStats, LastCheckpointReadOutcome, MetricEvent,
-        MetricId, WithMetricsReporterLayer as _,
+        MetricId, ScanPlanGenerationCompleted, WithMetricsReporterLayer as _,
     };
     use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
 
@@ -716,5 +712,28 @@ mod tests {
                 .any(|e| matches!(e, MetricEvent::SnapshotBuildFailure(_))),
             "a successful #[instrument(ret)] must not emit a failure event; got: {events:?}"
         );
+    }
+
+    #[test]
+    fn scan_plan_updates_nearest_parent_span_and_skips_disabled_reporting() {
+        tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+            ScanPlanGenerationCompleted::update(|_| panic!("disabled update evaluated"));
+        });
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        let span = tracing::info_span!(
+            "scan.declarative_metadata_scan_plan",
+            report = tracing::field::Empty
+        );
+        let operation_id = MetricId::new();
+        {
+            let _entered = span.enter();
+            tracing::info_span!("child").in_scope(|| {
+                ScanPlanGenerationCompleted::update(|event| event.operation_id = operation_id);
+            });
+        }
+        drop(span);
+        assert!(matches!(reporter.events().as_slice(),
+            [MetricEvent::ScanPlanGenerationCompleted(event)] if event.operation_id == operation_id));
     }
 }

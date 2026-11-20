@@ -423,7 +423,16 @@ impl MetricsReporter for CountingReporter {
                 CommitFailureReason::Error => self.commit_errors.inc(),
             },
             // Intentionally not tracked. Add counters if needed.
-            _ => {}
+            MetricEvent::ProtocolMetadataLoadSuccess(_)
+            | MetricEvent::ProtocolMetadataLoadFailure(_)
+            | MetricEvent::LogSegmentLoadFailure(_)
+            | MetricEvent::CrcReadFailure
+            | MetricEvent::CheckpointWriteSuccess(_)
+            | MetricEvent::CheckpointWriteFailure(_)
+            | MetricEvent::ChecksumWriteSuccess(_)
+            | MetricEvent::ChecksumWriteFailure(_)
+            | MetricEvent::ScanPlanGenerationCompleted(_)
+            | MetricEvent::ScanMetadataCompleted(_) => {}
         }
     }
 }
