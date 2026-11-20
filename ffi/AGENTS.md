@@ -533,7 +533,9 @@ pub unsafe extern "C" fn set_metadata(
     entries: CMetadataEntries,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<bool> {
-    let result = unsafe { set_metadata_impl(builder, entries) };
+    let result = crate::panic::catch("set_metadata", || unsafe {
+        set_metadata_impl(builder, entries)
+    });
     unsafe { result.into_extern_result(&*error_allocators) }
 }
 
@@ -571,6 +573,28 @@ error channels and often reduces a precise failure to a generic "visitor failed"
 iterators, each next call may return its own error. After a terminal error, the API must state
 whether the iterator can be retried or is poisoned. No callback may unwind across the C ABI.
 
+#### Panic boundaries
+
+Separate shared panic infrastructure from its mechanical application to exports. The infrastructure
+PR owns the hook, capture state, catcher helpers, unit tests, and guidance. A dependent PR adds the
+explicit calls to top-level `extern "C"` functions and the FFI integration cases. Remove any
+infrastructure-only unused-code allowance when wiring the exports.
+
+Use explicit calls to `crate::panic::catch` in exports returning `ExternResult`, as in the metadata
+example above. Include parsing, conversions, serialization, and operation-local cleanup inside the
+catcher, then convert the result through the existing error allocator. Exports without an
+`ExternResult` return use `crate::panic::catch_or_abort`. Keep these boundaries at the C entry
+points; ordinary Rust helpers remain ordinary Rust functions. Do not introduce boundary macros.
+
+Acquire and retain the allocator outside the catcher, including an engine reference when its
+containing builder or iterator is consumed. Convert consumed handles into Rust owners before work
+that can panic. Each nested C entry needs its own boundary. Caller-owned inputs remain borrowed.
+
+The helpers in `src/panic/mod.rs` install one global hook and report through existing tracing and
+error allocators. Keep hook installation and diagnostic capture in that module. A caught panic does
+not establish rollback or safe reuse of partially changed state. A commit panic can leave the
+outcome unknown; callers must reconcile it before retrying.
+
 ### Review checklist for new FFI APIs
 
 Before approving a new boundary type or function, answer:
@@ -597,6 +621,8 @@ Before approving a new boundary type or function, answer:
 16. Does opaque encoded state cross as bytes, with compatibility checked when required?
 17. Does the C header communicate the same ownership, nullability, and mutation semantics as the
     Rust documentation?
+18. Does each top-level C export have an explicit panic boundary, retaining its error allocator
+    when returning failures?
 
 ## Source layout
 
