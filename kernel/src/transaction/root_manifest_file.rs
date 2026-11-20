@@ -425,28 +425,11 @@ mod tests {
             .into_iter()
             .map(domain_metadata_line)
             .chain(log_txns.iter().map(|t| txn_line(&t.app_id, t.version)));
-        write_log_lines(&engine, &table_root, 1, log_commits)?;
-        compute_at_latest(&engine, &table_root, &[], set_transactions)
-    }
-
-    /// Writes one log commit per line right after the manifest commit at `manifest_version`.
-    fn write_log_lines(
-        engine: &SyncEngine,
-        table_root: &Url,
-        manifest_version: Version,
-        lines: impl IntoIterator<Item = String>,
-    ) -> Result<()> {
-        for (version, line) in (manifest_version + 1..).zip(lines) {
+        for (version, line) in (2..).zip(log_commits) {
             let data = parse_json_batch(vec![line.as_str()].into());
-            write_commit_after_manifest_commit(
-                engine,
-                table_root,
-                version,
-                manifest_version,
-                data,
-            )?;
+            write_commit_after_manifest_commit(&engine, &table_root, version, 1, data)?;
         }
-        Ok(())
+        compute_at_latest(&engine, &table_root, &[], set_transactions)
     }
 
     fn compute_at_latest(
@@ -464,6 +447,35 @@ mod tests {
             dm_changes,
             set_transactions,
         )?)
+    }
+
+    /// Commits `txns` and `domains` in one transaction on the latest snapshot, if there are any.
+    fn commit_transaction(
+        engine: &SyncEngine,
+        table_root: &Url,
+        txns: &[SetTransaction],
+        domains: &[DomainMetadata],
+    ) -> Result<()> {
+        if txns.is_empty() && domains.is_empty() {
+            return Ok(());
+        }
+        let snapshot = Snapshot::builder_for(table_root.clone()).build(engine)?;
+        let mut txn = snapshot
+            .update_table(UpdateTableOperation::Write, "test", true)
+            .build(engine, Box::new(FileSystemCommitter::new()))?;
+        for set_transaction in txns {
+            txn = txn.with_transaction_id(set_transaction.app_id.clone(), set_transaction.version);
+        }
+        for dm in domains {
+            let name = dm.domain().to_string();
+            txn = if dm.is_removed() {
+                txn.with_domain_metadata_removed(name)
+            } else {
+                txn.with_domain_metadata(name, dm.configuration().to_string())
+            };
+        }
+        txn.commit(engine)?.unwrap_committed();
+        Ok(())
     }
 
     #[rstest]
@@ -752,9 +764,10 @@ mod tests {
 
     /// A set transaction or domain metadata entry that a test can build, log and spill to a
     /// sidecar. An entry's value is the txn version or the domain configuration.
-    trait TestEntry: CheckpointActionEntry + PartialEq + Debug {
+    trait TestEntry: CheckpointActionEntry {
         const NAME: &'static str;
         fn at(key: &str, value: i64) -> Self;
+        fn value(&self) -> i64;
         fn line(&self) -> String;
         fn write_sidecar(
             engine: &SyncEngine,
@@ -769,6 +782,9 @@ mod tests {
         const NAME: &'static str = "txn";
         fn at(key: &str, value: i64) -> Self {
             txn(key, value)
+        }
+        fn value(&self) -> i64 {
+            self.version
         }
         fn line(&self) -> String {
             txn_line(&self.app_id, self.version)
@@ -791,6 +807,9 @@ mod tests {
         const NAME: &'static str = "domains";
         fn at(key: &str, value: i64) -> Self {
             domain(key, &value.to_string())
+        }
+        fn value(&self) -> i64 {
+            self.configuration().parse().unwrap()
         }
         fn line(&self) -> String {
             domain_metadata_line(self.clone())
@@ -828,13 +847,13 @@ mod tests {
     const LOGGED: i64 = 2;
     const CHANGED: i64 = 3;
 
-    /// The `T` side of a row: the action's sidecars, the lines logged before and after the action,
-    /// and this transaction's changes. Sidecars that must not be read point at files that were
-    /// never written.
+    /// The `T` side of a row: the action's sidecars, the lines logged before the action, the
+    /// entries logged after it, and this transaction's changes. Sidecars that must not be read
+    /// point at files that were never written.
     struct KindSetup<T> {
         sidecars: Vec<Sidecar>,
         before: Vec<String>,
-        logged: Vec<String>,
+        logged: Vec<T>,
         changes: Vec<T>,
     }
 
@@ -874,11 +893,10 @@ mod tests {
                 })
                 .collect_vec();
             T::set(checkpoint, at(self.inline, EXISTING), sidecars.clone());
-            let lines = |keys, value| at(keys, value).iter().map(T::line).collect();
             KindSetup {
                 sidecars,
-                before: lines(self.before, BEFORE),
-                logged: lines(self.logged, LOGGED),
+                before: at(self.before, BEFORE).iter().map(T::line).collect(),
+                logged: at(self.logged, LOGGED),
                 changes: at(self.changed, CHANGED),
             }
         }
@@ -890,22 +908,23 @@ mod tests {
             checkpoint: &CheckpointAction,
             setup: &KindSetup<T>,
         ) {
-            let newest = |key: &&str| {
-                if self.changed.contains(key) {
+            let newest = |key: &str| {
+                if self.changed.contains(&key) {
                     CHANGED
-                } else if self.logged.contains(key) {
+                } else if self.logged.contains(&key) {
                     LOGGED
                 } else {
                     EXISTING
                 }
             };
             let expected = (self.expected_inline.iter())
-                .map(|key| T::at(key, newest(key)))
+                .map(|&key| (key, newest(key)))
                 .collect_vec();
             let inline = T::inline(checkpoint)
                 .iter()
-                .sorted_by_key(|entry| entry.key());
-            assert_eq!(inline.collect_vec(), expected.iter().collect_vec());
+                .map(|entry| (entry.key(), entry.value()))
+                .sorted();
+            assert_eq!(inline.collect_vec(), expected);
             assert_eq!(
                 T::sidecars(checkpoint),
                 kept_or_empty(&setup.sidecars, self.sidecars_kept)
@@ -995,8 +1014,7 @@ mod tests {
             write_commit(&engine, &table_root, 1, data)?;
         }
         write_manifest_commit(&engine, &table_root, manifest_version, existing)?;
-        let logged = txns.logged.iter().chain(&domains.logged).cloned();
-        write_log_lines(&engine, &table_root, manifest_version, logged)?;
+        commit_transaction(&engine, &table_root, &txns.logged, &domains.logged)?;
 
         let checkpoint = compute_at_latest(&engine, &table_root, &domains.changes, &txns.changes)?;
 
@@ -1046,8 +1064,9 @@ mod tests {
             [domain("spilled", "1")],
         )];
         write_manifest_commit(&engine, &table_root, 1, existing.clone())?;
-        let lines = log_domains.into_iter().map(domain_metadata_line);
-        write_log_lines(&engine, &table_root, 1, lines)?;
+        for log_domain in log_domains {
+            commit_transaction(&engine, &table_root, &[], &[log_domain])?;
+        }
 
         let checkpoint = compute_at_latest(&engine, &table_root, &[], &[])?;
 
@@ -1223,7 +1242,8 @@ mod tests {
             txn_line(&logged_txn.app_id, logged_txn.version),
             domain_metadata_line(logged_domain.clone()),
         ];
-        write_log_lines(&engine, &table_root, 1, logged)?;
+        let data = parse_json_batch(logged.iter().map(String::as_str).collect_vec().into());
+        write_commit_after_manifest_commit(&engine, &table_root, 2, 1, data)?;
 
         // The CRC holds `from-crc` instead of the action's entries, so the source is visible.
         let built = Snapshot::builder_for(table_root.clone()).build(&engine)?;
