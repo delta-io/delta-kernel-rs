@@ -776,6 +776,7 @@ mod tests {
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::arrow::array::{AsArray, StructArray};
     use crate::arrow::buffer::{BooleanBuffer, NullBuffer};
+    #[cfg(feature = "arrow-60")]
     use crate::arrow::compute::concat_batches;
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Int64Type};
     #[cfg(feature = "arrow-60")]
@@ -999,19 +1000,84 @@ mod tests {
         Ok(())
     }
 
+    #[rustfmt::skip]
     #[rstest]
+    #[case::narrow_without_stats(
+        &["amount"], vec![],
+        &[
+            "+--------+",
+            "| amount |",
+            "+--------+",
+            "|        |",
+            "|        |",
+            "| 10     |",
+            "| 10     |",
+            "+--------+",
+        ],
+        &[],
+    )]
+    #[case::struct_prefix_with_count(
+        &["amount", "stats"], vec![StatsAgg::new("count", Agg::CountStar)],
+        &[
+            "+--------+-----------------+",
+            "| amount | stats           |",
+            "+--------+-----------------+",
+            "|        |                 |",
+            "|        |                 |",
+            "| 10     | {numRecords: 2} |",
+            "| 10     | {numRecords: 2} |",
+            "+--------+-----------------+",
+        ],
+        &[
+            "+-------+",
+            "| count |",
+            "+-------+",
+            "| 4     |",
+            "+-------+",
+        ],
+    )]
+    #[case::nested_prefix_with_scalar_and_struct_stats(
+        &["amount", "stats", "items"],
+        vec![
+            StatsAgg::new("count", Agg::CountStar),
+            StatsAgg::new("amount_count", Agg::count(column_name!("amount"))),
+            StatsAgg::new("amount_sum", Agg::sum(column_name!("amount"))),
+            StatsAgg::new("region_count", Agg::count(column_name!("region"))),
+            StatsAgg::new("first_stats", Agg::first_non_null(column_name!("stats"))),
+        ],
+        &[
+            "+--------+-----------------+----------------------+",
+            "| amount | stats           | items                |",
+            "+--------+-----------------+----------------------+",
+            "|        |                 |                      |",
+            "|        |                 |                      |",
+            "| 10     | {numRecords: 2} | {x: [{number: 1}, ]} |",
+            "| 10     | {numRecords: 2} | {x: [{number: 1}, ]} |",
+            "+--------+-----------------+----------------------+",
+        ],
+        &[
+            "+-------+--------------+------------+--------------+-----------------+",
+            "| count | amount_count | amount_sum | region_count | first_stats     |",
+            "+-------+--------------+------------+--------------+-----------------+",
+            "| 4     | 2            | 20         | 4            | {numRecords: 2} |",
+            "+-------+--------------+------------+--------------+-----------------+",
+        ],
+    )]
     fn write_parquet_writes_prefix_and_preserves_struct_stats(
-        #[values(false, true)] with_stats: bool,
+        #[case] write_fields: &[&str],
+        #[case] stats_agg: Vec<StatsAgg>,
+        #[case] expected_write: &[&str],
+        #[case] expected_stats: &[&str],
         #[values(false, true)] input_has_field_ids: bool,
     ) -> KernelResult<()> {
         let executor = SyncPlanExecutor::new(Some(Arc::new(InMemory::new())));
         let path = Url::parse("memory:///output.parquet")?;
-        let stats = schema! {
+        let stats_type = schema! {
             (StructField::nullable("numRecords", DataType::LONG)
                 .with_metadata([("parquet.field.id", 2i64)])),
         };
         let input_stats = if input_has_field_ids {
-            stats.clone()
+            stats_type.clone()
         } else {
             schema! { nullable "numRecords": LONG }
         };
@@ -1037,7 +1103,7 @@ mod tests {
         let write_schema = schema_ref! {
             (StructField::nullable("amount", DataType::LONG)
                 .with_metadata([("parquet.field.id", 1i64)])),
-            (StructField::nullable("stats", stats.clone())
+            (StructField::nullable("stats", stats_type)
                 .with_metadata([("parquet.field.id", 3i64)])),
             (StructField::nullable("items", MapType::new(
                 DataType::STRING, ArrayType::new(write_element, true), true,
@@ -1046,7 +1112,7 @@ mod tests {
                     "items.key": 4, "items.value": 5, "items.value.element": 6,
                 })),
             )])),
-        };
+        }.project(write_fields)?;
         let value = StructData::try_new(element.fields().cloned().collect(), vec![1i64.into()])?;
         let array = ArrayData::try_new(array_type, [value.into(), Scalar::Null(element.into())])?;
         let items = MapData::try_new(map_type.clone(), [("x", Scalar::from(array))])?;
@@ -1065,61 +1131,44 @@ mod tests {
                 "FR".into(),
             ],
         ];
-        let rows = PlanBuilder::values(input_schema.clone(), data.clone())?;
+        let rows = PlanBuilder::values(input_schema.clone(), data)?;
         let plan = PlanBuilder::write_parquet(
             [rows.clone(), rows],
-            WriteParquet::new(write_schema.clone(), path.clone()).with_stats_agg(if with_stats {
-                vec![
-                    StatsAgg::new("count", Agg::CountStar),
-                    StatsAgg::new("amount_count", Agg::count(column_name!("amount"))),
-                    StatsAgg::new("amount_sum", Agg::sum(column_name!("amount"))),
-                    StatsAgg::new("region_count", Agg::count(column_name!("region"))),
-                    StatsAgg::new("first_stats", Agg::first_non_null(column_name!("stats"))),
-                ]
-            } else {
-                vec![]
-            }),
+            WriteParquet::new(write_schema, path.clone()).with_stats_agg(stats_agg),
         )?
         .build()?;
         let output_schema: ArrowSchema = plan.schema.as_ref().try_into_arrow()?;
         let result = executor.eval_plan(plan, None)?;
         assert_eq!(result[0].schema().as_ref(), &output_schema);
-        if with_stats {
-            let actual = result[0].project(&[3, 4, 5, 6, 7])?;
-            #[rustfmt::skip]
-            let expected: &[&str] = &[
-                "+-------+--------------+------------+--------------+-----------------+",
-                "| count | amount_count | amount_sum | region_count | first_stats     |",
-                "+-------+--------------+------------+--------------+-----------------+",
-                "| 4     | 2            | 20         | 4            | {numRecords: 2} |",
-                "+-------+--------------+------------+--------------+-----------------+",
-            ];
-            assert_batches_sorted_eq!(expected, &[actual]);
+        let stats_columns = (FILE_META_SCHEMA.num_fields()..result[0].num_columns()).collect_vec();
+        if stats_columns.is_empty() {
+            assert!(expected_stats.is_empty());
+        } else {
+            let actual = result[0].project(&stats_columns)?;
+            assert_batches_sorted_eq!(expected_stats, &[actual]);
         }
         let file = executor.storage.head(&path)?;
         let reader =
             ParquetRecordBatchReaderBuilder::try_new(get_bytes(executor.storage.store(), &path)?)?;
         let fields = reader.parquet_schema().root_schema().get_fields();
-        assert_eq!(fields.len(), 3);
+        assert_eq!(fields.len(), write_fields.len());
         assert_eq!(fields[0].get_basic_info().id(), 1);
-        assert_eq!(fields[1].get_basic_info().id(), 3);
-        assert_eq!(fields[1].get_fields()[0].get_basic_info().id(), 2);
-        let entries = fields[2].get_fields()[0].get_fields();
-        assert_eq!(entries[0].get_basic_info().id(), 4);
-        assert_eq!(entries[1].get_basic_info().id(), 5);
-        let element = &entries[1].get_fields()[0].get_fields()[0];
-        assert_eq!(element.get_basic_info().id(), 6);
-        assert_eq!(element.get_fields()[0].get_basic_info().id(), 7);
-        let read_schema = input_schema.project(&["amount", "stats", "items"])?;
-        let plan = PlanBuilder::scan_parquet([file], &[], read_schema.clone())?.build()?;
+        if let Some(stats) = fields.get(1) {
+            assert_eq!(stats.get_basic_info().id(), 3);
+            assert_eq!(stats.get_fields()[0].get_basic_info().id(), 2);
+        }
+        if let Some(items) = fields.get(2) {
+            let entries = items.get_fields()[0].get_fields();
+            assert_eq!(entries[0].get_basic_info().id(), 4);
+            assert_eq!(entries[1].get_basic_info().id(), 5);
+            let element = &entries[1].get_fields()[0].get_fields()[0];
+            assert_eq!(element.get_basic_info().id(), 6);
+            assert_eq!(element.get_fields()[0].get_basic_info().id(), 7);
+        }
+        let read_schema = input_schema.project(write_fields)?;
+        let plan = PlanBuilder::scan_parquet([file], &[], read_schema)?.build()?;
         let actual = executor.eval_plan(plan, None)?;
-        let expected_rows = data
-            .iter()
-            .chain(&data)
-            .map(|row| row[..read_schema.num_fields()].to_vec())
-            .collect_vec();
-        let expected = values_to_record_batch(Values::new(read_schema, expected_rows))?;
-        assert_eq!(concat_batches(&expected.schema(), &actual)?, expected);
+        assert_batches_sorted_eq!(expected_write, &actual);
         Ok(())
     }
 
