@@ -828,6 +828,8 @@ mod tests {
             schema_context.partition_schema.as_deref(),
         )?;
         Ok(CheckpointWriter {
+            minimum_file_retention_timestamp: 0,
+            txn_expiration_timestamp: None,
             version: version_as_i64(snapshot.version())?,
             snapshot,
             schema_context,

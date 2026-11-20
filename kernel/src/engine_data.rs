@@ -189,14 +189,23 @@ impl<'a> MapItem<'a> {
         self.offsets.clone().map(move |idx| keys.value(idx))
     }
 
+    /// Visits every entry in storage order, preserving null values.
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (&'a str, Option<&'a str>)> + use<'a> {
+        let keys = self.keys;
+        let values = self.values;
+        self.offsets.clone().map(move |idx| {
+            (
+                keys.value(idx),
+                values.is_valid(idx).then(|| values.value(idx)),
+            )
+        })
+    }
+
     pub fn materialize(&self) -> HashMap<String, String> {
         let mut ret = HashMap::with_capacity(self.offsets.len());
-        for idx in self.offsets.clone() {
-            if self.values.is_valid(idx) {
-                ret.insert(
-                    self.keys.value(idx).to_string(),
-                    self.values.value(idx).to_string(),
-                );
+        for (key, value) in self.entries() {
+            if let Some(value) = value {
+                ret.insert(key.to_string(), value.to_string());
             }
         }
         ret
@@ -911,5 +920,19 @@ mod tests {
         let values = StringArray::from(Vec::<&str>::new());
         let map = MapItem::new(&keys, &values, 0..0);
         assert_eq!(map.keys().count(), 0);
+    }
+
+    #[rstest]
+    #[case(0..0, vec![])]
+    #[case(1..3, vec![("b", None), ("c", Some("3"))])]
+    #[case(0..3, vec![("a", Some("1")), ("b", None), ("c", Some("3"))])]
+    fn map_item_entries_preserve_nulls_and_row_bounds(
+        #[case] offsets: std::ops::Range<usize>,
+        #[case] expected: Vec<(&str, Option<&str>)>,
+    ) {
+        let keys = StringArray::from(vec!["a", "b", "c"]);
+        let values = StringArray::from(vec![Some("1"), None, Some("3")]);
+        let map = MapItem::new(&keys, &values, offsets);
+        assert_eq!(map.entries().collect::<Vec<_>>(), expected);
     }
 }
