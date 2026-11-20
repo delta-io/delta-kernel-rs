@@ -12,10 +12,10 @@
 //!
 //! Log compaction creates files with the naming pattern
 //! `{start_version}.{end_version}.compacted.json` that contain the reconciled actions from all
-//! commit files in the specified version range. Only commit/compaction files that intersect with
-//! [start_version, end_version] are processed. Note that `end_version` must be greater than
-//! `start_version` (equal versions are not allowed). This is similar to checkpoints but operates on
-//! a subset of versions rather than the entire table.
+//! commit files in the specified version range. Reads commits in [start_version, end_version],
+//! reusing existing compactions fully contained in that range. Note that `end_version` must be
+//! greater than `start_version` (equal versions are not allowed). This is similar to checkpoints
+//! but operates on a subset of versions rather than the entire table.
 //!
 //! ## Usage
 //!
@@ -128,8 +128,22 @@ impl Snapshot {
                 LogSegment::try_new(
                     LogSegmentFiles {
                         ascending_commit_files: commits_to_compact.to_vec(),
+                        ascending_compaction_files: source
+                            .listed
+                            .ascending_compaction_files
+                            .iter()
+                            .filter(|file| {
+                                matches!(
+                                    file.file_type,
+                                    LogPathFileType::CompactedCommit { hi }
+                                        if file.version >= start_version && hi <= end_version
+                                )
+                            })
+                            .cloned()
+                            .collect(),
                         latest_commit_file: commits_to_compact.last().cloned(),
                         max_published_version: commits_to_compact.last().map(|file| file.version),
+                        // CRCs describe full snapshots, not an interval.
                         ..Default::default()
                     },
                     source.log_root.clone(),

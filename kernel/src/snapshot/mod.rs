@@ -1540,13 +1540,14 @@ impl Snapshot {
     /// Requires a plan executor and a fresh latest snapshot built with checkpoint discovery.
     /// Compacts published commits with `start_version < end_version <= self.version()`,
     /// after the snapshot's checkpoint. Staged commit paths are unsupported.
-    /// Retains winning removes, transactions, and domain deletions regardless of age; includes
-    /// protocol and metadata only when present.
+    /// Reuses compactions fully contained in the interval. Retains winning removes, transactions,
+    /// and domain deletions from its inputs regardless of age; includes protocol and metadata only
+    /// when present.
     /// File actions have `dataChange=true`.
     ///
-    /// Errors on existing destinations. Missing versions return `DELTA_VERSIONS_NOT_CONTIGUOUS`;
-    /// missing files return `DELTA_TRUNCATED_TRANSACTION_LOG`.
-    /// AMT and automatic compaction are unsupported.
+    /// Errors on existing destinations. Gaps in listed commits return
+    /// `DELTA_VERSIONS_NOT_CONTIGUOUS`; missing selected input files return
+    /// `DELTA_TRUNCATED_TRANSACTION_LOG`. AMT and automatic compaction are unsupported.
     #[cfg(feature = "declarative-plans")]
     pub fn compact_log(
         &self,
@@ -1566,7 +1567,7 @@ impl Snapshot {
             .into());
         }
         let segment = self.log_compaction_segment(start_version, end_version)?;
-        let actions = MetadataPlanner::new(&segment, ActionSet::ALL, false)
+        let actions = MetadataPlanner::new(&segment, ActionSet::ALL, true)
             .with_stats(StatsOptions::json_only())
             .replay()?
             .project_patch(|patch| {

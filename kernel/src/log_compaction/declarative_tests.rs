@@ -2,23 +2,28 @@ use std::error::Error as _;
 use std::sync::Arc;
 
 use ::test_utils::table_builder::{FeatureSet, LogState, TestTableBuilder, VersionTarget};
-use ::test_utils::{add_commit, add_staged_commit, build_snapshot};
+use ::test_utils::{add_commit, add_staged_commit, assert_batches_sorted_eq, build_snapshot};
 use rstest::rstest;
 use serde_json::Value;
 use url::Url;
 
 use super::*;
-use crate::actions::{ADD_NAME, REMOVE_NAME};
+use crate::actions::{ADD_NAME, LOG_ADD_SCHEMA, REMOVE_NAME};
 use crate::arrow::error::ArrowError;
+use crate::committer::FileSystemCommitter;
 use crate::engine::DelegatingEngine;
 use crate::engine::sync::SyncEngine;
+use crate::expressions::{Expression as Expr, col};
 use crate::log_path::LogPath;
 use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::path::Path;
 use crate::path::ParsedLogPath;
-use crate::plans::{Operation, PlanExecutor, PlanResult};
+use crate::plans::{Operation, PlanBuilder, PlanExecutor, PlanResult};
+use crate::schema::schema_ref;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
+use crate::transaction::UpdateTableOperation;
+use crate::unit_test_utils::plans::execute_plan;
 use crate::unit_test_utils::{MockProtocolBuilder, MockTableConfigurationBuilder};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::unit_test_utils::{
@@ -105,10 +110,12 @@ fn compaction_preserves_action_payloads(
 }
 
 #[rstest]
-#[case::latest(VersionTarget::Latest, true)]
-#[case::at_version(VersionTarget::AtVersion(3), false)]
+#[case::latest(VersionTarget::Latest, false, true)]
+#[case::at_version(VersionTarget::AtVersion(3), false, false)]
+#[case::post_commit(VersionTarget::AtVersion(3), true, true)]
 fn compaction_requires_snapshot_built_as_latest(
     #[case] target: VersionTarget,
+    #[case] post_commit: bool,
     #[case] latest: bool,
 ) -> Result<()> {
     let table = TestTableBuilder::new()
@@ -118,9 +125,21 @@ fn compaction_requires_snapshot_built_as_latest(
     let engine = SyncEngine::new_with_store(table.store().clone());
     let snapshot = build_snapshot!(target, table.table_root(), &engine);
     assert_eq!(snapshot.version(), 3);
+    let snapshot = if post_commit {
+        assert!(!snapshot.is_built_as_latest());
+        snapshot
+            .update_table(UpdateTableOperation::Write, "test", true)
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?
+            .unwrap_post_commit_snapshot()
+    } else {
+        snapshot
+    };
+    assert_eq!(snapshot.version(), 3 + u64::from(post_commit));
     assert_eq!(snapshot.is_built_as_latest(), latest);
-    let path = ParsedLogPath::new_log_compaction(snapshot.table_root(), 0, 3)?.location;
-    let result = snapshot.compact_log(&engine, 0, 3);
+    let path =
+        ParsedLogPath::new_log_compaction(snapshot.table_root(), 0, snapshot.version())?.location;
+    let result = snapshot.compact_log(&engine, 0, snapshot.version());
     if latest {
         assert_eq!(result?, engine.storage_handler().head(&path)?);
     } else {
@@ -130,6 +149,54 @@ fn compaction_requires_snapshot_built_as_latest(
         )));
         assert!(engine.storage_handler().head(&path).is_err());
     }
+    Ok(())
+}
+
+#[rstest]
+#[case::inside(&[(2, 3)], &[2, 3])]
+#[case::crosses_left(&[(0, 2)], &[])]
+#[case::crosses_right(&[(3, 5)], &[])]
+#[case::overlapping(&[(1, 2), (2, 3)], &[1, 2])]
+#[tokio::test]
+async fn compaction_reuses_only_contained_ranges(
+    #[case] ranges: &[(Version, Version)],
+    #[case] delete_commits: &[Version],
+) -> Result<()> {
+    let table = TestTableBuilder::new()
+        .with_log_state(
+            LogState::with_latest_version(5).with_compaction_ranges(ranges.iter().copied()),
+        )
+        .build()
+        .unwrap();
+    let engine = SyncEngine::new_with_store(table.store().clone());
+    let snapshot = build_snapshot!(VersionTarget::Latest, table.table_root(), &engine);
+    for version in delete_commits {
+        table
+            .store()
+            .delete(&Path::from(format!("_delta_log/{version:020}.json")))
+            .await
+            .map_err(KernelError::from)?;
+    }
+    let meta = snapshot.compact_log(&engine, 1, 4)?;
+    let plan = PlanBuilder::scan_json([meta], &[], LOG_ADD_SCHEMA.clone())?
+        .project(
+            Expr::struct_from([col!("add.dataChange")]),
+            schema_ref! { nullable "dataChange": BOOLEAN },
+        )?
+        .build()?;
+    assert_batches_sorted_eq!(
+        [
+            "+------------+",
+            "| dataChange |",
+            "+------------+",
+            "| true       |",
+            "| true       |",
+            "| true       |",
+            "| true       |",
+            "+------------+",
+        ],
+        &execute_plan(&engine, plan)?
+    );
     Ok(())
 }
 
