@@ -28,6 +28,9 @@ use crate::checkpoint::CheckpointInfo;
 use crate::expressions::{ColumnName, Predicate, lit};
 #[cfg(test)]
 use crate::expressions::{Expression as Expr, expr};
+use crate::metrics::ScanPlanGenerationCompleted;
+use crate::path::{LogPathFileType, ParsedLogPath};
+use crate::plans::ir::nodes::Operator;
 use crate::plans::ir::plan::Plan;
 #[cfg(test)]
 use crate::schema::{
@@ -110,10 +113,43 @@ impl Scan {
         }?;
         // Keep commit removes through replay so they cancel older adds before selecting live files.
         let commits = planner.commit_actions(base_version)?;
-        planner
+        let plan = planner
             .replay_actions(commits, checkpoint)?
             .project_patch(|patch| patch.drop(VERSION))?
-            .build_opt()
+            .build_opt()?;
+        if let Some(plan) = &plan {
+            ScanPlanGenerationCompleted::update(|event| {
+                for node in &plan.nodes {
+                    let Operator::ScanJson(scan) = &node.op else {
+                        continue;
+                    };
+                    for file in &scan.files {
+                        let Some(path) = ParsedLogPath::new(file.meta.location.clone()) else {
+                            continue;
+                        };
+                        let end = match path.file_type {
+                            LogPathFileType::Commit | LogPathFileType::StagedCommit => path.version,
+                            LogPathFileType::CompactedCommit { hi } => {
+                                event.compaction_file_count += 1;
+                                hi
+                            }
+                            _ => continue,
+                        };
+                        event.commit_start_version = Some(
+                            event
+                                .commit_start_version
+                                .unwrap_or(path.version)
+                                .min(path.version),
+                        );
+                        event.commit_end_version =
+                            Some(event.commit_end_version.unwrap_or(end).max(end));
+                        event.commit_total_size_bytes =
+                            event.commit_total_size_bytes.saturating_add(file.meta.size);
+                    }
+                }
+            });
+        }
+        Ok(plan)
     }
 
     #[cfg(test)]

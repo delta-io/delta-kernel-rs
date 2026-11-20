@@ -1,10 +1,23 @@
 //! Observations from declarative scan-plan generation.
 
+use std::fmt;
 use std::sync::Arc;
 
+use super::MetricId;
 use crate::Version;
 use crate::checkpoint::CheckpointInfo;
 use crate::scan::{PartitionValuesOptions, StatsOptions};
+
+/// Result of one scan-plan-generation attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanPlanOutcome {
+    /// A metadata plan was produced.
+    Plan,
+    /// No metadata plan was needed.
+    Empty,
+    /// Planning failed.
+    Error,
+}
 
 /// Starting state selected before replaying newer commits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,4 +88,83 @@ pub struct MetadataPlanningReport {
     pub total_json_bytes: u64,
     /// Combined size of the selected Parquet inputs.
     pub total_parquet_bytes: u64,
+}
+
+/// Metrics collected during declarative scan-plan generation, including partial state on error.
+#[derive(Debug, Clone)]
+pub struct ScanPlanReport {
+    /// Identity of this planning attempt.
+    pub operation_id: MetricId,
+    /// Caller-supplied correlation identity.
+    pub correlation_id: Option<Arc<str>>,
+    /// Terminal planning result.
+    pub outcome: ScanPlanOutcome,
+    /// Wall-clock planning duration.
+    pub duration_ns: u64,
+    /// Checkpoint used for replay, absent for CRC and commit-only replay.
+    pub checkpoint: Option<CheckpointMetrics>,
+    /// Metadata planning metrics.
+    pub metadata_planning: MetadataPlanningReport,
+}
+
+impl ScanPlanReport {
+    pub(crate) const SPAN_NAME: &str = "scan.plan_generation_completed";
+
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn new() -> Self {
+        Self {
+            operation_id: MetricId::new(),
+            correlation_id: None,
+            outcome: ScanPlanOutcome::Error,
+            duration_ns: 0,
+            checkpoint: None,
+            metadata_planning: MetadataPlanningReport::default(),
+        }
+    }
+}
+
+impl fmt::Display for ScanPlanReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "ScanPlanReport(operation_id={}, outcome={:?}, duration_ns={}, \
+             replay_base={:?}, base_version={:?}, has_filter={}, read_collations={}, \
+             commit_start_version={:?}, commit_end_version={:?}, \
+             commit_total_size_bytes={}, compaction_file_count={}",
+            self.operation_id,
+            self.outcome,
+            self.duration_ns,
+            self.metadata_planning.replay_base,
+            self.metadata_planning.base_version,
+            self.metadata_planning.has_filter,
+            self.metadata_planning.read_collations,
+            self.metadata_planning.commit_start_version,
+            self.metadata_planning.commit_end_version,
+            self.metadata_planning.commit_total_size_bytes,
+            self.metadata_planning.compaction_file_count
+        )?;
+        if let Some(checkpoint) = &self.checkpoint {
+            write!(
+                f,
+                ", checkpoint_version={}, source={:?}, root_footer_calls={}, \
+                 sidecar_footer_calls={}, metadata_query_calls={}, checkpoint_duration_ns={}",
+                checkpoint.version,
+                checkpoint.source,
+                checkpoint.root_footer_calls,
+                checkpoint.sidecar_footer_calls,
+                checkpoint.metadata_query_calls,
+                checkpoint.duration_ns
+            )?;
+            if let Some(info) = &checkpoint.info {
+                write!(
+                    f,
+                    ", checkpoint_type={:?}, leaf_files={}, checkpoint_bytes={}",
+                    info.checkpoint_type(),
+                    info.leaf_file_count(),
+                    info.size_in_bytes()
+                )?;
+            }
+        }
+        f.write_str(")")
+    }
 }

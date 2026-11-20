@@ -20,6 +20,7 @@ use crate::engine::arrow_conversion::TryIntoArrow as _;
 use crate::engine::arrow_data::EngineDataArrowExt as _;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{Predicate as Pred, column_name, expr};
+use crate::metrics::{ReplayBase, ScanPlanOutcome};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::object_store::ObjectStoreExt as _;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -33,7 +34,7 @@ use crate::scan::{PartitionValuesOptions, Scan, StatsOptions, StructStats};
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
     commit_files, create_adaptive_metadata_table,
 };
-use crate::unit_test_utils::load_test_table;
+use crate::unit_test_utils::{assert_scan_plan_metrics, load_test_table};
 use crate::{Engine, Error, KernelResult, PredicateRef, Result, Snapshot, Version};
 
 // Normalizes metadata for comparison: the imperative path splits fields between the data batch
@@ -577,14 +578,40 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
         let snapshot = Snapshot::builder_for(latest.table_root().clone())
             .at_version(version)
             .build(engine.as_ref())?;
+        let snapshot = Arc::new(Snapshot::new(
+            snapshot.log_segment().clone(),
+            snapshot.table_configuration().clone(),
+        )?);
         let scan = snapshot
             .scan_builder()
-            .with_stats(stats)
-            .with_partition_values(partition_values)
+            .with_stats(stats.clone())
+            .with_partition_values(partition_values.clone())
+            .with_correlation_id("scan-plan-test")
             .build()?;
-        let plan = scan
-            .declarative_metadata_scan_plan(engine.as_ref())?
-            .expect("metadata plan");
+        let plan = assert_scan_plan_metrics(
+            || scan.declarative_metadata_scan_plan(engine.as_ref()),
+            |event| {
+                assert_eq!(event.outcome, ScanPlanOutcome::Plan);
+                assert_eq!(event.stats, stats);
+                assert_eq!(event.partition_values, partition_values);
+                assert_eq!(event.correlation_id.as_deref(), Some("scan-plan-test"));
+                assert_eq!(
+                    event.replay_base,
+                    Some(if version == 4 {
+                        ReplayBase::Empty
+                    } else {
+                        ReplayBase::Checkpoint
+                    })
+                );
+                assert_eq!(
+                    event.commit_start_version.zip(event.commit_end_version),
+                    (version == 4).then_some((0, 4))
+                );
+                assert_eq!(event.commit_total_size_bytes == 0, version != 4);
+                assert_eq!(event.checkpoint.is_some(), version == 5);
+            },
+        )?
+        .expect("metadata plan");
         let actual = engine
             .plan_executor()
             .unwrap()
@@ -1245,9 +1272,11 @@ async fn scan_compaction_selection_uses_snapshot_table_feature(
             imperative_metadata(snapshot.scan_builder().build()?, engine.as_ref()).is_err(),
             !adaptive_metadata
         );
-        let plan = scan
-            .declarative_metadata_scan_plan(engine.as_ref())?
-            .unwrap();
+        let plan = assert_scan_plan_metrics(
+            || scan.declarative_metadata_scan_plan(engine.as_ref()),
+            |event| assert_eq!(event.compaction_file_count, u64::from(!adaptive_metadata)),
+        )?
+        .unwrap();
         assert_eq!(
             plan.nodes.iter().any(|node| match &node.op {
                 Operator::ScanJson(scan) => scan.files.iter().any(|file| file
@@ -1298,12 +1327,31 @@ fn declarative_metadata_reconciles_checkpoint_with_later_commits(
     )?;
     assert_eq!(metadata_row_count(&expected), 4);
 
+    let segment = snapshot.log_segment();
+    let expected_bytes: u64 = if compact {
+        &segment.listed.ascending_compaction_files
+    } else {
+        &segment.listed.ascending_commit_files
+    }
+    .iter()
+    .filter(|file| file.version > 2)
+    .map(|file| file.location.size)
+    .sum();
     let scan = snapshot
         .scan_builder()
         .with_stats(StatsOptions::all())
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()?;
-    let plan = scan.declarative_metadata_scan_plan(&engine)?.unwrap();
+    let plan = assert_scan_plan_metrics(
+        || scan.declarative_metadata_scan_plan(&engine),
+        |event| {
+            assert_eq!(event.commit_start_version, Some(3));
+            assert_eq!(event.commit_end_version, Some(4));
+            assert_eq!(event.commit_total_size_bytes, expected_bytes);
+            assert_eq!(event.compaction_file_count, u64::from(compact));
+        },
+    )?
+    .unwrap();
     assert_eq!(
         plan.nodes.iter().any(|node| match &node.op {
             Operator::ScanJson(scan) =>
@@ -1443,9 +1491,16 @@ fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> Resu
     let scan = snapshot.clone().scan_builder().build()?;
 
     let no_plan_engine = DelegatingEngine::new(sync_engine).without_plan_executor();
-    let err = scan
-        .declarative_metadata_scan_plan(&no_plan_engine)
-        .unwrap_err();
+    let err = assert_scan_plan_metrics(
+        || scan.declarative_metadata_scan_plan(&no_plan_engine),
+        |event| {
+            assert_eq!(event.outcome, ScanPlanOutcome::Error);
+            let checkpoint = event.checkpoint.as_ref().unwrap();
+            assert!(checkpoint.info.is_none());
+            assert_eq!(checkpoint.cache_hit, Some(false));
+        },
+    )
+    .unwrap_err();
 
     assert!(matches!(err, KernelError::Unsupported(_)));
 
@@ -1454,8 +1509,15 @@ fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> Resu
         .with_predicate(Arc::new(Pred::FALSE))
         .build()?;
     assert!(
-        scan.declarative_metadata_scan_plan(&no_plan_engine)?
-            .is_none()
+        assert_scan_plan_metrics(
+            || scan.declarative_metadata_scan_plan(&no_plan_engine),
+            |event| {
+                assert_eq!(event.outcome, ScanPlanOutcome::Empty);
+                assert!(event.replay_base.is_none());
+                assert!(event.checkpoint.is_none());
+            },
+        )?
+        .is_none()
     );
     assert!(scan.snapshot.cached_checkpoint_info().is_none());
     Ok(())

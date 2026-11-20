@@ -92,6 +92,32 @@ impl CapturingReporter {
     }
 }
 
+/// Checks the single scan-plan completion emitted by a test operation.
+#[cfg(feature = "declarative-plans")]
+pub(crate) fn assert_scan_plan_metrics<T>(
+    generate: impl FnOnce() -> T,
+    check: impl FnOnce(&crate::metrics::ScanPlanGenerationCompleted),
+) -> T {
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    let result = generate();
+    let events = reporter.events();
+    let reports: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            MetricEvent::ScanPlanGenerationCompleted(event) => Some(event),
+            _ => None,
+        })
+        .collect();
+    let [event] = reports.as_slice() else {
+        panic!("expected one scan-plan report: {events:?}")
+    };
+    assert_ne!(event.operation_id, crate::metrics::MetricId::nil());
+    assert!(event.duration_ns > 0);
+    check(event);
+    result
+}
+
 /// Whether an event reports storage listing, copying, or a storage, JSON, or Parquet read.
 pub(crate) fn is_io_event(event: &MetricEvent) -> bool {
     match event {
@@ -100,7 +126,6 @@ pub(crate) fn is_io_event(event: &MetricEvent) -> bool {
         | MetricEvent::StorageCopyCompleted(_)
         | MetricEvent::JsonReadCompleted(_)
         | MetricEvent::ParquetReadCompleted(_) => true,
-        #[cfg(feature = "declarative-plans")]
         MetricEvent::ScanPlanGenerationCompleted(_) => false,
         MetricEvent::LogSegmentLoadSuccess(_)
         | MetricEvent::LogSegmentLoadFailure(_)
