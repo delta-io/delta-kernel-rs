@@ -1044,7 +1044,8 @@ mod tests {
         // A fully-populated action: every element kind, both sidecar `type`s.
         let action = CheckpointAction {
             version: 7,
-            content_root: ContentRoot::new("s3://bucket/manifest".to_string(), 512, 5),
+            content_root: ContentRoot::new("s3://bucket/manifest".to_string(), 512, 5)
+                .with_commit_timestamp(1_700_000_000_000),
             protocol: Protocol::new_unchecked(1, 2, None, None),
             metadata: Metadata::default(),
             transactions: vec![SetTransaction {
