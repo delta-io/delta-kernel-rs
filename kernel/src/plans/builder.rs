@@ -49,7 +49,7 @@ use super::ir::nodes::{
 };
 use super::ir::plan::{Plan, PlanNode};
 use crate::expressions::{ColumnName, Expression, ExpressionRef, PredicateRef, Scalar, StructData};
-use crate::schema::compare::{data_types_equal_ordered, fields_equal_ignoring_metadata};
+use crate::schema::compare::fields_equal_ignoring_metadata;
 use crate::schema::{SchemaRef, ToSchema};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::utils::CollectInto;
@@ -385,9 +385,7 @@ impl PlanBuilder {
                 let field = stats
                     .agg
                     .output_field(&input.schema, Some(stats.name.clone()))?;
-                if &field != output
-                    || !data_types_equal_ordered(field.data_type(), output.data_type())
-                {
+                if &field != output {
                     return Err(KernelError::schema(
                         "WriteParquet statistics must match every input",
                     ));

@@ -25,12 +25,6 @@ use std::collections::{HashMap, HashSet};
 use super::{DataType, StructField, StructType};
 use crate::utils::require;
 
-/// Exact type equality, including nested field order.
-#[cfg(feature = "declarative-plans")]
-pub(crate) fn data_types_equal_ordered(left: &DataType, right: &DataType) -> bool {
-    left == right && data_types_equal_ignoring_metadata(left, right)
-}
-
 /// Compares field names, nullability, and ordered types, ignoring field metadata recursively.
 #[cfg(feature = "declarative-plans")]
 pub(crate) fn fields_equal_ignoring_metadata(left: &StructField, right: &StructField) -> bool {
