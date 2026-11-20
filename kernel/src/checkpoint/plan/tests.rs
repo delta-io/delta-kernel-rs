@@ -21,6 +21,7 @@ use crate::arrow::compute::{cast, filter_record_batch, is_not_null, is_null, or}
 use crate::arrow::datatypes::Int64Type;
 use crate::arrow::record_batch::RecordBatch;
 use crate::checkpoint::{CheckpointSpec, V2CheckpointConfig};
+use crate::engine::DelegatingEngine;
 use crate::engine::arrow_conversion::TryFromArrow as _;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use crate::engine::arrow_utils::parse_json_impl;
