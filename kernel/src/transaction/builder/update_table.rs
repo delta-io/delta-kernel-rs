@@ -1083,7 +1083,7 @@ mod tests {
 
     #[test]
     fn with_table_properties_removed_unsets_user_property_and_keeps_protocol() -> Result<()> {
-        let engine = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let engine = Arc::new(SyncEngine::in_memory());
         let snapshot = create_table("memory:///", test_schema_flat(), "test-engine", true)
             .with_table_properties([
                 ("app.owner", "kernel"),
@@ -1158,7 +1158,7 @@ mod tests {
 
     #[test]
     fn with_table_properties_removed_skips_absent_keys_on_write() -> Result<()> {
-        let engine = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let engine = Arc::new(SyncEngine::in_memory());
         let snapshot = create_table("memory:///", test_schema_flat(), "test-engine", true)
             .with_table_properties([("app.owner", "kernel"), ("app.team", "delta")])
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
@@ -1212,7 +1212,7 @@ mod tests {
 
     #[test]
     fn with_table_properties_removed_accumulates_across_calls() -> Result<()> {
-        let engine = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let engine = Arc::new(SyncEngine::in_memory());
         let snapshot = create_table("memory:///", test_schema_flat(), "test-engine", true)
             .with_table_properties([
                 ("app.owner", "kernel"),
