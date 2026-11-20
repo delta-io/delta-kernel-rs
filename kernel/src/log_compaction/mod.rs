@@ -143,7 +143,7 @@ impl Snapshot {
                             .collect(),
                         latest_commit_file: commits_to_compact.last().cloned(),
                         max_published_version: commits_to_compact.last().map(|file| file.version),
-                        // CRCs describe full snapshots, not an interval.
+                        // CRCs do not contribute to log compaction.
                         ..Default::default()
                     },
                     source.log_root.clone(),
