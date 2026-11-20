@@ -1783,6 +1783,11 @@ impl ContentRoot {
             ..self
         }
     }
+
+    /// When the root manifest was committed, in milliseconds since the Unix epoch, if recorded.
+    pub(crate) fn commit_timestamp(&self) -> Option<i64> {
+        self.commit_timestamp
+    }
 }
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
