@@ -6,12 +6,11 @@ ensure that they are acting as a "connector" for the kernel APIs, thereby
 allowing us to test the exact same engine interfaces that any connector
 implemented on top of delta-kernel-rs would be using.
 
-Checkpoint specs write into temporary copies of their tables. With the
-`declarative-plans` feature, one plan reconstructs and writes V1 or sidecar-based V2
-checkpoints and computes all `_last_checkpoint` inputs. Kernel generates the hint bytes
-from the complete result. Other builds use `Snapshot::checkpoint`. After removing older JSON commits, the runner compares
-all checkpoint actions and companion reads with the source table. Snapshot specs
-validate protocol, metadata, transaction versions, and domain metadata expectations.
+Checkpoint specs use `Snapshot::checkpoint` on temporary copies of their tables. With the
+`declarative-plans` feature, a plan-backed engine writes V1 or sidecar-based V2 checkpoints
+and publishes the complete `_last_checkpoint` hint. After removing older JSON commits, the
+runner compares all checkpoint actions and companion reads with the source table. Snapshot
+specs validate protocol, metadata, transaction versions, and domain metadata expectations.
 
 ## Authoring a DAT case locally
 
