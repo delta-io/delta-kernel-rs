@@ -127,6 +127,32 @@ pub unsafe extern "C" fn enable_event_tracing(callback: TracingEventFn, max_leve
     setup_event_subscriber(callback, max_level).is_ok()
 }
 
+/// Changes the shared logging filter without replacing its callback or format.
+///
+/// When `enabled` is false, logging is disabled and `max_level` is ignored. Metrics and call-frame
+/// reporting retain their own filters. Returns false if the subscriber has not been initialized
+/// or the filter cannot be updated. This function does not install a logging callback.
+///
+/// Do not call this synchronously from a tracing callback: updating the filter requires exclusive
+/// access to the subscriber's logging layer.
+///
+/// `max_level` must be a valid [`Level`], including when logging is disabled.
+#[unsafe(no_mangle)]
+pub extern "C" fn set_event_tracing_level(enabled: bool, max_level: Level) -> bool {
+    let Ok(state) = TRACING_STATE.lock() else {
+        return false;
+    };
+    let Some(filter) = &state.logging_filter else {
+        return false;
+    };
+    let level = if enabled {
+        LevelFilter::from(max_level)
+    } else {
+        LevelFilter::OFF
+    };
+    filter.reload(level).is_ok()
+}
+
 pub type TracingLogLineFn = extern "C" fn(line: KernelStringSlice);
 
 /// Format to use for log lines. These correspond to the formats from [`tracing_subscriber`
@@ -722,6 +748,7 @@ pub unsafe extern "C" fn enable_frame_reporting(callback: FrameEventFn) -> bool 
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::process::Command;
 
     use tracing::field::Empty;
     use tracing::{debug, info, trace};
@@ -1193,6 +1220,65 @@ mod tests {
     fn emit_reloadable_frame_span() {
         let span = tracing::trace_span!("reloadable", enable_call_frame = Empty);
         let _guard = span.enter();
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot spawn subprocesses")]
+    fn event_tracing_level_updates_keep_frames_enabled() {
+        const CHILD: &str = "DELTA_KERNEL_LOG_LEVEL_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ffi_tracing::tests::event_tracing_level_updates_keep_frames_enabled",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        assert!(!set_event_tracing_level(true, Level::TRACE));
+        setup_event_subscriber(event_callback_with_filter_1, Level::ERROR).unwrap();
+        setup_metrics_reporter(capture_metric_event).unwrap();
+        TRACING_STATE
+            .lock()
+            .unwrap()
+            .register_frame_callback(capture_frame_event)
+            .unwrap();
+        for (enabled, level, expected) in [
+            (false, Level::ERROR, 0),
+            (true, Level::WARN, 2),
+            (true, Level::DEBUG, 4),
+            (true, Level::TRACE, 5),
+            (true, Level::ERROR, 1),
+            (false, Level::TRACE, 0),
+            (true, Level::INFO, 3),
+        ] {
+            assert!(set_event_tracing_level(enabled, level));
+            setup_events();
+            tracing::error!("Testing 1");
+            tracing::warn!("Testing 1");
+            info!("Testing 1");
+            debug!("Testing 1");
+            trace!("Testing 1");
+            with_events(|events| assert_eq!(events.unwrap().len(), expected));
+            let frames = capture_frame_events(emit_reloadable_frame_span);
+            assert_eq!(frames.len(), 2);
+            assert!(frames[0].is_open);
+            assert!(!frames[1].is_open);
+            assert_eq!(frames[0].span_id, frames[1].span_id);
+            METRIC_EVENTS.with(|events| *events.borrow_mut() = Some(vec![]));
+            delta_kernel::metrics::emit_json_read_completed(3, 100);
+            with_metric_events(|events| assert_eq!(events.unwrap(), ["json:3:100"]));
+        }
     }
 
     #[test]
