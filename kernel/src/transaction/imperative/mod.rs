@@ -320,6 +320,8 @@ impl<STATE> Transaction<STATE, Imperative> {
         write_validation::validate_add_files(
             &self.staged_data_changes.add_files_metadata,
             self.effective_table_config.physical_partition_columns(),
+            // Kernel writes `modificationTime` itself on adaptiveMetadata tables.
+            !self.is_adaptive_metadata_enabled(),
             uniqueness_validator.as_mut(),
         )?;
 

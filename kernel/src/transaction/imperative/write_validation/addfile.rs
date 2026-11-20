@@ -24,17 +24,23 @@ static ADD_FILE_COLUMNS_FOR_VALIDATION: LazyLock<ColumnNamesAndTypes> =
 static CLUSTERING_PROVIDER_COLUMNS: LazyLock<ColumnNamesAndTypes> =
     LazyLock::new(|| schema_ref! { (&ADD_FILE_CLUSTERING_PROVIDER_FIELD) }.leaves(None));
 
-/// Runs mandatory validations for every staged AddFile row. When `uniqueness_validator` is
+/// Runs mandatory validations for every staged AddFile row. A null `modificationTime` is
+/// rejected only when `require_modification_time` is set. When `uniqueness_validator` is
 /// provided, also validates file-action (addFile, removeFile) uniqueness across `adds` and the
 /// actions already in `uniqueness_validator`, and records `adds` into it.
 /// For example, this can be used to detect duplicates between addFile and removeFile actions.
 pub(crate) fn validate_add_files(
     adds: &[Box<dyn EngineData>],
     physical_partition_columns: impl IntoIterator<Item = String>,
+    require_modification_time: bool,
     uniqueness_validator: Option<&mut FileActionUniquenessValidator>,
 ) -> KernelResult<()> {
-    StagedDataValidator::for_add_files(physical_partition_columns, uniqueness_validator)
-        .validate_batches(adds)
+    StagedDataValidator::for_add_files(
+        physical_partition_columns,
+        require_modification_time,
+        uniqueness_validator,
+    )
+    .validate_batches(adds)
 }
 
 // TODO(#3757): Merge this validation into StagedDataValidator::for_add_files.
@@ -58,11 +64,13 @@ impl<'a> StagedDataValidator<'a> {
     /// Creates a validator that validates every staged add-file row.
     fn for_add_files(
         physical_partition_columns: impl IntoIterator<Item = String>,
+        require_modification_time: bool,
         uniqueness_validator: Option<&'a mut FileActionUniquenessValidator>,
     ) -> Self {
         let mut validations: Vec<Box<dyn Validation + 'a>> =
             vec![Box::new(MandatoryAddFileValidation {
                 physical_partition_columns: physical_partition_columns.into_iter().collect(),
+                require_modification_time,
             })];
         if let Some(uniqueness_validator) = uniqueness_validator {
             validations.push(Box::new(AddFileUniquenessValidation {
@@ -78,7 +86,8 @@ impl<'a> StagedDataValidator<'a> {
 /// Validates required-field existence and that each row's `partitionValues` keys match the table's
 /// physical partition columns.
 ///
-/// Required fields: `path`, `partitionValues`, `size`, `modificationTime`, and `dataChange`.
+/// Required fields: `path`, `partitionValues`, `size`, `modificationTime` (when
+/// `require_modification_time` is set), and `dataChange`.
 /// Optional fields: `stats`, `tags`, `deletionVector`, `baseRowId`,
 /// `defaultRowCommitVersion`, and `clusteringProvider`.
 ///
@@ -87,6 +96,7 @@ impl<'a> StagedDataValidator<'a> {
 /// TODO(#2869): Add intent-based validation for dataChange.
 struct MandatoryAddFileValidation {
     physical_partition_columns: HashSet<String>,
+    require_modification_time: bool,
 }
 
 // TODO(#3112): Share required AddFile validation with DV updates.
@@ -119,11 +129,13 @@ impl Validation for MandatoryAddFileValidation {
                 "AddFile for '{path}' has negative size {size}; size must be non-negative"
             )));
         }
-        validate_required_field_exist::<i64>(
-            getters[MODIFICATION_TIME].get_opt(row, "modificationTime")?,
-            path,
-            "modificationTime",
-        )?;
+        if self.require_modification_time {
+            validate_required_field_exist::<i64>(
+                getters[MODIFICATION_TIME].get_opt(row, "modificationTime")?,
+                path,
+                "modificationTime",
+            )?;
+        }
         Ok(())
     }
 }
@@ -192,6 +204,7 @@ mod tests {
         super::validate_add_files(
             adds,
             physical_partition_columns.iter().map(|s| s.to_string()),
+            true, // require_modification_time
             Some(&mut uniqueness_validator),
         )
     }
@@ -239,8 +252,12 @@ mod tests {
         }
 
         assert_result_error_with_message(
-            StagedDataValidator::for_add_files(std::iter::empty(), Some(&mut uniqueness_validator))
-                .validate_batches(&adds),
+            StagedDataValidator::for_add_files(
+                std::iter::empty(),
+                true, // require_modification_time
+                Some(&mut uniqueness_validator),
+            )
+            .validate_batches(&adds),
             "multiple AddFile actions",
         );
     }
@@ -278,6 +295,29 @@ mod tests {
             validate_add_files_unique(&[] /* physical_partition_columns */, &adds),
             &format!("missing required field '{field}'"),
         );
+    }
+
+    /// Without `require_modification_time`, only a null `modificationTime` is accepted.
+    #[rstest]
+    #[case::modification_time("modificationTime", None)]
+    #[case::path("path", Some("missing required field 'path'"))]
+    #[case::partition_values("partitionValues", Some("missing required field 'partitionValues'"))]
+    #[case::size("size", Some("missing required field 'size'"))]
+    fn null_field_when_modification_time_not_required(
+        #[case] field: &str,
+        #[case] expected_error: Option<&str>,
+    ) {
+        let batch = set_field_as_null(&nullable_add_file("dummy"), field, 0);
+        let result = super::validate_add_files(
+            &as_engine_data(batch),
+            std::iter::empty(),
+            false, // require_modification_time
+            None,
+        );
+        match expected_error {
+            Some(message) => assert_result_error_with_message(result, message),
+            None => result.unwrap(),
+        }
     }
 
     #[rstest]

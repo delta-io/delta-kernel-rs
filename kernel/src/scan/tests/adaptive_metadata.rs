@@ -17,7 +17,7 @@ use crate::content_tree::test_utils::{
     x_stats,
 };
 use crate::content_tree::{ContentTreeNodeEntry, TrackingInfo, TrackingStatus};
-use crate::engine::arrow_data::EngineDataArrowExt as _;
+use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{Predicate as Pred, Scalar, col, lit};
 use crate::scan::state::ScanFile;
@@ -26,14 +26,14 @@ use crate::schema::{SchemaRef, StructType, schema_ref};
 use crate::table_features::ColumnMappingMode;
 use crate::transaction::BASE_ADD_FILES_SCHEMA;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
-    checkpoint_action_with_root, commit_file_changes, commit_files, commit_info_line,
-    commit_root_manifest, commit_root_manifest_file, create_adaptive_metadata_table,
-    protocol_and_metadata_lines, setup_adaptive_metadata_table, write_commit,
-    write_commit_after_manifest_commit, write_manifest_commit_keeping_pm,
+    add_files_metadata, checkpoint_action_with_root, commit_file_changes, commit_files,
+    commit_info_line, commit_root_manifest, commit_root_manifest_file,
+    create_adaptive_metadata_table, protocol_and_metadata_lines, setup_adaptive_metadata_table,
+    write_commit, write_commit_after_manifest_commit, write_manifest_commit_keeping_pm,
 };
 use crate::unit_test_utils::{
-    assert_result_error_with_message, parse_json_batch, string_array_to_engine_data,
-    test_schema_flat_with_column_mapping,
+    assert_result_error_with_message, parse_json_batch, set_field_as_null,
+    string_array_to_engine_data, test_schema_flat_with_column_mapping,
 };
 use crate::{Engine, EngineData, FileMeta, KernelResult, Snapshot, Version};
 
@@ -117,12 +117,14 @@ fn scan_modification_times(engine: &SyncEngine, snapshot: Arc<Snapshot>) -> Vec<
 }
 
 /// A log add on an adaptiveMetadata table carries its own commit's In-Commit Timestamp in place of
-/// the connector's `modificationTime` (the fixture's `1`), including after a manifest commit. A
-/// previous commit with a future In-Commit Timestamp makes that value differ from the wall clock.
+/// the connector's `modificationTime` (the fixture's `1`, or null), including after a manifest
+/// commit. A previous commit with a future In-Commit Timestamp makes that value differ from the
+/// wall clock.
 #[rstest]
 fn log_adds_report_their_commit_timestamp(
     #[values(false, true)] after_manifest_commit: bool,
     #[values(false, true)] future_previous_ict: bool,
+    #[values(false, true)] null_connector_value: bool,
 ) {
     const FUTURE_ICT: i64 = 4_000_000_000_000;
     let (engine, _) = setup_adaptive_metadata_table();
@@ -142,7 +144,12 @@ fn log_adds_report_their_commit_timestamp(
         )
         .unwrap();
     }
-    let version = commit_files(&engine, &table_root(), &["c.parquet"], &[]);
+    let mut adds = add_files_metadata(&["c.parquet"]);
+    if null_connector_value {
+        adds = set_field_as_null(&adds, "modificationTime", 0);
+    }
+    let adds: Box<dyn EngineData> = Box::new(ArrowEngineData::new(adds));
+    let version = commit_file_changes(&engine, &table_root(), Some(adds), &[]);
     let snapshot = snapshot_at(&engine, version);
     let ict = snapshot
         .reader()
