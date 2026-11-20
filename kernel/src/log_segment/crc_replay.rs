@@ -807,10 +807,15 @@ mod tests {
     use test_utils::{LoggingTest, add_commit, assert_result_error_with_message};
 
     use super::*;
+    use crate::committer::FileSystemCommitter;
     use crate::crc::{DomainMetadataState, FileStats, FileStatsState, SetTransactionState};
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
+    use crate::schema::schema_ref;
+    use crate::snapshot::Snapshot;
     use crate::table_features::TableFeature;
+    use crate::transaction::UpdateTableOperation;
+    use crate::transaction::create_table::create_table;
 
     impl CrcReplayAccumulator {
         /// [`Self::on_commit_info`] for a commitInfo row without a `lastManifestCommit`.
@@ -1448,43 +1453,39 @@ mod tests {
         }
     }
 
-    // Each commit after version 0 sets the shared `app` / `d` and its own per-version entries, so
-    // the delta shows both which commits were replayed and that the newest one wins.
-    #[tokio::test]
-    async fn build_crc_delta_from_base_replays_only_commits_after_the_base() {
-        let store = Arc::new(InMemory::new());
-        let engine = SyncEngine::new_with_store(store.clone());
+    // Each commit after the table's creation sets the shared `app` / `d` and its own per-version
+    // entries, so the delta shows both which commits were replayed and that the newest one wins.
+    #[test]
+    fn build_crc_delta_from_base_replays_only_commits_after_the_base() {
+        let engine = SyncEngine::in_memory();
         let root = "memory:///t/";
-        add_commit(root, store.as_ref(), 0, r#"
-{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":[],"writerFeatures":["domainMetadata"]}}
-{"metaData":{"id":"id-0","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{},"createdTime":0}}
-"#.to_string()).await.unwrap();
+        create_table(root, schema_ref! { nullable "id": INTEGER }, "test", true)
+            .with_table_properties([("delta.feature.domainMetadata", "supported")])
+            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .unwrap()
+            .commit(&engine)
+            .unwrap()
+            .unwrap_committed();
         for version in 1..=3 {
-            let actions = [
-                format!(r#"{{"txn":{{"appId":"app","version":{version}}}}}"#),
-                format!(r#"{{"txn":{{"appId":"app-v{version}","version":{version}}}}}"#),
-                format!(
-                    r#"{{"domainMetadata":{{"domain":"d","configuration":"{version}","removed":false}}}}"#
-                ),
-                format!(
-                    r#"{{"domainMetadata":{{"domain":"d-v{version}","configuration":"{version}","removed":false}}}}"#
-                ),
-            ];
-            add_commit(root, store.as_ref(), version, actions.join("\n"))
-                .await
-                .unwrap();
+            Snapshot::builder_for(root)
+                .build(&engine)
+                .unwrap()
+                .update_table(UpdateTableOperation::Write, "test", true)
+                .with_transaction_id("app", version)
+                .with_transaction_id(format!("app-v{version}"), version)
+                .with_domain_metadata("d", version.to_string())
+                .with_domain_metadata(format!("d-v{version}"), version.to_string())
+                .build(&engine, Box::new(FileSystemCommitter::new()))
+                .unwrap()
+                .commit(&engine)
+                .unwrap()
+                .unwrap_committed();
         }
-        let log_root = url::Url::parse(root).unwrap().join("_delta_log/").unwrap();
-        let segment = LogSegment::for_snapshot_impl(
-            engine.storage_handler().as_ref(),
-            log_root,
-            vec![],
-            None,
-            Some(3),
-        )
-        .unwrap();
+        let snapshot = Snapshot::builder_for(root).build(&engine).unwrap();
 
-        let delta = segment.build_crc_delta_from_base(&engine, 1, None).unwrap();
+        let delta = (snapshot.log_segment())
+            .build_crc_delta_from_base(&engine, 1, None)
+            .unwrap();
 
         let txns: HashMap<_, _> = (delta.set_transactions.iter())
             .map(|(app_id, txn)| (app_id.as_str(), txn.version))
