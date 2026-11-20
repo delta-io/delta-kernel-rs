@@ -23,8 +23,8 @@ use crate::{KernelError, Version};
 mod config;
 mod deserialize;
 pub(crate) use config::{
-    is_delta_property_key, is_table_feature_signal_key, strip_table_feature_signal_prefix,
-    validate_and_normalize_property_for_create, validate_and_normalize_property_for_update,
+    is_table_feature_signal_key, strip_table_feature_signal_prefix,
+    validate_and_normalize_properties_for_create, validate_and_normalize_property_batch_for_update,
     validate_log_and_deleted_file_retention, validate_retention_for_property_adds,
 };
 pub use deserialize::ParseIntervalError;

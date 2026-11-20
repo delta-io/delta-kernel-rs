@@ -1,6 +1,6 @@
 //! Builder for transactions against an existing table.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use delta_kernel_derive::internal_api;
@@ -17,8 +17,7 @@ use crate::table_features::{
     validate_iceberg_compat_if_needed,
 };
 use crate::table_properties::{
-    is_delta_property_key, validate_and_normalize_property_for_update,
-    validate_retention_for_property_adds,
+    validate_and_normalize_property_batch_for_update, validate_retention_for_property_adds,
 };
 use crate::transaction::domain_metadata::validate_unique_domains;
 use crate::transaction::schema_evolution::{SchemaOperation, evolve_table_config};
@@ -536,19 +535,8 @@ fn validate_and_canonicalize_properties_added(
 ) -> KernelResult<HashMap<String, String>> {
     let mut validated = HashMap::new();
     for batch in properties_added {
-        let mut seen_delta_keys = HashSet::new();
-        for (key, _) in batch {
-            if is_delta_property_key(key) && !seen_delta_keys.insert(key.to_ascii_lowercase()) {
-                return Err(KernelError::invalid_transaction_state(format!(
-                    "Conflicting spellings of table property '{key}' in the same request"
-                )));
-            }
-        }
-        for (key, value) in batch {
-            let (canonical_key, value) =
-                validate_and_normalize_property_for_update(key.clone(), value.clone())?;
-            validated.insert(canonical_key, value);
-        }
+        let batch = validate_and_normalize_property_batch_for_update(batch.iter().cloned())?;
+        validated.extend(batch);
     }
     Ok(validated)
 }
