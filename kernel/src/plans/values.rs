@@ -1,6 +1,6 @@
 //! Materializes engine batches as struct rows through existing leaf getters.
 
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use crate::engine_data::{EngineData, GetData, RowVisitor};
 use crate::expressions::{ArrayData, MapData, Scalar, StructData};
@@ -10,27 +10,56 @@ use crate::{KernelError, KernelResult};
 pub(super) fn read_struct(
     batch: &dyn EngineData,
     schema: &SchemaRef,
-) -> KernelResult<Vec<StructData>> {
+    path: &mut ColumnName,
+    nulls: Option<&[bool]>,
+) -> KernelResult<Vec<Option<StructData>>> {
     let mut rows: Vec<Vec<Scalar>> = (0..batch.len())
         .map(|_| Vec::with_capacity(schema.num_fields()))
         .collect();
     for field in schema.fields() {
-        let mut visitor = ColumnVisitor {
-            field,
-            values: Vec::new(),
+        path.path_mut().push(field.name().clone());
+        let values = if let DataType::Struct(children) = field.data_type() {
+            let child_nulls = batch.is_null(path)?;
+            read_struct(
+                batch,
+                &Arc::new(children.as_ref().clone()),
+                path,
+                Some(&child_nulls),
+            )?
+            .into_iter()
+            .map(|row| match row {
+                Some(row) => Scalar::Struct(row),
+                None => Scalar::Null(field.data_type().clone()),
+            })
+            .collect()
+        } else {
+            let mut visitor = ColumnVisitor {
+                field,
+                nulls,
+                values: Vec::new(),
+            };
+            batch.visit_rows(std::slice::from_ref(path), &mut visitor)?;
+            visitor.values
         };
-        batch.visit_rows(&[ColumnName::new([field.name()])], &mut visitor)?;
-        for (row, value) in rows.iter_mut().zip(visitor.values) {
+        path.path_mut().pop();
+        for (row, value) in rows.iter_mut().zip(values) {
             row.push(value);
         }
     }
     rows.into_iter()
-        .map(|values| StructData::try_new(schema.clone(), values))
+        .enumerate()
+        .map(|(index, values)| {
+            nulls
+                .is_none_or(|nulls| !nulls[index])
+                .then(|| StructData::try_new(schema.clone(), values))
+                .transpose()
+        })
         .collect()
 }
 
 struct ColumnVisitor<'a> {
     field: &'a StructField,
+    nulls: Option<&'a [bool]>,
     values: Vec<Scalar>,
 }
 
@@ -68,7 +97,13 @@ impl RowVisitor for ColumnVisitor<'_> {
             ));
         };
         self.values = (0..row_count)
-            .map(|row| read_scalar(*getter, row, self.field))
+            .map(|row| {
+                if self.nulls.is_none_or(|nulls| !nulls[row]) {
+                    read_scalar(*getter, row, self.field)
+                } else {
+                    Ok(Scalar::Null(self.field.data_type().clone()))
+                }
+            })
             .collect::<KernelResult<_>>()?;
         Ok(())
     }
@@ -93,6 +128,12 @@ pub(super) fn ensure_supported(field: &StructField) -> KernelResult<()> {
             map.key_type() == &DataType::STRING
                 && map.value_type() == &DataType::STRING
                 && !map.value_contains_null()
+        }
+        DataType::Struct(fields) => {
+            for field in fields.fields() {
+                ensure_supported(field)?;
+            }
+            true
         }
         _ => false,
     };

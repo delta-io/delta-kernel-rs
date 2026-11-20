@@ -155,7 +155,8 @@ pub trait PlanExecutorExt: PlanExecutor {
     /// count. All batches are materialized before cardinality checks or Rust decoding. The plan's
     /// schema must equal the requested schema, including field nullability and metadata.
     ///
-    /// Supports numbers, booleans, strings, binary, dates, string lists, and string maps.
+    /// Supports numbers, booleans, strings, binary, dates, string lists, string maps, and nested
+    /// structs. A null struct masks its children, including their required fields.
     /// String-list source schemas must declare non-null elements; batches are also checked.
     /// Required nulls and null string-list elements return errors. Null map entries are dropped;
     /// duplicate-key results are unspecified. Other collections, decimals, and timestamps are
@@ -171,10 +172,14 @@ pub trait PlanExecutorExt: PlanExecutor {
                 plan.schema
             )));
         }
+        let mut path = ColumnName::default();
         let rows = self
             .execute_plan(plan)?
             .into_data()?
-            .map(|batch| values::read_struct(batch?.as_ref(), schema))
+            .map(|batch| {
+                values::read_struct(batch?.as_ref(), schema, &mut path, None)
+                    .map(|rows| rows.into_iter().flatten())
+            })
             .flatten_ok()
             .collect::<KernelResult<_>>()?;
         T::collect_into(rows)
