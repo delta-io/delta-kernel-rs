@@ -716,11 +716,11 @@ fn correlation_id_slice(correlation_id: Option<&str>) -> KernelStringSlice {
     }
 }
 
-impl MetricEvent {
-    /// Invoke the callback while all borrowed FFI records and nested storage are alive.
-    pub(crate) fn from_kernel(event: &kernel::MetricEvent, f: impl FnOnce(Self)) {
+/// Invoke `f` while the FFI event and all nested backing storage are alive.
+pub(crate) fn with_ffi_event(event: &kernel::MetricEvent, f: impl FnOnce(MetricEvent)) {
+    let event = {
         use kernel::MetricEvent as K;
-        let event = match event {
+        match event {
             K::ScanPlanGenerationCompleted(event) => return scan_plan::with_event(event, f),
             K::LogSegmentLoadSuccess(kernel::LogSegmentLoadSuccess {
                 operation_id,
@@ -732,7 +732,7 @@ impl MetricEvent {
                 num_compaction_files,
                 crc_versions_behind,
                 duration,
-            }) => Self::LogSegmentLoadSuccess(LogSegmentLoadSuccess {
+            }) => MetricEvent::LogSegmentLoadSuccess(LogSegmentLoadSuccess {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
@@ -751,7 +751,7 @@ impl MetricEvent {
                 table_type,
                 load_type,
                 duration,
-            }) => Self::LogSegmentLoadFailure(LogSegmentLoadFailure {
+            }) => MetricEvent::LogSegmentLoadFailure(LogSegmentLoadFailure {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
@@ -765,7 +765,7 @@ impl MetricEvent {
                 load_type,
                 source,
                 duration,
-            }) => Self::ProtocolMetadataLoadSuccess(ProtocolMetadataLoadSuccess {
+            }) => MetricEvent::ProtocolMetadataLoadSuccess(ProtocolMetadataLoadSuccess {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
@@ -779,7 +779,7 @@ impl MetricEvent {
                 table_type,
                 load_type,
                 duration,
-            }) => Self::ProtocolMetadataLoadFailure(ProtocolMetadataLoadFailure {
+            }) => MetricEvent::ProtocolMetadataLoadFailure(ProtocolMetadataLoadFailure {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
@@ -793,7 +793,7 @@ impl MetricEvent {
                 load_type,
                 version,
                 duration,
-            }) => Self::SnapshotBuildSuccess(SnapshotBuildSuccess {
+            }) => MetricEvent::SnapshotBuildSuccess(SnapshotBuildSuccess {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
@@ -807,7 +807,7 @@ impl MetricEvent {
                 table_type,
                 load_type,
                 duration,
-            }) => Self::SnapshotBuildFailure(SnapshotBuildFailure {
+            }) => MetricEvent::SnapshotBuildFailure(SnapshotBuildFailure {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
@@ -835,7 +835,7 @@ impl MetricEvent {
                     Some(o) => kernel_string_slice!(o),
                     None => KernelStringSlice::empty(),
                 };
-                Self::TransactionCommitSuccess(TransactionCommitSuccess {
+                MetricEvent::TransactionCommitSuccess(TransactionCommitSuccess {
                     operation_id: (*operation_id).into(),
                     correlation_id: correlation_id_slice(correlation_id.as_deref()),
                     table_type: (*table_type).into(),
@@ -858,7 +858,7 @@ impl MetricEvent {
                 correlation_id,
                 table_type,
                 reason,
-            }) => Self::TransactionCommitFailure(TransactionCommitFailure {
+            }) => MetricEvent::TransactionCommitFailure(TransactionCommitFailure {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
@@ -868,34 +868,34 @@ impl MetricEvent {
                 from_cache,
                 num_domains_returned,
                 duration,
-            }) => Self::DomainMetadataLoadSuccess(DomainMetadataLoadSuccess {
+            }) => MetricEvent::DomainMetadataLoadSuccess(DomainMetadataLoadSuccess {
                 from_cache: *from_cache,
                 num_domains_returned: *num_domains_returned,
                 duration_ns: duration_ns(*duration),
             }),
-            K::DomainMetadataLoadFailure => Self::DomainMetadataLoadFailure,
+            K::DomainMetadataLoadFailure => MetricEvent::DomainMetadataLoadFailure,
             K::SetTransactionLoadSuccess(kernel::SetTransactionLoadSuccess {
                 from_cache,
                 found,
                 duration,
-            }) => Self::SetTransactionLoadSuccess(SetTransactionLoadSuccess {
+            }) => MetricEvent::SetTransactionLoadSuccess(SetTransactionLoadSuccess {
                 from_cache: *from_cache,
                 found: *found,
                 duration_ns: duration_ns(*duration),
             }),
-            K::SetTransactionLoadFailure => Self::SetTransactionLoadFailure,
+            K::SetTransactionLoadFailure => MetricEvent::SetTransactionLoadFailure,
             K::CrcReadSuccess(kernel::CrcReadSuccess {
                 bytes_read,
                 duration,
-            }) => Self::CrcReadSuccess(CrcReadSuccess {
+            }) => MetricEvent::CrcReadSuccess(CrcReadSuccess {
                 bytes_read: *bytes_read,
                 duration_ns: duration_ns(*duration),
             }),
-            K::CrcReadFailure => Self::CrcReadFailure,
+            K::CrcReadFailure => MetricEvent::CrcReadFailure,
             K::LastCheckpointReadCompleted(kernel::LastCheckpointReadCompleted {
                 outcome,
                 duration,
-            }) => Self::LastCheckpointReadCompleted(LastCheckpointReadCompleted {
+            }) => MetricEvent::LastCheckpointReadCompleted(LastCheckpointReadCompleted {
                 outcome: (*outcome).into(),
                 duration_ns: duration_ns(*duration),
             }),
@@ -903,7 +903,7 @@ impl MetricEvent {
                 outcome,
                 resolution_mode,
                 duration,
-            }) => Self::ChecksumWriteSuccess(ChecksumWriteSuccess {
+            }) => MetricEvent::ChecksumWriteSuccess(ChecksumWriteSuccess {
                 outcome: (*outcome).into(),
                 resolution_mode: (*resolution_mode).into(),
                 duration_ns: duration_ns(*duration),
@@ -911,21 +911,21 @@ impl MetricEvent {
             K::ChecksumWriteFailure(kernel::ChecksumWriteFailure {
                 resolution_mode,
                 duration,
-            }) => Self::ChecksumWriteFailure(ChecksumWriteFailure {
+            }) => MetricEvent::ChecksumWriteFailure(ChecksumWriteFailure {
                 resolution_mode: (*resolution_mode).into(),
                 duration_ns: duration_ns(*duration),
             }),
             K::JsonReadCompleted(kernel::JsonReadCompleted {
                 num_files,
                 bytes_read,
-            }) => Self::JsonReadCompleted(JsonReadCompleted {
+            }) => MetricEvent::JsonReadCompleted(JsonReadCompleted {
                 num_files: *num_files,
                 bytes_read: *bytes_read,
             }),
             K::ParquetReadCompleted(kernel::ParquetReadCompleted {
                 num_files,
                 bytes_read,
-            }) => Self::ParquetReadCompleted(ParquetReadCompleted {
+            }) => MetricEvent::ParquetReadCompleted(ParquetReadCompleted {
                 num_files: *num_files,
                 bytes_read: *bytes_read,
             }),
@@ -946,7 +946,7 @@ impl MetricEvent {
                 dedup_visitor_time,
                 action_transform_time,
                 predicate_eval_time,
-            }) => Self::ScanMetadataCompleted(ScanMetadataCompleted {
+            }) => MetricEvent::ScanMetadataCompleted(ScanMetadataCompleted {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
@@ -967,7 +967,7 @@ impl MetricEvent {
             K::StorageListCompleted(kernel::StorageListCompleted {
                 duration,
                 num_files,
-            }) => Self::StorageListCompleted(StorageListCompleted {
+            }) => MetricEvent::StorageListCompleted(StorageListCompleted {
                 duration_ns: duration_ns(*duration),
                 num_files: *num_files,
             }),
@@ -975,13 +975,13 @@ impl MetricEvent {
                 duration,
                 num_files,
                 bytes_read,
-            }) => Self::StorageReadCompleted(StorageReadCompleted {
+            }) => MetricEvent::StorageReadCompleted(StorageReadCompleted {
                 duration_ns: duration_ns(*duration),
                 num_files: *num_files,
                 bytes_read: *bytes_read,
             }),
             K::StorageCopyCompleted(kernel::StorageCopyCompleted { duration }) => {
-                Self::StorageCopyCompleted(StorageCopyCompleted {
+                MetricEvent::StorageCopyCompleted(StorageCopyCompleted {
                     duration_ns: duration_ns(*duration),
                 })
             }
@@ -993,7 +993,7 @@ impl MetricEvent {
                 duration,
                 processing_stats,
                 output_stats,
-            }) => Self::CheckpointWriteSuccess(CheckpointWriteSuccess {
+            }) => MetricEvent::CheckpointWriteSuccess(CheckpointWriteSuccess {
                 operation_id: (*operation_id).into(),
                 version: *version,
                 outcome: (*outcome).into(),
@@ -1009,7 +1009,7 @@ impl MetricEvent {
                 duration,
                 processing_stats,
                 output_stats,
-            }) => Self::CheckpointWriteFailure(CheckpointWriteFailure {
+            }) => MetricEvent::CheckpointWriteFailure(CheckpointWriteFailure {
                 operation_id: (*operation_id).into(),
                 version: *version,
                 mode: (*mode).into(),
@@ -1017,14 +1017,9 @@ impl MetricEvent {
                 processing_stats: (*processing_stats).into(),
                 output_stats: (*output_stats).into(),
             }),
-        };
-        f(event)
-    }
-}
-
-/// Invoke `f` while the FFI event and all nested backing storage are alive.
-pub(crate) fn with_ffi_event(event: &kernel::MetricEvent, f: impl FnOnce(MetricEvent)) {
-    MetricEvent::from_kernel(event, f)
+        }
+    };
+    f(event)
 }
 
 #[cfg(test)]
