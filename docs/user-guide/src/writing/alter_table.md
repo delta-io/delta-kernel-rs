@@ -12,12 +12,8 @@ Before reading this page, make sure you understand
 
 Use **ALTER TABLE** for a standalone, metadata-only change. For example, you can add a nullable
 column or set table properties without writing or removing data files.
-`UpdateTableOperation::AlterTable` records `commitInfo.operation` as `ALTER TABLE`. Delta Spark
-uses finer-grained names for the same kinds of change (`ADD COLUMNS`, `SET TBLPROPERTIES`,
-`UNSET TBLPROPERTIES`, and so on). Pass `UpdateTableOperation::Custom("SET TBLPROPERTIES")` or
-`Custom("UNSET TBLPROPERTIES")` when you need that history string. Schema-change Spark names such
-as `ADD COLUMNS` are reserved and rejected as custom names. A `Custom` name skips the metadata-only
-validation below, so use `AlterTable` when you want those checks.
+`UpdateTableOperation::AlterTable` records `ALTER TABLE` as the operation; see its rustdoc if you
+need Spark-style history names.
 
 Use **SCHEMA EVOLUTION** to change the schema while writing or rewriting data files in the same
 transaction. For example, you can add a nullable column and append rows containing values for that
