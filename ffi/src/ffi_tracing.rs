@@ -133,8 +133,10 @@ pub unsafe extern "C" fn enable_event_tracing(callback: TracingEventFn, max_leve
 /// reporting retain their own filters. Returns false if the subscriber has not been initialized
 /// or the filter cannot be updated. This function does not install a logging callback.
 ///
-/// Do not call this synchronously from a tracing callback: updating the filter requires exclusive
-/// access to the subscriber's logging layer.
+/// A call to [`enable_event_tracing`], [`enable_log_line_tracing`], or
+/// [`enable_formatted_log_line_tracing`] replaces this level with its own `max_level`.
+///
+/// Concurrent calls are serialized. Do not call this synchronously from a tracing callback.
 ///
 /// `max_level` must be a valid [`Level`], including when logging is disabled.
 #[unsafe(no_mangle)]
@@ -1236,11 +1238,15 @@ mod tests {
                 .env(CHILD, "1")
                 .output()
                 .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
             assert!(
                 output.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
+                "{stdout}\n{}",
                 String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                stdout.contains("test result: ok. 1 passed;"),
+                "child did not run exactly one test:\n{stdout}"
             );
             return;
         }
