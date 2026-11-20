@@ -1115,6 +1115,7 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
         .build(&engine)?;
     snapshot_v1.checkpoint(&engine, None)?;
     assert_last_checkpoint_contents(&store, 2, 4, 2, size_in_bytes).await?;
+    assert_eq!(read_last_checkpoint_file(&store).await?, last_checkpoint);
     Ok(())
 }
 
