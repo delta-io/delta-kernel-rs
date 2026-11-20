@@ -12,7 +12,7 @@ use crate::parallel::sequential_phase::{AfterSequential, SequentialPhase};
 use crate::scan::ScanMetadata;
 use crate::scan::log_replay::{ScanLogReplayProcessor, SerializableScanState};
 use crate::schema::SchemaRef;
-use crate::{Engine, EngineData, FileMeta, KernelError, KernelResult};
+use crate::{Engine, EngineData, FileMeta, KernelError, KernelResult, Result};
 
 /// Result of sequential scan metadata processing.
 ///
@@ -101,7 +101,7 @@ impl SequentialScanMetadata {
 }
 
 impl Iterator for SequentialScanMetadata {
-    type Item = KernelResult<ScanMetadata>;
+    type Item = Result<ScanMetadata>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let _guard = self.span.enter();
@@ -128,10 +128,7 @@ pub struct ParallelState {
 impl ParallelLogReplayProcessor for Arc<ParallelState> {
     type Output = ScanMetadata;
 
-    fn process_actions_batch_parallel(
-        &self,
-        actions_batch: ActionsBatch,
-    ) -> KernelResult<Self::Output> {
+    fn process_actions_batch_parallel(&self, actions_batch: ActionsBatch) -> Result<Self::Output> {
         self.inner.process_actions_batch_parallel(actions_batch)
     }
 }
@@ -278,7 +275,7 @@ impl ParallelScanMetadata {
 }
 
 impl Iterator for ParallelScanMetadata {
-    type Item = KernelResult<ScanMetadata>;
+    type Item = Result<ScanMetadata>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let _guard = self.span.enter();

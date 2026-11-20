@@ -215,7 +215,7 @@ impl IncrementalScanBuilder {
     /// constructed. [`AddSkipping::SkipAll`] when the predicate statically excludes every file
     /// ([`PhysicalPredicate::StaticSkipAll`]); the stream still reports Removes but yields no
     /// live Adds. [`AddSkipping::Filter`] carries the reusable [`DataSkippingFilter`].
-    fn resolve_add_skipping(&self, engine: &dyn Engine) -> KernelResult<AddSkipping> {
+    fn resolve_add_skipping(&self, engine: &dyn Engine) -> Result<AddSkipping> {
         let Some(predicate) = self.predicate.as_ref() else {
             return Ok(AddSkipping::KeepAll);
         };

@@ -55,7 +55,9 @@ use crate::table_properties::{
     MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
 };
 use crate::utils::{require, try_parse_uri};
-use crate::{Engine, Error, KernelError, KernelResult, KernelResultIterator, Result, Version};
+use crate::{
+    DeltaError, Engine, Error, KernelError, KernelResult, KernelResultIterator, Result, Version,
+};
 
 mod log_replay;
 mod net_changes;
@@ -115,10 +117,22 @@ impl CdfMode {
     }
 
     /// Returns the mode-specific error when [`CdfMode::required_feature`] is disabled at `version`.
-    pub(crate) fn feature_disabled_error(self, version: Version) -> KernelError {
+    pub(crate) fn feature_disabled_error(
+        self,
+        version: Version,
+        start: Version,
+        end: Version,
+    ) -> Error {
         match self {
-            CdfMode::ChangeDataFeed => KernelError::change_data_feed_unsupported(version),
-            CdfMode::RowTracking => KernelError::row_tracking_change_feed_unsupported(version),
+            CdfMode::ChangeDataFeed => Error::Delta(DeltaError::missing_change_data(
+                start,
+                end,
+                version,
+                Some(Box::new(KernelError::change_data_feed_unsupported(version))),
+            )),
+            CdfMode::RowTracking => {
+                Error::Kernel(KernelError::row_tracking_change_feed_unsupported(version))
+            }
         }
     }
 
@@ -319,6 +333,19 @@ impl TableChanges {
         mode: CdfMode,
     ) -> Result<Self> {
         let log_root = table_root.join("_delta_log/").map_err(KernelError::from)?;
+        if let Some(end_version) = end_version
+            && start_version > end_version
+        {
+            // TODO(3421): Remove the KernelError generic source following the error migration
+            let source = KernelError::generic(
+                "Failed to build LogSegment: start_version cannot be greater than end_version",
+            );
+            return Err(Error::Delta(DeltaError::invalid_cdc_range(
+                start_version,
+                end_version,
+                Some(Box::new(source)),
+            )));
+        }
         let log_segment = LogSegment::for_table_changes(
             engine.storage_handler().as_ref(),
             log_root,
@@ -333,12 +360,9 @@ impl TableChanges {
             .table_configuration()
             .ensure_operation_supported(Operation::Cdf)?;
 
-        let end_snapshot = match end_version {
-            Some(version) => Snapshot::builder_from(start_snapshot.clone())
-                .at_version(version)
-                .build(engine)?,
-            None => Snapshot::builder_from(start_snapshot.clone()).build(engine)?,
-        };
+        let end_snapshot = Snapshot::builder_from(start_snapshot.clone())
+            .at_version(log_segment.end_version)
+            .build(engine)?;
         end_snapshot
             .table_configuration()
             .ensure_operation_supported(Operation::Cdf)?;
@@ -350,12 +374,16 @@ impl TableChanges {
         // for the cdc-file path, RowTracking for the row-tracking path.
         //
         // Note: We must still check each metadata and protocol action in the CDF range.
-        let check_table_config = |snapshot: &Snapshot| -> KernelResult<()> {
+        let check_table_config = |snapshot: &Snapshot| -> Result<()> {
             require!(
                 snapshot
                     .table_configuration()
                     .is_feature_enabled(&mode.required_feature()),
-                mode.feature_disabled_error(snapshot.version())
+                mode.feature_disabled_error(
+                    snapshot.version(),
+                    start_version,
+                    end_snapshot.version()
+                )
             );
             Ok(())
         };
@@ -541,6 +569,7 @@ impl TableChanges {
             commits,
             schema,
             None,
+            self.start_table_config.version()..=self.end_snapshot.version(),
             self.mode,
         )?;
         // Any listing error surfaces here rather than mid-iteration.
@@ -559,12 +588,15 @@ impl TableChanges {
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
+    use bytes::Bytes;
     use itertools::{Itertools, assert_equal};
 
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::actions::{Add, Metadata, Protocol, Remove};
+    use crate::engine::DelegatingEngine;
     use crate::engine::sync::SyncEngine;
     use crate::schema::{DataType, StructField, StructType, schema_ref};
     use crate::table_changes::CDF_FIELDS;
@@ -575,20 +607,135 @@ mod tests {
     };
     use crate::table_features::TableFeature;
     use crate::table_properties::{
-        COLUMN_MAPPING_MODE, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
+        COLUMN_MAPPING_MODE, ENABLE_CHANGE_DATA_FEED, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
         MATERIALIZED_ROW_ID_COLUMN_NAME,
     };
     use crate::unit_test_utils::{
         Action, LocalMockTable, assert_result_error_with_message,
         test_schema_flat_with_column_mapping,
     };
-    use crate::{Engine, Error, KernelError};
+    use crate::{Engine, Error, FileMeta, FileSlice, KernelError, StorageHandler};
 
     fn listing_test_schema() -> Arc<StructType> {
         schema_ref! {
             nullable "id": INTEGER,
             nullable "value": STRING,
         }
+    }
+
+    struct AppendAfterListing {
+        inner: Arc<dyn StorageHandler>,
+        commit_path: Url,
+        appended: AtomicBool,
+    }
+
+    impl StorageHandler for AppendAfterListing {
+        fn list_from(&self, path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+            let files = self
+                .inner
+                .list_from(path)?
+                .collect::<KernelResult<Vec<_>>>()?;
+            if !self.appended.swap(true, Ordering::SeqCst) {
+                self.inner.put(
+                    &self.commit_path,
+                    Bytes::from_static(b"{\"commitInfo\":{\"timestamp\":0}}"),
+                    false,
+                )?;
+            }
+            Ok(Box::new(files.into_iter().map(Ok)))
+        }
+
+        fn read_files(
+            &self,
+            files: Vec<FileSlice>,
+        ) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
+            self.inner.read_files(files)
+        }
+
+        fn copy_atomic(&self, src: &Url, dest: &Url) -> KernelResult<()> {
+            self.inner.copy_atomic(src, dest)
+        }
+
+        fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> KernelResult<()> {
+            self.inner.put(path, data, overwrite)
+        }
+
+        fn head(&self, path: &Url) -> KernelResult<FileMeta> {
+            self.inner.head(path)
+        }
+
+        fn delete(&self, path: &Url) -> KernelResult<()> {
+            self.inner.delete(path)
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::latest(None)]
+    #[case::explicit(Some(2))]
+    #[tokio::test]
+    async fn concurrent_append_preserves_selected_cdf_end_version(
+        #[case] end_version: Option<Version>,
+    ) {
+        let mut table = LocalMockTable::new();
+        let metadata = |enabled: bool| {
+            Metadata::try_new(
+                None,
+                None,
+                listing_test_schema(),
+                vec![],
+                0,
+                HashMap::from([(ENABLE_CHANGE_DATA_FEED.to_string(), enabled.to_string())]),
+            )
+            .unwrap()
+        };
+        table
+            .commit([
+                Action::Protocol(Protocol::try_new_legacy(1, 4).unwrap()),
+                Action::Metadata(metadata(true)),
+            ])
+            .await;
+        table.commit([Action::Metadata(metadata(false))]).await;
+        table.commit([Action::Metadata(metadata(true))]).await;
+        let root = Url::from_directory_path(table.table_root()).unwrap();
+        let inner: Arc<dyn Engine> = Arc::new(SyncEngine::new());
+        let storage = Arc::new(AppendAfterListing {
+            inner: inner.storage_handler(),
+            commit_path: root.join("_delta_log/00000000000000000003.json").unwrap(),
+            appended: AtomicBool::new(false),
+        });
+        let engine = Arc::new(
+            DelegatingEngine::new(inner)
+                .with_storage_handler(storage.clone())
+                .without_plan_executor(),
+        );
+        let changes = TableChanges::try_new(&root, engine.as_ref(), 0, end_version).unwrap();
+        assert!(storage.appended.load(Ordering::SeqCst));
+        assert_eq!(changes.end_version(), 2);
+        assert_eq!(changes.end_snapshot.version(), 2);
+        let scan = changes.into_scan_builder().build().unwrap();
+        let error = scan
+            .execute(engine)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .err()
+            .expect("expected missing change data");
+        let Error::Delta(error) = error else {
+            panic!("expected missing change data");
+        };
+        assert_eq!(error.name(), "DELTA_MISSING_CHANGE_DATA");
+        assert_eq!(
+            error
+                .parameters()
+                .iter()
+                .map(|p| (p.name(), p.value()))
+                .collect::<Vec<_>>(),
+            [
+                ("startVersion", "0"),
+                ("endVersion", "2"),
+                ("version", "1"),
+                ("key", ENABLE_CHANGE_DATA_FEED),
+            ]
+        );
     }
 
     #[test]
@@ -621,7 +768,7 @@ mod tests {
             );
             assert!(matches!(
                 res,
-                Err(Error::Kernel(KernelError::ChangeDataFeedUnsupported(_)))
+                Err(Error::Delta(ref error)) if error.name() == "DELTA_MISSING_CHANGE_DATA"
             ))
         }
     }
@@ -1123,5 +1270,48 @@ mod tests {
             .try_collect()
             .unwrap();
         assert!(listing.is_empty(), "expected an empty listing: {listing:?}");
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use std::error::Error as _;
+
+    use rstest::rstest;
+
+    use super::*;
+    use crate::DeltaErrorCondition;
+    use crate::engine::PanicEngine;
+
+    #[rstest]
+    #[case(CdfMode::ChangeDataFeed)]
+    #[case(CdfMode::RowTracking)]
+    fn reversed_cdf_bounds_fail_before_engine_access(#[case] mode: CdfMode) {
+        let error = TableChanges::try_new_internal(
+            Url::parse("memory:///").unwrap(),
+            &PanicEngine,
+            4,
+            Some(2),
+            mode,
+        )
+        .err()
+        .unwrap();
+        let Error::Delta(error) = error else {
+            panic!("expected Delta range error")
+        };
+        assert_eq!(error.condition(), DeltaErrorCondition::DeltaInvalidCdcRange);
+        assert_eq!(error.sql_state(), Some("22003"));
+        assert_eq!(
+            error
+                .parameters()
+                .iter()
+                .map(|p| (p.name(), p.value()))
+                .collect::<Vec<_>>(),
+            [("start", "4"), ("end", "2")]
+        );
+        assert!(
+            matches!(error.source().unwrap().downcast_ref::<KernelError>(),
+            Some(KernelError::Generic(message)) if message.contains("start_version"))
+        );
     }
 }

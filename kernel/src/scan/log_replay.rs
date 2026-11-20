@@ -15,6 +15,7 @@ use super::{
 };
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
+use crate::error::partition_value_error;
 use crate::expressions::{
     ColumnName, Expression, ExpressionRef, PredicateRef, UnaryExpressionOp, col, column_expr_ref,
     column_name, expr, null_lit,
@@ -35,7 +36,9 @@ use crate::schema::{
 use crate::struct_patch::{ProjectionStructPatchBuilder, project_struct_preserving_nulls};
 use crate::table_features::ColumnMappingMode;
 use crate::utils::{FoldWithOption as _, require};
-use crate::{Engine, ExpressionEvaluator, KernelError, KernelResult, KernelResultIterator};
+use crate::{
+    Engine, Error, ExpressionEvaluator, KernelError, KernelResult, KernelResultIterator, Result,
+};
 
 /// Read-time stats toggles consumed by [`ScanLogReplayProcessor`].
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
@@ -593,7 +596,7 @@ impl ScanLogReplayProcessor {
         dedup_selection: Vec<bool>,
         row_transform_exprs: Vec<Option<ExpressionRef>>,
         active_add_file_sizes: Vec<u64>,
-    ) -> KernelResult<RetryTransformAndDataSkipOutput> {
+    ) -> Result<RetryTransformAndDataSkipOutput> {
         let row_transform_exprs = dedup_selection
             .iter()
             .enumerate()
@@ -606,8 +609,9 @@ impl ScanLogReplayProcessor {
             .filter_map(|(selected, size)| (*selected).then_some(size))
             .collect();
         let actions = actions.apply_selection_vector(dedup_selection)?;
-        let (transformed_actions, final_selection) =
-            self.transform_and_data_skip(actions.as_ref(), is_log_batch)?;
+        let (transformed_actions, final_selection) = self
+            .transform_and_data_skip(actions.as_ref(), is_log_batch)
+            .map_err(partition_value_error)?;
         Ok(RetryTransformAndDataSkipOutput {
             transformed_actions,
             final_selection,
@@ -649,6 +653,9 @@ struct AddRemoveDedupVisitor<'a, D: Deduplicator> {
     row_transform_exprs: Vec<Option<ExpressionRef>>,
     active_add_file_sizes: Vec<u64>,
     metrics: &'a ScanMetrics,
+    // RowVisitor returns KernelError, so record whether this visit failed during partition
+    // parsing.
+    partition_parse_failed: bool,
 }
 
 impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
@@ -666,6 +673,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
             row_transform_exprs: Vec::new(),
             active_add_file_sizes,
             metrics,
+            partition_parse_failed: false,
         }
     }
 
@@ -736,7 +744,11 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
                     transform,
                     &partition_values,
                     self.state_info.column_mapping_mode,
-                )?
+                )
+                .inspect_err(|error| {
+                    self.partition_parse_failed =
+                        matches!(error.without_backtrace(), KernelError::ParseError(..));
+                })?
             }
             _ => Default::default(),
         };
@@ -1070,19 +1082,16 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
         fields(enable_call_frame),
         err
     )]
-    fn process_actions_batch_parallel(
-        &self,
-        actions_batch: ActionsBatch,
-    ) -> KernelResult<Self::Output> {
+    fn process_actions_batch_parallel(&self, actions_batch: ActionsBatch) -> Result<Self::Output> {
         let ActionsBatch {
             actions,
             is_log_batch,
         } = actions_batch;
         require!(
             !is_log_batch,
-            KernelError::generic(
+            Error::Kernel(KernelError::generic(
                 "Parallel checkpoint processor may only be applied to checkpoint files"
-            )
+            ))
         );
 
         let mut should_retry_transform_and_data_skip = false;
@@ -1096,11 +1105,11 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
                 Ok((transformed_actions, pre_dedup_selection)) => {
                     (Ok(transformed_actions), pre_dedup_selection)
                 }
-                Err(err @ KernelError::ParseError(_, _)) => {
+                Err(err) if matches!(err.without_backtrace(), KernelError::ParseError(..)) => {
                     should_retry_transform_and_data_skip = true;
                     (Err(err), vec![true; actions.len()])
                 }
-                Err(err) => return Err(err),
+                Err(err) => return Err(Error::Kernel(err)),
             };
 
         // Step 2: Run deduplication visitor on RAW batch (needs add.path, remove.path, etc.)
@@ -1118,7 +1127,14 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
                 self.state_info.clone(),
                 &self.metrics,
             );
-            visitor.visit_rows_of(actions.as_ref())?;
+            let result = visitor.visit_rows_of(actions.as_ref());
+            result.map_err(|error| {
+                if visitor.partition_parse_failed {
+                    partition_value_error(error)
+                } else {
+                    Error::Kernel(error)
+                }
+            })?;
             (
                 visitor.selection_vector,
                 visitor.row_transform_exprs,
@@ -1179,7 +1195,7 @@ impl ScanLogReplayProcessor {
     pub(crate) fn process_actions_batch_sequential(
         &mut self,
         actions_batch: ActionsBatch,
-    ) -> KernelResult<ScanMetadata> {
+    ) -> Result<ScanMetadata> {
         let ActionsBatch {
             actions,
             is_log_batch,
@@ -1205,11 +1221,11 @@ impl ScanLogReplayProcessor {
                 Ok((transformed_actions, pre_dedup_selection)) => {
                     (Ok(transformed_actions), pre_dedup_selection)
                 }
-                Err(err @ KernelError::ParseError(_, _)) => {
+                Err(err) if matches!(err.without_backtrace(), KernelError::ParseError(..)) => {
                     should_retry_transform_and_data_skip = true;
                     (Err(err), vec![true; actions.len()])
                 }
-                Err(err) => return Err(err),
+                Err(err) => return Err(Error::Kernel(err)),
             };
 
         // Step 2: Run deduplication visitor on RAW batch (needs add.path, remove.path, etc.)
@@ -1230,7 +1246,14 @@ impl ScanLogReplayProcessor {
                 self.state_info.clone(),
                 &self.metrics,
             );
-            visitor.visit_rows_of(actions.as_ref())?;
+            let result = visitor.visit_rows_of(actions.as_ref());
+            result.map_err(|error| {
+                if visitor.partition_parse_failed {
+                    partition_value_error(error)
+                } else {
+                    Error::Kernel(error)
+                }
+            })?;
             (
                 visitor.selection_vector,
                 visitor.row_transform_exprs,
@@ -1305,8 +1328,8 @@ pub(crate) fn scan_action_iter<I>(
     checkpoint_info: CheckpointReadInfo,
     stats_options: ScanStatsOptions,
     partition_values_options: ScanPartitionValuesOptions,
-) -> KernelResult<(
-    impl KernelResultIterator<ScanMetadata> + use<I>,
+) -> Result<(
+    impl Iterator<Item = Result<ScanMetadata>> + Send + use<I>,
     Arc<ScanMetrics>,
 )>
 where
@@ -1329,6 +1352,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
+    use std::error::Error as _;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -1353,7 +1377,9 @@ mod tests {
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
         IndirectDataSkippingPredicateEvaluator,
     };
-    use crate::log_replay::ActionsBatch;
+    use crate::log_replay::{
+        ActionsBatch, FileActionKey, HasSelectionVector, ParallelLogReplayProcessor,
+    };
     use crate::log_segment::CheckpointReadInfo;
     use crate::metrics::{MetricId, ScanType};
     use crate::scan::state::ScanFile;
@@ -1373,8 +1399,8 @@ mod tests {
     use crate::table_features::ColumnMappingMode;
     use crate::unit_test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use crate::{
-        Engine, EngineData, Expression as Expr, ExpressionEvaluator, ExpressionRef, KernelError,
-        KernelResult, Result,
+        DeltaErrorCondition, Engine, EngineData, Error, Expression as Expr, ExpressionEvaluator,
+        ExpressionRef, KernelError, KernelResult, Result,
     };
 
     /// Test evaluator that fails once before delegating, exposing both timed transform attempts.
@@ -1558,6 +1584,86 @@ mod tests {
             (),
             validate_simple,
         );
+    }
+
+    #[rstest]
+    fn partition_cast_reports_only_live_adds(
+        #[values(false, true)] parallel: bool,
+        #[values(false, true)] obsolete: bool,
+        #[values(false, true)] skip_row_transforms: bool,
+    ) {
+        let engine = SyncEngine::new();
+        let schema = schema_ref! { nullable "date": DATE };
+        let mut state = get_simple_state_info(schema, vec!["date".into()]).unwrap();
+        state.skip_row_transforms = skip_row_transforms;
+        state.physical_predicate = PhysicalPredicate::Some(
+            Arc::new(col!("date").is_not_null()),
+            schema_ref! { nullable "date": DATE },
+        );
+        let mut processor = ScanLogReplayProcessor::new(
+            &engine,
+            Arc::new(state),
+            test_checkpoint_info(),
+            ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
+        )
+        .unwrap();
+        let raw = "bad'\\date\"";
+        let add = serde_json::json!({"add": {
+            "path": "part.parquet", "partitionValues": {"date": raw},
+            "size": 1, "modificationTime": 0, "dataChange": true
+        }})
+        .to_string();
+        let mut actions = vec![];
+        if obsolete {
+            // Checkpoint Adds are also deduplicated against newer commits.
+            processor
+                .seen_file_keys
+                .insert(FileActionKey::new("part.parquet", None));
+        }
+        actions.push(add);
+        let batch = engine
+            .json_handler()
+            .parse_json(
+                string_array_to_engine_data(StringArray::from_iter_values(actions)),
+                COMMIT_READ_SCHEMA.clone(),
+            )
+            .unwrap();
+        let batch = ActionsBatch::new(batch, !parallel);
+        let result = if parallel {
+            processor.process_actions_batch_parallel(batch)
+        } else {
+            processor.process_actions_batch_sequential(batch)
+        };
+        if obsolete || skip_row_transforms {
+            assert_eq!(result.unwrap().has_selected_rows(), !obsolete);
+        } else {
+            let error = result.err().expect("invalid active partition");
+            let Error::Delta(error) = error else {
+                panic!("expected partition Delta error")
+            };
+            assert_eq!(
+                error.condition(),
+                DeltaErrorCondition::DeltaFailedCastPartitionValue
+            );
+            assert_eq!(error.sql_state(), Some("22018"));
+            assert_eq!(
+                error
+                    .parameters()
+                    .iter()
+                    .map(|p| (p.name(), p.value()))
+                    .collect::<Vec<_>>(),
+                vec![("value", raw), ("dataType", "date")]
+            );
+            let source = error
+                .source()
+                .unwrap()
+                .downcast_ref::<KernelError>()
+                .unwrap();
+            assert!(
+                matches!(source.without_backtrace(), KernelError::ParseError(value, DataType::Primitive(_)) if value == raw)
+            );
+        }
     }
 
     #[test]
@@ -1841,9 +1947,9 @@ mod tests {
         .unwrap();
 
         // Add file keys with and without DV info
-        let key1 = crate::log_replay::FileActionKey::new("file1.parquet", None);
-        let key2 = crate::log_replay::FileActionKey::new("file2.parquet", Some("dv-1".to_string()));
-        let key3 = crate::log_replay::FileActionKey::new("file3.parquet", Some("dv-2".to_string()));
+        let key1 = FileActionKey::new("file1.parquet", None);
+        let key2 = FileActionKey::new("file2.parquet", Some("dv-1".to_string()));
+        let key3 = FileActionKey::new("file3.parquet", Some("dv-2".to_string()));
         processor.seen_file_keys.insert(key1.clone());
         processor.seen_file_keys.insert(key2.clone());
         processor.seen_file_keys.insert(key3.clone());

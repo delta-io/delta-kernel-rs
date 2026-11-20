@@ -69,14 +69,15 @@ fn normalized_metadata_batch(
     Ok(RecordBatch::try_from_iter(columns)?)
 }
 
-fn imperative_metadata(scan: Scan, engine: &dyn Engine) -> KernelResult<Vec<RecordBatch>> {
+fn imperative_metadata(scan: Scan, engine: &dyn Engine) -> Result<Vec<RecordBatch>> {
     let mut batches = vec![];
     for metadata in scan.scan_metadata(engine)? {
         let (data, selection) = metadata?.scan_files.into_parts();
         let batch = filter_record_batch(
             &data.try_into_record_batch()?,
             &BooleanArray::from(selection),
-        )?;
+        )
+        .map_err(KernelError::from)?;
         if batch.num_rows() == 0 {
             continue;
         }

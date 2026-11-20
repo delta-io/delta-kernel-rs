@@ -3,7 +3,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use delta_kernel::KernelError;
 use delta_kernel::arrow::array::{Array, Int32Array, StringArray, new_null_array};
 use delta_kernel::arrow::datatypes::DataType as ArrowDataType;
 use delta_kernel::arrow::record_batch::RecordBatch;
@@ -20,6 +19,7 @@ use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
+use delta_kernel::{Error, KernelError};
 use rstest::rstest;
 use serde_json::json;
 use test_utils::{
@@ -1185,17 +1185,31 @@ async fn empty_create_then_add_column(
     assert_eq!(v0.schema().num_fields(), 0);
     assert_eq!(max_column_id(&v0), cm_mode.map(|_| 0));
 
-    // Scans and blind appends against the empty-schema snapshot are blocked with
-    // friendly errors that point users at ALTER TABLE ADD COLUMN.
     let scan_err = v0
         .clone()
         .scan_builder()
         .build()
         .expect_err("scan_builder().build() must reject empty-schema snapshots");
+    let Error::Delta(scan_err) = scan_err else {
+        panic!("expected empty-table Delta error");
+    };
+    assert_eq!(scan_err.name(), "DELTA_READ_TABLE_WITHOUT_COLUMNS");
+    assert_eq!(scan_err.sql_state(), Some("428GU"));
+    assert_eq!(
+        scan_err
+            .parameters()
+            .iter()
+            .map(|parameter| (parameter.name(), parameter.value()))
+            .collect::<Vec<_>>(),
+        [("tableName", v0.table_root().as_str())]
+    );
+    let source = std::error::Error::source(&scan_err)
+        .unwrap()
+        .downcast_ref::<KernelError>()
+        .unwrap();
     assert!(
-        scan_err.to_string().contains("empty schema")
-            && scan_err.to_string().contains("ALTER TABLE ADD COLUMN"),
-        "scan error must point at ALTER TABLE ADD COLUMN, got: {scan_err}"
+        matches!(source.without_backtrace(), KernelError::Generic(message)
+        if message.contains("ALTER TABLE ADD COLUMN"))
     );
     let write_state_err = v0
         .clone()

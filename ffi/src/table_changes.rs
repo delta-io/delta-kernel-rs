@@ -7,7 +7,7 @@ use delta_kernel::arrow::ffi::to_ffi;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::table_changes::TableChanges;
 use delta_kernel::table_changes::scan::TableChangesScan;
-use delta_kernel::{EngineData, KernelError, KernelResult, Version};
+use delta_kernel::{EngineData, KernelError, KernelResult, Result, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::{debug, trace};
 use url::Url;
@@ -172,7 +172,7 @@ pub unsafe extern "C" fn table_changes_scan(
 fn table_changes_scan_impl(
     table_changes: TableChanges,
     predicate: Option<&mut EnginePredicate>,
-) -> KernelResult<Handle<SharedTableChangesScan>> {
+) -> Result<Handle<SharedTableChangesScan>> {
     let mut scan_builder = table_changes.into_scan_builder();
     if let Some(predicate) = predicate {
         let mut visitor_state = KernelExpressionVisitorState::default();

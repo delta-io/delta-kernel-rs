@@ -14,18 +14,40 @@ use super::ConditionMetadata;
 pub enum DeltaErrorCondition {
     /// `DELTA_ADAPTIVE_METADATA_REQUIRES_COLUMN_MAPPING_ID_MODE` (SQLSTATE `42000`).
     DeltaAdaptiveMetadataRequiresColumnMappingIdMode,
+    /// `DELTA_CHANGELOG_ROW_TRACKING_DISABLED_IN_RANGE` (SQLSTATE `0AKDE`).
+    DeltaChangelogRowTrackingDisabledInRange,
+    /// `DELTA_CHANGE_DATA_FEED_INCOMPATIBLE_SCHEMA_CHANGE` (SQLSTATE `0AKDC`).
+    DeltaChangeDataFeedIncompatibleSchemaChange,
+    /// `DELTA_COLUMN_NOT_FOUND_IN_SCHEMA` (SQLSTATE `42703`).
+    DeltaColumnNotFoundInSchema,
+    /// `DELTA_COLUMN_PATH_NOT_NESTED` (SQLSTATE `42704`).
+    DeltaColumnPathNotNested,
+    /// `DELTA_DELETION_VECTOR_CHECKSUM_MISMATCH` (SQLSTATE `XXKDS`).
+    DeltaDeletionVectorChecksumMismatch,
+    /// `DELTA_DELETION_VECTOR_SIZE_MISMATCH` (SQLSTATE `XXKDS`).
+    DeltaDeletionVectorSizeMismatch,
     /// `DELTA_DUPLICATE_COLUMNS_FOUND.EXISTING_SCHEMA` (SQLSTATE `42711`).
     DeltaDuplicateColumnsFoundExistingSchema,
     /// `DELTA_DUPLICATE_COLUMNS_FOUND.PARTITION_COLUMNS` (SQLSTATE `42711`).
     DeltaDuplicateColumnsFoundPartitionColumns,
+    /// `DELTA_FAILED_CAST_PARTITION_VALUE` (SQLSTATE `22018`).
+    DeltaFailedCastPartitionValue,
+    /// `DELTA_FILE_NOT_FOUND` (SQLSTATE `42K03`).
+    DeltaFileNotFound,
+    /// `DELTA_INVALID_CDC_RANGE` (SQLSTATE `22003`).
+    DeltaInvalidCdcRange,
     /// `DELTA_LOG_FILE_NOT_FOUND` (SQLSTATE `42K03`).
     DeltaLogFileNotFound,
+    /// `DELTA_MISSING_CHANGE_DATA` (SQLSTATE `KD002`).
+    DeltaMissingChangeData,
     /// `DELTA_PARSING_UNSUPPORTED_DATA_TYPE` (SQLSTATE `KD009`).
     DeltaParsingUnsupportedDataType,
     /// `DELTA_PARTITION_COLUMN_NOT_FOUND` (SQLSTATE `42703`).
     DeltaPartitionColumnNotFound,
     /// `DELTA_PATH_DOES_NOT_EXIST` (SQLSTATE `42K03`).
     DeltaPathDoesNotExist,
+    /// `DELTA_READ_TABLE_WITHOUT_COLUMNS` (SQLSTATE `428GU`).
+    DeltaReadTableWithoutColumns,
     /// `DELTA_TRUNCATED_TRANSACTION_LOG` (SQLSTATE `42K03`).
     DeltaTruncatedTransactionLog,
     /// `DELTA_VERSIONS_NOT_CONTIGUOUS` (SQLSTATE `KD00C`).
@@ -43,6 +65,42 @@ impl DeltaErrorCondition {
                 parameter_names: &["feature", "prop", "mode"],
                 message_template: "The table feature '<feature>' requires column mapping mode 'id', but the table property '<prop>' is set to '<mode>'. Recreate the table with '<prop>' = 'id', or omit the property to have it set automatically.",
             },
+            Self::DeltaChangelogRowTrackingDisabledInRange => ConditionMetadata {
+                name: "DELTA_CHANGELOG_ROW_TRACKING_DISABLED_IN_RANGE",
+                sql_state: Some("0AKDE"),
+                parameter_names: &["version"],
+                message_template: "Delta CDC requires row tracking to remain enabled across the requested range.\nCommit at version <version> disabled row tracking. Pick a starting/ending version that brackets a row-tracking-enabled state.",
+            },
+            Self::DeltaChangeDataFeedIncompatibleSchemaChange => ConditionMetadata {
+                name: "DELTA_CHANGE_DATA_FEED_INCOMPATIBLE_SCHEMA_CHANGE",
+                sql_state: Some("0AKDC"),
+                parameter_names: &["start", "end", "readSchema", "readVersion", "incompatibleVersion"],
+                message_template: "Retrieving table changes between version <start> and <end> failed because of an incompatible schema change.\nYour read schema is <readSchema> at version <readVersion>, but we found an incompatible schema change at version <incompatibleVersion>.\nIf possible, please query table changes separately from version <start> to <incompatibleVersion> - 1, and from version <incompatibleVersion> to <end>.",
+            },
+            Self::DeltaColumnNotFoundInSchema => ConditionMetadata {
+                name: "DELTA_COLUMN_NOT_FOUND_IN_SCHEMA",
+                sql_state: Some("42703"),
+                parameter_names: &["columnName", "tableSchema"],
+                message_template: "Couldn't find column <columnName> in:\n<tableSchema>",
+            },
+            Self::DeltaColumnPathNotNested => ConditionMetadata {
+                name: "DELTA_COLUMN_PATH_NOT_NESTED",
+                sql_state: Some("42704"),
+                parameter_names: &["columnPath", "other", "column", "schema"],
+                message_template: "Expected <columnPath> to be a nested data type, but found <other>. Was looking for the\nindex of <column> in a nested field.\nSchema:\n<schema>",
+            },
+            Self::DeltaDeletionVectorChecksumMismatch => ConditionMetadata {
+                name: "DELTA_DELETION_VECTOR_CHECKSUM_MISMATCH",
+                sql_state: Some("XXKDS"),
+                parameter_names: &[],
+                message_template: "Could not verify deletion vector integrity, CRC checksum verification failed.",
+            },
+            Self::DeltaDeletionVectorSizeMismatch => ConditionMetadata {
+                name: "DELTA_DELETION_VECTOR_SIZE_MISMATCH",
+                sql_state: Some("XXKDS"),
+                parameter_names: &[],
+                message_template: "Deletion vector integrity check failed. Encountered a size mismatch.",
+            },
             Self::DeltaDuplicateColumnsFoundExistingSchema => ConditionMetadata {
                 name: "DELTA_DUPLICATE_COLUMNS_FOUND.EXISTING_SCHEMA",
                 sql_state: Some("42711"),
@@ -55,11 +113,35 @@ impl DeltaErrorCondition {
                 parameter_names: &["duplicateCols"],
                 message_template: "Found duplicate column(s): <duplicateCols>. The duplicate was found in the partition columns.",
             },
+            Self::DeltaFailedCastPartitionValue => ConditionMetadata {
+                name: "DELTA_FAILED_CAST_PARTITION_VALUE",
+                sql_state: Some("22018"),
+                parameter_names: &["value", "dataType"],
+                message_template: "Failed to cast partition value `<value>` to <dataType>",
+            },
+            Self::DeltaFileNotFound => ConditionMetadata {
+                name: "DELTA_FILE_NOT_FOUND",
+                sql_state: Some("42K03"),
+                parameter_names: &["path"],
+                message_template: "File path <path>",
+            },
+            Self::DeltaInvalidCdcRange => ConditionMetadata {
+                name: "DELTA_INVALID_CDC_RANGE",
+                sql_state: Some("22003"),
+                parameter_names: &["start", "end"],
+                message_template: "CDC range from start <start> to end <end> was invalid. End cannot be before start.",
+            },
             Self::DeltaLogFileNotFound => ConditionMetadata {
                 name: "DELTA_LOG_FILE_NOT_FOUND",
                 sql_state: Some("42K03"),
                 parameter_names: &["version", "checkpointVersion", "logPath"],
                 message_template: "Unable to retrieve the delta log files to construct table version <version> starting from checkpoint version <checkpointVersion> at <logPath>.",
+            },
+            Self::DeltaMissingChangeData => ConditionMetadata {
+                name: "DELTA_MISSING_CHANGE_DATA",
+                sql_state: Some("KD002"),
+                parameter_names: &["startVersion", "endVersion", "version", "key"],
+                message_template: "Error getting change data for range [<startVersion> , <endVersion>] as change data was not\nrecorded for version [<version>]. If you've enabled change data feed on this table,\nuse `DESCRIBE HISTORY` to see when it was first enabled.\nOtherwise, to start recording change data, use `ALTER TABLE table_name SET TBLPROPERTIES\n(<key>=true)`.",
             },
             Self::DeltaParsingUnsupportedDataType => ConditionMetadata {
                 name: "DELTA_PARSING_UNSUPPORTED_DATA_TYPE",
@@ -78,6 +160,12 @@ impl DeltaErrorCondition {
                 sql_state: Some("42K03"),
                 parameter_names: &["path"],
                 message_template: "<path> doesn't exist, or is not a Delta table.",
+            },
+            Self::DeltaReadTableWithoutColumns => ConditionMetadata {
+                name: "DELTA_READ_TABLE_WITHOUT_COLUMNS",
+                sql_state: Some("428GU"),
+                parameter_names: &["tableName"],
+                message_template: "You are trying to read a Delta table <tableName> that does not have any columns.\n\nWrite some new data with the option `mergeSchema = true` to be able to read the table.",
             },
             Self::DeltaTruncatedTransactionLog => ConditionMetadata {
                 name: "DELTA_TRUNCATED_TRANSACTION_LOG",

@@ -2,6 +2,7 @@
 //! the metadata needed to generate the Change Data Feed.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::RangeInclusive;
 use std::slice;
 use std::sync::{Arc, LazyLock};
 
@@ -25,8 +26,8 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::{Operation, TableFeature, format_features};
 use crate::utils::require;
 use crate::{
-    Engine, EngineData, Error, KernelError, KernelResult, KernelResultIterator, PredicateRef,
-    Result, RowVisitor,
+    DeltaError, Engine, EngineData, Error, KernelError, KernelResult, KernelResultIterator,
+    PredicateRef, Result, RowVisitor, Version,
 };
 
 #[cfg(test)]
@@ -58,6 +59,7 @@ pub(crate) fn table_changes_action_iter<I>(
     commit_files: I,
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
+    range: RangeInclusive<Version>,
 ) -> Result<impl Iterator<Item = Result<TableChangesScanMetadata>> + Send + use<I>>
 where
     I: IntoIterator<Item = ParsedLogPath>,
@@ -70,6 +72,7 @@ where
         commit_files,
         table_schema,
         physical_predicate,
+        range,
         CdfMode::ChangeDataFeed,
     )
 }
@@ -85,6 +88,7 @@ pub(crate) fn table_changes_action_iter_with_mode<I>(
     commit_files: I,
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
+    range: RangeInclusive<Version>,
     mode: CdfMode,
 ) -> Result<impl Iterator<Item = Result<TableChangesScanMetadata>> + Send + use<I>>
 where
@@ -110,13 +114,21 @@ where
     let result = commit_files
         .into_iter()
         .map(move |commit_file| -> Result<_> {
+            let version = commit_file.version;
             let scanner = LogReplayScanner::try_new(
                 engine.as_ref(),
                 &mut current_configuration,
                 commit_file,
                 &table_schema,
+                range.clone(),
                 mode,
-            )?;
+            )
+            .map_err(|error| match error {
+                Error::Delta(error) => {
+                    Error::Delta(error.with_context(format!("commit v={version}")))
+                }
+                other => other,
+            })?;
             Ok(scanner.into_scan_batches(engine.clone(), filter.clone())?)
         }) //Iterator-Result-Iterator-Result
         .flatten_ok() // Iterator-Result-Result
@@ -193,6 +205,7 @@ impl LogReplayScanner {
         table_configuration: &mut TableConfiguration,
         commit_file: ParsedLogPath,
         table_schema: &SchemaRef,
+        range: RangeInclusive<Version>,
         mode: CdfMode,
     ) -> Result<Self> {
         let visitor_schema = PreparePhaseVisitor::schema();
@@ -247,15 +260,25 @@ impl LogReplayScanner {
                 // Compatibility is evaluated against the end version's logical schema.
                 require!(
                     mode.schemas_compatible(&schema, table_schema.as_ref()),
-                    Error::Kernel(
-                        KernelError::change_data_feed_incompatible_schema_at_version(
-                            table_schema,
-                            &schema,
-                            commit_file.version
-                        )
-                    )
+                    Error::Delta(DeltaError::change_data_feed_incompatible_schema_change(
+                        *range.start(),
+                        *range.end(),
+                        table_schema,
+                        *range.end(),
+                        commit_file.version,
+                        Some(Box::new(
+                            KernelError::change_data_feed_incompatible_schema_at_version(
+                                table_schema,
+                                &schema,
+                                commit_file.version,
+                            )
+                        )),
+                    ))
                 );
             }
+
+            let was_row_tracking_enabled =
+                table_configuration.is_feature_enabled(&TableFeature::RowTracking);
 
             // Update table configuration with any new Protocol or Metadata from this commit
             if has_metadata_update || has_protocol_update {
@@ -287,7 +310,20 @@ impl LogReplayScanner {
             if has_metadata_update {
                 require!(
                     table_configuration.is_feature_enabled(&mode.required_feature()),
-                    Error::Kernel(mode.feature_disabled_error(commit_file.version))
+                    if mode == CdfMode::RowTracking && was_row_tracking_enabled {
+                        Error::Delta(DeltaError::row_tracking_disabled_in_range(
+                            commit_file.version,
+                            Some(Box::new(KernelError::row_tracking_change_feed_unsupported(
+                                commit_file.version,
+                            ))),
+                        ))
+                    } else {
+                        mode.feature_disabled_error(
+                            commit_file.version,
+                            *range.start(),
+                            *range.end(),
+                        )
+                    }
                 );
             }
 

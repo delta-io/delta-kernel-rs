@@ -11,15 +11,13 @@ use super::resolve_dvs::{ResolvedCdfScanFile, resolve_scan_file_dv};
 use super::scan_file::scan_metadata_to_scan_file;
 use super::{CdfMode, TableChanges};
 use crate::actions::deletion_vector::split_vector;
+use crate::error::{partition_value_error, required_file_error};
 use crate::scan::field_classifiers::CdfTransformFieldClassifier;
 use crate::scan::state_info::StateInfo;
 use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions};
 use crate::schema::{MetadataColumnSpec, SchemaRef};
 use crate::utils::FoldWithOption as _;
-use crate::{
-    Engine, EngineData, Error, FileMeta, KernelError, KernelResult, KernelResultIterator,
-    PredicateRef, Result,
-};
+use crate::{Engine, EngineData, Error, FileMeta, KernelError, PredicateRef, Result};
 
 /// The result of building a [`TableChanges`] scan over a table. This can be used to get the change
 /// data feed from the table.
@@ -112,14 +110,14 @@ impl TableChangesScanBuilder {
     /// provided schema make sense, and to prepare some metadata that the scan will need.  The
     /// [`TableChangesScan`] type itself can be used to fetch the files and associated metadata
     /// required to perform actual data reads.
-    pub fn build(self) -> KernelResult<TableChangesScan> {
+    pub fn build(self) -> Result<TableChangesScan> {
         // Row-tracking CDF requires row-level reconciliation by row IDs, which this
         // scanner does not perform.
         if self.table_changes.mode != CdfMode::ChangeDataFeed {
-            return Err(KernelError::unsupported(
+            return Err(Error::Kernel(KernelError::unsupported(
                 "A row-tracking TableChanges cannot be scanned for data; use \
                  TableChanges::scan_file_listing instead",
-            ));
+            )));
         }
         // Predicates may reference any column in the full CDF-extended schema even when
         // `with_schema` narrows the output. Resolve predicate columns against the full schema
@@ -130,9 +128,9 @@ impl TableChangesScanBuilder {
         if logical_read_schema.contains_metadata_column(&MetadataColumnSpec::RowId)
             || logical_read_schema.contains_metadata_column(&MetadataColumnSpec::RowCommitVersion)
         {
-            return Err(KernelError::unsupported(
+            return Err(Error::Kernel(KernelError::unsupported(
                 "Row ID and Row Commit Version metadata are unsupported in CDF scans",
-            ));
+            )));
         }
 
         // Create StateInfo using CDF field classifier
@@ -184,6 +182,8 @@ impl TableChangesScan {
             commits,
             schema,
             physical_predicate,
+            self.table_changes.start_table_config.version()
+                ..=self.table_changes.end_snapshot.version(),
         )?;
         Ok(Some(it).into_iter().flatten())
     }
@@ -235,7 +235,6 @@ impl TableChangesScan {
         let result = scan_files
             .map(move |scan_file| {
                 resolve_scan_file_dv(dv_engine_ref.as_ref(), &table_root, scan_file?)
-                    .map_err(Error::from)
             }) // Iterator-Result-Iterator
             .flatten_ok() // Iterator-Result
             .map(move |resolved_scan_file| -> Result<_> {
@@ -246,10 +245,9 @@ impl TableChangesScan {
                     state_info.as_ref(),
                     physical_predicate.clone(),
                 )
-                .map_err(Error::from)
             }) // Iterator-Result-Iterator-Result
             .flatten_ok() // Iterator-Result-Result
-            .map(|x| x?.map_err(Error::from)); // Iterator-Result
+            .map(Result::flatten); // Iterator-Result
 
         Ok(result)
     }
@@ -263,7 +261,7 @@ fn read_scan_file(
     table_root: &Url,
     state_info: &StateInfo,
     _physical_predicate: Option<PredicateRef>,
-) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>> + use<>> {
+) -> Result<impl Iterator<Item = Result<Box<dyn EngineData>>> + Send + use<>> {
     let ResolvedCdfScanFile {
         scan_file,
         mut selection_vector,
@@ -271,7 +269,8 @@ fn read_scan_file(
 
     let physical_schema =
         scan_file_physical_schema(&scan_file, state_info.physical_schema.as_ref());
-    let transform_expr = get_cdf_transform_expr(&scan_file, state_info, physical_schema.as_ref())?;
+    let transform_expr = get_cdf_transform_expr(&scan_file, state_info, physical_schema.as_ref())
+        .map_err(partition_value_error)?;
 
     // Only create an evaluator if transformation is needed
     let phys_to_logical_eval = transform_expr
@@ -286,7 +285,9 @@ fn read_scan_file(
     // Determine if the scan file was derived from a deletion vector pair
     let is_dv_resolved_pair = scan_file.remove_dv.is_some();
 
-    let location = table_root.join(&scan_file.path)?;
+    let location = table_root
+        .join(&scan_file.path)
+        .map_err(KernelError::from)?;
     let file = FileMeta {
         last_modified: 0,
         size: match scan_file.size {
@@ -295,16 +296,16 @@ fn read_scan_file(
                 .map_err(|_| KernelError::generic(format!("invalid file size: {s}")))?,
             None => 0,
         },
-        location,
+        location: location.clone(),
     };
     // TODO(#860): we disable predicate pushdown until we support row indexes.
-    let read_result_iter =
-        engine
-            .parquet_handler()
-            .read_parquet_files(&[file], physical_schema, None)?;
+    let read_result_iter = engine
+        .parquet_handler()
+        .read_parquet_files(&[file], physical_schema, None)
+        .map_err(|error| required_file_error(error, &location))?;
 
-    let result = read_result_iter.map(move |batch| -> KernelResult<_> {
-        let batch = batch?;
+    let result = read_result_iter.map(move |batch| -> Result<_> {
+        let batch = batch.map_err(|error| required_file_error(error, &location))?;
         // Transform the physical data into the correct logical form, or pass through unchanged.
         let logical = if let Some(ref eval) = phys_to_logical_eval {
             eval.evaluate(batch.as_ref())
@@ -359,7 +360,7 @@ fn read_scan_file(
             logical.and_then(|data| data.apply_selection_vector(sv))
         });
         selection_vector = rest;
-        result
+        result.map_err(Error::Kernel)
     });
     Ok(result)
 }

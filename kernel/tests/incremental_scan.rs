@@ -2047,10 +2047,8 @@ async fn unknown_column_predicate_fails_at_build() -> Result<(), Box<dyn std::er
         .with_predicate(predicate)
         .build(engine.as_ref());
 
-    // Fail-fast at build, surfacing the unresolved column. The concrete error is
-    // `KernelError::MissingColumn`, but a captured backtrace wraps it in `KernelError::Backtraced`,
-    // so match on the message rather than the variant.
-    assert_result_error_with_message(result, "unknown column: nonexistent");
+    // Missing predicate columns fail while building the scan.
+    assert_result_error_with_message(result, "Couldn't find column nonexistent");
 
     Ok(())
 }

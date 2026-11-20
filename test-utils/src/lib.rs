@@ -1220,10 +1220,10 @@ pub async fn setup_test_tables(
     ])
 }
 
-pub fn read_scan(scan: &Scan, engine: Arc<dyn Engine>) -> KernelResult<Vec<RecordBatch>> {
+pub fn read_scan(scan: &Scan, engine: Arc<dyn Engine>) -> Result<Vec<RecordBatch>> {
     let scan_results = scan.execute(engine)?;
     scan_results
-        .map(EngineDataArrowExt::try_into_record_batch)
+        .map(|batch| batch.and_then(|batch| batch.try_into_record_batch().map_err(Into::into)))
         .try_collect()
 }
 
@@ -2254,9 +2254,7 @@ pub fn remove_all_and_get_remove_actions(
     engine: &impl Engine,
 ) -> Result<Vec<serde_json::Value>> {
     let scan = snapshot.clone().scan_builder().build()?;
-    let all_scan_metadata: Vec<_> = scan
-        .scan_metadata(engine)?
-        .collect::<KernelResult<Vec<_>>>()?;
+    let all_scan_metadata: Vec<_> = scan.scan_metadata(engine)?.collect::<Result<Vec<_>>>()?;
 
     let mut txn = snapshot
         .clone()

@@ -21,7 +21,7 @@ use crate::scan::log_replay::ScanLogReplayProcessor;
 use crate::scan::{COMMIT_READ_SCHEMA, ScanMetadata};
 use crate::schema::SchemaRef;
 use crate::utils::require;
-use crate::{Engine, FileMeta, KernelError, KernelResult, KernelResultIterator};
+use crate::{Engine, Error, FileMeta, KernelError, KernelResult, KernelResultIterator, Result};
 
 /// Sequential log replay processor for parallel execution.
 ///
@@ -190,7 +190,7 @@ impl SequentialPhase {
 }
 
 impl Iterator for SequentialPhase {
-    type Item = KernelResult<ScanMetadata>;
+    type Item = Result<ScanMetadata>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let next = self
@@ -207,14 +207,17 @@ impl Iterator for SequentialPhase {
             return None;
         };
 
-        Some(result.and_then(|batch| self.processor.process_actions_batch_sequential(batch)))
+        Some(
+            result
+                .map_err(Error::Kernel)
+                .and_then(|batch| self.processor.process_actions_batch_sequential(batch)),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Result;
     use crate::scan::{AfterSequentialScanMetadata, StatsOptions};
     use crate::unit_test_utils::{assert_result_error_with_message, load_test_table};
 

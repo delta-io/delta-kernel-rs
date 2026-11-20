@@ -6,9 +6,7 @@ use itertools::Itertools;
 use rstest::rstest;
 use test_utils::LoggingTest;
 
-use super::{
-    TableChangesScanMetadata, table_changes_action_iter, table_changes_action_iter_with_mode,
-};
+use super::TableChangesScanMetadata;
 use crate::actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove};
 use crate::engine::sync::SyncEngine;
 use crate::expressions::expr;
@@ -31,7 +29,59 @@ use crate::unit_test_utils::{
     Action, LocalMockTable, MockProtocolBuilder, MockTableConfigurationBuilder,
     assert_result_error_with_message,
 };
-use crate::{Engine, Error, KernelError, KernelResult, Predicate, Result, Version};
+use crate::{
+    DeltaErrorCondition, Engine, Error, KernelError, KernelResult, Predicate, Result, Version,
+};
+
+fn table_changes_action_iter<I>(
+    engine: Arc<dyn Engine>,
+    configuration: &TableConfiguration,
+    commits: I,
+    schema: SchemaRef,
+    predicate: Option<(crate::PredicateRef, SchemaRef)>,
+) -> Result<impl Iterator<Item = Result<TableChangesScanMetadata>> + Send>
+where
+    I: IntoIterator<Item = ParsedLogPath>,
+{
+    let commits: Vec<_> = commits.into_iter().collect();
+    let end = commits
+        .last()
+        .map_or(configuration.version(), |c| c.version);
+    super::table_changes_action_iter(
+        engine,
+        configuration,
+        commits,
+        schema,
+        predicate,
+        configuration.version()..=end,
+    )
+}
+
+fn table_changes_action_iter_with_mode<I>(
+    engine: Arc<dyn Engine>,
+    configuration: &TableConfiguration,
+    commits: I,
+    schema: SchemaRef,
+    predicate: Option<(crate::PredicateRef, SchemaRef)>,
+    mode: CdfMode,
+) -> Result<impl Iterator<Item = Result<TableChangesScanMetadata>> + Send>
+where
+    I: IntoIterator<Item = ParsedLogPath>,
+{
+    let commits: Vec<_> = commits.into_iter().collect();
+    let end = commits
+        .last()
+        .map_or(configuration.version(), |c| c.version);
+    super::table_changes_action_iter_with_mode(
+        engine,
+        configuration,
+        commits,
+        schema,
+        predicate,
+        configuration.version()..=end,
+        mode,
+    )
+}
 
 fn get_schema() -> SchemaRef {
     schema_ref! {
@@ -245,7 +295,7 @@ async fn cdf_not_enabled() {
 
     assert!(matches!(
         res,
-        Err(Error::Kernel(KernelError::ChangeDataFeedUnsupported(_)))
+        Err(Error::Delta(ref error)) if error.name() == "DELTA_MISSING_CHANGE_DATA"
     ));
 }
 
@@ -382,7 +432,33 @@ async fn cdf_disabled_midstream() {
         )])
         .await;
 
-    assert_midstream_failure(engine, &mock_table);
+    let error = execute_table_changes(engine, &mock_table, 0, Some(1))
+        .err()
+        .unwrap();
+    let Error::Delta(error) = error else {
+        panic!("expected missing change data")
+    };
+    assert_eq!(error.name(), "DELTA_MISSING_CHANGE_DATA");
+    assert_eq!(error.sql_state(), Some("KD002"));
+    assert_eq!(
+        error
+            .parameters()
+            .iter()
+            .map(|p| (p.name(), p.value()))
+            .collect::<Vec<_>>(),
+        [
+            ("startVersion", "0"),
+            ("endVersion", "1"),
+            ("version", "1"),
+            ("key", ENABLE_CHANGE_DATA_FEED)
+        ]
+    );
+    let context = std::error::Error::source(&error).unwrap();
+    assert_eq!(context.to_string(), "commit v=1");
+    assert!(matches!(
+        context.source().unwrap().downcast_ref::<KernelError>(),
+        Some(KernelError::ChangeDataFeedUnsupported(1))
+    ));
 }
 
 #[rstest]
@@ -410,15 +486,28 @@ async fn row_tracking_unavailable_midstream_fails(#[case] properties: &[(&str, &
         .await;
 
     let res = execute_row_tracking(engine, &mock_table, get_schema()).map(|_| ());
-    assert!(
-        matches!(
-            &res,
-            Err(Error::Kernel(
-                KernelError::RowTrackingChangeFeedUnsupported(1)
-            ))
-        ),
-        "expected row tracking to be unavailable at version 1, got {res:?}"
+    let Error::Delta(error) = res.unwrap_err() else {
+        panic!("expected row-tracking transition error")
+    };
+    assert_eq!(
+        error.name(),
+        "DELTA_CHANGELOG_ROW_TRACKING_DISABLED_IN_RANGE"
     );
+    assert_eq!(error.sql_state(), Some("0AKDE"));
+    assert_eq!(
+        error
+            .parameters()
+            .iter()
+            .map(|p| (p.name(), p.value()))
+            .collect::<Vec<_>>(),
+        [("version", "1")]
+    );
+    let context = std::error::Error::source(&error).unwrap();
+    assert_eq!(context.to_string(), "commit v=1");
+    assert!(matches!(
+        context.source().unwrap().downcast_ref::<KernelError>(),
+        Some(KernelError::RowTrackingChangeFeedUnsupported(1))
+    ));
 }
 
 fn nested_id_type(value_type: DataType) -> DataType {
@@ -470,9 +559,8 @@ async fn row_tracking_schema_compatibility(
         assert!(
             matches!(
                 &res,
-                Err(Error::Kernel(
-                    KernelError::ChangeDataFeedIncompatibleSchema(_, _)
-                ))
+                Err(Error::Delta(error)) if error.condition() ==
+                    DeltaErrorCondition::DeltaChangeDataFeedIncompatibleSchemaChange
             ),
             "expected incompatible-schema error, got {res:?}"
         );
@@ -603,16 +691,41 @@ async fn incompatible_schemas_fail() {
 
         let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
         let table_config = get_default_table_config(&table_root_url);
+        let expected_read_schema = cdf_schema.to_string();
         let res: Result<Vec<_>> =
             table_changes_action_iter(engine, &table_config, commits, cdf_schema, None)
                 .unwrap()
                 .try_collect();
 
+        let Error::Delta(error) = res.err().unwrap() else {
+            panic!("expected replay schema Delta error")
+        };
+        assert_eq!(
+            error.name(),
+            "DELTA_CHANGE_DATA_FEED_INCOMPATIBLE_SCHEMA_CHANGE"
+        );
+        assert_eq!(error.sql_state(), Some("0AKDC"));
+        let parameters = error.parameters();
+        assert_eq!(
+            parameters.iter().map(|p| p.name()).collect::<Vec<_>>(),
+            [
+                "start",
+                "end",
+                "readSchema",
+                "readVersion",
+                "incompatibleVersion"
+            ]
+        );
+        assert_eq!(parameters[0].value(), "0");
+        assert_eq!(parameters[1].value(), "0");
+        assert_eq!(parameters[2].value(), expected_read_schema);
+        assert_eq!(parameters[3].value(), "0");
+        assert_eq!(parameters[4].value(), "0");
+        let context = std::error::Error::source(&error).unwrap();
+        assert_eq!(context.to_string(), "commit v=0");
         assert!(matches!(
-            res,
-            Err(Error::Kernel(
-                KernelError::ChangeDataFeedIncompatibleSchema(_, _)
-            ))
+            context.source().unwrap().downcast_ref::<KernelError>(),
+            Some(KernelError::ChangeDataFeedIncompatibleSchema(_, _))
         ));
     }
 
@@ -740,9 +853,7 @@ async fn demonstration_schema_evolution_failures() {
     assert!(
         matches!(
             res,
-            Err(Error::Kernel(
-                KernelError::ChangeDataFeedIncompatibleSchema(_, _)
-            ))
+            Err(Error::Delta(ref error)) if error.name() == "DELTA_CHANGE_DATA_FEED_INCOMPATIBLE_SCHEMA_CHANGE"
         ),
         "Expected ChangeDataFeedIncompatibleSchema error for adding nullable column"
     );
@@ -762,9 +873,7 @@ async fn demonstration_schema_evolution_failures() {
     assert!(
         matches!(
             res,
-            Err(Error::Kernel(
-                KernelError::ChangeDataFeedIncompatibleSchema(_, _)
-            ))
+            Err(Error::Delta(ref error)) if error.name() == "DELTA_CHANGE_DATA_FEED_INCOMPATIBLE_SCHEMA_CHANGE"
         ),
         "Expected ChangeDataFeedIncompatibleSchema error for type widening"
     );
@@ -784,9 +893,7 @@ async fn demonstration_schema_evolution_failures() {
     assert!(
         matches!(
             res,
-            Err(Error::Kernel(
-                KernelError::ChangeDataFeedIncompatibleSchema(_, _)
-            ))
+            Err(Error::Delta(ref error)) if error.name() == "DELTA_CHANGE_DATA_FEED_INCOMPATIBLE_SCHEMA_CHANGE"
         ),
         "Expected ChangeDataFeedIncompatibleSchema error for nullability change"
     );
@@ -1246,6 +1353,7 @@ async fn file_meta_timestamp() {
         &mut table_config,
         commit,
         &get_schema(),
+        0..=0,
         CdfMode::ChangeDataFeed,
     )
     .unwrap();
@@ -1534,6 +1642,7 @@ async fn test_timestamp_with_ict_enabled() {
         &mut table_config,
         commit,
         &get_schema(),
+        0..=0,
         CdfMode::ChangeDataFeed,
     )
     .unwrap();
@@ -1585,6 +1694,7 @@ async fn test_timestamp_with_ict_disabled() {
         &mut table_config,
         commit.clone(),
         &get_schema(),
+        0..=0,
         CdfMode::ChangeDataFeed,
     )
     .unwrap();
@@ -1643,6 +1753,7 @@ async fn test_timestamp_with_commit_info_not_first() {
         &mut table_config,
         commit,
         &get_schema(),
+        0..=0,
         CdfMode::ChangeDataFeed,
     );
 

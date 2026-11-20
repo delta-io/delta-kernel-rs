@@ -2668,7 +2668,7 @@ mod tests {
             .expect_err("DV updates should require delta.enableDeletionVectors=true");
 
         assert!(
-            matches!(err, KernelError::Unsupported(_)),
+            matches!(err, Error::Kernel(KernelError::Unsupported(_))),
             "unexpected error: {err}"
         );
         assert!(
@@ -2709,9 +2709,7 @@ mod tests {
         let (engine, snapshot) = setup_dv_enabled_table();
         let mut txn = create_dv_transaction(snapshot.clone(), &engine)?;
         let scan = snapshot.scan_builder().build()?;
-        let scan_metadata = scan
-            .scan_metadata(&engine)?
-            .collect::<KernelResult<Vec<_>>>()?;
+        let scan_metadata = scan.scan_metadata(&engine)?.collect::<Result<Vec<_>>>()?;
 
         let mut paths = Vec::new();
         for metadata in &scan_metadata {
@@ -2759,9 +2757,7 @@ mod tests {
             ));
         let staged_len_before = txn.staged_data_changes.dv_matched_files.len();
         let scan = snapshot.scan_builder().build()?;
-        let scan_metadata = scan
-            .scan_metadata(&engine)?
-            .collect::<KernelResult<Vec<_>>>()?;
+        let scan_metadata = scan.scan_metadata(&engine)?.collect::<Result<Vec<_>>>()?;
 
         let mut paths = Vec::new();
         for metadata in &scan_metadata {
@@ -2781,9 +2777,9 @@ mod tests {
             scan_metadata
                 .into_iter()
                 .map(|metadata| Ok(metadata.scan_files))
-                .chain(std::iter::once(Err(KernelError::generic(
+                .chain(std::iter::once(Err(Error::Kernel(KernelError::generic(
                     "simulated scan metadata failure",
-                )))),
+                ))))),
         );
 
         assert!(result.is_err(), "iterator error should propagate");

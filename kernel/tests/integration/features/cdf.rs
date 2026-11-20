@@ -435,12 +435,21 @@ fn false_data_change_is_ignored() -> delta_kernel::Result<()> {
 #[test]
 fn invalid_range_end_before_start() {
     let res = read_cdf_for_table("cdf-table-simple", 1, 0, None);
-    let expected_msg =
-        "Failed to build LogSegment: start_version cannot be greater than end_version";
-    assert!(matches!(
-        res,
-        Err(delta_kernel::Error::Kernel(KernelError::Generic(msg))) if msg == expected_msg
-    ));
+    let Err(delta_kernel::Error::Delta(error)) = res else {
+        panic!("expected invalid CDC range");
+    };
+    assert_eq!(error.name(), "DELTA_INVALID_CDC_RANGE");
+    assert_eq!(error.sql_state(), Some("22003"));
+    assert_eq!(error.parameters()[0].value(), "1");
+    assert_eq!(error.parameters()[1].value(), "0");
+    let source = std::error::Error::source(&error)
+        .unwrap()
+        .downcast_ref::<KernelError>()
+        .unwrap();
+    assert!(
+        matches!(source.without_backtrace(), KernelError::Generic(message)
+        if message == "Failed to build LogSegment: start_version cannot be greater than end_version")
+    );
 }
 
 #[test]

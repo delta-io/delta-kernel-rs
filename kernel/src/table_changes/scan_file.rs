@@ -564,6 +564,7 @@ mod tests {
             log_segment.listed.ascending_commit_files,
             table_schema,
             None,
+            0..=log_segment.end_version,
             CdfMode::RowTracking,
         )
         .unwrap();
@@ -672,6 +673,7 @@ mod tests {
             log_segment.listed.ascending_commit_files.clone(),
             table_schema,
             None,
+            0..=log_segment.end_version,
         )
         .unwrap();
         let scan_files: Vec<_> = scan_metadata_to_scan_file(scan_metadata)

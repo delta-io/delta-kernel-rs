@@ -28,18 +28,20 @@ use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::scan::data_skipping::{all_referenced_columns, as_checkpoint_skipping_predicate};
 use crate::scan::state::ScanFile;
+use crate::scan::state_info::tests::get_state_info_with_stats;
 use crate::schema::{
     self, ColumnMetadataKey, DataType, MetadataColumnSpec, StructField, StructType, schema,
     schema_ref,
 };
+use crate::table_changes::TableChanges;
 use crate::transaction::create_table::create_table;
 use crate::transaction::data_layout::DataLayout;
 use crate::unit_test_utils::TestCancellationToken;
 use crate::unit_test_utils::recording_reads::{Read, RecordingReads};
 use crate::{
-    CancellationTokenRef, Engine, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
-    KernelError, KernelResult, KernelResultIterator, ParquetFooter, ParquetHandler, PredicateRef,
-    Result, Snapshot,
+    CancellationTokenRef, Engine, EngineData, Error, FileDataReadResultIterator, FileMeta,
+    FileSize, KernelError, KernelResult, KernelResultIterator, ParquetFooter, ParquetHandler,
+    PredicateRef, Result, Snapshot,
 };
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -374,6 +376,96 @@ fn test_physical_predicate_case_insensitive(
     assert_eq!(result, expected);
 }
 
+#[rstest]
+#[case::missing(vec!["s", "absent"], false)]
+#[case::quoted_missing(vec!["s", "missing'\\\""], false)]
+#[case::scalar_prefix(vec!["s", "id", "child"], true)]
+#[case::quoted_prefix(vec!["quote'\\\"", "child"], true)]
+fn column_lookup_catalog_metadata(
+    #[case] path: Vec<&str>,
+    #[case] non_struct: bool,
+    #[values(false, true)] predicate: bool,
+) {
+    let schema = schema_ref! {
+        nullable "s": { nullable "id": LONG },
+        nullable "quote'\\\"": LONG,
+    };
+    let column = ColumnName::new(path.clone());
+    let error = if predicate {
+        PhysicalPredicate::try_new(
+            &Expr::column(path).is_not_null(),
+            &schema,
+            ColumnMappingMode::None,
+        )
+        .unwrap_err()
+    } else {
+        get_state_info_with_stats(
+            schema.clone(),
+            vec![],
+            None,
+            &[],
+            HashMap::new(),
+            vec![],
+            StatsOptions::struct_columns(vec![column.clone()]),
+        )
+        .expect_err("invalid requested column")
+    };
+    let Error::Delta(error) = error else {
+        panic!("expected lookup Delta error")
+    };
+    assert_eq!(
+        error.sql_state(),
+        Some(if non_struct { "42704" } else { "42703" })
+    );
+    let parameters = error
+        .parameters()
+        .iter()
+        .map(|p| (p.name(), p.value()))
+        .collect::<Vec<_>>();
+    let column_text = column.to_string();
+    let schema_text = schema.to_string();
+    if non_struct {
+        let prefix =
+            ColumnName::new(column.path()[..column.path().len() - 1].iter().cloned()).to_string();
+        assert_eq!(error.name(), "DELTA_COLUMN_PATH_NOT_NESTED");
+        assert_eq!(
+            parameters,
+            vec![
+                ("columnPath", prefix.as_str()),
+                ("other", "long"),
+                ("column", column_text.as_str()),
+                ("schema", schema_text.as_str())
+            ]
+        );
+    } else {
+        assert_eq!(error.name(), "DELTA_COLUMN_NOT_FOUND_IN_SCHEMA");
+        assert_eq!(
+            parameters,
+            vec![
+                ("columnName", column_text.as_str()),
+                ("tableSchema", schema_text.as_str())
+            ]
+        );
+    }
+    assert!(
+        std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<KernelError>()
+            .is_some()
+    );
+}
+
+#[rstest]
+#[case::empty_path(vec![])]
+#[case::resolved_path(vec!["id"])]
+fn lookup_classification_preserves_unrelated_kernel_errors(#[case] path: Vec<&str>) {
+    let schema = schema! { nullable "id": LONG };
+    let source = KernelError::Schema("missing mapping annotation".into());
+    let error = column_lookup_error(source, &schema, &ColumnName::new(path), false);
+    assert!(matches!(error, Error::Kernel(KernelError::Schema(message))
+        if message == "missing mapping annotation"));
+}
+
 /// Unknown column still fails even with case-insensitive matching.
 #[test]
 fn test_physical_predicate_case_insensitive_unknown_column() {
@@ -456,7 +548,7 @@ fn test_scan_builder_rejects_predicate_on_projection_only_metadata_column() {
         .expect_err("build should reject predicate referencing a projection-only metadata column");
     let msg = err.to_string();
     assert!(
-        msg.contains("Predicate references unknown column") && msg.contains("my_row_index"),
+        msg.contains("Couldn't find column my_row_index"),
         "unexpected error: {msg}"
     );
 }
@@ -646,7 +738,7 @@ fn test_without_row_transforms_scan_metadata_surfaces_deletion_vectors() {
     );
 }
 
-fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> KernelResult<Vec<String>> {
+fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> Result<Vec<String>> {
     let scan_metadata_iter = scan.scan_metadata(engine)?;
     fn scan_metadata_callback(paths: &mut Vec<String>, scan_file: ScanFile) {
         paths.push(scan_file.path.to_string());
@@ -882,7 +974,10 @@ fn scan_metadata_from_cancels_cached_metadata_consumption() {
         .unwrap();
 
     token.cancel();
-    assert!(matches!(metadata.next(), Some(Err(KernelError::Cancelled))));
+    assert!(matches!(
+        metadata.next(),
+        Some(Err(Error::Kernel(KernelError::Cancelled)))
+    ));
 }
 
 #[rstest]
@@ -951,8 +1046,11 @@ fn scan_metadata_from_binds_token_to_new_reads(
 
     if pre_cancelled {
         let cancelled = match result {
-            Err(KernelError::Cancelled) => true,
-            Ok(mut metadata) => matches!(metadata.next(), Some(Err(KernelError::Cancelled))),
+            Err(Error::Kernel(KernelError::Cancelled)) => true,
+            Ok(mut metadata) => matches!(
+                metadata.next(),
+                Some(Err(Error::Kernel(KernelError::Cancelled)))
+            ),
             Err(_) => false,
         };
         assert!(cancelled, "pre-cancelled scan must report cancellation");
@@ -1195,7 +1293,7 @@ fn test_scan_metadata_with_stats_columns() {
     let scan_metadata_results: Vec<_> = scan
         .scan_metadata(engine.as_ref())
         .unwrap()
-        .collect::<KernelResult<Vec<_>>>()
+        .collect::<Result<Vec<_>>>()
         .unwrap();
 
     assert!(
@@ -2130,7 +2228,7 @@ fn test_all_struct_parses_json_commit_stats() {
     for scan_metadata in scan
         .scan_metadata(engine.as_ref())
         .unwrap()
-        .collect::<KernelResult<Vec<_>>>()
+        .collect::<Result<Vec<_>>>()
         .unwrap()
     {
         let (underlying_data, selection_vector) = scan_metadata.scan_files.into_parts();
@@ -2219,7 +2317,7 @@ fn test_skip_stats_disables_data_skipping() {
     let scan_metadata_results: Vec<_> = scan
         .scan_metadata(engine.as_ref())
         .unwrap()
-        .collect::<KernelResult<Vec<_>>>()
+        .collect::<Result<Vec<_>>>()
         .unwrap();
 
     let mut selected_file_count = 0;
@@ -2253,7 +2351,7 @@ fn test_with_stats_last_call_wins() {
     for scan_metadata in scan
         .scan_metadata(engine.as_ref())
         .unwrap()
-        .collect::<KernelResult<Vec<_>>>()
+        .collect::<Result<Vec<_>>>()
         .unwrap()
     {
         let (underlying_data, _) = scan_metadata.scan_files.into_parts();
@@ -2284,7 +2382,7 @@ fn test_default_stats_options_no_struct_output() {
     let scan_metadata_results: Vec<_> = scan
         .scan_metadata(engine.as_ref())
         .unwrap()
-        .collect::<KernelResult<Vec<_>>>()
+        .collect::<Result<Vec<_>>>()
         .unwrap();
 
     assert!(
@@ -2500,7 +2598,7 @@ fn test_scan_metadata_with_nonexistent_stats_columns() {
         })
         .build();
 
-    assert_result_error_with_message(result, "Could not resolve column 'nonexistent_column'");
+    assert_result_error_with_message(result, "Couldn't find column nonexistent_column");
 }
 
 #[test]
@@ -2876,6 +2974,114 @@ fn scan_builder_stats_output_schemas_returns_none_without_struct_output(
         .with_stats(stats);
 
     assert!(builder.stats_output_schemas().unwrap().is_none());
+}
+
+struct FailingParquetHandler {
+    lazy: bool,
+    missing: bool,
+    paths: Arc<Mutex<Vec<String>>>,
+}
+
+impl ParquetHandler for FailingParquetHandler {
+    fn read_parquet_files(
+        &self,
+        files: &[FileMeta],
+        _schema: SchemaRef,
+        _predicate: Option<PredicateRef>,
+    ) -> KernelResult<FileDataReadResultIterator> {
+        self.paths
+            .lock()
+            .unwrap()
+            .extend(files.iter().map(|file| file.location.to_string()));
+        let error = if self.missing {
+            KernelError::FileNotFound("original engine diagnostic".into())
+        } else {
+            KernelError::Cancelled
+        };
+        if self.lazy {
+            Ok(Box::new(std::iter::once(Err(error))))
+        } else {
+            Err(error)
+        }
+    }
+
+    fn read_parquet_footer(&self, _: &FileMeta) -> KernelResult<ParquetFooter> {
+        panic!("unexpected footer read")
+    }
+
+    fn write_parquet_file(
+        &self,
+        _: Url,
+        _: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
+    ) -> KernelResult<FileSize> {
+        panic!("unexpected write")
+    }
+}
+
+#[rstest]
+fn required_data_file_errors_preserve_classification(
+    #[values(false, true)] lazy: bool,
+    #[values(false, true)] missing: bool,
+    #[values(false, true)] cdf: bool,
+) {
+    let fixture = if cdf {
+        "tests/data/table-with-cdf"
+    } else {
+        "tests/data/table-without-dv-small"
+    };
+    let root = Url::from_directory_path(fs::canonicalize(fixture).unwrap()).unwrap();
+    let paths = Arc::new(Mutex::new(vec![]));
+    let engine = Arc::new(
+        DelegatingEngine::new(Arc::new(SyncEngine::new())).with_parquet_handler(Arc::new(
+            FailingParquetHandler {
+                lazy,
+                missing,
+                paths: paths.clone(),
+            },
+        )),
+    );
+    let error = if cdf {
+        let changes = TableChanges::try_new(root.as_str(), engine.as_ref(), 0, Some(1)).unwrap();
+        Arc::new(changes)
+            .scan_builder()
+            .build()
+            .unwrap()
+            .execute(engine)
+            .unwrap()
+            .next()
+            .unwrap()
+            .err()
+            .expect("data-file failure")
+    } else {
+        let scan = Snapshot::builder_for(root.as_str())
+            .build(engine.as_ref())
+            .unwrap()
+            .scan_builder()
+            .build()
+            .unwrap();
+        scan.execute(engine)
+            .unwrap()
+            .next()
+            .unwrap()
+            .err()
+            .expect("data-file failure")
+    };
+    if missing {
+        let Error::Delta(error) = error else {
+            panic!("expected missing-file Delta error")
+        };
+        assert_eq!(error.name(), "DELTA_FILE_NOT_FOUND");
+        assert_eq!(error.sql_state(), Some("42K03"));
+        assert_eq!(error.parameters()[0].name(), "path");
+        let path = error.parameters()[0].value();
+        assert_eq!(path, paths.lock().unwrap()[0]);
+        assert_eq!(
+            std::error::Error::source(&error).unwrap().to_string(),
+            KernelError::FileNotFound("original engine diagnostic".into()).to_string()
+        );
+    } else {
+        assert!(matches!(error, Error::Kernel(KernelError::Cancelled)));
+    }
 }
 
 /// A [`ParquetHandler`] that returns an empty iterator for every `read_parquet_files` call.

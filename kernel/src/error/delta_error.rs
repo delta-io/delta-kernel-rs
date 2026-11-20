@@ -6,8 +6,8 @@ use std::fmt;
 
 use super::{BoxedError, DeltaErrorCondition};
 use crate::Version;
-use crate::schema::StructType;
-use crate::table_properties::LOG_RETENTION_DURATION;
+use crate::schema::{DataType, StructType};
+use crate::table_properties::{ENABLE_CHANGE_DATA_FEED, LOG_RETENTION_DURATION};
 #[cfg(any(test, feature = "test-utils"))]
 use crate::{KernelError, KernelResult};
 
@@ -103,6 +103,161 @@ impl DeltaError {
     /// disabled unless `RUST_BACKTRACE` or `RUST_LIB_BACKTRACE` enables it.
     pub fn backtrace(&self) -> &Backtrace {
         &self.backtrace
+    }
+
+    /// Reports a scan of a table whose schema has no columns.
+    pub fn read_table_without_columns(
+        table_name: impl ToString,
+        source: Option<BoxedError>,
+    ) -> Self {
+        // TODO(https://github.com/delta-io/delta/issues/8177): Update the message in delta-io/delta
+        // to "Add at least one column to the table before reading it."
+        Self::new(
+            DeltaErrorCondition::DeltaReadTableWithoutColumns,
+            vec![DeltaErrorParameter::new("tableName", table_name)],
+            source,
+        )
+    }
+
+    /// Reports an active file's partition value that cannot be read as the expected type.
+    pub fn failed_cast_partition_value(
+        value: &str,
+        data_type: &DataType,
+        source: Option<BoxedError>,
+    ) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaFailedCastPartitionValue,
+            vec![
+                DeltaErrorParameter::new("value", value),
+                DeltaErrorParameter::new("dataType", data_type),
+            ],
+            source,
+        )
+    }
+
+    /// Reports a replay commit that disables row tracking after a known enabled state.
+    pub fn row_tracking_disabled_in_range(version: Version, source: Option<BoxedError>) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaChangelogRowTrackingDisabledInRange,
+            vec![DeltaErrorParameter::new("version", version)],
+            source,
+        )
+    }
+
+    /// Reports the replay commit incompatible with the change feed's end-version read schema.
+    pub fn change_data_feed_incompatible_schema_change(
+        start: Version,
+        end: Version,
+        read_schema: &StructType,
+        read_version: Version,
+        incompatible_version: Version,
+        source: Option<BoxedError>,
+    ) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaChangeDataFeedIncompatibleSchemaChange,
+            vec![
+                DeltaErrorParameter::new("start", start),
+                DeltaErrorParameter::new("end", end),
+                DeltaErrorParameter::new("readSchema", read_schema),
+                DeltaErrorParameter::new("readVersion", read_version),
+                DeltaErrorParameter::new("incompatibleVersion", incompatible_version),
+            ],
+            source,
+        )
+    }
+
+    /// Reports a version without recorded change data in the requested inclusive range.
+    pub fn missing_change_data(
+        start_version: Version,
+        end_version: Version,
+        version: Version,
+        source: Option<BoxedError>,
+    ) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaMissingChangeData,
+            vec![
+                DeltaErrorParameter::new("startVersion", start_version),
+                DeltaErrorParameter::new("endVersion", end_version),
+                DeltaErrorParameter::new("version", version),
+                DeltaErrorParameter::new("key", ENABLE_CHANGE_DATA_FEED),
+            ],
+            source,
+        )
+    }
+
+    /// Reports the exact path of a required data, change-data, or deletion-vector file.
+    pub fn file_not_found(path: impl ToString, source: Option<BoxedError>) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaFileNotFound,
+            vec![DeltaErrorParameter::new("path", path)],
+            source,
+        )
+    }
+
+    /// Reports a deletion vector whose stored CRC differs from its computed checksum.
+    pub fn deletion_vector_checksum_mismatch(source: Option<BoxedError>) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaDeletionVectorChecksumMismatch,
+            vec![],
+            source,
+        )
+    }
+
+    /// Reports a stored deletion-vector size that differs from its descriptor.
+    pub fn deletion_vector_size_mismatch(source: Option<BoxedError>) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaDeletionVectorSizeMismatch,
+            vec![],
+            source,
+        )
+    }
+
+    /// Reports a requested logical column absent from the table schema.
+    pub fn column_not_found_in_schema(
+        column: &str,
+        schema: &StructType,
+        source: Option<BoxedError>,
+    ) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaColumnNotFoundInSchema,
+            vec![
+                DeltaErrorParameter::new("columnName", column),
+                DeltaErrorParameter::new("tableSchema", schema),
+            ],
+            source,
+        )
+    }
+
+    /// Reports the non-struct prefix that prevents resolving a nested logical column.
+    pub fn column_path_not_nested(
+        prefix: &str,
+        data_type: &DataType,
+        column: &str,
+        schema: &StructType,
+        source: Option<BoxedError>,
+    ) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaColumnPathNotNested,
+            vec![
+                DeltaErrorParameter::new("columnPath", prefix),
+                DeltaErrorParameter::new("other", data_type),
+                DeltaErrorParameter::new("column", column),
+                DeltaErrorParameter::new("schema", schema),
+            ],
+            source,
+        )
+    }
+
+    /// Reports explicitly reversed bounds for a change-data-feed request.
+    pub fn invalid_cdc_range(start: Version, end: Version, source: Option<BoxedError>) -> Self {
+        Self::new(
+            DeltaErrorCondition::DeltaInvalidCdcRange,
+            vec![
+                DeltaErrorParameter::new("start", start),
+                DeltaErrorParameter::new("end", end),
+            ],
+            source,
+        )
     }
 
     /// Creates a `DELTA_PATH_DOES_NOT_EXIST` error for a table root that does not exist or has no
@@ -406,7 +561,7 @@ mod tests {
     use rstest::rstest;
 
     use super::{DeltaError, DeltaErrorParameter, render_template};
-    use crate::schema::StructType;
+    use crate::schema::{DataType, StructType};
     use crate::table_features::ColumnMappingMode;
     use crate::{BoxedError, DeltaErrorCondition, Error, KernelError, Result};
 
@@ -421,6 +576,58 @@ mod tests {
                 .checked_sub(text.len())
                 .ok_or(fmt::Error)?;
             Ok(())
+        }
+    }
+
+    #[rstest]
+    #[case::range(|s| DeltaError::invalid_cdc_range(2, 1, s))]
+    #[case::size(DeltaError::deletion_vector_size_mismatch)]
+    #[case::checksum(DeltaError::deletion_vector_checksum_mismatch)]
+    #[case::file(|s| DeltaError::file_not_found("file:///missing", s))]
+    #[case::cdf_disabled(|s| DeltaError::missing_change_data(1, 3, 2, s))]
+    #[case::cdf_schema(|s| DeltaError::change_data_feed_incompatible_schema_change(
+        1, 3, &StructType::try_new([]).unwrap(), 3, 2, s))]
+    #[case::row_tracking(|s| DeltaError::row_tracking_disabled_in_range(2, s))]
+    #[case::partition(|s| DeltaError::failed_cast_partition_value("bad", &DataType::LONG, s))]
+    #[case::missing_column(|s| DeltaError::column_not_found_in_schema("missing", &StructType::try_new([]).unwrap(), s))]
+    #[case::non_struct(|s| DeltaError::column_path_not_nested("a", &DataType::LONG, "a.b", &StructType::try_new([]).unwrap(), s))]
+    fn scan_constructors_preserve_optional_sources(
+        #[case] make_error: fn(Option<BoxedError>) -> DeltaError,
+        #[values(0, 1, 2)] source_kind: u8,
+    ) {
+        let expected = make_error(None);
+        let source: Option<BoxedError> = match source_kind {
+            0 => None,
+            1 => Some(Box::new(KernelError::Backtraced {
+                source: Box::new(KernelError::generic("original scan cause")),
+                backtrace: Box::new(std::backtrace::Backtrace::capture()),
+            })),
+            _ => Some(Box::new(std::io::Error::other("original foreign cause"))),
+        };
+        let error = make_error(source);
+        assert_eq!(error.condition(), expected.condition());
+        assert_eq!(error.parameters(), expected.parameters());
+        assert_eq!(error.message(), expected.message());
+        if source_kind == 1 {
+            let source = error
+                .source()
+                .unwrap()
+                .downcast_ref::<KernelError>()
+                .unwrap();
+            assert!(matches!(source, KernelError::Backtraced { .. }));
+            assert_eq!(
+                source.without_backtrace().to_string(),
+                "Generic delta kernel error: original scan cause"
+            );
+        } else if source_kind == 2 {
+            let source = error
+                .source()
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .unwrap();
+            assert_eq!(source.to_string(), "original foreign cause");
+        } else {
+            assert!(error.source().is_none());
         }
     }
 

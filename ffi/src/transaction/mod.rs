@@ -4694,7 +4694,7 @@ mod tests {
         let scan = snapshot.scan_builder().build()?;
         let scan_meta: Vec<_> = scan
             .scan_metadata(kernel_engine.as_ref())?
-            .collect::<KernelResult<_>>()?;
+            .collect::<Result<_, _>>()?;
         let total_selected: usize = scan_meta
             .iter()
             .map(|m| {
@@ -4738,7 +4738,7 @@ mod tests {
         let scan = snapshot.scan_builder().build()?;
         let scan_meta_items: Vec<_> = scan
             .scan_metadata(kernel_engine.as_ref())?
-            .collect::<KernelResult<_>>()?;
+            .collect::<Result<_, _>>()?;
         assert_eq!(scan_meta_items.len(), 1);
 
         let scan_meta = scan_meta_items.into_iter().next().unwrap();
@@ -4965,8 +4965,8 @@ mod tests {
         let scan_after = snapshot.scan_builder().build()?;
         let total: usize = scan_after
             .execute(kernel_engine.clone())?
-            .map(|r| Ok::<_, delta_kernel::KernelError>(r?.len()))
-            .sum::<KernelResult<_>>()?;
+            .map(|r| r.map(|data| data.len()))
+            .sum::<delta_kernel::Result<_>>()?;
         assert_eq!(total, 2, "expected 2 surviving rows");
 
         unsafe {

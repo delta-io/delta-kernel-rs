@@ -53,6 +53,7 @@ use crate::actions::{ADD_FIELD, ADD_NAME, Add, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 use crate::engine::CancellableEngine;
 use crate::engine_data::FilteredEngineData;
+use crate::error::required_file_error;
 use crate::expressions::{
     ColumnName, ExpressionRef, MapToStructOptions, Predicate, PredicateRef, column_name,
 };
@@ -82,8 +83,8 @@ use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{ExpressionTransform, SchemaTransform, transform_output_type};
 use crate::utils::{FoldWithOption as _, IteratorExt, require};
 use crate::{
-    Engine, EngineData, Error, FileMeta, KernelError, KernelResult, KernelResultIterator, Result,
-    SnapshotRef, Version,
+    DeltaError, Engine, EngineData, Error, FileMeta, KernelError, KernelResult,
+    KernelResultIterator, Result, SnapshotRef, Version,
 };
 
 pub(crate) mod data_skipping;
@@ -597,7 +598,7 @@ impl ScanBuilder {
     /// Extra-indexed columns that cannot be resolved are omitted with a warning. Returns an error
     /// when a column requested through [`StatsOptions::struct_columns`] cannot be resolved, or when
     /// the selected fields cannot form a valid statistics schema.
-    pub fn stats_output_schemas(&self) -> KernelResult<Option<StatsOutputSchemas>> {
+    pub fn stats_output_schemas(&self) -> Result<Option<StatsOutputSchemas>> {
         build_stats_output_schemas(self.snapshot.table_configuration(), &self.stats)
     }
 
@@ -676,14 +677,15 @@ impl ScanBuilder {
         // Predicates may reference columns outside self.logical_read_schema, so resolve against the
         // full table schema
         let table_schema = self.snapshot.schema();
-        // Reject scans of empty-schema tables. CREATE TABLE accepts an empty schema as
-        // a transient state, but a scan over zero columns has no way to derive row
-        // counts downstream and panics in the arrow layer. Users must populate the
-        // schema with ALTER TABLE ADD COLUMN before scanning.
+        // CREATE TABLE accepts an empty schema, but scans require columns to derive row counts.
         if table_schema.num_fields() == 0 {
-            return Err(Error::Kernel(KernelError::generic(
+            let source = KernelError::generic(
                 "Cannot scan Delta table with empty schema; use ALTER TABLE ADD COLUMN \
                  to add at least one column before scanning",
+            );
+            return Err(Error::Delta(DeltaError::read_table_without_columns(
+                self.snapshot.table_root(),
+                Some(Box::new(source)),
             )));
         }
 
@@ -755,7 +757,7 @@ impl PhysicalPredicate {
         predicate: &Predicate,
         logical_schema: &Schema,
         column_mapping_mode: ColumnMappingMode,
-    ) -> KernelResult<PhysicalPredicate> {
+    ) -> Result<PhysicalPredicate> {
         if can_statically_skip_all_files(predicate) {
             return Ok(PhysicalPredicate::StaticSkipAll);
         }
@@ -786,9 +788,15 @@ impl PhysicalPredicate {
             // clause has invalid column references. Data skipping is best-effort and the predicate
             // anyway needs to be evaluated against every row of data -- which is impossible if the
             // columns are missing/invalid. Just blow up instead of trying to handle it gracefully.
-            return Err(KernelError::missing_column(format!(
+            let source = KernelError::missing_column(format!(
                 "Predicate references unknown column: {unresolved}"
-            )));
+            ));
+            return Err(column_lookup_error(
+                source,
+                logical_schema,
+                unresolved,
+                true,
+            ));
         }
         let Some(schema) = schema_opt else {
             // The predicate doesn't statically skip all files, and it doesn't reference any columns
@@ -1032,16 +1040,16 @@ pub struct Scan {
 pub(crate) fn build_stats_output_schemas(
     table_configuration: &TableConfiguration,
     stats: &StatsOptions,
-) -> KernelResult<Option<StatsOutputSchemas>> {
+) -> Result<Option<StatsOutputSchemas>> {
     match &stats.struct_stats {
         StructStats::None => Ok(None),
-        StructStats::AllIndexed { extra_indexed } => table_configuration
+        StructStats::AllIndexed { extra_indexed } => Ok(table_configuration
             .build_indexed_stats_output_schemas(
                 extra_indexed,
                 stats.variant_min_max,
                 #[cfg(feature = "geo-type-in-dev")]
                 stats.geometry_min_max,
-            ),
+            )?),
         StructStats::Columns { requested } => table_configuration
             .build_selected_stats_output_schemas(
                 requested,
@@ -1189,14 +1197,14 @@ impl Scan {
     pub fn scan_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> KernelResult<impl KernelResultIterator<ScanMetadata> + use<>> {
+    ) -> Result<impl Iterator<Item = Result<ScanMetadata>> + Send + use<>> {
         self.with_cancellable_engine(engine, |engine| self.scan_metadata_with_engine(engine))
     }
 
     fn scan_metadata_with_engine(
         &self,
         engine: &dyn Engine,
-    ) -> KernelResult<impl KernelResultIterator<ScanMetadata> + use<>> {
+    ) -> Result<impl Iterator<Item = Result<ScanMetadata>> + Send + use<>> {
         let actions_with_checkpoint_info = self.replay_for_scan_metadata(engine)?;
         self.scan_metadata_inner(engine, actions_with_checkpoint_info)
     }
@@ -1258,7 +1266,7 @@ impl Scan {
         existing_version: Version,
         existing_data: impl IntoIterator<Item = Box<dyn EngineData>, IntoIter: Send + 'static>,
         existing_predicate: Option<PredicateRef>,
-    ) -> KernelResult<Box<dyn KernelResultIterator<ScanMetadata>>> {
+    ) -> Result<Box<dyn Iterator<Item = Result<ScanMetadata>> + Send>> {
         self.with_cancellable_engine(engine, |engine| {
             self.scan_metadata_from_with_engine(
                 engine,
@@ -1275,7 +1283,7 @@ impl Scan {
         existing_version: Version,
         existing_data: impl IntoIterator<Item = Box<dyn EngineData>, IntoIter: Send + 'static>,
         _existing_predicate: Option<PredicateRef>,
-    ) -> KernelResult<Box<dyn KernelResultIterator<ScanMetadata>>> {
+    ) -> Result<Box<dyn Iterator<Item = Result<ScanMetadata>> + Send>> {
         // TODO(#3609): scan_metadata_from does not reuse existing partitionValues_parsed
         // from compatible checkpoints. Support reusing those values and enable connector-supplied
         // timezone support.
@@ -1284,10 +1292,10 @@ impl Scan {
                 self.snapshot.table_configuration(),
                 &self.partition_values_options,
             ),
-            KernelError::unsupported(
+            Error::Kernel(KernelError::unsupported(
                 "Kernel does not yet support with_timestamp_timezone in scan_metadata_from on \
                  tables with TIMESTAMP partition columns; use scan_metadata instead"
-            )
+            ))
         );
         // TODO(#966): validate that the current predicate is compatible with the hint predicate.
         let existing_data = existing_data.into_iter();
@@ -1297,11 +1305,11 @@ impl Scan {
             CancellableIterator::new(existing_data.map(Ok), self.cancellation_token.clone());
 
         if existing_version > self.snapshot.version() {
-            return Err(KernelError::Generic(format!(
+            return Err(Error::Kernel(KernelError::Generic(format!(
                 "existing_version {} is greater than current version {}",
                 existing_version,
                 self.snapshot.version()
-            )));
+            ))));
         }
 
         // in order to be processed by our log replay, we must re-shape the existing scan metadata
@@ -1423,7 +1431,7 @@ impl Scan {
         &self,
         engine: &dyn Engine,
         actions_with_checkpoint_info: ActionsWithCheckpointInfo<I>,
-    ) -> KernelResult<impl KernelResultIterator<ScanMetadata> + use<I>>
+    ) -> Result<impl Iterator<Item = Result<ScanMetadata>> + Send + use<I>>
     where
         I: KernelResultIterator<ActionsBatch>,
     {
@@ -1787,13 +1795,13 @@ impl Scan {
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>> + use<>> {
+    ) -> Result<impl Iterator<Item = Result<Box<dyn EngineData>>> + Send + use<>> {
         if self.state_info.skip_row_transforms {
-            return Err(KernelError::unsupported(
+            return Err(Error::Kernel(KernelError::unsupported(
                 "Scan::execute is not supported when row transforms are disabled by \
                  without_row_transforms or by with_timestamp_timezone on a table with TIMESTAMP \
                  partition columns; use scan_metadata for listing and read data with your own reader",
-            ));
+            )));
         }
 
         fn scan_metadata_callback(batches: &mut Vec<state::ScanFile>, file: state::ScanFile) {
@@ -1809,10 +1817,10 @@ impl Scan {
 
         let scan_metadata_iter = self.scan_metadata(engine.as_ref())?;
         let scan_files_iter = scan_metadata_iter
-            .map(|res| {
+            .map(|res| -> Result<_> {
                 let scan_metadata = res?;
                 let scan_files = vec![];
-                scan_metadata.visit_scan_files(scan_files, scan_metadata_callback)
+                Ok(scan_metadata.visit_scan_files(scan_files, scan_metadata_callback)?)
             })
             // Iterator<Result<Vec<ScanFile>>> to Iterator<Result<ScanFile>>
             .flatten_ok();
@@ -1820,9 +1828,9 @@ impl Scan {
         let physical_schema = self.physical_schema().clone();
         let logical_schema = self.logical_schema().clone();
         let result = scan_files_iter
-            .map(move |scan_file| -> KernelResult<_> {
+            .map(move |scan_file| -> Result<_> {
                 let scan_file = scan_file?;
-                let file_path = table_root.join(&scan_file.path)?;
+                let file_path = table_root.join(&scan_file.path).map_err(KernelError::from)?;
                 let mut selection_vector = scan_file
                     .dv_info
                     .get_selection_vector(engine.as_ref(), &table_root)?;
@@ -1831,7 +1839,7 @@ impl Scan {
                     size: scan_file.size.try_into().map_err(|_| {
                         KernelError::generic("Unable to convert scan file size into FileSize")
                     })?,
-                    location: file_path,
+                    location: file_path.clone(),
                 };
 
                 // WARNING: We validated the physical predicate against a schema that includes
@@ -1844,7 +1852,7 @@ impl Scan {
                     &[meta],
                     physical_schema.clone(),
                     None,
-                )?;
+                ).map_err(|error| required_file_error(error, &file_path))?;
 
                 let mut read_result_iter = read_result_iter.peekable();
 
@@ -1853,19 +1861,19 @@ impl Scan {
                 // 0-row file from a buggy connector, so we conservatively allow it.
                 let expect_data = scan_file.stats.as_ref().is_some_and(|s| s.num_records > 0);
                 if expect_data && read_result_iter.peek().is_none() {
-                    return Err(KernelError::internal_error(format!(
+                    return Err(Error::Kernel(KernelError::internal_error(format!(
                         "ParquetHandler returned no data for file '{}'. This is likely a connector \
                          bug -- the handler's read_parquet_files must return at least one batch for \
                          each requested file that contains rows.",
                         scan_file.path
-                    )));
+                    ))));
                 }
 
                 let engine = engine.clone(); // Arc clone
                 let physical_schema_inner = physical_schema.clone();
                 let logical_schema_inner = logical_schema.clone();
-                Ok(read_result_iter.map(move |read_result| -> KernelResult<_> {
-                    let read_result = read_result?;
+                Ok(read_result_iter.map(move |read_result| -> Result<_> {
+                    let read_result = read_result.map_err(|error| required_file_error(error, &file_path))?;
                     // transform the physical data into the correct logical form
                     let logical = state::transform_to_logical(
                         engine.as_ref(),
@@ -1885,13 +1893,13 @@ impl Scan {
                         logical.and_then(|data| data.apply_selection_vector(sv))
                     });
                     selection_vector = rest;
-                    result
+                    result.map_err(Error::Kernel)
                 }))
             })
             // Iterator<Result<Iterator<Result<Box<dyn EngineData>>>>> to Iterator<Result<Result<Box<dyn EngineData>>>>
             .flatten_ok()
             // Iterator<Result<Result<Box<dyn EngineData>>>> to Iterator<Result<Box<dyn EngineData>>>
-            .map(KernelResult::flatten);
+            .map(Result::flatten);
         Ok(result)
     }
 }
@@ -1928,14 +1936,63 @@ pub fn scan_row_schema() -> SchemaRef {
     log_replay::SCAN_ROW_SCHEMA.clone()
 }
 
+/// Reads a deletion vector into a selection mask, where `false` marks a deleted row.
+/// Rows beyond the returned mask are selected.
 pub fn selection_vector(
     engine: &dyn Engine,
     descriptor: &DeletionVectorDescriptor,
     table_root: &Url,
-) -> KernelResult<Vec<bool>> {
+) -> Result<Vec<bool>> {
     let storage = engine.storage_handler();
     let dv_treemap = descriptor.read(storage, table_root)?;
     Ok(deletion_treemap_to_bools(dv_treemap))
+}
+
+/// Classifies failed scan lookups without changing Kernel-only schema utilities.
+/// A successful logical lookup preserves other failures, such as missing mapping annotations.
+pub(crate) fn column_lookup_error(
+    error: KernelError,
+    schema: &StructType,
+    column: &ColumnName,
+    case_insensitive: bool,
+) -> Error {
+    if column.path().is_empty() {
+        return Error::Kernel(error);
+    }
+    let mut current = schema;
+    for (index, name) in column.path().iter().enumerate() {
+        let field = if case_insensitive {
+            current
+                .fields()
+                .find(|field| field.name().to_lowercase() == name.to_lowercase())
+        } else {
+            current.field(name)
+        };
+        let Some(field) = field else {
+            // TODO(3421): Remove the KernelError generic source following the error migration
+            return Error::Delta(DeltaError::column_not_found_in_schema(
+                &column.to_string(),
+                schema,
+                Some(Box::new(error)),
+            ));
+        };
+        if index + 1 == column.path().len() {
+            break;
+        }
+        let (DataType::Struct(inner) | DataType::File(inner)) = field.data_type() else {
+            let prefix = ColumnName::new(column.path()[..=index].iter().cloned());
+            // TODO(3421): Remove the KernelError generic source following the error migration
+            return Error::Delta(DeltaError::column_path_not_nested(
+                &prefix.to_string(),
+                field.data_type(),
+                &column.to_string(),
+                schema,
+                Some(Box::new(error)),
+            ));
+        };
+        current = inner;
+    }
+    Error::Kernel(error)
 }
 
 /// Returns [`MapToStructOptions`] with the supplied timezone, or the default (UTC) when absent.

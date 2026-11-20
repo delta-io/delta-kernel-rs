@@ -8,7 +8,7 @@ use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::scan::StatsOptions;
 use delta_kernel::{
-    CancellationToken as _, CancellationTokenRef, Engine, FileMeta, FileSlice, KernelError,
+    CancellationToken as _, CancellationTokenRef, Engine, Error, FileMeta, FileSlice, KernelError,
     KernelResult, KernelResultIterator, Snapshot, StorageHandler,
 };
 use rstest::rstest;
@@ -93,17 +93,18 @@ async fn precancelled_snapshot_reader_yields_cancelled() -> delta_kernel::Result
 }
 
 /// Asserts that `scan_metadata` reports cancellation before producing any data.
-fn assert_cancelled<
-    I: Iterator<Item = delta_kernel::KernelResult<delta_kernel::scan::ScanMetadata>>,
->(
-    result: delta_kernel::KernelResult<I>,
+fn assert_cancelled<I: Iterator<Item = delta_kernel::Result<delta_kernel::scan::ScanMetadata>>>(
+    result: delta_kernel::Result<I>,
 ) {
     match result {
-        Err(KernelError::Cancelled) => {}
+        Err(Error::Kernel(KernelError::Cancelled)) => {}
         Err(other) => panic!("expected Cancelled, got {other:?}"),
         Ok(mut iter) => {
             assert!(
-                matches!(iter.next(), Some(Err(KernelError::Cancelled))),
+                matches!(
+                    iter.next(),
+                    Some(Err(Error::Kernel(KernelError::Cancelled)))
+                ),
                 "cancelled scan must yield Err(Cancelled), never an Ok batch or bare None"
             );
         }
@@ -155,7 +156,10 @@ async fn mid_stream_cancellation_yields_cancelled() -> delta_kernel::Result<()> 
 
     token.cancel();
 
-    assert!(matches!(iter.next(), Some(Err(KernelError::Cancelled))));
+    assert!(matches!(
+        iter.next(),
+        Some(Err(Error::Kernel(KernelError::Cancelled)))
+    ));
     Ok(())
 }
 

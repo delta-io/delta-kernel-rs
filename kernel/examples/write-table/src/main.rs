@@ -279,7 +279,7 @@ async fn read_and_display_data(
 
     let batches: Vec<RecordBatch> = scan
         .execute(Arc::new(engine))?
-        .map(EngineDataArrowExt::try_into_record_batch)
+        .map(|batch| batch.and_then(|batch| batch.try_into_record_batch().map_err(Into::into)))
         .try_collect()?;
 
     print_batches(&batches).map_err(KernelError::from)?;

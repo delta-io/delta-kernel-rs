@@ -9,7 +9,7 @@ use delta_kernel::scan::state::{DvInfo, ScanFile};
 use delta_kernel::scan::{PartitionValuesOptions, Scan, ScanBuilder, ScanMetadata, StatsOptions};
 use delta_kernel::schema::{MetadataKey, MetadataValue};
 use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::{Expression, ExpressionRef, KernelError, KernelResult, KernelResultIterator};
+use delta_kernel::{Expression, ExpressionRef, KernelError, KernelResult, Result};
 use delta_kernel_ffi_macros::handle_descriptor;
 use derive_more::From;
 use tracing::{debug, trace};
@@ -37,7 +37,7 @@ pub struct SharedScan;
 pub struct SharedScanMetadata;
 
 /// Boxed scan metadata iterator stored behind [`ScanMetadataIterator`]'s mutex.
-type ScanMetadataIter = Box<dyn KernelResultIterator<ScanMetadata>>;
+type ScanMetadataIter = Box<dyn Iterator<Item = Result<ScanMetadata>> + Send>;
 
 /// An opaque, exclusive handle owning a [`ScanBuilder`].
 ///
@@ -605,7 +605,7 @@ pub unsafe extern "C" fn scan_metadata_iter_init(
 fn scan_metadata_iter_init_impl(
     engine: &Arc<dyn ExternEngine>,
     scan: &Scan,
-) -> KernelResult<Handle<SharedScanMetadataIterator>> {
+) -> Result<Handle<SharedScanMetadataIterator>> {
     let scan_metadata = scan.scan_metadata(engine.engine().as_ref())?;
     let data = ScanMetadataIterator {
         data: Mutex::new(Box::new(scan_metadata)),
@@ -646,7 +646,7 @@ fn scan_metadata_next_impl(
         engine_context: NullableCvoid,
         scan_metadata: Handle<SharedScanMetadata>,
     ),
-) -> KernelResult<bool> {
+) -> Result<bool> {
     let mut data = data.lock_iter()?;
     if let Some(scan_metadata) = data.next().transpose()? {
         (engine_visitor)(engine_context, Arc::new(scan_metadata).into());
@@ -991,7 +991,7 @@ fn selection_vector_from_dv_impl(
     dv_info: &DvInfo,
     extern_engine: &dyn ExternEngine,
     root_url: KernelResult<Url>,
-) -> KernelResult<KernelBoolSlice> {
+) -> Result<KernelBoolSlice> {
     match dv_info.get_selection_vector(extern_engine.engine().as_ref(), &root_url?)? {
         Some(v) => Ok(v.into()),
         None => Ok(KernelBoolSlice::empty()),
@@ -1018,7 +1018,7 @@ fn row_indexes_from_dv_impl(
     dv_info: &DvInfo,
     extern_engine: &dyn ExternEngine,
     root_url: KernelResult<Url>,
-) -> KernelResult<KernelRowIndexArray> {
+) -> Result<KernelRowIndexArray> {
     match dv_info.get_row_indexes(extern_engine.engine().as_ref(), &root_url?)? {
         Some(v) => Ok(v.into()),
         None => Ok(KernelRowIndexArray::empty()),
@@ -1142,7 +1142,7 @@ pub unsafe extern "C" fn scan_metadata_next_arrow(
 #[cfg(feature = "default-engine-base")]
 fn scan_metadata_next_arrow_impl(
     data: &ScanMetadataIterator,
-) -> KernelResult<*mut ScanMetadataArrowResult> {
+) -> Result<*mut ScanMetadataArrowResult> {
     let mut iter = data
         .data
         .lock()
@@ -1806,7 +1806,7 @@ mod scan_builder_tests {
     enum ColumnStatsExpected {
         Fields(&'static [&'static str]),
         SetterError(FFIKernelError),
-        BuildError(FFIKernelError),
+        BuildError(&'static str),
     }
 
     #[rstest::rstest]
@@ -1815,7 +1815,7 @@ mod scan_builder_tests {
     #[case::requested_missing(
         false,
         ColumnStatsInput::Missing,
-        ColumnStatsExpected::BuildError(FFIKernelError::GenericError)
+        ColumnStatsExpected::BuildError("DELTA_COLUMN_NOT_FOUND_IN_SCHEMA")
     )]
     #[case::extra_missing(true, ColumnStatsInput::Missing,
         ColumnStatsExpected::Fields(&["id", "val"]))]
@@ -1923,7 +1923,10 @@ mod scan_builder_tests {
                         else {
                             panic!("expected build error")
                         };
-                        assert_eq!(unsafe { recover_error(error) }.etype, expected);
+                        assert_eq!(
+                            unsafe { recover_error(error) }.condition.as_deref(),
+                            Some(expected)
+                        );
                     }
                     ColumnStatsExpected::SetterError(_) => unreachable!(),
                 }
@@ -2381,20 +2384,150 @@ mod scan_metadata_arrow_tests {
 mod tests {
     use std::collections::HashMap;
     use std::ptr::NonNull;
+    use std::sync::Arc;
 
     use delta_kernel::actions::deletion_vector::{
         DeletionVectorDescriptor, DeletionVectorStorageType,
     };
+    use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::scan::state::DvInfo;
     use delta_kernel::schema::{MetadataKey, MetadataValue};
     use rstest::rstest;
+    use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 
-    use super::cardinality_from_dv;
-    use crate::error::FFIKernelError;
+    use super::{cardinality_from_dv, row_indexes_from_dv, selection_vector_from_dv};
+    use crate::error::allocation::{DeltaErrorInfo, KernelErrorInfo};
+    use crate::error::{ErrorAllocators, ExternResult, FFIKernelError};
     use crate::ffi_test_utils::{
         TEST_ERROR_ALLOCATORS, assert_extern_result_error_contains, ok_or_panic,
     };
-    use crate::{KernelStringSlice, NullableCvoid, OptionalValue, TryFromStringSlice};
+    use crate::{
+        KernelStringSlice, NullableCvoid, OptionalValue, TryFromStringSlice, engine_to_handle,
+        free_engine, kernel_string_slice,
+    };
+
+    struct CapturedDelta {
+        condition: String,
+        sql_state: Option<String>,
+        parameters: Vec<(String, String)>,
+    }
+
+    unsafe extern "C" fn capture_scan_delta(
+        _: *mut std::ffi::c_void,
+        info: *const DeltaErrorInfo,
+    ) -> *mut std::ffi::c_void {
+        let info = unsafe { &*info };
+        let captured = CapturedDelta {
+            condition: unsafe { info.condition.try_to_string().unwrap() },
+            sql_state: match &info.sql_state {
+                OptionalValue::Some(value) => Some(unsafe { value.try_to_string().unwrap() }),
+                OptionalValue::None => None,
+            },
+            parameters: unsafe { info.parameters.try_as_slice().unwrap() }
+                .iter()
+                .map(|entry| unsafe {
+                    (
+                        entry.key.try_to_string().unwrap(),
+                        entry.value.try_to_string().unwrap(),
+                    )
+                })
+                .collect(),
+        };
+        Box::into_raw(Box::new(captured)).cast()
+    }
+
+    unsafe extern "C" fn capture_scan_kernel(
+        _: *mut std::ffi::c_void,
+        _: *const KernelErrorInfo,
+    ) -> *mut std::ffi::c_void {
+        Box::into_raw(Box::new(CapturedDelta {
+            condition: "KERNEL".into(),
+            sql_state: None,
+            parameters: vec![],
+        }))
+        .cast()
+    }
+
+    #[rstest]
+    #[case::size("DELTA_DELETION_VECTOR_SIZE_MISMATCH", 0)]
+    #[case::checksum("DELTA_DELETION_VECTOR_CHECKSUM_MISMATCH", 1)]
+    #[case::missing("DELTA_FILE_NOT_FOUND", 2)]
+    fn dv_delta_errors_reach_ffi(
+        #[case] condition: &str,
+        #[case] failure: u8,
+        #[values(false, true)] row_indexes: bool,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = url::Url::from_directory_path(directory.path()).unwrap();
+        let descriptor = DeletionVectorDescriptor {
+            storage_type: DeletionVectorStorageType::PersistedRelative,
+            path_or_inline_dv: "vBn[lx{q8@P<9BNH/isA".into(),
+            offset: Some(1),
+            size_in_bytes: 36,
+            cardinality: 2,
+        };
+        let path = descriptor.absolute_path(&root).unwrap().unwrap();
+        if failure != 2 {
+            let mut bytes = std::fs::read(
+                "../kernel/tests/data/table-with-dv-small/deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin"
+            ).unwrap();
+            if failure == 0 {
+                bytes[1..5].copy_from_slice(&99_u32.to_be_bytes());
+            } else {
+                bytes[41] ^= 1;
+            }
+            std::fs::write(path.to_file_path().unwrap(), bytes).unwrap();
+        }
+        let allocators = ErrorAllocators {
+            allocate_delta_error: capture_scan_delta,
+            allocate_kernel_error: capture_scan_kernel,
+            ..TEST_ERROR_ALLOCATORS
+        };
+        let engine = engine_to_handle(
+            Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build()),
+            allocators,
+        );
+        let info = DvInfo::from(descriptor);
+        let root_string = root.as_str();
+        let error = if row_indexes {
+            match unsafe {
+                row_indexes_from_dv(
+                    &info,
+                    engine.shallow_copy(),
+                    kernel_string_slice!(root_string),
+                )
+            } {
+                ExternResult::Err(error) => error,
+                _ => panic!("expected row-index failure"),
+            }
+        } else {
+            match unsafe {
+                selection_vector_from_dv(
+                    &info,
+                    engine.shallow_copy(),
+                    kernel_string_slice!(root_string),
+                )
+            } {
+                ExternResult::Err(error) => error,
+                _ => panic!("expected selection failure"),
+            }
+        };
+        let error = unsafe { Box::from_raw(error.cast::<CapturedDelta>()) };
+        assert_eq!(error.condition, condition);
+        assert_eq!(
+            error.sql_state.as_deref(),
+            Some(if failure == 2 { "42K03" } else { "XXKDS" })
+        );
+        assert_eq!(
+            error.parameters,
+            if failure == 2 {
+                vec![("path".into(), path.to_string())]
+            } else {
+                vec![]
+            }
+        );
+        unsafe { free_engine(engine) };
+    }
 
     #[rstest]
     #[case::absent(None, Ok(None))]
