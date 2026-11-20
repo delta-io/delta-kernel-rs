@@ -418,15 +418,16 @@ impl SyncPlanExecutor {
                         meta.location, list_files.base_url
                     )));
                 }
+                // Match Delta action-path encoding so listing and log paths join consistently.
                 let relative_path = uri_encode_path(&raw_relative_path).into_owned();
-                let location = list_files
+                let absolute_path = list_files
                     .base_url
                     .join(&relative_path)
                     .map_err(|error| KernelError::generic(error.to_string()))?;
                 let size = i64::try_from(meta.size)
                     .map_err(|_| KernelError::generic("Listed file size exceeds LONG range"))?;
                 Ok(vec![
-                    location.to_string().into(),
+                    absolute_path.to_string().into(),
                     relative_path.into(),
                     size.into(),
                     meta.last_modified.into(),
@@ -855,6 +856,32 @@ mod tests {
             .into_data()?
             .map(|data| data.try_into_record_batch())
             .collect::<KernelResult<Vec<_>>>()?;
+        assert!(
+            batches
+                .iter()
+                .all(|batch| batch.schema().field(0).name() == "absolute_path")
+        );
+        let mut actual_absolute_paths: Vec<_> = batches
+            .iter()
+            .flat_map(|batch| {
+                let paths = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("absolute_path is STRING");
+                (0..paths.len())
+                    .map(|row| paths.value(row).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        actual_absolute_paths.sort();
+        assert_eq!(
+            actual_absolute_paths,
+            [
+                "memory:///table/_delta_log/00000000000000000000.json",
+                "memory:///table/part=one/a%20b%25.parquet",
+            ]
+        );
         let mut actual: Vec<_> = batches
             .iter()
             .flat_map(|batch| {

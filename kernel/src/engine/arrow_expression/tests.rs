@@ -1950,7 +1950,7 @@ fn resolve_file_path_returns_absolute_and_relative_urls() {
     )
     .unwrap();
     let output_type = KernelDataType::from(schema! {
-        nullable "location": STRING,
+        nullable "absolute_path": STRING,
         nullable "relative_path": STRING,
     });
     let expression = Expr::unary(
@@ -1963,8 +1963,8 @@ fn resolve_file_path_returns_absolute_and_relative_urls() {
         .downcast_ref::<StructArray>()
         .unwrap()
         .clone();
-    let location = result
-        .column_by_name("location")
+    let absolute_path = result
+        .column_by_name("absolute_path")
         .unwrap()
         .as_any()
         .downcast_ref::<StringArray>()
@@ -1975,7 +1975,10 @@ fn resolve_file_path_returns_absolute_and_relative_urls() {
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
-    assert_eq!(location.value(0), "s3://bucket/table/data/a%20b%25.parquet");
+    assert_eq!(
+        absolute_path.value(0),
+        "s3://bucket/table/data/a%20b%25.parquet"
+    );
     assert_eq!(relative_path.value(0), "data/a%20b%25.parquet");
 
     let external = Expr::unary(
@@ -1988,8 +1991,8 @@ fn resolve_file_path_returns_absolute_and_relative_urls() {
         .downcast_ref::<StructArray>()
         .unwrap()
         .clone();
-    let location = result
-        .column_by_name("location")
+    let absolute_path = result
+        .column_by_name("absolute_path")
         .unwrap()
         .as_any()
         .downcast_ref::<StringArray>()
@@ -2000,7 +2003,7 @@ fn resolve_file_path_returns_absolute_and_relative_urls() {
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
-    assert_eq!(location.value(0), "s3://other/data.parquet");
+    assert_eq!(absolute_path.value(0), "s3://other/data.parquet");
     assert!(relative_path.is_null(0));
 
     let relative_external = Expr::unary(
@@ -2013,8 +2016,8 @@ fn resolve_file_path_returns_absolute_and_relative_urls() {
         .downcast_ref::<StructArray>()
         .unwrap()
         .clone();
-    let location = result
-        .column_by_name("location")
+    let absolute_path = result
+        .column_by_name("absolute_path")
         .unwrap()
         .as_any()
         .downcast_ref::<StringArray>()
@@ -2025,7 +2028,7 @@ fn resolve_file_path_returns_absolute_and_relative_urls() {
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
-    assert_eq!(location.value(0), "s3://bucket/outside%20file.parquet");
+    assert_eq!(absolute_path.value(0), "s3://bucket/outside%20file.parquet");
     assert!(relative_path.is_null(0));
 
     let absolute_in_table = Expr::unary(
@@ -2041,8 +2044,8 @@ fn resolve_file_path_returns_absolute_and_relative_urls() {
         .downcast_ref::<StructArray>()
         .unwrap()
         .clone();
-    let location = result
-        .column_by_name("location")
+    let absolute_path = result
+        .column_by_name("absolute_path")
         .unwrap()
         .as_any()
         .downcast_ref::<StringArray>()
@@ -2054,7 +2057,7 @@ fn resolve_file_path_returns_absolute_and_relative_urls() {
         .downcast_ref::<StringArray>()
         .unwrap();
     assert_eq!(
-        location.value(0),
+        absolute_path.value(0),
         "s3://bucket/table/data/M%C3%BCnchen.parquet"
     );
     assert_eq!(relative_path.value(0), "data/M%C3%BCnchen.parquet");
@@ -2074,7 +2077,7 @@ fn deletion_vector_path_resolves_absolute_and_inline_descriptors() {
     )
     .unwrap();
     let output_type = KernelDataType::from(schema! {
-        nullable "location": STRING,
+        nullable "absolute_path": STRING,
         nullable "relative_path": STRING,
     });
     let absolute = DeletionVectorDescriptor::try_new(
@@ -2095,8 +2098,8 @@ fn deletion_vector_path_resolves_absolute_and_inline_descriptors() {
         .downcast_ref::<StructArray>()
         .unwrap()
         .clone();
-    let location = result
-        .column_by_name("location")
+    let absolute_path = result
+        .column_by_name("absolute_path")
         .unwrap()
         .as_any()
         .downcast_ref::<StringArray>()
@@ -2107,7 +2110,7 @@ fn deletion_vector_path_resolves_absolute_and_inline_descriptors() {
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
-    assert_eq!(location.value(0), "s3://other/dv.bin");
+    assert_eq!(absolute_path.value(0), "s3://other/dv.bin");
     assert!(relative_path.is_null(0));
 
     let relative = DeletionVectorDescriptor::try_new(
@@ -2128,8 +2131,8 @@ fn deletion_vector_path_resolves_absolute_and_inline_descriptors() {
         .downcast_ref::<StructArray>()
         .unwrap()
         .clone();
-    let location = result
-        .column_by_name("location")
+    let absolute_path = result
+        .column_by_name("absolute_path")
         .unwrap()
         .as_any()
         .downcast_ref::<StringArray>()
@@ -2141,7 +2144,7 @@ fn deletion_vector_path_resolves_absolute_and_inline_descriptors() {
         .downcast_ref::<StringArray>()
         .unwrap();
     assert_eq!(
-        location.value(0),
+        absolute_path.value(0),
         "s3://bucket/table/ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
     );
     assert_eq!(
@@ -2167,13 +2170,13 @@ fn deletion_vector_path_resolves_absolute_and_inline_descriptors() {
         .downcast_ref::<StructArray>()
         .unwrap()
         .clone();
-    let location = result
-        .column_by_name("location")
+    let absolute_path = result
+        .column_by_name("absolute_path")
         .unwrap()
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
-    assert!(location.is_null(0));
+    assert!(absolute_path.is_null(0));
 }
 
 #[test]
@@ -2191,7 +2194,7 @@ fn deletion_vector_path_rejects_malformed_descriptors() {
     )
     .unwrap();
     let output_type = KernelDataType::from(schema! {
-        nullable "location": STRING,
+        nullable "absolute_path": STRING,
         nullable "relative_path": STRING,
     });
     let descriptor = Scalar::Struct(

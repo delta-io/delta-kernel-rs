@@ -42,8 +42,8 @@ message ScanJsonNode {
   delta.kernel.schema.StructType schema = 3;
 }
 
-// Recursively lists files under `base_url`. The engine returns absolute locations and URI-encoded
-// paths relative to `base_url`, matching Delta action path encoding.
+// Recursively lists files under `base_url`. The engine returns absolute paths and URI-encoded
+// relative paths, matching Delta action path encoding.
 message ListFilesNode {
   string base_url = 1;
   delta.kernel.schema.StructType schema = 2;

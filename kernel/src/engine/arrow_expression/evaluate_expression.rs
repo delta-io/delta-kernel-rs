@@ -293,14 +293,14 @@ fn evaluate_path_info_expression(
 ) -> KernelResult<ArrayRef> {
     let output_fields: Vec<_> = output_schema.fields().collect();
     if output_fields.len() != 2
-        || output_fields[0].name() != "location"
+        || output_fields[0].name() != "absolute_path"
         || output_fields[1].name() != "relative_path"
         || output_fields
             .iter()
             .any(|field| field.data_type() != &DataType::STRING)
     {
         return Err(KernelError::schema(
-            "Path resolution expression requires {location, relative_path} STRING output",
+            "Path resolution expression requires {absolute_path, relative_path} STRING output",
         ));
     }
 
@@ -324,7 +324,7 @@ fn evaluate_path_info_expression(
         .and_then(|array| array.as_any().downcast_ref::<StringArray>())
         .ok_or_else(|| KernelError::schema("Path resolution input is missing table_root"))?;
 
-    let mut locations = Vec::with_capacity(input.len());
+    let mut absolute_paths = Vec::with_capacity(input.len());
     let mut relative_paths = Vec::with_capacity(input.len());
     if deletion_vector {
         let descriptors = input
@@ -335,23 +335,23 @@ fn evaluate_path_info_expression(
             })?;
         for row in 0..input.len() {
             if input.is_null(row) || root_array.is_null(row) || descriptors.is_null(row) {
-                locations.push(None);
+                absolute_paths.push(None);
                 relative_paths.push(None);
                 continue;
             }
             let root = parse_table_root(root_array.value(row))?;
             let descriptor = deletion_vector_descriptor_at(descriptors, row)?;
-            let location = descriptor.absolute_path(&root)?;
-            let path_info = location
-                .map(|location| path_info_from_url(&root, location))
+            let absolute_path = descriptor.absolute_path(&root)?;
+            let path_info = absolute_path
+                .map(|absolute_path| path_info_from_url(&root, absolute_path))
                 .transpose()?;
             match path_info {
-                Some((location, relative_path)) => {
-                    locations.push(Some(location));
+                Some((absolute_path, relative_path)) => {
+                    absolute_paths.push(Some(absolute_path));
                     relative_paths.push(relative_path);
                 }
                 None => {
-                    locations.push(None);
+                    absolute_paths.push(None);
                     relative_paths.push(None);
                 }
             }
@@ -363,24 +363,24 @@ fn evaluate_path_info_expression(
             .ok_or_else(|| KernelError::schema("ResolveFilePath input is missing path"))?;
         for row in 0..input.len() {
             if input.is_null(row) || root_array.is_null(row) || paths.is_null(row) {
-                locations.push(None);
+                absolute_paths.push(None);
                 relative_paths.push(None);
                 continue;
             }
             let root = parse_table_root(root_array.value(row))?;
-            let location = resolve_delta_file_path(paths.value(row), &root)?;
-            let (location, relative_path) = path_info_from_url(&root, location)?;
-            locations.push(Some(location));
+            let absolute_path = resolve_delta_file_path(paths.value(row), &root)?;
+            let (absolute_path, relative_path) = path_info_from_url(&root, absolute_path)?;
+            absolute_paths.push(Some(absolute_path));
             relative_paths.push(relative_path);
         }
     }
 
     let arrow_schema: ArrowSchema = output_schema.try_into_arrow()?;
-    let locations = Arc::new(StringArray::from(locations)) as ArrayRef;
+    let absolute_paths = Arc::new(StringArray::from(absolute_paths)) as ArrayRef;
     let relative_paths = Arc::new(StringArray::from(relative_paths)) as ArrayRef;
     let path_info = StructArray::try_new(
         arrow_schema.fields().clone(),
-        vec![locations, relative_paths],
+        vec![absolute_paths, relative_paths],
         None,
     )?;
     validate_array_type(
@@ -438,7 +438,7 @@ fn parse_table_root(root: &str) -> KernelResult<Url> {
 }
 
 fn resolve_delta_file_path(path: &str, root: &Url) -> KernelResult<Url> {
-    let location = if scheme_len(path).is_some() {
+    let absolute_path = if scheme_len(path).is_some() {
         Url::parse(path).map_err(|error| KernelError::generic(error.to_string()))?
     } else {
         let decoded = uri_decode_path(path)
@@ -452,22 +452,22 @@ fn resolve_delta_file_path(path: &str, root: &Url) -> KernelResult<Url> {
         root.join(encoded.as_ref())
             .map_err(|error| KernelError::generic(error.to_string()))?
     };
-    if location.query().is_some() || location.fragment().is_some() {
+    if absolute_path.query().is_some() || absolute_path.fragment().is_some() {
         return Err(KernelError::generic(format!(
             "Delta action path must not contain a query or fragment: {path}"
         )));
     }
-    Ok(location)
+    Ok(absolute_path)
 }
 
-fn path_info_from_url(root: &Url, location: Url) -> KernelResult<(String, Option<String>)> {
-    let same_authority = root.scheme() == location.scheme()
-        && root.username() == location.username()
-        && root.password() == location.password()
-        && root.host_str() == location.host_str()
-        && root.port_or_known_default() == location.port_or_known_default();
+fn path_info_from_url(root: &Url, absolute_path: Url) -> KernelResult<(String, Option<String>)> {
+    let same_authority = root.scheme() == absolute_path.scheme()
+        && root.username() == absolute_path.username()
+        && root.password() == absolute_path.password()
+        && root.host_str() == absolute_path.host_str()
+        && root.port_or_known_default() == absolute_path.port_or_known_default();
     let relative = same_authority
-        .then(|| location.path().strip_prefix(root.path()))
+        .then(|| absolute_path.path().strip_prefix(root.path()))
         .flatten();
     let relative_path = relative
         .map(|relative| {
@@ -476,7 +476,7 @@ fn path_info_from_url(root: &Url, location: Url) -> KernelResult<(String, Option
             Ok::<String, KernelError>(uri_encode_path(&decoded).into_owned())
         })
         .transpose()?;
-    Ok((location.to_string(), relative_path))
+    Ok((absolute_path.to_string(), relative_path))
 }
 
 /// Evaluates a kernel expression over a record batch

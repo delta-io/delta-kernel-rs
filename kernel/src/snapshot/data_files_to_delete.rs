@@ -1,4 +1,7 @@
 //! Snapshot plans for VACUUM candidate discovery and file reachability.
+//!
+//! Kernel returns plans only; connectors retain deletion, inventory, clone, and engine-specific
+//! path policies.
 
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -23,7 +26,7 @@ use crate::{Engine, KernelError, KernelResult, LogPath, Result, Scalar, Version,
 
 const DEFAULT_DELETED_FILE_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const PATH: &str = "path";
-const LOCATION: &str = "location";
+const ABSOLUTE_PATH: &str = "absolute_path";
 const RELATIVE_PATH: &str = "relative_path";
 const LAST_MODIFIED: &str = "last_modified";
 const VERSION: &str = "version";
@@ -32,17 +35,17 @@ const DELTA_LOG_PREFIX: &str = "_delta_log/";
 const DELTA_LOG_PREFIX_END: &str = "_delta_log0";
 
 static PATH_INFO_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
-    nullable LOCATION: STRING,
+    nullable ABSOLUTE_PATH: STRING,
     nullable RELATIVE_PATH: STRING,
 };
 
 static REACHABLE_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
-    not_null LOCATION: STRING,
+    not_null ABSOLUTE_PATH: STRING,
     nullable RELATIVE_PATH: STRING,
 };
 
 static CANDIDATE_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
-    not_null LOCATION: STRING,
+    not_null ABSOLUTE_PATH: STRING,
     nullable RELATIVE_PATH: STRING,
 };
 
@@ -151,8 +154,8 @@ impl Snapshot {
             .filter(Expr::column([RELATIVE_PATH]).is_not_null())?
             .anti_join(
                 reachable.clone(),
-                [column_name!(LOCATION)],
-                [column_name!(LOCATION)],
+                [column_name!(ABSOLUTE_PATH)],
+                [column_name!(ABSOLUTE_PATH)],
             )?
             .anti_join(
                 reachable.clone(),
@@ -163,15 +166,15 @@ impl Snapshot {
             .filter(Expr::column([RELATIVE_PATH]).is_null())?
             .anti_join(
                 reachable,
-                [column_name!(LOCATION)],
-                [column_name!(LOCATION)],
+                [column_name!(ABSOLUTE_PATH)],
+                [column_name!(ABSOLUTE_PATH)],
             )?;
         let eligible = PlanBuilder::union_all([table_relative, external])?;
-        let distinct = eligible.aggregate_by([column_name!(LOCATION)], |aggs| {
+        let distinct = eligible.aggregate_by([column_name!(ABSOLUTE_PATH)], |aggs| {
             aggs.aggregate_as(Agg::count_star(), "candidate_count")
         })?;
         let output = distinct.project(
-            Expr::struct_from([Expr::column([LOCATION])]),
+            Expr::struct_from([Expr::column([ABSOLUTE_PATH])]),
             DATA_FILES_TO_DELETE_SCHEMA.clone(),
         )?;
         Ok(output.build_opt()?)
@@ -284,7 +287,7 @@ fn full_candidates(base_url: Url, cutoff_ms: i64) -> KernelResult<PlanBuilder> {
             Predicate::not(in_delta_log),
         ))?
         .project(
-            Expr::struct_from([Expr::column([LOCATION]), Expr::column([RELATIVE_PATH])]),
+            Expr::struct_from([Expr::column([ABSOLUTE_PATH]), Expr::column([RELATIVE_PATH])]),
             CANDIDATE_SCHEMA.clone(),
         )
 }
@@ -417,11 +420,11 @@ fn empty_reachable_plan() -> Result<PlanBuilder> {
 
 fn deduplicate_candidates(plan: PlanBuilder) -> KernelResult<PlanBuilder> {
     plan.aggregate_by(
-        [column_name!(LOCATION), column_name!(RELATIVE_PATH)],
+        [column_name!(ABSOLUTE_PATH), column_name!(RELATIVE_PATH)],
         |aggregates| aggregates.aggregate_as(Agg::count_star(), "candidate_count"),
     )?
     .project(
-        Expr::struct_from([Expr::column([LOCATION]), Expr::column([RELATIVE_PATH])]),
+        Expr::struct_from([Expr::column([ABSOLUTE_PATH]), Expr::column([RELATIVE_PATH])]),
         CANDIDATE_SCHEMA.clone(),
     )
 }
@@ -436,9 +439,9 @@ fn file_paths_from_action(
     let path_info = resolve_file_path_expression(table_root, path.clone());
     plan.filter(path.is_not_null())?
         .project(path_info, PATH_INFO_SCHEMA.clone())?
-        .filter(Expr::column([LOCATION]).is_not_null())?
+        .filter(Expr::column([ABSOLUTE_PATH]).is_not_null())?
         .project(
-            Expr::struct_from([Expr::column([LOCATION]), Expr::column([RELATIVE_PATH])]),
+            Expr::struct_from([Expr::column([ABSOLUTE_PATH]), Expr::column([RELATIVE_PATH])]),
             REACHABLE_SCHEMA.clone(),
         )
 }
@@ -452,9 +455,9 @@ fn deletion_vector_paths_from_action(
     let path_info = deletion_vector_path_expression(table_root, descriptor.clone());
     plan.filter(descriptor.is_not_null())?
         .project(path_info, PATH_INFO_SCHEMA.clone())?
-        .filter(Expr::column([LOCATION]).is_not_null())?
+        .filter(Expr::column([ABSOLUTE_PATH]).is_not_null())?
         .project(
-            Expr::struct_from([Expr::column([LOCATION]), Expr::column([RELATIVE_PATH])]),
+            Expr::struct_from([Expr::column([ABSOLUTE_PATH]), Expr::column([RELATIVE_PATH])]),
             REACHABLE_SCHEMA.clone(),
         )
 }
@@ -474,9 +477,9 @@ fn deletion_vector_path_expression(table_root: &Url, descriptor: Expr) -> Expr {
 }
 
 fn path_info_candidates(plan: PlanBuilder) -> KernelResult<PlanBuilder> {
-    plan.filter(Expr::column([LOCATION]).is_not_null())?
+    plan.filter(Expr::column([ABSOLUTE_PATH]).is_not_null())?
         .project(
-            Expr::struct_from([Expr::column([LOCATION]), Expr::column([RELATIVE_PATH])]),
+            Expr::struct_from([Expr::column([ABSOLUTE_PATH]), Expr::column([RELATIVE_PATH])]),
             CANDIDATE_SCHEMA.clone(),
         )
 }
