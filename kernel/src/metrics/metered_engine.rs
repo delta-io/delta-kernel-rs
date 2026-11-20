@@ -105,7 +105,11 @@ mod tests {
     }
 
     impl StorageHandler for StubStorageHandler {
-        fn list_from(&self, _path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+        fn list_from(
+            &self,
+            _path: &Url,
+            _end: Option<&Url>,
+        ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
             let results: Vec<_> = self.list_results.iter().cloned().map(Ok).collect();
             Ok(Box::new(results.into_iter()))
         }
@@ -157,7 +161,7 @@ mod tests {
 
         let engine = MeteredDeltaEngine::new(Arc::new(stub_engine()));
         let url = Url::parse("memory:///_delta_log/").unwrap();
-        let iter = engine.storage_handler().list_from(&url).unwrap();
+        let iter = engine.storage_handler().list_from(&url, None).unwrap();
         let _: Vec<_> = iter.collect();
 
         let listed = reporter

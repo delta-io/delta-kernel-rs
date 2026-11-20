@@ -70,6 +70,8 @@ env:
   HARNESS_CODEX_ENABLE_WEB_SEARCH: "0"
   # This Omnigent mode runs Claude unwrapped with native tools disabled.
   OMNIGENT_CLAUDE_SDK_NO_SANDBOX: "1"
+  # A leading "-" turns an Omnigent feature off.
+  OMNIGENT_FEATURES: "-peer_session_messaging"
   OMNIGENT_SKIP_WEB_UI: "true"
   UV_INDEX_URL: https://pypi.org/simple
   PIP_INDEX_URL: https://pypi.org/simple
@@ -368,6 +370,7 @@ jobs:
         if: steps.creds.outputs.available == 'true'
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
         with:
+          version: "0.13.9"
           enable-cache: true
 
       - name: Set up Node.js
@@ -493,6 +496,7 @@ jobs:
           from omnigent.spec import load
           from omnigent.tools import ToolManager
           from omnigent.tools.base import ToolContext
+          from omnigent.util.reasoning_effort import validate_effort_for_harness
           from review_context_policy import inject_review_context
 
           if not codex_harness._parse_truthy(
@@ -580,6 +584,15 @@ jobs:
               if contract.read_text().strip() != (agent.instructions or "").strip():
                   print(f"::error::{path} must reference its matching REVIEW.md.")
                   sys.exit(1)
+              effort = agent.executor.reasoning_effort
+              if effort is None:
+                  print(f"::error::{path} must set executor.reasoning_effort.")
+                  sys.exit(1)
+              try:
+                  validate_effort_for_harness(effort, agent.executor.config.get("harness"))
+              except ValueError as exc:
+                  print(f"::error::{path}: {exc}")
+                  sys.exit(1)
           checked_in_agents = {
               path.parent.name
               for path in reviewer_root.joinpath("agents").glob("*/config.yaml")
@@ -596,6 +609,16 @@ jobs:
           tool_names = set(manager.get_tool_names())
           if "sys_session_create" in tool_names:
               print("::error::sys_session_create must not be exposed to the AI reviewer.")
+              sys.exit(1)
+          disabled_tools = {
+              "sys_project_list",
+              "sys_project_update",
+              "sys_session_message",
+              "sys_session_update",
+          }
+          unexpected = sorted(disabled_tools & tool_names)
+          if unexpected:
+              print("::error::The AI reviewer exposes disabled tools: " + ", ".join(unexpected))
               sys.exit(1)
 
           send_schema = next(
@@ -614,7 +637,7 @@ jobs:
               sys.exit(1)
 
           source_tools = {"list_source_files", "read_source_file", "search_source_code"}
-          forbidden_source_tools = {"sys_os_edit", "sys_os_shell", "sys_os_write"}
+          forbidden_tools = {"sys_os_edit", "sys_os_shell", "sys_os_write"} | disabled_tools
           with tempfile.TemporaryDirectory() as source_root:
               source_path = pathlib.Path(source_root)
               source_path.joinpath("runtime-probe.txt").write_text("child tool runtime probe\n")
@@ -642,10 +665,10 @@ jobs:
                   if not source_tools <= sub_tool_names:
                       print(f"::error::{sub_agent.name} is missing read-only source tools.")
                       sys.exit(1)
-                  unexpected = sorted(forbidden_source_tools & sub_tool_names)
+                  unexpected = sorted(forbidden_tools & sub_tool_names)
                   if unexpected:
                       print(
-                          f"::error::{sub_agent.name} exposes forbidden source tools: "
+                          f"::error::{sub_agent.name} exposes forbidden tools: "
                           + ", ".join(unexpected)
                       )
                       sys.exit(1)
@@ -1220,6 +1243,11 @@ jobs:
               print(f"::error::AI review is not publishable: {detail}.")
               sys.exit(1)
 
+          if start_count > end_count:
+              print(
+                  "::notice::Truncated review copies ignored in the reviewer output: "
+                  f"{start_count - end_count}."
+              )
           if len(body) > 60_000:
               print("::error::AI review exceeded the 60000-character publication limit.")
               sys.exit(1)

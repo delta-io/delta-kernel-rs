@@ -26,6 +26,12 @@ type VisitVariadicFn =
     extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
 type VisitJunctionFn =
     extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
+type VisitToJsonFn = extern "C" fn(
+    data: *mut c_void,
+    sibling_list_id: usize,
+    child_list_id: usize,
+    full_precision_timestamps: bool,
+);
 type VisitParseJsonFn = extern "C" fn(
     data: *mut c_void,
     sibling_list_id: usize,
@@ -174,8 +180,9 @@ pub struct EngineExpressionVisitor {
     /// Visits the `ToJson` unary operator belonging to the list identified by `sibling_list_id`.
     /// The sub-expression will be in a _one_ item list identified by `child_list_id`.
     /// See [`UnaryExpressionOp::ToJson`] for the encoding the implementation must produce; in
-    /// particular, timestamps carry exactly three fractional digits, truncated.
-    pub visit_to_json: VisitUnaryFn,
+    /// particular, timestamps carry exactly three fractional digits, truncated, unless
+    /// `full_precision_timestamps` is set, in which case they carry all six microsecond digits.
+    pub visit_to_json: VisitToJsonFn,
     /// Visits the `ParseJson` expression belonging to the list identified by `sibling_list_id`.
     /// The sub-expression (JSON string) will be in a _one_ item list identified by
     /// `child_list_id`. The `output_schema` handle specifies the schema to parse the JSON
@@ -669,10 +676,16 @@ fn visit_expression_impl(
         Expression::Unary(UnaryExpression { op, expr }) => {
             let child_list_id = call!(visitor, make_field_list, 1);
             visit_expression_impl(visitor, expr, child_list_id);
-            let visit_fn = match op {
-                UnaryExpressionOp::ToJson => visitor.visit_to_json,
-            };
-            visit_fn(visitor.data, sibling_list_id, child_list_id);
+            match op {
+                UnaryExpressionOp::ToJson {
+                    full_precision_timestamps,
+                } => (visitor.visit_to_json)(
+                    visitor.data,
+                    sibling_list_id,
+                    child_list_id,
+                    *full_precision_timestamps,
+                ),
+            }
         }
         Expression::Binary(BinaryExpression { op, left, right }) => {
             let child_list_id = call!(visitor, make_field_list, 2);
@@ -961,6 +974,7 @@ mod tests {
     ignore_fn!(ignore_map_literal, usize, usize);
     ignore_fn!(ignore_case_when, usize, usize, usize);
     ignore_fn!(ignore_null, u8, u8, u8);
+    ignore_fn!(ignore_to_json, usize, bool);
     ignore_fn!(ignore_parse_json, usize, Handle<SharedSchema>);
     ignore_fn!(ignore_struct_patch, usize, usize, usize, usize);
     ignore_fn!(ignore_field_patch, KernelStringSlice, usize, bool, bool);
@@ -994,7 +1008,7 @@ mod tests {
             visit_or: ignore_child_list,
             visit_not: ignore_child_list,
             visit_is_null: ignore_child_list,
-            visit_to_json: ignore_child_list,
+            visit_to_json: ignore_to_json,
             visit_parse_json: ignore_parse_json,
             visit_map_to_struct,
             visit_lt: ignore_child_list,

@@ -40,10 +40,11 @@ pub enum IoOperation {
     /// Recursively list files at the given URL.
     ///
     /// Should return a [`PlanResult::FileMeta`](crate::plans::PlanResult::FileMeta) with one entry
-    /// per file. See [`StorageHandler::list_from`] for more details on the ordering contract.
+    /// per file. When `end` is set, every yielded location must sort strictly before it. See
+    /// [`StorageHandler::list_from`] for the ordering and bound contract.
     ///
     /// [`StorageHandler::list_from`]: crate::StorageHandler::list_from
-    FileListing { url: Url },
+    FileListing { url: Url, end: Option<Url> },
     /// Read raw bytes from one or more files (or byte ranges within files).
     ///
     /// Each [`FileSlice`] specifies a file URL and an optional byte range. Results are returned
@@ -85,9 +86,9 @@ pub enum IoOperation {
 }
 
 impl IoOperation {
-    /// Constructs an [`IoOperation::FileListing`] for the given URL.
-    pub fn file_listing(url: Url) -> Self {
-        Self::FileListing { url }
+    /// Constructs an [`IoOperation::FileListing`] for the given URL and optional exclusive end.
+    pub fn file_listing(url: Url, end: Option<Url>) -> Self {
+        Self::FileListing { url, end }
     }
 
     /// Constructs an [`IoOperation::ReadBytes`] for the given file slices.

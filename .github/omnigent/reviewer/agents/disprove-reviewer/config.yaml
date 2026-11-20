@@ -2,9 +2,12 @@ spec_version: 1
 name: disprove-reviewer
 description: 'Attempts to disprove candidate review findings before publication.'
 skills: none
+tool_groups:
+  projects: false
 executor:
   type: omnigent
   model: disprove
+  reasoning_effort: medium
   config:
     harness: codex
 instructions: REVIEW.md

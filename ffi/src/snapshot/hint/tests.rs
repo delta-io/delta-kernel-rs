@@ -162,7 +162,11 @@ impl StorageHandler for SingleHeadStorage {
         Ok(metadata)
     }
 
-    fn list_from(&self, _: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+    fn list_from(
+        &self,
+        _: &Url,
+        _: Option<&Url>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
         panic!("unexpected list_from")
     }
 

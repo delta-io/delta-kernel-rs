@@ -126,6 +126,8 @@ message ColumnName {
 message UnaryExpression {
   UnaryExpressionOp op = 1;
   Expression expr = 2;
+  // TO_JSON only: encode timestamps with all six microsecond digits instead of three.
+  bool to_json_full_precision_timestamps = 3;
 }
 
 message BinaryExpression {

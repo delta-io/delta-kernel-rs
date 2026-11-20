@@ -8,6 +8,8 @@ description: >-
   Ported from the repo's local /kernel-review reviewer roster; writes no code
   and posts nothing itself -- the workflow posts the consolidated review.
 skills: none
+tool_groups:
+  projects: false
 
 # The orchestrator brain runs on the claude-sdk harness against the configured
 # gateway (see ~/.omnigent/config.yaml written by the workflow). It only plans,
@@ -16,6 +18,7 @@ executor:
   type: omnigent
   context_window: 1000000
   model: default
+  reasoning_effort: medium
   config:
     harness: claude-sdk
 
@@ -49,13 +52,13 @@ guardrails:
     spawn_bounds:
       type: function
       function:
-        path: omnigent.inner.nessie.policies.spawn_bounds
+        path: omnigent.policies.builtins.orchestration.spawn_bounds
         arguments:
           max_dispatches_per_turn: 6
           dispatch_tools: [sys_session_send]
     headless_subagent_purpose_guard:
       type: function
       function:
-        path: omnigent.inner.nessie.policies.headless_subagent_purpose_guard
+        path: omnigent.policies.builtins.orchestration.headless_subagent_purpose_guard
         arguments:
           allowed_purposes: [review, explore, search]

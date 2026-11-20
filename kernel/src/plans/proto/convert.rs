@@ -66,8 +66,9 @@ impl From<&IoOperation> for proto_op::IoOperation {
     fn from(io: &IoOperation) -> Self {
         use proto_op::io_operation::Op;
         let op = match io {
-            IoOperation::FileListing { url } => Op::FileListing(proto_op::FileListing {
+            IoOperation::FileListing { url, end } => Op::FileListing(proto_op::FileListing {
                 url: url.to_string(),
+                end: end.as_ref().map(ToString::to_string),
             }),
             IoOperation::ReadBytes { files } => Op::ReadBytes(proto_op::ReadBytes {
                 files: convert_vec(files),
@@ -414,6 +415,11 @@ impl From<&UnaryExpression> for proto_expr::UnaryExpression {
         proto_expr::UnaryExpression {
             op: proto_expr::UnaryExpressionOp::from(unary.op) as i32,
             expr: Some(Box::new(unary.expr.as_ref().into())),
+            to_json_full_precision_timestamps: match unary.op {
+                UnaryExpressionOp::ToJson {
+                    full_precision_timestamps,
+                } => full_precision_timestamps,
+            },
         }
     }
 }
@@ -540,7 +546,7 @@ impl From<&ExpressionFieldPatch> for proto_expr::FieldTransform {
 impl From<UnaryExpressionOp> for proto_expr::UnaryExpressionOp {
     fn from(op: UnaryExpressionOp) -> Self {
         match op {
-            UnaryExpressionOp::ToJson => proto_expr::UnaryExpressionOp::ToJson,
+            UnaryExpressionOp::ToJson { .. } => proto_expr::UnaryExpressionOp::ToJson,
         }
     }
 }
@@ -1231,11 +1237,16 @@ mod tests {
     #[test]
     fn from_io_operation_file_listing() {
         let url = "memory:///table/";
-        let op = Operation::IoOperation(IoOperation::file_listing(Url::parse(url).unwrap()));
+        let end = "memory:///table/:";
+        let op = Operation::IoOperation(IoOperation::file_listing(
+            Url::parse(url).unwrap(),
+            Some(Url::parse(end).unwrap()),
+        ));
         let proto_op::io_operation::Op::FileListing(file_listing) = io_op(&op) else {
             panic!("expected FileListing");
         };
         assert_eq!(file_listing.url, url);
+        assert_eq!(file_listing.end.as_deref(), Some(end));
     }
 
     #[test]
@@ -1746,7 +1757,7 @@ mod tests {
         ),
         "transform"
     )]
-    #[case(Expression::unary(UnaryExpressionOp::ToJson, lit(1)), "unary")]
+    #[case(Expression::unary(UnaryExpressionOp::TO_JSON, lit(1)), "unary")]
     #[case(Expression::binary(BinaryExpressionOp::Plus, lit(1), lit(2)), "binary")]
     #[case(expr!(coalesce(1, 2)), "variadic")]
     #[case(Expression::opaque(TestOpaqueExprOp, [lit(1)]), "opaque")]
@@ -1831,14 +1842,21 @@ mod tests {
         assert!(guarded.nullability_predicate.is_some());
     }
 
-    #[test]
-    fn from_unary_expression() {
+    #[rstest]
+    fn from_unary_expression(#[values(false, true)] full_precision_timestamps: bool) {
+        let op = UnaryExpressionOp::ToJson {
+            full_precision_timestamps,
+        };
         let proto_expr::expression::Kind::Unary(unary) =
-            expr_kind_of(Expression::unary(UnaryExpressionOp::ToJson, lit(1)))
+            expr_kind_of(Expression::unary(op, lit(1)))
         else {
             panic!("expected a unary expression");
         };
         assert_eq!(unary.op, proto_expr::UnaryExpressionOp::ToJson as i32);
+        assert_eq!(
+            unary.to_json_full_precision_timestamps,
+            full_precision_timestamps
+        );
         assert!(unary.expr.is_some());
     }
 
@@ -1992,7 +2010,7 @@ mod tests {
     // === Expression and predicate operators ===
 
     #[rstest]
-    #[case(UnaryExpressionOp::ToJson, proto_expr::UnaryExpressionOp::ToJson)]
+    #[case(UnaryExpressionOp::TO_JSON, proto_expr::UnaryExpressionOp::ToJson)]
     fn from_unary_expression_op(
         #[case] op: UnaryExpressionOp,
         #[case] expected: proto_expr::UnaryExpressionOp,
