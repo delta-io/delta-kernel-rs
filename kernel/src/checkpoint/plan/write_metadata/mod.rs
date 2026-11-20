@@ -153,13 +153,13 @@ impl CheckpointWriter {
         PlanBuilder::union_all([
             bounded_prefetch(
                 non_content,
-                Expr::unary(UnaryExpressionOp::ToJson, col!("action")),
+                Expr::unary(UnaryExpressionOp::TO_JSON, col!("action")),
                 false,
                 LAST_CHECKPOINT_NON_FILE_ACTIONS_THRESHOLD,
             )?,
             bounded_prefetch(
                 sidecars,
-                Expr::unary(UnaryExpressionOp::ToJson, col!("sidecar")),
+                Expr::unary(UnaryExpressionOp::TO_JSON, col!("sidecar")),
                 true,
                 LAST_CHECKPOINT_SIDECARS_THRESHOLD,
             )?,
