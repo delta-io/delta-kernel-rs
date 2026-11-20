@@ -88,6 +88,12 @@ impl<MODE: ExecutionMode> Transaction<UpdateTable, MODE> {
     /// Stages `file` to be committed as the table's root manifest. The root manifest must include
     /// every file change up to the read snapshot's version.
     ///
+    /// Pass `in_commit_timestamp`, in milliseconds since the Unix epoch, when the root manifest was
+    /// written for a known commit time: the commit uses it as its In-Commit Timestamp and its
+    /// `checkpoint` action records it as the content root's commit timestamp. With `None`, kernel
+    /// picks the In-Commit Timestamp. The commit fails if a provided value is not later than the
+    /// read snapshot's In-Commit Timestamp.
+    ///
     /// Mutually exclusive with [`with_manifest_commit`](Transaction::with_manifest_commit), which
     /// has kernel build the tree instead.
     ///
@@ -96,7 +102,11 @@ impl<MODE: ExecutionMode> Transaction<UpdateTable, MODE> {
     /// Returns an error if the table does not support the `adaptiveMetadata-preview` feature, or if
     /// a manifest (content-tree) commit was already staged.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    pub fn with_root_manifest_file(mut self, file: FileMeta) -> KernelResult<Self> {
+    pub fn with_root_manifest_file(
+        mut self,
+        file: FileMeta,
+        in_commit_timestamp: Option<i64>,
+    ) -> KernelResult<Self> {
         require!(
             !matches!(self.manifest_write, Some(ManifestWrite::Commit(_))),
             KernelError::invalid_transaction_state(
@@ -116,6 +126,7 @@ impl<MODE: ExecutionMode> Transaction<UpdateTable, MODE> {
         self.manifest_write = Some(ManifestWrite::RootFile(RootManifestFile::new(
             file,
             read_snapshot,
+            in_commit_timestamp,
         )));
         Ok(self)
     }

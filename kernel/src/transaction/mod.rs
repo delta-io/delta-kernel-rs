@@ -314,7 +314,8 @@ pub struct Transaction<STATE = UpdateTable, MODE: ExecutionMode = Imperative> {
     // in the commit method.
     set_transactions: Vec<SetTransaction>,
     // commit-wide timestamp (in milliseconds since epoch) - used in ICT, `txn` action, etc. to
-    // keep all timestamps within the same commit consistent.
+    // keep all timestamps within the same commit consistent. An In-Commit Timestamp provided with
+    // a root manifest file replaces it only as the ICT.
     commit_timestamp: i64,
     // User-provided domain metadata additions (via with_domain_metadata API).
     user_domain_metadata_additions: Vec<DomainMetadata>,
@@ -1170,15 +1171,40 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
             return Ok(Some(self.commit_timestamp));
         }
 
-        // Existing table: enforce monotonicity per the Delta protocol. The timestamp
-        // must be the larger of:
-        // - The time at which the writer attempted the commit
-        // - One millisecond later than the previous commit's inCommitTimestamp
-        Ok(self
+        let Some(prev_ict) = self
             .read_snapshot()?
             .reader()
             .get_in_commit_timestamp(engine)?
-            .map(|prev_ict| self.commit_timestamp.max(prev_ict + 1)))
+        else {
+            return Ok(None);
+        };
+        let Some(provided) = self.provided_in_commit_timestamp() else {
+            // Existing table: enforce monotonicity per the Delta protocol. The timestamp
+            // must be the larger of:
+            // - The time at which the writer attempted the commit
+            // - One millisecond later than the previous commit's inCommitTimestamp
+            return Ok(Some(self.commit_timestamp.max(prev_ict + 1)));
+        };
+        // The caller may have recorded the provided timestamp elsewhere, such as in the root
+        // manifest it wrote, so it is used as is rather than adjusted.
+        require!(
+            provided > prev_ict,
+            KernelError::invalid_transaction_state(format!(
+                "In-Commit Timestamp {provided} provided with the root manifest is not later than \
+                 the previous In-Commit Timestamp {prev_ict}"
+            ))
+        );
+        Ok(Some(provided))
+    }
+
+    /// The In-Commit Timestamp provided with
+    /// [`with_root_manifest_file`](Transaction::with_root_manifest_file), if any.
+    fn provided_in_commit_timestamp(&self) -> Option<i64> {
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if let Some(ManifestWrite::RootFile(root_manifest_file)) = &self.manifest_write {
+            return root_manifest_file.in_commit_timestamp;
+        }
+        None
     }
 
     /// Returns the commit version for this transaction.

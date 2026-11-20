@@ -84,7 +84,7 @@ fn test_create_table_iceberg_native_v4_then_commit_root_manifest_only()
     let committed = snapshot
         .update_table(UpdateTableOperation::Write, "Test/1.0", true)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .with_root_manifest_file(root_manifest.clone())?
+        .with_root_manifest_file(root_manifest.clone(), None)?
         .commit(engine.as_ref())?
         .unwrap_committed();
     assert_eq!(committed.commit_version(), 1);
