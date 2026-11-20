@@ -80,8 +80,15 @@ pub(crate) const SIDECAR_FILE_SCHEMA_TAG: &str = "sidecarFileSchema";
 /// Optional add-action count from the [checkpoint metadata tags][spec] in the Delta protocol.
 ///
 /// [spec]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#checkpoint-metadata-tags
-#[cfg(feature = "declarative-plans")]
+#[cfg(any(
+    feature = "declarative-plans",
+    feature = "incremental-checkpoints-in-dev"
+))]
 pub(crate) const CHECKPOINT_NUM_ADD_FILES_TAG: &str = "numOfAddFiles";
+#[cfg(feature = "incremental-checkpoints-in-dev")]
+pub(crate) const SIDECAR_NUM_ACTIONS_TAG: &str = "sidecarNumActions";
+#[cfg(feature = "incremental-checkpoints-in-dev")]
+pub(crate) const SIDECAR_SIZE_IN_BYTES_TAG: &str = "sidecarSizeInBytes";
 #[internal_api]
 pub(crate) const DOMAIN_METADATA_NAME: &str = "domainMetadata";
 #[cfg(feature = "adaptive-metadata-in-dev")]

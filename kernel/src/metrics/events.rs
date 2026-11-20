@@ -396,6 +396,10 @@ pub enum CheckpointWriteMode {
     V2WithoutSidecars,
     /// A V2 checkpoint using the sidecar-writing path, which may produce zero sidecars.
     V2WithSidecars,
+    /// A V2 checkpoint attempted all-or-nothing reuse of inherited sidecars.
+    V2ReusingSidecarsAllOrNothing,
+    /// Benchmark-only reuse under an external fresh-Add-path assumption.
+    V2ReusingSidecarsAssumeFreshAddsForBenchmark,
 }
 
 /// A [`crate::Snapshot::checkpoint`] call wrote a checkpoint or reported that one already exists.
@@ -461,6 +465,8 @@ pub struct CheckpointWriteFailure {
 /// Action counts are taken before reconciliation and include discarded actions. If processing
 /// fails, counts include the entire received batch. Counts exclude actions generated for the new
 /// checkpoint, such as checkpoint metadata and sidecar references.
+/// Rows reread after a reuse attempt falls back are counted again; these are processing-work
+/// counts, rather than counts of distinct actions in the completed checkpoint.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CheckpointProcessingStats {
     /// Time setting up and consuming input from original commit files.
@@ -472,7 +478,8 @@ pub struct CheckpointProcessingStats {
     /// or failing iterator calls. Includes JSON main checkpoints as well as Parquet input.
     pub checkpoint_input_duration: Duration,
 
-    /// Time reconciling input actions and building selection vectors.
+    /// Time checking sidecar-reuse eligibility, reconciling actions, and building selection
+    /// vectors.
     pub reconciliation_duration: Duration,
 
     /// Time evaluating statistics and partition-value transforms for checkpoint output.
@@ -526,6 +533,8 @@ pub struct CheckpointWriteStats {
     pub num_actions: u64,
     /// Total sidecars referenced by the completed checkpoint.
     pub num_sidecars: u64,
+    /// Inherited sidecar files referenced without being rewritten. Zero on full fallback.
+    pub num_reused_sidecars: u64,
 }
 
 impl CheckpointWriteSuccess {
@@ -594,6 +603,7 @@ impl CheckpointWriteSuccess {
             "num_remove_files" => stats.num_remove_files = value,
             "num_actions" => stats.num_actions = value,
             "num_sidecars" => stats.num_sidecars = value,
+            "num_reused_sidecars" => stats.num_reused_sidecars = value,
             _ => return Err(Self::SPAN_NAME),
         }
         self.outcome = CheckpointWriteOutcome::Written { stats };
@@ -2580,6 +2590,7 @@ mod tests {
                 num_remove_files: 2,
                 num_actions: 7,
                 num_sidecars: 1,
+                num_reused_sidecars: 0,
             }
         },
         "written"
@@ -2600,6 +2611,14 @@ mod tests {
     #[case::v1(CheckpointWriteMode::V1, "v1")]
     #[case::v2_without_sidecars(CheckpointWriteMode::V2WithoutSidecars, "v2_without_sidecars")]
     #[case::v2_with_sidecars(CheckpointWriteMode::V2WithSidecars, "v2_with_sidecars")]
+    #[case::v2_reusing_sidecars_all_or_nothing(
+        CheckpointWriteMode::V2ReusingSidecarsAllOrNothing,
+        "v2_reusing_sidecars_all_or_nothing"
+    )]
+    #[case::v2_reusing_sidecars_assume_fresh_adds_for_benchmark(
+        CheckpointWriteMode::V2ReusingSidecarsAssumeFreshAddsForBenchmark,
+        "v2_reusing_sidecars_assume_fresh_adds_for_benchmark"
+    )]
     fn checkpoint_write_mode_serializes_to_wire_name_and_parses_back(
         #[case] mode: CheckpointWriteMode,
         #[case] wire: &str,
