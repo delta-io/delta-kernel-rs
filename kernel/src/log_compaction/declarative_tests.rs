@@ -185,7 +185,7 @@ async fn compaction_reuses_only_contained_ranges(
         )?
         .build()?;
     assert_batches_sorted_eq!(
-        [
+        vec![
             "+------------+",
             "| dataChange |",
             "+------------+",
