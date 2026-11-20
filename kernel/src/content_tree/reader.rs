@@ -89,19 +89,19 @@ pub(crate) fn read_add_actions_from_amt(
 ) -> Result<Box<dyn KernelResultIterator<FilteredEngineData>>> {
     let table_root = &ctx.table_root;
     let root = checkpoint.root_filemeta(table_root)?;
-    let schemas = ManifestReadSchema::new(ctx.content_stats());
-    let converter = make_root_entry_converter(engine, ctx, &schemas.root)?;
+    let kind = ManifestKind::root(ctx.content_stats());
+    let converter = make_root_entry_converter(engine, ctx, &kind)?;
     let leaf_filter = ctx
         .stats
         .as_ref()
-        .and_then(|stats| stats.leaf_filter(engine, schemas.root.clone()));
+        .and_then(|stats| stats.leaf_filter(engine, kind.read_schema.clone()));
     let mut root_actions = Vec::new();
     let mut leaves = LeafRefVisitor::new(table_root);
     let batches = engine
         .parquet_handler()
         .read_parquet_files_with_cancellation(
             slice::from_ref(&root),
-            schemas.root.clone(),
+            kind.read_schema.clone(),
             None,
             cancellation_token.cloned(),
         )?;
@@ -114,8 +114,7 @@ pub(crate) fn read_add_actions_from_amt(
         leaves.visit_batch(batch.as_ref(), keep)?;
         root_actions.push(converter.convert(batch.as_ref(), |_| Ok(vec![]))?);
     }
-    let leaf_actions =
-        LeafToAddActions::try_new(engine, leaves.leaves, schemas.leaf, ctx, cancellation_token)?;
+    let leaf_actions = LeafToAddActions::try_new(engine, leaves.leaves, ctx, cancellation_token)?;
     Ok(Box::new(
         root_actions.into_iter().map(Ok).chain(leaf_actions),
     ))
@@ -418,22 +417,35 @@ const LEAF_FILE_PATH_COLUMN: &str = "_file";
 /// position a manifest deletion vector or backreference refers to.
 const LEAF_ROW_INDEX_COLUMN: &str = "_row_index";
 
-/// The schemas AMT root and leaf manifests are read with.
-struct ManifestReadSchema {
-    /// Root manifest read schema: [`ContentTreeNodeEntry::to_schema_with_content_stats`].
-    root: SchemaRef,
-    /// Leaf manifest read schema: [`Self::root`] plus the [`LEAF_FILE_PATH_COLUMN`] and
-    /// [`LEAF_ROW_INDEX_COLUMN`] metadata columns. Root entries need neither: they are never
-    /// addressed by position.
-    leaf: SchemaRef,
+/// What differs between reading root and leaf manifest entries as `Add` actions.
+struct ManifestKind {
+    /// The schema the manifest is read with.
+    read_schema: SchemaRef,
+    /// Expression producing `Add.baseRowId`.
+    base_row_id: Expression,
+    /// Columns the caller of [`EntryConverter::convert`] supplies for `base_row_id`.
+    helpers: SchemaRef,
 }
 
-impl ManifestReadSchema {
-    /// Builds the manifest read schemas, reading `content_stats` when given.
-    fn new(content_stats: Option<StructType>) -> Self {
-        let entry_schema = Arc::new(ContentTreeNodeEntry::to_schema_with_content_stats(
-            content_stats,
-        ));
+impl ManifestKind {
+    /// A root manifest, read as [`ContentTreeNodeEntry::to_schema_with_content_stats`] with
+    /// `content_stats`. `Add.baseRowId` is the entry's `tracking.firstRowId`, which a root entry
+    /// must carry.
+    fn root(content_stats: Option<StructType>) -> Self {
+        Self {
+            read_schema: Arc::new(ContentTreeNodeEntry::to_schema_with_content_stats(
+                content_stats,
+            )),
+            base_row_id: Expression::column([TRACKING, FIRST_ROW_ID]),
+            helpers: Arc::new(StructType::new_unchecked([])),
+        }
+    }
+
+    /// A leaf manifest: the root read schema plus the [`LEAF_FILE_PATH_COLUMN`] and
+    /// [`LEAF_ROW_INDEX_COLUMN`] metadata columns that address entries by position. `Add.baseRowId`
+    /// is the `firstRowId` the reader resolves for each entry.
+    fn leaf(content_stats: Option<StructType>) -> Self {
+        let entries = ContentTreeNodeEntry::to_schema_with_content_stats(content_stats);
         let metadata = [
             StructField::create_metadata_column(
                 LEAF_FILE_PATH_COLUMN,
@@ -444,36 +456,30 @@ impl ManifestReadSchema {
                 MetadataColumnSpec::RowIndex,
             ),
         ];
-        let leaf = StructType::new_unchecked(entry_schema.fields().cloned().chain(metadata));
         Self {
-            root: entry_schema,
-            leaf: Arc::new(leaf),
+            read_schema: schema_with(&entries, [&StructType::new_unchecked(metadata)]),
+            base_row_id: Expression::column([FIRST_ROW_ID_HELPER]),
+            helpers: FIRST_ROW_ID_HELPER_SCHEMA.clone(),
         }
     }
 }
 
-/// What differs between converting root and leaf manifest entries: the sources of the `Add`
-/// row-tracking fields (a leaf entry inherits them from its parent), the helper columns those
-/// sources read, and which entries a manifest deletion vector removes.
+/// The per-manifest parts of converting entries to `Add`s: the source of
+/// `Add.defaultRowCommitVersion` (a leaf entry inherits it from its parent) and which entries the
+/// manifest deletion vector removes.
 struct AddFieldSources {
-    /// Expression producing `Add.baseRowId`.
-    base_row_id: Expression,
     /// Expression producing `Add.defaultRowCommitVersion`.
     default_row_commit_version: Expression,
-    /// Columns the caller of [`EntryConverter::convert`] supplies for the expressions above.
-    helpers: SchemaRef,
     /// Whether an entry is removed, becoming the [`REMOVED_COLUMN`] value.
     removed: Predicate,
 }
 
 impl AddFieldSources {
-    /// Root-manifest sources: read `tracking.firstRowId` / `tracking.sequenceNumber` straight off
-    /// the entry (a root entry carries both). Root entries are never removed.
+    /// Root-manifest sources: read `tracking.sequenceNumber` straight off the entry (a root entry
+    /// carries it). Root entries are never removed.
     fn root() -> Self {
         Self {
-            base_row_id: Expression::column([TRACKING, FIRST_ROW_ID]),
             default_row_commit_version: Expression::column([TRACKING, SEQUENCE_NUMBER]),
-            helpers: Arc::new(StructType::new_unchecked([])),
             removed: Predicate::FALSE,
         }
     }
@@ -519,7 +525,7 @@ struct EntryConverter {
     marker: Arc<dyn ExpressionEvaluator>,
     /// Picks the entries that become `Add` actions (see [`selected_predicate`]).
     selector: Arc<dyn PredicateEvaluator>,
-    /// The caller's [`AddFieldSources::helpers`] followed by the [`ADD_HELPER_SCHEMA`] columns.
+    /// The kind's [`ManifestKind::helpers`] followed by the [`ADD_HELPER_SCHEMA`] columns.
     helper_schema: SchemaRef,
     /// Evaluates an entry batch with [`REMOVED_COLUMN`] and the [`Self::helper_schema`] columns
     /// (see [`add_deletion_vector_expression`]).
@@ -529,7 +535,7 @@ struct EntryConverter {
 impl EntryConverter {
     /// Translates a content-tree entry batch, read with the converter's read schema, into an
     /// `Add`-action batch, keeping only the rows that read as live data files. `helper_columns`
-    /// computes the caller's [`AddFieldSources::helpers`] from the batch with [`REMOVED_COLUMN`]
+    /// computes the kind's [`ManifestKind::helpers`] from the batch with [`REMOVED_COLUMN`]
     /// appended.
     ///
     /// An entry becomes an `Add` when its `contentType` is [`DataContentType::Data`], its tracking
@@ -579,16 +585,16 @@ impl EntryConverter {
 /// # Parameters
 /// - `engine`: provides the [`crate::EvaluationHandler`] used to build the evaluator.
 /// - `ctx`: the per-read values the entry cannot supply (see [`ReadContext`]).
-/// - `read_schema`: the schema the root is read with (see [`ManifestReadSchema::root`]).
+/// - `kind`: how the root is read (see [`ManifestKind::root`]).
 ///
 /// # Errors
 /// Returns an error if the evaluator cannot be constructed.
 fn make_root_entry_converter(
     engine: &dyn Engine,
     ctx: &ReadContext,
-    read_schema: &SchemaRef,
+    kind: &ManifestKind,
 ) -> KernelResult<EntryConverter> {
-    make_entry_converter(engine, ctx, AddFieldSources::root(), read_schema)
+    make_entry_converter(engine, ctx, kind, AddFieldSources::root())
 }
 
 /// Converts the entry batches of one leaf manifest into `Add` actions, filling null tracking
@@ -612,7 +618,7 @@ impl LeafReadContext {
     /// - `engine`: provides the evaluation handler for the entry->`Add` transform.
     /// - `parent`: tracking info of the root `DataManifest` entry referencing the leaf.
     /// - `manifest_dv`: the parent's manifest deletion vector, if any.
-    /// - `read_schema`: the schema the leaf is read with (see [`ManifestReadSchema::leaf`]).
+    /// - `kind`: how the leaf is read (see [`ManifestKind::leaf`]).
     /// - `ctx`: the per-read values the entry cannot supply (see [`ReadContext`]).
     ///
     /// # Errors
@@ -622,7 +628,7 @@ impl LeafReadContext {
         engine: &dyn Engine,
         parent: &TrackingInfo,
         manifest_dv: Option<ManifestDv>,
-        read_schema: &SchemaRef,
+        kind: &ManifestKind,
         ctx: &ReadContext,
     ) -> KernelResult<Self> {
         // Root entries always carry explicit tracking values since nothing above them can be
@@ -645,17 +651,15 @@ impl LeafReadContext {
             None => Predicate::FALSE,
         };
         let sources = AddFieldSources {
-            base_row_id: Expression::column([FIRST_ROW_ID_HELPER]),
             default_row_commit_version: expr!(coalesce(
                 path(TRACKING, SEQUENCE_NUMBER),
                 lit(parent_sequence_number),
             )),
-            helpers: FIRST_ROW_ID_HELPER_SCHEMA.clone(),
             removed,
         };
         Ok(Self {
             next_first_row_id,
-            converter: make_entry_converter(engine, ctx, sources, read_schema)?,
+            converter: make_entry_converter(engine, ctx, kind, sources)?,
             last_removed_position,
             entry_count: 0,
         })
@@ -749,8 +753,8 @@ struct LeafToAddActions {
 }
 
 impl LeafToAddActions {
-    /// Validates and reads the leaves not [skipped](LeafRef::skipped), with `read_schema` (see
-    /// [`ManifestReadSchema::leaf`]), stopping when `cancellation_token` is cancelled.
+    /// Validates and reads the leaves not [skipped](LeafRef::skipped) as [`ManifestKind::leaf`],
+    /// stopping when `cancellation_token` is cancelled.
     ///
     /// # Errors
     /// Returns an error if two leaves share a location (their batches could not be told apart), if
@@ -760,7 +764,6 @@ impl LeafToAddActions {
     fn try_new(
         engine: &dyn Engine,
         leaves: Vec<LeafRef>,
-        read_schema: SchemaRef,
         ctx: &ReadContext,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> KernelResult<Self> {
@@ -771,25 +774,21 @@ impl LeafToAddActions {
                 dup.file_meta.location
             )));
         }
+        let kind = ManifestKind::leaf(ctx.content_stats());
         let (pending, files): (VecDeque<_>, Vec<_>) = leaves
             .into_iter()
             .filter(|leaf| !leaf.skipped)
             .map(|leaf| {
                 leaf.check_readable()?;
                 let location = leaf.file_meta.location.to_string();
-                let context = LeafReadContext::new(
-                    engine,
-                    &leaf.parent_info,
-                    leaf.manifest_dv,
-                    &read_schema,
-                    ctx,
-                )
-                .map_err(|e| match e {
-                    KernelError::MissingData(msg) => {
-                        KernelError::missing_data(format!("{msg} (leaf manifest '{location}')"))
-                    }
-                    e => e,
-                })?;
+                let context =
+                    LeafReadContext::new(engine, &leaf.parent_info, leaf.manifest_dv, &kind, ctx)
+                        .map_err(|e| match e {
+                        KernelError::MissingData(msg) => {
+                            KernelError::missing_data(format!("{msg} (leaf manifest '{location}')"))
+                        }
+                        e => e,
+                    })?;
                 Ok(((location, context), leaf.file_meta))
             })
             .collect::<KernelResult<_>>()?;
@@ -801,7 +800,7 @@ impl LeafToAddActions {
                     .parquet_handler()
                     .read_parquet_files_with_cancellation(
                         &files,
-                        read_schema,
+                        kind.read_schema,
                         None,
                         cancellation_token.cloned(),
                     )?,
@@ -906,14 +905,15 @@ impl RowVisitor for FilePathVisitor {
 }
 
 /// Shared constructor for [`EntryConverter`]: builds the marker, the selection predicate, and the
-/// entry->`Add` transform evaluators for batches read with `read_schema`.
+/// entry->`Add` transform evaluators for batches read as `kind`.
 fn make_entry_converter(
     engine: &dyn Engine,
     ctx: &ReadContext,
+    kind: &ManifestKind,
     sources: AddFieldSources,
-    read_schema: &SchemaRef,
 ) -> KernelResult<EntryConverter> {
     let handler = engine.evaluation_handler();
+    let read_schema = &kind.read_schema;
     let removed_field = StructField::nullable(REMOVED_COLUMN, DataType::BOOLEAN);
     let marked_schema = schema_with(read_schema, [&StructType::new_unchecked([removed_field])]);
     let marker = handler.new_expression_evaluator(
@@ -926,10 +926,14 @@ fn make_entry_converter(
     )?;
     let selector =
         handler.new_predicate_evaluator(marked_schema.clone(), Arc::new(selected_predicate()))?;
-    let helper_schema = schema_with(&sources.helpers, [ADD_HELPER_SCHEMA.as_ref()]);
+    let helper_schema = schema_with(&kind.helpers, [ADD_HELPER_SCHEMA.as_ref()]);
     let evaluator = handler.new_expression_evaluator(
         schema_with(&marked_schema, [helper_schema.as_ref()]),
-        Arc::new(build_entry_to_add_expression(ctx, &sources)?),
+        Arc::new(build_entry_to_add_expression(
+            ctx,
+            &kind.base_row_id,
+            &sources.default_row_commit_version,
+        )?),
         DataType::from(ctx.add_schema().as_ref().clone()),
     )?;
     Ok(EntryConverter {
@@ -977,11 +981,12 @@ fn validate_and_assign_first_row_ids(
 /// Builds the transform mapping a [`ContentTreeNodeEntry`] row to a `{ add: Add }` struct matching
 /// [`ReadContext::add_schema`].
 ///
-/// `ctx` supplies the fields the AMT entry cannot; `sources` supplies the row-tracking fields
-/// whose derivation differs between root and leaf entries.
+/// `ctx` supplies the fields the AMT entry cannot; `base_row_id` and `default_row_commit_version`
+/// supply the row-tracking fields.
 fn build_entry_to_add_expression(
     ctx: &ReadContext,
-    sources: &AddFieldSources,
+    base_row_id: &Expression,
+    default_row_commit_version: &Expression,
 ) -> KernelResult<Expression> {
     // TODO(#3320): read partition values from the entry's `partition` tuple once the read path
     // carries a partition spec; the AMT root written by the minimal blind-append path is
@@ -1009,8 +1014,8 @@ fn build_entry_to_add_expression(
             n if n == MODIFICATION_TIME_NAME => lit(ctx.modification_time),
             n if n == DATA_CHANGE_NAME => lit(ctx.data_change),
             n if n == DELETION_VECTOR_NAME => add_deletion_vector_expression(),
-            n if n == BASE_ROW_ID_NAME => sources.base_row_id.clone(),
-            n if n == DEFAULT_ROW_COMMIT_VERSION_NAME => sources.default_row_commit_version.clone(),
+            n if n == BASE_ROW_ID_NAME => base_row_id.clone(),
+            n if n == DEFAULT_ROW_COMMIT_VERSION_NAME => default_row_commit_version.clone(),
             n if n == STATS_PARSED => ctx.stats.as_ref()?.expression.as_ref().clone(),
             _ => return None,
         })
@@ -1466,13 +1471,21 @@ mod tests {
         )
     }
 
+    /// The leaf [`ManifestKind`] for batches built by [`leaf_batch`].
+    fn leaf_kind() -> ManifestKind {
+        ManifestKind {
+            read_schema: leaf_schema(),
+            ..ManifestKind::leaf(None)
+        }
+    }
+
     /// A leaf context under [`valid_parent`] for batches built by [`leaf_batch`].
     fn leaf_ctx(engine: &dyn Engine, manifest_dv: Option<ManifestDv>) -> LeafReadContext {
         LeafReadContext::new(
             engine,
             &valid_parent(),
             manifest_dv,
-            &leaf_schema(),
+            &leaf_kind(),
             &read_ctx(),
         )
         .unwrap()
@@ -1509,8 +1522,7 @@ mod tests {
         entries: &dyn EngineData,
         ctx: &ReadContext,
     ) -> KernelResult<FilteredEngineData> {
-        let converter =
-            make_root_entry_converter(engine, ctx, &Arc::new(ContentTreeNodeEntry::to_schema()))?;
+        let converter = make_root_entry_converter(engine, ctx, &ManifestKind::root(None))?;
         converter.convert(entries, |_| Ok(vec![]))
     }
 
@@ -1740,11 +1752,10 @@ mod tests {
         #[values(false, true)] with_stats: bool,
     ) {
         let content_stats = with_stats.then(x_upper_bound_stats);
-        let schemas = ManifestReadSchema::new(content_stats.clone());
-
-        let root = ContentTreeNodeEntry::to_schema_with_content_stats(content_stats);
-        assert_eq!(*schemas.root, root);
-        let leaf: Vec<_> = schemas.leaf.fields().collect();
+        let root = ContentTreeNodeEntry::to_schema_with_content_stats(content_stats.clone());
+        assert_eq!(*ManifestKind::root(content_stats.clone()).read_schema, root);
+        let leaf_read_schema = ManifestKind::leaf(content_stats).read_schema;
+        let leaf: Vec<_> = leaf_read_schema.fields().collect();
         let (entries, metadata) = leaf.split_at(leaf.len() - 2);
         assert_eq!(entries, root.fields().collect::<Vec<_>>());
         let specs: Vec<_> = metadata
@@ -1769,11 +1780,13 @@ mod tests {
             added_data_entry("b.parquet", 1, 1, 1, 0),
         ];
         let file = write_manifest(&engine, location.clone(), &entries);
-        let schemas = ManifestReadSchema::new(None);
-
         let batches: Vec<RecordBatch> = engine
             .parquet_handler()
-            .read_parquet_files(slice::from_ref(&file), schemas.leaf.clone(), None)
+            .read_parquet_files(
+                slice::from_ref(&file),
+                ManifestKind::leaf(None).read_schema,
+                None,
+            )
             .unwrap()
             .map(|batch| batch.unwrap().try_into_record_batch().unwrap())
             .collect();
@@ -2725,8 +2738,8 @@ mod tests {
     #[test]
     fn root_entry_converter_is_reusable_across_batches() {
         let engine = SyncEngine::new();
-        let root_schema = Arc::new(ContentTreeNodeEntry::to_schema());
-        let converter = make_root_entry_converter(&engine, &read_ctx(), &root_schema).unwrap();
+        let converter =
+            make_root_entry_converter(&engine, &read_ctx(), &ManifestKind::root(None)).unwrap();
         let mut deleted = added_data_entry("deleted.parquet", 1, 1, 0, 0);
         deleted.tracking.status = TrackingStatus::Deleted;
         let batches = [
@@ -3264,7 +3277,7 @@ mod tests {
             file_sequence_number,
             first_row_id,
         );
-        let result = LeafReadContext::new(&engine, &parent, None, &leaf_schema(), &read_ctx());
+        let result = LeafReadContext::new(&engine, &parent, None, &leaf_kind(), &read_ctx());
         assert_result_error_with_message(result, expected_field);
     }
 
@@ -3433,7 +3446,7 @@ mod tests {
             &content_stats,
             vec![leaf_stats(&content_stats, stats.as_ref())],
         );
-        let root_schema = ManifestReadSchema::new(Some(content_stats)).root;
+        let root_schema = ManifestKind::root(Some(content_stats)).read_schema;
         let filter = stats_read.leaf_filter(&engine, root_schema).unwrap();
         let keep = filter.apply(batch.as_ref()).unwrap();
         match keep.as_slice() {
