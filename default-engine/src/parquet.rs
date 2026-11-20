@@ -12,7 +12,7 @@ use delta_kernel::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as 
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::arrow_utils::{
     RowIndexBuilder, fixup_parquet_read, ordering_needs_row_indexes, parquet_read_plan,
-    validate_file_values_for_write,
+    to_parquet_bytes, validate_file_values_for_write,
 };
 use delta_kernel::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use delta_kernel::engine::{data_file_writer_options, reader_options, writer_options};
@@ -22,6 +22,7 @@ use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ParquetRecordBatchReaderBuilder,
 };
+#[cfg(test)]
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 #[allow(deprecated)]
 use delta_kernel::parquet::arrow::async_reader::ParquetObjectReader;
@@ -206,11 +207,11 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         let stats = collect_stats(record_batch, stats_columns, physical_schema)?;
 
         let options = data_file_writer_options(&record_batch.schema(), physical_schema)?;
-        let mut buffer = vec![];
-        let mut writer =
-            ArrowWriter::try_new_with_options(&mut buffer, record_batch.schema(), options)?;
-        writer.write(record_batch)?;
-        writer.close()?; // writer must be closed to write footer
+        let buffer = to_parquet_bytes(
+            record_batch.schema(),
+            options,
+            std::iter::once(Ok(record_batch.clone())),
+        )?;
 
         let size: u64 = buffer
             .len()

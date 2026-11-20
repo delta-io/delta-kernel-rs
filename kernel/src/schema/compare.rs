@@ -25,6 +25,55 @@ use std::collections::{HashMap, HashSet};
 use super::{DataType, StructField, StructType};
 use crate::utils::require;
 
+/// Exact type equality, including nested field order.
+#[cfg(feature = "declarative-plans")]
+pub(crate) fn data_types_equal_ordered(left: &DataType, right: &DataType) -> bool {
+    left == right && data_types_equal_ignoring_metadata(left, right)
+}
+
+/// Compares field names, nullability, and ordered types, ignoring field metadata recursively.
+#[cfg(feature = "declarative-plans")]
+pub(crate) fn fields_equal_ignoring_metadata(left: &StructField, right: &StructField) -> bool {
+    left.name() == right.name()
+        && left.is_nullable() == right.is_nullable()
+        && data_types_equal_ignoring_metadata(left.data_type(), right.data_type())
+}
+
+/// Compares types recursively, ignoring struct-field metadata.
+///
+/// Field order, names, nullability, and type identity must match, including the distinction between
+/// structs, FILE, and Variant. UDT annotations must match; metadata within their SQL types is
+/// ignored.
+#[cfg(feature = "declarative-plans")]
+pub(crate) fn data_types_equal_ignoring_metadata(left: &DataType, right: &DataType) -> bool {
+    match (left, right) {
+        (DataType::Struct(left), DataType::Struct(right))
+        | (DataType::Variant(left), DataType::Variant(right))
+        | (DataType::File(left), DataType::File(right)) => {
+            left.num_fields() == right.num_fields()
+                && left
+                    .fields()
+                    .zip(right.fields())
+                    .all(|(left, right)| fields_equal_ignoring_metadata(left, right))
+        }
+        (DataType::Array(left), DataType::Array(right)) => {
+            left.contains_null() == right.contains_null()
+                && data_types_equal_ignoring_metadata(left.element_type(), right.element_type())
+        }
+        (DataType::Map(left), DataType::Map(right)) => {
+            left.value_contains_null() == right.value_contains_null()
+                && data_types_equal_ignoring_metadata(left.key_type(), right.key_type())
+                && data_types_equal_ignoring_metadata(left.value_type(), right.value_type())
+        }
+        #[cfg(feature = "udt-in-dev")]
+        (DataType::UserDefined(left), DataType::UserDefined(right)) => {
+            left.annotation() == right.annotation()
+                && data_types_equal_ignoring_metadata(left.sql_type(), right.sql_type())
+        }
+        _ => left == right,
+    }
+}
+
 /// The nullability flag of a schema's field. This can be compared with a read schema field's
 /// nullability flag using [`Nullable::can_read_as`].
 #[derive(Clone, Copy)]
