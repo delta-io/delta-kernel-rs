@@ -22,14 +22,14 @@ pub enum CheckpointKind {
 /// [`LastCheckpointHint`] describes the portable fields. Layout discovery does not validate every
 /// required checkpoint action.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CheckpointShape {
+pub struct CheckpointInfo {
     pub(crate) leaf_checkpoint_schema: SchemaRef,
     pub(crate) sidecars: Arc<[FileMeta]>,
     pub(crate) size_in_bytes: u64,
     pub(crate) last_checkpoint: Box<LastCheckpointHint>,
 }
 
-impl CheckpointShape {
+impl CheckpointInfo {
     /// Returns where the checkpoint stores its file actions.
     pub fn kind(&self) -> CheckpointKind {
         if self.sidecars.is_empty() {

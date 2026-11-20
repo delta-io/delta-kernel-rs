@@ -69,6 +69,9 @@ pub struct WriteState {
     /// of the random prefix in [`BoundWriteContext::write_dir`] for both the column mapping and
     /// `randomizeFilePrefixes` paths.
     pub(super) random_prefix_length: NonZero<usize>,
+    /// Value of the `delta.fileType.writeLocation` table property, validated only when
+    /// [`BoundWriteContext::new_referenced_file_path`] uses it.
+    pub(super) file_type_write_location: Option<String>,
 }
 
 /// Names of materialized row-tracking id/commit-version columns supplied by a connector.
@@ -402,6 +405,7 @@ impl WriteState {
             materialize_partition_columns: table_config.should_materialize_partition_columns(),
             randomize_file_prefixes: props.should_randomize_file_prefixes(),
             random_prefix_length: props.random_prefix_length(),
+            file_type_write_location: props.file_type_write_location.clone(),
         }
     }
 
