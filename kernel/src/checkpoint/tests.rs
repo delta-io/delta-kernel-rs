@@ -310,13 +310,14 @@ async fn assert_last_checkpoint_contents(
     expected_size_in_bytes: u64,
 ) -> KernelResult<()> {
     let last_checkpoint_data = read_last_checkpoint_file(store).await?;
-    let expected_data = json!({
-        "version": expected_version,
-        "size": expected_size,
-        "sizeInBytes": expected_size_in_bytes,
-        "numOfAddFiles": expected_num_add_files,
-    });
-    assert_eq!(last_checkpoint_data, expected_data);
+    for (name, expected) in [
+        ("version", expected_version),
+        ("size", expected_size),
+        ("sizeInBytes", expected_size_in_bytes),
+        ("numOfAddFiles", expected_num_add_files),
+    ] {
+        assert_eq!(last_checkpoint_data[name], json!(expected), "{name}");
+    }
     Ok(())
 }
 
@@ -1058,6 +1059,7 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
         .build(&engine)?;
     snapshot_v1.checkpoint(&engine, None)?;
     assert_last_checkpoint_contents(&store, 2, 4, 2, size_in_bytes).await?;
+    assert_eq!(read_last_checkpoint_file(&store).await?, last_checkpoint);
     Ok(())
 }
 
