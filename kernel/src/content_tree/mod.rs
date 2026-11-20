@@ -502,6 +502,13 @@ impl From<TrackingStatus> for Scalar {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TimestampMicros(pub(crate) i64);
 
+impl TimestampMicros {
+    /// The timestamp in milliseconds since the Unix epoch, rounded down.
+    pub(crate) fn as_millis(self) -> i64 {
+        self.0.div_euclid(1000)
+    }
+}
+
 impl ToDataType for TimestampMicros {
     fn to_data_type() -> DataType {
         DataType::TIMESTAMP

@@ -20,6 +20,7 @@ use crate::content_tree::{ContentTreeNodeEntry, TrackingInfo, TrackingStatus};
 use crate::engine::arrow_data::EngineDataArrowExt as _;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{Predicate as Pred, Scalar, col, lit};
+use crate::scan::state::ScanFile;
 use crate::scan::{Scan, ScanMetadata};
 use crate::schema::{SchemaRef, StructType, schema_ref};
 use crate::table_features::ColumnMappingMode;
@@ -97,6 +98,78 @@ fn scan_paths(engine: &SyncEngine, snapshot: Arc<Snapshot>) -> Vec<String> {
 
 fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|v| v.to_string()).collect()
+}
+
+/// The `(path, modification_time)` of every file a scan of `snapshot` reads, sorted by path.
+fn scan_modification_times(engine: &SyncEngine, snapshot: Arc<Snapshot>) -> Vec<(String, i64)> {
+    let scan = snapshot.scan_builder().build().unwrap();
+    let mut files = vec![];
+    for scan_metadata in scan.scan_metadata(engine).unwrap() {
+        files = scan_metadata
+            .unwrap()
+            .visit_scan_files(files, |files: &mut Vec<_>, file: ScanFile| {
+                files.push((file.path.to_string(), file.modification_time));
+            })
+            .unwrap();
+    }
+    files.sort();
+    files
+}
+
+/// How a test loads the snapshot it scans.
+enum SnapshotLoad {
+    /// Time travel to the manifest commit.
+    ManifestCommit,
+    /// The latest snapshot, loaded from scratch.
+    Latest,
+    /// The latest snapshot, updated from the manifest commit's snapshot.
+    IncrementalFromManifestCommit,
+}
+
+/// Tree files report the manifest commit's In-Commit Timestamp, however the snapshot is loaded; a
+/// later log add keeps its own `modificationTime` (the fixture's `1`).
+#[rstest]
+#[case::time_travel_to_manifest_commit(SnapshotLoad::ManifestCommit, &["a.parquet", "b.parquet"])]
+#[case::latest(SnapshotLoad::Latest, &["a.parquet", "b.parquet", "c.parquet"])]
+#[case::incremental_update(
+    SnapshotLoad::IncrementalFromManifestCommit,
+    &["a.parquet", "b.parquet", "c.parquet"]
+)]
+fn scan_reports_manifest_commit_timestamp_for_tree_files(
+    #[case] load: SnapshotLoad,
+    #[case] expected_paths: &[&str],
+) {
+    let (engine, _) = setup_adaptive_metadata_table();
+    let tree = [
+        added_data_entry("a.parquet", 1, 1, 0, 0),
+        added_data_entry("b.parquet", 1, 1, 1, 0),
+    ];
+    let manifest_commit =
+        commit_root_manifest(&engine, &table_root(), "metadata/root.parquet", &tree);
+    commit_files(&engine, &table_root(), &["c.parquet"], &[]);
+    let manifest_snapshot = snapshot_at(&engine, manifest_commit);
+    let ict = manifest_snapshot
+        .reader()
+        .get_in_commit_timestamp(&engine)
+        .unwrap()
+        .expect("adaptiveMetadata tables record an In-Commit Timestamp");
+
+    let snapshot = match load {
+        SnapshotLoad::ManifestCommit => manifest_snapshot,
+        SnapshotLoad::Latest => Snapshot::builder_for(TABLE_ROOT).build(&engine).unwrap(),
+        SnapshotLoad::IncrementalFromManifestCommit => Snapshot::builder_from(manifest_snapshot)
+            .build(&engine)
+            .unwrap(),
+    };
+
+    let expected: Vec<_> = expected_paths
+        .iter()
+        .map(|path| {
+            let modification_time = if *path == "c.parquet" { 1 } else { ict };
+            (path.to_string(), modification_time)
+        })
+        .collect();
+    assert_eq!(scan_modification_times(&engine, snapshot), expected);
 }
 
 #[rstest]

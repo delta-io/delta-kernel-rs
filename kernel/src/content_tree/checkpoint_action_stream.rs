@@ -2,6 +2,8 @@
 
 use std::iter;
 
+use tracing::debug;
+
 use super::action_projector::ActionProjector;
 use super::checkpoint_sidecar::read_sidecar_actions;
 use super::reader::{AmtStatsRequest, ReadContext, StatsRead, read_add_actions_from_amt};
@@ -126,10 +128,22 @@ fn read_tree_adds(
         ))
         .into()
     );
+    // TODO(#4030): drop the fallback to 0 once the protocol requires the content root's commit
+    // timestamp.
+    let root_modification_time = checkpoint
+        .content_root
+        .commit_timestamp()
+        .unwrap_or_else(|| {
+            debug!(
+                root = %checkpoint.content_root.path,
+                "AMT content root has no commit timestamp; entries that inherit it read with \
+                 modificationTime 0"
+            );
+            0
+        });
     let ctx = ReadContext {
         table_root: log_root.table_root().clone(),
-        // TODO(#2866): inherit each file's commit timestamp instead of a non-zero constant.
-        modification_time: 1,
+        root_modification_time,
         data_change: false,
         stats: stats_request
             .map(|request| StatsRead::try_new(checkpoint, request))
@@ -389,11 +403,21 @@ mod tests {
         assert_eq!(batches, expected);
     }
 
-    #[test]
-    fn tree_adds_have_constant_modification_time_and_no_data_change() {
+    #[rstest]
+    #[case::root_commit_timestamp(Some(1_700_000_000_000), 1_700_000_000_000)]
+    #[case::no_root_commit_timestamp(None, 0)]
+    fn tree_adds_inherit_root_commit_timestamp_and_have_no_data_change(
+        #[case] root_commit_timestamp: Option<i64>,
+        #[case] expected_modification_time: i64,
+    ) {
         let engine = SyncEngine::in_memory();
-        let checkpoint =
+        let mut checkpoint =
             checkpoint_with_tree(&engine, &[added_data_entry("a.parquet", 1, 1, 0, 0)], 1);
+        if let Some(commit_timestamp) = root_commit_timestamp {
+            checkpoint.content_root = checkpoint
+                .content_root
+                .with_commit_timestamp(commit_timestamp);
+        }
 
         let batches: Vec<_> = read_checkpoint_action(
             &engine,
@@ -412,7 +436,10 @@ mod tests {
         let add = batch.column_by_name(ADD_NAME).unwrap().as_struct();
         let modification_time = add.column_by_name("modificationTime").unwrap();
         let data_change = add.column_by_name("dataChange").unwrap().as_boolean();
-        assert_eq!(modification_time.as_primitive::<Int64Type>().value(0), 1);
+        assert_eq!(
+            modification_time.as_primitive::<Int64Type>().value(0),
+            expected_modification_time
+        );
         assert!(!data_change.value(0));
     }
 
