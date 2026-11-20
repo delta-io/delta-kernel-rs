@@ -16,14 +16,21 @@ pub(super) struct RootManifestFile {
     pub(super) file: FileMeta,
     /// The snapshot being updated, whose active content the checkpoint action folds in.
     pub(super) read_snapshot: SnapshotRef,
+    /// The commit's In-Commit Timestamp, when the caller provides it.
+    pub(super) in_commit_timestamp: Option<i64>,
 }
 
 impl RootManifestFile {
     /// Constructs a `RootManifestFile` for the snapshot being updated.
-    pub(super) fn new(file: FileMeta, read_snapshot: SnapshotRef) -> Self {
+    pub(super) fn new(
+        file: FileMeta,
+        read_snapshot: SnapshotRef,
+        in_commit_timestamp: Option<i64>,
+    ) -> Self {
         RootManifestFile {
             file,
             read_snapshot,
+            in_commit_timestamp,
         }
     }
 
@@ -138,14 +145,12 @@ mod tests {
         size: u64,
         snapshot: SnapshotRef,
     ) -> RootManifestFile {
-        RootManifestFile {
-            file: FileMeta {
-                location: table_root.join(name).unwrap(),
-                last_modified: 0,
-                size,
-            },
-            read_snapshot: snapshot,
-        }
+        let file = FileMeta {
+            location: table_root.join(name).unwrap(),
+            last_modified: 0,
+            size,
+        };
+        RootManifestFile::new(file, snapshot, None)
     }
 
     #[test]
@@ -458,7 +463,7 @@ mod tests {
         let snapshot = Snapshot::builder_for("memory:///t/").build(&engine)?;
 
         let file = manifest_file("s3://bucket/metadata/root-v1.parquet", 1024)?;
-        let manifest = RootManifestFile::new(file.clone(), snapshot);
+        let manifest = RootManifestFile::new(file.clone(), snapshot, None);
         assert_eq!(manifest.file, file);
         Ok(())
     }
