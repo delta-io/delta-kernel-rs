@@ -559,6 +559,7 @@ void print_metric(MetricEvent event) {
     PM_U64(value, duration_ns);
     printf("  outcome: %d,\n", value.outcome.tag);
     if (value.outcome.tag == ChecksumWriteOutcomeWritten) {
+      PM_U64(value.outcome.written, bytes_written);
     }
     PM_END;
     return;

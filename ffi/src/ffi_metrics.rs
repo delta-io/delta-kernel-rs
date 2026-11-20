@@ -479,15 +479,17 @@ impl From<&kernel::TransactionCommitOutcome> for TransactionCommitOutcome {
 
 /// A [`delta_kernel::Snapshot::checkpoint`] attempt completed.
 ///
-/// Written checkpoints report completed processing and output. An early AlreadyExists reports zero
-/// processing and output values; later AlreadyExists returns retain the work performed.
+/// Processing and output statistics retain work performed before any outcome, including an error
+/// or `AlreadyExists`. Unreached stages report zero, including preflight failures. Only
+/// [`CheckpointWriteOutcome::Written`] carries completed-checkpoint contents. An error can occur
+/// after data writes, during hint publication or snapshot construction.
 #[repr(C)]
 pub struct CheckpointWriteCompleted {
     /// Unique identifier for this checkpoint attempt.
     pub operation_id: MetricId,
     /// Snapshot version being checkpointed.
     pub version: u64,
-    /// Whether the call wrote a checkpoint or found one already present.
+    /// Whether the call wrote a checkpoint, found one already present, or returned an error.
     pub outcome: CheckpointWriteOutcome,
     /// Selected checkpoint write mode.
     pub mode: CheckpointWriteMode,
@@ -691,9 +693,11 @@ impl From<&kernel::CrcReadOutcome> for CrcReadOutcome {
 }
 
 /// A [`delta_kernel::Snapshot::write_checksum`] attempt completed.
+///
+/// Storage may already contain the CRC if constructing the returned snapshot failed.
 #[repr(C)]
 pub struct ChecksumWriteCompleted {
-    /// Whether this call wrote a new CRC or the CRC already existed.
+    /// Whether the call wrote a new CRC, found one already present, or returned an error.
     pub outcome: ChecksumWriteOutcome,
     /// CRC construction path selected during this call.
     pub resolution_mode: ChecksumWriteResolutionMode,
@@ -1714,8 +1718,12 @@ mod tests {
         with_ffi_event(&snapshot, |ffi| {
             assert!(matches!(
                 ffi,
-                MetricEvent::SnapshotBuildCompleted(e)
-                    if e.load_type == SnapshotLoadType::SnapshotHint && e.duration_ns == duration_ns
+                MetricEvent::SnapshotBuildCompleted(SnapshotBuildCompleted {
+                    load_type: SnapshotLoadType::SnapshotHint,
+                    outcome: SnapshotBuildOutcome::Error,
+                    duration_ns: actual_duration,
+                    ..
+                }) if actual_duration == duration_ns
             ));
         });
 
@@ -1733,7 +1741,12 @@ mod tests {
         with_ffi_event(&log_segment, |ffi| {
             assert!(matches!(
                 ffi,
-                MetricEvent::LogSegmentLoadCompleted(e) if e.duration_ns == duration_ns
+                MetricEvent::LogSegmentLoadCompleted(LogSegmentLoadCompleted {
+                    load_type: LogSegmentLoadType::Full,
+                    outcome: LogSegmentLoadOutcome::Error,
+                    duration_ns: actual_duration,
+                    ..
+                }) if actual_duration == duration_ns
             ));
         });
 
@@ -1752,7 +1765,12 @@ mod tests {
         with_ffi_event(&protocol_metadata, |ffi| {
             assert!(matches!(
                 ffi,
-                MetricEvent::ProtocolMetadataLoadCompleted(e) if e.duration_ns == duration_ns
+                MetricEvent::ProtocolMetadataLoadCompleted(ProtocolMetadataLoadCompleted {
+                    load_type: LogSegmentLoadType::Full,
+                    outcome: ProtocolMetadataLoadOutcome::Error,
+                    duration_ns: actual_duration,
+                    ..
+                }) if actual_duration == duration_ns
             ));
         });
     }

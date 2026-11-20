@@ -727,12 +727,16 @@ impl Visit for LogSegmentLoadCompleted {
     }
 
     fn record_u64(&mut self, field: &Field, value: u64) {
+        if field.name() == "duration_ns" {
+            self.duration = Duration::from_nanos(value);
+            return;
+        }
+
         let LogSegmentLoadOutcome::Success { stats } = &mut self.outcome else {
             return;
         };
 
         match field.name() {
-            "duration_ns" => self.duration = Duration::from_nanos(value),
             "num_commit_files" => stats.num_commit_files = value,
             "num_checkpoint_files" => stats.num_checkpoint_files = value,
             "num_compaction_files" => stats.num_compaction_files = value,
@@ -859,14 +863,14 @@ impl Visit for ProtocolMetadataLoadCompleted {
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
-        let ProtocolMetadataLoadOutcome::Success { source, .. } = &mut self.outcome else {
-            return;
-        };
-
         self.context.record_str(field, value);
         match field.name() {
             "load_type" => self.load_type = LogSegmentLoadType::parse_or_unknown(value),
-            "pm_source" => (*source) = ProtocolMetadataSource::parse_or_unknown(value),
+            "pm_source" => {
+                if let ProtocolMetadataLoadOutcome::Success { source } = &mut self.outcome {
+                    *source = ProtocolMetadataSource::parse_or_unknown(value);
+                }
+            }
             _ => {}
         }
     }
@@ -2227,8 +2231,71 @@ fn has_error_outcome(attrs: &Attributes<'_>) -> bool {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use tracing::Callsite;
 
     use super::*;
+
+    #[test]
+    fn load_visitors_record_shared_fields_after_error() {
+        let callsite = tracing::callsite! {
+            name: "load_fields",
+            kind: tracing::metadata::Kind::SPAN,
+            fields: operation_id, correlation_id, is_catalog_managed, load_type, duration_ns,
+                num_commit_files, num_checkpoint_files, num_compaction_files, crc_versions_behind,
+                pm_source,
+        };
+        let fields = callsite.metadata().fields();
+        let field = |name| fields.field(name).unwrap();
+        let id = MetricId::new();
+        let mut log_segment = LogSegmentLoadCompleted {
+            outcome: LogSegmentLoadOutcome::Error,
+            ..LogSegmentLoadCompleted::empty()
+        };
+        let mut protocol_metadata = ProtocolMetadataLoadCompleted {
+            outcome: ProtocolMetadataLoadOutcome::Error,
+            ..ProtocolMetadataLoadCompleted::empty()
+        };
+
+        for visitor in [
+            &mut log_segment as &mut dyn Visit,
+            &mut protocol_metadata as &mut dyn Visit,
+        ] {
+            visitor.record_str(&field("operation_id"), &id.to_string());
+            visitor.record_str(&field("correlation_id"), "request-1");
+            visitor.record_bool(&field("is_catalog_managed"), true);
+            visitor.record_str(&field("load_type"), "incremental");
+            visitor.record_u64(&field("duration_ns"), 53);
+        }
+        log_segment.record_u64(&field("num_commit_files"), 3);
+        log_segment.record_u64(&field("num_checkpoint_files"), 1);
+        log_segment.record_u64(&field("num_compaction_files"), 2);
+        log_segment.record_i64(&field("crc_versions_behind"), 4);
+        protocol_metadata.record_str(&field("pm_source"), "full_replay");
+
+        for (context, load_type, duration) in [
+            (
+                &log_segment.context,
+                log_segment.load_type,
+                log_segment.duration,
+            ),
+            (
+                &protocol_metadata.context,
+                protocol_metadata.load_type,
+                protocol_metadata.duration,
+            ),
+        ] {
+            assert_eq!(context.operation_id, id);
+            assert_eq!(context.correlation_id.as_deref(), Some("request-1"));
+            assert_eq!(context.table_type, TableType::CatalogManaged);
+            assert_eq!(load_type, LogSegmentLoadType::Incremental);
+            assert_eq!(duration, Duration::from_nanos(53));
+        }
+        assert_eq!(log_segment.outcome, LogSegmentLoadOutcome::Error);
+        assert_eq!(
+            protocol_metadata.outcome,
+            ProtocolMetadataLoadOutcome::Error
+        );
+    }
 
     fn commit_success(operation_id: MetricId) -> TransactionCommitCompleted {
         TransactionCommitCompleted {
