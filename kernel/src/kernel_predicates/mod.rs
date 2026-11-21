@@ -9,9 +9,9 @@ use tracing::{trace, warn};
 
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, CaseWhenExpression,
-    ColumnName, Expression as Expr, JunctionPredicate, JunctionPredicateOp, OpaqueExpression,
-    OpaqueExpressionOpRef, OpaquePredicate, OpaquePredicateOpRef, Predicate as Pred, Scalar,
-    UnaryPredicate, UnaryPredicateOp,
+    CastMode, ColumnName, Expression as Expr, JunctionPredicate, JunctionPredicateOp,
+    OpaqueExpression, OpaqueExpressionOpRef, OpaquePredicate, OpaquePredicateOpRef,
+    Predicate as Pred, Scalar, UnaryPredicate, UnaryPredicateOp,
 };
 use crate::schema::DataType;
 
@@ -131,6 +131,7 @@ pub trait KernelPredicateEvaluator {
     /// operator for `<value> op CAST(<col>)`). Unsupported by default so a cast never drives file
     /// pruning. A per-row evaluator that resolves the column to its exact value can override it; a
     /// range-based evaluator can only do so soundly when the cast preserves order over the range.
+    /// Only called for [`CastMode::Safe`] casts, so a value that fails to cast is NULL.
     fn eval_pred_cast(
         &self,
         _op: BinaryPredicateOp,
@@ -336,21 +337,26 @@ pub trait KernelPredicateEvaluator {
                 Distinct => self.eval_pred_distinct(col, val, inverted),
                 In => None, // arg order is semantically important
             },
-            (Cast(c), Literal(val)) => match c.expr.as_ref() {
-                Column(col) => self.eval_pred_cast(op, col, &c.target, val, inverted),
-                _ => None,
-            },
-            (Literal(val), Cast(c)) => match c.expr.as_ref() {
-                // Commute so the cast column is on the left.
-                Column(col) => match op {
-                    LessThan => self.eval_pred_cast(GreaterThan, col, &c.target, val, inverted),
-                    GreaterThan => self.eval_pred_cast(LessThan, col, &c.target, val, inverted),
-                    Equal => self.eval_pred_cast(Equal, col, &c.target, val, inverted),
-                    Distinct => self.eval_pred_cast(Distinct, col, &c.target, val, inverted),
-                    In => None, // arg order is semantically important
-                },
-                _ => None,
-            },
+            // Only safe casts are evaluated: `eval_pred_cast` assumes a failed cast is NULL.
+            (Cast(c), Literal(val)) if c.options.mode() == CastMode::Safe => {
+                match c.expr.as_ref() {
+                    Column(col) => self.eval_pred_cast(op, col, &c.target, val, inverted),
+                    _ => None,
+                }
+            }
+            (Literal(val), Cast(c)) if c.options.mode() == CastMode::Safe => {
+                match c.expr.as_ref() {
+                    // Commute so the cast column is on the left.
+                    Column(col) => match op {
+                        LessThan => self.eval_pred_cast(GreaterThan, col, &c.target, val, inverted),
+                        GreaterThan => self.eval_pred_cast(LessThan, col, &c.target, val, inverted),
+                        Equal => self.eval_pred_cast(Equal, col, &c.target, val, inverted),
+                        Distinct => self.eval_pred_cast(Distinct, col, &c.target, val, inverted),
+                        In => None, // arg order is semantically important
+                    },
+                    _ => None,
+                }
+            }
             _ => {
                 trace!("Unsupported binary operand(s): {left:?} {op:?} {right:?}");
                 None
@@ -383,6 +389,9 @@ pub trait KernelPredicateEvaluator {
             Junction(JunctionPredicate { op, preds }) => {
                 self.eval_pred_junction(*op, preds, inverted)
             }
+            // Bitmap lookups never drive data skipping.
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            MumblingBitmapContains(_) => None,
             Opaque(OpaquePredicate { op, exprs }) => self.eval_pred_opaque(op, exprs, inverted),
             Unknown(_) => None, // not supported by definition
         }
@@ -709,6 +718,8 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
                     warn!("Failed to evaluate {:?}: {err:?}", op.as_ref());
                 })
                 .ok(),
+            // Only safe casts are evaluated: a strict cast fails rather than yielding NULL.
+            Expr::Cast(c) if c.options.mode() == CastMode::Strict => None,
             Expr::Cast(c) => cast_scalar(self.eval_expr(&c.expr)?, &c.target),
             // ParseJson and MapToStruct produce structured output, not scalar values
             Expr::ParseJson(_) | Expr::MapToStruct(_) => None,
