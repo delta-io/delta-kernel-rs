@@ -15,11 +15,11 @@ use url::Url;
 use super::handle::Handle;
 use crate::engine_data::ArrowFFIData;
 use crate::expressions::kernel_visitor::{KernelExpressionVisitorState, unwrap_kernel_predicate};
+use crate::panic::catch_panic_into_result;
 use crate::scan::EnginePredicate;
 use crate::{
-    AllocateStringFn, ExternEngine, ExternResult, IntoExternResult, KernelStringSlice,
-    NullableCvoid, SharedExternEngine, SharedSchema, kernel_string_slice,
-    unwrap_and_parse_path_as_url,
+    AllocateStringFn, ExternEngine, ExternResult, KernelStringSlice, NullableCvoid,
+    SharedExternEngine, SharedSchema, kernel_string_slice, unwrap_and_parse_path_as_url,
 };
 
 #[handle_descriptor(target=TableChanges, mutable=true, sized=true)]
@@ -41,10 +41,13 @@ pub unsafe extern "C" fn table_changes_from_version(
     engine: Handle<SharedExternEngine>,
     start_version: Version,
 ) -> ExternResult<Handle<ExclusiveTableChanges>> {
-    let url = unsafe { unwrap_and_parse_path_as_url(path) };
-    let engine = unsafe { engine.as_ref() };
-    let result = table_changes_impl(url, engine, start_version, None);
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let url = unwrap_and_parse_path_as_url(path);
+            let engine = engine.as_ref();
+            table_changes_impl(url, engine, start_version, None)
+        })
+    }
 }
 
 /// Get the table changes from the specified table between two versions
@@ -64,10 +67,13 @@ pub unsafe extern "C" fn table_changes_between_versions(
     start_version: Version,
     end_version: Version,
 ) -> ExternResult<Handle<ExclusiveTableChanges>> {
-    let url = unsafe { unwrap_and_parse_path_as_url(path) };
-    let engine = unsafe { engine.as_ref() };
-    let result = table_changes_impl(url, engine, start_version, end_version.into());
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let url = unwrap_and_parse_path_as_url(path);
+            let engine = engine.as_ref();
+            table_changes_impl(url, engine, start_version, end_version.into())
+        })
+    }
 }
 
 fn table_changes_impl(
@@ -164,9 +170,12 @@ pub unsafe extern "C" fn table_changes_scan(
     engine: Handle<SharedExternEngine>,
     predicate: Option<&mut EnginePredicate>,
 ) -> ExternResult<Handle<SharedTableChangesScan>> {
-    let table_changes = unsafe { table_changes.into_inner() };
-    let result = table_changes_scan_impl(*table_changes, predicate);
-    unsafe { result.into_extern_result(&engine.as_ref()) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let table_changes = table_changes.into_inner();
+            table_changes_scan_impl(*table_changes, predicate)
+        })
+    }
 }
 
 fn table_changes_scan_impl(
@@ -265,10 +274,13 @@ pub unsafe extern "C" fn table_changes_scan_execute(
     table_changes_scan: Handle<SharedTableChangesScan>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedScanTableChangesIterator>> {
-    let table_changes_scan = unsafe { table_changes_scan.as_ref() };
-    let engine = unsafe { engine.clone_as_arc() };
-    let result = table_changes_scan_execute_impl(table_changes_scan, engine.clone());
-    unsafe { result.into_extern_result(&engine.as_ref()) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let table_changes_scan = table_changes_scan.as_ref();
+            let engine = engine.clone_as_arc();
+            table_changes_scan_execute_impl(table_changes_scan, engine.clone())
+        })
+    }
 }
 
 fn table_changes_scan_execute_impl(
@@ -309,9 +321,13 @@ pub unsafe extern "C" fn free_scan_table_changes_iter(
 pub unsafe extern "C" fn scan_table_changes_next(
     data: Handle<SharedScanTableChangesIterator>,
 ) -> ExternResult<*mut ArrowFFIData> {
-    let data = unsafe { data.as_ref() };
-    let result = scan_table_changes_next_impl(data);
-    unsafe { result.into_extern_result(&data.engine.as_ref()) }
+    let panic_engine = unsafe { data.as_ref() }.engine.clone();
+    unsafe {
+        catch_panic_into_result(&panic_engine.as_ref(), || {
+            let data = data.as_ref();
+            scan_table_changes_next_impl(data)
+        })
+    }
 }
 
 fn scan_table_changes_next_impl(

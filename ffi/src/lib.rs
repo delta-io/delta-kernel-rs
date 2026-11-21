@@ -1598,15 +1598,18 @@ pub unsafe extern "C" fn get_earliest_commit(
     earliest_ratified_commit_version: OptionalValue<Version>,
     commit_type: FfiHistoryCommitType,
 ) -> ExternResult<Version> {
-    let engine_ref = unsafe { engine.as_ref() };
-    let log_root = unsafe { unwrap_and_parse_path_as_url(log_root) };
-    let result = get_earliest_commit_impl(
-        engine_ref,
-        log_root,
-        earliest_ratified_commit_version,
-        commit_type,
-    );
-    unsafe { result.into_extern_result(&engine_ref) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let engine_ref = engine.as_ref();
+            let log_root = unwrap_and_parse_path_as_url(log_root);
+            get_earliest_commit_impl(
+                engine_ref,
+                log_root,
+                earliest_ratified_commit_version,
+                commit_type,
+            )
+        })
+    }
 }
 
 fn get_earliest_commit_impl(
@@ -1662,16 +1665,19 @@ pub unsafe extern "C" fn latest_version_as_of(
     timestamp: i64,
     commit_type: FfiHistoryCommitType,
 ) -> ExternResult<FfiCommitAt> {
-    let engine_ref = unsafe { engine.as_ref() };
-    let snapshot = unsafe { snapshot.as_ref() };
-    let result = kernel_latest_version_as_of(
-        snapshot,
-        engine_ref.engine().as_ref(),
-        timestamp,
-        commit_type.into(),
-    )
-    .map(FfiCommitAt::from);
-    unsafe { result.into_extern_result(&engine_ref) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let engine_ref = engine.as_ref();
+            let snapshot = snapshot.as_ref();
+            kernel_latest_version_as_of(
+                snapshot,
+                engine_ref.engine().as_ref(),
+                timestamp,
+                commit_type.into(),
+            )
+            .map(FfiCommitAt::from)
+        })
+    }
 }
 
 /// Get the first commit (version and timestamp) within `snapshot`'s version range with a
@@ -1692,16 +1698,19 @@ pub unsafe extern "C" fn first_version_after(
     timestamp: i64,
     commit_type: FfiHistoryCommitType,
 ) -> ExternResult<FfiCommitAt> {
-    let engine_ref = unsafe { engine.as_ref() };
-    let snapshot = unsafe { snapshot.as_ref() };
-    let result = kernel_first_version_after(
-        snapshot,
-        engine_ref.engine().as_ref(),
-        timestamp,
-        commit_type.into(),
-    )
-    .map(FfiCommitAt::from);
-    unsafe { result.into_extern_result(&engine_ref) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let engine_ref = engine.as_ref();
+            let snapshot = snapshot.as_ref();
+            kernel_first_version_after(
+                snapshot,
+                engine_ref.engine().as_ref(),
+                timestamp,
+                commit_type.into(),
+            )
+            .map(FfiCommitAt::from)
+        })
+    }
 }
 
 /// Get the logical schema of the specified snapshot
