@@ -533,8 +533,11 @@ pub unsafe extern "C" fn set_metadata(
     entries: CMetadataEntries,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<bool> {
-    let result = unsafe { set_metadata_impl(builder, entries) };
-    unsafe { result.into_extern_result(&*error_allocators) }
+    unsafe {
+        crate::panic::catch_panic_into_result(&*error_allocators, || {
+            set_metadata_impl(builder, entries)
+        })
+    }
 }
 
 unsafe fn set_metadata_impl(
@@ -571,6 +574,16 @@ error channels and often reduces a precise failure to a generic "visitor failed"
 iterators, each next call may return its own error. After a terminal error, the API must state
 whether the iterator can be retried or is poisoned. No callback may unwind across the C ABI.
 
+#### Panic boundaries
+
+Wrap top-level C exports returning `ExternResult` with `crate::panic::catch_panic_into_result`.
+Keep operation work inside the closure and the error allocator alive outside it. Take ownership of
+consumed handles before work that can panic. Reuse existing tracing and error allocation.
+Do not add boundary macros, panic hooks, or abort handling.
+
+Catching a panic does not roll back state. Discard failed work and reconcile uncertain commit
+outcomes before retrying.
+
 ### Review checklist for new FFI APIs
 
 Before approving a new boundary type or function, answer:
@@ -597,6 +610,8 @@ Before approving a new boundary type or function, answer:
 16. Does opaque encoded state cross as bytes, with compatibility checked when required?
 17. Does the C header communicate the same ownership, nullability, and mutation semantics as the
     Rust documentation?
+18. Does each error-returning top-level C export have an explicit unwind boundary with a live
+    error allocator?
 
 ## Source layout
 
