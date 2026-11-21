@@ -93,7 +93,7 @@ impl Scan {
     pub(super) fn build_metadata_scan_plan_with(
         &self,
         base: MetadataReplayBase,
-        mut planner: MetadataPlanner<'_>,
+        planner: &mut MetadataPlanner<'_>,
     ) -> KernelResult<Option<Plan>> {
         let state = &self.state_info;
         if state.physical_predicate == PhysicalPredicate::StaticSkipAll {
@@ -104,7 +104,7 @@ impl Scan {
         let checkpoint = match base {
             MetadataReplayBase::Crc { version, files } => planner.crc_adds(version, files),
             MetadataReplayBase::Checkpoint { info, .. } => {
-                planner = planner.with_checkpoint_info(info);
+                planner.checkpoint_info = info;
                 planner.checkpoint_actions()
             }
         }?;
@@ -126,7 +126,7 @@ impl Scan {
             version: self.snapshot.log_segment().checkpoint_version,
             info: shape.into().cloned().map(Arc::new),
         };
-        self.build_metadata_scan_plan_with(base, planner.clone())
+        self.build_metadata_scan_plan_with(base, &mut planner.clone())
     }
 }
 // === Helpers ===
