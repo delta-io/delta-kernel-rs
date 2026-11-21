@@ -17,6 +17,8 @@ use super::LogSegment;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::{CheckpointAction, LastManifestCommit};
 use crate::actions::{DomainMetadata, Format, Metadata, Protocol, SetTransaction};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::content_tree::file_metadata::ADAPTIVE_METADATA_DOMAIN_NAME;
 use crate::crc::{
     Crc, DomainMetadataState, FileSizeHistogram, SetTransactionState, try_read_crc_file,
 };
@@ -288,6 +290,11 @@ enum Op {
     CorruptCrc {
         version: u64,
     },
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    RawCrc {
+        version: u64,
+        json: Value,
+    },
 }
 
 /// Declarative test builder: accumulate log operations, then build and assert.
@@ -407,6 +414,12 @@ impl CrcReadTest {
         self
     }
 
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn raw_crc(mut self, version: u64, json: Value) -> Self {
+        self.ops.push(Op::RawCrc { version, json });
+        self
+    }
+
     /// Execute all operations, returning a built test that can be asserted against.
     async fn build(self) -> BuiltCrcTest {
         Self::validate_ops(&self.ops);
@@ -438,6 +451,10 @@ impl CrcReadTest {
                 }
                 Op::CorruptCrc { version } => {
                     put(&store, version, "crc", "CORRUPT_CRC_DATA").await;
+                }
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                Op::RawCrc { version, json } => {
+                    put(&store, version, "crc", &json.to_string()).await;
                 }
                 Op::V2Checkpoint {
                     version,
@@ -598,14 +615,26 @@ impl BuiltCrcTest {
         assert_eq!(ict, expected_ict, "ICT mismatch at {label}");
     }
 
-    /// Lists the log, reads the latest on-disk CRC, and runs the unchecked P&M replay, returning
-    /// the latest AMT `checkpoint` action it captured, if any.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn captured_checkpoint_action(&self) -> Option<Arc<CheckpointAction>> {
+    fn latest_log_segment(&self) -> LogSegment {
         let storage = self.engine.storage_handler();
         let log_root = self.url.join("_delta_log/").unwrap();
-        let log_segment =
-            LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap()
+    }
+
+    /// Returns the latest on-disk CRC that the reader accepts, if any.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn latest_crc(&self) -> Option<Arc<Crc>> {
+        self.latest_log_segment()
+            .read_latest_crc(&self.engine)
+            .unwrap()
+    }
+
+    /// Runs the unchecked P&M replay on the latest CRC, returning the latest AMT `checkpoint`
+    /// action it captured, if any.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn captured_checkpoint_action(&self) -> Option<Arc<CheckpointAction>> {
+        let log_segment = self.latest_log_segment();
         let crc = log_segment.read_latest_crc(&self.engine).unwrap();
         log_segment
             .read_protocol_metadata_opt(&self.engine, crc.as_ref())
@@ -1025,6 +1054,38 @@ async fn test_corrupt_crc_at_non_target_version_falls_back() {
         .build()
         .await
         .assert_p_m(None, &protocol_a(), &metadata_a());
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[rstest]
+#[case::disagreeing_field_is_skipped(200, true)]
+#[case::agreeing_field_is_read(100, false)]
+#[tokio::test]
+async fn test_crc_file_metadata_field_ids_checked_against_domain(
+    #[case] clustering_provider: i32,
+    #[case] skipped: bool,
+) {
+    // The CRC carries P&M b, the checkpoint P&M a, so the P&M returned shows which one was read.
+    let mut crc = crc_json(&protocol_b(), &metadata_b(), None, &[], None);
+    crc["fileMetadataFieldIds"] = json!({"clusteringProvider": clustering_provider});
+    crc["domainMetadata"] = json!([{
+        "domain": ADAPTIVE_METADATA_DOMAIN_NAME,
+        "configuration": r#"{"fileMetadataFieldIds":{"clusteringProvider":100}}"#,
+        "removed": false,
+    }]);
+    let built = CrcReadTest::new()
+        .v2_checkpoint(0, protocol_a(), metadata_a()) // <-- P & M from here
+        .commit(1, [commit_info(DEFAULT_OPERATION, None)])
+        .raw_crc(1, crc)
+        .build()
+        .await;
+    assert_eq!(built.latest_crc().is_none(), skipped);
+    let (expected_protocol, expected_metadata) = if skipped {
+        (protocol_a(), metadata_a())
+    } else {
+        (protocol_b(), metadata_b())
+    };
+    built.assert_p_m(None, &expected_protocol, &expected_metadata);
 }
 
 #[tokio::test]
