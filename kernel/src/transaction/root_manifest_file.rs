@@ -298,8 +298,8 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::schema::schema_ref;
     use crate::snapshot::Snapshot;
+    use crate::transaction::Transaction;
     use crate::transaction::create_table::create_table;
-    use crate::transaction::{Transaction, UpdateTableOperation};
     use crate::unit_test_utils::adaptive_metadata_fixtures::{
         adaptive_metadata_protocol_and_metadata, domain, domain_metadata_line,
         minimal_checkpoint_action, setup_table, txn_line, write_commit,
@@ -307,8 +307,8 @@ mod tests {
         write_txn_sidecar,
     };
     use crate::unit_test_utils::{
-        MockTableConfigurationBuilder, assert_result_error_with_message, parse_json_batch,
-        string_array_to_engine_data,
+        MockTableConfigurationBuilder, assert_result_error_with_message, commit_on_latest,
+        parse_json_batch, string_array_to_engine_data,
     };
     use crate::{KernelResult, Result, create_row};
 
@@ -449,17 +449,12 @@ mod tests {
         )?)
     }
 
-    /// A write transaction on the latest snapshot that sets `txns` and `domains`.
-    fn transaction(
-        engine: &SyncEngine,
-        table_root: &Url,
+    /// Adds `txns` and `domains` to `txn`, removing each domain tombstoned in `domains`.
+    fn set_entries(
+        mut txn: Transaction,
         txns: &[SetTransaction],
         domains: &[DomainMetadata],
-    ) -> Result<Transaction> {
-        let snapshot = Snapshot::builder_for(table_root.clone()).build(engine)?;
-        let mut txn = snapshot
-            .update_table(UpdateTableOperation::Write, "test", true)
-            .build(engine, Box::new(FileSystemCommitter::new()))?;
+    ) -> Transaction {
         for set_transaction in txns {
             txn = txn.with_transaction_id(set_transaction.app_id.clone(), set_transaction.version);
         }
@@ -471,7 +466,7 @@ mod tests {
                 txn.with_domain_metadata(name, dm.configuration().to_string())
             };
         }
-        Ok(txn)
+        txn
     }
 
     /// Commits `txns` and `domains` in one transaction on the latest snapshot, if there are any.
@@ -484,9 +479,9 @@ mod tests {
         if txns.is_empty() && domains.is_empty() {
             return Ok(());
         }
-        transaction(engine, table_root, txns, domains)?
-            .commit(engine)?
-            .unwrap_committed();
+        commit_on_latest(engine, table_root, |txn| {
+            Ok(set_entries(txn, txns, domains))
+        })?;
         Ok(())
     }
 
@@ -766,7 +761,7 @@ mod tests {
         entries.iter().map(|entry| entry.key()).sorted().collect()
     }
 
-    /// Which kinds a [`compute_checkpoint_action_reuses_or_inlines_sidecars`] row changes.
+    /// Which kinds run a [`compute_checkpoint_action_reuses_or_inlines_sidecars`] row.
     #[derive(Clone, Copy, PartialEq)]
     enum Changed {
         Txns,
@@ -855,7 +850,6 @@ mod tests {
         sidecars: &'static [&'static [&'static str]],
         logged: &'static [&'static str],
         changed: &'static [&'static str],
-        /// The (key, value) pairs the new checkpoint action holds inline.
         expected_inline: &'static [(&'static str, i64)],
         sidecars_kept: bool,
         sidecars_read: bool,
@@ -867,8 +861,7 @@ mod tests {
     const LOGGED: i64 = 2;
     const CHANGED: i64 = 3;
 
-    /// The row a kind runs when the case doesn't change it: existing entries only, nothing logged
-    /// or changed.
+    /// Used for a kind the case doesn't change: existing entries only.
     const UNTOUCHED: SidecarRow = SidecarRow {
         before: &[],
         inline: &["untouched"],
@@ -876,6 +869,19 @@ mod tests {
         logged: &[],
         changed: &[],
         expected_inline: &[("untouched", EXISTING)],
+        sidecars_kept: true,
+        sidecars_read: false,
+    };
+
+    /// The action most cases start from: `inline` inline and `kept`/`spilled` in one sidecar, with
+    /// nothing logged or changed.
+    const BASE: SidecarRow = SidecarRow {
+        before: &[],
+        inline: &["inline"],
+        sidecars: &[&["kept", "spilled"]],
+        logged: &[],
+        changed: &[],
+        expected_inline: &[("inline", EXISTING)],
         sidecars_kept: true,
         sidecars_read: false,
     };
@@ -941,52 +947,35 @@ mod tests {
     // are kept unless a change touches a key stored in one; then every sidecar of that kind is
     // read and its entries move inline. Sidecars are read only when a change touches a key that
     // isn't inline. Each entry takes its newest value: this transaction's change, then a commit
-    // after the action, then the action itself; commits before the action are ignored. Each row
-    // runs for txns, domains, or both; a kind the row doesn't change runs `UNTOUCHED`.
+    // after the action, then the action itself; commits before the action are ignored.
     #[rstest]
-    #[case::unchanged(SidecarRow {
-        before: &[], inline: &["inline"], sidecars: &[&["kept", "spilled"]], logged: &[],
-        changed: &[],
-        expected_inline: &[("inline", EXISTING)], sidecars_kept: true, sidecars_read: false,
-    })]
+    #[case::unchanged(BASE)]
     #[case::inline_changed(SidecarRow {
-        before: &[], inline: &["inline"], sidecars: &[&["kept", "spilled"]], logged: &[],
-        changed: &["inline"],
-        expected_inline: &[("inline", CHANGED)], sidecars_kept: true, sidecars_read: false,
+        changed: &["inline"], expected_inline: &[("inline", CHANGED)], ..BASE
     })]
     #[case::inline_logged(SidecarRow {
-        before: &[], inline: &["inline"], sidecars: &[&["kept", "spilled"]], logged: &["inline"],
-        changed: &[],
-        expected_inline: &[("inline", LOGGED)], sidecars_kept: true, sidecars_read: false,
+        logged: &["inline"], expected_inline: &[("inline", LOGGED)], ..BASE
     })]
     #[case::transaction_overrides_log_commit(SidecarRow {
-        before: &[], inline: &["inline"], sidecars: &[&["kept", "spilled"]], logged: &["inline"],
-        changed: &["inline"],
-        expected_inline: &[("inline", CHANGED)], sidecars_kept: true, sidecars_read: false,
+        logged: &["inline"], changed: &["inline"], expected_inline: &[("inline", CHANGED)], ..BASE
     })]
     #[case::new_entry(SidecarRow {
-        before: &[], inline: &["inline"], sidecars: &[&["kept", "spilled"]], logged: &[],
-        changed: &["new"],
-        expected_inline: &[("inline", EXISTING), ("new", CHANGED)],
-        sidecars_kept: true, sidecars_read: true,
+        changed: &["new"], expected_inline: &[("inline", EXISTING), ("new", CHANGED)],
+        sidecars_read: true, ..BASE
     })]
     #[case::logged_new_entry(SidecarRow {
-        before: &[], inline: &["inline"], sidecars: &[&["kept", "spilled"]], logged: &["new"],
-        changed: &[],
-        expected_inline: &[("inline", EXISTING), ("new", LOGGED)],
-        sidecars_kept: true, sidecars_read: true,
+        logged: &["new"], expected_inline: &[("inline", EXISTING), ("new", LOGGED)],
+        sidecars_read: true, ..BASE
     })]
     #[case::sidecar_entry(SidecarRow {
-        before: &[], inline: &["inline"], sidecars: &[&["kept", "spilled"]], logged: &[],
         changed: &["spilled"],
         expected_inline: &[("inline", EXISTING), ("kept", EXISTING), ("spilled", CHANGED)],
-        sidecars_kept: false, sidecars_read: true,
+        sidecars_kept: false, sidecars_read: true, ..BASE
     })]
     #[case::logged_sidecar_entry(SidecarRow {
-        before: &[], inline: &["inline"], sidecars: &[&["kept", "spilled"]], logged: &["spilled"],
-        changed: &[],
+        logged: &["spilled"],
         expected_inline: &[("inline", EXISTING), ("kept", EXISTING), ("spilled", LOGGED)],
-        sidecars_kept: false, sidecars_read: true,
+        sidecars_kept: false, sidecars_read: true, ..BASE
     })]
     #[case::two_sidecars_kept(SidecarRow {
         before: &[], inline: &[], sidecars: &[&["a"], &["b"]], logged: &[], changed: &["new"],
@@ -1017,13 +1006,20 @@ mod tests {
         #[values(Changed::Txns, Changed::Domains, Changed::Both)] changed: Changed,
     ) -> Result<()> {
         let (engine, table_root) = setup_table()?;
-        let (txns_change, domains_change) = (changed != Changed::Domains, changed != Changed::Txns);
         // Entries logged before the action share one commit at version 1.
         let manifest_version = if row.before.is_empty() { 1 } else { 2 };
         let path = format!("metadata/root-v{manifest_version}.parquet");
         let mut existing = minimal_checkpoint_action(&path, manifest_version)?;
-        let txn_row = if txns_change { row } else { UNTOUCHED };
-        let domain_row = if domains_change { row } else { UNTOUCHED };
+        let txn_row = if changed == Changed::Domains {
+            UNTOUCHED
+        } else {
+            row
+        };
+        let domain_row = if changed == Changed::Txns {
+            UNTOUCHED
+        } else {
+            row
+        };
         let txns: KindSetup<SetTransaction> = txn_row.setup(&engine, &table_root, &mut existing);
         let domains: KindSetup<DomainMetadata> =
             domain_row.setup(&engine, &table_root, &mut existing);
@@ -1336,8 +1332,6 @@ mod tests {
         Ok(())
     }
 
-    // A manifest committed through a transaction keeps the untouched sidecars, and the next
-    // snapshot reads their entries alongside the transaction's own.
     #[test]
     fn committed_manifest_keeps_sidecars_that_the_next_snapshot_reads() -> Result<()> {
         let (engine, table_root) = setup_table()?;
@@ -1357,15 +1351,10 @@ mod tests {
         write_manifest_commit(&engine, &table_root, 1, existing.clone())?;
 
         let root_manifest = manifest_file(&format!("{table_root}metadata/root-v2.parquet"), 1024)?;
-        transaction(
-            &engine,
-            &table_root,
-            &[txn("new", 2)],
-            &[domain("new", "2")],
-        )?
-        .with_root_manifest_file(root_manifest)?
-        .commit(&engine)?
-        .unwrap_committed();
+        commit_on_latest(&engine, &table_root, |transaction| {
+            set_entries(transaction, &[txn("new", 2)], &[domain("new", "2")])
+                .with_root_manifest_file(root_manifest)
+        })?;
 
         let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
         let checkpoint = snapshot
