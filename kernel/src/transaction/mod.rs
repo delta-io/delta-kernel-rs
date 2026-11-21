@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use std::time::Instant;
 
 use delta_kernel_derive::internal_api;
 
@@ -16,6 +18,10 @@ use crate::error::KernelError;
 use crate::expressions::ColumnName;
 use crate::log_segment::LogSegment;
 use crate::metrics::MetricId;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::metrics::events::emit_checkpoint_action_computed;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::metrics::{CheckpointActionComputed, TableType};
 use crate::path::{LogRoot, ParsedLogPath};
 use crate::scan::log_replay::STATS_NAME;
 pub use crate::scan::log_replay::{CLUSTERING_PROVIDER_NAME, TAGS_NAME};
@@ -95,7 +101,7 @@ pub(crate) use leaf_writer::{LeafNodeWriter, LeafNodeWriterResult};
 #[internal_api]
 pub(crate) use manifest_commit_state::ManifestCommitState;
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use root_manifest_file::RootManifestFile;
+use root_manifest_file::{ComputedCheckpointAction, RootManifestFile};
 pub use write_state::{BoundWriteContextBuilder, RowTrackingMetadataColumns, WriteState};
 
 /// Type alias for an iterator of [`EngineData`] results.
@@ -931,13 +937,37 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         let Some(ManifestWrite::RootFile(root_manifest_file)) = &self.manifest_write else {
             return Ok(None);
         };
-        let action = root_manifest_file.compute_checkpoint_action(
+        let start = Instant::now();
+        let ComputedCheckpointAction {
+            action,
+            txn_source,
+            domain_metadata_source,
+            num_log_commits_replayed,
+            num_txn_sidecars_read,
+            num_domain_metadata_sidecars_read,
+        } = root_manifest_file.compute_checkpoint_action(
             engine,
             commit_version,
             &self.effective_table_config,
             dm_changes,
             &self.set_transactions,
         )?;
+        emit_checkpoint_action_computed(&CheckpointActionComputed {
+            operation_id: self.operation_id,
+            correlation_id: self.correlation_id.clone(),
+            table_type: TableType::from_catalog_managed(
+                self.effective_table_config.is_catalog_managed(),
+            ),
+            commit_version,
+            txn_source,
+            domain_metadata_source,
+            num_log_commits_replayed,
+            num_txn_sidecars_kept: action.txn_sidecars.len() as u64,
+            num_domain_metadata_sidecars_kept: action.domain_metadata_sidecars.len() as u64,
+            num_txn_sidecars_read,
+            num_domain_metadata_sidecars_read,
+            duration: start.elapsed(),
+        });
         Ok(Some(action))
     }
 

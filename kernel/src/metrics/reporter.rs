@@ -10,11 +10,11 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 
 use super::events::{
-    CheckpointWriteSuccess, ChecksumWriteSuccess, CrcReadSuccess, DomainMetadataLoadSuccess,
-    JsonReadCompleted, LastCheckpointReadCompleted, LogSegmentLoadSuccess, MetricEvent,
-    ParquetReadCompleted, ProtocolMetadataLoadSuccess, STORAGE_SPAN, ScanMetadataCompleted,
-    SetTransactionLoadSuccess, SnapshotBuildSuccess, TransactionCommitSuccess,
-    storage_metric_from_attrs,
+    CheckpointActionComputed, CheckpointWriteSuccess, ChecksumWriteSuccess, CrcReadSuccess,
+    DomainMetadataLoadSuccess, JsonReadCompleted, LastCheckpointReadCompleted,
+    LogSegmentLoadSuccess, MetricEvent, ParquetReadCompleted, ProtocolMetadataLoadSuccess,
+    STORAGE_SPAN, ScanMetadataCompleted, SetTransactionLoadSuccess, SnapshotBuildSuccess,
+    TransactionCommitSuccess, storage_metric_from_attrs,
 };
 
 // ====================================================================
@@ -149,6 +149,9 @@ where
             )),
             ScanMetadataCompleted::SPAN_NAME => Some(MetricEvent::ScanMetadataCompleted(
                 ScanMetadataCompleted::from_attrs(attrs),
+            )),
+            CheckpointActionComputed::SPAN_NAME => Some(MetricEvent::CheckpointActionComputed(
+                CheckpointActionComputed::from_attrs(attrs),
             )),
             STORAGE_SPAN => storage_metric_from_attrs(attrs),
             _ => None,
@@ -328,10 +331,14 @@ mod tests {
     use tracing_subscriber::registry;
     use uuid::Uuid;
 
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::metrics::events::emit_checkpoint_action_computed;
     use crate::metrics::events::{
         SNAPSHOT_COMPLETED_SPAN, SnapshotLoadMetricContext, emit_log_segment_load_failure,
         emit_protocol_metadata_load_failure,
     };
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::metrics::{CheckpointActionComputed, CheckpointEntrySource, TableType};
     use crate::metrics::{
         CheckpointOutputStats, CheckpointProcessingStats, CheckpointWriteMode,
         CheckpointWriteOutcome, CheckpointWriteStats, LastCheckpointReadOutcome, MetricEvent,
@@ -399,6 +406,50 @@ mod tests {
         };
         assert_eq!(event.outcome, expected);
         assert!(event.duration > Duration::ZERO);
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest::rstest]
+    #[case::set(Some("req"))]
+    #[case::unset(None)]
+    fn checkpoint_action_computed_decodes_span_fields(#[case] correlation_id: Option<&str>) {
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        let id = MetricId::new();
+        emit_checkpoint_action_computed(&CheckpointActionComputed {
+            operation_id: id,
+            correlation_id: correlation_id.map(Into::into),
+            table_type: TableType::CatalogManaged,
+            commit_version: 7,
+            txn_source: CheckpointEntrySource::Crc,
+            domain_metadata_source: CheckpointEntrySource::SidecarsInlined,
+            num_log_commits_replayed: 3,
+            num_txn_sidecars_kept: 2,
+            num_domain_metadata_sidecars_kept: 5,
+            num_txn_sidecars_read: 4,
+            num_domain_metadata_sidecars_read: 6,
+            duration: Duration::from_nanos(11),
+        });
+
+        let events = reporter.events();
+        let [MetricEvent::CheckpointActionComputed(event)] = events.as_slice() else {
+            panic!("expected one checkpoint action computed metric: {events:?}");
+        };
+        assert_eq!(event.operation_id, id);
+        assert_eq!(event.correlation_id.as_deref(), correlation_id);
+        assert_eq!(event.table_type, TableType::CatalogManaged);
+        assert_eq!(event.commit_version, 7);
+        assert_eq!(event.txn_source, CheckpointEntrySource::Crc);
+        assert_eq!(
+            event.domain_metadata_source,
+            CheckpointEntrySource::SidecarsInlined
+        );
+        assert_eq!(event.num_log_commits_replayed, 3);
+        assert_eq!(event.num_txn_sidecars_kept, 2);
+        assert_eq!(event.num_domain_metadata_sidecars_kept, 5);
+        assert_eq!(event.num_txn_sidecars_read, 4);
+        assert_eq!(event.num_domain_metadata_sidecars_read, 6);
+        assert_eq!(event.duration, Duration::from_nanos(11));
     }
 
     #[test]
