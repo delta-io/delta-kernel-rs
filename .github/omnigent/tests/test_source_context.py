@@ -27,7 +27,7 @@ class SourceContextTest(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.roots = {}
         env = {}
-        for repository in ("pr", "delta"):
+        for repository in ("pr", "delta", "guidance"):
             root = self.root / repository
             root.mkdir()
             self.roots[repository] = root
@@ -128,38 +128,38 @@ class SourceContextTest(unittest.TestCase):
         )
 
     def test_eof_and_requested_line_count(self):
-        path = self.roots["pr"] / "short.md"
+        path = self.roots["guidance"] / "short.md"
         path.write_text("first\nlast\n", encoding="utf-8")
         read = self.source_context.read_source_file
-        self.assertEqual(read("pr", "short.md", 1, 1), "1\tfirst\nNext line: 2")
-        self.assertEqual(read("pr", "short.md", 2, 1), "2\tlast\nEnd of file.")
-        self.assertEqual(read("pr", "short.md", 3), "End of file.")
+        self.assertEqual(read("guidance", "short.md", 1, 1), "1\tfirst\nNext line: 2")
+        self.assertEqual(read("guidance", "short.md", 2, 1), "2\tlast\nEnd of file.")
+        self.assertEqual(read("guidance", "short.md", 3), "End of file.")
         path.write_text("", encoding="utf-8")
-        self.assertEqual(read("pr", "short.md"), "End of file.")
+        self.assertEqual(read("guidance", "short.md"), "End of file.")
 
     def test_single_line_fills_output_budget_or_returns_error(self):
-        path = self.roots["pr"] / "wide.md"
+        path = self.roots["guidance"] / "wide.md"
         text = "x" * (40_000 - len("1\t\nEnd of file."))
         path.write_text(text, encoding="utf-8")
-        page = self.source_context.read_source_file("pr", "wide.md")
+        page = self.source_context.read_source_file("guidance", "wide.md")
         self.assertEqual(page, f"1\t{text}\nEnd of file.")
         self.assertEqual(len(page), 40_000)
         path.write_text(text + "x", encoding="utf-8")
         self.assertIn(
             "Error: source line 1 exceeds",
-            self.source_context.read_source_file("pr", "wide.md"),
+            self.source_context.read_source_file("guidance", "wide.md"),
         )
 
     def test_oversized_line_in_mid_file_can_be_skipped(self):
-        path = self.roots["pr"] / "wide.md"
+        path = self.roots["guidance"] / "wide.md"
         path.write_text("first\n" + "x" * 40_000 + "\nlast\n", encoding="utf-8")
         read = self.source_context.read_source_file
-        self.assertEqual(read("pr", "wide.md"), "1\tfirst\nNext line: 2")
+        self.assertEqual(read("guidance", "wide.md"), "1\tfirst\nNext line: 2")
         self.assertEqual(
-            read("pr", "wide.md", 2),
+            read("guidance", "wide.md", 2),
             "Error: source line 2 exceeds the 40000-character output limit; continue from line 3",
         )
-        self.assertEqual(read("pr", "wide.md", 3), "3\tlast\nEnd of file.")
+        self.assertEqual(read("guidance", "wide.md", 3), "3\tlast\nEnd of file.")
 
     def test_missing_binary_and_oversized_files_are_rejected(self):
         for repository, root in self.roots.items():
@@ -172,20 +172,20 @@ class SourceContextTest(unittest.TestCase):
                 self.assertIn("file exceeds", read(repository, "large.md"))
 
     def test_invalid_pagination_and_repository_are_rejected(self):
-        (self.roots["pr"] / "short.md").write_text("first\n", encoding="utf-8")
+        (self.roots["guidance"] / "short.md").write_text("first\n", encoding="utf-8")
         for start_line, line_count in ((0, 1), (1, 0), (1, 1001)):
             with self.subTest(start_line=start_line, line_count=line_count):
                 self.assertIn(
                     "Error: start_line must be positive",
                     self.source_context.read_source_file(
-                        "pr", "short.md", start_line, line_count
+                        "guidance", "short.md", start_line, line_count
                     ),
                 )
         self.assertIn(
             "repository must be", self.source_context.read_source_file("unknown", "missing.md")
         )
-        with patch.dict(os.environ, {"PR_SOURCE_ROOT": ""}):
+        with patch.dict(os.environ, {"GUIDANCE_SOURCE_ROOT": ""}):
             self.assertIn(
-                "PR_SOURCE_ROOT is not configured",
-                self.source_context.read_source_file("pr", "missing.md"),
+                "GUIDANCE_SOURCE_ROOT is not configured",
+                self.source_context.read_source_file("guidance", "missing.md"),
             )

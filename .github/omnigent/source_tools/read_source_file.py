@@ -8,7 +8,7 @@ from typing import Literal
 
 from omnigent_client import tool
 
-Repository = Literal["pr", "delta"]
+Repository = Literal["pr", "delta", "guidance"]
 
 
 def _implementation():
@@ -34,7 +34,7 @@ def read_source_file(
     produces an error that names the line to continue from.
 
     Args:
-        repository: Read from the exact PR checkout or read-only Delta reference.
+        repository: Read from the PR checkout, Delta reference, or trusted guidance snapshot.
         path: Repository-relative POSIX path to a text file.
         start_line: First line to return, using one-based numbering.
         line_count: Number of lines to return, from 1 through 1000.

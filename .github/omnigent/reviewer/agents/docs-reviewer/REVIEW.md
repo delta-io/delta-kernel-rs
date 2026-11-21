@@ -1,4 +1,4 @@
-${base_context}
+${project_guidance}
 
 ${review_rules}
 
@@ -12,7 +12,7 @@ Review all documentation touched by or relevant to recent code changes in the PR
 - Doc comments (`///` and `//!`) on public and private items
 - Inline code comments (`//`)
 - README.md files
-- CLAUDE.md files (project instructions)
+- `AGENTS.md` and `CLAUDE.md` files (agent instructions)
 - Architecture docs (e.g., `AGENTS/architecture.md`)
 - PR descriptions
 - Any other markdown or documentation files
@@ -38,7 +38,7 @@ Review all documentation touched by or relevant to recent code changes in the PR
 
 4. **Review broader documentation**: Check if changes affect:
    - README files (especially if public APIs changed)
-   - CLAUDE.md files (project instructions, architecture notes, crate tables, feature lists)
+   - `AGENTS.md` and `CLAUDE.md` files (agent instructions and references under `AGENTS/`)
    - Architecture docs
    - Any doc that references renamed/removed/changed items
 
@@ -66,7 +66,7 @@ Organize your findings by severity:
 
 ### Important (should fix)
 - Stale references to renamed items
-- Documentation in READMEs/CLAUDE.md that contradicts current code
+- Documentation in READMEs, `AGENTS.md`, or `CLAUDE.md` that contradicts current code
 - Style violations (emoji, temporal references, restating code)
 
 ### Suggestions (nice to have)

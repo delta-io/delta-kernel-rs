@@ -117,18 +117,10 @@ class PrepareReviewerTest(unittest.TestCase):
             with self.subTest(block=block.name):
                 self.assertIn(f"${{{block.stem}}}\n", instructions)
 
-    def test_maintainer_reviewers_differ_only_in_their_identity_line(self) -> None:
+    def test_maintainer_reviewers_share_one_instruction_text(self) -> None:
         claude, codex = (
             (REVIEWER_DIR / "agents" / name / "REVIEW.md").read_text(encoding="utf-8")
             for name in ("maintainer-claude-reviewer", "maintainer-codex-reviewer")
         )
-        self.assertEqual(
-            claude.replace(
-                "You are the Claude maintainer reviewer for the delta-kernel-rs project",
-                "You are the Codex maintainer reviewer for the delta-kernel-rs project",
-                1,
-            ),
-            codex,
-        )
-        self.assertNotEqual(claude, codex)
+        self.assertEqual(claude, codex)
         self.assertIn("${maintainer}\n", claude)
