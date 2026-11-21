@@ -2,14 +2,14 @@ use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
-use delta_kernel::commit_range::CommitRange;
 #[cfg(feature = "declarative-plans")]
 use delta_kernel::committer::write_commit_json_declarative;
 use delta_kernel::committer::{
-    CommitMetadata, CommitResponse, CommitType, Committer, PublishMetadata,
+    CommitMetadata, CommitResponse, CommitType, Committer, PublishMetadata, WinningCommits,
+    list_published_commits_and_merge_ratified_tail,
 };
 #[cfg(feature = "declarative-plans")]
-use delta_kernel::plans::{PlanExecutor, RelationRef, ScopedPlanExecutor};
+use delta_kernel::plans::{RelationRef, ScopedPlanExecutor};
 use delta_kernel::{
     Engine, FileMeta, FilteredEngineData, KernelError as DeltaError, KernelResult,
     KernelResultIterator,
@@ -43,11 +43,8 @@ macro_rules! require {
 /// For version >= 1, the committer writes a staged commit and calls the UC `update_table` API
 /// to ratify it.
 ///
-/// NOTE: this [`Committer`] requires a multi-threaded tokio runtime. That is, whatever
-/// implementation consumes the Committer to commit to the table, must call `commit` from within a
-/// multi-threaded tokio runtime context. Since the default engine uses tokio, this is compatible,
-/// but must ensure that the multi-threaded runtime is used. This applies to both `commit` and
-/// `commit_declarative`.
+/// Catalog requests require a multi-threaded Tokio runtime. Call `commit`, `commit_declarative`,
+/// and [`Committer::get_winning_commits`] from within that runtime.
 #[derive(Debug, Clone)]
 pub struct UCCommitter<C: UpdateTableClient> {
     update_table_client: Arc<C>,
@@ -70,40 +67,7 @@ impl<C: UpdateTableClient> UCCommitter<C> {
         }
     }
 
-    fn load_winning_commits(
-        &self,
-        engine: &dyn Engine,
-        table_root: &url::Url,
-        conflict_version: delta_kernel::Version,
-    ) -> KernelResult<CommitRange> {
-        require!(
-            conflict_version != 0,
-            DeltaError::unsupported("A create-table conflict cannot be rebased onto another table")
-        );
-        let (log_tail, latest_version) = self.read_commit_history(table_root)?;
-        CommitRange::builder_for(table_root, conflict_version)
-            .with_log_tail(log_tail, latest_version)
-            .build(engine)
-    }
-
-    #[cfg(feature = "declarative-plans")]
-    fn load_winning_commits_declarative(
-        &self,
-        executor: &dyn PlanExecutor,
-        table_root: &url::Url,
-        conflict_version: delta_kernel::Version,
-    ) -> KernelResult<CommitRange> {
-        require!(
-            conflict_version != 0,
-            DeltaError::unsupported("A create-table conflict cannot be rebased onto another table")
-        );
-        let (log_tail, latest_version) = self.read_commit_history(table_root)?;
-        CommitRange::builder_for(table_root, conflict_version)
-            .with_log_tail(log_tail, latest_version)
-            .build_declarative(executor)
-    }
-
-    fn read_commit_history(
+    fn fetch_ratified_commits(
         &self,
         table_root: &url::Url,
     ) -> KernelResult<(Vec<delta_kernel::LogPath>, delta_kernel::Version)> {
@@ -216,12 +180,7 @@ impl<C: UpdateTableClient> UCCommitter<C> {
             }
             Err(DeltaError::FileAlreadyExists(_)) => {
                 info!("version 0 commit conflict: commit file already exists");
-                Ok(CommitResponse::Conflict {
-                    version: 0,
-                    commits: Err(DeltaError::unsupported(
-                        "A create-table conflict cannot be rebased onto another table",
-                    )),
-                })
+                Ok(CommitResponse::Conflict { version: 0 })
             }
             Err(e) => Err(e),
         }
@@ -233,7 +192,6 @@ impl<C: UpdateTableClient> UCCommitter<C> {
         &self,
         commit_metadata: CommitMetadata,
         write: impl FnOnce(&url::Url) -> KernelResult<FileMeta>,
-        load_history: impl FnOnce() -> KernelResult<CommitRange>,
     ) -> KernelResult<CommitResponse>
     where
         C: 'static,
@@ -282,7 +240,6 @@ impl<C: UpdateTableClient> UCCommitter<C> {
             {
                 Ok(CommitResponse::Conflict {
                     version: commit_metadata.version(),
-                    commits: load_history(),
                 })
             }
             Err(
@@ -321,18 +278,12 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
                 ))
             });
         }
-        let table_root = commit_metadata.table_root().clone();
-        let version = commit_metadata.version();
-        self.commit_version_non_zero(
-            commit_metadata,
-            |path| {
-                engine
-                    .json_handler()
-                    .write_json_file(path, Box::new(actions), false)?;
-                engine.storage_handler().head(path)
-            },
-            || self.load_winning_commits(engine, &table_root, version),
-        )
+        self.commit_version_non_zero(commit_metadata, |path| {
+            engine
+                .json_handler()
+                .write_json_file(path, Box::new(actions), false)?;
+            engine.storage_handler().head(path)
+        })
     }
 
     #[cfg(feature = "declarative-plans")]
@@ -347,12 +298,32 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
                 write_commit_json_declarative(executor, actions, path.clone())
             });
         }
-        let table_root = commit_metadata.table_root().clone();
-        let version = commit_metadata.version();
-        self.commit_version_non_zero(
-            commit_metadata,
-            |path| write_commit_json_declarative(executor, actions, path.clone()),
-            || self.load_winning_commits_declarative(executor, &table_root, version),
+        self.commit_version_non_zero(commit_metadata, |path| {
+            write_commit_json_declarative(executor, actions, path.clone())
+        })
+    }
+
+    /// Loads winning history from published files and catalog-ratified staged commits.
+    ///
+    /// Discovery for a version 0 conflict is unsupported because it would load another table's
+    /// history after a failed create.
+    fn get_winning_commits(
+        &self,
+        engine: &dyn Engine,
+        table_root: &url::Url,
+        conflict_version: delta_kernel::Version,
+    ) -> KernelResult<WinningCommits> {
+        require!(
+            conflict_version != 0,
+            DeltaError::unsupported("A create-table conflict cannot be rebased onto another table")
+        );
+        let (log_tail, latest_version) = self.fetch_ratified_commits(table_root)?;
+        list_published_commits_and_merge_ratified_tail(
+            engine,
+            table_root,
+            conflict_version,
+            log_tail,
+            Some(latest_version),
         )
     }
 
@@ -421,6 +392,7 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use delta_kernel::arrow::array::{Array, RecordBatch, StringArray};
     use delta_kernel::committer::{CatalogCommit, CommitMetadata};
@@ -432,11 +404,14 @@ mod tests {
     use delta_kernel::plans::{PlanBuilder, ScopedPlanExecutor};
     #[cfg(feature = "declarative-plans")]
     use delta_kernel::schema::schema_ref;
-    use delta_kernel::{EngineData, FilteredEngineData, Version};
+    use delta_kernel::{
+        EngineData, EvaluationHandler, FilteredEngineData, JsonHandler, ParquetHandler,
+        StorageHandler, Version,
+    };
     use delta_kernel_default_engine::DefaultEngine;
     use rstest::rstest;
-    use unity_catalog_delta_client_api::InMemoryUpdateTableClient;
     use unity_catalog_delta_client_api::error::Result;
+    use unity_catalog_delta_client_api::{CommitState, InMemoryUpdateTableClient};
 
     use super::*;
 
@@ -444,9 +419,18 @@ mod tests {
     struct MockUpdateTableClient {
         requests: Mutex<Vec<UpdateTableRequest>>,
         error: Mutex<Option<ClientError>>,
+        history: Mutex<Option<CommitState>>,
+        history_calls: AtomicUsize,
     }
 
     impl UpdateTableClient for MockUpdateTableClient {
+        async fn get_commits(&self, _: &TableIdentifier, _: &str) -> Result<CommitState> {
+            self.history_calls.fetch_add(1, Ordering::SeqCst);
+            self.history.lock().unwrap().clone().ok_or_else(|| {
+                ClientError::UnsupportedOperation("Commit history unavailable".into())
+            })
+        }
+
         async fn update_table(
             &self,
             _: &TableIdentifier,
@@ -454,6 +438,60 @@ mod tests {
         ) -> Result<()> {
             self.requests.lock().unwrap().push(request);
             self.error.lock().unwrap().take().map_or(Ok(()), Err)
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingCatalogClient {
+        inner: InMemoryUpdateTableClient,
+        history_calls: AtomicUsize,
+    }
+
+    impl UpdateTableClient for CountingCatalogClient {
+        async fn update_table(
+            &self,
+            target: &TableIdentifier,
+            request: UpdateTableRequest,
+        ) -> Result<()> {
+            self.inner.update_table(target, request).await
+        }
+
+        async fn get_commits(
+            &self,
+            target: &TableIdentifier,
+            table_uuid: &str,
+        ) -> Result<CommitState> {
+            self.history_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.get_commits(target, table_uuid).await
+        }
+    }
+
+    struct CountingEngine {
+        inner: Arc<dyn Engine>,
+        storage_calls: AtomicUsize,
+    }
+
+    impl Engine for CountingEngine {
+        fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
+            self.inner.evaluation_handler()
+        }
+
+        fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+            self.storage_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.storage_handler()
+        }
+
+        fn json_handler(&self) -> Arc<dyn JsonHandler> {
+            self.inner.json_handler()
+        }
+
+        fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+            self.inner.parquet_handler()
+        }
+
+        #[cfg(feature = "declarative-plans")]
+        fn plan_executor(&self) -> Option<Arc<dyn delta_kernel::plans::PlanExecutor>> {
+            self.inner.plan_executor()
         }
     }
 
@@ -587,12 +625,15 @@ mod tests {
             if conflicted {
                 assert!(matches!(
                     result,
-                    Ok(CommitResponse::Conflict {
-                        version: 1,
-                        commits: Err(_)
-                    })
+                    Ok(CommitResponse::Conflict { version: 1 })
                 ));
                 assert_eq!(client.requests.lock().unwrap().len(), 1);
+                assert_eq!(client.history_calls.load(Ordering::SeqCst), 0);
+                let error = committer
+                    .get_winning_commits(&engine, &table_root, 1)
+                    .unwrap_err();
+                assert!(error.to_string().contains("UC commit-history read failed"));
+                assert_eq!(client.history_calls.load(Ordering::SeqCst), 1);
             } else if retryable {
                 assert!(matches!(result, Ok(CommitResponse::Retryable { .. })));
                 let retried = commit_with_style(
@@ -618,21 +659,25 @@ mod tests {
         case::declarative(CommitStyle::Declarative)
     )]
     #[tokio::test(flavor = "multi_thread")]
-    async fn duplicate_catalog_version_returns_conflict_and_loads_only_ratified_winners(
+    async fn catalog_conflict_defers_discovery_and_merges_published_and_staged_winners(
         #[case] style: CommitStyle,
         #[values(0, 2, 3)] published_until: u64,
     ) {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
         fs::create_dir_all(tmp_dir.path().join("_delta_log/_staged_commits")).unwrap();
-        let client = Arc::new(InMemoryUpdateTableClient::new());
-        client.create_table("test-table-id").unwrap();
+        let client = Arc::new(CountingCatalogClient::default());
+        client.inner.create_table("test-table-id").unwrap();
         let committer = UCCommitter::new(
-            client,
+            client.clone(),
             "test-table-id",
             TableIdentifier::new("test_catalog", "test_schema", "test_table"),
         );
-        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        let engine = CountingEngine {
+            inner: Arc::new(DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build()),
+            storage_calls: AtomicUsize::new(0),
+        };
+        let mut ratified_paths = Vec::new();
         for version in 1..=3 {
             let result = commit_with_style(
                 &committer,
@@ -641,8 +686,12 @@ mod tests {
                 catalog_managed_commit_metadata(table_root.clone(), version),
             )
             .unwrap();
-            assert!(matches!(result, CommitResponse::Committed { .. }));
+            let CommitResponse::Committed { file_meta } = result else {
+                panic!("expected a ratified commit");
+            };
+            ratified_paths.push(file_meta);
         }
+        let storage_calls_before_conflict = engine.storage_calls.load(Ordering::SeqCst);
         let result = commit_with_style(
             &committer,
             &engine,
@@ -650,14 +699,22 @@ mod tests {
             catalog_managed_commit_metadata(table_root.clone(), 1),
         )
         .unwrap();
-        let CommitResponse::Conflict { version, commits } = result else {
-            panic!("Expected a confirmed conflict with bundled catalog history");
+        let CommitResponse::Conflict { version } = result else {
+            panic!("expected a confirmed version conflict");
         };
         assert_eq!(version, 1);
-        let bundled = commits.unwrap();
-        assert_eq!(bundled.start_version(), 1);
-        assert_eq!(bundled.end_version(), 3);
-        assert_eq!(bundled.commit_files().unwrap().count(), 3);
+        assert_eq!(client.history_calls.load(Ordering::SeqCst), 0);
+        // Imperative submission requests storage only to HEAD the staged proposal. Declarative
+        // submission uses its scoped executor and never requests an engine storage handler.
+        let submission_storage_calls = match style {
+            CommitStyle::Imperative => 1,
+            #[cfg(feature = "declarative-plans")]
+            CommitStyle::Declarative => 0,
+        };
+        assert_eq!(
+            engine.storage_calls.load(Ordering::SeqCst),
+            storage_calls_before_conflict + submission_storage_calls,
+        );
         // The losing proposal also exists on disk, but only the catalog identifies winners.
         let staged_count = fs::read_dir(tmp_dir.path().join("_delta_log/_staged_commits"))
             .unwrap()
@@ -665,6 +722,7 @@ mod tests {
         assert_eq!(staged_count, 4);
         let state = committer
             .update_table_client
+            .inner
             .get_commits(&committer.table, &committer.table_id)
             .await
             .unwrap();
@@ -689,7 +747,7 @@ mod tests {
                     PublishMetadata::try_new(published_until, commits).unwrap(),
                 )
                 .unwrap();
-            committer.update_table_client.insert_table(
+            client.inner.insert_table(
                 "test-table-id",
                 unity_catalog_delta_client_api::TableData {
                     max_ratified_version: state.latest_version,
@@ -707,33 +765,122 @@ mod tests {
             "not ratified",
         )
         .unwrap();
+        let storage_calls_before_discovery = engine.storage_calls.load(Ordering::SeqCst);
         let winners = committer
-            .load_winning_commits(&engine, &table_root, 1)
+            .get_winning_commits(&engine, &table_root, version)
             .unwrap();
-        assert_eq!(winners.start_version(), 1);
-        assert_eq!(winners.end_version(), 3);
-        let paths = winners
-            .commit_files()
-            .unwrap()
-            .collect::<KernelResult<Vec<_>>>()
-            .unwrap();
-        assert_eq!(paths.len(), 3);
-        assert_eq!(
-            paths
-                .iter()
-                .filter(|p| p.location.location.path().contains("/_staged_commits/"))
-                .count(),
-            3 - published_until as usize
-        );
-        #[cfg(feature = "declarative-plans")]
-        {
-            let executor = SyncPlanExecutor::default();
-            let winners = committer
-                .load_winning_commits_declarative(&executor, &table_root, 1)
-                .unwrap();
-            assert_eq!(winners.end_version(), 3);
-            assert_eq!(winners.commit_files().unwrap().count(), 3);
+        assert_eq!(client.history_calls.load(Ordering::SeqCst), 1);
+        assert!(engine.storage_calls.load(Ordering::SeqCst) > storage_calls_before_discovery);
+        assert_eq!(winners.len(), 3);
+        for (winner, ratified) in winners.iter().zip(ratified_paths) {
+            let expected_path = if winner.version <= published_until {
+                published_commit_url(&table_root, winner.version)
+            } else {
+                ratified.location
+            };
+            assert_eq!(
+                winner.log_path,
+                delta_kernel::LogPath::try_new(
+                    engine.storage_handler().head(&expected_path).unwrap()
+                )
+                .unwrap(),
+            );
+            assert_eq!(
+                fs::read_to_string(expected_path.to_file_path().unwrap()).unwrap(),
+                "{\"test\":\"value\"}\n",
+            );
         }
+        assert_eq!(
+            winners
+                .iter()
+                .map(|winner| winner.version)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3],
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn winning_history_rejects_wrong_table_before_filesystem_io() {
+        let committer = test_committer();
+        *committer.update_table_client.history.lock().unwrap() = Some(CommitState {
+            table_uuid: "different-table-id".into(),
+            latest_version: 1,
+            commits: vec![],
+        });
+        let table_root = url::Url::parse("file:///table/").unwrap();
+        let error = committer
+            .get_winning_commits(&delta_kernel::engine::PanicEngine, &table_root, 1)
+            .unwrap_err();
+        assert!(error.to_string().contains("different table"));
+    }
+
+    #[rstest]
+    #[case::absolute_location("file:///other-table/_delta_log/00000000000000000001.json")]
+    #[case::parent_location("../00000000000000000001.json")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn winning_history_rejects_invalid_locations_before_filesystem_io(
+        #[case] file_name: &str,
+    ) {
+        let committer = test_committer();
+        *committer.update_table_client.history.lock().unwrap() = Some(CommitState {
+            table_uuid: "test-table-id".into(),
+            latest_version: 1,
+            commits: vec![Commit::new(1, 0, file_name, 1, 0)],
+        });
+        let table_root = url::Url::parse("file:///table/").unwrap();
+        assert!(matches!(
+            committer.get_winning_commits(&delta_kernel::engine::PanicEngine, &table_root, 1),
+            Err(DeltaError::InvalidLogPath(_)),
+        ));
+    }
+
+    #[rstest]
+    #[case::empty(&[], &[], |error: &DeltaError| matches!(error, DeltaError::EmptyLog))]
+    #[case::missing_start(&[2, 3], &[], |error: &DeltaError| matches!(error, DeltaError::StartVersionNotFound { .. }))]
+    #[case::missing_published_prefix(&[], &[3], |error: &DeltaError| matches!(error, DeltaError::StartVersionNotFound { .. }))]
+    #[case::gapped_published(&[1, 3], &[], |error: &DeltaError| matches!(error, DeltaError::MissingVersion(2)))]
+    #[case::gapped_catalog(&[], &[1, 3], |error: &DeltaError| matches!(error, DeltaError::LogTailVersionsNotContiguous { .. }))]
+    #[case::missing_catalog_end(&[1], &[2], |error: &DeltaError| matches!(error, DeltaError::MaxCatalogVersion(_)))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn winning_history_rejects_missing_or_gapped_commits(
+        #[case] published_versions: &[Version],
+        #[case] staged_versions: &[Version],
+        #[case] expected_error: fn(&DeltaError) -> bool,
+    ) {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
+        fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
+        for version in published_versions {
+            fs::write(
+                published_commit_url(&table_root, *version)
+                    .to_file_path()
+                    .unwrap(),
+                "published",
+            )
+            .unwrap();
+        }
+        let committer = test_committer();
+        *committer.update_table_client.history.lock().unwrap() = Some(CommitState {
+            table_uuid: "test-table-id".into(),
+            latest_version: 3,
+            commits: staged_versions
+                .iter()
+                .map(|version| {
+                    Commit::new(
+                        *version as i64,
+                        0,
+                        format!("{version:020}.4cb9708e-b478-44de-b203-53f9ba9b2876.json"),
+                        1,
+                        0,
+                    )
+                })
+                .collect(),
+        });
+        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        let error = committer
+            .get_winning_commits(&engine, &table_root, 1)
+            .unwrap_err();
+        assert!(expected_error(&error), "unexpected history error: {error}");
     }
 
     #[rstest]
@@ -851,17 +998,22 @@ mod tests {
         fs::create_dir_all(&delta_log).unwrap();
         fs::write(delta_log.join("00000000000000000000.json"), "existing").unwrap();
 
-        let commit_metadata = catalog_managed_commit_metadata(table_root, 0);
+        let commit_metadata = catalog_managed_commit_metadata(table_root.clone(), 0);
         let result = commit_with_style(&committer, &engine, style, commit_metadata).unwrap();
         assert!(
-            matches!(
-                result,
-                CommitResponse::Conflict {
-                    version: 0,
-                    commits: Err(_)
-                }
-            ),
+            matches!(result, CommitResponse::Conflict { version: 0 }),
             "expected Conflict for version 0 when file exists, got: {result:?}"
+        );
+        assert!(matches!(
+            committer.get_winning_commits(&delta_kernel::engine::PanicEngine, &table_root, 0),
+            Err(DeltaError::Unsupported(_)),
+        ));
+        assert_eq!(
+            committer
+                .update_table_client
+                .history_calls
+                .load(Ordering::SeqCst),
+            0,
         );
     }
 

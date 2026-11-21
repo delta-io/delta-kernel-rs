@@ -34,7 +34,7 @@ impl<MODE: ExecutionMode> Transaction<UpdateTable, MODE> {
     /// will fail (that is, we don't eagerly check domain validity here).
     /// Removing metadata for multiple distinct domains is allowed.
     pub fn with_domain_metadata_removed(mut self, domain: String) -> Self {
-        self.user_domain_removals.push(domain);
+        self.state.user_domain_removals.push(domain);
         self
     }
 
@@ -60,7 +60,7 @@ impl<MODE: ExecutionMode> Transaction<UpdateTable, MODE> {
     ///
     /// [Row Tracking]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#row-tracking
     pub fn ack_row_tracking_preservation(&mut self) {
-        self.row_tracking_preservation_acknowledged = true;
+        self.state.row_tracking_preservation_acknowledged = true;
     }
 
     /// Set an explicit row-tracking high-water mark for this transaction.
@@ -76,12 +76,12 @@ impl<MODE: ExecutionMode> Transaction<UpdateTable, MODE> {
         mut self,
         high_water_mark: i64,
     ) -> KernelResult<Self> {
-        if self.provided_row_tracking_high_water_mark.is_some() {
+        if self.state.provided_row_tracking_high_water_mark.is_some() {
             return Err(KernelError::generic(
                 "Row-tracking high-water mark already specified in this transaction",
             ));
         }
-        self.provided_row_tracking_high_water_mark = Some(high_water_mark);
+        self.state.provided_row_tracking_high_water_mark = Some(high_water_mark);
         Ok(self)
     }
 
@@ -98,22 +98,23 @@ impl<MODE: ExecutionMode> Transaction<UpdateTable, MODE> {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     pub fn with_root_manifest_file(mut self, file: FileMeta) -> KernelResult<Self> {
         require!(
-            !matches!(self.manifest_write, Some(ManifestWrite::Commit(_))),
+            !matches!(self.state.manifest_write, Some(ManifestWrite::Commit(_))),
             KernelError::invalid_transaction_state(
                 "explicit root manifest and manifest commit are mutually exclusive"
             )
         );
         require!(
-            self.effective_table_config
+            self.state
+                .effective_table_config
                 .is_feature_supported(&TableFeature::AdaptiveMetadataPreview),
             KernelError::unsupported(
                 "root manifest file commit requires the adaptiveMetadata-preview feature"
             )
         );
-        let read_snapshot = self.read_snapshot_opt.clone().ok_or_else(|| {
+        let read_snapshot = self.state.read_snapshot_opt.clone().ok_or_else(|| {
             KernelError::internal_error("existing-table transaction unexpectedly has no snapshot")
         })?;
-        self.manifest_write = Some(ManifestWrite::RootFile(RootManifestFile::new(
+        self.state.manifest_write = Some(ManifestWrite::RootFile(RootManifestFile::new(
             file,
             read_snapshot,
         )));
@@ -139,7 +140,7 @@ impl<MODE: ExecutionMode> Transaction<UpdateTable, MODE> {
         &mut self,
         engine: &dyn Engine,
     ) -> KernelResult<&mut ManifestCommitState> {
-        match &self.manifest_write {
+        match &self.state.manifest_write {
             Some(ManifestWrite::RootFile(_)) => {
                 return Err(KernelError::invalid_transaction_state(
                     "explicit root manifest and manifest commit are mutually exclusive",
@@ -148,7 +149,7 @@ impl<MODE: ExecutionMode> Transaction<UpdateTable, MODE> {
             // Repeated calls reuse the state from the first call.
             Some(ManifestWrite::Commit(_)) => {}
             None => {
-                let read_snapshot = self.read_snapshot_opt.clone().ok_or_else(|| {
+                let read_snapshot = self.state.read_snapshot_opt.clone().ok_or_else(|| {
                     KernelError::internal_error(
                         "existing-table transaction unexpectedly has no snapshot",
                     )
@@ -156,13 +157,13 @@ impl<MODE: ExecutionMode> Transaction<UpdateTable, MODE> {
                 let state = ManifestCommitState::try_new(
                     engine,
                     read_snapshot,
-                    self.get_commit_version(),
-                    &self.effective_table_config,
+                    self.state.get_commit_version(),
+                    &self.state.effective_table_config,
                 )?;
-                self.manifest_write = Some(ManifestWrite::Commit(state));
+                self.state.manifest_write = Some(ManifestWrite::Commit(state));
             }
         }
-        match &mut self.manifest_write {
+        match &mut self.state.manifest_write {
             Some(ManifestWrite::Commit(state)) => Ok(state),
             _ => Err(KernelError::internal_error(
                 "manifest commit state missing after initialization",

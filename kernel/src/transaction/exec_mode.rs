@@ -17,6 +17,11 @@ pub trait ExecutionMode: sealed::Sealed + StagedDataChanges + Default + std::fmt
 /// Surfaces methods for inspecting staged operations without inspecting the actual row contents.
 /// This allows validations (that are independent of the physical format of data) to share code.
 pub(crate) trait StagedDataChanges {
+    /// Whether any data-file input is staged, regardless of its eventual row count.
+    fn has_data_file_actions(&self) -> bool {
+        self.has_adds() || self.has_removes() || self.has_dv_inputs()
+    }
+
     /// Whether any add-file inputs are staged, regardless of their row counts.
     fn has_adds(&self) -> bool;
     /// Whether any remove-file inputs are staged, regardless of selection vectors.

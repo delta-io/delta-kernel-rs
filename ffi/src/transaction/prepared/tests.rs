@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use delta_kernel::actions::{DomainMetadata, Metadata, Protocol, get_commit_schema};
-use delta_kernel::committer::{CommitMetadata, FileSystemCommitter};
+use delta_kernel::committer::{CommitMetadata, Committer, FileSystemCommitter};
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::engine::sync::plan::{ScopedSyncPlanExecutor, SyncPlanExecutor};
 use delta_kernel::expressions::Scalar;
@@ -21,6 +21,7 @@ use prost::Message;
 use rstest::rstest;
 
 use super::*;
+use crate::commit_range::FfiCommitFile;
 use crate::delta_types::{FfiMetadata, FfiProtocol};
 use crate::error::{EngineExecError, EngineExecResult};
 use crate::ffi_test_utils::{TEST_ERROR_ALLOCATORS, ok_or_panic, recover_error};
@@ -51,7 +52,6 @@ extern "C" fn commit(
     metadata: *const FfiCommitMetadata,
     out: *mut EngineExecResult<FfiCommitResponse>,
 ) {
-    let callback_context = context;
     let context = unsafe { &*context.unwrap().as_ptr().cast::<Context>() };
     let metadata = unsafe { metadata.as_ref() }.unwrap();
     context.calls.fetch_add(1, Ordering::Relaxed);
@@ -76,20 +76,9 @@ extern "C" fn commit(
             .is_empty()
     );
     let result = match context.outcome {
-        0 => {
-            let mut commits = EngineExecResult::Uninit;
-            let root = unsafe { metadata.table_root.try_to_string() }.unwrap();
-            history(
-                callback_context,
-                unsafe { KernelStringSlice::new_unsafe(&root) },
-                metadata.version,
-                &mut commits,
-            );
-            EngineExecResult::Success(FfiCommitResponse::Conflict {
-                version: metadata.version,
-                commits,
-            })
-        }
+        0 => EngineExecResult::Success(FfiCommitResponse::Conflict {
+            version: metadata.version,
+        }),
         1 => EngineExecResult::Success(FfiCommitResponse::Retryable(EngineExecError {
             etype: FFIKernelError::IOErrorError,
             message: Box::new("rejected before acceptance".to_string()).into(),
@@ -107,10 +96,13 @@ extern "C" fn history(
     context: NullableCvoid,
     root: KernelStringSlice,
     version: u64,
-    out: *mut EngineExecResult<Handle<SharedCommitRange>>,
+    out: *mut EngineExecResult<Handle<SharedWinningCommits>>,
 ) {
     let context = unsafe { &*context.unwrap().as_ptr().cast::<Context>() };
     context.reads.fetch_add(1, Ordering::Relaxed);
+    if context.outcome == 3 {
+        return;
+    }
     if context
         .failures
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
@@ -125,10 +117,33 @@ extern "C" fn history(
         return;
     }
     let root = unsafe { root.try_to_string() }.unwrap();
-    let range = delta_kernel::commit_range::CommitRange::builder_for(root, version)
-        .build(context.engine.as_ref())
+    let commits = FileSystemCommitter::new()
+        .get_winning_commits(context.engine.as_ref(), &root.parse().unwrap(), version)
         .unwrap();
-    unsafe { out.write(EngineExecResult::Success(Arc::new(range).into())) }
+    let paths: Vec<delta_kernel::path::ParsedLogPath> =
+        commits.iter().map(|c| c.log_path.clone().into()).collect();
+    let views: Vec<_> = commits
+        .iter()
+        .zip(&paths)
+        .map(|(commit, path)| FfiCommitFile {
+            version: commit.version,
+            file: crate::log_path::FfiLogPath::from_parsed(path),
+        })
+        .collect();
+    let engine = engine_to_handle(context.engine.clone(), TEST_ERROR_ALLOCATORS);
+    let handle = unsafe {
+        ok_or_panic(create_winning_commits(
+            KernelStringSlice::new_unsafe(&root),
+            version,
+            commits.end_version(),
+            FfiSlice::new_unsafe(&views),
+            engine.shallow_copy(),
+        ))
+    };
+    unsafe {
+        crate::free_engine(engine);
+        out.write(EngineExecResult::Success(handle));
+    }
 }
 
 extern "C" fn free(context: NullableCvoid) {
@@ -169,7 +184,7 @@ extern "C" fn publish(
     unsafe { out.write(result) }
 }
 
-extern "C" fn visit_attempt(context: NullableCvoid, attempt: SubmittedAttemptView) {
+extern "C" fn visit_attempt(context: NullableCvoid, attempt: CommitAttemptView) {
     let calls = unsafe { &*context.unwrap().as_ptr().cast::<AtomicUsize>() };
     calls.fetch_add(1, Ordering::Relaxed);
     assert_eq!(attempt.version, 1);
@@ -467,10 +482,6 @@ extern "C" fn inspect_metadata(
     unsafe {
         out.write(EngineExecResult::Success(FfiCommitResponse::Conflict {
             version: 1,
-            commits: EngineExecResult::Failure(EngineExecError {
-                etype: FFIKernelError::IOErrorError,
-                message: Box::new("history unavailable".to_string()).into(),
-            }),
         }))
     }
 }
@@ -511,6 +522,7 @@ fn commit_callback_preserves_typed_metadata_payloads_and_presence(
             false,
             DeclarativeCommitterCallbacks {
                 commit: inspect_metadata,
+                get_winning_commits: OptionalValue::None,
                 publish: OptionalValue::None,
                 free: borrowed_context_free,
             },
@@ -522,10 +534,7 @@ fn commit_callback_preserves_typed_metadata_payloads_and_presence(
         .unwrap();
     assert!(matches!(
         result,
-        delta_kernel::committer::CommitResponse::Conflict {
-            version: 1,
-            commits: Err(_)
-        }
+        delta_kernel::committer::CommitResponse::Conflict { version: 1 }
     ));
     assert_eq!(expected.calls.load(Ordering::Relaxed), 1);
     unsafe { free_declarative_committer(committer) };
@@ -555,6 +564,7 @@ fn committer_publication_callback_validates_acknowledgment_and_releases_context(
             true,
             DeclarativeCommitterCallbacks {
                 commit,
+                get_winning_commits: OptionalValue::Some(history),
                 free,
                 publish: OptionalValue::Some(publish),
             },
@@ -699,14 +709,17 @@ fn declarative_ffi_prepares_and_commits_files_with_an_independently_retained_sco
 }
 
 #[rstest]
-#[case::cached_conflict(0, 0)]
-#[case::failed_eager_history(0, 1)]
-#[case::retryable(1, 0)]
-#[case::unknown(2, 0)]
-#[case::uninitialized_callback(3, 0)]
+#[case::fetched_conflict(0, 0, true)]
+#[case::failed_history_then_explicit_retry(0, 1, true)]
+#[case::extraction_before_fetch(0, 0, false)]
+#[case::failed_history_then_extraction(0, 1, false)]
+#[case::retryable(1, 0, false)]
+#[case::unknown(2, 0, false)]
+#[case::uninitialized_callback(3, 0, false)]
 fn ffi_outcomes_preserve_pending_work_and_history_across_ownership_transfers(
     #[case] outcome: u8,
     #[case] failures: usize,
+    #[case] fetch_history: bool,
     #[values(false, true)] result_first: bool,
 ) {
     let (store, rust_engine, snapshot) = table();
@@ -741,6 +754,7 @@ fn ffi_outcomes_preserve_pending_work_and_history_across_ownership_transfers(
             false,
             DeclarativeCommitterCallbacks {
                 commit,
+                get_winning_commits: OptionalValue::Some(history),
                 free,
                 publish: OptionalValue::None,
             },
@@ -792,15 +806,53 @@ fn ffi_outcomes_preserve_pending_work_and_history_across_ownership_transfers(
     free_view(take_optional(unsafe {
         prepared_transaction_commit_result_pending(&result)
     }));
-    if let OptionalValue::Some(error) =
-        unsafe { prepared_transaction_commit_result_history_error(&result) }
-    {
-        assert!(failures > 0);
-        assert_eq!(error.code, FFIKernelError::IOErrorError);
-        unsafe { free_prepared_transaction_error(error) };
-    } else {
-        assert_eq!(failures, 0);
+    assert_eq!(reads.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        Option::<u64>::from(unsafe {
+            prepared_transaction_commit_result_conflict_version(&result)
+        }),
+        (outcome == 0).then_some(1)
+    );
+    if failures > 0 {
+        match unsafe {
+            prepared_transaction_commit_result_get_winning_commits(&result, engine.shallow_copy())
+        } {
+            ExternResult::Err(error) => assert!(
+                unsafe { recover_error(error) }
+                    .message
+                    .contains("history unavailable")
+            ),
+            _ => panic!("Expected explicit discovery to fail"),
+        }
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            unsafe { prepared_transaction_commit_result_outcome(&result) },
+            PreparedTransactionOutcome::Conflicted
+        ));
     }
+    let retained_history = if fetch_history {
+        let winners = take_optional(unsafe {
+            ok_or_panic(prepared_transaction_commit_result_get_winning_commits(
+                &result,
+                engine.shallow_copy(),
+            ))
+        });
+        assert_history(&winners);
+        assert_eq!(reads.load(Ordering::Relaxed), failures + 1);
+        let second = take_optional(unsafe {
+            ok_or_panic(prepared_transaction_commit_result_get_winning_commits(
+                &result,
+                engine.shallow_copy(),
+            ))
+        });
+        assert_history(&second);
+        assert_eq!(reads.load(Ordering::Relaxed), failures + 2);
+        unsafe { free_winning_commits(second) };
+        Some(winners)
+    } else {
+        None
+    };
+    let expected_reads = reads.load(Ordering::Relaxed);
     let mut pending =
         take_optional(unsafe { prepared_transaction_commit_result_take_pending(&mut result) });
     assert_eq!(scope_drops.load(Ordering::Relaxed), 0);
@@ -819,45 +871,27 @@ fn ffi_outcomes_preserve_pending_work_and_history_across_ownership_transfers(
     let inspected = AtomicUsize::new(0);
     let context = NonNull::new((&inspected as *const AtomicUsize).cast_mut().cast());
     assert_eq!(
-        unsafe { prepared_transaction_visit_submitted_attempt(&pending, context, visit_attempt) },
+        unsafe { prepared_transaction_visit_unresolved_attempt(&pending, context, visit_attempt) },
         outcome >= 2
     );
     assert_eq!(inspected.load(Ordering::Relaxed), usize::from(outcome >= 2));
     if outcome == 0 {
-        assert_eq!(reads.load(Ordering::Relaxed), 1);
-        if failures > 0 {
-            for _ in 0..2 {
-                match unsafe {
-                    prepared_transaction_commit_result_get_winning_commits(
-                        &result,
-                        engine.shallow_copy(),
-                    )
-                } {
-                    ExternResult::Err(error) => assert!(
-                        unsafe { recover_error(error) }
-                            .message
-                            .contains("history unavailable")
-                    ),
-                    _ => panic!("Expected the saved history-load error"),
-                }
+        for _ in 0..2 {
+            let history = unsafe {
+                prepared_transaction_commit_result_get_winning_commits(
+                    &result,
+                    engine.shallow_copy(),
+                )
+            };
+            match history {
+                ExternResult::Err(error) => assert_eq!(
+                    unsafe { recover_error(error) }.etype,
+                    FFIKernelError::InvalidTransactionStateError
+                ),
+                _ => panic!("History discovery must fail after extraction"),
             }
-            assert_eq!(reads.load(Ordering::Relaxed), 1);
-        } else {
-            let winners = take_optional(unsafe {
-                ok_or_panic(prepared_transaction_commit_result_get_winning_commits(
-                    &result,
-                    engine.shallow_copy(),
-                ))
-            });
-            assert_eq!(unsafe { winners.as_ref() }.start_version(), 1);
-            assert_eq!(unsafe { winners.as_ref() }.end_version(), 3);
-            let again = take_optional(unsafe {
-                ok_or_panic(prepared_transaction_commit_result_get_winning_commits(
-                    &result,
-                    engine.shallow_copy(),
-                ))
-            });
-            assert_eq!(reads.load(Ordering::Relaxed), 1);
+        }
+        if let Some(winners) = &retained_history {
             match unsafe {
                 prepared_transaction_rebase(
                     &mut pending,
@@ -871,10 +905,9 @@ fn ffi_outcomes_preserve_pending_work_and_history_across_ownership_transfers(
                 ),
                 _ => panic!("Expected unsupported rebase"),
             }
-            unsafe {
-                crate::commit_range::free_commit_range(winners);
-                crate::commit_range::free_commit_range(again);
-            }
+            let view = unsafe { prepared_transaction_inspect(&pending) };
+            assert_eq!(view.target_version, 1);
+            free_view(view);
         }
     } else {
         assert!(matches!(
@@ -886,7 +919,6 @@ fn ffi_outcomes_preserve_pending_work_and_history_across_ownership_transfers(
             },
             OptionalValue::None
         ));
-        assert_eq!(reads.load(Ordering::Relaxed), 0);
         let error = take_optional(unsafe { prepared_transaction_commit_result_error(&result) });
         assert_eq!(
             error.code,
@@ -898,6 +930,7 @@ fn ffi_outcomes_preserve_pending_work_and_history_across_ownership_transfers(
         );
         unsafe { free_prepared_transaction_error(error) };
     }
+    assert_eq!(reads.load(Ordering::Relaxed), expected_reads);
     assert_eq!(calls.load(Ordering::Relaxed), 1);
     if result_first {
         unsafe { free_prepared_transaction_commit_result(result) };
@@ -910,37 +943,258 @@ fn ffi_outcomes_preserve_pending_work_and_history_across_ownership_transfers(
         free_pending(pending, outcome, unsafe { engine.shallow_copy() });
         assert_eq!(drops.load(Ordering::Relaxed), 1);
         assert_eq!(scope_drops.load(Ordering::Relaxed), 0);
-        if outcome == 0 && failures > 0 {
-            match unsafe {
-                prepared_transaction_commit_result_get_winning_commits(
-                    &result,
-                    engine.shallow_copy(),
-                )
-            } {
-                ExternResult::Err(error) => assert!(
-                    unsafe { recover_error(error) }
-                        .message
-                        .contains("history unavailable")
-                ),
-                _ => panic!("Expected the saved error after releasing the committer"),
-            }
-            assert_eq!(reads.load(Ordering::Relaxed), 1);
-        } else if outcome == 0 {
-            let history = take_optional(unsafe {
-                ok_or_panic(prepared_transaction_commit_result_get_winning_commits(
-                    &result,
-                    engine.shallow_copy(),
-                ))
-            });
-            assert_eq!(unsafe { history.as_ref() }.end_version(), 3);
-            unsafe { crate::commit_range::free_commit_range(history) };
-            assert_eq!(reads.load(Ordering::Relaxed), 1);
-        }
+        assert_eq!(reads.load(Ordering::Relaxed), expected_reads);
         assert_scope_rows(unsafe { result.as_ref() }.executor.as_ref(), relation);
         unsafe { free_prepared_transaction_commit_result(result) };
+    }
+    if let Some(history) = retained_history {
+        assert_history(&history);
+        unsafe { free_winning_commits(history) };
     }
     assert_eq!(scope_drops.load(Ordering::Relaxed), 1);
     assert_eq!(calls.load(Ordering::Relaxed), 1);
     unsafe { crate::free_engine(engine) };
     assert_eq!(drops.load(Ordering::Relaxed), 1);
+}
+
+fn assert_history(history: &Handle<SharedWinningCommits>) {
+    let visits = AtomicUsize::new(0);
+    let context = NonNull::new((&visits as *const AtomicUsize).cast_mut().cast());
+    unsafe { visit_winning_commits(history.shallow_copy(), context, inspect_history) };
+    assert_eq!(visits.load(Ordering::Relaxed), 1);
+}
+
+extern "C" fn inspect_history(context: NullableCvoid, commits: FfiSlice<FfiCommitFile>) {
+    let visits = unsafe { &*context.unwrap().as_ptr().cast::<AtomicUsize>() };
+    visits.fetch_add(1, Ordering::Relaxed);
+    let commits = unsafe { commits.try_as_slice() }.unwrap();
+    assert_eq!(commits.len(), 3);
+    for (commit, version) in commits.iter().zip(1..=3) {
+        assert_eq!(commit.version, version);
+        assert_eq!(
+            unsafe { commit.file.location().try_to_string() }.unwrap(),
+            format!("memory:///table/_delta_log/{version:020}.json")
+        );
+        assert!(commit.file.size() > 0);
+    }
+}
+
+#[rstest]
+#[case::published(false)]
+#[case::staged(true)]
+fn conflicted_commit_collection_copies_and_preserves_file_descriptors(#[case] staged: bool) {
+    let (_, rust_engine, _) = table();
+    let engine = engine_to_handle(rust_engine, TEST_ERROR_ALLOCATORS);
+    let (commits, expected) = {
+        let location = if staged {
+            "memory:///table/_delta_log/_staged_commits/00000000000000000001.3a0d65cd-4a56-49a8-937b-95f9e3ee90e5.json".to_string()
+        } else {
+            "memory:///table/_delta_log/00000000000000000001.json".to_string()
+        };
+        let views = vec![FfiCommitFile {
+            version: 1,
+            file: crate::log_path::FfiLogPath::new(
+                unsafe { KernelStringSlice::new_unsafe(&location) },
+                1234,
+                5678,
+            ),
+        }];
+        let expected = views
+            .iter()
+            .map(|view| delta_kernel::committer::WinningCommit {
+                version: view.version,
+                log_path: unsafe { view.file.log_path() }.unwrap(),
+            })
+            .collect::<Vec<_>>();
+        let commits = unsafe {
+            ok_or_panic(create_winning_commits(
+                KernelStringSlice::new_unsafe("memory:///table/"),
+                1,
+                1,
+                FfiSlice::new_unsafe(&views),
+                engine.shallow_copy(),
+            ))
+        };
+        (commits, expected)
+    };
+    unsafe { crate::free_engine(engine) };
+    let mut actual: Vec<delta_kernel::committer::WinningCommit> = Vec::new();
+    let context = NonNull::new((&mut actual as *mut Vec<_>).cast());
+    unsafe { visit_winning_commits(commits.shallow_copy(), context, copy_history) };
+    assert_eq!(actual.len(), expected.len());
+    for (actual, expected) in actual.iter().zip(&expected) {
+        assert_eq!(actual.version, expected.version);
+        assert_eq!(actual.log_path, expected.log_path);
+    }
+    unsafe { free_winning_commits(commits) };
+}
+
+extern "C" fn copy_history(context: NullableCvoid, commits: FfiSlice<FfiCommitFile>) {
+    let actual = unsafe {
+        &mut *context
+            .unwrap()
+            .as_ptr()
+            .cast::<Vec<delta_kernel::committer::WinningCommit>>()
+    };
+    actual.extend(
+        unsafe { commits.try_as_slice() }
+            .unwrap()
+            .iter()
+            .map(|commit| delta_kernel::committer::WinningCommit {
+                version: commit.version,
+                log_path: unsafe { commit.file.log_path() }.unwrap(),
+            }),
+    );
+}
+
+#[rstest]
+#[case::null_nonempty(0, FFIKernelError::GenericError)]
+#[case::invalid_log_path(1, FFIKernelError::InvalidLogPath)]
+#[case::invalid_utf8(2, FFIKernelError::Utf8Error)]
+#[case::null_empty_location(3, FFIKernelError::InvalidUrlError)]
+#[case::null_nonempty_location(4, FFIKernelError::GenericError)]
+fn conflicted_commit_collection_rejects_invalid_descriptors(
+    #[case] input: u8,
+    #[case] expected: FFIKernelError,
+) {
+    let (_, rust_engine, _) = table();
+    let engine = engine_to_handle(rust_engine, TEST_ERROR_ALLOCATORS);
+    let invalid = [0xffu8];
+    let location = if input >= 3 {
+        KernelStringSlice {
+            ptr: std::ptr::null(),
+            len: usize::from(input == 4),
+        }
+    } else if input == 2 {
+        KernelStringSlice {
+            ptr: invalid.as_ptr().cast(),
+            len: invalid.len(),
+        }
+    } else {
+        unsafe { KernelStringSlice::new_unsafe("memory:///table/not-a-log.json") }
+    };
+    let views = [FfiCommitFile {
+        version: 1,
+        file: crate::log_path::FfiLogPath::new(location, 1, 1),
+    }];
+    let commits = if input == 0 {
+        FfiSlice {
+            ptr: std::ptr::null(),
+            len: 1,
+        }
+    } else {
+        unsafe { FfiSlice::new_unsafe(&views) }
+    };
+    match unsafe {
+        create_winning_commits(
+            KernelStringSlice::new_unsafe("memory:///table/"),
+            1,
+            1,
+            commits,
+            engine.shallow_copy(),
+        )
+    } {
+        ExternResult::Err(error) => assert_eq!(unsafe { recover_error(error) }.etype, expected),
+        _ => panic!("Expected invalid descriptors to fail"),
+    }
+    unsafe { crate::free_engine(engine) };
+}
+
+#[rstest]
+#[case::absent(0, FFIKernelError::UnsupportedError)]
+#[case::uninitialized(3, FFIKernelError::InternalError)]
+#[case::failed(1, FFIKernelError::IOErrorError)]
+fn winning_history_callback_reports_missing_or_invalid_results_and_releases_context(
+    #[case] outcome: u8,
+    #[case] expected: FFIKernelError,
+) {
+    let (_, engine, snapshot) = table();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let context = NonNull::new(
+        Box::into_raw(Box::new(Context {
+            engine: engine.clone(),
+            snapshot,
+            calls: Arc::new(AtomicUsize::new(0)),
+            reads: reads.clone(),
+            drops: drops.clone(),
+            failures: AtomicUsize::new(1),
+            outcome,
+        }))
+        .cast(),
+    );
+    let committer = unsafe {
+        get_declarative_committer(
+            context,
+            false,
+            DeclarativeCommitterCallbacks {
+                commit,
+                get_winning_commits: if outcome == 0 {
+                    OptionalValue::None
+                } else {
+                    OptionalValue::Some(history)
+                },
+                publish: OptionalValue::None,
+                free,
+            },
+        )
+    };
+    let result = unsafe { committer.as_ref() }.get_winning_commits(
+        engine.as_ref(),
+        &"memory:///table/".parse().unwrap(),
+        1,
+    );
+    assert_eq!(FFIKernelError::from(&result.unwrap_err()), expected);
+    assert_eq!(reads.load(Ordering::Relaxed), usize::from(outcome != 0));
+    unsafe { free_declarative_committer(committer) };
+    assert_eq!(drops.load(Ordering::Relaxed), 1);
+}
+
+#[rstest]
+#[case::empty(&[], 1, 1)]
+#[case::missing_end(&[1], 1, 2)]
+#[case::gap(&[1, 3], 1, 3)]
+#[case::duplicate(&[1, 1], 1, 1)]
+#[case::wrong_start(&[2], 1, 2)]
+fn conflicted_commit_collection_rejects_incomplete_history(
+    #[case] versions: &[u64],
+    #[case] start: u64,
+    #[case] end: u64,
+) {
+    let (_, rust_engine, _) = table();
+    let engine = engine_to_handle(rust_engine, TEST_ERROR_ALLOCATORS);
+    let locations: Vec<_> = versions
+        .iter()
+        .map(|v| format!("memory:///table/_delta_log/{v:020}.json"))
+        .collect();
+    let views: Vec<_> = versions
+        .iter()
+        .zip(&locations)
+        .map(|(version, location)| FfiCommitFile {
+            version: *version,
+            file: crate::log_path::FfiLogPath::new(
+                unsafe { KernelStringSlice::new_unsafe(location) },
+                0,
+                1,
+            ),
+        })
+        .collect();
+    match unsafe {
+        create_winning_commits(
+            KernelStringSlice::new_unsafe("memory:///table/"),
+            start,
+            end,
+            FfiSlice::new_unsafe(&views),
+            engine.shallow_copy(),
+        )
+    } {
+        ExternResult::Err(error) => {
+            let _ = unsafe { recover_error(error) };
+        }
+        ExternResult::Ok(commits) => {
+            unsafe { free_winning_commits(commits) };
+            panic!("Expected incomplete winning history to be rejected");
+        }
+    }
+    unsafe { crate::free_engine(engine) };
 }

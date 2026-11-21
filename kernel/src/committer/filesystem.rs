@@ -3,16 +3,16 @@
 use tracing::{info, instrument};
 use url::Url;
 
-use super::Committer;
 use super::commit_types::{CommitMetadata, CommitResponse};
 use super::publish_types::PublishMetadata;
-use crate::commit_range::CommitRange;
+use super::{Committer, list_published_commits_and_merge_ratified_tail};
+use crate::committer::WinningCommits;
 #[cfg(feature = "declarative-plans")]
 use crate::committer::write_commit_json_declarative;
 #[cfg(feature = "declarative-plans")]
-use crate::plans::{PlanExecutor, RelationRef, ScopedPlanExecutor};
+use crate::plans::{RelationRef, ScopedPlanExecutor};
 use crate::{
-    Engine, FileMeta, FilteredEngineData, KernelError, KernelResult, KernelResultIterator,
+    Engine, FileMeta, FilteredEngineData, KernelError, KernelResult, KernelResultIterator, Version,
 };
 
 /// The `FileSystemCommitter` is an internal implementation of the `Committer` trait which
@@ -29,29 +29,9 @@ impl FileSystemCommitter {
         Self {}
     }
 
-    fn load_winning_commits(
-        &self,
-        engine: &dyn Engine,
-        table_root: &Url,
-        conflict_version: crate::Version,
-    ) -> KernelResult<CommitRange> {
-        CommitRange::builder_for(table_root, conflict_version).build(engine)
-    }
-
-    #[cfg(feature = "declarative-plans")]
-    fn load_winning_commits_declarative(
-        &self,
-        executor: &dyn PlanExecutor,
-        table_root: &Url,
-        conflict_version: crate::Version,
-    ) -> KernelResult<CommitRange> {
-        CommitRange::builder_for(table_root, conflict_version).build_declarative(executor)
-    }
-
     fn commit_response(
         result: KernelResult<FileMeta>,
-        version: crate::Version,
-        load_history: impl FnOnce() -> KernelResult<CommitRange>,
+        version: Version,
     ) -> KernelResult<CommitResponse> {
         match result {
             Ok(file_meta) => {
@@ -66,10 +46,7 @@ impl FileSystemCommitter {
                     conflicting_version = version,
                     "Filesystem commit conflict: target version already exists"
                 );
-                Ok(CommitResponse::Conflict {
-                    version,
-                    commits: load_history(),
-                })
+                Ok(CommitResponse::Conflict { version })
             }
             Err(e) => Err(e),
         }
@@ -102,9 +79,7 @@ impl Committer for FileSystemCommitter {
                     written_size,
                 )
             });
-        Self::commit_response(result, version, || {
-            self.load_winning_commits(engine, commit_metadata.table_root(), version)
-        })
+        Self::commit_response(result, version)
     }
 
     #[cfg(feature = "declarative-plans")]
@@ -123,9 +98,22 @@ impl Committer for FileSystemCommitter {
         let version = commit_metadata.version();
         let path = commit_metadata.published_commit_path()?;
         let result = write_commit_json_declarative(executor, actions, path);
-        Self::commit_response(result, version, || {
-            self.load_winning_commits_declarative(executor, commit_metadata.table_root(), version)
-        })
+        Self::commit_response(result, version)
+    }
+
+    fn get_winning_commits(
+        &self,
+        engine: &dyn Engine,
+        table_root: &Url,
+        conflict_version: Version,
+    ) -> KernelResult<WinningCommits> {
+        list_published_commits_and_merge_ratified_tail(
+            engine,
+            table_root,
+            conflict_version,
+            vec![],
+            None,
+        )
     }
 
     fn is_catalog_committer(&self) -> bool {
@@ -349,7 +337,7 @@ mod tests {
             vec![],
         );
         let second_metadata = CommitMetadata::new(
-            LogRoot::new(table_root).unwrap(),
+            LogRoot::new(table_root.clone()).unwrap(),
             1,
             CommitType::PathBasedWrite,
             12346,
@@ -378,27 +366,26 @@ mod tests {
             second_metadata,
         )
         .unwrap();
-        let CommitResponse::Conflict { version, commits } = second else {
-            panic!("Expected a confirmed conflict with bundled history");
+        let CommitResponse::Conflict { version } = second else {
+            panic!("Expected a confirmed conflict");
         };
         assert_eq!(version, 1);
-        let winners = commits.unwrap();
-        assert_eq!(winners.start_version(), 1);
-        assert_eq!(winners.end_version(), 1);
-        assert_eq!(winners.commit_files().unwrap().count(), 1);
+        let winners = committer
+            .get_winning_commits(&engine, &table_root, version)
+            .unwrap();
+        assert_eq!(winners.len(), 1);
+        assert_eq!(winners[0].version, 1);
     }
 
-    #[cfg(feature = "declarative-plans")]
     #[rstest]
-    #[case::complete(vec![10, 11, 12, 13], None)]
-    #[case::missing_first(vec![12, 13], Some(11))]
-    #[case::missing_middle(vec![11, 13], Some(12))]
-    #[case::missing_terminal(vec![11, 12], Some(13))]
+    #[case::complete(vec![10, 11, 12, 13], Ok(13))]
+    #[case::missing_first(vec![12, 13], Err(11))]
+    #[case::missing_middle(vec![11, 13], Err(12))]
+    #[case::unbounded_ends_at_last_commit(vec![11, 12], Ok(12))]
     #[tokio::test]
-    async fn winning_history_requires_complete_commits_even_with_a_checkpoint(
+    async fn winning_history_validates_listed_commit_range_with_a_checkpoint(
         #[case] versions: Vec<u64>,
-        #[case] missing_version: Option<u64>,
-        #[values(CommitStyle::Imperative, CommitStyle::Declarative)] style: CommitStyle,
+        #[case] expected: KernelResult<u64, u64>,
     ) {
         let storage = Arc::new(InMemory::new());
         let engine = SyncEngine::new_with_store(storage.clone());
@@ -421,33 +408,21 @@ mod tests {
             .unwrap();
         let root = Url::parse("memory:///table/").unwrap();
         let committer = FileSystemCommitter::new();
-        let executor = SyncPlanExecutor::new(Some(storage));
-        let result = match style {
-            CommitStyle::Imperative => committer.load_winning_commits(&engine, &root, 11),
-            CommitStyle::Declarative => {
-                committer.load_winning_commits_declarative(&executor, &root, 11)
-            }
-        };
-        match missing_version {
-            None => {
+        let result = committer.get_winning_commits(&engine, &root, 11);
+        match expected {
+            Ok(end_version) => {
                 let winners = result.unwrap();
-                assert_eq!(winners.start_version(), 11);
-                assert_eq!(winners.end_version(), 13);
-                let versions: Vec<_> = winners
-                    .commit_files()
-                    .unwrap()
-                    .map(|file| file.unwrap().version)
-                    .collect();
-                assert_eq!(versions, vec![11, 12, 13]);
+                let versions: Vec<_> = winners.iter().map(|commit| commit.version).collect();
+                assert_eq!(versions, (11..=end_version).collect::<Vec<_>>());
             }
-            Some(11) => assert!(matches!(
+            Err(11) => assert!(matches!(
                 result,
                 Err(KernelError::StartVersionNotFound {
                     requested: 11,
                     earliest: 12
                 })
             )),
-            Some(version) => assert!(matches!(
+            Err(version) => assert!(matches!(
                 result,
                 Err(KernelError::MissingVersion(missing)) if missing == version
             )),

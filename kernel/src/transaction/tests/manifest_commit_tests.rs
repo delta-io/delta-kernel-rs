@@ -33,7 +33,13 @@ fn adaptive_table_config() -> TableConfiguration {
 
 /// A root manifest `FileMeta` located under the transaction's table root.
 fn dummy_root_manifest_file_meta(txn: &Transaction) -> FileMeta {
-    let table_root = txn.read_snapshot_opt.clone().unwrap().table_root().clone();
+    let table_root = txn
+        .state
+        .read_snapshot_opt
+        .clone()
+        .unwrap()
+        .table_root()
+        .clone();
     FileMeta {
         location: table_root.join("metadata/root-v1.parquet").unwrap(),
         last_modified: 0,
@@ -57,22 +63,24 @@ fn with_root_manifest_file_rejects_non_adaptive_table() -> Result<()> {
 #[test]
 fn validate_manifest_write_allows_root_manifest_on_adaptive_table() -> Result<()> {
     let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
-    txn.effective_table_config = adaptive_table_config();
+    txn.state.effective_table_config = adaptive_table_config();
     let file = dummy_root_manifest_file_meta(&txn);
     txn = txn.with_root_manifest_file(file)?;
-    txn.validate_manifest_write_semantics()?;
+    txn.state
+        .validate_manifest_write_semantics(&txn.staged_data_changes)?;
     Ok(())
 }
 
 #[test]
 fn validate_manifest_write_rejects_root_manifest_with_file_actions() -> Result<()> {
     let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
-    txn.effective_table_config = adaptive_table_config();
+    txn.state.effective_table_config = adaptive_table_config();
     let file = dummy_root_manifest_file_meta(&txn);
     txn = txn.with_root_manifest_file(file)?;
     add_dummy_file(&mut txn);
     assert_result_error_with_message(
-        txn.validate_manifest_write_semantics(),
+        txn.state
+            .validate_manifest_write_semantics(&txn.staged_data_changes),
         "cannot include file actions",
     );
     Ok(())
@@ -83,9 +91,12 @@ fn validate_manifest_write_rejects_root_manifest_with_file_actions() -> Result<(
 #[test]
 fn with_manifest_commit_succeeds_on_adaptive_table() -> Result<()> {
     let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
-    txn.effective_table_config = adaptive_table_config();
+    txn.state.effective_table_config = adaptive_table_config();
     txn.with_manifest_commit(engine.as_ref())?;
-    assert!(matches!(txn.manifest_write, Some(ManifestWrite::Commit(_))));
+    assert!(matches!(
+        txn.state.manifest_write,
+        Some(ManifestWrite::Commit(_))
+    ));
     Ok(())
 }
 
@@ -103,9 +114,9 @@ fn with_manifest_commit_rejects_non_adaptive_table() -> Result<()> {
 #[test]
 fn with_manifest_commit_reuses_state_on_repeated_calls() -> Result<()> {
     let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
-    txn.effective_table_config = adaptive_table_config();
+    txn.state.effective_table_config = adaptive_table_config();
     txn.with_manifest_commit(engine.as_ref())?;
-    txn.effective_table_config = MockTableConfigurationBuilder::new().build();
+    txn.state.effective_table_config = MockTableConfigurationBuilder::new().build();
     assert!(
         txn.with_manifest_commit(engine.as_ref()).is_ok(),
         "repeated call must reuse the staged state instead of re-running try_new"
@@ -118,7 +129,7 @@ fn with_manifest_commit_reuses_state_on_repeated_calls() -> Result<()> {
 #[test]
 fn with_manifest_commit_rejects_when_root_manifest_staged() -> Result<()> {
     let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
-    txn.effective_table_config = adaptive_table_config();
+    txn.state.effective_table_config = adaptive_table_config();
     let file = dummy_root_manifest_file_meta(&txn);
     txn = txn.with_root_manifest_file(file)?;
     assert_result_error_with_message(
@@ -131,7 +142,7 @@ fn with_manifest_commit_rejects_when_root_manifest_staged() -> Result<()> {
 #[test]
 fn with_root_manifest_file_rejects_when_manifest_commit_staged() -> Result<()> {
     let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
-    txn.effective_table_config = adaptive_table_config();
+    txn.state.effective_table_config = adaptive_table_config();
     txn.with_manifest_commit(engine.as_ref())?;
     let file = dummy_root_manifest_file_meta(&txn);
     assert_result_error_with_message(txn.with_root_manifest_file(file), "mutually exclusive");
@@ -220,7 +231,7 @@ fn manifest_commit_after_schema_change_uses_evolved_schema(
         .update_table(operation, "test-engine", !is_alter)
         .add_column(StructField::nullable("fresh_column", DataType::INTEGER))
         .build(&engine, Box::new(FileSystemCommitter::new()))?;
-    let expected = txn.effective_table_config.physical_schema();
+    let expected = txn.state.effective_table_config.physical_schema();
     assert_ne!(expected, initial_schema);
     let writer = txn
         .with_manifest_commit(&engine)?
@@ -241,7 +252,7 @@ fn manifest_commit_after_schema_change_uses_evolved_schema(
 #[test]
 fn commit_rejects_pending_manifest_commit() -> Result<()> {
     let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
-    txn.effective_table_config = adaptive_table_config();
+    txn.state.effective_table_config = adaptive_table_config();
     txn.with_manifest_commit(engine.as_ref())?;
     assert_result_error_with_message(txn.commit(engine.as_ref()), "not yet supported");
     Ok(())
@@ -252,7 +263,7 @@ fn commit_rejects_pending_manifest_commit() -> Result<()> {
 #[test]
 fn leaf_writer_ops_unsupported() -> Result<()> {
     let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
-    txn.effective_table_config = adaptive_table_config();
+    txn.state.effective_table_config = adaptive_table_config();
     let mut leaf_writer = txn
         .with_manifest_commit(engine.as_ref())?
         .new_leaf_node_writer(engine.as_ref());

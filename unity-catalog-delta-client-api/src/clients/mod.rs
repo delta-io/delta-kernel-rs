@@ -24,7 +24,9 @@ pub struct CommitState {
 /// Trait for committing new versions to a UC-managed Delta table via the
 /// `update_table` endpoint.
 ///
-/// Implementations are responsible for any retry logic on transient failures.
+/// The transaction layer owns retries after confirmed rejections.
+/// Do not resubmit an update whose acceptance is uncertain. Return uncertain outcomes as errors
+/// so callers can resolve them before resubmission.
 #[allow(async_fn_in_trait)]
 pub trait UpdateTableClient: Send + Sync {
     /// Apply the typed `requirements + updates` payload atomically against `target`.
@@ -36,15 +38,16 @@ pub trait UpdateTableClient: Send + Sync {
 
     /// Reads ratified commit state for `target` after a confirmed version conflict.
     ///
-    /// `table_uuid` identifies the table the caller originally opened. The returned identity must
-    /// be checked before using history, since the named table may have been replaced. This method
-    /// must not infer ratification by listing staged files.
+    /// Catalog clients resolve `target` by name. `expected_table_uuid` is the identity the caller
+    /// opened. Return the actual identity in [`CommitState::table_uuid`]; `UCCommitter` compares it
+    /// with the expected UUID and rejects a replaced table before using history.
+    /// This method must not infer ratification by listing staged files.
     ///
     /// Returns an unsupported error when catalog reads are unavailable.
     async fn get_commits(
         &self,
         _target: &TableIdentifier,
-        _table_uuid: &str,
+        _expected_table_uuid: &str,
     ) -> Result<CommitState> {
         Err(Error::UnsupportedOperation(
             "This client does not support commit-history reads".to_string(),

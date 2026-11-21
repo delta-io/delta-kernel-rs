@@ -251,6 +251,7 @@ pub struct CountingReporter {
     pub commit_conflicts: RelaxedCounter,
     pub commit_retryable_failures: RelaxedCounter,
     pub commit_errors: RelaxedCounter,
+    pub commit_unknown_outcomes: RelaxedCounter,
     pub commit_add_files: RelaxedCounter,
     pub commit_remove_files: RelaxedCounter,
     pub commit_add_bytes: RelaxedCounter,
@@ -314,6 +315,7 @@ impl CountingReporter {
         self.commit_conflicts.reset();
         self.commit_retryable_failures.reset();
         self.commit_errors.reset();
+        self.commit_unknown_outcomes.reset();
         self.commit_add_files.reset();
         self.commit_remove_files.reset();
         self.commit_add_bytes.reset();
@@ -450,6 +452,7 @@ impl MetricsReporter for CountingReporter {
                 CommitFailureReason::Conflict => self.commit_conflicts.inc(),
                 CommitFailureReason::RetryableIo => self.commit_retryable_failures.inc(),
                 CommitFailureReason::Error => self.commit_errors.inc(),
+                CommitFailureReason::Unknown => self.commit_unknown_outcomes.inc(),
             },
             // Intentionally not tracked. Add counters if needed.
             MetricEvent::ProtocolMetadataLoadSuccess(_)
@@ -769,6 +772,7 @@ mod tests {
             CommitFailureReason::Conflict,
             CommitFailureReason::RetryableIo,
             CommitFailureReason::Error,
+            CommitFailureReason::Unknown,
         ] {
             reporter.report(MetricEvent::TransactionCommitFailure(
                 TransactionCommitFailure {
@@ -782,6 +786,7 @@ mod tests {
         assert_eq!(reporter.commit_conflicts.get(), 1);
         assert_eq!(reporter.commit_retryable_failures.get(), 1);
         assert_eq!(reporter.commit_errors.get(), 1);
+        assert_eq!(reporter.commit_unknown_outcomes.get(), 1);
         assert_eq!(reporter.transaction_commits.get(), 0);
     }
 

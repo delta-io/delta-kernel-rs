@@ -14,7 +14,7 @@ use crate::error::{EngineExecResult, ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::{
     ErrorAllocators, KernelBytesSlice, KernelOwnedBytes, KernelStringSlice, NullableCvoid,
-    OptionalValue, SharedExternEngine, TryFromStringSlice, kernel_bytes_slice, kernel_string_slice,
+    OptionalValue, SharedExternEngine, kernel_bytes_slice, kernel_string_slice,
 };
 
 /// Shared handle to an identifier and schema. Freeing it does not release the engine's rows.
@@ -155,7 +155,7 @@ pub unsafe extern "C" fn new_relation_ref(
 ) -> ExternResult<Handle<SharedRelationRef>> {
     let engine = unsafe { engine.as_ref() };
     let result: KernelResult<Handle<SharedRelationRef>> = (|| {
-        let id: String = unsafe { String::try_from_slice(&id) }?;
+        let id = unsafe { id.try_to_string() }?;
         let proto = proto_schema::StructType::decode(unsafe { schema.try_as_slice() }?)
             .map_err(KernelError::generic_err)?;
         let schema = Arc::new(StructType::try_from(proto)?);
@@ -210,7 +210,9 @@ mod tests {
 
     use super::*;
     use crate::error::{EngineExecError, FFIKernelError};
-    use crate::ffi_test_utils::{error_only_engine_handle, ok_or_panic};
+    use crate::ffi_test_utils::{
+        assert_extern_result_error_contains, error_only_engine_handle, ok_or_panic,
+    };
     use crate::plans::result::CPlanResult;
 
     struct Context {
@@ -314,15 +316,28 @@ mod tests {
         assert_eq!(freed.load(Ordering::Relaxed), 1);
     }
 
-    #[test]
-    fn relation_ref_round_trips_identifier_and_schema_with_named_cleanup() {
+    #[rstest]
+    #[case::ordinary("files-1", false)]
+    #[case::nonnull_empty("", false)]
+    #[case::null_empty("", true)]
+    fn relation_ref_round_trips_identifier_and_schema_with_named_cleanup(
+        #[case] id: &str,
+        #[case] null_pointer: bool,
+    ) {
         let engine = error_only_engine_handle();
         let schema = schema_ref! { nullable "id": INTEGER };
         let bytes = proto_schema::StructType::from(schema.as_ref()).encode_to_vec();
-        let id = "files-1";
+        let id_slice = if null_pointer {
+            KernelStringSlice {
+                ptr: std::ptr::null(),
+                len: 0,
+            }
+        } else {
+            kernel_string_slice!(id)
+        };
         let handle = unsafe {
             ok_or_panic(new_relation_ref(
-                kernel_string_slice!(id),
+                id_slice,
                 kernel_bytes_slice!(bytes),
                 engine.shallow_copy(),
             ))
@@ -339,5 +354,35 @@ mod tests {
             free_relation_ref(handle);
             crate::free_engine(engine);
         }
+    }
+
+    #[rstest]
+    #[case::null_nonempty(
+        true,
+        FFIKernelError::GenericError,
+        "string pointer is null with length 1"
+    )]
+    #[case::invalid_utf8(false, FFIKernelError::Utf8Error, "invalid utf-8")]
+    fn relation_ref_rejects_invalid_identifier(
+        #[case] null_pointer: bool,
+        #[case] expected_error: FFIKernelError,
+        #[case] expected_message: &str,
+    ) {
+        let engine = error_only_engine_handle();
+        let schema = schema_ref! { nullable "id": INTEGER };
+        let bytes = proto_schema::StructType::from(schema.as_ref()).encode_to_vec();
+        let invalid_utf8 = [0xff_u8];
+        let id = KernelStringSlice {
+            ptr: if null_pointer {
+                std::ptr::null()
+            } else {
+                invalid_utf8.as_ptr().cast()
+            },
+            len: invalid_utf8.len(),
+        };
+        let result =
+            unsafe { new_relation_ref(id, kernel_bytes_slice!(bytes), engine.shallow_copy()) };
+        unsafe { crate::free_engine(engine) };
+        assert_extern_result_error_contains(result, expected_error, expected_message);
     }
 }

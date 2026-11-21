@@ -1,59 +1,56 @@
 //! Owning declarative transaction preparation and single-attempt commit execution.
 
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 use std::time::Instant;
 
 use super::exec_mode::StagedDataChanges as _;
 use super::imperative::{build_add_action_projection, build_remove_struct_patch};
-use super::{CommittedTransaction, Declarative, Transaction, UpdateTable, WinningCommitHistory};
-use crate::actions::{
-    DomainMetadata, LOG_REMOVE_SCHEMA, Metadata, Protocol, SetTransaction, as_log_add_schema,
-    get_commit_schema,
-};
-use crate::commit_range::CommitRange;
-use crate::committer::CommitResponse;
+use super::{CommittedTransaction, Declarative, Transaction, TransactionState, UpdateTable};
+use crate::actions::{DomainMetadata, LOG_REMOVE_SCHEMA, as_log_add_schema, get_commit_schema};
+use crate::committer::{CommitResponse, WinningCommits};
 use crate::crc::FileStatsDelta;
 use crate::engine_data::TypedGetData as _;
 use crate::expressions::{
     BinaryPredicateOp, ColumnName, Expression, Predicate, Scalar, UnaryExpressionOp, col,
     column_name, lit, null_lit,
 };
+use crate::metrics::CommitFailureReason;
+use crate::metrics::events::TRANSACTION_COMMIT_SPAN;
 use crate::plans::ir::nodes::Agg;
 use crate::plans::{Operation, PlanBuilder, RelationRef, ScopedPlanExecutor};
 use crate::schema::{DataType, StructType, schema_ref};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::TableFeature;
-use crate::utils::{current_time_ms, require};
-use crate::{Engine, FileMeta, GetData, KernelError, KernelResult, RowVisitor, Version};
+use crate::utils::{PhantomType, current_time_ms, require};
+use crate::{Engine, GetData, KernelError, KernelResult, RowVisitor, Version};
 
 #[cfg(test)]
 mod tests;
 
 /// Prepared actions and context for a declarative commit attempt.
 ///
-/// Obtain this object through [`Transaction::prepare`]. Its target version is the checked baseline
-/// plus one. `commit` selects the attempt timestamp, validates the actions, and submits them. The
-/// executor holding the relations must remain alive across preparation, inspection, and recovery.
-/// The original transaction inputs remain available for validation and future regeneration.
+/// Obtain this object through [`Transaction::prepare_declarative`]. Its target version is the
+/// checked baseline plus one. `commit` selects the attempt timestamp, validates the actions, and
+/// submits them. The executor holding the relations must remain alive across preparation,
+/// inspection, and recovery. The original transaction inputs remain available for validation.
 #[derive(Debug)]
 pub struct PreparedTransaction<STATE = UpdateTable> {
-    transaction: Transaction<STATE, Declarative>,
+    state: TransactionState,
+    original_inputs: Declarative,
+    _state: PhantomType<STATE>,
     target_version: Version,
-    file_actions: RelationRef,
-    // Derived from the authoritative file relation and typed non-file actions. Regenerate this
-    // cache if a future rebase changes either source.
-    actions: RelationRef,
-    non_file_actions: PreparedNonFileActions,
-    submitted_attempt: Option<SubmittedAttempt>,
+    prepared_actions: RelationRef,
+    prepared_domain_metadata_actions: Vec<DomainMetadata>,
+    unresolved_attempt: Option<CommitAttempt>,
 }
 
 /// Result of submitting a prepared declarative transaction.
 ///
 /// Retryable rejections preserve pending state for another attempt at the same version. Conflicts
-/// preserve pending state and the winning history or discovery error returned by the committer.
-/// Getters perform no I/O. Unknown outcomes
-/// preserve the submitted attempt and must be resolved before another write; they are not evidence
-/// that the write failed. Successful results contain no pending transaction.
+/// preserve pending state for lazy winning-commit discovery through
+/// [`get_winning_commits`](Self::get_winning_commits). Unknown outcomes preserve the submitted
+/// attempt and must be resolved before another write; they are not evidence that the write failed.
+/// Successful results contain no pending transaction.
 #[derive(Debug)]
 #[must_use]
 pub enum PreparedTransactionCommitResult<STATE = UpdateTable> {
@@ -65,8 +62,6 @@ pub enum PreparedTransactionCommitResult<STATE = UpdateTable> {
         prepared_transaction: Option<Box<PreparedTransaction<STATE>>>,
         /// The rejected target version.
         conflict_version: Version,
-        /// Saved winning history or the discovery error returned by the committer.
-        winning_history: WinningCommitHistory,
     },
     /// A temporary failure prevented the attempt from committing.
     Retryable {
@@ -89,40 +84,41 @@ pub enum PreparedTransactionCommitResult<STATE = UpdateTable> {
 /// Recovery must establish whether this attempt committed before submitting new actions. Relations
 /// are ordered, with CommitInfo first, and remain owned by the connector's scoped executor.
 #[derive(Debug)]
-pub struct SubmittedAttempt {
+pub struct CommitAttempt {
     version: Version,
     timestamp: i64,
     in_commit_timestamp: Option<i64>,
     actions: Vec<RelationRef>,
-    file_meta: Option<FileMeta>,
 }
 
 impl<STATE> PreparedTransaction<STATE> {
-    /// The proposed commit version. It changes only after an approved baseline change.
+    /// The proposed commit version.
     pub fn target_version(&self) -> Version {
         self.target_version
     }
 
     /// The original snapshot, when writing an existing table.
     pub fn read_snapshot(&self) -> Option<&SnapshotRef> {
-        self.transaction.read_snapshot_opt.as_ref()
+        self.state.read_snapshot_opt.as_ref()
     }
 
-    /// Prepared file and non-file actions. CommitInfo is finalized separately during `commit`.
+    /// Prepared file and non-file actions.
+    ///
+    /// CommitInfo and removal timestamps are finalized separately during `commit`.
     pub fn get_delta_actions(&self) -> &RelationRef {
-        &self.actions
+        &self.prepared_actions
     }
 
     /// The submitted attempt retained after an unknown outcome, otherwise `None`.
-    pub fn submitted_attempt(&self) -> Option<&SubmittedAttempt> {
-        self.submitted_attempt.as_ref()
+    pub fn unresolved_attempt(&self) -> Option<&CommitAttempt> {
+        self.unresolved_attempt.as_ref()
     }
 
     /// Checks and resolves against winning commits without discarding pending state on error.
     ///
     /// Returns [`KernelError::Unsupported`]; conflict checking and resolution are not implemented.
     /// Neither the baseline nor prepared actions are changed by this call.
-    pub fn rebase(&mut self, _winning_commits: &CommitRange) -> KernelResult<()> {
+    pub fn rebase(&mut self, _winning_commits: &WinningCommits) -> KernelResult<()> {
         Err(KernelError::unsupported(
             "Prepared transaction rebase is not implemented",
         ))
@@ -136,48 +132,82 @@ impl<STATE> PreparedTransaction<STATE> {
     ///
     /// Post-commit Snapshot construction errors propagate after the write has succeeded; they do
     /// not undo the commit or establish that resubmission is safe.
+    #[tracing::instrument(
+        parent = &self.state.span,
+        name = TRANSACTION_COMMIT_SPAN,
+        skip_all,
+        fields(
+            report,
+            operation_id = %self.state.operation_id,
+            is_catalog_managed = self.state.effective_table_config.is_catalog_managed(),
+            correlation_id = self.state.correlation_id.as_deref().unwrap_or(""),
+            commit_version = self.target_version,
+            num_add_files,
+            num_remove_files,
+            num_dv_updates,
+            add_files_bytes,
+            remove_files_bytes,
+            is_blind_append,
+            data_change,
+            operation,
+            prepare_duration_ns,
+            committer_duration_ns,
+            failure_reason,
+        ),
+        err
+    )]
     pub fn commit(
         mut self,
         engine: &dyn Engine,
         executor: &dyn ScopedPlanExecutor,
     ) -> KernelResult<PreparedTransactionCommitResult<STATE>> {
         require!(
-            self.submitted_attempt.is_none(),
+            self.unresolved_attempt.is_none(),
             KernelError::invalid_transaction_state(
                 "Resolve the previous unknown commit outcome before submitting another attempt"
             )
         );
         let started = Instant::now();
-        self.transaction.validate_operation_compatibility()?;
-        self.transaction.validate_commit()?;
-        validate_inputs(&self.transaction, executor)?;
-        let file_stats = summarize_files(&self.file_actions, executor)?;
-        self.transaction.commit_timestamp = current_time_ms()?;
-        let commit_info = self
-            .transaction
-            .prepare_nonfile_actions(engine)?
-            .kernel_commit_info;
-        let info = retain_small_actions(
+        self.state
+            .validate_operation_compatibility(&self.original_inputs)?;
+        self.state.validate_commit(&self.original_inputs)?;
+        validate_file_inputs(&self.state, &self.original_inputs, executor)?;
+        let file_stats = summarize_files(&self.prepared_actions, executor)?;
+        self.state.commit_timestamp = current_time_ms()?;
+        let commit_info = self.state.build_kernel_commit_info(engine)?;
+        let info = retain_nonfile_actions(
             executor,
             "commit-info",
             vec![("commitInfo", commit_info.clone().into())],
         )?;
-        let actions = vec![info, self.actions.clone()];
-        let commit_metadata = self.transaction.create_commit_metadata(
+        let attempt_actions = if self.original_inputs.has_removes() {
+            let plan = PlanBuilder::relation_source(self.prepared_actions.clone()).project_patch(
+                |patch| {
+                    patch.replace_expr_at(
+                        ["remove"],
+                        "deletionTimestamp",
+                        lit(self.state.commit_timestamp),
+                    )
+                },
+            )?;
+            executor.execute_and_retain("attempt-actions", plan.build()?)?
+        } else {
+            self.prepared_actions.clone()
+        };
+        let actions = vec![info, attempt_actions];
+        let commit_metadata = self.state.create_commit_metadata(
             self.target_version,
             commit_info.in_commit_timestamp,
-            self.non_file_actions.protocol.clone(),
-            self.non_file_actions.metadata.clone(),
-            self.non_file_actions.domain_metadata.clone(),
+            self.prepared_domain_metadata_actions.clone(),
         )?;
-        let crc_delta = self.transaction.build_crc_delta(
+        let crc_delta = self.state.build_crc_delta(
             file_stats.clone(),
             commit_info.clone(),
-            self.non_file_actions.domain_metadata.clone(),
-        )?;
+            self.prepared_domain_metadata_actions.clone(),
+        );
         let prepare_duration = started.elapsed();
         let committer_started = Instant::now();
-        let result = self.transaction.committer.commit_declarative(
+        let result = self.state.committer.commit_declarative(
             executor,
             Box::new(actions.clone().into_iter()),
             commit_metadata,
@@ -185,13 +215,13 @@ impl<STATE> PreparedTransaction<STATE> {
         let committer_duration = committer_started.elapsed();
         match result {
             Ok(CommitResponse::Committed { file_meta }) => {
-                self.transaction.record_commit_success_metrics(
+                self.state.record_commit_success_metrics(
                     &file_stats,
                     0,
                     prepare_duration,
                     committer_duration,
                 );
-                let committed = self.transaction.into_committed(
+                let committed = self.state.into_committed(
                     file_meta,
                     crc_delta,
                     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -199,37 +229,36 @@ impl<STATE> PreparedTransaction<STATE> {
                 )?;
                 Ok(PreparedTransactionCommitResult::Committed(committed))
             }
-            Ok(CommitResponse::Conflict { version, commits }) => {
+            Ok(CommitResponse::Conflict { version }) => {
                 require!(
                     version == self.target_version,
                     KernelError::internal_error(
                         "Committer returned a conflict for a different version"
                     )
                 );
-                let winning_history = WinningCommitHistory::new(
-                    self.transaction.effective_table_config.table_root(),
-                    version,
-                    commits,
-                );
+                tracing::Span::current()
+                    .record("failure_reason", CommitFailureReason::Conflict.as_ref());
                 Ok(PreparedTransactionCommitResult::Conflicted {
                     prepared_transaction: Some(Box::new(self)),
                     conflict_version: version,
-                    winning_history,
                 })
             }
             Ok(CommitResponse::Retryable { error }) => {
+                tracing::Span::current()
+                    .record("failure_reason", CommitFailureReason::RetryableIo.as_ref());
                 Ok(PreparedTransactionCommitResult::Retryable {
                     prepared_transaction: Some(Box::new(self)),
                     error,
                 })
             }
             Err(error) => {
-                self.submitted_attempt = Some(SubmittedAttempt {
+                tracing::Span::current()
+                    .record("failure_reason", CommitFailureReason::Unknown.as_ref());
+                self.unresolved_attempt = Some(CommitAttempt {
                     version: self.target_version,
-                    timestamp: self.transaction.commit_timestamp,
+                    timestamp: self.state.commit_timestamp,
                     in_commit_timestamp: commit_info.in_commit_timestamp,
                     actions,
-                    file_meta: None,
                 });
                 Ok(PreparedTransactionCommitResult::Unknown {
                     prepared_transaction: Some(Box::new(self)),
@@ -265,10 +294,10 @@ impl<STATE> PreparedTransactionCommitResult<STATE> {
         }
     }
 
-    /// Transfers pending work without discarding the outcome or saved history.
+    /// Transfers pending work without discarding the outcome.
     ///
     /// Returns `None` after success or if pending work was already taken. Take the transaction
-    /// before borrowing history to pass to `rebase`.
+    /// after loading history and before borrowing it again to pass to `rebase`.
     pub fn take_prepared_transaction(&mut self) -> Option<PreparedTransaction<STATE>> {
         match self {
             Self::Committed(_) => None,
@@ -292,27 +321,30 @@ impl<STATE> PreparedTransactionCommitResult<STATE> {
         self.take_prepared_transaction()
     }
 
-    /// Returns saved winning history without performing I/O.
+    /// Fetches winning commits for a conflict in one discovery attempt.
     ///
-    /// Returns `None` for non-conflicts. If discovery failed, returns the saved error; restart
-    /// from a fresh Snapshot and rebuild the transaction. Calls remain valid after pending work
-    /// is taken or dropped and never retry discovery.
-    pub fn get_winning_commits(&self) -> KernelResult<Option<&Arc<CommitRange>>> {
+    /// Returns `None` for non-conflicts. Each call fetches history and returns owned validated
+    /// history or an error without saving either on this result. A failed read preserves
+    /// pending work; another explicit call retries discovery without resubmitting the commit.
+    /// Fetch before taking pending work, which owns the committer. Calls after extraction return
+    /// [`KernelError::InvalidTransactionState`].
+    pub fn get_winning_commits(&self, engine: &dyn Engine) -> KernelResult<Option<WinningCommits>> {
         match self {
             Self::Conflicted {
-                winning_history, ..
-            } => winning_history.get().map(Some),
+                prepared_transaction,
+                conflict_version,
+            } => {
+                let prepared = prepared_transaction.as_deref().ok_or_else(|| {
+                    KernelError::invalid_transaction_state(
+                        "Cannot discover winning commits after taking the prepared transaction",
+                    )
+                })?;
+                prepared
+                    .state
+                    .get_winning_commits(engine, *conflict_version)
+                    .map(Some)
+            }
             _ => Ok(None),
-        }
-    }
-
-    /// Returns the saved history-load error without performing I/O.
-    pub fn winning_commits_error(&self) -> Option<&KernelError> {
-        match self {
-            Self::Conflicted {
-                winning_history, ..
-            } => winning_history.load_error(),
-            _ => None,
         }
     }
 
@@ -327,7 +359,7 @@ impl<STATE> PreparedTransactionCommitResult<STATE> {
     }
 }
 
-impl SubmittedAttempt {
+impl CommitAttempt {
     /// Version passed to the committer.
     pub fn version(&self) -> Version {
         self.version
@@ -344,59 +376,82 @@ impl SubmittedAttempt {
     pub fn actions(&self) -> &[RelationRef] {
         &self.actions
     }
-    /// Written commit file when the committer returned its location during outcome recovery.
-    pub fn file_meta(&self) -> Option<&FileMeta> {
-        self.file_meta.as_ref()
-    }
 }
 
 impl<STATE> Transaction<STATE, Declarative> {
     /// Ends input collection and transforms file metadata into retained Delta action rows.
     ///
-    /// Metadata reads use `engine`; all file-row transforms and checks use `executor`. CommitInfo
-    /// is created during the later commit attempt. Relations must remain available in this scope.
+    /// Metadata reads and file-row transforms use `executor`. CommitInfo is created during the
+    /// later commit attempt. Relations must remain available in this scope.
     ///
     /// Supports partitioned and unpartitioned adds/removes and metadata-only changes. Row tracking,
-    /// clustered file writes, DV updates, and adaptive metadata return Unsupported. Validation is
-    /// repeated by `PreparedTransaction::commit` before submission.
-    pub fn prepare(
+    /// clustered file writes, DV updates, adaptive metadata, and connector-provided CommitInfo
+    /// return Unsupported. Validation is repeated by `PreparedTransaction::commit` before
+    /// submission.
+    pub fn prepare_declarative(
         self,
-        engine: &dyn Engine,
         executor: &dyn ScopedPlanExecutor,
     ) -> KernelResult<PreparedTransaction<STATE>> {
-        self.validate_operation_compatibility()?;
-        self.validate_commit()?;
-        validate_supported(&self)?;
-        let target_version = match &self.read_snapshot_opt {
+        self.state
+            .validate_operation_compatibility(&self.staged_data_changes)?;
+        self.state.validate_commit(&self.staged_data_changes)?;
+        validate_declarative_support(&self.state, &self.staged_data_changes)?;
+        let target_version = match &self.state.read_snapshot_opt {
             Some(snapshot) => snapshot
                 .version()
                 .checked_add(1)
                 .ok_or_else(|| KernelError::invalid_transaction_state("Commit version overflow"))?,
             None => 0,
         };
-        let non_file_actions = PreparedNonFileActions {
-            protocol: self
-                .should_emit_protocol
-                .then(|| self.effective_table_config.protocol().clone()),
-            metadata: self
-                .should_emit_metadata
-                .then(|| self.effective_table_config.metadata().clone()),
-            domain_metadata: self.generate_domain_metadata_actions(engine, None)?,
-            set_transactions: self.set_transactions.clone(),
-        };
+        let prepared_domain_metadata_actions =
+            self.state
+                .generate_domain_metadata_actions_with(None, |domains| {
+                    self.state
+                        .read_snapshot()?
+                        .reader()
+                        .get_domain_metadatas_declarative(executor, domains)
+                })?;
+        let mut nonfile_actions = Vec::new();
+        if self.state.should_emit_protocol {
+            nonfile_actions.push((
+                "protocol",
+                self.state.effective_table_config.protocol().clone().into(),
+            ));
+        }
+        if self.state.should_emit_metadata {
+            nonfile_actions.push((
+                "metaData",
+                self.state.effective_table_config.metadata().clone().into(),
+            ));
+        }
+        nonfile_actions.extend(
+            prepared_domain_metadata_actions
+                .iter()
+                .cloned()
+                .map(|value| ("domainMetadata", value.into())),
+        );
+        nonfile_actions.extend(
+            self.state
+                .set_transactions
+                .iter()
+                .cloned()
+                .map(|value| ("txn", value.into())),
+        );
         let mut plans = Vec::new();
         for input in &self.staged_data_changes.add_files {
-            let (schema, expr) = build_add_action_projection(input.schema(), self.data_change)?;
+            let (schema, expr) =
+                build_add_action_projection(input.schema(), self.state.data_change)?;
             let source = PlanBuilder::relation_source(input.clone())
                 .project(expr, as_log_add_schema(schema))?;
             plans.push(normalize_actions(source)?);
         }
         for input in &self.staged_data_changes.remove_files {
+            let coalesce_stats_with_parsed = input.schema().contains("stats_parsed");
             let patch = build_remove_struct_patch(
-                self.commit_timestamp,
-                self.data_change,
+                self.state.commit_timestamp,
+                self.state.data_change,
                 &[],
-                false,
+                coalesce_stats_with_parsed,
                 false,
             )?;
             let source = PlanBuilder::relation_source(input.clone()).project(
@@ -405,75 +460,30 @@ impl<STATE> Transaction<STATE, Declarative> {
             )?;
             plans.push(normalize_actions(source)?);
         }
-        let file_plan = if plans.is_empty() {
-            PlanBuilder::values(get_commit_schema().clone(), vec![])?
-        } else {
-            PlanBuilder::union_all(plans)?
-        };
-        let file_actions =
-            executor.execute_and_retain("prepared-file-actions", file_plan.build()?)?;
-        let small_actions = non_file_actions.rows();
-        let small_ref = retain_small_actions(executor, "prepared-non-file-actions", small_actions)?;
-        let actions = executor.execute_and_retain(
-            "prepared-actions",
-            PlanBuilder::union_all([
-                PlanBuilder::relation_source(file_actions.clone()),
-                PlanBuilder::relation_source(small_ref),
-            ])?
-            .build()?,
-        )?;
+        plans.push(nonfile_actions_plan(nonfile_actions)?);
+        let prepared_actions = executor
+            .execute_and_retain("prepared-actions", PlanBuilder::union_all(plans)?.build()?)?;
         Ok(PreparedTransaction {
-            transaction: self,
+            state: self.state,
+            original_inputs: self.staged_data_changes,
+            _state: self._state,
             target_version,
-            file_actions,
-            actions,
-            non_file_actions,
-            submitted_attempt: None,
+            prepared_actions,
+            prepared_domain_metadata_actions,
+            unresolved_attempt: None,
         })
     }
 }
 
-#[derive(Debug)]
-struct PreparedNonFileActions {
-    protocol: Option<Protocol>,
-    metadata: Option<Metadata>,
-    domain_metadata: Vec<DomainMetadata>,
-    set_transactions: Vec<SetTransaction>,
-}
-
-impl PreparedNonFileActions {
-    fn rows(&self) -> Vec<(&'static str, Scalar)> {
-        self.protocol
-            .iter()
-            .cloned()
-            .map(|value| ("protocol", value.into()))
-            .chain(
-                self.metadata
-                    .iter()
-                    .cloned()
-                    .map(|value| ("metaData", value.into())),
-            )
-            .chain(
-                self.domain_metadata
-                    .iter()
-                    .cloned()
-                    .map(|value| ("domainMetadata", value.into())),
-            )
-            .chain(
-                self.set_transactions
-                    .iter()
-                    .cloned()
-                    .map(|value| ("txn", value.into())),
-            )
-            .collect()
-    }
-}
-
-fn retain_small_actions(
+fn retain_nonfile_actions(
     executor: &dyn ScopedPlanExecutor,
-    name: &str,
+    relation_name: &str,
     actions: Vec<(&str, Scalar)>,
 ) -> KernelResult<RelationRef> {
+    executor.execute_and_retain(relation_name, nonfile_actions_plan(actions)?.build()?)
+}
+
+fn nonfile_actions_plan(actions: Vec<(&str, Scalar)>) -> KernelResult<PlanBuilder> {
     let schema = get_commit_schema().clone();
     let rows = actions
         .into_iter()
@@ -490,15 +500,19 @@ fn retain_small_actions(
                 .collect()
         })
         .collect();
-    executor.execute_and_retain(name, PlanBuilder::values(schema, rows)?.build()?)
+    PlanBuilder::values(schema, rows)
 }
 
 fn normalize_actions(source: PlanBuilder) -> KernelResult<PlanBuilder> {
-    fn align(input: &StructType, output: &StructType, prefix: &[String]) -> Expression {
-        Expression::struct_from(output.fields().map(|field| {
-            let mut path = prefix.to_vec();
+    fn align(
+        input_schema: &StructType,
+        output_schema: &StructType,
+        parent_path: &[String],
+    ) -> Expression {
+        Expression::struct_from(output_schema.fields().map(|field| {
+            let mut path = parent_path.to_vec();
             path.push(field.name().to_string());
-            match (input.field(field.name()), field.data_type()) {
+            match (input_schema.field(field.name()), field.data_type()) {
                 (None, _) => null_lit(field.data_type().clone()),
                 (Some(input_field), DataType::Struct(target)) => match input_field.data_type() {
                     DataType::Struct(actual) => Expression::case_when(
@@ -518,21 +532,30 @@ fn normalize_actions(source: PlanBuilder) -> KernelResult<PlanBuilder> {
     source.project(expr, get_commit_schema().clone())
 }
 
-fn validate_supported<STATE>(txn: &Transaction<STATE, Declarative>) -> KernelResult<()> {
+fn validate_declarative_support(
+    transaction_state: &TransactionState,
+    original_inputs: &Declarative,
+) -> KernelResult<()> {
     require!(
-        !txn.staged_data_changes.has_dv_inputs(),
+        transaction_state.engine_commit_info.is_none(),
+        KernelError::unsupported("Declarative connector-provided CommitInfo is not implemented")
+    );
+    require!(
+        !original_inputs.has_dv_inputs(),
         KernelError::unsupported("Declarative DV updates are not implemented")
     );
-    if txn.has_data_file_actions() {
+    if original_inputs.has_data_file_actions() {
         require!(
-            !txn.effective_table_config
-                .is_feature_enabled(&TableFeature::RowTracking),
+            !transaction_state
+                .effective_table_config
+                .is_feature_supported(&TableFeature::RowTracking),
             KernelError::unsupported("Declarative row tracking is not implemented")
         );
     }
-    if txn.staged_data_changes.has_adds() {
+    if original_inputs.has_adds() {
         require!(
-            txn.physical_clustering_columns
+            transaction_state
+                .physical_clustering_columns
                 .as_ref()
                 .is_none_or(Vec::is_empty),
             KernelError::unsupported("Declarative clustered file writes are not implemented")
@@ -540,25 +563,26 @@ fn validate_supported<STATE>(txn: &Transaction<STATE, Declarative>) -> KernelRes
     }
     #[cfg(feature = "adaptive-metadata-in-dev")]
     require!(
-        !txn.is_adaptive_metadata_enabled(),
+        !transaction_state.is_adaptive_metadata_enabled(),
         KernelError::unsupported("Declarative adaptive metadata writes are not implemented")
     );
     Ok(())
 }
 
-fn validate_inputs<STATE>(
-    txn: &Transaction<STATE, Declarative>,
+fn validate_file_inputs(
+    transaction_state: &TransactionState,
+    original_inputs: &Declarative,
     executor: &dyn ScopedPlanExecutor,
 ) -> KernelResult<()> {
-    validate_supported(txn)?;
-    let partition_columns: Vec<_> = txn
+    validate_declarative_support(transaction_state, original_inputs)?;
+    let partition_columns: Vec<_> = transaction_state
         .effective_table_config
         .physical_partition_columns()
         .collect();
     let partition_count = i64::try_from(partition_columns.len())
         .map_err(|_| KernelError::internal_error("Partition column count exceeds LONG"))?;
     let mut paths = Vec::new();
-    for input in &txn.staged_data_changes.add_files {
+    for input in &original_inputs.add_files {
         let mut invalid = vec![
             Predicate::is_null(col!("path")),
             Predicate::eq(col!("path"), lit("")),
@@ -571,7 +595,10 @@ fn validate_inputs<STATE>(
                 lit(partition_count),
             ),
         ];
-        if txn.effective_table_config.requires_stats_num_records() {
+        if transaction_state
+            .effective_table_config
+            .requires_stats_num_records()
+        {
             invalid.push(Predicate::is_null(col!("stats.numRecords")));
             invalid.push(Predicate::lt(col!("stats.numRecords"), lit(0i64)));
         }
@@ -610,7 +637,7 @@ fn validate_inputs<STATE>(
             schema_ref! { nullable "path": STRING },
         )?);
     }
-    for input in &txn.staged_data_changes.remove_files {
+    for input in &original_inputs.remove_files {
         let invalid = Predicate::or_from([
             Predicate::is_null(col!("path")),
             Predicate::eq(col!("path"), lit("")),
@@ -623,8 +650,8 @@ fn validate_inputs<STATE>(
             PlanBuilder::relation_source(input.clone()).filter(invalid)?,
             "Invalid RemoveFile metadata or unsupported deletion vector",
         )?;
-        if txn.data_change
-            && txn
+        if transaction_state.data_change
+            && transaction_state
                 .effective_table_config
                 .is_feature_enabled(&TableFeature::AppendOnly)
         {
@@ -639,7 +666,7 @@ fn validate_inputs<STATE>(
             schema_ref! { nullable "path": STRING },
         )?);
     }
-    if !txn.skip_dedup_validation && !paths.is_empty() {
+    if !transaction_state.skip_dedup_validation && !paths.is_empty() {
         let duplicate_paths = PlanBuilder::union_all(paths)?
             .aggregate_by([column_name!("path")], |a| a.count_star())?
             .filter(Predicate::gt(col!("count"), lit(1i64)))?;

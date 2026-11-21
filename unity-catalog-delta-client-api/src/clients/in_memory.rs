@@ -159,14 +159,15 @@ impl UpdateTableClient for InMemoryUpdateTableClient {
     async fn get_commits(
         &self,
         _target: &TableIdentifier,
-        table_uuid: &str,
+        expected_table_uuid: &str,
     ) -> Result<CommitState> {
+        // This test registry uses UUID keys instead of resolving three-part catalog names.
         let tables = self.tables.read().unwrap();
         let table = tables
-            .get(table_uuid)
-            .ok_or_else(|| Error::TableNotFound(table_uuid.to_string()))?;
+            .get(expected_table_uuid)
+            .ok_or_else(|| Error::TableNotFound(expected_table_uuid.to_string()))?;
         Ok(CommitState {
-            table_uuid: table_uuid.to_string(),
+            table_uuid: expected_table_uuid.to_string(),
             latest_version: table.max_ratified_version,
             commits: table.catalog_commits.clone(),
         })

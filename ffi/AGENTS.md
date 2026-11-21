@@ -957,22 +957,23 @@ Declarative lifecycle (`declarative-plans`): configure the existing create/updat
 with `declarative_*_txn_add_files` / `declarative_update_table_txn_remove_files`, then consume the
 transaction with `declarative_*_txn_prepare(txn, scope, engine)`. Commit the returned
 `ExclusivePreparedTransaction` with `prepared_transaction_commit` and inspect its typed outcome.
-`prepared_transaction_commit_result_take_pending` transfers pending work exactly once, leaving the
-result's saved history or discovery error available.
-`prepared_transaction_commit_result_get_winning_commits` returns an independent SharedCommitRange
-or the saved error without I/O. Its engine argument supplies error allocation only. If initial
-discovery failed, restart from a fresh Snapshot and rebuild the transaction. Success, Retryable,
-and Unknown do not perform history discovery. Rebase returns Unsupported without consuming pending
-work. Free results, pending transactions, views, and range handles as documented.
+Call `prepared_transaction_commit_result_get_winning_commits` before taking pending work. It uses
+Engine for one discovery attempt per call and returns an owned descriptor collection or an error.
+Discovery after extraction returns InvalidTransactionState. The result saves neither history nor
+fetch errors. SharedWinningCommits handles own validated WinningCommits independently. Rebase remains Unsupported and
+preserves pending work. See [prepared lifecycle rustdoc](src/transaction/prepared/mod.rs) for outcome,
+handle-transfer, and cleanup contracts.
 
 Prepared/result handles retain a SharedScopedPlanExecutor; scope cleanup waits for all such owners.
 `get_scoped_plan_executor` registers execution, retention, and final cleanup callbacks. Relations
 carry an ID and schema; `new_relation_ref` does not retain rows. The host must reject foreign or
-expired identifiers. `get_declarative_committer` registers commit/publication services.
-Commit callbacks receive one borrowed descriptor slice and metadata; callback outputs transfer
-ownership. A conflict bundles a winning-range handle or its load error. There is no history-recovery
-callback; releasing pending work releases its committer independently of the saved result.
-Error messages and schema outputs use owned byte buffers with named cleanup.
+expired identifiers. `get_declarative_committer` registers submission, optional history discovery,
+and publication services. Submission callbacks receive ordered relation descriptors and return the
+rejected version on a conflict. History callbacks return validated version/LogPath descriptors.
+`create_winning_commits` validates the supplied table root, rejected version, observed end, and
+descriptors without I/O.
+Pending work owns the committer. See [committer rustdoc](src/transaction/committer.rs) for callback
+borrowing and output ownership. Error messages and schemas use owned buffers with named cleanup.
 
 Update operations, engine info, and `data_change` are required at construction and cannot be changed.
 `new_update_table_txn_builder` accepts a typed operation;

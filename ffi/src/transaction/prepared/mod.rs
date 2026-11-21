@@ -16,8 +16,8 @@ use super::committer::with_commit_relations;
 use super::{
     ExclusiveCommittedTransaction, ExclusiveCreateTableTransactionBuilder,
     ExclusiveUpdateTableTransactionBuilder, FfiCommitRelation, MutableCommitter,
+    SharedWinningCommits,
 };
-use crate::commit_range::SharedCommitRange;
 use crate::error::{ExternResult, FFIKernelError, IntoExternResult};
 use crate::handle::Handle;
 use crate::plans::scoped::{SharedRelationRef, SharedScopedPlanExecutor};
@@ -53,7 +53,7 @@ enum ResultState {
     Create(PreparedTransactionCommitResult<CreateTable>),
 }
 
-/// Owning result, including pending work, history cache, and the retained executor scope.
+/// Owning result, including pending work and the retained executor scope.
 pub struct FfiPreparedTransactionCommitResult {
     state: ResultState,
     executor: Arc<dyn ScopedPlanExecutor>,
@@ -104,7 +104,7 @@ pub struct PreparedTransactionError {
 
 /// Borrowed record of the exact submitted attempt retained after an unknown outcome.
 #[repr(C)]
-pub struct SubmittedAttemptView {
+pub struct CommitAttemptView {
     /// Submitted version.
     pub version: u64,
     /// CommitInfo timestamp.
@@ -116,7 +116,7 @@ pub struct SubmittedAttemptView {
 }
 
 /// Receives a submitted attempt for the duration of one call. Copy any values retained afterward.
-pub type SubmittedAttemptVisitor = extern "C" fn(NullableCvoid, SubmittedAttemptView);
+pub type CommitAttemptVisitor = extern "C" fn(NullableCvoid, CommitAttemptView);
 
 // These variants differ only in their table-type parameter; keep all ownership transitions shared.
 macro_rules! on_prepared {
@@ -224,6 +224,7 @@ pub unsafe extern "C" fn declarative_update_table_txn_remove_files(
 /// Consumes the transaction and prepares actions, retaining a reference to `executor` on success.
 ///
 /// Returns preparation/unsupported-feature errors through `engine`; no commit is submitted.
+/// Preparation I/O uses `executor`; `engine` supplies only error allocation.
 ///
 /// # Safety
 /// All handles must be valid. `txn` is consumed, including on error; `engine` and `executor` are
@@ -237,21 +238,20 @@ pub unsafe extern "C" fn declarative_update_table_txn_prepare(
     let txn = unsafe { *txn.into_inner() };
     let executor = unsafe { executor.clone_as_arc() };
     let engine = unsafe { engine.as_ref() };
-    let result = txn
-        .prepare(engine.engine().as_ref(), executor.as_ref())
-        .map(|p| {
-            Box::new(FfiPreparedTransaction {
-                state: PreparedState::Update(p),
-                executor,
-            })
-            .into()
-        });
+    let result = txn.prepare_declarative(executor.as_ref()).map(|p| {
+        Box::new(FfiPreparedTransaction {
+            state: PreparedState::Update(p),
+            executor,
+        })
+        .into()
+    });
     unsafe { result.into_extern_result(&engine) }
 }
 
 /// Consumes a create-table transaction and prepares actions, retaining `executor` on success.
 ///
 /// Returns validation errors through `engine`; no commit is submitted.
+/// Preparation I/O uses `executor`; `engine` supplies only error allocation.
 ///
 /// # Safety
 /// Handles must be valid. `txn` is consumed even on error; `executor` and `engine` are borrowed.
@@ -265,15 +265,13 @@ pub unsafe extern "C" fn declarative_create_table_txn_prepare(
     let txn = unsafe { *txn.into_inner() };
     let executor = unsafe { executor.clone_as_arc() };
     let engine = unsafe { engine.as_ref() };
-    let result = txn
-        .prepare(engine.engine().as_ref(), executor.as_ref())
-        .map(|p| {
-            Box::new(FfiPreparedTransaction {
-                state: PreparedState::Create(p),
-                executor,
-            })
-            .into()
-        });
+    let result = txn.prepare_declarative(executor.as_ref()).map(|p| {
+        Box::new(FfiPreparedTransaction {
+            state: PreparedState::Create(p),
+            executor,
+        })
+        .into()
+    });
     unsafe { result.into_extern_result(&engine) }
 }
 
@@ -281,8 +279,7 @@ pub unsafe extern "C" fn declarative_create_table_txn_prepare(
 ///
 /// Validation and post-commit Snapshot construction errors use `ExternResult`. A post-commit error
 /// does not undo the accepted write. Conflict, retryable, and unknown outcomes retain pending work.
-/// Confirmed conflicts attempt to save history before returning; load failure preserves the
-/// conflict. Other outcomes do not discover history.
+/// Winning history is discovered only when explicitly requested through the result getter.
 ///
 /// # Safety
 /// Handles must be valid. `prepared` is consumed including on validation error; `engine` is
@@ -326,10 +323,10 @@ pub unsafe extern "C" fn prepared_transaction_inspect(
 /// `prepared` must point to a valid borrowed handle. The visitor/context must remain valid for the
 /// call and must not unwind, mutate or free `prepared`, or retain borrowed slices after returning.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn prepared_transaction_visit_submitted_attempt(
+pub unsafe extern "C" fn prepared_transaction_visit_unresolved_attempt(
     prepared: *const Handle<ExclusivePreparedTransaction>,
     context: NullableCvoid,
-    visitor: SubmittedAttemptVisitor,
+    visitor: CommitAttemptVisitor,
 ) -> bool {
     on_prepared!(&unsafe { (&*prepared).as_ref() }.state, p => visit_attempt(p, context, visitor))
 }
@@ -375,7 +372,7 @@ pub unsafe extern "C" fn prepared_transaction_commit_result_pending(
     on_result!(&unsafe { (&*result).as_ref() }.state, r => r.get_prepared_transaction().map(prepared_view).into())
 }
 
-/// Transfers pending work while leaving saved history or its discovery error in `result`.
+/// Transfers pending work while leaving the outcome in `result`.
 ///
 /// Returns `None` after success or if already taken. The returned handle owns its executor scope.
 ///
@@ -401,24 +398,30 @@ pub unsafe extern "C" fn prepared_transaction_commit_result_take_pending(
         .into()
 }
 
-/// Returns saved winning history without performing I/O.
+/// Fetches winning history for a confirmed conflict, returning owned descriptors.
 ///
-/// Returns `None` for non-conflicts and the saved discovery error when history is unavailable.
-/// Repeated calls do not retry discovery. The returned range is independently owned; release it
-/// with `free_commit_range`. `engine` supplies error allocation only.
+/// Returns `None` for non-conflicts. Each call makes one discovery attempt without saving history
+/// or its error. Call again to retry a failed fetch while pending work remains. Discovery after
+/// pending extraction returns an error. Returned collections remain valid independently of pending
+/// work and the result. `engine` supplies discovery I/O and error allocation. Release each returned
+/// collection with `free_winning_commits`.
 ///
 /// # Safety
-/// `result` must point to a valid borrowed handle; `engine` is valid and borrowed.
+/// `result_ptr` must point to a valid borrowed handle; `engine` is valid and borrowed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn prepared_transaction_commit_result_get_winning_commits(
-    result: *const Handle<ExclusivePreparedTransactionCommitResult>,
+    result_ptr: *const Handle<ExclusivePreparedTransactionCommitResult>,
     engine: Handle<SharedExternEngine>,
-) -> ExternResult<OptionalValue<Handle<SharedCommitRange>>> {
-    let result = unsafe { (&*result).as_ref() };
+) -> ExternResult<OptionalValue<Handle<SharedWinningCommits>>> {
     let engine = unsafe { engine.as_ref() };
-    let history = on_result!(&result.state, r => r.get_winning_commits()
-        .map(|h| h.map(|range| range.clone().into()).into()));
-    unsafe { history.into_extern_result(&engine) }
+    let history_result = unsafe { result_ptr.as_ref() }
+        .ok_or_else(|| KernelError::generic("result must not be null"))
+        .and_then(|result_handle| {
+            let commit_result = unsafe { result_handle.as_ref() };
+            on_result!(&commit_result.state, outcome => outcome.get_winning_commits(engine.engine().as_ref())
+                .map(|history| history.map(|commits| Arc::new(commits).into()).into()))
+        });
+    unsafe { history_result.into_extern_result(&engine) }
 }
 
 /// Returns a retryable/unknown outcome error, without consuming pending work or performing I/O.
@@ -434,18 +437,6 @@ pub unsafe extern "C" fn prepared_transaction_commit_result_error(
         PreparedTransactionCommitResult::Retryable { error, .. } | PreparedTransactionCommitResult::Unknown { error, .. } => Some(error_view(error)).into(),
         _ => OptionalValue::None,
     })
-}
-
-/// Returns the last history-load error without performing I/O, including an eager load failure.
-///
-/// # Safety
-/// `result` must point to a valid borrowed handle. Release the returned error with
-/// `free_prepared_transaction_error`, if present.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn prepared_transaction_commit_result_history_error(
-    result: *const Handle<ExclusivePreparedTransactionCommitResult>,
-) -> OptionalValue<PreparedTransactionError> {
-    on_result!(&unsafe { (&*result).as_ref() }.state, r => r.winning_commits_error().map(error_view).into())
 }
 
 /// Consumes a successful result and returns the existing committed-transaction handle.
@@ -476,7 +467,7 @@ pub unsafe extern "C" fn prepared_transaction_commit_result_into_committed(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn prepared_transaction_rebase(
     prepared: *mut Handle<ExclusivePreparedTransaction>,
-    winners: Handle<SharedCommitRange>,
+    winners: Handle<SharedWinningCommits>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<bool> {
     let prepared = unsafe { (&mut *prepared).as_mut() };
@@ -498,7 +489,7 @@ pub unsafe extern "C" fn free_prepared_transaction(prepared: Handle<ExclusivePre
 /// Drops a result and any pending work it still owns.
 ///
 /// # Safety
-/// `result` must be valid and is consumed. Extracted transactions/ranges remain independently
+/// `result` must be valid and is consumed. Extracted transactions/collections remain independently
 /// owned.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_prepared_transaction_commit_result(
@@ -529,7 +520,7 @@ pub unsafe extern "C" fn free_declarative_create_table_txn(
     unsafe { txn.drop_handle() }
 }
 
-/// Releases an error returned by the outcome or history-error accessors.
+/// Releases an error returned by the outcome error accessor.
 ///
 /// # Safety
 /// `error.message` must be a valid owned buffer; this call consumes it.
@@ -543,7 +534,7 @@ fn prepared_view<S>(p: &PreparedTransaction<S>) -> PreparedTransactionView {
         target_version: p.target_version(),
         read_snapshot: p.read_snapshot().cloned().map(Into::into).into(),
         actions: Arc::new(p.get_delta_actions().clone()).into(),
-        has_unknown_attempt: p.submitted_attempt().is_some(),
+        has_unknown_attempt: p.unresolved_attempt().is_some(),
     }
 }
 
@@ -566,15 +557,15 @@ unsafe fn take_committer(
 fn visit_attempt<S>(
     prepared: &PreparedTransaction<S>,
     context: NullableCvoid,
-    visitor: SubmittedAttemptVisitor,
+    visitor: CommitAttemptVisitor,
 ) -> bool {
-    let Some(attempt) = prepared.submitted_attempt() else {
+    let Some(attempt) = prepared.unresolved_attempt() else {
         return false;
     };
     with_commit_relations(attempt.actions(), |actions| {
         visitor(
             context,
-            SubmittedAttemptView {
+            CommitAttemptView {
                 version: attempt.version(),
                 timestamp: attempt.timestamp(),
                 in_commit_timestamp: attempt.in_commit_timestamp().into(),

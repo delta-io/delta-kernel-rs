@@ -37,9 +37,8 @@ This excerpt shows the required methods. `commit()` and `publish()` perform I/O;
 
 1. **`commit()`** atomically commits the given actions at the version specified in
    `CommitMetadata`. Returns `CommitResponse::Committed` on success or
-   `CommitResponse::Conflict { version, commits }` if another writer already committed this
-   version. Bundle complete winning history in `commits`; if discovery fails, put the load error
-   in that field so the response still reports a confirmed conflict.
+   `CommitResponse::Conflict { version }` if another writer already committed this version.
+   Return the conflict without fetching history.
    Return `CommitResponse::Retryable { error }` for a temporary failure known to have
    prevented acceptance of the commit.
 
@@ -53,13 +52,16 @@ This excerpt shows the required methods. `commit()` and `publish()` perform I/O;
    server-side, in which case `publish()` only notifies the catalog; others use
    PUT-if-absent copies from the client.
 
-After a confirmed version conflict, the committer loads and bundles the history needed for conflict
-checking. Catalog committers combine published files with catalog-ratified commits and report a
-history-load error if any required version is missing. Kernel saves the bundled history or its
-error on the conflict result. `get_winning_commits()` returns only that saved range or error and
-performs no I/O. If discovery failed, load a fresh Snapshot and rebuild your transaction. Success,
-temporary rejection, and unknown outcomes skip discovery. The trait also provides an optional
-declarative commit method; see its rustdoc for the complete API.
+Implement [`Committer::get_winning_commits`](https://docs.rs/delta_kernel/latest/delta_kernel/committer/trait.Committer.html#method.get_winning_commits)
+to support explicit history requests after a confirmed conflict. Combine published files with
+catalog-ratified commits and return descriptors in ascending order without gaps. The shared
+[`list_published_commits_and_merge_ratified_tail`](https://docs.rs/delta_kernel/latest/delta_kernel/committer/fn.list_published_commits_and_merge_ratified_tail.html)
+helper combines these sources using Engine handlers.
+
+For a conflict, each `get_winning_commits(engine)` call fetches owned `WinningCommits` or returns an
+error; history and errors are not cached. Fetch before extracting pending work, which owns the
+committer. Other outcomes skip discovery. See the trait's rustdoc for the optional declarative
+commit method.
 
 ## CommitMetadata
 
@@ -178,10 +180,9 @@ shape:
 }
 ```
 
-Map your catalog's "another writer won this version" error to `CommitResponse::Conflict` and
-include the rejected version and a winning-history discovery result. Return the confirmed conflict
-even if loading history fails. Kernel saves the bundled history or discovery error; result getters
-perform no I/O. A failed discovery requires a fresh Snapshot and rebuilt transaction. Return
+Map your catalog's "another writer won this version" error to
+`CommitResponse::Conflict { version }`. History discovery is a separate service, invoked only
+when the connector requests it from the conflict result. Return
 `CommitResponse::Retryable { error }` for confirmed temporary failures, such as a connection failure
 before sending the request or a catalog rejection requiring outstanding commits to be published.
 The pending transaction can then retry the same version without rebasing. Retryable outcomes do

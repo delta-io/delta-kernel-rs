@@ -57,7 +57,7 @@ Result alias and public signature changes need doctests and user-guide example c
 addition to workspace checks. Root workspace commands exclude `datafusion-executor` and
 `integration-tests`. Validate those workspaces separately with their supported Arrow features.
 
-Transaction lifecycle checks should cover bundled history reads for both filesystem and UC
+Transaction lifecycle checks should cover explicit history fetches for both filesystem and UC
 committers. Live UC tests are ignored by default and require a separate server-backed run; a green
 workspace run does not verify the REST server's conflict error classification.
 

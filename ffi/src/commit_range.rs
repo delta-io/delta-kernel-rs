@@ -541,7 +541,7 @@ pub unsafe extern "C" fn free_commit_actions_iter(iter: Handle<SharedCommitActio
     unsafe { iter.drop_handle() }
 }
 
-/// A commit file passed to the [`commit_range_commit_files_next`] visitor.
+/// Borrowed commit version and file metadata for commit-range and winning-history APIs.
 ///
 /// The record, and the `location` string it references, are borrowed for the duration of the
 /// visitor call only. The engine must copy any value it retains before the visitor returns.

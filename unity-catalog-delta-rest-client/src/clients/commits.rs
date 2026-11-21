@@ -37,8 +37,9 @@ impl UpdateTableClient for UCUpdateTableRestClient {
     async fn get_commits(
         &self,
         target: &TableIdentifier,
-        _table_uuid: &str,
+        _expected_table_uuid: &str,
     ) -> unity_catalog_delta_client_api::Result<CommitState> {
+        // Resolve the name and preserve the actual UUID for UCCommitter's identity validation.
         let result: crate::error::Result<LoadTableResponse> = async {
             let path = table_path(&target.catalog, &target.schema, &target.table);
             let response = self
@@ -86,10 +87,10 @@ impl UpdateTableClient for UCUpdateTableRestClient {
 mod tests {
     use std::time::Duration;
 
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpSocket};
     use tokio::sync::oneshot;
-    use unity_catalog_delta_client_api::{DeltaTableRequirement, Error};
+    use unity_catalog_delta_client_api::{Commit, DeltaTableRequirement, Error};
 
     use super::*;
 
@@ -113,6 +114,98 @@ mod tests {
             .build()
             .unwrap();
         UCUpdateTableRestClient::with_http_client(http_client, config)
+    }
+
+    #[tokio::test]
+    async fn history_get_requires_observed_bound_and_preserves_identity_and_commit_descriptors() {
+        let expected_table_uuid = "expected-uuid";
+        for (latest_version, table_uuid) in [
+            (Some(7), expected_table_uuid),
+            (Some(7), "replacement-uuid"),
+            (None, expected_table_uuid),
+        ] {
+            let mut body = serde_json::json!({
+                "metadata": {
+                    "etag": "e1",
+                    "table-type": "MANAGED",
+                    "table-uuid": table_uuid,
+                    "location": "memory:///table/",
+                    "created-time": 1,
+                    "updated-time": 2,
+                    "columns": {"type": "struct", "fields": []},
+                    "properties": {},
+                    "last-commit-version": 5
+                },
+                "commits": [
+                    {
+                        "version": 7,
+                        "timestamp": 7000,
+                        "file-name": "00000000000000000007.uuid7.json",
+                        "file-size": 123,
+                        "file-modification-timestamp": 7001
+                    },
+                    {
+                        "version": 6,
+                        "timestamp": 6000,
+                        "file-name": "00000000000000000006.uuid6.json",
+                        "file-size": 456,
+                        "file-modification-timestamp": 6001
+                    }
+                ]
+            });
+            if let Some(version) = latest_version {
+                body["latest-table-version"] = serde_json::json!(version);
+            }
+            let body = body.to_string();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                assert!(std::str::from_utf8(&request).unwrap().starts_with(concat!(
+                    "GET /api/2.1/unity-catalog/delta/v1/catalogs/catalog/",
+                    "schemas/schema/tables/table HTTP/1.1\r\n",
+                )));
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+            let result = client(address)
+                .get_commits(
+                    &TableIdentifier::new("catalog", "schema", "table"),
+                    expected_table_uuid,
+                )
+                .await;
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            if let Some(version) = latest_version {
+                let state = result.unwrap();
+                assert_eq!(state.latest_version, version);
+                assert_eq!(state.table_uuid, table_uuid);
+                assert_eq!(
+                    state.commits,
+                    vec![
+                        Commit::new(7, 7000, "00000000000000000007.uuid7.json", 123, 7001),
+                        Commit::new(6, 6000, "00000000000000000006.uuid6.json", 456, 6001),
+                    ]
+                );
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(Error::Generic(message))
+                        if message == "Catalog commit-history response omitted latest-table-version"
+                ));
+            }
+        }
     }
 
     #[tokio::test]

@@ -224,7 +224,7 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     ) -> KernelResult<Transaction<UpdateTable, MODE>> {
         self.validate()?;
         let transaction = try_new_update_table(self, committer, engine)?;
-        transaction.validate_domain_metadata_operations()?;
+        transaction.state.validate_domain_metadata_operations()?;
         Ok(transaction)
     }
 
@@ -350,21 +350,20 @@ fn try_new_update_table<MODE: ExecutionMode>(
         None => effective_table_config,
     };
 
-    Ok(Transaction {
-        read_snapshot_opt: Some(read_snapshot),
-        should_emit_metadata,
-        user_domain_removals: domain_metadata_removals,
-        is_blind_append,
-        physical_clustering_columns: clustering_columns,
-        ..Transaction::new(
-            common_state,
-            effective_table_config,
-            committer,
-            operation.into(),
-            span,
-            commit_timestamp,
-        )
-    })
+    let mut transaction = Transaction::new(
+        common_state,
+        effective_table_config,
+        committer,
+        operation.into(),
+        span,
+        commit_timestamp,
+    );
+    transaction.state.read_snapshot_opt = Some(read_snapshot);
+    transaction.state.should_emit_metadata = should_emit_metadata;
+    transaction.state.user_domain_removals = domain_metadata_removals;
+    transaction.state.is_blind_append = is_blind_append;
+    transaction.state.physical_clustering_columns = clustering_columns;
+    Ok(transaction)
 }
 
 fn apply_schema_changes(
@@ -441,23 +440,23 @@ mod tests {
             .with_transaction_id("app", 7)
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
-        assert_eq!(transaction.operation, operation.into());
-        assert_eq!(transaction.engine_info, "test-engine");
+        assert_eq!(transaction.state.operation, operation.into());
+        assert_eq!(transaction.state.engine_info, "test-engine");
         assert_eq!(
-            transaction.operation_parameters.as_ref().unwrap()["mode"].as_deref(),
+            transaction.state.operation_parameters.as_ref().unwrap()["mode"].as_deref(),
             Some("Append")
         );
         assert_eq!(
-            transaction.operation_metrics.as_ref().unwrap()["numFiles"].as_deref(),
+            transaction.state.operation_metrics.as_ref().unwrap()["numFiles"].as_deref(),
             Some("3")
         );
-        assert_eq!(transaction.set_transactions[0].app_id, "app");
-        assert_eq!(transaction.set_transactions[0].version, 7);
+        assert_eq!(transaction.state.set_transactions[0].app_id, "app");
+        assert_eq!(transaction.state.set_transactions[0].version, 7);
         assert_eq!(
-            transaction.set_transactions[0].last_updated,
-            Some(transaction.commit_timestamp)
+            transaction.state.set_transactions[0].last_updated,
+            Some(transaction.state.commit_timestamp)
         );
-        assert!(transaction.data_change);
+        assert!(transaction.state.data_change);
         Ok(())
     }
 
@@ -474,16 +473,19 @@ mod tests {
             .with_operation_metrics([("second", Some("value"))])
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
-        assert_eq!(transaction.operation, UpdateTableOperation::Delete.into());
-        assert_eq!(transaction.engine_info, "second-engine");
-        assert!(transaction.correlation_id.is_none());
-        let parameters = transaction.operation_parameters.as_ref().unwrap();
+        assert_eq!(
+            transaction.state.operation,
+            UpdateTableOperation::Delete.into()
+        );
+        assert_eq!(transaction.state.engine_info, "second-engine");
+        assert!(transaction.state.correlation_id.is_none());
+        let parameters = transaction.state.operation_parameters.as_ref().unwrap();
         assert_eq!(parameters.len(), 1);
         assert_eq!(parameters["second"].as_deref(), Some("value"));
-        let metrics = transaction.operation_metrics.as_ref().unwrap();
+        let metrics = transaction.state.operation_metrics.as_ref().unwrap();
         assert_eq!(metrics.len(), 1);
         assert_eq!(metrics["second"].as_deref(), Some("value"));
-        assert!(transaction.data_change);
+        assert!(transaction.state.data_change);
         Ok(())
     }
 
@@ -533,15 +535,18 @@ mod tests {
         transaction = transaction.with_row_tracking_high_water_mark(17)?;
 
         assert_eq!(
-            transaction.correlation_id.as_deref(),
+            transaction.state.correlation_id.as_deref(),
             Some("correlation-id")
         );
-        assert!(!transaction.data_change);
-        assert!(transaction.column_defaults_acknowledged);
-        assert!(transaction.row_tracking_preservation_acknowledged);
-        assert_eq!(transaction.provided_row_tracking_high_water_mark, Some(17));
-        assert!(transaction.engine_commit_info.is_some());
-        assert!(transaction.user_domain_removals.is_empty());
+        assert!(!transaction.state.data_change);
+        assert!(transaction.state.column_defaults_acknowledged);
+        assert!(transaction.state.row_tracking_preservation_acknowledged);
+        assert_eq!(
+            transaction.state.provided_row_tracking_high_water_mark,
+            Some(17)
+        );
+        assert!(transaction.state.engine_commit_info.is_some());
+        assert!(transaction.state.user_domain_removals.is_empty());
         Ok(())
     }
 
@@ -604,12 +609,13 @@ mod tests {
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
         assert_eq!(
-            transaction.operation,
+            transaction.state.operation,
             UpdateTableOperation::AlterTable.into()
         );
-        assert!(transaction.should_emit_metadata);
+        assert!(transaction.state.should_emit_metadata);
         assert!(
             transaction
+                .state
                 .effective_table_config
                 .logical_schema()
                 .contains("new_column")
@@ -629,7 +635,7 @@ mod tests {
             .add_column(StructField::nullable("new_column", DataType::STRING))
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
-        assert!(transaction.should_emit_metadata);
+        assert!(transaction.state.should_emit_metadata);
         Ok(())
     }
 
@@ -778,11 +784,11 @@ mod tests {
             );
         } else {
             let transaction = result.expect("non-ALTER transactions do not require schema changes");
-            assert_eq!(transaction.operation, operation.into());
-            assert!(!transaction.should_emit_metadata);
-            assert!(!transaction.should_emit_protocol);
+            assert_eq!(transaction.state.operation, operation.into());
+            assert!(!transaction.state.should_emit_metadata);
+            assert!(!transaction.state.should_emit_protocol);
             assert_eq!(
-                transaction.effective_table_config.logical_schema(),
+                transaction.state.effective_table_config.logical_schema(),
                 snapshot.schema()
             );
         }
@@ -825,10 +831,10 @@ mod tests {
             assert!(matches!(&error, KernelError::Unsupported(message) if message == &expected));
         } else {
             let transaction = result.expect("supported schema changes must build successfully");
-            assert_eq!(transaction.operation, operation.into());
-            assert!(transaction.should_emit_metadata);
-            assert!(!transaction.should_emit_protocol);
-            let schema = transaction.effective_table_config.logical_schema();
+            assert_eq!(transaction.state.operation, operation.into());
+            assert!(transaction.state.should_emit_metadata);
+            assert!(!transaction.state.should_emit_protocol);
+            let schema = transaction.state.effective_table_config.logical_schema();
             if input == NonemptySchemaInput::AddColumn {
                 assert_eq!(
                     schema.field("added").unwrap().data_type(),
@@ -906,8 +912,8 @@ mod tests {
         let transaction = builder
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
             .expect("schema changes must build in call order");
-        assert!(transaction.should_emit_metadata);
-        let schema = transaction.effective_table_config.logical_schema();
+        assert!(transaction.state.should_emit_metadata);
+        let schema = transaction.state.effective_table_config.logical_schema();
         assert!(schema.contains("new_column"));
         assert!(schema.contains("another_column"));
     }
@@ -997,7 +1003,7 @@ mod tests {
             .add_column(StructField::nullable("new_column", DataType::STRING))
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
-        assert!(!transaction.data_change);
+        assert!(!transaction.state.data_change);
 
         let data = || {
             let values = Arc::new(Int32Array::from(vec![1; selection_vector.len()])) as ArrayRef;
@@ -1022,7 +1028,7 @@ mod tests {
                 }
             }
         }
-        assert!(!transaction.data_change);
+        assert!(!transaction.state.data_change);
         let error = transaction.commit(engine.as_ref()).unwrap_err();
         assert!(
             matches!(&error, KernelError::InvalidTransactionState(message)
@@ -1051,7 +1057,7 @@ mod tests {
             );
         } else {
             let transaction = result?;
-            assert!(!transaction.data_change);
+            assert!(!transaction.state.data_change);
             let snapshot = transaction.commit(&engine)?.unwrap_post_commit_snapshot();
             assert_eq!(snapshot.version(), version + 1);
             assert!(snapshot.schema().contains("new_column"));
@@ -1066,7 +1072,7 @@ mod tests {
             .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
             .add_column(StructField::nullable("new_column", DataType::STRING))
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
-        transaction.data_change = true;
+        transaction.state.data_change = true;
         let error = transaction.commit(engine.as_ref()).unwrap_err();
         assert!(
             matches!(&error, KernelError::InvalidTransactionState(message)
@@ -1089,7 +1095,7 @@ mod tests {
             .add_column(StructField::nullable("new_column", DataType::STRING))
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
-        assert_eq!(transaction.data_change, data_change);
+        assert_eq!(transaction.state.data_change, data_change);
 
         let values = Arc::new(Int32Array::from_iter_values([1])) as ArrayRef;
         transaction
@@ -1098,7 +1104,7 @@ mod tests {
             .push(Box::new(ArrowEngineData::new(
                 RecordBatch::try_from_iter([("value", values)]).map_err(KernelError::from)?,
             )));
-        assert_eq!(transaction.data_change, data_change);
+        assert_eq!(transaction.state.data_change, data_change);
         Ok(())
     }
 

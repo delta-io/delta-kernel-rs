@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use url::Url;
 
 use crate::actions::{DomainMetadata, Metadata, Protocol};
-use crate::commit_range::CommitRange;
+use crate::log_path::LogPath;
 use crate::path::LogRoot;
 #[cfg(any(test, feature = "test-utils"))]
 use crate::schema::schema_ref;
@@ -346,6 +346,17 @@ impl CommitMetadata {
     }
 }
 
+/// One accepted winning commit, identified by its version and actual log file location.
+///
+/// Catalog committers may return ratified staged files that have not yet been published.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WinningCommit {
+    /// The version accepted by the table.
+    pub version: Version,
+    /// The published or catalog-ratified staged commit file.
+    pub log_path: LogPath,
+}
+
 /// Outcome of an atomic commit attempt through a catalog or filesystem.
 ///
 /// A confirmed temporary rejection returns [`Self::Retryable`], allowing the same version to be
@@ -365,14 +376,6 @@ pub enum CommitResponse {
     Conflict {
         /// The rejected version.
         version: Version,
-        /// Complete winning history, or its load error without losing the confirmed conflict.
-        ///
-        /// The range contains ascending, contiguous individual commits from `version` through a
-        /// finite observed latest version. Missing commits produce a load error even if covered
-        /// by a checkpoint. Catalog committers merge published files with ratified catalog
-        /// commits. A failed load is preserved for inspection; restart the transaction to
-        /// obtain fresh history.
-        commits: KernelResult<CommitRange>,
     },
     /// A temporary failure prevented acceptance of this commit attempt.
     ///

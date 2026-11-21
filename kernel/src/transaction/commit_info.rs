@@ -100,7 +100,7 @@ impl<STATE> Transaction<STATE, Imperative> {
         engine: &dyn Engine,
         kernel_commit_info: CommitInfo,
     ) -> KernelResult<Box<dyn EngineData>> {
-        match &self.engine_commit_info {
+        match &self.state.engine_commit_info {
             Some((engine_commit_info, engine_commit_info_schema)) => {
                 require!(
                     engine_commit_info.len() == 1,

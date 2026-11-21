@@ -12,8 +12,8 @@ impl<S> Transaction<S, Declarative> {
     ///
     /// The expected schema for `add_metadata` is given by [`Transaction::add_files_schema`].
     /// The relation must remain available in the executor passed to
-    /// [`prepare`](Self::prepare) until all commit attempts finish. Staging does not
-    /// execute the relation or validate its rows.
+    /// [`prepare_declarative`](Self::prepare_declarative) until all commit attempts finish. Staging
+    /// does not execute the relation or validate its rows.
     pub fn add_files_ref(&mut self, add_metadata: RelationRef) {
         self.staged_data_changes.add_files.push(add_metadata);
     }
@@ -26,7 +26,7 @@ impl Transaction<UpdateTable, Declarative> {
     ///
     /// The expected schema for `remove_metadata` is given by
     /// [`scan_row_schema`]. The relation must contain only the rows selected for removal and remain
-    /// available in the executor passed to [`prepare`](Self::prepare) until
+    /// available in the executor passed to [`prepare_declarative`](Self::prepare_declarative) until
     /// commit completes. Staging does not execute the relation or validate its rows.
     pub fn remove_files_ref(&mut self, remove_metadata: RelationRef) {
         self.staged_data_changes.remove_files.push(remove_metadata);
@@ -46,7 +46,7 @@ impl Transaction<UpdateTable, Declarative> {
     ///   `stats.numRecords` value.
     ///
     /// Both relations must remain available in the executor passed to
-    /// [`prepare`](Self::prepare) until all commit attempts finish.
+    /// [`prepare_declarative`](Self::prepare_declarative) until all commit attempts finish.
     pub fn update_deletion_vectors_ref(
         &mut self,
         new_dv_descriptors: RelationRef,

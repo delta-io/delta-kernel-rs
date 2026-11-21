@@ -178,7 +178,7 @@ pub struct ModeSelectionRequiresDeclarativePlans;
 ///         .build(engine, Box::new(FileSystemCommitter::new()))?;
 ///     txn.add_files_ref(adds);
 ///     txn.remove_files_ref(removes);
-///     txn.prepare(engine, executor)?.commit(engine, executor)
+///     txn.prepare_declarative(executor)?.commit(engine, executor)
 /// }
 /// ```
 #[cfg(feature = "declarative-plans")]
@@ -205,11 +205,36 @@ pub struct DeclarativeCommit;
 ///         .with_table_properties([("app.version", "1")])
 ///         .build(engine, Box::new(FileSystemCommitter::new()))?;
 ///     txn.add_files_ref(adds);
-///     txn.prepare(engine, executor)?.commit(engine, executor)
+///     txn.prepare_declarative(executor)?.commit(engine, executor)
 /// }
 /// ```
 #[cfg(feature = "declarative-plans")]
 pub struct DeclarativeCreateTableCommit;
+
+/// Winning commits are fetched explicitly and returned as owned validated history.
+///
+/// A failed load leaves the transaction available; calling the getter again retries discovery.
+///
+/// ```no_run
+/// use delta_kernel::transaction::{PreparedTransaction, PreparedTransactionCommitResult};
+/// use delta_kernel::{Engine, KernelResult};
+///
+/// fn inspect_conflict(
+///     result: &mut PreparedTransactionCommitResult,
+///     engine: &dyn Engine,
+/// ) -> KernelResult<Option<PreparedTransaction>> {
+///     let Some(commits) = result.get_winning_commits(engine)? else {
+///         return Ok(None);
+///     };
+///     let Some(pending) = result.take_prepared_transaction() else {
+///         return Ok(None);
+///     };
+///     assert_eq!(commits.first().map(|commit| commit.version), Some(pending.target_version()));
+///     Ok(Some(pending))
+/// }
+/// ```
+#[cfg(feature = "declarative-plans")]
+pub struct DeclarativeConflictDiscovery;
 
 /// Declarative transactions cannot invoke the imperative commit path.
 ///
@@ -364,7 +389,7 @@ pub struct ImperativeCannotUpdateDeletionVectorsRef;
 ///     engine: &dyn delta_kernel::Engine,
 ///     executor: &dyn ScopedPlanExecutor,
 /// ) {
-///     txn.prepare(engine, executor);
+///     txn.prepare_declarative(executor);
 /// }
 /// ```
 #[cfg(feature = "declarative-plans")]
@@ -383,7 +408,7 @@ pub struct ImperativeTxnWithDeclarativePrepare;
 ///     executor: &dyn ScopedPlanExecutor,
 ///     adds: RelationRef,
 /// ) -> KernelResult<()> {
-///     let prepared = txn.prepare(engine, executor)?;
+///     let prepared = txn.prepare_declarative(executor)?;
 ///     txn.add_files_ref(adds);
 ///     Ok(())
 /// }
