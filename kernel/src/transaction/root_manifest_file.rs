@@ -108,7 +108,6 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::schema::schema_ref;
     use crate::snapshot::Snapshot;
-    use crate::transaction::UpdateTableOperation;
     use crate::transaction::create_table::create_table;
     use crate::unit_test_utils::adaptive_metadata_fixtures::{
         adaptive_metadata_protocol_and_metadata, domain, domain_metadata_line,
@@ -117,8 +116,8 @@ mod tests {
         write_txn_sidecar,
     };
     use crate::unit_test_utils::{
-        MockTableConfigurationBuilder, assert_result_error_with_message, parse_json_batch,
-        string_array_to_engine_data,
+        MockTableConfigurationBuilder, assert_result_error_with_message, commit_on_latest,
+        parse_json_batch, string_array_to_engine_data,
     };
     use crate::{KernelResult, Result, create_row};
 
@@ -268,17 +267,17 @@ mod tests {
         if txns.is_empty() && domains.is_empty() {
             return Ok(());
         }
-        let snapshot = Snapshot::builder_for(table_root.clone()).build(engine)?;
-        let mut txn = snapshot
-            .update_table(UpdateTableOperation::Write, "test", true)
-            .build(engine, Box::new(FileSystemCommitter::new()))?;
-        for set_transaction in txns {
-            txn = txn.with_transaction_id(set_transaction.app_id.clone(), set_transaction.version);
-        }
-        for dm in domains {
-            txn = txn.with_domain_metadata(dm.domain().to_string(), dm.configuration().to_string());
-        }
-        txn.commit(engine)?.unwrap_committed();
+        commit_on_latest(engine, table_root, |mut txn| {
+            for set_transaction in txns {
+                let app_id = set_transaction.app_id.clone();
+                txn = txn.with_transaction_id(app_id, set_transaction.version);
+            }
+            for dm in domains {
+                let (domain, configuration) = (dm.domain(), dm.configuration());
+                txn = txn.with_domain_metadata(domain.to_string(), configuration.to_string());
+            }
+            Ok(txn)
+        })?;
         Ok(())
     }
 
@@ -479,7 +478,7 @@ mod tests {
         Ok(())
     }
 
-    /// Which kinds a [`compute_checkpoint_action_inlines_sidecar_entries`] row changes.
+    /// Which kinds run a [`compute_checkpoint_action_inlines_sidecar_entries`] row.
     #[derive(Clone, Copy, PartialEq)]
     enum Changed {
         Txns,
@@ -589,7 +588,6 @@ mod tests {
         sidecars: &'static [&'static [&'static str]],
         logged: &'static [&'static str],
         changed: &'static [&'static str],
-        /// The (key, value) pairs the new checkpoint action holds inline.
         expected_inline: &'static [(&'static str, i64)],
     }
 
@@ -599,8 +597,7 @@ mod tests {
     const LOGGED: i64 = 2;
     const CHANGED: i64 = 3;
 
-    /// The row a kind runs when the case doesn't change it: existing entries only, nothing logged
-    /// or changed.
+    /// Used for a kind the case doesn't change: existing entries only.
     const UNTOUCHED: SidecarRow = SidecarRow {
         before: &[],
         inline: &["untouched"],
@@ -608,6 +605,21 @@ mod tests {
         logged: &[],
         changed: &[],
         expected_inline: &[("untouched", EXISTING), ("untouched-spilled", EXISTING)],
+    };
+
+    /// The action most cases start from: `inline` inline and `kept`/`spilled` in one sidecar, with
+    /// nothing logged or changed.
+    const BASE: SidecarRow = SidecarRow {
+        before: &[],
+        inline: &["inline"],
+        sidecars: &[&["kept", "spilled"]],
+        logged: &[],
+        changed: &[],
+        expected_inline: &[
+            ("inline", EXISTING),
+            ("kept", EXISTING),
+            ("spilled", EXISTING),
+        ],
     };
 
     /// The `T` side of a row: the lines logged before the action, the entries logged after it,
@@ -655,52 +667,48 @@ mod tests {
 
     // `compute_checkpoint_action` writes every live entry inline and no sidecars. Each entry takes
     // its newest value: this transaction's change, then a commit after the action, then the action
-    // itself; commits before the action are ignored. Each row runs for txns, domains, or both; a
-    // kind the row doesn't change runs `UNTOUCHED`.
+    // itself; commits before the action are ignored.
     #[rstest]
-    #[case::unchanged(SidecarRow {
-        before: &[], inline: &["inline"], sidecars: &[&["kept", "spilled"]], logged: &[],
-        changed: &[],
-        expected_inline: &[("inline", EXISTING), ("kept", EXISTING), ("spilled", EXISTING)],
-    })]
+    #[case::unchanged(BASE)]
     #[case::inline_changed(SidecarRow {
-        before: &[], inline: &["inline"], sidecars: &[&["kept", "spilled"]], logged: &[],
         changed: &["inline"],
         expected_inline: &[("inline", CHANGED), ("kept", EXISTING), ("spilled", EXISTING)],
+        ..BASE
     })]
     #[case::inline_logged(SidecarRow {
-        before: &[], inline: &["inline"], sidecars: &[&["kept", "spilled"]], logged: &["inline"],
-        changed: &[],
+        logged: &["inline"],
         expected_inline: &[("inline", LOGGED), ("kept", EXISTING), ("spilled", EXISTING)],
+        ..BASE
     })]
     #[case::transaction_overrides_log_commit(SidecarRow {
-        before: &[], inline: &["inline"], sidecars: &[&["kept", "spilled"]], logged: &["inline"],
+        logged: &["inline"],
         changed: &["inline"],
         expected_inline: &[("inline", CHANGED), ("kept", EXISTING), ("spilled", EXISTING)],
+        ..BASE
     })]
     #[case::new_entry(SidecarRow {
-        before: &[], inline: &["inline"], sidecars: &[&["kept", "spilled"]], logged: &[],
         changed: &["new"],
         expected_inline: &[
             ("inline", EXISTING), ("kept", EXISTING), ("new", CHANGED), ("spilled", EXISTING),
         ],
+        ..BASE
     })]
     #[case::logged_new_entry(SidecarRow {
-        before: &[], inline: &["inline"], sidecars: &[&["kept", "spilled"]], logged: &["new"],
-        changed: &[],
+        logged: &["new"],
         expected_inline: &[
             ("inline", EXISTING), ("kept", EXISTING), ("new", LOGGED), ("spilled", EXISTING),
         ],
+        ..BASE
     })]
     #[case::sidecar_entry(SidecarRow {
-        before: &[], inline: &["inline"], sidecars: &[&["kept", "spilled"]], logged: &[],
         changed: &["spilled"],
         expected_inline: &[("inline", EXISTING), ("kept", EXISTING), ("spilled", CHANGED)],
+        ..BASE
     })]
     #[case::logged_sidecar_entry(SidecarRow {
-        before: &[], inline: &["inline"], sidecars: &[&["kept", "spilled"]], logged: &["spilled"],
-        changed: &[],
+        logged: &["spilled"],
         expected_inline: &[("inline", EXISTING), ("kept", EXISTING), ("spilled", LOGGED)],
+        ..BASE
     })]
     #[case::logged_before_action(SidecarRow {
         before: &["stale"], inline: &["inline"], sidecars: &[&["kept"]], logged: &["logged"],
@@ -721,13 +729,20 @@ mod tests {
         #[values(Changed::Txns, Changed::Domains, Changed::Both)] changed: Changed,
     ) -> Result<()> {
         let (engine, table_root) = setup_table()?;
-        let (txns_change, domains_change) = (changed != Changed::Domains, changed != Changed::Txns);
         // Entries logged before the action share one commit at version 1.
         let manifest_version = if row.before.is_empty() { 1 } else { 2 };
         let path = format!("metadata/root-v{manifest_version}.parquet");
         let mut existing = minimal_checkpoint_action(&path, manifest_version)?;
-        let txn_row = if txns_change { row } else { UNTOUCHED };
-        let domain_row = if domains_change { row } else { UNTOUCHED };
+        let txn_row = if changed == Changed::Domains {
+            UNTOUCHED
+        } else {
+            row
+        };
+        let domain_row = if changed == Changed::Txns {
+            UNTOUCHED
+        } else {
+            row
+        };
         let txns: KindSetup<SetTransaction> = txn_row.setup(&engine, &table_root, &mut existing);
         let domains: KindSetup<DomainMetadata> =
             domain_row.setup(&engine, &table_root, &mut existing);

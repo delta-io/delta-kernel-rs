@@ -52,7 +52,9 @@ use crate::table_properties::{
     ENABLE_ROW_TRACKING,
 };
 use crate::transaction::create_table::create_table;
-use crate::transaction::{BASE_ADD_FILES_SCHEMA, CreateTable, Transaction};
+use crate::transaction::{
+    BASE_ADD_FILES_SCHEMA, CommittedTransaction, CreateTable, Transaction, UpdateTableOperation,
+};
 use crate::{
     Engine, EngineData, FileMeta, KernelError, KernelResult, Result, Snapshot, SnapshotRef, Version,
 };
@@ -397,6 +399,20 @@ pub(crate) fn action_batch() -> Box<dyn EngineData> {
 /// `txn`-typed and one `domainMetadata`-typed sidecar. The checkpoint row is surrounded by
 /// non-checkpoint action rows so the outer `CheckpointVisitor` must skip other rows in the
 /// batch and locate the checkpoint action among them.
+/// Commits a write transaction on the latest snapshot of the table at `table_root`, after
+/// `configure` adds its actions.
+pub(crate) fn commit_on_latest(
+    engine: &dyn Engine,
+    table_root: impl AsRef<str>,
+    configure: impl FnOnce(Transaction) -> KernelResult<Transaction>,
+) -> Result<CommittedTransaction> {
+    let transaction = Snapshot::builder_for(table_root)
+        .build(engine)?
+        .update_table(UpdateTableOperation::Write, "test", true)
+        .build(engine, Box::new(FileSystemCommitter::new()))?;
+    Ok(configure(transaction)?.commit(engine)?.unwrap_committed())
+}
+
 #[cfg(feature = "adaptive-metadata-in-dev")]
 pub(crate) fn checkpoint_action_batch() -> Box<dyn EngineData> {
     let json_strings: StringArray = vec![
