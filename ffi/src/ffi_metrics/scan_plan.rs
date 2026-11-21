@@ -11,9 +11,6 @@ use crate::delta_types::{FfiColumnName, FfiColumnNameArray};
 use crate::scan::{FfiPartitionValuesOptions, FfiStatsOptions};
 use crate::{FfiSlice, KernelStringSlice, NullableCvoid, OptionalValue, kernel_string_slice};
 
-/// Layout version of the scan-plan metric and its nested records.
-pub const SCAN_PLAN_GENERATION_METRIC_VERSION: u32 = 4;
-
 /// Result of scan-plan generation.
 ///
 /// cbindgen:prefix-with-name=true

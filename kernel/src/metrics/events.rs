@@ -25,7 +25,7 @@ use tracing::span::Attributes;
 use tracing::warn;
 use uuid::Uuid;
 
-use super::{ScanPlanOutcome, ScanPlanReport};
+use super::ScanPlanReport;
 use crate::log_segment::LogSegment;
 
 // ====================================================================
@@ -277,10 +277,6 @@ impl MetricEvent {
     /// Marks a lifecycle event as failed when its span errors.
     pub(crate) fn into_failure(self) -> Self {
         match self {
-            Self::ScanPlanGenerationCompleted(mut report) => {
-                report.outcome = ScanPlanOutcome::Error;
-                Self::ScanPlanGenerationFailed(report)
-            }
             Self::LogSegmentLoadSuccess(e) => Self::LogSegmentLoadFailure(LogSegmentLoadFailure {
                 operation_id: e.operation_id,
                 table_type: e.table_type,
@@ -352,6 +348,7 @@ impl MetricEvent {
             | Self::JsonReadCompleted(_)
             | Self::ParquetReadCompleted(_)
             | Self::ScanMetadataCompleted(_)
+            | Self::ScanPlanGenerationCompleted(_)
             | Self::ScanPlanGenerationFailed(_)
             | Self::StorageListCompleted(_)
             | Self::StorageReadCompleted(_)

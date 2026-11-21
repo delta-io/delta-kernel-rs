@@ -78,9 +78,8 @@ impl ReportGeneratorLayer {
     #[allow(dead_code, reason = "Used by scan planning.")]
     pub(crate) fn current_reporter() -> Option<Arc<dyn MetricsReporter>> {
         tracing::dispatcher::get_default(|dispatch| {
-            dispatch
-                .downcast_ref::<Self>()
-                .map(|layer| layer.reporter.clone())
+            let layer = dispatch.downcast_ref::<Self>()?;
+            Some(layer.reporter.clone())
         })
     }
 
