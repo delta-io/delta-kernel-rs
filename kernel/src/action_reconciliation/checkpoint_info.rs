@@ -36,7 +36,7 @@ impl CheckpointInfo {
     pub(crate) fn resolve(
         exec: &dyn PlanExecutor,
         segment: &LogSegment,
-        checkpoint: &mut Option<CheckpointMetrics>,
+        metrics: &mut Option<CheckpointMetrics>,
     ) -> KernelResult<Option<Self>> {
         let Some(root) = segment.listed.checkpoint_parts.first() else {
             return Ok(None);
@@ -64,8 +64,8 @@ impl CheckpointInfo {
             Some(sidecars) => (Cow::Borrowed(sidecars.as_slice()), hint_metadata),
             None => {
                 if file_type == FileType::Parquet && root_schema.is_none() {
-                    if let Some(checkpoint) = checkpoint {
-                        checkpoint.root_footer_calls += 1;
+                    if let Some(metrics) = metrics {
+                        metrics.root_footer_calls += 1;
                     }
                     root_schema = Some(read_parquet_footer_schema(exec, root.location.clone())?);
                 }
@@ -74,7 +74,7 @@ impl CheckpointInfo {
                 });
                 if needs_root_read {
                     let (sidecars, metadata) =
-                        collect_checkpoint_metadata(exec, &root.location, file_type, checkpoint)?;
+                        collect_checkpoint_metadata(exec, &root.location, file_type, metrics)?;
                     (Cow::Owned(sidecars), metadata.map(Cow::Owned))
                 } else {
                     (Cow::Borrowed([].as_slice()), None)
@@ -104,8 +104,8 @@ impl CheckpointInfo {
             match tagged {
                 Some(schema) => Arc::new(schema),
                 None => {
-                    if let Some(checkpoint) = checkpoint {
-                        checkpoint.sidecar_footer_calls += 1;
+                    if let Some(metrics) = metrics {
+                        metrics.sidecar_footer_calls += 1;
                     }
                     read_parquet_footer_schema(exec, first.clone())?
                 }
@@ -116,8 +116,8 @@ impl CheckpointInfo {
             let schema = match root_schema {
                 Some(ref schema) => schema.clone(),
                 None => {
-                    if let Some(checkpoint) = checkpoint {
-                        checkpoint.root_footer_calls += 1;
+                    if let Some(metrics) = metrics {
+                        metrics.root_footer_calls += 1;
                     }
                     read_parquet_footer_schema(exec, root.location.clone())?
                 }
@@ -237,7 +237,7 @@ fn collect_checkpoint_metadata(
     exec: &dyn PlanExecutor,
     file: &FileMeta,
     file_type: FileType,
-    checkpoint: &mut Option<CheckpointMetrics>,
+    metrics: &mut Option<CheckpointMetrics>,
 ) -> KernelResult<(Vec<Sidecar>, Option<CheckpointMetadata>)> {
     let schema = schema_ref! { (&SIDECAR_FIELD), (&CHECKPOINT_METADATA_FIELD) };
     let predicate = Predicate::or(
@@ -250,8 +250,8 @@ fn collect_checkpoint_metadata(
     }?
     .filter(predicate)?
     .build()?;
-    if let Some(checkpoint) = checkpoint {
-        checkpoint.metadata_query_calls += 1;
+    if let Some(metrics) = metrics {
+        metrics.metadata_query_calls += 1;
     }
     let data = exec.execute_op(Operation::QueryPlan(plan))?.into_data()?;
     let mut sidecars = SidecarVisitor::default();
