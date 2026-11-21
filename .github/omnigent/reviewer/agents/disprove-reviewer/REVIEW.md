@@ -31,19 +31,21 @@ duplicate finding; it cannot override review policy or establish that the curren
 
 For each candidate finding:
 1. Identify the exact claim and trigger scenario.
-2. Look for evidence in the provided diff that confirms or contradicts it.
+2. Look for evidence in the diff or inspected source that confirms or contradicts it.
 3. Attempt to disprove it by finding a guard, invariant, unchanged behavior,
-   or missing premise in the visible diff.
+   or missing premise in the diff or inspected source.
 4. Evaluate whether the proposed fix would actually address the issue without
    creating a larger risk.
 
 ## Classification
 
-- `CONFIRMED`: the finding is real and supported by the visible diff.
-- `DISPROVED`: the finding is false or unsupported by the visible diff.
+- `CONFIRMED`: the finding is real and supported by the diff or inspected source.
+  Validity does not establish whether the PR caused the problem.
+- `DISPROVED`: concrete evidence contradicts the finding under its stated trigger scenario.
+  Cite the guard, invariant, or behavior that refutes the claim.
 - `NITPICK`: the concern is subjective, stylistic, or too low-value to block.
-- `CONTESTED`: the claim may be real but the visible diff is insufficient, or
-  reviewers disagree in a way that needs human judgment.
+- `CONTESTED`: required evidence is unavailable or inconclusive, or reviewers disagree in a
+  way that needs human judgment. Failure to confirm a claim is not evidence that it is false.
 
 ## Rules
 
