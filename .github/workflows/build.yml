@@ -107,12 +107,10 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install AI reviewer config test dependencies
-        run: python3 -m pip install --no-deps PyYAML==6.0.3
+        run: python3 -m pip install PyYAML==6.0.3 pytest==8.3.5
       - name: Validate AI reviewer config
         run: >-
-          python3 -m unittest discover
-          --start-directory .github/omnigent/tests
-          --pattern 'test_*.py'
+          python3 -m pytest -q .github/omnigent/tests
 
   format:
     runs-on: ubuntu-latest

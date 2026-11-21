@@ -7,6 +7,16 @@ CI review behavior.
 To run a reviewer locally, load its `config.yaml` bundle and provide the PR metadata and diff as
 review context.
 
+For a stacked PR, keep its generated stack list up to date, including a link to its immediate
+parent PR. If review scope resolution stops, check the neutral PR check for the reason, refresh
+the description or synchronize the stack, and retry. See
+[`resolve_review_base`](../review_scope.py) for the boundary selection rules. Published scoped
+reviews identify their reviewed commit range.
+
+Inline publication validates positions against GitHub's PR diff. LEFT-side findings stay in the
+collapsed review when that file's scoped and GitHub diff sections differ. If GitHub rejects an
+inline review, the fallback comment retains the findings intended for inline publication.
+
 Each published inline finding includes feedback instructions: react 👍 for helpful or 👎 for
 unhelpful or incorrect, or 👀 for out of scope. Feedback remains
 on the comment for manual review and prompt tuning; the workflow does not automatically consume
