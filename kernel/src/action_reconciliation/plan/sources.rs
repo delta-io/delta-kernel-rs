@@ -7,6 +7,8 @@ use crate::actions::{ADD_NAME, Add, LOG_ADD_SCHEMA};
 use crate::checkpoint::{CheckpointInfo, CheckpointKind};
 use crate::expressions::{column_name, lit};
 use crate::log_segment::LogSegment;
+use crate::metrics::MetadataPlanReport;
+use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::plans::ir::nodes::{FileType, ScanFile};
 use crate::schema::{DataType, SchemaRef, StructField};
 use crate::{KernelError, KernelResult, PlanBuilder, Version};
@@ -94,6 +96,7 @@ pub(crate) fn commit_arm(
     base_version: Option<Version>,
     schema: SchemaRef,
     use_compactions: bool,
+    report: &mut MetadataPlanReport,
 ) -> KernelResult<PlanBuilder> {
     let commit_files = match base_version {
         Some(version) => log_segment
@@ -101,6 +104,24 @@ pub(crate) fn commit_arm(
             .commit_cover_version_tagged_scan_files(use_compactions)?,
         None => log_segment.commit_cover_version_tagged_scan_files(use_compactions)?,
     };
+    // The selected commit cover is newest first.
+    for file in &commit_files {
+        let Some(path) = ParsedLogPath::new(file.meta.location.clone()) else {
+            continue;
+        };
+        let end = match path.file_type {
+            LogPathFileType::CompactedCommit { hi } => {
+                report.compaction_file_count += 1;
+                hi
+            }
+            _ => path.version,
+        };
+        report.commit_start_version = Some(path.version);
+        report.commit_end_version.get_or_insert(end);
+        report.commit_total_size_bytes = report
+            .commit_total_size_bytes
+            .saturating_add(file.meta.size);
+    }
     PlanBuilder::scan_json(commit_files, &[VERSION], schema)
 }
 
