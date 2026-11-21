@@ -371,10 +371,7 @@ impl Snapshot {
 
     /// Resolve checkpoint state once, without caching failures or holding an engine reference.
     #[cfg(feature = "declarative-plans")]
-    pub(crate) fn checkpoint_info(
-        &self,
-        engine: &dyn Engine,
-    ) -> CheckpointResolveResult<Option<Arc<CheckpointInfo>>> {
+    pub(crate) fn checkpoint_info(&self, engine: &dyn Engine) -> CheckpointResolveResult {
         let checkpoint_type = self.known_checkpoint_type();
         let mut metrics = self
             .log_segment
@@ -403,9 +400,10 @@ impl Snapshot {
                 None
             } else {
                 let executor = engine.require_plan_executor()?;
-                let resolved = CheckpointInfo::resolve(executor.as_ref(), self.log_segment());
+                let resolved =
+                    CheckpointInfo::resolve_with_metrics(executor.as_ref(), self.log_segment());
                 metrics = resolved.metrics;
-                resolved.result?.map(Arc::new)
+                resolved.result?
             };
             // All initializers hold the mutex; publish only after every fallible operation
             // succeeds.
