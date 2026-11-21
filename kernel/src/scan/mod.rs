@@ -1353,7 +1353,7 @@ impl Scan {
         // listed, so a hint from before it cannot be advanced commit by commit.
         #[cfg(feature = "adaptive-metadata-in-dev")]
         if let Some(checkpoint) = self.snapshot.latest_checkpoint_action(engine)?
-            && Version::try_from(checkpoint.version()).is_ok_and(|v| v > existing_version)
+            && checkpoint.version() > existing_version
         {
             return Ok(Box::new(self.scan_metadata(engine)?));
         }

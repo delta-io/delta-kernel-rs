@@ -42,7 +42,7 @@ use crate::unit_test_utils::adaptive_metadata_fixtures::{
 use crate::unit_test_utils::{
     adaptive_metadata_table_configuration, parse_json_batch, test_schema_flat_with_column_mapping,
 };
-use crate::{Engine, FileMeta, KernelError, KernelResult, Snapshot};
+use crate::{Engine, FileMeta, KernelError, KernelResult, Snapshot, Version};
 
 fn one_column_schema() -> SchemaRef {
     test_schema_flat_with_column_mapping()
@@ -76,7 +76,7 @@ fn checkpoint_action_at_path(
 ) -> String {
     let config = adaptive_metadata_table_configuration(schema, extra_features);
     let checkpoint = CheckpointAction {
-        version,
+        version: Version::try_from(version).unwrap(),
         content_root: ContentRoot::new(path.to_string(), 1, version),
         protocol: config.protocol().clone(),
         metadata: config.metadata().clone(),
@@ -217,13 +217,13 @@ impl ReplayLog {
 #[derive(Debug, Clone, Default)]
 struct ReplayExpectation {
     // The captured checkpoint action's version, `Some(None)` when replay must capture none.
-    captured: Option<Option<i64>>,
+    captured: Option<Option<Version>>,
     schema: Option<SchemaRef>,
     last_manifest_commit: Option<LastManifestCommitResolution>,
 }
 
 impl ReplayExpectation {
-    fn captured(mut self, version: Option<i64>) -> Self {
+    fn captured(mut self, version: Option<Version>) -> Self {
         self.captured = Some(version);
         self
     }
@@ -895,7 +895,7 @@ async fn plan_replay_bounded_by_crc_or_checkpoint_runs_one_plan(
 #[tokio::test]
 async fn plan_replay_runs_one_plan_beyond_the_newest_commit_only_when_needed(
     #[case] commits: Vec<String>,
-    #[case] expected_version: Option<i64>,
+    #[case] expected_version: Option<Version>,
     #[case] expected_plans: Vec<Vec<i64>>,
 ) {
     let log = ReplayLog::new(commits);
@@ -1118,7 +1118,7 @@ async fn check_segment_ending_on_checkpoint<E: Engine>(
 #[tokio::test]
 async fn incremental_update_resolves_latest_checkpoint_action(
     #[case] new_commit: String,
-    #[case] expected_version: i64,
+    #[case] expected_version: Version,
 ) {
     on_both_paths!(assert_incremental_update_action(
         &new_commit,
@@ -1128,7 +1128,7 @@ async fn incremental_update_resolves_latest_checkpoint_action(
 
 async fn assert_incremental_update_action<E: Engine>(
     new_commit: &str,
-    expected_version: i64,
+    expected_version: Version,
     make_engine: impl FnOnce(Arc<InMemory>) -> E,
 ) {
     let (store, table_root) = manifest_commit_table(&[]).await;
@@ -1206,7 +1206,7 @@ async fn latest_checkpoint_action_reads_commit_named_by_crc_pointer(
     #[case] v1: String,
     #[case] pointer_version: i64,
     #[case] pointer_content_root_version: i64,
-    #[case] expected: Result<i64, &str>,
+    #[case] expected: Result<Version, &str>,
 ) {
     let commits = [
         checkpoint_commit(0, &[], one_column_schema()),
@@ -1256,7 +1256,7 @@ async fn latest_checkpoint_action_fails_without_commit_or_crc_at_checkpoint_vers
 #[tokio::test]
 async fn latest_checkpoint_action_follows_commit_info_pointer(
     #[case] pointer: Option<LastManifestCommit>,
-    #[case] expected_version: Option<i64>,
+    #[case] expected_version: Option<Version>,
 ) {
     let commits = [
         checkpoint_commit(0, &[], one_column_schema()),
@@ -1303,7 +1303,7 @@ async fn read_last_checkpoint_action_from_pointer_rejects_commit_outside_segment
 #[tokio::test]
 async fn post_commit_snapshot_resolves_latest_checkpoint_action(
     #[case] write_root_manifest: bool,
-    #[case] expected_version: i64,
+    #[case] expected_version: Version,
 ) {
     let (store, table_root) = commit_table(&[checkpoint_commit(0, &[], one_column_schema())]).await;
     let engine = non_plan_engine(store.clone());

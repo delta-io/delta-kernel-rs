@@ -185,6 +185,28 @@ fn inline_and_sidecar_actions(
     Ok(Box::new(inline.chain(spilled)))
 }
 
+/// Reads the `protocol`, `metaData`, `txn`, and `domainMetadata` actions in `read_schema` from
+/// `checkpoint` and its sidecars, for callers that return [`KernelResult`].
+///
+/// `read_schema` must not include `add`: only content-tree reads can fail with a Delta error,
+/// which this would flatten into a [`KernelError`].
+pub(crate) fn read_non_add_actions(
+    engine: &dyn Engine,
+    checkpoint: &CheckpointAction,
+    log_root: &LogRoot,
+    read_schema: SchemaRef,
+) -> KernelResult<Box<dyn KernelResultIterator<ActionsBatch>>> {
+    require!(
+        read_schema.field(ADD_NAME).is_none(),
+        KernelError::internal_error(format!(
+            "read_non_add_actions cannot read `{ADD_NAME}` actions; read schema: {read_schema:?}"
+        ))
+    );
+    // TODO(#3421): propagate `Result` once the commit path can return Delta errors.
+    read_checkpoint_action(engine, checkpoint, log_root, read_schema, None)
+        .map_err(KernelError::generic_err)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -500,11 +522,10 @@ mod tests {
     }
 
     #[rstest]
-    #[case::negative(-1, -1, "version -1 is outside the log segment's versions 0..=3")]
     #[case::after_segment_end(4, 4, "version 4 is outside the log segment's versions 0..=3")]
     #[case::older_content_root(2, 1, "content root version 1 is older than its version 2")]
     fn rejects_checkpoint_action_versions_it_cannot_read(
-        #[case] version: i64,
+        #[case] version: Version,
         #[case] content_root_version: i64,
         #[case] message: &str,
     ) {
@@ -723,6 +744,19 @@ mod tests {
         assert_result_error_with_message(
             read_checkpoint_action(&engine, &checkpoint, &log_root(), schema, None),
             &format!("reading `{COMMIT_INFO_NAME}` actions"),
+        );
+    }
+
+    #[test]
+    fn read_non_add_actions_rejects_an_add_read_schema() {
+        let engine = SyncEngine::in_memory();
+        let checkpoint = checkpoint_action_with_root(ROOT_PATH, 1, 1).unwrap();
+        let schema = get_commit_schema()
+            .project(&[ADD_NAME, PROTOCOL_NAME])
+            .unwrap();
+        assert_result_error_with_message(
+            read_non_add_actions(&engine, &checkpoint, &log_root(), schema),
+            &format!("cannot read `{ADD_NAME}` actions"),
         );
     }
 }
