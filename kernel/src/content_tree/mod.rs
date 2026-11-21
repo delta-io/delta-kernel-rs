@@ -9,7 +9,7 @@ mod builder;
 mod checkpoint_action_stream;
 mod checkpoint_sidecar;
 mod dv_conversion;
-mod file_metadata;
+pub(crate) mod file_metadata;
 mod mumbling;
 mod reader;
 pub(crate) mod stats;
