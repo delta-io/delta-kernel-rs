@@ -807,10 +807,16 @@ mod tests {
     use test_utils::{LoggingTest, add_commit, assert_result_error_with_message};
 
     use super::*;
+    use crate::Result;
+    use crate::committer::FileSystemCommitter;
     use crate::crc::{DomainMetadataState, FileStats, FileStatsState, SetTransactionState};
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
+    use crate::schema::schema_ref;
+    use crate::snapshot::Snapshot;
     use crate::table_features::TableFeature;
+    use crate::transaction::create_table::create_table;
+    use crate::unit_test_utils::commit_on_latest;
 
     impl CrcReplayAccumulator {
         /// [`Self::on_commit_info`] for a commitInfo row without a `lastManifestCommit`.
@@ -1446,6 +1452,47 @@ mod tests {
                 "must be strictly less than end_version",
             );
         }
+    }
+
+    // Each commit after the table's creation sets the shared `app` / `d` and its own per-version
+    // entries, so the delta shows both which commits were replayed and that the newest one wins.
+    #[test]
+    fn build_crc_delta_from_base_replays_only_commits_after_the_base() -> Result<()> {
+        let engine = SyncEngine::in_memory();
+        let root = "memory:///t/";
+        create_table(root, schema_ref! { nullable "id": INTEGER }, "test", true)
+            .with_table_properties([("delta.feature.domainMetadata", "supported")])
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?
+            .unwrap_committed();
+        for version in 1..=3 {
+            commit_on_latest(&engine, root, |txn| {
+                Ok(txn
+                    .with_transaction_id("app".to_string(), version)
+                    .with_transaction_id(format!("app-v{version}"), version)
+                    .with_domain_metadata("d".to_string(), version.to_string())
+                    .with_domain_metadata(format!("d-v{version}"), version.to_string()))
+            })?;
+        }
+        let snapshot = Snapshot::builder_for(root).build(&engine)?;
+
+        let delta = (snapshot.log_segment()).build_crc_delta_from_base(&engine, 1, None)?;
+
+        let txns: HashMap<_, _> = (delta.set_transactions.iter())
+            .map(|(app_id, txn)| (app_id.as_str(), txn.version))
+            .collect();
+        assert_eq!(
+            txns,
+            HashMap::from([("app", 3), ("app-v2", 2), ("app-v3", 3)])
+        );
+        let domains: HashMap<_, _> = (delta.domain_metadata.iter())
+            .map(|(domain, dm)| (domain.as_str(), dm.configuration()))
+            .collect();
+        assert_eq!(
+            domains,
+            HashMap::from([("d", "3"), ("d-v2", "2"), ("d-v3", "3")])
+        );
+        Ok(())
     }
 
     #[tokio::test]
