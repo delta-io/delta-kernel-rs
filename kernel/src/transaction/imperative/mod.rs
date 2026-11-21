@@ -518,6 +518,7 @@ impl<STATE> Transaction<STATE, Imperative> {
                     .map(|a| Ok(a.deref())),
                 false, // no row tracking
                 self.data_change,
+                self.effective_table_config.stats_json_op(),
             )?;
             Ok((Box::new(add_actions), None))
         }
@@ -573,6 +574,7 @@ impl<STATE> Transaction<STATE, Imperative> {
             extended_add_files,
             true, // row tracking
             self.data_change,
+            self.effective_table_config.stats_json_op(),
         )?;
 
         // Do a dry run to eagerly compute the new high water mark so we can store it. The row
@@ -642,6 +644,7 @@ impl<STATE> Transaction<STATE, Imperative> {
         // adaptiveMetadata removes must carry a null deletionTimestamp and extendedFileMetadata =
         // true (see `Remove` and `build_remove_struct_patch`).
         let adaptive_metadata_enabled = self.is_adaptive_metadata_enabled();
+        let stats_json_op = self.effective_table_config.stats_json_op();
 
         let make_eval = |coalesce_stats_with_parsed: bool| {
             let columns_to_drop: Vec<_> = columns_to_drop.iter().map(String::as_str).collect();
@@ -650,6 +653,7 @@ impl<STATE> Transaction<STATE, Imperative> {
                 self.data_change,
                 &columns_to_drop,
                 coalesce_stats_with_parsed,
+                stats_json_op,
                 adaptive_metadata_enabled,
             )?;
             let expr = Arc::new(Expression::struct_from([Expression::struct_patch(patch)?]));
@@ -692,6 +696,7 @@ static DATA_CHANGE_COLUMN: LazyLock<StructField> =
 fn build_add_action_projection(
     input_schema: &StructType,
     data_change: bool,
+    stats_json_op: UnaryExpressionOp,
 ) -> KernelResult<(SchemaRef, Expression)> {
     let (output_schema, patch) = ProjectionStructPatchBuilder::new(input_schema)
         .insert_after(
@@ -702,20 +707,21 @@ fn build_add_action_projection(
         .replace(
             "stats",
             StructField::nullable("stats", DataType::STRING),
-            Expression::unary(UnaryExpressionOp::TO_JSON, col!("stats")),
+            Expression::unary(stats_json_op, col!("stats")),
         )
         .build()?;
     let patch = Expression::struct_from([patch]);
     Ok((output_schema, patch))
 }
 
-/// Transforms add file metadata into commit-ready add actions by converting stats to JSON and
-/// setting the `dataChange` field.
+/// Transforms add file metadata into commit-ready add actions by converting stats to JSON with
+/// `stats_json_op` and setting the `dataChange` field.
 fn build_add_actions<'a, I, T>(
     engine: &dyn Engine,
     add_files_metadata: I,
     row_tracking: bool,
     data_change: bool,
+    stats_json_op: UnaryExpressionOp,
 ) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>> + use<'a, I, T>>
 where
     I: KernelResultIterator<T> + 'a,
@@ -740,7 +746,8 @@ where
         } else {
             input_schema.clone()
         };
-        let (output_schema, adds_expr) = build_add_action_projection(&input_schema, data_change)?;
+        let (output_schema, adds_expr) =
+            build_add_action_projection(&input_schema, data_change, stats_json_op)?;
         let adds_evaluator = evaluation_handler.new_expression_evaluator(
             input_schema,
             Arc::new(adds_expr),
@@ -757,8 +764,8 @@ where
 /// Handles two "parsed" columns that predicate-based scans add to scan metadata:
 ///
 /// - `stats_parsed`: when `coalesce_stats_with_parsed` is true, the `stats` field is replaced with
-///   `COALESCE(stats, TO_JSON(stats_parsed))` and `stats_parsed` is dropped. The coalesce handles
-///   cases where `stats` is null (e.g., V2 checkpoints with `writeStatsAsJson=false`) by
+///   `COALESCE(stats, stats_json_op(stats_parsed))` and `stats_parsed` is dropped. The coalesce
+///   handles cases where `stats` is null (e.g., V2 checkpoints with `writeStatsAsJson=false`) by
 ///   reconstructing the JSON from the parsed representation.
 /// - `partitionValues_parsed`: dropped if present. Unlike stats, no reconstruction is needed: the
 ///   Remove action's `partitionValues` is sourced from `fileConstantValues.partitionValues`, which
@@ -772,6 +779,7 @@ fn build_remove_struct_patch(
     data_change: bool,
     columns_to_drop: &[&str],
     coalesce_stats_with_parsed: bool,
+    stats_json_op: UnaryExpressionOp,
     adaptive_metadata_enabled: bool,
 ) -> KernelResult<ExpressionStructPatch> {
     let deletion_timestamp = if adaptive_metadata_enabled {
@@ -799,10 +807,9 @@ fn build_remove_struct_patch(
         );
 
     if coalesce_stats_with_parsed {
-        // Replace stats with COALESCE(stats, TO_JSON(stats_parsed)) and drop stats_parsed.
         let coalesce_stats = Expression::coalesce([
             col!("stats"),
-            Expression::unary(UnaryExpressionOp::TO_JSON, col!(STATS_PARSED_NAME)),
+            Expression::unary(stats_json_op, col!(STATS_PARSED_NAME)),
         ]);
         patch = patch
             .replace("stats", coalesce_stats)
@@ -845,6 +852,7 @@ mod tests {
 
     use ::test_utils::get_column;
     use rstest::rstest;
+    use serde_json::json;
 
     use super::*;
     use crate::actions::{ADD_SCHEMA, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
@@ -862,12 +870,15 @@ mod tests {
     use crate::engine::{DelegatingEngine, RelaxedCounter};
     use crate::expressions::{ExpressionRef, MapData, PredicateRef, Scalar, StructData};
     use crate::scan::log_replay::PATH_NAME;
-    use crate::schema::{MapType, column_name};
+    use crate::schema::{MapType, column_name, schema};
     use crate::table_configuration::TableConfiguration;
     use crate::table_properties::APPEND_ONLY;
     use crate::transaction::create_table::create_table;
     use crate::transaction::operation::UpdateTableOperation;
-    use crate::unit_test_utils::{copy_test_table, create_valid_add_file_batch, test_schema_flat};
+    use crate::unit_test_utils::{
+        MICROSECOND_TIMESTAMP, assert_min_ts_in_stats_json, copy_test_table,
+        create_valid_add_file_batch, evaluate_on_json_rows, test_schema_flat,
+    };
     use crate::{
         EvaluationHandler, ExpressionEvaluator, KernelError, PredicateEvaluator, Result, Snapshot,
     };
@@ -893,7 +904,8 @@ mod tests {
         } else {
             add_files_schema.clone()
         };
-        let (schema, _) = build_add_action_projection(input_schema.as_ref(), true)?;
+        let (schema, _) =
+            build_add_action_projection(input_schema.as_ref(), true, UnaryExpressionOp::TO_JSON)?;
         let field_names: Vec<_> = schema.fields().map(|f| f.name().as_str()).collect();
         let mut expected_field_names = vec![
             "path",
@@ -997,7 +1009,13 @@ mod tests {
                 Ok(Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>)
             })
             .collect::<KernelResult<Vec<_>>>()?;
-        let actions = build_add_actions(&engine, batches.into_iter().map(Ok), row_tracking, true)?;
+        let actions = build_add_actions(
+            &engine,
+            batches.into_iter().map(Ok),
+            row_tracking,
+            true,
+            UnaryExpressionOp::TO_JSON,
+        )?;
         assert_eq!(handler.evaluators_created.get(), 0);
         let actions = actions.collect::<KernelResult<Vec<_>>>()?;
         assert_eq!(actions.len(), optional_columns.len());
@@ -1021,6 +1039,50 @@ mod tests {
         Ok(())
     }
 
+    #[rstest]
+    #[case::millisecond(UnaryExpressionOp::TO_JSON, "2026-07-02T15:55:55.298Z")]
+    #[case::full_precision(
+        UnaryExpressionOp::ToJson { full_precision_timestamps: true },
+        MICROSECOND_TIMESTAMP
+    )]
+    fn test_remove_stats_fall_back_to_stats_parsed_with_stats_json_op(
+        #[case] stats_json_op: UnaryExpressionOp,
+        #[case] expected_bound: &str,
+    ) -> KernelResult<()> {
+        let patch = build_remove_struct_patch(
+            0,    /* commit_timestamp */
+            true, /* data_change */
+            &[],  /* columns_to_drop */
+            true, /* coalesce_stats_with_parsed */
+            stats_json_op,
+            false, /* adaptive_metadata_enabled */
+        )?;
+        let expr = Arc::new(Expression::struct_from([Expression::struct_patch(patch)?]));
+        let stats_parsed = StructField::nullable(
+            STATS_PARSED_NAME,
+            schema! { nullable MIN_VALUES: { nullable "ts": TIMESTAMP } },
+        );
+        let input_schema = Arc::new(StructType::try_new(
+            scan_row_schema().fields().cloned().chain([stats_parsed]),
+        )?);
+
+        let rows = evaluate_on_json_rows(
+            &SyncEngine::new(),
+            input_schema,
+            expr,
+            Arc::new(schema_with_all_fields_nullable(&LOG_REMOVE_SCHEMA)),
+            &[json!({
+                "path": "a",
+                "size": 1,
+                "stats": null,
+                FILE_CONSTANT_VALUES_NAME: { PARTITION_VALUES_NAME: {} },
+                STATS_PARSED_NAME: { MIN_VALUES: { "ts": MICROSECOND_TIMESTAMP } },
+            })],
+        )?;
+        assert_min_ts_in_stats_json(&rows[0]["remove"]["stats"], expected_bound);
+        Ok(())
+    }
+
     /// Verifies the Remove projection's `deletionTimestamp` and `extendedFileMetadata` fields.
     /// `extendedFileMetadata` is always a presence predicate; `deletionTimestamp` derives from the
     /// input outside adaptiveMetadata and is fixed to null under it per the RFC.
@@ -1036,6 +1098,7 @@ mod tests {
             true,  /* data_change */
             &[],   /* columns_to_drop */
             false, /* coalesce_stats_with_parsed */
+            UnaryExpressionOp::TO_JSON,
             adaptive_metadata_enabled,
         )?;
         let path_patch = patch

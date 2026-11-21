@@ -135,7 +135,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::expressions::Expression;
+    use crate::expressions::{Expression, UnaryExpressionOp};
     use crate::scan::PhysicalPredicate;
     use crate::scan::state::DvInfo;
     use crate::scan::state_info::StateInfo;
@@ -199,6 +199,7 @@ mod tests {
             is_catalog_managed: false,
             skip_row_transforms: false,
             dv_normalization_root: None,
+            stats_json_op: UnaryExpressionOp::TO_JSON,
         }
     }
 
@@ -427,6 +428,7 @@ mod tests {
             is_catalog_managed: false,
             skip_row_transforms: false,
             dv_normalization_root: None,
+            stats_json_op: UnaryExpressionOp::TO_JSON,
         };
 
         let result = get_cdf_transform_expr(&scan_file, &state_info, &physical_schema);
