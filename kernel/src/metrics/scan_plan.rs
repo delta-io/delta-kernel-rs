@@ -6,7 +6,7 @@ use crate::Version;
 use crate::checkpoint::{CheckpointInfo, SelectedCheckpointType};
 
 /// Checkpoint selection and work observed during one planning attempt.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CheckpointMetrics {
     /// Selected checkpoint version, retained on failure.
     pub version: Version,
