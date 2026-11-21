@@ -19,7 +19,7 @@ from review_history import (
 from review_publish import INLINE_FEEDBACK_FOOTER, format_review_body as _format_review_body
 
 
-MAX_INLINE_FINDINGS = 12
+MAX_INLINE_FINDINGS = 25
 INLINE_FINDING_FIELDS = ("id", "path", "line", "side", "body")
 INLINE_FINDING_SIDES = ("LEFT", "RIGHT")
 _FINDING_HEADING_MARKER = "###"
