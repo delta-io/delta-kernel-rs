@@ -78,6 +78,7 @@ pub(crate) const FILE_SEQUENCE_NUMBER: &str = "fileSequenceNumber";
 pub(crate) const FIRST_ROW_ID: &str = "firstRowId";
 pub(crate) const DELETED_POSITIONS: &str = "deletedPositions";
 pub(crate) const REPLACED_POSITIONS: &str = "replacedPositions";
+pub(crate) const SNAPSHOT_TIMESTAMP: &str = "snapshotTimestamp";
 
 /// Field names within the [`DeletionVectorInfo`] sub-struct.
 pub(crate) const DV_INFO_OFFSET: &str = "offset";
@@ -194,6 +195,13 @@ pub struct TrackingInfo {
     // TODO: always `None` until DvCache tracks replaced positions in a later change.
     #[field_id = 7]
     pub(crate) replaced_positions: Option<Bytes>,
+
+    /// When the snapshot that added or last modified the file's data was committed. Inherited when
+    /// `None`: a root entry from the content root's commit timestamp, a leaf entry from its parent
+    /// `DataManifest` entry. Writers leave it `None` on `Added` entries and on entries `Modified`
+    /// by column files, and set it on every other entry they write to a new manifest.
+    #[field_id = 8]
+    pub(crate) snapshot_timestamp: Option<TimestampMicros>,
 }
 
 /// The `tracking.*` leaf columns [`TrackingInfo::try_from_getters`] reads, in getter order.
@@ -231,6 +239,9 @@ impl TrackingInfo {
             first_row_id: getters[5].get_opt(row, FIRST_ROW_ID)?,
             deleted_positions: positions(getters[6], DELETED_POSITIONS)?,
             replaced_positions: positions(getters[7], REPLACED_POSITIONS)?,
+            snapshot_timestamp: getters[8]
+                .get_timestamp(row, SNAPSHOT_TIMESTAMP)?
+                .map(TimestampMicros),
         })
     }
 }
@@ -485,6 +496,23 @@ impl From<TrackingStatus> for Scalar {
     }
 }
 
+/// A UTC timestamp in microseconds since the Unix epoch, stored as a `timestamp` (Iceberg
+/// `timestamptz`) column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TimestampMicros(pub(crate) i64);
+
+impl ToDataType for TimestampMicros {
+    fn to_data_type() -> DataType {
+        DataType::TIMESTAMP
+    }
+}
+
+impl From<TimestampMicros> for Scalar {
+    fn from(value: TimestampMicros) -> Self {
+        Scalar::Timestamp(value.0)
+    }
+}
+
 /// Sub-struct of ContentTreeNodeEntry summarizing a referenced manifest.
 #[derive(Debug, Clone, Default, PartialEq, ToSchema)]
 #[cfg_attr(test, derive(delta_kernel_derive::IntoStructData))]
@@ -565,12 +593,18 @@ fn struct_expr_from_schema(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use rstest::rstest;
 
     use super::*;
+    use crate::Engine as _;
+    use crate::arrow::array::{Array as _, AsArray as _, RecordBatch, StructArray};
+    use crate::arrow::datatypes::{Field, Schema};
     use crate::content_tree::test_utils::{
-        added_data_entry, entry_batch, struct_batch, with_field,
+        added_data_entry, entry_batch, struct_batch, with_field, write_batch,
     };
+    use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
     use crate::engine::sync::SyncEngine;
     use crate::engine_data::RowVisitor;
     use crate::schema::{ColumnMetadataKey, ColumnName, MetadataValue, StructField};
@@ -616,6 +650,7 @@ mod tests {
         first_row_id: Some(5),
         deleted_positions: Some(Bytes::from_static(b"deleted")),
         replaced_positions: Some(Bytes::from_static(b"replaced")),
+        snapshot_timestamp: Some(TimestampMicros(-1_500)),
     })]
     #[case::optional_fields_null(TrackingInfo {
         status: TrackingStatus::Deleted,
@@ -626,6 +661,7 @@ mod tests {
         first_row_id: None,
         deleted_positions: None,
         replaced_positions: None,
+        snapshot_timestamp: None,
     })]
     fn tracking_info_parses_from_getters(#[case] tracking: TrackingInfo) {
         let engine = SyncEngine::new();
@@ -633,6 +669,51 @@ mod tests {
         entry.tracking = tracking.clone();
         let batch = entry_batch(&engine, &[entry]);
         assert_eq!(visit_tracking(batch.as_ref()).unwrap(), vec![tracking]);
+    }
+
+    #[test]
+    fn tracking_info_reads_manifest_without_snapshot_timestamp_as_none() {
+        let engine = SyncEngine::in_memory();
+        let entries = entry_batch(&engine, &[added_data_entry("a.parquet", 1, 1, 0, 0)]);
+        let batch = without_tracking_field(entries.try_into_record_batch().unwrap());
+        let location =
+            Url::parse("memory:///table/metadata/no-snapshot-timestamp.parquet").unwrap();
+        let file = write_batch(&engine, location, Box::new(ArrowEngineData::new(batch)));
+        let schema = Arc::new(ContentTreeNodeEntry::to_schema());
+        let snapshot_timestamps: Vec<_> = engine
+            .parquet_handler()
+            .read_parquet_files(&[file], schema, None)
+            .unwrap()
+            .flat_map(|batch| visit_tracking(batch.unwrap().as_ref()).unwrap())
+            .map(|tracking| tracking.snapshot_timestamp)
+            .collect();
+        assert_eq!(snapshot_timestamps, vec![None]);
+    }
+
+    /// Drops `tracking.snapshotTimestamp` from an entry batch, as a writer that omits it does.
+    fn without_tracking_field(batch: RecordBatch) -> RecordBatch {
+        let index = batch.schema().index_of(TRACKING).unwrap();
+        let tracking = batch.column(index).as_struct();
+        let (fields, columns): (Vec<_>, Vec<_>) = tracking
+            .fields()
+            .iter()
+            .zip(tracking.columns())
+            .filter(|(field, _)| field.name() != SNAPSHOT_TIMESTAMP)
+            .map(|(field, column)| (field.clone(), column.clone()))
+            .unzip();
+        let tracking = StructArray::new(fields.into(), columns, tracking.nulls().cloned());
+        let old_field = batch.schema().field(index).clone();
+        let field = Field::new(
+            TRACKING,
+            tracking.data_type().clone(),
+            old_field.is_nullable(),
+        )
+        .with_metadata(old_field.metadata().clone());
+        let mut fields: Vec<_> = batch.schema().fields().iter().cloned().collect();
+        fields[index] = Arc::new(field);
+        let mut columns = batch.columns().to_vec();
+        columns[index] = Arc::new(tracking);
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
     }
 
     #[test]
@@ -747,6 +828,7 @@ mod tests {
         (FIRST_ROW_ID, Some(142), true),
         (DELETED_POSITIONS, Some(6), true),
         (REPLACED_POSITIONS, Some(7), true),
+        (SNAPSHOT_TIMESTAMP, Some(8), true),
     ])]
     #[case::deletion_vector_info(DeletionVectorInfo::to_schema(), &[
         (LOCATION, Some(155), false),
