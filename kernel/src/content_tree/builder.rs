@@ -241,6 +241,7 @@ mod tests {
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{Scalar, StructData};
+    use crate::schema::schema_ref;
 
     /// A row of write-metadata input, where any field may be null (to exercise null rejection).
     #[derive(Clone, Copy)]
@@ -304,7 +305,7 @@ mod tests {
                      commit_version,
                  }| {
                     let stats = StructData::try_new(
-                        vec![StructField::nullable(NUM_RECORDS, DataType::LONG)],
+                        schema_ref! { nullable NUM_RECORDS: LONG },
                         vec![opt_long(num_records)],
                     )
                     .unwrap();

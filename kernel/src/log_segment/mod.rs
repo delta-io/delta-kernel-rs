@@ -428,6 +428,8 @@ impl LogSegment {
     /// The checkpoint schema from the `_last_checkpoint` hint, when the hint describes the selected
     /// checkpoint (see [`Self::checkpoint_hint`]) and carried a `checkpointSchema`. `None`
     /// otherwise -- the caller then reads the checkpoint footer instead.
+    // TODO(#4048): `applies_to` matches only version and naming, so this schema can describe an
+    // earlier classic-named file that another writer replaced, and hide the new file's sidecars.
     pub(crate) fn checkpoint_hint_schema(&self) -> Option<SchemaRef> {
         self.checkpoint_hint()?.checkpoint_schema.clone()
     }
@@ -1468,6 +1470,7 @@ impl LogSegment {
         engine: &dyn Engine,
     ) -> KernelResult<(Option<SchemaRef>, Vec<FileMeta>)> {
         // Hint schema from `_last_checkpoint` avoids footer reads when available.
+        // TODO(#4048): a stale hint schema without a `sidecar` column hides the file's sidecars.
         let hint_schema = self.checkpoint_hint_schema();
 
         // All parts of a multi-part checkpoint belong to the same table version and follow

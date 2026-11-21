@@ -1393,7 +1393,7 @@ mod tests {
     };
     use crate::actions::visitors::AddVisitor;
     use crate::actions::{
-        LOG_ADD_SCHEMA, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
+        Add, LOG_ADD_SCHEMA, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
     };
     use crate::arrow::array::{AsArray as _, RecordBatch};
     use crate::arrow::compute::concat_batches;
@@ -1415,7 +1415,7 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{Predicate as Pred, StructData, col};
     use crate::scan::state::DvInfo;
-    use crate::schema::StructType;
+    use crate::schema::{StructType, schema_ref};
     use crate::unit_test_utils::adaptive_metadata_fixtures::checkpoint_action_with_root;
     use crate::unit_test_utils::{TestCancellationToken, assert_result_error_with_message};
     use crate::{Error, FileSize, ParquetFooter, ParquetHandler, PredicateRef};
@@ -1485,7 +1485,7 @@ mod tests {
         commit_version: i64,
     ) -> Vec<Scalar> {
         let add = StructData::try_new(
-            ADD_SCHEMA.fields().cloned().collect(),
+            Add::schema_ref().clone(),
             vec![
                 Scalar::from(path),
                 Scalar::Map(
@@ -1923,7 +1923,8 @@ mod tests {
                     let phys_id = |value: i64| {
                         let field = StructField::nullable("phys_id", DataType::LONG);
                         Scalar::Struct(
-                            StructData::try_new(vec![field], vec![value.into()]).unwrap(),
+                            StructData::try_new(schema_ref! { (field) }, vec![value.into()])
+                                .unwrap(),
                         )
                     };
                     let values = vec![
@@ -1934,10 +1935,10 @@ mod tests {
                         Scalar::Boolean(false),
                     ];
                     let stats =
-                        StructData::try_new(stats_schema.fields().cloned().collect(), values);
+                        StructData::try_new(schema_ref! { ..(stats_schema.fields()) }, values);
                     let field = StructField::nullable(STATS_PARSED, stats_schema.clone());
                     let add = StructData::try_new(
-                        add.fields().iter().cloned().chain([field]).collect(),
+                        schema_ref! { ..(add.fields()), (field) },
                         add.values()
                             .iter()
                             .cloned()

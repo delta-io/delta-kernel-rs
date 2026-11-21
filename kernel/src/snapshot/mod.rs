@@ -10,21 +10,29 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use delta_kernel_derive::internal_api;
-use tracing::{error, info, instrument, trace, warn};
+use tracing::{debug, error, info, instrument, trace, warn};
 use url::Url;
 
+#[cfg(feature = "declarative-plans")]
+use crate::FileMeta;
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
+#[cfg(feature = "declarative-plans")]
+use crate::action_reconciliation::plan::action_set::ActionSet;
+#[cfg(feature = "declarative-plans")]
+use crate::action_reconciliation::plan::{MetadataPlanner, VERSION};
 use crate::actions::set_transaction::SetTransactionScanner;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::visitors::SetTransactionMap;
+#[cfg(feature = "declarative-plans")]
+use crate::actions::{ADD_NAME, REMOVE_NAME};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::{CheckpointAction, LastManifestCommit};
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX, LOG_DOMAIN_METADATA_SCHEMA};
 #[cfg(feature = "declarative-plans")]
-use crate::checkpoint::CheckpointShape;
+use crate::checkpoint::CheckpointInfo;
 use crate::checkpoint::{
-    CheckpointSpec, CheckpointWriter, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT, V2CheckpointConfig,
-    ensure_standalone_checkpoint_supported,
+    CheckpointSpec, CheckpointWriter, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
+    SelectedCheckpointType, V2CheckpointConfig, ensure_standalone_checkpoint_supported,
 };
 use crate::clustering::{CLUSTERING_DOMAIN_NAME, ClusteringColumnInfo, parse_clustering_columns};
 use crate::committer::{Committer, PublishMetadata};
@@ -33,6 +41,8 @@ use crate::crc::{
     try_write_crc_file,
 };
 use crate::expressions::ColumnName;
+#[cfg(feature = "declarative-plans")]
+use crate::expressions::lit;
 use crate::incremental_scan::IncrementalScanBuilder;
 use crate::log_replay::ActionsBatch;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -49,8 +59,12 @@ use crate::metrics::{
     emit_protocol_metadata_load_failure,
 };
 use crate::path::ParsedLogPath;
+#[cfg(feature = "declarative-plans")]
+use crate::plans::{Operation as PlanOperation, PlanBuilder, file_meta_from_batches};
 use crate::row_tracking::{ROW_TRACKING_DOMAIN_NAME, parse_row_tracking_high_water_mark};
 use crate::scan::ScanBuilder;
+#[cfg(feature = "declarative-plans")]
+use crate::scan::StatsOptions;
 use crate::schema::{GeneratedColumn, SchemaRef};
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::{Operation, TableFeature, physical_to_logical_column_name_and_type};
@@ -132,9 +146,13 @@ pub struct Snapshot {
     built_as_latest: bool,
     /// Whether the last applicable incremental build requested ignoring new checkpoints.
     skipped_new_checkpoints: bool,
+    /// The selected checkpoint's type from a snapshot hint, the checkpoint writer, or the snapshot
+    /// an incremental update advanced. Used only when naming and protocol do not decide it, and
+    /// replaced by discovery once the checkpoint is read.
+    retained_checkpoint_type: Option<SelectedCheckpointType>,
     /// Complete state for the frozen segment. Shared with scan plans; failed reads are not cached.
     #[cfg(feature = "declarative-plans")]
-    checkpoint_info: OnceLock<Option<Arc<CheckpointShape>>>,
+    checkpoint_info: OnceLock<Option<Arc<CheckpointInfo>>>,
     #[cfg(feature = "declarative-plans")]
     checkpoint_info_init: Mutex<()>,
     /// This snapshot's latest AMT `checkpoint` action (see
@@ -326,6 +344,7 @@ impl Snapshot {
             crc,
             built_as_latest,
             skipped_new_checkpoints,
+            retained_checkpoint_type: None,
             #[cfg(feature = "declarative-plans")]
             checkpoint_info: OnceLock::new(),
             #[cfg(feature = "declarative-plans")]
@@ -342,7 +361,7 @@ impl Snapshot {
 
     /// Returns only completed metadata, without waiting for or starting checkpoint discovery.
     #[cfg(feature = "declarative-plans")]
-    pub(crate) fn cached_checkpoint_info(&self) -> Option<&Option<Arc<CheckpointShape>>> {
+    pub(crate) fn cached_checkpoint_info(&self) -> Option<&Option<Arc<CheckpointInfo>>> {
         self.checkpoint_info.get()
     }
 
@@ -351,7 +370,7 @@ impl Snapshot {
     pub(crate) fn checkpoint_info(
         &self,
         engine: &dyn Engine,
-    ) -> KernelResult<Option<Arc<CheckpointShape>>> {
+    ) -> KernelResult<Option<Arc<CheckpointInfo>>> {
         if let Some(resolved) = self.checkpoint_info.get() {
             return Ok(resolved.clone());
         }
@@ -369,7 +388,7 @@ impl Snapshot {
             None
         } else {
             let executor = engine.require_plan_executor()?;
-            CheckpointShape::resolve(executor.as_ref(), self.log_segment())?.map(Arc::new)
+            CheckpointInfo::resolve(executor.as_ref(), self.log_segment())?.map(Arc::new)
         };
         // All initializers hold the mutex; publish only after every fallible operation succeeds.
         let _ = self.checkpoint_info.set(resolved.clone());
@@ -568,6 +587,12 @@ impl Snapshot {
             (None, None) => return fail(KernelError::MissingMetadataAndProtocol),
         };
         emit_protocol_metadata_load(metric_context, source, pm_start.elapsed());
+        debug!(
+            ?source,
+            base_crc_version = ?base_crc.as_ref().map(|crc| crc.version),
+            crc_at_target = crc_at_version.is_some(),
+            "Resolved snapshot protocol and metadata"
+        );
 
         let table_configuration = TableConfiguration::try_new(
             metadata,
@@ -655,6 +680,13 @@ impl Snapshot {
             &new_table_configuration,
             new_crc,
         )?;
+        debug!(
+            parent: &self.span,
+            from_version = read_version,
+            to_version = new_version,
+            crc_version = ?new_crc.base().map(|crc| crc.version),
+            "Constructed post-commit snapshot state"
+        );
         // A successful commit means the post-commit snapshot is the latest version.
         Ok(Self::new_with_validated_crc(
             new_log_segment,
@@ -684,6 +716,33 @@ impl Snapshot {
     /// Returns an error if the total commit file size exceeds [`u64::MAX`].
     pub fn log_segment_stats(&self) -> KernelResult<LogSegmentStats> {
         self.log_segment.stats()
+    }
+
+    /// Returns the selected checkpoint's type when it is known without I/O: from completed
+    /// discovery, the Delta protocol's naming and feature rules, or the retained type.
+    pub(crate) fn known_checkpoint_type(&self) -> Option<SelectedCheckpointType> {
+        let root = self.log_segment.listed.checkpoint_parts.first()?;
+        #[cfg(feature = "declarative-plans")]
+        if let Some(Some(info)) = self.cached_checkpoint_info() {
+            return Some(info.checkpoint_type());
+        }
+        // TODO(#4057): the retained type is not checked against the checkpoint until it is read.
+        SelectedCheckpointType::from_naming_and_protocol(root, self.table_configuration.protocol())
+            .or(self.retained_checkpoint_type)
+    }
+
+    /// The selected checkpoint's type if `checkpoint_parts` selects this snapshot's checkpoint
+    /// files, so a snapshot derived from this one can keep it.
+    pub(crate) fn checkpoint_type_for_parts(
+        &self,
+        checkpoint_parts: &[ParsedLogPath],
+    ) -> Option<SelectedCheckpointType> {
+        let ours = &self.log_segment.listed.checkpoint_parts;
+        let same_files = checkpoint_parts
+            .iter()
+            .map(|part| &part.location)
+            .eq(ours.iter().map(|part| &part.location));
+        same_files.then(|| self.known_checkpoint_type()).flatten()
     }
 
     /// Captures retained snapshot state as an owned hint without engine I/O.
@@ -969,6 +1028,10 @@ impl Snapshot {
         if let Some(base) = self.tail_replay_base_crc(engine)?
             && let SetTransactionState::Complete(base_active) = &base.set_transaction_state
         {
+            debug!(
+                base_crc_version = base.version,
+                "Resolving application transaction from CRC and tail commits"
+            );
             let txn = SetTransactionScanner::get_one_rooted_in_crc(
                 self.log_segment(),
                 application_id,
@@ -987,6 +1050,7 @@ impl Snapshot {
 
         // Fallback: full log replay. Scan for the newest txn and apply expiration to it, like the
         // CRC paths above.
+        debug!("Resolving application transaction by full log replay: no authoritative CRC answer");
         let txn = SetTransactionScanner::get_one(self, application_id, engine)?;
         let version = txn.and_then(|txn| txn.non_expired_version(expiration_timestamp));
         record_metric(false, version.is_some());
@@ -1187,6 +1251,10 @@ impl Snapshot {
         if let Some(base) = self.tail_replay_base_crc(engine)?
             && let DomainMetadataState::Complete(base_active) = &base.domain_metadata_state
         {
+            debug!(
+                base_crc_version = base.version,
+                "Resolving domain metadata from CRC and tail commits"
+            );
             let rooted = self.log_segment().scan_domain_metadatas_rooted_in_crc(
                 base.version,
                 base_active,
@@ -1206,6 +1274,7 @@ impl Snapshot {
         //       miss search could skip that range and only scan the older commits, then
         //       union those results with the Partial cache's entries to produce the final
         //       answer.
+        debug!("Resolving domain metadata by full log replay: no authoritative CRC answer");
         let replayed = scan_domain_metadata_actions(
             self.read_log_actions(engine, LOG_DOMAIN_METADATA_SCHEMA.clone())?,
             domains,
@@ -1522,6 +1591,74 @@ impl Snapshot {
         LogCompactionWriter::try_new(self, start_version, end_version)
     }
 
+    /// Atomically writes a minor log compaction and returns its file metadata.
+    ///
+    /// Requires a plan executor and a fresh latest snapshot built with checkpoint discovery.
+    /// Compacts published commits with `start_version < end_version <= self.version()`,
+    /// after the snapshot's checkpoint. Staged commit paths are unsupported.
+    /// Reuses compactions fully contained in the interval. Retains winning removes, transactions,
+    /// and domain deletions from its inputs regardless of age; includes protocol and metadata only
+    /// when present.
+    /// File actions have `dataChange=true`.
+    ///
+    /// Errors on existing destinations. Gaps in listed commits return
+    /// `DELTA_VERSIONS_NOT_CONTIGUOUS`; missing selected input files return
+    /// `DELTA_TRUNCATED_TRANSACTION_LOG`. AMT and automatic compaction are unsupported.
+    #[cfg(feature = "declarative-plans")]
+    pub fn compact_log(
+        &self,
+        engine: &dyn Engine,
+        start_version: Version,
+        end_version: Version,
+    ) -> Result<FileMeta> {
+        let executor = engine.require_plan_executor()?;
+        self.table_configuration().ensure_read_write_supported()?;
+        if self
+            .table_configuration()
+            .is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
+        {
+            return Err(KernelError::unsupported(
+                "Declarative log compaction does not support adaptiveMetadata",
+            )
+            .into());
+        }
+        let segment = self.log_compaction_segment(start_version, end_version)?;
+        let actions = MetadataPlanner::new(&segment, ActionSet::ALL, true)
+            .with_stats(StatsOptions::json_only())
+            .replay()?
+            .project_patch(|patch| {
+                // Replay ignores dataChange in compacted state; use true for both file actions.
+                patch
+                    .replace_expr_at([ADD_NAME], "dataChange", lit(true))
+                    .replace_expr_at([REMOVE_NAME], "dataChange", lit(true))
+                    .drop(VERSION)
+            })?;
+        let path =
+            ParsedLogPath::new_log_compaction(self.table_root(), start_version, end_version)?;
+        let plan = PlanBuilder::write_json([actions], path.location, false, false)?.build()?;
+        match executor
+            .execute_op(PlanOperation::QueryPlan(plan))
+            .and_then(|result| file_meta_from_batches(result.into_data()?))
+        {
+            Ok(file_meta) => Ok(file_meta),
+            Err(error) => match error.without_backtrace() {
+                KernelError::FileNotFound(path) => {
+                    let config = self.table_configuration().metadata().configuration();
+                    Err(Error::Delta(DeltaError::truncated_transaction_log(
+                        path.clone(),
+                        end_version,
+                        config.get("delta.logRetentionDuration").map(String::as_str),
+                        config
+                            .get("delta.checkpointRetentionDuration")
+                            .map(String::as_str),
+                        Some(Box::new(error)),
+                    )))
+                }
+                _ => Err(Error::Kernel(error)),
+            },
+        }
+    }
+
     // ============================================================================
     // Mutations
     // ============================================================================
@@ -1633,6 +1770,11 @@ impl Snapshot {
         let record_root = |root: &str, mode: ChecksumWriteResolutionMode| {
             span.record("root", root);
             write_span.record("resolution_mode", mode.as_ref());
+            debug!(
+                root,
+                resolution_mode = mode.as_ref(),
+                "Selected checksum resolution strategy"
+            );
         };
         // Case 1: an in-memory CRC at this version is ready to write as-is.
         if let Some(crc) = self.crc_at_version() {
@@ -1867,18 +2009,32 @@ impl Snapshot {
         let checkpoint_log_path = ParsedLogPath::new(info.file_meta).ok_or_else(|| {
             KernelError::internal_error("Checkpoint path could not be parsed as a log path")
         })?;
+        let checkpoint_type = match mode {
+            CheckpointWriteMode::NotAttempted => {
+                return Err(KernelError::internal_error(
+                    "a successful checkpoint write must select a checkpoint mode",
+                )
+                .into());
+            }
+            CheckpointWriteMode::V1 => SelectedCheckpointType::V1,
+            CheckpointWriteMode::V2WithoutSidecars | CheckpointWriteMode::V2WithSidecars => {
+                SelectedCheckpointType::V2
+            }
+        };
         let new_log_segment = self
             .log_segment
             .try_new_with_checkpoint(checkpoint_log_path)?;
         // Carry only an at-version CRC forward: the checkpoint drops the commits below it, so a
         // stale base could no longer be advanced over them.
-        let new_snapshot = Arc::new(Snapshot::new_with_crc(
+        let mut new_snapshot = Snapshot::new_with_crc(
             new_log_segment,
             self.table_configuration().clone(),
             self.crc_at_version().cloned(),
             self.built_as_latest,
             false, /* skipped_new_checkpoints */
-        )?);
+        )?;
+        new_snapshot.retained_checkpoint_type = Some(checkpoint_type);
+        let new_snapshot = Arc::new(new_snapshot);
         span.record(
             "size_in_bytes",
             info.last_checkpoint_stats.size_in_bytes as u64,

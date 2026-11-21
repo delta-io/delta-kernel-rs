@@ -373,7 +373,7 @@ impl Values {
 impl<T: Into<StructData> + ToSchema> FromIterator<T> for Values {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         let rows = iter.into_iter().map(|row| row.into().into_parts().1);
-        Self::new(Arc::new(T::to_schema()), rows.collect())
+        Self::new(T::schema_ref().clone(), rows.collect())
     }
 }
 
@@ -389,8 +389,7 @@ where
         rows.into_iter()
             .enumerate()
             .map(|(index, row)| {
-                let schema = schema.as_ref().clone();
-                T::try_from(StructData::from_values_unchecked(schema, row))
+                T::try_from(StructData::from_values_unchecked(Arc::clone(&schema), row))
                     .map_err(|error| add_scalar_path_context(error, format!("[{index}]")))
             })
             .try_collect()

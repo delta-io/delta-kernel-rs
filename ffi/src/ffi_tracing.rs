@@ -32,7 +32,7 @@ use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{Layer, Registry, reload};
 
 use crate::ffi_metrics::{MetricEvent, with_ffi_event};
-use crate::{KernelStringSlice, kernel_string_slice};
+use crate::{KernelStringSlice, OptionalValue, kernel_string_slice};
 
 /// A type-erased logging layer that lives in the reloadable logging slot of the global subscriber.
 /// cbindgen:ignore
@@ -125,6 +125,31 @@ pub type TracingEventFn = extern "C" fn(event: Event);
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn enable_event_tracing(callback: TracingEventFn, max_level: Level) -> bool {
     setup_event_subscriber(callback, max_level).is_ok()
+}
+
+/// Changes the shared logging filter without replacing its callback or format.
+///
+/// Pass `Some(level)` to enable logging up to that level, or `None` to disable it. Metrics and
+/// call-frame reporting retain their own filters. Returns false if the subscriber has not been
+/// initialized or the filter cannot be updated. This function does not install a logging callback.
+///
+/// A call to [`enable_event_tracing`], [`enable_log_line_tracing`], or
+/// [`enable_formatted_log_line_tracing`] replaces this level with its own `max_level`.
+///
+/// Concurrent calls are serialized. Do not call this synchronously from a tracing callback.
+#[unsafe(no_mangle)]
+pub extern "C" fn set_event_tracing_level(max_level: OptionalValue<Level>) -> bool {
+    let Ok(state) = TRACING_STATE.lock() else {
+        return false;
+    };
+    let Some(filter) = &state.logging_filter else {
+        return false;
+    };
+    let level = match max_level {
+        OptionalValue::Some(level) => LevelFilter::from(level),
+        OptionalValue::None => LevelFilter::OFF,
+    };
+    filter.reload(level).is_ok()
 }
 
 pub type TracingLogLineFn = extern "C" fn(line: KernelStringSlice);
@@ -722,6 +747,7 @@ pub unsafe extern "C" fn enable_frame_reporting(callback: FrameEventFn) -> bool 
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::process::Command;
 
     use tracing::field::Empty;
     use tracing::{debug, info, trace};
@@ -1193,6 +1219,69 @@ mod tests {
     fn emit_reloadable_frame_span() {
         let span = tracing::trace_span!("reloadable", enable_call_frame = Empty);
         let _guard = span.enter();
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot spawn subprocesses")]
+    fn event_tracing_level_updates_keep_frames_enabled() {
+        const CHILD: &str = "DELTA_KERNEL_LOG_LEVEL_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ffi_tracing::tests::event_tracing_level_updates_keep_frames_enabled",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                stdout.contains("test result: ok. 1 passed;"),
+                "child did not run exactly one test:\n{stdout}"
+            );
+            return;
+        }
+
+        assert!(!set_event_tracing_level(OptionalValue::Some(Level::TRACE)));
+        setup_event_subscriber(event_callback_with_filter_1, Level::ERROR).unwrap();
+        setup_metrics_reporter(capture_metric_event).unwrap();
+        TRACING_STATE
+            .lock()
+            .unwrap()
+            .register_frame_callback(capture_frame_event)
+            .unwrap();
+        for (level, expected) in [
+            (OptionalValue::None, 0),
+            (OptionalValue::Some(Level::WARN), 2),
+            (OptionalValue::Some(Level::DEBUG), 4),
+            (OptionalValue::Some(Level::TRACE), 5),
+            (OptionalValue::Some(Level::ERROR), 1),
+            (OptionalValue::None, 0),
+            (OptionalValue::Some(Level::INFO), 3),
+        ] {
+            assert!(set_event_tracing_level(level));
+            setup_events();
+            tracing::error!("Testing 1");
+            tracing::warn!("Testing 1");
+            info!("Testing 1");
+            debug!("Testing 1");
+            trace!("Testing 1");
+            with_events(|events| assert_eq!(events.unwrap().len(), expected));
+            let frames = capture_frame_events(emit_reloadable_frame_span);
+            assert_eq!(frames.len(), 2);
+            assert!(frames[0].is_open);
+            assert!(!frames[1].is_open);
+            assert_eq!(frames[0].span_id, frames[1].span_id);
+            METRIC_EVENTS.with(|events| *events.borrow_mut() = Some(vec![]));
+            delta_kernel::metrics::emit_json_read_completed(3, 100);
+            with_metric_events(|events| assert_eq!(events.unwrap(), ["json:3:100"]));
+        }
     }
 
     #[test]
