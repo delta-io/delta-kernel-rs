@@ -15,6 +15,7 @@ use crate::expressions::{
     ColumnName, Expression as Expr, Predicate, UnaryExpressionOp, col, column_name, expr,
 };
 use crate::log_segment::LogSegment;
+use crate::metrics::MetadataPlanReport;
 use crate::scan::{PartitionValuesOptions, StatsOptions, map_to_struct_options};
 use crate::schema::{
     CheckpointFieldKind, DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
@@ -47,6 +48,7 @@ pub(crate) struct MetadataPlanner<'a> {
     pub(crate) parsed_partition_schema: Option<SchemaRef>,
     pub(crate) read_collations: bool,
     pub(crate) stats_filter: Option<Predicate>,
+    report: MetadataPlanReport,
 }
 
 /// The statistics representation present in a metadata plan.
@@ -73,6 +75,7 @@ impl<'a> MetadataPlanner<'a> {
             parsed_partition_schema: None,
             read_collations: false,
             stats_filter: None,
+            report: MetadataPlanReport::default(),
         }
     }
 
@@ -124,7 +127,7 @@ impl<'a> MetadataPlanner<'a> {
     /// Reconstructs requested actions with the configured stats and partition representations.
     /// Uses the caller's resolved schemas and options; sources supply `version`.
     /// Checkpoint file actions require a resolved shape. Winning domain deletions are retained.
-    pub(crate) fn replay(&self) -> KernelResult<PlanBuilder> {
+    pub(crate) fn replay(&mut self) -> KernelResult<PlanBuilder> {
         let commits = self.commit_actions(self.segment.checkpoint_version)?;
         let checkpoint = self.checkpoint_actions()?;
         self.replay_actions(commits, checkpoint)
@@ -190,12 +193,21 @@ impl<'a> MetadataPlanner<'a> {
     /// JSON stats are retained or synthesized only when requested.
     /// Unrequested tombstones retain their rows and keys for replay without the remove payload.
     pub(crate) fn commit_actions(
-        &self,
+        &mut self,
         base_version: Option<Version>,
     ) -> KernelResult<PlanBuilder> {
-        self.build_metadata_plan(ActionSource::Commit, None, |schema| {
-            sources::commit_arm(self.segment, base_version, schema, self.use_compactions)
-        })
+        let mut report = std::mem::take(&mut self.report);
+        let result = self.build_metadata_plan(ActionSource::Commit, None, |schema| {
+            sources::commit_arm(
+                self.segment,
+                base_version,
+                schema,
+                self.use_compactions,
+                &mut report,
+            )
+        });
+        self.report = report;
+        result
     }
 
     /// Reads and filters selected actions, attaches their identity key, then prepares metadata.
