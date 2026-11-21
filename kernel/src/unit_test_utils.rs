@@ -52,7 +52,9 @@ use crate::table_properties::{
     ENABLE_ROW_TRACKING,
 };
 use crate::transaction::create_table::create_table;
-use crate::transaction::{BASE_ADD_FILES_SCHEMA, CreateTable, Transaction};
+use crate::transaction::{
+    BASE_ADD_FILES_SCHEMA, CommittedTransaction, CreateTable, Transaction, UpdateTableOperation,
+};
 use crate::{
     Engine, EngineData, FileMeta, KernelError, KernelResult, Result, Snapshot, SnapshotRef, Version,
 };
@@ -397,6 +399,20 @@ pub(crate) fn action_batch() -> Box<dyn EngineData> {
 /// `txn`-typed and one `domainMetadata`-typed sidecar. The checkpoint row is surrounded by
 /// non-checkpoint action rows so the outer `CheckpointVisitor` must skip other rows in the
 /// batch and locate the checkpoint action among them.
+/// Commits a write transaction on the latest snapshot of the table at `table_root`, after
+/// `configure` adds its actions.
+pub(crate) fn commit_on_latest(
+    engine: &dyn Engine,
+    table_root: impl AsRef<str>,
+    configure: impl FnOnce(Transaction) -> KernelResult<Transaction>,
+) -> Result<CommittedTransaction> {
+    let transaction = Snapshot::builder_for(table_root)
+        .build(engine)?
+        .update_table(UpdateTableOperation::Write, "test", true)
+        .build(engine, Box::new(FileSystemCommitter::new()))?;
+    Ok(configure(transaction)?.commit(engine)?.unwrap_committed())
+}
+
 #[cfg(feature = "adaptive-metadata-in-dev")]
 pub(crate) fn checkpoint_action_batch() -> Box<dyn EngineData> {
     let json_strings: StringArray = vec![
@@ -416,8 +432,9 @@ pub(crate) mod adaptive_metadata_fixtures {
 
     use super::*;
     use crate::actions::{
-        CheckpointAction, ContentRoot, DomainMetadata, LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA,
-        LastManifestCommit, Sidecar,
+        CheckpointAction, ContentRoot, DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA,
+        LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA, LOG_TXN_SCHEMA, LastManifestCommit,
+        SetTransaction, Sidecar,
     };
     use crate::arrow::array::{Array as _, AsArray as _};
     use crate::content_tree::ContentTreeNodeEntry;
@@ -553,6 +570,29 @@ pub(crate) mod adaptive_metadata_fixtures {
             .write_parquet_file(location, Box::new(iter::once(Ok(data))))
             .unwrap();
         Sidecar::new(name.to_string(), size as i64, 0, None)
+    }
+
+    /// Writes `txns` as the `txn` sidecar `name` of the table at `table_root`.
+    pub(crate) fn write_txn_sidecar(
+        engine: &SyncEngine,
+        table_root: &Url,
+        name: &str,
+        txns: impl IntoIterator<Item = SetTransaction>,
+    ) -> Sidecar {
+        let rows = txns.into_iter().map(Into::into).collect();
+        write_sidecar(engine, table_root, name, LOG_TXN_SCHEMA.clone(), rows)
+    }
+
+    /// Writes `domains` as the `domainMetadata` sidecar `name` of the table at `table_root`.
+    pub(crate) fn write_domain_metadata_sidecar(
+        engine: &SyncEngine,
+        table_root: &Url,
+        name: &str,
+        domains: impl IntoIterator<Item = DomainMetadata>,
+    ) -> Sidecar {
+        let rows = domains.into_iter().map(Into::into).collect();
+        let schema = LOG_DOMAIN_METADATA_SCHEMA.clone();
+        write_sidecar(engine, table_root, name, schema, rows)
     }
 
     /// Creates an empty in-memory table and returns its engine and table-root URL.
