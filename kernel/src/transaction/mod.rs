@@ -1413,10 +1413,17 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         // enforces presence: `try_compute_for_txn` above errors with `MissingData` if any
         // add or remove row lacks `size` (see `FileStatsVisitor::visit` in
         // `kernel/src/crc/file_stats.rs`). So at this point every size is known to be
-        // present, and only operation classification can flip `is_incremental_safe`.
+        // present, and only operation classification or a manifest write can flip
+        // `is_incremental_safe`.
         // TODO(#3714): Preserve incremental file stats for commits without add/remove actions,
         // matching replay's safety rule.
-        let is_incremental_safe = self.operation.is_incremental_safe();
+        let operation_is_incremental_safe = self.operation.is_incremental_safe();
+        // A manifest write records its files in the manifest, not as add/remove actions. The
+        // operation itself is still supported, so it is not reported as the cause.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let is_incremental_safe = operation_is_incremental_safe && self.manifest_write.is_none();
+        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+        let is_incremental_safe = operation_is_incremental_safe;
         Ok(CrcDelta {
             file_stats,
             protocol: self
@@ -1431,7 +1438,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
             #[cfg(feature = "adaptive-metadata-in-dev")]
             last_manifest_commit: commit_info.last_manifest_commit,
             is_incremental_safe,
-            unsupported_operation: (!is_incremental_safe)
+            unsupported_operation: (!operation_is_incremental_safe)
                 .then(|| self.operation.as_str().to_string()),
         })
     }

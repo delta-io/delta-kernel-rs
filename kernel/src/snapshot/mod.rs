@@ -207,6 +207,24 @@ fn unresolved_crc(reason: &str) -> KernelError {
     KernelError::ChecksumWriteUnsupported(format!("Cannot resolve a CRC to write: {reason}"))
 }
 
+/// Errors if the checkpoint at `checkpoint_version` may reference an adaptiveMetadata manifest
+/// tree, given the newest `lastManifestCommit` at or after it. Such a checkpoint lists only the
+/// files added after the tree, so counting its adds misses the tree's files.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn require_no_manifest_tree_at_checkpoint(
+    checkpoint_version: Version,
+    last_manifest_commit: Option<&LastManifestCommit>,
+) -> KernelResult<()> {
+    match last_manifest_commit {
+        Some(last_manifest_commit) => Err(unresolved_crc(&format!(
+            "checkpoint {checkpoint_version} may not list the files of adaptiveMetadata manifest \
+             commit {}",
+            last_manifest_commit.version
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Table configuration, validated [`SnapshotCrc`], and (under AMT) checkpoint-action resolution
 /// produced by the P&M resolution step, ready to build a [`Snapshot`].
 struct PreparedSnapshot {
@@ -1685,7 +1703,10 @@ impl Snapshot {
     ///   the resolved CRC's `file_stats_state` is `Indeterminate` (a non-incremental operation like
     ///   Manual Update, or a counted file action with a missing size; recoverable with a full state
     ///   reconstruction in the future), or if `delta.enableInCommitTimestamps` is `true` but
-    ///   `inCommitTimestampOpt` is absent.
+    ///   `inCommitTimestampOpt` is absent. On an adaptiveMetadata table, kernel cannot count the
+    ///   files in a manifest tree, so this also fails once the table has a manifest commit, unless
+    ///   a CRC at or after the newest manifest commit exists to build on. Such a CRC must come from
+    ///   a writer that knows the tree's files.
     /// - The underlying read error if in-commit timestamps are enabled but the timestamp cannot be
     ///   read from the commit file.
     /// - I/O errors from the engine's storage handler if the write fails.
@@ -1756,8 +1777,9 @@ impl Snapshot {
     /// 4. A full reverse replay of the commit history.
     ///
     /// Returns [`KernelError::ChecksumWriteUnsupported`] when a root is reached but cannot yield a
-    /// writable CRC (missing protocol or metadata, or a non-incremental tail that dooms file
-    /// stats).
+    /// writable CRC (missing protocol or metadata, a non-incremental tail that dooms file stats,
+    /// or a checkpoint on a table with a manifest commit, which may not list the manifest tree's
+    /// files).
     ///
     /// The `root` span field records the selected root. `write_span` records its resolution mode.
     #[instrument(parent = &self.span, name = "snap.resolve_crc_for_write", skip_all, err, fields(root))]
@@ -1804,9 +1826,6 @@ impl Snapshot {
                 // A checkpoint carries no ICT or lastManifestCommit (it has no commitInfo). Since
                 // there's no tail delta to carry them either, read them from the commit at the
                 // checkpoint version. adaptiveMetadata requires ICT, so one read yields both.
-                let mut crc = log_segment
-                    .build_crc_from_checkpoint(engine)?
-                    .ok_or_else(|| unresolved_crc("checkpoint is missing protocol or metadata"))?;
                 #[cfg(feature = "adaptive-metadata-in-dev")]
                 if self
                     .table_configuration()
@@ -1814,10 +1833,16 @@ impl Snapshot {
                 {
                     let (in_commit_timestamp, last_manifest_commit) =
                         self.read_ict_and_last_manifest_commit(engine)?;
+                    require_no_manifest_tree_at_checkpoint(
+                        checkpoint_version,
+                        last_manifest_commit.as_ref(),
+                    )?;
+                    let mut crc = self.build_crc_from_checkpoint(engine)?;
                     crc.in_commit_timestamp_opt = Some(in_commit_timestamp);
                     crc.last_manifest_commit_opt = last_manifest_commit;
                     return Ok(Arc::new(crc));
                 }
+                let mut crc = self.build_crc_from_checkpoint(engine)?;
                 crc.in_commit_timestamp_opt = self.get_in_commit_timestamp(engine)?;
                 return Ok(Arc::new(crc));
             }
@@ -1835,9 +1860,15 @@ impl Snapshot {
                     None => "commits after the checkpoint are not incremental-safe".to_string(),
                 })
             );
-            let base = log_segment
-                .build_crc_from_checkpoint(engine)?
-                .ok_or_else(|| unresolved_crc("checkpoint is missing protocol or metadata"))?;
+            // The tail's lastManifestCommit is set iff a manifest commit is at or before `end`. It
+            // may be older than the checkpoint, and a newer one can hide an older one, so any
+            // pointer means the checkpoint may reference a tree.
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            require_no_manifest_tree_at_checkpoint(
+                checkpoint_version,
+                delta.last_manifest_commit.as_ref(),
+            )?;
+            let base = self.build_crc_from_checkpoint(engine)?;
             // The tail delta carries v_end's ICT, which `apply` sets on the result.
             return Ok(Arc::new(base.apply(delta, end)));
         }
@@ -1848,6 +1879,13 @@ impl Snapshot {
             .build_crc_from_version_zero(engine)?
             .ok_or_else(|| unresolved_crc("commit history is missing protocol or metadata"))?;
         Ok(Arc::new(crc))
+    }
+
+    /// Builds the CRC at this snapshot's checkpoint version from its checkpoint files.
+    fn build_crc_from_checkpoint(&self, engine: &dyn Engine) -> KernelResult<Crc> {
+        self.log_segment
+            .build_crc_from_checkpoint(engine)?
+            .ok_or_else(|| unresolved_crc("checkpoint is missing protocol or metadata"))
     }
 
     /// Performs a complete checkpoint of this snapshot using the provided engine.

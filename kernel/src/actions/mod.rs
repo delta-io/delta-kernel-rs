@@ -1484,6 +1484,13 @@ impl LastManifestCommit {
         Ok(())
     }
 
+    /// Whether this manifest commit's tree covers its own version, so its file changes are recorded
+    /// only in the tree. Otherwise the tree covers the table up to `contentRootVersion`, and the
+    /// commit's adds and removes are in the log.
+    pub(crate) fn files_only_in_manifest(&self) -> bool {
+        self.content_root_version == self.version
+    }
+
     /// Errors unless this names a manifest commit at or before `commit_version`, the version of
     /// the commit or CRC that carries it.
     pub(crate) fn ensure_at_or_before(&self, commit_version: Version) -> KernelResult<()> {
