@@ -380,7 +380,7 @@ impl From<&Expression> for proto_expr::Expression {
                 }))
             }
             // No proto cast node yet; serialize as an opaque unknown.
-            Expression::Cast(cast) => Kind::Unknown(format!("cast_to_{}", cast.target)),
+            Expression::Cast(cast) => Kind::Unknown(cast.unknown_name()),
         };
         proto_expr::Expression { kind: Some(kind) }
     }
@@ -1114,6 +1114,7 @@ mod tests {
         ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values, WriteJson,
     };
     use crate::plans::ir::plan::{Plan, PlanNode};
+    use crate::plans::proto::expressions::expression::Kind as ExprKind;
     use crate::plans::proto::{
         expressions as proto_expr, operation as proto_op, plan as proto_plan,
         schema as proto_schema,
@@ -1798,6 +1799,22 @@ mod tests {
             Kind::Unknown(_) => "unknown",
         };
         assert_eq!(kind, expected);
+    }
+
+    #[rstest]
+    #[case::safe(Expression::cast(col!("n"), DataType::INTEGER), "cast_to_integer")]
+    #[case::strict(
+        Expression::cast_strict(col!("n"), DataType::INTEGER),
+        "strict_cast_to_integer"
+    )]
+    fn from_cast_expression_keeps_mode_in_unknown_name(
+        #[case] expr: Expression,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(
+            proto_expr::Expression::from(&expr).kind,
+            Some(ExprKind::Unknown(expected.to_string()))
+        );
     }
 
     #[rstest]

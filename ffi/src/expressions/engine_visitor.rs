@@ -777,11 +777,7 @@ fn visit_expression_impl(
             );
         }
         // TODO(#2975): Add a dedicated visitor callback for cast expressions.
-        Expression::Cast(cast) => visit_unknown(
-            visitor,
-            sibling_list_id,
-            &format!("cast_to_{}", cast.target),
-        ),
+        Expression::Cast(cast) => visit_unknown(visitor, sibling_list_id, &cast.unknown_name()),
         Expression::Unknown(name) => visit_unknown(visitor, sibling_list_id, name),
     }
 }
