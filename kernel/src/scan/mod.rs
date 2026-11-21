@@ -1176,7 +1176,18 @@ impl Scan {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<impl KernelResultIterator<ScanMetadata> + use<>> {
-        self.with_cancellable_engine(engine, |engine| self.scan_metadata_with_engine(engine))
+        let table = self.table_root().clone();
+        let snapshot_version = self.snapshot.version();
+        let annotate_err = move |error: KernelError| {
+            error.wrap_with_context(format!(
+                "Failed to scan metadata for table '{table}' at snapshot {snapshot_version}"
+            ))
+        };
+        let metadata = self
+            .with_cancellable_engine(engine, |engine| self.scan_metadata_with_engine(engine))
+            .map_err(&annotate_err)?;
+        // The iterator can outlive both this call and the scan that supplied its context.
+        Ok(metadata.map(move |result| result.map_err(&annotate_err)))
     }
 
     fn scan_metadata_with_engine(
@@ -1487,7 +1498,15 @@ impl Scan {
             event.stats = self.stats.clone();
             event.partition_values = self.partition_values_options.clone();
         });
-        let result = self.declarative_metadata_scan_plan_inner(engine);
+        let result = self
+            .declarative_metadata_scan_plan_inner(engine)
+            .map_err(|error| {
+                error.wrap_with_context(format!(
+                    "Failed to plan metadata scan for table '{}' at snapshot {}",
+                    self.table_root(),
+                    self.snapshot.version(),
+                ))
+            });
         crate::metrics::ScanPlanGenerationCompleted::update(|event| {
             event.outcome = match &result {
                 Ok(Some(_)) => crate::metrics::ScanPlanOutcome::Plan,

@@ -1,3 +1,4 @@
+use std::error::Error as _;
 use std::sync::Arc;
 
 use ::test_utils::table_builder::{
@@ -8,6 +9,7 @@ use rstest::rstest;
 use serde_json::Value;
 
 use super::*;
+use crate::action_reconciliation::plan::action_set::ActionSource;
 use crate::arrow::array::{Array, ArrayRef, BooleanArray, StringArray, StructArray};
 use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
@@ -19,7 +21,7 @@ use crate::engine::DelegatingEngine;
 use crate::engine::arrow_conversion::TryIntoArrow as _;
 use crate::engine::arrow_data::EngineDataArrowExt as _;
 use crate::engine::sync::SyncEngine;
-use crate::expressions::{Predicate as Pred, column_name, expr};
+use crate::expressions::{Predicate as Pred, col, column_name, expr};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::object_store::ObjectStoreExt as _;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -34,7 +36,7 @@ use crate::unit_test_utils::adaptive_metadata_fixtures::{
     commit_files, create_adaptive_metadata_table,
 };
 use crate::unit_test_utils::load_test_table;
-use crate::{Engine, Error, KernelResult, PredicateRef, Result, Snapshot, Version};
+use crate::{Engine, Error, KernelError, KernelResult, PredicateRef, Result, Snapshot, Version};
 
 // Normalizes metadata for comparison: the imperative path splits fields between the data batch
 // and fileConstantValues, while the declarative path returns them in an add struct.
@@ -1349,6 +1351,32 @@ fn declarative_metadata_pruning_keeps_remove_for_checkpoint_reconciliation() -> 
 }
 
 #[rstest]
+#[case::commit(ActionSource::Commit)]
+#[case::checkpoint(ActionSource::Checkpoint)]
+#[case::crc(ActionSource::Crc)]
+fn metadata_pruning_errors_preserve_builder_cause(#[case] source: ActionSource) -> Result<()> {
+    let (engine, snapshot, _tempdir) = load_test_table("with_checkpoint_no_last_checkpoint")?;
+    let scan = snapshot.clone().scan_builder().build()?;
+    let planner = MetadataPlanner::try_from_scan(&scan)?;
+    let planner = planner
+        .with_checkpoint_info(snapshot.checkpoint_info(engine.as_ref())?)
+        .with_stats_filter(Some(col!("add.missing_stat").is_not_null()));
+    let error = match source {
+        ActionSource::Commit => planner.commit_actions(None),
+        ActionSource::Checkpoint => planner.checkpoint_actions(),
+        ActionSource::Crc => planner.crc_adds(0, vec![]),
+    }
+    .unwrap_err();
+    let cause = error.without_backtrace();
+    assert!(
+        matches!(cause, KernelError::Generic(message)
+        if message.contains("filter: column `add.missing_stat` not found")),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[rstest]
 fn declarative_metadata_prunes_across_v1_log_states(
     #[values(
         LogState::with_latest_version(4),
@@ -1433,6 +1461,57 @@ fn assert_declarative_metadata_matches_imperative(
 }
 
 #[test]
+fn checkpoint_source_errors_include_context_after_discovery_succeeds() -> Result<()> {
+    struct InvalidSchemaExecutor;
+
+    impl crate::plans::PlanExecutor for InvalidSchemaExecutor {
+        fn execute_op(
+            &self,
+            _op: crate::plans::Operation,
+        ) -> KernelResult<crate::plans::PlanResult> {
+            Ok(crate::plans::PlanResult::ParquetFooter(
+                crate::ParquetFooter {
+                    schema: crate::schema::schema_ref! { nullable "add": STRING },
+                },
+            ))
+        }
+    }
+
+    let (engine, original, _tempdir) = load_test_table("with_checkpoint_no_last_checkpoint")?;
+    let mut segment = original.log_segment().clone();
+    segment.last_checkpoint_metadata = None;
+    let checkpoint = segment.listed.checkpoint_parts[0].location.location.clone();
+    let snapshot = Arc::new(Snapshot::new(
+        segment,
+        original.table_configuration().clone(),
+    )?);
+    let scan = snapshot.clone().scan_builder().build()?;
+    let engine = DelegatingEngine::new(engine).with_plan_executor(Arc::new(InvalidSchemaExecutor));
+    let error = scan.declarative_metadata_scan_plan(&engine).unwrap_err();
+    assert!(snapshot.cached_checkpoint_info().is_some());
+    let message = error.to_string();
+    for context in [
+        "Failed to plan metadata scan".to_owned(),
+        "Failed to construct checkpoint replay source".to_owned(),
+        snapshot.table_root().to_string(),
+        format!("snapshot {}", snapshot.version()),
+        checkpoint.to_string(),
+        "metadata source field 'add' must be a struct".to_owned(),
+    ] {
+        assert!(message.contains(&context), "{message}");
+    }
+    let cause = std::iter::successors(error.source(), |source| (*source).source())
+        .filter_map(|source| source.downcast_ref::<KernelError>())
+        .last()
+        .unwrap();
+    assert!(
+        matches!(cause.without_backtrace(), KernelError::Schema(_)),
+        "{cause}"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> Result<()> {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(4).with_checkpoint_at([2]))
@@ -1447,7 +1526,18 @@ fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> Resu
         .declarative_metadata_scan_plan(&no_plan_engine)
         .unwrap_err();
 
-    assert!(matches!(err, KernelError::Unsupported(_)));
+    let message = err.to_string();
+    assert!(message.contains(table.table_root()), "{message}");
+    assert!(message.contains("snapshot 4"), "{message}");
+    assert!(
+        message.contains("Failed to plan metadata scan"),
+        "{message}"
+    );
+    let cause = std::iter::successors(err.source(), |error| (*error).source())
+        .filter_map(|error| error.downcast_ref::<KernelError>())
+        .last()
+        .unwrap();
+    assert!(matches!(cause, KernelError::Unsupported(_)));
 
     let scan = snapshot
         .scan_builder()

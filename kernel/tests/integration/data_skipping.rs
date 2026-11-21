@@ -1178,10 +1178,19 @@ async fn scan_with_replace_table_schema_change(
     }
     let error = surviving_paths(&table_path, engine, predicate, use_parallel)
         .expect_err("an active incompatible add file should fail the scan");
-    assert!(matches!(
-        error.downcast_ref::<KernelError>(),
-        Some(KernelError::ParseError(_, _))
-    ));
+    assert!(
+        std::iter::successors(Some(error.as_ref()), |source| source.source()).any(|source| {
+            source.downcast_ref::<KernelError>().is_some_and(|source| {
+                matches!(source.without_backtrace(), KernelError::ParseError(_, _))
+            })
+        }),
+        "{error}"
+    );
+    if !use_parallel {
+        let message = error.to_string();
+        assert!(message.contains(table_url.as_str()), "{message}");
+        assert!(message.contains("snapshot 4"), "{message}");
+    }
     Ok(())
 }
 
