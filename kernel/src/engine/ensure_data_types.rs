@@ -1032,6 +1032,17 @@ mod tests {
             (PrimitiveType::Integer, PrimitiveType::Date),
             (PrimitiveType::Long, PrimitiveType::Timestamp),
             (PrimitiveType::Long, PrimitiveType::TimestampNtz),
+            #[cfg(feature = "nanosecond-timestamps")]
+            (PrimitiveType::TimestampNanos, PrimitiveType::Timestamp),
+            #[cfg(feature = "nanosecond-timestamps")]
+            (PrimitiveType::TimestampNanos, PrimitiveType::TimestampNtz),
+            #[cfg(feature = "nanosecond-timestamps")]
+            (PrimitiveType::TimestampNanosNtz, PrimitiveType::Timestamp),
+            #[cfg(feature = "nanosecond-timestamps")]
+            (
+                PrimitiveType::TimestampNanosNtz,
+                PrimitiveType::TimestampNtz,
+            ),
         ];
         for (source_kernel, target_kernel) in reinterpretation_pairs {
             // Verify the kernel-level rule holds

@@ -911,6 +911,33 @@ async fn millisecond_truncated_timestamp_stats_dont_overprune(
     Ok(())
 }
 
+/// A checkpoint's `stats_parsed` may store timestamp min/max values as INT96 (the legacy Spark
+/// timestamp encoding, still written by some writers). Arrow reads INT96 as a nanosecond
+/// timestamp with no timezone, so such `stats_parsed` must still be usable for skipping a
+/// microsecond `TIMESTAMP` column. The fixture's checkpoint has no JSON `stats`, so ignoring
+/// `stats_parsed` disables pruning.
+///
+/// Only the sequential path is covered: the parallel path does not read `stats_parsed` (#2832).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn int96_timestamp_stats_parsed_in_checkpoint_prunes_files()
+-> Result<(), Box<dyn std::error::Error>> {
+    let table_path = std::fs::canonicalize("./tests/data/int96-stats-parsed-checkpoint")?;
+    let table_url = Url::from_directory_path(&table_path)
+        .map_err(|_| "table_path should be a valid file URL")?;
+    let engine = test_utils::create_default_engine_mt_executor(&table_url)?;
+
+    // old.parquet spans 2020 and new.parquet spans 2024; only new.parquet can hold rows at or
+    // after 2023-01-01T00:00:00Z.
+    let survivors = surviving_paths(
+        table_url.as_str(),
+        engine,
+        timestamp_pred(Pred::ge, 1_672_531_200_000_000),
+        false,
+    )?;
+    assert_eq!(survivors, vec!["new.parquet".to_string()]);
+    Ok(())
+}
+
 /// Replace table may change partition and data column types. A scan after replacement should
 /// remain compatible with the old addFiles.
 #[rstest]
