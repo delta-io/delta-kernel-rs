@@ -1,6 +1,8 @@
 use std::borrow::{Cow, ToOwned};
 use std::sync::Arc;
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::expressions::MumblingBitmapContainsPredicate;
 use crate::expressions::{
     BinaryExpression, BinaryPredicate, CaseWhenExpression, CastExpression, ColumnName, Expression,
     ExpressionRef, ExpressionStructPatch, JunctionPredicate, MapToStructExpression,
@@ -217,6 +219,17 @@ pub trait ExpressionTransform<'a> {
         self.recurse_into_pred_junction(pred)
     }
 
+    /// Called for each Mumbling bitmap lookup encountered during the traversal. The
+    /// provided implementation just forwards to
+    /// [`Self::recurse_into_pred_mumbling_bitmap_contains`].
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn transform_pred_mumbling_bitmap_contains(
+        &mut self,
+        pred: &'a MumblingBitmapContainsPredicate,
+    ) -> Self::Output<MumblingBitmapContainsPredicate> {
+        self.recurse_into_pred_mumbling_bitmap_contains(pred)
+    }
+
     /// Called for each opaque predicate encountered during the traversal. The provided
     /// implementation just forwards to [`Self::recurse_into_pred_opaque`].
     fn transform_pred_opaque(
@@ -323,6 +336,11 @@ pub trait ExpressionTransform<'a> {
                 let child = self.transform_pred_junction(j);
                 map_owned_or_else(pred, child, |j| Predicate::junction(j.op, j.preds))
             }
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            Predicate::MumblingBitmapContains(m) => {
+                let child = self.transform_pred_mumbling_bitmap_contains(m);
+                map_owned_or_else(pred, child, Predicate::MumblingBitmapContains)
+            }
             Predicate::Opaque(o) => {
                 let child = self.transform_pred_opaque(o);
                 map_owned_or_else(pred, child, Predicate::Opaque)
@@ -366,7 +384,11 @@ pub trait ExpressionTransform<'a> {
 
     /// Recursively transforms the child expression of a cast expression (unary).
     fn recurse_into_expr_cast(&mut self, expr: &'a CastExpression) -> Self::Output<CastExpression> {
-        let f = |child| CastExpression::new(child, expr.target.clone());
+        let f = |child: Expression| CastExpression {
+            expr: Box::new(child),
+            target: expr.target.clone(),
+            options: expr.options,
+        };
         map_owned_or_else(expr, self.transform_expr(&expr.expr), f)
     }
 
@@ -405,6 +427,16 @@ pub trait ExpressionTransform<'a> {
         let right = self.transform_expr(&b.right);
         let f = |(left, right)| BinaryPredicate::new(b.op, left, right);
         map_owned_pair_or_else(b, left, right, f)
+    }
+
+    /// Recursively transforms the looked-up value of a Mumbling bitmap lookup (unary).
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn recurse_into_pred_mumbling_bitmap_contains(
+        &mut self,
+        m: &'a MumblingBitmapContainsPredicate,
+    ) -> Self::Output<MumblingBitmapContainsPredicate> {
+        let value = self.transform_expr(m.value());
+        map_owned_or_else(m, value, |value| m.with_value(value))
     }
 
     /// Recursively transforms a unary expression's child (unary).
@@ -593,6 +625,14 @@ impl<'a> ExpressionTransform<'a> for ExpressionDepthChecker {
         self.depth_limited(Self::recurse_into_pred_binary, pred)
     }
 
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn transform_pred_mumbling_bitmap_contains(
+        &mut self,
+        pred: &'a MumblingBitmapContainsPredicate,
+    ) -> KernelResult<()> {
+        self.depth_limited(Self::recurse_into_pred_mumbling_bitmap_contains, pred)
+    }
+
     fn transform_pred_junction(&mut self, pred: &'a JunctionPredicate) -> KernelResult<()> {
         self.depth_limited(Self::recurse_into_pred_junction, pred)
     }
@@ -619,6 +659,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::content_tree::mumbling::tests::encode_positions;
     use crate::expressions::VariadicExpressionOp::Coalesce;
     use crate::expressions::{
         Expression, Expression as Expr, MapToStructOptions, OpaqueExpressionOp, OpaquePredicateOp,
@@ -783,6 +825,9 @@ mod tests {
     #[case::parse_json(|name: Option<&str>| name.map(|n| {
         Expr::ParseJson(ParseJsonExpression::new(Expr::column([n]), test_output_schema()))
     }))]
+    #[case::strict_cast(|name: Option<&str>| name.map(|n| {
+        Expr::cast_strict(Expr::column([n]), DataType::INTEGER)
+    }))]
     #[case::parse_json_no_match(|_| Some(Expr::ParseJson(
         ParseJsonExpression::new(col!("unchanged_col"), test_output_schema()),
     )))]
@@ -804,6 +849,20 @@ mod tests {
             matches!(result, Some(Cow::Borrowed(_))),
             expected.as_ref() == Some(&input)
         );
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest::rstest]
+    fn test_transform_pred_mumbling_bitmap_contains_keeps_bitmap(
+        #[values(Some("new_col"), None)] replacement: Option<&'static str>,
+    ) {
+        let lookup = |name: &str| {
+            Pred::try_mumbling_bitmap_contains(encode_positions(&[1]), Expr::column([name]))
+                .unwrap()
+        };
+        let input = lookup("old_col");
+        let result = ColumnReplacer(replacement).transform_pred(&input);
+        assert_eq!(result.as_deref(), replacement.map(lookup).as_ref());
     }
 
     #[test]
