@@ -369,9 +369,9 @@ impl LogSegment {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     fn newest_commit_after_checkpoint(&self) -> Option<&ParsedLogPath> {
         self.listed
-            .ascending_commit_files
-            .last()
-            .filter(|commit| commit.version == self.end_version)
+            .latest_commit_file
+            .as_ref()
+            .filter(|_| self.checkpoint_version != Some(self.end_version))
     }
 }
 
