@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
 use super::*;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::content_tree::mumbling::tests::encode_positions;
 use crate::expressions::{
     ArrayData, Expression as Expr, OpaqueExpressionOp, OpaquePredicateOp, Predicate as Pred,
     ScalarExpressionEvaluator, StructData, col, column_name, column_pred, expr, lit, null_lit,
@@ -720,6 +722,43 @@ fn test_has_uri_scheme_is_never_evaluated_for_skipping(
         filter.eval_pred(&Pred::has_uri_scheme(expr), inverted),
         None
     );
+}
+
+#[rstest::rstest]
+fn test_eval_binary_strict_cast_column_is_unknown(
+    #[values(true, false)] cast_on_left: bool,
+    #[values(
+        BinaryPredicateOp::LessThan,
+        BinaryPredicateOp::GreaterThan,
+        BinaryPredicateOp::Equal
+    )]
+    op: BinaryPredicateOp,
+) {
+    let filter = DefaultKernelPredicateEvaluator::from(Scalar::String("1".to_string()));
+    let strict = Expr::cast_strict(col!("x"), DataType::INTEGER);
+    let val = lit(10);
+    let (left, right) = if cast_on_left {
+        (&strict, &val)
+    } else {
+        (&val, &strict)
+    };
+    assert_eq!(filter.eval_pred_binary(op, left, right, false), None);
+}
+
+#[rstest::rstest]
+#[case::safe(Expr::cast(col!("x"), DataType::INTEGER), Some(Scalar::Integer(1)))]
+#[case::strict(Expr::cast_strict(col!("x"), DataType::INTEGER), None)]
+fn test_eval_expr_evaluates_only_safe_casts(#[case] expr: Expr, #[case] expected: Option<Scalar>) {
+    let filter = DefaultKernelPredicateEvaluator::from(Scalar::String("1".to_string()));
+    assert_eq!(filter.eval_expr(&expr), expected);
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[test]
+fn test_mumbling_bitmap_contains_is_never_evaluated_for_skipping() {
+    let filter = DefaultKernelPredicateEvaluator::from(Scalar::Long(1));
+    let pred = Pred::try_mumbling_bitmap_contains(encode_positions(&[1]), col!("pos")).unwrap();
+    assert_eq!(filter.eval(&pred), None);
 }
 
 #[derive(Debug, PartialEq)]
