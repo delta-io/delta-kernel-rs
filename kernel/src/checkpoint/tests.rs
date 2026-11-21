@@ -25,6 +25,7 @@ use crate::checkpoint::{
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use crate::committer::FileSystemCommitter;
+use crate::engine::DelegatingEngine;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::sync::SyncEngine;
 use crate::log_replay::HasSelectionVector;
@@ -36,12 +37,68 @@ use crate::table_features::TableFeature;
 use crate::transaction::UpdateTableOperation;
 use crate::transaction::create_table::create_table;
 use crate::unit_test_utils::Action;
+#[cfg(feature = "declarative-plans")]
+use crate::unit_test_utils::plans::execute_plan;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::unit_test_utils::{
     adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
 };
 pub(super) use crate::unit_test_utils::{create_add_action, create_remove_action};
-use crate::{Error, FileMeta, KernelError, KernelResult, LogPath, Result, Snapshot};
+use crate::{Engine, Error, FileMeta, KernelError, KernelResult, LogPath, Result, Snapshot};
+
+fn checkpoint_engine(engine: SyncEngine, declarative: bool) -> DelegatingEngine {
+    let engine = DelegatingEngine::new(Arc::new(engine));
+    if declarative {
+        engine
+    } else {
+        engine.without_plan_executor()
+    }
+}
+
+fn checkpoint_batches(
+    writer: &CheckpointWriter,
+    engine: &dyn Engine,
+) -> KernelResult<Vec<RecordBatch>> {
+    #[cfg(feature = "declarative-plans")]
+    if engine.plan_executor().is_some() {
+        if writer.schema_context.is_v2 {
+            let (content, non_content) = writer.declarative_v2_checkpoint_data_plans(engine)?;
+            let mut batches = execute_plan(engine, content)?;
+            batches.extend(execute_plan(engine, non_content)?);
+            return Ok(batches);
+        }
+        return execute_plan(engine, writer.declarative_checkpoint_data_plan(engine)?);
+    }
+    writer
+        .checkpoint_data(engine)?
+        .map(|batch| batch?.apply_selection_vector()?.try_into_record_batch())
+        .collect()
+}
+
+fn assert_checkpoint_actions(batches: &[RecordBatch], expected: &[(&str, Option<&str>)]) {
+    let mut actions = Vec::new();
+    for batch in batches {
+        for (field, column) in batch.schema_ref().fields().iter().zip(batch.columns()) {
+            // Reconstruction plans leave the manifest's checkpointMetadata to the writer.
+            if field.name() == "checkpointMetadata" {
+                continue;
+            }
+            let action = column.as_struct();
+            for row in 0..action.len() {
+                if action.is_valid(row) {
+                    let path = action
+                        .column_by_name("path")
+                        .map(|paths| paths.as_string::<i32>().value(row));
+                    actions.push((field.name().as_str(), path));
+                }
+            }
+        }
+    }
+    actions.sort_unstable();
+    let mut expected = expected.to_vec();
+    expected.sort_unstable();
+    assert_eq!(actions, expected);
+}
 
 #[rstest::rstest]
 #[case::default_retention(
@@ -332,10 +389,13 @@ async fn read_last_checkpoint_file(store: &Arc<InMemory>) -> KernelResult<Value>
 /// Tests the `checkpoint()` API with:
 /// - A table that does not support v2Checkpoint
 /// - No version specified (latest version is used)
+#[rstest::rstest]
+#[case::imperative(false)]
+#[cfg_attr(feature = "declarative-plans", case::declarative(true))]
 #[tokio::test]
-async fn test_v1_checkpoint_latest_version_by_default() -> Result<()> {
+async fn test_v1_checkpoint_latest_version_by_default(#[case] declarative: bool) -> Result<()> {
     let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = checkpoint_engine(SyncEngine::new_with_store(store.clone()), declarative);
 
     // 1st commit: adds `fake_path_1`
     write_commit_to_store(
@@ -376,6 +436,19 @@ async fn test_v1_checkpoint_latest_version_by_default() -> Result<()> {
             .map_err(KernelError::from)?
     );
 
+    assert_checkpoint_actions(
+        &checkpoint_batches(&writer, &engine)?,
+        &[
+            ("add", Some("fake_path_2")),
+            ("remove", Some("fake_path_1")),
+            ("metaData", None),
+            ("protocol", None),
+        ],
+    );
+    if declarative {
+        return Ok(());
+    }
+
     let result = writer.checkpoint_data(&engine)?;
     let mut data_iter = result;
     // The first batch should be the metadata and protocol actions.
@@ -411,10 +484,13 @@ async fn test_v1_checkpoint_latest_version_by_default() -> Result<()> {
 /// Tests the `checkpoint()` API with:
 /// - A table that does not support v2Checkpoint
 /// - A specific version specified (version 0)
+#[rstest::rstest]
+#[case::imperative(false)]
+#[cfg_attr(feature = "declarative-plans", case::declarative(true))]
 #[tokio::test]
-async fn test_v1_checkpoint_specific_version() -> Result<()> {
+async fn test_v1_checkpoint_specific_version(#[case] declarative: bool) -> Result<()> {
     let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = checkpoint_engine(SyncEngine::new_with_store(store.clone()), declarative);
 
     // 1st commit (version 0) - metadata and protocol actions
     // Protocol action does not include the v2Checkpoint reader/writer feature.
@@ -449,6 +525,14 @@ async fn test_v1_checkpoint_specific_version() -> Result<()> {
         Url::parse("memory:///_delta_log/00000000000000000000.checkpoint.parquet")
             .map_err(KernelError::from)?
     );
+
+    assert_checkpoint_actions(
+        &checkpoint_batches(&writer, &engine)?,
+        &[("metaData", None), ("protocol", None)],
+    );
+    if declarative {
+        return Ok(());
+    }
 
     let result = writer.checkpoint_data(&engine)?;
     let mut data_iter = result;
@@ -568,10 +652,13 @@ fn test_last_checkpoint_hint_stats_rejects_invalid_input(
 /// Tests the `checkpoint()` API with:
 /// - A table that does supports v2Checkpoint
 /// - No version specified (latest version is used)
+#[rstest::rstest]
+#[case::imperative(false)]
+#[cfg_attr(feature = "declarative-plans", case::declarative(true))]
 #[tokio::test]
-async fn test_v2_checkpoint_supported_table() -> Result<()> {
+async fn test_v2_checkpoint_supported_table(#[case] declarative: bool) -> Result<()> {
     let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = checkpoint_engine(SyncEngine::new_with_store(store.clone()), declarative);
 
     // 1st commit: adds `fake_path_2` & removes `fake_path_1`
     write_commit_to_store(
@@ -606,6 +693,19 @@ async fn test_v2_checkpoint_supported_table() -> Result<()> {
         Url::parse("memory:///_delta_log/00000000000000000001.checkpoint.parquet")
             .map_err(KernelError::from)?
     );
+
+    assert_checkpoint_actions(
+        &checkpoint_batches(&writer, &engine)?,
+        &[
+            ("add", Some("fake_path_2")),
+            ("remove", Some("fake_path_1")),
+            ("metaData", None),
+            ("protocol", None),
+        ],
+    );
+    if declarative {
+        return Ok(());
+    }
 
     let result = writer.checkpoint_data(&engine)?;
     let mut data_iter = result;
@@ -644,10 +744,13 @@ async fn test_v2_checkpoint_supported_table() -> Result<()> {
     Ok(())
 }
 
+#[rstest::rstest]
+#[case::imperative(false)]
+#[cfg_attr(feature = "declarative-plans", case::declarative(true))]
 #[tokio::test]
-async fn test_no_checkpoint_on_unpublished_snapshot() -> Result<()> {
+async fn test_no_checkpoint_on_unpublished_snapshot(#[case] declarative: bool) -> Result<()> {
     let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = checkpoint_engine(SyncEngine::new_with_store(store.clone()), declarative);
 
     // normal commit with catalog-managed protocol
     write_commit_to_store(
@@ -690,7 +793,14 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> Result<()> {
         .build(&engine)?;
 
     assert!(matches!(
-        snapshot.create_checkpoint_writer(&engine).unwrap_err(),
+        snapshot
+            .clone()
+            .create_checkpoint_writer(&engine)
+            .unwrap_err(),
+        Error::Kernel(KernelError::UnpublishedVersion(1))
+    ));
+    assert!(matches!(
+        snapshot.checkpoint(&engine, None).unwrap_err(),
         Error::Kernel(KernelError::UnpublishedVersion(1))
     ));
     Ok(())
@@ -698,8 +808,11 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> Result<()> {
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[rstest::rstest]
+#[case::imperative(false)]
+#[cfg_attr(feature = "declarative-plans", case::declarative(true))]
 #[tokio::test]
 async fn test_no_standalone_checkpoint_on_adaptive_metadata_table(
+    #[case] declarative: bool,
     #[values(
         None,
         Some(CheckpointSpec::V1),
@@ -708,7 +821,7 @@ async fn test_no_standalone_checkpoint_on_adaptive_metadata_table(
     spec: Option<CheckpointSpec>,
 ) -> Result<()> {
     let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = checkpoint_engine(SyncEngine::new_with_store(store.clone()), declarative);
     let config = adaptive_metadata_table_configuration(test_schema_flat_with_column_mapping(), &[]);
     let commit = [
         json!({ "commitInfo": { "timestamp": 1, "inCommitTimestamp": 1 } }),
@@ -742,10 +855,13 @@ fn create_add_action_with_stats(path: &str, num_records: i64) -> Action {
     })
 }
 
+#[rstest::rstest]
+#[case::imperative(false)]
+#[cfg_attr(feature = "declarative-plans", case::declarative(true))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_snapshot_checkpoint() -> Result<()> {
+async fn test_snapshot_checkpoint(#[case] declarative: bool) -> Result<()> {
     let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = checkpoint_engine(SyncEngine::new_with_store(store.clone()), declarative);
 
     // Version 0: metadata & protocol
     write_commit_to_store(
@@ -847,8 +963,11 @@ async fn test_snapshot_checkpoint() -> Result<()> {
     Ok(())
 }
 
+#[rstest::rstest]
+#[case::imperative(false)]
+#[cfg_attr(feature = "declarative-plans", case::declarative(true))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_checkpoint_preserves_domain_metadata() -> Result<()> {
+async fn test_checkpoint_preserves_domain_metadata(#[case] declarative: bool) -> Result<()> {
     // ===== Setup =====
     let tmp_dir = tempdir().unwrap();
     let table_path = tmp_dir.path();
@@ -885,7 +1004,7 @@ async fn test_checkpoint_preserves_domain_metadata() -> Result<()> {
     .unwrap();
 
     // ===== Create Engine =====
-    let engine = SyncEngine::new();
+    let engine = checkpoint_engine(SyncEngine::new(), declarative);
 
     let commit_domain_metadata = |domain: &str, value: &str| -> Result<()> {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
@@ -921,8 +1040,13 @@ async fn test_checkpoint_preserves_domain_metadata() -> Result<()> {
     Ok(())
 }
 
+#[rstest::rstest]
+#[case::imperative(false)]
+#[cfg_attr(feature = "declarative-plans", case::declarative(true))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> Result<()> {
+async fn test_checkpoint_excludes_tombstoned_domain_metadata(
+    #[case] declarative: bool,
+) -> Result<()> {
     // ===== Setup =====
     let tmp_dir = tempdir().unwrap();
     let table_path = tmp_dir.path();
@@ -962,7 +1086,7 @@ async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> Result<()> {
     // Use SyncEngine::new() (not new_with_store(LocalFileSystem::new())) so the engine builds
     // per-URL LocalFileSystem instances rooted at the URL's drive. The bare
     // LocalFileSystem::new() rejects absolute Windows paths via file:// URLs.
-    let engine = SyncEngine::new();
+    let engine = checkpoint_engine(SyncEngine::new(), declarative);
 
     // ===== Commit domain metadata for "foo" =====
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
@@ -1005,10 +1129,15 @@ async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> Result<()> {
     Ok(())
 }
 
+#[rstest::rstest]
+#[case::imperative(false)]
+#[cfg_attr(feature = "declarative-plans", case::declarative(true))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer() -> Result<()> {
+async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
+    #[case] declarative: bool,
+) -> Result<()> {
     let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = checkpoint_engine(SyncEngine::new_with_store(store.clone()), declarative);
 
     let table_root = Url::parse("memory:///").map_err(KernelError::from)?;
     let _ = create_table(
@@ -1164,15 +1293,18 @@ fn verify_checkpoint_schema_with_partitions(
 ///    recovering stats from stats_parsed via ToJson, or vice versa)
 /// 4. Verifies checkpoint 2 schema matches (json2, struct2)
 #[rstest::rstest]
+#[case::imperative(false)]
+#[cfg_attr(feature = "declarative-plans", case::declarative(true))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_stats_config_round_trip(
+    #[case] declarative: bool,
     #[values(true, false)] json1: bool,
     #[values(true, false)] struct1: bool,
     #[values(true, false)] json2: bool,
     #[values(true, false)] struct2: bool,
 ) -> Result<()> {
     let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = checkpoint_engine(SyncEngine::new_with_store(store.clone()), declarative);
     let table_root = Url::parse("memory:///").map_err(KernelError::from)?;
 
     // Commit 0: protocol + metadata with initial settings
@@ -1211,18 +1343,11 @@ async fn test_stats_config_round_trip(
     // expressions must recover stats across format changes.
     let snapshot2 = Snapshot::builder_for(table_root).build(&engine)?;
     let writer2 = snapshot2.create_checkpoint_writer(&engine)?;
-    let mut result2 = writer2.checkpoint_data(&engine)?;
+    let all_batches = checkpoint_batches(&writer2, &engine)?;
 
     // Verify checkpoint 2 schema matches new settings
-    let first_batch = result2.next().expect("should have at least one batch")?;
-    let data = first_batch.apply_selection_vector()?;
-    let record_batch = data.try_into_record_batch()?;
+    let record_batch = all_batches.first().expect("should have at least one batch");
     verify_checkpoint_schema(&record_batch.schema(), json2, struct2)?;
-
-    // Consume remaining batches (verifies COALESCE doesn't error)
-    for batch in result2 {
-        let _ = batch?;
-    }
 
     Ok(())
 }
@@ -1231,15 +1356,18 @@ async fn test_stats_config_round_trip(
 /// Verifies that `partitionValues_parsed` is included in the checkpoint schema when
 /// `writeStatsAsStruct` is true, and omitted when false.
 #[rstest::rstest]
+#[case::imperative(false)]
+#[cfg_attr(feature = "declarative-plans", case::declarative(true))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_stats_config_round_trip_partitioned(
+    #[case] declarative: bool,
     #[values(true, false)] json1: bool,
     #[values(true, false)] struct1: bool,
     #[values(true, false)] json2: bool,
     #[values(true, false)] struct2: bool,
 ) -> Result<()> {
     let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = checkpoint_engine(SyncEngine::new_with_store(store.clone()), declarative);
     let table_root = Url::parse("memory:///").map_err(KernelError::from)?;
 
     // Commit 0: protocol + partitioned metadata with initial settings
@@ -1289,15 +1417,9 @@ async fn test_stats_config_round_trip_partitioned(
     // Build snapshot that reads from checkpoint 1 + commit 2
     let snapshot2 = Snapshot::builder_for(table_root).build(&engine)?;
     let writer2 = snapshot2.create_checkpoint_writer(&engine)?;
-    let result2 = writer2.checkpoint_data(&engine)?;
 
     // Collect all checkpoint batches
-    let mut all_batches = Vec::new();
-    for batch_result in result2 {
-        let batch = batch_result?;
-        let data = batch.apply_selection_vector()?;
-        all_batches.push(data.try_into_record_batch()?);
-    }
+    let all_batches = checkpoint_batches(&writer2, &engine)?;
 
     // Verify checkpoint schema matches new settings
     verify_checkpoint_schema_with_partitions(
@@ -1348,10 +1470,13 @@ async fn test_stats_config_round_trip_partitioned(
 // the kernel builds a stats schema with that metadata on nullCount fields (via
 // NullCountStatsTransform), but the stats_parsed data from the old checkpoint lacks it,
 // causing an Arrow schema mismatch in the COALESCE expression.
+#[rstest::rstest]
+#[case::imperative(false)]
+#[cfg_attr(feature = "declarative-plans", case::declarative(true))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_checkpoint_with_varchar_metadata_on_field() -> Result<()> {
+async fn test_checkpoint_with_varchar_metadata_on_field(#[case] declarative: bool) -> Result<()> {
     let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = checkpoint_engine(SyncEngine::new_with_store(store.clone()), declarative);
 
     let config = HashMap::from([
         ("delta.checkpoint.writeStatsAsJson".into(), "true".into()),

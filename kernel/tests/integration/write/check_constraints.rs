@@ -8,11 +8,12 @@ use delta_kernel::table_properties::CheckConstraint;
 use delta_kernel::transaction::{Transaction, UpdateTableOperation};
 use delta_kernel::{Engine, KernelError, KernelResult, Snapshot, SnapshotRef};
 use rstest::rstest;
+use rstest_reuse::apply;
 use serde_json::json;
 use test_utils::{add_commit, create_add_files_metadata, test_table_setup, test_table_setup_mt};
 use url::Url;
 
-use crate::common::write_utils::get_scan_files;
+use crate::common::write_utils::{checkpoint_engine, checkpoint_modes, get_scan_files};
 
 const CHECK_CONSTRAINTS_FEATURE: &[&str] = &["checkConstraints"];
 const POSITIVE_AMOUNT: &[(&str, &str)] = &[("positive_amount", "amount > 0")];
@@ -108,12 +109,14 @@ async fn write_table(
     Ok(table_url)
 }
 
-#[rstest]
+#[apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshot_and_transaction_return_stored_constraints_in_name_order(
+    declarative: bool,
     #[values(false, true)] checkpoint: bool,
 ) -> delta_kernel::Result<()> {
     let (_tmp, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     let constraints = [
         ("NonEmptyName", "name != ''"),
         ("amount_below_limit", "amount < 1000"),
@@ -124,7 +127,7 @@ async fn snapshot_and_transaction_return_stored_constraints_in_name_order(
 
     let mut snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     if checkpoint {
-        snapshot.checkpoint(engine.as_ref(), None)?;
+        snapshot.checkpoint(checkpoint_engine.as_ref(), None)?;
         // A reloaded snapshot reads Metadata from the checkpoint instead of the commit.
         snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     }

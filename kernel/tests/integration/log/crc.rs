@@ -38,6 +38,8 @@ use test_utils::{
 };
 use url::Url;
 
+use crate::common::write_utils::{checkpoint_engine, checkpoint_modes};
+
 // ============================================================================
 // File stats from CRC on disk
 // ============================================================================
@@ -268,7 +270,7 @@ fn test_get_all_files_preserved_via_snapshot_hint() -> delta_kernel::Result<()> 
 
 // Tests incremental CRC replay when building a new snapshot from a base snapshot.
 // Base snapshot has a CRC at v3.
-#[rstest]
+#[rstest_reuse::apply(checkpoint_modes)]
 // no checkpoint, no newer CRC -> advance the base snapshot's crc@v3.
 #[case::in_memory_base(None, None, Some(5))]
 // a newer crc@v4 lands on disk and beats the base snapshot's crc@v3 -> advance crc@v4.
@@ -287,8 +289,10 @@ async fn test_incremental_update_advances_crc_with_real_file_stats(
     #[case] checkpoint_version: Option<Version>,
     #[case] crc_version: Option<Version>,
     #[case] expected_num_files: Option<i64>,
+    declarative: bool,
 ) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
 
     // ===== GIVEN: v0 (0 files, crc on disk), then five WRITE inserts (one file each) to v5 =====
     let committed = create_table_and_commit(&table_path, engine.as_ref())?;
@@ -322,7 +326,7 @@ async fn test_incremental_update_advances_crc_with_real_file_stats(
         Snapshot::builder_for(&table_path)
             .at_version(v)
             .build(engine.as_ref())?
-            .checkpoint(engine.as_ref(), None)?;
+            .checkpoint(checkpoint_engine.as_ref(), None)?;
     }
 
     // ===== WHEN: incrementally update the base snapshot to the latest version =====
@@ -749,15 +753,11 @@ async fn test_write_checksum_double_write_returns_already_exists(
     Ok(())
 }
 
-#[rstest]
+#[rstest_reuse::apply(checkpoint_modes)]
 #[case::version_zero(WriteRoot::VersionZero, None)]
 #[case::stale_crc_incremental(WriteRoot::StaleCrcIncrementalBuild, None)]
 #[case::stale_crc_non_incremental(WriteRoot::StaleCrcNonIncrementalBuild, None)]
 #[case::checkpoint_v1(WriteRoot::CheckpointWithTail, Some(CheckpointSpec::V1))]
-#[case::checkpoint_v2(
-    WriteRoot::CheckpointWithTail,
-    Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar))
-)]
 #[case::checkpoint_v2_sidecars(
     WriteRoot::CheckpointWithTail,
     Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
@@ -769,8 +769,33 @@ async fn test_write_checksum_preserves_stats_across_metadata_only_commits(
     #[case] root: WriteRoot,
     #[case] checkpoint: Option<CheckpointSpec>,
     #[values("VACUUM START", "VACUUM END", "SET TBLPROPERTIES", "ANALYZE STATS")] operation: &str,
+    declarative: bool,
+) -> delta_kernel::Result<()> {
+    check_metadata_only_commits(root, checkpoint, operation, declarative).await
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_write_checksum_preserves_stats_across_inline_v2_checkpoint(
+    #[values("VACUUM START", "VACUUM END", "SET TBLPROPERTIES", "ANALYZE STATS")] operation: &str,
+) -> delta_kernel::Result<()> {
+    check_metadata_only_commits(
+        WriteRoot::CheckpointWithTail,
+        Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar)),
+        operation,
+        false,
+    )
+    .await
+}
+
+async fn check_metadata_only_commits(
+    root: WriteRoot,
+    checkpoint: Option<CheckpointSpec>,
+    operation: &str,
+    declarative: bool,
 ) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     let mut builder = create_table(
         &table_path,
         schema_ref! { nullable "id": INTEGER },
@@ -790,7 +815,9 @@ async fn test_write_checksum_preserves_stats_across_metadata_only_commits(
         .unwrap_post_commit_snapshot();
     match root {
         WriteRoot::CheckpointWithTail => {
-            snap = snap.checkpoint(engine.as_ref(), checkpoint.as_ref())?.1;
+            snap = snap
+                .checkpoint(checkpoint_engine.as_ref(), checkpoint.as_ref())?
+                .1;
         }
         WriteRoot::StaleCrcIncrementalBuild | WriteRoot::StaleCrcNonIncrementalBuild => {
             snap.write_checksum(engine.as_ref())?;
@@ -880,7 +907,7 @@ enum WriteRoot {
 
 /// For each resolution root: build a table, load a snapshot, write the CRC, and validate its
 /// contents (file stats, active domains, set transactions).
-#[rstest]
+#[rstest_reuse::apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_write_checksum_resolves_correct_crc_from_each_root(
     #[values(
@@ -892,8 +919,10 @@ async fn test_write_checksum_resolves_correct_crc_from_each_root(
     )]
     root: WriteRoot,
     #[values(false, true)] ict_enabled: bool,
+    declarative: bool,
 ) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
 
     // === Create the table with domain metadata (and optionally ICT) enabled ===
     let schema = schema_ref! { nullable "id": INTEGER };
@@ -949,7 +978,7 @@ async fn test_write_checksum_resolves_correct_crc_from_each_root(
         if checkpoint_or_crc_version == Some(v) {
             match root {
                 WriteRoot::CheckpointNoTail | WriteRoot::CheckpointWithTail => {
-                    snap = snap.checkpoint(engine.as_ref(), None)?.1;
+                    snap = snap.checkpoint(checkpoint_engine.as_ref(), None)?.1;
                 }
                 WriteRoot::StaleCrcIncrementalBuild | WriteRoot::StaleCrcNonIncrementalBuild => {
                     snap.write_checksum(engine.as_ref())?;
@@ -1073,10 +1102,13 @@ async fn test_disabled_load_retains_stale_crc_as_base() -> delta_kernel::Result<
 /// Regression: a stale base carried through `checkpoint()` must not break a later `write_checksum`.
 /// The checkpoint drops the commits below it, so the stale base can no longer be advanced over
 /// them; resolution must fall back to the checkpoint root instead of erroring on a missing commit.
+#[rstest_reuse::apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_write_checksum_after_checkpoint_with_stale_base_resolves_from_checkpoint()
--> delta_kernel::Result<()> {
+async fn test_write_checksum_after_checkpoint_with_stale_base_resolves_from_checkpoint(
+    declarative: bool,
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     let source_path = std::fs::canonicalize(PathBuf::from("./tests/data/crc-full/")).unwrap();
     copy_directory(&source_path, _temp_dir.path()).unwrap();
 
@@ -1097,7 +1129,7 @@ async fn test_write_checksum_after_checkpoint_with_stale_base_resolves_from_chec
     // the v1 commit.
     let snap1 = Snapshot::builder_for(table_path).build(engine.as_ref())?;
     assert!(snap1.crc_at_version().is_none());
-    let (_, checkpointed) = snap1.checkpoint(engine.as_ref(), None)?;
+    let (_, checkpointed) = snap1.checkpoint(checkpoint_engine.as_ref(), None)?;
     assert_eq!(checkpointed.log_segment().checkpoint_version, Some(1));
 
     // Resolution must not trip the below-checkpoint base on the emptied commit tail.
@@ -1120,7 +1152,9 @@ async fn test_write_checksum_after_checkpoint_with_stale_base_resolves_from_chec
 async fn setup_incremental_below_checkpoint_base<E: TaskExecutor>(
     engine: &Arc<DefaultEngine<E>>,
     table_path: &str,
+    declarative: bool,
 ) -> delta_kernel::Result<SnapshotRef> {
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     let schema = schema_ref! { nullable "id": INTEGER };
     let mut snap = create_table(table_path, schema, "test_engine", true)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
@@ -1158,7 +1192,7 @@ async fn setup_incremental_below_checkpoint_base<E: TaskExecutor>(
     Snapshot::builder_for(table_path)
         .at_version(2)
         .build(engine.as_ref())?
-        .checkpoint(engine.as_ref(), None)?;
+        .checkpoint(checkpoint_engine.as_ref(), None)?;
 
     Ok(base)
 }
@@ -1168,10 +1202,13 @@ async fn setup_incremental_below_checkpoint_base<E: TaskExecutor>(
 /// would otherwise feed CRC@1 into `build_crc_from_base` on a segment whose checkpoint@2 dropped
 /// commit 2, erroring on the missing commit. The below-checkpoint base must be skipped, so the
 /// build falls back to log replay.
+#[rstest_reuse::apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_incremental_unlimited_skips_below_checkpoint_base() -> delta_kernel::Result<()> {
+async fn test_incremental_unlimited_skips_below_checkpoint_base(
+    declarative: bool,
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
-    let base = setup_incremental_below_checkpoint_base(&engine, &table_path).await?;
+    let base = setup_incremental_below_checkpoint_base(&engine, &table_path, declarative).await?;
 
     let updated = Snapshot::builder_from(base)
         .with_incremental_crc_replay(IncrementalReplay::Unlimited)
@@ -1185,11 +1222,13 @@ async fn test_incremental_unlimited_skips_below_checkpoint_base() -> delta_kerne
 /// Regression (incremental write path): after an incremental update retains a base below a
 /// newly-listed checkpoint, `write_checksum` must skip that below-checkpoint base and resolve from
 /// the checkpoint root rather than erroring on the commits the checkpoint subsumed.
+#[rstest_reuse::apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_write_checksum_incremental_stale_base_below_new_checkpoint_resolves()
--> delta_kernel::Result<()> {
+async fn test_write_checksum_incremental_stale_base_below_new_checkpoint_resolves(
+    declarative: bool,
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
-    let base = setup_incremental_below_checkpoint_base(&engine, &table_path).await?;
+    let base = setup_incremental_below_checkpoint_base(&engine, &table_path, declarative).await?;
 
     // Disabled update keeps the below-checkpoint base@1 un-advanced on the combined segment.
     let updated = Snapshot::builder_from(base).build(engine.as_ref())?;
@@ -1214,10 +1253,13 @@ async fn test_write_checksum_incremental_stale_base_below_new_checkpoint_resolve
 
 /// ICT enabled, checkpoint at the current version, but v_end's commit file is unreadable: the
 /// ICT read error propagates instead of being laundered into a generic "CRC unresolved" error.
+#[rstest_reuse::apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_propagates_read_error()
--> delta_kernel::Result<()> {
+async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_propagates_read_error(
+    declarative: bool,
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
 
     let schema = schema_ref! { nullable "id": INTEGER };
     let snap = create_table(&table_path, schema, "test_engine", true)
@@ -1235,7 +1277,7 @@ async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_p
     )
     .await?
     .unwrap_post_commit_snapshot();
-    let (_, snap) = snap.checkpoint(engine.as_ref(), None)?;
+    let (_, snap) = snap.checkpoint(checkpoint_engine.as_ref(), None)?;
     let checkpoint_version = snap.version();
 
     // Corrupt v_end's commit file so its ICT can't be read (the snapshot still loads from the
@@ -1279,7 +1321,7 @@ async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_p
     Ok(())
 }
 
-#[rstest]
+#[rstest_reuse::apply(checkpoint_modes)]
 #[case::full_history(WriteRoot::VersionZero)]
 #[case::stale_crc(WriteRoot::StaleCrcIncrementalBuild)]
 #[case::checkpoint(WriteRoot::CheckpointWithTail)]
@@ -1297,8 +1339,10 @@ async fn test_write_checksum_ignores_excluded_file_actions_and_counts_subsequent
         "Deletion Vector Tombstones"
     )]
     operation: &str,
+    declarative: bool,
 ) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     let snap = create_table_and_commit(&table_path, engine.as_ref())?
         .post_commit_snapshot()
         .unwrap()
@@ -1316,7 +1360,7 @@ async fn test_write_checksum_ignores_excluded_file_actions_and_counts_subsequent
             snap.write_checksum(engine.as_ref())?;
         }
         WriteRoot::CheckpointWithTail => {
-            snap.checkpoint(engine.as_ref(), None)?;
+            snap.checkpoint(checkpoint_engine.as_ref(), None)?;
         }
         WriteRoot::VersionZero => {}
         _ => unreachable!(),
@@ -1405,7 +1449,7 @@ async fn test_write_checksum_ignores_excluded_file_actions_and_counts_subsequent
     Ok(())
 }
 
-#[rstest]
+#[rstest_reuse::apply(checkpoint_modes)]
 #[case::checkpoint(true, IncrementalReplay::Disabled)]
 #[case::stale_crc(false, IncrementalReplay::Disabled)]
 #[case::advanced_crc(false, IncrementalReplay::Unlimited)]
@@ -1414,8 +1458,10 @@ async fn test_write_checksum_rejects_file_actions_with_unsafe_operation(
     #[case] with_checkpoint: bool,
     #[case] replay: IncrementalReplay,
     #[values("ANALYZE STATS", "Manual Update", "UNKNOWN", "SET TBLPROPERTIES")] operation: &str,
+    declarative: bool,
 ) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     let snap = create_table_and_commit(&table_path, engine.as_ref())?
         .post_commit_snapshot()
         .unwrap()
@@ -1431,7 +1477,7 @@ async fn test_write_checksum_rejects_file_actions_with_unsafe_operation(
     .await?
     .unwrap_post_commit_snapshot();
     if with_checkpoint {
-        snap = snap.checkpoint(engine.as_ref(), None)?.1;
+        snap = snap.checkpoint(checkpoint_engine.as_ref(), None)?.1;
     }
     insert_data_with(
         snap,
@@ -2703,7 +2749,7 @@ enum CrcStaleness {
     Absent,
 }
 
-#[rstest]
+#[rstest_reuse::apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_stale_crc_fresh_build_advance_matrix(
     #[values(
@@ -2713,6 +2759,7 @@ async fn test_stale_crc_fresh_build_advance_matrix(
     )]
     crc_staleness: CrcStaleness,
     #[values(false, true)] crc_missing_opt_fields: bool,
+    declarative: bool,
 ) -> delta_kernel::Result<()> {
     const CHECKPOINT_VERSION: i64 = 10;
     const LATEST_VERSION: i64 = 20;
@@ -2722,6 +2769,7 @@ async fn test_stale_crc_fresh_build_advance_matrix(
         CrcStaleness::Absent => None,
     };
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
 
     // === Step 1: Create table with clustering, rowTracking, ICT ===
     let schema = schema_ref! { nullable "id": INTEGER };
@@ -2748,7 +2796,7 @@ async fn test_stale_crc_fresh_build_advance_matrix(
     for v in 2..=CHECKPOINT_VERSION {
         snap = commit_with_dm_and_txn(snap, &engine, v).await?;
     }
-    snap = snap.checkpoint(engine.as_ref(), None)?.1;
+    snap = snap.checkpoint(checkpoint_engine.as_ref(), None)?.1;
 
     // === Step 3: Commit up to LATEST_VERSION, writing the CRC at its target version. ===
     //
@@ -2961,7 +3009,9 @@ fn no_parquet_reads_engine(inner: Arc<dyn Engine>) -> DelegatingEngine {
 async fn setup_stale_crc_dm_table<E: TaskExecutor>(
     engine: &Arc<DefaultEngine<E>>,
     table_path: &str,
+    declarative: bool,
 ) -> delta_kernel::Result<()> {
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     let schema = schema_ref! { nullable "id": INTEGER };
     let mut snap = create_table(table_path, schema, "test_engine", true)
         .with_table_properties([("delta.feature.domainMetadata", "supported")])
@@ -2984,7 +3034,7 @@ async fn setup_stale_crc_dm_table<E: TaskExecutor>(
         .await?;
 
         if v == 10 {
-            snap = snap.checkpoint(engine.as_ref(), None)?.1;
+            snap = snap.checkpoint(checkpoint_engine.as_ref(), None)?.1;
         }
         if v == 15 {
             snap.write_checksum(engine.as_ref())?;
@@ -3017,7 +3067,7 @@ enum Query {
 
 // Every query shape resolves against a stale Complete CRC by scanning only the commit tail. The
 // NoParquetReadsHandler panics if the v10 checkpoint is read, proving the checkpoint is skipped.
-#[rstest]
+#[rstest_reuse::apply(checkpoint_modes)]
 #[case::base_stands(Query::One("dom_before", Some("cfg_before")))]
 #[case::tail_overrides_base(Query::One("dom_updated", Some("cfg_updated_v16")))]
 #[case::tail_added(Query::One("dom_after", Some("cfg_after")))]
@@ -3030,9 +3080,10 @@ enum Query {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_dm_query_rooted_in_stale_complete_crc(
     #[case] query: Query,
+    declarative: bool,
 ) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
-    setup_stale_crc_dm_table(&engine, &table_path).await?;
+    setup_stale_crc_dm_table(&engine, &table_path, declarative).await?;
 
     let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert_eq!(fresh.version(), 20);
@@ -3070,10 +3121,13 @@ async fn test_dm_query_rooted_in_stale_complete_crc(
     Ok(())
 }
 
+#[rstest_reuse::apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_dm_query_stale_partial_crc_falls_through_to_full_scan() -> delta_kernel::Result<()> {
+async fn test_dm_query_stale_partial_crc_falls_through_to_full_scan(
+    declarative: bool,
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
-    setup_stale_crc_dm_table(&engine, &table_path).await?;
+    setup_stale_crc_dm_table(&engine, &table_path, declarative).await?;
 
     // Strip domainMetadata from the v15 CRC so it reloads as Partial: not authoritative, so the
     // query must not take the rooted path.
@@ -3126,7 +3180,9 @@ async fn test_dm_query_stale_partial_crc_falls_through_to_full_scan() -> delta_k
 async fn setup_stale_crc_txn_table<E: TaskExecutor>(
     engine: &Arc<DefaultEngine<E>>,
     table_path: &str,
+    declarative: bool,
 ) -> delta_kernel::Result<()> {
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     let schema = schema_ref! { nullable "id": INTEGER };
     let mut snap = create_table(table_path, schema, "test_engine", true)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
@@ -3144,7 +3200,7 @@ async fn setup_stale_crc_txn_table<E: TaskExecutor>(
         .await?;
 
         if v == 10 {
-            snap = snap.checkpoint(engine.as_ref(), None)?.1;
+            snap = snap.checkpoint(checkpoint_engine.as_ref(), None)?.1;
         }
         if v == 15 {
             snap.write_checksum(engine.as_ref())?;
@@ -3155,7 +3211,7 @@ async fn setup_stale_crc_txn_table<E: TaskExecutor>(
 
 // Every app_id resolves against a stale Complete CRC by scanning only the commit tail. The
 // NoParquetReadsHandler panics if the v10 checkpoint is read, proving the checkpoint is skipped.
-#[rstest]
+#[rstest_reuse::apply(checkpoint_modes)]
 #[case::base_stands("app_before", Some(5))]
 #[case::tail_supersedes_base("app_updated", Some(16))]
 #[case::tail_added("app_after", Some(18))]
@@ -3164,9 +3220,10 @@ async fn setup_stale_crc_txn_table<E: TaskExecutor>(
 async fn test_txn_query_rooted_in_stale_complete_crc(
     #[case] app_id: &str,
     #[case] expected: Option<i64>,
+    declarative: bool,
 ) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
-    setup_stale_crc_txn_table(&engine, &table_path).await?;
+    setup_stale_crc_txn_table(&engine, &table_path, declarative).await?;
 
     let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert_eq!(fresh.version(), 20);
@@ -3183,10 +3240,13 @@ async fn test_txn_query_rooted_in_stale_complete_crc(
     Ok(())
 }
 
+#[rstest_reuse::apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_txn_query_stale_partial_crc_falls_through_to_full_scan() -> delta_kernel::Result<()> {
+async fn test_txn_query_stale_partial_crc_falls_through_to_full_scan(
+    declarative: bool,
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
-    setup_stale_crc_txn_table(&engine, &table_path).await?;
+    setup_stale_crc_txn_table(&engine, &table_path, declarative).await?;
 
     // Strip setTransactions from the v15 CRC so it reloads as Partial: not authoritative, so the
     // query must not take the rooted path.

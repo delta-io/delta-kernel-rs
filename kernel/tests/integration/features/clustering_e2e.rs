@@ -16,21 +16,24 @@ use delta_kernel::snapshot::Snapshot;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use rstest::rstest;
+use rstest_reuse::apply;
 use test_utils::{
     IntoArray, generate_batch, read_add_infos, read_scan, test_table_setup_mt, write_batch_to_table,
 };
+
+use crate::common::write_utils::{checkpoint_engine, checkpoint_modes};
 
 /// Full lifecycle: create a clustered table, write data, verify stats include clustering columns,
 /// checkpoint, and verify clustering metadata and data survive. When `use_fresh_snapshot` is true,
 /// the write happens via a fresh snapshot (simulating a separate session that did not create the
 /// table).
-#[rstest]
+#[apply(checkpoint_modes)]
 #[case::post_commit_snapshot(false)]
 #[case::fresh_snapshot(true)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_clustered_table_write_and_checkpoint(
     #[case] use_fresh_snapshot: bool,
+    declarative: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let schema = schema_ref! {
@@ -108,7 +111,8 @@ async fn test_clustered_table_write_and_checkpoint(
     assert_eq!(total_rows, 5);
 
     // Checkpoint
-    snapshot.checkpoint(engine.as_ref(), None)?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
+    snapshot.checkpoint(checkpoint_engine.as_ref(), None)?;
 
     // Load fresh snapshot from checkpoint and verify everything survived
     let table_url = delta_kernel::try_parse_uri(&table_path)?;

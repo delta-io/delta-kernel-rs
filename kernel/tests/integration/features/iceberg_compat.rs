@@ -40,7 +40,9 @@ use test_utils::{
 };
 use url::Url;
 
-use crate::common::write_utils::{collect_all_parquet_field_ids, read_parquet_root_schema};
+use crate::common::write_utils::{
+    checkpoint_engine, checkpoint_modes, collect_all_parquet_field_ids, read_parquet_root_schema,
+};
 
 const TABLE_ROOT: &str = "memory:///";
 
@@ -422,7 +424,7 @@ async fn v2_partitioned_write_materializes_partition_and_nested_field_ids() {
 /// - `max`: maximum feature set we are able to enable through create table, with exceptions for:
 ///   `materializePartitionColumns` (omitted so the partition-materialization check below proves V3
 ///   implies it) and `catalogManaged` (requires a catalog committer).
-#[rstest::rstest]
+#[rstest_reuse::apply(checkpoint_modes)]
 #[case::min(
     /* extra_props */ &[],
     /* enable_features */ &[],
@@ -444,6 +446,7 @@ async fn v3_e2e_partitioned_writes_with_field_ids(
     #[case] extra_props: &[(&str, &str)],
     #[case] enable_features: &[&str],
     #[case] expected_features: &[&[&str]],
+    declarative: bool,
 ) {
     // === Setup ===
     let (_tmp_dir, table_path, _) = test_table_setup_mt().unwrap();
@@ -456,6 +459,8 @@ async fn v3_e2e_partitioned_writes_with_field_ids(
             )))
             .build(),
     );
+
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
 
     // === Create partitioned V3 table ===
     let schema = nested_schema_with_all_delta_types();
@@ -492,7 +497,7 @@ async fn v3_e2e_partitioned_writes_with_field_ids(
     Snapshot::builder_for(table_url.clone())
         .build(engine.as_ref())
         .unwrap()
-        .checkpoint(engine.as_ref(), None)
+        .checkpoint(checkpoint_engine.as_ref(), None)
         .unwrap();
     for commit_idx in 2..4_i32 {
         write_partitioned_data(&table_url, engine.clone(), commit_idx).await;

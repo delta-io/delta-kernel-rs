@@ -51,8 +51,9 @@ use test_utils::{
 use url::Url;
 
 use crate::common::write_utils::{
-    create_dv_table_with_files, get_scan_files, get_simple_int_schema, sequential_dv_descriptors,
-    set_table_properties, write_data_and_check_result_and_stats,
+    checkpoint_engine, checkpoint_modes, create_dv_table_with_files, get_scan_files,
+    get_simple_int_schema, sequential_dv_descriptors, set_table_properties,
+    write_data_and_check_result_and_stats,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2216,7 +2217,7 @@ async fn test_remove_files_with_modified_selection_vector() -> delta_kernel::Res
 ///   JSON string. Scan rows from that checkpoint have `stats=null` but `stats_parsed` non-null. The
 ///   remove action's `stats` is produced via `coalesce(null, to_json(stats_parsed))`, which
 ///   exercises the coalesce path in the fix.
-#[rstest::rstest]
+#[apply(checkpoint_modes)]
 #[case(false, false)]
 #[case(false, true)]
 #[case(true, false)]
@@ -2227,6 +2228,7 @@ async fn test_remove_files_with_modified_selection_vector() -> delta_kernel::Res
 // which avoids the deadlock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
+    declarative: bool,
     #[case] use_struct_stats_checkpoint: bool,
     #[case] use_predicate: bool,
 ) -> delta_kernel::Result<()> {
@@ -2267,7 +2269,8 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
             // log segment lazily while writing). This requires `TokioMultiThreadExecutor`,
             // which uses `block_in_place` to avoid deadlocking a single-thread runtime.
             let mt_engine = create_default_engine_mt_executor(&table_url)?;
-            snapshot_v2.checkpoint(mt_engine.as_ref(), None)?;
+            let checkpoint_engine = checkpoint_engine(mt_engine, None, declarative);
+            snapshot_v2.checkpoint(checkpoint_engine.as_ref(), None)?;
             Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?
         } else {
             Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?

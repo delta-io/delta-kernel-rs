@@ -36,6 +36,8 @@ use test_utils::{
 };
 use url::Url;
 
+use crate::common::write_utils::{checkpoint_engine, checkpoint_modes};
+
 #[cfg(feature = "declarative-plans")]
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
@@ -116,11 +118,12 @@ async fn snapshot_replay_uses_originals_and_non_amt_scans_use_compactions(
     Ok(())
 }
 
-#[rstest]
+#[rstest_reuse::apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread")]
 async fn partial_compaction_preserves_suppression(
     #[values(false, true)] checkpoint_prefix: bool,
     #[values(None, Some(1))] deletion_timestamp: Option<i64>,
+    declarative: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(1))
@@ -131,6 +134,8 @@ async fn partial_compaction_preserves_suppression(
         )
         .build()?;
     let (engine, reads) = test_engine(table.store().clone(), 1);
+    let checkpoint_engine =
+        checkpoint_engine(engine.clone(), Some(table.store().clone()), declarative);
     let files = table.store().list(None).try_collect::<Vec<_>>().await?;
     let data_path = &files
         .iter()
@@ -146,7 +151,7 @@ async fn partial_compaction_preserves_suppression(
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
     if checkpoint_prefix {
-        prefix.checkpoint(engine.as_ref(), None)?;
+        prefix.checkpoint(checkpoint_engine.as_ref(), None)?;
     }
     // The builder cannot express historical or missing deletion/transaction timestamps.
     let mut remove = json!({"path": data_path.as_ref(), "dataChange": true});
@@ -339,22 +344,29 @@ async fn compaction_crossing_checkpoint_uses_original_commits(
     Ok(())
 }
 
+#[rstest_reuse::apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread")]
-async fn checkpoint_from_compacted_log_preserves_rows() -> Result<(), Box<dyn std::error::Error>> {
+async fn checkpoint_from_compacted_log_preserves_rows(
+    declarative: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(3).with_compaction_ranges([(1, 3)]))
         .with_schema(schema_ref! { nullable "id": INTEGER })
         .build()?;
     let (engine, reads) = test_engine(table.store().clone(), 1);
+    let checkpoint_engine =
+        checkpoint_engine(engine.clone(), Some(table.store().clone()), declarative);
     let compacted = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
     let expected = scan_results(compacted.clone(), engine.clone())?;
-    compacted.checkpoint(engine.as_ref(), None)?;
-    assert!(
-        reads
-            .successful_paths()
-            .iter()
-            .any(|p| p.path().ends_with(".compacted.json"))
-    );
+    compacted.checkpoint(checkpoint_engine.as_ref(), None)?;
+    if !declarative {
+        assert!(
+            reads
+                .successful_paths()
+                .iter()
+                .any(|p| p.path().ends_with(".compacted.json"))
+        );
+    }
     let reloaded = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
     assert_eq!(scan_results(reloaded, engine.clone())?, expected);
     Ok(())

@@ -29,6 +29,8 @@ use test_utils::{
     write_batch_to_table,
 };
 
+use crate::common::write_utils::{checkpoint_engine, checkpoint_modes};
+
 fn simple_schema() -> SchemaRef {
     schema_ref! {
         nullable "id": INTEGER,
@@ -509,13 +511,15 @@ async fn alter_table_commit_info_includes_operation_maps() -> delta_kernel::Resu
 /// Each column is added in its own alter commit with a checkpoint after, exercising
 /// "do some ops -> checkpoint -> do more ops -> checkpoint". Under CM, also verifies fresh
 /// ids/physical names and that `maxColumnId` advanced.
-#[rstest]
+#[rstest_reuse::apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn add_columns_lifecycle(
     #[values(None, Some("name"), Some("id"))] cm_mode: Option<&str>,
     #[values(1, 3)] num_columns: usize,
+    declarative: bool,
 ) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     let properties: Vec<(&str, &str)> = cm_mode
         .map(|m| vec![("delta.columnMapping.mode", m)])
         .unwrap_or_default();
@@ -549,7 +553,7 @@ async fn add_columns_lifecycle(
         let post = committed
             .post_commit_snapshot()
             .expect("post-commit snapshot");
-        let (_, ckpt) = post.clone().checkpoint(engine.as_ref(), None)?;
+        let (_, ckpt) = post.clone().checkpoint(checkpoint_engine.as_ref(), None)?;
         current = ckpt;
     }
 
@@ -796,10 +800,12 @@ async fn add_column_failures(
 /// Exercises: create (v0) → alter add A (v1) → checkpoint at v1 → alter add B (v2) → write
 /// row with values in both new columns (v3) → reload. The reload must rebuild the snapshot
 /// from the checkpoint + alter commits + data commit and return the written values.
+#[rstest_reuse::apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn back_to_back_alters_with_checkpoint() -> delta_kernel::Result<()> {
+async fn back_to_back_alters_with_checkpoint(declarative: bool) -> delta_kernel::Result<()> {
     // Checkpoint writing requires the multi-threaded engine (like `maintenance_ops.rs`).
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
 
     // v0: create.
     let snapshot =
@@ -817,7 +823,9 @@ async fn back_to_back_alters_with_checkpoint() -> delta_kernel::Result<()> {
         .expect("post-commit snapshot at v1");
 
     // Checkpoint at v1.
-    let (_, v1_ckpt) = v1_snap.clone().checkpoint(engine.as_ref(), None)?;
+    let (_, v1_ckpt) = v1_snap
+        .clone()
+        .checkpoint(checkpoint_engine.as_ref(), None)?;
 
     // v2: add column "b" on top of the checkpointed snapshot.
     let v2 = v1_ckpt
@@ -1333,7 +1341,7 @@ async fn set_nullable_succeeds(
 /// End-to-end: create a table with a non-null layout column (partition or clustering),
 /// write a row, flip the layout column to nullable, checkpoint, reload from scratch, scan.
 /// Cross-product: layout kind (partitioned, clustered) x column-mapping mode (off, name, id).
-#[rstest]
+#[rstest_reuse::apply(checkpoint_modes)]
 #[case::partition("date", DataLayout::partitioned(["date"]), "2026-01-01")]
 #[case::clustered("region", DataLayout::clustered(["region"]), "us")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1342,8 +1350,10 @@ async fn set_nullable_on_layout_column_with_checkpoint(
     #[case] layout: DataLayout,
     #[case] col_value: &str,
     #[values(None, Some("name"), Some("id"))] cm_mode: Option<&str>,
+    declarative: bool,
 ) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     // Partition values live in the directory path; clustering values live in the row batch.
     let is_partitioned = matches!(layout, DataLayout::Partitioned { .. });
 
@@ -1412,7 +1422,9 @@ async fn set_nullable_on_layout_column_with_checkpoint(
     assert!(v2_snap.schema().field(col_name).unwrap().is_nullable());
 
     // Checkpoint at v2 so reload exercises the checkpoint path.
-    v2_snap.clone().checkpoint(engine.as_ref(), None)?;
+    v2_snap
+        .clone()
+        .checkpoint(checkpoint_engine.as_ref(), None)?;
 
     // Reload from scratch and verify the schema and row survive.
     let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
@@ -1458,12 +1470,14 @@ async fn set_nullable_nonexistent_column_fails() -> delta_kernel::Result<()> {
 /// SET NULLABLE flips a still-NOT-NULL column from the original schema. Under CM, also
 /// verifies existing fields' column mapping IDs are preserved by set_nullable while
 /// add_column receives a new CM ID and bumps maxColumnId.
-#[rstest]
+#[rstest_reuse::apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chain_add_column_and_set_nullable(
     #[values(None, Some("name"), Some("id"))] cm_mode: Option<&str>,
+    declarative: bool,
 ) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     let schema = schema_ref! {
         not_null "id": INTEGER,
         not_null "name": STRING,
@@ -1496,7 +1510,9 @@ async fn chain_add_column_and_set_nullable(
     let v1_snap = v1
         .post_commit_snapshot()
         .expect("post-commit snapshot at v1");
-    let (_, v1_ckpt) = v1_snap.clone().checkpoint(engine.as_ref(), None)?;
+    let (_, v1_ckpt) = v1_snap
+        .clone()
+        .checkpoint(checkpoint_engine.as_ref(), None)?;
     let v2 = v1_ckpt
         .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .add_column(StructField::nullable("age", DataType::INTEGER))
@@ -1507,7 +1523,9 @@ async fn chain_add_column_and_set_nullable(
     let v2_snap = v2
         .post_commit_snapshot()
         .expect("post-commit snapshot at v2");
-    v2_snap.clone().checkpoint(engine.as_ref(), None)?;
+    v2_snap
+        .clone()
+        .checkpoint(checkpoint_engine.as_ref(), None)?;
 
     let reloaded = Snapshot::builder_for(table_path).build(engine.as_ref())?;
     let schema = reloaded.schema();

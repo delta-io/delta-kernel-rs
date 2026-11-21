@@ -24,8 +24,8 @@ use test_utils::{
 };
 
 use crate::common::write_utils::{
-    create_dv_update_transaction, get_scan_files, resolve_struct_field,
-    write_deletion_vector_to_store,
+    checkpoint_engine, checkpoint_modes, create_dv_update_transaction, get_scan_files,
+    resolve_struct_field, write_deletion_vector_to_store,
 };
 
 /// Helper to write a parquet file with the given data to the table.
@@ -423,13 +423,14 @@ async fn test_scan_reads_puffin_framed_deletion_vector()
     Ok(())
 }
 
-#[rstest::rstest]
+#[rstest_reuse::apply(checkpoint_modes)]
 #[case::tight_bounds_true(Some(true))]
 #[case::tight_bounds_false(Some(false))]
 #[case::tight_bounds_absent(None)]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_dv_update_stats_tight_bound(
     #[case] initial_tight_bounds: Option<bool>,
+    declarative: bool,
 ) -> delta_kernel::Result<()> {
     // Nested schema: a `point` struct with two leaf columns.
     let schema = schema_ref! {
@@ -562,7 +563,8 @@ async fn test_dv_update_stats_tight_bound(
     // Checkpoint and validate the tightBounds of stats_parsed.
     let snapshot_v2 = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mt_engine = create_default_engine_mt_executor(&table_url)?;
-    snapshot_v2.checkpoint(mt_engine.as_ref(), None)?;
+    let checkpoint_engine = checkpoint_engine(mt_engine.clone(), None, declarative);
+    snapshot_v2.checkpoint(checkpoint_engine.as_ref(), None)?;
 
     let ckpt_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let scan = ckpt_snapshot

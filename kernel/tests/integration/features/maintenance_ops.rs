@@ -11,7 +11,6 @@ use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::schema_ref;
 use delta_kernel::snapshot::{CheckpointWriteResult, ChecksumWriteResult};
 use delta_kernel::transaction::create_table::create_table;
-use rstest::rstest;
 use serde_json::json;
 use test_utils::{
     CapturingReporter, add_commit, assert_result_error_with_message,
@@ -19,15 +18,19 @@ use test_utils::{
 };
 use url::Url;
 
-#[rstest]
+use crate::common::write_utils::{checkpoint_engine, checkpoint_modes};
+
+#[rstest_reuse::apply(checkpoint_modes)]
 #[case::v1_checkpoint(false)]
 #[case::v2_checkpoint(true)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_checkpoint_and_checksum_return_updated_snapshots(
     #[case] v2_checkpoint: bool,
+    declarative: bool,
 ) -> delta_kernel::Result<()> {
     // ===== GIVEN =====
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     let schema = schema_ref! { nullable "id": INTEGER };
     let mut builder = create_table(&table_path, schema, "test_engine", true);
     if v2_checkpoint {
@@ -46,7 +49,7 @@ async fn test_checkpoint_and_checksum_return_updated_snapshots(
     assert!(seg.listed.latest_crc_file.is_none());
 
     // ===== WHEN: we checkpoint =====
-    let (_, snapshot_w_ckpt) = snapshot.checkpoint(engine.as_ref(), None)?;
+    let (_, snapshot_w_ckpt) = snapshot.checkpoint(checkpoint_engine.as_ref(), None)?;
     let seg = snapshot_w_ckpt.log_segment();
 
     // ===== THEN =====
@@ -79,12 +82,16 @@ async fn test_checkpoint_and_checksum_return_updated_snapshots(
     Ok(())
 }
 
-#[rstest]
+#[rstest_reuse::apply(checkpoint_modes)]
 #[case::v1_checkpoint(false)]
 #[case::v2_checkpoint(true)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_checkpoint_already_exists(#[case] v2_checkpoint: bool) -> delta_kernel::Result<()> {
+async fn test_checkpoint_already_exists(
+    #[case] v2_checkpoint: bool,
+    declarative: bool,
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     let schema = schema_ref! { nullable "id": INTEGER };
     let mut builder = create_table(&table_path, schema, "test_engine", true);
     if v2_checkpoint {
@@ -97,11 +104,11 @@ async fn test_checkpoint_already_exists(#[case] v2_checkpoint: bool) -> delta_ke
     let snapshot = committed.post_commit_snapshot().unwrap();
 
     // First checkpoint writes successfully
-    let (result, snapshot_w_ckpt) = snapshot.checkpoint(engine.as_ref(), None)?;
+    let (result, snapshot_w_ckpt) = snapshot.checkpoint(checkpoint_engine.as_ref(), None)?;
     assert_eq!(result, CheckpointWriteResult::Written);
 
     // Calling checkpoint again on the returned snapshot detects the existing checkpoint
-    let (result, unchanged) = snapshot_w_ckpt.checkpoint(engine.as_ref(), None)?;
+    let (result, unchanged) = snapshot_w_ckpt.checkpoint(checkpoint_engine.as_ref(), None)?;
     assert_eq!(result, CheckpointWriteResult::AlreadyExists);
     assert_eq!(unchanged.version(), snapshot_w_ckpt.version());
 
@@ -111,13 +118,13 @@ async fn test_checkpoint_already_exists(#[case] v2_checkpoint: bool) -> delta_ke
         fresh.log_segment().checkpoint_version,
         Some(snapshot.version())
     );
-    let (result, _) = fresh.checkpoint(engine.as_ref(), None)?;
+    let (result, _) = fresh.checkpoint(checkpoint_engine.as_ref(), None)?;
     assert_eq!(result, CheckpointWriteResult::AlreadyExists);
 
     Ok(())
 }
 
-#[rstest]
+#[rstest_reuse::apply(checkpoint_modes)]
 #[case::unknown_writer_only_no_spec(&[], &["futureFeature"], None)]
 #[case::unknown_writer_only_v1(&[], &["futureFeature"], Some(CheckpointSpec::V1))]
 #[case::unknown_writer_only_v2(
@@ -159,8 +166,10 @@ async fn checkpoint_crc_writes_reject_unsupported_table_features(
     #[case] reader_features: &[&str],
     #[case] writer_features: &[&str],
     #[case] checkpoint_spec: Option<CheckpointSpec>,
+    declarative: bool,
 ) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     let table_url = Url::from_directory_path(&table_path).unwrap();
     let store = LocalFileSystem::new();
     let schema_string = json!({
@@ -201,8 +210,23 @@ async fn checkpoint_crc_writes_reject_unsupported_table_features(
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     let checkpoint_result = snapshot
-        .checkpoint(engine.as_ref(), checkpoint_spec.as_ref())
+        .checkpoint(checkpoint_engine.as_ref(), checkpoint_spec.as_ref())
         .map(|_| ());
+    let checkpoint_result = if declarative
+        && matches!(
+            &checkpoint_spec,
+            Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar))
+        ) {
+        assert_result_error_with_message(
+            checkpoint_result,
+            "Declarative V2 checkpoints require sidecars",
+        );
+        snapshot
+            .checkpoint(engine.as_ref(), checkpoint_spec.as_ref())
+            .map(|_| ())
+    } else {
+        checkpoint_result
+    };
     assert_result_error_with_message(checkpoint_result, "futureFeature");
 
     let initial_event_count = reporter.events().len();

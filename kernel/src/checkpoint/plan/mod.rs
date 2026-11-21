@@ -23,8 +23,9 @@ impl CheckpointWriter {
     /// Builds the rows for a single-part V1 checkpoint.
     ///
     /// Shares source planning and typed metadata conversion with scans. File writing and
-    /// publication remain with the caller. Collation-specific bounds stay in JSON stats;
-    /// ordinary statistics also support structured output.
+    /// publication remain with the caller. Ordinary statistics support structured output.
+    /// Collation bounds stay in JSON, retained alongside structured stats even when
+    /// `delta.checkpoint.writeStatsAsJson` is false, without planning-time sampling.
     pub fn declarative_checkpoint_data_plan(&self, engine: &dyn Engine) -> KernelResult<Plan> {
         self.checkpoint_actions(engine)?.build()
     }
@@ -121,7 +122,8 @@ impl CheckpointWriter {
         // structured stats use the writer's fixed schema without a planning-time replay.
         let output_stats_schema = context.stats_schema.clone();
         let stats = StatsOptions {
-            synthesize_json: context.stats_config.write_stats_as_json,
+            synthesize_json: context.stats_config.write_stats_as_json
+                || (write_struct && config.has_collations_feature()),
             // JSON synthesis preserves native bounds; structured output uses the writer's schema.
             variant_min_max: true,
             #[cfg(feature = "geo-type-in-dev")]
