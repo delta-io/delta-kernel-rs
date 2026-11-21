@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::actions::Add;
 use crate::checkpoint::CheckpointInfo;
-use crate::metrics::{CheckpointMetrics, ReplayBase, ScanPlanReport};
+use crate::metrics::{ReplayBase, ScanPlanReport};
 use crate::{Engine, KernelResult, Snapshot, Version};
 
 /// Reconciled table state from which metadata replay starts.
@@ -45,19 +45,9 @@ impl MetadataReplayBase {
         } else {
             ReplayBase::Empty
         });
-        report.checkpoint = checkpoint_version.map(|version| CheckpointMetrics {
-            version,
-            checkpoint_type: snapshot.known_checkpoint_type(),
-            info: None,
-            cache_hit: None,
-            root_footer_calls: 0,
-            sidecar_footer_calls: 0,
-            metadata_query_calls: 0,
-        });
-        let info = snapshot.checkpoint_info(engine, &mut report.checkpoint)?;
-        if let Some(checkpoint) = &mut report.checkpoint {
-            checkpoint.info = info.clone();
-        }
+        let resolved = snapshot.checkpoint_info(engine);
+        report.checkpoint = resolved.metrics;
+        let info = resolved.result?;
         Ok(Self::Checkpoint {
             version: checkpoint_version,
             info,
