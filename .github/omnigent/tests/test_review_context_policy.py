@@ -7,6 +7,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import yaml
+
 
 def _load_policy():
     path = Path(__file__).parents[1] / "review_context_policy.py"
@@ -75,3 +77,11 @@ class ReviewContextPolicyTest(unittest.TestCase):
 
         self.assertEqual(result["result"], "ALLOW")
         self.assertEqual(set(result["data"]["args"]), {"input", "purpose"})
+
+    def test_dispatch_guards_run_before_the_context_hook(self) -> None:
+        config_path = Path(__file__).parents[1] / "reviewer" / "config.yaml"
+        policies = yaml.safe_load(config_path.read_text())["guardrails"]["policies"]
+        self.assertEqual(
+            list(policies),
+            ["spawn_bounds", "headless_subagent_purpose_guard", "inject_review_context"],
+        )

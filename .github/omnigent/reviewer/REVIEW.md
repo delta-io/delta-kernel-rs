@@ -65,7 +65,9 @@ roster cap; supervise via the inbox, never busy-poll.
 Never end a turn after only saying what you will do. Emit the
 `sys_session_send` dispatch calls in the same turn. Only end a turn once the
 dispatches are in flight (you are woken when each reviewer finishes) or every
-reviewer has reported.
+reviewer has reported. If you dispatch the full primary roster in one turn,
+wait for a reviewer wake-up before dispatching a retry or the disprove reviewer.
+Reading the inbox does not reset the per-turn dispatch budget.
 
 If a `sys_session_send` dispatch or reviewer run fails, retry that reviewer
 once after the other in-flight reviewers report. Retry failed reviewers one at
@@ -82,11 +84,11 @@ disprove gate has returned a verdict.
 ## Disprove gate
 Before publishing any Blocker or Should Fix, run `disprove-reviewer` on the
 candidate finding list. Dispatch exactly one `disprove-reviewer` call for the
-whole batch; do not spawn one disprove reviewer per agent or per finding. Give
-it only compact, structured candidate findings, the agents that raised each
-finding, the cited diff excerpt/reference, and the proposed fix. Do not include
-the original reviewer reasoning beyond the candidate claim. Wait for the
-disprove gate before final consolidation.
+whole batch, with `args.purpose: "review"`; do not spawn one disprove reviewer
+per agent or per finding. Give it only compact, structured candidate findings,
+the agents that raised each finding, the cited diff excerpt/reference, and the
+proposed fix. Do not include the original reviewer reasoning beyond the
+candidate claim. Wait for the disprove gate before final consolidation.
 
 Route the gate's verdicts as follows:
 - `CONFIRMED`: keep the finding in the final review.
