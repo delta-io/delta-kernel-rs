@@ -68,7 +68,8 @@ pub(crate) fn added_data_entry(
 }
 
 /// A `DataManifest` entry referencing the leaf manifest at `location` with the given size and
-/// tracking status.
+/// tracking status. Its leaf holds one ADDED entry of 10 rows, the rows [`x_full_stats_value`]
+/// counts.
 pub(crate) fn data_manifest_entry(
     location: &str,
     size: i64,
@@ -79,6 +80,8 @@ pub(crate) fn data_manifest_entry(
     entry.tracking.status = status;
     entry.manifest_info = Some(ManifestInfo {
         format_version: AMT_FORMAT_VERSION,
+        added_files_count: 1,
+        added_rows_count: 10,
         ..Default::default()
     });
     entry
@@ -137,14 +140,25 @@ pub(crate) fn write_manifest_with_stats(
     content_stats: &StructType,
     stats: Vec<Scalar>,
 ) -> FileMeta {
+    let data = entry_batch_with_stats(engine, entries, content_stats, stats);
+    write_batch(engine, location, data)
+}
+
+/// Builds an [`entry_batch`] followed by a `content_stats` column of type `content_stats` holding
+/// `stats[i]` for entry `i`.
+pub(crate) fn entry_batch_with_stats(
+    engine: &dyn Engine,
+    entries: &[ContentTreeNodeEntry],
+    content_stats: &StructType,
+    stats: Vec<Scalar>,
+) -> Box<dyn EngineData> {
     let column_type = ArrayType::new(content_stats.clone(), true);
     let column = ArrayData::try_new(column_type, stats).unwrap();
     let schema = ContentTreeNodeEntry::to_schema_with_content_stats(Some(content_stats.clone()));
     let field = schema.field(CONTENT_STATS_FIELD_NAME).unwrap().clone();
-    let data = entry_batch(engine, entries)
+    entry_batch(engine, entries)
         .append_columns(Arc::new(StructType::new_unchecked([field])), vec![column])
-        .unwrap();
-    write_batch(engine, location, data)
+        .unwrap()
 }
 
 /// Every `content_stats` stat of [`x_table`].

@@ -17,16 +17,16 @@ use std::sync::Arc;
 
 use tracing::warn;
 
-use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, STATS_PARSED, TIGHT_BOUNDS};
+use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS};
 use crate::content_tree::{
-    CONTENT_STATS_FIELD_NAME, LOWER_BOUND, NAN_VALUE_COUNT, NULL_VALUE_COUNT, RECORD_COUNT,
-    TOTAL_BYTES, UPPER_BOUND, VALUE_COUNT,
+    ADDED_ROWS_COUNT, CONTENT_STATS_FIELD_NAME, CONTENT_TYPE, DELETED_ROWS_COUNT, DataContentType,
+    EXISTING_ROWS_COUNT, LOWER_BOUND, MANIFEST_INFO, MODIFIED_ROWS_COUNT, NAN_VALUE_COUNT,
+    NULL_VALUE_COUNT, RECORD_COUNT, REPLACED_ROWS_COUNT, TOTAL_BYTES, UPPER_BOUND, VALUE_COUNT,
 };
-use crate::expressions::{ColumnName, Expression, ExpressionRef, lit, null_lit};
+use crate::expressions::{ColumnName, Expression, ExpressionRef, Predicate as Pred, lit, null_lit};
 use crate::schema::{
-    ColumnMetadataKey, DataType, MetadataValue, PrimitiveType, SchemaRef, StructField, StructType,
+    ColumnMetadataKey, DataType, MetadataValue, PrimitiveType, StructField, StructType,
 };
-use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::{KernelError, KernelResult};
 
@@ -689,44 +689,12 @@ impl<'a> StatsLeafVisitor<'a> for StatsSchemaCollector {
 
 // == AMT content_stats -> parsed Delta stats ==
 
-/// Replaces [`CONTENT_STATS_FIELD_NAME`] in `input_schema` with a nullable [`STATS_PARSED`] column
-/// of type `delta_stats_schema` (see [`parsed_stats_expression`]). Other columns pass through.
-/// Returns `(output_schema, expression)`.
-pub(crate) fn build_parsed_stats_expression(
-    table_schema: &StructType,
-    delta_stats_schema: &StructType,
-    input_schema: &StructType,
-) -> KernelResult<(SchemaRef, ExpressionRef)> {
-    match input_schema
-        .field(CONTENT_STATS_FIELD_NAME)
-        .map(StructField::data_type)
-    {
-        Some(DataType::Struct(_)) => {}
-        other => {
-            return Err(KernelError::generic(format!(
-                "content_stats column '{CONTENT_STATS_FIELD_NAME}' must be a struct in the input \
-                 schema, found: {other:?}"
-            )));
-        }
-    }
-    if input_schema.field(RECORD_COUNT).is_none() {
-        return Err(KernelError::generic(format!(
-            "AMT entry column '{RECORD_COUNT}' not found in input schema"
-        )));
-    }
-
-    let stats_expr = parsed_stats_expression(table_schema, delta_stats_schema)?;
-    let output_field = StructField::nullable(STATS_PARSED, delta_stats_schema.clone());
-    ProjectionStructPatchBuilder::new(input_schema)
-        .replace(CONTENT_STATS_FIELD_NAME, output_field, Arc::new(stats_expr))
-        .build()
-}
-
 /// Builds the expression evaluating an AMT entry row to its Delta stats, a struct of type
 /// `delta_stats_schema`:
 ///
 /// ```text
-/// numRecords:  long               <- recordCount
+/// numRecords:  long               <- recordCount (data file entry)
+///                                    manifestInfo.*RowsCount summed (data manifest entry)
 /// nullCount:   {<table nesting>}  <- content_stats.<leaf>.null_value_count
 /// minValues:   {<table nesting>}  <- content_stats.<leaf>.lower_bound
 /// maxValues:   {<table nesting>}  <- content_stats.<leaf>.upper_bound
@@ -779,10 +747,23 @@ impl<'a> StatsLeafVisitor<'a> for ParsedStatsExprBuilder {
         let exprs = categories.sub_fields().map(|sub_field| {
             sub_field.map(|sub_field| {
                 let expr = match &entry {
-                    // TODO(#3491): AMT float bounds exclude NaN, but Delta readers take a finite
-                    // max as proof the file has no NaN.
                     Some(entry) => {
-                        Expression::column([CONTENT_STATS_FIELD_NAME, entry.name(), sub_field])
+                        let stat = |stat| {
+                            Expression::column([CONTENT_STATS_FIELD_NAME, entry.name(), stat])
+                        };
+                        let is_bound = sub_field == LOWER_BOUND || sub_field == UPPER_BOUND;
+                        if is_bound && is_floating_point(field.data_type()) {
+                            // AMT float/double bounds exclude NaN, while total order sorts a NaN
+                            // beyond every number (above or below, by its sign bit), so Delta
+                            // readers take finite bounds as proof that no row is NaN. The bounds
+                            // therefore only hold when no value is NaN.
+                            Expression::case_when(
+                                [(Pred::eq(stat(NAN_VALUE_COUNT), lit(0i64)), stat(sub_field))],
+                                null_lit(field.data_type().clone()),
+                            )
+                        } else {
+                            stat(sub_field)
+                        }
                     }
                     None if sub_field == NULL_VALUE_COUNT => null_lit(DataType::LONG),
                     // AMT records variant bounds as unshredded variants (see `leaf_stats_field`).
@@ -828,7 +809,21 @@ fn assemble_parsed_stats_expr(
     for field in delta_stats_schema.fields() {
         let name = field.name().as_str();
         let expr = match name {
-            NUM_RECORDS => Expression::column([RECORD_COUNT]),
+            // A manifest entry's `recordCount` counts the entries of the manifest it references,
+            // not rows, so its rows come from `manifestInfo` instead.
+            NUM_RECORDS => Expression::case_when(
+                [
+                    (
+                        content_type_is(DataContentType::Data),
+                        Expression::column([RECORD_COUNT]),
+                    ),
+                    (
+                        content_type_is(DataContentType::DataManifest),
+                        manifest_row_count(),
+                    ),
+                ],
+                null_lit(DataType::LONG),
+            ),
             // Wide bounds are still valid for data skipping; readers just can't treat them as
             // exact. Write an explicit `false` because kernel still reads an absent `tightBounds`
             // as tight.
@@ -845,6 +840,25 @@ fn assemble_parsed_stats_expr(
         fields.push(Arc::new(expr));
     }
     Ok(Expression::struct_from(fields))
+}
+
+/// Whether an entry row has `content_type`.
+fn content_type_is(content_type: DataContentType) -> Pred {
+    Pred::eq(Expression::column([CONTENT_TYPE]), lit(content_type as i32))
+}
+
+/// The rows of every entry of the manifest a manifest entry references, live or not.
+///
+/// A manifest deletion vector leaves the entry's aggregate `content_stats` counting the entries it
+/// removes, so counting only live rows could make `nullCount` equal `numRecords` while a live row
+/// is not null. Counting every row keeps `numRecords` at least the rows any aggregate covers.
+fn manifest_row_count() -> Expression {
+    let count = |name| Expression::column([MANIFEST_INFO, name]);
+    count(ADDED_ROWS_COUNT)
+        + count(EXISTING_ROWS_COUNT)
+        + count(MODIFIED_ROWS_COUNT)
+        + count(DELETED_ROWS_COUNT)
+        + count(REPLACED_ROWS_COUNT)
 }
 
 /// Combines a struct's `children` into one struct expression per stat category. `path` locates the
@@ -883,6 +897,14 @@ fn combine_children<'a>(
         }
     }
     Ok(exprs)
+}
+
+/// Whether `data_type` is FLOAT or DOUBLE, whose AMT bounds exclude NaN.
+fn is_floating_point(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Primitive(PrimitiveType::Float | PrimitiveType::Double)
+    )
 }
 
 /// Unwraps projection-derived visitor input, which the parsed stats walk always supplies.
@@ -924,6 +946,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::actions::STATS_PARSED;
     use crate::arrow::array::RecordBatch;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
@@ -2240,24 +2263,22 @@ mod tests {
             .clone()
     }
 
-    /// Evaluates [`build_parsed_stats_expression`] over `manifest_data`.
-    fn convert_amt_stats_to_delta_stats(
-        engine: &dyn Engine,
-        manifest_data: &dyn EngineData,
-        table_schema: &StructType,
-        delta_stats_schema: &StructType,
-        input_schema: &StructType,
-    ) -> KernelResult<Box<dyn EngineData>> {
-        let (output_schema, expr) =
-            build_parsed_stats_expression(table_schema, delta_stats_schema, input_schema)?;
-        engine
-            .evaluation_handler()
-            .new_expression_evaluator(Arc::new(input_schema.clone()), expr, output_schema.into())?
-            .evaluate(manifest_data)
+    /// The `manifestInfo` row counts the conversion reads.
+    fn manifest_row_counts_schema() -> StructType {
+        let rows_counts = [
+            ADDED_ROWS_COUNT,
+            EXISTING_ROWS_COUNT,
+            MODIFIED_ROWS_COUNT,
+            DELETED_ROWS_COUNT,
+            REPLACED_ROWS_COUNT,
+        ];
+        StructType::new_unchecked(
+            rows_counts.map(|name| StructField::not_null(name, DataType::LONG)),
+        )
     }
 
     /// The input schema the conversion reads: `content_stats` read with [`projected_stats_schema`],
-    /// plus the entry's `recordCount` column.
+    /// plus the entry's `recordCount`, `contentType`, and `manifestInfo` row counts.
     fn parsed_stats_input_schema(table: &StructType, delta: &StructType) -> StructType {
         StructType::new_unchecked([
             StructField::nullable(
@@ -2265,12 +2286,12 @@ mod tests {
                 projected_stats_schema(table, delta).expect("projected schema"),
             ),
             StructField::nullable(RECORD_COUNT, DataType::LONG),
+            StructField::nullable(CONTENT_TYPE, DataType::INTEGER),
+            StructField::nullable(MANIFEST_INFO, manifest_row_counts_schema()),
         ])
     }
 
-    /// Converts a single input row (`content_stats`, `recordCount`) and asserts the
-    /// produced batch equals one built directly from `expected_stats` (the Delta stats struct
-    /// scalar) and the same passthrough columns. Uses the real evaluator end to end.
+    /// [`assert_parsed_stats_of`] for a data file entry.
     fn assert_parsed_stats(
         table: &StructType,
         delta: &StructType,
@@ -2278,28 +2299,69 @@ mod tests {
         record_count: i64,
         expected_stats: Scalar,
     ) {
+        assert_parsed_stats_of(
+            None,
+            table,
+            delta,
+            content_stats,
+            record_count,
+            expected_stats,
+        );
+    }
+
+    /// Converts a single input row and asserts the produced Delta stats equal `expected_stats`.
+    /// The row is a data manifest entry with `manifest_rows_counts` as its `manifestInfo` row
+    /// counts when given, else a data file entry. Uses the real evaluator end to end.
+    fn assert_parsed_stats_of(
+        manifest_rows_counts: Option<[i64; 5]>,
+        table: &StructType,
+        delta: &StructType,
+        content_stats: Scalar,
+        record_count: i64,
+        expected_stats: Scalar,
+    ) {
         let input_schema = parsed_stats_input_schema(table, delta);
+        let (content_type, manifest_info) = match manifest_rows_counts {
+            Some(counts) => (
+                DataContentType::DataManifest,
+                struct_scalar(
+                    &manifest_row_counts_schema(),
+                    counts.map(Scalar::Long).to_vec(),
+                ),
+            ),
+            None => (
+                DataContentType::Data,
+                Scalar::Null(manifest_row_counts_schema().into()),
+            ),
+        };
         let engine = SyncEngine::new();
         let handler = engine.evaluation_handler();
         let input = handler
             .create_many(
                 Arc::new(input_schema.clone()),
-                vec![vec![content_stats, Scalar::Long(record_count)]],
+                vec![vec![
+                    content_stats,
+                    Scalar::Long(record_count),
+                    Scalar::Integer(content_type as i32),
+                    manifest_info,
+                ]],
             )
             .unwrap();
 
-        let (output_schema, _) =
-            build_parsed_stats_expression(table, delta, &input_schema).unwrap();
+        let output_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            STATS_PARSED,
+            delta.clone(),
+        )]));
         let expected = handler
-            .create_many(
-                output_schema,
-                vec![vec![expected_stats, Scalar::Long(record_count)]],
-            )
+            .create_many(output_schema.clone(), vec![vec![expected_stats]])
             .unwrap();
 
-        let actual =
-            convert_amt_stats_to_delta_stats(&engine, input.as_ref(), table, delta, &input_schema)
-                .unwrap();
+        let expr = Expression::struct_from([parsed_stats_expression(table, delta).unwrap()]);
+        let actual = handler
+            .new_expression_evaluator(Arc::new(input_schema), Arc::new(expr), output_schema.into())
+            .unwrap()
+            .evaluate(input.as_ref())
+            .unwrap();
 
         assert_eq!(to_batch(actual), to_batch(expected));
     }
@@ -2392,6 +2454,88 @@ mod tests {
         );
 
         assert_parsed_stats(&table, &delta, content_stats, 100, expected);
+    }
+
+    /// A manifest entry's `recordCount` counts entries, not rows, so its `numRecords` sums the
+    /// `manifestInfo` row counts of every status, live or not.
+    #[test]
+    fn parsed_stats_of_manifest_entry_sums_manifest_row_counts() {
+        let table = StructType::new_unchecked([field_with_id("id", DataType::LONG, true, 0)]);
+        let delta = StructType::new_unchecked([
+            StructField::nullable(NUM_RECORDS, DataType::LONG),
+            StructField::nullable(NULL_COUNT, stat_cols(["id"])),
+        ]);
+        let content_stats_schema = projected_stats_schema(&table, &delta).unwrap();
+        // Leaf sub-field order (nullCount only): value count, null value count.
+        let content_stats = struct_scalar(
+            &content_stats_schema,
+            vec![leaf_scalar(
+                &content_stats_schema,
+                "id",
+                vec![Scalar::Long(100), Scalar::Long(0)],
+            )],
+        );
+        let expected = struct_scalar(
+            &delta,
+            vec![
+                Scalar::Long(15),
+                struct_scalar(&stat_cols(["id"]), vec![Scalar::Long(0)]),
+            ],
+        );
+
+        assert_parsed_stats_of(
+            Some([1, 2, 3, 4, 5]),
+            &table,
+            &delta,
+            content_stats,
+            3,
+            expected,
+        );
+    }
+
+    /// AMT float/double bounds exclude NaN, so they are only Delta bounds (which kernel reads as
+    /// covering NaN) when no value is NaN.
+    #[rstest]
+    #[case::no_nan(Some(0), true)]
+    #[case::some_nan(Some(2), false)]
+    #[case::unknown_nan_count(None, false)]
+    fn parsed_stats_float_bounds_require_zero_nan_count(
+        #[case] nan_value_count: Option<i64>,
+        #[case] has_bounds: bool,
+    ) {
+        let table = StructType::new_unchecked([field_with_id("d", DataType::DOUBLE, true, 0)]);
+        let bounds = StructType::new_unchecked([StructField::nullable("d", DataType::DOUBLE)]);
+        let delta = StructType::new_unchecked([
+            StructField::nullable(MIN_VALUES, bounds.clone()),
+            StructField::nullable(MAX_VALUES, bounds.clone()),
+        ]);
+        let content_stats_schema = projected_stats_schema(&table, &delta).unwrap();
+        let double = |value: f64| match has_bounds {
+            true => Scalar::Double(value),
+            false => Scalar::Null(DataType::DOUBLE),
+        };
+        // Leaf sub-field order (min and max): lower bound, upper bound, NaN value count.
+        let content_stats = struct_scalar(
+            &content_stats_schema,
+            vec![leaf_scalar(
+                &content_stats_schema,
+                "d",
+                vec![
+                    Scalar::Double(1.5),
+                    Scalar::Double(9.5),
+                    nan_value_count.map_or(Scalar::Null(DataType::LONG), Scalar::Long),
+                ],
+            )],
+        );
+        let expected = struct_scalar(
+            &delta,
+            vec![
+                struct_scalar(&bounds, vec![double(1.5)]),
+                struct_scalar(&bounds, vec![double(9.5)]),
+            ],
+        );
+
+        assert_parsed_stats(&table, &delta, content_stats, 10, expected);
     }
 
     #[test]
@@ -2616,34 +2760,6 @@ mod tests {
         assert_parsed_stats(&table, &delta, content_stats, 8, expected);
     }
 
-    /// `content_stats_col` names the input's stats column; `with_record_count` controls whether
-    /// the input schema carries the required [`RECORD_COUNT`] entry column.
-    #[rstest]
-    #[case::content_stats_missing("other_stats", true, "must be a struct")]
-    #[case::record_count_missing(CONTENT_STATS_FIELD_NAME, false, "'recordCount' not found")]
-    fn parsed_stats_errors_on_bad_columns(
-        #[case] content_stats_col: &str,
-        #[case] with_record_count: bool,
-        #[case] needle: &str,
-    ) {
-        let table = StructType::new_unchecked([field_with_id("id", DataType::LONG, true, 0)]);
-        let delta = delta_stats_with_bounds(StatCategorySchemas::all(stat_cols(["id"])));
-        let content_stats_schema = projected_stats_schema(&table, &delta).unwrap();
-        let mut fields = vec![StructField::nullable(
-            content_stats_col,
-            content_stats_schema,
-        )];
-        if with_record_count {
-            fields.push(StructField::nullable(RECORD_COUNT, DataType::LONG));
-        }
-        let input_schema = StructType::new_unchecked(fields);
-
-        assert_result_error_with_message(
-            build_parsed_stats_expression(&table, &delta, &input_schema),
-            needle,
-        );
-    }
-
     #[test]
     fn parsed_stats_errors_when_category_order_differs_from_table() {
         let table = StructType::new_unchecked([
@@ -2655,10 +2771,8 @@ mod tests {
             min_values: stat_cols(["id", "score"]),
             max_values: stat_cols(["id", "score"]),
         });
-        let input_schema = parsed_stats_input_schema(&table, &delta);
-
         assert_result_error_with_message(
-            build_parsed_stats_expression(&table, &delta, &input_schema),
+            parsed_stats_expression(&table, &delta),
             "but the table walk produced",
         );
     }
