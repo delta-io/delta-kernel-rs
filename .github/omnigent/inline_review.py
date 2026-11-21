@@ -147,7 +147,9 @@ def diff_positions(diff: str) -> set[tuple[str, int, str]]:
     new_line: int | None = None
     in_hunk = False
 
-    for raw_line in diff.splitlines():
+    # Git ends a line only at a newline. `str.splitlines` also breaks at form feeds and other
+    # separators, which would shift every later position.
+    for raw_line in diff.removesuffix("\n").split("\n"):
         if raw_line.startswith("diff --git "):
             old_path = None
             new_path = None
@@ -529,12 +531,16 @@ def main() -> None:
     payload, unmapped, duplicates = build_review_payload(
         review=review,
         findings=findings,
-        diff=args.diff.read_text(errors="replace"),
+        diff=args.diff.read_bytes().decode("utf-8", errors="replace"),
         head_sha=args.head_sha,
         run_url=args.run_url,
         history=history,
         trusted_bot_logins=trusted_bot_logins,
-        review_diff=args.review_diff.read_text(errors="replace") if args.review_diff else None,
+        review_diff=(
+            args.review_diff.read_bytes().decode("utf-8", errors="replace")
+            if args.review_diff
+            else None
+        ),
     )
     args.output.write_text(json.dumps(payload))
     if args.fallback_output:
