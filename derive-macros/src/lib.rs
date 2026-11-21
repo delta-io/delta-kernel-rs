@@ -485,15 +485,6 @@ fn try_from_struct_data_fields<'a>(
             "TryFromStructData does not support #[skip_schema] fields",
         ));
     }
-    if let Some(field) = fields
-        .iter()
-        .find(|field| has_named_attr(&field.attrs, "allow_null_container_values"))
-    {
-        return Err(Error::new(
-            field.span(),
-            "TryFromStructData does not support #[allow_null_container_values] fields",
-        ));
-    }
     Ok(fields)
 }
 
@@ -594,8 +585,8 @@ fn struct_data_encoder(
 /// Missing, duplicate, and unknown fields are errors. Every field type must implement
 /// `TryFrom<Scalar, Error = KernelError>`. `#[skip_schema]` is rejected because the reverse
 /// conversion cannot infer a value or schema for a field omitted by `ToSchema`.
-/// `#[allow_null_container_values]` is rejected because its map scalar type cannot be converted
-/// by the standard `HashMap` conversion.
+/// `#[allow_null_container_values]` permits nullable map values and drops null entries when
+/// constructing the native map, preserving an absent optional map as `None`.
 /// Enum variants each wrap one struct, and exactly one variant must be non-null.
 #[proc_macro_derive(
     TryFromStructData,
@@ -617,26 +608,38 @@ fn try_from_struct_data_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
     }
     let struct_name = &input.ident;
     let fields = try_from_struct_data_fields(&input.data, "TryFromStructData", struct_name.span())?;
-    let (field_idents, field_types): (Vec<_>, Vec<_>) =
-        fields.into_iter().map(|f| (&f.ident, &f.ty)).unzip();
-    let schema_field_names: Vec<_> = field_idents
+    let field_idents = fields.iter().map(|field| &field.ident);
+    let fields_binding = quote! { fields };
+    let (field_types, field_values): (Vec<_>, Vec<_>) = fields
         .iter()
-        .map(|ident| ident.as_ref().map(get_schema_name))
-        .collect::<Option<_>>()
-        .ok_or_else(|| {
-            Error::new(
-                struct_name.span(),
-                "TryFromStructData can only be derived for structs with named fields",
-            )
-        })?;
+        .map(|field| {
+            let name = field.ident.as_ref().map(get_schema_name);
+            let ty = &field.ty;
+            let drop_nulls = has_named_attr(&field.attrs, "allow_null_container_values");
+            let conversion_type = if drop_nulls {
+                quote! { <#ty as delta_kernel::schema::derive_macro_utils::FromNullableContainer>::Nullable }
+            } else {
+                quote! { #ty }
+            };
+            let value = quote_spanned! { field.span() =>
+                #fields_binding.take_field::<#conversion_type>(stringify!(#name))?
+            };
+            let value = if drop_nulls {
+                quote! {
+                    <#ty as delta_kernel::schema::derive_macro_utils::FromNullableContainer>::from_nullable(#value)
+                }
+            } else {
+                value
+            };
+            (conversion_type, value)
+        })
+        .unzip();
 
     Ok(struct_data_decoder(
         struct_name,
         field_types,
         quote! {},
-        quote! { Self {
-            #(#field_idents: fields.take_field(stringify!(#schema_field_names))?,)*
-        } },
+        quote! { Self { #(#field_idents: #field_values,)* } },
     ))
 }
 
@@ -1211,10 +1214,6 @@ mod tests {
     #[case::skipped(
         "#[skip_schema]",
         "TryFromStructData does not support #[skip_schema] fields"
-    )]
-    #[case::nullable_container_values(
-        "#[allow_null_container_values]",
-        "TryFromStructData does not support #[allow_null_container_values] fields"
     )]
     fn try_from_struct_data_rejects_unsupported_field(
         #[case] attribute: &str,

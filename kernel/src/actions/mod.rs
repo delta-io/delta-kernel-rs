@@ -48,6 +48,8 @@ pub mod deletion_vector;
 pub mod deletion_vector_writer;
 pub mod set_transaction;
 
+#[cfg(all(test, feature = "declarative-plans", feature = "arrow-expression"))]
+mod plan_results;
 mod schema_deserializer;
 
 // see comment in ../lib.rs for the path module for why we include this way
@@ -1007,7 +1009,7 @@ impl CommitInfo {
 ///
 /// [Iceberg V4 metadata RFC]: https://github.com/delta-io/delta/blob/master/protocol_rfcs/iceberg-v4-metadata.md#backreferences
 #[cfg(feature = "adaptive-metadata-in-dev")]
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, TryFromStructData, Deserialize)]
 #[cfg_attr(test, derive(Serialize))]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
@@ -1020,7 +1022,7 @@ pub(crate) struct BackReference {
     pub(crate) pos: i32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, TryFromStructData, Deserialize)]
 #[cfg_attr(test, derive(Serialize, Default))]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
@@ -1229,7 +1231,7 @@ impl Add {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, TryFromStructData)]
 #[internal_api]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
 pub(crate) struct Remove {
@@ -1961,7 +1963,9 @@ impl CheckpointAction {
 /// file actions. This action is only allowed in checkpoints following the V2 spec.
 ///
 /// [More info]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#sidecar-file-information
-#[derive(ToSchema, IntoStructData, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    ToSchema, IntoStructData, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TryFromStructData,
+)]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct Sidecar {
@@ -2023,7 +2027,7 @@ impl Sidecar {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
-#[derive(Constructor, IntoStructData, ToSchema)]
+#[derive(Constructor, IntoStructData, ToSchema, TryFromStructData)]
 pub(crate) struct CheckpointMetadata {
     /// The version of the V2 spec checkpoint.
     ///

@@ -2,6 +2,7 @@
 ///
 /// Not intended for use by normal code.
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -188,6 +189,33 @@ impl<T: ToNullableContainerType> GetNullableContainerStructField for Option<T> {
     }
 }
 
+/// Converts a decoded map with nullable values, dropping null entries.
+#[internal_api]
+pub(crate) trait FromNullableContainer: Sized {
+    type Nullable;
+
+    fn from_nullable(value: Self::Nullable) -> Self;
+}
+
+impl<K: Eq + Hash, V> FromNullableContainer for HashMap<K, V> {
+    type Nullable = HashMap<K, Option<V>>;
+
+    fn from_nullable(value: Self::Nullable) -> Self {
+        value
+            .into_iter()
+            .filter_map(|(key, value)| value.map(|value| (key, value)))
+            .collect()
+    }
+}
+
+impl<K: Eq + Hash, V> FromNullableContainer for Option<HashMap<K, V>> {
+    type Nullable = Option<HashMap<K, Option<V>>>;
+
+    fn from_nullable(value: Self::Nullable) -> Self {
+        value.map(HashMap::<K, V>::from_nullable)
+    }
+}
+
 /// Requires exactly one non-null payload in a mixed row.
 #[allow(unused)]
 #[internal_api]
@@ -312,8 +340,66 @@ mod tests {
 
     use bytes::Bytes;
     use delta_kernel_derive::ToSchema;
+    use rstest::rstest;
 
-    use crate::schema::{ToSchema, schema};
+    use super::FromNullableContainer;
+    use crate::KernelResult;
+    use crate::expressions::Scalar;
+    use crate::schema::{DataType, MapType, ToSchema, schema};
+
+    fn project_nullable_map(
+        value: Scalar,
+        optional: bool,
+    ) -> KernelResult<Option<HashMap<String, String>>> {
+        if optional {
+            Ok(Option::<HashMap<String, String>>::from_nullable(
+                value.try_into()?,
+            ))
+        } else {
+            Ok(Some(HashMap::<String, String>::from_nullable(
+                value.try_into()?,
+            )))
+        }
+    }
+
+    #[rstest]
+    #[case::empty(HashMap::new(), HashMap::new())]
+    #[case::all_null(HashMap::from([("null".into(), None)]), HashMap::new())]
+    #[case::mixed(
+        HashMap::from([
+            ("null".into(), None),
+            ("empty".into(), Some("".into())),
+            ("value".into(), Some("kept".into())),
+        ]),
+        HashMap::from([("empty".into(), "".into()), ("value".into(), "kept".into())])
+    )]
+    fn nullable_container_projection_drops_only_null_entries(
+        #[case] values: HashMap<String, Option<String>>,
+        #[case] expected: HashMap<String, String>,
+        #[values(false, true)] optional: bool,
+    ) {
+        assert_eq!(
+            project_nullable_map(Scalar::from(values), optional).unwrap(),
+            Some(expected)
+        );
+    }
+
+    #[rstest]
+    #[case::matching_map(MapType::new(DataType::STRING, DataType::STRING, true).into(), true)]
+    #[case::non_nullable_values(MapType::new(DataType::STRING, DataType::STRING, false).into(), false)]
+    #[case::wrong_key(MapType::new(DataType::LONG, DataType::STRING, true).into(), false)]
+    #[case::wrong_value(MapType::new(DataType::STRING, DataType::LONG, true).into(), false)]
+    #[case::non_map(DataType::STRING, false)]
+    fn nullable_container_null_requires_optional_matching_map(
+        #[case] data_type: DataType,
+        #[case] matching: bool,
+        #[values(false, true)] optional: bool,
+    ) {
+        assert_eq!(
+            project_nullable_map(Scalar::Null(data_type), optional).ok(),
+            (optional && matching).then_some(None)
+        );
+    }
 
     #[derive(ToSchema)]
     struct AllPrimitivesNotNull {

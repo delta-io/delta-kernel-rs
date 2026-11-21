@@ -7,13 +7,14 @@ use std::sync::Arc;
 use bytes::Bytes;
 use crc::{CRC_32_ISO_HDLC, Crc};
 use delta_kernel::schema::derive_macro_utils::ToDataType;
-use delta_kernel_derive::{IntoStructData, ToSchema, internal_api};
+use delta_kernel_derive::{IntoStructData, ToSchema, TryFromStructData, internal_api};
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::amt_path_util::{resolve_table_relative, validate_table_relative};
+use crate::expressions::StructData;
 use crate::path_encoding::uri_decode_path;
 use crate::schema::DataType;
 use crate::snapshot::Snapshot;
@@ -192,7 +193,7 @@ pub struct DeletionVectorDescriptor {
     pub cardinality: i64,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, ToSchema, TryFromStructData)]
 #[serde(rename_all = "camelCase")]
 struct DeletionVectorRaw {
     storage_type: String,
@@ -213,6 +214,22 @@ impl TryFrom<DeletionVectorRaw> for DeletionVectorDescriptor {
             raw.size_in_bytes,
             raw.cardinality,
         )
+    }
+}
+
+impl TryFrom<StructData> for DeletionVectorDescriptor {
+    type Error = KernelError;
+
+    fn try_from(value: StructData) -> KernelResult<Self> {
+        DeletionVectorRaw::try_from(value)?.try_into()
+    }
+}
+
+impl TryFrom<Scalar> for DeletionVectorDescriptor {
+    type Error = KernelError;
+
+    fn try_from(value: Scalar) -> KernelResult<Self> {
+        StructData::try_from(value)?.try_into()
     }
 }
 
