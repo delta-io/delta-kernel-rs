@@ -57,11 +57,15 @@ guardrails:
         path: omnigent.policies.builtins.orchestration.headless_subagent_purpose_guard
         arguments:
           allowed_purposes: [review, explore, search]
-    # Append canonical PR context to each reviewer dispatch. Keep this hook last because
+    # See "How a child task is assembled" in README.md. Keep this hook last because
     # later policies cannot recognize a rewritten dispatch without its tool name.
-    inject_review_context:
+    append_child_task_body:
       type: function
       function:
-        path: review_context_policy.inject_review_context
+        path: child_task.append_child_task_body
         arguments:
-          context_path: /tmp/reviewer_context.txt
+          pr_data_path: /tmp/child_task_pr_data.md
+          root_guidance_path: /tmp/child_task_root_guidance.md
+          root_guidance_agents:
+            - maintainer-claude-reviewer
+            - maintainer-codex-reviewer

@@ -1,4 +1,4 @@
-${base_context}
+${project_guidance}
 
 ${review_rules}
 

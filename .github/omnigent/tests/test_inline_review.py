@@ -284,21 +284,19 @@ class InlineReviewTest(unittest.TestCase):
         review_rules = (SHARED_DIR / "review_rules.md").read_text().strip()
         for heading in ("## Known issue handling", "## Previous AI review handling"):
             self.assertIn(heading, review_rules)
-        base_context = (SHARED_DIR / "base_context.md").read_text().strip()
+        project_guidance = (SHARED_DIR / "project_guidance.md").read_text().strip()
         self.assertEqual(orchestrator.count(review_rules), 1)
-        self.assertNotIn(base_context, orchestrator)
+        self.assertNotIn(project_guidance, orchestrator)
         for agent, instructions in children.items():
-            with self.subTest(agent=agent, block="review_rules and base_context"):
+            with self.subTest(agent=agent, block="review_rules and project_guidance"):
                 self.assertEqual(instructions.count(review_rules), 1)
-                self.assertEqual(
-                    instructions.count(base_context), int(agent != "disprove-reviewer")
-                )
+                self.assertEqual(instructions.count(project_guidance), 1)
 
         description_policy = (SHARED_DIR / "pr_description.md").read_text().strip()
         self.assertIn("## PR description accuracy", description_policy)
         self.assertEqual(orchestrator.count(description_policy), 1)
         self.assertIn("Always dispatch\n`docs-reviewer`", reviewer_contract)
-        self.assertIn("only the PR title and description", reviewer_contract)
+        self.assertIn("including rustdoc the diff does not touch", reviewer_contract)
         for agent, instructions in children.items():
             with self.subTest(agent=agent, block="pr_description"):
                 self.assertEqual(
@@ -316,11 +314,13 @@ class InlineReviewTest(unittest.TestCase):
                     instructions.count(ci_environment), int(agent != "disprove-reviewer")
                 )
 
+        for standing_rule in ("reviewer/shared", "{review_rules}", "pass each the diff"):
+            with self.subTest(absent_from_orchestrator_task=standing_rule):
+                self.assertNotIn(standing_rule, workflow)
         self.assertIn("python3 .github/omnigent/prepare_reviewer.py", workflow)
-        self.assertIn('shared_dir.joinpath("review_rules.md")', workflow)
-        self.assertIn('shared_dir.joinpath("pr_description.md")', workflow)
-        self.assertEqual(workflow.count("{review_rules}"), 1)
-        self.assertEqual(workflow.count("{pr_description_rules}"), 1)
+        self.assertIn(
+            "printf 'project_doc_max_bytes = 0\\n' > \"$HOME/.codex/config.toml\"", workflow
+        )
         self.assertIn("[PR description truncated at 4096 characters", workflow)
         self.assertIn("format_review_history", workflow)
         self.assertIn("OMNIGENT_BOT_LOGIN: ${{ vars.OMNIGENT_BOT_LOGIN }}", workflow)
