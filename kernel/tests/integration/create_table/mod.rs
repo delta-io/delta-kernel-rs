@@ -259,6 +259,31 @@ async fn test_create_table_with_user_domain_metadata() -> delta_kernel::Result<(
     Ok(())
 }
 
+#[rstest]
+#[case::with_description(Some("table description"))]
+#[case::without_description(None)]
+#[tokio::test]
+async fn create_table_description_round_trips(
+    #[case] description: Option<&str>,
+) -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let mut create = create_table(&table_path, simple_schema()?, "Test/1.0", false);
+    if let Some(description) = description {
+        create = create.with_description(description);
+    }
+    let _ = create
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    assert_eq!(
+        snapshot.table_configuration().metadata().description(),
+        description
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_create_table_already_exists() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;

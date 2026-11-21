@@ -2465,6 +2465,13 @@ mod tests {
                 engine.shallow_copy(),
             )
         });
+        let builder = ok_or_panic(unsafe {
+            create_table_txn_builder_with_description(
+                builder,
+                ffi_str("table description"),
+                engine.shallow_copy(),
+            )
+        });
 
         let parameter_entries = [
             FfiNullableStringMapEntry {
@@ -2565,6 +2572,14 @@ mod tests {
 
         let committed = ok_or_panic(unsafe { create_table_txn_commit(txn, engine.shallow_copy()) });
         assert_eq!(unsafe { version_and_free(committed) }, 0);
+        let snapshot =
+            unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
+        let snapshot_arc = unsafe { snapshot.clone_as_arc() };
+        assert_eq!(
+            snapshot_arc.table_configuration().metadata().description(),
+            Some("table description")
+        );
+        unsafe { free_snapshot(snapshot) };
         let commit_info = read_commit_info_action(&store, &table_url, 0).await;
         assert_eq!(
             commit_info["commitInfo"]["operationParameters"]["key"],
@@ -2678,6 +2693,13 @@ mod tests {
         let builder = ok_or_panic(unsafe {
             update_table_txn_builder_add_column(builder, &added_field, engine.shallow_copy())
         });
+        let builder = ok_or_panic(unsafe {
+            update_table_txn_builder_with_description(
+                builder,
+                ffi_str("table description"),
+                engine.shallow_copy(),
+            )
+        });
         let txn =
             ok_or_panic(unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) });
         let txn = ok_or_panic(unsafe {
@@ -2698,6 +2720,13 @@ mod tests {
 
         let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
         assert_eq!(unsafe { version_and_free(committed) }, 1);
+        let updated = unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
+        let updated_arc = unsafe { updated.clone_as_arc() };
+        assert_eq!(
+            updated_arc.table_configuration().metadata().description(),
+            Some("table description")
+        );
+        unsafe { free_snapshot(updated) };
         let commit_info = read_commit_info_action(&store, &table_url, 1).await;
         assert_eq!(commit_info["commitInfo"]["operation"], "CUSTOM");
         assert_eq!(
@@ -3497,6 +3526,56 @@ mod tests {
             "Cannot modify the table property",
         );
         unsafe {
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_table_builder_removes_description_via_ffi() -> KernelResult<()> {
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_update_builder_remove_description", None);
+        let (_table_path, engine, builder) = create_table_txn_builder(
+            false,
+            &store,
+            &table_url,
+            vec![StructField::nullable("id", DataType::INTEGER)],
+        );
+        let builder = ok_or_panic(unsafe {
+            create_table_txn_builder_with_description(
+                builder,
+                ffi_str("table description"),
+                engine.shallow_copy(),
+            )
+        });
+        build_and_commit(builder, &engine);
+
+        let snapshot =
+            unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
+        let builder = unsafe {
+            ok_or_panic(new_update_table_txn_builder(
+                snapshot.shallow_copy(),
+                KernelUpdateTableOperation::AlterTable,
+                ffi_str("test-engine/1.0"),
+                false,
+                engine.shallow_copy(),
+            ))
+        };
+        let builder = unsafe { update_table_txn_builder_with_description_removed(builder) };
+        let txn =
+            ok_or_panic(unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
+        assert_eq!(unsafe { version_and_free(committed) }, 1);
+
+        let updated = unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
+        let description = unsafe { updated.as_ref() }
+            .table_configuration()
+            .metadata()
+            .description();
+        assert_eq!(description, None);
+        unsafe {
+            free_snapshot(updated);
             free_snapshot(snapshot);
             free_engine(engine);
         }

@@ -546,6 +546,16 @@ impl Metadata {
         self
     }
 
+    /// Returns a new Metadata with the description replaced, preserving all other fields. `None`
+    /// removes the description.
+    #[internal_api]
+    pub(crate) fn with_description(self, description: Option<String>) -> Self {
+        Self {
+            description,
+            ..self
+        }
+    }
+
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_unchecked(
