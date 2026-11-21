@@ -1098,7 +1098,7 @@ class InlineReviewTest(unittest.TestCase):
         self.assertEqual(unmapped, ["Nit1"])
         self.assertIn("### Nit1", payload["body"])
 
-    def test_workflow_inline_rejection_preserves_mapped_and_unmapped_findings(self) -> None:
+    def test_workflow_inline_rejection_preserves_prose_and_json_only_findings(self) -> None:
         repo_root = Path(__file__).resolve().parents[3]
         workflow = yaml.safe_load((repo_root / ".github/workflows/ai-review.yml").read_text())
         publish_step = next(
@@ -1111,7 +1111,7 @@ class InlineReviewTest(unittest.TestCase):
             root = Path(directory)
             (root / "review_output.txt").write_text(
                 "## Blocking issues\n### Blocker1\nDeleted parent line.\n\n"
-                "## Non-blocking notes\n### Nit1\nChild change.\n\n## Summary\nTwo findings."
+                "## Non-blocking notes\n### Nit1\nChild change.\n\n## Summary\nNeeds review."
             )
             findings = [
                 {
@@ -1124,6 +1124,7 @@ class InlineReviewTest(unittest.TestCase):
                 for finding_id, side, body in (
                     ("Blocker1", "LEFT", "Deleted parent line."),
                     ("Nit1", "RIGHT", "Child change."),
+                    ("Nit2", "RIGHT", "JSON-only finding."),
                 )
             ]
             (root / "inline_findings.json").write_text(json.dumps(findings))
@@ -1167,12 +1168,16 @@ class InlineReviewTest(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             submitted = json.loads((root / "submitted.json").read_text())
-            self.assertEqual(len(submitted["comments"]), 1)
-            self.assertEqual(submitted["comments"][0]["side"], "RIGHT")
+            self.assertEqual(len(submitted["comments"]), 2)
+            self.assertTrue(all(comment["side"] == "RIGHT" for comment in submitted["comments"]))
             self.assertIn("### Blocker1", submitted["body"])
             self.assertNotIn("### Nit1", submitted["body"])
+            self.assertNotIn("JSON-only finding.", submitted["body"])
             published = (root / "published.md").read_text()
-            for finding in ("### Blocker1", "Deleted parent line.", "### Nit1", "Child change."):
+            for finding in (
+                "### Blocker1", "Deleted parent line.", "### Nit1", "Child change.",
+                "### Nit2", "JSON-only finding.", "kernel/src/example.rs", "RIGHT, line 9",
+            ):
                 self.assertIn(finding, published)
 
     def test_exact_duplicate_inline_body_is_skipped_without_new_comments(self) -> None:

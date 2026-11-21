@@ -288,6 +288,33 @@ def build_review_payload(
     )
 
 
+def _include_missing_finding_sections(review: str, findings: list[dict[str, Any]]) -> str:
+    """Give validated JSON-only findings prose sections before mapping or fallback."""
+    boundaries = _review_boundaries(review)
+    present_ids = {
+        finding.group(1)
+        for _, line in boundaries
+        if (finding := _FINDING_HEADING.match(line)) is not None
+    }
+    sections: list[str] = []
+    for finding in findings:
+        try:
+            finding_id, path, line, side, body = _validate_finding(finding)
+        except ValueError:
+            continue
+        if finding_id not in present_ids:
+            sections.append(f"### {finding_id}\n`{path}` ({side}, line {line})\n\n{body}")
+            present_ids.add(finding_id)
+    if not sections:
+        return review
+    insertion = boundaries[0][0] if boundaries else len(review)
+    return "\n\n".join(
+        part
+        for part in (review[:insertion].rstrip(), *sections, review[insertion:].lstrip())
+        if part
+    )
+
+
 def _remove_finding_sections(review: str, finding_ids: set[str]) -> str:
     """Remove finding sections that are published inline or already present."""
     if not finding_ids:
@@ -497,10 +524,11 @@ def main() -> None:
 
     history = _load_history(args.history)
     trusted_bot_logins = _load_trusted_bot_logins(args.trusted_bot_logins)
-    review = args.review.read_text()
+    findings = json.loads(args.findings.read_text())
+    review = _include_missing_finding_sections(args.review.read_text(), findings)
     payload, unmapped, duplicates = build_review_payload(
         review=review,
-        findings=json.loads(args.findings.read_text()),
+        findings=findings,
         diff=args.diff.read_text(errors="replace"),
         head_sha=args.head_sha,
         run_url=args.run_url,

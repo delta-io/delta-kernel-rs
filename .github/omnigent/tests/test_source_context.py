@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import importlib.util
-import os
+import tempfile
+import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 def _load_source_context():
@@ -16,32 +18,44 @@ def _load_source_context():
     return module
 
 
-def test_read_list_and_search_are_confined_to_source_roots(tmp_path: Path) -> None:
-    source_context = _load_source_context()
-    pr_root = tmp_path / "pr"
-    delta_root = tmp_path / "delta"
-    pr_root.mkdir()
-    delta_root.mkdir()
-    (pr_root / "src").mkdir()
-    (pr_root / "src" / "lib.rs").write_text("fn visible() {}\nfn target() {}\n")
-    (delta_root / "PROTOCOL.md").write_text("# Protocol\nMUST retain context\n")
-    secret = tmp_path / "secret.txt"
-    secret.write_text("do not expose\n")
-    (pr_root / "outside").symlink_to(secret)
-    secret_dir = tmp_path / "secret-dir"
-    secret_dir.mkdir()
-    (secret_dir / "hidden.txt").write_text("directory symlink secret\n")
-    (pr_root / "outside-dir").symlink_to(secret_dir, target_is_directory=True)
+class SourceContextTest(unittest.TestCase):
+    def test_read_list_and_search_are_confined_to_source_roots(self) -> None:
+        source_context = _load_source_context()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pr_root = root / "pr"
+            delta_root = root / "delta"
+            pr_root.mkdir()
+            delta_root.mkdir()
+            (pr_root / "src").mkdir()
+            (pr_root / "src" / "lib.rs").write_text("fn visible() {}\nfn target() {}\n")
+            (delta_root / "PROTOCOL.md").write_text("# Protocol\nMUST retain context\n")
+            secret = root / "secret.txt"
+            secret.write_text("do not expose\n")
+            (pr_root / "outside").symlink_to(secret)
+            secret_dir = root / "secret-dir"
+            secret_dir.mkdir()
+            (secret_dir / "hidden.txt").write_text("directory symlink secret\n")
+            (pr_root / "outside-dir").symlink_to(secret_dir, target_is_directory=True)
 
-    os.environ["PR_SOURCE_ROOT"] = str(pr_root)
-    os.environ["DELTA_SOURCE_ROOT"] = str(delta_root)
-
-    assert "2\tfn target() {}" in source_context.read_source_file("pr", "src/lib.rs", 2, 1)
-    assert source_context.list_source_files("pr") == "src/lib.rs"
-    assert source_context.search_source_code("delta", "MUST") == (
-        "PROTOCOL.md:2: MUST retain context"
-    )
-    assert source_context.read_source_file("pr", "../secret.txt").startswith("Error:")
-    assert source_context.read_source_file("pr", "outside").startswith("Error:")
-    assert "outside-dir" not in source_context.list_source_files("pr")
-    assert source_context.search_source_code("pr", "directory symlink secret") == ""
+            with patch.dict(
+                "os.environ", {"PR_SOURCE_ROOT": str(pr_root), "DELTA_SOURCE_ROOT": str(delta_root)}
+            ):
+                self.assertIn(
+                    "2\tfn target() {}", source_context.read_source_file("pr", "src/lib.rs", 2, 1)
+                )
+                self.assertEqual(source_context.list_source_files("pr"), "src/lib.rs")
+                self.assertEqual(
+                    source_context.search_source_code("delta", "MUST"),
+                    "PROTOCOL.md:2: MUST retain context",
+                )
+                self.assertTrue(
+                    source_context.read_source_file("pr", "../secret.txt").startswith("Error:")
+                )
+                self.assertTrue(
+                    source_context.read_source_file("pr", "outside").startswith("Error:")
+                )
+                self.assertNotIn("outside-dir", source_context.list_source_files("pr"))
+                self.assertEqual(
+                    source_context.search_source_code("pr", "directory symlink secret"), ""
+                )

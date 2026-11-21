@@ -30,13 +30,14 @@ def resolve_review_base(
 
     The description's git-stack list identifies the immediate parent PR; comparison links
     and branch labels do not select commits. Ordinary PRs and stack roots use the GitHub
-    base. Children use the merge base of their parent's head and their own head, allowing
-    the parent to advance. If the parent's merge result is inherited by both the child
-    and its GitHub base, use that base instead, including after squash merges.
+    base. Children must inherit their parent's head; divergent histories require a stack
+    sync because ancestry cannot distinguish an advanced parent from a rewritten one.
+    Use the GitHub base when it contains the inherited parent head, or when both it and
+    the child inherit the parent's merge result, including after squash merges.
 
-    Raise ValueError for ambiguous descriptions, empty scopes, rewritten parents with no
-    shared changes outside the base branch, or a base-branch merge that would inflate the
-    scoped diff. API failures propagate instead of widening the review. The declared parent
+    Raise ValueError for ambiguous descriptions, empty scopes, divergent parent/child
+    histories, or a base-branch merge that would inflate the scoped diff.
+    API failures propagate instead of widening the review. The declared parent
     relationship remains author supplied; ancestry cannot establish its completeness.
     """
     if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is None:
@@ -85,20 +86,26 @@ def resolve_review_base(
             )
             return github_base
 
-    review_base = compare(parent_head, head_sha)["merge_base_commit"]["sha"]
+    parent_comparison = compare(parent_head, head_sha)
+    review_base = parent_comparison["merge_base_commit"]["sha"]
     if review_base == head_sha:
         raise ValueError("no child changes remain after the stack parent")
-    head_fork = compare(github_base, head_sha)["merge_base_commit"]["sha"]
+    if parent_comparison["status"] != "ahead" or review_base != parent_head:
+        raise ValueError(
+            "stack parent and child histories have diverged; sync the stack before reviewing"
+        )
     boundary_fork = compare(github_base, review_base)["merge_base_commit"]["sha"]
+    if boundary_fork == review_base:
+        _LOG.info(
+            "Review scope: parent PR #%s is already in GitHub base %s", parent_number, github_base
+        )
+        return github_base
+    head_fork = compare(github_base, head_sha)["merge_base_commit"]["sha"]
     if head_fork != boundary_fork:
         raise ValueError(
             "child merged base-branch changes absent from its parent; refresh the stack"
         )
-    if review_base == head_fork:
-        raise ValueError(
-            "stack parent has no shared changes outside the base branch; refresh the stack"
-        )
-    _LOG.info("Review scope: parent PR #%s merge base %s", parent_number, review_base)
+    _LOG.info("Review scope: inherited parent PR #%s head %s", parent_number, review_base)
     return review_base
 
 

@@ -121,12 +121,21 @@ class ReviewScopeTest(unittest.TestCase):
         self.assertEqual(self.resolve(_stack_body(f"[parent]({PR_URL}/1)")), GITHUB_BASE)
         self.get_json.assert_called_once_with(f"repos/{REPOSITORY}/pulls/1")
 
-    def test_advanced_parent_uses_the_inherited_merge_base(self) -> None:
+    def test_parent_and_child_heads_may_live_in_the_same_or_different_forks(self) -> None:
+        for parent_repository in ("contributor/delta-kernel-rs", "other/delta-kernel-rs"):
+            with self.subTest(parent_repository=parent_repository):
+                self.responses[f"repos/{REPOSITORY}/pulls/1"]["head"].update(
+                    repo={"full_name": parent_repository}, ref="stack/parent"
+                )
+                self.assertEqual(self.resolve(_stack_body(f"[parent]({PR_URL}/1)")), PARENT)
+
+    def test_advanced_parent_requires_sync_when_histories_have_diverged(self) -> None:
         self.responses[f"repos/{REPOSITORY}/pulls/1"]["head"]["sha"] = ADVANCED
         self.responses[f"repos/{REPOSITORY}/compare/{ADVANCED}...{HEAD}"] = _comparison(
             PARENT, "diverged"
         )
-        self.assertEqual(self.resolve(_stack_body(f"[parent]({PR_URL}/1)")), PARENT)
+        with self.assertRaisesRegex(ValueError, "diverged.*sync"):
+            self.resolve(_stack_body(f"[parent]({PR_URL}/1)"))
 
     def test_child_merging_main_without_parent_stops_inflated_scope(self) -> None:
         self.responses[f"repos/{REPOSITORY}/compare/{GITHUB_BASE}...{HEAD}"] = _comparison(
@@ -164,7 +173,7 @@ class ReviewScopeTest(unittest.TestCase):
         self.responses[f"repos/{REPOSITORY}/compare/{GITHUB_BASE}...{FORK}"] = _comparison(
             FORK, "behind"
         )
-        with self.assertRaisesRegex(ValueError, "no shared changes"):
+        with self.assertRaisesRegex(ValueError, "diverged.*sync"):
             self.resolve(_stack_body(f"[parent]({PR_URL}/1)"))
 
     def test_parent_containing_child_head_stops_empty_review(self) -> None:
@@ -250,6 +259,97 @@ class ReviewScopeTest(unittest.TestCase):
                     with patch.object(self.module, "_github_json", **response):
                         with self.assertRaisesRegex(SystemExit, "Cannot resolve PR review scope"):
                             self.module._main()
+
+    def test_github_json_projections_preserve_the_required_api_fields(self) -> None:
+        cases = (
+            (
+                f"repos/{REPOSITORY}/compare/{PARENT}...{HEAD}",
+                {
+                    "status": "ahead",
+                    "merge_base_commit": {"sha": PARENT, "message": "parent change"},
+                    "commits": [{"sha": HEAD}],
+                    "files": [{"filename": "child.py", "patch": "+child_change()"}],
+                },
+                _comparison(PARENT),
+            ),
+            (
+                f"repos/{REPOSITORY}/pulls/1",
+                {
+                    "head": {"sha": PARENT, "ref": "stack/parent"},
+                    "merged_at": None,
+                    "merge_commit_sha": MERGE,
+                    "body": "Parent description",
+                },
+                {"head": {"sha": PARENT}, "merged_at": None, "merge_commit_sha": MERGE},
+            ),
+        )
+        for endpoint, response, expected in cases:
+            with self.subTest(endpoint=endpoint):
+                with patch.object(
+                    self.module.subprocess, "check_output", return_value=json.dumps(expected)
+                ) as check_output:
+                    self.assertEqual(self.module._github_json(endpoint), expected)
+                command = check_output.call_args.args[0]
+                self.assertEqual(command[:4], ["gh", "api", endpoint, "--jq"])
+                self.assertTrue(check_output.call_args.kwargs["text"])
+                projected = subprocess.check_output(
+                    ["jq", command[4]], input=json.dumps(response), text=True
+                )
+                self.assertEqual(json.loads(projected), expected)
+
+    def test_validated_review_reports_only_a_distinct_reviewed_range(self) -> None:
+        repo_root = Path(__file__).resolve().parents[3]
+        workflow = yaml.safe_load((repo_root / ".github/workflows/ai-review.yml").read_text())
+        validate_step = next(
+            step
+            for job in workflow["jobs"].values()
+            for step in job["steps"]
+            if step.get("name") == "Validate review output"
+        )
+        script = validate_step["run"].rsplit("python3 - <<'PYEOF'\n", 1)[1].split("\nPYEOF", 1)[0]
+        marker = "1" * 32
+        review = "## Summary\nA child finding needs attention."
+        for review_base in (GITHUB_BASE, PARENT):
+            for mode in ("artifact", "inline"):
+                with self.subTest(review_base=review_base, mode=mode):
+                    with tempfile.TemporaryDirectory() as directory:
+                        root = Path(directory)
+                        inline = (
+                            f"\n<!-- AI_REVIEW_INLINE_START_{marker} -->\n"
+                            '{"findings":[]}\n'
+                            f"<!-- AI_REVIEW_INLINE_END_{marker} -->"
+                            if mode == "inline"
+                            else ""
+                        )
+                        (root / "review_raw_output.txt").write_text(
+                            f"<!-- AI_REVIEW_START_{marker} -->\n{review}{inline}\n"
+                            f"<!-- AI_REVIEW_END_{marker} -->\n"
+                        )
+                        result = subprocess.run(
+                            [sys.executable, "-c", script.replace("/tmp/", f"{root}/")],
+                            cwd=repo_root,
+                            env={
+                                **os.environ,
+                                "OUTPUT_MODE": mode,
+                                "REVIEW_MARKER": marker,
+                                "REVIEW_BASE_SHA": review_base,
+                                "GITHUB_BASE_SHA": GITHUB_BASE,
+                                "HEAD_SHA": HEAD,
+                                "REPO": REPOSITORY,
+                            },
+                            capture_output=True,
+                            text=True,
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                        prefix = (
+                            f"Reviewed range: [`{review_base}...{HEAD}`]"
+                            f"(https://github.com/{REPOSITORY}/compare/{review_base}...{HEAD}).\n\n"
+                            if review_base != GITHUB_BASE
+                            else ""
+                        )
+                        self.assertEqual(
+                            (root / "review_output.txt").read_text(), prefix + review + "\n"
+                        )
 
     def test_workflow_diff_and_all_reviewer_prompts_use_the_resolved_scope(self) -> None:
         repo_root = Path(__file__).resolve().parents[3]
@@ -390,6 +490,103 @@ class ReviewScopeTest(unittest.TestCase):
                     if review_base != GITHUB_BASE:
                         self.assertNotIn("+ancestor_change();", prompt)
                 self.assertIn("+ancestor_change();", (temp / "github_pr_diff.txt").read_text())
+
+
+class GitReviewScopeTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.module = _load_module()
+        directory = tempfile.TemporaryDirectory(prefix="review-scope-")
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Review scope test",
+            "GIT_COMMITTER_NAME": "Review scope test",
+            "GIT_AUTHOR_EMAIL": "review-scope@example.com",
+            "GIT_COMMITTER_EMAIL": "review-scope@example.com",
+        }
+        self.git("init", "-q")
+        self.base_files = {"base.py": "base\n"}
+        self.base = self.commit("base", (), self.base_files)
+        self.grandparent_files = {**self.base_files, "grandparent.py": "grandparent\n"}
+        self.grandparent = self.commit("grandparent", (self.base,), self.grandparent_files)
+
+    def git(self, *arguments: str, input: str | None = None) -> str:
+        return subprocess.check_output(
+            ["git", *arguments], cwd=self.root, env=self.env, input=input, text=True
+        ).strip()
+
+    def commit(self, label: str, parents: tuple[str, ...], files: dict[str, str]) -> str:
+        entries = [
+            f"100644 blob {self.git('hash-object', '-w', '--stdin', input=body)}\t{path}\n"
+            for path, body in sorted(files.items())
+        ]
+        tree = self.git("mktree", input="".join(entries))
+        arguments = ["commit-tree", tree, "-m", label]
+        for parent in parents:
+            arguments.extend(("-p", parent))
+        return self.git(*arguments)
+
+    def get_json(self, endpoint: str) -> dict:
+        if endpoint == f"repos/{REPOSITORY}/pulls/1":
+            return self.parent_metadata
+        base, head = endpoint.split("/compare/", 1)[1].split("...")
+        merge_base = self.git("merge-base", base, head)
+        status = (
+            "identical" if base == head else "ahead" if merge_base == base
+            else "behind" if merge_base == head else "diverged"
+        )
+        return _comparison(merge_base, status)
+
+    def test_amended_parent_never_reintroduces_inherited_changes(self) -> None:
+        for inherited_commits in (1, 2):
+            with self.subTest(inherited_commits=inherited_commits):
+                before_last = self.grandparent
+                if inherited_commits == 2:
+                    before_last = self.commit(
+                        "parent first change", (before_last,), self.grandparent_files
+                    )
+                parent_files = {**self.grandparent_files, "parent.py": "parent\n"}
+                original = self.commit("parent", (before_last,), parent_files)
+                child = self.commit("child", (original,), {**parent_files, "child.py": "child\n"})
+                amended = self.commit(
+                    "amended parent", (before_last,), {**parent_files, "parent.py": "amended\n"}
+                )
+                self.parent_metadata = {"head": {"sha": amended}, "merged_at": None}
+                metadata = _metadata(_stack_body(f"[parent]({PR_URL}/1)", original))
+                metadata["base"]["sha"] = self.base
+                metadata["head"]["sha"] = child
+                self.assertEqual(
+                    self.git("diff", "--name-only", f"{original}...{child}"), "child.py"
+                )
+                with self.assertRaisesRegex(ValueError, "diverged.*sync"):
+                    self.module.resolve_review_base(metadata, REPOSITORY, self.get_json)
+
+    def test_merge_commit_parent_uses_github_base_before_child_sync(self) -> None:
+        parent_files = {**self.grandparent_files, "parent.py": "parent\n"}
+        parent = self.commit("parent", (self.grandparent,), parent_files)
+        child = self.commit("child", (parent,), {**parent_files, "child.py": "child\n"})
+        merged = self.commit("merge parent", (self.base, parent), parent_files)
+        advanced_base = self.commit(
+            "advance base", (merged,), {**parent_files, "other.py": "unrelated\n"}
+        )
+        self.parent_metadata = {
+            "head": {"sha": parent},
+            "merged_at": "2026-11-21T00:00:00Z",
+            "merge_commit_sha": merged,
+        }
+        for github_base in (merged, advanced_base):
+            with self.subTest(github_base=github_base):
+                metadata = _metadata(_stack_body(f"[parent]({PR_URL}/1)", parent))
+                metadata["base"]["sha"] = github_base
+                metadata["head"]["sha"] = child
+                self.assertEqual(
+                    self.module.resolve_review_base(metadata, REPOSITORY, self.get_json),
+                    github_base,
+                )
+                self.assertEqual(
+                    self.git("diff", "--name-only", f"{github_base}...{child}"), "child.py"
+                )
 
 
 if __name__ == "__main__":
