@@ -5,6 +5,7 @@ use std::sync::Arc;
 use delta_kernel_derive::internal_api;
 
 use crate::actions::{Metadata, Protocol};
+use crate::checkpoint::SelectedCheckpointType;
 use crate::crc::Crc;
 use crate::error::SnapshotHintError;
 use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -88,6 +89,9 @@ pub(crate) struct SnapshotHint {
     crc: Option<Arc<Crc>>,
     /// Whether `version` was established as latest when the hint was captured.
     freshness: SnapshotHintFreshness,
+    /// The spec of the checkpoint selected from `log_segment_files`, when the hint's source knew
+    /// it. `None` means unknown, not that no checkpoint was selected.
+    checkpoint_type: Option<SelectedCheckpointType>,
 }
 
 impl SnapshotHint {
@@ -105,6 +109,10 @@ impl SnapshotHint {
     ///
     /// `publication_watermark` selects path-based inference or an explicit observation that may
     /// no longer be represented by a retained path.
+    ///
+    /// `checkpoint_type` is the spec of the checkpoint selected from `log_paths`, if known. Pass
+    /// `None` when unknown. It is used only when the checkpoint's naming and the table protocol do
+    /// not decide the type, and the checkpoint's contents replace it once discovery reads them.
     ///
     /// # Errors
     ///
@@ -126,6 +134,7 @@ impl SnapshotHint {
         last_checkpoint_hint: Option<LastCheckpointHint>,
         crc: Option<Arc<Crc>>,
         freshness: SnapshotHintFreshness,
+        checkpoint_type: Option<SelectedCheckpointType>,
     ) -> KernelResult<Self> {
         let log_root = try_parse_uri(table_root)?.join(DELTA_LOG_DIR_WITH_SLASH)?;
         let mut parsed_paths: Vec<ParsedLogPath> = log_paths.into_iter().map(Into::into).collect();
@@ -157,7 +166,25 @@ impl SnapshotHint {
             last_checkpoint_hint,
             crc,
             freshness,
+            checkpoint_type,
         })
+    }
+
+    /// Replaces the selected checkpoint's spec.
+    #[cfg(all(test, feature = "declarative-plans"))]
+    pub(crate) fn with_checkpoint_type(
+        mut self,
+        checkpoint_type: Option<SelectedCheckpointType>,
+    ) -> Self {
+        self.checkpoint_type = checkpoint_type;
+        self
+    }
+
+    /// Returns the selected checkpoint's spec, if the hint's source knew it.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn checkpoint_type(&self) -> Option<SelectedCheckpointType> {
+        self.checkpoint_type
     }
 
     /// Returns the version described by this hint.
@@ -241,6 +268,7 @@ impl SnapshotHint {
             metadata: snapshot.table_configuration().metadata().clone(),
             last_checkpoint_hint: last_checkpoint_hint.cloned(),
             crc: snapshot.crc_at_version().cloned(),
+            checkpoint_type: snapshot.known_checkpoint_type(),
             freshness: if snapshot.is_built_as_latest() {
                 SnapshotHintFreshness::Latest
             } else {
@@ -305,6 +333,7 @@ impl SnapshotHint {
             last_checkpoint_hint,
             crc,
             freshness,
+            checkpoint_type,
         } = *self;
         let built_as_latest = freshness == SnapshotHintFreshness::Latest
             && max_catalog_version.is_none_or(|max| max <= version);
@@ -374,14 +403,15 @@ impl SnapshotHint {
             );
         }
 
-        Snapshot::new_with_crc(
+        let mut snapshot = Snapshot::new_with_crc(
             log_segment,
             table_configuration,
             crc,
             built_as_latest,
             false, /* skipped_new_checkpoints */
-        )
-        .map(Into::into)
+        )?;
+        snapshot.retained_checkpoint_type = checkpoint_type;
+        Ok(snapshot.into())
     }
 }
 
@@ -687,6 +717,7 @@ mod tests {
             None,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
         )
         .unwrap();
 
@@ -723,6 +754,7 @@ mod tests {
             None,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
         )
         .unwrap();
 
@@ -758,6 +790,7 @@ mod tests {
             None,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
         )?;
         let (engine, _store, _table_root) = setup_test();
         assert_log_segment_hint_error(
@@ -789,6 +822,7 @@ mod tests {
             None,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
         );
         assert_result_error_with_message(result, expected_error);
     }
@@ -842,6 +876,7 @@ mod tests {
             None,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
         )
         .map_err(Error::from)
         .and_then(|hint| {
@@ -910,6 +945,7 @@ mod tests {
             None,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
         )
         .unwrap();
         let first_retained_path = hint
@@ -956,6 +992,7 @@ mod tests {
             None,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
         )
         .unwrap();
         let (engine, _store, _table_root) = setup_test();

@@ -358,7 +358,7 @@ impl Snapshot {
         let log_segment = current_segment
             .take()
             .ok_or_else(|| KernelError::internal_error("Missing prepared log segment"))?;
-        let snapshot = Self::new_with_validated_crc(
+        let mut snapshot = Self::new_with_validated_crc(
             log_segment,
             table_configuration,
             crc,
@@ -369,6 +369,8 @@ impl Snapshot {
             #[cfg(feature = "adaptive-metadata-in-dev")]
             resolution.last_manifest_commit,
         );
+        snapshot.retained_checkpoint_type = existing_snapshot
+            .checkpoint_type_for_parts(&snapshot.log_segment.listed.checkpoint_parts);
         Ok(Arc::new(snapshot))
     }
 
@@ -598,6 +600,7 @@ impl Snapshot {
             crc: existing.crc.clone(),
             built_as_latest,
             skipped_new_checkpoints,
+            retained_checkpoint_type: existing.retained_checkpoint_type,
             #[cfg(feature = "declarative-plans")]
             checkpoint_info: existing.checkpoint_info.clone(),
             #[cfg(feature = "declarative-plans")]

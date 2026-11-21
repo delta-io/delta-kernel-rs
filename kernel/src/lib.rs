@@ -123,6 +123,7 @@ pub mod table_features;
 pub mod table_properties;
 pub mod transaction;
 pub mod transforms;
+pub(crate) mod uri_reference;
 
 pub use crc::{FileSizeHistogram, FileStats};
 pub use log_path::LogPath;

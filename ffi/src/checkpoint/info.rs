@@ -3,17 +3,21 @@
 use delta_kernel::KernelResult;
 use delta_kernel::checkpoint::{CheckpointInfo, CheckpointKind};
 
+use super::FfiSelectedCheckpointType;
 use crate::delta_types::{CheckpointBacking, FfiLastCheckpoint};
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::{
-    KernelStringSlice, NullableCvoid, SharedExternEngine, SharedSnapshot, kernel_string_slice,
+    KernelStringSlice, NullableCvoid, OptionalValue, SharedExternEngine, SharedSnapshot,
+    kernel_string_slice,
 };
 
 /// Complete borrowed checkpoint summary passed to [`CheckpointInfoVisitor`].
 /// All nested storage expires when that visitor returns.
 #[repr(C)]
 pub struct FfiCheckpointInfo {
+    /// Whether the selected checkpoint follows the V1 or V2 specification.
+    pub checkpoint_type: FfiSelectedCheckpointType,
     /// Schema JSON for the files containing Add and Remove actions. For manifest checkpoints this
     /// is the sidecar schema; JSON leaves use the canonical action read schema.
     pub leaf_schema: KernelStringSlice,
@@ -52,6 +56,30 @@ impl From<CheckpointKind> for FfiCheckpointKind {
             CheckpointKind::Manifest => Self::Manifest,
         }
     }
+}
+
+/// Returns the selected checkpoint's V1 or V2 specification, or absent if none was selected.
+///
+/// Returns without I/O when the type is known. Otherwise, resolves checkpoint information through
+/// the engine's declarative executor and shares the result with checkpoint-info getters and scan
+/// planning. Failed discovery can be retried.
+///
+/// # Safety
+/// The snapshot and engine handles are borrowed and must remain valid for this call.
+/// During discovery, the executor must not request checkpoint information recursively on the
+/// same snapshot: that call would wait for initialization already in progress.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapshot_checkpoint_type(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<OptionalValue<FfiSelectedCheckpointType>> {
+    let snapshot = unsafe { snapshot.as_ref() };
+    let engine = unsafe { engine.as_ref() };
+    let result = snapshot
+        .reader()
+        .get_checkpoint_type(engine.engine().as_ref())
+        .map(|checkpoint_type| checkpoint_type.map(Into::into).into());
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Resolves the selected checkpoint and invokes `visitor` once with its complete summary.
@@ -98,6 +126,7 @@ fn visit(
     let schema = serde_json::to_string(info.leaf_schema())?;
     let checkpoint = CheckpointBacking::try_new(info.last_checkpoint())?;
     let value = FfiCheckpointInfo {
+        checkpoint_type: info.checkpoint_type().into(),
         leaf_schema: kernel_string_slice!(schema),
         leaf_file_count: info.leaf_file_count(),
         size_in_bytes: info.size_in_bytes(),
@@ -113,13 +142,22 @@ mod tests {
     use std::ptr::NonNull;
     use std::sync::Arc;
 
+    use delta_kernel::arrow::array::{RecordBatch, StringArray};
+    use delta_kernel::arrow::datatypes::{
+        DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+    };
+    use delta_kernel::engine::sync::SyncEngine;
     use delta_kernel::engine::{DelegatingEngine, PanicEngine};
     use delta_kernel::last_checkpoint_hint::LastCheckpointHint;
+    use delta_kernel::object_store::ObjectStoreExt as _;
+    use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel::object_store::path::Path;
+    use delta_kernel::parquet::arrow::ArrowWriter;
     use delta_kernel::plans::{Operation, PlanExecutor, PlanResult};
     use delta_kernel::snapshot::{
         PublicationWatermark, Snapshot, SnapshotHint, SnapshotHintFreshness,
     };
-    use delta_kernel::{FileMeta, KernelResult, LogPath};
+    use delta_kernel::{Engine, FileMeta, KernelResult, LogPath};
     use rstest::rstest;
     use url::Url;
 
@@ -130,7 +168,14 @@ mod tests {
     #[derive(Default)]
     struct Captured {
         visits: usize,
-        info: Option<(String, usize, u64, LastCheckpointHint, FfiCheckpointKind)>,
+        info: Option<(
+            String,
+            usize,
+            u64,
+            LastCheckpointHint,
+            FfiCheckpointKind,
+            FfiSelectedCheckpointType,
+        )>,
     }
 
     extern "C" fn capture(context: NullableCvoid, info: *const FfiCheckpointInfo) {
@@ -143,22 +188,26 @@ mod tests {
                 info.size_in_bytes,
                 unsafe { info.last_checkpoint.try_to_kernel() }.unwrap(),
                 info.kind,
+                info.checkpoint_type,
             )
         });
     }
 
     #[rstest]
-    #[case::no_checkpoint(false, false, false)]
-    #[case::manifest(true, true, false)]
-    #[case::leaf(true, false, false)]
-    #[case::failed_resolution(true, true, true)]
-    fn callback_copies_metadata_and_borrows_handles(
-        #[case] checkpoint: bool,
+    #[case::no_checkpoint(None, false, false)]
+    #[case::v1(Some(FfiSelectedCheckpointType::V1), false, false)]
+    #[case::manifest(Some(FfiSelectedCheckpointType::V2), true, false)]
+    #[case::leaf(Some(FfiSelectedCheckpointType::V2), false, false)]
+    #[case::failed_resolution(Some(FfiSelectedCheckpointType::V2), true, true)]
+    #[tokio::test]
+    async fn callback_copies_metadata_and_borrows_handles(
+        #[case] checkpoint: Option<FfiSelectedCheckpointType>,
         #[case] manifest: bool,
         #[case] invalid_size: bool,
     ) {
         // Given: borrowed handles for an absent, inline, manifest, or invalid checkpoint.
-        let (snapshot, engine) = checkpoint_handles(checkpoint, manifest, invalid_size);
+        let (snapshot, engine, root_size) =
+            checkpoint_handles(checkpoint, manifest, invalid_size).await;
         let mut captured = Captured::default();
         for attempt in 1..=2 {
             // When: the same handles are used for repeated exports.
@@ -191,8 +240,9 @@ mod tests {
         }
 
         // Then: copied schema and nested hint values remain usable after both handles are freed.
-        if checkpoint && !invalid_size {
-            let (copied_schema, count, bytes, hint, kind) = captured.info.unwrap();
+        if checkpoint.is_some() && !invalid_size {
+            let (copied_schema, count, bytes, hint, kind, checkpoint_type) = captured.info.unwrap();
+            assert_eq!(Some(checkpoint_type), checkpoint);
             assert_eq!(
                 kind,
                 if manifest {
@@ -208,13 +258,20 @@ mod tests {
                     serde_json::from_str(&copied_schema).unwrap();
                 assert!(schema.contains("add"));
             }
-            assert_eq!((count, bytes), (1, if manifest { 30 } else { 17 }));
+            assert_eq!(
+                (count, bytes),
+                (1, if manifest { root_size + 13 } else { root_size })
+            );
             assert_eq!(hint.size(), 7);
-            let sidecars = hint.v2_checkpoint().unwrap().sidecar_files().unwrap();
-            if manifest {
-                assert_eq!(sidecars[0].path, "leaf.parquet");
+            if checkpoint_type == FfiSelectedCheckpointType::V1 {
+                assert!(hint.v2_checkpoint().is_none());
             } else {
-                assert!(sidecars.is_empty());
+                let sidecars = hint.v2_checkpoint().unwrap().sidecar_files().unwrap();
+                if manifest {
+                    assert_eq!(sidecars[0].path, "leaf.parquet");
+                } else {
+                    assert!(sidecars.is_empty());
+                }
             }
         } else {
             assert!(captured.info.is_none());
@@ -250,10 +307,11 @@ mod tests {
         assert_eq!(unsafe { (*info).size_in_bytes }, 17);
     }
 
-    #[test]
-    fn callback_can_reenter_same_snapshot_with_null_context() {
+    #[tokio::test]
+    async fn callback_can_reenter_same_snapshot_with_null_context() {
         // Given: a callback that recursively exports from the same borrowed handles.
-        let (snapshot, engine) = checkpoint_handles(true, false, false);
+        let (snapshot, engine, _) =
+            checkpoint_handles(Some(FfiSelectedCheckpointType::V2), false, false).await;
         let mut state = ReentrantContext {
             snapshot,
             engine,
@@ -280,6 +338,7 @@ mod tests {
         }
     }
 
+    /// Panics on any execution: a snapshot built from these hints must resolve without I/O.
     struct NoIoExecutor;
 
     impl PlanExecutor for NoIoExecutor {
@@ -288,34 +347,63 @@ mod tests {
         }
     }
 
-    fn checkpoint_handles(
-        checkpoint: bool,
+    /// Builds handles from a snapshot hint, returning the checkpoint root's size. Every case runs
+    /// without I/O except V1: discovery reads a classic-named checkpoint's footer, so that case
+    /// writes a real checkpoint to in-memory storage.
+    async fn checkpoint_handles(
+        checkpoint: Option<FfiSelectedCheckpointType>,
         manifest: bool,
         invalid_size: bool,
-    ) -> (Handle<SharedSnapshot>, Handle<SharedExternEngine>) {
-        let engine = Arc::new(
-            DelegatingEngine::new(Arc::new(PanicEngine)).with_plan_executor(Arc::new(NoIoExecutor)),
-        );
+    ) -> (Handle<SharedSnapshot>, Handle<SharedExternEngine>, u64) {
+        let store = Arc::new(InMemory::new());
         let schema = r#"{"type":"struct","fields":[]}"#;
-        let filename = "00000000000000000000.checkpoint.11111111-1111-1111-1111-111111111111.json";
-        let last_checkpoint = checkpoint.then(|| serde_json::from_value::<LastCheckpointHint>(
-            serde_json::json!({
-                "version": 0, "size": 7,
-                "v2Checkpoint": {
-                    "path": filename,
-                    "sidecarFiles": if manifest {
-                        vec![serde_json::json!({ "path": "leaf.parquet", "sizeInBytes": if invalid_size { -1 } else { 13 }, "modificationTime": 23 })]
-                    } else {
-                        vec![]
-                    },
-                    "nonFileActions": [{ "checkpointMetadata": { "version": 0, "tags": { "sidecarFileSchema": schema } } }]
-                }
-            })
-        ).unwrap());
-        let path = if checkpoint {
+        let filename = if checkpoint == Some(FfiSelectedCheckpointType::V1) {
+            "00000000000000000000.checkpoint.parquet"
+        } else {
+            "00000000000000000000.checkpoint.11111111-1111-1111-1111-111111111111.json"
+        };
+        let last_checkpoint = checkpoint.map(|checkpoint_type| {
+            let value = if checkpoint_type == FfiSelectedCheckpointType::V1 {
+                serde_json::json!({
+                    "version": 0, "size": 7,
+                    "checkpointSchema": {
+                        "type": "struct",
+                        "fields": [{
+                            "name": "add", "type": "string", "nullable": true, "metadata": {}
+                        }]
+                    }
+                })
+            } else {
+                serde_json::json!({
+                    "version": 0, "size": 7,
+                    "v2Checkpoint": {
+                        "path": filename,
+                        "sidecarFiles": if manifest {
+                            vec![serde_json::json!({
+                                "path": "leaf.parquet",
+                                "sizeInBytes": if invalid_size { -1 } else { 13 },
+                                "modificationTime": 23
+                            })]
+                        } else {
+                            vec![]
+                        },
+                        "nonFileActions": [{ "checkpointMetadata": {
+                            "version": 0, "tags": { "sidecarFileSchema": schema }
+                        } }]
+                    }
+                })
+            };
+            serde_json::from_value::<LastCheckpointHint>(value).unwrap()
+        });
+        let path = if checkpoint.is_some() {
             filename
         } else {
             "00000000000000000000.json"
+        };
+        let root_size = if checkpoint == Some(FfiSelectedCheckpointType::V1) {
+            write_v1_checkpoint(&store, &format!("checkpoint-info/_delta_log/{path}")).await
+        } else {
+            17
         };
         let hint = SnapshotHint::try_new(
             "memory:///checkpoint-info/",
@@ -326,7 +414,7 @@ mod tests {
                     location: Url::parse(&format!("memory:///checkpoint-info/_delta_log/{path}"))
                         .unwrap(),
                     last_modified: 11,
-                    size: 17,
+                    size: root_size,
                 })
                 .unwrap(),
             ],
@@ -342,14 +430,44 @@ mod tests {
             last_checkpoint,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
         )
         .unwrap();
+        let engine: Arc<dyn Engine> = if checkpoint == Some(FfiSelectedCheckpointType::V1) {
+            Arc::new(SyncEngine::new_with_store(store))
+        } else {
+            Arc::new(
+                DelegatingEngine::new(Arc::new(PanicEngine))
+                    .with_plan_executor(Arc::new(NoIoExecutor)),
+            )
+        };
         let snapshot = Snapshot::builder_for("memory:///checkpoint-info/")
             .with_snapshot_hint(hint)
             .build(engine.as_ref())
             .unwrap();
         let snapshot: Handle<SharedSnapshot> = snapshot.into();
         let engine = engine_to_handle(engine, TEST_ERROR_ALLOCATORS);
-        (snapshot, engine)
+        (snapshot, engine, root_size)
+    }
+
+    /// Writes a V1 checkpoint whose only column is a string `add`, returning its size.
+    async fn write_v1_checkpoint(store: &InMemory, path: &str) -> u64 {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "add",
+            ArrowDataType::Utf8,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["{}"]))],
+        )
+        .unwrap();
+        let mut buffer = vec![];
+        let mut writer = ArrowWriter::try_new(&mut buffer, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let size = buffer.len() as u64;
+        store.put(&Path::from(path), buffer.into()).await.unwrap();
+        size
     }
 }

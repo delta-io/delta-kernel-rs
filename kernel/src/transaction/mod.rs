@@ -3198,14 +3198,14 @@ mod tests {
         let schema = test_schema_nested();
         let tag_type = MapType::new(DataType::STRING, DataType::STRING, true);
         let score_type = ArrayType::new(DataType::INTEGER, true);
-        let info_fields = vec![
-            StructField::nullable("name", DataType::STRING),
-            StructField::nullable("age", DataType::INTEGER),
-            StructField::nullable("tags", tag_type.clone()),
-            StructField::nullable("scores", score_type.clone()),
-        ];
+        let info_schema = schema_ref! {
+            nullable "name": STRING,
+            nullable "age": INTEGER,
+            nullable "tags": (tag_type.clone()),
+            nullable "scores": (score_type.clone()),
+        };
         let info1 = Scalar::Struct(StructData::try_new(
-            info_fields.clone(),
+            Arc::clone(&info_schema),
             vec![
                 "alice".into(),
                 30i32.into(),
@@ -3214,7 +3214,7 @@ mod tests {
             ],
         )?);
         let info2 = Scalar::Struct(StructData::try_new(
-            info_fields,
+            info_schema,
             vec![
                 "bob".into(),
                 25i32.into(),

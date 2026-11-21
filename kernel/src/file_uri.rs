@@ -5,8 +5,9 @@ use percent_encoding::percent_decode_str;
 use url::{Position, Url};
 use uuid::Uuid;
 
-use crate::path_encoding::{scheme_len, with_trailing_slash};
+use crate::path_encoding::with_trailing_slash;
 use crate::table_properties::FILE_TYPE_WRITE_LOCATION;
+use crate::uri_reference::scheme_len;
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
 

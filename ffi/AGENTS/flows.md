@@ -57,7 +57,13 @@ borrowed. The callback runs once on success and is not invoked on error. All nes
 when the callback returns; copy retained values during the callback. No hint handle is returned.
 Supply the copied values through `snapshot_builder_with_snapshot_hint` when rebuilding a snapshot.
 The hint preserves build-time freshness, not current freshness, and includes only a matching
-checkpoint hint and an at-version CRC. Compaction files are unsupported.
+checkpoint hint, an at-version CRC, and the selected checkpoint's type when known. Compaction files
+are unsupported.
+
+`FfiSnapshotHint.checkpoint_type` is an `OptionalValue<FfiSelectedCheckpointType>` for the
+checkpoint selected from the hint's log paths. `None` means unknown, not that no checkpoint was
+selected. C callers must set its tag explicitly, using `NoneFfiSelectedCheckpointType` when absent;
+a zero-initialized field is an invalid `Some` payload.
 
 Export includes an explicit publication watermark,
 preserving absence even when published commits are not represented by the retained paths.
@@ -76,6 +82,12 @@ checkpoint files, optional latest commit/CRC metadata, checkpoint version, and t
 watermark. It preserves staged paths independently of that watermark. The snapshot is borrowed;
 copy all retained values before the callback returns. It does not implement snapshot equivalence
 or establish freshness.
+
+`snapshot_checkpoint_type(snapshot, engine)` returns the selected checkpoint's V1/V2 specification,
+or absent when no checkpoint was selected, under `declarative-plans`. It returns without I/O when
+the type is known from the checkpoint's naming, the table protocol, the snapshot hint, or completed
+discovery. Otherwise it resolves the type through the same snapshot cache as
+`snapshot_checkpoint_info` and declarative scan planning.
 
 Snapshot accessors (`ffi/src/lib.rs`) include no-I/O reads such as `version` and
 `snapshot_file_stats`, which returns `OptionalValue<FfiFileStats>` (scalar
