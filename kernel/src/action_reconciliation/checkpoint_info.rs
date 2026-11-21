@@ -788,10 +788,7 @@ mod tests {
             Some(SelectedCheckpointType::V2)
         );
         let info = resolve_checkpoint_info(&snapshot, &counted);
-        scan.declarative_metadata_scan_plan(
-            &DelegatingEngine::new(Arc::new(counted)).without_plan_executor(),
-        )
-        .unwrap();
+        scan.declarative_metadata_scan_plan(&counted).unwrap();
 
         // Then: the cached result is shared and no further discovery is performed.
         assert!(Arc::ptr_eq(&info, cached));

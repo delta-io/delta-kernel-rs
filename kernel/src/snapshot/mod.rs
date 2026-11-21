@@ -372,14 +372,11 @@ impl Snapshot {
         engine: &dyn Engine,
         checkpoint: &mut Option<crate::metrics::CheckpointMetrics>,
     ) -> KernelResult<Option<Arc<CheckpointInfo>>> {
-        let mut cache_hit = |resolved: &Option<Arc<CheckpointInfo>>| {
+        if let Some(resolved) = self.checkpoint_info.get() {
             if let Some(checkpoint) = checkpoint {
                 checkpoint.cache_hit = Some(true);
             }
-            Ok(resolved.clone())
-        };
-        if let Some(resolved) = self.checkpoint_info.get() {
-            return cache_hit(resolved);
+            return Ok(resolved.clone());
         }
         // Fallible OnceLock initialization is unstable on our MSRV. Serialize discovery so
         // concurrent callers share one result while errors leave initialization retryable.
@@ -389,7 +386,10 @@ impl Snapshot {
             // A panicking initializer cannot publish partial state, so retry after poisoning.
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(resolved) = self.checkpoint_info.get() {
-            return cache_hit(resolved);
+            if let Some(checkpoint) = checkpoint {
+                checkpoint.cache_hit = Some(true);
+            }
+            return Ok(resolved.clone());
         }
         if let Some(checkpoint) = checkpoint {
             checkpoint.cache_hit = Some(false);

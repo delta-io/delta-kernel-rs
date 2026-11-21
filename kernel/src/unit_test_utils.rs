@@ -127,9 +127,6 @@ pub(crate) fn is_io_event(event: &MetricEvent) -> bool {
         | MetricEvent::StorageCopyCompleted(_)
         | MetricEvent::JsonReadCompleted(_)
         | MetricEvent::ParquetReadCompleted(_) => true,
-        MetricEvent::ScanPlanGenerationCompleted(_) | MetricEvent::ScanPlanGenerationFailed(_) => {
-            false
-        }
         MetricEvent::LogSegmentLoadSuccess(_)
         | MetricEvent::LogSegmentLoadFailure(_)
         | MetricEvent::ProtocolMetadataLoadSuccess(_)
@@ -149,6 +146,8 @@ pub(crate) fn is_io_event(event: &MetricEvent) -> bool {
         | MetricEvent::LastCheckpointReadCompleted(_)
         | MetricEvent::ChecksumWriteSuccess(_)
         | MetricEvent::ChecksumWriteFailure(_)
+        | MetricEvent::ScanPlanGenerationCompleted(_)
+        | MetricEvent::ScanPlanGenerationFailed(_)
         | MetricEvent::ScanMetadataCompleted(_) => false,
     }
 }
