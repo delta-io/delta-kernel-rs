@@ -43,12 +43,6 @@ tools:
 guardrails:
   ask_timeout: 86400
   policies:
-    inject_review_context:
-      type: function
-      function:
-        path: review_context_policy.inject_review_context
-        arguments:
-          context_path: /tmp/reviewer_context.txt
     spawn_bounds:
       type: function
       function:
@@ -62,3 +56,16 @@ guardrails:
         path: omnigent.policies.builtins.orchestration.headless_subagent_purpose_guard
         arguments:
           allowed_purposes: [review, explore, search]
+    # Dispatch hook: completes each child task. See README.md in this directory. Keep it last:
+    # Omnigent hands a rewritten dispatch to later policies without its tool name, so a policy
+    # listed after this hook does not recognize the dispatch and allows it.
+    append_child_task_body:
+      type: function
+      function:
+        path: child_task.append_child_task_body
+        arguments:
+          pr_data_path: /tmp/child_task_pr_data.md
+          root_guidance_path: /tmp/child_task_root_guidance.md
+          root_guidance_agents:
+            - maintainer-claude-reviewer
+            - maintainer-codex-reviewer
