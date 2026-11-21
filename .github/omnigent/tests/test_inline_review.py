@@ -1071,7 +1071,7 @@ class InlineReviewTest(unittest.TestCase):
                 payload, unmapped, _ = self.inline_review.build_review_payload(
                     review=review,
                     findings=findings,
-                    diff=DIFF,
+                    diff=DIFF + FILE_LIFECYCLE_DIFF,
                     review_diff=review_diff,
                     head_sha="f" * 40,
                     run_url="https://github.com/delta-io/delta-kernel-rs/actions/runs/1",

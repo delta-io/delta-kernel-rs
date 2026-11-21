@@ -14,13 +14,14 @@ from unittest.mock import Mock, patch
 
 import yaml
 
-
 REPOSITORY = "delta-io/delta-kernel-rs"
 PR_URL = f"https://github.com/{REPOSITORY}/pull"
 GITHUB_BASE = "a" * 40
 PARENT = "b" * 40
 HEAD = "c" * 40
+FORK = "d" * 40
 MERGE = "e" * 40
+ADVANCED = "f" * 40
 
 
 def _load_module():
@@ -28,7 +29,11 @@ def _load_module():
     spec = importlib.util.spec_from_file_location("review_scope", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    sys.path.insert(0, str(path.parent))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.pop(0)
     return module
 
 
@@ -60,229 +65,191 @@ def _stack_body(parent: str | None = None, boundary: str | None = None) -> str:
     return "\n".join(lines)
 
 
+def _comparison(base: str, status: str = "ahead") -> dict:
+    return {"status": status, "merge_base_commit": {"sha": base}}
+
+
 class ReviewScopeTest(unittest.TestCase):
     def setUp(self) -> None:
         self.module = _load_module()
-        self.get_json = Mock(
-            return_value={"status": "ahead", "merge_base_commit": {"sha": PARENT}}
-        )
+        self.responses = {
+            f"repos/{REPOSITORY}/pulls/1": {"head": {"sha": PARENT}, "merged_at": None},
+            f"repos/{REPOSITORY}/compare/{PARENT}...{HEAD}": _comparison(PARENT),
+            f"repos/{REPOSITORY}/compare/{GITHUB_BASE}...{HEAD}": _comparison(FORK, "diverged"),
+            f"repos/{REPOSITORY}/compare/{GITHUB_BASE}...{PARENT}": _comparison(FORK, "diverged"),
+            f"repos/{REPOSITORY}/compare/{MERGE}...{HEAD}": _comparison(FORK, "diverged"),
+        }
+        self.get_json = Mock(side_effect=self.responses.__getitem__)
 
     def resolve(self, body: str) -> str:
         return self.module.resolve_review_base(_metadata(body), REPOSITORY, self.get_json)
 
-    def test_ordinary_pr_and_stack_root_keep_github_base(self) -> None:
-        for body in ("", _stack_body(), f"Related PR: {PR_URL}/1"):
-            with self.subTest(body=body):
+    def test_ordinary_pr_and_stack_root_keep_github_base_and_log_reason(self) -> None:
+        for body, reason in (
+            ("", "ordinary PR"),
+            (_stack_body(), "stack root"),
+            (_stack_body(boundary=HEAD), "stack root"),
+        ):
+            with self.subTest(reason=reason), self.assertLogs("review_scope", level="INFO") as logs:
                 self.assertEqual(self.resolve(body), GITHUB_BASE)
+                self.assertIn(reason, logs.output[0])
         self.get_json.assert_not_called()
 
-    def test_pinned_parent_excludes_ancestor_pr_even_when_github_base_is_main(self) -> None:
-        body = _stack_body(f"[stack/parent]({PR_URL}/1)", PARENT)
-
-        self.assertEqual(self.resolve(body), PARENT)
-        self.get_json.assert_called_once_with(f"repos/{REPOSITORY}/compare/{PARENT}...{HEAD}")
-
-    def test_pinned_boundary_supports_unlinked_parent_and_renamed_branch(self) -> None:
-        body = _stack_body("stack/unlinked-parent", PARENT)
-        body = body.replace("**stack/child**", "**#2: child change**")
-
-        self.assertEqual(self.resolve(body), PARENT)
+    def test_parent_lookup_ignores_stale_malformed_and_empty_comparison_pins(self) -> None:
+        for boundary in (PARENT, HEAD, "not-a-sha"):
+            for pinned_head in (HEAD, FORK):
+                body = _stack_body(f"[parent]({PR_URL}/1)", boundary)
+                body = body.replace(f"..{HEAD}", f"..{pinned_head}")
+                with self.subTest(boundary=boundary, pinned_head=pinned_head):
+                    self.assertEqual(self.resolve(body), PARENT)
+        self.assertEqual(self.get_json.call_args_list[0].args, (f"repos/{REPOSITORY}/pulls/1",))
 
     def test_parent_lookup_skips_siblings_and_uses_immediate_ancestor(self) -> None:
         body = (
             "## Stacked PR\n"
-            f"- [stack/root]({PR_URL}/4)\n"
-            f"  - [stack/parent]({PR_URL}/1)\n"
-            f"    - [stack/sibling]({PR_URL}/5)\n"
-            f"    - [**stack/child**]({PR_URL}/2) <- _this PR_\n"
+            f"- [root]({PR_URL}/4)\n"
+            f"  - [parent]({PR_URL}/1)\n"
+            f"    - [sibling]({PR_URL}/5)\n"
+            f"    - [**renamed child**]({PR_URL}/2) <- _this PR_\n"
         )
         for listing in (body, body.replace("- ", "* ").replace("  ", "\t")):
             with self.subTest(listing=listing):
-                self.get_json.reset_mock()
-                self.get_json.side_effect = [
-                    {"head": {"sha": PARENT}, "merged_at": None},
-                    {"status": "ahead", "merge_base_commit": {"sha": PARENT}},
-                ]
                 self.assertEqual(self.resolve(listing), PARENT)
-                self.assertEqual(
-                    self.get_json.call_args_list[0].args, (f"repos/{REPOSITORY}/pulls/1",)
-                )
 
-    def test_squash_merged_parent_is_excluded_until_child_is_rebased(self) -> None:
-        for status, merge_base, expected in (
-            ("ahead", PARENT, PARENT),
-            ("diverged", "d" * 40, GITHUB_BASE),
-        ):
-            with self.subTest(status=status):
-                self.get_json.reset_mock()
-                self.get_json.side_effect = [
-                    {
-                        "head": {"sha": PARENT},
-                        "merged_at": "2026-10-21T00:00:00Z",
-                        "merge_commit_sha": MERGE,
-                    },
-                    {"status": status, "merge_base_commit": {"sha": merge_base}},
-                    {"status": "ahead", "merge_base_commit": {"sha": MERGE}},
-                ]
-                self.assertEqual(self.resolve(_stack_body(f"[parent]({PR_URL}/1)")), expected)
-                self.assertEqual(
-                    self.get_json.call_args_list[1].args,
-                    (f"repos/{REPOSITORY}/compare/{PARENT}...{HEAD}",),
-                )
-                expected_calls = 2 if expected == PARENT else 3
-                self.assertEqual(self.get_json.call_count, expected_calls)
-                if expected == GITHUB_BASE:
-                    self.assertEqual(
-                        self.get_json.call_args.args,
-                        (f"repos/{REPOSITORY}/compare/{MERGE}...{HEAD}",),
-                    )
+    def test_pr_targeting_parent_branch_uses_its_configured_base(self) -> None:
+        self.responses[f"repos/{REPOSITORY}/pulls/1"]["head"]["sha"] = GITHUB_BASE
+        self.assertEqual(self.resolve(_stack_body(f"[parent]({PR_URL}/1)")), GITHUB_BASE)
+        self.get_json.assert_called_once_with(f"repos/{REPOSITORY}/pulls/1")
 
-    def test_merged_parent_without_inherited_merge_result_stops_review(self) -> None:
-        for merge_sha, merge_comparison in (
-            (MERGE, {"status": "diverged", "merge_base_commit": {"sha": "d" * 40}}),
-            (MERGE, {"status": "behind", "merge_base_commit": {"sha": HEAD}}),
-            (MERGE, {"status": "ahead", "merge_base_commit": {"sha": "d" * 40}}),
-            (MERGE, {}),
-            (None, None),
-            ("not-a-sha", None),
-        ):
-            with self.subTest(merge_sha=merge_sha, comparison=merge_comparison):
-                self.get_json.reset_mock()
-                self.get_json.side_effect = [
-                    {
-                        "head": {"sha": PARENT},
-                        "merged_at": "2026-10-21T00:00:00Z",
-                        "merge_commit_sha": merge_sha,
-                    },
-                    {"status": "diverged", "merge_base_commit": {"sha": "d" * 40}},
-                    merge_comparison,
-                ]
-                with self.assertRaisesRegex(ValueError, "not an ancestor"):
-                    self.resolve(_stack_body(f"[parent]({PR_URL}/1)"))
-                self.assertEqual(self.get_json.call_count, 2 if merge_sha != MERGE else 3)
-
-    def test_other_sections_and_descendant_comparisons_do_not_change_scope(self) -> None:
-        body = _stack_body() + (
-            f" [[Files changed]({PR_URL}/3/files/{PARENT}..{HEAD})]\n"
-            "## Examples\n"
-            f"- [stack/parent]({PR_URL}/1)\n"
-            f"  - [stack/child]({PR_URL}/2)\n"
+    def test_advanced_parent_uses_the_inherited_merge_base(self) -> None:
+        self.responses[f"repos/{REPOSITORY}/pulls/1"]["head"]["sha"] = ADVANCED
+        self.responses[f"repos/{REPOSITORY}/compare/{ADVANCED}...{HEAD}"] = _comparison(
+            PARENT, "diverged"
         )
+        self.assertEqual(self.resolve(_stack_body(f"[parent]({PR_URL}/1)")), PARENT)
 
-        self.assertEqual(self.resolve(body), GITHUB_BASE)
-        self.get_json.assert_not_called()
-
-    def test_stack_header_with_prefix_is_supported(self) -> None:
-        body = _stack_body("stack/parent", PARENT).replace(
-            "## Stacked PR", "## \U0001f95e Stacked PR"
+    def test_child_merging_main_without_parent_stops_inflated_scope(self) -> None:
+        self.responses[f"repos/{REPOSITORY}/compare/{GITHUB_BASE}...{HEAD}"] = _comparison(
+            MERGE, "diverged"
         )
+        with self.assertRaisesRegex(ValueError, "base-branch changes"):
+            self.resolve(_stack_body(f"[parent]({PR_URL}/1)"))
 
-        self.assertEqual(self.resolve(body), PARENT)
+    def test_squash_merged_parent_is_excluded_until_merge_result_is_inherited(self) -> None:
+        self.responses[f"repos/{REPOSITORY}/pulls/1"].update(
+            merged_at="2026-10-21T00:00:00Z", merge_commit_sha=MERGE
+        )
+        self.assertEqual(self.resolve(_stack_body(f"[parent]({PR_URL}/1)", PARENT)), PARENT)
+        self.get_json.reset_mock()
+        self.responses[f"repos/{REPOSITORY}/compare/{MERGE}...{HEAD}"] = _comparison(MERGE)
+        self.responses[f"repos/{REPOSITORY}/compare/{MERGE}...{GITHUB_BASE}"] = _comparison(MERGE)
+        self.assertEqual(self.resolve(_stack_body(f"[parent]({PR_URL}/1)", PARENT)), GITHUB_BASE)
+        endpoints = [call.args[0] for call in self.get_json.call_args_list]
+        self.assertNotIn(f"repos/{REPOSITORY}/compare/{PARENT}...{HEAD}", endpoints)
 
-    def test_unrelated_headings_and_fenced_examples_leave_ordinary_pr_scope(self) -> None:
-        example = _stack_body("parent", PARENT)
+    def test_parent_merge_into_other_target_does_not_select_github_base(self) -> None:
+        self.responses[f"repos/{REPOSITORY}/pulls/1"].update(
+            merged_at="2026-10-21T00:00:00Z", merge_commit_sha=MERGE
+        )
+        self.responses[f"repos/{REPOSITORY}/compare/{MERGE}...{HEAD}"] = _comparison(MERGE)
+        self.responses[f"repos/{REPOSITORY}/compare/{MERGE}...{GITHUB_BASE}"] = _comparison(
+            FORK, "diverged"
+        )
+        self.assertEqual(self.resolve(_stack_body(f"[parent]({PR_URL}/1)")), PARENT)
+
+    def test_rewritten_parent_with_only_base_branch_history_stops_review(self) -> None:
+        self.responses[f"repos/{REPOSITORY}/compare/{PARENT}...{HEAD}"] = _comparison(
+            FORK, "diverged"
+        )
+        self.responses[f"repos/{REPOSITORY}/compare/{GITHUB_BASE}...{FORK}"] = _comparison(
+            FORK, "behind"
+        )
+        with self.assertRaisesRegex(ValueError, "no shared changes"):
+            self.resolve(_stack_body(f"[parent]({PR_URL}/1)"))
+
+    def test_parent_containing_child_head_stops_empty_review(self) -> None:
+        self.responses[f"repos/{REPOSITORY}/compare/{PARENT}...{HEAD}"] = _comparison(
+            HEAD, "behind"
+        )
+        with self.assertRaisesRegex(ValueError, "no child changes"):
+            self.resolve(_stack_body(f"[parent]({PR_URL}/1)"))
+
+    def test_stack_header_variants_and_horizontal_rule_are_supported(self) -> None:
+        for header in ("## Stacked PR", "## Stacked PRs", "**Stacked PR**", "## 🔗 Stacked PR"):
+            for rule in ("---------", "* * *", "___"):
+                body = _stack_body(f"[parent]({PR_URL}/1)").replace("## Stacked PR", header)
+                body += f"\n{rule}\n- [related]({PR_URL}/2)"
+                with self.subTest(header=header, rule=rule):
+                    self.assertEqual(self.resolve(body), PARENT)
+
+    def test_unrelated_headings_and_fenced_examples_leave_ordinary_scope(self) -> None:
         for body in (
-            "## Not a stacked PR\nThis change stands alone.",
-            "## Stacked PR migration notes\nRelated work.",
-            f"```markdown\n{example}\n```",
-            f"~~~~markdown\n~~~\n{example}\n~~~~",
+            "## Not a stacked PR",
+            "## Stacked PR migration notes",
+            f"```markdown\n{_stack_body()}\n```",
+            f"~~~~markdown\n~~~\n{_stack_body()}\n~~~~",
         ):
             with self.subTest(body=body):
                 self.assertEqual(self.resolve(body), GITHUB_BASE)
         self.get_json.assert_not_called()
 
-    def test_fenced_stack_example_does_not_override_the_real_boundary(self) -> None:
-        body = f"```markdown\n{_stack_body('example', 'd' * 40)}\n```\n"
-        body += _stack_body("actual parent", PARENT)
-
+    def test_fenced_example_does_not_override_real_stack(self) -> None:
+        body = f"```markdown\n{_stack_body()}\n```\n" + _stack_body(f"[parent]({PR_URL}/1)")
         self.assertEqual(self.resolve(body), PARENT)
+
+    def test_ambiguous_missing_and_unlinked_entries_stop_review(self) -> None:
+        body = _stack_body(f"[parent]({PR_URL}/1)")
+        cases = (
+            (body.replace("  - [**stack/child", "- [**stack/child"), "ambiguous flat"),
+            (body + "\n" + body, "multiple stack entries"),
+            (body.replace(f"{PR_URL}/2)", f"{PR_URL}/20)"), "no entry"),
+            (_stack_body("unlinked parent", PARENT), "no PR link"),
+            ("```\n" + body, "unclosed code fence"),
+        )
+        for listing, message in cases:
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                self.resolve(listing)
+        self.get_json.assert_not_called()
 
     def test_repository_and_metadata_sha_guards_stop_before_api_calls(self) -> None:
         for repository, field, value in (
             ("../other/repo", "head", HEAD),
-            (REPOSITORY, "head", "not-a-sha"),
-            (REPOSITORY, "base", "not-a-sha"),
+            (REPOSITORY, "head", "invalid"),
+            (REPOSITORY, "base", None),
         ):
-            with self.subTest(repository=repository, field=field):
-                metadata = _metadata()
-                metadata[field]["sha"] = value
-                with self.assertRaisesRegex(ValueError, "invalid"):
-                    self.module.resolve_review_base(metadata, repository, self.get_json)
+            metadata = _metadata()
+            metadata[field]["sha"] = value
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "invalid"):
+                self.module.resolve_review_base(metadata, repository, self.get_json)
         self.get_json.assert_not_called()
 
-    def test_invalid_parent_head_stops_before_comparison(self) -> None:
-        self.get_json.return_value = {"head": {"sha": "not-a-sha"}}
+    def test_invalid_parent_and_comparison_responses_stop_review(self) -> None:
+        for endpoint, response in (
+            (f"repos/{REPOSITORY}/pulls/1", {"head": {"sha": "bad"}}),
+            (f"repos/{REPOSITORY}/compare/{PARENT}...{HEAD}", {}),
+            (f"repos/{REPOSITORY}/compare/{PARENT}...{HEAD}", _comparison("bad")),
+            (f"repos/{REPOSITORY}/compare/{PARENT}...{HEAD}", _comparison(PARENT, "unknown")),
+        ):
+            with self.subTest(response=response):
+                original = self.responses[endpoint]
+                self.responses[endpoint] = response
+                with self.assertRaises((ValueError, KeyError)):
+                    self.resolve(_stack_body(f"[parent]({PR_URL}/1)"))
+                self.responses[endpoint] = original
 
-        with self.assertRaisesRegex(ValueError, "invalid stack parent SHA"):
-            self.resolve(_stack_body(f"[parent]({PR_URL}/1)"))
-        self.get_json.assert_called_once_with(f"repos/{REPOSITORY}/pulls/1")
-
-    def test_identical_boundary_and_three_dot_comparison_are_supported(self) -> None:
-        body = _stack_body("parent", PARENT).replace(f"{PARENT}..", f"{PARENT}...")
-        self.assertEqual(self.resolve(body), PARENT)
-
-        self.get_json.return_value = {"status": "identical", "merge_base_commit": {"sha": HEAD}}
-        self.assertEqual(self.resolve(_stack_body("parent", HEAD)), HEAD)
-
-    def test_cli_formats_api_and_missing_response_field_errors(self) -> None:
-        responses = (
-            {"side_effect": subprocess.CalledProcessError(1, ["gh", "api"])},
-            {"return_value": {}},
-        )
+    def test_cli_formats_api_and_missing_field_errors(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            metadata_path = Path(directory) / "meta.json"
-            metadata_path.write_text(json.dumps(_metadata(_stack_body(f"[parent]({PR_URL}/1)"))))
-            arguments = [
-                "review_scope.py", "--metadata", str(metadata_path), "--repository", REPOSITORY
-            ]
-            for response in responses:
-                with self.subTest(response=response):
-                    with patch.object(sys, "argv", arguments):
-                        with patch.object(self.module, "_github_json", **response):
-                            with self.assertRaisesRegex(
-                                SystemExit, "Cannot resolve PR review scope"
-                            ):
-                                self.module._main()
-
-    def test_stale_malformed_and_missing_boundaries_stop_review(self) -> None:
-        valid = _stack_body("stack/parent", PARENT)
-        cases = (
-            (valid.replace(f"..{HEAD}", f"..{'d' * 40}"), "stale or invalid"),
-            (valid.replace(f"{PARENT}..", "not-a-sha.."), "stale or invalid"),
-            (_stack_body("stack/parent"), "no PR or pinned comparison"),
-            (valid + "\n" + valid, "multiple stack entries"),
-            (valid.replace(f"{PR_URL}/2)", f"{PR_URL}/20)"), "no entry for the current PR"),
-        )
-        for body, error in cases:
-            with self.subTest(error=error), self.assertRaisesRegex(ValueError, error):
-                self.resolve(body)
-        self.get_json.assert_not_called()
-
-    def test_non_ancestor_parent_stops_review(self) -> None:
-        for comparison in (
-            {"status": "diverged", "merge_base_commit": {"sha": GITHUB_BASE}},
-            {"status": "ahead", "merge_base_commit": {"sha": GITHUB_BASE}},
-            {},
-        ):
-            with self.subTest(comparison=comparison):
-                self.get_json.return_value = comparison
-                with self.assertRaisesRegex(ValueError, "not an ancestor"):
-                    self.resolve(_stack_body("stack/parent", PARENT))
-
-    def test_parent_api_failure_does_not_fall_back_to_cumulative_diff(self) -> None:
-        self.get_json.side_effect = RuntimeError("GitHub unavailable")
-
-        with self.assertRaisesRegex(RuntimeError, "GitHub unavailable"):
-            self.resolve(_stack_body(f"[parent]({PR_URL}/1)"))
-
-    def test_merged_parent_with_unknown_ancestry_stops_review(self) -> None:
-        self.get_json.side_effect = [
-            {"head": {"sha": PARENT}, "merged_at": "2026-10-21T00:00:00Z"},
-            {},
-        ]
-
-        with self.assertRaisesRegex(ValueError, "not an ancestor"):
-            self.resolve(_stack_body(f"[parent]({PR_URL}/1)"))
+            path = Path(directory) / "meta.json"
+            path.write_text(json.dumps(_metadata(_stack_body(f"[parent]({PR_URL}/1)"))))
+            arguments = ["review_scope.py", "--metadata", str(path), "--repository", REPOSITORY]
+            for response in (
+                {"side_effect": subprocess.CalledProcessError(1, ["gh", "api"])},
+                {"return_value": {}},
+            ):
+                with self.subTest(response=response), patch.object(sys, "argv", arguments):
+                    with patch.object(self.module, "_github_json", **response):
+                        with self.assertRaisesRegex(SystemExit, "Cannot resolve PR review scope"):
+                            self.module._main()
 
     def test_workflow_diff_and_all_reviewer_prompts_use_the_resolved_scope(self) -> None:
         repo_root = Path(__file__).resolve().parents[3]
@@ -297,8 +264,12 @@ class ReviewScopeTest(unittest.TestCase):
         script = "read -r base_sha" + context_step["run"].split("read -r base_sha", 1)[1]
         cases = (
             ("", GITHUB_BASE),
-            (_stack_body("parent", PARENT), PARENT),
-            (_stack_body("parent", PARENT).replace(f"..{HEAD}", f"..{'d' * 40}"), None),
+            (_stack_body(f"[parent]({PR_URL}/1)", PARENT), PARENT),
+            (
+                _stack_body(f"[parent]({PR_URL}/1)", PARENT).replace(f"..{HEAD}", f"..{FORK}"),
+                PARENT,
+            ),
+            (_stack_body("unlinked parent", PARENT), None),
         )
         for body, review_base in cases:
             with self.subTest(review_base=review_base), tempfile.TemporaryDirectory() as directory:
@@ -308,16 +279,16 @@ class ReviewScopeTest(unittest.TestCase):
                 (temp / "pr_review_comments.json").write_text("[]")
                 (temp / "github-output").touch()
                 (temp / "python3").symlink_to(sys.executable)
-                comparison_response = json.dumps(
-                    {"status": "ahead", "merge_base_commit": {"sha": PARENT}}
-                )
+                responses = json.dumps(self.responses)
                 gh = temp / "gh"
                 gh.write_text(
                     f"#!{sys.executable}\n"
-                    "import os, pathlib, sys\n"
+                    "import json, os, pathlib, sys\n"
                     "root = pathlib.Path(os.environ['TEST_ROOT'])\n"
                     "with (root / 'api-calls').open('a') as calls:\n"
                     "    calls.write(sys.argv[2] + '\\n')\n"
+                    "if '--method' in sys.argv:\n"
+                    "    raise SystemExit(0)\n"
                     "if '-H' in sys.argv:\n"
                     "    diff = ('diff --git a/child.rs b/child.rs\\n'\n"
                     "            '--- a/child.rs\\n+++ b/child.rs\\n'\n"
@@ -326,7 +297,7 @@ class ReviewScopeTest(unittest.TestCase):
                     "        diff += '\\n+ancestor_change();'\n"
                     "    print(diff)\n"
                     "else:\n"
-                    f"    print({comparison_response!r})\n"
+                    f"    print(json.dumps(json.loads({responses!r})[sys.argv[2]]))\n"
                 )
                 gh.chmod(0o700)
                 result = subprocess.run(
@@ -345,15 +316,52 @@ class ReviewScopeTest(unittest.TestCase):
                 )
                 if review_base is None:
                     self.assertNotEqual(result.returncode, 0)
-                    self.assertIn("stale or invalid", result.stderr)
+                    self.assertIn("::error::Cannot select", result.stdout)
+                    self.assertIn("no PR link", (temp / "check-summary.txt").read_text())
+                    self.assertIn(f"head_sha={HEAD}", (temp / "github-output").read_text())
                     self.assertFalse((temp / "api-calls").exists())
                     self.assertFalse((temp / "review_prompt.txt").exists())
+                    check_step = next(
+                        step
+                        for job in workflow["jobs"].values()
+                        for step in job["steps"]
+                        if step.get("name") == "Publish non-blocking PR check"
+                    )
+                    self.assertIn("steps.context.outputs.head_sha != ''", check_step["if"])
+                    check = subprocess.run(
+                        [
+                            "bash",
+                            "-euo",
+                            "pipefail",
+                            "-c",
+                            check_step["run"].replace("/tmp/", f"{temp}/"),
+                        ],
+                        cwd=repo_root,
+                        env={
+                            **os.environ,
+                            "PATH": f"{temp}:{os.environ['PATH']}",
+                            "TEST_ROOT": str(temp),
+                            "BOT_TOKEN": "",
+                            "REVIEW_READY": "false",
+                            "HEAD_SHA": HEAD,
+                            "PR_NUMBER": "2",
+                            "REPO": REPOSITORY,
+                            "RUN_URL": f"https://github.com/{REPOSITORY}/actions/runs/1",
+                        },
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(check.returncode, 0, check.stderr)
+                    payload = json.loads((temp / "check-run.json").read_text())
+                    self.assertEqual(payload["head_sha"], HEAD)
+                    self.assertEqual(payload["conclusion"], "neutral")
+                    self.assertIn("no PR link", payload["output"]["summary"])
                     continue
                 self.assertEqual(result.returncode, 0, result.stderr)
                 calls = (temp / "api-calls").read_text().splitlines()
                 self.assertTrue(calls)
                 self.assertEqual(
-                    set(calls),
+                    {call for call in calls if "/compare/" in call and call.endswith(f"...{HEAD}")},
                     {
                         f"repos/{REPOSITORY}/compare/{review_base}...{HEAD}",
                         f"repos/{REPOSITORY}/compare/{GITHUB_BASE}...{HEAD}",
@@ -366,8 +374,18 @@ class ReviewScopeTest(unittest.TestCase):
                     prompt = (temp / name).read_text()
                     self.assertIn(f"**Review base SHA:** {review_base}", prompt)
                     self.assertIn(f"**GitHub base SHA:** {GITHUB_BASE}", prompt)
-                    self.assertIn("Review only defects introduced by the supplied diff", prompt)
-                    self.assertIn("author supplied and verified only for ancestry", prompt)
+                    if review_base != GITHUB_BASE:
+                        self.assertIn(
+                            "Changes inherited from ancestor PRs are context only", prompt
+                        )
+                        self.assertIn("Check effects on unchanged callers", prompt)
+                        if name == "reviewer_context.txt":
+                            self.assertLess(
+                                prompt.index("## Review scope"),
+                                prompt.index("untrusted review data"),
+                            )
+                    else:
+                        self.assertNotIn("## Review scope", prompt)
                     self.assertIn("+child_change();", prompt)
                     if review_base != GITHUB_BASE:
                         self.assertNotIn("+ancestor_change();", prompt)

@@ -4,13 +4,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import re
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
+from markdown_utils import markdown_lines
 
 _SHA = re.compile(r"[0-9a-f]{40}")
+_STACK_HEADING = re.compile(
+    r"^(?:#{1,6}\s+)?(?:\*\*)?(?:[^\w\s]+\s+)?Stacked PRs?(?:\*\*)?\s*#*\s*$",
+    re.IGNORECASE,
+)
+_HORIZONTAL_RULE = re.compile(r" {0,3}(?:(?:-\s*){3,}|(?:\*\s*){3,}|(?:_\s*){3,})")
+_LOG = logging.getLogger(__name__)
 
 
 def resolve_review_base(
@@ -18,106 +26,114 @@ def resolve_review_base(
     repository: str,
     get_json: Callable[[str], dict],
 ) -> str:
-    """Return the review base SHA for GitHub PR metadata and its repository.
+    """Return the review base SHA using the declared parent's GitHub ancestry.
 
-    Read the current PR's git-stack entry from its full description. Prefer its pinned
-    comparison link; otherwise request the immediate parent PR through ``get_json``, which
-    accepts a GitHub API endpoint. Ordinary PRs and stack roots without a pinned link use
-    the GitHub base SHA. A merged parent's original head remains the boundary while it is
-    an ancestor of the child; a child inheriting its merge result uses the GitHub base instead.
-    Stack boundaries are author supplied: ancestry checks do not prove the scope is complete.
-    Raise ValueError if a stack boundary is missing, stale, or not an ancestor of the head.
-    API errors propagate to the caller rather than expanding the review to ancestor PRs.
+    The description's git-stack list identifies the immediate parent PR; comparison links
+    and branch labels do not select commits. Ordinary PRs and stack roots use the GitHub
+    base. Children use the merge base of their parent's head and their own head, allowing
+    the parent to advance. If the parent's merge result is inherited by both the child
+    and its GitHub base, use that base instead, including after squash merges.
+
+    Raise ValueError for ambiguous descriptions, empty scopes, rewritten parents with no
+    shared changes outside the base branch, or a base-branch merge that would inflate the
+    scoped diff. API failures propagate instead of widening the review. The declared parent
+    relationship remains author supplied; ancestry cannot establish its completeness.
     """
     if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is None:
         raise ValueError("invalid repository")
-    head_sha = metadata["head"]["sha"]
-    github_base = metadata["base"]["sha"]
-    if _SHA.fullmatch(head_sha) is None or _SHA.fullmatch(github_base) is None:
-        raise ValueError("invalid PR base or head SHA")
-
+    head_sha = _validate_sha(metadata["head"]["sha"], "PR head")
+    github_base = _validate_sha(metadata["base"]["sha"], "PR base")
     entry = _stack_entry(metadata.get("body") or "", repository, metadata["number"])
-    if entry is None:
-        return github_base
-    current, parent = entry
-    parent_merged = False
-    current_url = f"https://github.com/{repository}/pull/{metadata['number']}"
-    comparison_link = re.search(re.escape(current_url) + r"/files/([^\s)]+)", current)
-    if comparison_link is not None:
-        boundary = re.fullmatch(r"([0-9a-f]{40})\.{2,3}([0-9a-f]{40})", comparison_link[1])
-        if boundary is None or boundary[2] != head_sha:
-            raise ValueError(
-                "stale or invalid stack comparison link; refresh the stack description"
-            )
-        review_base = boundary[1]
-    elif parent is not None:
-        parent_link = re.search(
-            rf"\]\(https://github\.com/{re.escape(repository)}/pull/([0-9]+)\)", parent
-        )
-        if parent_link is None:
-            raise ValueError("stack parent has no PR or pinned comparison link")
-        parent_metadata = get_json(f"repos/{repository}/pulls/{parent_link[1]}")
-        parent_merged = bool(parent_metadata.get("merged_at"))
-        review_base = parent_metadata["head"]["sha"]
-    else:
+    if entry is None or entry[1] is None:
+        reason = "ordinary PR" if entry is None else "stack root"
+        _LOG.info("Review scope: %s; GitHub base %s", reason, github_base)
         return github_base
 
-    if _SHA.fullmatch(review_base) is None:
-        raise ValueError("invalid stack parent SHA")
-    comparison = get_json(f"repos/{repository}/compare/{review_base}...{head_sha}")
-    if (
-        comparison.get("status") not in {"ahead", "identical"}
-        or comparison.get("merge_base_commit", {}).get("sha") != review_base
-    ):
-        if parent_merged and comparison.get("status") in {"behind", "diverged"}:
-            merge_sha = parent_metadata.get("merge_commit_sha")
-            if isinstance(merge_sha, str) and _SHA.fullmatch(merge_sha):
-                merged_comparison = get_json(
-                    f"repos/{repository}/compare/{merge_sha}...{head_sha}"
-                )
-                if (
-                    merged_comparison.get("status") in {"ahead", "identical"}
-                    and merged_comparison.get("merge_base_commit", {}).get("sha") == merge_sha
-                ):
-                    return github_base
-        raise ValueError("stack parent is not an ancestor of the PR head; refresh the stack")
+    parent_link = re.search(
+        rf"\]\(https://github\.com/{re.escape(repository)}/pull/([0-9]+)\)", entry[1]
+    )
+    if parent_link is None:
+        raise ValueError("stack parent has no PR link; refresh the stack description")
+    parent_number = parent_link[1]
+    parent = get_json(f"repos/{repository}/pulls/{parent_number}")
+    parent_head = _validate_sha(parent["head"]["sha"], "stack parent")
+    if parent_head == github_base:
+        _LOG.info("Review scope: GitHub base is parent PR #%s head %s", parent_number, github_base)
+        return github_base
+
+    def compare(base: str, head: str) -> dict:
+        if base == head:
+            return {"status": "identical", "merge_base_commit": {"sha": base}}
+        result = get_json(f"repos/{repository}/compare/{base}...{head}")
+        _validate_sha(result["merge_base_commit"]["sha"], "comparison merge base")
+        if result["status"] not in {"ahead", "behind", "diverged", "identical"}:
+            raise ValueError("invalid comparison status")
+        return result
+
+    def is_ancestor(base: str, head: str) -> bool:
+        result = compare(base, head)
+        return (
+            result["status"] in {"ahead", "identical"}
+            and result["merge_base_commit"]["sha"] == base
+        )
+
+    if parent.get("merged_at"):
+        merge_sha = _validate_sha(parent["merge_commit_sha"], "parent merge")
+        if is_ancestor(merge_sha, head_sha) and is_ancestor(merge_sha, github_base):
+            _LOG.info(
+                "Review scope: merged parent PR #%s; GitHub base %s", parent_number, github_base
+            )
+            return github_base
+
+    review_base = compare(parent_head, head_sha)["merge_base_commit"]["sha"]
+    if review_base == head_sha:
+        raise ValueError("no child changes remain after the stack parent")
+    head_fork = compare(github_base, head_sha)["merge_base_commit"]["sha"]
+    boundary_fork = compare(github_base, review_base)["merge_base_commit"]["sha"]
+    if head_fork != boundary_fork:
+        raise ValueError(
+            "child merged base-branch changes absent from its parent; refresh the stack"
+        )
+    if review_base == head_fork:
+        raise ValueError(
+            "stack parent has no shared changes outside the base branch; refresh the stack"
+        )
+    _LOG.info("Review scope: parent PR #%s merge base %s", parent_number, review_base)
     return review_base
 
 
 def _stack_entry(body: str, repository: str, number: int) -> tuple[str, str | None] | None:
-    current_link = re.compile(
-        rf"\]\(https://github\.com/{re.escape(repository)}/pull/{number}\)"
-    )
+    current_link = re.compile(rf"\]\(https://github\.com/{re.escape(repository)}/pull/{number}\)")
     parents: list[tuple[int, str]] = []
     entry = None
     in_stack = False
     has_stack = False
-    fence: str | None = None
-    for line in body.splitlines():
-        fence_match = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
-        if fence is not None:
-            if (
-                fence_match
-                and fence_match[1][0] == fence[0]
-                and len(fence_match[1]) >= len(fence)
-                and not fence_match[2].strip()
-            ):
-                fence = None
+    hidden_stack_fences: set[int] = set()
+    fence_start = None
+    root_indent = None
+    for _, raw_line, fence_start in markdown_lines(body):
+        line = raw_line.rstrip("\r\n")
+        if fence_start is not None:
+            if _STACK_HEADING.fullmatch(line):
+                hidden_stack_fences.add(fence_start)
             continue
-        if fence_match:
-            fence = fence_match[1]
-            continue
-        if re.match(r"^#{1,6}\s", line):
-            in_stack = re.fullmatch(
-                r"#{1,6}\s+(?:[^\w\s]+\s+)?Stacked PR\s*#*\s*", line, re.IGNORECASE
-            ) is not None
-            has_stack = has_stack or in_stack
+        if _STACK_HEADING.fullmatch(line):
+            in_stack = True
+            has_stack = True
             parents.clear()
+            root_indent = None
+            continue
+        if re.match(r"^#{1,6}\s", line) or _HORIZONTAL_RULE.fullmatch(line):
+            in_stack = False
             continue
         item = re.match(r"^([ \t]*)[-*]\s+(.+)", line)
         if not in_stack or item is None:
             continue
         indent = len(item[1].expandtabs())
+        if root_indent is None:
+            root_indent = indent
+        elif indent <= root_indent:
+            raise ValueError("ambiguous flat stack list; indent children beneath their parent")
         while parents and parents[-1][0] >= indent:
             parents.pop()
         if current_link.search(item[2]):
@@ -125,13 +141,26 @@ def _stack_entry(body: str, repository: str, number: int) -> tuple[str, str | No
                 raise ValueError("multiple stack entries for the current PR")
             entry = (item[2], parents[-1][1] if parents else None)
         parents.append((indent, item[2]))
+    if fence_start in hidden_stack_fences:
+        raise ValueError("unclosed code fence hides a stack description; refresh the description")
     if has_stack and entry is None:
         raise ValueError("stack description has no entry for the current PR")
     return entry
 
 
+def _validate_sha(value: str, label: str) -> str:
+    if not isinstance(value, str) or _SHA.fullmatch(value) is None:
+        raise ValueError(f"invalid {label} SHA")
+    return value
+
+
 def _github_json(endpoint: str) -> dict:
-    return json.loads(subprocess.check_output(["gh", "api", endpoint], text=True))
+    fields = (
+        "{status, merge_base_commit: {sha: .merge_base_commit.sha}}"
+        if "/compare/" in endpoint
+        else "{head: {sha: .head.sha}, merged_at, merge_commit_sha}"
+    )
+    return json.loads(subprocess.check_output(["gh", "api", endpoint, "--jq", fields], text=True))
 
 
 def _main() -> None:
@@ -139,10 +168,11 @@ def _main() -> None:
     parser.add_argument("--metadata", type=Path, required=True)
     parser.add_argument("--repository", required=True)
     args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     try:
         metadata = json.loads(args.metadata.read_text())
         review_base = resolve_review_base(metadata, args.repository, _github_json)
-    except (KeyError, ValueError, subprocess.CalledProcessError) as error:
+    except (KeyError, TypeError, ValueError, subprocess.CalledProcessError) as error:
         raise SystemExit(f"Cannot resolve PR review scope: {error}") from error
     print(review_base)
 

@@ -10,14 +10,15 @@ from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
+from markdown_utils import markdown_lines
 from review_history import (
     DEFAULT_TRUSTED_BOT_LOGINS,
     canonical_finding_body,
     is_duplicate_review,
     previous_inline_comments,
 )
-from review_publish import INLINE_FEEDBACK_FOOTER, format_review_body as _format_review_body
-
+from review_publish import INLINE_FEEDBACK_FOOTER
+from review_publish import format_review_body as _format_review_body
 
 MAX_INLINE_FINDINGS = 12
 INLINE_FINDING_FIELDS = ("id", "path", "line", "side", "body")
@@ -45,7 +46,6 @@ _FINDING_GROUP_HEADING = re.compile(
     rf"(?:{_FINDING_GROUP_NAME_PATTERN})\s*:)\s*$",
     re.IGNORECASE,
 )
-_CODE_FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 _HUNK_HEADER = re.compile(
     r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@"
 )
@@ -204,9 +204,9 @@ def build_review_payload(
     """Build a review using GitHub's ``diff`` for publication coordinates.
 
     When supplied, ``review_diff`` restricts inline positions to the reviewed scope. LEFT positions
-    from a different review diff remain in the body because their base-file coordinates may
-    refer to different code. Return the payload, unmapped IDs, and duplicate IDs; raise
-    ValueError for an invalid head SHA.
+    whose file sections differ between the two diffs remain in the body because their
+    base-file coordinates may refer to different code. Return the payload, unmapped IDs, and
+    duplicate IDs; raise ValueError for an invalid head SHA.
     """
     if re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
         raise ValueError("head SHA must be a 40-character lowercase hex value")
@@ -215,6 +215,8 @@ def build_review_payload(
     reviewed_positions = (
         diff_positions(review_diff) if review_diff is not None else allowed_positions
     )
+    github_sections = _diff_sections(diff)
+    review_sections = _diff_sections(review_diff) if review_diff is not None else github_sections
     comments: list[dict[str, Any]] = []
     unmapped: list[str] = []
     duplicates: list[str] = []
@@ -250,7 +252,7 @@ def build_review_payload(
         if (
             (path, line, side) not in allowed_positions
             or (path, line, side) not in reviewed_positions
-            or (side == "LEFT" and review_diff is not None and review_diff != diff)
+            or (side == "LEFT" and review_sections.get(path) != github_sections.get(path))
         ):
             unmapped.append(finding_id)
             continue
@@ -363,31 +365,13 @@ def _parse_review_boundaries(
     """Return reliable boundaries plus locations made ambiguous by fences."""
     headings: list[tuple[int, str]] = []
     hidden_finding_offsets: list[int] = []
-    fence_character: str | None = None
-    fence_length = 0
     fence_start: int | None = None
-    offset = 0
-
-    for line in review.splitlines(keepends=True):
-        fence = _CODE_FENCE.match(line)
-        if fence is not None:
-            marker = fence.group(1)
-            if fence_character is None:
-                fence_character = marker[0]
-                fence_length = len(marker)
-                fence_start = offset
-            elif marker[0] == fence_character and len(marker) >= fence_length:
-                fence_character = None
-                fence_length = 0
-                fence_start = None
-            offset += len(line)
-            continue
+    for offset, line, fence_start in markdown_lines(review):
         if _is_review_boundary(line):
-            if fence_character is None:
+            if fence_start is None:
                 headings.append((offset, line))
             elif _FINDING_HEADING.match(line) is not None:
                 hidden_finding_offsets.append(offset)
-        offset += len(line)
     return headings, fence_start, hidden_finding_offsets
 
 
@@ -411,6 +395,19 @@ def should_skip_inline_review(
         and isinstance(body, str)
         and is_duplicate_review(body, history, trusted_bot_logins)
     )
+
+
+def _diff_sections(diff: str) -> dict[str, str]:
+    sections = {}
+    for section in re.split(r"(?=^diff --git )", diff, flags=re.MULTILINE):
+        old = re.search(r"^--- (.+)$", section, re.MULTILINE)
+        new = re.search(r"^\+\+\+ (.+)$", section, re.MULTILINE)
+        path = _diff_path(new[1]) if new else None
+        if path is None and old:
+            path = _diff_path(old[1])
+        if path is not None:
+            sections[path] = section
+    return sections
 
 
 def _diff_path(value: str) -> str | None:
