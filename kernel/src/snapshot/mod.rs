@@ -17,6 +17,8 @@ use url::Url;
 use crate::FileMeta;
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 #[cfg(feature = "declarative-plans")]
+use crate::action_reconciliation::checkpoint_info::CheckpointResolveResult;
+#[cfg(feature = "declarative-plans")]
 use crate::action_reconciliation::plan::action_set::ActionSet;
 #[cfg(feature = "declarative-plans")]
 use crate::action_reconciliation::plan::{MetadataPlanner, VERSION};
@@ -50,6 +52,8 @@ use crate::log_segment::LastManifestCommitResolution;
 use crate::log_segment::{
     DomainMetadataMap, LogSegment, PmResolution, scan_domain_metadata_actions,
 };
+#[cfg(feature = "declarative-plans")]
+use crate::metrics::CheckpointMetrics;
 use crate::metrics::events::{
     CHECKSUM_WRITE_SPAN, DOMAIN_METADATA_LOADED_SPAN, SET_TRANSACTION_LOADED_SPAN,
 };
@@ -370,40 +374,50 @@ impl Snapshot {
     pub(crate) fn checkpoint_info(
         &self,
         engine: &dyn Engine,
-        metrics: &mut Option<crate::metrics::CheckpointMetrics>,
-    ) -> KernelResult<Option<Arc<CheckpointInfo>>> {
-        if let Some(resolved) = self.checkpoint_info.get() {
-            if let Some(metrics) = metrics {
-                metrics.cache_hit = Some(true);
+    ) -> CheckpointResolveResult<Option<Arc<CheckpointInfo>>> {
+        let checkpoint_type = self.known_checkpoint_type();
+        let mut metrics = self
+            .log_segment
+            .checkpoint_version
+            .map(|version| CheckpointMetrics {
+                version,
+                ..Default::default()
+            });
+        let mut cache_hit = true;
+        let result = (|| {
+            if let Some(resolved) = self.checkpoint_info.get() {
+                return Ok(resolved.clone());
             }
-            return Ok(resolved.clone());
-        }
-        // Fallible OnceLock initialization is unstable on our MSRV. Serialize discovery so
-        // concurrent callers share one result while errors leave initialization retryable.
-        let _guard = self
-            .checkpoint_info_init
-            .lock()
-            // A panicking initializer cannot publish partial state, so retry after poisoning.
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(resolved) = self.checkpoint_info.get() {
-            if let Some(metrics) = metrics {
-                metrics.cache_hit = Some(true);
+            // Fallible OnceLock initialization is unstable on our MSRV. Serialize discovery so
+            // concurrent callers share one result while errors leave initialization retryable.
+            let _guard = self
+                .checkpoint_info_init
+                .lock()
+                // A panicking initializer cannot publish partial state, so retry after poisoning.
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(resolved) = self.checkpoint_info.get() {
+                return Ok(resolved.clone());
             }
-            return Ok(resolved.clone());
+            cache_hit = false;
+            let resolved = if self.log_segment.listed.checkpoint_parts.is_empty() {
+                None
+            } else {
+                let executor = engine.require_plan_executor()?;
+                let resolved = CheckpointInfo::resolve(executor.as_ref(), self.log_segment());
+                metrics = resolved.metrics;
+                resolved.result?.map(Arc::new)
+            };
+            // All initializers hold the mutex; publish only after every fallible operation
+            // succeeds.
+            let _ = self.checkpoint_info.set(resolved.clone());
+            Ok(resolved)
+        })();
+        if let Some(metrics) = &mut metrics {
+            metrics.checkpoint_type = checkpoint_type;
+            metrics.cache_hit = Some(cache_hit);
+            metrics.info = result.as_ref().ok().cloned().flatten();
         }
-        if let Some(metrics) = metrics {
-            metrics.cache_hit = Some(false);
-        }
-        let resolved = if self.log_segment.listed.checkpoint_parts.is_empty() {
-            None
-        } else {
-            let executor = engine.require_plan_executor()?;
-            CheckpointInfo::resolve(executor.as_ref(), self.log_segment(), metrics)?
-                .map(Arc::new)
-        };
-        // All initializers hold the mutex; publish only after every fallible operation succeeds.
-        let _ = self.checkpoint_info.set(resolved.clone());
-        Ok(resolved)
+        CheckpointResolveResult { result, metrics }
     }
 
     /// The latest AMT `checkpoint` action this snapshot covers, or `None` when the table has no

@@ -112,7 +112,7 @@ impl<'a> SnapshotReader<'a> {
     ) -> KernelResult<Option<Arc<CheckpointInfo>>> {
         self.ensure_checkpoint_info_supported()?;
         self.read(engine, |snapshot, engine| {
-            snapshot.checkpoint_info(engine, &mut None)
+            snapshot.checkpoint_info(engine).result
         })
     }
 
