@@ -38,48 +38,62 @@ pub(crate) enum RowTrackingEnablement {
 ///
 /// Note that [`FileActionDeduplicator`](crate::log_replay::FileActionDeduplicator) uses different
 /// rules: it deduplicates `(path, dv_id)` pairs during log replay.
-// TODO(#3692): Optimize by using only one map.
 #[derive(Default)]
 pub(super) struct FileActionUniquenessValidator {
-    add_paths: HashMap<String, Option<String>>,
-    remove_paths: HashMap<String, Option<String>>,
+    paths: HashMap<String, SeenActions>,
+}
+
+enum FileActionType {
+    Add,
+    Remove,
+}
+
+enum SeenActions {
+    Add(Option<String>),
+    Remove(Option<String>),
+    Both,
 }
 
 impl FileActionUniquenessValidator {
     fn record_add(&mut self, path: &str, dv_id: Option<String>) -> KernelResult<()> {
-        Self::record(
-            path,
-            dv_id,
-            "AddFile",
-            &mut self.add_paths,
-            &self.remove_paths,
-        )
+        self.record(path, dv_id, FileActionType::Add)
     }
 
     fn record_remove(&mut self, path: &str, dv_id: Option<String>) -> KernelResult<()> {
-        Self::record(
-            path,
-            dv_id,
-            "RemoveFile",
-            &mut self.remove_paths,
-            &self.add_paths,
-        )
+        self.record(path, dv_id, FileActionType::Remove)
     }
 
     fn record(
+        &mut self,
         path: &str,
         dv_id: Option<String>,
-        action_name: &str,
-        same_type_actions: &mut HashMap<String, Option<String>>,
-        different_type_actions: &HashMap<String, Option<String>>,
+        action_type: FileActionType,
     ) -> KernelResult<()> {
-        let Entry::Vacant(entry) = same_type_actions.entry(path.to_owned()) else {
-            return Err(KernelError::invalid_transaction_state(format!(
-                "Transaction contains multiple {action_name} actions for path '{path}'"
-            )));
+        let mut entry = match self.paths.entry(path.to_owned()) {
+            Entry::Vacant(entry) => {
+                entry.insert(match action_type {
+                    FileActionType::Add => SeenActions::Add(dv_id),
+                    FileActionType::Remove => SeenActions::Remove(dv_id),
+                });
+                return Ok(());
+            }
+            Entry::Occupied(entry) => entry,
+        };
+        let previous_dv_id = match (entry.get(), &action_type) {
+            (SeenActions::Add(previous_dv_id), FileActionType::Remove) => previous_dv_id,
+            (SeenActions::Remove(previous_dv_id), FileActionType::Add) => previous_dv_id,
+            _ => {
+                let action_name = match action_type {
+                    FileActionType::Add => "AddFile",
+                    FileActionType::Remove => "RemoveFile",
+                };
+                return Err(KernelError::invalid_transaction_state(format!(
+                    "Transaction contains multiple {action_name} actions for path '{path}'"
+                )));
+            }
         };
         require!(
-            different_type_actions.get(path) != Some(&dv_id),
+            previous_dv_id != &dv_id,
             KernelError::invalid_transaction_state(match dv_id.as_deref() {
                 Some(dv_id) => format!(
                     "Transaction contains AddFile and RemoveFile actions for path '{path}' with the \
@@ -91,7 +105,7 @@ impl FileActionUniquenessValidator {
                 ),
             })
         );
-        entry.insert(dv_id);
+        entry.insert(SeenActions::Both);
         Ok(())
     }
 }
