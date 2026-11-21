@@ -125,47 +125,87 @@ async fn test_checkpoint_already_exists(
 }
 
 #[rstest_reuse::apply(checkpoint_modes)]
-#[case::unknown_writer_only_no_spec(&[], &["futureFeature"], None)]
-#[case::unknown_writer_only_v1(&[], &["futureFeature"], Some(CheckpointSpec::V1))]
+#[case::unknown_writer_only_no_spec(&[], &["futureFeature"], None, "futureFeature")]
+#[case::unknown_writer_only_v1(&[], &["futureFeature"], Some(CheckpointSpec::V1), "futureFeature")]
 #[case::unknown_writer_only_v2(
     &["v2Checkpoint"],
     &["v2Checkpoint", "futureFeature"],
-    Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar))
+    Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar)),
+    "futureFeature"
 )]
 #[case::unknown_writer_only_v2_sidecar(
     &["v2Checkpoint"],
     &["v2Checkpoint", "futureFeature"],
     Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
         file_actions_per_sidecar_hint: None,
-    }))
+    })),
+    "futureFeature"
 )]
 #[case::mixed_writer_only_no_spec(
     &["deletionVectors"],
     &["deletionVectors", "futureFeature"],
-    None
+    None,
+    "futureFeature"
 )]
 #[case::mixed_writer_only_v1(
     &["deletionVectors"],
     &["deletionVectors", "futureFeature"],
-    Some(CheckpointSpec::V1)
+    Some(CheckpointSpec::V1),
+    "futureFeature"
 )]
 #[case::mixed_writer_only_v2(
     &["deletionVectors", "v2Checkpoint"],
     &["deletionVectors", "v2Checkpoint", "futureFeature"],
-    Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar))
+    Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar)),
+    "futureFeature"
 )]
 #[case::mixed_writer_only_v2_sidecar(
     &["deletionVectors", "v2Checkpoint"],
     &["deletionVectors", "v2Checkpoint", "futureFeature"],
     Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
         file_actions_per_sidecar_hint: None,
-    }))
+    })),
+    "futureFeature"
+)]
+#[cfg_attr(
+    feature = "geo-type-in-dev",
+    case::geospatial_no_spec(&["geospatial"], &["geospatial"], None, "geospatial")
+)]
+#[cfg_attr(
+    feature = "geo-type-in-dev",
+    case::geospatial_v1(
+        &["geospatial"],
+        &["geospatial"],
+        Some(CheckpointSpec::V1),
+        "geospatial"
+    )
+)]
+#[cfg_attr(
+    feature = "geo-type-in-dev",
+    case::geospatial_v2(
+        &["geospatial", "v2Checkpoint"],
+        &["geospatial", "v2Checkpoint"],
+        Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar)),
+        "geospatial"
+    )
+)]
+#[cfg_attr(
+    feature = "geo-type-in-dev",
+    case::geospatial_v2_sidecar(
+        &["geospatial", "v2Checkpoint"],
+        &["geospatial", "v2Checkpoint"],
+        Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+            file_actions_per_sidecar_hint: None,
+        })),
+        "geospatial"
+    )
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn checkpoint_crc_writes_reject_unsupported_table_features(
     #[case] reader_features: &[&str],
     #[case] writer_features: &[&str],
     #[case] checkpoint_spec: Option<CheckpointSpec>,
+    #[case] expected_feature: &str,
     declarative: bool,
 ) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
@@ -227,13 +267,13 @@ async fn checkpoint_crc_writes_reject_unsupported_table_features(
     } else {
         checkpoint_result
     };
-    assert_result_error_with_message(checkpoint_result, "futureFeature");
+    assert_result_error_with_message(checkpoint_result, expected_feature);
 
     let initial_event_count = reporter.events().len();
     let start = Instant::now();
     let checksum_result = snapshot.write_checksum(engine.as_ref()).map(|_| ());
     let elapsed = start.elapsed();
-    assert_result_error_with_message(checksum_result, "futureFeature");
+    assert_result_error_with_message(checksum_result, expected_feature);
 
     let events: Vec<_> = reporter
         .events()
