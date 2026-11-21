@@ -2555,6 +2555,26 @@ mod tests {
         }
     }
 
+    /// Writers populate every field of the expected stats schema, leaving unknown ones null, so a
+    /// null field such as `tightStats` must be dropped rather than written as `null`.
+    #[rstest]
+    fn test_to_json_omits_null_fields(#[values(false, true)] full_precision_timestamps: bool) {
+        let value = StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("numRecords", ArrowDataType::Int64, true)),
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("tightStats", ArrowDataType::Boolean, true)),
+                Arc::new(BooleanArray::from(vec![None])),
+            ),
+        ]);
+        assert_eq!(
+            to_json_string(full_precision_timestamps, value),
+            r#"{"numRecords":1}"#
+        );
+    }
+
     /// `ParseJson` recovers what `ToJson` wrote with `full_precision_timestamps` exactly, and
     /// recovers its default output only down to the millisecond.
     #[rstest]

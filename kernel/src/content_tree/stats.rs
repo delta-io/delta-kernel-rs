@@ -17,7 +17,9 @@ use std::sync::Arc;
 
 use tracing::warn;
 
-use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, STATS_PARSED, TIGHT_BOUNDS};
+use crate::actions::{
+    MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, STATS_PARSED, TIGHT_BOUNDS, TIGHT_STATS,
+};
 use crate::content_tree::{
     CONTENT_STATS_FIELD_NAME, LOWER_BOUND, NAN_VALUE_COUNT, NULL_VALUE_COUNT, RECORD_COUNT,
     TOTAL_BYTES, UPPER_BOUND, VALUE_COUNT,
@@ -834,6 +836,8 @@ fn assemble_parsed_stats_expr(
             // as tight.
             // TODO(#3843): derive tightBounds and tightStats from the entry's tight_stats.
             TIGHT_BOUNDS => lit(false),
+            // Null leaves tightness unknown, which readers treat like `false`.
+            TIGHT_STATS => null_lit(DataType::BOOLEAN),
             _ => STAT_CATEGORIES
                 .iter()
                 .position(|category| *category == name)

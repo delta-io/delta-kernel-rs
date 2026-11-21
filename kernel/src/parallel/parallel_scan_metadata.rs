@@ -293,6 +293,7 @@ mod tests {
 
     use super::ParallelState;
     use crate::engine::sync::SyncEngine;
+    use crate::expressions::UnaryExpressionOp;
     use crate::log_segment::CheckpointReadInfo;
     use crate::metrics::{MetricEvent, ScanType, TableType};
     use crate::scan::PhysicalPredicate;
@@ -323,6 +324,7 @@ mod tests {
             is_catalog_managed: true,
             skip_row_transforms: false,
             dv_normalization_root: None,
+            stats_json_op: UnaryExpressionOp::TO_JSON,
         });
         let processor = ScanLogReplayProcessor::new(
             &engine,

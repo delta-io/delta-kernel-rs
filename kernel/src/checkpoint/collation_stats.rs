@@ -47,6 +47,7 @@ pub(crate) struct CollationStatsReadTransform {
 pub(crate) fn build_collation_stats_read_transform(
     requested: &StructType,
     source: Option<&StructField>,
+    stats_json_op: UnaryExpressionOp,
 ) -> KernelResult<Option<CollationStatsReadTransform>> {
     if !requested.contains_col(["add", "stats"]) {
         return Ok(None);
@@ -75,7 +76,7 @@ pub(crate) fn build_collation_stats_read_transform(
     );
     let json = Expression::coalesce([
         col!("add.stats"),
-        Expression::unary(UnaryExpressionOp::TO_JSON, col!("add.stats_parsed")),
+        Expression::unary(stats_json_op, col!("add.stats_parsed")),
     ]);
     let mut patch = ProjectionStructPatchBuilder::new(&read_schema).replace_expr_at(
         ["add"],
@@ -227,18 +228,21 @@ mod tests {
     use super::*;
     use crate::action_reconciliation::file_metadata::build_checkpoint_read_schema;
     use crate::action_reconciliation::log_replay::ActionReconciliationProcessor;
-    use crate::actions::{Metadata, Protocol};
-    use crate::arrow::array::StringArray;
+    use crate::actions::{LOG_ADD_SCHEMA, MIN_VALUES, Metadata, Protocol};
     use crate::checkpoint::{CHECKPOINT_ACTIONS_SCHEMA_V1, CheckpointWriter};
-    use crate::engine::arrow_utils::to_json_bytes;
     use crate::engine::sync::SyncEngine;
     use crate::engine_data::FilteredEngineData;
+    use crate::log_segment::CheckpointReadOptions;
     use crate::object_store::DynObjectStore;
     use crate::object_store::memory::InMemory;
     use crate::scan::StatsOptions;
     use crate::schema::{ColumnMetadataKey, MetadataValue, schema, schema_ref};
     use crate::snapshot::SnapshotRef;
-    use crate::{Engine, EngineData, Result, version_as_i64};
+    use crate::unit_test_utils::{
+        MICROSECOND_TIMESTAMP, assert_min_ts_in_stats_json, evaluate_on_json_rows, json_rows,
+        parse_actions,
+    };
+    use crate::{Engine, Result, version_as_i64};
 
     #[rstest]
     #[case::missing(None, vec![])]
@@ -559,16 +563,120 @@ mod tests {
             StructField::nullable(COLLATION_STATS, schema! { nullable "custom.ci.1": STRING });
         let requested = schema! { nullable "add": { nullable "stats": STRING } };
         assert!(
-            build_collation_stats_read_transform(&requested, None)
+            build_collation_stats_read_transform(&requested, None, UnaryExpressionOp::TO_JSON)
                 .unwrap()
                 .is_none()
         );
         let requested = schema! { nullable "add": { nullable "path": STRING } };
         assert!(
-            build_collation_stats_read_transform(&requested, Some(&source))
-                .unwrap()
-                .is_none()
+            build_collation_stats_read_transform(
+                &requested,
+                Some(&source),
+                UnaryExpressionOp::TO_JSON
+            )
+            .unwrap()
+            .is_none()
         );
+    }
+
+    #[rstest]
+    #[case::millisecond(UnaryExpressionOp::TO_JSON, "2026-07-02T15:55:55.298Z")]
+    #[case::full_precision(
+        UnaryExpressionOp::ToJson { full_precision_timestamps: true },
+        "2026-07-02T15:55:55.298677Z"
+    )]
+    fn read_transform_rebuilds_json_with_stats_json_op(
+        #[case] stats_json_op: UnaryExpressionOp,
+        #[case] expected_bound: &str,
+    ) -> Result<()> {
+        let source =
+            StructField::nullable(COLLATION_STATS, schema! { nullable "custom.ci.1": STRING });
+        let requested = schema! {
+            nullable "add": {
+                nullable "stats": STRING,
+                nullable "stats_parsed": { nullable MIN_VALUES: { nullable "ts": TIMESTAMP } },
+            },
+        };
+        let transform =
+            build_collation_stats_read_transform(&requested, Some(&source), stats_json_op)?
+                .unwrap();
+
+        let parsed_stats = json!({ MIN_VALUES: { "ts": MICROSECOND_TIMESTAMP } });
+        let rows = evaluate_on_json_rows(
+            &SyncEngine::new(),
+            transform.read_schema,
+            transform.expression,
+            transform.output_schema,
+            &[json!({ "add": { "stats": null, "stats_parsed": parsed_stats } })],
+        )?;
+        assert_min_ts_in_stats_json(&rows[0]["add"]["stats"], expected_bound);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::millisecond(UnaryExpressionOp::TO_JSON, "2026-07-02T15:55:55.298Z")]
+    #[case::full_precision(
+        UnaryExpressionOp::ToJson { full_precision_timestamps: true },
+        "2026-07-02T15:55:55.298677Z"
+    )]
+    #[tokio::test]
+    async fn checkpoint_read_rebuilds_collation_json_with_stats_json_op(
+        #[case] stats_json_op: UnaryExpressionOp,
+        #[case] expected_bound: &str,
+    ) -> Result<()> {
+        let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
+        let engine = SyncEngine::new_with_store(store.clone());
+        let table_schema = schema_ref! { nullable "ts": TIMESTAMP, (collated_field("other")) };
+        let metadata = Metadata::try_new(None, None, table_schema, vec![], 0, HashMap::new())?;
+        let protocol = Protocol::try_new_modern(Vec::<&str>::new(), ["collations"])?;
+        let mut actions = vec![
+            json!({ "protocol": protocol }),
+            json!({ "metaData": metadata }),
+        ];
+        commit(store.as_ref(), 0, &actions).await;
+        let mut add = add_action("a.parquet", json!({}));
+        add["add"]["stats_parsed"] = json!({
+            MIN_VALUES: { "ts": "2026-07-02T15:55:55.298677Z" },
+            COLLATION_STATS: { "ICU.en_US.72": { "minValues": { "other": "B" } } },
+        });
+        actions.push(add);
+        let ts_stats = schema! { nullable MIN_VALUES: { nullable "ts": TIMESTAMP } };
+        let source = SchemaStructPatchBuilder::new()
+            .append(StructField::nullable(
+                COLLATION_STATS,
+                schema! {
+                    nullable "ICU.en_US.72": { nullable "minValues": { nullable "other": STRING } },
+                },
+            ))
+            .build(&ts_stats)?;
+        write_checkpoint_rows(&engine, source, &actions, false)?;
+        let snapshot = Snapshot::builder_for("memory:///").build(&engine)?;
+
+        let options = CheckpointReadOptions {
+            stats_schema: Some(&ts_stats),
+            stats_json_op,
+            ..Default::default()
+        };
+        let batches = snapshot
+            .log_segment()
+            .read_actions_with_projected_checkpoint_actions(
+                &engine,
+                LOG_ADD_SCHEMA.clone(),
+                LOG_ADD_SCHEMA.clone(),
+                options,
+                true, /* use_compactions */
+            )?
+            .actions
+            .map(|batch| Ok(FilteredEngineData::with_all_rows_selected(batch?.actions)));
+        let adds = json_rows(batches)?
+            .into_iter()
+            .filter(|row| !row["add"].is_null())
+            .collect_vec();
+        assert_eq!(adds.len(), 1);
+        let stats: Value = serde_json::from_str(adds[0]["add"]["stats"].as_str().unwrap())
+            .map_err(KernelError::from)?;
+        assert_eq!(stats[MIN_VALUES]["ts"], expected_bound, "{stats}");
+        Ok(())
     }
 
     #[rstest]
@@ -784,19 +892,6 @@ mod tests {
         .unwrap();
     }
 
-    fn parse_actions(
-        engine: &dyn Engine,
-        schema: SchemaRef,
-        actions: &[Value],
-    ) -> KernelResult<Box<dyn EngineData>> {
-        engine.json_handler().parse_json(
-            crate::unit_test_utils::string_array_to_engine_data(StringArray::from_iter_values(
-                actions.iter().map(Value::to_string),
-            )),
-            schema,
-        )
-    }
-
     fn write_checkpoint_rows(
         engine: &dyn Engine,
         stats: StructType,
@@ -833,16 +928,6 @@ mod tests {
             schema_context,
             read_schema,
         })
-    }
-
-    fn json_rows(
-        batches: impl Iterator<Item = KernelResult<FilteredEngineData>> + Send,
-    ) -> KernelResult<Vec<Value>> {
-        let bytes = to_json_bytes(batches)?;
-        serde_json::Deserializer::from_slice(&bytes)
-            .into_iter::<Value>()
-            .map(|row| row.map_err(Into::into))
-            .collect()
     }
 
     /// Indexes `rows` by `path`, expecting exactly one row per sample file.
