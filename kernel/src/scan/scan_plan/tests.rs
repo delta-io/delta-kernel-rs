@@ -973,11 +973,15 @@ fn assert_metadata_output_options(
                 checkpoint_version.map_or(ReplayBase::Empty, |_| ReplayBase::Checkpoint);
             assert_eq!(event.replay_base, Some(replay_base));
             assert_eq!(event.checkpoint.is_some(), checkpoint_version.is_some());
-            assert_eq!(event.commit_start_version, files.first().map(|(lo, _)| *lo));
-            assert_eq!(event.commit_end_version, files.last().map(|(_, hi)| *hi));
-            assert_eq!(event.commit_total_size_bytes == 0, files.is_empty());
+            let report = &event.metadata_plan;
             assert_eq!(
-                event.compaction_file_count,
+                report.commit_start_version,
+                files.first().map(|(lo, _)| *lo)
+            );
+            assert_eq!(report.commit_end_version, files.last().map(|(_, hi)| *hi));
+            assert_eq!(report.commit_total_size_bytes == 0, files.is_empty());
+            assert_eq!(
+                report.compaction_file_count,
                 files.iter().filter(|(lo, hi)| lo != hi).count() as u64
             );
         },

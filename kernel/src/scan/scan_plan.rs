@@ -28,7 +28,6 @@ use crate::checkpoint::CheckpointInfo;
 use crate::expressions::{ColumnName, Predicate, lit};
 #[cfg(test)]
 use crate::expressions::{Expression as Expr, expr};
-use crate::metrics::ScanPlanReport;
 use crate::plans::ir::plan::Plan;
 #[cfg(test)]
 use crate::schema::{
@@ -94,8 +93,7 @@ impl Scan {
     pub(super) fn build_metadata_scan_plan_with(
         &self,
         base: MetadataReplayBase,
-        mut planner: MetadataPlanner<'_>,
-        report: &mut ScanPlanReport,
+        planner: &mut MetadataPlanner<'_>,
     ) -> KernelResult<Option<Plan>> {
         let state = &self.state_info;
         if state.physical_predicate == PhysicalPredicate::StaticSkipAll {
@@ -106,12 +104,12 @@ impl Scan {
         let checkpoint = match base {
             MetadataReplayBase::Crc { version, files } => planner.crc_adds(version, files),
             MetadataReplayBase::Checkpoint { info, .. } => {
-                planner = planner.with_checkpoint_info(info);
+                planner.checkpoint_info = info;
                 planner.checkpoint_actions()
             }
         }?;
         // Keep commit removes through replay so they cancel older adds before selecting live files.
-        let commits = planner.commit_actions(base_version, report)?;
+        let commits = planner.commit_actions(base_version)?;
         planner
             .replay_actions(commits, checkpoint)?
             .project_patch(|patch| patch.drop(VERSION))?
@@ -128,7 +126,7 @@ impl Scan {
             version: self.snapshot.log_segment().checkpoint_version,
             info: shape.into().cloned().map(Arc::new),
         };
-        self.build_metadata_scan_plan_with(base, planner.clone(), &mut ScanPlanReport::new())
+        self.build_metadata_scan_plan_with(base, &mut planner.clone())
     }
 }
 // === Helpers ===

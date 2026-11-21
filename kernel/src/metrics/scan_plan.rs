@@ -49,6 +49,19 @@ pub struct CheckpointMetrics {
     pub metadata_query_calls: u64,
 }
 
+/// Selected commit inputs observed while building a metadata plan.
+#[derive(Debug, Clone, Default)]
+pub struct MetadataPlanReport {
+    /// Inclusive first covered commit version, absent when no commits were selected.
+    pub commit_start_version: Option<Version>,
+    /// Inclusive last covered commit version, absent when no commits were selected.
+    pub commit_end_version: Option<Version>,
+    /// Combined size of the selected commit and compaction files.
+    pub commit_total_size_bytes: u64,
+    /// Selected compaction files, each counted once.
+    pub compaction_file_count: u64,
+}
+
 /// Metrics collected during declarative scan-plan generation, including partial state on error.
 #[derive(Debug, Clone)]
 pub struct ScanPlanReport {
@@ -68,14 +81,8 @@ pub struct ScanPlanReport {
     pub replay_base: Option<ReplayBase>,
     /// Checkpoint used for replay, absent for CRC and commit-only replay.
     pub checkpoint: Option<CheckpointMetrics>,
-    /// Inclusive first covered commit version, absent when no commits were selected.
-    pub commit_start_version: Option<Version>,
-    /// Inclusive last covered commit version, absent when no commits were selected.
-    pub commit_end_version: Option<Version>,
-    /// Combined size of the selected commit and compaction files.
-    pub commit_total_size_bytes: u64,
-    /// Selected compaction files, each counted once.
-    pub compaction_file_count: u64,
+    /// Inputs selected by the shared metadata planner.
+    pub metadata_plan: MetadataPlanReport,
 }
 
 impl ScanPlanReport {
@@ -92,10 +99,7 @@ impl ScanPlanReport {
             partition_values: PartitionValuesOptions::default(),
             replay_base: None,
             checkpoint: None,
-            commit_start_version: None,
-            commit_end_version: None,
-            commit_total_size_bytes: 0,
-            compaction_file_count: 0,
+            metadata_plan: MetadataPlanReport::default(),
         }
     }
 }
@@ -111,10 +115,10 @@ impl fmt::Display for ScanPlanReport {
             self.outcome,
             self.duration_ns,
             self.replay_base,
-            self.commit_start_version,
-            self.commit_end_version,
-            self.commit_total_size_bytes,
-            self.compaction_file_count
+            self.metadata_plan.commit_start_version,
+            self.metadata_plan.commit_end_version,
+            self.metadata_plan.commit_total_size_bytes,
+            self.metadata_plan.compaction_file_count
         )?;
         if let Some(checkpoint) = &self.checkpoint {
             write!(
