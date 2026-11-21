@@ -415,6 +415,27 @@ class InlineReviewTest(unittest.TestCase):
             },
         )
 
+    def test_diff_positions_count_lines_as_git_does(self) -> None:
+        diff = (
+            "diff --git a/kernel/src/breaks.rs b/kernel/src/breaks.rs\n"
+            "--- a/kernel/src/breaks.rs\n"
+            "+++ b/kernel/src/breaks.rs\n"
+            "@@ -1,3 +1,3 @@\n"
+            " first\x0cstill first\u2028still first\r\n"
+            "-second\rstill second\n"
+            "+replacement\n"
+            " third\n"
+        )
+        self.assertEqual(
+            self.inline_review.diff_positions(diff),
+            {
+                ("kernel/src/breaks.rs", 1, "RIGHT"),
+                ("kernel/src/breaks.rs", 2, "LEFT"),
+                ("kernel/src/breaks.rs", 2, "RIGHT"),
+                ("kernel/src/breaks.rs", 3, "RIGHT"),
+            },
+        )
+
     def test_diff_positions_handles_added_deleted_and_no_newline_files(self) -> None:
         self.assertEqual(
             self.inline_review.diff_positions(FILE_LIFECYCLE_DIFF),
@@ -1169,7 +1190,17 @@ class InlineReviewTest(unittest.TestCase):
             }
             paths["review"].write_text("## Summary\nNo findings.")
             paths["findings"].write_text("[]")
-            paths["diff"].write_text(DIFF)
+            paths["diff"].write_bytes(
+                (
+                    "diff --git a/kernel/src/breaks.rs b/kernel/src/breaks.rs\n"
+                    "--- a/kernel/src/breaks.rs\n"
+                    "+++ b/kernel/src/breaks.rs\n"
+                    "@@ -1,2 +1,2 @@\n"
+                    " first\rstill first\n"
+                    "-second\n"
+                    "+replacement\n"
+                ).encode()
+            )
             paths["history"].write_text("not JSON")
             paths["trusted"].write_text('["github-actions"]')
             arguments = [
@@ -1198,9 +1229,14 @@ class InlineReviewTest(unittest.TestCase):
                 str(paths["skip"]),
             ]
 
-            with patch.object(sys, "argv", arguments):
+            with patch.object(sys, "argv", arguments), patch.object(
+                self.inline_review,
+                "build_review_payload",
+                wraps=self.inline_review.build_review_payload,
+            ) as build_review_payload:
                 self.inline_review.main()
 
+            self.assertIn(" first\rstill first\n", build_review_payload.call_args.kwargs["diff"])
             self.assertEqual(json.loads(paths["output"].read_text())["comments"], [])
             self.assertEqual(paths["unmapped"].read_text(), "")
             self.assertEqual(paths["duplicate"].read_text(), "")
