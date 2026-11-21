@@ -16,6 +16,7 @@ use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{ColumnName, Predicate, col};
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
 use crate::log_segment::LogSegment;
+use crate::metrics::CheckpointMetrics;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::plans::ir::nodes::FileType;
 use crate::plans::{Operation, PlanBuilder, PlanExecutor};
@@ -35,6 +36,7 @@ impl CheckpointInfo {
     pub(crate) fn resolve(
         exec: &dyn PlanExecutor,
         segment: &LogSegment,
+        checkpoint: &mut Option<CheckpointMetrics>,
     ) -> KernelResult<Option<Self>> {
         let Some(root) = segment.listed.checkpoint_parts.first() else {
             return Ok(None);
@@ -62,6 +64,9 @@ impl CheckpointInfo {
             Some(sidecars) => (Cow::Borrowed(sidecars.as_slice()), hint_metadata),
             None => {
                 if file_type == FileType::Parquet && root_schema.is_none() {
+                    if let Some(checkpoint) = checkpoint {
+                        checkpoint.root_footer_calls += 1;
+                    }
                     root_schema = Some(read_parquet_footer_schema(exec, root.location.clone())?);
                 }
                 let needs_root_read = root_schema.as_ref().is_none_or(|schema| {
@@ -69,7 +74,7 @@ impl CheckpointInfo {
                 });
                 if needs_root_read {
                     let (sidecars, metadata) =
-                        collect_checkpoint_metadata(exec, &root.location, file_type)?;
+                        collect_checkpoint_metadata(exec, &root.location, file_type, checkpoint)?;
                     (Cow::Owned(sidecars), metadata.map(Cow::Owned))
                 } else {
                     (Cow::Borrowed([].as_slice()), None)
@@ -98,14 +103,24 @@ impl CheckpointInfo {
             });
             match tagged {
                 Some(schema) => Arc::new(schema),
-                None => read_parquet_footer_schema(exec, first.clone())?,
+                None => {
+                    if let Some(checkpoint) = checkpoint {
+                        checkpoint.sidecar_footer_calls += 1;
+                    }
+                    read_parquet_footer_schema(exec, first.clone())?
+                }
             }
         } else if file_type == FileType::Json {
             CHECKPOINT_ACTIONS_SCHEMA_V2.clone()
         } else {
             let schema = match root_schema {
                 Some(ref schema) => schema.clone(),
-                None => read_parquet_footer_schema(exec, root.location.clone())?,
+                None => {
+                    if let Some(checkpoint) = checkpoint {
+                        checkpoint.root_footer_calls += 1;
+                    }
+                    read_parquet_footer_schema(exec, root.location.clone())?
+                }
             };
             root_schema = Some(schema.clone());
             schema
@@ -222,6 +237,7 @@ fn collect_checkpoint_metadata(
     exec: &dyn PlanExecutor,
     file: &FileMeta,
     file_type: FileType,
+    checkpoint: &mut Option<CheckpointMetrics>,
 ) -> KernelResult<(Vec<Sidecar>, Option<CheckpointMetadata>)> {
     let schema = schema_ref! { (&SIDECAR_FIELD), (&CHECKPOINT_METADATA_FIELD) };
     let predicate = Predicate::or(
@@ -234,6 +250,9 @@ fn collect_checkpoint_metadata(
     }?
     .filter(predicate)?
     .build()?;
+    if let Some(checkpoint) = checkpoint {
+        checkpoint.metadata_query_calls += 1;
+    }
     let data = exec.execute_op(Operation::QueryPlan(plan))?.into_data()?;
     let mut sidecars = SidecarVisitor::default();
     let mut metadata = CheckpointMetadataVisitor::default();
@@ -501,7 +520,7 @@ mod tests {
         let exec = CountingExecutor::new();
 
         // When: the shared resolver discovers the complete checkpoint.
-        let resolved = CheckpointInfo::resolve(&exec, &segment).unwrap();
+        let resolved = CheckpointInfo::resolve(&exec, &segment, &mut None).unwrap();
 
         // Then: absence stays explicit; selected checkpoints always include their leaf schema.
         assert_eq!(
@@ -584,7 +603,10 @@ mod tests {
         assert_eq!(info.last_checkpoint().version(), 1);
         assert!(info.last_checkpoint().v2_checkpoint().is_none());
         assert!(info.last_checkpoint().parts().is_none());
-        let checkpoint_info = snapshot.checkpoint_info(engine.as_ref()).unwrap().unwrap();
+        let checkpoint_info = snapshot
+            .checkpoint_info(engine.as_ref(), &mut None)
+            .unwrap()
+            .unwrap();
         let sidecar_schema = read_parquet_footer_schema(
             &SyncPlanExecutor::default(),
             checkpoint_info.sidecars.as_ref()[0].clone(),
@@ -606,10 +628,13 @@ mod tests {
         };
 
         // When: the checkpoint schema is resolved.
-        let checkpoint_info =
-            CheckpointInfo::resolve(&SyncPlanExecutor::default(), snapshot.log_segment())
-                .unwrap()
-                .unwrap();
+        let checkpoint_info = CheckpointInfo::resolve(
+            &SyncPlanExecutor::default(),
+            snapshot.log_segment(),
+            &mut None,
+        )
+        .unwrap()
+        .unwrap();
 
         // Then: incompatible parsed statistics are unavailable.
         assert!(!LogSegment::schema_has_compatible_stats_parsed(
@@ -633,10 +658,13 @@ mod tests {
         let (_engine, snapshot, _tempdir) =
             load_test_table("v1-multi-part-partitioned-struct-stats-only").unwrap();
         // When: its parsed partition schema is resolved.
-        let checkpoint_info =
-            CheckpointInfo::resolve(&SyncPlanExecutor::default(), snapshot.log_segment())
-                .unwrap()
-                .unwrap();
+        let checkpoint_info = CheckpointInfo::resolve(
+            &SyncPlanExecutor::default(),
+            snapshot.log_segment(),
+            &mut None,
+        )
+        .unwrap()
+        .unwrap();
 
         // Then: missing columns are allowed, but incompatible column types are rejected.
         assert_eq!(
@@ -671,7 +699,9 @@ mod tests {
         let exec = CountingExecutor::new();
 
         // When: checkpoint metadata is resolved from the hint.
-        let checkpoint_info = CheckpointInfo::resolve(&exec, &segment).unwrap().unwrap();
+        let checkpoint_info = CheckpointInfo::resolve(&exec, &segment, &mut None)
+            .unwrap()
+            .unwrap();
 
         // Then: only the missing sidecar schema requires I/O.
         assert_eq!(checkpoint_info.kind(), CheckpointKind::Manifest);
@@ -793,7 +823,9 @@ mod tests {
         let exec = CountingExecutor::new();
 
         // When: full metadata is resolved.
-        let checkpoint_info = CheckpointInfo::resolve(&exec, &segment).unwrap().unwrap();
+        let checkpoint_info = CheckpointInfo::resolve(&exec, &segment, &mut None)
+            .unwrap()
+            .unwrap();
 
         // Then: the checkpoint is a leaf without draining its root. A Parquet root's footer is
         // read for the leaf schema because the hint carries no checkpoint schema.
@@ -935,7 +967,9 @@ mod tests {
         let exec = CountingExecutor::new();
 
         // When: metadata is resolved using that hint.
-        let checkpoint_info = CheckpointInfo::resolve(&exec, &segment).unwrap().unwrap();
+        let checkpoint_info = CheckpointInfo::resolve(&exec, &segment, &mut None)
+            .unwrap()
+            .unwrap();
 
         // Then: stats compatibility follows the hinted schema without any I/O.
         assert_eq!(checkpoint_info.kind(), CheckpointKind::Manifest);
@@ -1015,7 +1049,7 @@ mod tests {
                 .insert(CHECKPOINT_NUM_ADD_FILES_TAG.to_owned(), tag.to_owned());
         }
         // When: selected-checkpoint metadata is derived.
-        let resolved = CheckpointInfo::resolve(&CountingExecutor::new(), &segment)
+        let resolved = CheckpointInfo::resolve(&CountingExecutor::new(), &segment, &mut None)
             .unwrap()
             .unwrap();
         let derived = resolved.last_checkpoint();
@@ -1316,7 +1350,7 @@ mod tests {
         let exec = CountingExecutor::new();
 
         // When: discovery reads the malformed metadata.
-        let error = CheckpointInfo::resolve(&exec, &segment).unwrap_err();
+        let error = CheckpointInfo::resolve(&exec, &segment, &mut None).unwrap_err();
 
         // Then: resolution reports the specific metadata error.
         assert!(error.to_string().contains(expected_error), "{error}");
