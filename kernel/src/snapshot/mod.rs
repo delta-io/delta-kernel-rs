@@ -1757,7 +1757,8 @@ impl Snapshot {
     ///
     /// Returns [`KernelError::ChecksumWriteUnsupported`] when a root is reached but cannot yield a
     /// writable CRC (missing protocol or metadata, or a non-incremental tail that dooms file
-    /// stats).
+    /// stats), or when an adaptiveMetadata log with no checkpoint starts above version 0, so its
+    /// file stats live in a content tree.
     ///
     /// The `root` span field records the selected root. `write_span` records its resolution mode.
     #[instrument(parent = &self.span, name = "snap.resolve_crc_for_write", skip_all, err, fields(root))]
@@ -1840,6 +1841,30 @@ impl Snapshot {
                 .ok_or_else(|| unresolved_crc("checkpoint is missing protocol or metadata"))?;
             // The tail delta carries v_end's ICT, which `apply` sets on the result.
             return Ok(Arc::new(base.apply(delta, end)));
+        }
+
+        // An adaptiveMetadata log may be cleaned up below its content root, so a log with no
+        // checkpoint that starts above version 0 is rooted at a content tree rather than
+        // truncated. Its file stats live in that tree, which kernel does not read yet.
+        // TODO(#2866): remove once the base CRC can be built from the AMT checkpoint action and its
+        // content tree.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if let Some(first) = log_segment
+            .listed
+            .ascending_commit_files
+            .first()
+            .filter(|first| first.version > 0)
+            .filter(|_| {
+                self.table_configuration()
+                    .is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
+            })
+        {
+            span.record("root", "content_tree");
+            return Err(unresolved_crc(&format!(
+                "Compacted logs are not yet supported with AdaptiveMetadataPreview enabled. The log \
+                 starts at version {}.",
+                first.version
+            )));
         }
 
         // Case 4: neither CRC nor checkpoint, so reverse-replay the full commit history.
