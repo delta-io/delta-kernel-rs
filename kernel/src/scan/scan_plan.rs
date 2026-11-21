@@ -203,6 +203,7 @@ mod execution_tests;
 #[cfg(test)]
 mod tests {
     use ::test_utils::record_batch_to_bytes;
+    use delta_kernel_derive::{ToSchema, TryFromStructData};
     use serde_json::json;
     use url::Url;
 
@@ -213,25 +214,43 @@ mod tests {
     use crate::checkpoint::CheckpointKind;
     use crate::checkpoint::collation_stats::source_collation_stats;
     use crate::crc::Crc;
-    use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::arrow_utils::parse_json_impl;
     use crate::engine::sync::SyncEngine;
+    use crate::expressions::col;
     use crate::log_segment::LogSegment;
     use crate::log_segment_files::LogSegmentFiles;
     use crate::object_store::ObjectStoreExt as _;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
-    use crate::plans::Operation as PlanOperation;
-    use crate::plans::ir::nodes::{FileType, Operator};
+    use crate::plans::PlanExecutorExt as _;
+    use crate::plans::ir::nodes::{FileType, Operator, Project};
+    use crate::plans::ir::plan::PlanNode;
     use crate::scan::data_skipping::stats_schema::expected_stats_schema;
     use crate::scan::{PartitionValuesOptions, StatsOptions};
-    use crate::schema::StructType;
+    use crate::schema::{StructType, ToSchema as _};
     use crate::snapshot::Snapshot;
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::{
         MockProtocolBuilder, MockTableConfigurationBuilder, create_log_path,
     };
     use crate::{Engine as _, KernelError, KernelResult, Result};
+
+    #[derive(ToSchema, TryFromStructData)]
+    struct AddPath {
+        path: String,
+    }
+
+    fn project_paths(mut plan: Plan) -> Plan {
+        plan.schema = AddPath::schema_ref().clone();
+        plan.nodes.push(PlanNode::new(
+            Project {
+                expr: Expr::struct_from([col!(ADD_NAME, "path")]).into(),
+                schema: plan.schema.clone(),
+            },
+            vec![plan.nodes.len() - 1],
+        ));
+        plan
+    }
 
     fn mock_snapshot(log_segment: LogSegment) -> Result<Arc<Snapshot>> {
         let table_configuration = MockTableConfigurationBuilder::new()
@@ -773,24 +792,9 @@ mod tests {
                 .any(|node| matches!(node.op, Operator::Values(_))),
             base == "crc"
         );
-        let batches = engine
-            .plan_executor()
-            .unwrap()
-            .execute_op(PlanOperation::QueryPlan(plan))?
-            .into_data()?;
-        let mut actual_paths = vec![];
-        for batch in batches {
-            let batch = batch?.try_into_record_batch()?;
-            let add = batch
-                .column_by_name(ADD_NAME)
-                .expect("add column")
-                .as_struct();
-            let paths = add
-                .column_by_name("path")
-                .expect("add.path")
-                .as_string::<i32>();
-            actual_paths.extend(paths.iter().map(|path| path.unwrap().to_owned()));
-        }
+        let executor = engine.plan_executor().unwrap();
+        let adds: Vec<AddPath> = executor.execute_plan_into(project_paths(plan))?;
+        let mut actual_paths: Vec<_> = adds.into_iter().map(|add| add.path).collect();
         actual_paths.sort_unstable();
         assert_eq!(actual_paths, expected_paths);
         Ok(())
@@ -1002,15 +1006,9 @@ mod tests {
             .expect("non-empty");
 
         let engine = SyncEngine::new_with_store(store);
-        let mut batches = engine
-            .plan_executor()
-            .unwrap()
-            .execute_op(PlanOperation::QueryPlan(plan))?
-            .into_data()?;
-        let actual_rows = batches.try_fold(0, |rows, batch| {
-            Ok::<_, crate::KernelError>(rows + batch?.try_into_record_batch()?.num_rows())
-        })?;
-        assert_eq!(actual_rows, expected_rows);
+        let executor = engine.plan_executor().unwrap();
+        let adds: Vec<AddPath> = executor.execute_plan_into(project_paths(plan))?;
+        assert_eq!(adds.len(), expected_rows);
         Ok(())
     }
 }

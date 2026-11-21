@@ -10,7 +10,7 @@ use precommit::{
 use super::{CommitResult, Declarative, Transaction, UpdateTable};
 #[cfg(doc)]
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
-use crate::plans::{Operation, RelationRef, ScopedPlanExecutor};
+use crate::plans::{PlanExecutorExt as _, RelationRef, ScopedPlanExecutor};
 #[cfg(doc)]
 use crate::scan::scan_row_schema;
 use crate::table_features::TableFeature;
@@ -61,10 +61,7 @@ impl<S> Transaction<S, Declarative> {
             &checks,
             self.stats_schema()?.as_ref(),
         )?;
-        let result = executor
-            .execute_op(Operation::QueryPlan(plan))?
-            .into_data()?;
-        precommit::validate_result(result, &checks)
+        precommit::validate_result(executor.execute_plan_into(plan)?, &checks)
     }
 
     /// Selects which pre-commit check should be run (based on the effective table configuration
