@@ -35,9 +35,10 @@ use crate::engine::arrow_utils::{
 };
 use crate::expressions::{ArrayData, ColumnName, PredicateRef, Scalar};
 use crate::object_store::DynObjectStore;
+use crate::path_encoding::{uri_decode_path, uri_encode_path};
 use crate::plans::ir::nodes::{
-    DynamicScan, FILE_META_SCHEMA, FileType, Operator, Project, RelationId, RelationRef, ScanFile,
-    ScanJson, ScanParquet, SemiJoin, Values, WriteJson,
+    DynamicScan, FILE_META_SCHEMA, FileType, LIST_FILES_SCHEMA, ListFiles, Operator, Project,
+    RelationId, RelationRef, ScanFile, ScanJson, ScanParquet, SemiJoin, Values, WriteJson,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult, ScopedPlanExecutor};
@@ -246,6 +247,7 @@ impl SyncPlanExecutor {
                 file_constant_columns,
                 schema,
             }) => self.eval_scan(FileType::Json, files, file_constant_columns, schema),
+            Operator::ListFiles(list_files) => self.eval_list_files(list_files),
             Operator::ScanParquet(ScanParquet {
                 files,
                 file_constant_columns,
@@ -379,6 +381,61 @@ impl SyncPlanExecutor {
             }
         }
         Ok(batches)
+    }
+
+    /// Recursively lists files beneath `base_url` through the engine's storage handler.
+    fn eval_list_files(&self, list_files: ListFiles) -> KernelResult<Vec<RecordBatch>> {
+        let metas: Vec<FileMeta> = self
+            .storage
+            .list_from(&list_files.base_url, None)?
+            .collect::<KernelResult<_>>()?;
+        let rows = metas
+            .into_iter()
+            .map(|meta| {
+                let relative_url_path = list_files
+                    .base_url
+                    .make_relative(&meta.location)
+                    .ok_or_else(|| {
+                        KernelError::generic(format!(
+                            "Listed file {} is outside base URL {}",
+                            meta.location, list_files.base_url
+                        ))
+                    })?;
+                let raw_relative_path = uri_decode_path(&relative_url_path).ok_or_else(|| {
+                    KernelError::generic(format!(
+                        "Listed file {} has a non-UTF-8 URL path",
+                        meta.location
+                    ))
+                })?;
+                if raw_relative_path.is_empty()
+                    || raw_relative_path.starts_with('/')
+                    || raw_relative_path
+                        .split('/')
+                        .any(|segment| segment == "." || segment == "..")
+                {
+                    return Err(KernelError::generic(format!(
+                        "Listed file {} is not a valid child of base URL {}",
+                        meta.location, list_files.base_url
+                    )));
+                }
+                // Match Delta action-path encoding so listing and log paths join consistently.
+                let relative_path = uri_encode_path(&raw_relative_path).into_owned();
+                let absolute_path = list_files
+                    .base_url
+                    .join(&relative_path)
+                    .map_err(|error| KernelError::generic(error.to_string()))?;
+                let size = i64::try_from(meta.size)
+                    .map_err(|_| KernelError::generic("Listed file size exceeds LONG range"))?;
+                Ok(vec![
+                    absolute_path.to_string().into(),
+                    relative_path.into(),
+                    size.into(),
+                    meta.last_modified.into(),
+                ])
+            })
+            .collect::<KernelResult<_>>()?;
+        let values = Values::new(Arc::clone(&LIST_FILES_SCHEMA), rows);
+        Ok(vec![values_to_record_batch(values)?])
     }
 
     /// Reads files named by `input` rows.
@@ -777,6 +834,75 @@ mod tests {
         let scan = PlanBuilder::scan_json([meta], &[], schema)?.build()?;
         let batches = executor.eval_plan(scan, None)?;
         assert_batches_sorted_eq!(expected_rows, &batches);
+        Ok(())
+    }
+
+    #[test]
+    fn list_files_recursively_emits_encoded_relative_paths() -> KernelResult<()> {
+        let executor = SyncPlanExecutor::new(Some(Arc::new(InMemory::new())));
+        let root = Url::parse("memory:///table/")?;
+        let file = Url::parse("memory:///table/part=one/a%20b%25.parquet")?;
+        let log_file = Url::parse("memory:///table/_delta_log/00000000000000000000.json")?;
+        executor
+            .storage
+            .put(&file, Bytes::from_static(b"data"), false)?;
+        executor
+            .storage
+            .put(&log_file, Bytes::from_static(b"{}"), false)?;
+
+        let plan = PlanBuilder::list_files(root)?.build()?;
+        let batches = executor
+            .execute_op(Operation::QueryPlan(plan))?
+            .into_data()?
+            .map(|data| data.try_into_record_batch())
+            .collect::<KernelResult<Vec<_>>>()?;
+        assert!(
+            batches
+                .iter()
+                .all(|batch| batch.schema().field(0).name() == "absolute_path")
+        );
+        let mut actual_absolute_paths: Vec<_> = batches
+            .iter()
+            .flat_map(|batch| {
+                let paths = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("absolute_path is STRING");
+                (0..paths.len())
+                    .map(|row| paths.value(row).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        actual_absolute_paths.sort();
+        assert_eq!(
+            actual_absolute_paths,
+            [
+                "memory:///table/_delta_log/00000000000000000000.json",
+                "memory:///table/part=one/a%20b%25.parquet",
+            ]
+        );
+        let mut actual: Vec<_> = batches
+            .iter()
+            .flat_map(|batch| {
+                let paths = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("relative_path is STRING");
+                (0..paths.len())
+                    .map(|row| paths.value(row).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        actual.sort();
+        assert_eq!(
+            actual,
+            [
+                "_delta_log/00000000000000000000.json",
+                "part=one/a%20b%25.parquet",
+            ]
+        );
         Ok(())
     }
 

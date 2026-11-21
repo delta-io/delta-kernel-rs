@@ -42,6 +42,13 @@ message ScanJsonNode {
   delta.kernel.schema.StructType schema = 3;
 }
 
+// Recursively lists files under `base_url`. The engine returns absolute paths and URI-encoded
+// relative paths, matching Delta action path encoding.
+message ListFilesNode {
+  string base_url = 1;
+  delta.kernel.schema.StructType schema = 2;
+}
+
 message ValuesRow {
   repeated delta.kernel.expressions.Scalar values = 1;
 }
@@ -176,6 +183,8 @@ message Operator {
     AggregateNode aggregate = 8;
     SemiJoinNode semi_join = 9;
     PrefixSumNode prefix_sum = 12;
+    // Recursive directory listing source.
+    ListFilesNode list_files = 13;
     // Sinks (write nodes)
     WriteJsonNode write_json = 11;
   }

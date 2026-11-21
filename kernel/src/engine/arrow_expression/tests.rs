@@ -1938,6 +1938,288 @@ fn test_interval_scalar_to_array(#[case] scalar: Scalar, #[case] arrow_type: Dat
     assert_eq!(*nulls.data_type(), arrow_type);
 }
 
+#[test]
+fn resolve_file_path_returns_absolute_and_relative_urls() {
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "ignored",
+            DataType::Boolean,
+            true,
+        )])),
+        vec![Arc::new(BooleanArray::from(vec![true]))],
+    )
+    .unwrap();
+    let output_type = KernelDataType::from(schema! {
+        nullable "absolute_path": STRING,
+        nullable "relative_path": STRING,
+    });
+    let expression = Expr::unary(
+        UnaryExpressionOp::ResolveFilePath,
+        Expr::struct_from([lit("s3://bucket/table/"), lit("data/a%20b%25.parquet")]),
+    );
+    let result = evaluate_expression(&expression, &batch, Some(&output_type))
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap()
+        .clone();
+    let absolute_path = result
+        .column_by_name("absolute_path")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let relative_path = result
+        .column_by_name("relative_path")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(
+        absolute_path.value(0),
+        "s3://bucket/table/data/a%20b%25.parquet"
+    );
+    assert_eq!(relative_path.value(0), "data/a%20b%25.parquet");
+
+    let external = Expr::unary(
+        UnaryExpressionOp::ResolveFilePath,
+        Expr::struct_from([lit("s3://bucket/table/"), lit("s3://other/data.parquet")]),
+    );
+    let result = evaluate_expression(&external, &batch, Some(&output_type))
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap()
+        .clone();
+    let absolute_path = result
+        .column_by_name("absolute_path")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let relative_path = result
+        .column_by_name("relative_path")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(absolute_path.value(0), "s3://other/data.parquet");
+    assert!(relative_path.is_null(0));
+
+    let relative_external = Expr::unary(
+        UnaryExpressionOp::ResolveFilePath,
+        Expr::struct_from([lit("s3://bucket/table/"), lit("../outside%20file.parquet")]),
+    );
+    let result = evaluate_expression(&relative_external, &batch, Some(&output_type))
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap()
+        .clone();
+    let absolute_path = result
+        .column_by_name("absolute_path")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let relative_path = result
+        .column_by_name("relative_path")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(absolute_path.value(0), "s3://bucket/outside%20file.parquet");
+    assert!(relative_path.is_null(0));
+
+    let absolute_in_table = Expr::unary(
+        UnaryExpressionOp::ResolveFilePath,
+        Expr::struct_from([
+            lit("s3://bucket/table/"),
+            lit("s3://bucket/table/data/M%C3%BCnchen.parquet"),
+        ]),
+    );
+    let result = evaluate_expression(&absolute_in_table, &batch, Some(&output_type))
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap()
+        .clone();
+    let absolute_path = result
+        .column_by_name("absolute_path")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let relative_path = result
+        .column_by_name("relative_path")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(
+        absolute_path.value(0),
+        "s3://bucket/table/data/M%C3%BCnchen.parquet"
+    );
+    assert_eq!(relative_path.value(0), "data/M%C3%BCnchen.parquet");
+}
+
+#[test]
+fn deletion_vector_path_resolves_absolute_and_inline_descriptors() {
+    use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
+
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "ignored",
+            DataType::Boolean,
+            true,
+        )])),
+        vec![Arc::new(BooleanArray::from(vec![true]))],
+    )
+    .unwrap();
+    let output_type = KernelDataType::from(schema! {
+        nullable "absolute_path": STRING,
+        nullable "relative_path": STRING,
+    });
+    let absolute = DeletionVectorDescriptor::try_new(
+        DeletionVectorStorageType::PersistedAbsolute,
+        "s3://other/dv.bin",
+        Some(0),
+        4,
+        1,
+    )
+    .unwrap();
+    let expression = Expr::unary(
+        UnaryExpressionOp::DeletionVectorPath,
+        Expr::struct_from([lit("s3://bucket/table/"), lit(Scalar::from(absolute))]),
+    );
+    let result = evaluate_expression(&expression, &batch, Some(&output_type))
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap()
+        .clone();
+    let absolute_path = result
+        .column_by_name("absolute_path")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let relative_path = result
+        .column_by_name("relative_path")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(absolute_path.value(0), "s3://other/dv.bin");
+    assert!(relative_path.is_null(0));
+
+    let relative = DeletionVectorDescriptor::try_new(
+        DeletionVectorStorageType::PersistedRelative,
+        "a#b^-aqEH.-t@S}K{vb[*k^",
+        Some(0),
+        4,
+        1,
+    )
+    .unwrap();
+    let expression = Expr::unary(
+        UnaryExpressionOp::DeletionVectorPath,
+        Expr::struct_from([lit("s3://bucket/table/"), lit(Scalar::from(relative))]),
+    );
+    let result = evaluate_expression(&expression, &batch, Some(&output_type))
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap()
+        .clone();
+    let absolute_path = result
+        .column_by_name("absolute_path")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let relative_path = result
+        .column_by_name("relative_path")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(
+        absolute_path.value(0),
+        "s3://bucket/table/a%23b/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
+    );
+    assert_eq!(
+        relative_path.value(0),
+        "a%23b/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
+    );
+
+    let inline = DeletionVectorDescriptor::try_new(
+        DeletionVectorStorageType::Inline,
+        "inline-bytes",
+        None,
+        12,
+        1,
+    )
+    .unwrap();
+    let expression = Expr::unary(
+        UnaryExpressionOp::DeletionVectorPath,
+        Expr::struct_from([lit("s3://bucket/table/"), lit(Scalar::from(inline))]),
+    );
+    let result = evaluate_expression(&expression, &batch, Some(&output_type))
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap()
+        .clone();
+    let absolute_path = result
+        .column_by_name("absolute_path")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert!(absolute_path.is_null(0));
+}
+
+#[test]
+fn deletion_vector_path_rejects_malformed_descriptors() {
+    use crate::actions::deletion_vector::DeletionVectorDescriptor;
+    use crate::schema::ToSchema as _;
+
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "ignored",
+            DataType::Boolean,
+            true,
+        )])),
+        vec![Arc::new(BooleanArray::from(vec![true]))],
+    )
+    .unwrap();
+    let output_type = KernelDataType::from(schema! {
+        nullable "absolute_path": STRING,
+        nullable "relative_path": STRING,
+    });
+    let descriptor = Scalar::Struct(
+        StructData::try_new(
+            DeletionVectorDescriptor::to_schema()
+                .fields()
+                .cloned()
+                .collect(),
+            vec![
+                "invalid".into(),
+                "path".into(),
+                Scalar::null(KernelDataType::INTEGER),
+                4.into(),
+                1i64.into(),
+            ],
+        )
+        .unwrap(),
+    );
+    let expression = Expr::unary(
+        UnaryExpressionOp::DeletionVectorPath,
+        Expr::struct_from([lit("s3://bucket/table/"), lit(descriptor)]),
+    );
+    assert!(evaluate_expression(&expression, &batch, Some(&output_type)).is_err());
+}
+
 #[cfg(feature = "geo-type-in-dev")]
 #[rstest]
 #[case(geometry_type("EPSG:4326"))]

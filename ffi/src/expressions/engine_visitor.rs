@@ -673,20 +673,26 @@ fn visit_expression_impl(
             visit_expression_struct_patch(visitor, patch, sibling_list_id)
         }
         Expression::Predicate(pred) => visit_predicate_impl(visitor, pred, sibling_list_id),
-        Expression::Unary(UnaryExpression { op, expr }) => {
-            let child_list_id = call!(visitor, make_field_list, 1);
-            visit_expression_impl(visitor, expr, child_list_id);
-            match op {
-                UnaryExpressionOp::ToJson {
-                    full_precision_timestamps,
-                } => (visitor.visit_to_json)(
+        Expression::Unary(UnaryExpression { op, expr }) => match op {
+            UnaryExpressionOp::ToJson {
+                full_precision_timestamps,
+            } => {
+                let child_list_id = call!(visitor, make_field_list, 1);
+                visit_expression_impl(visitor, expr, child_list_id);
+                (visitor.visit_to_json)(
                     visitor.data,
                     sibling_list_id,
                     child_list_id,
                     *full_precision_timestamps,
-                ),
+                );
             }
-        }
+            UnaryExpressionOp::ResolveFilePath => {
+                visit_unknown(visitor, sibling_list_id, "resolve_file_path")
+            }
+            UnaryExpressionOp::DeletionVectorPath => {
+                visit_unknown(visitor, sibling_list_id, "deletion_vector_path")
+            }
+        },
         Expression::Binary(BinaryExpression { op, left, right }) => {
             let child_list_id = call!(visitor, make_field_list, 2);
             visit_expression_impl(visitor, left, child_list_id);

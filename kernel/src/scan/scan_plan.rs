@@ -28,6 +28,7 @@ use crate::checkpoint::CheckpointInfo;
 use crate::expressions::{ColumnName, Predicate, lit};
 #[cfg(test)]
 use crate::expressions::{Expression as Expr, expr};
+use crate::plans::PlanBuilder;
 use crate::plans::ir::plan::Plan;
 #[cfg(test)]
 use crate::schema::{
@@ -81,6 +82,32 @@ impl<'a> MetadataPlanner<'a> {
 }
 
 impl Scan {
+    /// Build the live-add metadata relation for composition into another kernel plan.
+    ///
+    /// This internal path is used by snapshot-level operations that need to combine the current
+    /// live adds with additional action-derived relations.
+    #[tracing::instrument(
+        name = "scan.declarative_metadata_scan_plan_builder",
+        skip_all,
+        fields(enable_call_frame),
+        err
+    )]
+    pub(crate) fn declarative_metadata_scan_plan_builder(
+        &self,
+        engine: &dyn crate::Engine,
+    ) -> KernelResult<Option<PlanBuilder>> {
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        self.require_no_checkpoint_action(engine, "declarative_metadata_scan_plan_builder")?;
+
+        if self.state_info.physical_predicate == PhysicalPredicate::StaticSkipAll {
+            return Ok(None);
+        }
+
+        let planner = MetadataPlanner::try_from_scan(self)?;
+        let base = MetadataReplayBase::try_new(&self.snapshot, engine)?;
+        self.build_metadata_scan_plan_builder_with(base, planner)
+    }
+
     /// Build the live-add metadata plan from checkpoint and commit actions.
     ///
     /// Returns `None` for an empty result.
@@ -93,8 +120,26 @@ impl Scan {
     pub(super) fn build_metadata_scan_plan_with(
         &self,
         base: MetadataReplayBase,
-        mut planner: MetadataPlanner<'_>,
+        planner: MetadataPlanner<'_>,
     ) -> KernelResult<Option<Plan>> {
+        let Some(builder) = self.build_metadata_scan_plan_builder_with(base, planner)? else {
+            return Ok(None);
+        };
+        builder.build_opt()
+    }
+
+    /// Builds the live-add metadata plan as a composable builder for another plan.
+    #[tracing::instrument(
+        name = "scan_plan.build_metadata_scan_plan_builder",
+        skip_all,
+        fields(enable_call_frame),
+        err
+    )]
+    pub(super) fn build_metadata_scan_plan_builder_with(
+        &self,
+        base: MetadataReplayBase,
+        mut planner: MetadataPlanner<'_>,
+    ) -> KernelResult<Option<PlanBuilder>> {
         let state = &self.state_info;
         if state.physical_predicate == PhysicalPredicate::StaticSkipAll {
             return Ok(None);
@@ -110,10 +155,11 @@ impl Scan {
         }?;
         // Keep commit removes through replay so they cancel older adds before selecting live files.
         let commits = planner.commit_actions(base_version)?;
-        planner
-            .replay_actions(commits, checkpoint)?
-            .project_patch(|patch| patch.drop(VERSION))?
-            .build_opt()
+        Ok(Some(
+            planner
+                .replay_actions(commits, checkpoint)?
+                .project_patch(|patch| patch.drop(VERSION))?,
+        ))
     }
 
     #[cfg(test)]

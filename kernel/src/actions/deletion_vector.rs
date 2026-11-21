@@ -14,7 +14,7 @@ use url::Url;
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::amt_path_util::{resolve_table_relative, validate_table_relative};
-use crate::path_encoding::uri_decode_path;
+use crate::path_encoding::{uri_decode_path, uri_encode_path};
 use crate::schema::DataType;
 use crate::snapshot::Snapshot;
 use crate::utils::require;
@@ -139,8 +139,10 @@ impl DeletionVectorPath {
     /// Returns the absolute path to the deletion vector file.
     pub fn absolute_path(&self) -> KernelResult<Url> {
         let dv_suffix = Self::relative_path(&self.prefix, &self.uuid);
+        // The prefix is raw path text; escape URI-reserved bytes before joining.
+        let encoded_dv_suffix = uri_encode_path(&dv_suffix);
         self.table_path
-            .join(&dv_suffix)
+            .join(encoded_dv_suffix.as_ref())
             .map_err(|_| KernelError::DeletionVector(format!("invalid path: {dv_suffix}")))
     }
 
@@ -501,7 +503,9 @@ impl DeletionVectorDescriptor {
         match self.storage_type {
             DeletionVectorStorageType::PersistedRelative => {
                 let dv_suffix = self.relative_path()?;
-                let dv_path = parent.join(&dv_suffix).map_err(|_| {
+                // Keep URI-reserved bytes in the path component when the prefix is joined.
+                let encoded_dv_suffix = uri_encode_path(&dv_suffix);
+                let dv_path = parent.join(encoded_dv_suffix.as_ref()).map_err(|_| {
                     KernelError::DeletionVector(format!("invalid path: {dv_suffix}"))
                 })?;
                 Ok(Some(dv_path))
@@ -1056,6 +1060,36 @@ mod tests {
             .unwrap();
         let example = dv_example();
         assert_eq!(dv_url, example.absolute_path(&parent).unwrap().unwrap());
+    }
+
+    #[rstest::rstest]
+    #[case::space("p=a b", "p=a%20b")]
+    #[case::percent("p=a%b", "p=a%25b")]
+    #[case::hash("p=a#b", "p=a%23b")]
+    #[case::question("p=a?b", "p=a%3Fb")]
+    fn persisted_relative_prefix_is_uri_encoded(
+        #[case] prefix: &str,
+        #[case] encoded_prefix: &str,
+    ) {
+        let parent = Url::parse("s3://mytable/").unwrap();
+        let mut path_or_inline_dv = prefix.to_owned();
+        path_or_inline_dv.push_str("^-aqEH.-t@S}K{vb[*k^");
+        let descriptor = DeletionVectorDescriptor::try_new(
+            DeletionVectorStorageType::PersistedRelative,
+            path_or_inline_dv,
+            Some(0),
+            4,
+            1,
+        )
+        .unwrap();
+        let expected = Url::parse(&format!(
+            "s3://mytable/{encoded_prefix}/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
+        ))
+        .unwrap();
+        assert_eq!(
+            expected,
+            descriptor.absolute_path(&parent).unwrap().unwrap()
+        );
     }
 
     // An unencoded-relative path is percent-encoded (preserving `/`) when resolved, so reserved
@@ -1773,6 +1807,22 @@ mod tests {
         let expected =
             "file:///tmp/test_table/dv/deletion_vector_abcdef01-2345-6789-abcd-ef0123456789.bin";
         assert_eq!(abs_path.as_str(), expected);
+    }
+
+    #[test]
+    fn test_deletion_vector_path_absolute_path_encodes_reserved_prefix() {
+        let table_path = Url::parse("s3://mytable/").unwrap();
+        let prefix = "p=a#b%20 c?".to_owned();
+        let known_uuid = uuid::Uuid::parse_str("abcdef01-2345-6789-abcd-ef0123456789").unwrap();
+        let dv_path = DeletionVectorPath::new_with_uuid(table_path, prefix, known_uuid);
+
+        assert_eq!(
+            dv_path.absolute_path().unwrap().as_str(),
+            concat!(
+                "s3://mytable/p=a%23b%2520%20c%3F/",
+                "deletion_vector_abcdef01-2345-6789-abcd-ef0123456789.bin"
+            )
+        );
     }
 
     #[test]
