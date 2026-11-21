@@ -105,11 +105,8 @@ pub(crate) fn assign_clustering_provider_field_id(
     }))
 }
 
-/// Assigns the `clusteringProvider` ID for an update transaction on `read_snapshot`'s table.
-///
-/// Returns the table configuration with `delta.columnMapping.maxColumnId` raised to the new ID,
-/// and the `delta.adaptiveMetadata` domain to commit. The domain is `None` when no ID is
-/// assigned, and the configuration is returned unchanged.
+/// Assigns the `clusteringProvider` ID for an update transaction on `read_snapshot`'s table,
+/// unless the transaction is a blind append.
 pub(crate) fn assign_for_update(
     table_config: TableConfiguration,
     read_snapshot: &Snapshot,
@@ -119,11 +116,29 @@ pub(crate) fn assign_for_update(
     if is_blind_append {
         return Ok((table_config, None));
     }
-    let assignment = assign_clustering_provider_field_id(&table_config, || {
+    assign_and_raise_max_column_id(table_config, || {
         read_snapshot
             .reader()
             .get_domain_metadata_internal(ADAPTIVE_METADATA_DOMAIN_NAME, engine)
-    })?;
+    })
+}
+
+/// Assigns the `clusteringProvider` ID for a table being created. The new table has no domain
+/// yet, so the mapping is never read.
+pub(crate) fn assign_for_create(
+    table_config: TableConfiguration,
+) -> Result<(TableConfiguration, Option<DomainMetadata>)> {
+    assign_and_raise_max_column_id(table_config, || Ok(None))
+}
+
+/// Raises `delta.columnMapping.maxColumnId` to the new ID and returns the domain to commit with
+/// it. The counter and the mapping change in one commit, so a later writer cannot pick the same
+/// ID. When no ID is assigned, the configuration is returned unchanged with a `None` domain.
+fn assign_and_raise_max_column_id(
+    table_config: TableConfiguration,
+    current_domain: impl FnOnce() -> KernelResult<Option<String>>,
+) -> Result<(TableConfiguration, Option<DomainMetadata>)> {
+    let assignment = assign_clustering_provider_field_id(&table_config, current_domain)?;
     let Some(ClusteringProviderFieldId { id, domain }) = assignment else {
         return Ok((table_config, None));
     };

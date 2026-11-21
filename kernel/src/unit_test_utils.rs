@@ -725,7 +725,8 @@ pub(crate) mod adaptive_metadata_fixtures {
 
     /// Commits the protocol and metadata of an adaptiveMetadata table partitioned by
     /// `partition_columns` as version 0 of the table at `table_root`. They are written directly
-    /// because `create_table` cannot enable `adaptiveMetadata-preview`.
+    /// rather than through `create_table`, so the fixture controls the schema and the In-Commit
+    /// Timestamp of the commit.
     pub(crate) fn create_adaptive_metadata_table(
         engine: &SyncEngine,
         table_root: &Url,
