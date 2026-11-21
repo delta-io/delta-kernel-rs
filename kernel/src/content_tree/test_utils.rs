@@ -200,6 +200,20 @@ fn write_batch(engine: &dyn Engine, location: Url, data: Box<dyn EngineData>) ->
     }
 }
 
+/// The non-null `<action>.path` leaf values of `batch`, as replay reads them, or none if it lacks
+/// the action column.
+pub(crate) fn action_paths(batch: &RecordBatch, action: &str) -> Vec<String> {
+    let Some(column) = batch.column_by_name(action) else {
+        return vec![];
+    };
+    let paths = column
+        .as_struct()
+        .column_by_name("path")
+        .unwrap()
+        .as_string::<i32>();
+    paths.iter().flatten().map(str::to_string).collect()
+}
+
 mod tests {
     use std::slice;
 
@@ -341,18 +355,4 @@ mod tests {
         let stats = batch.column_by_name(CONTENT_STATS_FIELD_NAME).unwrap();
         assert_eq!(stats.null_count(), batch.num_rows());
     }
-}
-
-/// The non-null `<action>.path` leaf values of `batch`, as replay reads them, or none if it lacks
-/// the action column.
-pub(crate) fn action_paths(batch: &RecordBatch, action: &str) -> Vec<String> {
-    let Some(column) = batch.column_by_name(action) else {
-        return vec![];
-    };
-    let paths = column
-        .as_struct()
-        .column_by_name("path")
-        .unwrap()
-        .as_string::<i32>();
-    paths.iter().flatten().map(str::to_string).collect()
 }

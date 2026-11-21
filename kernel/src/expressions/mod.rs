@@ -1,9 +1,14 @@
 //! Definitions and functions to create and manipulate kernel expressions
 
 use std::collections::HashSet;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use std::fmt::Debug;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use bytes::Bytes;
+use delta_kernel_derive::internal_api;
 use derive_more::From;
 use itertools::Itertools;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser};
@@ -20,6 +25,8 @@ pub(crate) use self::scalars::MONTHS_PER_YEAR;
 pub use self::scalars::{
     ArrayData, DecimalData, IntervalDayTimeData, IntervalYearMonthData, MapData, Scalar, StructData,
 };
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::content_tree::mumbling::MumblingBitmap;
 use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator,
@@ -468,14 +475,60 @@ pub struct ParseJsonExpression {
     pub output_schema: SchemaRef,
 }
 
-/// An expression that casts a child expression to a target type, following SQL `CAST` semantics: a
-/// value that cannot be represented in the target type evaluates to NULL rather than erroring.
+/// An expression that casts a child expression to a target type.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CastExpression {
     /// The expression whose value is cast.
     pub expr: Box<Expression>,
     /// The type the value is cast to.
     pub target: DataType,
+    /// How the cast behaves; see [`CastOptions`].
+    // Omitted when default so readers without `options` still accept safe casts.
+    #[serde(default, skip_serializing_if = "CastOptions::is_default")]
+    pub options: CastOptions,
+}
+
+/// Options that control how a [`CastExpression`] casts its input.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CastOptions {
+    #[serde(default, skip_serializing_if = "CastMode::is_safe")]
+    mode: CastMode,
+}
+
+/// How a [`CastExpression`] handles a value that cannot be represented in the target type, such as
+/// an integer that overflows or a string that does not parse.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CastMode {
+    /// The value becomes NULL, like SQL `TRY_CAST`.
+    #[default]
+    Safe,
+    /// Evaluation fails, like ANSI SQL `CAST`. A type pair the evaluator cannot cast also fails.
+    /// Nested and dictionary-encoded inputs are checked value by value as stored, so a value under
+    /// a NULL struct or list entry, outside an array slice, or unreferenced in a dictionary can
+    /// also fail the cast.
+    Strict,
+}
+
+/// A predicate that is TRUE when a serialized Iceberg Mumbling bitmap contains `value`, a LONG.
+///
+/// The bitmap (for example an adaptiveMetadata manifest deletion vector) is parsed when the
+/// predicate is built. The predicate is NULL when `value` is NULL, and FALSE for a `value` outside
+/// 0 to 2,097,151, the values a Mumbling bitmap can hold.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MumblingBitmapContainsPredicate {
+    bitmap: ParsedMumblingBitmap,
+    value: Box<Expression>,
+}
+
+/// A serialized Mumbling bitmap and its parse. Serializes as its bytes and parses them again on
+/// deserialization.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(try_from = "Vec<u8>", into = "Vec<u8>")]
+struct ParsedMumblingBitmap {
+    bytes: Bytes,
+    parsed: Arc<MumblingBitmap>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -662,6 +715,10 @@ pub enum Predicate {
     Binary(BinaryPredicate),
     /// A junction operation (AND/OR).
     Junction(JunctionPredicate),
+    /// Whether a serialized Mumbling bitmap contains a value. See
+    /// [`MumblingBitmapContainsPredicate`].
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    MumblingBitmapContains(MumblingBitmapContainsPredicate),
     /// A predicate that the engine defines and implements. Kernel interacts with the predicate
     /// only through methods provided by the [`OpaquePredicateOp`] trait.
     #[serde(serialize_with = "fail_serialize_opaque_predicate")]
@@ -899,13 +956,132 @@ impl MapToStructExpression {
 }
 
 impl CastExpression {
-    pub(crate) fn new(expr: impl Into<Expression>, target: DataType) -> Self {
+    pub(crate) fn new(expr: impl Into<Expression>, target: DataType, mode: CastMode) -> Self {
         Self {
             expr: Box::new(expr.into()),
             target,
+            options: CastOptions::default().with_mode(mode),
+        }
+    }
+
+    /// The name a cast is lowered to where a boundary has no cast node and must pass it as
+    /// [`Expression::Unknown`].
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn unknown_name(&self) -> String {
+        let prefix = match self.options.mode() {
+            CastMode::Safe => "cast_to",
+            CastMode::Strict => "strict_cast_to",
+        };
+        format!("{prefix}_{}", self.target)
+    }
+}
+
+impl CastOptions {
+    /// Sets how the cast handles a value it cannot represent.
+    pub fn with_mode(mut self, mode: CastMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Returns how the cast handles a value it cannot represent.
+    pub fn mode(&self) -> CastMode {
+        self.mode
+    }
+
+    /// Returns whether no cast options are configured.
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+impl CastMode {
+    fn is_safe(&self) -> bool {
+        *self == CastMode::Safe
+    }
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl MumblingBitmapContainsPredicate {
+    pub(crate) fn try_new(
+        bitmap: impl Into<Bytes>,
+        value: impl Into<Expression>,
+    ) -> KernelResult<Self> {
+        Ok(Self {
+            bitmap: ParsedMumblingBitmap::try_new(bitmap.into())?,
+            value: Box::new(value.into()),
+        })
+    }
+
+    /// The parsed bitmap.
+    pub(crate) fn bitmap(&self) -> &MumblingBitmap {
+        &self.bitmap.parsed
+    }
+
+    /// The value to look up.
+    pub(crate) fn value(&self) -> &Expression {
+        &self.value
+    }
+
+    /// This lookup with `value` replaced, keeping the parsed bitmap.
+    pub(crate) fn with_value(&self, value: impl Into<Expression>) -> Self {
+        Self {
+            bitmap: self.bitmap.clone(),
+            value: Box::new(value.into()),
         }
     }
 }
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl ParsedMumblingBitmap {
+    fn try_new(bytes: Bytes) -> KernelResult<Self> {
+        let parsed = MumblingBitmap::deserialize(bytes.clone()).map_err(|e| {
+            KernelError::invalid_expression(format!(
+                "MUMBLING_BITMAP_CONTAINS bitmap does not parse: {e}"
+            ))
+        })?;
+        Ok(Self {
+            bytes,
+            parsed: Arc::new(parsed),
+        })
+    }
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl TryFrom<Vec<u8>> for ParsedMumblingBitmap {
+    type Error = KernelError;
+
+    fn try_from(bytes: Vec<u8>) -> KernelResult<Self> {
+        Self::try_new(bytes.into())
+    }
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl From<ParsedMumblingBitmap> for Vec<u8> {
+    fn from(bitmap: ParsedMumblingBitmap) -> Self {
+        bitmap.bytes.to_vec()
+    }
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl PartialEq for ParsedMumblingBitmap {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl Debug for ParsedMumblingBitmap {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MumblingBitmap({} bytes)", self.bytes.len())
+    }
+}
+
+/// The name a [`Predicate::MumblingBitmapContains`] is lowered to where a boundary has no node for
+/// it and must pass it as [`Predicate::Unknown`].
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[internal_api]
+pub(crate) const MUMBLING_BITMAP_CONTAINS_NAME: &str = "mumbling_bitmap_contains";
 
 impl JunctionPredicate {
     pub(crate) fn new(op: JunctionPredicateOp, preds: Vec<Predicate>) -> Self {
@@ -1106,10 +1282,16 @@ impl Expression {
         Self::MapToStruct(MapToStructExpression::new(map_expr, options))
     }
 
-    /// Creates a new cast of `expr` to `target`, following SQL `CAST` semantics (unrepresentable
-    /// values become NULL). See [`CastExpression`].
+    /// Creates a new cast of `expr` to `target` in which unrepresentable values become NULL. See
+    /// [`CastMode::Safe`].
     pub fn cast(expr: impl Into<Expression>, target: DataType) -> Self {
-        Self::Cast(CastExpression::new(expr, target))
+        Self::Cast(CastExpression::new(expr, target, CastMode::Safe))
+    }
+
+    /// Creates a new cast of `expr` to `target` that fails evaluation on an unrepresentable value.
+    /// See [`CastMode::Strict`].
+    pub fn cast_strict(expr: impl Into<Expression>, target: DataType) -> Self {
+        Self::Cast(CastExpression::new(expr, target, CastMode::Strict))
     }
 }
 
@@ -1202,6 +1384,19 @@ impl Predicate {
     /// Create a new predicate `DISTINCT(self, other)`
     pub fn distinct(a: impl Into<Expression>, b: impl Into<Expression>) -> Self {
         Self::binary(BinaryPredicateOp::Distinct, a, b)
+    }
+
+    /// Creates a predicate that is TRUE when the serialized Mumbling bitmap `bitmap` contains
+    /// `value`, failing if `bitmap` does not parse. See [`MumblingBitmapContainsPredicate`].
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn try_mumbling_bitmap_contains(
+        bitmap: impl Into<Bytes>,
+        value: impl Into<Expression>,
+    ) -> KernelResult<Self> {
+        let lookup = MumblingBitmapContainsPredicate::try_new(bitmap, value)?;
+        Ok(Self::MumblingBitmapContains(lookup))
     }
 
     /// Create a new predicate `self AND other`
@@ -1427,7 +1622,10 @@ impl Display for Expression {
                 }
                 None => write!(f, "MAP_TO_STRUCT({})", m.map_expr),
             },
-            Cast(c) => write!(f, "CAST({} AS {})", c.expr, c.target),
+            Cast(c) => match c.options.mode() {
+                CastMode::Safe => write!(f, "CAST({} AS {})", c.expr, c.target),
+                CastMode::Strict => write!(f, "STRICT_CAST({} AS {})", c.expr, c.target),
+            },
         }
     }
 }
@@ -1454,6 +1652,11 @@ impl Display for Predicate {
                     JunctionPredicateOp::Or => "OR",
                 };
                 write!(f, "{op}({})", format_child_list(preds))
+            }
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            MumblingBitmapContains(MumblingBitmapContainsPredicate { bitmap, value }) => {
+                let len = bitmap.bytes.len();
+                write!(f, "MUMBLING_BITMAP_CONTAINS(<{len} bytes>, {value})")
             }
             Opaque(OpaquePredicate { op, exprs }) => {
                 write!(f, "{op:?}({})", format_child_list(exprs))
@@ -1576,6 +1779,10 @@ mod tests {
                 "URI_ENCODE_FILE_LOCATION(Column(x))",
             ),
             (
+                Expr::cast_strict(col!("x"), DataType::INTEGER),
+                "STRICT_CAST(Column(x) AS integer)",
+            ),
+            (
                 Expr::case_when([(col!("x").is_null(), lit(0))], col!("x")),
                 "CASE WHEN Column(x) IS NULL THEN 0 ELSE Column(x) END",
             ),
@@ -1672,6 +1879,8 @@ mod tests {
         use std::sync::Arc;
 
         use super::assert_roundtrip;
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        use crate::content_tree::mumbling::tests::encode_positions;
         use crate::expressions::scalars::{ArrayData, DecimalData, MapData, StructData};
         use crate::expressions::{
             BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression,
@@ -1811,6 +2020,36 @@ mod tests {
             }
         }
 
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        #[test]
+        fn test_mumbling_bitmap_contains_roundtrip_and_display() {
+            let bitmap = encode_positions(&[1]);
+            let pred =
+                Predicate::try_mumbling_bitmap_contains(bitmap.clone(), col!("value")).unwrap();
+            assert_roundtrip(&pred);
+            assert_eq!(
+                pred.to_string(),
+                format!(
+                    "MUMBLING_BITMAP_CONTAINS(<{} bytes>, Column(value))",
+                    bitmap.len()
+                )
+            );
+        }
+
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        #[test]
+        fn test_mumbling_bitmap_contains_rejects_unparseable_bitmap() {
+            assert_result_error_with_message(
+                Predicate::try_mumbling_bitmap_contains(vec![1, 2, 3], col!("value")),
+                "Invalid expression evaluation: MUMBLING_BITMAP_CONTAINS bitmap does not parse",
+            );
+            let pred = Predicate::try_mumbling_bitmap_contains(encode_positions(&[1]), col!("v"));
+            let mut json = serde_json::to_value(pred.unwrap()).unwrap();
+            json["MumblingBitmapContains"]["bitmap"] = serde_json::json!([1, 2, 3]);
+            let err = serde_json::from_value::<Predicate>(json).unwrap_err();
+            assert!(err.to_string().contains("bitmap does not parse"), "{err}");
+        }
+
         #[test]
         fn test_variadic_expression_roundtrip() {
             let expr = expr!(coalesce(col("a"), col("b"), "default"));
@@ -1824,8 +2063,16 @@ mod tests {
             Expression::cast(col!("part"), DataType::STRING),
             DataType::INTEGER,
         ))]
+        #[case::strict(Expression::cast_strict(col!("n"), DataType::INTEGER))]
         fn test_cast_expression_roundtrip(#[case] expr: Expression) {
             assert_roundtrip(&expr);
+        }
+
+        #[test]
+        fn test_safe_cast_serializes_without_options() {
+            let json =
+                serde_json::to_value(Expression::cast(col!("n"), DataType::INTEGER)).unwrap();
+            assert_eq!(json["Cast"].get("options"), None);
         }
 
         #[rstest::rstest]

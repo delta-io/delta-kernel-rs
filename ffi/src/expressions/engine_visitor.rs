@@ -2,6 +2,8 @@
 //! [`Expression`] or [`Predicate`] to an engine's native expression format.
 use std::ffi::c_void;
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use delta_kernel::expressions::MUMBLING_BITMAP_CONTAINS_NAME;
 use delta_kernel::expressions::{
     ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
     CaseWhenExpression, ColumnName, Expression, ExpressionRef, ExpressionStructPatch,
@@ -777,11 +779,7 @@ fn visit_expression_impl(
             );
         }
         // TODO(#2975): Add a dedicated visitor callback for cast expressions.
-        Expression::Cast(cast) => visit_unknown(
-            visitor,
-            sibling_list_id,
-            &format!("cast_to_{}", cast.target),
-        ),
+        Expression::Cast(cast) => visit_unknown(visitor, sibling_list_id, &cast.unknown_name()),
         Expression::Unknown(name) => visit_unknown(visitor, sibling_list_id, name),
     }
 }
@@ -826,6 +824,10 @@ fn visit_predicate_impl(
         Predicate::Opaque(OpaquePredicate { op, exprs }) => {
             visit_predicate_opaque(visitor, op, exprs, sibling_list_id)
         }
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        Predicate::MumblingBitmapContains(_) => {
+            visit_unknown(visitor, sibling_list_id, MUMBLING_BITMAP_CONTAINS_NAME)
+        }
         Predicate::Unknown(name) => visit_unknown(visitor, sibling_list_id, name),
     }
 }
@@ -847,6 +849,8 @@ fn visit_predicate_internal(predicate: &Predicate, visitor: &mut EngineExpressio
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use delta_kernel::expressions::col;
     use delta_kernel::expressions::{Expression, MapToStructOptions, Scalar, lit};
     use delta_kernel::schema::{IntervalDayToSecondType, IntervalYearToMonthType};
     use rstest::rstest;
@@ -1049,6 +1053,24 @@ mod tests {
             visit_unknown: visit_unknown_name,
             visit_case_when: ignore_case_when,
         }
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn visit_predicate_lowers_mumbling_bitmap_contains_to_unknown() {
+        let mut builder = TestExpressionBuilder::default();
+        let mut visitor = test_visitor(&mut builder);
+        // A serialized empty bitmap is just its header: version 1, no set bits, no containers.
+        let empty_bitmap = vec![1, 0, 0, 0, 0, 0];
+        let pred = Predicate::try_mumbling_bitmap_contains(empty_bitmap, col!("pos")).unwrap();
+        visit_predicate_internal(&pred, &mut visitor);
+        assert_eq!(
+            builder.events,
+            vec![LiteralEvent::Unknown {
+                sibling_list_id: 0,
+                name: MUMBLING_BITMAP_CONTAINS_NAME.to_string(),
+            }]
+        );
     }
 
     #[test]
