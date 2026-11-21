@@ -755,8 +755,8 @@ async fn offset_less_timestamp_partition_read_with_json_and_checkpoint(
     );
 }
 
-#[allow(clippy::too_many_arguments)]
 #[apply(checkpoint_modes)]
+#[allow(clippy::too_many_arguments)]
 #[case::utc_before(
     Predicate::from_expr(expr!(
         col("p_ts") < lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))
