@@ -17,7 +17,7 @@ use crate::schema::{
     ArrayType, ColumnMetadataKey, ColumnName, DataType, ExistingColumnMappingAnnotations,
     MakePhysical, MapType, MetadataValue, Schema, StructField, StructType,
 };
-use crate::table_properties::{COLUMN_MAPPING_MODE, TableProperties};
+use crate::table_properties::{COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, TableProperties};
 use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::{KernelError, KernelResult};
 
@@ -789,6 +789,32 @@ pub(crate) fn find_max_column_id_in_schema(schema: &StructType) -> Option<i64> {
     let mut visitor = MaxColumnId(None);
     visitor.transform_struct(schema);
     visitor.0
+}
+
+/// Returns the largest column mapping id to seed new id assignment from, given the persisted
+/// `delta.columnMapping.maxColumnId`. With column mapping enabled, a stale persisted value is
+/// raised to the schema's largest id, so a new id never reuses one already in the schema.
+/// A persisted value outside the 32-bit column mapping id range is an error in every mode.
+pub(crate) fn effective_max_column_id(
+    schema: &StructType,
+    column_mapping_mode: ColumnMappingMode,
+    persisted_max_column_id: Option<i64>,
+) -> KernelResult<Option<i64>> {
+    let Some(persisted) = persisted_max_column_id else {
+        return Ok(None);
+    };
+    // An out-of-range value means a non-conforming writer set the property. Reject it here,
+    // naming the property, rather than let id assignment fail later with a less clear error.
+    validate_column_mapping_id(persisted).map_err(|e| {
+        KernelError::invalid_protocol(format!(
+            "Table property `{COLUMN_MAPPING_MAX_COLUMN_ID}`: {e}"
+        ))
+    })?;
+    if column_mapping_mode == ColumnMappingMode::None {
+        return Ok(Some(persisted));
+    }
+    let schema_max = find_max_column_id_in_schema(schema).unwrap_or(0);
+    Ok(Some(persisted.max(schema_max)))
 }
 
 /// Visitor that walks a schema and records the largest column mapping id seen on any field,
@@ -2832,5 +2858,34 @@ mod tests {
         );
         let schema = schema! { (field) };
         assert_eq!(find_max_column_id_in_schema(&schema), Some(99));
+    }
+
+    // === effective_max_column_id tests ===
+
+    #[rstest::rstest]
+    #[case::persisted_matches_schema(ColumnMappingMode::Name, 5, Some(5), Some(5))]
+    #[case::stale_persisted_raised_to_schema(ColumnMappingMode::Name, 5, Some(3), Some(5))]
+    #[case::persisted_kept_without_column_mapping(ColumnMappingMode::None, 5, Some(3), Some(3))]
+    #[case::persisted_above_schema_kept(ColumnMappingMode::Name, 5, Some(7), Some(7))]
+    #[case::absent_property_stays_absent(ColumnMappingMode::Name, 5, None, None)]
+    fn effective_max_column_id_seeds_from_persisted_and_schema(
+        #[case] mode: ColumnMappingMode,
+        #[case] schema_max_id: i64,
+        #[case] persisted: Option<i64>,
+        #[case] expected: Option<i64>,
+    ) {
+        let schema = schema! { (field_with_id("a", DataType::STRING, schema_max_id)) };
+        let result = effective_max_column_id(&schema, mode, persisted);
+        assert_eq!(result.unwrap(), expected);
+    }
+
+    #[rstest::rstest]
+    #[case::above_32_bit_max(i32::MAX as i64 + 1)]
+    #[case::i64_max(i64::MAX)]
+    #[case::negative(-1)]
+    fn effective_max_column_id_rejects_out_of_range_persisted(#[case] persisted: i64) {
+        let schema = schema! { nullable "a": STRING };
+        let result = effective_max_column_id(&schema, ColumnMappingMode::Name, Some(persisted));
+        assert_result_error_with_message(result, &format!("Invalid column mapping id {persisted}"));
     }
 }

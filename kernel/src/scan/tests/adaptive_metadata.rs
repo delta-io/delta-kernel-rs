@@ -10,11 +10,13 @@ use serde_json::json;
 use url::Url;
 
 use super::get_files_for_scan;
+use crate::actions::{CheckpointAction, DomainMetadata, Sidecar};
 use crate::arrow::array::{AsArray as _, StringArray};
 use crate::arrow::datatypes::Int64Type;
 use crate::content_tree::test_utils::{
-    added_data_entry, data_manifest_entry, write_manifest, write_manifest_with_stats, x_full_stats,
-    x_stats,
+    CLUSTERING_FIELD_ID, added_data_entry, clustering_mapping_domain, clustering_only_stats_at,
+    clustering_only_stats_value_at, data_manifest_entry, write_manifest, write_manifest_with_stats,
+    x_full_stats, x_stats,
 };
 use crate::content_tree::{ContentTreeNodeEntry, TrackingInfo, TrackingStatus};
 use crate::engine::arrow_data::EngineDataArrowExt as _;
@@ -25,10 +27,11 @@ use crate::schema::{SchemaRef, StructType, schema_ref};
 use crate::table_features::ColumnMappingMode;
 use crate::transaction::BASE_ADD_FILES_SCHEMA;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
-    checkpoint_action_with_root, commit_file_changes, commit_files, commit_root_manifest,
-    commit_root_manifest_file, create_adaptive_metadata_table, protocol_and_metadata_lines,
-    setup_adaptive_metadata_table, write_commit_after_manifest_commit,
-    write_manifest_commit_keeping_pm,
+    CLUSTERED_AMT_FEATURES, checkpoint_action_with_root, clustering_provider_field_id,
+    commit_file_changes, commit_files, commit_root_manifest, commit_root_manifest_file,
+    commit_update, create_adaptive_metadata_table, domain, protocol_and_metadata_lines,
+    setup_adaptive_metadata_table, setup_clustered_table, write_amt_last_checkpoint_hint,
+    write_commit_after_manifest_commit, write_manifest_commit_keeping_pm,
 };
 use crate::unit_test_utils::{
     assert_result_error_with_message, parse_json_batch, string_array_to_engine_data,
@@ -482,4 +485,246 @@ fn scan_execute_reads_files_whose_locations_need_encoding() {
         rows,
         vec![(1, "first".to_string()), (2, "second".to_string())]
     );
+}
+
+/// The `clusteringProvider` value the tests record in tree entries.
+const LIQUID: &str = "liquid";
+
+/// Writes a root manifest at `root_path` holding `entries`, each with its `clusteringProvider`
+/// (none for `None`) stored under `field_id`.
+fn write_clustered_root(
+    engine: &SyncEngine,
+    root_path: &str,
+    entries: Vec<(ContentTreeNodeEntry, Option<&str>)>,
+    field_id: i32,
+) -> FileMeta {
+    let content_stats = clustering_only_stats_at(field_id);
+    let stats = entries
+        .iter()
+        .map(|(_, clustering)| match clustering {
+            Some(value) => clustering_only_stats_value_at(field_id, Scalar::from(*value)),
+            None => Scalar::Null(content_stats.clone().into()),
+        })
+        .collect();
+    let entries: Vec<_> = entries.into_iter().map(|(entry, _)| entry).collect();
+    let location = table_root().join(root_path).unwrap();
+    write_manifest_with_stats(engine, location, &entries, &content_stats, stats)
+}
+
+/// A checkpoint action at `version` whose root manifest holds `entries`, recording each entry's
+/// `clusteringProvider` stats (none for `None`) and carrying `domains` inline.
+fn clustered_checkpoint(
+    engine: &SyncEngine,
+    root_path: &str,
+    entries: Vec<(ContentTreeNodeEntry, Option<&str>)>,
+    version: Version,
+    domains: Vec<DomainMetadata>,
+) -> CheckpointAction {
+    let root = write_clustered_root(engine, root_path, entries, CLUSTERING_FIELD_ID);
+    let mut checkpoint = checkpoint_action_with_root(root_path, root.size as i64, version).unwrap();
+    checkpoint.domain_metadata = domains;
+    checkpoint
+}
+
+/// Commits a [`clustered_checkpoint`] at `version`.
+fn commit_clustered_checkpoint(
+    engine: &SyncEngine,
+    root_path: &str,
+    entries: Vec<(ContentTreeNodeEntry, Option<&str>)>,
+    version: Version,
+    domains: Vec<DomainMetadata>,
+) {
+    let checkpoint = clustered_checkpoint(engine, root_path, entries, version, domains);
+    write_manifest_commit_keeping_pm(engine, &table_root(), version, checkpoint).unwrap();
+}
+
+/// Commits at `version` a schema that keeps `id` and drops `name`.
+fn commit_schema_dropping_name(engine: &SyncEngine, version: Version) {
+    let id = test_schema_flat_with_column_mapping()
+        .field("id")
+        .unwrap()
+        .clone();
+    let lines = protocol_and_metadata_lines(Arc::new(StructType::new_unchecked([id])), &[]);
+    let data = parse_json_batch(lines.lines().collect::<Vec<_>>().into());
+    write_commit_after_manifest_commit(engine, &table_root(), version, version - 1, data).unwrap();
+}
+
+/// Asserts the `(path, clusteringProvider)` of each file scanned at `version`, sorted by path.
+fn assert_scan_clustering(
+    engine: &SyncEngine,
+    version: Version,
+    expected: &[(&str, Option<&str>)],
+) {
+    let mut rows = vec![];
+    for scan_files in cached_scan_metadata(engine, snapshot_at(engine, version)) {
+        let batch = scan_files.try_into_record_batch().unwrap();
+        let paths = batch.column_by_name("path").unwrap().as_string::<i32>();
+        let fields = batch
+            .column_by_name("fileConstantValues")
+            .unwrap()
+            .as_struct();
+        let providers = fields
+            .column_by_name("clusteringProvider")
+            .unwrap()
+            .as_string::<i32>();
+        rows.extend(
+            paths
+                .iter()
+                .zip(providers.iter())
+                .map(|(path, provider)| (path.unwrap().to_string(), provider.map(str::to_string))),
+        );
+    }
+    rows.sort();
+    let expected: Vec<_> = expected
+        .iter()
+        .map(|(path, provider)| (path.to_string(), provider.map(str::to_string)))
+        .collect();
+    assert_eq!(rows, expected);
+}
+
+#[test]
+fn scan_reads_clustering_provider_stored_under_the_assigned_id() {
+    let (engine, _) = setup_clustered_table(&CLUSTERED_AMT_FEATURES, 2, None);
+    let snapshot = commit_update(&engine, &table_root(), |builder| builder).unwrap();
+    let assigned = clustering_provider_field_id(&engine, &snapshot)
+        .unwrap()
+        .unwrap();
+
+    let entries = vec![
+        (added_data_entry("a.parquet", 1, 1, 0, 0), Some(LIQUID)),
+        (added_data_entry("b.parquet", 1, 1, 1, 0), None),
+    ];
+    let root = write_clustered_root(&engine, "metadata/root-2.parquet", entries, assigned);
+    let version = commit_root_manifest_file(&engine, &table_root(), root);
+
+    assert_scan_clustering(
+        &engine,
+        version,
+        &[("a.parquet", Some(LIQUID)), ("b.parquet", None)],
+    );
+}
+
+#[rstest]
+fn scan_restores_clustering_provider_from_tree_stats(
+    #[values(true, false)] mapped: bool,
+    #[values(true, false)] change_schema: bool,
+) {
+    let (engine, _) = setup_adaptive_metadata_table();
+    let entries = vec![
+        (added_data_entry("a.parquet", 1, 1, 0, 0), Some(LIQUID)),
+        (added_data_entry("b.parquet", 1, 1, 1, 0), None),
+    ];
+    let domains = if mapped {
+        vec![clustering_mapping_domain(CLUSTERING_FIELD_ID)]
+    } else {
+        vec![]
+    };
+    commit_clustered_checkpoint(&engine, "metadata/root.parquet", entries, 1, domains);
+    // Changes the schema after the checkpoint, so the scan reads the tree without Delta stats.
+    let version = if change_schema {
+        commit_schema_dropping_name(&engine, 2);
+        2
+    } else {
+        1
+    };
+
+    let provider = mapped.then_some(LIQUID);
+    assert_scan_clustering(
+        &engine,
+        version,
+        &[("a.parquet", provider), ("b.parquet", None)],
+    );
+}
+
+#[test]
+fn scan_uses_the_mapping_of_the_checkpoint_at_each_version() {
+    let (engine, _) = setup_adaptive_metadata_table();
+    let entry = || (added_data_entry("a.parquet", 1, 1, 0, 0), Some(LIQUID));
+    commit_clustered_checkpoint(&engine, "metadata/root-1.parquet", vec![entry()], 1, vec![]);
+    let domains = vec![clustering_mapping_domain(CLUSTERING_FIELD_ID)];
+    commit_clustered_checkpoint(
+        &engine,
+        "metadata/root-2.parquet",
+        vec![entry()],
+        2,
+        domains,
+    );
+
+    assert_scan_clustering(&engine, 1, &[("a.parquet", None)]);
+    assert_scan_clustering(&engine, 2, &[("a.parquet", Some(LIQUID))]);
+}
+
+#[test]
+fn scan_with_malformed_adaptive_metadata_domain_names_it() {
+    let (engine, _) = setup_adaptive_metadata_table();
+    let entry = (added_data_entry("a.parquet", 1, 1, 0, 0), Some(LIQUID));
+    let domains = vec![domain("delta.adaptiveMetadata", "not json")];
+    commit_clustered_checkpoint(&engine, "metadata/root.parquet", vec![entry], 1, domains);
+
+    let scan = snapshot_at(&engine, 1).scan_builder().build().unwrap();
+    assert_result_error_with_message(
+        get_files_for_scan(scan, &engine),
+        "Invalid Checkpoint: delta.adaptiveMetadata configuration is not valid",
+    );
+}
+
+#[test]
+fn scan_restores_clustering_provider_from_json_commit_after_checkpoint() {
+    let (engine, _) = setup_adaptive_metadata_table();
+    let entries = vec![
+        (added_data_entry("a.parquet", 1, 1, 0, 0), Some(LIQUID)),
+        (added_data_entry("b.parquet", 1, 1, 1, 0), None),
+    ];
+    let domains = vec![clustering_mapping_domain(CLUSTERING_FIELD_ID)];
+    commit_clustered_checkpoint(&engine, "metadata/root.parquet", entries, 1, domains);
+    let add = json!({
+        "add": {
+            "path": "c.parquet",
+            "partitionValues": {},
+            "size": 1,
+            "modificationTime": 1,
+            "dataChange": true,
+            "clusteringProvider": LIQUID,
+        }
+    });
+    let data = parse_json_batch(vec![add.to_string()].into());
+    write_commit_after_manifest_commit(&engine, &table_root(), 2, 1, data).unwrap();
+
+    assert_scan_clustering(
+        &engine,
+        2,
+        &[
+            ("a.parquet", Some(LIQUID)),
+            ("b.parquet", None),
+            ("c.parquet", Some(LIQUID)),
+        ],
+    );
+}
+
+#[test]
+fn scan_restores_clustering_provider_from_last_checkpoint_hint() {
+    let (engine, _) = setup_adaptive_metadata_table();
+    let entries = vec![(added_data_entry("a.parquet", 1, 1, 0, 0), Some(LIQUID))];
+    let domains = vec![clustering_mapping_domain(CLUSTERING_FIELD_ID)];
+    let checkpoint = clustered_checkpoint(&engine, "metadata/root.parquet", entries, 1, domains);
+    // The hint requires the commit at its version, so the commit is written as well.
+    write_manifest_commit_keeping_pm(&engine, &table_root(), 1, checkpoint.clone()).unwrap();
+    write_amt_last_checkpoint_hint(&engine, &table_root(), 1, checkpoint).unwrap();
+
+    assert_scan_clustering(&engine, 1, &[("a.parquet", Some(LIQUID))]);
+}
+
+#[test]
+fn scan_reads_file_metadata_mapping_without_opening_domain_sidecars() {
+    let (engine, _) = setup_adaptive_metadata_table();
+    let entries = vec![(added_data_entry("a.parquet", 1, 1, 0, 0), Some(LIQUID))];
+    let domains = vec![clustering_mapping_domain(CLUSTERING_FIELD_ID)];
+    let mut checkpoint =
+        clustered_checkpoint(&engine, "metadata/root.parquet", entries, 1, domains);
+    // The scan must not open the sidecar: the mapping is inline.
+    checkpoint.domain_metadata_sidecars =
+        vec![Sidecar::new("missing.parquet".to_string(), 1, 1, None)];
+    write_manifest_commit_keeping_pm(&engine, &table_root(), 1, checkpoint).unwrap();
+
+    assert_scan_clustering(&engine, 1, &[("a.parquet", Some(LIQUID))]);
 }
