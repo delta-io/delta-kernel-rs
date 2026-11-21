@@ -870,7 +870,7 @@ mod tests {
     use crate::engine::{DelegatingEngine, RelaxedCounter};
     use crate::expressions::{ExpressionRef, MapData, PredicateRef, Scalar, StructData};
     use crate::scan::log_replay::PATH_NAME;
-    use crate::schema::{MapType, column_name};
+    use crate::schema::{MapType, column_name, schema};
     use crate::table_configuration::TableConfiguration;
     use crate::table_properties::APPEND_ONLY;
     use crate::transaction::create_table::create_table;
