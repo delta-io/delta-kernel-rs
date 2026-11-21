@@ -1430,7 +1430,7 @@ mod tests {
     use super::*;
     use crate::Predicate as Pred;
     use crate::expressions::{BinaryPredicateOp, col, lit};
-    use crate::schema::{ToSchema, lazy_schema_ref, schema_ref};
+    use crate::schema::{ColumnNamesAndTypes, ToSchema, lazy_schema_ref, schema_ref};
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::assert_result_error_with_message;
 
@@ -2744,6 +2744,12 @@ mod tests {
             };
             &SCHEMA_INFO
         }
+
+        fn leaf_columns() -> &'static ColumnNamesAndTypes {
+            static LEAF_COLUMNS: LazyLock<ColumnNamesAndTypes> =
+                LazyLock::new(|| NullableMapValues::schema_ref().leaves(None));
+            &LEAF_COLUMNS
+        }
     }
 
     #[derive(ToSchema, IntoStructData)]
@@ -2907,6 +2913,12 @@ mod tests {
                     nullable "aExtra": STRING,
                 };
                 &SCHEMA
+            }
+
+            fn leaf_columns() -> &'static ColumnNamesAndTypes {
+                static LEAF_COLUMNS: LazyLock<ColumnNamesAndTypes> =
+                    LazyLock::new(|| Row::schema_ref().leaves(None));
+                &LEAF_COLUMNS
             }
         }
 

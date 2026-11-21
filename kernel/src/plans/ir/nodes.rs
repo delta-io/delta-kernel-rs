@@ -386,7 +386,7 @@ where
     fn try_from(Values { schema, rows }: Values) -> KernelResult<Self> {
         let rows = rows
             .into_iter()
-            .map(|row| StructData::from_values_unchecked(Arc::clone(&schema), row));
+            .map(|row| Ok(StructData::from_values_unchecked(Arc::clone(&schema), row)));
         crate::expressions::struct_rows::decode_rows::<T>(rows).collect()
     }
 }

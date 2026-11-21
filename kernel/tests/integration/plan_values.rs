@@ -20,7 +20,8 @@ use delta_kernel::expressions::{StructData, TryFromStructRows};
 use delta_kernel::plans::Operation;
 use delta_kernel::plans::ir::nodes::Values;
 use delta_kernel::schema::{
-    DataType, SchemaRef, StructField, StructType, ToSchema, lazy_schema_ref, schema,
+    ColumnNamesAndTypes, DataType, SchemaRef, StructField, StructType, ToSchema, lazy_schema_ref,
+    schema,
 };
 use delta_kernel::{
     EngineData, KernelError, KernelResult, PlanBuilder, PlanExecutor, PlanExecutorExt, PlanResult,
@@ -61,6 +62,12 @@ impl ToSchema for CustomRow {
     fn schema_ref() -> &'static SchemaRef {
         static SCHEMA_INFO: LazyLock<SchemaRef> = lazy_schema_ref! { not_null "id": INTEGER };
         &SCHEMA_INFO
+    }
+
+    fn leaf_columns() -> &'static ColumnNamesAndTypes {
+        static LEAF_COLUMNS: LazyLock<ColumnNamesAndTypes> =
+            LazyLock::new(|| CustomRow::schema_ref().leaves(None));
+        &LEAF_COLUMNS
     }
 }
 
@@ -209,51 +216,41 @@ where
                 error.without_backtrace(),
                 KernelError::ScalarConversion(_)
             ));
-            assert!(
-                error
-                    .to_string()
-                    .contains(&format!("expected {count_error}, found {count} rows"))
-            );
+            assert!(error.to_string().contains(&format!(
+                "expected {count_error}, found {} rows",
+                if count == 0 { "0" } else { "at least 2" }
+            )));
         }
     }
     Ok(())
 }
 
 #[rstest]
-#[case::required(|r: Vec<KernelResult<RecordBatch>>| execute_rows::<CustomRow>(r).map(drop), "exactly one row")]
-#[case::optional(|r: Vec<KernelResult<RecordBatch>>| execute_rows::<Option<CustomRow>>(r).map(drop), "at most one row")]
-#[case::vector(|r: Vec<KernelResult<RecordBatch>>| execute_rows::<Vec<CustomRow>>(r).map(drop), "")]
-fn cardinality_precedes_custom_decoding(
+#[case::required(|r| execute_rows::<CustomRow>(r).map(drop))]
+#[case::optional(|r| execute_rows::<Option<CustomRow>>(r).map(drop))]
+#[case::vector(|r| execute_rows::<Vec<CustomRow>>(r).map(drop))]
+fn custom_decoder_errors_stop_collection(
     #[case] decode: fn(Vec<KernelResult<RecordBatch>>) -> KernelResult<()>,
-    #[case] count_error: &str,
     #[values(1, 2)] count: usize,
     #[values(false, true)] split: bool,
+    #[values(false, true)] valid_first: bool,
 ) -> KernelResult<()> {
-    let batches = if split { vec![1; count] } else { vec![count] }
-        .into_iter()
-        .map(|count| {
-            Ok(generate_batch([(
-                "id",
-                vec![-1; count].into_arrow_array(),
-            )])?)
-        })
-        .collect();
-    let error = decode(batches).unwrap_err();
-    if count == 2 && !count_error.is_empty() {
-        assert!(matches!(
-            error.without_backtrace(),
-            KernelError::ScalarConversion(_)
-        ));
-        assert!(
-            error
-                .to_string()
-                .contains(&format!("expected {count_error}, found 2 rows"))
-        );
-    } else {
-        assert!(
-            matches!(error.without_backtrace(), KernelError::Generic(message) if message == "decoder rejected row")
-        );
+    let mut ids = vec![-1; count];
+    if valid_first {
+        ids.insert(0, 1);
     }
+    let batches = if split {
+        ids.into_iter().map(|id| vec![id]).collect()
+    } else {
+        vec![ids]
+    }
+    .into_iter()
+    .map(|ids| Ok(generate_batch([("id", ids.into_arrow_array())])?))
+    .collect();
+    let error = decode(batches).unwrap_err();
+    assert!(
+        matches!(error.without_backtrace(), KernelError::Generic(message) if message == "decoder rejected row")
+    );
     Ok(())
 }
 
@@ -297,11 +294,12 @@ where
     Ok(())
 }
 #[rstest]
-#[case::required(|r: Vec<KernelResult<RecordBatch>>| execute_rows::<TestRow>(r).map(drop))]
-#[case::optional(|r: Vec<KernelResult<RecordBatch>>| execute_rows::<Option<TestRow>>(r).map(drop))]
-#[case::vector(|r: Vec<KernelResult<RecordBatch>>| execute_rows::<Vec<TestRow>>(r).map(drop))]
-fn late_stream_errors_win_over_cardinality(
+#[case::required(|r| execute_rows::<TestRow>(r).map(drop), true)]
+#[case::optional(|r| execute_rows::<Option<TestRow>>(r).map(drop), true)]
+#[case::vector(|r| execute_rows::<Vec<TestRow>>(r).map(drop), false)]
+fn stream_errors_and_cardinality_stop_collection(
     #[case] convert: fn(Vec<KernelResult<RecordBatch>>) -> KernelResult<()>,
+    #[case] limited: bool,
     #[values(0, 1, 2)] count: usize,
 ) {
     let error = convert(vec![
@@ -309,9 +307,16 @@ fn late_stream_errors_win_over_cardinality(
         Err(KernelError::generic("late")),
     ])
     .unwrap_err();
-    assert!(
-        matches!(error.without_backtrace(), KernelError::Generic(message) if message == "late")
-    );
+    if limited && count == 2 {
+        assert!(matches!(
+            error.without_backtrace(),
+            KernelError::ScalarConversion(_)
+        ));
+    } else {
+        assert!(
+            matches!(error.without_backtrace(), KernelError::Generic(message) if message == "late")
+        );
+    }
 }
 #[rstest]
 #[case::unit(|| PlanResult::Unit)]
