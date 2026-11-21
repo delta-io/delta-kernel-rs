@@ -16,14 +16,6 @@ use test_utils::IntoArray;
 
 use super::{Containers, TestRow as FlatRow, data, execute_rows, row_batch};
 
-macro_rules! result_row {
-    ($(#[$attr:meta])* $vis:vis struct $name:ident { $($fields:tt)* }) => {
-        #[derive(Clone, Debug, PartialEq, IntoStructData, DeriveToSchema, TryFromStructData)]
-        $(#[$attr])*
-        $vis struct $name { $($fields)* }
-    };
-}
-
 result_row! { struct NestedType { row: FlatRow, containers: Containers } }
 
 result_row! { pub(super) struct TestRow {

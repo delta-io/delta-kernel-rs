@@ -30,7 +30,8 @@ use crate::KernelResultIterator;
 #[cfg(feature = "declarative-plans")]
 use crate::engine_data::{EngineData, RowVisitor as _};
 use crate::error::add_scalar_path_context;
-use crate::schema::ToSchema;
+use crate::schema::derive_macro_utils::validate_variant;
+use crate::schema::{SchemaRef, ToSchema};
 use crate::{KernelError, KernelResult};
 
 #[cfg(feature = "declarative-plans")]
@@ -160,14 +161,50 @@ fn decode_row<T: TryFrom<StructData, Error = KernelError>>(
     T::try_from(row).map_err(|error| add_scalar_path_context(error, format!("[{index}]")))
 }
 
+/// Groups mixed rows by schema field for the `TryFromStructRows` derive.
+#[internal_api]
+pub(crate) fn group_struct_rows<const N: usize>(
+    rows: impl StructRowSource,
+    schema: &SchemaRef,
+) -> KernelResult<[Vec<StructData>; N]> {
+    let mut groups: [Vec<StructData>; N] = std::array::from_fn(|_| Vec::new());
+    let mut row_index = 0;
+    rows.try_for_each(|row| {
+        let (actual, values) = row.into_parts();
+        if actual != *schema || values.len() != schema.num_fields() {
+            return Err(KernelError::invalid_struct_data(
+                "Incompatible mixed-row payload schema",
+            ));
+        }
+        validate_variant(&values)
+            .map_err(|error| add_scalar_path_context(error, format!("[{row_index}]")))?;
+        for (field, value) in actual
+            .fields()
+            .zip(values)
+            .filter(|(_, value)| !value.is_null())
+        {
+            let group = schema
+                .index_of(field.name())
+                .and_then(|index| groups.get_mut(index))
+                .ok_or_else(|| KernelError::internal_error("Missing payload group"))?;
+            group.push(value.try_into()?);
+        }
+        row_index += 1;
+        Ok(())
+    })?;
+    Ok(groups)
+}
+
 #[cfg(test)]
 mod tests {
     use std::ops::RangeInclusive;
+    use std::sync::Arc;
 
-    use delta_kernel_derive::{IntoStructData, ToSchema, TryFromStructData};
+    use delta_kernel_derive::{IntoStructData, ToSchema, TryFromStructData, TryFromStructRows};
     use rstest::rstest;
 
     use super::*;
+    use crate::schema::{StructField, StructType};
 
     #[derive(Clone, Debug, PartialEq, ToSchema, IntoStructData, TryFromStructData)]
     struct Added {
@@ -190,5 +227,55 @@ mod tests {
         } else {
             assert!(result.unwrap_err().to_string().contains("row"));
         }
+    }
+
+    #[derive(Debug, PartialEq, TryFromStructRows)]
+    struct Changes {
+        added: Added,
+        removed: Vec<Added>,
+    }
+
+    #[rstest]
+    #[case::declared_order(false, None)]
+    #[case::reordered(true, None)]
+    #[case::unknown(false, Some("other"))]
+    fn named_collections_resolve_struct_payloads_by_name(
+        #[case] reverse: bool,
+        #[case] extra: Option<&str>,
+    ) -> KernelResult<()> {
+        let mut fields = vec![
+            StructField::nullable("added", Added::schema_ref().clone()),
+            StructField::nullable("removed", Added::schema_ref().clone()),
+        ];
+        let mut values = vec![
+            Added { id: 7 }.into(),
+            crate::expressions::Scalar::Null(Added::schema_ref().clone().into()),
+        ];
+        if reverse {
+            fields.reverse();
+            values.reverse();
+        }
+        if let Some(name) = extra {
+            fields.push(StructField::nullable(name, Added::schema_ref().clone()));
+            values.push(crate::expressions::Scalar::Null(
+                Added::schema_ref().clone().into(),
+            ));
+        }
+        let result = StructType::try_new(fields).and_then(|schema| {
+            let row = StructData::try_new(Arc::new(schema), values)?;
+            Changes::collect_into([Ok(row)])
+        });
+        if extra.is_some() {
+            assert!(result.is_err());
+        } else {
+            assert_eq!(
+                result?,
+                Changes {
+                    added: Added { id: 7 },
+                    removed: vec![]
+                }
+            );
+        }
+        Ok(())
     }
 }

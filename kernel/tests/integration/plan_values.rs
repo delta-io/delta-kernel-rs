@@ -1,7 +1,5 @@
 //! Typed plan result conversion through the existing row visitor interface.
 
-mod nested;
-
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::{Arc, LazyLock};
@@ -38,6 +36,9 @@ macro_rules! result_row {
         $vis struct $name { $($fields)* }
     };
 }
+
+mod nested;
+mod variants;
 
 result_row! { struct TestRow { id: i32, label: Option<String> } }
 result_row! { #[derive(Default)] struct PrimitiveRow {
@@ -284,6 +285,10 @@ fn custom_decoder_errors_stop_collection(
 ])]
 #[case::nested(nested::rows(false))]
 #[case::nested_populated(nested::rows(true))]
+#[case::enum_variants(vec![
+    variants::Action::Add(variants::Add { id: 4 }),
+    variants::Action::Remove(variants::Remove { id: 5 }),
+])]
 fn rows_round_trip_through_values_and_executor<T>(#[case] expected: Vec<T>) -> KernelResult<()>
 where
     T: ToSchema

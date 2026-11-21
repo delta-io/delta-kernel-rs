@@ -197,6 +197,20 @@ impl<T: ToNullableContainerType> GetNullableContainerStructField for Option<T> {
     }
 }
 
+/// Requires exactly one non-null payload in a mixed row.
+#[allow(unused)]
+#[internal_api]
+pub(crate) fn validate_variant(values: &[Scalar]) -> KernelResult<()> {
+    let count = values.iter().filter(|value| !value.is_null()).count();
+    require!(
+        count == 1,
+        KernelError::invalid_struct_data(format!(
+            "Expected exactly one non-null variant, found {count}",
+        ))
+    );
+    Ok(())
+}
+
 /// Named fields consumed by the [`delta_kernel_derive::TryFromStructData`] macro.
 ///
 /// Field conversion errors acquire their path element as they unwind. Successful conversion does
