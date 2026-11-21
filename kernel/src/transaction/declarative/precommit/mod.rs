@@ -306,9 +306,9 @@ impl RowVisitor for CheckResultVisitor<'_> {
                 _ => return Err(invalid_summary("Missing check validity")),
             }
             let error_name = format!("{}{ERROR_SUFFIX}", check.name());
-            let fields: Vec<_> = check.output_schema().fields().cloned().collect();
-            let values = fields
-                .iter()
+            let schema = check.output_schema();
+            let values = schema
+                .fields()
                 .map(|field| {
                     read(
                         ColumnName::new([error_name.as_str(), field.name()]),
@@ -316,7 +316,7 @@ impl RowVisitor for CheckResultVisitor<'_> {
                     )
                 })
                 .collect::<KernelResult<Vec<_>>>()?;
-            let sample = StructData::try_new(fields, values)?;
+            let sample = StructData::try_new(schema, values)?;
             return Err(check.decode_error(sample)?);
         }
         Ok(())

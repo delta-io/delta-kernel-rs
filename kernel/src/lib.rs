@@ -207,7 +207,7 @@ pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use file_uri::{ReferencedFilePath, resolve_file_uri};
 pub use log_compaction::{LogCompactionWriter, should_compact};
 #[cfg(feature = "declarative-plans")]
-pub use plans::{IoOperation, Operation, PlanBuilder, PlanExecutor, PlanResult};
+pub use plans::{IoOperation, Operation, PlanBuilder, PlanExecutor, PlanExecutorExt, PlanResult};
 use schema::StructField;
 pub use snapshot::{Snapshot, SnapshotReader, SnapshotRef};
 

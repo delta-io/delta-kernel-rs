@@ -17,7 +17,8 @@ use crate::schema::IntervalYearToMonthType::{IntervalMonth, IntervalYear, Interv
 use crate::schema::derive_macro_utils::{GetStructField, ToDataType};
 use crate::schema::{
     ArrayType, DataType, DecimalType, IntervalDayToSecondType, IntervalFieldRange,
-    IntervalYearToMonthType, MapType, PrimitiveType, StructField, StructType, parse_interval_type,
+    IntervalYearToMonthType, MapType, PrimitiveType, SchemaRef, StructField, StructType,
+    parse_interval_type,
 };
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
@@ -368,32 +369,44 @@ impl<K: IntoScalar, V: IntoScalar> From<HashMap<K, Option<V>>> for MapData {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Values for a struct with a shared schema.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StructData {
-    fields: Vec<StructField>,
+    #[serde(
+        rename = "fields",
+        serialize_with = "serialize_struct_fields",
+        deserialize_with = "deserialize_struct_fields"
+    )]
+    schema: SchemaRef,
     values: Vec<Scalar>,
 }
 
 impl StructData {
-    /// Try to create a new struct data with the given fields and values.
+    /// Creates struct data from a shared schema and values in field order.
     ///
     /// This will return an error:
     /// - if the number of fields and values do not match
     /// - if the data types of the values do not match the data types of the fields
     /// - if a null value is assigned to a non-nullable field
-    pub fn try_new(fields: Vec<StructField>, values: Vec<Scalar>) -> KernelResult<Self> {
+    pub fn try_new(schema: SchemaRef, values: Vec<Scalar>) -> KernelResult<Self> {
         require!(
-            fields.len() == values.len(),
+            schema.num_fields() == values.len(),
             KernelError::invalid_struct_data(format!(
                 "Incorrect number of values for Struct fields, expected {} got {}",
-                fields.len(),
+                schema.num_fields(),
                 values.len()
             ))
         );
 
-        for (f, a) in fields.iter().zip(&values) {
+        for (f, a) in schema.fields().zip(&values) {
+            let matches_type = match (f.data_type(), a) {
+                (DataType::Struct(expected), Scalar::Struct(actual)) => {
+                    expected.as_ref() == actual.schema.as_ref()
+                }
+                _ => f.data_type() == &a.data_type(),
+            };
             require!(
-                f.data_type() == &a.data_type(),
+                matches_type,
                 KernelError::invalid_struct_data(format!(
                     "Incorrect datatype for Struct field {:?}, expected {} got {}",
                     f.name(),
@@ -412,32 +425,42 @@ impl StructData {
             );
         }
 
-        Ok(Self { fields, values })
+        Ok(Self { schema, values })
     }
 
     /// Infallible constructor used by `From<T>` where `schema` and `values` are produced using
     /// [`ToSchema`](delta_kernel::schema::ToSchema) and `Into<Scalar>`. Does not re-validate types
     /// or lengths.
     #[internal_api]
-    pub(crate) fn from_values_unchecked(schema: StructType, values: Vec<Scalar>) -> Self {
-        Self {
-            fields: schema.into_fields().collect(),
-            values,
-        }
+    pub(crate) fn from_values_unchecked(schema: SchemaRef, values: Vec<Scalar>) -> Self {
+        Self { schema, values }
     }
 
-    pub fn fields(&self) -> &[StructField] {
-        &self.fields
+    /// Returns the shared schema of this struct.
+    pub fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    pub fn fields(&self) -> impl ExactSizeIterator<Item = &StructField> + DoubleEndedIterator {
+        self.schema.fields()
     }
 
     pub fn values(&self) -> &[Scalar] {
         &self.values
     }
 
-    /// Consume this struct and return its fields and values.
+    /// Consume this struct and return its shared schema and values.
     #[internal_api]
-    pub(crate) fn into_parts(self) -> (Vec<StructField>, Vec<Scalar>) {
-        (self.fields, self.values)
+    pub(crate) fn into_parts(self) -> (SchemaRef, Vec<Scalar>) {
+        (self.schema, self.values)
+    }
+}
+
+impl PartialEq for StructData {
+    fn eq(&self, other: &Self) -> bool {
+        // StructType equality ignores field order; struct values are positional.
+        (Arc::ptr_eq(&self.schema, &other.schema) || self.fields().eq(other.fields()))
+            && self.values == other.values
     }
 }
 
@@ -528,7 +551,7 @@ impl Scalar {
             Self::Binary(_) => DataType::BINARY,
             Self::Decimal(d) => DataType::from(*d.ty()),
             Self::Null(data_type) => data_type.clone(),
-            Self::Struct(data) => DataType::struct_type_unchecked(data.fields.clone()),
+            Self::Struct(data) => data.schema.as_ref().clone().into(),
             Self::Array(data) => data.tpe.clone().into(),
             Self::Map(data) => data.data_type.clone().into(),
         }
@@ -692,7 +715,7 @@ impl Display for Scalar {
             Self::Struct(data) => {
                 write!(f, "{{")?;
                 let mut delim = "";
-                for (value, field) in data.values.iter().zip(data.fields.iter()) {
+                for (value, field) in data.values.iter().zip(data.fields()) {
                     write!(f, "{delim}{}: {value}", field.name)?;
                     delim = ", ";
                 }
@@ -1378,10 +1401,27 @@ fn parse_day_time_micros(raw: &str) -> Option<i64> {
     )
 }
 
+fn serialize_struct_fields<S: serde::Serializer>(
+    schema: &SchemaRef,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_seq(schema.fields())
+}
+
+fn deserialize_struct_fields<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<SchemaRef, D::Error> {
+    let fields = Vec::<StructField>::deserialize(deserializer)?;
+    StructType::try_new(fields)
+        .map(Arc::new)
+        .map_err(serde::de::Error::custom)
+}
+
 #[cfg(test)]
 mod tests {
     use std::f32::consts::PI;
     use std::fmt::Debug;
+    use std::sync::LazyLock;
 
     use bytes::Bytes;
     use delta_kernel_derive::{IntoStructData, ToSchema, TryFromStructData};
@@ -1390,7 +1430,7 @@ mod tests {
     use super::*;
     use crate::Predicate as Pred;
     use crate::expressions::{BinaryPredicateOp, col, lit};
-    use crate::schema::{ToSchema, schema};
+    use crate::schema::{ColumnNamesAndTypes, ToSchema, lazy_schema_ref, schema_ref};
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::assert_result_error_with_message;
 
@@ -2698,8 +2738,17 @@ mod tests {
     }
 
     impl ToSchema for NullableMapValues {
-        fn to_schema() -> StructType {
-            schema! { not_null "values": { STRING => nullable STRING } }
+        fn schema_ref() -> &'static SchemaRef {
+            static SCHEMA_INFO: LazyLock<SchemaRef> = lazy_schema_ref! {
+                not_null "values": { STRING => nullable STRING }
+            };
+            &SCHEMA_INFO
+        }
+
+        fn leaf_columns() -> &'static ColumnNamesAndTypes {
+            static LEAF_COLUMNS: LazyLock<ColumnNamesAndTypes> =
+                LazyLock::new(|| NullableMapValues::schema_ref().leaves(None));
+            &LEAF_COLUMNS
         }
     }
 
@@ -2725,6 +2774,38 @@ mod tests {
         assert_round_trip(test_person(), Person::to_schema());
     }
 
+    #[rstest]
+    #[case::empty(StructData::try_new(schema_ref! {}, vec![]).unwrap())]
+    #[case::nested(StructData::from(test_person()))]
+    fn struct_data_shares_schema_and_preserves_serialization(#[case] data: StructData) {
+        assert!(Arc::ptr_eq(data.schema(), data.clone().schema()));
+        let expected = serde_json::json!({
+            "fields": data.fields().collect::<Vec<_>>(),
+            "values": data.values(),
+        });
+        let serialized = serde_json::to_value(&data).unwrap();
+        assert_eq!(serialized, expected);
+        assert_eq!(
+            serde_json::from_value::<StructData>(serialized).unwrap(),
+            data
+        );
+    }
+
+    #[test]
+    fn struct_data_equality_preserves_field_order() {
+        let a = StructData::try_new(
+            schema_ref! { not_null "a": INTEGER, not_null "b": INTEGER },
+            vec![1.into(), 1.into()],
+        )
+        .unwrap();
+        let b = StructData::try_new(
+            schema_ref! { not_null "b": INTEGER, not_null "a": INTEGER },
+            vec![1.into(), 1.into()],
+        )
+        .unwrap();
+        assert_ne!(a, b);
+    }
+
     #[test]
     fn derived_struct_conversion_preserves_nullable_map_value_type() {
         let data: StructData = NullableMapValues {
@@ -2735,7 +2816,7 @@ mod tests {
             panic!("expected one map value");
         };
         assert!(values.map_type().value_contains_null());
-        StructData::try_new(data.fields().to_vec(), data.values().to_vec())
+        StructData::try_new(data.schema().clone(), data.values().to_vec())
             .expect("derived value must match its declared schema");
     }
 
@@ -2750,7 +2831,7 @@ mod tests {
             values: values.clone(),
         }
         .into();
-        StructData::try_new(data.fields().to_vec(), data.values().to_vec())
+        StructData::try_new(data.schema().clone(), data.values().to_vec())
             .expect("derived value must match its declared schema");
         match (values, &data.values()[0]) {
             (None, Scalar::Null(_)) => {}
@@ -2788,7 +2869,7 @@ mod tests {
     fn struct_data_rejects_null_for_non_nullable_field() {
         assert_result_error_with_message(
             StructData::try_new(
-                vec![StructField::not_null("value", DataType::STRING)],
+                schema_ref! { not_null "value": STRING },
                 vec![Scalar::null(DataType::STRING)],
             ),
             "Value for non-nullable field \"value\" cannot be null",
@@ -2799,7 +2880,7 @@ mod tests {
     #[case::not_a_struct(Scalar::Long(1), "expected Person, found long")]
     #[case::wrong_field_type(
         Scalar::Struct(StructData::from_values_unchecked(
-            Person::to_schema(),
+            Person::schema_ref().clone(),
             vec![
                 Scalar::from("not an integer"),
                 Scalar::from(Address { city: "NYC".to_string(), zip: None }),
@@ -2815,10 +2896,52 @@ mod tests {
         assert_result_error_with_message(Person::try_from(scalar), expected);
     }
 
+    #[rstest]
+    fn derived_struct_conversion_rejects_unconsumed_manual_schema_fields(
+        #[values(false, true)] wrapped: bool,
+    ) {
+        #[derive(Debug, TryFromStructData)]
+        struct Row {
+            value: i32,
+        }
+
+        impl ToSchema for Row {
+            fn schema_ref() -> &'static SchemaRef {
+                static SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+                    not_null "value": INTEGER,
+                    nullable "zExtra": STRING,
+                    nullable "aExtra": STRING,
+                };
+                &SCHEMA
+            }
+
+            fn leaf_columns() -> &'static ColumnNamesAndTypes {
+                static LEAF_COLUMNS: LazyLock<ColumnNamesAndTypes> =
+                    LazyLock::new(|| Row::schema_ref().leaves(None));
+                &LEAF_COLUMNS
+            }
+        }
+
+        let data = StructData::try_new(
+            Row::schema_ref().clone(),
+            vec![Scalar::Integer(7), Scalar::from("z"), Scalar::from("a")],
+        )
+        .unwrap();
+        let result = if wrapped {
+            Row::try_from(Scalar::Struct(data))
+        } else {
+            Row::try_from(data)
+        };
+        assert_result_error_with_message(
+            result.map(|row| row.value),
+            "expected no additional fields, found fields [\"aExtra\", \"zExtra\"]",
+        );
+    }
+
     #[test]
     fn derived_struct_conversion_requires_exact_field_count() {
         let values = vec![Scalar::from(1)];
-        let struct_data = StructData::from_values_unchecked(Person::to_schema(), values);
+        let struct_data = StructData::from_values_unchecked(Person::schema_ref().clone(), values);
         assert_result_error_with_message(
             Person::try_from(struct_data),
             "expected 3 struct values, found 1 struct values",
@@ -2831,21 +2954,23 @@ mod tests {
         let Scalar::Struct(data) = Scalar::from(person.clone()) else {
             unreachable!()
         };
-        let (mut fields, mut values) = data.into_parts();
+        let (schema, mut values) = data.into_parts();
+        let mut fields: Vec<_> = schema.fields().cloned().collect();
         fields.swap(0, 2);
         values.swap(0, 2);
-        let reordered = StructData::try_new(fields, values).unwrap();
+        let reordered =
+            StructData::try_new(Arc::new(StructType::try_new(fields).unwrap()), values).unwrap();
         assert_eq!(Person::try_from(reordered).unwrap(), person);
     }
 
     #[test]
     fn derived_struct_conversion_builds_nested_error_path_while_unwinding() {
         let address = StructData::from_values_unchecked(
-            Address::to_schema(),
+            Address::schema_ref().clone(),
             vec![Scalar::from(7), Scalar::null(DataType::INTEGER)],
         );
         let person = StructData::from_values_unchecked(
-            Person::to_schema(),
+            Person::schema_ref().clone(),
             vec![
                 Scalar::from(1),
                 Scalar::from(address),
@@ -2861,7 +2986,7 @@ mod tests {
     #[test]
     fn container_conversion_adds_index_to_nested_error_path() {
         let address = StructData::from_values_unchecked(
-            Address::to_schema(),
+            Address::schema_ref().clone(),
             vec![Scalar::from(7), Scalar::null(DataType::INTEGER)],
         );
         let array = ArrayData::try_new(
@@ -2879,7 +3004,7 @@ mod tests {
     fn derived_struct_conversion_checks_null_field_data_type() {
         // `Option::try_from` rejects a typed null whose data type does not match `T`.
         let address = StructData::from_values_unchecked(
-            schema! {
+            schema_ref! {
                 not_null "city": STRING,
                 nullable "zip": STRING,
             },

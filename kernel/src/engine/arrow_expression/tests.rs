@@ -317,17 +317,16 @@ fn test_literal_complex_type_array() {
         )
         .unwrap(),
     );
-    let struct_type = schema! {
+    let struct_type = schema_ref! {
         nullable "scalar": INTEGER,
         nullable "list": (array_type.clone()),
         nullable "null_list": (array_type.clone()),
         nullable "map": (map_type.clone()),
         nullable "null_map": (map_type.clone()),
     };
-    let struct_fields = struct_type.fields().cloned().collect::<Vec<_>>();
     let struct_value = Scalar::Struct(
         crate::expressions::StructData::try_new(
-            struct_fields.clone(),
+            Arc::clone(&struct_type),
             vec![
                 Scalar::Integer(42),
                 array_value,
@@ -1852,10 +1851,7 @@ fn test_create_many_nested_struct() {
     let row1 = vec![
         Scalar::Struct(
             crate::expressions::StructData::try_new(
-                vec![
-                    StructField::nullable("x", KernelDataType::INTEGER),
-                    StructField::nullable("y", KernelDataType::STRING),
-                ],
+                schema_ref! { nullable "x": INTEGER, nullable "y": STRING },
                 vec![10.into(), "hello".into()],
             )
             .unwrap(),
