@@ -66,6 +66,8 @@ mod operation;
 pub(crate) use operation::CommitOperation;
 pub use operation::UpdateTableOperation;
 #[cfg(feature = "adaptive-metadata-in-dev")]
+mod file_metadata_field_id;
+#[cfg(feature = "adaptive-metadata-in-dev")]
 mod leaf_writer;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 mod manifest_commit_state;
@@ -318,7 +320,8 @@ pub struct Transaction<STATE = UpdateTable, MODE: ExecutionMode = Imperative> {
     commit_timestamp: i64,
     // User-provided domain metadata additions (via with_domain_metadata API).
     user_domain_metadata_additions: Vec<DomainMetadata>,
-    // System-generated domain metadata produced by create-table transforms, e.g. clustering.
+    // System-generated domain metadata: create-table transforms, and the update-table assignment
+    // of a file metadata field ID.
     system_domain_metadata_additions: Vec<DomainMetadata>,
     // Row-tracking high-water mark explicitly provided by the caller.
     provided_row_tracking_high_water_mark: Option<i64>,
@@ -1596,6 +1599,8 @@ mod tests {
     // (tests/manifest_commit_tests.rs) but as a submodule of `tests`, so they reuse this
     // module's private helpers (e.g. `create_existing_table_txn`) without widening their
     // visibility.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    mod file_metadata_field_id_tests;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     mod manifest_commit_tests;
 

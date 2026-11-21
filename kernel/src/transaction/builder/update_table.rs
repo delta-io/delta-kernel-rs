@@ -18,6 +18,8 @@ use crate::table_features::{
 };
 use crate::table_properties::{is_delta_property_key, validate_and_normalize_property_for_update};
 use crate::transaction::domain_metadata::validate_unique_domains;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::transaction::file_metadata_field_id::assign_for_update;
 use crate::transaction::schema_evolution::{SchemaOperation, evolve_table_config};
 use crate::transaction::{
     ExecutionMode, Imperative, Transaction, UpdateTable, UpdateTableOperation,
@@ -437,12 +439,26 @@ fn try_new_update_table<MODE: ExecutionMode>(
         }
     };
     let has_property_changes = !properties_added.is_empty();
-    let should_emit_metadata = has_schema_changes || has_property_changes;
     let effective_table_config = if has_property_changes {
         apply_table_properties_added(effective_table_config, properties_added)?
     } else {
         effective_table_config
     };
+
+    // Runs after schema and property changes, so the seed counts the IDs they add.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    let (effective_table_config, assigned_domain) = assign_for_update(
+        effective_table_config,
+        &read_snapshot,
+        is_blind_append,
+        engine,
+    )?;
+    #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+    let assigned_domain = None;
+
+    // Assigning an ID raises maxColumnId, so it always changes the metadata.
+    let should_emit_metadata =
+        has_schema_changes || has_property_changes || assigned_domain.is_some();
 
     Ok(Transaction {
         read_snapshot_opt: Some(read_snapshot),
@@ -450,6 +466,7 @@ fn try_new_update_table<MODE: ExecutionMode>(
         user_domain_removals: domain_metadata_removals,
         is_blind_append,
         physical_clustering_columns: clustering_columns,
+        system_domain_metadata_additions: assigned_domain.into_iter().collect(),
         ..Transaction::new(
             common_state,
             effective_table_config,

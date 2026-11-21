@@ -232,15 +232,23 @@ pub(crate) fn content_stats_value_with_clustering(lower_bound: Scalar) -> Scalar
     Scalar::Struct(StructData::try_new(content_stats_with_clustering().into(), values).unwrap())
 }
 
-/// The `content_stats` type holding only the mapped `clusteringProvider` field.
-pub(crate) fn clustering_only_stats() -> StructType {
-    StructType::new_unchecked([clustering_field()])
+/// The `content_stats` type holding only the `#clusteringProvider` field for `field_id`.
+pub(crate) fn clustering_only_stats_at(field_id: i32) -> StructType {
+    let field = file_metadata_stats_field(CLUSTERING_PROVIDER_NAME, field_id).unwrap();
+    StructType::new_unchecked([field])
 }
 
-/// A [`clustering_only_stats`] value whose `clusteringProvider` `lower_bound` is `lower_bound`.
-pub(crate) fn clustering_only_stats_value(lower_bound: Scalar) -> Scalar {
-    let values = vec![clustering_stats_value(lower_bound)];
-    Scalar::Struct(StructData::try_new(clustering_only_stats().into(), values).unwrap())
+/// A [`clustering_only_stats_at`] value whose `#clusteringProvider` `lower_bound` is
+/// `lower_bound`.
+pub(crate) fn clustering_only_stats_value_at(field_id: i32, lower_bound: Scalar) -> Scalar {
+    let field = file_metadata_stats_field(CLUSTERING_PROVIDER_NAME, field_id).unwrap();
+    let DataType::Struct(stats) = field.data_type().clone() else {
+        panic!("file metadata stats must be a struct");
+    };
+    let stats_value = Scalar::Struct(
+        StructData::try_new(schema_ref! { ..(stats.fields()) }, vec![lower_bound]).unwrap(),
+    );
+    Scalar::Struct(StructData::try_new(schema_ref! { (field) }, vec![stats_value]).unwrap())
 }
 
 /// A physical table schema whose only column `x` (field ID 1) is a LONG.
