@@ -17,11 +17,6 @@ release = false
 [lib]
 crate-type = ["lib", "cdylib", "staticlib"]
 
-[lints.clippy]
-# derive_more::Constructor trips a clippy 1.99 false positive; see rust-clippy#17525.
-# TODO(#3483): remove once the upstream fix lands.
-redundant_field_names = "allow"
-
 [dependencies]
 bytes = "1.10"
 derive_more = { version = "~2.1", default-features = false, features = ["constructor", "from"] }
