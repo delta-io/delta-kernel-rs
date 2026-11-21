@@ -2266,7 +2266,7 @@ mod tests {
     #[rstest]
     #[case::struct_element(Scalar::Struct(
         StructData::try_new(
-            vec![StructField::nullable("a", DataType::INTEGER)],
+            schema_ref! { nullable "a": INTEGER },
             vec![Scalar::Integer(1)],
         )
         .unwrap(),

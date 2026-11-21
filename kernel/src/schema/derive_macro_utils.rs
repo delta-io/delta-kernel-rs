@@ -9,7 +9,7 @@ use delta_kernel_derive::internal_api;
 
 use crate::error::add_scalar_path_context;
 use crate::expressions::{MapData, Scalar, StructData};
-use crate::schema::{ArrayType, DataType, MapType, StructField, StructType, ToSchema};
+use crate::schema::{ArrayType, DataType, MapType, SchemaRef, StructField, ToSchema};
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
 
@@ -194,45 +194,39 @@ impl<T: ToNullableContainerType> GetNullableContainerStructField for Option<T> {
 /// not allocate or maintain path state.
 #[internal_api]
 pub(crate) struct StructDataFields {
-    expected: StructType,
-    fields: HashMap<String, (StructField, Scalar)>,
+    expected: SchemaRef,
+    actual: SchemaRef,
+    values: Vec<Option<Scalar>>,
 }
 
 impl StructDataFields {
-    pub(crate) fn try_new(data: StructData, expected: StructType) -> KernelResult<Self> {
-        let (actual_fields, values) = data.into_parts();
+    /// Creates a field decoder after checking that the value count matches both schemas.
+    #[internal_api]
+    pub(crate) fn try_new(data: StructData, expected: SchemaRef) -> KernelResult<Self> {
+        let (actual, values) = data.into_parts();
         require!(
-            actual_fields.len() == values.len(),
+            actual.num_fields() == values.len(),
             KernelError::scalar_conversion(
-                format!("{} struct values", actual_fields.len()),
+                format!("{} struct values", actual.num_fields()),
                 format!("{} struct values", values.len()),
             )
         );
         require!(
-            actual_fields.len() == expected.num_fields(),
+            actual.num_fields() == expected.num_fields(),
             KernelError::scalar_conversion(
                 format!("struct with {} fields", expected.num_fields()),
-                format!("struct with {} fields", actual_fields.len()),
+                format!("struct with {} fields", actual.num_fields()),
             )
         );
-        let mut fields = HashMap::with_capacity(actual_fields.len());
-        for (field, value) in actual_fields.into_iter().zip(values) {
-            let name = field.name().clone();
-            match fields.entry(name) {
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert((field, value));
-                }
-                std::collections::hash_map::Entry::Occupied(entry) => {
-                    return Err(add_scalar_path_context(
-                        KernelError::scalar_conversion("one field", "duplicate fields"),
-                        entry.key().clone(),
-                    ));
-                }
-            }
-        }
-        Ok(Self { expected, fields })
+        Ok(Self {
+            expected,
+            actual,
+            values: values.into_iter().map(Some).collect(),
+        })
     }
 
+    /// Consumes the named field, checks its schema nullability, and decodes its value.
+    #[internal_api]
     pub(crate) fn take_field<T: TryFrom<Scalar, Error = KernelError>>(
         &mut self,
         field_name: &str,
@@ -242,12 +236,17 @@ impl StructDataFields {
                 "Derived schema does not contain generated field {field_name:?}"
             ))
         })?;
-        let (actual_field, value) = self.fields.remove(field_name).ok_or_else(|| {
+        let missing = || {
             add_scalar_path_context(
                 KernelError::scalar_conversion("present field", "missing field"),
                 field_name,
             )
-        })?;
+        };
+        let (index, actual_field) = self
+            .actual
+            .field_with_index(field_name)
+            .ok_or_else(missing)?;
+        let value = self.values[index].take().ok_or_else(missing)?;
         require!(
             actual_field.is_nullable() == expected.is_nullable(),
             add_scalar_path_context(
@@ -271,11 +270,17 @@ impl StructDataFields {
     }
 
     /// Verifies that every named field was consumed.
+    #[internal_api]
     pub(crate) fn finish(self) -> KernelResult<()> {
-        if self.fields.is_empty() {
+        let mut extra: Vec<_> = self
+            .actual
+            .fields()
+            .zip(self.values)
+            .filter_map(|(field, value)| value.map(|_| field.name()))
+            .collect();
+        if extra.is_empty() {
             return Ok(());
         }
-        let mut extra: Vec<_> = self.fields.keys().collect();
         extra.sort_unstable();
         Err(KernelError::scalar_conversion(
             "no additional fields",
