@@ -379,14 +379,15 @@ fn empty_inputs(#[values(false, true)] with_source: bool) -> KernelResult<()> {
 #[case::trailing_empty_batch(&[1, 0], false, None)]
 #[case::surrounding_empty_batches(&[0, 1, 0], false, None)]
 #[case::multiple_rows_in_batch(&[2], false,
-    Some("expected exactly one row, found 2 rows"))]
+    Some("expected exactly one row, found at least 2 rows"))]
 #[case::multiple_rows_across_batches(&[1, 1], false,
-    Some("expected exactly one row, found 2 rows"))]
+    Some("expected exactly one row, found at least 2 rows"))]
 #[case::late_stream_error(&[1], true, Some("late stream error"))]
 #[case::late_stream_error_after_empty(&[1, 0], true, Some("late stream error"))]
-#[case::late_stream_error_after_multiple_rows(&[1, 1], true, Some("late stream error"))]
+#[case::late_stream_error_after_multiple_rows(&[1, 1], true,
+    Some("expected exactly one row, found at least 2 rows"))]
 #[case::first_stream_error(&[], true, Some("late stream error"))]
-fn summary_stream_exhaustion(
+fn summary_stream_cardinality_and_errors(
     #[case] batch_sizes: &[usize],
     #[case] late_error: bool,
     #[case] expected_error: Option<&str>,
