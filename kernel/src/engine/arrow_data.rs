@@ -14,6 +14,7 @@ use crate::arrow::array::{
     Array, ArrayRef, GenericByteArray, OffsetSizeTrait, RecordBatch, RunArray, StringViewArray,
     StructArray,
 };
+use crate::arrow::buffer::NullBuffer;
 use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef, Schema as ArrowSchema,
@@ -321,6 +322,37 @@ impl EngineData for ArrowEngineData {
         }
         true
     }
+
+    fn is_null(&self, name: &ColumnName) -> KernelResult<Vec<bool>> {
+        require!(
+            !name.path().is_empty(),
+            KernelError::missing_column("Column path must not be empty")
+        );
+        let (_, _, nulls) = name.path().iter().enumerate().try_fold(
+            (self.data.schema_ref().fields(), self.data.columns(), None),
+            |(fields, columns, nulls), (depth, component)| -> KernelResult<_> {
+                let (index, _) = fields.find(component.as_str()).ok_or_else(|| {
+                    KernelError::missing_column(format!(
+                        "Column {name}: field {component} not found"
+                    ))
+                })?;
+                let column = &columns[index];
+                let nulls = NullBuffer::union(nulls.as_ref(), column.logical_nulls().as_ref());
+                if depth + 1 == name.path().len() {
+                    return Ok((fields, columns, nulls));
+                }
+                let nested = column.as_struct_opt().ok_or_else(|| {
+                    KernelError::unexpected_column_type(format!(
+                        "Column {name}: field {component} is not a struct"
+                    ))
+                })?;
+                Ok((nested.fields(), nested.columns(), nulls))
+            },
+        )?;
+        Ok((0..self.len())
+            .map(|row| nulls.as_ref().is_some_and(|nulls| nulls.is_null(row)))
+            .collect())
+    }
 }
 
 impl ArrowEngineData {
@@ -553,7 +585,7 @@ mod tests {
     use crate::arrow::array::{
         Array, ArrayRef, AsArray, BinaryArray, BooleanArray, Int32Array, Int64Array,
         LargeBinaryArray, LargeStringArray, ListArray, ListViewArray, MapArray, RecordBatch,
-        RunArray, StringArray, StringViewArray, StructArray,
+        RunArray, StringArray, StringViewArray, StructArray, new_null_array,
     };
     use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{
@@ -1585,6 +1617,100 @@ mod tests {
         assert_eq!(result2.len(), 1);
         assert_eq!(result2.get("d"), Some(&"4".to_string()));
 
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::primitive(
+        Arc::new(Int32Array::from(vec![Some(1), None, Some(2), None])),
+        [false, true, false, true]
+    )]
+    #[case::null(new_null_array(&ArrowDataType::Null, 4), [true; 4])]
+    #[case::ree(
+        Arc::new(RunArray::<Int64Type>::try_new(
+            &Int64Array::from(vec![2, 4]),
+            &Int32Array::from(vec![Some(1), None]),
+        ).unwrap()),
+        [false, false, true, true]
+    )]
+    fn test_is_null_logical_nulls(
+        #[case] column: ArrayRef,
+        #[case] expected: [bool; 4],
+        #[values(0, 1, 4)] offset: usize,
+        #[values(false, true)] nested: bool,
+    ) -> KernelResult<()> {
+        let (column, path, expected) = if nested {
+            let parent = StructArray::try_new(
+                vec![ArrowField::new("leaf", column.data_type().clone(), true)].into(),
+                vec![column],
+                Some(vec![false, true, false, true].into()),
+            )?;
+            (
+                Arc::new(parent) as ArrayRef,
+                ColumnName::new(["value", "leaf"]),
+                [true, expected[1], true, expected[3]],
+            )
+        } else {
+            (column, column_name!("value"), expected)
+        };
+        let schema = ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            column.data_type().clone(),
+            true,
+        )]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![column])?;
+        let data = ArrowEngineData::new(batch.slice(offset, 4 - offset));
+        assert_eq!(data.is_null(&path)?, expected[offset..]);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::struct_column(&["nested"], Ok([true, false, false, false]))]
+    #[case::inner_struct(&["nested", "inner"], Ok([true, true, false, false]))]
+    #[case::leaf(&["nested", "inner", "leaf"], Ok([true, true, true, false]))]
+    #[case::literal_dot(&["a.b"], Ok([false, false, true, false]))]
+    #[case::empty_path(&[], Err("path must not be empty"))]
+    #[case::missing(&["missing"], Err("field missing not found"))]
+    #[case::dot_is_not_separator(&["a", "b"], Err("field a not found"))]
+    #[case::missing_below_null_outer(&["nested", "missing"], Err("field missing not found"))]
+    #[case::missing_below_null_inner(
+        &["nested", "inner", "missing"], Err("field missing not found")
+    )]
+    #[case::non_struct_below_null(
+        &["nested", "inner", "leaf", "child"], Err("field leaf is not a struct")
+    )]
+    #[case::null_non_struct(&["a.b", "child"], Err("field a.b is not a struct"))]
+    fn test_is_null_nested(
+        #[case] path: &[&str],
+        #[case] expected: Result<[bool; 4], &str>,
+        #[values(0, 1, 4)] offset: usize,
+    ) -> KernelResult<()> {
+        let leaf: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), Some(2), None, Some(4)]));
+        let inner = StructArray::try_new(
+            vec![ArrowField::new("leaf", ArrowDataType::Int32, true)].into(),
+            vec![Arc::clone(&leaf)],
+            Some(vec![true, false, true, true].into()),
+        )?;
+        let nested = StructArray::try_new(
+            vec![ArrowField::new("inner", inner.data_type().clone(), true)].into(),
+            vec![Arc::new(inner)],
+            Some(vec![false, true, true, true].into()),
+        )?;
+        let columns: Vec<ArrayRef> = vec![Arc::new(nested), leaf];
+        let fields: Vec<_> = ["nested", "a.b"]
+            .into_iter()
+            .zip(&columns)
+            .map(|(name, column)| ArrowField::new(name, column.data_type().clone(), true))
+            .collect();
+        let data = ArrowEngineData::new(
+            RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns)?
+                .slice(offset, 4 - offset),
+        );
+        let result = data.is_null(&ColumnName::new(path.iter().copied()));
+        match expected {
+            Ok(expected) => assert_eq!(result?, expected[offset..]),
+            Err(message) => assert_result_error_with_message(result, message),
+        }
         Ok(())
     }
 
