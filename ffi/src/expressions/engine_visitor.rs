@@ -187,6 +187,11 @@ pub struct EngineExpressionVisitor {
     /// particular, timestamps carry exactly three fractional digits, truncated, unless
     /// `full_precision_timestamps` is set, in which case they carry all six microsecond digits.
     pub visit_to_json: VisitToJsonFn,
+    /// Visits the `UriEncodeFileLocation` unary operator belonging to the list identified by
+    /// `sibling_list_id`. The sub-expression will be in a _one_ item list identified by
+    /// `child_list_id`. See [`UnaryExpressionOp::UriEncodeFileLocation`] for the encoding the
+    /// implementation must produce.
+    pub visit_uri_encode_file_location: VisitUnaryFn,
     /// Visits the `ParseJson` expression belonging to the list identified by `sibling_list_id`.
     /// The sub-expression (JSON string) will be in a _one_ item list identified by
     /// `child_list_id`. The `output_schema` handle specifies the schema to parse the JSON
@@ -689,6 +694,12 @@ fn visit_expression_impl(
                     child_list_id,
                     *full_precision_timestamps,
                 ),
+                UnaryExpressionOp::UriEncodeFileLocation => (visitor
+                    .visit_uri_encode_file_location)(
+                    visitor.data,
+                    sibling_list_id,
+                    child_list_id,
+                ),
             }
         }
         Expression::Binary(BinaryExpression { op, left, right }) => {
@@ -1015,6 +1026,7 @@ mod tests {
             visit_is_null: ignore_child_list,
             visit_has_uri_scheme: ignore_child_list,
             visit_to_json: ignore_to_json,
+            visit_uri_encode_file_location: ignore_child_list,
             visit_parse_json: ignore_parse_json,
             visit_map_to_struct,
             visit_lt: ignore_child_list,

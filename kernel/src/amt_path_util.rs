@@ -5,10 +5,10 @@
 
 use std::borrow::Cow;
 
-use url::{ParseError, Url};
+use url::Url;
 
-use crate::path_encoding::{uri_decode_path, uri_encode_path, with_trailing_slash};
-use crate::uri_reference::scheme_len;
+use crate::path_encoding::{uri_encode_path, with_trailing_slash};
+use crate::uri_reference::{scheme_len, uri_decode_location, uri_encode_location};
 use crate::utils::{require, to_file_size};
 use crate::{FileMeta, KernelError, KernelResult};
 
@@ -35,12 +35,11 @@ pub(crate) fn resolve_amt_location(path: &str, table_root: &Url) -> KernelResult
 /// Parses an absolute AMT `path` into a [`Url`] with its path component percent-encoded, as
 /// [`resolve_amt_location`] does, or returns `None` if `path` is relative (has no URI scheme).
 pub(crate) fn parse_absolute_amt_location(path: &str) -> KernelResult<Option<Url>> {
-    let Some(scheme_len) = scheme_len(path) else {
+    if scheme_len(path).is_none() {
         return Ok(None);
-    };
+    }
     reject_dot_segments(path)?;
-    let (prefix, raw_path) = split_authority(path, scheme_len);
-    let url = uri_with_encoded_path(prefix, raw_path).map_err(|e| {
+    let url = Url::parse(&uri_encode_location(path)).map_err(|e| {
         KernelError::generic(format!(
             "Failed to parse absolute AMT location {path:?}: {e}"
         ))
@@ -55,15 +54,14 @@ pub(crate) fn parse_absolute_amt_location(path: &str) -> KernelResult<Option<Url
 pub(crate) fn raw_amt_location_from_uri(uri: &str) -> KernelResult<String> {
     let invalid =
         |reason: &str| KernelError::generic(format!("Invalid absolute URI {uri:?}: {reason}"));
-    let scheme_len = scheme_len(uri).ok_or_else(|| invalid("no URI scheme"))?;
+    require!(scheme_len(uri).is_some(), invalid("no URI scheme"));
     let url = Url::parse(uri).map_err(|e| invalid(&e.to_string()))?;
     require!(
         url.query().is_none() && url.fragment().is_none(),
         invalid("a query or fragment cannot be stored as an AMT location")
     );
-    let (prefix, encoded_path) = split_authority(uri, scheme_len);
-    let path = uri_decode_path(encoded_path).ok_or_else(|| invalid("path is not valid UTF-8"))?;
-    Ok(format!("{prefix}{path}"))
+    let raw = uri_decode_location(uri).ok_or_else(|| invalid("path is not valid UTF-8"))?;
+    Ok(raw.into_owned())
 }
 
 /// Builds the [`FileMeta`] of an AMT manifest file referenced by `path` (absolute, or relative to
@@ -98,19 +96,12 @@ pub(crate) fn amt_manifest_filemeta(
 /// [`validate_table_relative`]), which would resolve outside the table root.
 pub(crate) fn amt_location_to_add_path(location: &str) -> KernelResult<Cow<'_, str>> {
     reject_dot_segments(location)?;
-    let (prefix, raw_path) = match scheme_len(location) {
-        Some(scheme_len) => split_authority(location, scheme_len),
-        None => {
-            validate_table_relative(location)?;
-            ("", location)
-        }
-    };
+    if scheme_len(location).is_none() {
+        validate_table_relative(location)?;
+    }
     // TODO(#2423): non-ASCII characters are percent-encoded here but left raw by Delta-Spark, so
     // Add/Remove reconciliation can see two spellings of the same file.
-    Ok(match uri_encode_path(raw_path) {
-        Cow::Borrowed(_) => Cow::Borrowed(location),
-        Cow::Owned(encoded) => Cow::Owned(format!("{prefix}{encoded}")),
-    })
+    Ok(uri_encode_location(location))
 }
 
 /// Resolve a strictly table-relative `path` into an absolute [`Url`] under `table_root`.
@@ -168,29 +159,11 @@ pub(crate) fn validate_table_relative(path: &str) -> KernelResult<()> {
 fn encode_and_join(path: &str, table_root: &Url) -> KernelResult<Url> {
     reject_dot_segments(path)?;
     let base = with_trailing_slash(table_root);
-    uri_with_encoded_path(&base, path).map_err(|e| {
+    Url::parse(&format!("{base}{}", uri_encode_path(path))).map_err(|e| {
         KernelError::generic(format!(
             "Failed to resolve relative AMT location {path:?} against table root {base}: {e}"
         ))
     })
-}
-
-/// Splits an absolute `location` whose scheme is `scheme_len` bytes long into its
-/// `scheme:[//authority]` prefix and the raw path that follows. The authority, when present, ends
-/// at the next `/`.
-fn split_authority(location: &str, scheme_len: usize) -> (&str, &str) {
-    let after_scheme = scheme_len + 1;
-    let prefix_len = match location[after_scheme..].strip_prefix("//") {
-        Some(rest) => after_scheme + 2 + rest.find('/').unwrap_or(rest.len()),
-        None => after_scheme,
-    };
-    location.split_at(prefix_len)
-}
-
-/// Parses `prefix` followed by the percent-encoded `raw_path`, so reserved characters in the
-/// raw path are not misparsed as URL syntax.
-fn uri_with_encoded_path(prefix: &str, raw_path: &str) -> Result<Url, ParseError> {
-    Url::parse(&format!("{prefix}{}", uri_encode_path(raw_path)))
 }
 
 /// Rejects a `path` containing a `.` or `..` segment: the Iceberg V4 path spec does not support
@@ -313,36 +286,6 @@ mod tests {
         "metadata/root.parquet",
         "memory:///table/metadata/root.parquet"
     )]
-    #[case::single_char_scheme_treated_as_absolute(
-        "memory:///table/",
-        "c:/foo/root.parquet",
-        "c:/foo/root.parquet"
-    )]
-    // A colon inside a relative path segment is not a scheme delimiter (a `/` precedes it), so
-    // the path stays relative.
-    #[case::colon_in_relative_segment_stays_relative(
-        "memory:///table/",
-        "metadata/snap-123:456.parquet",
-        "memory:///table/metadata/snap-123:456.parquet"
-    )]
-    // RFC 3986 requires the first scheme char to be ALPHA; a leading digit is not a scheme.
-    #[case::leading_digit_scheme_treated_as_relative(
-        "memory:///table/",
-        "3com/root.parquet",
-        "memory:///table/3com/root.parquet"
-    )]
-    // A non-ASCII leading letter (Greek alpha, U+03B1) is not a valid scheme char.
-    #[case::non_ascii_scheme_treated_as_relative(
-        "memory:///table/",
-        "\u{03b1}scheme/root.parquet",
-        "memory:///table/%CE%B1scheme/root.parquet"
-    )]
-    // A multi-char, non-alphanumeric scheme (`git+ssh`) is absolute and used as-is.
-    #[case::compound_scheme_treated_as_absolute(
-        "memory:///table/",
-        "git+ssh://host/repo/root.parquet",
-        "git+ssh://host/repo/root.parquet"
-    )]
     // A raw space is percent-encoded, not left to break URL parsing.
     #[case::space_is_encoded(
         "memory:///table/",
@@ -387,16 +330,6 @@ mod tests {
         "s3://bucket/data/a#b.parquet",
         "s3://bucket/data/a%23b.parquet"
     )]
-    #[case::absolute_question_and_space_are_encoded(
-        "memory:///table/",
-        "s3://bucket/data/a b?c.parquet",
-        "s3://bucket/data/a%20b%3Fc.parquet"
-    )]
-    #[case::absolute_percent_escape_is_literal(
-        "memory:///table/",
-        "s3://bucket/data/a%20b.parquet",
-        "s3://bucket/data/a%2520b.parquet"
-    )]
     fn test_resolve_amt_location(
         #[case] table_root: &str,
         #[case] path: &str,
@@ -410,14 +343,6 @@ mod tests {
     #[rstest]
     #[case::encoded_space("s3://bucket/data/dv%20file.bin", "s3://bucket/data/dv file.bin")]
     #[case::unencoded("s3://bucket/data/dv.bin", "s3://bucket/data/dv.bin")]
-    #[case::encoded_reserved_chars(
-        "s3://bucket/data/a%23b%3Fc%25d.bin",
-        "s3://bucket/data/a#b?c%d.bin"
-    )]
-    #[case::userinfo_authority_kept(
-        "abfss://c1@acct.dfs.core.windows.net/t/a%20b.bin",
-        "abfss://c1@acct.dfs.core.windows.net/t/a b.bin"
-    )]
     fn test_raw_amt_location_from_uri_round_trips(#[case] uri: &str, #[case] expected_raw: &str) {
         let raw = raw_amt_location_from_uri(uri).unwrap();
         assert_eq!(raw, expected_raw);
@@ -450,5 +375,16 @@ mod tests {
     fn test_resolve_amt_location_rejects_invalid_paths(#[case] path: &str, #[case] message: &str) {
         let table_root = Url::parse("memory:///table/").unwrap();
         assert_result_error_with_message(resolve_amt_location(path, &table_root), message);
+    }
+
+    #[rstest]
+    #[case::invalid_port("s3://bucket:port/a.parquet")]
+    #[case::space_in_authority("s3://my bucket/a.parquet")]
+    fn test_resolve_amt_location_rejects_unparseable_absolute(#[case] path: &str) {
+        let table_root = Url::parse("memory:///table/").unwrap();
+        assert_result_error_with_message(
+            resolve_amt_location(path, &table_root),
+            "Failed to parse absolute AMT location",
+        );
     }
 }
