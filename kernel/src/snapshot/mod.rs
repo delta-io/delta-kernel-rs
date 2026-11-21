@@ -36,6 +36,10 @@ use crate::checkpoint::{
 };
 use crate::clustering::{CLUSTERING_DOMAIN_NAME, ClusteringColumnInfo, parse_clustering_columns};
 use crate::committer::{Committer, PublishMetadata};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::content_tree::file_metadata::FileMetadataFieldIds;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::crc::FileMetadataFieldIdsState;
 use crate::crc::{
     Crc, CrcDelta, DomainMetadataState, FileSizeHistogram, FileStats, SetTransactionState,
     try_write_crc_file,
@@ -428,6 +432,19 @@ impl Snapshot {
         Ok(found)
     }
 
+    /// The file metadata field ID mapping to read this snapshot's checkpoint action with. A CRC
+    /// file at the snapshot version is authoritative: field IDs never change and are assigned
+    /// before use, so its mapping covers every tree entry. `None` leaves the mapping to the
+    /// checkpoint's own domain metadata.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn file_metadata_ids_from_crc(&self) -> Option<FileMetadataFieldIds> {
+        match self.crc_at_version()?.file_metadata_field_ids() {
+            FileMetadataFieldIdsState::Mapped(ids) => Some(ids),
+            FileMetadataFieldIdsState::Unmapped => Some(FileMetadataFieldIds::default()),
+            FileMetadataFieldIdsState::Unknown => None,
+        }
+    }
+
     /// Reads this snapshot's log with `schema`, newest first, for log replay. For a table with an
     /// AMT `checkpoint` action (see [`Self::latest_checkpoint_action`]), that action stands in for
     /// the checkpoint and the commits at or below its version.
@@ -446,7 +463,7 @@ impl Snapshot {
                 schema,
                 None,
                 None,
-                None,
+                self.file_metadata_ids_from_crc(),
             )?;
             return Ok(result.actions);
         }

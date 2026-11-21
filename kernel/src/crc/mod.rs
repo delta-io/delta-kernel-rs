@@ -235,9 +235,7 @@ impl Crc {
     }
 
     /// Returns what this CRC says about the file metadata field ID mapping at its version.
-    // No non-test caller yet.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn file_metadata_field_ids(&self) -> FileMetadataFieldIdsState {
         self.file_metadata_field_ids
     }

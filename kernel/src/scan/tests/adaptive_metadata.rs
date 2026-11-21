@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use itertools::Itertools as _;
 use rstest::rstest;
-use serde_json::json;
+use serde_json::{Value, json};
 use url::Url;
 
 use super::get_files_for_scan;
@@ -27,10 +27,11 @@ use crate::schema::{SchemaRef, StructType, schema_ref};
 use crate::table_features::ColumnMappingMode;
 use crate::transaction::BASE_ADD_FILES_SCHEMA;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
-    checkpoint_action_with_root, commit_file_changes, commit_files, commit_root_manifest,
-    commit_root_manifest_file, create_adaptive_metadata_table, domain, protocol_and_metadata_lines,
-    setup_adaptive_metadata_table, write_amt_last_checkpoint_hint,
-    write_commit_after_manifest_commit, write_manifest_commit_keeping_pm,
+    adaptive_metadata_protocol_and_metadata, checkpoint_action_with_root, commit_file_changes,
+    commit_files, commit_root_manifest, commit_root_manifest_file, create_adaptive_metadata_table,
+    domain, protocol_and_metadata_lines, setup_adaptive_metadata_table,
+    write_amt_last_checkpoint_hint, write_commit_after_manifest_commit,
+    write_manifest_commit_keeping_pm,
 };
 use crate::unit_test_utils::{
     assert_result_error_with_message, parse_json_batch, string_array_to_engine_data,
@@ -747,4 +748,63 @@ fn scan_reads_file_metadata_mapping_without_opening_domain_sidecars() {
     write_manifest_commit_keeping_pm(&engine, &table_root(), 1, checkpoint).unwrap();
 
     assert_scan_clustering(&engine, 1, &[("a.parquet", Some(LIQUID))]);
+}
+
+/// Writes the CRC file at `version` for the table's protocol and metadata, with
+/// `fileMetadataFieldIds` set to `field_ids` when given.
+fn write_crc(engine: &SyncEngine, version: Version, field_ids: Option<Value>) {
+    let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
+    let mut crc = json!({
+        "tableSizeBytes": 0,
+        "numFiles": 0,
+        "numMetadata": 1,
+        "numProtocol": 1,
+        "protocol": protocol,
+        "metadata": metadata,
+        // AMT tables enable In-Commit Timestamps, so the CRC must carry one.
+        "inCommitTimestampOpt": 1,
+        "lastManifestCommit": { "version": version, "contentRootVersion": version },
+    });
+    if let Some(field_ids) = field_ids {
+        crc["fileMetadataFieldIds"] = field_ids;
+    }
+    let path = table_root()
+        .join(&format!("_delta_log/{version:020}.crc"))
+        .unwrap();
+    engine
+        .storage_handler()
+        .put(&path, crc.to_string().into(), false)
+        .unwrap();
+}
+
+#[rstest]
+#[case::crc_field_wins_over_checkpoint_mapping(
+    true,
+    Some(json!({"clusteringProvider": CLUSTERING_FIELD_ID})),
+    CLUSTERING_FIELD_ID + 1,
+    Some(LIQUID)
+)]
+#[case::crc_without_field_maps_nothing(true, None, CLUSTERING_FIELD_ID, None)]
+#[case::malformed_crc_field_falls_back_to_checkpoint_mapping(
+    true,
+    Some(json!({"clusteringProvider": "x"})),
+    CLUSTERING_FIELD_ID,
+    Some(LIQUID)
+)]
+#[case::no_crc_uses_checkpoint_mapping(false, None, CLUSTERING_FIELD_ID, Some(LIQUID))]
+fn scan_file_metadata_mapping_comes_from_crc_at_snapshot_version(
+    #[case] write_crc_file: bool,
+    #[case] crc_field_ids: Option<Value>,
+    #[case] checkpoint_field_id: i32,
+    #[case] expected: Option<&str>,
+) {
+    let (engine, _) = setup_adaptive_metadata_table();
+    let entries = vec![(added_data_entry("a.parquet", 1, 1, 0, 0), Some(LIQUID))];
+    let domains = vec![clustering_mapping_domain(checkpoint_field_id)];
+    commit_clustered_checkpoint(&engine, "metadata/root.parquet", entries, 1, domains);
+    if write_crc_file {
+        write_crc(&engine, 1, crc_field_ids);
+    }
+
+    assert_scan_clustering(&engine, 1, &[("a.parquet", expected)]);
 }
