@@ -1324,7 +1324,8 @@ mod tests {
     use crate::content_tree::dv_conversion::extract_deletion_vector_content;
     use crate::content_tree::stats::MAX_DATA_FIELD_ID;
     use crate::content_tree::test_utils::{
-        action_paths, added_data_entry, data_manifest_entry, entry_batch, mumbling_bitmap,
+        CLUSTERING_FIELD_ID, action_paths, added_data_entry, content_stats_value_with_clustering,
+        content_stats_with_clustering, data_manifest_entry, entry_batch, mumbling_bitmap,
         struct_batch, test_dv_info, with_field, write_manifest, write_manifest_with_stats,
         x_full_stats, x_full_stats_value, x_upper_bound_stats,
     };
@@ -1897,44 +1898,11 @@ mod tests {
 
     const LIQUID: &str = "liquid";
 
-    /// Field ID the tests map `clusteringProvider` to. Its stats struct is keyed at 30_000, so it
-    /// cannot collide with the `x` leaf of [`x_full_stats`].
-    const CLUSTERING_FIELD_ID: i32 = 100;
-
     fn clustering_mapping() -> FileMetadataRead {
         FileMetadataRead::try_new(FileMetadataFieldIds {
             clustering_provider: Some(CLUSTERING_FIELD_ID),
         })
         .unwrap()
-    }
-
-    fn clustering_field() -> StructField {
-        file_metadata_stats_field(CLUSTERING_PROVIDER_NAME, CLUSTERING_FIELD_ID).unwrap()
-    }
-
-    fn content_stats_with_clustering() -> StructType {
-        StructType::new_unchecked(x_full_stats().fields().cloned().chain([clustering_field()]))
-    }
-
-    /// [`x_full_stats_value`] plus the mapped `clusteringProvider` stats struct, whose
-    /// `lower_bound` is `lower_bound`.
-    fn content_stats_value_with_clustering(lower_bound: Scalar) -> Scalar {
-        let Scalar::Struct(x) = x_full_stats_value() else {
-            panic!("content_stats must be a struct");
-        };
-        let DataType::Struct(clustering_type) = clustering_field().data_type().clone() else {
-            panic!("file metadata stats must be a struct");
-        };
-        let clustering = Scalar::Struct(
-            StructData::try_new(
-                schema_ref! { ..(clustering_type.fields()) },
-                vec![lower_bound],
-            )
-            .unwrap(),
-        );
-        let fields = content_stats_with_clustering().into();
-        let values = x.values().iter().cloned().chain([clustering]).collect();
-        Scalar::Struct(StructData::try_new(fields, values).unwrap())
     }
 
     #[test]
