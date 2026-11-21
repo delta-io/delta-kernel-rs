@@ -43,11 +43,12 @@ use delta_kernel_ffi_macros::handle_descriptor;
 #[cfg(feature = "default-engine-base")]
 use crate::engine_data::ArrowFFIData;
 use crate::handle::Handle;
+use crate::panic::catch_panic_into_result;
 #[cfg(feature = "default-engine-base")]
 use crate::scan::{CTransforms, ScanMetadataArrowResult};
 use crate::scan::{EnginePredicate, decode_engine_predicate};
 use crate::{
-    ExternEngine, ExternResult, IntoExternResult, KernelStringSlice, NullableCvoid, OptionalValue,
+    ExternEngine, ExternResult, KernelStringSlice, NullableCvoid, OptionalValue,
     SharedExternEngine, SharedSnapshot, kernel_string_slice,
 };
 
@@ -134,10 +135,12 @@ pub unsafe extern "C" fn incremental_scan_builder_with_predicate(
     engine: Handle<SharedExternEngine>,
     predicate: &mut EnginePredicate,
 ) -> ExternResult<Handle<ExclusiveIncrementalScanBuilder>> {
-    let engine = unsafe { engine.as_ref() };
-    let builder = unsafe { builder.into_inner() };
-    let result = incremental_scan_builder_with_predicate_impl(*builder, predicate);
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let builder = builder.into_inner();
+            incremental_scan_builder_with_predicate_impl(*builder, predicate)
+        })
+    }
 }
 
 fn incremental_scan_builder_with_predicate_impl(
@@ -168,10 +171,13 @@ fn incremental_scan_builder_with_predicate_impl(
 pub unsafe extern "C" fn incremental_scan_builder_build(
     builder: Handle<ExclusiveIncrementalScanBuilder>,
 ) -> ExternResult<OptionalValue<Handle<SharedIncrementalScanStream>>> {
-    let builder = unsafe { builder.into_inner() };
-    let engine = builder.engine.clone();
-    let result = incremental_scan_builder_build_impl(*builder);
-    unsafe { result.into_extern_result(&engine.as_ref()) }
+    let panic_engine = unsafe { builder.as_ref() }.engine.clone();
+    unsafe {
+        catch_panic_into_result(&panic_engine.as_ref(), || {
+            let builder = builder.into_inner();
+            incremental_scan_builder_build_impl(*builder)
+        })
+    }
 }
 
 fn incremental_scan_builder_build_impl(
@@ -228,9 +234,13 @@ pub unsafe extern "C" fn free_incremental_scan_builder(
 pub unsafe extern "C" fn incremental_scan_stream_next_arrow(
     stream: Handle<SharedIncrementalScanStream>,
 ) -> ExternResult<*mut ScanMetadataArrowResult> {
-    let stream = unsafe { stream.as_ref() };
-    let result = incremental_scan_stream_next_arrow_impl(stream);
-    unsafe { result.into_extern_result(&stream.engine.as_ref()) }
+    let panic_engine = unsafe { stream.as_ref() }.engine.clone();
+    unsafe {
+        catch_panic_into_result(&panic_engine.as_ref(), || {
+            let stream = stream.as_ref();
+            incremental_scan_stream_next_arrow_impl(stream)
+        })
+    }
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -288,10 +298,13 @@ fn next_arrow_batch(
 pub unsafe extern "C" fn incremental_scan_stream_into_summary(
     stream: Handle<SharedIncrementalScanStream>,
 ) -> ExternResult<Handle<SharedIncrementalScanSummary>> {
-    let inner_stream = unsafe { stream.into_inner() };
-    let engine = inner_stream.engine.clone();
-    let result = incremental_scan_stream_into_summary_impl(&inner_stream);
-    unsafe { result.into_extern_result(&engine.as_ref()) }
+    let panic_engine = unsafe { stream.as_ref() }.engine.clone();
+    unsafe {
+        catch_panic_into_result(&panic_engine.as_ref(), || {
+            let inner_stream = stream.into_inner();
+            incremental_scan_stream_into_summary_impl(&inner_stream)
+        })
+    }
 }
 
 fn incremental_scan_stream_into_summary_impl(

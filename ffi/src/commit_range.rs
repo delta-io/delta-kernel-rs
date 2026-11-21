@@ -10,9 +10,10 @@ use url::Url;
 use crate::engine_funcs::{ExclusiveFileReadResultIterator, FileReadResultIterator};
 use crate::handle::Handle;
 use crate::log_path::{FfiLogPath, LogPathArray};
+use crate::panic::catch_panic_into_result;
 use crate::{
-    ExternEngine, ExternResult, IntoExternResult, KernelStringSlice, NullableCvoid,
-    SharedExternEngine, SharedSnapshot, unwrap_and_parse_path_as_url,
+    ExternEngine, ExternResult, KernelStringSlice, NullableCvoid, SharedExternEngine,
+    SharedSnapshot, unwrap_and_parse_path_as_url,
 };
 
 /// An opaque, shared handle owning a [`CommitRange`] produced by
@@ -80,11 +81,13 @@ pub unsafe extern "C" fn commit_range_builder_for(
     start_version: Version,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveCommitRangeBuilder>> {
-    let engine_ref = unsafe { engine.as_ref() };
-    let engine_arc = unsafe { engine.clone_as_arc() };
-    let url = unsafe { unwrap_and_parse_path_as_url(path) };
-    let result = url.map(|url| make_commit_range_builder(url, start_version, engine_arc));
-    unsafe { result.into_extern_result(&engine_ref) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let engine_arc = engine.clone_as_arc();
+            let url = unwrap_and_parse_path_as_url(path);
+            url.map(|url| make_commit_range_builder(url, start_version, engine_arc))
+        })
+    }
 }
 
 /// Pin the end version of the range. When omitted, the range extends to the latest committed
@@ -122,14 +125,17 @@ pub unsafe extern "C" fn commit_range_builder_with_log_tail(
     log_tail: LogPathArray,
     max_catalog_version: Version,
 ) -> ExternResult<Handle<ExclusiveCommitRangeBuilder>> {
-    let mut builder = unsafe { builder.into_inner() };
-    let engine = builder.engine.clone();
-    let result = unsafe { log_tail.log_paths() }.map(|paths| {
-        builder.log_tail = paths;
-        builder.max_catalog_version = Some(max_catalog_version);
-        builder.into()
-    });
-    unsafe { result.into_extern_result(&engine.as_ref()) }
+    let panic_engine = unsafe { builder.as_ref() }.engine.clone();
+    unsafe {
+        catch_panic_into_result(&panic_engine.as_ref(), || {
+            let mut builder = builder.into_inner();
+            log_tail.log_paths().map(|paths| {
+                builder.log_tail = paths;
+                builder.max_catalog_version = Some(max_catalog_version);
+                builder.into()
+            })
+        })
+    }
 }
 
 /// Set the maximum catalog-ratified version on the builder.
@@ -207,10 +213,13 @@ pub unsafe extern "C" fn commit_range_builder_with_fail_on_data_loss(
 pub unsafe extern "C" fn commit_range_builder_build(
     builder: Handle<ExclusiveCommitRangeBuilder>,
 ) -> ExternResult<Handle<SharedCommitRange>> {
-    let builder_box = unsafe { builder.into_inner() };
-    let engine = builder_box.engine.clone();
-    let result = commit_range_builder_build_impl(*builder_box);
-    unsafe { result.into_extern_result(&engine.as_ref()) }
+    let panic_engine = unsafe { builder.as_ref() }.engine.clone();
+    unsafe {
+        catch_panic_into_result(&panic_engine.as_ref(), || {
+            let builder_box = builder.into_inner();
+            commit_range_builder_build_impl(*builder_box)
+        })
+    }
 }
 
 fn commit_range_builder_build_impl(
@@ -369,11 +378,13 @@ pub unsafe extern "C" fn commit_action_get_actions(
     commit_action: Handle<SharedCommitAction>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveFileReadResultIterator>> {
-    let engine_ref = unsafe { engine.as_ref() };
-    let commit_action = unsafe { commit_action.as_ref() };
-    let engine_arc = unsafe { engine.clone_as_arc() };
-    let result = commit_action_get_actions_impl(commit_action, engine_arc);
-    unsafe { result.into_extern_result(&engine_ref) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let commit_action = commit_action.as_ref();
+            let engine_arc = engine.clone_as_arc();
+            commit_action_get_actions_impl(commit_action, engine_arc)
+        })
+    }
 }
 
 fn commit_action_get_actions_impl(
@@ -435,12 +446,14 @@ pub unsafe extern "C" fn commit_range_commits(
     actions: *const DeltaAction,
     actions_len: usize,
 ) -> ExternResult<Handle<SharedCommitActionsIterator>> {
-    let engine_ref = unsafe { engine.as_ref() };
-    let commit_range = unsafe { commit_range.as_ref() };
-    let engine_arc = unsafe { engine.clone_as_arc() };
-    let actions = unsafe { parse_actions(actions, actions_len) };
-    let result = commit_range_commits_impl(commit_range, engine_arc, None, actions);
-    unsafe { result.into_extern_result(&engine_ref) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let commit_range = commit_range.as_ref();
+            let engine_arc = engine.clone_as_arc();
+            let actions = parse_actions(actions, actions_len);
+            commit_range_commits_impl(commit_range, engine_arc, None, actions)
+        })
+    }
 }
 
 /// Like [`commit_range_commits`], but seeds the iterator's protocol/metadata from `start_snapshot`.
@@ -466,13 +479,15 @@ pub unsafe extern "C" fn commit_range_commits_with_snapshot(
     actions: *const DeltaAction,
     actions_len: usize,
 ) -> ExternResult<Handle<SharedCommitActionsIterator>> {
-    let engine_ref = unsafe { engine.as_ref() };
-    let commit_range = unsafe { commit_range.as_ref() };
-    let engine_arc = unsafe { engine.clone_as_arc() };
-    let start_snapshot = unsafe { start_snapshot.clone_as_arc() };
-    let actions = unsafe { parse_actions(actions, actions_len) };
-    let result = commit_range_commits_impl(commit_range, engine_arc, Some(start_snapshot), actions);
-    unsafe { result.into_extern_result(&engine_ref) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let commit_range = commit_range.as_ref();
+            let engine_arc = engine.clone_as_arc();
+            let start_snapshot = start_snapshot.clone_as_arc();
+            let actions = parse_actions(actions, actions_len);
+            commit_range_commits_impl(commit_range, engine_arc, Some(start_snapshot), actions)
+        })
+    }
 }
 
 fn commit_range_commits_impl(
@@ -508,9 +523,13 @@ pub unsafe extern "C" fn commit_range_commits_next(
         commit_action: Handle<SharedCommitAction>,
     ),
 ) -> ExternResult<bool> {
-    let data = unsafe { data.as_ref() };
-    let result = commit_range_commits_next_impl(data, engine_context, engine_visitor);
-    unsafe { result.into_extern_result(&data.engine.as_ref()) }
+    let panic_engine = unsafe { data.as_ref() }.engine.clone();
+    unsafe {
+        catch_panic_into_result(&panic_engine.as_ref(), || {
+            let data = data.as_ref();
+            commit_range_commits_next_impl(data, engine_context, engine_visitor)
+        })
+    }
 }
 
 fn commit_range_commits_next_impl(
@@ -592,11 +611,13 @@ pub unsafe extern "C" fn commit_range_commit_files(
     commit_range: Handle<SharedCommitRange>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedCommitFilesIterator>> {
-    let engine_ref = unsafe { engine.as_ref() };
-    let commit_range = unsafe { commit_range.as_ref() };
-    let engine_arc = unsafe { engine.clone_as_arc() };
-    let result = commit_range_commit_files_impl(commit_range, engine_arc);
-    unsafe { result.into_extern_result(&engine_ref) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let commit_range = commit_range.as_ref();
+            let engine_arc = engine.clone_as_arc();
+            commit_range_commit_files_impl(commit_range, engine_arc)
+        })
+    }
 }
 
 fn commit_range_commit_files_impl(
@@ -628,9 +649,13 @@ pub unsafe extern "C" fn commit_range_commit_files_next(
     engine_context: NullableCvoid,
     engine_visitor: extern "C" fn(engine_context: NullableCvoid, commit_file: *const FfiCommitFile),
 ) -> ExternResult<bool> {
-    let data = unsafe { data.as_ref() };
-    let result = commit_range_commit_files_next_impl(data, engine_context, engine_visitor);
-    unsafe { result.into_extern_result(&data.engine.as_ref()) }
+    let panic_engine = unsafe { data.as_ref() }.engine.clone();
+    unsafe {
+        catch_panic_into_result(&panic_engine.as_ref(), || {
+            let data = data.as_ref();
+            commit_range_commit_files_next_impl(data, engine_context, engine_visitor)
+        })
+    }
 }
 
 fn commit_range_commit_files_next_impl(
