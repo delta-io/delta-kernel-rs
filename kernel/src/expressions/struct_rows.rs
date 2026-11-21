@@ -37,7 +37,7 @@ use crate::{KernelError, KernelResult};
 #[cfg(feature = "declarative-plans")]
 pub(crate) mod engine_rows;
 
-/// Collects struct rows into a row, optional row, or vector.
+/// Collects struct rows into a row, optional row, vector, or named payload collections.
 #[internal_api]
 pub(crate) trait TryFromStructRows: Sized {
     /// The input row type whose schema is used for decoding.
