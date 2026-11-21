@@ -1344,10 +1344,7 @@ mod tests {
     fn present_dv() -> Scalar {
         Scalar::Struct(
             StructData::try_new(
-                DeletionVectorDescriptor::to_schema()
-                    .fields()
-                    .cloned()
-                    .collect(),
+                DeletionVectorDescriptor::schema_ref().clone(),
                 vec![
                     Scalar::from("i"),
                     Scalar::from("inline"),

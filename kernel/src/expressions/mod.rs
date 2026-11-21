@@ -33,6 +33,13 @@ use crate::{DataType, DynPartialEq, KernelError, KernelResult};
 mod column_names;
 mod macros;
 mod scalars;
+#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+pub(crate) mod struct_rows;
+#[cfg(feature = "internal-api")]
+pub use struct_rows::TryFromStructRows;
+#[cfg(feature = "internal-api")]
+#[doc(hidden)]
+pub use struct_rows::group_struct_rows;
 mod sql;
 pub(crate) use self::sql::parse_sql;
 
@@ -1626,7 +1633,7 @@ mod tests {
             ExpressionStructPatchBuilder, MapToStructOptions, Predicate, Scalar, UnaryExpressionOp,
             col, column_name, expr, lit, null_lit,
         };
-        use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
+        use crate::schema::{ArrayType, DataType, DecimalType, MapType, schema_ref};
         use crate::unit_test_utils::assert_result_error_with_message;
 
         // ==================== Expression::Literal Tests ====================
@@ -1693,10 +1700,7 @@ mod tests {
                 // Struct
                 Expression::Literal(Scalar::Struct(
                     StructData::try_new(
-                        vec![
-                            StructField::nullable("x", DataType::INTEGER),
-                            StructField::nullable("y", DataType::STRING),
-                        ],
+                        schema_ref! { nullable "x": INTEGER, nullable "y": STRING },
                         vec![Scalar::Integer(42), Scalar::String("hello".to_string())],
                     )
                     .unwrap(),

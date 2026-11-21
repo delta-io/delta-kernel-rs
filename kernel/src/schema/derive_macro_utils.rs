@@ -2,6 +2,7 @@
 ///
 /// Not intended for use by normal code.
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -9,7 +10,7 @@ use delta_kernel_derive::internal_api;
 
 use crate::error::add_scalar_path_context;
 use crate::expressions::{MapData, Scalar, StructData};
-use crate::schema::{ArrayType, DataType, MapType, StructField, StructType, ToSchema};
+use crate::schema::{ArrayType, DataType, MapType, SchemaRef, StructField, ToSchema};
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
 
@@ -188,51 +189,86 @@ impl<T: ToNullableContainerType> GetNullableContainerStructField for Option<T> {
     }
 }
 
+/// Converts a decoded map with nullable values, dropping null entries.
+#[internal_api]
+pub(crate) trait FromNullableContainer: Sized {
+    type Nullable;
+
+    fn from_nullable(value: Self::Nullable) -> Self;
+}
+
+impl<K: Eq + Hash, V> FromNullableContainer for HashMap<K, V> {
+    type Nullable = HashMap<K, Option<V>>;
+
+    fn from_nullable(value: Self::Nullable) -> Self {
+        value
+            .into_iter()
+            .filter_map(|(key, value)| value.map(|value| (key, value)))
+            .collect()
+    }
+}
+
+impl<K: Eq + Hash, V> FromNullableContainer for Option<HashMap<K, V>> {
+    type Nullable = Option<HashMap<K, Option<V>>>;
+
+    fn from_nullable(value: Self::Nullable) -> Self {
+        value.map(HashMap::<K, V>::from_nullable)
+    }
+}
+
+/// Requires exactly one non-null payload in a mixed row.
+#[allow(unused)]
+#[internal_api]
+pub(crate) fn validate_variant(values: &[Scalar]) -> KernelResult<()> {
+    let count = values.iter().filter(|value| !value.is_null()).count();
+    require!(
+        count == 1,
+        KernelError::invalid_struct_data(format!(
+            "Expected exactly one non-null variant, found {count}",
+        ))
+    );
+    Ok(())
+}
+
 /// Named fields consumed by the [`delta_kernel_derive::TryFromStructData`] macro.
 ///
 /// Field conversion errors acquire their path element as they unwind. Successful conversion does
 /// not allocate or maintain path state.
 #[internal_api]
 pub(crate) struct StructDataFields {
-    expected: StructType,
-    fields: HashMap<String, (StructField, Scalar)>,
+    expected: SchemaRef,
+    actual: SchemaRef,
+    values: Vec<Option<Scalar>>,
 }
 
 impl StructDataFields {
-    pub(crate) fn try_new(data: StructData, expected: StructType) -> KernelResult<Self> {
-        let (actual_fields, values) = data.into_parts();
+    /// Creates a field decoder after checking that the value count matches both schemas.
+    #[internal_api]
+    pub(crate) fn try_new(data: StructData, expected: SchemaRef) -> KernelResult<Self> {
+        let (actual, values) = data.into_parts();
         require!(
-            actual_fields.len() == values.len(),
+            actual.num_fields() == values.len(),
             KernelError::scalar_conversion(
-                format!("{} struct values", actual_fields.len()),
+                format!("{} struct values", actual.num_fields()),
                 format!("{} struct values", values.len()),
             )
         );
         require!(
-            actual_fields.len() == expected.num_fields(),
+            actual.num_fields() == expected.num_fields(),
             KernelError::scalar_conversion(
                 format!("struct with {} fields", expected.num_fields()),
-                format!("struct with {} fields", actual_fields.len()),
+                format!("struct with {} fields", actual.num_fields()),
             )
         );
-        let mut fields = HashMap::with_capacity(actual_fields.len());
-        for (field, value) in actual_fields.into_iter().zip(values) {
-            let name = field.name().clone();
-            match fields.entry(name) {
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert((field, value));
-                }
-                std::collections::hash_map::Entry::Occupied(entry) => {
-                    return Err(add_scalar_path_context(
-                        KernelError::scalar_conversion("one field", "duplicate fields"),
-                        entry.key().clone(),
-                    ));
-                }
-            }
-        }
-        Ok(Self { expected, fields })
+        Ok(Self {
+            expected,
+            actual,
+            values: values.into_iter().map(Some).collect(),
+        })
     }
 
+    /// Consumes the named field, checks its schema nullability, and decodes its value.
+    #[internal_api]
     pub(crate) fn take_field<T: TryFrom<Scalar, Error = KernelError>>(
         &mut self,
         field_name: &str,
@@ -242,12 +278,17 @@ impl StructDataFields {
                 "Derived schema does not contain generated field {field_name:?}"
             ))
         })?;
-        let (actual_field, value) = self.fields.remove(field_name).ok_or_else(|| {
+        let missing = || {
             add_scalar_path_context(
                 KernelError::scalar_conversion("present field", "missing field"),
                 field_name,
             )
-        })?;
+        };
+        let (index, actual_field) = self
+            .actual
+            .field_with_index(field_name)
+            .ok_or_else(missing)?;
+        let value = self.values[index].take().ok_or_else(missing)?;
         require!(
             actual_field.is_nullable() == expected.is_nullable(),
             add_scalar_path_context(
@@ -271,11 +312,17 @@ impl StructDataFields {
     }
 
     /// Verifies that every named field was consumed.
+    #[internal_api]
     pub(crate) fn finish(self) -> KernelResult<()> {
-        if self.fields.is_empty() {
+        let mut extra: Vec<_> = self
+            .actual
+            .fields()
+            .zip(self.values)
+            .filter_map(|(field, value)| value.map(|_| field.name()))
+            .collect();
+        if extra.is_empty() {
             return Ok(());
         }
-        let mut extra: Vec<_> = self.fields.keys().collect();
         extra.sort_unstable();
         Err(KernelError::scalar_conversion(
             "no additional fields",
@@ -293,8 +340,66 @@ mod tests {
 
     use bytes::Bytes;
     use delta_kernel_derive::ToSchema;
+    use rstest::rstest;
 
-    use crate::schema::{ToSchema, schema};
+    use super::FromNullableContainer;
+    use crate::KernelResult;
+    use crate::expressions::Scalar;
+    use crate::schema::{DataType, MapType, ToSchema, schema};
+
+    fn project_nullable_map(
+        value: Scalar,
+        optional: bool,
+    ) -> KernelResult<Option<HashMap<String, String>>> {
+        if optional {
+            Ok(Option::<HashMap<String, String>>::from_nullable(
+                value.try_into()?,
+            ))
+        } else {
+            Ok(Some(HashMap::<String, String>::from_nullable(
+                value.try_into()?,
+            )))
+        }
+    }
+
+    #[rstest]
+    #[case::empty(HashMap::new(), HashMap::new())]
+    #[case::all_null(HashMap::from([("null".into(), None)]), HashMap::new())]
+    #[case::mixed(
+        HashMap::from([
+            ("null".into(), None),
+            ("empty".into(), Some("".into())),
+            ("value".into(), Some("kept".into())),
+        ]),
+        HashMap::from([("empty".into(), "".into()), ("value".into(), "kept".into())])
+    )]
+    fn nullable_container_projection_drops_only_null_entries(
+        #[case] values: HashMap<String, Option<String>>,
+        #[case] expected: HashMap<String, String>,
+        #[values(false, true)] optional: bool,
+    ) {
+        assert_eq!(
+            project_nullable_map(Scalar::from(values), optional).unwrap(),
+            Some(expected)
+        );
+    }
+
+    #[rstest]
+    #[case::matching_map(MapType::new(DataType::STRING, DataType::STRING, true).into(), true)]
+    #[case::non_nullable_values(MapType::new(DataType::STRING, DataType::STRING, false).into(), false)]
+    #[case::wrong_key(MapType::new(DataType::LONG, DataType::STRING, true).into(), false)]
+    #[case::wrong_value(MapType::new(DataType::STRING, DataType::LONG, true).into(), false)]
+    #[case::non_map(DataType::STRING, false)]
+    fn nullable_container_null_requires_optional_matching_map(
+        #[case] data_type: DataType,
+        #[case] matching: bool,
+        #[values(false, true)] optional: bool,
+    ) {
+        assert_eq!(
+            project_nullable_map(Scalar::Null(data_type), optional).ok(),
+            (optional && matching).then_some(None)
+        );
+    }
 
     #[derive(ToSchema)]
     struct AllPrimitivesNotNull {
