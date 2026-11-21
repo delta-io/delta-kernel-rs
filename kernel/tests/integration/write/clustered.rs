@@ -21,6 +21,7 @@ use delta_kernel::transaction::{
 };
 use delta_kernel::{EngineData as _, Snapshot};
 use itertools::Itertools;
+use rstest_reuse::apply;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
@@ -35,12 +36,14 @@ use test_utils::{
 use url::Url;
 
 use crate::common::write_utils::{
-    assert_column_mapping_mode, assert_min_max_stats, get_simple_schema, resolve_json_path,
-    resolve_struct_field, set_table_properties, simple_id_batch,
+    assert_column_mapping_mode, assert_min_max_stats, checkpoint_engine, checkpoint_modes,
+    get_simple_schema, resolve_json_path, resolve_struct_field, set_table_properties,
+    simple_id_batch,
 };
 
+#[apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_checkpoint_non_kernel_written_table() {
+async fn test_checkpoint_non_kernel_written_table(declarative: bool) {
     // Table written by a non-kernel-integrated connector: 7 rows with columns (i, j, k), where
     // parquet field nullabilities differ from the Delta schema. DefaultEngine reads it, coerces
     // nullabilities to match the Delta schema, creates a checkpoint, and verifies the data is
@@ -71,7 +74,10 @@ async fn test_checkpoint_non_kernel_written_table() {
     let batches_before = test_utils::read_scan(&scan_before, engine.clone()).unwrap();
 
     // Create checkpoint via snapshot.checkpoint()
-    snapshot.checkpoint(engine.as_ref(), None).unwrap();
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
+    snapshot
+        .checkpoint(checkpoint_engine.as_ref(), None)
+        .unwrap();
 
     // Read data after checkpoint
     let snapshot_after = Snapshot::builder_for(url.clone())
@@ -237,13 +243,14 @@ async fn test_clustered_table_write_has_stats(
 
 /// E2E test: create a clustered table with column mapping, enable writeStatsAsStruct,
 /// write data, checkpoint, and verify stats_parsed.
-#[rstest::rstest]
+#[apply(checkpoint_modes)]
 #[case::cm_none("none")]
 #[case::cm_name("name")]
 #[case::cm_id("id")]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_clustered_table_write_has_stats_parsed(
     #[case] cm_mode: &str,
+    declarative: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -286,7 +293,8 @@ async fn test_clustered_table_write_has_stats_parsed(
         get_any_level_column_physical_name(snapshot.schema().as_ref(), &column_name!("name"), cm)?
             .into_inner();
 
-    snapshot.checkpoint(engine.as_ref(), None)?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
+    snapshot.checkpoint(checkpoint_engine.as_ref(), None)?;
 
     // Read checkpoint parquet directly to verify stats_parsed contains only clustering columns.
     // `ScanBuilder::with_stats(StatsOptions::all())` doesn't support stats_parsed when

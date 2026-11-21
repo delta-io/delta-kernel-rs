@@ -39,6 +39,7 @@ use delta_kernel::{
     plans::{Operation, PlanExecutor as _, ir::nodes::FileType},
 };
 use rstest::rstest;
+use rstest_reuse::apply;
 use serde::Serialize;
 use serde_json::{Value, json};
 use test_utils::delta_kernel_default_engine::DefaultEngine;
@@ -50,7 +51,7 @@ use test_utils::{
 };
 use url::Url;
 
-use crate::common::write_utils::set_table_properties;
+use crate::common::write_utils::{checkpoint_engine, checkpoint_modes, set_table_properties};
 
 type TestEngine = DefaultEngine<TokioMultiThreadExecutor>;
 
@@ -87,8 +88,9 @@ fn long_batch(schema: &SchemaRef, c0_start: i64, rows: i64) -> RecordBatch {
 /// Creates a fresh table with `dataSkippingNumIndexedCols=2`, writes three add-files with
 /// disjoint `c0`/`c1` ranges, then checkpoints. Returns `(temp_dir, table_path, engine)`.
 /// The `temp_dir` keeps the on-disk table alive for the duration of the test.
-async fn build_capped_table_with_checkpoint()
--> Result<(tempfile::TempDir, String, Arc<TestEngine>), Box<dyn std::error::Error>> {
+async fn build_capped_table_with_checkpoint(
+    declarative: bool,
+) -> Result<(tempfile::TempDir, String, Arc<TestEngine>), Box<dyn std::error::Error>> {
     let schema = capped_schema();
     let (tmp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = Url::from_directory_path(&table_path)
@@ -118,7 +120,8 @@ async fn build_capped_table_with_checkpoint()
         .await?;
     }
 
-    snapshot.checkpoint(engine.as_ref(), None)?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
+    snapshot.checkpoint(checkpoint_engine.as_ref(), None)?;
     Ok((tmp_dir, table_path, engine))
 }
 
@@ -208,45 +211,49 @@ fn surviving_paths(
 //   file C: c0 in [100, 109], c1 in [200, 209]
 //   c2/c3/c4: past-cap, no stats.
 
-#[rstest]
+#[apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn all_in_cap_prunes(
     #[values(false, true)] use_parallel: bool,
+    declarative: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_tmp_dir, table_path, engine) = build_capped_table_with_checkpoint().await?;
+    let (_tmp_dir, table_path, engine) = build_capped_table_with_checkpoint(declarative).await?;
     let pred = Arc::new(Pred::from_expr(expr!(col("c0") > 60i64)));
     assert_eq!(surviving_files(&table_path, engine, pred, use_parallel)?, 1);
     Ok(())
 }
 
-#[rstest]
+#[apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn all_in_cap_keeps_all(
     #[values(false, true)] use_parallel: bool,
+    declarative: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_tmp_dir, table_path, engine) = build_capped_table_with_checkpoint().await?;
+    let (_tmp_dir, table_path, engine) = build_capped_table_with_checkpoint(declarative).await?;
     let pred = Arc::new(Pred::from_expr(expr!(col("c0") > 0i64)));
     assert_eq!(surviving_files(&table_path, engine, pred, use_parallel)?, 3);
     Ok(())
 }
 
-#[rstest]
+#[apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn all_past_cap_keeps_all(
     #[values(false, true)] use_parallel: bool,
+    declarative: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_tmp_dir, table_path, engine) = build_capped_table_with_checkpoint().await?;
+    let (_tmp_dir, table_path, engine) = build_capped_table_with_checkpoint(declarative).await?;
     let pred = Arc::new(Pred::from_expr(expr!(col("c4") > 1_000_000i64)));
     assert_eq!(surviving_files(&table_path, engine, pred, use_parallel)?, 3);
     Ok(())
 }
 
-#[rstest]
+#[apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mixed_and_in_cap_prunes(
     #[values(false, true)] use_parallel: bool,
+    declarative: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_tmp_dir, table_path, engine) = build_capped_table_with_checkpoint().await?;
+    let (_tmp_dir, table_path, engine) = build_capped_table_with_checkpoint(declarative).await?;
     // c0 > 60 prunes files A and B; c4 > 50 is past-cap and folds to NULL.
     // AND(false, NULL) = false keeps the prune; AND(true, NULL) = NULL keeps file C.
     let pred = Arc::new(Pred::from_expr(expr!(and(
@@ -257,12 +264,13 @@ async fn mixed_and_in_cap_prunes(
     Ok(())
 }
 
-#[rstest]
+#[apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mixed_or_keeps_all(
     #[values(false, true)] use_parallel: bool,
+    declarative: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_tmp_dir, table_path, engine) = build_capped_table_with_checkpoint().await?;
+    let (_tmp_dir, table_path, engine) = build_capped_table_with_checkpoint(declarative).await?;
     // c0 > 1000 would prune all 3 by max; c4 > 50 is past-cap and folds to NULL.
     // OR(false, NULL) = NULL keeps every file.
     let pred = Arc::new(Pred::from_expr(expr!(or(
@@ -273,12 +281,13 @@ async fn mixed_or_keeps_all(
     Ok(())
 }
 
-#[rstest]
+#[apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn boundary_c1_prunes_all(
     #[values(false, true)] use_parallel: bool,
+    declarative: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_tmp_dir, table_path, engine) = build_capped_table_with_checkpoint().await?;
+    let (_tmp_dir, table_path, engine) = build_capped_table_with_checkpoint(declarative).await?;
     // c1 max across files is 209 < 250 so the in-cap arm rules out everything.
     // c2 > 50 is past-cap and folds to NULL; AND(false, NULL) = false everywhere.
     let pred = Arc::new(Pred::from_expr(expr!(and(
@@ -296,6 +305,7 @@ async fn boundary_c1_prunes_all(
 /// original `add.stats` verbatim, so the past-cap stats survive into the checkpoint.
 async fn build_table_with_past_cap_stats(
     checkpoint: bool,
+    declarative: bool,
 ) -> Result<(tempfile::TempDir, String, Arc<TestEngine>), Box<dyn std::error::Error>> {
     let schema = capped_schema();
     let (tmp_dir, table_path, engine) = test_table_setup_mt()?;
@@ -322,7 +332,8 @@ async fn build_table_with_past_cap_stats(
         &[("delta.dataSkippingNumIndexedCols", "2")],
     )?;
     if checkpoint {
-        snapshot.checkpoint(engine.as_ref(), None)?;
+        let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
+        snapshot.checkpoint(checkpoint_engine.as_ref(), None)?;
     }
     Ok((tmp_dir, table_path, engine))
 }
@@ -433,7 +444,7 @@ async fn past_cap_column_surfaces_in_stats_parsed_output(
     #[case] stats: StatsOptions,
     #[case] expected_min_fields: &[&str],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_tmp_dir, table_path, engine) = build_table_with_past_cap_stats(false).await?;
+    let (_tmp_dir, table_path, engine) = build_table_with_past_cap_stats(false, false).await?;
     let url = delta_kernel::try_parse_uri(&table_path)?;
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
     let scan = snapshot.scan_builder().with_stats(stats).build()?;
@@ -445,7 +456,7 @@ async fn past_cap_column_surfaces_in_stats_parsed_output(
 }
 
 /// The checkpoint case verifies JSON recovery when struct stats omit the past-cap column.
-#[rstest]
+#[apply(checkpoint_modes)]
 #[case::json_commits(false)]
 #[case::checkpoint(true)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -459,8 +470,10 @@ async fn past_cap_stats_column_enables_pruning(
         StatsOptions::struct_columns(vec![column_name!("c2")])
     )]
     bypass_stats: StatsOptions,
+    declarative: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_tmp_dir, table_path, engine) = build_table_with_past_cap_stats(checkpoint).await?;
+    let (_tmp_dir, table_path, engine) =
+        build_table_with_past_cap_stats(checkpoint, declarative).await?;
     let predicate = || Arc::new(Pred::from_expr(expr!(col("c2") > 60i64)));
 
     let default_survivors = surviving_paths_with_stats(
@@ -751,10 +764,11 @@ async fn extended_year_timestamp_stats_dont_collapse_skipping(
 ///           bad stats had blanked the whole v1 batch during checkpoint write.
 ///   file_C: would-survive predicate via JSON `parse_json`, but the v3 Remove suppresses
 ///           it during log replay.
-#[rstest]
+#[apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn extended_year_timestamp_round_trip_via_checkpoint_and_remove(
     #[values(false, true)] use_parallel: bool,
+    declarative: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // writeStatsAsStruct makes the checkpoint materialize stats_parsed, the column where the
     // safe-cast result lands.
@@ -809,7 +823,8 @@ async fn extended_year_timestamp_round_trip_via_checkpoint_and_remove(
     // Checkpoint at v1: build_stats_parsed_expr COALESCE evaluates parse_json on the v1
     // batch and materializes stats_parsed with file_B's EventTime safe-cast to NULL.
     let snapshot_v1 = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    snapshot_v1.checkpoint(engine.as_ref(), None)?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
+    snapshot_v1.checkpoint(checkpoint_engine.as_ref(), None)?;
 
     // v2: file_C via JSON commit, post-checkpoint. Reads still see this as JSON stats and
     // run parse_json at scan time.
@@ -921,6 +936,7 @@ async fn replace_table_schema_change(
     checkpoint_spec: Option<&CheckpointSpec>,
     write_struct: bool,
     old_json_stats: bool,
+    declarative: bool,
 ) -> Result<(tempfile::TempDir, String, Arc<TestEngine>), Box<dyn std::error::Error>> {
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
 
@@ -983,9 +999,10 @@ async fn replace_table_schema_change(
     .await?;
 
     if let Some(spec) = checkpoint_spec {
+        let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
         Snapshot::builder_for(table_url.clone())
             .build(engine.as_ref())?
-            .checkpoint(engine.as_ref(), Some(spec))?;
+            .checkpoint(checkpoint_engine.as_ref(), Some(spec))?;
     }
 
     // Commit 3 replaces the table metadata and removes the addFiles.
@@ -1049,7 +1066,7 @@ async fn replace_table_schema_change(
 
 /// Replace table may change partition and data column types. A scan after replacement should
 /// remain compatible with the old addFiles.
-#[rstest]
+#[apply(checkpoint_modes)]
 #[case::partition(
     Arc::new(Pred::from_expr(expr!(col("part") == 1i64))),
     &["new-1.parquet"],
@@ -1076,6 +1093,7 @@ async fn scan_with_replace_table_schema_change(
     #[case] expected_active_bytes: u64,
     #[values(false, true)] use_parallel: bool,
     #[values(false, true)] checkpoint_old_add: bool,
+    declarative: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let old_schema = schema_ref! {
         nullable "part": STRING,
@@ -1089,6 +1107,7 @@ async fn scan_with_replace_table_schema_change(
         checkpoint_old_add.then_some(&checkpoint_spec),
         false,
         true,
+        declarative,
     )
     .await?;
     let store: Arc<delta_kernel::object_store::DynObjectStore> = Arc::new(LocalFileSystem::new());
@@ -1194,7 +1213,8 @@ async fn scan_with_replace_table_schema_change(
         let checkpoint_spec = CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
             file_actions_per_sidecar_hint: Some(1),
         });
-        snapshot.checkpoint(engine.as_ref(), Some(&checkpoint_spec))?;
+        let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
+        snapshot.checkpoint(checkpoint_engine.as_ref(), Some(&checkpoint_spec))?;
     }
     let error = surviving_paths(&table_path, engine, predicate, use_parallel)
         .expect_err("an active incompatible add file should fail the scan");
@@ -1226,6 +1246,7 @@ async fn declarative_checkpoint_after_replace_table_with_incompatible_native_met
         Some(&spec),
         true,
         old_json_stats,
+        false,
     )
     .await?;
     let table_url = Url::from_directory_path(&table_path).unwrap();
@@ -1506,7 +1527,7 @@ fn value_stats_json(num_records: i64, null_count: i64, bounds: Option<(i64, i64)
     )
 }
 
-#[rstest]
+#[apply(checkpoint_modes)]
 // Two representative operators: `=` exercises the direct null-intolerant arm of
 // `eval_sql_where` and `!=` the NOT-wrapped arm. The not-all-null guard is operator-agnostic, and
 // the unit test `test_all_null_pruning_all_comparison_ops` covers all six operators at the rewrite
@@ -1524,6 +1545,7 @@ async fn all_null_files_pruned_regardless_of_source(
     )]
     source: AllNullSource,
     #[values(false, true)] use_parallel: bool,
+    declarative: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
     let schema = schema_ref! { nullable "value": LONG };
@@ -1571,7 +1593,8 @@ async fn all_null_files_pruned_regardless_of_source(
     // Checkpoint so the all-null file (and the kept file) are sourced from the checkpoint parquet.
     if use_checkpoint {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-        snapshot.checkpoint(engine.as_ref(), None)?;
+        let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
+        snapshot.checkpoint(checkpoint_engine.as_ref(), None)?;
     }
 
     // v2: post-checkpoint JSON commit adding an all-null file (the delta-log source).
