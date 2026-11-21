@@ -18,7 +18,8 @@ use unity_catalog_delta_client_api::{
     UpdateTableRequest as ClientUpdateTableRequest,
 };
 
-use crate::error::{ErrorAllocators, ExternResult, IntoExternResult as _};
+use crate::error::{ErrorAllocators, ExternResult};
+use crate::panic::catch_panic_into_result;
 use crate::transaction::MutableCommitter;
 use crate::{ExclusiveRustString, NullableCvoid};
 
@@ -228,8 +229,11 @@ pub unsafe extern "C" fn get_uc_committer(
     table_name: KernelStringSlice,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<Handle<MutableCommitter>> {
-    let result = get_uc_committer_impl(commit_client, table_id, catalog, schema, table_name);
-    unsafe { result.into_extern_result(&*error_allocators) }
+    unsafe {
+        catch_panic_into_result(&*error_allocators, || {
+            get_uc_committer_impl(commit_client, table_id, catalog, schema, table_name)
+        })
+    }
 }
 
 fn get_uc_committer_impl(

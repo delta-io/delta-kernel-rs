@@ -19,7 +19,9 @@ use crate::ExclusiveEngineData;
 #[cfg(feature = "default-engine-base")]
 use crate::error::ErrorAllocators;
 #[cfg(feature = "default-engine-base")]
-use crate::{ExternResult, IntoExternResult, SharedExternEngine};
+use crate::panic::catch_panic_into_result;
+#[cfg(feature = "default-engine-base")]
+use crate::{ExternResult, SharedExternEngine};
 
 /// Get the number of rows in an engine data
 ///
@@ -107,10 +109,13 @@ pub unsafe extern "C" fn get_raw_arrow_data(
     data: Handle<ExclusiveEngineData>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<*mut ArrowFFIData> {
-    // TODO(frj): This consumes the handle. Is that what we really want?
-    let data = unsafe { data.into_inner() };
-    let result = get_raw_arrow_data_impl(data);
-    unsafe { result.into_extern_result(&engine.as_ref()) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            // TODO(frj): This consumes the handle. Is that what we really want?
+            let data = data.into_inner();
+            get_raw_arrow_data_impl(data)
+        })
+    }
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -166,10 +171,7 @@ pub unsafe extern "C" fn get_engine_data(
     schema: &FFI_ArrowSchema,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<Handle<ExclusiveEngineData>> {
-    unsafe {
-        let result = get_engine_data_impl(array, schema);
-        result.into_extern_result(&*error_allocators)
-    }
+    unsafe { catch_panic_into_result(&*error_allocators, || get_engine_data_impl(array, schema)) }
 }
 
 #[cfg(feature = "default-engine-base")]
