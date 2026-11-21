@@ -24,6 +24,7 @@ use crate::actions::{
 use crate::checkpoint::collation_stats::{
     build_collation_stats_read_transform, source_collation_stats,
 };
+use crate::checkpoint::metrics::{CheckpointMetrics, CheckpointPhase};
 use crate::committer::CatalogCommit;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::content_tree::read_checkpoint_action;
@@ -427,6 +428,8 @@ impl LogSegment {
     /// The checkpoint schema from the `_last_checkpoint` hint, when the hint describes the selected
     /// checkpoint (see [`Self::checkpoint_hint`]) and carried a `checkpointSchema`. `None`
     /// otherwise -- the caller then reads the checkpoint footer instead.
+    // TODO(#4048): `applies_to` matches only version and naming, so this schema can describe an
+    // earlier classic-named file that another writer replaced, and hide the new file's sidecars.
     pub(crate) fn checkpoint_hint_schema(&self) -> Option<SchemaRef> {
         self.checkpoint_hint()?.checkpoint_schema.clone()
     }
@@ -1143,6 +1146,21 @@ impl LogSegment {
         self.read_original_actions(engine, action_schema.clone(), action_schema)
     }
 
+    /// Reads checkpoint-write input, timing each source before the streams are joined.
+    pub(crate) fn read_actions_for_checkpoint(
+        &self,
+        engine: &dyn Engine,
+        action_schema: SchemaRef,
+        metrics: CheckpointMetrics,
+    ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
+        self.read_original_actions_with_metrics(
+            engine,
+            action_schema.clone(),
+            action_schema,
+            metrics,
+        )
+    }
+
     /// Read the AMT `checkpoint` action from the manifest commit that `pointer` (the snapshot's
     /// `lastManifestCommit`) refers to.
     ///
@@ -1166,7 +1184,10 @@ impl LogSegment {
             engine
                 .json_handler()
                 .read_json_files(files, LOG_CHECKPOINT_SCHEMA.clone(), None)?;
-        require_pointed_checkpoint_action(pointer, first_checkpoint_action(batches)?)
+        let action = first_checkpoint_action(batches)?
+            .ok_or_else(|| missing_pointed_checkpoint_action(pointer))?;
+        require_pointed_checkpoint_action(pointer, &action)?;
+        Ok(action)
     }
 
     /// The listed commit at `pointer`'s version, or `None` when this segment does not list it.
@@ -1308,11 +1329,34 @@ impl LogSegment {
         commit_schema: SchemaRef,
         checkpoint_schema: SchemaRef,
     ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
-        let commits = self.read_commit_actions(engine, commit_schema)?;
+        self.read_original_actions_with_metrics(
+            engine,
+            commit_schema,
+            checkpoint_schema,
+            CheckpointMetrics::disabled(),
+        )
+    }
+
+    fn read_original_actions_with_metrics(
+        &self,
+        engine: &dyn Engine,
+        commit_schema: SchemaRef,
+        checkpoint_schema: SchemaRef,
+        metrics: CheckpointMetrics,
+    ) -> KernelResult<impl KernelResultIterator<ActionsBatch> + use<>> {
+        let commits = {
+            let _timer = metrics.start(CheckpointPhase::LogTailInput);
+            self.read_commit_actions(engine, commit_schema)?
+        };
         let predicate = checkpoint_action_projection_predicate(&checkpoint_schema);
+        let checkpoint = {
+            let _timer = metrics.start(CheckpointPhase::CheckpointInput);
+            self.create_checkpoint_stream(engine, checkpoint_schema, predicate, None, None)?
+        };
+        let commits = metrics.input_iterator(CheckpointPhase::LogTailInput, commits);
         let checkpoint =
-            self.create_checkpoint_stream(engine, checkpoint_schema, predicate, None, None)?;
-        Ok(commits.chain(checkpoint.actions))
+            metrics.input_iterator(CheckpointPhase::CheckpointInput, checkpoint.actions);
+        Ok(commits.chain(checkpoint))
     }
 
     /// Original published and staged commits in `(after, through]`, newest first.
@@ -1424,6 +1468,7 @@ impl LogSegment {
         engine: &dyn Engine,
     ) -> KernelResult<(Option<SchemaRef>, Vec<FileMeta>)> {
         // Hint schema from `_last_checkpoint` avoids footer reads when available.
+        // TODO(#4048): a stale hint schema without a `sidecar` column hides the file's sidecars.
         let hint_schema = self.checkpoint_hint_schema();
 
         // All parts of a multi-part checkpoint belong to the same table version and follow
@@ -2052,16 +2097,13 @@ fn first_checkpoint_action(
     Ok(None)
 }
 
-/// Returns `action`, read from the manifest commit `pointer` names, after checking that it exists
-/// and has the pointer's content root version.
+/// Errors unless `action`, read from the manifest commit `pointer` names, has the pointer's content
+/// root version.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 fn require_pointed_checkpoint_action(
     pointer: &LastManifestCommit,
-    action: Option<CheckpointAction>,
-) -> KernelResult<CheckpointAction> {
-    let action = action.ok_or_else(|| {
-        last_manifest_commit_inconsistency(pointer, "that commit carries no checkpoint action")
-    })?;
+    action: &CheckpointAction,
+) -> KernelResult<()> {
     require!(
         action.content_root_version() == pointer.content_root_version,
         last_manifest_commit_inconsistency(
@@ -2072,7 +2114,13 @@ fn require_pointed_checkpoint_action(
             )
         )
     );
-    Ok(action)
+    Ok(())
+}
+
+/// The error for when the manifest commit that `pointer` names carries no checkpoint action.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn missing_pointed_checkpoint_action(pointer: &LastManifestCommit) -> KernelError {
+    last_manifest_commit_inconsistency(pointer, "that commit carries no checkpoint action")
 }
 
 /// The error for a `pointer` that the log contradicts, as explained by `detail`.

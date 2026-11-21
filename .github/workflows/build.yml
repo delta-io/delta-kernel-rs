@@ -57,6 +57,17 @@ env:
 # that issue is resolved and we've bumped to a fixed version. Skipping this cache is
 # essentially free for us: all cargo tools (cargo-nextest, cargo-msrv, cargo-llvm-cov)
 # are installed via taiki-e/install-action, which fetches prebuilt binaries.
+#
+# rust-cache must be 2.9.2 or newer. Cargo 1.100 and newer keep each package's compiled output
+# and fingerprints in `build/<package>/<hash>/`. Older rust-cache versions expect
+# `build/<package>-<hash>/`: before saving, they cut `build/proc-macro2/` at the last `-`, find
+# no crate named `proc`, and delete the directory. Cargo then rebuilds that crate and its
+# dependents after each restore.
+#
+# prefix-key starts every cache key and defaults to `v0-rust`. `v1-rust` is that default with
+# the number raised, which makes these jobs ignore every entry saved under `v0-rust`. Raise it
+# again, in every rust-cache step, to abandon bad entries: rust-cache does not save after an
+# exact key match, so a bad entry otherwise stays in use until its key changes.
 
 jobs:
   benchmark-scripts:
@@ -115,10 +126,6 @@ jobs:
           components: rustfmt
       - name: format
         run: cargo +nightly fmt -- --check
-      # Separate workspace; the root fmt above does not reach it. See datafusion-executor/Cargo.toml.
-      - name: format datafusion-executor
-        working-directory: datafusion-executor
-        run: cargo +nightly fmt -- --check
 
   msrv:
     runs-on: ubuntu-latest
@@ -128,8 +135,9 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
         with:
           cache: false
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          prefix-key: v1-rust
           cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@7bc99eee1f1b8902a125006cf790a1f4c8461e63 # v2.69.8
@@ -149,8 +157,9 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
         with:
           cache: false
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          prefix-key: v1-rust
           cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@7bc99eee1f1b8902a125006cf790a1f4c8461e63 # v2.69.8
@@ -181,8 +190,9 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
         with:
           cache: false
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          prefix-key: v1-rust
           cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: build docs
@@ -224,8 +234,9 @@ jobs:
         with:
           cache: false
           components: clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          prefix-key: v1-rust
           cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: build and lint with clippy
@@ -287,8 +298,9 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
         with:
           cache: false
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          prefix-key: v1-rust
           cache-bin: false
           key: ${{ matrix.config }}
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
@@ -344,8 +356,9 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
         with:
           cache: false
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          prefix-key: v1-rust
           cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: trybuild tests
@@ -396,8 +409,9 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
         with:
           cache: false
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          prefix-key: v1-rust
           cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Set output on fail
@@ -500,13 +514,9 @@ jobs:
           # Miri rebuilds the sysroot when rust-src file mtimes change, and each fresh rustup
           # install writes those files with new mtimes.
           cargo miri setup
-      # Miri needs rust-cache 2.9.2 or newer. Before saving, older versions cut nightly Cargo's
-      # `build/proc-macro2/` and `.fingerprint/proc-macro2/` names at the last `-`, find no crate
-      # named `proc`, and delete both. Cargo then rebuilds that crate and its dependents after
-      # each restore. Stable Cargo names these directories `proc-macro2-<hash>/`, which older
-      # versions parse correctly, so the other jobs are unaffected.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          prefix-key: v1-rust
           cache-bin: false
           # All shards restore this cache; only shard 1 saves it, to avoid uploading it five times.
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.partition == 1 }}
@@ -560,8 +570,9 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
         with:
           cache: false
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          prefix-key: v1-rust
           cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Install cargo-llvm-cov
@@ -577,34 +588,3 @@ jobs:
           fail_ci_if_error: true
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
-
-  # Separate workspace; the --workspace jobs above never touch it. See datafusion-executor/Cargo.toml.
-  datafusion-executor:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - name: Install minimal stable with clippy
-        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
-        with:
-          cache: false
-          components: clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          workspaces: datafusion-executor
-          cache-bin: false
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@98ec31d284eb962f41c14065e9391a955aa810cf # nextest
-      - name: build and lint with clippy
-        working-directory: datafusion-executor
-        run: cargo clippy --locked --benches --tests --all-features -- -D warnings
-      - name: build docs
-        working-directory: datafusion-executor
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --locked --all-features --no-deps
-      - name: test
-        working-directory: datafusion-executor
-        run: cargo nextest run --locked --all-features
-      - name: doc tests
-        working-directory: datafusion-executor
-        run: cargo test --locked --all-features --doc

@@ -15,7 +15,7 @@ use crate::content_tree::{
     DataFileFormat, DeletionVectorInfo, ManifestInfo, TrackingInfo, TrackingStatus,
 };
 use crate::expressions::{ArrayData, Scalar, StructData};
-use crate::schema::{ArrayType, DataType, StructField, StructType, ToSchema as _};
+use crate::schema::{ArrayType, DataType, StructField, StructType, ToSchema as _, schema_ref};
 use crate::{Engine, EngineData, FileMeta};
 
 /// A valid relative AMT deletion vector, convertible to a `DeletionVectorDescriptor`.
@@ -106,11 +106,7 @@ pub(crate) fn struct_batch(engine: &dyn Engine, entries: &[StructData]) -> Box<d
 
 /// Returns `data` with the (possibly nested) field at `path` replaced by `value`.
 pub(crate) fn with_field(data: &StructData, path: &[&str], value: Scalar) -> StructData {
-    let idx = data
-        .fields()
-        .iter()
-        .position(|f| f.name() == path[0])
-        .unwrap();
+    let idx = data.fields().position(|f| f.name() == path[0]).unwrap();
     let mut values = data.values().to_vec();
     values[idx] = match &path[1..] {
         [] => value,
@@ -119,7 +115,7 @@ pub(crate) fn with_field(data: &StructData, path: &[&str], value: Scalar) -> Str
             other => panic!("field '{}' is not a struct: {other:?}", path[0]),
         },
     };
-    StructData::try_new(data.fields().to_vec(), values).unwrap()
+    StructData::try_new(data.schema().clone(), values).unwrap()
 }
 
 /// Writes `entries` as a single-batch manifest parquet file at `location` and returns its
@@ -176,9 +172,14 @@ pub(crate) fn x_stats(stats: &StructType, values: &[i64]) -> Scalar {
         panic!("leaf stats must be a struct");
     };
     let leaf_values = values.iter().copied().map(Scalar::Long).collect();
-    let leaf_stats = StructData::try_new(leaf.fields().cloned().collect(), leaf_values).unwrap();
-    let fields = vec![leaf_field.clone()];
-    Scalar::Struct(StructData::try_new(fields, vec![Scalar::Struct(leaf_stats)]).unwrap())
+    let leaf_stats = StructData::try_new(schema_ref! { ..(leaf.fields()) }, leaf_values).unwrap();
+    Scalar::Struct(
+        StructData::try_new(
+            schema_ref! { (leaf_field) },
+            vec![Scalar::Struct(leaf_stats)],
+        )
+        .unwrap(),
+    )
 }
 
 /// A physical table schema whose only column `x` (field ID 1) is a LONG.
@@ -207,7 +208,6 @@ mod tests {
     use crate::arrow::compute::{cast, concat_batches};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
-    use crate::object_store::memory::InMemory;
     use crate::schema::{ColumnMetadataKey, MetadataValue};
 
     /// Covers `tight_stats` as `Some(true)`, `Some(false)`, and `None`.
@@ -225,7 +225,7 @@ mod tests {
 
     /// Writes [`manifest_entries`] to an in-memory store and returns the engine and file.
     fn write_test_manifest() -> (SyncEngine, FileMeta) {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let location = Url::parse("memory:///metadata/manifest.parquet").unwrap();
         let file = write_manifest(&engine, location, &manifest_entries());
         (engine, file)
@@ -307,7 +307,7 @@ mod tests {
     /// Reading with narrowed `content_stats` reads only the requested stats, by field ID.
     #[test]
     fn manifest_read_projects_requested_content_stats() {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let location = Url::parse("memory:///metadata/manifest.parquet").unwrap();
         let entries = [added_data_entry("a.parquet", 1, 10, 0, 1)];
         let stats = vec![x_full_stats_value()];

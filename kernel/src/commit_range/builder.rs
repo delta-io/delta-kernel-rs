@@ -415,18 +415,25 @@ mod tests {
     }
 
     impl StorageHandler for TestStorageHandler {
-        fn list_from(&self, path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+        fn list_from(
+            &self,
+            path: &Url,
+            end: Option<&Url>,
+        ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
             let files = self.files.clone().expect("unexpected storage listing");
             assert!(
                 files
                     .iter()
                     .all(|file| file.location.as_str() >= path.as_str())
             );
-            Ok(Box::new(files.into_iter().map(Ok).chain(
-                std::iter::once_with(|| {
-                    panic!("listing must stop after the first useful post-end commit")
-                }),
-            )))
+            let end = end.map(|end| end.as_str().to_string());
+            let in_range = files.into_iter().filter(move |file| {
+                end.as_ref()
+                    .is_none_or(|end| file.location.as_str() < end.as_str())
+            });
+            Ok(Box::new(in_range.map(Ok).chain(std::iter::once_with(
+                || panic!("listing must stop at the requested end or the first commit after it"),
+            ))))
         }
 
         fn read_files(

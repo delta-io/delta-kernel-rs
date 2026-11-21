@@ -7,7 +7,7 @@ use crate::expressions::{
 };
 use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
 use crate::scan::data_skipping::as_data_skipping_predicate;
-use crate::schema::ArrayType;
+use crate::schema::{ArrayType, schema_ref};
 use crate::{DataType, KernelResult};
 
 /// Helper trait to allow expect_eq! to work with both Option<Scalar> and Option<bool>
@@ -136,7 +136,7 @@ fn test_default_partial_cmp_scalars() {
         Binary(vec![1]),
         Scalar::decimal(1, 10, 10).unwrap(),
         Null(DataType::LONG),
-        Struct(StructData::try_new(vec![], vec![]).unwrap()),
+        Struct(StructData::try_new(schema_ref! {}, vec![]).unwrap()),
         Array(ArrayData::try_new(ArrayType::new(DataType::LONG, false), &[] as &[i64]).unwrap()),
     ];
     let larger_values = &[
@@ -154,7 +154,7 @@ fn test_default_partial_cmp_scalars() {
         Binary(vec![10]),
         Scalar::decimal(10, 10, 10).unwrap(),
         Null(DataType::LONG),
-        Struct(StructData::try_new(vec![], vec![]).unwrap()),
+        Struct(StructData::try_new(schema_ref! {}, vec![]).unwrap()),
         Array(ArrayData::try_new(ArrayType::new(DataType::LONG, false), &[] as &[i64]).unwrap()),
     ];
 
@@ -707,6 +707,18 @@ fn test_eval_binary_commutes_literal_and_cast_column(
     assert_eq!(
         filter.eval_pred_binary(op, &val, &cast_col, inverted),
         Some(expected != inverted)
+    );
+}
+
+#[rstest::rstest]
+fn test_has_uri_scheme_is_never_evaluated_for_skipping(
+    #[values(lit("s3://b/a"), col!("location"))] expr: Expr,
+    #[values(false, true)] inverted: bool,
+) {
+    let filter = DefaultKernelPredicateEvaluator::from(Scalar::from("s3://b/a"));
+    assert_eq!(
+        filter.eval_pred(&Pred::has_uri_scheme(expr), inverted),
+        None
     );
 }
 

@@ -1261,7 +1261,7 @@ mod tests {
     };
     use crate::actions::visitors::AddVisitor;
     use crate::actions::{
-        LOG_ADD_SCHEMA, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
+        Add, LOG_ADD_SCHEMA, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
     };
     use crate::arrow::array::{AsArray as _, RecordBatch};
     use crate::arrow::compute::concat_batches;
@@ -1278,9 +1278,8 @@ mod tests {
     use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
     use crate::engine::sync::SyncEngine;
     use crate::expressions::StructData;
-    use crate::object_store::memory::InMemory;
     use crate::scan::state::DvInfo;
-    use crate::schema::StructType;
+    use crate::schema::{StructType, schema_ref};
     use crate::unit_test_utils::adaptive_metadata_fixtures::checkpoint_action_with_root;
     use crate::unit_test_utils::{TestCancellationToken, assert_result_error_with_message};
     use crate::{Error, FileSize, ParquetFooter, ParquetHandler, PredicateRef};
@@ -1350,7 +1349,7 @@ mod tests {
         commit_version: i64,
     ) -> Vec<Scalar> {
         let add = StructData::try_new(
-            ADD_SCHEMA.fields().cloned().collect(),
+            Add::schema_ref().clone(),
             vec![
                 Scalar::from(path),
                 Scalar::Map(
@@ -1535,7 +1534,7 @@ mod tests {
 
     #[test]
     fn leaf_read_schema_reads_file_and_row_index() {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let location = Url::parse("memory:///table/metadata/leaf.parquet").unwrap();
         let entries = [
             added_data_entry("a.parquet", 1, 1, 0, 0),
@@ -1569,11 +1568,6 @@ mod tests {
 
     fn table_root() -> Url {
         Url::parse(TABLE_ROOT).unwrap()
-    }
-
-    /// An engine over an empty in-memory store.
-    fn memory_engine() -> SyncEngine {
-        SyncEngine::new_with_store(Arc::new(InMemory::new()))
     }
 
     /// How [`ShapedParquetHandler`] reshapes its inner handler's reads.
@@ -1637,7 +1631,7 @@ mod tests {
 
     /// An in-memory engine whose parquet reads are reshaped per `shape`.
     fn shaped_engine(shape: ReadShape) -> DelegatingEngine {
-        let sync = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let sync = Arc::new(SyncEngine::in_memory());
         let shaped = Arc::new(ShapedParquetHandler {
             inner: sync.parquet_handler(),
             shape,
@@ -1695,7 +1689,7 @@ mod tests {
 
     #[test]
     fn read_add_actions_from_amt_reads_root_data_entries() {
-        let engine = memory_engine();
+        let engine = SyncEngine::in_memory();
         let deleted = with_status(
             added_data_entry("deleted.parquet", 1, 1, 0, 0),
             TrackingStatus::Deleted,
@@ -1723,7 +1717,7 @@ mod tests {
     fn read_add_actions_from_amt_emits_requested_stats_parsed(
         #[values(false, true)] with_stats: bool,
     ) {
-        let engine = memory_engine();
+        let engine = SyncEngine::in_memory();
         // The manifests record `x_full_stats_value` for a LONG leaf with field ID 1, which the
         // checkpoint's schema (see `checkpoint_action_with_root`) maps to its `id` column,
         // physically `phys_id`.
@@ -1775,7 +1769,8 @@ mod tests {
                     let phys_id = |value: i64| {
                         let field = StructField::nullable("phys_id", DataType::LONG);
                         Scalar::Struct(
-                            StructData::try_new(vec![field], vec![value.into()]).unwrap(),
+                            StructData::try_new(schema_ref! { (field) }, vec![value.into()])
+                                .unwrap(),
                         )
                     };
                     let values = vec![
@@ -1786,10 +1781,10 @@ mod tests {
                         Scalar::Boolean(false),
                     ];
                     let stats =
-                        StructData::try_new(stats_schema.fields().cloned().collect(), values);
+                        StructData::try_new(schema_ref! { ..(stats_schema.fields()) }, values);
                     let field = StructField::nullable(STATS_PARSED, stats_schema.clone());
                     let add = StructData::try_new(
-                        add.fields().iter().cloned().chain([field]).collect(),
+                        schema_ref! { ..(add.fields()), (field) },
                         add.values()
                             .iter()
                             .cloned()
@@ -1825,7 +1820,7 @@ mod tests {
         #[values(TrackingStatus::Added, TrackingStatus::Modified)] status: TrackingStatus,
         #[values(false, true)] absolute_location: bool,
     ) {
-        let engine = memory_engine();
+        let engine = SyncEngine::in_memory();
         let dv_path = DeletionVectorPath::new_with_uuid(table_root(), "ab".into(), Uuid::nil());
         let mut buffer = Vec::new();
         let mut writer = StreamingDeletionVectorWriter::new(&mut buffer);
@@ -2025,7 +2020,7 @@ mod tests {
         #[case] leaf_entries: Vec<ContentTreeNodeEntry>,
         #[case] message: &str,
     ) {
-        let engine = memory_engine();
+        let engine = SyncEngine::in_memory();
         let mut leaf = write_leaf(&engine, "metadata/leaf.parquet", &leaf_entries, 5, 100);
         edit_parent(&mut leaf);
         let checkpoint = write_root(&engine, &[leaf]);
@@ -2045,7 +2040,7 @@ mod tests {
         #[case] edit_parent: fn(&mut ContentTreeNodeEntry),
         #[case] message: &str,
     ) {
-        let engine = memory_engine();
+        let engine = SyncEngine::in_memory();
         let mut leaf = write_leaf(&engine, "metadata/leaf.parquet", &[], 5, 100);
         edit_parent(&mut leaf);
         let checkpoint = write_root(&engine, &[leaf]);
@@ -2146,7 +2141,7 @@ mod tests {
     fn read_add_actions_from_amt_does_not_validate_manifest_dv_removed_entry(
         #[case] edit_removed: fn(&mut ContentTreeNodeEntry),
     ) {
-        let engine = memory_engine();
+        let engine = SyncEngine::in_memory();
         let mut removed = leaf_entry("removed.parquet", 1, 1, None, None, None);
         edit_removed(&mut removed);
         let kept = with_status(
@@ -2177,7 +2172,7 @@ mod tests {
         #[case] edit_removed: fn(&mut ContentTreeNodeEntry),
         #[case] message: &str,
     ) {
-        let engine = memory_engine();
+        let engine = SyncEngine::in_memory();
         let mut removed = leaf_entry("removed.parquet", 1, 1, Some(1), None, Some(1));
         edit_removed(&mut removed);
         let leaf = write_leaf(&engine, "metadata/leaf.parquet", &[removed], 5, 100);
@@ -2194,7 +2189,7 @@ mod tests {
         #[case] dv: Bytes,
         #[case] message: &str,
     ) {
-        let engine = memory_engine();
+        let engine = SyncEngine::in_memory();
         let mut leaf = write_leaf(&engine, "metadata/leaf.parquet", &[], 5, 100);
         leaf.manifest_info.as_mut().unwrap().dv = Some(dv);
         let checkpoint = write_root(&engine, &[leaf]);
@@ -2240,7 +2235,7 @@ mod tests {
 
     #[test]
     fn read_add_actions_from_amt_rejects_manifest_dv_on_empty_leaf() {
-        let engine = memory_engine();
+        let engine = SyncEngine::in_memory();
         let leaf = write_leaf(&engine, "metadata/leaf.parquet", &[], 5, 100);
         let checkpoint = write_root(&engine, &[with_manifest_dv(leaf, &[0])]);
         assert_result_error_with_message(
@@ -2283,7 +2278,7 @@ mod tests {
 
     #[test]
     fn read_add_actions_from_amt_errors_on_missing_leaf() {
-        let engine = memory_engine();
+        let engine = SyncEngine::in_memory();
         let missing = data_manifest_entry("metadata/missing.parquet", 1, TrackingStatus::Added);
         let checkpoint = write_root(&engine, &[missing]);
         assert_result_error_with_message(
@@ -2294,7 +2289,7 @@ mod tests {
 
     #[test]
     fn read_add_actions_from_amt_rejects_duplicate_leaf() {
-        let engine = memory_engine();
+        let engine = SyncEngine::in_memory();
         let leaf = write_leaf(&engine, "metadata/leaf.parquet", &[], 5, 100);
         let checkpoint = write_root(&engine, &[leaf.clone(), leaf]);
         assert_result_error_with_message(
@@ -2307,7 +2302,7 @@ mod tests {
     /// neither encoded nor validated, since it does not become an `Add`.
     #[test]
     fn read_add_actions_from_amt_encodes_root_and_leaf_paths() {
-        let engine = memory_engine();
+        let engine = SyncEngine::in_memory();
         let leaf = write_leaf(
             &engine,
             "metadata/leaf.parquet",
@@ -2339,7 +2334,7 @@ mod tests {
 
     #[test]
     fn read_add_actions_from_amt_rejects_dot_segment_in_live_location() {
-        let engine = memory_engine();
+        let engine = SyncEngine::in_memory();
         let checkpoint = write_root(&engine, &[added_data_entry("../a.parquet", 1, 1, 0, 0)]);
         assert_result_error_with_message(
             read_tree(&engine, &checkpoint),
@@ -2349,7 +2344,7 @@ mod tests {
 
     #[test]
     fn read_add_actions_from_amt_stops_when_cancelled() {
-        let engine = memory_engine();
+        let engine = SyncEngine::in_memory();
         let leaf = write_leaf(
             &engine,
             "metadata/leaf.parquet",
@@ -2381,7 +2376,7 @@ mod tests {
 
     #[test]
     fn read_add_actions_from_amt_errors_on_missing_root() {
-        let engine = memory_engine();
+        let engine = SyncEngine::in_memory();
         let checkpoint = checkpoint_action_with_root(ROOT_PATH, 1, 1).unwrap();
         assert_result_error_with_message(read_tree(&engine, &checkpoint), ROOT_PATH);
     }

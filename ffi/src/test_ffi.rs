@@ -16,8 +16,7 @@ use delta_kernel::kernel_predicates::{
     IndirectDataSkippingPredicateEvaluator,
 };
 use delta_kernel::schema::{
-    ArrayType, DataType, IntervalDayToSecondType, IntervalYearToMonthType, MapType, StructField,
-    StructType,
+    ArrayType, DataType, IntervalDayToSecondType, IntervalYearToMonthType, MapType, schema_ref,
 };
 
 use crate::expressions::{SharedExpression, SharedPredicate};
@@ -98,16 +97,15 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
     )
     .unwrap();
 
-    let nested_fields = vec![
-        StructField::not_null("a", DataType::INTEGER),
-        StructField::not_null("b", array_type),
-    ];
+    let nested_schema = schema_ref! {
+        not_null "a": INTEGER,
+        not_null "b": (array_type),
+    };
     let nested_values = vec![Scalar::Integer(500), Scalar::Array(array_data.clone())];
-    let nested_struct = StructData::try_new(nested_fields.clone(), nested_values).unwrap();
-    let nested_struct_type = StructType::try_new(nested_fields).unwrap();
+    let nested_struct = StructData::try_new(Arc::clone(&nested_schema), nested_values).unwrap();
 
     let top_level_struct = StructData::try_new(
-        vec![StructField::nullable("top", nested_struct_type)],
+        schema_ref! { nullable "top": (nested_schema) },
         vec![Scalar::Struct(nested_struct)],
     )
     .unwrap();
@@ -227,6 +225,7 @@ pub unsafe extern "C" fn get_testing_kernel_predicate() -> Handle<SharedPredicat
         )),
         Pred::from_expr(expr!(or(5 == 10, 20 != 10))),
         Pred::from_expr(expr!(is_not_null(col("col")))),
+        Pred::has_uri_scheme(col!("location")),
         Pred::opaque(OpaqueTestOp("bar".to_string()), vec![lit(42), lit(1.111)]),
         Pred::unknown("intrigue"),
         Pred::from_expr(Expr::case_when(

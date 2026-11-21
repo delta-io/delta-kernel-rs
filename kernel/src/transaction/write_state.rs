@@ -69,6 +69,9 @@ pub struct WriteState {
     /// of the random prefix in [`BoundWriteContext::write_dir`] for both the column mapping and
     /// `randomizeFilePrefixes` paths.
     pub(super) random_prefix_length: NonZero<usize>,
+    /// Value of the `delta.fileType.writeLocation` table property, validated only when
+    /// [`BoundWriteContext::new_referenced_file_path`] uses it.
+    pub(super) file_type_write_location: Option<String>,
 }
 
 /// Names of materialized row-tracking id/commit-version columns supplied by a connector.
@@ -402,6 +405,7 @@ impl WriteState {
             materialize_partition_columns: table_config.should_materialize_partition_columns(),
             randomize_file_prefixes: props.should_randomize_file_prefixes(),
             random_prefix_length: props.random_prefix_length(),
+            file_type_write_location: props.file_type_write_location.clone(),
         }
     }
 
@@ -453,7 +457,6 @@ mod tests {
     use super::*;
     use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
-    use crate::object_store::memory::InMemory;
     use crate::schema::{MetadataValue, schema_ref};
     use crate::transaction::create_table::create_table;
     use crate::transaction::data_layout::DataLayout;
@@ -485,8 +488,7 @@ mod tests {
             );
         }
 
-        let engine: Arc<dyn Engine> =
-            Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let engine: Arc<dyn Engine> = Arc::new(SyncEngine::in_memory());
         let txn = create_table(
             "memory:///table",
             schema_ref! {
@@ -731,8 +733,7 @@ mod tests {
             physical_field("second", "part", 2),
             StructField::nullable("value", DataType::INTEGER),
         ])?);
-        let engine: Arc<dyn Engine> =
-            Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let engine: Arc<dyn Engine> = Arc::new(SyncEngine::in_memory());
         let txn = create_table("memory:///case_sensitive_partitions", schema, "test", true)
             .with_data_layout(DataLayout::partitioned(["first", "second"]))
             .with_table_properties([("delta.columnMapping.mode", mode_property)])

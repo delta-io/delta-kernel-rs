@@ -97,6 +97,7 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
         }
         ROW_TRACKING_SUSPENDED => props.row_tracking_suspended = Some(parse_bool(v)?),
         PARQUET_FORMAT_VERSION => props.parquet_format_version = Some(v.to_string()),
+        FILE_TYPE_WRITE_LOCATION => props.file_type_write_location = Some(v.to_string()),
         PARQUET_COMPRESSION_CODEC => {
             // Preserve unrecognized codecs in `unknown_properties` so connectors can fall back
             // themselves.

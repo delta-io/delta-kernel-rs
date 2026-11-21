@@ -297,7 +297,7 @@ pub struct Transaction<STATE = UpdateTable, MODE: ExecutionMode = Imperative> {
     // Whether to emit a Protocol action. True for CREATE TABLE, false otherwise.
     should_emit_protocol: bool,
     // Whether to emit a Metadata action. True for CREATE TABLE and transactions with staged
-    // schema changes, false otherwise.
+    // schema or property changes, false otherwise.
     should_emit_metadata: bool,
     committer: Box<dyn Committer>,
     operation: CommitOperation,
@@ -1094,7 +1094,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
                 if !self.should_emit_metadata =>
             {
                 Err(KernelError::invalid_transaction_state(
-                    "ALTER TABLE requires at least one schema change",
+                    "ALTER TABLE requires at least one table change",
                 ))
             }
             (false, CommitOperation::UpdateTable(UpdateTableOperation::AlterTable))
@@ -1994,7 +1994,7 @@ mod tests {
     fn test_add_files_schema(
         #[values(DataLayout::None, DataLayout::clustered(["id"]))] layout: DataLayout,
     ) -> Result<()> {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let txn = create_table(
             "memory:///t",
             schema_ref! { nullable "id": INTEGER },
@@ -2132,8 +2132,7 @@ mod tests {
 
     #[test]
     fn schema_set_nullable_is_persisted_on_commit() -> Result<()> {
-        let engine: Arc<dyn Engine> =
-            Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let engine: Arc<dyn Engine> = Arc::new(SyncEngine::in_memory());
         let schema = Arc::new(StructType::try_new([
             StructField::not_null("id", DataType::INTEGER),
             StructField::nullable("name", DataType::STRING),
@@ -2488,8 +2487,7 @@ mod tests {
             ColumnMappingMode::Name => "name",
             ColumnMappingMode::Id => "id",
         };
-        let engine: Arc<dyn Engine> =
-            Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let engine: Arc<dyn Engine> = Arc::new(SyncEngine::in_memory());
         // Logical order: [p1, p2, d1, v(void), p3, p4, d2]; partition cols = p1, p2, p3, p4.
         let schema = schema_ref! {
             nullable "p1": STRING,
@@ -2935,7 +2933,7 @@ mod tests {
     #[case::alter_without_schema_changes(
         false,
         CommitOperation::UpdateTable(UpdateTableOperation::AlterTable),
-        "ALTER TABLE requires at least one schema change"
+        "ALTER TABLE requires at least one table change"
     )]
     #[case::empty_custom_operation(
         false,
@@ -3200,14 +3198,14 @@ mod tests {
         let schema = test_schema_nested();
         let tag_type = MapType::new(DataType::STRING, DataType::STRING, true);
         let score_type = ArrayType::new(DataType::INTEGER, true);
-        let info_fields = vec![
-            StructField::nullable("name", DataType::STRING),
-            StructField::nullable("age", DataType::INTEGER),
-            StructField::nullable("tags", tag_type.clone()),
-            StructField::nullable("scores", score_type.clone()),
-        ];
+        let info_schema = schema_ref! {
+            nullable "name": STRING,
+            nullable "age": INTEGER,
+            nullable "tags": (tag_type.clone()),
+            nullable "scores": (score_type.clone()),
+        };
         let info1 = Scalar::Struct(StructData::try_new(
-            info_fields.clone(),
+            Arc::clone(&info_schema),
             vec![
                 "alice".into(),
                 30i32.into(),
@@ -3216,7 +3214,7 @@ mod tests {
             ],
         )?);
         let info2 = Scalar::Struct(StructData::try_new(
-            info_fields,
+            info_schema,
             vec![
                 "bob".into(),
                 25i32.into(),
@@ -3310,8 +3308,7 @@ mod tests {
             ColumnMappingMode::Name => "name",
             ColumnMappingMode::Id => "id",
         };
-        let engine: Arc<dyn Engine> =
-            Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let engine: Arc<dyn Engine> = Arc::new(SyncEngine::in_memory());
         let mut txn = create_table(
             "memory:///row_tracking_logical_to_physical",
             schema_ref! { nullable "value": INTEGER },

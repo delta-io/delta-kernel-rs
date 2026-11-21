@@ -1497,6 +1497,18 @@ impl LastManifestCommit {
         Ok(())
     }
 
+    /// Whether some commit after `version`, up to this manifest commit, may record its file
+    /// actions only in the metadata tree, leaving them out of its commit JSON.
+    ///
+    /// Only the latest pointer is needed. A manifest commit's file actions live only in the tree
+    /// when its content root version is its own version, and content root versions never decrease
+    /// across manifest commits, so any such commit after `version` has a content root version at
+    /// or below this one's. A lagging content root makes the answer conservative.
+    pub(crate) fn may_have_tree_only_file_actions_after(&self, version: Version) -> bool {
+        // `validate` guarantees content_root_version is non-negative.
+        self.content_root_version as u64 > version
+    }
+
     /// Parses the first `commitInfo.lastManifestCommit` in `data`, if any.
     pub(crate) fn try_new_from_data(data: &dyn EngineData) -> KernelResult<Option<Self>> {
         let mut visitor = visitors::LastManifestCommitVisitor::default();
@@ -1670,27 +1682,28 @@ impl<'de> Deserialize<'de> for CheckpointAction {
 fn content_sidecar_element(type_str: &str, sidecar: Sidecar) -> KernelResult<Scalar> {
     let sidecar: StructData = sidecar.into();
     let fields = std::iter::once(StructField::not_null("type", DataType::STRING))
-        .chain(sidecar.fields().iter().cloned());
+        .chain(sidecar.fields().cloned());
     let values = std::iter::once(Scalar::from(type_str))
         .chain(sidecar.values().iter().cloned())
         .collect();
-    let fields = StructType::try_new(fields)?.into_fields().collect();
-    Ok(Scalar::Struct(StructData::try_new(fields, values)?))
+    let schema = Arc::new(StructType::try_new(fields)?);
+    Ok(Scalar::Struct(StructData::try_new(schema, values)?))
 }
 
 /// Wrap a single element `value` into a full union struct matching the checkpoint array's element
 /// type: the field named `field_name` holds `value`, every other field is a typed null.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 fn checkpoint_action_union_element(field_name: &str, value: Scalar) -> KernelResult<Scalar> {
-    let fields: Vec<StructField> = CHECKPOINT_ACTION_ELEMENT_SCHEMA.fields().cloned().collect();
     require!(
-        fields.iter().any(|f| f.name() == field_name),
+        CHECKPOINT_ACTION_ELEMENT_SCHEMA
+            .fields()
+            .any(|f| f.name() == field_name),
         KernelError::generic(format!(
             "checkpoint union element field {field_name:?} not found in element schema"
         ))
     );
-    let values = fields
-        .iter()
+    let values = CHECKPOINT_ACTION_ELEMENT_SCHEMA
+        .fields()
         .map(|field| {
             if field.name() == field_name {
                 value.clone()
@@ -1699,7 +1712,10 @@ fn checkpoint_action_union_element(field_name: &str, value: Scalar) -> KernelRes
             }
         })
         .collect();
-    Ok(Scalar::Struct(StructData::try_new(fields, values)?))
+    Ok(Scalar::Struct(StructData::try_new(
+        CHECKPOINT_ACTION_ELEMENT_SCHEMA.clone(),
+        values,
+    )?))
 }
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -2165,10 +2181,9 @@ mod tests {
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
     use crate::arrow::json::ReaderBuilder;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
-    use crate::engine::arrow_expression::ArrowEvaluationHandler;
+    use crate::engine::sync::SyncEngine;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::engine::to_json_bytes;
-    use crate::engine::{DelegatingEngine, PanicEngine};
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::engine_data::FilteredEngineData;
     use crate::expressions::{Scalar, StructData};
@@ -2190,13 +2205,6 @@ mod tests {
     #[case::unknown_action("futureAction", None)]
     fn test_action_presence_leaf(#[case] action_name: &str, #[case] expected_leaf: Option<&str>) {
         assert_eq!(action_presence_leaf(action_name), expected_leaf);
-    }
-
-    /// Allows Arrow expression evaluation and rejects other required handler access.
-    fn expr_engine() -> DelegatingEngine {
-        DelegatingEngine::new(Arc::new(PanicEngine))
-            .with_evaluation_handler(Arc::new(ArrowEvaluationHandler))
-            .without_plan_executor()
     }
 
     #[rstest]
@@ -2241,6 +2249,23 @@ mod tests {
     ) {
         let result = LastManifestCommit::new(version, content_root_version);
         assert_eq!(result.is_ok(), ok);
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::content_root_after_version(2, 2, 1, true)]
+    #[case::content_root_at_version(2, 2, 2, false)]
+    #[case::content_root_before_version(2, 2, 3, false)]
+    #[case::lagging_content_root_after_version(2, 1, 0, true)]
+    #[case::lagging_content_root_at_version(2, 1, 1, false)]
+    fn test_may_have_tree_only_file_actions_after_compares_content_root_version(
+        #[case] version: i64,
+        #[case] content_root_version: i64,
+        #[case] after: Version,
+        #[case] expected: bool,
+    ) {
+        let last = LastManifestCommit::new(version, content_root_version).unwrap();
+        assert_eq!(last.may_have_tree_only_file_actions_after(after), expected);
     }
 
     #[test]
@@ -3236,7 +3261,7 @@ mod tests {
         let Scalar::Struct(struct_data) = &scalar else {
             panic!("Expected struct scalar, got {scalar}");
         };
-        let field_names: Vec<_> = struct_data.fields().iter().map(|f| f.name()).collect();
+        let field_names: Vec<_> = struct_data.fields().map(|f| f.name()).collect();
         assert_eq!(field_names, ["provider", "options"]);
         assert_eq!(struct_data.values()[0], Scalar::from("parquet"));
 
@@ -3260,7 +3285,7 @@ mod tests {
 
     #[test]
     fn test_metadata_with_log_schema() {
-        let engine = expr_engine();
+        let engine = SyncEngine::new();
         let schema = schema_ref! { not_null "id": INTEGER };
 
         let metadata = Metadata::try_new(
@@ -3308,7 +3333,7 @@ mod tests {
 
     #[test]
     fn test_protocol_creates_log_row() {
-        let engine = expr_engine();
+        let engine = SyncEngine::new();
         let protocol = Protocol::try_new_modern(
             [TableFeature::DeletionVectors, TableFeature::ColumnMapping],
             [TableFeature::DeletionVectors, TableFeature::ColumnMapping],
@@ -3496,7 +3521,7 @@ mod tests {
 
         let add: Add = serde_json::from_str(json).unwrap();
         let data: StructData = add.clone().into();
-        StructData::try_new(data.fields().to_vec(), data.values().to_vec())
+        StructData::try_new(data.schema().clone(), data.values().to_vec())
             .expect("complete add must match its derived schema");
         assert_eq!(
             add.partition_values,
@@ -3689,7 +3714,7 @@ mod tests {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
     fn test_checkpoint_action_scalar_round_trip() -> KernelResult<()> {
-        let engine = expr_engine();
+        let engine = SyncEngine::new();
         let action = sample_checkpoint_action();
         let scalar = action.clone().try_into_scalar()?;
         let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
@@ -3724,7 +3749,7 @@ mod tests {
         // pin the exact bytes. This is the only guard on the wire format: element order, camelCase
         // field names, the sidecar `type` discriminator, and the JSON writer's null omission (the
         // null union siblings collapse each element to a single-key tagged object).
-        let engine = expr_engine();
+        let engine = SyncEngine::new();
         let scalar = sample_checkpoint_action().try_into_scalar()?;
         let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
         let filtered = FilteredEngineData::with_all_rows_selected(data);
@@ -3810,7 +3835,7 @@ mod tests {
             txn_sidecars: vec![sidecar("t1.parquet"), sidecar("t2.parquet")],
             domain_metadata_sidecars: vec![],
         };
-        let engine = expr_engine();
+        let engine = SyncEngine::new();
         let scalar = action.clone().try_into_scalar()?;
         let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
         let back = CheckpointAction::try_new_from_data(data.as_ref())?
@@ -3833,7 +3858,7 @@ mod tests {
             ),
             ..sample_checkpoint_action()
         };
-        let engine = expr_engine();
+        let engine = SyncEngine::new();
         let scalar = action.clone().try_into_scalar()?;
         let data = create_row(&engine, LOG_CHECKPOINT_SCHEMA.clone(), scalar)?;
         let back = CheckpointAction::try_new_from_data(data.as_ref())?

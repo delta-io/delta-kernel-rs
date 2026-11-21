@@ -25,10 +25,9 @@ use crate::committer::{CommitMetadata, CommitResponse};
 use crate::crc::FileStatsDelta;
 use crate::engine_data::FilteredEngineData;
 use crate::error::KernelError;
-use crate::expressions::UnaryExpressionOp::ToJson;
 use crate::expressions::{
-    ArrayData, ColumnName, ExpressionStructPatch, ExpressionStructPatchBuilder, Predicate, col,
-    column_name, lit, null_lit,
+    ArrayData, ColumnName, ExpressionStructPatch, ExpressionStructPatchBuilder, Predicate,
+    UnaryExpressionOp, col, column_name, lit, null_lit,
 };
 use crate::log_replay::HasSelectionVector;
 use crate::metrics::CommitFailureReason;
@@ -703,7 +702,7 @@ fn build_add_action_projection(
         .replace(
             "stats",
             StructField::nullable("stats", DataType::STRING),
-            Expression::unary(ToJson, col!("stats")),
+            Expression::unary(UnaryExpressionOp::TO_JSON, col!("stats")),
         )
         .build()?;
     let patch = Expression::struct_from([patch]);
@@ -803,7 +802,7 @@ fn build_remove_struct_patch(
         // Replace stats with COALESCE(stats, TO_JSON(stats_parsed)) and drop stats_parsed.
         let coalesce_stats = Expression::coalesce([
             col!("stats"),
-            Expression::unary(ToJson, col!(STATS_PARSED_NAME)),
+            Expression::unary(UnaryExpressionOp::TO_JSON, col!(STATS_PARSED_NAME)),
         ]);
         patch = patch
             .replace("stats", coalesce_stats)
@@ -843,7 +842,6 @@ fn build_remove_struct_patch(
 mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use ::test_utils::get_column;
     use rstest::rstest;
@@ -857,14 +855,14 @@ mod tests {
     use crate::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
     use crate::arrow::record_batch::RecordBatch;
     use crate::committer::FileSystemCommitter;
-    use crate::engine::DelegatingEngine;
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
+    use crate::engine::{DelegatingEngine, RelaxedCounter};
     use crate::expressions::{ExpressionRef, MapData, PredicateRef, Scalar, StructData};
     use crate::scan::log_replay::PATH_NAME;
-    use crate::schema::{MapType, column_name, schema};
+    use crate::schema::{MapType, column_name};
     use crate::table_configuration::TableConfiguration;
     use crate::table_properties::APPEND_ONLY;
     use crate::transaction::create_table::create_table;
@@ -931,7 +929,7 @@ mod tests {
 
     #[derive(Default)]
     struct CountingEvaluationHandler {
-        evaluators_created: AtomicUsize,
+        evaluators_created: RelaxedCounter,
     }
 
     impl EvaluationHandler for CountingEvaluationHandler {
@@ -941,7 +939,7 @@ mod tests {
             expression: ExpressionRef,
             output_type: DataType,
         ) -> KernelResult<Arc<dyn ExpressionEvaluator>> {
-            self.evaluators_created.fetch_add(1, Ordering::Relaxed);
+            self.evaluators_created.inc();
             ArrowEvaluationHandler.new_expression_evaluator(schema, expression, output_type)
         }
 
@@ -974,7 +972,7 @@ mod tests {
     fn test_add_action_evaluators_reused_for_repeated_schema(
         #[values(false, true)] row_tracking: bool,
         #[case] optional_columns: &[(bool, bool)],
-        #[case] max_evaluators: usize,
+        #[case] max_evaluators: u64,
     ) -> KernelResult<()> {
         let handler = Arc::new(CountingEvaluationHandler::default());
         let engine = DelegatingEngine::new(Arc::new(SyncEngine::new()))
@@ -1000,7 +998,7 @@ mod tests {
             })
             .collect::<KernelResult<Vec<_>>>()?;
         let actions = build_add_actions(&engine, batches.into_iter().map(Ok), row_tracking, true)?;
-        assert_eq!(handler.evaluators_created.load(Ordering::Relaxed), 0);
+        assert_eq!(handler.evaluators_created.get(), 0);
         let actions = actions.collect::<KernelResult<Vec<_>>>()?;
         assert_eq!(actions.len(), optional_columns.len());
         for (action, &(tags, provider)) in actions.iter().zip(optional_columns) {
@@ -1014,7 +1012,7 @@ mod tests {
                 row_tracking
             );
         }
-        let created = handler.evaluators_created.load(Ordering::Relaxed);
+        let created = handler.evaluators_created.get();
         assert!(
             created <= max_evaluators,
             "created {created} evaluators for {} batches; expected at most {max_evaluators}",
@@ -1285,17 +1283,15 @@ mod tests {
 
     /// Creates test add file metadata with configurable stats for the "value" column.
     fn create_test_add_files(paths: Vec<&str>, stats: Vec<TestFileStats>) -> Box<dyn EngineData> {
-        let value_schema = schema! { nullable "value": LONG };
-        let value_fields = value_schema.fields().cloned().collect::<Vec<_>>();
-        let value_struct_type = DataType::from(value_schema);
-        let stats_schema = schema! {
+        let value_schema = schema_ref! { nullable "value": LONG };
+        let value_struct_type = DataType::from(value_schema.clone());
+        let stats_schema = schema_ref! {
             nullable NUM_RECORDS: LONG,
             nullable NULL_COUNT: (value_struct_type.clone()),
             nullable MIN_VALUES: (value_struct_type.clone()),
             nullable MAX_VALUES: (value_struct_type.clone()),
         };
-        let stats_fields = stats_schema.fields().cloned().collect::<Vec<_>>();
-        let stats_type = DataType::from(stats_schema);
+        let stats_type = DataType::from(stats_schema.clone());
         let schema = schema_ref! {
             not_null "path": STRING,
             not_null "partitionValues": { STRING => nullable STRING },
@@ -1322,7 +1318,7 @@ mod tests {
                         let value_struct = |v: Option<i64>| {
                             let scalar = v.map_or(Scalar::Null(DataType::LONG), |n| n.into());
                             Scalar::Struct(
-                                StructData::try_new(value_fields.clone(), vec![scalar]).unwrap(),
+                                StructData::try_new(value_schema.clone(), vec![scalar]).unwrap(),
                             )
                         };
                         let (null_count, min, max) = match stat {
@@ -1339,7 +1335,7 @@ mod tests {
                         };
                         Scalar::Struct(
                             StructData::try_new(
-                                stats_fields.clone(),
+                                stats_schema.clone(),
                                 vec![100i64.into(), null_count, min, max],
                             )
                             .unwrap(),
