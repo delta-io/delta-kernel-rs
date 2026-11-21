@@ -397,8 +397,10 @@ impl Snapshot {
 
     /// The latest AMT `checkpoint` action this snapshot covers, or `None` when the table has no
     /// checkpoint action at this version (a classic non-AMT table, or an AMT table that has none
-    /// yet). Served from memory when the build captured it; otherwise read from the manifest
-    /// commit that [`Self::last_manifest_commit`] names, so the log is never scanned.
+    /// yet). Served from memory when the build captured it; otherwise taken from the manifest
+    /// commit that [`Self::last_manifest_commit`] names, so the log is never scanned. The action
+    /// embedded in the `_last_checkpoint` hint the snapshot was listed from stands in for that
+    /// commit when it is the one the pointer names, and is the latest when there is no pointer.
     ///
     /// # Errors
     /// Returns an error if `lastManifestCommit` or the manifest commit cannot be read, or if the
@@ -416,13 +418,11 @@ impl Snapshot {
         if let Some(cached) = self.checkpoint_action.get() {
             return Ok(cached.clone());
         }
-        let found = match self.last_manifest_commit(engine)? {
-            Some(pointer) => Some(Arc::new(
-                self.log_segment
-                    .read_last_checkpoint_action_from_pointer(engine, &pointer)?,
-            )),
-            None => None,
-        };
+        let pointer = self.last_manifest_commit(engine)?;
+        let found = self
+            .log_segment
+            .latest_checkpoint_action(engine, pointer.as_ref())?
+            .map(Arc::new);
         // A concurrent caller may win the race to fill the cell; both read the same commit.
         let _ = self.checkpoint_action.set(found.clone());
         Ok(found)
