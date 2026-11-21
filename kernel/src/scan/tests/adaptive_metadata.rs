@@ -14,8 +14,8 @@ use crate::actions::{CheckpointAction, DomainMetadata, Sidecar};
 use crate::arrow::array::{AsArray as _, StringArray};
 use crate::arrow::datatypes::Int64Type;
 use crate::content_tree::test_utils::{
-    CLUSTERING_FIELD_ID, added_data_entry, clustering_mapping_domain, clustering_only_stats,
-    clustering_only_stats_value, data_manifest_entry, write_manifest, write_manifest_with_stats,
+    CLUSTERING_FIELD_ID, added_data_entry, clustering_mapping_domain, clustering_only_stats_at,
+    clustering_only_stats_value_at, data_manifest_entry, write_manifest, write_manifest_with_stats,
     x_full_stats, x_stats,
 };
 use crate::content_tree::{ContentTreeNodeEntry, TrackingInfo, TrackingStatus};
@@ -27,9 +27,10 @@ use crate::schema::{SchemaRef, StructType, schema_ref};
 use crate::table_features::ColumnMappingMode;
 use crate::transaction::BASE_ADD_FILES_SCHEMA;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
-    adaptive_metadata_protocol_and_metadata, checkpoint_action_with_root, commit_file_changes,
-    commit_files, commit_root_manifest, commit_root_manifest_file, create_adaptive_metadata_table,
-    domain, protocol_and_metadata_lines, setup_adaptive_metadata_table,
+    CLUSTERED_AMT_FEATURES, adaptive_metadata_protocol_and_metadata, checkpoint_action_with_root,
+    clustering_provider_field_id, commit_file_changes, commit_files, commit_root_manifest,
+    commit_root_manifest_file, commit_update, create_adaptive_metadata_table, domain,
+    protocol_and_metadata_lines, setup_adaptive_metadata_table, setup_clustered_table,
     write_amt_last_checkpoint_hint, write_commit_after_manifest_commit,
     write_manifest_commit_keeping_pm,
 };
@@ -544,6 +545,27 @@ fn scan_execute_reads_files_whose_locations_need_encoding() {
 /// The `clusteringProvider` value the tests record in tree entries.
 const LIQUID: &str = "liquid";
 
+/// Writes a root manifest at `root_path` holding `entries`, each with its `clusteringProvider`
+/// (none for `None`) stored under `field_id`.
+fn write_clustered_root(
+    engine: &SyncEngine,
+    root_path: &str,
+    entries: Vec<(ContentTreeNodeEntry, Option<&str>)>,
+    field_id: i32,
+) -> FileMeta {
+    let content_stats = clustering_only_stats_at(field_id);
+    let stats = entries
+        .iter()
+        .map(|(_, clustering)| match clustering {
+            Some(value) => clustering_only_stats_value_at(field_id, Scalar::from(*value)),
+            None => Scalar::Null(content_stats.clone().into()),
+        })
+        .collect();
+    let entries: Vec<_> = entries.into_iter().map(|(entry, _)| entry).collect();
+    let location = table_root().join(root_path).unwrap();
+    write_manifest_with_stats(engine, location, &entries, &content_stats, stats)
+}
+
 /// A checkpoint action at `version` whose root manifest holds `entries`, recording each entry's
 /// `clusteringProvider` stats (none for `None`) and carrying `domains` inline.
 fn clustered_checkpoint(
@@ -553,17 +575,7 @@ fn clustered_checkpoint(
     version: Version,
     domains: Vec<DomainMetadata>,
 ) -> CheckpointAction {
-    let stats = entries
-        .iter()
-        .map(|(_, clustering)| match clustering {
-            Some(value) => clustering_only_stats_value(Scalar::from(*value)),
-            None => Scalar::Null(clustering_only_stats().into()),
-        })
-        .collect();
-    let entries: Vec<_> = entries.into_iter().map(|(entry, _)| entry).collect();
-    let location = table_root().join(root_path).unwrap();
-    let root =
-        write_manifest_with_stats(engine, location, &entries, &clustering_only_stats(), stats);
+    let root = write_clustered_root(engine, root_path, entries, CLUSTERING_FIELD_ID);
     let mut checkpoint = checkpoint_action_with_root(root_path, root.size as i64, version).unwrap();
     checkpoint.domain_metadata = domains;
     checkpoint
@@ -623,6 +635,28 @@ fn assert_scan_clustering(
         .map(|(path, provider)| (path.to_string(), provider.map(str::to_string)))
         .collect();
     assert_eq!(rows, expected);
+}
+
+#[test]
+fn scan_reads_clustering_provider_stored_under_the_assigned_id() {
+    let (engine, _) = setup_clustered_table(&CLUSTERED_AMT_FEATURES, 2, None);
+    let snapshot = commit_update(&engine, &table_root(), |builder| builder).unwrap();
+    let assigned = clustering_provider_field_id(&engine, &snapshot)
+        .unwrap()
+        .unwrap();
+
+    let entries = vec![
+        (added_data_entry("a.parquet", 1, 1, 0, 0), Some(LIQUID)),
+        (added_data_entry("b.parquet", 1, 1, 1, 0), None),
+    ];
+    let root = write_clustered_root(&engine, "metadata/root-2.parquet", entries, assigned);
+    let version = commit_root_manifest_file(&engine, &table_root(), root);
+
+    assert_scan_clustering(
+        &engine,
+        version,
+        &[("a.parquet", Some(LIQUID)), ("b.parquet", None)],
+    );
 }
 
 #[rstest]
