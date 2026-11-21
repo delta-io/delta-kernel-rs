@@ -9,8 +9,10 @@
 //! yet carried across (see the per-field TODOs); the entry data that flows into the action is the
 //! file location, size, row-tracking numbers, deletion vector, and, when the caller requests them,
 //! the Delta stats as `Add.stats_parsed` (see [`StatsRead`]).
-//! `modificationTime` and `dataChange` have no AMT source and are supplied by the caller via
-//! [`ReadContext`].
+//! `modificationTime` is the entry's tracking `snapshotTimestamp`. An entry without one inherits
+//! it: a leaf entry from its parent `DataManifest` entry, a root entry from the content root's
+//! commit timestamp (see [`ReadContext`]). `dataChange` has no AMT source and is supplied by the
+//! caller via [`ReadContext`].
 
 use std::borrow::Cow;
 use std::collections::{HashSet, VecDeque};
@@ -32,8 +34,9 @@ use crate::content_tree::{
     AMT_FORMAT_VERSION, COLUMN_FILES, CONTENT_TYPE, ColumnFile, ContentTreeNodeEntry,
     DV_INFO_COLUMNS, DataContentType, DataFileFormat, FILE_FORMAT, FILE_SIZE_IN_BYTES,
     FIRST_ROW_ID, FORMAT_VERSION, LOCATION, MANIFEST_DV, MANIFEST_INFO, MODIFIED_SNAPSHOT_ID,
-    PARTITION_SPEC_ID, RECORD_COUNT, SEQUENCE_NUMBER, TRACKING, TRACKING_COLUMNS, TRACKING_STATUS,
-    TrackingInfo, TrackingStatus, struct_expr_from_schema,
+    PARTITION_SPEC_ID, RECORD_COUNT, SEQUENCE_NUMBER, SNAPSHOT_TIMESTAMP, TRACKING,
+    TRACKING_COLUMNS, TRACKING_STATUS, TimestampMicros, TrackingInfo, TrackingStatus,
+    struct_expr_from_schema,
 };
 use crate::engine_data::{
     EngineData, FilteredEngineData, GetData, RowVisitor, StructList, TypedGetData as _,
@@ -106,17 +109,12 @@ pub(crate) fn read_add_actions_from_amt(
 }
 
 /// Values the read path needs but cannot derive from an AMT entry, so the caller must supply them.
-///
-/// The context carries the table root that relative entry locations resolve against. The AMT entry
-/// also lacks the data file's modification time and a `dataChange` flag, so without this context
-/// the reader would have to invent both. Supplying them here keeps the function signature
-/// stable once a real source (e.g. the commit timestamp) is threaded through. Which Delta stats the
-/// caller reads is likewise a property of the read, not of the entry.
 pub(crate) struct ReadContext {
     /// The table root URL relative manifest locations resolve against.
     pub(crate) table_root: Url,
-    /// Emitted as `Add.modificationTime`.
-    pub(crate) modification_time: i64,
+    /// The `Add.modificationTime`, in milliseconds since the Unix epoch, of entries with no
+    /// snapshot timestamp of their own or from a parent: the content root's commit timestamp.
+    pub(crate) root_modification_time: i64,
     /// Emitted as `Add.dataChange`.
     pub(crate) data_change: bool,
     /// The Delta stats to emit as `Add.stats_parsed`, or `None` to emit no `stats_parsed`. Must
@@ -325,24 +323,36 @@ impl ManifestReadSchema {
     }
 }
 
-/// Expressions for the `Add` row-tracking fields whose source differs between root and leaf
-/// manifests (a leaf entry inherits them from its parent).
+/// Expressions for the `Add` fields whose source differs between root and leaf manifests (a leaf
+/// entry inherits a null value from its parent, a root entry from the content root).
 struct AddFieldSources {
     /// Expression producing `Add.baseRowId`.
     base_row_id: Expression,
     /// Expression producing `Add.defaultRowCommitVersion`.
     default_row_commit_version: Expression,
+    /// Expression producing `Add.modificationTime`.
+    modification_time: Expression,
 }
 
 impl AddFieldSources {
     /// Root-manifest sources: read `tracking.firstRowId` / `tracking.sequenceNumber` straight off
-    /// the entry (a root entry carries both).
-    fn root() -> Self {
+    /// the entry (a root entry carries both), and inherit a missing snapshot timestamp from the
+    /// content root.
+    fn root(ctx: &ReadContext) -> Self {
         Self {
             base_row_id: Expression::column([TRACKING, FIRST_ROW_ID]),
             default_row_commit_version: Expression::column([TRACKING, SEQUENCE_NUMBER]),
+            modification_time: modification_time_or(ctx.root_modification_time),
         }
     }
+}
+
+/// `Add.modificationTime`: the entry's own snapshot timestamp, else `inherited` (milliseconds).
+fn modification_time_or(inherited: i64) -> Expression {
+    Expression::coalesce([
+        Expression::column([MODIFICATION_TIME_HELPER]),
+        lit(inherited),
+    ])
 }
 
 /// Column appended to a leaf entry batch holding each entry's resolved `firstRowId`; read as
@@ -361,12 +371,20 @@ static FIRST_ROW_ID_HELPER_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 /// RFC 2396 form `Add.path` uses, or null when encoding leaves it unchanged.
 const ENCODED_PATH_HELPER: &str = "_encodedPath";
 
+/// Column appended to an entry batch holding each selected entry's own `snapshotTimestamp` in
+/// milliseconds, or null when the entry inherits it.
+const MODIFICATION_TIME_HELPER: &str = "_modificationTime";
+
 /// Helper columns [`EntryConverter::convert`] appends to every entry batch: the
-/// [`ADD_DV_HELPER_SCHEMA`] columns followed by [`ENCODED_PATH_HELPER`].
+/// [`ADD_DV_HELPER_SCHEMA`] columns followed by [`ENCODED_PATH_HELPER`] and
+/// [`MODIFICATION_TIME_HELPER`].
 static ADD_HELPER_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     schema_with_helpers(
         &ADD_DV_HELPER_SCHEMA,
-        &StructType::new_unchecked([StructField::nullable(ENCODED_PATH_HELPER, DataType::STRING)]),
+        &StructType::new_unchecked([
+            StructField::nullable(ENCODED_PATH_HELPER, DataType::STRING),
+            StructField::nullable(MODIFICATION_TIME_HELPER, DataType::LONG),
+        ]),
     )
 });
 
@@ -415,12 +433,17 @@ impl EntryConverter {
             selection: Vec::new(),
             deletion_vectors: AddDeletionVectorColumns::default(),
             encoded_paths: Vec::new(),
+            modification_times: Vec::new(),
         };
         visitor.visit_rows_of(entries)?;
         let mut helper_columns = visitor.deletion_vectors.into_columns()?;
         helper_columns.push(ArrayData::try_new(
             ArrayType::new(DataType::STRING, true),
             visitor.encoded_paths,
+        )?);
+        helper_columns.push(ArrayData::try_new(
+            ArrayType::new(DataType::LONG, true),
+            visitor.modification_times,
         )?);
         let augmented = entries.append_columns(ADD_HELPER_SCHEMA.clone(), helper_columns)?;
         let actions = self.evaluator.evaluate(augmented.as_ref())?;
@@ -443,7 +466,7 @@ fn make_root_entry_converter(
     make_entry_converter(
         engine,
         ctx,
-        &AddFieldSources::root(),
+        &AddFieldSources::root(ctx),
         Arc::new(ContentTreeNodeEntry::to_schema_with_content_stats(
             ctx.content_stats(),
         )),
@@ -481,8 +504,8 @@ impl LeafReadContext {
         manifest_dv: Option<MumblingBitmap>,
         ctx: &ReadContext,
     ) -> KernelResult<Self> {
-        // Root entries always carry explicit tracking values since nothing above them can be
-        // inherited from, so a null here is a malformed root rather than a value to inherit.
+        // A root entry's `sequenceNumber` and `firstRowId` have nothing to inherit from, so a null
+        // here is a malformed root.
         let require = |value: Option<i64>, field: &str| {
             value.ok_or_else(|| {
                 KernelError::missing_data(format!(
@@ -491,12 +514,16 @@ impl LeafReadContext {
             })
         };
         let parent_sequence_number = require(parent.sequence_number, SEQUENCE_NUMBER)?;
+        let parent_modification_time = parent
+            .snapshot_timestamp
+            .map_or(ctx.root_modification_time, TimestampMicros::as_millis);
         let sources = AddFieldSources {
             base_row_id: Expression::column([FIRST_ROW_ID_HELPER]),
             default_row_commit_version: expr!(coalesce(
                 path(TRACKING, SEQUENCE_NUMBER),
                 lit(parent_sequence_number),
             )),
+            modification_time: modification_time_or(parent_modification_time),
         };
         let input_schema = schema_with_helpers(
             &ContentTreeNodeEntry::to_schema_with_content_stats(ctx.content_stats()),
@@ -834,8 +861,8 @@ fn build_entry_to_add_expression(
             // path carries a partition spec.
             n if n == PARTITION_VALUES_NAME => empty_partition_values.clone(),
             n if n == SIZE_NAME => Expression::column([FILE_SIZE_IN_BYTES]),
-            // The AMT entry carries neither of these; both come from the caller's `ReadContext`.
-            n if n == MODIFICATION_TIME_NAME => lit(ctx.modification_time),
+            n if n == MODIFICATION_TIME_NAME => sources.modification_time.clone(),
+            // The AMT entry has no `dataChange`, so it comes from the caller's `ReadContext`.
             n if n == DATA_CHANGE_NAME => lit(ctx.data_change),
             n if n == DELETION_VECTOR_NAME => add_deletion_vector_expression(),
             n if n == BASE_ROW_ID_NAME => sources.base_row_id.clone(),
@@ -881,7 +908,9 @@ fn partition_values_map_type() -> KernelResult<MapType> {
 ///   equivalent.
 ///
 /// Alongside, it encodes each selected entry's raw `location` (see [`amt_location_to_add_path`])
-/// into [`ENCODED_PATH_HELPER`] values: the encoded path when encoding changes it, else null.
+/// into [`ENCODED_PATH_HELPER`] values: the encoded path when encoding changes it, else null. It
+/// also converts each selected entry's `snapshotTimestamp` to milliseconds as
+/// [`MODIFICATION_TIME_HELPER`] values: null when the entry has none, so it inherits one.
 struct AddSelectionVisitor<'r> {
     removed: RemovedEntries<'r>,
     selection: Vec<bool>,
@@ -889,11 +918,12 @@ struct AddSelectionVisitor<'r> {
     /// selected entry's deletion vector is kept.
     deletion_vectors: AddDeletionVectorColumns,
     encoded_paths: Vec<Scalar>,
+    modification_times: Vec<Scalar>,
 }
 
 /// Index of the first [`DV_INFO_COLUMNS`] getter in [`AddSelectionVisitor`]'s getters, which end
 /// with them.
-const ADD_SELECTION_DV_START: usize = 7;
+const ADD_SELECTION_DV_START: usize = 8;
 
 impl RowVisitor for AddSelectionVisitor<'_> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
@@ -906,6 +936,7 @@ impl RowVisitor for AddSelectionVisitor<'_> {
                 ColumnName::new([PARTITION_SPEC_ID]),
                 ColumnName::new([TRACKING, MODIFIED_SNAPSHOT_ID]),
                 ColumnName::new([COLUMN_FILES]),
+                ColumnName::new([TRACKING, SNAPSHOT_TIMESTAMP]),
             ];
             let types: [DataType; ADD_SELECTION_DV_START] = [
                 DataType::INTEGER,
@@ -915,6 +946,7 @@ impl RowVisitor for AddSelectionVisitor<'_> {
                 DataType::INTEGER,
                 DataType::LONG,
                 ArrayType::new(ColumnFile::to_schema(), false).into(),
+                DataType::TIMESTAMP,
             ];
             let (dv_names, dv_types) = DV_INFO_COLUMNS.as_ref();
             let names = names.into_iter().chain(dv_names.iter().cloned());
@@ -927,12 +959,14 @@ impl RowVisitor for AddSelectionVisitor<'_> {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         self.selection.reserve(row_count);
         self.encoded_paths.reserve(row_count);
+        self.modification_times.reserve(row_count);
         for row in 0..row_count {
             // `selection` holds one flag per row visited so far, so its length is this row's index.
             if self.removed.contains(self.selection.len()) {
                 self.deletion_vectors.push_null();
                 self.selection.push(false);
                 self.encoded_paths.push(Scalar::Null(DataType::STRING));
+                self.modification_times.push(Scalar::Null(DataType::LONG));
                 continue;
             }
             let content_type = DataContentType::try_from_repr(getters[0].get(row, CONTENT_TYPE)?)?;
@@ -951,18 +985,25 @@ impl RowVisitor for AddSelectionVisitor<'_> {
                     false
                 }
             };
-            let encoded_path = if selected {
+            let (encoded_path, modification_time) = if selected {
                 check_selected_entry(row, location, getters, &mut self.deletion_vectors)?;
-                match amt_location_to_add_path(location)? {
+                let encoded_path = match amt_location_to_add_path(location)? {
                     Cow::Owned(path) => Some(path),
                     Cow::Borrowed(_) => None,
-                }
+                };
+                // Converted here rather than by a `Cast`, whose TIMESTAMP-to-LONG unit is
+                // engine-defined.
+                let modification_time = getters[7]
+                    .get_timestamp(row, SNAPSHOT_TIMESTAMP)?
+                    .map(|micros| TimestampMicros(micros).as_millis());
+                (encoded_path, modification_time)
             } else {
                 self.deletion_vectors.push_null();
-                None
+                (None, None)
             };
             self.selection.push(selected);
             self.encoded_paths.push(encoded_path.into());
+            self.modification_times.push(modification_time.into());
         }
         Ok(())
     }
@@ -1284,12 +1325,15 @@ mod tests {
     use crate::unit_test_utils::{TestCancellationToken, assert_result_error_with_message};
     use crate::{Error, FileSize, ParquetFooter, ParquetHandler, PredicateRef};
 
+    /// The content root commit timestamp [`read_ctx`] reads against, in milliseconds.
+    const ROOT_TIMESTAMP_MILLIS: i64 = 1234;
+
     /// The [`ReadContext`] the tests read against; [`expected_add_row`] reads its values back.
     /// Non-default values so a hard-coded `modificationTime` / `dataChange` would fail.
     fn read_ctx() -> ReadContext {
         ReadContext {
             table_root: table_root(),
-            modification_time: 1234,
+            root_modification_time: ROOT_TIMESTAMP_MILLIS,
             data_change: false,
             stats: None,
         }
@@ -1360,7 +1404,7 @@ mod tests {
                     .unwrap(),
                 ),
                 Scalar::Long(size),
-                Scalar::Long(read_ctx().modification_time),
+                Scalar::Long(ROOT_TIMESTAMP_MILLIS),
                 Scalar::Boolean(read_ctx().data_change),
                 null_of("stats"),
                 null_of("tags"),
@@ -2681,6 +2725,7 @@ mod tests {
             first_row_id,
             deleted_positions: None,
             replaced_positions: None,
+            snapshot_timestamp: None,
         }
     }
 
@@ -2992,5 +3037,113 @@ mod tests {
     /// against the surviving `Add` rows.
     fn filtered_to_batch(filtered: FilteredEngineData) -> Box<dyn EngineData> {
         filtered.apply_selection_vector().unwrap()
+    }
+
+    /// The `Add.modificationTime` of each selected row of `actions`.
+    fn modification_times(actions: FilteredEngineData) -> Vec<i64> {
+        let batch = filtered_to_batch(actions).try_into_record_batch().unwrap();
+        let add = batch.column_by_name(ADD_NAME).unwrap().as_struct();
+        let column = add.column_by_name(MODIFICATION_TIME_NAME).unwrap();
+        column.as_primitive::<Int64Type>().values().to_vec()
+    }
+
+    /// A live entry with `status` and the given own `snapshotTimestamp`, in microseconds.
+    fn timestamped_entry(
+        status: TrackingStatus,
+        snapshot_micros: Option<i64>,
+    ) -> ContentTreeNodeEntry {
+        let mut entry = with_status(
+            leaf_entry("a.parquet", 1, 1, Some(1), Some(3), Some(500)),
+            status,
+        );
+        entry.tracking.snapshot_timestamp = snapshot_micros.map(TimestampMicros);
+        entry
+    }
+
+    #[rstest]
+    #[case::own_value(Some(5_000_000), 5_000)]
+    #[case::own_value_rounds_down(Some(-1_500), -2)]
+    #[case::inherits_root(None, ROOT_TIMESTAMP_MILLIS)]
+    fn root_entry_modification_time(
+        #[case] own_micros: Option<i64>,
+        #[case] expected: i64,
+        #[values(
+            TrackingStatus::Added,
+            TrackingStatus::Existing,
+            TrackingStatus::Modified
+        )]
+        status: TrackingStatus,
+    ) {
+        let engine = SyncEngine::new();
+        let entries = [timestamped_entry(status, own_micros)];
+        let actions = convert_root_entries_to_add_actions(
+            &engine,
+            entry_batch(&engine, &entries).as_ref(),
+            &read_ctx(),
+        )
+        .unwrap();
+        assert_eq!(modification_times(actions), vec![expected]);
+    }
+
+    #[rstest]
+    #[case::own_value(Some(5_000_000), Some(7_000_000), ROOT_TIMESTAMP_MILLIS, 5_000)]
+    #[case::inherits_parent(None, Some(7_000_999), ROOT_TIMESTAMP_MILLIS, 7_000)]
+    #[case::inherits_parent_rounds_down(None, Some(-1), ROOT_TIMESTAMP_MILLIS, -1)]
+    #[case::inherits_root(None, None, ROOT_TIMESTAMP_MILLIS, ROOT_TIMESTAMP_MILLIS)]
+    #[case::inherits_zero_root(None, None, 0, 0)]
+    fn leaf_entry_modification_time(
+        #[case] own_micros: Option<i64>,
+        #[case] parent_micros: Option<i64>,
+        #[case] root_modification_time: i64,
+        #[case] expected: i64,
+        #[values(
+            TrackingStatus::Added,
+            TrackingStatus::Existing,
+            TrackingStatus::Modified
+        )]
+        status: TrackingStatus,
+    ) {
+        let engine = SyncEngine::new();
+        let parent = TrackingInfo {
+            snapshot_timestamp: parent_micros.map(TimestampMicros),
+            ..valid_parent()
+        };
+        let read_ctx = ReadContext {
+            root_modification_time,
+            ..read_ctx()
+        };
+        let mut ctx = LeafReadContext::new(&engine, &parent, None, &read_ctx).unwrap();
+        let entries = [timestamped_entry(status, own_micros)];
+        let actions = ctx
+            .convert_leaf_entries_to_add_actions(entry_batch(&engine, &entries).as_ref())
+            .unwrap();
+        assert_eq!(modification_times(actions), vec![expected]);
+    }
+
+    #[test]
+    fn leaf_modification_time_stays_aligned_across_removed_and_deleted_entries() {
+        let engine = SyncEngine::new();
+        let parent = TrackingInfo {
+            snapshot_timestamp: Some(TimestampMicros(9_000_000)),
+            ..valid_parent()
+        };
+        let removed = MumblingBitmap::deserialize(mumbling_bitmap(&[1])).unwrap();
+        let mut ctx = LeafReadContext::new(&engine, &parent, Some(removed), &read_ctx()).unwrap();
+        let entry = |path, status, snapshot_micros: Option<i64>| {
+            let mut entry =
+                with_status(leaf_entry(path, 1, 1, Some(1), Some(3), Some(500)), status);
+            entry.tracking.snapshot_timestamp = snapshot_micros.map(TimestampMicros);
+            entry
+        };
+        let entries = [
+            entry("own.parquet", TrackingStatus::Added, Some(5_000_000)),
+            entry("removed.parquet", TrackingStatus::Added, Some(1_000_000)),
+            entry("deleted.parquet", TrackingStatus::Deleted, Some(2_000_000)),
+            entry("inherits.parquet", TrackingStatus::Added, None),
+        ];
+        let actions = ctx
+            .convert_leaf_entries_to_add_actions(entry_batch(&engine, &entries).as_ref())
+            .unwrap();
+        assert_eq!(modification_times(actions), vec![5_000, 9_000]);
     }
 }
