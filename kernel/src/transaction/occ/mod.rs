@@ -11,6 +11,11 @@
 //! - Any winner `protocol` action fails T.
 //! - A `metaData` winner fails T unless its `delta.identity.schemaUpdate` tag is exactly `true` and
 //!   T changes no metadata.
+//! - A row-tracking backfill or unbackfill winner fails a T that rewrites any file.
+//!
+//! `ensure_no_manifest_commit` and `ensure_row_tracking_marks` reject a winner that Kernel can't
+//! check: a manifest commit, a `delta.rowTracking` removal, or a row-tracking mark that it can't
+//! read.
 
 mod winner_check_plan;
 
@@ -55,6 +60,8 @@ pub(crate) struct WinningCommit {
 pub(crate) struct LoserFacts {
     /// T writes a `metaData` action.
     pub(crate) changes_metadata: bool,
+    /// T removes a file, updates a deletion vector or adds a file again.
+    pub(crate) rewrites_files: bool,
     /// The domains that T writes, including removal tombstones.
     pub(crate) written_domains: Vec<String>,
     /// The app IDs whose `txn` version T read.

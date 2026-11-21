@@ -84,7 +84,7 @@ pub(crate) const SIDECAR_FILE_SCHEMA_TAG: &str = "sidecarFileSchema";
 pub(crate) const CHECKPOINT_NUM_ADD_FILES_TAG: &str = "numOfAddFiles";
 #[internal_api]
 pub(crate) const DOMAIN_METADATA_NAME: &str = "domainMetadata";
-#[cfg(feature = "adaptive-metadata-in-dev")]
+#[cfg(any(feature = "adaptive-metadata-in-dev", feature = "declarative-plans"))]
 #[internal_api]
 pub(crate) const CHECKPOINT_ACTION_NAME: &str = "checkpoint";
 #[cfg(feature = "adaptive-metadata-in-dev")]

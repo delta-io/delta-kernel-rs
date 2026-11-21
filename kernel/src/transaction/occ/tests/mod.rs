@@ -85,6 +85,13 @@ fn txn(app_id: &str) -> Value {
     line(Action::Txn(SetTransaction::new(app_id.into(), 3, Some(0))))
 }
 
+/// A manifest commit's `checkpoint` action.
+///
+/// Its one element holds only `checkpointMetadata.version`.
+fn manifest_checkpoint(version: Version) -> Value {
+    json!({"checkpoint": [{"checkpointMetadata": {"version": version}}]})
+}
+
 // === Fixtures ===
 
 /// Writes `commits` to a new table, and returns the table and its commits after `read_version`.
@@ -130,6 +137,10 @@ fn fake_summary(version: Version, operation: &str, is_blind_append: bool) -> Win
         operation: Some(operation.to_string()),
         is_blind_append,
         in_commit_timestamp: None,
+        is_manifest_commit: false,
+        row_id_high_water_mark: None,
+        writes_row_tracking: false,
+        removes_row_tracking: false,
         first_violation: None,
     }
 }
@@ -137,6 +148,7 @@ fn fake_summary(version: Version, operation: &str, is_blind_append: bool) -> Win
 fn deleted_date_facts() -> LoserFacts {
     LoserFacts {
         changes_metadata: false,
+        rewrites_files: true,
         written_domains: vec![],
         read_app_ids: vec![],
     }

@@ -3,7 +3,9 @@ use rstest::rstest;
 use super::*;
 use crate::transaction::occ::ConflictKind::Winner;
 use crate::transaction::occ::winner_check_plan::{
-    COMMIT_INFO_ACTIONS, WINNER_CHECK_OUTPUT_SCHEMA, first_winner_conflict,
+    COMMIT_INFO_ACTIONS, ROW_TRACKING_BACKFILL_OPERATION, ROW_TRACKING_UNBACKFILL_OPERATION,
+    WINNER_CHECK_OUTPUT_SCHEMA, ensure_no_manifest_commit, ensure_row_tracking_marks,
+    first_winner_conflict,
 };
 use crate::unit_test_utils::assert_result_error_with_message;
 
@@ -241,4 +243,70 @@ fn identity_only_metadata_winner(
     let summaries = summaries_with(set_facts, &[(7, actions)]);
     let expected = rule_at_7("UPDATE SCHEMA", WinnerRule::MetadataChanged).filter(|_| fails);
     assert_eq!(first_winner_conflict(&summaries), expected);
+}
+
+// === Row tracking and manifest commits ===
+
+#[rstest]
+#[case::backfill_fails_a_rewrite(ROW_TRACKING_BACKFILL_OPERATION, true)]
+#[case::backfill_passes_without_a_rewrite(ROW_TRACKING_BACKFILL_OPERATION, false)]
+#[case::unbackfill_fails_a_rewrite(ROW_TRACKING_UNBACKFILL_OPERATION, true)]
+fn row_tracking_backfill_winner(#[case] operation: &str, #[case] rewrites_files: bool) {
+    let set_facts = |facts: &mut LoserFacts| facts.rewrites_files = rewrites_files;
+    let summaries = summaries_with(set_facts, &[(7, vec![commit_info(operation)])]);
+    let expected = rule_at_7(operation, WinnerRule::BackfillConflict).filter(|_| rewrites_files);
+    assert_eq!(first_winner_conflict(&summaries), expected);
+}
+
+#[test]
+fn row_tracking_mark_comes_only_from_live_row_tracking_domain() {
+    let actions = vec![
+        commit_info("WRITE"),
+        domain("app.x", "{not json"),
+        row_tracking(1099),
+    ];
+    let summaries = summaries(&[(7, actions)]);
+    assert_eq!(only_summary(&summaries).row_id_high_water_mark, Some(1099));
+    ensure_no_manifest_commit(&summaries).unwrap();
+    ensure_row_tracking_marks(&summaries).unwrap();
+}
+
+#[test]
+fn removed_other_domain_passes_row_tracking_check() {
+    let summaries = summaries(&[(7, vec![commit_info("WRITE"), removed_domain("app.x")])]);
+    ensure_row_tracking_marks(&summaries).unwrap();
+}
+
+#[rstest]
+#[case::row_tracking_configurations_without_mark_in_two_winners(
+    vec![
+        (7, vec![commit_info("WRITE"), domain(ROW_TRACKING_DOMAIN_NAME, "{}")]),
+        (8, vec![commit_info("WRITE"), domain(ROW_TRACKING_DOMAIN_NAME, "{not json")]),
+    ],
+    "Generic delta kernel error: Conflict detection could not read the rowIdHighWaterMark of the \
+     `delta.rowTracking` domain in the winning commits at versions [7, 8]",
+)]
+#[case::row_tracking_tombstone(
+    vec![(7, vec![commit_info("WRITE"), removed_domain(ROW_TRACKING_DOMAIN_NAME)])],
+    "Unsupported: The winning commit at version 7 removes the `delta.rowTracking` domain",
+)]
+#[case::row_tracking_tombstone_reported_before_earlier_unreadable_mark(
+    vec![
+        (7, vec![commit_info("WRITE"), domain(ROW_TRACKING_DOMAIN_NAME, "{}")]),
+        (8, vec![commit_info("WRITE"), removed_domain(ROW_TRACKING_DOMAIN_NAME)]),
+    ],
+    "Unsupported: The winning commit at version 8 removes the `delta.rowTracking` domain",
+)]
+#[case::manifest_commit(
+    vec![(7, vec![commit_info("WRITE"), manifest_checkpoint(7)])],
+    "Unsupported: Conflict detection does not support the manifest commit at version 7",
+)]
+fn row_tracking_and_manifest_checks(
+    #[case] commits: Vec<(Version, Vec<Value>)>,
+    #[case] message: &str,
+) {
+    let summaries = summaries(&commits);
+    let result =
+        ensure_no_manifest_commit(&summaries).and_then(|()| ensure_row_tracking_marks(&summaries));
+    assert_result_error_with_message(result, message);
 }
