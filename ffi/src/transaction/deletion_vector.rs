@@ -12,8 +12,9 @@ use delta_kernel::{KernelError, KernelResult};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 use super::ExclusiveUpdateTableTransaction;
-use crate::error::{ExternResult, IntoExternResult};
+use crate::error::ExternResult;
 use crate::handle::Handle;
+use crate::panic::catch_panic_into_result;
 use crate::scan::SharedScanMetadataIterator;
 use crate::{KernelStringSlice, SharedExternEngine, TryFromStringSlice};
 
@@ -139,19 +140,21 @@ pub unsafe extern "C" fn dv_descriptor_new(
     cardinality: i64,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveDvDescriptor>> {
-    let engine = unsafe { engine.as_ref() };
-    let path = unsafe { TryFromStringSlice::try_from_slice(&path_or_inline_dv) };
-    let result = KernelDvStorageType::try_from(storage_type).and_then(|storage_type| {
-        dv_descriptor_new_impl(
-            storage_type,
-            path,
-            has_offset,
-            offset,
-            size_in_bytes,
-            cardinality,
-        )
-    });
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let path = TryFromStringSlice::try_from_slice(&path_or_inline_dv);
+            KernelDvStorageType::try_from(storage_type).and_then(|storage_type| {
+                dv_descriptor_new_impl(
+                    storage_type,
+                    path,
+                    has_offset,
+                    offset,
+                    size_in_bytes,
+                    cardinality,
+                )
+            })
+        })
+    }
 }
 
 fn dv_descriptor_new_impl(
@@ -193,12 +196,14 @@ pub unsafe extern "C" fn dv_descriptor_map_insert(
     descriptor: Handle<ExclusiveDvDescriptor>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<bool> {
-    let map_ref = unsafe { map.as_mut() };
-    let engine_ref = unsafe { engine.as_ref() };
-    let descriptor = unsafe { descriptor.into_inner() };
-    let path_result = unsafe { TryFromStringSlice::try_from_slice(&data_file_path) };
-    let result = dv_descriptor_map_insert_impl(map_ref, path_result, *descriptor).map(|_| true);
-    unsafe { result.into_extern_result(&engine_ref) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let map_ref = map.as_mut();
+            let descriptor = descriptor.into_inner();
+            let path_result = TryFromStringSlice::try_from_slice(&data_file_path);
+            dv_descriptor_map_insert_impl(map_ref, path_result, *descriptor).map(|_| true)
+        })
+    }
 }
 
 fn dv_descriptor_map_insert_impl(
@@ -244,13 +249,15 @@ pub unsafe extern "C" fn update_table_txn_update_deletion_vectors(
     scan_iter: Handle<SharedScanMetadataIterator>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<bool> {
-    let txn_ref = unsafe { txn.as_mut() };
-    let dv_map = unsafe { dv_map.into_inner() };
-    let scan_iter = unsafe { scan_iter.into_inner() };
-    let engine_ref = unsafe { engine.as_ref() };
-    let result =
-        update_table_txn_update_deletion_vectors_impl(txn_ref, *dv_map, &scan_iter).map(|_| true);
-    unsafe { result.into_extern_result(&engine_ref) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let txn_ref = txn.as_mut();
+            let dv_map = dv_map.into_inner();
+            let scan_iter = scan_iter.into_inner();
+            update_table_txn_update_deletion_vectors_impl(txn_ref, *dv_map, &scan_iter)
+                .map(|_| true)
+        })
+    }
 }
 
 fn update_table_txn_update_deletion_vectors_impl(

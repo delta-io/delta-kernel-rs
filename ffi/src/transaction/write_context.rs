@@ -11,9 +11,10 @@ use delta_kernel_ffi_macros::handle_descriptor;
 use super::partition_value::{ExclusivePartitionValueMap, PartitionValueMap};
 use super::{ExclusiveCreateTableTransaction, ExclusiveUpdateTableTransaction};
 use crate::delta_types::{FfiColumnName, FfiColumnNameArray, FfiStringArray};
-use crate::error::{ExternResult, IntoExternResult};
+use crate::error::ExternResult;
 use crate::expressions::SharedExpression;
 use crate::handle::Handle;
+use crate::panic::catch_panic_into_result;
 use crate::{
     AllocateBytesFn, AllocateColumnNamesFn, AllocateStringFn, KernelBytesSlice, KernelStringSlice,
     NullableCvoid, OptionalValue, SharedExternEngine, SharedSchema, TryFromStringSlice, Url,
@@ -60,10 +61,12 @@ pub unsafe extern "C" fn update_table_txn_write_state(
     txn: Handle<ExclusiveUpdateTableTransaction>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedWriteState>> {
-    let txn = unsafe { txn.as_ref() };
-    let engine = unsafe { engine.as_ref() };
-    let result = txn.write_state().map(Into::into);
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let txn = txn.as_ref();
+            txn.write_state().map(Into::into)
+        })
+    }
 }
 
 /// Encodes write state for transport to workers running the same kernel version.
@@ -79,12 +82,14 @@ pub unsafe extern "C" fn write_state_encode(
     allocate_fn: AllocateBytesFn,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<NullableCvoid> {
-    let state = unsafe { state.as_ref() };
-    let engine = unsafe { engine.as_ref() };
-    let result = state
-        .encode()
-        .map(|state| allocate_fn(kernel_bytes_slice!(state)));
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let state = state.as_ref();
+            state
+                .encode()
+                .map(|state| allocate_fn(kernel_bytes_slice!(state)))
+        })
+    }
 }
 
 /// Decodes the payload from [`write_state_encode`] into an owned write-state handle.
@@ -98,10 +103,12 @@ pub unsafe extern "C" fn write_state_decode(
     encoded: KernelBytesSlice,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedWriteState>> {
-    let engine = unsafe { engine.as_ref() };
-    let encoded = unsafe { encoded.try_as_slice() };
-    let result = encoded.and_then(WriteState::decode).map(Into::into);
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let encoded = encoded.try_as_slice();
+            encoded.and_then(WriteState::decode).map(Into::into)
+        })
+    }
 }
 
 /// Creates a builder for one bound write context.
@@ -171,24 +178,26 @@ pub unsafe extern "C" fn write_context_builder_with_row_tracking_columns(
     columns: &FfiRowTrackingMetadataColumns,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveWriteContextBuilder>> {
-    let builder = unsafe { builder.into_inner() };
-    let engine = unsafe { engine.as_ref() };
-    let row_id_col_name = Option::<&KernelStringSlice>::from(&columns.row_id_col_name)
-        .map(|name| unsafe { TryFromStringSlice::try_from_slice(name) })
-        .transpose();
-    let row_commit_version_col_name =
-        Option::<&KernelStringSlice>::from(&columns.row_commit_version_col_name)
-            .map(|name| unsafe { TryFromStringSlice::try_from_slice(name) })
-            .transpose();
-    let result = row_id_col_name
-        .and_then(|row_id_col_name| {
-            Ok(RowTrackingMetadataColumns {
-                row_id_col_name,
-                row_commit_version_col_name: row_commit_version_col_name?,
-            })
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let builder = builder.into_inner();
+            let row_id_col_name = Option::<&KernelStringSlice>::from(&columns.row_id_col_name)
+                .map(|name| TryFromStringSlice::try_from_slice(name))
+                .transpose();
+            let row_commit_version_col_name =
+                Option::<&KernelStringSlice>::from(&columns.row_commit_version_col_name)
+                    .map(|name| TryFromStringSlice::try_from_slice(name))
+                    .transpose();
+            row_id_col_name
+                .and_then(|row_id_col_name| {
+                    Ok(RowTrackingMetadataColumns {
+                        row_id_col_name,
+                        row_commit_version_col_name: row_commit_version_col_name?,
+                    })
+                })
+                .map(|columns| Box::new(builder.with_row_tracking_columns(columns)).into())
         })
-        .map(|columns| Box::new(builder.with_row_tracking_columns(columns)).into());
-    unsafe { result.into_extern_result(&engine) }
+    }
 }
 
 /// Builds and consumes a write-context builder.
@@ -206,10 +215,12 @@ pub unsafe extern "C" fn write_context_builder_build(
     builder: Handle<ExclusiveWriteContextBuilder>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedWriteContext>> {
-    let builder = unsafe { builder.into_inner() };
-    let engine = unsafe { engine.as_ref() };
-    let result = builder.build().map(|context| Arc::new(context).into());
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let builder = builder.into_inner();
+            builder.build().map(|context| Arc::new(context).into())
+        })
+    }
 }
 
 /// Drops a write-context builder without building it.
@@ -276,13 +287,14 @@ pub unsafe extern "C" fn update_table_txn_get_unpartitioned_write_context(
     txn: Handle<ExclusiveUpdateTableTransaction>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedWriteContext>> {
-    let txn = unsafe { txn.as_ref() };
-    let engine = unsafe { engine.as_ref() };
-    let result = txn
-        .write_state()
-        .and_then(|state| state.write_context_builder().build())
-        .map(|context| Arc::new(context).into());
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let txn = txn.as_ref();
+            txn.write_state()
+                .and_then(|state| state.write_context_builder().build())
+                .map(|context| Arc::new(context).into())
+        })
+    }
 }
 
 /// Gets the write context from a create-table transaction for an unpartitioned table.
@@ -298,13 +310,14 @@ pub unsafe extern "C" fn create_table_txn_get_unpartitioned_write_context(
     txn: Handle<ExclusiveCreateTableTransaction>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedWriteContext>> {
-    let txn = unsafe { txn.as_ref() };
-    let engine = unsafe { engine.as_ref() };
-    let result = txn
-        .write_state()
-        .and_then(|state| state.write_context_builder().build())
-        .map(|context| Arc::new(context).into());
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let txn = txn.as_ref();
+            txn.write_state()
+                .and_then(|state| state.write_context_builder().build())
+                .map(|context| Arc::new(context).into())
+        })
+    }
 }
 
 /// Gets the write context from a transaction for a partitioned table, for the partition described
@@ -331,19 +344,21 @@ pub unsafe extern "C" fn update_table_txn_get_partitioned_write_context(
     partition_values: Handle<ExclusivePartitionValueMap>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedWriteContext>> {
-    let txn = unsafe { txn.as_ref() };
-    let partition_values = unsafe { partition_values.into_inner() };
-    let engine = unsafe { engine.as_ref() };
-    let result = partitioned_write_context_impl(
-        |pv| {
-            txn.write_state()?
-                .write_context_builder()
-                .with_partition_values(pv)
-                .build()
-        },
-        *partition_values,
-    );
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let txn = txn.as_ref();
+            let partition_values = partition_values.into_inner();
+            partitioned_write_context_impl(
+                |pv| {
+                    txn.write_state()?
+                        .write_context_builder()
+                        .with_partition_values(pv)
+                        .build()
+                },
+                *partition_values,
+            )
+        })
+    }
 }
 
 /// Gets the write context from a create-table transaction for a partitioned table. See
@@ -360,19 +375,21 @@ pub unsafe extern "C" fn create_table_txn_get_partitioned_write_context(
     partition_values: Handle<ExclusivePartitionValueMap>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedWriteContext>> {
-    let txn = unsafe { txn.as_ref() };
-    let partition_values = unsafe { partition_values.into_inner() };
-    let engine = unsafe { engine.as_ref() };
-    let result = partitioned_write_context_impl(
-        |pv| {
-            txn.write_state()?
-                .write_context_builder()
-                .with_partition_values(pv)
-                .build()
-        },
-        *partition_values,
-    );
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let txn = txn.as_ref();
+            let partition_values = partition_values.into_inner();
+            partitioned_write_context_impl(
+                |pv| {
+                    txn.write_state()?
+                        .write_context_builder()
+                        .with_partition_values(pv)
+                        .build()
+                },
+                *partition_values,
+            )
+        })
+    }
 }
 
 fn partitioned_write_context_impl(
@@ -544,12 +561,14 @@ pub unsafe extern "C" fn resolve_file_path(
     allocate_fn: AllocateStringFn,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<NullableCvoid> {
-    let write_context = unsafe { write_context.as_ref() };
-    let engine = unsafe { engine.as_ref() };
-    let file_url: KernelResult<&str> = unsafe { TryFromStringSlice::try_from_slice(&file_url) };
-    let result = resolve_file_path_impl(write_context, file_url)
-        .map(|path| allocate_fn(kernel_string_slice!(path)));
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let write_context = write_context.as_ref();
+            let file_url: KernelResult<&str> = TryFromStringSlice::try_from_slice(&file_url);
+            resolve_file_path_impl(write_context, file_url)
+                .map(|path| allocate_fn(kernel_string_slice!(path)))
+        })
+    }
 }
 
 fn resolve_file_path_impl(

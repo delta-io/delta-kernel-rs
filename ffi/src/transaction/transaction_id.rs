@@ -4,10 +4,11 @@ use delta_kernel::{KernelResult, Snapshot};
 
 use crate::error::ExternResult;
 use crate::handle::Handle;
+use crate::panic::catch_panic_into_result;
 use crate::transaction::ExclusiveUpdateTableTransactionBuilder;
 use crate::{
-    ExternEngine, IntoExternResult, KernelStringSlice, OptionalValue, SharedExternEngine,
-    SharedSnapshot, TryFromStringSlice,
+    ExternEngine, KernelStringSlice, OptionalValue, SharedExternEngine, SharedSnapshot,
+    TryFromStringSlice,
 };
 
 /// Associates an app_id and version with a transaction. These will be applied to the table on
@@ -27,12 +28,13 @@ pub unsafe extern "C" fn update_table_txn_builder_with_transaction_id(
     version: i64,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
-    let builder = unsafe { *builder.into_inner() };
-    let engine = unsafe { engine.as_ref() };
-    let app_id_res: KernelResult<String> = unsafe { TryFromStringSlice::try_from_slice(&app_id) };
-    let result =
-        app_id_res.map(|app_id| Box::new(builder.with_transaction_id(app_id, version)).into());
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let builder = *builder.into_inner();
+            let app_id_res: KernelResult<String> = TryFromStringSlice::try_from_slice(&app_id);
+            app_id_res.map(|app_id| Box::new(builder.with_transaction_id(app_id, version)).into())
+        })
+    }
 }
 
 /// Retrieves the version associated with an app_id from a snapshot.
@@ -49,12 +51,15 @@ pub unsafe extern "C" fn get_app_id_version(
     app_id: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<OptionalValue<i64>> {
-    let snapshot = unsafe { snapshot.clone_as_arc() };
-    let engine = unsafe { engine.as_ref() };
-    let app_id_res = unsafe { String::try_from_slice(&app_id) };
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let snapshot = snapshot.clone_as_arc();
+            let engine = engine.as_ref();
+            let app_id_res = String::try_from_slice(&app_id);
 
-    let result = get_app_id_version_impl(snapshot, app_id_res, engine).map(OptionalValue::from);
-    unsafe { result.into_extern_result(&engine) }
+            get_app_id_version_impl(snapshot, app_id_res, engine).map(OptionalValue::from)
+        })
+    }
 }
 
 fn get_app_id_version_impl(

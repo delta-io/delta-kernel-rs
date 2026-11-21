@@ -16,8 +16,9 @@
 use delta_kernel::KernelResult;
 use delta_kernel::transaction::Transaction;
 
-use crate::error::{ExternResult, IntoExternResult};
+use crate::error::ExternResult;
 use crate::handle::Handle;
+use crate::panic::catch_panic_into_result;
 use crate::transaction::ExclusiveUpdateTableTransaction;
 use crate::{KernelStringSlice, NullableCvoid, SharedExternEngine, kernel_string_slice};
 
@@ -74,10 +75,12 @@ pub unsafe extern "C" fn update_table_txn_visit_top_level_column_defaults(
     engine_context: NullableCvoid,
     visitor: ColumnDefaultVisitor,
 ) -> ExternResult<usize> {
-    let engine = unsafe { engine.as_ref() };
-    let txn = unsafe { txn.as_ref() };
-    let result = visit_top_level_column_defaults_impl(txn, engine_context, visitor);
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let txn = txn.as_ref();
+            visit_top_level_column_defaults_impl(txn, engine_context, visitor)
+        })
+    }
 }
 
 fn visit_top_level_column_defaults_impl(
