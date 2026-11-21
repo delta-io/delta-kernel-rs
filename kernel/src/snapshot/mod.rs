@@ -37,6 +37,8 @@ use crate::checkpoint::{
 use crate::clustering::{CLUSTERING_DOMAIN_NAME, ClusteringColumnInfo, parse_clustering_columns};
 use crate::committer::{Committer, PublishMetadata};
 #[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::content_tree::file_metadata::ADAPTIVE_METADATA_DOMAIN_NAME;
+#[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::content_tree::file_metadata::FileMetadataFieldIds;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::crc::FileMetadataFieldIdsState;
@@ -1733,6 +1735,8 @@ impl Snapshot {
         self.table_configuration().ensure_read_write_supported()?;
 
         let crc = self.resolve_crc_for_write(engine, &tracing::Span::current())?;
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let crc = self.with_adaptive_metadata_domain(engine, crc)?;
 
         let crc_path = ParsedLogPath::new_crc(self.table_root(), self.version())?;
 
@@ -1761,6 +1765,33 @@ impl Snapshot {
             }
             Err(e) => Err(Error::Kernel(e)),
         }
+    }
+
+    /// Sets the `delta.adaptiveMetadata` domain on `crc` to the table's domain at this version,
+    /// if the table has one. A CRC built from commits or a checkpoint can miss a domain that only
+    /// the checkpoint action carries, and the written `fileMetadataFieldIds` comes from the domain.
+    // TODO(#2866): Do the same for every system domain, not only the adaptive metadata one.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn with_adaptive_metadata_domain(
+        &self,
+        engine: &dyn Engine,
+        crc: Arc<Crc>,
+    ) -> KernelResult<Arc<Crc>> {
+        if !self.has_adaptive_metadata() {
+            return Ok(crc);
+        }
+        let mut domains = self.get_domain_metadatas_internal(
+            engine,
+            Some(&HashSet::from([ADAPTIVE_METADATA_DOMAIN_NAME])),
+        )?;
+        let Some(domain) = domains.remove(ADAPTIVE_METADATA_DOMAIN_NAME) else {
+            return Ok(crc);
+        };
+        let mut crc = Arc::unwrap_or_clone(crc);
+        crc.domain_metadata_state
+            .map_mut()
+            .insert(ADAPTIVE_METADATA_DOMAIN_NAME.to_string(), domain);
+        Ok(Arc::new(crc))
     }
 
     /// Resolve the CRC to write for this snapshot's version.

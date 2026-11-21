@@ -49,7 +49,10 @@ pub(crate) use writer::try_write_crc_file;
 use crate::actions::LastManifestCommit;
 use crate::actions::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::content_tree::file_metadata::FileMetadataFieldIds;
+use crate::content_tree::file_metadata::{
+    ADAPTIVE_METADATA_DOMAIN_NAME, FILE_METADATA_FIELD_IDS, FileMetadataFieldIds,
+    configuration_object,
+};
 use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
 use crate::{KernelError, KernelResult, Version};
 
@@ -302,9 +305,10 @@ struct CrcRaw {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_manifest_commit: Option<LastManifestCommit>,
-    /// Kept as raw JSON so a malformed mapping is reported with its content.
+    /// Kept as raw JSON so a malformed mapping is reported with its content. Derived from the
+    /// domain metadata on write.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[serde(default, skip_serializing)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     file_metadata_field_ids: Option<Value>,
     /// The Delta protocol spec names this field `fileSizeHistogram`, but Delta-Spark writers
     /// historically emit it as `histogramOpt`. To remain compatible with CRC files written by
@@ -437,7 +441,7 @@ impl TryFrom<&Crc> for CrcRaw {
             #[cfg(feature = "adaptive-metadata-in-dev")]
             last_manifest_commit: crc.last_manifest_commit_opt.clone(),
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            file_metadata_field_ids: None,
+            file_metadata_field_ids: file_metadata_field_ids_for_write(&crc.domain_metadata_state)?,
         })
     }
 }
@@ -652,6 +656,22 @@ impl TryFrom<&[Add]> for DerivedDeletionStats {
     }
 }
 
+/// The `fileMetadataFieldIds` to write, copied from the `delta.adaptiveMetadata` domain. `None`
+/// when the domains do not hold it.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn file_metadata_field_ids_for_write(domains: &DomainMetadataState) -> KernelResult<Option<Value>> {
+    let Some(domain) = domains.map().get(ADAPTIVE_METADATA_DOMAIN_NAME) else {
+        return Ok(None);
+    };
+    // Readers parse the field as the typed mapping, so check it before copying the raw value.
+    FileMetadataFieldIds::try_from_configuration(domain.configuration())
+        .map_err(KernelError::generic)?;
+    let mut configuration =
+        configuration_object(domain.configuration()).map_err(KernelError::generic)?;
+    // The typed parse above requires the field, so it is present here.
+    Ok(configuration.remove(FILE_METADATA_FIELD_IDS))
+}
+
 /// Parses a CRC's `fileMetadataFieldIds`. Unknown keys are ignored, as in the domain
 /// configuration.
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -802,7 +822,7 @@ mod tests {
     use crate::actions::LastManifestCommit;
     use crate::actions::{Add, DomainMetadata, Protocol, SetTransaction};
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    use crate::content_tree::file_metadata::FileMetadataFieldIds;
+    use crate::content_tree::file_metadata::{ADAPTIVE_METADATA_DOMAIN_NAME, FileMetadataFieldIds};
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::content_tree::test_utils::CLUSTERING_FIELD_ID;
     use crate::table_features::TableFeature;
@@ -1255,6 +1275,59 @@ mod tests {
             Ok(state) => assert_eq!(result.unwrap().file_metadata_field_ids(), state),
             Err(message) => assert_result_error_with_message(result, message),
         }
+    }
+
+    /// A `Crc` that holds only the given domain metadata, for serialization tests.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn minimal_crc(domain_metadata_state: DomainMetadataState) -> Crc {
+        Crc {
+            protocol: valid_protocol(),
+            file_stats_state: FileStatsState::Complete(FileStats::try_new(0, 0, None).unwrap()),
+            domain_metadata_state,
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::domain_keeps_unrecognized_keys(
+        vec![DomainMetadata::new(
+            ADAPTIVE_METADATA_DOMAIN_NAME.to_string(),
+            r#"{"fileMetadataFieldIds":{"clusteringProvider":100,"unknown":5},"version":2}"#
+                .to_string(),
+        )],
+        Some(json!({"clusteringProvider": 100, "unknown": 5})),
+        FileMetadataFieldIdsState::Mapped(FileMetadataFieldIds {
+            clustering_provider: Some(100),
+        })
+    )]
+    #[case::no_domain(vec![], None, FileMetadataFieldIdsState::Unmapped)]
+    fn ser_file_metadata_field_ids_copies_domain_mapping(
+        #[case] domains: Vec<DomainMetadata>,
+        #[case] expected: Option<Value>,
+        #[case] expected_state: FileMetadataFieldIdsState,
+    ) {
+        let crc = minimal_crc(DomainMetadataState::try_complete(domains).unwrap());
+        let json = serde_json::to_value(&crc).unwrap();
+        assert_eq!(json.get("fileMetadataFieldIds").cloned(), expected);
+        let reloaded = Crc::try_from_json_bytes(json.to_string().as_bytes(), 0).unwrap();
+        assert_eq!(reloaded.file_metadata_field_ids(), expected_state);
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn ser_file_metadata_field_ids_rejects_malformed_domain() {
+        let domains = vec![DomainMetadata::new(
+            ADAPTIVE_METADATA_DOMAIN_NAME.to_string(),
+            "not json".to_string(),
+        )];
+        let crc = minimal_crc(DomainMetadataState::try_complete(domains).unwrap());
+        let err = serde_json::to_value(&crc).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("delta.adaptiveMetadata configuration is not valid"),
+            "{err}"
+        );
     }
 
     // ===== numMetadata / numProtocol rejection =====
