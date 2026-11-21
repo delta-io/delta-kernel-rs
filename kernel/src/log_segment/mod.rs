@@ -31,6 +31,7 @@ use crate::content_tree::read_checkpoint_action;
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
 use crate::log_replay::ActionsBatch;
+use crate::log_segment_files::HintListing;
 #[internal_api]
 use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::{
@@ -159,6 +160,19 @@ pub(crate) struct LogSegment {
     /// [`Self::checkpoint_hint_sidecars`] accessors built on it). Read this field directly only
     /// when the raw hint is wanted as-is -- e.g. re-threading it into a derived segment.
     pub(crate) last_checkpoint_metadata: Option<LastCheckpointHint>,
+}
+
+/// The AMT checkpoint a [`LogSegment`]'s commits build on in place of a checkpoint file. See
+/// [`LogSegment::amt_base`].
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AmtBase<'a> {
+    /// The version of the checkpoint action's content root. The segment's commits follow it.
+    pub(crate) version: Version,
+    /// The checkpoint action, when the `_last_checkpoint` hint embeds it. Otherwise the manifest
+    /// commit that added it is in the segment and replay reads it from there. The snapshot's
+    /// `lastManifestCommit`, when it has one, takes precedence over this action.
+    pub(crate) checkpoint_action: Option<&'a CheckpointAction>,
 }
 
 /// Validate the invariants shared by catalog-managed snapshot and commit-range log tails.
@@ -425,6 +439,25 @@ impl LogSegment {
             .filter(|hint| hint.applies_to(&self.listed.checkpoint_parts))
     }
 
+    /// The AMT checkpoint this segment's commits build on in place of a checkpoint file, or `None`
+    /// if the segment has a checkpoint file or was not listed from an AMT `_last_checkpoint` hint.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn amt_base(&self) -> Option<AmtBase<'_>> {
+        if self.checkpoint_version.is_some() {
+            return None;
+        }
+        let hint = self.last_checkpoint_metadata.as_ref()?;
+        // A hint after the end version was ignored by listing. Listing that does not start from the
+        // hint drops it from the segment (see `Self::for_snapshot_with_engine`).
+        if hint.amt_manifest_commit_version().is_none() || hint.version > self.end_version {
+            return None;
+        }
+        Some(AmtBase {
+            version: hint.version,
+            checkpoint_action: hint.amt_checkpoint_action(),
+        })
+    }
+
     /// The checkpoint schema from the `_last_checkpoint` hint, when the hint describes the selected
     /// checkpoint (see [`Self::checkpoint_hint`]) and carried a `checkpointSchema`. `None`
     /// otherwise -- the caller then reads the checkpoint footer instead.
@@ -515,7 +548,7 @@ impl LogSegment {
         err
     )]
     pub(crate) fn for_snapshot(
-        storage: &dyn StorageHandler,
+        engine: &dyn Engine,
         log_root: Url,
         log_tail: Vec<ParsedLogPath>,
         time_travel_version: impl Into<Option<Version>>,
@@ -523,10 +556,12 @@ impl LogSegment {
     ) -> Result<Self> {
         let time_travel_version = time_travel_version.into();
         let start = std::time::Instant::now();
+        let storage = engine.storage_handler();
         let build = || {
-            let checkpoint_hint = LastCheckpointHint::try_read(storage, &log_root)?;
-            Self::for_snapshot_impl(
-                storage,
+            let checkpoint_hint = LastCheckpointHint::try_read(storage.as_ref(), &log_root)?;
+            Self::for_snapshot_with_engine(
+                storage.as_ref(),
+                Some(engine),
                 log_root,
                 log_tail,
                 checkpoint_hint,
@@ -552,8 +587,31 @@ impl LogSegment {
     }
 
     // factored out for testing
+    #[cfg(test)]
     pub(crate) fn for_snapshot_impl(
         storage: &dyn StorageHandler,
+        log_root: Url,
+        log_tail: Vec<ParsedLogPath>,
+        checkpoint_hint: Option<LastCheckpointHint>,
+        time_travel_version: Option<Version>,
+    ) -> Result<Self> {
+        Self::for_snapshot_with_engine(
+            storage,
+            None,
+            log_root,
+            log_tail,
+            checkpoint_hint,
+            time_travel_version,
+        )
+    }
+
+    /// Builds the segment as [`Self::for_snapshot_impl`] does. `engine` reads the snapshot's
+    /// newest commit when an AMT hint cannot supply the snapshot's base; without it, that case is
+    /// an error.
+    #[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_variables))]
+    fn for_snapshot_with_engine(
+        storage: &dyn StorageHandler,
+        engine: Option<&dyn Engine>,
         log_root: Url,
         log_tail: Vec<ParsedLogPath>,
         checkpoint_hint: Option<LastCheckpointHint>,
@@ -581,22 +639,59 @@ impl LogSegment {
         //    checkpoint found)
         // 4. no usable_hint,      end_version is None  --> list from v0 unbounded
 
-        let listed_files = match (usable_hint, end_version) {
+        // `listed_from_hint` is false only when an AMT hint was usable but listing had to start
+        // elsewhere; the segment then drops the hint so it is not taken as the segment's base.
+        let (listed_files, listed_from_hint) = match (usable_hint, end_version) {
             // Cases 1 and 2
-            (Some(cp), end_version) => LogSegmentFiles::list_with_checkpoint_hint(
-                cp,
-                storage,
-                &log_root,
-                log_tail,
-                end_version,
-            )?,
+            (Some(cp), end_version) => {
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                let relist_log_tail = log_tail.clone();
+                match LogSegmentFiles::list_with_checkpoint_hint(
+                    cp,
+                    storage,
+                    &log_root,
+                    log_tail,
+                    end_version,
+                )? {
+                    HintListing::Listed(listed_files) => (listed_files, true),
+                    #[cfg(feature = "adaptive-metadata-in-dev")]
+                    HintListing::ManifestCommitAfterSnapshot(hinted_files) => {
+                        let engine = engine.ok_or_else(|| {
+                            KernelError::invalid_checkpoint(format!(
+                                "_last_checkpoint AMT hint at version {} names a manifest commit \
+                                 after the snapshot, so listing needs the snapshot's \
+                                 lastManifestCommit",
+                                cp.version
+                            ))
+                        })?;
+                        match Self::list_before_manifest_commit(
+                            engine,
+                            storage,
+                            &log_root,
+                            relist_log_tail,
+                            cp,
+                            &hinted_files,
+                        )? {
+                            Some(relisted) => (relisted, false),
+                            None => (hinted_files, true),
+                        }
+                    }
+                }
+            }
             // Case 3
-            (None, Some(end)) => LogSegmentFiles::list_with_backward_checkpoint_scan(
-                storage, &log_root, log_tail, end,
-            )?,
+            (None, Some(end)) => (
+                LogSegmentFiles::list_with_backward_checkpoint_scan(
+                    storage, &log_root, log_tail, end,
+                )?,
+                true,
+            ),
             // Case 4
-            (None, None) => LogSegmentFiles::list(storage, &log_root, log_tail, None, None)?,
+            (None, None) => (
+                LogSegmentFiles::list(storage, &log_root, log_tail, None, None)?,
+                true,
+            ),
         };
+        let checkpoint_hint = checkpoint_hint.filter(|_| listed_from_hint);
 
         Self::try_new_for_snapshot(listed_files, log_root, time_travel_version, checkpoint_hint)
     }
@@ -653,6 +748,47 @@ impl LogSegment {
                 Error::Kernel(error)
             }
         })
+    }
+
+    /// Lists a snapshot that ends before its AMT `_last_checkpoint` hint's manifest commit (see
+    /// [`HintListing::ManifestCommitAfterSnapshot`]). The newest commit in `hinted_files` is the
+    /// snapshot's, and its `commitInfo.lastManifestCommit`, when present, names the manifest commit
+    /// carrying the snapshot's latest checkpoint action, so listing starts from that action's
+    /// content root. Without one, no manifest commit precedes the snapshot: `None` keeps
+    /// `hinted_files` when the hint embeds its checkpoint action, and otherwise the snapshot is
+    /// listed as if there were no hint.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn list_before_manifest_commit(
+        engine: &dyn Engine,
+        storage: &dyn StorageHandler,
+        log_root: &Url,
+        log_tail: Vec<ParsedLogPath>,
+        hint: &LastCheckpointHint,
+        hinted_files: &LogSegmentFiles,
+    ) -> KernelResult<Option<LogSegmentFiles>> {
+        let newest_commit = hinted_files.ascending_commit_files.last().ok_or_else(|| {
+            KernelError::internal_error(
+                "AMT hint listing before its manifest commit has no commits",
+            )
+        })?;
+        let (_, last_manifest_commit) = newest_commit.read_ict_and_last_manifest_commit(engine)?;
+        let relisted = match last_manifest_commit {
+            Some(last_manifest_commit) => LogSegmentFiles::list_from_last_manifest_commit(
+                storage,
+                log_root,
+                log_tail,
+                &last_manifest_commit,
+                newest_commit.version,
+            )?,
+            None if hint.amt_checkpoint_action().is_some() => return Ok(None),
+            None => LogSegmentFiles::list_with_backward_checkpoint_scan(
+                storage,
+                log_root,
+                log_tail,
+                newest_commit.version,
+            )?,
+        };
+        Ok(Some(relisted))
     }
 
     /// Constructs a [`LogSegment`] to be used for `TableChanges`. For a TableChanges between
