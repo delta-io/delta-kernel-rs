@@ -4,7 +4,6 @@ use delta_kernel::commit_range::CommitRange;
 use delta_kernel::history_manager::{HistoryCommitType, first_version_after, latest_version_as_of};
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::{KernelError, Snapshot};
-use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
