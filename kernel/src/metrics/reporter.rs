@@ -75,6 +75,14 @@ impl ReportGeneratorLayer {
         Self { reporter }
     }
 
+    #[allow(dead_code, reason = "Used by scan planning.")]
+    pub(crate) fn current_reporter() -> Option<Arc<dyn MetricsReporter>> {
+        tracing::dispatcher::get_default(|dispatch| {
+            let layer = dispatch.downcast_ref::<Self>()?;
+            Some(layer.reporter.clone())
+        })
+    }
+
     /// Apply `record` to the visitor stashed on `span`, then drain its pending warnings. Warnings
     /// must be emitted *after* the `extensions_mut` lock is released; calling `warn!()` while
     /// holding it would re-enter the layer and deadlock.

@@ -79,6 +79,11 @@ impl<'a> MetadataPlanner<'a> {
         }
     }
 
+    /// Returns source-selection metrics, including work completed before an error.
+    pub(crate) fn report(&self) -> &MetadataPlanReport {
+        &self.report
+    }
+
     pub(crate) fn with_checkpoint_info(
         mut self,
         checkpoint_info: impl Into<Option<Arc<CheckpointInfo>>>,

@@ -20,6 +20,7 @@ use crate::engine::arrow_conversion::TryIntoArrow as _;
 use crate::engine::arrow_data::EngineDataArrowExt as _;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{Predicate as Pred, column_name, expr};
+use crate::metrics::{ReplayBase, ScanPlanOutcome};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::object_store::ObjectStoreExt as _;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -33,7 +34,7 @@ use crate::scan::{PartitionValuesOptions, Scan, StatsOptions, StructStats};
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
     commit_files, create_adaptive_metadata_table,
 };
-use crate::unit_test_utils::load_test_table;
+use crate::unit_test_utils::{assert_scan_plan_metrics, load_test_table};
 use crate::{Engine, Error, KernelResult, PredicateRef, Result, Snapshot, Version};
 
 // Normalizes metadata for comparison: the imperative path splits fields between the data batch
@@ -756,25 +757,29 @@ fn declarative_json_only_disables_metadata_pruning(
     LogState::with_latest_version(2),
     FeatureSet::new(),
     checkpoint_json_stats(),
-    StatsOptions::all()
+    StatsOptions::all(),
+    (None, &[(0, 0), (1, 1), (2, 2)])
 )]
 #[case::v1_checkpoint_json(
     LogState::with_latest_version(2).with_checkpoint_at([2]),
     FeatureSet::new(),
     checkpoint_json_stats(),
-    StatsOptions::all()
+    StatsOptions::all(),
+    (Some(2), &[])
 )]
 #[case::v1_checkpoint_struct(
     LogState::with_latest_version(2).with_checkpoint_at([2]),
     FeatureSet::new(),
     checkpoint_struct_stats(),
-    StatsOptions::all_struct()
+    StatsOptions::all_struct(),
+    (Some(2), &[])
 )]
 #[case::v1_mixed_struct_only(
     LogState::with_latest_version(2).with_checkpoint_at([1]),
     FeatureSet::new(),
     checkpoint_struct_stats(),
-    StatsOptions::all()
+    StatsOptions::all(),
+    (Some(1), &[(2, 2)])
 )]
 #[case::v2_checkpoint_json(
     LogState::with_latest_version(2)
@@ -782,7 +787,8 @@ fn declarative_json_only_disables_metadata_pruning(
         .with_sidecars_if_enabled(None),
     FeatureSet::new().v2_checkpoint(),
     checkpoint_json_stats(),
-    StatsOptions::all()
+    StatsOptions::all(),
+    (Some(2), &[])
 )]
 #[case::v2_mixed_struct(
     LogState::with_latest_version(2)
@@ -790,7 +796,8 @@ fn declarative_json_only_disables_metadata_pruning(
         .with_sidecars_if_enabled(None),
     FeatureSet::new().v2_checkpoint(),
     checkpoint_struct_stats(),
-    StatsOptions::all_struct()
+    StatsOptions::all_struct(),
+    (Some(1), &[(2, 2)])
 )]
 #[case::v2_mixed_struct_only(
     LogState::with_latest_version(2)
@@ -798,7 +805,8 @@ fn declarative_json_only_disables_metadata_pruning(
         .with_sidecars_if_enabled(None),
     FeatureSet::new().v2_checkpoint(),
     checkpoint_struct_stats(),
-    StatsOptions::all()
+    StatsOptions::all(),
+    (Some(1), &[(2, 2)])
 )]
 #[case::v2_checkpoint_without_stats(
     LogState::with_latest_version(2)
@@ -806,33 +814,44 @@ fn declarative_json_only_disables_metadata_pruning(
         .with_sidecars_if_enabled(None),
     FeatureSet::new().v2_checkpoint(),
     no_checkpoint_stats(),
-    StatsOptions::all_struct()
+    StatsOptions::all_struct(),
+    (Some(2), &[])
 )]
 #[case::compaction(
     LogState::with_latest_version(3).with_compaction_ranges([(0, 2)]),
     FeatureSet::new(),
     checkpoint_json_stats(),
-    StatsOptions::all()
+    StatsOptions::all(),
+    (None, &[(0, 2), (3, 3)])
 )]
 #[case::compaction_after_sidecars(
     LogState::with_latest_version(4).with_checkpoint_at([2])
         .with_sidecars_if_enabled(Some(1)).with_compaction_ranges([(3, 4)]),
     FeatureSet::new().v2_checkpoint().column_mapping("name"),
     checkpoint_struct_stats(),
-    StatsOptions::all_struct()
+    StatsOptions::all_struct(),
+    (Some(2), &[(3, 4)])
 )]
 fn declarative_metadata_output_options_across_log_shapes(
     #[case] log_state: LogState,
     #[case] features: FeatureSet,
     #[case] table_config: TableConfig,
     #[case] stats: StatsOptions,
+    #[case] metrics: (Option<Version>, &[(Version, Version)]),
     #[values(
         PartitionValuesOptions::default(),
         PartitionValuesOptions::with_struct()
     )]
     partitions: PartitionValuesOptions,
 ) -> Result<()> {
-    assert_metadata_output_options(log_state, features, table_config, stats, partitions)
+    assert_metadata_output_options(
+        log_state,
+        features,
+        table_config,
+        stats,
+        partitions,
+        metrics,
+    )
 }
 
 #[rstest]
@@ -857,6 +876,7 @@ fn declarative_metadata_synthesizes_json_for_struct_only_checkpoints(
         checkpoint_struct_stats(),
         stats,
         PartitionValuesOptions::with_struct(),
+        (Some(2), &[]),
     )
     .unwrap();
 }
@@ -914,6 +934,7 @@ fn assert_metadata_output_options(
     table_config: TableConfig,
     stats: StatsOptions,
     partitions: PartitionValuesOptions,
+    (checkpoint_version, files): (Option<Version>, &[(Version, Version)]),
 ) -> Result<()> {
     let json_requested = stats.synthesize_json;
     let parsed_partitions_requested = partitions.parsed_struct;
@@ -939,8 +960,32 @@ fn assert_metadata_output_options(
         .scan_builder()
         .with_stats(stats)
         .with_partition_values(partitions)
+        .with_correlation_id("scan-plan-test")
         .build()?;
-    let actual = declarative_metadata(&scan, &engine)?;
+    let actual = assert_scan_plan_metrics(
+        || declarative_metadata(&scan, &engine),
+        |event| {
+            assert_eq!(event.outcome, ScanPlanOutcome::Plan);
+            assert_eq!(event.stats, scan.stats);
+            assert_eq!(event.partition_values, scan.partition_values_options);
+            assert_eq!(event.correlation_id.as_deref(), Some("scan-plan-test"));
+            let replay_base =
+                checkpoint_version.map_or(ReplayBase::Empty, |_| ReplayBase::Checkpoint);
+            assert_eq!(event.replay_base, Some(replay_base));
+            assert_eq!(event.checkpoint.is_some(), checkpoint_version.is_some());
+            let report = &event.metadata_plan;
+            assert_eq!(
+                report.commit_start_version,
+                files.first().map(|(lo, _)| *lo)
+            );
+            assert_eq!(report.commit_end_version, files.last().map(|(_, hi)| *hi));
+            assert_eq!(report.commit_total_size_bytes == 0, files.is_empty());
+            assert_eq!(
+                report.compaction_file_count,
+                files.iter().filter(|(lo, hi)| lo != hi).count() as u64
+            );
+        },
+    )?;
 
     for batches in [&actual, &expected] {
         assert!(
@@ -1443,9 +1488,16 @@ fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> Resu
     let scan = snapshot.clone().scan_builder().build()?;
 
     let no_plan_engine = DelegatingEngine::new(sync_engine).without_plan_executor();
-    let err = scan
-        .declarative_metadata_scan_plan(&no_plan_engine)
-        .unwrap_err();
+    let err = assert_scan_plan_metrics(
+        || scan.declarative_metadata_scan_plan(&no_plan_engine),
+        |event| {
+            assert_eq!(event.outcome, ScanPlanOutcome::Error);
+            let checkpoint = event.checkpoint.as_ref().unwrap();
+            assert!(checkpoint.info.is_none());
+            assert_eq!(checkpoint.cache_hit, Some(false));
+        },
+    )
+    .unwrap_err();
 
     assert!(matches!(err, KernelError::Unsupported(_)));
 
@@ -1454,8 +1506,15 @@ fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> Resu
         .with_predicate(Arc::new(Pred::FALSE))
         .build()?;
     assert!(
-        scan.declarative_metadata_scan_plan(&no_plan_engine)?
-            .is_none()
+        assert_scan_plan_metrics(
+            || scan.declarative_metadata_scan_plan(&no_plan_engine),
+            |event| {
+                assert_eq!(event.outcome, ScanPlanOutcome::Empty);
+                assert!(event.replay_base.is_none());
+                assert!(event.checkpoint.is_none());
+            },
+        )?
+        .is_none()
     );
     assert!(scan.snapshot.cached_checkpoint_info().is_none());
     Ok(())

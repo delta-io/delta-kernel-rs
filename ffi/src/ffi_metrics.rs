@@ -9,7 +9,9 @@
 //! - Operation ids are UUIDs in kernel (see [`MetricId`]). Here we report the raw 16 bytes of the
 //!   UUID.
 
+mod scan_plan;
 use delta_kernel::metrics as kernel;
+pub use scan_plan::*;
 
 use crate::{KernelStringSlice, kernel_string_slice};
 
@@ -695,6 +697,10 @@ pub enum MetricEvent {
     ChecksumWriteSuccess(ChecksumWriteSuccess),
     ChecksumWriteFailure(ChecksumWriteFailure),
     LastCheckpointReadCompleted(LastCheckpointReadCompleted),
+    /// Callback-scoped borrowed scan-plan report.
+    ScanPlanGenerationCompleted(*const ScanPlanReport),
+    /// Callback-scoped borrowed scan-plan report.
+    ScanPlanGenerationFailed(*const ScanPlanReport),
 }
 
 fn duration_ns(duration: std::time::Duration) -> u64 {
@@ -716,9 +722,11 @@ impl MetricEvent {
     /// Build an FFI event from a kernel event. Note that this event is only valid as long as the
     /// passed argument is still alive, since we might make `KernelStringSlices` out of some
     /// fields.
-    pub(crate) fn from_kernel(event: &kernel::MetricEvent) -> Self {
+    /// Scan-plan events need temporary backing storage and are handled by `with_ffi_event`.
+    pub(crate) fn from_kernel(event: &kernel::MetricEvent) -> Option<Self> {
         use kernel::MetricEvent as K;
-        match event {
+        Some(match event {
+            K::ScanPlanGenerationCompleted(_) | K::ScanPlanGenerationFailed(_) => return None,
             K::LogSegmentLoadSuccess(kernel::LogSegmentLoadSuccess {
                 operation_id,
                 correlation_id,
@@ -1014,16 +1022,19 @@ impl MetricEvent {
                 processing_stats: (*processing_stats).into(),
                 output_stats: (*output_stats).into(),
             }),
-        }
+        })
     }
 }
 
 /// Invoke `f` with the FFI [`MetricEvent`] built from `event`.
-pub(crate) fn with_ffi_event<R>(
-    event: &kernel::MetricEvent,
-    f: impl FnOnce(MetricEvent) -> R,
-) -> R {
-    f(MetricEvent::from_kernel(event))
+pub(crate) fn with_ffi_event(event: &kernel::MetricEvent, f: impl FnOnce(MetricEvent)) {
+    if let kernel::MetricEvent::ScanPlanGenerationCompleted(report) = event {
+        scan_plan::with_event(report, false, f);
+    } else if let kernel::MetricEvent::ScanPlanGenerationFailed(report) = event {
+        scan_plan::with_event(report, true, f);
+    } else if let Some(event) = MetricEvent::from_kernel(event) {
+        f(event);
+    }
 }
 
 #[cfg(test)]
