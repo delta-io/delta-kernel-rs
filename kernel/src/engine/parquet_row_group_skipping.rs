@@ -178,14 +178,15 @@ impl ParquetStatsProvider for RowGroupFilter<'_> {
 /// Extracts the minimum stat value from a parquet column chunk, converting from the physical
 /// parquet type to the requested logical Delta type. INT64 timestamp stats are rescaled to
 /// microseconds and decimal stats widened to the requested scale using the column's Parquet
-/// annotation; a decimal stat that cannot be widened exactly is `None`.
+/// annotation; a decimal stat that cannot be widened exactly is `None`, as is a string or binary
+/// stat taken from the legacy `min`/`max` footer fields (see [`byte_array_bound`]).
 fn extract_min_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Option<Scalar> {
-    let value = match (data_type.as_primitive_opt()?, column.statistics()?) {
-        (PrimitiveType::String, Statistics::ByteArray(s)) => s.min_opt()?.as_utf8().ok()?.into(),
-        (PrimitiveType::String, Statistics::FixedLenByteArray(s)) => {
-            s.min_opt()?.as_utf8().ok()?.into()
+    let stats = column.statistics()?;
+    let value = match (data_type.as_primitive_opt()?, stats) {
+        (PrimitiveType::String, _) => {
+            let bytes = byte_array_bound(stats, StatBound::Min)?;
+            std::str::from_utf8(bytes).ok()?.into()
         }
-        (PrimitiveType::String, _) => return None,
         (PrimitiveType::Long, Statistics::Int64(s)) => s.min_opt()?.into(),
         (PrimitiveType::Long, Statistics::Int32(s)) => (*s.min_opt()? as i64).into(),
         (PrimitiveType::Long, _) => return None,
@@ -202,9 +203,7 @@ fn extract_min_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Opt
         (PrimitiveType::Double, _) => return None,
         (PrimitiveType::Boolean, Statistics::Boolean(s)) => s.min_opt()?.into(),
         (PrimitiveType::Boolean, _) => return None,
-        (PrimitiveType::Binary, Statistics::ByteArray(s)) => s.min_opt()?.data().into(),
-        (PrimitiveType::Binary, Statistics::FixedLenByteArray(s)) => s.min_opt()?.data().into(),
-        (PrimitiveType::Binary, _) => return None,
+        (PrimitiveType::Binary, _) => byte_array_bound(stats, StatBound::Min)?.into(),
         (PrimitiveType::Date, Statistics::Int32(s)) => Scalar::Date(*s.min_opt()?),
         (PrimitiveType::Date, _) => return None,
         (PrimitiveType::Timestamp, Statistics::Int64(s)) => Scalar::Timestamp(
@@ -219,13 +218,9 @@ fn extract_min_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Opt
         (PrimitiveType::IntervalYearMonth(_) | PrimitiveType::IntervalDayTime(_), _) => {
             return None;
         }
-        (PrimitiveType::Decimal(d), stats) => {
+        (PrimitiveType::Decimal(d), _) => {
             let column = column.column_descr();
-            decimal_stat_as(
-                decimal_unscaled(stats, column, DecimalBound::Min)?,
-                column,
-                *d,
-            )?
+            decimal_stat_as(decimal_unscaled(stats, column, StatBound::Min)?, column, *d)?
         }
         // Void columns have no Parquet representation, so no stats exist
         (PrimitiveType::Void, _) => return None,
@@ -238,14 +233,15 @@ fn extract_min_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Opt
 /// Extracts the maximum stat value from a parquet column chunk, converting from the physical
 /// parquet type to the requested logical Delta type. INT64 timestamp stats are rescaled to
 /// microseconds and decimal stats widened to the requested scale using the column's Parquet
-/// annotation; a decimal stat that cannot be widened exactly is `None`.
+/// annotation; a decimal stat that cannot be widened exactly is `None`, as is a string or binary
+/// stat taken from the legacy `min`/`max` footer fields (see [`byte_array_bound`]).
 fn extract_max_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Option<Scalar> {
-    let value = match (data_type.as_primitive_opt()?, column.statistics()?) {
-        (PrimitiveType::String, Statistics::ByteArray(s)) => s.max_opt()?.as_utf8().ok()?.into(),
-        (PrimitiveType::String, Statistics::FixedLenByteArray(s)) => {
-            s.max_opt()?.as_utf8().ok()?.into()
+    let stats = column.statistics()?;
+    let value = match (data_type.as_primitive_opt()?, stats) {
+        (PrimitiveType::String, _) => {
+            let bytes = byte_array_bound(stats, StatBound::Max)?;
+            std::str::from_utf8(bytes).ok()?.into()
         }
-        (PrimitiveType::String, _) => return None,
         (PrimitiveType::Long, Statistics::Int64(s)) => s.max_opt()?.into(),
         (PrimitiveType::Long, Statistics::Int32(s)) => (*s.max_opt()? as i64).into(),
         (PrimitiveType::Long, _) => return None,
@@ -262,9 +258,7 @@ fn extract_max_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Opt
         (PrimitiveType::Double, _) => return None,
         (PrimitiveType::Boolean, Statistics::Boolean(s)) => s.max_opt()?.into(),
         (PrimitiveType::Boolean, _) => return None,
-        (PrimitiveType::Binary, Statistics::ByteArray(s)) => s.max_opt()?.data().into(),
-        (PrimitiveType::Binary, Statistics::FixedLenByteArray(s)) => s.max_opt()?.data().into(),
-        (PrimitiveType::Binary, _) => return None,
+        (PrimitiveType::Binary, _) => byte_array_bound(stats, StatBound::Max)?.into(),
         (PrimitiveType::Date, Statistics::Int32(s)) => Scalar::Date(*s.max_opt()?),
         (PrimitiveType::Date, _) => return None,
         (PrimitiveType::Timestamp, Statistics::Int64(s)) => Scalar::Timestamp(
@@ -279,13 +273,9 @@ fn extract_max_scalar(data_type: &DataType, column: &ColumnChunkMetaData) -> Opt
         (PrimitiveType::IntervalYearMonth(_) | PrimitiveType::IntervalDayTime(_), _) => {
             return None;
         }
-        (PrimitiveType::Decimal(d), stats) => {
+        (PrimitiveType::Decimal(d), _) => {
             let column = column.column_descr();
-            decimal_stat_as(
-                decimal_unscaled(stats, column, DecimalBound::Max)?,
-                column,
-                *d,
-            )?
+            decimal_stat_as(decimal_unscaled(stats, column, StatBound::Max)?, column, *d)?
         }
         // Void columns have no Parquet representation, so no stats exist
         (PrimitiveType::Void, _) => return None,
@@ -302,33 +292,51 @@ fn extract_nullcount(stats: Option<&Statistics>) -> Option<i64> {
     Some(stats?.null_count_opt()? as i64)
 }
 
-enum DecimalBound {
+enum StatBound {
     Min,
     Max,
 }
 
+/// Bound of a BYTE_ARRAY or FIXED_LEN_BYTE_ARRAY column chunk as raw bytes.
+///
+/// Legacy `min`/`max` footer fields are rejected: writers filled them using signed byte
+/// comparison, while data skipping compares these bounds with predicate literals through
+/// [`Scalar::logical_partial_cmp`], which orders `String` and `Binary` by unsigned bytes. The two
+/// orders disagree as soon as a byte is >= 0x80, so either bound may exclude values the row group
+/// holds. Equal legacy bounds do not prove a single value either: parquet-mr before 1.8.0 could
+/// store a reused buffer as both bounds (PARQUET-251), and kernel has no `created_by` check to
+/// rule such files out.
+fn byte_array_bound(stats: &Statistics, bound: StatBound) -> Option<&[u8]> {
+    if stats.is_min_max_deprecated() {
+        return None;
+    }
+    match (stats, bound) {
+        (Statistics::ByteArray(s), StatBound::Min) => s.min_bytes_opt(),
+        (Statistics::ByteArray(s), StatBound::Max) => s.max_bytes_opt(),
+        (Statistics::FixedLenByteArray(s), StatBound::Min) => s.min_bytes_opt(),
+        (Statistics::FixedLenByteArray(s), StatBound::Max) => s.max_bytes_opt(),
+        _ => None,
+    }
+}
+
 /// Unscaled bound of a decimal column chunk from its INT32, INT64 or FIXED_LEN_BYTE_ARRAY stats.
 ///
-/// Legacy `min`/`max` footer fields are rejected for FIXED_LEN_BYTE_ARRAY: writers filled them
-/// using byte-wise comparison, which is not numeric order for multi-byte two's complement.
-/// Bounds must match the column's `type_length` so a truncated value cannot be sign-extended
-/// to a different number.
+/// FIXED_LEN_BYTE_ARRAY bounds come from [`byte_array_bound`], which rejects legacy `min`/`max`
+/// footer fields; byte-wise comparison is not numeric order for multi-byte two's complement
+/// either. Bounds must match the column's `type_length` so a truncated value cannot be
+/// sign-extended to a different number.
 fn decimal_unscaled(
     stats: &Statistics,
     column: &ColumnDescriptor,
-    bound: DecimalBound,
+    bound: StatBound,
 ) -> Option<i128> {
     Some(match (stats, bound) {
-        (Statistics::Int32(s), DecimalBound::Min) => (*s.min_opt()?).into(),
-        (Statistics::Int32(s), DecimalBound::Max) => (*s.max_opt()?).into(),
-        (Statistics::Int64(s), DecimalBound::Min) => (*s.min_opt()?).into(),
-        (Statistics::Int64(s), DecimalBound::Max) => (*s.max_opt()?).into(),
-        (Statistics::FixedLenByteArray(s), bound) if !stats.is_min_max_deprecated() => {
-            let bytes = match bound {
-                DecimalBound::Min => s.min_bytes_opt()?,
-                DecimalBound::Max => s.max_bytes_opt()?,
-            };
-            fixed_len_decimal_bits(bytes, column)?
+        (Statistics::Int32(s), StatBound::Min) => (*s.min_opt()?).into(),
+        (Statistics::Int32(s), StatBound::Max) => (*s.max_opt()?).into(),
+        (Statistics::Int64(s), StatBound::Min) => (*s.min_opt()?).into(),
+        (Statistics::Int64(s), StatBound::Max) => (*s.max_opt()?).into(),
+        (Statistics::FixedLenByteArray(_), bound) => {
+            fixed_len_decimal_bits(byte_array_bound(stats, bound)?, column)?
         }
         _ => return None,
     })
