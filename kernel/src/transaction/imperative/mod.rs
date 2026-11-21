@@ -191,6 +191,10 @@ impl<STATE> Transaction<STATE, Imperative> {
     ///
     /// The base schema and supported optional columns for `add_metadata` are described by
     /// [`Transaction::add_files_schema`].
+    ///
+    /// On tables with the adaptiveMetadata feature, every staged file is treated as newly added:
+    /// its `modificationTime` becomes the commit's In-Commit Timestamp. Re-adding an existing file
+    /// to update only its metadata, such as its statistics, is not supported here.
     pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) {
         self.staged_data_changes
             .add_files_metadata
@@ -370,6 +374,7 @@ impl<STATE> Transaction<STATE, Imperative> {
                 .evaluation_handler()
                 .create_many(LOG_TXN_SCHEMA.clone(), Vec::from_iter(rows))
         });
+        let in_commit_timestamp = kernel_commit_info.in_commit_timestamp;
         let commit_info_action = self.generate_commit_info(engine, kernel_commit_info);
         let protocol_action = protocol
             .map(|protocol| create_row(engine, LOG_PROTOCOL_SCHEMA.clone(), protocol.clone()))
@@ -379,7 +384,7 @@ impl<STATE> Transaction<STATE, Imperative> {
             .transpose()?;
 
         let (add_actions, row_tracking_domain_metadata) =
-            self.generate_adds(engine, commit_version)?;
+            self.generate_adds(engine, commit_version, in_commit_timestamp)?;
 
         let dm_changes =
             self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
@@ -479,16 +484,31 @@ impl<STATE> Transaction<STATE, Imperative> {
         Ok(())
     }
 
-    /// Generates add actions and row tracking domain metadata for a commit.
+    /// Generates add actions and row tracking domain metadata for a commit whose In-Commit
+    /// Timestamp is `in_commit_timestamp`.
     #[instrument(name = "txn.gen_adds", skip_all, err)]
     fn generate_adds<'a>(
         &'a self,
         engine: &dyn Engine,
         commit_version: u64,
+        in_commit_timestamp: Option<i64>,
     ) -> KernelResult<(
         EngineDataResultIterator<'a>,
         Option<RowTrackingDomainMetadata>,
     )> {
+        // adaptiveMetadata tables record a file's modification time as the In-Commit Timestamp of
+        // the commit that adds it.
+        let modification_time = self
+            .is_adaptive_metadata_enabled()
+            .then(|| {
+                in_commit_timestamp.ok_or_else(|| {
+                    KernelError::invalid_transaction_state(format!(
+                        "adaptiveMetadata commit at version {commit_version} has no In-Commit \
+                         Timestamp"
+                    ))
+                })
+            })
+            .transpose()?;
         // Note: this does not require delta.enableRowTracking=true. "supported" is sufficient
         // for writers to assign row IDs.
         let assign_fresh_row_tracking_metadata = self
@@ -508,7 +528,7 @@ impl<STATE> Transaction<STATE, Imperative> {
         let commit_version = version_as_i64(commit_version)?;
 
         if assign_fresh_row_tracking_metadata {
-            self.generate_adds_with_row_tracking(engine, commit_version)
+            self.generate_adds_with_row_tracking(engine, commit_version, modification_time)
         } else {
             let add_actions = build_add_actions(
                 engine,
@@ -518,6 +538,7 @@ impl<STATE> Transaction<STATE, Imperative> {
                     .map(|a| Ok(a.deref())),
                 false, // no row tracking
                 self.data_change,
+                modification_time,
             )?;
             Ok((Box::new(add_actions), None))
         }
@@ -534,6 +555,7 @@ impl<STATE> Transaction<STATE, Imperative> {
         &'a self,
         engine: &dyn Engine,
         commit_version: i64,
+        modification_time: Option<i64>,
     ) -> KernelResult<(
         EngineDataResultIterator<'a>,
         Option<RowTrackingDomainMetadata>,
@@ -573,6 +595,7 @@ impl<STATE> Transaction<STATE, Imperative> {
             extended_add_files,
             true, // row tracking
             self.data_change,
+            modification_time,
         )?;
 
         // Do a dry run to eagerly compute the new high water mark so we can store it. The row
@@ -688,12 +711,14 @@ impl<STATE> Transaction<STATE, Imperative> {
 static DATA_CHANGE_COLUMN: LazyLock<StructField> =
     LazyLock::new(|| StructField::not_null("dataChange", DataType::BOOLEAN));
 
-/// Builds the projection for converting add file metadata into commit-ready Add actions.
+/// Builds the projection for converting add file metadata into commit-ready Add actions. When
+/// `modification_time` is set, it replaces the input `modificationTime`.
 fn build_add_action_projection(
     input_schema: &StructType,
     data_change: bool,
+    modification_time: Option<i64>,
 ) -> KernelResult<(SchemaRef, Expression)> {
-    let (output_schema, patch) = ProjectionStructPatchBuilder::new(input_schema)
+    let mut builder = ProjectionStructPatchBuilder::new(input_schema)
         .insert_after(
             "modificationTime",
             DATA_CHANGE_COLUMN.clone(),
@@ -703,19 +728,27 @@ fn build_add_action_projection(
             "stats",
             StructField::nullable("stats", DataType::STRING),
             Expression::unary(UnaryExpressionOp::TO_JSON, col!("stats")),
-        )
-        .build()?;
+        );
+    if let Some(modification_time) = modification_time {
+        builder = builder.replace(
+            "modificationTime",
+            StructField::not_null("modificationTime", DataType::LONG),
+            lit(modification_time),
+        );
+    }
+    let (output_schema, patch) = builder.build()?;
     let patch = Expression::struct_from([patch]);
     Ok((output_schema, patch))
 }
 
-/// Transforms add file metadata into commit-ready add actions by converting stats to JSON and
-/// setting the `dataChange` field.
+/// Transforms add file metadata into commit-ready add actions by converting stats to JSON, setting
+/// the `dataChange` field, and, when `modification_time` is set, replacing `modificationTime`.
 fn build_add_actions<'a, I, T>(
     engine: &dyn Engine,
     add_files_metadata: I,
     row_tracking: bool,
     data_change: bool,
+    modification_time: Option<i64>,
 ) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>> + use<'a, I, T>>
 where
     I: KernelResultIterator<T> + 'a,
@@ -740,7 +773,8 @@ where
         } else {
             input_schema.clone()
         };
-        let (output_schema, adds_expr) = build_add_action_projection(&input_schema, data_change)?;
+        let (output_schema, adds_expr) =
+            build_add_action_projection(&input_schema, data_change, modification_time)?;
         let adds_evaluator = evaluation_handler.new_expression_evaluator(
             input_schema,
             Arc::new(adds_expr),
@@ -850,13 +884,13 @@ mod tests {
     use crate::actions::{ADD_SCHEMA, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
     use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
     use crate::arrow::array::{
-        ArrayRef, BooleanArray, Int64Array, StringArray, StructArray, new_null_array,
+        ArrayRef, AsArray as _, BooleanArray, Int64Array, StringArray, StructArray, new_null_array,
     };
-    use crate::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Int64Type, Schema as ArrowSchema};
     use crate::arrow::record_batch::RecordBatch;
     use crate::committer::FileSystemCommitter;
     use crate::engine::arrow_conversion::TryIntoArrow;
-    use crate::engine::arrow_data::ArrowEngineData;
+    use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::SyncEngine;
     use crate::engine::{DelegatingEngine, RelaxedCounter};
@@ -867,6 +901,10 @@ mod tests {
     use crate::table_properties::APPEND_ONLY;
     use crate::transaction::create_table::create_table;
     use crate::transaction::operation::UpdateTableOperation;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::unit_test_utils::adaptive_metadata_fixtures::setup_adaptive_metadata_table;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::unit_test_utils::assert_result_error_with_message;
     use crate::unit_test_utils::{copy_test_table, create_valid_add_file_batch, test_schema_flat};
     use crate::{
         EvaluationHandler, ExpressionEvaluator, KernelError, PredicateEvaluator, Result, Snapshot,
@@ -893,7 +931,7 @@ mod tests {
         } else {
             add_files_schema.clone()
         };
-        let (schema, _) = build_add_action_projection(input_schema.as_ref(), true)?;
+        let (schema, _) = build_add_action_projection(input_schema.as_ref(), true, None)?;
         let field_names: Vec<_> = schema.fields().map(|f| f.name().as_str()).collect();
         let mut expected_field_names = vec![
             "path",
@@ -960,6 +998,73 @@ mod tests {
         }
     }
 
+    /// A one-row add-file metadata batch (`modificationTime` 1) with the optional `tags` and
+    /// `clusteringProvider` columns and, when `row_tracking`, the row-tracking columns, all null.
+    fn add_files_batch(
+        tags: bool,
+        provider: bool,
+        row_tracking: bool,
+    ) -> KernelResult<Box<dyn EngineData>> {
+        let schema = add_files_schema_with(tags, provider);
+        let schema = if row_tracking {
+            with_row_tracking_cols(schema)?
+        } else {
+            schema.clone()
+        };
+        let arrow_schema: ArrowSchema = schema.as_ref().try_into_arrow()?;
+        let mut columns = create_valid_add_file_batch(false).columns().to_vec();
+        columns.extend(
+            arrow_schema.fields()[columns.len()..]
+                .iter()
+                .map(|field| new_null_array(field.data_type(), 1)),
+        );
+        let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)?;
+        Ok(Box::new(ArrowEngineData::new(batch)))
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn adaptive_metadata_adds_require_an_in_commit_timestamp() -> Result<()> {
+        let (engine, table_root) = setup_adaptive_metadata_table();
+        let mut transaction = Snapshot::builder_for(table_root)
+            .build(&engine)?
+            .update_table(UpdateTableOperation::Write, "test-engine", true)
+            .build(&engine, Box::new(FileSystemCommitter::new()))?;
+        let adds = create_valid_add_file_batch(false /* all_nullable */);
+        transaction.add_files(Box::new(ArrowEngineData::new(adds)));
+        assert_result_error_with_message(
+            transaction.generate_adds(&engine, 1, None).map(|_| ()),
+            "adaptiveMetadata commit at version 1 has no In-Commit Timestamp",
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::keeps_input(None, 1)]
+    #[case::replaces_input(Some(42), 42)]
+    fn test_add_actions_modification_time(
+        #[values(false, true)] row_tracking: bool,
+        #[case] modification_time: Option<i64>,
+        #[case] expected: i64,
+    ) -> KernelResult<()> {
+        let engine = SyncEngine::new();
+        let batch = add_files_batch(false, false, row_tracking)?;
+        let actions = build_add_actions(
+            &engine,
+            iter::once(Ok(batch)),
+            row_tracking,
+            true, // data_change
+            modification_time,
+        )?;
+        let mut actions = actions.collect::<KernelResult<Vec<_>>>()?;
+        assert_eq!(actions.len(), 1);
+        let batch = actions.remove(0).try_into_record_batch()?;
+        let add = batch.column_by_name("add").unwrap().as_struct();
+        let column = add.column_by_name("modificationTime").unwrap();
+        assert_eq!(column.as_primitive::<Int64Type>().values(), &[expected]);
+        Ok(())
+    }
+
     #[rstest]
     #[case::base(&[(false, false), (false, false)], 1)]
     #[case::tags(&[(true, false), (true, false)], 1)]
@@ -979,25 +1084,15 @@ mod tests {
             .with_evaluation_handler(handler.clone());
         let batches = optional_columns
             .iter()
-            .map(|&(tags, provider)| {
-                let schema = add_files_schema_with(tags, provider);
-                let schema = if row_tracking {
-                    with_row_tracking_cols(schema)?
-                } else {
-                    schema.clone()
-                };
-                let arrow_schema: ArrowSchema = schema.as_ref().try_into_arrow()?;
-                let mut columns = create_valid_add_file_batch(false).columns().to_vec();
-                columns.extend(
-                    arrow_schema.fields()[columns.len()..]
-                        .iter()
-                        .map(|field| new_null_array(field.data_type(), 1)),
-                );
-                let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)?;
-                Ok(Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>)
-            })
+            .map(|&(tags, provider)| add_files_batch(tags, provider, row_tracking))
             .collect::<KernelResult<Vec<_>>>()?;
-        let actions = build_add_actions(&engine, batches.into_iter().map(Ok), row_tracking, true)?;
+        let actions = build_add_actions(
+            &engine,
+            batches.into_iter().map(Ok),
+            row_tracking,
+            true,
+            None,
+        )?;
         assert_eq!(handler.evaluators_created.get(), 0);
         let actions = actions.collect::<KernelResult<Vec<_>>>()?;
         assert_eq!(actions.len(), optional_columns.len());
@@ -1194,7 +1289,7 @@ mod tests {
             false, /* all_nullable */
         ))));
 
-        let (mut adds, _) = transaction.generate_adds(&engine, 0)?;
+        let (mut adds, _) = transaction.generate_adds(&engine, 0, None)?;
         let add = ArrowEngineData::try_from_engine_data(adds.next().expect("Add action")?)?;
         let add = get_column!(add.record_batch(), "add", StructArray);
         assert_eq!(
