@@ -424,6 +424,7 @@ pub(crate) mod adaptive_metadata_fixtures {
     use crate::content_tree::test_utils::write_manifest;
     use crate::engine_data::FilteredEngineData;
     use crate::expressions::Scalar;
+    use crate::last_checkpoint_hint::{AmtCheckpoint, CheckpointType, LastCheckpointHint};
     use crate::path::LogRoot;
     use crate::transaction::UpdateTableOperation;
     use crate::{create_row, version_as_i64};
@@ -525,6 +526,34 @@ pub(crate) mod adaptive_metadata_fixtures {
     /// `content_root_version`.
     pub(crate) fn pointer(version: i64, content_root_version: i64) -> LastManifestCommit {
         LastManifestCommit::new(version, content_root_version).unwrap()
+    }
+
+    /// Writes the `_last_checkpoint` hint at `version`, embedding `checkpoint` as its AMT
+    /// checkpoint.
+    pub(crate) fn write_amt_last_checkpoint_hint(
+        engine: &SyncEngine,
+        table_root: &Url,
+        version: Version,
+        checkpoint: CheckpointAction,
+    ) -> KernelResult<()> {
+        let hint = LastCheckpointHint {
+            version,
+            size: 1,
+            checkpoint_type: Some(CheckpointType::AdaptiveMetadataTree),
+            amt_checkpoint: Some(AmtCheckpoint {
+                manifest_commit_version: version,
+                checkpoint: Some(checkpoint),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let log_root = table_root.join("_delta_log/")?;
+        engine.storage_handler().put(
+            &LastCheckpointHint::path(&log_root)?,
+            hint.to_json_bytes().into(),
+            true,
+        )?;
+        Ok(())
     }
 
     /// Writes `rows` (each a value of `schema`'s single action field) as the checkpoint sidecar

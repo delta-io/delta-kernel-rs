@@ -4,7 +4,8 @@ use std::iter;
 
 use super::action_projector::ActionProjector;
 use super::checkpoint_sidecar::read_sidecar_actions;
-use super::reader::{ReadContext, StatsRead, read_add_actions_from_amt};
+use super::file_metadata::FileMetadataFieldIds;
+use super::reader::{FileMetadataRead, ReadContext, StatsRead, read_add_actions_from_amt};
 use crate::actions::{
     ADD_NAME, CheckpointAction, DOMAIN_METADATA_NAME, LOG_DOMAIN_METADATA_SCHEMA,
     LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA, LOG_TXN_SCHEMA, METADATA_NAME, PROTOCOL_NAME,
@@ -135,6 +136,9 @@ fn read_tree_adds(
         stats: stats_schema
             .map(|schema| StatsRead::try_new(checkpoint, schema.clone()))
             .transpose()?,
+        file_metadata: FileMetadataRead::try_new(FileMetadataFieldIds::try_from_checkpoint(
+            checkpoint,
+        )?)?,
     };
     let projector = ActionProjector::try_new(engine, ADD_NAME, ctx.add_schema(), read_schema)?;
     // The engine's handlers carry any cancellation token bound to this read.
