@@ -418,6 +418,16 @@ jobs:
           claude --version
           codex --version
 
+      - name: Expand reviewer instructions
+        if: steps.creds.outputs.available == 'true'
+        run: |
+          set -euo pipefail
+          # Each REVIEW.md names its shared blocks by placeholder. Replace the checked-out bundle
+          # with an expanded copy so that every later step loads complete instructions.
+          python3 .github/omnigent/prepare_reviewer.py "$RUNNER_TEMP/reviewer"
+          rm -r .github/omnigent/reviewer
+          mv "$RUNNER_TEMP/reviewer" .github/omnigent/reviewer
+
       - name: Disable reviewer host skills
         if: steps.creds.outputs.available == 'true'
         run: |
@@ -497,6 +507,7 @@ jobs:
           from omnigent.tools import ToolManager
           from omnigent.tools.base import ToolContext
           from omnigent.util.reasoning_effort import validate_effort_for_harness
+          from prepare_reviewer import expand_instructions
           from review_context_policy import inject_review_context
 
           if not codex_harness._parse_truthy(
@@ -532,6 +543,11 @@ jobs:
           if any(marker in reviewer_contract for marker in legacy_markers):
               print("::error::REVIEW.md must use invocation-supplied per-run markers.")
               sys.exit(1)
+          for instructions_path in reviewer_root.rglob("REVIEW.md"):
+              instructions = instructions_path.read_text()
+              if expand_instructions(instructions, reviewer_root / "shared") != instructions:
+                  print(f"::error::{instructions_path} has an unexpanded shared block.")
+                  sys.exit(1)
           config_paths = list(reviewer_root.rglob("config.yaml"))
           harnesses = set()
           for path in config_paths:
@@ -878,11 +894,6 @@ jobs:
               attach_inline_comment_sides,
               format_review_history,
           )
-          from review_policy import (
-              KNOWN_ISSUE_POLICY,
-              PREVIOUS_REVIEW_POLICY,
-              PR_DESCRIPTION_POLICY,
-          )
 
           max_diff_bytes = 80_000
           max_prompt_bytes = 120_000
@@ -930,9 +941,9 @@ jobs:
               if truncated
               else ""
           )
-          known_issue_policy = KNOWN_ISSUE_POLICY.strip()
-          previous_review_policy = PREVIOUS_REVIEW_POLICY.strip()
-          pr_description_policy = PR_DESCRIPTION_POLICY.strip()
+          shared_dir = pathlib.Path(".github/omnigent/reviewer/shared")
+          review_rules = shared_dir.joinpath("review_rules.md").read_text().strip()
+          pr_description_rules = shared_dir.joinpath("pr_description.md").read_text().strip()
 
           # The parent prompt uses history during consolidation; reviewer_context
           # carries the same bounded text to each independently prompted child.
@@ -990,11 +1001,9 @@ jobs:
           catches, and do not restate the diff. "No blocking issues" is a fine
           review.
 
-          {known_issue_policy}
+          {review_rules}
 
-          {previous_review_policy}
-
-          {pr_description_policy}
+          {pr_description_rules}
 
           {review_history}
 

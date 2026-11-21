@@ -7,6 +7,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import yaml
+
 
 def _load_policy():
     path = Path(__file__).parents[1] / "review_context_policy.py"
@@ -32,37 +34,52 @@ def _dispatch(input_text: str) -> dict:
     }
 
 
-def test_dispatch_includes_canonical_context_even_when_input_is_placeholder(tmp_path: Path) -> None:
-    policy = _load_policy()
-    context_path = tmp_path / "review-context.txt"
-    context_path.write_text("Head SHA: abc123\n\n```diff\n+actual change\n```\n")
-
-    result = policy.inject_review_context(context_path=str(context_path))(_dispatch("review it"))
-
-    assert result["result"] == "ALLOW"
-    child_input = result["data"]["args"]["input"]
-    assert child_input.startswith("review it\n\n## Canonical PR context")
-    assert "Head SHA: abc123" in child_input
-    assert "+actual change" in child_input
-
-
-def test_dispatch_fails_closed_without_canonical_context(tmp_path: Path) -> None:
-    policy = _load_policy()
-    evaluate = policy.inject_review_context(context_path=str(tmp_path / "missing.txt"))
-
-    assert evaluate(_dispatch("review it"))["result"] == "DENY"
-
-
-def test_non_dispatch_tool_is_unchanged(tmp_path: Path) -> None:
-    policy = _load_policy()
-    evaluate = policy.inject_review_context(context_path=str(tmp_path / "missing.txt"))
-
-    assert evaluate({"type": "tool_call", "target": "sys_read_inbox"}) == {
-        "result": "ALLOW"
-    }
-
-
 class ReviewContextPolicyTest(unittest.TestCase):
+    def test_dispatch_includes_canonical_context_even_when_input_is_placeholder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            context_path = Path(tmp) / "review-context.txt"
+            context_path.write_text("Head SHA: abc123\n\n```diff\n+actual change\n```\n")
+            evaluate = _load_policy().inject_review_context(context_path=str(context_path))
+            result = evaluate(_dispatch("review it"))
+
+        self.assertEqual(result["result"], "ALLOW")
+        child_input = result["data"]["args"]["input"]
+        self.assertTrue(child_input.startswith("review it\n\n## Canonical PR context"))
+        self.assertIn("Head SHA: abc123", child_input)
+        self.assertIn("+actual change", child_input)
+
+    def test_dispatch_preserves_carriage_returns_in_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            context_path = Path(tmp) / "review-context.txt"
+            context_path.write_bytes(b"Head SHA: abc123\n+first\rstill first\n")
+            evaluate = _load_policy().inject_review_context(context_path=str(context_path))
+            result = evaluate(_dispatch("review it"))
+
+        self.assertEqual(result["result"], "ALLOW")
+        self.assertIn("+first\rstill first", result["data"]["args"]["input"])
+
+    def test_dispatch_fails_closed_without_canonical_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            context_path = Path(tmp) / "missing.txt"
+            evaluate = _load_policy().inject_review_context(context_path=str(context_path))
+            self.assertEqual(evaluate(_dispatch("review it"))["result"], "DENY")
+
+    def test_dispatch_denies_invalid_utf8_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            context_path = Path(tmp) / "review-context.txt"
+            context_path.write_bytes(b"Head SHA: abc\n\xff\n")
+            evaluate = _load_policy().inject_review_context(context_path=str(context_path))
+            self.assertEqual(evaluate(_dispatch("review it"))["result"], "DENY")
+
+    def test_non_dispatch_tool_is_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            context_path = Path(tmp) / "missing.txt"
+            evaluate = _load_policy().inject_review_context(context_path=str(context_path))
+            self.assertEqual(
+                evaluate({"type": "tool_call", "target": "sys_read_inbox"}),
+                {"result": "ALLOW"},
+            )
+
     def test_dispatch_drops_model_and_reasoning_effort_overrides(self) -> None:
         event = _dispatch("review it")
         event["data"]["arguments"]["args"].update(
@@ -75,3 +92,11 @@ class ReviewContextPolicyTest(unittest.TestCase):
 
         self.assertEqual(result["result"], "ALLOW")
         self.assertEqual(set(result["data"]["args"]), {"input", "purpose"})
+
+    def test_dispatch_guards_run_before_the_context_hook(self) -> None:
+        config_path = Path(__file__).parents[1] / "reviewer" / "config.yaml"
+        policies = yaml.safe_load(config_path.read_text())["guardrails"]["policies"]
+        self.assertEqual(
+            list(policies),
+            ["spawn_bounds", "headless_subagent_purpose_guard", "inject_review_context"],
+        )
