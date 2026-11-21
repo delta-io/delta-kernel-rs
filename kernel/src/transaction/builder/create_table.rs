@@ -54,6 +54,8 @@ use crate::table_properties::{
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::transaction::file_metadata_field_id::assign_for_create;
 use crate::transaction::{CommitOperation, CreateTable, ExecutionMode, Imperative, Transaction};
 use crate::utils::{current_time_ms, try_parse_uri};
 use crate::{Engine, KernelError, KernelResult, Result, StorageHandler};
@@ -1196,11 +1198,20 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
             .into());
         }
 
+        // Runs after column mapping assigns the schema's IDs, so the new ID is above all of them.
+        // Assigning it in the create commit means the first files already have a mapping.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let (table_configuration, assigned_domain) = assign_for_create(table_configuration)?;
+        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+        let assigned_domain = None;
+        let mut system_domain_metadata = data_layout_result.system_domain_metadata;
+        system_domain_metadata.extend(assigned_domain);
+
         // Create Transaction<CreateTable> with the effective table configuration
         let transaction = try_new_create_table(
             table_configuration,
             committer,
-            data_layout_result.system_domain_metadata,
+            system_domain_metadata,
             data_layout_result.clustering_columns,
             self.common_state,
         )?;

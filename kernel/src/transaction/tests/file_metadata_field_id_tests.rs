@@ -1,18 +1,27 @@
-//! Tests for assigning the `clusteringProvider` file metadata field ID on update transactions.
+//! Tests for assigning the `clusteringProvider` file metadata field ID on table creation and
+//! update transactions.
+
+use std::sync::Arc;
 
 use rstest::rstest;
 use serde_json::Value;
 use url::Url;
 
+use crate::clustering::CLUSTERING_DOMAIN_NAME;
 use crate::committer::FileSystemCommitter;
 use crate::content_tree::file_metadata::{ADAPTIVE_METADATA_DOMAIN_NAME, FileMetadataFieldIds};
 use crate::content_tree::stats::MAX_DATA_FIELD_ID;
+use crate::engine::sync::SyncEngine;
 use crate::row_tracking::ROW_TRACKING_DOMAIN_NAME;
-use crate::schema::{DataType, SchemaRef, StructField};
+use crate::schema::{ArrayType, DataType, SchemaRef, StructField, StructType, schema_ref};
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, TableFeature};
-use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
+use crate::table_properties::{
+    COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, ENABLE_ICEBERG_NATIVE_V4,
+};
+use crate::transaction::create_table::create_table;
+use crate::transaction::data_layout::DataLayout;
 use crate::transaction::file_metadata_field_id::assign_clustering_provider_field_id;
 use crate::transaction::{Transaction, UpdateTableOperation};
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
@@ -382,5 +391,115 @@ fn user_supplied_adaptive_metadata_domain_is_rejected() -> Result<()> {
         .with_domain_metadata(ADAPTIVE_METADATA_DOMAIN_NAME, "{}")
         .build(&engine, Box::new(FileSystemCommitter::new()));
     assert_result_error_with_message(built, "Cannot modify domains that start with 'delta.'");
+    Ok(())
+}
+
+// === Create table ===
+
+fn flat_schema() -> SchemaRef {
+    schema_ref! {
+        nullable "id": LONG,
+        nullable "name": STRING,
+    }
+}
+
+/// Creates a table with column mapping in id mode, clustered on `id` when `clustered` and
+/// adaptiveMetadata when `adaptive_metadata`. Returns the engine and the first commit's snapshot.
+fn create_table_snapshot(
+    schema: SchemaRef,
+    clustered: bool,
+    adaptive_metadata: bool,
+) -> Result<(SyncEngine, SnapshotRef)> {
+    let mut properties = vec![(COLUMN_MAPPING_MODE, "id")];
+    if adaptive_metadata {
+        properties.push((ENABLE_ICEBERG_NATIVE_V4, "true"));
+    }
+    let layout = if clustered {
+        DataLayout::clustered(["id"])
+    } else {
+        DataLayout::None
+    };
+    let engine = SyncEngine::in_memory();
+    let snapshot = create_table("memory:///create-table/", schema, "test", true)
+        .with_table_properties(properties)
+        .with_data_layout(layout)
+        .build(&engine, Box::new(FileSystemCommitter::new()))?
+        .commit(&engine)?
+        .unwrap_post_commit_snapshot();
+    Ok((engine, snapshot))
+}
+
+fn has_clustering_domain(engine: &dyn Engine, snapshot: &Snapshot) -> Result<bool> {
+    Ok(snapshot
+        .reader()
+        .get_domain_metadata_internal(CLUSTERING_DOMAIN_NAME, engine)?
+        .is_some())
+}
+
+#[rstest]
+#[case::clustered_adaptive_metadata(true, true, Some(3))]
+#[case::clustered_without_adaptive_metadata(true, false, None)]
+#[case::adaptive_metadata_without_clustering(false, true, None)]
+#[case::neither_clustered_nor_adaptive_metadata(false, false, None)]
+fn create_assigns_id_in_first_commit_only_for_clustered_adaptive_metadata(
+    #[case] clustered: bool,
+    #[case] adaptive_metadata: bool,
+    #[case] expected_id: Option<i32>,
+) -> Result<()> {
+    let (engine, snapshot) = create_table_snapshot(flat_schema(), clustered, adaptive_metadata)?;
+    assert_eq!(snapshot.version(), 0);
+    assert_eq!(
+        clustering_provider_field_id(&engine, &snapshot)?,
+        expected_id
+    );
+    assert_eq!(
+        max_column_id(&snapshot),
+        Some(expected_id.map_or(2, i64::from))
+    );
+    assert_eq!(has_clustering_domain(&engine, &snapshot)?, clustered);
+    let column_ids: Vec<i64> = snapshot
+        .schema()
+        .fields()
+        .filter_map(StructField::column_mapping_id)
+        .collect();
+    if let Some(id) = expected_id {
+        assert!(!column_ids.contains(&i64::from(id)));
+    }
+    Ok(())
+}
+
+#[rstest]
+#[case::without_checksum(false)]
+#[case::with_checksum(true)]
+fn create_then_reload_then_update_keeps_the_assigned_id(
+    #[case] write_checksum: bool,
+) -> Result<()> {
+    let (engine, created) = create_table_snapshot(flat_schema(), true, true)?;
+    if write_checksum {
+        created.write_checksum(&engine)?;
+    }
+    let table_root = created.table_root().clone();
+    let reloaded = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+    assert_eq!(reloaded.crc_at_version().is_some(), write_checksum);
+    assert_eq!(clustering_provider_field_id(&engine, &reloaded)?, Some(3));
+    assert_eq!(max_column_id(&reloaded), Some(3));
+
+    let updated = commit_update(&engine, &table_root, |builder| builder)?;
+    assert_eq!(clustering_provider_field_id(&engine, &updated)?, Some(3));
+    assert_eq!(max_column_id(&updated), Some(3));
+    Ok(())
+}
+
+#[test]
+fn create_assigns_id_above_nested_column_ids() -> Result<()> {
+    let item = StructType::try_new([StructField::nullable("sku", DataType::LONG)])?;
+    let schema = Arc::new(StructType::try_new([
+        StructField::nullable("id", DataType::LONG),
+        StructField::nullable("items", ArrayType::new(item, true)),
+    ])?);
+    let (engine, snapshot) = create_table_snapshot(schema, true, true)?;
+    // Column mapping gives `id`, `items`, the array element, and `sku` the IDs 1 to 4.
+    assert_eq!(clustering_provider_field_id(&engine, &snapshot)?, Some(5));
+    assert_eq!(max_column_id(&snapshot), Some(5));
     Ok(())
 }
