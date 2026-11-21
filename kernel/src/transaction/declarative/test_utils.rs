@@ -6,7 +6,7 @@ use crate::engine::arrow_data::{EngineDataArrowExt, fix_nested_null_masks};
 use crate::engine::sync::plan::ScopedSyncPlanExecutor;
 use crate::expressions::{Expression, Scalar, StructData, col, lit};
 use crate::plans::{Operation, PlanBuilder, PlanExecutor, RelationRef};
-use crate::schema::{DataType, SchemaRef, StructField, lazy_schema_ref, schema_ref};
+use crate::schema::{DataType, SchemaRef, lazy_schema_ref, schema_ref};
 
 /// Table-specific statistics schema used by the staged-action fixtures.
 pub(super) static STATS_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
@@ -52,12 +52,12 @@ pub(super) fn make_ref(
             let stats_schema = STATS_SCHEMA.clone();
             let leaf = |v| -> KernelResult<Scalar> {
                 Ok(Scalar::Struct(StructData::try_new(
-                    vec![StructField::nullable("physical.id", DataType::LONG)],
+                    schema_ref! { nullable "physical.id": LONG },
                     vec![long(v)],
                 )?))
             };
             let values = Scalar::Struct(StructData::try_new(
-                stats_schema.fields().cloned().collect(),
+                stats_schema.clone(),
                 vec![
                     long(stats.num_records),
                     leaf(stats.null_count)?,

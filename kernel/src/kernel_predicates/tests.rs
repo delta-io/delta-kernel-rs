@@ -7,7 +7,7 @@ use crate::expressions::{
 };
 use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
 use crate::scan::data_skipping::as_data_skipping_predicate;
-use crate::schema::ArrayType;
+use crate::schema::{ArrayType, schema_ref};
 use crate::{DataType, KernelResult};
 
 /// Helper trait to allow expect_eq! to work with both Option<Scalar> and Option<bool>
@@ -136,7 +136,7 @@ fn test_default_partial_cmp_scalars() {
         Binary(vec![1]),
         Scalar::decimal(1, 10, 10).unwrap(),
         Null(DataType::LONG),
-        Struct(StructData::try_new(vec![], vec![]).unwrap()),
+        Struct(StructData::try_new(schema_ref! {}, vec![]).unwrap()),
         Array(ArrayData::try_new(ArrayType::new(DataType::LONG, false), &[] as &[i64]).unwrap()),
     ];
     let larger_values = &[
@@ -154,7 +154,7 @@ fn test_default_partial_cmp_scalars() {
         Binary(vec![10]),
         Scalar::decimal(10, 10, 10).unwrap(),
         Null(DataType::LONG),
-        Struct(StructData::try_new(vec![], vec![]).unwrap()),
+        Struct(StructData::try_new(schema_ref! {}, vec![]).unwrap()),
         Array(ArrayData::try_new(ArrayType::new(DataType::LONG, false), &[] as &[i64]).unwrap()),
     ];
 

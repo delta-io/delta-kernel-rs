@@ -297,7 +297,7 @@ mod tests {
     use super::*;
     use crate::expressions::{ArrayData, MapData, Scalar, StructData};
     use crate::schema::{
-        ArrayType, DataType, IntervalYearToMonthType, MapType, PrimitiveType, StructField,
+        ArrayType, DataType, IntervalYearToMonthType, MapType, PrimitiveType, schema_ref,
     };
 
     // ============================================================================
@@ -849,7 +849,7 @@ mod tests {
     #[test]
     fn test_non_null_struct_returns_error() {
         let data = StructData::try_new(
-            vec![StructField::nullable("x", DataType::INTEGER)],
+            schema_ref! { nullable "x": INTEGER },
             vec![Scalar::Integer(1)],
         )
         .unwrap();
