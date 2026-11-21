@@ -946,8 +946,8 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
             .is_feature_enabled(&TableFeature::AdaptiveMetadataPreview)
     }
 
-    /// Sets the adaptiveMetadata `dataChange` and `lastManifestCommit` fields on `commit_info` when
-    /// the feature is enabled.
+    /// Sets the adaptiveMetadata `lastManifestCommit` field on `commit_info` when the feature is
+    /// enabled.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     fn set_adaptive_metadata_commit_info(
         &self,
@@ -955,7 +955,6 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         commit_info: &mut CommitInfo,
     ) -> KernelResult<()> {
         if self.is_adaptive_metadata_enabled() {
-            commit_info.set_data_change(self.data_change);
             commit_info.set_last_manifest_commit(self.last_manifest_commit(engine)?);
         }
         Ok(())
@@ -1287,6 +1286,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
             kernel_commit_info.set_row_tracking_preserved();
         }
 
+        kernel_commit_info.set_data_change(self.data_change);
         #[cfg(feature = "adaptive-metadata-in-dev")]
         self.set_adaptive_metadata_commit_info(engine, &mut kernel_commit_info)?;
         Ok(NonfileCommitActions {

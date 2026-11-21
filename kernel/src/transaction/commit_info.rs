@@ -56,18 +56,13 @@ fn commit_info_literal_exprs(
             "tags",
             string_map_literal_expr(commit_info.tags, &string_map_type)?,
         ),
+        ("dataChange", Arc::new(lit(commit_info.data_change))),
     ];
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    literal_exprs.extend([
-        (
-            "dataChange",
-            Arc::new(lit(commit_info.data_change)) as ExpressionRef,
-        ),
-        (
-            "lastManifestCommit",
-            Arc::new(lit(commit_info.last_manifest_commit)),
-        ),
-    ]);
+    literal_exprs.push((
+        "lastManifestCommit",
+        Arc::new(lit(commit_info.last_manifest_commit)),
+    ));
     let expected_expr_len = CommitInfo::to_schema().fields().len();
     if literal_exprs.len() != expected_expr_len {
         return Err(KernelError::Generic(format!(
@@ -646,7 +641,6 @@ mod tests {
     }
 
     /// Kernel's `dataChange` is emitted (null when unset) and overrides any engine-supplied value.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
     #[rstest::rstest]
     fn test_build_commit_info_data_change(
         #[values(None, Some(true), Some(false))] txn_data_change: Option<bool>,
