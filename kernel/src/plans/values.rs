@@ -1,70 +1,54 @@
 //! Materializes engine batches as struct rows through existing leaf getters.
 
-use std::sync::LazyLock;
-
 use crate::engine_data::{EngineData, GetData, RowVisitor};
 use crate::expressions::{ArrayData, MapData, Scalar, StructData};
-use crate::schema::{ArrayType, ColumnName, DataType, MapType, SchemaRef, StructField};
+use crate::schema::{
+    ColumnName, ColumnNamesAndTypes, DataType, PrimitiveType, SchemaRef, StructField,
+};
 use crate::{KernelError, KernelResult};
 
 pub(super) fn read_struct(
     batch: &dyn EngineData,
-    schema: &SchemaRef,
+    schema: &'static SchemaRef,
+    columns: &'static ColumnNamesAndTypes,
 ) -> KernelResult<Vec<StructData>> {
-    let mut rows: Vec<Vec<Scalar>> = (0..batch.len())
-        .map(|_| Vec::with_capacity(schema.num_fields()))
-        .collect();
-    for field in schema.fields() {
-        let mut visitor = ColumnVisitor { field, rows };
-        batch.visit_rows(&[ColumnName::new([field.name()])], &mut visitor)?;
-        rows = visitor.rows;
-    }
-    rows.into_iter()
-        .map(|values| StructData::try_new(schema.clone(), values))
-        .collect()
+    let mut visitor = StructVisitor {
+        schema,
+        columns,
+        rows: Vec::new(),
+    };
+    visitor.visit_rows_of(batch)?;
+    Ok(visitor.rows)
 }
 
-struct ColumnVisitor<'a> {
-    field: &'a StructField,
-    rows: Vec<Vec<Scalar>>,
+struct StructVisitor {
+    schema: &'static SchemaRef,
+    columns: &'static ColumnNamesAndTypes,
+    rows: Vec<StructData>,
 }
 
-impl RowVisitor for ColumnVisitor<'_> {
+impl RowVisitor for StructVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        static NAME: LazyLock<[ColumnName; 1]> = LazyLock::new(|| [ColumnName::new(["value"])]);
-        static COLLECTIONS: LazyLock<[DataType; 2]> = LazyLock::new(|| {
-            [
-                ArrayType::new(DataType::STRING, false).into(),
-                MapType::new(DataType::STRING, DataType::STRING, true).into(),
-            ]
-        });
-        let types: &'static [DataType] = match self.field.data_type() {
-            &DataType::BOOLEAN => &[DataType::BOOLEAN],
-            &DataType::BYTE => &[DataType::BYTE],
-            &DataType::SHORT => &[DataType::SHORT],
-            &DataType::INTEGER => &[DataType::INTEGER],
-            &DataType::LONG => &[DataType::LONG],
-            &DataType::FLOAT => &[DataType::FLOAT],
-            &DataType::DOUBLE => &[DataType::DOUBLE],
-            &DataType::STRING => &[DataType::STRING],
-            &DataType::BINARY => &[DataType::BINARY],
-            &DataType::DATE => &[DataType::DATE],
-            DataType::Array(_) => &COLLECTIONS[..1],
-            DataType::Map(_) => &COLLECTIONS[1..],
-            _ => &[],
-        };
-        (NAME.as_slice(), types)
+        self.columns.as_ref()
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
-        let [getter] = getters else {
+        if getters.len() != self.columns.as_ref().0.len() {
             return Err(KernelError::missing_column(
-                "Expected one result column getter",
+                "Expected one getter for each result leaf",
             ));
-        };
-        for (row, values) in (0..row_count).zip(&mut self.rows) {
-            values.push(read_scalar(*getter, row, self.field)?);
         }
+        self.rows = (0..row_count)
+            .map(|row| {
+                let values = self
+                    .schema
+                    .fields()
+                    .zip(getters)
+                    .map(|(field, getter)| read_scalar(*getter, row, field))
+                    .collect::<KernelResult<_>>()?;
+                StructData::try_new(self.schema.clone(), values)
+            })
+            .collect::<KernelResult<_>>()?;
         Ok(())
     }
 }
@@ -89,7 +73,20 @@ pub(super) fn ensure_supported(field: &StructField) -> KernelResult<()> {
                 && map.value_type() == &DataType::STRING
                 && !map.value_contains_null()
         }
-        _ => false,
+        DataType::Struct(_) => false,
+        DataType::Primitive(
+            PrimitiveType::Timestamp
+            | PrimitiveType::TimestampNtz
+            | PrimitiveType::Void
+            | PrimitiveType::Decimal(_)
+            | PrimitiveType::IntervalDayTime(_)
+            | PrimitiveType::IntervalYearMonth(_),
+        ) => false,
+        #[cfg(feature = "geo-type-in-dev")]
+        DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => false,
+        #[cfg(feature = "udt-in-dev")]
+        DataType::UserDefined(_) => false,
+        DataType::Variant(_) | DataType::File(_) => false,
     };
     if supported {
         Ok(())
@@ -156,22 +153,23 @@ fn read_scalar<'a>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, LazyLock};
 
     use test_utils::generate_batch;
 
     use super::*;
     use crate::arrow::array::{ArrayRef, Date32Array};
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::schema::schema_ref;
+    use crate::schema::lazy_schema_ref;
 
     #[test]
     fn dates_preserve_values_and_nulls() -> KernelResult<()> {
         let values = Arc::new(Date32Array::from(vec![Some(-1), Some(0), None])) as ArrayRef;
-        let schema = schema_ref! { nullable "value": DATE };
-        ensure_supported(schema.field("value").unwrap())?;
+        static SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! { nullable "value": DATE };
+        static COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| SCHEMA.leaves(None));
+        ensure_supported(SCHEMA.field("value").unwrap())?;
         let batch = generate_batch([("value", values)])?;
-        let rows = read_struct(&ArrowEngineData::new(batch), &schema)?;
+        let rows = read_struct(&ArrowEngineData::new(batch), &SCHEMA, &COLUMNS)?;
         assert_eq!(
             rows.into_iter()
                 .flat_map(|row| row.into_parts().1)

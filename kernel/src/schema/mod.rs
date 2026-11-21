@@ -205,6 +205,10 @@ pub(crate) trait ToSchema {
 
     /// Returns the schema cached for this concrete type.
     fn schema_ref() -> &'static SchemaRef;
+
+    /// Returns the cached schema leaf names and types in schema order.
+    #[cfg_attr(not(feature = "declarative-plans"), allow(dead_code))]
+    fn leaf_columns() -> &'static ColumnNamesAndTypes;
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq, From)]

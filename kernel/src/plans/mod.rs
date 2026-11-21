@@ -86,11 +86,10 @@
 //! # }
 //! ```
 //!
-//! These conversions use the output schema and visitor selections, materialize every batch, and
-//! propagate late errors. Converting to a struct requires exactly one total row; `Option<T>`
-//! permits zero or one. Counts are checked before Rust decoding. The plan output schema must
-//! exactly match the requested schema, including field nullability and metadata. Callers must
-//! project out unwanted fields.
+//! These conversions decode batches in order and stop at the first error. Converting to a struct
+//! requires exactly one total row; `Option<T>` permits zero or one. Both decode at most two rows.
+//! The plan output schema must exactly match the requested schema, including field nullability
+//! and metadata. Callers must project out unwanted fields.
 //!
 //! # Where to look
 //!
@@ -153,15 +152,15 @@ pub trait PlanExecutorExt: PlanExecutor {
     /// Executes a plan and decodes its requested output, checking schema and row counts.
     ///
     /// A row requires exactly one result; an optional row allows at most one; vectors accept any
-    /// count. All batches are materialized before cardinality checks or Rust decoding. The plan's
-    /// schema must equal the requested schema, including field nullability and metadata.
+    /// count. Batches are decoded in order, stopping at the first error. A row or optional row
+    /// decodes at most two rows; later batches may remain unread. The plan's schema must equal the
+    /// requested schema, including field nullability and metadata.
     ///
     /// Supports numbers, booleans, strings, binary, dates, string lists, and string maps.
     /// List elements and map values must be non-nullable in the schema, even for empty streams.
-    /// String-list source schemas must declare non-null elements, and batches are also checked.
-    /// Required nulls and null string-list elements return errors. Physical null map entries
-    /// are dropped.
-    /// Duplicate-key results are unspecified. Other collections, decimals, and timestamps are
+    /// String-list source schemas must declare non-null elements; batches are also checked.
+    /// Required nulls and null string-list elements return errors. Null map entries are dropped;
+    /// duplicate-key results are unspecified. Other collections, decimals, and timestamps are
     /// unsupported, including for empty streams.
     fn execute_plan_into<T: TryFromStructRows>(&self, plan: Plan) -> KernelResult<T> {
         let schema = <T::Row as ToSchema>::schema_ref();
@@ -174,13 +173,13 @@ pub trait PlanExecutorExt: PlanExecutor {
                 plan.schema
             )));
         }
-        let rows = self
-            .execute_plan(plan)?
-            .into_data()?
-            .map(|batch| values::read_struct(batch?.as_ref(), schema))
-            .flatten_ok()
-            .collect::<KernelResult<_>>()?;
-        T::collect_into(rows)
+        let columns = <T::Row as ToSchema>::leaf_columns();
+        T::collect_into(
+            self.execute_plan(plan)?
+                .into_data()?
+                .map(|batch| values::read_struct(batch?.as_ref(), schema, columns))
+                .flatten_ok(),
+        )
     }
 }
 
