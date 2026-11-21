@@ -23,7 +23,7 @@ Pass it explicitly when you construct the builder. The table shows typical workf
 | Transaction Component | ALTER TABLE | SCHEMA EVOLUTION |
 |--------|------------------------|---------------------------------|
 | Operation | `UpdateTableOperation::AlterTable` | The data operation, such as `UpdateTableOperation::Write` |
-| Schema or property changes | At least one required | Optional, queued alongside the data operation |
+| Schema, property, or description changes | At least one required | Optional, queued alongside the data operation |
 | Data-file changes | None staged | Staged on the built transaction |
 | `data_change` constructor argument | `false` | `true` if records change; `false` otherwise |
 
@@ -131,9 +131,9 @@ let result = snapshot
     .commit(&engine)?;
 ```
 
-Building an `UpdateTableOperation::AlterTable` transaction without a schema operation or property
-update returns an error. The unified builder performs this check at runtime because other
-operations may combine schema evolution with data-file actions.
+Building an `UpdateTableOperation::AlterTable` transaction without a schema operation, property
+update, or description update returns an error. The unified builder performs this check at
+runtime because other operations may combine schema evolution with data-file actions.
 
 ## Setting table properties
 
