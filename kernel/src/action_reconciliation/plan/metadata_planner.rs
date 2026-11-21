@@ -15,6 +15,7 @@ use crate::expressions::{
     ColumnName, Expression as Expr, Predicate, UnaryExpressionOp, col, column_name, expr,
 };
 use crate::log_segment::LogSegment;
+use crate::metrics::ScanPlanReport;
 use crate::scan::{PartitionValuesOptions, StatsOptions, map_to_struct_options};
 use crate::schema::{
     CheckpointFieldKind, DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
@@ -125,7 +126,8 @@ impl<'a> MetadataPlanner<'a> {
     /// Uses the caller's resolved schemas and options; sources supply `version`.
     /// Checkpoint file actions require a resolved shape. Winning domain deletions are retained.
     pub(crate) fn replay(&self) -> KernelResult<PlanBuilder> {
-        let commits = self.commit_actions(self.segment.checkpoint_version)?;
+        let commits =
+            self.commit_actions(self.segment.checkpoint_version, &mut ScanPlanReport::new())?;
         let checkpoint = self.checkpoint_actions()?;
         self.replay_actions(commits, checkpoint)
     }
@@ -192,9 +194,16 @@ impl<'a> MetadataPlanner<'a> {
     pub(crate) fn commit_actions(
         &self,
         base_version: Option<Version>,
+        report: &mut ScanPlanReport,
     ) -> KernelResult<PlanBuilder> {
         self.build_metadata_plan(ActionSource::Commit, None, |schema| {
-            sources::commit_arm(self.segment, base_version, schema, self.use_compactions)
+            sources::commit_arm(
+                self.segment,
+                base_version,
+                schema,
+                self.use_compactions,
+                report,
+            )
         })
     }
 

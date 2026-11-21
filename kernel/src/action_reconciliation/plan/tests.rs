@@ -101,7 +101,7 @@ async fn replay_selects_latest_action_without_retention(
     let snapshot = build_snapshot!(VersionTarget::Latest, &table_root, &engine);
     let checkpoint_info = actions
         .live_adds
-        .then(|| snapshot.checkpoint_info(&engine))
+        .then(|| snapshot.checkpoint_info(&engine, &mut None))
         .transpose()?
         .flatten();
     let state = MetadataPlanner::new(

@@ -49,21 +49,9 @@ pub struct CheckpointMetrics {
     pub metadata_query_calls: u64,
 }
 
-impl CheckpointMetrics {
-    #[allow(dead_code, reason = "Used by scan planning.")]
-    pub(crate) fn update(update: impl FnOnce(&mut Self)) {
-        ScanPlanGenerationCompleted::update(|event| {
-            if let Some(checkpoint) = &mut event.checkpoint {
-                update(checkpoint);
-            }
-        });
-    }
-}
-
-/// Completion of a declarative scan-plan-generation attempt, including partial state on error.
-/// Collected by [`super::ReportGeneratorLayer`] through a Registry-backed tracing subscriber.
+/// Metrics collected during declarative scan-plan generation, including partial state on error.
 #[derive(Debug, Clone)]
-pub struct ScanPlanGenerationCompleted {
+pub struct ScanPlanReport {
     /// Identity of this planning attempt.
     pub operation_id: MetricId,
     /// Caller-supplied correlation identity.
@@ -90,9 +78,10 @@ pub struct ScanPlanGenerationCompleted {
     pub compaction_file_count: u64,
 }
 
-impl ScanPlanGenerationCompleted {
+impl ScanPlanReport {
     pub(crate) const SPAN_NAME: &str = "scan.declarative_metadata_scan_plan";
 
+    #[allow(dead_code, reason = "Used by scan planning.")]
     pub(crate) fn new() -> Self {
         Self {
             operation_id: MetricId::new(),
@@ -109,17 +98,13 @@ impl ScanPlanGenerationCompleted {
             compaction_file_count: 0,
         }
     }
-
-    pub(crate) fn update(update: impl FnOnce(&mut Self)) {
-        super::reporter::update_scan_plan(update);
-    }
 }
 
-impl fmt::Display for ScanPlanGenerationCompleted {
+impl fmt::Display for ScanPlanReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "ScanPlanGenerationCompleted(operation_id={}, outcome={:?}, duration_ns={}, \
+            "ScanPlanReport(operation_id={}, outcome={:?}, duration_ns={}, \
              replay_base={:?}, commit_start_version={:?}, commit_end_version={:?}, \
              commit_total_size_bytes={}, compaction_file_count={}",
             self.operation_id,

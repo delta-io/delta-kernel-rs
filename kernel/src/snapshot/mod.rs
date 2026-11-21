@@ -370,12 +370,12 @@ impl Snapshot {
     pub(crate) fn checkpoint_info(
         &self,
         engine: &dyn Engine,
+        checkpoint: &mut Option<crate::metrics::CheckpointMetrics>,
     ) -> KernelResult<Option<Arc<CheckpointInfo>>> {
-        let cache_hit = |resolved: &Option<Arc<CheckpointInfo>>| {
-            crate::metrics::CheckpointMetrics::update(|m| {
-                m.cache_hit = Some(true);
-                m.info = resolved.clone();
-            });
+        let mut cache_hit = |resolved: &Option<Arc<CheckpointInfo>>| {
+            if let Some(checkpoint) = checkpoint {
+                checkpoint.cache_hit = Some(true);
+            }
             Ok(resolved.clone())
         };
         if let Some(resolved) = self.checkpoint_info.get() {
@@ -391,15 +391,17 @@ impl Snapshot {
         if let Some(resolved) = self.checkpoint_info.get() {
             return cache_hit(resolved);
         }
-        crate::metrics::CheckpointMetrics::update(|m| m.cache_hit = Some(false));
+        if let Some(checkpoint) = checkpoint {
+            checkpoint.cache_hit = Some(false);
+        }
         let resolved = if self.log_segment.listed.checkpoint_parts.is_empty() {
             None
         } else {
             let executor = engine.require_plan_executor()?;
-            CheckpointInfo::resolve(executor.as_ref(), self.log_segment())?.map(Arc::new)
+            CheckpointInfo::resolve(executor.as_ref(), self.log_segment(), checkpoint)?
+                .map(Arc::new)
         };
         // All initializers hold the mutex; publish only after every fallible operation succeeds.
-        crate::metrics::CheckpointMetrics::update(|m| m.info = resolved.clone());
         let _ = self.checkpoint_info.set(resolved.clone());
         Ok(resolved)
     }
