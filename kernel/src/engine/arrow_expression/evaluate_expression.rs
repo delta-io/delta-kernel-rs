@@ -8,6 +8,7 @@ use itertools::Itertools;
 use tracing::warn;
 
 use super::timestamp_timezone::TimestampTimezone;
+use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
     self as arrow_array, Array, ArrayBuilder, ArrayData, ArrayRef, AsArray, BooleanArray, Datum,
@@ -45,6 +46,7 @@ use crate::expressions::{
     UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
+use crate::utils::require;
 
 #[internal_api]
 pub(crate) trait ProvidesColumnByName {
@@ -336,6 +338,21 @@ pub fn evaluate_expression(
             }
             Some(data_type) => Err(KernelError::generic(format!(
                 "{op} operator requires STRING output, but got {data_type:?}"
+            ))),
+        },
+        (
+            Unary(UnaryExpression {
+                op: DeletionVectorPath,
+                expr,
+            }),
+            result_type,
+        ) => match result_type {
+            None | Some(&DataType::STRING) => {
+                let input = evaluate_expression(expr, batch, None)?;
+                deletion_vector_path(&input)
+            }
+            Some(data_type) => Err(KernelError::generic(format!(
+                "DeletionVectorPath operator requires STRING output, but got {data_type:?}"
             ))),
         },
         (Binary(BinaryExpression { op, left, right }), _) => {
@@ -988,6 +1005,44 @@ fn to_json_with_timestamp_formats(
             array_ref.data_type()
         ))),
     }
+}
+
+/// Evaluates [`UnaryExpressionOp::DeletionVectorPath`] over an array of DV descriptor structs.
+fn deletion_vector_path(input: &dyn Array) -> KernelResult<ArrayRef> {
+    let dvs = input.as_struct_opt().ok_or_else(|| {
+        KernelError::generic(format!(
+            "DELETION_VECTOR_PATH requires a struct input, got {:?}",
+            input.data_type()
+        ))
+    })?;
+    let string_field = |name: &str| {
+        dvs.column_by_name(name)
+            .and_then(|column| column.as_string_opt::<i32>())
+            .ok_or_else(|| {
+                KernelError::generic(format!(
+                    "DELETION_VECTOR_PATH input requires a string field `{name}`"
+                ))
+            })
+    };
+    let storage_types = string_field("storageType")?;
+    let paths = string_field("pathOrInlineDv")?;
+    let result: StringArray = (0..dvs.len())
+        .map(|row| {
+            if dvs.is_null(row) {
+                return Ok(None);
+            }
+            // A missing field in a present descriptor must fail rather than yield NULL: callers
+            // use the path to protect the DV file from deletion.
+            require!(
+                storage_types.is_valid(row) && paths.is_valid(row),
+                KernelError::generic(
+                    "DELETION_VECTOR_PATH input has a NULL storageType or pathOrInlineDv"
+                )
+            );
+            DeletionVectorDescriptor::file_path(storage_types.value(row), paths.value(row))
+        })
+        .collect::<KernelResult<_>>()?;
+    Ok(Arc::new(result))
 }
 
 /// Coalesce multiple arrays into one by selecting the first non-null value from each row.
@@ -4735,5 +4790,58 @@ mod tests {
             result.to_data(),
             Int32Array::from(vec![else_value; num_rows]).to_data()
         );
+    }
+    /// Evaluates `DeletionVectorPath` over DV structs built from `(storageType, pathOrInlineDv)`
+    /// rows, where `None` is a NULL descriptor.
+    fn deletion_vector_paths(rows: Vec<Option<(Option<&str>, &str)>>) -> KernelResult<ArrayRef> {
+        let storage_types: StringArray = rows
+            .iter()
+            .map(|row| row.and_then(|(storage_type, _)| storage_type))
+            .collect();
+        let paths: StringArray = rows.iter().map(|row| row.map(|(_, path)| path)).collect();
+        let nulls = NullBuffer::from(rows.iter().map(Option::is_some).collect::<Vec<_>>());
+        let dvs = StructArray::try_new(
+            Fields::from(vec![
+                ArrowField::new("storageType", ArrowDataType::Utf8, true),
+                ArrowField::new("pathOrInlineDv", ArrowDataType::Utf8, true),
+            ]),
+            vec![Arc::new(storage_types), Arc::new(paths)],
+            Some(nulls),
+        )?;
+        let schema = ArrowSchema::new(vec![ArrowField::new("dv", dvs.data_type().clone(), true)]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(dvs)])?;
+        let expr = Expr::unary(UnaryExpressionOp::DeletionVectorPath, col!("dv"));
+        evaluate_expression(&expr, &batch, Some(&DataType::STRING))
+    }
+
+    #[test]
+    fn test_deletion_vector_path_resolves_files_and_nulls_inline_and_absent_dvs() {
+        let result = deletion_vector_paths(vec![
+            Some((Some("u"), "ab^-aqEH.-t@S}K{vb[*k^")),
+            Some((Some("p"), "s3://mytable/dv.bin")),
+            Some((
+                Some("i"),
+                "wi5b=000010000siXQKl0rr91000f55c8Xg0@@D72lkbi5=-{L",
+            )),
+            None,
+        ])
+        .unwrap();
+        let expected = StringArray::from(vec![
+            Some("ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"),
+            Some("s3://mytable/dv.bin"),
+            None,
+            None,
+        ]);
+        assert_eq!(result.as_string::<i32>(), &expected);
+    }
+
+    #[rstest]
+    #[case::null_storage_type(Some((None, "s3://mytable/dv.bin")), "NULL storageType")]
+    #[case::malformed_uuid(Some((Some("u"), "too-short")), "Invalid length")]
+    fn test_deletion_vector_path_rejects_invalid_descriptor(
+        #[case] row: Option<(Option<&str>, &str)>,
+        #[case] message: &str,
+    ) {
+        assert_result_error_with_message(deletion_vector_paths(vec![row]), message);
     }
 }

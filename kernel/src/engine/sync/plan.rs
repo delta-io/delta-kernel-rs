@@ -36,8 +36,8 @@ use crate::engine::arrow_utils::{
 use crate::expressions::{ArrayData, ColumnName, PredicateRef, Scalar};
 use crate::object_store::DynObjectStore;
 use crate::plans::ir::nodes::{
-    DynamicScan, FILE_META_SCHEMA, FileType, Operator, Project, RelationId, RelationRef, ScanFile,
-    ScanJson, ScanParquet, SemiJoin, Values, WriteJson,
+    DynamicScan, FILE_META_SCHEMA, FileType, ListFiles, Operator, Project, RelationId, RelationRef,
+    ScanFile, ScanJson, ScanParquet, SemiJoin, Values, WriteJson,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult, ScopedPlanExecutor};
@@ -255,6 +255,7 @@ impl SyncPlanExecutor {
             Operator::RelationSource(relation_ref) => {
                 self.eval_relation_source(&relation_ref, relation_store)
             }
+            Operator::ListFiles(list_files) => self.eval_list_files(list_files),
             Operator::UnionAll(_) => Ok(Vec::from_iter(
                 inputs.iter().flat_map(|&i| results[i].iter().cloned()),
             )),
@@ -319,6 +320,37 @@ impl SyncPlanExecutor {
                 meta.last_modified.into(),
             ]],
         ))?])
+    }
+
+    fn eval_list_files(&self, list_files: ListFiles) -> KernelResult<Vec<RecordBatch>> {
+        let metas: Vec<FileMeta> = self
+            .storage
+            .list_from(&list_files.base_url, None)?
+            .collect::<KernelResult<_>>()?;
+        let rows = metas
+            .into_iter()
+            .map(|meta| {
+                let relative_path = list_files
+                    .base_url
+                    .make_relative(&meta.location)
+                    .ok_or_else(|| {
+                        KernelError::generic(format!(
+                            "Listed file {} is outside base URL {}",
+                            meta.location, list_files.base_url
+                        ))
+                    })?;
+                let size = i64::try_from(meta.size)
+                    .map_err(|_| KernelError::generic("Listed file size exceeds LONG range"))?;
+                Ok(vec![
+                    meta.location.to_string().into(),
+                    relative_path.into(),
+                    size.into(),
+                    meta.last_modified.into(),
+                ])
+            })
+            .collect::<KernelResult<Vec<_>>>()?;
+        let batch = values_to_record_batch(Values::new(list_files.schema, rows))?;
+        Ok(vec![batch])
     }
 
     /// Reads `files` as `file_type`, broadcasting each file's [`ScanFile::file_constants`] into the

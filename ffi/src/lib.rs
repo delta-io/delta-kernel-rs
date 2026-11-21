@@ -21,7 +21,11 @@ use delta_kernel::history_manager::{
 };
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::object_store::ObjectStore;
+#[cfg(feature = "declarative-plans")]
+use delta_kernel::plans::Operation;
 use delta_kernel::schema::Schema;
+#[cfg(feature = "declarative-plans")]
+use delta_kernel::snapshot::DataCleanupOptions;
 use delta_kernel::snapshot::{CheckpointWriteResult, LogSegmentStats, Snapshot, SnapshotRef};
 use delta_kernel::{Engine, EngineData, FileStats, KernelResult, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
@@ -1398,6 +1402,39 @@ pub unsafe extern "C" fn snapshot_timestamp(
     let result = snapshot
         .reader()
         .get_timestamp(engine_ref.engine().as_ref());
+    unsafe { result.into_extern_result(&engine_ref) }
+}
+
+/// Builds the declarative data-cleanup plan for `snapshot` and returns its serialized operation.
+///
+/// The engine must execute the returned query plan before deleting any files. The kernel never
+/// deletes files itself. `now_ms` sets the time used to compute the retention cutoff; a present
+/// `deleted_file_retention_ms` overrides the table property.
+///
+/// The caller owns the returned bytes and must release them with [`free_kernel_bytes`]. Both input
+/// handles are borrowed.
+///
+/// # Safety
+///
+/// Caller must pass valid snapshot and engine handles and retain ownership of both for this call.
+#[cfg(feature = "declarative-plans")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapshot_eligible_data_files_to_be_deleted(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+    now_ms: i64,
+    deleted_file_retention_ms: OptionalValue<u64>,
+) -> ExternResult<KernelOwnedBytes> {
+    let engine_ref = unsafe { engine.as_ref() };
+    let snapshot: SnapshotRef = unsafe { snapshot.clone_as_arc() };
+    let options = match deleted_file_retention_ms {
+        OptionalValue::Some(milliseconds) => DataCleanupOptions::new(now_ms)
+            .with_deleted_file_retention(std::time::Duration::from_millis(milliseconds)),
+        OptionalValue::None => DataCleanupOptions::new(now_ms),
+    };
+    let result = snapshot
+        .eligible_data_files_to_be_deleted(engine_ref.engine().as_ref(), &options)
+        .map(|plan| Operation::QueryPlan(plan).to_proto_bytes().into());
     unsafe { result.into_extern_result(&engine_ref) }
 }
 

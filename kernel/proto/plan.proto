@@ -57,6 +57,12 @@ message RelationSourceNode {
   delta.kernel.schema.StructType schema = 2;
 }
 
+// Recursively lists files below a hierarchical directory URL ending in `/`.
+message ListFilesNode {
+  string base_url = 1;
+  delta.kernel.schema.StructType schema = 2;
+}
+
 // ============================================================================
 // Transform payloads (1+ inputs)
 // ============================================================================
@@ -176,6 +182,7 @@ message Operator {
     AggregateNode aggregate = 8;
     SemiJoinNode semi_join = 9;
     PrefixSumNode prefix_sum = 12;
+    ListFilesNode list_files = 13;
     // Sinks (write nodes)
     WriteJsonNode write_json = 11;
   }

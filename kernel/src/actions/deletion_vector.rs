@@ -15,6 +15,8 @@ use url::Url;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::amt_path_util::{resolve_table_relative, validate_table_relative};
 use crate::path_encoding::uri_decode_path;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::path_encoding::uri_encode_path;
 use crate::schema::DataType;
 use crate::snapshot::Snapshot;
 use crate::utils::require;
@@ -495,6 +497,33 @@ impl DeletionVectorDescriptor {
         let prefix = std::str::from_utf8(&bytes[..prefix_len])
             .map_err(|_| KernelError::deletion_vector("DV path prefix is not valid UTF-8"))?;
         Ok(DeletionVectorPath::relative_path(prefix, &uuid))
+    }
+
+    /// Returns the path of the file storing a deletion vector, in the same form as an Add action's
+    /// `path`, or `None` for an inline DV. Takes the descriptor's raw `storageType` and
+    /// `pathOrInlineDv` fields so evaluators of [`UnaryExpressionOp::DeletionVectorPath`] need not
+    /// build a full descriptor per row. Errors on an unknown storage type or a malformed
+    /// `pathOrInlineDv`.
+    ///
+    /// [`UnaryExpressionOp::DeletionVectorPath`]: crate::expressions::UnaryExpressionOp::DeletionVectorPath
+    #[cfg(all(feature = "arrow-expression", feature = "default-engine-base"))]
+    pub(crate) fn file_path(
+        storage_type: &str,
+        path_or_inline_dv: &str,
+    ) -> KernelResult<Option<String>> {
+        match storage_type.parse()? {
+            DeletionVectorStorageType::PersistedRelative => {
+                Self::decode_uuid_relative_path(path_or_inline_dv).map(Some)
+            }
+            DeletionVectorStorageType::PersistedAbsolute => Ok(Some(path_or_inline_dv.to_string())),
+            // `'r'` stores the raw path, while Add paths are percent-encoded.
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            DeletionVectorStorageType::PersistedUnencodedRelative => {
+                validate_table_relative(path_or_inline_dv)?;
+                Ok(Some(uri_encode_path(path_or_inline_dv).into_owned()))
+            }
+            DeletionVectorStorageType::Inline => Ok(None),
+        }
     }
 
     pub fn absolute_path(&self, parent: &Url) -> KernelResult<Option<Url>> {
@@ -1176,6 +1205,36 @@ mod tests {
             err.contains(expected_error),
             "error {err:?} did not contain {expected_error:?}"
         );
+    }
+
+    #[rstest::rstest]
+    #[case(
+        "u",
+        "ab^-aqEH.-t@S}K{vb[*k^",
+        Some("ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin")
+    )]
+    #[case("p", "s3://mytable/dv.bin", Some("s3://mytable/dv.bin"))]
+    #[case("i", "wi5b=000010000siXQKl0rr91000f55c8Xg0@@D72lkbi5=-{L", None)]
+    #[cfg_attr(
+        feature = "adaptive-metadata-in-dev",
+        case("r", "data/a b.bin", Some("data/a%20b.bin"))
+    )]
+    #[cfg(all(feature = "arrow-expression", feature = "default-engine-base"))]
+    fn test_file_path(
+        #[case] storage_type: &str,
+        #[case] path_or_inline_dv: &str,
+        #[case] expected: Option<&str>,
+    ) {
+        let path = DeletionVectorDescriptor::file_path(storage_type, path_or_inline_dv).unwrap();
+        assert_eq!(path.as_deref(), expected);
+    }
+
+    #[rstest::rstest]
+    #[case("u", "too-short")]
+    #[case("x", "s3://mytable/dv.bin")]
+    #[cfg(all(feature = "arrow-expression", feature = "default-engine-base"))]
+    fn test_file_path_rejects_invalid(#[case] storage_type: &str, #[case] path: &str) {
+        assert!(DeletionVectorDescriptor::file_path(storage_type, path).is_err());
     }
 
     #[test]

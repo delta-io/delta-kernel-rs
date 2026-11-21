@@ -28,6 +28,8 @@ use crate::checkpoint::CheckpointInfo;
 use crate::expressions::{ColumnName, Predicate, lit};
 #[cfg(test)]
 use crate::expressions::{Expression as Expr, expr};
+use crate::plans::PlanBuilder;
+#[cfg(test)]
 use crate::plans::ir::plan::Plan;
 #[cfg(test)]
 use crate::schema::{
@@ -81,20 +83,21 @@ impl<'a> MetadataPlanner<'a> {
 }
 
 impl Scan {
-    /// Build the live-add metadata plan from checkpoint and commit actions.
+    /// Build the live-add metadata relation from checkpoint and commit actions, unbuilt so callers
+    /// can compose it into a larger plan.
     ///
-    /// Returns `None` for an empty result.
+    /// Returns `None` when the scan predicate skips every file.
     #[tracing::instrument(
         name = "scan_plan.build_metadata_scan_plan",
         skip_all,
         fields(enable_call_frame),
         err
     )]
-    pub(super) fn build_metadata_scan_plan_with(
+    pub(super) fn metadata_scan_plan_builder_with(
         &self,
         base: MetadataReplayBase,
         mut planner: MetadataPlanner<'_>,
-    ) -> KernelResult<Option<Plan>> {
+    ) -> KernelResult<Option<PlanBuilder>> {
         let state = &self.state_info;
         if state.physical_predicate == PhysicalPredicate::StaticSkipAll {
             return Ok(None);
@@ -112,8 +115,8 @@ impl Scan {
         let commits = planner.commit_actions(base_version)?;
         planner
             .replay_actions(commits, checkpoint)?
-            .project_patch(|patch| patch.drop(VERSION))?
-            .build_opt()
+            .project_patch(|patch| patch.drop(VERSION))
+            .map(Some)
     }
 
     #[cfg(test)]
@@ -126,7 +129,10 @@ impl Scan {
             version: self.snapshot.log_segment().checkpoint_version,
             info: shape.into().cloned().map(Arc::new),
         };
-        self.build_metadata_scan_plan_with(base, planner.clone())
+        match self.metadata_scan_plan_builder_with(base, planner.clone())? {
+            Some(plan) => plan.build_opt(),
+            None => Ok(None),
+        }
     }
 }
 // === Helpers ===

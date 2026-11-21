@@ -43,9 +43,9 @@ use delta_kernel_derive::internal_api;
 use url::Url;
 
 use super::ir::nodes::{
-    Aggregate, AggregateBuilder, DynamicScan, FILE_META_SCHEMA, FileType, Filter, Operator,
-    PrefixSum, Project, RelationRef, ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values,
-    WriteJson,
+    Aggregate, AggregateBuilder, DynamicScan, FILE_META_SCHEMA, FileType, Filter,
+    LIST_FILES_SCHEMA, ListFiles, Operator, PrefixSum, Project, RelationRef, ScanFile, ScanJson,
+    ScanParquet, SemiJoin, UnionAll, Values, WriteJson,
 };
 use super::ir::plan::{Plan, PlanNode};
 use crate::expressions::{ColumnName, Expression, ExpressionRef, PredicateRef, Scalar, StructData};
@@ -133,6 +133,28 @@ impl PlanBuilder {
         schema: impl Into<SchemaRef>,
     ) -> KernelResult<Self> {
         Self::scan_source(FileType::Json, files, file_constant_columns, schema)
+    }
+
+    /// A recursive file listing source below `base_url`.
+    ///
+    /// The engine lists the directory when it executes the plan and emits rows matching
+    /// [`LIST_FILES_SCHEMA`]. The URL must be hierarchical and end in `/` so every descendant is
+    /// included. As with [`Self::relation_source`], this source is always present because kernel
+    /// cannot know whether the directory is empty until execution.
+    pub fn list_files(base_url: Url) -> KernelResult<Self> {
+        if !base_url.path().ends_with('/') {
+            return Err(KernelError::generic(
+                "ListFiles requires a directory URL ending in `/`",
+            ));
+        }
+        Ok(Self::present(
+            LIST_FILES_SCHEMA.clone(),
+            ListFiles {
+                base_url,
+                schema: LIST_FILES_SCHEMA.clone(),
+            },
+            vec![],
+        ))
     }
 
     /// Shared body of [`Self::scan_parquet`] / [`Self::scan_json`]. Normalizes and validates the
@@ -859,6 +881,28 @@ mod tests {
         let src = scan(id_schema());
         assert_eq!(src.schema(), &id_schema());
         assert_plan(src, &[(&[], "scan_parquet")]);
+    }
+
+    #[test]
+    fn list_files_builds_single_source_node() {
+        let base_url = Url::parse("memory:///table/").unwrap();
+        let source = PlanBuilder::list_files(base_url.clone()).unwrap();
+        assert_eq!(source.schema(), &*LIST_FILES_SCHEMA);
+        let plan = assert_plan(source, &[(&[], "list_files")]);
+        let Operator::ListFiles(list_files) = &plan.nodes[0].op else {
+            panic!("expected ListFiles");
+        };
+        assert_eq!(list_files.base_url, base_url);
+        assert_eq!(list_files.schema, *LIST_FILES_SCHEMA);
+    }
+
+    #[test]
+    fn list_files_requires_a_directory_url() {
+        let base_url = Url::parse("memory:///table").unwrap();
+        assert_result_error_with_message(
+            PlanBuilder::list_files(base_url),
+            "ListFiles requires a directory URL ending in `/`",
+        );
     }
 
     /// `relation_source` records the handle's id and schema and builds to a single source node.
