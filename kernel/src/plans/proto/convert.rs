@@ -575,6 +575,7 @@ impl From<UnaryPredicateOp> for proto_expr::UnaryPredicateOp {
     fn from(op: UnaryPredicateOp) -> Self {
         match op {
             UnaryPredicateOp::IsNull => proto_expr::UnaryPredicateOp::IsNull,
+            UnaryPredicateOp::HasUriScheme => proto_expr::UnaryPredicateOp::HasUriScheme,
         }
     }
 }
@@ -2054,6 +2055,10 @@ mod tests {
 
     #[rstest]
     #[case(UnaryPredicateOp::IsNull, proto_expr::UnaryPredicateOp::IsNull)]
+    #[case(
+        UnaryPredicateOp::HasUriScheme,
+        proto_expr::UnaryPredicateOp::HasUriScheme
+    )]
     fn from_unary_predicate_op(
         #[case] op: UnaryPredicateOp,
         #[case] expected: proto_expr::UnaryPredicateOp,

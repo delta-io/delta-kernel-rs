@@ -12,7 +12,7 @@ use crate::arrow::array::types::*;
 use crate::arrow::array::{
     self as arrow_array, Array, ArrayBuilder, ArrayData, ArrayRef, AsArray, BooleanArray, Datum,
     ListArray, MapArray, MutableArrayData, NullBufferBuilder, RecordBatch, StringArray,
-    StructArray, make_array, new_null_array,
+    StringArrayType, StructArray, make_array, new_null_array,
 };
 use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
 use crate::arrow::compute::kernels::cast_utils::{Parser, string_to_datetime};
@@ -45,6 +45,7 @@ use crate::expressions::{
     UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
+use crate::uri_reference::scheme_len;
 
 #[internal_api]
 pub(crate) trait ProvidesColumnByName {
@@ -750,11 +751,13 @@ pub fn evaluate_predicate(
         Not(pred) => evaluate_predicate(pred, batch, !inverted),
         Unary(UnaryPredicate { op, expr }) => {
             let arr = evaluate_expression(expr.as_ref(), batch, None)?;
-            let eval_op_fn = match (op, inverted) {
-                (UnaryPredicateOp::IsNull, false) => is_null,
-                (UnaryPredicateOp::IsNull, true) => is_not_null,
-            };
-            Ok(eval_op_fn(&arr)?)
+            match (op, inverted) {
+                (UnaryPredicateOp::IsNull, false) => Ok(is_null(&arr)?),
+                (UnaryPredicateOp::IsNull, true) => Ok(is_not_null(&arr)?),
+                (UnaryPredicateOp::HasUriScheme, _) => {
+                    Ok(maybe_inverted(Cow::Owned(has_uri_scheme(&arr)?))?)
+                }
+            }
         }
         Binary(BinaryPredicate { op, left, right }) => {
             let (left, right) = (left.as_ref(), right.as_ref());
@@ -883,6 +886,24 @@ pub fn evaluate_predicate(
         }
         Unknown(name) => Err(KernelError::unsupported(format!(
             "Unknown predicate: {name:?}"
+        ))),
+    }
+}
+
+/// Evaluates [`UnaryPredicateOp::HasUriScheme`] over any string representation.
+fn has_uri_scheme(input: &ArrayRef) -> KernelResult<BooleanArray> {
+    fn eval<'a>(references: impl StringArrayType<'a>) -> BooleanArray {
+        references
+            .iter()
+            .map(|r| r.map(|r| scheme_len(r).is_some()))
+            .collect()
+    }
+    match input.data_type() {
+        ArrowDataType::Utf8 => Ok(eval(input.as_string::<i32>())),
+        ArrowDataType::LargeUtf8 => Ok(eval(input.as_string::<i64>())),
+        ArrowDataType::Utf8View => Ok(eval(input.as_string_view())),
+        other => Err(KernelError::invalid_expression(format!(
+            "HasUriScheme requires a string input, got {other}"
         ))),
     }
 }
@@ -1257,7 +1278,8 @@ mod tests {
     use crate::arrow::array::{
         ArrayData as ArrowArrayData, ArrayRef, BinaryArray, BooleanArray, Date32Array,
         Float32Array, Float64Array, Int32Array, Int64Array, LargeStringArray, ListArray,
-        MapBuilder, StringArray, StringBuilder, StructArray, TimestampMicrosecondArray,
+        MapBuilder, StringArray, StringBuilder, StringViewArray, StructArray,
+        TimestampMicrosecondArray,
     };
     use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{
@@ -2330,6 +2352,56 @@ mod tests {
         let result = evaluate_predicate(&pred, &batch, inverted).unwrap();
         assert_eq!(result.null_count(), 0);
         assert_eq!(result.values().iter().collect::<Vec<_>>(), expected);
+    }
+
+    /// Each reference paired with whether it has a URI scheme.
+    const HAS_URI_SCHEME_CASES: &[(Option<&str>, Option<bool>)] = &[
+        (Some("s3://bucket/a.parquet"), Some(true)),
+        (
+            Some("abfss://c@a.dfs.core.windows.net/t/a b.parquet"),
+            Some(true),
+        ),
+        (Some("C:/data"), Some(true)),
+        (Some("x+y.z-1:rest"), Some(true)),
+        (Some("data/a.parquet"), Some(false)),
+        (Some("data/a:b.parquet"), Some(false)),
+        (Some("1abc:/a"), Some(false)),
+        (Some(":a"), Some(false)),
+        (Some(""), Some(false)),
+        (None, None),
+    ];
+
+    #[rstest]
+    fn test_has_uri_scheme(
+        #[values(
+            |r| Arc::new(StringArray::from(r)) as ArrayRef,
+            |r| Arc::new(LargeStringArray::from(r)) as ArrayRef,
+            |r| Arc::new(StringViewArray::from(r)) as ArrayRef
+        )]
+        make_array: fn(Vec<Option<&'static str>>) -> ArrayRef,
+        #[values(false, true)] inverted: bool,
+    ) {
+        let references = HAS_URI_SCHEME_CASES.iter().map(|(r, _)| *r).collect();
+        let batch = RecordBatch::try_from_iter([("r", make_array(references))]).unwrap();
+        let result =
+            evaluate_predicate(&Pred::has_uri_scheme(col!("r")), &batch, inverted).unwrap();
+        let expected: BooleanArray = HAS_URI_SCHEME_CASES
+            .iter()
+            .map(|(_, has_scheme)| has_scheme.map(|h| h != inverted))
+            .collect();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_has_uri_scheme_rejects_non_string_input() {
+        let batch =
+            RecordBatch::try_from_iter([("n", Arc::new(Int32Array::from(vec![1])) as ArrayRef)])
+                .unwrap();
+        let err = evaluate_predicate(&Pred::has_uri_scheme(col!("n")), &batch, false).unwrap_err();
+        assert!(
+            matches!(err, KernelError::InvalidExpressionEvaluation(_)),
+            "{err}"
+        );
     }
 
     #[rstest]
