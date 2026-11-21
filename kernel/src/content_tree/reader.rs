@@ -3222,9 +3222,10 @@ mod tests {
                 .map_or(Scalar::Null(DataType::LONG), Scalar::Long),
             other => panic!("unexpected leaf stat '{other}'"),
         });
-        let leaf = StructData::try_new(leaf.fields().cloned().collect(), values.collect()).unwrap();
-        let fields = vec![leaf_field.clone()];
-        Scalar::Struct(StructData::try_new(fields, vec![Scalar::Struct(leaf)]).unwrap())
+        let leaf =
+            StructData::try_new(schema_ref! { ..(leaf.fields()) }, values.collect()).unwrap();
+        let schema = schema_ref! { (leaf_field.clone()) };
+        Scalar::Struct(StructData::try_new(schema, vec![Scalar::Struct(leaf)]).unwrap())
     }
 
     /// Whether the leaf filter reads or skips a leaf.
