@@ -354,8 +354,10 @@ impl TryFrom<&str> for DataSkippingNumIndexedCols {
 }
 
 /// The isolation level applied during transaction
+///
+/// Parsing ignores ASCII letter case.
 #[derive(Debug, EnumString, Default, Copy, Clone, PartialEq, Eq)]
-#[strum(serialize_all = "camelCase")]
+#[strum(serialize_all = "camelCase", ascii_case_insensitive)]
 pub enum IsolationLevel {
     /// The strongest isolation level. It ensures that committed write operations
     /// and all reads are Serializable. Operations are allowed as long as there
@@ -367,8 +369,7 @@ pub enum IsolationLevel {
 
     /// A weaker isolation level than Serializable. It ensures only that the write
     /// operations (that is, not reads) are serializable. However, this is still stronger
-    /// than Snapshot isolation. WriteSerializable is the default isolation level because
-    /// it provides great balance of data consistency and availability for most common operations.
+    /// than Snapshot isolation.
     WriteSerializable,
 
     /// SnapshotIsolation is a guarantee that all reads made in a transaction will see a consistent

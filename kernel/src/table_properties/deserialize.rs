@@ -473,4 +473,30 @@ mod tests {
         let props = TableProperties::from([(PARQUET_COMPRESSION_CODEC, "snappy")]);
         assert_eq!(props.compression_codec_or_default(), Snappy);
     }
+
+    #[rstest]
+    #[case::pascal_case_serializable("Serializable", Some(IsolationLevel::Serializable))]
+    #[case::uppercase_serializable("SERIALIZABLE", Some(IsolationLevel::Serializable))]
+    #[case::pascal_case_write_serializable(
+        "WriteSerializable",
+        Some(IsolationLevel::WriteSerializable)
+    )]
+    #[case::lowercase_write_serializable(
+        "writeserializable",
+        Some(IsolationLevel::WriteSerializable)
+    )]
+    #[case::pascal_case_snapshot_isolation(
+        "SnapshotIsolation",
+        Some(IsolationLevel::SnapshotIsolation)
+    )]
+    #[case::misspelled("Serializabel", None)]
+    #[case::snake_case("write_serializable", None)]
+    #[case::padded(" Serializable", None)]
+    fn test_parse_isolation_level_ignores_only_letter_case(
+        #[case] value: &str,
+        #[case] expected: Option<IsolationLevel>,
+    ) {
+        let props = TableProperties::from([(ISOLATION_LEVEL, value)]);
+        assert_eq!(props.isolation_level, expected);
+    }
 }
