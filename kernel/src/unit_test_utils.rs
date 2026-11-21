@@ -414,6 +414,8 @@ pub(crate) fn checkpoint_action_batch() -> Box<dyn EngineData> {
 pub(crate) mod adaptive_metadata_fixtures {
     use std::iter;
 
+    use serde_json::json;
+
     use super::*;
     use crate::actions::{
         CheckpointAction, ContentRoot, DomainMetadata, LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA,
@@ -421,12 +423,21 @@ pub(crate) mod adaptive_metadata_fixtures {
     };
     use crate::arrow::array::{Array as _, AsArray as _};
     use crate::content_tree::ContentTreeNodeEntry;
+    use crate::content_tree::file_metadata::{ADAPTIVE_METADATA_DOMAIN_NAME, FileMetadataFieldIds};
     use crate::content_tree::test_utils::write_manifest;
     use crate::engine_data::FilteredEngineData;
     use crate::expressions::Scalar;
+    use crate::last_checkpoint_hint::{AmtCheckpoint, CheckpointType, LastCheckpointHint};
     use crate::path::LogRoot;
-    use crate::transaction::UpdateTableOperation;
+    use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
+    use crate::transaction::{UpdateTableOperation, UpdateTableTransactionBuilder};
     use crate::{create_row, version_as_i64};
+
+    /// Features an adaptiveMetadata table needs to hold `clusteringProvider`.
+    pub(crate) const CLUSTERED_AMT_FEATURES: [TableFeature; 2] = [
+        TableFeature::AdaptiveMetadataPreview,
+        TableFeature::ClusteredTable,
+    ];
 
     /// The protocol and metadata of a minimal adaptiveMetadata table.
     pub(crate) fn adaptive_metadata_protocol_and_metadata() -> (Protocol, Metadata) {
@@ -525,6 +536,34 @@ pub(crate) mod adaptive_metadata_fixtures {
     /// `content_root_version`.
     pub(crate) fn pointer(version: i64, content_root_version: i64) -> LastManifestCommit {
         LastManifestCommit::new(version, content_root_version).unwrap()
+    }
+
+    /// Writes the `_last_checkpoint` hint at `version`, embedding `checkpoint` as its AMT
+    /// checkpoint.
+    pub(crate) fn write_amt_last_checkpoint_hint(
+        engine: &SyncEngine,
+        table_root: &Url,
+        version: Version,
+        checkpoint: CheckpointAction,
+    ) -> KernelResult<()> {
+        let hint = LastCheckpointHint {
+            version,
+            size: 1,
+            checkpoint_type: Some(CheckpointType::AdaptiveMetadataTree),
+            amt_checkpoint: Some(AmtCheckpoint {
+                manifest_commit_version: version,
+                checkpoint: Some(checkpoint),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let log_root = table_root.join("_delta_log/")?;
+        engine.storage_handler().put(
+            &LastCheckpointHint::path(&log_root)?,
+            hint.to_json_bytes().into(),
+            true,
+        )?;
+        Ok(())
     }
 
     /// Writes `rows` (each a value of `schema`'s single action field) as the checkpoint sidecar
@@ -686,7 +725,8 @@ pub(crate) mod adaptive_metadata_fixtures {
 
     /// Commits the protocol and metadata of an adaptiveMetadata table partitioned by
     /// `partition_columns` as version 0 of the table at `table_root`. They are written directly
-    /// because `create_table` cannot enable `adaptiveMetadata-preview`.
+    /// rather than through `create_table`, so the fixture controls the schema and the In-Commit
+    /// Timestamp of the commit.
     pub(crate) fn create_adaptive_metadata_table(
         engine: &SyncEngine,
         table_root: &Url,
@@ -795,12 +835,15 @@ pub(crate) mod adaptive_metadata_fixtures {
         adds: &[&str],
         removes: &[&str],
     ) -> Version {
-        let adds = (!adds.is_empty()).then(|| {
-            let batch = nullable_add_files(adds);
-            let batch = replace_column(&batch, "stats", one_record_stats(&batch));
-            Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>
-        });
+        let adds = (!adds.is_empty()).then(|| add_files_batch(adds));
         commit_file_changes(engine, table_root, adds, removes)
+    }
+
+    /// A batch of add-file rows for `paths`, with the one-record `stats` row tracking requires.
+    pub(crate) fn add_files_batch(paths: &[&str]) -> Box<dyn EngineData> {
+        let batch = nullable_add_files(paths);
+        let batch = replace_column(&batch, "stats", one_record_stats(&batch));
+        Box::new(ArrowEngineData::new(batch))
     }
 
     /// Like [`commit_files`], but adds the files `adds` describes, a batch of the transaction's
@@ -898,6 +941,122 @@ pub(crate) mod adaptive_metadata_fixtures {
             })
             .collect();
         Arc::new(StructArray::try_new(fields.clone(), columns, None).unwrap())
+    }
+
+    /// Where a [`setup_clustered_table`] table holds its `delta.adaptiveMetadata` domain.
+    #[derive(Clone, Copy)]
+    pub(crate) enum DomainPlacement {
+        /// In the table's first commit, next to its protocol and metadata.
+        FirstCommit,
+        /// In a JSON commit after the first.
+        LaterCommit,
+        /// In a JSON commit after a manifest commit's checkpoint action.
+        AfterCheckpoint,
+    }
+
+    /// Creates an in-memory table with the features and properties the assignment tests need,
+    /// plus `extra_features`. The table is clustered only when `extra_features` includes
+    /// `ClusteredTable`, and it is adaptiveMetadata only when it includes
+    /// `AdaptiveMetadataPreview`. `delta.columnMapping.maxColumnId` is `max_column_id`. The
+    /// table's protocol and metadata are version 0, and `domain` (if any) is placed as described
+    /// by [`DomainPlacement`].
+    pub(crate) fn setup_clustered_table(
+        extra_features: &[TableFeature],
+        max_column_id: i32,
+        domain: Option<(DomainPlacement, DomainMetadata)>,
+    ) -> (SyncEngine, Url) {
+        let max_column_id = max_column_id.to_string();
+        let table_config = MockTableConfigurationBuilder::new()
+            .with_schema(test_schema_flat_with_column_mapping())
+            .with_column_mapping(ColumnMappingMode::Id)
+            .with_properties([
+                (COLUMN_MAPPING_MAX_COLUMN_ID, max_column_id.as_str()),
+                (ENABLE_IN_COMMIT_TIMESTAMPS, "true"),
+                (ENABLE_ROW_TRACKING, "true"),
+                (ENABLE_DELETION_VECTORS, "true"),
+            ])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features(
+                        [
+                            TableFeature::ColumnMapping,
+                            TableFeature::DeletionVectors,
+                            TableFeature::DomainMetadata,
+                            TableFeature::InCommitTimestamp,
+                            TableFeature::RowTracking,
+                        ]
+                        .into_iter()
+                        .chain(extra_features.iter().cloned()),
+                    )
+                    .build(),
+            )
+            .build();
+        let engine = SyncEngine::in_memory();
+        let table_root = Url::parse("memory:///").unwrap();
+        let pm = format!(
+            "{}\n{}",
+            json!({ "protocol": table_config.protocol() }),
+            json!({ "metaData": table_config.metadata() }),
+        );
+        let first_commit = match &domain {
+            Some((DomainPlacement::FirstCommit, domain)) => {
+                format!("{pm}\n{}", domain_metadata_line(domain.clone()))
+            }
+            _ => pm,
+        };
+        write_ict_commit(&engine, &table_root, 0, None, &first_commit);
+        match domain {
+            Some((DomainPlacement::LaterCommit, domain)) => {
+                write_ict_commit(&engine, &table_root, 1, None, &domain_metadata_line(domain));
+            }
+            Some((DomainPlacement::AfterCheckpoint, domain)) => {
+                // The checkpoint's protocol and metadata are the table's, as a manifest commit
+                // writes.
+                let checkpoint = CheckpointAction::new(
+                    1,
+                    ContentRoot::new("metadata/root.parquet".to_string(), 1024, 1),
+                    table_config.protocol().clone(),
+                    table_config.metadata().clone(),
+                    vec![],
+                    vec![],
+                );
+                write_manifest_commit_keeping_pm(&engine, &table_root, 1, checkpoint).unwrap();
+                let line = domain_metadata_line(domain);
+                let data = parse_json_batch(vec![line.as_str()].into());
+                write_commit_after_manifest_commit(&engine, &table_root, 2, 1, data).unwrap();
+            }
+            _ => {}
+        }
+        (engine, table_root)
+    }
+
+    /// Commits an update to the latest snapshot of the table at `table_root`, with `configure`
+    /// applied to its builder, and returns the post-commit snapshot.
+    pub(crate) fn commit_update(
+        engine: &SyncEngine,
+        table_root: &Url,
+        configure: impl FnOnce(UpdateTableTransactionBuilder) -> UpdateTableTransactionBuilder,
+    ) -> Result<SnapshotRef> {
+        let snapshot = Snapshot::builder_for(table_root.clone()).build(engine)?;
+        let txn = configure(snapshot.update_table(UpdateTableOperation::Write, "test", true))
+            .build(engine, Box::new(FileSystemCommitter::new()))?;
+        Ok(txn.commit(engine)?.unwrap_post_commit_snapshot())
+    }
+
+    /// The `clusteringProvider` field ID that `snapshot`'s `delta.adaptiveMetadata` domain maps.
+    pub(crate) fn clustering_provider_field_id(
+        engine: &dyn Engine,
+        snapshot: &Snapshot,
+    ) -> Result<Option<i32>> {
+        let Some(configuration) = snapshot
+            .reader()
+            .get_domain_metadata_internal(ADAPTIVE_METADATA_DOMAIN_NAME, engine)?
+        else {
+            return Ok(None);
+        };
+        let ids = FileMetadataFieldIds::try_from_configuration(&configuration)
+            .map_err(KernelError::generic)?;
+        Ok(ids.clustering_provider)
     }
 
     fn write_transaction(engine: &SyncEngine, snapshot: SnapshotRef) -> Transaction {

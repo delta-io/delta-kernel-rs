@@ -118,6 +118,20 @@ impl DomainMetadataState {
     ) -> KernelResult<Self> {
         Ok(Self::Partial(domain_metadata_map(values, false)?))
     }
+
+    /// The domains held, whether or not the state is complete.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn map(&self) -> &HashMap<String, DomainMetadata> {
+        let (Self::Complete(map) | Self::Partial(map)) = self;
+        map
+    }
+
+    /// Mutable access to the domains held, whether or not the state is complete.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn map_mut(&mut self) -> &mut HashMap<String, DomainMetadata> {
+        let (Self::Complete(map) | Self::Partial(map)) = self;
+        map
+    }
 }
 
 fn domain_metadata_map(
