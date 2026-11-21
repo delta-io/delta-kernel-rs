@@ -200,6 +200,8 @@ pub(crate) struct StructDataFields {
 }
 
 impl StructDataFields {
+    /// Creates a field decoder after checking that the value count matches both schemas.
+    #[internal_api]
     pub(crate) fn try_new(data: StructData, expected: SchemaRef) -> KernelResult<Self> {
         let (actual, values) = data.into_parts();
         require!(
@@ -223,6 +225,8 @@ impl StructDataFields {
         })
     }
 
+    /// Consumes the named field, checks its schema nullability, and decodes its value.
+    #[internal_api]
     pub(crate) fn take_field<T: TryFrom<Scalar, Error = KernelError>>(
         &mut self,
         field_name: &str,
@@ -266,6 +270,7 @@ impl StructDataFields {
     }
 
     /// Verifies that every named field was consumed.
+    #[internal_api]
     pub(crate) fn finish(self) -> KernelResult<()> {
         let mut extra: Vec<_> = self
             .actual
