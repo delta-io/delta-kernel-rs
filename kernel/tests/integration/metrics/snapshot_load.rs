@@ -344,8 +344,7 @@ fn snapshot_at_checkpoint_tip_emits_expected_metrics() -> delta_kernel::Result<(
 // Scenario 4: log compaction covering early commits + one tail commit
 // ============================================================================
 
-/// Snapshot loading reports listed compactions but reconstructs state from original commits.
-
+/// Snapshot loading reads the listed compaction in place of the commits it covers.
 #[tokio::test]
 async fn snapshot_with_log_compaction_emits_expected_metrics() -> delta_kernel::Result<()> {
     let table = TestTableBuilder::new()
@@ -370,8 +369,16 @@ async fn snapshot_with_log_compaction_emits_expected_metrics() -> delta_kernel::
     assert_eq!(reporter.checkpoint_files.get(), 0);
     assert_eq!(reporter.compaction_files.get(), 1);
 
-    assert_eq!(reporter.json_read_calls.get(), 1);
-    assert_eq!(reporter.json_files_read.get(), 4);
+    // With adaptiveMetadata support, a cover containing a compaction makes replay read the newest
+    // commit on its own before the older files.
+    let expected_json_read_calls = if cfg!(feature = "adaptive-metadata-in-dev") {
+        2
+    } else {
+        1
+    };
+    assert_eq!(reporter.json_read_calls.get(), expected_json_read_calls);
+    // Commit 3 plus the 0..=2 compaction.
+    assert_eq!(reporter.json_files_read.get(), 2);
     assert_eq!(reporter.parquet_read_calls.get(), 0);
 
     Ok(())
