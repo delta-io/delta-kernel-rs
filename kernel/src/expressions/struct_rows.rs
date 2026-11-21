@@ -4,10 +4,11 @@ use delta_kernel_derive::internal_api;
 
 use super::StructData;
 use crate::error::add_scalar_path_context;
-use crate::schema::ToSchema;
+use crate::schema::derive_macro_utils::validate_variant;
+use crate::schema::{SchemaRef, ToSchema};
 use crate::{KernelError, KernelResult};
 
-/// Collects struct rows into a row, optional row, or vector.
+/// Collects struct rows into a row, optional row, vector, or named payload collections.
 #[internal_api]
 pub(crate) trait TryFromStructRows: Sized {
     /// The input row type whose schema is used for materialization.
