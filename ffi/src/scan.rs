@@ -22,12 +22,12 @@ use crate::engine_data::ArrowFFIData;
 use crate::error::ErrorAllocators;
 use crate::expressions::SharedExpression;
 use crate::expressions::kernel_visitor::{KernelExpressionVisitorState, unwrap_kernel_predicate};
+use crate::panic::catch_panic_into_result;
 use crate::schema_visitor::{KernelSchemaVisitorState, extract_kernel_schema};
 use crate::{
-    AllocateStringFn, ExternEngine, ExternResult, IntoExternResult, KernelBoolSlice,
-    KernelRowIndexArray, KernelStringSlice, NullableCvoid, OptionalValue, SharedExternEngine,
-    SharedSchema, SharedSnapshot, TryFromStringSlice, kernel_string_slice,
-    unwrap_and_parse_path_as_url,
+    AllocateStringFn, ExternEngine, ExternResult, KernelBoolSlice, KernelRowIndexArray,
+    KernelStringSlice, NullableCvoid, OptionalValue, SharedExternEngine, SharedSchema,
+    SharedSnapshot, TryFromStringSlice, kernel_string_slice, unwrap_and_parse_path_as_url,
 };
 
 #[handle_descriptor(target=Scan, mutable=false, sized=true)]
@@ -183,9 +183,12 @@ pub unsafe extern "C" fn selection_vector_from_scan_metadata(
     scan_metadata: Handle<SharedScanMetadata>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<KernelBoolSlice> {
-    let scan_metadata = unsafe { scan_metadata.as_ref() };
-    let result = selection_vector_from_scan_metadata_impl(scan_metadata);
-    unsafe { result.into_extern_result(&engine.as_ref()) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let scan_metadata = scan_metadata.as_ref();
+            selection_vector_from_scan_metadata_impl(scan_metadata)
+        })
+    }
 }
 
 fn selection_vector_from_scan_metadata_impl(
@@ -217,8 +220,7 @@ pub unsafe extern "C" fn scan(
     schema: Option<&EngineSchema>,
 ) -> ExternResult<Handle<SharedScan>> {
     let snapshot = unsafe { snapshot.clone_as_arc() };
-    let result = scan_impl(snapshot, predicate, schema);
-    unsafe { result.into_extern_result(&engine.as_ref()) }
+    unsafe { catch_panic_into_result(&engine.as_ref(), || scan_impl(snapshot, predicate, schema)) }
 }
 
 /// Decode an [`EnginePredicate`] into a kernel [`Predicate`] by running the engine's visitor.
@@ -318,9 +320,13 @@ pub unsafe extern "C" fn scan_builder_with_correlation_id(
 ) -> ExternResult<Handle<ExclusiveScanBuilder>> {
     let builder = unsafe { builder.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    let result = unsafe { correlation_id.try_to_string() }
-        .map(|id| Box::new(builder.with_correlation_id(id)).into());
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine, || {
+            correlation_id
+                .try_to_string()
+                .map(|id| Box::new(builder.with_correlation_id(id)).into())
+        })
+    }
 }
 
 /// Apply a predicate to an [`ExclusiveScanBuilder`] for data skipping and row-level filtering.
@@ -343,8 +349,11 @@ pub unsafe extern "C" fn scan_builder_with_predicate(
 ) -> ExternResult<Handle<ExclusiveScanBuilder>> {
     let engine = unsafe { engine.as_ref() };
     let builder = unsafe { builder.into_inner() };
-    let result = apply_predicate(*builder, predicate).map(|b| Box::new(b).into());
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine, || {
+            apply_predicate(*builder, predicate).map(|b| Box::new(b).into())
+        })
+    }
 }
 
 /// Apply a column projection schema to an [`ExclusiveScanBuilder`].
@@ -366,8 +375,7 @@ pub unsafe extern "C" fn scan_builder_with_schema(
     schema: &EngineSchema,
 ) -> ExternResult<Handle<ExclusiveScanBuilder>> {
     let engine = unsafe { engine.as_ref() };
-    let result = scan_builder_with_schema_impl(builder, schema);
-    unsafe { result.into_extern_result(&engine) }
+    unsafe { catch_panic_into_result(&engine, || scan_builder_with_schema_impl(builder, schema)) }
 }
 
 fn scan_builder_with_schema_impl(
@@ -399,9 +407,13 @@ pub unsafe extern "C" fn scan_builder_with_stats(
 ) -> ExternResult<Handle<ExclusiveScanBuilder>> {
     let builder = unsafe { builder.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    let result = unsafe { options.try_to_kernel() }
-        .map(|options| Box::new(builder.with_stats(options)).into());
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine, || {
+            options
+                .try_to_kernel()
+                .map(|options| Box::new(builder.with_stats(options)).into())
+        })
+    }
 }
 
 /// Configure how partition values are included in the resulting scan metadata.
@@ -439,8 +451,11 @@ pub unsafe extern "C" fn scan_builder_build(
 ) -> ExternResult<Handle<SharedScan>> {
     let engine = unsafe { engine.as_ref() };
     let builder = unsafe { builder.into_inner() };
-    let result = builder.build().map(|scan| Arc::new(scan).into());
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine, || {
+            builder.build().map(|scan| Arc::new(scan).into())
+        })
+    }
 }
 
 /// Free an [`ExclusiveScanBuilder`] without building a scan.
@@ -529,9 +544,12 @@ pub unsafe extern "C" fn scan_declarative_metadata_plan(
 ) -> ExternResult<OptionalValue<crate::KernelOwnedBytes>> {
     let scan = unsafe { scan.as_ref() };
     let extern_engine = unsafe { engine.as_ref() };
-    let inner_engine = extern_engine.engine();
-    let result = scan_declarative_metadata_plan_impl(scan, inner_engine.as_ref());
-    unsafe { result.into_extern_result(&extern_engine) }
+    unsafe {
+        catch_panic_into_result(&extern_engine, || {
+            let inner_engine = extern_engine.engine();
+            scan_declarative_metadata_plan_impl(scan, inner_engine.as_ref())
+        })
+    }
 }
 
 #[cfg(feature = "declarative-plans")]
@@ -596,10 +614,13 @@ pub unsafe extern "C" fn scan_metadata_iter_init(
     engine: Handle<SharedExternEngine>,
     scan: Handle<SharedScan>,
 ) -> ExternResult<Handle<SharedScanMetadataIterator>> {
-    let engine = unsafe { engine.clone_as_arc() };
-    let scan = unsafe { scan.as_ref() };
-    let result = scan_metadata_iter_init_impl(&engine, scan);
-    unsafe { result.into_extern_result(&engine.as_ref()) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let engine = engine.clone_as_arc();
+            let scan = scan.as_ref();
+            scan_metadata_iter_init_impl(&engine, scan)
+        })
+    }
 }
 
 fn scan_metadata_iter_init_impl(
@@ -635,9 +656,13 @@ pub unsafe extern "C" fn scan_metadata_next(
         scan_metadata: Handle<SharedScanMetadata>,
     ),
 ) -> ExternResult<bool> {
-    let data = unsafe { data.as_ref() };
-    let result = scan_metadata_next_impl(data, engine_context, engine_visitor);
-    unsafe { result.into_extern_result(&data.engine.as_ref()) }
+    let panic_engine = unsafe { data.as_ref() }.engine.clone();
+    unsafe {
+        catch_panic_into_result(&panic_engine.as_ref(), || {
+            let data = data.as_ref();
+            scan_metadata_next_impl(data, engine_context, engine_visitor)
+        })
+    }
 }
 fn scan_metadata_next_impl(
     data: &ScanMetadataIterator,
@@ -733,9 +758,11 @@ pub unsafe extern "C" fn get_from_string_map(
     allocate_fn: AllocateStringFn,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<NullableCvoid> {
-    let engine = unsafe { engine.as_ref() };
-    let result = get_from_string_map_impl(map, key, allocate_fn);
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            get_from_string_map_impl(map, key, allocate_fn)
+        })
+    }
 }
 fn get_from_string_map_impl(
     map: &CStringMap,
@@ -848,9 +875,11 @@ pub unsafe extern "C" fn get_from_metadata_map(
     allocate_fn: AllocateStringFn,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<NullableCvoid> {
-    let engine = unsafe { engine.as_ref() };
-    let result = get_from_metadata_map_impl(map, key, kind_out, allocate_fn);
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            get_from_metadata_map_impl(map, key, kind_out, allocate_fn)
+        })
+    }
 }
 fn get_from_metadata_map_impl(
     map: &CMetadataMap,
@@ -967,8 +996,7 @@ pub unsafe extern "C" fn cardinality_from_dv(
     dv_info: &DvInfo,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<OptionalValue<u64>> {
-    let result = dv_info.cardinality().map(Into::into);
-    unsafe { result.into_extern_result(&*error_allocators) }
+    unsafe { catch_panic_into_result(&*error_allocators, || dv_info.cardinality().map(Into::into)) }
 }
 
 /// Get a selection vector out of a [`DvInfo`] struct
@@ -981,10 +1009,13 @@ pub unsafe extern "C" fn selection_vector_from_dv(
     engine: Handle<SharedExternEngine>,
     root_url: KernelStringSlice,
 ) -> ExternResult<KernelBoolSlice> {
-    let engine = unsafe { engine.as_ref() };
-    let root_url = unsafe { unwrap_and_parse_path_as_url(root_url) };
-    let result = selection_vector_from_dv_impl(dv_info, engine, root_url);
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let engine = engine.as_ref();
+            let root_url = unwrap_and_parse_path_as_url(root_url);
+            selection_vector_from_dv_impl(dv_info, engine, root_url)
+        })
+    }
 }
 
 fn selection_vector_from_dv_impl(
@@ -1008,10 +1039,13 @@ pub unsafe extern "C" fn row_indexes_from_dv(
     engine: Handle<SharedExternEngine>,
     root_url: KernelStringSlice,
 ) -> ExternResult<KernelRowIndexArray> {
-    let engine = unsafe { engine.as_ref() };
-    let root_url = unsafe { unwrap_and_parse_path_as_url(root_url) };
-    let result = row_indexes_from_dv_impl(dv_info, engine, root_url);
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let engine = engine.as_ref();
+            let root_url = unwrap_and_parse_path_as_url(root_url);
+            row_indexes_from_dv_impl(dv_info, engine, root_url)
+        })
+    }
 }
 
 fn row_indexes_from_dv_impl(
@@ -1070,10 +1104,12 @@ pub unsafe extern "C" fn visit_scan_metadata(
     engine_context: NullableCvoid,
     callback: CScanCallback,
 ) -> ExternResult<bool> {
-    let scan_metadata = unsafe { scan_metadata.as_ref() };
-    let engine = unsafe { engine.as_ref() };
-    let result = visit_scan_metadata_impl(scan_metadata, engine_context, callback);
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let scan_metadata = scan_metadata.as_ref();
+            visit_scan_metadata_impl(scan_metadata, engine_context, callback)
+        })
+    }
 }
 fn visit_scan_metadata_impl(
     scan_metadata: &ScanMetadata,
@@ -1133,10 +1169,12 @@ pub unsafe extern "C" fn scan_metadata_next_arrow(
     data: Handle<SharedScanMetadataIterator>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<*mut ScanMetadataArrowResult> {
-    let data = unsafe { data.as_ref() };
-    let engine = unsafe { engine.as_ref() };
-    let result = scan_metadata_next_arrow_impl(data);
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let data = data.as_ref();
+            scan_metadata_next_arrow_impl(data)
+        })
+    }
 }
 
 #[cfg(feature = "default-engine-base")]

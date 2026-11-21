@@ -8,8 +8,9 @@ use delta_kernel_ffi_macros::handle_descriptor;
 use url::Url;
 
 use super::hint;
-use crate::error::{ExternResult, IntoExternResult};
+use crate::error::ExternResult;
 use crate::handle::Handle;
+use crate::panic::catch_panic_into_result;
 use crate::{
     ExternEngine, KernelStringSlice, SharedExternEngine, SharedSnapshot, log_path,
     unwrap_and_parse_path_as_url,
@@ -85,16 +86,13 @@ pub unsafe extern "C" fn get_snapshot_builder(
 ) -> ExternResult<Handle<ExclusiveSnapshotBuilder>> {
     let engine_ref = unsafe { engine.as_ref() };
     let engine_arc = unsafe { engine.clone_as_arc() };
-    let url = unsafe { unwrap_and_parse_path_as_url(path) };
-    let source = match url {
-        Ok(url) => FfiSnapshotBuilderSource::TableRoot(url),
-        Err(e) => {
-            let result: KernelResult<Handle<ExclusiveSnapshotBuilder>> = Err(e);
-            return unsafe { result.into_extern_result(&engine_ref) };
-        }
-    };
-    let result = make_snapshot_builder(source, engine_arc);
-    unsafe { result.into_extern_result(&engine_ref) }
+    unsafe {
+        catch_panic_into_result(&engine_ref, || {
+            let url = unwrap_and_parse_path_as_url(path)?;
+            let source = FfiSnapshotBuilderSource::TableRoot(url);
+            make_snapshot_builder(source, engine_arc)
+        })
+    }
 }
 
 /// Get a builder for incrementally updating an existing snapshot.
@@ -115,11 +113,14 @@ pub unsafe extern "C" fn get_snapshot_builder_from(
     let engine_ref = unsafe { engine.as_ref() };
     let engine_arc = unsafe { engine.clone_as_arc() };
     let snapshot_arc = unsafe { prev_snapshot.clone_as_arc() };
-    let result = make_snapshot_builder(
-        FfiSnapshotBuilderSource::ExistingSnapshot(snapshot_arc),
-        engine_arc,
-    );
-    unsafe { result.into_extern_result(&engine_ref) }
+    unsafe {
+        catch_panic_into_result(&engine_ref, || {
+            make_snapshot_builder(
+                FfiSnapshotBuilderSource::ExistingSnapshot(snapshot_arc),
+                engine_arc,
+            )
+        })
+    }
 }
 
 /// Sets an explicit target version on a snapshot builder. When omitted, a hinted build uses the
@@ -163,11 +164,14 @@ pub unsafe extern "C" fn snapshot_builder_with_correlation_id(
 ) -> ExternResult<Handle<ExclusiveSnapshotBuilder>> {
     let mut builder = unsafe { builder.into_inner() };
     let engine = builder.engine.clone();
-    let result = unsafe { correlation_id.try_to_string() }.map(|id| {
-        builder.correlation_id = Some(id).filter(|id| !id.is_empty());
-        builder.into()
-    });
-    unsafe { result.into_extern_result(&engine.as_ref()) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            correlation_id.try_to_string().map(|id| {
+                builder.correlation_id = Some(id).filter(|id| !id.is_empty());
+                builder.into()
+            })
+        })
+    }
 }
 
 /// Set the replay mode for advancing a stale CRC during a fresh or incremental snapshot build.
@@ -220,9 +224,11 @@ pub unsafe extern "C" fn snapshot_builder_with_log_tail(
     let mut builder = unsafe { builder.into_inner() };
     let engine_arc = builder.engine.clone();
     let engine_ref = engine_arc.as_ref();
-    let result = unsafe { snapshot_builder_with_log_tail_impl(&mut builder, log_tail) }
-        .map(|_| builder.into());
-    unsafe { result.into_extern_result(&engine_ref) }
+    unsafe {
+        catch_panic_into_result(&engine_ref, || {
+            snapshot_builder_with_log_tail_impl(&mut builder, log_tail).map(|_| builder.into())
+        })
+    }
 }
 
 /// Bound the snapshot version to what the catalog has ratified.
@@ -276,8 +282,7 @@ pub unsafe extern "C" fn snapshot_builder_build(
     let engine_arc = unsafe { builder.as_mut() }.engine.clone();
     let engine_ref = engine_arc.as_ref();
     let builder_box = unsafe { builder.into_inner() };
-    let result = snapshot_builder_build_impl(*builder_box);
-    unsafe { result.into_extern_result(&engine_ref) }
+    unsafe { catch_panic_into_result(&engine_ref, || snapshot_builder_build_impl(*builder_box)) }
 }
 
 /// Free a snapshot builder without building a snapshot (e.g. on an error path).

@@ -4,8 +4,9 @@ use delta_kernel::KernelResult;
 use delta_kernel::checkpoint::{CheckpointKind, CheckpointShape};
 
 use crate::delta_types::{CheckpointBacking, FfiLastCheckpoint};
-use crate::error::{ExternResult, IntoExternResult};
+use crate::error::ExternResult;
 use crate::handle::Handle;
+use crate::panic::catch_panic_into_result;
 use crate::{
     KernelStringSlice, NullableCvoid, SharedExternEngine, SharedSnapshot, kernel_string_slice,
 };
@@ -76,14 +77,17 @@ pub unsafe extern "C" fn snapshot_checkpoint_info(
     context: NullableCvoid,
     visitor: CheckpointShapeVisitor,
 ) -> ExternResult<bool> {
-    let snapshot = unsafe { snapshot.as_ref() };
-    let engine = unsafe { engine.as_ref() };
-    let result = snapshot
-        .reader()
-        .get_checkpoint_info(engine.engine().as_ref())
-        .and_then(|info| visit(info.as_deref(), context, visitor))
-        .map(|()| true);
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let snapshot = snapshot.as_ref();
+            let engine = engine.as_ref();
+            snapshot
+                .reader()
+                .get_checkpoint_info(engine.engine().as_ref())
+                .and_then(|info| visit(info.as_deref(), context, visitor))
+                .map(|()| true)
+        })
+    }
 }
 
 fn visit(

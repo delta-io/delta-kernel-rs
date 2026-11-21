@@ -33,6 +33,8 @@ use {
     std::collections::HashMap, std::num::NonZero,
 };
 
+use crate::panic::catch_panic_into_result;
+
 // cbindgen doesn't understand our use of feature flags here, and by default it parses `mod handle`
 // twice. So we tell it to ignore one of the declarations to avoid double-definition errors.
 /// cbindgen:ignore
@@ -49,7 +51,6 @@ use handle::Handle;
 extern crate self as delta_kernel_ffi;
 
 mod alloc_stats;
-#[cfg_attr(not(test), allow(dead_code))]
 mod panic;
 
 #[cfg(feature = "declarative-plans")]
@@ -1328,13 +1329,16 @@ pub unsafe extern "C" fn checkpoint_snapshot(
     engine: Handle<SharedExternEngine>,
     spec: Option<&FfiCheckpointSpec>,
 ) -> ExternResult<FfiCheckpointWriteResult> {
-    let engine_ref = unsafe { engine.as_ref() };
-    let snapshot_ref: SnapshotRef = unsafe { snapshot.clone_as_arc() };
-    let kernel_spec = spec.map(|s| s.to_kernel());
-    let result = snapshot_ref
-        .checkpoint(engine_ref.engine().as_ref(), kernel_spec.as_ref())
-        .map(|(result, updated)| FfiCheckpointWriteResult::from_kernel(result, updated));
-    unsafe { result.into_extern_result(&engine_ref) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let engine_ref = engine.as_ref();
+            let snapshot_ref: SnapshotRef = snapshot.clone_as_arc();
+            let kernel_spec = spec.map(|s| s.to_kernel());
+            snapshot_ref
+                .checkpoint(engine_ref.engine().as_ref(), kernel_spec.as_ref())
+                .map(|(result, updated)| FfiCheckpointWriteResult::from_kernel(result, updated))
+        })
+    }
 }
 
 /// Publish unpublished catalog commits on a catalog-managed snapshot.
@@ -1359,13 +1363,16 @@ pub unsafe extern "C" fn snapshot_publish_with_committer(
     committer: Handle<MutableCommitter>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedSnapshot>> {
-    let engine_ref = unsafe { engine.as_ref() };
-    let snapshot_ref: SnapshotRef = unsafe { snapshot.clone_as_arc() };
-    let committer = unsafe { committer.into_inner() };
-    let result = snapshot_ref
-        .publish(engine_ref.engine().as_ref(), committer.as_ref())
-        .map(|updated| updated.into());
-    unsafe { result.into_extern_result(&engine_ref) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let engine_ref = engine.as_ref();
+            let snapshot_ref: SnapshotRef = snapshot.clone_as_arc();
+            let committer = committer.into_inner();
+            snapshot_ref
+                .publish(engine_ref.engine().as_ref(), committer.as_ref())
+                .map(|updated| updated.into())
+        })
+    }
 }
 
 /// Get the version of the specified snapshot
@@ -1396,12 +1403,15 @@ pub unsafe extern "C" fn snapshot_timestamp(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<i64> {
-    let engine_ref = unsafe { engine.as_ref() };
-    let snapshot = unsafe { snapshot.as_ref() };
-    let result = snapshot
-        .reader()
-        .get_timestamp(engine_ref.engine().as_ref());
-    unsafe { result.into_extern_result(&engine_ref) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let engine_ref = engine.as_ref();
+            let snapshot = snapshot.as_ref();
+            snapshot
+                .reader()
+                .get_timestamp(engine_ref.engine().as_ref())
+        })
+    }
 }
 
 /// Statistics for the original commit files in a snapshot's log segment.
@@ -1444,10 +1454,12 @@ pub unsafe extern "C" fn snapshot_log_segment_stats(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<FfiLogSegmentStats> {
-    let engine_ref = unsafe { engine.as_ref() };
-    let snapshot = unsafe { snapshot.as_ref() };
-    let result = snapshot.log_segment_stats().map(FfiLogSegmentStats::from);
-    unsafe { result.into_extern_result(&engine_ref) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let snapshot = snapshot.as_ref();
+            snapshot.log_segment_stats().map(FfiLogSegmentStats::from)
+        })
+    }
 }
 
 /// File-level statistics for a snapshot, sourced from the snapshot's CRC.
