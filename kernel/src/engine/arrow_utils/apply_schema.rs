@@ -8,7 +8,7 @@ use super::super::arrow_conversion::{
     LIST_ARRAY_ROOT, MAP_KEY_DEFAULT, MAP_VALUE_DEFAULT, kernel_flat_parquet_id_to_arrow_metadata,
     lookup_nested_field_id, parquet_field_id_metadata,
 };
-use super::make_arrow_error;
+use super::{fix_nested_null_masks, make_arrow_error};
 use crate::KernelResult;
 use crate::arrow::array::{
     Array, ArrayRef, AsArray, GenericListArray, GenericListViewArray, MapArray, OffsetSizeTrait,
@@ -25,14 +25,18 @@ use crate::schema::{
     ArrayType, ColumnMetadataKey, DataType, FILE_FIELDS, MapType, Schema, StructField,
 };
 
-// Apply a schema to an array. The array _must_ be a `StructArray`. Returns a `RecordBatch` where
-// the names of fields, nullable, and metadata in the struct have been transformed to match those
-// in the schema specified by `schema`.
-//
-// Note: If the struct array has top-level nulls, the child columns are expected to already have
-// those nulls propagated. Arrow's JSON reader does this automatically, and parquet data goes
-// through `fix_nested_null_masks` which handles it. We decompose the struct and discard its null
-// buffer since RecordBatch cannot have top-level nulls.
+/// Applies the struct `schema` to `array` and expands its fields into a record batch.
+///
+/// Field names, nullability, and metadata follow `schema`. Root NULLs propagate through child
+/// structs before the root validity buffer is discarded, since a record batch cannot store it.
+/// Existing child NULLs remain NULL, and the row count is preserved even without output fields.
+/// For example, expanding `CASE WHEN keep THEN named_struct('value', value, 'keep', keep) END`
+/// produces `(NULL, NULL)` for `(keep, value) = (false, 8)` or `(NULL, 9)`.
+///
+/// # Errors
+///
+/// Returns an error if `array` or `schema` is not a struct, their types are incompatible, or
+/// the resulting columns contain NULLs that violate the target schema's nullability.
 pub(crate) fn apply_schema(array: &dyn Array, schema: &DataType) -> KernelResult<RecordBatch> {
     let DataType::Struct(struct_schema) = schema else {
         return Err(KernelError::generic(
@@ -40,6 +44,17 @@ pub(crate) fn apply_schema(array: &dyn Array, schema: &DataType) -> KernelResult
         ));
     };
     let applied = apply_schema_to_struct(array, struct_schema)?;
+    let applied = if applied.null_count() > 0 {
+        if let Some(field) = struct_schema.fields().find(|field| !field.is_nullable()) {
+            return Err(make_arrow_error(format!(
+                "Column '{}' is declared as non-nullable but contains null values",
+                field.name()
+            )));
+        }
+        fix_nested_null_masks(applied)
+    } else {
+        applied
+    };
     // Zero-column batches still need an explicit row count.
     let num_rows = applied.len();
     let (fields, columns, _nulls) = applied.into_parts();
@@ -538,6 +553,7 @@ mod apply_schema_validation_tests {
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema, TimeUnit,
         TimestampMicrosecondType,
     };
+    use crate::arrow::error::ArrowError;
     #[cfg(feature = "udt-in-dev")]
     use crate::engine::arrow_conversion::TryIntoArrow as _;
     use crate::engine::arrow_utils::{ReorderIndex, list_type_with_element, reorder_struct_array};
@@ -551,6 +567,49 @@ mod apply_schema_validation_tests {
         array_in_map_with_field_ids, assert_result_error_with_message,
         collect_arrow_field_metadata, complex_nested_with_field_ids,
     };
+
+    /// Flattening `{ value: 8 }` beneath a NULL root requires a nullable output field.
+    /// A non-nullable target must produce an error instead of exposing the hidden value or
+    /// silently widening the requested schema.
+    #[test]
+    fn apply_schema_root_nulls_reject_non_nullable_output() {
+        let input = StructArray::new(
+            vec![ArrowField::new("value", ArrowDataType::Int32, false)].into(),
+            vec![Arc::new(Int32Array::from(vec![7, 8]))],
+            Some(NullBuffer::from(vec![true, false])),
+        );
+        let target = DataType::from(schema! { not_null "value": INTEGER });
+        let Err(error) = apply_schema(&input, &target) else {
+            panic!("expected non-nullable output to reject root nulls");
+        };
+        assert!(
+            matches!(
+                error.without_backtrace(),
+                KernelError::Arrow(ArrowError::InvalidArgumentError(_))
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn apply_schema_root_nulls_allow_non_nullable_child_of_nullable_struct() {
+        let inner = StructArray::new(
+            vec![ArrowField::new("value", ArrowDataType::Int32, false)].into(),
+            vec![Arc::new(Int32Array::from(vec![7, 8]))],
+            None,
+        );
+        let input = StructArray::new(
+            vec![ArrowField::new("nested", inner.data_type().clone(), false)].into(),
+            vec![Arc::new(inner)],
+            Some(NullBuffer::from(vec![true, false])),
+        );
+        let target = DataType::from(schema! { nullable "nested": { not_null "value": INTEGER } });
+        let batch = apply_schema(&input, &target).unwrap();
+        let nested = batch.column(0).as_struct();
+        assert!(!nested.fields()[0].is_nullable());
+        assert!(nested.is_valid(0));
+        assert!(nested.is_null(1));
+    }
 
     /// Verifies that applying a UDT schema restores logical child nullability without changing
     /// its physical container shape.
@@ -871,12 +930,9 @@ mod apply_schema_validation_tests {
         }
     }
 
-    /// Test that apply_schema handles structs with top-level nulls correctly.
-    ///
-    /// This simulates a Delta log scenario where each row is one action type (add, remove, etc.).
-    /// When extracting `add.stats_parsed`, rows where `add` is null (e.g., remove actions) should
-    /// have null child columns. The child columns are expected to already have nulls propagated
-    /// (Arrow's JSON reader does this, and parquet data goes through `fix_nested_null_masks`).
+    /// Applying root NULLs preserves child arrays that already contain those NULLs.
+    /// For example, `[1, NULL, 3, NULL]` remains unchanged under parent validity
+    /// `[true, false, true, false]`.
     #[test]
     fn test_apply_schema_handles_top_level_nulls() {
         // Create a struct array with 4 rows where rows 1 and 3 have top-level nulls.

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
+import tempfile
+import unittest
 from pathlib import Path
 
 
@@ -58,3 +60,18 @@ def test_non_dispatch_tool_is_unchanged(tmp_path: Path) -> None:
     assert evaluate({"type": "tool_call", "target": "sys_read_inbox"}) == {
         "result": "ALLOW"
     }
+
+
+class ReviewContextPolicyTest(unittest.TestCase):
+    def test_dispatch_drops_model_and_reasoning_effort_overrides(self) -> None:
+        event = _dispatch("review it")
+        event["data"]["arguments"]["args"].update(
+            model="another-model", reasoning_effort="max"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            context_path = Path(tmp) / "review-context.txt"
+            context_path.write_text("Head SHA: abc123\n")
+            result = _load_policy().inject_review_context(context_path=str(context_path))(event)
+
+        self.assertEqual(result["result"], "ALLOW")
+        self.assertEqual(set(result["data"]["args"]), {"input", "purpose"})

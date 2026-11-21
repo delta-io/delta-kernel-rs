@@ -90,6 +90,7 @@ pub enum FFIKernelError {
     CommitRangeError = 55,
     InvalidIntervalError = 56,
     UnsupportedFileUriError = 57,
+    UnsupportedReferencedFilePathError = 58,
 }
 
 impl From<KernelError> for FFIKernelError {
@@ -149,6 +150,9 @@ impl From<&KernelError> for FFIKernelError {
             KernelError::InvalidDecimal(_) => FFIKernelError::InvalidDecimalError,
             KernelError::InvalidInterval(_) => FFIKernelError::InvalidIntervalError,
             KernelError::UnsupportedFileUri(_) => FFIKernelError::UnsupportedFileUriError,
+            KernelError::UnsupportedReferencedFilePath(_) => {
+                FFIKernelError::UnsupportedReferencedFilePathError
+            }
             KernelError::InvalidGeoParams(_) => FFIKernelError::InvalidGeoParamsError,
             KernelError::InvalidStructData(_) => FFIKernelError::InvalidStructDataError,
             KernelError::InternalError(_) => FFIKernelError::InternalError,
@@ -347,6 +351,9 @@ impl From<EngineExecError> for KernelError {
             FFIKernelError::InvalidDecimalError => KernelError::InvalidDecimal(message),
             FFIKernelError::InvalidIntervalError => KernelError::InvalidInterval(message),
             FFIKernelError::UnsupportedFileUriError => KernelError::UnsupportedFileUri(message),
+            FFIKernelError::UnsupportedReferencedFilePathError => {
+                KernelError::UnsupportedReferencedFilePath(message)
+            }
             FFIKernelError::InvalidGeoParamsError => KernelError::InvalidGeoParams(message),
             FFIKernelError::InvalidStructDataError => KernelError::InvalidStructData(message),
             FFIKernelError::InvalidExpression => KernelError::InvalidExpressionEvaluation(message),
@@ -585,6 +592,29 @@ mod error_code_tests {
         let err: KernelError =
             exec_error(FFIKernelError::UnsupportedFileUriError, "invalid").into();
         assert!(matches!(err, KernelError::UnsupportedFileUri(message) if message == "invalid"));
+    }
+
+    #[test]
+    fn unsupported_referenced_file_path_error_has_stable_ffi_mapping() {
+        assert_eq!(
+            FFIKernelError::from(KernelError::UnsupportedReferencedFilePath(
+                "invalid".to_string()
+            )),
+            FFIKernelError::UnsupportedReferencedFilePathError
+        );
+        assert_eq!(
+            FFIKernelError::UnsupportedReferencedFilePathError as i32,
+            58
+        );
+
+        let err: KernelError = exec_error(
+            FFIKernelError::UnsupportedReferencedFilePathError,
+            "invalid",
+        )
+        .into();
+        assert!(
+            matches!(err, KernelError::UnsupportedReferencedFilePath(message) if message == "invalid")
+        );
     }
 
     #[test]

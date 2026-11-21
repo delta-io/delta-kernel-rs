@@ -23,7 +23,7 @@ use crate::expressions::{
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::get_scan_metadata_transform_expr;
 use crate::scan::{restored_add_schema, scan_row_schema};
-use crate::schema::{ArrayType, SchemaRef, StructField, ToSchema, lazy_schema_ref};
+use crate::schema::{ArrayType, SchemaRef, ToSchema, lazy_schema_ref};
 use crate::table_features::TableFeature;
 use crate::{DataType, Engine, Expression, KernelResult, KernelResultIterator};
 
@@ -531,11 +531,6 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
         getters: &[&'a dyn GetData<'a>],
         rows: RowIndexIterator<'_>,
     ) -> KernelResult<()> {
-        static DV_SCHEMA_FIELDS: LazyLock<Vec<StructField>> = LazyLock::new(|| {
-            DeletionVectorDescriptor::to_schema()
-                .into_fields()
-                .collect()
-        });
         let num_rows = rows.num_rows();
         self.new_entries.reserve(num_rows);
         for row_index in rows {
@@ -595,7 +590,7 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                     })?
                 };
                 let deletion_vector = Scalar::Struct(StructData::try_new(
-                    DV_SCHEMA_FIELDS.clone(),
+                    DeletionVectorDescriptor::schema_ref().clone(),
                     vec![
                         Scalar::from(dv_result.storage_type.to_string()),
                         Scalar::from(dv_result.path_or_inline_dv.clone()),

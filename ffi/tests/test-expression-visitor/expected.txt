@@ -101,6 +101,8 @@ StructExpression
     Integer(42)
     Double(1.111000)
   Unknown(mystery)
+  UriEncodeFileLocation
+    Column(location)
   MapToStruct
     Column(pv)
   MapToStruct(timestamp_timezone=America/Los_Angeles)
@@ -160,6 +162,8 @@ And
   Not
     IsNull
       Column(col)
+  HasUriScheme
+    Column(location)
   OpaquePredicate(bar)
     Integer(42)
     Double(1.111000)

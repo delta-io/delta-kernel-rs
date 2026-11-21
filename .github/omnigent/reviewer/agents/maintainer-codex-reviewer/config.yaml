@@ -2,9 +2,12 @@ spec_version: 1
 name: maintainer-codex-reviewer
 description: 'Codex maintainer-level Rust + Delta protocol review.'
 skills: none
+tool_groups:
+  projects: false
 executor:
   type: omnigent
   model: maintainer-codex
+  reasoning_effort: medium
   config:
     harness: codex
 instructions: REVIEW.md

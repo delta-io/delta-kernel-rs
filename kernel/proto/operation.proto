@@ -45,6 +45,8 @@ message FileSlice {
 
 message FileListing {
   string url = 1;
+  // Exclusive upper bound; omit for an unbounded listing. Older executors may ignore this field.
+  optional string end = 2;
 }
 
 message ReadBytes {

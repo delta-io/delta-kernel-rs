@@ -2,9 +2,12 @@ spec_version: 1
 name: delta-protocol-reviewer
 description: 'Audits changes for Delta protocol compliance.'
 skills: none
+tool_groups:
+  projects: false
 executor:
   type: omnigent
   model: default
+  reasoning_effort: medium
   config:
     harness: claude-sdk
 instructions: REVIEW.md

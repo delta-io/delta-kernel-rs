@@ -265,9 +265,9 @@ pub(crate) fn fixup_parquet_read(
 }
 
 /// Fails if a `file` value in `batch` is invalid for a writer to write: it breaks a rule reads
-/// apply (see [`fixup_parquet_read`]) or has a malformed `checksum`, so a writer never writes a
-/// data file that readers reject. Columns are matched to `kernel_schema` by name, and a `file`
-/// column missing from `batch` is an error.
+/// apply (see [`fixup_parquet_read`]), its `uri` breaks the URI resolution rules, or it has a
+/// malformed `checksum`, so a writer never writes a data file that readers reject. Columns are
+/// matched to `kernel_schema` by name, and a `file` column missing from `batch` is an error.
 #[internal_api]
 pub(crate) fn validate_file_values_for_write(
     batch: &RecordBatch,
