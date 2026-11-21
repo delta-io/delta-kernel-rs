@@ -3,13 +3,18 @@
 //! of the stats struct for that ID in `content_stats`. The IDs are recorded in the
 //! `delta.adaptiveMetadata` domain.
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 use crate::actions::{CheckpointAction, DomainMetadata};
 use crate::{KernelError, KernelResult};
 
 /// The domain whose configuration maps file metadata fields to their IDs.
 pub(crate) const ADAPTIVE_METADATA_DOMAIN_NAME: &str = "delta.adaptiveMetadata";
+
+/// The key of the field ID mapping in the `delta.adaptiveMetadata` configuration.
+pub(crate) const FILE_METADATA_FIELD_IDS: &str = "fileMetadataFieldIds";
 
 /// The field IDs of the file metadata fields a table maps. The default maps none.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -27,16 +32,27 @@ struct AdaptiveMetadataConfiguration {
     file_metadata_field_ids: FileMetadataFieldIds,
 }
 
+/// Parses the configuration string of the `delta.adaptiveMetadata` domain.
+fn parse_configuration<T: DeserializeOwned>(configuration: &str) -> Result<T, String> {
+    serde_json::from_str(configuration).map_err(|err| {
+        format!(
+            "{ADAPTIVE_METADATA_DOMAIN_NAME} configuration is not valid: {err}, \
+             found {configuration}"
+        )
+    })
+}
+
+/// Parses the `delta.adaptiveMetadata` configuration as a raw JSON object. Keys Kernel does not
+/// recognize are kept, so a writer that copies or rewrites the configuration preserves them.
+pub(crate) fn configuration_object(configuration: &str) -> Result<Map<String, Value>, String> {
+    parse_configuration(configuration)
+}
+
 impl FileMetadataFieldIds {
-    /// Parses the configuration string of the `delta.adaptiveMetadata` domain.
+    /// Reads the mapping from a `delta.adaptiveMetadata` configuration, failing if the
+    /// configuration does not parse.
     pub(crate) fn try_from_configuration(configuration: &str) -> Result<Self, String> {
-        let config: AdaptiveMetadataConfiguration =
-            serde_json::from_str(configuration).map_err(|err| {
-                format!(
-                    "{ADAPTIVE_METADATA_DOMAIN_NAME} configuration is not valid: {err}, \
-                     found {configuration}"
-                )
-            })?;
+        let config: AdaptiveMetadataConfiguration = parse_configuration(configuration)?;
         Ok(config.file_metadata_field_ids)
     }
 
@@ -111,6 +127,16 @@ mod tests {
         let err = FileMetadataFieldIds::try_from_configuration(configuration).unwrap_err();
         assert!(err.starts_with(ADAPTIVE_METADATA_DOMAIN_NAME), "{err}");
         assert!(err.contains(configuration), "{err}");
+    }
+
+    #[test]
+    fn configuration_object_keeps_unrecognized_keys() {
+        let object = configuration_object(
+            r#"{"fileMetadataFieldIds":{"clusteringProvider":100,"other":5},"version":2}"#,
+        )
+        .unwrap();
+        assert_eq!(object["fileMetadataFieldIds"]["other"], 5);
+        assert_eq!(object["version"], 2);
     }
 
     #[rstest]
