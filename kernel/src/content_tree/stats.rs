@@ -60,7 +60,7 @@ const STATS_SPACE_FIELD_ID_END: i32 = 200_000_000;
 const MAX_DATA_STATS_FIELD_ID: i32 = STATS_SPACE_FIELD_ID_END - NUM_SUPPORTED_STATS_PER_COLUMN;
 
 /// The maximum data field ID whose stats struct fits within the reserved range.
-const MAX_DATA_FIELD_ID: i32 = (MAX_DATA_STATS_FIELD_ID
+pub(crate) const MAX_DATA_FIELD_ID: i32 = (MAX_DATA_STATS_FIELD_ID
     - STATS_SPACE_FIELD_ID_START_FOR_DATA_FIELDS)
     / NUM_SUPPORTED_STATS_PER_COLUMN;
 
@@ -120,11 +120,40 @@ const DATA_SPACE: StatsSpace = StatsSpace {
 pub(crate) fn field_id_to_statistics_base(field_id: i32) -> Option<i32> {
     if SUPPORTED_METADATA_FIELD_IDS.contains(&field_id) {
         Some(METADATA_SPACE.base(field_id))
-    } else if (0..=MAX_DATA_FIELD_ID).contains(&field_id) {
+    } else if is_data_field_id(field_id) {
         Some(DATA_SPACE.base(field_id))
     } else {
         None
     }
+}
+
+/// Whether `field_id` is a data field ID, one whose stats struct fits in the stats field ID range.
+/// Reserved metadata field IDs are not data field IDs, even though they have stats.
+pub(crate) fn is_data_field_id(field_id: i32) -> bool {
+    (0..=MAX_DATA_FIELD_ID).contains(&field_id)
+}
+
+/// Builds the `content_stats` field that holds the value of a file metadata field with ID
+/// `field_id`, named `#{key}`. The field's only sub-field is `lower_bound`, a string, which carries
+/// the value. Returns `None` unless `field_id` is a data field ID (see [`is_data_field_id`]).
+pub(crate) fn file_metadata_stats_field(key: &str, field_id: i32) -> Option<StructField> {
+    if !is_data_field_id(field_id) {
+        return None;
+    }
+    let base_id = DATA_SPACE.base(field_id);
+    let categories = StatCategories {
+        null_count: false,
+        min_values: true,
+        max_values: false,
+    };
+    let stats = build_stats_struct(base_id, &DataType::STRING, Some(categories));
+    // `ColumnName` escapes `#` in Delta stats struct names, so this name never collides with one.
+    Some(field_with_id(
+        &format!("#{key}"),
+        stats.into(),
+        true,
+        base_id,
+    ))
 }
 
 /// Creates a physical-schema [`StructField`] carrying the Iceberg/Parquet field ID.
@@ -1006,6 +1035,39 @@ mod tests {
     #[case(2_147_483_646)] // _file (unsupported reserved metadata)
     fn field_id_to_statistics_base_rejects_invalid(#[case] field_id: i32) {
         assert_eq!(field_id_to_statistics_base(field_id), None);
+    }
+
+    #[test]
+    fn file_metadata_stats_field_holds_lower_bound_at_data_stats_base() {
+        let field = file_metadata_stats_field("clusteringProvider", 100).unwrap();
+        assert_eq!(field.name(), "#clusteringProvider");
+        assert_eq!(get_field_id(&field), Some(30_000));
+        let DataType::Struct(stats) = field.data_type() else {
+            panic!("file metadata stats must be a struct");
+        };
+        let sub_fields: Vec<_> = stats
+            .fields()
+            .map(|f| {
+                (
+                    f.name().as_str(),
+                    get_field_id(f).unwrap(),
+                    f.data_type().clone(),
+                )
+            })
+            .collect();
+        assert_eq!(sub_fields, [(LOWER_BOUND, 30_001, DataType::STRING)]);
+    }
+
+    /// File metadata field IDs that `file_metadata_stats_field` must reject.
+    #[rstest]
+    #[case(-1)]
+    #[case(MAX_DATA_FIELD_ID + 1)]
+    #[case(ROW_ID_FIELD_ID)]
+    fn file_metadata_stats_field_rejects_non_data_ids(#[case] field_id: i32) {
+        assert_eq!(
+            file_metadata_stats_field("clusteringProvider", field_id),
+            None
+        );
     }
 
     /// Returns the stats struct named `name` (the flat dotted output key) in `stats`, panicking if
