@@ -176,8 +176,9 @@ mod tests {
                 assert_eq!(event.replay_base, Some(ReplayBase::Crc));
                 assert!(event.checkpoint.is_none());
                 let bounds = (target_version > version).then_some((version + 1, target_version));
+                let report = &event.metadata_plan;
                 assert_eq!(
-                    event.commit_start_version.zip(event.commit_end_version),
+                    report.commit_start_version.zip(report.commit_end_version),
                     bounds
                 );
             },

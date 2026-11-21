@@ -177,10 +177,10 @@ pub(super) fn with_event<F: FnOnce(MetricEvent)>(
             checkpoint: checkpoint
                 .as_ref()
                 .map_or(std::ptr::null(), std::ptr::from_ref),
-            commit_start_version: event.commit_start_version.into(),
-            commit_end_version: event.commit_end_version.into(),
-            commit_total_size_bytes: event.commit_total_size_bytes,
-            compaction_file_count: event.compaction_file_count,
+            commit_start_version: event.metadata_plan.commit_start_version.into(),
+            commit_end_version: event.metadata_plan.commit_end_version.into(),
+            commit_total_size_bytes: event.metadata_plan.commit_total_size_bytes,
+            compaction_file_count: event.metadata_plan.compaction_file_count,
         };
         f(if *failed {
             MetricEvent::ScanPlanGenerationFailed(&record)
@@ -257,10 +257,12 @@ mod tests {
                 sidecar_footer_calls: 0,
                 metadata_query_calls: 0,
             }),
-            commit_start_version: with_checkpoint.then_some(0),
-            commit_end_version: with_checkpoint.then_some(0),
-            commit_total_size_bytes: 0,
-            compaction_file_count: 0,
+            metadata_plan: kernel::MetadataPlanReport {
+                commit_start_version: with_checkpoint.then_some(0),
+                commit_end_version: with_checkpoint.then_some(0),
+                commit_total_size_bytes: 0,
+                compaction_file_count: 0,
+            },
         };
         let source = if failed {
             kernel::MetricEvent::ScanPlanGenerationFailed(event.clone())
