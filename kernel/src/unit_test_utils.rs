@@ -96,7 +96,7 @@ impl CapturingReporter {
 #[cfg(feature = "declarative-plans")]
 pub(crate) fn assert_scan_plan_metrics<T>(
     generate: impl FnOnce() -> T,
-    check: impl FnOnce(&crate::metrics::ScanPlanGenerationCompleted),
+    check: impl FnOnce(&crate::metrics::ScanPlanReport),
 ) -> T {
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
@@ -105,7 +105,8 @@ pub(crate) fn assert_scan_plan_metrics<T>(
     let reports: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
-            MetricEvent::ScanPlanGenerationCompleted(event) => Some(event),
+            MetricEvent::ScanPlanGenerationCompleted(event)
+            | MetricEvent::ScanPlanGenerationFailed(event) => Some(event),
             _ => None,
         })
         .collect();
@@ -126,7 +127,9 @@ pub(crate) fn is_io_event(event: &MetricEvent) -> bool {
         | MetricEvent::StorageCopyCompleted(_)
         | MetricEvent::JsonReadCompleted(_)
         | MetricEvent::ParquetReadCompleted(_) => true,
-        MetricEvent::ScanPlanGenerationCompleted(_) => false,
+        MetricEvent::ScanPlanGenerationCompleted(_) | MetricEvent::ScanPlanGenerationFailed(_) => {
+            false
+        }
         MetricEvent::LogSegmentLoadSuccess(_)
         | MetricEvent::LogSegmentLoadFailure(_)
         | MetricEvent::ProtocolMetadataLoadSuccess(_)

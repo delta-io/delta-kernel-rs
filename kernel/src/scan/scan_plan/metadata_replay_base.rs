@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::actions::Add;
 use crate::checkpoint::CheckpointInfo;
-use crate::metrics::{CheckpointMetrics, ReplayBase, ScanPlanGenerationCompleted};
+use crate::metrics::{CheckpointMetrics, ReplayBase, ScanPlanReport};
 use crate::{Engine, KernelResult, Snapshot, Version};
 
 /// Reconciled table state from which metadata replay starts.
@@ -19,7 +19,11 @@ pub(in crate::scan) enum MetadataReplayBase {
 impl MetadataReplayBase {
     /// Select the newest eligible metadata base and resolve checkpoint information only when
     /// needed.
-    pub(in crate::scan) fn try_new(snapshot: &Snapshot, engine: &dyn Engine) -> KernelResult<Self> {
+    pub(in crate::scan) fn try_new(
+        snapshot: &Snapshot,
+        engine: &dyn Engine,
+        report: &mut ScanPlanReport,
+    ) -> KernelResult<Self> {
         let checkpoint_version = snapshot.log_segment().checkpoint_version;
         // Keep replay eligibility independent of SnapshotCrc's validation.
         if let Some((version, files)) = snapshot
@@ -29,30 +33,31 @@ impl MetadataReplayBase {
                 checkpoint_version.is_none_or(|checkpoint| *version >= checkpoint)
             })
         {
-            ScanPlanGenerationCompleted::update(|event| event.replay_base = Some(ReplayBase::Crc));
+            report.replay_base = Some(ReplayBase::Crc);
             return Ok(Self::Crc {
                 version,
                 files: files.to_vec(),
             });
         }
 
-        ScanPlanGenerationCompleted::update(|event| {
-            event.replay_base = Some(if checkpoint_version.is_some() {
-                ReplayBase::Checkpoint
-            } else {
-                ReplayBase::Empty
-            });
-            event.checkpoint = checkpoint_version.map(|version| CheckpointMetrics {
-                version,
-                checkpoint_type: snapshot.known_checkpoint_type(),
-                info: None,
-                cache_hit: None,
-                root_footer_calls: 0,
-                sidecar_footer_calls: 0,
-                metadata_query_calls: 0,
-            });
+        report.replay_base = Some(if checkpoint_version.is_some() {
+            ReplayBase::Checkpoint
+        } else {
+            ReplayBase::Empty
         });
-        let info = snapshot.checkpoint_info(engine)?;
+        report.checkpoint = checkpoint_version.map(|version| CheckpointMetrics {
+            version,
+            checkpoint_type: snapshot.known_checkpoint_type(),
+            info: None,
+            cache_hit: None,
+            root_footer_calls: 0,
+            sidecar_footer_calls: 0,
+            metadata_query_calls: 0,
+        });
+        let info = snapshot.checkpoint_info(engine, &mut report.checkpoint)?;
+        if let Some(checkpoint) = &mut report.checkpoint {
+            checkpoint.info = info.clone();
+        }
         Ok(Self::Checkpoint {
             version: checkpoint_version,
             info,
@@ -114,7 +119,8 @@ mod tests {
         let crc = Some(crc);
         let snapshot = Arc::new(Snapshot::new_with_crc(segment, config, crc, false, false)?);
         let scan = snapshot.scan_builder().build()?;
-        let base = MetadataReplayBase::try_new(&scan.snapshot, &engine)?;
+        let base =
+            MetadataReplayBase::try_new(&scan.snapshot, &engine, &mut ScanPlanReport::new())?;
         assert_eq!(base.version(), Some(version));
         let is_crc = matches!(base, MetadataReplayBase::Crc { .. });
         assert_eq!(is_crc, has_all_files);

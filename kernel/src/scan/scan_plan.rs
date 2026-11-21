@@ -28,9 +28,7 @@ use crate::checkpoint::CheckpointInfo;
 use crate::expressions::{ColumnName, Predicate, lit};
 #[cfg(test)]
 use crate::expressions::{Expression as Expr, expr};
-use crate::metrics::ScanPlanGenerationCompleted;
-use crate::path::{LogPathFileType, ParsedLogPath};
-use crate::plans::ir::nodes::Operator;
+use crate::metrics::ScanPlanReport;
 use crate::plans::ir::plan::Plan;
 #[cfg(test)]
 use crate::schema::{
@@ -97,6 +95,7 @@ impl Scan {
         &self,
         base: MetadataReplayBase,
         mut planner: MetadataPlanner<'_>,
+        report: &mut ScanPlanReport,
     ) -> KernelResult<Option<Plan>> {
         let state = &self.state_info;
         if state.physical_predicate == PhysicalPredicate::StaticSkipAll {
@@ -112,44 +111,11 @@ impl Scan {
             }
         }?;
         // Keep commit removes through replay so they cancel older adds before selecting live files.
-        let commits = planner.commit_actions(base_version)?;
-        let plan = planner
+        let commits = planner.commit_actions(base_version, report)?;
+        planner
             .replay_actions(commits, checkpoint)?
             .project_patch(|patch| patch.drop(VERSION))?
-            .build_opt()?;
-        if let Some(plan) = &plan {
-            ScanPlanGenerationCompleted::update(|event| {
-                for node in &plan.nodes {
-                    let Operator::ScanJson(scan) = &node.op else {
-                        continue;
-                    };
-                    for file in &scan.files {
-                        let Some(path) = ParsedLogPath::new(file.meta.location.clone()) else {
-                            continue;
-                        };
-                        let end = match path.file_type {
-                            LogPathFileType::Commit | LogPathFileType::StagedCommit => path.version,
-                            LogPathFileType::CompactedCommit { hi } => {
-                                event.compaction_file_count += 1;
-                                hi
-                            }
-                            _ => continue,
-                        };
-                        event.commit_start_version = Some(
-                            event
-                                .commit_start_version
-                                .unwrap_or(path.version)
-                                .min(path.version),
-                        );
-                        event.commit_end_version =
-                            Some(event.commit_end_version.unwrap_or(end).max(end));
-                        event.commit_total_size_bytes =
-                            event.commit_total_size_bytes.saturating_add(file.meta.size);
-                    }
-                }
-            });
-        }
-        Ok(plan)
+            .build_opt()
     }
 
     #[cfg(test)]
@@ -162,7 +128,7 @@ impl Scan {
             version: self.snapshot.log_segment().checkpoint_version,
             info: shape.into().cloned().map(Arc::new),
         };
-        self.build_metadata_scan_plan_with(base, planner.clone())
+        self.build_metadata_scan_plan_with(base, planner.clone(), &mut ScanPlanReport::new())
     }
 }
 // === Helpers ===

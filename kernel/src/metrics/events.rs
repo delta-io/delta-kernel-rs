@@ -25,7 +25,7 @@ use tracing::span::Attributes;
 use tracing::warn;
 use uuid::Uuid;
 
-use super::{ScanPlanGenerationCompleted, ScanPlanOutcome};
+use super::{ScanPlanOutcome, ScanPlanReport};
 use crate::log_segment::LogSegment;
 
 // ====================================================================
@@ -115,7 +115,8 @@ pub enum MetricEvent {
     JsonReadCompleted(JsonReadCompleted),
     ParquetReadCompleted(ParquetReadCompleted),
     ScanMetadataCompleted(ScanMetadataCompleted),
-    ScanPlanGenerationCompleted(ScanPlanGenerationCompleted),
+    ScanPlanGenerationCompleted(ScanPlanReport),
+    ScanPlanGenerationFailed(ScanPlanReport),
     StorageListCompleted(StorageListCompleted),
     StorageReadCompleted(StorageReadCompleted),
     StorageCopyCompleted(StorageCopyCompleted),
@@ -125,9 +126,6 @@ impl MetricEvent {
     /// Set the wall-clock duration on lifecycle events.
     pub(crate) fn set_duration_if_applicable(&mut self, d: Duration) {
         match self {
-            Self::ScanPlanGenerationCompleted(e) => {
-                e.duration_ns = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
-            }
             // Lifecycle events receive elapsed time from the tracing layer.
             Self::SnapshotBuildSuccess(e) => e.set_duration(d),
             Self::SnapshotBuildFailure(e) => e.duration = d,
@@ -141,13 +139,15 @@ impl MetricEvent {
             Self::ChecksumWriteSuccess(e) => e.duration = d,
             Self::ChecksumWriteFailure(e) => e.duration = d,
 
-            // Emit-based events set their duration as a creation attribute, so the
-            // span-close hook must not overwrite it.
+            // Emit-based events already carry their duration, so the span-close hook must not
+            // overwrite it.
             Self::LogSegmentLoadSuccess(_)
             | Self::LogSegmentLoadFailure(_)
             | Self::ProtocolMetadataLoadSuccess(_)
             | Self::ProtocolMetadataLoadFailure(_)
             | Self::ScanMetadataCompleted(_)
+            | Self::ScanPlanGenerationCompleted(_)
+            | Self::ScanPlanGenerationFailed(_)
             | Self::StorageListCompleted(_)
             | Self::StorageReadCompleted(_)
             | Self::StorageCopyCompleted(_) => {}
@@ -177,7 +177,9 @@ impl MetricEvent {
             Self::ProtocolMetadataLoadSuccess(_) => Err(ProtocolMetadataLoadSuccess::SPAN_NAME),
             Self::SetTransactionLoadSuccess(_) => Err(SetTransactionLoadSuccess::SPAN_NAME),
             Self::LastCheckpointReadCompleted(_) => Err(LastCheckpointReadCompleted::SPAN_NAME),
-            Self::ScanPlanGenerationCompleted(_) => Err(ScanPlanGenerationCompleted::SPAN_NAME),
+            Self::ScanPlanGenerationCompleted(_) | Self::ScanPlanGenerationFailed(_) => {
+                Err(ScanPlanReport::SPAN_NAME)
+            }
             Self::ScanMetadataCompleted(_) => Err(ScanMetadataCompleted::SPAN_NAME),
             Self::JsonReadCompleted(_) => Err(JsonReadCompleted::SPAN_NAME),
             Self::ParquetReadCompleted(_) => Err(ParquetReadCompleted::SPAN_NAME),
@@ -213,7 +215,9 @@ impl MetricEvent {
             Self::LastCheckpointReadCompleted(_) => Err(LastCheckpointReadCompleted::SPAN_NAME),
             Self::CheckpointWriteSuccess(_) => Err(CheckpointWriteSuccess::SPAN_NAME),
             Self::ChecksumWriteSuccess(_) => Err(ChecksumWriteSuccess::SPAN_NAME),
-            Self::ScanPlanGenerationCompleted(_) => Err(ScanPlanGenerationCompleted::SPAN_NAME),
+            Self::ScanPlanGenerationCompleted(_) | Self::ScanPlanGenerationFailed(_) => {
+                Err(ScanPlanReport::SPAN_NAME)
+            }
             Self::ScanMetadataCompleted(_) => Err(ScanMetadataCompleted::SPAN_NAME),
             Self::JsonReadCompleted(_) => Err(JsonReadCompleted::SPAN_NAME),
             Self::ParquetReadCompleted(_) => Err(ParquetReadCompleted::SPAN_NAME),
@@ -273,9 +277,9 @@ impl MetricEvent {
     /// Marks a lifecycle event as failed when its span errors.
     pub(crate) fn into_failure(self) -> Self {
         match self {
-            Self::ScanPlanGenerationCompleted(mut e) => {
-                e.outcome = ScanPlanOutcome::Error;
-                Self::ScanPlanGenerationCompleted(e)
+            Self::ScanPlanGenerationCompleted(mut report) => {
+                report.outcome = ScanPlanOutcome::Error;
+                Self::ScanPlanGenerationFailed(report)
             }
             Self::LogSegmentLoadSuccess(e) => Self::LogSegmentLoadFailure(LogSegmentLoadFailure {
                 operation_id: e.operation_id,
@@ -348,6 +352,7 @@ impl MetricEvent {
             | Self::JsonReadCompleted(_)
             | Self::ParquetReadCompleted(_)
             | Self::ScanMetadataCompleted(_)
+            | Self::ScanPlanGenerationFailed(_)
             | Self::StorageListCompleted(_)
             | Self::StorageReadCompleted(_)
             | Self::StorageCopyCompleted(_)) => e,
@@ -380,7 +385,8 @@ impl fmt::Display for MetricEvent {
             Self::JsonReadCompleted(e) => e.fmt(f),
             Self::ParquetReadCompleted(e) => e.fmt(f),
             Self::ScanMetadataCompleted(e) => e.fmt(f),
-            Self::ScanPlanGenerationCompleted(e) => e.fmt(f),
+            Self::ScanPlanGenerationCompleted(e) => write!(f, "ScanPlanGenerationCompleted({e})"),
+            Self::ScanPlanGenerationFailed(e) => write!(f, "ScanPlanGenerationFailed({e})"),
             Self::StorageListCompleted(e) => e.fmt(f),
             Self::StorageReadCompleted(e) => e.fmt(f),
             Self::StorageCopyCompleted(e) => e.fmt(f),

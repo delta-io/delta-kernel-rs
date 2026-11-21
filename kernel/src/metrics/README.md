@@ -1,8 +1,11 @@
 # Kernel metrics
 
-Kernel emits metrics as `tracing` spans. A connector installs `ReportGeneratorLayer`
+Most Kernel metrics are emitted as `tracing` spans. A connector installs `ReportGeneratorLayer`
 (`reporter.rs`), which turns each span carrying the `report` field into a `MetricEvent`
-(`events.rs`) and hands it to the connector's `MetricsReporter`. Kernel does no aggregation.
+(`events.rs`) and hands it to the connector's `MetricsReporter`. Scan-plan generation passes a
+`ScanPlanReport` through planning and emits `ScanPlanGenerationCompleted` or
+`ScanPlanGenerationFailed` through the installed reporter; its span provides call frames and logs.
+Kernel does no aggregation.
 
 ## Two mechanisms
 

@@ -8,9 +8,7 @@ use tracing::span::{Attributes, Id, Record};
 use tracing::{Level, Span, Subscriber, event, warn};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
-use tracing_subscriber::registry::LookupSpan as _;
 
-use super::ScanPlanGenerationCompleted;
 use super::events::{
     CheckpointWriteSuccess, ChecksumWriteSuccess, CrcReadSuccess, DomainMetadataLoadSuccess,
     JsonReadCompleted, LastCheckpointReadCompleted, LogSegmentLoadSuccess, MetricEvent,
@@ -75,6 +73,15 @@ impl ReportGeneratorLayer {
     /// Create a new layer that forwards metric events to the given reporter.
     pub fn new(reporter: Arc<dyn MetricsReporter>) -> Self {
         Self { reporter }
+    }
+
+    #[allow(dead_code, reason = "Used by scan planning.")]
+    pub(crate) fn current_reporter() -> Option<Arc<dyn MetricsReporter>> {
+        tracing::dispatcher::get_default(|dispatch| {
+            dispatch
+                .downcast_ref::<Self>()
+                .map(|layer| layer.reporter.clone())
+        })
     }
 
     /// Apply `record` to the visitor stashed on `span`, then drain its pending warnings. Warnings
@@ -152,9 +159,6 @@ where
             ScanMetadataCompleted::SPAN_NAME => Some(MetricEvent::ScanMetadataCompleted(
                 ScanMetadataCompleted::from_attrs(attrs),
             )),
-            ScanPlanGenerationCompleted::SPAN_NAME => Some(
-                MetricEvent::ScanPlanGenerationCompleted(ScanPlanGenerationCompleted::new()),
-            ),
             STORAGE_SPAN => storage_metric_from_attrs(attrs),
             _ => None,
         };
@@ -220,25 +224,6 @@ where
             self.reporter.report(event);
         }
     }
-}
-
-/// Updates the nearest scan-plan event in the current tracing scope. Disabled reporting does
-/// not evaluate the update. Subscriber wrappers must expose their underlying tracing registry.
-pub(super) fn update_scan_plan(update: impl FnOnce(&mut ScanPlanGenerationCompleted)) {
-    Span::current().with_subscriber(|(id, dispatch)| {
-        let registry = dispatch.downcast_ref::<tracing_subscriber::Registry>()?;
-        for span in registry.span(id)?.scope() {
-            if let Some(EventVisitor {
-                event: Some(MetricEvent::ScanPlanGenerationCompleted(event)),
-                ..
-            }) = span.extensions_mut().get_mut::<EventVisitor>()
-            {
-                update(event);
-                break;
-            }
-        }
-        Some(())
-    });
 }
 
 // ====================================================================
@@ -359,7 +344,7 @@ mod tests {
     use crate::metrics::{
         CheckpointOutputStats, CheckpointProcessingStats, CheckpointWriteMode,
         CheckpointWriteOutcome, CheckpointWriteStats, CrcReadFailureReason,
-        LastCheckpointReadOutcome, MetricEvent, MetricId, ScanPlanGenerationCompleted,
+        LastCheckpointReadOutcome, MetricEvent, MetricId,
         WithMetricsReporterLayer as _,
     };
     use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
@@ -771,28 +756,5 @@ mod tests {
                 .any(|e| matches!(e, MetricEvent::SnapshotBuildFailure(_))),
             "a successful #[instrument(ret)] must not emit a failure event; got: {events:?}"
         );
-    }
-
-    #[test]
-    fn scan_plan_updates_nearest_parent_span_and_skips_disabled_reporting() {
-        tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
-            ScanPlanGenerationCompleted::update(|_| panic!("disabled update evaluated"));
-        });
-        let reporter = Arc::new(CapturingReporter::default());
-        let _guard = install_thread_local_metrics_reporter(reporter.clone());
-        let span = tracing::info_span!(
-            "scan.declarative_metadata_scan_plan",
-            report = tracing::field::Empty
-        );
-        let operation_id = MetricId::new();
-        {
-            let _entered = span.enter();
-            tracing::info_span!("child").in_scope(|| {
-                ScanPlanGenerationCompleted::update(|event| event.operation_id = operation_id);
-            });
-        }
-        drop(span);
-        assert!(matches!(reporter.events().as_slice(),
-            [MetricEvent::ScanPlanGenerationCompleted(event)] if event.operation_id == operation_id));
     }
 }
