@@ -66,7 +66,7 @@ impl SetTransactionScanner {
 /// Folds `actions`, a newest-first read with [`LOG_TXN_SCHEMA`], into the latest `txn` per
 /// application id, stopping early once `application_id` (if given) is found.
 // TODO: we could have this track _multiple_ application ids instead of only up to one.
-fn scan_application_transactions(
+pub(crate) fn scan_application_transactions(
     actions: impl Iterator<Item = KernelResult<ActionsBatch>>,
     application_id: Option<&str>,
 ) -> KernelResult<SetTransactionMap> {
