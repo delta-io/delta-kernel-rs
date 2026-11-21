@@ -137,7 +137,9 @@ fn read_tree_adds(
         stats: stats_request
             .map(|request| StatsRead::try_new(checkpoint, request))
             .transpose()?,
-        file_metadata: FileMetadataRead::try_new(FileMetadataFieldIds::default())?,
+        file_metadata: FileMetadataRead::try_new(FileMetadataFieldIds::try_from_checkpoint(
+            checkpoint,
+        )?)?,
     };
     let projector = ActionProjector::try_new(engine, ADD_NAME, ctx.add_schema(), read_schema)?;
     // The engine's handlers carry any cancellation token bound to this read.
