@@ -89,6 +89,10 @@ use crate::{
 /// declarative, relational plan algebra, without prescribing *how* to do it.
 pub trait PlanExecutor: AsAny {
     /// Executes the given declarative plan and returns the result.
+    ///
+    /// Errors should identify the failing operation and any known file or field. This applies
+    /// both to errors returned here and to errors yielded while consuming the result. Callers
+    /// can then add table, snapshot, and request context with [`KernelError::wrap_with_context`].
     fn execute_op(&self, op: Operation) -> KernelResult<PlanResult>;
 
     /// Reads a parquet file's footer (schema and, in future, row-group stats) via a

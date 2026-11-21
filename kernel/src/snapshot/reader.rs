@@ -104,8 +104,17 @@ impl<'a> SnapshotReader<'a> {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<Arc<CheckpointInfo>>> {
-        self.ensure_checkpoint_info_supported()?;
-        self.read(engine, |snapshot, engine| snapshot.checkpoint_info(engine))
+        self.read(engine, |snapshot, engine| {
+            self.ensure_checkpoint_info_supported()?;
+            snapshot.checkpoint_info(engine)
+        })
+        .map_err(|source| {
+            source.wrap_with_context(format!(
+                "Failed to read checkpoint information for table '{}' at snapshot {}",
+                self.snapshot.table_root(),
+                self.snapshot.version(),
+            ))
+        })
     }
 
     /// Sets the cancellation token for this reader's handler-backed reads.
