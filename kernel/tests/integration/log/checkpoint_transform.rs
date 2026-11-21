@@ -27,6 +27,8 @@ use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadEx
 use test_utils::{insert_data, read_scan, write_batch_to_table};
 use url::Url;
 
+use crate::common::write_utils::{checkpoint_engine, checkpoint_modes};
+
 /// Creates an in-memory store and the table root URL.
 fn new_in_memory_store() -> (Arc<InMemory>, Url) {
     (Arc::new(InMemory::new()), Url::parse("memory:///").unwrap())
@@ -90,13 +92,14 @@ fn build_commit(
 /// 4. Writes more data, then changes config to (json2, struct2)
 /// 5. Creates checkpoint 2 (reads from checkpoint 1 + new commits, exercises COALESCE)
 /// 6. Reads all data back and verifies correctness
-#[rstest::rstest]
+#[rstest_reuse::apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_checkpoint_stats_config_with_real_data(
     #[values(true, false)] json1: bool,
     #[values(true, false)] struct1: bool,
     #[values(true, false)] json2: bool,
     #[values(true, false)] struct2: bool,
+    declarative: bool,
 ) -> delta_kernel::Result<()> {
     let (store, table_root) = new_in_memory_store();
     let executor = Arc::new(TokioMultiThreadExecutor::new(
@@ -107,6 +110,8 @@ async fn test_checkpoint_stats_config_with_real_data(
             .with_task_executor(executor)
             .build(),
     );
+
+    let checkpoint_engine = checkpoint_engine(engine.clone(), Some(store.clone()), declarative);
 
     // Version 0: protocol + metadata with initial stats config
     write_commit(
@@ -131,7 +136,7 @@ async fn test_checkpoint_stats_config_with_real_data(
 
     // Checkpoint 1 with (json1, struct1) settings
     let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
-    snapshot.checkpoint(engine.as_ref(), None)?;
+    snapshot.checkpoint(checkpoint_engine.as_ref(), None)?;
 
     // Version 2: write more data
     let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
@@ -156,7 +161,7 @@ async fn test_checkpoint_stats_config_with_real_data(
 
     // Checkpoint 2 with (json2, struct2) settings (reads from checkpoint 1 + commits 2-3)
     let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
-    snapshot.checkpoint(engine.as_ref(), None)?;
+    snapshot.checkpoint(checkpoint_engine.as_ref(), None)?;
 
     // Read all data back and verify correctness
     let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
@@ -213,13 +218,14 @@ async fn test_checkpoint_stats_config_with_real_data(
 /// Two partition columns exercise different parsing paths:
 ///   - `created_at` (timestamp): "2024-01-15 10:30:00" → microseconds-since-epoch
 ///   - `tag` (binary): "hello" → raw bytes
-#[rstest::rstest]
+#[rstest_reuse::apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_checkpoint_partitioned_with_real_data(
     #[values(true, false)] json1: bool,
     #[values(true, false)] struct1: bool,
     #[values(true, false)] json2: bool,
     #[values(true, false)] struct2: bool,
+    declarative: bool,
 ) -> delta_kernel::Result<()> {
     let (store, table_root) = new_in_memory_store();
     let executor = Arc::new(TokioMultiThreadExecutor::new(
@@ -230,6 +236,8 @@ async fn test_checkpoint_partitioned_with_real_data(
             .with_task_executor(executor)
             .build(),
     );
+
+    let checkpoint_engine = checkpoint_engine(engine.clone(), Some(store.clone()), declarative);
 
     // Version 0: protocol + partitioned metadata with initial stats config
     write_commit(
@@ -274,7 +282,7 @@ async fn test_checkpoint_partitioned_with_real_data(
 
     // Checkpoint 1 with (json1, struct1) settings
     let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
-    snapshot.checkpoint(engine.as_ref(), None)?;
+    snapshot.checkpoint(checkpoint_engine.as_ref(), None)?;
 
     // Version 2: write data for partition created_at=2025-03-01 09:15:30.123456, tag=world
     let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
@@ -319,7 +327,7 @@ async fn test_checkpoint_partitioned_with_real_data(
 
     // Checkpoint 2 with (json2, struct2) settings (reads from checkpoint 1 + commits 2-3)
     let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
-    snapshot.checkpoint(engine.as_ref(), None)?;
+    snapshot.checkpoint(checkpoint_engine.as_ref(), None)?;
 
     // Verify partitionValues_parsed content directly in the checkpoint
     if struct2 {
@@ -430,8 +438,11 @@ const COLUMN_MAPPING_SCHEMA: &str = r#"{"type":"struct","fields":[{"name":"id","
 /// Verifies that `partitionValues_parsed` uses physical column names when column mapping
 /// is enabled. The checkpoint should contain `col-category-phys` (physical) not `category`
 /// (logical) as the field name inside `partitionValues_parsed`.
+#[rstest_reuse::apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_checkpoint_partition_values_parsed_with_column_mapping() -> delta_kernel::Result<()> {
+async fn test_checkpoint_partition_values_parsed_with_column_mapping(
+    declarative: bool,
+) -> delta_kernel::Result<()> {
     let (store, table_root) = new_in_memory_store();
     let executor = Arc::new(TokioMultiThreadExecutor::new(
         tokio::runtime::Handle::current(),
@@ -441,6 +452,8 @@ async fn test_checkpoint_partition_values_parsed_with_column_mapping() -> delta_
             .with_task_executor(executor)
             .build(),
     );
+
+    let checkpoint_engine = checkpoint_engine(engine.clone(), Some(store.clone()), declarative);
 
     // Version 0: protocol + metadata with column mapping and writeStatsAsStruct=true
     let protocol = json!({
@@ -491,7 +504,7 @@ async fn test_checkpoint_partition_values_parsed_with_column_mapping() -> delta_
 
     // Create checkpoint with writeStatsAsStruct=true
     let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
-    snapshot.checkpoint(engine.as_ref(), None)?;
+    snapshot.checkpoint(checkpoint_engine.as_ref(), None)?;
 
     // Read checkpoint and verify partitionValues_parsed uses physical name
     let checkpoint_path = Path::from("_delta_log/00000000000000000001.checkpoint.parquet");
@@ -559,9 +572,11 @@ const WIDE_SCHEMA: &str = r#"{"type":"struct","fields":[{"name":"id","type":"lon
 /// When a schema-evolved table has a checkpoint with stats_parsed covering only the
 /// pre-evolution columns, scanning with a predicate on a newly added column should
 /// not panic. The missing stats column should be treated as unknown (no data skipping).
+#[rstest_reuse::apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_scan_schema_evolved_table_with_checkpoint_predicate_on_new_column()
--> delta_kernel::Result<()> {
+async fn test_scan_schema_evolved_table_with_checkpoint_predicate_on_new_column(
+    declarative: bool,
+) -> delta_kernel::Result<()> {
     let (store, table_root) = new_in_memory_store();
     let executor = Arc::new(TokioMultiThreadExecutor::new(
         tokio::runtime::Handle::current(),
@@ -571,6 +586,8 @@ async fn test_scan_schema_evolved_table_with_checkpoint_predicate_on_new_column(
             .with_task_executor(executor)
             .build(),
     );
+
+    let checkpoint_engine = checkpoint_engine(engine.clone(), Some(store.clone()), declarative);
 
     // Version 0: protocol + metadata with schema [id, name], stats as struct enabled
     write_commit(
@@ -595,7 +612,7 @@ async fn test_scan_schema_evolved_table_with_checkpoint_predicate_on_new_column(
 
     // Checkpoint at V1: stats_parsed covers only [id, name]
     let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
-    snapshot.checkpoint(engine.as_ref(), None)?;
+    snapshot.checkpoint(checkpoint_engine.as_ref(), None)?;
 
     // Version 2: schema evolution - add `age` column via new metadata action
     write_commit(

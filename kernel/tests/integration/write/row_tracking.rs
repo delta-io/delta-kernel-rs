@@ -22,16 +22,16 @@ mod row_tracking_preservation {
     use delta_kernel::actions::deletion_vector_writer::KernelDeletionVector;
     use delta_kernel::arrow::array::{Array, ArrayRef, MapBuilder, StringArray, StringBuilder};
     use delta_kernel::schema::{DataType, SchemaRef, StructField};
+    use rstest_reuse::apply;
     use test_utils::delta_kernel_default_engine::DefaultEngine;
     use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
     use test_utils::{read_actions_from_commit, read_add_infos};
     use url::Url;
 
     use super::*;
-    use crate::common::read_utils::read_parquet_file;
     use crate::common::write_utils::{
-        create_dv_update_transaction, get_scan_files, set_table_properties,
-        write_deletion_vector_to_store,
+        checkpoint_engine, checkpoint_modes, create_dv_update_transaction, get_scan_files,
+        set_table_properties, write_deletion_vector_to_store,
     };
     use crate::features::row_tracking::setup_number_table_with_features;
 
@@ -456,7 +456,7 @@ mod row_tracking_preservation {
         Ok(())
     }
 
-    #[rstest::rstest]
+    #[apply(checkpoint_modes)]
     #[case::minimum_feature_set(&[("delta.enableRowTracking", "true")])]
     #[case::maximum_feature_set(&[
         ("delta.columnMapping.mode", "name"),
@@ -471,10 +471,12 @@ mod row_tracking_preservation {
     ])]
     #[tokio::test(flavor = "multi_thread")]
     async fn optimize_preserves_row_tracking_metadata_in_data_and_checkpoint(
+        declarative: bool,
         #[case] table_properties: &[(&str, &str)],
     ) -> delta_kernel::Result<()> {
         // === Write two source files ===
         let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+        let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
         let schema = schema_ref! { nullable "number": INTEGER };
         let snapshot = kernel_create_table(table_path.as_str(), schema, "Test/1.0", true)
             .with_table_properties(table_properties.iter().copied())
@@ -541,11 +543,21 @@ mod row_tracking_preservation {
         );
 
         // === Checkpoint the OPTIMIZE commit ===
-        optimized_snapshot.checkpoint(engine.as_ref(), None)?;
-        let checkpoint_path = std::path::Path::new(&table_path)
-            .join("_delta_log")
-            .join(format!("{optimize_version:020}.checkpoint.parquet"));
-        let checkpoint = read_parquet_file(&checkpoint_path);
+        optimized_snapshot.checkpoint(checkpoint_engine.as_ref(), None)?;
+        let checkpoint_snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+        assert_eq!(
+            checkpoint_snapshot.log_segment().checkpoint_version,
+            Some(optimize_version)
+        );
+        let writer = checkpoint_snapshot
+            .clone()
+            .create_checkpoint_writer(engine.as_ref())?;
+        let checkpoint_batches = writer
+            .checkpoint_data(engine.as_ref())?
+            .map(|batch| Ok(into_record_batch(batch?.apply_selection_vector()?)))
+            .collect::<KernelResult<Vec<_>>>()?;
+        let checkpoint = concat_batches(&checkpoint_batches[0].schema(), &checkpoint_batches)
+            .map_err(delta_kernel::KernelError::from)?;
         assert_eq!(
             collect_checkpoint_row_tracking_metadata(&checkpoint, "add"),
             vec![(5, 3)]
@@ -555,7 +567,6 @@ mod row_tracking_preservation {
             vec![(0, 1), (2, 2)]
         );
 
-        let checkpoint_snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
         assert_eq!(
             collect_rows(
                 &read_row_tracking_scan(

@@ -16,6 +16,8 @@ use test_utils::{
 };
 use url::Url;
 
+use crate::common::write_utils::{checkpoint_engine, checkpoint_modes};
+
 fn setup_test() -> (
     Arc<InMemory>,
     Arc<DefaultEngine<TokioBackgroundExecutor>>,
@@ -311,15 +313,17 @@ async fn log_tail_behind_filesystem() -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-#[rstest]
+#[rstest_reuse::apply(checkpoint_modes)]
 #[case::without_checkpoint(false)]
 #[case::with_checkpoint(true)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incremental_snapshot_skip_new_checkpoints_with_log_tail(
     #[case] with_checkpoint: bool,
+    declarative: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // ===== GIVEN =====
     let (storage, engine, table_url) = setup_test_mt();
+    let checkpoint_engine = checkpoint_engine(engine.clone(), Some(storage.clone()), declarative);
     let table_root = table_url.as_str();
 
     // commits 0, 1, 2 in storage (catalog-managed)
@@ -342,7 +346,9 @@ async fn incremental_snapshot_skip_new_checkpoints_with_log_tail(
         .build(engine.as_ref())?;
     assert_eq!(initial_snapshot.version(), 1);
     if with_checkpoint {
-        initial_snapshot.clone().checkpoint(engine.as_ref(), None)?;
+        initial_snapshot
+            .clone()
+            .checkpoint(checkpoint_engine.as_ref(), None)?;
         initial_snapshot = Snapshot::builder_for(table_root)
             .at_version(1)
             .with_max_catalog_version(2)
@@ -351,7 +357,7 @@ async fn incremental_snapshot_skip_new_checkpoints_with_log_tail(
             .at_version(2)
             .with_max_catalog_version(2)
             .build(engine.as_ref())?
-            .checkpoint(engine.as_ref(), None)?;
+            .checkpoint(checkpoint_engine.as_ref(), None)?;
     }
 
     // Add a published version 3 that the staged catalog commit will supersede.

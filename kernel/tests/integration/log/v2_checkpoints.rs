@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
@@ -21,6 +21,7 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{Engine, KernelError, Snapshot};
 use itertools::Itertools;
+use rstest_reuse::apply;
 use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
 use test_utils::{
     begin_transaction_with, create_add_files_metadata, create_table_and_load_snapshot, insert_data,
@@ -29,8 +30,8 @@ use test_utils::{
 
 use crate::common::read_utils::read_parquet_file;
 use crate::common::write_utils::{
-    get_simple_schema, load_existing_single_file_checkpoint_path, resolve_struct_field,
-    simple_id_batch,
+    checkpoint_engine, checkpoint_modes, get_simple_schema,
+    load_existing_single_file_checkpoint_path, resolve_struct_field, simple_id_batch,
 };
 
 fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> delta_kernel::Result<Vec<RecordBatch>> {
@@ -257,9 +258,11 @@ fn v2_checkpoints_parquet_with_last_checkpoint() -> delta_kernel::Result<()> {
 /// V2 checkpoints include a checkpointMetadata batch in addition to the regular action
 /// batches. All batches in a parquet file must share the same schema. This test verifies
 /// that `snapshot.checkpoint()` can write a V2 checkpoint without schema mismatch errors.
+#[apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_v2_checkpoint_parquet_write() -> delta_kernel::Result<()> {
+async fn test_v2_checkpoint_parquet_write(declarative: bool) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
     let schema = schema_ref! { nullable "value": INTEGER };
@@ -287,7 +290,7 @@ async fn test_v2_checkpoint_parquet_write() -> delta_kernel::Result<()> {
 
     // This writes to parquet — will fail if the checkpointMetadata batch has a different
     // schema than the action batches.
-    snapshot.checkpoint(engine.as_ref(), None)?;
+    snapshot.checkpoint(checkpoint_engine.as_ref(), None)?;
 
     // Verify the checkpoint was written and is used by a fresh snapshot
     let snapshot2 = Snapshot::builder_for(table_url).build(engine.as_ref())?;
@@ -329,20 +332,22 @@ async fn test_v2_checkpoint_parquet_write() -> delta_kernel::Result<()> {
 /// delta actions, writes a sidecar checkpoint, then adds more commits on top. Verifies
 /// `_last_checkpoint`, the checkpoint parquet contents, and performs a scan to verify the data
 /// is correct.
+#[apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_v2_checkpoint_with_sidecars() -> delta_kernel::Result<()> {
+async fn test_v2_checkpoint_with_sidecars(declarative: bool) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
     // === Step 1: Create V2 table with adds, removes, domain metadata, and set-transactions ===
     let snapshot = v2_table_with_domain_metadata_and_txn(&table_path, &table_url, &engine).await?;
     let version = snapshot.version() as i64;
 
-    // === Step 2: Write V2 checkpoint with sidecars (hint=2 splits actions across sidecars) ===
+    // === Step 2: Write V2 checkpoint with sidecars ===
     let checkpoint_spec = CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
         file_actions_per_sidecar_hint: Some(2),
     });
-    snapshot.checkpoint(engine.as_ref(), Some(&checkpoint_spec))?;
+    snapshot.checkpoint(checkpoint_engine.as_ref(), Some(&checkpoint_spec))?;
 
     // === Step 3: Add post-checkpoint commits (insert + domain metadata update) ===
     let info_field = Arc::new(ArrowField::new("name", ArrowDataType::Utf8, true));
@@ -374,16 +379,19 @@ async fn test_v2_checkpoint_with_sidecars() -> delta_kernel::Result<()> {
     let ckpt_file = load_existing_single_file_checkpoint_path(&table_path, version as _);
     let ckpt_file_size = std::fs::metadata(&ckpt_file).unwrap().len() as i64;
     let sidecars_dir_for_size = std::path::Path::new(&table_path).join("_delta_log/_sidecars");
-    let sidecars_total_size: i64 = list_sidecar_parquet_files(&sidecars_dir_for_size)
+    let sidecar_files = list_sidecar_parquet_files(&sidecars_dir_for_size);
+    let sidecars_total_size: i64 = sidecar_files
         .iter()
         .map(|e| e.metadata().unwrap().len() as i64)
         .sum();
 
     assert_eq!(last_ckpt["version"], version);
     // size = 1 protocol + 1 metadata + 8 adds + 8 removes + 3 domain metadata
-    //       + 2 set-transactions (app1 reconciled to the latest) + 1 checkpointMetadata
-    //       + 5 sidecar references = 29
-    assert_eq!(last_ckpt["size"].as_i64().unwrap(), 29);
+    //       + 2 reconciled set-transactions + 1 checkpointMetadata + sidecar references
+    assert_eq!(
+        last_ckpt["size"].as_i64().unwrap(),
+        24 + sidecar_files.len() as i64
+    );
     assert_eq!(
         last_ckpt["sizeInBytes"].as_i64().unwrap(),
         ckpt_file_size + sidecars_total_size
@@ -393,9 +401,8 @@ async fn test_v2_checkpoint_with_sidecars() -> delta_kernel::Result<()> {
     // === Step 5: Read raw checkpoint parquet and validate fields ===
     //   - Main checkpoint has sidecar, protocol, metadata, checkpointMetadata, domainMetadata, txn
     //   - Main checkpoint has NO add/remove actions (they live in sidecars)
-    //   - 5 sidecar references match the actual sidecar files on disk
+    //   - Sidecar references match the actual sidecar files on disk
     //   - Sidecar files contain only add/remove actions
-    //   - Per-sidecar distribution: 1 sidecar with 8 removes, 4 sidecars with 2 adds each
     //   - checkpointMetadata version matches checkpoint version
     //   - 3 reconciled domain metadata actions
     //   - 2 reconciled txn actions (`app1@3`, `app2@5`)
@@ -420,36 +427,31 @@ async fn test_v2_checkpoint_with_sidecars() -> delta_kernel::Result<()> {
     // Validate sidecar actions in the main checkpoint
     let sidecar_col = get_struct_column_from_record_batch(&ckpt_batch, "sidecar");
     let sidecar_rows = valid_row_indices(sidecar_col, ckpt_batch.num_rows());
-    // 1 sidecar for the bulk-remove batch (8 removes) + 4 sidecars for adds (2 each)
-    assert_eq!(
-        sidecar_rows.len(),
-        5,
-        "checkpoint should contain 5 sidecar action rows"
-    );
+    assert_eq!(sidecar_rows.len(), sidecar_files.len());
+    if !declarative {
+        // 1 sidecar for the bulk-remove batch + 4 sidecars for adds (2 each).
+        assert_eq!(sidecar_rows.len(), 5);
+    }
 
     assert_sidecar_actions_match_disk(sidecar_col, &sidecar_rows, &table_path, engine.as_ref());
 
     // Main checkpoint must NOT contain add/remove actions (they live in sidecars)
     for action in ["add", "remove"] {
-        let col = get_struct_column_from_record_batch(&ckpt_batch, action);
-        let rows = valid_row_indices(col, ckpt_batch.num_rows());
-        assert!(
-            rows.is_empty(),
-            "main checkpoint should not contain {action} actions when sidecars are used, \
-             but found {} rows",
-            rows.len()
-        );
+        if let Some(col) = ckpt_batch.column_by_name(action) {
+            assert!(
+                valid_row_indices(col.as_ref(), ckpt_batch.num_rows()).is_empty(),
+                "main checkpoint should not contain {action} actions when sidecars are used"
+            );
+        }
     }
 
     // Validate sidecar files contain ONLY add/remove file actions
     let sidecars_dir = std::path::Path::new(&table_path).join("_delta_log/_sidecars");
-    let per_sidecar = assert_sidecars_contain_only_file_actions(&sidecars_dir);
-    // 1 sidecar has 8 removes (bulk delete can't be split), 4 sidecars have 2 adds each
-    assert_eq!(
-        per_sidecar,
-        vec![(0, 8), (2, 0), (2, 0), (2, 0), (2, 0)],
-        "per-sidecar (adds, removes) distribution"
-    );
+    let per_sidecar = assert_sidecars_contain_only_file_actions(&sidecars_dir, (8, 8));
+    if !declarative {
+        // The imperative splitter keeps each input batch intact.
+        assert_eq!(per_sidecar, vec![(0, 8), (2, 0), (2, 0), (2, 0), (2, 0)]);
+    }
 
     // Validate checkpointMetadata action
     let ckpt_meta_col = get_struct_column_from_record_batch(&ckpt_batch, "checkpointMetadata");
@@ -579,9 +581,13 @@ async fn test_v2_checkpoint_with_sidecars() -> delta_kernel::Result<()> {
 /// E2E test: create a partitioned table with stats, write several commits, checkpoint,
 /// then read the raw checkpoint parquet to verify `stats_parsed`, `stats`, and
 /// `partitionValues_parsed` fields are correctly populated.
+#[apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_v2_checkpoint_partition_values_parsed_and_stats() -> delta_kernel::Result<()> {
+async fn test_v2_checkpoint_partition_values_parsed_and_stats(
+    declarative: bool,
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
     let snapshot2 = create_partitioned_stats_table(&table_path, &table_url, &engine).await?;
@@ -590,17 +596,14 @@ async fn test_v2_checkpoint_partition_values_parsed_and_stats() -> delta_kernel:
     let checkpoint_spec = CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
         file_actions_per_sidecar_hint: Some(1),
     });
-    snapshot2.checkpoint(engine.as_ref(), Some(&checkpoint_spec))?;
+    snapshot2.checkpoint(checkpoint_engine.as_ref(), Some(&checkpoint_spec))?;
 
     // === Validate sidecar structure ===
     let sidecars_dir = std::path::Path::new(&table_path).join("_delta_log/_sidecars");
-    let per_sidecar = assert_sidecars_contain_only_file_actions(&sidecars_dir);
-    // 2 adds with hint=1 -> 2 sidecars with 1 add each
-    assert_eq!(
-        per_sidecar,
-        vec![(1, 0), (1, 0)],
-        "per-sidecar (adds, removes) distribution"
-    );
+    let per_sidecar = assert_sidecars_contain_only_file_actions(&sidecars_dir, (2, 0));
+    if !declarative {
+        assert_eq!(per_sidecar, vec![(1, 0), (1, 0)]);
+    }
 
     // === Read sidecar files and validate stats_parsed, stats JSON, and partitionValues_parsed ===
     let sidecar_files = list_sidecar_parquet_files(&sidecars_dir);
@@ -752,7 +755,7 @@ async fn test_v2_checkpoint_partition_values_parsed_and_stats() -> delta_kernel:
 }
 
 /// Parameterized negative tests for writing v2 checkpoint with sidecars.
-#[rstest::rstest]
+#[apply(checkpoint_modes)]
 #[case::v2_spec_requires_v2checkpoint_feature(
     false,
     CheckpointSpec::V2(V2CheckpointConfig::NoSidecar),
@@ -768,11 +771,13 @@ async fn test_v2_checkpoint_partition_values_parsed_and_stats() -> delta_kernel:
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_checkpoint_spec_rejected(
+    declarative: bool,
     #[case] enable_v2checkpoint: bool,
     #[case] spec: CheckpointSpec,
     #[case] err_substring: &str,
 ) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
     let schema = schema_ref! { nullable "value": INTEGER };
@@ -787,7 +792,7 @@ async fn test_checkpoint_spec_rejected(
 
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
 
-    let result = snapshot.checkpoint(engine.as_ref(), Some(&spec));
+    let result = snapshot.checkpoint(checkpoint_engine.as_ref(), Some(&spec));
     let err_msg = result.expect_err("spec should be rejected").to_string();
     assert!(
         err_msg.contains(err_substring),
@@ -800,9 +805,13 @@ async fn test_checkpoint_spec_rejected(
 /// V2 checkpoint with sidecar on a table that has no file actions: the loop writes zero
 /// sidecar files, the main checkpoint contains no `sidecar` action rows, and `_last_checkpoint`
 /// reports `numOfAddFiles = 0` and `sizeInBytes` equal to the main checkpoint file size.
+#[apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_v2_sidecar_checkpoint_with_no_file_actions() -> delta_kernel::Result<()> {
+async fn test_v2_sidecar_checkpoint_with_no_file_actions(
+    declarative: bool,
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
     let schema = schema_ref! { nullable "value": INTEGER };
@@ -819,7 +828,7 @@ async fn test_v2_sidecar_checkpoint_with_no_file_actions() -> delta_kernel::Resu
     let spec = CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
         file_actions_per_sidecar_hint: Some(2),
     });
-    snapshot.checkpoint(engine.as_ref(), Some(&spec))?;
+    snapshot.checkpoint(checkpoint_engine.as_ref(), Some(&spec))?;
 
     // No sidecar files on disk: when there are no file actions, our writer should not even
     // create the `_sidecars` directory.
@@ -1052,8 +1061,10 @@ fn assert_sidecar_actions_match_disk(
         .join("_delta_log/_sidecars/")
         .unwrap();
 
+    let mut paths = HashSet::new();
     for &row in sidecar_rows {
         let path = sidecar_path_col.as_string::<i32>().value(row);
+        assert!(paths.insert(path), "duplicate sidecar reference: {path}");
         assert!(
             path.ends_with(".parquet"),
             "sidecar path should be a parquet file, got: {path}"
@@ -1093,6 +1104,7 @@ fn assert_sidecar_actions_match_disk(
 /// `(add_count, remove_count)` per sidecar.
 fn assert_sidecars_contain_only_file_actions(
     sidecars_dir: &std::path::Path,
+    expected_totals: (usize, usize),
 ) -> Vec<(usize, usize)> {
     let sidecar_files = list_sidecar_parquet_files(sidecars_dir);
     assert!(
@@ -1142,6 +1154,12 @@ fn assert_sidecars_contain_only_file_actions(
             .unwrap_or(0);
         per_sidecar_counts.push((adds, removes));
     }
+    assert_eq!(
+        per_sidecar_counts
+            .iter()
+            .fold((0, 0), |(adds, removes), (a, r)| (adds + a, removes + r)),
+        expected_totals
+    );
     per_sidecar_counts.sort();
     per_sidecar_counts
 }
@@ -1228,6 +1246,8 @@ async fn test_snapshot_checkpoint_default_on_v2_table(
 ) -> delta_kernel::Result<()> {
     let schema = get_simple_schema();
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    // Declarative V2 rejects inline checkpoints.
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, false);
     let mut snapshot = create_table_and_load_snapshot(
         &table_path,
         schema.clone(),
@@ -1244,7 +1264,7 @@ async fn test_snapshot_checkpoint_default_on_v2_table(
     .await?;
 
     let version = snapshot.version();
-    snapshot.checkpoint(engine.as_ref(), spec.as_ref())?;
+    snapshot.checkpoint(checkpoint_engine.as_ref(), spec.as_ref())?;
 
     let sidecars_dir = std::path::Path::new(&table_path).join("_delta_log/_sidecars");
     assert!(
@@ -1276,32 +1296,31 @@ async fn test_snapshot_checkpoint_default_on_v2_table(
 /// V2 sidecar checkpoint works end-to-end on a table that combines `v2Checkpoint` with
 /// one other feature/layout. After the checkpoint, a fresh snapshot loads from the
 /// checkpoint with no trailing commits and the scan returns the full 6-row dataset.
-#[rstest::rstest]
+#[apply(checkpoint_modes)]
 #[case::clustered(vec![CrossFeature::Clustered])]
 #[case::column_mapping_and_partitioned(vec![CrossFeature::ColumnMapping, CrossFeature::Partitioned])]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_v2_sidecar_checkpoint_cross_feature(
+    declarative: bool,
     #[case] features: Vec<CrossFeature>,
 ) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
     let snapshot = build_v2_table_with_feature(&table_path, &table_url, &engine, &features).await?;
     let version = snapshot.version();
 
-    // 3 add files with hint=2 -> 2 sidecars: one with 2 adds, one with 1 add.
     let spec = CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
         file_actions_per_sidecar_hint: Some(2),
     });
-    snapshot.checkpoint(engine.as_ref(), Some(&spec))?;
+    snapshot.checkpoint(checkpoint_engine.as_ref(), Some(&spec))?;
 
     let sidecars_dir = std::path::Path::new(&table_path).join("_delta_log/_sidecars");
-    let per_sidecar = assert_sidecars_contain_only_file_actions(&sidecars_dir);
-    assert_eq!(
-        per_sidecar,
-        vec![(1, 0), (2, 0)],
-        "per-sidecar (adds, removes) distribution does not match expected"
-    );
+    let per_sidecar = assert_sidecars_contain_only_file_actions(&sidecars_dir, (3, 0));
+    if !declarative {
+        assert_eq!(per_sidecar, vec![(1, 0), (2, 0)]);
+    }
 
     // Fresh snapshot loads from the checkpoint with no trailing commits.
     let fresh = Snapshot::builder_for(table_url).build(engine.as_ref())?;
@@ -1342,9 +1361,11 @@ async fn test_v2_sidecar_checkpoint_cross_feature(
 /// checkpoint, `_last_checkpoint` advances to the latest version, the fresh snapshot
 /// loads from that checkpoint with no trailing commits, and the scan returns the union
 /// of both write phases.
+#[apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_v2_sidecar_consecutive_checkpoints() -> delta_kernel::Result<()> {
+async fn test_v2_sidecar_consecutive_checkpoints(declarative: bool) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
     let schema = get_simple_schema();
@@ -1375,7 +1396,7 @@ async fn test_v2_sidecar_consecutive_checkpoints() -> delta_kernel::Result<()> {
     )
     .await?;
     let v_first = snapshot.version();
-    snapshot.checkpoint(engine.as_ref(), Some(&spec))?;
+    snapshot.checkpoint(checkpoint_engine.as_ref(), Some(&spec))?;
     assert_eq!(
         read_last_checkpoint(&table_path)["version"].as_u64(),
         Some(v_first),
@@ -1399,7 +1420,7 @@ async fn test_v2_sidecar_consecutive_checkpoints() -> delta_kernel::Result<()> {
     )
     .await?;
     let v_second = snapshot.version();
-    snapshot.checkpoint(engine.as_ref(), Some(&spec))?;
+    snapshot.checkpoint(checkpoint_engine.as_ref(), Some(&spec))?;
 
     // === Validate _last_checkpoint advanced and reflects all 4 add files. ===
     let last = read_last_checkpoint(&table_path);
@@ -1441,9 +1462,13 @@ async fn test_v2_sidecar_consecutive_checkpoints() -> delta_kernel::Result<()> {
 
 /// On a table with `deletionVectors` + `rowTracking` enabled, insert data, apply DV and write a
 /// V2 sidecar checkpoint. Scan back and make sure the DV and row-tracking columns are present.
+#[apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_v2_sidecar_preserves_dv_and_row_tracking_on_add() -> delta_kernel::Result<()> {
+async fn test_v2_sidecar_preserves_dv_and_row_tracking_on_add(
+    declarative: bool,
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     let schema = get_simple_schema();
 
@@ -1503,7 +1528,7 @@ async fn test_v2_sidecar_preserves_dv_and_row_tracking_on_add() -> delta_kernel:
 
     // === Step 4: Write a V2 sidecar checkpoint. ===
     snapshot.checkpoint(
-        engine.as_ref(),
+        checkpoint_engine.as_ref(),
         Some(&CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
             file_actions_per_sidecar_hint: None,
         })),
@@ -1542,14 +1567,16 @@ async fn test_v2_sidecar_preserves_dv_and_row_tracking_on_add() -> delta_kernel:
 }
 
 /// Verify the default `file_actions_per_sidecar_hint` (50_000): staging 60_000 add actions
-/// across 60 batches of 1000 (so the splitter cuts cleanly at the 50k boundary) must
-/// produce exactly 2 sidecar files.
+/// across 60 batches of 1000 produces exactly 2 sidecars imperatively. Declarative grouping
+/// is chosen by the executor and must preserve all file actions.
+#[apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_v2_sidecar_default_hint_splits_at_50k() -> delta_kernel::Result<()> {
+async fn test_v2_sidecar_default_hint_splits_at_50k(declarative: bool) -> delta_kernel::Result<()> {
     const PER_COMMIT: usize = 1_000;
     const COMMITS: usize = 60;
 
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
     // === Step 1: Create v2Checkpoint table. ===
@@ -1584,21 +1611,19 @@ async fn test_v2_sidecar_default_hint_splits_at_50k() -> delta_kernel::Result<()
 
     // === Step 3: Sidecar checkpoint with default hint (None -> 50_000). ===
     snapshot.checkpoint(
-        engine.as_ref(),
+        checkpoint_engine.as_ref(),
         Some(&CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
             file_actions_per_sidecar_hint: None,
         })),
     )?;
 
-    // === Step 4: 50 commits' worth (50k adds) fills the first sidecar at the 50k hint;
-    //     the remaining 10 commits (10k adds) go into the second sidecar. ===
+    // === Step 4: Validate file actions and the imperative splitter's default boundary. ===
     let sidecars_dir = std::path::Path::new(&table_path).join("_delta_log/_sidecars");
-    let per_sidecar = assert_sidecars_contain_only_file_actions(&sidecars_dir);
-    assert_eq!(
-        per_sidecar,
-        vec![(10_000, 0), (50_000, 0)],
-        "per-sidecar (adds, removes) distribution"
-    );
+    let per_sidecar =
+        assert_sidecars_contain_only_file_actions(&sidecars_dir, (PER_COMMIT * COMMITS, 0));
+    if !declarative {
+        assert_eq!(per_sidecar, vec![(10_000, 0), (50_000, 0)]);
+    }
     assert_eq!(
         read_last_checkpoint(&table_path)["numOfAddFiles"].as_i64(),
         Some((PER_COMMIT * COMMITS) as i64),
@@ -1720,6 +1745,8 @@ async fn build_v2_table_with_feature<E: TaskExecutor>(
 async fn snapshot_selects_uuid_checkpoint_over_classic_at_one_version() -> delta_kernel::Result<()>
 {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    // The selection test needs a classic inline checkpoint as its lower-ranked candidate.
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, false);
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
     let schema = schema_ref! { nullable "value": INTEGER };
@@ -1740,7 +1767,7 @@ async fn snapshot_selects_uuid_checkpoint_over_classic_at_one_version() -> delta
 
     // Writes `<version>.checkpoint.parquet` plus a `_last_checkpoint` describing it.
     snapshot.checkpoint(
-        engine.as_ref(),
+        checkpoint_engine.as_ref(),
         Some(&CheckpointSpec::V2(V2CheckpointConfig::NoSidecar)),
     )?;
 

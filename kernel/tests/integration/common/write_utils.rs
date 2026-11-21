@@ -19,12 +19,13 @@ use delta_kernel::actions::deletion_vector_writer::{
 use delta_kernel::actions::{MAX_VALUES, MIN_VALUES};
 use delta_kernel::arrow::array::{Int32Array, StructArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
+use delta_kernel::engine::DelegatingEngine;
+#[cfg(feature = "declarative-plans")]
+use delta_kernel::engine::PanicEngine;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 #[cfg(feature = "declarative-plans")]
 use delta_kernel::engine::sync::plan::SyncPlanExecutor;
-#[cfg(feature = "declarative-plans")]
-use delta_kernel::engine::{DelegatingEngine, PanicEngine};
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStore, ObjectStoreExt};
@@ -49,6 +50,32 @@ use uuid::Uuid;
 
 /// Deterministic placeholder for test commit JSON comparisons.
 pub const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
+
+#[cfg(feature = "declarative-plans")]
+#[rstest_reuse::template]
+#[rstest::rstest]
+fn checkpoint_modes(#[values(false, true)] declarative: bool) {}
+
+#[cfg(not(feature = "declarative-plans"))]
+#[rstest_reuse::template]
+#[rstest::rstest]
+fn checkpoint_modes(#[values(false)] declarative: bool) {}
+
+/// Selects checkpoint execution while retaining the supplied engine's handlers.
+pub fn checkpoint_engine(
+    inner: Arc<dyn Engine>,
+    store: Option<Arc<DynObjectStore>>,
+    declarative: bool,
+) -> Arc<dyn Engine> {
+    let engine = DelegatingEngine::new(inner).without_plan_executor();
+    #[cfg(feature = "declarative-plans")]
+    if declarative {
+        return Arc::new(engine.with_plan_executor(Arc::new(SyncPlanExecutor::new(store))));
+    }
+    #[cfg(not(feature = "declarative-plans"))]
+    let _ = (store, declarative);
+    Arc::new(engine)
+}
 
 /// Simulates an external writer by rewriting a complete local commit with `edit`.
 ///
