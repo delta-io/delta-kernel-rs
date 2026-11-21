@@ -115,10 +115,11 @@ impl CommitRange {
         self.start_version
     }
 
-    /// Last version (inclusive) in the range.
+    /// Last version (inclusive) in the range: the requested end version, else the maximum catalog
+    /// version, else the latest version found when the range was built.
     ///
-    /// An empty relaxed range retains its requested end version. If no end was requested and no
-    /// commits were observed, this returns [`Self::start_version`] as an anchor.
+    /// With commit range validation disabled, the end can be before the start, and a range with
+    /// neither bound that finds no commits returns [`Self::start_version`].
     pub fn end_version(&self) -> Version {
         self.end_version
     }
@@ -127,7 +128,8 @@ impl CommitRange {
     ///
     /// An empty relaxed range can still report a missing start version during `commit_files`
     /// iteration if a later observed commit proves the gap.
-    pub fn is_empty(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
         self.commit_files.is_empty()
     }
 
@@ -160,11 +162,16 @@ impl CommitRange {
                 "Commit file iteration is not supported for this range".to_string()
             )
         );
+        // A range that reaches its end needs no later commit to prove a gap, so a later version
+        // is only kept for an empty, short, or reversed range.
+        let reaches_end = self
+            .commit_files
+            .last()
+            .is_some_and(|file| file.version == self.end_version);
         Ok(CommitFileIterator {
             files: self.commit_files.clone().into_iter(),
             start_version: self.start_version,
-            end_version: self.end_version,
-            first_version_after_end: self.first_version_after_end,
+            first_version_after_end: self.first_version_after_end.filter(|_| !reaches_end),
             expected_version: Some(self.start_version),
             fail_on_data_loss: self.fail_on_data_loss,
             done: false,
@@ -261,7 +268,7 @@ impl CommitRange {
 struct CommitFileIterator {
     files: std::vec::IntoIter<ParsedLogPath>,
     start_version: Version,
-    end_version: Version,
+    /// Set only when the range stops short of its end, so any value proves a gap.
     first_version_after_end: Option<Version>,
     /// `None` once a file at `Version::MAX` was yielded, so no later version can be expected.
     expected_version: Option<Version>,
@@ -276,39 +283,36 @@ impl Iterator for CommitFileIterator {
         if self.done {
             return None;
         }
-        let file = self.files.next();
-        let observed_version = file
-            .as_ref()
-            .map(|file| file.version)
-            .or_else(|| self.first_version_after_end.take());
-        let Some(observed_version) = observed_version else {
+        let Some(file) = self.files.next() else {
             self.done = true;
-            return None;
+            let later_version = self.first_version_after_end.take()?;
+            return self.gap_error(later_version).map(Err);
         };
-        // R4: Only an observed successor proves data loss. Check the start even for reversed
-        // bounds, but do not require continuity beyond a fully consumed range's end.
-        if self.fail_on_data_loss
-            && let Some(expected) = self.expected_version
-            && (expected == self.start_version || expected <= self.end_version)
-            && expected != observed_version
-        {
+        if let Some(err) = self.gap_error(file.version) {
             self.done = true;
-            let err = if expected == self.start_version {
+            return Some(Err(err));
+        }
+        self.expected_version = file.version.checked_add(1);
+        Some(Ok(file))
+    }
+}
+
+#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+impl CommitFileIterator {
+    /// Returns the data-loss error for observing `observed` instead of the expected version, if
+    /// `fail_on_data_loss` is enabled and they differ.
+    fn gap_error(&self, observed: Version) -> Option<KernelError> {
+        let expected = self.expected_version?;
+        (self.fail_on_data_loss && expected != observed).then(|| {
+            if expected == self.start_version {
                 KernelError::StartVersionNotFound {
                     requested: self.start_version,
-                    earliest: observed_version,
+                    earliest: observed,
                 }
             } else {
                 KernelError::MissingVersion(expected)
-            };
-            return Some(Err(err));
-        }
-        let Some(file) = file else {
-            self.done = true;
-            return None;
-        };
-        self.expected_version = file.version.checked_add(1);
-        Some(Ok(file))
+            }
+        })
     }
 }
 
@@ -1522,6 +1526,7 @@ mod tests {
     #[case::empty_bounded(&[4], 5, Some(7), &[], &[], None)]
     #[case::empty_unbounded(&[4], 5, None, &[], &[], None)]
     #[case::reversed_start_present(&[7, 9], 7, Some(5), &[], &[], None)]
+    #[case::reversed_start_only(&[7], 7, Some(5), &[], &[], None)]
     #[case::reversed_empty(&[6], 7, Some(5), &[], &[], None)]
     #[case::reversed_start_missing(
         &[8], 7, Some(5), &[], &[],
@@ -1541,8 +1546,8 @@ mod tests {
         #[case] versions: &[Version],
         #[case] start_version: Version,
         #[case] end_version: Option<Version>,
-        #[case] available_versions: &[Version],
-        #[case] prefix_before_error: &[Version],
+        #[case] in_range_versions: &[Version],
+        #[case] yielded_before_error: &[Version],
         #[case] expected_err: Option<KernelError>,
         #[values(true, false)] fail_on_data_loss: bool,
     ) {
@@ -1555,16 +1560,16 @@ mod tests {
             .build(engine.as_ref())
             .unwrap();
         assert_eq!(range.start_version(), start_version);
-        assert_eq!(range.is_empty(), available_versions.is_empty());
+        assert_eq!(range.is_empty(), in_range_versions.is_empty());
         assert_eq!(
             range.end_version(),
             end_version
-                .unwrap_or_else(|| available_versions.last().copied().unwrap_or(start_version))
+                .unwrap_or_else(|| in_range_versions.last().copied().unwrap_or(start_version))
         );
         let (expected_versions, expected_err) = if fail_on_data_loss {
-            (prefix_before_error, expected_err)
+            (yielded_before_error, expected_err)
         } else {
-            (available_versions, None)
+            (in_range_versions, None)
         };
 
         let mut iter = range.commit_files().unwrap();

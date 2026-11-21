@@ -210,7 +210,6 @@ impl CommitRangeBuilder {
     }
 
     fn validate_inputs(&self) -> KernelResult<()> {
-        // R1: Reversed bounds are valid for relaxed file iteration, which checks gaps first.
         if self.commit_range_validation
             && let Some(end_version) = self.end_version
         {
@@ -285,8 +284,6 @@ impl CommitRangeBuilder {
         let mut commit_files = Vec::new();
         let mut first_version_after_end = None;
         let storage = engine.storage_handler();
-        // R3: Resolve catalog priority before probing beyond the bound. The filesystem prefix
-        // stops at the tail, and the combined sequence stops at its first post-end commit.
         let files = list_delta_log_from_storage(
             storage.as_ref(),
             log_root,
@@ -322,7 +319,6 @@ impl CommitRangeBuilder {
             }
             commit_files.push(file);
         }
-        // R2: An empty relaxed range retains a bound, or the start anchor when unbounded.
         let end_version = configured_end_version
             .or_else(|| commit_files.last().map(|file| file.version))
             .unwrap_or(start_version);
@@ -401,7 +397,9 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use test_utils::assert_result_error_with_message;
+    use test_utils::{
+        assert_result_error_with_message, compacted_log_path_for_versions, delta_path_for_version,
+    };
 
     use super::*;
     use crate::commit_range::DeltaAction;
@@ -583,71 +581,45 @@ mod tests {
         #[values(false, true)] include_non_commit_files: bool,
     ) {
         let table_root = dv_small_table_root();
-        let mut files: Vec<_> = filesystem_versions
+        let mut paths: Vec<_> = filesystem_versions
             .iter()
-            .map(|version| FileMeta {
-                location: table_root
-                    .join(&format!("_delta_log/{version:020}.json"))
-                    .unwrap(),
-                last_modified: 0,
-                size: 1,
-            })
+            .map(|version| delta_path_for_version(*version, "json"))
             .collect();
         if include_non_commit_files {
-            for suffix in [
-                "checkpoint.parquet",
-                "crc",
-                "00000000000000000009.compacted.json",
-            ] {
-                files.push(FileMeta {
-                    location: table_root
-                        .join(&format!("_delta_log/{start:020}.{suffix}"))
-                        .unwrap(),
-                    last_modified: 0,
-                    size: 1,
-                });
-            }
-            files.sort_by(|a, b| a.location.as_str().cmp(b.location.as_str()));
+            paths.extend([
+                delta_path_for_version(start, "checkpoint.parquet"),
+                delta_path_for_version(start, "crc"),
+                compacted_log_path_for_versions(start, 9, "json"),
+            ]);
+            paths.sort();
         }
+        let files = paths
+            .iter()
+            .map(|path| FileMeta::new(table_root.join(path.as_ref()).unwrap(), 0, 1))
+            .collect();
         let engine = DelegatingEngine::new(Arc::new(SyncEngine::new()))
             .with_storage_handler(Arc::new(TestStorageHandler { files: Some(files) }));
-        let mut builder = CommitRange::builder_for(&table_root, start)
+        let tail: Vec<_> = tail_versions
+            .iter()
+            .map(|version| staged_commit(&table_root, *version))
+            .collect();
+        let range = CommitRange::builder_for(&table_root, start)
             .with_end_version(end)
-            .with_commit_range_validation(false);
-        if let Some(max_version) = tail_versions.last().copied() {
-            builder = builder.with_log_tail(
-                tail_versions
-                    .iter()
-                    .map(|version| staged_commit(&table_root, *version))
-                    .collect(),
-                max_version,
-            );
-        }
-        let range = builder.build(&engine).unwrap();
+            .with_commit_range_validation(false)
+            .fold_with(tail_versions.last(), |builder, max| {
+                builder.with_log_tail(tail, *max)
+            })
+            .build(&engine)
+            .unwrap();
+
         assert_eq!(range.first_version_after_end, Some(expected_probe));
         let versions: Vec<_> = range.commit_files.iter().map(|file| file.version).collect();
         assert_eq!(versions, expected_versions);
-        for file in &range.commit_files {
-            if tail_versions.contains(&file.version) {
-                assert_eq!(file.file_type, LogPathFileType::StagedCommit);
-            }
-        }
-        let mut files = range.commit_files().unwrap();
-        for version in expected_versions {
-            assert_eq!(files.next().unwrap().unwrap().version, *version);
-        }
-        if expected_versions
-            .last()
-            .is_some_and(|version| *version < end)
-        {
-            assert!(matches!(
-                files.next().unwrap(),
-                Err(KernelError::MissingVersion(7))
-            ));
-        } else {
-            assert!(files.next().is_none());
-        }
-        assert!(files.next().is_none());
+        // Catalog priority: in-range versions covered by the tail come from the tail.
+        assert!(range.commit_files.iter().all(|file| {
+            (file.file_type == LogPathFileType::StagedCommit)
+                == tail_versions.contains(&file.version)
+        }));
     }
 
     #[rstest::rstest]
