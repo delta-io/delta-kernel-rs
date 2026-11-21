@@ -9,8 +9,9 @@ use delta_kernel::actions::deletion_vector_writer::{
 use delta_kernel::{KernelError, KernelResult};
 use delta_kernel_ffi_macros::handle_descriptor;
 
-use crate::error::{EngineExecResult, ErrorAllocators, ExternResult, IntoExternResult};
+use crate::error::{EngineExecResult, ErrorAllocators, ExternResult};
 use crate::handle::{BoxExt, Handle};
+use crate::panic::catch_panic_into_result;
 use crate::{FfiSlice, KernelBytesSlice, NullableCvoid};
 
 /// Writes some or all of `bytes` to the caller's output.
@@ -114,20 +115,25 @@ pub unsafe extern "C" fn deletion_vector_add_indexes(
     indexes: FfiSlice<u64>,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<bool> {
-    let result: KernelResult<_> = (|| {
-        // SAFETY: a nonempty input is aligned, initialized, and readable for this call.
-        let rows = unsafe { indexes.try_as_slice() }?;
-        if rows.iter().any(|index| *index > i64::MAX as u64) {
-            return Err(KernelError::deletion_vector(
-                "DV row indexes must not exceed i64::MAX",
-            ));
-        }
-        // SAFETY: the caller prevents concurrent access; validation completed before mutation.
-        unsafe { vector.as_mut() }.add_deleted_row_indexes(rows);
-        Ok(true)
-    })();
-    // SAFETY: the allocator table, context, and callbacks are valid for this call.
-    unsafe { result.into_extern_result(&*error_allocators) }
+    unsafe {
+        catch_panic_into_result(&*error_allocators, || {
+            let result: KernelResult<_> = (|| {
+                // SAFETY: a nonempty input is aligned, initialized, and readable for this call.
+                let rows = indexes.try_as_slice()?;
+                if rows.iter().any(|index| *index > i64::MAX as u64) {
+                    return Err(KernelError::deletion_vector(
+                        "DV row indexes must not exceed i64::MAX",
+                    ));
+                }
+                // SAFETY: the caller prevents concurrent access; validation completed before
+                // mutation.
+                vector.as_mut().add_deleted_row_indexes(rows);
+                Ok(true)
+            })();
+            // SAFETY: the allocator table, context, and callbacks are valid for this call.
+            result
+        })
+    }
 }
 
 /// Consumes an abandoned deletion vector without serializing it.
@@ -161,29 +167,35 @@ pub unsafe extern "C" fn new_dv_writer(
     output: &FfiDvWriterOutput,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<Handle<ExclusiveDvWriter>> {
-    let result: KernelResult<_> = (|| {
-        if output.write.is_none() || output.flush.is_none() {
-            return Err(KernelError::generic(
-                "DV writer requires write and flush callbacks",
-            ));
-        }
-        let mut output = BoxExt::into_non_null(Box::new(OwnedDvOutput(FfiDvWriterOutput {
-            context: output.context,
-            write: output.write,
-            flush: output.flush,
-        })));
-        // SAFETY: DvWriter owns this stable allocation and drops the serializer's borrow before
-        // freeing it. The private pointer is never exposed or used while the borrow is active.
-        let writer = StreamingDeletionVectorWriter::new(unsafe { output.as_mut() });
-        Ok(Box::new(DvWriter {
-            writer: Some(writer),
-            output,
-            failed: false,
+    unsafe {
+        catch_panic_into_result(&*error_allocators, || {
+            let result: KernelResult<_> = (|| {
+                if output.write.is_none() || output.flush.is_none() {
+                    return Err(KernelError::generic(
+                        "DV writer requires write and flush callbacks",
+                    ));
+                }
+                let mut output =
+                    BoxExt::into_non_null(Box::new(OwnedDvOutput(FfiDvWriterOutput {
+                        context: output.context,
+                        write: output.write,
+                        flush: output.flush,
+                    })));
+                // SAFETY: DvWriter owns this stable allocation and drops the serializer's borrow
+                // before freeing it. The private pointer is never exposed or used
+                // while the borrow is active.
+                let writer = StreamingDeletionVectorWriter::new(output.as_mut());
+                Ok(Box::new(DvWriter {
+                    writer: Some(writer),
+                    output,
+                    failed: false,
+                })
+                .into())
+            })();
+            // SAFETY: the allocator table, context, and callbacks are valid for this call.
+            result
         })
-        .into())
-    })();
-    // SAFETY: the allocator table, context, and callbacks are valid for this call.
-    unsafe { result.into_extern_result(&*error_allocators) }
+    }
 }
 
 /// Serializes one complete vector, returning its offset, size, and cardinality.
@@ -207,26 +219,32 @@ pub unsafe extern "C" fn dv_writer_write(
     vector: Handle<ExclusiveDeletionVector>,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<FfiDvWriteResult> {
-    // SAFETY: the caller transfers the live vector exactly once. Consume before any fallible check
-    // so it is dropped on failed-writer, serialization, and output errors alike.
-    let vector = unsafe { vector.into_inner() };
-    let result: KernelResult<_> = (|| {
-        // SAFETY: the caller supplies a valid handle and prevents concurrent/re-entrant access.
-        let writer = unsafe { writer.as_mut() };
-        if writer.failed {
-            return Err(KernelError::invalid_transaction_state(
-                "DV writer has failed",
-            ));
-        }
-        let serializer = writer.writer.as_mut().ok_or_else(|| {
-            KernelError::invalid_transaction_state("DV writer has been finalized")
-        })?;
-        let result = serializer.write_deletion_vector(*vector);
-        writer.failed = result.is_err();
-        result.map(FfiDvWriteResult::from)
-    })();
-    // SAFETY: the allocator table, context, and callbacks are valid for this call.
-    unsafe { result.into_extern_result(&*error_allocators) }
+    unsafe {
+        catch_panic_into_result(&*error_allocators, || {
+            // SAFETY: the caller transfers the live vector exactly once. Consume before any
+            // fallible check so it is dropped on failed-writer, serialization, and
+            // output errors alike.
+            let vector = vector.into_inner();
+            let result: KernelResult<_> = (|| {
+                // SAFETY: the caller supplies a valid handle and prevents concurrent/re-entrant
+                // access.
+                let writer = writer.as_mut();
+                if writer.failed {
+                    return Err(KernelError::invalid_transaction_state(
+                        "DV writer has failed",
+                    ));
+                }
+                let serializer = writer.writer.as_mut().ok_or_else(|| {
+                    KernelError::invalid_transaction_state("DV writer has been finalized")
+                })?;
+                let result = serializer.write_deletion_vector(*vector);
+                writer.failed = result.is_err();
+                result.map(FfiDvWriteResult::from)
+            })();
+            // SAFETY: the allocator table, context, and callbacks are valid for this call.
+            result
+        })
+    }
 }
 
 /// Finalizes and consumes the writer, flushing its output.
@@ -246,21 +264,27 @@ pub unsafe extern "C" fn dv_writer_finalize(
     writer: Handle<ExclusiveDvWriter>,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<bool> {
-    // SAFETY: the caller transfers a live handle exactly once, including on failure.
-    let mut writer = unsafe { writer.into_inner() };
-    let result = if writer.failed {
-        Err(KernelError::invalid_transaction_state(
-            "DV writer has failed",
-        ))
-    } else {
-        writer
-            .writer
-            .take()
-            .ok_or_else(|| KernelError::invalid_transaction_state("DV writer has been finalized"))
-            .and_then(StreamingDeletionVectorWriter::finalize)
-    };
-    // SAFETY: the allocator table, context, and callbacks are valid for this call.
-    unsafe { result.map(|()| true).into_extern_result(&*error_allocators) }
+    unsafe {
+        catch_panic_into_result(&*error_allocators, || {
+            // SAFETY: the caller transfers a live handle exactly once, including on failure.
+            let mut writer = writer.into_inner();
+            let result = if writer.failed {
+                Err(KernelError::invalid_transaction_state(
+                    "DV writer has failed",
+                ))
+            } else {
+                writer
+                    .writer
+                    .take()
+                    .ok_or_else(|| {
+                        KernelError::invalid_transaction_state("DV writer has been finalized")
+                    })
+                    .and_then(StreamingDeletionVectorWriter::finalize)
+            };
+            // SAFETY: the allocator table, context, and callbacks are valid for this call.
+            result.map(|()| true)
+        })
+    }
 }
 
 /// Abandons and consumes a writer without flushing or freeing its caller-owned output.

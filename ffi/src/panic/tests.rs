@@ -65,6 +65,10 @@ mod plan_based {
     use crate::scan::{
         free_scan, scan_builder, scan_builder_build, scan_declarative_metadata_plan,
     };
+    use crate::transaction::{
+        KernelUpdateTableOperation, free_update_table_txn, new_update_table_txn_builder,
+        update_table_txn_builder_build, update_table_txn_commit,
+    };
     use crate::{
         ExternEngine, OptionalValue, SharedExternEngine, free_engine, free_snapshot,
         get_snapshot_builder, kernel_string_slice, snapshot_builder_build,
@@ -89,6 +93,8 @@ mod plan_based {
     #[rstest]
     #[case::snapshot(0, "builder.rs:")]
     #[case::scan_plan(1, "scan.rs:")]
+    #[case::transaction_build(2, "update_table.rs:")]
+    #[case::transaction_commit(3, "update_table.rs:")]
     #[tokio::test]
     async fn planning_succeeds_after_panic(#[case] panic_stage: u8, #[case] expected: &str) {
         let store = Arc::new(InMemory::new());
@@ -135,7 +141,32 @@ mod plan_based {
         let bytes = unsafe { bytes.into_vec() };
         let op = proto::Operation::decode(bytes.as_slice()).unwrap();
         assert!(matches!(op.op, Some(proto::operation::Op::QueryPlan(_))));
-
+        if panic_stage >= 2 {
+            let engine_info = "panic-test/1.0";
+            let transaction = || unsafe {
+                let builder = ok_or_panic(new_update_table_txn_builder(
+                    snapshot.shallow_copy(),
+                    KernelUpdateTableOperation::Write,
+                    kernel_string_slice!(engine_info),
+                    true,
+                    engine.shallow_copy(),
+                ));
+                update_table_txn_builder_build(builder, engine.shallow_copy())
+            };
+            if panic_stage == 2 {
+                external.fail_next.store(true, Ordering::SeqCst);
+                assert_error(transaction(), FFIKernelError::InternalError, expected);
+            } else {
+                let txn = ok_or_panic(transaction());
+                external.fail_next.store(true, Ordering::SeqCst);
+                assert_error(
+                    unsafe { update_table_txn_commit(txn, engine.shallow_copy()) },
+                    FFIKernelError::InternalError,
+                    expected,
+                );
+            }
+            unsafe { free_update_table_txn(ok_or_panic(transaction())) };
+        }
         unsafe {
             free_scan(scan);
             free_snapshot(snapshot);

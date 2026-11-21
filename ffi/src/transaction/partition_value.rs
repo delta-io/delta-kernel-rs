@@ -13,9 +13,10 @@ use delta_kernel::KernelResult;
 use delta_kernel::expressions::Scalar;
 use delta_kernel_ffi_macros::handle_descriptor;
 
-use crate::error::{ExternResult, IntoExternResult};
+use crate::error::ExternResult;
 use crate::expressions::kernel_visitor::NullTypeTag;
 use crate::handle::Handle;
+use crate::panic::catch_panic_into_result;
 use crate::{KernelStringSlice, SharedExternEngine, TryFromStringSlice};
 
 /// Owns a map from a partition column's logical name to its [`Scalar`] value. Engines build the
@@ -88,12 +89,14 @@ pub unsafe extern "C" fn partition_value_map_insert_string(
     value: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<bool> {
-    let map = unsafe { map.as_mut() };
-    let engine = unsafe { engine.as_ref() };
-    let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let value = unsafe { String::try_from_slice(&value) };
-    let result = partition_value_map_insert_impl(map, name, value.map(Scalar::from));
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let map = map.as_mut();
+            let name = TryFromStringSlice::try_from_slice(&name);
+            let value = String::try_from_slice(&value);
+            partition_value_map_insert_impl(map, name, value.map(Scalar::from))
+        })
+    }
 }
 
 /// Insert an `integer` (32-bit) partition value under `name`.
@@ -108,11 +111,13 @@ pub unsafe extern "C" fn partition_value_map_insert_int(
     value: i32,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<bool> {
-    let map = unsafe { map.as_mut() };
-    let engine = unsafe { engine.as_ref() };
-    let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let result = partition_value_map_insert_impl(map, name, Ok(Scalar::from(value)));
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let map = map.as_mut();
+            let name = TryFromStringSlice::try_from_slice(&name);
+            partition_value_map_insert_impl(map, name, Ok(Scalar::from(value)))
+        })
+    }
 }
 
 /// Insert a `long` (64-bit) partition value under `name`.
@@ -127,11 +132,13 @@ pub unsafe extern "C" fn partition_value_map_insert_long(
     value: i64,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<bool> {
-    let map = unsafe { map.as_mut() };
-    let engine = unsafe { engine.as_ref() };
-    let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let result = partition_value_map_insert_impl(map, name, Ok(Scalar::from(value)));
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let map = map.as_mut();
+            let name = TryFromStringSlice::try_from_slice(&name);
+            partition_value_map_insert_impl(map, name, Ok(Scalar::from(value)))
+        })
+    }
 }
 
 /// Insert a `short` (16-bit) partition value under `name`.
@@ -146,11 +153,13 @@ pub unsafe extern "C" fn partition_value_map_insert_short(
     value: i16,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<bool> {
-    let map = unsafe { map.as_mut() };
-    let engine = unsafe { engine.as_ref() };
-    let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let result = partition_value_map_insert_impl(map, name, Ok(Scalar::from(value)));
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let map = map.as_mut();
+            let name = TryFromStringSlice::try_from_slice(&name);
+            partition_value_map_insert_impl(map, name, Ok(Scalar::from(value)))
+        })
+    }
 }
 
 /// Insert a `byte` (8-bit) partition value under `name`.
@@ -165,11 +174,13 @@ pub unsafe extern "C" fn partition_value_map_insert_byte(
     value: i8,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<bool> {
-    let map = unsafe { map.as_mut() };
-    let engine = unsafe { engine.as_ref() };
-    let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let result = partition_value_map_insert_impl(map, name, Ok(Scalar::from(value)));
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let map = map.as_mut();
+            let name = TryFromStringSlice::try_from_slice(&name);
+            partition_value_map_insert_impl(map, name, Ok(Scalar::from(value)))
+        })
+    }
 }
 
 /// Insert a `float` (32-bit) partition value under `name`.
@@ -184,11 +195,13 @@ pub unsafe extern "C" fn partition_value_map_insert_float(
     value: f32,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<bool> {
-    let map = unsafe { map.as_mut() };
-    let engine = unsafe { engine.as_ref() };
-    let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let result = partition_value_map_insert_impl(map, name, Ok(Scalar::from(value)));
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let map = map.as_mut();
+            let name = TryFromStringSlice::try_from_slice(&name);
+            partition_value_map_insert_impl(map, name, Ok(Scalar::from(value)))
+        })
+    }
 }
 
 /// Insert a `double` (64-bit) partition value under `name`.
@@ -203,11 +216,13 @@ pub unsafe extern "C" fn partition_value_map_insert_double(
     value: f64,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<bool> {
-    let map = unsafe { map.as_mut() };
-    let engine = unsafe { engine.as_ref() };
-    let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let result = partition_value_map_insert_impl(map, name, Ok(Scalar::from(value)));
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let map = map.as_mut();
+            let name = TryFromStringSlice::try_from_slice(&name);
+            partition_value_map_insert_impl(map, name, Ok(Scalar::from(value)))
+        })
+    }
 }
 
 /// Insert a `boolean` partition value under `name`.
@@ -222,11 +237,13 @@ pub unsafe extern "C" fn partition_value_map_insert_bool(
     value: bool,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<bool> {
-    let map = unsafe { map.as_mut() };
-    let engine = unsafe { engine.as_ref() };
-    let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let result = partition_value_map_insert_impl(map, name, Ok(Scalar::from(value)));
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let map = map.as_mut();
+            let name = TryFromStringSlice::try_from_slice(&name);
+            partition_value_map_insert_impl(map, name, Ok(Scalar::from(value)))
+        })
+    }
 }
 
 /// Insert a `date` partition value (`value` = days since the Unix epoch) under `name`.
@@ -241,11 +258,13 @@ pub unsafe extern "C" fn partition_value_map_insert_date(
     value: i32,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<bool> {
-    let map = unsafe { map.as_mut() };
-    let engine = unsafe { engine.as_ref() };
-    let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let result = partition_value_map_insert_impl(map, name, Ok(Scalar::Date(value)));
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let map = map.as_mut();
+            let name = TryFromStringSlice::try_from_slice(&name);
+            partition_value_map_insert_impl(map, name, Ok(Scalar::Date(value)))
+        })
+    }
 }
 
 /// Insert a `timestamp` partition value (`value` = microseconds since the Unix epoch, UTC) under
@@ -261,11 +280,13 @@ pub unsafe extern "C" fn partition_value_map_insert_timestamp(
     value: i64,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<bool> {
-    let map = unsafe { map.as_mut() };
-    let engine = unsafe { engine.as_ref() };
-    let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let result = partition_value_map_insert_impl(map, name, Ok(Scalar::Timestamp(value)));
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let map = map.as_mut();
+            let name = TryFromStringSlice::try_from_slice(&name);
+            partition_value_map_insert_impl(map, name, Ok(Scalar::Timestamp(value)))
+        })
+    }
 }
 
 /// Insert a `timestamp_ntz` partition value (`value` = microseconds since the Unix epoch, no
@@ -281,11 +302,13 @@ pub unsafe extern "C" fn partition_value_map_insert_timestamp_ntz(
     value: i64,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<bool> {
-    let map = unsafe { map.as_mut() };
-    let engine = unsafe { engine.as_ref() };
-    let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let result = partition_value_map_insert_impl(map, name, Ok(Scalar::TimestampNtz(value)));
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let map = map.as_mut();
+            let name = TryFromStringSlice::try_from_slice(&name);
+            partition_value_map_insert_impl(map, name, Ok(Scalar::TimestampNtz(value)))
+        })
+    }
 }
 
 /// Insert a `binary` partition value under `name`, copying `len` bytes from `value`.
@@ -302,17 +325,20 @@ pub unsafe extern "C" fn partition_value_map_insert_binary(
     len: usize,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<bool> {
-    let map = unsafe { map.as_mut() };
-    let engine = unsafe { engine.as_ref() };
-    let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    // `from_raw_parts` requires a non-null pointer even when `len == 0`, so guard the empty case.
-    let bytes = if value.is_null() || len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(value, len) }
-    };
-    let result = partition_value_map_insert_impl(map, name, Ok(Scalar::Binary(bytes.to_vec())));
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let map = map.as_mut();
+            let name = TryFromStringSlice::try_from_slice(&name);
+            // `from_raw_parts` requires a non-null pointer even when `len == 0`, so guard the
+            // empty case.
+            let bytes = if value.is_null() || len == 0 {
+                &[]
+            } else {
+                std::slice::from_raw_parts(value, len)
+            };
+            partition_value_map_insert_impl(map, name, Ok(Scalar::Binary(bytes.to_vec())))
+        })
+    }
 }
 
 /// Insert a `decimal` partition value under `name`. The unscaled 128-bit value is supplied as two
@@ -332,13 +358,14 @@ pub unsafe extern "C" fn partition_value_map_insert_decimal(
     scale: u8,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<bool> {
-    let map = unsafe { map.as_mut() };
-    let engine = unsafe { engine.as_ref() };
-    let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let value = ((value_hi as i128) << 64) | (value_lo as i128);
-    let result =
-        partition_value_map_insert_impl(map, name, Scalar::decimal(value, precision, scale));
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let map = map.as_mut();
+            let name = TryFromStringSlice::try_from_slice(&name);
+            let value = ((value_hi as i128) << 64) | (value_lo as i128);
+            partition_value_map_insert_impl(map, name, Scalar::decimal(value, precision, scale))
+        })
+    }
 }
 
 /// Insert a typed `null` partition value under `name`. The `type_tag` identifies the column's
@@ -362,14 +389,16 @@ pub unsafe extern "C" fn partition_value_map_insert_null(
     scale: u8,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<bool> {
-    let map = unsafe { map.as_mut() };
-    let engine = unsafe { engine.as_ref() };
-    let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    let scalar = NullTypeTag::try_from(type_tag)
-        .and_then(|tag| tag.to_data_type(precision, scale))
-        .map(Scalar::Null);
-    let result = partition_value_map_insert_impl(map, name, scalar);
-    unsafe { result.into_extern_result(&engine) }
+    unsafe {
+        catch_panic_into_result(&engine.as_ref(), || {
+            let map = map.as_mut();
+            let name = TryFromStringSlice::try_from_slice(&name);
+            let scalar = NullTypeTag::try_from(type_tag)
+                .and_then(|tag| tag.to_data_type(precision, scale))
+                .map(Scalar::Null);
+            partition_value_map_insert_impl(map, name, scalar)
+        })
+    }
 }
 
 #[cfg(test)]
