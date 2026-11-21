@@ -1562,6 +1562,7 @@ impl Scan {
                     checkpoint_schema,
                     physical_stats_read_schema,
                     amt_stats_request,
+                    None,
                 );
         }
         // Checkpoints already represent reconciled state, so scans project only Add actions. This

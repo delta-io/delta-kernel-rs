@@ -446,6 +446,7 @@ impl Snapshot {
                 schema,
                 None,
                 None,
+                None,
             )?;
             return Ok(result.actions);
         }
