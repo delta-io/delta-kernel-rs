@@ -139,8 +139,10 @@ impl DeletionVectorPath {
     /// Returns the absolute path to the deletion vector file.
     pub fn absolute_path(&self) -> KernelResult<Url> {
         let dv_suffix = Self::relative_path(&self.prefix, &self.uuid);
+        // The prefix is raw path text; escape URI-reserved bytes before joining.
+        let encoded_dv_suffix = uri_encode_path(&dv_suffix);
         self.table_path
-            .join(&dv_suffix)
+            .join(encoded_dv_suffix.as_ref())
             .map_err(|_| KernelError::DeletionVector(format!("invalid path: {dv_suffix}")))
     }
 
@@ -1805,6 +1807,22 @@ mod tests {
         let expected =
             "file:///tmp/test_table/dv/deletion_vector_abcdef01-2345-6789-abcd-ef0123456789.bin";
         assert_eq!(abs_path.as_str(), expected);
+    }
+
+    #[test]
+    fn test_deletion_vector_path_absolute_path_encodes_reserved_prefix() {
+        let table_path = Url::parse("s3://mytable/").unwrap();
+        let prefix = "p=a#b%20 c?".to_owned();
+        let known_uuid = uuid::Uuid::parse_str("abcdef01-2345-6789-abcd-ef0123456789").unwrap();
+        let dv_path = DeletionVectorPath::new_with_uuid(table_path, prefix, known_uuid);
+
+        assert_eq!(
+            dv_path.absolute_path().unwrap().as_str(),
+            concat!(
+                "s3://mytable/p=a%23b%2520%20c%3F/",
+                "deletion_vector_abcdef01-2345-6789-abcd-ef0123456789.bin"
+            )
+        );
     }
 
     #[test]
