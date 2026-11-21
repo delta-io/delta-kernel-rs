@@ -43,17 +43,12 @@ tools:
 guardrails:
   ask_timeout: 86400
   policies:
-    inject_review_context:
-      type: function
-      function:
-        path: review_context_policy.inject_review_context
-        arguments:
-          context_path: /tmp/reviewer_context.txt
     spawn_bounds:
       type: function
       function:
         path: omnigent.policies.builtins.orchestration.spawn_bounds
         arguments:
+          # Allow the full primary reviewer roster to start in one turn.
           max_dispatches_per_turn: 6
           dispatch_tools: [sys_session_send]
     headless_subagent_purpose_guard:
@@ -62,3 +57,15 @@ guardrails:
         path: omnigent.policies.builtins.orchestration.headless_subagent_purpose_guard
         arguments:
           allowed_purposes: [review, explore, search]
+    # See "How a child task is assembled" in README.md. Keep this hook last because
+    # later policies cannot recognize a rewritten dispatch without its tool name.
+    append_child_task_body:
+      type: function
+      function:
+        path: child_task.append_child_task_body
+        arguments:
+          pr_data_path: /tmp/child_task_pr_data.md
+          root_guidance_path: /tmp/child_task_root_guidance.md
+          root_guidance_agents:
+            - maintainer-claude-reviewer
+            - maintainer-codex-reviewer
