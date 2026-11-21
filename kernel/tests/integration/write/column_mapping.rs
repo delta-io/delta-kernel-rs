@@ -283,7 +283,7 @@ async fn test_column_mapping_write(
 
     // Step 6: Remove files and verify remove.stats matches original add.stats
     {
-        let original_add_stats: Vec<serde_json::Value> =
+        let mut original_add_stats: Vec<serde_json::Value> =
             add_actions.iter().filter_map(|a| a.stats.clone()).collect();
         assert!(
             !original_add_stats.is_empty(),
@@ -297,7 +297,7 @@ async fn test_column_mapping_write(
             "Expected at least one remove action"
         );
 
-        let remove_stats: Vec<serde_json::Value> = remove_actions
+        let mut remove_stats: Vec<serde_json::Value> = remove_actions
             .iter()
             .filter_map(|r| {
                 r["stats"]
@@ -305,6 +305,8 @@ async fn test_column_mapping_write(
                     .map(|s| serde_json::from_str(s).unwrap())
             })
             .collect();
+        original_add_stats.sort_by_cached_key(serde_json::Value::to_string);
+        remove_stats.sort_by_cached_key(serde_json::Value::to_string);
         assert_eq!(
             remove_stats, original_add_stats,
             "remove.stats should match original add.stats"
