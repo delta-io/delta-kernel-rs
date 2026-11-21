@@ -48,6 +48,7 @@ use crate::schema::{
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::table_features::TableFeature;
+use crate::utils::FoldWithOption as _;
 use crate::{
     Engine, EngineData, KernelError, KernelResult, KernelResultIterator, Version, version_as_i64,
 };
@@ -62,12 +63,38 @@ impl LogSegment {
     /// Under `adaptive-metadata-in-dev`, the result's `captured_checkpoint_action` is the latest
     /// AMT checkpoint action when replay captured it, for the caller to store on the
     /// [`Snapshot`](crate::Snapshot).
-    #[instrument(name = "log_seg.load_p_m", skip_all, fields(enable_call_frame), err)]
     pub(crate) fn read_protocol_metadata_opt(
         &self,
         engine: &dyn Engine,
         crc: Option<&Arc<Crc>>,
     ) -> KernelResult<PmResolution> {
+        self.read_protocol_metadata(engine, crc, None)
+    }
+
+    /// [`Self::read_protocol_metadata_opt`] for a caller that already holds the Protocol and
+    /// Metadata as of `existing_version`, such as an incremental snapshot update. The result leaves
+    /// out replayed P&M at or below that version, since the caller's are at least as new, and
+    /// ignores a `crc` at or below it.
+    pub(crate) fn read_protocol_metadata_newer_than(
+        &self,
+        engine: &dyn Engine,
+        crc: Option<&Arc<Crc>>,
+        existing_version: Version,
+    ) -> KernelResult<PmResolution> {
+        self.read_protocol_metadata(engine, crc, Some(existing_version))
+    }
+
+    #[instrument(name = "log_seg.load_p_m", skip_all, fields(enable_call_frame), err)]
+    fn read_protocol_metadata(
+        &self,
+        engine: &dyn Engine,
+        crc: Option<&Arc<Crc>>,
+        existing_version: Option<Version>,
+    ) -> KernelResult<PmResolution> {
+        // The caller's P&M are at least as new as a CRC at or below `existing_version`, and
+        // falling back to that CRC's P&M would roll them back.
+        let crc = crc.filter(|c| existing_version.is_none_or(|v| c.version > v));
+
         // Case 1: If CRC at target version, use it directly and exit early.
         if let Some(crc) = crc.filter(|c| c.version == self.end_version) {
             info!("P&M from CRC at target version {}", self.end_version);
@@ -133,11 +160,16 @@ impl LogSegment {
         };
         #[cfg(feature = "adaptive-metadata-in-dev")]
         let newest_commit_info_read = self.replay_read_newest_commit_info(&candidate)?;
-        Ok(candidate.into_resolution(
-            ProtocolMetadataSource::FullReplay,
-            #[cfg(feature = "adaptive-metadata-in-dev")]
-            newest_commit_info_read,
-        ))
+        // A lagging AMT checkpoint action can carry P&M at or below `existing_version`, which the
+        // caller holds at least as new.
+        let floor = existing_version.map(version_as_i64).transpose()?;
+        Ok(candidate
+            .fold_with(floor, PmCandidate::newer_than)
+            .into_resolution(
+                ProtocolMetadataSource::FullReplay,
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                newest_commit_info_read,
+            ))
     }
 
     /// Whether replay of this segment read its newest commit's `commitInfo`. Replay stops inside
