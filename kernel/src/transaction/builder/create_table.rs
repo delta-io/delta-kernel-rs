@@ -32,12 +32,11 @@ use crate::schema::{
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     ColumnMappingMode, IcebergCompatValidationContext, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
-    SET_TABLE_FEATURE_SUPPORTED_VALUE, TableFeature, V2_VALIDATOR, add_feature_to_lists,
-    assign_column_mapping_metadata, auto_enable_property_driven_features,
-    ensure_domain_metadata_dependency, find_max_column_id_in_schema,
-    get_any_level_column_physical_name, get_column_mapping_mode_from_properties,
-    schema_contains_timestamp_ntz, strip_stray_column_mapping_metadata,
-    validate_iceberg_compat_if_needed,
+    TableFeature, V2_VALIDATOR, add_feature_to_lists, assign_column_mapping_metadata,
+    auto_enable_property_driven_features, ensure_domain_metadata_dependency,
+    find_max_column_id_in_schema, get_any_level_column_physical_name,
+    get_column_mapping_mode_from_properties, schema_contains_timestamp_ntz,
+    strip_stray_column_mapping_metadata, validate_iceberg_compat_if_needed,
 };
 use crate::table_properties::{
     APPEND_ONLY, CHECKPOINT_INTERVAL, CHECKPOINT_POLICY, CHECKPOINT_WRITE_STATS_AS_JSON,
@@ -54,60 +53,10 @@ use crate::table_properties::{
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
+use crate::transaction::protocol_prep::{ALLOWED_DELTA_FEATURES, parse_feature_signal};
 use crate::transaction::{CommitOperation, CreateTable, ExecutionMode, Imperative, Transaction};
 use crate::utils::{current_time_ms, try_parse_uri};
 use crate::{Engine, KernelError, KernelResult, Result, StorageHandler};
-
-/// Table features allowed to be enabled via `delta.feature.*=supported` during CREATE TABLE.
-///
-/// Feature signals (`delta.feature.X=supported`) are validated against this list.
-/// Only features in this list can be enabled via feature signals.
-const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
-    // DomainMetadata is required for clustering and other system domain operations
-    TableFeature::DomainMetadata,
-    // ColumnMapping enables column mapping (name/id mode)
-    TableFeature::ColumnMapping,
-    // InCommitTimestamp enables in-commit timestamps (writer-only)
-    TableFeature::InCommitTimestamp,
-    // VacuumProtocolCheck ensures consistent protocol checks during VACUUM
-    TableFeature::VacuumProtocolCheck,
-    // CatalogManaged enables catalog-managed table support
-    TableFeature::CatalogManaged,
-    // Note: Clustering is NOT included here. Users should not enable clustering via
-    // `delta.feature.clustering = supported`. Instead, clustering is enabled by
-    // specifying clustering columns via `with_data_layout()`.
-    TableFeature::DeletionVectors,
-    TableFeature::V2Checkpoint,
-    // Simple protocol-only features: enabling these only updates the protocol action.
-    // They can also be auto-enabled via their enablement properties (e.g. delta.appendOnly=true)
-    // through `maybe_auto_enable_property_driven_features`.
-    TableFeature::AppendOnly,
-    TableFeature::ChangeDataFeed,
-    TableFeature::TypeWidening,
-    TableFeature::RowTracking,
-    TableFeature::VariantType,
-    TableFeature::VariantShredding,
-    // Invariants is auto-enabled by `maybe_enable_invariants` when the schema has non-null
-    // fields. Allowing explicit `delta.feature.invariants=supported` lets users pre-enable
-    // the feature on an all-nullable table so a later ALTER TABLE ADD COLUMN NOT NULL does
-    // not need a protocol upgrade.
-    TableFeature::Invariants,
-    // MaterializePartitionColumns keeps partition columns in the data files instead of
-    // dropping them on write. There is no `delta.*` enablement property; the only opt-in at
-    // create time is the explicit feature signal
-    // `delta.feature.materializePartitionColumns=supported`.
-    TableFeature::MaterializePartitionColumns,
-    TableFeature::Collations,
-    // IcebergCompatV2 is a writer-only feature that gates Iceberg V2 conversion compatibility.
-    // Dependent features (ColumnMapping) are auto-added during create table.
-    TableFeature::IcebergCompatV2,
-    // IcebergCompatV3 is a writer-only feature that gates Iceberg V3 conversion compatibility.
-    // Dependent features (ColumnMapping, RowTracking, DomainMetadata) are auto-added during
-    // create table.
-    TableFeature::IcebergCompatV3,
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    TableFeature::IcebergNativeV4Preview,
-];
 
 /// The single allow-list of `delta.*` properties accepted during CREATE TABLE. Any `delta.*`
 /// key not present here is rejected.
@@ -832,28 +781,7 @@ fn validate_extract_table_features_and_properties(
 
     // Process and validate feature signals
     for (key, value) in &feature_signals {
-        // Safe: we partitioned for keys starting with this prefix above
-        let Some(feature_name) = key.strip_prefix(SET_TABLE_FEATURE_SUPPORTED_PREFIX) else {
-            continue;
-        };
-
-        // Validate that the value is "supported"
-        if value != SET_TABLE_FEATURE_SUPPORTED_VALUE {
-            return Err(KernelError::generic(format!(
-                "Invalid value '{value}' for '{key}'. Only '{SET_TABLE_FEATURE_SUPPORTED_VALUE}' is allowed."
-            )));
-        }
-
-        // Parse feature name to TableFeature (unknown features become TableFeature::Unknown)
-        let feature: TableFeature = feature_name
-            .parse()
-            .unwrap_or_else(|_| TableFeature::Unknown(feature_name.to_string()));
-
-        if !ALLOWED_DELTA_FEATURES.contains(&feature) {
-            return Err(KernelError::generic(format!(
-                "Enabling feature '{feature_name}' via '{key}' is not supported during CREATE TABLE"
-            )));
-        }
+        let feature = parse_feature_signal(key, value, "CREATE TABLE")?;
 
         // VariantShredding requires VariantType as a dependency
         if feature == TableFeature::VariantShredding {

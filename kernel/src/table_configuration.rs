@@ -395,9 +395,25 @@ impl TableConfiguration {
         metadata: Metadata,
         logical_schema: SchemaRef,
     ) -> Result<Self> {
+        Self::try_new_with_schema_and_protocol(
+            base,
+            metadata,
+            logical_schema,
+            base.protocol.clone(),
+        )
+    }
+
+    /// Like [`try_new_with_schema`](Self::try_new_with_schema), but validates against `protocol`
+    /// instead of `base`'s protocol.
+    pub(crate) fn try_new_with_schema_and_protocol(
+        base: &Self,
+        metadata: Metadata,
+        logical_schema: SchemaRef,
+        protocol: Protocol,
+    ) -> Result<Self> {
         Self::try_new_inner(
             metadata,
-            base.protocol.clone(),
+            protocol,
             base.table_root.clone(),
             base.version,
             logical_schema,

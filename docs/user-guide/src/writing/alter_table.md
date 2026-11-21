@@ -12,6 +12,11 @@ Before reading this page, make sure you understand
 
 Use **ALTER TABLE** for a standalone, metadata-only change. For example, you can add a nullable
 column or set table properties without writing or removing data files.
+`UpdateTableOperation::AlterTable` records `commitInfo.operation` as `ALTER TABLE`. Delta Spark
+uses finer-grained names for the same kinds of change (`ADD COLUMNS`, `SET TBLPROPERTIES`,
+`UNSET TBLPROPERTIES`, and so on). Pass `UpdateTableOperation::Custom("SET TBLPROPERTIES")` (or the
+matching Spark name) when you need that history string; Kernel still applies the same metadata
+validation.
 
 Use **SCHEMA EVOLUTION** to change the schema while writing or rewriting data files in the same
 transaction. For example, you can add a nullable column and append rows containing values for that
@@ -145,9 +150,31 @@ original casing. Recognized config-only `delta.*` keys, such as `delta.checkpoin
 and value-validated. Repeated calls merge. Two entries for the same `delta.*` key in one call
 (including exact duplicates and case variants) are rejected.
 
-Feature-enabling properties (for example `delta.enableChangeDataFeed`), `delta.feature.*` signals,
-unknown `delta.*` keys, and CHECK constraints are rejected. Setting properties does not change the
-protocol. Re-setting a property to its current value still counts as an `ALTER TABLE` change.
+Feature-enabling properties (for example `delta.enableChangeDataFeed` or
+`delta.enableDeletionVectors`) are accepted and may upgrade the protocol when the property turns a
+feature on. Unknown `delta.*` keys and CHECK constraints are rejected. Re-setting a property to its
+current value still counts as an `ALTER TABLE` change.
+
+These transitions need a rewrite or backfill, so Kernel rejects them on existing tables: enabling or
+disabling row tracking; any column-mapping mode change; enabling or disabling IcebergCompatV1, V2,
+or V3; enabling or disabling `icebergWriterCompatV1` or `icebergWriterCompatV3`; and disabling ICT
+on a `catalogManaged` table.
+
+To enable a feature without a matching property, pass `delta.feature.<name>` set to `supported`,
+for example `("delta.feature.deletionVectors", "supported")`. Only features that CREATE TABLE also
+accepts through feature signals are allowed, and the signal is applied to the protocol only. Other
+values, unknown features, and rejected features fail the build. Signals cannot be combined with a
+blind append. Feature signals cannot bypass the existing-table toggle rejections above.
+
+`delta.enableVariantShredding=true` also enables `variantShredding-preview`, unless the
+`variantShredding` feature is already in the protocol.
+`delta.universalFormat.enabledFormats` accepts `iceberg` and `hudi`. Listing `iceberg` requires
+`delta.enableIcebergCompatV2` or `delta.enableIcebergCompatV3` to be `true`, and both cannot be
+enabled together.
+
+Adding a `timestamp_ntz` column enables the `timestampNtz` feature in the same commit. Enabling
+`catalogManaged` through a feature signal also sets `delta.enableInCommitTimestamps` to `true`, and
+an explicit `false` is rejected.
 
 ```rust,ignore
 let result = snapshot
@@ -155,7 +182,20 @@ let result = snapshot
     .with_table_properties_added([
         ("app.owner", "analytics"),
         ("delta.checkpointInterval", "10"),
+        ("delta.enableChangeDataFeed", "true"),
     ])
+    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .commit(&engine)?;
+```
+
+Call `with_table_properties_removed` to drop application properties. Only non-`delta.*` keys may be
+removed; removing a missing key is not an error. Adding and removing the same key in one
+transaction is rejected.
+
+```rust,ignore
+let result = snapshot
+    .update_table(UpdateTableOperation::AlterTable, "my-app/1.0", /* data_change */ false)
+    .with_table_properties_removed(["app.owner"])
     .build(&engine, Box::new(FileSystemCommitter::new()))?
     .commit(&engine)?;
 ```

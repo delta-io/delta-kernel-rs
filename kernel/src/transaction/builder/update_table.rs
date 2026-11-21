@@ -13,11 +13,14 @@ use crate::schema::StructField;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    IcebergCompatValidationContext, Operation, TableFeature, V2_VALIDATOR, V3_VALIDATOR,
-    validate_iceberg_compat_if_needed,
+    IcebergCompatValidationContext, Operation, SET_TABLE_FEATURE_SUPPORTED_PREFIX, TableFeature,
+    V2_VALIDATOR, V3_VALIDATOR, validate_iceberg_compat_if_needed,
 };
-use crate::table_properties::{is_delta_property_key, validate_and_normalize_property_for_update};
+use crate::table_properties::{
+    DELTA_PROPERTY_PREFIX, is_delta_property_key, validate_and_normalize_property_for_update,
+};
 use crate::transaction::domain_metadata::validate_unique_domains;
+use crate::transaction::protocol_prep::{parse_feature_signal, prepare_protocol_for_update};
 use crate::transaction::schema_evolution::{SchemaOperation, evolve_table_config};
 use crate::transaction::{
     ExecutionMode, Imperative, Transaction, UpdateTable, UpdateTableOperation,
@@ -68,6 +71,7 @@ pub struct UpdateTableBuilderState {
     /// [`with_table_properties_added`](UpdateTableTransactionBuilder::with_table_properties_added)
     /// call; later calls override earlier values for the same canonical key at build.
     properties_added: Vec<Vec<(String, String)>>,
+    properties_removed: HashSet<String>,
     domain_metadata_removals: Vec<String>,
     is_blind_append: bool,
 }
@@ -75,6 +79,7 @@ pub struct UpdateTableBuilderState {
 impl UpdateTableBuilderState {
     fn has_property_changes(&self) -> bool {
         self.properties_added.iter().any(|batch| !batch.is_empty())
+            || !self.properties_removed.is_empty()
     }
 
     fn has_metadata_changes(&self) -> bool {
@@ -100,6 +105,10 @@ impl<MODE: ExecutionMode> std::fmt::Debug for TransactionBuilder<UpdateTable, MO
                     .map(Vec::len)
                     .sum::<usize>(),
             )
+            .field(
+                "properties_removed_count",
+                &self.local_state.properties_removed.len(),
+            )
             .finish()
     }
 }
@@ -118,6 +127,7 @@ impl TransactionBuilder<UpdateTable> {
                 operation,
                 schema_changes: None,
                 properties_added: Vec::new(),
+                properties_removed: HashSet::new(),
                 domain_metadata_removals: Vec::new(),
                 is_blind_append: false,
             },
@@ -147,10 +157,12 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// their original key casing. Recognized config-only `delta.*` keys are rewritten to their
     /// canonical form and value-validated during [`build`](Self::build).
     ///
-    /// Feature-enabling `delta.*` properties (for example `delta.enableDeletionVectors`),
-    /// `delta.feature.*` signals, CHECK constraints, and unknown `delta.*` keys are rejected.
-    /// Property changes are applied during [`build`](Self::build). For `ALTER TABLE`, requested
-    /// adds always emit Metadata, including when every value already matches the current
+    /// Feature-enablement `delta.*` properties (for example `delta.enableDeletionVectors`) are
+    /// accepted and upgrade the protocol during [`build`](Self::build).
+    /// `delta.feature.<name>=supported` signals enable the named feature on the protocol; the same
+    /// features CREATE TABLE accepts are allowed. CHECK constraints and unknown `delta.*` keys are
+    /// rejected. Property changes are applied during [`build`](Self::build). For `ALTER TABLE`,
+    /// requested adds always emit Metadata, including when every value already matches the current
     /// configuration. Data operations skip unchanged values so Metadata is emitted only when at
     /// least one added value actually changes.
     pub fn with_table_properties_added<I, K, V>(mut self, properties: I) -> Self
@@ -166,6 +178,23 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         if !batch.is_empty() {
             self.local_state.properties_added.push(batch);
         }
+        self
+    }
+
+    /// Removes table properties from the metadata configuration.
+    ///
+    /// Only non-`delta.*` application properties may be removed. Removing a key that is not present
+    /// is not an error. Repeated calls accumulate keys. Adding and removing the same key in one
+    /// transaction is rejected during [`build`](Self::build). Removals are applied during
+    /// [`build`](Self::build) and cause a Metadata action to be emitted.
+    pub fn with_table_properties_removed<I, K>(mut self, keys: I) -> Self
+    where
+        I: IntoIterator<Item = K>,
+        K: Into<String>,
+    {
+        self.local_state
+            .properties_removed
+            .extend(keys.into_iter().map(Into::into));
         self
     }
 
@@ -326,6 +355,11 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
                 "blind append cannot include property changes",
             ));
         }
+        validate_properties_removed_keys(&self.local_state.properties_removed)?;
+        validate_properties_added_removed_no_overlap(
+            &self.local_state.properties_added,
+            &self.local_state.properties_removed,
+        )?;
 
         let removals = validate_unique_domains(
             self.local_state
@@ -349,8 +383,24 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         // Duplicate additions are validated by the shared builder state.
         self.common_state.validate()?;
         // Property key/value validation does not need the engine; reject before any I/O in build.
+        // Feature signals are validated later by parse_feature_signal after partitioning.
         if self.local_state.has_property_changes() {
-            let _ = validate_and_canonicalize_properties_added(&self.local_state.properties_added)?;
+            let non_feature_batches: Vec<Vec<(String, String)>> = self
+                .local_state
+                .properties_added
+                .iter()
+                .map(|batch| {
+                    batch
+                        .iter()
+                        .filter(|(key, _)| !key.starts_with(SET_TABLE_FEATURE_SUPPORTED_PREFIX))
+                        .cloned()
+                        .collect()
+                })
+                .filter(|batch: &Vec<_>| !batch.is_empty())
+                .collect();
+            if !non_feature_batches.is_empty() {
+                let _ = validate_and_canonicalize_properties_added(&non_feature_batches)?;
+            }
         }
         Ok(())
     }
@@ -371,6 +421,7 @@ fn try_new_update_table<MODE: ExecutionMode>(
         operation,
         schema_changes,
         properties_added,
+        properties_removed,
         domain_metadata_removals,
         is_blind_append,
     } = local_state;
@@ -401,7 +452,8 @@ fn try_new_update_table<MODE: ExecutionMode>(
         read_version = read_snapshot.version(),
     );
 
-    let effective_table_config = read_snapshot.table_configuration().clone();
+    let read_table_config = read_snapshot.table_configuration().clone();
+    let mut effective_table_config = read_table_config.clone();
 
     validate_iceberg_compat_if_needed(
         &effective_table_config,
@@ -415,15 +467,37 @@ fn try_new_update_table<MODE: ExecutionMode>(
         IcebergCompatValidationContext::Write,
     )?;
 
+    // Feature signals (`delta.feature.X=supported`) are partitioned out of each add-batch and are
+    // not stored in metadata; remaining batches keep call-order for canonicalization.
+    let mut feature_signal_pairs = HashMap::new();
+    let mut remaining_batches = Vec::new();
+    for batch in properties_added {
+        let mut remaining = Vec::new();
+        for (key, value) in batch {
+            if key.starts_with(SET_TABLE_FEATURE_SUPPORTED_PREFIX) {
+                feature_signal_pairs.insert(key, value);
+            } else {
+                remaining.push((key, value));
+            }
+        }
+        if !remaining.is_empty() {
+            remaining_batches.push(remaining);
+        }
+    }
+    let feature_signals = feature_signal_pairs
+        .iter()
+        .map(|(key, value)| parse_feature_signal(key, value, "UPDATE TABLE"))
+        .collect::<KernelResult<Vec<_>>>()?;
+    let has_property_removes = !properties_removed.is_empty();
     let has_schema_changes = schema_changes.is_some();
-    let effective_table_config = match schema_changes {
+    effective_table_config = match schema_changes {
         Some(changes) => apply_schema_changes(effective_table_config, changes)?,
         None => effective_table_config,
     };
-    let properties_added = if properties_added.is_empty() {
+    let properties_added = if remaining_batches.is_empty() {
         HashMap::new()
     } else {
-        let validated = validate_and_canonicalize_properties_added(&properties_added)?;
+        let validated = validate_and_canonicalize_properties_added(&remaining_batches)?;
         // ALTER TABLE always keeps requested adds (Spark always rewrites Metadata for SET
         // TBLPROPERTIES). Data operations drop identical values so Metadata is emitted only when
         // a value actually changes.
@@ -436,17 +510,37 @@ fn try_new_update_table<MODE: ExecutionMode>(
             )
         }
     };
-    let has_property_changes = !properties_added.is_empty();
-    let should_emit_metadata = has_schema_changes || has_property_changes;
-    let effective_table_config = if has_property_changes {
-        apply_table_properties_added(effective_table_config, properties_added)?
-    } else {
-        effective_table_config
-    };
+    let has_property_adds = !properties_added.is_empty();
+    let mut should_emit_metadata = has_schema_changes || has_property_adds || has_property_removes;
+    if has_property_adds {
+        effective_table_config =
+            apply_table_properties_added(effective_table_config, properties_added)?;
+    }
+    if has_property_removes {
+        effective_table_config =
+            apply_table_properties_removed(effective_table_config, properties_removed)?;
+    }
+
+    // Property-driven feature enablement may upgrade the protocol and apply metadata side effects.
+    let protocol_prep =
+        prepare_protocol_for_update(&read_table_config, effective_table_config, &feature_signals)?;
+    effective_table_config = protocol_prep.table_config;
+    should_emit_metadata |= protocol_prep.metadata_side_effects;
+    let should_emit_protocol = protocol_prep.should_emit_protocol;
+    if should_emit_protocol {
+        should_emit_metadata = true;
+    }
+    if operation == UpdateTableOperation::AlterTable && !should_emit_metadata {
+        return Err(KernelError::invalid_transaction_state(
+            "ALTER TABLE requires at least one table change",
+        )
+        .into());
+    }
 
     Ok(Transaction {
         read_snapshot_opt: Some(read_snapshot),
         should_emit_metadata,
+        should_emit_protocol,
         user_domain_removals: domain_metadata_removals,
         is_blind_append,
         physical_clustering_columns: clustering_columns,
@@ -518,6 +612,18 @@ fn apply_table_properties_added(
     TableConfiguration::try_new_with_schema(&table_config, metadata, table_config.logical_schema())
 }
 
+/// Removes `properties_removed` keys from `table_config`'s metadata. Missing keys are ignored.
+fn apply_table_properties_removed(
+    table_config: TableConfiguration,
+    properties_removed: HashSet<String>,
+) -> Result<TableConfiguration> {
+    let metadata = table_config
+        .metadata()
+        .clone()
+        .with_configuration_keys_unset(properties_removed);
+    TableConfiguration::try_new_with_schema(&table_config, metadata, table_config.logical_schema())
+}
+
 fn validate_and_canonicalize_properties_added(
     properties_added: &[Vec<(String, String)>],
 ) -> KernelResult<HashMap<String, String>> {
@@ -540,6 +646,43 @@ fn validate_and_canonicalize_properties_added(
     Ok(validated)
 }
 
+fn validate_properties_removed_keys(properties_removed: &HashSet<String>) -> KernelResult<()> {
+    if let Some(key) = properties_removed
+        .iter()
+        .find(|key| is_delta_property_key(key))
+    {
+        return Err(KernelError::generic(format!(
+            "Unsetting '{DELTA_PROPERTY_PREFIX}' table properties is currently unsupported \
+             (requested '{key}')"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_properties_added_removed_no_overlap(
+    properties_added: &[Vec<(String, String)>],
+    properties_removed: &HashSet<String>,
+) -> KernelResult<()> {
+    let mut overlapping: Vec<&str> = properties_removed
+        .iter()
+        .filter(|key| {
+            properties_added
+                .iter()
+                .flatten()
+                .any(|(added_key, _)| added_key == *key)
+        })
+        .map(String::as_str)
+        .collect();
+    if overlapping.is_empty() {
+        return Ok(());
+    }
+    overlapping.sort_unstable();
+    Err(KernelError::generic(format!(
+        "Cannot set and unset the same table property in the same transaction. \
+         Properties set and unset: {overlapping:?}"
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -551,21 +694,61 @@ mod tests {
     use crate::arrow::array::{ArrayRef, Int32Array, StringArray};
     use crate::arrow::datatypes::Schema as ArrowSchema;
     use crate::arrow::record_batch::RecordBatch;
-    use crate::committer::FileSystemCommitter;
+    use crate::committer::{
+        CommitMetadata, CommitResponse, Committer, FileSystemCommitter, PublishMetadata,
+    };
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
+    use crate::engine_data::FilteredEngineData;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::expressions::ColumnName;
     use crate::expressions::column_name;
     use crate::schema::{DataType, StructField, schema_ref};
     use crate::snapshot::Snapshot;
     use crate::table_features::TableFeature;
-    use crate::table_properties::{ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3};
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::table_properties::ENABLE_DELETION_VECTORS;
+    use crate::table_properties::{
+        ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
+    };
     use crate::transaction::create_table::create_table;
     use crate::transaction::{SchemaOperation, UpdateTableOperation};
     use crate::unit_test_utils::{copy_test_table, load_test_table, test_schema_flat};
-    use crate::{Engine, Error, KernelError, Result, SnapshotRef};
+    use crate::{
+        Engine, Error, FileMeta, KernelError, KernelResult, KernelResultIterator, Result,
+        SnapshotRef,
+    };
+
+    /// Writes catalog-managed commits to the published log path so unit tests can create such
+    /// tables without a real catalog.
+    struct PublishingCatalogCommitter;
+
+    impl Committer for PublishingCatalogCommitter {
+        fn commit(
+            &self,
+            engine: &dyn Engine,
+            actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
+            commit_metadata: CommitMetadata,
+        ) -> KernelResult<CommitResponse> {
+            let path = commit_metadata.published_commit_path()?;
+            let written_size =
+                engine
+                    .json_handler()
+                    .write_json_file(&path, Box::new(actions), false)?;
+            Ok(CommitResponse::Committed {
+                file_meta: FileMeta::new(path, commit_metadata.in_commit_timestamp(), written_size),
+            })
+        }
+
+        fn is_catalog_committer(&self) -> bool {
+            true
+        }
+
+        fn publish(&self, _: &dyn Engine, _: PublishMetadata) -> KernelResult<()> {
+            Ok(())
+        }
+    }
 
     #[rstest]
     #[case::write(UpdateTableOperation::Write)]
@@ -966,12 +1149,147 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn with_table_properties_removed_unsets_user_property_and_keeps_protocol() -> Result<()> {
+        let engine = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let snapshot = create_table("memory:///", test_schema_flat(), "test-engine", true)
+            .with_table_properties([
+                ("app.owner", "kernel"),
+                ("app.team", "delta"),
+                ("delta.enableChangeDataFeed", "true"),
+            ])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+        let protocol_before = snapshot.table_configuration().protocol().clone();
+
+        let transaction = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_removed(["app.owner"])
+            .with_table_properties_added([("app.region", "eu")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+        let after = transaction
+            .effective_table_config
+            .metadata()
+            .configuration();
+        assert!(transaction.should_emit_metadata);
+        assert!(!after.contains_key("app.owner"));
+        assert_eq!(after.get("app.team").map(String::as_str), Some("delta"));
+        assert_eq!(after.get("app.region").map(String::as_str), Some("eu"));
+        assert_eq!(
+            transaction.effective_table_config.protocol(),
+            &protocol_before
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn with_table_properties_removed_matches_ordinary_keys_case_sensitively() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let transaction = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([("app.owner", "kernel")])
+            .with_table_properties_removed(["App.Owner"])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+        assert_eq!(
+            transaction
+                .effective_table_config
+                .metadata()
+                .configuration()
+                .get("app.owner")
+                .map(String::as_str),
+            Some("kernel")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn with_table_properties_removed_missing_key_still_emits_metadata() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let transaction = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_removed(["app.missing"])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+        assert!(transaction.should_emit_metadata);
+        assert!(
+            !transaction
+                .effective_table_config
+                .metadata()
+                .configuration()
+                .contains_key("app.missing")
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::delta_property("delta.checkpointInterval", "Unsetting 'delta.' table properties")]
+    #[case::feature_enabling_delta_property(
+        "delta.enableTypeWidening",
+        "Unsetting 'delta.' table properties"
+    )]
+    #[case::delta_property_mixed_case(
+        "DELTA.enableTypeWidening",
+        "Unsetting 'delta.' table properties"
+    )]
+    #[case::overlap_with_add("app.owner", "Cannot set and unset the same table property")]
+    fn with_table_properties_removed_rejects_invalid_keys(
+        #[case] key: &str,
+        #[case] expected: &str,
+    ) -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let mut builder = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_removed([key]);
+        if key == "app.owner" {
+            builder = builder.with_table_properties_added([("app.owner", "kernel")]);
+        }
+        let error = builder
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "error={error}, expected={expected}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn blind_append_rejects_property_removals() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let error = snapshot
+            .update_table(UpdateTableOperation::Write, "test-engine", true)
+            .with_blind_append()
+            .with_table_properties_removed(["app.owner"])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            Error::Kernel(KernelError::InvalidTransactionState(message))
+            if message == "blind append cannot include property changes"
+        ));
+        Ok(())
+    }
+
     #[rstest]
     #[case::unknown_delta("delta.unknownProperty", "true", "Unknown configuration key")]
-    #[case::feature_enablement(
-        "delta.enableChangeDataFeed",
-        "true",
+    #[case::check_constraint(
+        "delta.constraints.positive_id",
+        "id > 0",
         "Cannot modify the table property"
+    )]
+    #[case::malformed_interval(
+        "delta.checkpointInterval",
+        "not-a-number",
+        "Invalid value 'not-a-number' for table property"
+    )]
+    #[case::malformed_bool(
+        "delta.enableExpiredLogCleanup",
+        "yes",
+        "Invalid value 'yes' for table property"
     )]
     fn with_table_properties_added_rejects_via_registry(
         #[case] key: &str,
@@ -988,6 +1306,473 @@ mod tests {
         assert!(
             error.to_string().contains(expected),
             "error={error}, expected={expected}"
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::change_data_feed("delta.enableChangeDataFeed", "true", TableFeature::ChangeDataFeed)]
+    #[case::deletion_vectors("delta.enableDeletionVectors", "true", TableFeature::DeletionVectors)]
+    #[case::type_widening("delta.enableTypeWidening", "true", TableFeature::TypeWidening)]
+    #[case::in_commit_timestamps(
+        "delta.enableInCommitTimestamps",
+        "true",
+        TableFeature::InCommitTimestamp
+    )]
+    fn with_table_properties_added_enables_feature_and_upgrades_protocol(
+        #[case] key: &str,
+        #[case] value: &str,
+        #[case] feature: TableFeature,
+    ) -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let before = snapshot.table_configuration().protocol().clone();
+        assert!(
+            !snapshot
+                .table_configuration()
+                .is_feature_supported(&feature),
+            "{feature} unexpectedly already supported"
+        );
+
+        let transaction = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([(key, value)])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+        assert!(transaction.should_emit_metadata);
+        assert!(transaction.should_emit_protocol);
+        assert!(
+            transaction
+                .effective_table_config
+                .is_feature_supported(&feature)
+        );
+        assert!(
+            transaction
+                .effective_table_config
+                .is_feature_enabled(&feature)
+        );
+        assert_ne!(transaction.effective_table_config.protocol(), &before);
+        Ok(())
+    }
+
+    #[test]
+    fn with_table_properties_added_applies_v2_checkpoint_policy_side_effects() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let transaction = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([("delta.checkpointPolicy", "v2")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+        assert!(transaction.should_emit_metadata);
+        assert!(transaction.should_emit_protocol);
+        assert!(
+            transaction
+                .effective_table_config
+                .is_feature_supported(&TableFeature::V2Checkpoint)
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::column_mapping_name("delta.columnMapping.mode", "name")]
+    #[case::column_mapping_id("delta.columnMapping.mode", "id")]
+    fn with_table_properties_added_rejects_column_mapping_mode_change(
+        #[case] key: &str,
+        #[case] value: &str,
+    ) -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let error = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([(key, value)])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Changing column mapping mode on an existing table"),
+            "error={error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn with_table_properties_added_rejects_deletion_vectors_on_iceberg_compat_v2_table()
+    -> Result<()> {
+        let engine = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let snapshot = create_table("memory:///", test_schema_flat(), "test-engine", true)
+            .with_table_properties([
+                ("delta.enableIcebergCompatV2", "true"),
+                ("delta.columnMapping.mode", "name"),
+            ])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+        let error = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([("delta.enableDeletionVectors", "true")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be enabled together with"),
+            "error={error}"
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::row_tracking_property("delta.enableRowTracking", "true", "row tracking")]
+    #[case::row_tracking_signal("delta.feature.rowTracking", "supported", "row tracking")]
+    #[case::iceberg_compat_v1("delta.enableIcebergCompatV1", "true", "IcebergCompatV1")]
+    #[case::iceberg_compat_v2("delta.enableIcebergCompatV2", "true", "IcebergCompatV2")]
+    #[case::iceberg_compat_v3("delta.enableIcebergCompatV3", "true", "IcebergCompatV3")]
+    #[case::iceberg_compat_v2_signal(
+        "delta.feature.icebergCompatV2",
+        "supported",
+        "IcebergCompatV2"
+    )]
+    #[case::iceberg_compat_v3_signal(
+        "delta.feature.icebergCompatV3",
+        "supported",
+        "IcebergCompatV3"
+    )]
+    fn with_table_properties_added_rejects_existing_table_toggle(
+        #[case] key: &str,
+        #[case] value: &str,
+        #[case] expected: &str,
+    ) -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let error = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([(key, value)])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "error={error}, expected={expected}"
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::change_data_feed("delta.feature.changeDataFeed", TableFeature::ChangeDataFeed)]
+    #[case::deletion_vectors("delta.feature.deletionVectors", TableFeature::DeletionVectors)]
+    #[case::type_widening("delta.feature.typeWidening", TableFeature::TypeWidening)]
+    #[case::timestamp_ntz("delta.feature.timestampNtz", TableFeature::TimestampWithoutTimezone)]
+    fn with_table_properties_added_accepts_feature_signal_and_upgrades_protocol(
+        #[case] key: &str,
+        #[case] feature: TableFeature,
+    ) -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let transaction = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([(key, "supported")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+        assert!(transaction.should_emit_protocol);
+        assert!(
+            transaction
+                .effective_table_config
+                .is_feature_supported(&feature)
+        );
+        assert!(
+            !transaction
+                .effective_table_config
+                .metadata()
+                .configuration()
+                .keys()
+                .any(|k| k.starts_with("delta.feature.")),
+            "feature signals must not be written to table properties"
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::non_supported_value("delta.feature.deletionVectors", "enabled", "Only 'supported'")]
+    #[case::unknown_feature("delta.feature.notAFeature", "supported", "Enabling feature")]
+    #[case::not_allowlisted("delta.feature.identityColumns", "supported", "during UPDATE TABLE")]
+    #[case::clustering("delta.feature.clustering", "supported", "during UPDATE TABLE")]
+    #[case::row_tracking("delta.feature.rowTracking", "supported", "row tracking")]
+    fn with_table_properties_added_rejects_feature_signal(
+        #[case] key: &str,
+        #[case] value: &str,
+        #[case] expected: &str,
+    ) -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let error = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([(key, value)])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "error={error}, expected={expected}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn alter_table_feature_signal_for_already_enabled_feature_is_rejected_as_no_op() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-with-dv-small")?;
+        assert!(
+            snapshot
+                .table_configuration()
+                .is_feature_supported(&TableFeature::DeletionVectors)
+        );
+        let error = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([("delta.feature.deletionVectors", "supported")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ALTER TABLE requires at least one table change"),
+            "error={error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn blind_append_rejects_feature_signals() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let error = snapshot
+            .update_table(UpdateTableOperation::Write, "test-engine", true)
+            .with_blind_append()
+            .with_table_properties_added([("delta.feature.deletionVectors", "supported")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            Error::Kernel(KernelError::InvalidTransactionState(message))
+            if message == "blind append cannot include property changes"
+        ));
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::enable_writer_compat_v1("delta.enableIcebergWriterCompatV1", "true")]
+    #[case::enable_writer_compat_v3("delta.enableIcebergWriterCompatV3", "true")]
+    fn with_table_properties_added_rejects_writer_compat_toggle(
+        #[case] key: &str,
+        #[case] value: &str,
+    ) -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let error = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([(key, value)])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Enabling or disabling Iceberg writer compatibility"),
+            "error={error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn with_table_properties_added_enables_variant_shredding_preview() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let transaction = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([("delta.enableVariantShredding", "true")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+        let config = &transaction.effective_table_config;
+        assert!(config.is_feature_supported(&TableFeature::VariantShreddingPreview));
+        assert!(config.is_feature_supported(&TableFeature::VariantType));
+        assert!(!config.is_feature_supported(&TableFeature::VariantShredding));
+        Ok(())
+    }
+
+    #[test]
+    fn variant_shredding_ga_signal_adds_variant_type_and_skips_preview() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let transaction = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([
+                ("delta.enableVariantShredding", "true"),
+                ("delta.feature.variantShredding", "supported"),
+            ])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+        let config = &transaction.effective_table_config;
+        assert!(config.is_feature_supported(&TableFeature::VariantShredding));
+        assert!(config.is_feature_supported(&TableFeature::VariantType));
+        assert!(!config.is_feature_supported(&TableFeature::VariantShreddingPreview));
+        Ok(())
+    }
+
+    #[test]
+    fn with_table_properties_added_rejects_iceberg_uniform_without_compat_v2_or_v3() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let error = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([("delta.universalFormat.enabledFormats", "iceberg")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("enable iceberg uniform format"),
+            "error={error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn with_table_properties_added_accepts_hudi_universal_format() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let transaction = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([("delta.universalFormat.enabledFormats", "hudi")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        assert!(transaction.should_emit_metadata);
+        Ok(())
+    }
+
+    #[test]
+    fn add_timestamp_ntz_column_enables_timestamp_ntz_feature() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let transaction = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .add_column(StructField::nullable("ts", DataType::TIMESTAMP_NTZ))
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        assert!(
+            transaction
+                .effective_table_config
+                .is_feature_supported(&TableFeature::TimestampWithoutTimezone)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn with_table_properties_added_catalog_managed_sets_ict_enablement_property() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let transaction = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([("delta.feature.catalogManaged", "supported")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+        let config = &transaction.effective_table_config;
+        assert!(config.is_feature_supported(&TableFeature::CatalogManaged));
+        assert!(config.is_feature_supported(&TableFeature::InCommitTimestamp));
+        assert_eq!(
+            config
+                .metadata()
+                .configuration()
+                .get(ENABLE_IN_COMMIT_TIMESTAMPS)
+                .map(String::as_str),
+            Some("true")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn with_table_properties_added_catalog_managed_rejects_explicit_ict_disable() -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let error = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([
+                ("delta.feature.catalogManaged", "supported"),
+                ("delta.enableInCommitTimestamps", "false"),
+            ])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Catalog-managed tables require"),
+            "error={error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn with_table_properties_added_rejects_ict_disable_on_catalog_managed_table() -> Result<()> {
+        let engine = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let snapshot = create_table("memory:///", test_schema_flat(), "test-engine", true)
+            .with_table_properties([("delta.feature.catalogManaged", "supported")])
+            .build(engine.as_ref(), Box::new(PublishingCatalogCommitter))?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+        assert!(
+            snapshot
+                .table_configuration()
+                .is_feature_supported(&TableFeature::CatalogManaged)
+        );
+
+        let error = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([("delta.enableInCommitTimestamps", "false")])
+            .build(engine.as_ref(), Box::new(PublishingCatalogCommitter))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Cannot disable inCommitTimestamp on a catalogManaged table"),
+            "error={error}"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn with_table_properties_added_enables_iceberg_native_v4_fills_dv_and_ict() -> Result<()> {
+        let engine = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let snapshot = create_table("memory:///", test_schema_flat(), "test-engine", true)
+            .with_table_properties([
+                ("delta.columnMapping.mode", "id"),
+                ("delta.enableRowTracking", "true"),
+            ])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+
+        let transaction = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([("delta.enableIcebergNativeV4", "true")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+        let config = &transaction.effective_table_config;
+        let props = config.metadata().configuration();
+        assert_eq!(
+            props.get(ENABLE_DELETION_VECTORS).map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            props.get(ENABLE_IN_COMMIT_TIMESTAMPS).map(String::as_str),
+            Some("true")
+        );
+        assert!(config.is_feature_enabled(&TableFeature::DeletionVectors));
+        assert!(config.is_feature_enabled(&TableFeature::InCommitTimestamp));
+        assert!(config.is_feature_supported(&TableFeature::IcebergNativeV4Preview));
+        assert!(config.is_feature_supported(&TableFeature::AdaptiveMetadataPreview));
+        Ok(())
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn with_table_properties_added_rejects_iceberg_native_v4_with_dv_disabled() -> Result<()> {
+        let engine = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let snapshot = create_table("memory:///", test_schema_flat(), "test-engine", true)
+            .with_table_properties([
+                ("delta.columnMapping.mode", "id"),
+                ("delta.enableRowTracking", "true"),
+                ("delta.enableDeletionVectors", "false"),
+            ])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+
+        let error = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([("delta.enableIcebergNativeV4", "true")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "IcebergNativeV4 requires 'delta.enableDeletionVectors' to be 'true', got 'false'"
+            ),
+            "error={error}"
         );
         Ok(())
     }
