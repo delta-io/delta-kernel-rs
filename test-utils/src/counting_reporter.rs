@@ -432,6 +432,7 @@ impl MetricsReporter for CountingReporter {
             | MetricEvent::ChecksumWriteSuccess(_)
             | MetricEvent::ChecksumWriteFailure(_)
             | MetricEvent::ScanPlanGenerationCompleted(_)
+            | MetricEvent::ScanPlanGenerationFailed(_)
             | MetricEvent::ScanMetadataCompleted(_) => {}
         }
     }
