@@ -454,16 +454,16 @@ pub fn into_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
         Err(e) => return e.to_compile_error().into(),
     };
     let field_types = fields.iter().map(|field| &field.ty);
-    let value_binding = quote! { value };
+    let value = quote! { value };
     let field_values = fields.iter().map(|field| {
         let ident = &field.ident;
         if has_named_attr(&field.attrs, "allow_null_container_values") {
             quote_spanned! { field.span() =>
                 delta_kernel::schema::derive_macro_utils::IntoNullableContainerScalar::
-                    into_nullable_container_scalar(#value_binding.#ident)
+                    into_nullable_container_scalar(#value.#ident)
             }
         } else {
-            quote_spanned! { field.span() => #value_binding.#ident.into() }
+            quote_spanned! { field.span() => #value.#ident.into() }
         }
     });
 
