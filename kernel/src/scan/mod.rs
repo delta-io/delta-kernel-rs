@@ -876,11 +876,16 @@ impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
     }
 }
 
-/// Prefixes all column references in a predicate with a fixed path. The checkpoint path prefixes
-/// stat expressions that already carry their `stats_parsed.*` root (e.g. `stats_parsed.minValues.x
-/// > 100`) with `add`, yielding `add.stats_parsed.minValues.x > 100`.
-struct PrefixColumns {
+/// Prefixes every column reference in a predicate with a fixed path. For example, the prefix
+/// `add` turns `stats_parsed.minValues.x > 100` into `add.stats_parsed.minValues.x > 100`.
+pub(crate) struct PrefixColumns {
     prefix: ColumnName,
+}
+
+impl PrefixColumns {
+    pub(crate) fn new(prefix: ColumnName) -> Self {
+        Self { prefix }
+    }
 }
 
 impl<'a> ExpressionTransform<'a> for PrefixColumns {
@@ -1642,9 +1647,7 @@ impl Scan {
             &self.state_info.eligible_physical_stats_columns,
         )?;
 
-        let mut prefixer = PrefixColumns {
-            prefix: column_name!("add"),
-        };
+        let mut prefixer = PrefixColumns::new(column_name!("add"));
         let prefixed = prefixer.transform_pred(&skipping_pred);
         Some(Arc::new(prefixed.into_owned()))
     }

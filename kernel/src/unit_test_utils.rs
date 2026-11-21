@@ -328,6 +328,24 @@ pub(crate) fn nullable_add_files(paths: &[&str]) -> RecordBatch {
     concat_batches(&batches[0].schema(), &batches).expect("failed to concatenate add-file rows")
 }
 
+/// A `stats` column for `batch` recording one record per file, which row tracking requires.
+#[cfg(any(feature = "declarative-plans", feature = "adaptive-metadata-in-dev"))]
+pub(crate) fn one_record_stats(batch: &RecordBatch) -> ArrayRef {
+    let schema = batch.schema();
+    let DataType::Struct(fields) = schema.field_with_name("stats").unwrap().data_type() else {
+        panic!("add-file stats must be a struct");
+    };
+    let rows = batch.num_rows();
+    let columns = fields
+        .iter()
+        .map(|field| match field.name().as_str() {
+            "numRecords" => Arc::new(Int64Array::from(vec![1; rows])) as ArrayRef,
+            _ => new_null_array(field.data_type(), rows),
+        })
+        .collect();
+    Arc::new(StructArray::try_new(fields.clone(), columns, None).unwrap())
+}
+
 pub(crate) fn set_field_as_null(batch: &RecordBatch, field: &str, row: usize) -> RecordBatch {
     let schema = batch.schema();
     let index = schema.index_of(field).expect("field in schema");
@@ -881,23 +899,6 @@ pub(crate) mod adaptive_metadata_fixtures {
             .unwrap()
             .unwrap_committed()
             .commit_version()
-    }
-
-    /// A `stats` column for `batch` recording one record per file, which row tracking requires.
-    fn one_record_stats(batch: &RecordBatch) -> ArrayRef {
-        let schema = batch.schema();
-        let DataType::Struct(fields) = schema.field_with_name("stats").unwrap().data_type() else {
-            panic!("add-file stats must be a struct");
-        };
-        let rows = batch.num_rows();
-        let columns = fields
-            .iter()
-            .map(|field| match field.name().as_str() {
-                "numRecords" => Arc::new(Int64Array::from(vec![1; rows])) as ArrayRef,
-                _ => new_null_array(field.data_type(), rows),
-            })
-            .collect();
-        Arc::new(StructArray::try_new(fields.clone(), columns, None).unwrap())
     }
 
     fn write_transaction(engine: &SyncEngine, snapshot: SnapshotRef) -> Transaction {
