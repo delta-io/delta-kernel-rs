@@ -6,7 +6,7 @@ use delta_kernel::metrics as kernel;
 use delta_kernel::scan::StructStats;
 
 use super::{MetricEvent, MetricId, correlation_id_slice};
-use crate::checkpoint::{FfiCheckpointInfo, FfiSelectedCheckpointType, visit};
+use crate::checkpoint::{FfiCheckpointInfo, FfiCheckpointMetrics, visit};
 use crate::delta_types::{FfiColumnName, FfiColumnNameArray};
 use crate::scan::{FfiPartitionValuesOptions, FfiStatsOptions};
 use crate::{FfiSlice, KernelStringSlice, NullableCvoid, OptionalValue, kernel_string_slice};
@@ -33,22 +33,6 @@ pub enum ReplayBase {
     Empty,
 }
 
-/// Checkpoint selection, shared information, and discovery work for this planning attempt.
-/// The info pointer and all nested values are borrowed only for the metric callback.
-#[repr(C)]
-pub struct CheckpointMetrics {
-    /// Selected version, retained if discovery fails.
-    pub version: u64,
-    /// Type known at selection time; the resolved type is available in `info`.
-    pub checkpoint_type: OptionalValue<FfiSelectedCheckpointType>,
-    /// Null if discovery did not produce checkpoint information.
-    pub info: *const FfiCheckpointInfo,
-    pub cache_hit: OptionalValue<bool>,
-    pub root_footer_calls: u64,
-    pub sidecar_footer_calls: u64,
-    pub metadata_query_calls: u64,
-}
-
 /// A scan-plan-generation attempt. The record, checkpoint pointer, strings, and column paths are
 /// borrowed only for the metric callback; copy every retained value before returning.
 #[repr(C)]
@@ -65,7 +49,7 @@ pub struct ScanPlanReport {
     pub partition_timezone: OptionalValue<KernelStringSlice>,
     pub replay_base: OptionalValue<ReplayBase>,
     /// Null when no checkpoint was used.
-    pub checkpoint: *const CheckpointMetrics,
+    pub checkpoint: *const FfiCheckpointMetrics,
     pub commit_start_version: OptionalValue<u64>,
     pub commit_end_version: OptionalValue<u64>,
     pub commit_total_size_bytes: u64,
@@ -123,17 +107,17 @@ pub(super) fn with_event<F: FnOnce(MetricEvent)>(
             StructStats::AllIndexed { .. } => FfiStatsOptions::AllStructWithExtraIndexed(columns),
             StructStats::Columns { .. } => FfiStatsOptions::StructColumns(columns),
         };
-        let checkpoint = event
+        let metrics = event
             .checkpoint
             .as_ref()
-            .map(|checkpoint| CheckpointMetrics {
-                version: checkpoint.version,
-                checkpoint_type: checkpoint.checkpoint_type.map(Into::into).into(),
+            .map(|metrics| FfiCheckpointMetrics {
+                version: metrics.version,
+                checkpoint_type: metrics.checkpoint_type.map(Into::into).into(),
                 info,
-                cache_hit: checkpoint.cache_hit.into(),
-                root_footer_calls: checkpoint.root_footer_calls,
-                sidecar_footer_calls: checkpoint.sidecar_footer_calls,
-                metadata_query_calls: checkpoint.metadata_query_calls,
+                cache_hit: metrics.cache_hit.into(),
+                root_footer_calls: metrics.root_footer_calls,
+                sidecar_footer_calls: metrics.sidecar_footer_calls,
+                metadata_query_calls: metrics.metadata_query_calls,
             });
         let record = ScanPlanReport {
             operation_id: event.operation_id.into(),
@@ -174,7 +158,7 @@ pub(super) fn with_event<F: FnOnce(MetricEvent)>(
                     kernel::ReplayBase::Empty => ReplayBase::Empty,
                 })
                 .into(),
-            checkpoint: checkpoint
+            checkpoint: metrics
                 .as_ref()
                 .map_or(std::ptr::null(), std::ptr::from_ref),
             commit_start_version: event.metadata_plan.commit_start_version.into(),
@@ -191,7 +175,7 @@ pub(super) fn with_event<F: FnOnce(MetricEvent)>(
     let info = event
         .checkpoint
         .as_ref()
-        .and_then(|checkpoint| checkpoint.info.as_deref());
+        .and_then(|metrics| metrics.info.as_deref());
     let mut context = (event, failed, Some(f));
     if let Err(error) = visit(info, Some(NonNull::from(&mut context).cast()), accept::<F>) {
         tracing::warn!(%error, "Failed to convert scan-plan metric checkpoint information");
@@ -205,7 +189,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::checkpoint::checkpoint_handles;
+    use crate::checkpoint::{FfiSelectedCheckpointType, checkpoint_handles};
     use crate::ffi_metrics::with_ffi_event;
     use crate::{TryFromStringSlice as _, free_engine, free_snapshot};
 
