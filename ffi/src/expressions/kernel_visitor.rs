@@ -17,10 +17,11 @@ use crate::expressions::FfiOpaquePredicateOp;
 use crate::expressions::opaque_eval::{COpaqueEvalCallbacks, FfiOpaqueEvalCallbacks};
 use crate::expressions::{FfiMapToStructOptions, SharedExpression, SharedPredicate};
 use crate::handle::Handle;
+use crate::panic::catch_panic_into_result;
 use crate::scan::{EngineExpression, EnginePredicate};
 use crate::{
-    EngineIterator, ErrorAllocators, ExternResult, IntoExternResult, KernelStringSlice,
-    ReferenceSet, TryFromStringSlice,
+    EngineIterator, ErrorAllocators, ExternResult, KernelStringSlice, ReferenceSet,
+    TryFromStringSlice,
 };
 
 pub(crate) enum ExpressionOrPredicate {
@@ -241,8 +242,11 @@ pub unsafe extern "C" fn visit_expression_column(
     parts_len: usize,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let result = unsafe { visit_expression_column_impl(state, parts, parts_len) };
-    unsafe { result.into_extern_result(&*error_allocators) }
+    unsafe {
+        catch_panic_into_result(&*error_allocators, || {
+            visit_expression_column_impl(state, parts, parts_len)
+        })
+    }
 }
 /// # Safety
 /// `parts` must point to `parts_len` valid [`KernelStringSlice`], each valid for the
@@ -301,9 +305,12 @@ pub unsafe extern "C" fn visit_expression_literal_string(
     value: KernelStringSlice,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let value = unsafe { String::try_from_slice(&value) };
-    let result = visit_expression_literal_string_impl(state, value);
-    unsafe { result.into_extern_result(&*error_allocators) }
+    unsafe {
+        catch_panic_into_result(&*error_allocators, || {
+            let value = String::try_from_slice(&value);
+            visit_expression_literal_string_impl(state, value)
+        })
+    }
 }
 fn visit_expression_literal_string_impl(
     state: &mut KernelExpressionVisitorState,
@@ -447,8 +454,11 @@ pub unsafe extern "C" fn visit_expression_literal_decimal(
     scale: u8,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let result = visit_expression_literal_decimal_impl(state, value_hi, value_lo, precision, scale);
-    unsafe { result.into_extern_result(&*error_allocators) }
+    unsafe {
+        catch_panic_into_result(&*error_allocators, || {
+            visit_expression_literal_decimal_impl(state, value_hi, value_lo, precision, scale)
+        })
+    }
 }
 
 fn visit_expression_literal_decimal_impl(
@@ -643,8 +653,11 @@ pub unsafe extern "C" fn visit_expression_literal_null(
     scale: u8,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let result = visit_expression_literal_null_impl(state, type_tag, precision, scale);
-    unsafe { result.into_extern_result(&*error_allocators) }
+    unsafe {
+        catch_panic_into_result(&*error_allocators, || {
+            visit_expression_literal_null_impl(state, type_tag, precision, scale)
+        })
+    }
 }
 
 fn visit_expression_literal_null_impl(
@@ -741,8 +754,11 @@ pub unsafe extern "C" fn visit_engine_expression(
     engine_expression: &mut EngineExpression,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<Handle<SharedExpression>> {
-    let result = visit_engine_expression_impl(engine_expression);
-    unsafe { result.into_extern_result(&*error_allocators) }
+    unsafe {
+        catch_panic_into_result(&*error_allocators, || {
+            visit_engine_expression_impl(engine_expression)
+        })
+    }
 }
 
 fn visit_engine_expression_impl(
@@ -776,8 +792,11 @@ pub unsafe extern "C" fn visit_engine_predicate(
     engine_predicate: &mut EnginePredicate,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<Handle<SharedPredicate>> {
-    let result = visit_engine_predicate_impl(engine_predicate);
-    unsafe { result.into_extern_result(&*error_allocators) }
+    unsafe {
+        catch_panic_into_result(&*error_allocators, || {
+            visit_engine_predicate_impl(engine_predicate)
+        })
+    }
 }
 
 fn visit_engine_predicate_impl(
@@ -835,9 +854,12 @@ pub unsafe extern "C" fn visit_predicate_opaque(
     children: &mut EngineIterator,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let name = unsafe { String::try_from_slice(&name) };
-    let result = visit_predicate_opaque_impl(state, name, children);
-    unsafe { result.into_extern_result(&*error_allocators) }
+    unsafe {
+        catch_panic_into_result(&*error_allocators, || {
+            let name = String::try_from_slice(&name);
+            visit_predicate_opaque_impl(state, name, children)
+        })
+    }
 }
 
 fn visit_predicate_opaque_impl(
@@ -884,11 +906,14 @@ pub unsafe extern "C" fn visit_predicate_opaque_with_eval(
     callbacks: COpaqueEvalCallbacks,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<usize> {
-    let name = unsafe { String::try_from_slice(&name) };
-    // Wrap immediately so free_state fires exactly once on every exit path.
-    let callbacks = Arc::new(FfiOpaqueEvalCallbacks::new(callbacks));
-    let result = visit_predicate_opaque_with_eval_impl(state, name, children, callbacks);
-    unsafe { result.into_extern_result(&*error_allocators) }
+    unsafe {
+        catch_panic_into_result(&*error_allocators, || {
+            let name = String::try_from_slice(&name);
+            // Wrap immediately so free_state fires exactly once on every exit path.
+            let callbacks = Arc::new(FfiOpaqueEvalCallbacks::new(callbacks));
+            visit_predicate_opaque_with_eval_impl(state, name, children, callbacks)
+        })
+    }
 }
 
 #[cfg(feature = "default-engine-base")]

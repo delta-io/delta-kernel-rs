@@ -1,6 +1,21 @@
 //! FFI interface for the delta kernel
 //!
 //! Exposes that an engine needs to call from C/C++ to interface with kernel
+//!
+//! # Panic containment
+//!
+//! C exports returning [`error::ExternResult`] catch ordinary unwinding Rust panics and return
+//! [`error::FFIKernelError::InternalError`] through the operation's existing error allocator.
+//! The error message includes the FFI call location and panic payload and is logged through
+//! tracing. Ordinary errors keep their existing codes and messages.
+//!
+//! Consuming calls still consume their inputs on failure. Discard failed work and create fresh
+//! builders; containment does not roll back engine state or side effects. A transaction panic
+//! can leave the commit outcome unknown; reconcile that outcome before retrying. Containment does
+//! not establish that arbitrary connector implementations can be reused after a panic.
+//!
+//! Each nested C entry returning an error needs its own boundary; foreign callbacks must not
+//! unwind.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 // we re-allow panics in tests
@@ -70,7 +85,7 @@ pub mod error;
 pub mod rest_engine;
 #[cfg(feature = "default-engine-base")]
 pub mod table_changes;
-use error::{AllocateError, ErrorAllocators, ExternResult, IntoExternResult};
+use error::{AllocateError, ErrorAllocators, ExternResult};
 #[cfg(feature = "delta-kernel-unity-catalog")]
 pub mod delta_kernel_unity_catalog;
 pub mod expressions;
@@ -497,8 +512,11 @@ pub unsafe extern "C" fn allocate_kernel_string(
     kernel_str: KernelStringSlice,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<Handle<ExclusiveRustString>> {
-    let result = allocate_kernel_string_impl(kernel_str);
-    unsafe { result.into_extern_result(&*error_allocators) }
+    unsafe {
+        catch_panic_into_result(&*error_allocators, || {
+            allocate_kernel_string_impl(kernel_str)
+        })
+    }
 }
 
 fn allocate_kernel_string_impl(
@@ -885,10 +903,13 @@ pub unsafe extern "C" fn get_engine_builder(
     path: KernelStringSlice,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<Handle<ExclusiveEngineBuilder>> {
-    let error_allocators = unsafe { *error_allocators };
-    let url = unsafe { unwrap_and_parse_path_as_url(path) };
-    let result = get_engine_builder_impl(url, error_allocators);
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe {
+        catch_panic_into_result(&*error_allocators, || {
+            let error_allocators = *error_allocators;
+            let url = unwrap_and_parse_path_as_url(path);
+            get_engine_builder_impl(url, error_allocators)
+        })
+    }
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -937,10 +958,13 @@ pub unsafe extern "C" fn builder_with_option(
     key: KernelStringSlice,
     value: KernelStringSlice,
 ) -> ExternResult<Handle<ExclusiveEngineBuilder>> {
-    let mut builder = unsafe { builder.into_inner() };
-    let error_allocators = builder.error_allocators;
-    let result = builder_with_option_impl(&mut builder, key, value).map(|_| builder.into());
-    unsafe { result.into_extern_result(&error_allocators) }
+    let allocator = unsafe { builder.as_ref() }.error_allocators;
+    unsafe {
+        catch_panic_into_result(&allocator, || {
+            let mut builder = builder.into_inner();
+            builder_with_option_impl(&mut builder, key, value).map(|_| builder.into())
+        })
+    }
 }
 #[cfg(feature = "default-engine-base")]
 fn builder_with_option_impl(
@@ -1039,12 +1063,14 @@ pub unsafe extern "C" fn builder_with_rest_object_store(
     callback: Option<rest_engine::CAuthHeaderCallback>,
     context: NullableCvoid,
 ) -> ExternResult<Handle<ExclusiveEngineBuilder>> {
-    let mut builder = unsafe { builder.into_inner() };
-    let error_allocators = builder.error_allocators;
-    let result =
-        builder_with_rest_object_store_impl(&mut builder, endpoint_config, callback, context)
-            .map(|_| builder.into());
-    unsafe { result.into_extern_result(&error_allocators) }
+    let allocator = unsafe { builder.as_ref() }.error_allocators;
+    unsafe {
+        catch_panic_into_result(&allocator, || {
+            let mut builder = builder.into_inner();
+            builder_with_rest_object_store_impl(&mut builder, endpoint_config, callback, context)
+                .map(|_| builder.into())
+        })
+    }
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -1080,16 +1106,20 @@ fn builder_with_rest_object_store_impl(
 pub unsafe extern "C" fn builder_build(
     builder: Handle<ExclusiveEngineBuilder>,
 ) -> ExternResult<Handle<SharedExternEngine>> {
-    let builder_box = unsafe { builder.into_inner() };
-    let result = get_default_engine_impl(
-        builder_box.url,
-        builder_box.options,
-        builder_box.object_store_backend,
-        builder_box.multithreaded_executor_config,
-        builder_box.io_config,
-        builder_box.error_allocators,
-    );
-    unsafe { result.into_extern_result(&builder_box.error_allocators) }
+    let allocator = unsafe { builder.as_ref() }.error_allocators;
+    unsafe {
+        catch_panic_into_result(&allocator, || {
+            let builder_box = builder.into_inner();
+            get_default_engine_impl(
+                builder_box.url,
+                builder_box.options,
+                builder_box.object_store_backend,
+                builder_box.multithreaded_executor_config,
+                builder_box.io_config,
+                builder_box.error_allocators,
+            )
+        })
+    }
 }
 
 /// Creates a default engine for `path` and retains a copy of its error allocation callbacks.
@@ -1107,10 +1137,13 @@ pub unsafe extern "C" fn get_default_engine(
     path: KernelStringSlice,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<Handle<SharedExternEngine>> {
-    let error_allocators = unsafe { *error_allocators };
-    let url = unsafe { unwrap_and_parse_path_as_url(path) };
-    let result = get_default_default_engine_impl(url, error_allocators);
-    unsafe { result.into_extern_result(&error_allocators) }
+    unsafe {
+        catch_panic_into_result(&*error_allocators, || {
+            let error_allocators = *error_allocators;
+            let url = unwrap_and_parse_path_as_url(path);
+            get_default_default_engine_impl(url, error_allocators)
+        })
+    }
 }
 
 // get the default version of the default engine :)
