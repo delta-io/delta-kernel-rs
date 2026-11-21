@@ -1626,7 +1626,7 @@ mod tests {
             ExpressionStructPatchBuilder, MapToStructOptions, Predicate, Scalar, UnaryExpressionOp,
             col, column_name, expr, lit, null_lit,
         };
-        use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
+        use crate::schema::{ArrayType, DataType, DecimalType, MapType, schema_ref};
         use crate::unit_test_utils::assert_result_error_with_message;
 
         // ==================== Expression::Literal Tests ====================
@@ -1693,10 +1693,7 @@ mod tests {
                 // Struct
                 Expression::Literal(Scalar::Struct(
                     StructData::try_new(
-                        vec![
-                            StructField::nullable("x", DataType::INTEGER),
-                            StructField::nullable("y", DataType::STRING),
-                        ],
+                        schema_ref! { nullable "x": INTEGER, nullable "y": STRING },
                         vec![Scalar::Integer(42), Scalar::String("hello".to_string())],
                     )
                     .unwrap(),

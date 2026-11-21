@@ -162,13 +162,17 @@ pub fn derive_to_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStre
     let output = quote! {
         #[automatically_derived]
         impl delta_kernel::schema::ToSchema for #struct_ident {
-            fn to_schema() -> delta_kernel::schema::StructType {
-                use delta_kernel::schema::derive_macro_utils::{
-                    ToDataType as _, GetStructField as _, GetNullableContainerStructField as _,
-                };
-                delta_kernel::schema::StructType::new_unchecked([
-                    #schema_fields
-                ])
+            fn schema_ref() -> &'static delta_kernel::schema::SchemaRef {
+                static SCHEMA_INFO: ::std::sync::LazyLock<delta_kernel::schema::SchemaRef> =
+                    ::std::sync::LazyLock::new(|| {
+                        use delta_kernel::schema::derive_macro_utils::{
+                            ToDataType as _, GetStructField as _, GetNullableContainerStructField as _,
+                        };
+                        ::std::sync::Arc::new(delta_kernel::schema::StructType::new_unchecked([
+                            #schema_fields
+                        ]))
+                    });
+                &SCHEMA_INFO
             }
         }
     };
@@ -450,15 +454,16 @@ pub fn into_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
         Err(e) => return e.to_compile_error().into(),
     };
     let field_types = fields.iter().map(|field| &field.ty);
+    let value_binding = quote! { value };
     let field_values = fields.iter().map(|field| {
         let ident = &field.ident;
         if has_named_attr(&field.attrs, "allow_null_container_values") {
             quote_spanned! { field.span() =>
                 delta_kernel::schema::derive_macro_utils::IntoNullableContainerScalar::
-                    into_nullable_container_scalar(value.#ident)
+                    into_nullable_container_scalar(#value_binding.#ident)
             }
         } else {
-            quote_spanned! { field.span() => value.#ident.into() }
+            quote_spanned! { field.span() => #value_binding.#ident.into() }
         }
     });
 
@@ -471,7 +476,7 @@ pub fn into_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
         {
             fn from(value: #struct_name) -> Self {
                 Self::from_values_unchecked(
-                    <#struct_name as delta_kernel::schema::ToSchema>::to_schema(),
+                    <#struct_name as delta_kernel::schema::ToSchema>::schema_ref().clone(),
                     vec![ #(#field_values),* ],
                 )
             }
@@ -547,7 +552,7 @@ fn try_from_struct_data_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
                 let mut fields =
                     delta_kernel::schema::derive_macro_utils::StructDataFields::try_new(
                         value,
-                        <#struct_name as delta_kernel::schema::ToSchema>::to_schema(),
+                        <#struct_name as delta_kernel::schema::ToSchema>::schema_ref().clone(),
                     )?;
                 let result = Self {
                     #(#field_idents: fields.take_field(stringify!(#schema_field_names))?,)*
