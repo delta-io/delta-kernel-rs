@@ -253,6 +253,10 @@ pub enum KernelError {
     ScalarConversion(#[from] ScalarConversionError),
 
     /// A generic error with a message
+    #[deprecated(
+        note = "Use an appropriate DeltaError, an existing specific KernelError variant, \
+                or add a new KernelError variant"
+    )]
     #[error("Generic delta kernel error: {0}")]
     Generic(String),
 
@@ -481,6 +485,10 @@ pub enum KernelError {
     TableAlreadyExistsAtPath(String),
 
     /// Some functionality is currently unsupported
+    #[deprecated(
+        note = "Use an appropriate DeltaError, an existing specific KernelError variant, \
+                or add a new KernelError variant"
+    )]
     #[error("Unsupported: {0}")]
     Unsupported(String),
 
@@ -557,6 +565,12 @@ impl KernelError {
             source: source.into(),
         }
     }
+
+    /// Creates a generic error from a message.
+    #[deprecated(
+        note = "Use an appropriate DeltaError, an existing specific KernelError variant, \
+                or add a new KernelError variant"
+    )]
     pub fn generic(msg: impl ToString) -> Self {
         Self::Generic(msg.to_string())
     }
@@ -638,6 +652,11 @@ impl KernelError {
         Self::InvalidTransactionState(msg.to_string())
     }
 
+    /// Creates an error describing unsupported functionality.
+    #[deprecated(
+        note = "Use an appropriate DeltaError, an existing specific KernelError variant, \
+                or add a new KernelError variant"
+    )]
     pub fn unsupported(msg: impl ToString) -> Self {
         Self::Unsupported(msg.to_string())
     }
