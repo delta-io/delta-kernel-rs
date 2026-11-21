@@ -4,6 +4,7 @@ use std::backtrace::{Backtrace, BacktraceStatus};
 use std::convert::Infallible;
 use std::num::ParseIntError;
 use std::str::Utf8Error;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::Version;
 #[cfg(feature = "default-engine-base")]
@@ -18,6 +19,16 @@ mod delta_error_condition;
 
 pub use delta_error::{DeltaError, DeltaErrorParameter};
 pub use delta_error_condition::DeltaErrorCondition;
+
+/// Enables construction-site error backtraces independently of Rust's environment settings.
+///
+/// This process-wide, idempotent setting affects errors created afterward and cannot be disabled.
+/// It enables capture for every [`DeltaError`] and for [`KernelError::with_backtrace`]; it does not
+/// add backtraces to other Kernel errors. Without this call, capture follows `RUST_LIB_BACKTRACE`
+/// and `RUST_BACKTRACE`. Capture still requires platform support and can be expensive.
+pub fn enable_error_backtraces() {
+    FORCE_ERROR_BACKTRACES.store(true, Ordering::Relaxed);
+}
 
 /// An error returned by a Delta Kernel operation.
 #[derive(Debug, thiserror::Error)]
@@ -696,10 +707,10 @@ impl KernelError {
         }
     }
 
-    // Capture a backtrace when the error is constructed.
+    /// Captures a backtrace when enabled through the environment or [`enable_error_backtraces`].
     #[must_use]
     pub fn with_backtrace(self) -> Self {
-        let backtrace = Backtrace::capture();
+        let backtrace = capture_error_backtrace();
         match backtrace.status() {
             BacktraceStatus::Captured => Self::Backtraced {
                 source: Box::new(self),
@@ -751,5 +762,15 @@ impl From<object_store::Error> for KernelError {
 impl From<Infallible> for KernelError {
     fn from(value: Infallible) -> Self {
         match value {}
+    }
+}
+
+static FORCE_ERROR_BACKTRACES: AtomicBool = AtomicBool::new(false);
+
+fn capture_error_backtrace() -> Backtrace {
+    if FORCE_ERROR_BACKTRACES.load(Ordering::Relaxed) {
+        Backtrace::force_capture()
+    } else {
+        Backtrace::capture()
     }
 }
