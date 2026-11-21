@@ -3,7 +3,7 @@
 //! of the stats struct for that ID in `content_stats`. The IDs are recorded in the
 //! `delta.adaptiveMetadata` domain.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::actions::{CheckpointAction, DomainMetadata};
 use crate::{KernelError, KernelResult};
@@ -12,7 +12,7 @@ use crate::{KernelError, KernelResult};
 pub(crate) const ADAPTIVE_METADATA_DOMAIN_NAME: &str = "delta.adaptiveMetadata";
 
 /// The field IDs of the file metadata fields a table maps. The default maps none.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct FileMetadataFieldIds {
     /// The field ID of `add.clusteringProvider`, or `None` when the table does not map it.
