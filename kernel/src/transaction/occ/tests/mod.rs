@@ -2,24 +2,26 @@
 
 mod winner_check_plan;
 
+use std::collections::HashMap;
+
 use ::test_utils::add_commit;
 use futures::executor::block_on;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use url::Url;
 
 use super::*;
-use crate::actions::{CommitInfo, Remove};
+use crate::actions::{CommitInfo, DomainMetadata, Protocol, Remove, SetTransaction};
 use crate::commit_range::CommitRange;
 use crate::engine::sync::SyncEngine;
 use crate::engine::sync::plan::SyncPlanExecutor;
 use crate::expressions::Scalar;
 use crate::object_store::local::LocalFileSystem;
 use crate::plans::{Operation, PlanExecutor as _};
-use crate::transaction::occ::winner_check_plan::{
-    WinnerSummary, read_winner_summaries, winner_check_plan,
-};
-use crate::unit_test_utils::Action;
+use crate::row_tracking::RowTrackingDomainMetadata;
+use crate::schema::schema;
+use crate::transaction::occ::winner_check_plan::{read_winner_summaries, winner_check_plan};
+use crate::unit_test_utils::{Action, metadata_action};
 
 const READ_VERSION: Version = 6;
 
@@ -50,6 +52,37 @@ fn remove(path: &str, data_change: bool) -> Value {
         data_change,
         ..Default::default()
     }))
+}
+
+fn protocol() -> Value {
+    line(Action::Protocol(Protocol::try_new_legacy(1, 2).unwrap()))
+}
+
+fn metadata() -> Value {
+    line(metadata_action(
+        "test-table",
+        &schema! { nullable "date": DATE },
+        0,
+    ))
+}
+
+fn domain(name: &str, configuration: &str) -> Value {
+    let domain = DomainMetadata::new(name.into(), configuration.into());
+    line(Action::DomainMetadata(domain))
+}
+
+fn removed_domain(name: &str) -> Value {
+    let domain = DomainMetadata::remove(name.into(), "{}".into());
+    line(Action::DomainMetadata(domain))
+}
+
+fn row_tracking(high_water_mark: i64) -> Value {
+    let domain = RowTrackingDomainMetadata::new(high_water_mark);
+    line(Action::DomainMetadata(domain.try_into().unwrap()))
+}
+
+fn txn(app_id: &str) -> Value {
+    line(Action::Txn(SetTransaction::new(app_id.into(), 3, Some(0))))
 }
 
 // === Fixtures ===
@@ -97,15 +130,27 @@ fn fake_summary(version: Version, operation: &str, is_blind_append: bool) -> Win
         operation: Some(operation.to_string()),
         is_blind_append,
         in_commit_timestamp: None,
+        first_violation: None,
     }
 }
 
-fn winner_summaries(winners: &[WinningCommit]) -> Vec<WinnerSummary> {
-    try_winner_summaries(winners).unwrap()
+fn deleted_date_facts() -> LoserFacts {
+    LoserFacts {
+        changes_metadata: false,
+        written_domains: vec![],
+        read_app_ids: vec![],
+    }
 }
 
-fn try_winner_summaries(winners: &[WinningCommit]) -> KernelResult<Vec<WinnerSummary>> {
-    let plan = winner_check_plan(winners).unwrap();
+fn winner_summaries(facts: &LoserFacts, winners: &[WinningCommit]) -> Vec<WinnerSummary> {
+    try_winner_summaries(facts, winners).unwrap()
+}
+
+fn try_winner_summaries(
+    facts: &LoserFacts,
+    winners: &[WinningCommit],
+) -> KernelResult<Vec<WinnerSummary>> {
+    let plan = winner_check_plan(facts, winners).unwrap();
     let result = SyncPlanExecutor::default().execute_op(Operation::QueryPlan(plan));
     read_winner_summaries(result.unwrap(), winners)
 }
@@ -117,4 +162,12 @@ fn only_summary(summaries: &[WinnerSummary]) -> &WinnerSummary {
         panic!("expected one winner summary, got {summaries:?}");
     };
     summary
+}
+
+fn conflict(version: Version, operation: Option<&str>, kind: ConflictKind) -> Option<Conflict> {
+    Some(Conflict {
+        version,
+        operation: operation.map(str::to_string),
+        kind,
+    })
 }
