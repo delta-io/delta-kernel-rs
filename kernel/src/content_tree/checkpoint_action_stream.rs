@@ -204,8 +204,8 @@ mod tests {
     use crate::engine::CancellableEngine;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
-    use crate::log_segment::LogSegment;
     use crate::log_segment::tests::{add_checkpoint_to_store, latest_log_segment};
+    use crate::log_segment::{CheckpointReadOptions, LogSegment};
     use crate::object_store::ObjectStoreExt as _;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
@@ -285,7 +285,7 @@ mod tests {
                 &table_root(),
                 commit_schema,
                 checkpoint_schema,
-                None,
+                CheckpointReadOptions::default(),
                 false,
             )?
             .actions

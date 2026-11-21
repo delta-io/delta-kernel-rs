@@ -105,6 +105,14 @@ struct InternalScanState {
     /// Table root for normalizing paths. `Some` iff adaptiveMetadata is enabled.
     #[serde(default)]
     dv_normalization_root: Option<Url>,
+    /// Blobs without this field come from kernels that always encoded stats JSON with
+    /// [`UnaryExpressionOp::TO_JSON`].
+    #[serde(default = "millisecond_stats_json_op")]
+    stats_json_op: UnaryExpressionOp,
+}
+
+fn millisecond_stats_json_op() -> UnaryExpressionOp {
+    UnaryExpressionOp::TO_JSON
 }
 
 /// Serializable processor state for distributed processing. This can be serialized using the
@@ -270,6 +278,7 @@ impl ScanLogReplayProcessor {
             synthesize_json,
         } = stats_options;
         let timestamp_timezone_name = partition_values_options.timestamp_timezone.as_deref();
+        let json_synthesis_op = synthesize_json.then(|| state_info.stats_json_op);
 
         // Create metrics first so we can pass them to DataSkippingFilter
         let metrics = Arc::new(ScanMetrics::default());
@@ -354,7 +363,7 @@ impl ScanLogReplayProcessor {
                     stats_schema_for_transform.clone(),
                     false, /* has_stats_parsed */
                     skip_stats,
-                    synthesize_json,
+                    json_synthesis_op,
                     partition_schema_for_transform.clone(),
                     false, /* has_partition_values_parsed */
                     timestamp_timezone_name,
@@ -368,7 +377,7 @@ impl ScanLogReplayProcessor {
                     stats_schema_for_transform,
                     has_stats_parsed,
                     skip_stats,
-                    synthesize_json,
+                    json_synthesis_op,
                     partition_schema_for_transform,
                     has_partition_values_parsed,
                     timestamp_timezone_name,
@@ -428,6 +437,7 @@ impl ScanLogReplayProcessor {
             is_catalog_managed,
             skip_row_transforms,
             dv_normalization_root,
+            stats_json_op,
         } = self.state_info.as_ref().clone();
 
         // Extract predicate from PhysicalPredicate
@@ -452,6 +462,7 @@ impl ScanLogReplayProcessor {
             is_catalog_managed,
             skip_row_transforms,
             dv_normalization_root,
+            stats_json_op,
         };
         let internal_state_blob = serde_json::to_vec(&internal_state).map_err(|e| {
             KernelError::generic(format!("Failed to serialize internal state: {e}"))
@@ -517,6 +528,7 @@ impl ScanLogReplayProcessor {
             is_catalog_managed: internal_state.is_catalog_managed,
             skip_row_transforms: internal_state.skip_row_transforms,
             dv_normalization_root: internal_state.dv_normalization_root,
+            stats_json_op: internal_state.stats_json_op,
         });
 
         Self::new_with_seen_files(
@@ -946,14 +958,15 @@ fn build_stats_output_projection(
 /// - `physical_stats_read_schema`: Schema for parsing stats from JSON for data skipping and
 ///   structured output, or None if structured stats are not needed.
 /// - `has_stats_parsed`: Whether checkpoint has pre-parsed stats_parsed column. When true and
-///   `synthesize_json` is true, stats output uses `COALESCE(add.stats, ToJson(add.stats_parsed))`
+///   `synthesize_json` is `Some(op)`, stats output uses `COALESCE(add.stats, op(add.stats_parsed))`
 ///   so that `ScanFile.stats` is populated even when the checkpoint lacks JSON stats
 ///   (writeStatsAsJson=false).
 /// - `skip_stats`: When true, replaces the stats column with a null literal, avoiding reads of the
 ///   JSON stats column in checkpoint parquet files.
-/// - `synthesize_json`: When false, disables the `ToJson(add.stats_parsed)` fallback regardless of
-///   `has_stats_parsed`. Compatible parsed-stats checkpoints produce null JSON stats and can omit
-///   the JSON stats column; JSON-only checkpoints and commits retain `add.stats` as fallback input.
+/// - `synthesize_json`: The JSON-encoding operator for the `stats_parsed` fallback. `None` disables
+///   the fallback regardless of `has_stats_parsed`. Compatible parsed-stats checkpoints produce
+///   null JSON stats and can omit the JSON stats column; JSON-only checkpoints and commits retain
+///   `add.stats` as fallback input.
 /// - `partition_schema`: Schema of typed partition columns for data skipping, or None if partition
 ///   value parsing is not needed.
 /// - `has_partition_values_parsed`: Whether the source carries a native `partitionValues_parsed`
@@ -968,19 +981,19 @@ fn get_add_transform_expr(
     physical_stats_read_schema: Option<SchemaRef>,
     has_stats_parsed: bool,
     skip_stats: bool,
-    synthesize_json: bool,
+    synthesize_json: Option<UnaryExpressionOp>,
     partition_schema: Option<SchemaRef>,
     has_partition_values_parsed: bool,
     timestamp_timezone: Option<&str>,
 ) -> ExpressionRef {
     let stats_expr = if skip_stats {
         Arc::new(null_lit(DataType::STRING))
-    } else if has_stats_parsed && synthesize_json {
+    } else if let Some(json_op) = synthesize_json.filter(|_| has_stats_parsed) {
         // Checkpoint may lack JSON stats when writeStatsAsJson=false. Fall back to
         // serializing stats_parsed so ScanFile.stats is populated either way.
         Arc::new(Expression::coalesce([
             col!("add.stats"),
-            Expression::unary(UnaryExpressionOp::TO_JSON, col!("add.stats_parsed")),
+            Expression::unary(json_op, col!("add.stats_parsed")),
         ]))
     } else if has_stats_parsed {
         // The compatible checkpoint projection can omit add.stats when JSON output is disabled.
@@ -1334,12 +1347,15 @@ mod tests {
     use std::time::Duration;
 
     use rstest::rstest;
+    use serde_json::json;
     use url::Url;
 
     use super::{
-        InternalScanState, ParsedColumnSource, ScanLogReplayProcessor, ScanPartitionValuesOptions,
-        ScanStatsOptions, SerializableScanState, get_add_transform_expr, scan_action_iter,
+        InternalScanState, ParsedColumnSource, SCAN_ROW_SCHEMA, ScanLogReplayProcessor,
+        ScanPartitionValuesOptions, ScanStatsOptions, SerializableScanState,
+        get_add_transform_expr, scan_action_iter,
     };
+    use crate::actions::{ADD_NAME, LOG_ADD_SCHEMA, MIN_VALUES};
     use crate::arrow::array::StringArray;
     use crate::arrow::array::cast::AsArray;
     use crate::arrow::array::types::TimestampMicrosecondType;
@@ -1369,9 +1385,15 @@ mod tests {
     use crate::scan::{
         COMMIT_READ_SCHEMA, PartitionValuesOptions, PhysicalPredicate, StatsOptions,
     };
-    use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, schema_ref};
+    use crate::schema::{
+        DataType, MetadataColumnSpec, SchemaRef, SchemaStructPatchBuilder, StructField, schema,
+        schema_ref,
+    };
     use crate::table_features::ColumnMappingMode;
-    use crate::unit_test_utils::{assert_result_error_with_message, string_array_to_engine_data};
+    use crate::unit_test_utils::{
+        MICROSECOND_TIMESTAMP, assert_min_ts_in_stats_json, assert_result_error_with_message,
+        evaluate_on_json_rows, string_array_to_engine_data,
+    };
     use crate::{
         Engine, EngineData, Expression as Expr, ExpressionEvaluator, ExpressionRef, KernelError,
         KernelResult, Result,
@@ -1614,6 +1636,7 @@ mod tests {
             is_catalog_managed: false,
             skip_row_transforms: false,
             dv_normalization_root: None,
+            stats_json_op: UnaryExpressionOp::TO_JSON,
         });
         let (iter, _metrics) = scan_action_iter(
             &SyncEngine::new(),
@@ -2110,6 +2133,7 @@ mod tests {
                 is_catalog_managed: false,
                 skip_row_transforms: false,
                 dv_normalization_root: None,
+                stats_json_op: UnaryExpressionOp::TO_JSON,
             });
             let checkpoint_info = test_checkpoint_info();
             let processor = ScanLogReplayProcessor::new(
@@ -2148,6 +2172,7 @@ mod tests {
             is_catalog_managed: false,
             skip_row_transforms: false,
             dv_normalization_root: None,
+            stats_json_op: UnaryExpressionOp::TO_JSON,
         });
         let processor = ScanLogReplayProcessor::new(
             &engine,
@@ -2182,6 +2207,7 @@ mod tests {
             is_catalog_managed: true,
             skip_row_transforms: false,
             dv_normalization_root: None,
+            stats_json_op: UnaryExpressionOp::TO_JSON,
         });
         let processor = ScanLogReplayProcessor::new(
             &engine,
@@ -2216,6 +2242,7 @@ mod tests {
             is_catalog_managed: false,
             skip_row_transforms: skip,
             dv_normalization_root: None,
+            stats_json_op: UnaryExpressionOp::TO_JSON,
         });
         let processor = ScanLogReplayProcessor::new(
             &engine,
@@ -2250,6 +2277,9 @@ mod tests {
             requested_physical_stats_columns: Vec::new(),
             is_catalog_managed: false,
             skip_row_transforms: false,
+            stats_json_op: UnaryExpressionOp::ToJson {
+                full_precision_timestamps: dv_normalization_root.is_some(),
+            },
             dv_normalization_root,
         });
         ScanLogReplayProcessor::new(
@@ -2274,11 +2304,17 @@ mod tests {
             processor.into_serializable_state().unwrap(),
         )
         .unwrap();
+        assert_eq!(
+            deserialized.state_info.stats_json_op,
+            UnaryExpressionOp::ToJson {
+                full_precision_timestamps: root.is_some()
+            }
+        );
         assert_eq!(deserialized.state_info.dv_normalization_root, root);
     }
 
     #[test]
-    fn test_deserialize_blob_without_dv_normalization_root_defaults_to_none() {
+    fn test_deserialize_blob_without_dv_normalization_root_or_stats_json_op_uses_defaults() {
         let engine = SyncEngine::new();
         let root = Url::parse("s3://bucket/table/").unwrap();
         let mut state = processor_with_dv_normalization_root(&engine, Some(root))
@@ -2286,15 +2322,16 @@ mod tests {
             .unwrap();
         let mut blob: serde_json::Value =
             serde_json::from_slice(&state.internal_state_blob).unwrap();
-        assert!(
-            blob.as_object_mut()
-                .unwrap()
-                .remove("dv_normalization_root")
-                .is_some()
-        );
+        let fields = blob.as_object_mut().unwrap();
+        assert!(fields.remove("dv_normalization_root").is_some());
+        assert!(fields.remove("stats_json_op").is_some());
         state.internal_state_blob = serde_json::to_vec(&blob).unwrap();
         let deserialized = ScanLogReplayProcessor::from_serializable_state(&engine, state).unwrap();
         assert_eq!(deserialized.state_info.dv_normalization_root, None);
+        assert_eq!(
+            deserialized.state_info.stats_json_op,
+            UnaryExpressionOp::TO_JSON
+        );
     }
 
     #[test]
@@ -2332,6 +2369,7 @@ mod tests {
             is_catalog_managed: false,
             skip_row_transforms: false,
             dv_normalization_root: None,
+            stats_json_op: UnaryExpressionOp::TO_JSON,
         };
         let predicate = Arc::new(crate::expressions::column_pred!("id"));
         let invalid_blob = serde_json::to_vec(&invalid_internal_state).unwrap();
@@ -2366,6 +2404,7 @@ mod tests {
             is_catalog_managed: false,
             skip_row_transforms: false,
             dv_normalization_root: None,
+            stats_json_op: UnaryExpressionOp::TO_JSON,
         };
         let blob = serde_json::to_string(&invalid_internal_state).unwrap();
         let mut obj: serde_json::Value = serde_json::from_str(&blob).unwrap();
@@ -2544,6 +2583,54 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::millisecond(UnaryExpressionOp::TO_JSON, "2026-07-02T15:55:55.298Z")]
+    #[case::full_precision(
+        UnaryExpressionOp::ToJson { full_precision_timestamps: true },
+        MICROSECOND_TIMESTAMP
+    )]
+    fn add_transform_synthesizes_stats_json_with_stats_json_op(
+        #[case] stats_json_op: UnaryExpressionOp,
+        #[case] expected_bound: &str,
+    ) -> KernelResult<()> {
+        let stats_parsed = StructField::nullable(
+            "stats_parsed",
+            schema! { nullable MIN_VALUES: { nullable "ts": TIMESTAMP } },
+        );
+        let checkpoint_schema = Arc::new(
+            SchemaStructPatchBuilder::new()
+                .append_at([ADD_NAME], stats_parsed)
+                .build(&LOG_ADD_SCHEMA)?,
+        );
+        let transform = get_add_transform_expr(
+            None,  // physical_stats_read_schema
+            true,  // has_stats_parsed
+            false, // skip_stats
+            Some(stats_json_op),
+            None,  // partition_schema
+            false, // has_partition_values_parsed
+            None,  // timestamp_timezone
+        );
+
+        let rows = evaluate_on_json_rows(
+            &SyncEngine::new(),
+            checkpoint_schema,
+            transform,
+            SCAN_ROW_SCHEMA.clone(),
+            &[json!({ ADD_NAME: {
+                "path": "a",
+                "partitionValues": {},
+                "size": 1,
+                "modificationTime": 0,
+                "dataChange": true,
+                "stats": null,
+                "stats_parsed": { MIN_VALUES: { "ts": MICROSECOND_TIMESTAMP } },
+            } })],
+        )?;
+        assert_min_ts_in_stats_json(&rows[0]["stats"], expected_bound);
+        Ok(())
+    }
+
     /// Walk `expr` and count `Unary { op: ToJson, .. }` occurrences anywhere in the tree.
     // Closures wrap `count_to_json` to dereference `&Arc<Expression>` -> `&Expression`;
     // clippy doesn't see the auto-deref so flags them as redundant.
@@ -2605,9 +2692,9 @@ mod tests {
         // Synthesis enabled: COALESCE branch present -> exactly one ToJson.
         let with_synthesis = get_add_transform_expr(
             Some(stats_schema.clone()),
-            true,  // has_stats_parsed
-            false, // skip_stats
-            true,  // synthesize_json
+            true,                             // has_stats_parsed
+            false,                            // skip_stats
+            Some(UnaryExpressionOp::TO_JSON), // synthesize_json
             partition_schema.clone(),
             false, // has_partition_values_parsed
             None,  // timestamp_timezone
@@ -2623,7 +2710,7 @@ mod tests {
             Some(stats_schema),
             true,  // has_stats_parsed
             false, // skip_stats
-            false, // synthesize_json
+            None,  // synthesize_json
             partition_schema,
             false, // has_partition_values_parsed
             None,  // timestamp_timezone
