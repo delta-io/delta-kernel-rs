@@ -416,7 +416,7 @@ fn visit_expression_struct_literal(
 ) {
     let child_value_list_id = call!(visitor, make_field_list, struct_data.fields().len());
     let child_field_list_id = call!(visitor, make_field_list, struct_data.fields().len());
-    for (field, value) in struct_data.fields().iter().zip(struct_data.values()) {
+    for (field, value) in struct_data.fields().zip(struct_data.values()) {
         let field_name = field.name();
         call!(
             visitor,

@@ -929,7 +929,7 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{Scalar, StructData};
     use crate::scan::data_skipping::stats_schema::{StatsConfig, expected_stats_schema};
-    use crate::schema::{ArrayType, MapType};
+    use crate::schema::{ArrayType, MapType, schema_ref};
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
     use crate::table_properties::DataSkippingNumIndexedCols;
@@ -2216,7 +2216,7 @@ mod tests {
 
     /// Builds a `Scalar::Struct` of `values` typed by `schema` (values in field order).
     fn struct_scalar(schema: &StructType, values: Vec<Scalar>) -> Scalar {
-        Scalar::Struct(StructData::try_new(schema.fields().cloned().collect(), values).unwrap())
+        Scalar::Struct(StructData::try_new(schema_ref! { ..(schema.fields()) }, values).unwrap())
     }
 
     /// The single-column `content_stats` leaf struct for `name` in `content_stats_schema`, filled
