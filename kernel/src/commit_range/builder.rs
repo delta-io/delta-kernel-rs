@@ -313,11 +313,16 @@ impl CommitRangeBuilder {
         );
         for file in files {
             let file = file?;
-            if configured_end_version.is_some_and(|end| file.version > end) {
-                first_version_after_end = Some(file.version);
+            let version = file.version;
+            if configured_end_version.is_some_and(|end| version > end) {
+                first_version_after_end = Some(version);
                 break;
             }
             commit_files.push(file);
+            // A range that reaches its end needs no later commit as gap evidence.
+            if configured_end_version == Some(version) {
+                break;
+            }
         }
         let end_version = configured_end_version
             .or_else(|| commit_files.last().map(|file| file.version))
@@ -574,17 +579,19 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::filesystem_probe(&[5, 6, 8], 5, 7, &[], &[5, 6], 8)]
-    #[case::catalog_probe(&[5, 6, 9], 5, 7, &[8, 9], &[5, 6], 8)]
-    #[case::catalog_supplies_end(&[5, 6, 9], 5, 7, &[7, 8, 9], &[5, 6, 7], 8)]
-    #[case::catalog_supplies_reversed_start(&[8], 7, 5, &[7, 8], &[], 7)]
-    fn test_relaxed_listing_stops_at_first_logical_post_end_commit(
+    #[case::filesystem_reaches_end(&[5, 6, 7], 5, 7, &[], &[5, 6, 7], None)]
+    #[case::filesystem_probe(&[5, 6, 8], 5, 7, &[], &[5, 6], Some(8))]
+    #[case::catalog_probe(&[5, 6, 9], 5, 7, &[8, 9], &[5, 6], Some(8))]
+    #[case::catalog_supplies_end(&[5, 6, 9], 5, 7, &[7, 8, 9], &[5, 6, 7], None)]
+    #[case::catalog_overrides_filesystem(&[5, 6, 7], 5, 7, &[6, 7, 8], &[5, 6, 7], None)]
+    #[case::catalog_supplies_reversed_start(&[8], 7, 5, &[7, 8], &[], Some(7))]
+    fn test_relaxed_listing_stops_at_end_or_first_later_commit(
         #[case] filesystem_versions: &[Version],
         #[case] start: Version,
         #[case] end: Version,
         #[case] tail_versions: &[Version],
         #[case] expected_versions: &[Version],
-        #[case] expected_probe: Version,
+        #[case] expected_version_after_end: Option<Version>,
         #[values(false, true)] include_non_commit_files: bool,
     ) {
         let table_root = dv_small_table_root();
@@ -619,7 +626,7 @@ mod tests {
             .build(&engine)
             .unwrap();
 
-        assert_eq!(range.first_version_after_end, Some(expected_probe));
+        assert_eq!(range.first_version_after_end, expected_version_after_end);
         let versions: Vec<_> = range.commit_files.iter().map(|file| file.version).collect();
         assert_eq!(versions, expected_versions);
         // Catalog priority: in-range versions covered by the tail come from the tail.

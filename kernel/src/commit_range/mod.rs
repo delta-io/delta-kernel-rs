@@ -118,8 +118,11 @@ impl CommitRange {
     /// Last version (inclusive) in the range: the requested end version, else the maximum catalog
     /// version, else the latest version found when the range was built.
     ///
-    /// With commit range validation disabled, the end can be before the start, and a range with
-    /// neither bound that finds no commits returns [`Self::start_version`].
+    /// With commit range validation disabled, the end is a bound, not necessarily an observed
+    /// commit: a range with no requested end and a maximum catalog version of 7 reports 7 even if
+    /// iteration stops after commit 6. Track progress from the yielded commit files instead. The
+    /// end can also be before the start, and a range with neither bound that finds no commits
+    /// returns [`Self::start_version`].
     pub fn end_version(&self) -> Version {
         self.end_version
     }
@@ -162,16 +165,10 @@ impl CommitRange {
                 "Commit file iteration is not supported for this range".to_string()
             )
         );
-        // A range that reaches its end needs no later commit to prove a gap, so a later version
-        // is only kept for an empty, short, or reversed range.
-        let reaches_end = self
-            .commit_files
-            .last()
-            .is_some_and(|file| file.version == self.end_version);
         Ok(CommitFileIterator {
             files: self.commit_files.clone().into_iter(),
             start_version: self.start_version,
-            first_version_after_end: self.first_version_after_end.filter(|_| !reaches_end),
+            first_version_after_end: self.first_version_after_end,
             expected_version: Some(self.start_version),
             fail_on_data_loss: self.fail_on_data_loss,
             done: false,
@@ -268,7 +265,9 @@ impl CommitRange {
 struct CommitFileIterator {
     files: std::vec::IntoIter<ParsedLogPath>,
     start_version: Version,
-    /// Set only when the range stops short of its end, so any value proves a gap.
+    /// First commit version after the end, recorded only when the range stops short of its end.
+    /// It is potential gap evidence: it proves a gap only if it differs from the expected version,
+    /// so for a reversed range whose start exists it equals the start and proves nothing.
     first_version_after_end: Option<Version>,
     /// `None` once a file at `Version::MAX` was yielded, so no later version can be expected.
     expected_version: Option<Version>,
