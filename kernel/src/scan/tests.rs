@@ -771,6 +771,107 @@ fn scan_metadata_from_requires_timezone_support_only_for_timestamp_partitions(
     }
 }
 
+#[rstest]
+fn metadata_scan_errors_retain_context_after_scan_is_dropped(
+    #[values(false, true)] setup_failure: bool,
+    #[values(false, true)] cancelled: bool,
+) {
+    struct FailingJsonHandler {
+        inner: Arc<dyn crate::JsonHandler>,
+        setup_failure: bool,
+        cancelled: bool,
+    }
+
+    impl crate::JsonHandler for FailingJsonHandler {
+        fn parse_json(
+            &self,
+            json_strings: Box<dyn EngineData>,
+            output_schema: SchemaRef,
+        ) -> KernelResult<Box<dyn EngineData>> {
+            self.inner.parse_json(json_strings, output_schema)
+        }
+
+        fn read_json_files(
+            &self,
+            files: &[FileMeta],
+            physical_schema: SchemaRef,
+            predicate: Option<PredicateRef>,
+        ) -> KernelResult<FileDataReadResultIterator> {
+            let error = if self.cancelled {
+                KernelError::Cancelled
+            } else {
+                KernelError::file_not_found("injected metadata read failure")
+            };
+            if self.setup_failure {
+                return Err(error);
+            }
+            let mut data = self
+                .inner
+                .read_json_files(files, physical_schema, predicate)?;
+            let first = data.next().expect("fixture must produce a batch")?;
+            Ok(Box::new(
+                std::iter::once(Ok(first)).chain(std::iter::once(Err(error))),
+            ))
+        }
+
+        fn write_json_file(
+            &self,
+            path: &Url,
+            data: Box<dyn KernelResultIterator<crate::FilteredEngineData> + '_>,
+            overwrite: bool,
+        ) -> KernelResult<FileSize> {
+            self.inner.write_json_file(path, data, overwrite)
+        }
+    }
+
+    let (engine, snapshot, _tempdir) =
+        crate::unit_test_utils::load_test_table("basic_partitioned").unwrap();
+    let table = snapshot.table_root().clone();
+    let version = snapshot.version();
+    let handler = engine.json_handler();
+    let engine = DelegatingEngine::new(engine).with_json_handler(Arc::new(FailingJsonHandler {
+        inner: handler,
+        setup_failure,
+        cancelled,
+    }));
+    let scan = snapshot.scan_builder().build().unwrap();
+    let result = scan.scan_metadata(&engine);
+    let error = if setup_failure {
+        result.err().expect("setup must fail")
+    } else {
+        let mut metadata = result.unwrap();
+        drop(scan);
+        drop(engine);
+        assert!(metadata.next().expect("first batch").is_ok());
+        metadata
+            .next()
+            .expect("deferred read failure")
+            .err()
+            .expect("read must fail")
+    };
+    if cancelled {
+        assert!(matches!(error, KernelError::Cancelled));
+        return;
+    }
+    let message = error.to_string();
+    for context in [
+        "Failed to scan metadata".to_owned(),
+        table.to_string(),
+        format!("snapshot {version}"),
+        "injected metadata read failure".to_owned(),
+    ] {
+        assert!(message.contains(&context), "{message}");
+    }
+    let cause = std::iter::successors(
+        Some(&error as &(dyn std::error::Error + 'static)),
+        |error| (*error).source(),
+    )
+    .filter_map(|error| error.downcast_ref::<KernelError>())
+    .last()
+    .unwrap();
+    assert!(matches!(cause, KernelError::FileNotFound(_)), "{cause}");
+}
+
 #[test_log::test]
 fn scan_metadata_from_cancels_cached_metadata_consumption() {
     let path =

@@ -203,7 +203,7 @@ const EXPECTED_KERNEL_FAILURES: &[ExpectedFailure] = &[
     // input, but exposes the lower-level JSON decoding error instead.
     ExpectedFailure {
         reason: "Kernel exposes a JSON decoding error instead of SparkException",
-        expected_error: "got: Json error:",
+        expected_error: "Json error:",
         patterns: &[
             "corruption_err_schema_empty/specs/corruption_err_schema_empty_read_all",
             "corruption_err_schema_invalid_json/specs/corruption_err_schema_invalid_json_read_all",

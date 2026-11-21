@@ -11,6 +11,7 @@ use std::sync::Arc;
 use super::data_skipping::as_sql_data_skipping_predicate_with_stats_columns;
 use super::state_info::StateInfo;
 use super::{PhysicalPredicate, Scan};
+use crate::KernelResult;
 use crate::action_reconciliation::file_metadata::PARTITION_VALUES_PARSED_FIELD as PARTITION_VALUES_PARSED;
 #[cfg(test)]
 use crate::action_reconciliation::file_metadata::STATS_FIELD as STATS;
@@ -33,7 +34,6 @@ use crate::schema::{
 use crate::transforms::{ExpressionTransform, transform_output_type};
 #[cfg(test)]
 use crate::utils::FoldWithOption as _;
-use crate::{KernelError, KernelResult};
 
 mod metadata_replay_base;
 
@@ -85,7 +85,8 @@ impl Scan {
     #[tracing::instrument(
         name = "scan_plan.build_metadata_scan_plan",
         skip_all,
-        fields(enable_call_frame)
+        fields(enable_call_frame),
+        err
     )]
     pub(super) fn build_metadata_scan_plan_with(
         &self,
@@ -101,44 +102,40 @@ impl Scan {
         let checkpoint = match base {
             MetadataReplayBase::Crc { version, files } => {
                 planner.crc_adds(version, files).map_err(|error| {
-                    KernelError::generic_with_source(
-                        format!("Constructing CRC replay source at version {version}"),
-                        error,
-                    )
+                    error.wrap_with_context(format!(
+                        "Failed to construct CRC replay source at version {version}"
+                    ))
                 })
             }
             MetadataReplayBase::Checkpoint { info, .. } => {
                 planner = planner.with_checkpoint_info(info);
                 planner.checkpoint_actions().map_err(|error| {
-                    KernelError::generic_with_source(
-                        format!(
-                            "Constructing checkpoint replay source at version {base_version:?}"
-                        ),
-                        error,
-                    )
+                    let message = self.snapshot.log_segment().listed.checkpoint_parts.first()
+                        .map_or_else(
+                            || "Failed to construct empty checkpoint replay source".to_owned(),
+                            |root| format!(
+                                "Failed to construct checkpoint replay source '{}' at version {}",
+                                root.location.location, root.version,
+                            ),
+                        );
+                    error.wrap_with_context(message)
                 })
             }
         }?;
         // Keep commit removes through replay so they cancel older adds before selecting live files.
         let commits = planner.commit_actions(base_version).map_err(|error| {
-            KernelError::generic_with_source(
-                format!("Constructing commit source after replay base {base_version:?}"),
-                error,
-            )
+            let message = base_version.map_or_else(
+                || "Failed to construct commit replay source from the start of the log".to_owned(),
+                |version| {
+                    format!("Failed to construct commit replay source after version {version}")
+                },
+            );
+            error.wrap_with_context(message)
         })?;
         planner
-            .replay_actions(commits, checkpoint)
-            .map_err(|error| {
-                KernelError::generic_with_source(
-                    "Reconciling commit actions with the replay base",
-                    error,
-                )
-            })?
-            .project_patch(|patch| patch.drop(VERSION))
-            .and_then(|plan| plan.build_opt())
-            .map_err(|error| {
-                KernelError::generic_with_source("Projecting the final metadata scan output", error)
-            })
+            .replay_actions(commits, checkpoint)?
+            .project_patch(|patch| patch.drop(VERSION))?
+            .build_opt()
     }
 
     #[cfg(test)]
