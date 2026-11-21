@@ -117,6 +117,7 @@ pub enum MetricEvent {
     StorageListCompleted(StorageListCompleted),
     StorageReadCompleted(StorageReadCompleted),
     StorageCopyCompleted(StorageCopyCompleted),
+    CheckpointActionComputed(CheckpointActionComputed),
 }
 
 impl MetricEvent {
@@ -143,6 +144,7 @@ impl MetricEvent {
             | Self::ProtocolMetadataLoadSuccess(_)
             | Self::ProtocolMetadataLoadFailure(_)
             | Self::ScanMetadataCompleted(_)
+            | Self::CheckpointActionComputed(_)
             | Self::StorageListCompleted(_)
             | Self::StorageReadCompleted(_)
             | Self::StorageCopyCompleted(_) => {}
@@ -173,6 +175,7 @@ impl MetricEvent {
             Self::SetTransactionLoadSuccess(_) => Err(SetTransactionLoadSuccess::SPAN_NAME),
             Self::LastCheckpointReadCompleted(_) => Err(LastCheckpointReadCompleted::SPAN_NAME),
             Self::ScanMetadataCompleted(_) => Err(ScanMetadataCompleted::SPAN_NAME),
+            Self::CheckpointActionComputed(_) => Err(CheckpointActionComputed::SPAN_NAME),
             Self::JsonReadCompleted(_) => Err(JsonReadCompleted::SPAN_NAME),
             Self::ParquetReadCompleted(_) => Err(ParquetReadCompleted::SPAN_NAME),
             Self::StorageListCompleted(_)
@@ -208,6 +211,7 @@ impl MetricEvent {
             Self::CheckpointWriteSuccess(_) => Err(CheckpointWriteSuccess::SPAN_NAME),
             Self::ChecksumWriteSuccess(_) => Err(ChecksumWriteSuccess::SPAN_NAME),
             Self::ScanMetadataCompleted(_) => Err(ScanMetadataCompleted::SPAN_NAME),
+            Self::CheckpointActionComputed(_) => Err(CheckpointActionComputed::SPAN_NAME),
             Self::JsonReadCompleted(_) => Err(JsonReadCompleted::SPAN_NAME),
             Self::ParquetReadCompleted(_) => Err(ParquetReadCompleted::SPAN_NAME),
             Self::StorageListCompleted(_)
@@ -328,6 +332,7 @@ impl MetricEvent {
             | Self::JsonReadCompleted(_)
             | Self::ParquetReadCompleted(_)
             | Self::ScanMetadataCompleted(_)
+            | Self::CheckpointActionComputed(_)
             | Self::StorageListCompleted(_)
             | Self::StorageReadCompleted(_)
             | Self::StorageCopyCompleted(_)) => e,
@@ -363,6 +368,7 @@ impl fmt::Display for MetricEvent {
             Self::StorageListCompleted(e) => e.fmt(f),
             Self::StorageReadCompleted(e) => e.fmt(f),
             Self::StorageCopyCompleted(e) => e.fmt(f),
+            Self::CheckpointActionComputed(e) => e.fmt(f),
         }
     }
 }
@@ -2148,6 +2154,177 @@ impl Visit for ScanMetadataCompletedAttrs {
 }
 
 // ====================================================================
+// CheckpointActionComputed
+// ====================================================================
+
+/// Where a root manifest commit took the set transactions or domain metadata for its
+/// `checkpoint` action from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, StrumDisplay, AsRefStr, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+#[non_exhaustive]
+pub enum CheckpointEntrySource {
+    /// The snapshot's CRC, which holds every entry of this kind.
+    Crc,
+    /// The snapshot's state, because the table has no earlier `checkpoint` action.
+    Snapshot,
+    /// The latest `checkpoint` action's inline entries, keeping its sidecars. Sidecars may still
+    /// be read to check whether a changed entry is stored in one.
+    CheckpointAction,
+    /// The latest `checkpoint` action with its sidecars read and written inline, because a
+    /// change touched an entry stored in one.
+    SidecarsInlined,
+    /// Decode fell back here because the span's `txn_source` or `domain_metadata_source` field was
+    /// unset or unrecognized. Kernel never emits this deliberately.
+    Unknown,
+}
+
+impl CheckpointEntrySource {
+    fn parse_or_unknown(s: &str) -> Self {
+        if s.is_empty() {
+            return Self::Unknown;
+        }
+        Self::from_str(s).unwrap_or_else(|e| {
+            warn!("Invalid checkpoint entry source '{s}' on span: {e}. Using Unknown.");
+            Self::Unknown
+        })
+    }
+}
+
+/// A root manifest commit computed the `checkpoint` action it writes.
+#[derive(Debug, Clone)]
+pub struct CheckpointActionComputed {
+    /// The committing transaction's operation id.
+    pub operation_id: MetricId,
+    /// Opaque, caller-supplied id for joining this operation's metric events to the caller's
+    /// own request or operation id.
+    pub correlation_id: Option<Arc<str>>,
+    pub table_type: TableType,
+    /// The version being committed.
+    pub commit_version: u64,
+    /// Where the set transactions came from.
+    pub txn_source: CheckpointEntrySource,
+    /// Where the domain metadata came from.
+    pub domain_metadata_source: CheckpointEntrySource,
+    /// Log commits after the latest `checkpoint` action replayed to update it. 0 when neither
+    /// source is `CheckpointAction` or `SidecarsInlined`.
+    pub num_log_commits_replayed: u64,
+    /// Set transaction sidecars carried over from the latest `checkpoint` action. 0 unless
+    /// `txn_source` is `CheckpointAction`.
+    pub num_txn_sidecars_kept: u64,
+    /// Domain metadata sidecars carried over from the latest `checkpoint` action. 0 unless
+    /// `domain_metadata_source` is `CheckpointAction`.
+    pub num_domain_metadata_sidecars_kept: u64,
+    /// Set transaction sidecars of the latest `checkpoint` action that were read. Sidecars are
+    /// read when a changed key is not among the action's inline entries, and are counted
+    /// whether they were then kept or moved inline.
+    pub num_txn_sidecars_read: u64,
+    /// Domain metadata sidecars of the latest `checkpoint` action that were read. Sidecars are
+    /// read when a changed key is not among the action's inline entries, and are counted
+    /// whether they were then kept or moved inline.
+    pub num_domain_metadata_sidecars_read: u64,
+    /// Time spent computing the action.
+    pub duration: Duration,
+}
+
+impl CheckpointActionComputed {
+    pub(crate) const SPAN_NAME: &'static str = "txn.checkpoint_action_computed";
+
+    /// The all-unset seed that [`Self::from_attrs`] fills in as span fields arrive. Each field
+    /// here is the value used when its span field is absent.
+    fn empty() -> Self {
+        Self {
+            operation_id: MetricId::nil(),
+            correlation_id: None,
+            table_type: TableType::from_catalog_managed(false),
+            commit_version: 0,
+            txn_source: CheckpointEntrySource::Unknown,
+            domain_metadata_source: CheckpointEntrySource::Unknown,
+            num_log_commits_replayed: 0,
+            num_txn_sidecars_kept: 0,
+            num_domain_metadata_sidecars_kept: 0,
+            num_txn_sidecars_read: 0,
+            num_domain_metadata_sidecars_read: 0,
+            duration: Duration::ZERO,
+        }
+    }
+
+    pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
+        let mut event = Self::empty();
+        attrs.record(&mut event);
+        event
+    }
+}
+
+impl Visit for CheckpointActionComputed {
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        if field.name() == IS_CATALOG_MANAGED_FIELD {
+            self.table_type = TableType::from_catalog_managed(value);
+        }
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        match field.name() {
+            CORRELATION_ID_FIELD if !value.is_empty() => self.correlation_id = Some(value.into()),
+            "txn_source" => self.txn_source = CheckpointEntrySource::parse_or_unknown(value),
+            "domain_metadata_source" => {
+                self.domain_metadata_source = CheckpointEntrySource::parse_or_unknown(value)
+            }
+            _ => {}
+        }
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        match field.name() {
+            "commit_version" => self.commit_version = value,
+            "num_log_commits_replayed" => self.num_log_commits_replayed = value,
+            "num_txn_sidecars_kept" => self.num_txn_sidecars_kept = value,
+            "num_domain_metadata_sidecars_kept" => self.num_domain_metadata_sidecars_kept = value,
+            "num_txn_sidecars_read" => self.num_txn_sidecars_read = value,
+            "num_domain_metadata_sidecars_read" => self.num_domain_metadata_sidecars_read = value,
+            "duration_ns" => self.duration = Duration::from_nanos(value),
+            _ => {}
+        }
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        if let Some(id) = record_operation_id(field, value, Self::SPAN_NAME) {
+            self.operation_id = id;
+        }
+    }
+}
+
+impl fmt::Display for CheckpointActionComputed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            operation_id,
+            correlation_id,
+            table_type,
+            commit_version,
+            txn_source,
+            domain_metadata_source,
+            num_log_commits_replayed,
+            num_txn_sidecars_kept,
+            num_domain_metadata_sidecars_kept,
+            num_txn_sidecars_read,
+            num_domain_metadata_sidecars_read,
+            duration,
+        } = self;
+        write!(
+            f,
+            "CheckpointActionComputed(id={operation_id}, table_type={table_type}, \
+             correlation_id={correlation_id:?}, commit_version={commit_version}, txn_source={txn_source}, \
+             domain_metadata_source={domain_metadata_source}, \
+             log_commits_replayed={num_log_commits_replayed}, \
+             txn_sidecars_kept={num_txn_sidecars_kept}, \
+             domain_metadata_sidecars_kept={num_domain_metadata_sidecars_kept}, \
+             txn_sidecars_read={num_txn_sidecars_read}, \
+             domain_metadata_sidecars_read={num_domain_metadata_sidecars_read}, \
+             duration={duration:?})"
+        )
+    }
+}
+
+// ====================================================================
 // Storage events (List / Read / Copy)
 // ====================================================================
 //
@@ -2632,6 +2809,32 @@ mod tests {
         #[case] expected: ScanType,
     ) {
         assert_eq!(ScanType::parse_lenient(value), expected);
+    }
+
+    #[rstest]
+    #[case::crc(CheckpointEntrySource::Crc, "crc")]
+    #[case::snapshot(CheckpointEntrySource::Snapshot, "snapshot")]
+    #[case::checkpoint_action(CheckpointEntrySource::CheckpointAction, "checkpoint_action")]
+    #[case::sidecars_inlined(CheckpointEntrySource::SidecarsInlined, "sidecars_inlined")]
+    #[case::unknown(CheckpointEntrySource::Unknown, "unknown")]
+    fn checkpoint_entry_source_serializes_to_wire_name_and_parses_back(
+        #[case] source: CheckpointEntrySource,
+        #[case] wire: &str,
+    ) {
+        let serialized: &'static str = source.into();
+        assert_eq!(serialized, wire);
+        assert_eq!(CheckpointEntrySource::from_str(wire).unwrap(), source);
+    }
+
+    #[rstest]
+    #[case::known("sidecars_inlined", CheckpointEntrySource::SidecarsInlined)]
+    #[case::empty_maps_to_unknown("", CheckpointEntrySource::Unknown)]
+    #[case::unrecognized_maps_to_unknown("totally_unknown", CheckpointEntrySource::Unknown)]
+    fn checkpoint_entry_source_parse_or_unknown(
+        #[case] value: &str,
+        #[case] expected: CheckpointEntrySource,
+    ) {
+        assert_eq!(CheckpointEntrySource::parse_or_unknown(value), expected);
     }
 
     #[rstest]
