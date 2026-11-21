@@ -1,6 +1,7 @@
 //! Shared action builders and fixtures. T is the losing transaction. By default, T is a DELETE of
 //! the partition `DELETED_DATE`. `delete_conflict` also makes T read and remove `DELETED_FILE`.
 
+mod detect_conflicts;
 mod occ_plan;
 mod winner_check_plan;
 
@@ -20,7 +21,7 @@ use crate::engine::sync::SyncEngine;
 use crate::engine::sync::plan::{ScopedSyncPlanExecutor, SyncPlanExecutor};
 use crate::expressions::{Expression, Scalar, StructData, lit};
 use crate::object_store::local::LocalFileSystem;
-use crate::plans::{Operation, PlanBuilder, PlanExecutor as _, ScopedPlanExecutor};
+use crate::plans::{PlanBuilder, PlanExecutor as _};
 use crate::row_tracking::RowTrackingDomainMetadata;
 use crate::schema::{PrimitiveType, schema, schema_ref};
 use crate::transaction::occ::winner_check_plan::{read_winner_summaries, winner_check_plan};
@@ -127,7 +128,11 @@ fn table_winners(
         let body = Vec::from_iter(actions.iter().map(Value::to_string)).join("\n");
         block_on(add_commit(&root, &store, *version, body)).unwrap();
     }
-    let winners = winners_after(&root, read_version);
+    let winners = if commits.is_empty() {
+        Vec::new()
+    } else {
+        winners_after(&root, read_version)
+    };
     (dir, winners)
 }
 
@@ -187,6 +192,7 @@ fn partitioned_delete_facts(
     LoserFacts {
         checked_version: read_version,
         isolation_level: IsolationLevel::WriteSerializable,
+        is_manifest_commit: false,
         has_data_change: true,
         operation_changes_data: true,
         changes_metadata: false,
@@ -262,6 +268,14 @@ impl LoserRelations {
             read_files,
         }
     }
+
+    fn detect(
+        &self,
+        facts: &LoserFacts,
+        winners: &[WinningCommit],
+    ) -> KernelResult<ConflictDetection> {
+        detect_conflicts(&self.executor, facts, winners, &self.file_actions)
+    }
 }
 
 fn retain(
@@ -275,6 +289,13 @@ fn retain(
 }
 
 // === Expected results ===
+
+fn outcome(detection: ConflictDetection) -> Option<Conflict> {
+    match detection {
+        ConflictDetection::NoConflict(_) => None,
+        ConflictDetection::Conflict(conflict) => Some(conflict),
+    }
+}
 
 fn only_summary(summaries: &[WinnerSummary]) -> &WinnerSummary {
     let [summary] = summaries else {

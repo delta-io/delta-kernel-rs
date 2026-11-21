@@ -1,21 +1,24 @@
 //! Conflict detection for a transaction T that lost a commit race.
 //!
 //! A winner is a commit after T's checked version. The checked version is T's read version on the
-//! first check, then the last winner version of the previous check. The winner check plan returns
-//! one summary for each winner that has an action, with the first winner rule that the winner
-//! breaks. The OCC plan checks the winners' file actions against T's reads and removes.
+//! first check, then the last winner version of the previous check. [`detect_conflicts`] checks
+//! every winner against the winner rules before it checks the winners' file actions against T's
+//! reads and removes. So the reported winner can differ from Delta Spark's.
 //!
-//! Differences from Delta Spark:
+//! Other differences from Delta Spark:
 //! - Kernel returns an error for a winner with more than one `commitInfo` action. Delta Spark uses
 //!   the first one.
 //! - Any winner `protocol` action fails T.
 //! - A `metaData` winner fails T unless its `delta.identity.schemaUpdate` tag is exactly `true` and
 //!   T changes no metadata.
 //! - A row-tracking backfill or unbackfill winner fails a T that rewrites any file.
+//! - Detection returns an error, not a conflict, for a T or a winner that Kernel can't check.
 //!
-//! `ensure_no_manifest_commit` and `ensure_row_tracking_marks` reject a winner that Kernel can't
-//! check: a manifest commit, a `delta.rowTracking` removal, or a row-tracking mark that it can't
-//! read.
+//! `detect_conflicts` runs the checks in this order: the input checks on T and on the winner list,
+//! the winner summaries, the winner rules, the manifest-commit check, the OCC plan, and the
+//! row-tracking check. The first check that fails decides the result. So a winner-rule conflict at
+//! a later version is reported before an OCC conflict at an earlier one, and a manifest-commit
+//! winner fails detection even when an OCC check would fail T.
 
 mod occ_plan;
 mod winner_check_plan;
@@ -24,17 +27,70 @@ mod winner_check_plan;
 mod tests;
 
 pub(crate) use occ_plan::OccCheck;
+use occ_plan::{first_occ_conflict, occ_plan, select_read_append_versions};
 pub(crate) use winner_check_plan::{WinnerRule, WinnerSummary};
+use winner_check_plan::{
+    ensure_no_manifest_commit, ensure_row_tracking_marks, ensure_winner_summaries,
+    first_winner_conflict, read_winner_summaries, winner_check_plan,
+};
 
 use crate::action_reconciliation::plan::VERSION;
 use crate::engine_data::RowVisitor;
 use crate::expressions::MapToStructOptions;
 use crate::plans::ir::nodes::ScanFile;
-use crate::plans::{PlanBuilder, PlanResult, RelationRef};
+use crate::plans::{Operation, PlanBuilder, PlanResult, RelationRef, ScopedPlanExecutor};
 use crate::row_tracking::ROW_TRACKING_DOMAIN_NAME;
 use crate::schema::SchemaRef;
 use crate::table_properties::IsolationLevel;
 use crate::{FileMeta, KernelError, KernelResult, PredicateRef, Version, version_as_i64};
+
+/// Checks T against `winners`, and returns the conflict that Kernel reports or the winner
+/// summaries.
+///
+/// An error means that Kernel couldn't check T against the winners, and the caller must fail T.
+///
+/// `winners` must hold every commit from `facts.checked_version + 1`, in ascending version order.
+/// `file_actions` and any `ReadScope::Files` `read_files` must be retained in `executor`'s scope.
+/// `file_actions` must have a `remove.path` column. The paths in both must match the `path`
+/// values written in the log.
+pub(crate) fn detect_conflicts(
+    executor: &dyn ScopedPlanExecutor,
+    facts: &LoserFacts,
+    winners: &[WinningCommit],
+    file_actions: &RelationRef,
+) -> KernelResult<ConflictDetection> {
+    ensure_supported_loser(facts)?;
+    ensure_winners_follow_checked_version(facts.checked_version, winners)?;
+    if winners.is_empty() {
+        return Ok(ConflictDetection::NoConflict(Vec::new()));
+    }
+    let plan = winner_check_plan(facts, winners)?;
+    let summaries = read_winner_summaries(executor.execute_op(Operation::QueryPlan(plan))?)?;
+    ensure_winner_summaries(winners, &summaries)?;
+    if let Some(conflict) = first_winner_conflict(&summaries) {
+        return Ok(ConflictDetection::Conflict(conflict));
+    }
+    ensure_no_manifest_commit(&summaries)?;
+    let read_append_versions = select_read_append_versions(facts, &summaries);
+    let plan = occ_plan(facts, winners, &read_append_versions, file_actions)?;
+    let violations = executor.execute_op(Operation::QueryPlan(plan))?;
+    if let Some(conflict) = first_occ_conflict(violations, &summaries)? {
+        return Ok(ConflictDetection::Conflict(conflict));
+    }
+    ensure_row_tracking_marks(&summaries)?;
+    Ok(ConflictDetection::NoConflict(summaries))
+}
+
+#[derive(Debug)]
+pub(crate) enum ConflictDetection {
+    /// No winner conflicts with T.
+    ///
+    /// Only a winner that writes the `delta.rowTracking` domain has a high-water mark in its
+    /// summary. Before T commits, the caller must move T's row IDs past the winners' marks and T's
+    /// in-commit timestamp past the winners' timestamps.
+    NoConflict(Vec<WinnerSummary>),
+    Conflict(Conflict),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Conflict {
@@ -59,8 +115,8 @@ pub(crate) struct WinningCommit {
 
 /// The facts about T that conflict detection needs.
 ///
-/// T is never a row-tracking backfill or unbackfill and never drops a feature: Kernel reserves
-/// those operation names.
+/// Only `checked_version` changes between checks. T is never a row-tracking backfill or
+/// unbackfill and never drops a feature: Kernel reserves those operation names.
 #[derive(Debug, Clone)]
 pub(crate) struct LoserFacts {
     /// T's read version on the first check, then the last winner version of the previous check.
@@ -69,6 +125,8 @@ pub(crate) struct LoserFacts {
     ///
     /// Compare the value case-insensitively, and fail T when it matches no level.
     pub(crate) isolation_level: IsolationLevel,
+    /// T writes a top-level `checkpoint` action, as an adaptiveMetadata manifest commit does.
+    pub(crate) is_manifest_commit: bool,
     /// At least one of T's file actions has `dataChange=true`.
     pub(crate) has_data_change: bool,
     /// T's operation changes data, like Delta Spark's `DeltaOperations.Operation.changesData`.
@@ -81,6 +139,8 @@ pub(crate) struct LoserFacts {
     /// Count `cdc` as a file action.
     pub(crate) has_other_actions: bool,
     /// T removes a file, updates a deletion vector or adds a file again.
+    ///
+    /// Derive it from T's staged actions. It must be true when `file_actions` holds a remove.
     pub(crate) rewrites_files: bool,
     /// The domains that T writes, including removal tombstones.
     pub(crate) written_domains: Vec<String>,
@@ -136,6 +196,48 @@ impl ReadScope {
     fn is_nothing(&self) -> bool {
         matches!(self, ReadScope::Nothing)
     }
+}
+
+/// Rejects a T that Kernel can't check, or that read nothing but rewrites files.
+///
+/// Delta Spark doesn't let a writer set SnapshotIsolation as the table level. Kernel can't check T
+/// at that level. A manifest commit's `checkpoint` restates all txns and domains, so a retry would
+/// drop a winner's changes.
+fn ensure_supported_loser(facts: &LoserFacts) -> KernelResult<()> {
+    if facts.isolation_level == IsolationLevel::SnapshotIsolation {
+        return Err(KernelError::unsupported(
+            "Conflict detection does not support the table isolation level SnapshotIsolation",
+        ));
+    }
+    if facts.is_manifest_commit {
+        return Err(KernelError::unsupported(
+            "Conflict detection does not support a transaction that writes a manifest commit",
+        ));
+    }
+    if facts.read_scope.is_nothing() && facts.rewrites_files {
+        return Err(KernelError::internal_error(
+            "A transaction that removes or re-adds files must pass the files that it read",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_winners_follow_checked_version(
+    checked_version: Version,
+    winners: &[WinningCommit],
+) -> KernelResult<()> {
+    let follows_checked_version = winners
+        .iter()
+        .zip(1..)
+        .all(|(winner, offset)| checked_version.checked_add(offset) == Some(winner.version));
+    if !follows_checked_version {
+        return Err(KernelError::internal_error(format!(
+            "Winning commits {:?} must start at checked version {checked_version} + 1 with no \
+             version gap",
+            winner_versions(winners),
+        )));
+    }
+    Ok(())
 }
 
 /// A JSON scan of the winners' commit files, with each row's winner version in `VERSION`.

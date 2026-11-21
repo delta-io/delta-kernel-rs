@@ -12,7 +12,7 @@
 //! `dataChange`.
 //!
 //! For `ReadScope::Nothing`, `select_read_append_versions` selects no version and `read_delete` has
-//! no read files.
+//! no read files. `delete_delete` still runs, as a backstop for inconsistent facts.
 
 use std::sync::LazyLock;
 
