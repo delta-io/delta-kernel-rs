@@ -92,11 +92,11 @@ mod tests {
     use url::Url;
 
     use super::*;
+    use crate::engine::DelegatingEngine;
     use crate::engine::sync::SyncEngine;
-    use crate::engine::test_delegating::DelegatingEngine;
     use crate::metrics::MetricEvent;
-    use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
-    use crate::{FileMeta, FileSlice, KernelResult, KernelResultIteratorStatic};
+    use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
+    use crate::{FileMeta, FileSlice, KernelResult, KernelResultIterator};
 
     /// Minimal storage handler used in tests: returns N preconfigured FileMeta items.
     #[derive(Debug)]
@@ -105,14 +105,18 @@ mod tests {
     }
 
     impl StorageHandler for StubStorageHandler {
-        fn list_from(&self, _path: &Url) -> KernelResult<KernelResultIteratorStatic<FileMeta>> {
+        fn list_from(
+            &self,
+            _path: &Url,
+            _end: Option<&Url>,
+        ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
             let results: Vec<_> = self.list_results.iter().cloned().map(Ok).collect();
             Ok(Box::new(results.into_iter()))
         }
         fn read_files(
             &self,
             _files: Vec<FileSlice>,
-        ) -> KernelResult<KernelResultIteratorStatic<Bytes>> {
+        ) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
             Ok(Box::new(std::iter::empty()))
         }
         fn copy_atomic(&self, _src: &Url, _dest: &Url) -> KernelResult<()> {
@@ -157,7 +161,7 @@ mod tests {
 
         let engine = MeteredDeltaEngine::new(Arc::new(stub_engine()));
         let url = Url::parse("memory:///_delta_log/").unwrap();
-        let iter = engine.storage_handler().list_from(&url).unwrap();
+        let iter = engine.storage_handler().list_from(&url, None).unwrap();
         let _: Vec<_> = iter.collect();
 
         let listed = reporter
@@ -185,10 +189,12 @@ mod tests {
     fn json_and_parquet_handlers_are_metered() {
         let engine = MeteredDeltaEngine::new(Arc::new(stub_engine()));
         assert!(engine.json_handler().any_ref().is::<MeteredJsonHandler>());
-        assert!(engine
-            .parquet_handler()
-            .any_ref()
-            .is::<MeteredParquetHandler>());
+        assert!(
+            engine
+                .parquet_handler()
+                .any_ref()
+                .is::<MeteredParquetHandler>()
+        );
     }
 
     #[test]

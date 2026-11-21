@@ -20,7 +20,9 @@ use crate::expressions::ColumnName;
 use crate::table_features::ColumnMappingMode;
 use crate::{KernelError, Version};
 
+mod config;
 mod deserialize;
+pub(crate) use config::{is_delta_property_key, validate_and_normalize_property_for_update};
 pub use deserialize::ParseIntervalError;
 
 /// Prefix for delta table properties (e.g., `delta.enableChangeDataFeed`, `delta.appendOnly`).
@@ -44,6 +46,7 @@ pub(crate) const ENABLE_TYPE_WIDENING: &str = "delta.enableTypeWidening";
 pub(crate) const ENABLE_ICEBERG_COMPAT_V1: &str = "delta.enableIcebergCompatV1";
 pub(crate) const ENABLE_ICEBERG_COMPAT_V2: &str = "delta.enableIcebergCompatV2";
 pub(crate) const ENABLE_ICEBERG_COMPAT_V3: &str = "delta.enableIcebergCompatV3";
+pub(crate) const ENABLE_ICEBERG_NATIVE_V4: &str = "delta.enableIcebergNativeV4";
 pub(crate) const ISOLATION_LEVEL: &str = "delta.isolationLevel";
 pub(crate) const LOG_RETENTION_DURATION: &str = "delta.logRetentionDuration";
 pub(crate) const ENABLE_EXPIRED_LOG_CLEANUP: &str = "delta.enableExpiredLogCleanup";
@@ -67,6 +70,7 @@ pub(crate) const IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION: &str =
 pub(crate) const IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP: &str =
     "delta.inCommitTimestampEnablementTimestamp";
 pub(crate) const CHECK_CONSTRAINT_PREFIX: &str = "delta.constraints.";
+pub(crate) const FILE_TYPE_WRITE_LOCATION: &str = "delta.fileType.writeLocation";
 
 /// Delta table properties. These are parsed from the 'configuration' map in the most recent
 /// 'Metadata' action of a table.
@@ -156,6 +160,9 @@ pub struct TableProperties {
     /// ensures compatibility with Apache Iceberg V3 table format.
     pub enable_iceberg_compat_v3: Option<bool>,
 
+    /// When enabled, table content metadata is kept in the Adaptive Metadata Tree (AMT).
+    pub enable_iceberg_native_v4: Option<bool>,
+
     /// The degree to which a transaction must be isolated from modifications made by concurrent
     /// transactions.
     ///
@@ -241,6 +248,17 @@ pub struct TableProperties {
     /// The timestamp of the table at which in-commit timestamps were enabled. This must be the
     /// same as the inCommitTimestamp of the commit when this feature was enabled.
     pub in_commit_timestamp_enablement_timestamp: Option<i64>,
+
+    /// Where writers write the files of new `file` references: a table-root-relative path under
+    /// `_files`, or an absolute URI outside the table root. When absent, the write location is
+    /// `_files`. An internal property that users cannot set, change or remove; only the system
+    /// that allocates the write location, such as a catalog, sets it. Kernel never consults it to
+    /// resolve a `uri`. Use [`BoundWriteContext::new_referenced_file_path`] to get a location
+    /// under it, which also validates the value.
+    ///
+    /// [`BoundWriteContext::new_referenced_file_path`]:
+    ///     crate::transaction::BoundWriteContext::new_referenced_file_path
+    pub file_type_write_location: Option<String>,
 
     /// The table's [CHECK constraints], one per `delta.constraints.<name>` property, sorted by
     /// name and then SQL.
@@ -472,6 +490,7 @@ mod tests {
         assert_eq!(ENABLE_ICEBERG_COMPAT_V1, "delta.enableIcebergCompatV1");
         assert_eq!(ENABLE_ICEBERG_COMPAT_V2, "delta.enableIcebergCompatV2");
         assert_eq!(ENABLE_ICEBERG_COMPAT_V3, "delta.enableIcebergCompatV3");
+        assert_eq!(ENABLE_ICEBERG_NATIVE_V4, "delta.enableIcebergNativeV4");
         assert_eq!(ISOLATION_LEVEL, "delta.isolationLevel");
         assert_eq!(LOG_RETENTION_DURATION, "delta.logRetentionDuration");
         assert_eq!(ENABLE_EXPIRED_LOG_CLEANUP, "delta.enableExpiredLogCleanup");
@@ -511,6 +530,7 @@ mod tests {
             IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP,
             "delta.inCommitTimestampEnablementTimestamp"
         );
+        assert_eq!(FILE_TYPE_WRITE_LOCATION, "delta.fileType.writeLocation");
     }
 
     #[test]
@@ -589,9 +609,11 @@ mod tests {
                 parsed.column_mapping_max_column_id, None,
                 "input: {invalid}"
             );
-            assert!(parsed
-                .unknown_properties
-                .contains_key(COLUMN_MAPPING_MAX_COLUMN_ID));
+            assert!(
+                parsed
+                    .unknown_properties
+                    .contains_key(COLUMN_MAPPING_MAX_COLUMN_ID)
+            );
         }
     }
 
@@ -642,6 +664,7 @@ mod tests {
             (ENABLE_ICEBERG_COMPAT_V1, "true"),
             (ENABLE_ICEBERG_COMPAT_V2, "true"),
             (ENABLE_ICEBERG_COMPAT_V3, "true"),
+            (ENABLE_ICEBERG_NATIVE_V4, "true"),
             (ISOLATION_LEVEL, "snapshotIsolation"),
             (LOG_RETENTION_DURATION, "interval 2 seconds"),
             (ENABLE_EXPIRED_LOG_CLEANUP, "true"),
@@ -663,6 +686,7 @@ mod tests {
             (IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP, "1612345678"),
             (PARQUET_FORMAT_VERSION, "2.12.0"),
             (PARQUET_COMPRESSION_CODEC, "zstd"),
+            (FILE_TYPE_WRITE_LOCATION, "_files/p1"),
         ];
         let actual = TableProperties::from(properties.into_iter());
         let expected = TableProperties {
@@ -683,6 +707,7 @@ mod tests {
             enable_iceberg_compat_v1: Some(true),
             enable_iceberg_compat_v2: Some(true),
             enable_iceberg_compat_v3: Some(true),
+            enable_iceberg_native_v4: Some(true),
             isolation_level: Some(IsolationLevel::SnapshotIsolation),
             log_retention_duration: Some(Duration::new(2, 0)),
             enable_expired_log_cleanup: Some(true),
@@ -703,6 +728,7 @@ mod tests {
             parquet_format_version: Some("2.12.0".to_string()),
             parquet_compression_codec: Some(ParquetCompressionCodec::Zstd),
             in_commit_timestamp_enablement_timestamp: Some(1_612_345_678),
+            file_type_write_location: Some("_files/p1".to_string()),
             check_constraints: vec![],
             unknown_properties: HashMap::new(),
         };

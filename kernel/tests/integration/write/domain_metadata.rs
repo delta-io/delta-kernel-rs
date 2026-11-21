@@ -1,10 +1,10 @@
 //! Integration tests for domain metadata set/remove flows.
 
-use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::ObjectStoreExt as _;
-use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::Snapshot;
+use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::object_store::ObjectStoreExt as _;
+use delta_kernel::object_store::path::Path;
+use delta_kernel::transaction::UpdateTableOperation;
 use itertools::Itertools;
 use rstest::rstest;
 use serde_json::Deserializer;
@@ -87,9 +87,13 @@ async fn test_set_domain_metadata_basic() -> Result<(), Box<dyn std::error::Erro
     }
 
     let final_snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let domain1_config = final_snapshot.get_domain_metadata(domain1, &engine)?;
+    let domain1_config = final_snapshot
+        .reader()
+        .get_domain_metadata(domain1, &engine)?;
     assert_eq!(domain1_config, Some(config1.to_string()));
-    let domain2_config = final_snapshot.get_domain_metadata(domain2, &engine)?;
+    let domain2_config = final_snapshot
+        .reader()
+        .get_domain_metadata(domain2, &engine)?;
     assert_eq!(domain2_config, Some(config2.to_string()));
     Ok(())
 }
@@ -140,8 +144,8 @@ async fn test_set_domain_metadata_errors() -> Result<(), Box<dyn std::error::Err
 }
 
 #[tokio::test]
-async fn test_set_domain_metadata_unsupported_writer_feature(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_set_domain_metadata_unsupported_writer_feature()
+-> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let schema = get_simple_int_schema();
@@ -166,14 +170,17 @@ async fn test_set_domain_metadata_unsupported_writer_feature(
         .with_domain_metadata("app.config".to_string(), "test_config".to_string())
         .commit(&engine);
 
-    assert_result_error_with_message(res, "Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature");
+    assert_result_error_with_message(
+        res,
+        "Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature",
+    );
 
     Ok(())
 }
 
 #[tokio::test]
-async fn test_remove_domain_metadata_unsupported_writer_feature(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_remove_domain_metadata_unsupported_writer_feature()
+-> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let schema = get_simple_int_schema();
@@ -203,7 +210,10 @@ async fn test_remove_domain_metadata_unsupported_writer_feature(
         |builder| builder.with_domain_metadata_removed("app.config"),
     );
 
-    assert_result_error_with_message(res, "Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature");
+    assert_result_error_with_message(
+        res,
+        "Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature",
+    );
 
     Ok(())
 }
@@ -255,7 +265,9 @@ async fn test_remove_domain_metadata_non_existent_domain() -> Result<(), Box<dyn
     );
 
     let final_snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let config = final_snapshot.get_domain_metadata(domain, &engine)?;
+    let config = final_snapshot
+        .reader()
+        .get_domain_metadata(domain, &engine)?;
     assert_eq!(config, None);
 
     Ok(())
@@ -291,9 +303,10 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
         .with_domain_metadata_removed("app.config")
         .build(&engine, Box::new(FileSystemCommitter::new()))
         .unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("cannot be added and removed in one transaction"));
+    assert!(
+        err.to_string()
+            .contains("cannot be added and removed in one transaction")
+    );
 
     // remove then set same domain
     let err = snapshot
@@ -303,9 +316,10 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
         .with_domain_metadata("test.domain", "v1")
         .build(&engine, Box::new(FileSystemCommitter::new()))
         .unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("cannot be added and removed in one transaction"));
+    assert!(
+        err.to_string()
+            .contains("cannot be added and removed in one transaction")
+    );
 
     // remove same domain twice
     let err = snapshot
@@ -327,9 +341,11 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
         |builder| builder.with_domain_metadata_removed("delta.system"),
     )
     .unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("Cannot modify domains that start with 'delta.' as those are system controlled"));
+    assert!(
+        err.to_string().contains(
+            "Cannot modify domains that start with 'delta.' as those are system controlled"
+        )
+    );
 
     Ok(())
 }
@@ -381,9 +397,15 @@ async fn test_builder_domain_metadata_with_late_operation(
         assert_result_error_with_message(result, "already specified in this transaction");
         let latest = Snapshot::builder_for(table_url).build(&engine)?;
         assert_eq!(latest.version(), snapshot.version());
-        assert_eq!(latest.get_domain_metadata("app.config", &engine)?, None);
         assert_eq!(
-            latest.get_domain_metadata("app.other", &engine)?.as_deref(),
+            latest.reader().get_domain_metadata("app.config", &engine)?,
+            None
+        );
+        assert_eq!(
+            latest
+                .reader()
+                .get_domain_metadata("app.other", &engine)?
+                .as_deref(),
             Some("original")
         );
     } else {
@@ -391,12 +413,16 @@ async fn test_builder_domain_metadata_with_late_operation(
         assert_eq!(latest.version(), snapshot.version() + 1);
         assert_eq!(
             latest
+                .reader()
                 .get_domain_metadata("app.config", &engine)?
                 .as_deref(),
             Some("builder")
         );
         assert_eq!(
-            latest.get_domain_metadata("app.other", &engine)?.as_deref(),
+            latest
+                .reader()
+                .get_domain_metadata("app.other", &engine)?
+                .as_deref(),
             (!remove).then_some("late")
         );
     }
@@ -468,7 +494,9 @@ async fn test_domain_metadata_set_then_remove() -> Result<(), Box<dyn std::error
 
     // verify reads see the metadata removal
     let final_snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let domain_config = final_snapshot.get_domain_metadata(domain, &engine)?;
+    let domain_config = final_snapshot
+        .reader()
+        .get_domain_metadata(domain, &engine)?;
     assert_eq!(domain_config, None);
 
     Ok(())

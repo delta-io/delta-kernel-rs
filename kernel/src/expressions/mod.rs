@@ -6,24 +6,27 @@ use std::sync::Arc;
 
 use derive_more::From;
 use itertools::Itertools;
-use serde::{de, ser, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser};
 
 #[doc(hidden)]
 pub use self::column_names::{__require_valid_simple_column_segment, column_expr};
 pub use self::column_names::{
-    col, column_expr_ref, column_name, column_pred, joined_column_expr, joined_column_name,
-    ColumnName,
+    ColumnName, col, column_expr_ref, column_name, column_pred, joined_column_expr,
+    joined_column_name,
 };
 #[doc(inline)]
 pub use self::macros::expr;
-pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
+pub(crate) use self::scalars::MONTHS_PER_YEAR;
+pub use self::scalars::{
+    ArrayData, DecimalData, IntervalDayTimeData, IntervalYearMonthData, MapData, Scalar, StructData,
+};
 use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator,
 };
 use crate::schema::SchemaRef;
 pub use crate::struct_patch::{ExpressionFieldPatch, ExpressionStructPatch};
-use crate::transforms::{transform_output_type, ExpressionTransform};
+use crate::transforms::{ExpressionTransform, transform_output_type};
 use crate::utils::CollectInto;
 use crate::{DataType, DynPartialEq, KernelError, KernelResult};
 
@@ -82,6 +85,20 @@ pub enum UnaryPredicateOp {
     /// SQL `expr IS NULL`: `true` when the input is null and `false` otherwise, never null itself.
     /// A wrapping `NOT` inverts it to `IS NOT NULL`.
     IsNull,
+    /// `true` when a STRING URI reference begins with a scheme followed by `:`, per
+    /// [RFC 3986 section 3.1]: `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) ":"`. Equivalent to
+    /// `regexp_like(expr, '^[A-Za-z][A-Za-z0-9+.\-]*:')`. A reference without a scheme is
+    /// relative. A NULL input yields NULL, and so does its `NOT`. Other input types are an error.
+    ///
+    /// ```text
+    /// HAS_URI_SCHEME('s3://bucket/a b.parquet')  -- true
+    /// HAS_URI_SCHEME('C:/data')                  -- true
+    /// HAS_URI_SCHEME('data/a:b.parquet')         -- false
+    /// HAS_URI_SCHEME('1abc:/a')                  -- false
+    /// ```
+    ///
+    /// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
+    HasUriScheme,
 }
 
 /// A binary predicate operator.
@@ -125,7 +142,8 @@ pub enum UnaryExpressionOp {
     /// SQL `to_json(expr)`: encode a struct as a JSON object string, one string per row. The input
     /// must be a struct and the output is STRING. A NULL input row produces a NULL string rather
     /// than `"null"`. This is the inverse of [`ParseJsonExpression`] for every type except
-    /// timestamps, whose sub-millisecond precision this operator discards (see below).
+    /// timestamps, whose sub-millisecond precision this operator discards unless
+    /// `full_precision_timestamps` is set (see below).
     ///
     /// Nested structs and arrays encode as JSON objects and arrays. Binary encodes as lowercase
     /// hex rather than base64, two digits per byte in the order the bytes appear, so
@@ -142,8 +160,45 @@ pub enum UnaryExpressionOp {
     /// `{"ts":"2026-07-02T15:55:55.298Z"}`. Emitting more digits, or rounding up, makes readers
     /// prune files that hold matching rows.
     ///
+    /// When `full_precision_timestamps` is set, timestamps instead encode with exactly six
+    /// fractional digits, so the same value becomes `{"ts":"2026-07-02T15:55:55.298677Z"}` and the
+    /// operator is the exact inverse of [`ParseJsonExpression`].
+    ///
     /// [Per-file Statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#per-file-statistics
-    ToJson,
+    ToJson {
+        /// Encode timestamps with all six microsecond digits instead of three.
+        full_precision_timestamps: bool,
+    },
+    /// Percent-encodes the path of a raw (unencoded) STRING URI reference per [RFC 3986]. Each
+    /// character that may not appear literally in a path ([section 3.3]), such as space, `#`, `%`
+    /// and `?`, becomes `%XX` ([section 2.1]), and a non-ASCII character becomes one `%XX` per
+    /// byte of its UTF-8 encoding. All other characters, including `/`, `.`, `:` and `@`, are kept.
+    ///
+    /// When the reference begins with a scheme (see [`UnaryPredicateOp::HasUriScheme`]), its
+    /// `scheme:` and any `//authority` (up to the next `/`) are kept verbatim. Existing `%XX`
+    /// escapes are not recognized, so an already-encoded input is encoded again. The output is
+    /// STRING, a NULL input yields NULL, and other input types are an error.
+    ///
+    /// ```text
+    /// URI_ENCODE_FILE_LOCATION('data/a b.parquet')         -- 'data/a%20b.parquet'
+    /// URI_ENCODE_FILE_LOCATION('s3://bucket/a#1.parquet')  -- 's3://bucket/a%231.parquet'
+    /// URI_ENCODE_FILE_LOCATION('data/München')             -- 'data/M%C3%BCnchen'
+    /// URI_ENCODE_FILE_LOCATION('data/a%20b.parquet')       -- 'data/a%2520b.parquet'
+    /// ```
+    ///
+    /// [RFC 3986]: https://datatracker.ietf.org/doc/html/rfc3986
+    /// [section 2.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-2.1
+    /// [section 3.3]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.3
+    // TODO(#2423): decide whether this keeps percent-encoding non-ASCII if `add.path` stops doing
+    // so.
+    UriEncodeFileLocation,
+}
+
+impl UnaryExpressionOp {
+    /// [`ToJson`](Self::ToJson) with timestamps truncated to milliseconds.
+    pub const TO_JSON: Self = Self::ToJson {
+        full_precision_timestamps: false,
+    };
 }
 
 /// A binary arithmetic operator over two numeric operands.
@@ -363,9 +418,29 @@ pub struct VariadicExpression {
     pub exprs: Vec<Expression>,
 }
 
+/// A searched SQL `CASE WHEN` expression.
+///
+/// Conditions are checked in order. The first TRUE condition selects its result expression;
+/// FALSE and NULL conditions fall through to the next branch. Only the selected result is
+/// evaluated for each row. If no condition is TRUE, `else_expr` is evaluated.
+/// An empty branch list evaluates to `else_expr`.
+/// Every THEN result and `else_expr` must have the same logical data type, including typed NULLs.
+/// For example, integer results require an integer ELSE or a NULL typed as [`DataType::INTEGER`].
+/// No implicit casts or numeric widening are applied. The Arrow evaluator requires evaluated
+/// results to have identical Arrow types, including string representations and nested fields.
+/// Runtime type validation checks evaluated results; unused branches are not evaluated to check
+/// their types.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CaseWhenExpression {
+    /// Ordered condition/result pairs.
+    pub branches: Vec<(Predicate, Expression)>,
+    /// The fallback expression when no condition is TRUE.
+    pub else_expr: Box<Expression>,
+}
+
 /// An expression that parses a JSON string column into a struct column of `output_schema`, the
 /// inverse of [`UnaryExpressionOp::ToJson`] except for the sub-millisecond timestamp precision
-/// that operator discards.
+/// that operator discards unless `full_precision_timestamps` is set.
 ///
 /// Unparseable input must degrade to NULL rather than fail the query, because kernel parses
 /// `add.stats` with this operator and data skipping reads null stats as "include the file". The
@@ -515,8 +590,10 @@ pub enum Expression {
     /// validated against the schema, so building a struct takes both. The expression count must
     /// equal the output field count.
     ///
-    /// The optional nullability predicate says when to *keep* the struct: a row survives only
-    /// where it is true, and nulls entirely where it is false or null.
+    /// The optional nullability predicate keeps the struct where it is true and makes the
+    /// entire struct null where it is false or null. See
+    /// [`ExpressionEvaluator::evaluate`](crate::ExpressionEvaluator::evaluate) for how a null
+    /// struct expands into output columns.
     ///
     /// ```sql
     /// CASE WHEN keep_pred THEN struct(expr1, expr2, ...) END
@@ -534,6 +611,8 @@ pub enum Expression {
     Binary(BinaryExpression),
     /// An expression that takes a variable number of expressions as input.
     Variadic(VariadicExpression),
+    /// A conditional expression with ordered WHEN branches and a required ELSE.
+    CaseWhen(CaseWhenExpression),
     /// An expression that the engine defines and implements. Kernel interacts with the expression
     /// only through methods provided by the [`OpaqueExpressionOp`] trait.
     #[serde(serialize_with = "fail_serialize_opaque_expression")]
@@ -672,6 +751,18 @@ impl VariadicExpression {
     }
 }
 
+impl CaseWhenExpression {
+    pub(crate) fn new(
+        branches: impl IntoIterator<Item = (Predicate, Expression)>,
+        else_expr: Expression,
+    ) -> Self {
+        Self {
+            branches: branches.into_iter().collect(),
+            else_expr: Box::new(else_expr),
+        }
+    }
+}
+
 impl ParseJsonExpression {
     pub(crate) fn new(json_expr: impl Into<Expression>, output_schema: SchemaRef) -> Self {
         Self {
@@ -684,8 +775,8 @@ impl ParseJsonExpression {
 /// Connector-supplied options controlling how a [`MapToStructExpression`] parses map values.
 ///
 /// Kernel does not infer these settings from the host environment or table metadata.
-/// Expression producers must use one reader timezone for all partition-value expressions in a
-/// scan so materialization and pruning cannot interpret the same value differently.
+/// Expression producers must use the same `timestamp_timezone` for all partition-value expressions
+/// in a scan so materialization and pruning cannot interpret the same value differently.
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct MapToStructOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -695,17 +786,18 @@ pub struct MapToStructOptions {
 impl MapToStructOptions {
     /// Interpret offset-less `TIMESTAMP` values in `timestamp_timezone`.
     ///
-    /// Accepts an IANA timezone identifier or a fixed offset in `+HH:MM` or `-HH:MM` form. Named
-    /// zones preserve their clock-transition rules; fixed offsets apply when the reader
-    /// configuration itself is fixed. Use [`MapToStructOptions::default`] for UTC.
+    /// Accepts an IANA timezone identifier, a fixed offset in `+HH:MM[:SS]` or `-HH:MM[:SS]` form,
+    /// or `Z` for UTC. The exact uppercase IDs `EST`, `MST`, and `HST` use fixed offsets `-05:00`,
+    /// `-07:00`, and `-10:00`, respectively. Full IANA region names preserve historical clock
+    /// transitions. Use [`MapToStructOptions::default`] for UTC.
     pub fn with_timestamp_timezone(mut self, timestamp_timezone: impl Into<String>) -> Self {
         self.timestamp_timezone = Some(timestamp_timezone.into());
         self
     }
 
-    /// Returns the configured IANA timezone or fixed offset, or `None` when UTC applies.
+    /// Returns the timezone string as configured, or `None` when UTC applies.
     ///
-    /// Fixed offsets use `+HH:MM` or `-HH:MM` form.
+    /// See [`Self::with_timestamp_timezone`] for accepted IDs and offsets.
     pub fn timestamp_timezone(&self) -> Option<&str> {
         self.timestamp_timezone.as_deref()
     }
@@ -968,6 +1060,22 @@ impl Expression {
         Self::variadic(VariadicExpressionOp::Array, exprs)
     }
 
+    /// Creates a searched CASE expression from ordered condition/result `branches` and an
+    /// `else_expr` fallback. Empty `branches` return `else_expr` directly.
+    /// All branch results and `else_expr` must have the same logical type, including typed NULLs;
+    /// no implicit type coercion is performed.
+    /// See [`CaseWhenExpression`] for evaluation semantics.
+    pub fn case_when(
+        branches: impl IntoIterator<Item = (Predicate, Expression)>,
+        else_expr: Expression,
+    ) -> Self {
+        let branches = branches.into_iter().collect::<Vec<_>>();
+        match branches.is_empty() {
+            true => else_expr,
+            false => Self::CaseWhen(CaseWhenExpression::new(branches, else_expr)),
+        }
+    }
+
     /// Creates a new opaque expression
     pub fn opaque(
         op: impl OpaqueExpressionOp,
@@ -984,7 +1092,7 @@ impl Expression {
     /// Creates a new ParseJson expression that parses a JSON string column into a struct.
     /// This is the inverse of [`UnaryExpressionOp::ToJson`] - it converts a JSON-encoded string
     /// into a struct. Sub-millisecond timestamp precision does not survive the round trip, since
-    /// `ToJson` truncates it.
+    /// `ToJson` truncates it unless `full_precision_timestamps` is set.
     pub fn parse_json(json_expr: impl Into<Expression>, output_schema: SchemaRef) -> Self {
         Self::ParseJson(ParseJsonExpression::new(json_expr, output_schema))
     }
@@ -1054,6 +1162,11 @@ impl Predicate {
     /// Create a new predicate `self IS NOT NULL`
     pub fn is_not_null(expr: impl Into<Expression>) -> Self {
         Self::not(Self::is_null(expr))
+    }
+
+    /// Create a new predicate `HAS_URI_SCHEME(expr)`; see [`UnaryPredicateOp::HasUriScheme`].
+    pub fn has_uri_scheme(expr: impl Into<Expression>) -> Self {
+        Self::unary(UnaryPredicateOp::HasUriScheme, expr)
     }
 
     /// Create a new predicate `self == other`
@@ -1183,7 +1296,8 @@ impl Display for UnaryExpressionOp {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         use UnaryExpressionOp::*;
         match self {
-            ToJson => write!(f, "TO_JSON"),
+            ToJson { .. } => write!(f, "TO_JSON"),
+            UriEncodeFileLocation => write!(f, "URI_ENCODE_FILE_LOCATION"),
         }
     }
 }
@@ -1269,10 +1383,27 @@ impl Display for Expression {
                 }
                 write!(f, ")")
             }
+            Unary(UnaryExpression {
+                op:
+                    op @ UnaryExpressionOp::ToJson {
+                        full_precision_timestamps: true,
+                    },
+                expr,
+            }) => write!(f, "{op}({expr}, full_precision_timestamps)"),
             Unary(UnaryExpression { op, expr }) => write!(f, "{op}({expr})"),
             Binary(BinaryExpression { op, left, right }) => write!(f, "{left} {op} {right}"),
             Variadic(VariadicExpression { op, exprs }) => {
                 write!(f, "{op}({})", format_child_list(exprs))
+            }
+            CaseWhen(CaseWhenExpression {
+                branches,
+                else_expr,
+            }) => {
+                write!(f, "CASE")?;
+                for (condition, result) in branches {
+                    write!(f, " WHEN {condition} THEN {result}")?;
+                }
+                write!(f, " ELSE {else_expr} END")
             }
             Opaque(OpaqueExpression { op, exprs }) => {
                 write!(f, "{op:?}({})", format_child_list(exprs))
@@ -1315,6 +1446,7 @@ impl Display for Predicate {
             Binary(BinaryPredicate { op, left, right }) => write!(f, "{left} {op} {right}"),
             Unary(UnaryPredicate { op, expr }) => match op {
                 UnaryPredicateOp::IsNull => write!(f, "{expr} IS NULL"),
+                UnaryPredicateOp::HasUriScheme => write!(f, "HAS_URI_SCHEME({expr})"),
             },
             Junction(JunctionPredicate { op, preds }) => {
                 let op = match op {
@@ -1391,11 +1523,12 @@ impl<'a> ExpressionTransform<'a> for GetColumnReferences<'a> {
 mod tests {
     use std::fmt::Debug;
 
-    use serde::de::DeserializeOwned;
     use serde::Serialize;
+    use serde::de::DeserializeOwned;
 
     use super::{
-        col, column_pred, lit, DataType, Expression as Expr, MapToStructOptions, Predicate as Pred,
+        DataType, Expression as Expr, MapToStructOptions, Predicate as Pred, UnaryExpressionOp,
+        col, column_pred, expr, lit,
     };
 
     /// Helper function to verify roundtrip serialization/deserialization
@@ -1424,6 +1557,37 @@ mod tests {
             (
                 Expr::cast(col!("x"), DataType::DATE),
                 "CAST(Column(x) AS date)",
+            ),
+            (
+                Expr::unary(UnaryExpressionOp::TO_JSON, col!("x")),
+                "TO_JSON(Column(x))",
+            ),
+            (
+                Expr::unary(
+                    UnaryExpressionOp::ToJson {
+                        full_precision_timestamps: true,
+                    },
+                    col!("x"),
+                ),
+                "TO_JSON(Column(x), full_precision_timestamps)",
+            ),
+            (
+                Expr::unary(UnaryExpressionOp::UriEncodeFileLocation, col!("x")),
+                "URI_ENCODE_FILE_LOCATION(Column(x))",
+            ),
+            (
+                Expr::case_when([(col!("x").is_null(), lit(0))], col!("x")),
+                "CASE WHEN Column(x) IS NULL THEN 0 ELSE Column(x) END",
+            ),
+            (
+                Expr::case_when(
+                    [
+                        (col!("x").is_null(), lit(0)),
+                        (col!("x").gt(lit(100)), lit(100)),
+                    ],
+                    col!("x"),
+                ),
+                "CASE WHEN Column(x) IS NULL THEN 0 WHEN Column(x) > 100 THEN 100 ELSE Column(x) END",
             ),
         ];
 
@@ -1472,25 +1636,28 @@ mod tests {
     fn test_predicate_format() {
         let cases = [
             (column_pred!("x"), "Column(x)"),
-            (col!("x").eq(lit(2)), "Column(x) = 2"),
+            (Pred::from_expr(expr!(col("x") == 2)), "Column(x) = 2"),
             ((col!("x") - lit(4)).lt(lit(10)), "Column(x) - 4 < 10"),
             (
-                Pred::and(col!("x").ge(lit(2)), col!("x").le(lit(10))),
+                Pred::from_expr(expr!(and(col("x") >= 2, col("x") <= 10))),
                 "AND(NOT(Column(x) < 2), NOT(Column(x) > 10))",
             ),
             (
-                Pred::and_from([
-                    col!("x").ge(lit(2)),
-                    col!("x").le(lit(10)),
-                    col!("x").le(lit(100)),
-                ]),
+                Pred::from_expr(expr!(and(col("x") >= 2, col("x") <= 10, col("x") <= 100))),
                 "AND(NOT(Column(x) < 2), NOT(Column(x) > 10), NOT(Column(x) > 100))",
             ),
             (
-                Pred::or(col!("x").gt(lit(2)), col!("x").lt(lit(10))),
+                Pred::from_expr(expr!(or(col("x") > 2, col("x") < 10))),
                 "OR(Column(x) > 2, Column(x) < 10)",
             ),
-            (col!("x").eq(lit("foo")), "Column(x) = 'foo'"),
+            (
+                Pred::from_expr(expr!(col("x") == "foo")),
+                "Column(x) = 'foo'",
+            ),
+            (
+                Pred::not(Pred::has_uri_scheme(col!("x"))),
+                "NOT(HAS_URI_SCHEME(Column(x)))",
+            ),
         ];
 
         for (pred, expected) in cases {
@@ -1507,11 +1674,11 @@ mod tests {
         use super::assert_roundtrip;
         use crate::expressions::scalars::{ArrayData, DecimalData, MapData, StructData};
         use crate::expressions::{
-            col, column_name, lit, null_lit, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
-            Expression, ExpressionStructPatchBuilder, MapToStructOptions, Predicate, Scalar,
-            UnaryExpressionOp,
+            BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression,
+            ExpressionStructPatchBuilder, MapToStructOptions, Predicate, Scalar, UnaryExpressionOp,
+            col, column_name, expr, lit, null_lit,
         };
-        use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
+        use crate::schema::{ArrayType, DataType, DecimalType, MapType, schema_ref};
         use crate::unit_test_utils::assert_result_error_with_message;
 
         // ==================== Expression::Literal Tests ====================
@@ -1578,10 +1745,7 @@ mod tests {
                 // Struct
                 Expression::Literal(Scalar::Struct(
                     StructData::try_new(
-                        vec![
-                            StructField::nullable("x", DataType::INTEGER),
-                            StructField::nullable("y", DataType::STRING),
-                        ],
+                        schema_ref! { nullable "x": INTEGER, nullable "y": STRING },
                         vec![Scalar::Integer(42), Scalar::String("hello".to_string())],
                     )
                     .unwrap(),
@@ -1620,10 +1784,16 @@ mod tests {
 
         // ==================== Expression Operations Tests ====================
 
-        #[test]
-        fn test_unary_expression_roundtrip() {
-            let expr = Expression::unary(UnaryExpressionOp::ToJson, col!("data"));
-            assert_roundtrip(&expr);
+        #[rstest::rstest]
+        fn test_unary_expression_roundtrip(
+            #[values(
+                UnaryExpressionOp::TO_JSON,
+                UnaryExpressionOp::ToJson { full_precision_timestamps: true },
+                UnaryExpressionOp::UriEncodeFileLocation
+            )]
+            op: UnaryExpressionOp,
+        ) {
+            assert_roundtrip(&Expression::unary(op, col!("data")));
         }
 
         #[test]
@@ -1643,7 +1813,7 @@ mod tests {
 
         #[test]
         fn test_variadic_expression_roundtrip() {
-            let expr = Expression::coalesce([col!("a"), col!("b"), lit("default")]);
+            let expr = expr!(coalesce(col("a"), col("b"), "default"));
             assert_roundtrip(&expr);
         }
 
@@ -1666,6 +1836,27 @@ mod tests {
             lit(42i64),
         ]))]
         fn test_array_expression_roundtrip(#[case] expr: Expression) {
+            assert_roundtrip(&expr);
+        }
+
+        #[rstest::rstest]
+        fn test_case_when_expression_roundtrip(
+            #[values(0, 1, 2)] num_branches: i32,
+            #[values(Expression::literal(0), null_lit(DataType::INTEGER))] else_expr: Expression,
+        ) {
+            let branches = (0..num_branches).map(|i| {
+                (
+                    col!("a").gt(Expression::literal(i)),
+                    Expression::case_when(
+                        [(col!("flag").is_null(), Expression::literal(i))],
+                        col!("value"),
+                    ),
+                )
+            });
+            let expr = Expression::case_when(branches, else_expr.clone());
+            if num_branches == 0 {
+                assert_eq!(expr, else_expr);
+            }
             assert_roundtrip(&expr);
         }
 
@@ -1726,7 +1917,7 @@ mod tests {
 
         #[test]
         fn test_expression_wrapping_predicate_roundtrip() {
-            let pred = Predicate::eq(col!("x"), lit(10));
+            let pred = Predicate::from_expr(expr!(col("x") == 10));
             let expr = Expression::from_pred(pred);
             assert_roundtrip(&expr);
         }
@@ -1787,14 +1978,15 @@ mod tests {
                 Predicate::TRUE,
                 Predicate::FALSE,
                 // NOT
-                Predicate::not(Predicate::from_expr(col!("x"))),
+                Predicate::from_expr(expr!(not(col("x")))),
                 // Nested NOT
-                Predicate::not(Predicate::not(Predicate::gt(col!("x"), lit(5)))),
+                Predicate::from_expr(expr!(not(not(col("x") > 5)))),
                 // Unknown
                 Predicate::unknown("some_unknown_predicate()"),
                 // Unary predicates
-                Predicate::is_null(col!("nullable_col")),
-                Predicate::is_not_null(col!("nullable_col")),
+                Predicate::from_expr(expr!(is_null(col("nullable_col")))),
+                Predicate::from_expr(expr!(is_not_null(col("nullable_col")))),
+                Predicate::has_uri_scheme(col!("location")),
             ];
 
             for pred in &cases {
@@ -1810,13 +2002,13 @@ mod tests {
         #[test]
         fn test_predicate_comparisons_roundtrip() {
             let cases: Vec<Predicate> = vec![
-                Predicate::eq(col!("x"), lit(42)),
-                Predicate::ne(col!("status"), lit("active")),
-                Predicate::lt(col!("age"), lit(18)),
-                Predicate::le(col!("price"), lit(100)),
-                Predicate::gt(col!("score"), lit(90)),
-                Predicate::ge(col!("quantity"), lit(1)),
-                Predicate::distinct(col!("a"), col!("b")),
+                Predicate::from_expr(expr!(col("x") == 42)),
+                Predicate::from_expr(expr!(col("status") != "active")),
+                Predicate::from_expr(expr!(col("age") < 18)),
+                Predicate::from_expr(expr!(col("price") <= 100)),
+                Predicate::from_expr(expr!(col("score") > 90)),
+                Predicate::from_expr(expr!(col("quantity") >= 1)),
+                Predicate::from_expr(expr!(distinct(col("a"), col("b")))),
             ];
 
             for pred in &cases {
@@ -1843,35 +2035,29 @@ mod tests {
         fn test_predicate_junctions_roundtrip() {
             let cases: Vec<Predicate> = vec![
                 // Simple AND
-                Predicate::and(
-                    Predicate::gt(col!("x"), lit(0)),
-                    Predicate::lt(col!("x"), lit(100)),
-                ),
+                Predicate::from_expr(expr!(and(col("x") > 0, col("x") < 100))),
                 // Simple OR
-                Predicate::or(
-                    Predicate::eq(col!("status"), lit("active")),
-                    Predicate::eq(col!("status"), lit("pending")),
-                ),
+                Predicate::from_expr(expr!(or(
+                    col("status") == "active",
+                    col("status") == "pending"
+                ))),
                 // Multiple AND
-                Predicate::and_from([
-                    Predicate::gt(col!("x"), lit(0)),
-                    Predicate::lt(col!("x"), lit(100)),
-                    Predicate::is_not_null(col!("x")),
-                ]),
+                Predicate::from_expr(expr!(and(
+                    col("x") > 0,
+                    col("x") < 100,
+                    is_not_null(col("x"))
+                ))),
                 // Multiple OR
-                Predicate::or_from([
-                    Predicate::eq(col!("type"), lit("A")),
-                    Predicate::eq(col!("type"), lit("B")),
-                    Predicate::eq(col!("type"), lit("C")),
-                ]),
+                Predicate::from_expr(expr!(or(
+                    col("type") == "A",
+                    col("type") == "B",
+                    col("type") == "C"
+                ))),
                 // Nested: (a > 0 AND b < 100) OR (c = 'special')
-                Predicate::or(
-                    Predicate::and(
-                        Predicate::gt(col!("a"), lit(0)),
-                        Predicate::lt(col!("b"), lit(100)),
-                    ),
-                    Predicate::eq(col!("c"), lit("special")),
-                ),
+                Predicate::from_expr(expr!(or(
+                    and(col("a") > 0, col("b") < 100),
+                    col("c") == "special"
+                ))),
             ];
 
             for pred in &cases {
@@ -1892,7 +2078,7 @@ mod tests {
 
             // Expression wrapping a predicate that references expressions
             let inner_pred = Predicate::and(
-                Predicate::eq(col!("x"), lit(1)),
+                Predicate::from_expr(expr!(col("x") == 1)),
                 Predicate::gt(
                     Expression::binary(BinaryExpressionOp::Plus, col!("y"), col!("z")),
                     lit(10),
@@ -1906,8 +2092,8 @@ mod tests {
 
         #[test]
         fn test_opaque_expression_serialize_fails() {
-            use crate::expressions::{OpaqueExpressionOp, ScalarExpressionEvaluator};
             use crate::KernelResult;
+            use crate::expressions::{OpaqueExpressionOp, ScalarExpressionEvaluator};
 
             #[derive(Debug, PartialEq)]
             struct TestOpaqueExprOp;
@@ -1932,12 +2118,12 @@ mod tests {
 
         #[test]
         fn test_opaque_predicate_serialize_fails() {
+            use crate::KernelResult;
             use crate::expressions::{OpaquePredicateOp, ScalarExpressionEvaluator};
             use crate::kernel_predicates::{
                 DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
                 IndirectDataSkippingPredicateEvaluator,
             };
-            use crate::KernelResult;
 
             #[derive(Debug, PartialEq)]
             struct TestOpaquePredOp;

@@ -133,11 +133,11 @@ events from the same snapshot load together.
 | Event | Fields | What it measures |
 |-------|--------|------------------|
 | `LogSegmentLoadSuccess` | `operation_id`, `duration`, `num_commit_files`, `num_checkpoint_files`, `num_compaction_files`, `has_latest_crc_file` | Time to list and organize log files into a log segment. |
-| `LogSegmentLoadFailure` | `operation_id` | Log segment load failed. |
+| `LogSegmentLoadFailure` | `operation_id`, `duration` | Time spent before log segment loading failed. |
 | `ProtocolMetadataLoadSuccess` | `operation_id`, `duration` | Time to read protocol and metadata actions from the log. |
-| `ProtocolMetadataLoadFailure` | `operation_id` | Protocol/metadata load failed. |
+| `ProtocolMetadataLoadFailure` | `operation_id`, `duration` | Time spent before protocol/metadata loading failed. |
 | `SnapshotBuildSuccess` | `operation_id`, `version`, `duration` | End-to-end snapshot creation, including the table version that was loaded. |
-| `SnapshotBuildFailure` | `operation_id` | Snapshot creation failed. Use this to track error rates. |
+| `SnapshotBuildFailure` | `operation_id`, `duration` | Time spent before snapshot creation failed. Use this to track error rates. |
 
 ### Scan metadata events
 
@@ -192,13 +192,31 @@ storage call may serve multiple higher-level operations.
 | `JsonReadCompleted` | `num_files`, `bytes_read` | One `JsonHandler::read_json_files` call completed. `bytes_read` is the sum of on-disk file sizes. |
 | `ParquetReadCompleted` | `num_files`, `bytes_read` | One `ParquetHandler::read_parquet_files` call completed. `bytes_read` is the sum of on-disk file sizes. |
 | `CrcReadSuccess` | `duration`, `bytes_read` | One CRC file read and parsed successfully. `bytes_read` is the raw byte count from storage. |
-| `CrcReadFailure` | none | A CRC file read or parse failed. The caller falls back to log replay. |
+| `CrcReadFailure` | none | A CRC file read or parse failed. Non-cancellation failures allow log replay. |
 
 > [!NOTE]
 > If you implement a custom `JsonHandler` or `ParquetHandler`, call
 > `delta_kernel::metrics::emit_json_read_completed` or
 > `emit_parquet_read_completed` once per read call so connectors that install
 > the metrics layer still see those events from your handler.
+
+### Checkpoint hint reads
+
+Use [LastCheckpointReadCompleted](https://docs.rs/delta_kernel/latest/delta_kernel/metrics/struct.LastCheckpointReadCompleted.html)
+to count `_last_checkpoint` read attempts and record their duration by outcome. A missing or invalid
+hint normally leads to log listing. A file-not-found error returned directly by storage propagates
+instead of falling back, but still reports `NotFound`. Use snapshot events to measure snapshot
+failures separately from hint availability. The event has no `operation_id`; see its rustdoc for
+outcome and timing semantics.
+
+### Checksum write events
+
+To track checksum write latency and errors, use
+[ChecksumWriteSuccess](https://docs.rs/delta_kernel/latest/delta_kernel/metrics/struct.ChecksumWriteSuccess.html)
+and [ChecksumWriteFailure](https://docs.rs/delta_kernel/latest/delta_kernel/metrics/struct.ChecksumWriteFailure.html).
+A checksum that already exists produces a success event. See
+[Snapshot::write_checksum](https://docs.rs/delta_kernel/latest/delta_kernel/struct.Snapshot.html#method.write_checksum)
+for the call's behavior.
 
 ## Correlating events with MetricId
 
@@ -277,8 +295,9 @@ impl MetricsReporter for CorrelatingReporter {
             MetricEvent::SnapshotBuildFailure(e) => {
                 let steps = self.drain(e.operation_id);
                 println!(
-                    "Snapshot {} failed after {} sub-events; last step: {:?}",
+                    "Snapshot {} failed after {:?} ({} sub-events); last step: {:?}",
                     e.operation_id,
+                    e.duration,
                     steps.len(),
                     steps.last()
                 );

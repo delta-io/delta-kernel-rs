@@ -5,7 +5,8 @@
 
 use std::borrow::Cow;
 
-use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
+use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
+use url::Url;
 
 /// Characters encoded by [`uri_encode_path`]: `%`, space, and ASCII chars illegal in a
 /// URI path, plus all ASCII controls via [`CONTROLS`]. Non-ASCII UTF-8 bytes are ALSO
@@ -46,6 +47,16 @@ pub(crate) fn uri_encode_path(path: &str) -> Cow<'_, str> {
 /// bytes are not valid UTF-8.
 pub(crate) fn uri_decode_path(path: &str) -> Option<Cow<'_, str>> {
     percent_decode_str(path).decode_utf8().ok()
+}
+
+/// Returns `url` as a string that ends in `/`, so a relative path can be appended to it with no
+/// further separator.
+pub(crate) fn with_trailing_slash(url: &Url) -> String {
+    let mut base = url.as_str().to_string();
+    if !base.ends_with('/') {
+        base.push('/');
+    }
+    base
 }
 
 #[cfg(test)]

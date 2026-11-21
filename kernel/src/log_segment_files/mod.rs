@@ -18,13 +18,10 @@ use itertools::Itertools;
 use tracing::{debug, info, instrument, warn};
 use url::Url;
 
-use crate::cancellation::CancellationTokenRef;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::LogPathFileType::*;
-use crate::path::{
-    may_begin_listable_log_path, CheckpointInstance, LogPathFileType, ParsedLogPath,
-};
-use crate::{KernelError, KernelResult, StorageHandler, Version};
+use crate::path::{CheckpointInstance, LogPathFileType, ParsedLogPath};
+use crate::{KernelError, KernelResult, KernelResultIterator, StorageHandler, Version};
 
 #[cfg(test)]
 mod tests;
@@ -57,56 +54,51 @@ pub(crate) struct LogSegmentFiles {
 }
 
 /// Returns a lazy iterator of [`ParsedLogPath`]s from the filesystem over versions
-/// `[start_version, end_version]`. The iterator handles parsing, filtering out non-listable
-/// files (e.g. dot-prefixed files), and stopping at `end_version`. It stops consuming the
-/// underlying listing at the first path past the version-named region, so directories like
+/// `[start_version, end_version]`. The iterator handles parsing and filtering out non-listable
+/// files (e.g. dot-prefixed files). The version window and the end of the version-named region
+/// are encoded as a [`StorageHandler::list_from`] URL range, so directories like
 /// `_staged_commits/` and `_sidecars/` are never paged through.
 ///
 /// This is a thin wrapper around [`StorageHandler::list_from`] that provides the standard
 /// Delta log file discovery pipeline. Callers are responsible for handling the `log_tail`
 /// (catalog-provided commits) and tracking `max_published_version`.
 ///
-/// With a `cancellation_token`, [`StorageHandler::list_from_with_cancellation`] owns cancellation
-/// for the underlying listing. This pipeline preserves any cancellation error through its filters.
+/// The storage handler owns cancellation for the underlying listing. This pipeline preserves any
+/// cancellation error through its filters.
 #[internal_api]
 pub(crate) fn list_delta_log_from_storage(
     storage: &dyn StorageHandler,
     log_root: &Url,
     start_version: Version,
     end_version: Version,
-    cancellation_token: Option<&CancellationTokenRef>,
-) -> KernelResult<impl Iterator<Item = KernelResult<ParsedLogPath>>> {
+) -> KernelResult<impl KernelResultIterator<ParsedLogPath> + use<>> {
     let start_from = log_root.join(&format!("{start_version:020}"))?;
-    let log_root_str = log_root.to_string();
+    let end_at = delta_log_listing_end(log_root, end_version)?;
     let files = storage
-        .list_from_with_cancellation(&start_from, cancellation_token.cloned())?
-        // The listing is sorted by full path, so nothing relevant follows the first relative path
-        // past the version-named region (see `may_begin_listable_log_path`). Stopping there avoids
-        // paging through `_staged_commits/` and `_sidecars/`, which can hold thousands of files.
-        // A path that doesn't strip the log_root prefix is kept; parsing discards it.
-        // TODO(#2740): push the bound into the listing request itself.
-        .take_while(move |meta_res| match meta_res {
-            Ok(meta) => meta
-                .location
-                .as_str()
-                .strip_prefix(&log_root_str)
-                .is_none_or(may_begin_listable_log_path),
-            Err(_) => true,
-        })
-        .map(|meta| ParsedLogPath::try_from(meta?))
+        .list_from(&start_from, Some(&end_at))?
+        .map_ok(ParsedLogPath::new)
         // NOTE: this filters out .crc files etc which start with "." - some engines
         // produce `.something.parquet.crc` corresponding to `something.parquet`. Kernel
         // doesn't care about these files. Critically, note these are _different_ than
         // normal `version.crc` files which are listed + captured normally. Additionally
         // we likely aren't even 'seeing' these files since lexicographically the string
         // "." comes before the string "0".
-        .filter_map_ok(|path_opt| path_opt.filter(|p| p.should_list()))
-        .take_while(move |path_res| match path_res {
-            // discard any path with too-large version; keep errors
-            Ok(path) => path.version <= end_version,
-            Err(_) => true,
-        });
+        .filter_map_ok(|path_opt| path_opt.filter(|p| p.should_list()));
     Ok(files)
+}
+
+/// Exclusive listing URL just past the version-named files for `[start_version, end_version]`.
+///
+/// `Version::MAX` is treated as unbounded: the bound is `':'` (UTF-8 successor of `'9'`), so
+/// listing stops after the version-named region without naming protocol directories. A finite
+/// `end_version` uses the zero-padded `end_version + 1` path with no extension:
+/// `{end:020}.json` sorts before `{end+1:020}`, and `{end+1:020}.json` sorts after it.
+fn delta_log_listing_end(log_root: &Url, end_version: Version) -> KernelResult<Url> {
+    if end_version == Version::MAX {
+        Ok(log_root.join(":")?)
+    } else {
+        Ok(log_root.join(&format!("{:020}", end_version + 1))?)
+    }
 }
 
 /// Groups all checkpoint parts according to the checkpoint they belong to.
@@ -157,11 +149,10 @@ fn group_checkpoint_parts(
                 // a multi-part checkpoint
                 if let Some(part_files) = checkpoints.get_mut(&CheckpointInstance::MultiPart {
                     num_parts: *num_parts,
-                }) {
-                    if *part_num as usize == 1 + part_files.len() {
-                        // Safe to append because all previous parts exist
-                        part_files.push(part_file);
-                    }
+                }) && *part_num as usize == 1 + part_files.len()
+                {
+                    // Safe to append because all previous parts exist
+                    part_files.push(part_file);
                 }
             }
             Commit | StagedCommit | CompactedCommit { .. } | Crc | Unknown => {}
@@ -310,8 +301,6 @@ struct ListingAccumulator {
     /// ends
     pending_checkpoint_parts: Vec<ParsedLogPath>,
     /// End-version bound used in process_file() to filter CompactedCommit files
-    // TODO(#2337): remove allow(dead_code) when log compaction is re-enabled
-    #[allow(dead_code)]
     end_version: Option<Version>,
     /// The version of the current group being accumulated
     group_version: Option<Version>,
@@ -325,17 +314,10 @@ impl ListingAccumulator {
         }
         match file.file_type {
             Commit | StagedCommit => self.output.ascending_commit_files.push(file),
-            // TODO(#2337): re-enable log compaction once testing is sufficient
-            // CompactedCommit { hi } if self.end_version.is_none_or(|end| hi <= end) => {
-            //     self.output.ascending_compaction_files.push(file);
-            // }
-            // CompactedCommit { .. } => (), // Failed the bounds check above
-            CompactedCommit { .. } => {
-                debug!(
-                    "Skipping unsupported log compaction file: {:?}",
-                    file.location
-                );
+            CompactedCommit { hi } if self.end_version.is_none_or(|end| hi <= end) => {
+                self.output.ascending_compaction_files.push(file);
             }
+            CompactedCommit { .. } => (), // Failed the bounds check above
             ClassicCheckpoint | UuidCheckpoint | MultiPartCheckpoint { .. } => {
                 self.pending_checkpoint_parts.push(file)
             }
@@ -429,14 +411,14 @@ impl LogSegmentFiles {
     /// - `end_version`: upper bound (inclusive) on versions to include, `None` means no bound
     /// - `checkpoint_handling`: whether complete checkpoints replace the replay base
     pub(crate) fn build_log_segment_files(
-        fs_files: impl Iterator<Item = KernelResult<ParsedLogPath>>,
+        fs_files: impl KernelResultIterator<ParsedLogPath>,
         log_tail: Vec<ParsedLogPath>,
         start_version: Version,
         end_version: Option<Version>,
         checkpoint_handling: CheckpointHandling,
     ) -> KernelResult<Self> {
-        // check log_tail is only commits
-        // note that LogSegment checks no gaps/duplicates so we don't duplicate that here
+        // `validate_catalog_managed_log_tail` enforces that log_tail is only commits, and
+        // LogSegment checks no gaps/duplicates, so we don't duplicate that here
         debug_assert!(
             log_tail.iter().all(|entry| entry.is_commit()),
             "log_tail should only contain commits"
@@ -575,7 +557,6 @@ impl LogSegmentFiles {
         log_tail: Vec<ParsedLogPath>,
         start_version: Option<Version>,
         end_version: Option<Version>,
-        cancellation_token: Option<&CancellationTokenRef>,
     ) -> KernelResult<Self> {
         debug_assert!(
             log_tail.iter().all(|entry| entry.is_commit()),
@@ -583,8 +564,7 @@ impl LogSegmentFiles {
         );
         let start = start_version.unwrap_or(0);
         let end = end_version.unwrap_or(Version::MAX);
-        let fs_iter =
-            list_delta_log_from_storage(storage, log_root, start, end, cancellation_token)?;
+        let fs_iter = list_delta_log_from_storage(storage, log_root, start, end)?;
 
         let log_tail_start_version = log_tail.first().map(|f| f.version);
         let mut listed_commits = Vec::new();
@@ -643,7 +623,6 @@ impl LogSegmentFiles {
         log_tail: Vec<ParsedLogPath>,
         start_version: Option<Version>,
         end_version: Option<Version>,
-        cancellation_token: Option<&CancellationTokenRef>,
     ) -> KernelResult<Self> {
         Self::list_with_checkpoint_handling(
             storage,
@@ -652,7 +631,6 @@ impl LogSegmentFiles {
             start_version,
             end_version,
             CheckpointHandling::Adopt,
-            cancellation_token,
         )
     }
 
@@ -663,12 +641,10 @@ impl LogSegmentFiles {
         start_version: Option<Version>,
         end_version: Option<Version>,
         checkpoint_handling: CheckpointHandling,
-        cancellation_token: Option<&CancellationTokenRef>,
     ) -> KernelResult<Self> {
         let start = start_version.unwrap_or(0);
         let end = end_version.unwrap_or(Version::MAX);
-        let fs_iter =
-            list_delta_log_from_storage(storage, log_root, start, end, cancellation_token)?;
+        let fs_iter = list_delta_log_from_storage(storage, log_root, start, end)?;
         Self::build_log_segment_files(fs_iter, log_tail, start, end_version, checkpoint_handling)
     }
 
@@ -686,7 +662,6 @@ impl LogSegmentFiles {
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         end_version: Option<Version>,
-        cancellation_token: Option<&CancellationTokenRef>,
     ) -> KernelResult<Self> {
         let listed_files = Self::list(
             storage,
@@ -694,7 +669,6 @@ impl LogSegmentFiles {
             log_tail,
             Some(checkpoint_metadata.version),
             end_version,
-            cancellation_token,
         )?;
 
         let Some(latest_checkpoint) = listed_files.checkpoint_parts.last() else {
@@ -729,10 +703,9 @@ impl LogSegmentFiles {
         };
         if latest_checkpoint.version != checkpoint_metadata.version {
             info!(
-            "_last_checkpoint hint is out of date. _last_checkpoint version: {}. Using actual most recent: {}",
-            checkpoint_metadata.version,
-            latest_checkpoint.version
-        );
+                "_last_checkpoint hint is out of date. _last_checkpoint version: {}. Using actual most recent: {}",
+                checkpoint_metadata.version, latest_checkpoint.version
+            );
         } else if !checkpoint_metadata.applies_to(&listed_files.checkpoint_parts) {
             // Expected whenever a writer checkpoints a version another writer already checkpointed
             // and leaves the hint alone. `applies_to` also makes `LogSegment::checkpoint_hint`
@@ -778,7 +751,6 @@ impl LogSegmentFiles {
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         end_version: Version,
-        cancellation_token: Option<&CancellationTokenRef>,
     ) -> KernelResult<Self> {
         // Scan backward in 1000-version windows, collecting ALL file types, until a complete
         // checkpoint is found or the log is exhausted.
@@ -787,17 +759,12 @@ impl LogSegmentFiles {
         // upper is the exclusive upper bound of the next window; adding 1 includes end_version
         // in the first window. The inclusive range passed to list_delta_log_from_storage is
         // [lower, upper - 1].
+        // TODO(#3835): Handle the exclusive upper bound when end_version is Version::MAX.
         let mut upper = end_version + 1;
         while upper > 0 {
             let lower = upper.saturating_sub(BACKWARD_SCAN_WINDOW_SIZE);
-            let window_files: Vec<_> = list_delta_log_from_storage(
-                storage,
-                log_root,
-                lower,
-                upper - 1,
-                cancellation_token,
-            )?
-            .try_collect()?;
+            let window_files: Vec<_> =
+                list_delta_log_from_storage(storage, log_root, lower, upper - 1)?.try_collect()?;
 
             found_checkpoint_version = find_complete_checkpoint_version(&window_files);
             windows.push(window_files);

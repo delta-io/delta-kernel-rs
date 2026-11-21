@@ -1,10 +1,12 @@
 //! Log-replay and checkpoint-structure integration tests.
 
 mod checkpoint_transform;
+mod compaction_round_trip;
 mod crc;
 mod empty_log_files;
 mod history_manager;
 mod log_compaction;
 mod log_tail;
 mod snapshot_build;
+mod v1_checkpoints;
 mod v2_checkpoints;

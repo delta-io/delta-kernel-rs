@@ -18,8 +18,7 @@ The `create_table` function returns a builder that you configure and then commit
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField, StructType};
 # use delta_kernel::transaction::create_table::create_table;
-# use delta_kernel::KernelResult;
-# fn example() -> KernelResult<()> {
+# fn example() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 let schema = Arc::new(StructType::try_new([
@@ -92,6 +91,41 @@ let schema = Arc::new(StructType::try_new([
 
 For the full list of supported data types, see [Schemas and Data Types](../concepts/schema_and_types.md).
 
+## Collated string columns
+
+To preserve a non-binary collation, attach `ColumnMetadataKey::Collations` to the nearest
+`StructField` with `StructField::with_metadata`. Store its value as `MetadataValue::Other`
+containing a JSON object whose keys start with that field's name. A STRING field named `name`
+uses `"name"`:
+
+```json
+{ "name": "ICU.en_US" }
+```
+
+An array field named `tags` uses `"tags.element"`. A map field named `m` uses `"m.key"` or
+`"m.value"`. These container segments can be combined for nested arrays and maps.
+Nested struct children own their annotations. Kernel validates the object, STRING targets,
+and non-default `Provider.Name` identifiers before creating or altering a schema.
+Use unversioned identifiers in schema annotations. Per-file statistics use versioned identifiers.
+
+Snapshot loading applies the same annotation validation, even for binary-only reads.
+Malformed annotations and annotated schemas without a declared collation feature are rejected.
+Logical schemas retain their annotations. Physical schemas rewrite the owning-field prefix to
+the physical column name when column mapping is enabled.
+
+An annotated schema automatically selects the stable `collations` writer feature. You can
+also request it with `delta.feature.collations=supported`. CREATE rejects
+`delta.feature.collations-preview=supported`, consistent with other preview feature signals.
+Existing tables declaring `collations-preview` retain that feature during writes and ALTER.
+Both features share support and dependency rules and require `domainMetadata`, which Kernel
+adds during CREATE. ALTER requires either feature to be declared already; it doesn't
+automatically upgrade the protocol.
+
+Kernel preserves the annotations and existing collation statistics without evaluating
+collations or computing collated bounds. For collation-aware queries, follow the
+[predicate-pushdown contract](../reading/filter_pushdown.md#collation-aware-queries) to avoid
+discarding matching files with binary predicates.
+
 ## Table properties
 
 You can set custom application properties on the table:
@@ -105,8 +139,7 @@ You can set custom application properties on the table:
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField, StructType};
 # use delta_kernel::transaction::create_table::create_table;
-# use delta_kernel::KernelResult;
-# fn example() -> KernelResult<()> {
+# fn example() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 # let schema = Arc::new(StructType::try_new([
@@ -142,8 +175,7 @@ layout for queries that filter on the clustering columns:
 # use delta_kernel::schema::{DataType, StructField, StructType};
 # use delta_kernel::transaction::create_table::create_table;
 # use delta_kernel::transaction::data_layout::DataLayout;
-# use delta_kernel::KernelResult;
-# fn example() -> KernelResult<()> {
+# fn example() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 let schema = Arc::new(StructType::try_new([
@@ -198,8 +230,7 @@ entire directories when filtering on those columns.
 # use delta_kernel::schema::{DataType, StructField, StructType};
 # use delta_kernel::transaction::create_table::create_table;
 # use delta_kernel::transaction::data_layout::DataLayout;
-# use delta_kernel::KernelResult;
-# fn example() -> KernelResult<()> {
+# fn example() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 let schema = Arc::new(StructType::try_new([
@@ -353,8 +384,29 @@ Features enabled when specific column types or annotations appear in the schema.
 | Trigger | Reader/Writer feature | Writer feature | Properties set |
 |---------|-----------------------|----------------|----------------|
 | `VARIANT` type in schema | `variantType` | — | — |
+| `FILE` type in schema | `fileType-preview` | — | — |
 | `TIMESTAMP_NTZ` type in schema | `timestampNtz` | — | — |
+| `__COLLATIONS` metadata in schema | - | `collations`, `domainMetadata` | - |
 | Any field with `nullable: false` in schema | — | `invariants` | — |
+
+> [!NOTE]
+> Support for the `FILE` type is a preview. Kernel creates the table and reads a `FILE` column as
+> the struct of its six fields. It does not yet collect statistics for the column or resolve the
+> bytes a value refers to.
+>
+> The default engine writes a `FILE` column as the protocol requires, which needs an Arrow
+> version whose Parquet writer supports the `FILE` logical type (`arrow-60` or later); with an
+> older one it refuses to write one. An engine that writes its own Parquet files
+> must write a `FILE` column the same way:
+>
+> - annotate the group with the Parquet `FILE` logical type,
+> - under column mapping, set each sub-field's Parquet `field_id` to the column's field id plus
+>   its offset (`uri` +1, `offset` +2, `size` +3, `content_type` +4, `checksum` +5, `inline` +6),
+>   and
+> - in each non-null value, set `uri` or `inline`, set `size` only together with `uri`, set
+>   `offset` only together with `uri` and `size`, and never set a negative `offset` or `size`.
+>   Kernel rejects reads of values that break these rules, and the default engine rejects writes
+>   of them.
 
 ### Feature-signal only
 

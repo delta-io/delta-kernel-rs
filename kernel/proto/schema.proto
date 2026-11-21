@@ -100,6 +100,8 @@ message UserDefinedType {
   map<string, UserDefinedAnnotationValue> annotation = 2;
 }
 
+message FileType {}
+
 message MetadataValue {
   oneof value {
     int64 number = 1;
@@ -124,5 +126,6 @@ message DataType {
     MapType map = 4;
     VariantType variant = 5;
     UserDefinedType user_defined = 6;
+    FileType file = 7;
   }
 }

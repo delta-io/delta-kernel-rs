@@ -32,27 +32,42 @@ if(UDT_IN_DEV)
   add_test(NAME udt_annotation_round_trip COMMAND udt_annotation_test
     "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/read-table-testing/udt-annotations/")
 endif()
+add_executable(commit_range_commit_files commit_range_commit_files.c ../common/kernel_utils.c)
+target_compile_definitions(commit_range_commit_files PUBLIC DEFINE_DEFAULT_ENGINE_BASE)
+target_include_directories(commit_range_commit_files PUBLIC
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../target/ffi-headers"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../common")
+target_link_directories(commit_range_commit_files PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/../../../target/debug")
+target_link_libraries(commit_range_commit_files PUBLIC delta_kernel_ffi)
 set(TestRunner "../../../tests/read-table-testing/run_test.sh")
-set(DatPath "../../../../acceptance/tests/dat/out/reader_tests/generated")
+set(DatPath "../../../../acceptance/workloads")
 set(ExpectedPath "../../../tests/read-table-testing/expected-data")
 set(KernelTestPath "../../../../kernel/tests/data")
-add_test(NAME read_and_print_all_prim COMMAND ${TestRunner} ${DatPath}/all_primitive_types/delta/ ${ExpectedPath}/all-prim-types.expected)
-add_test(NAME read_and_print_all_prim_cols COMMAND ${TestRunner} ${DatPath}/all_primitive_types/delta/ ${ExpectedPath}/all-prim-types-cols.expected -cdecimal,float64)
-add_test(NAME read_and_print_nested COMMAND ${TestRunner} ${DatPath}/nested_types/delta/ ${ExpectedPath}/nested-types.expected)
-add_test(NAME read_and_print_nested_cols COMMAND ${TestRunner} ${DatPath}/nested_types/delta/ ${ExpectedPath}/nested-types-cols.expected -cmap,struct,array)
-add_test(NAME read_and_print_basic_partitioned COMMAND ${TestRunner} ${DatPath}/basic_partitioned/delta/ ${ExpectedPath}/basic-partitioned.expected)
+add_test(NAME read_and_print_all_prim COMMAND ${TestRunner} ${DatPath}/types_all_primitive_types/delta/ ${ExpectedPath}/all-prim-types.expected)
+add_test(NAME read_and_print_all_prim_cols COMMAND ${TestRunner} ${DatPath}/types_all_primitive_types/delta/ ${ExpectedPath}/all-prim-types-cols.expected -cdecimal_col,double_col)
+# The primitive-types fixture has no byte or short columns.
+add_test(NAME read_and_print_byte COMMAND ${TestRunner} ${DatPath}/reads_byte_boundaries/delta/ ${ExpectedPath}/byte.expected)
+add_test(NAME read_and_print_short COMMAND ${TestRunner} ${DatPath}/reads_short_boundaries/delta/ ${ExpectedPath}/short.expected)
+add_test(NAME read_and_print_nested COMMAND ${TestRunner} ${DatPath}/types_nested_types/delta/ ${ExpectedPath}/nested-types.expected)
+add_test(NAME read_and_print_nested_cols COMMAND ${TestRunner} ${DatPath}/types_nested_types/delta/ ${ExpectedPath}/nested-types-cols.expected -cprops,info,tags)
+add_test(NAME read_and_print_basic_partitioned COMMAND ${TestRunner} ${DatPath}/reads_oss_partitioned/delta/ ${ExpectedPath}/basic-partitioned.expected)
 add_test(NAME read_and_print_with_dv_small COMMAND ${TestRunner} ${KernelTestPath}/table-with-dv-small/ ${ExpectedPath}/table-with-dv-small.expected)
 add_test(NAME read_and_print_void_col COMMAND ${TestRunner} ${KernelTestPath}/void-column/ ${ExpectedPath}/void-column.expected -cid,void_col)
 add_test(NAME read_and_print_with_short_dv COMMAND ${TestRunner} ${KernelTestPath}/with-short-dv/ ${ExpectedPath}/with-short-dv.expected)
 # Exercises the Arrow batch-mode scan metadata path (scan_metadata_next_arrow). The arrow path
 # does not call read_parquet_file, so the data section is "[No data]"; this test still
 # requires PRINT_DATA=ON because iterate_scan_metadata_arrow is gated behind it.
-add_test(NAME read_arrow_metadata_basic COMMAND ${TestRunner} ${DatPath}/basic_partitioned/delta/ ${ExpectedPath}/basic-partitioned-arrow-metadata.expected -a)
-# Exercises typed field metadata across the FFI: the column_mapping table's fields carry
+add_test(NAME read_arrow_metadata_basic COMMAND ${TestRunner} ${DatPath}/reads_oss_partitioned/delta/ ${ExpectedPath}/basic-partitioned-arrow-metadata.expected -a)
+# Exercises typed field metadata across the FFI: the table's fields carry
 # `delta.columnMapping.id`, which the schema visitor reads back via get_from_metadata_map and
 # prints per field.
-add_test(NAME read_column_mapping_metadata COMMAND ${TestRunner} ${DatPath}/column_mapping/delta/ ${ExpectedPath}/column-mapping-arrow-metadata.expected -a)
-add_test(NAME read_projected_column_mapping COMMAND ${TestRunner} ${DatPath}/column_mapping/delta/ ${ExpectedPath}/column-mapping-projected.expected -cletter,new_int)
+add_test(NAME read_column_mapping_metadata COMMAND ${TestRunner} ${DatPath}/column_mapping_rename_column/delta/ ${ExpectedPath}/column-mapping-arrow-metadata.expected -a)
+add_test(NAME read_projected_column_mapping COMMAND ${TestRunner} ${DatPath}/column_mapping_rename_column/delta/ ${ExpectedPath}/column-mapping-projected.expected -cnew_name)
+add_test(NAME snapshot_visit_metadata COMMAND ${TestRunner} ${KernelTestPath}/partition_cm/none/ ${ExpectedPath}/snapshot-metadata.expected -m)
+add_test(NAME commit_range_commit_files_basic_partitioned
+  COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/read-table-testing/run_commit_range_commit_files_test.sh"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../acceptance/workloads/reads_oss_partitioned/delta/"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/read-table-testing/expected-data/commit-range-commit-files-basic-partitioned.expected")
 if(GEO_TYPE_IN_DEV)
   target_compile_definitions(read_table PUBLIC DEFINE_GEO_TYPE_IN_DEV)
   add_test(NAME read_and_print_geo COMMAND ${TestRunner} ${KernelTestPath}/table-with-geo/ ${ExpectedPath}/table-with-geo.expected)
@@ -67,12 +82,15 @@ endif(WIN32)
 if(MSVC)
   target_compile_options(read_table PRIVATE /W3 /WX)
   target_compile_options(udt_annotation_test PRIVATE /W3 /WX)
+  target_compile_options(commit_range_commit_files PRIVATE /W3 /WX)
 else()
   # no-strict-prototypes because arrow headers have fn defs without prototypes
   target_compile_options(read_table PRIVATE -Wall -Wextra -Wpedantic -Werror -Wno-strict-prototypes -g -fsanitize=address)
   target_link_options(read_table PRIVATE -g -fsanitize=address)
   target_compile_options(udt_annotation_test PRIVATE -Wall -Wextra -Wpedantic -Werror -Wno-strict-prototypes -g -fsanitize=address)
   target_link_options(udt_annotation_test PRIVATE -g -fsanitize=address)
+  target_compile_options(commit_range_commit_files PRIVATE -Wall -Wextra -Wpedantic -Werror -Wno-strict-prototypes -g -fsanitize=address)
+  target_link_options(commit_range_commit_files PRIVATE -g -fsanitize=address)
 endif()
 
 if(VERBOSE)

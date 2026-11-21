@@ -20,6 +20,7 @@ pub(in crate::transaction) struct TransactionBuilderState {
     pub(in crate::transaction) transaction_ids: Vec<(String, i64)>,
     pub(in crate::transaction) domain_metadata_additions: Vec<DomainMetadata>,
     pub(in crate::transaction) data_change: bool,
+    pub(in crate::transaction) skip_dedup_validation: bool,
 }
 
 impl std::fmt::Debug for TransactionBuilderState {
@@ -33,6 +34,7 @@ impl std::fmt::Debug for TransactionBuilderState {
             .field("transaction_ids", &self.transaction_ids)
             .field("domain_metadata_additions", &self.domain_metadata_additions)
             .field("data_change", &self.data_change)
+            .field("skip_dedup_validation", &self.skip_dedup_validation)
             .finish()
     }
 }

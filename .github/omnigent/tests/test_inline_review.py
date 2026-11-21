@@ -99,6 +99,24 @@ class InlineReviewTest(unittest.TestCase):
 
         self.assertEqual(review, "Corrected review.")
 
+    def test_extract_marked_review_ignores_truncated_copy_before_complete_review(self) -> None:
+        marker = "a" * 32
+        start = f"<!-- AI_REVIEW_START_{marker} -->"
+        end = f"<!-- AI_REVIEW_END_{marker} -->"
+        complete_copy = f"{start}\n## Summary\nThe change is correct.\n{end}"
+        truncated_copies = {
+            "cut inside the review text": complete_copy[: complete_copy.index("correct") + 3],
+            "cut inside the end marker": complete_copy[: complete_copy.index(end) + 4],
+        }
+
+        for cut, truncated_copy in truncated_copies.items():
+            with self.subTest(cut):
+                review = self.review_publish.extract_marked_review(
+                    f"{truncated_copy}\n\n{complete_copy}", marker
+                )
+
+                self.assertEqual(review, "## Summary\nThe change is correct.")
+
     def test_extract_marked_review_rejects_nested_markers(self) -> None:
         marker = "a" * 32
         start = f"<!-- AI_REVIEW_START_{marker} -->"
@@ -214,6 +232,24 @@ class InlineReviewTest(unittest.TestCase):
         for section in self.inline_review._REVIEW_SECTION_NAMES:
             self.assertIn(section, contract)
 
+    def test_every_reviewer_config_sets_reasoning_effort_valid_for_its_harness(
+        self,
+    ) -> None:
+        # Copied from `omnigent.util.reasoning_effort`, which CI does not install for these tests.
+        valid_efforts = {
+            "claude-sdk": {"low", "medium", "high", "xhigh", "max"},
+            "codex": {"none", "minimal", "low", "medium", "high", "xhigh"},
+        }
+        reviewer_dir = Path(__file__).parents[1] / "reviewer"
+        config_paths = sorted(reviewer_dir.rglob("config.yaml"))
+        self.assertTrue(config_paths)
+        for config_path in config_paths:
+            with self.subTest(config=config_path.parent.name):
+                executor = yaml.safe_load(config_path.read_text())["executor"]
+                harness = executor["config"]["harness"]
+                self.assertIn(harness, valid_efforts)
+                self.assertIn(executor.get("reasoning_effort"), valid_efforts[harness])
+
     def test_markdown_prompts_preserve_source_safety(self) -> None:
         reviewer_dir = Path(__file__).parents[1] / "reviewer"
         for config_path in reviewer_dir.rglob("config.yaml"):
@@ -296,6 +332,74 @@ class InlineReviewTest(unittest.TestCase):
         )[0]
 
         self.assertIn("mode=inline", automatic_trigger)
+
+    def test_review_allowlist_uses_repository_variable_without_checkout(self) -> None:
+        path = Path(__file__).parents[2] / "workflows" / "ai-review.yml"
+        workflow = yaml.safe_load(path.read_text())
+        steps = workflow["jobs"]["authorize"]["steps"]
+        authorization = next(step for step in steps if step.get("id") == "access")
+
+        self.assertEqual(
+            authorization["env"]["AI_REVIEW_ALLOWLIST"], "${{ vars.AI_REVIEW_ALLOWLIST }}"
+        )
+        self.assertFalse(any("actions/checkout@" in step.get("uses", "") for step in steps))
+
+    def test_review_authorization_checks_allowlist_subject_event_and_write_access(self) -> None:
+        path = Path(__file__).parents[2] / "workflows" / "ai-review.yml"
+        workflow = yaml.safe_load(path.read_text())
+        authorization = next(
+            step
+            for step in workflow["jobs"]["authorize"]["steps"]
+            if step.get("id") == "access"
+        )
+        cases = [
+            ("exact match", '["alice", "bob"]', "alice", True),
+            ("case-insensitive match", '["Alice"]', "ALICE", True),
+            ("substring", '["malice"]', "alice", False),
+            ("missing login", '["bob"]', "alice", False),
+            ("trailing text", '["alice # note", "alice "]', "alice", False),
+            ("empty subject", '["", "alice"]', "", False),
+            ("unset variable", None, "alice", False),
+            ("empty variable", "", "alice", False),
+            ("empty array", "[]", "alice", False),
+            ("invalid JSON", '["alice"', "alice", False),
+            ("string instead of array", '"alice"', "alice", False),
+            ("object instead of array", '{"login": "alice"}', "alice", False),
+            ("null instead of array", "null", "alice", False),
+            ("number instead of array", "42", "alice", False),
+            ("non-string entry", '["alice", 42]', "alice", False),
+            ("nested array", '[["alice"]]', "alice", False),
+            ("multiple JSON values", '[] ["alice"]', "alice", False),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            for event in ("issue_comment", "pull_request_target", "workflow_dispatch"):
+                for has_write in (False, True):
+                    for name, allowlist, subject, matches in cases:
+                        with self.subTest(event=event, has_write=has_write, case=name):
+                            output.write_text("")
+                            env = {
+                                **os.environ,
+                                "AUTH_SUBJECT": subject,
+                                "EVENT_NAME": event,
+                                "HAS_WRITE": str(has_write).lower(),
+                                "GITHUB_OUTPUT": str(output),
+                            }
+                            env.pop("AI_REVIEW_ALLOWLIST", None)
+                            if allowlist is not None:
+                                env["AI_REVIEW_ALLOWLIST"] = allowlist
+                            result = subprocess.run(
+                                ["bash", "-c", authorization["run"]],
+                                env=env,
+                                check=False,
+                                capture_output=True,
+                                text=True,
+                            )
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            allowed = has_write or (event != "workflow_dispatch" and matches)
+                            self.assertEqual(
+                                output.read_text(), f"allowed={str(allowed).lower()}\n"
+                            )
 
     def test_diff_positions_tracks_both_sides_and_context(self) -> None:
         self.assertEqual(

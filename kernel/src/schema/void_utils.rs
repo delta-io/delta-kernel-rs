@@ -11,9 +11,9 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use super::{schema_ref, DataType, PrimitiveType, Schema, SchemaRef, StructField, StructType};
+use super::{DataType, PrimitiveType, Schema, SchemaRef, StructField, StructType, schema_ref};
 use crate::expressions::ExpressionStructPatchBuilder;
-use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::{KernelError, KernelResult};
 
 /// Returns true when this struct directly contains no non-void fields. The check is local --
@@ -190,8 +190,8 @@ fn add_void_stripping_inner<'a>(
 mod tests {
     use super::*;
     use crate::schema::{
-        schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField,
-        StructType,
+        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+        schema,
     };
 
     // ---- validate_schema_for_write tests ----

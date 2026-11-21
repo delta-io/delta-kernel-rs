@@ -4,15 +4,16 @@ use bytes::Bytes;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
 use delta_kernel::{
-    CancellationTokenRef, FileMeta, FileSlice, KernelError, KernelResult,
-    KernelResultIteratorStatic, StorageHandler,
+    CancellationTokenRef, FileMeta, FileSlice, KernelError, KernelResult, KernelResultIterator,
+    StorageHandler, keep_listing,
 };
+use futures::future::ready;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use url::Url;
 
-use crate::executor::TaskExecutor;
 use crate::UrlExt;
+use crate::executor::TaskExecutor;
 
 #[derive(Debug)]
 pub struct ObjectStoreStorageHandler<E: TaskExecutor> {
@@ -35,6 +36,19 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
         self.readahead = readahead;
         self
     }
+
+    fn list_from_iter(
+        &self,
+        path: &Url,
+        end: Option<&Url>,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+        super::stream_future_to_cancellable_iter(
+            self.task_executor.clone(),
+            list_from_impl(self.inner.clone(), path.clone(), end.cloned()),
+            cancellation_token,
+        )
+    }
 }
 
 /// Native async implementation for list_from.
@@ -43,10 +57,15 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
 /// handler (e.g. inside `DefaultEngine`'s `storage_handler()`), so this function just
 /// returns the raw stream.
 ///
+/// When `end` is set, ordered stores apply the exclusive bound on the object_store stream so
+/// later pages are not fetched. Unordered stores still walk the prefix, but drop entries at or
+/// after `end` before sorting.
+///
 /// [`MeteredStorageHandler`]: delta_kernel::metrics::MeteredStorageHandler
 async fn list_from_impl(
     store: Arc<DynObjectStore>,
     path: Url,
+    end: Option<Url>,
 ) -> KernelResult<BoxStream<'static, KernelResult<FileMeta>>> {
     // The offset is used for list-after; the prefix is used to restrict the listing to a specific
     // directory. Unfortunately, `Path` provides no easy way to check whether a name is
@@ -72,7 +91,14 @@ async fn list_from_impl(
         .map(move |meta| {
             let meta = meta?;
             let mut location = path.clone();
-            location.set_path(&format!("/{}", meta.location.as_ref()));
+            // Unlike set_path, this escapes literal '%' characters in object keys.
+            location
+                .path_segments_mut()
+                .map_err(|()| {
+                    KernelError::InvalidTableLocation(format!("Invalid listing URL: {path}"))
+                })?
+                .clear()
+                .extend(meta.location.parts());
             Ok(FileMeta {
                 location,
                 last_modified: meta.last_modified.timestamp_millis(),
@@ -81,15 +107,16 @@ async fn list_from_impl(
         });
 
     if !has_ordered_listing {
-        // Local filesystem doesn't return sorted list - need to collect and sort
-        let mut items: Vec<_> = stream.try_collect().await?;
+        // Local filesystem doesn't return a sorted list. Drop entries at or after `end` before
+        // sorting so protocol subdirs (e.g. `_staged_commits/`) are not part of the sort.
+        let mut items: Vec<_> = stream
+            .filter(move |item| ready(keep_listing(item, end.as_ref())))
+            .try_collect()
+            .await?;
         items.sort_unstable();
-        Ok(Box::pin(stream::iter(
-            items
-                .into_iter()
-                .map(Ok::<FileMeta, delta_kernel::KernelError>),
-        )))
+        Ok(Box::pin(stream::iter(items.into_iter().map(Ok))))
     } else {
+        let stream = stream.take_while(move |item| ready(keep_listing(item, end.as_ref())));
         Ok(Box::pin(stream))
     }
 }
@@ -194,22 +221,21 @@ async fn head_impl(store: Arc<DynObjectStore>, url: Url) -> KernelResult<FileMet
 }
 
 impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
-    fn list_from(&self, path: &Url) -> KernelResult<KernelResultIteratorStatic<FileMeta>> {
-        self.list_from_with_cancellation(path, None)
+    fn list_from(
+        &self,
+        path: &Url,
+        end: Option<&Url>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+        self.list_from_iter(path, end, None)
     }
 
     fn list_from_with_cancellation(
         &self,
         path: &Url,
+        end: Option<&Url>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> KernelResult<KernelResultIteratorStatic<FileMeta>> {
-        let future = list_from_impl(self.inner.clone(), path.clone());
-        let iter = super::stream_future_to_cancellable_iter(
-            self.task_executor.clone(),
-            future,
-            cancellation_token,
-        )?;
-        Ok(iter)
+    ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+        self.list_from_iter(path, end, cancellation_token)
     }
 
     /// Read data specified by the start and end offset from the file.
@@ -218,7 +244,10 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
     ///
     /// Multiple reads may occur in parallel, depending on the configured readahead.
     /// See [`Self::with_readahead`].
-    fn read_files(&self, files: Vec<FileSlice>) -> KernelResult<KernelResultIteratorStatic<Bytes>> {
+    fn read_files(
+        &self,
+        files: Vec<FileSlice>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
         self.read_files_with_cancellation(files, None)
     }
 
@@ -226,7 +255,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         &self,
         files: Vec<FileSlice>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> KernelResult<KernelResultIteratorStatic<Bytes>> {
+    ) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
         let future = read_files_impl(self.inner.clone(), files, self.readahead);
         let iter = super::stream_future_to_cancellable_iter(
             self.task_executor.clone(),
@@ -295,16 +324,18 @@ mod tests {
     use std::ops::Range;
     use std::time::Duration;
 
+    use delta_kernel::object_store::ObjectStore as _;
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::memory::InMemory;
-    use delta_kernel::Engine as _;
+    use delta_kernel::schema::schema_ref;
+    use delta_kernel::{Engine as _, Snapshot};
     use delta_kernel_default_engine_test_utils::current_time_duration;
     use itertools::Itertools;
-    use test_utils::delta_path_for_version;
+    use test_utils::{create_table_and_load_snapshot, delta_path_for_version};
 
     use super::*;
-    use crate::executor::tokio::TokioBackgroundExecutor;
     use crate::DefaultEngineBuilder;
+    use crate::executor::tokio::TokioBackgroundExecutor;
 
     fn setup_test() -> (
         tempfile::TempDir,
@@ -418,7 +449,10 @@ mod tests {
         let engine = DefaultEngineBuilder::new(store).build();
         let files: Vec<_> = engine
             .storage_handler()
-            .list_from(&table_root.join("_delta_log").unwrap().join("0").unwrap())
+            .list_from(
+                &table_root.join("_delta_log").unwrap().join("0").unwrap(),
+                None,
+            )
             .unwrap()
             .try_collect()
             .unwrap();
@@ -448,7 +482,7 @@ mod tests {
         let engine = DefaultEngineBuilder::new(store).build();
         let files = engine
             .storage_handler()
-            .list_from(&url.join("_delta_log").unwrap().join("0").unwrap())
+            .list_from(&url.join("_delta_log").unwrap().join("0").unwrap(), None)
             .unwrap();
         let mut len = 0;
         for (file, expected) in files.zip(expected_names.iter()) {
@@ -465,6 +499,242 @@ mod tests {
             len += 1;
         }
         assert_eq!(len, 10, "list_from should have returned 10 files");
+    }
+
+    #[tokio::test]
+    async fn list_from_rejects_url_without_path_segments() {
+        let store = Arc::new(InMemory::new());
+        // A non-empty listing is needed to reach URL construction.
+        store
+            .put(&Path::from("table/file.json"), "data".into())
+            .await
+            .unwrap();
+
+        // mailto: URLs cannot be modified through path_segments_mut().
+        let directory_url = Url::parse("mailto:table/").unwrap();
+        let error = list_from_impl(store, directory_url, None)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, KernelError::InvalidTableLocation(message)
+                if message == "Invalid listing URL: mailto:table/"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case("table", "table")]
+    #[case("table%2F", "table%252F")]
+    #[case("table%252F", "table%25252F")]
+    #[case("table%41", "table%2541")]
+    #[case("table%20", "table%2520")]
+    #[case("table%", "table%25")]
+    #[case("table name", "table%20name")]
+    #[case("table?#", "table%3F%23")]
+    #[case("table\u{e9}", "table%C3%A9")]
+    #[case("parent/%2E", "parent/%252E")]
+    #[case("parent/%2e%2e", "parent/%252e%252e")]
+    #[tokio::test]
+    async fn list_from_preserves_table_paths(
+        #[case] raw_table_name: &str,
+        #[case] encoded_table_name: &str,
+        #[values(1, 3)] file_count: usize,
+    ) {
+        // === Prepare objects under the literal table name ===
+        let store = Arc::new(InMemory::new());
+        for index in (0..file_count).rev() {
+            let key = Path::parse(format!("{raw_table_name}/file_{index}.json")).unwrap();
+            store.put(&key, "data".into()).await.unwrap();
+        }
+
+        // === Call the listing implementation using the escaped directory URL ===
+        let directory_url = Url::parse(&format!("s3://bucket/{encoded_table_name}/")).unwrap();
+        let files: Vec<_> = list_from_impl(store, directory_url, None)
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        // === Check that every returned URL preserves the table name and file order ===
+        assert_eq!(files.len(), file_count);
+        for (index, file) in files.iter().enumerate() {
+            assert_eq!(
+                file.location.as_str(),
+                format!("s3://bucket/{encoded_table_name}/file_{index}.json")
+            );
+        }
+    }
+
+    // Decoding a listed URL must recover the raw key, including literal text such as "%2F".
+    // Cloud URL schemes use an in-memory store here, so the test needs no network access.
+    #[rstest::rstest]
+    #[case("table", "table")]
+    #[case("table%2F", "table%252F")]
+    #[case("table%252F", "table%25252F")]
+    #[case("table%41", "table%2541")]
+    #[case("table%20", "table%2520")]
+    #[case("table%", "table%25")]
+    #[case("table name", "table%20name")]
+    #[case("table?#", "table%3F%23")]
+    #[case("table\u{e9}", "table%C3%A9")]
+    #[tokio::test]
+    async fn in_memory_store_listing_preserves_object_keys(
+        #[case] raw_name: &str,
+        #[case] encoded_name: &str,
+        #[values(
+            "s3://bucket/",
+            "gs://bucket/",
+            "az://container/",
+            "https://example.test/"
+        )]
+        base_url: &str,
+    ) {
+        // === Prepare objects using their literal names ===
+        let store = Arc::new(InMemory::new());
+        let expected_data = Bytes::from("kernel-data");
+        let expected_keys: Vec<_> = (0..3)
+            .map(|version| {
+                Path::parse(format!(
+                    "{raw_name}/_delta_log/{version:020}.{raw_name}.json"
+                ))
+                .unwrap()
+            })
+            .collect();
+
+        // Insert in reverse order so the assertions below also check the returned version order.
+        for key in expected_keys.iter().rev() {
+            store.put(key, expected_data.clone().into()).await.unwrap();
+        }
+
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let storage = engine.storage_handler();
+
+        // === List using the correctly escaped directory URL ===
+        let directory_url = Url::parse(&format!("{base_url}{encoded_name}/_delta_log/")).unwrap();
+        let listed_files: Vec<_> = storage
+            .list_from(&directory_url, None)
+            .unwrap()
+            .try_collect()
+            .unwrap();
+
+        // === Check the listing and read each returned URL ===
+        assert_eq!(listed_files.len(), expected_keys.len());
+        for (version, (file, key)) in listed_files.iter().zip(&expected_keys).enumerate() {
+            // For example, raw "table%2F" must appear as "table%252F" in the URL.
+            assert_eq!(
+                file.location.as_str(),
+                format!("{directory_url}{version:020}.{encoded_name}.json")
+            );
+            assert_eq!(Path::from_url_path(file.location.path()).unwrap(), *key);
+
+            // Constructing the URL must preserve the object's size and modification time.
+            let metadata = store.head(key).await.unwrap();
+            assert_eq!(file.size, metadata.size);
+            assert_eq!(
+                file.last_modified,
+                metadata.last_modified.timestamp_millis()
+            );
+
+            // Reading a listed URL must return the original bytes.
+            let read_back: Vec<_> = storage
+                .read_files(vec![(file.location.clone(), None)])
+                .unwrap()
+                .try_collect()
+                .unwrap();
+            assert_eq!(read_back, vec![expected_data.clone()]);
+        }
+
+        // Resuming after the first listed URL must exclude that file and keep the remaining order.
+        let after_first: Vec<_> = storage
+            .list_from(&listed_files[0].location, None)
+            .unwrap()
+            .try_collect()
+            .unwrap();
+        assert_eq!(after_first, listed_files[1..]);
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn listed_url_reads_original_object_when_decoded_key_exists(
+        #[values(
+            "s3://bucket/",
+            "gs://bucket/",
+            "az://container/",
+            "https://example.test/"
+        )]
+        base_url: &str,
+    ) {
+        let store = Arc::new(InMemory::new());
+        let expected_data = Bytes::from("kernel-data");
+        let original_key = Path::parse("table%41/file%41.json").unwrap();
+        store
+            .put(&original_key, expected_data.clone().into())
+            .await
+            .unwrap();
+
+        // "%41" decodes to "A". Different bytes expose a read from the wrong existing key.
+        let decoy_key = Path::parse("tableA/fileA.json").unwrap();
+        store.put(&decoy_key, "wrong file".into()).await.unwrap();
+
+        let engine = DefaultEngineBuilder::new(store).build();
+        let storage = engine.storage_handler();
+        let directory_url = Url::parse(&format!("{base_url}table%2541/")).unwrap();
+        let listed_files: Vec<_> = storage
+            .list_from(&directory_url, None)
+            .unwrap()
+            .try_collect()
+            .unwrap();
+        assert_eq!(listed_files.len(), 1);
+
+        let read_back: Vec<_> = storage
+            .read_files(vec![(listed_files[0].location.clone(), None)])
+            .unwrap()
+            .try_collect()
+            .unwrap();
+        assert_eq!(read_back, vec![expected_data]);
+    }
+
+    // Check the same name preservation on disk, where reading file:// URLs uses OS path conversion.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn listing_preserves_literal_percent_in_local_paths(
+        #[values("table", "table%2F", "table%252F", "table%41", "table%20", "table%")]
+        raw_directory: &str,
+    ) {
+        // === Prepare a real file inside the literal directory name ===
+        let (tmp, store, storage) = setup_test();
+        let file_path = tmp
+            .path()
+            .join(raw_directory)
+            .join("_delta_log/00000000000000000001.json");
+        let key = Path::from_absolute_path(&file_path).unwrap();
+        let expected_data = Bytes::from("kernel-data");
+        store.put(&key, expected_data.clone().into()).await.unwrap();
+
+        // === List the directory using a file:// URL ===
+        let directory_url = Url::from_directory_path(file_path.parent().unwrap()).unwrap();
+        let listed_files: Vec<_> = storage
+            .list_from(&directory_url, None)
+            .unwrap()
+            .try_collect()
+            .unwrap();
+
+        // === Check that the listed URL points to the file we created and reads its bytes ===
+        let expected_url = Url::from_file_path(&file_path).unwrap();
+        assert_eq!(listed_files.len(), 1);
+        assert_eq!(listed_files[0].location, expected_url);
+
+        let read_back: Vec<_> = storage
+            .read_files(vec![(listed_files[0].location.clone(), None)])
+            .unwrap()
+            .try_collect()
+            .unwrap();
+        assert_eq!(read_back, vec![expected_data]);
     }
 
     #[tokio::test]
@@ -612,10 +882,122 @@ mod tests {
         let url = Url::from_directory_path(tempdir.path()).unwrap();
         let token: CancellationTokenRef = Arc::new(test_utils::TestCancellationToken::cancelled());
 
-        let listed = handler.list_from_with_cancellation(&url, Some(token.clone()));
+        let listed = handler.list_from_with_cancellation(&url, None, Some(token.clone()));
         assert!(matches!(listed, Err(KernelError::Cancelled)));
 
         let read = handler.read_files_with_cancellation(vec![(url, None)], Some(token));
         assert!(matches!(read, Err(KernelError::Cancelled)));
+    }
+
+    // Upper-bound comparison uses percent-decoded paths, so a caller-built bound that still
+    // contains unreserved escapes (t%61ble) matches listed locations rebuilt from object keys.
+    #[rstest::rstest]
+    #[case::ordered("s3://bucket/")]
+    #[case::unordered("file:///")]
+    #[tokio::test]
+    async fn list_from_upper_bound_preserves_commits_under_encoded_roots(
+        #[case] origin: &str,
+        #[values("table/", "t%61ble/")] table_dir: &str,
+        #[values(":", "00000000000000000001")] upper: &str,
+    ) {
+        let store = Arc::new(InMemory::new());
+        let commit = "table/_delta_log/00000000000000000000.json";
+        store
+            .put(&Path::from(commit), Bytes::new().into())
+            .await
+            .unwrap();
+
+        let origin = Url::parse(origin).unwrap();
+        let log_root = origin.join(table_dir).unwrap().join("_delta_log/").unwrap();
+        let start = log_root.join("00000000000000000000").unwrap();
+        let expected = vec![origin.join(commit).unwrap()];
+        let unbounded: Vec<_> = list_from_impl(store.clone(), start.clone(), None)
+            .await
+            .unwrap()
+            .map_ok(|meta| meta.location)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(unbounded, expected);
+
+        let bounded: Vec<_> = list_from_impl(store, start, Some(log_root.join(upper).unwrap()))
+            .await
+            .unwrap()
+            .map_ok(|meta| meta.location)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(bounded, expected);
+    }
+
+    #[rstest::rstest]
+    fn snapshot_upper_bound_preserves_tables_under_encoded_roots(
+        #[values("s3://bucket/table/", "s3://bucket/t%61ble/")] table_root: &str,
+    ) {
+        let engine = DefaultEngineBuilder::new(Arc::new(InMemory::new())).build();
+        let created = create_table_and_load_snapshot(
+            "s3://bucket/table/",
+            schema_ref! { nullable "id": LONG },
+            &engine,
+            &[],
+        )
+        .unwrap();
+
+        let loaded = Snapshot::builder_for(table_root).build(&engine).unwrap();
+        assert_eq!(loaded.version(), created.version());
+        assert_eq!(loaded.schema(), created.schema());
+    }
+
+    // Ordered stores stream in native/object-key order. Comparing the bound in that same
+    // percent-decoded space keeps take_while from stopping early on URL-string reorderings.
+    #[rstest::rstest]
+    #[case::ascii("a.json", ["a.json", "z.json"], "m", &["a.json"])]
+    #[case::unicode_after_bound("é.json", ["z.json", "é.json"], "m", &[])]
+    #[case::unicode_stops_after_z("é.json", ["z.json", "é.json"], "~", &["z.json"])]
+    #[tokio::test]
+    async fn list_from_upper_bound_follows_decoded_path_order(
+        #[case] filename: &str,
+        #[case] native_order: [&str; 2],
+        #[case] upper: &str,
+        #[case] expected_names: &[&str],
+        #[values("s3://bucket/", "file:///")] origin: &str,
+    ) {
+        let store = Arc::new(InMemory::new());
+        for name in ["z.json", filename] {
+            store
+                .put(
+                    &Path::parse(format!("dir/{name}")).unwrap(),
+                    Bytes::new().into(),
+                )
+                .await
+                .unwrap();
+        }
+        // InMemory preserves native key order, like an ordinary S3 bucket.
+        let native: Vec<_> = store
+            .list(Some(&Path::from("dir")))
+            .map_ok(|meta| meta.location)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            native,
+            native_order.map(|name| Path::parse(format!("dir/{name}")).unwrap())
+        );
+
+        let start = Url::parse(origin).unwrap().join("dir/").unwrap();
+        let end = start.join(upper).unwrap();
+        let expected: Vec<_> = expected_names
+            .iter()
+            .map(|name| start.join(name).unwrap())
+            .collect();
+
+        let bounded: Vec<_> = list_from_impl(store, start, Some(end))
+            .await
+            .unwrap()
+            .map_ok(|meta| meta.location)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(bounded, expected);
     }
 }

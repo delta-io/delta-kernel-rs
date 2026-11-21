@@ -24,7 +24,7 @@ use delta_kernel::{
     KernelError, KernelResult, KernelResultIterator, PredicateRef,
 };
 use futures::stream::{self, BoxStream};
-use futures::{ready, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt, ready};
 use url::Url;
 
 use crate::executor::TaskExecutor;
@@ -197,7 +197,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
     fn write_json_file(
         &self,
         path: &Url,
-        data: KernelResultIterator<'_, FilteredEngineData>,
+        data: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
         overwrite: bool,
     ) -> KernelResult<FileSize> {
         self.task_executor.block_on(write_json_file_impl(
@@ -283,7 +283,7 @@ mod tests {
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::ops::Range;
     use std::path::PathBuf;
-    use std::sync::{mpsc, Arc, Mutex};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::task::Waker;
 
     use delta_kernel::actions::get_commit_schema;
@@ -424,10 +424,10 @@ mod tests {
                     //    completed
                     // 3. the next key is the last key in the queue, in which case there is nothing
                     //    left to do (no need to wake anyone)
-                    if let Some(next_key) = state.ordered_keys.front().cloned() {
-                        if let Some(waker) = state.wakers.remove(&next_key) {
-                            waker.wake(); // NOTE: Not async, returns instantly.
-                        }
+                    if let Some(next_key) = state.ordered_keys.front().cloned()
+                        && let Some(waker) = state.wakers.remove(&next_key)
+                    {
+                        waker.wake(); // NOTE: Not async, returns instantly.
                     }
                     Poll::Ready(())
                 } else {

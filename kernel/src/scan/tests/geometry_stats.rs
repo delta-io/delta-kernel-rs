@@ -1,7 +1,7 @@
 use ::test_utils::add_commit;
 
 use super::*;
-use crate::actions::{get_commit_schema, TIGHT_BOUNDS};
+use crate::actions::{TIGHT_BOUNDS, get_commit_schema};
 use crate::arrow::array::{ArrayRef, AsArray, BinaryArray};
 use crate::engine::arrow_expression::evaluate_expression::evaluate_expression;
 use crate::engine::arrow_expression::opaque::{ArrowOpaqueExpression, ArrowOpaqueExpressionOp};
@@ -274,7 +274,7 @@ impl ParquetHandler for GeometryStatsHandler {
     fn write_parquet_file(
         &self,
         location: Url,
-        data: KernelResultIteratorStatic<Box<dyn EngineData>>,
+        data: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
     ) -> KernelResult<FileSize> {
         self.parquet.write_parquet_file(location, data)
     }

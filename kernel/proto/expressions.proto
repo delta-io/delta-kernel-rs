@@ -21,6 +21,7 @@ import "schema.proto";
 enum UnaryPredicateOp {
   UNARY_PREDICATE_OP_UNSPECIFIED = 0;
   UNARY_PREDICATE_OP_IS_NULL = 1;
+  UNARY_PREDICATE_OP_HAS_URI_SCHEME = 2;
 }
 
 enum BinaryPredicateOp {
@@ -35,6 +36,7 @@ enum BinaryPredicateOp {
 enum UnaryExpressionOp {
   UNARY_EXPRESSION_OP_UNSPECIFIED = 0;
   UNARY_EXPRESSION_OP_TO_JSON = 1;
+  UNARY_EXPRESSION_OP_URI_ENCODE_FILE_LOCATION = 2;
 }
 
 enum BinaryExpressionOp {
@@ -126,6 +128,8 @@ message ColumnName {
 message UnaryExpression {
   UnaryExpressionOp op = 1;
   Expression expr = 2;
+  // TO_JSON only: encode timestamps with all six microsecond digits instead of three.
+  bool to_json_full_precision_timestamps = 3;
 }
 
 message BinaryExpression {
@@ -139,10 +143,15 @@ message VariadicExpression {
   repeated Expression exprs = 2;
 }
 
-message IfExpression {
+message CaseWhenBranch {
   Predicate condition = 1;
-  Expression then_expr = 2;
-  Expression else_expr = 3;
+  Expression result = 2;
+}
+
+// Ordered branches and a required ELSE. All results must have the same logical type.
+message CaseWhenExpression {
+  repeated CaseWhenBranch branches = 1;
+  Expression else_expr = 2;
 }
 
 message ParseJsonExpression {
@@ -151,9 +160,11 @@ message ParseJsonExpression {
 }
 
 message MapToStructOptions {
-  // Optional connector-supplied IANA timezone or normalized fixed offset (`+HH:MM` or `-HH:MM`)
-  // for offset-less TIMESTAMP values. Kernel never infers this from the host or table metadata. A
-  // timezone or offset in a value takes precedence; absence means UTC.
+  // Optional connector-supplied IANA timezone, normalized fixed offset (`+HH:MM[:SS]` or
+  // `-HH:MM[:SS]`), or `Z` (UTC) for offset-less TIMESTAMP values. Kernel never infers this from
+  // the host or table metadata. Exact uppercase EST, MST, and HST use fixed offsets -05:00,
+  // -07:00, and -10:00, respectively. Full IANA region names preserve historical clock transitions.
+  // A timezone or offset in a value takes precedence; absence means UTC.
   optional string timestamp_timezone = 1;
 }
 
@@ -241,8 +252,7 @@ message Expression {
     UnaryExpression unary = 6;
     BinaryExpression binary = 7;
     VariadicExpression variadic = 8;
-    // TODO: IfExpression is not yet available in Kernel but will be needed in the future.
-    IfExpression if_expr = 9;
+    CaseWhenExpression case_when = 9;
     OpaqueExpression opaque = 10;
     ParseJsonExpression parse_json = 11;
     MapToStructExpression map_to_struct = 12;

@@ -4,23 +4,29 @@
 #![allow(dead_code)]
 #![allow(unreachable_pub)]
 
+mod action_projector;
 mod builder;
+mod checkpoint_action_stream;
+mod checkpoint_sidecar;
 mod dv_conversion;
+mod mumbling;
 mod reader;
 pub(crate) mod stats;
 #[cfg(test)]
 pub(crate) mod test_utils;
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use bytes::Bytes;
+pub(crate) use checkpoint_action_stream::read_checkpoint_action;
 use delta_kernel_derive::ToSchema;
 use url::Url;
 
-use crate::engine_data::EngineData;
-use crate::expressions::{null_lit, Expression, Scalar, StructData};
+use crate::engine_data::{EngineData, GetData, TypedGetData as _};
+use crate::expressions::{Expression, Scalar, StructData, null_lit};
 use crate::schema::derive_macro_utils::ToDataType;
-use crate::schema::{DataType, StructType};
+use crate::schema::{ColumnNamesAndTypes, DataType, StructType, ToSchema as _};
 use crate::{KernelError, KernelResult, Version};
 
 /// Field names in the [`ContentTreeNodeEntry`] schema.
@@ -35,6 +41,9 @@ pub(crate) const SORT_ORDER_ID: &str = "sortOrderId";
 pub(crate) const RECORD_COUNT: &str = "recordCount";
 pub(crate) const FILE_SIZE_IN_BYTES: &str = "fileSizeInBytes";
 pub(crate) const CONTENT_STATS_FIELD_NAME: &str = "content_stats";
+/// Parquet field ID of [`ContentTreeNodeEntry::content_stats`], matching its `#[field_id]`.
+const CONTENT_STATS_FIELD_ID: i32 = 146;
+pub(crate) const TIGHT_STATS: &str = "tightStats";
 pub(crate) const MANIFEST_INFO: &str = "manifestInfo";
 pub(crate) const KEY_METADATA: &str = "keyMetadata";
 pub(crate) const SPLIT_OFFSETS: &str = "splitOffsets";
@@ -81,7 +90,6 @@ pub(crate) const FIELD_IDS: &str = "fieldIds";
 /// Field names for the different fields within content_stats.
 pub(crate) const LOWER_BOUND: &str = "lower_bound";
 pub(crate) const UPPER_BOUND: &str = "upper_bound";
-pub(crate) const TIGHT_BOUNDS: &str = "tight_bounds";
 pub(crate) const VALUE_COUNT: &str = "value_count";
 pub(crate) const NULL_VALUE_COUNT: &str = "null_value_count";
 pub(crate) const NAN_VALUE_COUNT: &str = "nan_value_count";
@@ -132,11 +140,15 @@ pub(crate) struct DeletionVectorInfo {
     pub(crate) key_metadata: Option<Bytes>,
 }
 
+/// The `deletionVector.*` leaf columns of a content entry, in [`DeletionVectorInfo`] field order.
+pub(crate) static DV_INFO_COLUMNS: LazyLock<ColumnNamesAndTypes> =
+    LazyLock::new(|| DeletionVectorInfo::to_schema().leaves(DV_INFO));
+
 /// Sub-struct of ContentTreeNodeEntry that tracks details
 /// of the history of a file in the AMT (its current state,
 /// a sequence number for when it was added, etc).
 #[derive(Debug, Clone, ToSchema)]
-#[cfg_attr(test, derive(delta_kernel_derive::IntoStructData))]
+#[cfg_attr(test, derive(PartialEq, delta_kernel_derive::IntoStructData))]
 pub struct TrackingInfo {
     /// Whether this entry is added, existing, or deleted.
     #[field_id = 0]
@@ -184,6 +196,45 @@ pub struct TrackingInfo {
     pub(crate) replaced_positions: Option<Bytes>,
 }
 
+/// The `tracking.*` leaf columns [`TrackingInfo::try_from_getters`] reads, in getter order.
+pub(crate) static TRACKING_COLUMNS: LazyLock<ColumnNamesAndTypes> =
+    LazyLock::new(|| TrackingInfo::to_schema().leaves(TRACKING));
+
+impl TrackingInfo {
+    /// Parses one row's `tracking` struct from `getters`, which must follow [`TRACKING_COLUMNS`]
+    /// order.
+    ///
+    /// # Errors
+    /// Returns an error if the getter count differs from [`TRACKING_COLUMNS`], if `status` is null
+    /// or not a known [`TrackingStatus`], or if a getter yields a value of the wrong type.
+    pub(crate) fn try_from_getters<'a>(
+        row: usize,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> KernelResult<Self> {
+        let expected = TRACKING_COLUMNS.as_ref().0.len();
+        if getters.len() != expected {
+            return Err(KernelError::internal_error(format!(
+                "Expected {expected} AMT tracking getters, got {}",
+                getters.len()
+            )));
+        }
+        let positions = |getter: &'a dyn GetData<'a>, field: &str| -> KernelResult<_> {
+            let bytes: Option<&[u8]> = getter.get_opt(row, field)?;
+            Ok(bytes.map(Bytes::copy_from_slice))
+        };
+        Ok(Self {
+            status: TrackingStatus::try_from_repr(getters[0].get(row, TRACKING_STATUS)?)?,
+            snapshot_id: getters[1].get_opt(row, TRACKING_SNAPSHOT_ID)?,
+            modified_snapshot_id: getters[2].get_opt(row, MODIFIED_SNAPSHOT_ID)?,
+            sequence_number: getters[3].get_opt(row, SEQUENCE_NUMBER)?,
+            file_sequence_number: getters[4].get_opt(row, FILE_SEQUENCE_NUMBER)?,
+            first_row_id: getters[5].get_opt(row, FIRST_ROW_ID)?,
+            deleted_positions: positions(getters[6], DELETED_POSITIONS)?,
+            replaced_positions: positions(getters[7], REPLACED_POSITIONS)?,
+        })
+    }
+}
+
 /// Represents an entry/row in a ContentTree node.
 #[derive(Debug, Clone, ToSchema)]
 #[cfg_attr(test, derive(delta_kernel_derive::IntoStructData))]
@@ -214,7 +265,7 @@ pub(super) struct ContentTreeNodeEntry {
 
     /// Partition data tuple, schema based on the partition spec. Required (non-nullable)
     /// when present in the schema. The schema is dynamically generated based on the
-    /// partition spec via [`Self::to_schema_with_content_stats`]. When `None` in Rust,
+    /// partition spec. When `None` in Rust,
     /// a struct with null-valued fields is produced during serialization.
     #[skip_schema]
     #[field_id = 102]
@@ -240,6 +291,17 @@ pub(super) struct ContentTreeNodeEntry {
     #[skip_schema]
     #[field_id = 146]
     pub(crate) content_stats: Option<StructData>,
+
+    /// Whether [`Self::content_stats`] are tight: `value_count`, `null_value_count`, and
+    /// `nan_value_count` are exact over the entry's live rows, as are `lower_bound` and
+    /// `upper_bound` for fixed-length types. String and binary bounds may be truncated and
+    /// geospatial bounds are bounding boxes, so they are never tight. Variant bounds are judged
+    /// per path by the bound's value type. `total_bytes` is not part of tightness. Readers must
+    /// treat `None` as not tight. See the Iceberg spec on stats [tightness].
+    ///
+    /// [tightness]: https://github.com/apache/iceberg/blob/main/format/spec.md#stats-tightness
+    #[field_id = 151]
+    pub(crate) tight_stats: Option<bool>,
 
     /// Must be set if content_type is {Data,Delete}Manifest, otherwise `None`.
     #[field_id = 150]
@@ -273,6 +335,22 @@ pub(super) struct ContentTreeNodeEntry {
     /// TODO: assign a Parquet field ID dynamically based on Iceberg expressions once they are
     /// supported in the AMF spec.
     pub(crate) tags: Option<HashMap<String, Option<String>>>,
+}
+
+impl ContentTreeNodeEntry {
+    /// The entry schema ([`Self::to_schema`]) followed by the nullable `content_stats` column when
+    /// `content_stats` (the per-leaf stats struct, see [`stats`]) is given.
+    pub(crate) fn to_schema_with_content_stats(content_stats: Option<StructType>) -> StructType {
+        let content_stats = content_stats.map(|stats| {
+            stats::field_with_id(
+                CONTENT_STATS_FIELD_NAME,
+                stats.into(),
+                true,
+                CONTENT_STATS_FIELD_ID,
+            )
+        });
+        StructType::new_unchecked(Self::to_schema().into_fields().chain(content_stats))
+    }
 }
 
 /// A file storing the values of some fields for each row of another file, used by column updates.
@@ -490,8 +568,95 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::schema::{ColumnMetadataKey, MetadataValue, StructField, ToSchema};
+    use crate::content_tree::test_utils::{
+        added_data_entry, entry_batch, struct_batch, with_field,
+    };
+    use crate::engine::sync::SyncEngine;
+    use crate::engine_data::RowVisitor;
+    use crate::schema::{ColumnMetadataKey, ColumnName, MetadataValue, StructField};
     use crate::unit_test_utils::assert_result_error_with_message;
+
+    /// Collects every row's [`TrackingInfo`] via [`TrackingInfo::try_from_getters`].
+    #[derive(Default)]
+    struct TrackingVisitor {
+        tracking: Vec<TrackingInfo>,
+    }
+
+    impl RowVisitor for TrackingVisitor {
+        fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+            TRACKING_COLUMNS.as_ref()
+        }
+
+        fn visit<'a>(
+            &mut self,
+            row_count: usize,
+            getters: &[&'a dyn GetData<'a>],
+        ) -> KernelResult<()> {
+            for row in 0..row_count {
+                self.tracking
+                    .push(TrackingInfo::try_from_getters(row, getters)?);
+            }
+            Ok(())
+        }
+    }
+
+    fn visit_tracking(batch: &dyn EngineData) -> KernelResult<Vec<TrackingInfo>> {
+        let mut visitor = TrackingVisitor::default();
+        visitor.visit_rows_of(batch)?;
+        Ok(visitor.tracking)
+    }
+
+    #[rstest]
+    #[case::all_fields_set(TrackingInfo {
+        status: TrackingStatus::Existing,
+        snapshot_id: Some(1),
+        modified_snapshot_id: Some(2),
+        sequence_number: Some(3),
+        file_sequence_number: Some(4),
+        first_row_id: Some(5),
+        deleted_positions: Some(Bytes::from_static(b"deleted")),
+        replaced_positions: Some(Bytes::from_static(b"replaced")),
+    })]
+    #[case::optional_fields_null(TrackingInfo {
+        status: TrackingStatus::Deleted,
+        snapshot_id: None,
+        modified_snapshot_id: None,
+        sequence_number: None,
+        file_sequence_number: None,
+        first_row_id: None,
+        deleted_positions: None,
+        replaced_positions: None,
+    })]
+    fn tracking_info_parses_from_getters(#[case] tracking: TrackingInfo) {
+        let engine = SyncEngine::new();
+        let mut entry = added_data_entry("a.parquet", 1, 1, 0, 0);
+        entry.tracking = tracking.clone();
+        let batch = entry_batch(&engine, &[entry]);
+        assert_eq!(visit_tracking(batch.as_ref()).unwrap(), vec![tracking]);
+    }
+
+    #[test]
+    fn tracking_info_rejects_unknown_status() {
+        let engine = SyncEngine::new();
+        let entry = with_field(
+            &added_data_entry("a.parquet", 1, 1, 0, 0).into(),
+            &[TRACKING, TRACKING_STATUS],
+            Scalar::Integer(9),
+        );
+        let batch = struct_batch(&engine, &[entry]);
+        assert_result_error_with_message(
+            visit_tracking(batch.as_ref()),
+            "Invalid AMT tracking status value: 9",
+        );
+    }
+
+    #[test]
+    fn tracking_info_rejects_wrong_getter_count() {
+        assert_result_error_with_message(
+            TrackingInfo::try_from_getters(0, &[]),
+            "AMT tracking getters, got 0",
+        );
+    }
 
     #[test]
     fn struct_expr_from_schema_errors_on_missing_required_field() {
@@ -553,7 +718,7 @@ mod tests {
     /// The AMT struct Parquet field IDs and nullability are a protocol contract with the Iceberg v4
     /// spec. This pins the name, field ID, and nullability of every field in each `to_schema()`, in
     /// order, so an accidental change fails loudly. `partition` and `content_stats` are
-    /// `#[skip_schema]` and only appear in `to_schema_with_content_stats`, so they are absent here.
+    /// `#[skip_schema]`, so they are absent here.
     /// `tags` is a Delta extension with no field ID (matched by name).
     #[rstest]
     #[case::content_tree_node_entry(ContentTreeNodeEntry::to_schema(), &[
@@ -566,6 +731,7 @@ mod tests {
         (SORT_ORDER_ID, Some(140), true),
         (RECORD_COUNT, Some(103), false),
         (FILE_SIZE_IN_BYTES, Some(104), false),
+        (TIGHT_STATS, Some(151), true),
         (MANIFEST_INFO, Some(150), true),
         (KEY_METADATA, Some(131), true),
         (SPLIT_OFFSETS, Some(132), true),
@@ -635,5 +801,26 @@ mod tests {
                 "field id mismatch for {name}",
             );
         }
+    }
+
+    /// Like [`amt_schema_field_contract`], pins the `content_stats` column appended to the entry
+    /// schema.
+    #[rstest]
+    fn to_schema_with_content_stats_appends_content_stats(#[values(false, true)] with_stats: bool) {
+        let stats = StructType::new_unchecked([StructField::nullable("x", DataType::LONG)]);
+        let schema =
+            ContentTreeNodeEntry::to_schema_with_content_stats(with_stats.then(|| stats.clone()));
+
+        let entry = ContentTreeNodeEntry::to_schema();
+        let fields: Vec<_> = schema.fields().collect();
+        let (entry_fields, content_stats) = fields.split_at(entry.num_fields());
+        assert_eq!(entry_fields, entry.fields().collect::<Vec<_>>());
+        let expected = with_stats.then(|| {
+            StructField::nullable(CONTENT_STATS_FIELD_NAME, stats).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(146),
+            )])
+        });
+        assert_eq!(content_stats.first().copied(), expected.as_ref());
     }
 }

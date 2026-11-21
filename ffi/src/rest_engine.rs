@@ -18,13 +18,13 @@ use std::time::Duration;
 use delta_kernel::object_store::{Error as ObjectStoreError, ObjectStore};
 use delta_kernel::{KernelError, KernelResult};
 use delta_kernel_default_engine::rest_store::{
-    build_rest_client, headers_from_pairs, AuthHeaderProvider, HeaderMap, RefreshingHeaderProvider,
-    RestClientOptions, RestEndpointConfig, RestObjectStore, StaticHeaderProvider,
+    AuthHeaderProvider, HeaderMap, RefreshingHeaderProvider, RestClientOptions, RestEndpointConfig,
+    RestObjectStore, StaticHeaderProvider, build_rest_client, headers_from_pairs,
 };
 use derive_more::Constructor;
 use url::Url;
 
-use crate::error::AllocateErrorFn;
+use crate::error::ErrorAllocators;
 use crate::handle::Handle;
 use crate::{ExclusiveRustString, KernelStringSlice, NullableCvoid, TryFromStringSlice};
 
@@ -42,54 +42,54 @@ pub const AUTH_MAX_NUM_HEADERS: usize = 8;
 /// [`CAuthHeaderCallback`] is passed to
 /// [`builder_with_rest_object_store`](crate::builder_with_rest_object_store).
 pub const REST_BUILDER_OPTION_HEADER_PREFIX: &str = "header.";
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub static REST_BUILDER_OPTION_HEADER_PREFIX_KEY: [u8; 8] = *b"header.\0";
 
 /// PEM client-certificate path. mTLS is enabled only when cert, key, and CA paths are all set.
 pub const REST_BUILDER_OPTION_TLS_CERT_PATH: &str = "tls.cert_path";
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub static REST_BUILDER_OPTION_TLS_CERT_PATH_KEY: [u8; 14] = *b"tls.cert_path\0";
 
 /// PEM client-private-key path (required with [`REST_BUILDER_OPTION_TLS_CERT_PATH`] and
 /// [`REST_BUILDER_OPTION_TLS_CA_PATH`] for mTLS).
 pub const REST_BUILDER_OPTION_TLS_KEY_PATH: &str = "tls.key_path";
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub static REST_BUILDER_OPTION_TLS_KEY_PATH_KEY: [u8; 13] = *b"tls.key_path\0";
 
 /// PEM CA-bundle path used to verify the server (required with cert and key for mTLS).
 pub const REST_BUILDER_OPTION_TLS_CA_PATH: &str = "tls.ca_path";
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub static REST_BUILDER_OPTION_TLS_CA_PATH_KEY: [u8; 12] = *b"tls.ca_path\0";
 
 /// Accept server certificate hostname mismatches (default `false`). Certificate trust and
 /// validity checks remain enabled. Intended for test environments.
 pub const REST_BUILDER_OPTION_TLS_ALLOW_INVALID_HOSTNAMES: &str = "tls.allow_invalid_hostnames";
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub static REST_BUILDER_OPTION_TLS_ALLOW_INVALID_HOSTNAMES_KEY: [u8; 28] =
     *b"tls.allow_invalid_hostnames\0";
 
 /// Comma-separated DNS overrides as `host=ip:port` entries (bypasses system resolver; SNI
 /// unchanged).
 pub const REST_BUILDER_OPTION_TLS_DNS_OVERRIDE: &str = "tls.dns_override";
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub static REST_BUILDER_OPTION_TLS_DNS_OVERRIDE_KEY: [u8; 17] = *b"tls.dns_override\0";
 
 /// HTTP request timeout in seconds; unset uses the reqwest default.
 pub const REST_BUILDER_OPTION_TLS_TIMEOUT_SECS: &str = "tls.timeout_secs";
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub static REST_BUILDER_OPTION_TLS_TIMEOUT_SECS_KEY: [u8; 17] = *b"tls.timeout_secs\0";
 
 /// Maximum automatic retries for transient failures (5xx, connect/timeout) on idempotent REST
 /// requests; defaults to `0` when unset. Ambiguous `Create` puts use
 /// [`REST_BUILDER_OPTION_PUT_VERIFY_ON_AMBIGUOUS`] instead.
 pub const REST_BUILDER_OPTION_RETRY_MAX_RETRIES: &str = "retry.max_retries";
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub static REST_BUILDER_OPTION_RETRY_MAX_RETRIES_KEY: [u8; 18] = *b"retry.max_retries\0";
 
 /// After an ambiguous PUT, verify object existence before treating the write as successful.
 /// Value: `true` or `false`; defaults to `false` when unset.
 pub const REST_BUILDER_OPTION_PUT_VERIFY_ON_AMBIGUOUS: &str = "put.verify_on_ambiguous";
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub static REST_BUILDER_OPTION_PUT_VERIFY_ON_AMBIGUOUS_KEY: [u8; 24] =
     *b"put.verify_on_ambiguous\0";
 
@@ -142,18 +142,22 @@ pub struct CAuthHeaders {
 ///
 /// The kernel invokes this when it needs fresh headers. For each entry in `headers[0..count]`,
 /// set `name` and `value` via [`allocate_kernel_string`](crate::allocate_kernel_string) using the
-/// supplied `allocate_error` callback (the same allocator the engine registered on
+/// supplied `error_allocators` callback table (the same allocator the engine registered on
 /// [`get_engine_builder`](crate::get_engine_builder)). Set `ttl_ms` to report how long those
 /// headers stay valid. With a non-zero TTL the kernel caches them and re-invokes near expiry; with
 /// `ttl_ms = 0` it invokes the callback on every request.
 ///
 /// `context` is the opaque pointer registered via
-/// [`builder_with_rest_object_store`](crate::builder_with_rest_object_store). `allocate_error` is
+/// [`builder_with_rest_object_store`](crate::builder_with_rest_object_store). `error_allocators` is
 /// forwarded on each invocation so the callback can pass it to
-/// [`allocate_kernel_string`](crate::allocate_kernel_string) without the engine having to stash it
-/// separately.
-pub type CAuthHeaderCallback =
-    extern "C" fn(context: NullableCvoid, out: *mut CAuthHeaders, allocate_error: AllocateErrorFn);
+/// [`allocate_kernel_string`](crate::allocate_kernel_string). The table pointer is valid only
+/// until this callback returns. Copying the table does not extend the lifetime of its context
+/// or callback code.
+pub type CAuthHeaderCallback = extern "C" fn(
+    context: NullableCvoid,
+    out: *mut CAuthHeaders,
+    error_allocators: *const ErrorAllocators,
+);
 
 /// State for [`crate::ObjectStoreBackend::Rest`], stored on
 /// [`FfiEngineBuilder`](crate::FfiEngineBuilder)
@@ -170,7 +174,7 @@ pub(crate) struct RestBuilderState {
 pub(crate) struct FfiAuthHeaderProvider {
     callback: CAuthHeaderCallback,
     context: NullableCvoid,
-    allocate_error: AllocateErrorFn,
+    error_allocators: ErrorAllocators,
 }
 // SAFETY: see [`builder_with_rest_object_store`](crate::builder_with_rest_object_store): `context`
 // and `callback` must be safe to invoke from any thread concurrently.
@@ -183,14 +187,13 @@ impl FfiAuthHeaderProvider {
         let out = headers.as_mut_ptr();
         // SAFETY: `out` is valid for writes here. The callback initializes `headers[0..count]`;
         // only those slots are read below.
-        unsafe {
-            (*out).count = 0;
-            (*out).ttl_ms = 0;
-            (self.callback)(self.context, out, self.allocate_error);
-            let ttl = ((*out).ttl_ms != 0).then(|| Duration::from_millis((*out).ttl_ms));
-            let pairs = take_auth_pairs_from_c(out)?;
-            Ok((headers_from_pairs(pairs)?, ttl))
-        }
+        unsafe { (*out).count = 0 };
+        unsafe { (*out).ttl_ms = 0 };
+        (self.callback)(self.context, out, &self.error_allocators);
+        let ttl_ms = unsafe { (*out).ttl_ms };
+        let ttl = (ttl_ms != 0).then(|| Duration::from_millis(ttl_ms));
+        let pairs = unsafe { take_auth_pairs_from_c(out)? };
+        Ok((headers_from_pairs(pairs)?, ttl))
     }
 }
 
@@ -199,11 +202,11 @@ pub(crate) fn rest_builder_state_from_ffi(
     endpoint_config: &CRestEndpointConfig,
     callback: Option<CAuthHeaderCallback>,
     context: NullableCvoid,
-    allocate_error: AllocateErrorFn,
+    error_allocators: ErrorAllocators,
 ) -> KernelResult<RestBuilderState> {
     Ok(RestBuilderState {
         endpoint_config: rest_endpoint_config_from_c(endpoint_config)?,
-        auth_callback: callback.map(|cb| FfiAuthHeaderProvider::new(cb, context, allocate_error)),
+        auth_callback: callback.map(|cb| FfiAuthHeaderProvider::new(cb, context, error_allocators)),
     })
 }
 
@@ -218,7 +221,7 @@ pub(crate) fn rest_builder_state_from_ffi(
 unsafe fn take_auth_pairs_from_c(
     headers: *mut CAuthHeaders,
 ) -> KernelResult<Vec<(String, String)>> {
-    let count = (*headers).count as usize;
+    let count = unsafe { (*headers).count } as usize;
     if count > AUTH_MAX_NUM_HEADERS {
         return Err(KernelError::generic(format!(
             "auth header count {count} exceeds max {AUTH_MAX_NUM_HEADERS}"
@@ -227,10 +230,10 @@ unsafe fn take_auth_pairs_from_c(
 
     let mut pairs = Vec::with_capacity(count);
     for i in 0..count {
-        let slot = ptr::read(ptr::addr_of_mut!((*headers).headers[i]));
+        let slot = unsafe { ptr::read(ptr::addr_of_mut!((*headers).headers[i])) };
         // SAFETY: each handle is moved out of `CAuthHeaders` exactly once.
-        let name = *slot.name.into_inner();
-        let value = *slot.value.into_inner();
+        let name = unsafe { *slot.name.into_inner() };
+        let value = unsafe { *slot.value.into_inner() };
         pairs.push((name, value));
     }
     Ok(pairs)
@@ -383,7 +386,7 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::ffi_test_utils::allocate_err;
+    use crate::ffi_test_utils::TEST_ERROR_ALLOCATORS;
     use crate::kernel_string_slice;
 
     // Miri policy for this module. See ffi/AGENTS.md "Testing under Miri" for the policy;
@@ -394,8 +397,8 @@ mod tests {
     //   3. Client-build tests: reach `build_rest_client`. Their `unsafe` is a subset of what groups
     //      1-2 run under Miri, so the slow ones are `#[cfg_attr(miri, ignore)]`.
 
-    fn test_allocate_error() -> AllocateErrorFn {
-        allocate_err
+    fn test_error_allocators() -> ErrorAllocators {
+        TEST_ERROR_ALLOCATORS
     }
 
     fn test_auth_header_pair(name: &str, value: &str) -> CAuthHeaderPair {
@@ -452,7 +455,7 @@ mod tests {
             &test_c_rest_endpoint_config(),
             None,
             None,
-            test_allocate_error(),
+            test_error_allocators(),
         )
         .unwrap()
     }
@@ -584,7 +587,11 @@ mod tests {
         assert!(unsafe { take_auth_pairs_from_c(storage.as_mut_ptr()).is_err() });
     }
 
-    extern "C" fn fill_auth_direct(_: NullableCvoid, out: *mut CAuthHeaders, _: AllocateErrorFn) {
+    extern "C" fn fill_auth_direct(
+        _: NullableCvoid,
+        out: *mut CAuthHeaders,
+        _: *const ErrorAllocators,
+    ) {
         write_test_auth_headers(&[("authorization", "Bearer t")], out);
         unsafe {
             (*out).ttl_ms = 60_000;
@@ -596,7 +603,7 @@ mod tests {
         let provider = FfiAuthHeaderProvider {
             callback: fill_auth_direct,
             context: None,
-            allocate_error: test_allocate_error(),
+            error_allocators: test_error_allocators(),
         };
         let (headers, ttl) = provider.collect().unwrap();
         assert_eq!(headers.get("authorization").unwrap(), "Bearer t");
@@ -706,7 +713,7 @@ mod tests {
             &test_c_rest_endpoint_config(),
             Some(fill_auth_direct),
             None,
-            test_allocate_error(),
+            test_error_allocators(),
         )
         .unwrap();
         assert!(build_rest_object_store(&test_base_url(), &HashMap::new(), &rest).is_ok());
@@ -738,7 +745,8 @@ mod tests {
         let mut config = test_c_rest_endpoint_config();
         config.files_prefix = kernel_string_slice!(prefix);
         config.entry_strip_prefix = kernel_string_slice!(prefix);
-        let rest = rest_builder_state_from_ffi(&config, None, None, test_allocate_error()).unwrap();
+        let rest =
+            rest_builder_state_from_ffi(&config, None, None, test_error_allocators()).unwrap();
 
         let mut options = HashMap::new();
         options.insert(

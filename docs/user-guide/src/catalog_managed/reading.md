@@ -50,23 +50,23 @@ commits, then translates each one into a `LogPath`:
 ```rust,ignore
 use delta_kernel::LogPath;
 
-let log_path = LogPath::staged_commit(
-    table_url.clone(),                              // table root URL (must end with '/')
-    "00000000000000000008.<uuid>.json",             // staged filename: <version>.<uuid>.json
+let log_path = LogPath::from_commit_filename(
+    table_url.clone(),                              // table root URL
+    8,                                              // version the catalog reported
+    "00000000000000000008.<uuid>.json",             // filename the catalog reported
     1234567890,                                     // last modified timestamp
     4096,                                           // file size in bytes
 )?;
 ```
 
-The filename follows the Delta staged-commit convention: a zero-padded 20-digit version,
-the UUID assigned when the commit was staged, and a `.json` extension. Kernel mints the
+A staged commit filename follows the Delta staged-commit convention: a zero-padded 20-digit
+version, the UUID assigned when the commit was staged, and a `.json` extension. Kernel mints the
 UUID inside `CommitMetadata::staged_commit_path()` at write time; the writer passes the
 resulting path to the catalog, and the catalog returns that same path on reads. If your
 catalog returns commits as `(version, uuid, ...)` tuples, format the filename as
-`{version:020}.{uuid}.json` before calling `LogPath::staged_commit`. Published commit
-files use `{version:020}.json` and are loaded via `LogPath::try_new`, not
-`LogPath::staged_commit`. The `table_url` argument must end with `/`, otherwise
-`LogPath::staged_commit` returns an error.
+`{version:020}.{uuid}.json`. Catalogs may also report a commit that is already published by its
+`{version:020}.json` filename; `LogPath::from_commit_filename` resolves either form to the
+right directory. It returns an error if the filename's version does not match `version`.
 
 Then pass the resulting `Vec<LogPath>` to `SnapshotBuilder` along with the maximum
 catalog-ratified version:
@@ -80,27 +80,100 @@ let snapshot = Snapshot::builder_for(table_url)
     .build(&engine)?;
 ```
 
-The log tail must be a **contiguous sequence** `M..=N`: ascending by version, no gaps,
+When nonempty, the log tail must be a **contiguous sequence** `M..=N`: ascending by version, no gaps,
 no duplicates. The first version `M` can be any value `>= 0` (typical catalog clients
-return a suffix of recent commits, not the full history). The last version `N` depends
-on whether you are time-traveling:
+return a suffix of recent commits, not the full history). When you supply
+`max_catalog_version`, the last version `N` must satisfy these constraints:
 
 - Without time travel, `N` must equal `max_catalog_version`.
-- With `.at_version(v)`, `N` must be `>= v`, and `max_catalog_version` must still be
-  set. Both constraints apply simultaneously.
+- With `.at_version(v)`, `N` must be `>= v`, and `v` must not exceed
+  `max_catalog_version`.
+
+If the tail passed to `with_log_tail` contains any staged paths, you must supply `max_catalog_version`,
+even for an explicit-version load using `.at_version(v)`. This requirement applies even when
+those commits have published copies in `_delta_log/`. A nonempty tail containing only published
+paths doesn't itself require a catalog bound.
+
+The order of `.at_version()`, `.with_log_tail()`, and `.with_max_catalog_version()`
+doesn't matter.
+
+For incremental updates, supply the catalog's current tail, including unpublished commits
+already represented in the cached Snapshot. Supplying only the new suffix can fail before
+Kernel combines it with the cached history. Omitting both the bound and tail while a cached
+downgrade remains unpublished can also fail. These incremental-discovery limitations are tracked in
+[issue #3851](https://github.com/delta-io/delta-kernel-rs/issues/3851).
 
 The log tail can overlap with published commits already in `_delta_log/`. For any
 version present in both, Kernel uses the log-tail entry, as the Delta spec requires
 readers to prefer the catalog-supplied commit when the catalog provides one.
+For commit replay, Kernel ignores filesystem commit files from the tail's first version onward,
+including filesystem commits newer than the tail.
 
 Call `.with_max_catalog_version(N)` to tell Kernel the highest version the catalog has
 ratified. This prevents Kernel from loading filesystem commits beyond what the catalog
-knows about.
+knows about. Supply this bound even when the catalog returns an empty tail.
 
-> [!NOTE]
-> To time-travel to a specific version within a catalog-managed table, call both
-> `.at_version(v)` and `.with_max_catalog_version(N)` on the builder. Call order does
-> not matter. The requested version must not exceed `N`.
+## Time travel and management changes
+
+When using catalog discovery, pass its bound together with `.at_version(v)` for time
+travel. The requested version must not exceed the bound, regardless of the protocol at
+that version. Without an explicit target, Kernel rejects a Snapshot whose protocol is
+catalog-managed unless you supply a bound.
+
+For an explicit target, Kernel doesn't require a bound solely because that
+version was catalog-managed. For example, after a published downgrade, you can read an
+earlier catalog-managed version from published history without a bound. If the table is currently
+catalog-managed, obtain its catalog bound and ratified tail even for an explicit-version load.
+Kernel doesn't load newer protocol state to determine whether this obligation applies. The
+explicit-version exemption also applies when the requested version happens to be the latest.
+
+Staged paths retained in an existing Snapshot or complete snapshot hint don't by themselves
+require you to supply a bound. For example, a filesystem-managed Snapshot can retain historical
+staged paths after their commits were published and the table was downgraded. Any supplied bound
+still applies to an explicit target.
+
+To load the catalog's latest ratified version, supply its bound and available tail for both
+fresh and incremental builds, including when that version is a downgrade. An empty tail is
+valid if the required history is otherwise available. A staged file's existence alone doesn't
+prove ratification, so obtain staged entries from the catalog.
+
+A ratified downgrade produces a non-catalog-managed Snapshot. Kernel cannot distinguish it
+from an ordinary filesystem commit using that protocol alone. It therefore cannot always
+reject a missing bound at a downgrade. It does reject a missing bound when a latest version
+request returns a catalog-managed Snapshot, including at an upgrade, or when you supply staged
+paths through `with_log_tail`.
+
+After the downgrade is published, refresh without the old bound to discover later filesystem
+commits. Keeping the old bound still selects the downgrade version when you omit `.at_version()`.
+Newer filesystem commits don't invalidate that bounded read.
+
+For example, suppose version 5 downgrades the table and version 6 is its latest filesystem commit.
+Both are published, and the filesystem contains the history needed to read them. For a fresh
+build with no log tail or snapshot hint:
+
+| Explicit target | `max_catalog_version` | Result |
+|-----------------|-----------------------|--------|
+| Omitted | `5` | Read version 5, even though version 6 exists and version 5 is no longer catalog-managed. |
+| `.at_version(6)` | `5` | Reject with `MaxCatalogVersion` because the requested version exceeds the bound. |
+| Omitted | Omitted | Discover and read version 6. |
+
+## Publication evidence and snapshot reuse
+
+Publication can advance without changing a snapshot's version. Snapshot reuse can retain older
+publication evidence even when a supplied tail or filesystem listing establishes further
+publication. As a result, checkpointing can return `UnpublishedVersion` after the required commits
+have been published. This limitation is tracked in
+[issue #3845](https://github.com/delta-io/delta-kernel-rs/issues/3845).
+
+To refresh publication evidence, build a fresh snapshot with `Snapshot::builder_for(table_root)`
+after publication, supplying the catalog bound and tail when required by the request. The fresh
+build must observe the published copies to record their publication.
+
+`skip_new_checkpoints()` lists after the cached snapshot version, so it cannot observe publication
+at that version. Complete snapshot hints perform no engine I/O and preserve the publication
+evidence supplied in the hint.
+
+## Reading the snapshot
 
 For a complete Unity Catalog example, see
 [Reading Unity Catalog tables](../unity_catalog/reading.md).

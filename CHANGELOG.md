@@ -1,5 +1,19 @@
 # Changelog
 
+## [v0.30.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.30.1/) (2026-10-23)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.30.0...v0.30.1)
+
+
+### 🐛 Bug Fixes
+
+1. Restore `update_table_txn_with_transaction_id` and `create_table_txn_with_transaction_id` so
+   FFI callers can add transaction IDs after building a transaction ([#3668]).
+
+
+[#3668]: https://github.com/delta-io/delta-kernel-rs/pull/3668
+
+
 ## [v0.30.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.30.0/) (2026-10-16)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.29.0...v0.30.0)

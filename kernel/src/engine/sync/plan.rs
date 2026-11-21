@@ -1,11 +1,8 @@
-//! A synchronous, test-only [`PlanExecutor`] backed by [`SyncEngine`] handlers.
+//! A synchronous [`PlanExecutor`] for tests, backed by the sync storage helpers.
 //!
-//! Wired into [`SyncEngine::plan_executor`]. The query path evaluates a [`Plan`] eagerly,
-//! materializing every node's output in full before its consumers run. Streaming is not needed
-//! because this executor only serves tests, which never approach memory limits.
-//!
-//! [`SyncEngine`]: super::SyncEngine
-//! [`SyncEngine::plan_executor`]: super::SyncEngine
+//! The query path evaluates a [`Plan`] eagerly, materializing every node's output in full before
+//! its consumers run. Streaming is not needed because this executor only serves tests, which never
+//! approach memory limits.
 //
 // TODO: The `IoOperation` paths will eventually be used to replace SyncEngine with an
 // PlanBasedEngine (backed by this PlanExecutor)
@@ -20,6 +17,7 @@ use itertools::Itertools;
 use super::aggs::eval_aggregate;
 use super::json::try_create_from_json;
 use super::parquet::{parquet_footer, try_create_from_parquet};
+use super::prefix_sum::eval_prefix_sum;
 use super::storage::SyncStorageHandler;
 use super::{put_bytes, read_files_arrow};
 use crate::arrow::array::{
@@ -31,28 +29,28 @@ use crate::arrow::row::{OwnedRow, RowConverter, SortField};
 use crate::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::arrow_expression::evaluate_expression::extract_column_ref;
-use crate::engine::arrow_expression::{extract_column, ArrowEvaluationHandler};
-use crate::engine::arrow_utils::{coerce_columns_to_schema, to_json_bytes};
+use crate::engine::arrow_expression::{ArrowEvaluationHandler, extract_column};
+use crate::engine::arrow_utils::{
+    coerce_columns_to_schema, fix_record_batch_nested_null_masks, to_json_bytes,
+};
 use crate::expressions::{ArrayData, ColumnName, PredicateRef, Scalar};
 use crate::object_store::DynObjectStore;
 use crate::plans::ir::nodes::{
-    DynamicScan, FileType, Operator, Project, RelationId, RelationRef, ScanFile, ScanJson,
-    ScanParquet, SemiJoin, Values, WriteJson, FILE_META_SCHEMA,
+    DynamicScan, FILE_META_SCHEMA, FileType, Operator, Project, RelationId, RelationRef, ScanFile,
+    ScanJson, ScanParquet, SemiJoin, Values, WriteJson,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult, ScopedPlanExecutor};
 use crate::schema::{ArrayType, DataType, SchemaRef, StructType};
 use crate::{
     EvaluationHandler as _, FileMeta, FilteredEngineData, KernelError, KernelResult,
-    KernelResultIteratorStatic, StorageHandler as _,
+    KernelResultIterator, StorageHandler as _,
 };
 
 /// A synchronous, test-only [`PlanExecutor`].
 ///
-/// Scans read files directly through the sync module's Arrow read core ([`read_files_arrow`],
-/// [`parquet_footer`]) that backs the [`JsonHandler`] / [`ParquetHandler`] traits, so those
-/// handlers can eventually be retired in favor of declarative plans. [`IoOperation`]s still
-/// delegate to [`SyncStorageHandler`].
+/// Scans read files through the sync module's Arrow read core, which also backs the
+/// [`JsonHandler`] and [`ParquetHandler`] traits. [`IoOperation`]s use the sync storage handler.
 ///
 /// All I/O is performed synchronously via [`futures::executor::block_on`]; cloud-backed stores are
 /// not supported (see [`super`] module docs).
@@ -60,7 +58,7 @@ use crate::{
 /// [`JsonHandler`]: crate::JsonHandler
 /// [`ParquetHandler`]: crate::ParquetHandler
 #[derive(Clone)]
-pub(crate) struct SyncPlanExecutor {
+pub struct SyncPlanExecutor {
     storage: Arc<SyncStorageHandler>,
 }
 
@@ -68,7 +66,7 @@ pub(crate) struct SyncPlanExecutor {
 static NEXT_RELATION_ID: AtomicU64 = AtomicU64::new(0);
 
 /// A synchronous plan executor that retains relations for its own lifetime.
-pub(crate) struct ScopedSyncPlanExecutor {
+pub struct ScopedSyncPlanExecutor {
     executor: SyncPlanExecutor,
     relation_store: RelationStore,
 }
@@ -84,14 +82,14 @@ impl SyncPlanExecutor {
     /// Create a `SyncPlanExecutor` over `store`, or over a per-URL [`LocalFileSystem`] when `None`.
     ///
     /// [`LocalFileSystem`]: crate::object_store::local::LocalFileSystem
-    pub(crate) fn new(store: Option<Arc<DynObjectStore>>) -> Self {
+    pub fn new(store: Option<Arc<DynObjectStore>>) -> Self {
         Self {
             storage: Arc::new(SyncStorageHandler::new(store)),
         }
     }
 
     /// Returns an executor that retains relations until the scope is dropped.
-    pub(crate) fn get_scoped(&self) -> ScopedSyncPlanExecutor {
+    pub fn get_scoped(&self) -> ScopedSyncPlanExecutor {
         ScopedSyncPlanExecutor {
             executor: self.clone(),
             relation_store: Mutex::new(HashMap::new()),
@@ -104,7 +102,7 @@ impl ScopedSyncPlanExecutor {
     /// `name` is prepended to the relation ID as a debug hint.
     ///
     /// Returns an error if `schema` differs from the batch schema or retention fails.
-    pub(crate) fn create_ref(
+    pub fn create_ref(
         &self,
         name: &str,
         schema: SchemaRef,
@@ -156,11 +154,12 @@ impl SyncPlanExecutor {
 
     fn execute_io(&self, op: IoOperation) -> KernelResult<PlanResult> {
         match op {
-            IoOperation::FileListing { url } => {
+            IoOperation::FileListing { url, end } => {
                 // `StorageHandler::list_from` returns a non-`Send` iterator, so we collect into
                 // a `Vec` first to convert into a `Send` iterator.
                 // TODO(#2619): Evaluate whether StorageHandler should just return `Send` iterators
-                let metas: Vec<KernelResult<FileMeta>> = self.storage.list_from(&url)?.collect();
+                let metas: Vec<KernelResult<FileMeta>> =
+                    self.storage.list_from(&url, end.as_ref())?.collect();
                 Ok(PlanResult::FileMeta(Box::new(metas.into_iter())))
             }
             IoOperation::ReadBytes { files } => {
@@ -218,7 +217,14 @@ impl SyncPlanExecutor {
         let mut outputs: Vec<Vec<RecordBatch>> = Vec::with_capacity(plan.nodes.len());
         for node in plan.nodes {
             let output = self.eval_node(node, &outputs, relation_store)?;
-            outputs.push(output);
+            // Every consumer, including the caller of the final node, sees nested children with
+            // their ancestors' null masks applied. Project can introduce new nullable structs.
+            outputs.push(
+                output
+                    .into_iter()
+                    .map(fix_record_batch_nested_null_masks)
+                    .try_collect()?,
+            );
         }
         outputs
             .pop()
@@ -258,6 +264,7 @@ impl SyncPlanExecutor {
                 self.eval_dynamic_scan(dynamic_scan, &results[inputs[0]])
             }
             Operator::Aggregate(aggregate) => eval_aggregate(&aggregate, &results[inputs[0]]),
+            Operator::PrefixSum(prefix_sum) => eval_prefix_sum(&prefix_sum, &results[inputs[0]]),
             Operator::WriteJson(write) => {
                 self.eval_write_json(&write, inputs.iter().flat_map(|&i| results[i].iter()))
             }
@@ -341,7 +348,7 @@ impl SyncPlanExecutor {
             let metas = [file.meta.clone()];
             let read_schema = read_schema.clone();
             // The two constructors have distinct `impl Iterator` types, so box to unify the arms.
-            let data: KernelResultIteratorStatic<ArrowEngineData> = match file_type {
+            let data: Box<dyn KernelResultIterator<ArrowEngineData>> = match file_type {
                 FileType::Json => Box::new(read_files_arrow(
                     store,
                     &metas,
@@ -425,10 +432,8 @@ fn retain_relation(
     batches: Vec<RecordBatch>,
 ) -> KernelResult<RelationRef> {
     validate_relation_batches(&schema, &batches)?;
-    // `try_update` is unavailable at the crate's MSRV.
-    #[allow(deprecated)]
     let counter = NEXT_RELATION_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .map_err(|_| KernelError::internal_error("relation id space exhausted"))?;
     let id = format!("{name}-{counter}");
     relation_store
@@ -502,12 +507,13 @@ fn dynamic_scan_files(
             if path.is_null(row) {
                 return Err(KernelError::generic("DynamicScan path must not be null"));
             }
-            if let Some((dv, dv_ancestors)) = &dv {
-                if dv.is_valid(row) && dv_ancestors.iter().all(|ancestor| ancestor.is_valid(row)) {
-                    return Err(KernelError::unsupported(
-                        "SyncPlanExecutor DynamicScan with deletion vectors",
-                    ));
-                }
+            if let Some((dv, dv_ancestors)) = &dv
+                && dv.is_valid(row)
+                && dv_ancestors.iter().all(|ancestor| ancestor.is_valid(row))
+            {
+                return Err(KernelError::unsupported(
+                    "SyncPlanExecutor DynamicScan with deletion vectors",
+                ));
             }
             let path = path.value(row);
             let location = dynamic_scan.base_url.join(path)?;
@@ -715,11 +721,15 @@ mod tests {
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::arrow::array::StructArray;
     use crate::arrow::buffer::{BooleanBuffer, NullBuffer};
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field};
     use crate::engine::sync::get_bytes;
-    use crate::expressions::{col, column_name, lit, Predicate, StructData};
+    use crate::expressions::{
+        Expression, Predicate, StructData, col, column_name, expr, lit, null_lit,
+    };
     use crate::object_store::memory::InMemory;
     use crate::plans::PlanBuilder;
-    use crate::schema::{schema, schema_ref, ToSchema as _};
+    use crate::plans::ir::nodes::Agg;
+    use crate::schema::{ToSchema as _, schema, schema_ref};
 
     fn write_plan(
         inputs: impl IntoIterator<Item = PlanBuilder>,
@@ -788,7 +798,7 @@ mod tests {
             PlanBuilder::values(schema.clone(), vec![vec![0i64.into()]])?,
             PlanBuilder::values(schema.clone(), vec![vec![7i64.into()], vec![6i64.into()]])?,
         ])?
-        .filter(Predicate::gt(col!("id"), lit(1i64)))?;
+        .filter(Predicate::from_expr(expr!(col("id") > 1i64)))?;
         let second = PlanBuilder::union_all([
             PlanBuilder::values(schema.clone(), vec![vec![3i64.into()], vec![4i64.into()]])?,
             PlanBuilder::values(schema.clone(), vec![vec![2i64.into()]])?,
@@ -916,9 +926,11 @@ mod tests {
         let error = scoped
             .create_ref("arrow-batch", wrong_schema, batch.clone())
             .expect_err("a mismatched schema must be rejected");
-        assert!(error
-            .to_string()
-            .contains("record batch schema does not match"));
+        assert!(
+            error
+                .to_string()
+                .contains("record batch schema does not match")
+        );
 
         let relation_ref = scoped.create_ref("arrow-batch", schema, batch.clone())?;
         assert!(relation_ref.id().starts_with("arrow-batch-"));
@@ -935,9 +947,232 @@ mod tests {
             .execute_op(Operation::QueryPlan(query))
             .err()
             .expect("the unscoped executor must reject a scope's relation");
-        assert!(error
-            .to_string()
-            .contains("requires an executor that can store relations"));
+        assert!(
+            error
+                .to_string()
+                .contains("requires an executor that can store relations")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_respects_nested_parent_nulls_from_relation() -> KernelResult<()> {
+        let schema = schema_ref! { nullable "nested": { nullable "value": LONG } };
+        let nested = StructArray::new(
+            vec![Arc::new(Field::new("value", ArrowDataType::Int64, true))].into(),
+            vec![Arc::new(Int64Array::from(vec![99, 7]))],
+            Some(NullBuffer::from(vec![false, true])),
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.as_ref().try_into_arrow()?),
+            vec![Arc::new(nested)],
+        )?;
+        let scoped = SyncPlanExecutor::default().get_scoped();
+        let source = scoped.create_ref("nested", schema, batch)?;
+
+        let path = column_name!("nested.value");
+        let aggregate = PlanBuilder::relation_source(source)
+            .aggregate_ungrouped(|aggs| {
+                aggs.aggregate_as(Agg::count(path.clone()), "count")
+                    .aggregate_as(Agg::first_non_null(path.clone()), "first")
+                    .aggregate_as(Agg::min(path.clone()), "min")
+                    .aggregate_as(Agg::sum(path.clone()), "sum")
+                    .aggregate_as(
+                        Agg::min_non_null_by(path.clone(), path.clone(), path),
+                        "selected",
+                    )
+            })?
+            .build()?;
+        let batches = scoped
+            .executor
+            .eval_plan(aggregate, Some(&scoped.relation_store))?;
+        let values: Vec<_> = batches[0]
+            .columns()
+            .iter()
+            .map(|column| {
+                column
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .iter()
+                    .next()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(values, [Some(1), Some(7), Some(7), Some(7), Some(7)]);
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_respects_nested_parent_nulls_from_project() -> KernelResult<()> {
+        let nested = Expression::struct_with_nullability_from(
+            [col!("value")],
+            Expression::from(Predicate::eq(col!("value"), lit(7i64))),
+        );
+        let plan = PlanBuilder::values(
+            schema_ref! { not_null "value": LONG },
+            vec![vec![99i64.into()], vec![7i64.into()]],
+        )?
+        .project(
+            Expression::struct_from([nested]),
+            schema_ref! { nullable "nested": { nullable "value": LONG } },
+        )?
+        .aggregate_ungrouped(|aggs| {
+            aggs.aggregate_as(Agg::count(column_name!("nested.value")), "count")
+                .aggregate_as(Agg::first_non_null(column_name!("nested.value")), "first")
+        })?
+        .build()?;
+        let batches = SyncPlanExecutor::default().eval_plan(plan, None)?;
+        let count = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let first = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(count.iter().collect::<Vec<_>>(), [Some(1)]);
+        assert_eq!(first.iter().collect::<Vec<_>>(), [Some(7)]);
+        Ok(())
+    }
+
+    #[test]
+    fn filter_respects_nested_parent_nulls_from_relation() -> KernelResult<()> {
+        let schema = schema_ref! { nullable "nested": { nullable "value": LONG } };
+        let nested = StructArray::new(
+            vec![Arc::new(Field::new("value", ArrowDataType::Int64, true))].into(),
+            vec![Arc::new(Int64Array::from(vec![99, 7]))],
+            Some(NullBuffer::from(vec![false, true])),
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.as_ref().try_into_arrow()?),
+            vec![Arc::new(nested)],
+        )?;
+        let scoped = SyncPlanExecutor::default().get_scoped();
+        let source = scoped.create_ref("nested", schema, batch)?;
+        let plan = PlanBuilder::relation_source(source)
+            .filter(Predicate::is_not_null(col!("nested.value")))?
+            .project(
+                Expression::struct_from([col!("nested.value")]),
+                schema_ref! { nullable "value": LONG },
+            )?
+            .build()?;
+        let output = scoped
+            .executor
+            .eval_plan(plan, Some(&scoped.relation_store))?;
+        let values = output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(values.iter().collect::<Vec<_>>(), [Some(7)]);
+        Ok(())
+    }
+
+    /// A top-level CASE guard nulls every output field while a nested CASE guard nulls only
+    /// its own struct. For `(keep, nested_keep, value) = (true, false, 10)`, the result is
+    /// `(10, true, NULL, NULL)`; a FALSE or NULL `keep` produces an all-NULL row.
+    #[test]
+    fn project_preserves_root_nulls_and_nested_guard_scope() -> KernelResult<()> {
+        let output_schema = schema_ref! {
+            nullable "value": LONG,
+            nullable "keep": BOOLEAN,
+            nullable "nested": { nullable "value": LONG },
+            nullable "nothing": VOID,
+        };
+        let nested = Expression::struct_with_nullability_from([col!("value")], col!("nested_keep"));
+        let plan = PlanBuilder::values(
+            schema_ref! {
+                nullable "keep": BOOLEAN,
+                nullable "nested_keep": BOOLEAN,
+                not_null "value": LONG,
+            },
+            vec![
+                vec![true.into(), true.into(), 7i64.into()],
+                vec![false.into(), true.into(), 8i64.into()],
+                vec![Scalar::null(DataType::BOOLEAN), true.into(), 9i64.into()],
+                vec![true.into(), false.into(), 10i64.into()],
+                vec![true.into(), Scalar::null(DataType::BOOLEAN), 11i64.into()],
+            ],
+        )?
+        .project(
+            Expression::struct_with_nullability_from(
+                [
+                    col!("value"),
+                    col!("keep"),
+                    nested,
+                    null_lit(DataType::VOID),
+                ],
+                col!("keep"),
+            ),
+            output_schema.clone(),
+        )?
+        .build()?;
+        let batches = SyncPlanExecutor::default()
+            .execute_op(Operation::QueryPlan(plan))?
+            .into_data()?
+            .map(|data| data.try_into_record_batch())
+            .collect::<KernelResult<Vec<_>>>()?;
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 5);
+        assert_eq!(
+            batch.schema().as_ref(),
+            &output_schema.as_ref().try_into_arrow()?
+        );
+        assert_eq!(
+            batch.column(0).as_ref(),
+            &Int64Array::from(vec![Some(7), None, None, Some(10), Some(11)])
+        );
+        assert_eq!(
+            batch.column(1).as_ref(),
+            &BooleanArray::from(vec![Some(true), None, None, Some(true), Some(true)])
+        );
+        let nested = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(
+            (0..5).map(|row| nested.is_valid(row)).collect::<Vec<_>>(),
+            [true, false, false, false, false]
+        );
+        assert_eq!(
+            nested.column(0).as_ref(),
+            &Int64Array::from(vec![Some(7), None, None, None, None])
+        );
+        assert_eq!(batch.column(3).logical_null_count(), 5);
+        Ok(())
+    }
+
+    #[test]
+    fn project_returns_logical_values_from_nullable_struct() -> KernelResult<()> {
+        let nested = Expression::struct_with_nullability_from(
+            [col!("value")],
+            Expression::from(Predicate::eq(col!("value"), lit(7i64))),
+        );
+        let plan = PlanBuilder::values(
+            schema_ref! { not_null "value": LONG },
+            vec![vec![99i64.into()], vec![7i64.into()]],
+        )?
+        .project(
+            Expression::struct_from([nested]),
+            schema_ref! { nullable "nested": { nullable "value": LONG } },
+        )?
+        .project(
+            Expression::struct_from([col!("nested.value")]),
+            schema_ref! { nullable "value": LONG },
+        )?
+        .build()?;
+        let output = SyncPlanExecutor::default().eval_plan(plan, None)?;
+        let values = output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(values.iter().collect::<Vec<_>>(), [None, Some(7)]);
         Ok(())
     }
 
@@ -951,9 +1186,11 @@ mod tests {
         let error = scoped
             .execute_and_retain("wrong-schema", plan)
             .expect_err("a mismatched plan schema must be rejected");
-        assert!(error
-            .to_string()
-            .contains("record batch schema does not match"));
+        assert!(
+            error
+                .to_string()
+                .contains("record batch schema does not match")
+        );
         assert!(scoped.relation_store.lock().unwrap().is_empty());
         Ok(())
     }
@@ -967,14 +1204,14 @@ mod tests {
             schema.clone(),
             vec![vec![1i64.into()], vec![2i64.into()], vec![3i64.into()]],
         )?
-        .filter(Predicate::gt(col!("id"), lit(1i64)))?
+        .filter(Predicate::from_expr(expr!(col("id") > 1i64)))?
         .build()?;
         let first = scoped.execute_and_retain("filtered", source)?;
         assert_eq!(first.schema(), &schema);
         assert!(first.id().starts_with("filtered-"));
 
         let second_source = PlanBuilder::relation_source(first.clone())
-            .filter(Predicate::lt(col!("id"), lit(3i64)))?
+            .filter(Predicate::from_expr(expr!(col("id") < 3i64)))?
             .build()?;
         let second = scoped.execute_and_retain("refiltered", second_source)?;
         assert_ne!(first.id(), second.id());
@@ -1025,9 +1262,11 @@ mod tests {
             .execute_op(Operation::QueryPlan(unscoped))
             .err()
             .expect("the unscoped executor must reject a scope's relation");
-        assert!(error
-            .to_string()
-            .contains("requires an executor that can store relations"));
+        assert!(
+            error
+                .to_string()
+                .contains("requires an executor that can store relations")
+        );
 
         let weak_column = {
             let retained_relations = first_scope.relation_store.lock().unwrap();
@@ -1105,10 +1344,7 @@ mod tests {
     fn present_dv() -> Scalar {
         Scalar::Struct(
             StructData::try_new(
-                DeletionVectorDescriptor::to_schema()
-                    .fields()
-                    .cloned()
-                    .collect(),
+                DeletionVectorDescriptor::schema_ref().clone(),
                 vec![
                     Scalar::from("i"),
                     Scalar::from("inline"),

@@ -1,9 +1,10 @@
 //! Integration tests for parsed-stats output.
 
+use delta_kernel::Snapshot;
 use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, STATS_PARSED};
 use delta_kernel::arrow::array::{
-    Array, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int16Array, Int32Array,
-    Int64Array, Int8Array, RecordBatch, StringArray, StructArray,
+    Array, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
 };
 use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::arrow::datatypes::DataType as ArrowDataType;
@@ -11,10 +12,9 @@ use delta_kernel::arrow::util::display::{ArrayFormatter, FormatOptions};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::scan::StatsOptions;
 use delta_kernel::table_features::ColumnMappingMode;
-use delta_kernel::Snapshot;
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
-use test_utils::table_builder::{unpartitioned, version_latest, FeatureSet, LogState, TableConfig};
+use test_utils::table_builder::{FeatureSet, LogState, TableConfig, unpartitioned, version_latest};
 use test_utils::{get_column, test_context};
 
 /// Validate that JSON stats object values match the corresponding parsed struct array.

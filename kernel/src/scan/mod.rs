@@ -1,4 +1,38 @@
-//! Functionality to create and execute scans (reads) over data stored in a delta table
+//! Build and execute reads over a Delta table snapshot.
+//!
+//! Start with [`Snapshot::scan_builder`](crate::Snapshot::scan_builder) to create a
+//! [`ScanBuilder`]. Configure the projected
+//! columns with [`ScanBuilder::with_schema`] and optional data skipping with
+//! [`ScanBuilder::with_predicate`], then call [`ScanBuilder::build`] to obtain a [`Scan`].
+//! The scan reads the table version captured by the snapshot.
+//!
+//! Choose an execution path based on who will read the data files:
+//!
+//! - [`Scan::execute`] reads files through the supplied [`Engine`], applies the per-file transforms
+//!   and deletion vectors, and returns batches of logical table data.
+//! - [`Scan::scan_metadata`] returns [`ScanMetadata`] for connectors that schedule their own reads.
+//!   Use [`ScanMetadata::visit_scan_files`] to consume file metadata. The connector handles file
+//!   reads, physical-to-logical transforms, and deletion vectors as described in [`state`].
+//!
+//! # Example
+//!
+//! Read every column using an existing snapshot and engine:
+//!
+//! ```no_run
+//! # use std::sync::Arc;
+//! # use delta_kernel::{Engine, Result, SnapshotRef};
+//! # fn read(snapshot: SnapshotRef, engine: Arc<dyn Engine>) -> Result<()> {
+//! let scan = snapshot.scan_builder().build()?;
+//! for batch in scan.execute(engine)? {
+//!     let batch = batch?;
+//!     println!("Read {} rows", batch.len());
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The [scan guide](https://docs.delta.io/kernel/rust/reading/building_a_scan.html) develops the
+//! connector workflow with projection, predicates, and execution examples.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -13,14 +47,15 @@ use url::Url;
 use self::data_skipping::as_checkpoint_skipping_predicate;
 use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
 use crate::actions::deletion_vector::{
-    deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
+    DeletionVectorDescriptor, deletion_treemap_to_bools, split_vector,
 };
-use crate::actions::{Add, ADD_FIELD, ADD_NAME, REMOVE_FIELD, SIDECAR_FIELD};
+use crate::actions::{ADD_FIELD, ADD_NAME, Add, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
-#[cfg(feature = "declarative-plans")]
-use crate::checkpoint::CheckpointShape;
+use crate::engine::CancellableEngine;
 use crate::engine_data::FilteredEngineData;
-use crate::expressions::{column_name, ColumnName, ExpressionRef, Predicate, PredicateRef};
+use crate::expressions::{
+    ColumnName, ExpressionRef, MapToStructOptions, Predicate, PredicateRef, column_name,
+};
 use crate::kernel_predicates::{
     DefaultKernelPredicateEvaluator, EmptyColumnResolver, KernelPredicateEvaluator as _,
 };
@@ -33,21 +68,21 @@ use crate::parallel::sequential_phase::SequentialPhase;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::plan::Plan;
 use crate::scan::log_replay::{
-    ScanLogReplayProcessor, BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME,
-    DEFAULT_ROW_COMMIT_VERSION_NAME,
+    BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME,
+    ScanLogReplayProcessor,
 };
 use crate::scan::metrics::ScanMetrics;
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
-    lazy_schema_ref, schema_ref, ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef,
-    StructField, StructType, ToSchema as _,
+    ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField, StructType,
+    ToSchema as _, lazy_schema_ref, schema_ref,
 };
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, Operation};
-use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
-use crate::utils::{require, FoldWithOption as _, IteratorExt};
+use crate::transforms::{ExpressionTransform, SchemaTransform, transform_output_type};
+use crate::utils::{FoldWithOption as _, IteratorExt, require};
 use crate::{
-    Engine, EngineData, FileMeta, KernelError, KernelResult, KernelResultIteratorStatic,
+    Engine, EngineData, Error, FileMeta, KernelError, KernelResult, KernelResultIterator, Result,
     SnapshotRef, Version,
 };
 
@@ -108,28 +143,31 @@ pub use crate::parallel::parallel_scan_metadata::{
 };
 
 /// Configures structured-stats output and JSON synthesis in scan metadata.
-/// Existing JSON passes through for commits and checkpoints without compatible structured stats
-/// unless stats are disabled.
+/// Imperative scans pass existing JSON through for commits and checkpoints without compatible
+/// structured stats unless stats are disabled.
+///
+/// Declarative metadata plans emit JSON stats only when JSON output is requested. JSON requests
+/// without structured output disable stats and partition pruning; statically-unsatisfiable
+/// predicates still skip the scan. The data-row predicate and imperative metadata path are
+/// unchanged.
 ///
 /// Most consumers should pick one of the named constructors:
 /// - [`Self::json_only`] (default) -- JSON stats only.
-/// - [`Self::all_struct`] -- all struct stats without JSON synthesis. Compatible checkpoints omit
-///   JSON stats; commits and checkpoints without compatible structured stats pass existing JSON
-///   through.
+/// - [`Self::all_struct`] -- all struct stats without JSON synthesis. Declarative plans omit JSON;
+///   imperative scans pass existing JSON through except on compatible checkpoints.
 /// - [`Self::struct_columns`] -- selected struct stats with the same JSON behavior.
 /// - [`Self::all`] -- both representations.
 /// - [`Self::none`] -- neither, AND disables internal data skipping. Unlike the other four
 ///   constructors, this is the only one that stops kernel from reading stats from parquet at all.
 #[derive(Clone, Debug)]
 pub struct StatsOptions {
-    /// Whether to surface JSON stats on parsed-stats checkpoints (where the
-    /// checkpoint writes stats only as a struct, not as JSON). When true, kernel
-    /// re-serializes the struct stats into JSON so engines that read JSON stats
-    /// see a populated value; when false, JSON stats are left null on such
-    /// checkpoints and the engine consumes the struct stats directly.
+    /// Whether to emit JSON stats in declarative metadata plans, synthesizing them from compatible
+    /// structured stats when the source has no JSON. When false, declarative plans omit JSON stats
+    /// from every source.
     ///
-    /// No effect on tables that write JSON stats directly, or on commit JSON --
-    /// the existing JSON is passed through regardless.
+    /// Imperative scans use this flag only for synthesis from structured checkpoint stats;
+    /// existing JSON from commits and checkpoints without compatible structured stats passes
+    /// through unless stats are disabled.
     pub(crate) synthesize_json: bool,
 
     /// Which struct stats columns to request in `stats_parsed`.
@@ -153,7 +191,7 @@ pub struct StatsOptions {
 /// stats, for example because another writer generated them.
 #[derive(Clone, Debug)]
 pub enum StructStats {
-    /// Don't emit `stats_parsed`. Kernel still reads predicate-referenced stats for
+    /// Don't emit `stats_parsed`. Imperative scans still read predicate-referenced stats for
     /// internal data skipping unless the caller picked [`StatsOptions::none`], which
     /// disables stats reading entirely.
     None,
@@ -194,9 +232,9 @@ impl StatsOptions {
         Self::default()
     }
 
-    /// All struct stats without JSON synthesis. Compatible checkpoints omit JSON stats and avoid
-    /// per-batch `ToJson`; commits and checkpoints without compatible structured stats pass
-    /// existing JSON through.
+    /// All struct stats without JSON synthesis. Declarative metadata plans omit JSON stats.
+    /// Imperative scans omit JSON for compatible checkpoints and otherwise pass existing JSON
+    /// through.
     pub fn all_struct() -> Self {
         Self {
             synthesize_json: false,
@@ -207,7 +245,8 @@ impl StatsOptions {
         }
     }
 
-    /// Returns struct stats for only `cols`, regardless of the table's indexed set.
+    /// Returns struct stats for only `cols`, regardless of the table's indexed set, with the JSON
+    /// behavior of [`Self::all_struct`].
     /// Predicate-only statistics may still be read for data skipping but are not returned.
     ///
     /// Names that cannot be resolved return an error. Missing per-file values read as NULL and do
@@ -220,7 +259,8 @@ impl StatsOptions {
         }
     }
 
-    /// Returns struct stats for all indexed columns and `extra_indexed`.
+    /// Returns struct stats for all indexed columns and `extra_indexed`, with the JSON behavior of
+    /// [`Self::all_struct`].
     ///
     /// Extra-indexed columns bypass the table's configured indexed set. Missing on-disk stats read
     /// as NULL and do not prune; names that cannot be resolved are ignored with a warning.
@@ -246,8 +286,8 @@ impl StatsOptions {
     /// when a predicate is set). Kernel reads no stats columns from parquet at all.
     /// Use when the engine handles its own pruning.
     ///
-    /// To get internal predicate-based skipping without `stats_parsed` output, use
-    /// [`StatsOptions::default`] (JSON only) or set `struct_stats` to `AllIndexed`/`Columns`.
+    /// To get internal predicate-based skipping, use [`Self::all_struct`]. Imperative scans also
+    /// support skipping without `stats_parsed` output via [`Self::json_only`].
     pub fn none() -> Self {
         Self {
             synthesize_json: false,
@@ -305,6 +345,27 @@ impl StatsOptions {
         self
     }
 
+    /// JSON synthesis must preserve native stats outside the requested structured output.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn json_synthesis_schema(
+        &self,
+        config: &TableConfiguration,
+    ) -> KernelResult<Option<SchemaRef>> {
+        if !self.synthesize_json {
+            return Ok(None);
+        }
+        let columns = config
+            .physical_data_schema_without_partition_columns()
+            .leaves(None);
+        let builder = config
+            .stats_schema_builder()
+            .with_required_physical_columns(Some(columns.as_ref().0))
+            .with_variant_min_max(self.variant_min_max);
+        #[cfg(feature = "geo-type-in-dev")]
+        let builder = builder.with_geometry_min_max(self.geometry_min_max);
+        builder.build().map(Some)
+    }
+
     /// Checks that the options form a supported combination.
     ///
     /// # Errors
@@ -337,19 +398,31 @@ impl StatsOptions {
     }
 }
 
-/// Engine-facing partition value options. Pass to [`ScanBuilder::with_partition_values`] to
-/// declare whether scan metadata output includes the typed `partitionValues_parsed` struct
-/// alongside the raw string map (`fileConstantValues.partitionValues`), which is always present.
+/// Where Kernel got a typed column in a [`ScanMetadata`] batch.
 ///
-/// When the typed struct is requested, scan metadata output gains a top-level
-/// `partitionValues_parsed` struct column with one typed nullable field per partition column
-/// (physical names, table partition-column order). On non-partitioned tables the column is
-/// omitted. Values come directly from the checkpoint's native `partitionValues_parsed` column
-/// when present, otherwise from parsing the string map.
+/// See [`ScanMetadata::partition_values_source`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParsedColumnSource {
+    /// Read from the checkpoint's own typed column. `TIMESTAMP` values are fixed instants that the
+    /// timezone setting does not change.
+    Checkpoint,
+    /// Built by Kernel from the raw action field. For partition values this is the
+    /// `add.partitionValues` string map, so offset-less `TIMESTAMP` values depend on
+    /// [`PartitionValuesOptions::with_timestamp_timezone`].
+    Derived,
+}
+
+/// Engine-facing partition value options. Pass to scan builders, such as [`ScanBuilder`] and
+/// [`crate::incremental_scan::IncrementalScanBuilder`], to control partition-column related
+/// behavior.
+///
+/// Note: Not all scans support every option. See each scan builder's documentation for limitations.
 #[derive(Clone, Debug, Default)]
 pub struct PartitionValuesOptions {
     /// Whether to emit the typed `partitionValues_parsed` struct column.
     pub(crate) parsed_struct: bool,
+    /// Timezone used to interpret offset-less `TIMESTAMP` partition strings.
+    pub(crate) timestamp_timezone: Option<String>,
 }
 
 impl PartitionValuesOptions {
@@ -358,16 +431,64 @@ impl PartitionValuesOptions {
         Self::default()
     }
 
-    /// Emit the typed `partitionValues_parsed` struct alongside the raw string map. Lets engines
-    /// consume `partitionValues_parsed` directly instead of parsing the string map per row.
+    /// When this is called, the read output gains a `partitionValues_parsed` struct column with one
+    /// typed nullable field per partition column, using physical names. Fields follow table schema
+    /// order restricted to partition columns, which can differ from the order in metadata's
+    /// `partitionColumns`.
+    /// On non-partitioned tables the column is omitted. Values come directly from the checkpoint's
+    /// native `partitionValues_parsed` column when present and compatible, otherwise from parsing
+    /// the string map. [`ScanMetadata::partition_values_source`] reports which one a batch used.
     pub fn with_struct() -> Self {
         Self {
             parsed_struct: true,
+            timestamp_timezone: None,
         }
+    }
+
+    /// Interpret offset-less `TIMESTAMP` values in `add.partitionValues` using
+    /// `timestamp_timezone` when no compatible `add.partitionValues_parsed` exists.
+    /// The provided timezone must match the timezone used to write those offset-less values.
+    ///
+    /// `timestamp_timezone` must be an IANA timezone identifier recognized by Kernel, a normalized
+    /// fixed offset in `+HH:MM[:SS]` or `-HH:MM[:SS]` form, or `Z` for UTC. The exact uppercase IDs
+    /// `EST`, `MST`, and `HST` use fixed offsets `-05:00`, `-07:00`, and `-10:00`, respectively.
+    /// Full IANA region names preserve historical clock transitions. An explicit offset or timezone
+    /// in a partition value takes precedence. This option applies to partition pruning in full and
+    /// incremental scans and to returned parsed partition values in full scans. It does not affect
+    /// `TIMESTAMP_NTZ`.
+    ///
+    /// For example, if a `TIMESTAMP` partition column `ts` has
+    /// `add.partitionValues["ts"] = "2024-01-15 12:30:45"`, setting `timestamp_timezone` to
+    /// `"America/Los_Angeles"` (UTC-08:00 on that date) interprets it as `2024-01-15T20:30:45Z`.
+    ///
+    /// Note: The [Delta protocol] requires interpreting offset-less timestamps in the writer's
+    /// timezone, but does not record that timezone. As a result, the timezone can only be supplied
+    /// by the connector, and Kernel cannot verify that it matches the writer's timezone.
+    ///
+    /// For full scans, Kernel does not yet support setting a timezone for row transforms on tables
+    /// with `TIMESTAMP` partition columns, so this option omits them as if
+    /// [`ScanBuilder::without_row_transforms`] were set on those tables.
+    ///
+    /// Without this option, Kernel interprets offset-less timestamps as UTC. Invalid timezones
+    /// cause errors only when Kernel evaluates an expression with the timezone, not when this
+    /// option is set or the scan is built.
+    ///
+    /// [Delta protocol]:
+    /// https://github.com/delta-io/delta/blob/master/PROTOCOL.md#partition-value-serialization
+    // TODO(#3609): Row transforms always parse `addFile.partitionValues` instead of using
+    // compatible `partitionValues_parsed` from checkpoints and are not timezone-aware.
+    // Support using those parsed values and enable timezone support.
+    pub fn with_timestamp_timezone(mut self, timestamp_timezone: impl Into<String>) -> Self {
+        self.timestamp_timezone = Some(timestamp_timezone.into());
+        self
     }
 }
 
 /// Builder to scan a snapshot of a table.
+///
+/// See the [scan guide] for the projection, predicate, and execution workflow.
+///
+/// [scan guide]: https://docs.delta.io/kernel/rust/reading/building_a_scan.html
 pub struct ScanBuilder {
     snapshot: SnapshotRef,
     logical_read_schema: Option<SchemaRef>,
@@ -375,7 +496,7 @@ pub struct ScanBuilder {
     stats: StatsOptions,
     correlation_id: Option<Arc<str>>,
     without_row_transforms: bool,
-    partition_values: PartitionValuesOptions,
+    partition_values_options: PartitionValuesOptions,
     cancellation_token: Option<CancellationTokenRef>,
 }
 
@@ -387,7 +508,7 @@ impl std::fmt::Debug for ScanBuilder {
             .field("stats", &self.stats)
             .field("correlation_id", &self.correlation_id)
             .field("without_row_transforms", &self.without_row_transforms)
-            .field("partition_values", &self.partition_values)
+            .field("partition_values_options", &self.partition_values_options)
             .finish()
     }
 }
@@ -402,7 +523,7 @@ impl ScanBuilder {
             stats: StatsOptions::default(),
             correlation_id: None,
             without_row_transforms: false,
-            partition_values: PartitionValuesOptions::default(),
+            partition_values_options: PartitionValuesOptions::default(),
             cancellation_token: None,
         }
     }
@@ -441,6 +562,12 @@ impl ScanBuilder {
     /// A predicate alone enables internal data skipping; kernel does not surface stats
     /// to the engine by default. Use [`with_stats`](Self::with_stats) if the engine
     /// also wants stats in the scan metadata output.
+    ///
+    /// String comparisons use UTF-8 binary semantics, including on columns with `__COLLATIONS`.
+    /// Kernel's pruning ignores `statsWithCollation`. For collation-aware queries, the connector
+    /// must derive a conservative predicate whose TRUE rows include every match of the original
+    /// filter, and apply the original filter after reading. Unsupported comparisons must not
+    /// discard rows through Kernel or underlying-reader pushdown.
     ///
     /// [`StructType::add_metadata_column`]: crate::schema::StructType::add_metadata_column
     pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {
@@ -506,11 +633,17 @@ impl ScanBuilder {
 
     /// Configure partition value output for the scan. See [`PartitionValuesOptions`].
     ///
-    /// Defaults to [`PartitionValuesOptions::default`] (string map only). Engines that
-    /// consume `partitionValues_parsed` directly should pass
-    /// [`PartitionValuesOptions::with_struct`] to also emit the typed struct column.
-    pub fn with_partition_values(mut self, partition_values: PartitionValuesOptions) -> Self {
-        self.partition_values = partition_values;
+    /// Defaults to [`PartitionValuesOptions::default`] (string map only).
+    ///
+    /// If `with_struct` is requested for a partitioned table, `scan_files` includes
+    /// `partitionValues_parsed` as a top-level sibling of `fileConstantValues`. The raw
+    /// `fileConstantValues.partitionValues` map remains present. See
+    /// [`PartitionValuesOptions::with_struct`] for other output details.
+    pub fn with_partition_values(
+        mut self,
+        partition_values_options: PartitionValuesOptions,
+    ) -> Self {
+        self.partition_values_options = partition_values_options;
         self
     }
 
@@ -539,7 +672,7 @@ impl ScanBuilder {
     /// [`Scan`] type itself can be used to fetch the files and associated metadata required to
     /// perform actual data reads.
     #[tracing::instrument(name = "scan_builder.build", skip_all, fields(enable_call_frame), err)]
-    pub fn build(self) -> KernelResult<Scan> {
+    pub fn build(self) -> Result<Scan> {
         // Predicates may reference columns outside self.logical_read_schema, so resolve against the
         // full table schema
         let table_schema = self.snapshot.schema();
@@ -548,10 +681,10 @@ impl ScanBuilder {
         // counts downstream and panics in the arrow layer. Users must populate the
         // schema with ALTER TABLE ADD COLUMN before scanning.
         if table_schema.num_fields() == 0 {
-            return Err(KernelError::generic(
+            return Err(Error::Kernel(KernelError::generic(
                 "Cannot scan Delta table with empty schema; use ALTER TABLE ADD COLUMN \
                  to add at least one column before scanning",
-            ));
+            )));
         }
 
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
@@ -569,13 +702,17 @@ impl ScanBuilder {
             self.snapshot.table_configuration(),
             self.predicate,
             &self.stats,
-            &self.partition_values,
+            &self.partition_values_options,
             (), // No classifier, default is for scans
         )?;
 
         // Retain the transform spec but skip building per-file expressions, which also skips the
         // per-row partition-value parse done only to build them.
-        state_info.skip_row_transforms = self.without_row_transforms;
+        state_info.skip_row_transforms = self.without_row_transforms
+            || table_requires_timestamp_timezone_support(
+                self.snapshot.table_configuration(),
+                &self.partition_values_options,
+            );
 
         let commits_since_checkpoint = self.snapshot.log_segment().commits_since_checkpoint();
         if self.snapshot.skipped_new_checkpoints() && commits_since_checkpoint > 0 {
@@ -593,7 +730,7 @@ impl ScanBuilder {
             state_info: Arc::new(state_info),
             stats: self.stats,
             correlation_id: self.correlation_id,
-            partition_values: self.partition_values,
+            partition_values_options: self.partition_values_options,
             cancellation_token: self.cancellation_token,
         })
     }
@@ -798,9 +935,9 @@ pub fn get_transform_for_row(
     transforms.get(row).cloned().flatten()
 }
 
-/// [`ScanMetadata`] contains (1) a batch of [`FilteredEngineData`] specifying data files to be
-/// scanned and (2) a vector of transforms (one transform per scan file) that must be applied to the
-/// data read from those files.
+/// [`ScanMetadata`] contains a batch of [`FilteredEngineData`] specifying data files to be scanned,
+/// the transforms (one per scan file) that must be applied to the data read from those files, and
+/// the source of the batch's parsed partition values (see [`Self::partition_values_source`]).
 pub struct ScanMetadata {
     /// Filtered engine data with one row per file to scan (and only selected rows should be
     /// scanned)
@@ -816,20 +953,54 @@ pub struct ScanMetadata {
     ///   [`Scan::logical_schema()`].
     /// - `None`: No transformation is needed; the data is already in the correct logical form.
     ///
+    /// If row transforms were disabled through [`ScanBuilder::without_row_transforms`] or
+    /// [`PartitionValuesOptions::with_timestamp_timezone`] on a table with `TIMESTAMP` partition
+    /// columns, this vector is empty and the connector must reconstruct logical rows itself.
+    /// Otherwise, an absent transform means the data is already in the correct logical form.
+    ///
     /// Note: This vector can be indexed by row number, as rows masked by the selection vector will
     /// have corresponding entries that will be `None`.
     pub scan_file_transforms: Vec<Option<ExpressionRef>>,
+
+    /// Set by log replay from the evaluator that produced `scan_files`. See
+    /// [`Self::partition_values_source`].
+    partition_values_source: Option<ParsedColumnSource>,
 }
 
 impl ScanMetadata {
+    /// Where this batch's `partitionValues_parsed` column came from, or `None` when the batch has
+    /// no such column.
+    ///
+    /// On partitioned tables, Kernel emits the column when [`PartitionValuesOptions::with_struct`]
+    /// is set, or when the scan predicate references a partition column and stats are not skipped.
+    /// A batch never mixes sources: checkpoint batches report `Checkpoint` when the checkpoint has
+    /// a compatible native `partitionValues_parsed` column, and `Derived` otherwise; commit
+    /// batches always report `Derived`. `parallel_scan_metadata` always reports `Derived`.
+    /// `Scan::scan_metadata_from` reports `Derived` for the cached rows and later commits; when the
+    /// checkpoint is newer than `existing_version`, it falls back to a full scan that follows the
+    /// rules above.
+    ///
+    /// The emitted field set and its source depend on this scan's configuration: a predicate-only
+    /// scan can report `Checkpoint` for a file that a `with_struct` scan reports as `Derived`.
+    /// [`ParsedColumnSource::Checkpoint`] values are fixed instants;
+    /// [`ParsedColumnSource::Derived`] values of offset-less `TIMESTAMP` strings depend on
+    /// [`PartitionValuesOptions::with_timestamp_timezone`]. A connector that caches values across
+    /// timezones can reuse a cached `Checkpoint` value only when the current batch also reports
+    /// `Checkpoint` for the same emitted field set.
+    pub fn partition_values_source(&self) -> Option<ParsedColumnSource> {
+        self.partition_values_source
+    }
+
     fn try_new(
         data: Box<dyn EngineData>,
         selection_vector: Vec<bool>,
         scan_file_transforms: Vec<Option<ExpressionRef>>,
+        partition_values_source: Option<ParsedColumnSource>,
     ) -> KernelResult<Self> {
         Ok(Self {
             scan_files: FilteredEngineData::try_new(data, selection_vector)?,
             scan_file_transforms,
+            partition_values_source,
         })
     }
 }
@@ -842,19 +1013,23 @@ impl HasSelectionVector for ScanMetadata {
 
 /// The result of building a scan over a table. This can be used to get the actual data from
 /// scanning the table.
+///
+/// See the [scan guide] for choosing between the execution APIs.
+///
+/// [scan guide]: https://docs.delta.io/kernel/rust/reading/building_a_scan.html
 pub struct Scan {
     snapshot: SnapshotRef,
     state_info: Arc<StateInfo>,
     stats: StatsOptions,
     correlation_id: Option<Arc<str>>,
-    partition_values: PartitionValuesOptions,
+    partition_values_options: PartitionValuesOptions,
     /// Scan-local token for cached metadata checks and I/O; `None` retains engine I/O
     /// cancellation.
     cancellation_token: Option<CancellationTokenRef>,
 }
 
 /// Builds the consumer-visible stats schemas without predicate-only fields.
-fn build_stats_output_schemas(
+pub(crate) fn build_stats_output_schemas(
     table_configuration: &TableConfiguration,
     stats: &StatsOptions,
 ) -> KernelResult<Option<StatsOutputSchemas>> {
@@ -939,7 +1114,8 @@ impl Scan {
     /// Build the partition-value read options passed to [`ScanLogReplayProcessor`].
     fn partition_values_options(&self) -> log_replay::ScanPartitionValuesOptions {
         log_replay::ScanPartitionValuesOptions {
-            parsed_struct: self.partition_values.parsed_struct,
+            parsed_struct: self.partition_values_options.parsed_struct,
+            timestamp_timezone: self.partition_values_options.timestamp_timezone.clone(),
         }
     }
 
@@ -1008,13 +1184,19 @@ impl Scan {
     ///   row at index `i` in the above data, if an expression exists at index `i` in the `Vec`, the
     ///   associated expression _must_ be applied to the data read from the file specified by the
     ///   row. The resultant schema for this expression is guaranteed to be
-    ///   [`Self::logical_schema()`]. If the item at index `i` in this `Vec` is `None`, or if the
-    ///   `Vec` contains fewer than `i` elements, no expression need be applied and the data read
-    ///   from disk is already in the correct logical state.
+    ///   [`Self::logical_schema()`]. Some entries in this `Vec` may be `None`, and the whole `Vec`
+    ///   may be empty. See [`ScanMetadata::scan_file_transforms`] for details of these cases.
     pub fn scan_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> KernelResult<impl Iterator<Item = KernelResult<ScanMetadata>>> {
+    ) -> KernelResult<impl KernelResultIterator<ScanMetadata> + use<>> {
+        self.with_cancellable_engine(engine, |engine| self.scan_metadata_with_engine(engine))
+    }
+
+    fn scan_metadata_with_engine(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<impl KernelResultIterator<ScanMetadata> + use<>> {
         let actions_with_checkpoint_info = self.replay_for_scan_metadata(engine)?;
         self.scan_metadata_inner(engine, actions_with_checkpoint_info)
     }
@@ -1061,6 +1243,13 @@ impl Scan {
     /// * `existing_version` - Table version the provided data was read from.
     /// * `existing_data` - Existing processed scan metadata with all selection vectors applied.
     /// * `existing_predicate` - The predicate used by the previous scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if [`PartitionValuesOptions::with_timestamp_timezone`] was set on a table
+    /// with `TIMESTAMP` partition columns,
+    /// if `existing_version` exceeds the snapshot version, or if scan metadata cannot be
+    /// restored or read.
     #[allow(unused)]
     #[internal_api]
     pub(crate) fn scan_metadata_from(
@@ -1068,8 +1257,38 @@ impl Scan {
         engine: &dyn Engine,
         existing_version: Version,
         existing_data: impl IntoIterator<Item = Box<dyn EngineData>, IntoIter: Send + 'static>,
+        existing_predicate: Option<PredicateRef>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<ScanMetadata>>> {
+        self.with_cancellable_engine(engine, |engine| {
+            self.scan_metadata_from_with_engine(
+                engine,
+                existing_version,
+                existing_data,
+                existing_predicate,
+            )
+        })
+    }
+
+    fn scan_metadata_from_with_engine(
+        &self,
+        engine: &dyn Engine,
+        existing_version: Version,
+        existing_data: impl IntoIterator<Item = Box<dyn EngineData>, IntoIter: Send + 'static>,
         _existing_predicate: Option<PredicateRef>,
-    ) -> KernelResult<KernelResultIteratorStatic<ScanMetadata>> {
+    ) -> KernelResult<Box<dyn KernelResultIterator<ScanMetadata>>> {
+        // TODO(#3609): scan_metadata_from does not reuse existing partitionValues_parsed
+        // from compatible checkpoints. Support reusing those values and enable connector-supplied
+        // timezone support.
+        require!(
+            !table_requires_timestamp_timezone_support(
+                self.snapshot.table_configuration(),
+                &self.partition_values_options,
+            ),
+            KernelError::unsupported(
+                "Kernel does not yet support with_timestamp_timezone in scan_metadata_from on \
+                 tables with TIMESTAMP partition columns; use scan_metadata instead"
+            )
+        );
         // TODO(#966): validate that the current predicate is compatible with the hint predicate.
         let existing_data = existing_data.into_iter();
         // Cached metadata bypasses engine handlers, so kernel must poll cancellation while
@@ -1128,6 +1347,14 @@ impl Scan {
         // TODO: we may be able to apply heuristics or other logic to try and fetch missing deltas
         // from the log.
         if matches!(log_segment.checkpoint_version, Some(v) if v > existing_version) {
+            return Ok(Box::new(self.scan_metadata_with_engine(engine)?));
+        }
+        // Likewise for an AMT checkpoint action: commits at or below its version may no longer be
+        // listed, so a hint from before it cannot be advanced commit by commit.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if let Some(checkpoint) = self.snapshot.latest_checkpoint_action(engine)?
+            && Version::try_from(checkpoint.version()).is_ok_and(|v| v > existing_version)
+        {
             return Ok(Box::new(self.scan_metadata(engine)?));
         }
 
@@ -1157,7 +1384,7 @@ impl Scan {
             meta_predicate,
             physical_stats_read_schema,
             None,
-            self.cancellation_token.as_ref(),
+            !self.snapshot.has_adaptive_metadata(),
         )?;
         // Only the cached suffix needs a kernel-side check. The engine owns cancellation for the
         // newly read action prefix.
@@ -1177,13 +1404,29 @@ impl Scan {
         )?))
     }
 
-    fn scan_metadata_inner(
+    fn with_cancellable_engine<T>(
         &self,
         engine: &dyn Engine,
-        actions_with_checkpoint_info: ActionsWithCheckpointInfo<
-            impl Iterator<Item = KernelResult<ActionsBatch>> + Send,
-        >,
-    ) -> KernelResult<impl Iterator<Item = KernelResult<ScanMetadata>> + Send> {
+        operation: impl FnOnce(&dyn Engine) -> T,
+    ) -> T {
+        let scoped_engine = self
+            .cancellation_token
+            .clone()
+            .map(|token| CancellableEngine::new(engine, token));
+        let engine = scoped_engine
+            .as_ref()
+            .map_or(engine, |engine| engine as &dyn Engine);
+        operation(engine)
+    }
+
+    fn scan_metadata_inner<I>(
+        &self,
+        engine: &dyn Engine,
+        actions_with_checkpoint_info: ActionsWithCheckpointInfo<I>,
+    ) -> KernelResult<impl KernelResultIterator<ScanMetadata> + use<I>>
+    where
+        I: KernelResultIterator<ActionsBatch>,
+    {
         let start = Instant::now();
         let operation_id = MetricId::new();
         let is_catalog_managed = self.snapshot.table_configuration().is_catalog_managed();
@@ -1224,8 +1467,12 @@ impl Scan {
     #[cfg(feature = "declarative-plans")]
     /// Builds a declarative plan that produces the scan's live `add` actions.
     ///
-    /// `engine` supplies the plan executor used to inspect checkpoint shape. Returns `None` when
-    /// no Delta metadata matches this scan.
+    /// Planning shares cached checkpoint metadata with
+    /// [`crate::snapshot::SnapshotReader::get_checkpoint_info`], resolving the complete layout and
+    /// leaf schema on first use or waiting for in-progress resolution. Manifest plans use the
+    /// resolved sidecar list. A CRC at least as new as the checkpoint with `allFiles`, or a
+    /// statically empty scan, skips checkpoint discovery. Returns `None` when no Delta metadata
+    /// matches this scan.
     ///
     /// This method returns the metadata plan without executing it. A connector that consumes the
     /// resulting live `add` rows may run the plan through the generic
@@ -1235,8 +1482,10 @@ impl Scan {
     ///
     /// # Errors
     ///
-    /// Returns an error if the engine provides no [`PlanExecutor`](crate::plans::PlanExecutor),
-    /// or if log discovery, checkpoint inspection, or plan construction fails.
+    /// Returns an error if [`PartitionValuesOptions::with_timestamp_timezone`] was set on a table
+    /// with `TIMESTAMP` partition columns, if planning requires a
+    /// [`PlanExecutor`](crate::plans::PlanExecutor) that the engine does not provide, or if log
+    /// discovery, checkpoint inspection, or plan construction fails.
     #[tracing::instrument(
         name = "scan.declarative_metadata_scan_plan",
         skip_all,
@@ -1247,28 +1496,67 @@ impl Scan {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<Plan>> {
-        // Resolve the checkpoint shape once. Retain the leaf schema only when parsed metadata is
-        // needed for output or pruning.
-        let plan_executor = engine.require_plan_executor()?;
-        let needs_leaf_schema = self.state_info.physical_stats_read_schema().is_some()
-            || self.state_info.physical_partition_schema.is_some();
-        let shape = if needs_leaf_schema {
-            CheckpointShape::try_new_with_leaf_schema(plan_executor.as_ref(), &self.snapshot)?
-        } else {
-            CheckpointShape::try_new(plan_executor.as_ref(), &self.snapshot)?
-        };
-        self.build_metadata_scan_plan(&shape)
+        // TODO(#3609): Support connector-supplied timezone in declarative metadata scans.
+        require!(
+            !table_requires_timestamp_timezone_support(
+                self.snapshot.table_configuration(),
+                &self.partition_values_options,
+            ),
+            KernelError::unsupported(
+                "Kernel does not yet support with_timestamp_timezone in \
+                 declarative_metadata_scan_plan on tables with TIMESTAMP partition columns; \
+                 use scan_metadata instead"
+            )
+        );
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        self.require_no_checkpoint_action(engine, "declarative_metadata_scan_plan")?;
+
+        // A statically-unsatisfiable predicate (e.g. `x > 10 AND FALSE`) skips the whole table.
+        if self.state_info.physical_predicate == PhysicalPredicate::StaticSkipAll {
+            return Ok(None);
+        }
+
+        let planner = scan_plan::MetadataPlanner::try_from_scan(self)?;
+        let base = scan_plan::MetadataReplayBase::try_new(&self.snapshot, engine)?;
+        self.build_metadata_scan_plan_with(base, planner)
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    /// Whether JSON stats synthesis requires the checkpoint's collation stats schema.
+    fn needs_collation_stats_schema(&self) -> bool {
+        self.stats.synthesize_json && self.snapshot.table_configuration().has_collations_feature()
     }
 
     // Factored out to facilitate testing
     fn replay_for_scan_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> KernelResult<
-        ActionsWithCheckpointInfo<impl Iterator<Item = KernelResult<ActionsBatch>> + Send>,
-    > {
+    ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
         let (checkpoint_schema, meta_predicate, physical_stats_read_schema) =
             self.checkpoint_read_options();
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if let Some(checkpoint) = self.snapshot.latest_checkpoint_action(engine)? {
+            // The scan's stats schema follows the snapshot's schema, which a later commit may have
+            // changed since the checkpoint's `content_stats` were written.
+            let stats_parsed = checkpoint.metadata().schema_string()
+                == self
+                    .snapshot
+                    .table_configuration()
+                    .metadata()
+                    .schema_string();
+            return self
+                .snapshot
+                .log_segment()
+                .read_actions_with_checkpoint_action(
+                    engine,
+                    &checkpoint,
+                    self.snapshot.table_root(),
+                    COMMIT_READ_SCHEMA.clone(),
+                    checkpoint_schema,
+                    physical_stats_read_schema,
+                    stats_parsed,
+                );
+        }
         // Checkpoints already represent reconciled state, so scans project only Add actions. This
         // derives `add.path IS NOT NULL` and allows readers to skip non-Add row groups.
         self.snapshot
@@ -1283,8 +1571,26 @@ impl Scan {
                     .physical_partition_schema
                     .as_ref()
                     .map(|s| s.as_ref()),
-                self.cancellation_token.as_ref(),
+                !self.snapshot.has_adaptive_metadata(),
             )
+    }
+
+    /// Errors when the snapshot has an AMT `checkpoint` action, which `entry_point` does not yet
+    /// read.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn require_no_checkpoint_action(
+        &self,
+        engine: &dyn Engine,
+        entry_point: &str,
+    ) -> KernelResult<()> {
+        match self.snapshot.latest_checkpoint_action(engine)? {
+            Some(checkpoint) => Err(KernelError::unsupported(format!(
+                "{entry_point} does not yet read the adaptiveMetadata checkpoint action at version \
+                 {}",
+                checkpoint.version()
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// Builds a predicate for row group skipping in checkpoint and sidecar parquet files.
@@ -1305,6 +1611,7 @@ impl Scan {
         let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate else {
             return None;
         };
+
         // Skipping needs either data-column stats or partition values to rewrite against; a
         // partition-only predicate has no `stats_parsed` schema, a data-only predicate on an
         // unpartitioned table has no partition schema.
@@ -1353,17 +1660,22 @@ impl Scan {
     /// distributed phases. Use [`scan_metadata`](Self::scan_metadata) for scan-local
     /// cancellation.
     ///
+    /// Returns an error if [`PartitionValuesOptions::with_timestamp_timezone`] was set on a table
+    /// with `TIMESTAMP` partition columns, since parallel scan metadata does not yet support
+    /// timestamp timezone.
+    /// Use [`scan_metadata`](Self::scan_metadata) for scans with a timestamp timezone.
+    ///
     /// # Example
     ///
     /// ```no_run
     /// # use std::sync::Arc;
-    /// # use delta_kernel::{Engine, KernelResult};
+    /// # use delta_kernel::Engine;
     /// # use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
     /// # use delta_kernel::Snapshot;
     /// # use url::Url;
     /// # use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
     /// # use delta_kernel::object_store::local::LocalFileSystem;
-    /// # fn main() -> KernelResult<()> {
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
     /// let table_root = Url::parse("file:///path/to/table")?;
     ///
@@ -1414,6 +1726,19 @@ impl Scan {
                  use scan_metadata for a cancellable scan",
             ));
         }
+        // TODO(#3609): Support connector-supplied timezone in parallel metadata scans.
+        require!(
+            !table_requires_timestamp_timezone_support(
+                self.snapshot.table_configuration(),
+                &self.partition_values_options,
+            ),
+            KernelError::unsupported(
+                "Kernel does not yet support with_timestamp_timezone in parallel_scan_metadata on \
+                 tables with TIMESTAMP partition columns; use scan_metadata"
+            )
+        );
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        self.require_no_checkpoint_action(engine.as_ref(), "parallel_scan_metadata")?;
         // For the sequential/parallel phase approach, we use a conservative checkpoint_info
         // since SequentialPhase reads checkpoints via CheckpointManifestReader which doesn't
         // currently support stats_parsed optimization.
@@ -1439,6 +1764,7 @@ impl Scan {
             self.snapshot.log_segment(),
             engine.clone(),
             checkpoint_read_schema,
+            !self.snapshot.has_adaptive_metadata(),
         )?;
 
         Ok(SequentialScanMetadata::new(
@@ -1452,19 +1778,21 @@ impl Scan {
     /// final table data. Generally connectors/engines will want to use [`Scan::scan_metadata`] so
     /// they can have more control over the execution of the scan.
     ///
-    /// Returns an error if the scan was built with [`ScanBuilder::without_row_transforms`]; use
-    /// [`Scan::scan_metadata`] instead.
+    /// Returns an error if row transforms were disabled through
+    /// [`ScanBuilder::without_row_transforms`] or
+    /// [`PartitionValuesOptions::with_timestamp_timezone`] on a table with `TIMESTAMP` partition
+    /// columns; use [`Scan::scan_metadata`] instead.
     // This calls [`Scan::scan_metadata`] to get an iterator of `ScanMetadata` actions for the scan,
     // and then uses the `engine`'s [`crate::ParquetHandler`] to read the actual table data.
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> KernelResult<impl Iterator<Item = KernelResult<Box<dyn EngineData>>>> {
+    ) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>> + use<>> {
         if self.state_info.skip_row_transforms {
             return Err(KernelError::unsupported(
-                "Scan::execute is not supported when the scan was built with \
-                 without_row_transforms; use scan_metadata for listing and read data with your \
-                 own reader",
+                "Scan::execute is not supported when row transforms are disabled by \
+                 without_row_transforms or by with_timestamp_timezone on a table with TIMESTAMP \
+                 partition columns; use scan_metadata for listing and read data with your own reader",
             ));
         }
 
@@ -1563,7 +1891,7 @@ impl Scan {
             // Iterator<Result<Iterator<Result<Box<dyn EngineData>>>>> to Iterator<Result<Result<Box<dyn EngineData>>>>
             .flatten_ok()
             // Iterator<Result<Result<Box<dyn EngineData>>>> to Iterator<Result<Box<dyn EngineData>>>
-            .map(|x| x?);
+            .map(KernelResult::flatten);
         Ok(result)
     }
 }
@@ -1608,4 +1936,34 @@ pub fn selection_vector(
     let storage = engine.storage_handler();
     let dv_treemap = descriptor.read(storage, table_root)?;
     Ok(deletion_treemap_to_bools(dv_treemap))
+}
+
+/// Returns [`MapToStructOptions`] with the supplied timezone, or the default (UTC) when absent.
+pub(crate) fn map_to_struct_options(timestamp_timezone: Option<&str>) -> MapToStructOptions {
+    MapToStructOptions::default().fold_with(
+        timestamp_timezone,
+        MapToStructOptions::with_timestamp_timezone,
+    )
+}
+
+/// If a table has `TIMESTAMP` partition columns and the connector supplies a timezone, the read
+/// path must support applying it to offset-less timestamp partition values. Unsupported paths,
+/// such as parallel scans, use this check to return an error.
+///
+/// NOTE: This is a conservative choice. The read paths may not actually use the `TIMESTAMP`
+/// partition columns, for example when they are projected out.
+fn table_requires_timestamp_timezone_support(
+    table_configuration: &TableConfiguration,
+    partition_values: &PartitionValuesOptions,
+) -> bool {
+    partition_values.timestamp_timezone.is_some()
+        && table_configuration
+            .logical_partition_columns()
+            .iter()
+            .any(|name| {
+                table_configuration
+                    .logical_schema_ref()
+                    .field(name)
+                    .is_some_and(|field| field.data_type() == &DataType::TIMESTAMP)
+            })
 }

@@ -1,12 +1,12 @@
 //! Conversions from the kernel plan IR into the prost-generated proto wire types.
 
 use super::plan::agg as proto_agg;
-use super::schema::data_type::Kind as DataTypeKind;
-use super::schema::metadata_value::Value as MetadataValueKind;
-use super::schema::primitive_type::Kind as PrimitiveTypeKind;
 #[cfg(feature = "geo-type-in-dev")]
 use super::schema::EdgeInterpolationAlgorithm as EdgeAlgo;
 use super::schema::SimplePrimitiveType as Simple;
+use super::schema::data_type::Kind as DataTypeKind;
+use super::schema::metadata_value::Value as MetadataValueKind;
+use super::schema::primitive_type::Kind as PrimitiveTypeKind;
 use super::{
     expressions as proto_expr, operation as proto_op, plan as proto_plan, schema as proto_schema,
 };
@@ -19,14 +19,14 @@ use crate::expressions::{
     VariadicExpressionOp,
 };
 use crate::plans::ir::nodes::{
-    Agg, Aggregate, DynamicScan, FileType, Filter, Operator, Project, RelationRef, ScanFile,
-    ScanJson, ScanParquet, SemiJoin, Values, WriteJson,
+    Agg, Aggregate, DynamicScan, FileType, Filter, Operator, PrefixSum, Project, RelationRef,
+    ScanFile, ScanJson, ScanParquet, SemiJoin, Values, WriteJson,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation};
 use crate::schema::{
-    ArrayType, DataType, DecimalType, MapType, MetadataValue, PrimitiveType, StructField,
-    StructType,
+    ArrayType, DataType, DecimalType, IntervalDayToSecondType, IntervalYearToMonthType, MapType,
+    MetadataValue, PrimitiveType, StructField, StructType,
 };
 #[cfg(feature = "geo-type-in-dev")]
 use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
@@ -66,8 +66,9 @@ impl From<&IoOperation> for proto_op::IoOperation {
     fn from(io: &IoOperation) -> Self {
         use proto_op::io_operation::Op;
         let op = match io {
-            IoOperation::FileListing { url } => Op::FileListing(proto_op::FileListing {
+            IoOperation::FileListing { url, end } => Op::FileListing(proto_op::FileListing {
                 url: url.to_string(),
+                end: end.as_ref().map(ToString::to_string),
             }),
             IoOperation::ReadBytes { files } => Op::ReadBytes(proto_op::ReadBytes {
                 files: convert_vec(files),
@@ -153,6 +154,7 @@ impl From<&Operator> for proto_plan::Operator {
             Operator::Filter(n) => Op::Filter(n.into()),
             Operator::DynamicScan(n) => Op::DynamicScan(n.into()),
             Operator::Aggregate(n) => Op::Aggregate(n.into()),
+            Operator::PrefixSum(n) => Op::PrefixSum(n.into()),
             Operator::WriteJson(n) => Op::WriteJson(n.into()),
             Operator::SemiJoin(n) => Op::SemiJoin(n.into()),
             Operator::UnionAll(_) => Op::UnionAll(proto_plan::UnionAllNode {}),
@@ -284,6 +286,11 @@ impl From<&Agg> for proto_plan::Agg {
                 value: Some(value.into()),
             }),
             Agg::CountStar => proto_agg::Func::CountStar(proto_plan::CountStarAgg {}),
+            Agg::FirstNonNull(value) => {
+                proto_agg::Func::FirstNonNull(proto_plan::FirstNonNullAgg {
+                    value: Some(value.into()),
+                })
+            }
             Agg::MinNonNullBy(operands) => {
                 proto_agg::Func::MinNonNullBy(proto_plan::MinNonNullByAgg {
                     value: Some((&operands.value).into()),
@@ -309,6 +316,16 @@ impl From<&SemiJoin> for proto_plan::SemiJoinNode {
             inverted: node.inverted,
             probe_keys: convert_vec(&node.probe_keys),
             build_keys: convert_vec(&node.build_keys),
+        }
+    }
+}
+
+impl From<&PrefixSum> for proto_plan::PrefixSumNode {
+    fn from(node: &PrefixSum) -> Self {
+        proto_plan::PrefixSumNode {
+            input: Some((&node.input).into()),
+            output: node.output.clone(),
+            schema: Some(node.schema.as_ref().into()),
         }
     }
 }
@@ -349,6 +366,19 @@ impl From<&Expression> for proto_expr::Expression {
             Expression::MapToStruct(map_to_struct) => {
                 Kind::MapToStruct(Box::new(map_to_struct.into()))
             }
+            Expression::CaseWhen(case_when) => {
+                Kind::CaseWhen(Box::new(proto_expr::CaseWhenExpression {
+                    branches: case_when
+                        .branches
+                        .iter()
+                        .map(|(condition, result)| proto_expr::CaseWhenBranch {
+                            condition: Some(condition.into()),
+                            result: Some(result.into()),
+                        })
+                        .collect(),
+                    else_expr: Some(Box::new(case_when.else_expr.as_ref().into())),
+                }))
+            }
             // No proto cast node yet; serialize as an opaque unknown.
             Expression::Cast(cast) => Kind::Unknown(format!("cast_to_{}", cast.target)),
         };
@@ -385,6 +415,12 @@ impl From<&UnaryExpression> for proto_expr::UnaryExpression {
         proto_expr::UnaryExpression {
             op: proto_expr::UnaryExpressionOp::from(unary.op) as i32,
             expr: Some(Box::new(unary.expr.as_ref().into())),
+            to_json_full_precision_timestamps: match unary.op {
+                UnaryExpressionOp::ToJson {
+                    full_precision_timestamps,
+                } => full_precision_timestamps,
+                UnaryExpressionOp::UriEncodeFileLocation => false,
+            },
         }
     }
 }
@@ -511,7 +547,10 @@ impl From<&ExpressionFieldPatch> for proto_expr::FieldTransform {
 impl From<UnaryExpressionOp> for proto_expr::UnaryExpressionOp {
     fn from(op: UnaryExpressionOp) -> Self {
         match op {
-            UnaryExpressionOp::ToJson => proto_expr::UnaryExpressionOp::ToJson,
+            UnaryExpressionOp::ToJson { .. } => proto_expr::UnaryExpressionOp::ToJson,
+            UnaryExpressionOp::UriEncodeFileLocation => {
+                proto_expr::UnaryExpressionOp::UriEncodeFileLocation
+            }
         }
     }
 }
@@ -540,6 +579,7 @@ impl From<UnaryPredicateOp> for proto_expr::UnaryPredicateOp {
     fn from(op: UnaryPredicateOp) -> Self {
         match op {
             UnaryPredicateOp::IsNull => proto_expr::UnaryPredicateOp::IsNull,
+            UnaryPredicateOp::HasUriScheme => proto_expr::UnaryPredicateOp::HasUriScheme,
         }
     }
 }
@@ -581,8 +621,8 @@ impl From<&Scalar> for proto_expr::Scalar {
             Scalar::Boolean(v) => Value::Boolean(*v),
             Scalar::Timestamp(v) => Value::Timestamp(*v),
             Scalar::TimestampNtz(v) => Value::TimestampNtz(*v),
-            Scalar::IntervalYearMonth(v) => Value::IntervalYearMonth(*v),
-            Scalar::IntervalDayTime(v) => Value::IntervalDayTime(*v),
+            Scalar::IntervalYearMonth(v) => Value::IntervalYearMonth(v.months()),
+            Scalar::IntervalDayTime(v) => Value::IntervalDayTime(v.micros()),
             Scalar::Date(v) => Value::Date(*v),
             Scalar::Binary(v) => Value::Binary(v.clone()),
             Scalar::Decimal(decimal) => Value::Decimal(decimal.into()),
@@ -607,7 +647,7 @@ impl From<&DecimalData> for proto_expr::DecimalData {
 impl From<&StructData> for proto_expr::StructData {
     fn from(struct_data: &StructData) -> Self {
         proto_expr::StructData {
-            fields: convert_vec(struct_data.fields()),
+            fields: struct_data.fields().map(Into::into).collect(),
             values: convert_vec(struct_data.values()),
         }
     }
@@ -668,6 +708,9 @@ impl From<&DataType> for proto_schema::DataType {
                         .collect(),
                 }))
             }
+            // The proto `FileType` is empty: a `file` has a fixed, canonical set of sub-fields, so
+            // the type identity alone is enough to reconstruct it.
+            DataType::File(_) => DataTypeKind::File(proto_schema::FileType {}),
         };
         proto_schema::DataType { kind: Some(kind) }
     }
@@ -698,10 +741,11 @@ impl From<&PrimitiveType> for proto_schema::PrimitiveType {
                 PrimitiveTypeKind::Geography(geography.as_ref().into())
             }
             PrimitiveType::Void => PrimitiveTypeKind::Simple(Simple::Void as i32),
-            PrimitiveType::IntervalYearMonth => {
+            PrimitiveType::IntervalYearMonth(_) => {
+                // The proto tag carries no qualifier; decoding reconstructs the full-range type.
                 PrimitiveTypeKind::Simple(Simple::IntervalYearMonth as i32)
             }
-            PrimitiveType::IntervalDayTime => {
+            PrimitiveType::IntervalDayTime(_) => {
                 PrimitiveTypeKind::Simple(Simple::IntervalDayTime as i32)
             }
         };
@@ -782,7 +826,7 @@ impl From<&StructField> for proto_schema::StructField {
         let metadata = field
             .metadata
             .iter()
-            .map(|(key, value)| (key.clone(), value.into()))
+            .map(|(key, value)| (key.to_string(), value.into()))
             .collect();
         proto_schema::StructField {
             name: field.name.clone(),
@@ -829,7 +873,7 @@ impl TryFrom<proto_schema::StructField> for StructField {
         let metadata = proto
             .metadata
             .into_iter()
-            .map(|(key, value)| Ok::<_, KernelError>((key, MetadataValue::try_from(value)?)))
+            .map(|(key, value)| Ok::<_, KernelError>((key.into(), MetadataValue::try_from(value)?)))
             .collect::<KernelResult<std::collections::HashMap<_, _>>>()?;
         Ok(StructField {
             name: proto.name,
@@ -874,6 +918,7 @@ impl TryFrom<proto_schema::DataType> for DataType {
                     return Err(KernelError::unsupported("UDT requires udt-in-dev"));
                 }
             }
+            DataTypeKind::File(_) => DataType::file_type(),
         };
         Ok(data_type)
     }
@@ -904,10 +949,14 @@ impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
                     Simple::Timestamp => PrimitiveType::Timestamp,
                     Simple::TimestampNtz => PrimitiveType::TimestampNtz,
                     Simple::Void => PrimitiveType::Void,
-                    Simple::IntervalYearMonth => PrimitiveType::IntervalYearMonth,
-                    Simple::IntervalDayTime => PrimitiveType::IntervalDayTime,
+                    Simple::IntervalYearMonth => PrimitiveType::interval_year_month(
+                        IntervalYearToMonthType::IntervalYearToMonth,
+                    ),
+                    Simple::IntervalDayTime => PrimitiveType::interval_day_time(
+                        IntervalDayToSecondType::IntervalDayToSecond,
+                    ),
                     Simple::Unspecified => {
-                        return Err(KernelError::schema("SimplePrimitiveType is unspecified"))
+                        return Err(KernelError::schema("SimplePrimitiveType is unspecified"));
                     }
                 }
             }
@@ -926,7 +975,7 @@ impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
             PrimitiveTypeKind::Geometry(_) | PrimitiveTypeKind::Geography(_) => {
                 return Err(KernelError::schema(
                     "geometry/geography types require the 'geo-type-in-dev' feature",
-                ))
+                ));
             }
         };
         Ok(primitive)
@@ -983,7 +1032,7 @@ impl TryFrom<EdgeAlgo> for EdgeInterpolationAlgorithm {
             EdgeAlgo::Unspecified => {
                 return Err(KernelError::invalid_geo_params(
                     "EdgeInterpolationAlgorithm is unspecified",
-                ))
+                ));
             }
         };
         Ok(algorithm)
@@ -1050,19 +1099,19 @@ mod tests {
     use super::EdgeAlgo;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::expressions::{
-        col, column_name, lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
-        DecimalData, Expression, ExpressionStructPatchBuilder, JunctionPredicateOp, MapData,
-        MapToStructOptions, OpaqueExpressionOp, OpaquePredicateOp, Predicate, Scalar,
-        ScalarExpressionEvaluator, StructData, UnaryExpressionOp, UnaryPredicateOp,
-        VariadicExpressionOp,
+        ArrayData, BinaryExpressionOp, BinaryPredicateOp, ColumnName, DecimalData, Expression,
+        ExpressionStructPatchBuilder, JunctionPredicateOp, MapData, MapToStructOptions,
+        OpaqueExpressionOp, OpaquePredicateOp, Predicate, Scalar, ScalarExpressionEvaluator,
+        StructData, UnaryExpressionOp, UnaryPredicateOp, VariadicExpressionOp, col, column_name,
+        expr, lit,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
         IndirectDataSkippingPredicateEvaluator,
     };
     use crate::plans::ir::nodes::{
-        Agg, Aggregate, DynamicScan, FileType, Filter, Operator, Project, RelationRef, ScanFile,
-        ScanJson, ScanParquet, SemiJoin, UnionAll, Values, WriteJson,
+        Agg, Aggregate, DynamicScan, FileType, Filter, Operator, PrefixSum, Project, RelationRef,
+        ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values, WriteJson,
     };
     use crate::plans::ir::plan::{Plan, PlanNode};
     use crate::plans::proto::{
@@ -1071,8 +1120,9 @@ mod tests {
     };
     use crate::plans::{IoOperation, Operation};
     use crate::schema::{
-        schema, schema_ref, ArrayType, DataType, DecimalType, MapType, MetadataValue,
-        PrimitiveType, SchemaRef, StructField, StructType, ToSchema as _,
+        ArrayType, DataType, DecimalType, IntervalDayToSecondType, IntervalYearToMonthType,
+        MapType, MetadataValue, PrimitiveType, SchemaRef, StructField, StructType, ToSchema as _,
+        schema, schema_ref,
     };
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
@@ -1192,11 +1242,16 @@ mod tests {
     #[test]
     fn from_io_operation_file_listing() {
         let url = "memory:///table/";
-        let op = Operation::IoOperation(IoOperation::file_listing(Url::parse(url).unwrap()));
+        let end = "memory:///table/:";
+        let op = Operation::IoOperation(IoOperation::file_listing(
+            Url::parse(url).unwrap(),
+            Some(Url::parse(end).unwrap()),
+        ));
         let proto_op::io_operation::Op::FileListing(file_listing) = io_op(&op) else {
             panic!("expected FileListing");
         };
         assert_eq!(file_listing.url, url);
+        assert_eq!(file_listing.end.as_deref(), Some(end));
     }
 
     #[test]
@@ -1308,7 +1363,7 @@ mod tests {
                 },
                 PlanNode {
                     op: Operator::Filter(Filter {
-                        predicate: Arc::new(Predicate::gt(col!("id"), lit(5i32))),
+                        predicate: Arc::new(Predicate::from_expr(expr!(col("id") > 5i32))),
                     }),
                     inputs: vec![0],
                 },
@@ -1405,6 +1460,14 @@ mod tests {
         Operator::SemiJoin(SemiJoin { inverted: false, probe_keys: vec![], build_keys: vec![] }),
         "semi_join"
     )]
+    #[case(
+        Operator::PrefixSum(PrefixSum {
+            input: ColumnName::new(["n"]),
+            output: "offset".to_string(),
+            schema: sample_schema(),
+        }),
+        "prefix_sum"
+    )]
     #[case(Operator::UnionAll(UnionAll), "union_all")]
     #[case(Operator::WriteJson(WriteJson {
         file_path: Url::parse("memory:///out.json").unwrap(), overwrite: false,
@@ -1422,6 +1485,7 @@ mod tests {
             Op::DynamicScan(_) => "dynamic_scan",
             Op::Aggregate(_) => "aggregate",
             Op::SemiJoin(_) => "semi_join",
+            Op::PrefixSum(_) => "prefix_sum",
             Op::UnionAll(_) => "union_all",
             Op::WriteJson(_) => "write_json",
         };
@@ -1622,12 +1686,26 @@ mod tests {
         assert!(proto.schema.is_some());
     }
 
+    #[test]
+    fn from_prefix_sum() {
+        let node = PrefixSum {
+            input: ColumnName::new(["n"]),
+            output: "offset".to_string(),
+            schema: sample_schema(),
+        };
+        let proto = proto_plan::PrefixSumNode::from(&node);
+        assert_eq!(proto.input.expect("input").path, ["n"]);
+        assert_eq!(proto.output, "offset");
+        assert!(proto.schema.is_some());
+    }
+
     #[rstest]
     #[case(Agg::min(column_name!("a")), "min")]
     #[case(Agg::max(column_name!("a")), "max")]
     #[case(Agg::sum(column_name!("a")), "sum")]
     #[case(Agg::count(column_name!("a")), "count")]
     #[case(Agg::count_star(), "count_star")]
+    #[case(Agg::first_non_null(column_name!("a")), "first_non_null")]
     #[case(Agg::min_non_null_by(column_name!("a"), column_name!("s"), column_name!("k")), "min_non_null_by")]
     #[case(Agg::max_non_null_by(column_name!("a"), column_name!("s"), column_name!("k")), "max_non_null_by")]
     fn from_agg(#[case] agg: Agg, #[case] expected: &str) {
@@ -1639,6 +1717,10 @@ mod tests {
             Func::Sum(_) => "sum",
             Func::Count(_) => "count",
             Func::CountStar(_) => "count_star",
+            Func::FirstNonNull(agg) => {
+                assert_eq!(agg.value.unwrap().path, ["a"]);
+                "first_non_null"
+            }
             Func::MinNonNullBy(_) => "min_non_null_by",
             Func::MaxNonNullBy(_) => "max_non_null_by",
         };
@@ -1680,9 +1762,9 @@ mod tests {
         ),
         "transform"
     )]
-    #[case(Expression::unary(UnaryExpressionOp::ToJson, lit(1)), "unary")]
+    #[case(Expression::unary(UnaryExpressionOp::TO_JSON, lit(1)), "unary")]
     #[case(Expression::binary(BinaryExpressionOp::Plus, lit(1), lit(2)), "binary")]
-    #[case(Expression::coalesce([lit(1), lit(2)]), "variadic")]
+    #[case(expr!(coalesce(1, 2)), "variadic")]
     #[case(Expression::opaque(TestOpaqueExprOp, [lit(1)]), "opaque")]
     #[case(Expression::parse_json(lit("{}"), sample_schema()), "parse_json")]
     #[case(
@@ -1697,6 +1779,7 @@ mod tests {
         "map_to_struct"
     )]
     #[case(Expression::unknown("x"), "unknown")]
+    #[case(Expression::case_when([(Predicate::TRUE, lit(1))], lit(2)), "case_when")]
     fn from_expression(#[case] expr: Expression, #[case] expected: &str) {
         use proto_expr::expression::Kind;
         let kind = match proto_expr::Expression::from(&expr).kind.unwrap() {
@@ -1708,7 +1791,7 @@ mod tests {
             Kind::Unary(_) => "unary",
             Kind::Binary(_) => "binary",
             Kind::Variadic(_) => "variadic",
-            Kind::IfExpr(_) => "if_expr",
+            Kind::CaseWhen(_) => "case_when",
             Kind::Opaque(_) => "opaque",
             Kind::ParseJson(_) => "parse_json",
             Kind::MapToStruct(_) => "map_to_struct",
@@ -1719,10 +1802,10 @@ mod tests {
 
     #[rstest]
     #[case(Predicate::TRUE, "boolean_expression")]
-    #[case(Predicate::not(Predicate::TRUE), "not")]
-    #[case(Predicate::is_null(lit(1)), "unary")]
-    #[case(Predicate::gt(lit(1), lit(2)), "binary")]
-    #[case(Predicate::and(Predicate::TRUE, Predicate::FALSE), "junction")]
+    #[case(Predicate::from_expr(expr!(not(true))), "not")]
+    #[case(Predicate::from_expr(expr!(is_null(1))), "unary")]
+    #[case(Predicate::from_expr(expr!(1 > 2)), "binary")]
+    #[case(Predicate::from_expr(expr!(and(true, false))), "junction")]
     #[case(Predicate::opaque(TestOpaquePredOp, [lit(1)]), "opaque")]
     #[case(Predicate::Unknown("x".to_string()), "unknown")]
     fn from_predicate(#[case] pred: Predicate, #[case] expected: &str) {
@@ -1764,14 +1847,21 @@ mod tests {
         assert!(guarded.nullability_predicate.is_some());
     }
 
-    #[test]
-    fn from_unary_expression() {
+    #[rstest]
+    fn from_unary_expression(#[values(false, true)] full_precision_timestamps: bool) {
+        let op = UnaryExpressionOp::ToJson {
+            full_precision_timestamps,
+        };
         let proto_expr::expression::Kind::Unary(unary) =
-            expr_kind_of(Expression::unary(UnaryExpressionOp::ToJson, lit(1)))
+            expr_kind_of(Expression::unary(op, lit(1)))
         else {
             panic!("expected a unary expression");
         };
         assert_eq!(unary.op, proto_expr::UnaryExpressionOp::ToJson as i32);
+        assert_eq!(
+            unary.to_json_full_precision_timestamps,
+            full_precision_timestamps
+        );
         assert!(unary.expr.is_some());
     }
 
@@ -1790,7 +1880,7 @@ mod tests {
     #[test]
     fn from_variadic_expression() {
         let proto_expr::expression::Kind::Variadic(variadic) =
-            expr_kind_of(Expression::coalesce([lit(1), lit(2), lit(3)]))
+            expr_kind_of(expr!(coalesce(1, 2, 3)))
         else {
             panic!("expected a variadic expression");
         };
@@ -1852,7 +1942,8 @@ mod tests {
 
     #[test]
     fn from_unary_predicate() {
-        let proto_expr::predicate::Kind::Unary(unary) = pred_kind_of(Predicate::is_null(lit(1)))
+        let proto_expr::predicate::Kind::Unary(unary) =
+            pred_kind_of(Predicate::from_expr(expr!(is_null(1))))
         else {
             panic!("expected a unary predicate");
         };
@@ -1863,7 +1954,7 @@ mod tests {
     #[test]
     fn from_binary_predicate() {
         let proto_expr::predicate::Kind::Binary(binary) =
-            pred_kind_of(Predicate::gt(lit(1), lit(2)))
+            pred_kind_of(Predicate::from_expr(expr!(1 > 2)))
         else {
             panic!("expected a binary predicate");
         };
@@ -1875,7 +1966,7 @@ mod tests {
     #[test]
     fn from_junction_predicate() {
         let proto_expr::predicate::Kind::Junction(junction) =
-            pred_kind_of(Predicate::and(Predicate::TRUE, Predicate::FALSE))
+            pred_kind_of(Predicate::from_expr(expr!(and(true, false))))
         else {
             panic!("expected a junction predicate");
         };
@@ -1924,7 +2015,11 @@ mod tests {
     // === Expression and predicate operators ===
 
     #[rstest]
-    #[case(UnaryExpressionOp::ToJson, proto_expr::UnaryExpressionOp::ToJson)]
+    #[case(UnaryExpressionOp::TO_JSON, proto_expr::UnaryExpressionOp::ToJson)]
+    #[case(
+        UnaryExpressionOp::UriEncodeFileLocation,
+        proto_expr::UnaryExpressionOp::UriEncodeFileLocation
+    )]
     fn from_unary_expression_op(
         #[case] op: UnaryExpressionOp,
         #[case] expected: proto_expr::UnaryExpressionOp,
@@ -1968,6 +2063,10 @@ mod tests {
 
     #[rstest]
     #[case(UnaryPredicateOp::IsNull, proto_expr::UnaryPredicateOp::IsNull)]
+    #[case(
+        UnaryPredicateOp::HasUriScheme,
+        proto_expr::UnaryPredicateOp::HasUriScheme
+    )]
     fn from_unary_predicate_op(
         #[case] op: UnaryPredicateOp,
         #[case] expected: proto_expr::UnaryPredicateOp,
@@ -2035,7 +2134,7 @@ mod tests {
     #[case(
         Scalar::Struct(
             StructData::try_new(
-                vec![StructField::nullable("a", DataType::INTEGER)],
+                schema_ref! { nullable "a": INTEGER },
                 vec![Scalar::Integer(1)],
             )
             .unwrap(),
@@ -2083,26 +2182,78 @@ mod tests {
 
     #[rstest]
     #[case(
-        Scalar::IntervalYearMonth(30),
+        Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
         proto_expr::scalar::Value::IntervalYearMonth(30)
     )]
     #[case(
-        Scalar::IntervalYearMonth(i32::MIN),
+        Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalYear).unwrap(),
+        proto_expr::scalar::Value::IntervalYearMonth(24)
+    )]
+    #[case(
+        Scalar::interval_year_month(30, IntervalYearToMonthType::IntervalMonth).unwrap(),
+        proto_expr::scalar::Value::IntervalYearMonth(30)
+    )]
+    #[case(
+        Scalar::interval_year_month(i32::MIN, IntervalYearToMonthType::IntervalYearToMonth).unwrap(),
         proto_expr::scalar::Value::IntervalYearMonth(i32::MIN)
     )]
     #[case(
-        Scalar::IntervalDayTime(-5),
+        Scalar::interval_day_time(-5, IntervalDayToSecondType::IntervalDayToSecond).unwrap(),
         proto_expr::scalar::Value::IntervalDayTime(-5)
     )]
     #[case(
-        Scalar::IntervalDayTime(i64::MAX),
+        Scalar::interval_day_time(i64::MAX, IntervalDayToSecondType::IntervalDayToSecond).unwrap(),
         proto_expr::scalar::Value::IntervalDayTime(i64::MAX)
+    )]
+    #[case(
+        Scalar::interval_day_time(86_400_000_000, IntervalDayToSecondType::IntervalDay).unwrap(),
+        proto_expr::scalar::Value::IntervalDayTime(86_400_000_000)
+    )]
+    #[case(
+        Scalar::interval_day_time(93_600_000_000, IntervalDayToSecondType::IntervalDayToHour).unwrap(),
+        proto_expr::scalar::Value::IntervalDayTime(93_600_000_000)
     )]
     fn from_interval_scalar_preserves_payload(
         #[case] scalar: Scalar,
         #[case] expected: proto_expr::scalar::Value,
     ) {
         assert_eq!(scalar_value_of(scalar), expected);
+    }
+
+    #[rstest]
+    #[case(IntervalYearToMonthType::IntervalYear)]
+    #[case(IntervalYearToMonthType::IntervalMonth)]
+    #[case(IntervalYearToMonthType::IntervalYearToMonth)]
+    fn from_interval_year_month_null_encodes_generic_type(#[case] dtype: IntervalYearToMonthType) {
+        let scalar = Scalar::Null(DataType::interval_year_month(dtype));
+        let proto_expr::scalar::Value::Null(data_type) = scalar_value_of(scalar) else {
+            panic!("expected a null scalar");
+        };
+
+        let decoded = DataType::try_from(data_type).unwrap();
+        assert_eq!(decoded, DataType::INTERVAL_YEAR_MONTH);
+    }
+
+    #[rstest]
+    #[case(IntervalDayToSecondType::IntervalDay)]
+    #[case(IntervalDayToSecondType::IntervalHour)]
+    #[case(IntervalDayToSecondType::IntervalMinute)]
+    #[case(IntervalDayToSecondType::IntervalSecond)]
+    #[case(IntervalDayToSecondType::IntervalDayToHour)]
+    #[case(IntervalDayToSecondType::IntervalDayToMinute)]
+    #[case(IntervalDayToSecondType::IntervalDayToSecond)]
+    #[case(IntervalDayToSecondType::IntervalHourToMinute)]
+    #[case(IntervalDayToSecondType::IntervalHourToSecond)]
+    #[case(IntervalDayToSecondType::IntervalMinuteToSecond)]
+    fn from_interval_day_time_null_encodes_generic_type(#[case] dtype: IntervalDayToSecondType) {
+        let scalar = Scalar::Null(DataType::interval_day_time(dtype));
+        let proto_expr::scalar::Value::Null(data_type) = scalar_value_of(scalar) else {
+            panic!("expected a null scalar");
+        };
+        assert_eq!(
+            DataType::try_from(data_type).unwrap(),
+            DataType::INTERVAL_DAY_TIME
+        );
     }
 
     #[test]
@@ -2120,7 +2271,7 @@ mod tests {
     #[test]
     fn from_struct_data() {
         let struct_data = StructData::try_new(
-            vec![StructField::nullable("a", DataType::INTEGER)],
+            schema_ref! { nullable "a": INTEGER },
             vec![Scalar::Integer(1)],
         )
         .unwrap();
@@ -2241,6 +2392,7 @@ mod tests {
     #[case(DataType::from(schema! { nullable "a": INTEGER }), "struct")]
     #[case(MapType::new(DataType::STRING, DataType::INTEGER, true).into(), "map")]
     #[case(DataType::unshredded_variant(), "variant")]
+    #[case(DataType::file_type(), "file")]
     fn from_data_type(#[case] value: DataType, #[case] expected: &str) {
         use proto_schema::data_type::Kind;
         let kind = match proto_schema::DataType::from(&value).kind.unwrap() {
@@ -2250,6 +2402,7 @@ mod tests {
             Kind::Map(_) => "map",
             Kind::Variant(_) => "variant",
             Kind::UserDefined(_) => "udt",
+            Kind::File(_) => "file",
         };
         assert_eq!(kind, expected);
     }
@@ -2272,11 +2425,27 @@ mod tests {
     )]
     #[case(PrimitiveType::Void, proto_schema::SimplePrimitiveType::Void)]
     #[case(
-        PrimitiveType::IntervalYearMonth,
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth),
         proto_schema::SimplePrimitiveType::IntervalYearMonth
     )]
     #[case(
-        PrimitiveType::IntervalDayTime,
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYear),
+        proto_schema::SimplePrimitiveType::IntervalYearMonth
+    )]
+    #[case(
+        PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalMonth),
+        proto_schema::SimplePrimitiveType::IntervalYearMonth
+    )]
+    #[case(
+        PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalDayToSecond),
+        proto_schema::SimplePrimitiveType::IntervalDayTime
+    )]
+    #[case(
+        PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalDay),
+        proto_schema::SimplePrimitiveType::IntervalDayTime
+    )]
+    #[case(
+        PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalMinuteToSecond),
         proto_schema::SimplePrimitiveType::IntervalDayTime
     )]
     fn from_primitive_type(
@@ -2409,8 +2578,8 @@ mod tests {
             PrimitiveType::Timestamp,
             PrimitiveType::TimestampNtz,
             PrimitiveType::Void,
-            PrimitiveType::IntervalYearMonth,
-            PrimitiveType::IntervalDayTime
+            PrimitiveType::interval_year_month(IntervalYearToMonthType::IntervalYearToMonth),
+            PrimitiveType::interval_day_time(IntervalDayToSecondType::IntervalDayToSecond)
         )]
         primitive: PrimitiveType,
     ) {
@@ -2532,6 +2701,22 @@ mod tests {
             decoded.expect("decode succeeds"),
             DataType::unshredded_variant()
         );
+    }
+
+    /// A `file` keeps its logical type on the wire: it must decode back to a `file`, not to the
+    /// plain struct it is physically stored as. Covers a top-level column and nested positions.
+    #[test]
+    fn file_round_trips() {
+        use crate::schema::StructField;
+        let schema = StructType::new_unchecked([
+            StructField::nullable("f", DataType::file_type()),
+            StructField::nullable("arr", ArrayType::new(DataType::file_type(), true)),
+            StructField::nullable(
+                "m",
+                MapType::new(DataType::STRING, DataType::file_type(), true),
+            ),
+        ]);
+        assert_schema_round_trips(schema);
     }
 
     // Builds a proto `DataType::Primitive` with the given (possibly malformed) primitive kind.

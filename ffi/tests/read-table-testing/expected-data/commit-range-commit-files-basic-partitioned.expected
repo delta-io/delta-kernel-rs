@@ -1,0 +1,8 @@
+commit file:
+  version: 0
+  location: file://<DAT>/reads_oss_partitioned/delta/_delta_log/00000000000000000000.json
+  size: 1130
+commit file:
+  version: 1
+  location: file://<DAT>/reads_oss_partitioned/delta/_delta_log/00000000000000000001.json
+  size: 2018

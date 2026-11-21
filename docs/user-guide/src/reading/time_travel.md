@@ -1,9 +1,10 @@
 # Time travel and snapshot management
 
-To read a Delta table at a specific version or refresh an existing snapshot to
-pick up new commits, you use Kernel's `SnapshotBuilder` API. The builder
-supports both full construction from a table URL and incremental updates from an
-existing `Snapshot`.
+To load or refresh a point-in-time view of a table, build a `Snapshot` for the version you need.
+The [`Snapshot` rustdoc] defines the exact API contract; this page compares the available
+workflows.
+
+[`Snapshot` rustdoc]: https://docs.rs/delta_kernel/latest/delta_kernel/snapshot/struct.Snapshot.html
 
 Before reading this page, make sure you understand
 [Building a Scan](./building_a_scan.md).
@@ -21,8 +22,8 @@ specific historical version, chain `.at_version()` onto the builder.
 # use std::sync::Arc;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::{KernelResult, Snapshot};
-# fn example() -> KernelResult<()> {
+# use delta_kernel::Snapshot;
+# fn example() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
@@ -47,8 +48,8 @@ To read the latest version, omit `at_version`:
 # use std::sync::Arc;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::{KernelResult, Snapshot};
-# fn example() -> KernelResult<()> {
+# use delta_kernel::Snapshot;
+# fn example() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
@@ -72,8 +73,8 @@ snapshot's version, avoiding a full log replay.
 # use std::sync::Arc;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::{KernelResult, Snapshot};
-# fn example() -> KernelResult<()> {
+# use delta_kernel::Snapshot;
+# fn example() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
@@ -110,8 +111,8 @@ with `at_version`:
 # use std::sync::Arc;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::{KernelResult, Snapshot};
-# fn example() -> KernelResult<()> {
+# use delta_kernel::Snapshot;
+# fn example() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
@@ -126,7 +127,7 @@ let updated = Snapshot::builder_from(snapshot)
 
 ## Getting the timestamp of a version
 
-`Snapshot` exposes `get_timestamp`, which returns the timestamp of the
+`SnapshotReader` exposes `get_timestamp`, which returns the timestamp of the
 snapshot's version in milliseconds since the Unix epoch. When the table has
 In-Commit Timestamps (ICT) enabled, the method returns the ICT value stored
 inside the commit. Otherwise, it falls back to the filesystem's last-modified
@@ -138,8 +139,8 @@ time on the commit file.
 # use std::sync::Arc;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::{KernelResult, Snapshot};
-# fn example() -> KernelResult<()> {
+# use delta_kernel::Snapshot;
+# fn example() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
@@ -147,7 +148,7 @@ let snapshot = Snapshot::builder_for(&url)
     .at_version(5)
     .build(&engine)?;
 
-let timestamp_ms = snapshot.get_timestamp(&engine)?;
+let timestamp_ms = snapshot.reader().get_timestamp(&engine)?;
 println!("Version {} was committed at {} ms", snapshot.version(), timestamp_ms);
 # Ok(())
 # }
@@ -186,9 +187,9 @@ Pass `HistoryCommitType::Published` to allow any version that still has a commit
 # extern crate delta_kernel_default_engine;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::{KernelResult, Snapshot};
+# use delta_kernel::Snapshot;
 # use delta_kernel::history_manager::{latest_version_as_of, HistoryCommitType};
-# fn example() -> KernelResult<()> {
+# fn example() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
@@ -225,9 +226,9 @@ timestamp is optional. Pass `None` to indicate no upper bound.
 # extern crate delta_kernel_default_engine;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::{KernelResult, Snapshot};
+# use delta_kernel::Snapshot;
 use delta_kernel::history_manager::timestamp_range_to_versions;
-# fn example() -> KernelResult<()> {
+# fn example() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();

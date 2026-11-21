@@ -1,8 +1,8 @@
 //! FFI types for mimicking the kernel's `PlanResult` enum.
 
 use super::iter::{CBytesIterator, CEngineDataIterator, CFileMetaIterator};
-use crate::handle::Handle;
 use crate::ExclusiveRustBytes;
+use crate::handle::Handle;
 
 /// C-compatible equivalent of the kernel's `ParquetFooter` struct.
 ///

@@ -1,42 +1,46 @@
 //! Integration tests for parsed partition-value output (`partitionValues_parsed`).
 
+use std::fs::File;
 use std::sync::Arc;
 
+use chrono::{DateTime, NaiveDateTime};
 use delta_kernel::arrow::array::{
     Array, BinaryArray, BooleanArray, Int32Array, RecordBatch, StringArray, StructArray,
+    TimestampMicrosecondArray,
 };
 use delta_kernel::arrow::compute::filter_record_batch;
+use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::expressions::{col, lit, ColumnName, Predicate};
-use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::expressions::{ColumnName, Expression, Predicate, Scalar, expr};
 use delta_kernel::object_store::DynObjectStore;
+use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::parquet::arrow::ArrowWriter;
 use delta_kernel::scan::state::ScanFile;
-use delta_kernel::scan::PartitionValuesOptions;
-use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
-use delta_kernel::Snapshot;
+use delta_kernel::scan::{
+    AfterSequentialScanMetadata, ParallelScanMetadata, ParsedColumnSource, PartitionValuesOptions,
+    ScanMetadata, StatsOptions,
+};
+use delta_kernel::schema::{DataType, StructField, schema_ref};
+use delta_kernel::table_features::{ColumnMappingMode, get_any_level_column_physical_name};
+use delta_kernel::transaction::create_table::create_table;
+use delta_kernel::transaction::data_layout::DataLayout;
+use delta_kernel::{Engine, Snapshot, SnapshotRef};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
-use test_utils::table_builder::{partitioned, version_latest, FeatureSet, LogState, TableConfig};
+use test_utils::table_builder::{
+    DataLayoutConfig, FeatureSet, LogState, TableConfig, TestTableBuilder, partitioned,
+    unpartitioned, version_latest,
+};
 use test_utils::{
-    add_commit, create_default_engine_mt_executor, get_column,
-    install_thread_local_metrics_reporter, test_context, CountingReporter,
+    CountingReporter, add_commit, assert_result_error_with_message,
+    create_default_engine_mt_executor, get_column, install_thread_local_metrics_reporter,
+    test_context, test_table_setup_mt,
 };
 use url::Url;
 
-/// Requesting the typed struct via `with_struct()` on a partitioned table must emit a
-/// `partitionValues_parsed` column with one field per partition column, keyed by physical name.
-///
-/// Run across every column mapping mode and both log-segment shapes:
-/// - `native_checkpoint = false`: no checkpoint, so the struct is synthesized from the
-///   `partitionValues` string map via `MAP_TO_STRUCT` on a JSON commit.
-/// - `native_checkpoint = true`: a checkpoint with `writeStatsAsStruct=true`, so the read takes the
-///   checkpoint's native `partitionValues_parsed` column directly. For the non-null values this
-///   table writes, that column matches what `MAP_TO_STRUCT` would reconstruct, so both sources
-///   yield the same struct.
-///
-/// The struct keys on physical names, so a logical-vs-physical mismatch under `Id`/`Name` mapping
-/// would surface every partition value as null. The builder writes well-defined (non-null)
-/// partition values, so the non-null assertion guards physical-name matching in all combinations.
+/// Typed partition values use physical names across column mapping modes, with or without a
+/// checkpoint.
 #[rstest]
 fn scan_metadata_emits_partition_values_parsed_across_column_mapping(
     #[values(
@@ -146,6 +150,174 @@ fn scan_metadata_emits_partition_values_parsed_across_column_mapping(
     }
 
     assert_eq!(file_count, 1, "Should have processed exactly one file");
+}
+
+/// Returns `(source, has_partitionValues_parsed_column)` for every batch that has selected rows.
+fn batch_partition_values_sources<E: std::fmt::Debug>(
+    batches: impl IntoIterator<Item = Result<ScanMetadata, E>>,
+) -> Vec<(Option<ParsedColumnSource>, bool)> {
+    let mut sources = Vec::new();
+    for metadata in batches {
+        let metadata = metadata.unwrap();
+        let source = metadata.partition_values_source();
+        let (data, selection) = metadata.scan_files.into_parts();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data).unwrap().into();
+        let batch = filter_record_batch(&batch, &BooleanArray::from(selection)).unwrap();
+        if batch.num_rows() > 0 {
+            let has_column = batch.column_by_name("partitionValues_parsed").is_some();
+            sources.push((source, has_column));
+        }
+    }
+    sources
+}
+
+/// Asserts the batches report exactly the expected sources, each paired with a present column
+/// (or an absent one for `None`).
+fn assert_batch_sources(
+    actual: Vec<(Option<ParsedColumnSource>, bool)>,
+    expected: &[Option<ParsedColumnSource>],
+) {
+    for source in expected {
+        assert!(
+            actual.iter().any(|(s, _)| s == source),
+            "no batch reported {source:?}; got {actual:?}"
+        );
+    }
+    for (source, has_column) in &actual {
+        assert!(
+            expected.contains(source),
+            "unexpected source {source:?}; expected one of {expected:?}"
+        );
+        assert_eq!(
+            *has_column,
+            source.is_some(),
+            "column presence vs {source:?}"
+        );
+    }
+}
+
+#[rstest]
+#[case::json_only(1, None, false, &[Some(ParsedColumnSource::Derived)])]
+#[case::checkpoint_with_native(
+    1, Some(1), true, &[Some(ParsedColumnSource::Checkpoint)]
+)]
+#[case::checkpoint_without_native(1, Some(1), false, &[Some(ParsedColumnSource::Derived)])]
+#[case::checkpoint_then_commit(
+    2,
+    Some(1),
+    true,
+    &[Some(ParsedColumnSource::Checkpoint), Some(ParsedColumnSource::Derived)]
+)]
+fn scan_metadata_reports_partition_values_source(
+    #[case] latest_version: u64,
+    #[case] checkpoint_at: Option<u64>,
+    #[case] write_stats_as_struct: bool,
+    #[case] expected: &[Option<ParsedColumnSource>],
+) {
+    let (engine, snapshot, _table) = test_context!(
+        LogState::with_latest_version(latest_version).maybe_with_checkpoint_at(checkpoint_at),
+        FeatureSet::empty(),
+        partitioned(),
+        TableConfig::new().write_stats_as_struct(write_stats_as_struct),
+        version_latest(),
+    );
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(PartitionValuesOptions::with_struct())
+        .build()
+        .unwrap();
+
+    assert_batch_sources(
+        batch_partition_values_sources(scan.scan_metadata(&engine).unwrap()),
+        expected,
+    );
+}
+
+#[rstest]
+#[case::predicate_only(
+    partitioned(),
+    false,
+    true,
+    false,
+    Some(ParsedColumnSource::Checkpoint)
+)]
+#[case::predicate_only_skip_stats(partitioned(), false, true, true, None)]
+#[case::struct_skip_stats(partitioned(), true, false, true, Some(ParsedColumnSource::Checkpoint))]
+#[case::no_struct_no_predicate(partitioned(), false, false, false, None)]
+#[case::unpartitioned_with_struct(unpartitioned(), true, false, false, None)]
+fn scan_metadata_partition_values_source_follows_emitted_column(
+    #[case] data_layout: DataLayoutConfig,
+    #[case] with_struct: bool,
+    #[case] with_partition_predicate: bool,
+    #[case] skip_stats: bool,
+    #[case] expected: Option<ParsedColumnSource>,
+) {
+    let (engine, snapshot, _table) = test_context!(
+        LogState::with_latest_version(1).with_checkpoint_at([1]),
+        FeatureSet::empty(),
+        data_layout,
+        TableConfig::new().write_stats_as_struct(true),
+        version_latest(),
+    );
+    let mut builder = snapshot.scan_builder();
+    if with_struct {
+        builder = builder.with_partition_values(PartitionValuesOptions::with_struct());
+    }
+    if with_partition_predicate {
+        builder = builder.with_predicate(Arc::new(Predicate::is_not_null(Expression::column([
+            "part_int",
+        ]))));
+    }
+    if skip_stats {
+        builder = builder.with_stats(StatsOptions::none());
+    }
+    let scan = builder.build().unwrap();
+
+    assert_batch_sources(
+        batch_partition_values_sources(scan.scan_metadata(&engine).unwrap()),
+        &[expected],
+    );
+}
+
+/// Parallel scan metadata derives `partitionValues_parsed` from the string map even when the
+/// checkpoint has a native column, in both the sequential and the parallel phase.
+#[test]
+fn parallel_scan_metadata_reports_derived_partition_values_source() {
+    let (engine, snapshot, _table) = test_context!(
+        LogState::with_latest_version(2)
+            .with_checkpoint_at([1])
+            .with_sidecars_if_enabled(Some(1)),
+        FeatureSet::new().v2_checkpoint(),
+        partitioned(),
+        TableConfig::new().write_stats_as_struct(true),
+        version_latest(),
+    );
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(PartitionValuesOptions::with_struct())
+        .build()
+        .unwrap();
+    let engine = Arc::new(engine);
+    let mut sequential = scan.parallel_scan_metadata(engine.clone()).unwrap();
+
+    assert_batch_sources(
+        batch_partition_values_sources(sequential.by_ref()),
+        &[Some(ParsedColumnSource::Derived)],
+    );
+
+    let AfterSequentialScanMetadata::Parallel { state, files } = sequential.finish().unwrap()
+    else {
+        panic!("expected a parallel checkpoint phase");
+    };
+    assert!(!files.is_empty());
+    let parallel = ParallelScanMetadata::try_new(engine, Arc::from(state), files).unwrap();
+
+    // Checked separately so that a `Derived` commit batch from the sequential phase cannot
+    // satisfy the assertion for the sidecar batches.
+    assert_batch_sources(
+        batch_partition_values_sources(parallel),
+        &[Some(ParsedColumnSource::Derived)],
+    );
 }
 
 // === Foreign-writer literal empty-string partition values ===
@@ -312,9 +484,7 @@ fn collect_path(paths: &mut Vec<String>, scan_file: ScanFile) {
 /// - `p_str IS NULL` prunes it and `p_str IS NOT NULL` keeps it (the value is "", not null).
 /// - the same holds for the binary column (`p_bin`), whose "" reconstructs as empty bytes.
 ///
-/// The `native_checkpoint` axis exercises that pruning is identical before and after a kernel
-/// checkpoint: the checkpoint reconstructs the same "" into its native `partitionValues_parsed`
-/// column, so skipping keeps and prunes the same files a scan of the JSON commit would.
+/// The checkpoint axis verifies that native parsed checkpoint values preserve these semantics.
 #[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_string_partition_pruning(#[values(false, true)] native_checkpoint: bool) {
@@ -363,31 +533,720 @@ async fn empty_string_partition_pruning(#[values(false, true)] native_checkpoint
 
     // The empty-string value is a real "", so equality and null predicates treat it as such.
     assert_eq!(
-        surviving(Predicate::eq(col!("p_str"), lit(""))),
+        surviving(Predicate::from_expr(expr!(col("p_str") == ""))),
         vec![empty.clone()],
         "empty-string file must be kept under p_str = ''"
     );
     assert_eq!(
-        surviving(Predicate::eq(col!("p_str"), lit("other"))),
+        surviving(Predicate::from_expr(expr!(col("p_str") == "other"))),
         vec![other.clone()],
         "empty-string file must be pruned under p_str = 'other'"
     );
     // Both partition values are non-null ("" and "other"), so IS NULL prunes both and IS NOT NULL
     // keeps both.
     assert!(
-        surviving(Predicate::is_null(col!("p_str"))).is_empty(),
+        surviving(Predicate::from_expr(expr!(is_null(col("p_str"))))).is_empty(),
         "no file has a null p_str, so IS NULL prunes both (the empty file's value is \"\", not null)"
     );
     assert_eq!(
-        surviving(Predicate::is_not_null(col!("p_str"))),
+        surviving(Predicate::from_expr(expr!(is_not_null(col("p_str"))))),
         both,
         "both files must be kept under p_str IS NOT NULL"
     );
 
     // The binary column reconstructs "" as empty bytes, pruned the same way.
     assert_eq!(
-        surviving(Predicate::eq(col!("p_bin"), lit(b"other".as_slice()))),
+        surviving(Predicate::from_expr(expr!(
+            col("p_bin") == lit(b"other".as_slice())
+        ))),
         vec![other.clone()],
         "empty-bytes file must be pruned under p_bin = X'6f74686572'"
     );
+}
+
+#[rstest]
+#[case::default_utc(None, "2024-01-15 12:30:45.123456", "2024-01-15T12:30:45.123456Z")]
+#[case::explicit_utc(
+    Some("UTC"),
+    "2024-01-15 12:30:45.123456",
+    "2024-01-15T12:30:45.123456Z"
+)]
+#[case::los_angeles_winter(
+    Some("America/Los_Angeles"),
+    "2024-01-15 12:30:45.123456",
+    "2024-01-15T20:30:45.123456Z"
+)]
+#[case::los_angeles_summer(
+    Some("America/Los_Angeles"),
+    "2024-06-15 08:00:00.500500",
+    "2024-06-15T15:00:00.500500Z"
+)]
+#[case::fixed_offset(
+    Some("+12:45"),
+    "2024-01-15 12:30:45.123456",
+    "2024-01-14T23:45:45.123456Z"
+)]
+#[case::explicit_offset(
+    Some("America/Los_Angeles"),
+    "2024-01-15T12:30:45+02:00",
+    "2024-01-15T10:30:45Z"
+)]
+#[case::dst_overlap(
+    Some("America/Los_Angeles"),
+    "2024-11-03 01:30:00",
+    "2024-11-03T08:30:00Z"
+)]
+#[case::dst_gap(
+    Some("America/Los_Angeles"),
+    "2024-03-10 02:30:00",
+    "2024-03-10T10:30:00Z"
+)]
+#[case::hst_historical(Some("HST"), "1940-01-01 00:00:00", "1940-01-01T10:00:00Z")]
+#[case::mst_historical(Some("MST"), "1943-07-01 00:00:00", "1943-07-01T07:00:00Z")]
+#[case::est_historical(Some("EST"), "1900-01-01 00:00:00", "1900-01-01T05:00:00Z")]
+#[case::honolulu_historical(
+    Some("Pacific/Honolulu"),
+    "1940-01-01 00:00:00",
+    "1940-01-01T10:30:00Z"
+)]
+#[case::phoenix_historical(Some("America/Phoenix"), "1943-07-01 00:00:00", "1943-07-01T06:00:00Z")]
+#[case::panama_historical(Some("America/Panama"), "1900-01-01 00:00:00", "1900-01-01T05:19:36Z")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn offset_less_timestamp_partition_read_with_json_and_checkpoint(
+    #[case] tz: Option<&str>,
+    #[case] timestamp: &str,
+    #[values("none", "id", "name")] cm_mode: &str,
+    #[case] expected_ts: &str,
+    #[values(false, true)] write_parsed_partition: bool,
+) {
+    // === Init a table with one file in a checkpoint and one in JSON ===
+    let (_temp_dir, table_path, engine) = test_table_setup_mt().unwrap();
+    let snapshot = create_timestamp_partition_table_with_parsed_partition(
+        &table_path,
+        engine.as_ref(),
+        cm_mode,
+        write_parsed_partition,
+    );
+
+    insert_raw_timestamp_partitions(
+        &snapshot,
+        &[TimestampPartitionFile {
+            filename: "file1.parquet",
+            timestamp,
+        }],
+    )
+    .await;
+    let snapshot = Snapshot::builder_for(&table_path)
+        .build(engine.as_ref())
+        .unwrap();
+    snapshot.checkpoint(engine.as_ref(), None).unwrap();
+
+    insert_raw_timestamp_partitions(
+        &snapshot,
+        &[TimestampPartitionFile {
+            filename: "file2.parquet",
+            timestamp,
+        }],
+    )
+    .await;
+    let snapshot = Snapshot::builder_for(&table_path)
+        .build(engine.as_ref())
+        .unwrap();
+    let physical_names = physical_timestamp_partition_names(&snapshot);
+
+    // === Build a scan with the timezone ===
+    let options = tz.map_or_else(PartitionValuesOptions::with_struct, |tz| {
+        PartitionValuesOptions::with_struct().with_timestamp_timezone(tz)
+    });
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(options)
+        .build()
+        .unwrap();
+
+    // === Assert results ===
+    // Checkpoint writes interpret offset-less timestamps in UTC.
+    let checkpoint_parsed_ts = DateTime::parse_from_rfc3339(timestamp)
+        .map(|value| value.timestamp_micros())
+        .or_else(|_| {
+            NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%d %H:%M:%S%.f")
+                .map(|value| value.and_utc().timestamp_micros())
+        })
+        .unwrap();
+    let expected_ts = timestamp_micros(expected_ts);
+    let mut paths = Vec::new();
+    let mut sources = Vec::new();
+    for metadata in scan.scan_metadata(engine.as_ref()).unwrap() {
+        let metadata = metadata.unwrap();
+        if tz.is_some() {
+            assert!(metadata.scan_file_transforms.iter().all(Option::is_none));
+        }
+        let source = metadata.partition_values_source();
+        let (data, selection) = metadata.scan_files.into_parts();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data).unwrap().into();
+        let batch = filter_record_batch(&batch, &BooleanArray::from(selection)).unwrap();
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let parsed = get_column!(batch, "partitionValues_parsed", StructArray);
+        let timestamps = get_column!(parsed, &physical_names[0], TimestampMicrosecondArray);
+        let timestamps_ntz = get_column!(parsed, &physical_names[1], TimestampMicrosecondArray);
+        let integers = get_column!(parsed, &physical_names[2], Int32Array);
+        let file_paths = get_column!(batch, "path", StringArray);
+        for field in parsed.columns() {
+            assert_eq!(field.null_count(), 0);
+        }
+        for row in 0..batch.num_rows() {
+            let path = file_paths.value(row);
+            let expected = match path {
+                "file1.parquet" if write_parsed_partition => checkpoint_parsed_ts,
+                "file1.parquet" | "file2.parquet" => expected_ts,
+                _ => panic!("unexpected file: {path}"),
+            };
+            assert_eq!(timestamps.value(row), expected, "{path}");
+            assert_eq!(
+                timestamps_ntz.value(row),
+                timestamp_micros("2024-01-15T12:30:45.123456Z"),
+                "timezone must not affect TIMESTAMP_NTZ"
+            );
+            assert_eq!(integers.value(row), 7);
+            paths.push(path.to_string());
+            sources.push((path.to_string(), source));
+        }
+    }
+    paths.sort();
+    assert_eq!(paths, ["file1.parquet", "file2.parquet"]);
+
+    // Each file reports the source of the batch it was read from. `file1` is in the checkpoint, so
+    // it reports `Checkpoint` only when the checkpoint has a native column. `file2` exists only in
+    // a JSON commit, which carries just the string map, so it is always `Derived`.
+    let checkpoint_source = if write_parsed_partition {
+        ParsedColumnSource::Checkpoint
+    } else {
+        ParsedColumnSource::Derived
+    };
+    sources.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        sources,
+        [
+            ("file1.parquet".to_string(), Some(checkpoint_source)),
+            (
+                "file2.parquet".to_string(),
+                Some(ParsedColumnSource::Derived)
+            ),
+        ]
+    );
+}
+
+#[rstest]
+#[case::utc_before(
+    Predicate::from_expr(expr!(
+        col("p_ts") < lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))
+    )),
+    None,
+    ("2024-01-15 12:30:45.123456", "2024-01-15T18:30:45.123456Z"),
+    &[
+        ("offset-less-in-checkpoint.parquet", "2024-01-15T12:30:45.123456Z"),
+        ("offset-less-in-json.parquet", "2024-01-15T12:30:45.123456Z"),
+    ],
+    true /* write_parsed_partition */
+)]
+#[case::utc_after(
+    Predicate::from_expr(expr!(
+        col("p_ts") > lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))
+    )),
+    None,
+    ("2024-01-15 12:30:45.123456", "2024-01-15T18:30:45.123456Z"),
+    &[
+        ("utc-in-checkpoint.parquet", "2024-01-15T18:30:45.123456Z"),
+        ("utc-in-json.parquet", "2024-01-15T18:30:45.123456Z"),
+    ],
+    true /* write_parsed_partition */
+)]
+#[case::los_angeles_before(
+    Predicate::from_expr(expr!(
+        col("p_ts") < lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))
+    )),
+    Some("America/Los_Angeles"),
+    ("2024-01-15 12:30:45.123456", "2024-01-15T18:30:45.123456Z"),
+    &[("offset-less-in-checkpoint.parquet", "2024-01-15T12:30:45.123456Z")],
+    true /* write_parsed_partition */
+)]
+#[case::los_angeles_after(
+    Predicate::from_expr(expr!(
+        col("p_ts") > lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))
+    )),
+    Some("America/Los_Angeles"),
+    ("2024-01-15 12:30:45.123456", "2024-01-15T18:30:45.123456Z"),
+    &[
+        ("offset-less-in-json.parquet", "2024-01-15T20:30:45.123456Z"),
+        ("utc-in-checkpoint.parquet", "2024-01-15T18:30:45.123456Z"),
+        ("utc-in-json.parquet", "2024-01-15T18:30:45.123456Z"),
+    ],
+    true /* write_parsed_partition */
+)]
+#[case::los_angeles_before_without_parsed(
+    Predicate::from_expr(expr!(
+        col("p_ts") < lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))
+    )),
+    Some("America/Los_Angeles"),
+    ("2024-01-15 12:30:45.123456", "2024-01-15T18:30:45.123456Z"),
+    &[],
+    false /* write_parsed_partition */
+)]
+#[case::hst_historical(
+    Predicate::from_expr(expr!(
+        col("p_ts") == lit(Scalar::Timestamp(timestamp_micros("1940-01-01T10:00:00Z")))
+    )),
+    Some("HST"),
+    ("1940-01-01 00:00:00", "1940-01-01T10:30:00Z"),
+    &[
+        ("offset-less-in-checkpoint.parquet", "1940-01-01T10:00:00Z"),
+        ("offset-less-in-json.parquet", "1940-01-01T10:00:00Z"),
+    ],
+    false /* write_parsed_partition */
+)]
+#[case::mst_historical(
+    Predicate::from_expr(expr!(
+        col("p_ts") == lit(Scalar::Timestamp(timestamp_micros("1943-07-01T07:00:00Z")))
+    )),
+    Some("MST"),
+    ("1943-07-01 00:00:00", "1943-07-01T06:00:00Z"),
+    &[
+        ("offset-less-in-checkpoint.parquet", "1943-07-01T07:00:00Z"),
+        ("offset-less-in-json.parquet", "1943-07-01T07:00:00Z"),
+    ],
+    false /* write_parsed_partition */
+)]
+#[case::est_historical(
+    Predicate::from_expr(expr!(
+        col("p_ts") == lit(Scalar::Timestamp(timestamp_micros("1900-01-01T05:00:00Z")))
+    )),
+    Some("EST"),
+    ("1900-01-01 00:00:00", "1900-01-01T05:19:36Z"),
+    &[
+        ("offset-less-in-checkpoint.parquet", "1900-01-01T05:00:00Z"),
+        ("offset-less-in-json.parquet", "1900-01-01T05:00:00Z"),
+    ],
+    false /* write_parsed_partition */
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn offset_less_timestamp_partition_predicates_with_json_and_checkpoint(
+    #[case] predicate: Predicate,
+    #[case] tz: Option<&str>,
+    #[case] timestamps: (&str, &str),
+    #[case] expected_files_and_timestamps: &[(&str, &str)],
+    #[case] write_parsed_partition: bool,
+    #[values(false, true)] parsed_struct_on_scan: bool,
+    #[values("none", "id", "name")] cm_mode: &str,
+) {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt().unwrap();
+    let snapshot = create_timestamp_partition_table_with_parsed_partition(
+        &table_path,
+        engine.as_ref(),
+        cm_mode,
+        write_parsed_partition,
+    );
+
+    insert_raw_timestamp_partitions(
+        &snapshot,
+        &[
+            TimestampPartitionFile {
+                filename: "offset-less-in-checkpoint.parquet",
+                timestamp: timestamps.0,
+            },
+            TimestampPartitionFile {
+                filename: "utc-in-checkpoint.parquet",
+                timestamp: timestamps.1,
+            },
+        ],
+    )
+    .await;
+    let snapshot = Snapshot::builder_for(&table_path)
+        .build(engine.as_ref())
+        .unwrap();
+    snapshot.checkpoint(engine.as_ref(), None).unwrap();
+
+    insert_raw_timestamp_partitions(
+        &snapshot,
+        &[
+            TimestampPartitionFile {
+                filename: "offset-less-in-json.parquet",
+                timestamp: timestamps.0,
+            },
+            TimestampPartitionFile {
+                filename: "utc-in-json.parquet",
+                timestamp: timestamps.1,
+            },
+        ],
+    )
+    .await;
+    let snapshot = Snapshot::builder_for(&table_path)
+        .build(engine.as_ref())
+        .unwrap();
+    let physical_names = physical_timestamp_partition_names(&snapshot);
+    let mut options = if parsed_struct_on_scan {
+        PartitionValuesOptions::with_struct()
+    } else {
+        PartitionValuesOptions::string_map_only()
+    };
+    if let Some(tz) = tz {
+        options = options.with_timestamp_timezone(tz);
+    }
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(predicate.clone()))
+        .with_partition_values(options)
+        .build()
+        .unwrap();
+
+    let mut actual = Vec::new();
+    for metadata in scan.scan_metadata(engine.as_ref()).unwrap() {
+        let (data, selection) = metadata.unwrap().scan_files.into_parts();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data).unwrap().into();
+        let batch = filter_record_batch(&batch, &BooleanArray::from(selection)).unwrap();
+        let paths = get_column!(batch, "path", StringArray);
+        let timestamps = parsed_struct_on_scan.then(|| {
+            let parsed = get_column!(batch, "partitionValues_parsed", StructArray);
+            get_column!(parsed, &physical_names[0], TimestampMicrosecondArray)
+        });
+        for row in 0..batch.num_rows() {
+            actual.push((
+                paths.value(row).to_string(),
+                timestamps.map(|timestamps| {
+                    assert!(!timestamps.is_null(row));
+                    timestamps.value(row)
+                }),
+            ));
+        }
+    }
+    actual.sort();
+    let expected: Vec<_> = expected_files_and_timestamps
+        .iter()
+        .map(|(path, timestamp)| {
+            (
+                path.to_string(),
+                parsed_struct_on_scan.then(|| timestamp_micros(timestamp)),
+            )
+        })
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "tz={tz:?}, cm={cm_mode}, parsed={parsed_struct_on_scan}"
+    );
+}
+
+// Parallel scan, declarative scan, and scan.execute() require timezone support when the table is
+// timestamp partitioned.
+#[rstest]
+#[case::unpartitioned(vec![])]
+#[case::timestamp(vec![("ts", DataType::TIMESTAMP)])]
+#[case::timestamp_ntz(vec![("ts_ntz", DataType::TIMESTAMP_NTZ)])]
+#[case::integer(vec![("id", DataType::INTEGER)])]
+#[case::string(vec![("category", DataType::STRING)])]
+fn different_scans_require_timezone_support_only_for_timestamp_partitions(
+    #[values("UTC", "America/Los_Angeles", "+05:30")] tz: &str,
+    #[values(false, true)] parsed_struct: bool,
+    #[case] partition_columns: Vec<(&str, DataType)>,
+) {
+    let timestamp_partitioned = partition_columns
+        .iter()
+        .any(|(_, data_type)| data_type == &DataType::TIMESTAMP);
+    let (partition_names, partition_fields): (Vec<_>, Vec<_>) = partition_columns
+        .into_iter()
+        .map(|(name, data_type)| (name, StructField::nullable(name, data_type)))
+        .unzip();
+    let table = TestTableBuilder::new()
+        .with_log_state(LogState::with_latest_version(1).with_checkpoint_at([1]))
+        .with_table_config(TableConfig::new().write_stats_as_struct(true))
+        .with_schema(schema_ref! {
+            ..(partition_fields),
+            nullable "value": INTEGER,
+        })
+        .with_partition_columns(partition_names)
+        .build()
+        .unwrap();
+    let engine = Arc::new(table.engine());
+    let snapshot = Snapshot::builder_for(table.table_root())
+        .build(engine.as_ref())
+        .unwrap();
+    let options = if parsed_struct {
+        PartitionValuesOptions::with_struct()
+    } else {
+        PartitionValuesOptions::string_map_only()
+    };
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(options.with_timestamp_timezone(tz))
+        .build()
+        .unwrap();
+
+    #[cfg(feature = "declarative-plans")]
+    assert_result_error_with_message(
+        scan.declarative_metadata_scan_plan(engine.as_ref()),
+        if timestamp_partitioned {
+            "with_timestamp_timezone in declarative_metadata_scan_plan"
+        } else {
+            "this engine does not provide a PlanExecutor"
+        },
+    );
+    let parallel_result = scan.parallel_scan_metadata(engine.clone());
+    let execute_result = scan.execute(engine);
+    if timestamp_partitioned {
+        assert_result_error_with_message(
+            parallel_result,
+            "with_timestamp_timezone in parallel_scan_metadata",
+        );
+        assert_result_error_with_message(execute_result, "row transforms are disabled");
+    } else {
+        parallel_result.unwrap();
+        let batches = execute_result
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(!batches.is_empty());
+    }
+}
+
+#[rstest]
+#[case::unpartitioned(vec![], false /* expect_transform */)]
+#[case::not_timestamp_partition(vec!["category", "ts_ntz"], true /* expect_transform */)]
+#[case::timestamp_partition(vec!["ts"], false /* expect_transform */)]
+fn timestamp_timezone_controls_row_transforms(
+    #[case] partition_columns: Vec<&str>,
+    #[case] expect_transform: bool,
+    #[values("UTC", "America/Los_Angeles", "+05:30")] timezone: &str,
+) {
+    let timestamp_partition = partition_columns.contains(&"ts");
+    let table = TestTableBuilder::new()
+        .with_log_state(LogState::with_latest_version(1))
+        .with_schema(schema_ref! {
+            nullable "ts": TIMESTAMP,
+            nullable "ts_ntz": TIMESTAMP_NTZ,
+            nullable "category": STRING,
+            nullable "value": INTEGER,
+        })
+        .with_partition_columns(partition_columns)
+        .with_data(1, 3)
+        .build()
+        .unwrap();
+    let engine = Arc::new(table.engine());
+    let snapshot = Snapshot::builder_for(table.table_root())
+        .build(engine.as_ref())
+        .unwrap();
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(PartitionValuesOptions::default().with_timestamp_timezone(timezone))
+        .build()
+        .unwrap();
+
+    let mut file_count = 0;
+    for metadata in scan.scan_metadata(engine.as_ref()).unwrap() {
+        let (_, count) = metadata
+            .unwrap()
+            .visit_scan_files((expect_transform, file_count), |(expected, count), file| {
+                assert_eq!(file.transform.is_some(), *expected);
+                *count += 1;
+            })
+            .unwrap();
+        file_count = count;
+    }
+    assert!(file_count > 0);
+
+    let result = scan.execute(engine);
+    if timestamp_partition {
+        assert_result_error_with_message(result, "row transforms are disabled");
+    } else {
+        let row_count: usize = result.unwrap().map(|batch| batch.unwrap().len()).sum();
+        assert_eq!(row_count, 3);
+    }
+}
+
+#[test]
+fn scan_metadata_ignores_invalid_timestamp_timezone_for_unpartitioned_table() {
+    let (engine, snapshot, _table) = test_context!(
+        LogState::with_latest_version(1),
+        FeatureSet::empty(),
+        unpartitioned(),
+        TableConfig::new(),
+        version_latest(),
+    );
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(
+            PartitionValuesOptions::with_struct().with_timestamp_timezone("Not/AZone"),
+        )
+        .build()
+        .unwrap();
+
+    let mut file_count = 0;
+    for metadata in scan.scan_metadata(&engine).unwrap() {
+        file_count = metadata
+            .unwrap()
+            .visit_scan_files(file_count, |count, _| *count += 1)
+            .unwrap();
+    }
+    assert_eq!(file_count, 1);
+}
+
+#[rstest]
+#[case::invalid_zone("2024-01-15 12:30:45", "Not/AZone", "Not/AZone")]
+#[case::invalid_timestamp("not a timestamp", "America/Los_Angeles", "not a timestamp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timezone_aware_parsed_partition_values_report_invalid_input(
+    #[case] raw_timestamp: &str,
+    #[case] timestamp_timezone: &str,
+    #[case] expected_error: &str,
+) {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt().unwrap();
+    let snapshot = create_timestamp_partition_table(&table_path, engine.as_ref(), "none");
+    insert_raw_timestamp_partitions(
+        &snapshot,
+        &[TimestampPartitionFile {
+            filename: "part.parquet",
+            timestamp: raw_timestamp,
+        }],
+    )
+    .await;
+    let snapshot = Snapshot::builder_for(&table_path)
+        .build(engine.as_ref())
+        .unwrap();
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(
+            PartitionValuesOptions::with_struct().with_timestamp_timezone(timestamp_timezone),
+        )
+        .build();
+    let error = match scan {
+        Err(error) => error,
+        Ok(scan) => delta_kernel::Error::Kernel(match scan.scan_metadata(engine.as_ref()) {
+            Err(error) => error,
+            Ok(mut metadata) => {
+                let result = metadata.next().expect("one metadata result");
+                let Err(error) = result else {
+                    panic!("invalid timestamp input must fail map parsing");
+                };
+                error
+            }
+        }),
+    };
+    assert!(error.to_string().contains(expected_error), "{error}");
+}
+
+fn create_timestamp_partition_table(
+    table_path: &str,
+    engine: &dyn Engine,
+    cm_mode: &str,
+) -> SnapshotRef {
+    create_timestamp_partition_table_with_parsed_partition(
+        table_path, engine, cm_mode, true, /* write_parsed_partition */
+    )
+}
+
+fn create_timestamp_partition_table_with_parsed_partition(
+    table_path: &str,
+    engine: &dyn Engine,
+    cm_mode: &str,
+    write_parsed_partition: bool,
+) -> SnapshotRef {
+    let schema = schema_ref! {
+        nullable "p_ts": TIMESTAMP,
+        nullable "p_ntz": TIMESTAMP_NTZ,
+        nullable "p_int": INTEGER,
+        nullable "value": INTEGER,
+    };
+    create_table(table_path, schema, "Test/1.0", true)
+        .with_data_layout(DataLayout::partitioned(["p_ts", "p_ntz", "p_int"]))
+        .with_table_properties([
+            ("delta.columnMapping.mode", cm_mode),
+            (
+                "delta.checkpoint.writeStatsAsStruct",
+                if write_parsed_partition {
+                    "true"
+                } else {
+                    "false"
+                },
+            ),
+        ])
+        .build(engine, Box::new(FileSystemCommitter::new()))
+        .unwrap()
+        .commit(engine)
+        .unwrap()
+        .unwrap_post_commit_snapshot()
+}
+
+struct TimestampPartitionFile<'a> {
+    filename: &'a str,
+    timestamp: &'a str,
+}
+
+// Write Parquet and commit Add actions with the specified serialized timestamp in partitionValues.
+// This allows offset-less timestamps in addFile.partitionValues which kernel doesn't write.
+async fn insert_raw_timestamp_partitions(
+    snapshot: &SnapshotRef,
+    files: &[TimestampPartitionFile<'_>],
+) {
+    let physical_names = physical_timestamp_partition_names(snapshot);
+    let scan = snapshot.clone().scan_builder().build().unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(scan.physical_schema().as_ref().try_into_arrow().unwrap()),
+        vec![Arc::new(Int32Array::from(vec![42]))],
+    )
+    .unwrap();
+    let table_path = snapshot.table_root().to_file_path().unwrap();
+    let actions: Vec<_> = files
+        .iter()
+        .map(|file| {
+            let path = table_path.join(file.filename);
+            let mut writer =
+                ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            let file_size = std::fs::metadata(path).unwrap().len();
+            let partition_values: serde_json::Map<_, _> = physical_names
+                .iter()
+                .zip([file.timestamp, "2024-01-15 12:30:45.123456", "7"])
+                .map(|(name, value)| (name.clone(), serde_json::Value::String(value.to_string())))
+                .collect();
+            serde_json::json!({
+                "add": {
+                    "path": file.filename,
+                    "partitionValues": partition_values,
+                    "size": file_size,
+                    "modificationTime": 1700000000000_i64,
+                    "dataChange": true,
+                    "stats": "{\"numRecords\":1}",
+                },
+            })
+            .to_string()
+        })
+        .collect();
+    add_commit(
+        snapshot.table_root().as_str(),
+        &LocalFileSystem::new(),
+        snapshot.version() + 1,
+        actions.join("\n"),
+    )
+    .await
+    .unwrap();
+}
+
+fn physical_timestamp_partition_names(snapshot: &Snapshot) -> [String; 3] {
+    ["p_ts", "p_ntz", "p_int"].map(|name| {
+        get_any_level_column_physical_name(
+            snapshot.schema().as_ref(),
+            &ColumnName::new([name]),
+            snapshot.table_configuration().column_mapping_mode(),
+        )
+        .unwrap()
+        .into_inner()
+        .pop()
+        .unwrap()
+    })
+}
+
+fn timestamp_micros(value: &str) -> i64 {
+    DateTime::parse_from_rfc3339(value)
+        .unwrap()
+        .timestamp_micros()
 }

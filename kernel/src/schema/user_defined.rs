@@ -6,8 +6,9 @@ use serde::de::Error as _;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use super::file_utils::UsesFile;
 use super::{DataType, StructField};
-use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::{KernelError, KernelResult};
 
 /// An engine-defined annotation over a physical Delta type.
@@ -54,8 +55,8 @@ impl UserDefinedType {
     ///
     /// # Errors
     ///
-    /// Returns an error if `sql_type` contains another UDT or a metadata column, or if `annotation`
-    /// contains the reserved key `type` or `sqlType`.
+    /// Returns an error if `sql_type` contains another UDT, a metadata column, or a `file`, or if
+    /// `annotation` contains the reserved key `type` or `sqlType`.
     pub fn try_new(
         sql_type: impl Into<DataType>,
         annotation: HashMap<String, Option<String>>,
@@ -69,6 +70,13 @@ impl UserDefinedType {
         if contains_metadata_column(&sql_type) {
             return Err(KernelError::schema(
                 "A UDT sqlType must not contain a metadata column",
+            ));
+        }
+        // A `file` must be visible in the schema, so the table features and handling it requires
+        // apply; a UDT is visited as a leaf.
+        if UsesFile.transform(&sql_type).is_err() {
+            return Err(KernelError::schema(
+                "A UDT sqlType must not contain a `file`",
             ));
         }
         if annotation.contains_key("type") || annotation.contains_key("sqlType") {
@@ -165,15 +173,15 @@ fn contains_metadata_column(data_type: &DataType) -> bool {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     use super::*;
-    use crate::schema::compare::{Error as ComparisonError, SchemaComparison};
-    use crate::schema::{schema, ArrayType, MapType, StructField};
-    use crate::table_changes::CdfMode;
-    use crate::transforms::{transform_output_type, SchemaTransform};
     #[cfg(feature = "declarative-plans")]
     use crate::PlanBuilder;
+    use crate::schema::compare::{Error as ComparisonError, SchemaComparison};
+    use crate::schema::{ArrayType, MapType, StructField, schema};
+    use crate::table_changes::CdfMode;
+    use crate::transforms::{SchemaTransform, transform_output_type};
 
     #[rstest]
     #[case(json!({"type":"udt", "sqlType":"long"}))]
@@ -467,6 +475,20 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("reserved")
+        );
+    }
+
+    /// A `file` inside a UDT would hide it from the `fileType` feature requirement.
+    #[rstest]
+    #[case::direct(DataType::file_type())]
+    #[case::nested(schema! { nullable "f": (DataType::file_type()) }.into())]
+    #[case::array_element(ArrayType::new(DataType::file_type(), true).into())]
+    fn construction_rejects_file(#[case] sql_type: DataType) {
+        assert!(
+            UserDefinedType::try_new(sql_type, HashMap::new())
+                .unwrap_err()
+                .to_string()
+                .contains("must not contain a `file`")
         );
     }
 

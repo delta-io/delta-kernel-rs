@@ -7,18 +7,20 @@ use std::sync::{Arc, LazyLock};
 use url::Url;
 
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor};
-use crate::expressions::{column_name, ColumnName};
+use crate::expressions::{ColumnName, column_name};
 use crate::log_replay::deduplicator::{Deduplicator, FileActionInfo};
 use crate::log_replay::{FileActionDeduplicator, FileActionKey};
 use crate::scan::data_skipping::DataSkippingFilter;
-use crate::scan::{PhysicalPredicate, COMMIT_READ_SCHEMA};
+use crate::scan::{
+    COMMIT_READ_SCHEMA, PartitionValuesOptions, PhysicalPredicate, map_to_struct_options,
+};
 use crate::schema::{ColumnNamesAndTypes, DataType};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::Operation;
 use crate::utils::require;
 use crate::{
-    Engine, EngineData, FileDataReadResultIterator, FileMeta, KernelError, KernelResult,
-    PredicateRef, Version,
+    Engine, EngineData, Error, FileDataReadResultIterator, FileMeta, KernelError, KernelResult,
+    PredicateRef, Result, Version,
 };
 
 /// Builder for an incremental scan over `(base_version, target_version]`. Construct via
@@ -29,6 +31,7 @@ pub struct IncrementalScanBuilder {
     target_snapshot: SnapshotRef,
     base_version: Version,
     predicate: Option<PredicateRef>,
+    partition_values_options: PartitionValuesOptions,
 }
 
 impl IncrementalScanBuilder {
@@ -38,6 +41,7 @@ impl IncrementalScanBuilder {
             target_snapshot: target_snapshot.into(),
             base_version,
             predicate: None,
+            partition_values_options: PartitionValuesOptions::default(),
         }
     }
 
@@ -60,9 +64,27 @@ impl IncrementalScanBuilder {
         self
     }
 
-    /// Build the incremental scan stream, or `None` if the target snapshot's commit list
-    /// cannot serve `(base_version, target_version]` (consumers should fall back to a full
-    /// scan via [`crate::Snapshot::scan_builder`]).
+    /// Configure how partition values are interpreted when pruning with [`Self::with_predicate`].
+    /// The timezone option has no effect without a predicate on partition columns.
+    ///
+    /// Defaults to [`PartitionValuesOptions::default`].
+    ///
+    /// Kernel does not yet support [`PartitionValuesOptions::with_struct`] in incremental scans.
+    /// Passing it causes [`Self::build`] to return an error.
+    pub fn with_partition_values(
+        mut self,
+        partition_values_options: PartitionValuesOptions,
+    ) -> Self {
+        self.partition_values_options = partition_values_options;
+        self
+    }
+
+    /// Build the incremental scan stream, or `None` if the range cannot be served from commit
+    /// JSONs (consumers should fall back to a full scan via [`crate::Snapshot::scan_builder`]).
+    /// That happens when the target snapshot's commit list does not cover
+    /// `(base_version, target_version]`, or when some commit in the range may record file actions
+    /// outside its commit JSON (e.g. adaptiveMetadata manifest commits). TODO(#2866): serve such
+    /// ranges by reading their file actions from the metadata tree instead of returning `None`.
     ///
     /// Does not re-list `_delta_log/`: walks the target snapshot's already-validated commit
     /// list and clips it to `(base_version, target_version]`. For catalog-managed tables
@@ -80,11 +102,12 @@ impl IncrementalScanBuilder {
     ///
     /// # Errors
     /// - `Err` if `base_version >= target_snapshot.version()` (caller error).
+    /// - [`KernelError::Unsupported`] if typed partition value output is requested.
     /// - [`KernelError::MissingColumn`] if a [`with_predicate`](Self::with_predicate) predicate
     ///   references a column absent from the table schema.
     /// - `Err` if the target snapshot's protocol contains an unsupported reader feature.
-    /// - `Err` if the engine fails to open the commit stream.
-    pub fn build(self, engine: &dyn Engine) -> KernelResult<Option<IncrementalScanStream>> {
+    /// - `Err` if the engine fails to read the log.
+    pub fn build(self, engine: &dyn Engine) -> Result<Option<IncrementalScanStream>> {
         // TODO(#2493): the version validation, the snapshot-commit-list extraction and
         // clipping below, and the "snapshot covers the range" check should all be replaced
         // by a single `CommitRangeBuilder::from_snapshot(...).build(engine)` call once
@@ -92,9 +115,16 @@ impl IncrementalScanBuilder {
         let target_version = self.target_snapshot.version();
         require!(
             self.base_version < target_version,
-            KernelError::generic(format!(
+            Error::Kernel(KernelError::generic(format!(
                 "IncrementalScanBuilder: base_version ({}) must be less than target_version ({})",
                 self.base_version, target_version
+            )))
+        );
+        // TODO(#3702): Support returning parsed partition values in incremental scans.
+        require!(
+            !self.partition_values_options.parsed_struct,
+            Error::Kernel(KernelError::unsupported(
+                "Kernel does not yet support returning parsed partition values in incremental scans"
             ))
         );
         // Resolve the predicate into an Add-side skipping strategy up front so `build` can
@@ -129,6 +159,17 @@ impl IncrementalScanBuilder {
         // `CommitRange::build` (e.g. `KernelError::CommitsUnavailable { missing: Range<Version>
         // }`), pattern-matched here to return `None`.
         if snapshot_first_version.is_none_or(|v| v > start_version) {
+            return Ok(None);
+        }
+
+        // TODO(#2866): derive in-range manifest commits' file changes from the metadata tree
+        // instead of falling back.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if self
+            .target_snapshot
+            .last_manifest_commit(engine)?
+            .is_some_and(|last| last.may_have_tree_only_file_actions_after(self.base_version))
+        {
             return Ok(None);
         }
 
@@ -190,11 +231,19 @@ impl IncrementalScanBuilder {
                 // parse stats from `add.stats` JSON and partition values from
                 // `add.partitionValues`, then skip against the shared `DataSkippingFilter`.
                 // `None` (predicate ineligible for skipping) degrades to keep-all.
+                //
+                // Here we pass the timezone to MapToStruct unconditionally, even if the predicate
+                // does not reference a TIMESTAMP partition column. As a result, data skipping fails
+                // for an invalid timezone whenever it evaluates a predicate on any partition
+                // column. This is an intentional choice to reduce branches.
                 let filter = DataSkippingFilter::for_raw_action_batch(
                     engine,
                     physical_predicate,
                     table_configuration,
                     COMMIT_READ_SCHEMA.clone(),
+                    map_to_struct_options(
+                        self.partition_values_options.timestamp_timezone.as_deref(),
+                    ),
                 );
                 Ok(filter.map_or(AddSkipping::KeepAll, |f| AddSkipping::Filter(Arc::new(f))))
             }
@@ -712,3 +761,6 @@ impl RowVisitor for IncrementalDedupVisitor<'_, '_> {
         Ok(())
     }
 }
+
+#[cfg(all(test, feature = "adaptive-metadata-in-dev"))]
+mod amt_tests;

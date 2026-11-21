@@ -2,6 +2,7 @@
 
 use std::sync::{Arc, LazyLock};
 
+use crate::KernelResult;
 use crate::arrow::array::{
     ArrayRef, GenericListArray, GenericListViewArray, Int32Array, LargeListArray, ListArray,
     OffsetSizeTrait, StructArray,
@@ -10,7 +11,6 @@ use crate::arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Fields};
 use crate::engine_data::{GetData, RowVisitor};
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
-use crate::KernelResult;
 
 /// The list encodings that `ListLikeArray` unifies. The view flavors resolve a row's elements from
 /// a separate sizes buffer rather than from adjacent offsets, so they exercise a structurally
