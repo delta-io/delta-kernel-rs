@@ -370,11 +370,11 @@ impl Snapshot {
     pub(crate) fn checkpoint_info(
         &self,
         engine: &dyn Engine,
-        checkpoint: &mut Option<crate::metrics::CheckpointMetrics>,
+        metrics: &mut Option<crate::metrics::CheckpointMetrics>,
     ) -> KernelResult<Option<Arc<CheckpointInfo>>> {
         if let Some(resolved) = self.checkpoint_info.get() {
-            if let Some(checkpoint) = checkpoint {
-                checkpoint.cache_hit = Some(true);
+            if let Some(metrics) = metrics {
+                metrics.cache_hit = Some(true);
             }
             return Ok(resolved.clone());
         }
@@ -386,19 +386,19 @@ impl Snapshot {
             // A panicking initializer cannot publish partial state, so retry after poisoning.
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(resolved) = self.checkpoint_info.get() {
-            if let Some(checkpoint) = checkpoint {
-                checkpoint.cache_hit = Some(true);
+            if let Some(metrics) = metrics {
+                metrics.cache_hit = Some(true);
             }
             return Ok(resolved.clone());
         }
-        if let Some(checkpoint) = checkpoint {
-            checkpoint.cache_hit = Some(false);
+        if let Some(metrics) = metrics {
+            metrics.cache_hit = Some(false);
         }
         let resolved = if self.log_segment.listed.checkpoint_parts.is_empty() {
             None
         } else {
             let executor = engine.require_plan_executor()?;
-            CheckpointInfo::resolve(executor.as_ref(), self.log_segment(), checkpoint)?
+            CheckpointInfo::resolve(executor.as_ref(), self.log_segment(), metrics)?
                 .map(Arc::new)
         };
         // All initializers hold the mutex; publish only after every fallible operation succeeds.
