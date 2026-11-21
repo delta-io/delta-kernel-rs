@@ -109,15 +109,16 @@ use url::Url;
 mod builder;
 pub mod ir;
 pub mod proto;
+mod values;
 
 pub use builder::PlanBuilder;
 use bytes::Bytes;
 pub use ir::nodes::{RelationId, RelationRef};
 pub use ir::plan::Plan;
 pub use ir::{IoOperation, Operation};
+use itertools::Itertools;
 
 use crate::engine_data::TypedGetData as _;
-use crate::expressions::struct_rows::engine_rows;
 use crate::expressions::{ColumnName, TryFromStructRows, column_name};
 use crate::schema::{DataType, ToSchema};
 use crate::{
@@ -182,7 +183,8 @@ pub trait PlanExecutorExt: PlanExecutor {
     /// decodes at most two rows; later batches may remain unread. The plan's schema must equal the
     /// requested schema, including field nullability and metadata.
     ///
-    /// Supports numbers, booleans, strings, binary, dates, string lists, and string maps.
+    /// Supports numbers, booleans, strings, binary, dates, string lists, string maps, and nested
+    /// structs. A null struct masks its children, including their required fields.
     /// List elements and map values must be non-nullable in the schema, even for empty streams.
     /// String-list source schemas must declare non-null elements; batches are also checked.
     /// Required nulls and null string-list elements return errors. Null map entries are dropped;
@@ -191,7 +193,7 @@ pub trait PlanExecutorExt: PlanExecutor {
     fn execute_plan_into<T: TryFromStructRows>(&self, plan: Plan) -> KernelResult<T> {
         let schema = <T::Row as ToSchema>::schema_ref();
         for field in schema.fields() {
-            engine_rows::ensure_supported(field)?;
+            values::ensure_supported(field)?;
         }
         if &plan.schema != schema {
             return Err(KernelError::invalid_struct_data(format!(
@@ -199,7 +201,16 @@ pub trait PlanExecutorExt: PlanExecutor {
                 plan.schema
             )));
         }
-        T::collect_batches(self.execute_plan(plan)?.into_data()?)
+        let columns = <T::Row as ToSchema>::leaf_columns();
+        T::collect_into(
+            self.execute_plan(plan)?
+                .into_data()?
+                .map(|batch| {
+                    values::read_struct(batch?.as_ref(), schema, columns)
+                        .map(|rows| rows.into_iter().flatten())
+                })
+                .flatten_ok(),
+        )
     }
 }
 

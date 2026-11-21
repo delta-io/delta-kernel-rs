@@ -1,5 +1,7 @@
 //! Typed plan result conversion through the existing row visitor interface.
 
+mod nested;
+
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::{Arc, LazyLock};
@@ -279,6 +281,8 @@ fn custom_decoder_errors_stop_collection(
         attrs: Some(HashMap::from([("key".to_owned(), "value".to_owned())])),
     },
 ])]
+#[case::nested(nested::rows(false))]
+#[case::nested_populated(nested::rows(true))]
 fn rows_round_trip_through_values_and_executor<T>(#[case] expected: Vec<T>) -> KernelResult<()>
 where
     T: ToSchema
@@ -488,8 +492,9 @@ fn string_lists_reject_null_elements_with_hidden_bytes(
 #[case::nested_list(execute_rows::<Vec<NestedList>>, None)]
 #[case::nested_map(execute_rows::<Vec<NestedMap>>, None)]
 #[case::nullable_list_elements(execute_rows::<Vec<NullableList>>, None)]
-#[case::nullable_struct(execute_rows::<Vec<NestedStruct>>, None)]
+#[case::nullable_struct(execute_rows::<Vec<NestedStruct>>, Some(empty_batch::<NestedStruct> as fn() -> _))]
 #[case::nullable_map_values(execute_rows::<Vec<NullableMap>>, None)]
+#[case::unsupported_descendant(execute_rows::<Vec<nested::UnsupportedDescendant>>, None)]
 fn schema_support_controls_empty_results_and_stream_errors<T: Debug>(
     #[case] convert: fn(Vec<KernelResult<RecordBatch>>) -> KernelResult<Vec<T>>,
     #[case] batch: Option<fn() -> KernelResult<RecordBatch>>,
