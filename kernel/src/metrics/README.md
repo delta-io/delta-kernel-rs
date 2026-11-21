@@ -43,8 +43,8 @@ not the enclosing snapshot build. `Success` means a parsed hint was retained; it
 that the caller can use the checkpoint it names. See the type's rustdoc for outcome semantics.
 
 The span records `outcome` explicitly. The error channel fills an unrecorded outcome with `Error`
-without overwriting an explicit classification, such as `NotFound` on a top-level storage error.
-Malformed outcome labels decode to `Unknown` and defer warnings until the extension lock is released.
+without overwriting an explicit classification. Malformed outcome labels decode to `Unknown` and
+defer warnings until the extension lock is released.
 
 Use a flat outcome enum when every outcome has the same payload. When payloads differ, tagged
 variants can carry success-only statistics or a failure-only reason without optional fields.

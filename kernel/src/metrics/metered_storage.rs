@@ -105,6 +105,44 @@ impl StorageHandler for MeteredStorageHandler {
         )))
     }
 
+    fn read_small_file(&self, file: FileSlice) -> KernelResult<Option<Bytes>> {
+        let start = Instant::now();
+        let data = self.inner.read_small_file(file)?;
+        let (num_files, bytes_read) = match &data {
+            Some(bytes) => (1, bytes.len() as u64),
+            None => (0, 0),
+        };
+        emit_storage_span(
+            StorageReadCompleted::NAME,
+            start.elapsed(),
+            num_files,
+            bytes_read,
+        );
+        Ok(data)
+    }
+
+    fn read_small_file_with_cancellation(
+        &self,
+        file: FileSlice,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> KernelResult<Option<Bytes>> {
+        let start = Instant::now();
+        let data = self
+            .inner
+            .read_small_file_with_cancellation(file, cancellation_token)?;
+        let (num_files, bytes_read) = match &data {
+            Some(bytes) => (1, bytes.len() as u64),
+            None => (0, 0),
+        };
+        emit_storage_span(
+            StorageReadCompleted::NAME,
+            start.elapsed(),
+            num_files,
+            bytes_read,
+        );
+        Ok(data)
+    }
+
     fn copy_atomic(&self, src: &Url, dest: &Url) -> KernelResult<()> {
         let start = Instant::now();
         let result = self.inner.copy_atomic(src, dest);
