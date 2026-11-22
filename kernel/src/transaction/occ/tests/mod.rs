@@ -1,5 +1,5 @@
 //! Shared action builders and fixtures. T is the losing transaction. By default, T is a DELETE of
-//! the partition `DELETED_DATE`.
+//! the partition `DELETED_DATE`. `delete_conflict` also makes T read and remove `DELETED_FILE`.
 
 mod occ_plan;
 mod winner_check_plan;
@@ -17,10 +17,10 @@ use super::*;
 use crate::actions::{Add, CommitInfo, DomainMetadata, Protocol, Remove, SetTransaction};
 use crate::commit_range::CommitRange;
 use crate::engine::sync::SyncEngine;
-use crate::engine::sync::plan::SyncPlanExecutor;
-use crate::expressions::{Expression, Scalar, lit};
+use crate::engine::sync::plan::{ScopedSyncPlanExecutor, SyncPlanExecutor};
+use crate::expressions::{Expression, Scalar, StructData, lit};
 use crate::object_store::local::LocalFileSystem;
-use crate::plans::{Operation, PlanExecutor as _};
+use crate::plans::{Operation, PlanBuilder, PlanExecutor as _, ScopedPlanExecutor};
 use crate::row_tracking::RowTrackingDomainMetadata;
 use crate::schema::{PrimitiveType, schema, schema_ref};
 use crate::transaction::occ::winner_check_plan::{read_winner_summaries, winner_check_plan};
@@ -29,6 +29,7 @@ use crate::unit_test_utils::{Action, metadata_action};
 const READ_VERSION: Version = 6;
 const DELETED_DATE: &str = "2026-10-01";
 const OTHER_DATE: &str = "2026-10-02";
+const DELETED_FILE: &str = "date=2026-10-01/part-a.parquet";
 
 // === Actions ===
 
@@ -165,15 +166,21 @@ fn fake_summary(version: Version, operation: &str, is_blind_append: bool) -> Win
     }
 }
 
+/// A read relation that no executor retains, for plans that don't read it.
+fn no_read_files() -> RelationRef {
+    RelationRef::new("read_files", schema_ref! { not_null "path": STRING })
+}
+
 /// Makes `facts` an OPTIMIZE, which drops to SnapshotIsolation under WriteSerializable.
 fn make_optimize(facts: &mut LoserFacts) {
     facts.has_data_change = false;
     facts.operation_changes_data = false;
 }
 
-/// A DELETE under WriteSerializable that rewrites files.
+/// A DELETE under WriteSerializable that read the files in `read_files` and rewrites files.
 fn partitioned_delete_facts(
     read_version: Version,
+    read_files: &RelationRef,
     partition_schema: SchemaRef,
     partition_predicate: Option<PredicateRef>,
 ) -> LoserFacts {
@@ -188,6 +195,7 @@ fn partitioned_delete_facts(
         written_domains: vec![],
         read_app_ids: vec![],
         read_scope: ReadScope::Files {
+            read_files: read_files.clone(),
             partition_schema,
             partition_predicate,
             map_to_struct_options: MapToStructOptions::default(),
@@ -195,9 +203,10 @@ fn partitioned_delete_facts(
     }
 }
 
-fn deleted_date_facts() -> LoserFacts {
+fn deleted_date_facts(read_files: &RelationRef) -> LoserFacts {
     partitioned_delete_facts(
         READ_VERSION,
+        read_files,
         schema_ref! { nullable "date": DATE },
         Some(equals("date", date(DELETED_DATE))),
     )
@@ -222,6 +231,47 @@ fn try_winner_summaries(
     let plan = winner_check_plan(facts, winners).unwrap();
     let result = SyncPlanExecutor::default().execute_op(Operation::QueryPlan(plan));
     read_winner_summaries(result.unwrap(), winners)
+}
+
+/// T's file actions and read files, retained in a fresh scoped executor.
+struct LoserRelations {
+    executor: ScopedSyncPlanExecutor,
+    file_actions: RelationRef,
+    read_files: RelationRef,
+}
+
+impl LoserRelations {
+    /// T removes the files in `removed` and reads the files in `read`. The OCC plan reads only the
+    /// removes of T's file actions.
+    fn new(removed: &[&str], read: &[&str]) -> Self {
+        let executor = SyncPlanExecutor::default().get_scoped();
+        let path_schema = schema_ref! { not_null "path": STRING };
+        let remove = |&path: &&str| {
+            vec![Scalar::Struct(
+                StructData::try_new(path_schema.clone(), vec![path.into()]).unwrap(),
+            )]
+        };
+        let file_actions = schema_ref! { nullable "remove": { not_null "path": STRING } };
+        let removes = Vec::from_iter(removed.iter().map(remove));
+        let file_actions = retain(&executor, "file_actions", file_actions, removes);
+        let reads = Vec::from_iter(read.iter().map(|&path| vec![Scalar::from(path)]));
+        let read_files = retain(&executor, "read_files", path_schema, reads);
+        Self {
+            executor,
+            file_actions,
+            read_files,
+        }
+    }
+}
+
+fn retain(
+    executor: &dyn ScopedPlanExecutor,
+    name: &str,
+    schema: SchemaRef,
+    rows: Vec<Vec<Scalar>>,
+) -> RelationRef {
+    let plan = PlanBuilder::values(schema, rows).unwrap().build().unwrap();
+    executor.execute_and_retain(name, plan).unwrap()
 }
 
 // === Expected results ===

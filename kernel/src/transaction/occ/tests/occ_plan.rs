@@ -10,19 +10,31 @@ use crate::transaction::occ::winner_check_plan::{
     ROW_TRACKING_BACKFILL_OPERATION, ROW_TRACKING_UNBACKFILL_OPERATION,
 };
 
-/// The first OCC violation of the default T after `adjust`.
-fn delete_conflict(
+/// The first OCC violation of the default T after `adjust`, where T removes the files in
+/// `removed` and reads the files in `read`.
+fn occ_conflict(
     adjust: impl FnOnce(&mut LoserFacts),
+    removed: &[&str],
+    read: &[&str],
     commits: &[(Version, Vec<Value>)],
 ) -> Option<Conflict> {
-    let mut facts = deleted_date_facts();
+    let relations = LoserRelations::new(removed, read);
+    let mut facts = deleted_date_facts(&relations.read_files);
     adjust(&mut facts);
     let (_table, winners) = table_winners(facts.checked_version, commits);
     let summaries = winner_summaries(&facts, &winners);
     let versions = select_read_append_versions(&facts, &summaries);
-    let plan = occ_plan(&facts, &winners, &versions).unwrap();
-    let result = SyncPlanExecutor::default().execute_op(Operation::QueryPlan(plan));
+    let plan = occ_plan(&facts, &winners, &versions, &relations.file_actions).unwrap();
+    let result = relations.executor.execute_op(Operation::QueryPlan(plan));
     first_occ_conflict(result.unwrap(), &summaries).unwrap()
+}
+
+/// The first OCC violation of the default T, which reads and removes `DELETED_FILE`.
+fn delete_conflict(
+    adjust: impl FnOnce(&mut LoserFacts),
+    commits: &[(Version, Vec<Value>)],
+) -> Option<Conflict> {
+    occ_conflict(adjust, &[DELETED_FILE], &[DELETED_FILE], commits)
 }
 
 fn write_at_7(check: OccCheck) -> Option<Conflict> {
@@ -72,26 +84,98 @@ fn earliest_read_append_version_is_reported() {
     assert_eq!(result, expected);
 }
 
+#[rstest]
+#[case::read_delete(&[], &[DELETED_FILE], OccCheck::ReadDelete)]
+#[case::delete_delete(&[DELETED_FILE], &[], OccCheck::DeleteDelete)]
+fn winner_remove_conflicts_whatever_its_data_change(
+    #[case] removed: &[&str],
+    #[case] read: &[&str],
+    #[case] check: OccCheck,
+    #[values(true, false)] data_change: bool,
+) {
+    let actions = vec![commit_info("OPTIMIZE"), remove(DELETED_FILE, data_change)];
+    let result = occ_conflict(|_| {}, removed, read, &[(7, actions)]);
+    assert_eq!(result, conflict(7, Some("OPTIMIZE"), Occ(check)));
+}
+
+#[test]
+fn files_scope_passes_remove_of_unread_file() {
+    let actions = vec![
+        commit_info("WRITE"),
+        remove("date=2026-10-02/part-b.parquet", true),
+    ];
+    assert_eq!(delete_conflict(|_| {}, &[(7, actions)]), None);
+}
+
+#[rstest]
+#[case::read_append_before_other_checks_of_one_version(
+    READ_VERSION,
+    vec![(7, vec![commit_info("WRITE"), remove(DELETED_FILE, true), add("f7", DELETED_DATE)])],
+    write_at_7(OccCheck::ReadAppend),
+)]
+// An earlier `ReadDelete` comes before a later `ReadAppend`.
+#[case::earlier_version_then_check_order(
+    8,
+    vec![
+        (9, vec![commit_info("DELETE"), remove(DELETED_FILE, true)]),
+        (10, vec![commit_info("WRITE"), add("f10", DELETED_DATE)]),
+    ],
+    conflict(9, Some("DELETE"), Occ(OccCheck::ReadDelete)),
+)]
+fn occ_reporting_order(
+    #[case] checked_version: Version,
+    #[case] commits: Vec<(Version, Vec<Value>)>,
+    #[case] expected: Option<Conflict>,
+) {
+    let result = delete_conflict(|facts| facts.checked_version = checked_version, &commits);
+    assert_eq!(result, expected);
+}
+
 // === Read scope ===
 
 #[rstest]
 #[case::whole_table_conflicts_with_add_in_other_partition(
     ReadScope::WholeTable,
+    &[DELETED_FILE],
     add("f7", OTHER_DATE),
-    write_at_7(OccCheck::ReadAppend)
+    write_at_7(OccCheck::ReadAppend),
 )]
-#[case::nothing_passes_add_in_read_partition(ReadScope::Nothing, add("f7", DELETED_DATE), None)]
+#[case::whole_table_conflicts_with_remove_of_unread_file(
+    ReadScope::WholeTable,
+    &[DELETED_FILE],
+    remove("date=2026-10-02/part-b.parquet", true),
+    write_at_7(OccCheck::ReadDelete),
+)]
+#[case::whole_table_passes_winner_without_file_actions(
+    ReadScope::WholeTable,
+    &[DELETED_FILE],
+    txn("other-app"),
+    None,
+)]
+#[case::nothing_passes_add_in_read_partition(
+    ReadScope::Nothing,
+    &[],
+    add("f7", DELETED_DATE),
+    None,
+)]
+#[case::nothing_passes_remove_of_unremoved_file(
+    ReadScope::Nothing,
+    &[],
+    remove(DELETED_FILE, true),
+    None,
+)]
 fn whole_table_or_nothing_read_scope(
     #[case] read_scope: ReadScope,
+    #[case] removed: &[&str],
     #[case] action: Value,
     #[case] expected: Option<Conflict>,
 ) {
     let set_scope = |facts: &mut LoserFacts| {
         facts.read_scope = read_scope;
-        facts.rewrites_files = !facts.read_scope.is_nothing();
+        facts.rewrites_files = !removed.is_empty();
     };
     let commits = [(7, vec![commit_info("WRITE"), action])];
-    assert_eq!(delete_conflict(set_scope, &commits), expected);
+    assert_eq!(occ_conflict(set_scope, removed, &[], &commits), expected);
 }
 
 #[rstest]
@@ -157,7 +241,7 @@ fn whole_table_or_nothing_read_scope(
     vec![],
 )]
 fn read_append_versions(#[case] adjust: fn(&mut LoserFacts), #[case] expected: Vec<Version>) {
-    let mut facts = deleted_date_facts();
+    let mut facts = deleted_date_facts(&no_read_files());
     adjust(&mut facts);
     // No case expects version 10 or 11: `read_append` never checks a row-tracking backfill or
     // unbackfill.

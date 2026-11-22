@@ -15,7 +15,7 @@ fn summaries_with(
     commits: &[(Version, Vec<Value>)],
 ) -> Vec<WinnerSummary> {
     let (_table, winners) = table_winners(READ_VERSION, commits);
-    let mut facts = deleted_date_facts();
+    let mut facts = deleted_date_facts(&no_read_files());
     adjust(&mut facts);
     winner_summaries(&facts, &winners)
 }
@@ -119,7 +119,7 @@ fn empty_winner_commit_fails_winner_summary_check() {
         ],
     );
     assert_result_error_with_message(
-        try_winner_summaries(&deleted_date_facts(), &winners),
+        try_winner_summaries(&deleted_date_facts(&no_read_files()), &winners),
         "Generic delta kernel error: Conflict detection read no action from the commit file of \
          version 8",
     );
@@ -144,7 +144,7 @@ fn winner_with_several_commit_infos_fails_winner_summary_check() {
         ],
     );
     assert_result_error_with_message(
-        try_winner_summaries(&deleted_date_facts(), &winners),
+        try_winner_summaries(&deleted_date_facts(&no_read_files()), &winners),
         "Generic delta kernel error: Conflict detection can't check the winning commits at \
          versions [8], because each has more than one `commitInfo` action",
     );

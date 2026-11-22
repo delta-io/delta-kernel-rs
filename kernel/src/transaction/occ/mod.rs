@@ -3,7 +3,7 @@
 //! A winner is a commit after T's checked version. The checked version is T's read version on the
 //! first check, then the last winner version of the previous check. The winner check plan returns
 //! one summary for each winner that has an action, with the first winner rule that the winner
-//! breaks. The OCC plan checks the winners' adds against T's reads.
+//! breaks. The OCC plan checks the winners' file actions against T's reads and removes.
 //!
 //! Differences from Delta Spark:
 //! - Kernel returns an error for a winner with more than one `commitInfo` action. Delta Spark uses
@@ -30,7 +30,7 @@ use crate::action_reconciliation::plan::VERSION;
 use crate::engine_data::RowVisitor;
 use crate::expressions::MapToStructOptions;
 use crate::plans::ir::nodes::ScanFile;
-use crate::plans::{PlanBuilder, PlanResult};
+use crate::plans::{PlanBuilder, PlanResult, RelationRef};
 use crate::row_tracking::ROW_TRACKING_DOMAIN_NAME;
 use crate::schema::SchemaRef;
 use crate::table_properties::IsolationLevel;
@@ -103,9 +103,13 @@ impl LoserFacts {
 /// The part of the table that T read.
 #[derive(Debug, Clone)]
 pub(crate) enum ReadScope {
-    /// Any winner add can conflict with T.
+    /// Any winner add or remove can conflict with T.
     WholeTable,
     Files {
+        /// The files that T's scans returned, with a `path` column.
+        ///
+        /// Include every file that T adds again, so that a winner's remove of it fails T.
+        read_files: RelationRef,
         /// T's read-time partition schema, keyed by physical names.
         partition_schema: SchemaRef,
         /// The conjuncts of T's read predicate that reference only partition columns, by
@@ -123,7 +127,8 @@ pub(crate) enum ReadScope {
         map_to_struct_options: MapToStructOptions,
     },
     /// T ran no scan, for example a blind append. `read_app_ids` still applies. If T ran a scan,
-    /// pass `Files`, even if the scan returned no file.
+    /// pass `Files`, even if the scan returned no file. If T removes or re-adds a file, pass
+    /// `Files` or `WholeTable`.
     Nothing,
 }
 

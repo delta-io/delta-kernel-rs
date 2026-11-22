@@ -1,14 +1,18 @@
 //! The OCC plan returns one row for each check and version whose file actions conflict with T.
 //!
 //! ```text
-//! read_append: ScanJson -> Filter(add) -> Project(part) -> Filter(predicate) -> Project
-//!              -> Aggregate(check, version)
+//! read_append:   ScanJson -> Filter(add) -> Project(part) -> Filter(predicate) -> Project -+
+//! read_delete:   ScanJson -> Filter(remove) -+-> SemiJoin(read_files) -> Project ----------+
+//! delete_delete:                             +-> SemiJoin(file_actions) -> Project --------+
+//!                                                          UnionAll -> Aggregate(check, version)
 //! ```
 //!
 //! Project(part) and Filter(predicate) run only for a partitioned `ReadScope::Files` with a
-//! predicate. No check filters on `dataChange`.
+//! predicate, and SemiJoin(read_files) runs only for `ReadScope::Files`. No check filters on
+//! `dataChange`.
 //!
-//! For `ReadScope::Nothing`, `select_read_append_versions` selects no version.
+//! For `ReadScope::Nothing`, `select_read_append_versions` selects no version and `read_delete` has
+//! no read files.
 
 use std::sync::LazyLock;
 
@@ -21,10 +25,10 @@ use super::{
 };
 use crate::action_reconciliation::file_metadata::PARTITION_VALUES_FIELD;
 use crate::action_reconciliation::plan::VERSION;
-use crate::actions::ADD_NAME;
+use crate::actions::{ADD_NAME, REMOVE_NAME};
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{ColumnName, Expression, col, column_name, lit};
-use crate::plans::{Plan, PlanBuilder, PlanResult};
+use crate::plans::{Plan, PlanBuilder, PlanResult, RelationRef};
 use crate::scan::PrefixColumns;
 use crate::schema::{
     ColumnNamesAndTypes, DataType, SchemaRef, StructField, StructType, lazy_schema_ref, try_schema,
@@ -35,11 +39,19 @@ use crate::{KernelError, KernelResult, Version};
 
 const CHECK: &str = "check";
 const PART: &str = "part";
+const PATH: &str = "path";
 
 static WINNER_ADDS_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     not_null (VERSION): LONG,
     nullable (ADD_NAME): {
         not_null (PARTITION_VALUES_FIELD): { STRING => nullable STRING },
+    },
+};
+
+static WINNER_REMOVES_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    not_null (VERSION): LONG,
+    nullable (REMOVE_NAME): {
+        not_null (PATH): STRING,
     },
 };
 
@@ -54,23 +66,36 @@ static VIOLATION_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 pub(crate) enum OccCheck {
     /// The winner adds a file that T should have read.
     ReadAppend,
+    /// The winner removes a file that T read.
+    ReadDelete,
+    /// The winner removes a file that T also removes.
+    DeleteDelete,
 }
 
 /// Builds the OCC plan over `winners`.
 ///
-/// `read_append` scans only the winners at `read_append_versions`.
+/// `read_append` scans only the winners at `read_append_versions`. `file_actions` must have a
+/// `remove.path` column.
 pub(super) fn occ_plan(
     facts: &LoserFacts,
     winners: &[WinningCommit],
     read_append_versions: &[Version],
+    file_actions: &RelationRef,
 ) -> KernelResult<Plan> {
     let read_append = read_append_branch(&facts.read_scope, winners, read_append_versions)?;
-    violations(read_append, OccCheck::ReadAppend)?
-        // One row for each (check, version). Nothing reads the count.
-        .aggregate_by([column_name!(CHECK), column_name!(VERSION)], |aggs| {
-            aggs.count_star()
-        })?
-        .build()
+    let removes = winner_removes(winners)?;
+    let read_delete = read_delete_branch(&facts.read_scope, removes.clone())?;
+    let delete_delete = delete_delete_branch(removes, file_actions)?;
+    PlanBuilder::union_all([
+        violations(read_append, OccCheck::ReadAppend)?,
+        violations(read_delete, OccCheck::ReadDelete)?,
+        violations(delete_delete, OccCheck::DeleteDelete)?,
+    ])?
+    // One row for each (check, version). Nothing reads the count.
+    .aggregate_by([column_name!(CHECK), column_name!(VERSION)], |aggs| {
+        aggs.count_star()
+    })?
+    .build()
 }
 
 /// Returns the winner versions that `read_append` checks.
@@ -157,6 +182,37 @@ fn read_append_branch(
     let mut prefixer = PrefixColumns::new(column_name!(PART));
     let predicate = prefixer.transform_pred(partition_predicate).into_owned();
     adds.project(part, part_schema)?.filter(predicate)
+}
+
+/// Winner removes of files that T read.
+fn read_delete_branch(read_scope: &ReadScope, removes: PlanBuilder) -> KernelResult<PlanBuilder> {
+    match read_scope {
+        ReadScope::WholeTable => Ok(removes),
+        ReadScope::Files { read_files, .. } => removes.semi_join(
+            PlanBuilder::relation_source(read_files.clone()),
+            [column_name!(REMOVE_NAME, PATH)],
+            [column_name!(PATH)],
+        ),
+        ReadScope::Nothing => PlanBuilder::values(WINNER_REMOVES_SCHEMA.clone(), vec![]),
+    }
+}
+
+/// Winner removes of paths that T also removes.
+fn delete_delete_branch(
+    removes: PlanBuilder,
+    file_actions: &RelationRef,
+) -> KernelResult<PlanBuilder> {
+    let loser_removes = PlanBuilder::relation_source(file_actions.clone())
+        .filter(col!(REMOVE_NAME).is_not_null())?;
+    removes.semi_join(
+        loser_removes,
+        [column_name!(REMOVE_NAME, PATH)],
+        [column_name!(REMOVE_NAME, PATH)],
+    )
+}
+
+fn winner_removes(winners: &[WinningCommit]) -> KernelResult<PlanBuilder> {
+    scan_winners(winners, WINNER_REMOVES_SCHEMA.clone())?.filter(col!(REMOVE_NAME).is_not_null())
 }
 
 fn violations(branch: PlanBuilder, check: OccCheck) -> KernelResult<PlanBuilder> {
