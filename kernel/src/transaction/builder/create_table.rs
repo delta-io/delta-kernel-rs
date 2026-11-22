@@ -913,6 +913,7 @@ pub struct CreateTableBuilderState {
     path: String,
     schema: SchemaRef,
     table_properties: HashMap<String, String>,
+    description: Option<String>,
     data_layout: DataLayout,
 }
 
@@ -934,6 +935,7 @@ impl TransactionBuilder<CreateTable> {
                 path: path.as_ref().to_string(),
                 schema,
                 table_properties: HashMap::new(),
+                description: None,
                 data_layout: DataLayout::None,
             },
             _mode: PhantomData,
@@ -984,6 +986,16 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
         self.local_state
             .table_properties
             .extend(properties.into_iter().map(|(k, v)| (k.into(), v.into())));
+        self
+    }
+
+    /// Sets the description of the new Delta table, stored in the `description` field of its
+    /// metadata.
+    ///
+    /// Calling this method again replaces the previous description.
+    #[internal_api]
+    pub(crate) fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.local_state.description = Some(description.into());
         self
     }
 
@@ -1178,7 +1190,7 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
             .unwrap_or_default();
         let metadata = Metadata::try_new(
             None, // name
-            None, // description
+            self.local_state.description,
             effective_schema.clone(),
             partition_columns,
             current_time_ms()?,
