@@ -303,8 +303,6 @@ impl<'a> SnapshotReader<'a> {
         engine: &dyn Engine,
         operation: impl FnOnce(&Snapshot, &dyn Engine) -> KernelResult<T>,
     ) -> KernelResult<T> {
-        #[cfg(feature = "limited-memory")]
-        let _scope = crate::memory::AllocationScope::new(self.snapshot.memory_allocator());
         let scoped_engine = self
             .cancellation_token
             .as_ref()

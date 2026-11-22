@@ -13,17 +13,14 @@ use delta_kernel_derive::internal_api;
 use derive_more::From;
 use indexmap::IndexMap;
 use itertools::Itertools;
-use serde::de::Error as DeError;
 use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 #[cfg(feature = "geo-type-in-dev")]
 use strum::{Display as StrumDisplay, EnumString};
 use tracing::warn;
 
 // re-export because many call sites that use schemas do not necessarily use expressions
 pub(crate) use crate::expressions::{ColumnName, column_name};
-#[cfg(feature = "limited-memory")]
 use crate::memory::Owned;
 use crate::reserved_field_ids::FILE_NAME;
 use crate::schema::collation_utils::rewrite_collation_field_prefix;
@@ -212,17 +209,13 @@ pub(crate) trait ToSchema {
     fn schema_ref() -> &'static SchemaRef;
 }
 
-#[derive(Debug, Serialize, Clone, Eq, From)]
-#[cfg_attr(not(feature = "limited-memory"), derive(Deserialize, PartialEq))]
+#[derive(Debug, Serialize, Clone, Eq, PartialEq, From)]
 #[serde(untagged)]
 pub enum MetadataValue {
     #[from]
     Number(i64),
     #[from(String, &String, &str)]
-    String(String),
-    /// String metadata retained under an explicit memory budget.
-    #[cfg(feature = "limited-memory")]
-    LimitedString(Arc<crate::memory::LimitedString>),
+    String(crate::memory::SharedString),
     #[from]
     Boolean(bool),
     // The [PROTOCOL](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#struct-field) states
@@ -237,27 +230,22 @@ impl MetadataValue {
     pub fn as_string(&self) -> Option<&str> {
         match self {
             Self::String(value) => Some(value),
-            #[cfg(feature = "limited-memory")]
-            Self::LimitedString(value) => Some(value.as_str()),
+
             _ => None,
         }
     }
 }
 
-#[cfg(feature = "limited-memory")]
-mod limited_data_type;
-#[cfg(feature = "limited-memory")]
-mod limited_metadata;
-#[cfg(feature = "limited-memory")]
-mod limited_physical;
+mod data_type;
+mod metadata_value;
+mod physical;
 
 impl Display for MetadataValue {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             MetadataValue::Number(n) => write!(f, "{n}"),
             MetadataValue::String(s) => write!(f, "{s}"),
-            #[cfg(feature = "limited-memory")]
-            MetadataValue::LimitedString(s) => write!(f, "{s}"),
+
             MetadataValue::Boolean(b) => write!(f, "{b}"),
             MetadataValue::Other(v) => write!(f, "{v}"), // just write the json back
         }
@@ -469,7 +457,7 @@ impl StructField {
         let mut metadata = HashMap::new();
         metadata.insert(
             ColumnMetadataKey::MetadataSpec.as_ref().into(),
-            MetadataValue::String(spec.text_value().to_string()),
+            MetadataValue::String(spec.text_value().to_string().into()),
         );
 
         Self {
@@ -901,47 +889,28 @@ pub struct StructTypeBuilder {
     fields: IndexMap<String, StructField>,
 }
 
-#[cfg(feature = "limited-memory")]
 type FieldStorage = crate::memory::Owned<StructField>;
-#[cfg(not(feature = "limited-memory"))]
-type FieldStorage = StructField;
 type FieldRef = Arc<FieldStorage>;
-#[cfg(feature = "limited-memory")]
 type FieldMap = crate::memory::OrderedMap<FieldRef>;
-#[cfg(not(feature = "limited-memory"))]
-type FieldMap = IndexMap<String, FieldRef>;
 
 fn field_ref(field: &FieldRef) -> &StructField {
     field
 }
 
-fn unbudgeted_field(field: StructField) -> FieldRef {
-    #[cfg(feature = "limited-memory")]
-    {
-        Arc::new(crate::memory::Owned::unbudgeted(field))
-    }
-    #[cfg(not(feature = "limited-memory"))]
-    {
-        Arc::new(field)
-    }
+fn owned_field(field: StructField) -> FieldRef {
+    Arc::new(crate::memory::Owned::from(field))
 }
 
-#[cfg(feature = "limited-memory")]
 fn try_field(field: StructField) -> KernelResult<FieldRef> {
     Ok(Arc::new(crate::memory::Owned::try_new(field)?))
 }
 
 fn unwrap_field(field: FieldRef) -> StructField {
-    #[cfg(feature = "limited-memory")]
     {
         match Arc::try_unwrap(field) {
             Ok(field) => field.into_inner(),
             Err(shared) => field_ref(&shared).clone(),
         }
-    }
-    #[cfg(not(feature = "limited-memory"))]
-    {
-        Arc::unwrap_or_clone(field)
     }
 }
 
@@ -953,7 +922,7 @@ impl Clone for StructType {
             fields: self
                 .fields
                 .iter()
-                .map(|(name, field)| (name.clone(), unbudgeted_field(field_ref(field).clone())))
+                .map(|(name, field)| (name.to_owned(), owned_field(field_ref(field).clone())))
                 .collect(),
             metadata_columns: self.metadata_columns.clone(),
         }
@@ -997,7 +966,6 @@ impl StructTypeBuilder {
 }
 
 impl StructType {
-    #[cfg(feature = "limited-memory")]
     pub(crate) fn try_from_unchecked_results(
         fields: impl IntoIterator<Item = KernelResult<StructField>>,
     ) -> KernelResult<Self> {
@@ -1017,20 +985,12 @@ impl StructType {
         })
     }
 
-    #[cfg(feature = "limited-memory")]
-    pub(crate) fn try_make_validated_physical(
-        &self,
-        mode: ColumnMappingMode,
-    ) -> KernelResult<Self> {
-        limited_physical::materialize(self, mode)
+    pub(crate) fn make_validated_physical(&self, mode: ColumnMappingMode) -> KernelResult<Self> {
+        physical::materialize(self, mode)
     }
 
     pub(crate) fn try_clone(&self) -> KernelResult<Self> {
-        #[cfg(feature = "limited-memory")]
-        if crate::memory::MemoryBudget::current().is_some() {
-            return Self::try_from_unchecked_results(self.fields().map(StructField::try_clone));
-        }
-        Ok(self.clone())
+        Self::try_from_unchecked_results(self.fields().map(StructField::try_clone))
     }
 
     /// Returns a subset whose retained fields share storage with this already-valid schema.
@@ -1038,23 +998,24 @@ impl StructType {
     /// Calls `keep` once per field in schema order, preserves that order, and rebuilds metadata
     /// column indexes without revalidating fields. Mutable access must use copy-on-write to avoid
     /// changing fields in the source schema.
-    pub(crate) fn share_selected_fields(&self, mut keep: impl FnMut(&StructField) -> bool) -> Self {
-        let fields: FieldMap = self
-            .fields
-            .iter()
-            .filter(|(_, field)| keep(field))
-            .map(|(name, field)| (name.clone(), field.clone()))
-            .collect();
+    pub(crate) fn share_selected_fields(
+        &self,
+        mut keep: impl FnMut(&StructField) -> bool,
+    ) -> KernelResult<Self> {
+        let mut fields = FieldMap::new();
+        for (name, field) in self.fields.iter().filter(|(_, field)| keep(field)) {
+            fields.try_insert(name.to_owned(), field.clone())?;
+        }
         let metadata_columns = fields
             .values()
             .enumerate()
             .filter_map(|(index, field)| field.get_metadata_column_spec().map(|spec| (spec, index)))
             .collect();
-        Self {
+        Ok(Self {
             type_name: self.type_name.clone(),
             fields,
             metadata_columns,
-        }
+        })
     }
 
     /// Creates a new [`StructType`] from the given fields.
@@ -1065,9 +1026,6 @@ impl StructType {
     /// - the schema contains duplicate metadata columns
     /// - the schema contains nested metadata columns
     pub fn try_new(fields: impl IntoIterator<Item = StructField>) -> KernelResult<Self> {
-        #[cfg(not(feature = "limited-memory"))]
-        let mut field_map = IndexMap::new();
-        #[cfg(feature = "limited-memory")]
         let mut field_map = FieldMap::new();
         let mut metadata_columns = HashMap::new();
         let mut seen_lowercase_names = HashSet::new();
@@ -1098,9 +1056,6 @@ impl StructType {
                 )));
             }
 
-            #[cfg(not(feature = "limited-memory"))]
-            field_map.insert(field.name.clone(), Arc::new(field));
-            #[cfg(feature = "limited-memory")]
             field_map.try_insert(field.name.clone(), try_field(field)?)?;
         }
 
@@ -1141,10 +1096,9 @@ impl StructType {
             if let Some(metadata_column_spec) = field.get_metadata_column_spec() {
                 metadata_columns.insert(metadata_column_spec, i);
             }
-            field_map.insert(field.name.clone(), unbudgeted_field(field));
+            field_map.insert(field.name.to_owned(), owned_field(field));
         }
 
-        #[cfg(feature = "limited-memory")]
         let field_map = field_map.into();
         Self {
             type_name: "struct".into(),
@@ -1177,7 +1131,11 @@ impl StructType {
 
     /// Adds fields to this [`StructType`], returning a new [`StructType`].
     pub fn add(&self, fields: impl IntoIterator<Item = StructField>) -> KernelResult<Self> {
-        Self::try_new(self.fields().cloned().chain(fields))
+        Self::try_from_results(
+            self.fields()
+                .map(StructField::try_clone)
+                .chain(fields.into_iter().map(Ok)),
+        )
     }
 
     /// Adds a predefined metadata column to this [`StructType`], returning a new [`StructType`].
@@ -1382,7 +1340,7 @@ impl StructType {
 
     /// Gets all the field names in this struct type in the order they are defined.
     pub fn field_names(&self) -> impl ExactSizeIterator<Item = &String> {
-        self.fields.keys()
+        self.fields.values().map(|field| field.name())
     }
 
     /// Gets the number of fields in this struct type.
@@ -1457,16 +1415,6 @@ impl StructType {
     ) -> KernelResult<Self> {
         let mut transformer = MakePhysical::new(column_mapping_mode);
         transformer.transform_struct(self).map(|s| s.into_owned())
-    }
-
-    /// Materialize physical names and metadata after read-path column mapping validation.
-    ///
-    /// [`MakePhysical::validate_read_column_mapping`] must have succeeded for this schema and
-    /// `mode`, and both must remain unchanged after validation.
-    pub(crate) fn make_validated_physical(&self, mode: ColumnMappingMode) -> Self {
-        MaterializePhysical(mode)
-            .transform_struct(self)
-            .into_owned()
     }
 
     /// Validates that there are no metadata columns in the given fields.
@@ -1640,9 +1588,6 @@ impl<'a> IntoIterator for &'a StructType {
 /// [`IndexMap`]: indexmap::IndexMap
 #[derive(Debug)]
 pub struct StructFieldIntoIter {
-    #[cfg(not(feature = "limited-memory"))]
-    inner: indexmap::map::IntoValues<String, FieldRef>,
-    #[cfg(feature = "limited-memory")]
     inner: crate::memory::ordered_map::IntoValues<FieldRef>,
 }
 
@@ -1661,8 +1606,8 @@ impl Iterator for StructFieldIntoIter {
         self.inner.count()
     }
 
-    fn last(self) -> Option<Self::Item> {
-        self.inner.last().map(unwrap_field)
+    fn last(mut self) -> Option<Self::Item> {
+        self.inner.next_back().map(unwrap_field)
     }
 
     fn nth(&mut self, n: usize) -> Option<Self::Item> {
@@ -1725,9 +1670,6 @@ impl DoubleEndedIterator for StructFieldIntoIter {
 /// [`IndexMap`]: indexmap::IndexMap
 #[derive(Debug, Clone)]
 pub struct StructFieldRefIter<'a> {
-    #[cfg(not(feature = "limited-memory"))]
-    inner: indexmap::map::Values<'a, String, FieldRef>,
-    #[cfg(feature = "limited-memory")]
     inner: crate::memory::ordered_map::Values<'a, FieldRef>,
 }
 
@@ -1920,10 +1862,7 @@ where
 struct StructTypeSerDeHelper {
     #[serde(rename = "type")]
     _type_name: String,
-    #[cfg(not(feature = "limited-memory"))]
-    fields: Vec<StructField>,
-    #[cfg(feature = "limited-memory")]
-    fields: crate::memory::LimitedVec<StructField>,
+    fields: crate::memory::MetadataVec<StructField>,
 }
 
 impl Serialize for StructType {
@@ -1956,7 +1895,6 @@ impl<'de> Deserialize<'de> for StructType {
     {
         let helper = StructTypeSerDeHelper::deserialize(deserializer)?;
         StructType::try_new(helper.fields).map_err(|error| {
-            #[cfg(feature = "limited-memory")]
             if let KernelError::Memory(failure) = error.without_backtrace() {
                 crate::memory::record_failure(*failure);
             }
@@ -2697,22 +2635,11 @@ impl Display for PrimitiveType {
     }
 }
 
-#[cfg(feature = "limited-memory")]
 type DataTypeBox<T> = crate::memory::Owned<T>;
-#[cfg(not(feature = "limited-memory"))]
-type DataTypeBox<T> = Box<T>;
 
 // This consumes either the standard Box or its allocator-bearing representation.
-#[cfg_attr(not(feature = "limited-memory"), allow(clippy::boxed_local))]
 pub(crate) fn unbox_data_type<T>(value: DataTypeBox<T>) -> T {
-    #[cfg(feature = "limited-memory")]
-    {
-        value.into_inner()
-    }
-    #[cfg(not(feature = "limited-memory"))]
-    {
-        *value
-    }
+    value.into_inner()
 }
 
 #[derive(Debug, Serialize, PartialEq, Clone, Eq, From)]
@@ -2773,62 +2700,8 @@ impl From<SchemaRef> for DataType {
 // clear "Unsupported Delta table type: 'X'" message. We deserialize to Value first, then
 // dispatch based on structure (string -> Primitive/Variant, object -> Array/Struct/Map).
 impl<'de> serde::Deserialize<'de> for DataType {
-    fn deserialize<D>(deserializer: D) -> KernelResult<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[cfg(feature = "limited-memory")]
-        if crate::memory::MemoryBudget::current().is_some() {
-            return limited_data_type::deserialize(deserializer);
-        }
-        let value = Value::deserialize(deserializer)?;
-
-        // String values are either primitive types, "variant" or "file"
-        if let Value::String(s) = &value {
-            if s == "variant" {
-                return match DataType::unshredded_variant() {
-                    DataType::Variant(st) => Ok(DataType::Variant(st)),
-                    _ => Err(DeError::custom("Failed to create variant type")),
-                };
-            }
-            if s == "file" {
-                return Ok(DataType::file_type());
-            }
-
-            // Try PrimitiveType - this will give us good error messages for unsupported types
-            return PrimitiveType::deserialize(value.clone())
-                .map(DataType::Primitive)
-                .map_err(|e| DeError::custom(e.to_string()));
-        }
-
-        // Object values are complex types - dispatch based on "type" field
-        if let Value::Object(map) = &value
-            && let Some(Value::String(type_str)) = map.get("type")
-        {
-            // Value-to-type conversion recurses outside the JSON decoder's stack-growth adapter.
-            return match type_str.as_str() {
-                "array" => ArrayType::deserialize(serde_stacker::Deserializer::new(value))
-                    .map(DataType::from)
-                    .map_err(|e| DeError::custom(e.to_string())),
-                "struct" => StructType::deserialize(serde_stacker::Deserializer::new(value))
-                    .map(DataType::from)
-                    .map_err(|e| DeError::custom(e.to_string())),
-                "map" => MapType::deserialize(serde_stacker::Deserializer::new(value))
-                    .map(DataType::from)
-                    .map_err(|e| DeError::custom(e.to_string())),
-                #[cfg(feature = "udt-in-dev")]
-                "udt" => UserDefinedType::deserialize(serde_stacker::Deserializer::new(value))
-                    .map(DataType::UserDefined)
-                    .map_err(DeError::custom),
-                _ => Err(unsupported_delta_type_error(type_str)),
-            };
-        }
-
-        // Fallback error with the actual value that failed
-        Err(DeError::custom(format!(
-            "Invalid data type: {}",
-            serde_json::to_string(&value).unwrap_or_else(|_| format!("{value:?}"))
-        )))
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        data_type::deserialize(deserializer)
     }
 }
 
@@ -2843,6 +2716,10 @@ pub(crate) static FILE_FIELDS: LazyLock<StructType> = LazyLock::new(|| {
         StructField::nullable("checksum", DataType::STRING),
         StructField::nullable("inline", DataType::BINARY),
     ])
+});
+
+pub(crate) static VARIANT_FIELDS: LazyLock<StructType> = LazyLock::new(|| {
+    schema! { not_null "metadata": BINARY, not_null "value": BINARY }
 });
 
 /// The `file` sub-fields that get `minValues` and `maxValues` statistics. All six sub-fields get
@@ -2868,42 +2745,31 @@ pub(crate) fn is_null_count_only_file_sub_field(path: &[&StructField]) -> bool {
 
 impl DataType {
     pub(crate) fn try_from_struct(value: StructType) -> KernelResult<Self> {
-        #[cfg(feature = "limited-memory")]
-        {
-            Ok(Self::Struct(Owned::try_new(value)?))
-        }
-        #[cfg(not(feature = "limited-memory"))]
-        {
-            Ok(value.into())
-        }
+        Ok(Self::Struct(Owned::try_new(value)?))
     }
 
     pub(crate) fn try_clone(&self) -> KernelResult<Self> {
-        #[cfg(feature = "limited-memory")]
-        if crate::memory::MemoryBudget::current().is_some() {
-            return stacker::maybe_grow(64 * 1024, 2 * 1024 * 1024, || {
-                Ok(match self {
-                    Self::Primitive(value) => Self::Primitive(value.clone()),
-                    Self::Struct(value) => Self::Struct(Owned::try_new(value.try_clone()?)?),
-                    Self::Array(value) => Self::Array(Owned::try_new(ArrayType {
-                        type_name: value.type_name.clone(),
-                        element_type: value.element_type.try_clone()?,
-                        contains_null: value.contains_null,
-                    })?),
-                    Self::Map(value) => Self::Map(Owned::try_new(MapType {
-                        type_name: value.type_name.clone(),
-                        key_type: value.key_type.try_clone()?,
-                        value_type: value.value_type.try_clone()?,
-                        value_contains_null: value.value_contains_null,
-                    })?),
-                    Self::Variant(value) => Self::Variant(Owned::try_new(value.try_clone()?)?),
-                    Self::File(value) => Self::File(Owned::try_new(value.try_clone()?)?),
-                    #[cfg(feature = "udt-in-dev")]
-                    Self::UserDefined(value) => Self::UserDefined(value.clone()),
-                })
-            });
-        }
-        Ok(self.clone())
+        stacker::maybe_grow(64 * 1024, 2 * 1024 * 1024, || {
+            Ok(match self {
+                Self::Primitive(value) => Self::Primitive(value.clone()),
+                Self::Struct(value) => Self::Struct(Owned::try_new(value.try_clone()?)?),
+                Self::Array(value) => Self::Array(Owned::try_new(ArrayType {
+                    type_name: value.type_name.clone(),
+                    element_type: value.element_type.try_clone()?,
+                    contains_null: value.contains_null,
+                })?),
+                Self::Map(value) => Self::Map(Owned::try_new(MapType {
+                    type_name: value.type_name.clone(),
+                    key_type: value.key_type.try_clone()?,
+                    value_type: value.value_type.try_clone()?,
+                    value_contains_null: value.value_contains_null,
+                })?),
+                Self::Variant(value) => Self::Variant(Owned::try_new(value.try_clone()?)?),
+                Self::File(value) => Self::File(Owned::try_new(value.try_clone()?)?),
+                #[cfg(feature = "udt-in-dev")]
+                Self::UserDefined(value) => Self::UserDefined(value.clone()),
+            })
+        })
     }
 
     pub const STRING: Self = DataType::Primitive(PrimitiveType::String);
@@ -3065,19 +2931,13 @@ impl DataType {
     pub fn try_struct_type_from_results<E: Into<KernelError>>(
         fields: impl IntoIterator<Item = KernelResult<StructField, E>>,
     ) -> KernelResult<Self> {
-        StructType::try_from_results(fields).map(Self::from)
+        StructType::try_from_results(fields).and_then(Self::try_from_struct)
     }
 
     /// Create a new unshredded [`DataType::Variant`]. This data type is a struct of two not-null
     /// binary fields: `metadata` and `value`.
     pub fn unshredded_variant() -> Self {
-        DataType::Variant(
-            schema! {
-                not_null "metadata": BINARY,
-                not_null "value": BINARY,
-            }
-            .into(),
-        )
+        DataType::Variant(VARIANT_FIELDS.clone().into())
     }
 
     /// Create a new [`DataType::File`] with the canonical physical layout: a struct of six
@@ -3093,7 +2953,7 @@ impl DataType {
     pub fn variant_type(fields: impl IntoIterator<Item = StructField>) -> KernelResult<Self> {
         // Different from regular StructTypes, Variants are not allowed to contain metadata columns
         // at all, so we also need to check their top-level primitive types.
-        Ok(DataType::Variant(
+        Ok(DataType::Variant(Owned::try_new(
             StructType::try_from_results(fields.into_iter().map(|field| {
                 if field.is_metadata_column() {
                     Err(KernelError::schema(
@@ -3102,9 +2962,8 @@ impl DataType {
                 } else {
                     Ok(field)
                 }
-            }))?
-            .into(),
-        ))
+            }))?,
+        )?))
     }
 
     /// Attempt to convert this data type to a [`PrimitiveType`]. Returns `None` if this is a
@@ -3365,35 +3224,6 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
     }
 }
 
-/// Rewrites immutable fields whose annotations have already passed read-path validation.
-struct MaterializePhysical(ColumnMappingMode);
-
-impl<'a> SchemaTransform<'a> for MaterializePhysical {
-    transform_output_type!(|'a, T| Cow<'a, T>);
-
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Cow<'a, StructField> {
-        if field.is_metadata_column() {
-            return Cow::Borrowed(field);
-        }
-        let data_type = self.transform(field.data_type()).into_owned();
-        let metadata = field.logical_to_physical_metadata(self.0);
-        Cow::Owned(StructField {
-            name: field.physical_name(self.0).to_owned(),
-            data_type,
-            nullable: field.nullable,
-            metadata,
-        })
-    }
-
-    fn transform_variant(&mut self, stype: &'a StructType) -> Cow<'a, StructType> {
-        Cow::Borrowed(stype)
-    }
-
-    fn transform_file(&mut self, stype: &'a StructType) -> Cow<'a, StructType> {
-        Cow::Borrowed(stype)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -3418,7 +3248,9 @@ mod tests {
             ),
         ])
         .unwrap();
-        let subset = schema.share_selected_fields(|field| field.name() == "data");
+        let subset = schema
+            .share_selected_fields(|field| field.name() == "data")
+            .unwrap();
         assert!(Arc::ptr_eq(&schema.fields["data"], &subset.fields["data"]));
         let expected = StructType::try_new([schema.field("data").unwrap().clone()]).unwrap();
         assert_eq!(subset, expected);
@@ -3431,7 +3263,7 @@ mod tests {
     #[test]
     fn subset_owned_fields_do_not_mutate_source() {
         let schema = schema! { nullable "data": LONG };
-        let shared = schema.share_selected_fields(|_| true);
+        let shared = schema.share_selected_fields(|_| true).unwrap();
         assert!(Arc::ptr_eq(&schema.fields["data"], &shared.fields["data"]));
         let mut owned = shared.into_fields().next().unwrap();
         owned
@@ -3465,7 +3297,9 @@ mod tests {
             StructField::nullable("value", DataType::LONG),
         ])
         .unwrap();
-        let subset = schema.share_selected_fields(|field| field.name() != "partition");
+        let subset = schema
+            .share_selected_fields(|field| field.name() != "partition")
+            .unwrap();
         assert_eq!(
             subset
                 .fields()
@@ -4345,7 +4179,7 @@ mod tests {
             ),
             (
                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                MetadataValue::String("col-physical".to_string()),
+                MetadataValue::String("col-physical".to_string().into()),
             ),
         ]);
         let physical = logical.make_physical(mode).unwrap();
@@ -4440,7 +4274,7 @@ mod tests {
                 ),
                 (
                     ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                    MetadataValue::String(format!("col-{name}")),
+                    MetadataValue::String(format!("col-{name}").into()),
                 ),
             ])
         }
@@ -4636,7 +4470,7 @@ mod tests {
         )
         .add_metadata([(
             ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-            MetadataValue::String("phys".to_string()),
+            MetadataValue::String("phys".to_string().into()),
         )]);
         assert_result_error_with_message(
             field.make_physical(ColumnMappingMode::Name),
@@ -4682,7 +4516,7 @@ mod tests {
     fn test_metadata_value_to_string() {
         assert_eq!(MetadataValue::Number(0).to_string(), "0");
         assert_eq!(
-            MetadataValue::String("hello".to_string()).to_string(),
+            MetadataValue::String("hello".to_string().into()).to_string(),
             "hello"
         );
         assert_eq!(MetadataValue::Boolean(true).to_string(), "true");
@@ -4732,7 +4566,7 @@ mod tests {
         let mut field = StructField::nullable("c", DataType::STRING);
         field.metadata.insert(
             ColumnMetadataKey::Invariants.as_ref().into(),
-            MetadataValue::String("c > 0".to_string()),
+            MetadataValue::String("c > 0".to_string().into()),
         );
 
         let schema = schema! {
@@ -4747,7 +4581,7 @@ mod tests {
                 let mut field = StructField::nullable("d", DataType::INTEGER);
                 field.metadata.insert(
                     ColumnMetadataKey::Invariants.as_ref().into(),
-                    MetadataValue::String("d > 0".to_string()),
+                    MetadataValue::String("d > 0".to_string().into()),
                 );
                 field
             }),
@@ -4766,7 +4600,7 @@ mod tests {
                 let mut field = StructField::nullable("d", DataType::INTEGER);
                 field.metadata.insert(
                     ColumnMetadataKey::Invariants.as_ref().into(),
-                    MetadataValue::String("d > 0".to_string()),
+                    MetadataValue::String("d > 0".to_string().into()),
                 );
                 field
             }),
@@ -4785,7 +4619,7 @@ mod tests {
                 let mut field = StructField::nullable("d", DataType::INTEGER);
                 field.metadata.insert(
                     ColumnMetadataKey::Invariants.as_ref().into(),
-                    MetadataValue::String("d > 0".to_string()),
+                    MetadataValue::String("d > 0".to_string().into()),
                 );
                 field
             }),
@@ -4936,7 +4770,7 @@ mod tests {
     #[test]
     fn test_iterator_with_metadata() {
         let field_with_metadata = StructField::nullable("test_field", DataType::STRING)
-            .with_metadata([("key1", MetadataValue::String("value1".to_string()))]);
+            .with_metadata([("key1", MetadataValue::String("value1".to_string().into()))]);
 
         let struct_type = StructType::new_unchecked([field_with_metadata]);
 
@@ -4945,7 +4779,7 @@ mod tests {
             assert_eq!(field.metadata().len(), 1);
             assert_eq!(
                 field.metadata().get("key1"),
-                Some(&MetadataValue::String("value1".to_string()))
+                Some(&MetadataValue::String("value1".to_string().into()))
             );
         }
 
@@ -4954,7 +4788,7 @@ mod tests {
             assert_eq!(field.metadata().len(), 1);
             assert_eq!(
                 field.metadata().get("key1"),
-                Some(&MetadataValue::String("value1".to_string()))
+                Some(&MetadataValue::String("value1".to_string().into()))
             );
         }
     }
@@ -5402,7 +5236,7 @@ mod tests {
             type_name: "struct".into(),
             fields: [(
                 nested_field_with_metadata.name.clone(),
-                unbudgeted_field(nested_field_with_metadata),
+                owned_field(nested_field_with_metadata),
             )]
             .into_iter()
             .collect(),
@@ -5427,7 +5261,7 @@ mod tests {
             type_name: "struct".into(),
             fields: [(
                 nested_field_with_metadata.name.clone(),
-                unbudgeted_field(nested_field_with_metadata),
+                owned_field(nested_field_with_metadata),
             )]
             .into_iter()
             .collect(),
@@ -5453,7 +5287,7 @@ mod tests {
             type_name: "struct".into(),
             fields: [(
                 nested_field_with_metadata.name.clone(),
-                unbudgeted_field(nested_field_with_metadata),
+                owned_field(nested_field_with_metadata),
             )]
             .into_iter()
             .collect(),

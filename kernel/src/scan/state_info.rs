@@ -100,8 +100,6 @@ fn validate_stats_output_schema(
 /// All the state needed to process a scan.
 #[derive(Debug, Clone)]
 pub(crate) struct StateInfo {
-    #[cfg(feature = "limited-memory")]
-    pub(crate) allocator: Option<crate::memory::LimitedAllocator>,
     /// The logical schema for this scan
     pub(crate) logical_schema: SchemaRef,
     /// The physical schema to read from parquet files
@@ -663,8 +661,6 @@ impl StateInfo {
             };
 
         Ok(StateInfo {
-            #[cfg(feature = "limited-memory")]
-            allocator: crate::memory::MemoryBudget::current().map(|budget| budget.allocator()),
             logical_schema: logical_read_schema,
             physical_schema,
             physical_predicate,

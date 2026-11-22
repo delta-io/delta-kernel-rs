@@ -1744,7 +1744,7 @@ pub(crate) fn validate_physical_schema_column_mapping(
         .map(|f| {
             let physical_name =
                 match f.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
-                    Some(MetadataValue::String(name)) => name.clone(),
+                    Some(MetadataValue::String(name)) => name.to_string(),
                     _ if mode == ColumnMappingMode::None => f.name().to_string(),
                     _ => panic!("Logical field '{}' missing physicalName metadata", f.name()),
                 };
@@ -1776,7 +1776,7 @@ pub(crate) fn validate_physical_schema_column_mapping(
 
         assert_eq!(
             physical_field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName),
-            Some(&MetadataValue::String(expected_name.clone())),
+            Some(&MetadataValue::String(expected_name.clone().into())),
             "columnMapping.physicalName mismatch for '{}'",
             physical_field.name()
         );
@@ -1927,7 +1927,7 @@ pub(crate) mod column_mapping_physical_name_dedup_fixtures {
             ),
             (
                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                MetadataValue::String(phys.to_string()),
+                MetadataValue::String(phys.to_string().into()),
             ),
         ])
     }

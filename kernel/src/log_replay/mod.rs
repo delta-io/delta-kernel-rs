@@ -13,12 +13,11 @@
 //! This module provides structures for efficient batch processing, focusing on file action
 //! deduplication with `FileActionDeduplicator` which tracks unique files across log batches
 //! to minimize memory usage for tables with extensive history.
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
 use derive_more::Constructor;
-use tracing::{trace, warn};
+use tracing::warn;
 use url::Url;
 
 use crate::engine_data::GetData;
@@ -72,9 +71,7 @@ pub(crate) struct FileActionDeduplicator<'seen> {
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log for deduplication. This is a mutable reference to the set
     /// of seen file keys that persists across multiple log batches.
-    seen_file_keys: &'seen mut HashSet<FileActionKey>,
-    #[cfg(feature = "limited-memory")]
-    limited_keys: Option<&'seen mut crate::memory::FileKeySet>,
+    seen_file_keys: &'seen mut dyn deduplicator::SeenFileKeys,
     // TODO: Consider renaming to `is_commit_batch`, `deduplicate_batch`, or `save_batch`
     // to better reflect its role in deduplication logic.
     /// Whether we're processing a commit log JSON file (`true`) or a checkpoint file (`false`).
@@ -95,20 +92,11 @@ pub(crate) struct FileActionDeduplicator<'seen> {
 }
 
 impl<'seen> FileActionDeduplicator<'seen> {
-    #[cfg(feature = "limited-memory")]
-    pub(crate) fn with_limited_keys(
-        mut self,
-        keys: Option<&'seen mut crate::memory::FileKeySet>,
-    ) -> Self {
-        self.limited_keys = keys;
-        self
-    }
-
     // Hand-written (not `#[derive(Constructor)]`) so the eight-field constructor can carry the
     // `too_many_arguments` allow; the positional field order is the call-site argument order.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        seen_file_keys: &'seen mut HashSet<FileActionKey>,
+        seen_file_keys: &'seen mut dyn deduplicator::SeenFileKeys,
         is_log_batch: bool,
         add_path_index: usize,
         add_size_index: usize,
@@ -119,8 +107,6 @@ impl<'seen> FileActionDeduplicator<'seen> {
     ) -> Self {
         Self {
             seen_file_keys,
-            #[cfg(feature = "limited-memory")]
-            limited_keys: None,
             is_log_batch,
             add_path_index,
             add_size_index,
@@ -134,44 +120,10 @@ impl<'seen> FileActionDeduplicator<'seen> {
 
 impl Deduplicator for FileActionDeduplicator<'_> {
     fn try_check_and_record_seen(&mut self, key: FileActionKey) -> KernelResult<bool> {
-        #[cfg(feature = "limited-memory")]
-        if let Some(keys) = &mut self.limited_keys {
-            return if self.is_log_batch {
-                Ok(!keys.try_insert(key.path(), key.dv_unique_id())?)
-            } else {
-                Ok(keys.contains(key.path(), key.dv_unique_id()))
-            };
-        }
-        Ok(self.check_and_record_seen(key))
-    }
-
-    /// Checks if log replay already processed this logical file (in which case the current action
-    /// should be ignored). If not already seen, register it so we can recognize future duplicates.
-    /// Returns `true` if we have seen the file and should ignore it, `false` if we have not seen it
-    /// and should process it.
-    fn check_and_record_seen(&mut self, key: FileActionKey) -> bool {
-        // Note: each (add.path + add.dv_unique_id()) pair has a
-        // unique Add + Remove pair in the log. For example:
-        // https://github.com/delta-io/delta/blob/master/spark/src/test/resources/delta/table-with-dv-large/_delta_log/00000000000000000001.json
-
-        if self.seen_file_keys.contains(&key) {
-            trace!(
-                "Ignoring duplicate ({}, {:?}) in scan, is log {}",
-                key.path, key.dv_unique_id, self.is_log_batch
-            );
-            true
+        if self.is_log_batch {
+            Ok(!self.seen_file_keys.try_insert_key(key)?)
         } else {
-            trace!(
-                "Including ({}, {:?}) in scan, is log {}",
-                key.path, key.dv_unique_id, self.is_log_batch
-            );
-            if self.is_log_batch {
-                // Remember file actions from this batch so we can ignore duplicates as we process
-                // batches from older commit and/or checkpoint files. We don't track checkpoint
-                // batches because they are already the oldest actions and never replace anything.
-                self.seen_file_keys.insert(key);
-            }
-            false
+            Ok(self.seen_file_keys.contains_key(&key))
         }
     }
 
@@ -473,9 +425,9 @@ mod tests {
         assert_eq!(add_key.dv_unique_id(), Some(expected_add_dv_id));
 
         let commit_removes = HashSet::from([remove_key.clone()]);
-        assert!(!deduplicator.check_and_record_seen(remove_key));
+        assert!(!deduplicator.try_check_and_record_seen(remove_key).unwrap());
         assert_eq!(
-            deduplicator.check_and_record_seen(add_key),
+            deduplicator.try_check_and_record_seen(add_key).unwrap(),
             expect_cancelled
         );
 
@@ -486,7 +438,9 @@ mod tests {
             .unwrap()
             .key;
         assert_eq!(
-            checkpoint.check_and_record_seen(checkpoint_add_key),
+            checkpoint
+                .try_check_and_record_seen(checkpoint_add_key)
+                .unwrap(),
             expect_cancelled
         );
         Ok(())
@@ -637,16 +591,40 @@ mod tests {
             let mut deduplicator = create_deduplicator(&mut seen, true);
 
             // Pre-existing key should be detected as duplicate
-            assert!(deduplicator.check_and_record_seen(pre_existing_key.clone()));
+            assert!(
+                deduplicator
+                    .try_check_and_record_seen(pre_existing_key.clone())
+                    .unwrap()
+            );
 
             // First time seeing keys, should return false and record them
-            assert!(!deduplicator.check_and_record_seen(key1.clone()));
-            assert!(!deduplicator.check_and_record_seen(key2.clone()));
-            assert!(!deduplicator.check_and_record_seen(key_with_dv.clone()));
+            assert!(
+                !deduplicator
+                    .try_check_and_record_seen(key1.clone())
+                    .unwrap()
+            );
+            assert!(
+                !deduplicator
+                    .try_check_and_record_seen(key2.clone())
+                    .unwrap()
+            );
+            assert!(
+                !deduplicator
+                    .try_check_and_record_seen(key_with_dv.clone())
+                    .unwrap()
+            );
 
             // Second time seeing keys, should return true (duplicates)
-            assert!(deduplicator.check_and_record_seen(key1.clone()));
-            assert!(deduplicator.check_and_record_seen(key_with_dv.clone()));
+            assert!(
+                deduplicator
+                    .try_check_and_record_seen(key1.clone())
+                    .unwrap()
+            );
+            assert!(
+                deduplicator
+                    .try_check_and_record_seen(key_with_dv.clone())
+                    .unwrap()
+            );
         }
 
         // Keys should be recorded in seen set
@@ -661,12 +639,24 @@ mod tests {
             let new_key = FileActionKey::new("new.parquet", None);
 
             // First time seeing new_key in checkpoint, should return false but NOT record it
-            assert!(!deduplicator.check_and_record_seen(new_key.clone()));
+            assert!(
+                !deduplicator
+                    .try_check_and_record_seen(new_key.clone())
+                    .unwrap()
+            );
             // Still returns false on second call (not recorded)
-            assert!(!deduplicator.check_and_record_seen(new_key.clone()));
+            assert!(
+                !deduplicator
+                    .try_check_and_record_seen(new_key.clone())
+                    .unwrap()
+            );
 
             // Existing keys from seen set should still be detected
-            assert!(deduplicator.check_and_record_seen(key1.clone()));
+            assert!(
+                deduplicator
+                    .try_check_and_record_seen(key1.clone())
+                    .unwrap()
+            );
         }
     }
 
@@ -745,7 +735,9 @@ mod tests {
         // File modified in commit - should be filtered from checkpoint
         let commit_modified = FileActionKey::new("modified_in_commit.parquet", None);
         assert!(
-            deduplicator.check_and_record_seen(commit_modified),
+            deduplicator
+                .try_check_and_record_seen(commit_modified)
+                .unwrap(),
             "Files seen in commits should be filtered from checkpoint"
         );
 
@@ -753,14 +745,18 @@ mod tests {
         let commit_modified_dv =
             FileActionKey::new("modified_with_dv.parquet", Some("dv123".to_string()));
         assert!(
-            deduplicator.check_and_record_seen(commit_modified_dv),
+            deduplicator
+                .try_check_and_record_seen(commit_modified_dv)
+                .unwrap(),
             "Files with DVs seen in commits should be filtered from checkpoint"
         );
 
         // File only in checkpoint - should NOT be filtered
         let checkpoint_only = FileActionKey::new("checkpoint_only.parquet", None);
         assert!(
-            !deduplicator.check_and_record_seen(checkpoint_only),
+            !deduplicator
+                .try_check_and_record_seen(checkpoint_only)
+                .unwrap(),
             "Files only in checkpoint should not be filtered"
         );
 

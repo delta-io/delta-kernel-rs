@@ -1184,7 +1184,7 @@ mod apply_schema_validation_tests {
 
     #[rstest]
     #[case::not_json_object(
-        MetadataValue::String("not a json object".to_string()),
+        MetadataValue::String("not a json object".to_string().into()),
         "must be a JSON object",
     )]
     #[case::entry_not_an_integer(

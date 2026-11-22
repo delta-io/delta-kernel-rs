@@ -26,30 +26,15 @@ use crate::{KernelError, KernelResult, KernelResultIterator, StorageHandler, Ver
 #[cfg(test)]
 mod tests;
 
-#[cfg(feature = "limited-memory")]
-type CommitFiles = crate::memory::RetainedVec<ParsedLogPath>;
-#[cfg(not(feature = "limited-memory"))]
-type CommitFiles = Vec<ParsedLogPath>;
+type CommitFiles = crate::memory::MetadataVec<ParsedLogPath>;
 
 pub(crate) fn commit_files(files: Vec<ParsedLogPath>) -> CommitFiles {
-    #[cfg(feature = "limited-memory")]
-    {
-        files.into()
-    }
-    #[cfg(not(feature = "limited-memory"))]
-    {
-        files
-    }
+    files.into()
 }
 
 pub(crate) fn push_commit(files: &mut CommitFiles, file: ParsedLogPath) -> KernelResult<()> {
-    #[cfg(feature = "limited-memory")]
     {
         files.try_push(file)?;
-    }
-    #[cfg(not(feature = "limited-memory"))]
-    {
-        files.push(file);
     }
     Ok(())
 }

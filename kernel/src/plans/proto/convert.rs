@@ -841,9 +841,7 @@ impl From<&MetadataValue> for proto_schema::MetadataValue {
     fn from(metadata: &MetadataValue) -> Self {
         let value = match metadata {
             MetadataValue::Number(n) => MetadataValueKind::Number(*n),
-            MetadataValue::String(s) => MetadataValueKind::String(s.clone()),
-            #[cfg(feature = "limited-memory")]
-            MetadataValue::LimitedString(s) => MetadataValueKind::String(s.as_str().to_owned()),
+            MetadataValue::String(s) => MetadataValueKind::String(s.as_str().to_owned()),
             MetadataValue::Boolean(b) => MetadataValueKind::Boolean(*b),
             MetadataValue::Other(json) => MetadataValueKind::OtherJson(json.to_string()),
         };
@@ -1079,7 +1077,7 @@ impl TryFrom<proto_schema::MetadataValue> for MetadataValue {
             .ok_or_else(|| KernelError::schema("MetadataValue proto missing value"))?;
         let metadata = match value {
             MetadataValueKind::Number(n) => MetadataValue::Number(n),
-            MetadataValueKind::String(s) => MetadataValue::String(s),
+            MetadataValueKind::String(s) => MetadataValue::String(s.into()),
             MetadataValueKind::Boolean(b) => MetadataValue::Boolean(b),
             MetadataValueKind::OtherJson(json) => {
                 MetadataValue::Other(serde_json::from_str(&json)?)
@@ -1195,16 +1193,10 @@ mod tests {
     }
 
     fn decode(op: &Operation) -> proto_op::Operation {
-        let bytes = op.to_proto_bytes();
-        let decoded = prost::Message::decode(bytes.as_slice()).expect("decode succeeds");
-        #[cfg(feature = "limited-memory")]
-        {
-            let budget = crate::memory::MemoryBudget::new(64 * 1024 * 1024);
-            let bytes = super::super::limited_encode::encode(op, &budget).unwrap();
-            let actual: proto_op::Operation = prost::Message::decode(bytes.as_ref()).unwrap();
-            assert_eq!(actual, decoded);
-        }
-        decoded
+        let bytes = op.try_to_proto_bytes().unwrap();
+        let actual: proto_op::Operation = prost::Message::decode(bytes.as_ref()).unwrap();
+        assert_eq!(actual, proto_op::Operation::from(op));
+        actual
     }
 
     fn io_op(op: &Operation) -> proto_op::io_operation::Op {
@@ -1215,24 +1207,21 @@ mod tests {
     }
 
     fn expr_kind_of(expr: Expression) -> proto_expr::expression::Kind {
-        #[cfg(feature = "limited-memory")]
-        super::super::limited_encode::equivalence::expression(&expr);
+        super::super::encode::equivalence::expression(&expr);
         proto_expr::Expression::from(&expr)
             .kind
             .expect("expression kind present")
     }
 
     fn pred_kind_of(pred: Predicate) -> proto_expr::predicate::Kind {
-        #[cfg(feature = "limited-memory")]
-        super::super::limited_encode::equivalence::predicate(&pred);
+        super::super::encode::equivalence::predicate(&pred);
         proto_expr::Predicate::from(&pred)
             .kind
             .expect("predicate kind present")
     }
 
     fn scalar_value_of(scalar: Scalar) -> proto_expr::scalar::Value {
-        #[cfg(feature = "limited-memory")]
-        super::super::limited_encode::equivalence::scalar(&scalar);
+        super::super::encode::equivalence::scalar(&scalar);
         proto_expr::Scalar::from(&scalar)
             .value
             .expect("scalar value present")
@@ -1490,8 +1479,7 @@ mod tests {
         schema: sample_schema(), ordered: true,
     }), "write_json")]
     fn from_operator(#[case] op: Operator, #[case] expected: &str) {
-        #[cfg(feature = "limited-memory")]
-        super::super::limited_encode::equivalence::operator(&op);
+        super::super::encode::equivalence::operator(&op);
         use proto_plan::operator::Op;
         let kind = match proto_plan::Operator::from(&op).op.unwrap() {
             Op::ScanParquet(_) => "scan_parquet",
@@ -1727,8 +1715,7 @@ mod tests {
     #[case(Agg::min_non_null_by(column_name!("a"), column_name!("s"), column_name!("k")), "min_non_null_by")]
     #[case(Agg::max_non_null_by(column_name!("a"), column_name!("s"), column_name!("k")), "max_non_null_by")]
     fn from_agg(#[case] agg: Agg, #[case] expected: &str) {
-        #[cfg(feature = "limited-memory")]
-        super::super::limited_encode::equivalence::agg(&agg);
+        super::super::encode::equivalence::agg(&agg);
         use proto_plan::agg::Func;
         let proto = proto_plan::Agg::from(&agg);
         let kind = match proto.func.unwrap() {
@@ -2547,7 +2534,7 @@ mod tests {
         proto_schema::metadata_value::Value::Number(5)
     )]
     #[case(
-        MetadataValue::String("s".to_string()),
+        MetadataValue::String("s".to_string().into()),
         proto_schema::metadata_value::Value::String("s".to_string())
     )]
     #[case(
@@ -2572,16 +2559,14 @@ mod tests {
 
     /// Round-trips a [`DataType`] through its proto form and back, asserting it is unchanged.
     fn assert_data_type_round_trips(data_type: DataType) {
-        #[cfg(feature = "limited-memory")]
-        super::super::limited_encode::equivalence::data_type(&data_type);
+        super::super::encode::equivalence::data_type(&data_type);
         let decoded = DataType::try_from(proto_schema::DataType::from(&data_type));
         assert_eq!(decoded.expect("decode succeeds"), data_type);
     }
 
     /// Round-trips a [`StructType`] through its proto form and back, asserting it is unchanged.
     fn assert_schema_round_trips(schema: StructType) {
-        #[cfg(feature = "limited-memory")]
-        super::super::limited_encode::equivalence::schema(&schema);
+        super::super::encode::equivalence::schema(&schema);
         let decoded = StructType::try_from(proto_schema::StructType::from(&schema));
         assert_eq!(decoded.expect("decode succeeds"), schema);
     }
@@ -2688,13 +2673,12 @@ mod tests {
 
     #[rstest]
     #[case(MetadataValue::Number(7))]
-    #[case(MetadataValue::String("hello".to_string()))]
+    #[case(MetadataValue::String("hello".to_string().into()))]
     #[case(MetadataValue::Boolean(true))]
     #[case(MetadataValue::Other(serde_json::json!({"nested": [1, 2, 3]})))]
     fn round_trip_field_metadata(#[case] value: MetadataValue) {
         let field = StructField::nullable("f", DataType::INTEGER).with_metadata([("k", value)]);
-        #[cfg(feature = "limited-memory")]
-        super::super::limited_encode::equivalence::field(&field);
+        super::super::encode::equivalence::field(&field);
         let decoded = StructField::try_from(proto_schema::StructField::from(&field));
         assert_eq!(decoded.expect("decode succeeds"), field);
     }

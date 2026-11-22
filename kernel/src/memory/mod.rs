@@ -1,26 +1,24 @@
-//! Experimental fallible storage for driver metadata. Requires Rust 1.100.
+//! Shared allocation tracking for allocation-heavy Kernel metadata. Requires Rust 1.100.
 //!
-//! Install [`MemoryBudget::install_global`] before any Kernel work to share one cap across ordinary
-//! snapshot, scan, transaction, and FFI calls. Derived objects, returned wire buffers, and lazy
-//! iterators retain their allocator until deallocation, including across threads and after the
-//! originating call returns. Callers do not enter thread-local scopes.
+//! Participating storage always allocates through [`KERNEL_ALLOCATOR`]. Its requested-byte limit
+//! is disabled by default. Set or clear the limit with [`KernelAllocator::set_limit`], or the FFI
+//! `kernel_memory_set_limit` entry point. No scopes, per-operation owners, or builder options are
+//! needed; usage follows the backing allocations until they are freed, across calls and threads.
 //!
-//! Explicit builder `with_allocator` methods optionally impose an additional local cap.
-//! [`MemoryBudget::with`] is a construction adapter for standalone serde calls.
-//! This does not intercept global allocations or bound engine-owned Arrow, Parquet, or parser
-//! scratch storage.
+//! The limit covers participating storage, not process RSS or allocations through other
+//! allocators, including engine-owned Arrow/Parquet buffers and parser-private scratch space.
 //!
 //! ```no_run
-//! # use delta_kernel::{Engine, Snapshot, memory::MemoryBudget};
+//! # use delta_kernel::{Engine, Snapshot, memory::KERNEL_ALLOCATOR};
 //! # fn example(engine: &dyn Engine) -> delta_kernel::Result<()> {
-//! let budget = MemoryBudget::install_global(64 * 1024 * 1024)
+//! KERNEL_ALLOCATOR.set_limit(Some(64 * 1024 * 1024))
 //!     .map_err(delta_kernel::KernelError::from)?;
 //! let snapshot = Snapshot::builder_for("file:///table/").build(engine)?;
 //! let scan = snapshot.scan_builder().build()?;
 //! for batch in scan.scan_metadata(engine)? {
 //!     let _batch = batch?;
 //! }
-//! assert!(budget.usage().peak <= budget.usage().limit);
+//! assert!(KERNEL_ALLOCATOR.usage().reserved <= 64 * 1024 * 1024);
 //! # Ok(())
 //! # }
 //! ```
@@ -37,12 +35,9 @@ mod shared_string;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use allocator::{AllocatedIterator, AllocationScope};
-pub use allocator::{LimitedAllocator, MemoryBudget, MemoryUsage};
-pub use containers::{
-    LimitedBytes, LimitedIntoIter, LimitedString, LimitedVec, RetainedVec, try_to_json,
-};
-pub use json::{LimitedJson, try_parse_json};
+pub use allocator::{KERNEL_ALLOCATOR, KernelAllocator, MemoryUsage};
+pub use containers::{IntoIter, MetadataBytes, MetadataString, MetadataVec, try_to_json};
+pub use json::{JsonValue, try_parse_json};
 pub use keys::FileKeySet;
 pub use ordered_map::OrderedMap;
 #[cfg(feature = "default-engine-base")]
@@ -53,40 +48,31 @@ pub use shared_string::SharedString;
 /// A failure that can be propagated without allocating an error message.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MemoryError {
-    /// Global policy was already sealed by configuration or allocator construction.
-    AlreadyConfigured,
-    /// The budget or backing allocator could not satisfy a container allocation.
+    /// The requested limit is below current tracked usage.
+    LimitBelowUsage,
+    /// The shared allocator could not satisfy a container allocation.
     AllocationFailed {
-        /// The requested-byte cap shared by the operation's containers.
+        /// The configured cap, or `usize::MAX` when enforcement is disabled.
         limit: usize,
     },
     /// A requested container size cannot be represented.
     CapacityOverflow,
-    /// The serializer rejected its input independently of the output allocation budget.
+    /// The serializer rejected its input independently of the output allocation.
     Serialization,
     /// Input is not valid JSON under the parser's supported nesting limit.
     InvalidJson,
-    /// A schema exceeds the experiment's recursion-depth limit.
-    SchemaTooDeep,
-    /// A top-level schema projection contains an invalid field index.
-    InvalidProjection,
-    /// A log-tail entry does not follow the previous entry's version.
-    InvalidLogOrder,
 }
 
 impl std::fmt::Display for MemoryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::AlreadyConfigured => f.write_str("global memory policy is already configured"),
+            Self::LimitBelowUsage => f.write_str("memory limit is below current tracked usage"),
             Self::AllocationFailed { limit } => {
                 write!(f, "allocation failed under a {limit}-byte metadata budget")
             }
             Self::CapacityOverflow => f.write_str("container capacity overflow"),
             Self::Serialization => f.write_str("metadata serialization failed"),
             Self::InvalidJson => f.write_str("invalid metadata JSON"),
-            Self::SchemaTooDeep => f.write_str("schema nesting limit exceeded"),
-            Self::InvalidProjection => f.write_str("invalid schema projection"),
-            Self::InvalidLogOrder => f.write_str("log tail is not in consecutive version order"),
         }
     }
 }
@@ -100,6 +86,22 @@ impl From<MemoryError> for crate::KernelError {
     fn from(error: MemoryError) -> Self {
         Self::Memory(error)
     }
+}
+
+// Fixed canonical schemas have infallible constructors. Complete their initialization before any
+// cap can be published; query-sized schema construction uses the fallible storage paths.
+fn initialize_schemas() {
+    static INITIALIZED: std::sync::Once = std::sync::Once::new();
+    INITIALIZED.call_once(|| {
+        crate::actions::initialize_schemas();
+        crate::scan::initialize_schemas();
+        crate::transaction::initialize_schemas();
+        crate::checkpoint::initialize_schemas();
+        #[cfg(feature = "declarative-plans")]
+        std::sync::LazyLock::force(&crate::plans::ir::nodes::FILE_META_SCHEMA);
+        std::sync::LazyLock::force(&crate::schema::FILE_FIELDS);
+        std::sync::LazyLock::force(&crate::schema::VARIANT_FIELDS);
+    });
 }
 
 thread_local! {

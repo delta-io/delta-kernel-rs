@@ -1113,7 +1113,7 @@ pub fn schema_with_column_defaults(
         .map(|field| match column_defaults.remove(field.name.as_str()) {
             Some(sql) => field.clone().add_metadata([(
                 ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
-                MetadataValue::String(sql.to_string()),
+                MetadataValue::String(sql.to_string().into()),
             )]),
             None => field.clone(),
         })

@@ -1692,7 +1692,7 @@ async fn add_column_with_orphan_default_metadata_succeeds() -> delta_kernel::Res
         create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
     let field = StructField::nullable("new_col", DataType::INTEGER).add_metadata([(
         ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
-        MetadataValue::String("42".to_string()),
+        MetadataValue::String("42".to_string().into()),
     )]);
 
     snapshot

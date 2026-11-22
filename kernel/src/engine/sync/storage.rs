@@ -65,23 +65,13 @@ impl StorageHandler for SyncStorageHandler {
                 size: meta.size,
             })
         });
-        #[cfg(feature = "limited-memory")]
-        if let Some(budget) = crate::memory::MemoryBudget::current() {
-            let mut items = crate::memory::LimitedVec::new(&budget);
-            let mut metas =
-                std::pin::pin!(metas.filter(move |item| ready(keep_listing(item, end))));
-            while let Some(meta) = futures::executor::block_on(metas.try_next())? {
-                items.try_push(meta)?;
-            }
-            items.as_mut_slice().sort_unstable();
-            return Ok(Box::new(items.into_iter().map(Ok)));
+
+        let mut items = crate::memory::MetadataVec::new();
+        let mut metas = std::pin::pin!(metas.filter(move |item| ready(keep_listing(item, end))));
+        while let Some(meta) = futures::executor::block_on(metas.try_next())? {
+            items.try_push(meta)?;
         }
-        let mut items: Vec<FileMeta> = futures::executor::block_on(
-            metas
-                .filter(move |item| ready(keep_listing(item, end)))
-                .try_collect(),
-        )?;
-        items.sort_unstable();
+        items.as_mut_slice().sort_unstable();
         Ok(Box::new(items.into_iter().map(Ok)))
     }
 
@@ -90,15 +80,9 @@ impl StorageHandler for SyncStorageHandler {
         files: Vec<FileSlice>,
     ) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
         let store = self.store.clone();
-        #[cfg(feature = "limited-memory")]
-        let budget = crate::memory::MemoryBudget::current();
-        let results = files.into_iter().map(move |(url, _range_opt)| {
-            #[cfg(feature = "limited-memory")]
-            if let Some(budget) = &budget {
-                return budget.with(|| super::get_bytes(store.as_ref(), &url));
-            }
-            super::get_bytes(store.as_ref(), &url)
-        });
+        let results = files
+            .into_iter()
+            .map(move |(url, _range_opt)| super::get_bytes(store.as_ref(), &url));
         Ok(Box::new(results))
     }
 

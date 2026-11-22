@@ -63,7 +63,6 @@ impl_to_data_type!(
     (bool, DataType::BOOLEAN)
 );
 
-#[cfg(feature = "limited-memory")]
 impl ToDataType for crate::memory::SharedString {
     fn to_data_type() -> DataType {
         DataType::STRING

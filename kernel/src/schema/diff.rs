@@ -754,7 +754,7 @@ mod tests {
             ("delta.columnMapping.id", MetadataValue::Number(id)),
             (
                 "delta.columnMapping.physicalName",
-                MetadataValue::String(format!("col_{id}")),
+                MetadataValue::String(format!("col_{id}").into()),
             ),
         ])
     }
@@ -864,7 +864,7 @@ mod tests {
                 ("delta.columnMapping.id", MetadataValue::Number(1)),
                 (
                     "delta.columnMapping.physicalName",
-                    MetadataValue::String("col_1".to_string()),
+                    MetadataValue::String("col_1".to_string().into()),
                 ),
             ])),
         };
@@ -873,7 +873,7 @@ mod tests {
                 ("delta.columnMapping.id", MetadataValue::Number(1)),
                 (
                     "delta.columnMapping.physicalName",
-                    MetadataValue::String("col_1".to_string()),
+                    MetadataValue::String("col_1".to_string().into()),
                 ),
             ])),
         };
@@ -894,7 +894,7 @@ mod tests {
                 ("delta.columnMapping.id", MetadataValue::Number(1)),
                 (
                     "delta.columnMapping.physicalName",
-                    MetadataValue::String("col_001".to_string()),
+                    MetadataValue::String("col_001".to_string().into()),
                 ),
             ])),
         };
@@ -903,7 +903,7 @@ mod tests {
                 ("delta.columnMapping.id", MetadataValue::Number(1)),
                 (
                     "delta.columnMapping.physicalName",
-                    MetadataValue::String("col_002".to_string()),
+                    MetadataValue::String("col_002".to_string().into()),
                 ),
             ])),
         };
@@ -920,7 +920,7 @@ mod tests {
                 ("delta.columnMapping.id", MetadataValue::Number(1)),
                 (
                     "delta.columnMapping.physicalName",
-                    MetadataValue::String("col_1".to_string()),
+                    MetadataValue::String("col_1".to_string().into()),
                 ),
             ])),
         };
@@ -941,14 +941,14 @@ mod tests {
         // Test that a field with multiple simultaneous changes produces FieldChangeType::Multiple
         let before = schema! {
             (create_field_with_id("user_name", DataType::STRING, false, 1)
-                .add_metadata([("custom", MetadataValue::String("old_value".to_string()))])),
+                .add_metadata([("custom", MetadataValue::String("old_value".to_string().into()))])),
         };
 
         let after = schema! {
             // Metadata changed
             // Renamed + nullability loosened
             (create_field_with_id("userName", DataType::STRING, true, 1)
-                .add_metadata([("custom", MetadataValue::String("new_value".to_string()))])),
+                .add_metadata([("custom", MetadataValue::String("new_value".to_string().into()))])),
         };
 
         let diff = SchemaDiff::new(&before, &after).unwrap();
@@ -982,14 +982,14 @@ mod tests {
         // breaking changes
         let before = schema! {
             (create_field_with_id("user_name", DataType::STRING, true, 1)
-                .add_metadata([("custom", MetadataValue::String("old_value".to_string()))])),
+                .add_metadata([("custom", MetadataValue::String("old_value".to_string().into()))])),
         };
 
         let after = schema! {
             // Metadata changed
             // Renamed + nullability tightened
             (create_field_with_id("userName", DataType::STRING, false, 1)
-                .add_metadata([("custom", MetadataValue::String("new_value".to_string()))])),
+                .add_metadata([("custom", MetadataValue::String("new_value".to_string().into()))])),
         };
 
         let diff = SchemaDiff::new(&before, &after).unwrap();

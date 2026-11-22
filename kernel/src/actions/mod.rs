@@ -3,11 +3,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-#[cfg(any(
-    not(feature = "limited-memory"),
-    feature = "adaptive-metadata-in-dev",
-    test
-))]
+#[cfg(any(feature = "adaptive-metadata-in-dev", test))]
 use std::sync::Arc;
 use std::sync::LazyLock;
 
@@ -56,24 +52,11 @@ pub mod set_transaction;
 
 mod schema_deserializer;
 
-#[cfg(feature = "limited-memory")]
 type SchemaString = crate::memory::SharedString;
-#[cfg(not(feature = "limited-memory"))]
-type SchemaString = Arc<String>;
-#[cfg(feature = "limited-memory")]
 type SchemaStringView = crate::memory::SharedString;
-#[cfg(not(feature = "limited-memory"))]
-type SchemaStringView = String;
 
 fn serialize_schema_string(schema: &SchemaRef) -> KernelResult<SchemaString> {
-    #[cfg(feature = "limited-memory")]
-    {
-        crate::memory::SharedString::try_to_json(schema)
-    }
-    #[cfg(not(feature = "limited-memory"))]
-    {
-        Ok(Arc::new(serde_json::to_string(schema)?))
-    }
+    crate::memory::SharedString::try_to_json(schema)
 }
 
 // see comment in ../lib.rs for the path module for why we include this way
@@ -320,6 +303,28 @@ pub(crate) fn get_commit_schema() -> &'static SchemaRef {
 /// Gets a schema for all actions defined by the delta spec.
 pub(crate) fn get_all_actions_schema() -> &'static SchemaRef {
     &ALL_ACTIONS_SCHEMA
+}
+
+pub(crate) fn initialize_schemas() {
+    let _ = get_all_actions_schema();
+    for schema in [
+        &LOG_ADD_SCHEMA,
+        &LOG_REMOVE_SCHEMA,
+        &LOG_METADATA_SCHEMA,
+        &LOG_PROTOCOL_SCHEMA,
+        &LOG_COMMIT_INFO_SCHEMA,
+        &LOG_TXN_SCHEMA,
+        &LOG_DOMAIN_METADATA_SCHEMA,
+    ] {
+        LazyLock::force(schema);
+    }
+    #[cfg(any(test, feature = "internal-api"))]
+    LazyLock::force(&COMMIT_SCHEMA);
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    {
+        LazyLock::force(&LOG_CHECKPOINT_SCHEMA);
+        LazyLock::force(&LAST_MANIFEST_COMMIT_FIELD);
+    }
 }
 
 /// Returns true if the schema contains file actions (add or remove)
@@ -3212,9 +3217,6 @@ mod tests {
         .unwrap();
         let saved_json = serde_json::to_value(&metadata).unwrap();
         let copy = metadata.clone();
-        #[cfg(not(feature = "limited-memory"))]
-        assert!(Arc::ptr_eq(&metadata.schema_string, &copy.schema_string));
-        #[cfg(feature = "limited-memory")]
         assert!(metadata.schema_string.ptr_eq(&copy.schema_string));
         let changed = metadata
             .with_schema(schema_ref! { nullable "name": STRING })

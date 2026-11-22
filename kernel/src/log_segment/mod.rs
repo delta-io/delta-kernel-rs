@@ -753,9 +753,6 @@ impl LogSegment {
         while start_idx > 0 && commits[start_idx].version == 1 + commits[start_idx - 1].version {
             start_idx -= 1;
         }
-        #[cfg(not(feature = "limited-memory"))]
-        commits.drain(..start_idx);
-        #[cfg(feature = "limited-memory")]
         commits.remove_prefix(start_idx);
 
         LogSegment::try_new(listed_commits, log_root, Some(end_version), None)

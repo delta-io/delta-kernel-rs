@@ -172,6 +172,17 @@ static TAGS_AND_CLUSTERING_PROVIDER_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = lazy
     (&ADD_FILE_CLUSTERING_PROVIDER_FIELD),
 };
 
+pub(crate) fn initialize_schemas() {
+    for schema in [
+        &BASE_ADD_FILES_SCHEMA,
+        &TAGS_ADD_FILES_SCHEMA,
+        &CLUSTERING_PROVIDER_ADD_FILES_SCHEMA,
+        &TAGS_AND_CLUSTERING_PROVIDER_ADD_FILES_SCHEMA,
+    ] {
+        LazyLock::force(schema);
+    }
+}
+
 /// The add-files schema with the optional columns present in a batch.
 fn add_files_schema_with(tags: bool, clustering_provider: bool) -> &'static SchemaRef {
     match (tags, clustering_provider) {
@@ -283,8 +294,6 @@ pub struct CreateTable;
 /// }
 /// ```
 pub struct Transaction<STATE = UpdateTable, MODE: ExecutionMode = Imperative> {
-    #[cfg(feature = "limited-memory")]
-    allocator: Option<crate::memory::LimitedAllocator>,
     span: tracing::Span,
     // Correlates all metric events emitted by this transaction.
     operation_id: MetricId,
@@ -669,8 +678,6 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     /// column defaults, CHECK constraints, or generated columns that the connector has not
     /// acknowledged.
     pub fn write_state(&self) -> KernelResult<Arc<WriteState>> {
-        #[cfg(feature = "limited-memory")]
-        let _scope = crate::memory::AllocationScope::new(self.allocator.as_ref());
         self.ensure_schema_non_empty_for_write_state()?;
         self.ensure_column_defaults_acknowledged()?;
         #[cfg(feature = "check-constraints-in-dev")]
@@ -727,10 +734,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
 
         Self {
             span,
-            #[cfg(feature = "limited-memory")]
-            allocator: common_state.allocator.or_else(|| {
-                crate::memory::MemoryBudget::current().map(|budget| budget.allocator())
-            }),
+
             operation_id: MetricId::new(),
             correlation_id: common_state.correlation_id,
             read_snapshot_opt: None,
@@ -1358,7 +1362,6 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
                 let snapshot = snap.new_post_commit(
                     parsed_commit,
                     crc_delta,
-                    #[cfg(feature = "limited-memory")]
                     Some(self.effective_table_config.at_version(commit_version)),
                     #[cfg(feature = "adaptive-metadata-in-dev")]
                     checkpoint_action,
@@ -1687,8 +1690,6 @@ mod tests {
             expected_commit_timestamp,
         );
         let Transaction {
-            #[cfg(feature = "limited-memory")]
-            allocator,
             span,
             operation_id,
             correlation_id,
@@ -1729,8 +1730,6 @@ mod tests {
             _state: _,
         } = transaction;
 
-        #[cfg(feature = "limited-memory")]
-        assert!(allocator.is_none());
         assert_eq!(span.id(), expected_span.id());
         assert_ne!(operation_id, MetricId::nil());
         assert!(correlation_id.is_none());
@@ -1805,8 +1804,6 @@ mod tests {
 
         let transaction = Transaction::<CreateTable>::new(
             TransactionBuilderState {
-                #[cfg(feature = "limited-memory")]
-                allocator: None,
                 correlation_id: Some("correlation-id".into()),
                 operation_parameters: Some(expected_parameters.clone()),
                 operation_metrics: Some(expected_metrics.clone()),

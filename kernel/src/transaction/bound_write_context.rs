@@ -330,8 +330,6 @@ mod tests {
     ) -> BoundWriteContext {
         let schema = schema_ref! { nullable "value": INTEGER };
         let write_state = Arc::new(WriteState {
-            #[cfg(feature = "limited-memory")]
-            allocator: None,
             table_root: Url::parse("s3://bucket/table/").unwrap(),
             full_logical_schema: schema.clone(),
             base_logical_data_schema: schema.clone(),

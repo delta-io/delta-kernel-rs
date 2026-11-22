@@ -98,7 +98,6 @@ optional = true
 # no default features
 default = []
 # Local allocator experiment; enabling this feature requires Rust 1.100.
-limited-memory = []
 # internal-api will make everything marked #[internal_api] public.
 internal-api = []
 # prettyprint enables Arrow pretty-print helpers (test/example oriented).

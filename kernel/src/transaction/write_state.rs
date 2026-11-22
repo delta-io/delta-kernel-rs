@@ -23,12 +23,7 @@ use crate::{DataType, Expression, KernelError, KernelResult};
 const WRITE_STATE_FORMAT_VERSION: u32 = 1;
 
 /// Owned transport bytes retaining any participating allocation budget until the buffer is freed.
-#[cfg(feature = "limited-memory")]
 pub type WriteStateBytes = bytes::Bytes;
-/// Owned transport bytes for an encoded write state.
-#[cfg(not(feature = "limited-memory"))]
-pub type WriteStateBytes = Vec<u8>;
-
 /// Table-wide state required to create [`BoundWriteContext`] instances.
 ///
 /// A transaction creates this state once on the driver through
@@ -38,9 +33,6 @@ pub type WriteStateBytes = Vec<u8>;
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WriteState {
-    #[cfg(feature = "limited-memory")]
-    #[serde(skip)]
-    pub(super) allocator: Option<crate::memory::LimitedAllocator>,
     pub(super) table_root: Url,
     /// Complete logical table schema, including partition columns.
     ///
@@ -169,8 +161,6 @@ impl BoundWriteContextBuilder {
     /// - The connector specifies a row-tracking metadata column that conflicts with another logical
     ///   field.
     pub fn build(self) -> KernelResult<BoundWriteContext> {
-        #[cfg(feature = "limited-memory")]
-        let _scope = crate::memory::AllocationScope::new(self.write_state.allocator.as_ref());
         let is_partitioned = !self.write_state.logical_partition_columns.is_empty();
         require!(
             is_partitioned || self.partition_values.is_none(),
@@ -344,28 +334,6 @@ struct DecodedWriteStateWire {
 }
 
 impl WriteState {
-    /// Return the in-process allocator retained for participating write-state operations.
-    ///
-    /// Encoding does not transfer allocation ownership to another process. Receivers select a
-    /// local allocator with [`Self::decode_in`].
-    #[cfg(feature = "limited-memory")]
-    pub fn memory_allocator(&self) -> Option<&crate::memory::LimitedAllocator> {
-        self.allocator.as_ref()
-    }
-
-    /// Decode write state with an explicit local allocator retained by the result.
-    ///
-    /// The input is borrowed for this call. Engine buffers and unconverted schema storage remain
-    /// outside this experimental cap.
-    #[cfg(feature = "limited-memory")]
-    pub fn decode_in(
-        bytes: &[u8],
-        allocator: crate::memory::LimitedAllocator,
-    ) -> KernelResult<Arc<Self>> {
-        let _scope = crate::memory::AllocationScope::new(Some(&allocator));
-        Self::decode(bytes)
-    }
-
     /// Creates a builder for a write context.
     ///
     /// For an unpartitioned table, call [`BoundWriteContextBuilder::build`] directly. For a
@@ -394,41 +362,12 @@ impl WriteState {
     ///
     /// Returns an error if any field cannot be serialized.
     pub fn encode(&self) -> KernelResult<WriteStateBytes> {
-        #[cfg(feature = "limited-memory")]
-        if let Some(budget) = self
-            .allocator
-            .as_ref()
-            .map(|allocator| allocator.budget().clone())
-            .or_else(crate::memory::MemoryBudget::current)
-        {
-            return self
-                .encode_with_budget(&budget)
-                .map(bytes::Bytes::from_owner);
-        }
-        let encoded = serde_json::to_vec(&WriteStateWire {
-            version: WRITE_STATE_FORMAT_VERSION,
-            write_state: self,
-        })?;
-        #[cfg(feature = "limited-memory")]
-        let encoded = encoded.into();
-        Ok(encoded)
-    }
-
-    /// Encode write state into owned storage charged until the returned buffer is freed.
-    ///
-    /// Source schemas and serializer scratch are outside this output budget.
-    #[cfg(feature = "limited-memory")]
-    pub fn encode_with_budget(
-        &self,
-        budget: &crate::memory::MemoryBudget,
-    ) -> KernelResult<crate::memory::LimitedBytes> {
-        Ok(crate::memory::try_to_json(
-            budget,
+        Ok(bytes::Bytes::from_owner(crate::memory::try_to_json(
             &WriteStateWire {
                 version: WRITE_STATE_FORMAT_VERSION,
                 write_state: self,
             },
-        )?)
+        )?))
     }
 
     /// Decodes shared write state from JSON bytes produced by [`encode`](Self::encode).
@@ -439,15 +378,7 @@ impl WriteState {
     /// Returns an error if the bytes contain an unsupported format version or do not contain a
     /// valid serialized write state.
     pub fn decode(bytes: &[u8]) -> KernelResult<Arc<Self>> {
-        #[cfg(not(feature = "limited-memory"))]
-        let wire: DecodedWriteStateWire = serde_json::from_slice(bytes)?;
-        #[cfg(feature = "limited-memory")]
-        let mut wire: DecodedWriteStateWire = crate::memory::decode_json(bytes)?;
-        #[cfg(feature = "limited-memory")]
-        {
-            wire.write_state.allocator =
-                crate::memory::MemoryBudget::current().map(|budget| budget.allocator());
-        }
+        let wire: DecodedWriteStateWire = crate::memory::decode_json(bytes)?;
         require!(
             wire.version == WRITE_STATE_FORMAT_VERSION,
             KernelError::generic(format!(
@@ -462,8 +393,6 @@ impl WriteState {
         let props = table_config.table_properties();
         Self {
             table_root: table_config.table_root().clone(),
-            #[cfg(feature = "limited-memory")]
-            allocator: crate::memory::MemoryBudget::current().map(|budget| budget.allocator()),
             full_logical_schema: table_config.logical_schema(),
             base_logical_data_schema: table_config.logical_schema_without_partition_columns(),
             base_physical_data_schema: table_config.physical_write_schema(),
@@ -799,7 +728,7 @@ mod tests {
                 ("delta.columnMapping.id", MetadataValue::Number(id)),
                 (
                     "delta.columnMapping.physicalName",
-                    MetadataValue::String(physical_name.to_string()),
+                    MetadataValue::String(physical_name.to_string().into()),
                 ),
             ])
         };

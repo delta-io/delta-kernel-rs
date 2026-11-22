@@ -49,7 +49,7 @@ fn schema_with_generated_columns(generated: &[(&str, &str)]) -> SchemaRef {
     let generated_fields = generated.iter().map(|(name, raw_sql)| {
         StructField::nullable(*name, DataType::INTEGER).add_metadata([(
             ColumnMetadataKey::GenerationExpression.as_ref(),
-            MetadataValue::String(raw_sql.to_string()),
+            MetadataValue::String(raw_sql.to_string().into()),
         )])
     });
     let fields = [
@@ -363,7 +363,7 @@ async fn adding_a_column_with_a_generation_expression_fails(
     let field_with_generation_expression = StructField::nullable("next_age", DataType::INTEGER)
         .add_metadata([(
             ColumnMetadataKey::GenerationExpression.as_ref(),
-            MetadataValue::String("age + 1".to_string()),
+            MetadataValue::String("age + 1".to_string().into()),
         )]);
     let column_to_add = if nested {
         let struct_with_generation_expression =

@@ -81,13 +81,7 @@ pub unsafe extern "C" fn write_state_encode(
 ) -> ExternResult<NullableCvoid> {
     let state = unsafe { state.as_ref() };
     let engine = unsafe { engine.as_ref() };
-    #[cfg(feature = "limited-memory")]
-    if let Some(allocator) = state.memory_allocator() {
-        let result = state
-            .encode_with_budget(allocator.budget())
-            .map(|bytes| allocate_fn(kernel_bytes_slice!(bytes)));
-        return unsafe { result.into_extern_result(&engine) };
-    }
+
     let result = state
         .encode()
         .map(|state| allocate_fn(kernel_bytes_slice!(state)));
@@ -108,32 +102,6 @@ pub unsafe extern "C" fn write_state_decode(
     let engine = unsafe { engine.as_ref() };
     let encoded = unsafe { encoded.try_as_slice() };
     let result = encoded.and_then(WriteState::decode).map(Into::into);
-    unsafe { result.into_extern_result(&engine) }
-}
-
-/// Decode write state using a caller-selected local allocation budget.
-///
-/// The returned state retains its allocator and may outlive `budget`. Encoded state never
-/// transfers a budget or accounting counters between processes. Release the result with
-/// [`free_write_state`]. The cap covers participating storage, excluding host copies and engine
-/// buffers. [`write_state_encode`] uses the retained budget for its output buffer.
-///
-/// # Safety
-///
-/// The encoded slice must satisfy [`KernelBytesSlice`]'s contract and is borrowed for this call.
-/// Both handles must be valid and are borrowed.
-#[cfg(feature = "limited-memory")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn write_state_decode_with_memory_budget(
-    encoded: KernelBytesSlice,
-    budget: Handle<crate::memory::SharedMemoryBudget>,
-    engine: Handle<SharedExternEngine>,
-) -> ExternResult<Handle<SharedWriteState>> {
-    let engine = unsafe { engine.as_ref() };
-    let allocator = unsafe { budget.as_ref() }.allocator();
-    let result = unsafe { encoded.try_as_slice() }
-        .and_then(|bytes| WriteState::decode_in(bytes, allocator))
-        .map(Into::into);
     unsafe { result.into_extern_result(&engine) }
 }
 

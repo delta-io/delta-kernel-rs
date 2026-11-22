@@ -159,8 +159,6 @@ pub(crate) fn run_with_validate_callback<T: Clone>(
 ) {
     let logical_schema = logical_schema.unwrap_or_else(|| schema_ref! {});
     let state_info = Arc::new(StateInfo {
-        #[cfg(feature = "limited-memory")]
-        allocator: crate::memory::MemoryBudget::current().map(|budget| budget.allocator()),
         logical_schema: logical_schema.clone(),
         physical_schema: logical_schema,
         physical_predicate: PhysicalPredicate::None,

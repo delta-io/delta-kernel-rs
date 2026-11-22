@@ -1,206 +1,186 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-use rstest::rstest;
+use std::alloc::{AllocError, Allocator, Layout};
+use std::process::Command;
+use std::sync::{Arc, Barrier};
 
 use super::*;
-use crate::schema::{DataType, MetadataValue, StructField, StructType};
-use crate::table_features::ColumnMappingMode;
+use crate::schema::{DataType, StructType};
 
-#[test]
-fn owning_iterator_drops_each_element_once_after_consumption_from_both_ends() {
-    struct Item(Arc<AtomicUsize>);
-    impl Drop for Item {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, Ordering::Relaxed);
-        }
+// Each cap-changing test runs alone even under cargo test's shared-process harness.
+fn isolated(run: impl FnOnce()) {
+    let current = std::thread::current();
+    let name = current.name().unwrap();
+    if std::env::var("KERNEL_MEMORY_TEST").as_deref() == Ok(name) {
+        KERNEL_ALLOCATOR.set_limit(None).unwrap();
+        run();
+        return;
     }
-    let drops = Arc::new(AtomicUsize::new(0));
-    let budget = MemoryBudget::new(1024);
-    let mut values = LimitedVec::new(&budget);
-    for _ in 0..8 {
-        values.try_push(Item(drops.clone())).unwrap();
-    }
-    let reserved = budget.usage().reserved;
-    let mut iter = values.into_iter();
-    drop(iter.next());
-    drop(iter.next_back());
-    assert_eq!(iter.len(), 6);
-    assert_eq!(drops.load(Ordering::Relaxed), 2);
-    assert_eq!(budget.usage().reserved, reserved);
-    std::thread::spawn(move || drop(iter)).join().unwrap();
-    assert_eq!(drops.load(Ordering::Relaxed), 8);
-    assert_eq!(budget.usage().reserved, 0);
-}
-
-#[test]
-fn bounded_ordered_map_matches_indexmap_order_replacement_and_growth_failures() {
-    let mut baseline = indexmap::IndexMap::new();
-    let measured = MemoryBudget::new(usize::MAX);
-    measured.with(|| {
-        let mut actual = OrderedMap::new();
-        for index in (0..300).map(|i| i * 17 % 151) {
-            let key = format!("key-{index}");
-            assert_eq!(
-                actual.try_insert(key.clone(), index).unwrap(),
-                baseline.insert(key, index)
-            );
-        }
-        assert!(actual.iter().eq(baseline.iter()));
-        assert!(actual.values().rev().eq(baseline.values().rev()));
-        assert!(actual.keys().eq(baseline.keys()));
-        for (index, key) in baseline.keys().enumerate() {
-            assert_eq!(actual.get_index_of(key), Some(index));
-            assert_eq!(actual.get_index(index), baseline.get_index(index));
-        }
-        let mut actual = actual.into_values();
-        let mut expected = baseline.clone().into_values();
-        assert_eq!(actual.next(), expected.next());
-        assert_eq!(actual.next_back(), expected.next_back());
-        assert!(actual.eq(expected));
-    });
-    let required = measured.usage().peak;
-    assert_eq!(measured.usage().reserved, 0);
-    for cap in (0..required).step_by(97).chain([required]) {
-        let budget = MemoryBudget::new(cap);
-        budget.with(|| {
-            let mut actual = OrderedMap::new();
-            for (key, value) in &baseline {
-                let before: Vec<_> = actual.iter().map(|(k, v)| (k.clone(), *v)).collect();
-                if actual.try_insert(key.clone(), *value).is_err() {
-                    assert!(actual.iter().eq(before.iter().map(|(k, v)| (k, v))));
-                    break;
-                }
-            }
-        });
-        assert!(budget.usage().peak <= cap);
-        assert_eq!(budget.usage().reserved, 0);
-    }
-}
-
-#[rstest]
-#[case(ColumnMappingMode::None)]
-#[case(ColumnMappingMode::Id)]
-#[case(ColumnMappingMode::Name)]
-fn bounded_physical_materialization_preserves_mapping_and_canonical_types(
-    #[case] mode: ColumnMappingMode,
-) {
-    let annotate = |field: StructField, id: i64| {
-        if mode == ColumnMappingMode::None {
-            field
-        } else {
-            field.with_metadata([
-                ("delta.columnMapping.id", MetadataValue::Number(id)),
-                (
-                    "delta.columnMapping.physicalName",
-                    MetadataValue::String(format!("physical_{id}")),
-                ),
-            ])
-        }
-    };
-    let schema = StructType::try_new([
-        annotate(
-            StructField::nullable(
-                "nested",
-                StructType::try_new([
-                    annotate(
-                        StructField::nullable(
-                            "array",
-                            crate::schema::ArrayType::new(DataType::LONG, true),
-                        ),
-                        2,
-                    ),
-                    annotate(
-                        StructField::nullable(
-                            "map",
-                            crate::schema::MapType::new(DataType::STRING, DataType::STRING, false),
-                        ),
-                        3,
-                    ),
-                ])
-                .unwrap(),
-            ),
-            1,
-        ),
-        annotate(StructField::nullable("file", DataType::file_type()), 4),
-        annotate(
-            StructField::nullable("variant", DataType::unshredded_variant()),
-            16,
-        ),
-    ])
-    .unwrap();
-    let expected = schema.make_physical(mode).unwrap();
-    let budget = MemoryBudget::new(1024 * 1024);
-    let actual = budget
-        .with(|| schema.try_make_validated_physical(mode))
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env("KERNEL_MEMORY_TEST", name)
+        .output()
         .unwrap();
-    assert_eq!(expected, actual);
-    assert_eq!(
-        serde_json::to_value(&expected).unwrap(),
-        serde_json::to_value(&actual).unwrap()
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert!(budget.usage().reserved > 0);
-    drop(actual);
-    assert_eq!(budget.usage().reserved, 0);
-    let required = budget.usage().peak;
-    for cap in [0, 256, required - 1, required] {
-        let budget = MemoryBudget::new(cap);
-        let result = budget.with(|| schema.try_make_validated_physical(mode));
-        assert_eq!(result.is_ok(), cap >= required, "mode={mode} cap={cap}");
-        drop(result);
-        assert_eq!(budget.usage().reserved, 0);
-        assert!(budget.usage().peak <= cap);
-    }
 }
 
 #[test]
-fn boxed_payloads_preserve_alignment_and_zero_sized_iterator_drops() {
-    #[repr(align(256))]
-    struct Aligned([u8; 256]);
-    let budget = MemoryBudget::new(256);
-    let value = Owned::try_new_in(Aligned([7; 256]), budget.allocator()).unwrap();
-    assert_eq!((&*value as *const Aligned) as usize % 256, 0);
-    assert_eq!(value.0[0], 7);
-    assert_eq!(budget.usage().reserved, 256);
-    drop(value);
-    assert_eq!(budget.usage().reserved, 0);
+fn singleton_allocator_tracks_unlimited_then_enforces_and_reconfigures() {
+    isolated(|| {
+        let baseline = KERNEL_ALLOCATOR.usage().reserved;
+        let allocator = KERNEL_ALLOCATOR;
+        assert_eq!(allocator.usage().limit, None);
+        assert_eq!(allocator.usage().reserved, baseline);
+        let mut bytes = MetadataBytes::try_copy(b"abcdefgh").unwrap();
+        assert_eq!(allocator.usage().reserved, baseline + bytes.capacity());
+        assert_eq!(
+            allocator.set_limit(Some(baseline + 7)),
+            Err(MemoryError::LimitBelowUsage)
+        );
+        assert_eq!(allocator.usage().limit, None);
+        allocator.set_limit(Some(baseline + 8)).unwrap();
+        assert!(bytes.try_push(b'i').is_err());
+        assert_eq!(&*bytes, b"abcdefgh");
+        assert_eq!(allocator.usage().reserved, baseline + 8);
+        assert_eq!(allocator.usage().rejected, 1);
+        allocator.set_limit(None).unwrap();
+        bytes.try_push(b'i').unwrap();
+        let peak = allocator.usage().peak;
+        drop(bytes);
+        assert_eq!(allocator.usage().reserved, baseline);
+        allocator.set_limit(Some(baseline)).unwrap();
+        assert!(MetadataBytes::try_copy(b"x").is_err());
+        assert!(MetadataBytes::try_copy(b"").is_ok());
+        assert_eq!(allocator.usage().peak, peak);
+        allocator.set_limit(None).unwrap();
+    });
+}
 
-    static DROPS: AtomicUsize = AtomicUsize::new(0);
-    struct Empty;
-    impl Drop for Empty {
-        fn drop(&mut self) {
-            DROPS.fetch_add(1, Ordering::Relaxed);
+#[test]
+fn allocator_zeroed_growth_shrink_alignment_and_backing_failure() {
+    isolated(|| {
+        let baseline = KERNEL_ALLOCATOR.usage().reserved;
+        let allocator = KERNEL_ALLOCATOR;
+        let a = Layout::from_size_align(64, 64).unwrap();
+        let b = Layout::from_size_align(128, 64).unwrap();
+        let allocation = allocator.allocate_zeroed(a).unwrap();
+        // SAFETY: The allocator returned a live block of the requested size.
+        unsafe {
+            assert!(allocation.as_ref().iter().all(|byte| *byte == 0));
+            allocation.cast::<u8>().as_ptr().write(23);
+            allocator.set_limit(Some(baseline + 128)).unwrap();
+            assert!(allocator.grow(allocation.cast(), a, b).is_err());
+            assert_eq!(allocation.cast::<u8>().as_ptr().read(), 23);
+            assert_eq!(allocator.usage().reserved, baseline + 64);
+            allocator.set_limit(Some(baseline + 192)).unwrap();
+            let grown = allocator.grow_zeroed(allocation.cast(), a, b).unwrap();
+            assert_eq!(grown.cast::<u8>().as_ptr().read(), 23);
+            assert!(grown.as_ref()[64..].iter().all(|byte| *byte == 0));
+            let shrunk = allocator.shrink(grown.cast(), b, a).unwrap();
+            assert_eq!(shrunk.cast::<u8>().as_ptr().read(), 23);
+            assert_eq!(allocator.usage().reserved, baseline + 64);
+            allocator.deallocate(shrunk.cast(), a);
         }
-    }
-    let zero = MemoryBudget::new(0);
-    let mut values = LimitedVec::new(&zero);
-    for _ in 0..7 {
-        values.try_push(Empty).unwrap();
-    }
-    let mut iter = values.into_iter();
-    drop(iter.next());
-    drop(iter.next_back());
-    drop(iter);
-    assert_eq!(DROPS.load(Ordering::Relaxed), 7);
-    assert_eq!(zero.usage().reserved, 0);
+        allocator.set_limit(None).unwrap();
+        let rejected = allocator.usage().rejected;
+        assert!(allocator.allocate_with(a, |_| Err(AllocError)).is_err());
+        assert_eq!(allocator.usage().reserved, baseline);
+        assert_eq!(allocator.usage().rejected, rejected);
+        let aligned = Layout::from_size_align(256, 4096).unwrap();
+        let allocation = allocator.allocate(aligned).unwrap();
+        assert_eq!(allocation.cast::<u8>().as_ptr().addr() % 4096, 0);
+        unsafe {
+            KERNEL_ALLOCATOR.deallocate(allocation.cast(), aligned);
+        }
+        assert_eq!(allocator.usage().reserved, baseline);
+        assert_eq!(
+            MetadataVec::<u64>::new().try_reserve_exact(usize::MAX),
+            Err(MemoryError::CapacityOverflow)
+        );
+    });
 }
 
 #[test]
-fn shared_schema_text_and_boxed_nodes_release_on_the_last_owning_thread() {
-    let budget = MemoryBudget::new(4096);
-    let text = budget
-        .with(|| SharedString::try_copy("schema payload"))
-        .unwrap();
-    let boxed = budget.with(|| Owned::try_new([0_u8; 256])).unwrap();
-    let clone = text.clone();
-    drop(text);
-    assert_eq!(budget.usage().reserved, "schema payload".len() + 256);
-    std::thread::spawn(move || drop((clone, boxed)))
-        .join()
-        .unwrap();
-    assert_eq!(budget.usage().reserved, 0);
-    let zero = MemoryBudget::new(0);
-    assert!(zero.with(|| Owned::try_new(1)).is_err());
-    assert!(zero.with(|| SharedString::try_copy("x")).is_err());
-    assert_eq!(zero.usage().reserved, 0);
+fn one_cap_is_shared_by_concurrent_allocations_and_cross_thread_frees() {
+    isolated(|| {
+        let baseline = KERNEL_ALLOCATOR.usage().reserved;
+        KERNEL_ALLOCATOR.set_limit(Some(baseline + 4096)).unwrap();
+        let initial_peak = KERNEL_ALLOCATOR.usage().peak;
+        let gate = Arc::new(Barrier::new(17));
+        let workers: Vec<_> = (0..16)
+            .map(|_| {
+                let gate = gate.clone();
+                std::thread::spawn(move || {
+                    let allocation = MetadataBytes::try_copy(&[7; 1024]).ok();
+                    gate.wait();
+                    gate.wait();
+                    allocation
+                })
+            })
+            .collect();
+        gate.wait();
+        assert_eq!(KERNEL_ALLOCATOR.usage().reserved, baseline + 4096);
+        assert_eq!(KERNEL_ALLOCATOR.usage().rejected, 12);
+        assert_eq!(
+            KERNEL_ALLOCATOR.usage().peak,
+            initial_peak.max(baseline + 4096)
+        );
+        gate.wait();
+        let allocations: Vec<_> = workers
+            .into_iter()
+            .filter_map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(allocations.len(), 4);
+        drop(allocations);
+        assert_eq!(KERNEL_ALLOCATOR.usage().reserved, baseline);
+        KERNEL_ALLOCATOR.set_limit(None).unwrap();
+    });
+}
+
+#[test]
+fn retained_strings_and_nested_schema_use_the_same_allocator_without_scopes() {
+    isolated(|| {
+        let baseline = KERNEL_ALLOCATOR.usage().reserved;
+        let json = r#"{"type":"struct","fields":[{"name":"nested","type":{"type":"array","elementType":{"type":"struct","fields":[{"name":"leaf","type":"long","nullable":true,"metadata":{"comment":"retained annotation"}}]},"containsNull":true},"nullable":true,"metadata":{}}]}"#;
+        let schema: StructType = decode_json(json.as_bytes()).unwrap();
+        assert!(matches!(
+            schema.field("nested").unwrap().data_type(),
+            DataType::Array(_)
+        ));
+        let used = KERNEL_ALLOCATOR.usage().reserved;
+        assert!(used > 0);
+        KERNEL_ALLOCATOR.set_limit(Some(used)).unwrap();
+        assert!(decode_json::<StructType>(json.as_bytes()).is_err());
+        assert_eq!(KERNEL_ALLOCATOR.usage().reserved, used);
+        drop(schema);
+        assert_eq!(KERNEL_ALLOCATOR.usage().reserved, baseline);
+        KERNEL_ALLOCATOR.set_limit(None).unwrap();
+        let text = SharedString::try_copy("schema payload").unwrap();
+        let copy = text.clone();
+        let retained = KERNEL_ALLOCATOR.usage().reserved;
+        drop(text);
+        assert_eq!(KERNEL_ALLOCATOR.usage().reserved, retained);
+        std::thread::spawn(move || drop(copy)).join().unwrap();
+        assert_eq!(KERNEL_ALLOCATOR.usage().reserved, baseline);
+    });
+}
+
+#[test]
+fn file_and_variant_schema_decoding_is_fallible_at_each_small_limit() {
+    isolated(|| {
+        let baseline = KERNEL_ALLOCATOR.usage().reserved;
+        for json in [br#""file""#.as_slice(), br#""variant""#.as_slice()] {
+            for headroom in (0..2048).step_by(32) {
+                KERNEL_ALLOCATOR
+                    .set_limit(Some(baseline + headroom))
+                    .unwrap();
+                drop(decode_json::<DataType>(json));
+                assert_eq!(KERNEL_ALLOCATOR.usage().reserved, baseline);
+            }
+        }
+        KERNEL_ALLOCATOR.set_limit(None).unwrap();
+    });
 }

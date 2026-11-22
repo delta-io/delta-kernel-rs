@@ -543,14 +543,7 @@ fn scan_declarative_metadata_plan_impl(
     Ok(plan
         .map(|plan| -> KernelResult<_> {
             let operation = delta_kernel::Operation::QueryPlan(plan);
-            #[cfg(feature = "limited-memory")]
-            {
-                operation.try_to_proto_bytes().map(Into::into)
-            }
-            #[cfg(not(feature = "limited-memory"))]
-            {
-                Ok(operation.to_proto_bytes().into())
-            }
+            operation.try_to_proto_bytes().map(Into::into)
         })
         .transpose()?
         .into())

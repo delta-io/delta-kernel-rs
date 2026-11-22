@@ -326,6 +326,16 @@ static LAST_CHECKPOINT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     nullable "numOfAddFiles": LONG,
 };
 
+pub(crate) fn initialize_schemas() {
+    for schema in [
+        &LAST_CHECKPOINT_SCHEMA,
+        &CHECKPOINT_ACTIONS_SCHEMA_V1,
+        &CHECKPOINT_ACTIONS_SCHEMA_V2,
+    ] {
+        LazyLock::force(schema);
+    }
+}
+
 /// Action fields shared by V1 and V2 checkpoint schemas.
 fn base_checkpoint_action_fields() -> [&'static LazyLock<StructField>; 7] {
     [

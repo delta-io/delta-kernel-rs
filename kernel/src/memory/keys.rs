@@ -3,7 +3,7 @@ use std::hash::BuildHasher;
 
 use serde::ser::SerializeSeq;
 
-use super::{LimitedAllocator, LimitedString, LimitedVec, MemoryBudget, MemoryError, MemoryResult};
+use super::{MemoryError, MemoryResult, MetadataString, MetadataVec};
 
 /// Fallible file-action deduplication state keyed by path and optional DV identity.
 ///
@@ -12,30 +12,41 @@ use super::{LimitedAllocator, LimitedString, LimitedVec, MemoryBudget, MemoryErr
 /// for Kernel's deletion-vector identity construction or action-selection rules.
 #[derive(Debug)]
 pub struct FileKeySet {
-    buckets: LimitedVec<Option<FileKey>>,
+    buckets: MetadataVec<Option<FileKey>>,
     len: usize,
     hasher: RandomState,
 }
 
 #[derive(Debug)]
 struct FileKey {
-    path: LimitedString,
-    dv: Option<LimitedString>,
+    path: MetadataString,
+    dv: Option<MetadataString>,
 }
 
 impl FileKeySet {
-    /// Create an empty set using a shared requested-byte budget.
-    pub fn new(budget: &MemoryBudget) -> Self {
-        Self::new_in(budget.allocator())
-    }
-
-    /// Create an empty set retaining an explicit standard allocator.
-    pub fn new_in(allocator: LimitedAllocator) -> Self {
+    /// Create empty deduplication storage using the shared Kernel allocator.
+    pub fn new() -> Self {
         Self {
-            buckets: LimitedVec::new_in(allocator),
+            buckets: MetadataVec::new(),
             len: 0,
             hasher: RandomState::new(),
         }
+    }
+
+    /// Preallocate fallibly for the estimated number of replay keys.
+    pub fn try_with_capacity(capacity: usize) -> MemoryResult<Self> {
+        let mut keys = Self::new();
+        let buckets = capacity
+            .checked_mul(2)
+            .and_then(usize::checked_next_power_of_two)
+            .ok_or(MemoryError::CapacityOverflow)?;
+        if capacity > 0 {
+            keys.buckets.try_reserve_exact(buckets)?;
+            for _ in 0..buckets {
+                keys.buckets.try_push(None)?;
+            }
+        }
+        Ok(keys)
     }
 
     /// Record an owned key, leaving existing keys intact if an allocation fails.
@@ -44,10 +55,8 @@ impl FileKeySet {
             return Ok(false);
         }
         let key = FileKey {
-            path: LimitedString::try_copy(self.buckets.budget(), path)?,
-            dv: dv
-                .map(|dv| LimitedString::try_copy(self.buckets.budget(), dv))
-                .transpose()?,
+            path: MetadataString::try_copy(path)?,
+            dv: dv.map(MetadataString::try_copy).transpose()?,
         };
         if self.len >= self.buckets.len() / 2 {
             self.try_grow()?;
@@ -67,7 +76,7 @@ impl FileKeySet {
             match &self.buckets[index] {
                 Some(key)
                     if key.path.as_str() == path
-                        && key.dv.as_ref().map(LimitedString::as_str) == dv =>
+                        && key.dv.as_ref().map(MetadataString::as_str) == dv =>
                 {
                     return true;
                 }
@@ -94,7 +103,7 @@ impl FileKeySet {
             .max(4)
             .checked_mul(2)
             .ok_or(MemoryError::CapacityOverflow)?;
-        let mut buckets = LimitedVec::new(self.buckets.budget());
+        let mut buckets = MetadataVec::new();
         buckets.try_reserve_exact(capacity)?;
         for _ in 0..capacity {
             buckets.try_push(None)?;
@@ -118,11 +127,11 @@ fn hash_key(hasher: &RandomState, path: &str, dv: Option<&str>) -> usize {
     hasher.hash_one((path, dv)) as usize
 }
 
-fn insert_key(buckets: &mut LimitedVec<Option<FileKey>>, hasher: &RandomState, key: FileKey) {
+fn insert_key(buckets: &mut MetadataVec<Option<FileKey>>, hasher: &RandomState, key: FileKey) {
     let mut index = hash_key(
         hasher,
         key.path.as_str(),
-        key.dv.as_ref().map(LimitedString::as_str),
+        key.dv.as_ref().map(MetadataString::as_str),
     ) & (buckets.len() - 1);
     while buckets[index].is_some() {
         index = (index + 1) & (buckets.len() - 1);
@@ -141,7 +150,7 @@ impl serde::Serialize for FileKeySet {
         for key in self.buckets.iter().flatten() {
             sequence.serialize_element(&Key {
                 path: key.path.as_str(),
-                dv_unique_id: key.dv.as_ref().map(LimitedString::as_str),
+                dv_unique_id: key.dv.as_ref().map(MetadataString::as_str),
             })?;
         }
         sequence.end()
@@ -159,9 +168,7 @@ impl<'de> serde::Deserialize<'de> for FileKeySet {
                 self,
                 mut input: A,
             ) -> Result<Self::Value, A::Error> {
-                let budget =
-                    MemoryBudget::current().unwrap_or_else(|| MemoryBudget::new(usize::MAX));
-                let mut keys = FileKeySet::new(&budget);
+                let mut keys = FileKeySet::new();
                 while let Some(key) = input.next_element::<crate::log_replay::FileActionKey>()? {
                     keys.try_insert(key.path(), key.dv_unique_id())
                         .map_err(|error| {
@@ -173,5 +180,11 @@ impl<'de> serde::Deserialize<'de> for FileKeySet {
             }
         }
         deserializer.deserialize_seq(Keys)
+    }
+}
+
+impl Default for FileKeySet {
+    fn default() -> Self {
+        Self::new()
     }
 }

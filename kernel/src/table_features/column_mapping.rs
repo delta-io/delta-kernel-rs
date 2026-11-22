@@ -602,7 +602,7 @@ pub(crate) fn try_assign_flat_column_mapping_info(
             *max_id = (*max_id).max(preserved_id);
             new_field.metadata.insert(
                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref().into(),
-                MetadataValue::String(format!("col-{}", Uuid::new_v4())),
+                MetadataValue::String(format!("col-{}", Uuid::new_v4()).into()),
             );
         }
         // Only `physicalName` present: preserve name, allocate id.
@@ -622,7 +622,7 @@ pub(crate) fn try_assign_flat_column_mapping_info(
             );
             new_field.metadata.insert(
                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref().into(),
-                MetadataValue::String(format!("col-{}", Uuid::new_v4())),
+                MetadataValue::String(format!("col-{}", Uuid::new_v4()).into()),
             );
         }
     }
@@ -1298,7 +1298,7 @@ mod tests {
         if let Some(name) = stale_physical_name {
             metadata.push((
                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                MetadataValue::String(name.to_string()),
+                MetadataValue::String(name.to_string().into()),
             ));
         }
         let field = StructField::not_null("stale", DataType::INTEGER).with_metadata(metadata);
@@ -1386,7 +1386,7 @@ mod tests {
         let wrong_typed = schema! {
             (StructField::nullable("a", DataType::INTEGER).add_metadata([(
                 ColumnMetadataKey::ColumnMappingId.as_ref(),
-                MetadataValue::String("not-a-number".to_string()),
+                MetadataValue::String("not-a-number".to_string().into()),
             )])),
         };
         assert!(schema_has_column_mapping_metadata(&wrong_typed));
@@ -1402,7 +1402,7 @@ mod tests {
             ),
             (
                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                MetadataValue::String("col-a".to_string()),
+                MetadataValue::String("col-a".to_string().into()),
             ),
             ("delta.identity.start", MetadataValue::Number(7)),
         ]);
@@ -1486,7 +1486,7 @@ mod tests {
             ),
             (
                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                MetadataValue::String(format!("col-{name}")),
+                MetadataValue::String(format!("col-{name}").into()),
             ),
         ])
     }
@@ -1722,7 +1722,7 @@ mod tests {
         if let Some(name) = pre_name {
             metadata.push((
                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                MetadataValue::String(name.to_string()),
+                MetadataValue::String(name.to_string().into()),
             ));
         }
         let field = StructField::not_null(FIELD_UNDER_TEST, DataType::INTEGER);
@@ -1863,7 +1863,7 @@ mod tests {
                     ),
                     (
                         ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                        MetadataValue::String(format!("p-{name}")),
+                        MetadataValue::String(format!("p-{name}").into()),
                     ),
                 ]),
             );
@@ -1913,8 +1913,8 @@ mod tests {
     /// the error names both the offending key and the kind of violation.
     #[rstest::rstest]
     #[case::id_wrong_type_string(
-        Some(MetadataValue::String("not-a-number".to_string())),
-        Some(MetadataValue::String("p".to_string())),
+        Some(MetadataValue::String("not-a-number".to_string().into())),
+        Some(MetadataValue::String("p".to_string().into())),
         "non-numeric",
         ColumnMetadataKey::ColumnMappingId,
     )]
@@ -1926,19 +1926,19 @@ mod tests {
     )]
     #[case::name_empty_no_id(
         None,
-        Some(MetadataValue::String(String::new())),
+        Some(MetadataValue::String(String::new().into())),
         "empty",
         ColumnMetadataKey::ColumnMappingPhysicalName
     )]
     #[case::name_empty_with_id(
         Some(MetadataValue::Number(5)),
-        Some(MetadataValue::String(String::new())),
+        Some(MetadataValue::String(String::new().into())),
         "empty",
         ColumnMetadataKey::ColumnMappingPhysicalName
     )]
     #[case::id_negative_with_name(
         Some(MetadataValue::Number(-7)),
-        Some(MetadataValue::String("p".to_string())),
+        Some(MetadataValue::String("p".to_string().into())),
         "Invalid column mapping id",
         ColumnMetadataKey::ColumnMappingId,
     )]
@@ -2063,13 +2063,13 @@ mod tests {
             ),
             (
                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                MetadataValue::String("preserved-name".to_string()),
+                MetadataValue::String("preserved-name".to_string().into()),
             ),
         ]);
         let needs_allocation = StructField::not_null("needs_alloc", DataType::INTEGER)
             .add_metadata([(
                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                MetadataValue::String("user-supplied".to_string()),
+                MetadataValue::String("user-supplied".to_string().into()),
             )]);
         let schema = schema! {
             (preserved),
@@ -2450,7 +2450,7 @@ mod tests {
             (StructField::not_null("y", DataType::INTEGER).add_metadata([
                 (
                     ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                    MetadataValue::String("col-inner-y".to_string()),
+                    MetadataValue::String("col-inner-y".to_string().into()),
                 ),
                 (
                     ColumnMetadataKey::ColumnMappingId.as_ref(),
@@ -2463,7 +2463,7 @@ mod tests {
             (StructField::nullable("a", inner).add_metadata([
                 (
                     ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                    MetadataValue::String("col-outer-a".to_string()),
+                    MetadataValue::String("col-outer-a".to_string().into()),
                 ),
                 (
                     ColumnMetadataKey::ColumnMappingId.as_ref(),
@@ -2559,7 +2559,7 @@ mod tests {
         if has_physical_name {
             inner_field = inner_field.add_metadata([(
                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                MetadataValue::String("col-inner-y".to_string()),
+                MetadataValue::String("col-inner-y".to_string().into()),
             )]);
         }
         if has_id {
@@ -2576,7 +2576,7 @@ mod tests {
             (StructField::nullable("a", inner).add_metadata([
                 (
                     ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                    MetadataValue::String("col-outer-a".to_string()),
+                    MetadataValue::String("col-outer-a".to_string().into()),
                 ),
                 (
                     ColumnMetadataKey::ColumnMappingId.as_ref(),
@@ -2658,7 +2658,7 @@ mod tests {
     fn physical_to_logical_with_name_mapping() {
         let field = StructField::not_null("user_id", DataType::INTEGER).with_metadata([(
             "delta.columnMapping.physicalName".to_string(),
-            MetadataValue::String("col-abc-123".to_string()),
+            MetadataValue::String("col-abc-123".to_string().into()),
         )]);
         let schema = schema! { (field) };
 
@@ -2695,12 +2695,12 @@ mod tests {
     fn physical_to_logical_nested_struct_with_mapping() {
         let inner_field = StructField::nullable("city", DataType::STRING).with_metadata([(
             "delta.columnMapping.physicalName".to_string(),
-            MetadataValue::String("col-inner-456".to_string()),
+            MetadataValue::String("col-inner-456".to_string().into()),
         )]);
         let inner_struct = schema! { (inner_field) };
         let outer_field = StructField::nullable("address", inner_struct).with_metadata([(
             "delta.columnMapping.physicalName".to_string(),
-            MetadataValue::String("col-outer-123".to_string()),
+            MetadataValue::String("col-outer-123".to_string().into()),
         )]);
         let schema = schema! { (outer_field) };
 

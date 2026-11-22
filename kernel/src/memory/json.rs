@@ -5,7 +5,7 @@ use serde::de::{self, DeserializeSeed, IntoDeserializer, MapAccess, SeqAccess, V
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use super::{LimitedString, LimitedVec, MemoryBudget, MemoryError, MemoryResult};
+use super::{MemoryError, MemoryResult, MetadataString, MetadataVec};
 
 /// A fallibly materialized JSON tree for schema and log-action payloads.
 ///
@@ -14,7 +14,7 @@ use super::{LimitedString, LimitedVec, MemoryBudget, MemoryError, MemoryResult};
 /// type proves fallible tree construction, not a cap on the complete parsing operation. It does
 /// not validate Delta schema or action semantics.
 #[derive(Debug)]
-pub enum LimitedJson {
+pub enum JsonValue {
     /// JSON null.
     Null,
     /// JSON boolean.
@@ -22,14 +22,24 @@ pub enum LimitedJson {
     /// JSON numeric scalar.
     Number(serde_json::Number),
     /// A string with budgeted owned UTF-8 storage.
-    String(LimitedString),
+    String(MetadataString),
     /// An array with budgeted element capacity.
-    Array(LimitedVec<LimitedJson>),
+    Array(MetadataVec<JsonValue>),
     /// Object entries with budgeted keys and values, in input order.
-    Object(LimitedVec<(LimitedString, LimitedJson)>),
+    Object(MetadataVec<(MetadataString, JsonValue)>),
 }
 
-impl LimitedJson {
+impl Drop for JsonValue {
+    fn drop(&mut self) {
+        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || match self {
+            Self::Array(values) => values.clear(),
+            Self::Object(entries) => entries.clear(),
+            _ => {}
+        });
+    }
+}
+
+impl JsonValue {
     /// Borrow the last matching object member, or `None` for a missing key or non-object value.
     pub fn member(&self, name: &str) -> Option<&Self> {
         match self {
@@ -43,7 +53,7 @@ impl LimitedJson {
     }
 }
 
-impl Serialize for LimitedJson {
+impl Serialize for JsonValue {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             Self::Null => serializer.serialize_unit(),
@@ -72,9 +82,8 @@ impl Serialize for LimitedJson {
 ///
 /// Budget failure is propagated as `AllocationFailed`, independently of serde's error formatting.
 /// Input bytes and parser-private scratch/error allocations are outside the retained-tree cap.
-pub fn try_parse_json(budget: &MemoryBudget, input: &str) -> MemoryResult<LimitedJson> {
+pub fn try_parse_json(input: &str) -> MemoryResult<JsonValue> {
     let context = Context {
-        budget,
         failure: Cell::new(None),
     };
     let mut deserializer = serde_json::Deserializer::from_str(input);
@@ -85,12 +94,11 @@ pub fn try_parse_json(budget: &MemoryBudget, input: &str) -> MemoryResult<Limite
     Ok(parsed)
 }
 
-struct Context<'a> {
-    budget: &'a MemoryBudget,
+struct Context {
     failure: Cell<Option<MemoryError>>,
 }
 
-impl Context<'_> {
+impl Context {
     fn propagate<T, E: de::Error>(&self, value: MemoryResult<T>) -> Result<T, E> {
         value.map_err(|error| {
             self.failure.set(Some(error));
@@ -102,82 +110,84 @@ impl Context<'_> {
 
 #[derive(Clone, Copy)]
 struct Seed<'a> {
-    context: &'a Context<'a>,
+    context: &'a Context,
 }
 
 impl<'de> DeserializeSeed<'de> for Seed<'_> {
-    type Value = LimitedJson;
+    type Value = JsonValue;
 
     fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
-        deserializer.deserialize_any(self)
+        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+            deserializer.deserialize_any(self)
+        })
     }
 }
 
 impl<'de> Visitor<'de> for Seed<'_> {
-    type Value = LimitedJson;
+    type Value = JsonValue;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("a JSON value")
     }
 
     fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-        Ok(LimitedJson::Null)
+        Ok(JsonValue::Null)
     }
 
     fn visit_bool<E: de::Error>(self, value: bool) -> Result<Self::Value, E> {
-        Ok(LimitedJson::Bool(value))
+        Ok(JsonValue::Bool(value))
     }
 
     fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
-        Ok(LimitedJson::Number(value.into()))
+        Ok(JsonValue::Number(value.into()))
     }
 
     fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
-        Ok(LimitedJson::Number(value.into()))
+        Ok(JsonValue::Number(value.into()))
     }
 
     fn visit_f64<E: de::Error>(self, value: f64) -> Result<Self::Value, E> {
         serde_json::Number::from_f64(value)
-            .map(LimitedJson::Number)
+            .map(JsonValue::Number)
             .ok_or_else(|| E::custom("invalid JSON number"))
     }
 
     fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
         self.context
-            .propagate(LimitedString::try_copy(self.context.budget, value))
-            .map(LimitedJson::String)
+            .propagate(MetadataString::try_copy(value))
+            .map(JsonValue::String)
     }
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
-        let mut values = LimitedVec::new(self.context.budget);
+        let mut values = MetadataVec::new();
         while let Some(value) = sequence.next_element_seed(self)? {
             self.context.propagate(values.try_push(value))?;
         }
-        Ok(LimitedJson::Array(values))
+        Ok(JsonValue::Array(values))
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-        let mut entries = LimitedVec::new(self.context.budget);
+        let mut entries = MetadataVec::new();
         while let Some(key) = map.next_key_seed(StringSeed(self.context))? {
             let value = map.next_value_seed(self)?;
             if let Some((_, previous)) = entries
                 .as_mut_slice()
                 .iter_mut()
-                .find(|(name, _): &&mut (LimitedString, LimitedJson)| name.as_str() == key.as_str())
+                .find(|(name, _): &&mut (MetadataString, JsonValue)| name.as_str() == key.as_str())
             {
                 *previous = value;
             } else {
                 self.context.propagate(entries.try_push((key, value)))?;
             }
         }
-        Ok(LimitedJson::Object(entries))
+        Ok(JsonValue::Object(entries))
     }
 }
 
-struct StringSeed<'a>(&'a Context<'a>);
+struct StringSeed<'a>(&'a Context);
 
 impl<'de> DeserializeSeed<'de> for StringSeed<'_> {
-    type Value = LimitedString;
+    type Value = MetadataString;
 
     fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
         deserializer.deserialize_str(self)
@@ -185,48 +195,45 @@ impl<'de> DeserializeSeed<'de> for StringSeed<'_> {
 }
 
 impl Visitor<'_> for StringSeed<'_> {
-    type Value = LimitedString;
+    type Value = MetadataString;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("an object key")
     }
 
     fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
-        self.0
-            .propagate(LimitedString::try_copy(self.0.budget, value))
+        self.0.propagate(MetadataString::try_copy(value))
     }
 }
 
-impl<'de> Deserialize<'de> for LimitedJson {
+impl<'de> Deserialize<'de> for JsonValue {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let budget = MemoryBudget::current().unwrap_or_else(|| MemoryBudget::new(usize::MAX));
         let context = Context {
-            budget: &budget,
             failure: Cell::new(None),
         };
         Seed { context: &context }.deserialize(deserializer)
     }
 }
 
-impl<'de> IntoDeserializer<'de, de::value::Error> for &'de LimitedJson {
+impl<'de> IntoDeserializer<'de, de::value::Error> for &'de JsonValue {
     type Deserializer = Self;
     fn into_deserializer(self) -> Self {
         self
     }
 }
 
-impl<'de> Deserializer<'de> for &'de LimitedJson {
+impl<'de> Deserializer<'de> for &'de JsonValue {
     type Error = de::value::Error;
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self {
-            LimitedJson::Null => visitor.visit_unit(),
-            LimitedJson::Bool(value) => visitor.visit_bool(*value),
-            LimitedJson::Number(value) => value.deserialize_any(visitor).map_err(de::Error::custom),
-            LimitedJson::String(value) => visitor.visit_borrowed_str(value.as_str()),
-            LimitedJson::Array(values) => {
+            JsonValue::Null => visitor.visit_unit(),
+            JsonValue::Bool(value) => visitor.visit_bool(*value),
+            JsonValue::Number(value) => value.deserialize_any(visitor).map_err(de::Error::custom),
+            JsonValue::String(value) => visitor.visit_borrowed_str(value.as_str()),
+            JsonValue::Array(values) => {
                 visitor.visit_seq(de::value::SeqDeserializer::new(values.iter()))
             }
-            LimitedJson::Object(entries) => {
+            JsonValue::Object(entries) => {
                 visitor.visit_map(de::value::MapDeserializer::new(entries.iter().map(
                     |(key, value)| (de::value::BorrowedStrDeserializer::new(key.as_str()), value),
                 )))
@@ -235,7 +242,7 @@ impl<'de> Deserializer<'de> for &'de LimitedJson {
     }
     fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self {
-            LimitedJson::Null => visitor.visit_none(),
+            JsonValue::Null => visitor.visit_none(),
             _ => visitor.visit_some(self),
         }
     }

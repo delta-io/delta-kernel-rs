@@ -305,7 +305,7 @@ async fn column_mapping_should_succeed() {
                 ColumnMetadataKey::ColumnMappingPhysicalName
                     .as_ref()
                     .to_string(),
-                MetadataValue::String(name.to_string()),
+                MetadataValue::String(name.to_string().into()),
             ),
         ]))
     }

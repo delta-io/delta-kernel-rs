@@ -1400,7 +1400,7 @@ async fn test_checkpoint_with_varchar_metadata_on_field() -> Result<()> {
         nullable "id": LONG,
         (StructField::nullable("name", KernelDataType::STRING).with_metadata([(
                 "__CHAR_VARCHAR_TYPE_STRING",
-                crate::schema::MetadataValue::String("varchar(255)".to_string()),
+                crate::schema::MetadataValue::String("varchar(255)".to_string().into()),
             )])),
     };
     write_commit_to_store(

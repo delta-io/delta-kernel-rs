@@ -1122,7 +1122,7 @@ mod tests {
         // A field-id annotation of the wrong metadata type is treated as missing => error.
         let field = StructField::not_null("c", DataType::INTEGER).with_metadata([(
             ColumnMetadataKey::ParquetFieldId.as_ref(),
-            MetadataValue::String("1".to_string()),
+            MetadataValue::String("1".to_string().into()),
         )]);
         assert!(stats_schema(&StructType::new_unchecked([field])).is_err());
     }

@@ -65,16 +65,6 @@ pub struct TransactionBuilder<T: TransactionType = UpdateTable, MODE: ExecutionM
 }
 
 impl<T: TransactionType, MODE: ExecutionMode> TransactionBuilder<T, MODE> {
-    /// Select the allocator for new participating transaction storage.
-    ///
-    /// Update transactions inherit the snapshot's allocator by default. Shared snapshot storage
-    /// retains its original allocation owner. Engine buffers remain outside this partial cap.
-    #[cfg(feature = "limited-memory")]
-    pub fn with_allocator(mut self, allocator: crate::memory::LimitedAllocator) -> Self {
-        self.common_state.allocator = Some(allocator);
-        self
-    }
-
     /// Selects `NewMode` for the transaction, preserving all accumulated configuration.
     ///
     /// Returns a builder whose `build` method constructs a transaction in the selected mode.

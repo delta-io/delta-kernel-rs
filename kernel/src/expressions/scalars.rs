@@ -854,7 +854,6 @@ impl From<Arc<String>> for Scalar {
     }
 }
 
-#[cfg(feature = "limited-memory")]
 impl From<crate::memory::SharedString> for Scalar {
     fn from(value: crate::memory::SharedString) -> Self {
         Self::String(value.into_global())

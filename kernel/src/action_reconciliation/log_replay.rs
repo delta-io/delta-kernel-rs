@@ -471,7 +471,7 @@ impl ActionReconciliationVisitor<'_> {
         };
 
         // Check for valid, non-duplicate adds and non-expired removes
-        let is_valid = if self.deduplicator.check_and_record_seen(file_key) {
+        let is_valid = if self.deduplicator.try_check_and_record_seen(file_key)? {
             false // duplicate!
         } else if is_add {
             self.add_actions_count += 1;

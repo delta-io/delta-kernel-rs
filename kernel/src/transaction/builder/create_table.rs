@@ -1074,8 +1074,6 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
         engine: &dyn Engine,
         committer: Box<dyn Committer>,
     ) -> Result<CreateTableTransaction<MODE>> {
-        #[cfg(feature = "limited-memory")]
-        let _scope = crate::memory::AllocationScope::new(self.common_state.allocator.as_ref());
         self.common_state.validate()?;
 
         // Validate path
@@ -3001,7 +2999,7 @@ mod tests {
             "field '{}' physicalName '{physical_name}' must start with 'col-'",
             field.name(),
         );
-        physical_name.clone()
+        physical_name.to_string()
     }
 
     /// Extracts the `delta.columnMapping.nested.ids` JSON object from a field, panicking if

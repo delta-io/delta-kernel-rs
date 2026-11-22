@@ -1,81 +1,56 @@
 use std::ops::{Deref, DerefMut};
 
-use super::{LimitedAllocator, LimitedVec, MemoryBudget, MemoryResult};
+use super::{KERNEL_ALLOCATOR, KernelAllocator, MemoryResult, MetadataVec};
 
-/// Owned payload storage with a fallible allocator-aware construction path.
+/// An owned metadata payload using the shared Kernel allocator.
 ///
-/// Infallible `Clone` retains its ordinary allocation semantics outside the cap. Code that must
-/// enforce a budget must construct its replacement through `try_new` instead.
-pub struct Owned<T>(Storage<T>);
-
-#[derive(Debug)]
-enum Storage<T> {
-    Global(Box<T>),
-    Limited(Box<T, LimitedAllocator>),
-}
-
-impl<T: std::fmt::Debug> std::fmt::Debug for Owned<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        (**self).fmt(f)
-    }
-}
+/// Use [`Self::try_new`] at fallible boundaries. Infallible conversions and cloning have Rust's
+/// ordinary allocation-error behavior if the allocator rejects their allocation.
+pub struct Owned<T>(Box<T, KernelAllocator>);
 
 impl<T> Owned<T> {
-    /// Construct owned storage under the active budget, if configured.
+    /// Allocate a payload, returning an error if its allocation cannot be reserved.
     pub fn try_new(value: T) -> MemoryResult<Self> {
-        match MemoryBudget::current() {
-            Some(budget) => Self::try_new_in(value, budget.allocator()),
-            None => Ok(Self::unbudgeted(value)),
-        }
-    }
-
-    /// Construct owned storage using an explicit allocator without infallible allocation.
-    pub fn try_new_in(value: T, allocator: LimitedAllocator) -> MemoryResult<Self> {
-        let mut values = LimitedVec::new_in(allocator);
+        let mut values = MetadataVec::new();
         values.try_reserve_exact(1)?;
         values.try_push(value)?;
-        // The single-element vector has no spare capacity, so boxing cannot require a shrink.
-        let slice = values.into_vec().into_boxed_slice();
-        let (ptr, allocator) = Box::into_raw_with_allocator(slice);
-        // SAFETY: A one-element boxed slice has the same data layout as its element. Allocator
-        // ownership and the original allocation's size and alignment are preserved.
-        let boxed = unsafe { Box::from_raw_in(ptr.cast::<T>(), allocator) };
-        Ok(Self(Storage::Limited(boxed)))
+        // Exact capacity avoids a potentially allocating shrink during boxing.
+        let (ptr, allocator) = Box::into_raw_with_allocator(values.into_vec().into_boxed_slice());
+        // SAFETY: A single-element slice has its element's layout and preserves the allocator.
+        Ok(Self(unsafe {
+            Box::from_raw_in(ptr.cast::<T>(), allocator)
+        }))
     }
 
-    pub(crate) fn unbudgeted(value: T) -> Self {
-        Self(Storage::Global(Box::new(value)))
-    }
-
-    /// Move out the value, releasing its allocation and reservation.
+    /// Move out the value and release its tracked allocation.
     pub fn into_inner(self) -> T {
-        match self.0 {
-            Storage::Global(value) => *value,
-            Storage::Limited(value) => *value,
-        }
+        *self.0
     }
 }
-
-impl<T> Deref for Owned<T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        match &self.0 {
-            Storage::Global(value) => value,
-            Storage::Limited(value) => value,
-        }
+impl<T> From<T> for Owned<T> {
+    fn from(value: T) -> Self {
+        Self(Box::new_in(value, KERNEL_ALLOCATOR))
     }
 }
-impl<T> DerefMut for Owned<T> {
-    fn deref_mut(&mut self) -> &mut T {
-        match &mut self.0 {
-            Storage::Global(value) => value,
-            Storage::Limited(value) => value,
-        }
+impl<T> From<Box<T>> for Owned<T> {
+    fn from(value: Box<T>) -> Self {
+        Self::from(*value)
     }
 }
 impl<T: Clone> Clone for Owned<T> {
     fn clone(&self) -> Self {
-        Self::unbudgeted((**self).clone())
+        Self::from((**self).clone())
+    }
+}
+impl<T> Deref for Owned<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+impl<T> DerefMut for Owned<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
     }
 }
 impl<T: PartialEq> PartialEq for Owned<T> {
@@ -84,16 +59,6 @@ impl<T: PartialEq> PartialEq for Owned<T> {
     }
 }
 impl<T: Eq> Eq for Owned<T> {}
-impl<T> From<T> for Owned<T> {
-    fn from(value: T) -> Self {
-        Self::unbudgeted(value)
-    }
-}
-impl<T> From<Box<T>> for Owned<T> {
-    fn from(value: Box<T>) -> Self {
-        Self(Storage::Global(value))
-    }
-}
 impl<T> AsRef<T> for Owned<T> {
     fn as_ref(&self) -> &T {
         self
@@ -110,6 +75,12 @@ impl<T: serde::Serialize> serde::Serialize for Owned<T> {
     }
 }
 impl<T: std::fmt::Display> std::fmt::Display for Owned<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for Owned<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         (**self).fmt(f)
     }

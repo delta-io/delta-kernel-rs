@@ -34,5 +34,4 @@ pub mod operation {
 }
 
 mod convert;
-#[cfg(feature = "limited-memory")]
-pub(crate) mod limited_encode;
+pub(crate) mod encode;

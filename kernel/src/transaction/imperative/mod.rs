@@ -100,13 +100,6 @@ impl<STATE> Transaction<STATE, Imperative> {
         err
     )]
     pub fn commit(self, engine: &dyn Engine) -> Result<CommitResult<STATE>> {
-        #[cfg(feature = "limited-memory")]
-        let _scope = crate::memory::AllocationScope::new(
-            self.allocator
-                .clone()
-                .or_else(|| crate::memory::MemoryBudget::current().map(|budget| budget.allocator()))
-                .as_ref(),
-        );
         let commit_start = Instant::now();
 
         // === Pre-commit validation ===

@@ -2,18 +2,18 @@ use std::io::{self, Write};
 
 use bytes::Bytes;
 
-use super::{LimitedBytes, MemoryBudget, MemoryError};
+use super::{MemoryError, MetadataBytes};
 
 /// A writer that preserves allocation errors across serializers' I/O error wrappers.
 pub(crate) struct JsonOutput {
-    storage: LimitedBytes,
+    storage: MetadataBytes,
     failure: Option<MemoryError>,
 }
 
 impl JsonOutput {
-    pub(crate) fn new(budget: &MemoryBudget) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            storage: LimitedBytes::new(budget),
+            storage: MetadataBytes::new(),
             failure: None,
         }
     }

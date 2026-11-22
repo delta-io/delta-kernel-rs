@@ -637,10 +637,7 @@ pub(crate) fn visit_metadata_at<'a>(
             .unwrap_or_default(),
     };
     let schema_text: &str = getters[5].get(row_index, "metadata.schema_string")?;
-    #[cfg(feature = "limited-memory")]
     let schema_string = crate::memory::SharedString::try_copy(schema_text)?;
-    #[cfg(not(feature = "limited-memory"))]
-    let schema_string = Arc::<String>::new(schema_text.to_owned());
     let partition_columns: Vec<_> = getters[6].get(row_index, "metadata.partition_list")?;
     let created_time: Option<i64> = getters[7].get_opt(row_index, "metadata.created_time")?;
     let configuration: HashMap<_, _> = getters[8]

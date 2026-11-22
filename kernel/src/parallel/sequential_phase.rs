@@ -193,8 +193,6 @@ impl Iterator for SequentialPhase {
     type Item = KernelResult<ScanMetadata>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        #[cfg(feature = "limited-memory")]
-        let _scope = crate::memory::AllocationScope::new(self.processor.memory_allocator());
         let next = self
             .commit_phase
             .as_mut()

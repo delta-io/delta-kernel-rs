@@ -1,14 +1,13 @@
 //! Some utilities for working with arrow data types
 
+mod action_json;
 pub(crate) mod apply_schema;
 pub(crate) mod file_type_validation;
-#[cfg(feature = "limited-memory")]
-mod limited_json;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use delta_kernel_derive::internal_api;
 use derive_more::Constructor;
@@ -29,8 +28,7 @@ use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef as ArrowFieldRef,
     Fields as ArrowFields, Int64Type, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
-use crate::arrow::json::writer::{LineDelimited, NullableEncoder, make_encoder};
-use crate::arrow::json::{Encoder, EncoderFactory, EncoderOptions, ReaderBuilder, WriterBuilder};
+use crate::arrow::json::ReaderBuilder;
 use crate::engine::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::ensure_data_types::DataTypeCompat;
@@ -1591,76 +1589,13 @@ pub(crate) fn filter_to_record_batch(
     Ok((*arrow_data).into())
 }
 
-// we want to keep nulls in our partition map, so we end up with data in the log like:
-// {partitionValues:{"foo": null}}, which is what is generally expected. Without this we would
-// get: {partitionValues:{}}
-/// This is a special encoder factory that will use the default encoder for all array types except
-/// MapArrays. For MapArrays, it uses Arrow's map encoder with options preserving
-/// keys that have null values.
-#[derive(Debug)]
-struct NullValueMapEncoderFactory;
-
-impl EncoderFactory for NullValueMapEncoderFactory {
-    fn make_default_encoder<'a>(
-        &self,
-        field: &'a ArrowFieldRef,
-        array: &'a dyn ArrowArray,
-        _options: &'a EncoderOptions,
-    ) -> KernelResult<Option<NullableEncoder<'a>>, crate::arrow::error::ArrowError> {
-        // `make_encoder` needs a new `EncoderOptions` in order to set `with_explicit_nulls`. The
-        // lifetime of the created encoder becomes tied to the lifetime of the `EncoderOptions`,
-        // and local options would be freed here. We also can't put the options inside the
-        // NullValueMapEncoderFactory, because this method takes `&self` not `&'a self`, and we
-        // can't change that as it's part of the trait definition. Static options satisfy the
-        // required lifetime. Building here returns Arrow errors because `Encoder::encode` cannot
-        // return a `Result`; a per-row wrapper would have to unwrap them.
-        match array.data_type() {
-            ArrowDataType::Map(_, _) => {
-                static MAP_OPTIONS: LazyLock<EncoderOptions> =
-                    LazyLock::new(|| EncoderOptions::default().with_explicit_nulls(true));
-                // A map with non-string keys is valid Arrow but unsupported by Arrow's JSON map
-                // encoder. If every map is null (for example, `[null, null]`), the JSON writer
-                // omits the field and never encodes a key, so preserve that generic behavior.
-                if array.null_count() == array.len() {
-                    let encoder = Box::new(NullMapPlaceholderEncoder);
-                    return Ok(Some(NullableEncoder::new(encoder, array.nulls().cloned())));
-                }
-                // The writer retains this encoder for the batch, avoiding reconstruction of its
-                // key and value encoders for every row.
-                make_encoder(field, array, &MAP_OPTIONS).map(Some)
-            }
-            _ => Ok(None),
-        }
-    }
-}
-
-// Every row is null, so the JSON writer uses the null buffer without calling this placeholder.
-struct NullMapPlaceholderEncoder;
-
-impl Encoder for NullMapPlaceholderEncoder {
-    fn encode(&mut self, _idx: usize, out: &mut Vec<u8>) {
-        out.extend_from_slice(b"null");
-    }
-}
-
 /// serialize an arrow RecordBatch to a JSON string by appending to a buffer.
 // TODO (zach): this should stream data to the JSON writer and output an iterator.
 #[internal_api]
 pub(crate) fn to_json_bytes(
     data: impl KernelResultIterator<FilteredEngineData>,
 ) -> KernelResult<bytes::Bytes> {
-    #[cfg(feature = "limited-memory")]
-    if let Some(budget) = crate::memory::MemoryBudget::current() {
-        return limited_json::write(data, &budget);
-    }
-    let builder = WriterBuilder::new().with_encoder_factory(Arc::new(NullValueMapEncoderFactory));
-    let mut writer = builder.build::<_, LineDelimited>(Vec::new());
-    for chunk in data {
-        let batch = filter_to_record_batch(chunk?)?;
-        writer.write(&batch)?;
-    }
-    writer.finish()?;
-    Ok(writer.into_inner().into())
+    action_json::write(data)
 }
 
 /// Applies post-processing to data read from a JSON file. Inserts synthesized metadata columns
@@ -3154,7 +3089,7 @@ mod tests {
             (StructField::not_null("values", ArrayType::new(DataType::LONG, false)).with_metadata(
                 [(
                     ColumnMetadataKey::ColumnMappingNestedIds.as_ref(),
-                    MetadataValue::String("not a json object".to_string()),
+                    MetadataValue::String("not a json object".to_string().into()),
                 )],
             )),
         }

@@ -10,7 +10,7 @@ use delta_kernel::{KernelError, KernelResult};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 use crate::error::{EngineExecResult, ErrorAllocators, ExternResult, IntoExternResult};
-use crate::handle::{BoxExt, Handle};
+use crate::handle::Handle;
 use crate::{FfiSlice, KernelBytesSlice, NullableCvoid};
 
 /// Writes some or all of `bytes` to the caller's output.
@@ -167,7 +167,7 @@ pub unsafe extern "C" fn new_dv_writer(
                 "DV writer requires write and flush callbacks",
             ));
         }
-        let mut output = BoxExt::into_non_null(Box::new(OwnedDvOutput(FfiDvWriterOutput {
+        let mut output = Box::into_non_null(Box::new(OwnedDvOutput(FfiDvWriterOutput {
             context: output.context,
             write: output.write,
             flush: output.flush,
