@@ -280,6 +280,10 @@ pub(super) fn ensure_row_tracking_marks(summaries: &[WinnerSummary]) -> KernelRe
     Ok(())
 }
 
+pub(super) fn is_row_tracking_backfill_or_unbackfill(operation: &str) -> bool {
+    ROW_TRACKING_BACKFILL_OPERATIONS.contains(&operation)
+}
+
 /// One row for each action. Columns that don't apply to the action are NULL.
 fn action_row_expr(facts: &LoserFacts) -> Expression {
     let conflicting_domains = facts

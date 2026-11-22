@@ -1,8 +1,11 @@
-//! Shared action builders and fixtures. T is the losing transaction.
+//! Shared action builders and fixtures. T is the losing transaction. By default, T is a DELETE of
+//! the partition `DELETED_DATE`.
 
+mod occ_plan;
 mod winner_check_plan;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use ::test_utils::add_commit;
 use futures::executor::block_on;
@@ -11,19 +14,21 @@ use tempfile::TempDir;
 use url::Url;
 
 use super::*;
-use crate::actions::{CommitInfo, DomainMetadata, Protocol, Remove, SetTransaction};
+use crate::actions::{Add, CommitInfo, DomainMetadata, Protocol, Remove, SetTransaction};
 use crate::commit_range::CommitRange;
 use crate::engine::sync::SyncEngine;
 use crate::engine::sync::plan::SyncPlanExecutor;
-use crate::expressions::Scalar;
+use crate::expressions::{Expression, Scalar, lit};
 use crate::object_store::local::LocalFileSystem;
 use crate::plans::{Operation, PlanExecutor as _};
 use crate::row_tracking::RowTrackingDomainMetadata;
-use crate::schema::schema;
+use crate::schema::{PrimitiveType, schema, schema_ref};
 use crate::transaction::occ::winner_check_plan::{read_winner_summaries, winner_check_plan};
 use crate::unit_test_utils::{Action, metadata_action};
 
 const READ_VERSION: Version = 6;
+const DELETED_DATE: &str = "2026-10-01";
+const OTHER_DATE: &str = "2026-10-02";
 
 // === Actions ===
 
@@ -43,6 +48,21 @@ fn base_commit_info(operation: &str) -> CommitInfo {
 
 fn commit_info(operation: &str) -> Value {
     line(Action::CommitInfo(base_commit_info(operation)))
+}
+
+fn base_add(path: &str, partition_values: &[(&str, &str)]) -> Add {
+    let partition_values = partition_values.iter().map(|&(k, v)| (k.into(), v.into()));
+    Add {
+        path: path.into(),
+        partition_values: HashMap::from_iter(partition_values),
+        size: 1,
+        data_change: true,
+        ..Default::default()
+    }
+}
+
+fn add(path: &str, date: &str) -> Value {
+    line(Action::Add(base_add(path, &[("date", date)])))
 }
 
 fn remove(path: &str, data_change: bool) -> Value {
@@ -145,13 +165,50 @@ fn fake_summary(version: Version, operation: &str, is_blind_append: bool) -> Win
     }
 }
 
-fn deleted_date_facts() -> LoserFacts {
+/// Makes `facts` an OPTIMIZE, which drops to SnapshotIsolation under WriteSerializable.
+fn make_optimize(facts: &mut LoserFacts) {
+    facts.has_data_change = false;
+    facts.operation_changes_data = false;
+}
+
+/// A DELETE under WriteSerializable that rewrites files.
+fn partitioned_delete_facts(
+    read_version: Version,
+    partition_schema: SchemaRef,
+    partition_predicate: Option<PredicateRef>,
+) -> LoserFacts {
     LoserFacts {
+        checked_version: read_version,
+        isolation_level: IsolationLevel::WriteSerializable,
+        has_data_change: true,
+        operation_changes_data: true,
         changes_metadata: false,
+        has_other_actions: false,
         rewrites_files: true,
         written_domains: vec![],
         read_app_ids: vec![],
+        read_scope: ReadScope::Files {
+            partition_schema,
+            partition_predicate,
+            map_to_struct_options: MapToStructOptions::default(),
+        },
     }
+}
+
+fn deleted_date_facts() -> LoserFacts {
+    partitioned_delete_facts(
+        READ_VERSION,
+        schema_ref! { nullable "date": DATE },
+        Some(equals("date", date(DELETED_DATE))),
+    )
+}
+
+fn equals(column: &str, value: impl Into<Scalar>) -> PredicateRef {
+    Arc::new(Expression::column([column]).eq(lit(value)))
+}
+
+fn date(value: &str) -> Scalar {
+    PrimitiveType::Date.parse_scalar(value).unwrap()
 }
 
 fn winner_summaries(facts: &LoserFacts, winners: &[WinningCommit]) -> Vec<WinnerSummary> {
