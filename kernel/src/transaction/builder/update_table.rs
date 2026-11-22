@@ -50,7 +50,7 @@ use crate::{Engine, Error, KernelError, KernelResult, Result};
 ///
 /// Set `data_change` when constructing the builder: `true` for logical data changes, or `false`
 /// for metadata-only changes and data-preserving rewrites. `ALTER TABLE` requires `false` and at
-/// least one schema or property change, while blind append requires `true`.
+/// least one schema, property, or description change, while blind append requires `true`.
 /// [`build`](UpdateTableTransactionBuilder::build) rejects incompatible intent; commit validates
 /// the staged file actions and rejects any staged data-file batches or manifest writes for
 /// `ALTER TABLE`.
@@ -68,6 +68,9 @@ pub struct UpdateTableBuilderState {
     /// [`with_table_properties_added`](UpdateTableTransactionBuilder::with_table_properties_added)
     /// call; later calls override earlier values for the same canonical key at build.
     properties_added: Vec<Vec<(String, String)>>,
+    /// Set by the last call to `with_description` or `with_description_removed`. `Some(None)`
+    /// removes the description.
+    description: Option<Option<String>>,
     domain_metadata_removals: Vec<String>,
     is_blind_append: bool,
 }
@@ -78,7 +81,7 @@ impl UpdateTableBuilderState {
     }
 
     fn has_metadata_changes(&self) -> bool {
-        self.schema_changes.is_some() || self.has_property_changes()
+        self.schema_changes.is_some() || self.has_property_changes() || self.description.is_some()
     }
 }
 
@@ -118,6 +121,7 @@ impl TransactionBuilder<UpdateTable> {
                 operation,
                 schema_changes: None,
                 properties_added: Vec::new(),
+                description: None,
                 domain_metadata_removals: Vec::new(),
                 is_blind_append: false,
             },
@@ -131,8 +135,8 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     ///
     /// Blind appends add new files without depending on existing table state. Commit validation
     /// requires staged Add metadata and rejects staged Remove metadata or deletion-vector batches.
-    /// Blind append is also invalid for `ALTER TABLE`, schema changes, property changes, or
-    /// `dataChange = false`.
+    /// Blind append is also invalid for `ALTER TABLE`, schema changes, property changes,
+    /// description changes, or `dataChange = false`.
     pub fn with_blind_append(mut self) -> Self {
         self.local_state.is_blind_append = true;
         self
@@ -252,6 +256,27 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         self
     }
 
+    /// Sets a new description for the table.
+    ///
+    /// For `ALTER TABLE`, a requested description always emits Metadata, including when the table
+    /// already has it. Data operations emit Metadata for it only when it differs from the current
+    /// description. A later call to this method or to
+    /// [`with_description_removed`](Self::with_description_removed) replaces it.
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.local_state.description = Some(Some(description.into()));
+        self
+    }
+
+    /// Removes the table description.
+    ///
+    /// For `ALTER TABLE`, the removal always emits Metadata, including when the table has no
+    /// description. Data operations emit Metadata for it only when the table has a description. A
+    /// later call to this method or to [`with_description`](Self::with_description) replaces it.
+    pub fn with_description_removed(mut self) -> Self {
+        self.local_state.description = Some(None);
+        self
+    }
+
     /// Validates the accumulated intent and builds a transaction.
     ///
     /// The caller-supplied `data_change` is preserved, including when no files are staged.
@@ -326,6 +351,11 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
                 "blind append cannot include property changes",
             ));
         }
+        if self.local_state.is_blind_append && self.local_state.description.is_some() {
+            return Err(KernelError::invalid_transaction_state(
+                "blind append cannot include description changes",
+            ));
+        }
 
         let removals = validate_unique_domains(
             self.local_state
@@ -371,6 +401,7 @@ fn try_new_update_table<MODE: ExecutionMode>(
         operation,
         schema_changes,
         properties_added,
+        description,
         domain_metadata_removals,
         is_blind_append,
     } = local_state;
@@ -437,11 +468,21 @@ fn try_new_update_table<MODE: ExecutionMode>(
         }
     };
     let has_property_changes = !properties_added.is_empty();
-    let should_emit_metadata = has_schema_changes || has_property_changes;
+    // Like property adds, ALTER TABLE always keeps the requested description, and data operations
+    // drop it when it equals the current one.
+    let description = description.filter(|description| {
+        operation == UpdateTableOperation::AlterTable
+            || effective_table_config.metadata().description() != description.as_deref()
+    });
+    let should_emit_metadata = has_schema_changes || has_property_changes || description.is_some();
     let effective_table_config = if has_property_changes {
         apply_table_properties_added(effective_table_config, properties_added)?
     } else {
         effective_table_config
+    };
+    let effective_table_config = match description {
+        Some(description) => apply_description(effective_table_config, description)?,
+        None => effective_table_config,
     };
 
     Ok(Transaction {
@@ -515,6 +556,17 @@ fn apply_table_properties_added(
         .fold(table_config.metadata().clone(), |metadata, (key, value)| {
             metadata.with_configuration_entry(key, value)
         });
+    TableConfiguration::try_new_with_schema(&table_config, metadata, table_config.logical_schema())
+}
+
+fn apply_description(
+    table_config: TableConfiguration,
+    description: Option<String>,
+) -> Result<TableConfiguration> {
+    let metadata = table_config
+        .metadata()
+        .clone()
+        .with_description(description);
     TableConfiguration::try_new_with_schema(&table_config, metadata, table_config.logical_schema())
 }
 
@@ -1006,6 +1058,30 @@ mod tests {
             &error,
             Error::Kernel(KernelError::InvalidTransactionState(message))
             if message == "blind append cannot include property changes"
+        ));
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::set_description(Some("table description"))]
+    #[case::remove_description(None)]
+    fn blind_append_rejects_description_changes(#[case] description: Option<&str>) -> Result<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let builder = snapshot
+            .update_table(UpdateTableOperation::Write, "test-engine", true)
+            .with_blind_append();
+        let builder = match description {
+            Some(description) => builder.with_description(description),
+            None => builder.with_description_removed(),
+        };
+        let error = builder
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            Error::Kernel(KernelError::InvalidTransactionState(message))
+            if message == "blind append cannot include description changes"
         ));
         Ok(())
     }
