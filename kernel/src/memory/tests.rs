@@ -3,7 +3,10 @@ use std::process::Command;
 use std::sync::{Arc, Barrier};
 
 use super::*;
+use crate::expressions::{Expression, Predicate, lit};
+use crate::scan::PhysicalPredicate;
 use crate::schema::{DataType, StructType};
+use crate::table_features::ColumnMappingMode;
 
 // Each cap-changing test runs alone even under cargo test's shared-process harness.
 fn isolated(run: impl FnOnce()) {
@@ -182,5 +185,57 @@ fn file_and_variant_schema_decoding_is_fallible_at_each_small_limit() {
             }
         }
         KERNEL_ALLOCATOR.set_limit(None).unwrap();
+    });
+}
+
+#[test]
+fn predicate_schema_selection_and_physical_rewrite_return_errors_without_headroom() {
+    isolated(|| {
+        let baseline = KERNEL_ALLOCATOR.usage().reserved;
+        let schema: StructType = decode_json(br#"{"type":"struct","fields":[{"name":"nested","type":{"type":"struct","fields":[{"name":"leaf","type":"long","nullable":true,"metadata":{}}]},"nullable":true,"metadata":{}}]}"#).unwrap();
+        let predicate = Predicate::eq(Expression::column(["nested", "leaf"]), lit(7i64));
+        let retained = KERNEL_ALLOCATOR.usage().reserved;
+        KERNEL_ALLOCATOR.set_limit(Some(retained)).unwrap();
+        for result in [
+            PhysicalPredicate::try_new(&predicate, &schema, ColumnMappingMode::None).map(|_| ()),
+            schema.make_physical(ColumnMappingMode::None).map(|_| ()),
+            schema.with_fields_filtered(|_| true).map(|_| ()),
+        ] {
+            let error = result.unwrap_err();
+            assert!(matches!(
+                error.without_backtrace(),
+                crate::KernelError::Memory(_)
+            ));
+            assert_eq!(KERNEL_ALLOCATOR.usage().reserved, retained);
+        }
+        KERNEL_ALLOCATOR.set_limit(None).unwrap();
+        assert!(PhysicalPredicate::try_new(&predicate, &schema, ColumnMappingMode::None).is_ok());
+        assert!(schema.make_physical(ColumnMappingMode::None).is_ok());
+        drop(schema);
+        assert_eq!(KERNEL_ALLOCATOR.usage().reserved, baseline);
+    });
+}
+
+#[cfg(feature = "declarative-plans")]
+#[test]
+fn first_replay_key_construction_is_fallible_without_warmup() {
+    isolated(|| {
+        let baseline = KERNEL_ALLOCATOR.usage().reserved;
+        KERNEL_ALLOCATOR.set_limit(Some(baseline)).unwrap();
+        let error = crate::action_reconciliation::plan::action_set::ActionSet::live_adds()
+            .key(crate::action_reconciliation::plan::action_set::ActionSource::Commit)
+            .unwrap_err();
+        assert!(matches!(
+            error.without_backtrace(),
+            crate::KernelError::Memory(_)
+        ));
+        assert_eq!(KERNEL_ALLOCATOR.usage().reserved, baseline);
+        KERNEL_ALLOCATOR.set_limit(None).unwrap();
+        drop(
+            crate::action_reconciliation::plan::action_set::ActionSet::live_adds()
+                .key(crate::action_reconciliation::plan::action_set::ActionSource::Commit)
+                .unwrap(),
+        );
+        assert_eq!(KERNEL_ALLOCATOR.usage().reserved, baseline);
     });
 }

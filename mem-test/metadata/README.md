@@ -41,6 +41,9 @@ runs in a separate process.
 
 ## Run
 
+For the cross-product checks, phase failures, and recovery assertions, use
+[the local lifecycle matrix](LIFECYCLE_CHECKS.md).
+
 From the repository root:
 
 ```sh

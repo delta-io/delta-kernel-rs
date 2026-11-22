@@ -535,7 +535,8 @@ fn get_indices(
             // If the field is a variant, make sure the parquet schema matches the unshredded
             // variant representation. This is to ensure that shredded reads are not
             // performed.
-            if requested_type == &DataType::unshredded_variant() {
+            if matches!(requested_type, DataType::Variant(schema) if schema.as_ref() == &*crate::schema::VARIANT_FIELDS)
+            {
                 validate_parquet_variant(field)?;
             }
             match field.data_type() {
@@ -665,7 +666,7 @@ fn get_indices(
                                     "map fields had more than 2 members",
                                 ));
                             }
-                            let inner_schema = map_type.as_struct_schema(key_name, val_name);
+                            let inner_schema = map_type.as_struct_schema(key_name, val_name)?;
                             let mask_before = mask_indices.len();
                             let (parquet_advance, mut children) = get_indices(
                                 parquet_index + parquet_offset,

@@ -1,0 +1,33 @@
+{
+  "tables": [
+    {"name":"flat_json_tail", "fixture":{"shape":"flat","width":32,"initial_files":32,"tail_commits":32,"checkpoint":false,"stats_columns":-1,"stats_fields":32}},
+    {"name":"checkpoint_only", "fixture":{"shape":"flat","width":128,"initial_files":128,"tail_commits":0,"stats_columns":-1,"stats_fields":32}},
+    {"name":"nested_hybrid", "fixture":{"width":128,"initial_files":64,"tail_commits":32,"stats_columns":-1,"stats_fields":32}},
+    {"name":"deep_schema", "fixture":{"shape":"deep","width":8,"depth":16,"initial_files":16,"tail_commits":8,"stats_columns":-1,"stats_fields":8}},
+    {"name":"arrays_maps", "fixture":{"shape":"mixed","width":64,"initial_files":32,"tail_commits":16,"stats_columns":-1,"stats_fields":64,"parsed_stats":true}},
+    {"name":"wide_schema", "fixture":{"width":1024,"metadata_bytes":256,"initial_files":16,"tail_commits":16,"stats_columns":-1,"stats_fields":32}},
+    {"name":"long_tail", "fixture":{"width":32,"initial_files":64,"tail_commits":1000,"stats_columns":-1,"stats_fields":16}},
+    {"name":"many_actions", "fixture":{"width":32,"initial_files":1000,"tail_commits":8,"actions_per_commit":512,"removes_per_commit":256,"stats_columns":-1,"stats_fields":4}},
+    {"name":"dense_struct_stats", "fixture":{"width":256,"initial_files":64,"tail_commits":16,"stats_columns":-1,"stats_fields":256,"stats_string_bytes":32,"parsed_stats":true,"checkpoint_json_stats":false}},
+    {"name":"large_action_stats", "fixture":{"width":16,"initial_files":32,"tail_commits":8,"stats_columns":-1,"stats_fields":8,"stats_bytes":131072}},
+    {"name":"large_schema_metadata", "fixture":{"width":32,"metadata_bytes":32768,"initial_files":16,"tail_commits":8,"stats_columns":-1,"stats_fields":8}},
+    {"name":"partitioned", "fixture":{"width":64,"initial_files":32,"tail_commits":16,"stats_columns":-1,"stats_fields":32,"parsed_stats":true,"partitioned":true}}
+  ],
+  "queries": [
+    {"name":"all_columns", "query":{}},
+    {"name":"narrow_projection", "query":{"projection":1,"stats":"selected","stats_projection":1}},
+    {"name":"no_stats", "query":{"stats":"none"}},
+    {"name":"json_stats", "query":{"stats":"json"}},
+    {"name":"both_stats", "query":{"stats":"both"}},
+    {"name":"range", "query":{"filter":"range","projection":4}},
+    {"name":"wide_and", "query":{"filter":"and","terms":64}},
+    {"name":"wide_or", "query":{"filter":"or","terms":512}},
+    {"name":"large_in", "query":{"filter":"in","terms":1024}},
+    {"name":"null_checks", "query":{"filter":"nulls","terms":64}},
+    {"name":"nested_predicate", "query":{"filter":"nested","terms":32}},
+    {"name":"large_literal", "query":{"filter":"string","literal_bytes":65536}},
+    {"name":"static_empty", "query":{"filter":"constant_false"}},
+    {"name":"many_relations", "query":{"relations":32,"stats":"selected","stats_projection":4}},
+    {"name":"partition_filter", "requires_partitioned":true, "query":{"filter":"partition","parsed_partitions":true}}
+  ]
+}

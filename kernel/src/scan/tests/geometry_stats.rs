@@ -395,3 +395,4 @@ fn point_wkb(x: f64, y: f64) -> Vec<u8> {
 fn hex_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
+use crate::transforms::SchemaTransform;

@@ -46,39 +46,8 @@ establish total native-memory coverage.
 
 ## Measured results
 
-These local macOS runs use Rust 1.100 release builds, structured scan statistics, and a warmed
-baseline. They measure the declarative driver lifecycle described above. Numbers are MiB unless
-stated otherwise; independent high-water marks in the table need not occur together.
-
-| Exact tail limit | Outcome | Kernel reservation peak | Rust requested-heap peak | RSS peak |
-| --- | --- | ---: | ---: | ---: |
-| Disabled | Success | 221.29 | 250.85 | 504.83 |
-| 512 | Success | 221.29 | 250.85 | 501.59 |
-| 128 | Allocation error | 128.00 | 243.61 | 371.17 |
-| 64 | Allocation error | 64.00 | 243.61 | 323.45 |
-
-Every run returned to the 159,388-byte warmed Kernel baseline. The low-limit runs still have large
-Rust peaks because snapshot discovery in the reference engine uses allocations outside this
-allocator. The successful metadata-plan wire output is 12,140,985 bytes; encoded write state is
-34,422,173 bytes.
-
-For the parsed-stats case, use 1,000 top-level columns / 3,000 fields, 200,918 schema-JSON bytes,
-100 initial files, one checkpoint, 1,000 tail commits, 4,096-byte action-stat payloads, and all
-indexed columns. One worker succeeds with disabled, 256 MiB, and 64 MiB limits, with a 24.15 MiB
-Kernel peak and a 27.66 MiB Rust peak. Four unlimited workers peak at 84.16 MiB through the Kernel
-allocator and 96.49 MiB of Rust heap; all also succeed under 256 MiB. Under a shared 64 MiB limit,
-two workers succeeded and two returned allocation errors, with the Kernel peak bounded at 64 MiB.
-The completion split depends on scheduling. All runs returned to the same warmed baseline.
-
-A separate full-lifecycle DHAT run starts after canonical initialization and before snapshot
-loading. At its single simultaneous Rust heap peak, 231,885,521 of 262,784,536 requested bytes
-(88.24%) were allocated through `KernelAllocator`. Remaining live groups included schema
-structures (22,631,122 bytes), other allocations (4,505,718), log descriptors/URLs (3,520,739), and
-metadata strings (241,436). This is live Rust-heap attribution, not RSS or foreign-memory coverage.
-
-Run `python3 mem-test/metadata/run_exhaustion.py --help` for fresh-process failure sweeps. The
-validated sweep includes 43 limit cases, with 32 configured between lifecycle stages; each checks
-that failures propagate, query allocations are released, and no commit is published. The generated
-C ABI harness also retains plan bytes across other handle destruction, frees them on another
-pthread, and verifies repeated successful imperative diagnostic commits reach a stable retained
-baseline. Imperative commit checks do not extend declarative commit support.
+The [local lifecycle matrix](LIFECYCLE_CHECKS.md#validated-results) records simultaneous-peak heap
+attribution across table, query, and generated plan shapes, together with pressure, recovery,
+concurrency, and exact wide-tail checks. Its [compact receipts](LIFECYCLE_RESULTS.json) record the
+manifests, executable hash, and measurement boundaries. Coverage varies substantially by workload;
+a schema-heavy profile cannot establish coverage for an Arrow-heavy one.

@@ -766,7 +766,7 @@ impl StructField {
     ) -> KernelResult<Self> {
         MakePhysical::new(column_mapping_mode)
             .transform_struct_field(self)
-            .map(|f| f.into_owned())
+            .and_then(|_| physical::materialize_field(self, column_mapping_mode))
     }
 
     pub(crate) fn has_invariants(&self) -> bool {
@@ -1398,7 +1398,19 @@ impl StructType {
     pub(crate) fn leaves<'s>(&self, own_name: impl Into<Option<&'s str>>) -> ColumnNamesAndTypes {
         let mut get_leaves = GetSchemaLeaves::new(own_name.into());
         get_leaves.transform_struct(self);
-        (get_leaves.names, get_leaves.types).into()
+        (
+            get_leaves.names,
+            get_leaves.types.into_iter().cloned().collect::<Vec<_>>(),
+        )
+            .into()
+    }
+
+    /// Collect leaf paths without copying the types retained by those fields.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn leaf_names(&self) -> Vec<ColumnName> {
+        let mut leaves = GetSchemaLeaves::new(None);
+        leaves.transform_struct(self);
+        leaves.names
     }
 
     /// Applies physical name mappings to this field. If the `column_mapping_mode` is
@@ -1413,8 +1425,8 @@ impl StructType {
         &self,
         column_mapping_mode: ColumnMappingMode,
     ) -> KernelResult<Self> {
-        let mut transformer = MakePhysical::new(column_mapping_mode);
-        transformer.transform_struct(self).map(|s| s.into_owned())
+        MakePhysical::validate_read_column_mapping(column_mapping_mode, self)?;
+        self.make_validated_physical(column_mapping_mode)
     }
 
     /// Validates that there are no metadata columns in the given fields.
@@ -1471,7 +1483,11 @@ impl StructType {
         &self,
         predicate: impl Fn(&StructField) -> bool,
     ) -> KernelResult<Self> {
-        Self::try_new(self.fields().filter(|f| predicate(f)).cloned())
+        Self::try_from_results(
+            self.fields()
+                .filter(|f| predicate(f))
+                .map(StructField::try_clone),
+        )
     }
 
     /// Returns an optional [`StructType`] containing only the top-level fields for which
@@ -1979,11 +1995,15 @@ impl MapType {
 
     /// Create a schema assuming the map is stored as a struct with the specified key and value
     /// field names
-    pub fn as_struct_schema(&self, key_name: String, val_name: String) -> Schema {
-        schema! {
-            not_null (key_name): (self.key_type.clone()),
-            (StructField::new(val_name, self.value_type.clone(), self.value_contains_null)),
-        }
+    pub fn as_struct_schema(&self, key_name: String, val_name: String) -> KernelResult<Schema> {
+        StructType::try_new([
+            StructField::not_null(key_name, self.key_type.try_clone()?),
+            StructField::new(
+                val_name,
+                self.value_type.try_clone()?,
+                self.value_contains_null,
+            ),
+        ])
     }
 }
 
@@ -2924,7 +2944,7 @@ impl DataType {
 
     /// Create a new struct type with the given fields.
     pub fn try_struct_type(fields: impl IntoIterator<Item = StructField>) -> KernelResult<Self> {
-        Ok(StructType::try_new(fields)?.into())
+        Self::try_from_struct(StructType::try_new(fields)?)
     }
 
     /// Create a new struct type from a fallible iterator of fields.
@@ -3034,12 +3054,12 @@ impl Display for DataType {
     }
 }
 
-struct GetSchemaLeaves {
+struct GetSchemaLeaves<'a> {
     path: Vec<String>,
     names: Vec<ColumnName>,
-    types: Vec<DataType>,
+    types: Vec<&'a DataType>,
 }
-impl GetSchemaLeaves {
+impl GetSchemaLeaves<'_> {
     fn new(own_name: Option<&str>) -> Self {
         Self {
             path: own_name.into_iter().map(|s| s.to_string()).collect(),
@@ -3049,7 +3069,7 @@ impl GetSchemaLeaves {
     }
 }
 
-impl<'a> SchemaTransform<'a> for GetSchemaLeaves {
+impl<'a> SchemaTransform<'a> for GetSchemaLeaves<'a> {
     transform_output_type!(|'a, T| ());
 
     fn transform_struct_field(&mut self, field: &'a StructField) {
@@ -3058,21 +3078,15 @@ impl<'a> SchemaTransform<'a> for GetSchemaLeaves {
             self.recurse_into_struct_field(field);
         } else {
             self.names.push(ColumnName::new(&self.path));
-            self.types.push(field.data_type.clone());
+            self.types.push(&field.data_type);
         }
         self.path.pop();
     }
 }
 
-/// What a [`MakePhysical`] walk does with each field. The modes bundle the physical-rewrite
-/// behavior with the matching treatment of a stale `delta.columnMapping.*` annotation left over on
-/// a mapping-disabled table.
+/// Treatment of stale column-mapping annotations during validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MakePhysicalMode {
-    /// Rewrite each field to its physical name + metadata (the read/build path). A stale
-    /// annotation in `None` mode is tolerated: resolved by logical name and dropped from the
-    /// physical metadata.
-    Rewrite,
     /// Validate read-path annotations without constructing a physical schema.
     ValidateRead,
     /// Validate annotations only, without rewriting (the strict write-path check). A stale
@@ -3083,7 +3097,7 @@ enum MakePhysicalMode {
 impl MakePhysicalMode {
     fn stale_annotation_policy(self) -> StaleAnnotationPolicy {
         match self {
-            Self::Rewrite | Self::ValidateRead => StaleAnnotationPolicy::Ignore,
+            Self::ValidateRead => StaleAnnotationPolicy::Ignore,
             Self::ValidateStrict => StaleAnnotationPolicy::Reject,
         }
     }
@@ -3101,8 +3115,7 @@ pub(crate) struct MakePhysical<'a> {
     /// fields. Only structs introduce siblings; arrays/maps don't push frames since their
     /// elements / keys / values are anonymous.
     sibling_names_stack: Vec<HashMap<&'a str, &'a str>>,
-    /// Whether this walk rewrites fields to physical form or only validates (see
-    /// [`MakePhysicalMode`]).
+    /// Whether validation tolerates stale read-path annotations.
     mode: MakePhysicalMode,
 }
 impl<'a> MakePhysical<'a> {
@@ -3112,7 +3125,7 @@ impl<'a> MakePhysical<'a> {
             logical_path: vec![],
             seen_ids: HashMap::new(),
             sibling_names_stack: vec![],
-            mode: MakePhysicalMode::Rewrite,
+            mode: MakePhysicalMode::ValidateRead,
         }
     }
 
@@ -3157,14 +3170,10 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
 
     fn transform_struct(&mut self, stype: &'a StructType) -> KernelResult<Cow<'a, StructType>> {
         self.sibling_names_stack.push(HashMap::new());
-        let result = if self.mode == MakePhysicalMode::Rewrite {
-            self.recurse_into_struct(stype)
-        } else {
-            stype
-                .fields()
-                .try_for_each(|field| self.transform_struct_field(field).map(|_| ()))
-                .map(|()| Cow::Borrowed(stype))
-        };
+        let result = stype
+            .fields()
+            .try_for_each(|field| self.transform_struct_field(field).map(|_| ()))
+            .map(|()| Cow::Borrowed(stype));
         self.sibling_names_stack.pop();
         result
     }
@@ -3182,7 +3191,7 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
         &mut self,
         field: &'a StructField,
     ) -> KernelResult<Cow<'a, StructField>> {
-        let (physical_name, _id) = validate_and_extract_column_mapping_annotations(
+        validate_and_extract_column_mapping_annotations(
             field,
             self.column_mapping_mode,
             self.mode.stale_annotation_policy(),
@@ -3195,19 +3204,7 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
             return Ok(Cow::Borrowed(field));
         }
 
-        self.transform_inner(field.name(), |this| {
-            if this.mode != MakePhysicalMode::Rewrite {
-                return this.recurse_into_struct_field(field);
-            }
-            let data_type = this.transform(field.data_type())?.into_owned();
-            let metadata = field.logical_to_physical_metadata(this.column_mapping_mode);
-            Ok(Cow::Owned(StructField {
-                name: physical_name.to_owned(),
-                data_type,
-                nullable: field.nullable,
-                metadata,
-            }))
-        })
+        self.transform_inner(field.name(), |this| this.recurse_into_struct_field(field))
     }
 
     fn transform_variant(&mut self, stype: &'a StructType) -> KernelResult<Cow<'a, StructType>> {

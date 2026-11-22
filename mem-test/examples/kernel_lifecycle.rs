@@ -53,9 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .or_else(|| fixture.as_ref().map(|fixture| fixture.table_root.as_str()))
         .ok_or("missing table root")?;
     let limit = cap.checked_mul(1024 * 1024).ok_or("limit overflow")?;
-    if cap != 0 {
-        KERNEL_ALLOCATOR.set_limit(Some(limit))?;
-    }
+    KERNEL_ALLOCATOR.set_limit((cap != 0).then_some(limit))?;
     let stop_after = std::env::var("KERNEL_MEMORY_STOP_AFTER").unwrap_or_default();
     let mut stages = Vec::with_capacity(8);
     std::fs::create_dir_all("target")?;
@@ -147,6 +145,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "tail_commits": fixture.as_ref().map_or(tail as u64, |fixture| fixture.tail_commits),
         "in_process_fixture_path": fixture.as_ref().map(|fixture| fixture.directory.path()),
         "fixture": root, "limit_enabled": cap != 0,
+        "fixture_details": fixture.as_ref().map(support::Fixture::description),
         "stop_after": stop_after,
         "mode": std::env::var("KERNEL_MEMORY_MODE").unwrap_or_else(|_| "imperative".into()),
         "profile_from_stage": profile_from,

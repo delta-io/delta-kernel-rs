@@ -1729,7 +1729,7 @@ impl LogSegment {
     /// Creates a pruned LogSegment of only the commits and compactions in
     /// `(start_v_exclusive, end_version]`, dropping checkpoint files, CRC files, and
     /// last-checkpoint metadata.
-    pub(crate) fn segment_after_version(&self, start_v_exclusive: Version) -> Self {
+    pub(crate) fn segment_after_version(&self, start_v_exclusive: Version) -> KernelResult<Self> {
         // A checkpoint above start_v_exclusive would drop the commits between them, since the
         // returned segment keeps only (start_v_exclusive, end] and no checkpoint.
         debug_assert!(
@@ -1738,39 +1738,15 @@ impl LogSegment {
             "segment_after_version: start_v_exclusive ({start_v_exclusive}) is below checkpoint {:?}",
             self.checkpoint_version,
         );
-        let (commits, compactions) =
-            self.filtered_commits_and_compactions(Some(start_v_exclusive), self.end_version);
-        LogSegment {
-            end_version: self.end_version,
-            checkpoint_version: None,
-            log_root: self.log_root.clone(),
-            last_checkpoint_metadata: None,
-            listed: LogSegmentFiles {
-                ascending_commit_files: crate::log_segment_files::commit_files(commits),
-                ascending_compaction_files: compactions,
-                checkpoint_parts: vec![],
-                latest_crc_file: None,
-                latest_commit_file: None,
-                max_published_version: None,
-            },
-        }
-    }
-
-    /// Filters commits and compactions to those within `(lo_exclusive, hi_inclusive]`.
-    /// If `lo_exclusive` is `None`, there is no lower bound.
-    fn filtered_commits_and_compactions(
-        &self,
-        lo_exclusive: Option<Version>,
-        hi_inclusive: Version,
-    ) -> (Vec<ParsedLogPath>, Vec<ParsedLogPath>) {
-        let above_lo = |v: Version| lo_exclusive.is_none_or(|lo| lo < v);
-        let commits = self
+        let mut commits = crate::memory::MetadataVec::new();
+        for commit in self
             .listed
             .ascending_commit_files
             .iter()
-            .filter(|c| above_lo(c.version) && c.version <= hi_inclusive)
-            .cloned()
-            .collect();
+            .filter(|c| start_v_exclusive < c.version && c.version <= self.end_version)
+        {
+            commits.try_push(commit.clone())?;
+        }
         let compactions = self
             .listed
             .ascending_compaction_files
@@ -1779,12 +1755,25 @@ impl LogSegment {
                 matches!(
                     c.file_type,
                     LogPathFileType::CompactedCommit { hi }
-                        if above_lo(c.version) && hi <= hi_inclusive
+                        if start_v_exclusive < c.version && hi <= self.end_version
                 )
             })
             .cloned()
             .collect();
-        (commits, compactions)
+        Ok(LogSegment {
+            end_version: self.end_version,
+            checkpoint_version: None,
+            log_root: self.log_root.clone(),
+            last_checkpoint_metadata: None,
+            listed: LogSegmentFiles {
+                ascending_commit_files: commits,
+                ascending_compaction_files: compactions,
+                checkpoint_parts: vec![],
+                latest_crc_file: None,
+                latest_commit_file: None,
+                max_published_version: None,
+            },
+        })
     }
 
     /// How many commits since a checkpoint, according to this log segment.

@@ -26,11 +26,19 @@ def main():
     parser.add_argument("--stats-columns", type=int, default=0)
     parser.add_argument("--parsed-stats", action="store_true")
     parser.add_argument("--profile-from-stage", default="")
-    parser.add_argument("--phases", nargs="+", default=["snapshot", "scan_consumed", "complete"])
+    parser.add_argument("--fixture-options", help="JSON object accepted by rss_lifecycle prepare-json")
+    parser.add_argument("--query", help="JSON object accepted by KERNEL_MEMORY_QUERY")
+    parser.add_argument("--phases", nargs="+")
     args = parser.parse_args()
+    if args.phases is None:
+        args.phases = ["complete"] if args.mode == "declarative" else ["snapshot", "scan_consumed", "complete"]
+    if args.mode == "declarative" and args.phases != ["complete"]:
+        parser.error("declarative profiling supports the complete lifecycle; use --profile-from-stage to narrow it")
     args.output.mkdir(parents=True, exist_ok=True)
-    fixture = invoke(args.prepare_binary, "prepare", args.width, args.tail, args.initial,
-                     args.stats_bytes, args.stats_columns, int(args.parsed_stats))
+    fixture = (invoke(args.prepare_binary, "prepare-json", args.fixture_options)
+               if args.fixture_options else
+               invoke(args.prepare_binary, "prepare", args.width, args.tail, args.initial,
+                      args.stats_bytes, args.stats_columns, int(args.parsed_stats)))
     source = Path(fixture["path"])
     try:
         for phase in args.phases:
@@ -42,8 +50,11 @@ def main():
                            KERNEL_MEMORY_PROFILE=str(profile), KERNEL_MEMORY_GLOBAL="1",
                            KERNEL_MEMORY_STOP_AFTER=phase, KERNEL_MEMORY_MODE=args.mode,
                            KERNEL_MEMORY_PROFILE_FROM_STAGE=args.profile_from_stage)
-                result = subprocess.run([str(args.heap_binary), str(args.width), str(args.tail),
-                                         str(args.initial), str(args.cap)],
+                if args.query:
+                    env["KERNEL_MEMORY_QUERY"] = args.query
+                result = subprocess.run([str(args.heap_binary), str(fixture["width"]),
+                                         str(fixture["tail_commits"]),
+                                         str(fixture["initial_files"]), str(args.cap)],
                                         env=env, capture_output=True, text=True)
                 receipt = json.loads(result.stdout)
                 receipt["fixture_details"] = fixture

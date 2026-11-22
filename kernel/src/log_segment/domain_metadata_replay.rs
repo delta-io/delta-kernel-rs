@@ -36,7 +36,7 @@ impl LogSegment {
         engine: &dyn Engine,
     ) -> KernelResult<DomainMetadataMap> {
         let tail = self
-            .segment_after_version(base_version)
+            .segment_after_version(base_version)?
             .scan_tail_including_tombstones(domains, engine)?;
         let reconciled = match domains {
             // Filtered: the newest tail action per requested domain wins; a tombstone settles the

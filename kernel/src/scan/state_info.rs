@@ -605,17 +605,19 @@ impl StateInfo {
         );
         let table_partition_schema =
             if (has_predicate || partition_values.parsed_struct) && !partition_columns.is_empty() {
-                let partition_fields: Vec<StructField> = table_configuration
+                let partition_fields = table_configuration
                     .logical_schema()
                     .fields()
                     .zip(table_configuration.physical_schema().fields())
                     .filter(|(logical_f, _)| partition_columns.contains(logical_f.name()))
-                    .map(|(_, physical_f)| physical_f.clone())
-                    .collect();
+                    .map(|(_, physical_f)| physical_f.try_clone())
+                    .collect::<KernelResult<Vec<_>>>()?;
                 if partition_fields.is_empty() {
                     None
                 } else {
-                    Some(Arc::new(StructType::new_unchecked(partition_fields)))
+                    Some(Arc::new(StructType::try_from_unchecked_results(
+                        partition_fields.into_iter().map(Ok),
+                    )?))
                 }
             } else {
                 None
@@ -643,12 +645,14 @@ impl StateInfo {
         // an empty string cast to a non-string/binary type), and a non-nullable field would then
         // error.
         let physical_partition_schema = if partition_values.parsed_struct {
-            table_partition_schema.map(|tps| {
-                let nullable_fields = tps
-                    .fields()
-                    .map(|f| StructField::nullable(f.name(), f.data_type().clone()));
-                Arc::new(StructType::new_unchecked(nullable_fields))
-            })
+            table_partition_schema
+                .map(|tps| {
+                    let nullable_fields = tps
+                        .fields()
+                        .map(|f| Ok(StructField::nullable(f.name(), f.data_type().try_clone()?)));
+                    StructType::try_from_unchecked_results(nullable_fields).map(Arc::new)
+                })
+                .transpose()?
         } else {
             predicate_partition_schema
         };

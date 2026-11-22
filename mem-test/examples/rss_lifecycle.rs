@@ -7,6 +7,7 @@ mod rss_memory;
 mod support;
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
@@ -101,11 +102,20 @@ impl Observation {
 #[derive(Serialize)]
 struct Stage {
     worker: usize,
+    iteration: usize,
     name: &'static str,
     // Global window resets are meaningful only with one workload thread.
     rust_requested_peak_since_previous_stage: Option<usize>,
     #[serde(flatten)]
     observation: Observation,
+}
+
+#[derive(Serialize)]
+struct Failure {
+    worker: usize,
+    iteration: usize,
+    after_stage: &'static str,
+    memory_error: bool,
 }
 
 #[derive(Serialize)]
@@ -126,6 +136,16 @@ struct Samples {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("prepare-json") {
+        let options: support::FixtureOptions =
+            serde_json::from_str(args.get(1).ok_or("missing fixture JSON")?)?;
+        let fixture = support::Fixture::from_options(&options)?;
+        let mut report = fixture.description();
+        report["options"] = serde_json::to_value(options)?;
+        let _ = fixture.directory.keep();
+        println!("{report}");
+        return Ok(());
+    }
     if args.first().map(String::as_str) == Some("prepare") {
         let width: usize = args[1].parse()?;
         let tail: u64 = args[2].parse()?;
@@ -157,15 +177,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             support::Fixture::create_with_action_size(width, initial, tail, padded, stats_bytes)?
         };
-        let report = serde_json::json!({
-            "path": fixture.directory.path(), "table_root": fixture.table_root,
-            "width": fixture.width, "schema_fields": fixture.width * 3,
-            "schema_json_bytes": fixture.schema_bytes,
-            "initial_files": fixture.initial_files, "tail_commits": fixture.tail_commits,
-            "checkpoints": 1,
-            "action_stats_bytes": stats_bytes,
-            "indexed_stats_columns": stats_columns, "checkpoint_parsed_stats": parsed_stats,
-        });
+        let mut report = fixture.description();
+        report["action_stats_bytes"] = stats_bytes.into();
+        report["indexed_stats_columns"] = stats_columns.into();
+        report["checkpoint_parsed_stats"] = parsed_stats.into();
         let _ = fixture.directory.keep();
         println!("{report}");
         return Ok(());
@@ -176,8 +191,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let cap: usize = args.get(2).ok_or("missing cap")?.parse()?;
     let concurrency: usize = args.get(3).ok_or("missing concurrency")?.parse()?;
-    if concurrency == 0 {
-        return Err("concurrency must be positive".into());
+    let repetitions: usize = args
+        .get(4)
+        .map(|value| value.parse())
+        .transpose()?
+        .unwrap_or(1);
+    if concurrency == 0 || repetitions == 0 {
+        return Err("concurrency and repetitions must be positive".into());
     }
     KERNEL_ALLOCATOR.set_limit(None)?;
     let start = Instant::now();
@@ -191,7 +211,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     KERNEL_ALLOCATOR.set_limit((cap != 0).then_some(cap))?;
     let gate = Arc::new(Barrier::new(concurrency + 2));
     let stop = Arc::new(AtomicBool::new(false));
-    let stages = Arc::new(Mutex::new(Vec::with_capacity(concurrency * 16)));
+    let stages = Arc::new(Mutex::new(Vec::with_capacity(
+        concurrency * repetitions * 16,
+    )));
     let sample_thread = {
         let gate = gate.clone();
         let stop = stop.clone();
@@ -228,53 +250,73 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let stages = stages.clone();
         workers.push(std::thread::spawn(move || {
             gate.wait();
-            let record = |name| {
-                if std::env::var("KERNEL_MEMORY_LIMIT_AFTER_STAGE").as_deref() == Ok(name) {
-                    assert_eq!(concurrency, 1, "stage limit injection requires one worker");
-                    let headroom = std::env::var("KERNEL_MEMORY_STAGE_HEADROOM")
-                        .unwrap_or_else(|_| "0".into())
-                        .parse::<usize>()
-                        .unwrap();
-                    KERNEL_ALLOCATOR
-                        .set_limit(Some(
-                            KERNEL_ALLOCATOR
-                                .usage()
-                                .reserved
-                                .checked_add(headroom)
-                                .unwrap(),
-                        ))
-                        .unwrap();
-                }
-                let observation = Observation::get(start);
-                let window = (concurrency == 1)
-                    .then(|| WINDOW_PEAK.swap(LIVE.load(Ordering::Relaxed), Ordering::Relaxed));
-                stages.lock().unwrap().push(Stage {
+            let mut outcomes = Vec::with_capacity(repetitions);
+            for iteration in 0..repetitions {
+                let last_stage = Cell::new("start");
+                let record = |name| {
+                    last_stage.set(name);
+                    if std::env::var("KERNEL_MEMORY_LIMIT_AFTER_STAGE").as_deref() == Ok(name) {
+                        assert_eq!(concurrency, 1, "stage limit injection requires one worker");
+                        let headroom = std::env::var("KERNEL_MEMORY_STAGE_HEADROOM")
+                            .unwrap_or_else(|_| "0".into())
+                            .parse::<usize>()
+                            .unwrap();
+                        KERNEL_ALLOCATOR
+                            .set_limit(Some(
+                                KERNEL_ALLOCATOR
+                                    .usage()
+                                    .reserved
+                                    .checked_add(headroom)
+                                    .unwrap(),
+                            ))
+                            .unwrap();
+                    }
+                    let observation = Observation::get(start);
+                    let window = (concurrency == 1)
+                        .then(|| WINDOW_PEAK.swap(LIVE.load(Ordering::Relaxed), Ordering::Relaxed));
+                    stages.lock().unwrap().push(Stage {
+                        worker,
+                        iteration,
+                        name,
+                        rust_requested_peak_since_previous_stage: window,
+                        observation,
+                    });
+                    if matches!(
+                        name,
+                        "declarative_metadata_plan_proto_live_no_execution"
+                            | "declarative_write_state_encoded_live"
+                            | "owners_dropped"
+                    ) {
+                        capture_vm_map(name).unwrap();
+                    }
+                };
+                let started = Instant::now();
+                let result = lifecycle(table.as_str(), &record);
+                let elapsed_us = started.elapsed().as_micros();
+                let failure = result.as_ref().err().map(|error| Failure {
                     worker,
-                    name,
-                    rust_requested_peak_since_previous_stage: window,
-                    observation,
+                    iteration,
+                    after_stage: last_stage.get(),
+                    memory_error: matches!(error, delta_kernel::Error::Kernel(error)
+                    if matches!(error.without_backtrace(), delta_kernel::KernelError::Memory(_))),
                 });
-                if matches!(
-                    name,
-                    "declarative_metadata_plan_proto_live_no_execution"
-                        | "declarative_write_state_encoded_live"
-                        | "owners_dropped"
-                ) {
-                    capture_vm_map(name).unwrap();
-                }
-            };
-            let result = lifecycle(table.as_str(), &record);
-            record("owners_dropped");
-            result.map_err(|error| error.to_string())
+                record("owners_dropped");
+                outcomes.push((
+                    result.map_err(|error| error.to_string()),
+                    failure,
+                    elapsed_us,
+                ));
+            }
+            outcomes
         }));
     }
     PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
     WINDOW_PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
     let baseline = Observation::get(start);
     gate.wait();
-    let results: Vec<_> = workers
+    let outcomes: Vec<_> = workers
         .into_iter()
-        .map(|worker| worker.join().unwrap())
+        .flat_map(|worker| worker.join().unwrap())
         .collect();
     let cleaned = Observation::get(start);
     stop.store(true, Ordering::Relaxed);
@@ -284,8 +326,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let relieved_bytes = allocator_relief();
     let after_relief = Observation::get(start);
     let usage = KERNEL_ALLOCATOR.usage();
+    let mut results = Vec::new();
+    let mut failures = Vec::new();
+    let mut elapsed_us = Vec::new();
+    for (result, failure, elapsed) in outcomes {
+        results.push(result);
+        failures.push(failure);
+        elapsed_us.push(elapsed);
+    }
+    let recovery = if std::env::var_os("KERNEL_MEMORY_RECOVERY").is_some() {
+        KERNEL_ALLOCATOR.set_limit(None)?;
+        let table = try_parse_uri(root.join("table-0").to_str().ok_or("recovery path")?)?;
+        let result = lifecycle(table.as_str(), &|_| {}).map_err(|error| error.to_string());
+        Some(serde_json::json!({"result": result, "after_cleanup": Observation::get(start)}))
+    } else {
+        None
+    };
     let report = serde_json::json!({
         "kind": "fresh_process_rss", "cap_bytes": cap, "concurrency": concurrency,
+        "repetitions": repetitions, "operation_elapsed_us": elapsed_us,
         "mode": std::env::var("KERNEL_MEMORY_MODE").unwrap_or_else(|_| "imperative".into()),
         "warmup_enabled": warmed, "cold_baseline": cold_baseline,
         "vm_maps_enabled": std::env::var_os("KERNEL_MEMORY_VM_MAPS").is_some(),
@@ -294,7 +353,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "allocator_reported_relieved_bytes": relieved_bytes,
         "workload_elapsed_us": cleaned.elapsed_us - baseline.elapsed_us,
         "kernel_rejections": usage.rejected,
-        "results": results, "stages": *stages.lock().unwrap(),
+        "results": results, "failures": failures, "recovery": recovery,
+        "stages": *stages.lock().unwrap(),
         "measurement": "No DHAT. RSS is OS resident bytes; Rust counts are requested layouts. Samples are adjacent atomic/OS observations, not a transactionally consistent snapshot. Fixture preparation and copies ran in other processes. A zero cap disables participating limits.",
     });
     println!("{}", serde_json::to_string_pretty(&report)?);

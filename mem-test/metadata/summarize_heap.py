@@ -23,6 +23,8 @@ for point in profile["pps"]:
         category = "metadata_strings"
     elif "arrow_" in stack and any(item in stack for item in ["MutableBuffer", "BufferBuilder", "ArrayBuilder", "TapeDecoder"]):
         category = "arrow_buffers_and_parser"
+    elif any(item in stack for item in ["arrow_array::", "arrow_data::", "arrow_schema::", "arrow_json::"]):
+        category = "arrow_objects_schemas_and_decoder_state"
     elif "Vec<delta_kernel::path::ParsedLogPath>" in stack or "url::" in stack:
         category = "log_descriptors_and_urls"
     elif any(item in stack for item in ["delta_kernel::schema::", "indexmap::"]):
