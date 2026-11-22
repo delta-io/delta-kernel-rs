@@ -134,7 +134,7 @@ struct Samples {
     at_max_sampled_kernel_live: Observation,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("prepare-json") {
         let options: support::FixtureOptions =
@@ -298,7 +298,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     iteration,
                     after_stage: last_stage.get(),
                     memory_error: matches!(error, delta_kernel::Error::Kernel(error)
-                    if matches!(error.without_backtrace(), delta_kernel::KernelError::Memory(_))),
+                    if matches!(error.without_backtrace(), delta_kernel::KernelError::Memory(_)
+                        | delta_kernel::KernelError::Arrow(delta_kernel::arrow::error::ArrowError::MemoryError(_)))),
                 });
                 record("owners_dropped");
                 outcomes.push((

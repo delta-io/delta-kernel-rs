@@ -26,7 +26,7 @@ struct Stage {
     kernel_peak: usize,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn main() -> Result<(), Box<dyn std::error::Error>> {
     // width, tail commits, initial files, cap MiB; zero disables the limit.
     let args: Vec<_> = std::env::args()
         .skip(1)

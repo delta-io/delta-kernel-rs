@@ -34,7 +34,10 @@ def run_worker(binary, root, cap, concurrency, repetitions, query, stage, timeou
         env=env, text=True, capture_output=True, timeout=timeout,
     )
     if result.returncode:
-        raise RuntimeError(f"worker exit {result.returncode}: {result.stderr[-12000:]}")
+        stderr = result.stderr
+        if len(stderr) > 12000:
+            stderr = stderr[:8000] + "\n... stderr truncated ...\n" + stderr[-4000:]
+        raise RuntimeError(f"worker exit {result.returncode}: {stderr}")
     return json.loads(result.stdout)
 
 

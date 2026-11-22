@@ -43,6 +43,8 @@ runs in a separate process.
 
 For the cross-product checks, phase failures, and recovery assertions, use
 [the local lifecycle matrix](LIFECYCLE_CHECKS.md).
+The separate [Arrow allocator experiment](../arrow-allocator-poc/README.md) tests dependency
+storage and error propagation without changing the normal Kernel dependency configuration.
 
 From the repository root:
 

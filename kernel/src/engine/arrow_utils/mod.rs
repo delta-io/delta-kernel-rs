@@ -19,11 +19,11 @@ use self::file_type_validation::validate_file_values_for_read;
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::{
     Array as ArrowArray, ArrayRef as ArrowArrayRef, GenericListArray, GenericListViewArray,
-    MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, RecordBatchOptions, StringArray,
-    StructArray, make_array, new_null_array,
+    MapArray, NullArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, RecordBatchOptions,
+    StringArray, StructArray, make_array,
 };
 use crate::arrow::buffer::NullBuffer;
-use crate::arrow::compute::{CastOptions, cast_with_options};
+use crate::arrow::compute::{CastOptions, cast, cast_with_options};
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef as ArrowFieldRef,
     Fields as ArrowFields, Int64Type, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
@@ -942,16 +942,21 @@ type FieldArrayOpt = Option<(Arc<ArrowField>, Arc<dyn ArrowArray>)>;
 /// Creates an array for a missing field. For non-nullable structs, produces a non-null struct
 /// (no null buffer) with recursively missing children, preserving the non-null constraint at
 /// every level. For all other types (or nullable structs), produces an all-null array.
-fn new_missing_array(field: &ArrowField, num_rows: usize) -> Arc<dyn ArrowArray> {
+fn new_missing_array(field: &ArrowField, num_rows: usize) -> KernelResult<ArrowArrayRef> {
     match (field.is_nullable(), field.data_type()) {
         (false, ArrowDataType::Struct(child_fields)) => {
             let child_arrays: Vec<Arc<dyn ArrowArray>> = child_fields
                 .iter()
                 .map(|f| new_missing_array(f, num_rows))
-                .collect();
-            Arc::new(StructArray::new(child_fields.clone(), child_arrays, None))
+                .collect::<KernelResult<_>>()?;
+            Ok(Arc::new(StructArray::try_new_with_length(
+                child_fields.clone(),
+                child_arrays,
+                None,
+                num_rows,
+            )?))
         }
-        _ => new_null_array(field.data_type(), num_rows),
+        _ => Ok(cast(&NullArray::new(num_rows), field.data_type())?),
     }
 }
 
@@ -1074,7 +1079,7 @@ pub(crate) fn reorder_struct_array(
                     ));
                 }
                 ReorderIndexTransform::Missing(field) => {
-                    let array = new_missing_array(field, num_rows);
+                    let array = new_missing_array(field, num_rows)?;
                     final_fields_cols[reorder_index.index] = Some((field.clone(), array));
                 }
                 ReorderIndexTransform::RowIndex(field) => {
@@ -1271,12 +1276,16 @@ pub(crate) fn fix_record_batch_nested_null_masks(batch: RecordBatch) -> KernelRe
 /// Splits a StructArray into its parts, unions in the parent null mask, and uses the result to
 /// recursively update the children as well before putting everything back together.
 fn compute_nested_null_masks(sa: StructArray, parent_nulls: Option<&NullBuffer>) -> StructArray {
+    if !needs_nested_null_masks(&sa, parent_nulls) {
+        return sa;
+    }
     let len = sa.len();
     let (fields, columns, nulls) = sa.into_parts();
     let nulls = NullBuffer::union(parent_nulls, nulls.as_ref());
     let columns = columns
         .into_iter()
         .map(|column| match column.data_type() {
+            _ if !needs_nested_null_masks(column.as_ref(), nulls.as_ref()) => column,
             // NullArray (void columns) does not accept a null buffer — all values are
             // already null by definition, so propagating the parent null mask is a no-op.
             ArrowDataType::Null => column,
@@ -1310,6 +1319,27 @@ fn compute_nested_null_masks(sa: StructArray, parent_nulls: Option<&NullBuffer>)
     // SAFETY: We are simply reassembling the input `StructArray` we previously broke apart, with
     // updated null buffers. See above for details about null buffer safety.
     unsafe { StructArray::new_unchecked_with_length(fields, columns, nulls, len) }
+}
+
+// Avoid cloning array objects and their ArrayData trees when the reader or a previous operator
+// already propagated every ancestor's nulls. The check borrows the existing arrays and masks.
+fn needs_nested_null_masks(array: &dyn ArrowArray, parent_nulls: Option<&NullBuffer>) -> bool {
+    if matches!(array.data_type(), ArrowDataType::Null) {
+        return false;
+    }
+    if let Some(parent) = parent_nulls
+        && array.nulls().is_none_or(|nulls| !nulls.contains(parent))
+    {
+        return true;
+    }
+    match array.data_type() {
+        ArrowDataType::Struct(_) => array
+            .as_struct()
+            .columns()
+            .iter()
+            .any(|column| needs_nested_null_masks(column.as_ref(), array.nulls())),
+        _ => false,
+    }
 }
 
 /// Parse a column of JSON strings into a typed `RecordBatch` matching `schema`. N input
@@ -4749,6 +4779,38 @@ mod tests {
             other => panic!("expected nested Struct, got {other:?}"),
         };
         assert_eq!(nested_children[0].name(), "tgt_z");
+    }
+
+    #[test]
+    fn normalized_null_masks_preserve_array_ownership() {
+        let normalized: ArrowArrayRef = Arc::new(Int32Array::from(vec![None, Some(2), Some(3)]));
+        let unmasked: ArrowArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        let fields = ArrowFields::from(vec![
+            ArrowField::new("normalized", ArrowDataType::Int32, true),
+            ArrowField::new("unmasked", ArrowDataType::Int32, true),
+        ]);
+        let nested = Arc::new(StructArray::new(
+            fields.clone(),
+            vec![normalized.clone(), unmasked],
+            Some(NullBuffer::from(vec![false, true, true])),
+        ));
+        let batch = StructArray::new(
+            vec![ArrowField::new(
+                "nested",
+                ArrowDataType::Struct(fields),
+                true,
+            )]
+            .into(),
+            vec![nested],
+            None,
+        );
+        let fixed = fix_nested_null_masks(batch);
+        let nested = fixed.column(0).as_struct();
+        assert!(Arc::ptr_eq(nested.column(0), &normalized));
+        assert_eq!(nested.column(1).nulls(), nested.nulls());
+        let normalized_nested = fixed.column(0).clone();
+        let fixed_again = fix_nested_null_masks(fixed);
+        assert!(Arc::ptr_eq(fixed_again.column(0), &normalized_nested));
     }
 
     #[rstest]

@@ -7,8 +7,8 @@ use std::sync::Arc;
 use itertools::Itertools;
 
 use super::plan::encode_keys_as_rows;
-use crate::arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, new_null_array};
-use crate::arrow::compute::interleave;
+use crate::arrow::array::{Array, ArrayRef, Int64Array, NullArray, RecordBatch};
+use crate::arrow::compute::{cast, interleave};
 use crate::arrow::datatypes::DataType as ArrowDataType;
 use crate::arrow::row::OwnedRow;
 use crate::engine::arrow_conversion::TryIntoArrow as _;
@@ -156,7 +156,7 @@ impl BoundAggregate for FirstNonNullAgg {
 
     fn finalize(&self, states: &[&dyn Any], input: &[RecordBatch]) -> KernelResult<ArrayRef> {
         let mut arrays = extract_column_values(input, &self.column)?;
-        arrays.push(new_null_array(&self.output_type, 1));
+        arrays.push(cast(&NullArray::new(1), &self.output_type)?);
         let null_row = (input.len(), 0);
         let rows: Vec<_> = states
             .iter()
@@ -375,7 +375,7 @@ impl BoundAggregate for NonNullByAgg {
 
     fn finalize(&self, states: &[&dyn Any], input: &[RecordBatch]) -> KernelResult<ArrayRef> {
         let mut arrays = extract_column_values(input, &self.value)?;
-        arrays.push(new_null_array(&self.output_type, 1));
+        arrays.push(cast(&NullArray::new(1), &self.output_type)?);
 
         // Groups with no winner interleave from the one-row null array we appended above.
         let initial_row = (input.len(), 0);

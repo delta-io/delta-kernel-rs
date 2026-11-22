@@ -98,7 +98,10 @@ for the difference between requested heap bytes, RSS, and physical footprint.
 ## Validated results
 
 [The compact results](LIFECYCLE_RESULTS.json) record the manifest and executable hashes, platform,
-check counts, and simultaneous-peak heap attribution. On Rust 1.100 / macOS arm64:
+check counts, and simultaneous-peak heap attribution for the published-dependency baseline build.
+The [Arrow allocator experiment](../arrow-allocator-poc/README.md) records separate measurements
+with its dependency storage changes and reference-executor retention improvements.
+On Rust 1.100 / macOS arm64:
 
 - The matrix crossed 169 compatible pairs at concurrency 1 and 4: 2,354 fresh-process checks and
   7,762 measured operations. These included 3,995 typed allocation errors and 2,354 successful

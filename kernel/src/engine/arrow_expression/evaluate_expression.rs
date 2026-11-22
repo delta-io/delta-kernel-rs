@@ -9,11 +9,13 @@ use itertools::Itertools;
 use tracing::warn;
 
 use super::timestamp_timezone::TimestampTimezone;
+#[cfg(test)]
+use crate::arrow::array::new_null_array;
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
     self as arrow_array, Array, ArrayBuilder, ArrayData, ArrayRef, AsArray, BooleanArray, Datum,
-    LargeStringBuilder, ListArray, MapArray, MutableArrayData, NullBufferBuilder, RecordBatch,
-    StringArray, StringArrayType, StringViewBuilder, StructArray, make_array, new_null_array,
+    LargeStringBuilder, ListArray, MapArray, MutableArrayData, NullArray, NullBufferBuilder,
+    RecordBatch, StringArray, StringArrayType, StringViewBuilder, StructArray, make_array,
 };
 use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
 use crate::arrow::compute::kernels::cast_utils::{Parser, string_to_datetime};
@@ -403,16 +405,24 @@ pub fn evaluate_expression(
             // converts them to per-cell NULL rather than failing the batch.
             match parse_json_impl(json_arr.as_ref(), p.output_schema.clone()) {
                 Ok(batch) => Ok(Arc::new(StructArray::from(batch)) as ArrayRef),
+                Err(e)
+                    if matches!(
+                        e.without_backtrace(),
+                        KernelError::Memory(_) | KernelError::Arrow(ArrowError::MemoryError(_))
+                    ) =>
+                {
+                    Err(e)
+                }
                 Err(e) => {
                     warn!(
                         "Failed to parse JSON stats as {}: {e}. Using null stats.",
                         p.output_schema,
                     );
                     let arrow_schema = ArrowSchema::try_from_kernel(p.output_schema.as_ref())?;
-                    Ok(new_null_array(
+                    Ok(cast(
+                        &NullArray::new(json_arr.len()),
                         &ArrowDataType::Struct(arrow_schema.fields().clone()),
-                        json_arr.len(),
-                    ))
+                    )?)
                 }
             }
         }
@@ -433,7 +443,7 @@ pub fn evaluate_expression(
             let output = if can_cast_types(input.data_type(), &target) {
                 cast(&input, &target)?
             } else {
-                new_null_array(&target, input.len())
+                cast(&NullArray::new(input.len()), &target)?
             };
             validate_array_type(output, result_type)
         }
