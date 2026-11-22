@@ -57,6 +57,7 @@ itertools = "0.14.0"
 rstest = "0.23"
 
 [features]
+limited-memory = ["delta_kernel/limited-memory"]
 default = ["default-engine-rustls", "arrow"]
 default-engine-native-tls = ["delta_kernel/default-engine-base", "dep:delta_kernel_default_engine", "delta_kernel_default_engine/native-tls", "default-engine-base"]
 default-engine-rustls = ["delta_kernel/default-engine-base", "dep:delta_kernel_default_engine", "delta_kernel_default_engine/rustls", "default-engine-base"]

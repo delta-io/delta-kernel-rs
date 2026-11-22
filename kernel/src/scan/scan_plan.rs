@@ -274,7 +274,9 @@ mod tests {
             checkpoint_version,
             log_root,
             listed: LogSegmentFiles {
-                ascending_commit_files,
+                ascending_commit_files: crate::log_segment_files::commit_files(
+                    ascending_commit_files,
+                ),
                 checkpoint_parts,
                 latest_commit_file,
                 max_published_version: Some(end_version),

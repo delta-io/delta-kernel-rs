@@ -13,13 +13,18 @@ use delta_kernel_derive::internal_api;
 use derive_more::From;
 use indexmap::IndexMap;
 use itertools::Itertools;
+use serde::de::Error as DeError;
+use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 #[cfg(feature = "geo-type-in-dev")]
 use strum::{Display as StrumDisplay, EnumString};
 use tracing::warn;
 
 // re-export because many call sites that use schemas do not necessarily use expressions
 pub(crate) use crate::expressions::{ColumnName, column_name};
+#[cfg(feature = "limited-memory")]
+use crate::memory::Owned;
 use crate::reserved_field_ids::FILE_NAME;
 use crate::schema::collation_utils::rewrite_collation_field_prefix;
 use crate::table_features::{
@@ -207,13 +212,17 @@ pub(crate) trait ToSchema {
     fn schema_ref() -> &'static SchemaRef;
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq, From)]
+#[derive(Debug, Serialize, Clone, Eq, From)]
+#[cfg_attr(not(feature = "limited-memory"), derive(Deserialize, PartialEq))]
 #[serde(untagged)]
 pub enum MetadataValue {
     #[from]
     Number(i64),
     #[from(String, &String, &str)]
     String(String),
+    /// String metadata retained under an explicit memory budget.
+    #[cfg(feature = "limited-memory")]
+    LimitedString(Arc<crate::memory::LimitedString>),
     #[from]
     Boolean(bool),
     // The [PROTOCOL](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#struct-field) states
@@ -223,11 +232,32 @@ pub enum MetadataValue {
     Other(serde_json::Value),
 }
 
+impl MetadataValue {
+    /// Borrow string metadata without copying its storage.
+    pub fn as_string(&self) -> Option<&str> {
+        match self {
+            Self::String(value) => Some(value),
+            #[cfg(feature = "limited-memory")]
+            Self::LimitedString(value) => Some(value.as_str()),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "limited-memory")]
+mod limited_data_type;
+#[cfg(feature = "limited-memory")]
+mod limited_metadata;
+#[cfg(feature = "limited-memory")]
+mod limited_physical;
+
 impl Display for MetadataValue {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             MetadataValue::Number(n) => write!(f, "{n}"),
             MetadataValue::String(s) => write!(f, "{s}"),
+            #[cfg(feature = "limited-memory")]
+            MetadataValue::LimitedString(s) => write!(f, "{s}"),
             MetadataValue::Boolean(b) => write!(f, "{b}"),
             MetadataValue::Other(v) => write!(f, "{v}"), // just write the json back
         }
@@ -395,6 +425,15 @@ pub(crate) struct ExistingColumnMappingAnnotations<'a> {
 }
 
 impl StructField {
+    pub(crate) fn try_clone(&self) -> KernelResult<Self> {
+        Ok(Self {
+            name: self.name.clone(),
+            data_type: self.data_type.try_clone()?,
+            nullable: self.nullable,
+            metadata: self.metadata.clone(),
+        })
+    }
+
     /// The name of the default row index metadata column.
     ///
     /// Note that the dot does not indicate a nested field, it is just a separator for the metadata
@@ -486,13 +525,12 @@ impl StructField {
 
     /// Returns the metadata column spec if this is a metadata column, otherwise returns None.
     pub fn get_metadata_column_spec(&self) -> Option<MetadataColumnSpec> {
-        match self
-            .metadata
-            .get(ColumnMetadataKey::MetadataSpec.as_ref())?
-        {
-            MetadataValue::String(s) => MetadataColumnSpec::from_str(s).ok(),
-            _ => None,
-        }
+        MetadataColumnSpec::from_str(
+            self.metadata
+                .get(ColumnMetadataKey::MetadataSpec.as_ref())?
+                .as_string()?,
+        )
+        .ok()
     }
 
     /// Returns true if this field is an internal column added by Kernel.
@@ -530,7 +568,7 @@ impl StructField {
     ) -> KernelResult<Option<&str>> {
         match self.get_config_value(key) {
             None => Ok(None),
-            Some(MetadataValue::String(value)) => Ok(Some(value)),
+            Some(value) if value.as_string().is_some() => Ok(value.as_string()),
             Some(other) => Err(KernelError::schema(format!(
                 "Field '{}' has a non-string `{}` annotation: {other}",
                 self.name,
@@ -603,24 +641,14 @@ impl StructField {
             }
         };
         let physical_name =
-            match self.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
-                Some(MetadataValue::String(s)) if s.is_empty() => {
-                    return Err(KernelError::schema(format!(
-                        "Field '{}' has an empty `{}` annotation",
-                        self.name,
-                        ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                    )));
-                }
-                Some(MetadataValue::String(s)) => Some(s.as_str()),
-                None => None,
-                Some(_) => {
-                    return Err(KernelError::schema(format!(
-                        "Field '{}' has a non-string `{}` annotation",
-                        self.name,
-                        ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                    )));
-                }
-            };
+            self.get_string_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)?;
+        if physical_name.is_some_and(str::is_empty) {
+            return Err(KernelError::schema(format!(
+                "Field '{}' has an empty `{}` annotation",
+                self.name,
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref()
+            )));
+        }
         Ok(ExistingColumnMappingAnnotations { id, physical_name })
     }
 
@@ -657,9 +685,10 @@ impl StructField {
     #[internal_api]
     pub(crate) fn physical_name(&self, column_mapping_mode: ColumnMappingMode) -> &str {
         if let ColumnMappingMode::Id | ColumnMappingMode::Name = column_mapping_mode
-            && let Some(MetadataValue::String(physical_name)) = self
+            && let Some(physical_name) = self
                 .metadata
                 .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
+                .and_then(MetadataValue::as_string)
         {
             physical_name
         } else {
@@ -670,11 +699,10 @@ impl StructField {
     /// Returns true if this field has a physical name annotation
     /// in its column mapping metadata.
     pub(crate) fn has_physical_name_annotation(&self) -> bool {
-        matches!(
-            self.metadata
-                .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref()),
-            Some(MetadataValue::String(_))
-        )
+        self.metadata
+            .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
+            .and_then(MetadataValue::as_string)
+            .is_some()
     }
 
     /// Returns true if this field has a column mapping ID annotation
@@ -862,7 +890,7 @@ pub struct StructType {
     // We use indexmap to preserve the order of fields as they are defined in the schema
     // while also allowing for fast lookup by name. The alternative is to do a linear search
     // for each field by name would be potentially quite expensive for large schemas.
-    fields: IndexMap<String, Arc<StructField>>,
+    fields: FieldMap,
     /// The metadata columns in this struct
     // We use a dedicated map for metadata columns to allow for fast lookup without having to
     // iterate over all fields.
@@ -873,6 +901,50 @@ pub struct StructTypeBuilder {
     fields: IndexMap<String, StructField>,
 }
 
+#[cfg(feature = "limited-memory")]
+type FieldStorage = crate::memory::Owned<StructField>;
+#[cfg(not(feature = "limited-memory"))]
+type FieldStorage = StructField;
+type FieldRef = Arc<FieldStorage>;
+#[cfg(feature = "limited-memory")]
+type FieldMap = crate::memory::OrderedMap<FieldRef>;
+#[cfg(not(feature = "limited-memory"))]
+type FieldMap = IndexMap<String, FieldRef>;
+
+fn field_ref(field: &FieldRef) -> &StructField {
+    field
+}
+
+fn unbudgeted_field(field: StructField) -> FieldRef {
+    #[cfg(feature = "limited-memory")]
+    {
+        Arc::new(crate::memory::Owned::unbudgeted(field))
+    }
+    #[cfg(not(feature = "limited-memory"))]
+    {
+        Arc::new(field)
+    }
+}
+
+#[cfg(feature = "limited-memory")]
+fn try_field(field: StructField) -> KernelResult<FieldRef> {
+    Ok(Arc::new(crate::memory::Owned::try_new(field)?))
+}
+
+fn unwrap_field(field: FieldRef) -> StructField {
+    #[cfg(feature = "limited-memory")]
+    {
+        match Arc::try_unwrap(field) {
+            Ok(field) => field.into_inner(),
+            Err(shared) => field_ref(&shared).clone(),
+        }
+    }
+    #[cfg(not(feature = "limited-memory"))]
+    {
+        Arc::unwrap_or_clone(field)
+    }
+}
+
 impl Clone for StructType {
     // Preserve deep-copy behavior; only share_selected_fields shares fields between schemas.
     fn clone(&self) -> Self {
@@ -881,7 +953,7 @@ impl Clone for StructType {
             fields: self
                 .fields
                 .iter()
-                .map(|(name, field)| (name.clone(), Arc::new(field.as_ref().clone())))
+                .map(|(name, field)| (name.clone(), unbudgeted_field(field_ref(field).clone())))
                 .collect(),
             metadata_columns: self.metadata_columns.clone(),
         }
@@ -925,13 +997,49 @@ impl StructTypeBuilder {
 }
 
 impl StructType {
+    #[cfg(feature = "limited-memory")]
+    pub(crate) fn try_from_unchecked_results(
+        fields: impl IntoIterator<Item = KernelResult<StructField>>,
+    ) -> KernelResult<Self> {
+        let mut field_map = FieldMap::new();
+        let mut metadata_columns = HashMap::new();
+        for (index, field) in fields.into_iter().enumerate() {
+            let field = field?;
+            if let Some(spec) = field.get_metadata_column_spec() {
+                metadata_columns.insert(spec, index);
+            }
+            field_map.try_insert(field.name.clone(), try_field(field)?)?;
+        }
+        Ok(Self {
+            type_name: "struct".into(),
+            fields: field_map,
+            metadata_columns,
+        })
+    }
+
+    #[cfg(feature = "limited-memory")]
+    pub(crate) fn try_make_validated_physical(
+        &self,
+        mode: ColumnMappingMode,
+    ) -> KernelResult<Self> {
+        limited_physical::materialize(self, mode)
+    }
+
+    pub(crate) fn try_clone(&self) -> KernelResult<Self> {
+        #[cfg(feature = "limited-memory")]
+        if crate::memory::MemoryBudget::current().is_some() {
+            return Self::try_from_unchecked_results(self.fields().map(StructField::try_clone));
+        }
+        Ok(self.clone())
+    }
+
     /// Returns a subset whose retained fields share storage with this already-valid schema.
     ///
     /// Calls `keep` once per field in schema order, preserves that order, and rebuilds metadata
     /// column indexes without revalidating fields. Mutable access must use copy-on-write to avoid
     /// changing fields in the source schema.
     pub(crate) fn share_selected_fields(&self, mut keep: impl FnMut(&StructField) -> bool) -> Self {
-        let fields: IndexMap<_, _> = self
+        let fields: FieldMap = self
             .fields
             .iter()
             .filter(|(_, field)| keep(field))
@@ -957,7 +1065,10 @@ impl StructType {
     /// - the schema contains duplicate metadata columns
     /// - the schema contains nested metadata columns
     pub fn try_new(fields: impl IntoIterator<Item = StructField>) -> KernelResult<Self> {
+        #[cfg(not(feature = "limited-memory"))]
         let mut field_map = IndexMap::new();
+        #[cfg(feature = "limited-memory")]
+        let mut field_map = FieldMap::new();
         let mut metadata_columns = HashMap::new();
         let mut seen_lowercase_names = HashSet::new();
 
@@ -987,7 +1098,10 @@ impl StructType {
                 )));
             }
 
+            #[cfg(not(feature = "limited-memory"))]
             field_map.insert(field.name.clone(), Arc::new(field));
+            #[cfg(feature = "limited-memory")]
+            field_map.try_insert(field.name.clone(), try_field(field)?)?;
         }
 
         Ok(Self {
@@ -1027,9 +1141,11 @@ impl StructType {
             if let Some(metadata_column_spec) = field.get_metadata_column_spec() {
                 metadata_columns.insert(metadata_column_spec, i);
             }
-            field_map.insert(field.name.clone(), Arc::new(field));
+            field_map.insert(field.name.clone(), unbudgeted_field(field));
         }
 
+        #[cfg(feature = "limited-memory")]
+        let field_map = field_map.into();
         Self {
             type_name: "struct".into(),
             fields: field_map,
@@ -1042,10 +1158,11 @@ impl StructType {
     /// from this order in this schema. Returns an Err if a specified field doesn't exist.
     pub fn project_as_struct(&self, names: &[impl AsRef<str>]) -> KernelResult<StructType> {
         let fields = names.iter().map(|name| {
-            self.fields
+            let field = self
+                .fields
                 .get(name.as_ref())
-                .map(|field| field.as_ref().clone())
-                .ok_or_else(|| KernelError::missing_column(name.as_ref()))
+                .ok_or_else(|| KernelError::missing_column(name.as_ref()))?;
+            field_ref(field).try_clone()
         });
         Self::try_from_results(fields)
     }
@@ -1094,7 +1211,7 @@ impl StructType {
 
     /// Gets the field with the given name.
     pub fn field(&self, name: impl AsRef<str>) -> Option<&StructField> {
-        self.fields.get(name.as_ref()).map(Arc::as_ref)
+        self.fields.get(name.as_ref()).map(field_ref)
     }
 
     /// Retrieves the nested field named by the given column path.
@@ -1188,33 +1305,33 @@ impl StructType {
     pub fn field_with_index(&self, name: impl AsRef<str>) -> Option<(usize, &StructField)> {
         self.fields
             .get_full(name.as_ref())
-            .map(|(index, _, field)| (index, field.as_ref()))
+            .map(|(index, _, field)| (index, field_ref(field)))
     }
 
     /// Gets the field at the given index.
     pub fn field_at_index(&self, index: usize) -> Option<&StructField> {
         self.fields
             .get_index(index)
-            .map(|(_, field)| field.as_ref())
+            .map(|(_, field)| field_ref(field))
     }
 
     /// Gets a reference to all the fields in this struct type.
     pub fn fields(
         &self,
     ) -> impl ExactSizeIterator<Item = &StructField> + DoubleEndedIterator + FusedIterator {
-        self.fields.values().map(Arc::as_ref)
+        self.fields.values().map(field_ref)
     }
 
     /// Gets an iterator over all the fields in this struct type.
     pub fn into_fields(
         self,
     ) -> impl ExactSizeIterator<Item = StructField> + DoubleEndedIterator + FusedIterator {
-        self.fields.into_values().map(Arc::unwrap_or_clone)
+        self.fields.into_values().map(unwrap_field)
     }
 
     /// Gets a mutable reference to the underlying field map.
     #[internal_api]
-    pub(crate) fn field_map_mut(&mut self) -> &mut IndexMap<String, Arc<StructField>> {
+    pub(crate) fn field_map_mut(&mut self) -> &mut FieldMap {
         &mut self.fields
     }
 
@@ -1523,14 +1640,17 @@ impl<'a> IntoIterator for &'a StructType {
 /// [`IndexMap`]: indexmap::IndexMap
 #[derive(Debug)]
 pub struct StructFieldIntoIter {
-    inner: indexmap::map::IntoValues<String, Arc<StructField>>,
+    #[cfg(not(feature = "limited-memory"))]
+    inner: indexmap::map::IntoValues<String, FieldRef>,
+    #[cfg(feature = "limited-memory")]
+    inner: crate::memory::ordered_map::IntoValues<FieldRef>,
 }
 
 impl Iterator for StructFieldIntoIter {
     type Item = StructField;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(Arc::unwrap_or_clone)
+        self.inner.next().map(unwrap_field)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -1542,11 +1662,11 @@ impl Iterator for StructFieldIntoIter {
     }
 
     fn last(self) -> Option<Self::Item> {
-        self.inner.last().map(Arc::unwrap_or_clone)
+        self.inner.last().map(unwrap_field)
     }
 
     fn nth(&mut self, n: usize) -> Option<Self::Item> {
-        self.inner.nth(n).map(Arc::unwrap_or_clone)
+        self.inner.nth(n).map(unwrap_field)
     }
 }
 
@@ -1560,7 +1680,7 @@ impl FusedIterator for StructFieldIntoIter {}
 
 impl DoubleEndedIterator for StructFieldIntoIter {
     fn next_back(&mut self) -> Option<Self::Item> {
-        self.inner.next_back().map(Arc::unwrap_or_clone)
+        self.inner.next_back().map(unwrap_field)
     }
 }
 
@@ -1605,14 +1725,17 @@ impl DoubleEndedIterator for StructFieldIntoIter {
 /// [`IndexMap`]: indexmap::IndexMap
 #[derive(Debug, Clone)]
 pub struct StructFieldRefIter<'a> {
-    inner: indexmap::map::Values<'a, String, Arc<StructField>>,
+    #[cfg(not(feature = "limited-memory"))]
+    inner: indexmap::map::Values<'a, String, FieldRef>,
+    #[cfg(feature = "limited-memory")]
+    inner: crate::memory::ordered_map::Values<'a, FieldRef>,
 }
 
 impl<'a> Iterator for StructFieldRefIter<'a> {
     type Item = &'a StructField;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(Arc::as_ref)
+        self.inner.next().map(field_ref)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -1630,7 +1753,7 @@ impl FusedIterator for StructFieldRefIter<'_> {}
 
 impl DoubleEndedIterator for StructFieldRefIter<'_> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        self.inner.next_back().map(Arc::as_ref)
+        self.inner.next_back().map(field_ref)
     }
 }
 
@@ -1792,12 +1915,15 @@ where
     T::deserialize(deserializer).map(Some)
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StructTypeSerDeHelper {
     #[serde(rename = "type")]
-    type_name: String,
+    _type_name: String,
+    #[cfg(not(feature = "limited-memory"))]
     fields: Vec<StructField>,
+    #[cfg(feature = "limited-memory")]
+    fields: crate::memory::LimitedVec<StructField>,
 }
 
 impl Serialize for StructType {
@@ -1805,11 +1931,20 @@ impl Serialize for StructType {
     where
         S: serde::Serializer,
     {
-        StructTypeSerDeHelper {
-            type_name: self.type_name.clone(),
-            fields: self.fields().cloned().collect(),
+        struct Fields<'a>(&'a StructType);
+        impl Serialize for Fields<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut fields = serializer.serialize_seq(Some(self.0.num_fields()))?;
+                for field in self.0.fields() {
+                    fields.serialize_element(field)?;
+                }
+                fields.end()
+            }
         }
-        .serialize(serializer)
+        let mut wire = serializer.serialize_struct("StructType", 2)?;
+        wire.serialize_field("type", &self.type_name)?;
+        wire.serialize_field("fields", &Fields(self))?;
+        wire.end()
     }
 }
 
@@ -1820,7 +1955,13 @@ impl<'de> Deserialize<'de> for StructType {
         Self: Sized,
     {
         let helper = StructTypeSerDeHelper::deserialize(deserializer)?;
-        StructType::try_new(helper.fields).map_err(serde::de::Error::custom)
+        StructType::try_new(helper.fields).map_err(|error| {
+            #[cfg(feature = "limited-memory")]
+            if let KernelError::Memory(failure) = error.without_backtrace() {
+                crate::memory::record_failure(*failure);
+            }
+            serde::de::Error::custom(error)
+        })
     }
 }
 
@@ -2556,6 +2697,24 @@ impl Display for PrimitiveType {
     }
 }
 
+#[cfg(feature = "limited-memory")]
+type DataTypeBox<T> = crate::memory::Owned<T>;
+#[cfg(not(feature = "limited-memory"))]
+type DataTypeBox<T> = Box<T>;
+
+// This consumes either the standard Box or its allocator-bearing representation.
+#[cfg_attr(not(feature = "limited-memory"), allow(clippy::boxed_local))]
+pub(crate) fn unbox_data_type<T>(value: DataTypeBox<T>) -> T {
+    #[cfg(feature = "limited-memory")]
+    {
+        value.into_inner()
+    }
+    #[cfg(not(feature = "limited-memory"))]
+    {
+        *value
+    }
+}
+
 #[derive(Debug, Serialize, PartialEq, Clone, Eq, From)]
 #[serde(untagged, rename_all = "camelCase")]
 pub enum DataType {
@@ -2564,19 +2723,19 @@ pub enum DataType {
     Primitive(PrimitiveType),
     /// An array stores a variable length collection of items of some type.
     #[from(ArrayType)]
-    Array(Box<ArrayType>),
+    Array(DataTypeBox<ArrayType>),
     /// A struct is used to represent both the top-level schema of the table as well
     /// as struct columns that contain nested columns.
     #[from(StructType)]
-    Struct(Box<StructType>),
+    Struct(DataTypeBox<StructType>),
     /// A map stores an arbitrary length collection of key-value pairs
     /// with a single keyType and a single valueType
     #[from(MapType)]
-    Map(Box<MapType>),
+    Map(DataTypeBox<MapType>),
     /// The Variant data type. The physical representation can be flexible to support shredded
     /// reads. The unshredded schema is `Variant(StructType<metadata: BINARY, value: BINARY>)`.
     #[serde(serialize_with = "serialize_variant")]
-    Variant(Box<StructType>),
+    Variant(DataTypeBox<StructType>),
     /// An engine annotation over a physical Delta type.
     /// Retains logical type information in schemas; physical operations use the enclosed
     /// `sql_type`. See [`UserDefinedType`] for a schema example.
@@ -2588,7 +2747,7 @@ pub enum DataType {
     /// `checksum`, and `inline`. Like Variant, the type identity is carried in the Delta schema;
     /// the physical representation is a plain struct.
     #[serde(serialize_with = "serialize_file")]
-    File(Box<StructType>),
+    File(DataTypeBox<StructType>),
 }
 
 #[cfg(feature = "geo-type-in-dev")]
@@ -2618,9 +2777,10 @@ impl<'de> serde::Deserialize<'de> for DataType {
     where
         D: serde::Deserializer<'de>,
     {
-        use serde::de::Error;
-        use serde_json::Value;
-
+        #[cfg(feature = "limited-memory")]
+        if crate::memory::MemoryBudget::current().is_some() {
+            return limited_data_type::deserialize(deserializer);
+        }
         let value = Value::deserialize(deserializer)?;
 
         // String values are either primitive types, "variant" or "file"
@@ -2628,7 +2788,7 @@ impl<'de> serde::Deserialize<'de> for DataType {
             if s == "variant" {
                 return match DataType::unshredded_variant() {
                     DataType::Variant(st) => Ok(DataType::Variant(st)),
-                    _ => Err(Error::custom("Failed to create variant type")),
+                    _ => Err(DeError::custom("Failed to create variant type")),
                 };
             }
             if s == "file" {
@@ -2638,7 +2798,7 @@ impl<'de> serde::Deserialize<'de> for DataType {
             // Try PrimitiveType - this will give us good error messages for unsupported types
             return PrimitiveType::deserialize(value.clone())
                 .map(DataType::Primitive)
-                .map_err(|e| Error::custom(e.to_string()));
+                .map_err(|e| DeError::custom(e.to_string()));
         }
 
         // Object values are complex types - dispatch based on "type" field
@@ -2649,23 +2809,23 @@ impl<'de> serde::Deserialize<'de> for DataType {
             return match type_str.as_str() {
                 "array" => ArrayType::deserialize(serde_stacker::Deserializer::new(value))
                     .map(DataType::from)
-                    .map_err(|e| Error::custom(e.to_string())),
+                    .map_err(|e| DeError::custom(e.to_string())),
                 "struct" => StructType::deserialize(serde_stacker::Deserializer::new(value))
                     .map(DataType::from)
-                    .map_err(|e| Error::custom(e.to_string())),
+                    .map_err(|e| DeError::custom(e.to_string())),
                 "map" => MapType::deserialize(serde_stacker::Deserializer::new(value))
                     .map(DataType::from)
-                    .map_err(|e| Error::custom(e.to_string())),
+                    .map_err(|e| DeError::custom(e.to_string())),
                 #[cfg(feature = "udt-in-dev")]
                 "udt" => UserDefinedType::deserialize(serde_stacker::Deserializer::new(value))
                     .map(DataType::UserDefined)
-                    .map_err(Error::custom),
+                    .map_err(DeError::custom),
                 _ => Err(unsupported_delta_type_error(type_str)),
             };
         }
 
         // Fallback error with the actual value that failed
-        Err(Error::custom(format!(
+        Err(DeError::custom(format!(
             "Invalid data type: {}",
             serde_json::to_string(&value).unwrap_or_else(|_| format!("{value:?}"))
         )))
@@ -2707,6 +2867,45 @@ pub(crate) fn is_null_count_only_file_sub_field(path: &[&StructField]) -> bool {
 }
 
 impl DataType {
+    pub(crate) fn try_from_struct(value: StructType) -> KernelResult<Self> {
+        #[cfg(feature = "limited-memory")]
+        {
+            Ok(Self::Struct(Owned::try_new(value)?))
+        }
+        #[cfg(not(feature = "limited-memory"))]
+        {
+            Ok(value.into())
+        }
+    }
+
+    pub(crate) fn try_clone(&self) -> KernelResult<Self> {
+        #[cfg(feature = "limited-memory")]
+        if crate::memory::MemoryBudget::current().is_some() {
+            return stacker::maybe_grow(64 * 1024, 2 * 1024 * 1024, || {
+                Ok(match self {
+                    Self::Primitive(value) => Self::Primitive(value.clone()),
+                    Self::Struct(value) => Self::Struct(Owned::try_new(value.try_clone()?)?),
+                    Self::Array(value) => Self::Array(Owned::try_new(ArrayType {
+                        type_name: value.type_name.clone(),
+                        element_type: value.element_type.try_clone()?,
+                        contains_null: value.contains_null,
+                    })?),
+                    Self::Map(value) => Self::Map(Owned::try_new(MapType {
+                        type_name: value.type_name.clone(),
+                        key_type: value.key_type.try_clone()?,
+                        value_type: value.value_type.try_clone()?,
+                        value_contains_null: value.value_contains_null,
+                    })?),
+                    Self::Variant(value) => Self::Variant(Owned::try_new(value.try_clone()?)?),
+                    Self::File(value) => Self::File(Owned::try_new(value.try_clone()?)?),
+                    #[cfg(feature = "udt-in-dev")]
+                    Self::UserDefined(value) => Self::UserDefined(value.clone()),
+                })
+            });
+        }
+        Ok(self.clone())
+    }
+
     pub const STRING: Self = DataType::Primitive(PrimitiveType::String);
     pub const LONG: Self = DataType::Primitive(PrimitiveType::Long);
     pub const INTEGER: Self = DataType::Primitive(PrimitiveType::Integer);
@@ -2872,10 +3071,13 @@ impl DataType {
     /// Create a new unshredded [`DataType::Variant`]. This data type is a struct of two not-null
     /// binary fields: `metadata` and `value`.
     pub fn unshredded_variant() -> Self {
-        DataType::Variant(Box::new(schema! {
-            not_null "metadata": BINARY,
-            not_null "value": BINARY,
-        }))
+        DataType::Variant(
+            schema! {
+                not_null "metadata": BINARY,
+                not_null "value": BINARY,
+            }
+            .into(),
+        )
     }
 
     /// Create a new [`DataType::File`] with the canonical physical layout: a struct of six
@@ -2883,7 +3085,7 @@ impl DataType {
     /// `checksum`: STRING, `inline`: BINARY. Like Variant, the type identity is carried in the
     /// Delta schema; physically a `file` is this struct.
     pub fn file_type() -> Self {
-        DataType::File(Box::new(FILE_FIELDS.clone()))
+        DataType::File(FILE_FIELDS.clone().into())
     }
 
     /// Create a new [`DataType::Variant`] from the provided fields. For unshredded variants, you
@@ -2891,8 +3093,8 @@ impl DataType {
     pub fn variant_type(fields: impl IntoIterator<Item = StructField>) -> KernelResult<Self> {
         // Different from regular StructTypes, Variants are not allowed to contain metadata columns
         // at all, so we also need to check their top-level primitive types.
-        Ok(DataType::Variant(Box::new(StructType::try_from_results(
-            fields.into_iter().map(|field| {
+        Ok(DataType::Variant(
+            StructType::try_from_results(fields.into_iter().map(|field| {
                 if field.is_metadata_column() {
                     Err(KernelError::schema(
                         "Metadata columns are not allowed in Variant types".to_string(),
@@ -2900,8 +3102,9 @@ impl DataType {
                 } else {
                     Ok(field)
                 }
-            }),
-        )?)))
+            }))?
+            .into(),
+        ))
     }
 
     /// Attempt to convert this data type to a [`PrimitiveType`]. Returns `None` if this is a
@@ -4091,7 +4294,7 @@ mod tests {
         let DataType::Array(atype) = physical_field.data_type else {
             panic!("Expected an Array");
         };
-        let DataType::Struct(stype) = atype.element_type else {
+        let DataType::Struct(stype) = unbox_data_type(atype).element_type else {
             panic!("Expected a Struct");
         };
         let struct_field = stype.fields.get_index(0).unwrap().1;
@@ -4371,7 +4574,7 @@ mod tests {
                 let DataType::Array(atype) = physical_field.data_type else {
                     panic!("Expected an Array");
                 };
-                let DataType::Struct(stype) = atype.element_type else {
+                let DataType::Struct(stype) = unbox_data_type(atype).element_type else {
                     panic!("Expected a Struct");
                 };
 
@@ -5199,7 +5402,7 @@ mod tests {
             type_name: "struct".into(),
             fields: [(
                 nested_field_with_metadata.name.clone(),
-                Arc::new(nested_field_with_metadata),
+                unbudgeted_field(nested_field_with_metadata),
             )]
             .into_iter()
             .collect(),
@@ -5224,7 +5427,7 @@ mod tests {
             type_name: "struct".into(),
             fields: [(
                 nested_field_with_metadata.name.clone(),
-                Arc::new(nested_field_with_metadata),
+                unbudgeted_field(nested_field_with_metadata),
             )]
             .into_iter()
             .collect(),
@@ -5250,7 +5453,7 @@ mod tests {
             type_name: "struct".into(),
             fields: [(
                 nested_field_with_metadata.name.clone(),
-                Arc::new(nested_field_with_metadata),
+                unbudgeted_field(nested_field_with_metadata),
             )]
             .into_iter()
             .collect(),

@@ -307,7 +307,7 @@ impl SyncPlanExecutor {
                 ArrowEngineData::new(batch.clone()),
             )))
         }))?;
-        put_bytes(self.storage.store(), file_path, bytes.into(), *overwrite)?;
+        put_bytes(self.storage.store(), file_path, bytes, *overwrite)?;
         let meta = self.storage.head(file_path)?;
         let size = i64::try_from(meta.size)
             .map_err(|_| KernelError::generic("Written file size exceeds LONG range"))?;
@@ -562,7 +562,7 @@ fn eval_project(project: Project, input: &[RecordBatch]) -> KernelResult<Vec<Rec
     let evaluator = ArrowEvaluationHandler.new_expression_evaluator(
         input_schema,
         project.expr,
-        project.schema.as_ref().clone().into(),
+        project.schema.as_ref().try_clone()?.into(),
     )?;
     input
         .iter()

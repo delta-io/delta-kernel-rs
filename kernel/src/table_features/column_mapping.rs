@@ -232,9 +232,9 @@ pub(crate) fn validate_and_extract_column_mapping_annotations<'a>(
     }
 
     let annotation = ColumnMetadataKey::ColumnMappingPhysicalName.as_ref();
-    let physical_name = match (mode, physical_name_meta) {
+    let physical_name = match (mode, physical_name_meta.map(MetadataValue::as_string)) {
         (ColumnMappingMode::None, None) => field.name(),
-        (ColumnMappingMode::Name | ColumnMappingMode::Id, Some(MetadataValue::String(s))) => s,
+        (ColumnMappingMode::Name | ColumnMappingMode::Id, Some(Some(name))) => name,
         (ColumnMappingMode::Name | ColumnMappingMode::Id, Some(_)) => {
             return Err(KernelError::schema(format!(
                 "The {annotation} annotation on field '{}' must be a string",
@@ -330,7 +330,7 @@ pub(crate) fn validate_and_extract_column_mapping_annotations<'a>(
         // the same `physicalName`.
         if let Some(siblings) = current_field_siblings {
             siblings
-                .insert(physical_name.as_str(), field.name().as_str())
+                .insert(physical_name, field.name().as_str())
                 .map_or(Ok(()), |prev| {
                     Err(KernelError::schema(format!(
                         "Duplicate `delta.columnMapping.physicalName` '{physical_name}' \
@@ -764,8 +764,9 @@ fn expect_physical_name(field: &StructField) -> KernelResult<String> {
     match field
         .metadata
         .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
+        .and_then(MetadataValue::as_string)
     {
-        Some(MetadataValue::String(s)) => Ok(s.clone()),
+        Some(s) => Ok(s.to_owned()),
         _ => Err(KernelError::internal_error(format!(
             "Expect field '{}' to have a physical name annotation",
             field.name,
@@ -826,9 +827,10 @@ impl<'a> SchemaTransform<'a> for MaxColumnId {
                 }
             }
             // A `file` held in an Array/Map slot reserves the ids after the slot's id.
-            if let Some(MetadataValue::String(physical_name)) = field
+            if let Some(physical_name) = field
                 .metadata()
                 .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
+                .and_then(MetadataValue::as_string)
             {
                 let mut file_slots = Vec::new();
                 collect_file_slot_paths(&field.data_type, physical_name, &mut file_slots);
@@ -2805,11 +2807,14 @@ mod tests {
     /// top-level `v=4`.
     #[test]
     fn find_max_column_id_variant_recurses_into_inner_fields() {
-        let variant = DataType::Variant(Box::new(schema! {
-            (field_with_id("metadata", DataType::BINARY, 10)),
-            (field_with_id("value", DataType::BINARY, 20)),
-            (field_with_id("shred", DataType::STRING, 23)),
-        }));
+        let variant = DataType::Variant(
+            schema! {
+                (field_with_id("metadata", DataType::BINARY, 10)),
+                (field_with_id("value", DataType::BINARY, 20)),
+                (field_with_id("shred", DataType::STRING, 23)),
+            }
+            .into(),
+        );
         let schema = schema! { (field_with_id("v", variant, 4)) };
         assert_eq!(find_max_column_id_in_schema(&schema), Some(23));
     }

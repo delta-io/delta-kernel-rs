@@ -47,6 +47,11 @@ pub(crate) trait Deduplicator {
     /// to track new files. Returns `true` if the file should be filtered out.
     fn check_and_record_seen(&mut self, key: FileActionKey) -> bool;
 
+    /// Fallible recording used by replay visitors before accepting an action.
+    fn try_check_and_record_seen(&mut self, key: FileActionKey) -> KernelResult<bool> {
+        Ok(self.check_and_record_seen(key))
+    }
+
     /// Returns `true` for commit log batches (updates hashmap), `false` for checkpoints
     /// (read-only).
     fn is_log_batch(&self) -> bool;
@@ -106,6 +111,8 @@ pub(crate) trait Deduplicator {
 #[allow(unused)]
 pub(crate) struct CheckpointDeduplicator<'a> {
     seen_file_keys: &'a HashSet<FileActionKey>,
+    #[cfg(feature = "limited-memory")]
+    limited_keys: Option<&'a crate::memory::FileKeySet>,
     add_path_index: usize,
     add_size_index: usize,
     add_dv_start_index: usize,
@@ -114,6 +121,12 @@ pub(crate) struct CheckpointDeduplicator<'a> {
 }
 
 impl<'a> CheckpointDeduplicator<'a> {
+    #[cfg(feature = "limited-memory")]
+    pub(crate) fn with_limited_keys(mut self, keys: Option<&'a crate::memory::FileKeySet>) -> Self {
+        self.limited_keys = keys;
+        self
+    }
+
     #[allow(unused)]
     pub(crate) fn try_new(
         seen_file_keys: &'a HashSet<FileActionKey>,
@@ -124,6 +137,8 @@ impl<'a> CheckpointDeduplicator<'a> {
     ) -> KernelResult<Self> {
         Ok(CheckpointDeduplicator {
             seen_file_keys,
+            #[cfg(feature = "limited-memory")]
+            limited_keys: None,
             add_path_index,
             add_size_index,
             add_dv_start_index,
@@ -163,6 +178,10 @@ impl Deduplicator for CheckpointDeduplicator<'_> {
 
     /// Read-only check against seen set. Returns `true` if file should be filtered out.
     fn check_and_record_seen(&mut self, key: FileActionKey) -> bool {
+        #[cfg(feature = "limited-memory")]
+        if let Some(keys) = self.limited_keys {
+            return keys.contains(key.path(), key.dv_unique_id());
+        }
         self.seen_file_keys.contains(&key)
     }
 

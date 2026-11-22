@@ -390,10 +390,9 @@ fn has_added_ancestor(path: &ColumnName, added_ancestor_paths: &HashSet<ColumnNa
 
 /// Gets the physical name of a field if present
 fn physical_name(field: &StructField) -> Option<&str> {
-    match field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
-        Some(MetadataValue::String(s)) => Some(s.as_str()),
-        _ => None,
-    }
+    field
+        .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
+        .and_then(MetadataValue::as_string)
 }
 
 /// Validates that physical names are consistent between two versions of the same field.

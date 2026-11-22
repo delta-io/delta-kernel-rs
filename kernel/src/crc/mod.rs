@@ -300,7 +300,10 @@ impl Crc {
     /// Returns an error for malformed JSON or invalid counts, statistics, or histogram fields.
     #[internal_api]
     pub(crate) fn try_from_json_bytes(bytes: &[u8], version: Version) -> KernelResult<Self> {
+        #[cfg(not(feature = "limited-memory"))]
         let raw: CrcRaw = serde_json::from_slice(bytes)?;
+        #[cfg(feature = "limited-memory")]
+        let raw: CrcRaw = crate::memory::decode_json(bytes)?;
         // Per the Delta protocol spec, numMetadata and numProtocol MUST be 1 in any CRC file.
         // Reject malformed files at the deserialization boundary so callers can trust the value.
         for (name, value) in [

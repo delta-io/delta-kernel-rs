@@ -1,11 +1,14 @@
 //! This module contains logic to compute the expected schema for file statistics
 
 mod column_filter;
-
+#[cfg(feature = "limited-memory")]
+mod limited;
 use std::borrow::Cow;
 
 use column_filter::StatsColumnFilter;
 pub(crate) use column_filter::StatsConfig;
+#[cfg(feature = "limited-memory")]
+pub(crate) use limited::strip_metadata as try_strip_metadata;
 
 use crate::KernelResult;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS};
@@ -150,6 +153,19 @@ use crate::transforms::{SchemaTransform, transform_output_type};
 ///   columns that also pass the `config` filtering will be included.
 #[allow(unused)]
 pub(crate) fn expected_stats_schema(
+    data_schema: &Schema,
+    config: &StatsConfig<'_>,
+    required_columns: Option<&[ColumnName]>,
+    requested_columns: Option<&[ColumnName]>,
+) -> KernelResult<Schema> {
+    #[cfg(feature = "limited-memory")]
+    if crate::memory::MemoryBudget::current().is_some() {
+        return limited::expected(data_schema, config, required_columns, requested_columns);
+    }
+    expected_stats_schema_unbounded(data_schema, config, required_columns, requested_columns)
+}
+
+fn expected_stats_schema_unbounded(
     data_schema: &Schema,
     config: &StatsConfig<'_>,
     required_columns: Option<&[ColumnName]>,
@@ -465,6 +481,23 @@ mod tests {
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
     use crate::table_properties::TableProperties;
+
+    #[cfg(feature = "limited-memory")]
+    fn expected_stats_schema(
+        schema: &Schema,
+        config: &StatsConfig<'_>,
+        required: Option<&[ColumnName]>,
+        requested: Option<&[ColumnName]>,
+    ) -> KernelResult<Schema> {
+        let expected = super::expected_stats_schema(schema, config, required, requested)?;
+        let budget = crate::memory::MemoryBudget::new(64 * 1024 * 1024);
+        let actual =
+            budget.with(|| super::limited::expected(schema, config, required, requested))?;
+        assert_eq!(actual, expected);
+        drop(actual);
+        assert_eq!(budget.usage().reserved, 0);
+        Ok(expected)
+    }
 
     #[cfg(feature = "geo-type-in-dev")]
     #[rstest]

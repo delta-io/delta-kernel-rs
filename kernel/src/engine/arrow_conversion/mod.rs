@@ -1232,9 +1232,13 @@ mod tests {
     /// file with a different field set, is rejected rather than silently converted.
     #[test]
     fn test_non_canonical_file_schema_is_rejected() {
-        let non_canonical = DataType::File(Box::new(crate::schema::StructType::new_unchecked([
-            crate::schema::StructField::nullable("uri", DataType::STRING),
-        ])));
+        let non_canonical = DataType::File(
+            crate::schema::StructType::new_unchecked([crate::schema::StructField::nullable(
+                "uri",
+                DataType::STRING,
+            )])
+            .into(),
+        );
         let err = ArrowDataType::try_from_kernel(&non_canonical).unwrap_err();
         assert!(
             err.to_string().contains("Only the canonical file schema"),

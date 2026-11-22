@@ -221,7 +221,7 @@ fn list_and_destructure(
 ) {
     let r = LogSegmentFiles::list(storage, log_root, log_tail, start_version, end_version).unwrap();
     (
-        r.ascending_commit_files,
+        r.ascending_commit_files.into_iter().collect::<Vec<_>>(),
         r.ascending_compaction_files,
         r.checkpoint_parts,
         r.latest_crc_file,

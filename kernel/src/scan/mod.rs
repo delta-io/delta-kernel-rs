@@ -490,6 +490,8 @@ impl PartitionValuesOptions {
 ///
 /// [scan guide]: https://docs.delta.io/kernel/rust/reading/building_a_scan.html
 pub struct ScanBuilder {
+    #[cfg(feature = "limited-memory")]
+    allocator: Option<crate::memory::LimitedAllocator>,
     snapshot: SnapshotRef,
     logical_read_schema: Option<SchemaRef>,
     predicate: Option<PredicateRef>,
@@ -516,8 +518,13 @@ impl std::fmt::Debug for ScanBuilder {
 impl ScanBuilder {
     /// Create a new [`ScanBuilder`] instance.
     pub fn new(snapshot: impl Into<SnapshotRef>) -> Self {
+        let snapshot = snapshot.into();
         Self {
-            snapshot: snapshot.into(),
+            #[cfg(feature = "limited-memory")]
+            allocator: snapshot.memory_allocator().cloned().or_else(|| {
+                crate::memory::MemoryBudget::current().map(|budget| budget.allocator())
+            }),
+            snapshot,
             logical_read_schema: None,
             predicate: None,
             stats: StatsOptions::default(),
@@ -526,6 +533,17 @@ impl ScanBuilder {
             partition_values_options: PartitionValuesOptions::default(),
             cancellation_token: None,
         }
+    }
+
+    /// Select the allocator for new participating scan storage, including lazy log replay.
+    ///
+    /// By default the scan inherits the snapshot's allocator. An override leaves shared snapshot
+    /// storage charged to its original owner. The allocator survives moving the scan or its
+    /// metadata iterator to another thread. Engine buffers remain outside this partial cap.
+    #[cfg(feature = "limited-memory")]
+    pub fn with_allocator(mut self, allocator: crate::memory::LimitedAllocator) -> Self {
+        self.allocator = Some(allocator);
+        self
     }
 
     /// Provide [`Schema`] for columns to select from the [`Snapshot`].
@@ -673,6 +691,8 @@ impl ScanBuilder {
     /// perform actual data reads.
     #[tracing::instrument(name = "scan_builder.build", skip_all, fields(enable_call_frame), err)]
     pub fn build(self) -> Result<Scan> {
+        #[cfg(feature = "limited-memory")]
+        let _scope = crate::memory::AllocationScope::new(self.allocator.as_ref());
         // Predicates may reference columns outside self.logical_read_schema, so resolve against the
         // full table schema
         let table_schema = self.snapshot.schema();
@@ -1064,6 +1084,12 @@ impl std::fmt::Debug for Scan {
 }
 
 impl Scan {
+    /// Return the allocator retained for new participating scan allocations.
+    #[cfg(feature = "limited-memory")]
+    pub fn memory_allocator(&self) -> Option<&crate::memory::LimitedAllocator> {
+        self.state_info.allocator.as_ref()
+    }
+
     /// Whether stats reading is entirely skipped, disabling internal data skipping.
     fn skip_stats(&self) -> bool {
         !self.stats.synthesize_json && matches!(self.stats.struct_stats, StructStats::None)
@@ -1409,6 +1435,8 @@ impl Scan {
         engine: &dyn Engine,
         operation: impl FnOnce(&dyn Engine) -> T,
     ) -> T {
+        #[cfg(feature = "limited-memory")]
+        let _scope = crate::memory::AllocationScope::new(self.memory_allocator());
         let scoped_engine = self
             .cancellation_token
             .clone()
@@ -1461,7 +1489,10 @@ impl Scan {
             info!(%event);
             emit_scan_metadata_completed(&event);
         };
-        Ok(iter.into_iter().flatten().on_complete(on_complete))
+        let iter = iter.into_iter().flatten().on_complete(on_complete);
+        #[cfg(feature = "limited-memory")]
+        let iter = crate::memory::AllocatedIterator::new(iter, self.memory_allocator().cloned());
+        Ok(iter)
     }
 
     #[cfg(feature = "declarative-plans")]
@@ -1496,6 +1527,8 @@ impl Scan {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<Plan>> {
+        #[cfg(feature = "limited-memory")]
+        let _scope = crate::memory::AllocationScope::new(self.memory_allocator());
         // TODO(#3609): Support connector-supplied timezone in declarative metadata scans.
         require!(
             !table_requires_timestamp_timezone_support(
@@ -1719,6 +1752,8 @@ impl Scan {
         &self,
         engine: Arc<dyn Engine>,
     ) -> KernelResult<SequentialScanMetadata> {
+        #[cfg(feature = "limited-memory")]
+        let _scope = crate::memory::AllocationScope::new(self.memory_allocator());
         // The scan token is not carried across distributed phases.
         if self.cancellation_token.is_some() {
             return Err(KernelError::unsupported(
@@ -1788,6 +1823,8 @@ impl Scan {
         &self,
         engine: Arc<dyn Engine>,
     ) -> KernelResult<impl KernelResultIterator<Box<dyn EngineData>> + use<>> {
+        #[cfg(feature = "limited-memory")]
+        let _scope = crate::memory::AllocationScope::new(self.memory_allocator());
         if self.state_info.skip_row_transforms {
             return Err(KernelError::unsupported(
                 "Scan::execute is not supported when row transforms are disabled by \
@@ -1892,6 +1929,9 @@ impl Scan {
             .flatten_ok()
             // Iterator<Result<Result<Box<dyn EngineData>>>> to Iterator<Result<Box<dyn EngineData>>>
             .map(KernelResult::flatten);
+        #[cfg(feature = "limited-memory")]
+        let result =
+            crate::memory::AllocatedIterator::new(result, self.memory_allocator().cloned());
         Ok(result)
     }
 }

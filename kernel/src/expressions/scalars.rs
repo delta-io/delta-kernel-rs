@@ -854,6 +854,13 @@ impl From<Arc<String>> for Scalar {
     }
 }
 
+#[cfg(feature = "limited-memory")]
+impl From<crate::memory::SharedString> for Scalar {
+    fn from(value: crate::memory::SharedString) -> Self {
+        Self::String(value.into_global())
+    }
+}
+
 // NOTE: We "cheat" and use the macro support trait `ToDataType`
 impl<T: IntoScalar> From<Option<T>> for Scalar {
     fn from(t: Option<T>) -> Self {

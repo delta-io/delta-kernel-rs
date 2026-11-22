@@ -249,6 +249,8 @@ impl CommitRangeBuilder {
         .ascending_commit_files;
         let last_version = commit_files.last().ok_or(KernelError::EmptyLog)?.version;
         let end_version = configured_end_version.unwrap_or(last_version);
+        #[cfg(feature = "limited-memory")]
+        let commit_files = commit_files.into_iter().collect();
         Ok((commit_files, end_version))
     }
 

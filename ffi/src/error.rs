@@ -91,6 +91,8 @@ pub enum FFIKernelError {
     InvalidIntervalError = 56,
     UnsupportedFileUriError = 57,
     UnsupportedReferencedFilePathError = 58,
+    #[cfg(feature = "limited-memory")]
+    MemoryBudgetError = 59,
 }
 
 impl From<KernelError> for FFIKernelError {
@@ -102,6 +104,8 @@ impl From<KernelError> for FFIKernelError {
 impl From<&KernelError> for FFIKernelError {
     fn from(e: &KernelError) -> Self {
         match e {
+            #[cfg(feature = "limited-memory")]
+            KernelError::Memory(_) => FFIKernelError::MemoryBudgetError,
             // NOTE: By definition, no KernelError maps to FFIError
             #[cfg(feature = "default-engine-base")]
             KernelError::Arrow(_) => FFIKernelError::ArrowError,
@@ -331,6 +335,10 @@ impl From<EngineExecError> for KernelError {
         // consumed exactly once, here.
         let message = *unsafe { message.into_inner() };
         match etype {
+            #[cfg(feature = "limited-memory")]
+            code @ FFIKernelError::MemoryBudgetError => {
+                KernelError::generic(format!("engine execution error ({code:?}): {message}"))
+            }
             FFIKernelError::CheckpointWriteError => KernelError::CheckpointWrite(message),
             FFIKernelError::EngineDataTypeError => KernelError::EngineDataType(message),
             FFIKernelError::GenericError => KernelError::Generic(message),

@@ -160,7 +160,14 @@ pub fn extract_kernel_schema(
             "Didn't consume all visited fields, schema is invalid.",
         ))
     } else {
-        Ok(*struct_type)
+        #[cfg(feature = "limited-memory")]
+        {
+            Ok(struct_type.into_inner())
+        }
+        #[cfg(not(feature = "limited-memory"))]
+        {
+            Ok(*struct_type)
+        }
     }
 }
 

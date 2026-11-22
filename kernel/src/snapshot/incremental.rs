@@ -558,7 +558,9 @@ impl Snapshot {
         };
         let combined_log_segment = LogSegment::try_new_for_snapshot(
             LogSegmentFiles {
-                ascending_commit_files,
+                ascending_commit_files: crate::log_segment_files::commit_files(
+                    ascending_commit_files,
+                ),
                 ascending_compaction_files,
                 checkpoint_parts: new_checkpoint_parts,
                 latest_crc_file: crc_file,
@@ -590,11 +592,14 @@ impl Snapshot {
     ) -> Arc<Snapshot> {
         if existing.built_as_latest == built_as_latest
             && existing.skipped_new_checkpoints == skipped_new_checkpoints
+            && Self::same_allocation_owner(existing)
         {
             return existing.clone();
         }
         Arc::new(Self {
             span: existing.span.clone(),
+            #[cfg(feature = "limited-memory")]
+            allocator: crate::memory::MemoryBudget::current().map(|budget| budget.allocator()),
             log_segment: existing.log_segment.clone(),
             table_configuration: existing.table_configuration.clone(),
             crc: existing.crc.clone(),
@@ -610,6 +615,22 @@ impl Snapshot {
             #[cfg(feature = "adaptive-metadata-in-dev")]
             last_manifest_commit: existing.last_manifest_commit.clone(),
         })
+    }
+
+    fn same_allocation_owner(_existing: &Snapshot) -> bool {
+        #[cfg(feature = "limited-memory")]
+        {
+            match (
+                _existing.memory_allocator(),
+                crate::memory::MemoryBudget::current(),
+            ) {
+                (None, None) => true,
+                (Some(allocator), Some(budget)) => allocator.budget().ptr_eq(&budget),
+                _ => false,
+            }
+        }
+        #[cfg(not(feature = "limited-memory"))]
+        true
     }
 
     /// Determine the on-disk CRC file the combined segment should carry.

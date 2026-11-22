@@ -1,6 +1,8 @@
 //! FFI interfaces for snapshot construction and metadata access.
 
 mod builder;
+#[cfg(feature = "limited-memory")]
+pub use builder::snapshot_builder_with_memory_budget;
 pub mod hint;
 
 pub use builder::{

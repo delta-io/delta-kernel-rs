@@ -44,6 +44,8 @@ pub(crate) fn read_crc_file_or_none(
     match try_read_crc_file(engine, crc_file) {
         Ok(crc) => Ok(Some(Arc::new(crc))),
         Err(KernelError::Cancelled) => Err(KernelError::Cancelled),
+        #[cfg(feature = "limited-memory")]
+        Err(error) if matches!(error.without_backtrace(), KernelError::Memory(_)) => Err(error),
         Err(_) => Ok(None),
     }
 }
@@ -70,6 +72,25 @@ mod tests {
     fn test_table_root(dir: &str) -> url::Url {
         let path = std::fs::canonicalize(PathBuf::from(dir)).unwrap();
         url::Url::from_directory_path(path).unwrap()
+    }
+
+    #[cfg(feature = "limited-memory")]
+    #[test]
+    fn optional_crc_budget_exhaustion_does_not_fall_back_to_replay() {
+        let root = test_table_root("./tests/data/crc-full/");
+        let path = ParsedLogPath::create_parsed_crc(&root, 0);
+        let bytes = std::fs::read(path.location.as_url().to_file_path().unwrap()).unwrap();
+        let budget = crate::memory::MemoryBudget::new(0);
+        let decoded = budget.with(|| Crc::try_from_json_bytes(&bytes, 0));
+        assert!(
+            matches!(decoded, Err(ref error) if matches!(error.without_backtrace(), KernelError::Memory(_)))
+        );
+        let read = budget.with(|| read_crc_file_or_none(&SyncEngine::new(), &path));
+        assert!(
+            matches!(read, Err(ref error) if matches!(error.without_backtrace(), KernelError::Memory(_)))
+        );
+        assert_eq!(budget.usage().reserved, 0);
+        assert!(budget.usage().rejected > 0);
     }
 
     #[rstest::rstest]

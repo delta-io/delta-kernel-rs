@@ -166,7 +166,11 @@ fn get_segment(
         start_version,
         end_version,
     )?;
-    Ok(log_segment.listed.ascending_commit_files)
+    Ok(log_segment
+        .listed
+        .ascending_commit_files
+        .into_iter()
+        .collect())
 }
 
 fn result_to_sv(iter: impl Iterator<Item = Result<TableChangesScanMetadata>> + Send) -> Vec<bool> {

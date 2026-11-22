@@ -26,6 +26,34 @@ use crate::{KernelError, KernelResult, KernelResultIterator, StorageHandler, Ver
 #[cfg(test)]
 mod tests;
 
+#[cfg(feature = "limited-memory")]
+type CommitFiles = crate::memory::RetainedVec<ParsedLogPath>;
+#[cfg(not(feature = "limited-memory"))]
+type CommitFiles = Vec<ParsedLogPath>;
+
+pub(crate) fn commit_files(files: Vec<ParsedLogPath>) -> CommitFiles {
+    #[cfg(feature = "limited-memory")]
+    {
+        files.into()
+    }
+    #[cfg(not(feature = "limited-memory"))]
+    {
+        files
+    }
+}
+
+pub(crate) fn push_commit(files: &mut CommitFiles, file: ParsedLogPath) -> KernelResult<()> {
+    #[cfg(feature = "limited-memory")]
+    {
+        files.try_push(file)?;
+    }
+    #[cfg(not(feature = "limited-memory"))]
+    {
+        files.push(file);
+    }
+    Ok(())
+}
+
 /// Represents the set of log files found during a listing operation in the Delta log directory.
 ///
 /// - `ascending_commit_files`: All commit and staged commit files found, sorted by version. May
@@ -45,7 +73,7 @@ mod tests;
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 #[internal_api]
 pub(crate) struct LogSegmentFiles {
-    pub ascending_commit_files: Vec<ParsedLogPath>,
+    pub ascending_commit_files: CommitFiles,
     pub ascending_compaction_files: Vec<ParsedLogPath>,
     pub checkpoint_parts: Vec<ParsedLogPath>,
     pub latest_crc_file: Option<ParsedLogPath>,
@@ -308,12 +336,12 @@ struct ListingAccumulator {
 }
 
 impl ListingAccumulator {
-    fn process_file(&mut self, file: ParsedLogPath) {
+    fn process_file(&mut self, file: ParsedLogPath) -> KernelResult<()> {
         if !should_process_log_file(&file) {
-            return;
+            return Ok(());
         }
         match file.file_type {
-            Commit | StagedCommit => self.output.ascending_commit_files.push(file),
+            Commit | StagedCommit => push_commit(&mut self.output.ascending_commit_files, file)?,
             CompactedCommit { hi } if self.end_version.is_none_or(|end| hi <= end) => {
                 self.output.ascending_compaction_files.push(file);
             }
@@ -334,6 +362,7 @@ impl ListingAccumulator {
                 );
             }
         }
+        Ok(())
     }
 
     /// Called before processing each new file. If `file_version` differs from the current
@@ -456,7 +485,7 @@ impl LogSegmentFiles {
             }
 
             acc.maybe_flush_and_advance(file.version);
-            acc.process_file(file);
+            acc.process_file(file)?;
         }
 
         // Phase 2: Process log_tail entries. We do this after Phase 1 because log_tail commits
@@ -479,7 +508,7 @@ impl LogSegmentFiles {
             }
 
             acc.maybe_flush_and_advance(file.version);
-            acc.process_file(file);
+            acc.process_file(file)?;
         }
 
         // Flush the final group
@@ -499,7 +528,7 @@ impl LogSegmentFiles {
         Ok(acc.output)
     }
 
-    pub(crate) fn ascending_commit_files(&self) -> &Vec<ParsedLogPath> {
+    pub(crate) fn ascending_commit_files(&self) -> &CommitFiles {
         &self.ascending_commit_files
     }
 
@@ -510,7 +539,7 @@ impl LogSegmentFiles {
             .filter(|f| f.file_type == LogPathFileType::StagedCommit)
     }
 
-    pub(crate) fn ascending_commit_files_mut(&mut self) -> &mut Vec<ParsedLogPath> {
+    pub(crate) fn ascending_commit_files_mut(&mut self) -> &mut CommitFiles {
         &mut self.ascending_commit_files
     }
 
@@ -567,7 +596,7 @@ impl LogSegmentFiles {
         let fs_iter = list_delta_log_from_storage(storage, log_root, start, end)?;
 
         let log_tail_start_version = log_tail.first().map(|f| f.version);
-        let mut listed_commits = Vec::new();
+        let mut listed_commits = CommitFiles::new();
         let mut max_published_version: Option<Version> = None;
         // Filesystem commits, skipping any covered by the log_tail.
         for file_result in fs_iter {
@@ -580,7 +609,7 @@ impl LogSegmentFiles {
                 continue;
             }
             should_process_log_file(&file); // warns if 0 bytes
-            listed_commits.push(file);
+            push_commit(&mut listed_commits, file)?;
         }
 
         // Log_tail commits, extending the filesystem prefix in ascending order.
@@ -591,7 +620,7 @@ impl LogSegmentFiles {
             if file.file_type == LogPathFileType::Commit {
                 max_published_version = max_published_version.max(Some(file.version));
             }
-            listed_commits.push(file);
+            push_commit(&mut listed_commits, file)?;
         }
 
         let latest_commit_file = listed_commits.last().cloned();

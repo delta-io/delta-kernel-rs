@@ -187,6 +187,8 @@ mod tests {
     ) -> StateInfo {
         let physical_schema = create_test_physical_schema();
         StateInfo {
+            #[cfg(feature = "limited-memory")]
+            allocator: None,
             logical_schema,
             physical_schema: physical_schema.into(),
             physical_predicate: PhysicalPredicate::None,
@@ -415,6 +417,8 @@ mod tests {
         let transform_spec = vec![];
 
         let state_info = StateInfo {
+            #[cfg(feature = "limited-memory")]
+            allocator: None,
             logical_schema,
             physical_schema: physical_schema.clone().into(),
             physical_predicate: PhysicalPredicate::None,

@@ -24,7 +24,22 @@ pub enum Operation {
 }
 
 impl Operation {
+    /// Serializes directly into owned wire storage, returning an allocation error on exhaustion.
+    ///
+    /// With `limited-memory`, the active shared budget owns the returned bytes until their final
+    /// clone is released. Encoding borrows this operation rather than constructing a protobuf copy.
+    pub fn try_to_proto_bytes(&self) -> crate::KernelResult<Bytes> {
+        #[cfg(feature = "limited-memory")]
+        if let Some(budget) = crate::memory::MemoryBudget::current() {
+            return crate::plans::proto::limited_encode::encode(self, &budget);
+        }
+        Ok(self.to_proto_bytes().into())
+    }
+
     /// Serializes this [`Operation`] into its proto wire representation.
+    ///
+    /// This infallible convenience method does not enforce an allocation budget. Kernel engine
+    /// boundaries use [`Self::try_to_proto_bytes`] to propagate allocation failures.
     pub fn to_proto_bytes(&self) -> Vec<u8> {
         use prost::Message as _;
         crate::plans::proto::operation::Operation::from(self).encode_to_vec()

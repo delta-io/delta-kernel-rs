@@ -43,6 +43,8 @@ pub struct FromSnapshot;
 /// # }
 /// ```
 pub struct SnapshotBuilder<Mode = FromTableRoot> {
+    #[cfg(feature = "limited-memory")]
+    allocator: Option<crate::memory::LimitedAllocator>,
     table_root: Option<String>,
     existing_snapshot: Option<SnapshotRef>,
     version: Option<Version>,
@@ -140,6 +142,8 @@ impl SnapshotBuilder<FromTableRoot> {
 
     pub(crate) fn new_for(table_root: impl AsRef<str>) -> Self {
         Self {
+            #[cfg(feature = "limited-memory")]
+            allocator: crate::memory::MemoryBudget::current().map(|budget| budget.allocator()),
             table_root: Some(table_root.as_ref().to_string()),
             existing_snapshot: None,
             version: None,
@@ -184,6 +188,8 @@ impl SnapshotBuilder<FromTableRoot> {
 impl SnapshotBuilder<FromSnapshot> {
     pub(crate) fn new_from(existing_snapshot: SnapshotRef) -> Self {
         Self {
+            #[cfg(feature = "limited-memory")]
+            allocator: existing_snapshot.memory_allocator().cloned(),
             table_root: None,
             existing_snapshot: Some(existing_snapshot),
             version: None,
@@ -216,6 +222,17 @@ impl SnapshotBuilder<FromSnapshot> {
 }
 
 impl<Mode> SnapshotBuilder<Mode> {
+    /// Retain an allocator for participating snapshot storage and subsequent operations.
+    ///
+    /// Derived scans and transactions inherit it across threads. Existing storage reused from a
+    /// prior snapshot keeps its original owner; this only selects the owner of new allocations.
+    /// Engine allocations and Kernel storage not yet using this allocator remain outside its cap.
+    #[cfg(feature = "limited-memory")]
+    pub fn with_allocator(mut self, allocator: crate::memory::LimitedAllocator) -> Self {
+        self.allocator = Some(allocator);
+        self
+    }
+
     // ============================================================================
     // Chainable configuration
     // ============================================================================
@@ -362,6 +379,8 @@ impl<Mode> SnapshotBuilder<Mode> {
         err
     )]
     pub fn build(self, engine: &dyn Engine) -> Result<SnapshotRef> {
+        #[cfg(feature = "limited-memory")]
+        let _scope = crate::memory::AllocationScope::new(self.allocator.as_ref());
         // Fold the context into the message string rather than passing structured fields: this
         // `info!` fires inside the `snap.build` metrics span, where any field the
         // `SnapshotBuildSuccess` event doesn't recognize would trip a spurious "Invalid field"
@@ -379,6 +398,8 @@ impl<Mode> SnapshotBuilder<Mode> {
 
         // Destructure self so fields can be moved independently
         let Self {
+            #[cfg(feature = "limited-memory")]
+                allocator: _,
             table_root,
             existing_snapshot,
             version,

@@ -111,8 +111,19 @@ impl TransactionBuilder<UpdateTable> {
         engine_info: String,
         data_change: bool,
     ) -> Self {
+        #[cfg(feature = "limited-memory")]
+        let allocator = snapshot
+            .memory_allocator()
+            .cloned()
+            .or_else(|| crate::memory::MemoryBudget::current().map(|budget| budget.allocator()));
+        let common_state = TransactionBuilderState::new(engine_info, data_change);
+        #[cfg(feature = "limited-memory")]
+        let common_state = TransactionBuilderState {
+            allocator,
+            ..common_state
+        };
         Self {
-            common_state: TransactionBuilderState::new(engine_info, data_change),
+            common_state,
             local_state: UpdateTableBuilderState {
                 snapshot,
                 operation,
@@ -283,6 +294,8 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         engine: &dyn Engine,
         committer: Box<dyn Committer>,
     ) -> Result<Transaction<UpdateTable, MODE>> {
+        #[cfg(feature = "limited-memory")]
+        let _scope = crate::memory::AllocationScope::new(self.common_state.allocator.as_ref());
         self.validate()?;
         let transaction = try_new_update_table(self, committer, engine)?;
         transaction.validate_domain_metadata_operations()?;

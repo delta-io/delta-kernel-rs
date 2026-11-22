@@ -1,0 +1,193 @@
+{
+  "global_peak_requested_rust_bytes": 304677091,
+  "limited_live_at_global_peak": 13328,
+  "limited_fraction_at_global_peak": 4.374467393086669e-05,
+  "groups": {
+    "schema_structures": 286073010,
+    "other": 15910457,
+    "log_descriptors_and_urls": 2680296,
+    "limited_allocator": 13328
+  },
+  "largest_sites": [
+    {
+      "bytes": 100791936,
+      "category": "schema_structures",
+      "frames": [
+        "<alloc::raw_vec::RawVec<delta_kernel::plans::proto::schema::StructField>>::with_capacity_in",
+        "<alloc::vec::Vec<delta_kernel::plans::proto::schema::StructField>>::with_capacity_in",
+        "<alloc::vec::Vec<delta_kernel::plans::proto::schema::StructField>>::with_capacity"
+      ]
+    },
+    {
+      "bytes": 53761008,
+      "category": "schema_structures",
+      "frames": [
+        "<alloc::boxed::Box<delta_kernel::schema::StructField>>::new",
+        "<delta_kernel::memory::owned::Owned<delta_kernel::schema::StructField>>::unbudgeted",
+        "delta_kernel::schema::unbudgeted_field"
+      ]
+    },
+    {
+      "bytes": 26877312,
+      "category": "schema_structures",
+      "frames": [
+        "<alloc::raw_vec::RawVec<delta_kernel::plans::proto::schema::StructField>>::with_capacity_in",
+        "<alloc::vec::Vec<delta_kernel::plans::proto::schema::StructField>>::with_capacity_in",
+        "<alloc::vec::Vec<delta_kernel::plans::proto::schema::StructField>>::with_capacity"
+      ]
+    },
+    {
+      "bytes": 20160000,
+      "category": "schema_structures",
+      "frames": [
+        "<alloc::boxed::Box<delta_kernel::schema::StructType>>::new",
+        "<delta_kernel::memory::owned::Owned<delta_kernel::schema::StructType>>::unbudgeted",
+        "<delta_kernel::memory::owned::Owned<delta_kernel::schema::StructType> as core::clone::Clone>::clone"
+      ]
+    },
+    {
+      "bytes": 19200360,
+      "category": "schema_structures",
+      "frames": [
+        "<alloc::boxed::Box<alloc::sync::ArcInner<delta_kernel::memory::owned::Owned<delta_kernel::schema::StructField>>>>::new",
+        "<alloc::sync::Arc<delta_kernel::memory::owned::Owned<delta_kernel::schema::StructField>>>::new",
+        "delta_kernel::schema::unbudgeted_field"
+      ]
+    },
+    {
+      "bytes": 16800120,
+      "category": "schema_structures",
+      "frames": [
+        "<alloc::raw_vec::RawVec<indexmap::Bucket<alloc::string::String, alloc::sync::Arc<delta_kernel::memory::owned::Owned<delta_kernel::schema::StructField>>>>>::with_capacity_in",
+        "<alloc::vec::Vec<indexmap::Bucket<alloc::string::String, alloc::sync::Arc<delta_kernel::memory::owned::Owned<delta_kernel::schema::StructField>>>>>::with_capacity_in",
+        "<alloc::vec::Vec<indexmap::Bucket<alloc::string::String, alloc::sync::Arc<delta_kernel::memory::owned::Owned<delta_kernel::schema::StructField>>>>>::with_capacity"
+      ]
+    },
+    {
+      "bytes": 12120994,
+      "category": "other",
+      "frames": [
+        "<delta_kernel::plans::proto::operation::Operation as prost::message::Message>::encode_to_vec",
+        "<delta_kernel::plans::ir::operation::Operation>::to_proto_bytes"
+      ]
+    },
+    {
+      "bytes": 10080000,
+      "category": "schema_structures",
+      "frames": [
+        "<alloc::boxed::Box<delta_kernel::schema::StructType>>::new",
+        "<delta_kernel::memory::owned::Owned<delta_kernel::schema::StructType>>::unbudgeted",
+        "<delta_kernel::memory::owned::Owned<delta_kernel::schema::StructType> as core::clone::Clone>::clone"
+      ]
+    },
+    {
+      "bytes": 8804828,
+      "category": "schema_structures",
+      "frames": [
+        "<indexmap::inner::Core<alloc::string::String, alloc::sync::Arc<delta_kernel::memory::owned::Owned<delta_kernel::schema::StructField>>>>::with_capacity",
+        "<indexmap::map::IndexMap<alloc::string::String, alloc::sync::Arc<delta_kernel::memory::owned::Owned<delta_kernel::schema::StructField>>>>::with_capacity_and_hasher",
+        "<indexmap::map::IndexMap<alloc::string::String, alloc::sync::Arc<delta_kernel::memory::owned::Owned<delta_kernel::schema::StructField>>> as core::iter::traits::collect::FromIterator<(alloc::string::String, alloc::sync::Arc<delta_kernel::memory::owned::Owned<delta_kernel::schema::StructField>>)>>::from_iter::<core::iter::adapters::map::Map<either::Either<indexmap::map::iter::Iter<alloc::string::String, alloc::sync::Arc<delta_kernel::memory::owned::Owned<delta_kernel::schema::StructField>>>, core::iter::adapters::map::Map<core::slice::iter::Iter<(alloc::string::String, alloc::sync::Arc<delta_kernel::memory::owned::Owned<delta_kernel::schema::StructField>>)>, <delta_kernel::memory::ordered_map::OrderedMap<alloc::sync::Arc<delta_kernel::memory::owned::Owned<delta_kernel::schema::StructField>>>>::iter::{closure#0}>>, <delta_kernel::schema::StructType as core::clone::Clone>::clone::{closure#0}>>"
+      ]
+    },
+    {
+      "bytes": 6720000,
+      "category": "schema_structures",
+      "frames": [
+        "<alloc::boxed::Box<delta_kernel::schema::StructField>>::new",
+        "<delta_kernel::memory::owned::Owned<delta_kernel::schema::StructField>>::unbudgeted",
+        "delta_kernel::schema::unbudgeted_field"
+      ]
+    },
+    {
+      "bytes": 6720000,
+      "category": "schema_structures",
+      "frames": [
+        "<alloc::raw_vec::RawVec<delta_kernel::plans::proto::schema::StructField>>::with_capacity_in",
+        "<alloc::vec::Vec<delta_kernel::plans::proto::schema::StructField>>::with_capacity_in",
+        "<alloc::vec::Vec<delta_kernel::plans::proto::schema::StructField>>::with_capacity"
+      ]
+    },
+    {
+      "bytes": 2400240,
+      "category": "schema_structures",
+      "frames": [
+        "<alloc::raw_vec::RawVec<indexmap::Bucket<alloc::string::String, alloc::sync::Arc<delta_kernel::memory::owned::Owned<delta_kernel::schema::StructField>>>>>::with_capacity_in",
+        "<alloc::vec::Vec<indexmap::Bucket<alloc::string::String, alloc::sync::Arc<delta_kernel::memory::owned::Owned<delta_kernel::schema::StructField>>>>>::with_capacity_in",
+        "<alloc::vec::Vec<indexmap::Bucket<alloc::string::String, alloc::sync::Arc<delta_kernel::memory::owned::Owned<delta_kernel::schema::StructField>>>>>::with_capacity"
+      ]
+    },
+    {
+      "bytes": 2400000,
+      "category": "schema_structures",
+      "frames": [
+        "<alloc::boxed::Box<alloc::sync::ArcInner<delta_kernel::memory::owned::Owned<delta_kernel::schema::StructField>>>>::new",
+        "<alloc::sync::Arc<delta_kernel::memory::owned::Owned<delta_kernel::schema::StructField>>>::new",
+        "delta_kernel::schema::unbudgeted_field"
+      ]
+    },
+    {
+      "bytes": 2400000,
+      "category": "schema_structures",
+      "frames": [
+        "<alloc::raw_vec::RawVec<indexmap::Bucket<alloc::string::String, alloc::sync::Arc<delta_kernel::memory::owned::Owned<delta_kernel::schema::StructField>>>>>::with_capacity_in",
+        "<alloc::vec::Vec<indexmap::Bucket<alloc::string::String, alloc::sync::Arc<delta_kernel::memory::owned::Owned<delta_kernel::schema::StructField>>>>>::with_capacity_in",
+        "<alloc::vec::Vec<indexmap::Bucket<alloc::string::String, alloc::sync::Arc<delta_kernel::memory::owned::Owned<delta_kernel::schema::StructField>>>>>::with_capacity"
+      ]
+    },
+    {
+      "bytes": 1780675,
+      "category": "schema_structures",
+      "frames": [
+        "<delta_kernel::schema::StructField as core::clone::Clone>::clone",
+        "<delta_kernel::schema::StructType as core::clone::Clone>::clone::{closure#0}",
+        "core::iter::adapters::map::map_fold::<(&alloc::string::String, &alloc::sync::Arc<delta_kernel::memory::owned::Owned<delta_kernel::schema::StructField>>),"
+      ]
+    },
+    {
+      "bytes": 1660028,
+      "category": "schema_structures",
+      "frames": [
+        "<delta_kernel::plans::proto::schema::StructField as core::convert::From<&delta_kernel::schema::StructField>>::from",
+        "<&delta_kernel::schema::StructField as core::convert::Into<delta_kernel::plans::proto::schema::StructField>>::into",
+        "<<&delta_kernel::schema::StructField as core::convert::Into<delta_kernel::plans::proto::schema::StructField>>::into as core::ops::function::FnMut<(&delta_kernel::schema::StructField,)>>::call_mut"
+      ]
+    },
+    {
+      "bytes": 1340000,
+      "category": "log_descriptors_and_urls",
+      "frames": [
+        "<url::Url as core::fmt::Display>::fmt",
+        "<url::Url as alloc::string::SpecToString>::spec_to_string",
+        "<url::Url as alloc::string::ToString>::to_string"
+      ]
+    },
+    {
+      "bytes": 1340000,
+      "category": "log_descriptors_and_urls",
+      "frames": [
+        "<url::Url as core::clone::Clone>::clone",
+        "<delta_kernel::FileMeta as core::clone::Clone>::clone",
+        "<delta_kernel::plans::ir::nodes::ScanFile as core::clone::Clone>::clone"
+      ]
+    },
+    {
+      "bytes": 1306773,
+      "category": "schema_structures",
+      "frames": [
+        "<delta_kernel::schema::StructType as core::clone::Clone>::clone::{closure#0}",
+        "core::iter::adapters::map::map_fold::<(&alloc::string::String, &alloc::sync::Arc<delta_kernel::memory::owned::Owned<delta_kernel::schema::StructField>>),",
+        "<indexmap::map::iter::Iter<alloc::string::String, alloc::sync::Arc<delta_kernel::memory::owned::Owned<delta_kernel::schema::StructField>>> as core::iter::traits::iterator::Iterator>::fold::<(), core::iter::adapters::map::map_fold<(&alloc::string::String, &alloc::sync::Arc<delta_kernel::memory::owned::Owned<delta_kernel::schema::StructField>>),"
+      ]
+    },
+    {
+      "bytes": 1280000,
+      "category": "other",
+      "frames": [
+        "<alloc::raw_vec::RawVec<delta_kernel::expressions::scalars::Scalar>>::with_capacity_in",
+        "<alloc::vec::Vec<delta_kernel::expressions::scalars::Scalar>>::with_capacity_in",
+        "<delta_kernel::expressions::scalars::Scalar as <[_]>::to_vec_in::ConvertVec>::to_vec::<alloc::alloc::Global>"
+      ]
+    }
+  ],
+  "scope": "Allocations tracked after profiler start; excludes direct libc/C++, RSS, fragmentation and stacks. Stack grouping is diagnostic, not enforcement."
+}

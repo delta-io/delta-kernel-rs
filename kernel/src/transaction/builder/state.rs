@@ -12,6 +12,8 @@ use crate::{EngineData, KernelError, KernelResult};
 /// Shared transaction configuration collected before build.
 #[derive(Default)]
 pub(in crate::transaction) struct TransactionBuilderState {
+    #[cfg(feature = "limited-memory")]
+    pub(in crate::transaction) allocator: Option<crate::memory::LimitedAllocator>,
     pub(in crate::transaction) correlation_id: Option<Arc<str>>,
     pub(in crate::transaction) operation_parameters: Option<HashMap<String, Option<String>>>,
     pub(in crate::transaction) operation_metrics: Option<HashMap<String, Option<String>>>,
@@ -42,6 +44,8 @@ impl std::fmt::Debug for TransactionBuilderState {
 impl TransactionBuilderState {
     pub(super) fn new(engine_info: String, data_change: bool) -> Self {
         Self {
+            #[cfg(feature = "limited-memory")]
+            allocator: crate::memory::MemoryBudget::current().map(|budget| budget.allocator()),
             engine_info,
             data_change,
             ..Self::default()

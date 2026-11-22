@@ -19,6 +19,8 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+#[cfg(feature = "limited-memory")]
+use futures::TryStreamExt;
 use itertools::Itertools;
 use tracing::trace;
 use url::Url;
@@ -216,6 +218,18 @@ pub(super) fn get_bytes(
 ) -> KernelResult<Bytes> {
     let (store, _, path) = resolve_scope(default_store, location)?;
     let get_result = futures::executor::block_on(store.get(&path))?;
+    #[cfg(feature = "limited-memory")]
+    if let Some(budget) = crate::memory::MemoryBudget::current() {
+        let mut output = crate::memory::LimitedBytes::new(&budget);
+        let size = usize::try_from(get_result.meta.size)
+            .map_err(|_| crate::memory::MemoryError::CapacityOverflow)?;
+        output.try_reserve_exact(size)?;
+        let mut chunks = get_result.into_stream();
+        while let Some(chunk) = futures::executor::block_on(chunks.try_next())? {
+            output.try_extend_from_slice(&chunk)?;
+        }
+        return Ok(Bytes::from_owner(output));
+    }
     Ok(futures::executor::block_on(get_result.bytes())?)
 }
 

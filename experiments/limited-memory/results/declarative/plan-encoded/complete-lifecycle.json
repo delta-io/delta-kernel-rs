@@ -1,0 +1,127 @@
+{
+  "budget_enabled": true,
+  "error": null,
+  "fixture": "file:///var/folders/gy/1kdbw3sj2bsg9q12x502jtfm0000gp/T/kernel-heap-worker-0y7krlra/table/",
+  "global_budget": true,
+  "heap_profile_enabled": true,
+  "in_process_fixture_path": null,
+  "initial_files": 1000,
+  "kind": "real_kernel_lifecycle",
+  "limit_bytes": 536870912,
+  "mode": "declarative",
+  "peak_reserved_bytes": 250112706,
+  "profile_from_stage": "declarative_scan_state_built",
+  "rejections": 0,
+  "reserved_after_cleanup": 0,
+  "result": {
+    "declarative_commit_supported": false,
+    "engine_ops": 3,
+    "largest_engine_op_proto_bytes": 1581554,
+    "metadata_plan_nodes": 15,
+    "metadata_plan_proto_bytes": 12120983,
+    "snapshot_version": 10001,
+    "staged_relations": 1,
+    "write_state_bytes": 34422171
+  },
+  "rust_heap_after_cleanup": 66163,
+  "rust_heap_peak": 194899355,
+  "schema_json_bytes": 11301270,
+  "stages": [
+    {
+      "budget_live": 38960058,
+      "budget_peak": 38960058,
+      "elapsed_ns": 1065560416,
+      "name": "declarative_snapshot_ready_mock_engine_included",
+      "rust_heap_live": null,
+      "rust_heap_peak": null
+    },
+    {
+      "budget_live": 38971146,
+      "budget_peak": 50312243,
+      "elapsed_ns": 3437500,
+      "name": "declarative_checkpoint_info_ready_mock_engine_included",
+      "rust_heap_live": null,
+      "rust_heap_peak": null
+    },
+    {
+      "budget_live": 85452634,
+      "budget_peak": 131934186,
+      "elapsed_ns": 121331459,
+      "name": "declarative_scan_state_built",
+      "rust_heap_live": 0,
+      "rust_heap_peak": 0
+    },
+    {
+      "budget_live": 224946882,
+      "budget_peak": 224946882,
+      "elapsed_ns": 32402956041,
+      "name": "declarative_metadata_plan_built_no_execution",
+      "rust_heap_live": 169733531,
+      "rust_heap_peak": 174457103
+    },
+    {
+      "budget_live": 241724098,
+      "budget_peak": 250112706,
+      "elapsed_ns": 31172292,
+      "name": "declarative_metadata_plan_proto_live_no_execution",
+      "rust_heap_live": 186510795,
+      "rust_heap_peak": 194899355
+    },
+    {
+      "budget_live": 102229850,
+      "budget_peak": 250112706,
+      "elapsed_ns": 273643958,
+      "name": "declarative_metadata_plan_owned_wire_live",
+      "rust_heap_live": 16836611,
+      "rust_heap_peak": 194899355
+    },
+    {
+      "budget_live": 85452634,
+      "budget_peak": 250112706,
+      "elapsed_ns": 2042,
+      "name": "declarative_metadata_plan_released",
+      "rust_heap_live": 59347,
+      "rust_heap_peak": 194899355
+    },
+    {
+      "budget_live": 85452634,
+      "budget_peak": 250112706,
+      "elapsed_ns": 777875,
+      "name": "declarative_transaction_relations_staged",
+      "rust_heap_live": 64656,
+      "rust_heap_peak": 194899355
+    },
+    {
+      "budget_live": 122583586,
+      "budget_peak": 250112706,
+      "elapsed_ns": 829556917,
+      "name": "declarative_write_state_encoded_live",
+      "rust_heap_live": 39120246,
+      "rust_heap_peak": 194899355
+    },
+    {
+      "budget_live": 38971146,
+      "budget_peak": 250112706,
+      "elapsed_ns": 30817500,
+      "name": "declarative_read_write_owners_released",
+      "rust_heap_live": 65371,
+      "rust_heap_peak": 194899355
+    }
+  ],
+  "stop_after": "complete",
+  "tail_commits": 10000,
+  "width": 10000,
+  "fixture_details": {
+    "action_stats_bytes": 0,
+    "checkpoint_parsed_stats": false,
+    "checkpoints": 1,
+    "indexed_stats_columns": -1,
+    "initial_files": 1000,
+    "path": "/var/folders/gy/1kdbw3sj2bsg9q12x502jtfm0000gp/T/.tmpOaSG19",
+    "schema_fields": 30000,
+    "schema_json_bytes": 11301270,
+    "table_root": "file:///private/var/folders/gy/1kdbw3sj2bsg9q12x502jtfm0000gp/T/.tmpOaSG19/",
+    "tail_commits": 10000,
+    "width": 10000
+  }
+}

@@ -73,6 +73,8 @@ pub(crate) struct FileActionDeduplicator<'seen> {
     /// far in the log for deduplication. This is a mutable reference to the set
     /// of seen file keys that persists across multiple log batches.
     seen_file_keys: &'seen mut HashSet<FileActionKey>,
+    #[cfg(feature = "limited-memory")]
+    limited_keys: Option<&'seen mut crate::memory::FileKeySet>,
     // TODO: Consider renaming to `is_commit_batch`, `deduplicate_batch`, or `save_batch`
     // to better reflect its role in deduplication logic.
     /// Whether we're processing a commit log JSON file (`true`) or a checkpoint file (`false`).
@@ -93,6 +95,15 @@ pub(crate) struct FileActionDeduplicator<'seen> {
 }
 
 impl<'seen> FileActionDeduplicator<'seen> {
+    #[cfg(feature = "limited-memory")]
+    pub(crate) fn with_limited_keys(
+        mut self,
+        keys: Option<&'seen mut crate::memory::FileKeySet>,
+    ) -> Self {
+        self.limited_keys = keys;
+        self
+    }
+
     // Hand-written (not `#[derive(Constructor)]`) so the eight-field constructor can carry the
     // `too_many_arguments` allow; the positional field order is the call-site argument order.
     #[allow(clippy::too_many_arguments)]
@@ -108,6 +119,8 @@ impl<'seen> FileActionDeduplicator<'seen> {
     ) -> Self {
         Self {
             seen_file_keys,
+            #[cfg(feature = "limited-memory")]
+            limited_keys: None,
             is_log_batch,
             add_path_index,
             add_size_index,
@@ -120,6 +133,18 @@ impl<'seen> FileActionDeduplicator<'seen> {
 }
 
 impl Deduplicator for FileActionDeduplicator<'_> {
+    fn try_check_and_record_seen(&mut self, key: FileActionKey) -> KernelResult<bool> {
+        #[cfg(feature = "limited-memory")]
+        if let Some(keys) = &mut self.limited_keys {
+            return if self.is_log_batch {
+                Ok(!keys.try_insert(key.path(), key.dv_unique_id())?)
+            } else {
+                Ok(keys.contains(key.path(), key.dv_unique_id()))
+            };
+        }
+        Ok(self.check_and_record_seen(key))
+    }
+
     /// Checks if log replay already processed this logical file (in which case the current action
     /// should be ignored). If not already seen, register it so we can recognize future duplicates.
     /// Returns `true` if we have seen the file and should ignore it, `false` if we have not seen it

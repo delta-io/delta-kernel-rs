@@ -244,9 +244,28 @@ impl ParallelState {
             serde_json::from_slice(bytes).map_err(KernelError::MalformedJson)?;
         Self::from_serializable_state(engine, state)
     }
+
+    /// Restore state with a local allocator retained across subsequent worker calls.
+    ///
+    /// Serialized bytes never transfer a process's allocation owner. Participating decoded
+    /// storage uses this allocator; engine buffers and unconverted schema storage remain outside
+    /// its cap.
+    #[cfg(feature = "limited-memory")]
+    pub fn from_bytes_in(
+        engine: &dyn Engine,
+        bytes: &[u8],
+        allocator: crate::memory::LimitedAllocator,
+    ) -> KernelResult<Self> {
+        let _scope = crate::memory::AllocationScope::new(Some(&allocator));
+        let mut state: SerializableScanState = crate::memory::decode_json(bytes)?;
+        state.allocator = Some(allocator);
+        Self::from_serializable_state(engine, state)
+    }
 }
 
 pub struct ParallelScanMetadata {
+    #[cfg(feature = "limited-memory")]
+    allocator: Option<crate::memory::LimitedAllocator>,
     pub(crate) processor: ParallelPhase<Arc<ParallelState>>,
     span: Span,
 }
@@ -257,8 +276,12 @@ impl ParallelScanMetadata {
         state: Arc<ParallelState>,
         leaf_files: Vec<FileMeta>,
     ) -> KernelResult<Self> {
+        #[cfg(feature = "limited-memory")]
+        let _scope = crate::memory::AllocationScope::new(state.inner.memory_allocator());
         let read_schema = state.file_read_schema();
         Ok(Self {
+            #[cfg(feature = "limited-memory")]
+            allocator: state.inner.memory_allocator().cloned(),
             processor: ParallelPhase::try_new(engine, state, leaf_files, read_schema)?,
             // TODO: Associate the same scan ID from sequential phase to correlate phases
             span: info_span!("parallel_scan_metadata"),
@@ -270,6 +293,8 @@ impl ParallelScanMetadata {
         iter: impl IntoIterator<Item = KernelResult<Box<dyn EngineData>>, IntoIter: Send + 'static>,
     ) -> Self {
         Self {
+            #[cfg(feature = "limited-memory")]
+            allocator: state.inner.memory_allocator().cloned(),
             processor: ParallelPhase::new_from_iter(state.clone(), iter),
             // TODO: Associate the same scan ID from sequential phase to correlate phases
             span: info_span!("parallel_scan_metadata"),
@@ -281,6 +306,8 @@ impl Iterator for ParallelScanMetadata {
     type Item = KernelResult<ScanMetadata>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        #[cfg(feature = "limited-memory")]
+        let _scope = crate::memory::AllocationScope::new(self.allocator.as_ref());
         let _guard = self.span.enter();
         self.processor.next()
     }
@@ -311,6 +338,8 @@ mod tests {
             nullable "id": INTEGER,
         };
         let state_info = Arc::new(StateInfo {
+            #[cfg(feature = "limited-memory")]
+            allocator: crate::memory::MemoryBudget::current().map(|budget| budget.allocator()),
             logical_schema: schema.clone(),
             physical_schema: schema,
             physical_predicate: PhysicalPredicate::None,

@@ -6,7 +6,7 @@ mod deletion_vector_writer;
 mod partition_value;
 mod transaction_id;
 mod update_table;
-mod write_context;
+pub(crate) mod write_context;
 
 use std::collections::HashMap;
 use std::sync::Arc;

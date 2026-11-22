@@ -27,6 +27,8 @@ use crate::{
 /// Finally, call [`snapshot_builder_build`] to consume the builder and obtain the snapshot. If you
 /// need to discard the builder without building, call [`free_snapshot_builder`].
 pub struct FfiSnapshotBuilder {
+    #[cfg(feature = "limited-memory")]
+    allocator: Option<delta_kernel::memory::LimitedAllocator>,
     pub(super) engine: Arc<dyn ExternEngine>,
     pub(super) source: FfiSnapshotBuilderSource,
     version: Option<Version>,
@@ -142,6 +144,28 @@ pub unsafe extern "C" fn snapshot_builder_with_version(
 ) -> Handle<ExclusiveSnapshotBuilder> {
     let mut builder = unsafe { builder.into_inner() };
     builder.version = Some(version);
+    builder.into()
+}
+
+/// Select a shared budget for participating snapshot allocations and derived operations.
+///
+/// Consumes `builder` and borrows `budget`. The replacement builder, snapshot, scans, and update
+/// transactions retain the allocator, so `budget` may be released after this call. Existing
+/// allocations reused from an older snapshot keep their original owner. This experimental cap
+/// excludes engine buffers and Kernel storage not yet using the limited allocator.
+///
+/// # Safety
+///
+/// Both handles must be valid. Do not reuse or free the consumed builder. The budget remains
+/// owned by the caller and must eventually be released with [`crate::memory::free_memory_budget`].
+#[cfg(feature = "limited-memory")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapshot_builder_with_memory_budget(
+    builder: Handle<ExclusiveSnapshotBuilder>,
+    budget: Handle<crate::memory::SharedMemoryBudget>,
+) -> Handle<ExclusiveSnapshotBuilder> {
+    let mut builder = unsafe { builder.into_inner() };
+    builder.allocator = Some(unsafe { budget.as_ref() }.allocator());
     builder.into()
 }
 
@@ -300,6 +324,8 @@ fn make_snapshot_builder(
     engine: Arc<dyn ExternEngine>,
 ) -> KernelResult<Handle<ExclusiveSnapshotBuilder>> {
     Ok(Box::new(FfiSnapshotBuilder {
+        #[cfg(feature = "limited-memory")]
+        allocator: None,
         engine,
         source,
         version: None,
@@ -324,6 +350,8 @@ fn snapshot_builder_build_impl(
     builder: FfiSnapshotBuilder,
 ) -> delta_kernel::Result<Handle<SharedSnapshot>> {
     let FfiSnapshotBuilder {
+        #[cfg(feature = "limited-memory")]
+        allocator,
         engine,
         source,
         version,
@@ -336,6 +364,8 @@ fn snapshot_builder_build_impl(
     let engine = engine.engine();
 
     struct BuildOptions {
+        #[cfg(feature = "limited-memory")]
+        allocator: Option<delta_kernel::memory::LimitedAllocator>,
         version: Option<Version>,
         correlation_id: Option<String>,
         incremental_replay: IncrementalReplay,
@@ -355,6 +385,8 @@ fn snapshot_builder_build_impl(
             -> KernelResult<delta_kernel::snapshot::SnapshotBuilder<Mode>>,
     ) -> delta_kernel::Result<SnapshotRef> {
         let BuildOptions {
+            #[cfg(feature = "limited-memory")]
+            allocator,
             version,
             correlation_id,
             incremental_replay,
@@ -362,6 +394,10 @@ fn snapshot_builder_build_impl(
             max_catalog_version,
             snapshot_hint,
         } = options;
+        #[cfg(feature = "limited-memory")]
+        if let Some(allocator) = allocator {
+            builder = builder.with_allocator(allocator);
+        }
         builder = builder.with_incremental_crc_replay(incremental_replay);
         if let Some(correlation_id) = correlation_id {
             builder = builder.with_correlation_id(correlation_id);
@@ -382,6 +418,8 @@ fn snapshot_builder_build_impl(
     }
 
     let options = BuildOptions {
+        #[cfg(feature = "limited-memory")]
+        allocator,
         version,
         correlation_id,
         incremental_replay,

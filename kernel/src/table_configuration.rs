@@ -216,7 +216,7 @@ impl<'a> StatsSchemaBuilder<'a> {
             self.required_physical_columns,
             self.requested_physical_columns,
         )?);
-        Ok(strip_metadata(physical_stats_schema))
+        strip_metadata(physical_stats_schema)
     }
 }
 
@@ -236,11 +236,19 @@ pub(crate) enum InCommitTimestampEnablement {
 /// Utility function to strip field metadata from stats schemas. This metadata describes logical
 /// table columns, not the stats. Keeping it can cause schema mismatches when combining the parsed
 /// stats from a checkpoint written before logical metadata was added.
-fn strip_metadata(schema: SchemaRef) -> SchemaRef {
-    match StripFieldMetadataTransform.transform_struct(&schema) {
-        Cow::Owned(s) => Arc::new(s),
-        _ => schema,
+fn strip_metadata(schema: SchemaRef) -> KernelResult<SchemaRef> {
+    #[cfg(feature = "limited-memory")]
+    if crate::memory::MemoryBudget::current().is_some() {
+        return Ok(Arc::new(
+            crate::scan::data_skipping::stats_schema::try_strip_metadata(&schema)?,
+        ));
     }
+    Ok(
+        match StripFieldMetadataTransform.transform_struct(&schema) {
+            Cow::Owned(s) => Arc::new(s),
+            _ => schema,
+        },
+    )
 }
 
 /// Builds one side of [`StatsOutputSchemas`] for explicitly selected columns.
@@ -268,7 +276,7 @@ fn build_stats_schema_for_columns(
         required_columns,
         requested_columns,
     )?);
-    Ok(strip_metadata(schema))
+    strip_metadata(schema)
 }
 
 fn validate_partition_columns(metadata: &Metadata, logical_schema: &StructType) -> Result<()> {
@@ -473,6 +481,16 @@ impl TableConfiguration {
             IcebergCompatValidationContext::TableConfiguration,
         )?;
 
+        #[cfg(feature = "limited-memory")]
+        if crate::memory::MemoryBudget::current().is_some() {
+            // physical_schema() is infallible. Build its retained storage at this fallible
+            // boundary so a lazy request cannot abort or bypass the active allocation budget.
+            table_config.physical_schema = OnceLock::from(Arc::new(
+                table_config
+                    .logical_schema
+                    .try_make_validated_physical(column_mapping_mode)?,
+            ));
+        }
         Ok(table_config)
     }
 
@@ -499,6 +517,14 @@ impl TableConfiguration {
             table_configuration.table_root.clone(),
             new_version,
         )
+    }
+
+    #[cfg(feature = "limited-memory")]
+    pub(crate) fn at_version(&self, version: Version) -> Self {
+        Self {
+            version,
+            ..self.clone()
+        }
     }
 
     /// Creates a new [`TableConfiguration`] representing the table configuration immediately

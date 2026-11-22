@@ -49,6 +49,8 @@ use handle::Handle;
 extern crate self as delta_kernel_ffi;
 
 mod alloc_stats;
+#[cfg(feature = "limited-memory")]
+pub mod memory;
 
 pub mod checkpoint;
 pub mod column_default;
@@ -86,6 +88,8 @@ pub mod snapshot;
 /// Preserves the `snapshot_hint` import path for Rust callers.
 #[doc(hidden)]
 pub use snapshot::hint as snapshot_hint;
+#[cfg(feature = "limited-memory")]
+pub use snapshot::snapshot_builder_with_memory_budget;
 pub use snapshot::{
     ExclusiveSnapshotBuilder, FfiIncrementalReplay, FfiSnapshotBuilder, free_snapshot_builder,
     get_snapshot_builder, get_snapshot_builder_from, snapshot_builder_build,
@@ -566,26 +570,54 @@ mod private {
     /// An owned byte buffer allocated by the kernel. Any time the engine receives a
     /// `KernelOwnedBytes` as a return value from a kernel method, the engine owns the buffer and
     /// must free it by calling [super::free_kernel_bytes] exactly once.
+    /// Pass this record unchanged to the release function. With `limited-memory`, its opaque
+    /// owner retains the original allocator until the last reference to the storage is released.
     #[cfg(feature = "declarative-plans")]
     #[repr(C)]
     pub struct KernelOwnedBytes {
         ptr: NonNull<u8>,
         len: usize,
+        // Keep the allocator-bearing Bytes owner until free_kernel_bytes, including across
+        // threads.
+        #[cfg(feature = "limited-memory")]
+        owner: NonNull<std::ffi::c_void>,
     }
 
     #[cfg(feature = "declarative-plans")]
     impl KernelOwnedBytes {
-        /// Converts this buffer back into a `Vec<u8>`.
+        /// Consumes this buffer as a `Vec<u8>`, copying allocator-backed storage when necessary.
         ///
         /// # Safety
         ///
-        /// The buffer must have been originally created `From<Vec<u8>>`, and must not have already
-        /// been consumed by a previous call to this method.
+        /// The buffer must have come from Kernel and must not have been consumed or freed.
         pub unsafe fn into_vec(self) -> Vec<u8> {
-            if self.len == 0 {
-                Default::default()
-            } else {
-                unsafe { Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.len) }
+            #[cfg(feature = "limited-memory")]
+            {
+                unsafe { self.into_bytes() }.to_vec()
+            }
+            #[cfg(not(feature = "limited-memory"))]
+            {
+                if self.len == 0 {
+                    Default::default()
+                } else {
+                    unsafe { Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.len) }
+                }
+            }
+        }
+
+        /// Consumes the original byte owner, preserving its allocator and allocation charge.
+        ///
+        /// # Safety
+        ///
+        /// The buffer must have come from Kernel and must not have been consumed or freed.
+        pub unsafe fn into_bytes(self) -> bytes::Bytes {
+            #[cfg(feature = "limited-memory")]
+            {
+                *unsafe { Box::from_raw(self.owner.cast::<bytes::Bytes>().as_ptr()) }
+            }
+            #[cfg(not(feature = "limited-memory"))]
+            {
+                unsafe { self.into_vec() }.into()
             }
         }
     }
@@ -593,8 +625,32 @@ mod private {
     #[cfg(feature = "declarative-plans")]
     impl From<Vec<u8>> for KernelOwnedBytes {
         fn from(val: Vec<u8>) -> Self {
-            let (ptr, len) = vec_into_ffi_ptr(val);
-            KernelOwnedBytes { ptr, len }
+            #[cfg(feature = "limited-memory")]
+            {
+                bytes::Bytes::from(val).into()
+            }
+            #[cfg(not(feature = "limited-memory"))]
+            {
+                let (ptr, len) = vec_into_ffi_ptr(val);
+                KernelOwnedBytes { ptr, len }
+            }
+        }
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    impl From<bytes::Bytes> for KernelOwnedBytes {
+        fn from(val: bytes::Bytes) -> Self {
+            #[cfg(feature = "limited-memory")]
+            {
+                let ptr = NonNull::from(val.as_ref()).cast();
+                let len = val.len();
+                let owner = NonNull::from(Box::leak(Box::new(val))).cast();
+                Self { ptr, len, owner }
+            }
+            #[cfg(not(feature = "limited-memory"))]
+            {
+                val.to_vec().into()
+            }
         }
     }
 
@@ -735,7 +791,7 @@ pub unsafe extern "C" fn free_row_indexes(slice: KernelRowIndexArray) {
 #[cfg(feature = "declarative-plans")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_kernel_bytes(bytes: KernelOwnedBytes) {
-    let _ = unsafe { bytes.into_vec() };
+    let _ = unsafe { bytes.into_bytes() };
 }
 
 // TODO: Do we want this handle at all? Perhaps we should just _always_ pass raw *mut c_void

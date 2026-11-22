@@ -2,6 +2,8 @@
 
 pub(crate) mod apply_schema;
 pub(crate) mod file_type_validation;
+#[cfg(feature = "limited-memory")]
+mod limited_json;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -1646,7 +1648,11 @@ impl Encoder for NullMapPlaceholderEncoder {
 #[internal_api]
 pub(crate) fn to_json_bytes(
     data: impl KernelResultIterator<FilteredEngineData>,
-) -> KernelResult<Vec<u8>> {
+) -> KernelResult<bytes::Bytes> {
+    #[cfg(feature = "limited-memory")]
+    if let Some(budget) = crate::memory::MemoryBudget::current() {
+        return limited_json::write(data, &budget);
+    }
     let builder = WriterBuilder::new().with_encoder_factory(Arc::new(NullValueMapEncoderFactory));
     let mut writer = builder.build::<_, LineDelimited>(Vec::new());
     for chunk in data {
@@ -1654,7 +1660,7 @@ pub(crate) fn to_json_bytes(
         writer.write(&batch)?;
     }
     writer.finish()?;
-    Ok(writer.into_inner())
+    Ok(writer.into_inner().into())
 }
 
 /// Applies post-processing to data read from a JSON file. Inserts synthesized metadata columns
@@ -4485,7 +4491,7 @@ mod tests {
         let json = to_json_bytes(Box::new(std::iter::once(Ok(filtered_data)))).unwrap();
 
         // This is the outer JSON row; the null `map_col` field is omitted.
-        assert_eq!(json, b"{}\n");
+        assert_eq!(json.as_ref(), b"{}\n");
     }
 
     #[rstest]

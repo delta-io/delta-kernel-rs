@@ -127,7 +127,9 @@ impl Snapshot {
             .and_then(|()| {
                 LogSegment::try_new(
                     LogSegmentFiles {
-                        ascending_commit_files: commits_to_compact.to_vec(),
+                        ascending_commit_files: crate::log_segment_files::commit_files(
+                            commits_to_compact.to_vec(),
+                        ),
                         ascending_compaction_files: source
                             .listed
                             .ascending_compaction_files

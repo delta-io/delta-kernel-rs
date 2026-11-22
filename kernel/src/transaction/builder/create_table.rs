@@ -1074,6 +1074,8 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
         engine: &dyn Engine,
         committer: Box<dyn Committer>,
     ) -> Result<CreateTableTransaction<MODE>> {
+        #[cfg(feature = "limited-memory")]
+        let _scope = crate::memory::AllocationScope::new(self.common_state.allocator.as_ref());
         self.common_state.validate()?;
 
         // Validate path

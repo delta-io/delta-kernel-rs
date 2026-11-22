@@ -130,12 +130,21 @@ struct InternalScanState {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SerializableScanState {
+    /// In-process allocation owner. Serialization never transfers a process's budget.
+    #[cfg(feature = "limited-memory")]
+    #[serde(skip)]
+    pub allocator: Option<crate::memory::LimitedAllocator>,
     /// Optional predicate for data skipping (if provided)
     pub predicate: Option<PredicateRef>,
     /// Opaque internal state blob
     pub internal_state_blob: Vec<u8>,
     /// Set of file action keys that have already been processed.
     pub seen_file_keys: HashSet<FileActionKey>,
+    /// Budgeted retained keys. Present only for the experimental limited-memory mode.
+    /// Reconstruct under an explicit budget on the receiving thread.
+    #[cfg(feature = "limited-memory")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limited_seen_file_keys: Option<crate::memory::FileKeySet>,
     /// Information about checkpoint reading for stats optimization
     pub(crate) checkpoint_info: CheckpointReadInfo,
 }
@@ -185,6 +194,8 @@ pub struct ScanLogReplayProcessor {
     /// far in the log. This is used to filter out files with Remove actions as
     /// well as duplicate entries in the log.
     seen_file_keys: HashSet<FileActionKey>,
+    #[cfg(feature = "limited-memory")]
+    limited_keys: Option<crate::memory::FileKeySet>,
     /// Read-time stats options.
     stats_options: ScanStatsOptions,
     /// Read-time partition value options.
@@ -207,6 +218,11 @@ struct RetryTransformAndDataSkipOutput {
 }
 
 impl ScanLogReplayProcessor {
+    #[cfg(feature = "limited-memory")]
+    pub(crate) fn memory_allocator(&self) -> Option<&crate::memory::LimitedAllocator> {
+        self.state_info.allocator.as_ref()
+    }
+
     // These index positions correspond to the order of columns defined in
     // `AddRemoveDedupVisitor::selected_column_names_and_types()`
     const ADD_PATH_INDEX: usize = 0; // Position of "add.path" in getters
@@ -229,6 +245,12 @@ impl ScanLogReplayProcessor {
         partition_values_options: ScanPartitionValuesOptions,
     ) -> KernelResult<Self> {
         let dedup_capacity = state_info.dedup_capacity_hint();
+        #[cfg(feature = "limited-memory")]
+        let dedup_capacity = if state_info.allocator.is_some() {
+            0
+        } else {
+            dedup_capacity
+        };
         Self::new_with_seen_files(
             engine,
             state_info,
@@ -260,6 +282,16 @@ impl ScanLogReplayProcessor {
         stats_options: ScanStatsOptions,
         partition_values_options: ScanPartitionValuesOptions,
     ) -> KernelResult<Self> {
+        #[cfg(feature = "limited-memory")]
+        let (seen_file_keys, limited_keys) = if let Some(allocator) = state_info.allocator.clone() {
+            let mut keys = crate::memory::FileKeySet::new_in(allocator);
+            for key in seen_file_keys {
+                keys.try_insert(key.path(), key.dv_unique_id())?;
+            }
+            (HashSet::new(), Some(keys))
+        } else {
+            (seen_file_keys, None)
+        };
         let CheckpointReadInfo {
             has_stats_parsed,
             has_partition_values_parsed,
@@ -377,6 +409,8 @@ impl ScanLogReplayProcessor {
             )?,
             stats_output_projection,
             seen_file_keys,
+            #[cfg(feature = "limited-memory")]
+            limited_keys,
             state_info,
             stats_options,
             partition_values_options,
@@ -389,6 +423,14 @@ impl ScanLogReplayProcessor {
     /// Get a reference to the checkpoint info.
     pub(crate) fn checkpoint_info(&self) -> &CheckpointReadInfo {
         &self.checkpoint_info
+    }
+
+    fn seen_key_count(&self) -> usize {
+        #[cfg(feature = "limited-memory")]
+        if let Some(keys) = &self.limited_keys {
+            return keys.len();
+        }
+        self.seen_file_keys.len()
     }
 
     pub(crate) fn get_metrics(&self) -> &ScanMetrics {
@@ -416,6 +458,8 @@ impl ScanLogReplayProcessor {
     #[allow(unused)]
     pub(crate) fn into_serializable_state(self) -> KernelResult<SerializableScanState> {
         let StateInfo {
+            #[cfg(feature = "limited-memory")]
+            allocator,
             logical_schema,
             physical_schema,
             physical_predicate,
@@ -458,9 +502,13 @@ impl ScanLogReplayProcessor {
         })?;
 
         Ok(SerializableScanState {
+            #[cfg(feature = "limited-memory")]
+            allocator,
             predicate,
             internal_state_blob,
             seen_file_keys: self.seen_file_keys,
+            #[cfg(feature = "limited-memory")]
+            limited_seen_file_keys: self.limited_keys,
             checkpoint_info: self.checkpoint_info,
         })
     }
@@ -485,8 +533,20 @@ impl ScanLogReplayProcessor {
         state: SerializableScanState,
     ) -> KernelResult<Self> {
         // Deserialize internal state from json
+        #[cfg(feature = "limited-memory")]
+        let _scope = crate::memory::AllocationScope::new(
+            state
+                .allocator
+                .clone()
+                .or_else(|| crate::memory::MemoryBudget::current().map(|budget| budget.allocator()))
+                .as_ref(),
+        );
+        #[cfg(not(feature = "limited-memory"))]
         let internal_state: InternalScanState = serde_json::from_slice(&state.internal_state_blob)
             .map_err(KernelError::MalformedJson)?;
+        #[cfg(feature = "limited-memory")]
+        let internal_state: InternalScanState =
+            crate::memory::decode_json(&state.internal_state_blob)?;
         if let Some(schemas) = &internal_state.physical_stats_schemas {
             schemas.validate()?;
         }
@@ -505,6 +565,8 @@ impl ScanLogReplayProcessor {
         };
 
         let state_info = Arc::new(StateInfo {
+            #[cfg(feature = "limited-memory")]
+            allocator: crate::memory::MemoryBudget::current().map(|budget| budget.allocator()),
             logical_schema: internal_state.logical_schema,
             physical_schema: internal_state.physical_schema,
             physical_predicate,
@@ -519,14 +581,29 @@ impl ScanLogReplayProcessor {
             dv_normalization_root: internal_state.dv_normalization_root,
         });
 
-        Self::new_with_seen_files(
+        #[cfg(feature = "limited-memory")]
+        if state.limited_seen_file_keys.is_some() && !state.seen_file_keys.is_empty() {
+            return Err(KernelError::generic(
+                "serialized scan state contains competing key owners",
+            ));
+        }
+        let processor = Self::new_with_seen_files(
             engine,
             state_info,
             state.checkpoint_info,
             state.seen_file_keys,
             internal_state.stats_options,
             internal_state.partition_values_options,
-        )
+        )?;
+        #[cfg(feature = "limited-memory")]
+        let processor = {
+            let mut processor = processor;
+            if let Some(keys) = state.limited_seen_file_keys {
+                processor.limited_keys = Some(keys);
+            }
+            processor
+        };
+        Ok(processor)
     }
 
     /// The source of `partitionValues_parsed` in the batch type being processed.
@@ -718,7 +795,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         };
 
         // Check both adds and removes (skipping already-seen), but only transform and return adds
-        if self.deduplicator.check_and_record_seen(file_key) || !is_add {
+        if self.deduplicator.try_check_and_record_seen(file_key)? || !is_add {
             return Ok(false);
         }
 
@@ -1111,6 +1188,8 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
             Self::ADD_DV_START_INDEX,
             self.state_info.dv_normalization_root.clone(),
         )?;
+        #[cfg(feature = "limited-memory")]
+        let deduplicator = deduplicator.with_limited_keys(self.limited_keys.as_ref());
         let (dedup_selection, row_transform_exprs, active_add_file_sizes) = {
             let mut visitor = AddRemoveDedupVisitor::new(
                 deduplicator,
@@ -1159,7 +1238,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
             self.partition_values_source(is_log_batch),
         )?;
         self.metrics
-            .update_peak_hash_set_size(self.seen_file_keys.len());
+            .update_peak_hash_set_size(self.seen_key_count());
         Ok(scan_metadata)
     }
 }
@@ -1223,6 +1302,8 @@ impl ScanLogReplayProcessor {
             Self::REMOVE_DV_START_INDEX,
             self.state_info.dv_normalization_root.clone(),
         );
+        #[cfg(feature = "limited-memory")]
+        let deduplicator = deduplicator.with_limited_keys(self.limited_keys.as_mut());
         let (dedup_selection, row_transform_exprs, active_add_file_sizes) = {
             let mut visitor = AddRemoveDedupVisitor::new(
                 deduplicator,
@@ -1271,7 +1352,7 @@ impl ScanLogReplayProcessor {
             self.partition_values_source(is_log_batch),
         )?;
         self.metrics
-            .update_peak_hash_set_size(self.seen_file_keys.len());
+            .update_peak_hash_set_size(self.seen_key_count());
         Ok(scan_metadata)
     }
 
@@ -1602,6 +1683,8 @@ mod tests {
         let batch = vec![add_batch_simple(COMMIT_READ_SCHEMA.clone())];
         let logical_schema = schema_ref! {};
         let state_info = Arc::new(StateInfo {
+            #[cfg(feature = "limited-memory")]
+            allocator: crate::memory::MemoryBudget::current().map(|budget| budget.allocator()),
             logical_schema: logical_schema.clone(),
             physical_schema: logical_schema.clone(),
             physical_predicate: PhysicalPredicate::None,
@@ -2098,6 +2181,8 @@ mod tests {
         ] {
             let schema: SchemaRef = schema_ref! { nullable "id": INTEGER };
             let state_info = Arc::new(StateInfo {
+                #[cfg(feature = "limited-memory")]
+                allocator: crate::memory::MemoryBudget::current().map(|budget| budget.allocator()),
                 logical_schema: schema.clone(),
                 physical_schema: schema,
                 physical_predicate: PhysicalPredicate::None,
@@ -2136,6 +2221,8 @@ mod tests {
         let checkpoint_info = test_checkpoint_info();
         let schema: SchemaRef = schema_ref! { nullable "id": INTEGER };
         let state_info = Arc::new(StateInfo {
+            #[cfg(feature = "limited-memory")]
+            allocator: crate::memory::MemoryBudget::current().map(|budget| budget.allocator()),
             logical_schema: schema.clone(),
             physical_schema: schema,
             physical_predicate: PhysicalPredicate::None,
@@ -2170,6 +2257,8 @@ mod tests {
         let engine = SyncEngine::new();
         let schema: SchemaRef = schema_ref! { nullable "id": INTEGER };
         let state_info = Arc::new(StateInfo {
+            #[cfg(feature = "limited-memory")]
+            allocator: crate::memory::MemoryBudget::current().map(|budget| budget.allocator()),
             logical_schema: schema.clone(),
             physical_schema: schema,
             physical_predicate: PhysicalPredicate::None,
@@ -2204,6 +2293,8 @@ mod tests {
             nullable "id": INTEGER,
         };
         let state_info = Arc::new(StateInfo {
+            #[cfg(feature = "limited-memory")]
+            allocator: crate::memory::MemoryBudget::current().map(|budget| budget.allocator()),
             logical_schema: schema.clone(),
             physical_schema: schema.clone(),
             physical_predicate: PhysicalPredicate::None,
@@ -2239,6 +2330,8 @@ mod tests {
     ) -> ScanLogReplayProcessor {
         let schema: SchemaRef = schema_ref! { nullable "id": INTEGER };
         let state_info = Arc::new(StateInfo {
+            #[cfg(feature = "limited-memory")]
+            allocator: crate::memory::MemoryBudget::current().map(|budget| budget.allocator()),
             logical_schema: schema.clone(),
             physical_schema: schema,
             physical_predicate: PhysicalPredicate::None,
@@ -2303,9 +2396,13 @@ mod tests {
         let engine = SyncEngine::new();
         let checkpoint_info = test_checkpoint_info();
         let invalid_state = SerializableScanState {
+            #[cfg(feature = "limited-memory")]
+            allocator: None,
             predicate: None,
             internal_state_blob: vec![0, 1, 2, 3, 255], // Invalid JSON
             seen_file_keys: HashSet::new(),
+            #[cfg(feature = "limited-memory")]
+            limited_seen_file_keys: None,
             checkpoint_info,
         };
         assert!(ScanLogReplayProcessor::from_serializable_state(&engine, invalid_state).is_err());
@@ -2336,9 +2433,13 @@ mod tests {
         let predicate = Arc::new(crate::expressions::column_pred!("id"));
         let invalid_blob = serde_json::to_vec(&invalid_internal_state).unwrap();
         let invalid_state = SerializableScanState {
+            #[cfg(feature = "limited-memory")]
+            allocator: None,
             predicate: Some(predicate), // Predicate exists but schema is None
             internal_state_blob: invalid_blob,
             seen_file_keys: HashSet::new(),
+            #[cfg(feature = "limited-memory")]
+            limited_seen_file_keys: None,
             checkpoint_info,
         };
         let result = ScanLogReplayProcessor::from_serializable_state(&engine, invalid_state);
@@ -2379,9 +2480,13 @@ mod tests {
     #[test]
     fn deserialize_serializable_scan_state_with_extra_fields_fails() {
         let state = SerializableScanState {
+            #[cfg(feature = "limited-memory")]
+            allocator: None,
             predicate: None,
             internal_state_blob: vec![],
             seen_file_keys: HashSet::new(),
+            #[cfg(feature = "limited-memory")]
+            limited_seen_file_keys: None,
             checkpoint_info: test_checkpoint_info(),
         };
         let blob = serde_json::to_string(&state).unwrap();
@@ -2403,9 +2508,13 @@ mod tests {
 
         // Directly create a SerializableScanState with the opaque predicate
         let state = SerializableScanState {
+            #[cfg(feature = "limited-memory")]
+            allocator: None,
             predicate: Some(opaque_predicate),
             internal_state_blob: vec![],
             seen_file_keys: HashSet::new(),
+            #[cfg(feature = "limited-memory")]
+            limited_seen_file_keys: None,
             checkpoint_info: test_checkpoint_info(),
         };
 

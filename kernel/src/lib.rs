@@ -108,6 +108,9 @@ pub mod incremental_scan;
 mod log_compaction;
 mod log_path;
 mod log_reader;
+#[cfg(feature = "limited-memory")]
+#[clippy::msrv = "1.100"]
+pub mod memory;
 pub mod metrics;
 pub mod partition;
 pub(crate) mod path_encoding;

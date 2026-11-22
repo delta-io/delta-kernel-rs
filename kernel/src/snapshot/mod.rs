@@ -135,6 +135,8 @@ pub enum CheckpointWriteResult {
 ///
 /// [snapshot management guide]: https://docs.delta.io/kernel/rust/reading/time_travel.html
 pub struct Snapshot {
+    #[cfg(feature = "limited-memory")]
+    allocator: Option<crate::memory::LimitedAllocator>,
     span: tracing::Span,
     log_segment: LogSegment,
     table_configuration: TableConfiguration,
@@ -219,6 +221,15 @@ struct PreparedSnapshot {
 }
 
 impl Snapshot {
+    /// Return the allocator inherited by new scans, transactions, and snapshot updates.
+    ///
+    /// Retained storage keeps its original allocator, including storage shared from older
+    /// snapshots. This is an experimental partial allocation cap, not a bound on native memory.
+    #[cfg(feature = "limited-memory")]
+    pub fn memory_allocator(&self) -> Option<&crate::memory::LimitedAllocator> {
+        self.allocator.as_ref()
+    }
+
     // ============================================================================
     // Construction entry points
     // ============================================================================
@@ -339,6 +350,8 @@ impl Snapshot {
         };
         Self {
             span,
+            #[cfg(feature = "limited-memory")]
+            allocator: crate::memory::MemoryBudget::current().map(|budget| budget.allocator()),
             log_segment,
             table_configuration,
             crc,
@@ -371,6 +384,8 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<Arc<CheckpointInfo>>> {
+        #[cfg(feature = "limited-memory")]
+        let _scope = crate::memory::AllocationScope::new(self.memory_allocator());
         if let Some(resolved) = self.checkpoint_info.get() {
             return Ok(resolved.clone());
         }
@@ -632,6 +647,7 @@ impl Snapshot {
         &self,
         commit: ParsedLogPath,
         crc_delta: CrcDelta,
+        #[cfg(feature = "limited-memory")] prepared_configuration: Option<TableConfiguration>,
         #[cfg(feature = "adaptive-metadata-in-dev")] checkpoint_action: Option<CheckpointAction>,
     ) -> Result<Self> {
         require!(
@@ -652,12 +668,26 @@ impl Snapshot {
             )))
         );
 
+        #[cfg(not(feature = "limited-memory"))]
         let new_table_configuration = TableConfiguration::new_post_commit(
             self.table_configuration(),
             new_version,
             crc_delta.metadata.clone(),
             crc_delta.protocol.clone(),
         )?;
+
+        // Reuse the configuration validated while building the transaction. Re-parsing after
+        // publication could turn a successful commit into a budget-exhaustion error.
+        #[cfg(feature = "limited-memory")]
+        let new_table_configuration = match prepared_configuration {
+            Some(configuration) => configuration,
+            None => TableConfiguration::new_post_commit(
+                self.table_configuration(),
+                new_version,
+                crc_delta.metadata.clone(),
+                crc_delta.protocol.clone(),
+            )?,
+        };
 
         let new_log_segment = self.log_segment.new_with_commit_appended(commit)?;
 
@@ -2083,6 +2113,8 @@ impl Snapshot {
         engine: &dyn Engine,
         committer: &dyn Committer,
     ) -> Result<SnapshotRef> {
+        #[cfg(feature = "limited-memory")]
+        let _scope = crate::memory::AllocationScope::new(self.memory_allocator());
         // TODO(#3929): Emit metrics for commits submitted, metadata lookups, duration, and outcome.
         let unpublished_catalog_commits = self.log_segment().get_unpublished_catalog_commits()?;
 
@@ -2261,7 +2293,7 @@ mod tests {
         let segment = LogSegment::try_new(
             LogSegmentFiles {
                 latest_commit_file: commits.last().cloned(),
-                ascending_commit_files: commits,
+                ascending_commit_files: crate::log_segment_files::commit_files(commits),
                 checkpoint_parts: vec![checkpoint],
                 latest_crc_file: observed_crc
                     .then(|| ParsedLogPath::create_parsed_crc(&table_root, 0)),
@@ -3582,6 +3614,8 @@ mod tests {
             .new_post_commit(
                 fake_new_commit,
                 CrcDelta::default(),
+                #[cfg(feature = "limited-memory")]
+                None,
                 #[cfg(feature = "adaptive-metadata-in-dev")]
                 None,
             )
@@ -3627,6 +3661,8 @@ mod tests {
             .new_post_commit(
                 commit,
                 CrcDelta::default(),
+                #[cfg(feature = "limited-memory")]
+                None,
                 #[cfg(feature = "adaptive-metadata-in-dev")]
                 None,
             )

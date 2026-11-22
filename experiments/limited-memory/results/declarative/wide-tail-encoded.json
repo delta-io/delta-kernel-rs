@@ -1,0 +1,530 @@
+{
+  "fixture": {
+    "action_stats_bytes": 0,
+    "checkpoint_parsed_stats": false,
+    "checkpoints": 1,
+    "indexed_stats_columns": -1,
+    "initial_files": 1000,
+    "path": "/var/folders/gy/1kdbw3sj2bsg9q12x502jtfm0000gp/T/.tmpI99HOc",
+    "schema_fields": 30000,
+    "schema_json_bytes": 11301270,
+    "table_root": "file:///private/var/folders/gy/1kdbw3sj2bsg9q12x502jtfm0000gp/T/.tmpI99HOc/",
+    "tail_commits": 10000,
+    "width": 10000
+  },
+  "runs": [
+    {
+      "after_allocator_relief": {
+        "elapsed_us": 1402564,
+        "limited_live": 0,
+        "limited_peak": 250112706,
+        "os_peak_rss_bytes": 611909632,
+        "rss_bytes": 516292608,
+        "rust_requested_live": 84582,
+        "rust_requested_peak": 296535181
+      },
+      "after_cleanup": {
+        "elapsed_us": 1401568,
+        "limited_live": 0,
+        "limited_peak": 250112706,
+        "os_peak_rss_bytes": 611909632,
+        "rss_bytes": 516308992,
+        "rust_requested_live": 84910,
+        "rust_requested_peak": 296535181
+      },
+      "allocator_reported_relieved_bytes": 0,
+      "baseline": {
+        "elapsed_us": 168,
+        "limited_live": 0,
+        "limited_peak": 0,
+        "os_peak_rss_bytes": 8323072,
+        "rss_bytes": 8323072,
+        "rust_requested_live": 3800,
+        "rust_requested_peak": 3800
+      },
+      "before_allocator_relief": {
+        "elapsed_us": 1402562,
+        "limited_live": 0,
+        "limited_peak": 250112706,
+        "os_peak_rss_bytes": 611909632,
+        "rss_bytes": 516292608,
+        "rust_requested_live": 84582,
+        "rust_requested_peak": 296535181
+      },
+      "cap_bytes": 536870912,
+      "cold_baseline": {
+        "elapsed_us": 0,
+        "limited_live": 0,
+        "limited_peak": 0,
+        "os_peak_rss_bytes": 7897088,
+        "rss_bytes": 7897088,
+        "rust_requested_live": 848,
+        "rust_requested_peak": 947
+      },
+      "concurrency": 1,
+      "kind": "fresh_process_rss",
+      "limited_rejections": 0,
+      "measurement": "No DHAT. RSS is OS resident bytes; Rust counts are requested layouts. Samples are adjacent atomic/OS observations, not a transactionally consistent snapshot. Fixture preparation and copies ran in other processes. A zero cap disables participating limits.",
+      "mode": "declarative",
+      "results": [
+        {
+          "Ok": {
+            "declarative_commit_supported": false,
+            "engine_ops": 3,
+            "largest_engine_op_proto_bytes": 1601556,
+            "metadata_plan_nodes": 15,
+            "metadata_plan_proto_bytes": 12140985,
+            "snapshot_version": 10001,
+            "staged_relations": 1,
+            "write_state_bytes": 34422173
+          }
+        }
+      ],
+      "samples": {
+        "at_max_sampled_limited_live": {
+          "elapsed_us": 1319727,
+          "limited_live": 241724098,
+          "limited_peak": 250112706,
+          "os_peak_rss_bytes": 558596096,
+          "rss_bytes": 558596096,
+          "rust_requested_live": 288146573,
+          "rust_requested_peak": 296535181
+        },
+        "at_max_sampled_rss": {
+          "elapsed_us": 1381394,
+          "limited_live": 20492444,
+          "limited_peak": 250112706,
+          "os_peak_rss_bytes": 611909632,
+          "rss_bytes": 611909632,
+          "rust_requested_live": 22589073,
+          "rust_requested_peak": 296535181
+        },
+        "at_max_sampled_rust_live": {
+          "elapsed_us": 1319727,
+          "limited_live": 241724098,
+          "limited_peak": 250112706,
+          "os_peak_rss_bytes": 558596096,
+          "rss_bytes": 558596096,
+          "rust_requested_live": 288146573,
+          "rust_requested_peak": 296535181
+        },
+        "count": 1121
+      },
+      "stages": [
+        {
+          "elapsed_us": 1043015,
+          "limited_live": 38960058,
+          "limited_peak": 38960058,
+          "name": "declarative_snapshot_ready_mock_engine_included",
+          "os_peak_rss_bytes": 330416128,
+          "rss_bytes": 327729152,
+          "rust_requested_live": 44406133,
+          "rust_requested_peak": 255263914,
+          "rust_requested_peak_since_previous_stage": 255263914,
+          "worker": 0
+        },
+        {
+          "elapsed_us": 1047704,
+          "limited_live": 38971146,
+          "limited_peak": 50312243,
+          "name": "declarative_checkpoint_info_ready_mock_engine_included",
+          "os_peak_rss_bytes": 339181568,
+          "rss_bytes": 339181568,
+          "rust_requested_live": 44429388,
+          "rust_requested_peak": 255263914,
+          "rust_requested_peak_since_previous_stage": 55930351,
+          "worker": 0
+        },
+        {
+          "elapsed_us": 1185132,
+          "limited_live": 85452634,
+          "limited_peak": 131934186,
+          "name": "declarative_scan_state_built",
+          "os_peak_rss_bytes": 426967040,
+          "rss_bytes": 426967040,
+          "rust_requested_live": 101615824,
+          "rust_requested_peak": 255263914,
+          "rust_requested_peak_since_previous_stage": 161653868,
+          "worker": 0
+        },
+        {
+          "elapsed_us": 1291510,
+          "limited_live": 224946882,
+          "limited_peak": 224946882,
+          "name": "declarative_metadata_plan_built_no_execution",
+          "os_peak_rss_bytes": 539328512,
+          "rss_bytes": 539328512,
+          "rust_requested_live": 271369357,
+          "rust_requested_peak": 276112931,
+          "rust_requested_peak_since_previous_stage": 276112931,
+          "worker": 0
+        },
+        {
+          "elapsed_us": 1319757,
+          "limited_live": 241724098,
+          "limited_peak": 250112706,
+          "name": "declarative_metadata_plan_proto_live_no_execution",
+          "os_peak_rss_bytes": 558596096,
+          "rss_bytes": 558596096,
+          "rust_requested_live": 288146621,
+          "rust_requested_peak": 296535181,
+          "rust_requested_peak_since_previous_stage": 296535181,
+          "worker": 0
+        },
+        {
+          "elapsed_us": 1346623,
+          "limited_live": 102229850,
+          "limited_peak": 250112706,
+          "name": "declarative_metadata_plan_owned_wire_live",
+          "os_peak_rss_bytes": 558678016,
+          "rss_bytes": 558678016,
+          "rust_requested_live": 118452435,
+          "rust_requested_peak": 296535181,
+          "rust_requested_peak_since_previous_stage": 288146621,
+          "worker": 0
+        },
+        {
+          "elapsed_us": 1346628,
+          "limited_live": 85452634,
+          "limited_peak": 250112706,
+          "name": "declarative_metadata_plan_released",
+          "os_peak_rss_bytes": 558678016,
+          "rss_bytes": 558678016,
+          "rust_requested_live": 101675171,
+          "rust_requested_peak": 296535181,
+          "rust_requested_peak_since_previous_stage": 118452435,
+          "worker": 0
+        },
+        {
+          "elapsed_us": 1346659,
+          "limited_live": 85452634,
+          "limited_peak": 250112706,
+          "name": "declarative_transaction_relations_staged",
+          "os_peak_rss_bytes": 558759936,
+          "rss_bytes": 558759936,
+          "rust_requested_live": 101680482,
+          "rust_requested_peak": 296535181,
+          "rust_requested_peak_since_previous_stage": 101681060,
+          "worker": 0
+        },
+        {
+          "elapsed_us": 1368342,
+          "limited_live": 122583594,
+          "limited_peak": 250112706,
+          "name": "declarative_write_state_encoded_live",
+          "os_peak_rss_bytes": 611860480,
+          "rss_bytes": 611860480,
+          "rust_requested_live": 140736082,
+          "rust_requested_peak": 296535181,
+          "rust_requested_peak_since_previous_stage": 159301514,
+          "worker": 0
+        },
+        {
+          "elapsed_us": 1379873,
+          "limited_live": 38971146,
+          "limited_peak": 250112706,
+          "name": "declarative_read_write_owners_released",
+          "os_peak_rss_bytes": 611909632,
+          "rss_bytes": 611909632,
+          "rust_requested_live": 44493479,
+          "rust_requested_peak": 296535181,
+          "rust_requested_peak_since_previous_stage": 140736082,
+          "worker": 0
+        },
+        {
+          "elapsed_us": 1401505,
+          "limited_live": 0,
+          "limited_peak": 250112706,
+          "name": "owners_dropped",
+          "os_peak_rss_bytes": 611909632,
+          "rss_bytes": 516374528,
+          "rust_requested_live": 85678,
+          "rust_requested_peak": 296535181,
+          "rust_requested_peak_since_previous_stage": 44493479,
+          "worker": 0
+        }
+      ],
+      "warmup_enabled": false,
+      "workload_elapsed_us": 1401400,
+      "published_next_commit": [
+        false
+      ]
+    },
+    {
+      "after_allocator_relief": {
+        "elapsed_us": 1230995,
+        "limited_live": 0,
+        "limited_peak": 134217666,
+        "os_peak_rss_bytes": 430505984,
+        "rss_bytes": 430407680,
+        "rust_requested_live": 79942,
+        "rust_requested_peak": 255263914
+      },
+      "after_cleanup": {
+        "elapsed_us": 1230533,
+        "limited_live": 0,
+        "limited_peak": 134217666,
+        "os_peak_rss_bytes": 430505984,
+        "rss_bytes": 430424064,
+        "rust_requested_live": 80270,
+        "rust_requested_peak": 255263914
+      },
+      "allocator_reported_relieved_bytes": 0,
+      "baseline": {
+        "elapsed_us": 184,
+        "limited_live": 0,
+        "limited_peak": 0,
+        "os_peak_rss_bytes": 8323072,
+        "rss_bytes": 8323072,
+        "rust_requested_live": 3800,
+        "rust_requested_peak": 3800
+      },
+      "before_allocator_relief": {
+        "elapsed_us": 1230993,
+        "limited_live": 0,
+        "limited_peak": 134217666,
+        "os_peak_rss_bytes": 430505984,
+        "rss_bytes": 430407680,
+        "rust_requested_live": 79942,
+        "rust_requested_peak": 255263914
+      },
+      "cap_bytes": 134217728,
+      "cold_baseline": {
+        "elapsed_us": 0,
+        "limited_live": 0,
+        "limited_peak": 0,
+        "os_peak_rss_bytes": 7897088,
+        "rss_bytes": 7897088,
+        "rust_requested_live": 848,
+        "rust_requested_peak": 947
+      },
+      "concurrency": 1,
+      "kind": "fresh_process_rss",
+      "limited_rejections": 1,
+      "measurement": "No DHAT. RSS is OS resident bytes; Rust counts are requested layouts. Samples are adjacent atomic/OS observations, not a transactionally consistent snapshot. Fixture preparation and copies ran in other processes. A zero cap disables participating limits.",
+      "mode": "declarative",
+      "results": [
+        {
+          "Err": "allocation failed under a 134217728-byte metadata budget"
+        }
+      ],
+      "samples": {
+        "at_max_sampled_limited_live": {
+          "elapsed_us": 1209615,
+          "limited_live": 133899482,
+          "limited_peak": 134217666,
+          "os_peak_rss_bytes": 430440448,
+          "rss_bytes": 430440448,
+          "rust_requested_live": 163988428,
+          "rust_requested_peak": 255263914
+        },
+        "at_max_sampled_rss": {
+          "elapsed_us": 1229714,
+          "limited_live": 4185648,
+          "limited_peak": 134217666,
+          "os_peak_rss_bytes": 430473216,
+          "rss_bytes": 430473216,
+          "rust_requested_live": 4978027,
+          "rust_requested_peak": 255263914
+        },
+        "at_max_sampled_rust_live": {
+          "elapsed_us": 955400,
+          "limited_live": 4984600,
+          "limited_peak": 16325201,
+          "os_peak_rss_bytes": 327892992,
+          "rss_bytes": 327892992,
+          "rust_requested_live": 254969361,
+          "rust_requested_peak": 255263914
+        },
+        "count": 976
+      },
+      "stages": [
+        {
+          "elapsed_us": 1056400,
+          "limited_live": 38960058,
+          "limited_peak": 38960058,
+          "name": "declarative_snapshot_ready_mock_engine_included",
+          "os_peak_rss_bytes": 330448896,
+          "rss_bytes": 325320704,
+          "rust_requested_live": 44406133,
+          "rust_requested_peak": 255263914,
+          "rust_requested_peak_since_previous_stage": 255263914,
+          "worker": 0
+        },
+        {
+          "elapsed_us": 1059643,
+          "limited_live": 38971146,
+          "limited_peak": 50312243,
+          "name": "declarative_checkpoint_info_ready_mock_engine_included",
+          "os_peak_rss_bytes": 336756736,
+          "rss_bytes": 336756736,
+          "rust_requested_live": 44429388,
+          "rust_requested_peak": 255263914,
+          "rust_requested_peak_since_previous_stage": 55930351,
+          "worker": 0
+        },
+        {
+          "elapsed_us": 1172413,
+          "limited_live": 85452634,
+          "limited_peak": 131934186,
+          "name": "declarative_scan_state_built",
+          "os_peak_rss_bytes": 424837120,
+          "rss_bytes": 424837120,
+          "rust_requested_live": 101615824,
+          "rust_requested_peak": 255263914,
+          "rust_requested_peak_since_previous_stage": 161653868,
+          "worker": 0
+        },
+        {
+          "elapsed_us": 1230414,
+          "limited_live": 0,
+          "limited_peak": 134217666,
+          "name": "owners_dropped",
+          "os_peak_rss_bytes": 430473216,
+          "rss_bytes": 430473216,
+          "rust_requested_live": 80934,
+          "rust_requested_peak": 255263914,
+          "rust_requested_peak_since_previous_stage": 164382818,
+          "worker": 0
+        }
+      ],
+      "warmup_enabled": false,
+      "workload_elapsed_us": 1230349,
+      "published_next_commit": [
+        false
+      ]
+    },
+    {
+      "after_allocator_relief": {
+        "elapsed_us": 1032087,
+        "limited_live": 0,
+        "limited_peak": 67108754,
+        "os_peak_rss_bytes": 356007936,
+        "rss_bytes": 355909632,
+        "rust_requested_live": 20594,
+        "rust_requested_peak": 255263913
+      },
+      "after_cleanup": {
+        "elapsed_us": 1031135,
+        "limited_live": 0,
+        "limited_peak": 67108754,
+        "os_peak_rss_bytes": 356007936,
+        "rss_bytes": 355926016,
+        "rust_requested_live": 20922,
+        "rust_requested_peak": 255263913
+      },
+      "allocator_reported_relieved_bytes": 0,
+      "baseline": {
+        "elapsed_us": 140,
+        "limited_live": 0,
+        "limited_peak": 0,
+        "os_peak_rss_bytes": 8323072,
+        "rss_bytes": 8323072,
+        "rust_requested_live": 3799,
+        "rust_requested_peak": 3799
+      },
+      "before_allocator_relief": {
+        "elapsed_us": 1032083,
+        "limited_live": 0,
+        "limited_peak": 67108754,
+        "os_peak_rss_bytes": 356007936,
+        "rss_bytes": 355909632,
+        "rust_requested_live": 20594,
+        "rust_requested_peak": 255263913
+      },
+      "cap_bytes": 67108864,
+      "cold_baseline": {
+        "elapsed_us": 0,
+        "limited_live": 0,
+        "limited_peak": 0,
+        "os_peak_rss_bytes": 7897088,
+        "rss_bytes": 7897088,
+        "rust_requested_live": 847,
+        "rust_requested_peak": 946
+      },
+      "concurrency": 1,
+      "kind": "fresh_process_rss",
+      "limited_rejections": 1,
+      "measurement": "No DHAT. RSS is OS resident bytes; Rust counts are requested layouts. Samples are adjacent atomic/OS observations, not a transactionally consistent snapshot. Fixture preparation and copies ran in other processes. A zero cap disables participating limits.",
+      "mode": "declarative",
+      "results": [
+        {
+          "Err": "allocation failed under a 67108864-byte metadata budget"
+        }
+      ],
+      "samples": {
+        "at_max_sampled_limited_live": {
+          "elapsed_us": 1022003,
+          "limited_live": 65535962,
+          "limited_peak": 65535962,
+          "os_peak_rss_bytes": 354418688,
+          "rss_bytes": 354418688,
+          "rust_requested_live": 77941652,
+          "rust_requested_peak": 255263913
+        },
+        "at_max_sampled_rss": {
+          "elapsed_us": 1030790,
+          "limited_live": 2328024,
+          "limited_peak": 67108754,
+          "os_peak_rss_bytes": 355958784,
+          "rss_bytes": 355958784,
+          "rust_requested_live": 2669914,
+          "rust_requested_peak": 255263913
+        },
+        "at_max_sampled_rust_live": {
+          "elapsed_us": 903518,
+          "limited_live": 4984600,
+          "limited_peak": 16325201,
+          "os_peak_rss_bytes": 327778304,
+          "rss_bytes": 327778304,
+          "rust_requested_live": 255186088,
+          "rust_requested_peak": 255263913
+        },
+        "count": 825
+      },
+      "stages": [
+        {
+          "elapsed_us": 1003834,
+          "limited_live": 38960058,
+          "limited_peak": 38960058,
+          "name": "declarative_snapshot_ready_mock_engine_included",
+          "os_peak_rss_bytes": 330383360,
+          "rss_bytes": 325287936,
+          "rust_requested_live": 44406132,
+          "rust_requested_peak": 255263913,
+          "rust_requested_peak_since_previous_stage": 255263913,
+          "worker": 0
+        },
+        {
+          "elapsed_us": 1007100,
+          "limited_live": 38971146,
+          "limited_peak": 50312243,
+          "name": "declarative_checkpoint_info_ready_mock_engine_included",
+          "os_peak_rss_bytes": 336740352,
+          "rss_bytes": 336740352,
+          "rust_requested_live": 44429387,
+          "rust_requested_peak": 255263913,
+          "rust_requested_peak_since_previous_stage": 55930350,
+          "worker": 0
+        },
+        {
+          "elapsed_us": 1031090,
+          "limited_live": 0,
+          "limited_peak": 67108754,
+          "name": "owners_dropped",
+          "os_peak_rss_bytes": 355975168,
+          "rss_bytes": 355975168,
+          "rust_requested_live": 21586,
+          "rust_requested_peak": 255263913,
+          "rust_requested_peak_since_previous_stage": 79841758,
+          "worker": 0
+        }
+      ],
+      "warmup_enabled": false,
+      "workload_elapsed_us": 1030995,
+      "published_next_commit": [
+        false
+      ]
+    }
+  ]
+}

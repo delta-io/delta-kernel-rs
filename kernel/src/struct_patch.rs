@@ -676,7 +676,7 @@ fn schema_walk<Item: SchemaPatchItem>(
         let field_patch = fields.remove(field_name).unwrap_or_default();
         match field_patch.action {
             FieldPatchOp::Drop { .. } => {}
-            FieldPatchOp::Keep => output.push(input_field.clone()),
+            FieldPatchOp::Keep => output.push(input_field.try_clone()?),
             FieldPatchOp::Replace(item) => output.push(item.into_field()),
             FieldPatchOp::Nested(node) => {
                 let DataType::Struct(nested_schema) = input_field.data_type() else {
@@ -688,7 +688,7 @@ fn schema_walk<Item: SchemaPatchItem>(
                 let children = schema_walk(*node, nested_schema)?;
                 let field = StructField::new(
                     input_field.name(),
-                    StructType::try_new(children)?,
+                    DataType::try_from_struct(StructType::try_new(children)?)?,
                     input_field.nullable,
                 );
                 output.push(field.with_metadata(input_field.metadata.clone()));
@@ -750,7 +750,7 @@ impl<'a> ProjectionStructPatchBuilder<'a> {
         .into_iter()
         .collect();
         let field = self.input_schema.field_at(&field_path)?;
-        Ok(field.clone())
+        field.try_clone()
     }
 
     /// Creates a new top-level projection patch builder over `input_schema`.

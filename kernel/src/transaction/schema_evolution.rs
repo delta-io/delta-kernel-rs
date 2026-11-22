@@ -64,9 +64,15 @@ fn add_field(parent: &mut StructType, field: StructField, parent_path: String) -
             parent_path,
         )));
     }
+    #[cfg(not(feature = "limited-memory"))]
     parent
         .field_map_mut()
         .insert(field.name().clone(), Arc::new(field));
+    #[cfg(feature = "limited-memory")]
+    parent.field_map_mut().try_insert(
+        field.name().clone(),
+        Arc::new(crate::memory::Owned::try_new(field)?),
+    )?;
     Ok(())
 }
 
@@ -227,7 +233,7 @@ pub(crate) fn apply_schema_operations(
                 "schema root changed type during schema evolution",
             ));
         };
-        schema = *updated_schema;
+        schema = crate::schema::unbox_data_type(updated_schema);
     }
 
     validate_schema(&schema, column_mapping_mode, cdf_enabled)?;
@@ -498,7 +504,7 @@ mod tests {
         DataType::INTEGER,
         true,
     )))]
-    #[case::variant(DataType::Variant(Box::new(struct_with_generation_expression())))]
+    #[case::variant(DataType::Variant(struct_with_generation_expression().into()))]
     fn rejects_nested_generation_expression_on_added_field(#[case] data_type: DataType) {
         let field = StructField::nullable("added", data_type);
         let operation = SchemaOperation::add_column(None, field);

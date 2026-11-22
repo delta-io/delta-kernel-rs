@@ -3,7 +3,13 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, LazyLock};
+#[cfg(any(
+    not(feature = "limited-memory"),
+    feature = "adaptive-metadata-in-dev",
+    test
+))]
+use std::sync::Arc;
+use std::sync::LazyLock;
 
 use delta_kernel_derive::{IntoStructData, ToSchema, TryFromStructData, internal_api};
 use derive_more::Constructor;
@@ -49,6 +55,26 @@ pub mod deletion_vector_writer;
 pub mod set_transaction;
 
 mod schema_deserializer;
+
+#[cfg(feature = "limited-memory")]
+type SchemaString = crate::memory::SharedString;
+#[cfg(not(feature = "limited-memory"))]
+type SchemaString = Arc<String>;
+#[cfg(feature = "limited-memory")]
+type SchemaStringView = crate::memory::SharedString;
+#[cfg(not(feature = "limited-memory"))]
+type SchemaStringView = String;
+
+fn serialize_schema_string(schema: &SchemaRef) -> KernelResult<SchemaString> {
+    #[cfg(feature = "limited-memory")]
+    {
+        crate::memory::SharedString::try_to_json(schema)
+    }
+    #[cfg(not(feature = "limited-memory"))]
+    {
+        Ok(Arc::new(serde_json::to_string(schema)?))
+    }
+}
 
 // see comment in ../lib.rs for the path module for why we include this way
 #[cfg(feature = "internal-api")]
@@ -353,7 +379,7 @@ pub struct Metadata {
     /// Specification of the encoding for the files stored in the table
     format: Format,
     /// Schema JSON, shared to avoid copying large schemas when cloning metadata.
-    schema_string: Arc<String>,
+    schema_string: SchemaString,
     /// Column names by which the data should be partitioned
     partition_columns: Vec<String>,
     /// The time when this metadata action is created, in milliseconds since the Unix epoch
@@ -389,7 +415,7 @@ impl Metadata {
                 provider: format_provider,
                 options: format_options,
             },
-            schema_string: Arc::new(schema_string),
+            schema_string: schema_string.into(),
             partition_columns,
             created_time,
             configuration,
@@ -429,7 +455,7 @@ impl Metadata {
             // both for legacy reasons and to enable possible support for other formats in the
             // future (See delta-io/delta#87).
             format: Format::default(),
-            schema_string: Arc::new(serde_json::to_string(&schema)?),
+            schema_string: serialize_schema_string(&schema)?,
             partition_columns,
             created_time: Some(created_time),
             configuration,
@@ -487,7 +513,7 @@ impl Metadata {
     }
 
     #[internal_api]
-    pub(crate) fn schema_string(&self) -> &String {
+    pub(crate) fn schema_string(&self) -> &SchemaStringView {
         &self.schema_string
     }
 
@@ -529,7 +555,7 @@ impl Metadata {
     #[internal_api]
     pub(crate) fn with_schema(self, schema: SchemaRef) -> KernelResult<Self> {
         Ok(Self {
-            schema_string: Arc::new(serde_json::to_string(&schema)?),
+            schema_string: serialize_schema_string(&schema)?,
             ..self
         })
     }
@@ -563,7 +589,7 @@ impl Metadata {
             name,
             description,
             format,
-            schema_string: Arc::new(schema_string.into()),
+            schema_string: schema_string.into().into(),
             partition_columns,
             created_time,
             configuration,
@@ -2579,7 +2605,7 @@ mod tests {
     #[case::exceeded(332, true)]
     fn parse_schema_nesting_boundary(#[case] depth: usize, #[case] exceeds_limit: bool) {
         let metadata = Metadata {
-            schema_string: Arc::new(serde_json::to_string(&nested_schema(depth)).unwrap()),
+            schema_string: serde_json::to_string(&nested_schema(depth)).unwrap().into(),
             ..Default::default()
         };
 
@@ -3186,7 +3212,10 @@ mod tests {
         .unwrap();
         let saved_json = serde_json::to_value(&metadata).unwrap();
         let copy = metadata.clone();
+        #[cfg(not(feature = "limited-memory"))]
         assert!(Arc::ptr_eq(&metadata.schema_string, &copy.schema_string));
+        #[cfg(feature = "limited-memory")]
+        assert!(metadata.schema_string.ptr_eq(&copy.schema_string));
         let changed = metadata
             .with_schema(schema_ref! { nullable "name": STRING })
             .unwrap();

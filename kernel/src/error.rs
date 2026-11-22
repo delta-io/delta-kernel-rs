@@ -222,6 +222,10 @@ impl From<SnapshotHintError> for KernelError {
 #[non_exhaustive]
 #[derive(thiserror::Error, Debug)]
 pub enum KernelError {
+    /// A participating metadata allocation could not be satisfied.
+    #[cfg(feature = "limited-memory")]
+    #[error(transparent)]
+    Memory(crate::memory::MemoryError),
     /// This is an error that includes a backtrace. To have a particular type of error include such
     /// backtrace (when RUST_BACKTRACE=1), annotate the error with `#[error(transparent)]` and then
     /// add the error type and enum variant to the `from_with_backtrace!` macro invocation
@@ -730,6 +734,13 @@ from_with_backtrace!(
 #[cfg(feature = "default-engine-base")]
 impl From<ArrowError> for KernelError {
     fn from(value: ArrowError) -> Self {
+        #[cfg(feature = "limited-memory")]
+        if let ArrowError::ExternalError(source) = &value
+            && let Some(error) = source.downcast_ref::<KernelError>()
+            && let Self::Memory(failure) = error.without_backtrace()
+        {
+            return Self::Memory(*failure);
+        }
         Self::Arrow(value).with_backtrace()
     }
 }

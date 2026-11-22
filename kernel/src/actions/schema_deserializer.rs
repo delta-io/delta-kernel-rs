@@ -9,6 +9,8 @@ use crate::{KernelError, KernelResult, Result};
 
 /// Decodes a schema with a finite budget for visited JSON containers.
 pub(super) fn parse(json: &str, recursion_limit: usize) -> Result<StructType> {
+    #[cfg(feature = "limited-memory")]
+    crate::memory::take_failure();
     let mut deserializer = serde_json::Deserializer::from_str(json);
     deserializer.disable_recursion_limit();
     let exceeded = Cell::new(false);
@@ -22,6 +24,10 @@ pub(super) fn parse(json: &str, recursion_limit: usize) -> Result<StructType> {
     ))
     .and_then(|schema| deserializer.end().map(|()| schema))
     .map_err(|error| {
+        #[cfg(feature = "limited-memory")]
+        if let Some(failure) = crate::memory::take_failure() {
+            return KernelError::from(failure).into();
+        }
         if exceeded.get() {
             KernelError::schema(format!(
                 "Table schema is too deeply nested: decoding metaData.schemaString \
