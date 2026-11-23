@@ -47,9 +47,12 @@ impl MetadataReplayBase {
             ReplayBase::Empty
         });
         report.metadata_plan.base_version = checkpoint_version;
-        let resolved = snapshot.checkpoint_info_with_metrics(engine);
-        report.checkpoint = resolved.metrics;
-        let info = resolved.result?;
+        let info = if let Some(resolved) = snapshot.checkpoint_info_with_metrics(engine) {
+            report.checkpoint = Some(resolved.metrics);
+            Some(resolved.result?)
+        } else {
+            None
+        };
         Ok(Self::Checkpoint {
             version: checkpoint_version,
             info,

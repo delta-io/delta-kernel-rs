@@ -999,7 +999,7 @@ fn assert_metadata_output_options(
                 )),
                 checkpoint_version.map(|version| (
                     version,
-                    CheckpointSource::Resolved,
+                    Some(CheckpointSource::Resolved),
                     checkpoint_io
                 ))
             );
@@ -1544,7 +1544,7 @@ fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> Resu
             assert!(!report.has_filter);
             let checkpoint = event.checkpoint.as_ref().unwrap();
             assert!(checkpoint.info.is_none());
-            assert_eq!(checkpoint.source, CheckpointSource::None);
+            assert_eq!(checkpoint.source, None);
         },
     )
     .unwrap_err();

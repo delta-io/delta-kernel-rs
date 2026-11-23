@@ -120,7 +120,7 @@ pub(super) fn with_event<F: FnOnce(MetricEvent)>(
                 version: metrics.version,
                 checkpoint_type: metrics.checkpoint_type.map(Into::into).into(),
                 info,
-                source: metrics.source.into(),
+                source: metrics.source.map(Into::into).into(),
                 root_footer_calls: metrics.root_footer_calls,
                 sidecar_footer_calls: metrics.sidecar_footer_calls,
                 metadata_query_calls: metrics.metadata_query_calls,
@@ -242,7 +242,7 @@ mod tests {
                 version: 0,
                 checkpoint_type: None,
                 info,
-                source: kernel::CheckpointSource::Resolved,
+                source: Some(kernel::CheckpointSource::Resolved),
                 root_footer_calls: 1,
                 sidecar_footer_calls: 0,
                 metadata_query_calls: 0,
@@ -349,7 +349,10 @@ mod tests {
                     assert_eq!(sidecars[0].modification_time, 23);
                 }
                 assert_eq!(checkpoint.checkpoint_type, OptionalValue::None);
-                assert_eq!(checkpoint.source, FfiCheckpointSource::Resolved);
+                assert_eq!(
+                    checkpoint.source,
+                    OptionalValue::Some(FfiCheckpointSource::Resolved)
+                );
                 assert_eq!(checkpoint.root_footer_calls, 1);
                 assert_eq!(checkpoint.sidecar_footer_calls, 0);
             }
