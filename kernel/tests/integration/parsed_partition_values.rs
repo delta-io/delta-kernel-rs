@@ -13,6 +13,8 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::{ColumnName, Expression, Predicate, Scalar, expr};
+#[cfg(feature = "declarative-plans")]
+use delta_kernel::metrics::{MetricEvent, ReplayBase, ScanPlanOutcome};
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::parquet::arrow::ArrowWriter;
@@ -27,6 +29,8 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{Engine, Snapshot, SnapshotRef};
 use rstest::rstest;
+#[cfg(feature = "declarative-plans")]
+use test_utils::CapturingReporter;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::table_builder::{
     DataLayoutConfig, FeatureSet, LogState, TableConfig, TestTableBuilder, partitioned,
@@ -982,14 +986,51 @@ fn different_scans_require_timezone_support_only_for_timestamp_partitions(
         .unwrap();
 
     #[cfg(feature = "declarative-plans")]
-    assert_result_error_with_message(
-        scan.declarative_metadata_scan_plan(engine.as_ref()),
-        if timestamp_partitioned {
-            "with_timestamp_timezone in declarative_metadata_scan_plan"
-        } else {
-            "this engine does not provide a PlanExecutor"
-        },
-    );
+    {
+        let reporter = Arc::new(CapturingReporter::default());
+        let guard = install_thread_local_metrics_reporter(reporter.clone());
+        let result = scan.declarative_metadata_scan_plan(engine.as_ref());
+        drop(guard);
+        assert_result_error_with_message(
+            result,
+            if timestamp_partitioned {
+                "with_timestamp_timezone in declarative_metadata_scan_plan"
+            } else {
+                "this engine does not provide a PlanExecutor"
+            },
+        );
+        let events: Vec<_> = reporter
+            .events()
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    MetricEvent::ScanPlanGenerationCompleted(_)
+                        | MetricEvent::ScanPlanGenerationFailed(_)
+                )
+            })
+            .collect();
+        let [MetricEvent::ScanPlanGenerationFailed(event)] = events.as_slice() else {
+            panic!("expected one scan-plan failure: {events:?}");
+        };
+        assert_eq!(event.outcome, ScanPlanOutcome::Error);
+        let report = &event.metadata_planning;
+        assert_eq!(report.stats, StatsOptions::default());
+        assert_eq!(report.partition_values.parsed_struct(), parsed_struct);
+        assert_eq!(report.partition_values.timestamp_timezone(), Some(tz));
+        assert!(!report.has_filter);
+        assert_eq!(
+            report.replay_base,
+            (!timestamp_partitioned).then_some(ReplayBase::Checkpoint)
+        );
+        assert_eq!(report.base_version, (!timestamp_partitioned).then_some(1));
+        assert_eq!(event.checkpoint.is_some(), !timestamp_partitioned);
+        if let Some(checkpoint) = &event.checkpoint {
+            assert_eq!(checkpoint.version, 1);
+            assert!(checkpoint.info.is_none());
+            assert!(checkpoint.source.is_none());
+        }
+    }
     let parallel_result = scan.parallel_scan_metadata(engine.clone());
     let execute_result = scan.execute(engine);
     if timestamp_partitioned {
