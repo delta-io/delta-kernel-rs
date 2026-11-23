@@ -301,6 +301,11 @@ async fn test_v2_checkpoint_parquet_write(declarative: bool) -> delta_kernel::Re
         "expected snapshot to use the written checkpoint, but checkpoint_parts is empty"
     );
     assert_eq!(
+        log_segment.listed.checkpoint_parts[0].filename,
+        format!("{:020}.checkpoint.parquet", snapshot2.version()),
+    );
+    assert!(read_last_checkpoint(&table_path)["v2Checkpoint"].is_null());
+    assert_eq!(
         log_segment.checkpoint_version,
         Some(1),
         "expected checkpoint at version 1"

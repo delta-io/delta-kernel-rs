@@ -9,10 +9,14 @@
 //! ## Checkpoint Types and Selection Logic
 //! This API supports two checkpoint types, selected based on table features:
 //!
-//! | Table Feature    | Resulting Checkpoint Type                   | Description                                                                                                             |
-//! |------------------|---------------------------------------------|-------------------------------------------------------------------------------------------------------------------------|
-//! | No v2Checkpoints | Single-file Classic-named V1                | Follows V1 specification without [`CheckpointMetadata`] action                                                          |
-//! | v2Checkpoints    | Classic-named V2 (with or without sidecars) | Follows V2 specification with [`CheckpointMetadata`] action while maintaining backward compatibility via classic naming |
+//! | Table feature | Checkpoint content | Default root |
+//! |---------------|--------------------|--------------|
+//! | No v2Checkpoint | V1, without [`CheckpointMetadata`] | Classic-named Parquet |
+//! | v2Checkpoint | V2, with [`CheckpointMetadata`] | Classic-named Parquet |
+//!
+//! With `declarative-plans`, V2 writes use sidecars. A custom declarative writer can opt into
+//! UUID-named JSON or Parquet roots through `CheckpointWriter::with_checkpoint_naming`.
+//! Handler-based V2 writes support inline file actions or sidecars.
 //!
 //! For more information on the V1/V2 specifications, see the following protocol section:
 //! <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#checkpoint-specs>
@@ -92,12 +96,10 @@
 //! ## Warning
 //! Multi-part (V1) checkpoints are DEPRECATED and UNSAFE.
 //!
-//! ## Note
-//! We currently do not plan to support UUID-named V2 checkpoints, since S3's put-if-absent
-//! semantics remove the need for UUIDs to ensure uniqueness. Supporting only classic-named
-//! checkpoints avoids added complexity, such as coordinating naming decisions between kernel and
-//! engine, and handling coexistence with legacy V1 checkpoints. If a compelling use case arises
-//! in the future, we can revisit this decision.
+//! ## Root Naming
+//! [`Snapshot::checkpoint`] writes a classic-named Parquet root. For UUID-named V2 roots, create
+//! a writer, select `CheckpointNaming::Uuid`, execute its declarative checkpoint plan, and
+//! atomically publish the bytes returned by `CheckpointWriter::last_checkpoint_bytes_from_result`.
 //!
 //! [`CheckpointMetadata`]: crate::actions::CheckpointMetadata
 //! [`FileMeta`]: crate::FileMeta
@@ -352,6 +354,17 @@ pub(crate) static CHECKPOINT_ACTIONS_SCHEMA_V2: LazyLock<SchemaRef> = lazy_schem
     (&CHECKPOINT_METADATA_FIELD),
 };
 
+/// Root naming for declarative checkpoint writes.
+#[cfg(feature = "declarative-plans")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CheckpointNaming {
+    /// `<version>.checkpoint.parquet`, for V1 or V2 checkpoints.
+    #[default]
+    Classic,
+    /// `<version>.checkpoint.<uuid>.json` or `.parquet`, for V2 checkpoints.
+    Uuid,
+}
+
 /// Orchestrates the process of creating a checkpoint for a table.
 ///
 /// The [`CheckpointWriter`] is the entry point for generating checkpoint data for a Delta table.
@@ -378,6 +391,8 @@ pub struct CheckpointWriter {
     read_schema: SchemaRef,
     #[cfg(feature = "declarative-plans")]
     v2_checkpoint_config: V2CheckpointConfig,
+    #[cfg(feature = "declarative-plans")]
+    checkpoint_naming: CheckpointNaming,
 }
 
 impl RetentionCalculator for CheckpointWriter {
@@ -412,6 +427,8 @@ impl CheckpointWriter {
             read_schema,
             #[cfg(feature = "declarative-plans")]
             v2_checkpoint_config: V2CheckpointConfig::NoSidecar,
+            #[cfg(feature = "declarative-plans")]
+            checkpoint_naming: CheckpointNaming::default(),
         })
     }
 

@@ -2058,35 +2058,29 @@ mod tests {
     }
 
     #[rstest]
-    fn from_map_to_struct_expression(#[values(false, true)] null_on_invalid: bool) {
-        let proto_expr::expression::Kind::MapToStruct(map_to_struct) = expr_kind_of(
-            Expression::map_to_struct(col!("m"), MapToStructOptions::default()),
-        ) else {
-            panic!("expected a map_to_struct expression");
-        };
-        assert!(map_to_struct.map_expr.is_some());
-        assert_eq!(map_to_struct.options, None);
-
+    fn from_map_to_struct_expression(
+        #[values(None, Some("America/Los_Angeles"))] timestamp_timezone: Option<&str>,
+        #[values(false, true)] null_on_invalid: bool,
+    ) {
+        let options = timestamp_timezone
+            .map_or_else(MapToStructOptions::default, |timezone| {
+                MapToStructOptions::default().with_timestamp_timezone(timezone)
+            })
+            .with_null_on_invalid(null_on_invalid);
         let proto_expr::expression::Kind::MapToStruct(map_to_struct) =
-            expr_kind_of(Expression::map_to_struct(
-                col!("m"),
-                MapToStructOptions::default()
-                    .with_timestamp_timezone("America/Los_Angeles")
-                    .with_null_on_invalid(null_on_invalid),
-            ))
+            expr_kind_of(Expression::map_to_struct(col!("m"), options))
         else {
             panic!("expected a map_to_struct expression");
         };
+        assert!(map_to_struct.map_expr.is_some());
         assert_eq!(
-            map_to_struct
-                .options
-                .as_ref()
-                .and_then(|options| options.timestamp_timezone.as_deref()),
-            Some("America/Los_Angeles")
-        );
-        assert_eq!(
-            map_to_struct.options.unwrap().null_on_invalid,
-            null_on_invalid
+            map_to_struct.options,
+            (timestamp_timezone.is_some() || null_on_invalid).then(|| {
+                proto_expr::MapToStructOptions {
+                    timestamp_timezone: timestamp_timezone.map(str::to_owned),
+                    null_on_invalid,
+                }
+            })
         );
     }
 
