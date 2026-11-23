@@ -34,4 +34,6 @@ pub struct CheckpointMetrics {
     pub sidecar_footer_calls: u64,
     /// Checkpoint-metadata query engine invocations in this attempt.
     pub metadata_query_calls: u64,
+    /// Elapsed lookup time in nanoseconds, including waiting for shared resolution.
+    pub duration_ns: u64,
 }

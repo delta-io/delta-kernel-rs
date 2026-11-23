@@ -5,6 +5,7 @@
 
 use std::borrow::Cow;
 use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
@@ -43,6 +44,7 @@ impl CheckpointInfo {
         segment: &LogSegment,
     ) -> Option<CheckpointResolveResult> {
         let root = segment.listed.checkpoint_parts.first()?;
+        let start = Instant::now();
         let mut metrics = CheckpointMetrics {
             version: root.version,
             ..Default::default()
@@ -58,6 +60,7 @@ impl CheckpointInfo {
         } else {
             None
         };
+        metrics.duration_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
         tracing::Span::current().record("metrics", tracing::field::debug(&metrics));
         if let Err(error) = &result {
             tracing::error!(error = %error);

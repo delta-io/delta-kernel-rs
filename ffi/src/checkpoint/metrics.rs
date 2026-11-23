@@ -43,4 +43,6 @@ pub struct FfiCheckpointMetrics {
     pub root_footer_calls: u64,
     pub sidecar_footer_calls: u64,
     pub metadata_query_calls: u64,
+    /// Elapsed checkpoint lookup time in nanoseconds, including waiting for shared resolution.
+    pub duration_ns: u64,
 }
