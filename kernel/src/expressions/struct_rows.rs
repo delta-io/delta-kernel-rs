@@ -80,6 +80,7 @@ impl_row_result!(Vec<T>, |rows| {
     Ok(output)
 });
 
+#[cfg(feature = "declarative-plans")]
 pub(crate) fn decode_rows<T: TryFrom<StructData, Error = KernelError>>(
     rows: impl IntoIterator<Item = KernelResult<StructData>>,
 ) -> impl Iterator<Item = KernelResult<T>> {
