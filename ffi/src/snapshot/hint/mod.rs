@@ -11,6 +11,7 @@ use crate::delta_types::{
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::log_path::LogPathArray;
+use crate::panic::catch_panic;
 use crate::{NullableCvoid, OptionalValue, SharedExternEngine, SharedSnapshot};
 
 mod export;
@@ -40,13 +41,14 @@ pub unsafe extern "C" fn snapshot_to_snapshot_hint(
     context: NullableCvoid,
     visitor: SnapshotHintVisitor,
 ) -> ExternResult<bool> {
-    let snapshot = unsafe { snapshot.as_ref() };
-    let engine = unsafe { engine.as_ref() };
-    let result = snapshot
-        .to_snapshot_hint()
-        .and_then(|hint| export::visit(&hint, context, visitor))
-        .map(|()| true);
-    unsafe { result.into_extern_result(&engine) }
+    let result = catch_panic(|| {
+        let snapshot = unsafe { snapshot.as_ref() };
+        snapshot
+            .to_snapshot_hint()
+            .and_then(|hint| export::visit(&hint, context, visitor))
+            .map(|()| true)
+    });
+    unsafe { result.into_extern_result(&engine.as_ref()) }
 }
 
 /// Receives one complete borrowed hint. All nested storage expires when the callback returns.
@@ -211,8 +213,10 @@ pub unsafe extern "C" fn snapshot_builder_with_snapshot_hint(
 ) -> ExternResult<Handle<ExclusiveSnapshotBuilder>> {
     let mut builder = unsafe { builder.into_inner() };
     let engine = builder.engine.clone();
-    let result = unsafe { snapshot_builder_with_snapshot_hint_impl(&mut builder, value) }
-        .map(|_| builder.into());
+    let result = catch_panic(|| {
+        unsafe { snapshot_builder_with_snapshot_hint_impl(&mut builder, value) }
+            .map(|_| builder.into())
+    });
     unsafe { result.into_extern_result(&engine.as_ref()) }
 }
 
