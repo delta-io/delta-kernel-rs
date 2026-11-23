@@ -116,7 +116,6 @@ use bytes::Bytes;
 pub use ir::nodes::{RelationId, RelationRef};
 pub use ir::plan::Plan;
 pub use ir::{IoOperation, Operation};
-use itertools::Itertools;
 
 use crate::engine_data::TypedGetData as _;
 use crate::expressions::{ColumnName, TryFromStructRows, column_name};
@@ -202,15 +201,11 @@ pub trait PlanExecutorExt: PlanExecutor {
             )));
         }
         let columns = <T::Row as ToSchema>::leaf_columns();
-        T::collect_into(
-            self.execute_plan(plan)?
-                .into_data()?
-                .map(|batch| {
-                    values::read_struct(batch?.as_ref(), schema, columns)
-                        .map(|rows| rows.into_iter().flatten())
-                })
-                .flatten_ok(),
-        )
+        T::collect_into(values::BatchRows {
+            batches: self.execute_plan(plan)?.into_data()?,
+            schema,
+            columns,
+        })
     }
 }
 

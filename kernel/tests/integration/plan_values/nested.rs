@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::{ArrayRef, Int32Array, RecordBatch, StructArray};
+use delta_kernel::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray, StructArray};
 use delta_kernel::arrow::buffer::NullBuffer;
 use delta_kernel::delta_kernel_derive::{
     IntoStructData, ToSchema as DeriveToSchema, TryFromStructData,
@@ -86,6 +86,36 @@ fn invalid_nested_parents_are_rejected(#[case] name: &str) -> KernelResult<()> {
         SimpleNestedRow::schema_ref(),
     );
     assert!(actual.is_err());
+    Ok(())
+}
+
+#[rstest]
+#[case::required(|rows| execute_rows::<SimpleNestedRow>(rows).map(drop), "exactly one row")]
+#[case::optional(|rows| execute_rows::<Option<SimpleNestedRow>>(rows).map(drop), "at most one row")]
+#[case::vector(|rows| execute_rows::<Vec<SimpleNestedRow>>(rows).map(drop), "id")]
+fn nested_rows_stop_at_the_first_error(
+    #[case] decode: fn(Vec<KernelResult<RecordBatch>>) -> KernelResult<()>,
+    #[case] message: &str,
+    #[values(false, true)] split: bool,
+) -> KernelResult<()> {
+    let ids = if split {
+        vec![vec![Some(1)], vec![Some(2)], vec![None]]
+    } else {
+        vec![vec![Some(1), Some(2), None]]
+    };
+    let batches = ids
+        .into_iter()
+        .map(|ids| {
+            let labels = Arc::new(StringArray::from(vec![None::<&str>; ids.len()])) as ArrayRef;
+            let nested = nested_array(
+                vec![("id", Arc::new(Int32Array::from(ids))), ("label", labels)],
+                None,
+            );
+            Ok(RecordBatch::try_from_iter([("nested", nested)])?)
+        })
+        .collect();
+    let error = decode(batches).unwrap_err();
+    assert!(error.to_string().contains(message), "{error:?}");
     Ok(())
 }
 

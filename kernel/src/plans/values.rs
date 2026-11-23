@@ -1,112 +1,133 @@
-//! Materializes engine batches as struct rows through existing leaf getters.
+//! Decodes engine batches one struct row at a time through existing leaf getters.
 
 use std::sync::Arc;
 
 use crate::engine_data::{EngineData, GetData, RowVisitor};
-use crate::expressions::{ArrayData, MapData, Scalar, StructData};
+use crate::expressions::{ArrayData, MapData, Scalar, StructData, StructRowSource};
 use crate::schema::{
-    ColumnName, ColumnNamesAndTypes, DataType, PrimitiveType, SchemaRef, StructField,
+    ColumnName, ColumnNamesAndTypes, DataType, PrimitiveType, SchemaRef, StructField, StructType,
 };
-use crate::{KernelError, KernelResult};
+use crate::{KernelError, KernelResult, KernelResultIterator};
 
-pub(super) fn read_struct(
-    batch: &dyn EngineData,
-    schema: &'static SchemaRef,
-    columns: &'static ColumnNamesAndTypes,
-) -> KernelResult<Vec<Option<StructData>>> {
-    let mut visitor = StructVisitor {
-        batch,
-        schema,
-        columns,
-        rows: Vec::new(),
-    };
-    visitor.visit_rows_of(batch)?;
-    Ok(visitor.rows)
+pub(super) struct BatchRows {
+    pub(super) batches: Box<dyn KernelResultIterator<Box<dyn EngineData>>>,
+    pub(super) schema: &'static SchemaRef,
+    pub(super) columns: &'static ColumnNamesAndTypes,
 }
 
-struct StructVisitor<'a> {
+impl StructRowSource for BatchRows {
+    fn try_for_each(
+        mut self,
+        mut consume: impl FnMut(StructData) -> KernelResult<()>,
+    ) -> KernelResult<()> {
+        self.batches.try_for_each(|batch| {
+            let batch = batch?;
+            StructVisitor {
+                batch: batch.as_ref(),
+                schema: self.schema,
+                columns: self.columns,
+                consume: &mut consume,
+            }
+            .visit_rows_of(batch.as_ref())
+        })
+    }
+}
+
+struct StructVisitor<'a, F> {
     batch: &'a dyn EngineData,
     schema: &'static SchemaRef,
     columns: &'static ColumnNamesAndTypes,
-    rows: Vec<Option<StructData>>,
+    consume: F,
 }
 
-impl RowVisitor for StructVisitor<'_> {
+impl<F: FnMut(StructData) -> KernelResult<()>> RowVisitor for StructVisitor<'_, F> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         self.columns.as_ref()
     }
 
-    fn visit<'a>(
-        &mut self,
-        _row_count: usize,
-        getters: &[&'a dyn GetData<'a>],
-    ) -> KernelResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         if getters.len() != self.columns.as_ref().0.len() {
             return Err(KernelError::missing_column(
                 "Expected one getter for each result leaf",
             ));
         }
-        self.rows = materialize_struct(
+        let fields = read_fields(
             self.batch,
             self.schema,
             &mut ColumnName::default(),
-            None,
             &mut getters.iter().copied(),
         )?;
-        Ok(())
+        (0..row_count)
+            .try_for_each(|row| (self.consume)(read_struct_row(self.schema, &fields, row)?))
     }
 }
 
-fn materialize_struct<'a>(
+enum FieldReader<'a> {
+    Leaf(&'a StructField, &'a dyn GetData<'a>),
+    Struct {
+        data_type: &'a DataType,
+        schema: SchemaRef,
+        fields: Vec<FieldReader<'a>>,
+        nulls: Vec<bool>,
+    },
+}
+
+fn read_fields<'a>(
     batch: &dyn EngineData,
-    schema: &SchemaRef,
+    schema: &'a StructType,
     path: &mut ColumnName,
-    nulls: Option<&[bool]>,
     getters: &mut impl Iterator<Item = &'a dyn GetData<'a>>,
-) -> KernelResult<Vec<Option<StructData>>> {
-    let mut rows: Vec<Vec<Scalar>> = (0..batch.len())
-        .map(|_| Vec::with_capacity(schema.num_fields()))
-        .collect();
-    for field in schema.fields() {
-        if let DataType::Struct(children) = field.data_type() {
-            path.path_mut().push(field.name().clone());
-            let child_nulls = batch.is_null(path)?;
-            let children = materialize_struct(
-                batch,
-                &Arc::new(children.as_ref().clone()),
-                path,
-                Some(&child_nulls),
-                getters,
-            )?;
-            path.path_mut().pop();
-            for (row, child) in rows.iter_mut().zip(children) {
-                row.push(match child {
-                    Some(child) => Scalar::Struct(child),
-                    None => Scalar::Null(field.data_type().clone()),
-                });
+) -> KernelResult<Vec<FieldReader<'a>>> {
+    schema
+        .fields()
+        .map(|field| {
+            if let DataType::Struct(children) = field.data_type() {
+                path.path_mut().push(field.name().clone());
+                let nulls = batch.is_null(path)?;
+                let fields = read_fields(batch, children, path, getters)?;
+                path.path_mut().pop();
+                Ok(FieldReader::Struct {
+                    data_type: field.data_type(),
+                    schema: Arc::new(children.as_ref().clone()),
+                    fields,
+                    nulls,
+                })
+            } else {
+                Ok(FieldReader::Leaf(
+                    field,
+                    getters.next().ok_or_else(|| {
+                        KernelError::missing_column("Missing result column getter")
+                    })?,
+                ))
             }
-        } else {
-            let getter = getters
-                .next()
-                .ok_or_else(|| KernelError::missing_column("Missing result column getter"))?;
-            for (row, values) in rows.iter_mut().enumerate() {
-                values.push(if nulls.is_none_or(|nulls| !nulls[row]) {
-                    read_scalar(getter, row, field)?
-                } else {
-                    Scalar::Null(field.data_type().clone())
-                });
-            }
-        }
-    }
-    rows.into_iter()
-        .enumerate()
-        .map(|(index, values)| {
-            nulls
-                .is_none_or(|nulls| !nulls[index])
-                .then(|| StructData::try_new(schema.clone(), values))
-                .transpose()
         })
         .collect()
+}
+
+fn read_struct_row(
+    schema: &SchemaRef,
+    fields: &[FieldReader<'_>],
+    row: usize,
+) -> KernelResult<StructData> {
+    let values = fields
+        .iter()
+        .map(|field| match field {
+            FieldReader::Leaf(field, getter) => read_scalar(*getter, row, field),
+            FieldReader::Struct {
+                data_type,
+                schema,
+                fields,
+                nulls,
+            } => {
+                if nulls[row] {
+                    Ok(Scalar::Null((*data_type).clone()))
+                } else {
+                    read_struct_row(schema, fields, row).map(Scalar::Struct)
+                }
+            }
+        })
+        .collect::<KernelResult<_>>()?;
+    StructData::try_new(schema.clone(), values)
 }
 
 pub(super) fn ensure_supported(field: &StructField) -> KernelResult<()> {
@@ -230,12 +251,20 @@ mod tests {
         static COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| SCHEMA.leaves(None));
         ensure_supported(SCHEMA.field("value").unwrap())?;
         let batch = generate_batch([("value", values)])?;
-        let rows = read_struct(&ArrowEngineData::new(batch), &SCHEMA, &COLUMNS)?;
+        let batch = ArrowEngineData::new(batch);
+        let mut values = Vec::new();
+        StructVisitor {
+            batch: &batch,
+            schema: &SCHEMA,
+            columns: &COLUMNS,
+            consume: |row: StructData| {
+                values.extend(row.into_parts().1);
+                Ok(())
+            },
+        }
+        .visit_rows_of(&batch)?;
         assert_eq!(
-            rows.into_iter()
-                .flatten()
-                .flat_map(|row| row.into_parts().1)
-                .collect::<Vec<_>>(),
+            values,
             vec![
                 Scalar::Date(-1),
                 Scalar::Date(0),
