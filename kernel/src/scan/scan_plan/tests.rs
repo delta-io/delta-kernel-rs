@@ -20,7 +20,7 @@ use crate::engine::arrow_conversion::TryIntoArrow as _;
 use crate::engine::arrow_data::EngineDataArrowExt as _;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{Predicate as Pred, column_name, expr};
-use crate::metrics::{ReplayBase, ScanPlanOutcome};
+use crate::metrics::{CheckpointSource, ReplayBase, ScanPlanOutcome};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::object_store::ObjectStoreExt as _;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1494,7 +1494,7 @@ fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> Resu
             assert_eq!(event.outcome, ScanPlanOutcome::Error);
             let checkpoint = event.checkpoint.as_ref().unwrap();
             assert!(checkpoint.info.is_none());
-            assert_eq!(checkpoint.cache_hit, Some(false));
+            assert_eq!(checkpoint.source, CheckpointSource::None);
         },
     )
     .unwrap_err();

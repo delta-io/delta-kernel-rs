@@ -114,7 +114,7 @@ pub(super) fn with_event<F: FnOnce(MetricEvent)>(
                 version: metrics.version,
                 checkpoint_type: metrics.checkpoint_type.map(Into::into).into(),
                 info,
-                cache_hit: metrics.cache_hit.into(),
+                source: metrics.source.into(),
                 root_footer_calls: metrics.root_footer_calls,
                 sidecar_footer_calls: metrics.sidecar_footer_calls,
                 metadata_query_calls: metrics.metadata_query_calls,
@@ -189,7 +189,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::checkpoint::{FfiSelectedCheckpointType, checkpoint_handles};
+    use crate::checkpoint::{FfiCheckpointSource, FfiSelectedCheckpointType, checkpoint_handles};
     use crate::ffi_metrics::with_ffi_event;
     use crate::{TryFromStringSlice as _, free_engine, free_snapshot};
 
@@ -236,7 +236,7 @@ mod tests {
                 version: 0,
                 checkpoint_type: None,
                 info,
-                cache_hit: Some(false),
+                source: kernel::CheckpointSource::Resolved,
                 root_footer_calls: 1,
                 sidecar_footer_calls: 0,
                 metadata_query_calls: 0,
@@ -332,7 +332,7 @@ mod tests {
                     assert_eq!(sidecars[0].modification_time, 23);
                 }
                 assert_eq!(checkpoint.checkpoint_type, OptionalValue::None);
-                assert_eq!(checkpoint.cache_hit, OptionalValue::Some(false));
+                assert_eq!(checkpoint.source, FfiCheckpointSource::Resolved);
                 assert_eq!(checkpoint.root_footer_calls, 1);
                 assert_eq!(checkpoint.sidecar_footer_calls, 0);
             }
