@@ -2087,6 +2087,29 @@ pub(crate) fn validate_commit_file_types(commits: &[ParsedLogPath]) -> KernelRes
     Ok(())
 }
 
+/// Validates that individual commits cover the requested start through the end without gaps.
+///
+/// Callers must first restrict the files to the requested range and validate their file types.
+pub(crate) fn validate_complete_commit_range(
+    start_version: Version,
+    end_version: Version,
+    commit_files: &[ParsedLogPath],
+) -> KernelResult<()> {
+    validate_start_version_available(start_version, commit_files.first())?;
+    validate_commit_files_sorted(commit_files)?;
+    validate_commit_files_contiguous(commit_files)?;
+    let last_version = commit_files.last().ok_or(KernelError::EmptyLog)?.version;
+    if last_version < end_version {
+        let missing_version = last_version.checked_add(1).ok_or_else(|| {
+            KernelError::internal_error(
+                "Commit version overflow while validating the end of a commit range",
+            )
+        })?;
+        return Err(KernelError::MissingVersion(missing_version));
+    }
+    Ok(())
+}
+
 /// Validates that commit versions are in strictly increasing order.
 pub(crate) fn validate_commit_files_sorted(commits: &[ParsedLogPath]) -> KernelResult<()> {
     if let Some([a, b]) = commits

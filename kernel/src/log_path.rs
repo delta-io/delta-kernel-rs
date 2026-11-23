@@ -21,6 +21,24 @@ impl From<LogPath> for ParsedLogPath {
 }
 
 impl LogPath {
+    /// Returns the location, modification time, and size needed to read this log file.
+    ///
+    /// ```
+    /// # use delta_kernel::{KernelResult, LogPath};
+    /// # fn example() -> KernelResult<()> {
+    /// let root = "memory:///table/".parse()?;
+    /// let path = LogPath::from_commit_filename(root, 11,
+    ///     "00000000000000000011.00000000-0000-4000-8000-000000000001.json", 7, 42)?;
+    /// assert!(path.file_meta().location.path().contains("_staged_commits/"));
+    /// assert_eq!(path.file_meta().size, 42);
+    /// # Ok(())
+    /// # }
+    /// # example().unwrap();
+    /// ```
+    pub fn file_meta(&self) -> &FileMeta {
+        &self.0.location
+    }
+
     /// Attempt to create a `LogPath` from `FileMeta`. This returns an error if the path isn't a
     /// valid log path.
     pub fn try_new(file_meta: FileMeta) -> KernelResult<Self> {

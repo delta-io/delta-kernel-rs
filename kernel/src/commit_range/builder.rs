@@ -3,9 +3,7 @@ use url::Url;
 
 use crate::commit_range::CommitRange;
 use crate::log_segment::{
-    validate_catalog_managed_log_tail, validate_commit_file_types,
-    validate_commit_files_contiguous, validate_commit_files_sorted,
-    validate_start_version_available,
+    validate_catalog_managed_log_tail, validate_commit_file_types, validate_complete_commit_range,
 };
 use crate::log_segment_files::LogSegmentFiles;
 use crate::path::ParsedLogPath;
@@ -168,7 +166,7 @@ impl CommitRangeBuilder {
 
         validate_commit_file_types(&commit_files)?;
         if commit_range_validation {
-            Self::validate_complete_range(start_version, end_version, &commit_files)?;
+            validate_complete_commit_range(start_version, end_version, &commit_files)?;
         }
 
         if commit_ordering == CommitOrdering::DescendingOrder {
@@ -252,18 +250,6 @@ impl CommitRangeBuilder {
         Ok((commit_files, end_version))
     }
 
-    fn validate_complete_range(
-        start_version: Version,
-        end_version: Version,
-        commit_files: &[ParsedLogPath],
-    ) -> KernelResult<()> {
-        validate_start_version_available(start_version, commit_files.first())?;
-        validate_commit_files_sorted(commit_files)?;
-        validate_commit_files_contiguous(commit_files)?;
-        let last_version = commit_files.last().ok_or(KernelError::EmptyLog)?.version;
-        validate_terminal_commit_available(end_version, last_version)
-    }
-
     fn validate_catalog_managed_inputs(&self) -> KernelResult<()> {
         if let Some(max_catalog_version) = self.max_catalog_version {
             require!(
@@ -304,18 +290,6 @@ fn validate_version_range(start: Version, end: Version) -> KernelResult<()> {
         )));
     }
 
-    Ok(())
-}
-
-fn validate_terminal_commit_available(end: Version, available_end: Version) -> KernelResult<()> {
-    if available_end < end {
-        let missing_version = available_end.checked_add(1).ok_or_else(|| {
-            KernelError::internal_error(
-                "Commit version overflow while validating the end of a commit range",
-            )
-        })?;
-        return Err(KernelError::MissingVersion(missing_version));
-    }
     Ok(())
 }
 
@@ -633,7 +607,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(matches!(
-            CommitRangeBuilder::validate_complete_range(0, 1, &commit_files),
+            validate_complete_commit_range(0, 1, &commit_files),
             Err(KernelError::InvalidLogSegment(_))
         ));
     }
