@@ -10,7 +10,7 @@ use crate::engine_data::filter_by_predicate;
 use crate::expressions::{
     Expression, ExpressionStructPatchBuilder, Predicate, Scalar, StructData, col, expr, null_lit,
 };
-use crate::schema::{DataType, SchemaRef, StructField, try_schema};
+use crate::schema::{DataType, SchemaRef, StructField, schema_ref, try_schema};
 use crate::{
     Engine, EngineData, EvaluationHandler, ExpressionEvaluator, FileMeta, KernelError,
     KernelResult, PredicateEvaluator,
@@ -62,7 +62,7 @@ pub(super) fn create_sidecar_action_batch(
             sidecar_field.data_type()
         )));
     };
-    let sidecar_fields: Vec<StructField> = sidecar_struct.fields().cloned().collect();
+    let sidecar_schema = schema_ref! { ..(sidecar_struct.fields()) };
     // Per-row data template (follows checkpoint data schema, all fields null). Each sidecar row is
     // built by cloning this and populating only the `sidecar` field.
     let null_template: Vec<Scalar> = checkpoint_data_fields
@@ -76,9 +76,9 @@ pub(super) fn create_sidecar_action_batch(
         .map(|reference| -> KernelResult<Vec<Scalar>> {
             let size_in_bytes = reference.file_meta.size_as_i64()?;
 
-            // Sidecar struct values, ordered to match `sidecar_fields`.
-            let values: Vec<Scalar> = sidecar_fields
-                .iter()
+            // Sidecar struct values, ordered to match `sidecar_schema`.
+            let values: Vec<Scalar> = sidecar_schema
+                .fields()
                 .map(|field| match field.name().as_str() {
                     // Per the protocol, implementations are encouraged to store only
                     // the file's name for the `path` field.
@@ -99,7 +99,7 @@ pub(super) fn create_sidecar_action_batch(
 
             let mut row = null_template.clone();
             row[sidecar_col_idx] =
-                Scalar::Struct(StructData::try_new(sidecar_fields.clone(), values)?);
+                Scalar::Struct(StructData::try_new(Arc::clone(&sidecar_schema), values)?);
             Ok(row)
         })
         .try_collect()?;

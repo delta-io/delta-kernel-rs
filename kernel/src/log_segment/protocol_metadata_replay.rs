@@ -46,6 +46,8 @@ use crate::schema::{
     ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec, StructField, StructType,
     column_name, schema_ref,
 };
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::table_features::TableFeature;
 use crate::{
     Engine, EngineData, KernelError, KernelResult, KernelResultIterator, Version, version_as_i64,
 };
@@ -94,10 +96,16 @@ impl LogSegment {
             // Ignore pruned P&M at or below the CRC version: a lagging AMT checkpoint action can
             // carry it, and the CRC's P&M is at least as new. A captured checkpoint action is still
             // the latest: any action at or below the CRC is older.
-            let mut resolution = pruned
-                .replay_for_pm(engine)?
+            let replayed = pruned.replay_for_pm(engine)?;
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            let newest_commit_info_read = pruned.replay_read_newest_commit_info(&replayed)?;
+            let mut resolution = replayed
                 .newer_than(version_as_i64(crc.version)?)
-                .into_resolution(ProtocolMetadataSource::CrcSeededPmOnlyReplay);
+                .into_resolution(
+                    ProtocolMetadataSource::CrcSeededPmOnlyReplay,
+                    #[cfg(feature = "adaptive-metadata-in-dev")]
+                    newest_commit_info_read,
+                );
             if resolution.metadata.is_some() && resolution.protocol.is_some() {
                 info!("Found P&M from pruned log replay");
                 return Ok(resolution);
@@ -123,7 +131,23 @@ impl LogSegment {
             Some(_) => self.replay_for_pm(engine)?,
             None => self.replay_for_pm_with_unbounded_segment(engine)?,
         };
-        Ok(candidate.into_resolution(ProtocolMetadataSource::FullReplay))
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let newest_commit_info_read = self.replay_read_newest_commit_info(&candidate)?;
+        Ok(candidate.into_resolution(
+            ProtocolMetadataSource::FullReplay,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            newest_commit_info_read,
+        ))
+    }
+
+    /// Whether replay of this segment read its newest commit's `commitInfo`. Replay stops inside
+    /// that commit only once it has both P&M, and with In-Commit Timestamps `commitInfo` comes
+    /// first.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn replay_read_newest_commit_info(&self, candidate: &PmCandidate) -> KernelResult<bool> {
+        Ok(self.newest_commit_after_checkpoint().is_some()
+            && (candidate.enables_in_commit_timestamps()
+                || !candidate.is_final_at(version_as_i64(self.end_version)?)))
     }
 
     /// Replays the log segment for the latest Protocol and Metadata, each with its version, in one
@@ -618,12 +642,16 @@ pub(crate) enum LastManifestCommitResolution {
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 impl LastManifestCommitResolution {
-    /// Resolves the `lastManifestCommit` that P&M replay read from the newest commit. A miss is
-    /// `Unresolved` because replay may not have read that commit's `commitInfo`: replay can stop
-    /// before it, and a segment ending on a checkpoint does not list that commit.
-    fn from_replay(captured: Option<LastManifestCommit>) -> Self {
+    /// Resolves the `lastManifestCommit` that P&M replay captured from the snapshot version's
+    /// commit.
+    ///
+    /// `newest_commit_info_read` says whether replay read that commit's `commitInfo`. If so, a
+    /// missing `captured` pointer resolves to `Resolved(None)`. Otherwise it is `Unresolved`
+    /// and is read from the commit file on first use.
+    fn from_replay(captured: Option<LastManifestCommit>, newest_commit_info_read: bool) -> Self {
         match captured {
             Some(pointer) => Self::Resolved(Some(pointer)),
+            None if newest_commit_info_read => Self::Resolved(None),
             None => Self::Unresolved,
         }
     }
@@ -686,7 +714,12 @@ impl PmCandidate {
     }
 
     /// The resolution this replay result gives the snapshot, resolved through `source`.
-    fn into_resolution(self, source: ProtocolMetadataSource) -> PmResolution {
+    /// `newest_commit_info_read` is as for [`LastManifestCommitResolution::from_replay`].
+    fn into_resolution(
+        self,
+        source: ProtocolMetadataSource,
+        #[cfg(feature = "adaptive-metadata-in-dev")] newest_commit_info_read: bool,
+    ) -> PmResolution {
         PmResolution {
             metadata: self.metadata.map(|(_, m)| m),
             protocol: self.protocol.map(|(_, p)| p),
@@ -696,8 +729,22 @@ impl PmCandidate {
             #[cfg(feature = "adaptive-metadata-in-dev")]
             last_manifest_commit: LastManifestCommitResolution::from_replay(
                 self.last_manifest_commit,
+                newest_commit_info_read,
             ),
         }
+    }
+
+    /// Whether the Protocol and Metadata found enable In-Commit Timestamps.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn enables_in_commit_timestamps(&self) -> bool {
+        let (Some((_, protocol)), Some((_, metadata))) = (&self.protocol, &self.metadata) else {
+            return false;
+        };
+        protocol.has_table_feature(&TableFeature::InCommitTimestamp)
+            && metadata
+                .parse_table_properties()
+                .enable_in_commit_timestamps
+                == Some(true)
     }
 
     /// Whether both Protocol and Metadata are found at or above `version`.
@@ -1399,8 +1446,11 @@ mod tests {
 
         #[test]
         fn test_into_resolution_drops_versions() {
-            let resolution =
-                candidate(1, Some(3), Some(4)).into_resolution(ProtocolMetadataSource::FullReplay);
+            let resolution = candidate(1, Some(3), Some(4)).into_resolution(
+                ProtocolMetadataSource::FullReplay,
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                true,
+            );
             assert_eq!(resolution.protocol, Some(protocol(1)));
             assert_eq!(resolution.metadata, Some(metadata(1)));
             assert_eq!(resolution.source, ProtocolMetadataSource::FullReplay);

@@ -31,8 +31,8 @@ use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX, LOG_DOMAIN_METADATA
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointInfo;
 use crate::checkpoint::{
-    CheckpointSpec, CheckpointWriter, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT, V2CheckpointConfig,
-    ensure_standalone_checkpoint_supported,
+    CheckpointSpec, CheckpointWriter, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
+    SelectedCheckpointType, V2CheckpointConfig, ensure_standalone_checkpoint_supported,
 };
 use crate::clustering::{CLUSTERING_DOMAIN_NAME, ClusteringColumnInfo, parse_clustering_columns};
 use crate::committer::{Committer, PublishMetadata};
@@ -146,6 +146,10 @@ pub struct Snapshot {
     built_as_latest: bool,
     /// Whether the last applicable incremental build requested ignoring new checkpoints.
     skipped_new_checkpoints: bool,
+    /// The selected checkpoint's type from a snapshot hint, the checkpoint writer, or the snapshot
+    /// an incremental update advanced. Used only when naming and protocol do not decide it, and
+    /// replaced by discovery once the checkpoint is read.
+    retained_checkpoint_type: Option<SelectedCheckpointType>,
     /// Complete state for the frozen segment. Shared with scan plans; failed reads are not cached.
     #[cfg(feature = "declarative-plans")]
     checkpoint_info: OnceLock<Option<Arc<CheckpointInfo>>>,
@@ -340,6 +344,7 @@ impl Snapshot {
             crc,
             built_as_latest,
             skipped_new_checkpoints,
+            retained_checkpoint_type: None,
             #[cfg(feature = "declarative-plans")]
             checkpoint_info: OnceLock::new(),
             #[cfg(feature = "declarative-plans")]
@@ -711,6 +716,33 @@ impl Snapshot {
     /// Returns an error if the total commit file size exceeds [`u64::MAX`].
     pub fn log_segment_stats(&self) -> KernelResult<LogSegmentStats> {
         self.log_segment.stats()
+    }
+
+    /// Returns the selected checkpoint's type when it is known without I/O: from completed
+    /// discovery, the Delta protocol's naming and feature rules, or the retained type.
+    pub(crate) fn known_checkpoint_type(&self) -> Option<SelectedCheckpointType> {
+        let root = self.log_segment.listed.checkpoint_parts.first()?;
+        #[cfg(feature = "declarative-plans")]
+        if let Some(Some(info)) = self.cached_checkpoint_info() {
+            return Some(info.checkpoint_type());
+        }
+        // TODO(#4057): the retained type is not checked against the checkpoint until it is read.
+        SelectedCheckpointType::from_naming_and_protocol(root, self.table_configuration.protocol())
+            .or(self.retained_checkpoint_type)
+    }
+
+    /// The selected checkpoint's type if `checkpoint_parts` selects this snapshot's checkpoint
+    /// files, so a snapshot derived from this one can keep it.
+    pub(crate) fn checkpoint_type_for_parts(
+        &self,
+        checkpoint_parts: &[ParsedLogPath],
+    ) -> Option<SelectedCheckpointType> {
+        let ours = &self.log_segment.listed.checkpoint_parts;
+        let same_files = checkpoint_parts
+            .iter()
+            .map(|part| &part.location)
+            .eq(ours.iter().map(|part| &part.location));
+        same_files.then(|| self.known_checkpoint_type()).flatten()
     }
 
     /// Captures retained snapshot state as an owned hint without engine I/O.
@@ -1997,18 +2029,32 @@ impl Snapshot {
         let checkpoint_log_path = ParsedLogPath::new(info.file_meta).ok_or_else(|| {
             KernelError::internal_error("Checkpoint path could not be parsed as a log path")
         })?;
+        let checkpoint_type = match mode {
+            CheckpointWriteMode::NotAttempted => {
+                return Err(KernelError::internal_error(
+                    "a successful checkpoint write must select a checkpoint mode",
+                )
+                .into());
+            }
+            CheckpointWriteMode::V1 => SelectedCheckpointType::V1,
+            CheckpointWriteMode::V2WithoutSidecars | CheckpointWriteMode::V2WithSidecars => {
+                SelectedCheckpointType::V2
+            }
+        };
         let new_log_segment = self
             .log_segment
             .try_new_with_checkpoint(checkpoint_log_path)?;
         // Carry only an at-version CRC forward: the checkpoint drops the commits below it, so a
         // stale base could no longer be advanced over them.
-        let new_snapshot = Arc::new(Snapshot::new_with_crc(
+        let mut new_snapshot = Snapshot::new_with_crc(
             new_log_segment,
             self.table_configuration().clone(),
             self.crc_at_version().cloned(),
             self.built_as_latest,
             false, /* skipped_new_checkpoints */
-        )?);
+        )?;
+        new_snapshot.retained_checkpoint_type = Some(checkpoint_type);
+        let new_snapshot = Arc::new(new_snapshot);
         span.record(
             "size_in_bytes",
             info.last_checkpoint_stats.size_in_bytes as u64,

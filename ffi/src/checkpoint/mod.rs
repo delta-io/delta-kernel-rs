@@ -1,7 +1,12 @@
-//! FFI checkpoint metadata resolved through the engine's declarative executor.
+//! FFI checkpoint types and metadata resolved through the engine's declarative executor.
 
+#[cfg(feature = "declarative-plans")]
 mod info;
+mod types;
 
+#[cfg(feature = "declarative-plans")]
 pub use info::{
     CheckpointInfoVisitor, FfiCheckpointInfo, FfiCheckpointKind, snapshot_checkpoint_info,
+    snapshot_checkpoint_type,
 };
+pub use types::FfiSelectedCheckpointType;

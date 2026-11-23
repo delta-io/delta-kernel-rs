@@ -419,6 +419,7 @@ impl From<&UnaryExpression> for proto_expr::UnaryExpression {
                 UnaryExpressionOp::ToJson {
                     full_precision_timestamps,
                 } => full_precision_timestamps,
+                UnaryExpressionOp::UriEncodeFileLocation => false,
             },
         }
     }
@@ -547,6 +548,9 @@ impl From<UnaryExpressionOp> for proto_expr::UnaryExpressionOp {
     fn from(op: UnaryExpressionOp) -> Self {
         match op {
             UnaryExpressionOp::ToJson { .. } => proto_expr::UnaryExpressionOp::ToJson,
+            UnaryExpressionOp::UriEncodeFileLocation => {
+                proto_expr::UnaryExpressionOp::UriEncodeFileLocation
+            }
         }
     }
 }
@@ -575,6 +579,7 @@ impl From<UnaryPredicateOp> for proto_expr::UnaryPredicateOp {
     fn from(op: UnaryPredicateOp) -> Self {
         match op {
             UnaryPredicateOp::IsNull => proto_expr::UnaryPredicateOp::IsNull,
+            UnaryPredicateOp::HasUriScheme => proto_expr::UnaryPredicateOp::HasUriScheme,
         }
     }
 }
@@ -642,7 +647,7 @@ impl From<&DecimalData> for proto_expr::DecimalData {
 impl From<&StructData> for proto_expr::StructData {
     fn from(struct_data: &StructData) -> Self {
         proto_expr::StructData {
-            fields: convert_vec(struct_data.fields()),
+            fields: struct_data.fields().map(Into::into).collect(),
             values: convert_vec(struct_data.values()),
         }
     }
@@ -2011,6 +2016,10 @@ mod tests {
 
     #[rstest]
     #[case(UnaryExpressionOp::TO_JSON, proto_expr::UnaryExpressionOp::ToJson)]
+    #[case(
+        UnaryExpressionOp::UriEncodeFileLocation,
+        proto_expr::UnaryExpressionOp::UriEncodeFileLocation
+    )]
     fn from_unary_expression_op(
         #[case] op: UnaryExpressionOp,
         #[case] expected: proto_expr::UnaryExpressionOp,
@@ -2054,6 +2063,10 @@ mod tests {
 
     #[rstest]
     #[case(UnaryPredicateOp::IsNull, proto_expr::UnaryPredicateOp::IsNull)]
+    #[case(
+        UnaryPredicateOp::HasUriScheme,
+        proto_expr::UnaryPredicateOp::HasUriScheme
+    )]
     fn from_unary_predicate_op(
         #[case] op: UnaryPredicateOp,
         #[case] expected: proto_expr::UnaryPredicateOp,
@@ -2121,7 +2134,7 @@ mod tests {
     #[case(
         Scalar::Struct(
             StructData::try_new(
-                vec![StructField::nullable("a", DataType::INTEGER)],
+                schema_ref! { nullable "a": INTEGER },
                 vec![Scalar::Integer(1)],
             )
             .unwrap(),
@@ -2258,7 +2271,7 @@ mod tests {
     #[test]
     fn from_struct_data() {
         let struct_data = StructData::try_new(
-            vec![StructField::nullable("a", DataType::INTEGER)],
+            schema_ref! { nullable "a": INTEGER },
             vec![Scalar::Integer(1)],
         )
         .unwrap();
