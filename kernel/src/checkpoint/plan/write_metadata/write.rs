@@ -6,6 +6,7 @@ use super::{NUM_ACTIONS, NUM_ADDS, NUM_BYTES, STATISTICS_SCHEMA};
 use crate::checkpoint::{CheckpointWriter, LastCheckpointHintStats};
 use crate::engine_data::TypedGetData as _;
 use crate::expressions::{ColumnName, Expression as Expr, col, column_name, lit, null_lit};
+use crate::last_checkpoint_hint::LastCheckpointV2;
 use crate::plans::ir::nodes::{Agg, FILE_META_SCHEMA, StatsAgg, WriteParquet};
 use crate::plans::{Plan, PlanBuilder, PlanResult};
 use crate::schema::{DataType, SchemaRef, lazy_schema_ref};
@@ -98,7 +99,18 @@ impl CheckpointWriter {
         let (root, schema) = rows
             .root
             .ok_or_else(|| KernelError::checkpoint_write("Missing checkpoint root"))?;
-        let bytes = self.serialize_checkpoint_hint(&statistics, &root, schema)?;
+        let bytes = self.serialize_checkpoint_hint(
+            &statistics,
+            &root,
+            schema,
+            LastCheckpointV2 {
+                path: String::new(),
+                size_in_bytes: None,
+                modification_time: None,
+                sidecar_files: None,
+                non_file_actions: None,
+            },
+        )?;
         Ok((root, statistics, bytes))
     }
 }
