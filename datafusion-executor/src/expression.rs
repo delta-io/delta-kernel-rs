@@ -73,6 +73,12 @@ pub fn to_df_expr(
         KernelExpression::ParseJson(parse) => parse_json_to_df_expr(parse, input_schema),
 
         KernelExpression::Unary(u) => match u.op {
+            UnaryExpressionOp::MapSize => Err(KernelError::unsupported(
+                "converting the MapSize expression is not yet supported",
+            )),
+            UnaryExpressionOp::MapKeys => Err(KernelError::unsupported(
+                "converting the MapKeys expression is not yet supported",
+            )),
             UnaryExpressionOp::ToJson => Err(KernelError::unsupported(
                 "converting the ToJson expression is not yet supported",
             )),

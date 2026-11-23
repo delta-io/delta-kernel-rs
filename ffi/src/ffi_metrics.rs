@@ -52,7 +52,7 @@ impl From<kernel::ScanType> for ScanType {
     }
 }
 
-/// Why a transaction commit did not succeed.
+/// Why a transaction commit attempt did not return confirmed success.
 ///
 /// cbindgen:prefix-with-name=true
 #[repr(C)]
@@ -60,6 +60,8 @@ pub enum CommitFailureReason {
     Conflict,
     RetryableIo,
     Error,
+    /// Acceptance of the commit was not established; the commit may have succeeded.
+    Unknown,
 }
 
 impl From<kernel::CommitFailureReason> for CommitFailureReason {
@@ -68,6 +70,7 @@ impl From<kernel::CommitFailureReason> for CommitFailureReason {
             kernel::CommitFailureReason::Conflict => Self::Conflict,
             kernel::CommitFailureReason::RetryableIo => Self::RetryableIo,
             kernel::CommitFailureReason::Error => Self::Error,
+            kernel::CommitFailureReason::Unknown => Self::Unknown,
         }
     }
 }
@@ -355,8 +358,10 @@ pub struct TransactionCommitSuccess {
     pub total_duration_ns: u64,
 }
 
-/// A transaction commit did not succeed; `reason` distinguishes conflict, retryable IO, and
-/// terminal errors.
+/// A transaction commit attempt did not return confirmed success.
+///
+/// With [`CommitFailureReason::Unknown`], acceptance was not established and the commit may have
+/// succeeded.
 #[repr(C)]
 pub struct TransactionCommitFailure {
     pub operation_id: MetricId,
@@ -1120,21 +1125,38 @@ mod tests {
         });
     }
 
-    #[test]
-    fn from_kernel_maps_failure_reason() {
+    #[rstest]
+    #[case::conflict(
+        kernel::CommitFailureReason::Conflict,
+        CommitFailureReason::Conflict,
+        0
+    )]
+    #[case::retryable_io(
+        kernel::CommitFailureReason::RetryableIo,
+        CommitFailureReason::RetryableIo,
+        1
+    )]
+    #[case::error(kernel::CommitFailureReason::Error, CommitFailureReason::Error, 2)]
+    #[case::unknown(kernel::CommitFailureReason::Unknown, CommitFailureReason::Unknown, 3)]
+    fn from_kernel_maps_failure_reason(
+        #[case] reason: kernel::CommitFailureReason,
+        #[case] expected: CommitFailureReason,
+        #[case] abi_value: u32,
+    ) {
         let id = kernel::MetricId::new();
         let failure =
             kernel::MetricEvent::TransactionCommitFailure(kernel::TransactionCommitFailure {
                 operation_id: id,
                 correlation_id: Some("req-fail".into()),
                 table_type: kernel::TableType::CatalogManaged,
-                reason: kernel::CommitFailureReason::Conflict,
+                reason,
             });
         with_ffi_event(&failure, |ffi| {
             let MetricEvent::TransactionCommitFailure(e) = ffi else {
                 panic!("expected TransactionCommitFailure");
             };
-            assert!(matches!(e.reason, CommitFailureReason::Conflict));
+            assert_eq!(discriminant(&e.reason), discriminant(&expected));
+            assert_eq!(expected as u32, abi_value);
             assert!(matches!(e.table_type, TableType::CatalogManaged));
             assert_eq!(e.operation_id.bytes, id.as_bytes());
             let cid: &str =

@@ -5,11 +5,23 @@ use std::collections::HashSet;
 use delta_kernel_derive::internal_api;
 
 use super::Snapshot;
+#[cfg(feature = "declarative-plans")]
+use crate::RowVisitor;
+#[cfg(feature = "declarative-plans")]
+use crate::action_reconciliation::plan::{MetadataPlanner, action_set::ActionSet};
 use crate::actions::DomainMetadata;
+#[cfg(feature = "declarative-plans")]
+use crate::actions::visitors::DomainMetadataVisitor;
 use crate::clustering::ClusteringColumnInfo;
+#[cfg(feature = "declarative-plans")]
+use crate::crc::{DomainMetadataState, merge_domain_metadata};
 use crate::engine::CancellableEngine;
 use crate::expressions::ColumnName;
+#[cfg(feature = "declarative-plans")]
+use crate::expressions::{Predicate, col, lit};
 use crate::log_segment::DomainMetadataMap;
+#[cfg(feature = "declarative-plans")]
+use crate::plans::{Operation, PlanBuilder, ScopedPlanExecutor};
 use crate::{CancellationTokenRef, Engine, KernelResult};
 
 /// Reads snapshot metadata with an optional cancellation token.
@@ -179,6 +191,72 @@ impl<'a> SnapshotReader<'a> {
         self.read(engine, |snapshot, engine| {
             snapshot.get_domain_metadatas_internal(engine, domains)
         })
+    }
+
+    /// Reads only the requested domains, keeping existing CRC state when it can answer the lookup.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn get_domain_metadatas_declarative(
+        &self,
+        executor: &dyn ScopedPlanExecutor,
+        domains: &HashSet<&str>,
+    ) -> KernelResult<DomainMetadataMap> {
+        let snapshot = self.snapshot;
+        let select_domains = |map: &DomainMetadataMap| {
+            map.iter()
+                .filter(|(domain, _)| domains.contains(domain.as_str()))
+                .map(|(domain, metadata)| (domain.clone(), metadata.clone()))
+                .collect::<DomainMetadataMap>()
+        };
+        if let Some(crc) = snapshot.crc_at_version() {
+            match &crc.domain_metadata_state {
+                DomainMetadataState::Complete(map) => return Ok(select_domains(map)),
+                DomainMetadataState::Partial(map)
+                    if domains.iter().all(|domain| map.contains_key(*domain)) =>
+                {
+                    return Ok(select_domains(map));
+                }
+                _ => {}
+            }
+        }
+        let base = snapshot
+            .base_crc()
+            .and_then(|crc| match &crc.domain_metadata_state {
+                DomainMetadataState::Complete(map) => Some((crc.version, map)),
+                _ => None,
+            });
+        let planner = MetadataPlanner::new(
+            snapshot.log_segment(),
+            ActionSet {
+                domain_metadata: true,
+                ..Default::default()
+            },
+        );
+        let plan = if let Some((version, _)) = base {
+            let commits = planner.commit_actions(Some(version))?;
+            let empty = PlanBuilder::values(commits.schema().clone(), vec![])?;
+            planner.replay_actions(commits, empty)?
+        } else {
+            planner.replay()?
+        };
+        let plan = plan
+            .filter(Predicate::or_from(domains.iter().map(|domain| {
+                Predicate::eq(col!("domainMetadata.domain"), lit(*domain))
+            })))?
+            .build()?;
+        let mut visitor = DomainMetadataVisitor::default();
+        for batch in executor
+            .execute_op(Operation::QueryPlan(plan))?
+            .into_data()?
+        {
+            visitor.visit_rows_of(batch?.as_ref())?;
+        }
+        let mut active = base.map(|(_, map)| select_domains(map)).unwrap_or_default();
+        // The replay plan emits one latest action per domain, including removal tombstones.
+        merge_domain_metadata(
+            &mut active,
+            visitor.into_domain_metadatas_including_tombstones(),
+        );
+        Ok(active)
     }
 
     /// Returns the latest configuration for a user or system `domain`, or `None` if absent.

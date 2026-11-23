@@ -93,8 +93,8 @@ impl CommitRangeBuilder {
 
     /// Enable or disable build-time commit range validation. Defaults to `true`.
     ///
-    /// When `true`, [`Self::build`] requires the requested start version to be present and the
-    /// listed commits to be contiguous. When `false`, [`Self::build`] materializes whatever
+    /// When `true`, building requires the requested start version to be present and the
+    /// listed commits to be contiguous. When `false`, building materializes whatever
     /// commits are listed in the range without validating the start version, contiguity, or
     /// end version. Disabling validation is only supported for path-based builders
     /// ([`CommitRange::builder_for`]) with ascending ordering.
@@ -155,13 +155,20 @@ impl CommitRangeBuilder {
                 start_version,
                 configured_end_version,
             )?,
-            None => Self::list_commit_files(
-                engine,
-                &log_root,
-                log_tail,
-                start_version,
-                configured_end_version,
-            )?,
+            None => {
+                let commit_files = LogSegmentFiles::list_commits(
+                    engine.storage_handler().as_ref(),
+                    &log_root,
+                    log_tail,
+                    Some(start_version),
+                    configured_end_version,
+                )?
+                .ascending_commit_files;
+                let latest_commit_version =
+                    commit_files.last().ok_or(KernelError::EmptyLog)?.version;
+                let end_version = configured_end_version.unwrap_or(latest_commit_version);
+                (commit_files, end_version)
+            }
         };
 
         validate_commit_file_types(&commit_files)?;
@@ -227,26 +234,6 @@ impl CommitRangeBuilder {
             .filter(|path| path.version >= start_version && path.version <= end_version)
             .collect();
         commit_files.sort_unstable_by_key(|path| path.version);
-        Ok((commit_files, end_version))
-    }
-
-    fn list_commit_files(
-        engine: &dyn Engine,
-        log_root: &Url,
-        log_tail: Vec<ParsedLogPath>,
-        start_version: Version,
-        configured_end_version: Option<Version>,
-    ) -> KernelResult<(Vec<ParsedLogPath>, Version)> {
-        let commit_files = LogSegmentFiles::list_commits(
-            engine.storage_handler().as_ref(),
-            log_root,
-            log_tail,
-            Some(start_version),
-            configured_end_version,
-        )?
-        .ascending_commit_files;
-        let last_version = commit_files.last().ok_or(KernelError::EmptyLog)?.version;
-        let end_version = configured_end_version.unwrap_or(last_version);
         Ok((commit_files, end_version))
     }
 
@@ -368,6 +355,69 @@ mod tests {
         assert_eq!(range.start_version(), 0);
         assert_eq!(range.end_version(), 1);
         assert_eq!(range.table_root().as_str(), table_root.as_str());
+    }
+
+    #[rstest::rstest]
+    #[case::complete(&[11, 12, 13], "checkpoint.parquet", "checkpoint", None, true, Ok(13))]
+    #[case::missing_middle(&[11, 13], "checkpoint.parquet", "checkpoint", None, true, Err(12))]
+    #[case::unbounded_ends_at_last_commit(
+        &[11, 12], "checkpoint.parquet", "checkpoint", None, true, Ok(12)
+    )]
+    #[case::explicit_end_requires_commit_json(
+        &[11, 12], "checkpoint.parquet", "checkpoint", Some(13), true, Err(13)
+    )]
+    #[case::validation_disabled(&[11, 12], "checkpoint.parquet", "checkpoint", None, false, Ok(12))]
+    #[case::explicit_end_before_checkpoint(
+        &[11, 12, 13], "checkpoint.parquet", "checkpoint", Some(12), true, Ok(12)
+    )]
+    #[case::incomplete_checkpoint(
+        &[11, 12], "checkpoint.0000000001.0000000002.parquet", "checkpoint", None, true, Ok(12)
+    )]
+    #[case::empty_checkpoint(&[11, 12], "checkpoint.parquet", "", None, true, Ok(12))]
+    fn test_commit_range_bounds_with_checkpoint(
+        #[case] commit_versions: &[Version],
+        #[case] checkpoint_suffix: &str,
+        #[case] checkpoint_contents: &str,
+        #[case] end_version: Option<Version>,
+        #[case] validate_range: bool,
+        #[case] expected: KernelResult<Version, Version>,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("_delta_log");
+        std::fs::create_dir(&log).unwrap();
+        for version in commit_versions {
+            std::fs::write(log.join(format!("{version:020}.json")), "not JSON").unwrap();
+        }
+        std::fs::write(
+            log.join(format!("{:020}.{checkpoint_suffix}", 13)),
+            checkpoint_contents,
+        )
+        .unwrap();
+        let root = Url::from_directory_path(directory.path()).unwrap();
+        let builder = CommitRange::builder_for(root.as_str(), 11)
+            .fold_with(end_version, CommitRangeBuilder::with_end_version)
+            .with_commit_range_validation(validate_range);
+        let result = builder.build(&SyncEngine::new());
+        match expected {
+            Err(missing_version) => {
+                assert!(
+                    matches!(result, Err(KernelError::MissingVersion(v)) if v == missing_version)
+                );
+            }
+            Ok(end_version) => {
+                let range = result.unwrap();
+                assert_eq!(range.start_version(), 11);
+                assert_eq!(range.end_version(), end_version);
+                let actual_versions: Vec<_> =
+                    range.commit_files.iter().map(|file| file.version).collect();
+                let expected_versions: Vec<_> = commit_versions
+                    .iter()
+                    .copied()
+                    .filter(|version| *version <= end_version)
+                    .collect();
+                assert_eq!(actual_versions, expected_versions);
+            }
+        }
     }
 
     #[test]

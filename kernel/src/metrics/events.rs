@@ -1095,7 +1095,7 @@ impl fmt::Display for TransactionCommitSuccess {
     }
 }
 
-/// Why a transaction commit did not succeed.
+/// Why a transaction commit attempt did not return confirmed success.
 ///
 /// Serializes to its `snake_case` name for the `failure_reason` span field (e.g.
 /// `RetryableIo` -> `"retryable_io"`).
@@ -1108,10 +1108,14 @@ pub enum CommitFailureReason {
     RetryableIo,
     /// A terminal (non-retryable) error occurred.
     Error,
+    /// Acceptance of the commit was not established; the commit may have succeeded.
+    Unknown,
 }
 
-/// A transaction commit did not succeed; `reason` distinguishes conflict, retryable IO, and
-/// terminal errors.
+/// A transaction commit attempt did not return confirmed success.
+///
+/// With [`CommitFailureReason::Unknown`], acceptance was not established and the commit may have
+/// succeeded.
 #[derive(Debug, Clone)]
 pub struct TransactionCommitFailure {
     pub operation_id: MetricId,
@@ -2307,7 +2311,8 @@ mod tests {
     #[case::conflict("conflict", CommitFailureReason::Conflict)]
     #[case::retryable_io("retryable_io", CommitFailureReason::RetryableIo)]
     #[case::error("error", CommitFailureReason::Error)]
-    #[case::unknown_defaults_to_error("totally_unknown", CommitFailureReason::Error)]
+    #[case::unknown("unknown", CommitFailureReason::Unknown)]
+    #[case::unrecognized_defaults_to_error("totally_unknown", CommitFailureReason::Error)]
     fn record_str_failure_reason_flips_to_expected_reason(
         #[case] value: &str,
         #[case] expected: CommitFailureReason,
@@ -2382,6 +2387,7 @@ mod tests {
     #[case::conflict(CommitFailureReason::Conflict, "conflict")]
     #[case::retryable_io(CommitFailureReason::RetryableIo, "retryable_io")]
     #[case::error(CommitFailureReason::Error, "error")]
+    #[case::unknown(CommitFailureReason::Unknown, "unknown")]
     fn commit_failure_reason_serializes_to_wire_name_and_parses_back(
         #[case] reason: CommitFailureReason,
         #[case] wire: &str,

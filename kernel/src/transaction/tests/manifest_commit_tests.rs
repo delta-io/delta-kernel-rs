@@ -66,7 +66,8 @@ fn validate_manifest_write_allows_root_manifest_on_adaptive_table() -> Result<()
     txn.state.effective_table_config = adaptive_table_config();
     let file = dummy_root_manifest_file_meta(&txn);
     txn = txn.with_root_manifest_file(file)?;
-    txn.validate_manifest_write_semantics()?;
+    txn.state
+        .validate_manifest_write_semantics(&txn.staged_data_changes)?;
     Ok(())
 }
 
@@ -78,7 +79,8 @@ fn validate_manifest_write_rejects_root_manifest_with_file_actions() -> Result<(
     txn = txn.with_root_manifest_file(file)?;
     add_dummy_file(&mut txn);
     assert_result_error_with_message(
-        txn.validate_manifest_write_semantics(),
+        txn.state
+            .validate_manifest_write_semantics(&txn.staged_data_changes),
         "cannot include file actions",
     );
     Ok(())

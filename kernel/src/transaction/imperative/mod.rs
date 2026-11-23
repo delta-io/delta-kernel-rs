@@ -104,8 +104,9 @@ impl<STATE> Transaction<STATE, Imperative> {
         let commit_start = Instant::now();
 
         // === Pre-commit validation ===
-        self.validate_operation_compatibility()?;
-        self.validate_commit()?;
+        self.state
+            .validate_operation_compatibility(&self.staged_data_changes)?;
+        self.state.validate_commit(&self.staged_data_changes)?;
         self.validate_file_actions()?;
 
         // === Action generation ===
@@ -134,8 +135,6 @@ impl<STATE> Transaction<STATE, Imperative> {
         let commit_metadata = self.state.create_commit_metadata(
             commit_version,
             kernel_commit_info.in_commit_timestamp,
-            protocol,
-            metadata,
             dm_changes.clone(),
         )?;
         let prepare_duration = commit_start.elapsed();
@@ -257,7 +256,7 @@ impl<STATE> Transaction<STATE, Imperative> {
                 );
                 let crc_delta = self
                     .state
-                    .build_crc_delta(file_stats, commit_info, dm_changes)?;
+                    .build_crc_delta(file_stats, commit_info, dm_changes);
                 Ok(CommitResult::Committed(self.state.into_committed(
                     file_meta,
                     crc_delta,
@@ -269,6 +268,11 @@ impl<STATE> Transaction<STATE, Imperative> {
                 tracing::Span::current()
                     .record("failure_reason", CommitFailureReason::Conflict.as_ref());
                 Ok(CommitResult::Conflicted(self.into_conflicted(version)))
+            }
+            Ok(CommitResponse::Retryable { error }) => {
+                tracing::Span::current()
+                    .record("failure_reason", CommitFailureReason::RetryableIo.as_ref());
+                Ok(CommitResult::Retryable(self.into_retryable(error)))
             }
             // TODO: we may want to be more or less selective about what is retryable (this is tied
             // to the idea of "what kind of Errors should write_json_file return?")
@@ -714,7 +718,7 @@ static DATA_CHANGE_COLUMN: LazyLock<StructField> =
     LazyLock::new(|| StructField::not_null("dataChange", DataType::BOOLEAN));
 
 /// Builds the projection for converting add file metadata into commit-ready Add actions.
-fn build_add_action_projection(
+pub(super) fn build_add_action_projection(
     input_schema: &StructType,
     data_change: bool,
 ) -> KernelResult<(SchemaRef, Expression)> {
@@ -792,7 +796,7 @@ where
 /// When `adaptive_metadata_enabled` is set, the RFC requires `deletionTimestamp` to be null
 /// (cleanup uses tree reachability, not timestamp expiry), so it is emitted as a fixed literal
 /// rather than derived from the input.
-fn build_remove_struct_patch(
+pub(super) fn build_remove_struct_patch(
     commit_timestamp: i64,
     data_change: bool,
     columns_to_drop: &[&str],

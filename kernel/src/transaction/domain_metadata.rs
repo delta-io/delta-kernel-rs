@@ -3,8 +3,10 @@ use std::collections::HashSet;
 use super::TransactionState;
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::error::KernelError;
+use crate::log_segment::DomainMetadataMap;
 use crate::row_tracking::{
     ROW_TRACKING_DOMAIN_NAME, ROW_TRACKING_INITIAL_HIGH_WATER_MARK, RowTrackingDomainMetadata,
+    parse_row_tracking_high_water_mark,
 };
 use crate::table_features::TableFeature;
 use crate::{Engine, KernelResult};
@@ -153,45 +155,6 @@ impl TransactionState {
         Ok(())
     }
 
-    /// Generate removal actions for user domain metadata by scanning the log.
-    ///
-    /// This performs an expensive log replay operation to fetch the previous configuration
-    /// value for each domain being removed, as required by the Delta spec for tombstones.
-    /// Returns an empty vector if there are no domain removals.
-    pub(super) fn generate_user_domain_removal_actions(
-        &self,
-        engine: &dyn Engine,
-    ) -> KernelResult<Vec<DomainMetadata>> {
-        if self.user_domain_removals.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // Scan log to fetch existing configurations for tombstones.
-        // Pass the specific set of domains to remove so that log replay can terminate early
-        // once all target domains have been found, instead of replaying the entire log.
-        let domains: HashSet<&str> = self
-            .user_domain_removals
-            .iter()
-            .map(String::as_str)
-            .collect();
-        let existing_domains = self
-            .read_snapshot()?
-            .reader()
-            .get_domain_metadatas_internal(engine, Some(&domains))?;
-
-        // Create removal tombstones with pre-image configurations
-        Ok(self
-            .user_domain_removals
-            .iter()
-            .filter_map(|domain| {
-                // If domain doesn't exist in the log, this is a no-op (filter it out)
-                existing_domains.get(domain).map(|existing| {
-                    DomainMetadata::remove(domain.clone(), existing.configuration().to_owned())
-                })
-            })
-            .collect())
-    }
-
     /// Generates domain metadata actions (assumes domain metadata operations have already
     /// been validated)
     ///
@@ -208,28 +171,63 @@ impl TransactionState {
         engine: &dyn Engine,
         row_tracking_high_watermark: Option<RowTrackingDomainMetadata>,
     ) -> KernelResult<Vec<DomainMetadata>> {
-        let removal_actions = self.generate_user_domain_removal_actions(engine)?;
+        self.generate_domain_metadata_actions_with(row_tracking_high_watermark, |domains| {
+            self.read_snapshot()?
+                .reader()
+                .get_domain_metadatas_internal(engine, Some(domains))
+        })
+    }
 
-        let row_tracking_high_watermark =
-            if let Some(provided) = self.provided_row_tracking_high_water_mark {
-                let calculated = match row_tracking_high_watermark {
-                    Some(metadata) => metadata.high_water_mark(),
-                    None => self
-                        .read_snapshot()?
-                        .reader()
-                        .get_row_tracking_high_water_mark(engine)?
-                        .unwrap_or(ROW_TRACKING_INITIAL_HIGH_WATER_MARK),
-                };
-                if provided < calculated {
-                    return Err(KernelError::generic(format!(
-                        "Provided row-tracking high-water mark {provided} cannot be less than the \
-                         calculated value {calculated}",
-                    )));
-                }
-                Some(RowTrackingDomainMetadata::new(provided))
-            } else {
-                row_tracking_high_watermark
+    /// Generates domain actions using the supplied lookup for existing domain state.
+    /// Only domains needed for removals or high-water-mark validation are requested.
+    pub(super) fn generate_domain_metadata_actions_with(
+        &self,
+        row_tracking_high_watermark: Option<RowTrackingDomainMetadata>,
+        load_domains: impl FnOnce(&HashSet<&str>) -> KernelResult<DomainMetadataMap>,
+    ) -> KernelResult<Vec<DomainMetadata>> {
+        let mut domains: HashSet<&str> = self
+            .user_domain_removals
+            .iter()
+            .map(String::as_str)
+            .collect();
+        if self.provided_row_tracking_high_water_mark.is_some()
+            && row_tracking_high_watermark.is_none()
+        {
+            domains.insert(ROW_TRACKING_DOMAIN_NAME);
+        }
+        let existing_domains = if domains.is_empty() {
+            DomainMetadataMap::new()
+        } else {
+            load_domains(&domains)?
+        };
+        // Removal tombstones preserve the previous configuration. Absent domains are no-ops.
+        let removal_actions = self.user_domain_removals.iter().filter_map(|domain| {
+            existing_domains.get(domain).map(|existing| {
+                DomainMetadata::remove(domain.clone(), existing.configuration().to_owned())
+            })
+        });
+
+        let row_tracking_high_watermark = if let Some(provided) =
+            self.provided_row_tracking_high_water_mark
+        {
+            let calculated = match row_tracking_high_watermark {
+                Some(metadata) => metadata.high_water_mark(),
+                None => existing_domains
+                    .get(ROW_TRACKING_DOMAIN_NAME)
+                    .map(|metadata| parse_row_tracking_high_water_mark(metadata.configuration()))
+                    .transpose()?
+                    .unwrap_or(ROW_TRACKING_INITIAL_HIGH_WATER_MARK),
             };
+            if provided < calculated {
+                return Err(KernelError::generic(format!(
+                    "Provided row-tracking high-water mark {provided} cannot be less than the \
+                         calculated value {calculated}",
+                )));
+            }
+            Some(RowTrackingDomainMetadata::new(provided))
+        } else {
+            row_tracking_high_watermark
+        };
 
         // Generate the single row-tracking domain action, if any.
         let row_tracking_domain_action = row_tracking_high_watermark

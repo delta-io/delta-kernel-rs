@@ -1,79 +1,35 @@
-//! Transaction context and helpers independent of staged data changes.
+//! Transaction context shared by input collection and prepared commits.
 
-use std::sync::Arc;
-use std::time::Duration;
+use super::*;
 
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use super::ManifestWrite;
-use super::builder::TransactionBuilderState;
-use super::{
-    CommitOperation, CommittedTransaction, NonfileCommitActions, PostCommitStats, TransactionState,
-};
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::actions::{CheckpointAction, LastManifestCommit};
-use crate::actions::{CommitInfo, DomainMetadata, Metadata, Protocol, SetTransaction};
-use crate::committer::{CommitMetadata, CommitProtocolMetadata, CommitType, Committer};
-use crate::crc::{CrcDelta, FileStatsDelta};
-use crate::log_segment::LogSegment;
-use crate::metrics::MetricId;
-use crate::path::{LogRoot, ParsedLogPath};
-use crate::snapshot::Snapshot;
-use crate::table_configuration::TableConfiguration;
-use crate::table_features::TableFeature;
-use crate::utils::require;
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::version_as_i64;
-use crate::{Engine, FileMeta, KernelError, KernelResult, Version};
+impl std::fmt::Debug for TransactionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransactionState")
+            .field(
+                "read_version",
+                &self
+                    .read_snapshot_opt
+                    .as_ref()
+                    .map(|snapshot| snapshot.version()),
+            )
+            .field("table_root", self.effective_table_config.table_root())
+            .field("operation", &self.operation)
+            .finish_non_exhaustive()
+    }
+}
 
 impl TransactionState {
-    /// Initializes transaction context from builder intent and the supplied table configuration,
-    /// committer, operation, span, and timestamp.
-    pub(super) fn new(
-        common_state: TransactionBuilderState,
-        effective_table_config: TableConfiguration,
-        committer: Box<dyn Committer>,
-        operation: CommitOperation,
-        span: tracing::Span,
-        commit_timestamp: i64,
-    ) -> Self {
-        let set_transactions = common_state
-            .transaction_ids
-            .into_iter()
-            .map(|(app_id, version)| SetTransaction::new(app_id, version, Some(commit_timestamp)))
-            .collect();
-
-        Self {
-            span,
-            operation_id: MetricId::new(),
-            correlation_id: common_state.correlation_id,
-            read_snapshot_opt: None,
-            effective_table_config,
-            should_emit_protocol: false,
-            should_emit_metadata: false,
-            committer,
-            operation,
-            operation_parameters: common_state.operation_parameters,
-            operation_metrics: common_state.operation_metrics,
-            engine_info: common_state.engine_info,
-            engine_commit_info: common_state.engine_commit_info,
-            skip_dedup_validation: common_state.skip_dedup_validation,
-            set_transactions,
-            commit_timestamp,
-            user_domain_metadata_additions: common_state.domain_metadata_additions,
-            system_domain_metadata_additions: vec![],
-            provided_row_tracking_high_water_mark: None,
-            user_domain_removals: vec![],
-            data_change: common_state.data_change,
-            column_defaults_acknowledged: false,
-            #[cfg(feature = "check-constraints-in-dev")]
-            check_constraints_acknowledged: false,
-            generated_columns_acknowledged: false,
-            row_tracking_preservation_acknowledged: false,
-            is_blind_append: false,
-            #[cfg(feature = "adaptive-metadata-in-dev")]
-            manifest_write: None,
-            physical_clustering_columns: None,
-        }
+    pub(super) fn get_winning_commits(
+        &self,
+        engine: &dyn Engine,
+        conflict_version: Version,
+    ) -> KernelResult<WinningCommits> {
+        let table_root = self.effective_table_config.table_root();
+        let commits = self
+            .committer
+            .get_winning_commits(engine, table_root, conflict_version)?;
+        commits.validate_for_conflict(table_root, conflict_version)?;
+        Ok(commits)
     }
 
     /// Determines the commit type based on whether this is a create-table operation and whether
@@ -122,8 +78,6 @@ impl TransactionState {
         &self,
         commit_version: Version,
         in_commit_timestamp: Option<i64>,
-        new_protocol: Option<Protocol>,
-        new_metadata: Option<Metadata>,
         domain_metadata_changes: Vec<crate::actions::DomainMetadata>,
     ) -> KernelResult<CommitMetadata> {
         let log_root = LogRoot::new(self.effective_table_config.table_root().clone())?;
@@ -148,8 +102,10 @@ impl TransactionState {
         let protocol_metadata = CommitProtocolMetadata::try_new(
             read_protocol,
             read_metadata,
-            new_protocol,
-            new_metadata,
+            self.should_emit_protocol
+                .then(|| self.effective_table_config.protocol().clone()),
+            self.should_emit_metadata
+                .then(|| self.effective_table_config.metadata().clone()),
         )?;
         Ok(CommitMetadata::new(
             log_root,
@@ -160,6 +116,93 @@ impl TransactionState {
             protocol_metadata,
             domain_metadata_changes,
         ))
+    }
+
+    /// Validate that the transaction is eligible to be marked as a blind append.
+    ///
+    /// Note: Domain metadata additions/removals are allowed; blind append only constrains
+    /// data-file operations and read predicates. Conflict resolution determines whether
+    /// metadata changes are problematic.
+    pub(super) fn validate_blind_append_semantics(
+        &self,
+        staged: &impl exec_mode::StagedDataChanges,
+    ) -> KernelResult<()> {
+        if !self.is_blind_append {
+            return Ok(());
+        }
+        require!(
+            !self.is_create_table(),
+            KernelError::invalid_transaction_state(
+                "Blind append is not supported for create-table transactions",
+            )
+        );
+        require!(
+            staged.has_adds(),
+            KernelError::invalid_transaction_state(
+                "Blind append requires at least one added data file"
+            )
+        );
+        require!(
+            self.data_change,
+            KernelError::invalid_transaction_state("Blind append requires data_change to be true")
+        );
+        require!(
+            !staged.has_removes(),
+            KernelError::invalid_transaction_state("Blind append cannot remove files")
+        );
+        require!(
+            !staged.has_dv_inputs(),
+            KernelError::invalid_transaction_state("Blind append cannot update deletion vectors")
+        );
+
+        Ok(())
+    }
+
+    /// Validate the staged manifest write, if any. A root-manifest-file commit must carry no data
+    /// file actions; a manifest (content-tree) commit cannot be committed yet (its write path is
+    /// not built). The `adaptiveMetadata-preview` feature and root/commit mutual exclusion are
+    /// enforced when staging, so they need no check here.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(super) fn validate_manifest_write_semantics(
+        &self,
+        staged: &impl exec_mode::StagedDataChanges,
+    ) -> KernelResult<()> {
+        match &self.manifest_write {
+            Some(ManifestWrite::RootFile(_)) => {
+                require!(
+                    !staged.has_data_file_actions(),
+                    KernelError::generic("root manifest file commit cannot include file actions")
+                );
+            }
+            Some(ManifestWrite::Commit(_)) => {
+                return Err(KernelError::unsupported(
+                    "committing a manifest commit is not yet supported",
+                ));
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    /// Reject file actions on a commit to an `icebergNativeV4-preview` table.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(super) fn validate_iceberg_native_v4_semantics(
+        &self,
+        staged: &impl exec_mode::StagedDataChanges,
+    ) -> KernelResult<()> {
+        if !self
+            .effective_table_config
+            .is_feature_enabled(&TableFeature::IcebergNativeV4Preview)
+        {
+            return Ok(());
+        }
+        require!(
+            !staged.has_data_file_actions(),
+            KernelError::invalid_transaction_state(
+                "commits to icebergNativeV4-preview tables cannot include file actions"
+            )
+        );
+        Ok(())
     }
 
     /// Builds the `checkpoint` action committing the configured root manifest file, or `None` if
@@ -227,6 +270,21 @@ impl TransactionState {
                 None => Ok(None),
             },
         }
+    }
+
+    /// Reject data file writes (add/remove/DV) against an empty-schema table.
+    /// CREATE TABLE and metadata-only commits are exempt.
+    pub(super) fn ensure_schema_non_empty_for_data_writes(
+        &self,
+        staged: &impl exec_mode::StagedDataChanges,
+    ) -> KernelResult<()> {
+        if self.is_create_table() {
+            return Ok(());
+        }
+        if staged.has_data_file_actions() {
+            self.ensure_schema_non_empty_for_write_state()?;
+        }
+        Ok(())
     }
 
     /// Reject write-state creation on empty-schema tables, so engines fail before staging any
@@ -315,6 +373,54 @@ impl TransactionState {
         self.read_snapshot_opt.is_none()
     }
 
+    pub(super) fn validate_operation_compatibility(
+        &self,
+        staged: &impl exec_mode::StagedDataChanges,
+    ) -> KernelResult<()> {
+        self.operation
+            .validate()
+            .map_err(KernelError::invalid_transaction_state)?;
+        match (self.is_create_table(), &self.operation) {
+            (true, CommitOperation::CreateTable) => Ok(()),
+            (false, CommitOperation::UpdateTable(UpdateTableOperation::AlterTable))
+                if !self.should_emit_metadata =>
+            {
+                Err(KernelError::invalid_transaction_state(
+                    "ALTER TABLE requires at least one schema change",
+                ))
+            }
+            (false, CommitOperation::UpdateTable(UpdateTableOperation::AlterTable))
+                if self.data_change =>
+            {
+                Err(KernelError::invalid_transaction_state(
+                    "ALTER TABLE requires data_change to be false",
+                ))
+            }
+            (false, CommitOperation::UpdateTable(UpdateTableOperation::AlterTable))
+                if staged.has_data_file_actions() =>
+            {
+                Err(KernelError::invalid_transaction_state(
+                    "ALTER TABLE cannot include data-file actions",
+                ))
+            }
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            (false, CommitOperation::UpdateTable(UpdateTableOperation::AlterTable))
+                if self.manifest_write.is_some() =>
+            {
+                Err(KernelError::invalid_transaction_state(
+                    "ALTER TABLE cannot include manifest writes",
+                ))
+            }
+            (false, CommitOperation::UpdateTable(_)) => Ok(()),
+            (true, _) => Err(KernelError::invalid_transaction_state(
+                "create-table transactions must use the CREATE TABLE operation",
+            )),
+            (false, CommitOperation::CreateTable) => Err(KernelError::invalid_transaction_state(
+                "CREATE TABLE cannot use an update-table transaction",
+            )),
+        }
+    }
+
     // Returns the read snapshot. Returns an error if this is a create-table transaction.
     // To get the `Option<SnapshotRef>` directly, use the `read_snapshot_opt` field.
     pub(super) fn read_snapshot(&self) -> KernelResult<&Snapshot> {
@@ -362,13 +468,98 @@ impl TransactionState {
         }
     }
 
+    /// Performs all pre-commit validations based on configured transaction settings.
+    /// This method does not introspect into staged file-actions (see validate_file_actions
+    /// instead).
+    pub(super) fn validate_commit(
+        &self,
+        staged: &impl exec_mode::StagedDataChanges,
+    ) -> KernelResult<()> {
+        // Kernel cannot distinguish Remove actions and DV updates that only delete rows from those
+        // that accompany copied or updated rows, so both require the preservation acknowledgment.
+        if staged.has_removes() || staged.has_dv_updates() {
+            self.effective_table_config
+                .validate_feature_support_for_remove()?;
+            self.ensure_row_tracking_preservation_acknowledged()?;
+        }
+
+        #[cfg(feature = "check-constraints-in-dev")]
+        self.ensure_check_constraints_acknowledged()?;
+        self.ensure_generated_columns_acknowledged()?;
+
+        // TODO(zach): we currently do this in two passes - can we do it in one and still keep refs
+        // in the HashSet?
+        let mut app_ids = HashSet::with_capacity(self.set_transactions.len());
+        if let Some(dup) = self
+            .set_transactions
+            .iter()
+            .find(|t| !app_ids.insert(&t.app_id))
+        {
+            return Err(KernelError::generic(format!(
+                "app_id {} already exists in transaction",
+                dup.app_id
+            )));
+        }
+
+        self.validate_blind_append_semantics(staged)?;
+        self.ensure_schema_non_empty_for_data_writes(staged)?;
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        self.validate_manifest_write_semantics(staged)?;
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        self.validate_iceberg_native_v4_semantics(staged)?;
+
+        // Validate that the schema supports data writes when files are being added. Reads and
+        // metadata-only commits are always allowed.
+        if staged.has_adds() {
+            validate_schema_for_write(&self.effective_table_config.logical_schema())?;
+        }
+
+        // If a data-changing transaction has add files together with remove files or DV updates,
+        // block it when CDF is enabled. Kernel cannot discern DML operations. DML operations that
+        // update rows require a `cdc` file, but Kernel does not currently support writing CDC
+        // files.
+        if !self.is_create_table()
+            && staged.has_adds()
+            && (staged.has_removes() || staged.has_dv_updates())
+            && self.data_change
+        {
+            let cdf_enabled = self
+                .effective_table_config
+                .is_feature_enabled(&TableFeature::ChangeDataFeed);
+            require!(
+                !cdf_enabled,
+                KernelError::generic(
+                    "Cannot add and remove data in the same transaction when Change Data Feed is enabled (delta.enableChangeDataFeed = true). \
+                     This would require writing CDC files for DML operations, which is not yet supported. \
+                     Consider using separate transactions: one to add files, another to remove files or update deletion vectors."
+                )
+            );
+        }
+
+        self.validate_domain_metadata_operations()?;
+        Ok(())
+    }
+
     /// Generate non-file commit actions as in-memory structs, that can then be encoded into the
     /// committable format (e.g EngineData)
     pub(super) fn prepare_nonfile_actions(
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<NonfileCommitActions> {
-        let set_transactions = self.set_transactions.clone();
+        Ok(NonfileCommitActions {
+            commit_version: self.get_commit_version(),
+            kernel_commit_info: self.build_kernel_commit_info(engine)?,
+            protocol: self
+                .should_emit_protocol
+                .then(|| self.effective_table_config.protocol().clone()),
+            metadata: self
+                .should_emit_metadata
+                .then(|| self.effective_table_config.metadata().clone()),
+            set_transactions: self.set_transactions.clone(),
+        })
+    }
+
+    pub(super) fn build_kernel_commit_info(&self, engine: &dyn Engine) -> KernelResult<CommitInfo> {
         let in_commit_timestamp = self.get_in_commit_timestamp(engine)?;
         let mut kernel_commit_info = CommitInfo::new(
             self.commit_timestamp,
@@ -397,17 +588,7 @@ impl TransactionState {
 
         #[cfg(feature = "adaptive-metadata-in-dev")]
         self.set_adaptive_metadata_commit_info(engine, &mut kernel_commit_info)?;
-        Ok(NonfileCommitActions {
-            commit_version: self.get_commit_version(),
-            kernel_commit_info,
-            protocol: self
-                .should_emit_protocol
-                .then(|| self.effective_table_config.protocol().clone()),
-            metadata: self
-                .should_emit_metadata
-                .then(|| self.effective_table_config.metadata().clone()),
-            set_transactions,
-        })
+        Ok(kernel_commit_info)
     }
 
     pub(super) fn record_commit_success_metrics(
@@ -502,9 +683,9 @@ impl TransactionState {
         file_stats: FileStatsDelta,
         commit_info: CommitInfo,
         dm_changes: Vec<DomainMetadata>,
-    ) -> KernelResult<CrcDelta> {
+    ) -> CrcDelta {
         // TODO: drop these conversions by migrating the upstream chain
-        //       (`CommitMetadata.domain_metadata_changes`, `TransactionState.set_transactions`)
+        //       (`CommitMetadata.domain_metadata_changes`, `Transaction.set_transactions`)
         //       to `HashMap<String, _>`, lifting protocol-mandated uniqueness from runtime
         //       checks into the type system.
         let domain_metadata = dm_changes
@@ -516,15 +697,12 @@ impl TransactionState {
             .iter()
             .map(|txn| (txn.app_id.clone(), txn.clone()))
             .collect();
-        // Although `remove.size` is optional per the Delta protocol, the kernel write path
-        // enforces presence: `try_compute_for_txn` in the imperative commit path errors if any
-        // add or remove row lacks `size` (see `FileStatsVisitor::visit` in
-        // `kernel/src/crc/file_stats.rs`). So at this point every size is known to be
-        // present, and only operation classification can flip `is_incremental_safe`.
+        // The write path requires add/remove sizes, so operation classification determines
+        // whether these statistics are safe to apply incrementally.
         // TODO(#3714): Preserve incremental file stats for commits without add/remove actions,
         // matching replay's safety rule.
         let is_incremental_safe = self.operation.is_incremental_safe();
-        Ok(CrcDelta {
+        CrcDelta {
             file_stats,
             protocol: self
                 .should_emit_protocol
@@ -540,6 +718,6 @@ impl TransactionState {
             is_incremental_safe,
             unsupported_operation: (!is_incremental_safe)
                 .then(|| self.operation.as_str().to_string()),
-        })
+        }
     }
 }
