@@ -22,15 +22,24 @@ impl StructRowSource for BatchRows {
     ) -> KernelResult<()> {
         self.batches.try_for_each(|batch| {
             let batch = batch?;
-            StructVisitor {
-                batch: batch.as_ref(),
-                schema: self.schema,
-                columns: self.columns,
-                consume: &mut consume,
-            }
-            .visit_rows_of(batch.as_ref())
+            read_struct(batch.as_ref(), self.schema, self.columns, &mut consume)
         })
     }
+}
+
+pub(super) fn read_struct(
+    batch: &dyn EngineData,
+    schema: &'static SchemaRef,
+    columns: &'static ColumnNamesAndTypes,
+    consume: impl FnMut(StructData) -> KernelResult<()>,
+) -> KernelResult<()> {
+    StructVisitor {
+        batch,
+        schema,
+        columns,
+        consume,
+    }
+    .visit_rows_of(batch)
 }
 
 struct StructVisitor<'a, F> {
@@ -63,9 +72,8 @@ impl<F: FnMut(StructData) -> KernelResult<()>> RowVisitor for StructVisitor<'_, 
 }
 
 enum FieldReader<'a> {
-    Leaf(&'a StructField, &'a dyn GetData<'a>),
+    Leaf(&'a dyn GetData<'a>),
     Struct {
-        data_type: &'a DataType,
         schema: SchemaRef,
         fields: Vec<FieldReader<'a>>,
         nulls: Vec<bool>,
@@ -87,18 +95,14 @@ fn read_fields<'a>(
                 let fields = read_fields(batch, children, path, getters)?;
                 path.path_mut().pop();
                 Ok(FieldReader::Struct {
-                    data_type: field.data_type(),
                     schema: Arc::new(children.as_ref().clone()),
                     fields,
                     nulls,
                 })
             } else {
-                Ok(FieldReader::Leaf(
-                    field,
-                    getters.next().ok_or_else(|| {
-                        KernelError::missing_column("Missing result column getter")
-                    })?,
-                ))
+                Ok(FieldReader::Leaf(getters.next().ok_or_else(|| {
+                    KernelError::missing_column("Missing result column getter")
+                })?))
             }
         })
         .collect()
@@ -109,18 +113,18 @@ fn read_struct_row(
     fields: &[FieldReader<'_>],
     row: usize,
 ) -> KernelResult<StructData> {
-    let values = fields
-        .iter()
-        .map(|field| match field {
-            FieldReader::Leaf(field, getter) => read_scalar(*getter, row, field),
+    let values = schema
+        .fields()
+        .zip(fields)
+        .map(|(field, reader)| match reader {
+            FieldReader::Leaf(getter) => read_scalar(*getter, row, field),
             FieldReader::Struct {
-                data_type,
                 schema,
                 fields,
                 nulls,
             } => {
                 if nulls[row] {
-                    Ok(Scalar::Null((*data_type).clone()))
+                    Ok(Scalar::Null(field.data_type().clone()))
                 } else {
                     read_struct_row(schema, fields, row).map(Scalar::Struct)
                 }
@@ -253,16 +257,10 @@ mod tests {
         let batch = generate_batch([("value", values)])?;
         let batch = ArrowEngineData::new(batch);
         let mut values = Vec::new();
-        StructVisitor {
-            batch: &batch,
-            schema: &SCHEMA,
-            columns: &COLUMNS,
-            consume: |row: StructData| {
-                values.extend(row.into_parts().1);
-                Ok(())
-            },
-        }
-        .visit_rows_of(&batch)?;
+        read_struct(&batch, &SCHEMA, &COLUMNS, |row| {
+            values.extend(row.into_parts().1);
+            Ok(())
+        })?;
         assert_eq!(
             values,
             vec![
