@@ -500,10 +500,7 @@ mod tests {
             .unwrap_or(Scalar::Null(DataType::INTEGER));
         Scalar::Struct(
             StructData::try_new(
-                DeletionVectorDescriptor::to_schema()
-                    .fields()
-                    .cloned()
-                    .collect(),
+                DeletionVectorDescriptor::schema_ref().clone(),
                 vec![
                     Scalar::String(dv.storage_type.to_string()),
                     Scalar::String(dv.path_or_inline_dv.clone()),
@@ -546,7 +543,7 @@ mod tests {
                 DvColumnShape::ScanRow => dv,
                 DvColumnShape::LogBatch => Scalar::Struct(
                     StructData::try_new(
-                        vec![StructField::nullable("deletionVector", dv_schema)],
+                        schema_ref! { nullable "deletionVector": (dv_schema) },
                         vec![dv],
                     )
                     .unwrap(),
@@ -698,7 +695,7 @@ mod tests {
         );
         let partial_dv = Scalar::Struct(
             StructData::try_new(
-                nullable_dv_schema.fields().cloned().collect(),
+                schema_ref! { ..(nullable_dv_schema.fields()) },
                 vec![
                     Scalar::String(DeletionVectorStorageType::PersistedRelative.to_string()),
                     Scalar::Null(DataType::STRING), // pathOrInlineDv missing

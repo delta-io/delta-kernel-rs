@@ -471,6 +471,15 @@ mod tests {
     }
 
     #[test]
+    fn test_default_engine_in_memory() {
+        use delta_kernel::object_store::memory::InMemory;
+
+        let url = Url::parse("memory:///").unwrap();
+        let engine = DefaultEngineBuilder::new(Arc::new(InMemory::new())).build();
+        test_arrow_engine(&engine, &url);
+    }
+
+    #[test]
     fn test_default_engine_builder_new_and_build() {
         let tmp = tempfile::tempdir().unwrap();
         let url = Url::from_directory_path(tmp.path()).unwrap();

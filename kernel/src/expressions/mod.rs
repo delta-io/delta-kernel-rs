@@ -85,6 +85,20 @@ pub enum UnaryPredicateOp {
     /// SQL `expr IS NULL`: `true` when the input is null and `false` otherwise, never null itself.
     /// A wrapping `NOT` inverts it to `IS NOT NULL`.
     IsNull,
+    /// `true` when a STRING URI reference begins with a scheme followed by `:`, per
+    /// [RFC 3986 section 3.1]: `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) ":"`. Equivalent to
+    /// `regexp_like(expr, '^[A-Za-z][A-Za-z0-9+.\-]*:')`. A reference without a scheme is
+    /// relative. A NULL input yields NULL, and so does its `NOT`. Other input types are an error.
+    ///
+    /// ```text
+    /// HAS_URI_SCHEME('s3://bucket/a b.parquet')  -- true
+    /// HAS_URI_SCHEME('C:/data')                  -- true
+    /// HAS_URI_SCHEME('data/a:b.parquet')         -- false
+    /// HAS_URI_SCHEME('1abc:/a')                  -- false
+    /// ```
+    ///
+    /// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
+    HasUriScheme,
 }
 
 /// A binary predicate operator.
@@ -128,7 +142,8 @@ pub enum UnaryExpressionOp {
     /// SQL `to_json(expr)`: encode a struct as a JSON object string, one string per row. The input
     /// must be a struct and the output is STRING. A NULL input row produces a NULL string rather
     /// than `"null"`. This is the inverse of [`ParseJsonExpression`] for every type except
-    /// timestamps, whose sub-millisecond precision this operator discards (see below).
+    /// timestamps, whose sub-millisecond precision this operator discards unless
+    /// `full_precision_timestamps` is set (see below).
     ///
     /// Nested structs and arrays encode as JSON objects and arrays. Binary encodes as lowercase
     /// hex rather than base64, two digits per byte in the order the bytes appear, so
@@ -145,8 +160,45 @@ pub enum UnaryExpressionOp {
     /// `{"ts":"2026-07-02T15:55:55.298Z"}`. Emitting more digits, or rounding up, makes readers
     /// prune files that hold matching rows.
     ///
+    /// When `full_precision_timestamps` is set, timestamps instead encode with exactly six
+    /// fractional digits, so the same value becomes `{"ts":"2026-07-02T15:55:55.298677Z"}` and the
+    /// operator is the exact inverse of [`ParseJsonExpression`].
+    ///
     /// [Per-file Statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#per-file-statistics
-    ToJson,
+    ToJson {
+        /// Encode timestamps with all six microsecond digits instead of three.
+        full_precision_timestamps: bool,
+    },
+    /// Percent-encodes the path of a raw (unencoded) STRING URI reference per [RFC 3986]. Each
+    /// character that may not appear literally in a path ([section 3.3]), such as space, `#`, `%`
+    /// and `?`, becomes `%XX` ([section 2.1]), and a non-ASCII character becomes one `%XX` per
+    /// byte of its UTF-8 encoding. All other characters, including `/`, `.`, `:` and `@`, are kept.
+    ///
+    /// When the reference begins with a scheme (see [`UnaryPredicateOp::HasUriScheme`]), its
+    /// `scheme:` and any `//authority` (up to the next `/`) are kept verbatim. Existing `%XX`
+    /// escapes are not recognized, so an already-encoded input is encoded again. The output is
+    /// STRING, a NULL input yields NULL, and other input types are an error.
+    ///
+    /// ```text
+    /// URI_ENCODE_FILE_LOCATION('data/a b.parquet')         -- 'data/a%20b.parquet'
+    /// URI_ENCODE_FILE_LOCATION('s3://bucket/a#1.parquet')  -- 's3://bucket/a%231.parquet'
+    /// URI_ENCODE_FILE_LOCATION('data/München')             -- 'data/M%C3%BCnchen'
+    /// URI_ENCODE_FILE_LOCATION('data/a%20b.parquet')       -- 'data/a%2520b.parquet'
+    /// ```
+    ///
+    /// [RFC 3986]: https://datatracker.ietf.org/doc/html/rfc3986
+    /// [section 2.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-2.1
+    /// [section 3.3]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.3
+    // TODO(#2423): decide whether this keeps percent-encoding non-ASCII if `add.path` stops doing
+    // so.
+    UriEncodeFileLocation,
+}
+
+impl UnaryExpressionOp {
+    /// [`ToJson`](Self::ToJson) with timestamps truncated to milliseconds.
+    pub const TO_JSON: Self = Self::ToJson {
+        full_precision_timestamps: false,
+    };
 }
 
 /// A binary arithmetic operator over two numeric operands.
@@ -388,7 +440,7 @@ pub struct CaseWhenExpression {
 
 /// An expression that parses a JSON string column into a struct column of `output_schema`, the
 /// inverse of [`UnaryExpressionOp::ToJson`] except for the sub-millisecond timestamp precision
-/// that operator discards.
+/// that operator discards unless `full_precision_timestamps` is set.
 ///
 /// Unparseable input must degrade to NULL rather than fail the query, because kernel parses
 /// `add.stats` with this operator and data skipping reads null stats as "include the file". The
@@ -538,8 +590,10 @@ pub enum Expression {
     /// validated against the schema, so building a struct takes both. The expression count must
     /// equal the output field count.
     ///
-    /// The optional nullability predicate says when to *keep* the struct: a row survives only
-    /// where it is true, and nulls entirely where it is false or null.
+    /// The optional nullability predicate keeps the struct where it is true and makes the
+    /// entire struct null where it is false or null. See
+    /// [`ExpressionEvaluator::evaluate`](crate::ExpressionEvaluator::evaluate) for how a null
+    /// struct expands into output columns.
     ///
     /// ```sql
     /// CASE WHEN keep_pred THEN struct(expr1, expr2, ...) END
@@ -1038,7 +1092,7 @@ impl Expression {
     /// Creates a new ParseJson expression that parses a JSON string column into a struct.
     /// This is the inverse of [`UnaryExpressionOp::ToJson`] - it converts a JSON-encoded string
     /// into a struct. Sub-millisecond timestamp precision does not survive the round trip, since
-    /// `ToJson` truncates it.
+    /// `ToJson` truncates it unless `full_precision_timestamps` is set.
     pub fn parse_json(json_expr: impl Into<Expression>, output_schema: SchemaRef) -> Self {
         Self::ParseJson(ParseJsonExpression::new(json_expr, output_schema))
     }
@@ -1108,6 +1162,11 @@ impl Predicate {
     /// Create a new predicate `self IS NOT NULL`
     pub fn is_not_null(expr: impl Into<Expression>) -> Self {
         Self::not(Self::is_null(expr))
+    }
+
+    /// Create a new predicate `HAS_URI_SCHEME(expr)`; see [`UnaryPredicateOp::HasUriScheme`].
+    pub fn has_uri_scheme(expr: impl Into<Expression>) -> Self {
+        Self::unary(UnaryPredicateOp::HasUriScheme, expr)
     }
 
     /// Create a new predicate `self == other`
@@ -1237,7 +1296,8 @@ impl Display for UnaryExpressionOp {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         use UnaryExpressionOp::*;
         match self {
-            ToJson => write!(f, "TO_JSON"),
+            ToJson { .. } => write!(f, "TO_JSON"),
+            UriEncodeFileLocation => write!(f, "URI_ENCODE_FILE_LOCATION"),
         }
     }
 }
@@ -1323,6 +1383,13 @@ impl Display for Expression {
                 }
                 write!(f, ")")
             }
+            Unary(UnaryExpression {
+                op:
+                    op @ UnaryExpressionOp::ToJson {
+                        full_precision_timestamps: true,
+                    },
+                expr,
+            }) => write!(f, "{op}({expr}, full_precision_timestamps)"),
             Unary(UnaryExpression { op, expr }) => write!(f, "{op}({expr})"),
             Binary(BinaryExpression { op, left, right }) => write!(f, "{left} {op} {right}"),
             Variadic(VariadicExpression { op, exprs }) => {
@@ -1379,6 +1446,7 @@ impl Display for Predicate {
             Binary(BinaryPredicate { op, left, right }) => write!(f, "{left} {op} {right}"),
             Unary(UnaryPredicate { op, expr }) => match op {
                 UnaryPredicateOp::IsNull => write!(f, "{expr} IS NULL"),
+                UnaryPredicateOp::HasUriScheme => write!(f, "HAS_URI_SCHEME({expr})"),
             },
             Junction(JunctionPredicate { op, preds }) => {
                 let op = match op {
@@ -1459,8 +1527,8 @@ mod tests {
     use serde::de::DeserializeOwned;
 
     use super::{
-        DataType, Expression as Expr, MapToStructOptions, Predicate as Pred, col, column_pred,
-        expr, lit,
+        DataType, Expression as Expr, MapToStructOptions, Predicate as Pred, UnaryExpressionOp,
+        col, column_pred, expr, lit,
     };
 
     /// Helper function to verify roundtrip serialization/deserialization
@@ -1489,6 +1557,23 @@ mod tests {
             (
                 Expr::cast(col!("x"), DataType::DATE),
                 "CAST(Column(x) AS date)",
+            ),
+            (
+                Expr::unary(UnaryExpressionOp::TO_JSON, col!("x")),
+                "TO_JSON(Column(x))",
+            ),
+            (
+                Expr::unary(
+                    UnaryExpressionOp::ToJson {
+                        full_precision_timestamps: true,
+                    },
+                    col!("x"),
+                ),
+                "TO_JSON(Column(x), full_precision_timestamps)",
+            ),
+            (
+                Expr::unary(UnaryExpressionOp::UriEncodeFileLocation, col!("x")),
+                "URI_ENCODE_FILE_LOCATION(Column(x))",
             ),
             (
                 Expr::case_when([(col!("x").is_null(), lit(0))], col!("x")),
@@ -1569,6 +1654,10 @@ mod tests {
                 Pred::from_expr(expr!(col("x") == "foo")),
                 "Column(x) = 'foo'",
             ),
+            (
+                Pred::not(Pred::has_uri_scheme(col!("x"))),
+                "NOT(HAS_URI_SCHEME(Column(x)))",
+            ),
         ];
 
         for (pred, expected) in cases {
@@ -1589,7 +1678,7 @@ mod tests {
             ExpressionStructPatchBuilder, MapToStructOptions, Predicate, Scalar, UnaryExpressionOp,
             col, column_name, expr, lit, null_lit,
         };
-        use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
+        use crate::schema::{ArrayType, DataType, DecimalType, MapType, schema_ref};
         use crate::unit_test_utils::assert_result_error_with_message;
 
         // ==================== Expression::Literal Tests ====================
@@ -1656,10 +1745,7 @@ mod tests {
                 // Struct
                 Expression::Literal(Scalar::Struct(
                     StructData::try_new(
-                        vec![
-                            StructField::nullable("x", DataType::INTEGER),
-                            StructField::nullable("y", DataType::STRING),
-                        ],
+                        schema_ref! { nullable "x": INTEGER, nullable "y": STRING },
                         vec![Scalar::Integer(42), Scalar::String("hello".to_string())],
                     )
                     .unwrap(),
@@ -1698,10 +1784,16 @@ mod tests {
 
         // ==================== Expression Operations Tests ====================
 
-        #[test]
-        fn test_unary_expression_roundtrip() {
-            let expr = Expression::unary(UnaryExpressionOp::ToJson, col!("data"));
-            assert_roundtrip(&expr);
+        #[rstest::rstest]
+        fn test_unary_expression_roundtrip(
+            #[values(
+                UnaryExpressionOp::TO_JSON,
+                UnaryExpressionOp::ToJson { full_precision_timestamps: true },
+                UnaryExpressionOp::UriEncodeFileLocation
+            )]
+            op: UnaryExpressionOp,
+        ) {
+            assert_roundtrip(&Expression::unary(op, col!("data")));
         }
 
         #[test]
@@ -1894,6 +1986,7 @@ mod tests {
                 // Unary predicates
                 Predicate::from_expr(expr!(is_null(col("nullable_col")))),
                 Predicate::from_expr(expr!(is_not_null(col("nullable_col")))),
+                Predicate::has_uri_scheme(col!("location")),
             ];
 
             for pred in &cases {

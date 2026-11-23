@@ -25,10 +25,9 @@ use crate::committer::{CommitMetadata, CommitResponse};
 use crate::crc::FileStatsDelta;
 use crate::engine_data::FilteredEngineData;
 use crate::error::KernelError;
-use crate::expressions::UnaryExpressionOp::ToJson;
 use crate::expressions::{
-    ArrayData, ColumnName, ExpressionStructPatch, ExpressionStructPatchBuilder, Predicate, col,
-    column_name, lit, null_lit,
+    ArrayData, ColumnName, ExpressionStructPatch, ExpressionStructPatchBuilder, Predicate,
+    UnaryExpressionOp, col, column_name, lit, null_lit,
 };
 use crate::log_replay::HasSelectionVector;
 use crate::metrics::CommitFailureReason;
@@ -703,7 +702,7 @@ fn build_add_action_projection(
         .replace(
             "stats",
             StructField::nullable("stats", DataType::STRING),
-            Expression::unary(ToJson, col!("stats")),
+            Expression::unary(UnaryExpressionOp::TO_JSON, col!("stats")),
         )
         .build()?;
     let patch = Expression::struct_from([patch]);
@@ -803,7 +802,7 @@ fn build_remove_struct_patch(
         // Replace stats with COALESCE(stats, TO_JSON(stats_parsed)) and drop stats_parsed.
         let coalesce_stats = Expression::coalesce([
             col!("stats"),
-            Expression::unary(ToJson, col!(STATS_PARSED_NAME)),
+            Expression::unary(UnaryExpressionOp::TO_JSON, col!(STATS_PARSED_NAME)),
         ]);
         patch = patch
             .replace("stats", coalesce_stats)
@@ -863,7 +862,7 @@ mod tests {
     use crate::engine::{DelegatingEngine, RelaxedCounter};
     use crate::expressions::{ExpressionRef, MapData, PredicateRef, Scalar, StructData};
     use crate::scan::log_replay::PATH_NAME;
-    use crate::schema::{MapType, column_name, schema};
+    use crate::schema::{MapType, column_name};
     use crate::table_configuration::TableConfiguration;
     use crate::table_properties::APPEND_ONLY;
     use crate::transaction::create_table::create_table;
@@ -1284,17 +1283,15 @@ mod tests {
 
     /// Creates test add file metadata with configurable stats for the "value" column.
     fn create_test_add_files(paths: Vec<&str>, stats: Vec<TestFileStats>) -> Box<dyn EngineData> {
-        let value_schema = schema! { nullable "value": LONG };
-        let value_fields = value_schema.fields().cloned().collect::<Vec<_>>();
-        let value_struct_type = DataType::from(value_schema);
-        let stats_schema = schema! {
+        let value_schema = schema_ref! { nullable "value": LONG };
+        let value_struct_type = DataType::from(value_schema.clone());
+        let stats_schema = schema_ref! {
             nullable NUM_RECORDS: LONG,
             nullable NULL_COUNT: (value_struct_type.clone()),
             nullable MIN_VALUES: (value_struct_type.clone()),
             nullable MAX_VALUES: (value_struct_type.clone()),
         };
-        let stats_fields = stats_schema.fields().cloned().collect::<Vec<_>>();
-        let stats_type = DataType::from(stats_schema);
+        let stats_type = DataType::from(stats_schema.clone());
         let schema = schema_ref! {
             not_null "path": STRING,
             not_null "partitionValues": { STRING => nullable STRING },
@@ -1321,7 +1318,7 @@ mod tests {
                         let value_struct = |v: Option<i64>| {
                             let scalar = v.map_or(Scalar::Null(DataType::LONG), |n| n.into());
                             Scalar::Struct(
-                                StructData::try_new(value_fields.clone(), vec![scalar]).unwrap(),
+                                StructData::try_new(value_schema.clone(), vec![scalar]).unwrap(),
                             )
                         };
                         let (null_count, min, max) = match stat {
@@ -1338,7 +1335,7 @@ mod tests {
                         };
                         Scalar::Struct(
                             StructData::try_new(
-                                stats_fields.clone(),
+                                stats_schema.clone(),
                                 vec![100i64.into(), null_count, min, max],
                             )
                             .unwrap(),

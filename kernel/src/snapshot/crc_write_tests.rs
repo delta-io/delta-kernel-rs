@@ -233,8 +233,12 @@ struct PutStorage {
 }
 
 impl StorageHandler for PutStorage {
-    fn list_from(&self, path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
-        self.storage.list_from(path)
+    fn list_from(
+        &self,
+        path: &Url,
+        end: Option<&Url>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+        self.storage.list_from(path, end)
     }
 
     fn read_files(

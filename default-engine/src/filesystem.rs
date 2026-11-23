@@ -5,8 +5,9 @@ use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
 use delta_kernel::{
     CancellationTokenRef, FileMeta, FileSlice, KernelError, KernelResult, KernelResultIterator,
-    StorageHandler,
+    StorageHandler, keep_listing,
 };
+use futures::future::ready;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use url::Url;
@@ -35,6 +36,19 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
         self.readahead = readahead;
         self
     }
+
+    fn list_from_iter(
+        &self,
+        path: &Url,
+        end: Option<&Url>,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+        super::stream_future_to_cancellable_iter(
+            self.task_executor.clone(),
+            list_from_impl(self.inner.clone(), path.clone(), end.cloned()),
+            cancellation_token,
+        )
+    }
 }
 
 /// Native async implementation for list_from.
@@ -43,10 +57,15 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
 /// handler (e.g. inside `DefaultEngine`'s `storage_handler()`), so this function just
 /// returns the raw stream.
 ///
+/// When `end` is set, ordered stores apply the exclusive bound on the object_store stream so
+/// later pages are not fetched. Unordered stores still walk the prefix, but drop entries at or
+/// after `end` before sorting.
+///
 /// [`MeteredStorageHandler`]: delta_kernel::metrics::MeteredStorageHandler
 async fn list_from_impl(
     store: Arc<DynObjectStore>,
     path: Url,
+    end: Option<Url>,
 ) -> KernelResult<BoxStream<'static, KernelResult<FileMeta>>> {
     // The offset is used for list-after; the prefix is used to restrict the listing to a specific
     // directory. Unfortunately, `Path` provides no easy way to check whether a name is
@@ -88,15 +107,16 @@ async fn list_from_impl(
         });
 
     if !has_ordered_listing {
-        // Local filesystem doesn't return sorted list - need to collect and sort
-        let mut items: Vec<_> = stream.try_collect().await?;
+        // Local filesystem doesn't return a sorted list. Drop entries at or after `end` before
+        // sorting so protocol subdirs (e.g. `_staged_commits/`) are not part of the sort.
+        let mut items: Vec<_> = stream
+            .filter(move |item| ready(keep_listing(item, end.as_ref())))
+            .try_collect()
+            .await?;
         items.sort_unstable();
-        Ok(Box::pin(stream::iter(
-            items
-                .into_iter()
-                .map(Ok::<FileMeta, delta_kernel::KernelError>),
-        )))
+        Ok(Box::pin(stream::iter(items.into_iter().map(Ok))))
     } else {
+        let stream = stream.take_while(move |item| ready(keep_listing(item, end.as_ref())));
         Ok(Box::pin(stream))
     }
 }
@@ -201,22 +221,21 @@ async fn head_impl(store: Arc<DynObjectStore>, url: Url) -> KernelResult<FileMet
 }
 
 impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
-    fn list_from(&self, path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
-        self.list_from_with_cancellation(path, None)
+    fn list_from(
+        &self,
+        path: &Url,
+        end: Option<&Url>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+        self.list_from_iter(path, end, None)
     }
 
     fn list_from_with_cancellation(
         &self,
         path: &Url,
+        end: Option<&Url>,
         cancellation_token: Option<CancellationTokenRef>,
     ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
-        let future = list_from_impl(self.inner.clone(), path.clone());
-        let iter = super::stream_future_to_cancellable_iter(
-            self.task_executor.clone(),
-            future,
-            cancellation_token,
-        )?;
-        Ok(iter)
+        self.list_from_iter(path, end, cancellation_token)
     }
 
     /// Read data specified by the start and end offset from the file.
@@ -305,12 +324,14 @@ mod tests {
     use std::ops::Range;
     use std::time::Duration;
 
-    use delta_kernel::Engine as _;
+    use delta_kernel::object_store::ObjectStore as _;
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel::schema::schema_ref;
+    use delta_kernel::{Engine as _, Snapshot};
     use delta_kernel_default_engine_test_utils::current_time_duration;
     use itertools::Itertools;
-    use test_utils::delta_path_for_version;
+    use test_utils::{create_table_and_load_snapshot, delta_path_for_version};
 
     use super::*;
     use crate::DefaultEngineBuilder;
@@ -428,7 +449,10 @@ mod tests {
         let engine = DefaultEngineBuilder::new(store).build();
         let files: Vec<_> = engine
             .storage_handler()
-            .list_from(&table_root.join("_delta_log").unwrap().join("0").unwrap())
+            .list_from(
+                &table_root.join("_delta_log").unwrap().join("0").unwrap(),
+                None,
+            )
             .unwrap()
             .try_collect()
             .unwrap();
@@ -458,7 +482,7 @@ mod tests {
         let engine = DefaultEngineBuilder::new(store).build();
         let files = engine
             .storage_handler()
-            .list_from(&url.join("_delta_log").unwrap().join("0").unwrap())
+            .list_from(&url.join("_delta_log").unwrap().join("0").unwrap(), None)
             .unwrap();
         let mut len = 0;
         for (file, expected) in files.zip(expected_names.iter()) {
@@ -488,7 +512,7 @@ mod tests {
 
         // mailto: URLs cannot be modified through path_segments_mut().
         let directory_url = Url::parse("mailto:table/").unwrap();
-        let error = list_from_impl(store, directory_url)
+        let error = list_from_impl(store, directory_url, None)
             .await
             .unwrap()
             .try_collect::<Vec<_>>()
@@ -529,7 +553,7 @@ mod tests {
 
         // === Call the listing implementation using the escaped directory URL ===
         let directory_url = Url::parse(&format!("s3://bucket/{encoded_table_name}/")).unwrap();
-        let files: Vec<_> = list_from_impl(store, directory_url)
+        let files: Vec<_> = list_from_impl(store, directory_url, None)
             .await
             .unwrap()
             .try_collect()
@@ -593,7 +617,7 @@ mod tests {
         // === List using the correctly escaped directory URL ===
         let directory_url = Url::parse(&format!("{base_url}{encoded_name}/_delta_log/")).unwrap();
         let listed_files: Vec<_> = storage
-            .list_from(&directory_url)
+            .list_from(&directory_url, None)
             .unwrap()
             .try_collect()
             .unwrap();
@@ -627,7 +651,7 @@ mod tests {
 
         // Resuming after the first listed URL must exclude that file and keep the remaining order.
         let after_first: Vec<_> = storage
-            .list_from(&listed_files[0].location)
+            .list_from(&listed_files[0].location, None)
             .unwrap()
             .try_collect()
             .unwrap();
@@ -661,7 +685,7 @@ mod tests {
         let storage = engine.storage_handler();
         let directory_url = Url::parse(&format!("{base_url}table%2541/")).unwrap();
         let listed_files: Vec<_> = storage
-            .list_from(&directory_url)
+            .list_from(&directory_url, None)
             .unwrap()
             .try_collect()
             .unwrap();
@@ -695,7 +719,7 @@ mod tests {
         // === List the directory using a file:// URL ===
         let directory_url = Url::from_directory_path(file_path.parent().unwrap()).unwrap();
         let listed_files: Vec<_> = storage
-            .list_from(&directory_url)
+            .list_from(&directory_url, None)
             .unwrap()
             .try_collect()
             .unwrap();
@@ -858,10 +882,122 @@ mod tests {
         let url = Url::from_directory_path(tempdir.path()).unwrap();
         let token: CancellationTokenRef = Arc::new(test_utils::TestCancellationToken::cancelled());
 
-        let listed = handler.list_from_with_cancellation(&url, Some(token.clone()));
+        let listed = handler.list_from_with_cancellation(&url, None, Some(token.clone()));
         assert!(matches!(listed, Err(KernelError::Cancelled)));
 
         let read = handler.read_files_with_cancellation(vec![(url, None)], Some(token));
         assert!(matches!(read, Err(KernelError::Cancelled)));
+    }
+
+    // Upper-bound comparison uses percent-decoded paths, so a caller-built bound that still
+    // contains unreserved escapes (t%61ble) matches listed locations rebuilt from object keys.
+    #[rstest::rstest]
+    #[case::ordered("s3://bucket/")]
+    #[case::unordered("file:///")]
+    #[tokio::test]
+    async fn list_from_upper_bound_preserves_commits_under_encoded_roots(
+        #[case] origin: &str,
+        #[values("table/", "t%61ble/")] table_dir: &str,
+        #[values(":", "00000000000000000001")] upper: &str,
+    ) {
+        let store = Arc::new(InMemory::new());
+        let commit = "table/_delta_log/00000000000000000000.json";
+        store
+            .put(&Path::from(commit), Bytes::new().into())
+            .await
+            .unwrap();
+
+        let origin = Url::parse(origin).unwrap();
+        let log_root = origin.join(table_dir).unwrap().join("_delta_log/").unwrap();
+        let start = log_root.join("00000000000000000000").unwrap();
+        let expected = vec![origin.join(commit).unwrap()];
+        let unbounded: Vec<_> = list_from_impl(store.clone(), start.clone(), None)
+            .await
+            .unwrap()
+            .map_ok(|meta| meta.location)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(unbounded, expected);
+
+        let bounded: Vec<_> = list_from_impl(store, start, Some(log_root.join(upper).unwrap()))
+            .await
+            .unwrap()
+            .map_ok(|meta| meta.location)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(bounded, expected);
+    }
+
+    #[rstest::rstest]
+    fn snapshot_upper_bound_preserves_tables_under_encoded_roots(
+        #[values("s3://bucket/table/", "s3://bucket/t%61ble/")] table_root: &str,
+    ) {
+        let engine = DefaultEngineBuilder::new(Arc::new(InMemory::new())).build();
+        let created = create_table_and_load_snapshot(
+            "s3://bucket/table/",
+            schema_ref! { nullable "id": LONG },
+            &engine,
+            &[],
+        )
+        .unwrap();
+
+        let loaded = Snapshot::builder_for(table_root).build(&engine).unwrap();
+        assert_eq!(loaded.version(), created.version());
+        assert_eq!(loaded.schema(), created.schema());
+    }
+
+    // Ordered stores stream in native/object-key order. Comparing the bound in that same
+    // percent-decoded space keeps take_while from stopping early on URL-string reorderings.
+    #[rstest::rstest]
+    #[case::ascii("a.json", ["a.json", "z.json"], "m", &["a.json"])]
+    #[case::unicode_after_bound("é.json", ["z.json", "é.json"], "m", &[])]
+    #[case::unicode_stops_after_z("é.json", ["z.json", "é.json"], "~", &["z.json"])]
+    #[tokio::test]
+    async fn list_from_upper_bound_follows_decoded_path_order(
+        #[case] filename: &str,
+        #[case] native_order: [&str; 2],
+        #[case] upper: &str,
+        #[case] expected_names: &[&str],
+        #[values("s3://bucket/", "file:///")] origin: &str,
+    ) {
+        let store = Arc::new(InMemory::new());
+        for name in ["z.json", filename] {
+            store
+                .put(
+                    &Path::parse(format!("dir/{name}")).unwrap(),
+                    Bytes::new().into(),
+                )
+                .await
+                .unwrap();
+        }
+        // InMemory preserves native key order, like an ordinary S3 bucket.
+        let native: Vec<_> = store
+            .list(Some(&Path::from("dir")))
+            .map_ok(|meta| meta.location)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            native,
+            native_order.map(|name| Path::parse(format!("dir/{name}")).unwrap())
+        );
+
+        let start = Url::parse(origin).unwrap().join("dir/").unwrap();
+        let end = start.join(upper).unwrap();
+        let expected: Vec<_> = expected_names
+            .iter()
+            .map(|name| start.join(name).unwrap())
+            .collect();
+
+        let bounded: Vec<_> = list_from_impl(store, start, Some(end))
+            .await
+            .unwrap()
+            .map_ok(|meta| meta.location)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(bounded, expected);
     }
 }

@@ -4,13 +4,14 @@ use delta_kernel::snapshot::{SnapshotHint, SnapshotHintError, SnapshotHintFreshn
 use delta_kernel::{KernelError, KernelResult, Version};
 
 use super::builder::{ExclusiveSnapshotBuilder, FfiSnapshotBuilder, FfiSnapshotBuilderSource};
+use crate::checkpoint::FfiSelectedCheckpointType;
 use crate::delta_types::{
     FfiCrc, FfiLastCheckpoint, FfiMetadata, FfiProtocol, FfiPublicationWatermark,
 };
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::log_path::LogPathArray;
-use crate::{NullableCvoid, SharedExternEngine, SharedSnapshot};
+use crate::{NullableCvoid, OptionalValue, SharedExternEngine, SharedSnapshot};
 
 mod export;
 
@@ -91,6 +92,13 @@ pub struct FfiSnapshotHint {
     ///
     /// Export always uses an explicit variant, never `InferFromLogPaths`.
     pub publication_watermark: FfiPublicationWatermark,
+    /// The spec of the checkpoint selected from `log_paths`, if known. `None` means unknown, not
+    /// that no checkpoint was selected. Kernel uses it only when the checkpoint's naming and the
+    /// table protocol do not decide the type, and the checkpoint's contents replace it once read.
+    ///
+    /// C callers must set the tag explicitly, using `NoneFfiSelectedCheckpointType` when absent:
+    /// a zero-initialized field is an invalid `Some` payload.
+    pub checkpoint_type: OptionalValue<FfiSelectedCheckpointType>,
 }
 
 fn invalid_with_source(message: impl Into<String>, source: KernelError) -> KernelError {
@@ -157,6 +165,9 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
         last_checkpoint_hint,
         crc,
         freshness,
+        Option::<&FfiSelectedCheckpointType>::from(&value.checkpoint_type)
+            .copied()
+            .map(Into::into),
     )?;
     builder.snapshot_hint = Some(Box::new(snapshot_hint));
     Ok(())

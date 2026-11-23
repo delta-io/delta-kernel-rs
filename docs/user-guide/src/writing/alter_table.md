@@ -12,6 +12,7 @@ Before reading this page, make sure you understand
 
 Use **ALTER TABLE** for a standalone, metadata-only change. For example, you can add a nullable
 column or set table properties without writing or removing data files.
+`UpdateTableOperation::AlterTable` records `ALTER TABLE` as the operation.
 
 Use **SCHEMA EVOLUTION** to change the schema while writing or rewriting data files in the same
 transaction. For example, you can add a nullable column and append rows containing values for that
@@ -156,6 +157,18 @@ let result = snapshot
         ("app.owner", "analytics"),
         ("delta.checkpointInterval", "10"),
     ])
+    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .commit(&engine)?;
+```
+
+Call `with_table_properties_removed` to drop application properties. Only non-`delta.*` keys may be
+removed; removing a missing key is not an error. Adding and removing the same key in one
+transaction is rejected.
+
+```rust,ignore
+let result = snapshot
+    .update_table(UpdateTableOperation::AlterTable, "my-app/1.0", /* data_change */ false)
+    .with_table_properties_removed(["app.owner"])
     .build(&engine, Box::new(FileSystemCommitter::new()))?
     .commit(&engine)?;
 ```
