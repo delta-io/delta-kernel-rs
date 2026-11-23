@@ -12,8 +12,7 @@ Before reading this page, make sure you understand
 
 Use **ALTER TABLE** for a standalone, metadata-only change. For example, you can add a nullable
 column or set table properties without writing or removing data files.
-`UpdateTableOperation::AlterTable` records `ALTER TABLE` as the operation; see its rustdoc if you
-need Spark-style history names.
+`UpdateTableOperation::AlterTable` records `ALTER TABLE` as the operation.
 
 Use **SCHEMA EVOLUTION** to change the schema while writing or rewriting data files in the same
 transaction. For example, you can add a nullable column and append rows containing values for that

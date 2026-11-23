@@ -392,7 +392,7 @@ pub unsafe extern "C" fn update_table_txn_builder_with_table_properties_added(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_builder_with_table_properties_removed(
     builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
-    keys: &FfiStringArray,
+    keys: FfiStringArray,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
     let builder = unsafe { *builder.into_inner() };
