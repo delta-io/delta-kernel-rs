@@ -66,130 +66,131 @@ impl CheckpointInfo {
             version,
             ..Default::default()
         });
-        let result = (|| {
-            let Some(root) = segment.listed.checkpoint_parts.first() else {
-                return Ok(None);
-            };
-            let file_type = if root.is_json() {
-                FileType::Json
-            } else {
-                FileType::Parquet
-            };
-            let hint_metadata = segment
-                .checkpoint_hint()
-                .and_then(|hint| hint.v2_checkpoint.as_ref())
-                .and_then(|v2| v2.non_file_actions.as_ref())
-                .and_then(|actions| {
-                    actions.iter().find_map(|action| match action {
-                        HintAction::CheckpointMetadata(metadata) => Some(Cow::Borrowed(metadata)),
-                        _ => None,
-                    })
-                });
-            // TODO(#4048): `_last_checkpoint`'s schema can describe an earlier classic-named file
-            // that another writer replaced. Without a `sidecar` column it hides the new
-            // file's sidecars and makes it classify as V1.
-            let mut root_schema = segment.checkpoint_hint_schema();
-            let (sidecars, metadata) = match segment.checkpoint_hint_sidecars() {
-                Some(sidecars) => (Cow::Borrowed(sidecars.as_slice()), hint_metadata),
-                None => {
-                    if file_type == FileType::Parquet && root_schema.is_none() {
-                        if let Some(metrics) = &mut metrics {
-                            metrics.root_footer_calls += 1;
-                        }
-                        root_schema =
-                            Some(read_parquet_footer_schema(exec, root.location.clone())?);
-                    }
-                    let needs_root_read = root_schema.as_ref().is_none_or(|schema| {
-                        schema.contains(SIDECAR_NAME) || schema.contains(CHECKPOINT_METADATA_NAME)
-                    });
-                    if needs_root_read {
-                        let (sidecars, metadata) = collect_checkpoint_metadata(
-                            exec,
-                            &root.location,
-                            file_type,
-                            &mut metrics,
-                        )?;
-                        (Cow::Owned(sidecars), metadata.map(Cow::Owned))
-                    } else {
-                        (Cow::Borrowed([].as_slice()), None)
-                    }
-                }
-            };
-            if let Some(metadata) = &metadata
-                && metadata.version != root.version_as_i64()?
-            {
-                return Err(KernelError::invalid_checkpoint(
-                    "Checkpoint metadata version mismatch",
-                ));
-            }
-            let checkpoint_type = SelectedCheckpointType::from_contents(root, metadata.is_some());
-            let files = sidecars
-                .iter()
-                .map(|sidecar| sidecar.to_filemeta(&segment.log_root))
-                .collect::<KernelResult<Arc<[FileMeta]>>>()?;
-            let leaf_checkpoint_schema = if let Some(first) = files.first() {
-                let tagged = segment.checkpoint_hint_sidecar_file_schema().or_else(|| {
-                    metadata
-                        .as_ref()
-                        .and_then(|m| m.tags.as_ref())
-                        .and_then(|tags| tags.get(SIDECAR_FILE_SCHEMA_TAG))
-                        .and_then(|json| serde_json::from_str::<StructType>(json).ok())
-                });
-                match tagged {
-                    Some(schema) => Arc::new(schema),
-                    None => {
-                        if let Some(metrics) = &mut metrics {
-                            metrics.sidecar_footer_calls += 1;
-                        }
-                        read_parquet_footer_schema(exec, first.clone())?
-                    }
-                }
-            } else if file_type == FileType::Json {
-                CHECKPOINT_ACTIONS_SCHEMA_V2.clone()
-            } else {
-                let schema = match root_schema {
-                    Some(ref schema) => schema.clone(),
-                    None => {
-                        if let Some(metrics) = &mut metrics {
-                            metrics.root_footer_calls += 1;
-                        }
-                        read_parquet_footer_schema(exec, root.location.clone())?
-                    }
-                };
-                root_schema = Some(schema.clone());
-                schema
-            };
-            let size_in_bytes = segment
-                .listed
-                .checkpoint_parts
-                .iter()
-                .map(|part| part.location.size)
-                .chain(files.iter().map(|file| file.size))
-                .try_fold(0u64, |sum, size| {
-                    sum.checked_add(size)
-                        .ok_or_else(|| KernelError::invalid_checkpoint("Checkpoint size overflow"))
-                })?;
-            let last_checkpoint = Box::new(derived_last_checkpoint(
-                root,
-                segment.checkpoint_hint(),
-                sidecars,
-                metadata.as_deref(),
-                root_schema.as_ref(),
-                size_in_bytes,
-            )?);
-            Ok(Some(Arc::new(Self {
-                checkpoint_type,
-                leaf_checkpoint_schema,
-                sidecars: files,
-                size_in_bytes,
-                last_checkpoint,
-            })))
-        })();
+        let result = Self::resolve_inner(exec, segment, &mut metrics);
         tracing::Span::current().record("metrics", tracing::field::debug(&metrics));
         if let Err(error) = &result {
             tracing::error!(error = %error);
         }
         CheckpointResolveResult { result, metrics }
+    }
+
+    fn resolve_inner(
+        exec: &dyn PlanExecutor,
+        segment: &LogSegment,
+        metrics: &mut Option<CheckpointMetrics>,
+    ) -> KernelResult<Option<Arc<Self>>> {
+        let Some(root) = segment.listed.checkpoint_parts.first() else {
+            return Ok(None);
+        };
+        let file_type = if root.is_json() {
+            FileType::Json
+        } else {
+            FileType::Parquet
+        };
+        let hint_metadata = segment
+            .checkpoint_hint()
+            .and_then(|hint| hint.v2_checkpoint.as_ref())
+            .and_then(|v2| v2.non_file_actions.as_ref())
+            .and_then(|actions| {
+                actions.iter().find_map(|action| match action {
+                    HintAction::CheckpointMetadata(metadata) => Some(Cow::Borrowed(metadata)),
+                    _ => None,
+                })
+            });
+        // TODO(#4048): `_last_checkpoint`'s schema can describe an earlier classic-named file that
+        // another writer replaced. Without a `sidecar` column it hides the new file's sidecars and
+        // makes it classify as V1.
+        let mut root_schema = segment.checkpoint_hint_schema();
+        let (sidecars, metadata) = match segment.checkpoint_hint_sidecars() {
+            Some(sidecars) => (Cow::Borrowed(sidecars.as_slice()), hint_metadata),
+            None => {
+                if file_type == FileType::Parquet && root_schema.is_none() {
+                    if let Some(metrics) = metrics {
+                        metrics.root_footer_calls += 1;
+                    }
+                    root_schema = Some(read_parquet_footer_schema(exec, root.location.clone())?);
+                }
+                let needs_root_read = root_schema.as_ref().is_none_or(|schema| {
+                    schema.contains(SIDECAR_NAME) || schema.contains(CHECKPOINT_METADATA_NAME)
+                });
+                if needs_root_read {
+                    let (sidecars, metadata) =
+                        collect_checkpoint_metadata(exec, &root.location, file_type, metrics)?;
+                    (Cow::Owned(sidecars), metadata.map(Cow::Owned))
+                } else {
+                    (Cow::Borrowed([].as_slice()), None)
+                }
+            }
+        };
+        if let Some(metadata) = &metadata
+            && metadata.version != root.version_as_i64()?
+        {
+            return Err(KernelError::invalid_checkpoint(
+                "Checkpoint metadata version mismatch",
+            ));
+        }
+        let checkpoint_type = SelectedCheckpointType::from_contents(root, metadata.is_some());
+        let files = sidecars
+            .iter()
+            .map(|sidecar| sidecar.to_filemeta(&segment.log_root))
+            .collect::<KernelResult<Arc<[FileMeta]>>>()?;
+        let leaf_checkpoint_schema = if let Some(first) = files.first() {
+            let tagged = segment.checkpoint_hint_sidecar_file_schema().or_else(|| {
+                metadata
+                    .as_ref()
+                    .and_then(|m| m.tags.as_ref())
+                    .and_then(|tags| tags.get(SIDECAR_FILE_SCHEMA_TAG))
+                    .and_then(|json| serde_json::from_str::<StructType>(json).ok())
+            });
+            match tagged {
+                Some(schema) => Arc::new(schema),
+                None => {
+                    if let Some(metrics) = metrics {
+                        metrics.sidecar_footer_calls += 1;
+                    }
+                    read_parquet_footer_schema(exec, first.clone())?
+                }
+            }
+        } else if file_type == FileType::Json {
+            CHECKPOINT_ACTIONS_SCHEMA_V2.clone()
+        } else {
+            let schema = match root_schema {
+                Some(ref schema) => schema.clone(),
+                None => {
+                    if let Some(metrics) = metrics {
+                        metrics.root_footer_calls += 1;
+                    }
+                    read_parquet_footer_schema(exec, root.location.clone())?
+                }
+            };
+            root_schema = Some(schema.clone());
+            schema
+        };
+        let size_in_bytes = segment
+            .listed
+            .checkpoint_parts
+            .iter()
+            .map(|part| part.location.size)
+            .chain(files.iter().map(|file| file.size))
+            .try_fold(0u64, |sum, size| {
+                sum.checked_add(size)
+                    .ok_or_else(|| KernelError::invalid_checkpoint("Checkpoint size overflow"))
+            })?;
+        let last_checkpoint = Box::new(derived_last_checkpoint(
+            root,
+            segment.checkpoint_hint(),
+            sidecars,
+            metadata.as_deref(),
+            root_schema.as_ref(),
+            size_in_bytes,
+        )?);
+        Ok(Some(Arc::new(Self {
+            checkpoint_type,
+            leaf_checkpoint_schema,
+            sidecars: files,
+            size_in_bytes,
+            last_checkpoint,
+        })))
     }
 }
 
