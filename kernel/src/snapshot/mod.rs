@@ -375,7 +375,9 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<Arc<CheckpointInfo>>> {
-        self.checkpoint_info_with_metrics(engine).result
+        self.checkpoint_info_with_metrics(engine)
+            .map(|resolved| resolved.result)
+            .transpose()
     }
 
     /// Resolve checkpoint state and retain metrics, including work performed before an error.
@@ -383,34 +385,30 @@ impl Snapshot {
     pub(crate) fn checkpoint_info_with_metrics(
         &self,
         engine: &dyn Engine,
-    ) -> CheckpointResolveResult {
+    ) -> Option<CheckpointResolveResult> {
         let checkpoint_type = self.known_checkpoint_type();
-        let mut resolved = self.checkpoint_info_inner(engine);
-        if let Some(metrics) = &mut resolved.metrics {
-            metrics.checkpoint_type = checkpoint_type;
-            metrics.info = resolved.result.as_ref().ok().cloned().flatten();
-        }
-        resolved
+        let mut resolved = self.checkpoint_info_inner(engine)?;
+        resolved.metrics.checkpoint_type = checkpoint_type;
+        resolved.metrics.info = resolved.result.as_ref().ok().cloned();
+        Some(resolved)
     }
 
     #[cfg(feature = "declarative-plans")]
-    fn checkpoint_info_inner(&self, engine: &dyn Engine) -> CheckpointResolveResult {
-        let mut resolved = CheckpointResolveResult {
-            result: Ok(None),
-            metrics: self
-                .log_segment
-                .checkpoint_version
-                .map(|version| CheckpointMetrics {
-                    version,
-                    ..Default::default()
-                }),
+    fn checkpoint_info_inner(&self, engine: &dyn Engine) -> Option<CheckpointResolveResult> {
+        let Some(version) = self.log_segment.checkpoint_version else {
+            let _ = self.checkpoint_info.set(None);
+            return None;
         };
-        if let Some(cached) = self.checkpoint_info.get() {
-            resolved.result = Ok(cached.clone());
-            if let Some(metrics) = &mut resolved.metrics {
-                metrics.source = CheckpointSource::SnapshotCache;
-            }
-            return resolved;
+        let mut metrics = CheckpointMetrics {
+            version,
+            ..Default::default()
+        };
+        if let Some(Some(cached)) = self.checkpoint_info.get() {
+            metrics.source = Some(CheckpointSource::SnapshotCache);
+            return Some(CheckpointResolveResult {
+                result: Ok(cached.clone()),
+                metrics,
+            });
         }
         // Fallible OnceLock initialization is unstable on our MSRV. Serialize discovery so
         // concurrent callers share one result while errors leave initialization retryable.
@@ -419,26 +417,25 @@ impl Snapshot {
             .lock()
             // A panicking initializer cannot publish partial state, so retry after poisoning.
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(cached) = self.checkpoint_info.get() {
-            resolved.result = Ok(cached.clone());
-            if let Some(metrics) = &mut resolved.metrics {
-                metrics.source = CheckpointSource::SnapshotCache;
-            }
-            return resolved;
+        if let Some(Some(cached)) = self.checkpoint_info.get() {
+            metrics.source = Some(CheckpointSource::SnapshotCache);
+            return Some(CheckpointResolveResult {
+                result: Ok(cached.clone()),
+                metrics,
+            });
         }
-        if !self.log_segment.listed.checkpoint_parts.is_empty() {
-            match engine.require_plan_executor() {
-                Ok(executor) => {
-                    resolved = CheckpointInfo::resolve(executor.as_ref(), self.log_segment());
-                }
-                Err(error) => resolved.result = Err(error),
-            }
-        }
-        // All initializers hold the mutex; publish only after every fallible operation succeeds.
+        let resolved = match engine.require_plan_executor() {
+            Ok(executor) => CheckpointInfo::resolve(executor.as_ref(), self.log_segment())?,
+            Err(error) => CheckpointResolveResult {
+                result: Err(error),
+                metrics,
+            },
+        };
+        // Publish selected-checkpoint metadata only after every fallible operation succeeds.
         if let Ok(info) = &resolved.result {
-            let _ = self.checkpoint_info.set(info.clone());
+            let _ = self.checkpoint_info.set(Some(info.clone()));
         }
-        resolved
+        Some(resolved)
     }
 
     /// The latest AMT `checkpoint` action this snapshot covers, or `None` when the table has no
