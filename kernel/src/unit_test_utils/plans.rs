@@ -1,9 +1,9 @@
 use serde_json::Value;
 
+use super::into_record_batch;
 use crate::arrow::json::WriterBuilder;
 use crate::arrow::json::writer::JsonArray;
 use crate::arrow::record_batch::RecordBatch;
-use crate::engine::arrow_data::EngineDataArrowExt as _;
 use crate::engine::sync::plan::SyncPlanExecutor;
 use crate::plans::ir::nodes::Operator;
 use crate::plans::{Operation, Plan, PlanExecutor, PlanExecutorCapabilities, PlanResult};
@@ -40,13 +40,14 @@ impl PlanExecutor for IOOnlyPlanExecutor {
     }
 }
 
+
 /// Executes a declarative plan and returns its Arrow batches.
 pub(crate) fn execute_plan(engine: &dyn Engine, plan: Plan) -> KernelResult<Vec<RecordBatch>> {
     engine
         .require_plan_executor()?
         .execute_op(Operation::QueryPlan(plan))?
         .into_data()?
-        .map(|batch| batch?.try_into_record_batch())
+        .map(|batch| batch.map(into_record_batch))
         .collect()
 }
 
