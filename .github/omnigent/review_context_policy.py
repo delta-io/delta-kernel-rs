@@ -37,8 +37,8 @@ def inject_review_context(*, context_path: str) -> Callable[[dict[str, Any]], di
             }
 
         try:
-            context = path.read_text(encoding="utf-8")
-        except OSError:
+            context = path.read_bytes().decode("utf-8")
+        except (OSError, ValueError):
             return {
                 "result": "DENY",
                 "reason": "Canonical PR review context is unavailable.",

@@ -28,7 +28,10 @@ def read_source_file(
     start_line: int = 1,
     line_count: int = 400,
 ) -> str:
-    """Read bounded, line-numbered text from a source file.
+    """Read complete, numbered lines within the output limit.
+
+    Continue from the returned "Next line" cursor until "End of file". A line too long to return
+    produces an error that names the line to continue from.
 
     Args:
         repository: Read from the exact PR checkout or read-only Delta reference.
