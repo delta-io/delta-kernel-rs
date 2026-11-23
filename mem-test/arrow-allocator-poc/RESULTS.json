@@ -294,5 +294,141 @@
     "Allocation-stack categories describe call stacks, not a proof of ownership. Only the KernelAllocator category counts as enforced coverage.",
     "Correctness-run timings have small sample counts and do not establish performance or p99.9 latency regressions."
   ],
-  "experimental_harness_clippy": true
+  "experimental_harness_clippy": true,
+  "tail_memory": {
+    "source_commit": "f5f7f03103fcdbac258922e7d91d63b36764a9a0",
+    "heap_binary_sha256": "64ddfd01883c3afa0e6e6b56b02f966fffe362dc3c04a6cc13a1faff07170471",
+    "units": "bytes",
+    "concurrency": 1,
+    "notes": [
+      "Capped and outside-cap subsets refer to the same DHAT global peak of live requested Rust allocation bytes. Fixed canonical initialization precedes profiler startup and is excluded from this partition.",
+      "The allocator own-peak counters include the canonical baseline and may peak at a different instant. The narrow query has a later allocator peak than its overall Rust heap peak.",
+      "RSS is an independent process high-water mark from a separate unlimited correctness worker with warmup and two measured operations. It is not time-aligned with the heap profile and excludes DHAT profiling overhead.",
+      "RSS minus profiled live Rust bytes cannot identify the amounts of allocator-retained pages, code/stacks, direct libc/C++ allocations or other resident memory. Those portions have not been separately attributed here.",
+      "Allocation-type and allocation-stack groups are alternative disjoint partitions of the same bytes. Arc categories include object storage and refcounts, not the separately allocated data buffers they reference.",
+      "Profiles include local reference-engine discovery; terminal metadata-plan execution and declarative commit are excluded."
+    ],
+    "exact_fixture": {
+      "width": 10000,
+      "schema_fields": 30000,
+      "schema_json_bytes": 11301270,
+      "initial_files": 1000,
+      "tail_commits": 10000,
+      "checkpoints": 1
+    },
+    "exact_fixture_options": {
+      "width": 10000,
+      "schema_bytes": 11301270,
+      "initial_files": 1000,
+      "tail_commits": 10000,
+      "stats_columns": -1
+    },
+    "exact_fixture_profiles": [
+      {
+        "query": "all_columns",
+        "query_options": {},
+        "requested_rust_bytes_at_peak": 262783448,
+        "capped_bytes_at_same_peak": 231884336,
+        "measured_rust_bytes_outside_cap_at_same_peak": 30899112,
+        "capped_fraction_at_peak": 0.882416064500379,
+        "peak_first_observed_at": "declarative_metadata_plan_proto_live_no_execution",
+        "allocator_own_peak_reserved_bytes_including_canonical_baseline": 232042139,
+        "allocator_bytes_after_cleanup_including_canonical_baseline": 158203,
+        "allocation_stack_groups_at_peak": {
+          "kernel_allocator": 231884336,
+          "schema_structures": 22628342,
+          "other": 4506588,
+          "log_descriptors_and_urls": 3520605,
+          "metadata_strings": 241327,
+          "arrow_objects_schemas_and_decoder_state": 2250
+        },
+        "allocation_types_at_peak": {
+          "capped_kernel_storage": 231884336,
+          "other_measured_rust_outside_cap": 30899112
+        },
+        "separate_unprofiled_worker": {
+          "repetitions": 2,
+          "allocator_peak_reserved_bytes": 232042139,
+          "requested_rust_peak_bytes": 262291658,
+          "process_rss_high_water_bytes": 507527168
+        }
+      },
+      {
+        "query": "narrow_projection",
+        "query_options": {
+          "projection": 1,
+          "stats": "selected",
+          "stats_projection": 1
+        },
+        "requested_rust_bytes_at_peak": 212865703,
+        "capped_bytes_at_same_peak": 7090186,
+        "measured_rust_bytes_outside_cap_at_same_peak": 205775517,
+        "capped_fraction_at_peak": 0.033308259151545894,
+        "peak_first_observed_at": "declarative_snapshot_ready_mock_engine_included",
+        "allocator_own_peak_reserved_bytes_including_canonical_baseline": 93433715,
+        "allocator_bytes_after_cleanup_including_canonical_baseline": 158203,
+        "allocation_stack_groups_at_peak": {
+          "arrow_objects_schemas_and_decoder_state": 138392714,
+          "arrow_buffers_and_parser": 53605104,
+          "other": 11596297,
+          "kernel_allocator": 7090186,
+          "log_descriptors_and_urls": 2180471,
+          "schema_structures": 931
+        },
+        "allocation_types_at_peak": {
+          "arrow_array_objects_and_refcounts": 65125896,
+          "other_measured_rust_outside_cap": 35277509,
+          "arrow_buffer_ownership_objects_and_refcounts": 52484800,
+          "capped_kernel_storage": 7090186,
+          "arrow_schema_field_objects_and_refcounts": 20247040,
+          "arrow_array_data_vectors": 32640272
+        },
+        "separate_unprofiled_worker": {
+          "repetitions": 2,
+          "allocator_peak_reserved_bytes": 93433577,
+          "requested_rust_peak_bytes": 212606901,
+          "process_rss_high_water_bytes": 347013120
+        }
+      },
+      {
+        "query": "wide_or",
+        "query_options": {
+          "filter": "or",
+          "terms": 512
+        },
+        "requested_rust_bytes_at_peak": 313436836,
+        "capped_bytes_at_same_peak": 274464964,
+        "measured_rust_bytes_outside_cap_at_same_peak": 38971872,
+        "capped_fraction_at_peak": 0.875662757136816,
+        "peak_first_observed_at": "declarative_metadata_plan_proto_live_no_execution",
+        "allocator_own_peak_reserved_bytes_including_canonical_baseline": 274622767,
+        "allocator_bytes_after_cleanup_including_canonical_baseline": 158203,
+        "allocation_stack_groups_at_peak": {
+          "kernel_allocator": 274464964,
+          "schema_structures": 27936764,
+          "other": 7270926,
+          "log_descriptors_and_urls": 3520605,
+          "metadata_strings": 241327,
+          "arrow_objects_schemas_and_decoder_state": 2250
+        },
+        "allocation_types_at_peak": {
+          "other_measured_rust_outside_cap": 38971872,
+          "capped_kernel_storage": 274464964
+        },
+        "separate_unprofiled_worker": {
+          "repetitions": 2,
+          "allocator_peak_reserved_bytes": 274622767,
+          "requested_rust_peak_bytes": 312945046,
+          "process_rss_high_water_bytes": 568164352
+        }
+      }
+    ],
+    "reproduction": {
+      "script": "mem-test/metadata/run_heap.py",
+      "mode": "declarative",
+      "cap_mib": 0,
+      "fixture_options": "exact_fixture_options above; also lifecycle_stress.json tables[0].fixture",
+      "query_options": "Use each exact_fixture_profiles entry query_options"
+    }
+  }
 }

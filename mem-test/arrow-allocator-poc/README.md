@@ -25,6 +25,9 @@ Arrow array objects, `ArrayData` trees, schema objects, and other ordinary depen
 still have allocations outside this allocator. Public infallible Arrow operations also retain
 infallible allocation paths. Passing these checks does not establish a whole-Arrow or process-RSS
 cap. The [results](RESULTS.json) record simultaneous-peak attribution and the tested boundaries.
+Their `tail_memory` section includes the exact wide-tail fixture with full/narrow projections and
+a wide filter. It separates bytes passing through the cap at the Rust heap peak, measured bytes
+outside the cap, the allocator's own peak counter, and RSS from a separate unprofiled worker.
 
 From the Kernel repository root, choose a new output directory:
 
@@ -55,11 +58,15 @@ are shared within a library instance. `verify.py` checks ownership, failed growt
 release, and recovery. Its C Data export check keeps the allocation charged until the exported
 array's C release callback runs on another thread. It rejects each participating allocation in turn
 across JSON shapes and an actual checkpoint-backed declarative lifecycle, checking typed errors and
-cleanup. The matrix
-adds table/query variation and concurrent callers sharing the same cap.
+cleanup. The matrix adds table/query variation and concurrent callers sharing the same cap.
 
 The measured lifecycle includes snapshot discovery, checkpoint resolution, query and metadata-plan
 construction, wire encoding, opaque write-relation staging, and final release. The local reference
 engine executes discovery operations. Terminal metadata-plan execution and declarative commit are
 outside the measurement. Heap figures are requested Rust bytes, rather than RSS. Timing samples
 from these correctness checks are diagnostic.
+
+For an exact wide-tail heap profile, use `mem-test/metadata/run_heap.py` with the experimental
+`rss_lifecycle` and `kernel_lifecycle` binaries, `--mode declarative --cap 0`, and the
+`--fixture-options` and `--query` JSON objects recorded in `tail_memory`. This uses the same
+profiler entry point as `profile.py`; fixture preparation stays outside the measurement.
