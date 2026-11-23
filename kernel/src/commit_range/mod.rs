@@ -115,14 +115,7 @@ impl CommitRange {
         self.start_version
     }
 
-    /// Last version (inclusive) in the range: the requested end version, else the maximum catalog
-    /// version, else the latest version found when the range was built.
-    ///
-    /// With commit range validation disabled, the end is a bound, not necessarily an observed
-    /// commit: a range with no requested end and a maximum catalog version of 7 reports 7 even if
-    /// iteration stops after commit 6. Track progress from the yielded commit files instead. The
-    /// end can also be before the start, and a range with neither bound that finds no commits
-    /// returns [`Self::start_version`].
+    /// Last version (inclusive) in the range.
     pub fn end_version(&self) -> Version {
         self.end_version
     }
@@ -143,14 +136,9 @@ impl CommitRange {
 
     /// Iterator over the range's commit files in ascending version order.
     ///
-    /// Version gaps are detected lazily as the iterator advances. With `fail_on_data_loss` enabled,
-    /// a missing start version yields [`KernelError::StartVersionNotFound`], and a later gap up to
-    /// the end version yields [`KernelError::MissingVersion`]. A gap requires an observed later
-    /// commit; ordinary listing exhaustion ends iteration even before the requested end. The
-    /// iterator ends after its first error. Otherwise, available files are yielded across gaps.
-    ///
-    /// For reversed bounds, the first observed commit is checked against the requested start
-    /// before being excluded by the end bound. No out-of-range commit is yielded.
+    /// With `fail_on_data_loss` enabled, the iterator returns an error when a later observed commit
+    /// proves a version in the requested range is missing, and ends after that error. Otherwise,
+    /// available files are yielded across gaps.
     ///
     /// Returns [`KernelError::CommitRange`] if the range was not built with
     /// [`CommitOrdering::AscendingOrder`].

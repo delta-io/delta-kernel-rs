@@ -172,13 +172,13 @@ pub unsafe extern "C" fn commit_range_builder_with_commit_range_validation(
 }
 
 /// Set whether [`commit_range_commit_files_next`] fails on missing versions. This is by default
-/// `true` when you construct a builder. Only affects ranges built with commit range validation
-/// disabled.
+/// `true` when you construct a builder.
 ///
 /// When `true`, a missing start version or a gap through the range's end version surfaces as an
 /// error when the commit-files iterator reaches it, provided an observed later commit proves the
-/// gap. Listing exhaustion without a later commit ends iteration normally. When `false`,
-/// available commit files are yielded across gaps.
+/// gap. Without an explicit end version or maximum catalog version, the range ends at the last
+/// listed commit, so a trailing gap cannot be detected. When `false`, available commit files are
+/// yielded across gaps.
 ///
 /// # Safety
 ///
@@ -615,9 +615,8 @@ fn commit_range_commit_files_impl(
 
 /// Call `engine_visitor` once with the next commit file, returning `true` if a file was yielded
 /// and `false` once the iterator is exhausted. When the range was built with `fail_on_data_loss`
-/// enabled, an observed later commit proving a missing start or a gap through the range's end
-/// surfaces as an error from this call. Listing exhaustion ends iteration normally. Iteration is
-/// fused after the first error: later calls return `false`.
+/// enabled, a missing start version or a gap through the range's end version surfaces as an error
+/// from this call. Iteration is fused after the first error: later calls return `false`.
 ///
 /// The [`FfiCommitFile`] pointer and the location string it references are valid only until the
 /// visitor returns. The visitor must not retain them.

@@ -101,8 +101,8 @@ impl CommitRangeBuilder {
     /// When `true`, [`Self::build`] requires the requested start version to be present and the
     /// listed commits to be contiguous. When `false`, [`Self::build`] materializes whatever
     /// commits are listed in the range without validating the start version, contiguity, or
-    /// end version. Empty and reversed ranges are allowed. Disabling validation is only supported
-    /// for path-based builders ([`CommitRange::builder_for`]) with ascending ordering.
+    /// end version. Disabling validation is only supported for path-based builders
+    /// ([`CommitRange::builder_for`]) with ascending ordering.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn with_commit_range_validation(mut self, commit_range_validation: bool) -> Self {
@@ -115,8 +115,7 @@ impl CommitRangeBuilder {
     ///
     /// When `true`, a missing start version or a gap through the end version surfaces as an error
     /// when `CommitRange::commit_files` reaches it, provided an observed later commit proves the
-    /// gap. Listing exhaustion without a later commit ends iteration normally. When `false`,
-    /// available commit files are yielded across gaps.
+    /// gap. When `false`, available commit files are yielded across gaps.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn with_fail_on_data_loss(mut self, fail_on_data_loss: bool) -> Self {
@@ -128,14 +127,17 @@ impl CommitRangeBuilder {
     /// [`CommitRange`]. A path-based builder lists `_delta_log/`; a snapshot-based builder reuses
     /// the snapshot's log segment. Neither path reads commit JSON.
     ///
-    /// With commit range validation enabled, returns [`KernelError::MissingVersion`] if a
-    /// snapshot-derived range requires a commit beyond what is available from the snapshot's log
-    /// segment and the supplied catalog tail, or if the listed commits are non-contiguous;
-    /// [`KernelError::StartVersionNotFound`] (carrying the earliest still-available version) if the
-    /// requested start is unavailable but later versions exist; [`KernelError::EmptyLog`] if
-    /// nothing is available in the requested range; and [`KernelError::CommitRange`] if the
-    /// resolved version range is invalid (start > end). Disabling validation allows empty and
-    /// reversed ranges and defers gap checks to `CommitRange::commit_files`.
+    /// With commit range validation enabled, returns:
+    /// - [`KernelError::MissingVersion`] if the listed commits are non-contiguous, or if a
+    ///   snapshot-derived range requires a commit beyond the snapshot's log segment and the
+    ///   supplied catalog tail.
+    /// - [`KernelError::StartVersionNotFound`] if the requested start is unavailable but later
+    ///   versions exist. The error carries the earliest still-available version.
+    /// - [`KernelError::EmptyLog`] if no commit is available in the requested range.
+    /// - [`KernelError::CommitRange`] if the resolved version range is invalid (start > end).
+    ///
+    /// Disabling validation allows empty and reversed ranges and defers gap checks to
+    /// `CommitRange::commit_files`.
     pub fn build(self, engine: &dyn Engine) -> KernelResult<CommitRange> {
         self.validate_supported_modes()?;
 
