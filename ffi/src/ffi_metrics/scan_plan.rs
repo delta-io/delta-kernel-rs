@@ -37,7 +37,7 @@ pub enum ReplayBase {
 /// borrowed only for the metric callback; copy every retained value before returning.
 #[repr(C)]
 pub struct ScanPlanReport {
-    // === Planning attempt ===
+    // === Operation ===
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub outcome: ScanPlanOutcome,
