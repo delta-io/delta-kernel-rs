@@ -4,6 +4,18 @@ use std::sync::Arc;
 
 use crate::Version;
 use crate::checkpoint::CheckpointInfo;
+use crate::scan::{PartitionValuesOptions, StatsOptions};
+
+/// Starting state selected before replaying newer commits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayBase {
+    /// Complete live-file state from a CRC.
+    Crc,
+    /// A selected checkpoint.
+    Checkpoint,
+    /// Replay starts from commits alone.
+    Empty,
+}
 
 /// Checkpoint discovery path reached by an attempt, independently of success or failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,9 +48,21 @@ pub struct CheckpointMetrics {
     pub duration_ns: u64,
 }
 
-/// Selected commit inputs observed while building a metadata plan.
+/// Configuration and selected inputs observed while building a metadata plan.
 #[derive(Debug, Clone, Default)]
 pub struct MetadataPlanReport {
+    /// Requested statistics options.
+    pub stats: StatsOptions,
+    /// Requested partition-value options, including the timestamp timezone.
+    pub partition_values: PartitionValuesOptions,
+    /// Whether reading source collation statistics is enabled.
+    pub read_collations: bool,
+    /// Whether a statistics filter is configured.
+    pub has_filter: bool,
+    /// Starting state selected before replay, absent before source selection.
+    pub replay_base: Option<ReplayBase>,
+    /// Selected checkpoint or CRC version, absent before selection or for an empty base.
+    pub base_version: Option<Version>,
     /// Inclusive first covered commit version, absent when no commits were selected.
     pub commit_start_version: Option<Version>,
     /// Inclusive last covered commit version, absent when no commits were selected.

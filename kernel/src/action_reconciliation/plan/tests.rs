@@ -12,6 +12,7 @@ use crate::arrow::compute::{concat_batches, filter_record_batch, is_not_null};
 use crate::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use crate::engine::arrow_conversion::TryIntoArrow;
 use crate::engine::sync::SyncEngine;
+use crate::metrics::ReplayBase;
 use crate::scan::StatsOptions;
 use crate::schema::schema_ref;
 use crate::table_features::TableFeature;
@@ -104,14 +105,29 @@ async fn replay_selects_latest_action_without_retention(
         .then(|| snapshot.checkpoint_info(&engine))
         .transpose()?
         .flatten();
-    let state = MetadataPlanner::new(
+    let mut planner = MetadataPlanner::new(
         snapshot.log_segment(),
         actions,
         !snapshot.has_adaptive_metadata(),
     )
     .with_stats(StatsOptions::json_only())
-    .with_checkpoint_info(checkpoint_info)
-    .replay()?;
+    .with_checkpoint_info(checkpoint_info);
+    let state = planner.replay()?;
+    let report = planner.report();
+    assert!(report.stats.synthesize_json());
+    assert!(!report.partition_values.parsed_struct());
+    assert_eq!(report.partition_values.timestamp_timezone(), None);
+    assert!(!report.read_collations);
+    assert!(!report.has_filter);
+    assert_eq!(report.base_version, checkpoint.is_some().then_some(3));
+    assert_eq!(
+        report.replay_base,
+        Some(if checkpoint.is_some() {
+            ReplayBase::Checkpoint
+        } else {
+            ReplayBase::Empty
+        })
+    );
     // Then: each requested payload and version comes from its latest action.
     let names = actions.output_action_names().collect::<Vec<_>>();
     let schema = schema_ref! {
