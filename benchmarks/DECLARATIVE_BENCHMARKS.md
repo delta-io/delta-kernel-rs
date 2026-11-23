@@ -8,6 +8,97 @@ runner loads a table/version and parses its predicate during setup. Each read it
 builds a scan with `StatsOptions::all_struct()`, calls `scan_metadata` (or its parallel
 API), and drains the results. It does not read table data files.
 
+### Imperative performance coverage and declarative equivalents
+
+The inventory below describes the benchmark archive pinned by
+[`benchmarks/build.rs`](build.rs) at the proposal's base revision, `7b43fd2f`:
+[`v0.0.5_benchmark_workloads.tar.gz`](https://github.com/delta-incubator/dat/releases/download/v0.0.5-preview/v0.0.5_benchmark_workloads.tar.gz).
+The inventory uses the published specs. Every table below is tagged `base`, so its imperative
+benchmarks are selected by the default PR benchmark run.
+
+| Existing benchmark cases | Imperative performance coverage | Declarative equivalent |
+|---|---|---|
+| `v1Checkpoint/readMetadataLatest` | Replay 10,000 adds from a v1 checkpoint. | **Prototype:** matched sync imperative, plan construction, and plan-plus-execution. |
+| `v2Checkpoint/readMetadataLatest` | Replay 10,000 adds with four sidecars; serial and `parallel2` configurations. | **Prototype:** the same sync comparisons. Matching query concurrency needs executor support. |
+| `partitioned/readMetadataLatestPredicate` | `part = 3` on 20,000 adds across ten partitions, with a checkpoint and later commits. | **Registry extension:** reuse the same table and predicate for partition-pruning plans. |
+| `clustered/readMetadataLatestPredicate` | `id < 500` on a liquid-clustered, ten-column table with 20,000 adds. | **Registry extension:** reuse the predicate to measure declarative statistics-based skipping. |
+| `wideSchemaJsonStats/readMetadataLatestPredicate`, `wideSchemaStructStats/readMetadataLatestPredicate` | `id < 1000000` over 400 adds; 200 nested struct columns plus `id`. Compare JSON versus structured checkpoint stats. | **Registry extension:** use the same scan stats options to compare parsing, projection, and planning/execution costs. |
+| `v1Checkpoint/snapshotLatest`, `v2Checkpoint/snapshotLatest`, both wide-schema `snapshotLatest` cases | Construct a fresh snapshot each iteration; measure snapshot discovery and protocol/metadata loading. | **Separate measurement:** the metadata plan API requires an existing snapshot. Add snapshot-plus-plan timing, or an executor-backed snapshot-loading comparison. |
+| `crcVeryStale/snapshotLatest`, `crcSlightlyStale/snapshotLatest`, `crcLatest/snapshotLatest`, `crcMissing/snapshotLatest` | Snapshot construction at v200 with a checkpoint at v100 and a CRC at v150, v195, v200, or absent. | **Separate measurement:** preserve the snapshot phase and vary its execution engine; metadata-plan timing alone does not mirror these benchmarks. |
+
+For the snapshot comparisons, [`PlanBasedEngine`](../kernel/src/engine/plans/mod.rs)
+can route existing snapshot-loading handlers through a `PlanExecutor`. That measures
+execution through plans for individual handler calls while retaining Kernel's snapshot
+algorithm; it is not a single declarative snapshot-reconstruction query.
+
+All specs in this pinned benchmark archive target the latest version. The runner can
+accept version-based time travel, but the published performance suite does not exercise
+historical versions, incremental snapshot refresh, or timestamp-based lookup. It also
+does not benchmark table-data reads (`ReadData` is unimplemented), writes, DVs, or the
+full range of table features covered by correctness tests. Existing I/O summaries are
+per-operation counters; peak memory and production query concurrency are not measured.
+
+There are also benchmarks outside DAT. [`kernel/benches/metadata_bench.rs`](../kernel/benches/metadata_bench.rs)
+times `create_snapshot` and metadata scans over a bundled JSON-only, 300,000-add,
+100-column partitioned fixture, with and without row-transform construction. The fixture
+can be reused for declarative replay scaling; the imperative row-transform toggle has
+no direct equivalent in the live-`add` plan output. [`expression_bench.rs`](../kernel/benches/expression_bench.rs)
+measures Arrow `to_json` on simple, complex, and nested structs from 100 to 1,000,000 rows.
+A plan-operator benchmark could complement that microbenchmark, but it would include
+executor overhead and answer a different question. Neither binary is invoked by the
+DAT PR comparison script, which runs `workload_bench`.
+
+### Imperative correctness coverage and what mirroring requires
+
+The acceptance harness consumes a separate corpus, pinned to `0.0.7-preview` in
+[`acceptance/build.rs`](../acceptance/build.rs). Its read path builds a snapshot, applies
+the requested predicate/projection, calls `Scan::execute`, then applies the residual
+row predicate and final projection. It compares schema-aligned data with Spark's
+expected rows, independent of row order, and checks row count. Snapshot cases compare
+protocol, metadata, and an explicitly requested version. Negative cases check expected
+errors; the harness also maintains explicit skips and expected Kernel failures.
+
+Sources: [workload execution](../acceptance/src/acceptance_workloads/workload.rs),
+[validation](../acceptance/src/acceptance_workloads/validation.rs), and
+[case discovery and exceptions](../acceptance/tests/acceptance_workloads_reader.rs).
+
+| Imperative test cases / assertions | Declarative coverage and mirroring work |
+|---|---|
+| DAT `reads_*`, `schema_evolution_*`, `type_widening_*`, `variant_*`: full reads, projections, null/nested types, changed schemas, and historical versions. | **Not mirrored end to end.** The plan returns file metadata. Feed its output through data reading, transforms, DV application, and the same residual predicate/projection before reusing DAT's expected-row assertions. |
+| DAT `log_replay_add_remove_readd`, `checkpoints_*`: add/remove reconciliation, checkpoint-plus-commit replay, and checkpoint layouts. | **Partly mirrored already:** Kernel's declarative parity tests compare normalized metadata for v1/v2 layouts, sidecars, later commits, compactions, and remove retention. Extend this comparison across applicable DAT fixtures. |
+| DAT `data_skipping_*`, including `data_skipping_and_simple`: hit/miss predicates and partition/statistics filtering. | **Partly mirrored already:** declarative tests cover matching/nonmatching predicates, null partitions, and partition pruning without structured stats. Extend to the DAT predicate matrix; validate live files separately from final row results. |
+| Kernel `parsed_stats.rs`, `parsed_partition_values.rs`, and column-mapping tests: output schemas, selected stats columns, partition values, and physical/logical names. | **Substantial existing parity coverage:** declarative tests cover stats options, exact leaf schemas, structured-only checkpoints, JSON synthesis, nested column-mapped stats, and parsed partitions. Reuse these assertions when broadening benchmarks. |
+| DAT `deletion_vectors_*`, `column_mapping_*`, `row_tracking_*`: feature-specific reads and metadata. | **Full corpus parity remains work.** Compare DV descriptors, physical names, row IDs, and commit versions in metadata, then retain the corresponding data-read assertions. Returning the same file paths is insufficient. |
+| DAT `time_travel_*`, `protocol_versions_*`, `corruption_*`: version selection, protocol/metadata validation, and invalid-table behavior. | **Separate preparation/error coverage:** both paths still load a snapshot. Metadata-query parity does not validate that loading phase. Preserve version/error assertions and audit declarative failure stages; timestamp-based travel is unsupported by the current DAT Rust adapter. |
+| Generated Kernel `cross_product::test_cross_product_read_write`: log layouts, CRC/checkpoint hints and cleanup, feature sets, data layouts/stats, and latest/historical/incremental snapshot targets. | **Extend the generated test:** run both metadata paths on each applicable fixture and compare normalized outputs. Keep its existing data-read, write-setup, and CRC-write assertions; a declarative metadata scan does not replace them. |
+
+The existing declarative comparisons live in
+[`kernel/src/scan/scan_plan/tests.rs`](../kernel/src/scan/scan_plan/tests.rs), with additional
+commit-deduplication and CRC cases in [`scan_plan.rs`](../kernel/src/scan/scan_plan.rs).
+The generated imperative sweep is in
+[`kernel/tests/integration/cross_product/mod.rs`](../kernel/tests/integration/cross_product/mod.rs).
+These comparisons are different from running the complete DAT acceptance corpus through
+a declarative connector. The prototype's own parity test is narrower still: selected
+file paths for full scans, partition predicates, data skipping, empty scans, and a
+historical version.
+
+For end-to-end mirroring, the connector must actually consume the plan's file output.
+Building a plan and then calling the unchanged `Scan::execute` would still use imperative
+file discovery. A metadata-only harness can be introduced first; matching the DAT data
+oracle additionally requires the downstream reader described above.
+
+Two limits matter when claiming parity. The imperative DAT reader currently does not
+assert the spec's `fileCount`/`filesSkipped` or compare `expected_metadata` file sets;
+its oracle is the final data. Add explicit normalized metadata assertions for a
+metadata-only declarative harness. Allow legitimate conservative pruning differences
+when comparing with Spark: identical skipped-file counts are not required for correct
+results. Also, DAT `write`, `cdf`, `checkpoint`, and `crc` operation specs are skipped
+by this acceptance harness. Companion read/snapshot specs
+can validate resulting tables, but that does not test executing those operations through
+Kernel. There is no existing DAT operation-execution coverage to mirror for those types.
+
+### Declarative API and executor
+
 The declarative counterpart already exists:
 [`Scan::declarative_metadata_scan_plan`](https://github.com/delta-io/delta-kernel-rs/blob/7b43fd2f/kernel/src/scan/mod.rs#L1467)
 returns an optional plan producing live `add` actions. The caller executes that plan
