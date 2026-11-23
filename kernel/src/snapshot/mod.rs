@@ -371,7 +371,19 @@ impl Snapshot {
 
     /// Resolve checkpoint state once, without caching failures or holding an engine reference.
     #[cfg(feature = "declarative-plans")]
-    pub(crate) fn checkpoint_info(&self, engine: &dyn Engine) -> CheckpointResolveResult {
+    pub(crate) fn checkpoint_info(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<Option<Arc<CheckpointInfo>>> {
+        self.checkpoint_info_with_metrics(engine).result
+    }
+
+    /// Resolve checkpoint state and retain metrics, including work performed before an error.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn checkpoint_info_with_metrics(
+        &self,
+        engine: &dyn Engine,
+    ) -> CheckpointResolveResult {
         let checkpoint_type = self.known_checkpoint_type();
         let mut metrics = self
             .log_segment

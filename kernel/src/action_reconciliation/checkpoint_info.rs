@@ -656,11 +656,7 @@ mod tests {
         assert_eq!(info.last_checkpoint().version(), 1);
         assert!(info.last_checkpoint().v2_checkpoint().is_none());
         assert!(info.last_checkpoint().parts().is_none());
-        let checkpoint_info = snapshot
-            .checkpoint_info(engine.as_ref())
-            .result
-            .unwrap()
-            .unwrap();
+        let checkpoint_info = snapshot.checkpoint_info(engine.as_ref()).unwrap().unwrap();
         let sidecar_schema = read_parquet_footer_schema(
             &SyncPlanExecutor::default(),
             checkpoint_info.sidecars.as_ref()[0].clone(),

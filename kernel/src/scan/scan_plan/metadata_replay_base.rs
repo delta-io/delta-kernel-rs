@@ -34,7 +34,7 @@ impl MetadataReplayBase {
             });
         }
 
-        let info = snapshot.checkpoint_info(engine).result?;
+        let info = snapshot.checkpoint_info(engine)?;
         Ok(Self::Checkpoint {
             version: checkpoint_version,
             info,

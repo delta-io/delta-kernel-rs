@@ -274,7 +274,7 @@ mod tests {
         let snapshot = Snapshot::new(segment, snapshot.table_configuration().clone())?;
         let checkpoint_info = actions
             .contains_content_actions()
-            .then(|| snapshot.checkpoint_info(&engine).result)
+            .then(|| snapshot.checkpoint_info(&engine))
             .transpose()?
             .flatten();
 
