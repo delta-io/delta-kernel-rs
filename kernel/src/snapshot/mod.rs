@@ -390,46 +390,51 @@ impl Snapshot {
             .checkpoint_version
             .map(|version| CheckpointMetrics {
                 version,
+                source: CheckpointSource::SnapshotCache,
                 ..Default::default()
             });
-        let mut cache_hit = true;
-        let result = (|| {
-            if let Some(resolved) = self.checkpoint_info.get() {
-                return Ok(resolved.clone());
-            }
-            // Fallible OnceLock initialization is unstable on our MSRV. Serialize discovery so
-            // concurrent callers share one result while errors leave initialization retryable.
-            let _guard = self
-                .checkpoint_info_init
-                .lock()
-                // A panicking initializer cannot publish partial state, so retry after poisoning.
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(resolved) = self.checkpoint_info.get() {
-                return Ok(resolved.clone());
-            }
-            cache_hit = false;
-            let resolved = if self.log_segment.listed.checkpoint_parts.is_empty() {
-                None
-            } else {
-                let executor = engine.require_plan_executor()?;
-                let resolved =
-                    CheckpointInfo::resolve_with_metrics(executor.as_ref(), self.log_segment());
-                metrics = resolved.metrics;
-                resolved.result?
-            };
-            // All initializers hold the mutex; publish only after every fallible operation
-            // succeeds.
-            let _ = self.checkpoint_info.set(resolved.clone());
-            Ok(resolved)
-        })();
+        let result = self.checkpoint_info_inner(engine, &mut metrics);
         if let Some(metrics) = &mut metrics {
             metrics.checkpoint_type = checkpoint_type;
-            if cache_hit {
-                metrics.source = CheckpointSource::SnapshotCache;
-            }
             metrics.info = result.as_ref().ok().cloned().flatten();
         }
         CheckpointResolveResult { result, metrics }
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    fn checkpoint_info_inner(
+        &self,
+        engine: &dyn Engine,
+        metrics: &mut Option<CheckpointMetrics>,
+    ) -> KernelResult<Option<Arc<CheckpointInfo>>> {
+        if let Some(resolved) = self.checkpoint_info.get() {
+            return Ok(resolved.clone());
+        }
+        // Fallible OnceLock initialization is unstable on our MSRV. Serialize discovery so
+        // concurrent callers share one result while errors leave initialization retryable.
+        let _guard = self
+            .checkpoint_info_init
+            .lock()
+            // A panicking initializer cannot publish partial state, so retry after poisoning.
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(resolved) = self.checkpoint_info.get() {
+            return Ok(resolved.clone());
+        }
+        if let Some(metrics) = metrics {
+            metrics.source = CheckpointSource::None;
+        }
+        let resolved = if self.log_segment.listed.checkpoint_parts.is_empty() {
+            None
+        } else {
+            let executor = engine.require_plan_executor()?;
+            let resolved =
+                CheckpointInfo::resolve_with_metrics(executor.as_ref(), self.log_segment());
+            *metrics = resolved.metrics;
+            resolved.result?
+        };
+        // All initializers hold the mutex; publish only after every fallible operation succeeds.
+        let _ = self.checkpoint_info.set(resolved.clone());
+        Ok(resolved)
     }
 
     /// The latest AMT `checkpoint` action this snapshot covers, or `None` when the table has no
