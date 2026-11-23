@@ -66,7 +66,9 @@ use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegme
 use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::events::emit_scan_metadata_completed;
 #[cfg(feature = "declarative-plans")]
-use crate::metrics::{MetricEvent, ReportGeneratorLayer, ScanPlanOutcome, ScanPlanReport};
+use crate::metrics::{
+    MetadataPlanReport, MetricEvent, ReportGeneratorLayer, ScanPlanOutcome, ScanPlanReport,
+};
 use crate::metrics::{MetricId, ScanType};
 use crate::parallel::sequential_phase::SequentialPhase;
 #[cfg(feature = "declarative-plans")]
@@ -1535,8 +1537,12 @@ impl Scan {
         let reporter = ReportGeneratorLayer::current_reporter();
         let mut report = ScanPlanReport {
             correlation_id: self.correlation_id.clone(),
-            stats: self.stats.clone(),
-            partition_values: self.partition_values_options.clone(),
+            metadata_plan: MetadataPlanReport {
+                stats: self.stats.clone(),
+                partition_values: self.partition_values_options.clone(),
+                read_collations: self.needs_collation_stats_schema(),
+                ..Default::default()
+            },
             ..ScanPlanReport::new()
         };
         let result = self.declarative_metadata_scan_plan_inner(engine, &mut report);
@@ -1583,9 +1589,10 @@ impl Scan {
         }
 
         let mut planner = scan_plan::MetadataPlanner::try_from_scan(self)?;
+        report.metadata_plan = planner.report();
         let base = scan_plan::MetadataReplayBase::try_new(&self.snapshot, engine, report)?;
         let result = self.build_metadata_scan_plan_with(base, &mut planner);
-        report.metadata_plan = planner.report().clone();
+        report.metadata_plan = planner.report();
         result
     }
 

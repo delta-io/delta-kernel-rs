@@ -743,7 +743,10 @@ fn declarative_json_only_disables_metadata_pruning(
     let predicate = Some(Arc::new(pruning.0));
     let pruned = metadata(StatsOptions::all_struct(), predicate.clone())?;
     assert_eq!(metadata_row_count(&pruned), pruning.1);
-    let actual = metadata(StatsOptions::json_only(), predicate)?;
+    let actual = assert_scan_plan_metrics(
+        || metadata(StatsOptions::json_only(), predicate),
+        |event| assert!(!event.metadata_plan.has_filter),
+    )?;
     assert_metadata_eq(
         &actual,
         &baseline,
@@ -973,12 +976,16 @@ fn assert_metadata_output_options(
         || declarative_metadata(&scan, &engine),
         |event| {
             assert_eq!(event.outcome, ScanPlanOutcome::Plan);
-            assert_eq!(event.stats, scan.stats);
-            assert_eq!(event.partition_values, scan.partition_values_options);
+            let report = &event.metadata_plan;
+            assert_eq!(report.stats, scan.stats);
+            assert_eq!(report.partition_values, scan.partition_values_options);
             assert_eq!(event.correlation_id.as_deref(), Some("scan-plan-test"));
             let replay_base =
                 checkpoint_version.map_or(ReplayBase::Empty, |_| ReplayBase::Checkpoint);
-            assert_eq!(event.replay_base, Some(replay_base));
+            assert_eq!(report.replay_base, Some(replay_base));
+            assert_eq!(report.base_version, checkpoint_version);
+            assert!(!report.read_collations);
+            assert!(!report.has_filter);
             let checkpoint = event.checkpoint.as_ref();
             assert_eq!(
                 checkpoint.map(|checkpoint| (
@@ -1003,7 +1010,6 @@ fn assert_metadata_output_options(
                     cached.as_ref().unwrap()
                 ));
             }
-            let report = &event.metadata_plan;
             assert_eq!(
                 report.commit_start_version,
                 files.first().map(|(lo, _)| *lo)
@@ -1093,7 +1099,10 @@ fn declarative_metadata_data_skipping(
         .with_stats(StatsOptions::all())
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()?;
-    let actual = declarative_metadata(&scan, engine.as_ref())?;
+    let actual = assert_scan_plan_metrics(
+        || declarative_metadata(&scan, engine.as_ref()),
+        |event| assert!(event.metadata_plan.has_filter),
+    )?;
 
     assert_metadata_eq(
         &without_columns(&actual, &[STATS])?,
@@ -1515,13 +1524,24 @@ fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> Resu
         .expect("build checkpoint-plus-commits table");
     let sync_engine = Arc::new(SyncEngine::new_with_store(table.store().clone()));
     let snapshot = Snapshot::builder_for(table.table_root()).build(sync_engine.as_ref())?;
-    let scan = snapshot.clone().scan_builder().build()?;
+    let scan = snapshot
+        .clone()
+        .scan_builder()
+        .with_partition_values(PartitionValuesOptions::default().with_timestamp_timezone("UTC"))
+        .build()?;
 
     let no_plan_engine = DelegatingEngine::new(sync_engine).without_plan_executor();
     let err = assert_scan_plan_metrics(
         || scan.declarative_metadata_scan_plan(&no_plan_engine),
         |event| {
             assert_eq!(event.outcome, ScanPlanOutcome::Error);
+            let report = &event.metadata_plan;
+            assert_eq!(report.stats, scan.stats);
+            assert_eq!(report.partition_values, scan.partition_values_options);
+            assert_eq!(report.partition_values.timestamp_timezone(), Some("UTC"));
+            assert_eq!(report.replay_base, Some(ReplayBase::Checkpoint));
+            assert_eq!(report.base_version, Some(2));
+            assert!(!report.has_filter);
             let checkpoint = event.checkpoint.as_ref().unwrap();
             assert!(checkpoint.info.is_none());
             assert_eq!(checkpoint.source, CheckpointSource::None);
@@ -1540,7 +1560,7 @@ fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> Resu
             || scan.declarative_metadata_scan_plan(&no_plan_engine),
             |event| {
                 assert_eq!(event.outcome, ScanPlanOutcome::Empty);
-                assert!(event.replay_base.is_none());
+                assert!(event.metadata_plan.replay_base.is_none());
                 assert!(event.checkpoint.is_none());
             },
         )?

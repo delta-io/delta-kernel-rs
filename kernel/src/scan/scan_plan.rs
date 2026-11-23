@@ -577,9 +577,10 @@ mod tests {
             leaf_checkpoint_schema: Arc::new(leaf_checkpoint_schema),
             ..shape(kind, None)
         };
-        let plan = scan
-            .build_metadata_scan_plan(&shape, &MetadataPlanner::try_from_scan(&scan)?)?
-            .unwrap();
+        let planner = MetadataPlanner::try_from_scan(&scan)?;
+        assert_eq!(planner.report().read_collations, preserve_json);
+        assert!(!planner.report().has_filter);
+        let plan = scan.build_metadata_scan_plan(&shape, &planner)?.unwrap();
         let read_schema = leaf_read_schema(&plan);
         assert_eq!(source_collation_stats(read_schema).is_some(), preserve_json);
         assert_eq!(

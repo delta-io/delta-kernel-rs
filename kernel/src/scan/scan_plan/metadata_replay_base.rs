@@ -33,18 +33,20 @@ impl MetadataReplayBase {
                 checkpoint_version.is_none_or(|checkpoint| *version >= checkpoint)
             })
         {
-            report.replay_base = Some(ReplayBase::Crc);
+            report.metadata_plan.replay_base = Some(ReplayBase::Crc);
+            report.metadata_plan.base_version = Some(version);
             return Ok(Self::Crc {
                 version,
                 files: files.to_vec(),
             });
         }
 
-        report.replay_base = Some(if checkpoint_version.is_some() {
+        report.metadata_plan.replay_base = Some(if checkpoint_version.is_some() {
             ReplayBase::Checkpoint
         } else {
             ReplayBase::Empty
         });
+        report.metadata_plan.base_version = checkpoint_version;
         let resolved = snapshot.checkpoint_info_with_metrics(engine);
         report.checkpoint = resolved.metrics;
         let info = resolved.result?;
@@ -163,10 +165,11 @@ mod tests {
                 )
             },
             |event| {
-                assert_eq!(event.replay_base, Some(ReplayBase::Crc));
+                let report = &event.metadata_plan;
+                assert_eq!(report.replay_base, Some(ReplayBase::Crc));
+                assert_eq!(report.base_version, Some(version));
                 assert!(event.checkpoint.is_none());
                 let bounds = (target_version > version).then_some((version + 1, target_version));
-                let report = &event.metadata_plan;
                 assert_eq!(
                     report.commit_start_version.zip(report.commit_end_version),
                     bounds

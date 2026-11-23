@@ -54,6 +54,9 @@ pub struct ScanPlanReport {
     pub commit_end_version: OptionalValue<u64>,
     pub commit_total_size_bytes: u64,
     pub compaction_file_count: u64,
+    pub read_collations: bool,
+    pub has_filter: bool,
+    pub base_version: OptionalValue<u64>,
 }
 
 pub(super) fn with_event<F: FnOnce(MetricEvent)>(
@@ -73,7 +76,8 @@ pub(super) fn with_event<F: FnOnce(MetricEvent)>(
                 .as_ptr()
         };
         let Some(f) = callback.take() else { return };
-        let columns = match event.stats.struct_stats() {
+        let metadata = &event.metadata_plan;
+        let columns = match metadata.stats.struct_stats() {
             StructStats::None => &[][..],
             StructStats::AllIndexed { extra_indexed } => extra_indexed.as_slice(),
             StructStats::Columns { requested } => requested.as_slice(),
@@ -97,10 +101,12 @@ pub(super) fn with_event<F: FnOnce(MetricEvent)>(
             .collect();
         // Safety: columns and all nested storage remain alive until the callback returns.
         let columns = unsafe { FfiColumnNameArray::new_unsafe(&columns) };
-        let stats = match event.stats.struct_stats() {
-            StructStats::None if event.stats.synthesize_json() => FfiStatsOptions::JsonOnly,
+        let stats = match metadata.stats.struct_stats() {
+            StructStats::None if metadata.stats.synthesize_json() => FfiStatsOptions::JsonOnly,
             StructStats::None => FfiStatsOptions::None,
-            StructStats::AllIndexed { .. } if event.stats.synthesize_json() => FfiStatsOptions::All,
+            StructStats::AllIndexed { .. } if metadata.stats.synthesize_json() => {
+                FfiStatsOptions::All
+            }
             StructStats::AllIndexed { extra_indexed } if extra_indexed.is_empty() => {
                 FfiStatsOptions::AllStruct
             }
@@ -129,28 +135,28 @@ pub(super) fn with_event<F: FnOnce(MetricEvent)>(
             },
             duration_ns: event.duration_ns,
             stats,
-            variant_min_max: event.stats.variant_min_max(),
+            variant_min_max: metadata.stats.variant_min_max(),
             geometry_min_max: {
                 #[cfg(feature = "geo-type-in-dev")]
                 {
-                    event.stats.geometry_min_max()
+                    metadata.stats.geometry_min_max()
                 }
                 #[cfg(not(feature = "geo-type-in-dev"))]
                 {
                     false
                 }
             },
-            partition_values: if event.partition_values.parsed_struct() {
+            partition_values: if metadata.partition_values.parsed_struct() {
                 FfiPartitionValuesOptions::WithStruct
             } else {
                 FfiPartitionValuesOptions::StringMapOnly
             },
-            partition_timezone: event
+            partition_timezone: metadata
                 .partition_values
                 .timestamp_timezone()
                 .map(|timezone| kernel_string_slice!(timezone))
                 .into(),
-            replay_base: event
+            replay_base: metadata
                 .replay_base
                 .map(|base| match base {
                     kernel::ReplayBase::Crc => ReplayBase::Crc,
@@ -161,10 +167,13 @@ pub(super) fn with_event<F: FnOnce(MetricEvent)>(
             checkpoint: metrics
                 .as_ref()
                 .map_or(std::ptr::null(), std::ptr::from_ref),
-            commit_start_version: event.metadata_plan.commit_start_version.into(),
-            commit_end_version: event.metadata_plan.commit_end_version.into(),
-            commit_total_size_bytes: event.metadata_plan.commit_total_size_bytes,
-            compaction_file_count: event.metadata_plan.compaction_file_count,
+            commit_start_version: metadata.commit_start_version.into(),
+            commit_end_version: metadata.commit_end_version.into(),
+            commit_total_size_bytes: metadata.commit_total_size_bytes,
+            compaction_file_count: metadata.compaction_file_count,
+            read_collations: metadata.read_collations,
+            has_filter: metadata.has_filter,
+            base_version: metadata.base_version.into(),
         };
         f(if *failed {
             MetricEvent::ScanPlanGenerationFailed(&record)
@@ -229,9 +238,6 @@ mod tests {
                 kernel::ScanPlanOutcome::Plan
             },
             duration_ns: 19,
-            stats,
-            partition_values: PartitionValuesOptions::with_struct().with_timestamp_timezone("UTC"),
-            replay_base: with_checkpoint.then_some(kernel::ReplayBase::Checkpoint),
             checkpoint: with_checkpoint.then_some(kernel::CheckpointMetrics {
                 version: 0,
                 checkpoint_type: None,
@@ -242,12 +248,20 @@ mod tests {
                 metadata_query_calls: 0,
             }),
             metadata_plan: kernel::MetadataPlanReport {
+                stats,
+                partition_values: PartitionValuesOptions::with_struct()
+                    .with_timestamp_timezone("UTC"),
+                read_collations: failed,
+                has_filter: !failed,
+                replay_base: with_checkpoint.then_some(kernel::ReplayBase::Checkpoint),
+                base_version: with_checkpoint.then_some(0),
                 commit_start_version: with_checkpoint.then_some(0),
                 commit_end_version: with_checkpoint.then_some(0),
                 commit_total_size_bytes: 0,
                 compaction_file_count: 0,
             },
         };
+        let metadata = &event.metadata_plan;
         let source = if failed {
             kernel::MetricEvent::ScanPlanGenerationFailed(event.clone())
         } else {
@@ -277,7 +291,10 @@ mod tests {
                 }
             );
             assert_eq!(record.duration_ns, 19);
-            match (&record.stats, event.stats.struct_stats()) {
+            assert_eq!(record.read_collations, failed);
+            assert_eq!(record.has_filter, !failed);
+            assert_eq!(record.base_version, with_checkpoint.then_some(0).into());
+            match (&record.stats, metadata.stats.struct_stats()) {
                 (FfiStatsOptions::StructColumns(columns), StructStats::Columns { requested }) => {
                     assert_eq!(
                         &unsafe { columns.try_to_column_names() }.unwrap(),
