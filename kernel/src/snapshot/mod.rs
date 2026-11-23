@@ -427,8 +427,7 @@ impl Snapshot {
         if !self.log_segment.listed.checkpoint_parts.is_empty() {
             match engine.require_plan_executor() {
                 Ok(executor) => {
-                    resolved =
-                        CheckpointInfo::resolve_with_metrics(executor.as_ref(), self.log_segment());
+                    resolved = CheckpointInfo::resolve(executor.as_ref(), self.log_segment());
                 }
                 Err(error) => resolved.result = Err(error),
             }

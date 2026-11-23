@@ -34,11 +34,11 @@ pub(crate) struct CheckpointResolveResult {
 impl CheckpointInfo {
     /// Resolves the selected checkpoint and retains work performed before an error.
     #[tracing::instrument(
-        name = "checkpoint_info.resolve_with_metrics",
+        name = "checkpoint_info.resolve",
         skip_all,
         fields(enable_call_frame, metrics = tracing::field::Empty)
     )]
-    pub(crate) fn resolve_with_metrics(
+    pub(crate) fn resolve(
         exec: &dyn PlanExecutor,
         segment: &LogSegment,
     ) -> CheckpointResolveResult {
@@ -553,7 +553,7 @@ mod tests {
         let exec = CountingExecutor::new();
 
         // When: the shared resolver discovers the complete checkpoint.
-        let resolved = CheckpointInfo::resolve_with_metrics(&exec, &segment);
+        let resolved = CheckpointInfo::resolve(&exec, &segment);
         let metrics = resolved.metrics;
         let resolved = resolved.result.unwrap();
         assert_eq!(metrics.is_some(), expected_checkpoint.is_some());
@@ -671,13 +671,11 @@ mod tests {
         };
 
         // When: the checkpoint schema is resolved.
-        let checkpoint_info = CheckpointInfo::resolve_with_metrics(
-            &SyncPlanExecutor::default(),
-            snapshot.log_segment(),
-        )
-        .result
-        .unwrap()
-        .unwrap();
+        let checkpoint_info =
+            CheckpointInfo::resolve(&SyncPlanExecutor::default(), snapshot.log_segment())
+                .result
+                .unwrap()
+                .unwrap();
 
         // Then: incompatible parsed statistics are unavailable.
         assert!(!LogSegment::schema_has_compatible_stats_parsed(
@@ -701,13 +699,11 @@ mod tests {
         let (_engine, snapshot, _tempdir) =
             load_test_table("v1-multi-part-partitioned-struct-stats-only").unwrap();
         // When: its parsed partition schema is resolved.
-        let checkpoint_info = CheckpointInfo::resolve_with_metrics(
-            &SyncPlanExecutor::default(),
-            snapshot.log_segment(),
-        )
-        .result
-        .unwrap()
-        .unwrap();
+        let checkpoint_info =
+            CheckpointInfo::resolve(&SyncPlanExecutor::default(), snapshot.log_segment())
+                .result
+                .unwrap()
+                .unwrap();
 
         // Then: missing columns are allowed, but incompatible column types are rejected.
         assert_eq!(
@@ -742,7 +738,7 @@ mod tests {
         let exec = CountingExecutor::new();
 
         // When: checkpoint metadata is resolved from the hint.
-        let checkpoint_info = CheckpointInfo::resolve_with_metrics(&exec, &segment)
+        let checkpoint_info = CheckpointInfo::resolve(&exec, &segment)
             .result
             .unwrap()
             .unwrap();
@@ -876,7 +872,7 @@ mod tests {
         let exec = CountingExecutor::new();
 
         // When: full metadata is resolved.
-        let resolved = CheckpointInfo::resolve_with_metrics(&exec, &segment);
+        let resolved = CheckpointInfo::resolve(&exec, &segment);
         let checkpoint_info = resolved.result.unwrap().unwrap();
         let metrics = resolved.metrics.unwrap();
         assert_eq!(metrics.version, root.version);
@@ -1027,7 +1023,7 @@ mod tests {
         let exec = CountingExecutor::new();
 
         // When: metadata is resolved using that hint.
-        let resolved = CheckpointInfo::resolve_with_metrics(&exec, &segment);
+        let resolved = CheckpointInfo::resolve(&exec, &segment);
         let checkpoint_info = resolved.result.unwrap().unwrap();
         let metrics = resolved.metrics.unwrap();
         assert_eq!(Some(metrics.version), segment.checkpoint_version);
@@ -1119,7 +1115,7 @@ mod tests {
                 .insert(CHECKPOINT_NUM_ADD_FILES_TAG.to_owned(), tag.to_owned());
         }
         // When: selected-checkpoint metadata is derived.
-        let resolved = CheckpointInfo::resolve_with_metrics(&CountingExecutor::new(), &segment)
+        let resolved = CheckpointInfo::resolve(&CountingExecutor::new(), &segment)
             .result
             .unwrap()
             .unwrap();
@@ -1421,9 +1417,7 @@ mod tests {
         let exec = CountingExecutor::new();
 
         // When: discovery reads the malformed metadata.
-        let error = CheckpointInfo::resolve_with_metrics(&exec, &segment)
-            .result
-            .unwrap_err();
+        let error = CheckpointInfo::resolve(&exec, &segment).result.unwrap_err();
 
         // Then: resolution reports the specific metadata error.
         assert!(error.to_string().contains(expected_error), "{error}");
