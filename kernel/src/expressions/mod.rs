@@ -169,6 +169,29 @@ pub enum UnaryExpressionOp {
         /// Encode timestamps with all six microsecond digits instead of three.
         full_precision_timestamps: bool,
     },
+    /// Percent-encodes the path of a raw (unencoded) STRING URI reference per [RFC 3986]. Each
+    /// character that may not appear literally in a path ([section 3.3]), such as space, `#`, `%`
+    /// and `?`, becomes `%XX` ([section 2.1]), and a non-ASCII character becomes one `%XX` per
+    /// byte of its UTF-8 encoding. All other characters, including `/`, `.`, `:` and `@`, are kept.
+    ///
+    /// When the reference begins with a scheme (see [`UnaryPredicateOp::HasUriScheme`]), its
+    /// `scheme:` and any `//authority` (up to the next `/`) are kept verbatim. Existing `%XX`
+    /// escapes are not recognized, so an already-encoded input is encoded again. The output is
+    /// STRING, a NULL input yields NULL, and other input types are an error.
+    ///
+    /// ```text
+    /// URI_ENCODE_FILE_LOCATION('data/a b.parquet')         -- 'data/a%20b.parquet'
+    /// URI_ENCODE_FILE_LOCATION('s3://bucket/a#1.parquet')  -- 's3://bucket/a%231.parquet'
+    /// URI_ENCODE_FILE_LOCATION('data/München')             -- 'data/M%C3%BCnchen'
+    /// URI_ENCODE_FILE_LOCATION('data/a%20b.parquet')       -- 'data/a%2520b.parquet'
+    /// ```
+    ///
+    /// [RFC 3986]: https://datatracker.ietf.org/doc/html/rfc3986
+    /// [section 2.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-2.1
+    /// [section 3.3]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.3
+    // TODO(#2423): decide whether this keeps percent-encoding non-ASCII if `add.path` stops doing
+    // so.
+    UriEncodeFileLocation,
 }
 
 impl UnaryExpressionOp {
@@ -1274,6 +1297,7 @@ impl Display for UnaryExpressionOp {
         use UnaryExpressionOp::*;
         match self {
             ToJson { .. } => write!(f, "TO_JSON"),
+            UriEncodeFileLocation => write!(f, "URI_ENCODE_FILE_LOCATION"),
         }
     }
 }
@@ -1548,6 +1572,10 @@ mod tests {
                 "TO_JSON(Column(x), full_precision_timestamps)",
             ),
             (
+                Expr::unary(UnaryExpressionOp::UriEncodeFileLocation, col!("x")),
+                "URI_ENCODE_FILE_LOCATION(Column(x))",
+            ),
+            (
                 Expr::case_when([(col!("x").is_null(), lit(0))], col!("x")),
                 "CASE WHEN Column(x) IS NULL THEN 0 ELSE Column(x) END",
             ),
@@ -1757,12 +1785,15 @@ mod tests {
         // ==================== Expression Operations Tests ====================
 
         #[rstest::rstest]
-        fn test_unary_expression_roundtrip(#[values(false, true)] full_precision_timestamps: bool) {
-            let op = UnaryExpressionOp::ToJson {
-                full_precision_timestamps,
-            };
-            let expr = Expression::unary(op, col!("data"));
-            assert_roundtrip(&expr);
+        fn test_unary_expression_roundtrip(
+            #[values(
+                UnaryExpressionOp::TO_JSON,
+                UnaryExpressionOp::ToJson { full_precision_timestamps: true },
+                UnaryExpressionOp::UriEncodeFileLocation
+            )]
+            op: UnaryExpressionOp,
+        ) {
+            assert_roundtrip(&Expression::unary(op, col!("data")));
         }
 
         #[test]

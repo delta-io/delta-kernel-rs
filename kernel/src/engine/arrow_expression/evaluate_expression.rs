@@ -1,6 +1,7 @@
 //! Expression handling based on arrow-rs compute kernels.
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -11,8 +12,8 @@ use super::timestamp_timezone::TimestampTimezone;
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
     self as arrow_array, Array, ArrayBuilder, ArrayData, ArrayRef, AsArray, BooleanArray, Datum,
-    ListArray, MapArray, MutableArrayData, NullBufferBuilder, RecordBatch, StringArray,
-    StringArrayType, StructArray, make_array, new_null_array,
+    LargeStringBuilder, ListArray, MapArray, MutableArrayData, NullBufferBuilder, RecordBatch,
+    StringArray, StringArrayType, StringViewBuilder, StructArray, make_array, new_null_array,
 };
 use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
 use crate::arrow::compute::kernels::cast_utils::{Parser, string_to_datetime};
@@ -45,7 +46,7 @@ use crate::expressions::{
     UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
-use crate::uri_reference::scheme_len;
+use crate::uri_reference::{scheme_len, uri_encode_location};
 
 #[internal_api]
 pub(crate) trait ProvidesColumnByName {
@@ -317,28 +318,32 @@ pub fn evaluate_expression(
         (Predicate(_), Some(data_type)) => Err(KernelError::generic(format!(
             "Predicate evaluation produces boolean output, but caller expects {data_type:?}"
         ))),
-        (
-            Unary(UnaryExpression {
-                op: op @ ToJson {
-                    full_precision_timestamps,
-                },
-                expr,
-            }),
-            result_type,
-        ) => match result_type {
-            None | Some(&DataType::STRING) => {
-                let input = evaluate_expression(expr, batch, None)?;
-                let formats = if *full_precision_timestamps {
-                    STATS_TIMESTAMP_MICROS_FORMATS
-                } else {
-                    STATS_TIMESTAMP_MILLIS_FORMATS
-                };
-                Ok(to_json_with_timestamp_formats(&input, formats)?)
+        (Unary(UnaryExpression { op, expr }), result_type) => {
+            let output_type = match op {
+                ToJson { .. } | UriEncodeFileLocation => DataType::STRING,
+            };
+            if let Some(expected) = result_type
+                && *expected != output_type
+            {
+                return Err(KernelError::invalid_expression(format!(
+                    "{op} operator produces {output_type}, but caller expects {expected}"
+                )));
             }
-            Some(data_type) => Err(KernelError::generic(format!(
-                "{op} operator requires STRING output, but got {data_type:?}"
-            ))),
-        },
+            let input = evaluate_expression(expr, batch, None)?;
+            match op {
+                ToJson {
+                    full_precision_timestamps,
+                } => {
+                    let formats = if *full_precision_timestamps {
+                        STATS_TIMESTAMP_MICROS_FORMATS
+                    } else {
+                        STATS_TIMESTAMP_MILLIS_FORMATS
+                    };
+                    Ok(to_json_with_timestamp_formats(&input, formats)?)
+                }
+                UriEncodeFileLocation => map_changed_strings(&input, op, uri_encode_location),
+            }
+        }
         (Binary(BinaryExpression { op, left, right }), _) => {
             let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
             let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
@@ -890,20 +895,91 @@ pub fn evaluate_predicate(
     }
 }
 
+/// Applies `f` to every non-NULL row of a string array, keeping NULLs and the input's string
+/// representation. Returns `input` itself when `f` borrows every row unchanged. Other array types
+/// are an error naming `op`.
+fn map_changed_strings(
+    input: &ArrayRef,
+    op: impl Display,
+    f: impl for<'r> Fn(&'r str) -> Cow<'r, str>,
+) -> KernelResult<ArrayRef> {
+    let mapped = match input.data_type() {
+        ArrowDataType::Utf8 => {
+            let rows = input.as_string::<i32>();
+            let builder = || LargeStringBuilder::with_capacity(rows.len(), rows.values().len());
+            // Large offsets keep the build from overflowing; the cast back to Utf8 then returns an
+            // error where building a Utf8 array directly would panic.
+            replay_changed_rows(rows, builder, f)
+                .map(|mapped| cast(&mapped, &ArrowDataType::Utf8))
+                .transpose()?
+        }
+        ArrowDataType::LargeUtf8 => {
+            let rows = input.as_string::<i64>();
+            let builder = || LargeStringBuilder::with_capacity(rows.len(), rows.values().len());
+            replay_changed_rows(rows, builder, f)
+        }
+        ArrowDataType::Utf8View => {
+            let rows = input.as_string_view();
+            replay_changed_rows(rows, || StringViewBuilder::with_capacity(rows.len()), f)
+        }
+        other => {
+            return Err(KernelError::invalid_expression(format!(
+                "{op} requires a string input, got {other}"
+            )));
+        }
+    };
+    Ok(mapped.unwrap_or_else(|| input.clone()))
+}
+
+/// `rows` with `f` applied, built with a builder from `make_builder`, or `None` when `f` borrows
+/// every row unchanged. Finding the first changed row costs one call of `f` per earlier row and
+/// allocates nothing; the rows before it are then copied as they are.
+fn replay_changed_rows<'a, B>(
+    rows: impl StringArrayType<'a>,
+    make_builder: impl FnOnce() -> B,
+    f: impl Fn(&'a str) -> Cow<'a, str>,
+) -> Option<ArrayRef>
+where
+    B: ArrayBuilder + Extend<Option<Cow<'a, str>>>,
+{
+    let first_changed = rows
+        .iter()
+        .position(|row| row.is_some_and(|row| matches!(f(row), Cow::Owned(_))))?;
+    let mut builder = make_builder();
+    builder.extend(
+        rows.iter()
+            .take(first_changed)
+            .map(|row| row.map(Cow::Borrowed)),
+    );
+    builder.extend(rows.iter().skip(first_changed).map(|row| row.map(&f)));
+    Some(builder.finish())
+}
+
 /// Evaluates [`UnaryPredicateOp::HasUriScheme`] over any string representation.
 fn has_uri_scheme(input: &ArrayRef) -> KernelResult<BooleanArray> {
-    fn eval<'a>(references: impl StringArrayType<'a>) -> BooleanArray {
-        references
-            .iter()
-            .map(|r| r.map(|r| scheme_len(r).is_some()))
-            .collect()
+    let has_scheme = map_string_rows(input, "HasUriScheme", |r| scheme_len(r).is_some())?;
+    Ok(BooleanArray::from(has_scheme))
+}
+
+/// Applies `f` to every non-NULL row of a string array of any representation, keeping NULLs.
+/// Other array types are an error naming `op`.
+fn map_string_rows<'a, T>(
+    input: &'a ArrayRef,
+    op: impl Display,
+    f: impl FnMut(&'a str) -> T,
+) -> KernelResult<Vec<Option<T>>> {
+    fn map_rows<'a, T>(
+        rows: impl StringArrayType<'a>,
+        mut f: impl FnMut(&'a str) -> T,
+    ) -> Vec<Option<T>> {
+        rows.iter().map(|row| row.map(&mut f)).collect()
     }
     match input.data_type() {
-        ArrowDataType::Utf8 => Ok(eval(input.as_string::<i32>())),
-        ArrowDataType::LargeUtf8 => Ok(eval(input.as_string::<i64>())),
-        ArrowDataType::Utf8View => Ok(eval(input.as_string_view())),
+        ArrowDataType::Utf8 => Ok(map_rows(input.as_string::<i32>(), f)),
+        ArrowDataType::LargeUtf8 => Ok(map_rows(input.as_string::<i64>(), f)),
+        ArrowDataType::Utf8View => Ok(map_rows(input.as_string_view(), f)),
         other => Err(KernelError::invalid_expression(format!(
-            "HasUriScheme requires a string input, got {other}"
+            "{op} requires a string input, got {other}"
         ))),
     }
 }
@@ -2354,6 +2430,116 @@ mod tests {
         assert_eq!(result.values().iter().collect::<Vec<_>>(), expected);
     }
 
+    /// Builds a string array of each representation kernel reads as STRING.
+    type MakeStringArray = fn(Vec<Option<&'static str>>) -> ArrayRef;
+    const STRING_ARRAYS: [MakeStringArray; 3] = [
+        |l| Arc::new(StringArray::from(l)),
+        |l| Arc::new(LargeStringArray::from(l)),
+        |l| Arc::new(StringViewArray::from(l)),
+    ];
+
+    /// The output keeps the input's representation. Rows before the first one needing encoding
+    /// are copied as they are. A slice whose preceding row needs encoding is read only within its
+    /// bounds.
+    #[rstest]
+    #[case::mixed(
+        &[
+            Some("data/a.parquet"),
+            None,
+            Some("data/a b.parquet"),
+            Some("s3://bucket/a#1.parquet"),
+            Some("s3://bucket/b.parquet"),
+            None,
+        ],
+        &[
+            Some("data/a.parquet"),
+            None,
+            Some("data/a%20b.parquet"),
+            Some("s3://bucket/a%231.parquet"),
+            Some("s3://bucket/b.parquet"),
+            None,
+        ],
+    )]
+    #[case::only_a_lone_escape_changes(
+        &[Some("data/a.parquet"), None, Some(" ")],
+        &[Some("data/a.parquet"), None, Some("%20")],
+    )]
+    fn test_uri_encode_file_location(
+        #[case] locations: &[Option<&'static str>],
+        #[case] expected: &[Option<&'static str>],
+        #[values(0, 1, 2)] representation: usize,
+        #[values(None, Some(&DataType::STRING))] result_type: Option<&'static DataType>,
+        #[values(false, true)] sliced: bool,
+    ) {
+        let make_array = STRING_ARRAYS[representation];
+        let input = if sliced {
+            let rows = [Some("a b.parquet")]
+                .into_iter()
+                .chain(locations.iter().copied());
+            make_array(rows.collect()).slice(1, locations.len())
+        } else {
+            make_array(locations.to_vec())
+        };
+        let batch = RecordBatch::try_from_iter([("l", input.clone())]).unwrap();
+        let expr = Expr::unary(UnaryExpressionOp::UriEncodeFileLocation, col!("l"));
+        let result = evaluate_expression(&expr, &batch, result_type).unwrap();
+        assert_eq!(result.data_type(), input.data_type());
+        let result = cast(&result, &ArrowDataType::Utf8).unwrap();
+        assert_eq!(
+            result.as_string::<i32>(),
+            &StringArray::from(expected.to_vec())
+        );
+    }
+
+    /// An input with nothing to encode is returned as is. A slice is checked only within its
+    /// bounds, so a row before it that needs encoding does not matter.
+    #[rstest]
+    fn test_uri_encode_file_location_returns_unchanged_input(
+        #[values(0, 1, 2)] representation: usize,
+        #[values(false, true)] sliced: bool,
+    ) {
+        let unchanged = [Some("data/a.parquet"), None, Some("s3://bucket/a.parquet")];
+        let make_array = STRING_ARRAYS[representation];
+        let input = if sliced {
+            make_array([Some("a b.parquet")].into_iter().chain(unchanged).collect()).slice(1, 3)
+        } else {
+            make_array(unchanged.to_vec())
+        };
+        let batch = RecordBatch::try_from_iter([("l", input.clone())]).unwrap();
+        let expr = Expr::unary(UnaryExpressionOp::UriEncodeFileLocation, col!("l"));
+        let result = evaluate_expression(&expr, &batch, None).unwrap();
+        assert!(Arc::ptr_eq(&result, &input));
+    }
+
+    #[test]
+    fn test_uri_encode_file_location_rejects_non_string_input() {
+        let batch =
+            RecordBatch::try_from_iter([("n", Arc::new(Int32Array::from(vec![1])) as ArrayRef)])
+                .unwrap();
+        let expr = Expr::unary(UnaryExpressionOp::UriEncodeFileLocation, col!("n"));
+        let err = evaluate_expression(&expr, &batch, None).unwrap_err();
+        assert!(
+            matches!(err, KernelError::InvalidExpressionEvaluation(_)),
+            "{err}"
+        );
+    }
+
+    #[rstest]
+    fn test_unary_expression_rejects_non_string_output(
+        #[values(UnaryExpressionOp::TO_JSON, UnaryExpressionOp::UriEncodeFileLocation)]
+        op: UnaryExpressionOp,
+    ) {
+        let batch =
+            RecordBatch::try_from_iter([("s", Arc::new(StringArray::from(vec!["a"])) as ArrayRef)])
+                .unwrap();
+        let expr = Expr::unary(op, col!("s"));
+        let err = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap_err();
+        assert!(
+            matches!(err, KernelError::InvalidExpressionEvaluation(_)),
+            "{err}"
+        );
+    }
+
     /// Each reference paired with whether it has a URI scheme.
     const HAS_URI_SCHEME_CASES: &[(Option<&str>, Option<bool>)] = &[
         (Some("s3://bucket/a.parquet"), Some(true)),
@@ -2673,7 +2859,7 @@ mod tests {
     }
 
     #[rstest]
-    #[case::non_string_output(Some(&DataType::INTEGER), "operator requires STRING output")]
+    #[case::non_string_output(Some(&DataType::INTEGER), "but caller expects integer")]
     #[case::non_struct_input(Some(&DataType::STRING), "TO_JSON can only be applied to struct")]
     fn test_to_json_rejects_invalid_types(
         #[case] result_type: Option<&DataType>,
