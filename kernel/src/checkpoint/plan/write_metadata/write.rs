@@ -1,6 +1,7 @@
 //! One execution writes checkpoint files and returns only bounded hint inputs to Kernel.
 
 use super::*;
+use crate::checkpoint::CheckpointNaming;
 use crate::plans::ir::nodes::{FILE_META_SCHEMA, FileType, WriteParquet};
 use crate::plans::{Plan, PlanResult};
 use crate::{DeltaError, Engine, Result};
@@ -13,10 +14,19 @@ static RESULT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 };
 
 impl CheckpointWriter {
+    /// Chooses root naming for declarative checkpoint plans.
+    ///
+    /// Classic Parquet is the default. UUID roots require V2 and support JSON or Parquet.
+    pub fn with_checkpoint_naming(mut self, naming: CheckpointNaming) -> Self {
+        self.checkpoint_naming = naming;
+        self
+    }
+
     /// Builds one plan that writes a checkpoint and computes all `_last_checkpoint` inputs.
     ///
-    /// V1 requires Parquet. V2 writes Parquet sidecars and a JSON or Parquet UUID root. Counts
-    /// share the rows used by the writes, and byte totals use completed file descriptors. All
+    /// V1 and V2 default to classic-named Parquet roots. V2 writes Parquet sidecars and supports
+    /// UUID-named JSON or Parquet roots with [`Self::with_checkpoint_naming`]. Counts share
+    /// the rows used by the writes, and byte totals use completed file descriptors. All
     /// output depends on the successful root write. Execute once and pass the complete result to
     /// [`Self::last_checkpoint_bytes_from_result`], then atomically publish the returned bytes.
     /// Collation-specific bounds remain in JSON stats, without a separate sampling query.
@@ -25,6 +35,17 @@ impl CheckpointWriter {
         engine: &dyn Engine,
         format: FileType,
     ) -> KernelResult<Plan> {
+        let uuid_root = self.checkpoint_naming == CheckpointNaming::Uuid;
+        if uuid_root && !self.schema_context.is_v2 {
+            return Err(KernelError::unsupported(
+                "UUID-named checkpoints require V2",
+            ));
+        }
+        if !uuid_root && format != FileType::Parquet {
+            return Err(KernelError::unsupported(
+                "Classic-named checkpoints require Parquet",
+            ));
+        }
         let (actions, counts, sidecars) = if self.schema_context.is_v2 {
             let (content, non_content) = self.v2_checkpoint_actions(engine)?;
             let counts = action_counts(content.clone(), true)?;
@@ -51,14 +72,11 @@ impl CheckpointWriter {
             let counts = PlanBuilder::union_all([counts, action_counts(manifest.clone(), false)?])?;
             (manifest, counts, Some(sidecars))
         } else {
-            if format != FileType::Parquet {
-                return Err(KernelError::unsupported("V1 checkpoints require Parquet"));
-            }
             let actions = self.checkpoint_actions(engine)?;
             let counts = action_counts(actions.clone(), true)?;
             (actions, counts, None)
         };
-        let root_path = if self.schema_context.is_v2 {
+        let root_path = if uuid_root {
             let extension = match format {
                 FileType::Json => "json",
                 FileType::Parquet => "parquet",
@@ -88,7 +106,7 @@ impl CheckpointWriter {
             result_rows(totals, "statistics", None)?,
             result_rows(root.clone(), "root", checkpoint_schema)?,
         ];
-        if self.schema_context.is_v2 {
+        if uuid_root {
             results.push(result_rows(
                 Self::last_checkpoint_prefetch(actions)?,
                 "prefetch",

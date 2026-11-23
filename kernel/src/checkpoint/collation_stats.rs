@@ -889,6 +889,8 @@ mod tests {
             read_schema,
             #[cfg(feature = "declarative-plans")]
             v2_checkpoint_config: crate::checkpoint::V2CheckpointConfig::NoSidecar,
+            #[cfg(feature = "declarative-plans")]
+            checkpoint_naming: Default::default(),
         })
     }
 

@@ -89,9 +89,9 @@ pub static FILES_META_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 ///   checkpoints, should never be empty). It is recommended that implementors reject such inputs
 ///   with an error, however kernel does not rely on such behavior and will perform its own
 ///   pre-write validations to ensure this does not happen.
-/// - Behavior can be undefined if a single plan contains multiple writes to the same destination,
-///   because execution order is unspecified and executors may optimize away common table
-///   expressions.
+/// - Kernel will never emit a plan with distinct write nodes targeting the same destination.
+/// - All consumers of a shared write node must reuse its completed result, including after
+///   optimization. Consuming that node again must not repeat the write.
 ///
 /// # Ordering Example
 ///

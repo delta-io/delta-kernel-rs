@@ -1883,10 +1883,10 @@ impl Snapshot {
     ///
     /// If a checkpoint already exists at this version, returns
     /// [`CheckpointWriteResult::AlreadyExists`] with the original snapshot unchanged.
-    /// Otherwise, writes a checkpoint parquet file and the `_last_checkpoint` file and returns
-    /// [`CheckpointWriteResult::Written`] with an updated [`SnapshotRef`] whose log segment
-    /// reflects the new checkpoint. Commits and compaction files subsumed by the checkpoint are
-    /// dropped from the returned snapshot.
+    /// Otherwise, writes a classic-named Parquet checkpoint and the `_last_checkpoint` file and
+    /// returns [`CheckpointWriteResult::Written`] with an updated [`SnapshotRef`] whose log
+    /// segment reflects the new checkpoint. Commits and compaction files subsumed by the
+    /// checkpoint are dropped from the returned snapshot.
     ///
     /// With `declarative-plans`, an engine providing a plan executor uses one plan for all
     /// checkpoint files and counts, followed by atomic publication of Kernel-generated

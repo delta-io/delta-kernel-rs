@@ -35,6 +35,7 @@ use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{KernelError, Snapshot, SnapshotRef};
 #[cfg(feature = "declarative-plans")]
 use delta_kernel::{
+    checkpoint::CheckpointNaming,
     engine::{plans::PlanBasedEngine, sync::plan::SyncPlanExecutor},
     plans::{Operation, PlanExecutor as _, ir::nodes::FileType},
 };
@@ -1254,6 +1255,11 @@ async fn declarative_checkpoint_after_replace_table_with_incompatible_native_met
     let executor = Arc::new(SyncPlanExecutor::new(None));
     let planning_engine = PlanBasedEngine::new(Some(engine.clone()), executor.clone());
     let writer = snapshot.create_checkpoint_writer(&planning_engine)?;
+    let writer = if format == FileType::Json {
+        writer.with_checkpoint_naming(CheckpointNaming::Uuid)
+    } else {
+        writer
+    };
     let plan = writer.declarative_checkpoint_plan(&planning_engine, format)?;
     let bytes = writer
         .last_checkpoint_bytes_from_result(executor.execute_op(Operation::QueryPlan(plan))?)?;
