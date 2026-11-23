@@ -758,28 +758,28 @@ fn declarative_json_only_disables_metadata_pruning(
     FeatureSet::new(),
     checkpoint_json_stats(),
     StatsOptions::all(),
-    (None, &[(0, 0), (1, 1), (2, 2)])
+    (None, &[(0, 0), (1, 1), (2, 2)], (0, 0, 0))
 )]
 #[case::v1_checkpoint_json(
     LogState::with_latest_version(2).with_checkpoint_at([2]),
     FeatureSet::new(),
     checkpoint_json_stats(),
     StatsOptions::all(),
-    (Some(2), &[])
+    (Some(2), &[], (1, 0, 0))
 )]
 #[case::v1_checkpoint_struct(
     LogState::with_latest_version(2).with_checkpoint_at([2]),
     FeatureSet::new(),
     checkpoint_struct_stats(),
     StatsOptions::all_struct(),
-    (Some(2), &[])
+    (Some(2), &[], (1, 0, 0))
 )]
 #[case::v1_mixed_struct_only(
     LogState::with_latest_version(2).with_checkpoint_at([1]),
     FeatureSet::new(),
     checkpoint_struct_stats(),
     StatsOptions::all(),
-    (Some(1), &[(2, 2)])
+    (Some(1), &[(2, 2)], (1, 0, 0))
 )]
 #[case::v2_checkpoint_json(
     LogState::with_latest_version(2)
@@ -788,7 +788,7 @@ fn declarative_json_only_disables_metadata_pruning(
     FeatureSet::new().v2_checkpoint(),
     checkpoint_json_stats(),
     StatsOptions::all(),
-    (Some(2), &[])
+    (Some(2), &[], (1, 1, 1))
 )]
 #[case::v2_mixed_struct(
     LogState::with_latest_version(2)
@@ -797,7 +797,7 @@ fn declarative_json_only_disables_metadata_pruning(
     FeatureSet::new().v2_checkpoint(),
     checkpoint_struct_stats(),
     StatsOptions::all_struct(),
-    (Some(1), &[(2, 2)])
+    (Some(1), &[(2, 2)], (1, 1, 1))
 )]
 #[case::v2_mixed_struct_only(
     LogState::with_latest_version(2)
@@ -806,7 +806,7 @@ fn declarative_json_only_disables_metadata_pruning(
     FeatureSet::new().v2_checkpoint(),
     checkpoint_struct_stats(),
     StatsOptions::all(),
-    (Some(1), &[(2, 2)])
+    (Some(1), &[(2, 2)], (1, 1, 1))
 )]
 #[case::v2_checkpoint_without_stats(
     LogState::with_latest_version(2)
@@ -815,14 +815,14 @@ fn declarative_json_only_disables_metadata_pruning(
     FeatureSet::new().v2_checkpoint(),
     no_checkpoint_stats(),
     StatsOptions::all_struct(),
-    (Some(2), &[])
+    (Some(2), &[], (1, 1, 1))
 )]
 #[case::compaction(
     LogState::with_latest_version(3).with_compaction_ranges([(0, 2)]),
     FeatureSet::new(),
     checkpoint_json_stats(),
     StatsOptions::all(),
-    (None, &[(0, 2), (3, 3)])
+    (None, &[(0, 2), (3, 3)], (0, 0, 0))
 )]
 #[case::compaction_after_sidecars(
     LogState::with_latest_version(4).with_checkpoint_at([2])
@@ -830,14 +830,14 @@ fn declarative_json_only_disables_metadata_pruning(
     FeatureSet::new().v2_checkpoint().column_mapping("name"),
     checkpoint_struct_stats(),
     StatsOptions::all_struct(),
-    (Some(2), &[(3, 4)])
+    (Some(2), &[(3, 4)], (1, 1, 1))
 )]
 fn declarative_metadata_output_options_across_log_shapes(
     #[case] log_state: LogState,
     #[case] features: FeatureSet,
     #[case] table_config: TableConfig,
     #[case] stats: StatsOptions,
-    #[case] metrics: (Option<Version>, &[(Version, Version)]),
+    #[case] metrics: (Option<Version>, &[(Version, Version)], (u64, u64, u64)),
     #[values(
         PartitionValuesOptions::default(),
         PartitionValuesOptions::with_struct()
@@ -857,17 +857,20 @@ fn declarative_metadata_output_options_across_log_shapes(
 #[rstest]
 #[case::v1(
     LogState::with_latest_version(2).with_checkpoint_at([2]),
-    FeatureSet::new()
+    FeatureSet::new(),
+    (1, 0, 0)
 )]
 #[case::v2(
     LogState::with_latest_version(2)
         .with_checkpoint_at([2])
         .with_sidecars_if_enabled(None),
-    FeatureSet::new().v2_checkpoint()
+    FeatureSet::new().v2_checkpoint(),
+    (1, 1, 1)
 )]
 fn declarative_metadata_synthesizes_json_for_struct_only_checkpoints(
     #[case] log_state: LogState,
     #[case] features: FeatureSet,
+    #[case] checkpoint_io: (u64, u64, u64),
     #[values(StatsOptions::json_only(), StatsOptions::all())] stats: StatsOptions,
 ) {
     assert_metadata_output_options(
@@ -876,7 +879,7 @@ fn declarative_metadata_synthesizes_json_for_struct_only_checkpoints(
         checkpoint_struct_stats(),
         stats,
         PartitionValuesOptions::with_struct(),
-        (Some(2), &[]),
+        (Some(2), &[], checkpoint_io),
     )
     .unwrap();
 }
@@ -934,7 +937,11 @@ fn assert_metadata_output_options(
     table_config: TableConfig,
     stats: StatsOptions,
     partitions: PartitionValuesOptions,
-    (checkpoint_version, files): (Option<Version>, &[(Version, Version)]),
+    (checkpoint_version, files, checkpoint_io): (
+        Option<Version>,
+        &[(Version, Version)],
+        (u64, u64, u64),
+    ),
 ) -> Result<()> {
     let json_requested = stats.synthesize_json;
     let parsed_partitions_requested = partitions.parsed_struct;
@@ -972,7 +979,30 @@ fn assert_metadata_output_options(
             let replay_base =
                 checkpoint_version.map_or(ReplayBase::Empty, |_| ReplayBase::Checkpoint);
             assert_eq!(event.replay_base, Some(replay_base));
-            assert_eq!(event.checkpoint.is_some(), checkpoint_version.is_some());
+            let checkpoint = event.checkpoint.as_ref();
+            assert_eq!(
+                checkpoint.map(|checkpoint| (
+                    checkpoint.version,
+                    checkpoint.source,
+                    (
+                        checkpoint.root_footer_calls,
+                        checkpoint.sidecar_footer_calls,
+                        checkpoint.metadata_query_calls,
+                    ),
+                )),
+                checkpoint_version.map(|version| (
+                    version,
+                    CheckpointSource::Resolved,
+                    checkpoint_io
+                ))
+            );
+            if let Some(checkpoint) = checkpoint {
+                let cached = scan.snapshot.cached_checkpoint_info().unwrap();
+                assert!(Arc::ptr_eq(
+                    checkpoint.info.as_ref().unwrap(),
+                    cached.as_ref().unwrap()
+                ));
+            }
             let report = &event.metadata_plan;
             assert_eq!(
                 report.commit_start_version,
