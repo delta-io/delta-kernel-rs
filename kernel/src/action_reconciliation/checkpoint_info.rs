@@ -103,30 +103,13 @@ impl CheckpointInfo {
                         schema.contains(SIDECAR_NAME) || schema.contains(CHECKPOINT_METADATA_NAME)
                     });
                     if needs_root_read {
-                        let schema = schema_ref! { (&SIDECAR_FIELD), (&CHECKPOINT_METADATA_FIELD) };
-                        let predicate = Predicate::or(
-                            col!(SIDECAR_NAME, "path").is_not_null(),
-                            col!(CHECKPOINT_METADATA_NAME, "version").is_not_null(),
-                        );
-                        let file = root.location.clone();
-                        let plan = match file_type {
-                            FileType::Parquet => PlanBuilder::scan_parquet([file], &[], schema),
-                            FileType::Json => PlanBuilder::scan_json([file], &[], schema),
-                        }?
-                        .filter(predicate)?
-                        .build()?;
-                        if let Some(metrics) = &mut metrics {
-                            metrics.metadata_query_calls += 1;
-                        }
-                        let data = exec.execute_op(Operation::QueryPlan(plan))?.into_data()?;
-                        let mut sidecars = SidecarVisitor::default();
-                        let mut metadata = CheckpointMetadataVisitor::default();
-                        for batch in data {
-                            let batch = batch?;
-                            sidecars.visit_rows_of(batch.as_ref())?;
-                            metadata.visit_rows_of(batch.as_ref())?;
-                        }
-                        (Cow::Owned(sidecars.sidecars), metadata.0.map(Cow::Owned))
+                        let (sidecars, metadata) = collect_checkpoint_metadata(
+                            exec,
+                            &root.location,
+                            file_type,
+                            &mut metrics,
+                        )?;
+                        (Cow::Owned(sidecars), metadata.map(Cow::Owned))
                     } else {
                         (Cow::Borrowed([].as_slice()), None)
                     }
@@ -282,6 +265,43 @@ fn derived_last_checkpoint(
 )]
 fn read_parquet_footer_schema(exec: &dyn PlanExecutor, file: FileMeta) -> KernelResult<SchemaRef> {
     Ok(exec.read_parquet_footer(file)?.schema)
+}
+
+#[tracing::instrument(
+    name = "checkpoint_info.collect_checkpoint_metadata",
+    skip_all,
+    fields(enable_call_frame),
+    err
+)]
+fn collect_checkpoint_metadata(
+    exec: &dyn PlanExecutor,
+    file: &FileMeta,
+    file_type: FileType,
+    metrics: &mut Option<CheckpointMetrics>,
+) -> KernelResult<(Vec<Sidecar>, Option<CheckpointMetadata>)> {
+    let schema = schema_ref! { (&SIDECAR_FIELD), (&CHECKPOINT_METADATA_FIELD) };
+    let predicate = Predicate::or(
+        col!(SIDECAR_NAME, "path").is_not_null(),
+        col!(CHECKPOINT_METADATA_NAME, "version").is_not_null(),
+    );
+    let plan = match file_type {
+        FileType::Parquet => PlanBuilder::scan_parquet([file.clone()], &[], schema),
+        FileType::Json => PlanBuilder::scan_json([file.clone()], &[], schema),
+    }?
+    .filter(predicate)?
+    .build()?;
+    if let Some(metrics) = metrics {
+        metrics.metadata_query_calls += 1;
+    }
+    let data = exec.execute_op(Operation::QueryPlan(plan))?.into_data()?;
+    let mut sidecars = SidecarVisitor::default();
+    let mut metadata = CheckpointMetadataVisitor::default();
+    for batch in data {
+        let batch = batch?;
+        sidecars.visit_rows_of(batch.as_ref())?;
+        metadata.visit_rows_of(batch.as_ref())?;
+    }
+    Ok((sidecars.sidecars, metadata.0))
 }
 
 #[derive(Default)]
