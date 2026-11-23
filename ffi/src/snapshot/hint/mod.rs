@@ -97,11 +97,11 @@ pub struct FfiSnapshotHint {
     ///
     /// Export always uses an explicit variant, never `InferFromLogPaths`.
     pub publication_watermark: FfiPublicationWatermark,
-    /// The spec of the checkpoint selected from `log_paths`, if known. `None` means unknown, not
+    /// The spec of the checkpoint selected from `log_paths`, if known. Null means unknown, not
     /// that no checkpoint was selected. Kernel uses it only when the checkpoint's naming and the
     /// table protocol do not decide the type, and the checkpoint's contents replace it once read.
     ///
-    /// Null means unknown. A claim inconsistent with naming or protocol is ignored.
+    /// A claim inconsistent with naming or protocol is ignored.
     pub checkpoint_type: *const FfiSelectedCheckpointType,
     /// Optional checksum telemetry. Null means unknown. It does not change CRC validation,
     /// retention, or snapshot success. An inconsistent claim is reported as `Unknown`.

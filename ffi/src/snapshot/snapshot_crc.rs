@@ -22,6 +22,8 @@ pub enum FfiCrcSource {
     Stale {
         /// Version of the on-disk checksum from which the retained CRC was read or reconstructed.
         /// This may be older than the retained CRC's own version.
+        /// The C API does not expose that retained version, so the number of incorporated
+        /// commits cannot be derived. Subtracting this from the snapshot version would overcount.
         on_disk_version: u64,
     },
     /// No checksum file was found in the snapshot's selected version range.

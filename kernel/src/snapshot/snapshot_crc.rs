@@ -33,16 +33,19 @@ pub enum CrcSource {
     /// actions.
     Reconstructed {
         /// Version of the original on-disk checksum, preserved across in-memory updates.
-        /// The cumulative number of incorporated commits is the retained CRC's version minus
-        /// this version. Here the retained CRC is at the snapshot version.
+        /// Subtract this from [`Snapshot::version()`] to obtain the cumulative number of
+        /// incorporated commits.
+        ///
+        /// [`Snapshot::version()`]: super::Snapshot::version
         on_disk_version: Version,
     },
     /// A usable checksum is retained behind the snapshot version.
     Stale {
         /// Version of the on-disk checksum from which the retained CRC was read or reconstructed.
         /// This preserves its origin even when an already-reconstructed CRC becomes stale.
-        /// The retained CRC's version, not the snapshot version, determines how many commits
-        /// have been incorporated since this on-disk version.
+        /// The public API does not expose the retained CRC's version, so the number of
+        /// incorporated commits cannot be derived. Subtracting this from the snapshot version
+        /// would also count commits that the retained CRC has not incorporated.
         on_disk_version: Version,
     },
     /// Loading found no checksum candidate in its listed version range and retained no in-memory

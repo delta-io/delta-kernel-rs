@@ -97,7 +97,8 @@ discovery. Otherwise it resolves the type through the same snapshot cache as
 `snapshot_crc_source(snapshot, out)` writes the retained `FfiCrcSource` without I/O. It records
 what construction observed about checksum files, independently of whether file stats are available.
 `Reconstructed` and `Stale` carry the original `on_disk_version`; see `CrcSource` for the variant
-semantics and how to derive the cumulative commit count. Observations stay fixed after construction.
+semantics and how to derive the cumulative commit count for `Reconstructed`. The count is not
+publicly derivable for `Stale`. Observations stay fixed after construction.
 
 Snapshot accessors (`ffi/src/lib.rs`) include no-I/O reads such as `version` and
 `snapshot_file_stats`, which returns `OptionalValue<FfiFileStats>` (scalar
