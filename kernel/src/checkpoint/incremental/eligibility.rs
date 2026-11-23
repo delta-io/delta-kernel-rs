@@ -50,7 +50,7 @@ impl TailEligibility {
                 col!("protocol.minReaderVersion"),
                 col!("_file"),
                 col!("commitInfo.operation"),
-                Expression::from(Predicate::is_not_null(col!("commitInfo"))).into(),
+                Expression::from(Predicate::is_not_null(col!("commitInfo"))),
             ])
             .into(),
             ELIGIBILITY_SCHEMA.clone().into(),
