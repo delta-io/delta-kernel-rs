@@ -15,7 +15,7 @@ use crate::expressions::{
     ColumnName, Expression as Expr, Predicate, UnaryExpressionOp, col, column_name, expr,
 };
 use crate::log_segment::LogSegment;
-use crate::metrics::{MetadataPlanReport, ReplayBase};
+use crate::metrics::{MetadataPlanningReport, ReplayBase};
 use crate::scan::{PartitionValuesOptions, StatsOptions, map_to_struct_options};
 use crate::schema::{
     CheckpointFieldKind, DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
@@ -48,7 +48,7 @@ pub(crate) struct MetadataPlanner<'a> {
     pub(crate) parsed_partition_schema: Option<SchemaRef>,
     pub(crate) read_collations: bool,
     pub(crate) stats_filter: Option<Predicate>,
-    report: MetadataPlanReport,
+    report: MetadataPlanningReport,
 }
 
 /// The statistics representation present in a metadata plan.
@@ -75,13 +75,13 @@ impl<'a> MetadataPlanner<'a> {
             parsed_partition_schema: None,
             read_collations: false,
             stats_filter: None,
-            report: MetadataPlanReport::default(),
+            report: MetadataPlanningReport::default(),
         }
     }
 
-    /// Returns configured options and selected inputs, including partial state on error.
-    pub(crate) fn report(&self) -> MetadataPlanReport {
-        MetadataPlanReport {
+    /// Returns metadata planning metrics, including partial state on error.
+    pub(crate) fn report(&self) -> MetadataPlanningReport {
+        MetadataPlanningReport {
             stats: self.stats.clone(),
             partition_values: self.partitions.clone(),
             read_collations: self.read_collations,

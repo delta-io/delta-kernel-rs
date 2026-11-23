@@ -48,9 +48,9 @@ pub struct CheckpointMetrics {
     pub duration_ns: u64,
 }
 
-/// Configuration and selected inputs observed while building a metadata plan.
+/// Metrics collected during metadata planning.
 #[derive(Debug, Clone, Default)]
-pub struct MetadataPlanReport {
+pub struct MetadataPlanningReport {
     /// Requested statistics options.
     pub stats: StatsOptions,
     /// Requested partition-value options, including the timestamp timezone.

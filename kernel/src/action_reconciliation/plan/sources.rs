@@ -7,7 +7,7 @@ use crate::actions::{ADD_NAME, Add, LOG_ADD_SCHEMA};
 use crate::checkpoint::{CheckpointInfo, CheckpointKind};
 use crate::expressions::{column_name, lit};
 use crate::log_segment::LogSegment;
-use crate::metrics::MetadataPlanReport;
+use crate::metrics::MetadataPlanningReport;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::plans::ir::nodes::{FileType, ScanFile};
 use crate::schema::{DataType, SchemaRef, StructField};
@@ -96,7 +96,7 @@ pub(crate) fn commit_arm(
     base_version: Option<Version>,
     schema: SchemaRef,
     use_compactions: bool,
-    report: &mut MetadataPlanReport,
+    report: &mut MetadataPlanningReport,
 ) -> KernelResult<PlanBuilder> {
     let commit_files = match base_version {
         Some(version) => log_segment
