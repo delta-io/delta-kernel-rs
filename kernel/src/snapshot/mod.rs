@@ -402,12 +402,14 @@ impl Snapshot {
                 .checkpoint_version
                 .map(|version| CheckpointMetrics {
                     version,
-                    source: CheckpointSource::SnapshotCache,
                     ..Default::default()
                 }),
         };
         if let Some(cached) = self.checkpoint_info.get() {
             resolved.result = Ok(cached.clone());
+            if let Some(metrics) = &mut resolved.metrics {
+                metrics.source = CheckpointSource::SnapshotCache;
+            }
             return resolved;
         }
         // Fallible OnceLock initialization is unstable on our MSRV. Serialize discovery so
@@ -419,10 +421,10 @@ impl Snapshot {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(cached) = self.checkpoint_info.get() {
             resolved.result = Ok(cached.clone());
+            if let Some(metrics) = &mut resolved.metrics {
+                metrics.source = CheckpointSource::SnapshotCache;
+            }
             return resolved;
-        }
-        if let Some(metrics) = &mut resolved.metrics {
-            metrics.source = CheckpointSource::None;
         }
         if !self.log_segment.listed.checkpoint_parts.is_empty() {
             match engine.require_plan_executor() {
