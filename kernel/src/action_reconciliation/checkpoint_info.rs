@@ -233,10 +233,15 @@ fn collect_checkpoint_metadata(
     #[derive(delta_kernel_derive::TryFromStructRows)]
     struct CheckpointRows {
         sidecar: Vec<Sidecar>,
-        checkpoint_metadata: Option<CheckpointMetadata>,
+        checkpoint_metadata: Vec<CheckpointMetadata>,
     }
-    let rows: CheckpointRows = exec.execute_plan_into(plan)?;
-    Ok((rows.sidecar, rows.checkpoint_metadata))
+    let mut rows: CheckpointRows = exec.execute_plan_into(plan)?;
+    if rows.checkpoint_metadata.len() > 1 {
+        return Err(KernelError::invalid_checkpoint(
+            "Duplicate checkpointMetadata",
+        ));
+    }
+    Ok((rows.sidecar, rows.checkpoint_metadata.pop()))
 }
 
 #[cfg(test)]
