@@ -15,7 +15,7 @@ use std::sync::{Arc, LazyLock};
 
 use tracing::{instrument, warn};
 
-use super::LogSegment;
+use super::{LogSegment, PmResolution};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::visitors::visit_last_manifest_commit_at;
 use crate::actions::visitors::{
@@ -38,7 +38,7 @@ use crate::schema::{
     ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec, SchemaRef, StructField,
     StructType, column_name, lazy_schema_ref,
 };
-use crate::snapshot::IncrementalReplay;
+use crate::snapshot::{CrcSource, IncrementalReplay, SnapshotCrc};
 use crate::utils::require;
 use crate::{Engine, FileMeta, KernelError, KernelResult, RowVisitor, Version};
 
@@ -74,18 +74,10 @@ static REPLAY_COMMIT_INFO_FIELD: LazyLock<StructField> = LazyLock::new(|| {
     StructField::nullable(COMMIT_INFO_NAME, StructType::new_unchecked(fields))
 });
 
-/// The origin of the checksum selected as a replay base.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CrcBaseOrigin {
-    /// Read from an on-disk checksum file during this load.
-    Disk,
-    /// Reused from the caller's retained checksum.
-    InMemory,
-}
-
 impl LogSegment {
-    /// Try to build the CRC at this segment's `end_version` from the caller's resolved `base` CRC.
-    /// Handles three cases:
+    /// Try to build the CRC at this segment's `end_version` from the caller's resolved CRC state.
+    /// Returns the resulting CRC state and its protocol/metadata resolution without changing the
+    /// base. Handles three cases:
     /// - Case 1: no base CRC available -> return None
     /// - Case 2: base CRC at `end_version` -> return it as-is
     /// - Case 3: stale base CRC older than `end_version` -> advance it to `end_version` when
@@ -93,37 +85,42 @@ impl LogSegment {
     pub(crate) fn try_build_crc_within_budget(
         &self,
         engine: &dyn Engine,
-        base: Option<&Arc<Crc>>,
+        base: &SnapshotCrc,
         incremental_replay: IncrementalReplay,
-    ) -> KernelResult<Option<(Arc<Crc>, ProtocolMetadataSource)>> {
-        let Some(base) = base else {
+    ) -> KernelResult<Option<(SnapshotCrc, PmResolution)>> {
+        let Some(base_crc) = base.as_ref() else {
             return Ok(None);
         };
-        if base.version == self.end_version {
-            return Ok(Some((base.clone(), ProtocolMetadataSource::CrcAtTarget)));
+        if base_crc.version == self.end_version {
+            return Ok(Some((
+                base.clone(),
+                PmResolution::from_crc(base_crc, ProtocolMetadataSource::CrcAtTarget),
+            )));
         }
-        if !incremental_replay.should_advance(base.version, self.end_version)? {
+        if !incremental_replay.should_advance(base_crc.version, self.end_version)? {
             return Ok(None);
         }
         // TODO(#3421): Classify required-commit gaps and replay-file failures during CRC
         // advancement as Delta errors using the base and target versions, preserving the
         // original error sources.
-        let advanced = self.build_crc_from_base(engine, base)?;
+        let advanced = Arc::new(self.build_crc_from_base(engine, base_crc)?);
+        let resolution =
+            PmResolution::from_crc(&advanced, ProtocolMetadataSource::CrcAdvancedByReplay);
         Ok(Some((
-            Arc::new(advanced),
-            ProtocolMetadataSource::CrcAdvancedByReplay,
+            base.with_replayed_crc(advanced, self.end_version),
+            resolution,
         )))
     }
 
-    /// Pick the latest CRC to use as an advance base: this segment's on-disk CRC or
-    /// `in_memory_base`, whichever is newer, falling back to `in_memory_base` on a failed on-disk
-    /// read, except cancellation. Drops a base below the checkpoint; returns None when no candidate
-    /// remains. Returns the selected origin explicitly for checksum provenance.
+    /// Picks the newest usable CRC, preserving source information for a retained CRC.
+    /// Falls back to the retained CRC on a failed disk read, except cancellation, and drops a
+    /// selected CRC below the checkpoint. Absence observations describe this segment's listing.
     pub(crate) fn pick_latest_base_crc(
         &self,
         engine: &dyn Engine,
-        in_memory_base: Option<&Arc<Crc>>,
-    ) -> KernelResult<Option<(Arc<Crc>, CrcBaseOrigin)>> {
+        retained: Option<&SnapshotCrc>,
+    ) -> KernelResult<SnapshotCrc> {
+        let in_memory_base = retained.and_then(SnapshotCrc::as_ref);
         let preferred_disk_crc = self
             .listed
             .latest_crc_file
@@ -133,26 +130,30 @@ impl LogSegment {
             .map(|file| read_crc_file_or_none(engine, file))
             .transpose()?
             .flatten();
-        Ok(disk_crc
-            .map(|crc| (crc, CrcBaseOrigin::Disk))
-            .or_else(|| {
-                in_memory_base
-                    .cloned()
-                    .map(|crc| (crc, CrcBaseOrigin::InMemory))
-            })
-            .filter(|(crc, _)| {
-                self.checkpoint_version
-                    .is_none_or(|ckpt| crc.version >= ckpt)
-            }))
+        let selected = disk_crc
+            .map(SnapshotCrc::from_file)
+            .or_else(|| retained.filter(|state| state.as_ref().is_some()).cloned())
+            .filter(|state| {
+                state.as_ref().is_some_and(|crc| {
+                    self.checkpoint_version
+                        .is_none_or(|ckpt| crc.version >= ckpt)
+                })
+            });
+        Ok(selected.unwrap_or_else(|| {
+            let source = if self.listed.latest_crc_file.is_some() {
+                CrcSource::Unusable
+            } else {
+                CrcSource::Missing
+            };
+            SnapshotCrc::from_parts(None, self.end_version, source)
+        }))
     }
 
     /// Read this segment's latest on-disk CRC (`latest_crc_file`), at whatever version it sits.
-    /// Returns None when there is no CRC file or a non-cancellation read failure. The CRC may be
-    /// stale (older than `end_version`).
-    pub(crate) fn read_latest_crc(&self, engine: &dyn Engine) -> KernelResult<Option<Arc<Crc>>> {
-        Ok(self
-            .pick_latest_base_crc(engine, /* in_memory_base */ None)?
-            .map(|(crc, _)| crc))
+    /// Records `Missing` or `Unusable` when no CRC is resolved. The CRC may be older than
+    /// `end_version`; snapshot construction classifies it for the target version.
+    pub(crate) fn read_latest_crc(&self, engine: &dyn Engine) -> KernelResult<SnapshotCrc> {
+        self.pick_latest_base_crc(engine, None)
     }
 
     /// Produce a fresh `Crc` at `self.end_version` by reverse-replaying the commits in

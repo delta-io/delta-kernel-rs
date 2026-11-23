@@ -13,7 +13,7 @@ use crate::log_path::LogPath;
 use crate::log_segment::{LogSegment, validate_catalog_version_bounds};
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::path::{DELTA_LOG_DIR_WITH_SLASH, ParsedLogPath};
-use crate::snapshot::{CrcSource, IncrementalReplay, SnapshotRef};
+use crate::snapshot::{CrcSource, IncrementalReplay, SnapshotCrc, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::{require, try_parse_uri};
 use crate::{KernelError, KernelResult, Result, Snapshot, Version};
@@ -283,11 +283,7 @@ impl SnapshotHint {
             metadata: snapshot.table_configuration().metadata().clone(),
             last_checkpoint_hint: last_checkpoint_hint.cloned(),
             crc: snapshot.crc_at_version().cloned(),
-            crc_source: Some(
-                snapshot
-                    .crc
-                    .updated_provenance(snapshot.crc_at_version(), snapshot.version()),
-            ),
+            crc_source: Some(snapshot.crc.retain_at_version().source()),
             checkpoint_type: snapshot.known_checkpoint_type(),
             freshness: if snapshot.is_built_as_latest() {
                 SnapshotHintFreshness::Latest
@@ -427,8 +423,7 @@ impl SnapshotHint {
         let mut snapshot = Snapshot::new_with_crc(
             log_segment,
             table_configuration,
-            crc,
-            crc_source.unwrap_or_default(),
+            SnapshotCrc::from_parts(crc, version, crc_source.unwrap_or(CrcSource::Unknown)),
             built_as_latest,
             false, /* skipped_new_checkpoints */
         )?;
@@ -583,7 +578,7 @@ mod tests {
             version: hint_version,
             ..Default::default()
         });
-        let snapshot = Snapshot::new_with_crc(
+        let snapshot = Snapshot::new_with_crc_and_source(
             LogSegment::try_new(
                 hint.log_segment_files,
                 snapshot.log_segment().log_root.clone(),
@@ -592,7 +587,7 @@ mod tests {
             )?,
             snapshot.table_configuration().clone(),
             snapshot.crc_at_version().cloned(),
-            CrcSource::default(),
+            CrcSource::Unknown,
             false,
             false,
         )?;
@@ -694,7 +689,7 @@ mod tests {
                 "{table_root}_delta_log/00000000000000000000.\
                  00000000000000000001.compacted.json"
             )));
-        let snapshot = Snapshot::new_with_crc(
+        let snapshot = Snapshot::new_with_crc_and_source(
             LogSegment::try_new(
                 hint.log_segment_files,
                 snapshot.log_segment().log_root.clone(),
@@ -703,7 +698,7 @@ mod tests {
             )?,
             snapshot.table_configuration().clone(),
             None,
-            CrcSource::default(),
+            CrcSource::Unknown,
             false,
             false,
         )?;

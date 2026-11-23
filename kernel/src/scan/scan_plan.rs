@@ -761,11 +761,11 @@ mod tests {
                 ..Default::default()
             })
         });
-        let scan = Arc::new(Snapshot::new_with_crc(
+        let scan = Arc::new(Snapshot::new_with_crc_and_source(
             segment,
             config,
             crc,
-            CrcSource::default(),
+            CrcSource::Unknown,
             false,
             false,
         )?)

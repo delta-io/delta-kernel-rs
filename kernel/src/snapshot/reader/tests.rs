@@ -99,7 +99,7 @@ fn reader_crc_cache_respects_completeness(
         crc.domain_metadata_state = DomainMetadataState::Partial(domains);
         crc.set_transaction_state = SetTransactionState::Partial(transactions);
         Arc::get_mut(&mut snapshot).unwrap().crc =
-            SnapshotCrc::try_new(Some(Arc::new(crc)), 0, None, CrcSource::default()).unwrap();
+            SnapshotCrc::try_new(Some(Arc::new(crc)), 0, None, CrcSource::Unknown).unwrap();
     }
     let reader = snapshot.reader().with_cancellation_token(Arc::new(
         TestCancellationToken::cancelled(),

@@ -752,11 +752,11 @@ mod tests {
             domain_metadata_state: DomainMetadataState::Partial(Default::default()),
             ..Default::default()
         });
-        let snapshot = Snapshot::new_with_crc(
+        let snapshot = Snapshot::new_with_crc_and_source(
             built.log_segment().clone(),
             built.table_configuration().clone(),
             Some(crc),
-            CrcSource::default(),
+            CrcSource::Unknown,
             true,
             false,
         )?;

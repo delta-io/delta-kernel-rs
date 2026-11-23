@@ -177,7 +177,7 @@ fn crc_write_resolution_or_validation_error_retains_mode_and_duration(
             unsupported_operation: None,
         };
         let version = snapshot.version();
-        let provenance = snapshot.crc.provenance();
+        let provenance = snapshot.crc.source();
         Arc::get_mut(&mut snapshot).unwrap().crc =
             SnapshotCrc::try_new(Some(Arc::new(crc)), version, None, provenance)?;
     } else {

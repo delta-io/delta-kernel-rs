@@ -25,7 +25,7 @@ use crate::engine::sync::SyncEngine;
 use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::path::ParsedLogPath;
-use crate::snapshot::{CrcSource, IncrementalReplay, SnapshotBuilder, SnapshotRef};
+use crate::snapshot::{CrcSource, IncrementalReplay, SnapshotBuilder, SnapshotCrc, SnapshotRef};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::table_configuration::TableConfiguration;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -510,9 +510,12 @@ impl BuiltCrcTest {
         let log_root = self.url.join("_delta_log/").unwrap();
         let log_segment =
             LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
+        let retained = in_memory_base
+            .map(|crc| SnapshotCrc::from_parts(Some(crc.clone()), crc.version, CrcSource::Unknown));
         Ok(log_segment
-            .pick_latest_base_crc(engine, in_memory_base)?
-            .map(|(crc, _)| crc.version))
+            .pick_latest_base_crc(engine, retained.as_ref())?
+            .as_ref()
+            .map(|crc| crc.version))
     }
 
     /// Read the on-disk CRC at `version` from this test's log.
@@ -1587,7 +1590,7 @@ async fn test_stale_crc_advanced_only_within_replay_budget(
     assert_eq!(
         rebuilt.crc_source(),
         if matches!(expected_source, CrcSource::Stale { .. }) {
-            CrcSource::default()
+            CrcSource::Unknown
         } else {
             expected_source
         }
@@ -1617,11 +1620,12 @@ async fn test_stale_crc_advances_past_foreign_last_manifest_commit() {
 #[case::newer_disk_crc(Some(1), false, 1)]
 #[case::corrupt_newer_disk_crc(Some(1), true, 0)]
 #[tokio::test]
-async fn pick_latest_base_crc_reports_origin_and_preserves_cancellation(
+async fn pick_latest_base_crc_preserves_source_and_cancellation(
     #[case] disk_version: Option<Version>,
     #[case] corrupt_crc: bool,
     #[case] expected_version: Version,
     #[values(false, true)] cancelled: bool,
+    #[values(false, true)] known_source: bool,
 ) {
     // Given an in-memory baseline and an optional checksum candidate on disk.
     let mut test = CrcReadTest::new()
@@ -1654,21 +1658,28 @@ async fn pick_latest_base_crc_reports_origin_and_preserves_cancellation(
     }
     let engine = CancellableEngine::new(&built.engine, token);
 
-    // When the baseline is selected, reading a newer disk candidate may be cancelled.
-    let result = segment.pick_latest_base_crc(&engine, Some(&base));
+    let retained_source = if known_source {
+        CrcSource::AtVersion
+    } else {
+        CrcSource::Unknown
+    };
+    let retained = SnapshotCrc::from_parts(Some(base.clone()), base.version, retained_source);
 
-    // Then cancellation propagates; otherwise the selected origin is explicit.
+    // When the baseline is selected, reading a newer disk candidate may be cancelled.
+    let result = segment.pick_latest_base_crc(&engine, Some(&retained));
+
+    // Then cancellation propagates; otherwise selection preserves or establishes the source.
     if cancelled && disk_version == Some(1) {
         assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
     } else {
-        let (selected, origin) = result.unwrap().unwrap();
-        assert_eq!(selected.version, expected_version);
+        let selected = result.unwrap();
+        assert_eq!(selected.as_ref().unwrap().version, expected_version);
         assert_eq!(
-            origin,
+            selected.source(),
             if expected_version == base.version {
-                super::CrcBaseOrigin::InMemory
+                retained_source
             } else {
-                super::CrcBaseOrigin::Disk
+                CrcSource::AtVersion
             }
         );
     }

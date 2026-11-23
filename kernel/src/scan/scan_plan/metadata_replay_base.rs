@@ -95,11 +95,11 @@ mod tests {
         let segment = snapshot.log_segment().clone();
         let config = snapshot.table_configuration().clone();
         let crc = Some(crc);
-        let snapshot = Arc::new(Snapshot::new_with_crc(
+        let snapshot = Arc::new(Snapshot::new_with_crc_and_source(
             segment,
             config,
             crc,
-            CrcSource::default(),
+            CrcSource::Unknown,
             false,
             false,
         )?);
@@ -148,11 +148,11 @@ mod tests {
         let paths: Vec<_> = commits.iter().map(String::as_str).collect();
         let segment = log_segment(log_root, &paths, None);
         let config = target.table_configuration().clone();
-        let snapshot = Arc::new(Snapshot::new_with_crc(
+        let snapshot = Arc::new(Snapshot::new_with_crc_and_source(
             segment,
             config,
             crc,
-            CrcSource::default(),
+            CrcSource::Unknown,
             false,
             false,
         )?);
