@@ -45,7 +45,7 @@ impl MetadataReplayBase {
         } else {
             ReplayBase::Empty
         });
-        let resolved = snapshot.checkpoint_info(engine);
+        let resolved = snapshot.checkpoint_info_with_metrics(engine);
         report.checkpoint = resolved.metrics;
         let info = resolved.result?;
         Ok(Self::Checkpoint {
