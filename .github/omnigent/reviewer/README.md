@@ -4,8 +4,10 @@ Each reviewer bundle uses its adjacent `REVIEW.md` as the executable Omnigent pr
 `instructions: REVIEW.md` in `config.yaml`. Changes to those Markdown files therefore change the
 CI review behavior.
 
-To run a reviewer locally, load its `config.yaml` bundle and provide the PR metadata and diff as
-review context.
+To run a reviewer locally, [expand the shared instruction blocks](#shared-instruction-blocks)
+into a directory that does not exist yet. From that directory, load `config.yaml` for the
+orchestrator or `agents/<name>/config.yaml` for a child reviewer. Supply the PR metadata and diff
+as review context.
 
 PR authors using git stack should keep the generated stack list in their PR description up to
 date, including the link to the immediate parent PR. The parent and child PRs must be opened in the
@@ -26,6 +28,47 @@ Each published inline finding includes feedback instructions: react 👍 for hel
 unhelpful or incorrect, or 👀 for out of scope. Feedback remains
 on the comment for manual review and prompt tuning; the workflow does not automatically consume
 these ratings or learn from them. The footer is excluded from exact finding deduplication.
+
+## Shared instruction blocks
+
+Each `REVIEW.md` keeps its reviewer's own instructions inline and shows, in reading order,
+everything that reviewer receives. Text that several reviewers share is stored once under
+[`shared/`](shared), and a `REVIEW.md` names it with a placeholder line. The line
+`${review_rules}` stands for `shared/review_rules.md`.
+
+| Block | Contents | Included by |
+|---|---|---|
+| `${base_context}` | Project conventions and read-only source tools | Every child except `disprove-reviewer` |
+| `${review_rules}` | Known issue handling and previous AI review handling | Every reviewer |
+| `${pr_description}` | PR description accuracy | The orchestrator and `docs-reviewer` |
+| `${maintainer}` | Maintainer expertise and review criteria | Both maintainer reviewers |
+| `${ci_environment}` | CI restrictions | Every child except `disprove-reviewer` |
+
+For example, `agents/docs-reviewer/REVIEW.md` reads:
+
+```text
+${base_context}
+
+${review_rules}
+
+${pr_description}
+
+You are an elite documentation reviewer specializing in Rust codebases ...
+[the docs reviewer's own mission, review process, and output format]
+
+${ci_environment}
+```
+
+Omnigent loads `REVIEW.md` as written, so [`prepare_reviewer.py`](../prepare_reviewer.py) writes a
+copy of this directory in which every placeholder line is replaced by its block:
+
+```bash
+python3 .github/omnigent/prepare_reviewer.py /tmp/reviewer
+```
+
+The "Expand reviewer instructions" step in `ai-review.yml` runs the same command and uses the copy
+in place of the checked-out directory. To see exactly what a reviewer receives, read its
+`REVIEW.md` in the copy.
 
 ## Tools
 

@@ -29,10 +29,15 @@ def _load_module(name):
     return module
 
 
+SHARED_DIR = Path(__file__).parents[1] / "reviewer" / "shared"
+_PREPARE_REVIEWER = _load_module("prepare_reviewer")
+
+
 def _configured_prompt(path: Path) -> str:
+    """Return the instructions a reviewer loads: its `REVIEW.md` with shared blocks expanded."""
     config = yaml.safe_load(path.read_text())
-    instructions = config["instructions"]
-    return path.with_name(instructions).read_text().strip()
+    instructions = path.with_name(config["instructions"]).read_text()
+    return _PREPARE_REVIEWER.expand_instructions(instructions, SHARED_DIR).strip()
 
 
 DIFF = """\
@@ -264,60 +269,58 @@ class InlineReviewTest(unittest.TestCase):
                     or "untrusted text" in prompt
                 )
 
-    def test_shared_policies_reach_parent_and_child_reviewers(self) -> None:
+    def test_shared_blocks_reach_the_reviewers_they_apply_to(self) -> None:
         omnigent_dir = Path(__file__).parents[1]
         reviewer_dir = omnigent_dir / "reviewer"
         reviewer_contract = (reviewer_dir / "REVIEW.md").read_text()
         workflow = (omnigent_dir.parent / "workflows" / "ai-review.yml").read_text()
-        review_policy = _load_module("review_policy")
-        for policy in (
-            review_policy.KNOWN_ISSUE_POLICY.strip(),
-            review_policy.PREVIOUS_REVIEW_POLICY.strip(),
-        ):
-            self.assertIn(policy, reviewer_contract)
-            self.assertIn(policy, _configured_prompt(reviewer_dir / "config.yaml"))
-            for agent_dir in (reviewer_dir / "agents").iterdir():
-                if not agent_dir.is_dir():
-                    continue
-                with self.subTest(agent=agent_dir.name, policy=policy.partition("\n")[0]):
-                    self.assertIn(policy, (agent_dir / "REVIEW.md").read_text())
-                    self.assertIn(policy, _configured_prompt(agent_dir / "config.yaml"))
-        description_policy = review_policy.PR_DESCRIPTION_POLICY.strip()
-        self.assertIn(description_policy, reviewer_contract)
+        orchestrator = _configured_prompt(reviewer_dir / "config.yaml")
+        children = {
+            path.parent.name: _configured_prompt(path)
+            for path in sorted((reviewer_dir / "agents").glob("*/config.yaml"))
+        }
+        self.assertTrue(children)
+
+        review_rules = (SHARED_DIR / "review_rules.md").read_text().strip()
+        for heading in ("## Known issue handling", "## Previous AI review handling"):
+            self.assertIn(heading, review_rules)
+        base_context = (SHARED_DIR / "base_context.md").read_text().strip()
+        self.assertEqual(orchestrator.count(review_rules), 1)
+        self.assertNotIn(base_context, orchestrator)
+        for agent, instructions in children.items():
+            with self.subTest(agent=agent, block="review_rules and base_context"):
+                self.assertEqual(instructions.count(review_rules), 1)
+                self.assertEqual(
+                    instructions.count(base_context), int(agent != "disprove-reviewer")
+                )
+
+        description_policy = (SHARED_DIR / "pr_description.md").read_text().strip()
+        self.assertIn("## PR description accuracy", description_policy)
+        self.assertEqual(orchestrator.count(description_policy), 1)
         self.assertIn("Always dispatch\n`docs-reviewer`", reviewer_contract)
         self.assertIn("only the PR title and description", reviewer_contract)
-        for agent in (
-            "docs-reviewer",
-        ):
-            with self.subTest(agent=agent, policy="PR description accuracy"):
-                agent_dir = reviewer_dir / "agents" / agent
-                self.assertIn(description_policy, (agent_dir / "REVIEW.md").read_text())
-                self.assertIn(description_policy, _configured_prompt(agent_dir / "config.yaml"))
-        for agent in (
-            "architecture-reviewer",
-            "delta-protocol-reviewer",
-            "disprove-reviewer",
-            "maintainer-claude-reviewer",
-            "maintainer-codex-reviewer",
-            "test-coverage-reviewer",
-        ):
-            with self.subTest(agent=agent, policy="single description reviewer"):
-                agent_dir = reviewer_dir / "agents" / agent
-                self.assertNotIn(description_policy, (agent_dir / "REVIEW.md").read_text())
-        self.assertIn(
-            "PR_DESCRIPTION_POLICY,",
-            workflow,
-        )
-        self.assertIn("known_issue_policy = KNOWN_ISSUE_POLICY.strip()", workflow)
-        self.assertIn(
-            "previous_review_policy = PREVIOUS_REVIEW_POLICY.strip()", workflow
-        )
-        self.assertIn(
-            "pr_description_policy = PR_DESCRIPTION_POLICY.strip()", workflow
-        )
-        self.assertEqual(workflow.count("{known_issue_policy}"), 1)
-        self.assertEqual(workflow.count("{previous_review_policy}"), 1)
-        self.assertEqual(workflow.count("{pr_description_policy}"), 1)
+        for agent, instructions in children.items():
+            with self.subTest(agent=agent, block="pr_description"):
+                self.assertEqual(
+                    instructions.count(description_policy), int(agent == "docs-reviewer")
+                )
+
+        maintainer = (SHARED_DIR / "maintainer.md").read_text().strip()
+        ci_environment = (SHARED_DIR / "ci_environment.md").read_text().strip()
+        for agent, instructions in children.items():
+            with self.subTest(agent=agent, block="maintainer and ci_environment"):
+                self.assertEqual(
+                    instructions.count(maintainer), int(agent.startswith("maintainer-"))
+                )
+                self.assertEqual(
+                    instructions.count(ci_environment), int(agent != "disprove-reviewer")
+                )
+
+        self.assertIn("python3 .github/omnigent/prepare_reviewer.py", workflow)
+        self.assertIn('shared_dir.joinpath("review_rules.md")', workflow)
+        self.assertIn('shared_dir.joinpath("pr_description.md")', workflow)
+        self.assertEqual(workflow.count("{review_rules}"), 1)
+        self.assertEqual(workflow.count("{pr_description_rules}"), 1)
         self.assertIn("[PR description truncated at 4096 characters", workflow)
         self.assertIn("format_review_history", workflow)
         self.assertIn("OMNIGENT_BOT_LOGIN: ${{ vars.OMNIGENT_BOT_LOGIN }}", workflow)
