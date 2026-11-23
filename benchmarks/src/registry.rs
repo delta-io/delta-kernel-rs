@@ -18,6 +18,24 @@ use serde::Deserialize;
 pub struct ReadConfig {
     pub name: String,
     pub parallel_scan: ParallelScan,
+    /// Metadata API and executor used by this configuration.
+    #[serde(default)]
+    pub metadata_execution: MetadataExecution,
+}
+
+/// Selects the metadata operation while retaining the DAT table, version, and predicate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MetadataExecution {
+    /// Uses the asynchronous default engine and the imperative scan API.
+    #[default]
+    Imperative,
+    /// Uses the imperative scan API with the local synchronous test engine.
+    ImperativeSync,
+    /// Builds and fully executes a plan with the eager synchronous test executor.
+    DeclarativeSync,
+    /// Builds and drops a plan without executing its query operators.
+    DeclarativePlan,
 }
 
 /// The built-in default read configs (a single serial config).
@@ -25,6 +43,7 @@ pub fn default_read_configs() -> Vec<ReadConfig> {
     vec![ReadConfig {
         name: "serial".into(),
         parallel_scan: ParallelScan::Disabled,
+        metadata_execution: MetadataExecution::Imperative,
     }]
 }
 
@@ -108,6 +127,17 @@ impl BenchRegistry {
                 let key = format!("{table}/{case}");
                 if configs.is_empty() {
                     return Err(format!("registry entry '{key}' has an empty config list").into());
+                }
+                for config in configs {
+                    if config.metadata_execution != MetadataExecution::Imperative
+                        && config.parallel_scan != ParallelScan::Disabled
+                    {
+                        return Err(format!(
+                            "registry entry '{key}/{}' requires parallelScan disabled for {:?}",
+                            config.name, config.metadata_execution
+                        )
+                        .into());
+                    }
                 }
                 let names: HashSet<_> = configs.iter().map(|config| config.name.as_str()).collect();
                 if names.len() != configs.len() {
@@ -216,9 +246,26 @@ mod tests {
         let names: Vec<_> = configs.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["serial", "parallel2"]);
         assert_eq!(configs[0].parallel_scan, ParallelScan::Disabled);
+        assert_eq!(configs[0].metadata_execution, MetadataExecution::Imperative);
         assert_eq!(
             configs[1].parallel_scan,
             ParallelScan::Enabled { num_threads: 2 }
+        );
+    }
+
+    #[test]
+    fn synchronous_metadata_rejects_imperative_parallel_scan() {
+        let registry: BenchRegistry = serde_json::from_str(
+            r#"{"t":{"read":[{"name":"sync","parallelScan":{"enabled":{"numThreads":2}},
+                "metadataExecution":"declarativeSync"}]}}"#,
+        )
+        .unwrap();
+        assert!(
+            registry
+                .validate(&[])
+                .unwrap_err()
+                .to_string()
+                .contains("requires parallelScan disabled")
         );
     }
 

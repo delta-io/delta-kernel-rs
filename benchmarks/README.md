@@ -2,6 +2,14 @@
 
 This crate contains benchmarking infrastructure for Delta Kernel using Criterion and JSON workload specs. It is separate from the `kernel` crate to keep benchmark-specific code and dependencies out of the core library.
 
+## Declarative metadata benchmarks
+
+The registry can also select `imperativeSync`, `declarativeSync`, or `declarativePlan`
+through `metadataExecution`. These local-only configurations compare the imperative
+API with the eager synchronous test executor and isolate plan construction. See the
+[mini design and prototype guide](DECLARATIVE_BENCHMARKS.md) for timing boundaries,
+CI behavior, and the DAT artifact requirements.
+
 ## Running benchmarks
 
 ```bash
@@ -212,6 +220,9 @@ that belong with the source live here and reference benchmarks by name.
 
 Config-field value forms:
 
+- `metadataExecution` (read configs): `"imperative"` (default), `"imperativeSync"`,
+  `"declarativeSync"`, or `"declarativePlan"`. Sync/planning modes require a local table
+  and `parallelScan: "disabled"`; their I/O profiles are unavailable.
 - `parallelScan` (read configs): `"disabled"` or `{ "enabled": { "numThreads": <n> } }` — serde
   externally-tagged, so the fieldless variant is a bare string and the parameterized variant a
   single-key object.

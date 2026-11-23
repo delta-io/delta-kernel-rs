@@ -2,7 +2,18 @@
   "10kAdds0CommitsSinceChkpt1V2Chkpt": {
     "readMetadataLatest": [
       { "name": "serial",    "parallelScan": "disabled" },
-      { "name": "parallel2", "parallelScan": { "enabled": { "numThreads": 2 } } }
+      { "name": "parallel2", "parallelScan": { "enabled": { "numThreads": 2 } } },
+      { "name": "imperativeSync", "parallelScan": "disabled", "metadataExecution": "imperativeSync" },
+      { "name": "declarativeSync", "parallelScan": "disabled", "metadataExecution": "declarativeSync" },
+      { "name": "declarativePlan", "parallelScan": "disabled", "metadataExecution": "declarativePlan" }
+    ]
+  },
+  "10kAdds0CommitsSinceChkpt1Chkpt": {
+    "readMetadataLatest": [
+      { "name": "serial", "parallelScan": "disabled" },
+      { "name": "imperativeSync", "parallelScan": "disabled", "metadataExecution": "imperativeSync" },
+      { "name": "declarativeSync", "parallelScan": "disabled", "metadataExecution": "declarativeSync" },
+      { "name": "declarativePlan", "parallelScan": "disabled", "metadataExecution": "declarativePlan" }
     ]
   }
 }
