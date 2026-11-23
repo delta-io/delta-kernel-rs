@@ -79,6 +79,7 @@ def parse_rows(lines):
       ratio:        chg_ms / base_ms, or None if either side is missing/zero
     """
     rows = []
+    changes_column = lines[0].find('changes') if lines else -1
     for line in lines[2:]:  # skip critcmp header rows
         if not line.strip():
             continue
@@ -92,6 +93,12 @@ def parse_rows(lines):
         dur_fields = [f.strip() for f in fields[1:] if '±' in f]
         base_dur_str = dur_fields[0] if len(dur_fields) > 0 else None
         chg_dur_str  = dur_fields[1] if len(dur_fields) > 1 else None
+        if len(dur_fields) == 1 and changes_column >= 0:
+            # critcmp leaves the absent baseline's fixed-width column blank. Splitting on
+            # whitespace loses that column and would put a newly added benchmark under Base.
+            duration_column = line.index(dur_fields[0])
+            if duration_column >= changes_column:
+                base_dur_str, chg_dur_str = None, dur_fields[0]
 
         if not name and not base_dur_str and not chg_dur_str:
             continue
