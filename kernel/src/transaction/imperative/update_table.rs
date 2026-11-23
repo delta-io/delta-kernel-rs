@@ -184,7 +184,7 @@ impl Transaction<UpdateTable, Imperative> {
         new_dv_descriptors: HashMap<String, DeletionVectorDescriptor>,
         existing_data_files: impl KernelResultIterator<FilteredEngineData>,
     ) -> KernelResult<()> {
-        if self.is_create_table() {
+        if self.state.is_create_table() {
             return Err(KernelError::generic(
                 "Deletion vector operations require an existing table",
             ));
@@ -249,6 +249,7 @@ impl Transaction<UpdateTable, Imperative> {
     /// writer features AND the `delta.enableDeletionVectors` table property set to `true`).
     fn ensure_deletion_vectors_enabled(&self) -> KernelResult<()> {
         if !self
+            .state
             .effective_table_config
             .is_feature_enabled(&TableFeature::DeletionVectors)
         {
@@ -372,7 +373,7 @@ impl<STATE> Transaction<STATE, Imperative> {
         engine: &'a dyn Engine,
     ) -> KernelResult<impl KernelResultIterator<FilteredEngineData> + 'a> {
         // Create-table transactions should not have any DV update actions
-        if self.is_create_table() && !self.staged_data_changes.dv_matched_files.is_empty() {
+        if self.state.is_create_table() && !self.staged_data_changes.dv_matched_files.is_empty() {
             return Err(crate::error::KernelError::internal_error(
                 "CREATE TABLE transaction cannot have DV update actions",
             ));
@@ -424,7 +425,7 @@ impl<STATE> Transaction<STATE, Imperative> {
         )?;
         #[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_mut))]
         let mut add_patch = ExpressionStructPatchBuilder::new_nested(["add"])
-            .insert_after("modificationTime", lit(self.data_change));
+            .insert_after("modificationTime", lit(self.state.data_change));
         // Kernel does not populate adaptive-metadata-tree back references on writes, so emit a null
         // to keep the produced struct aligned with the `backReference` field of LOG_ADD_SCHEMA.
         #[cfg(feature = "adaptive-metadata-in-dev")]

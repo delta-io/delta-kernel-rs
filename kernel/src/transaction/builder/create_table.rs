@@ -1203,7 +1203,7 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
             data_layout_result.clustering_columns,
             self.common_state,
         )?;
-        transaction.validate_domain_metadata_operations()?;
+        transaction.state.validate_domain_metadata_operations()?;
         Ok(transaction)
     }
 }
@@ -1230,20 +1230,19 @@ fn try_new_create_table<MODE: ExecutionMode>(
         operation = "CREATE",
     );
     let commit_timestamp = current_time_ms()?;
-    Ok(Transaction {
-        should_emit_protocol: true,
-        should_emit_metadata: true,
-        system_domain_metadata_additions: system_domain_metadata,
-        physical_clustering_columns: clustering_columns,
-        ..Transaction::new(
-            common_state,
-            effective_table_config,
-            committer,
-            CommitOperation::CreateTable,
-            span,
-            commit_timestamp,
-        )
-    })
+    let mut transaction = Transaction::new(
+        common_state,
+        effective_table_config,
+        committer,
+        CommitOperation::CreateTable,
+        span,
+        commit_timestamp,
+    );
+    transaction.state.should_emit_protocol = true;
+    transaction.state.should_emit_metadata = true;
+    transaction.state.system_domain_metadata_additions = system_domain_metadata;
+    transaction.state.physical_clustering_columns = clustering_columns;
+    Ok(transaction)
 }
 
 #[cfg(test)]
@@ -1322,23 +1321,26 @@ mod tests {
         }
         let transaction = builder.build(&engine, Box::new(FileSystemCommitter::new()))?;
 
-        assert_eq!(transaction.skip_dedup_validation, skip_dedup_validation);
-        assert_eq!(transaction.engine_info, "test-engine");
         assert_eq!(
-            transaction.correlation_id.as_deref(),
+            transaction.state.skip_dedup_validation,
+            skip_dedup_validation
+        );
+        assert_eq!(transaction.state.engine_info, "test-engine");
+        assert_eq!(
+            transaction.state.correlation_id.as_deref(),
             Some("test-correlation")
         );
         assert_eq!(
-            transaction.operation_parameters.as_ref().unwrap()["mode"].as_deref(),
+            transaction.state.operation_parameters.as_ref().unwrap()["mode"].as_deref(),
             Some("Create")
         );
-        assert_eq!(transaction.set_transactions[0].app_id, "app");
-        assert_eq!(transaction.set_transactions[0].version, 7);
+        assert_eq!(transaction.state.set_transactions[0].app_id, "app");
+        assert_eq!(transaction.state.set_transactions[0].version, 7);
         assert_eq!(
-            transaction.set_transactions[0].last_updated,
-            Some(transaction.commit_timestamp)
+            transaction.state.set_transactions[0].last_updated,
+            Some(transaction.state.commit_timestamp)
         );
-        assert_eq!(transaction.data_change, expected_data_change);
+        assert_eq!(transaction.state.data_change, expected_data_change);
         let committed = transaction.commit(&engine)?.unwrap_committed();
         assert_eq!(committed.commit_version(), 0);
         let metrics = reporter
@@ -2852,7 +2854,7 @@ mod tests {
             &[(ENABLE_ICEBERG_NATIVE_V4, "true")],
         )
         .unwrap();
-        let config = &txn.effective_table_config;
+        let config = &txn.state.effective_table_config;
         assert_eq!(config.column_mapping_mode(), ColumnMappingMode::Id);
         assert_eq!(
             config
@@ -2948,7 +2950,7 @@ mod tests {
             &[(ENABLE_ICEBERG_NATIVE_V4, "true")],
         )
         .unwrap();
-        let config = &txn.effective_table_config;
+        let config = &txn.state.effective_table_config;
         assert!(config.is_feature_enabled(&TableFeature::IcebergNativeV4Preview));
         assert!(config.is_feature_supported(&TableFeature::Invariants));
         assert!(!config.is_feature_enabled(&TableFeature::Invariants));
@@ -2969,7 +2971,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let config = &txn.effective_table_config;
+        let config = &txn.state.effective_table_config;
         assert!(config.is_feature_enabled(&TableFeature::IcebergNativeV4Preview));
         assert!(config.is_feature_supported(&feature));
     }

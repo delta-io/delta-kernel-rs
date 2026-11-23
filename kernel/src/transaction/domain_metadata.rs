@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use super::{ExecutionMode, Transaction};
+use super::TransactionState;
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::error::KernelError;
 use crate::row_tracking::{
@@ -9,7 +9,7 @@ use crate::row_tracking::{
 use crate::table_features::TableFeature;
 use crate::{Engine, KernelResult};
 
-impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
+impl TransactionState {
     /// Validate domain metadata operations for both create-table and existing-table transactions.
     ///
     /// Enforces the following rules:

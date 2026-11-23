@@ -529,7 +529,7 @@ impl Snapshot {
     /// the delta is applied to produce a precomputed in-memory CRC for the new version,
     /// avoiding re-reading metadata from storage. A stale base is carried forward unchanged;
     /// no CRC stays no CRC. CREATE TABLE handles CRC construction separately in
-    /// `Transaction::into_committed`.
+    /// `TransactionState::into_committed`.
     ///
     /// `checkpoint_action` is the `checkpoint` action the commit wrote, if any; it becomes the
     /// post-commit snapshot's latest checkpoint action. Without one, the latest action is unchanged

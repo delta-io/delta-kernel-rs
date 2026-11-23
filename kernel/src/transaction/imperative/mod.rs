@@ -77,15 +77,15 @@ impl<STATE> Transaction<STATE, Imperative> {
     /// `ALTER TABLE` returns a validation error if any data-file batches or manifest writes are
     /// staged. Empty or fully unselected data-file batches are also rejected.
     #[instrument(
-        parent = &self.span,
+        parent = &self.state.span,
         name = TRANSACTION_COMMIT_SPAN,
         skip_all,
         fields(
             report,
-            operation_id = %self.operation_id,
-            is_catalog_managed = self.effective_table_config.is_catalog_managed(),
-            correlation_id = self.correlation_id.as_deref().unwrap_or(""),
-            commit_version = self.get_commit_version(),
+            operation_id = %self.state.operation_id,
+            is_catalog_managed = self.state.effective_table_config.is_catalog_managed(),
+            correlation_id = self.state.correlation_id.as_deref().unwrap_or(""),
+            commit_version = self.state.get_commit_version(),
             num_add_files,
             num_remove_files,
             num_dv_updates,
@@ -115,7 +115,7 @@ impl<STATE> Transaction<STATE, Imperative> {
             protocol,
             metadata,
             set_transactions,
-        } = self.prepare_nonfile_actions(engine)?;
+        } = self.state.prepare_nonfile_actions(engine)?;
         let CommitBatches {
             actions,
             dm_changes,
@@ -131,7 +131,7 @@ impl<STATE> Transaction<STATE, Imperative> {
         )?;
 
         // === Commit ===
-        let commit_metadata = self.create_commit_metadata(
+        let commit_metadata = self.state.create_commit_metadata(
             commit_version,
             kernel_commit_info.in_commit_timestamp,
             protocol,
@@ -182,7 +182,7 @@ impl<STATE> Transaction<STATE, Imperative> {
         engine_commit_info: Box<dyn EngineData>,
         commit_info_schema: SchemaRef,
     ) -> Self {
-        self.engine_commit_info = Some((engine_commit_info, commit_info_schema));
+        self.state.engine_commit_info = Some((engine_commit_info, commit_info_schema));
         self
     }
 
@@ -211,7 +211,10 @@ impl<STATE> Transaction<STATE, Imperative> {
         commit_metadata: CommitMetadata,
     ) -> (KernelResult<CommitResponse>, Duration) {
         let committer_start = Instant::now();
-        let commit_response = self.committer.commit(engine, actions, commit_metadata);
+        let commit_response = self
+            .state
+            .committer
+            .commit(engine, actions, commit_metadata);
         (commit_response, committer_start.elapsed())
     }
 
@@ -235,6 +238,7 @@ impl<STATE> Transaction<STATE, Imperative> {
                 // TODO(#2717): the commit already succeeded atomically; the post-commit `?`
                 //              below must not fail the txn (and must not mislabel the metric).
                 let bin_boundaries = self
+                    .state
                     .read_snapshot_opt
                     .as_ref()
                     .and_then(|snap| snap.get_file_stats_if_present())
@@ -245,14 +249,16 @@ impl<STATE> Transaction<STATE, Imperative> {
                     &self.staged_data_changes.remove_files_metadata,
                     bin_boundaries.as_deref(),
                 )?;
-                self.record_commit_success_metrics(
+                self.state.record_commit_success_metrics(
                     &file_stats,
                     self.staged_data_changes.num_dv_updates as u64,
                     prepare_duration,
                     committer_duration,
                 );
-                let crc_delta = self.build_crc_delta(file_stats, commit_info, dm_changes)?;
-                Ok(CommitResult::Committed(self.into_committed(
+                let crc_delta = self
+                    .state
+                    .build_crc_delta(file_stats, commit_info, dm_changes)?;
+                Ok(CommitResult::Committed(self.state.into_committed(
                     file_meta,
                     crc_delta,
                     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -277,8 +283,9 @@ impl<STATE> Transaction<STATE, Imperative> {
 
     // Reject data-file removals / DV updates on appendOnly tables when `data_change` is true.
     fn validate_append_only_semantics(&self) -> KernelResult<()> {
-        if !self.data_change
+        if !self.state.data_change
             || !self
+                .state
                 .effective_table_config
                 .is_feature_enabled(&TableFeature::AppendOnly)
         {
@@ -312,15 +319,18 @@ impl<STATE> Transaction<STATE, Imperative> {
 
         // Share the uniqueness validator across validations to detect cross-source conflicts.
         // TODO(#3545): Pre-size the uniqueness validator's maps.
-        let mut uniqueness_validator = (!self.skip_dedup_validation)
+        let mut uniqueness_validator = (!self.state.skip_dedup_validation)
             .then(write_validation::FileActionUniquenessValidator::default);
         write_validation::validate_add_files(
             &self.staged_data_changes.add_files_metadata,
-            self.effective_table_config.physical_partition_columns(),
+            self.state
+                .effective_table_config
+                .physical_partition_columns(),
             uniqueness_validator.as_mut(),
         )?;
 
         if !self
+            .state
             .effective_table_config
             .is_feature_supported(&TableFeature::ClusteredTable)
         {
@@ -330,6 +340,7 @@ impl<STATE> Transaction<STATE, Imperative> {
         }
 
         let row_tracking_enablement = if self
+            .state
             .effective_table_config
             .is_feature_enabled(&TableFeature::RowTracking)
         {
@@ -339,7 +350,9 @@ impl<STATE> Transaction<STATE, Imperative> {
         };
         write_validation::validate_dv_matched_files(
             &self.staged_data_changes.dv_matched_files,
-            self.effective_table_config.physical_partition_columns(),
+            self.state
+                .effective_table_config
+                .physical_partition_columns(),
             row_tracking_enablement,
             uniqueness_validator.as_mut(),
         )?;
@@ -382,8 +395,9 @@ impl<STATE> Transaction<STATE, Imperative> {
         let (add_actions, row_tracking_domain_metadata) =
             self.generate_adds(engine, commit_version)?;
 
-        let dm_changes =
-            self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
+        let dm_changes = self
+            .state
+            .generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
         let domain_metadata_actions = (!dm_changes.is_empty()).then(|| {
             let rows = dm_changes.iter().map(|dm| vec![dm.clone().into()]);
             engine
@@ -401,7 +415,8 @@ impl<STATE> Transaction<STATE, Imperative> {
 
         #[cfg(feature = "adaptive-metadata-in-dev")]
         let checkpoint_action =
-            self.generate_checkpoint_action(engine, commit_version, &dm_changes)?;
+            self.state
+                .generate_checkpoint_action(engine, commit_version, &dm_changes)?;
         #[cfg(feature = "adaptive-metadata-in-dev")]
         let checkpoint_action_data = checkpoint_action
             .clone()
@@ -449,16 +464,20 @@ impl<STATE> Transaction<STATE, Imperative> {
         if add_files.is_empty() {
             return Ok(());
         }
-        if self.effective_table_config.requires_stats_num_records() {
+        if self
+            .state
+            .effective_table_config
+            .requires_stats_num_records()
+        {
             // TODO: Likely it's better to merge this with the clustering column validation below,
             // benchmark it and see if it's faster. If so, refactor this to do both validations in
             // one pass.
             stats_verifier::verify_num_records_present(add_files)?;
         }
-        if let Some(ref clustering_cols) = self.physical_clustering_columns
+        if let Some(ref clustering_cols) = self.state.physical_clustering_columns
             && !clustering_cols.is_empty()
         {
-            let physical_schema = self.effective_table_config.physical_schema();
+            let physical_schema = self.state.effective_table_config.physical_schema();
             let columns_with_types: Vec<(ColumnName, DataType)> = clustering_cols
                 .iter()
                 .map(|col| {
@@ -493,6 +512,7 @@ impl<STATE> Transaction<STATE, Imperative> {
         // Note: this does not require delta.enableRowTracking=true. "supported" is sufficient
         // for writers to assign row IDs.
         let assign_fresh_row_tracking_metadata = self
+            .state
             .effective_table_config
             .should_assign_fresh_row_tracking_metadata();
 
@@ -501,8 +521,9 @@ impl<STATE> Transaction<STATE, Imperative> {
             // high water mark domain metadata (rowIdHighWaterMark = -1) so subsequent writes
             // have a valid starting point. For all other empty commits (metadata-only, etc.),
             // nothing row-tracking-related needs to be written.
-            let row_tracking_dm = (assign_fresh_row_tracking_metadata && self.is_create_table())
-                .then(RowTrackingDomainMetadata::initial);
+            let row_tracking_dm = (assign_fresh_row_tracking_metadata
+                && self.state.is_create_table())
+            .then(RowTrackingDomainMetadata::initial);
             return Ok((Box::new(iter::empty()), row_tracking_dm));
         }
 
@@ -518,7 +539,7 @@ impl<STATE> Transaction<STATE, Imperative> {
                     .iter()
                     .map(|a| Ok(a.deref())),
                 false, // no row tracking
-                self.data_change,
+                self.state.data_change,
             )?;
             Ok((Box::new(add_actions), None))
         }
@@ -539,10 +560,11 @@ impl<STATE> Transaction<STATE, Imperative> {
         EngineDataResultIterator<'a>,
         Option<RowTrackingDomainMetadata>,
     )> {
-        let row_id_high_water_mark = if self.is_create_table() {
+        let row_id_high_water_mark = if self.state.is_create_table() {
             None
         } else {
-            self.read_snapshot()?
+            self.state
+                .read_snapshot()?
                 .reader()
                 .get_row_tracking_high_water_mark(engine)?
         };
@@ -573,7 +595,7 @@ impl<STATE> Transaction<STATE, Imperative> {
             engine,
             extended_add_files,
             true, // row tracking
-            self.data_change,
+            self.state.data_change,
         )?;
 
         // Do a dry run to eagerly compute the new high water mark so we can store it. The row
@@ -619,7 +641,9 @@ impl<STATE> Transaction<STATE, Imperative> {
     {
         // Create-table transactions should not have any remove actions.
         // Only error if there are actually files queued for removal.
-        if self.is_create_table() && !self.staged_data_changes.remove_files_metadata.is_empty() {
+        if self.state.is_create_table()
+            && !self.staged_data_changes.remove_files_metadata.is_empty()
+        {
             return Err(KernelError::internal_error(
                 "CREATE TABLE transaction cannot have remove actions",
             ));
@@ -642,13 +666,13 @@ impl<STATE> Transaction<STATE, Imperative> {
 
         // adaptiveMetadata removes must carry a null deletionTimestamp and extendedFileMetadata =
         // true (see `Remove` and `build_remove_struct_patch`).
-        let adaptive_metadata_enabled = self.is_adaptive_metadata_enabled();
+        let adaptive_metadata_enabled = self.state.is_adaptive_metadata_enabled();
 
         let make_eval = |coalesce_stats_with_parsed: bool| {
             let columns_to_drop: Vec<_> = columns_to_drop.iter().map(String::as_str).collect();
             let patch = build_remove_struct_patch(
-                self.commit_timestamp,
-                self.data_change,
+                self.state.commit_timestamp,
+                self.state.data_change,
                 &columns_to_drop,
                 coalesce_stats_with_parsed,
                 adaptive_metadata_enabled,
@@ -876,7 +900,7 @@ mod tests {
         /// Set clustering columns for testing purposes without needing a table
         /// with the ClusteredTable feature enabled.
         fn with_clustering_columns_for_test(mut self, columns: Vec<ColumnName>) -> Self {
-            self.physical_clustering_columns = Some(columns);
+            self.state.physical_clustering_columns = Some(columns);
             self
         }
     }
@@ -1099,15 +1123,16 @@ mod tests {
 
     fn set_append_only(txn: &mut Transaction, enabled: bool) -> KernelResult<()> {
         let metadata = txn
+            .state
             .effective_table_config
             .metadata()
             .clone()
             .with_configuration_entry(APPEND_ONLY, enabled.to_string());
         let table_config = TableConfiguration::try_new_from(
-            &txn.effective_table_config,
+            &txn.state.effective_table_config,
             Some(metadata),
             None,
-            txn.effective_table_config.version(),
+            txn.state.effective_table_config.version(),
         )?;
         txn.replace_effective_table_config(table_config);
         Ok(())
