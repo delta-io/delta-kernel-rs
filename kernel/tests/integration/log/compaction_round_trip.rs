@@ -119,12 +119,12 @@ async fn snapshot_replay_and_non_amt_scans_use_compactions(
                     .filter(|event| {
                         matches!(
                             event,
-                            MetricEvent::ScanPlanGenerationCompleted(_)
-                                | MetricEvent::ScanPlanGenerationFailed(_)
+                            MetricEvent::ScanPlanGenerationSuccess(_)
+                                | MetricEvent::ScanPlanGenerationFailure(_)
                         )
                     })
                     .collect();
-                let [MetricEvent::ScanPlanGenerationCompleted(event)] = events.as_slice() else {
+                let [MetricEvent::ScanPlanGenerationSuccess(event)] = events.as_slice() else {
                     panic!("expected one scan-plan completion: {events:?}");
                 };
                 assert_eq!(event.outcome, ScanPlanOutcome::Plan);

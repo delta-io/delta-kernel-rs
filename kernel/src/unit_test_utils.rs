@@ -105,8 +105,8 @@ pub(crate) fn assert_scan_plan_metrics<T>(
     let reports: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
-            MetricEvent::ScanPlanGenerationCompleted(event)
-            | MetricEvent::ScanPlanGenerationFailed(event) => Some(event),
+            MetricEvent::ScanPlanGenerationSuccess(event)
+            | MetricEvent::ScanPlanGenerationFailure(event) => Some(event),
             _ => None,
         })
         .collect();
@@ -146,8 +146,8 @@ pub(crate) fn is_io_event(event: &MetricEvent) -> bool {
         | MetricEvent::LastCheckpointReadCompleted(_)
         | MetricEvent::ChecksumWriteSuccess(_)
         | MetricEvent::ChecksumWriteFailure(_)
-        | MetricEvent::ScanPlanGenerationCompleted(_)
-        | MetricEvent::ScanPlanGenerationFailed(_)
+        | MetricEvent::ScanPlanGenerationSuccess(_)
+        | MetricEvent::ScanPlanGenerationFailure(_)
         | MetricEvent::ScanMetadataCompleted(_) => false,
     }
 }

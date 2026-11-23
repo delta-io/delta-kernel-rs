@@ -182,9 +182,9 @@ pub(super) fn with_event<F: FnOnce(MetricEvent)>(
             compaction_file_count: metadata.compaction_file_count,
         };
         f(if *failed {
-            MetricEvent::ScanPlanGenerationFailed(&record)
+            MetricEvent::ScanPlanGenerationFailure(&record)
         } else {
-            MetricEvent::ScanPlanGenerationCompleted(&record)
+            MetricEvent::ScanPlanGenerationSuccess(&record)
         });
     }
     let info = event
@@ -270,16 +270,16 @@ mod tests {
         };
         let metadata = &event.metadata_planning;
         let source = if failed {
-            kernel::MetricEvent::ScanPlanGenerationFailed(event.clone())
+            kernel::MetricEvent::ScanPlanGenerationFailure(event.clone())
         } else {
-            kernel::MetricEvent::ScanPlanGenerationCompleted(event.clone())
+            kernel::MetricEvent::ScanPlanGenerationSuccess(event.clone())
         };
         let mut visits = 0;
         with_ffi_event(&source, |ffi| {
             visits += 1;
             let record = match (ffi, failed) {
-                (MetricEvent::ScanPlanGenerationCompleted(record), false)
-                | (MetricEvent::ScanPlanGenerationFailed(record), true) => record,
+                (MetricEvent::ScanPlanGenerationSuccess(record), false)
+                | (MetricEvent::ScanPlanGenerationFailure(record), true) => record,
                 _ => panic!("expected matching scan-plan metric"),
             };
             // Safety: the record and all nested storage are borrowed for this callback.

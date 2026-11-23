@@ -1005,12 +1005,12 @@ fn different_scans_require_timezone_support_only_for_timestamp_partitions(
             .filter(|event| {
                 matches!(
                     event,
-                    MetricEvent::ScanPlanGenerationCompleted(_)
-                        | MetricEvent::ScanPlanGenerationFailed(_)
+                    MetricEvent::ScanPlanGenerationSuccess(_)
+                        | MetricEvent::ScanPlanGenerationFailure(_)
                 )
             })
             .collect();
-        let [MetricEvent::ScanPlanGenerationFailed(event)] = events.as_slice() else {
+        let [MetricEvent::ScanPlanGenerationFailure(event)] = events.as_slice() else {
             panic!("expected one scan-plan failure: {events:?}");
         };
         assert_eq!(event.outcome, ScanPlanOutcome::Error);
