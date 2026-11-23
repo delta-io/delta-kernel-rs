@@ -1026,6 +1026,7 @@ fn different_scans_require_timezone_support_only_for_timestamp_partitions(
         assert_eq!(report.base_version, (!timestamp_partitioned).then_some(1));
         assert_eq!(event.checkpoint.is_some(), !timestamp_partitioned);
         if let Some(checkpoint) = &event.checkpoint {
+            assert!(checkpoint.duration_ns <= event.duration_ns);
             assert_eq!(checkpoint.version, 1);
             assert!(checkpoint.info.is_none());
             assert!(checkpoint.source.is_none());

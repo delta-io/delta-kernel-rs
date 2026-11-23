@@ -9,8 +9,10 @@
 //! - Operation ids are UUIDs in kernel (see [`MetricId`]). Here we report the raw 16 bytes of the
 //!   UUID.
 
+mod metadata_planning;
 mod scan_plan;
 use delta_kernel::metrics as kernel;
+pub use metadata_planning::*;
 pub use scan_plan::*;
 
 use crate::{KernelStringSlice, kernel_string_slice};

@@ -147,6 +147,7 @@ async fn snapshot_replay_and_non_amt_scans_use_compactions(
                 assert_eq!(report.compaction_file_count, 1);
                 assert_eq!(event.checkpoint.is_some(), checkpoint);
                 if let Some(checkpoint) = &event.checkpoint {
+                    assert!(checkpoint.duration_ns <= event.duration_ns);
                     assert_eq!(checkpoint.version, 1);
                     let info = checkpoint.info.as_ref().unwrap();
                     assert_eq!(info.last_checkpoint().version(), checkpoint.version);
