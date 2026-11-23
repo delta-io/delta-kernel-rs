@@ -396,10 +396,8 @@ pub enum CheckpointWriteMode {
     V2WithoutSidecars,
     /// A V2 checkpoint using the sidecar-writing path, which may produce zero sidecars.
     V2WithSidecars,
-    /// A V2 checkpoint attempted all-or-nothing reuse of inherited sidecars.
-    V2ReusingSidecarsAllOrNothing,
-    /// Benchmark-only reuse under an external fresh-Add-path assumption.
-    V2ReusingSidecarsAssumeFreshAddsForBenchmark,
+    /// A V2 checkpoint attempted all-or-nothing reuse of eligible inherited sidecars.
+    V2ReusingEligibleSidecars,
 }
 
 /// A [`crate::Snapshot::checkpoint`] call wrote a checkpoint or reported that one already exists.
@@ -2611,13 +2609,9 @@ mod tests {
     #[case::v1(CheckpointWriteMode::V1, "v1")]
     #[case::v2_without_sidecars(CheckpointWriteMode::V2WithoutSidecars, "v2_without_sidecars")]
     #[case::v2_with_sidecars(CheckpointWriteMode::V2WithSidecars, "v2_with_sidecars")]
-    #[case::v2_reusing_sidecars_all_or_nothing(
-        CheckpointWriteMode::V2ReusingSidecarsAllOrNothing,
-        "v2_reusing_sidecars_all_or_nothing"
-    )]
-    #[case::v2_reusing_sidecars_assume_fresh_adds_for_benchmark(
-        CheckpointWriteMode::V2ReusingSidecarsAssumeFreshAddsForBenchmark,
-        "v2_reusing_sidecars_assume_fresh_adds_for_benchmark"
+    #[case::v2_reusing_eligible_sidecars(
+        CheckpointWriteMode::V2ReusingEligibleSidecars,
+        "v2_reusing_eligible_sidecars"
     )]
     fn checkpoint_write_mode_serializes_to_wire_name_and_parses_back(
         #[case] mode: CheckpointWriteMode,

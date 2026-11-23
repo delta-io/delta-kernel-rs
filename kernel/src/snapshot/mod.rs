@@ -1911,11 +1911,7 @@ impl Snapshot {
                         file_actions_per_sidecar_hint: Some(0),
                     } => true,
                     #[cfg(feature = "incremental-checkpoints-in-dev")]
-                    V2CheckpointConfig::ReuseSidecarsAllOrNothing {
-                        file_actions_per_sidecar_hint: Some(0),
-                    } => true,
-                    #[cfg(feature = "incremental-checkpoints-in-dev")]
-                    V2CheckpointConfig::ReuseSidecarsAssumeFreshAddsForBenchmark {
+                    V2CheckpointConfig::ReuseEligibleSidecars {
                         file_actions_per_sidecar_hint: Some(0),
                     } => true,
                     _ => false,
@@ -1941,13 +1937,9 @@ impl Snapshot {
                 CheckpointWriteMode::V2WithSidecars
             }
             #[cfg(feature = "incremental-checkpoints-in-dev")]
-            Some(CheckpointSpec::V2(V2CheckpointConfig::ReuseSidecarsAllOrNothing { .. })) => {
-                CheckpointWriteMode::V2ReusingSidecarsAllOrNothing
+            Some(CheckpointSpec::V2(V2CheckpointConfig::ReuseEligibleSidecars { .. })) => {
+                CheckpointWriteMode::V2ReusingEligibleSidecars
             }
-            #[cfg(feature = "incremental-checkpoints-in-dev")]
-            Some(CheckpointSpec::V2(
-                V2CheckpointConfig::ReuseSidecarsAssumeFreshAddsForBenchmark { .. },
-            )) => CheckpointWriteMode::V2ReusingSidecarsAssumeFreshAddsForBenchmark,
             _ if v2_supported => CheckpointWriteMode::V2WithoutSidecars,
             _ => CheckpointWriteMode::V1,
         };
@@ -1959,27 +1951,12 @@ impl Snapshot {
 
         let write_result = match spec {
             #[cfg(feature = "incremental-checkpoints-in-dev")]
-            Some(CheckpointSpec::V2(V2CheckpointConfig::ReuseSidecarsAllOrNothing {
+            Some(CheckpointSpec::V2(V2CheckpointConfig::ReuseEligibleSidecars {
                 file_actions_per_sidecar_hint,
             })) => {
                 let hint =
                     file_actions_per_sidecar_hint.unwrap_or(DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT);
-                writer.write_v2_checkpoint_reusing_all_sidecars(
-                    engine,
-                    hint,
-                    metrics.clone(),
-                    false,
-                )
-            }
-            #[cfg(feature = "incremental-checkpoints-in-dev")]
-            Some(CheckpointSpec::V2(
-                V2CheckpointConfig::ReuseSidecarsAssumeFreshAddsForBenchmark {
-                    file_actions_per_sidecar_hint,
-                },
-            )) => {
-                let hint =
-                    file_actions_per_sidecar_hint.unwrap_or(DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT);
-                writer.write_v2_checkpoint_reusing_all_sidecars(engine, hint, metrics.clone(), true)
+                writer.write_v2_checkpoint_reusing_all_sidecars(engine, hint, metrics.clone())
             }
             Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
                 file_actions_per_sidecar_hint,

@@ -1,7 +1,7 @@
 //! All-or-nothing V2 sidecar reuse.
 //!
 //! Root summaries establish base compatibility before a single streaming tail replay. Reuse
-//! requires no inherited Removes; the benchmark opt-in also assumes fresh tail Add paths.
+//! requires no inherited Removes, allowlisted operations and tail-local input identities.
 //! An unsafe tail continues into inherited sidecars through the same reconciler, preserving
 //! already-written tail output. Successful reuse never opens inherited sidecars.
 
@@ -12,6 +12,7 @@ use std::sync::{Arc, LazyLock};
 use itertools::Itertools as _;
 use url::Url;
 
+use self::eligibility::TailEligibility;
 use super::metrics::{CheckpointMetrics, CheckpointPhase};
 use super::{CheckpointWriter, ReusedSidecars, WrittenCheckpointInfo};
 use crate::action_reconciliation::RetentionCalculator as _;
@@ -26,10 +27,14 @@ use crate::engine_data::{GetData, TypedGetData as _};
 use crate::expressions::ColumnName;
 use crate::log_replay::ActionsBatch;
 use crate::schema::{ColumnNamesAndTypes, DataType, StructType, schema_ref};
+use crate::utils::current_time_ms;
+
+mod eligibility;
 use crate::{Engine, KernelError, KernelResult, KernelResultIterator, RowVisitor};
 
 // Includes retained transaction and domain-metadata rows, as well as sidecar references.
 const MAX_BUFFERED_ROOT_ROWS: usize = 10_000;
+const SIDECAR_REUSE_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 
 impl CheckpointWriter {
     pub(crate) fn write_v2_checkpoint_reusing_all_sidecars(
@@ -37,12 +42,12 @@ impl CheckpointWriter {
         engine: &dyn Engine,
         file_actions_per_sidecar_hint: usize,
         metrics: CheckpointMetrics,
-        assume_fresh_adds_for_benchmark: bool,
     ) -> KernelResult<WrittenCheckpointInfo> {
+        let now_ms = current_time_ms()?;
         let Some(ReusableBase {
             captured_root,
             inherited,
-        }) = self.read_reusable_base(engine, &metrics)?
+        }) = self.read_reusable_base(engine, &metrics, now_ms)?
         else {
             return self.write_v2_checkpoint_with_sidecars(
                 engine,
@@ -62,27 +67,32 @@ impl CheckpointWriter {
             .map(|reference| reference.file_meta.clone())
             .collect();
         let reuse_allowed = Arc::new(AtomicBool::new(true));
+        let mut tail = TailEligibility::new(
+            engine,
+            self.read_schema.clone(),
+            log_segment.listed.ascending_commit_files.iter(),
+            self.snapshot.table_configuration().dv_normalization_root(),
+        )?;
         let tail_actions = {
             let _timer = metrics.start(CheckpointPhase::LogTailInput);
-            log_segment.read_commit_actions(engine, self.read_schema.clone())?
+            log_segment.read_commit_actions(engine, tail.read_schema().clone())?
         };
-        let tail_actions = metrics.input_iterator(CheckpointPhase::LogTailInput, tail_actions);
-        let tail_actions = tail_actions.map({
+        let mut tail_actions = metrics.input_iterator(CheckpointPhase::LogTailInput, tail_actions);
+        let tail_actions = std::iter::from_fn({
             let reuse_allowed = reuse_allowed.clone();
             let metrics = metrics.clone();
-            let mut tail = TailSummary::default();
-            move |batch| {
-                let batch = batch?;
-                if reuse_allowed.load(Ordering::Relaxed) {
+            move || {
+                let Some(batch) = tail_actions.next() else {
+                    reuse_allowed.store(tail.is_eligible(), Ordering::Relaxed);
+                    return None;
+                };
+                Some(batch.and_then(|batch| {
                     let _timer = metrics.start(CheckpointPhase::Reconciliation);
-                    tail.visit_rows_of(batch.actions.as_ref())?;
-                    if tail.requires_full_checkpoint(assume_fresh_adds_for_benchmark) {
-                        reuse_allowed.store(false, Ordering::Relaxed);
-                    }
-                }
-                Ok(batch)
+                    tail.process_batch(batch)
+                }))
             }
-        });
+        })
+        .fuse();
 
         // Tail exhaustion makes reuse_allowed final. Base actions are older than the tail, so
         // reconciled tail output stays valid whether or not the base is expanded.
@@ -137,6 +147,7 @@ impl CheckpointWriter {
         &self,
         engine: &dyn Engine,
         metrics: &CheckpointMetrics,
+        now_ms: i64,
     ) -> KernelResult<Option<ReusableBase>> {
         let log_segment = self.snapshot.log_segment();
         let [base] = log_segment.listed.checkpoint_parts.as_slice() else {
@@ -174,6 +185,7 @@ impl CheckpointWriter {
         let mut references = SidecarReferenceVisitor {
             log_root: &log_segment.log_root,
             references: Vec::new(),
+            has_missing_modification_time: false,
         };
         let mut root_summary = RootSummary::default();
         let mut captured_root = Vec::new();
@@ -192,7 +204,13 @@ impl CheckpointWriter {
                 captured_root.push(ActionsBatch::new(batch, false));
             }
         }
-        if references.references.is_empty() {
+        if references.has_missing_modification_time
+            || references.references.is_empty()
+            || references
+                .references
+                .iter()
+                .any(|reference| !sidecar_is_recent(reference.file_meta.last_modified, now_ms))
+        {
             return Ok(None);
         }
         // Missing optional proof permits fallback; a malformed V2 root is an error.
@@ -254,54 +272,11 @@ struct ReusableBase {
     inherited: ReusedSidecars,
 }
 
-#[derive(Default)]
-struct TailSummary {
-    has_add: bool,
-    has_remove: bool,
-    has_unsafe_add: bool,
-    has_metadata_or_protocol: bool,
-}
-
-impl TailSummary {
-    fn requires_full_checkpoint(&self, assume_fresh_adds_for_benchmark: bool) -> bool {
-        self.has_remove
-            || self.has_metadata_or_protocol
-            || self.has_unsafe_add
-            || (self.has_add && !assume_fresh_adds_for_benchmark)
-    }
-}
-
-impl RowVisitor for TailSummary {
-    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        static COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-            let schema = schema_ref! {
-                nullable "add": { nullable "path": STRING, nullable "dataChange": BOOLEAN },
-                nullable "remove": { nullable "path": STRING },
-                nullable "metaData": { nullable "id": STRING },
-                nullable "protocol": { nullable "minReaderVersion": INTEGER },
-            };
-            schema.leaves(None)
-        });
-        COLUMNS.as_ref()
-    }
-
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
-        let [add, data_change, remove, metadata, protocol] = getters else {
-            return Err(KernelError::internal_error("Expected tail action getters"));
-        };
-        for row in 0..row_count {
-            if add.get_str(row, "add.path")?.is_some() {
-                self.has_add = true;
-                self.has_unsafe_add |= data_change.get_opt(row, "add.dataChange")? != Some(true);
-            }
-            self.has_remove |= remove.get_str(row, "remove.path")?.is_some();
-            self.has_metadata_or_protocol |= metadata.get_str(row, "metaData.id")?.is_some()
-                || protocol
-                    .get_int(row, "protocol.minReaderVersion")?
-                    .is_some();
-        }
-        Ok(())
-    }
+fn sidecar_is_recent(modification_time: i64, now_ms: i64) -> bool {
+    modification_time > 0
+        && now_ms
+            .checked_sub(modification_time)
+            .is_some_and(|age| (0..SIDECAR_REUSE_WINDOW_MS).contains(&age))
 }
 
 #[derive(Default)]
@@ -357,6 +332,7 @@ fn trusted_base_summary(tags: &HashMap<String, String>) -> Option<(i64, StructTy
 struct SidecarReferenceVisitor<'a> {
     log_root: &'a Url,
     references: Vec<SidecarReference>,
+    has_missing_modification_time: bool,
 }
 
 impl RowVisitor for SidecarReferenceVisitor<'_> {
@@ -372,10 +348,13 @@ impl RowVisitor for SidecarReferenceVisitor<'_> {
         };
         for row in 0..row_count {
             if let Some(path) = path.get_opt(row, "sidecar.path")? {
+                let modification_time =
+                    modification_time.get_opt(row, "sidecar.modificationTime")?;
+                self.has_missing_modification_time |= modification_time.is_none();
                 let sidecar = Sidecar {
                     path,
                     size_in_bytes: size_in_bytes.get(row, "sidecar.sizeInBytes")?,
-                    modification_time: modification_time.get(row, "sidecar.modificationTime")?,
+                    modification_time: modification_time.unwrap_or(0),
                     tags: None,
                 };
                 let tags: Option<HashMap<String, Option<String>>> =

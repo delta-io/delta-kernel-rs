@@ -7,17 +7,20 @@ use rstest::rstest;
 use serde_json::{Value, json};
 use url::Url;
 
-use crate::actions::{Add, SetTransaction, Sidecar};
+use super::eligibility::TailEligibility;
+use crate::actions::{Add, CommitInfo, SetTransaction, Sidecar};
 use crate::arrow::array::{Array, MapArray, StringArray, StructArray};
 use crate::arrow::json::writer::{JsonArray, WriterBuilder};
 use crate::checkpoint::tests::{
     create_metadata_action, create_v2_checkpoint_protocol_action, new_in_memory_store,
-    write_commit_to_store,
+    write_commit_to_store as write_actions_to_store,
 };
 use crate::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use crate::engine::DelegatingEngine;
+use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::sync::SyncEngine;
 use crate::engine_data::FilteredEngineData;
+use crate::log_replay::ActionsBatch;
 use crate::metrics::{
     CheckpointWriteMode, CheckpointWriteOutcome, CheckpointWriteSuccess, MetricEvent,
 };
@@ -25,6 +28,7 @@ use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use crate::path::ParsedLogPath;
 use crate::schema::SchemaRef;
 use crate::unit_test_utils::{
     Action, CapturingReporter, create_add_action, create_remove_action,
@@ -39,7 +43,7 @@ use crate::{
 fn spec(reuse: bool) -> CheckpointSpec {
     let file_actions_per_sidecar_hint = Some(1);
     CheckpointSpec::V2(if reuse {
-        V2CheckpointConfig::ReuseSidecarsAllOrNothing {
+        V2CheckpointConfig::ReuseEligibleSidecars {
             file_actions_per_sidecar_hint,
         }
     } else {
@@ -49,12 +53,31 @@ fn spec(reuse: bool) -> CheckpointSpec {
     })
 }
 
-fn benchmark_spec() -> CheckpointSpec {
-    CheckpointSpec::V2(
-        V2CheckpointConfig::ReuseSidecarsAssumeFreshAddsForBenchmark {
-            file_actions_per_sidecar_hint: Some(1),
-        },
-    )
+fn commit_info(operation: Option<&str>) -> Action {
+    let mut info = CommitInfo::new(0, None, operation.map(str::to_owned), None, false);
+    info.operation = operation.map(str::to_owned);
+    Action::CommitInfo(info)
+}
+
+async fn write_commit_to_store(
+    store: &Arc<InMemory>,
+    mut actions: Vec<Action>,
+    version: u64,
+) -> KernelResult<()> {
+    if !actions
+        .iter()
+        .any(|action| matches!(action, Action::CommitInfo(_)))
+    {
+        let operation = if actions.iter().any(
+            |action| matches!(action, Action::Add(add) if !add.data_change && add.stats.is_some()),
+        ) {
+            "COMPUTE STATS"
+        } else {
+            "WRITE"
+        };
+        actions.push(commit_info(Some(operation)));
+    }
+    write_actions_to_store(store, actions, version).await
 }
 
 fn txn(version: i64) -> Action {
@@ -132,7 +155,7 @@ impl JsonHandler for TrackTailJson {
         let fail_on_older_batch = self.fail_on_older_batch;
         let mut emitted = 0;
         Ok(Box::new(std::iter::from_fn(move || {
-            // SyncJsonHandler yields one batch for each of these one-action commits.
+            // SyncJsonHandler yields one batch per commit, including its commitInfo row.
             // With hint=1, Add D's sidecar must finish before the older file is pulled.
             if emitted == 1 {
                 assert!(
@@ -601,11 +624,11 @@ fn single_checkpoint_success(reporter: &CapturingReporter) -> CheckpointWriteSuc
 }
 
 #[rstest]
-#[case::append(vec![vec![create_add_action("D")]], false, false, vec!["A", "B", "D"])]
+#[case::append(vec![vec![create_add_action("D")]], true, false, vec!["A", "B", "D"])]
 #[case::tail_compaction(
     vec![vec![create_add_action("D")],
          vec![create_remove_action("D"), create_add_action("E")]],
-    false,
+    true,
     false,
     vec!["A", "B", "E"]
 )]
@@ -614,6 +637,11 @@ fn single_checkpoint_success(reporter: &CapturingReporter) -> CheckpointWriteSuc
     false,
     false,
     vec!["B", "D"]
+)]
+#[case::expired_inherited_remove(
+    vec![vec![Action::Remove(crate::actions::Remove {
+        path: "A".into(), deletion_timestamp: Some(0), ..Default::default()
+    })]], false, false, vec!["B"]
 )]
 #[case::metadata_readd(
     vec![vec![Action::Add(Add {
@@ -663,7 +691,14 @@ async fn all_or_nothing_reuses_only_unchanged_base(
         write_commit_to_store(&store, actions, index as u64 + 1).await?;
     }
     let target = Snapshot::builder_for("memory:///").build(&engine)?;
-    target.checkpoint(&engine, Some(&spec(true)))?;
+    if expect_reuse {
+        target.checkpoint(
+            &guarded_engine(store.clone(), &inherited)?,
+            Some(&spec(true)),
+        )?;
+    } else {
+        target.checkpoint(&engine, Some(&spec(true)))?;
+    }
     let (root, leaves) = checkpoint_rows(&store, version).await;
     let reused = inherited.intersection(&sidecars(&root)).count();
     assert_eq!(reused, if expect_reuse { inherited.len() } else { 0 });
@@ -831,10 +866,7 @@ async fn reuse_checkpoint_metrics_count_input_work_and_published_rows(
             inherited.len() as u64
         }
     );
-    assert_eq!(
-        event.mode,
-        CheckpointWriteMode::V2ReusingSidecarsAllOrNothing
-    );
+    assert_eq!(event.mode, CheckpointWriteMode::V2ReusingEligibleSidecars);
     assert_eq!(event.version, 1);
     let CheckpointWriteOutcome::Written { stats } = event.outcome else {
         panic!("expected a written checkpoint");
@@ -844,7 +876,7 @@ async fn reuse_checkpoint_metrics_count_input_work_and_published_rows(
     assert_eq!(stats.num_add_files, 2);
     assert_eq!(stats.num_remove_files, 0);
     assert_eq!(stats.num_actions, (root.len() + leaves.len()) as u64);
-    assert_eq!(event.processing_stats.num_actions_from_log_tail, 1);
+    assert_eq!(event.processing_stats.num_actions_from_log_tail, 2);
     // Fallback reads the root during preflight, then reads it and its sidecars again.
     assert_eq!(
         event.processing_stats.num_actions_from_checkpoint,
@@ -916,10 +948,7 @@ async fn missing_or_inline_base_writes_full_sidecar_checkpoint(
 }
 
 #[rstest]
-#[case::all_or_nothing(V2CheckpointConfig::ReuseSidecarsAllOrNothing {
-    file_actions_per_sidecar_hint: Some(0),
-})]
-#[case::benchmark(V2CheckpointConfig::ReuseSidecarsAssumeFreshAddsForBenchmark {
+#[case::all_or_nothing(V2CheckpointConfig::ReuseEligibleSidecars {
     file_actions_per_sidecar_hint: Some(0),
 })]
 #[tokio::test(flavor = "multi_thread")]
@@ -1210,8 +1239,8 @@ async fn base_root_read_error_does_not_publish_a_checkpoint()
 }
 
 #[tokio::test]
-async fn benchmark_fresh_append_reuses_without_inherited_sidecar_io()
--> Result<(), Box<dyn std::error::Error>> {
+async fn fresh_append_reuses_without_inherited_sidecar_io() -> Result<(), Box<dyn std::error::Error>>
+{
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
     write_commit_to_store(
@@ -1236,16 +1265,13 @@ async fn benchmark_fresh_append_reuses_without_inherited_sidecar_io()
     let event = {
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
         let target = Snapshot::builder_for("memory:///").build(&engine)?;
-        target.checkpoint(&guarded, Some(&benchmark_spec()))?;
+        target.checkpoint(&guarded, Some(&spec(true)))?;
         single_checkpoint_success(&reporter)
     };
     let (root, leaves) = checkpoint_rows(&store, 1).await;
     assert!(inherited.is_subset(&sidecars(&root)));
     assert_eq!(sidecars(&root).len(), inherited.len() + 1);
-    assert_eq!(
-        event.mode,
-        CheckpointWriteMode::V2ReusingSidecarsAssumeFreshAddsForBenchmark
-    );
+    assert_eq!(event.mode, CheckpointWriteMode::V2ReusingEligibleSidecars);
     let CheckpointWriteOutcome::Written { stats } = event.outcome else {
         panic!("expected a written checkpoint");
     };
@@ -1280,7 +1306,7 @@ async fn benchmark_fresh_append_reuses_without_inherited_sidecar_io()
     None
 )]
 #[tokio::test]
-async fn benchmark_assumption_rejects_unsafe_tail_actions(
+async fn reuse_rejects_unsafe_tail_actions(
     #[case] tail: Vec<Action>,
     #[case] expected_active: Vec<&str>,
     #[case] expected_a_stats: Option<&str>,
@@ -1305,7 +1331,7 @@ async fn benchmark_assumption_rejects_unsafe_tail_actions(
     write_commit_to_store(&store, tail, 1).await?;
     Snapshot::builder_for("memory:///")
         .build(&engine)?
-        .checkpoint(&engine, Some(&benchmark_spec()))?;
+        .checkpoint(&engine, Some(&spec(true)))?;
     let (root, leaves) = checkpoint_rows(&store, 1).await;
     assert_eq!(inherited.intersection(&sidecars(&root)).count(), 0);
     let mut active: Vec<_> = leaves
@@ -1362,7 +1388,7 @@ async fn late_tail_fallback_keeps_already_written_add_sidecar(
     let event = {
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
         let target = Snapshot::builder_for("memory:///").build(engine.as_ref())?;
-        target.checkpoint(&tracked, Some(&benchmark_spec()))?;
+        target.checkpoint(&tracked, Some(&spec(true)))?;
         single_checkpoint_success(&reporter)
     };
 
@@ -1376,10 +1402,7 @@ async fn late_tail_fallback_keeps_already_written_add_sidecar(
     let (root, leaves) = checkpoint_rows(&store, 2).await;
     let final_sidecars = sidecars(&root);
     assert!(inherited.is_disjoint(&final_sidecars));
-    assert_eq!(
-        event.mode,
-        CheckpointWriteMode::V2ReusingSidecarsAssumeFreshAddsForBenchmark
-    );
+    assert_eq!(event.mode, CheckpointWriteMode::V2ReusingEligibleSidecars);
     let CheckpointWriteOutcome::Written { stats } = event.outcome else {
         panic!("expected a written checkpoint");
     };
@@ -1461,7 +1484,7 @@ async fn reuse_reads_each_tail_json_once_without_inherited_sidecar_io()
     let state = Arc::new(Mutex::new(TailReadAndSidecarWrites::default()));
     let guarded = guarded_engine(store.clone(), &inherited)?;
     let tracked = tracked_tail_engine(Arc::new(guarded), state.clone(), false);
-    target.checkpoint(&tracked, Some(&benchmark_spec()))?;
+    target.checkpoint(&tracked, Some(&spec(true)))?;
 
     let observed = state.lock().unwrap().clone();
     let expected_reads = HashMap::from([
@@ -1510,7 +1533,7 @@ async fn late_tail_json_error_after_sidecar_flush_does_not_publish_root_or_hint(
     let target = Snapshot::builder_for("memory:///").build(engine.as_ref())?;
     let state = Arc::new(Mutex::new(TailReadAndSidecarWrites::default()));
     let tracked = tracked_tail_engine(engine, state.clone(), true);
-    let result = target.checkpoint(&tracked, Some(&benchmark_spec()));
+    let result = target.checkpoint(&tracked, Some(&spec(true)));
     assert!(
         result
             .unwrap_err()
@@ -1579,9 +1602,7 @@ async fn inherited_sidecar_read_error_after_tail_flush_preserves_base_checkpoint
             state: state.clone(),
         },
     ));
-    let error = target
-        .checkpoint(&failing, Some(&benchmark_spec()))
-        .unwrap_err();
+    let error = target.checkpoint(&failing, Some(&spec(true))).unwrap_err();
     assert!(
         error
             .to_string()
@@ -1625,5 +1646,353 @@ async fn inherited_sidecar_read_error_after_tail_flush_preserves_base_checkpoint
         .collect();
     active.sort_unstable();
     assert_eq!(active, ["A", "B"]);
+    Ok(())
+}
+
+async fn classify_tail(
+    commits: Vec<Vec<Value>>,
+    rows_per_batch: usize,
+    staged: bool,
+    dv_normalization_root: Option<Url>,
+) -> KernelResult<bool> {
+    let (store, _) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+    let table_root = Url::parse("memory:///")?;
+    let paths: Vec<_> = (1..=commits.len() as u64)
+        .map(|version| {
+            if staged {
+                ParsedLogPath::create_parsed_staged_commit(&table_root, version)
+            } else {
+                ParsedLogPath::create_parsed_published_commit(&table_root, version)
+            }
+        })
+        .collect();
+    for (path, rows) in paths.iter().zip(commits) {
+        let contents = rows
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        store
+            .put(
+                &Path::from(path.location.location.path().trim_start_matches('/')),
+                contents.into(),
+            )
+            .await?;
+    }
+    let mut tail = TailEligibility::new(
+        &engine,
+        super::super::CHECKPOINT_ACTIONS_SCHEMA_V2.clone(),
+        paths.iter(),
+        dv_normalization_root,
+    )?;
+    let files: Vec<_> = paths
+        .iter()
+        .rev()
+        .map(|path| path.location.clone())
+        .collect();
+    for batch in engine
+        .json_handler()
+        .read_json_files(&files, tail.read_schema().clone(), None)?
+    {
+        let batch = ArrowEngineData::try_from_engine_data(batch?)?;
+        let batch = batch.record_batch();
+        for start in (0..batch.num_rows()).step_by(rows_per_batch) {
+            let slice = batch.slice(start, rows_per_batch.min(batch.num_rows() - start));
+            tail.process_batch(ActionsBatch::new(
+                Box::new(ArrowEngineData::new(slice)),
+                true,
+            ))?;
+        }
+    }
+    Ok(tail.is_eligible())
+}
+
+#[rstest]
+#[case::write("WRITE", true)]
+#[case::streaming("STREAMING UPDATE", true)]
+#[case::optimize("OPTIMIZE", true)]
+#[case::delete("DELETE", true)]
+#[case::update("UPDATE", true)]
+#[case::merge("MERGE", true)]
+#[case::stats("COMPUTE STATS", false)]
+#[case::dv_tombstones("Deletion Vector Tombstones", false)]
+#[case::backfill("ROW TRACKING BACKFILL", false)]
+#[case::crc_only_operation("TRUNCATE", false)]
+#[case::unknown("something new", false)]
+#[case::wrong_case("write", false)]
+#[case::whitespace("WRITE ", false)]
+#[case::empty("", false)]
+#[tokio::test]
+async fn every_tail_commit_requires_an_exact_allowlisted_operation(
+    #[case] operation: &str,
+    #[case] eligible: bool,
+    #[values(false, true)] with_add: bool,
+    #[values(false, true)] staged: bool,
+) -> KernelResult<()> {
+    let mut rows = Vec::new();
+    if with_add {
+        rows.push(json_add("new", None));
+    }
+    // One-row batches force the operation into a later batch than its Add.
+    rows.push(json!({"commitInfo": {"operation": operation}}));
+    assert_eq!(classify_tail(vec![rows], 1, staged, None).await?, eligible);
+    Ok(())
+}
+
+#[rstest]
+#[case::missing(vec![json_add("new", None)])]
+#[case::empty_commit(vec![])]
+#[case::no_file_actions(vec![json!({"txn": {"appId": "x", "version": 1}})])]
+#[case::null_operation(vec![json!({"commitInfo": {"operation": null}})])]
+#[case::empty_commit_info(vec![json!({"commitInfo": {}})])]
+#[case::duplicate(vec![
+    json!({"commitInfo": {"operation": "WRITE"}}),
+    json!({"commitInfo": {"operation": "WRITE"}}),
+])]
+#[case::null_duplicate(vec![
+    json!({"commitInfo": {"operation": "WRITE"}}),
+    json!({"commitInfo": {"operation": null}}),
+])]
+#[tokio::test]
+async fn missing_or_ambiguous_operations_prevent_reuse(
+    #[case] rows: Vec<Value>,
+) -> KernelResult<()> {
+    assert!(!classify_tail(vec![rows], 1, false, None).await?);
+    Ok(())
+}
+
+fn json_add(path: &str, dv: Option<&str>) -> Value {
+    let mut row = json!({"add": {"path": path, "partitionValues": {}, "size": 0, "modificationTime": 1, "dataChange": false}});
+    if let Some(dv) = dv {
+        row["add"]["deletionVector"] =
+            json!({"storageType": "i", "pathOrInlineDv": dv, "sizeInBytes": 1, "cardinality": 1});
+    }
+    row
+}
+
+fn json_remove(path: &str, dv: Option<&str>) -> Value {
+    let mut row = json!({"remove": {"path": path, "deletionTimestamp": 0, "dataChange": false}});
+    if let Some(dv) = dv {
+        row["remove"]["deletionVector"] =
+            json!({"storageType": "i", "pathOrInlineDv": dv, "sizeInBytes": 1, "cardinality": 1});
+    }
+    row
+}
+
+#[rstest]
+#[case::tail_local(vec![vec![json_add("D", None)], vec![json_remove("D", None)]], true)]
+#[case::inherited(vec![vec![json_remove("A", None)]], false)]
+#[case::later_add(vec![vec![json_remove("A", None)], vec![json_add("A", None)]], false)]
+#[case::same_commit_add_first(vec![vec![json_add("A", None), json_remove("A", None)]], false)]
+#[case::same_commit_remove_first(vec![vec![json_remove("A", None), json_add("A", None)]], false)]
+#[case::same_commit_readd_has_earlier_origin(
+    vec![vec![json_add("D", None)], vec![json_add("D", None), json_remove("D", None)]], true
+)]
+#[case::older_inherited_remove_not_hidden(
+    vec![vec![json_remove("A", None)], vec![json_add("A", None)], vec![json_remove("A", None)]], false
+)]
+#[case::tail_local_dv(
+    vec![vec![json_add("D", Some("dv1"))],
+         vec![json_add("D", Some("dv2")), json_remove("D", Some("dv1"))],
+         vec![json_remove("D", Some("dv2")), json_add("D", Some("dv3"))]], true
+)]
+#[case::different_dv_is_not_a_match(
+    vec![vec![json_add("A", Some("dv2"))], vec![json_remove("A", Some("dv1"))]], false
+)]
+#[case::initial_base_dv_change_not_hidden(
+    vec![vec![json_remove("A", Some("dv1")), json_add("A", Some("dv2"))],
+         vec![json_remove("A", Some("dv2")), json_add("A", Some("dv3"))]], false
+)]
+#[tokio::test]
+async fn removes_require_the_same_identity_in_a_strictly_earlier_tail_commit(
+    #[case] mut commits: Vec<Vec<Value>>,
+    #[case] eligible: bool,
+    #[values(1, 1_000)] rows_per_batch: usize,
+) -> KernelResult<()> {
+    for rows in &mut commits {
+        rows.push(json!({"commitInfo": {"operation": "OPTIMIZE"}}));
+    }
+    assert_eq!(
+        classify_tail(commits, rows_per_batch, false, None).await?,
+        eligible
+    );
+    Ok(())
+}
+
+#[rstest]
+#[case::recent(100_000, 100_001, true)]
+#[case::exactly_now(100_000, 100_000, true)]
+#[case::just_inside(1, super::SIDECAR_REUSE_WINDOW_MS, true)]
+#[case::boundary(1, super::SIDECAR_REUSE_WINDOW_MS + 1, false)]
+#[case::old(1, super::SIDECAR_REUSE_WINDOW_MS + 2, false)]
+#[case::zero(0, 100_000, false)]
+#[case::negative(-1, 100_000, false)]
+#[case::future(100_001, 100_000, false)]
+#[case::overflow(i64::MAX, i64::MIN, false)]
+fn sidecar_age_is_measured_from_original_modification_time(
+    #[case] modification_time: i64,
+    #[case] now: i64,
+    #[case] eligible: bool,
+) {
+    assert_eq!(super::sidecar_is_recent(modification_time, now), eligible);
+}
+
+#[rstest]
+#[case::inside_window(Some(86_401_001), true)]
+#[case::at_expiry(Some(86_401_000), false)]
+#[case::missing(None, false)]
+#[case::zero(Some(0), false)]
+#[case::negative(Some(-1), false)]
+#[case::future(Some(172_801_001), false)]
+#[tokio::test]
+async fn base_gate_uses_original_sidecar_timestamps_without_sidecar_reads(
+    #[case] modification_time: Option<i64>,
+    #[case] eligible: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (store, _) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+    write_commit_to_store(
+        &store,
+        vec![
+            create_metadata_action(),
+            create_v2_checkpoint_protocol_action(),
+            create_add_action("A"),
+        ],
+        0,
+    )
+    .await?;
+    Snapshot::builder_for("memory:///")
+        .build(&engine)?
+        .checkpoint(&engine, Some(&spec(false)))?;
+    let (mut root, _) = checkpoint_rows(&store, 0).await;
+    let inherited = sidecars(&root);
+    for row in &mut root {
+        if row["sidecar"].is_object() {
+            row["sidecar"]["modificationTime"] = json!(modification_time);
+        }
+    }
+    replace_base_root_with_json(&store, &root).await;
+    write_commit_to_store(&store, vec![txn(1)], 1).await?;
+    let writer = Snapshot::builder_for("memory:///")
+        .build(&engine)?
+        .create_checkpoint_writer(&engine)?;
+    let guarded = guarded_engine(store, &inherited)?;
+    assert_eq!(
+        writer
+            .read_reusable_base(&guarded, &super::CheckpointMetrics::disabled(), 172_801_000,)?
+            .is_some(),
+        eligible
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn nested_reuse_does_not_renew_original_sidecar_age() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (store, _) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+    write_commit_to_store(
+        &store,
+        vec![
+            create_metadata_action(),
+            create_v2_checkpoint_protocol_action(),
+            create_add_action("A"),
+        ],
+        0,
+    )
+    .await?;
+    Snapshot::builder_for("memory:///")
+        .build(&engine)?
+        .checkpoint(&engine, Some(&spec(false)))?;
+    let (mut root, _) = checkpoint_rows(&store, 0).await;
+    let inherited = sidecars(&root);
+    let original_time = crate::utils::current_time_ms()? - 23 * 60 * 60 * 1_000;
+    for row in &mut root {
+        if row["sidecar"].is_object() {
+            row["sidecar"]["modificationTime"] = json!(original_time);
+        }
+    }
+    replace_base_root_with_json(&store, &root).await;
+    write_commit_to_store(&store, vec![txn(1)], 1).await?;
+    let guarded = guarded_engine(store.clone(), &inherited)?;
+    Snapshot::builder_for("memory:///")
+        .build(&engine)?
+        .checkpoint(&guarded, Some(&spec(true)))?;
+    let (root, _) = checkpoint_rows(&store, 1).await;
+    assert_eq!(sidecars(&root), inherited);
+    assert!(
+        root.iter()
+            .filter(|row| row["sidecar"].is_object())
+            .all(|row| row["sidecar"]["modificationTime"] == original_time)
+    );
+    write_commit_to_store(&store, vec![txn(2)], 2).await?;
+    let writer = Snapshot::builder_for("memory:///")
+        .build(&engine)?
+        .create_checkpoint_writer(&engine)?;
+    assert!(
+        writer
+            .read_reusable_base(
+                &guarded,
+                &super::CheckpointMetrics::disabled(),
+                original_time + super::SIDECAR_REUSE_WINDOW_MS,
+            )?
+            .is_none()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_commit_between_supported_commits_prevents_reuse() -> KernelResult<()> {
+    let supported = vec![json!({"commitInfo": {"operation": "WRITE"}})];
+    assert!(!classify_tail(vec![supported.clone(), vec![], supported], 1, false, None).await?);
+    Ok(())
+}
+
+#[rstest]
+#[case::unknown_source(99, "Unlisted tail commit source")]
+#[case::out_of_order(1, "not in newest-first order")]
+#[tokio::test]
+async fn invalid_tail_provenance_is_an_error(
+    #[case] second_version: u64,
+    #[case] expected_error: &str,
+) -> KernelResult<()> {
+    let (store, _) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+    let table_root = Url::parse("memory:///")?;
+    let expected: Vec<_> = [1, 2]
+        .into_iter()
+        .map(|v| ParsedLogPath::create_parsed_published_commit(&table_root, v))
+        .collect();
+    let mut tail = TailEligibility::new(
+        &engine,
+        super::super::CHECKPOINT_ACTIONS_SCHEMA_V2.clone(),
+        expected.iter(),
+        None,
+    )?;
+    // version 1 followed by version 2 violates the JSON reader's ordering contract.
+    let versions = if second_version == 1 {
+        vec![1, 2]
+    } else {
+        vec![2, second_version]
+    };
+    for version in &versions {
+        write_commit_to_store(&store, vec![], *version).await?;
+    }
+    let files: Vec<_> = versions
+        .into_iter()
+        .map(|v| ParsedLogPath::create_parsed_published_commit(&table_root, v).location)
+        .collect();
+    let mut error = None;
+    for batch in engine
+        .json_handler()
+        .read_json_files(&files, tail.read_schema().clone(), None)?
+    {
+        if let Err(err) = tail.process_batch(ActionsBatch::new(batch?, true)) {
+            error = Some(err);
+            break;
+        }
+    }
+    assert!(error.unwrap().to_string().contains(expected_error));
     Ok(())
 }

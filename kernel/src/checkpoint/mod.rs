@@ -319,24 +319,19 @@ pub enum V2CheckpointConfig {
         /// default.
         file_actions_per_sidecar_hint: Option<usize>,
     },
-    /// Reuse all sidecars when the tail has no Add, Remove, `metaData`, or `protocol` action
-    /// and the base root reports zero retained Removes, exact counts, and a compatible sidecar
-    /// schema. Unsupported inputs use full V2 checkpoint construction. Successful reuse never
-    /// reads inherited sidecar files.
+    /// Reuse all eligible sidecars from the previous V2 checkpoint. Each tail commit must
+    /// declare a supported operation, and its file actions must leave inherited state unchanged.
+    /// The base must report exact counts, zero retained Removes and a compatible sidecar schema;
+    /// every inherited sidecar must be less than 24 hours old. Otherwise, construct a full
+    /// checkpoint. Successful reuse never reads inherited sidecar objects.
+    ///
+    /// Operation classification relies on supported writer conventions, as incremental CRC
+    /// replay does. Operation names alone are not a protocol-wide guarantee of fresh file paths.
     ///
     /// The caller must protect base sidecars from concurrent cleanup through publication and
     /// while retained checkpoints reference them.
     #[cfg(feature = "incremental-checkpoints-in-dev")]
-    ReuseSidecarsAllOrNothing {
-        /// Suggested number of file actions per newly written sidecar.
-        file_actions_per_sidecar_hint: Option<usize>,
-    },
-    /// Like [`Self::ReuseSidecarsAllOrNothing`], but also permits tail Adds with `dataChange=true`.
-    /// The caller must guarantee that every tail Add path is absent from all inherited sidecars;
-    /// Kernel does not check this. Removes, Adds whose `dataChange` is not `true`, and metadata
-    /// or protocol actions fall back to a full checkpoint. Use only for isolated benchmarks.
-    #[cfg(feature = "incremental-checkpoints-in-dev")]
-    ReuseSidecarsAssumeFreshAddsForBenchmark {
+    ReuseEligibleSidecars {
         /// Suggested number of file actions per newly written sidecar.
         file_actions_per_sidecar_hint: Option<usize>,
     },

@@ -112,10 +112,8 @@ pub enum CheckpointWriteMode {
     V2WithoutSidecars,
     /// V2 sidecar-writing path, which can produce zero sidecars if there are no file actions.
     V2WithSidecars,
-    /// V2 checkpoint attempted reuse of all inherited sidecars.
-    V2ReusingSidecarsAllOrNothing,
-    /// Benchmark-only reuse under a fresh-Add-path assumption.
-    V2ReusingSidecarsAssumeFreshAddsForBenchmark,
+    /// V2 checkpoint attempted all-or-nothing reuse of eligible inherited sidecars.
+    V2ReusingEligibleSidecars,
 }
 
 impl From<kernel::CheckpointWriteMode> for CheckpointWriteMode {
@@ -125,11 +123,8 @@ impl From<kernel::CheckpointWriteMode> for CheckpointWriteMode {
             kernel::CheckpointWriteMode::V1 => Self::V1,
             kernel::CheckpointWriteMode::V2WithoutSidecars => Self::V2WithoutSidecars,
             kernel::CheckpointWriteMode::V2WithSidecars => Self::V2WithSidecars,
-            kernel::CheckpointWriteMode::V2ReusingSidecarsAllOrNothing => {
-                Self::V2ReusingSidecarsAllOrNothing
-            }
-            kernel::CheckpointWriteMode::V2ReusingSidecarsAssumeFreshAddsForBenchmark => {
-                Self::V2ReusingSidecarsAssumeFreshAddsForBenchmark
+            kernel::CheckpointWriteMode::V2ReusingEligibleSidecars => {
+                Self::V2ReusingEligibleSidecars
             }
         }
     }
@@ -1099,13 +1094,9 @@ mod tests {
         kernel::CheckpointWriteMode::V2WithSidecars,
         CheckpointWriteMode::V2WithSidecars
     )]
-    #[case::v2_reusing_all(
-        kernel::CheckpointWriteMode::V2ReusingSidecarsAllOrNothing,
-        CheckpointWriteMode::V2ReusingSidecarsAllOrNothing
-    )]
-    #[case::v2_reusing_benchmark(
-        kernel::CheckpointWriteMode::V2ReusingSidecarsAssumeFreshAddsForBenchmark,
-        CheckpointWriteMode::V2ReusingSidecarsAssumeFreshAddsForBenchmark
+    #[case::v2_reusing_eligible(
+        kernel::CheckpointWriteMode::V2ReusingEligibleSidecars,
+        CheckpointWriteMode::V2ReusingEligibleSidecars
     )]
     fn from_kernel_checkpoint_written_preserves_stats(
         #[case] mode: kernel::CheckpointWriteMode,
@@ -1126,15 +1117,13 @@ mod tests {
             let sidecars = u64::from(matches!(
                 mode,
                 kernel::CheckpointWriteMode::V2WithSidecars
-                    | kernel::CheckpointWriteMode::V2ReusingSidecarsAllOrNothing
-                    | kernel::CheckpointWriteMode::V2ReusingSidecarsAssumeFreshAddsForBenchmark
+                    | kernel::CheckpointWriteMode::V2ReusingEligibleSidecars
             )) * 2;
             (101, 3, 5, 11 + sidecars, sidecars)
         };
         let reused_sidecars = if matches!(
             mode,
-            kernel::CheckpointWriteMode::V2ReusingSidecarsAllOrNothing
-                | kernel::CheckpointWriteMode::V2ReusingSidecarsAssumeFreshAddsForBenchmark
+            kernel::CheckpointWriteMode::V2ReusingEligibleSidecars
         ) {
             sidecars / 2
         } else {
@@ -1202,13 +1191,9 @@ mod tests {
         kernel::CheckpointWriteMode::V2WithSidecars,
         CheckpointWriteMode::V2WithSidecars
     )]
-    #[case::v2_reusing_all(
-        kernel::CheckpointWriteMode::V2ReusingSidecarsAllOrNothing,
-        CheckpointWriteMode::V2ReusingSidecarsAllOrNothing
-    )]
-    #[case::v2_reusing_benchmark(
-        kernel::CheckpointWriteMode::V2ReusingSidecarsAssumeFreshAddsForBenchmark,
-        CheckpointWriteMode::V2ReusingSidecarsAssumeFreshAddsForBenchmark
+    #[case::v2_reusing_eligible(
+        kernel::CheckpointWriteMode::V2ReusingEligibleSidecars,
+        CheckpointWriteMode::V2ReusingEligibleSidecars
     )]
     fn from_kernel_checkpoint_nonwritten_preserves_mode_and_duration(
         #[case] mode: kernel::CheckpointWriteMode,
