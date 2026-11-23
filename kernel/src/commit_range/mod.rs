@@ -1491,6 +1491,48 @@ mod tests {
     }
 
     #[rstest::rstest]
+    #[case::start_present(&[7, 8], None)]
+    #[case::start_missing(&[8], Some(8))]
+    #[case::no_later_commit(&[], None)]
+    #[tokio::test]
+    async fn test_relaxed_reversed_range_with_partial_catalog_tail(
+        #[case] versions: &[Version],
+        #[case] expected_earliest: Option<Version>,
+        #[values(false, true)] fail_on_data_loss: bool,
+    ) {
+        let commits: Vec<_> = versions.iter().map(|v| (*v, VALID_PROTOCOL_LINE)).collect();
+        let (engine, table_root) = engine_with_commits(&commits).await;
+        let tail = LogPath::staged_commit(
+            Url::parse(table_root).unwrap(),
+            "00000000000000000005.00000000-0000-4000-8000-000000000005.json",
+            0,
+            1,
+        )
+        .unwrap();
+        let range = CommitRange::builder_for(table_root, 7)
+            .with_end_version(5)
+            .with_log_tail(vec![tail], 10)
+            .with_commit_range_validation(false)
+            .with_fail_on_data_loss(fail_on_data_loss)
+            .build(engine.as_ref())
+            .unwrap();
+        assert!(range.is_empty());
+        let mut files = range.commit_files().unwrap();
+        match expected_earliest.filter(|_| fail_on_data_loss) {
+            Some(expected) => {
+                let error = files.next().unwrap().unwrap_err();
+                assert!(matches!(
+                    error.without_backtrace(),
+                    KernelError::StartVersionNotFound { requested: 7, earliest }
+                        if *earliest == expected
+                ));
+            }
+            None => assert!(files.next().is_none()),
+        }
+        assert!(files.next().is_none());
+    }
+
+    #[rstest::rstest]
     #[case::contiguous(&[5, 6, 7], 5, Some(7), &[5, 6, 7], &[5, 6, 7], None)]
     #[case::missing_start(
         &[6, 7], 5, Some(7), &[6, 7], &[],

@@ -283,7 +283,10 @@ impl CommitRangeBuilder {
         configured_end_version: Option<Version>,
         max_catalog_version: Option<Version>,
     ) -> KernelResult<(Vec<ParsedLogPath>, Version, Option<Version>)> {
-        let tail_start = log_tail.first().map(|file| file.version);
+        let tail_start = log_tail
+            .iter()
+            .find(|file| file.version >= start_version)
+            .map(|file| file.version);
         let mut first_version_after_end = None;
         let storage = engine.storage_handler();
         let files = list_delta_log_from_storage(
