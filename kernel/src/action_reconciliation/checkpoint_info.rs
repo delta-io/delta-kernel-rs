@@ -1252,7 +1252,7 @@ mod tests {
     }
 
     #[rstest]
-    #[case::duplicate("duplicate", "at most one row")]
+    #[case::duplicate("duplicate", "Duplicate checkpointMetadata")]
     #[case::version_mismatch("version_mismatch", "Checkpoint metadata version mismatch")]
     #[case::multiple_actions("multiple_actions", "exactly one non-null variant")]
     fn invalid_checkpoint_metadata_is_rejected(
