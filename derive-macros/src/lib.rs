@@ -680,6 +680,7 @@ fn try_from_struct_rows_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
     }
 
     let row_name = format_ident!("__{}Row", name);
+    let field_count = fields.len();
     let row_input: DeriveInput = syn::parse2(quote! {
         pub struct #row_name {
             #(#[allow(dead_code)]
@@ -701,14 +702,25 @@ fn try_from_struct_rows_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
             #[automatically_derived]
             impl delta_kernel::expressions::TryFromStructRows for #name #where_clause {
                 type Row = #row_name;
+                type State = (usize, [::std::vec::Vec<delta_kernel::expressions::StructData>; #field_count]);
 
-                fn collect_into(
-                    rows: impl delta_kernel::expressions::StructRowSource,
-                ) -> delta_kernel::KernelResult<Self> {
-                    let [#(#idents),*] = delta_kernel::expressions::group_struct_rows(
-                        rows,
+                fn new_state() -> Self::State {
+                    (0, ::std::array::from_fn(|_| ::std::vec::Vec::new()))
+                }
+
+                fn push(
+                    state: &mut Self::State,
+                    row: delta_kernel::expressions::StructData,
+                ) -> delta_kernel::KernelResult<()> {
+                    delta_kernel::expressions::group_struct_row(
+                        state,
+                        row,
                         <Self::Row as delta_kernel::schema::ToSchema>::schema_ref(),
-                    )?;
+                    )
+                }
+
+                fn finish(state: Self::State) -> delta_kernel::KernelResult<Self> {
+                    let (_, [#(#idents),*]) = state;
                     Ok(Self {
                         #(#idents: <#types as delta_kernel::expressions::TryFromStructRows>::collect_into(
                             #idents.into_iter().map(::core::result::Result::Ok),

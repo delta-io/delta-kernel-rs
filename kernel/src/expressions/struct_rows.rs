@@ -161,38 +161,36 @@ fn decode_row<T: TryFrom<StructData, Error = KernelError>>(
     T::try_from(row).map_err(|error| add_scalar_path_context(error, format!("[{index}]")))
 }
 
-/// Groups mixed rows by schema field for the `TryFromStructRows` derive.
+/// Groups a mixed row into the collection matching each non-null payload field.
 #[internal_api]
-pub(crate) fn group_struct_rows<const N: usize>(
-    rows: impl StructRowSource,
+pub(crate) fn group_struct_row<const N: usize>(
+    state: &mut (usize, [Vec<StructData>; N]),
+    row: StructData,
     schema: &SchemaRef,
-) -> KernelResult<[Vec<StructData>; N]> {
-    let mut groups: [Vec<StructData>; N] = std::array::from_fn(|_| Vec::new());
-    let mut row_index = 0;
-    rows.try_for_each(|row| {
-        let (actual, values) = row.into_parts();
-        if actual != *schema || values.len() != schema.num_fields() {
-            return Err(KernelError::invalid_struct_data(
-                "Incompatible mixed-row payload schema",
-            ));
-        }
-        validate_variant(&values)
-            .map_err(|error| add_scalar_path_context(error, format!("[{row_index}]")))?;
-        for (field, value) in actual
-            .fields()
-            .zip(values)
-            .filter(|(_, value)| !value.is_null())
-        {
-            let group = schema
-                .index_of(field.name())
-                .and_then(|index| groups.get_mut(index))
-                .ok_or_else(|| KernelError::internal_error("Missing payload group"))?;
-            group.push(value.try_into()?);
-        }
-        row_index += 1;
-        Ok(())
-    })?;
-    Ok(groups)
+) -> KernelResult<()> {
+    let index = state.0;
+    let groups = &mut state.1;
+    let (actual, values) = row.into_parts();
+    if actual != *schema || values.len() != schema.num_fields() {
+        return Err(KernelError::invalid_struct_data(
+            "Incompatible mixed-row payload schema",
+        ));
+    }
+    validate_variant(&values)
+        .map_err(|error| add_scalar_path_context(error, format!("[{index}]")))?;
+    for (field, value) in actual
+        .fields()
+        .zip(values)
+        .filter(|(_, value)| !value.is_null())
+    {
+        let group = schema
+            .index_of(field.name())
+            .and_then(|index| groups.get_mut(index))
+            .ok_or_else(|| KernelError::internal_error("Missing payload group"))?;
+        group.push(value.try_into()?);
+    }
+    state.0 += 1;
+    Ok(())
 }
 
 #[cfg(test)]
