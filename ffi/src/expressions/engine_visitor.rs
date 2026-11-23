@@ -293,10 +293,12 @@ pub struct EngineExpressionVisitor {
         op: Handle<SharedOpaquePredicateOp>,
         child_list_id: usize,
     ),
-    /// Visits the name of an expression or predicate that has no dedicated callback, belonging to
-    /// the list identified by `sibling_list_id`. This covers `Expression::Unknown`,
-    /// `Predicate::Unknown` and operators such as `MAP_LEN` and `MAP_HAS_KEY`. The callback
-    /// receives only the name.
+    /// Visits the name of an `Expression::Unknown` or `Predicate::Unknown` belonging to the
+    /// list identified by `sibling_list_id`.
+    ///
+    /// Kernel operators that have no dedicated callback yet, such as `MAP_LEN` and `MAP_HAS_KEY`,
+    /// also arrive here with only their name as a temporary fallback. Engines should treat them
+    /// as unsupported. A later release may give them dedicated callbacks.
     pub visit_unknown:
         extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
     /// Visits a CASE WHEN expression belonging to the list identified by `sibling_list_id`.
@@ -1063,7 +1065,7 @@ mod tests {
     #[rstest::rstest]
     #[case::map_len(Expression::column(["m"]).map_len(), "MAP_LEN")]
     #[case::map_has_key(
-        Expression::from_pred(Predicate::map_has_key(Expression::column(["m"]), Expression::literal("k"))),
+        Expression::from_pred(Predicate::map_has_key(Expression::column(["m"]), lit("k"))),
         "MAP_HAS_KEY"
     )]
     fn visit_map_accessors_as_unknown(#[case] expr: Expression, #[case] expected_name: &str) {

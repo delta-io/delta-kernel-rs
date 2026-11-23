@@ -721,8 +721,9 @@ fn arrow_convert_to_non_view_type(vals: Arc<dyn Array>) -> KernelResult<Arc<dyn 
 /// NULL key yields NULL.
 ///
 /// The key must have one row per map row and the map's key type. A string or binary key whose
-/// Arrow layout differs from the map keys, such as `Utf8` against `Utf8View`, is converted to the
-/// map key layout. Maps with nested key types are rejected.
+/// Arrow layout differs from the map keys, such as `Utf8` against `Utf8View`, is aligned with the
+/// map keys by [`align_comparison_operands`], the same way [`BinaryPredicateOp::Equal`] aligns
+/// its operands. Maps with nested key types are rejected.
 fn map_has_key(map: &ArrayRef, key: &ArrayRef) -> KernelResult<BooleanArray> {
     let map = as_map_array(map, "MapHasKey")?;
     if key.len() != map.len() {
@@ -739,17 +740,15 @@ fn map_has_key(map: &ArrayRef, key: &ArrayRef) -> KernelResult<BooleanArray> {
             map_keys.data_type()
         )));
     }
-    let key = if key.data_type() == map_keys.data_type() {
-        Cow::Borrowed(key)
-    } else if is_layout_only_difference(key.data_type(), map_keys.data_type()) {
-        Cow::Owned(cast(key, map_keys.data_type())?)
-    } else {
+    if key.data_type() != map_keys.data_type()
+        && !is_layout_only_difference(key.data_type(), map_keys.data_type())
+    {
         return Err(KernelError::invalid_expression(format!(
             "MapHasKey requires a key of the map key type {:?}, but got {:?}",
             map_keys.data_type(),
             key.data_type()
         )));
-    };
+    }
     // Repeat each row's key once per entry of that row, so a single `eq` compares all entries.
     let offsets = map.value_offsets();
     let first = offsets[0] as usize;
@@ -758,6 +757,7 @@ fn map_has_key(map: &ArrayRef, key: &ArrayRef) -> KernelResult<BooleanArray> {
         .flat_map(|row| std::iter::repeat_n(row as u32, entry_len(row)))
         .collect();
     let entry_keys = map_keys.slice(first, entry_rows.len());
+    let (entry_keys, key) = align_comparison_operands(entry_keys, key.clone())?;
     let row_keys = take(key.as_ref(), &entry_rows, None)?;
     let matches = eq(&entry_keys, &row_keys)?;
     let has_key = (0..map.len()).map(|row| {
@@ -768,6 +768,21 @@ fn map_has_key(map: &ArrayRef, key: &ArrayRef) -> KernelResult<BooleanArray> {
         Some(matches.slice(start, entry_len(row)).true_count() > 0)
     });
     Ok(has_key.collect())
+}
+
+/// Converts both comparison operands to view layouts when their Arrow types differ. Casting from a
+/// non-view layout to a view layout is faster than the reverse.
+fn align_comparison_operands(
+    left: ArrayRef,
+    right: ArrayRef,
+) -> KernelResult<(ArrayRef, ArrayRef)> {
+    if left.data_type() == right.data_type() {
+        return Ok((left, right));
+    }
+    Ok((
+        arrow_convert_to_view_type(left)?,
+        arrow_convert_to_view_type(right)?,
+    ))
 }
 
 /// True when both types are string layouts or both are binary layouts. A cast between them keeps
@@ -936,18 +951,7 @@ pub fn evaluate_predicate(
             let left = evaluate_expression(left, batch, None)?;
             let right = evaluate_expression(right, batch, None)?;
 
-            // If the types differ (e.g. one side is a view type and the other is not),
-            // normalize both to view types since benchamrking results show that casting from
-            // non-view to view type is faster than casting from view type to non-view
-            // type.
-            let (left, right) = if left.data_type() == right.data_type() {
-                (left, right)
-            } else {
-                (
-                    arrow_convert_to_view_type(left)?,
-                    arrow_convert_to_view_type(right)?,
-                )
-            };
+            let (left, right) = align_comparison_operands(left, right)?;
             Ok(eval_fn(&left, &right)?)
         }
         Junction(JunctionPredicate { op, preds }) => {
@@ -3406,6 +3410,15 @@ mod tests {
         RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map)]).unwrap()
     }
 
+    fn create_cast_key_map_batch(
+        source_type: ArrowDataType,
+        key_type: ArrowDataType,
+    ) -> RecordBatch {
+        let keys: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
+        let keys = cast(&cast(&keys, &source_type).unwrap(), &key_type).unwrap();
+        create_map_batch(keys, vec![0, 2, 2], None)
+    }
+
     fn create_nested_key_map_batch() -> RecordBatch {
         let field = Arc::new(ArrowField::new("x", ArrowDataType::Int32, false));
         let keys = StructArray::from(vec![(
@@ -3484,30 +3497,41 @@ mod tests {
         lit(Scalar::Date(20)),
         vec![Some(true), Some(false)],
     )]
+    #[case::utf8_view_keys(
+        create_cast_key_map_batch(ArrowDataType::Utf8, ArrowDataType::Utf8View),
+        lit("b"),
+        vec![Some(true), Some(false)],
+    )]
+    #[case::utf8_view_keys_null_key(
+        create_cast_key_map_batch(ArrowDataType::Utf8, ArrowDataType::Utf8View),
+        null_lit(DataType::STRING),
+        vec![None, None],
+    )]
+    #[case::large_utf8_keys(
+        create_cast_key_map_batch(ArrowDataType::Utf8, ArrowDataType::LargeUtf8),
+        lit("b"),
+        vec![Some(true), Some(false)],
+    )]
+    #[case::large_utf8_keys_null_key(
+        create_cast_key_map_batch(ArrowDataType::Utf8, ArrowDataType::LargeUtf8),
+        null_lit(DataType::STRING),
+        vec![None, None],
+    )]
+    #[case::binary_view_keys(
+        create_cast_key_map_batch(ArrowDataType::Binary, ArrowDataType::BinaryView),
+        lit(Scalar::Binary(b"b".to_vec())),
+        vec![Some(true), Some(false)],
+    )]
+    #[case::large_binary_keys(
+        create_cast_key_map_batch(ArrowDataType::Binary, ArrowDataType::LargeBinary),
+        lit(Scalar::Binary(b"b".to_vec())),
+        vec![Some(true), Some(false)],
+    )]
     fn test_map_has_key_layouts(
         #[case] batch: RecordBatch,
         #[case] key: Expr,
         #[case] expected: Vec<Option<bool>>,
     ) {
-        let pred = Pred::map_has_key(col!("m"), key);
-        let result = evaluate_predicate(&pred, &batch, false).unwrap();
-        let expected = BooleanArray::from(expected);
-        assert_eq!(result, expected);
-    }
-
-    #[rstest]
-    #[case::utf8_view_present_key(ArrowDataType::Utf8View, lit("b"), vec![Some(true), Some(false)])]
-    #[case::utf8_view_null_key(ArrowDataType::Utf8View, null_lit(DataType::STRING), vec![None, None])]
-    #[case::large_utf8_present_key(ArrowDataType::LargeUtf8, lit("b"), vec![Some(true), Some(false)])]
-    #[case::large_utf8_null_key(ArrowDataType::LargeUtf8, null_lit(DataType::STRING), vec![None, None])]
-    fn test_map_has_key_utf8_key_against_other_string_map_keys(
-        #[case] key_type: ArrowDataType,
-        #[case] key: Expr,
-        #[case] expected: Vec<Option<bool>>,
-    ) {
-        let keys: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
-        let keys = cast(&keys, &key_type).unwrap();
-        let batch = create_map_batch(keys, vec![0, 2, 2], None);
         let pred = Pred::map_has_key(col!("m"), key);
         let result = evaluate_predicate(&pred, &batch, false).unwrap();
         let expected = BooleanArray::from(expected);
