@@ -23,7 +23,7 @@ fn encode_segment(name: &str) -> impl std::fmt::Display + '_ {
 /// Builds the Delta-Tables per-table resource path
 /// (`delta/v1/catalogs/{catalog}/schemas/{schema}/tables/{table}`) that the `load_table` and
 /// credential-vending endpoints share.
-fn table_path(catalog: &str, schema: &str, table: &str) -> String {
+pub(super) fn table_path(catalog: &str, schema: &str, table: &str) -> String {
     format!(
         "delta/v1/catalogs/{}/schemas/{}/tables/{}",
         encode_segment(catalog),

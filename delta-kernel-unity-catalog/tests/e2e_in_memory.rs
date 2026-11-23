@@ -2,12 +2,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{ArrayRef, Int32Array, StringArray};
-use delta_kernel::commit_range::CommitRange;
+use delta_kernel::committer::list_published_commits_and_merge_ratified_tail;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::path::LogPathFileType;
 use delta_kernel::schema::schema_ref;
-use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::transaction::create_table::create_table;
+use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
 use delta_kernel::{Engine, KernelError, Snapshot};
 use delta_kernel_default_engine::DefaultEngine;
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
@@ -291,10 +291,20 @@ async fn test_snapshot_from_catalog_response_with_published_commits(
     assert_eq!(selected_adds, 2 - base_version as usize);
 
     let resp = client.load_table_response(TABLE_ID, table_uri.as_str())?;
-    let range = CommitRange::builder_for(table_uri.as_str(), 0)
-        .with_log_tail(log_tail_from_commits(&resp.commits, table_uri.clone())?, 2)
-        .build(engine.as_ref())?;
-    assert_eq!(range.end_version(), 2);
+    let winners = list_published_commits_and_merge_ratified_tail(
+        engine.as_ref(),
+        &table_uri,
+        0,
+        log_tail_from_commits(&resp.commits, table_uri.clone())?,
+        Some(2),
+    )?;
+    assert_eq!(
+        winners
+            .iter()
+            .map(|winner| winner.version)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2],
+    );
 
     // Checkpointing a new commit requires publishing it on top of the mixed log tail.
     commit(&snapshot, &client, &engine)?
@@ -352,12 +362,16 @@ async fn test_catalog_response_rejects_duplicate_commit_versions(
         })
     ));
 
-    let range_error = CommitRange::builder_for(table_uri.as_str(), 0)
-        .with_log_tail(log_tail_from_commits(&resp.commits, table_uri)?, 1)
-        .build(&engine)
-        .unwrap_err();
+    let history_error = list_published_commits_and_merge_ratified_tail(
+        &engine,
+        &table_uri,
+        0,
+        log_tail_from_commits(&resp.commits, table_uri.clone())?,
+        Some(1),
+    )
+    .unwrap_err();
     assert!(matches!(
-        range_error,
+        history_error,
         KernelError::LogTailVersionsNotContiguous {
             first_version: 1,
             second_version: 1,
@@ -367,7 +381,7 @@ async fn test_catalog_response_rejects_duplicate_commit_versions(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_insert_without_publish_hits_limit() -> Result<(), TestError> {
+async fn test_insert_without_publish_returns_retryable_at_limit() -> Result<(), TestError> {
     let TestSetup {
         update_table_client,
         engine,
@@ -383,17 +397,23 @@ async fn test_insert_without_publish_hits_limit() -> Result<(), TestError> {
     }
     assert_eq!(snapshot.version(), max);
 
-    // Next insert should fail with MaxUnpublishedCommitsExceeded
     let committer = Box::new(uc_committer(&update_table_client));
-    let err = snapshot
+    let result = snapshot
         .clone()
         .update_table(UpdateTableOperation::Write, "test-engine", true)
         .build(&engine, committer)?
-        .commit(&engine)
-        .unwrap_err();
+        .commit(&engine)?;
+    let CommitResult::Retryable(pending) = result else {
+        panic!("Expected a retryable unpublished-commit limit rejection");
+    };
     assert!(
-        matches!(err, delta_kernel::KernelError::Generic(msg) if msg.contains("Max unpublished commits"))
+        pending
+            .error
+            .to_string()
+            .contains("Max unpublished commits")
     );
+    let state = update_table_client.load_table_response(TABLE_ID, "memory:///")?;
+    assert_eq!(state.latest_table_version, Some(max as i64));
     Ok(())
 }
 

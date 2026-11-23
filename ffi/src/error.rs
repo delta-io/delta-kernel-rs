@@ -328,6 +328,7 @@ impl From<EngineExecError> for KernelError {
             FFIKernelError::CheckpointWriteError => KernelError::CheckpointWrite(message),
             FFIKernelError::EngineDataTypeError => KernelError::EngineDataType(message),
             FFIKernelError::GenericError => KernelError::Generic(message),
+            FFIKernelError::IOErrorError => KernelError::IOError(std::io::Error::other(message)),
             FFIKernelError::CommitRangeError => KernelError::CommitRange(message),
             FFIKernelError::MaxCatalogVersionError => KernelError::MaxCatalogVersion(message),
             FFIKernelError::InternalError => KernelError::InternalError(message),
@@ -386,7 +387,6 @@ impl From<EngineExecError> for KernelError {
             code @ (FFIKernelError::UnknownError
             | FFIKernelError::FFIError
             | FFIKernelError::ExtractError
-            | FFIKernelError::IOErrorError
             | FFIKernelError::InvalidUrlError
             | FFIKernelError::MalformedJsonError
             | FFIKernelError::ParseError
@@ -612,10 +612,7 @@ mod tests {
         FFIKernelError::InvalidSnapshotHint,
         "Invalid snapshot hint: boom"
     )]
-    #[case::fallback_io(
-        FFIKernelError::IOErrorError,
-        "Generic delta kernel error: engine execution error (IOErrorError): boom"
-    )]
+    #[case::io(FFIKernelError::IOErrorError, "boom")]
     #[case::fallback_row_tracking(
         FFIKernelError::RowTrackingChangeFeedUnsupported,
         "Generic delta kernel error: engine execution error (RowTrackingChangeFeedUnsupported): boom"
