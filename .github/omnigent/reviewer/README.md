@@ -7,6 +7,21 @@ CI review behavior.
 To run a reviewer locally, load its `config.yaml` bundle and provide the PR metadata and diff as
 review context.
 
+PR authors using git stack should keep the generated stack list in their PR description up to
+date, including the link to the immediate parent PR. The parent and child PRs must be opened in the
+same repository; their head branches can live in forks. For an unmerged parent, the child must
+inherit the parent's current head, or the workflow stops with a neutral PR check explaining that
+the stack needs synchronizing. This avoids guessing which changes belong to the child after a parent
+advances or is rewritten.
+Scope decisions are logged in the workflow run. If resolution stops, the author should follow the
+neutral check's instructions to refresh the description or synchronize the stack, then retry.
+See [`resolve_review_base`](../review_scope.py) for the boundary selection rules. Published scoped
+reviews identify their reviewed commit range.
+
+Inline publication validates positions against GitHub's PR diff. LEFT-side findings stay in the
+collapsed review when that file's scoped and GitHub diff sections differ. If GitHub rejects an
+inline review, the fallback comment retains the findings intended for inline publication.
+
 Each published inline finding includes feedback instructions: react 👍 for helpful or 👎 for
 unhelpful or incorrect, or 👀 for out of scope. Feedback remains
 on the comment for manual review and prompt tuning; the workflow does not automatically consume
