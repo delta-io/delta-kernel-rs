@@ -2037,9 +2037,9 @@ impl Snapshot {
                 .into());
             }
             CheckpointWriteMode::V1 => SelectedCheckpointType::V1,
-            CheckpointWriteMode::V2WithoutSidecars | CheckpointWriteMode::V2WithSidecars => {
-                SelectedCheckpointType::V2
-            }
+            CheckpointWriteMode::V2WithoutSidecars
+            | CheckpointWriteMode::V2WithSidecars
+            | CheckpointWriteMode::V2ReusingEligibleSidecars => SelectedCheckpointType::V2,
         };
         let new_log_segment = self
             .log_segment

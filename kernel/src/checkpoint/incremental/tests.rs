@@ -7,6 +7,7 @@ use rstest::rstest;
 use serde_json::{Value, json};
 use url::Url;
 
+use super::SIDECAR_REUSE_WINDOW_MS;
 use super::eligibility::TailEligibility;
 use crate::actions::{Add, CommitInfo, SetTransaction, Sidecar};
 use crate::arrow::array::{Array, MapArray, StringArray, StructArray};
@@ -1265,7 +1266,11 @@ async fn fresh_append_reuses_without_inherited_sidecar_io() -> Result<(), Box<dy
     let event = {
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
         let target = Snapshot::builder_for("memory:///").build(&engine)?;
-        target.checkpoint(&guarded, Some(&spec(true)))?;
+        let (_, checkpointed) = target.checkpoint(&guarded, Some(&spec(true)))?;
+        assert_eq!(
+            checkpointed.known_checkpoint_type(),
+            Some(crate::checkpoint::SelectedCheckpointType::V2)
+        );
         single_checkpoint_success(&reporter)
     };
     let (root, leaves) = checkpoint_rows(&store, 1).await;
@@ -1823,9 +1828,9 @@ async fn removes_require_the_same_identity_in_a_strictly_earlier_tail_commit(
 #[rstest]
 #[case::recent(100_000, 100_001, true)]
 #[case::exactly_now(100_000, 100_000, true)]
-#[case::just_inside(1, super::SIDECAR_REUSE_WINDOW_MS, true)]
-#[case::boundary(1, super::SIDECAR_REUSE_WINDOW_MS + 1, false)]
-#[case::old(1, super::SIDECAR_REUSE_WINDOW_MS + 2, false)]
+#[case::just_inside(1, SIDECAR_REUSE_WINDOW_MS, true)]
+#[case::boundary(1, SIDECAR_REUSE_WINDOW_MS + 1, false)]
+#[case::old(1, SIDECAR_REUSE_WINDOW_MS + 2, false)]
 #[case::zero(0, 100_000, false)]
 #[case::negative(-1, 100_000, false)]
 #[case::future(100_001, 100_000, false)]

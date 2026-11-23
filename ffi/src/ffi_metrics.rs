@@ -1121,14 +1121,12 @@ mod tests {
             )) * 2;
             (101, 3, 5, 11 + sidecars, sidecars)
         };
-        let reused_sidecars = if matches!(
-            mode,
-            kernel::CheckpointWriteMode::V2ReusingEligibleSidecars
-        ) {
-            sidecars / 2
-        } else {
-            0
-        };
+        let reused_sidecars =
+            if matches!(mode, kernel::CheckpointWriteMode::V2ReusingEligibleSidecars) {
+                sidecars / 2
+            } else {
+                0
+            };
         let event = kernel::MetricEvent::CheckpointWriteSuccess(kernel::CheckpointWriteSuccess {
             operation_id,
             version: 42,
