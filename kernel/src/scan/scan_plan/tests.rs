@@ -745,7 +745,7 @@ fn declarative_json_only_disables_metadata_pruning(
     assert_eq!(metadata_row_count(&pruned), pruning.1);
     let actual = assert_scan_plan_metrics(
         || metadata(StatsOptions::json_only(), predicate),
-        |event| assert!(!event.metadata_plan.has_filter),
+        |event| assert!(!event.metadata_planning.has_filter),
     )?;
     assert_metadata_eq(
         &actual,
@@ -976,7 +976,7 @@ fn assert_metadata_output_options(
         || declarative_metadata(&scan, &engine),
         |event| {
             assert_eq!(event.outcome, ScanPlanOutcome::Plan);
-            let report = &event.metadata_plan;
+            let report = &event.metadata_planning;
             assert_eq!(report.stats, scan.stats);
             assert_eq!(report.partition_values, scan.partition_values_options);
             assert_eq!(event.correlation_id.as_deref(), Some("scan-plan-test"));
@@ -1101,7 +1101,7 @@ fn declarative_metadata_data_skipping(
         .build()?;
     let actual = assert_scan_plan_metrics(
         || declarative_metadata(&scan, engine.as_ref()),
-        |event| assert!(event.metadata_plan.has_filter),
+        |event| assert!(event.metadata_planning.has_filter),
     )?;
 
     assert_metadata_eq(
@@ -1535,7 +1535,7 @@ fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> Resu
         || scan.declarative_metadata_scan_plan(&no_plan_engine),
         |event| {
             assert_eq!(event.outcome, ScanPlanOutcome::Error);
-            let report = &event.metadata_plan;
+            let report = &event.metadata_planning;
             assert_eq!(report.stats, scan.stats);
             assert_eq!(report.partition_values, scan.partition_values_options);
             assert_eq!(report.partition_values.timestamp_timezone(), Some("UTC"));
@@ -1560,7 +1560,7 @@ fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> Resu
             || scan.declarative_metadata_scan_plan(&no_plan_engine),
             |event| {
                 assert_eq!(event.outcome, ScanPlanOutcome::Empty);
-                assert!(event.metadata_plan.replay_base.is_none());
+                assert!(event.metadata_planning.replay_base.is_none());
                 assert!(event.checkpoint.is_none());
             },
         )?

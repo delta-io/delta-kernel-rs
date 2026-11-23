@@ -76,7 +76,7 @@ pub(super) fn with_event<F: FnOnce(MetricEvent)>(
                 .as_ptr()
         };
         let Some(f) = callback.take() else { return };
-        let metadata = &event.metadata_plan;
+        let metadata = &event.metadata_planning;
         let columns = match metadata.stats.struct_stats() {
             StructStats::None => &[][..],
             StructStats::AllIndexed { extra_indexed } => extra_indexed.as_slice(),
@@ -247,7 +247,7 @@ mod tests {
                 sidecar_footer_calls: 0,
                 metadata_query_calls: 0,
             }),
-            metadata_plan: kernel::MetadataPlanReport {
+            metadata_planning: kernel::MetadataPlanningReport {
                 stats,
                 partition_values: PartitionValuesOptions::with_struct()
                     .with_timestamp_timezone("UTC"),
@@ -261,7 +261,7 @@ mod tests {
                 compaction_file_count: 0,
             },
         };
-        let metadata = &event.metadata_plan;
+        let metadata = &event.metadata_planning;
         let source = if failed {
             kernel::MetricEvent::ScanPlanGenerationFailed(event.clone())
         } else {
