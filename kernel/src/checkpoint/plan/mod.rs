@@ -58,7 +58,7 @@ impl CheckpointWriter {
             .filter(file_retention_predicate(
                 self.deleted_file_retention_timestamp()?,
             ))?
-            .project_patch(|patch| patch.drop(VERSION))?
+            .project_patch(checkpoint_file_projection)?
             .build()?;
         let non_content = MetadataPlanner::new(
             self.snapshot.log_segment(),
