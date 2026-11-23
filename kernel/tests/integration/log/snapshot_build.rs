@@ -7,8 +7,7 @@ use delta_kernel::arrow::array::{ArrayRef, Int32Array};
 use delta_kernel::committer::{Committer, FileSystemCommitter};
 use delta_kernel::schema::{DataType, schema, schema_ref};
 use delta_kernel::snapshot::{
-    CheckpointWriteResult, ChecksumWriteResult, CrcProvenance, CrcSource, IncrementalReplay,
-    SnapshotBuilder,
+    CheckpointWriteResult, ChecksumWriteResult, CrcSource, IncrementalReplay, SnapshotBuilder,
 };
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{KernelError, KernelResult, Snapshot, Version};
@@ -391,15 +390,12 @@ async fn built_as_latest_is_inherited_by_derived_snapshots(
     // version is also considered built as latest.
     let base_is_latest = !base_snap_time_travel_to_latest || kind == TableKind::CatalogManaged;
     assert_eq!(base.is_built_as_latest(), base_is_latest);
-    let expected_source = if replay == IncrementalReplay::Unlimited {
-        CrcSource::Reconstructed {
-            num_commits: LATEST_VERSION,
-        }
+    let expected_provenance = if replay == IncrementalReplay::Unlimited {
+        CrcSource::Reconstructed { on_disk_version: 0 }
     } else {
-        CrcSource::Stale
+        CrcSource::Stale { on_disk_version: 0 }
     };
-    let expected_provenance = CrcProvenance::new(expected_source, Some(0));
-    assert_eq!(base.crc_provenance(), expected_provenance);
+    assert_eq!(base.crc_source(), expected_provenance);
 
     // checkpoint and write_checksum inherit the base's flag.
     let (ckpt_result, after_checkpoint) = base.checkpoint(engine.as_ref(), None)?;
@@ -409,26 +405,23 @@ async fn built_as_latest_is_inherited_by_derived_snapshots(
     let expected_checkpoint_provenance = if replay == IncrementalReplay::Unlimited {
         expected_provenance
     } else {
-        CrcProvenance::new(CrcSource::Unknown, None)
+        CrcSource::Unknown
     };
     assert_eq!(
-        after_checkpoint.crc_provenance(),
+        after_checkpoint.crc_source(),
         expected_checkpoint_provenance
     );
 
     let (crc_result, after_checksum) = after_checkpoint.write_checksum(engine.as_ref())?;
     assert_eq!(crc_result, ChecksumWriteResult::Written);
     assert_eq!(after_checksum.is_built_as_latest(), base_is_latest);
-    assert_eq!(
-        after_checksum.crc_provenance(),
-        CrcProvenance::new(CrcSource::AtVersion, Some(LATEST_VERSION)),
-    );
+    assert_eq!(after_checksum.crc_source(), CrcSource::AtVersion);
 
     // publish() (catalog-managed only) also inherits the base's flag.
     if kind == TableKind::CatalogManaged {
         let published = base.publish(engine.as_ref(), &TestCatalogCommitter)?;
         assert_eq!(published.is_built_as_latest(), base_is_latest);
-        assert_eq!(published.crc_provenance(), expected_provenance);
+        assert_eq!(published.crc_source(), expected_provenance);
     }
 
     // A post-commit snapshot is latest.
@@ -436,15 +429,12 @@ async fn built_as_latest_is_inherited_by_derived_snapshots(
     assert_eq!(post_commit.version(), 4);
     assert!(post_commit.is_built_as_latest());
     assert_eq!(
-        post_commit.crc_provenance(),
-        CrcProvenance::new(
-            if replay == IncrementalReplay::Unlimited {
-                CrcSource::Reconstructed { num_commits: 4 }
-            } else {
-                CrcSource::Stale
-            },
-            Some(0),
-        ),
+        post_commit.crc_source(),
+        if replay == IncrementalReplay::Unlimited {
+            CrcSource::Reconstructed { on_disk_version: 0 }
+        } else {
+            CrcSource::Stale { on_disk_version: 0 }
+        },
     );
 
     Ok(())

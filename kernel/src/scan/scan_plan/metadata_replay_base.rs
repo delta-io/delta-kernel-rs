@@ -64,7 +64,7 @@ mod tests {
     use crate::plans::Operation as PlanOperation;
     use crate::plans::ir::nodes::Operator;
     use crate::scan::scan_plan::tests::log_segment;
-    use crate::snapshot::CrcProvenance;
+    use crate::snapshot::CrcSource;
     use crate::unit_test_utils::load_test_table;
 
     #[rstest]
@@ -99,7 +99,7 @@ mod tests {
             segment,
             config,
             crc,
-            CrcProvenance::default(),
+            CrcSource::default(),
             false,
             false,
         )?);
@@ -152,7 +152,7 @@ mod tests {
             segment,
             config,
             crc,
-            CrcProvenance::default(),
+            CrcSource::default(),
             false,
             false,
         )?);

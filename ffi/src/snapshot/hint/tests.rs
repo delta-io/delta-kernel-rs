@@ -14,9 +14,7 @@ use delta_kernel::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
 use delta_kernel::log_segment::LogSegment;
 use delta_kernel::metrics::{MetricEvent, SnapshotLoadType};
 use delta_kernel::path::{LogPathFileType, ParsedLogPath};
-use delta_kernel::snapshot::{
-    CrcProvenance, CrcSource, IncrementalReplay, PublicationWatermark, Snapshot,
-};
+use delta_kernel::snapshot::{CrcSource, IncrementalReplay, PublicationWatermark, Snapshot};
 use delta_kernel::{FileMeta, FileSlice, KernelResult, KernelResultIterator, StorageHandler};
 use test_utils::table_builder::{LogState, TestTableBuilder};
 use test_utils::{
@@ -34,7 +32,7 @@ use crate::ffi_test_utils::{
     assert_extern_result_error_with_message, install_thread_local_metrics_reporter, ok_or_panic,
 };
 use crate::log_path::FfiLogPath;
-use crate::snapshot::snapshot_crc::snapshot_crc_provenance;
+use crate::snapshot::snapshot_crc::snapshot_crc_source;
 use crate::{
     FfiFileStats, FfiIncrementalReplay, FfiLogSegmentStats, KernelI64Slice, KernelStringSlice,
     OptionalValue, SharedExternEngine, engine_to_handle, free_engine, free_snapshot,
@@ -283,7 +281,7 @@ fn test_snapshot_hint(
         crc: std::ptr::null(),
         publication_watermark: FfiPublicationWatermark::InferFromLogPaths,
         checkpoint_type: std::ptr::null(),
-        crc_provenance: std::ptr::null(),
+        crc_source: std::ptr::null(),
     }
 }
 
@@ -1638,7 +1636,7 @@ fn aggregate_with_rejects_null_nonempty_log_path_array() {
         crc: std::ptr::null(),
         publication_watermark: FfiPublicationWatermark::InferFromLogPaths,
         checkpoint_type: std::ptr::null(),
-        crc_provenance: std::ptr::null(),
+        crc_source: std::ptr::null(),
     };
     let result = unsafe { snapshot_builder_with_snapshot_hint(builder, &hint) };
     assert_extern_result_error_contains(
@@ -2421,17 +2419,19 @@ fn build_rejects_internally_supplied_hint_for_existing_snapshot_builder() {
 }
 
 #[rstest::rstest]
-#[case::at_version(Some(2), CrcSource::AtVersion, Some(2))]
-#[case::reconstructed(Some(2), CrcSource::Reconstructed { num_commits: 2 }, Some(0))]
-#[case::missing(None, CrcSource::Missing, None)]
-#[case::unusable(None, CrcSource::Unusable, None)]
-#[case::unknown(Some(2), CrcSource::Unknown, None)]
-#[case::unknown_absent(None, CrcSource::Unknown, None)]
-#[case::inconsistent(Some(2), CrcSource::Missing, Some(7))]
+#[case::at_version(Some(2), CrcSource::AtVersion, CrcSource::AtVersion)]
+#[case::reconstructed(Some(2), CrcSource::Reconstructed { on_disk_version: 0 }, CrcSource::Reconstructed { on_disk_version: 0 })]
+#[case::missing(None, CrcSource::Missing, CrcSource::Missing)]
+#[case::unusable(None, CrcSource::Unusable, CrcSource::Unusable)]
+#[case::unknown(Some(2), CrcSource::Unknown, CrcSource::Unknown)]
+#[case::unknown_absent(None, CrcSource::Unknown, CrcSource::Unknown)]
+#[case::inconsistent(Some(2), CrcSource::Missing, CrcSource::Unknown)]
+#[case::future_disk_version(Some(2), CrcSource::Reconstructed { on_disk_version: 3 }, CrcSource::Unknown)]
+#[case::stale_at_version(Some(2), CrcSource::Stale { on_disk_version: 0 }, CrcSource::Unknown)]
 fn checksum_telemetry_round_trips_without_changing_hint_state(
     #[case] crc_version: Option<u64>,
     #[case] source: CrcSource,
-    #[case] base_version: Option<u64>,
+    #[case] expected: CrcSource,
 ) {
     // Given an upstream-valid hint with optional CRC telemetry.
     let engine = test_engine();
@@ -2443,11 +2443,10 @@ fn checksum_telemetry_round_trips_without_changing_hint_state(
     .map(|path| FfiLogPath::new(slice(path), 123, 456));
     let mut crc = empty_crc();
     crc.version = 2;
-    let provenance = CrcProvenance::new(source, base_version);
-    let ffi_provenance = provenance.into();
+    let ffi_provenance = source.into();
     let hint = FfiSnapshotHint {
         crc: crc_version.map_or(std::ptr::null(), |_| &crc),
-        crc_provenance: &ffi_provenance,
+        crc_source: &ffi_provenance,
         ..test_snapshot_hint(&paths, 2, FfiSnapshotHintFreshness::Unverified)
     };
 
@@ -2461,14 +2460,9 @@ fn checksum_telemetry_round_trips_without_changing_hint_state(
     let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
     let rebuilt = rebuild_through_visitor(&snapshot, &engine);
     let mut observed = std::mem::MaybeUninit::uninit();
-    unsafe { snapshot_crc_provenance(rebuilt.shallow_copy(), observed.as_mut_ptr()) };
+    unsafe { snapshot_crc_source(rebuilt.shallow_copy(), observed.as_mut_ptr()) };
 
     // Then telemetry survives, invalid claims become Unknown, and CRC presence is unchanged.
-    let expected = if base_version == Some(7) {
-        CrcProvenance::default()
-    } else {
-        provenance
-    };
     assert_eq!(unsafe { observed.assume_init() }, expected.into());
     let rebuilt_ref = unsafe { rebuilt.as_ref() };
     assert_eq!(

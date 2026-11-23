@@ -340,7 +340,7 @@ void compile_snapshot_hint_abi(void)
     .last_checkpoint = &last_checkpoint,
     .crc = &crc,
     .checkpoint_type = NULL,
-    .crc_provenance = NULL,
+    .crc_source = NULL,
   };
   ExternResultHandleExclusiveSnapshotBuilder (*with_snapshot_hint)(
       HandleExclusiveSnapshotBuilder, const FfiSnapshotHint*) =

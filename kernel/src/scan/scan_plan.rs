@@ -226,7 +226,7 @@ mod tests {
     use crate::scan::data_skipping::stats_schema::expected_stats_schema;
     use crate::scan::{PartitionValuesOptions, StatsOptions};
     use crate::schema::StructType;
-    use crate::snapshot::{CrcProvenance, Snapshot};
+    use crate::snapshot::{CrcSource, Snapshot};
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::{
         MockProtocolBuilder, MockTableConfigurationBuilder, create_log_path,
@@ -765,7 +765,7 @@ mod tests {
             segment,
             config,
             crc,
-            CrcProvenance::default(),
+            CrcSource::default(),
             false,
             false,
         )?)

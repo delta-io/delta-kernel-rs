@@ -25,7 +25,7 @@ use crate::engine::sync::SyncEngine;
 use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::path::ParsedLogPath;
-use crate::snapshot::{CrcProvenance, CrcSource, IncrementalReplay, SnapshotBuilder, SnapshotRef};
+use crate::snapshot::{CrcSource, IncrementalReplay, SnapshotBuilder, SnapshotRef};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::table_configuration::TableConfiguration;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1530,13 +1530,13 @@ async fn test_full_replay_across_two_commits_propagates_all_state() {
 // Commits 0-3 (target v3) with an optional CRC at `crc_version`.
 #[rstest]
 #[case::at_target_disabled(Some(3), false, IncrementalReplay::Disabled, CrcSource::AtVersion)]
-#[case::disabled_stale(Some(1), false, IncrementalReplay::Disabled, CrcSource::Stale)]
-#[case::up_to_zero(Some(1), false, IncrementalReplay::UpToCommits(0), CrcSource::Stale)]
-#[case::interior(Some(2), false, IncrementalReplay::UpToCommits(5), CrcSource::Reconstructed { num_commits: 1 })]
-#[case::at_budget(Some(1), false, IncrementalReplay::UpToCommits(2), CrcSource::Reconstructed { num_commits: 2 })]
-#[case::over_budget(Some(1), false, IncrementalReplay::UpToCommits(1), CrcSource::Stale)]
-#[case::unlimited(Some(0), false, IncrementalReplay::Unlimited, CrcSource::Reconstructed { num_commits: 3 })]
-#[case::unlimited_stale(Some(1), false, IncrementalReplay::Unlimited, CrcSource::Reconstructed { num_commits: 2 })]
+#[case::disabled_stale(Some(1), false, IncrementalReplay::Disabled, CrcSource::Stale { on_disk_version: 1 })]
+#[case::up_to_zero(Some(1), false, IncrementalReplay::UpToCommits(0), CrcSource::Stale { on_disk_version: 1 })]
+#[case::interior(Some(2), false, IncrementalReplay::UpToCommits(5), CrcSource::Reconstructed { on_disk_version: 2 })]
+#[case::at_budget(Some(1), false, IncrementalReplay::UpToCommits(2), CrcSource::Reconstructed { on_disk_version: 1 })]
+#[case::over_budget(Some(1), false, IncrementalReplay::UpToCommits(1), CrcSource::Stale { on_disk_version: 1 })]
+#[case::unlimited(Some(0), false, IncrementalReplay::Unlimited, CrcSource::Reconstructed { on_disk_version: 0 })]
+#[case::unlimited_stale(Some(1), false, IncrementalReplay::Unlimited, CrcSource::Reconstructed { on_disk_version: 1 })]
 #[case::missing(None, false, IncrementalReplay::Unlimited, CrcSource::Missing)]
 #[case::unusable(Some(3), true, IncrementalReplay::Unlimited, CrcSource::Unusable)]
 #[tokio::test]
@@ -1575,8 +1575,7 @@ async fn test_stale_crc_advanced_only_within_replay_budget(
         snapshot.crc_at_version().map(|c| c.version),
         expected_crc_version
     );
-    let expected = CrcProvenance::new(expected_source, crc_version.filter(|_| !corrupt_crc));
-    assert_eq!(snapshot.crc_provenance(), expected);
+    assert_eq!(snapshot.crc_source(), expected_source);
 
     // When the snapshot is rebuilt from its hint.
     let rebuilt = Snapshot::builder_for(built.url.clone())
@@ -1586,11 +1585,11 @@ async fn test_stale_crc_advanced_only_within_replay_budget(
     // Then hints preserve only at-version CRCs, as they do without telemetry.
     assert_eq!(rebuilt.base_crc(), snapshot.crc_at_version());
     assert_eq!(
-        rebuilt.crc_provenance(),
-        if expected_source == CrcSource::Stale {
-            CrcProvenance::default()
+        rebuilt.crc_source(),
+        if matches!(expected_source, CrcSource::Stale { .. }) {
+            CrcSource::default()
         } else {
-            expected
+            expected_source
         }
     );
 }

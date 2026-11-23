@@ -53,7 +53,7 @@ pub(super) fn visit(
     let checkpoint_view = checkpoint.as_ref().map(CheckpointBacking::as_ffi);
     let crc_view = crc.as_ref().map(CrcBacking::as_ffi);
     let checkpoint_type = hint.checkpoint_type().map(Into::into);
-    let crc_provenance = hint.crc_provenance().map(Into::into);
+    let crc_source = hint.crc_source().map(Into::into);
     let value = FfiSnapshotHint {
         version: hint.version(),
         freshness: match hint.freshness() {
@@ -67,7 +67,7 @@ pub(super) fn visit(
         crc: optional_pointer(crc_view.as_ref()),
         publication_watermark: hint.publication_watermark().into(),
         checkpoint_type: optional_pointer(checkpoint_type.as_ref()),
-        crc_provenance: optional_pointer(crc_provenance.as_ref()),
+        crc_source: optional_pointer(crc_source.as_ref()),
     };
     visitor(context, &value);
     Ok(())

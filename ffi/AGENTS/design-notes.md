@@ -186,7 +186,7 @@ pub struct FfiSnapshotHint {
     pub crc: *const FfiCrc,
     pub publication_watermark: FfiPublicationWatermark,
     pub checkpoint_type: *const FfiSelectedCheckpointType,
-    pub crc_provenance: *const FfiCrcProvenance,
+    pub crc_source: *const FfiCrcSource,
 }
 
 pub unsafe extern "C" fn snapshot_builder_with_snapshot_hint(

@@ -66,7 +66,7 @@ reports `Unknown` and does not affect whether the hint is accepted. CRC validati
 are independent of telemetry. See `FfiSnapshotHint` for the claim rules.
 
 Optional fields in `FfiSnapshotHint` use borrowed nullable pointers: `last_checkpoint`, `crc`,
-`checkpoint_type`, and `crc_provenance`. Null means absent. A null checkpoint type means unknown,
+`checkpoint_type`, and `crc_source`. Null means absent. A null checkpoint type means unknown,
 not that no checkpoint was selected. A supplied type is advisory; naming and protocol take
 precedence, and checkpoint discovery replaces it with the observed type.
 
@@ -94,10 +94,10 @@ the type is known from the checkpoint's naming, the table protocol, the snapshot
 discovery. Otherwise it resolves the type through the same snapshot cache as
 `snapshot_checkpoint_info` and declarative scan planning.
 
-`snapshot_crc_provenance(snapshot, out)` writes the retained `FfiCrcProvenance` without I/O. Its
-`FfiCrcSource` records what construction observed about checksum files (`AtVersion`,
-`Reconstructed { num_commits }`, `Stale`, `Missing`, `Unusable`, or `Unknown`), independently of
-whether file stats are available. Observations stay fixed after construction.
+`snapshot_crc_source(snapshot, out)` writes the retained `FfiCrcSource` without I/O. It records
+what construction observed about checksum files, independently of whether file stats are available.
+`Reconstructed` and `Stale` carry the original `on_disk_version`; see `CrcSource` for the variant
+semantics and how to derive the cumulative commit count. Observations stay fixed after construction.
 
 Snapshot accessors (`ffi/src/lib.rs`) include no-I/O reads such as `version` and
 `snapshot_file_stats`, which returns `OptionalValue<FfiFileStats>` (scalar

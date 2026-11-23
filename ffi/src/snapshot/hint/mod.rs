@@ -12,7 +12,7 @@ use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::log_path::LogPathArray;
 use crate::panic::catch_panic;
-use crate::snapshot::snapshot_crc::FfiCrcProvenance;
+use crate::snapshot::snapshot_crc::FfiCrcSource;
 use crate::{NullableCvoid, SharedExternEngine, SharedSnapshot};
 
 mod export;
@@ -105,12 +105,12 @@ pub struct FfiSnapshotHint {
     pub checkpoint_type: *const FfiSelectedCheckpointType,
     /// Optional checksum telemetry. Null means unknown. It does not change CRC validation,
     /// retention, or snapshot success. An inconsistent claim is reported as `Unknown`.
-    /// `Unknown` requires no base version. `Missing` and `Unusable` require no CRC or base
-    /// version. `AtVersion` requires CRC and base at `version`; `Reconstructed` requires an
-    /// at-version CRC, an older base, and `num_commits == version - base_version`.
+    /// `Missing` and `Unusable` require no CRC. `AtVersion` requires an at-version CRC;
+    /// `Reconstructed` requires an at-version CRC and an older `on_disk_version`.
+    /// `Stale` is inconsistent with hints, which only accept at-version CRCs.
     /// Export includes the observation, but omitting a stale CRC resets its provenance to
     /// `Unknown`.
-    pub crc_provenance: *const FfiCrcProvenance,
+    pub crc_source: *const FfiCrcSource,
 }
 
 fn invalid_with_source(message: impl Into<String>, source: KernelError) -> KernelError {
@@ -180,7 +180,9 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
         unsafe { value.checkpoint_type.as_ref() }
             .copied()
             .map(Into::into),
-        unsafe { value.crc_provenance.as_ref() }.map(FfiCrcProvenance::to_kernel),
+        unsafe { value.crc_source.as_ref() }
+            .copied()
+            .map(Into::into),
     )?;
     builder.snapshot_hint = Some(Box::new(snapshot_hint));
     Ok(())

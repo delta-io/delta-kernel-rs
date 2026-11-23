@@ -354,7 +354,7 @@ impl Snapshot {
         )?;
 
         tracing::Span::current().record("version", table_configuration.version());
-        let crc_provenance = super::snapshot_crc::SnapshotCrc::resolved_provenance(
+        let crc_source = super::snapshot_crc::SnapshotCrc::resolved_provenance(
             base_crc.as_ref(),
             base_origin,
             Some(&existing_snapshot.crc),
@@ -366,7 +366,7 @@ impl Snapshot {
             combined_log_segment,
             &table_configuration,
             crc_at_version.map(|(crc, _)| crc).or(base_crc),
-            crc_provenance,
+            crc_source,
         )?;
         let log_segment = current_segment
             .take()
@@ -695,7 +695,7 @@ mod tests {
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::LogPathFileType;
     use crate::schema::schema;
-    use crate::snapshot::{CheckpointWriteResult, CrcProvenance, CrcSource, commit};
+    use crate::snapshot::{CheckpointWriteResult, CrcSource, commit};
     use crate::unit_test_utils::{
         Action, CapturingReporter, install_thread_local_metrics_reporter, serialize_actions,
         string_array_to_engine_data,
@@ -1933,6 +1933,7 @@ mod tests {
         #[case] expected_base_version: Version,
         #[values(false, true)] skip_new_checkpoints: bool,
         #[values(false, true)] known_provenance: bool,
+        #[values(false, true)] stale_intermediate: bool,
     ) -> Result<()> {
         // Given an in-memory checksum reconstructed from disk version 1 through version 3.
         let ctx = setup_incremental_snapshot_test()?;
@@ -1951,8 +1952,8 @@ mod tests {
             .build(ctx.engine.as_ref())?;
         assert_eq!(snapshot_a.crc_at_version().map(|c| c.version), Some(3));
         assert_eq!(
-            snapshot_a.crc_provenance().source,
-            CrcSource::Reconstructed { num_commits: 2 }
+            snapshot_a.crc_source(),
+            CrcSource::Reconstructed { on_disk_version: 1 }
         );
         let snapshot_a = if known_provenance {
             snapshot_a
@@ -1961,10 +1962,35 @@ mod tests {
                 snapshot_a.log_segment().clone(),
                 snapshot_a.table_configuration().clone(),
                 snapshot_a.base_crc().cloned(),
-                CrcProvenance::default(),
+                CrcSource::default(),
                 false, /* built_as_latest */
                 false, /* skipped_new_checkpoints */
             )?)
+        };
+
+        // When an intermediate snapshot advances with CRC replay disabled, the retained CRC
+        // stays at version 3 while the snapshot moves to version 4.
+        let snapshot_a = if stale_intermediate {
+            let stale = Snapshot::builder_from(snapshot_a)
+                .at_version(4)
+                .with_incremental_crc_replay(IncrementalReplay::Disabled)
+                .build(ctx.engine.as_ref())?;
+
+            // Then the stale CRC keeps its disk origin, including an unknown origin.
+            assert_eq!(stale.version(), 4);
+            assert_eq!(stale.base_crc().map(|crc| crc.version), Some(3));
+            assert!(stale.crc_at_version().is_none());
+            assert_eq!(
+                stale.crc_source(),
+                if known_provenance {
+                    CrcSource::Stale { on_disk_version: 1 }
+                } else {
+                    CrcSource::Unknown
+                }
+            );
+            stale
+        } else {
+            snapshot_a
         };
 
         if let Some(corrupt) = new_disk_crc {
@@ -1988,25 +2014,34 @@ mod tests {
         };
         let updated = builder.build(ctx.engine.as_ref())?;
 
-        // Then a usable newer disk checksum establishes provenance; otherwise the retained
+        // Ignoring checkpoints lists only after the previous snapshot, so a CRC written at v4
+        // after the intermediate v4 snapshot was built is outside that listing range.
+        let listed_new_disk_crc =
+            new_disk_crc.filter(|_| !(skip_new_checkpoints && stale_intermediate));
+        let expected_base_version = if skip_new_checkpoints && stale_intermediate {
+            1
+        } else {
+            expected_base_version
+        };
+
+        // Then a listed, usable newer disk checksum establishes provenance; otherwise the retained
         // baseline's provenance, including Unknown, survives.
         assert_eq!(updated.version(), 5);
         assert_eq!(updated.crc_at_version().map(|c| c.version), expected_crc_v);
         assert_eq!(
-            updated.crc_provenance(),
-            if known_provenance || new_disk_crc == Some(false) {
-                CrcProvenance::new(
-                    if expected_crc_v.is_some() {
-                        CrcSource::Reconstructed {
-                            num_commits: updated.version() - expected_base_version,
-                        }
-                    } else {
-                        CrcSource::Stale
-                    },
-                    Some(expected_base_version),
-                )
+            updated.crc_source(),
+            if known_provenance || listed_new_disk_crc == Some(false) {
+                if expected_crc_v.is_some() {
+                    CrcSource::Reconstructed {
+                        on_disk_version: expected_base_version,
+                    }
+                } else {
+                    CrcSource::Stale {
+                        on_disk_version: expected_base_version,
+                    }
+                }
             } else {
-                CrcProvenance::default()
+                CrcSource::default()
             }
         );
         assert_eq!(
@@ -2016,7 +2051,7 @@ mod tests {
                 .latest_crc_file
                 .as_ref()
                 .map(|f| f.version),
-            Some(if new_disk_crc.is_some() { 4 } else { 1 })
+            Some(if listed_new_disk_crc.is_some() { 4 } else { 1 })
         );
 
         Ok(())

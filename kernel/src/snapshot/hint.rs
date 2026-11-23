@@ -13,7 +13,7 @@ use crate::log_path::LogPath;
 use crate::log_segment::{LogSegment, validate_catalog_version_bounds};
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::path::{DELTA_LOG_DIR_WITH_SLASH, ParsedLogPath};
-use crate::snapshot::{CrcProvenance, IncrementalReplay, SnapshotRef};
+use crate::snapshot::{CrcSource, IncrementalReplay, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::{require, try_parse_uri};
 use crate::{KernelError, KernelResult, Result, Snapshot, Version};
@@ -92,7 +92,7 @@ pub(crate) struct SnapshotHint {
     /// The spec of the checkpoint selected from `log_segment_files`, when the hint's source knew
     /// it. `None` means unknown, not that no checkpoint was selected.
     checkpoint_type: Option<SelectedCheckpointType>,
-    crc_provenance: Option<CrcProvenance>,
+    crc_source: Option<CrcSource>,
 }
 
 impl SnapshotHint {
@@ -115,7 +115,7 @@ impl SnapshotHint {
     /// `None` when unknown. It is used only when the checkpoint's naming and the table protocol do
     /// not decide the type, and the checkpoint's contents replace it once discovery reads them.
     ///
-    /// `crc_provenance` supplies optional telemetry. It never changes CRC selection or whether
+    /// `crc_source` supplies optional telemetry. It never changes CRC selection or whether
     /// the hint is accepted. An absent or inconsistent claim is reported as `Unknown`.
     ///
     /// # Errors
@@ -139,7 +139,7 @@ impl SnapshotHint {
         crc: Option<Arc<Crc>>,
         freshness: SnapshotHintFreshness,
         checkpoint_type: Option<SelectedCheckpointType>,
-        crc_provenance: Option<CrcProvenance>,
+        crc_source: Option<CrcSource>,
     ) -> KernelResult<Self> {
         let log_root = try_parse_uri(table_root)?.join(DELTA_LOG_DIR_WITH_SLASH)?;
         let mut parsed_paths: Vec<ParsedLogPath> = log_paths.into_iter().map(Into::into).collect();
@@ -172,7 +172,7 @@ impl SnapshotHint {
             crc,
             freshness,
             checkpoint_type,
-            crc_provenance,
+            crc_source,
         })
     }
 
@@ -196,8 +196,8 @@ impl SnapshotHint {
     /// Returns the supplied or captured checksum provenance, if present.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub(crate) fn crc_provenance(&self) -> Option<CrcProvenance> {
-        self.crc_provenance
+    pub(crate) fn crc_source(&self) -> Option<CrcSource> {
+        self.crc_source
     }
 
     /// Returns the version described by this hint.
@@ -283,7 +283,7 @@ impl SnapshotHint {
             metadata: snapshot.table_configuration().metadata().clone(),
             last_checkpoint_hint: last_checkpoint_hint.cloned(),
             crc: snapshot.crc_at_version().cloned(),
-            crc_provenance: Some(
+            crc_source: Some(
                 snapshot
                     .crc
                     .updated_provenance(snapshot.crc_at_version(), snapshot.version()),
@@ -354,7 +354,7 @@ impl SnapshotHint {
             crc,
             freshness,
             checkpoint_type,
-            crc_provenance,
+            crc_source,
         } = *self;
         let built_as_latest = freshness == SnapshotHintFreshness::Latest
             && max_catalog_version.is_none_or(|max| max <= version);
@@ -428,7 +428,7 @@ impl SnapshotHint {
             log_segment,
             table_configuration,
             crc,
-            crc_provenance.unwrap_or_default(),
+            crc_source.unwrap_or_default(),
             built_as_latest,
             false, /* skipped_new_checkpoints */
         )?;
@@ -592,7 +592,7 @@ mod tests {
             )?,
             snapshot.table_configuration().clone(),
             snapshot.crc_at_version().cloned(),
-            CrcProvenance::default(),
+            CrcSource::default(),
             false,
             false,
         )?;
@@ -703,7 +703,7 @@ mod tests {
             )?,
             snapshot.table_configuration().clone(),
             None,
-            CrcProvenance::default(),
+            CrcSource::default(),
             false,
             false,
         )?;
@@ -1505,7 +1505,7 @@ mod tests {
         let (engine, table_root, _snapshot, mut hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         if !with_telemetry {
-            hint.crc_provenance = None;
+            hint.crc_source = None;
         }
         let matching_crc = hint.crc.as_ref().unwrap().as_ref().clone();
 
