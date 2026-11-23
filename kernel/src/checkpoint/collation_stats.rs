@@ -597,12 +597,10 @@ mod tests {
             assert_eq!(add["path"], path);
             assert!(add["stats_parsed"].get(COLLATION_STATS).is_none());
             assert_eq!(add["stats_parsed"]["numRecords"], 2);
-            assert_eq!(add.get("stats").is_some(), write_json);
-            if write_json {
-                let stats: Value = serde_json::from_str(add["stats"].as_str().unwrap())
-                    .map_err(KernelError::from)?;
-                assert_json_contains(&stats[COLLATION_STATS], &active_bounds);
-            }
+            assert!(add.get("stats").is_some());
+            let stats: Value =
+                serde_json::from_str(add["stats"].as_str().unwrap()).map_err(KernelError::from)?;
+            assert_json_contains(&stats[COLLATION_STATS], &active_bounds);
         }
         Ok(())
     }
