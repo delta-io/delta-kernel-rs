@@ -109,16 +109,15 @@ use url::Url;
 mod builder;
 pub mod ir;
 pub mod proto;
-mod values;
 
 pub use builder::PlanBuilder;
 use bytes::Bytes;
 pub use ir::nodes::{RelationId, RelationRef};
 pub use ir::plan::Plan;
 pub use ir::{IoOperation, Operation};
-use itertools::Itertools;
 
 use crate::engine_data::TypedGetData as _;
+use crate::expressions::struct_rows::engine_rows;
 use crate::expressions::{ColumnName, TryFromStructRows, column_name};
 use crate::schema::{DataType, ToSchema};
 use crate::{
@@ -188,7 +187,7 @@ pub trait PlanExecutorExt: PlanExecutor {
     fn execute_plan_into<T: TryFromStructRows>(&self, plan: Plan) -> KernelResult<T> {
         let schema = <T::Row as ToSchema>::schema_ref();
         for field in schema.fields() {
-            values::ensure_supported(field)?;
+            engine_rows::ensure_supported(field)?;
         }
         if &plan.schema != schema {
             return Err(KernelError::invalid_struct_data(format!(
@@ -196,13 +195,7 @@ pub trait PlanExecutorExt: PlanExecutor {
                 plan.schema
             )));
         }
-        let columns = <T::Row as ToSchema>::leaf_columns();
-        T::collect_into(
-            self.execute_plan(plan)?
-                .into_data()?
-                .map(|batch| values::read_struct(batch?.as_ref(), schema, columns))
-                .flatten_ok(),
-        )
+        T::collect_batches(self.execute_plan(plan)?.into_data()?)
     }
 }
 

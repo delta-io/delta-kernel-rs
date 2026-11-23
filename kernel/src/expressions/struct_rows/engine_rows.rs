@@ -1,59 +1,39 @@
-//! Materializes engine batches as struct rows through existing leaf getters.
+//! Decodes engine batches one struct row at a time through existing leaf getters.
 
-use crate::engine_data::{EngineData, GetData, RowVisitor};
+use super::TryFromStructRows;
+use crate::engine_data::{GetData, RowVisitor};
 use crate::expressions::{ArrayData, MapData, Scalar, StructData};
-use crate::schema::{
-    ColumnName, ColumnNamesAndTypes, DataType, PrimitiveType, SchemaRef, StructField,
-};
+use crate::schema::{ColumnName, DataType, PrimitiveType, StructField, ToSchema};
 use crate::{KernelError, KernelResult};
 
-pub(super) fn read_struct(
-    batch: &dyn EngineData,
-    schema: &'static SchemaRef,
-    columns: &'static ColumnNamesAndTypes,
-) -> KernelResult<Vec<StructData>> {
-    let mut visitor = StructVisitor {
-        schema,
-        columns,
-        rows: Vec::new(),
-    };
-    visitor.visit_rows_of(batch)?;
-    Ok(visitor.rows)
+pub(super) struct StructVisitor<'a, T: TryFromStructRows> {
+    pub(super) state: &'a mut T::State,
 }
 
-struct StructVisitor {
-    schema: &'static SchemaRef,
-    columns: &'static ColumnNamesAndTypes,
-    rows: Vec<StructData>,
-}
-
-impl RowVisitor for StructVisitor {
+impl<T: TryFromStructRows> RowVisitor for StructVisitor<'_, T> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        self.columns.as_ref()
+        T::Row::leaf_columns().as_ref()
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
-        if getters.len() != self.columns.as_ref().0.len() {
+        if getters.len() != T::Row::leaf_columns().as_ref().0.len() {
             return Err(KernelError::missing_column(
                 "Expected one getter for each result leaf",
             ));
         }
-        self.rows = (0..row_count)
-            .map(|row| {
-                let values = self
-                    .schema
-                    .fields()
-                    .zip(getters)
-                    .map(|(field, getter)| read_scalar(*getter, row, field))
-                    .collect::<KernelResult<_>>()?;
-                StructData::try_new(self.schema.clone(), values)
-            })
-            .collect::<KernelResult<_>>()?;
-        Ok(())
+        let schema = T::Row::schema_ref();
+        (0..row_count).try_for_each(|row| {
+            let values = schema
+                .fields()
+                .zip(getters)
+                .map(|(field, getter)| read_scalar(*getter, row, field))
+                .collect::<KernelResult<_>>()?;
+            T::push(self.state, StructData::try_new(schema.clone(), values)?)
+        })
     }
 }
 
-pub(super) fn ensure_supported(field: &StructField) -> KernelResult<()> {
+pub(crate) fn ensure_supported(field: &StructField) -> KernelResult<()> {
     let supported = match field.data_type() {
         &DataType::BOOLEAN
         | &DataType::BYTE
@@ -153,27 +133,18 @@ fn read_scalar<'a>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, LazyLock};
-
-    use test_utils::generate_batch;
-
     use super::*;
-    use crate::arrow::array::{ArrayRef, Date32Array};
-    use crate::engine::arrow_data::ArrowEngineData;
-    use crate::schema::lazy_schema_ref;
+    use crate::arrow::array::Date32Array;
 
     #[test]
     fn dates_preserve_values_and_nulls() -> KernelResult<()> {
-        let values = Arc::new(Date32Array::from(vec![Some(-1), Some(0), None])) as ArrayRef;
-        static SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! { nullable "value": DATE };
-        static COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| SCHEMA.leaves(None));
-        ensure_supported(SCHEMA.field("value").unwrap())?;
-        let batch = generate_batch([("value", values)])?;
-        let rows = read_struct(&ArrowEngineData::new(batch), &SCHEMA, &COLUMNS)?;
+        let values = Date32Array::from(vec![Some(-1), Some(0), None]);
+        let field = StructField::nullable("value", DataType::DATE);
+        ensure_supported(&field)?;
         assert_eq!(
-            rows.into_iter()
-                .flat_map(|row| row.into_parts().1)
-                .collect::<Vec<_>>(),
+            (0..values.len())
+                .map(|row| read_scalar(&values, row, &field))
+                .collect::<KernelResult<Vec<_>>>()?,
             vec![
                 Scalar::Date(-1),
                 Scalar::Date(0),

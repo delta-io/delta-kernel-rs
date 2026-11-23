@@ -1,64 +1,137 @@
-//! Collection and cardinality rules for materialized struct rows.
+//! Collection and cardinality rules for struct rows.
 
 use delta_kernel_derive::internal_api;
 
 use super::StructData;
+#[cfg(feature = "declarative-plans")]
+use crate::KernelResultIterator;
+#[cfg(feature = "declarative-plans")]
+use crate::engine_data::{EngineData, RowVisitor as _};
 use crate::error::add_scalar_path_context;
 use crate::schema::ToSchema;
 use crate::{KernelError, KernelResult};
 
+#[cfg(feature = "declarative-plans")]
+pub(crate) mod engine_rows;
+
 /// Collects struct rows into a row, optional row, or vector.
 #[internal_api]
 pub(crate) trait TryFromStructRows: Sized {
-    /// The input row type whose schema is used for materialization.
+    /// The input row type whose schema is used for decoding.
     type Row: ToSchema + TryFrom<StructData, Error = KernelError>;
 
+    /// Accumulates rows until the output can be constructed.
+    type State;
+
+    /// Creates an empty accumulator.
+    fn new_state() -> Self::State;
+
+    /// Consumes the next row. Discard the accumulator if this returns an error.
+    fn push(state: &mut Self::State, row: StructData) -> KernelResult<()>;
+
+    /// Constructs the output, checking final row counts.
+    fn finish(state: Self::State) -> KernelResult<Self>;
+
     /// Collects fallible rows, stopping at the first decoding or cardinality error.
-    fn collect_into(rows: impl IntoIterator<Item = KernelResult<StructData>>)
-    -> KernelResult<Self>;
+    fn collect_into(
+        rows: impl IntoIterator<Item = KernelResult<StructData>>,
+    ) -> KernelResult<Self> {
+        let mut state = Self::new_state();
+        rows.into_iter()
+            .try_for_each(|row| Self::push(&mut state, row?))?;
+        Self::finish(state)
+    }
+
+    /// Decodes batches in order, stopping at the first source, decoding, or cardinality error.
+    /// Unsupported requested schemas are rejected even for empty streams.
+    #[cfg(feature = "declarative-plans")]
+    fn collect_batches(
+        mut batches: impl KernelResultIterator<Box<dyn EngineData>>,
+    ) -> KernelResult<Self> {
+        Self::Row::schema_ref()
+            .fields()
+            .try_for_each(engine_rows::ensure_supported)?;
+        let mut state = Self::new_state();
+        batches.try_for_each(|batch| {
+            let batch = batch?;
+            engine_rows::StructVisitor::<Self> { state: &mut state }.visit_rows_of(batch.as_ref())
+        })?;
+        Self::finish(state)
+    }
 }
 
 macro_rules! impl_row_result {
-    ($target:ty, |$rows:ident| $finish:expr) => {
+    ($target:ty, $state_type:ty, |$state:ident, $row:ident| $push:expr, |$output:ident| $finish:expr) => {
         impl<T: ToSchema + TryFrom<StructData, Error = KernelError>> TryFromStructRows for $target {
             type Row = T;
+            type State = $state_type;
 
-            fn collect_into(
-                rows: impl IntoIterator<Item = KernelResult<StructData>>,
-            ) -> KernelResult<Self> {
-                let mut $rows = decode_rows::<T>(rows);
+            fn new_state() -> Self::State {
+                Default::default()
+            }
+
+            fn push($state: &mut Self::State, $row: StructData) -> KernelResult<()> {
+                $push
+            }
+
+            fn finish($output: Self::State) -> KernelResult<Self> {
                 $finish
             }
         }
     };
 }
 
-impl_row_result!(T, |rows| match rows.next().transpose()? {
-    Some(value) if rows.next().transpose()?.is_none() => Ok(value),
-    value => Err(KernelError::scalar_conversion(
-        "exactly one row",
-        if value.is_some() {
-            "at least 2 rows"
-        } else {
-            "0 rows"
-        },
-    )),
-});
-impl_row_result!(Option<T>, |rows| match rows.next().transpose()? {
-    Some(_) if rows.next().transpose()?.is_some() => Err(KernelError::scalar_conversion(
-        "at most one row",
-        "at least 2 rows",
-    )),
-    value => Ok(value),
-});
-impl_row_result!(Vec<T>, |rows| rows.by_ref().collect());
+impl_row_result!(
+    T,
+    Option<T>,
+    |state, row| push_one(state, row, "exactly one row"),
+    |state| state.ok_or_else(|| KernelError::scalar_conversion("exactly one row", "0 rows"))
+);
+impl_row_result!(
+    Option<T>,
+    Option<T>,
+    |state, row| push_one(state, row, "at most one row"),
+    |state| Ok(state)
+);
+impl_row_result!(
+    Vec<T>,
+    Vec<T>,
+    |state, row| {
+        state.push(decode_row(row, state.len())?);
+        Ok(())
+    },
+    |state| Ok(state)
+);
 
+#[cfg(feature = "declarative-plans")]
 pub(crate) fn decode_rows<T: TryFrom<StructData, Error = KernelError>>(
     rows: impl IntoIterator<Item = KernelResult<StructData>>,
 ) -> impl Iterator<Item = KernelResult<T>> {
-    rows.into_iter().enumerate().map(|(index, row)| {
-        T::try_from(row?).map_err(|error| add_scalar_path_context(error, format!("[{index}]")))
-    })
+    rows.into_iter()
+        .enumerate()
+        .map(|(index, row)| decode_row(row?, index))
+}
+
+fn push_one<T: TryFrom<StructData, Error = KernelError>>(
+    state: &mut Option<T>,
+    row: StructData,
+    count_error: &str,
+) -> KernelResult<()> {
+    let value = decode_row(row, usize::from(state.is_some()))?;
+    if state.replace(value).is_some() {
+        return Err(KernelError::scalar_conversion(
+            count_error,
+            "at least 2 rows",
+        ));
+    }
+    Ok(())
+}
+
+fn decode_row<T: TryFrom<StructData, Error = KernelError>>(
+    row: StructData,
+    index: usize,
+) -> KernelResult<T> {
+    T::try_from(row).map_err(|error| add_scalar_path_context(error, format!("[{index}]")))
 }
 
 #[cfg(test)]

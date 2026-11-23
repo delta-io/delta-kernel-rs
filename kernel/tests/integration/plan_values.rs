@@ -13,7 +13,7 @@ use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
 use delta_kernel::delta_kernel_derive::{
     IntoStructData, ToSchema as DeriveToSchema, TryFromStructData,
 };
-use delta_kernel::engine::arrow_conversion::{TryIntoArrow, TryIntoKernel};
+use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::sync::plan::SyncPlanExecutor;
 use delta_kernel::expressions::{StructData, TryFromStructRows};
@@ -129,15 +129,7 @@ impl PlanExecutor for ResultExecutor {
 }
 
 fn execute_rows<T: TryFromStructRows>(batches: Vec<KernelResult<RecordBatch>>) -> KernelResult<T> {
-    let schema = batches
-        .iter()
-        .find_map(|batch| batch.as_ref().ok())
-        .map(|batch| -> KernelResult<SchemaRef> {
-            let schema: StructType = batch.schema().as_ref().try_into_kernel()?;
-            Ok(Arc::new(schema))
-        })
-        .unwrap_or_else(|| Ok(<T::Row as ToSchema>::schema_ref().clone()))?;
-    execute_result(data(batches), &schema)
+    execute_result(data(batches), <T::Row as ToSchema>::schema_ref())
 }
 
 fn execute_result<T: TryFromStructRows>(result: PlanResult, schema: &SchemaRef) -> KernelResult<T> {
@@ -234,10 +226,14 @@ fn custom_decoder_errors_stop_collection(
     #[values(1, 2)] count: usize,
     #[values(false, true)] split: bool,
     #[values(false, true)] valid_first: bool,
+    #[values(false, true)] invalid_later: bool,
 ) -> KernelResult<()> {
-    let mut ids = vec![-1; count];
+    let mut ids = vec![Some(-1); count];
     if valid_first {
-        ids.insert(0, 1);
+        ids.insert(0, Some(1));
+    }
+    if invalid_later {
+        ids.push(None);
     }
     let batches = if split {
         ids.into_iter().map(|id| vec![id]).collect()
@@ -245,11 +241,17 @@ fn custom_decoder_errors_stop_collection(
         vec![ids]
     }
     .into_iter()
-    .map(|ids| Ok(generate_batch([("id", ids.into_arrow_array())])?))
+    .map(|ids| {
+        Ok(generate_batch([(
+            "id",
+            Arc::new(Int32Array::from(ids)) as ArrayRef,
+        )])?)
+    })
     .collect();
     let error = decode(batches).unwrap_err();
     assert!(
-        matches!(error.without_backtrace(), KernelError::Generic(message) if message == "decoder rejected row")
+        matches!(error.without_backtrace(), KernelError::Generic(message) if message == "decoder rejected row"),
+        "{error:?}"
     );
     Ok(())
 }
