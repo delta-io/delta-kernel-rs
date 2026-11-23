@@ -1,5 +1,5 @@
-//! Checkpoint manifests and `_last_checkpoint` metadata over retained action/write-result
-//! relations.
+//! Checkpoint manifests and `_last_checkpoint` metadata over reconstructed actions and completed
+//! writes.
 //!
 //! Counts describe retained rows; byte sizes come from caller-supplied completed write results.
 //! V2 prefetch is bounded in the engine before returning to Kernel. Kernel serializes the hint
@@ -13,6 +13,8 @@ use serde::de::DeserializeOwned;
 mod write;
 
 use super::super::{CheckpointWriter, LastCheckpointHintStats, V2CheckpointConfig};
+#[cfg(test)]
+use crate::EngineData;
 use crate::actions::{CHECKPOINT_METADATA_FIELD, SIDECAR_FIELD, SIDECAR_FILE_SCHEMA_TAG, Sidecar};
 use crate::engine_data::TypedGetData as _;
 use crate::expressions::{
@@ -25,10 +27,10 @@ use crate::last_checkpoint_hint::{
 use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::plans::ir::nodes::Agg;
 use crate::plans::{Plan, RelationRef};
-use crate::schema::{
-    DataType, SchemaRef, StructField, StructType, ToSchema as _, lazy_schema_ref, schema,
-};
-use crate::{EngineData, FileMeta, GetData, KernelError, KernelResult, PlanBuilder, RowVisitor};
+#[cfg(test)]
+use crate::schema::StructField;
+use crate::schema::{DataType, SchemaRef, StructType, ToSchema as _, lazy_schema_ref, schema};
+use crate::{FileMeta, GetData, KernelError, KernelResult, PlanBuilder, RowVisitor};
 
 const NUM_ACTIONS: &str = "num_actions";
 const NUM_ADDS: &str = "num_of_add_files";
@@ -48,13 +50,6 @@ static STATISTICS_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 };
 
 impl CheckpointWriter {
-    /// Counts actions and adds in retained V1 checkpoint or V2 sidecar input rows.
-    /// Returns one row, including zero counts for empty input. Reuse the same retained input for
-    /// writing so counting does not repeat reconstruction or depend on output file boundaries.
-    pub fn declarative_checkpoint_counts_plan(actions: RelationRef) -> KernelResult<Plan> {
-        action_counts(PlanBuilder::relation_source(actions), true)?.build()
-    }
-
     /// Projects completed sidecar write results into sidecar actions.
     /// Input rows contain `path` relative to `_sidecars/`, `size` in bytes, and
     /// `file_modification` in milliseconds since the Unix epoch.
@@ -63,7 +58,7 @@ impl CheckpointWriter {
     }
 
     /// Builds the V2 manifest rows, including sidecar references and fresh checkpoint metadata.
-    /// `content_counts` is the retained result of [`Self::declarative_checkpoint_counts_plan`].
+    /// `content_counts` contains `num_actions` and `num_of_add_files` for the sidecar input.
     /// The engine combines these counts with completed sidecar sizes and constructs the metadata.
     /// `content_schema` is the sidecar input schema; its bounded JSON goes in `sidecarFileSchema`.
     /// No files are written: retain these rows for the manifest write and hint computation.
@@ -135,8 +130,7 @@ impl CheckpointWriter {
     /// Builds bounded V2 hint prefetch from the retained manifest rows.
     /// Each list is complete, including checkpointMetadata, or omitted when it exceeds the
     /// count threshold. The bound is enforced in the engine before any rows reach Kernel.
-    /// Return all output batches to [`Self::last_checkpoint_bytes`]; empty lists differ from
-    /// omitted lists. A null JSON row marks a complete list, even when the list is empty.
+    /// A null JSON row marks a complete list, keeping empty lists distinct from omitted lists.
     pub fn declarative_last_checkpoint_prefetch_plan(manifest: RelationRef) -> KernelResult<Plan> {
         let manifest = PlanBuilder::relation_source(manifest);
         let non_content = manifest.clone().filter(col!("sidecar.path").is_null())?;
@@ -166,141 +160,12 @@ impl CheckpointWriter {
         .build()
     }
 
-    /// Computes the three `_last_checkpoint` statistics from retained actions and write results.
-    ///
-    /// For V1, `checkpoint_actions` is the retained checkpoint input and both optional arguments
-    /// are absent. For V2, it is the retained manifest from
-    /// [`Self::declarative_v2_checkpoint_manifest_plan`]; supply `content_counts` from
-    /// [`Self::declarative_checkpoint_counts_plan`] and the completed sidecar descriptors,
-    /// including an empty relation when there are no sidecars.
-    ///
-    /// `root_file` contains exactly one row with `path` relative to the log directory, `size`,
-    /// and `file_modification`. Sidecars use the same schema, relative to `_sidecars/`.
-    /// Pass the single output row and root file metadata to [`Self::last_checkpoint_bytes`] only
-    /// after all referenced files have been successfully written.
-    pub fn declarative_last_checkpoint_statistics_plan(
-        &self,
-        checkpoint_actions: RelationRef,
-        root_file: RelationRef,
-        content_counts: Option<RelationRef>,
-        sidecars: Option<RelationRef>,
-    ) -> KernelResult<Plan> {
-        if self.schema_context.is_v2 != content_counts.is_some()
-            || content_counts.is_some() != sidecars.is_some()
-        {
-            return Err(KernelError::checkpoint_write(
-                "V2 checkpoint statistics require both content counts and sidecar write results",
-            ));
-        }
-        let mut counts = vec![action_counts(
-            PlanBuilder::relation_source(checkpoint_actions),
-            !self.schema_context.is_v2,
-        )?];
-        if let Some(content_counts) = content_counts {
-            counts.push(PlanBuilder::relation_source(content_counts));
-        }
-        checkpoint_totals(PlanBuilder::union_all(counts)?, sidecars, Some(root_file))?.build()
-    }
-
-    /// Serializes `_last_checkpoint` JSON from one aggregate row and the completed root file.
-    ///
-    /// `statistics` must be the single row from
-    /// [`Self::declarative_last_checkpoint_statistics_plan`]. `root_file` describes the
-    /// successfully written single-part checkpoint or V2 manifest. `checkpoint_schema` is the
-    /// actual root input schema. For a UUID V2 root, `prefetch` must contain every batch from
-    /// [`Self::declarative_last_checkpoint_prefetch_plan`]. Pass an empty iterator for classic
-    /// roots. Schema fields and prefetch lists use the size/count limits. The JSON checksum
-    /// covers all serialized fields. The returned bytes may be published only
-    /// after all referenced checkpoint files have been successfully written.
-    pub fn last_checkpoint_bytes(
-        &self,
-        statistics: &dyn EngineData,
-        root_file: &FileMeta,
-        checkpoint_schema: &SchemaRef,
-        prefetch: impl IntoIterator<Item = KernelResult<Box<dyn EngineData>>>,
-    ) -> KernelResult<Vec<u8>> {
-        let stats = read_statistics(statistics)?;
-        let root = ParsedLogPath::new(root_file.clone())
-            .ok_or_else(|| KernelError::checkpoint_write("Invalid checkpoint root file"))?;
-        let valid_format = match CheckpointInstance::of(&root) {
-            Some(CheckpointInstance::Classic) => true,
-            Some(CheckpointInstance::Uuid { .. }) => self.schema_context.is_v2,
-            _ => false,
-        };
-        if !valid_format
-            || root.version != self.snapshot.version()
-            || root_file.location != self.snapshot.log_segment().log_root.join(&root.filename)?
-        {
-            return Err(KernelError::checkpoint_write(
-                "Checkpoint root does not match this writer",
-            ));
-        }
-        let root_size = i64::try_from(root_file.size)
-            .map_err(|_| KernelError::checkpoint_write("Checkpoint root size exceeds i64"))?;
-        if stats.size_in_bytes < root_size
-            || (!self.schema_context.is_v2 && stats.size_in_bytes != root_size)
-        {
-            return Err(KernelError::checkpoint_write(
-                "Checkpoint byte count does not match root file",
-            ));
-        }
-        let uuid_root = matches!(
-            CheckpointInstance::of(&root),
-            Some(CheckpointInstance::Uuid { .. })
-        );
-        let mut v2 = LastCheckpointV2 {
-            path: root.filename.clone(),
-            size_in_bytes: Some(root_size),
-            modification_time: Some(root_file.last_modified),
-            sidecar_files: None,
-            non_file_actions: None,
-        };
-        for batch in prefetch {
-            v2.visit_rows_of(batch?.as_ref())?;
-        }
-        let parquet = root.filename.ends_with(".parquet");
-        let hint = LastCheckpointHint {
-            version: self.snapshot.version(),
-            size: stats.num_actions,
-            parts: None,
-            size_in_bytes: Some(stats.size_in_bytes),
-            num_of_add_files: Some(stats.num_of_add_files),
-            checkpoint_schema: if parquet && checkpoint_schema_json(checkpoint_schema)?.is_some() {
-                Some(checkpoint_schema.clone())
-            } else {
-                None
-            },
-            checksum: None,
-            tags: None,
-            v2_checkpoint: uuid_root.then_some(v2),
-            #[cfg(feature = "adaptive-metadata-in-dev")]
-            checkpoint_type: None,
-            #[cfg(feature = "adaptive-metadata-in-dev")]
-            amt_checkpoint: None,
-        };
-        // Also prefetch the file status for a singular classic checkpoint.
-        let mut file = CheckpointHintFile {
-            hint,
-            checkpoint_files: (!uuid_root).then(|| {
-                [serde_json::json!({
-                    "path": root.filename,
-                    "length": root_size,
-                    "isDir": false,
-                    "modificationTime": root_file.last_modified,
-                })]
-            }),
-        };
-        file.hint.checksum = Some(json_checksum::json_checksum(&serde_json::to_value(&file)?));
-        Ok(serde_json::to_vec(&file)?)
-    }
-}
-
-impl CheckpointWriter {
     fn serialize_checkpoint_hint(
         &self,
         stats: &LastCheckpointHintStats,
         root_file: &FileMeta,
         checkpoint_schema: SchemaRef,
+        mut v2: LastCheckpointV2,
     ) -> KernelResult<Vec<u8>> {
         if stats.num_actions < stats.num_of_add_files
             || stats.num_of_add_files < 0
@@ -312,10 +177,14 @@ impl CheckpointWriter {
         }
         let root = ParsedLogPath::new(root_file.clone())
             .ok_or_else(|| KernelError::checkpoint_write("Invalid checkpoint root file"))?;
-        if !matches!(
-            CheckpointInstance::of(&root),
-            Some(CheckpointInstance::Classic)
-        ) || root.version != self.snapshot.version()
+        let valid_format = match CheckpointInstance::of(&root) {
+            Some(CheckpointInstance::Classic) => true,
+            Some(CheckpointInstance::Uuid { .. }) => self.schema_context.is_v2,
+            _ => false,
+        };
+        if !valid_format
+            || root.extension != "parquet"
+            || root.version != self.snapshot.version()
             || root_file.location != self.snapshot.log_segment().log_root.join(&root.filename)?
         {
             return Err(KernelError::checkpoint_write(
@@ -324,11 +193,23 @@ impl CheckpointWriter {
         }
         let root_size = i64::try_from(root_file.size)
             .map_err(|_| KernelError::checkpoint_write("Checkpoint root size exceeds i64"))?;
-        if stats.size_in_bytes != root_size {
+        let has_sidecars = self.schema_context.is_v2
+            && matches!(
+                &self.v2_checkpoint_config,
+                V2CheckpointConfig::WithSidecar { .. }
+            );
+        if stats.size_in_bytes < root_size || (!has_sidecars && stats.size_in_bytes != root_size) {
             return Err(KernelError::checkpoint_write(
                 "Checkpoint byte count does not match root file",
             ));
         }
+        let uuid_root = matches!(
+            CheckpointInstance::of(&root),
+            Some(CheckpointInstance::Uuid { .. })
+        );
+        v2.path = root.filename.clone();
+        v2.size_in_bytes = Some(root_size);
+        v2.modification_time = Some(root_file.last_modified);
         let hint = LastCheckpointHint {
             version: self.snapshot.version(),
             size: stats.num_actions,
@@ -337,7 +218,7 @@ impl CheckpointWriter {
             num_of_add_files: Some(stats.num_of_add_files),
             checkpoint_schema: checkpoint_schema_json(&checkpoint_schema)?
                 .map(|_| checkpoint_schema),
-            checkpoint_files: Some(vec![CheckpointFileStatus {
+            checkpoint_files: (!uuid_root).then(|| vec![CheckpointFileStatus {
                 path: root.filename,
                 length: root_size,
                 is_dir: false,
@@ -345,7 +226,7 @@ impl CheckpointWriter {
             }]),
             checksum: None,
             tags: None,
-            v2_checkpoint: None,
+            v2_checkpoint: uuid_root.then_some(v2),
             #[cfg(feature = "adaptive-metadata-in-dev")]
             checkpoint_type: None,
             #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -388,6 +269,7 @@ impl RowVisitor for LastCheckpointHintStats {
     }
 }
 
+#[cfg(test)]
 fn action_counts(actions: PlanBuilder, includes_adds: bool) -> KernelResult<PlanBuilder> {
     let counts = actions.aggregate_ungrouped(|aggs| {
         let aggs = aggs.aggregate_as(Agg::count_star(), NUM_ACTIONS);
@@ -429,6 +311,7 @@ fn checkpoint_totals(
     })
 }
 
+#[cfg(test)]
 fn read_statistics(data: &dyn EngineData) -> KernelResult<LastCheckpointHintStats> {
     let mut stats = LastCheckpointHintStats {
         num_actions: 0,
@@ -455,6 +338,7 @@ fn sidecar_actions(sidecars: RelationRef) -> KernelResult<PlanBuilder> {
         Arc::new(schema! { (&SIDECAR_FIELD) }),
     )
 }
+
 fn checkpoint_schema_json(schema: &SchemaRef) -> KernelResult<Option<String>> {
     let json = serde_json::to_string(schema)?;
     Ok((json.encode_utf16().count() <= CHECKPOINT_SCHEMA_THRESHOLD).then_some(json))
@@ -537,4 +421,4 @@ fn collect_prefetch<T: DeserializeOwned>(
 mod tests;
 
 #[cfg(test)]
-mod v1_tests;
+mod v2_tests;
