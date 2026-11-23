@@ -1,4 +1,5 @@
 use delta_kernel_derive::internal_api;
+use itertools::Itertools;
 use url::Url;
 
 use crate::commit_range::CommitRange;
@@ -281,7 +282,6 @@ impl CommitRangeBuilder {
         max_catalog_version: Option<Version>,
     ) -> KernelResult<(Vec<ParsedLogPath>, Version, Option<Version>)> {
         let tail_start = log_tail.first().map(|file| file.version);
-        let mut commit_files = Vec::new();
         let mut first_version_after_end = None;
         let storage = engine.storage_handler();
         let files = list_delta_log_from_storage(
@@ -311,19 +311,22 @@ impl CommitRangeBuilder {
                 })
                 .map(Ok),
         );
-        for file in files {
-            let file = file?;
-            let version = file.version;
-            if configured_end_version.is_some_and(|end| version > end) {
-                first_version_after_end = Some(version);
-                break;
-            }
-            commit_files.push(file);
+        let commit_files = files
+            // A commit past the end stops the listing and is kept as gap evidence.
+            .take_while(|file| match file {
+                Ok(file) if configured_end_version.is_some_and(|end| file.version > end) => {
+                    first_version_after_end = Some(file.version);
+                    false
+                }
+                _ => true,
+            })
             // A range that reaches its end needs no later commit as gap evidence.
-            if configured_end_version == Some(version) {
-                break;
-            }
-        }
+            .take_while_inclusive(|file| {
+                !file
+                    .as_ref()
+                    .is_ok_and(|file| configured_end_version == Some(file.version))
+            })
+            .collect::<KernelResult<Vec<_>>>()?;
         let end_version = configured_end_version
             .or_else(|| commit_files.last().map(|file| file.version))
             .unwrap_or(start_version);
