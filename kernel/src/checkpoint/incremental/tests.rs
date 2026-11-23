@@ -625,24 +625,33 @@ fn single_checkpoint_success(reporter: &CapturingReporter) -> CheckpointWriteSuc
 }
 
 #[rstest]
-#[case::append(vec![vec![create_add_action("D")]], true, false, vec!["A", "B", "D"])]
+#[case::append(vec![vec![create_add_action("D")]], true, false, vec!["A", "B", "D"], vec![])]
 #[case::tail_compaction(
     vec![vec![create_add_action("D")],
-         vec![create_remove_action("D"), create_add_action("E")]],
+         vec![
+             Action::Remove(crate::actions::Remove {
+                 path: "D".into(), deletion_timestamp: Some(i64::MAX), data_change: false,
+                 ..Default::default()
+             }),
+             Action::Add(Add { path: "E".into(), data_change: false, ..Default::default() }),
+             commit_info(Some("OPTIMIZE")),
+         ]],
     true,
     false,
-    vec!["A", "B", "E"]
+    vec!["A", "B", "E"],
+    vec![("D", Some(i64::MAX))]
 )]
 #[case::inherited_remove(
     vec![vec![create_remove_action("A"), create_add_action("D")]],
     false,
     false,
-    vec!["B", "D"]
+    vec!["B", "D"],
+    vec![("A", Some(i64::MAX))]
 )]
 #[case::expired_inherited_remove(
     vec![vec![Action::Remove(crate::actions::Remove {
         path: "A".into(), deletion_timestamp: Some(0), ..Default::default()
-    })]], false, false, vec!["B"]
+    })]], false, false, vec!["B"], vec![]
 )]
 #[case::metadata_readd(
     vec![vec![Action::Add(Add {
@@ -653,23 +662,26 @@ fn single_checkpoint_success(reporter: &CapturingReporter) -> CheckpointWriteSuc
     })]],
     false,
     false,
-    vec!["A", "B"]
+    vec!["A", "B"],
+    vec![]
 )]
 #[case::inherited_tombstone_readd(
     vec![vec![create_add_action("old")]],
     false,
     true,
-    vec!["A", "B", "old"]
+    vec!["A", "B", "old"],
+    vec![]
 )]
-#[case::metadata_change(vec![vec![create_metadata_action()]], false, false, vec!["A", "B"])]
-#[case::txn_only(vec![vec![txn(1)]], true, false, vec!["A", "B"])]
-#[case::base_tombstone(vec![vec![txn(1)]], false, true, vec!["A", "B"])]
+#[case::metadata_change(vec![vec![create_metadata_action()]], false, false, vec!["A", "B"], vec![])]
+#[case::txn_only(vec![vec![txn(1)]], true, false, vec!["A", "B"], vec![])]
+#[case::base_tombstone(vec![vec![txn(1)]], false, true, vec!["A", "B"], vec![("old", Some(i64::MAX))])]
 #[tokio::test]
 async fn all_or_nothing_reuses_only_unchanged_base(
     #[case] commits: Vec<Vec<Action>>,
     #[case] expect_reuse: bool,
     #[case] base_tombstone: bool,
     #[case] expected_active: Vec<&str>,
+    #[case] expected_removed: Vec<(&str, Option<i64>)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
@@ -709,6 +721,16 @@ async fn all_or_nothing_reuses_only_unchanged_base(
         .collect();
     active.sort_unstable();
     assert_eq!(active, expected_active);
+    let mut removed: Vec<_> = leaves
+        .iter()
+        .filter_map(|row| {
+            row["remove"]["path"]
+                .as_str()
+                .map(|path| (path, row["remove"]["deletionTimestamp"].as_i64()))
+        })
+        .collect();
+    removed.sort_unstable();
+    assert_eq!(removed, expected_removed);
     assert_hint_counts(&store, version).await;
     let fresh = Snapshot::builder_for("memory:///").build(&engine)?;
     assert_eq!(fresh.log_segment().checkpoint_version, Some(version));
@@ -1883,12 +1905,20 @@ async fn base_gate_uses_original_sidecar_timestamps_without_sidecar_reads(
         .build(&engine)?
         .create_checkpoint_writer(&engine)?;
     let guarded = guarded_engine(store, &inherited)?;
-    assert_eq!(
-        writer
-            .read_reusable_base(&guarded, &super::CheckpointMetrics::disabled(), 172_801_000,)?
-            .is_some(),
-        eligible
-    );
+    let reusable =
+        writer.read_reusable_base(&guarded, &super::CheckpointMetrics::disabled(), 172_801_000);
+    if modification_time.is_none() {
+        // The protocol requires this field; malformed sidecar actions fail decoding.
+        assert!(
+            reusable
+                .err()
+                .expect("missing sidecar timestamp must fail decoding")
+                .to_string()
+                .contains("modificationTime")
+        );
+    } else {
+        assert_eq!(reusable?.is_some(), eligible);
+    }
     Ok(())
 }
 
