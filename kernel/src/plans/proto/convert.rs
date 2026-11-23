@@ -241,7 +241,7 @@ impl From<&WriteJson> for proto_plan::WriteJsonNode {
 impl From<&WriteParquet> for proto_plan::WriteParquetNode {
     fn from(node: &WriteParquet) -> Self {
         Self {
-            schema: Some(node.schema.as_ref().into()),
+            output_schema: Some(node.output_schema.as_ref().into()),
             file_path: node.file_path.to_string(),
             overwrite: node.overwrite,
             ordered: node.ordered,
@@ -1563,10 +1563,10 @@ mod tests {
                 } else {
                     FILE_META_SCHEMA.as_ref().clone()
                 };
-                assert_eq!(write.schema.as_ref(), &expected);
-                assert_eq!(write.schema, plan.schema);
+                assert_eq!(write.output_schema.as_ref(), &expected);
+                assert_eq!(write.output_schema, plan.schema);
                 let proto = proto_plan::WriteParquetNode::from(write);
-                assert_eq!(proto.schema, Some((&expected).into()));
+                assert_eq!(proto.output_schema, Some((&expected).into()));
                 let expected_stats = if with_stats {
                     vec![proto_plan::write_parquet_node::StatsAgg {
                         name: "row_count".into(),

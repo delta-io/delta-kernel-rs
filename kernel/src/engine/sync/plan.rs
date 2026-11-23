@@ -335,7 +335,7 @@ impl SyncPlanExecutor {
         } else {
             eval_aggregate(&write.to_aggregate()?, &input)?
         };
-        let output_schema = Arc::new(write.schema.as_ref().try_into_arrow()?);
+        let output_schema = Arc::new(write.output_schema.as_ref().try_into_arrow()?);
         let schema: Arc<ArrowSchema> = Arc::new(write.write_schema.as_ref().try_into_arrow()?);
         let options = data_file_writer_options(&schema, &write.write_schema)?;
         // Input order is preserved even when `ordered` is false.

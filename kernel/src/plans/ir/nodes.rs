@@ -136,12 +136,13 @@ pub struct WriteJson {
 /// replacing the destination.
 #[derive(Debug, Clone)]
 pub struct WriteParquet {
-    /// Output schema resolved by
+    /// Output schema of the relation containing file descriptors (`location`, `size`,
+    /// `last_modified`) and configured aggregate statistics, resolved by
     /// [`PlanBuilder::write_parquet`](crate::PlanBuilder::write_parquet).
-    pub schema: SchemaRef,
+    pub output_schema: SchemaRef,
     /// Named aggregate statistics over all input rows, in output-column order.
     pub stats_agg: Vec<StatsAgg>,
-    /// Physical schema of all input columns, including file metadata.
+    /// Schema of the rows written to Parquet, including Parquet field metadata.
     pub write_schema: SchemaRef,
     /// Fully qualified URL of the destination file.
     pub file_path: Url,
@@ -155,7 +156,7 @@ impl WriteParquet {
     /// Configures a single-file write with no statistics, overwrite, or input ordering.
     pub fn new(write_schema: SchemaRef, file_path: Url) -> Self {
         Self {
-            schema: FILE_META_SCHEMA.clone(),
+            output_schema: FILE_META_SCHEMA.clone(),
             stats_agg: Vec::new(),
             write_schema,
             file_path,
@@ -192,7 +193,7 @@ impl WriteParquet {
         Ok(Aggregate {
             group_by: vec![],
             aggs,
-            schema: self.schema.project(&names)?,
+            schema: self.output_schema.project(&names)?,
         })
     }
 }

@@ -392,8 +392,8 @@ impl PlanBuilder {
                 }
             }
         }
-        write.schema = Arc::new(FILE_META_SCHEMA.add(stats_schema.fields().cloned())?);
-        Ok(Self::present(write.schema.clone(), write, present))
+        write.output_schema = Arc::new(FILE_META_SCHEMA.add(stats_schema.fields().cloned())?);
+        Ok(Self::present(write.output_schema.clone(), write, present))
     }
 
     /// Keep rows where `predicate` holds. Output schema is unchanged. See [`Filter`].
