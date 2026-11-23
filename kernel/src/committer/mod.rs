@@ -29,20 +29,25 @@
 mod commit_types;
 #[cfg(feature = "declarative-plans")]
 mod declarative;
+mod discovery;
 mod filesystem;
 mod publish_types;
+mod winning_commits;
 
-pub use commit_types::{CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType};
+pub use commit_types::{
+    CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, WinningCommit,
+};
 #[cfg(feature = "declarative-plans")]
 pub use declarative::write_commit_json_declarative;
+pub use discovery::list_published_commits_and_merge_ratified_tail;
 pub use filesystem::FileSystemCommitter;
 pub use publish_types::{CatalogCommit, PublishMetadata};
+use url::Url;
+pub use winning_commits::WinningCommits;
 
 #[cfg(feature = "declarative-plans")]
-use crate::KernelError;
-#[cfg(feature = "declarative-plans")]
 use crate::plans::{RelationRef, ScopedPlanExecutor};
-use crate::{Engine, FilteredEngineData, KernelResult, KernelResultIterator};
+use crate::{Engine, FilteredEngineData, KernelError, KernelResult, KernelResultIterator, Version};
 
 /// A Committer is the system by which transactions are committed to a table. Transactions are
 /// effectively a collection of actions performed on the table at a specific version. The kernel
@@ -90,6 +95,25 @@ pub trait Committer: Send {
     ) -> KernelResult<CommitResponse> {
         Err(KernelError::unsupported(
             "This committer does not support declarative commits",
+        ))
+    }
+
+    /// Fetches accepted commits starting at a confirmed conflict's rejected version.
+    ///
+    /// Return nonempty, ascending, contiguous individual commits through an observed latest
+    /// version. Catalog implementations must combine published files with ratified catalog
+    /// commits, excluding unratified proposals. Missing history is an error, including history
+    /// covered only by a checkpoint. This call does not submit or retry a commit.
+    ///
+    /// The default implementation returns [`KernelError::Unsupported`].
+    fn get_winning_commits(
+        &self,
+        _engine: &dyn Engine,
+        _table_root: &Url,
+        _conflict_version: Version,
+    ) -> KernelResult<WinningCommits> {
+        Err(KernelError::unsupported(
+            "This committer does not support winning commit discovery",
         ))
     }
 

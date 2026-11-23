@@ -8,7 +8,7 @@ use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::path::LogRoot;
 #[cfg(any(test, feature = "test-utils"))]
 use crate::schema::schema_ref;
-use crate::{KernelResult, Version};
+use crate::{KernelResult, LogPath, Version};
 
 /// The type of commit operation being performed. This communicates to the committer whether this
 /// is a table creation or a write to an existing table, and whether the table is catalog-managed.
@@ -343,6 +343,17 @@ impl CommitMetadata {
             .push(DomainMetadata::new(domain.to_string(), String::new()));
         self
     }
+}
+
+/// One accepted winning commit, identified by its version and actual log file location.
+///
+/// Catalog committers may return ratified staged files that have not yet been published.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WinningCommit {
+    /// The version accepted by the table.
+    pub version: Version,
+    /// The published or catalog-ratified staged commit file.
+    pub log_path: LogPath,
 }
 
 /// `CommitResponse` is the result of committing a transaction via a catalog. The committer uses
