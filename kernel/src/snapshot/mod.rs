@@ -52,11 +52,11 @@ use crate::log_segment::LastManifestCommitResolution;
 use crate::log_segment::{
     DomainMetadataMap, LogSegment, PmResolution, scan_domain_metadata_actions,
 };
-#[cfg(feature = "declarative-plans")]
-use crate::metrics::CheckpointMetrics;
 use crate::metrics::events::{
     CHECKSUM_WRITE_SPAN, DOMAIN_METADATA_LOADED_SPAN, SET_TRANSACTION_LOADED_SPAN,
 };
+#[cfg(feature = "declarative-plans")]
+use crate::metrics::{CheckpointMetrics, CheckpointSource};
 use crate::metrics::{
     CheckpointWriteMode, CheckpointWriteOutcome, ChecksumWriteOutcome, ChecksumWriteResolutionMode,
     MetricId, SnapshotLoadMetricContext, emit_protocol_metadata_load,
@@ -412,7 +412,9 @@ impl Snapshot {
         })();
         if let Some(metrics) = &mut metrics {
             metrics.checkpoint_type = checkpoint_type;
-            metrics.cache_hit = Some(cache_hit);
+            if cache_hit {
+                metrics.source = CheckpointSource::SnapshotCache;
+            }
             metrics.info = result.as_ref().ok().cloned().flatten();
         }
         CheckpointResolveResult { result, metrics }

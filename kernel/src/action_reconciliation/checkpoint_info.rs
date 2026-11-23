@@ -16,7 +16,7 @@ use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{ColumnName, Predicate, col};
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
 use crate::log_segment::LogSegment;
-use crate::metrics::CheckpointMetrics;
+use crate::metrics::{CheckpointMetrics, CheckpointSource};
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::plans::ir::nodes::FileType;
 use crate::plans::{Operation, PlanBuilder, PlanExecutor};
@@ -67,6 +67,18 @@ impl CheckpointInfo {
             ..Default::default()
         });
         let result = Self::resolve_inner(exec, segment, &mut metrics);
+        if let Some(metrics) = &mut metrics {
+            metrics.source = if metrics.root_footer_calls != 0
+                || metrics.sidecar_footer_calls != 0
+                || metrics.metadata_query_calls != 0
+            {
+                CheckpointSource::Resolved
+            } else if segment.checkpoint_hint().is_some() {
+                CheckpointSource::LastCheckpoint
+            } else {
+                CheckpointSource::None
+            };
+        }
         tracing::Span::current().record("metrics", tracing::field::debug(&metrics));
         if let Err(error) = &result {
             tracing::error!(error = %error);

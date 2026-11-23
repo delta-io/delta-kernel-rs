@@ -5,6 +5,21 @@ use std::sync::Arc;
 use crate::Version;
 use crate::checkpoint::{CheckpointInfo, SelectedCheckpointType};
 
+/// Checkpoint discovery path reached by an attempt, independently of success or failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CheckpointSource {
+    /// No discovery source was reached.
+    #[default]
+    None,
+    /// Completed checkpoint information was reused from the snapshot cache.
+    SnapshotCache,
+    /// Applicable `_last_checkpoint` metadata was used without checkpoint I/O.
+    LastCheckpoint,
+    /// At least one checkpoint footer or metadata-query invocation was attempted.
+    /// Applicable hint metadata may also have been used.
+    Resolved,
+}
+
 /// Checkpoint selection and work observed during one planning attempt.
 #[derive(Debug, Clone, Default)]
 pub struct CheckpointMetrics {
@@ -14,8 +29,8 @@ pub struct CheckpointMetrics {
     pub checkpoint_type: Option<SelectedCheckpointType>,
     /// Shared resolved information, absent if discovery failed.
     pub info: Option<Arc<CheckpointInfo>>,
-    /// Whether discovery reused the snapshot cache.
-    pub cache_hit: Option<bool>,
+    /// Discovery path reached by this attempt.
+    pub source: CheckpointSource,
     /// Root-footer engine invocations in this attempt.
     pub root_footer_calls: u64,
     /// Sidecar-footer engine invocations in this attempt.
