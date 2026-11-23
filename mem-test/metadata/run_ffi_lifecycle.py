@@ -11,16 +11,16 @@ import tempfile
 
 def main():
     root = Path(__file__).resolve().parents[2]
-    target = Path(os.environ.get("KERNEL_MEMORY_TARGET", root / "target"))
+    target = Path(os.environ.get("KERNEL_MEMORY_TARGET", root / "target")).resolve()
     subprocess.run(
-        ["cargo", "+1.100.0", "build", "--offline", "--locked", "-p", "delta_kernel_ffi",
+        ["cargo", "+1.95.0", "build", "--offline", "--locked", "-p", "delta_kernel_ffi",
          "--features", "declarative-plans,vendored-protoc", "--target-dir", str(target)],
-        cwd=root, check=True,
+        cwd=root, env=dict(os.environ, CARGO_TARGET_DIR=str(target)), check=True,
     )
     executable = target / "ffi-limited-lifecycle"
     subprocess.run(
         [os.environ.get("CC", "cc"), "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread",
-         "-I", str(root / "target" / "ffi-headers"), str(Path(__file__).with_name("ffi_lifecycle.c")),
+         "-I", str(target), str(Path(__file__).with_name("ffi_lifecycle.c")),
          "-L", str(target / "debug"), "-ldelta_kernel_ffi",
          f"-Wl,-rpath,{target / 'debug'}", "-o", str(executable)],
         cwd=root, check=True,

@@ -1,7 +1,10 @@
-use std::alloc::{AllocError, Allocator, Layout};
+use std::alloc::{GlobalAlloc, Layout};
 use std::process::Command;
 use std::sync::{Arc, Barrier};
 
+use allocator_api2::alloc::Allocator;
+
+use super::allocator::ContainerAllocator;
 use super::*;
 use crate::expressions::{Expression, Predicate, lit};
 use crate::scan::PhysicalPredicate;
@@ -66,7 +69,7 @@ fn singleton_allocator_tracks_unlimited_then_enforces_and_reconfigures() {
 fn allocator_zeroed_growth_shrink_alignment_and_backing_failure() {
     isolated(|| {
         let baseline = KERNEL_ALLOCATOR.usage().reserved;
-        let allocator = KERNEL_ALLOCATOR;
+        let allocator = ContainerAllocator;
         let a = Layout::from_size_align(64, 64).unwrap();
         let b = Layout::from_size_align(128, 64).unwrap();
         let allocation = allocator.allocate_zeroed(a).unwrap();
@@ -74,35 +77,76 @@ fn allocator_zeroed_growth_shrink_alignment_and_backing_failure() {
         unsafe {
             assert!(allocation.as_ref().iter().all(|byte| *byte == 0));
             allocation.cast::<u8>().as_ptr().write(23);
-            allocator.set_limit(Some(baseline + 128)).unwrap();
+            KERNEL_ALLOCATOR.set_limit(Some(baseline + 128)).unwrap();
             assert!(allocator.grow(allocation.cast(), a, b).is_err());
             assert_eq!(allocation.cast::<u8>().as_ptr().read(), 23);
-            assert_eq!(allocator.usage().reserved, baseline + 64);
-            allocator.set_limit(Some(baseline + 192)).unwrap();
+            assert_eq!(KERNEL_ALLOCATOR.usage().reserved, baseline + 64);
+            KERNEL_ALLOCATOR.set_limit(Some(baseline + 192)).unwrap();
             let grown = allocator.grow_zeroed(allocation.cast(), a, b).unwrap();
             assert_eq!(grown.cast::<u8>().as_ptr().read(), 23);
             assert!(grown.as_ref()[64..].iter().all(|byte| *byte == 0));
             let shrunk = allocator.shrink(grown.cast(), b, a).unwrap();
             assert_eq!(shrunk.cast::<u8>().as_ptr().read(), 23);
-            assert_eq!(allocator.usage().reserved, baseline + 64);
+            assert_eq!(KERNEL_ALLOCATOR.usage().reserved, baseline + 64);
             allocator.deallocate(shrunk.cast(), a);
         }
-        allocator.set_limit(None).unwrap();
-        let rejected = allocator.usage().rejected;
-        assert!(allocator.allocate_with(a, |_| Err(AllocError)).is_err());
-        assert_eq!(allocator.usage().reserved, baseline);
-        assert_eq!(allocator.usage().rejected, rejected);
+        KERNEL_ALLOCATOR.set_limit(None).unwrap();
+        let rejected = KERNEL_ALLOCATOR.usage().rejected;
+        assert!(
+            KERNEL_ALLOCATOR
+                .allocate_with(a, |_| std::ptr::null_mut())
+                .is_null()
+        );
+        assert_eq!(KERNEL_ALLOCATOR.usage().reserved, baseline);
+        assert_eq!(KERNEL_ALLOCATOR.usage().rejected, rejected);
         let aligned = Layout::from_size_align(256, 4096).unwrap();
         let allocation = allocator.allocate(aligned).unwrap();
         assert_eq!(allocation.cast::<u8>().as_ptr().addr() % 4096, 0);
         unsafe {
-            KERNEL_ALLOCATOR.deallocate(allocation.cast(), aligned);
+            allocator.deallocate(allocation.cast(), aligned);
         }
-        assert_eq!(allocator.usage().reserved, baseline);
+        assert_eq!(KERNEL_ALLOCATOR.usage().reserved, baseline);
+        KERNEL_ALLOCATOR.set_limit(Some(baseline)).unwrap();
+        let zero = Layout::from_size_align(0, 4096).unwrap();
+        let allocation = allocator.allocate_zeroed(zero).unwrap();
+        assert_eq!(allocation.cast::<u8>().as_ptr().addr() % 4096, 0);
+        assert_eq!(KERNEL_ALLOCATOR.usage().reserved, baseline);
+        // SAFETY: The zero-size allocation and its layout come from this adapter.
+        unsafe { allocator.deallocate(allocation.cast(), zero) };
         assert_eq!(
             MetadataVec::<u64>::new().try_reserve_exact(usize::MAX),
             Err(MemoryError::CapacityOverflow)
         );
+    });
+}
+
+#[test]
+fn global_alloc_backend_rejects_reallocation_without_losing_the_original_block() {
+    isolated(|| {
+        let baseline = KERNEL_ALLOCATOR.usage().reserved;
+        let layout = Layout::from_size_align(64, 64).unwrap();
+        KERNEL_ALLOCATOR.set_limit(Some(baseline + 128)).unwrap();
+        // SAFETY: The layout is nonzero. Every successful allocation is released with its layout.
+        unsafe {
+            let pointer = KERNEL_ALLOCATOR.alloc_zeroed(layout);
+            assert!(!pointer.is_null());
+            assert!(
+                std::slice::from_raw_parts(pointer, 64)
+                    .iter()
+                    .all(|&b| b == 0)
+            );
+            pointer.write(23);
+            assert!(KERNEL_ALLOCATOR.realloc(pointer, layout, 128).is_null());
+            assert_eq!(pointer.read(), 23);
+            assert_eq!(KERNEL_ALLOCATOR.usage().reserved, baseline + 64);
+            KERNEL_ALLOCATOR.set_limit(Some(baseline + 192)).unwrap();
+            let grown = KERNEL_ALLOCATOR.realloc(pointer, layout, 128);
+            assert!(!grown.is_null());
+            assert_eq!(grown.read(), 23);
+            assert_eq!(KERNEL_ALLOCATOR.usage().reserved, baseline + 128);
+            KERNEL_ALLOCATOR.dealloc(grown, Layout::from_size_align(128, 64).unwrap());
+        }
+        assert_eq!(KERNEL_ALLOCATOR.usage().reserved, baseline);
     });
 }
 

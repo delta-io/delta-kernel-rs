@@ -37,6 +37,7 @@ pre-release-hook = [
 redundant_field_names = "allow"
 
 [dependencies]
+allocator-api2 = "=0.2.21"
 delta_kernel_derive = { path = "../derive-macros", version = "0.30.1" }
 bytes = "1.10"
 chrono = "0.4.41"
@@ -97,7 +98,6 @@ optional = true
 [features]
 # no default features
 default = []
-# Local allocator experiment; enabling this feature requires Rust 1.100.
 # internal-api will make everything marked #[internal_api] public.
 internal-api = []
 # prettyprint enables Arrow pretty-print helpers (test/example oriented).

@@ -1,8 +1,9 @@
 # Shared Kernel allocator POC
 
-Selected metadata storage always uses `memory::KERNEL_ALLOCATOR`, an explicit stable Rust 1.100
-`Allocator`. Kernel does not install a process `GlobalAlloc`. Tracking starts at the first allocation;
-the default limit is `None`. There are no budget handles, TLS policy scopes, or builder setters.
+Selected metadata storage always uses `memory::KERNEL_ALLOCATOR`, an explicit stable `GlobalAlloc`
+backend. Fallible containers use a private `allocator-api2` adapter; Kernel does not replace the
+process allocator. Tracking starts at the first allocation; the default limit is `None`. There are
+no budget handles, TLS policy scopes, or builder setters.
 
 ```rust
 use delta_kernel::memory::KERNEL_ALLOCATOR;
@@ -49,7 +50,7 @@ storage and error propagation without changing the normal Kernel dependency conf
 From the repository root:
 
 ```sh
-CARGO_PROFILE_RELEASE_DEBUG=1 cargo +1.100.0 build --locked --release -p mem-test --features declarative-benchmark \
+CARGO_PROFILE_RELEASE_DEBUG=1 cargo +1.95.0 build --locked --release -p mem-test --features declarative-benchmark \
   --example rss_lifecycle --example kernel_lifecycle
 
 python3 mem-test/metadata/run_rss.py \
@@ -82,6 +83,6 @@ tracks requested Rust heap bytes without DHAT. On macOS, `KERNEL_MEMORY_VM_MAPS=
 self-inspection of physical footprint, malloc pages, and resident stacks. See
 [the measurement notes](DECLARATIVE_RSS.md) for interpreting those metrics.
 
-The POC raises the workspace minimum to Rust 1.100, changes schema ownership payloads, and returns
+The POC preserves the workspace minimum of Rust 1.95, changes schema ownership payloads, and returns
 allocator-owning `Bytes` from write-state encoding. The C `KernelOwnedBytes` record has an opaque
 owner word; rebuild connector bindings from the matching generated header.

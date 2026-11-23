@@ -11,7 +11,7 @@ Cargo feature flags keep both crates dependency-light.
 ## Requirements
 
 - **Rust edition**: 2024
-- **Minimum Rust version**: 1.100
+- **Minimum Rust version**: 1.95
 
 ## Adding the dependency
 

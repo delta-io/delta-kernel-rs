@@ -1,4 +1,4 @@
-//! Shared allocation tracking for allocation-heavy Kernel metadata. Requires Rust 1.100.
+//! Shared allocation tracking for allocation-heavy Kernel metadata using stable `GlobalAlloc`.
 //!
 //! Participating storage always allocates through [`KERNEL_ALLOCATOR`]. Its requested-byte limit
 //! is disabled by default. Set or clear the limit with [`KernelAllocator::set_limit`], or the FFI

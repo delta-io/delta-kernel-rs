@@ -1,12 +1,15 @@
 use std::ops::{Deref, DerefMut};
 
-use super::{KERNEL_ALLOCATOR, KernelAllocator, MemoryResult, MetadataVec};
+use allocator_api2::boxed::Box as AllocBox;
+
+use super::allocator::ContainerAllocator;
+use super::{MemoryResult, MetadataVec};
 
 /// An owned metadata payload using the shared Kernel allocator.
 ///
 /// Use [`Self::try_new`] at fallible boundaries. Infallible conversions and cloning have Rust's
 /// ordinary allocation-error behavior if the allocator rejects their allocation.
-pub struct Owned<T>(Box<T, KernelAllocator>);
+pub struct Owned<T>(AllocBox<T, ContainerAllocator>);
 
 impl<T> Owned<T> {
     /// Allocate a payload, returning an error if its allocation cannot be reserved.
@@ -15,21 +18,22 @@ impl<T> Owned<T> {
         values.try_reserve_exact(1)?;
         values.try_push(value)?;
         // Exact capacity avoids a potentially allocating shrink during boxing.
-        let (ptr, allocator) = Box::into_raw_with_allocator(values.into_vec().into_boxed_slice());
+        let (ptr, allocator) =
+            AllocBox::into_raw_with_allocator(values.into_vec().into_boxed_slice());
         // SAFETY: A single-element slice has its element's layout and preserves the allocator.
         Ok(Self(unsafe {
-            Box::from_raw_in(ptr.cast::<T>(), allocator)
+            AllocBox::from_raw_in(ptr.cast::<T>(), allocator)
         }))
     }
 
     /// Move out the value and release its tracked allocation.
     pub fn into_inner(self) -> T {
-        *self.0
+        AllocBox::into_inner(self.0)
     }
 }
 impl<T> From<T> for Owned<T> {
     fn from(value: T) -> Self {
-        Self(Box::new_in(value, KERNEL_ALLOCATOR))
+        Self(AllocBox::new_in(value, ContainerAllocator))
     }
 }
 impl<T> From<Box<T>> for Owned<T> {

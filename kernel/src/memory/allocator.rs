@@ -1,15 +1,18 @@
-use std::alloc::{AllocError, Allocator, Global, Layout};
+use std::alloc::{self, GlobalAlloc, Layout};
 use std::ptr::NonNull;
 use std::sync::Mutex;
+
+use allocator_api2::alloc::{AllocError, Allocator};
 
 use super::{MemoryError, MemoryResult};
 
 /// The allocator used by Kernel's participating metadata storage.
 ///
 /// Every copy uses the same counters and optional limit, including across threads and FFI calls.
-/// This is an explicit [`Allocator`]; it does not replace the process's global allocator.
+/// Storage calls this [`GlobalAlloc`] backend explicitly. It forwards to the process's existing
+/// allocator, so it must not itself be installed with `#[global_allocator]`.
 /// Use fallible collection growth (`try_reserve`): infallible growth can invoke Rust's
-/// allocation-error handler when this allocator returns [`AllocError`].
+/// allocation-error handler when this allocator returns null.
 #[derive(Clone, Copy, Debug)]
 pub struct KernelAllocator {
     _private: (),
@@ -71,18 +74,18 @@ impl KernelAllocator {
         }
     }
 
-    fn reserve(&self, bytes: usize) -> Result<Reservation, AllocError> {
+    fn reserve(&self, bytes: usize) -> Option<Reservation> {
         let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
         let next = state.reserved.checked_add(bytes);
         match next {
             Some(next) if state.limit.is_none_or(|limit| next <= limit) => {
                 state.reserved = next;
                 state.peak = state.peak.max(next);
-                Ok(Reservation { bytes })
+                Some(Reservation { bytes })
             }
             _ => {
                 state.rejected = state.rejected.saturating_add(1);
-                Err(AllocError)
+                None
             }
         }
     }
@@ -95,33 +98,76 @@ impl KernelAllocator {
     pub(super) fn allocate_with(
         &self,
         layout: Layout,
-        backing: impl FnOnce(Layout) -> Result<NonNull<[u8]>, AllocError>,
-    ) -> Result<NonNull<[u8]>, AllocError> {
-        let reservation = self.reserve(layout.size())?;
-        let allocation = backing(layout)?;
-        // Expose exactly the charged length, so every fitting layout frees that same charge.
-        let allocation = NonNull::slice_from_raw_parts(allocation.cast(), layout.size());
-        std::mem::forget(reservation);
-        Ok(allocation)
+        backing: impl FnOnce(Layout) -> *mut u8,
+    ) -> *mut u8 {
+        let Some(reservation) = self.reserve(layout.size()) else {
+            return std::ptr::null_mut();
+        };
+        let allocation = backing(layout);
+        if !allocation.is_null() {
+            std::mem::forget(reservation);
+        }
+        allocation
     }
 }
 
-// SAFETY: Global supplies aligned storage; the exposed block size is exactly the accounted size.
-// All copies share one state. Default grow/shrink allocate the replacement before freeing the
-// original block, so both blocks count toward the limit and failure preserves the original block.
-unsafe impl Allocator for KernelAllocator {
+// SAFETY: The host allocation functions supply aligned storage and receive the original layouts.
+// Reservation updates finish before the backing call; a failed backing call rolls them back.
+// This backend is invoked explicitly and is never registered as the process allocator.
+unsafe impl GlobalAlloc for KernelAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        self.allocate_with(layout, |layout| unsafe { alloc::alloc(layout) })
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        self.allocate_with(layout, |layout| unsafe { alloc::alloc_zeroed(layout) })
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: The caller supplies a live allocation from this allocator and a fitting layout.
+        unsafe { alloc::dealloc(ptr, layout) };
+        self.release(layout.size());
+    }
+}
+
+/// Adapts the stable backend to fallible containers without using std's allocator API.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ContainerAllocator;
+
+impl ContainerAllocator {
+    fn allocate_with(&self, layout: Layout, zeroed: bool) -> Result<NonNull<[u8]>, AllocError> {
+        let pointer = if layout.size() == 0 {
+            std::ptr::without_provenance_mut(layout.align())
+        } else if zeroed {
+            // SAFETY: The layout is nonzero and the backend forwards its alignment unchanged.
+            unsafe { KERNEL_ALLOCATOR.alloc_zeroed(layout) }
+        } else {
+            // SAFETY: The layout is nonzero and the backend forwards its alignment unchanged.
+            unsafe { KERNEL_ALLOCATOR.alloc(layout) }
+        };
+        NonNull::new(pointer)
+            .map(|pointer| NonNull::slice_from_raw_parts(pointer, layout.size()))
+            .ok_or(AllocError)
+    }
+}
+
+// SAFETY: Each block retains this allocator through its owner. Zero-size blocks use an aligned
+// sentinel. Default grow/shrink allocate before freeing, preserving the old block on failure and
+// charging overlapping storage until the backing allocation is actually released.
+unsafe impl Allocator for ContainerAllocator {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        self.allocate_with(layout, |layout| Global.allocate(layout))
+        self.allocate_with(layout, false)
     }
 
     fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        self.allocate_with(layout, |layout| Global.allocate_zeroed(layout))
+        self.allocate_with(layout, true)
     }
 
-    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-        // SAFETY: The caller supplies a live allocation from this allocator and a fitting layout.
-        unsafe { Global.deallocate(ptr, layout) };
-        self.release(layout.size());
+    unsafe fn deallocate(&self, pointer: NonNull<u8>, layout: Layout) {
+        if layout.size() != 0 {
+            // SAFETY: Nonzero blocks come from this backend and retain their original layout.
+            unsafe { KERNEL_ALLOCATOR.dealloc(pointer.as_ptr(), layout) };
+        }
     }
 }
 

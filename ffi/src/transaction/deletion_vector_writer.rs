@@ -167,11 +167,11 @@ pub unsafe extern "C" fn new_dv_writer(
                 "DV writer requires write and flush callbacks",
             ));
         }
-        let mut output = Box::into_non_null(Box::new(OwnedDvOutput(FfiDvWriterOutput {
+        let mut output = NonNull::from(Box::leak(Box::new(OwnedDvOutput(FfiDvWriterOutput {
             context: output.context,
             write: output.write,
             flush: output.flush,
-        })));
+        }))));
         // SAFETY: DvWriter owns this stable allocation and drops the serializer's borrow before
         // freeing it. The private pointer is never exposed or used while the borrow is active.
         let writer = StreamingDeletionVectorWriter::new(unsafe { output.as_mut() });

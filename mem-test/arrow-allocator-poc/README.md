@@ -1,8 +1,10 @@
 # Local Arrow allocator experiment
 
 This separate Cargo workspace connects participating Arrow storage to Kernel's existing shared
-`Allocator` on Rust 1.100. Tracking is always enabled after registration. Kernel's existing limit
-controls enforcement; no request scopes or builder budgets are introduced.
+`GlobalAlloc` backend on Rust 1.95. A stable `allocator-api2` adapter provides the fallible
+containers; no standard-library allocator API is required. Tracking is always enabled after
+registration. Kernel's existing limit controls enforcement; no request scopes or builder budgets
+are introduced.
 
 `prepare.py` applies the patch to disposable copies of cached Arrow 60.0.0 sources. It preserves the
 Cargo registry and the normal Kernel dependency configuration. The benchmark entry points install
@@ -24,8 +26,10 @@ inputs after their final consumer and reuses arrays whose nested null masks are 
 Arrow array objects, `ArrayData` trees, schema objects, and other ordinary dependency containers
 still have allocations outside this allocator. Public infallible Arrow operations also retain
 infallible allocation paths. Passing these checks does not establish a whole-Arrow or process-RSS
-cap. The [results](RESULTS.json) record simultaneous-peak attribution and the tested boundaries.
-Their `tail_memory` section includes the exact wide-tail fixture with full/narrow projections and
+cap. The [stable-backend validation](GLOBAL_ALLOC_VALIDATION.json) records Rust 1.95 checks and
+simultaneous-peak attribution for the `GlobalAlloc` implementation. The [historical results](RESULTS.json)
+retain measurements from the Rust 1.100 `std::alloc::Allocator` implementation. Their `tail_memory`
+section includes the exact wide-tail fixture with full/narrow projections and
 a wide filter. It separates bytes passing through the cap at the Rust heap peak, measured bytes
 outside the cap, the allocator's own peak counter, and RSS from a separate unprofiled worker.
 
@@ -35,7 +39,7 @@ From the Kernel repository root, choose a new output directory:
 python3 mem-test/arrow-allocator-poc/prepare.py --output /tmp/kernel-arrow-poc
 
 CARGO_TARGET_DIR=/tmp/kernel-arrow-poc/target CARGO_PROFILE_RELEASE_DEBUG=1 \
-  cargo +1.100.0 build --offline \
+  cargo +1.95.0 build --offline \
   --manifest-path mem-test/arrow-allocator-poc/Cargo.toml \
   --config /tmp/kernel-arrow-poc/patch.toml --release
 

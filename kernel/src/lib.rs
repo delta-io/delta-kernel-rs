@@ -108,7 +108,6 @@ pub mod incremental_scan;
 mod log_compaction;
 mod log_path;
 mod log_reader;
-#[clippy::msrv = "1.100"]
 pub mod memory;
 pub mod metrics;
 pub mod partition;

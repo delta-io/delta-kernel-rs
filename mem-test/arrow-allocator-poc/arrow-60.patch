@@ -5,7 +5,7 @@
  [package]
  edition = "2024"
 -rust-version = "1.88"
-+rust-version = "1.100"
++rust-version = "1.95"
  name = "arrow-array"
  version = "60.0.0"
  authors = ["Apache Arrow <dev@arrow.apache.org>"]
@@ -38,22 +38,30 @@
  [package]
  edition = "2024"
 -rust-version = "1.88"
-+rust-version = "1.100"
++rust-version = "1.95"
  name = "arrow-buffer"
  version = "60.0.0"
  authors = ["Apache Arrow <dev@arrow.apache.org>"]
+@@ -241,3 +241,6 @@
+ [lints.rustdoc.all]
+ level = "warn"
+ priority = -1
++
++[dependencies.allocator-api2]
++version = "=0.2.21"
 --- a/arrow-buffer/src/alloc/mod.rs
 +++ b/arrow-buffer/src/alloc/mod.rs
-@@ -23,6 +23,8 @@
+@@ -23,6 +23,9 @@
  use std::sync::Arc;
  
  mod alignment;
 +mod shared;
++pub use allocator_api2::alloc::{AllocError, Allocator};
 +pub use shared::{AllocatorVec, SharedAllocator, TryVecExt, install_default_allocator, try_vec};
  
  pub use alignment::ALIGNMENT;
  
-@@ -35,7 +37,7 @@
+@@ -35,7 +38,7 @@
  /// Mode of deallocating memory regions
  pub(crate) enum Deallocation {
      /// An allocation using [`std::alloc`]
@@ -62,7 +70,7 @@
      /// An allocation from an external source like the FFI interface
      /// Deallocation will happen on `Allocation::drop`
      /// The size of the allocation is tracked here separately only
-@@ -46,7 +48,7 @@
+@@ -46,7 +49,7 @@
  impl Debug for Deallocation {
      fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
          match self {
@@ -71,7 +79,7 @@
                  write!(f, "Deallocation::Standard {layout:?}")
              }
              Deallocation::Custom(_, size) => {
-@@ -64,7 +66,7 @@
+@@ -64,7 +67,7 @@
      fn test_size_of_deallocation() {
          assert_eq!(
              std::mem::size_of::<Deallocation>(),
@@ -82,18 +90,21 @@
  }
 --- a/arrow-buffer/src/alloc/shared.rs
 +++ b/arrow-buffer/src/alloc/shared.rs
-@@ -0,0 +1,128 @@
+@@ -0,0 +1,144 @@
 +// SPDX-License-Identifier: Apache-2.0
 +
 +//! Allocator injection for the local Kernel allocation experiment.
 +
-+use std::alloc::{AllocError, Allocator, Global, Layout};
++use std::alloc::{self, GlobalAlloc, Layout};
++
++use allocator_api2::alloc::{AllocError, Allocator};
++use allocator_api2::vec::Vec;
 +use std::fmt;
 +use std::panic::RefUnwindSafe;
 +use std::ptr::NonNull;
 +use std::sync::OnceLock;
 +
-+type BackingAllocator = dyn Allocator + Send + Sync + RefUnwindSafe;
++type BackingAllocator = dyn GlobalAlloc + Send + Sync + RefUnwindSafe;
 +
 +static DEFAULT_ALLOCATOR: OnceLock<&'static BackingAllocator> = OnceLock::new();
 +
@@ -121,7 +132,7 @@
 +    }
 +
 +    fn backing(self) -> &'static BackingAllocator {
-+        self.0.unwrap_or(&Global)
++        self.0.unwrap_or(&HostHeap)
 +    }
 +}
 +
@@ -139,40 +150,53 @@
 +    }
 +}
 +
-+// SAFETY: Each operation uses the same retained allocator and forwards the caller's layouts.
++// This private backend preserves the allocation domain of ordinary imported Rust vectors.
++// It is used explicitly and must not be registered with #[global_allocator].
++struct HostHeap;
++
++// SAFETY: Layouts and pointers are forwarded unchanged to the existing process allocator.
++unsafe impl GlobalAlloc for HostHeap {
++    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
++        unsafe { alloc::alloc(layout) }
++    }
++    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
++        unsafe { alloc::alloc_zeroed(layout) }
++    }
++    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
++        unsafe { alloc::dealloc(pointer, layout) }
++    }
++}
++
++impl SharedAllocator {
++    fn allocate_with(self, layout: Layout, zeroed: bool) -> Result<NonNull<[u8]>, AllocError> {
++        let pointer = if layout.size() == 0 {
++            std::ptr::without_provenance_mut(layout.align())
++        } else if zeroed {
++            // SAFETY: The layout is nonzero and the selected backend retains its identity.
++            unsafe { self.backing().alloc_zeroed(layout) }
++        } else {
++            // SAFETY: The layout is nonzero and the selected backend retains its identity.
++            unsafe { self.backing().alloc(layout) }
++        };
++        NonNull::new(pointer)
++            .map(|pointer| NonNull::slice_from_raw_parts(pointer, layout.size()))
++            .ok_or(AllocError)
++    }
++}
++
++// SAFETY: Allocations retain their backend. Zero-size allocations use an aligned sentinel.
++// Default grow/shrink preserve the old block on failure and charge both blocks while copying.
 +unsafe impl Allocator for SharedAllocator {
 +    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-+        self.backing().allocate(layout)
++        self.allocate_with(layout, false)
 +    }
 +    fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-+        self.backing().allocate_zeroed(layout)
++        self.allocate_with(layout, true)
 +    }
-+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-+        unsafe { self.backing().deallocate(ptr, layout) }
-+    }
-+    unsafe fn grow(
-+        &self,
-+        ptr: NonNull<u8>,
-+        old: Layout,
-+        new: Layout,
-+    ) -> Result<NonNull<[u8]>, AllocError> {
-+        unsafe { self.backing().grow(ptr, old, new) }
-+    }
-+    unsafe fn grow_zeroed(
-+        &self,
-+        ptr: NonNull<u8>,
-+        old: Layout,
-+        new: Layout,
-+    ) -> Result<NonNull<[u8]>, AllocError> {
-+        unsafe { self.backing().grow_zeroed(ptr, old, new) }
-+    }
-+    unsafe fn shrink(
-+        &self,
-+        ptr: NonNull<u8>,
-+        old: Layout,
-+        new: Layout,
-+    ) -> Result<NonNull<[u8]>, AllocError> {
-+        unsafe { self.backing().shrink(ptr, old, new) }
++    unsafe fn deallocate(&self, pointer: NonNull<u8>, layout: Layout) {
++        if layout.size() != 0 {
++            unsafe { self.backing().dealloc(pointer.as_ptr(), layout) }
++        }
 +    }
 +}
 +
@@ -279,17 +303,16 @@
  
 --- a/arrow-buffer/src/buffer/mutable.rs
 +++ b/arrow-buffer/src/buffer/mutable.rs
-@@ -15,7 +15,8 @@
+@@ -15,6 +15,8 @@
  // specific language governing permissions and limitations
  // under the License.
  
--use std::alloc::Layout;
 +use crate::alloc::SharedAllocator;
-+use std::alloc::{Allocator, Layout};
++use allocator_api2::alloc::Allocator;
+ use std::alloc::Layout;
  use std::mem;
  use std::ptr::NonNull;
- 
-@@ -125,10 +126,30 @@
+@@ -125,10 +127,30 @@
      // invariant: len <= capacity
      len: usize,
      layout: Layout,
@@ -320,7 +343,7 @@
  }
  
  impl MutableBuffer {
-@@ -163,11 +184,15 @@
+@@ -163,11 +185,15 @@
              .ok_or(MutableBufferError::LayoutError)?;
          let layout = Layout::from_size_align(capacity, ALIGNMENT)
              .map_err(|_| MutableBufferError::LayoutError)?;
@@ -337,7 +360,7 @@
                  match NonNull::new(raw_ptr) {
                      Some(ptr) => ptr,
                      None => return Err(MutableBufferError::AllocationError(layout)),
-@@ -178,6 +203,7 @@
+@@ -178,6 +204,7 @@
              data,
              len: 0,
              layout,
@@ -345,7 +368,7 @@
              #[cfg(feature = "pool")]
              reservation: TrackedReservation::default(),
          })
-@@ -206,11 +232,15 @@
+@@ -206,11 +233,15 @@
      pub fn try_from_len_zeroed(len: usize) -> Result<Self, MutableBufferError> {
          let layout =
              Layout::from_size_align(len, ALIGNMENT).map_err(|_| MutableBufferError::LayoutError)?;
@@ -362,7 +385,7 @@
                  match NonNull::new(raw_ptr) {
                      Some(ptr) => ptr,
                      None => return Err(MutableBufferError::AllocationError(layout)),
-@@ -221,6 +251,7 @@
+@@ -221,6 +252,7 @@
              data,
              len,
              layout,
@@ -370,7 +393,7 @@
              #[cfg(feature = "pool")]
              reservation: TrackedReservation::default(),
          })
-@@ -228,8 +259,8 @@
+@@ -228,8 +260,8 @@
  
      /// Allocates a new [MutableBuffer] from given `Bytes`.
      pub(crate) fn from_bytes(bytes: Bytes) -> Result<Self, Bytes> {
@@ -381,7 +404,7 @@
              Deallocation::Custom(..) => return Err(bytes),
          };
  
-@@ -244,6 +275,7 @@
+@@ -244,6 +276,7 @@
              data,
              len,
              layout,
@@ -389,7 +412,7 @@
              #[cfg(feature = "pool")]
              reservation,
          })
-@@ -427,22 +459,22 @@
+@@ -427,22 +460,22 @@
          if new_layout.size() == 0 {
              if self.layout.size() != 0 {
                  // Safety: data was allocated with layout
@@ -421,7 +444,7 @@
          self.layout = new_layout;
          #[cfg(feature = "pool")]
          self.reservation.resize(self.layout.size());
-@@ -588,7 +620,13 @@
+@@ -588,7 +621,13 @@
  
      #[inline]
      pub(super) fn into_buffer(self) -> Buffer {
@@ -436,7 +459,7 @@
          #[cfg(feature = "pool")]
          bytes.reservation.replace(self.reservation.take());
          std::mem::forget(self);
-@@ -982,6 +1020,7 @@
+@@ -982,6 +1021,7 @@
              data,
              len,
              layout,
@@ -444,7 +467,7 @@
              #[cfg(feature = "pool")]
              reservation: TrackedReservation::default(),
          }
-@@ -1194,7 +1233,7 @@
+@@ -1194,7 +1234,7 @@
      fn drop(&mut self) {
          if self.layout.size() != 0 {
              // Safety: data was allocated with standard allocator with given layout
@@ -529,14 +552,14 @@
      /// Creates a new `BooleanBufferBuilder` from [`MutableBuffer`] of `len`
 --- a/arrow-buffer/src/bytes.rs
 +++ b/arrow-buffer/src/bytes.rs
-@@ -20,6 +20,7 @@
+@@ -19,6 +19,7 @@
+ //! how to de-allocate itself, [`Bytes`].
  //! Note that this is a low-level functionality of this crate.
  
++use allocator_api2::alloc::Allocator;
  use core::slice;
-+use std::alloc::Allocator;
  use std::ptr::NonNull;
  use std::{fmt::Debug, fmt::Formatter};
- 
 @@ -97,7 +98,7 @@
  
      pub(crate) fn capacity(&self) -> usize {
@@ -658,7 +681,7 @@
  [package]
  edition = "2024"
 -rust-version = "1.88"
-+rust-version = "1.100"
++rust-version = "1.95"
  name = "arrow-data"
  version = "60.0.0"
  authors = ["Apache Arrow <dev@arrow.apache.org>"]
@@ -1143,7 +1166,7 @@
  [package]
  edition = "2024"
 -rust-version = "1.88"
-+rust-version = "1.100"
++rust-version = "1.95"
  name = "arrow-json"
  version = "60.0.0"
  authors = ["Apache Arrow <dev@arrow.apache.org>"]
@@ -1264,7 +1287,7 @@
 +        let mut child_pos = try_vec(
 +            pos.len()
 +                .checked_mul(expected)
-+                .ok_or_else(|| allocation_error(std::alloc::AllocError))?,
++                .ok_or_else(|| allocation_error(arrow_buffer::alloc::AllocError))?,
 +        )
 +        .map_err(allocation_error)?;
  
@@ -1431,17 +1454,17 @@
  }
 --- a/arrow-json/src/reader/serializer.rs
 +++ b/arrow-json/src/reader/serializer.rs
-@@ -16,20 +16,34 @@
+@@ -16,6 +16,8 @@
  // under the License.
  
  use crate::reader::tape::TapeElement;
++use arrow_buffer::alloc::AllocError;
 +use arrow_buffer::alloc::{AllocatorVec, TryVecExt};
  use lexical_core::FormattedSize;
  use serde_core::ser::{
      Impossible, SerializeMap, SerializeSeq, SerializeStruct, SerializeTuple, SerializeTupleStruct,
- };
+@@ -23,13 +25,25 @@
  use serde_core::{Serialize, Serializer};
-+use std::alloc::AllocError;
  
  #[derive(Debug)]
 -pub struct SerializerError(String);
@@ -1753,7 +1776,7 @@
 +
 +//! Fallible backing storage for the JSON decoder's variable-size output.
 +
-+use std::alloc::AllocError;
++use arrow_buffer::alloc::AllocError;
 +use std::marker::PhantomData;
 +
 +use arrow_array::{
@@ -2012,7 +2035,7 @@
  use arrow_schema::{ArrowError, DataType, Fields};
  
  use crate::reader::tape::{Tape, TapeElement};
-@@ -28,14 +28,14 @@
+@@ -28,14 +28,16 @@
  /// Reusable buffer for tape positions, indexed by (field_idx, row_idx).
  /// A value of 0 indicates the field is absent for that row.
  struct FieldTapePositions {
@@ -2025,21 +2048,23 @@
      fn new() -> Self {
          Self {
 -            data: Vec::new(),
-+            data: Vec::new_in(arrow_buffer::alloc::SharedAllocator::default()),
++            data: arrow_buffer::alloc::AllocatorVec::new_in(
++                arrow_buffer::alloc::SharedAllocator::default(),
++            ),
              row_count: 0,
          }
      }
-@@ -47,6 +47,9 @@
+@@ -47,6 +49,9 @@
              ))
          })?;
          self.data.clear();
 +        self.data
 +            .try_reserve(total_len)
-+            .map_err(|_| super::tape::allocation_error(std::alloc::AllocError))?;
++            .map_err(|_| super::tape::allocation_error(arrow_buffer::alloc::AllocError))?;
          self.data.resize(total_len, 0);
          self.row_count = row_count;
          Ok(())
-@@ -140,11 +143,11 @@
+@@ -140,11 +145,11 @@
                                  end_idx
                              }
                              (TapeElement::Null, Some(nulls)) => {
@@ -2053,7 +2078,7 @@
                                  continue;
                              }
                              (_, _) => return Err(tape.error(*p, "{")),
-@@ -189,11 +192,11 @@
+@@ -189,11 +194,11 @@
                                  end_idx
                              }
                              (TapeElement::Null, Some(nulls)) => {
@@ -2073,11 +2098,11 @@
  // under the License.
  
  use crate::reader::serializer::TapeSerializer;
++use arrow_buffer::alloc::AllocError;
 +use arrow_buffer::alloc::{AllocatorVec, TryVecExt, try_vec};
  use arrow_schema::ArrowError;
  use memchr::memchr2;
  use serde_core::Serialize;
-+use std::alloc::AllocError;
  use std::fmt::Write;
 +
 +pub(super) fn allocation_error(_: AllocError) -> ArrowError {
@@ -2488,7 +2513,7 @@
  [package]
  edition = "2024"
 -rust-version = "1.88"
-+rust-version = "1.100"
++rust-version = "1.95"
  name = "parquet"
  version = "60.0.0"
  authors = ["Apache Arrow <dev@arrow.apache.org>"]

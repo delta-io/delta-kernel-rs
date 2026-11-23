@@ -33,7 +33,7 @@ counts, DAG depth, maximum input fan-in, JSON/Parquet source counts, and wire le
 From the repository root:
 
 ```sh
-CARGO_PROFILE_RELEASE_DEBUG=1 cargo +1.100.0 build --locked --release -p mem-test \
+CARGO_PROFILE_RELEASE_DEBUG=1 cargo +1.95.0 build --locked --release -p mem-test \
   --features declarative-benchmark --example rss_lifecycle --example kernel_lifecycle
 
 python3 mem-test/metadata/run_matrix.py \
@@ -97,11 +97,14 @@ for the difference between requested heap bytes, RSS, and physical footprint.
 
 ## Validated results
 
-[The compact results](LIFECYCLE_RESULTS.json) record the manifest and executable hashes, platform,
+[Stable-backend validation](../arrow-allocator-poc/GLOBAL_ALLOC_VALIDATION.json) records the Rust
+1.95 `GlobalAlloc` checks, including the matrix, exact wide-tail stress case, and C lifecycle.
+
+[The original results](LIFECYCLE_RESULTS.json) record the manifest and executable hashes, platform,
 check counts, and simultaneous-peak heap attribution for the published-dependency baseline build.
-The [Arrow allocator experiment](../arrow-allocator-poc/README.md) records separate measurements
-with its dependency storage changes and reference-executor retention improvements.
-On Rust 1.100 / macOS arm64:
+The measurements below used the historical Rust 1.100 `std::alloc::Allocator` implementation on
+macOS arm64. The [Arrow allocator experiment](../arrow-allocator-poc/README.md) records separate
+measurements with its dependency storage changes and reference-executor retention improvements.
 
 - The matrix crossed 169 compatible pairs at concurrency 1 and 4: 2,354 fresh-process checks and
   7,762 measured operations. These included 3,995 typed allocation errors and 2,354 successful

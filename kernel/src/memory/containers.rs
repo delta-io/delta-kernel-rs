@@ -1,9 +1,11 @@
 use std::io::{self, Write};
 use std::ops::{Deref, DerefMut};
 
+use allocator_api2::vec::Vec as AllocVec;
 use serde::Serialize;
 
-use super::{KERNEL_ALLOCATOR, KernelAllocator, MemoryError, MemoryResult};
+use super::allocator::ContainerAllocator;
+use super::{KERNEL_ALLOCATOR, MemoryError, MemoryResult};
 
 /// An allocator-aware vector with fallible growth methods.
 ///
@@ -11,12 +13,12 @@ use super::{KERNEL_ALLOCATOR, KernelAllocator, MemoryError, MemoryResult};
 /// use the allocator; an ordinary `String` here does not charge its contents. Infallible
 /// conversions and cloning retain Rust's ordinary allocation-error behavior on exhaustion.
 #[derive(Debug)]
-pub struct MetadataVec<T>(Vec<T, KernelAllocator>);
+pub struct MetadataVec<T>(AllocVec<T, ContainerAllocator>);
 
 impl<T> MetadataVec<T> {
     /// Create empty storage using the shared Kernel allocator.
     pub fn new() -> Self {
-        Self(Vec::new_in(KERNEL_ALLOCATOR))
+        Self(AllocVec::new_in(ContainerAllocator))
     }
 
     /// Append `value`, returning an error without changing the elements if growth fails.
@@ -67,7 +69,7 @@ impl<T> MetadataVec<T> {
         self.0.capacity()
     }
 
-    pub(crate) fn into_vec(self) -> Vec<T, KernelAllocator> {
+    pub(super) fn into_vec(self) -> AllocVec<T, ContainerAllocator> {
         self.0
     }
 
@@ -312,7 +314,7 @@ impl<T> From<Vec<T>> for MetadataVec<T> {
 }
 impl<T> FromIterator<T> for MetadataVec<T> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        let mut values = Vec::new_in(KERNEL_ALLOCATOR);
+        let mut values = AllocVec::new_in(ContainerAllocator);
         values.extend(iter);
         Self(values)
     }

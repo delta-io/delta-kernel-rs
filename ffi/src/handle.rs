@@ -347,7 +347,7 @@ mod private {
         type Raw = T;
 
         fn into_handle_ptr(val: Box<T>) -> NonNull<T> {
-            Box::into_non_null(val)
+            NonNull::from(Box::leak(val))
         }
         unsafe fn as_ref<'a>(ptr: *const T) -> &'a T {
             unsafe { &*ptr }
@@ -412,7 +412,7 @@ mod private {
 
         fn into_handle_ptr(val: Box<T>) -> NonNull<Box<T>> {
             // Double-boxing needed in order to obtain a thin pointer
-            Box::into_non_null(Box::new(val))
+            NonNull::from(Box::leak(Box::new(val)))
         }
         unsafe fn as_ref<'a>(ptr: *const Box<T>) -> &'a T {
             let boxed = unsafe { &*ptr };
@@ -445,7 +445,7 @@ mod private {
 
         fn into_handle_ptr(val: Arc<T>) -> NonNull<Arc<T>> {
             // Double-boxing needed in order to obtain a thin pointer
-            Box::into_non_null(Box::new(val))
+            NonNull::from(Box::leak(Box::new(val)))
         }
         unsafe fn as_ref<'a>(ptr: *const Arc<T>) -> &'a T {
             let arc = unsafe { &*ptr };

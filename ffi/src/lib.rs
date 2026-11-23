@@ -541,7 +541,7 @@ mod private {
     ///
     /// Pair with [`Vec::from_raw_parts(ptr.as_ptr(), len, len)`](Vec::from_raw_parts).
     fn vec_into_ffi_ptr<T>(val: Vec<T>) -> (NonNull<T>, usize) {
-        let ptr = Box::into_non_null(val.into_boxed_slice());
+        let ptr = NonNull::from(Box::leak(val.into_boxed_slice()));
         (ptr.cast(), ptr.len())
     }
 

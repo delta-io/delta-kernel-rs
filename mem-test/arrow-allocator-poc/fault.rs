@@ -1,6 +1,5 @@
-use std::alloc::{AllocError, Allocator, Layout};
+use std::alloc::{GlobalAlloc, Layout};
 use std::error::Error;
-use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -20,17 +19,17 @@ static PROBE: Probe = Probe;
 struct Probe;
 
 // SAFETY: Successful storage and layouts are forwarded unchanged to Kernel's allocator.
-unsafe impl Allocator for Probe {
-    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+unsafe impl GlobalAlloc for Probe {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let call = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
         if call == FAIL_AT.load(Ordering::Relaxed) {
             REJECTED.fetch_add(1, Ordering::Relaxed);
-            return Err(AllocError);
+            return std::ptr::null_mut();
         }
-        KERNEL_ALLOCATOR.allocate(layout)
+        unsafe { KERNEL_ALLOCATOR.alloc(layout) }
     }
-    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-        unsafe { KERNEL_ALLOCATOR.deallocate(ptr, layout) }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { KERNEL_ALLOCATOR.dealloc(ptr, layout) }
     }
 }
 
