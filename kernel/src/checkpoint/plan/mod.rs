@@ -1,12 +1,15 @@
 //! Single-part checkpoint reconstruction using shared metadata planning and action replay.
 
+mod write_metadata;
+
 use super::CheckpointWriter;
 use crate::action_reconciliation::RetentionCalculator as _;
 use crate::action_reconciliation::plan::action_set::ActionSet;
 use crate::action_reconciliation::plan::{MetadataPlanner, VERSION};
 use crate::expressions::{Expression as Expr, Predicate, col, lit};
-use crate::plans::Plan;
+use crate::plans::{Plan, PlanBuilder};
 use crate::scan::{PartitionValuesOptions, StatsOptions};
+use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::{Engine, KernelError, KernelResult};
 
 impl CheckpointWriter {
@@ -15,6 +18,10 @@ impl CheckpointWriter {
     /// Shares source planning and typed metadata conversion with scans. File writing and
     /// publication remain with the caller. Collation-stat sampling is unsupported.
     pub fn declarative_checkpoint_data_plan(&self, engine: &dyn Engine) -> KernelResult<Plan> {
+        self.checkpoint_actions(engine)?.build()
+    }
+
+    fn checkpoint_actions(&self, engine: &dyn Engine) -> KernelResult<PlanBuilder> {
         if self.schema_context.is_v2 {
             return Err(KernelError::unsupported(
                 "This plan requires a V1 checkpoint writer",
@@ -27,8 +34,7 @@ impl CheckpointWriter {
                 file_retention_predicate(self.deleted_file_retention_timestamp()?),
                 non_content_retention_predicate(self.get_transaction_expiration_timestamp()?),
             ))?
-            .project_patch(|patch| patch.drop(VERSION))?
-            .build()
+            .project_patch(checkpoint_file_projection)
     }
 
     /// Configures metadata replay using this writer's output representations and schemas.
@@ -73,6 +79,18 @@ impl CheckpointWriter {
     }
 }
 
+// Checkpoint removes carry only tombstone metadata; sparse patches preserve null actions.
+fn checkpoint_file_projection(
+    patch: ProjectionStructPatchBuilder<'_>,
+) -> ProjectionStructPatchBuilder<'_> {
+    patch
+        .drop_at(["remove"], "stats")
+        .drop_at(["remove"], "tags")
+        .replace_expr_at(["add"], "dataChange", lit(false))
+        .replace_expr_at(["remove"], "dataChange", lit(false))
+        .drop(VERSION)
+}
+
 // Retention follows replay so expired removes and deleted domains still suppress older state.
 fn file_retention_predicate(file_cutoff: i64) -> Predicate {
     Predicate::or(
@@ -83,9 +101,9 @@ fn file_retention_predicate(file_cutoff: i64) -> Predicate {
 
 fn non_content_retention_predicate(txn_cutoff: Option<i64>) -> Predicate {
     let txn_retained = match txn_cutoff {
-        // Kernel retains a missing lastUpdated for compatibility with existing checkpoints.
+        // Replay has already suppressed older versions; missing lastUpdated expires with retention.
         Some(cutoff) => Predicate::or(
-            col!("txn.lastUpdated").is_null(),
+            col!("txn.appId").is_null(),
             col!("txn.lastUpdated").gt(lit(cutoff)),
         ),
         None => Predicate::TRUE,

@@ -13,8 +13,8 @@ use crate::action_reconciliation::file_metadata::{
 use crate::action_reconciliation::log_replay::ActionReconciliationProcessor;
 use crate::action_reconciliation::plan::VERSION;
 use crate::action_reconciliation::plan::action_set::ActionSet;
-use crate::arrow::array::StringArray;
-use crate::arrow::compute::{filter_record_batch, is_not_null, or};
+use crate::arrow::array::{AsArray as _, StringArray};
+use crate::arrow::compute::{filter_record_batch, is_not_null, is_null, or};
 use crate::arrow::record_batch::RecordBatch;
 use crate::checkpoint::CheckpointSpec;
 use crate::engine::arrow_conversion::TryFromArrow as _;
@@ -72,13 +72,43 @@ fn assert_checkpoint_plan(
 ) -> KernelResult<Vec<RecordBatch>> {
     let schema = plan.schema.clone();
     let actual = execute(engine, plan)?;
-    let expected = select_checkpoint_actions(expected, actions)?;
+    let expected = checkpoint_reference_batches(engine, expected, actions)?;
     assert_eq!(
         schema.as_ref(),
         &StructType::try_from_arrow(expected[0].schema())?
     );
     assert_eq!(json_rows(&actual, true)?, json_rows(&expected, true)?);
     Ok(actual)
+}
+
+// Apply checkpoint-only payload rules to the imperative reference.
+fn checkpoint_reference_batches(
+    engine: &dyn Engine,
+    batches: &[RecordBatch],
+    actions: ActionSet,
+) -> KernelResult<Vec<RecordBatch>> {
+    select_checkpoint_actions(batches, actions)?
+        .into_iter()
+        .map(|batch| {
+            let input = Arc::new(StructType::try_from_arrow(batch.schema())?);
+            let mut patch = ProjectionStructPatchBuilder::new(&input);
+            if actions.live_adds {
+                patch = patch.replace_expr_at(["add"], "dataChange", lit(false));
+            }
+            if actions.include_tombstones {
+                patch = patch
+                    .replace_expr_at(["remove"], "dataChange", lit(false))
+                    .drop_at(["remove"], "stats")
+                    .drop_at(["remove"], "tags");
+            }
+            let (output, expression) = patch.build()?;
+            engine
+                .evaluation_handler()
+                .new_expression_evaluator(input, expression, output.into())?
+                .evaluate(&ArrowEngineData::new(batch))?
+                .try_into_record_batch()
+        })
+        .collect()
 }
 
 #[rstest]
@@ -175,10 +205,17 @@ fn existing_checkpoint_data(
             .process_actions_batch(batch?)?
             .filtered_data
             .into_parts();
-        batches.push(selected_batch(FilteredEngineData::try_new(
+        let mut batch = selected_batch(FilteredEngineData::try_new(
             evaluator.evaluate(data.as_ref())?,
             selected,
-        )?)?);
+        )?)?;
+        if txn_cutoff.is_some() {
+            // The legacy reference retains missing lastUpdated after suppressing older versions.
+            let txn = batch["txn"].as_struct();
+            let keep = or(&is_null(txn)?, &is_not_null(&txn["lastUpdated"])?)?;
+            batch = filter_record_batch(&batch, &keep)?;
+        }
+        batches.push(batch);
     }
     Ok(batches)
 }
@@ -303,7 +340,7 @@ async fn checkpoint_plan_reconciles_all_groups_and_retains_after_replay(
             file_retention_predicate(100),
             non_content_retention_predicate(txn_cutoff),
         ))?
-        .project_patch(|patch| patch.drop(VERSION))?
+        .project_patch(checkpoint_file_projection)?
         .build()?;
     let actual = assert_checkpoint_plan(&engine, plan, ActionSet::ALL, &expected)?;
     let result = json_rows(&actual, true)?;
@@ -326,7 +363,8 @@ async fn checkpoint_plan_reconciles_all_groups_and_retains_after_replay(
     let reloaded_writer = reloaded.create_checkpoint_writer(&engine)?;
     assert_eq!(
         json_rows(
-            &select_checkpoint_actions(
+            &checkpoint_reference_batches(
+                &engine,
                 &existing_checkpoint_data(&reloaded_writer, &engine, 100, txn_cutoff)?,
                 ActionSet::ALL
             )?,
@@ -487,7 +525,10 @@ async fn checkpoint_uses_declared_metadata_representations(
             .collect::<KernelResult<Vec<_>>>()?;
         assert_eq!(
             json_rows(&actual, true)?,
-            json_rows(&select_checkpoint_actions(&expected, ActionSet::ALL)?, true)?
+            json_rows(
+                &checkpoint_reference_batches(&engine, &expected, ActionSet::ALL)?,
+                true
+            )?
         );
     }
     let actual_rows = json_rows(&actual, true)?;
