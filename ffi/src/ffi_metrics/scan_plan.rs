@@ -5,11 +5,11 @@ use std::ptr::NonNull;
 use delta_kernel::metrics as kernel;
 use delta_kernel::scan::StructStats;
 
-use super::{MetadataPlanningReport, MetricEvent, MetricId, ReplayBase, correlation_id_slice};
+use super::{MetricEvent, MetricId, correlation_id_slice};
 use crate::checkpoint::{FfiCheckpointInfo, FfiCheckpointMetrics, visit};
 use crate::delta_types::{FfiColumnName, FfiColumnNameArray};
 use crate::scan::{FfiPartitionValuesOptions, FfiStatsOptions};
-use crate::{FfiSlice, KernelStringSlice, NullableCvoid, kernel_string_slice};
+use crate::{FfiSlice, KernelStringSlice, NullableCvoid, OptionalValue, kernel_string_slice};
 
 /// Result of scan-plan generation.
 ///
@@ -22,6 +22,17 @@ pub enum ScanPlanOutcome {
     Error,
 }
 
+/// Starting state selected for metadata replay.
+///
+/// cbindgen:prefix-with-name=true
+#[derive(Debug, PartialEq)]
+#[repr(C)]
+pub enum ReplayBase {
+    Crc,
+    Checkpoint,
+    Empty,
+}
+
 /// A scan-plan-generation attempt. The record, checkpoint pointer, strings, and column paths are
 /// borrowed only for the metric callback; copy every retained value before returning.
 #[repr(C)]
@@ -30,9 +41,22 @@ pub struct ScanPlanReport {
     pub correlation_id: KernelStringSlice,
     pub outcome: ScanPlanOutcome,
     pub duration_ns: u64,
+    pub stats: FfiStatsOptions,
+    pub variant_min_max: bool,
+    /// False when Geometry statistics support is disabled.
+    pub geometry_min_max: bool,
+    pub partition_values: FfiPartitionValuesOptions,
+    pub partition_timezone: OptionalValue<KernelStringSlice>,
+    pub replay_base: OptionalValue<ReplayBase>,
     /// Null when no checkpoint was used.
     pub checkpoint: *const FfiCheckpointMetrics,
-    pub metadata_planning: MetadataPlanningReport,
+    pub commit_start_version: OptionalValue<u64>,
+    pub commit_end_version: OptionalValue<u64>,
+    pub commit_total_size_bytes: u64,
+    pub compaction_file_count: u64,
+    pub read_collations: bool,
+    pub has_filter: bool,
+    pub base_version: OptionalValue<u64>,
 }
 
 pub(super) fn with_event<F: FnOnce(MetricEvent)>(
@@ -111,48 +135,46 @@ pub(super) fn with_event<F: FnOnce(MetricEvent)>(
                 kernel::ScanPlanOutcome::Error => ScanPlanOutcome::Error,
             },
             duration_ns: event.duration_ns,
+            stats,
+            variant_min_max: metadata.stats.variant_min_max(),
+            geometry_min_max: {
+                #[cfg(feature = "geo-type-in-dev")]
+                {
+                    metadata.stats.geometry_min_max()
+                }
+                #[cfg(not(feature = "geo-type-in-dev"))]
+                {
+                    false
+                }
+            },
+            partition_values: if metadata.partition_values.parsed_struct() {
+                FfiPartitionValuesOptions::WithStruct
+            } else {
+                FfiPartitionValuesOptions::StringMapOnly
+            },
+            partition_timezone: metadata
+                .partition_values
+                .timestamp_timezone()
+                .map(|timezone| kernel_string_slice!(timezone))
+                .into(),
+            replay_base: metadata
+                .replay_base
+                .map(|base| match base {
+                    kernel::ReplayBase::Crc => ReplayBase::Crc,
+                    kernel::ReplayBase::Checkpoint => ReplayBase::Checkpoint,
+                    kernel::ReplayBase::Empty => ReplayBase::Empty,
+                })
+                .into(),
             checkpoint: metrics
                 .as_ref()
                 .map_or(std::ptr::null(), std::ptr::from_ref),
-            metadata_planning: MetadataPlanningReport {
-                stats,
-                variant_min_max: metadata.stats.variant_min_max(),
-                geometry_min_max: {
-                    #[cfg(feature = "geo-type-in-dev")]
-                    {
-                        metadata.stats.geometry_min_max()
-                    }
-                    #[cfg(not(feature = "geo-type-in-dev"))]
-                    {
-                        false
-                    }
-                },
-                partition_values: if metadata.partition_values.parsed_struct() {
-                    FfiPartitionValuesOptions::WithStruct
-                } else {
-                    FfiPartitionValuesOptions::StringMapOnly
-                },
-                partition_timezone: metadata
-                    .partition_values
-                    .timestamp_timezone()
-                    .map(|timezone| kernel_string_slice!(timezone))
-                    .into(),
-                replay_base: metadata
-                    .replay_base
-                    .map(|base| match base {
-                        kernel::ReplayBase::Crc => ReplayBase::Crc,
-                        kernel::ReplayBase::Checkpoint => ReplayBase::Checkpoint,
-                        kernel::ReplayBase::Empty => ReplayBase::Empty,
-                    })
-                    .into(),
-                commit_start_version: metadata.commit_start_version.into(),
-                commit_end_version: metadata.commit_end_version.into(),
-                commit_total_size_bytes: metadata.commit_total_size_bytes,
-                compaction_file_count: metadata.compaction_file_count,
-                read_collations: metadata.read_collations,
-                has_filter: metadata.has_filter,
-                base_version: metadata.base_version.into(),
-            },
+            commit_start_version: metadata.commit_start_version.into(),
+            commit_end_version: metadata.commit_end_version.into(),
+            commit_total_size_bytes: metadata.commit_total_size_bytes,
+            compaction_file_count: metadata.compaction_file_count,
+            read_collations: metadata.read_collations,
+            has_filter: metadata.has_filter,
+            base_version: metadata.base_version.into(),
         };
         f(if *failed {
             MetricEvent::ScanPlanGenerationFailed(&record)
@@ -179,7 +201,7 @@ mod tests {
     use super::*;
     use crate::checkpoint::{FfiCheckpointSource, FfiSelectedCheckpointType, checkpoint_handles};
     use crate::ffi_metrics::with_ffi_event;
-    use crate::{OptionalValue, TryFromStringSlice as _, free_engine, free_snapshot};
+    use crate::{TryFromStringSlice as _, free_engine, free_snapshot};
 
     #[rstest]
     #[case::columns(StatsOptions::struct_columns(vec![column_name!("nested", "field.with.dot")]))]
@@ -257,7 +279,6 @@ mod tests {
             };
             // Safety: the record and all nested storage are borrowed for this callback.
             let record = unsafe { &*record };
-            let planning = &record.metadata_planning;
             assert_eq!(record.operation_id.bytes, event.operation_id.as_bytes());
             assert_eq!(
                 unsafe { String::try_from_slice(&record.correlation_id) }.unwrap(),
@@ -272,10 +293,10 @@ mod tests {
                 }
             );
             assert_eq!(record.duration_ns, 19);
-            assert_eq!(planning.read_collations, failed);
-            assert_eq!(planning.has_filter, !failed);
-            assert_eq!(planning.base_version, with_checkpoint.then_some(0).into());
-            match (&planning.stats, metadata.stats.struct_stats()) {
+            assert_eq!(record.read_collations, failed);
+            assert_eq!(record.has_filter, !failed);
+            assert_eq!(record.base_version, with_checkpoint.then_some(0).into());
+            match (&record.stats, metadata.stats.struct_stats()) {
                 (FfiStatsOptions::StructColumns(columns), StructStats::Columns { requested }) => {
                     assert_eq!(
                         &unsafe { columns.try_to_column_names() }.unwrap(),
@@ -295,19 +316,19 @@ mod tests {
                 _ => panic!("incorrect stats options"),
             }
             assert!(matches!(
-                planning.partition_values,
+                record.partition_values,
                 FfiPartitionValuesOptions::WithStruct
             ));
-            let OptionalValue::Some(timezone) = &planning.partition_timezone else {
+            let OptionalValue::Some(timezone) = &record.partition_timezone else {
                 panic!("missing timezone");
             };
             assert_eq!(unsafe { String::try_from_slice(timezone) }.unwrap(), "UTC");
             assert_eq!(
-                planning.commit_start_version,
+                record.commit_start_version,
                 with_checkpoint.then_some(0).into()
             );
             assert_eq!(
-                planning.commit_end_version,
+                record.commit_end_version,
                 with_checkpoint.then_some(0).into()
             );
             assert_eq!(record.checkpoint.is_null(), !with_checkpoint);
