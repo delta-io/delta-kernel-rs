@@ -19,7 +19,7 @@ pub(super) fn visit(
     visitor: SnapshotHintVisitor,
 ) -> KernelResult<()> {
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    if hint.retained_crc().is_some_and(|crc| {
+    if hint.crc().is_some_and(|crc| {
         crc.last_manifest_commit().is_some()
             || crc
                 .all_files()
@@ -49,9 +49,11 @@ pub(super) fn visit(
         .last_checkpoint_hint()
         .map(CheckpointBacking::try_new)
         .transpose()?;
-    let crc = hint.retained_crc().map(CrcBacking::new);
+    let crc = hint.crc().map(CrcBacking::new);
     let checkpoint_view = checkpoint.as_ref().map(CheckpointBacking::as_ffi);
     let crc_view = crc.as_ref().map(CrcBacking::as_ffi);
+    let checkpoint_type = hint.checkpoint_type().map(Into::into);
+    let crc_provenance = hint.crc_provenance().map(Into::into);
     let value = FfiSnapshotHint {
         version: hint.version(),
         freshness: match hint.freshness() {
@@ -64,8 +66,8 @@ pub(super) fn visit(
         last_checkpoint: optional_pointer(checkpoint_view.as_ref()),
         crc: optional_pointer(crc_view.as_ref()),
         publication_watermark: hint.publication_watermark().into(),
-        checkpoint_type: hint.checkpoint_type().map(Into::into).into(),
-        crc_provenance: hint.crc_provenance().map(Into::into).into(),
+        checkpoint_type: optional_pointer(checkpoint_type.as_ref()),
+        crc_provenance: optional_pointer(crc_provenance.as_ref()),
     };
     visitor(context, &value);
     Ok(())

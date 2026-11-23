@@ -58,19 +58,17 @@ borrowed. The callback runs once on success and is not invoked on error. All nes
 when the callback returns; copy retained values during the callback. No hint handle is returned.
 Supply the copied values through `snapshot_builder_with_snapshot_hint` when rebuilding a snapshot.
 The hint preserves build-time freshness, not current freshness, a matching checkpoint hint,
-the selected checkpoint type when known, retained CRC state (including stale baselines), and
-checksum provenance.
-`crc` is null only when no checksum is retained. Exports always include checksum provenance,
-preserving `Missing`/`Unusable` with a null CRC. Input hints may omit it: the snapshot then reports
-`Unknown`, and any supplied CRC must be at the hint version. Claims of a usable checksum require a
-non-null CRC. Any supplied CRC must be at or after the hint's selected checkpoint; an older CRC is
-rejected when the snapshot is built. Later updates that select a newer checkpoint can discard it.
-Compaction files are unsupported.
+the selected checkpoint type when known, and an at-version CRC. Stale CRCs are omitted.
+Checksum telemetry is preserved for an exported CRC and for absent-CRC observations such as
+`Missing` or `Unusable`. Omitting a stale CRC resets its provenance to `Unknown`.
+Input hints may omit telemetry; the snapshot then reports `Unknown`. Inconsistent telemetry also
+reports `Unknown` and does not affect whether the hint is accepted. CRC validation and retention
+are independent of telemetry. See `FfiSnapshotHint` for the claim rules.
 
-`FfiSnapshotHint.checkpoint_type` is an `OptionalValue<FfiSelectedCheckpointType>` for the
-checkpoint selected from the hint's log paths. `None` means unknown, not that no checkpoint was
-selected. C callers must set its tag explicitly, using `NoneFfiSelectedCheckpointType` when absent;
-a zero-initialized field is an invalid `Some` payload.
+Optional fields in `FfiSnapshotHint` use borrowed nullable pointers: `last_checkpoint`, `crc`,
+`checkpoint_type`, and `crc_provenance`. Null means absent. A null checkpoint type means unknown,
+not that no checkpoint was selected. A supplied type is advisory; naming and protocol take
+precedence, and checkpoint discovery replaces it with the observed type.
 
 Export includes an explicit publication watermark,
 preserving absence even when published commits are not represented by the retained paths.

@@ -22,7 +22,7 @@ impl MetadataReplayBase {
         let checkpoint_version = snapshot.log_segment().checkpoint_version;
         // Keep replay eligibility independent of SnapshotCrc's validation.
         if let Some((version, files)) = snapshot
-            .retained_crc()
+            .base_crc()
             .and_then(|crc| Some((crc.version, crc.all_files()?)))
             .filter(|(version, _)| {
                 checkpoint_version.is_none_or(|checkpoint| *version >= checkpoint)
@@ -133,7 +133,7 @@ mod tests {
         let base = Snapshot::builder_for(latest.table_root().clone())
             .at_version(4)
             .build(engine.as_ref())?;
-        let base_crc = base.retained_crc().expect("version 4 CRC");
+        let base_crc = base.base_crc().expect("version 4 CRC");
         let version = base_crc.version;
         let files = base_crc.all_files().expect("CRC allFiles");
         let crc = Some(Arc::new(Crc {

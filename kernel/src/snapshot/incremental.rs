@@ -290,40 +290,19 @@ impl Snapshot {
         // matching the fresh path.
         let pm_start = std::time::Instant::now();
         let base_crc = combined_log_segment
-            .pick_latest_base_crc(engine, existing_snapshot.retained_crc())
+            .pick_latest_base_crc(engine, existing_snapshot.base_crc())
             .inspect_err(|_| {
                 emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
             })?;
-        let crc_at_version = (|| {
-            if let Some(base) = base_crc
-                .as_ref()
-                .filter(|crc| crc.version <= existing_snapshot_version)
-            {
-                if base.version == existing_snapshot_version {
-                    existing_snapshot.validate_crc_configuration(base)?;
-                } else if incremental_replay.should_advance(base.version, new_end_version)? {
-                    // Validate at the existing snapshot before newer P&M actions can mask an
-                    // inconsistent hinted baseline. Charge the original base-to-target distance.
-                    let validated_base = Arc::new(
-                        existing_snapshot
-                            .log_segment()
-                            .build_crc_from_base(engine, base)?,
-                    );
-                    existing_snapshot.validate_crc_configuration(&validated_base)?;
-                    return combined_log_segment.try_build_crc_within_budget(
-                        engine,
-                        Some(&validated_base),
-                        IncrementalReplay::Unlimited,
-                    );
-                }
-            }
-            combined_log_segment.try_build_crc_within_budget(
-                engine,
-                base_crc.as_ref(),
-                incremental_replay,
-            )
-        })()
-        .inspect_err(|_| emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed()))?;
+        let (base_crc, base_origin) = match base_crc {
+            Some((crc, origin)) => (Some(crc), Some(origin)),
+            None => (None, None),
+        };
+        let crc_at_version = combined_log_segment
+            .try_build_crc_within_budget(engine, base_crc.as_ref(), incremental_replay)
+            .inspect_err(|_| {
+                emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
+            })?;
 
         let existing_table_config = existing_snapshot.table_configuration();
         let resolution = match &crc_at_version {
@@ -377,6 +356,7 @@ impl Snapshot {
         tracing::Span::current().record("version", table_configuration.version());
         let crc_provenance = super::snapshot_crc::SnapshotCrc::resolved_provenance(
             base_crc.as_ref(),
+            base_origin,
             Some(&existing_snapshot.crc),
             crc_at_version.as_ref().map(|(crc, _)| crc),
             new_end_version,
@@ -1980,7 +1960,7 @@ mod tests {
             Arc::new(Snapshot::new_with_crc(
                 snapshot_a.log_segment().clone(),
                 snapshot_a.table_configuration().clone(),
-                snapshot_a.retained_crc().cloned(),
+                snapshot_a.base_crc().cloned(),
                 CrcProvenance::default(),
                 false, /* built_as_latest */
                 false, /* skipped_new_checkpoints */

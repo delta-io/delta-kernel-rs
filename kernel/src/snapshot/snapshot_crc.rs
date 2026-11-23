@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use crate::crc::Crc;
+use crate::log_segment::CrcBaseOrigin;
 use crate::utils::require;
 use crate::{KernelError, KernelResult, Version};
 
@@ -60,14 +61,17 @@ pub enum CrcSource {
 pub struct CrcProvenance {
     /// How the checksum was resolved.
     pub source: CrcSource,
-    /// Version of the on-disk checksum file used as the original baseline, when known.
-    /// This stays at the disk file's version when the checksum is advanced in memory.
+    /// Version of the on-disk CRC from which the retained CRC was read or reconstructed.
+    /// This stays at that on-disk version across in-memory replay and later snapshot updates.
+    /// For example, CRC@8 replayed to v10 and retained by snapshot v12 has source `Stale` and
+    /// `base_version = Some(8)`. Keeping v8 allows a later reconstruction to v12 to report four
+    /// commits, even though `Stale` itself carries no commit count.
     pub base_version: Option<Version>,
 }
 
 impl CrcProvenance {
     /// Describes `source` and the on-disk baseline's `base_version`, if known.
-    /// Snapshot-hint construction validates the claim against the retained checksum.
+    /// Inconsistent snapshot-hint telemetry is reported as `Unknown` without rejecting the hint.
     #[delta_kernel_derive::internal_api]
     pub(crate) fn new(source: CrcSource, base_version: Option<Version>) -> Self {
         Self {
@@ -81,7 +85,7 @@ impl CrcProvenance {
 /// read from disk (or computed) at most once; keeping it lets later queries and CRC writes reuse
 /// the already-parsed state instead of re-reading it. A `Some(crc)` is one of:
 /// - at the snapshot version: authoritative, servable at zero I/O via [`Self::at_version`];
-/// - stale (older): available through [`Self::retained`] for reuse, never served as authoritative.
+/// - stale (older): available through [`Self::base`] for reuse, never served as authoritative.
 ///
 /// [`Snapshot`]: super::Snapshot
 #[derive(Debug, Clone)]
@@ -93,8 +97,8 @@ pub(super) struct SnapshotCrc {
 
 impl SnapshotCrc {
     /// Wrap the CRC a snapshot at `snapshot_version` resolved. A `Some(crc)` must sit in
-    /// `[checkpoint_version, snapshot_version]`, and its provenance must agree with its version
-    /// and the original disk baseline.
+    /// `[checkpoint_version, snapshot_version]`. Inconsistent telemetry is replaced with `Unknown`
+    /// without changing the retained CRC or the construction result.
     pub(super) fn try_new(
         crc: Option<Arc<Crc>>,
         snapshot_version: Version,
@@ -117,43 +121,16 @@ impl SnapshotCrc {
                 ))
             );
         }
-        Self::validate_provenance(crc.as_deref(), snapshot_version, provenance)?;
+        let provenance = if Self::provenance_matches(crc.as_deref(), snapshot_version, provenance) {
+            provenance
+        } else {
+            CrcProvenance::default()
+        };
         Ok(Self {
             crc,
             snapshot_version,
             provenance,
         })
-    }
-
-    /// Checks the checksum's provenance independently of its log-segment bounds.
-    pub(super) fn validate_provenance(
-        crc: Option<&Crc>,
-        snapshot_version: Version,
-        provenance: CrcProvenance,
-    ) -> KernelResult<()> {
-        let valid_provenance = match (provenance.source, provenance.base_version, crc) {
-            (CrcSource::Unknown, None, _) => true,
-            (CrcSource::Missing | CrcSource::Unusable, None, None) => true,
-            (CrcSource::AtVersion, Some(base_version), Some(crc)) => {
-                base_version == snapshot_version && crc.version == snapshot_version
-            }
-            (CrcSource::Stale, Some(base_version), Some(crc)) => {
-                base_version <= crc.version && crc.version < snapshot_version
-            }
-            (CrcSource::Reconstructed { num_commits }, Some(base_version), Some(crc)) => {
-                base_version < snapshot_version
-                    && crc.version == snapshot_version
-                    && num_commits == snapshot_version - base_version
-            }
-            _ => false,
-        };
-        require!(
-            valid_provenance,
-            KernelError::internal_error(
-                "Checksum source or baseline version conflicts with retained checksum"
-            )
-        );
-        Ok(())
     }
 
     pub(super) fn provenance(&self) -> CrcProvenance {
@@ -171,23 +148,24 @@ impl SnapshotCrc {
     }
 
     /// Resolves provenance after choosing and optionally advancing a replay baseline.
-    /// `LogSegment::pick_latest_base_crc` preserves the in-memory Arc's identity when it wins.
     pub(super) fn resolved_provenance(
         base: Option<&Arc<Crc>>,
+        origin: Option<CrcBaseOrigin>,
         previous: Option<&Self>,
         crc_at_version: Option<&Arc<Crc>>,
         snapshot_version: Version,
         candidate_present: bool,
     ) -> CrcProvenance {
-        let provenance = match base {
-            Some(base) => previous
-                .filter(|old| old.retained().is_some_and(|crc| Arc::ptr_eq(crc, base)))
-                .map_or(
-                    CrcProvenance::new(CrcSource::AtVersion, Some(base.version)),
-                    Self::provenance,
-                ),
-            None if candidate_present => CrcProvenance::new(CrcSource::Unusable, None),
-            None => CrcProvenance::new(CrcSource::Missing, None),
+        let provenance = match (base, origin) {
+            (Some(base), Some(CrcBaseOrigin::Disk)) => {
+                CrcProvenance::new(CrcSource::AtVersion, Some(base.version))
+            }
+            (Some(_), Some(CrcBaseOrigin::InMemory)) => {
+                previous.map(Self::provenance).unwrap_or_default()
+            }
+            (Some(_), None) => CrcProvenance::default(),
+            (None, _) if candidate_present => CrcProvenance::new(CrcSource::Unusable, None),
+            (None, _) => CrcProvenance::new(CrcSource::Missing, None),
         };
         Self::provenance_for_crc(provenance, crc_at_version.or(base), snapshot_version)
     }
@@ -202,8 +180,32 @@ impl SnapshotCrc {
 
     /// Returns the CRC kept in memory, whether at the snapshot version or stale.
     /// It may have been read from disk or advanced by replaying commits.
-    pub(super) fn retained(&self) -> Option<&Arc<Crc>> {
+    pub(super) fn base(&self) -> Option<&Arc<Crc>> {
         self.crc.as_ref()
+    }
+
+    /// Checks the checksum's provenance independently of its log-segment bounds.
+    fn provenance_matches(
+        crc: Option<&Crc>,
+        snapshot_version: Version,
+        provenance: CrcProvenance,
+    ) -> bool {
+        match (provenance.source, provenance.base_version, crc) {
+            (CrcSource::Unknown, None, _) => true,
+            (CrcSource::Missing | CrcSource::Unusable, None, None) => true,
+            (CrcSource::AtVersion, Some(base_version), Some(crc)) => {
+                base_version == snapshot_version && crc.version == snapshot_version
+            }
+            (CrcSource::Stale, Some(base_version), Some(crc)) => {
+                base_version <= crc.version && crc.version < snapshot_version
+            }
+            (CrcSource::Reconstructed { num_commits }, Some(base_version), Some(crc)) => {
+                base_version < snapshot_version
+                    && crc.version == snapshot_version
+                    && num_commits == snapshot_version - base_version
+            }
+            _ => false,
+        }
     }
 
     fn provenance_for_crc(
@@ -269,22 +271,30 @@ mod tests {
     fn new_accepts_crc_at_checkpoint() {
         let holder =
             SnapshotCrc::try_new(Some(crc_at(3)), 5, Some(3), CrcProvenance::default()).unwrap();
-        assert_eq!(holder.retained().map(|c| c.version), Some(3));
+        assert_eq!(holder.base().map(|c| c.version), Some(3));
     }
 
-    #[rstest::rstest]
-    #[case::at_version(Some(5), Some(5))]
-    #[case::stale(Some(3), None)]
-    #[case::absent(None, None)]
-    fn at_version_serves_only_crc_matching_snapshot_version(
-        #[case] crc_version: Option<Version>,
-        #[case] at_version: Option<Version>,
-    ) {
+    #[test]
+    fn at_version_serves_crc_matching_snapshot_version() {
         let holder =
-            SnapshotCrc::try_new(crc_version.map(crc_at), 5, None, CrcProvenance::default())
-                .unwrap();
-        assert_eq!(holder.at_version().map(|c| c.version), at_version);
-        assert_eq!(holder.retained().map(|c| c.version), crc_version);
+            SnapshotCrc::try_new(Some(crc_at(5)), 5, None, CrcProvenance::default()).unwrap();
+        assert_eq!(holder.at_version().map(|c| c.version), Some(5));
+        assert_eq!(holder.base().map(|c| c.version), Some(5));
+    }
+
+    #[test]
+    fn stale_crc_is_base_but_not_at_version() {
+        let holder =
+            SnapshotCrc::try_new(Some(crc_at(3)), 5, None, CrcProvenance::default()).unwrap();
+        assert!(holder.at_version().is_none());
+        assert_eq!(holder.base().map(|c| c.version), Some(3));
+    }
+
+    #[test]
+    fn none_holder_serves_nothing() {
+        let holder = SnapshotCrc::try_new(None, 5, None, CrcProvenance::default()).unwrap();
+        assert!(holder.at_version().is_none());
+        assert!(holder.base().is_none());
     }
 
     #[rstest::rstest]
@@ -304,7 +314,7 @@ mod tests {
     #[case::missing_with_base(None, CrcSource::Missing, Some(3))]
     #[case::unusable_with_base(None, CrcSource::Unusable, Some(3))]
     #[case::unknown_with_base(Some(5), CrcSource::Unknown, Some(3))]
-    fn rejects_inconsistent_provenance(
+    fn inconsistent_provenance_is_unknown_without_changing_crc(
         #[case] crc_version: Option<Version>,
         #[case] source: CrcSource,
         #[case] base_version: Option<Version>,
@@ -313,13 +323,16 @@ mod tests {
         let crc = crc_version.map(crc_at);
 
         // When the checksum and provenance are used to construct a snapshot's CRC state.
-        let error = SnapshotCrc::try_new(crc, 5, None, CrcProvenance::new(source, base_version))
-            .unwrap_err();
+        let state = SnapshotCrc::try_new(
+            crc.clone(),
+            5,
+            None,
+            CrcProvenance::new(source, base_version),
+        )
+        .unwrap();
 
-        // Then an invalid internal derivation is reported as an internal error.
-        assert!(matches!(
-            error.without_backtrace(),
-            KernelError::InternalError(_)
-        ));
+        // Then only telemetry is discarded; CRC retention and construction success are unchanged.
+        assert_eq!(state.provenance(), CrcProvenance::default());
+        assert_eq!(state.base(), crc.as_ref());
     }
 }

@@ -74,6 +74,15 @@ static REPLAY_COMMIT_INFO_FIELD: LazyLock<StructField> = LazyLock::new(|| {
     StructField::nullable(COMMIT_INFO_NAME, StructType::new_unchecked(fields))
 });
 
+/// The origin of the checksum selected as a replay base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CrcBaseOrigin {
+    /// Read from an on-disk checksum file during this load.
+    Disk,
+    /// Reused from the caller's retained checksum.
+    InMemory,
+}
+
 impl LogSegment {
     /// Try to build the CRC at this segment's `end_version` from the caller's resolved `base` CRC.
     /// Handles three cases:
@@ -109,13 +118,12 @@ impl LogSegment {
     /// Pick the latest CRC to use as an advance base: this segment's on-disk CRC or
     /// `in_memory_base`, whichever is newer, falling back to `in_memory_base` on a failed on-disk
     /// read, except cancellation. Drops a base below the checkpoint; returns None when no candidate
-    /// remains. When the in-memory base wins, preserves its Arc identity so snapshot provenance
-    /// can distinguish reuse from reading a checksum file.
+    /// remains. Returns the selected origin explicitly for checksum provenance.
     pub(crate) fn pick_latest_base_crc(
         &self,
         engine: &dyn Engine,
         in_memory_base: Option<&Arc<Crc>>,
-    ) -> KernelResult<Option<Arc<Crc>>> {
+    ) -> KernelResult<Option<(Arc<Crc>, CrcBaseOrigin)>> {
         let preferred_disk_crc = self
             .listed
             .latest_crc_file
@@ -125,17 +133,26 @@ impl LogSegment {
             .map(|file| read_crc_file_or_none(engine, file))
             .transpose()?
             .flatten();
-        Ok(disk_crc.or_else(|| in_memory_base.cloned()).filter(|crc| {
-            self.checkpoint_version
-                .is_none_or(|ckpt| crc.version >= ckpt)
-        }))
+        Ok(disk_crc
+            .map(|crc| (crc, CrcBaseOrigin::Disk))
+            .or_else(|| {
+                in_memory_base
+                    .cloned()
+                    .map(|crc| (crc, CrcBaseOrigin::InMemory))
+            })
+            .filter(|(crc, _)| {
+                self.checkpoint_version
+                    .is_none_or(|ckpt| crc.version >= ckpt)
+            }))
     }
 
     /// Read this segment's latest on-disk CRC (`latest_crc_file`), at whatever version it sits.
     /// Returns None when there is no CRC file or a non-cancellation read failure. The CRC may be
     /// stale (older than `end_version`).
     pub(crate) fn read_latest_crc(&self, engine: &dyn Engine) -> KernelResult<Option<Arc<Crc>>> {
-        self.pick_latest_base_crc(engine, /* in_memory_base */ None)
+        Ok(self
+            .pick_latest_base_crc(engine, /* in_memory_base */ None)?
+            .map(|(crc, _)| crc))
     }
 
     /// Produce a fresh `Crc` at `self.end_version` by reverse-replaying the commits in

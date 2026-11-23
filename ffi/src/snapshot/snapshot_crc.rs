@@ -10,7 +10,7 @@ use crate::{Handle, OptionalValue, SharedSnapshot};
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(C)]
 pub enum FfiCrcSource {
-    /// A usable checksum file was resolved at the snapshot version.
+    /// A usable on-disk checksum file was resolved at the snapshot version.
     AtVersion,
     /// An on-disk checksum was advanced in memory to the snapshot version.
     Reconstructed {
@@ -60,7 +60,9 @@ impl From<FfiCrcSource> for CrcSource {
 pub struct FfiCrcProvenance {
     /// How the checksum was resolved.
     pub source: FfiCrcSource,
-    /// Version of the on-disk checksum file used as the original baseline, if known.
+    /// Version of the on-disk CRC from which the retained CRC was read or reconstructed.
+    /// Preserved across replay and while the CRC is stale, so later reconstruction can count all
+    /// commits since that on-disk version. See [`CrcProvenance::base_version`].
     pub base_version: OptionalValue<u64>,
 }
 

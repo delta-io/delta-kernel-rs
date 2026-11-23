@@ -512,7 +512,7 @@ impl BuiltCrcTest {
             LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
         Ok(log_segment
             .pick_latest_base_crc(engine, in_memory_base)?
-            .map(|c| c.version))
+            .map(|(crc, _)| crc.version))
     }
 
     /// Read the on-disk CRC at `version` from this test's log.
@@ -1583,9 +1583,16 @@ async fn test_stale_crc_advanced_only_within_replay_budget(
         .with_snapshot_hint(snapshot.to_snapshot_hint().unwrap())
         .build(&built.engine)
         .unwrap();
-    // Then both checksum and provenance survive.
-    assert_eq!(rebuilt.crc_provenance(), expected);
-    assert_eq!(rebuilt.retained_crc(), snapshot.retained_crc());
+    // Then hints preserve only at-version CRCs, as they do without telemetry.
+    assert_eq!(rebuilt.base_crc(), snapshot.crc_at_version());
+    assert_eq!(
+        rebuilt.crc_provenance(),
+        if expected_source == CrcSource::Stale {
+            CrcProvenance::default()
+        } else {
+            expected
+        }
+    );
 }
 
 // Without adaptiveMetadata, CRC replay ignores `commitInfo.lastManifestCommit`, so a value of any
@@ -1611,7 +1618,7 @@ async fn test_stale_crc_advances_past_foreign_last_manifest_commit() {
 #[case::newer_disk_crc(Some(1), false, 1)]
 #[case::corrupt_newer_disk_crc(Some(1), true, 0)]
 #[tokio::test]
-async fn pick_latest_base_crc_preserves_cancellation_and_in_memory_identity(
+async fn pick_latest_base_crc_reports_origin_and_preserves_cancellation(
     #[case] disk_version: Option<Version>,
     #[case] corrupt_crc: bool,
     #[case] expected_version: Version,
@@ -1651,15 +1658,20 @@ async fn pick_latest_base_crc_preserves_cancellation_and_in_memory_identity(
     // When the baseline is selected, reading a newer disk candidate may be cancelled.
     let result = segment.pick_latest_base_crc(&engine, Some(&base));
 
-    // Then cancellation propagates; otherwise a winning in-memory baseline keeps its identity.
+    // Then cancellation propagates; otherwise the selected origin is explicit.
     if cancelled && disk_version == Some(1) {
         assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
     } else {
-        let selected = result.unwrap().unwrap();
+        let (selected, origin) = result.unwrap().unwrap();
         assert_eq!(selected.version, expected_version);
-        if expected_version == base.version {
-            assert!(Arc::ptr_eq(&base, &selected));
-        }
+        assert_eq!(
+            origin,
+            if expected_version == base.version {
+                super::CrcBaseOrigin::InMemory
+            } else {
+                super::CrcBaseOrigin::Disk
+            }
+        );
     }
 }
 
