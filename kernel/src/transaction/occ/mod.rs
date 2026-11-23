@@ -30,8 +30,8 @@ pub(crate) use occ_plan::OccCheck;
 use occ_plan::{first_occ_conflict, occ_plan, select_read_append_versions};
 pub(crate) use winner_check_plan::{WinnerRule, WinnerSummary};
 use winner_check_plan::{
-    ensure_no_manifest_commit, ensure_row_tracking_marks, ensure_winner_summaries,
-    first_winner_conflict, read_winner_summaries, winner_check_plan,
+    ensure_no_manifest_commit, ensure_row_tracking_marks, first_winner_conflict,
+    read_winner_summaries, winner_check_plan,
 };
 
 use crate::action_reconciliation::plan::VERSION;
@@ -65,8 +65,8 @@ pub(crate) fn detect_conflicts(
         return Ok(ConflictDetection::NoConflict(Vec::new()));
     }
     let plan = winner_check_plan(facts, winners)?;
-    let summaries = read_winner_summaries(executor.execute_op(Operation::QueryPlan(plan))?)?;
-    ensure_winner_summaries(winners, &summaries)?;
+    let result = executor.execute_op(Operation::QueryPlan(plan))?;
+    let summaries = read_winner_summaries(result, winners)?;
     if let Some(conflict) = first_winner_conflict(&summaries) {
         return Ok(ConflictDetection::Conflict(conflict));
     }
