@@ -573,7 +573,20 @@ mod tests {
         let exec = CountingExecutor::new();
 
         // When: the shared resolver discovers the complete checkpoint.
-        let resolved = CheckpointInfo::resolve(&exec, &segment).unwrap();
+        let resolved = CheckpointInfo::resolve_with_metrics(&exec, &segment);
+        let metrics = resolved.metrics;
+        let resolved = resolved.result.unwrap();
+        assert_eq!(metrics.is_some(), expected_checkpoint.is_some());
+        if let Some(metrics) = metrics {
+            assert_eq!(Some(metrics.version), segment.checkpoint_version);
+            assert_eq!(
+                (
+                    metrics.metadata_query_calls,
+                    metrics.root_footer_calls + metrics.sidecar_footer_calls
+                ),
+                exec.io_counts()
+            );
+        }
 
         // Then: absence stays explicit; selected checkpoints always include their leaf schema.
         assert_eq!(
@@ -835,11 +848,20 @@ mod tests {
     }
 
     #[rstest]
-    #[case::json("v2-checkpoints-json-without-sidecars", 0)]
-    #[case::parquet("v2-checkpoints-parquet-without-sidecars", 1)]
+    #[case::json(
+        "v2-checkpoints-json-without-sidecars",
+        0,
+        CheckpointSource::LastCheckpoint
+    )]
+    #[case::parquet(
+        "v2-checkpoints-parquet-without-sidecars",
+        1,
+        CheckpointSource::Resolved
+    )]
     fn empty_sidecars_hint_classifies_leaf_without_drain(
         #[case] table: &str,
         #[case] footer_reads: u64,
+        #[case] source: CheckpointSource,
         #[values(false, true)] include_metadata: bool,
     ) {
         // Given: a UUID-named checkpoint whose `_last_checkpoint` lists no sidecars.
@@ -865,7 +887,14 @@ mod tests {
         let exec = CountingExecutor::new();
 
         // When: full metadata is resolved.
-        let checkpoint_info = CheckpointInfo::resolve(&exec, &segment).unwrap().unwrap();
+        let resolved = CheckpointInfo::resolve_with_metrics(&exec, &segment);
+        let checkpoint_info = resolved.result.unwrap().unwrap();
+        let metrics = resolved.metrics.unwrap();
+        assert_eq!(metrics.version, root.version);
+        assert_eq!(metrics.source, source);
+        assert_eq!(metrics.root_footer_calls, footer_reads);
+        assert_eq!(metrics.sidecar_footer_calls, 0);
+        assert_eq!(metrics.metadata_query_calls, 0);
 
         // Then: the checkpoint is a leaf without draining its root. A Parquet root's footer is
         // read for the leaf schema because the hint carries no checkpoint schema.
@@ -995,10 +1024,12 @@ mod tests {
     }
 
     #[rstest]
-    #[case::parquet("parquet")]
-    #[case::json("json")]
+    #[case::parquet("parquet", CheckpointSource::LastCheckpoint, (0, 0, 0))]
+    #[case::json("json", CheckpointSource::LastCheckpoint, (0, 0, 0))]
     fn manifest_hint_sidecar_file_schema_skips_footer_read(
         #[case] extension: &str,
+        #[case] source: CheckpointSource,
+        #[case] counters: (u64, u64, u64),
         #[values(false, true)] compatible: bool,
     ) {
         // Given: a complete manifest hint with a compatible or incompatible sidecar schema.
@@ -1007,7 +1038,19 @@ mod tests {
         let exec = CountingExecutor::new();
 
         // When: metadata is resolved using that hint.
-        let checkpoint_info = CheckpointInfo::resolve(&exec, &segment).unwrap().unwrap();
+        let resolved = CheckpointInfo::resolve_with_metrics(&exec, &segment);
+        let checkpoint_info = resolved.result.unwrap().unwrap();
+        let metrics = resolved.metrics.unwrap();
+        assert_eq!(Some(metrics.version), segment.checkpoint_version);
+        assert_eq!(metrics.source, source);
+        assert_eq!(
+            (
+                metrics.root_footer_calls,
+                metrics.sidecar_footer_calls,
+                metrics.metadata_query_calls
+            ),
+            counters
+        );
 
         // Then: stats compatibility follows the hinted schema without any I/O.
         assert_eq!(checkpoint_info.kind(), CheckpointKind::Manifest);
