@@ -121,6 +121,7 @@ mod tests {
     use crate::arrow::util::pretty::pretty_format_batches;
     use crate::checkpoint::{CheckpointSpec, V2CheckpointConfig};
     use crate::committer::FileSystemCommitter;
+    use crate::engine::DelegatingEngine;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
     use crate::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
@@ -227,9 +228,13 @@ mod tests {
             names.len()
         );
 
-        let snapshot = snapshot.checkpoint(&engine, Some(&spec))?.1;
+        // Preserve the full payloads used by the imperative reconstruction above.
+        let checkpoint_engine =
+            DelegatingEngine::new(Arc::new(SyncEngine::new_with_store(table.store().clone())))
+                .without_plan_executor();
+        let snapshot = snapshot.checkpoint(&checkpoint_engine, Some(&spec))?.1;
         let mut segment = snapshot.log_segment().clone();
-        // V2 hints identify UUID-named manifests; Kernel's writer uses classic naming.
+        // V2 hints identify UUID-named manifests; the fixture uses classic naming.
         if matches!(spec, CheckpointSpec::V2(_)) {
             let checkpoint = &mut segment.listed.checkpoint_parts[0];
             let path = ParsedLogPath::new_uuid_parquet_checkpoint(
