@@ -1,7 +1,12 @@
 //! Conflict detection for a transaction T that lost a commit race.
 //!
-//! A winner is a commit after T's checked version. The winner check plan returns one summary for
-//! each winner that has an action.
+//! A winner is a commit after T's checked version. The checked version is T's read version on the
+//! first check, then the last winner version of the previous check. The winner check plan returns
+//! one summary for each winner that has an action.
+//!
+//! Differences from Delta Spark:
+//! - Kernel returns an error for a winner with more than one `commitInfo` action. Delta Spark uses
+//!   the first one.
 
 mod winner_check_plan;
 

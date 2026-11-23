@@ -101,9 +101,13 @@ fn fake_summary(version: Version, operation: &str, is_blind_append: bool) -> Win
 }
 
 fn winner_summaries(winners: &[WinningCommit]) -> Vec<WinnerSummary> {
+    try_winner_summaries(winners).unwrap()
+}
+
+fn try_winner_summaries(winners: &[WinningCommit]) -> KernelResult<Vec<WinnerSummary>> {
     let plan = winner_check_plan(winners).unwrap();
     let result = SyncPlanExecutor::default().execute_op(Operation::QueryPlan(plan));
-    read_winner_summaries(result.unwrap()).unwrap()
+    read_winner_summaries(result.unwrap(), winners)
 }
 
 // === Expected results ===

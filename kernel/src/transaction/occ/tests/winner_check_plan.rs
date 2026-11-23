@@ -1,9 +1,7 @@
 use rstest::rstest;
 
 use super::*;
-use crate::transaction::occ::winner_check_plan::{
-    WINNER_CHECK_OUTPUT_SCHEMA, ensure_winner_summaries,
-};
+use crate::transaction::occ::winner_check_plan::{COMMIT_INFO_ACTIONS, WINNER_CHECK_OUTPUT_SCHEMA};
 use crate::unit_test_utils::assert_result_error_with_message;
 
 fn summaries(commits: &[(Version, Vec<Value>)]) -> Vec<WinnerSummary> {
@@ -22,6 +20,13 @@ fn summaries(commits: &[(Version, Vec<Value>)]) -> Vec<WinnerSummary> {
     }))],
     (Some("WRITE"), true, Some(1_700_000_000_000)),
 )]
+#[case::commit_info_without_blind_append(
+    vec![line(Action::CommitInfo(CommitInfo {
+        is_blind_append: None,
+        ..base_commit_info("WRITE")
+    }))],
+    (Some("WRITE"), false, None),
+)]
 #[case::missing_commit_info(vec![remove("a.parquet", true)], (None, false, None))]
 fn winner_summary_reads_commit_info(
     #[case] actions: Vec<Value>,
@@ -39,15 +44,10 @@ fn winner_summary_reads_commit_info(
 
 #[test]
 fn winner_summaries_match_winners_with_several_actions() {
-    let (_table, winners) = table_winners(
-        READ_VERSION,
-        &[
-            (7, vec![commit_info("WRITE"), remove("a.parquet", true)]),
-            (8, vec![remove("b.parquet", true), commit_info("DELETE")]),
-        ],
-    );
-    let summaries = winner_summaries(&winners);
-    ensure_winner_summaries(&winners, &summaries).unwrap();
+    let summaries = summaries(&[
+        (7, vec![commit_info("WRITE"), remove("a.parquet", true)]),
+        (8, vec![remove("b.parquet", true), commit_info("DELETE")]),
+    ]);
     let expected = [
         fake_summary(7, "WRITE", false),
         fake_summary(8, "DELETE", false),
@@ -55,31 +55,35 @@ fn winner_summaries_match_winners_with_several_actions() {
     assert_eq!(summaries, expected);
 }
 
-#[test]
-fn read_winner_summaries_sorts_by_version() {
+/// Reads a winner check output with one row at each of `versions` as the summaries of `winners`.
+/// Each row counts one `commitInfo` action and has NULL or false in the other columns.
+fn read_output(versions: &[i64], winners: &[WinningCommit]) -> KernelResult<Vec<WinnerSummary>> {
     let row = |version: i64| {
         let fields = WINNER_CHECK_OUTPUT_SCHEMA.fields();
         Vec::from_iter(fields.map(|field| match field.name().as_str() {
             VERSION => Scalar::from(version),
+            COMMIT_INFO_ACTIONS => Scalar::from(1i64),
             _ if field.is_nullable() => Scalar::Null(field.data_type().clone()),
             _ => Scalar::from(false),
         }))
     };
-    let plan = PlanBuilder::values(WINNER_CHECK_OUTPUT_SCHEMA.clone(), vec![row(8), row(7)]);
-    let result = SyncPlanExecutor::default()
-        .execute_op(Operation::QueryPlan(plan.unwrap().build().unwrap()));
-    let summaries = read_winner_summaries(result.unwrap()).unwrap();
+    let rows = Vec::from_iter(versions.iter().copied().map(row));
+    let plan = PlanBuilder::values(WINNER_CHECK_OUTPUT_SCHEMA.clone(), rows).unwrap();
+    let result =
+        SyncPlanExecutor::default().execute_op(Operation::QueryPlan(plan.build().unwrap()));
+    read_winner_summaries(result.unwrap(), winners)
+}
+
+#[test]
+fn read_winner_summaries_sorts_by_version() {
+    let summaries = read_output(&[8, 7], &[fake_winner(7), fake_winner(8)]).unwrap();
     assert_eq!(Vec::from_iter(summaries.iter().map(|s| s.version)), [7, 8]);
 }
 
 #[test]
 fn extra_winner_summary_fails() {
-    let summaries = [
-        fake_summary(7, "WRITE", false),
-        fake_summary(8, "WRITE", false),
-    ];
     assert_result_error_with_message(
-        ensure_winner_summaries(&[fake_winner(7)], &summaries),
+        read_output(&[7, 8], &[fake_winner(7)]),
         "Internal error The winner check returned summaries for versions [7, 8], but the winning \
          commits are at versions [7]",
     );
@@ -87,11 +91,42 @@ fn extra_winner_summary_fails() {
 
 #[test]
 fn empty_winner_commit_fails_winner_summary_check() {
-    let (_table, winners) = table_winners(READ_VERSION, &[(7, vec![])]);
-    let summaries = winner_summaries(&winners);
+    let (_table, winners) = table_winners(
+        READ_VERSION,
+        &[
+            (7, vec![commit_info("WRITE")]),
+            (8, vec![]),
+            (9, vec![commit_info("WRITE")]),
+        ],
+    );
     assert_result_error_with_message(
-        ensure_winner_summaries(&winners, &summaries),
+        try_winner_summaries(&winners),
         "Generic delta kernel error: Conflict detection read no action from the commit file of \
-         version 7",
+         version 8",
+    );
+}
+
+#[test]
+fn winner_with_several_commit_infos_fails_winner_summary_check() {
+    let (_table, winners) = table_winners(
+        READ_VERSION,
+        &[
+            (7, vec![commit_info("WRITE")]),
+            (
+                8,
+                vec![
+                    commit_info("DELETE"),
+                    line(Action::CommitInfo(CommitInfo {
+                        timestamp: Some(0),
+                        ..Default::default()
+                    })),
+                ],
+            ),
+        ],
+    );
+    assert_result_error_with_message(
+        try_winner_summaries(&winners),
+        "Generic delta kernel error: Conflict detection can't check the winning commits at \
+         versions [8], because each has more than one `commitInfo` action",
     );
 }
