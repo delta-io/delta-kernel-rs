@@ -72,12 +72,10 @@ pub(super) fn winner_check_plan(winners: &[WinningCommit]) -> KernelResult<Plan>
 }
 
 /// Reads the winner check plan output into one summary for each winner, in ascending version
-/// order. The engine can return the aggregate groups in any order. `winners` must be in ascending
-/// version order.
+/// order. `winners` must be in ascending version order.
 ///
-/// Returns an error for a winner that Kernel can't check. A winner whose commit file has no action,
-/// such as an empty file, gets no summary. Each `first_non_null` aggregate picks its field on its
-/// own, so a winner with more than one `commitInfo` action could get a mixed summary.
+/// Returns an error for a winner that Kernel can't check: one whose commit file has no action,
+/// such as an empty file, or one with more than one `commitInfo` action.
 pub(super) fn read_winner_summaries(
     result: PlanResult,
     winners: &[WinningCommit],
@@ -86,6 +84,7 @@ pub(super) fn read_winner_summaries(
         mut summaries,
         mut multi_commit_info_versions,
     } = visit_batches(result)?;
+    // The engine can return the aggregate groups in any order.
     summaries.sort_by_key(|summary| summary.version);
     let returned = Vec::from_iter(summaries.iter().map(|summary| summary.version));
     let expected = winner_versions(winners);
@@ -100,6 +99,8 @@ pub(super) fn read_winner_summaries(
              commits are at versions {expected:?}"
         )));
     }
+    // Each `first_non_null` aggregate picks its field on its own, so several `commitInfo` actions
+    // could give a mixed summary.
     if !multi_commit_info_versions.is_empty() {
         multi_commit_info_versions.sort_unstable();
         return Err(KernelError::generic(format!(
