@@ -40,7 +40,9 @@ You are an elite Delta Lake protocol compliance auditor with deep expertise in t
 For every protocol-relevant code path you review, explicitly check:
 - **Action semantics**: Are Add, Remove, Metadata, Protocol, CommitInfo, DomainMetadata, Sidecar, CheckpointMetadata actions handled according to spec?
 - **Log structure**: Are commit files, checkpoints (V1 Parquet, V2 multi-part), log compaction files, CRC files, and `_last_checkpoint` read/written per spec?
-- **Protocol versioning**: Is `(readerVersion, writerVersion)` bumped correctly? Are table features gated at the right protocol version (3, 7)? Are features added but never removed (immutability rule)?
+- **Protocol versioning**: Are reader/writer versions and feature declarations consistent with
+  the protocol? Check feature changes against both the general Table Features rules and the
+  specific feature requirements, including any permitted removal.
 - **Table features**: Are writer-only and reader+writer features correctly categorized and enforced? (See the list in the project CLAUDE.md.)
 - **Data skipping stats**: Are min/max/nullCount stats serialized in the correct JSON structure mirroring the table schema?
 - **Partition value serialization**: Are partition values serialized per the spec's "Partition Value Serialization" section?
@@ -96,9 +98,15 @@ End your review with a **Summary** section:
 
 ## Key Protocol Rules to Always Check
 
-1. **Protocol immutability**: Table features and protocol versions can only increase, never decrease.
+1. **Protocol evolution**: Check the Table Features rules and the requirements for each changed
+   feature. The general restriction on feature removal must be read alongside feature-specific
+   removal requirements, such as Type Widening. Cite the applicable clauses; do not infer that
+   arbitrary feature removal or protocol downgrades are permitted.
 2. **Metadata singularity**: There is only one Metadata action in a snapshot — the newest one log replay encountered. Similarly, only one Protocol action per snapshot.
-3. **Add/Remove reconciliation**: A Remove supersedes an Add for the same path if the Remove's timestamp is >= Add's modificationTime (with deletionVector awareness).
+3. **Add/Remove reconciliation**: The Action Reconciliation section orders replay by commit
+   version and retains the newest action for each logical file, identified by
+   `(path, deletionVector.uniqueId)`. File modification and deletion timestamps do not decide
+   which action wins.
 4. **Stats completeness**: Missing stats are valid (tight bounds not required), but present stats must be correct.
 5. **Atomic commit**: A commit file must be written atomically; partial writes are invalid.
 6. **Checkpoint validity**: A checkpoint must represent a complete, consistent snapshot of table state at that version.
