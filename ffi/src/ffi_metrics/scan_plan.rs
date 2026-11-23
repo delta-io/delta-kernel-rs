@@ -37,26 +37,31 @@ pub enum ReplayBase {
 /// borrowed only for the metric callback; copy every retained value before returning.
 #[repr(C)]
 pub struct ScanPlanReport {
+    // === Planning attempt ===
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub outcome: ScanPlanOutcome,
     pub duration_ns: u64,
+
+    // === Scan options ===
     pub stats: FfiStatsOptions,
     pub variant_min_max: bool,
     /// False when Geometry statistics support is disabled.
     pub geometry_min_max: bool,
     pub partition_values: FfiPartitionValuesOptions,
     pub partition_timezone: OptionalValue<KernelStringSlice>,
+    pub read_collations: bool,
+    pub has_filter: bool,
+
+    // === Log replay ===
     pub replay_base: OptionalValue<ReplayBase>,
+    pub base_version: OptionalValue<u64>,
     /// Null when no checkpoint was used.
     pub checkpoint: *const FfiCheckpointMetrics,
     pub commit_start_version: OptionalValue<u64>,
     pub commit_end_version: OptionalValue<u64>,
     pub commit_total_size_bytes: u64,
     pub compaction_file_count: u64,
-    pub read_collations: bool,
-    pub has_filter: bool,
-    pub base_version: OptionalValue<u64>,
 }
 
 pub(super) fn with_event<F: FnOnce(MetricEvent)>(
@@ -157,6 +162,8 @@ pub(super) fn with_event<F: FnOnce(MetricEvent)>(
                 .timestamp_timezone()
                 .map(|timezone| kernel_string_slice!(timezone))
                 .into(),
+            read_collations: metadata.read_collations,
+            has_filter: metadata.has_filter,
             replay_base: metadata
                 .replay_base
                 .map(|base| match base {
@@ -165,6 +172,7 @@ pub(super) fn with_event<F: FnOnce(MetricEvent)>(
                     kernel::ReplayBase::Empty => ReplayBase::Empty,
                 })
                 .into(),
+            base_version: metadata.base_version.into(),
             checkpoint: metrics
                 .as_ref()
                 .map_or(std::ptr::null(), std::ptr::from_ref),
@@ -172,9 +180,6 @@ pub(super) fn with_event<F: FnOnce(MetricEvent)>(
             commit_end_version: metadata.commit_end_version.into(),
             commit_total_size_bytes: metadata.commit_total_size_bytes,
             compaction_file_count: metadata.compaction_file_count,
-            read_collations: metadata.read_collations,
-            has_filter: metadata.has_filter,
-            base_version: metadata.base_version.into(),
         };
         f(if *failed {
             MetricEvent::ScanPlanGenerationFailed(&record)
