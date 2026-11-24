@@ -720,12 +720,45 @@ fn arrow_convert_to_non_view_type(vals: Arc<dyn Array>) -> KernelResult<Arc<dyn 
 /// Whether each row of a map array contains the key at the same row of `key`. A NULL map row or a
 /// NULL key yields NULL.
 ///
-/// The key must have one row per map row and the map's key type. A string or binary key whose
-/// Arrow layout differs from the map keys, such as `Utf8` against `Utf8View`, is aligned with the
-/// map keys by [`align_comparison_operands`], the same way [`BinaryPredicateOp::Equal`] aligns
-/// its operands. Maps with nested key types are rejected.
+/// Arrow stores the entries of all map rows back to back, and `value_offsets` marks where each
+/// row starts. Every entry gets the key of its row, one `eq` compares all entries, and each row
+/// then checks its own entries for a match.
 fn map_has_key(map: &ArrayRef, key: &ArrayRef) -> KernelResult<BooleanArray> {
     let map = as_map_array(map, "MapHasKey")?;
+    check_map_has_key_inputs(map, key)?;
+
+    // Give every map entry the key of its row, so entry i of row r is compared with key r.
+    let offsets = map.value_offsets();
+    let first_entry = offsets[0] as usize;
+    let entries_in_row = |row: usize| (offsets[row + 1] - offsets[row]) as usize;
+    let row_of_each_entry: UInt32Array = (0..map.len())
+        .flat_map(|row| std::iter::repeat_n(row as u32, entries_in_row(row)))
+        .collect();
+    let entry_keys = map.keys().slice(first_entry, row_of_each_entry.len());
+    let (entry_keys, key) = align_comparison_operands(entry_keys, key.clone())?;
+    let key_for_each_entry = take(key.as_ref(), &row_of_each_entry, None)?;
+
+    // Compare all entries at once, then check each row for at least one match.
+    let entry_matches = eq(&entry_keys, &key_for_each_entry)?;
+    let has_key = (0..map.len()).map(|row| {
+        if map.is_null(row) || key.is_null(row) {
+            return None;
+        }
+        let row_start = offsets[row] as usize - first_entry;
+        let row_matches = entry_matches.slice(row_start, entries_in_row(row));
+        Some(row_matches.true_count() > 0)
+    });
+    Ok(has_key.collect())
+}
+
+/// Checks that `key` has one row per map row and a type that `map_has_key` can compare with the
+/// map keys.
+///
+/// The key must have the map's key type. A string or binary key whose Arrow layout differs from
+/// the map keys, such as `Utf8` against `Utf8View`, is accepted and aligned by
+/// [`align_comparison_operands`], the same way [`BinaryPredicateOp::Equal`] aligns its operands.
+/// Maps with nested key types are rejected.
+fn check_map_has_key_inputs(map: &MapArray, key: &ArrayRef) -> KernelResult<()> {
     if key.len() != map.len() {
         return Err(KernelError::invalid_expression(format!(
             "MapHasKey requires one key per map row, but got {} keys for {} rows",
@@ -733,41 +766,20 @@ fn map_has_key(map: &ArrayRef, key: &ArrayRef) -> KernelResult<BooleanArray> {
             map.len()
         )));
     }
-    let map_keys = map.keys();
-    if map_keys.data_type().is_nested() {
+    let map_key_type = map.keys().data_type();
+    if map_key_type.is_nested() {
         return Err(KernelError::invalid_expression(format!(
-            "MapHasKey does not support nested map key type {:?}",
-            map_keys.data_type()
+            "MapHasKey does not support nested map key type {map_key_type:?}"
         )));
     }
-    if key.data_type() != map_keys.data_type()
-        && !is_layout_only_difference(key.data_type(), map_keys.data_type())
+    if key.data_type() != map_key_type && !is_layout_only_difference(key.data_type(), map_key_type)
     {
         return Err(KernelError::invalid_expression(format!(
-            "MapHasKey requires a key of the map key type {:?}, but got {:?}",
-            map_keys.data_type(),
+            "MapHasKey requires a key of the map key type {map_key_type:?}, but got {:?}",
             key.data_type()
         )));
     }
-    // Repeat each row's key once per entry of that row, so a single `eq` compares all entries.
-    let offsets = map.value_offsets();
-    let first = offsets[0] as usize;
-    let entry_len = |row: usize| (offsets[row + 1] - offsets[row]) as usize;
-    let entry_rows: UInt32Array = (0..map.len())
-        .flat_map(|row| std::iter::repeat_n(row as u32, entry_len(row)))
-        .collect();
-    let entry_keys = map_keys.slice(first, entry_rows.len());
-    let (entry_keys, key) = align_comparison_operands(entry_keys, key.clone())?;
-    let row_keys = take(key.as_ref(), &entry_rows, None)?;
-    let matches = eq(&entry_keys, &row_keys)?;
-    let has_key = (0..map.len()).map(|row| {
-        if map.is_null(row) || key.is_null(row) {
-            return None;
-        }
-        let start = offsets[row] as usize - first;
-        Some(matches.slice(start, entry_len(row)).true_count() > 0)
-    });
-    Ok(has_key.collect())
+    Ok(())
 }
 
 /// Converts both comparison operands to view layouts when their Arrow types differ. Casting from a
