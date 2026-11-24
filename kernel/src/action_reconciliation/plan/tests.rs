@@ -98,6 +98,14 @@ async fn replay_selects_latest_action_without_retention(
             Action::DomainMetadata(domain_deletion),
         ])
         .await;
+    let expected_start = if checkpoint.is_some() { 4 } else { 0 };
+    let mut expected_bytes = 0;
+    for version in expected_start..=5 {
+        let path = table
+            .table_root()
+            .join(format!("_delta_log/{version:020}.json"));
+        expected_bytes += std::fs::metadata(path).unwrap().len();
+    }
     // When: shared replay reads the requested actions using complete checkpoint discovery.
     let snapshot = build_snapshot!(VersionTarget::Latest, &table_root, &engine);
     let checkpoint_info = actions
@@ -120,6 +128,10 @@ async fn replay_selects_latest_action_without_retention(
     assert!(!report.read_collations);
     assert!(!report.has_filter);
     assert_eq!(report.base_version, checkpoint.is_some().then_some(3));
+    assert_eq!(report.commit_start_version, Some(expected_start));
+    assert_eq!(report.commit_end_version, Some(5));
+    assert_eq!(report.compaction_file_count, 0);
+    assert_eq!(report.commit_total_size_bytes, expected_bytes);
     assert_eq!(
         report.replay_base,
         Some(if checkpoint.is_some() {
