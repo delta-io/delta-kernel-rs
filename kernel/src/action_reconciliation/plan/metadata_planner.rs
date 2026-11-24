@@ -135,6 +135,7 @@ impl<'a> MetadataPlanner<'a> {
         self
     }
 
+    // TODO(#4107): Consume the configured planner in replay instead of mutating source builders.
     /// Reconstructs requested actions with the configured stats and partition representations.
     /// Uses the caller's resolved schemas and options; sources supply `version`.
     /// Checkpoint file actions require a resolved shape. Winning domain deletions are retained.
