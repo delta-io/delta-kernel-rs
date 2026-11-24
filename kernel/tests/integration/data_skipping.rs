@@ -774,7 +774,14 @@ async fn extended_year_timestamp_round_trip_via_checkpoint_and_remove(
     // writeStatsAsStruct makes the checkpoint materialize stats_parsed, the column where the
     // safe-cast result lands.
     let (_tmp_dir, table_path, engine, table_url, store) =
-        timestamp_stats_table_setup(&[("delta.checkpoint.writeStatsAsStruct", "true")])?;
+        timestamp_stats_table_setup(if declarative {
+            &[
+                ("delta.checkpoint.writeStatsAsStruct", "true"),
+                ("delta.feature.v2Checkpoint", "supported"),
+            ]
+        } else {
+            &[("delta.checkpoint.writeStatsAsStruct", "true")]
+        })?;
     let table_url_string = table_url.to_string();
 
     // v1: file_A + file_B + file_E in one commit. The shared batch is what makes the
@@ -825,7 +832,8 @@ async fn extended_year_timestamp_round_trip_via_checkpoint_and_remove(
     // batch and materializes stats_parsed with file_B's EventTime safe-cast to NULL.
     let snapshot_v1 = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
-    snapshot_v1.checkpoint(checkpoint_engine.as_ref(), None)?;
+    let checkpoint_spec = declarative.then_some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar));
+    snapshot_v1.checkpoint(checkpoint_engine.as_ref(), checkpoint_spec.as_ref())?;
 
     // v2: file_C via JSON commit, post-checkpoint. Reads still see this as JSON stats and
     // run parse_json at scan time.
@@ -1571,7 +1579,16 @@ async fn all_null_files_pruned_regardless_of_source(
         AllNullSource::CheckpointJsonStats => &[("delta.checkpoint.writeStatsAsStruct", "false")],
         AllNullSource::CommitOnly => &[],
     };
-    let _ = create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), table_properties)?;
+    let mut table_properties = table_properties.to_vec();
+    let structured_checkpoint = matches!(
+        source,
+        AllNullSource::CheckpointStructStats | AllNullSource::Both
+    );
+    if declarative && structured_checkpoint {
+        table_properties.push(("delta.feature.v2Checkpoint", "supported"));
+    }
+    let _ =
+        create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), &table_properties)?;
     let store: Arc<delta_kernel::object_store::DynObjectStore> = Arc::new(LocalFileSystem::new());
     let table_url = Url::from_directory_path(&table_path)
         .map_err(|_| "table_path should be a valid file URL")?;
@@ -1604,7 +1621,9 @@ async fn all_null_files_pruned_regardless_of_source(
     if use_checkpoint {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
         let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
-        snapshot.checkpoint(checkpoint_engine.as_ref(), None)?;
+        let checkpoint_spec = (declarative && structured_checkpoint)
+            .then_some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar));
+        snapshot.checkpoint(checkpoint_engine.as_ref(), checkpoint_spec.as_ref())?;
     }
 
     // v2: post-checkpoint JSON commit adding an all-null file (the delta-log source).
