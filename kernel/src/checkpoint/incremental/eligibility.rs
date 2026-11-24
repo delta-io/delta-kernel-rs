@@ -16,14 +16,14 @@ use crate::schema::{
 };
 use crate::{Engine, ExpressionEvaluator, KernelError, KernelResult, RowVisitor, Version};
 
-pub(super) struct TailEligibility {
+pub(super) struct SidecarReuseTailValidator {
     read_schema: SchemaRef,
     eligibility_projection: Arc<dyn ExpressionEvaluator>,
     action_projection: Arc<dyn ExpressionEvaluator>,
     summary: TailSummary,
 }
 
-impl TailEligibility {
+impl SidecarReuseTailValidator {
     pub(super) fn new<'a>(
         engine: &dyn Engine,
         action_schema: SchemaRef,

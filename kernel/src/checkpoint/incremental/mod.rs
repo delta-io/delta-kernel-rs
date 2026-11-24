@@ -12,13 +12,13 @@ use std::sync::{Arc, LazyLock};
 use itertools::Itertools as _;
 use url::Url;
 
-use self::eligibility::TailEligibility;
+use self::eligibility::SidecarReuseTailValidator;
 use super::metrics::{CheckpointMetrics, CheckpointPhase};
 use super::{
     CheckpointWriter, MIN_REMOVE_DELETION_TIMESTAMP_TAG, ReusedSidecars, WrittenCheckpointInfo,
 };
-use crate::action_reconciliation::RetentionCalculator as _;
 use crate::action_reconciliation::file_metadata::build_checkpoint_transform;
+use crate::action_reconciliation::{ActionReconciliationIteratorState, RetentionCalculator as _};
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
     CHECKPOINT_NUM_ADD_FILES_TAG, SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NUM_ACTIONS_TAG,
@@ -45,20 +45,13 @@ impl CheckpointWriter {
         file_actions_per_sidecar_hint: usize,
         metrics: CheckpointMetrics,
     ) -> KernelResult<WrittenCheckpointInfo> {
-        let target_file_count = self
-            .snapshot
-            .crc_at_version()
-            .and_then(|crc| crc.file_stats())
-            .map(|stats| stats.num_files());
-        let Some(target_file_count) =
-            target_file_count.filter(|_| self.snapshot.is_built_as_latest())
-        else {
+        if !self.snapshot.is_built_as_latest() {
             return self.write_v2_checkpoint_with_sidecars(
                 engine,
                 file_actions_per_sidecar_hint,
                 metrics,
             );
-        };
+        }
         let now_ms = current_time_ms()?;
         let file_retention = self.deleted_file_retention_timestamp()?;
         let Some(ReusableBase {
@@ -85,7 +78,9 @@ impl CheckpointWriter {
         let reuse_allowed = Arc::new(AtomicBool::new(true));
         let sidecars_started = Arc::new(AtomicUsize::new(0));
         let inherited_sidecar_count = inherited.references.len();
-        let mut tail = TailEligibility::new(
+        let inherited_file_action_count = inherited.num_adds.checked_add(inherited.num_removes);
+        let reconciliation_state = Arc::new(ActionReconciliationIteratorState::default());
+        let mut tail = SidecarReuseTailValidator::new(
             engine,
             self.read_schema.clone(),
             log_segment.listed.ascending_commit_files.iter(),
@@ -120,17 +115,26 @@ impl CheckpointWriter {
             let metrics = metrics.clone();
             let reuse_allowed = reuse_allowed.clone();
             let sidecars_started = sidecars_started.clone();
+            let reconciliation_state = reconciliation_state.clone();
             move || {
                 let candidate_sidecars =
                     inherited_sidecar_count.checked_add(sidecars_started.load(Ordering::Relaxed));
-                let reuse = reuse_allowed.load(Ordering::Relaxed)
-                    && candidate_sidecars.is_some_and(|count| {
-                        density_allows_reuse(
-                            target_file_count,
-                            count,
-                            file_actions_per_sidecar_hint,
-                        )
+                // Before expanding the base, these counters include only reconciled tail actions.
+                let target_file_action_count = inherited_file_action_count
+                    .and_then(|count| count.checked_add(reconciliation_state.add_actions_count()))
+                    .and_then(|count| {
+                        count.checked_add(reconciliation_state.remove_actions_count())
                     });
+                let reuse = reuse_allowed.load(Ordering::Relaxed)
+                    && target_file_action_count
+                        .zip(candidate_sidecars)
+                        .is_some_and(|(file_actions, sidecar_count)| {
+                            density_allows_reuse(
+                                file_actions,
+                                sidecar_count,
+                                file_actions_per_sidecar_hint,
+                            )
+                        });
                 reuse_allowed.store(reuse, Ordering::Relaxed);
                 let sidecars: Box<dyn KernelResultIterator<ActionsBatch>> = if reuse {
                     Box::new(std::iter::empty())
@@ -149,7 +153,7 @@ impl CheckpointWriter {
         .flatten_ok()
         .map(|batch| batch.and_then(std::convert::identity));
         let actions = tail_actions.chain(base_actions);
-        let data = self.reconcile_checkpoint_actions_with_retention(
+        let (data, output_schema) = self.reconcile_checkpoint_actions_with_retention(
             engine,
             actions,
             file_retention,
@@ -160,7 +164,7 @@ impl CheckpointWriter {
         self.write_sidecar_checkpoint(
             engine,
             file_actions_per_sidecar_hint,
-            data,
+            (data.with_shared_state(reconciliation_state), output_schema),
             move || {
                 if reuse_allowed.load(Ordering::Relaxed) {
                     inherited
@@ -304,11 +308,11 @@ struct ReusableBase {
     inherited: ReusedSidecars,
 }
 
-fn density_allows_reuse(num_files: i64, num_sidecars: usize, hint: usize) -> bool {
-    let Ok(num_files) = u128::try_from(num_files) else {
+fn density_allows_reuse(num_file_actions: i64, num_sidecars: usize, hint: usize) -> bool {
+    let Ok(num_file_actions) = u128::try_from(num_file_actions) else {
         return false;
     };
-    hint > 0 && num_sidecars > 0 && 2 * num_files >= (num_sidecars as u128) * (hint as u128)
+    hint > 0 && num_sidecars > 0 && 2 * num_file_actions >= (num_sidecars as u128) * (hint as u128)
 }
 
 fn sidecar_is_recent(modification_time: i64, now_ms: i64) -> bool {

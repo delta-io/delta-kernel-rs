@@ -187,6 +187,17 @@ impl ActionReconciliationIterator {
         Arc::clone(&self.state)
     }
 
+    /// Shares counters with an input continuation.
+    /// Supply fresh state before polling this iterator or sharing its [`Self::state`] handle.
+    #[cfg(feature = "incremental-checkpoints-in-dev")]
+    pub(crate) fn with_shared_state(
+        mut self,
+        state: Arc<ActionReconciliationIteratorState>,
+    ) -> Self {
+        self.state = state;
+        self
+    }
+
     /// Helper to transform a batch: update metrics and extract filtered data
     fn transform_batch(
         &mut self,
@@ -504,12 +515,10 @@ impl ActionReconciliationVisitor<'_> {
             self.remove_actions_count += 1;
             #[cfg(feature = "incremental-checkpoints-in-dev")]
             {
-                self.min_remove_deletion_timestamp = Some(
-                    self.min_remove_deletion_timestamp
-                        .map_or(deletion_timestamp, |minimum| {
-                            minimum.min(deletion_timestamp)
-                        }),
-                );
+                let minimum = self
+                    .min_remove_deletion_timestamp
+                    .get_or_insert(deletion_timestamp);
+                *minimum = (*minimum).min(deletion_timestamp);
             }
             true
         };

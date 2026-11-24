@@ -333,8 +333,10 @@ pub enum V2CheckpointConfig {
     /// declare a supported operation, and its file actions must leave inherited state unchanged.
     /// The base must report exact counts, a compatible sidecar schema and sufficient retention
     /// metadata for inherited Removes. Every inherited sidecar must be less than 24 hours old.
-    /// Reuse requires a snapshot built as latest with complete at-version CRC file statistics.
-    /// If the candidate averages fewer live files per sidecar than half the effective sizing
+    /// Reuse requires a snapshot built as latest. The candidate's file-action count combines
+    /// inherited Adds and Removes with surviving tail Adds and retained Removes counted by
+    /// reconciliation; no CRC is required. Root non-file actions do not contribute to density.
+    /// If the candidate averages fewer file actions per sidecar than half the effective sizing
     /// hint, or another eligibility check fails, construct a full checkpoint. Successful reuse
     /// never reads inherited sidecar objects.
     ///
@@ -718,11 +720,7 @@ impl CheckpointWriter {
                 sidecars_started.clone(),
                 &metrics,
             )? {
-                sidecar_references.push(SidecarReference {
-                    path: entry.0,
-                    file_meta: entry.1,
-                    tags: None,
-                });
+                sidecar_references.push(entry);
             }
             let is_exhausted = splitter
                 .lock()
@@ -763,12 +761,13 @@ impl CheckpointWriter {
             })?
             .into_non_file_batches();
 
+        let num_adds = checked_sum_action_counts(iter_state.add_actions_count(), reused.num_adds)?;
+        let num_removes =
+            checked_sum_action_counts(iter_state.remove_actions_count(), reused.num_removes)?;
+        let num_remove_files = u64::try_from(num_removes)
+            .map_err(|_| KernelError::internal_error("Negative Remove count"))?;
         #[cfg(feature = "incremental-checkpoints-in-dev")]
         let tags = {
-            let num_adds =
-                checked_sum_action_counts(iter_state.add_actions_count(), reused.num_adds)?;
-            let num_removes =
-                checked_sum_action_counts(iter_state.remove_actions_count(), reused.num_removes)?;
             let mut tags = HashMap::from([
                 (
                     SIDECAR_NUM_ACTIONS_TAG.to_owned(),
@@ -840,16 +839,8 @@ impl CheckpointWriter {
             info.last_checkpoint_stats.num_actions,
             checked_sum_action_counts(inherited_actions, 1)?,
         )?;
-        info.last_checkpoint_stats.num_of_add_files = checked_sum_action_counts(
-            info.last_checkpoint_stats.num_of_add_files,
-            reused.num_adds,
-        )?;
-        let inherited_removes = u64::try_from(reused.num_removes)
-            .map_err(|_| KernelError::internal_error("Negative inherited Remove count"))?;
-        info.num_remove_files = info
-            .num_remove_files
-            .checked_add(inherited_removes)
-            .ok_or_else(|| KernelError::checkpoint_write("Remove count overflow"))?;
+        info.last_checkpoint_stats.num_of_add_files = num_adds;
+        info.num_remove_files = num_remove_files;
         info.num_reused_sidecars = num_reused_sidecars;
         Ok(info)
     }
@@ -1060,7 +1051,7 @@ fn write_single_sidecar(
     version: Version,
     sidecars_started: Option<Arc<AtomicUsize>>,
     metrics: &CheckpointMetrics,
-) -> KernelResult<Option<(String, FileMeta)>> {
+) -> KernelResult<Option<SidecarReference>> {
     let mut iter = SingleSidecarDataIterator::new(
         splitter.clone(),
         file_actions_per_sidecar_hint,
@@ -1078,7 +1069,11 @@ fn write_single_sidecar(
         true,
     )?;
     let meta = verify_written_file(engine, &sidecar_url, written_size, metrics)?;
-    Ok(Some((filename, meta)))
+    Ok(Some(SidecarReference {
+        path: filename,
+        file_meta: meta,
+        tags: None,
+    }))
 }
 
 #[derive(Default)]

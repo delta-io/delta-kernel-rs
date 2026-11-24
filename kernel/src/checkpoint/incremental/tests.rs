@@ -8,8 +8,8 @@ use serde_json::{Value, json};
 use url::Url;
 
 use super::SIDECAR_REUSE_WINDOW_MS;
-use super::eligibility::TailEligibility;
-use crate::actions::{Add, CommitInfo, SetTransaction, Sidecar};
+use super::eligibility::SidecarReuseTailValidator;
+use crate::actions::{Add, CommitInfo, Remove, SetTransaction, Sidecar};
 use crate::arrow::array::{Array, MapArray, StringArray, StructArray};
 use crate::checkpoint::tests::{
     create_metadata_action, create_v2_checkpoint_protocol_action, new_in_memory_store,
@@ -54,6 +54,23 @@ fn spec_with_hint(reuse: bool, file_actions_per_sidecar_hint: Option<usize>) -> 
             file_actions_per_sidecar_hint,
         }
     })
+}
+
+async fn write_base_checkpoint(
+    store: &Arc<InMemory>,
+    engine: &dyn Engine,
+    paths: &[&str],
+) -> crate::Result<()> {
+    let mut actions = vec![
+        create_metadata_action(),
+        create_v2_checkpoint_protocol_action(),
+    ];
+    actions.extend(paths.iter().map(|path| create_add_action(path)));
+    write_commit_to_store(store, actions, 0).await?;
+    Snapshot::builder_for("memory:///")
+        .build(engine)?
+        .checkpoint(engine, Some(&spec(false)))?;
+    Ok(())
 }
 
 async fn latest_with_crc(store: &Arc<InMemory>, num_files: usize) -> crate::Result<SnapshotRef> {
@@ -147,22 +164,14 @@ impl JsonHandler for TrackTailJson {
             2,
             "expected the two tail commits in one ordered read"
         );
-        assert!(
-            files[0]
-                .location
-                .path()
-                .ends_with("00000000000000000002.json")
-        );
-        assert!(
-            files[1]
-                .location
-                .path()
-                .ends_with("00000000000000000001.json")
-        );
         let filenames: Vec<_> = files
             .iter()
             .map(|file| file.location.path().rsplit('/').next().unwrap().to_owned())
             .collect();
+        assert!(
+            filenames[0] > filenames[1],
+            "tail commits must be newest-first"
+        );
         {
             let mut state = self.state.lock().unwrap();
             for filename in &filenames {
@@ -177,7 +186,7 @@ impl JsonHandler for TrackTailJson {
         let mut emitted = 0;
         Ok(Box::new(std::iter::from_fn(move || {
             // SyncJsonHandler yields one batch per commit, including its commitInfo row.
-            // With hint=1, Add D's sidecar must finish before the older file is pulled.
+            // The newest batch reaches the hint, flushing Add D before the older commit.
             if emitted == 1 {
                 assert!(
                     !state.lock().unwrap().written_sidecars.is_empty(),
@@ -737,6 +746,120 @@ async fn all_or_nothing_reuses_only_unchanged_base(
 
 #[rstest]
 #[tokio::test]
+async fn successive_compactions_merge_inherited_and_tail_remove_summaries(
+    #[values(false, true)] tail_is_older: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (store, _) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+    let original = crate::utils::current_time_ms()? - 3_600_000;
+    let first = if tail_is_older {
+        original - 20
+    } else {
+        original + 20
+    };
+    let remove = |path: &str, timestamp| {
+        Action::Remove(crate::actions::Remove {
+            path: path.into(),
+            deletion_timestamp: Some(timestamp),
+            data_change: false,
+            ..Default::default()
+        })
+    };
+    let mut actions = vec![
+        create_metadata_action(),
+        create_v2_checkpoint_protocol_action(),
+        remove("old", original),
+    ];
+    actions.extend(["A", "B", "C", "D"].map(create_add_action));
+    write_commit_to_store(&store, actions, 0).await?;
+    Snapshot::builder_for("memory:///")
+        .build(&engine)?
+        .checkpoint(&engine, Some(&spec(false)))?;
+    let (mut previous_root, _) = checkpoint_rows(&store, 0).await;
+    let mut expected = vec![("old".to_owned(), Some(original))];
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    for (generation, (path, timestamp)) in [("tail-1", first), ("tail-2", original - 30)]
+        .into_iter()
+        .enumerate()
+    {
+        let version = 2 * (generation as u64 + 1);
+        write_commit_to_store(&store, vec![create_add_action(path)], version - 1).await?;
+        write_commit_to_store(
+            &store,
+            vec![remove(path, timestamp), commit_info(Some("OPTIMIZE"))],
+            version,
+        )
+        .await?;
+        let inherited = sidecars(&previous_root);
+        let target = latest_with_crc(&store, 4).await?;
+        target.checkpoint(
+            &guarded_engine(store.clone(), &inherited)?,
+            Some(&spec(true)),
+        )?;
+        let events: Vec<_> = reporter
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                MetricEvent::CheckpointWriteSuccess(event) if event.version == version => {
+                    Some(event)
+                }
+                _ => None,
+            })
+            .collect();
+        let [event] = events.as_slice() else {
+            panic!("expected one checkpoint success for version {version}, got {events:?}");
+        };
+        let CheckpointWriteOutcome::Written { stats } = &event.outcome else {
+            panic!("expected a written checkpoint");
+        };
+        let (root, leaves) = checkpoint_rows(&store, version).await;
+        assert!(inherited.is_subset(&sidecars(&root)));
+        assert_eq!(stats.num_reused_sidecars, inherited.len() as u64);
+        assert_eq!(sidecars(&root).len(), inherited.len() + 1);
+        expected.push((path.to_owned(), Some(timestamp)));
+        expected.sort_unstable();
+        let mut actual: Vec<_> = leaves
+            .iter()
+            .filter_map(|row| {
+                row["remove"]["path"]
+                    .as_str()
+                    .map(|path| (path.to_owned(), row["remove"]["deletionTimestamp"].as_i64()))
+            })
+            .collect();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
+        let mut adds: Vec<_> = leaves
+            .iter()
+            .filter_map(|row| row["add"]["path"].as_str())
+            .collect();
+        adds.sort_unstable();
+        assert_eq!(adds, ["A", "B", "C", "D"]);
+        let tags = &root
+            .iter()
+            .find_map(|row| row.get("checkpointMetadata"))
+            .unwrap()["tags"];
+        let minimum = expected
+            .iter()
+            .map(|(_, timestamp)| timestamp.unwrap())
+            .min()
+            .unwrap();
+        assert_eq!(
+            tags["kernel.minRemoveDeletionTimestamp"],
+            minimum.to_string()
+        );
+        assert_eq!(tags["numOfAddFiles"], "4");
+        assert_eq!(tags["sidecarNumActions"], (4 + expected.len()).to_string());
+        assert_eq!(stats.num_remove_files, expected.len() as u64);
+        assert_eq!(stats.num_actions, (root.len() + leaves.len()) as u64);
+        assert_hint_counts(&store, version).await;
+        previous_root = root;
+    }
+    Ok(())
+}
+
+#[rstest]
+#[tokio::test]
 async fn repeated_reuse_seeds_missing_summary_and_preserves_original_remove_minimum(
     #[values(false, true)] base_tombstone: bool,
     #[values(false, true)] missing_minimum: bool,
@@ -823,19 +946,7 @@ async fn invalid_base_proof_falls_back_to_full_checkpoint(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
-    write_commit_to_store(
-        &store,
-        vec![
-            create_metadata_action(),
-            create_v2_checkpoint_protocol_action(),
-            create_add_action("A"),
-        ],
-        0,
-    )
-    .await?;
-    Snapshot::builder_for("memory:///")
-        .build(&engine)?
-        .checkpoint(&engine, Some(&spec(false)))?;
+    write_base_checkpoint(&store, &engine, &["A"]).await?;
     let (mut root, _) = checkpoint_rows(&store, 0).await;
     let inherited = sidecars(&root);
     let tags = root
@@ -1021,19 +1132,7 @@ async fn reuse_specs_reject_zero_sidecar_hint_without_publication(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
-    write_commit_to_store(
-        &store,
-        vec![
-            create_metadata_action(),
-            create_v2_checkpoint_protocol_action(),
-            create_add_action("A"),
-        ],
-        0,
-    )
-    .await?;
-    Snapshot::builder_for("memory:///")
-        .build(&engine)?
-        .checkpoint(&engine, Some(&spec(false)))?;
+    write_base_checkpoint(&store, &engine, &["A"]).await?;
     let hint_before = store
         .get(&Path::from("_delta_log/_last_checkpoint"))
         .await?
@@ -1086,19 +1185,7 @@ async fn malformed_base_root_falls_back_or_errors_before_publication(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
-    write_commit_to_store(
-        &store,
-        vec![
-            create_metadata_action(),
-            create_v2_checkpoint_protocol_action(),
-            create_add_action("A"),
-        ],
-        0,
-    )
-    .await?;
-    Snapshot::builder_for("memory:///")
-        .build(&engine)?
-        .checkpoint(&engine, Some(&spec(false)))?;
+    write_base_checkpoint(&store, &engine, &["A"]).await?;
     let (mut root, _) = checkpoint_rows(&store, 0).await;
     let inherited = sidecars(&root);
     let hint_before = store
@@ -1173,19 +1260,7 @@ async fn ordinary_reuse_preserves_nullable_sidecar_tags_without_reading_sidecars
 -> Result<(), Box<dyn std::error::Error>> {
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
-    write_commit_to_store(
-        &store,
-        vec![
-            create_metadata_action(),
-            create_v2_checkpoint_protocol_action(),
-            create_add_action("A"),
-        ],
-        0,
-    )
-    .await?;
-    Snapshot::builder_for("memory:///")
-        .build(&engine)?
-        .checkpoint(&engine, Some(&spec(false)))?;
+    write_base_checkpoint(&store, &engine, &["A"]).await?;
     let (mut root, _) = checkpoint_rows(&store, 0).await;
     let inherited = sidecars(&root);
     for row in &mut root {
@@ -1218,19 +1293,7 @@ async fn inherited_sidecar_guard_rejects_full_checkpoint_reads()
 -> Result<(), Box<dyn std::error::Error>> {
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
-    write_commit_to_store(
-        &store,
-        vec![
-            create_metadata_action(),
-            create_v2_checkpoint_protocol_action(),
-            create_add_action("A"),
-        ],
-        0,
-    )
-    .await?;
-    Snapshot::builder_for("memory:///")
-        .build(&engine)?
-        .checkpoint(&engine, Some(&spec(false)))?;
+    write_base_checkpoint(&store, &engine, &["A"]).await?;
     let (root, _) = checkpoint_rows(&store, 0).await;
     let inherited = sidecars(&root);
     assert_eq!(inherited.len(), 1);
@@ -1257,19 +1320,7 @@ async fn base_root_read_error_does_not_publish_a_checkpoint()
 -> Result<(), Box<dyn std::error::Error>> {
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
-    write_commit_to_store(
-        &store,
-        vec![
-            create_metadata_action(),
-            create_v2_checkpoint_protocol_action(),
-            create_add_action("A"),
-        ],
-        0,
-    )
-    .await?;
-    Snapshot::builder_for("memory:///")
-        .build(&engine)?
-        .checkpoint(&engine, Some(&spec(false)))?;
+    write_base_checkpoint(&store, &engine, &["A"]).await?;
     write_commit_to_store(&store, vec![txn(1)], 1).await?;
     let target = latest_with_crc(&store, 1).await?;
     let guarded = DelegatingEngine::new(Arc::new(SyncEngine::new_with_store(store.clone())))
@@ -1307,20 +1358,7 @@ async fn fresh_append_reuses_without_inherited_sidecar_io() -> Result<(), Box<dy
 {
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
-    write_commit_to_store(
-        &store,
-        vec![
-            create_metadata_action(),
-            create_v2_checkpoint_protocol_action(),
-            create_add_action("A"),
-            create_add_action("B"),
-        ],
-        0,
-    )
-    .await?;
-    Snapshot::builder_for("memory:///")
-        .build(&engine)?
-        .checkpoint(&engine, Some(&spec(false)))?;
+    write_base_checkpoint(&store, &engine, &["A", "B"]).await?;
     let (base_root, _) = checkpoint_rows(&store, 0).await;
     let inherited = sidecars(&base_root);
     write_commit_to_store(&store, vec![create_add_action("fresh-D")], 1).await?;
@@ -1381,19 +1419,7 @@ async fn reuse_rejects_unsafe_tail_actions(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
-    write_commit_to_store(
-        &store,
-        vec![
-            create_metadata_action(),
-            create_v2_checkpoint_protocol_action(),
-            create_add_action("A"),
-        ],
-        0,
-    )
-    .await?;
-    Snapshot::builder_for("memory:///")
-        .build(&engine)?
-        .checkpoint(&engine, Some(&spec(false)))?;
+    write_base_checkpoint(&store, &engine, &["A"]).await?;
     let (base_root, _) = checkpoint_rows(&store, 0).await;
     let inherited = sidecars(&base_root);
     write_commit_to_store(&store, tail, 1).await?;
@@ -1435,41 +1461,35 @@ async fn late_tail_fallback_keeps_already_written_add_sidecar(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (store, _) = new_in_memory_store();
     let engine = Arc::new(SyncEngine::new_with_store(store.clone()));
-    write_commit_to_store(
-        &store,
-        vec![
-            create_metadata_action(),
-            create_v2_checkpoint_protocol_action(),
-            create_add_action("A"),
-            create_add_action("B"),
-        ],
-        0,
-    )
-    .await?;
+    write_base_checkpoint(&store, engine.as_ref(), &["A"]).await?;
+    write_commit_to_store(&store, vec![create_add_action("B")], 1).await?;
     Snapshot::builder_for("memory:///")
         .build(engine.as_ref())?
         .checkpoint(engine.as_ref(), Some(&spec(false)))?;
-    let (base_root, base_leaves) = checkpoint_rows(&store, 0).await;
+    let (base_root, base_leaves) = checkpoint_rows(&store, 1).await;
     let inherited = sidecars(&base_root);
+    assert_eq!(inherited.len(), 2);
     let (older, newest) = if density_fallback {
         (
             vec![
                 create_add_action("E"),
                 create_add_action("F"),
                 create_add_action("G"),
+                create_add_action("H"),
             ],
             vec![
                 create_add_action("D"),
                 create_remove_action("E"),
                 create_remove_action("F"),
                 create_remove_action("G"),
+                create_remove_action("H"),
             ],
         )
     } else {
         (vec![older_action], vec![create_add_action("D")])
     };
-    write_commit_to_store(&store, older, 1).await?;
-    write_commit_to_store(&store, newest, 2).await?;
+    write_commit_to_store(&store, older, 2).await?;
+    write_commit_to_store(&store, newest, 3).await?;
     let state = Arc::new(Mutex::new(TailReadAndSidecarWrites::default()));
     let tracked = tracked_tail_engine(engine.clone(), state.clone(), false);
     let reporter = Arc::new(CapturingReporter::default());
@@ -1480,7 +1500,7 @@ async fn late_tail_fallback_keeps_already_written_add_sidecar(
             &tracked,
             Some(&spec_with_hint(
                 true,
-                Some(if density_fallback { 4 } else { 1 }),
+                Some(if density_fallback { 5 } else { 1 }),
             )),
         )?;
         single_checkpoint_success(&reporter)
@@ -1488,12 +1508,12 @@ async fn late_tail_fallback_keeps_already_written_add_sidecar(
 
     let observed = state.lock().unwrap().clone();
     let expected_reads = HashMap::from([
+        ("00000000000000000003.json".to_owned(), 1),
         ("00000000000000000002.json".to_owned(), 1),
-        ("00000000000000000001.json".to_owned(), 1),
     ]);
     assert_eq!(observed.tail_requests, expected_reads);
     assert_eq!(observed.tail_batches, expected_reads);
-    let (root, leaves) = checkpoint_rows(&store, 2).await;
+    let (root, leaves) = checkpoint_rows(&store, 3).await;
     let final_sidecars = sidecars(&root);
     assert!(inherited.is_disjoint(&final_sidecars));
     assert_eq!(event.mode, CheckpointWriteMode::V2ReusingEligibleSidecars);
@@ -1546,7 +1566,7 @@ async fn late_tail_fallback_keeps_already_written_add_sidecar(
         .find(|row| row["add"]["path"] == "A")
         .and_then(|row| row["add"]["stats"].as_str());
     assert_eq!(actual_a_stats, expected_a_stats);
-    assert_hint_counts(&store, 2).await;
+    assert_hint_counts(&store, 3).await;
     Ok(())
 }
 
@@ -1555,20 +1575,7 @@ async fn reuse_reads_each_tail_json_once_without_inherited_sidecar_io()
 -> Result<(), Box<dyn std::error::Error>> {
     let (store, _) = new_in_memory_store();
     let engine = Arc::new(SyncEngine::new_with_store(store.clone()));
-    write_commit_to_store(
-        &store,
-        vec![
-            create_metadata_action(),
-            create_v2_checkpoint_protocol_action(),
-            create_add_action("A"),
-            create_add_action("B"),
-        ],
-        0,
-    )
-    .await?;
-    Snapshot::builder_for("memory:///")
-        .build(engine.as_ref())?
-        .checkpoint(engine.as_ref(), Some(&spec(false)))?;
+    write_base_checkpoint(&store, engine.as_ref(), &["A", "B"]).await?;
     let (base_root, base_leaves) = checkpoint_rows(&store, 0).await;
     let inherited = sidecars(&base_root);
     assert!(base_leaves.iter().all(|row| row["add"]["path"] != "D"));
@@ -1609,19 +1616,7 @@ async fn late_tail_json_error_after_sidecar_flush_does_not_publish_root_or_hint(
 -> Result<(), Box<dyn std::error::Error>> {
     let (store, _) = new_in_memory_store();
     let engine = Arc::new(SyncEngine::new_with_store(store.clone()));
-    write_commit_to_store(
-        &store,
-        vec![
-            create_metadata_action(),
-            create_v2_checkpoint_protocol_action(),
-            create_add_action("A"),
-        ],
-        0,
-    )
-    .await?;
-    Snapshot::builder_for("memory:///")
-        .build(engine.as_ref())?
-        .checkpoint(engine.as_ref(), Some(&spec(false)))?;
+    write_base_checkpoint(&store, engine.as_ref(), &["A"]).await?;
     write_commit_to_store(&store, vec![create_remove_action("A")], 1).await?;
     write_commit_to_store(&store, vec![create_add_action("D")], 2).await?;
     let target = latest_with_crc(&store, 1).await?;
@@ -1662,20 +1657,7 @@ async fn inherited_sidecar_read_error_after_tail_flush_preserves_base_checkpoint
 -> Result<(), Box<dyn std::error::Error>> {
     let (store, _) = new_in_memory_store();
     let engine = Arc::new(SyncEngine::new_with_store(store.clone()));
-    write_commit_to_store(
-        &store,
-        vec![
-            create_metadata_action(),
-            create_v2_checkpoint_protocol_action(),
-            create_add_action("A"),
-            create_add_action("B"),
-        ],
-        0,
-    )
-    .await?;
-    Snapshot::builder_for("memory:///")
-        .build(engine.as_ref())?
-        .checkpoint(engine.as_ref(), Some(&spec(false)))?;
+    write_base_checkpoint(&store, engine.as_ref(), &["A", "B"]).await?;
     let (base_root, _) = checkpoint_rows(&store, 0).await;
     let inherited = sidecars(&base_root);
     let hint_before = store
@@ -1774,7 +1756,7 @@ async fn classify_tail(
             )
             .await?;
     }
-    let mut tail = TailEligibility::new(
+    let mut tail = SidecarReuseTailValidator::new(
         &engine,
         super::super::CHECKPOINT_ACTIONS_SCHEMA_V2.clone(),
         paths.iter(),
@@ -1947,19 +1929,7 @@ async fn base_gate_uses_original_sidecar_timestamps_without_sidecar_reads(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
-    write_commit_to_store(
-        &store,
-        vec![
-            create_metadata_action(),
-            create_v2_checkpoint_protocol_action(),
-            create_add_action("A"),
-        ],
-        0,
-    )
-    .await?;
-    Snapshot::builder_for("memory:///")
-        .build(&engine)?
-        .checkpoint(&engine, Some(&spec(false)))?;
+    write_base_checkpoint(&store, &engine, &["A"]).await?;
     let (mut root, _) = checkpoint_rows(&store, 0).await;
     let inherited = sidecars(&root);
     for row in &mut root {
@@ -1999,19 +1969,7 @@ async fn nested_reuse_does_not_renew_original_sidecar_age() -> Result<(), Box<dy
 {
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
-    write_commit_to_store(
-        &store,
-        vec![
-            create_metadata_action(),
-            create_v2_checkpoint_protocol_action(),
-            create_add_action("A"),
-        ],
-        0,
-    )
-    .await?;
-    Snapshot::builder_for("memory:///")
-        .build(&engine)?
-        .checkpoint(&engine, Some(&spec(false)))?;
+    write_base_checkpoint(&store, &engine, &["A"]).await?;
     let (mut root, _) = checkpoint_rows(&store, 0).await;
     let inherited = sidecars(&root);
     let original_time = crate::utils::current_time_ms()? - 23 * 60 * 60 * 1_000;
@@ -2072,7 +2030,7 @@ async fn invalid_tail_provenance_is_an_error(
         .into_iter()
         .map(|v| ParsedLogPath::create_parsed_published_commit(&table_root, v))
         .collect();
-    let mut tail = TailEligibility::new(
+    let mut tail = SidecarReuseTailValidator::new(
         &engine,
         super::super::CHECKPOINT_ACTIONS_SCHEMA_V2.clone(),
         expected.iter(),
@@ -2115,19 +2073,19 @@ async fn invalid_tail_provenance_is_an_error(
 #[case::default_below(49_999, 2, 50_000, false)]
 #[case::default_equal(50_000, 2, 50_000, true)]
 #[case::default_above(50_001, 2, 50_000, true)]
-#[case::no_live_files(0, 1, 1, false)]
+#[case::no_file_actions(0, 1, 1, false)]
 #[case::no_sidecars(1, 0, 1, false)]
 #[case::negative_count(-1, 1, 1, false)]
 #[case::large_count(i64::MAX, 2, i64::MAX as usize, true)]
 #[case::large_product(i64::MAX, usize::MAX, usize::MAX, false)]
 fn sidecar_density_uses_exact_half_hint(
-    #[case] num_files: i64,
+    #[case] num_file_actions: i64,
     #[case] num_sidecars: usize,
     #[case] hint: usize,
     #[case] expected: bool,
 ) {
     assert_eq!(
-        super::density_allows_reuse(num_files, num_sidecars, hint),
+        super::density_allows_reuse(num_file_actions, num_sidecars, hint),
         expected
     );
 }
@@ -2140,7 +2098,7 @@ fn sidecar_density_uses_exact_half_hint(
 #[case::odd_equal_half(4, Some(5), false, vec![true])]
 #[case::odd_above_half(5, Some(5), false, vec![true])]
 #[case::default_hint(2, None, false, vec![false])]
-#[case::retained_tail_remove_counts_as_a_sidecar(3, Some(4), true, vec![false])]
+#[case::retained_tail_remove_counts_as_a_file_action(3, Some(4), true, vec![true])]
 #[case::repeated_tiny_tails(16, Some(16), false, vec![true, false])]
 #[tokio::test]
 async fn density_counts_pending_tail_sidecars_and_consolidates_sparse_candidates(
@@ -2148,6 +2106,7 @@ async fn density_counts_pending_tail_sidecars_and_consolidates_sparse_candidates
     #[case] hint: Option<usize>,
     #[case] tail_remove: bool,
     #[case] expected_reuse: Vec<bool>,
+    #[values(None, Some(10_000))] cached_crc_count: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
@@ -2176,7 +2135,13 @@ async fn density_counts_pending_tail_sidecars_and_consolidates_sparse_candidates
         } else {
             num_files += 1;
         }
-        let target = latest_with_crc(&store, num_files).await?;
+        let target = if let Some(count) = cached_crc_count {
+            latest_with_crc(&store, count).await?
+        } else {
+            let target = Snapshot::builder_for("memory:///").build(&engine)?;
+            assert!(target.crc_at_version().is_none());
+            target
+        };
         let guarded;
         let output_engine: &dyn Engine = if expect_reuse {
             guarded = guarded_engine(store.clone(), &inherited)?;
@@ -2213,6 +2178,158 @@ async fn density_counts_pending_tail_sidecars_and_consolidates_sparse_candidates
         );
         assert_hint_counts(&store, version).await;
     }
+    Ok(())
+}
+
+#[rstest]
+#[case::all_tail_batches_count(
+    vec![vec![create_add_action("F")], vec![create_add_action("G")]],
+    vec!["F", "G"], 6, true
+)]
+#[case::duplicate_tail_adds_count_once(
+    vec![vec![create_add_action("F")], vec![create_add_action("F")]],
+    vec!["F"], 6, false
+)]
+#[case::retained_tail_remove_counts_as_a_file_action(
+    vec![vec![create_add_action("F")], vec![create_remove_action("F")]],
+    vec![], 5, true
+)]
+#[case::tail_replacement_counts_add_and_retained_remove(
+    vec![vec![create_add_action("F")], vec![create_remove_action("F"), create_add_action("G")]],
+    vec!["G"], 6, true
+)]
+#[case::non_file_batch_does_not_increase_density(
+    vec![vec![txn(1)], vec![create_add_action("F")]],
+    vec!["F"], 6, false
+)]
+#[case::non_file_only_tail_does_not_increase_density(
+    vec![vec![txn(1)], vec![txn(2)]], vec![], 10, false
+)]
+#[case::expired_tail_remove_does_not_increase_density(
+    vec![vec![create_add_action("F")], vec![Action::Remove(Remove {
+        path: "F".into(), deletion_timestamp: Some(0), data_change: true, ..Default::default()
+    })]],
+    vec![], 10, false
+)]
+#[case::superseded_tail_remove_does_not_increase_density(
+    vec![vec![create_add_action("F")], vec![create_remove_action("F")], vec![create_add_action("F")]],
+    vec!["F"], 6, false
+)]
+#[tokio::test]
+async fn density_uses_selected_file_actions_without_crc(
+    #[case] commits: Vec<Vec<Action>>,
+    #[case] surviving_tail_adds: Vec<&str>,
+    #[case] hint: usize,
+    #[case] expect_reuse: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (store, _) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+    let mut expected = vec!["A0", "A1", "A2", "A3"];
+    write_base_checkpoint(&store, &engine, &expected).await?;
+    expected.extend(surviving_tail_adds);
+    expected.sort_unstable();
+    let (base_root, _) = checkpoint_rows(&store, 0).await;
+    let inherited = sidecars(&base_root);
+    for (index, actions) in commits.into_iter().enumerate() {
+        write_commit_to_store(&store, actions, index as u64 + 1).await?;
+    }
+    let target = Snapshot::builder_for("memory:///").build(&engine)?;
+    assert!(target.crc_at_version().is_none());
+    let version = target.version();
+    let guarded;
+    let output_engine: &dyn Engine = if expect_reuse {
+        guarded = guarded_engine(store.clone(), &inherited)?;
+        &guarded
+    } else {
+        &engine
+    };
+    let reporter = Arc::new(CapturingReporter::default());
+    {
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        target.checkpoint(output_engine, Some(&spec_with_hint(true, Some(hint))))?;
+    }
+    let CheckpointWriteOutcome::Written { stats } = single_checkpoint_success(&reporter).outcome
+    else {
+        panic!("expected a written checkpoint");
+    };
+    let (root, leaves) = checkpoint_rows(&store, version).await;
+    let reused = inherited.intersection(&sidecars(&root)).count();
+    assert_eq!(reused, if expect_reuse { inherited.len() } else { 0 });
+    assert_eq!(stats.num_reused_sidecars, reused as u64);
+    assert_eq!(stats.num_add_files, expected.len() as u64);
+    let mut actual: Vec<_> = leaves
+        .iter()
+        .filter_map(|row| row["add"]["path"].as_str())
+        .collect();
+    actual.sort_unstable();
+    assert_eq!(actual, expected);
+    assert_hint_counts(&store, version).await;
+    Ok(())
+}
+
+#[rstest]
+#[case::non_file_tail(vec![txn(1)], 8, vec!["A2", "A3"])]
+#[case::append_tail(vec![create_add_action("F")], 4, vec!["A2", "A3", "F"])]
+#[tokio::test]
+async fn density_includes_inherited_remove_tombstones_without_crc(
+    #[case] tail: Vec<Action>,
+    #[case] hint: usize,
+    #[case] expected_adds: Vec<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (store, _) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+    let mut actions = vec![
+        create_metadata_action(),
+        create_v2_checkpoint_protocol_action(),
+    ];
+    actions.extend(["A0", "A1", "A2", "A3"].map(create_add_action));
+    write_commit_to_store(&store, actions, 0).await?;
+    write_commit_to_store(
+        &store,
+        vec![create_remove_action("A0"), create_remove_action("A1")],
+        1,
+    )
+    .await?;
+    Snapshot::builder_for("memory:///")
+        .build(&engine)?
+        .checkpoint(&engine, Some(&spec_with_hint(false, None)))?;
+    let (base_root, _) = checkpoint_rows(&store, 1).await;
+    let inherited = sidecars(&base_root);
+    assert_eq!(inherited.len(), 1);
+
+    write_commit_to_store(&store, tail, 2).await?;
+    let target = Snapshot::builder_for("memory:///").build(&engine)?;
+    assert!(target.crc_at_version().is_none());
+    let reporter = Arc::new(CapturingReporter::default());
+    {
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        target.checkpoint(
+            &guarded_engine(store.clone(), &inherited)?,
+            Some(&spec_with_hint(true, Some(hint))),
+        )?;
+    }
+    let CheckpointWriteOutcome::Written { stats } = single_checkpoint_success(&reporter).outcome
+    else {
+        panic!("expected a written checkpoint");
+    };
+    let (root, leaves) = checkpoint_rows(&store, 2).await;
+    assert_eq!(inherited.intersection(&sidecars(&root)).count(), 1);
+    assert_eq!(stats.num_reused_sidecars, 1);
+    assert_eq!(stats.num_add_files, expected_adds.len() as u64);
+    assert_eq!(stats.num_remove_files, 2);
+    let mut actual_adds: Vec<_> = leaves
+        .iter()
+        .filter_map(|row| row["add"]["path"].as_str())
+        .collect();
+    actual_adds.sort_unstable();
+    assert_eq!(actual_adds, expected_adds);
+    let mut actual_removes: Vec<_> = leaves
+        .iter()
+        .filter_map(|row| row["remove"]["path"].as_str())
+        .collect();
+    actual_removes.sort_unstable();
+    assert_eq!(actual_removes, ["A0", "A1"]);
+    assert_hint_counts(&store, 2).await;
     Ok(())
 }
 
@@ -2272,17 +2389,20 @@ enum Admission {
     MissingCrc,
     StaleCrc,
     IndeterminateCrc,
+    UnrelatedCrcCount,
     ExplicitVersion,
 }
 
 #[rstest]
-#[case::missing_crc(Admission::MissingCrc)]
-#[case::stale_crc(Admission::StaleCrc)]
-#[case::indeterminate_crc(Admission::IndeterminateCrc)]
-#[case::explicit_at_latest_version(Admission::ExplicitVersion)]
+#[case::missing_crc(Admission::MissingCrc, true)]
+#[case::stale_crc(Admission::StaleCrc, true)]
+#[case::indeterminate_crc(Admission::IndeterminateCrc, true)]
+#[case::unrelated_crc_count(Admission::UnrelatedCrcCount, true)]
+#[case::explicit_at_latest_version(Admission::ExplicitVersion, false)]
 #[tokio::test]
-async fn reuse_requires_latest_build_and_available_complete_target_crc(
+async fn reuse_admission_requires_latest_snapshot_but_not_crc_statistics(
     #[case] admission: Admission,
+    #[case] expect_reuse: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (store, _) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
@@ -2303,9 +2423,16 @@ async fn reuse_requires_latest_build_and_available_complete_target_crc(
     }
     let mut tail = vec![create_add_action("B")];
     if matches!(admission, Admission::IndeterminateCrc) {
-        tail.push(commit_info(Some("Manual Update")));
+        tail.push(create_add_action("D"));
     }
     write_commit_to_store(&store, tail, 1).await?;
+    let target_version = if matches!(admission, Admission::IndeterminateCrc) {
+        // Remove.size is optional; CRC replay cannot count its bytes, but reuse can prove locality.
+        write_commit_to_store(&store, vec![create_remove_action("D")], 2).await?;
+        2
+    } else {
+        1
+    };
     let target = match admission {
         Admission::ExplicitVersion => {
             latest_with_crc(&store, 2).await?;
@@ -2323,6 +2450,7 @@ async fn reuse_requires_latest_build_and_available_complete_target_crc(
             assert!(target.crc_at_version().unwrap().file_stats().is_none());
             target
         }
+        Admission::UnrelatedCrcCount => latest_with_crc(&store, 0).await?,
         Admission::MissingCrc | Admission::StaleCrc => {
             let target = Snapshot::builder_for("memory:///").build(&engine)?;
             assert!(target.crc_at_version().is_none());
@@ -2336,24 +2464,41 @@ async fn reuse_requires_latest_build_and_available_complete_target_crc(
     let (base_root, _) = checkpoint_rows(&store, 0).await;
     let inherited = sidecars(&base_root);
     let reporter = Arc::new(CapturingReporter::default());
+    let guarded;
+    let output_engine: &dyn Engine = if expect_reuse {
+        guarded = guarded_engine(store.clone(), &inherited)?;
+        &guarded
+    } else {
+        &engine
+    };
     {
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
-        target.checkpoint(&engine, Some(&spec(true)))?;
+        target.checkpoint(output_engine, Some(&spec(true)))?;
     }
     let CheckpointWriteOutcome::Written { stats } = single_checkpoint_success(&reporter).outcome
     else {
         panic!("expected a written checkpoint");
     };
-    assert_eq!(stats.num_reused_sidecars, 0);
-    let (root, leaves) = checkpoint_rows(&store, 1).await;
-    assert!(inherited.is_disjoint(&sidecars(&root)));
+    assert_eq!(
+        stats.num_reused_sidecars,
+        if expect_reuse {
+            inherited.len() as u64
+        } else {
+            0
+        }
+    );
+    let (root, leaves) = checkpoint_rows(&store, target_version).await;
+    assert_eq!(
+        inherited.intersection(&sidecars(&root)).count(),
+        if expect_reuse { inherited.len() } else { 0 }
+    );
     let mut active: Vec<_> = leaves
         .iter()
         .filter_map(|row| row["add"]["path"].as_str())
         .collect();
     active.sort_unstable();
     assert_eq!(active, ["A", "B"]);
-    assert_hint_counts(&store, 1).await;
+    assert_hint_counts(&store, target_version).await;
     Ok(())
 }
 
