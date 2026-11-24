@@ -8,9 +8,8 @@
 //! [`TableProperties`].
 //!
 //! [`Schema`]: crate::schema::Schema
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
 use tracing::warn;
@@ -19,8 +18,7 @@ use url::Url;
 use crate::actions::{Metadata, NULL_COUNT, Protocol};
 use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
-    StatsConfig, StripFieldMetadataTransform, expected_stats_schema, is_skipping_eligible_datatype,
-    stats_column_names,
+    StatsConfig, expected_stats_schema, is_skipping_eligible_datatype, stats_column_names,
 };
 use crate::schema::collation_utils::validate_collations_feature_support;
 pub(crate) use crate::schema::file_utils::validate_file_type_feature_support;
@@ -45,7 +43,6 @@ use crate::table_features::{
     validate_timestamp_ntz_feature_support,
 };
 use crate::table_properties::{COLUMN_MAPPING_MODE, TableProperties};
-use crate::transforms::SchemaTransform as _;
 use crate::utils::require;
 use crate::{DeltaError, Error, KernelError, KernelResult, Result, Version};
 
@@ -216,7 +213,7 @@ impl<'a> StatsSchemaBuilder<'a> {
             self.required_physical_columns,
             self.requested_physical_columns,
         )?);
-        Ok(strip_metadata(physical_stats_schema))
+        strip_metadata(physical_stats_schema)
     }
 }
 
@@ -236,11 +233,10 @@ pub(crate) enum InCommitTimestampEnablement {
 /// Utility function to strip field metadata from stats schemas. This metadata describes logical
 /// table columns, not the stats. Keeping it can cause schema mismatches when combining the parsed
 /// stats from a checkpoint written before logical metadata was added.
-fn strip_metadata(schema: SchemaRef) -> SchemaRef {
-    match StripFieldMetadataTransform.transform_struct(&schema) {
-        Cow::Owned(s) => Arc::new(s),
-        _ => schema,
-    }
+fn strip_metadata(schema: SchemaRef) -> KernelResult<SchemaRef> {
+    Ok(Arc::new(
+        crate::scan::data_skipping::stats_schema::try_strip_metadata(&schema)?,
+    ))
 }
 
 /// Builds one side of [`StatsOutputSchemas`] for explicitly selected columns.
@@ -268,7 +264,7 @@ fn build_stats_schema_for_columns(
         required_columns,
         requested_columns,
     )?);
-    Ok(strip_metadata(schema))
+    strip_metadata(schema)
 }
 
 fn validate_partition_columns(metadata: &Metadata, logical_schema: &StructType) -> Result<()> {
@@ -319,10 +315,10 @@ pub(crate) struct TableConfiguration {
     logical_schema: SchemaRef,
     /// Whether any field in the logical schema declares a column default.
     has_column_with_default: bool,
-    /// Physical schema, materialized only for operations that request it.
-    physical_schema: OnceLock<SchemaRef>,
-    /// Logical and physical schemas without partition columns, initialized together on first use.
-    data_schemas_without_partition_columns: OnceLock<FilteredDataSchemas>,
+    /// Physical schema, materialized at the fallible configuration boundary.
+    physical_schema: SchemaRef,
+    /// Logical and physical data views, sharing retained fields with their complete schemas.
+    data_schemas_without_partition_columns: FilteredDataSchemas,
     table_properties: TableProperties,
     column_mapping_mode: ColumnMappingMode,
     table_root: Url,
@@ -416,11 +412,20 @@ impl TableConfiguration {
 
         MakePhysical::validate_read_column_mapping(column_mapping_mode, &logical_schema)?;
 
+        let physical_schema =
+            Arc::new(logical_schema.make_validated_physical(column_mapping_mode)?);
+        let data_schemas_without_partition_columns = filter_data_schemas(
+            &logical_schema,
+            &physical_schema,
+            &metadata,
+            column_mapping_mode,
+        )?;
+
         let mut table_config = Self {
             logical_schema,
             has_column_with_default: false,
-            physical_schema: OnceLock::new(),
-            data_schemas_without_partition_columns: OnceLock::new(),
+            physical_schema,
+            data_schemas_without_partition_columns,
             metadata,
             protocol,
             table_properties,
@@ -499,6 +504,13 @@ impl TableConfiguration {
             table_configuration.table_root.clone(),
             new_version,
         )
+    }
+
+    pub(crate) fn at_version(&self, version: Version) -> Self {
+        Self {
+            version,
+            ..self.clone()
+        }
     }
 
     /// Creates a new [`TableConfiguration`] representing the table configuration immediately
@@ -813,35 +825,7 @@ impl TableConfiguration {
     }
 
     fn data_schemas_without_partition_columns(&self) -> &FilteredDataSchemas {
-        self.data_schemas_without_partition_columns.get_or_init(|| {
-            let physical_schema = self.physical_schema();
-            let partition_columns: HashSet<&str> = self
-                .metadata
-                .partition_columns()
-                .iter()
-                .map(String::as_str)
-                .collect();
-            if partition_columns.is_empty() {
-                return FilteredDataSchemas {
-                    logical: self.logical_schema.clone(),
-                    physical: physical_schema,
-                };
-            }
-            // Partition columns use logical names; translate them before filtering physical fields.
-            let physical_partition_columns: HashSet<_> = partition_columns
-                .iter()
-                .filter_map(|name| self.logical_schema.field(name))
-                .map(|field| field.physical_name(self.column_mapping_mode))
-                .collect();
-            FilteredDataSchemas {
-                logical: Arc::new(self.logical_schema.share_selected_fields(|field| {
-                    !partition_columns.contains(field.name().as_str())
-                })),
-                physical: Arc::new(physical_schema.share_selected_fields(|field| {
-                    !physical_partition_columns.contains(field.name().as_str())
-                })),
-            }
-        })
+        &self.data_schemas_without_partition_columns
     }
 
     /// Translates `delta.dataSkippingStatsColumns` entries to physical column names.
@@ -953,14 +937,7 @@ impl TableConfiguration {
     /// physical column names derived from column mapping metadata.
     #[internal_api]
     pub(crate) fn physical_schema(&self) -> SchemaRef {
-        self.physical_schema
-            .get_or_init(|| {
-                Arc::new(
-                    self.logical_schema
-                        .make_validated_physical(self.column_mapping_mode),
-                )
-            })
-            .clone()
+        self.physical_schema.clone()
     }
 
     /// Whether partition column values must be materialized into data files.
@@ -1430,6 +1407,40 @@ struct FilteredDataSchemas {
     physical: SchemaRef,
 }
 
+fn filter_data_schemas(
+    logical: &SchemaRef,
+    physical: &SchemaRef,
+    metadata: &Metadata,
+    mode: ColumnMappingMode,
+) -> KernelResult<FilteredDataSchemas> {
+    let partition_columns: HashSet<&str> = metadata
+        .partition_columns()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    if partition_columns.is_empty() {
+        return Ok(FilteredDataSchemas {
+            logical: logical.clone(),
+            physical: physical.clone(),
+        });
+    }
+    let physical_partition_columns: HashSet<_> = partition_columns
+        .iter()
+        .filter_map(|name| logical.field(name))
+        .map(|field| field.physical_name(mode))
+        .collect();
+    Ok(FilteredDataSchemas {
+        logical: Arc::new(
+            logical.share_selected_fields(|field| {
+                !partition_columns.contains(field.name().as_str())
+            })?,
+        ),
+        physical: Arc::new(physical.share_selected_fields(|field| {
+            !physical_partition_columns.contains(field.name().as_str())
+        })?),
+    })
+}
+
 #[cfg(test)]
 mod test {
 
@@ -1564,7 +1575,7 @@ mod test {
     }
 
     #[rstest]
-    fn physical_schema_is_lazy_and_preserves_eager_output(
+    fn physical_schema_is_shared_and_matches_validated_output(
         #[values(
             ColumnMappingMode::None,
             ColumnMappingMode::Name,
@@ -1594,13 +1605,11 @@ mod test {
             .with_protocol(MockProtocolBuilder::new().with_features(features).build())
             .build();
         let untouched = config.clone();
-        assert!(config.physical_schema.get().is_none());
         config.ensure_operation_supported(Operation::Scan).unwrap();
-        assert!(config.physical_schema.get().is_none());
         let physical = config.physical_schema();
         assert_eq!(*physical, expected);
         assert!(Arc::ptr_eq(&physical, &config.physical_schema()));
-        assert!(untouched.physical_schema.get().is_none());
+        assert!(Arc::ptr_eq(&physical, &untouched.physical_schema()));
         assert_eq!(config, untouched);
     }
 
@@ -1637,7 +1646,7 @@ mod test {
     }
 
     #[rstest]
-    fn scan_schema_reuse_matches_fallback_and_preserves_projection_laziness(
+    fn scan_schema_reuse_matches_fallback_and_preserves_projection(
         #[values(
             ColumnMappingMode::None,
             ColumnMappingMode::Name,
@@ -1670,13 +1679,6 @@ mod test {
             (),
         )
         .unwrap();
-        assert!(config.physical_schema.get().is_none());
-        assert!(
-            config
-                .data_schemas_without_partition_columns
-                .get()
-                .is_none()
-        );
         assert_eq!(
             *projected.physical_schema,
             projected_schema.make_physical(mode).unwrap()
@@ -1692,7 +1694,6 @@ mod test {
             (),
         )
         .unwrap();
-        assert!(config.physical_schema.get().is_none());
         let reused = StateInfo::try_new(
             table_schema.clone(),
             table_schema,
@@ -1703,7 +1704,6 @@ mod test {
             (),
         )
         .unwrap();
-        assert!(config.physical_schema.get().is_some());
         assert_eq!(reused.logical_schema, fallback.logical_schema);
         assert_eq!(reused.physical_schema, fallback.physical_schema);
         assert_eq!(reused.transform_spec, fallback.transform_spec);
@@ -4241,7 +4241,7 @@ mod test {
         field.metadata.insert(
             crate::schema::ColumnMetadataKey::Invariants.as_ref().into(),
             crate::schema::MetadataValue::String(
-                r#"{"expression": {"expression": "value > 0"}}"#.to_string(),
+                r#"{"expression": {"expression": "value > 0"}}"#.into(),
             ),
         );
         let config = MockTableConfigurationBuilder::new()

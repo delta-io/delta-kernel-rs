@@ -295,7 +295,10 @@ impl<'a> MetadataPlanner<'a> {
                             .map(Arc::new)
                     },
                 )?;
-                let stats_parsed_field = StructField::nullable(STATS_PARSED, stats_schema);
+                let stats_parsed_field = StructField::nullable(
+                    STATS_PARSED,
+                    DataType::try_from_struct(stats_schema.try_clone()?)?,
+                );
                 let patch = patch.drop(STATS).insert_after(STATS, stats_parsed_field);
                 (patch, StatsKind::Struct)
             }
@@ -321,7 +324,10 @@ impl<'a> MetadataPlanner<'a> {
                     CheckpointFieldKind::PartitionValues,
                 ) =>
             {
-                let field = StructField::nullable(PARTITION_VALUES_PARSED, required.clone());
+                let field = StructField::nullable(
+                    PARTITION_VALUES_PARSED,
+                    DataType::try_from_struct(required.try_clone()?)?,
+                );
                 (patch.insert_after(PARTITION_VALUES, field), true)
             }
             _ => (patch, false),
@@ -330,7 +336,10 @@ impl<'a> MetadataPlanner<'a> {
         let read_schema = action_patch
             .replace(
                 ADD_NAME,
-                StructField::nullable(ADD_NAME, add_patch.build(&ADD_SCHEMA)?),
+                StructField::nullable(
+                    ADD_NAME,
+                    DataType::try_from_struct(add_patch.build(&ADD_SCHEMA)?)?,
+                ),
             )
             .build(&selected)?;
         Ok((Arc::new(read_schema), stats_kind, has_struct_partitions))
@@ -357,10 +366,21 @@ impl<'a> MetadataPlanner<'a> {
             .parsed_partition_schema
             .as_ref()
             .filter(|_| !has_struct_partitions);
+        let stats_field = stats_schema_to_parse
+            .map(|schema| {
+                DataType::try_from_struct(schema.try_clone()?)
+                    .map(|data_type| (schema, StructField::nullable(STATS_PARSED, data_type)))
+            })
+            .transpose()?;
+        let partition_field = partition_schema_to_parse
+            .map(|schema| {
+                DataType::try_from_struct(schema.try_clone()?)
+                    .map(|data_type| StructField::nullable(PARTITION_VALUES_PARSED, data_type))
+            })
+            .transpose()?;
         let plan = plan.project_patch(|patch| {
             patch
-                .fold_with(stats_schema_to_parse, |patch, schema| {
-                    let field = StructField::nullable(STATS_PARSED, schema.clone());
+                .fold_with(stats_field, |patch, (schema, field)| {
                     let expr = Expr::parse_json(col!(ADD_NAME, STATS), Arc::clone(schema));
                     let patch = if self.stats.synthesize_json {
                         stats = StatsKind::Both;
@@ -371,8 +391,7 @@ impl<'a> MetadataPlanner<'a> {
                     };
                     patch.insert_after_at([ADD_NAME], STATS, field, expr)
                 })
-                .fold_with(partition_schema_to_parse, |patch, schema| {
-                    let field = StructField::nullable(PARTITION_VALUES_PARSED, schema.clone());
+                .fold_with(partition_field, |patch, field| {
                     let expr = Expr::map_to_struct(
                         col!(ADD_NAME, PARTITION_VALUES),
                         map_to_struct_options(self.partitions.timestamp_timezone.as_deref()),
@@ -447,11 +466,17 @@ impl<'a> MetadataPlanner<'a> {
 
         let input_schema = plan.schema().clone();
         let read_stats = get_parsed_stats_field(stats, &input_schema)?;
+        let json_stats_field = output_stats_schema
+            .filter(|_| stats == StatsKind::Json)
+            .map(|schema| {
+                DataType::try_from_struct(schema.try_clone()?)
+                    .map(|data_type| (schema, StructField::nullable(STATS_PARSED, data_type)))
+            })
+            .transpose()?;
         plan.project_patch(|mut patch| {
             let mut patch = match stats {
                 StatsKind::None => patch,
-                StatsKind::Json => patch.fold_with(output_stats_schema, |patch, schema| {
-                    let field = StructField::nullable(STATS_PARSED, schema.clone());
+                StatsKind::Json => patch.fold_with(json_stats_field, |patch, (schema, field)| {
                     let expr = Expr::parse_json(col!(ADD_NAME, STATS), Arc::clone(schema));
                     patch.insert_after_at([ADD_NAME], STATS, field, expr)
                 }),

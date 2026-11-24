@@ -96,7 +96,9 @@ pub(crate) use leaf_writer::{LeafNodeWriter, LeafNodeWriterResult};
 pub(crate) use manifest_commit_state::ManifestCommitState;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use root_manifest_file::RootManifestFile;
-pub use write_state::{BoundWriteContextBuilder, RowTrackingMetadataColumns, WriteState};
+pub use write_state::{
+    BoundWriteContextBuilder, RowTrackingMetadataColumns, WriteState, WriteStateBytes,
+};
 
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
@@ -169,6 +171,18 @@ static TAGS_AND_CLUSTERING_PROVIDER_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = lazy
     (&ADD_FILE_TAGS_FIELD),
     (&ADD_FILE_CLUSTERING_PROVIDER_FIELD),
 };
+
+#[cfg(feature = "memory-budget")]
+pub(crate) fn initialize_schemas() {
+    for schema in [
+        &BASE_ADD_FILES_SCHEMA,
+        &TAGS_ADD_FILES_SCHEMA,
+        &CLUSTERING_PROVIDER_ADD_FILES_SCHEMA,
+        &TAGS_AND_CLUSTERING_PROVIDER_ADD_FILES_SCHEMA,
+    ] {
+        LazyLock::force(schema);
+    }
+}
 
 /// The add-files schema with the optional columns present in a batch.
 fn add_files_schema_with(tags: bool, clustering_provider: bool) -> &'static SchemaRef {
@@ -721,6 +735,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
 
         Self {
             span,
+
             operation_id: MetricId::new(),
             correlation_id: common_state.correlation_id,
             read_snapshot_opt: None,
@@ -1348,6 +1363,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
                 let snapshot = snap.new_post_commit(
                     parsed_commit,
                     crc_delta,
+                    Some(self.effective_table_config.at_version(commit_version)),
                     #[cfg(feature = "adaptive-metadata-in-dev")]
                     checkpoint_action,
                 )?;

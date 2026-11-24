@@ -360,7 +360,7 @@ fn log_segment_stats_counts_only_replay_commits(
         log_root: Url::parse("memory:///_delta_log/").unwrap(),
         last_checkpoint_metadata: None,
         listed: LogSegmentFiles {
-            ascending_commit_files: commits,
+            ascending_commit_files: crate::log_segment_files::commit_files(commits),
             checkpoint_parts: if checkpoint_only {
                 vec![create_log_path_with_size(
                     "memory:///_delta_log/00000000000000000000.checkpoint.parquet",
@@ -2154,7 +2154,7 @@ fn try_new_keeps_compactions_after_checkpoint_through_end_version(
                 .into_iter()
                 .collect(),
             latest_commit_file: commit_files.last().cloned(),
-            ascending_commit_files: commit_files,
+            ascending_commit_files: crate::log_segment_files::commit_files(commit_files),
             ascending_compaction_files: vec![compaction(&table_root, lo, hi)],
             ..Default::default()
         },
@@ -2247,7 +2247,7 @@ fn commit_cover_after_excludes_compaction_starting_at_or_before_bound(
         LogSegmentFiles {
             latest_commit_file: commits.last().cloned(),
             max_published_version: Some(end_version),
-            ascending_commit_files: commits,
+            ascending_commit_files: crate::log_segment_files::commit_files(commits),
             ascending_compaction_files: vec![log_path(format!(
                 "{:020}.{:020}.compacted.json",
                 11, 20
@@ -2584,7 +2584,7 @@ fn test_validate_listed_log_file_in_order_compaction_files() {
     LogSegment::try_new(
         LogSegmentFiles {
             latest_commit_file: commit_files.last().cloned(),
-            ascending_commit_files: commit_files,
+            ascending_commit_files: crate::log_segment_files::commit_files(commit_files),
             ascending_compaction_files: vec![
                 compaction(&table_root, 0, 4),
                 compaction(&table_root, 1, 2),
@@ -2604,7 +2604,10 @@ fn test_validate_listed_log_file_out_of_order_compaction_files() {
     let log_root = table_root.join("_delta_log/").unwrap();
     let result = LogSegment::try_new(
         LogSegmentFiles {
-            ascending_commit_files: commits(&table_root, [1]),
+            ascending_commit_files: crate::log_segment_files::commit_files(commits(
+                &table_root,
+                [1],
+            )),
             ascending_compaction_files: vec![
                 compaction(&table_root, 0, 4),
                 compaction(&table_root, 0, 3),
@@ -2653,7 +2656,10 @@ fn test_validate_listed_log_file_invalid_commit_sequence(
     let log_root = table_root.join("_delta_log/").unwrap();
     let result = LogSegment::try_new(
         LogSegmentFiles {
-            ascending_commit_files: commits(&table_root, versions.iter().copied()),
+            ascending_commit_files: crate::log_segment_files::commit_files(commits(
+                &table_root,
+                versions.iter().copied(),
+            )),
             ..Default::default()
         },
         log_root,
@@ -2677,7 +2683,7 @@ fn test_validate_listed_log_file_cached_fields_match_location() {
     let mut commit = create_log_path("file:///_delta_log/00000000000000000000.json");
     commit.version = 1;
     let err = validate_log_path_fields(&LogSegmentFiles {
-        ascending_commit_files: vec![commit.clone()],
+        ascending_commit_files: crate::log_segment_files::commit_files(vec![commit.clone()]),
         latest_commit_file: Some(commit),
         ..Default::default()
     })
@@ -2691,10 +2697,10 @@ fn test_validate_listed_log_file_out_of_order_commit_files() {
     assert!(
         LogSegment::try_new(
             LogSegmentFiles {
-                ascending_commit_files: vec![
+                ascending_commit_files: crate::log_segment_files::commit_files(vec![
                     create_log_path("file:///_delta_log/00000000000000000003.json"),
                     create_log_path("file:///_delta_log/00000000000000000001.json"),
-                ],
+                ]),
                 ..Default::default()
             },
             log_root,
@@ -2710,10 +2716,10 @@ fn test_validate_truncated_log_segment_reports_first_missing_version() {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
     let result = LogSegment::try_new(
         LogSegmentFiles {
-            ascending_commit_files: vec![
+            ascending_commit_files: crate::log_segment_files::commit_files(vec![
                 create_log_path("file:///_delta_log/00000000000000000001.json"),
                 create_log_path("file:///_delta_log/00000000000000000002.json"),
-            ],
+            ]),
             ..Default::default()
         },
         log_root,
@@ -2736,7 +2742,10 @@ fn test_validate_checkpoint_commit_gap_reports_lowest_missing_version(
     let result = LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![classic_checkpoint(&table_root, checkpoint_version)],
-            ascending_commit_files: commits(&table_root, commit_versions.iter().copied()),
+            ascending_commit_files: crate::log_segment_files::commit_files(commits(
+                &table_root,
+                commit_versions.iter().copied(),
+            )),
             ..Default::default()
         },
         log_root,
@@ -2754,11 +2763,11 @@ fn test_checkpoint_covers_gap_before_retained_commits() {
             checkpoint_parts: vec![create_log_path(
                 "file:///_delta_log/00000000000000000005.checkpoint.parquet",
             )],
-            ascending_commit_files: vec![
+            ascending_commit_files: crate::log_segment_files::commit_files(vec![
                 create_log_path("file:///_delta_log/00000000000000000004.json"),
                 create_log_path("file:///_delta_log/00000000000000000006.json"),
                 create_log_path("file:///_delta_log/00000000000000000007.json"),
-            ],
+            ]),
             latest_commit_file: Some(create_log_path(
                 "file:///_delta_log/00000000000000000007.json",
             )),
@@ -2785,9 +2794,9 @@ fn test_try_new_crc_at_end_version_is_ok() {
     assert!(
         LogSegment::try_new(
             LogSegmentFiles {
-                ascending_commit_files: vec![create_log_path(
-                    "file:///_delta_log/00000000000000000002.json",
-                )],
+                ascending_commit_files: crate::log_segment_files::commit_files(vec![
+                    create_log_path("file:///_delta_log/00000000000000000002.json",)
+                ]),
                 latest_commit_file: Some(create_log_path(
                     "file:///_delta_log/00000000000000000002.json",
                 )),
@@ -2810,7 +2819,7 @@ fn test_try_new_crc_rejects_non_crc_path() {
     let commit = create_log_path("file:///_delta_log/00000000000000000002.json");
     let err = LogSegment::try_new(
         LogSegmentFiles {
-            ascending_commit_files: vec![commit.clone()],
+            ascending_commit_files: crate::log_segment_files::commit_files(vec![commit.clone()]),
             latest_commit_file: Some(commit.clone()),
             latest_crc_file: Some(commit),
             ..Default::default()
@@ -2829,9 +2838,9 @@ fn test_try_new_crc_newer_than_end_version_is_err() {
     assert!(
         LogSegment::try_new(
             LogSegmentFiles {
-                ascending_commit_files: vec![create_log_path(
-                    "file:///_delta_log/00000000000000000002.json",
-                )],
+                ascending_commit_files: crate::log_segment_files::commit_files(vec![
+                    create_log_path("file:///_delta_log/00000000000000000002.json",)
+                ]),
                 latest_commit_file: Some(create_log_path(
                     "file:///_delta_log/00000000000000000002.json",
                 )),
@@ -2854,9 +2863,9 @@ fn test_try_new_crc_older_than_checkpoint_is_err() {
     assert!(
         LogSegment::try_new(
             LogSegmentFiles {
-                ascending_commit_files: vec![create_log_path(
-                    "file:///_delta_log/00000000000000000004.json",
-                )],
+                ascending_commit_files: crate::log_segment_files::commit_files(vec![
+                    create_log_path("file:///_delta_log/00000000000000000004.json",)
+                ]),
                 latest_commit_file: Some(create_log_path(
                     "file:///_delta_log/00000000000000000004.json",
                 )),
@@ -2991,9 +3000,9 @@ fn test_validate_listed_log_file_commit_files_contains_non_commit() {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
     let result = LogSegment::try_new(
         LogSegmentFiles {
-            ascending_commit_files: vec![create_log_path(
+            ascending_commit_files: crate::log_segment_files::commit_files(vec![create_log_path(
                 "file:///_delta_log/00000000000000000010.checkpoint.parquet",
-            )],
+            )]),
             ..Default::default()
         },
         log_root,
@@ -3008,9 +3017,9 @@ fn test_validate_listed_log_file_compaction_files_contains_non_compaction() {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
     let result = LogSegment::try_new(
         LogSegmentFiles {
-            ascending_commit_files: vec![create_log_path(
+            ascending_commit_files: crate::log_segment_files::commit_files(vec![create_log_path(
                 "file:///_delta_log/00000000000000000002.json",
-            )],
+            )]),
             ascending_compaction_files: vec![create_log_path(
                 "file:///_delta_log/00000000000000000001.json",
             )],
@@ -3032,9 +3041,9 @@ fn test_validate_listed_log_file_compaction_start_exceeds_end() {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
     let result = LogSegment::try_new(
         LogSegmentFiles {
-            ascending_commit_files: vec![create_log_path(
+            ascending_commit_files: crate::log_segment_files::commit_files(vec![create_log_path(
                 "file:///_delta_log/00000000000000000005.json",
-            )],
+            )]),
             ascending_compaction_files: vec![create_log_path(
                 "file:///_delta_log/00000000000000000005.00000000000000000002.compacted.json",
             )],
@@ -3393,11 +3402,11 @@ fn test_log_segment_contiguous_commit_files() {
     assert!(
         LogSegment::try_new(
             LogSegmentFiles {
-                ascending_commit_files: vec![
+                ascending_commit_files: crate::log_segment_files::commit_files(vec![
                     create_log_path("file:///_delta_log/00000000000000000001.json"),
                     create_log_path("file:///_delta_log/00000000000000000002.json"),
                     create_log_path("file:///_delta_log/00000000000000000003.json"),
-                ],
+                ]),
                 latest_commit_file: Some(create_log_path(
                     "file:///_delta_log/00000000000000000003.json",
                 )),
@@ -3413,10 +3422,10 @@ fn test_log_segment_contiguous_commit_files() {
     // gaps are disallowed by LogSegment::try_new
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
-            ascending_commit_files: vec![
+            ascending_commit_files: crate::log_segment_files::commit_files(vec![
                 create_log_path("file:///_delta_log/00000000000000000001.json"),
                 create_log_path("file:///_delta_log/00000000000000000004.json"),
-            ],
+            ]),
             ..Default::default()
         },
         log_root,
@@ -3460,7 +3469,7 @@ fn checkpoint_sidecars_distinguishes_empty_from_absent() -> KernelResult<()> {
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, 1)],
-            ascending_commit_files: vec![commit.clone()],
+            ascending_commit_files: crate::log_segment_files::commit_files(vec![commit.clone()]),
             latest_commit_file: Some(commit),
             ..Default::default()
         },
@@ -3532,7 +3541,7 @@ fn checkpoint_hint_sidecar_file_schema_resolution(
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, 1)],
-            ascending_commit_files: vec![commit.clone()],
+            ascending_commit_files: crate::log_segment_files::commit_files(vec![commit.clone()]),
             latest_commit_file: Some(commit),
             ..Default::default()
         },
@@ -3595,7 +3604,7 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, cp_size)],
-            ascending_commit_files: vec![commit_v2.clone()],
+            ascending_commit_files: crate::log_segment_files::commit_files(vec![commit_v2.clone()]),
             latest_commit_file: Some(commit_v2),
             ..Default::default()
         },
@@ -3673,7 +3682,7 @@ async fn test_get_file_actions_schema_v2_identity_filter(
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, cp_size)],
-            ascending_commit_files: vec![commit_v2.clone()],
+            ascending_commit_files: crate::log_segment_files::commit_files(vec![commit_v2.clone()]),
             latest_commit_file: Some(commit_v2),
             ..Default::default()
         },
@@ -5008,7 +5017,7 @@ fn assert_log_segment_extended(orig: LogSegment, new: LogSegment) {
             end_version: 0,
             listed: LogSegmentFiles {
                 max_published_version: None,
-                ascending_commit_files: vec![],
+                ascending_commit_files: crate::log_segment_files::commit_files(vec![]),
                 latest_commit_file: None,
                 ..log_segment.listed
             },
@@ -5674,7 +5683,7 @@ async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
     })
     .await;
 
-    let after = seg.segment_after_version(case.crc_version);
+    let after = seg.segment_after_version(case.crc_version).unwrap();
     assert_eq!(extract_commit_versions(&after), case.after_commits);
     assert_eq!(extract_compaction_ranges(&after), case.after_compactions);
     assert!(after.checkpoint_version.is_none());

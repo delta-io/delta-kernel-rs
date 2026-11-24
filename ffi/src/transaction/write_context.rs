@@ -81,6 +81,7 @@ pub unsafe extern "C" fn write_state_encode(
 ) -> ExternResult<NullableCvoid> {
     let state = unsafe { state.as_ref() };
     let engine = unsafe { engine.as_ref() };
+
     let result = state
         .encode()
         .map(|state| allocate_fn(kernel_bytes_slice!(state)));

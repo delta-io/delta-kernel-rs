@@ -24,10 +24,12 @@ pub enum Operation {
 }
 
 impl Operation {
-    /// Serializes this [`Operation`] into its proto wire representation.
-    pub fn to_proto_bytes(&self) -> Vec<u8> {
-        use prost::Message as _;
-        crate::plans::proto::operation::Operation::from(self).encode_to_vec()
+    /// Serializes directly into owned wire storage, returning an allocation error on exhaustion.
+    ///
+    /// The shared Kernel allocator tracks returned bytes until their final clone is released.
+    /// Encoding borrows this operation instead of constructing a protobuf copy.
+    pub fn try_to_proto_bytes(&self) -> crate::KernelResult<Bytes> {
+        crate::plans::proto::encode::encode(self)
     }
 }
 

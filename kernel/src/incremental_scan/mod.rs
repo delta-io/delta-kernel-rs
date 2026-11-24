@@ -741,7 +741,7 @@ impl RowVisitor for IncrementalDedupVisitor<'_, '_> {
             // Both Adds AND Removes update the seen set. A duplicate Add for a file
             // removed earlier in the range (later chronologically, since we read newest
             // first) must not leak through.
-            if self.deduplicator.check_and_record_seen(key.clone()) {
+            if self.deduplicator.try_check_and_record_seen(key.clone())? {
                 continue;
             }
 

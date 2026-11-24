@@ -166,7 +166,11 @@ fn get_segment(
         start_version,
         end_version,
     )?;
-    Ok(log_segment.listed.ascending_commit_files)
+    Ok(log_segment
+        .listed
+        .ascending_commit_files
+        .into_iter()
+        .collect())
 }
 
 fn result_to_sv(iter: impl Iterator<Item = Result<TableChangesScanMetadata>> + Send) -> Vec<bool> {
@@ -301,7 +305,7 @@ async fn column_mapping_should_succeed() {
                 ColumnMetadataKey::ColumnMappingPhysicalName
                     .as_ref()
                     .to_string(),
-                MetadataValue::String(name.to_string()),
+                MetadataValue::String(name.to_string().into()),
             ),
         ]))
     }

@@ -1,0 +1,245 @@
+{
+  "implementation": "Installed stable std::alloc::GlobalAlloc hook with atomic shared counters, standard containers, and fallible reservation APIs; no allocator-api2 or per-buffer allocator registration.",
+  "recorded_at_utc": "2026-11-24T00:02:52.510984+00:00",
+  "platform": "macOS-26.7.1-arm64-arm-64bit",
+  "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+  "workspace_msrv": "1.95",
+  "scope": "Declarative driver construction/encoding only; no terminal-plan execution or commit. Rust/RSS measurements include local reference-engine work and caller query construction. Global-allocator builds also track caller diagnostics, so exact per-container cleanup baselines do not apply. Allocation aborts in pressure probes are recoverability gaps, not successful error returns. A sampled ratio is not allocation-stack attribution.",
+  "source": {
+    "parent_commit": "745ebfb5a4a751712e50ed1d9b4decb868c41e80",
+    "current_allocator_and_harness_sources_sha256": "d623cc43656cbc085d1bf3726af9fb6a775436baf9da5d5b9739d49f9003c635",
+    "source_digest_algorithm": "SHA256 of sorted relative UTF-8 path, NUL, file bytes, NUL for each source_input_files entry.",
+    "source_digest_note": "After executable validation, peak/reset documentation and Python abort classification were tightened. Saved gap receipts and fresh smoke probes confirm the same classification; measured Rust executable code is unchanged.",
+    "source_input_files": [
+      "Cargo.lock",
+      "Cargo.toml",
+      "ffi/Cargo.toml",
+      "ffi/src/alloc_stats.rs",
+      "ffi/src/error/allocation.rs",
+      "ffi/src/memory/mod.rs",
+      "ffi/tests/memory.rs",
+      "kernel/Cargo.toml",
+      "kernel/src/memory/allocator.rs",
+      "kernel/src/memory/containers.rs",
+      "kernel/src/memory/json.rs",
+      "kernel/src/memory/keys.rs",
+      "kernel/src/memory/mod.rs",
+      "kernel/src/memory/ordered_map.rs",
+      "kernel/src/memory/output.rs",
+      "kernel/src/memory/owned.rs",
+      "kernel/src/memory/shared_string.rs",
+      "kernel/src/memory/tests.rs",
+      "mem-test/Cargo.toml",
+      "mem-test/arrow-allocator-poc/Cargo.toml",
+      "mem-test/arrow-allocator-poc/checks.rs",
+      "mem-test/arrow-allocator-poc/fault.rs",
+      "mem-test/arrow-allocator-poc/heap.rs",
+      "mem-test/arrow-allocator-poc/rss.rs",
+      "mem-test/arrow-allocator-poc/verify.py",
+      "mem-test/examples/kernel_lifecycle.rs",
+      "mem-test/examples/rss_lifecycle.rs",
+      "mem-test/metadata/ffi_lifecycle.c",
+      "mem-test/metadata/run_matrix.py",
+      "mem-test/metadata/run_rss.py"
+    ],
+    "arrow_patch_sha256": "7ae4ea785cdd7900090aadef9810183065bc41191bb4723dfb2381687e5e965a",
+    "arrow_version": "60.0.0",
+    "reapplied_patch_matching_manifests_and_rust_sources": 415,
+    "poc_cargo_lock_sha256": "6f045fd99445c418222fbb6f832378d7c043d2856ec2daa62e7ec9e802d7f001"
+  },
+  "binary_sha256": {
+    "rss_lifecycle": "a0e6370f8324747a2a504886f32d216cb418101a60c1ebba7cf1fa7ede95bb5a",
+    "kernel_lifecycle": "747909bc574483c83154d2f885cbe88443c88bfb11948dcc19dc6629e9f965b9",
+    "allocation_checks": "337b36c30aa169489a938fc63939a4514370603c943a8109ef08e6084a73e409",
+    "fault_probe": "553b1e09c5d61067c1ddc058f62496666bf2da59810557ebe380b3e1c55059b2"
+  },
+  "allocator_behavior": {
+    "reservation": "Atomic compare-and-swap checks overflow and the limit before calling the backing allocator.",
+    "release": "Atomic fetch_sub after backing deallocation; allocation failure rolls back its reservation.",
+    "reallocation": "Reserve complete replacement while old bytes remain charged, delegate to backing realloc, then release old bytes on success or roll back replacement on failure.",
+    "configuration": "Allocation-free atomic reader/writer gate excludes reservations during limit changes, usage snapshots, and peak resets; backing calls and frees hold no gate.",
+    "default_enforcement": false,
+    "ffi_default_global_allocator_feature": true
+  },
+  "normal_kernel_validation": {
+    "workspace_all_feature_tests_passed": 22375,
+    "workspace_tests_skipped": 39,
+    "workspace_filter": "not test(invalid_handle_code)",
+    "workspace_summary": "Summary [ 152.838s] 22375 tests run: 22375 passed, 39 skipped",
+    "compiler_diagnostic_test": "Separated compiler-message test uses its expected Rust 1.100 toolchain; no stderr snapshots overwritten.",
+    "compiler_diagnostic_rust_1_100_summary": "Summary [  30.157s] 1 test run: 1 passed, 736 skipped",
+    "format": true,
+    "clippy_warnings_denied": true,
+    "rustdoc_warnings_denied": true,
+    "doctests": true,
+    "no_default_feature_aliases_passed": 4,
+    "core_allocator_and_ffi_tests_summary": "Summary [   0.147s] 10 tests run: 10 passed, 11622 skipped",
+    "contention": {
+      "simultaneous_vectors": 16,
+      "admitted_vectors_under_4096_byte_headroom": 4,
+      "allocator_workers_during_limit_updates": 4,
+      "concurrent_limit_changes": 2000
+    },
+    "generated_c_actual_cdylib": "Two unlimited and two 64-MiB lifecycle passes, zero-headroom write-state encoding returns memory error 59 and retries after clearing the limit, foreign pthread releases retained bytes at zero extra headroom, stable retained baseline after full release."
+  },
+  "matrix": {
+    "manifest_sha256": "6f175db457a1cbb5a251d2a89b0a5e509c8ee8d6324f82e4e80c5db19feb85a3",
+    "result_sha256": "19779615c9956b2691b298650f9c8fc64f5035a2afe1a28c8a0c92ae925e2073",
+    "receipts_sha256": "a0e194200fcd8a053e4daac0f102f4375c84bc8c497fe917afa110f2bf139a75",
+    "attempted_processes": 1690,
+    "returned_process_receipts": 1072,
+    "returned_operations": 2389,
+    "successful_returned_operations": 1793,
+    "unlimited_and_generous_limit_processes": 676,
+    "unlimited_and_generous_limit_successful_operations": 1690,
+    "typed_allocation_errors": 596,
+    "allocation_abort_recoverability_gaps": 618,
+    "recoverability_gaps_by_mode": {
+      "no_headroom": 338,
+      "after:declarative_transaction_relations_staged": 169,
+      "pressure": 99,
+      "after:declarative_metadata_plan_built_no_execution": 12
+    },
+    "unexpected_failures": 0,
+    "compatible_table_query_pairs": 169,
+    "concurrency": [
+      1,
+      4
+    ],
+    "repetitions": 1,
+    "distinct_plan_shapes": 21,
+    "serial_stages_with_enforcement_disabled_matching_independent_current_bytes": 2632,
+    "maximum_current_byte_difference_at_those_stages": 0,
+    "elapsed_seconds": 134.82
+  },
+  "stress": {
+    "manifest_sha256": "775a54bf91321147161f1eddd82c9901454072895b65410658f197e200fd4229",
+    "result_sha256": "0d283ae0d2472e86bcf66e0daf46f3148a54da9576c247d7f718999e7e8e2810",
+    "receipts_sha256": "e4499f767e12a63f2a1fff702ac329bb11ee6ca68089a27247cc32ee41041047",
+    "attempted_processes": 18,
+    "returned_process_receipts": 10,
+    "returned_operations": 10,
+    "successful_returned_operations": 6,
+    "unlimited_and_generous_limit_processes": 6,
+    "unlimited_and_generous_limit_successful_operations": 6,
+    "typed_allocation_errors": 4,
+    "allocation_abort_recoverability_gaps": 8,
+    "recoverability_gaps_by_mode": {
+      "pressure": 2,
+      "no_headroom": 3,
+      "after:declarative_transaction_relations_staged": 3
+    },
+    "unexpected_failures": 0,
+    "compatible_table_query_pairs": 3,
+    "concurrency": [
+      1
+    ],
+    "repetitions": 1,
+    "distinct_plan_shapes": 2,
+    "serial_stages_with_enforcement_disabled_matching_independent_current_bytes": 48,
+    "maximum_current_byte_difference_at_those_stages": 0,
+    "elapsed_seconds": 38.608
+  },
+  "exact_tail_fixture": {
+    "width": 10000,
+    "schema_fields": 30000,
+    "schema_json_bytes": 11301270,
+    "initial_files": 1000,
+    "checkpoints": 1,
+    "tail_commits": 10000
+  },
+  "exact_tail_unprofiled_peaks": [
+    {
+      "query": "all_columns",
+      "concurrency": 1,
+      "actual_requested_rust_heap_peak_bytes": 253902506,
+      "budget_reservation_peak_bytes": 262291082,
+      "os_rss_high_water_bytes": 449085440
+    },
+    {
+      "query": "narrow_projection",
+      "concurrency": 1,
+      "actual_requested_rust_heap_peak_bytes": 206045253,
+      "budget_reservation_peak_bytes": 206045253,
+      "os_rss_high_water_bytes": 314195968
+    },
+    {
+      "query": "wide_or",
+      "concurrency": 1,
+      "actual_requested_rust_heap_peak_bytes": 304555894,
+      "budget_reservation_peak_bytes": 312944470,
+      "os_rss_high_water_bytes": 520044544
+    }
+  ],
+  "peak_measurement_notes": [
+    "One measured operation per query, concurrency 1, tracking enabled and limit disabled. Includes fixed canonical schemas, caller/harness, and local Rust reference-engine allocations.",
+    "Rust and reservation peaks reset after warmup. RSS is process high-water and includes startup/warmup. Independent peaks need not coincide.",
+    "Reservation peaks can exceed actual requested Rust heap due to conservative old-plus-new realloc accounting, including in-place growth.",
+    "Current validation contains no new DHAT allocation-stack profiles. Historical profiles in RESULTS.json and GLOBAL_ALLOC_VALIDATION.json retain their original provenance."
+  ],
+  "allocation_fault_survey": {
+    "result_sha256": "fbe2dc6aa6a61fbcca36399483108aea0924d84db36a3da0bcfceb0e39a02b94",
+    "attempted_checks": 38,
+    "successfully_injected_typed_errors": 4,
+    "allocation_abort_recoverability_gaps": 27,
+    "unexpected_failures": 0,
+    "named_checks_returned_successfully": 7,
+    "named_checks_attempted": 9,
+    "named_check_abort_locations": [
+      "json_decoder_initialization",
+      "json_flush"
+    ],
+    "coverage_note": "One-shot global fault sequences stop at the first infallible gap; ordinal coverage is not exhaustive."
+  },
+  "dependency_unit_tests": {
+    "arrow-buffer": {
+      "passed": 359,
+      "summary": "Summary [   2.189s] 359 tests run: 359 passed, 0 skipped",
+      "scope": "library, all features"
+    },
+    "arrow-data": {
+      "passed": 53,
+      "summary": "Summary [   0.305s] 53 tests run: 53 passed, 0 skipped",
+      "scope": "library, all features"
+    },
+    "arrow-array": {
+      "passed": 766,
+      "summary": "Summary [   6.251s] 766 tests run: 766 passed, 1 skipped",
+      "scope": "library, all features"
+    },
+    "arrow-select": {
+      "passed": 429,
+      "summary": "Summary [   3.122s] 429 tests run: 429 passed, 0 skipped",
+      "scope": "library, all features"
+    },
+    "arrow-cast": {
+      "passed": 422,
+      "summary": "Summary [   3.095s] 422 tests run: 422 passed, 0 skipped",
+      "scope": "library, all features"
+    },
+    "arrow-json": {
+      "passed": 141,
+      "summary": "Summary [   1.066s] 141 tests run: 141 passed, 0 skipped",
+      "scope": "library, all features"
+    },
+    "parquet": {
+      "passed": 78,
+      "summary": "Summary [   0.465s] 78 tests run: 78 passed, 1356 skipped",
+      "scope": "record_reader, array_reader, and errors modules"
+    }
+  },
+  "selected_dependency_tests_passed": 2248,
+  "experimental_harness_clippy": true,
+  "limitations": [
+    "Recoverability is incomplete: infallible Arc/Box/container, dependency, engine, and caller allocations may abort when the global hook rejects a request.",
+    "Pressure probes span Kernel, caller construction, and the local reference engine. Abort counts are not attributed exclusively to Kernel.",
+    "Recovery gaps are explicitly recorded with --record-infallible-gaps; default strict runs fail on these aborts. Unlimited/fit failures and unexpected errors still fail either mode.",
+    "The limit bounds requested Rust reservations through this allocator domain, not whole-process native memory or RSS. Direct libc/C++, foreign engine storage, mappings, stacks, allocator overhead, and retained pages are outside requested-layout accounting.",
+    "Current serial stage observations agree exactly with an independent requested-Rust-byte tracker. This is not a new simultaneous-peak allocation-stack attribution or an RSS coverage fraction.",
+    "Terminal metadata-plan execution and declarative commit are not exercised by this lifecycle.",
+    "Correctness-run timings with one repetition cannot establish p99.9 latency or performance regressions."
+  ],
+  "current_validation": "ALLOCATOR_API_VALIDATION.json",
+  "historical": true,
+  "superseded_reason": "Process-global rejection exposed ordinary infallible allocations to abort. Replaced by an explicit opt-in Allocator backend with Kernel MSRV 1.95 and budgeting/FFI MSRV 1.100."
+}

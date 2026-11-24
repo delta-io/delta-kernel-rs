@@ -202,7 +202,7 @@ fn test_schema_with_column_defaults_overwrites_existing_default() {
     let field = with_second.field("c").expect("c field must exist");
     assert_eq!(
         field.get_config_value(&ColumnMetadataKey::CurrentDefault),
-        Some(&MetadataValue::String("99".to_string())),
+        Some(&MetadataValue::String("99".to_string().into())),
         "second call must overwrite the first CURRENT_DEFAULT value",
     );
 }
@@ -445,7 +445,7 @@ async fn test_transaction_top_level_column_defaults_excludes_nested_defaults(
 ) -> delta_kernel::Result<()> {
     let nested_default = StructField::nullable("inner", DataType::INTEGER).add_metadata([(
         ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
-        MetadataValue::String("7".to_string()),
+        MetadataValue::String("7".to_string().into()),
     )]);
 
     // `a`: no default, `b`: kernel-parsable default, `c`: non-kernel-parsable default,

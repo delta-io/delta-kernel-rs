@@ -65,12 +65,13 @@ impl StorageHandler for SyncStorageHandler {
                 size: meta.size,
             })
         });
-        let mut items: Vec<FileMeta> = futures::executor::block_on(
-            metas
-                .filter(move |item| ready(keep_listing(item, end)))
-                .try_collect(),
-        )?;
-        items.sort_unstable();
+
+        let mut items = crate::memory::MetadataVec::new();
+        let mut metas = std::pin::pin!(metas.filter(move |item| ready(keep_listing(item, end))));
+        while let Some(meta) = futures::executor::block_on(metas.try_next())? {
+            items.try_push(meta)?;
+        }
+        items.as_mut_slice().sort_unstable();
         Ok(Box::new(items.into_iter().map(Ok)))
     }
 
@@ -79,15 +80,10 @@ impl StorageHandler for SyncStorageHandler {
         files: Vec<FileSlice>,
     ) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
         let store = self.store.clone();
-        let results: Vec<KernelResult<Bytes>> = files
+        let results = files
             .into_iter()
-            .map(|(url, _range_opt)| {
-                let (s, _, path) = resolve_scope(store.as_ref(), &url)?;
-                let get_result = futures::executor::block_on(s.get(&path))?;
-                Ok(futures::executor::block_on(get_result.bytes())?)
-            })
-            .collect();
-        Ok(Box::new(results.into_iter()))
+            .map(move |(url, _range_opt)| super::get_bytes(store.as_ref(), &url));
+        Ok(Box::new(results))
     }
 
     fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> KernelResult<()> {

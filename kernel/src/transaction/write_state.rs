@@ -22,6 +22,8 @@ use crate::{DataType, Expression, KernelError, KernelResult};
 
 const WRITE_STATE_FORMAT_VERSION: u32 = 1;
 
+/// Owned transport bytes retaining any participating allocation budget until the buffer is freed.
+pub type WriteStateBytes = bytes::Bytes;
 /// Table-wide state required to create [`BoundWriteContext`] instances.
 ///
 /// A transaction creates this state once on the driver through
@@ -359,11 +361,13 @@ impl WriteState {
     /// kernel upgrades.
     ///
     /// Returns an error if any field cannot be serialized.
-    pub fn encode(&self) -> KernelResult<Vec<u8>> {
-        Ok(serde_json::to_vec(&WriteStateWire {
-            version: WRITE_STATE_FORMAT_VERSION,
-            write_state: self,
-        })?)
+    pub fn encode(&self) -> KernelResult<WriteStateBytes> {
+        Ok(bytes::Bytes::from_owner(crate::memory::try_to_json(
+            &WriteStateWire {
+                version: WRITE_STATE_FORMAT_VERSION,
+                write_state: self,
+            },
+        )?))
     }
 
     /// Decodes shared write state from JSON bytes produced by [`encode`](Self::encode).
@@ -374,7 +378,7 @@ impl WriteState {
     /// Returns an error if the bytes contain an unsupported format version or do not contain a
     /// valid serialized write state.
     pub fn decode(bytes: &[u8]) -> KernelResult<Arc<Self>> {
-        let wire: DecodedWriteStateWire = serde_json::from_slice(bytes)?;
+        let wire: DecodedWriteStateWire = crate::memory::decode_json(bytes)?;
         require!(
             wire.version == WRITE_STATE_FORMAT_VERSION,
             KernelError::generic(format!(
@@ -724,7 +728,7 @@ mod tests {
                 ("delta.columnMapping.id", MetadataValue::Number(id)),
                 (
                     "delta.columnMapping.physicalName",
-                    MetadataValue::String(physical_name.to_string()),
+                    MetadataValue::String(physical_name.to_string().into()),
                 ),
             ])
         };

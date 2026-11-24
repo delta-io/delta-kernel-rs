@@ -1,0 +1,10 @@
+{
+  "tables": [
+    {"name":"exact_wide_tail", "fixture":{"width":10000,"schema_bytes":11301270,"initial_files":1000,"tail_commits":10000,"stats_columns":-1}}
+  ],
+  "queries": [
+    {"name":"all_columns", "query":{}},
+    {"name":"narrow_projection", "query":{"projection":1,"stats":"selected","stats_projection":1}},
+    {"name":"wide_or", "query":{"filter":"or","terms":512}}
+  ]
+}

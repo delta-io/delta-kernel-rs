@@ -199,10 +199,12 @@ mod tests {
     ) -> Result<ScanLogReplayProcessor> {
         let state_info = Arc::new(get_simple_state_info(test_schema(), vec![])?);
 
-        let seen_file_keys: HashSet<FileActionKey> = seen_paths
-            .iter()
-            .map(|path| FileActionKey::new(*path, None))
-            .collect();
+        let mut seen_file_keys = crate::memory::FileKeySet::new();
+        for path in seen_paths {
+            seen_file_keys
+                .try_insert(path, None)
+                .map_err(KernelError::from)?;
+        }
 
         let checkpoint_info = CheckpointReadInfo::without_stats_parsed();
 

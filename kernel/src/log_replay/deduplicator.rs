@@ -30,6 +30,32 @@ pub(crate) struct FileActionInfo {
     pub(crate) is_add: bool,
 }
 
+pub(crate) trait SeenFileKeys {
+    fn contains_key(&self, key: &FileActionKey) -> bool;
+    fn try_insert_key(&mut self, key: FileActionKey) -> KernelResult<bool>;
+}
+impl SeenFileKeys for HashSet<FileActionKey> {
+    fn contains_key(&self, key: &FileActionKey) -> bool {
+        self.contains(key)
+    }
+    fn try_insert_key(&mut self, key: FileActionKey) -> KernelResult<bool> {
+        if self.contains(&key) {
+            return Ok(false);
+        }
+        self.try_reserve(1)
+            .map_err(|_| crate::memory::MemoryError::AllocationFailed { limit: usize::MAX })?;
+        Ok(self.insert(key))
+    }
+}
+impl SeenFileKeys for crate::memory::FileKeySet {
+    fn contains_key(&self, key: &FileActionKey) -> bool {
+        self.contains(key.path(), key.dv_unique_id())
+    }
+    fn try_insert_key(&mut self, key: FileActionKey) -> KernelResult<bool> {
+        Ok(self.try_insert(key.path(), key.dv_unique_id())?)
+    }
+}
+
 pub(crate) trait Deduplicator {
     /// Extracts a file action key from the data. Returns a `FileActionInfo` if found.
     ///
@@ -43,9 +69,8 @@ pub(crate) trait Deduplicator {
         skip_removes: bool,
     ) -> KernelResult<Option<FileActionInfo>>;
 
-    /// Checks if this file has been seen. When `is_log_batch() = true`, updates the hashmap
-    /// to track new files. Returns `true` if the file should be filtered out.
-    fn check_and_record_seen(&mut self, key: FileActionKey) -> bool;
+    /// Check and, for log batches, record the key before accepting its action.
+    fn try_check_and_record_seen(&mut self, key: FileActionKey) -> KernelResult<bool>;
 
     /// Returns `true` for commit log batches (updates hashmap), `false` for checkpoints
     /// (read-only).
@@ -105,7 +130,7 @@ pub(crate) trait Deduplicator {
 /// [`FileActionDeduplicator`]: crate::log_replay::FileActionDeduplicator
 #[allow(unused)]
 pub(crate) struct CheckpointDeduplicator<'a> {
-    seen_file_keys: &'a HashSet<FileActionKey>,
+    seen_file_keys: &'a dyn SeenFileKeys,
     add_path_index: usize,
     add_size_index: usize,
     add_dv_start_index: usize,
@@ -116,7 +141,7 @@ pub(crate) struct CheckpointDeduplicator<'a> {
 impl<'a> CheckpointDeduplicator<'a> {
     #[allow(unused)]
     pub(crate) fn try_new(
-        seen_file_keys: &'a HashSet<FileActionKey>,
+        seen_file_keys: &'a dyn SeenFileKeys,
         add_path_index: usize,
         add_size_index: usize,
         add_dv_start_index: usize,
@@ -162,8 +187,8 @@ impl Deduplicator for CheckpointDeduplicator<'_> {
     }
 
     /// Read-only check against seen set. Returns `true` if file should be filtered out.
-    fn check_and_record_seen(&mut self, key: FileActionKey) -> bool {
-        self.seen_file_keys.contains(&key)
+    fn try_check_and_record_seen(&mut self, key: FileActionKey) -> KernelResult<bool> {
+        Ok(self.seen_file_keys.contains_key(&key))
     }
 
     /// Always `false` - checkpoint batches never update the seen set.

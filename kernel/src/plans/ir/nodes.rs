@@ -990,7 +990,7 @@ impl Agg {
             let field = input_schema.field_at(value)?;
             let (data_type, metadata) = match output_data_type {
                 Some(data_type) => (data_type, HashMap::new()),
-                None => (field.data_type.clone(), field.metadata.clone()),
+                None => (field.data_type.try_clone()?, field.metadata.clone()),
             };
             Ok(StructField {
                 // Without clone, we capture `alias` by value and `CountStar` arm can't use it
@@ -1110,7 +1110,7 @@ impl AggregateBuilder {
     pub fn build(self) -> KernelResult<Aggregate> {
         let mut fields = Vec::with_capacity(self.group_by.len() + self.aggs.len());
         for key in &self.group_by {
-            fields.push(self.input_schema.field_at(key)?.clone());
+            fields.push(self.input_schema.field_at(key)?.try_clone()?);
         }
         let mut aggs = Vec::with_capacity(self.aggs.len());
         for (agg, alias) in self.aggs {

@@ -73,7 +73,7 @@ impl JsonHandler for SyncJsonHandler {
     ) -> KernelResult<FileSize> {
         let buf = to_json_bytes(data)?;
         let size = buf.len() as FileSize;
-        put_bytes(self.store.as_ref(), path, buf.into(), overwrite)?;
+        put_bytes(self.store.as_ref(), path, buf, overwrite)?;
         Ok(size)
     }
 }

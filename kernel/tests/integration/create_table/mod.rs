@@ -480,7 +480,7 @@ async fn test_create_table_rejects_delta_invariants_metadata() -> KernelResult<(
     let mut field = StructField::nullable("x", DataType::INTEGER);
     field.metadata.insert(
         ColumnMetadataKey::Invariants.as_ref().into(),
-        MetadataValue::String(r#"{"expression": {"expression": "x > 0"}}"#.to_string()),
+        MetadataValue::String(r#"{"expression": {"expression": "x > 0"}}"#.to_string().into()),
     );
     let schema = schema_ref! { (field) };
 

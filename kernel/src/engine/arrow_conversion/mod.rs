@@ -28,6 +28,7 @@ use crate::arrow::datatypes::{
 };
 use crate::arrow::error::ArrowError;
 use crate::error::KernelError;
+use crate::memory::{Owned, SharedString};
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::schema::{
     ArrayType, ColumnMetadataKey, DataType, MapType, MetadataKey, MetadataValue, PrimitiveType,
@@ -55,7 +56,7 @@ pub(crate) fn kernel_flat_parquet_id_to_arrow_metadata(
                 key.to_string()
             };
             match val {
-                MetadataValue::String(s) => Ok((transformed_key, s.clone())),
+                MetadataValue::String(s) => Ok((transformed_key, s.to_string())),
                 _ => Ok((
                     transformed_key,
                     serde_json::to_string(val).map_err(|e| ArrowError::JsonError(e.to_string()))?,
@@ -482,7 +483,13 @@ impl TryFromArrow<&ArrowField> for StructField {
                     })?;
                     return Ok((k.as_str().into(), MetadataValue::Other(value)));
                 }
-                Ok((k.as_str().into(), MetadataValue::from(v)))
+                Ok((
+                    k.as_str().into(),
+                    MetadataValue::String(
+                        SharedString::try_copy(v)
+                            .map_err(|error| ArrowError::from_external_error(error.into()))?,
+                    ),
+                ))
             })
             .collect::<Result<_, _>>()?;
         let mut nested_ids = serde_json::Map::new();
@@ -629,31 +636,16 @@ impl TryFromArrow<&ArrowDataType> for DataType {
                 fields.iter().map(|field| field.as_ref().try_into_kernel()),
             )
             .map_err(|e| ArrowError::from_external_error(e.into())),
-            ArrowDataType::List(field) => Ok(ArrayType::new(
-                DataType::try_from_arrow((*field).data_type())?,
-                (*field).is_nullable(),
-            )
-            .into()),
-            ArrowDataType::ListView(field) => Ok(ArrayType::new(
-                DataType::try_from_arrow((*field).data_type())?,
-                (*field).is_nullable(),
-            )
-            .into()),
-            ArrowDataType::LargeList(field) => Ok(ArrayType::new(
-                DataType::try_from_arrow((*field).data_type())?,
-                (*field).is_nullable(),
-            )
-            .into()),
-            ArrowDataType::LargeListView(field) => Ok(ArrayType::new(
-                DataType::try_from_arrow((*field).data_type())?,
-                (*field).is_nullable(),
-            )
-            .into()),
-            ArrowDataType::FixedSizeList(field, _) => Ok(ArrayType::new(
-                DataType::try_from_arrow((*field).data_type())?,
-                (*field).is_nullable(),
-            )
-            .into()),
+            ArrowDataType::List(field)
+            | ArrowDataType::ListView(field)
+            | ArrowDataType::LargeList(field)
+            | ArrowDataType::LargeListView(field)
+            | ArrowDataType::FixedSizeList(field, _) => Owned::try_new(ArrayType::new(
+                DataType::try_from_arrow(field.data_type())?,
+                field.is_nullable(),
+            ))
+            .map(DataType::Array)
+            .map_err(|error| ArrowError::from_external_error(KernelError::from(error).into())),
             ArrowDataType::Map(field, _)
                 if let ArrowDataType::Struct(struct_fields) = field.data_type()
                     && let [key, value] = struct_fields.as_ref() =>
@@ -661,7 +653,11 @@ impl TryFromArrow<&ArrowDataType> for DataType {
                 let key_type = DataType::try_from_arrow(key.data_type())?;
                 let value_type = DataType::try_from_arrow(value.data_type())?;
                 let value_type_nullable = value.is_nullable();
-                Ok(MapType::new(key_type, value_type, value_type_nullable).into())
+                Owned::try_new(MapType::new(key_type, value_type, value_type_nullable))
+                    .map(DataType::Map)
+                    .map_err(|error| {
+                        ArrowError::from_external_error(KernelError::from(error).into())
+                    })
             }
             // Dictionary types are just an optimized in-memory representation of an array.
             // Schema-wise, they are the same as the value type.
@@ -967,7 +963,7 @@ mod tests {
             ColumnMetadataKey::ColumnMappingNestedIds
                 .as_ref()
                 .to_string(),
-            MetadataValue::String("not a json object".to_string()),
+            MetadataValue::String("not a json object".to_string().into()),
         )]);
         assert_result_error_with_message(
             ArrowSchema::try_from_kernel(&schema),
@@ -1232,9 +1228,13 @@ mod tests {
     /// file with a different field set, is rejected rather than silently converted.
     #[test]
     fn test_non_canonical_file_schema_is_rejected() {
-        let non_canonical = DataType::File(Box::new(crate::schema::StructType::new_unchecked([
-            crate::schema::StructField::nullable("uri", DataType::STRING),
-        ])));
+        let non_canonical = DataType::File(
+            crate::schema::StructType::new_unchecked([crate::schema::StructField::nullable(
+                "uri",
+                DataType::STRING,
+            )])
+            .into(),
+        );
         let err = ArrowDataType::try_from_kernel(&non_canonical).unwrap_err();
         assert!(
             err.to_string().contains("Only the canonical file schema"),

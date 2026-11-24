@@ -339,6 +339,7 @@ impl Snapshot {
         };
         Self {
             span,
+
             log_segment,
             table_configuration,
             crc,
@@ -632,6 +633,7 @@ impl Snapshot {
         &self,
         commit: ParsedLogPath,
         crc_delta: CrcDelta,
+        prepared_configuration: Option<TableConfiguration>,
         #[cfg(feature = "adaptive-metadata-in-dev")] checkpoint_action: Option<CheckpointAction>,
     ) -> Result<Self> {
         require!(
@@ -652,12 +654,17 @@ impl Snapshot {
             )))
         );
 
-        let new_table_configuration = TableConfiguration::new_post_commit(
-            self.table_configuration(),
-            new_version,
-            crc_delta.metadata.clone(),
-            crc_delta.protocol.clone(),
-        )?;
+        // Reuse the configuration validated while building the transaction. Re-parsing after
+        // publication could turn a successful commit into a budget-exhaustion error.
+        let new_table_configuration = match prepared_configuration {
+            Some(configuration) => configuration,
+            None => TableConfiguration::new_post_commit(
+                self.table_configuration(),
+                new_version,
+                crc_delta.metadata.clone(),
+                crc_delta.protocol.clone(),
+            )?,
+        };
 
         let new_log_segment = self.log_segment.new_with_commit_appended(commit)?;
 
@@ -2261,7 +2268,7 @@ mod tests {
         let segment = LogSegment::try_new(
             LogSegmentFiles {
                 latest_commit_file: commits.last().cloned(),
-                ascending_commit_files: commits,
+                ascending_commit_files: crate::log_segment_files::commit_files(commits),
                 checkpoint_parts: vec![checkpoint],
                 latest_crc_file: observed_crc
                     .then(|| ParsedLogPath::create_parsed_crc(&table_root, 0)),
@@ -3582,6 +3589,7 @@ mod tests {
             .new_post_commit(
                 fake_new_commit,
                 CrcDelta::default(),
+                None,
                 #[cfg(feature = "adaptive-metadata-in-dev")]
                 None,
             )
@@ -3627,6 +3635,7 @@ mod tests {
             .new_post_commit(
                 commit,
                 CrcDelta::default(),
+                None,
                 #[cfg(feature = "adaptive-metadata-in-dev")]
                 None,
             )

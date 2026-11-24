@@ -325,7 +325,7 @@ impl Snapshot {
                 // TODO(#3421): Classify missing replay-file failures as Delta errors using the
                 // incremental replay context, preserving the original error sources.
                 combined_log_segment
-                    .segment_after_version(existing_snapshot_version)
+                    .segment_after_version(existing_snapshot_version)?
                     .read_protocol_metadata_opt(engine, newer_base)
                     .inspect_err(|_| {
                         emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
@@ -558,7 +558,9 @@ impl Snapshot {
         };
         let combined_log_segment = LogSegment::try_new_for_snapshot(
             LogSegmentFiles {
-                ascending_commit_files,
+                ascending_commit_files: crate::log_segment_files::commit_files(
+                    ascending_commit_files,
+                ),
                 ascending_compaction_files,
                 checkpoint_parts: new_checkpoint_parts,
                 latest_crc_file: crc_file,
@@ -595,6 +597,7 @@ impl Snapshot {
         }
         Arc::new(Self {
             span: existing.span.clone(),
+
             log_segment: existing.log_segment.clone(),
             table_configuration: existing.table_configuration.clone(),
             crc: existing.crc.clone(),

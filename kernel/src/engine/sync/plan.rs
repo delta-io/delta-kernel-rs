@@ -1,8 +1,7 @@
 //! A synchronous [`PlanExecutor`] for tests, backed by the sync storage helpers.
 //!
-//! The query path evaluates a [`Plan`] eagerly, materializing every node's output in full before
-//! its consumers run. Streaming is not needed because this executor only serves tests, which never
-//! approach memory limits.
+//! The query path evaluates a [`Plan`] eagerly, materializing each node's output before its
+//! consumers run and releasing inputs after their last consumer.
 //
 // TODO: The `IoOperation` paths will eventually be used to replace SyncEngine with an
 // PlanBasedEngine (backed by this PlanExecutor)
@@ -34,6 +33,7 @@ use crate::engine::arrow_utils::{
     coerce_columns_to_schema, fix_record_batch_nested_null_masks, to_json_bytes,
 };
 use crate::expressions::{ArrayData, ColumnName, PredicateRef, Scalar};
+use crate::memory::MetadataVec;
 use crate::object_store::DynObjectStore;
 use crate::plans::ir::nodes::{
     DynamicScan, FILE_META_SCHEMA, FileType, Operator, Project, RelationId, RelationRef, ScanFile,
@@ -214,32 +214,60 @@ impl SyncPlanExecutor {
         plan: Plan,
         relation_store: Option<&RelationStore>,
     ) -> KernelResult<Vec<RecordBatch>> {
-        let mut outputs: Vec<Vec<RecordBatch>> = Vec::with_capacity(plan.nodes.len());
-        for node in plan.nodes {
-            let output = self.eval_node(node, &outputs, relation_store)?;
+        let node_count = plan.nodes.len();
+        let mut last_use = MetadataVec::new();
+        last_use.try_reserve_exact(node_count)?;
+        for index in 0..node_count {
+            last_use.try_push(index)?;
+        }
+        for (index, node) in plan.nodes.iter().enumerate() {
+            for &input in &node.inputs {
+                if input >= index {
+                    return Err(KernelError::generic(
+                        "plan inputs must precede their consumer",
+                    ));
+                }
+                last_use[input] = index;
+            }
+        }
+
+        let mut outputs: MetadataVec<Vec<RecordBatch>> = MetadataVec::new();
+        outputs.try_reserve_exact(node_count)?;
+        for (index, PlanNode { op, inputs }) in plan.nodes.into_iter().enumerate() {
+            let output = self.eval_node(op, &inputs, &outputs, relation_store)?;
+            for input in inputs {
+                if last_use[input] == index {
+                    // Drop the vector's capacity as well as its batches. Output arrays that
+                    // share an input's buffers retain their own references.
+                    outputs[input] = Vec::new();
+                }
+            }
             // Every consumer, including the caller of the final node, sees nested children with
             // their ancestors' null masks applied. Project can introduce new nullable structs.
-            outputs.push(
+            let output = output
+                .into_iter()
+                .map(fix_record_batch_nested_null_masks)
+                .try_collect()?;
+            outputs.try_push(if last_use[index] == index && index + 1 != node_count {
+                Vec::new()
+            } else {
                 output
-                    .into_iter()
-                    .map(fix_record_batch_nested_null_masks)
-                    .try_collect()?,
-            );
+            })?;
         }
         outputs
             .pop()
             .ok_or_else(|| KernelError::generic("plan has no nodes"))
     }
 
-    /// Evaluates a single plan node. `node.inputs` are indices into `outputs`, the
+    /// Evaluates a single plan node. `inputs` are indices into `results`, the
     /// already-materialized results of every prior node, in the node's declared input order.
     fn eval_node(
         &self,
-        node: PlanNode,
+        op: Operator,
+        inputs: &[usize],
         results: &[Vec<RecordBatch>],
         relation_store: Option<&RelationStore>,
     ) -> KernelResult<Vec<RecordBatch>> {
-        let PlanNode { op, inputs } = node;
         match op {
             Operator::ScanJson(ScanJson {
                 files,
@@ -307,7 +335,7 @@ impl SyncPlanExecutor {
                 ArrowEngineData::new(batch.clone()),
             )))
         }))?;
-        put_bytes(self.storage.store(), file_path, bytes.into(), *overwrite)?;
+        put_bytes(self.storage.store(), file_path, bytes, *overwrite)?;
         let meta = self.storage.head(file_path)?;
         let size = i64::try_from(meta.size)
             .map_err(|_| KernelError::generic("Written file size exceeds LONG range"))?;
@@ -338,8 +366,8 @@ impl SyncPlanExecutor {
         let read_fields = schema
             .fields()
             .filter(|f| !file_constant_columns.contains(f.name()))
-            .cloned();
-        let read_schema = Arc::new(StructType::try_new(read_fields)?);
+            .map(|field| field.try_clone());
+        let read_schema = Arc::new(StructType::try_from_results(read_fields)?);
         let output_schema: Arc<ArrowSchema> = Arc::new(schema.as_ref().try_into_arrow()?);
 
         let store = self.storage.store();
@@ -562,7 +590,7 @@ fn eval_project(project: Project, input: &[RecordBatch]) -> KernelResult<Vec<Rec
     let evaluator = ArrowEvaluationHandler.new_expression_evaluator(
         input_schema,
         project.expr,
-        project.schema.as_ref().clone().into(),
+        project.schema.as_ref().try_clone()?.into(),
     )?;
     input
         .iter()
@@ -728,8 +756,66 @@ mod tests {
     };
     use crate::object_store::memory::InMemory;
     use crate::plans::PlanBuilder;
-    use crate::plans::ir::nodes::Agg;
+    use crate::plans::ir::nodes::{Agg, Filter, UnionAll};
     use crate::schema::{ToSchema as _, schema, schema_ref};
+
+    #[test]
+    fn shared_inputs_survive_until_their_last_consumer() -> KernelResult<()> {
+        let schema = schema_ref! { not_null "id": LONG };
+        let plan = Plan {
+            schema: schema.clone(),
+            nodes: vec![
+                PlanNode::new(
+                    Values::new(
+                        schema,
+                        vec![vec![1i64.into()], vec![2i64.into()], vec![3i64.into()]],
+                    ),
+                    vec![],
+                ),
+                PlanNode::new(
+                    Filter {
+                        predicate: Arc::new(Predicate::from_expr(expr!(col("id") > 1i64))),
+                    },
+                    vec![0],
+                ),
+                PlanNode::new(
+                    Filter {
+                        predicate: Arc::new(Predicate::from_expr(expr!(col("id") < 3i64))),
+                    },
+                    vec![0],
+                ),
+                PlanNode::new(UnionAll, vec![1, 2, 1]),
+            ],
+        };
+        let batches = SyncPlanExecutor::default().eval_plan(plan, None)?;
+        assert_batches_sorted_eq!(
+            vec![
+                "+----+", "| id |", "+----+", "| 1  |", "| 2  |", "| 2  |", "| 2  |", "| 3  |",
+                "| 3  |", "+----+",
+            ],
+            &batches
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::self_reference(1)]
+    #[case::forward_reference(2)]
+    #[case::out_of_bounds(usize::MAX)]
+    fn plan_rejects_inputs_that_do_not_precede_their_consumer(#[case] input: usize) {
+        let schema = schema_ref! { not_null "id": LONG };
+        let plan = Plan {
+            schema: schema.clone(),
+            nodes: vec![
+                PlanNode::new(Values::new(schema, vec![vec![1i64.into()]]), vec![]),
+                PlanNode::new(UnionAll, vec![input]),
+            ],
+        };
+        let error = SyncPlanExecutor::default()
+            .eval_plan(plan, None)
+            .unwrap_err();
+        assert!(error.to_string().contains("inputs must precede"));
+    }
 
     fn write_plan(
         inputs: impl IntoIterator<Item = PlanBuilder>,

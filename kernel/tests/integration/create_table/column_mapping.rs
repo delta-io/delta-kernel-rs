@@ -746,7 +746,7 @@ fn test_create_table_preserves_or_fills_cm_metadata(
     match expected_physical {
         Some(phys) => assert_eq!(
             f.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName),
-            Some(&MetadataValue::String(phys.to_string()))
+            Some(&MetadataValue::String(phys.to_string().into()))
         ),
         // No physical name supplied: kernel fills `col-<uuid>`.
         None => match f.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
@@ -837,7 +837,7 @@ fn test_create_table_preserves_preexisting_metadata_in_nested_types() -> delta_k
     assert_eq!(leaf.column_mapping_id(), Some(42));
     assert_eq!(
         leaf.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName),
-        Some(&MetadataValue::String("phys-leaf".to_string()))
+        Some(&MetadataValue::String("phys-leaf".to_string().into()))
     );
 
     // bare and outer seed above the nested preserved max (42), in field order.

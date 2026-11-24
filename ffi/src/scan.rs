@@ -541,11 +541,11 @@ fn scan_declarative_metadata_plan_impl(
 ) -> KernelResult<OptionalValue<crate::KernelOwnedBytes>> {
     let plan = scan.declarative_metadata_scan_plan(engine)?;
     Ok(plan
-        .map(|plan| {
-            delta_kernel::Operation::QueryPlan(plan)
-                .to_proto_bytes()
-                .into()
+        .map(|plan| -> KernelResult<_> {
+            let operation = delta_kernel::Operation::QueryPlan(plan);
+            operation.try_to_proto_bytes().map(Into::into)
         })
+        .transpose()?
         .into())
 }
 
@@ -791,9 +791,9 @@ impl From<&MetadataValue> for CMetadataValueKind {
     fn from(val: &MetadataValue) -> Self {
         match val {
             MetadataValue::Number(_) => CMetadataValueKind::MetadataNumber,
-            MetadataValue::String(_) => CMetadataValueKind::MetadataString,
             MetadataValue::Boolean(_) => CMetadataValueKind::MetadataBoolean,
-            MetadataValue::Other(_) => CMetadataValueKind::MetadataJson,
+            value if value.as_string().is_some() => CMetadataValueKind::MetadataString,
+            _ => CMetadataValueKind::MetadataJson,
         }
     }
 }

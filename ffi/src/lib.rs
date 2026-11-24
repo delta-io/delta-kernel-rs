@@ -49,6 +49,7 @@ use handle::Handle;
 extern crate self as delta_kernel_ffi;
 
 mod alloc_stats;
+pub mod memory;
 
 pub mod checkpoint;
 pub mod column_default;
@@ -536,13 +537,11 @@ pub unsafe extern "C" fn allocate_kernel_bytes(
 mod private {
     use std::ptr::NonNull;
 
-    use crate::handle::BoxExt;
-
     /// Convert a `Vec<T>` into a thin `(ptr, len)` pair, shrinking capacity to `len`.
     ///
     /// Pair with [`Vec::from_raw_parts(ptr.as_ptr(), len, len)`](Vec::from_raw_parts).
     fn vec_into_ffi_ptr<T>(val: Vec<T>) -> (NonNull<T>, usize) {
-        let ptr = BoxExt::into_non_null(val.into_boxed_slice());
+        let ptr = NonNull::from(Box::leak(val.into_boxed_slice()));
         (ptr.cast(), ptr.len())
     }
 
@@ -566,35 +565,53 @@ mod private {
     /// An owned byte buffer allocated by the kernel. Any time the engine receives a
     /// `KernelOwnedBytes` as a return value from a kernel method, the engine owns the buffer and
     /// must free it by calling [super::free_kernel_bytes] exactly once.
+    /// Pass this record unchanged to the release function. Its opaque
+    /// owner retains the original allocator until the last reference to the storage is released.
     #[cfg(feature = "declarative-plans")]
     #[repr(C)]
     pub struct KernelOwnedBytes {
         ptr: NonNull<u8>,
         len: usize,
+        // Keep the allocator-bearing Bytes owner until free_kernel_bytes, including across
+        // threads.
+        owner: NonNull<std::ffi::c_void>,
     }
 
     #[cfg(feature = "declarative-plans")]
     impl KernelOwnedBytes {
-        /// Converts this buffer back into a `Vec<u8>`.
+        /// Consumes this buffer as a `Vec<u8>`, copying allocator-backed storage when necessary.
         ///
         /// # Safety
         ///
-        /// The buffer must have been originally created `From<Vec<u8>>`, and must not have already
-        /// been consumed by a previous call to this method.
+        /// The buffer must have come from Kernel and must not have been consumed or freed.
         pub unsafe fn into_vec(self) -> Vec<u8> {
-            if self.len == 0 {
-                Default::default()
-            } else {
-                unsafe { Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.len) }
-            }
+            unsafe { self.into_bytes() }.to_vec()
+        }
+
+        /// Consumes the original byte owner, preserving its allocator and allocation charge.
+        ///
+        /// # Safety
+        ///
+        /// The buffer must have come from Kernel and must not have been consumed or freed.
+        pub unsafe fn into_bytes(self) -> bytes::Bytes {
+            *unsafe { Box::from_raw(self.owner.cast::<bytes::Bytes>().as_ptr()) }
         }
     }
 
     #[cfg(feature = "declarative-plans")]
     impl From<Vec<u8>> for KernelOwnedBytes {
         fn from(val: Vec<u8>) -> Self {
-            let (ptr, len) = vec_into_ffi_ptr(val);
-            KernelOwnedBytes { ptr, len }
+            bytes::Bytes::from(val).into()
+        }
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    impl From<bytes::Bytes> for KernelOwnedBytes {
+        fn from(val: bytes::Bytes) -> Self {
+            let ptr = NonNull::from(val.as_ref()).cast();
+            let len = val.len();
+            let owner = NonNull::from(Box::leak(Box::new(val))).cast();
+            Self { ptr, len, owner }
         }
     }
 
@@ -735,7 +752,7 @@ pub unsafe extern "C" fn free_row_indexes(slice: KernelRowIndexArray) {
 #[cfg(feature = "declarative-plans")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_kernel_bytes(bytes: KernelOwnedBytes) {
-    let _ = unsafe { bytes.into_vec() };
+    let _ = unsafe { bytes.into_bytes() };
 }
 
 // TODO: Do we want this handle at all? Perhaps we should just _always_ pass raw *mut c_void

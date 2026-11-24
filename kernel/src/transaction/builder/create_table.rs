@@ -2999,7 +2999,7 @@ mod tests {
             "field '{}' physicalName '{physical_name}' must start with 'col-'",
             field.name(),
         );
-        physical_name.clone()
+        physical_name.to_string()
     }
 
     /// Extracts the `delta.columnMapping.nested.ids` JSON object from a field, panicking if

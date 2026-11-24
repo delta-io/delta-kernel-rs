@@ -1122,7 +1122,7 @@ mod tests {
         // A field-id annotation of the wrong metadata type is treated as missing => error.
         let field = StructField::not_null("c", DataType::INTEGER).with_metadata([(
             ColumnMetadataKey::ParquetFieldId.as_ref(),
-            MetadataValue::String("1".to_string()),
+            MetadataValue::String("1".to_string().into()),
         )]);
         assert!(stats_schema(&StructType::new_unchecked([field])).is_err());
     }
@@ -1154,12 +1154,12 @@ mod tests {
     }
 
     #[rstest]
-    #[case::array(DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, false))))]
-    #[case::map(DataType::Map(Box::new(MapType::new(
+    #[case::array(DataType::Array(ArrayType::new(DataType::INTEGER, false).into()))]
+    #[case::map(DataType::Map(MapType::new(
         DataType::STRING,
         DataType::INTEGER,
         false
-    ))))]
+    ).into()))]
     fn stats_schema_complex_leaf_is_omitted(#[case] data_type: DataType) {
         // Array element / map key-value nodes carry no field-id context, so they produce no leaf
         // stats. The column is omitted rather than emitting an unbuildable empty stats struct.
@@ -1173,7 +1173,7 @@ mod tests {
     fn stats_schema_struct_of_only_complex_is_omitted() {
         let inner = StructType::new_unchecked([field_with_id(
             "f0",
-            DataType::Array(Box::new(ArrayType::new(DataType::FLOAT, true))),
+            DataType::Array(ArrayType::new(DataType::FLOAT, true).into()),
             true,
             2,
         )]);
@@ -1190,7 +1190,7 @@ mod tests {
             field_with_id("p", DataType::INTEGER, true, 2),
             field_with_id(
                 "a",
-                DataType::Array(Box::new(ArrayType::new(DataType::FLOAT, true))),
+                DataType::Array(ArrayType::new(DataType::FLOAT, true).into()),
                 true,
                 3,
             ),
@@ -1339,9 +1339,9 @@ mod tests {
     fn stats_schema_variant_stats_independent_of_physical_layout() {
         // Stats are emitted for any variant column regardless of its physical inner layout: even a
         // variant whose inner struct lacks a `value` field still gets unshredded-variant bounds.
-        let variant = DataType::Variant(Box::new(StructType::new_unchecked([
-            StructField::not_null("metadata", DataType::BINARY),
-        ])));
+        let variant = DataType::Variant(
+            StructType::new_unchecked([StructField::not_null("metadata", DataType::BINARY)]).into(),
+        );
         let field = field_with_id("v", variant, false, 3);
         let schema = StructType::new_unchecked([field]);
         let stats = stats_schema(&schema).expect("stats_schema should succeed");
@@ -1683,17 +1683,13 @@ mod tests {
             field_with_id("id", DataType::LONG, false, 0),
             field_with_id(
                 "arr",
-                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))),
+                DataType::Array(ArrayType::new(DataType::INTEGER, true).into()),
                 true,
                 1,
             ),
             field_with_id(
                 "m",
-                DataType::Map(Box::new(MapType::new(
-                    DataType::STRING,
-                    DataType::INTEGER,
-                    true,
-                ))),
+                DataType::Map(MapType::new(DataType::STRING, DataType::INTEGER, true).into()),
                 true,
                 2,
             ),

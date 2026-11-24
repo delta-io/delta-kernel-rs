@@ -1,0 +1,436 @@
+{
+  "implementation": "Historical std::alloc::Allocator backend; compiler and hashes below describe that implementation.",
+  "current_validation": "ALLOCATOR_API_VALIDATION.json",
+  "platform": "macOS-26.7.1-arm64-arm-64bit",
+  "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+  "scope": "Declarative snapshot discovery, checkpoint resolution, query/schema and scan-plan construction, wire encoding, write-relation staging and write-state encoding, and owner release. Includes local reference-engine execution and caller query construction. Excludes terminal metadata-plan execution and declarative commit. Heap coverage is live requested Rust bytes at the simultaneous peak, not RSS or foreign-memory coverage.",
+  "source": {
+    "base_commit": "145b8dbc20889d771cff1df7f659e3604c0ac3cd",
+    "kernel_and_harness_diff_sha256": "da991c44b5cbae16c459965a1e17bea0f0b4e2258c0baba896e7e983fc35e5c5",
+    "poc_build_inputs_sha256": "35026e7ba97c99e65ac832dc1c8f1e7450475480153d664802a0045314cc1500",
+    "arrow_patch_sha256": "93236e605c0bde2184c99432762314770b58eaea35fe62315c8bc1bb82a6f116",
+    "arrow_version": "60.0.0",
+    "reapplied_patch_matches_all_manifests_and_sources": true
+  },
+  "binary_sha256": {
+    "rss_lifecycle": "14b55434e4328709a2ef48f8f1a577de8ee5e03424d2dbad23e4004a1d58ba7e",
+    "kernel_lifecycle": "64ddfd01883c3afa0e6e6b56b02f966fffe362dc3c04a6cc13a1faff07170471",
+    "allocation_checks": "adee7bcbe75def6482bbf95112669e591492d9dcc89da7f8e9d250f0219a4621",
+    "fault_probe": "42267d564566c85e0b13aeb3f36185386841f798f56ad702f9f2f7d0e4a72e8b"
+  },
+  "baseline_binary_sha256": {
+    "rss_lifecycle": "a6c6feba8beb847f6f46ab82aed6f56860c4bc8c10dcc77605094682cdb98d03",
+    "kernel_lifecycle": "d9ab67c62650c57f9562c1d4042c035c1e616d924cfb78926c5969dffa846dae"
+  },
+  "allocation_checks": {
+    "checks": 360,
+    "injected_errors": 326,
+    "failures": 0,
+    "scope": "Every participating allocation ordinal across six JSON shapes and four phases, plus one checkpoint-backed declarative lifecycle. Named checks cover growth, shrink, Global imports, allocator-vector conversions, cross-thread release, C Data release callbacks, and recovery."
+  },
+  "matrix": {
+    "manifest": "mem-test/metadata/lifecycle_matrix.json",
+    "manifest_sha256": "6f175db457a1cbb5a251d2a89b0a5e509c8ee8d6324f82e4e80c5db19feb85a3",
+    "fresh_process_checks": 2354,
+    "checked_operations": 7762,
+    "successes": 3835,
+    "allocation_errors": 3927,
+    "successful_recoveries": 2354,
+    "failures": 0,
+    "concurrency": [
+      1,
+      4
+    ],
+    "distinct_plan_shapes": 21
+  },
+  "stress": {
+    "manifest": "mem-test/metadata/lifecycle_stress.json",
+    "manifest_sha256": "775a54bf91321147161f1eddd82c9901454072895b65410658f197e200fd4229",
+    "fresh_process_checks": 30,
+    "checked_operations": 42,
+    "successes": 14,
+    "allocation_errors": 28,
+    "successful_recoveries": 30,
+    "failures": 0,
+    "concurrency": [
+      1
+    ],
+    "distinct_plan_shapes": 2,
+    "fixture": {
+      "width": 10000,
+      "schema_fields": 30000,
+      "schema_json_bytes": 11301270,
+      "initial_files": 1000,
+      "tail_commits": 10000,
+      "checkpoints": 1
+    }
+  },
+  "normal_kernel_validation": {
+    "workspace_all_feature_tests_passed": 22374,
+    "workspace_tests_skipped": 38,
+    "format": true,
+    "clippy": true,
+    "rustdoc_warnings_denied": true,
+    "doctests": true,
+    "no_default_feature_aliases_passed": 4
+  },
+  "dependency_unit_tests": {
+    "arrow-buffer": {
+      "summary": "[   5.709s] 359 tests run: 359 passed, 0 skipped",
+      "scope": "library, all features"
+    },
+    "arrow-data": {
+      "summary": "[   0.898s] 53 tests run: 53 passed, 0 skipped",
+      "scope": "library, all features"
+    },
+    "arrow-array": {
+      "summary": "[  11.316s] 766 tests run: 766 passed, 1 skipped",
+      "scope": "library, all features"
+    },
+    "arrow-select": {
+      "summary": "[   5.638s] 429 tests run: 429 passed, 0 skipped",
+      "scope": "library, all features"
+    },
+    "arrow-cast": {
+      "summary": "[   5.585s] 422 tests run: 422 passed, 0 skipped",
+      "scope": "library, all features"
+    },
+    "arrow-json": {
+      "summary": "[   2.286s] 141 tests run: 141 passed, 0 skipped",
+      "scope": "library, all features"
+    },
+    "parquet": {
+      "summary": "[   0.502s] 78 tests run: 78 passed, 1302 skipped",
+      "scope": "record_reader, array_reader, and errors modules"
+    }
+  },
+  "baseline_heap_profiles": [
+    {
+      "table": "wide_schema",
+      "query": "all_columns",
+      "requested_rust_bytes_at_peak": 24984964,
+      "kernel_bytes_at_same_peak": 21879548,
+      "kernel_fraction": 0.8757086061841034,
+      "groups": {
+        "kernel_allocator": 21879548,
+        "schema_structures": 2830454,
+        "other": 240572,
+        "metadata_strings": 25903,
+        "log_descriptors_and_urls": 6237,
+        "arrow_objects_schemas_and_decoder_state": 2250
+      }
+    },
+    {
+      "table": "deep_schema",
+      "query": "nested_predicate",
+      "requested_rust_bytes_at_peak": 3034196,
+      "kernel_bytes_at_same_peak": 2492508,
+      "kernel_fraction": 0.8214723109515667,
+      "groups": {
+        "kernel_allocator": 2492508,
+        "other": 334676,
+        "schema_structures": 199822,
+        "log_descriptors_and_urls": 3421,
+        "arrow_objects_schemas_and_decoder_state": 2250,
+        "metadata_strings": 1519
+      }
+    },
+    {
+      "table": "dense_struct_stats",
+      "query": "both_stats",
+      "requested_rust_bytes_at_peak": 7825535,
+      "kernel_bytes_at_same_peak": 6944793,
+      "kernel_fraction": 0.8874528067410088,
+      "groups": {
+        "kernel_allocator": 6944793,
+        "schema_structures": 719979,
+        "other": 78043,
+        "arrow_objects_schemas_and_decoder_state": 68935,
+        "metadata_strings": 7548,
+        "log_descriptors_and_urls": 6237
+      }
+    },
+    {
+      "table": "many_actions",
+      "query": "range",
+      "requested_rust_bytes_at_peak": 2207170,
+      "kernel_bytes_at_same_peak": 402868,
+      "kernel_fraction": 0.18252694627056365,
+      "groups": {
+        "arrow_buffers_and_parser": 1284280,
+        "arrow_objects_schemas_and_decoder_state": 508530,
+        "kernel_allocator": 402868,
+        "other": 6557,
+        "log_descriptors_and_urls": 2631,
+        "schema_structures": 2304
+      }
+    },
+    {
+      "table": "large_action_stats",
+      "query": "large_in",
+      "requested_rust_bytes_at_peak": 1347072,
+      "kernel_bytes_at_same_peak": 147394,
+      "kernel_fraction": 0.10941805634739643,
+      "groups": {
+        "arrow_buffers_and_parser": 1125272,
+        "kernel_allocator": 147394,
+        "arrow_objects_schemas_and_decoder_state": 62914,
+        "other": 6557,
+        "log_descriptors_and_urls": 2631,
+        "schema_structures": 2304
+      }
+    },
+    {
+      "table": "long_tail",
+      "query": "wide_or",
+      "requested_rust_bytes_at_peak": 18529855,
+      "kernel_bytes_at_same_peak": 449539,
+      "kernel_fraction": 0.024260254599941553,
+      "groups": {
+        "arrow_objects_schemas_and_decoder_state": 12016726,
+        "arrow_buffers_and_parser": 5803751,
+        "kernel_allocator": 449539,
+        "log_descriptors_and_urls": 218471,
+        "other": 40437,
+        "schema_structures": 931
+      }
+    }
+  ],
+  "experimental_heap_profiles": [
+    {
+      "table": "wide_schema",
+      "query": "all_columns",
+      "requested_rust_bytes_at_peak": 24984964,
+      "kernel_bytes_at_same_peak": 21879548,
+      "kernel_fraction": 0.8757086061841034,
+      "groups": {
+        "kernel_allocator": 21879548,
+        "schema_structures": 2830454,
+        "other": 240572,
+        "metadata_strings": 25903,
+        "log_descriptors_and_urls": 6237,
+        "arrow_objects_schemas_and_decoder_state": 2250
+      }
+    },
+    {
+      "table": "deep_schema",
+      "query": "nested_predicate",
+      "requested_rust_bytes_at_peak": 3034196,
+      "kernel_bytes_at_same_peak": 2492508,
+      "kernel_fraction": 0.8214723109515667,
+      "groups": {
+        "kernel_allocator": 2492508,
+        "other": 334676,
+        "schema_structures": 199822,
+        "log_descriptors_and_urls": 3421,
+        "arrow_objects_schemas_and_decoder_state": 2250,
+        "metadata_strings": 1519
+      }
+    },
+    {
+      "table": "dense_struct_stats",
+      "query": "both_stats",
+      "requested_rust_bytes_at_peak": 7825535,
+      "kernel_bytes_at_same_peak": 6944793,
+      "kernel_fraction": 0.8874528067410088,
+      "groups": {
+        "kernel_allocator": 6944793,
+        "schema_structures": 719979,
+        "other": 78043,
+        "arrow_objects_schemas_and_decoder_state": 68935,
+        "metadata_strings": 7548,
+        "log_descriptors_and_urls": 6237
+      }
+    },
+    {
+      "table": "many_actions",
+      "query": "range",
+      "requested_rust_bytes_at_peak": 2300766,
+      "kernel_bytes_at_same_peak": 2165224,
+      "kernel_fraction": 0.9410883158043887,
+      "groups": {
+        "kernel_allocator": 2165224,
+        "arrow_objects_schemas_and_decoder_state": 101314,
+        "arrow_buffers_and_parser": 22736,
+        "other": 6557,
+        "log_descriptors_and_urls": 2631,
+        "schema_structures": 2304
+      }
+    },
+    {
+      "table": "large_action_stats",
+      "query": "large_in",
+      "requested_rust_bytes_at_peak": 1464476,
+      "kernel_bytes_at_same_peak": 1371886,
+      "kernel_fraction": 0.9367760209112338,
+      "groups": {
+        "kernel_allocator": 1371886,
+        "arrow_objects_schemas_and_decoder_state": 58362,
+        "arrow_buffers_and_parser": 22736,
+        "other": 6557,
+        "log_descriptors_and_urls": 2631,
+        "schema_structures": 2304
+      }
+    },
+    {
+      "table": "long_tail",
+      "query": "wide_or",
+      "requested_rust_bytes_at_peak": 18994927,
+      "kernel_bytes_at_same_peak": 660810,
+      "kernel_fraction": 0.03478876228374028,
+      "groups": {
+        "arrow_objects_schemas_and_decoder_state": 12709166,
+        "arrow_buffers_and_parser": 5365104,
+        "kernel_allocator": 660810,
+        "log_descriptors_and_urls": 218471,
+        "other": 40445,
+        "schema_structures": 931
+      }
+    }
+  ],
+  "limitations": [
+    "The normal Kernel dependency graph uses published Arrow. This separate POC applies a local dependency patch and registers the allocator at its benchmark entry points.",
+    "Arrow array/schema objects, ArrayData child vectors, Bytes control blocks, and other ordinary dependency allocations remain outside enforcement. Storage imported from ordinary Vec retains its original allocator, including vectors created inside dependencies.",
+    "Public infallible Arrow APIs retain infallible allocation behavior. Error-injection results establish the tested paths and shapes, not every Arrow operation.",
+    "At the long-tail peak, budgeted storage is 660810 of 18994927 requested Rust bytes. This is insufficient for a whole-lifecycle native-memory cap.",
+    "Allocation-stack categories describe call stacks, not a proof of ownership. Only the KernelAllocator category counts as enforced coverage.",
+    "Correctness-run timings have small sample counts and do not establish performance or p99.9 latency regressions."
+  ],
+  "experimental_harness_clippy": true,
+  "tail_memory": {
+    "source_commit": "f5f7f03103fcdbac258922e7d91d63b36764a9a0",
+    "heap_binary_sha256": "64ddfd01883c3afa0e6e6b56b02f966fffe362dc3c04a6cc13a1faff07170471",
+    "units": "bytes",
+    "concurrency": 1,
+    "notes": [
+      "Capped and outside-cap subsets refer to the same DHAT global peak of live requested Rust allocation bytes. Fixed canonical initialization precedes profiler startup and is excluded from this partition.",
+      "The allocator own-peak counters include the canonical baseline and may peak at a different instant. The narrow query has a later allocator peak than its overall Rust heap peak.",
+      "RSS is an independent process high-water mark from a separate unlimited correctness worker with warmup and two measured operations. It is not time-aligned with the heap profile and excludes DHAT profiling overhead.",
+      "RSS minus profiled live Rust bytes cannot identify the amounts of allocator-retained pages, code/stacks, direct libc/C++ allocations or other resident memory. Those portions have not been separately attributed here.",
+      "Allocation-type and allocation-stack groups are alternative disjoint partitions of the same bytes. Arc categories include object storage and refcounts, not the separately allocated data buffers they reference.",
+      "Profiles include local reference-engine discovery; terminal metadata-plan execution and declarative commit are excluded."
+    ],
+    "exact_fixture": {
+      "width": 10000,
+      "schema_fields": 30000,
+      "schema_json_bytes": 11301270,
+      "initial_files": 1000,
+      "tail_commits": 10000,
+      "checkpoints": 1
+    },
+    "exact_fixture_options": {
+      "width": 10000,
+      "schema_bytes": 11301270,
+      "initial_files": 1000,
+      "tail_commits": 10000,
+      "stats_columns": -1
+    },
+    "exact_fixture_profiles": [
+      {
+        "query": "all_columns",
+        "query_options": {},
+        "requested_rust_bytes_at_peak": 262783448,
+        "capped_bytes_at_same_peak": 231884336,
+        "measured_rust_bytes_outside_cap_at_same_peak": 30899112,
+        "capped_fraction_at_peak": 0.882416064500379,
+        "peak_first_observed_at": "declarative_metadata_plan_proto_live_no_execution",
+        "allocator_own_peak_reserved_bytes_including_canonical_baseline": 232042139,
+        "allocator_bytes_after_cleanup_including_canonical_baseline": 158203,
+        "allocation_stack_groups_at_peak": {
+          "kernel_allocator": 231884336,
+          "schema_structures": 22628342,
+          "other": 4506588,
+          "log_descriptors_and_urls": 3520605,
+          "metadata_strings": 241327,
+          "arrow_objects_schemas_and_decoder_state": 2250
+        },
+        "allocation_types_at_peak": {
+          "capped_kernel_storage": 231884336,
+          "other_measured_rust_outside_cap": 30899112
+        },
+        "separate_unprofiled_worker": {
+          "repetitions": 2,
+          "allocator_peak_reserved_bytes": 232042139,
+          "requested_rust_peak_bytes": 262291658,
+          "process_rss_high_water_bytes": 507527168
+        }
+      },
+      {
+        "query": "narrow_projection",
+        "query_options": {
+          "projection": 1,
+          "stats": "selected",
+          "stats_projection": 1
+        },
+        "requested_rust_bytes_at_peak": 212865703,
+        "capped_bytes_at_same_peak": 7090186,
+        "measured_rust_bytes_outside_cap_at_same_peak": 205775517,
+        "capped_fraction_at_peak": 0.033308259151545894,
+        "peak_first_observed_at": "declarative_snapshot_ready_mock_engine_included",
+        "allocator_own_peak_reserved_bytes_including_canonical_baseline": 93433715,
+        "allocator_bytes_after_cleanup_including_canonical_baseline": 158203,
+        "allocation_stack_groups_at_peak": {
+          "arrow_objects_schemas_and_decoder_state": 138392714,
+          "arrow_buffers_and_parser": 53605104,
+          "other": 11596297,
+          "kernel_allocator": 7090186,
+          "log_descriptors_and_urls": 2180471,
+          "schema_structures": 931
+        },
+        "allocation_types_at_peak": {
+          "arrow_array_objects_and_refcounts": 65125896,
+          "other_measured_rust_outside_cap": 35277509,
+          "arrow_buffer_ownership_objects_and_refcounts": 52484800,
+          "capped_kernel_storage": 7090186,
+          "arrow_schema_field_objects_and_refcounts": 20247040,
+          "arrow_array_data_vectors": 32640272
+        },
+        "separate_unprofiled_worker": {
+          "repetitions": 2,
+          "allocator_peak_reserved_bytes": 93433577,
+          "requested_rust_peak_bytes": 212606901,
+          "process_rss_high_water_bytes": 347013120
+        }
+      },
+      {
+        "query": "wide_or",
+        "query_options": {
+          "filter": "or",
+          "terms": 512
+        },
+        "requested_rust_bytes_at_peak": 313436836,
+        "capped_bytes_at_same_peak": 274464964,
+        "measured_rust_bytes_outside_cap_at_same_peak": 38971872,
+        "capped_fraction_at_peak": 0.875662757136816,
+        "peak_first_observed_at": "declarative_metadata_plan_proto_live_no_execution",
+        "allocator_own_peak_reserved_bytes_including_canonical_baseline": 274622767,
+        "allocator_bytes_after_cleanup_including_canonical_baseline": 158203,
+        "allocation_stack_groups_at_peak": {
+          "kernel_allocator": 274464964,
+          "schema_structures": 27936764,
+          "other": 7270926,
+          "log_descriptors_and_urls": 3520605,
+          "metadata_strings": 241327,
+          "arrow_objects_schemas_and_decoder_state": 2250
+        },
+        "allocation_types_at_peak": {
+          "other_measured_rust_outside_cap": 38971872,
+          "capped_kernel_storage": 274464964
+        },
+        "separate_unprofiled_worker": {
+          "repetitions": 2,
+          "allocator_peak_reserved_bytes": 274622767,
+          "requested_rust_peak_bytes": 312945046,
+          "process_rss_high_water_bytes": 568164352
+        }
+      }
+    ],
+    "reproduction": {
+      "script": "mem-test/metadata/run_heap.py",
+      "mode": "declarative",
+      "cap_mib": 0,
+      "fixture_options": "exact_fixture_options above; also lifecycle_stress.json tables[0].fixture",
+      "query_options": "Use each exact_fixture_profiles entry query_options"
+    }
+  }
+}

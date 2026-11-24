@@ -222,6 +222,9 @@ impl From<SnapshotHintError> for KernelError {
 #[non_exhaustive]
 #[derive(thiserror::Error, Debug)]
 pub enum KernelError {
+    /// A participating metadata allocation could not be satisfied.
+    #[error(transparent)]
+    Memory(crate::memory::MemoryError),
     /// This is an error that includes a backtrace. To have a particular type of error include such
     /// backtrace (when RUST_BACKTRACE=1), annotate the error with `#[error(transparent)]` and then
     /// add the error type and enum variant to the `from_with_backtrace!` macro invocation
@@ -696,9 +699,17 @@ impl KernelError {
         }
     }
 
-    // Capture a backtrace when the error is constructed.
+    /// Capture a backtrace unless this error reports exhausted memory.
     #[must_use]
     pub fn with_backtrace(self) -> Self {
+        // Capturing or formatting a backtrace can allocate substantially more memory while
+        // reporting an allocation failure. Preserve the typed error without that extra work.
+        match &self {
+            Self::Memory(crate::memory::MemoryError::AllocationFailed { .. }) => return self,
+            #[cfg(feature = "default-engine-base")]
+            Self::Arrow(ArrowError::MemoryError(_)) => return self,
+            _ => {}
+        }
         let backtrace = Backtrace::capture();
         match backtrace.status() {
             BacktraceStatus::Captured => Self::Backtraced {
@@ -730,6 +741,12 @@ from_with_backtrace!(
 #[cfg(feature = "default-engine-base")]
 impl From<ArrowError> for KernelError {
     fn from(value: ArrowError) -> Self {
+        if let ArrowError::ExternalError(source) = &value
+            && let Some(error) = source.downcast_ref::<KernelError>()
+            && let Self::Memory(failure) = error.without_backtrace()
+        {
+            return Self::Memory(*failure);
+        }
         Self::Arrow(value).with_backtrace()
     }
 }
@@ -751,5 +768,39 @@ impl From<object_store::Error> for KernelError {
 impl From<Infallible> for KernelError {
     fn from(value: Infallible) -> Self {
         match value {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_errors_do_not_capture_enabled_backtraces() {
+        const CHILD: &str = "DELTA_KERNEL_MEMORY_ERROR_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "error::tests::memory_errors_do_not_capture_enabled_backtraces",
+                ])
+                .env(CHILD, "1")
+                .env("RUST_LIB_BACKTRACE", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        assert_eq!(Backtrace::capture().status(), BacktraceStatus::Captured);
+        let error = KernelError::Memory(crate::memory::MemoryError::AllocationFailed { limit: 1 });
+        assert!(matches!(error.with_backtrace(), KernelError::Memory(_)));
+        #[cfg(feature = "default-engine-base")]
+        {
+            let error = KernelError::from(ArrowError::MemoryError("budget exhausted".into()));
+            assert!(matches!(
+                error.with_backtrace(),
+                KernelError::Arrow(ArrowError::MemoryError(_))
+            ));
+        }
     }
 }

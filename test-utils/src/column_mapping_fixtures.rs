@@ -40,7 +40,7 @@ pub fn cm_field(name: &str, id: i64, phys: &str, ty: impl Into<DataType>) -> Str
         ),
         (
             ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-            MetadataValue::String(phys.to_string()),
+            MetadataValue::String(phys.to_string().into()),
         ),
     ])
 }
@@ -57,6 +57,6 @@ pub fn cm_field_id_only(name: &str, id: i64, ty: impl Into<DataType>) -> StructF
 pub fn cm_field_physical_name_only(name: &str, phys: &str, ty: impl Into<DataType>) -> StructField {
     StructField::nullable(name, ty).with_metadata([(
         ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-        MetadataValue::String(phys.to_string()),
+        MetadataValue::String(phys.to_string().into()),
     )])
 }

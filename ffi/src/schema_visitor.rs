@@ -24,6 +24,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 
+use delta_kernel::memory::{Owned, SharedString};
 use delta_kernel::schema::{
     ArrayType, DataType, DecimalType, IntervalDayToSecondType, IntervalYearToMonthType, MapType,
     MetadataKey, MetadataValue, PrimitiveType, StructField, StructType,
@@ -124,7 +125,7 @@ fn visit_metadata_value_impl(
     let value = value?;
     let value = match kind {
         CMetadataValueKind::MetadataNumber => MetadataValue::Number(value.parse()?),
-        CMetadataValueKind::MetadataString => MetadataValue::String(value.to_owned()),
+        CMetadataValueKind::MetadataString => MetadataValue::String(SharedString::try_copy(value)?),
         CMetadataValueKind::MetadataBoolean => {
             MetadataValue::Boolean(value.parse().map_err(|_| {
                 KernelError::schema("Invalid Boolean metadata value: expected true or false")
@@ -160,7 +161,7 @@ pub fn extract_kernel_schema(
             "Didn't consume all visited fields, schema is invalid.",
         ))
     } else {
-        Ok(*struct_type)
+        Ok(struct_type.into_inner())
     }
 }
 
@@ -858,7 +859,12 @@ fn visit_field_array_impl(
     })?;
 
     let array_type = ArrayType::new(element_field.data_type, element_field.nullable);
-    let field = StructField::new(name_str, array_type, nullable).with_metadata(metadata);
+    let field = StructField::new(
+        name_str,
+        DataType::Array(Owned::try_new(array_type)?),
+        nullable,
+    )
+    .with_metadata(metadata);
     Ok(wrap_field(state, field))
 }
 
@@ -929,7 +935,8 @@ fn visit_field_map_impl(
         value_field.data_type,
         value_field.nullable,
     );
-    let field = StructField::new(name_str, map_type, nullable).with_metadata(metadata);
+    let field = StructField::new(name_str, DataType::Map(Owned::try_new(map_type)?), nullable)
+        .with_metadata(metadata);
     Ok(wrap_field(state, field))
 }
 
@@ -1516,14 +1523,14 @@ mod tests {
 
     #[rstest]
     #[case(CMetadataValueKind::MetadataNumber, "17", MetadataValue::Number(17))]
-    #[case(CMetadataValueKind::MetadataString, "value", MetadataValue::String("value".to_string()))]
+    #[case(CMetadataValueKind::MetadataString, "value", MetadataValue::String("value".to_string().into()))]
     #[case(
         CMetadataValueKind::MetadataBoolean,
         "true",
         MetadataValue::Boolean(true)
     )]
     #[case(CMetadataValueKind::MetadataJson, "17", MetadataValue::Number(17))]
-    #[case(CMetadataValueKind::MetadataJson, r#""value""#, MetadataValue::String("value".to_string()))]
+    #[case(CMetadataValueKind::MetadataJson, r#""value""#, MetadataValue::String("value".to_string().into()))]
     #[case(CMetadataValueKind::MetadataJson, "true", MetadataValue::Boolean(true))]
     #[case(CMetadataValueKind::MetadataJson, r#"{"nested":1}"#, MetadataValue::Other(serde_json::json!({"nested": 1})))]
     fn metadata_value_decodes_text_and_normalizes_json_scalars(
@@ -1578,7 +1585,10 @@ mod tests {
     fn outbound_metadata_round_trips_through_field_visitor() {
         let values: HashMap<MetadataKey, MetadataValue> = HashMap::from([
             ("number".into(), MetadataValue::Number(17)),
-            ("string".into(), MetadataValue::String("true".to_string())),
+            (
+                "string".into(),
+                MetadataValue::String("true".to_string().into()),
+            ),
             ("boolean".into(), MetadataValue::Boolean(true)),
             (
                 "array".into(),
@@ -1611,7 +1621,7 @@ mod tests {
         expected.insert("json_number".into(), MetadataValue::Number(17));
         expected.insert(
             "json_string".into(),
-            MetadataValue::String("value".to_string()),
+            MetadataValue::String("value".to_string().into()),
         );
         expected.insert("json_boolean".into(), MetadataValue::Boolean(true));
         let mut source = CMetadataMap::from(values.clone());
@@ -1758,7 +1768,10 @@ mod tests {
         let mut state = KernelSchemaVisitorState::default();
         let expected: HashMap<MetadataKey, MetadataValue> = HashMap::from([
             ("number".into(), MetadataValue::Number(17)),
-            ("string".into(), MetadataValue::String("value".to_string())),
+            (
+                "string".into(),
+                MetadataValue::String("value".to_string().into()),
+            ),
             ("boolean".into(), MetadataValue::Boolean(true)),
             (
                 "json".into(),

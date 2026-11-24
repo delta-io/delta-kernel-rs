@@ -92,7 +92,7 @@ impl LogSegment {
                 "Pruning log segment to commits after CRC version {}",
                 crc.version
             );
-            let pruned = self.segment_after_version(crc.version);
+            let pruned = self.segment_after_version(crc.version)?;
             // Ignore pruned P&M at or below the CRC version: a lagging AMT checkpoint action can
             // carry it, and the CRC's P&M is at least as new. A captured checkpoint action is still
             // the latest: any action at or below the CRC is older.
@@ -998,9 +998,11 @@ fn pm_plan_schema(extra_actions: &[PmPlanExtraAction]) -> KernelResult<SchemaRef
     let actions = [&*PROTOCOL_FIELD, &*METADATA_FIELD]
         .into_iter()
         .chain(extra_actions.iter().map(|action| action.field))
-        .cloned();
+        .map(StructField::try_clone);
     let version = StructField::not_null("version", DataType::LONG);
-    Ok(Arc::new(StructType::try_new(actions.chain([version]))?))
+    Ok(Arc::new(StructType::try_from_results(
+        actions.chain([Ok(version)]),
+    )?))
 }
 
 /// The Protocol and Metadata in `batch`, tagged with their versions. Under AMT, also any checkpoint

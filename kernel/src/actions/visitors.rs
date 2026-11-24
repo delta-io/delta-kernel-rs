@@ -636,7 +636,8 @@ pub(crate) fn visit_metadata_at<'a>(
             .get_opt(row_index, "metadata.format.options")?
             .unwrap_or_default(),
     };
-    let schema_string: String = getters[5].get(row_index, "metadata.schema_string")?;
+    let schema_text: &str = getters[5].get(row_index, "metadata.schema_string")?;
+    let schema_string = crate::memory::SharedString::try_copy(schema_text)?;
     let partition_columns: Vec<_> = getters[6].get(row_index, "metadata.partition_list")?;
     let created_time: Option<i64> = getters[7].get_opt(row_index, "metadata.created_time")?;
     let configuration: HashMap<_, _> = getters[8]
@@ -648,7 +649,7 @@ pub(crate) fn visit_metadata_at<'a>(
         name,
         description,
         format,
-        schema_string: schema_string.into(),
+        schema_string,
         partition_columns,
         created_time,
         configuration,
@@ -1292,7 +1293,7 @@ mod tests {
         let bytes = to_json_bytes(std::iter::once(Ok(
             FilteredEngineData::with_all_rows_selected(data),
         )))?;
-        let commit_json = String::from_utf8(bytes).unwrap();
+        let commit_json = std::str::from_utf8(&bytes).unwrap();
 
         let data = parse_json_batch(StringArray::from(vec![commit_json]));
         let parsed = CheckpointAction::try_new_from_data(data.as_ref())?

@@ -132,7 +132,7 @@ async fn read_json_files_impl(
 async fn write_json_file_impl(
     store: Arc<DynObjectStore>,
     path: Url,
-    buffer: Vec<u8>,
+    buffer: Bytes,
     overwrite: bool,
 ) -> KernelResult<FileSize> {
     let size = buffer.len() as FileSize;

@@ -1,12 +1,13 @@
 //! Some utilities for working with arrow data types
 
+mod action_json;
 pub(crate) mod apply_schema;
 pub(crate) mod file_type_validation;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use delta_kernel_derive::internal_api;
 use derive_more::Constructor;
@@ -18,17 +19,16 @@ use self::file_type_validation::validate_file_values_for_read;
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::{
     Array as ArrowArray, ArrayRef as ArrowArrayRef, GenericListArray, GenericListViewArray,
-    MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, RecordBatchOptions, StringArray,
-    StructArray, make_array, new_null_array,
+    MapArray, NullArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, RecordBatchOptions,
+    StringArray, StructArray, make_array,
 };
 use crate::arrow::buffer::NullBuffer;
-use crate::arrow::compute::{CastOptions, cast_with_options};
+use crate::arrow::compute::{CastOptions, cast, cast_with_options};
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef as ArrowFieldRef,
     Fields as ArrowFields, Int64Type, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
-use crate::arrow::json::writer::{LineDelimited, NullableEncoder, make_encoder};
-use crate::arrow::json::{Encoder, EncoderFactory, EncoderOptions, ReaderBuilder, WriterBuilder};
+use crate::arrow::json::ReaderBuilder;
 use crate::engine::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::ensure_data_types::DataTypeCompat;
@@ -535,7 +535,8 @@ fn get_indices(
             // If the field is a variant, make sure the parquet schema matches the unshredded
             // variant representation. This is to ensure that shredded reads are not
             // performed.
-            if requested_type == &DataType::unshredded_variant() {
+            if matches!(requested_type, DataType::Variant(schema) if schema.as_ref() == &*crate::schema::VARIANT_FIELDS)
+            {
                 validate_parquet_variant(field)?;
             }
             match field.data_type() {
@@ -665,7 +666,7 @@ fn get_indices(
                                     "map fields had more than 2 members",
                                 ));
                             }
-                            let inner_schema = map_type.as_struct_schema(key_name, val_name);
+                            let inner_schema = map_type.as_struct_schema(key_name, val_name)?;
                             let mask_before = mask_indices.len();
                             let (parquet_advance, mut children) = get_indices(
                                 parquet_index + parquet_offset,
@@ -941,16 +942,21 @@ type FieldArrayOpt = Option<(Arc<ArrowField>, Arc<dyn ArrowArray>)>;
 /// Creates an array for a missing field. For non-nullable structs, produces a non-null struct
 /// (no null buffer) with recursively missing children, preserving the non-null constraint at
 /// every level. For all other types (or nullable structs), produces an all-null array.
-fn new_missing_array(field: &ArrowField, num_rows: usize) -> Arc<dyn ArrowArray> {
+fn new_missing_array(field: &ArrowField, num_rows: usize) -> KernelResult<ArrowArrayRef> {
     match (field.is_nullable(), field.data_type()) {
         (false, ArrowDataType::Struct(child_fields)) => {
             let child_arrays: Vec<Arc<dyn ArrowArray>> = child_fields
                 .iter()
                 .map(|f| new_missing_array(f, num_rows))
-                .collect();
-            Arc::new(StructArray::new(child_fields.clone(), child_arrays, None))
+                .collect::<KernelResult<_>>()?;
+            Ok(Arc::new(StructArray::try_new_with_length(
+                child_fields.clone(),
+                child_arrays,
+                None,
+                num_rows,
+            )?))
         }
-        _ => new_null_array(field.data_type(), num_rows),
+        _ => Ok(cast(&NullArray::new(num_rows), field.data_type())?),
     }
 }
 
@@ -1073,7 +1079,7 @@ pub(crate) fn reorder_struct_array(
                     ));
                 }
                 ReorderIndexTransform::Missing(field) => {
-                    let array = new_missing_array(field, num_rows);
+                    let array = new_missing_array(field, num_rows)?;
                     final_fields_cols[reorder_index.index] = Some((field.clone(), array));
                 }
                 ReorderIndexTransform::RowIndex(field) => {
@@ -1270,12 +1276,16 @@ pub(crate) fn fix_record_batch_nested_null_masks(batch: RecordBatch) -> KernelRe
 /// Splits a StructArray into its parts, unions in the parent null mask, and uses the result to
 /// recursively update the children as well before putting everything back together.
 fn compute_nested_null_masks(sa: StructArray, parent_nulls: Option<&NullBuffer>) -> StructArray {
+    if !needs_nested_null_masks(&sa, parent_nulls) {
+        return sa;
+    }
     let len = sa.len();
     let (fields, columns, nulls) = sa.into_parts();
     let nulls = NullBuffer::union(parent_nulls, nulls.as_ref());
     let columns = columns
         .into_iter()
         .map(|column| match column.data_type() {
+            _ if !needs_nested_null_masks(column.as_ref(), nulls.as_ref()) => column,
             // NullArray (void columns) does not accept a null buffer — all values are
             // already null by definition, so propagating the parent null mask is a no-op.
             ArrowDataType::Null => column,
@@ -1309,6 +1319,27 @@ fn compute_nested_null_masks(sa: StructArray, parent_nulls: Option<&NullBuffer>)
     // SAFETY: We are simply reassembling the input `StructArray` we previously broke apart, with
     // updated null buffers. See above for details about null buffer safety.
     unsafe { StructArray::new_unchecked_with_length(fields, columns, nulls, len) }
+}
+
+// Avoid cloning array objects and their ArrayData trees when the reader or a previous operator
+// already propagated every ancestor's nulls. The check borrows the existing arrays and masks.
+fn needs_nested_null_masks(array: &dyn ArrowArray, parent_nulls: Option<&NullBuffer>) -> bool {
+    if matches!(array.data_type(), ArrowDataType::Null) {
+        return false;
+    }
+    if let Some(parent) = parent_nulls
+        && array.nulls().is_none_or(|nulls| !nulls.contains(parent))
+    {
+        return true;
+    }
+    match array.data_type() {
+        ArrowDataType::Struct(_) => array
+            .as_struct()
+            .columns()
+            .iter()
+            .any(|column| needs_nested_null_masks(column.as_ref(), array.nulls())),
+        _ => false,
+    }
 }
 
 /// Parse a column of JSON strings into a typed `RecordBatch` matching `schema`. N input
@@ -1589,72 +1620,13 @@ pub(crate) fn filter_to_record_batch(
     Ok((*arrow_data).into())
 }
 
-// we want to keep nulls in our partition map, so we end up with data in the log like:
-// {partitionValues:{"foo": null}}, which is what is generally expected. Without this we would
-// get: {partitionValues:{}}
-/// This is a special encoder factory that will use the default encoder for all array types except
-/// MapArrays. For MapArrays, it uses Arrow's map encoder with options preserving
-/// keys that have null values.
-#[derive(Debug)]
-struct NullValueMapEncoderFactory;
-
-impl EncoderFactory for NullValueMapEncoderFactory {
-    fn make_default_encoder<'a>(
-        &self,
-        field: &'a ArrowFieldRef,
-        array: &'a dyn ArrowArray,
-        _options: &'a EncoderOptions,
-    ) -> KernelResult<Option<NullableEncoder<'a>>, crate::arrow::error::ArrowError> {
-        // `make_encoder` needs a new `EncoderOptions` in order to set `with_explicit_nulls`. The
-        // lifetime of the created encoder becomes tied to the lifetime of the `EncoderOptions`,
-        // and local options would be freed here. We also can't put the options inside the
-        // NullValueMapEncoderFactory, because this method takes `&self` not `&'a self`, and we
-        // can't change that as it's part of the trait definition. Static options satisfy the
-        // required lifetime. Building here returns Arrow errors because `Encoder::encode` cannot
-        // return a `Result`; a per-row wrapper would have to unwrap them.
-        match array.data_type() {
-            ArrowDataType::Map(_, _) => {
-                static MAP_OPTIONS: LazyLock<EncoderOptions> =
-                    LazyLock::new(|| EncoderOptions::default().with_explicit_nulls(true));
-                // A map with non-string keys is valid Arrow but unsupported by Arrow's JSON map
-                // encoder. If every map is null (for example, `[null, null]`), the JSON writer
-                // omits the field and never encodes a key, so preserve that generic behavior.
-                if array.null_count() == array.len() {
-                    let encoder = Box::new(NullMapPlaceholderEncoder);
-                    return Ok(Some(NullableEncoder::new(encoder, array.nulls().cloned())));
-                }
-                // The writer retains this encoder for the batch, avoiding reconstruction of its
-                // key and value encoders for every row.
-                make_encoder(field, array, &MAP_OPTIONS).map(Some)
-            }
-            _ => Ok(None),
-        }
-    }
-}
-
-// Every row is null, so the JSON writer uses the null buffer without calling this placeholder.
-struct NullMapPlaceholderEncoder;
-
-impl Encoder for NullMapPlaceholderEncoder {
-    fn encode(&mut self, _idx: usize, out: &mut Vec<u8>) {
-        out.extend_from_slice(b"null");
-    }
-}
-
 /// serialize an arrow RecordBatch to a JSON string by appending to a buffer.
 // TODO (zach): this should stream data to the JSON writer and output an iterator.
 #[internal_api]
 pub(crate) fn to_json_bytes(
     data: impl KernelResultIterator<FilteredEngineData>,
-) -> KernelResult<Vec<u8>> {
-    let builder = WriterBuilder::new().with_encoder_factory(Arc::new(NullValueMapEncoderFactory));
-    let mut writer = builder.build::<_, LineDelimited>(Vec::new());
-    for chunk in data {
-        let batch = filter_to_record_batch(chunk?)?;
-        writer.write(&batch)?;
-    }
-    writer.finish()?;
-    Ok(writer.into_inner())
+) -> KernelResult<bytes::Bytes> {
+    action_json::write(data)
 }
 
 /// Applies post-processing to data read from a JSON file. Inserts synthesized metadata columns
@@ -3148,7 +3120,7 @@ mod tests {
             (StructField::not_null("values", ArrayType::new(DataType::LONG, false)).with_metadata(
                 [(
                     ColumnMetadataKey::ColumnMappingNestedIds.as_ref(),
-                    MetadataValue::String("not a json object".to_string()),
+                    MetadataValue::String("not a json object".to_string().into()),
                 )],
             )),
         }
@@ -4485,7 +4457,7 @@ mod tests {
         let json = to_json_bytes(Box::new(std::iter::once(Ok(filtered_data)))).unwrap();
 
         // This is the outer JSON row; the null `map_col` field is omitted.
-        assert_eq!(json, b"{}\n");
+        assert_eq!(json.as_ref(), b"{}\n");
     }
 
     #[rstest]
@@ -4807,6 +4779,38 @@ mod tests {
             other => panic!("expected nested Struct, got {other:?}"),
         };
         assert_eq!(nested_children[0].name(), "tgt_z");
+    }
+
+    #[test]
+    fn normalized_null_masks_preserve_array_ownership() {
+        let normalized: ArrowArrayRef = Arc::new(Int32Array::from(vec![None, Some(2), Some(3)]));
+        let unmasked: ArrowArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        let fields = ArrowFields::from(vec![
+            ArrowField::new("normalized", ArrowDataType::Int32, true),
+            ArrowField::new("unmasked", ArrowDataType::Int32, true),
+        ]);
+        let nested = Arc::new(StructArray::new(
+            fields.clone(),
+            vec![normalized.clone(), unmasked],
+            Some(NullBuffer::from(vec![false, true, true])),
+        ));
+        let batch = StructArray::new(
+            vec![ArrowField::new(
+                "nested",
+                ArrowDataType::Struct(fields),
+                true,
+            )]
+            .into(),
+            vec![nested],
+            None,
+        );
+        let fixed = fix_nested_null_masks(batch);
+        let nested = fixed.column(0).as_struct();
+        assert!(Arc::ptr_eq(nested.column(0), &normalized));
+        assert_eq!(nested.column(1).nulls(), nested.nulls());
+        let normalized_nested = fixed.column(0).clone();
+        let fixed_again = fix_nested_null_masks(fixed);
+        assert!(Arc::ptr_eq(fixed_again.column(0), &normalized_nested));
     }
 
     #[rstest]

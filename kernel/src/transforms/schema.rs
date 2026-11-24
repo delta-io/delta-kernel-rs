@@ -166,7 +166,7 @@ pub trait SchemaTransform<'a> {
             }
             DataType::Variant(stype) => {
                 let child = self.transform_variant(stype);
-                map_owned_or_else(data_type, child, |s| DataType::Variant(Box::new(s)))
+                map_owned_or_else(data_type, child, |s| DataType::Variant(s.into()))
             }
             #[cfg(feature = "udt-in-dev")]
             DataType::UserDefined(udt) => {
@@ -175,7 +175,7 @@ pub trait SchemaTransform<'a> {
             }
             DataType::File(stype) => {
                 let child = self.transform_file(stype);
-                map_owned_or_else(data_type, child, |s| DataType::File(Box::new(s)))
+                map_owned_or_else(data_type, child, |s| DataType::File(s.into()))
             }
         })
     }

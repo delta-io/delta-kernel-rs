@@ -1085,7 +1085,10 @@ mod tests {
         let path = create_log_path(supplied);
         let mut files = LogSegmentFiles::default();
         match field {
-            SnapshotHintPathField::AscendingCommit => files.ascending_commit_files.push(path),
+            SnapshotHintPathField::AscendingCommit => {
+                crate::log_segment_files::push_commit(&mut files.ascending_commit_files, path)
+                    .unwrap()
+            }
             SnapshotHintPathField::AscendingCompaction => {
                 files.ascending_compaction_files.push(path)
             }
@@ -1335,7 +1338,7 @@ mod tests {
             )
         };
         hint.log_segment_files = LogSegmentFiles {
-            ascending_commit_files,
+            ascending_commit_files: crate::log_segment_files::commit_files(ascending_commit_files),
             checkpoint_parts,
             latest_commit_file: Some(staged),
             ..Default::default()

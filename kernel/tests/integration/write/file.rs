@@ -258,7 +258,7 @@ async fn test_write_and_read_nested_file_column(
     // The column is written under its physical name.
     let physical_name = match column.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
     {
-        Some(MetadataValue::String(name)) => name.clone(),
+        Some(MetadataValue::String(name)) => name.to_string(),
         _ => "c".to_string(),
     };
     assert!(
@@ -444,7 +444,7 @@ async fn test_write_collects_stats_for_file_column(
     let physical = |field: &StructField| match field
         .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
     {
-        Some(MetadataValue::String(name)) => name.clone(),
+        Some(MetadataValue::String(name)) => name.to_string(),
         _ => field.name().clone(),
     };
     let schema = snapshot.schema();
@@ -656,7 +656,7 @@ async fn test_clustering_on_file_sub_field(
         .unwrap()
         .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
     {
-        Some(MetadataValue::String(name)) => name.clone(),
+        Some(MetadataValue::String(name)) => name.to_string(),
         _ => "c".to_string(),
     };
     assert_eq!(stats["minValues"][&c]["size"], 10, "{stats}");

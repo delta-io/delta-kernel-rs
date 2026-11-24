@@ -64,9 +64,10 @@ fn add_field(parent: &mut StructType, field: StructField, parent_path: String) -
             parent_path,
         )));
     }
-    parent
-        .field_map_mut()
-        .insert(field.name().clone(), Arc::new(field));
+    parent.field_map_mut().try_insert(
+        field.name().clone(),
+        Arc::new(crate::memory::Owned::try_new(field)?),
+    )?;
     Ok(())
 }
 
@@ -227,7 +228,7 @@ pub(crate) fn apply_schema_operations(
                 "schema root changed type during schema evolution",
             ));
         };
-        schema = *updated_schema;
+        schema = crate::schema::unbox_data_type(updated_schema);
     }
 
     validate_schema(&schema, column_mapping_mode, cdf_enabled)?;
@@ -376,7 +377,7 @@ mod tests {
             .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
             .expect("field should have physical name")
         {
-            MetadataValue::String(s) => s.clone(),
+            MetadataValue::String(s) => s.to_string(),
             other => panic!("expected String, got {other:?}"),
         }
     }
@@ -462,7 +463,7 @@ mod tests {
     #[case::unknown_identity_annotation("delta.identity.futureAnnotation")]
     fn rejects_generated_or_identity_metadata_on_added_field(#[case] key: &str) {
         let field = StructField::nullable("added", DataType::STRING)
-            .add_metadata([(key, MetadataValue::String("value".to_string()))]);
+            .add_metadata([(key, MetadataValue::String("value".to_string().into()))]);
         let operation = SchemaOperation::add_column(None, field);
 
         let err = apply_schema_operations(
@@ -482,7 +483,7 @@ mod tests {
     fn struct_with_generation_expression() -> StructType {
         let field = StructField::nullable("nested", DataType::STRING).add_metadata([(
             ColumnMetadataKey::GenerationExpression.as_ref(),
-            MetadataValue::String("value".to_string()),
+            MetadataValue::String("value".to_string().into()),
         )]);
         StructType::try_new([field]).unwrap()
     }
@@ -498,7 +499,7 @@ mod tests {
         DataType::INTEGER,
         true,
     )))]
-    #[case::variant(DataType::Variant(Box::new(struct_with_generation_expression())))]
+    #[case::variant(DataType::Variant(struct_with_generation_expression().into()))]
     fn rejects_nested_generation_expression_on_added_field(#[case] data_type: DataType) {
         let field = StructField::nullable("added", data_type);
         let operation = SchemaOperation::add_column(None, field);
@@ -573,7 +574,7 @@ mod tests {
         let schema =
             StructType::try_new([StructField::nullable("container", parent_type)]).unwrap();
         let expected_source = schema.clone();
-        let shared = schema.share_selected_fields(|_| true);
+        let shared = schema.share_selected_fields(|_| true).unwrap();
         assert!(std::ptr::eq(
             schema.field("container").unwrap(),
             shared.field("container").unwrap()
@@ -663,7 +664,7 @@ mod tests {
         #[case] column: ColumnName,
     ) {
         let expected_source = schema.clone();
-        let shared = schema.share_selected_fields(|_| true);
+        let shared = schema.share_selected_fields(|_| true).unwrap();
         assert!(
             schema
                 .fields()
@@ -1021,7 +1022,7 @@ mod tests {
         let mut field = StructField::nullable("named", DataType::STRING);
         field.metadata.insert(
             ColumnMetadataKey::ColumnMappingPhysicalName.as_ref().into(),
-            MetadataValue::String("user-supplied-name".to_string()),
+            MetadataValue::String("user-supplied-name".to_string().into()),
         );
         let ops = vec![SchemaOperation::add_column(None, field)];
         let result = apply_schema_operations(
@@ -1074,7 +1075,7 @@ mod tests {
         let mut field = StructField::nullable("bad", DataType::STRING);
         field.metadata.insert(
             ColumnMetadataKey::ColumnMappingId.as_ref().into(),
-            MetadataValue::String("not-a-number".to_string()),
+            MetadataValue::String("not-a-number".to_string().into()),
         );
         let ops = vec![SchemaOperation::add_column(None, field)];
         let err = apply_schema_operations(

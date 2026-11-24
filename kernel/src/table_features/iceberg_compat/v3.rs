@@ -209,7 +209,7 @@ mod column_default_tests {
     ) -> StructField {
         StructField::nullable(name, data_type).add_metadata([(
             CurrentDefault.as_ref().to_string(),
-            MetadataValue::String(default_sql.to_string()),
+            MetadataValue::String(default_sql.to_string().into()),
         )])
     }
 
@@ -340,7 +340,7 @@ mod type_change_tests {
             ),
             (
                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                MetadataValue::String("col-1".to_string()),
+                MetadataValue::String("col-1".to_string().into()),
             ),
         ])
     }
@@ -433,7 +433,7 @@ mod type_change_tests {
         let table_configuration = table_config_with_schema(schema! {
             (StructField::nullable("a", DataType::STRING).add_metadata([(
                 ColumnMetadataKey::TypeChanges.as_ref(),
-                MetadataValue::String("not an array".to_string()),
+                MetadataValue::String("not an array".to_string().into()),
             )])),
         });
 

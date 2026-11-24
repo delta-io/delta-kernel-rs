@@ -3031,9 +3031,13 @@ dependencies = [
  "delta_kernel",
  "delta_kernel_default_engine",
  "dhat",
+ "futures",
+ "libc",
  "rayon",
+ "serde",
  "serde_json",
  "tempfile",
+ "test_utils",
  "tracing",
  "url",
 ]

@@ -2,8 +2,6 @@
 
 #![allow(dead_code)]
 
-use std::sync::LazyLock;
-
 use crate::KernelResult;
 use crate::actions::{
     ADD_NAME, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
@@ -12,7 +10,7 @@ use crate::actions::{
 use crate::expressions::{
     ColumnName, Expression as Expr, Predicate, col, column_name, joined_column_expr,
 };
-use crate::schema::{DataType, SchemaRef, StructField, StructType, schema};
+use crate::schema::{DataType, SchemaRef, StructField};
 
 /// Name of the column used to identify actions during log replay.
 pub(crate) const ACTION_KEY: &str = "action_key";
@@ -144,7 +142,7 @@ impl ActionSet {
         let mut lanes = vec![];
         if actions.live_adds {
             lanes.push((
-                FILE_ACTION_KEY_FIELD.clone(),
+                file_action_key_field()?,
                 file_action_key_expr(actions.reads_removes(source)),
             ));
         }
@@ -172,10 +170,11 @@ impl ActionSet {
                 col!("domainMetadata.domain"),
             ));
         }
-        let key_schema = StructType::try_new(lanes.iter().map(|(field, _)| field.clone()))?;
+        let (fields, expressions): (Vec<_>, Vec<_>) = lanes.into_iter().unzip();
+        let key_type = DataType::try_struct_type(fields)?;
         Ok((
-            StructField::not_null(ACTION_KEY, key_schema),
-            Expr::struct_from(lanes.into_iter().map(|(_, expr)| expr)),
+            StructField::not_null(ACTION_KEY, key_type),
+            Expr::struct_from(expressions),
         ))
     }
 
@@ -194,17 +193,18 @@ fn action_predicate(names: impl Iterator<Item = &'static str>) -> Predicate {
 }
 
 /// File identity used for replay.
-static FILE_ACTION_KEY_FIELD: LazyLock<StructField> = LazyLock::new(|| {
-    let schema = schema! {
-        nullable "path": STRING,
-        nullable "deletionVector": {
-            not_null "storageType": STRING,
-            not_null "pathOrInlineDv": STRING,
-            nullable "offset": INTEGER,
-        },
-    };
-    StructField::nullable(ACTION_KEY, schema)
-});
+fn file_action_key_field() -> KernelResult<StructField> {
+    let dv = DataType::try_struct_type([
+        StructField::not_null("storageType", DataType::STRING),
+        StructField::not_null("pathOrInlineDv", DataType::STRING),
+        StructField::nullable("offset", DataType::INTEGER),
+    ])?;
+    let key = DataType::try_struct_type([
+        StructField::nullable("path", DataType::STRING),
+        StructField::nullable("deletionVector", dv),
+    ])?;
+    Ok(StructField::nullable(ACTION_KEY, key))
+}
 
 /// Builds the path/DV identity, referencing remove fields only when the source reads them.
 fn file_action_key_expr(includes_removes: bool) -> Expr {

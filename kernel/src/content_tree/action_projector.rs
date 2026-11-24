@@ -64,7 +64,7 @@ impl ActionProjector {
         let evaluator = engine.evaluation_handler().new_expression_evaluator(
             source,
             Arc::new(expr),
-            read_schema.as_ref().clone().into(),
+            read_schema.as_ref().try_clone()?.into(),
         )?;
         Ok(ActionProjector { evaluator })
     }

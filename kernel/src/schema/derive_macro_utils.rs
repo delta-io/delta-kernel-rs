@@ -63,6 +63,12 @@ impl_to_data_type!(
     (bool, DataType::BOOLEAN)
 );
 
+impl ToDataType for crate::memory::SharedString {
+    fn to_data_type() -> DataType {
+        DataType::STRING
+    }
+}
+
 // ToDataType impl for non-nullable array types
 impl<T: ToDataType> ToDataType for Vec<T> {
     fn to_data_type() -> DataType {

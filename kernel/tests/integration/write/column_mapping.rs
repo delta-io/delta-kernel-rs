@@ -505,7 +505,7 @@ async fn test_read_and_append_tolerates_stale_column_mapping_when_disabled()
             ("delta.columnMapping.id", MetadataValue::Number(2)),
             (
                 "delta.columnMapping.physicalName",
-                MetadataValue::String("col-2f8a".to_string()),
+                MetadataValue::String("col-2f8a".to_string().into()),
             ),
         ])),
     };

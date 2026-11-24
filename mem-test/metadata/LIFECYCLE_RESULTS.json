@@ -1,0 +1,150 @@
+{
+  "implementation": "Historical std::alloc::Allocator backend; compiler and hashes below describe that implementation.",
+  "current_validation": "../arrow-allocator-poc/ALLOCATOR_API_VALIDATION.json",
+  "platform": "macOS-26.7.1-arm64-arm-64bit",
+  "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+  "scope": "Local synthetic declarative driver planning and encoding. No terminal-plan execution or declarative commit. Rust heap includes the local reference engine and caller query construction. DHAT starts after fixed canonical initialization. This is not RSS or foreign-memory coverage.",
+  "matrix": {
+    "manifest": "lifecycle_matrix.json",
+    "manifest_sha256": "6f175db457a1cbb5a251d2a89b0a5e509c8ee8d6324f82e4e80c5db19feb85a3",
+    "table_profiles": 12,
+    "query_profiles": 15,
+    "compatible_pairs": 169,
+    "fresh_process_checks": 2354,
+    "checked_operations": 7762,
+    "failures": 0,
+    "plan_signatures": 21,
+    "plan_signature_fields": [
+      "operator_counts",
+      "depth",
+      "max_fan_in",
+      "json_files",
+      "parquet_files"
+    ],
+    "successes": 3767,
+    "allocation_errors": 3995,
+    "successful_recoveries": 2354
+  },
+  "stress": {
+    "manifest": "lifecycle_stress.json",
+    "manifest_sha256": "775a54bf91321147161f1eddd82c9901454072895b65410658f197e200fd4229",
+    "table_profiles": 1,
+    "query_profiles": 3,
+    "compatible_pairs": 3,
+    "fresh_process_checks": 21,
+    "checked_operations": 33,
+    "failures": 0,
+    "plan_signatures": 2,
+    "plan_signature_fields": [
+      "operator_counts",
+      "depth",
+      "max_fan_in",
+      "json_files",
+      "parquet_files"
+    ],
+    "successes": 14,
+    "allocation_errors": 19,
+    "successful_recoveries": 21,
+    "fixture": {
+      "width": 10000,
+      "schema_fields": 30000,
+      "schema_json_bytes": 11301270,
+      "initial_files": 1000,
+      "tail_commits": 10000,
+      "checkpoints": 1
+    }
+  },
+  "heap_profiles": [
+    {
+      "table": "deep_schema",
+      "query": "nested_predicate",
+      "requested_rust_bytes_at_peak": 3034196,
+      "kernel_bytes_at_same_peak": 2492508,
+      "kernel_fraction": 0.8214723109515667,
+      "groups": {
+        "kernel_allocator": 2492508,
+        "other": 334542,
+        "schema_structures": 199822,
+        "log_descriptors_and_urls": 3555,
+        "arrow_objects_schemas_and_decoder_state": 2250,
+        "metadata_strings": 1519
+      }
+    },
+    {
+      "table": "dense_struct_stats",
+      "query": "both_stats",
+      "requested_rust_bytes_at_peak": 7825535,
+      "kernel_bytes_at_same_peak": 6944793,
+      "kernel_fraction": 0.8874528067410088,
+      "groups": {
+        "kernel_allocator": 6944793,
+        "schema_structures": 719979,
+        "other": 77909,
+        "arrow_objects_schemas_and_decoder_state": 68935,
+        "metadata_strings": 7548,
+        "log_descriptors_and_urls": 6371
+      }
+    },
+    {
+      "table": "large_action_stats",
+      "query": "large_in",
+      "requested_rust_bytes_at_peak": 1347032,
+      "kernel_bytes_at_same_peak": 147234,
+      "kernel_fraction": 0.10930252584942303,
+      "groups": {
+        "arrow_buffers_and_parser": 1125272,
+        "kernel_allocator": 147234,
+        "arrow_objects_schemas_and_decoder_state": 63034,
+        "other": 6423,
+        "log_descriptors_and_urls": 2765,
+        "schema_structures": 2304
+      }
+    },
+    {
+      "table": "long_tail",
+      "query": "wide_or",
+      "requested_rust_bytes_at_peak": 23208871,
+      "kernel_bytes_at_same_peak": 449379,
+      "kernel_fraction": 0.019362380875829765,
+      "groups": {
+        "arrow_objects_schemas_and_decoder_state": 16919046,
+        "arrow_buffers_and_parser": 5580607,
+        "kernel_allocator": 449379,
+        "log_descriptors_and_urls": 218605,
+        "other": 40303,
+        "schema_structures": 931
+      }
+    },
+    {
+      "table": "many_actions",
+      "query": "range",
+      "requested_rust_bytes_at_peak": 2207130,
+      "kernel_bytes_at_same_peak": 402708,
+      "kernel_fraction": 0.1824577618898751,
+      "groups": {
+        "arrow_buffers_and_parser": 1284280,
+        "arrow_objects_schemas_and_decoder_state": 508650,
+        "kernel_allocator": 402708,
+        "other": 6423,
+        "log_descriptors_and_urls": 2765,
+        "schema_structures": 2304
+      }
+    },
+    {
+      "table": "wide_schema",
+      "query": "all_columns",
+      "requested_rust_bytes_at_peak": 24984964,
+      "kernel_bytes_at_same_peak": 21879548,
+      "kernel_fraction": 0.8757086061841034,
+      "groups": {
+        "kernel_allocator": 21879548,
+        "schema_structures": 2830454,
+        "other": 240438,
+        "metadata_strings": 25903,
+        "log_descriptors_and_urls": 6371,
+        "arrow_objects_schemas_and_decoder_state": 2250
+      }
+    }
+  ],
+  "rss_worker_sha256": "ed799586bda2e2103a42ba573bfa054776d73b8646fb4e6779e980ac9e005226"
+}

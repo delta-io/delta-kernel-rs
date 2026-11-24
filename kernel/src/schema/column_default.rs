@@ -223,7 +223,7 @@ pub(crate) fn field_with_default(
     use crate::schema::{ColumnMetadataKey, MetadataValue};
     StructField::nullable(name, data_type).add_metadata([(
         ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
-        MetadataValue::String(raw_sql.to_string()),
+        MetadataValue::String(raw_sql.to_string().into()),
     )])
 }
 

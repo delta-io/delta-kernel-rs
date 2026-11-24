@@ -34,3 +34,4 @@ pub mod operation {
 }
 
 mod convert;
+pub(crate) mod encode;

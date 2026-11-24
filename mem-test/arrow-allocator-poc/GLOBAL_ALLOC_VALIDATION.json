@@ -1,0 +1,162 @@
+{
+  "implementation": "Historical explicit std::alloc::GlobalAlloc backend with private allocator-api2 containers; not installed as the global hook.",
+  "platform": "macOS-26.7.1-arm64-arm-64bit",
+  "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+  "workspace_msrv": "1.95",
+  "scope": "Declarative snapshot discovery, checkpoint resolution, query/schema and scan-plan construction, encoding, opaque write-relation staging, write-state encoding, and release. Includes local reference-engine and caller allocations. Excludes terminal metadata-plan execution and declarative commit. Heap coverage is simultaneous requested Rust bytes, not RSS.",
+  "source": {
+    "parent_commit": "d49fd428aa8b48fc1cb3b6b36e0618d3c1ea5c73",
+    "kernel_allocator_sources_and_manifests_sha256": "3b87fc292ca43e302bdc82640b496f3d00910386935bfab37f4470557229ee0a",
+    "kernel_allocator_source_input_files": 13,
+    "arrow_patch_sha256": "c6bcfc635b2177341f094cc324733a0b40dded202fb7122d44acc87f0b214f1c",
+    "arrow_version": "60.0.0",
+    "reapplied_patch_matching_manifests_and_rust_sources": 415,
+    "poc_cargo_lock_sha256": "dd17662e6399fc842f999f1aea5bfd7e28fe84ca497e69418ead4d7ba3c68697"
+  },
+  "binary_sha256": {
+    "rss_lifecycle": "3bdfcd72d485e4e2c6861f24d98b0c98eb8261e9a230b5c749c627162c9bb593",
+    "kernel_lifecycle": "476a156ab9cc2c2a02e7782b51739777826377a58c7cd9e440305835f3757bea",
+    "allocation_checks": "31bc216610f9d27294d5a7247f9b14e9babdeeaeca3adcc88233d4671668ee4c",
+    "fault_probe": "0b33ce8b24f4994eb13c48f20579ed52502a5116f43cf105e8bb53ee451e1185"
+  },
+  "allocation_checks": {
+    "checks": 360,
+    "injected_errors": 326,
+    "failures": 0
+  },
+  "matrix": {
+    "manifest_sha256": "6f175db457a1cbb5a251d2a89b0a5e509c8ee8d6324f82e4e80c5db19feb85a3",
+    "process_checks": 2354,
+    "measured_operations": 7762,
+    "compatible_table_query_pairs": 169,
+    "concurrency": [
+      1,
+      4
+    ],
+    "typed_allocation_errors": 3935,
+    "distinct_plan_shapes": 21,
+    "failures": 0
+  },
+  "stress": {
+    "manifest_sha256": "775a54bf91321147161f1eddd82c9901454072895b65410658f197e200fd4229",
+    "process_checks": 30,
+    "measured_operations": 42,
+    "compatible_table_query_pairs": 3,
+    "concurrency": [
+      1
+    ],
+    "typed_allocation_errors": 28,
+    "distinct_plan_shapes": 2,
+    "failures": 0
+  },
+  "normal_kernel_validation": {
+    "rustc": "1.95.0",
+    "workspace_all_feature_tests_passed": 22374,
+    "workspace_tests_skipped": 38,
+    "compiler_diagnostic_snapshot_tests_failed": 1,
+    "compiler_diagnostic_snapshot_note": "The separately reported invalid_handle_code test rejects all seven invalid programs, but three stderr snapshots differ on Rust 1.95. CI also separates this test from required runtime checks. Unchanged snapshots pass on Rust 1.100; no snapshots were overwritten.",
+    "compiler_diagnostic_snapshot_rust_1_100": "Summary [  71.767s] 1 test run: 1 passed (1 slow), 736 skipped",
+    "format": true,
+    "clippy": true,
+    "rustdoc_warnings_denied": true,
+    "doctests": true,
+    "no_default_feature_aliases_passed": 4,
+    "c_ffi_lifecycle": true
+  },
+  "dependency_unit_tests": {
+    "arrow-buffer": {
+      "passed": 359,
+      "summary": "Summary [   4.661s] 359 tests run: 359 passed, 0 skipped",
+      "scope": "library, all features"
+    },
+    "arrow-data": {
+      "passed": 53,
+      "summary": "Summary [   0.749s] 53 tests run: 53 passed, 0 skipped",
+      "scope": "library, all features"
+    },
+    "arrow-array": {
+      "passed": 766,
+      "summary": "Summary [  10.584s] 766 tests run: 766 passed, 1 skipped",
+      "scope": "library, all features"
+    },
+    "arrow-select": {
+      "passed": 429,
+      "summary": "Summary [   5.307s] 429 tests run: 429 passed, 0 skipped",
+      "scope": "library, all features"
+    },
+    "arrow-cast": {
+      "passed": 422,
+      "summary": "Summary [   6.891s] 422 tests run: 422 passed, 0 skipped",
+      "scope": "library, all features"
+    },
+    "arrow-json": {
+      "passed": 141,
+      "summary": "Summary [   0.962s] 141 tests run: 141 passed, 0 skipped",
+      "scope": "library, all features"
+    },
+    "parquet": {
+      "passed": 78,
+      "summary": "Summary [   0.510s] 78 tests run: 78 passed, 1356 skipped",
+      "scope": "record_reader, array_reader, and errors modules"
+    }
+  },
+  "experimental_harness_clippy": true,
+  "experimental_heap_profiles": [
+    {
+      "table": "wide_schema",
+      "query": "all_columns",
+      "requested_rust_bytes_at_peak": 24984964,
+      "kernel_bytes_at_same_peak": 21879548,
+      "outside_allocator_bytes_at_same_peak": 3105416,
+      "kernel_fraction": 0.8757086061841034
+    },
+    {
+      "table": "deep_schema",
+      "query": "nested_predicate",
+      "requested_rust_bytes_at_peak": 3034196,
+      "kernel_bytes_at_same_peak": 2492508,
+      "outside_allocator_bytes_at_same_peak": 541688,
+      "kernel_fraction": 0.8214723109515667
+    },
+    {
+      "table": "dense_struct_stats",
+      "query": "both_stats",
+      "requested_rust_bytes_at_peak": 7825535,
+      "kernel_bytes_at_same_peak": 6944793,
+      "outside_allocator_bytes_at_same_peak": 880742,
+      "kernel_fraction": 0.8874528067410088
+    },
+    {
+      "table": "many_actions",
+      "query": "range",
+      "requested_rust_bytes_at_peak": 2300766,
+      "kernel_bytes_at_same_peak": 2165224,
+      "outside_allocator_bytes_at_same_peak": 135542,
+      "kernel_fraction": 0.9410883158043887
+    },
+    {
+      "table": "large_action_stats",
+      "query": "large_in",
+      "requested_rust_bytes_at_peak": 1464476,
+      "kernel_bytes_at_same_peak": 1371886,
+      "outside_allocator_bytes_at_same_peak": 92590,
+      "kernel_fraction": 0.9367760209112338
+    },
+    {
+      "table": "long_tail",
+      "query": "wide_or",
+      "requested_rust_bytes_at_peak": 18994927,
+      "kernel_bytes_at_same_peak": 660810,
+      "outside_allocator_bytes_at_same_peak": 18334117,
+      "kernel_fraction": 0.03478876228374028
+    }
+  ],
+  "historical_measurements": "RESULTS.json and ../metadata/LIFECYCLE_RESULTS.json retain the original Rust 1.100 std::alloc::Allocator measurements, including absolute exact-wide-tail heap/RSS attribution.",
+  "limitations": [
+    "The cap covers participating requested bytes, including overlapping growth, rather than whole-process native memory or RSS.",
+    "Arrow array/schema objects, ArrayData trees, buffer ownership objects, and other ordinary dependency allocations remain outside enforcement.",
+    "Ordinary infallible allocation paths retain allocation-error-handler behavior; GlobalAlloc alone does not make them recoverable.",
+    "Correctness-run timings do not establish p99.9 latency or performance regressions."
+  ],
+  "current_validation": "ALLOCATOR_API_VALIDATION.json"
+}

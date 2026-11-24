@@ -1,18 +1,19 @@
 //! This module contains logic to compute the expected schema for file statistics
 
+mod build;
 mod column_filter;
-
 use std::borrow::Cow;
 
+pub(crate) use build::strip_metadata as try_strip_metadata;
 use column_filter::StatsColumnFilter;
 pub(crate) use column_filter::StatsConfig;
 
 use crate::KernelResult;
+#[cfg(test)]
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS};
-use crate::schema::{
-    ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, StructField, StructType,
-    file_sub_field_has_min_max,
-};
+#[cfg(test)]
+use crate::schema::{ArrayType, MapType, StructType};
+use crate::schema::{ColumnName, DataType, PrimitiveType, Schema, StructField};
 use crate::transforms::{SchemaTransform, transform_output_type};
 
 /// Generates the expected schema for file statistics.
@@ -155,44 +156,7 @@ pub(crate) fn expected_stats_schema(
     required_columns: Option<&[ColumnName]>,
     requested_columns: Option<&[ColumnName]>,
 ) -> KernelResult<Schema> {
-    let mut fields = Vec::with_capacity(5);
-    fields.push(StructField::nullable(NUM_RECORDS, DataType::LONG));
-
-    // generate the base stats schema:
-    // - make all fields nullable
-    // - include fields according to table properties (num_indexed_cols, stats_columns, ...)
-    // - always include required columns (e.g. clustering columns, per Delta protocol)
-    // - optionally filter output to only requested columns
-    let mut base_transform = BaseStatsTransform::new(config, required_columns, requested_columns);
-    if let Some(base_schema) = base_transform.transform_struct(data_schema) {
-        let base_schema = base_schema.into_owned();
-
-        // convert all leaf fields to data type LONG for null count
-        let mut null_count_transform = NullCountStatsTransform;
-        let null_count_schema = null_count_transform.transform_struct(&base_schema);
-        fields.push(StructField::nullable(
-            NULL_COUNT,
-            null_count_schema.into_owned(),
-        ));
-
-        // include only min/max skipping eligible fields (data types)
-        let mut min_max_transform = MinMaxStatsTransform {
-            variant_min_max: config.variant_min_max,
-            #[cfg(feature = "geo-type-in-dev")]
-            geometry_min_max: config.geometry_min_max,
-        };
-        if let Some(min_max_schema) = min_max_transform.transform_struct(&base_schema) {
-            let min_max_schema = min_max_schema.into_owned();
-            fields.push(StructField::nullable(MIN_VALUES, min_max_schema.clone()));
-            fields.push(StructField::nullable(MAX_VALUES, min_max_schema));
-        }
-    }
-
-    // tightBounds indicates whether min/max statistics are accurate (true) or potentially
-    // outdated due to deletion vectors (false)
-    fields.push(StructField::nullable(TIGHT_BOUNDS, DataType::BOOLEAN));
-
-    StructType::try_new(fields)
+    build::expected(data_schema, config, required_columns, requested_columns)
 }
 
 /// Returns the column names that should have statistics collected.
@@ -223,7 +187,9 @@ pub(crate) fn stats_column_names(
 /// strip it to avoid possible schema mismatches when reading `stats_parsed` from older data, since
 /// that metadata (which describes the logical table column, not the stats values) could have
 /// changed.
+#[cfg(test)]
 pub(crate) struct StripFieldMetadataTransform;
+#[cfg(test)]
 impl<'a> SchemaTransform<'a> for StripFieldMetadataTransform {
     transform_output_type!(|'a, T| Cow<'a, T>);
 
@@ -281,7 +247,9 @@ fn make_nullable_field<'a>(
 /// since null counts are always integers, while struct fields are recursed into
 /// to preserve the nested structure. A `file` column becomes a plain struct of its sub-fields.
 /// Field metadata (including column mapping info) is preserved for all fields.
+#[cfg(test)]
 pub(crate) struct NullCountStatsTransform;
+#[cfg(test)]
 impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
     transform_output_type!(|'a, T| Cow<'a, T>);
 
@@ -310,121 +278,8 @@ impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
 /// that may be considered for stats collection. Depending on the type of stats -
 /// min/max/nullcount/... - additional transformations may be applied.
 ///
-/// All fields in the output are nullable. Clustering columns are always included per
-/// the Delta protocol.
-#[allow(unused)]
-struct BaseStatsTransform<'col> {
-    filter: StatsColumnFilter<'col>,
-}
-
-impl<'col> BaseStatsTransform<'col> {
-    #[allow(unused)]
-    fn new(
-        config: &StatsConfig<'col>,
-        required_columns: Option<&'col [ColumnName]>,
-        requested_columns: Option<&'col [ColumnName]>,
-    ) -> Self {
-        Self {
-            filter: StatsColumnFilter::new(config, required_columns, requested_columns),
-        }
-    }
-
-    /// Checks whether a leaf column (primitive, array, map, or variant) should be included in the
-    /// stats schema and records it against the column limit if so. The column limit is based on
-    /// schema order, so we count all leaf columns that pass the table filter, but only generate
-    /// stats for requested columns.
-    fn include_leaf(&mut self) -> bool {
-        if !self.filter.should_include_for_table() {
-            return false;
-        }
-        self.filter.record_included();
-        self.filter.should_include_for_requested()
-    }
-}
-
-impl<'a> SchemaTransform<'a> for BaseStatsTransform<'_> {
-    transform_output_type!(|'a, T| Option<Cow<'a, T>>);
-
-    // Always traverse struct and `file` fields. All other leaf types count against the column
-    // limit, including each `file` sub-field.
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
-        self.filter.enter_field(field.name());
-        let data_type = self.transform(&field.data_type);
-        self.filter.exit_field();
-        Some(make_nullable_field(field, data_type?))
-    }
-
-    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
-        self.include_leaf().then_some(Cow::Borrowed(ptype))
-    }
-
-    fn transform_array(&mut self, atype: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
-        self.include_leaf().then_some(Cow::Borrowed(atype))
-    }
-
-    fn transform_map(&mut self, mtype: &'a MapType) -> Option<Cow<'a, MapType>> {
-        self.include_leaf().then_some(Cow::Borrowed(mtype))
-    }
-
-    fn transform_variant(&mut self, vtype: &'a StructType) -> Option<Cow<'a, StructType>> {
-        self.include_leaf().then_some(Cow::Borrowed(vtype))
-    }
-}
-
-// removes all fields with non eligible data types
-//
-// should only be applied to schema processed via `BaseStatsTransform`.
-struct MinMaxStatsTransform {
-    variant_min_max: bool,
-    #[cfg(feature = "geo-type-in-dev")]
-    geometry_min_max: bool,
-}
-
-impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
-    transform_output_type!(|'a, T| Option<Cow<'a, T>>);
-
-    /// A `file` column's bounds are a plain struct of the sub-fields that have min/max statistics.
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
-        let DataType::File(file_fields) = &field.data_type else {
-            return self.recurse_into_struct_field(field);
-        };
-        let sub_fields: Vec<_> = file_fields
-            .fields()
-            .filter(|f| file_sub_field_has_min_max(f.name()))
-            .filter_map(|f| self.transform_struct_field(f))
-            .map(Cow::into_owned)
-            .collect();
-        (!sub_fields.is_empty()).then(|| {
-            let data_type = StructType::new_unchecked(sub_fields).into();
-            make_nullable_field(field, Cow::Owned(data_type))
-        })
-    }
-
-    // Array and Map fields pass through BaseStatsTransform (for nullCount) but must be excluded
-    // from min/max stats.
-    fn transform_array(&mut self, _: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
-        None
-    }
-    fn transform_map(&mut self, _: &'a MapType) -> Option<Cow<'a, MapType>> {
-        None
-    }
-
-    /// Not recursed into: the `metadata` and `value` binaries are the statistic's own encoding, not
-    /// columns that carry statistics of their own.
-    fn transform_variant(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
-        self.variant_min_max.then_some(Cow::Borrowed(stype))
-    }
-
-    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
-        #[cfg(feature = "geo-type-in-dev")]
-        if matches!(ptype, PrimitiveType::Geometry(_)) {
-            return self.geometry_min_max.then_some(Cow::Borrowed(ptype));
-        }
-        is_skipping_eligible_datatype(ptype).then_some(Cow::Borrowed(ptype))
-    }
-}
-
-/// Checks if a data type is eligible for min/max file skipping.
+/// All fields in the output are nullable. Clustering columns are always included per/// Checks if a
+/// data type is eligible for min/max file skipping.
 ///
 /// This is also used to validate clustering column types, since clustering requires
 /// per-file statistics on clustering columns.

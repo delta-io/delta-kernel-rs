@@ -43,7 +43,9 @@ pub struct DeltaErrorInfo {
 /// Kernel never reads or frees the error objects returned by these callbacks. The connector is
 /// responsible for freeing them. Callbacks must not unwind across the FFI boundary. Their code
 /// and context must remain valid whenever they are called. If shared across threads, callbacks
-/// must support concurrent calls and synchronize access to their context as needed.
+/// must support concurrent calls and synchronize access to their context as needed. When the
+/// global Rust budget is exhausted, the Kernel memory-error callback receives static message
+/// bytes; the callback must be able to report failure without another Rust allocation.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ErrorAllocators {
@@ -85,6 +87,22 @@ impl ErrorAllocators {
     /// The context and callback must satisfy [`ErrorAllocators`]'s lifetime and concurrency
     /// requirements. The callback must follow its field's memory access and ownership rules.
     pub unsafe fn allocate_kernel_error(&self, error: KernelError) -> *mut c_void {
+        let memory_error = matches!(error.without_backtrace(), KernelError::Memory(_));
+        #[cfg(feature = "default-engine-base")]
+        let memory_error = memory_error
+            || matches!(
+                error.without_backtrace(),
+                KernelError::Arrow(delta_kernel::arrow::error::ArrowError::MemoryError(_))
+            );
+        if memory_error {
+            let message = "Kernel memory allocation failed";
+            let descriptor = KernelErrorInfo {
+                code: FFIKernelError::MemoryBudgetError,
+                message: kernel_string_slice!(message),
+            };
+            // Formatting a String would allocate while the global limit may have no headroom.
+            return unsafe { (self.allocate_kernel_error)(self.context, &descriptor) };
+        }
         let message = error.to_string();
         let descriptor = KernelErrorInfo {
             code: error.into(),

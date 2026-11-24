@@ -74,12 +74,12 @@ use crate::scan::log_replay::{
 use crate::scan::metrics::ScanMetrics;
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
-    ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField, StructType,
-    ToSchema as _, lazy_schema_ref, schema_ref,
+    DataType, PrimitiveType, Schema, SchemaRef, StructField, StructType, ToSchema as _,
+    lazy_schema_ref, schema_ref,
 };
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, Operation};
-use crate::transforms::{ExpressionTransform, SchemaTransform, transform_output_type};
+use crate::transforms::{ExpressionTransform, transform_output_type};
 use crate::utils::{FoldWithOption as _, IteratorExt, require};
 use crate::{
     Engine, EngineData, Error, FileMeta, KernelError, KernelResult, KernelResultIterator, Result,
@@ -356,10 +356,10 @@ impl StatsOptions {
         }
         let columns = config
             .physical_data_schema_without_partition_columns()
-            .leaves(None);
+            .leaf_names();
         let builder = config
             .stats_schema_builder()
-            .with_required_physical_columns(Some(columns.as_ref().0))
+            .with_required_physical_columns(Some(&columns))
             .with_variant_min_max(self.variant_min_max);
         #[cfg(feature = "geo-type-in-dev")]
         let builder = builder.with_geometry_min_max(self.geometry_min_max);
@@ -772,12 +772,11 @@ impl PhysicalPredicate {
             unresolved_references,
             folded_references,
             column_mappings: HashMap::new(),
-            logical_path: vec![],
             folded_logical_path: vec![],
             physical_path: vec![],
             column_mapping_mode,
         };
-        let schema_opt = get_referenced_fields.transform_struct(logical_schema);
+        let schema_opt = get_referenced_fields.select_struct(logical_schema)?;
         let mut unresolved = get_referenced_fields.unresolved_references.into_iter();
         if let Some(unresolved) = unresolved.next() {
             // Schema traversal failed to resolve at least one column referenced by the predicate.
@@ -801,7 +800,7 @@ impl PhysicalPredicate {
         if let Some(predicate) = apply_mappings.transform_pred(predicate) {
             Ok(PhysicalPredicate::Some(
                 Arc::new(predicate.into_owned()),
-                Arc::new(schema.into_owned()),
+                Arc::new(schema),
             ))
         } else {
             Ok(PhysicalPredicate::None)
@@ -827,18 +826,61 @@ struct GetReferencedFields<'a> {
     /// the same column with different casings all resolve correctly.
     folded_references: HashMap<Vec<String>, Vec<&'a ColumnName>>,
     column_mappings: HashMap<ColumnName, ColumnName>,
-    logical_path: Vec<String>,
     /// Case-folded version of `logical_path`, maintained incrementally via push/pop to avoid
     /// re-folding the entire path at every leaf field.
     folded_logical_path: Vec<String>,
     physical_path: Vec<String>,
     column_mapping_mode: ColumnMappingMode,
 }
-impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
-    transform_output_type!(|'a, T| Option<Cow<'a, T>>);
+impl GetReferencedFields<'_> {
+    fn select_struct(&mut self, schema: &StructType) -> KernelResult<Option<StructType>> {
+        let selected = StructType::try_from_unchecked_results(
+            schema
+                .fields()
+                .filter_map(|field| self.select_field(field).transpose()),
+        )?;
+        Ok((selected.num_fields() != 0).then_some(selected))
+    }
 
-    // Capture the path mapping for this leaf field
-    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
+    fn select_field(&mut self, field: &StructField) -> KernelResult<Option<StructField>> {
+        let physical_name = field.physical_name(self.column_mapping_mode);
+        self.folded_logical_path.push(field.name.to_lowercase());
+        self.physical_path.push(physical_name.to_owned());
+        let selected = self.select_type(field.data_type());
+        self.folded_logical_path.pop();
+        self.physical_path.pop();
+        Ok(selected?.map(|data_type| StructField {
+            name: physical_name.to_owned(),
+            data_type,
+            nullable: field.nullable,
+            metadata: field.metadata.clone(),
+        }))
+    }
+
+    fn select_type(&mut self, value: &DataType) -> KernelResult<Option<DataType>> {
+        stacker::maybe_grow(64 * 1024, 2 * 1024 * 1024, || match value {
+            DataType::Primitive(primitive) => {
+                Ok(self.select_primitive(primitive).map(DataType::Primitive))
+            }
+            DataType::Struct(schema) | DataType::Variant(schema) | DataType::File(schema) => {
+                let Some(selected) = self.select_struct(schema)? else {
+                    return Ok(None);
+                };
+                let selected = crate::memory::Owned::try_new(selected)?;
+                Ok(Some(match value {
+                    DataType::Variant(_) => DataType::Variant(selected),
+                    DataType::File(_) => DataType::File(selected),
+                    _ => DataType::Struct(selected),
+                }))
+            }
+            // Arrays and maps are not eligible for data skipping.
+            DataType::Array(_) | DataType::Map(_) => Ok(None),
+            #[cfg(feature = "udt-in-dev")]
+            DataType::UserDefined(_) => value.try_clone().map(Some),
+        })
+    }
+
+    fn select_primitive(&mut self, ptype: &PrimitiveType) -> Option<PrimitiveType> {
         // Record the physical name mappings for all referenced leaf columns. Delta column names
         // are case-insensitive, so we probe the case-folded lookup map for O(1) matching.
         let pred_cols = self
@@ -852,27 +894,7 @@ impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
             self.column_mappings
                 .insert(pred_col.clone(), physical.clone());
         }
-        Some(Cow::Borrowed(ptype))
-    }
-
-    // array and map fields are not eligible for data skipping, so filter them out.
-    fn transform_array(&mut self, _: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
-        None
-    }
-    fn transform_map(&mut self, _: &'a MapType) -> Option<Cow<'a, MapType>> {
-        None
-    }
-
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
-        let physical_name = field.physical_name(self.column_mapping_mode);
-        self.logical_path.push(field.name.clone());
-        self.folded_logical_path.push(field.name.to_lowercase());
-        self.physical_path.push(physical_name.to_string());
-        let field = self.recurse_into_struct_field(field);
-        self.logical_path.pop();
-        self.folded_logical_path.pop();
-        self.physical_path.pop();
-        Some(Cow::Owned(field?.with_name(physical_name)))
+        Some(ptype.clone())
     }
 }
 
@@ -920,6 +942,21 @@ static RESTORED_ADD_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
         nullable CLUSTERING_PROVIDER_NAME: STRING,
     },
 };
+
+#[cfg(feature = "memory-budget")]
+pub(crate) fn initialize_schemas() {
+    for schema in [
+        &COMMIT_READ_SCHEMA,
+        &CHECKPOINT_READ_SCHEMA,
+        &CHECKPOINT_READ_SCHEMA_NO_JSON_STATS,
+        &PARALLEL_CHECKPOINT_READ_SCHEMA,
+        &PARALLEL_CHECKPOINT_READ_SCHEMA_NO_JSON_STATS,
+        &RESTORED_ADD_SCHEMA,
+        &log_replay::SCAN_ROW_SCHEMA,
+    ] {
+        LazyLock::force(schema);
+    }
+}
 
 pub(crate) fn restored_add_schema() -> &'static SchemaRef {
     &RESTORED_ADD_SCHEMA

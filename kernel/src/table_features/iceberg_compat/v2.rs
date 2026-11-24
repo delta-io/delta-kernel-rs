@@ -229,7 +229,7 @@ mod tests {
 
     #[rstest]
     #[case::wrong_metadata_type(
-        MetadataValue::String("not an array".to_string()),
+        MetadataValue::String("not an array".to_string().into()),
         "non-array",
     )]
     #[case::json_object(

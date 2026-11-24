@@ -44,6 +44,7 @@ pub(crate) fn read_crc_file_or_none(
     match try_read_crc_file(engine, crc_file) {
         Ok(crc) => Ok(Some(Arc::new(crc))),
         Err(KernelError::Cancelled) => Err(KernelError::Cancelled),
+        Err(error) if matches!(error.without_backtrace(), KernelError::Memory(_)) => Err(error),
         Err(_) => Ok(None),
     }
 }

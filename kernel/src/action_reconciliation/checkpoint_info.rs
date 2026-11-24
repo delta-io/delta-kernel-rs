@@ -892,7 +892,9 @@ mod tests {
         LogSegment::try_new(
             LogSegmentFiles {
                 checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, 1)],
-                ascending_commit_files: vec![commit.clone()],
+                ascending_commit_files: crate::log_segment_files::commit_files(vec![
+                    commit.clone(),
+                ]),
                 latest_commit_file: Some(commit),
                 ..Default::default()
             },
