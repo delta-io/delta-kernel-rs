@@ -1,15 +1,13 @@
 //! Callback-scoped views of scan-plan metrics.
 
-use std::ptr::NonNull;
-
 use delta_kernel::metrics as kernel;
 use delta_kernel::scan::StructStats;
 
 use super::{MetricEvent, MetricId, correlation_id_slice};
-use crate::checkpoint::{FfiCheckpointInfo, FfiCheckpointMetrics, visit};
+use crate::checkpoint::{FfiCheckpointMetrics, visit};
 use crate::delta_types::{FfiColumnName, FfiColumnNameArray};
 use crate::scan::{FfiPartitionValuesOptions, FfiStatsOptions};
-use crate::{FfiSlice, KernelStringSlice, NullableCvoid, OptionalValue, kernel_string_slice};
+use crate::{FfiSlice, KernelStringSlice, OptionalValue, kernel_string_slice};
 
 /// Result of scan-plan generation.
 ///
@@ -65,18 +63,11 @@ pub struct ScanPlanReport {
 }
 
 pub(super) fn with_event<F: FnOnce(MetricEvent)>(event: &kernel::ScanPlanReport, f: F) {
-    extern "C" fn accept<F: FnOnce(MetricEvent)>(
-        context: NullableCvoid,
-        info: *const FfiCheckpointInfo,
-    ) {
-        let Some(context) = context else { return };
-        // Safety: visit invokes this callback synchronously with the live context below.
-        let (event, callback) = unsafe {
-            &mut *context
-                .cast::<(&kernel::ScanPlanReport, Option<F>)>()
-                .as_ptr()
-        };
-        let Some(f) = callback.take() else { return };
+    let info = event
+        .checkpoint
+        .as_ref()
+        .and_then(|metrics| metrics.info.as_deref());
+    if let Err(error) = visit(info, |info| {
         let metadata = &event.metadata_planning;
         let columns = match metadata.stats.struct_stats() {
             StructStats::None => &[][..],
@@ -119,7 +110,6 @@ pub(super) fn with_event<F: FnOnce(MetricEvent)>(event: &kernel::ScanPlanReport,
             .as_ref()
             .map(|metrics| FfiCheckpointMetrics {
                 version: metrics.version,
-                checkpoint_type: metrics.checkpoint_type.map(Into::into).into(),
                 info,
                 source: metrics.source.map(Into::into).into(),
                 root_footer_calls: metrics.root_footer_calls,
@@ -178,13 +168,7 @@ pub(super) fn with_event<F: FnOnce(MetricEvent)>(event: &kernel::ScanPlanReport,
             compaction_file_count: metadata.compaction_file_count,
         };
         f(MetricEvent::ScanPlanGenerationCompleted(&record));
-    }
-    let info = event
-        .checkpoint
-        .as_ref()
-        .and_then(|metrics| metrics.info.as_deref());
-    let mut context = (event, Some(f));
-    if let Err(error) = visit(info, Some(NonNull::from(&mut context).cast()), accept::<F>) {
+    }) {
         tracing::warn!(%error, "Failed to convert scan-plan metric checkpoint information");
     }
 }
@@ -238,7 +222,6 @@ mod tests {
             duration_ns: 19,
             checkpoint: with_checkpoint.then_some(kernel::CheckpointMetrics {
                 version: 0,
-                checkpoint_type: None,
                 info,
                 source: Some(kernel::CheckpointSource::Resolved),
                 root_footer_calls: 1,
@@ -341,7 +324,6 @@ mod tests {
                     assert_eq!(sidecars[0].size_in_bytes, 13);
                     assert_eq!(sidecars[0].modification_time, 23);
                 }
-                assert_eq!(checkpoint.checkpoint_type, OptionalValue::None);
                 assert_eq!(
                     checkpoint.source,
                     OptionalValue::Some(FfiCheckpointSource::Resolved)

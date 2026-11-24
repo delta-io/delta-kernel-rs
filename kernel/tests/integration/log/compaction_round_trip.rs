@@ -145,7 +145,6 @@ async fn snapshot_replay_and_non_amt_scans_use_compactions(
                     assert_eq!(checkpoint.version, 1);
                     let info = checkpoint.info.as_ref().unwrap();
                     assert_eq!(info.last_checkpoint().version(), checkpoint.version);
-                    assert_eq!(checkpoint.checkpoint_type, Some(info.checkpoint_type()));
                 }
                 assert!(plan_uses_compaction(&plan));
                 let batches = SyncPlanExecutor::new(Some(table.store().clone()))
