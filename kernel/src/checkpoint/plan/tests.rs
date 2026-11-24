@@ -250,6 +250,14 @@ fn existing_checkpoint_data(
             let keep = or(&is_null(txn)?, &is_not_null(&txn["lastUpdated"])?)?;
             batch = filter_record_batch(&batch, &keep)?;
         }
+        // This oracle covers replay before the factory supplies fresh checkpoint metadata.
+        if let Ok(metadata) = batch.schema().index_of(CHECKPOINT_METADATA_NAME) {
+            batch = batch.project(
+                &(0..batch.num_columns())
+                    .filter(|index| *index != metadata)
+                    .collect::<Vec<_>>(),
+            )?;
+        }
         batches.push(batch);
     }
     Ok(batches)
