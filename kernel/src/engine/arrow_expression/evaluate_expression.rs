@@ -717,12 +717,11 @@ fn arrow_convert_to_non_view_type(vals: Arc<dyn Array>) -> KernelResult<Arc<dyn 
     }
 }
 
-/// Whether each row of a map array contains the key at the same row of `key`. A NULL map row or a
-/// NULL key yields NULL.
+/// Returns, for each row, whether the row's map contains the row's key.
 ///
-/// Arrow stores the entries of all map rows back to back, and `value_offsets` marks where each
-/// row starts. Every entry gets the key of its row, one `eq` compares all entries, and each row
-/// then checks its own entries for a match.
+/// `map` and `key` are columns with the same number of rows. Row `i` of the result is true when
+/// map `i` has key `i`, false otherwise, and NULL when the map or the key is NULL. For example,
+/// maps `[{a: 1, b: 2}, {a: 1}, NULL]` with keys `["b", "z", "a"]` give `[true, false, NULL]`.
 fn map_has_key(map: &ArrayRef, key: &ArrayRef) -> KernelResult<BooleanArray> {
     let map = as_map_array(map, "MapHasKey")?;
     check_map_has_key_inputs(map, key)?;
@@ -751,13 +750,11 @@ fn map_has_key(map: &ArrayRef, key: &ArrayRef) -> KernelResult<BooleanArray> {
     Ok(has_key.collect())
 }
 
-/// Checks that `key` has one row per map row and a type that `map_has_key` can compare with the
-/// map keys.
+/// Checks that `map_has_key` can compare `key` with the keys of `map`.
 ///
-/// The key must have the map's key type. A string or binary key whose Arrow layout differs from
-/// the map keys, such as `Utf8` against `Utf8View`, is accepted and aligned by
-/// [`align_comparison_operands`], the same way [`BinaryPredicateOp::Equal`] aligns its operands.
-/// Maps with nested key types are rejected.
+/// `key` must have one row per map row and the same type as the map keys. String and binary keys
+/// may use a different Arrow layout than the map keys, such as `Utf8` against `Utf8View`. Maps
+/// with nested key types are rejected.
 fn check_map_has_key_inputs(map: &MapArray, key: &ArrayRef) -> KernelResult<()> {
     if key.len() != map.len() {
         return Err(KernelError::invalid_expression(format!(
