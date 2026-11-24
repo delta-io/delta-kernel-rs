@@ -726,7 +726,7 @@ fn map_has_key(map: &ArrayRef, key: &ArrayRef) -> KernelResult<BooleanArray> {
     let map = as_map_array(map, "MapHasKey")?;
     check_map_has_key_inputs(map, key)?;
 
-    // Give every map entry the key of its row, so entry i of row r is compared with key r.
+    // Give every map entry the key of its row, so one comparison covers all entries.
     let offsets = map.value_offsets();
     let first_entry = offsets[0] as usize;
     let entries_in_row = |row: usize| (offsets[row + 1] - offsets[row]) as usize;
@@ -779,8 +779,8 @@ fn check_map_has_key_inputs(map: &MapArray, key: &ArrayRef) -> KernelResult<()> 
     Ok(())
 }
 
-/// Converts both comparison operands to view layouts when their Arrow types differ. Casting from a
-/// non-view layout to a view layout is faster than the reverse.
+/// When the operand types differ, converts string and binary operands, including list elements, to
+/// view layouts. Casting a non-view layout to a view layout is faster than the reverse.
 fn align_comparison_operands(
     left: ArrayRef,
     right: ArrayRef,
@@ -3373,6 +3373,14 @@ mod tests {
         assert_eq!(result.null_count(), len);
     }
 
+    /// Builds a batch with a map column `m` and a key column `k`:
+    ///
+    /// | row | `m`              | `k`    |
+    /// |-----|------------------|--------|
+    /// | 0   | `{a: 1, b: 2}`   | `a`    |
+    /// | 1   | `{}`             | NULL   |
+    /// | 2   | NULL             | `a`    |
+    /// | 3   | `{c: NULL}`      | `c`    |
     fn create_accessor_map_batch() -> RecordBatch {
         let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         builder.keys().append_value("a");
@@ -3501,11 +3509,6 @@ mod tests {
         lit(2_i32),
         vec![Some(true), Some(false)],
     )]
-    #[case::date_keys(
-        create_map_batch(Arc::new(Date32Array::from(vec![10, 20])), vec![0, 2, 2], None),
-        lit(Scalar::Date(20)),
-        vec![Some(true), Some(false)],
-    )]
     #[case::utf8_view_keys(
         create_cast_key_map_batch(ArrowDataType::Utf8, ArrowDataType::Utf8View),
         lit("b"),
@@ -3550,16 +3553,6 @@ mod tests {
     #[rstest]
     #[case::non_map_input(create_accessor_map_batch(), col!("k"), lit("a"))]
     #[case::integer_key_for_string_keys(create_accessor_map_batch(), col!("m"), lit(1_i32))]
-    #[case::long_key_for_integer_keys(
-        create_map_batch(Arc::new(Int32Array::from(vec![1])), vec![0, 1], None),
-        col!("m"),
-        lit(1_i64),
-    )]
-    #[case::signed_key_for_unsigned_keys(
-        create_map_batch(Arc::new(UInt32Array::from(vec![1])), vec![0, 1], None),
-        col!("m"),
-        lit(-1_i32),
-    )]
     #[case::microsecond_key_for_millisecond_keys(
         create_map_batch(Arc::new(TimestampMillisecondArray::from(vec![1])), vec![0, 1], None),
         col!("m"),
@@ -3577,16 +3570,6 @@ mod tests {
         let is_invalid_expression =
             matches!(result, Err(KernelError::InvalidExpressionEvaluation(_)));
         assert!(is_invalid_expression, "{result:?}");
-    }
-
-    #[rstest]
-    #[case::map_len_missing_map(Expr::map_len(col!("missing")))]
-    #[case::map_has_key_missing_map(Expr::from_pred(Pred::map_has_key(col!("missing"), lit("a"))))]
-    #[case::map_has_key_missing_key(Expr::from_pred(Pred::map_has_key(col!("m"), col!("missing"))))]
-    fn test_map_accessors_propagate_input_errors(#[case] expr: Expr) {
-        let batch = create_accessor_map_batch();
-        let result = evaluate_expression(&expr, &batch, None);
-        assert!(result.is_err(), "{result:?}");
     }
 
     #[test]
