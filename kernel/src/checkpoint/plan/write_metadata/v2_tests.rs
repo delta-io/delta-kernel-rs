@@ -75,7 +75,10 @@ async fn checkpoint_statistics_match_reconciliation_and_write_results(
     let snapshot = Snapshot::builder_for(table.table_root())
         .build(&engine)
         .unwrap();
-    let writer = snapshot.create_checkpoint_writer(&engine)?;
+    let mut writer = snapshot.create_checkpoint_writer(&engine)?;
+    writer.v2_checkpoint_config = V2CheckpointConfig::WithSidecar {
+        file_actions_per_sidecar_hint: None,
+    };
     let legacy = writer.checkpoint_data(&engine)?;
     let legacy_state = legacy.state();
     for batch in legacy {
