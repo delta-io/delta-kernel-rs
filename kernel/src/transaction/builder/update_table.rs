@@ -161,7 +161,10 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
     /// accepted and upgrade the protocol during [`build`](Self::build).
     /// `delta.feature.<name>=supported` signals enable the named feature on the protocol; the same
     /// features CREATE TABLE accepts are allowed. CHECK constraints and unknown `delta.*` keys are
-    /// rejected. Property changes are applied during [`build`](Self::build). For `ALTER TABLE`,
+    /// rejected. Changes that would rewrite an existing table are also rejected during
+    /// [`build`](Self::build): toggling row tracking, changing the column mapping mode, and
+    /// enabling or disabling IcebergCompat or Iceberg writer compatibility. Property changes are
+    /// applied during [`build`](Self::build). For `ALTER TABLE`,
     /// requested adds always emit Metadata, including when every value already matches the current
     /// configuration. Data operations skip unchanged values so Metadata is emitted only when at
     /// least one added value actually changes.
@@ -358,6 +361,7 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
             ));
         }
         validate_properties_removed_keys(&self.local_state.properties_removed)?;
+        reject_duplicate_delta_keys_in_batch(&self.local_state.properties_added)?;
         // Overlap check needs canonical add keys (`DELTA.checkpointInterval` vs remove of
         // `delta.checkpointInterval`). Feature signals are not table properties and are
         // validated by parse_feature_signal during build.
@@ -467,6 +471,7 @@ fn try_new_update_table<MODE: ExecutionMode>(
     )?;
 
     let is_alter = operation == UpdateTableOperation::AlterTable;
+    reject_duplicate_delta_keys_in_batch(&properties_added)?;
     // Feature signals (`delta.feature.X=supported`) are partitioned out of each add-batch and are
     // not stored in metadata; remaining batches keep call-order for canonicalization.
     let mut feature_signal_pairs = HashMap::new();
@@ -667,6 +672,24 @@ fn validate_and_canonicalize_properties_added(
 ) -> KernelResult<HashMap<String, String>> {
     let mut validated = HashMap::new();
     for batch in properties_added {
+        for (key, value) in batch {
+            let (canonical_key, value) =
+                validate_and_normalize_property_for_update(key.clone(), value.clone())?;
+            validated.insert(canonical_key, value);
+        }
+    }
+    Ok(validated)
+}
+
+/// Rejects case-insensitive duplicate `delta.*` keys within a single add-batch.
+///
+/// Runs over the original batches, including `delta.feature.*` signals, which are later
+/// partitioned into a map that would otherwise silently drop all but the last spelling (for
+/// example `delta.feature.foo=invalid` followed by `delta.feature.foo=supported`).
+fn reject_duplicate_delta_keys_in_batch(
+    properties_added: &[Vec<(String, String)>],
+) -> KernelResult<()> {
+    for batch in properties_added {
         let mut seen_delta_keys = HashSet::new();
         for (key, _) in batch {
             if is_delta_property_key(key) && !seen_delta_keys.insert(key.to_ascii_lowercase()) {
@@ -675,13 +698,8 @@ fn validate_and_canonicalize_properties_added(
                 )));
             }
         }
-        for (key, value) in batch {
-            let (canonical_key, value) =
-                validate_and_normalize_property_for_update(key.clone(), value.clone())?;
-            validated.insert(canonical_key, value);
-        }
     }
-    Ok(validated)
+    Ok(())
 }
 
 fn validate_properties_removed_keys(properties_removed: &HashSet<String>) -> KernelResult<()> {
@@ -1169,6 +1187,30 @@ mod tests {
             .with_table_properties_added([
                 ("DELTA.checkpointInterval", "1"),
                 ("delta.checkpointInterval", "42"),
+            ])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Conflicting spellings of table property"),
+            "error={error}"
+        );
+        Ok(())
+    }
+
+    /// Duplicate feature signals in one call must be rejected rather than silently collapsed into
+    /// the signal map (where the last spelling would win).
+    #[test]
+    fn with_table_properties_added_rejects_duplicate_feature_signals_in_same_request() -> Result<()>
+    {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let error = snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([
+                ("delta.feature.deletionVectors", "invalid"),
+                ("delta.feature.deletionVectors", "supported"),
             ])
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
             .unwrap_err();
