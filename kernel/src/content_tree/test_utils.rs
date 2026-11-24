@@ -12,8 +12,9 @@ pub(crate) use crate::content_tree::mumbling::tests::encode_positions as mumblin
 use crate::content_tree::stats::{field_with_id, projected_stats_schema, stats_schema};
 use crate::content_tree::{
     AMT_FORMAT_VERSION, CONTENT_STATS_FIELD_NAME, ContentTreeNodeEntry, DataContentType,
-    DataFileFormat, DeletionVectorInfo, ManifestInfo, TrackingInfo, TrackingStatus,
+    DataFileFormat, DeletionVectorInfo, ManifestInfo, TAGS, TrackingInfo, TrackingStatus,
 };
+use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use crate::expressions::{ArrayData, Scalar, StructData};
 use crate::schema::{ArrayType, DataType, StructField, StructType, ToSchema as _, schema_ref};
 use crate::{Engine, EngineData, FileMeta};
@@ -128,6 +129,21 @@ pub(crate) fn write_manifest(
     write_batch(engine, location, entry_batch(engine, entries))
 }
 
+/// Writes `entries` like [`write_manifest`], but without the `tags` column, which writers may omit.
+pub(crate) fn write_manifest_without_tags(
+    engine: &dyn Engine,
+    location: Url,
+    entries: &[ContentTreeNodeEntry],
+) -> FileMeta {
+    let batch = entry_batch(engine, entries)
+        .try_into_record_batch()
+        .unwrap();
+    let tags = batch.schema().index_of(TAGS).unwrap();
+    let columns: Vec<_> = (0..batch.num_columns()).filter(|&i| i != tags).collect();
+    let batch = batch.project(&columns).unwrap();
+    write_batch(engine, location, Box::new(ArrowEngineData::new(batch)))
+}
+
 /// Writes `entries` like [`write_manifest`], followed by a `content_stats` column of type
 /// `content_stats` holding `stats[i]` for entry `i`.
 pub(crate) fn write_manifest_with_stats(
@@ -206,7 +222,6 @@ mod tests {
     use super::*;
     use crate::arrow::array::{Array as _, RecordBatch};
     use crate::arrow::compute::{cast, concat_batches};
-    use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
     use crate::schema::{ColumnMetadataKey, MetadataValue};
 
