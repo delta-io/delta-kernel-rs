@@ -49,6 +49,8 @@ use handle::Handle;
 extern crate self as delta_kernel_ffi;
 
 mod alloc_stats;
+#[cfg_attr(not(test), expect(dead_code))]
+mod panic;
 
 #[cfg(feature = "declarative-plans")]
 pub mod checkpoint;
