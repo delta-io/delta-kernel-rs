@@ -202,37 +202,35 @@ mod tests {
     }
 
     #[rstest]
-    #[case::declared_order(false, None, false)]
-    #[case::reordered(true, None, false)]
-    #[case::unknown(false, Some("other"), false)]
-    #[case::wrong_null_type(false, None, true)]
+    #[case::declared_order(false, None, false, false)]
+    #[case::reordered(true, None, false, false)]
+    #[case::wrong_null_type(false, None, true, false)]
+    #[case::active_field_renamed(false, Some("other"), false, false)]
+    #[case::non_struct_active_payload(false, None, false, true)]
     fn named_collections_resolve_struct_payloads_by_name(
         #[case] reverse: bool,
-        #[case] extra: Option<&str>,
+        #[case] renamed_active: Option<&str>,
         #[case] wrong_null_type: bool,
+        #[case] non_struct_active: bool,
     ) -> KernelResult<()> {
+        let active = if non_struct_active {
+            crate::expressions::Scalar::Integer(7)
+        } else {
+            Added { id: 7 }.into()
+        };
         let removed_type = if wrong_null_type {
             DataType::STRING
         } else {
             Added::schema_ref().clone().into()
         };
         let mut fields = vec![
-            StructField::nullable("added", Added::schema_ref().clone()),
+            StructField::nullable(renamed_active.unwrap_or("added"), active.data_type()),
             StructField::nullable("removed", removed_type.clone()),
         ];
-        let mut values = vec![
-            Added { id: 7 }.into(),
-            crate::expressions::Scalar::Null(removed_type),
-        ];
+        let mut values = vec![active, crate::expressions::Scalar::Null(removed_type)];
         if reverse {
             fields.reverse();
             values.reverse();
-        }
-        if let Some(name) = extra {
-            fields.push(StructField::nullable(name, Added::schema_ref().clone()));
-            values.push(crate::expressions::Scalar::Null(
-                Added::schema_ref().clone().into(),
-            ));
         }
         let result = StructType::try_new(fields).and_then(|schema| {
             let row = StructData::try_new(Arc::new(schema), values)?;
@@ -240,8 +238,10 @@ mod tests {
         });
         if wrong_null_type {
             assert_result_error_with_message(result, "removed: expected struct, found string");
-        } else if extra.is_some() {
-            assert!(result.is_err());
+        } else if let Some(name) = renamed_active {
+            assert_result_error_with_message(result, &format!("known variant field, found {name}"));
+        } else if non_struct_active {
+            assert_result_error_with_message(result, "added: expected StructData, found integer");
         } else {
             assert_eq!(
                 result?,

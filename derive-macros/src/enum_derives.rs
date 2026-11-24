@@ -71,41 +71,45 @@ pub(super) fn into_struct_data(input: &DeriveInput) -> Result<TokenStream, Error
     let struct_name = &input.ident;
     let variants = variants(input)?;
     let payloads = variants.iter().map(|v| v.payload);
-    let arms = variants.iter().enumerate().map(|(index, variant)| {
+    let arms = variants.iter().map(|variant| {
         let ident = variant.ident;
-        quote! { #struct_name::#ident(value) => values[#index] =
-        delta_kernel::expressions::Scalar::Struct(value.into()), }
+        let name = &variant.name;
+        quote! { #struct_name::#ident(value) =>
+        (#name, delta_kernel::expressions::Scalar::Struct(value.into())), }
     });
     let bounds = quote! { #(#payloads: Into<delta_kernel::expressions::StructData>,)* };
     let values = quote! {{
-        let mut values: ::std::vec::Vec<_> = schema
+        let (name, value) = match value { #(#arms)* };
+        let mut value = ::std::option::Option::Some(value);
+        schema
             .fields()
             .map(|field| {
-                delta_kernel::expressions::Scalar::Null(field.data_type().clone())
+                value.take_if(|_| field.name().as_str() == name).unwrap_or_else(|| {
+                    delta_kernel::expressions::Scalar::Null(field.data_type().clone())
+                })
             })
-            .collect();
-        match value { #(#arms)* }
-        values
+            .collect::<::std::vec::Vec<_>>()
     }};
     let output = super::struct_data_encoder(struct_name, bounds, values);
     Ok(output)
 }
 
 pub(super) fn try_from_struct_data(struct_name: &Ident, variants: &[Variant<'_>]) -> TokenStream {
-    let arms = variants.iter().enumerate().map(|(index, variant)| {
+    let arms = variants.iter().map(|variant| {
         let ident = variant.ident;
         let payload = variant.payload;
+        let name = &variant.name;
         quote! {
-            #index => <#payload as TryFrom<delta_kernel::expressions::Scalar>>::try_from(value)
+            #name => <#payload as TryFrom<delta_kernel::expressions::Scalar>>::try_from(value)
                 .map(Self::#ident),
         }
     });
     let payloads = variants.iter().map(|v| v.payload);
     let result = quote! {{
-        let (index, name, value) = fields.take_variant()?;
-        match index {
+        let (_, name, value) = fields.take_variant()?;
+        match name {
             #(#arms)*
-            _ => Err(delta_kernel::KernelError::internal_error("Unknown variant field index")),
+            _ => Err(delta_kernel::KernelError::internal_error(format!("Unknown enum variant field {name:?}"))),
         }.map_err(|error| delta_kernel::error::add_scalar_path_context(error, name))?
     }};
     super::struct_data_decoder(struct_name, payloads, result)

@@ -664,9 +664,11 @@ fn try_from_struct_rows_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
                     )?;
                     let (index, name, value) = fields.take_variant()?;
                     match index {
-                        #(#indices => <#types as delta_kernel::expressions::TryFromStructRows>::push(
-                            &mut state.#indices, value.try_into()?,
-                        ),)*
+                        #(#indices => value.try_into().and_then(|row| {
+                            <#types as delta_kernel::expressions::TryFromStructRows>::push(
+                                &mut state.#indices, row,
+                            )
+                        }),)*
                         _ => Err(delta_kernel::KernelError::internal_error("Unknown variant field index")),
                     }.map_err(|error| delta_kernel::error::add_scalar_path_context(error, name))?;
                     fields.finish()
@@ -949,6 +951,24 @@ mod tests {
     use syn::parse_quote;
 
     use super::*;
+
+    #[rstest]
+    #[case::generic(
+        "struct Rows<T> { values: Vec<T> }",
+        "TryFromStructRows requires a concrete collector without generic parameters"
+    )]
+    #[case::normalized_casefold_collision(
+        "struct Rows { a_b: Vec<i32>, ab: Vec<i32> }",
+        "duplicate schema field name"
+    )]
+    fn try_from_struct_rows_rejects_invalid_collectors(
+        #[case] source: &str,
+        #[case] expected: &str,
+    ) {
+        let input = syn::parse_str::<DeriveInput>(source).unwrap();
+        let error = try_from_struct_rows_impl(&input).unwrap_err();
+        assert_eq!(error.to_string(), expected);
+    }
 
     fn implementation_name(input: &Item) -> Ident {
         let Item::Macro(item) = input else {

@@ -266,7 +266,8 @@ impl StructDataFields {
         })
     }
 
-    /// Consumes the named field, checks its schema nullability, and decodes its value.
+    /// Consumes the named field, checks its schema nullability and a null scalar's exact data type,
+    /// and decodes its value.
     #[internal_api]
     pub(crate) fn take_field<T>(&mut self, field_name: &str) -> KernelResult<T>
     where

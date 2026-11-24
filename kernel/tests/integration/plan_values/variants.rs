@@ -7,12 +7,12 @@ use delta_kernel::delta_kernel_derive::{
     TryFromStructRows as DeriveStructRows,
 };
 use delta_kernel::expressions::{Scalar, StructData, TryFromStructRows};
-use delta_kernel::schema::{SchemaRef, ToSchema, schema};
+use delta_kernel::schema::{ColumnNamesAndTypes, SchemaRef, ToSchema, schema};
 use delta_kernel::{KernelError, KernelResult};
 use rstest::rstest;
 use test_utils::{IntoArray, assert_result_error_with_message};
 
-use super::nested::{EmptyRow, nested_array};
+use super::nested::nested_array;
 use super::{CustomRow, data, execute_result, optional, singleton};
 
 type Batches = Vec<KernelResult<RecordBatch>>;
@@ -58,7 +58,7 @@ action_collectors! {
 #[derive(Debug, PartialEq, DeriveStructRows)]
 struct NullableRows {
     nullable_row: Option<NullableRow>,
-    empty_row: Option<EmptyRow>,
+    remove: Option<Remove>,
 }
 
 #[derive(Clone, Debug, PartialEq, IntoStructData, DeriveToSchema, TryFromStructData)]
@@ -67,7 +67,9 @@ pub(super) enum Action {
     Remove(Remove),
 }
 
-#[derive(Debug, PartialEq, IntoStructData, DeriveToSchema, TryFromStructData)]
+result_row! { struct ReversedActionFields { remove: Option<Remove>, add: Option<Add> } }
+
+#[derive(Debug, PartialEq, IntoStructData, TryFromStructData)]
 enum RenamedAction {
     #[schema_rename = "add"]
     Created(Add),
@@ -75,10 +77,36 @@ enum RenamedAction {
     Deleted(Remove),
 }
 
+impl ToSchema for RenamedAction {
+    fn schema_ref() -> &'static SchemaRef {
+        ReversedActionFields::schema_ref()
+    }
+
+    fn leaf_columns() -> &'static ColumnNamesAndTypes {
+        ReversedActionFields::leaf_columns()
+    }
+}
+
+#[rstest]
+#[case::add(RenamedAction::Created(Add { id: 8 }), 1)]
+#[case::remove(RenamedAction::Deleted(Remove { id: 8 }), 0)]
+fn enum_encoding_uses_manual_schema_order(
+    #[case] value: RenamedAction,
+    #[case] active: usize,
+) -> KernelResult<()> {
+    let mut values = vec![Scalar::Null(Add::schema_ref().clone().into()); 2];
+    values[active] = Add { id: 8 }.into();
+    assert_eq!(
+        StructData::from(value),
+        StructData::try_new(RenamedAction::schema_ref().clone(), values)?,
+    );
+    Ok(())
+}
+
 #[derive(Debug, PartialEq, DeriveToSchema, TryFromStructData)]
 enum NullableAction {
     NullableRow(NullableRow),
-    EmptyRow(EmptyRow),
+    Remove(Remove),
 }
 
 fn payload(ids: &[Option<i32>]) -> ArrayRef {
@@ -206,6 +234,9 @@ fn named_collections_use_manual_decoders(
 #[case::renamed_variant(
     vec![Ok(batch(&[None], &[Some(8)]))], RenamedAction::Deleted(Remove { id: 8 })
 )]
+#[case::renamed_add(
+    vec![Ok(batch(&[Some(8)], &[None]))], RenamedAction::Created(Add { id: 8 })
+)]
 fn named_collections_use_declared_fields_and_payload_decoders<T>(
     #[case] batches: Batches,
     #[case] expected: T,
@@ -254,7 +285,7 @@ fn variant_collection_errors_follow_consumption_order<T: Debug>(
 #[case::required_payloads(Action::schema_ref().clone(), Action::try_from,
     vec![Scalar::from(Add { id: 1 }), Scalar::from(Remove { id: 2 })])]
 #[case::nullable_payloads(NullableAction::schema_ref().clone(), NullableAction::try_from,
-    vec![Scalar::from(NullableRow { id: None }), Scalar::from(EmptyRow {})])]
+    vec![Scalar::from(NullableRow { id: None }), Scalar::from(Remove { id: 42 })])]
 #[case::named_collection(Action::schema_ref().clone(), |row| RequiredActions::collect_into([Ok(row)]),
     vec![Scalar::from(Add { id: 1 }), Scalar::from(Remove { id: 2 })])]
 fn variant_decoders_report_neither_and_both_fields<T: Debug>(
@@ -284,34 +315,34 @@ fn variant_decoders_report_neither_and_both_fields<T: Debug>(
 #[case::enum_row(|nullable| if nullable {
     NullableAction::NullableRow(NullableRow { id: None })
 } else {
-    NullableAction::EmptyRow(EmptyRow {})
+    NullableAction::Remove(Remove { id: 42 })
 })]
 #[case::named_collection(|nullable: bool| NullableRows {
     nullable_row: nullable.then_some(NullableRow { id: None }),
-    empty_row: (!nullable).then_some(EmptyRow {}),
+    remove: (!nullable).then_some(Remove { id: 42 }),
 })]
 fn present_payload_with_all_null_children_remains_present<T>(
     #[case] expected: fn(bool) -> T,
     #[values(false, true)] nullable: bool,
-    #[values(false, true)] empty: bool,
+    #[values(false, true)] removed: bool,
     #[values(false, true)] split: bool,
 ) -> KernelResult<()>
 where
     T: TryFromStructRows + Debug + PartialEq,
 {
     // An invalid second row must win over result cardinality errors.
-    let (nullable_validity, empty_validity) = if nullable == empty {
-        (vec![true, nullable], vec![false, empty])
+    let (nullable_validity, remove_validity) = if nullable == removed {
+        (vec![true, nullable], vec![false, removed])
     } else {
-        (vec![nullable], vec![empty])
+        (vec![nullable], vec![removed])
     };
     let count = nullable_validity.len();
     let batch = RecordBatch::try_from_iter_with_nullable([
         (
-            "emptyRow",
+            "remove",
             nested_array(
                 vec![("id", vec![42; count].into_arrow_array())],
-                Some(empty_validity),
+                Some(remove_validity),
             ),
             true,
         ),
@@ -330,7 +361,7 @@ where
         vec![Ok(batch)]
     };
     let actual = execute_rows::<T>(batches);
-    if nullable == empty {
+    if nullable == removed {
         assert!(matches!(
             actual.unwrap_err().without_backtrace(),
             KernelError::InvalidStructData(message)
