@@ -621,6 +621,10 @@ impl From<&Scalar> for proto_expr::Scalar {
             Scalar::Boolean(v) => Value::Boolean(*v),
             Scalar::Timestamp(v) => Value::Timestamp(*v),
             Scalar::TimestampNtz(v) => Value::TimestampNtz(*v),
+            #[cfg(feature = "nanosecond-timestamps")]
+            Scalar::TimestampNanos(v) => Value::TimestampNanos(*v),
+            #[cfg(feature = "nanosecond-timestamps")]
+            Scalar::TimestampNanosNtz(v) => Value::TimestampNanosNtz(*v),
             Scalar::IntervalYearMonth(v) => Value::IntervalYearMonth(v.months()),
             Scalar::IntervalDayTime(v) => Value::IntervalDayTime(v.micros()),
             Scalar::Date(v) => Value::Date(*v),
@@ -731,6 +735,14 @@ impl From<&PrimitiveType> for proto_schema::PrimitiveType {
             PrimitiveType::Date => PrimitiveTypeKind::Simple(Simple::Date as i32),
             PrimitiveType::Timestamp => PrimitiveTypeKind::Simple(Simple::Timestamp as i32),
             PrimitiveType::TimestampNtz => PrimitiveTypeKind::Simple(Simple::TimestampNtz as i32),
+            #[cfg(feature = "nanosecond-timestamps")]
+            PrimitiveType::TimestampNanos => {
+                PrimitiveTypeKind::Simple(Simple::TimestampNanos as i32)
+            }
+            #[cfg(feature = "nanosecond-timestamps")]
+            PrimitiveType::TimestampNanosNtz => {
+                PrimitiveTypeKind::Simple(Simple::TimestampNanosNtz as i32)
+            }
             PrimitiveType::Decimal(decimal) => PrimitiveTypeKind::Decimal((*decimal).into()),
             #[cfg(feature = "geo-type-in-dev")]
             PrimitiveType::Geometry(geometry) => {
@@ -955,6 +967,18 @@ impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
                     Simple::IntervalDayTime => PrimitiveType::interval_day_time(
                         IntervalDayToSecondType::IntervalDayToSecond,
                     ),
+                    #[cfg(feature = "nanosecond-timestamps")]
+                    Simple::TimestampNanos => PrimitiveType::TimestampNanos,
+                    #[cfg(feature = "nanosecond-timestamps")]
+                    Simple::TimestampNanosNtz => PrimitiveType::TimestampNanosNtz,
+                    // The proto enum always carries the nanos variants, but these can only be
+                    // decoded when the nanosecond-timestamps feature is enabled.
+                    #[cfg(not(feature = "nanosecond-timestamps"))]
+                    Simple::TimestampNanos | Simple::TimestampNanosNtz => {
+                        return Err(KernelError::schema(
+                            "timestamp_ltz(9) and timestamp_ntz(9) types require the 'nanosecond-timestamps' feature",
+                        ));
+                    }
                     Simple::Unspecified => {
                         return Err(KernelError::schema("SimplePrimitiveType is unspecified"));
                     }
@@ -2113,6 +2137,14 @@ mod tests {
 
     #[rstest]
     #[case(Scalar::Integer(7), "integer")]
+    #[cfg_attr(
+        feature = "nanosecond-timestamps",
+        case(Scalar::TimestampNanos(7), "timestamp_nanos")
+    )]
+    #[cfg_attr(
+        feature = "nanosecond-timestamps",
+        case(Scalar::TimestampNanosNtz(7), "timestamp_nanos_ntz")
+    )]
     #[case(Scalar::Long(7), "long")]
     #[case(Scalar::Short(7), "short")]
     #[case(Scalar::Byte(7), "byte")]
@@ -2167,6 +2199,8 @@ mod tests {
             Value::Boolean(_) => "boolean",
             Value::Timestamp(_) => "timestamp",
             Value::TimestampNtz(_) => "timestamp_ntz",
+            Value::TimestampNanos(_) => "timestamp_nanos",
+            Value::TimestampNanosNtz(_) => "timestamp_nanos_ntz",
             Value::IntervalYearMonth(_) => "interval_year_month",
             Value::IntervalDayTime(_) => "interval_day_time",
             Value::Date(_) => "date",
@@ -2409,6 +2443,20 @@ mod tests {
 
     #[rstest]
     #[case(PrimitiveType::String, proto_schema::SimplePrimitiveType::String)]
+    #[cfg_attr(
+        feature = "nanosecond-timestamps",
+        case(
+            PrimitiveType::TimestampNanos,
+            proto_schema::SimplePrimitiveType::TimestampNanos
+        )
+    )]
+    #[cfg_attr(
+        feature = "nanosecond-timestamps",
+        case(
+            PrimitiveType::TimestampNanosNtz,
+            proto_schema::SimplePrimitiveType::TimestampNanosNtz
+        )
+    )]
     #[case(PrimitiveType::Long, proto_schema::SimplePrimitiveType::Long)]
     #[case(PrimitiveType::Integer, proto_schema::SimplePrimitiveType::Integer)]
     #[case(PrimitiveType::Short, proto_schema::SimplePrimitiveType::Short)]
@@ -2584,6 +2632,32 @@ mod tests {
         primitive: PrimitiveType,
     ) {
         assert_data_type_round_trips(DataType::Primitive(primitive));
+    }
+
+    #[cfg(feature = "nanosecond-timestamps")]
+    #[rstest]
+    fn round_trip_timestamp_nanos(
+        #[values(PrimitiveType::TimestampNanos, PrimitiveType::TimestampNanosNtz)]
+        primitive: PrimitiveType,
+    ) {
+        assert_data_type_round_trips(DataType::Primitive(primitive));
+    }
+
+    #[cfg(not(feature = "nanosecond-timestamps"))]
+    #[rstest]
+    fn timestamp_nanos_decode_requires_feature(
+        #[values(
+            proto_schema::SimplePrimitiveType::TimestampNanos,
+            proto_schema::SimplePrimitiveType::TimestampNanosNtz
+        )]
+        simple: proto_schema::SimplePrimitiveType,
+    ) {
+        let err = DataType::try_from(simple_primitive_data_type(simple as i32)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("require the 'nanosecond-timestamps' feature"),
+            "{err}"
+        );
     }
 
     #[rstest]

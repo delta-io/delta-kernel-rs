@@ -30,6 +30,8 @@ use crate::schema::{
     schema_contains_non_null_fields,
 };
 use crate::table_configuration::TableConfiguration;
+#[cfg(feature = "nanosecond-timestamps")]
+use crate::table_features::schema_contains_timestamp_nanos;
 use crate::table_features::{
     ColumnMappingMode, IcebergCompatValidationContext, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
     SET_TABLE_FEATURE_SUPPORTED_VALUE, TableFeature, V2_VALIDATOR, add_feature_to_lists,
@@ -449,6 +451,25 @@ fn maybe_enable_invariants(schema: &SchemaRef, validated: &mut ValidatedTablePro
     if schema_contains_non_null_fields(schema) {
         add_feature_to_lists(
             TableFeature::Invariants,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+    }
+}
+
+#[cfg(feature = "nanosecond-timestamps")]
+/// Conditionally adds the `timestampNanos` and `timestampNtz` features to the protocol when the
+/// schema contains TimestampNanos columns anywhere in the schema tree (top-level, nested structs,
+/// arrays, maps).
+fn maybe_enable_timestamp_nanos(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
+    if schema_contains_timestamp_nanos(schema) {
+        add_feature_to_lists(
+            TableFeature::TimestampNanos,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+        add_feature_to_lists(
+            TableFeature::TimestampWithoutTimezone,
             &mut validated.reader_features,
             &mut validated.writer_features,
         );
@@ -1147,6 +1168,10 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
         maybe_enable_timestamp_ntz(&effective_schema, &mut validated);
         maybe_enable_collations(&effective_schema, &mut validated);
         maybe_enable_invariants(&effective_schema, &mut validated);
+
+        // Auto-enable timestampNanos feature if schema contains TimestampNanos columns
+        #[cfg(feature = "nanosecond-timestamps")]
+        maybe_enable_timestamp_nanos(&effective_schema, &mut validated);
 
         // Property-driven auto-enablement: check enablement properties
         maybe_auto_enable_property_driven_features(&mut validated);

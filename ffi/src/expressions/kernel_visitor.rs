@@ -387,6 +387,87 @@ pub extern "C" fn visit_expression_literal_timestamp(
     wrap_expression(state, lit(Scalar::Timestamp(value)))
 }
 
+/// Visit a timestamp literal expression 'value' (i64 representing nanoseconds since unix epoch)
+///
+/// Returns an error if kernel was not built with the `nanosecond-timestamps` feature.
+///
+/// # Safety
+///
+/// `error_allocators` must be non-null, aligned, and point to an initialized [`ErrorAllocators`]
+/// for this call. Its callbacks and context must satisfy [`ErrorAllocators`]'s requirements
+/// until this call returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visit_expression_literal_timestamp_nanos(
+    state: &mut KernelExpressionVisitorState,
+    value: i64,
+    error_allocators: *const ErrorAllocators,
+) -> ExternResult<usize> {
+    let result = visit_expression_literal_timestamp_nanos_impl(state, value);
+    unsafe { result.into_extern_result(&*error_allocators) }
+}
+
+#[cfg(feature = "nanosecond-timestamps")]
+fn visit_expression_literal_timestamp_nanos_impl(
+    state: &mut KernelExpressionVisitorState,
+    value: i64,
+) -> KernelResult<usize> {
+    Ok(wrap_expression(
+        state,
+        Expression::literal(Scalar::TimestampNanos(value)),
+    ))
+}
+
+#[cfg(not(feature = "nanosecond-timestamps"))]
+fn visit_expression_literal_timestamp_nanos_impl(
+    _state: &mut KernelExpressionVisitorState,
+    _value: i64,
+) -> KernelResult<usize> {
+    Err(delta_kernel::KernelError::unsupported(
+        "`nanosecond-timestamps` feature not enabled in delta-kernel",
+    ))
+}
+
+/// Visit a timestamp literal expression 'value' (i64 representing nanoseconds since
+/// unix epoch, with no timezone)
+///
+/// Returns an error if kernel was not built with the `nanosecond-timestamps` feature.
+///
+/// # Safety
+///
+/// `error_allocators` must be non-null, aligned, and point to an initialized [`ErrorAllocators`]
+/// for this call. Its callbacks and context must satisfy [`ErrorAllocators`]'s requirements
+/// until this call returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visit_expression_literal_timestamp_nanos_ntz(
+    state: &mut KernelExpressionVisitorState,
+    value: i64,
+    error_allocators: *const ErrorAllocators,
+) -> ExternResult<usize> {
+    let result = visit_expression_literal_timestamp_nanos_ntz_impl(state, value);
+    unsafe { result.into_extern_result(&*error_allocators) }
+}
+
+#[cfg(feature = "nanosecond-timestamps")]
+fn visit_expression_literal_timestamp_nanos_ntz_impl(
+    state: &mut KernelExpressionVisitorState,
+    value: i64,
+) -> KernelResult<usize> {
+    Ok(wrap_expression(
+        state,
+        Expression::literal(Scalar::TimestampNanosNtz(value)),
+    ))
+}
+
+#[cfg(not(feature = "nanosecond-timestamps"))]
+fn visit_expression_literal_timestamp_nanos_ntz_impl(
+    _state: &mut KernelExpressionVisitorState,
+    _value: i64,
+) -> KernelResult<usize> {
+    Err(delta_kernel::KernelError::unsupported(
+        "`nanosecond-timestamps` feature not enabled in delta-kernel",
+    ))
+}
+
 /// visit a timestamp_ntz literal expression 'value' (i64 representing microseconds since unix
 /// epoch)
 #[unsafe(no_mangle)]
@@ -466,7 +547,7 @@ fn visit_expression_literal_decimal_impl(
 
 /// Type tag for null literal construction via FFI. Identifies the data type of a typed null.
 ///
-/// Most primitive types use fixed discriminants 0-14. Decimal uses 12 and requires additional
+/// Primitive types use fixed discriminants. Decimal uses 12 and requires additional
 /// precision/scale parameters. Non-primitive types (struct, array, map, variant) and the `void`
 /// primitive use the [`NonPrimitive`](Self::NonPrimitive) sentinel because they cannot be
 /// reconstructed from a type tag alone.
@@ -509,6 +590,13 @@ pub(crate) enum NullTypeTag {
     IntervalYearMonth = 13,
     /// Null of type `interval day to second` (signed microsecond duration).
     IntervalDayTime = 14,
+    // Not gated on `nanosecond-timestamps`, so these discriminants stay reserved and the C enum
+    // is identical with or without the feature. Without it, building a null from these tags
+    // returns an error.
+    /// EXPERIMENTAL. Null of type `timestamp_ltz(9)` (nanoseconds since epoch, UTC-adjusted).
+    TimestampNanos = 15,
+    /// EXPERIMENTAL. Null of type `timestamp_ntz(9)` (nanoseconds since epoch, no timezone).
+    TimestampNanosNtz = 16,
     /// Sentinel for non-primitive null types (struct, array, map, variant) and void. Emitted by
     /// the kernel-to-engine visitor when the null's type cannot be reconstructed from a compact
     /// tag. Engines that receive this tag should use opaque expressions or a schema visitor to
@@ -539,6 +627,8 @@ impl TryFrom<u8> for NullTypeTag {
             12 => Ok(Self::Decimal),
             13 => Ok(Self::IntervalYearMonth),
             14 => Ok(Self::IntervalDayTime),
+            15 => Ok(Self::TimestampNanos),
+            16 => Ok(Self::TimestampNanosNtz),
             255 => Ok(Self::NonPrimitive),
             other => Err(delta_kernel::KernelError::generic(format!(
                 "Unrecognized null type tag: {other}"
@@ -567,6 +657,10 @@ impl NullTypeTag {
                 PrimitiveType::Date => (Self::Date, 0, 0),
                 PrimitiveType::Timestamp => (Self::Timestamp, 0, 0),
                 PrimitiveType::TimestampNtz => (Self::TimestampNtz, 0, 0),
+                #[cfg(feature = "nanosecond-timestamps")]
+                PrimitiveType::TimestampNanos => (Self::TimestampNanos, 0, 0),
+                #[cfg(feature = "nanosecond-timestamps")]
+                PrimitiveType::TimestampNanosNtz => (Self::TimestampNanosNtz, 0, 0),
                 PrimitiveType::IntervalYearMonth(_) => (Self::IntervalYearMonth, 0, 0),
                 PrimitiveType::IntervalDayTime(_) => (Self::IntervalDayTime, 0, 0),
                 PrimitiveType::Decimal(dt) => (Self::Decimal, dt.precision(), dt.scale()),
@@ -610,6 +704,18 @@ impl NullTypeTag {
             Self::Date => Ok(DataType::DATE),
             Self::Timestamp => Ok(DataType::TIMESTAMP),
             Self::TimestampNtz => Ok(DataType::TIMESTAMP_NTZ),
+            #[cfg(not(feature = "nanosecond-timestamps"))]
+            Self::TimestampNanos => Err(delta_kernel::KernelError::unsupported(
+                "`nanosecond-timestamps` feature not enabled in delta-kernel",
+            )),
+            #[cfg(feature = "nanosecond-timestamps")]
+            Self::TimestampNanos => Ok(DataType::TIMESTAMP_NANOS),
+            #[cfg(not(feature = "nanosecond-timestamps"))]
+            Self::TimestampNanosNtz => Err(delta_kernel::KernelError::unsupported(
+                "`nanosecond-timestamps` feature not enabled in delta-kernel",
+            )),
+            #[cfg(feature = "nanosecond-timestamps")]
+            Self::TimestampNanosNtz => Ok(DataType::TIMESTAMP_NANOS_NTZ),
             Self::IntervalYearMonth => Ok(DataType::INTERVAL_YEAR_MONTH),
             Self::IntervalDayTime => Ok(DataType::INTERVAL_DAY_TIME),
             Self::Decimal => Ok(DataType::Primitive(PrimitiveType::decimal(
@@ -918,6 +1024,8 @@ mod tests {
 
     use super::*;
     use crate::expressions::FfiMapToStructOptions;
+    #[cfg(not(feature = "nanosecond-timestamps"))]
+    use crate::ffi_test_utils::assert_extern_result_error_contains;
 
     #[rstest]
     #[case::default(None)]
@@ -1051,8 +1159,72 @@ mod tests {
     #[case(NullTypeTag::TimestampNtz, DataType::TIMESTAMP_NTZ)]
     #[case(NullTypeTag::IntervalYearMonth, DataType::INTERVAL_YEAR_MONTH)]
     #[case(NullTypeTag::IntervalDayTime, DataType::INTERVAL_DAY_TIME)]
+    #[cfg_attr(
+        feature = "nanosecond-timestamps",
+        case(NullTypeTag::TimestampNanos, DataType::TIMESTAMP_NANOS)
+    )]
+    #[cfg_attr(
+        feature = "nanosecond-timestamps",
+        case(NullTypeTag::TimestampNanosNtz, DataType::TIMESTAMP_NANOS_NTZ)
+    )]
     fn to_data_type_primitive(#[case] tag: NullTypeTag, #[case] expected: DataType) {
         assert_eq!(tag.to_data_type(0, 0).unwrap(), expected);
+    }
+
+    #[cfg(not(feature = "nanosecond-timestamps"))]
+    #[rstest]
+    fn to_data_type_timestamp_nanos_requires_feature(
+        #[values(NullTypeTag::TimestampNanos, NullTypeTag::TimestampNanosNtz)] tag: NullTypeTag,
+    ) {
+        let error = tag.to_data_type(0, 0).unwrap_err();
+        assert!(
+            matches!(
+                error.without_backtrace(),
+                delta_kernel::KernelError::Unsupported(_)
+            ),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("nanosecond-timestamps"),
+            "{error}"
+        );
+    }
+
+    type VisitTimestampNanosFn = unsafe extern "C" fn(
+        &mut KernelExpressionVisitorState,
+        i64,
+        *const ErrorAllocators,
+    ) -> ExternResult<usize>;
+
+    #[cfg(feature = "nanosecond-timestamps")]
+    #[rstest]
+    #[case(visit_expression_literal_timestamp_nanos, Scalar::TimestampNanos(-123))]
+    #[case(visit_expression_literal_timestamp_nanos_ntz, Scalar::TimestampNanosNtz(-123))]
+    fn timestamp_nanos_literal_visitors_build_nanos_scalars(
+        #[case] visit: VisitTimestampNanosFn,
+        #[case] expected: Scalar,
+    ) {
+        let mut state = KernelExpressionVisitorState::default();
+        let id = ok_or_panic(unsafe { visit(&mut state, -123, &TEST_ERROR_ALLOCATORS) });
+        let expr = unwrap_kernel_expression(&mut state, id).unwrap();
+        assert_eq!(expr, lit(expected));
+    }
+
+    #[cfg(not(feature = "nanosecond-timestamps"))]
+    #[rstest]
+    fn timestamp_nanos_literal_visitors_require_feature(
+        #[values(
+            visit_expression_literal_timestamp_nanos,
+            visit_expression_literal_timestamp_nanos_ntz
+        )]
+        visit: VisitTimestampNanosFn,
+    ) {
+        let mut state = KernelExpressionVisitorState::default();
+        assert_extern_result_error_contains(
+            unsafe { visit(&mut state, -123, &TEST_ERROR_ALLOCATORS) },
+            FFIKernelError::UnsupportedError,
+            "nanosecond-timestamps",
+        );
     }
 
     #[test]
@@ -1115,13 +1287,15 @@ mod tests {
     #[case(12, NullTypeTag::Decimal)]
     #[case(13, NullTypeTag::IntervalYearMonth)]
     #[case(14, NullTypeTag::IntervalDayTime)]
+    #[case(15, NullTypeTag::TimestampNanos)]
+    #[case(16, NullTypeTag::TimestampNanosNtz)]
     #[case(255, NullTypeTag::NonPrimitive)]
     fn try_from_u8_valid(#[case] value: u8, #[case] expected: NullTypeTag) {
         assert_eq!(NullTypeTag::try_from(value).unwrap(), expected);
     }
 
     #[rstest]
-    #[case(15)]
+    #[case(17)]
     #[case(42)]
     #[case(254)]
     fn try_from_u8_invalid(#[case] value: u8) {
@@ -1147,7 +1321,7 @@ mod tests {
     #[test]
     fn visit_null_unrecognized_tag_returns_error() {
         let mut state = KernelExpressionVisitorState::default();
-        assert!(visit_expression_literal_null_impl(&mut state, 15, 0, 0).is_err());
+        assert!(visit_expression_literal_null_impl(&mut state, 17, 0, 0).is_err());
     }
 
     #[test]
