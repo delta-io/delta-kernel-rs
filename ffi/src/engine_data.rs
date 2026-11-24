@@ -13,13 +13,15 @@ use delta_kernel::arrow::array::{
 };
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
+#[cfg(feature = "default-engine-base")]
+use delta_kernel_ffi_macros::ffi_export;
 
 use super::handle::Handle;
 use crate::ExclusiveEngineData;
 #[cfg(feature = "default-engine-base")]
 use crate::error::ErrorAllocators;
 #[cfg(feature = "default-engine-base")]
-use crate::{ExternResult, IntoExternResult, SharedExternEngine};
+use crate::{ExternResult, SharedExternEngine};
 
 /// Get the number of rows in an engine data
 ///
@@ -102,6 +104,7 @@ impl ArrowFFIData {
 /// data_handle must be a valid ExclusiveEngineData as read by the
 /// [`delta_kernel_default_engine::DefaultEngine`] obtained from `get_default_engine`.
 #[cfg(feature = "default-engine-base")]
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_raw_arrow_data(
     data: Handle<ExclusiveEngineData>,
@@ -109,8 +112,7 @@ pub unsafe extern "C" fn get_raw_arrow_data(
 ) -> ExternResult<*mut ArrowFFIData> {
     // TODO(frj): This consumes the handle. Is that what we really want?
     let data = unsafe { data.into_inner() };
-    let result = get_raw_arrow_data_impl(data);
-    unsafe { result.into_extern_result(&engine.as_ref()) }
+    get_raw_arrow_data_impl(data)
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -160,16 +162,14 @@ pub unsafe extern "C" fn free_arrow_ffi_data(result: *mut ArrowFFIData) {
 /// - `schema` must be a valid pointer to a FFI_ArrowSchema
 /// - `error_allocators` must satisfy the callback table requirements above
 #[cfg(feature = "default-engine-base")]
+#[ffi_export(error_allocator = unsafe { &*error_allocators })]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_engine_data(
     array: FFI_ArrowArray,
     schema: &FFI_ArrowSchema,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<Handle<ExclusiveEngineData>> {
-    unsafe {
-        let result = get_engine_data_impl(array, schema);
-        result.into_extern_result(&*error_allocators)
-    }
+    unsafe { get_engine_data_impl(array, schema) }
 }
 
 #[cfg(feature = "default-engine-base")]

@@ -54,7 +54,7 @@ use url::Url;
 use crate::delta_types::{FfiColumnName, FfiNullableStringMap};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::engine_funcs::FileMeta;
-use crate::error::{ExternResult, IntoExternResult};
+use crate::error::ExternResult;
 use crate::handle::Handle;
 use crate::scan::EngineSchema;
 use crate::schema_visitor::{KernelSchemaVisitorState, extract_kernel_schema};

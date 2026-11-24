@@ -9,10 +9,10 @@ use std::os::raw::c_int;
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::transaction::Transaction;
 use delta_kernel::{KernelError, KernelResult};
-use delta_kernel_ffi_macros::handle_descriptor;
+use delta_kernel_ffi_macros::{ffi_export, handle_descriptor};
 
 use super::ExclusiveUpdateTableTransaction;
-use crate::error::{ExternResult, IntoExternResult};
+use crate::error::ExternResult;
 use crate::handle::Handle;
 use crate::scan::SharedScanMetadataIterator;
 use crate::{KernelStringSlice, SharedExternEngine, TryFromStringSlice};
@@ -129,6 +129,7 @@ impl TryFrom<c_int> for KernelDvStorageType {
 /// # Safety
 ///
 /// `path_or_inline_dv` and `engine` must be valid. Both are borrowed for this call.
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dv_descriptor_new(
     storage_type: c_int,
@@ -139,9 +140,8 @@ pub unsafe extern "C" fn dv_descriptor_new(
     cardinality: i64,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveDvDescriptor>> {
-    let engine = unsafe { engine.as_ref() };
     let path = unsafe { TryFromStringSlice::try_from_slice(&path_or_inline_dv) };
-    let result = KernelDvStorageType::try_from(storage_type).and_then(|storage_type| {
+    KernelDvStorageType::try_from(storage_type).and_then(|storage_type| {
         dv_descriptor_new_impl(
             storage_type,
             path,
@@ -150,8 +150,7 @@ pub unsafe extern "C" fn dv_descriptor_new(
             size_in_bytes,
             cardinality,
         )
-    });
-    unsafe { result.into_extern_result(&engine) }
+    })
 }
 
 fn dv_descriptor_new_impl(
@@ -186,6 +185,7 @@ fn dv_descriptor_new_impl(
 ///
 /// All handles and `data_file_path` must be valid. This call mutably borrows `map`, borrows
 /// `engine` and `data_file_path`, and unconditionally consumes `descriptor`, including on error.
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dv_descriptor_map_insert(
     mut map: Handle<ExclusiveDvDescriptorMap>,
@@ -194,11 +194,9 @@ pub unsafe extern "C" fn dv_descriptor_map_insert(
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<bool> {
     let map_ref = unsafe { map.as_mut() };
-    let engine_ref = unsafe { engine.as_ref() };
     let descriptor = unsafe { descriptor.into_inner() };
     let path_result = unsafe { TryFromStringSlice::try_from_slice(&data_file_path) };
-    let result = dv_descriptor_map_insert_impl(map_ref, path_result, *descriptor).map(|_| true);
-    unsafe { result.into_extern_result(&engine_ref) }
+    dv_descriptor_map_insert_impl(map_ref, path_result, *descriptor).map(|_| true)
 }
 
 fn dv_descriptor_map_insert_impl(
@@ -237,6 +235,7 @@ fn dv_descriptor_map_insert_impl(
 /// All handles must be valid. This call mutably borrows `txn`, borrows `engine`, and
 /// unconditionally consumes both `dv_map` and `scan_iter`, including on error. Do not use or free
 /// either consumed handle afterward. The caller must eventually commit or free `txn`.
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_update_deletion_vectors(
     mut txn: Handle<ExclusiveUpdateTableTransaction>,
@@ -247,10 +246,7 @@ pub unsafe extern "C" fn update_table_txn_update_deletion_vectors(
     let txn_ref = unsafe { txn.as_mut() };
     let dv_map = unsafe { dv_map.into_inner() };
     let scan_iter = unsafe { scan_iter.into_inner() };
-    let engine_ref = unsafe { engine.as_ref() };
-    let result =
-        update_table_txn_update_deletion_vectors_impl(txn_ref, *dv_map, &scan_iter).map(|_| true);
-    unsafe { result.into_extern_result(&engine_ref) }
+    update_table_txn_update_deletion_vectors_impl(txn_ref, *dv_map, &scan_iter).map(|_| true)
 }
 
 fn update_table_txn_update_deletion_vectors_impl(

@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
 use delta_kernel::{KernelResult, Snapshot};
+use delta_kernel_ffi_macros::ffi_export;
 
 use crate::error::ExternResult;
 use crate::handle::Handle;
 use crate::transaction::ExclusiveUpdateTableTransactionBuilder;
 use crate::{
-    ExternEngine, IntoExternResult, KernelStringSlice, OptionalValue, SharedExternEngine,
-    SharedSnapshot, TryFromStringSlice,
+    ExternEngine, KernelStringSlice, OptionalValue, SharedExternEngine, SharedSnapshot,
+    TryFromStringSlice,
 };
 
 /// Associates an app_id and version with a transaction. These will be applied to the table on
@@ -20,6 +21,7 @@ use crate::{
 /// `builder` and `engine` must be [valid][Handle#Validity] handles, and `app_id` must be a valid
 /// string slice. This call borrows `engine` and `app_id` and unconditionally consumes `builder`,
 /// including on error.
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_builder_with_transaction_id(
     builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
@@ -27,12 +29,9 @@ pub unsafe extern "C" fn update_table_txn_builder_with_transaction_id(
     version: i64,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
-    let builder = unsafe { *builder.into_inner() };
-    let engine = unsafe { engine.as_ref() };
+    let builder = *unsafe { builder.into_inner() };
     let app_id_res: KernelResult<String> = unsafe { TryFromStringSlice::try_from_slice(&app_id) };
-    let result =
-        app_id_res.map(|app_id| Box::new(builder.with_transaction_id(app_id, version)).into());
-    unsafe { result.into_extern_result(&engine) }
+    app_id_res.map(|app_id| Box::new(builder.with_transaction_id(app_id, version)).into())
 }
 
 /// Retrieves the version associated with an app_id from a snapshot.
@@ -43,6 +42,7 @@ pub unsafe extern "C" fn update_table_txn_builder_with_transaction_id(
 /// # Safety
 /// Caller must ensure [valid][Handle#Validity] handles are provided for snapshot and engine. The
 /// `app_id` string slice must be valid.
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_app_id_version(
     snapshot: Handle<SharedSnapshot>,
@@ -53,8 +53,7 @@ pub unsafe extern "C" fn get_app_id_version(
     let engine = unsafe { engine.as_ref() };
     let app_id_res = unsafe { String::try_from_slice(&app_id) };
 
-    let result = get_app_id_version_impl(snapshot, app_id_res, engine).map(OptionalValue::from);
-    unsafe { result.into_extern_result(&engine) }
+    get_app_id_version_impl(snapshot, app_id_res, engine).map(OptionalValue::from)
 }
 
 fn get_app_id_version_impl(
