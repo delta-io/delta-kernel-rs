@@ -89,13 +89,12 @@ use crate::{
 /// not restrict handler I/O or explicitly requested plan execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanExecutorCapabilities {
-    /// Supports I/O operations and general relational plans, including protocol and metadata
-    /// replay.
+    /// Supports I/O operations and general relational plans.
     Full,
     /// Supports I/O operations and file-scan plans.
     ///
     /// This includes single-node JSON and Parquet scans and empty [`ir::nodes::Values`] plans
-    /// produced for empty reads. Kernel replays protocol and metadata through imperative handlers.
+    /// produced for empty reads.
     IoOnly,
 }
 

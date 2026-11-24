@@ -7,8 +7,7 @@ use crate::{Engine, KernelError, KernelResult};
 
 /// Executes I/O operations and file-scan plans through [`SyncPlanExecutor`].
 ///
-/// Disables declarative protocol and metadata replay and rejects relational plans so tests detect
-/// incorrect P&M dispatch.
+/// Rejects relational plans so tests detect execution beyond the declared I/O-only capabilities.
 pub(crate) struct IOOnlyPlanExecutor(pub SyncPlanExecutor);
 
 impl PlanExecutor for IOOnlyPlanExecutor {
