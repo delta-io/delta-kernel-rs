@@ -33,7 +33,7 @@ use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
 #[cfg(feature = "declarative-plans")]
-use crate::plans::{IoOperation, Operation, ir::nodes::FileType};
+use crate::plans::{IoOperation, Operation};
 use crate::schema::{DataType as KernelDataType, StructField, schema_ref};
 use crate::table_features::TableFeature;
 use crate::transaction::UpdateTableOperation;
@@ -65,7 +65,7 @@ fn write_v1_checkpoint(
         let writer = snapshot.clone().create_checkpoint_writer(engine)?;
         let executor = engine.require_plan_executor()?;
         let result = executor.execute_op(Operation::QueryPlan(
-            writer.declarative_checkpoint_plan(engine, FileType::Parquet)?,
+            writer.declarative_checkpoint_plan(engine)?,
         ))?;
         let bytes = writer.last_checkpoint_bytes_from_result(result)?;
         executor

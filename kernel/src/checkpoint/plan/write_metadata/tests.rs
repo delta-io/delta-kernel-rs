@@ -6,7 +6,7 @@ use rstest::rstest;
 use serde_json::{Value, json};
 use url::Url;
 
-use super::{CHECKPOINT_SCHEMA_THRESHOLD, checkpoint_schema_json};
+use super::CHECKPOINT_SCHEMA_THRESHOLD;
 use crate::arrow::array::StringArray;
 use crate::arrow::record_batch::RecordBatch;
 use crate::checkpoint::CheckpointWriter;
@@ -20,7 +20,7 @@ use crate::engine::sync::SyncEngine;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::path::ParsedLogPath;
-use crate::plans::ir::nodes::{FILE_META_SCHEMA, FileType, Operator};
+use crate::plans::ir::nodes::{FILE_META_SCHEMA, Operator};
 use crate::plans::{IoOperation, Operation, PlanResult};
 use crate::schema::{DataType, StructField, StructType, schema, schema_ref};
 use crate::transaction::UpdateTableOperation;
@@ -32,6 +32,7 @@ use crate::{
 
 fn checkpoint_table(
     state: &str,
+    oversized_schema: bool,
 ) -> Result<(TestTable, SnapshotRef, SyncEngine), Box<dyn std::error::Error>> {
     let log_state = if state == "empty" {
         LogState::with_latest_version(0)
@@ -39,11 +40,20 @@ fn checkpoint_table(
         LogState::with_latest_version(2)
             .maybe_with_checkpoint_at((state == "predecessor").then_some(1))
     };
-    let table = TestTableBuilder::new()
+    let builder = TestTableBuilder::new()
         .with_features(FeatureSet::new().domain_metadata())
         .with_log_state(log_state)
-        .with_data(1, 1)
-        .build()?;
+        .with_data(1, 1);
+    let builder = if oversized_schema {
+        let name = "x".repeat(CHECKPOINT_SCHEMA_THRESHOLD);
+        let schema = ::test_utils::table_builder::partitioned_schema();
+        let field = schema.field("part_long").unwrap().with_name(name.clone());
+        let schema = schema.add([field])?.project(&["value", name.as_str()])?;
+        builder.with_schema(schema).with_partition_columns([name])
+    } else {
+        builder
+    };
+    let table = builder.build()?;
     let engine = SyncEngine::new_with_store(table.store().clone());
     let mut snapshot = Snapshot::builder_for(table.table_root()).build(&engine)?;
     if state != "empty" {
@@ -111,13 +121,15 @@ fn reconciled_rows(writer: &CheckpointWriter, engine: &dyn Engine) -> KernelResu
 }
 
 #[rstest]
-#[case::empty("empty")]
-#[case::mixed("mixed")]
-#[case::predecessor("predecessor")]
+#[case::empty("empty", false)]
+#[case::mixed("mixed", false)]
+#[case::predecessor("predecessor", false)]
+#[case::oversized_schema("empty", true)]
 fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
     #[case] state: &str,
+    #[case] oversized_schema: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_table, snapshot, engine) = checkpoint_table(state)?;
+    let (_table, snapshot, engine) = checkpoint_table(state, oversized_schema)?;
     let writer = snapshot.clone().create_checkpoint_writer(&engine)?;
     let log = snapshot.log_segment().log_root.clone();
     let hint_path = log.join("_last_checkpoint")?;
@@ -137,7 +149,7 @@ fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
         .filter(|row| row.get("add").is_some())
         .count();
 
-    let plan = writer.declarative_checkpoint_plan(&engine, FileType::Parquet)?;
+    let plan = writer.declarative_checkpoint_plan(&engine)?;
     assert_eq!(
         plan.schema,
         schema_ref! {
@@ -146,8 +158,11 @@ fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
                 not_null "num_of_add_files": LONG,
                 not_null "size_in_bytes": LONG,
             }),
-            nullable "root": (FILE_META_SCHEMA.clone()),
-            nullable "checkpoint_schema": STRING,
+            nullable "root": (StructType::try_new(
+                FILE_META_SCHEMA.fields().cloned().chain([
+                    StructField::not_null("checkpoint_schema", DataType::STRING),
+                ]),
+            )?),
         },
     );
     let mut writes = plan.nodes.iter().filter_map(|node| match &node.op {
@@ -204,8 +219,12 @@ fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
     let reader = ParquetRecordBatchReaderBuilder::try_new(completed)?;
     let disk_schema = Arc::new(StructType::try_from_arrow(reader.schema().clone())?);
     assert_eq!(disk_schema, input_schema);
-    let returned_schema: StructType =
-        serde_json::from_str(root_row["checkpoint_schema"].as_str().unwrap())?;
+    let internal_schema = root["checkpoint_schema"].as_str().unwrap();
+    assert_eq!(
+        internal_schema.encode_utf16().count() > CHECKPOINT_SCHEMA_THRESHOLD,
+        oversized_schema,
+    );
+    let returned_schema: StructType = serde_json::from_str(internal_schema)?;
     assert_eq!(&returned_schema, disk_schema.as_ref());
     let DataType::Struct(remove) = disk_schema.field("remove").unwrap().data_type() else {
         panic!("remove must be a struct");
@@ -233,7 +252,7 @@ fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
             "parts": null,
             "sizeInBytes": descriptor.size,
             "numOfAddFiles": expected_adds,
-            "checkpointSchema": disk_schema,
+            "checkpointSchema": (!oversized_schema).then_some(&disk_schema),
             "checkpointFiles": [{
                 "path": descriptor.location.path_segments().unwrap().next_back().unwrap(),
                 "length": descriptor.size,
@@ -317,20 +336,10 @@ fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
     Ok(())
 }
 
-#[rstest]
-#[case::json(false, FileType::Json, "V1 checkpoints require Parquet")]
-#[case::v2(true, FileType::Parquet, "This plan requires a V1 checkpoint writer")]
-fn checkpoint_rejects_unsupported_format_and_table_before_engine_access(
-    #[case] v2: bool,
-    #[case] format: FileType,
-    #[case] expected_error: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+#[test]
+fn checkpoint_rejects_v2_before_engine_access() -> Result<(), Box<dyn std::error::Error>> {
     let table = TestTableBuilder::new()
-        .with_features(if v2 {
-            FeatureSet::new().v2_checkpoint()
-        } else {
-            FeatureSet::new()
-        })
+        .with_features(FeatureSet::new().v2_checkpoint())
         .build()?;
     let engine = SyncEngine::new_with_store(table.store().clone());
     let snapshot = Snapshot::builder_for(table.table_root()).build(&engine)?;
@@ -341,8 +350,8 @@ fn checkpoint_rejects_unsupported_format_and_table_before_engine_access(
         .collect::<KernelResult<Vec<_>>>()?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
     ::test_utils::assert_result_error_with_message(
-        writer.declarative_checkpoint_plan(&PanicEngine, format),
-        expected_error,
+        writer.declarative_checkpoint_plan(&PanicEngine),
+        "This plan requires a V1 checkpoint writer",
     );
     assert_eq!(
         engine
@@ -404,7 +413,7 @@ fn checkpoint_validates_add_count_against_crc(
     let result = engine
         .require_plan_executor()?
         .execute_op(Operation::QueryPlan(
-            writer.declarative_checkpoint_plan(&engine, FileType::Parquet)?,
+            writer.declarative_checkpoint_plan(&engine)?,
         ))?;
     let bytes = writer.last_checkpoint_bytes_from_result(result);
     if succeeds {
@@ -443,6 +452,7 @@ fn checkpoint_validates_add_count_against_crc(
 #[case::short_bytes([1, 0, 16], &["statistics", "root"], Some("Checkpoint byte count does not match root file"))]
 #[case::long_bytes([1, 0, 18], &["statistics", "root"], Some("Checkpoint byte count does not match root file"))]
 #[case::missing_root([1, 0, 17], &["statistics"], Some("Missing checkpoint root"))]
+#[case::missing_root_schema([1, 0, 17], &["statistics", "root_without_schema"], Some("Invalid checkpoint result row"))]
 #[case::duplicate_root([1, 0, 17], &["statistics", "root", "root"], Some("Duplicate checkpoint root"))]
 #[case::no_result_arm([1, 0, 17], &["statistics", "root", "empty"], Some("Invalid checkpoint result row"))]
 #[case::multiple_result_arms([1, 0, 17], &["statistics", "root", "overlapping"], Some("Invalid checkpoint result row"))]
@@ -463,10 +473,11 @@ fn checkpoint_statistics_decoder_validates_counts_and_root(
     #[case] arms: &[&str],
     #[case] expected_error: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_table, snapshot, engine) = checkpoint_table("empty")?;
+    let (_table, snapshot, engine) = checkpoint_table("empty", false)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
     let statistics = json!({"num_actions": counts[0], "num_of_add_files": counts[1], "size_in_bytes": counts[2]});
-    let root = json!({"location": writer.checkpoint_path()?, "size": 17, "last_modified": 19});
+    let root = json!({"location": writer.checkpoint_path()?, "size": 17, "last_modified": 19,
+        "checkpoint_schema": serde_json::to_string(&schema! { nullable "value": LONG })?});
     let rows = arms
         .iter()
         .filter(|arm| **arm != "late")
@@ -474,6 +485,11 @@ fn checkpoint_statistics_decoder_validates_counts_and_root(
             match *arm {
                 "statistics" => json!({"statistics": statistics}),
                 "root" => json!({"root": root}),
+                "root_without_schema" => {
+                    let mut partial = root.clone();
+                    partial.as_object_mut().unwrap().remove("checkpoint_schema");
+                    json!({"root": partial})
+                }
                 "empty" => json!({}),
                 "overlapping" => json!({"statistics": statistics, "root": root}),
                 "statistics_with_root_size" => {
@@ -483,7 +499,7 @@ fn checkpoint_statistics_decoder_validates_counts_and_root(
                     json!({"statistics": statistics, "root": {"last_modified": 19}})
                 }
                 "statistics_with_schema" => {
-                    json!({"statistics": statistics, "checkpoint_schema": "not JSON"})
+                    json!({"statistics": statistics, "root": {"checkpoint_schema": "not JSON"}})
                 }
                 "root_with_adds" => json!({"root": root, "statistics": {"num_of_add_files": 0}}),
                 "root_with_bytes" => json!({"root": root, "statistics": {"size_in_bytes": 17}}),
@@ -514,9 +530,7 @@ fn checkpoint_statistics_decoder_validates_counts_and_root(
             .to_string()
         })
         .collect::<Vec<_>>();
-    let schema = writer
-        .declarative_checkpoint_plan(&engine, FileType::Parquet)?
-        .schema;
+    let schema = writer.declarative_checkpoint_plan(&engine)?.schema;
     // Allow partial nested rows so malformed engine results reach the result visitor.
     let mut fields = Vec::new();
     for field in schema.fields() {
@@ -569,15 +583,13 @@ fn checkpoint_statistics_decoder_rejects_invalid_root(
     #[case] size: i64,
     #[case] expected_error: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_table, snapshot, engine) = checkpoint_table("empty")?;
+    let (_table, snapshot, engine) = checkpoint_table("empty", false)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
     let rows = [
         json!({"statistics":{"num_actions":1,"num_of_add_files":0,"size_in_bytes":17}}),
-        json!({"root":{"location":writer.snapshot.log_segment().log_root.join(path)?,"size":size,"last_modified":19}}),
+        json!({"root":{"location":writer.snapshot.log_segment().log_root.join(path)?,"size":size,"last_modified":19,"checkpoint_schema":serde_json::to_string(&schema! { nullable "value": LONG })?}}),
     ];
-    let schema = writer
-        .declarative_checkpoint_plan(&engine, FileType::Parquet)?
-        .schema;
+    let schema = writer.declarative_checkpoint_plan(&engine)?.schema;
     let batch = parse_json_impl(
         &StringArray::from(rows.map(|row| row.to_string()).to_vec()),
         schema,
@@ -608,6 +620,18 @@ fn checkpoint_schema_respects_length_limit(
         name,
         DataType::STRING,
     )])?);
-    assert_eq!(checkpoint_schema_json(&schema)?.is_some(), included);
+    let (_table, snapshot, engine) = checkpoint_table("empty", false)?;
+    let writer = snapshot.create_checkpoint_writer(&engine)?;
+    let bytes = writer.serialize_checkpoint_hint(
+        &crate::checkpoint::LastCheckpointHintStats {
+            num_actions: 1,
+            num_of_add_files: 0,
+            size_in_bytes: 17,
+        },
+        &FileMeta::new(writer.checkpoint_path()?, 19, 17),
+        schema.clone(),
+    )?;
+    let hint: LastCheckpointHint = serde_json::from_slice(&bytes)?;
+    assert_eq!(hint.checkpoint_schema, included.then_some(schema));
     Ok(())
 }

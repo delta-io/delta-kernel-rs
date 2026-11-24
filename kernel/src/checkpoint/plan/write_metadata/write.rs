@@ -2,19 +2,23 @@
 
 use std::sync::LazyLock;
 
-use super::{NUM_ACTIONS, NUM_ADDS, NUM_BYTES, STATISTICS_SCHEMA, checkpoint_schema_json};
+use super::{NUM_ACTIONS, NUM_ADDS, NUM_BYTES, STATISTICS_SCHEMA};
 use crate::checkpoint::{CheckpointWriter, LastCheckpointHintStats};
 use crate::engine_data::TypedGetData as _;
 use crate::expressions::{ColumnName, Expression as Expr, col, column_name, lit, null_lit};
-use crate::plans::ir::nodes::{Agg, FILE_META_SCHEMA, FileType, StatsAgg, WriteParquet};
+use crate::plans::ir::nodes::{Agg, FILE_META_SCHEMA, StatsAgg, WriteParquet};
 use crate::plans::{Plan, PlanBuilder, PlanResult};
 use crate::schema::{DataType, SchemaRef, lazy_schema_ref};
 use crate::{DeltaError, Engine, FileMeta, GetData, KernelError, KernelResult, Result, RowVisitor};
 
+static ROOT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    ..(FILE_META_SCHEMA.fields()),
+    not_null "checkpoint_schema": STRING,
+};
+
 static RESULT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     nullable "statistics": (STATISTICS_SCHEMA.clone()),
-    nullable "root": (FILE_META_SCHEMA.clone()),
-    nullable "checkpoint_schema": STRING,
+    nullable "root": (ROOT_SCHEMA.clone()),
 };
 
 impl CheckpointWriter {
@@ -22,23 +26,16 @@ impl CheckpointWriter {
     ///
     /// Counts cover the rows written, and the completed file descriptor supplies the byte size.
     /// Execute once and pass the complete result to [`Self::last_checkpoint_bytes_from_result`],
-    /// then atomically publish the returned `_last_checkpoint` bytes. V2 writers and non-Parquet
-    /// formats are rejected before planning reads.
-    pub fn declarative_checkpoint_plan(
-        &self,
-        engine: &dyn Engine,
-        format: FileType,
-    ) -> KernelResult<Plan> {
+    /// then atomically publish the returned `_last_checkpoint` bytes. V2 writers are rejected
+    /// before planning reads.
+    pub fn declarative_checkpoint_plan(&self, engine: &dyn Engine) -> KernelResult<Plan> {
         if self.schema_context.is_v2 {
             return Err(KernelError::unsupported(
                 "This plan requires a V1 checkpoint writer",
             ));
         }
-        if format != FileType::Parquet {
-            return Err(KernelError::unsupported("V1 checkpoints require Parquet"));
-        }
         let actions = self.checkpoint_actions(engine)?;
-        let checkpoint_schema = checkpoint_schema_json(actions.schema())?;
+        let checkpoint_schema = serde_json::to_string(actions.schema())?;
         let write = WriteParquet::new(actions.schema().clone(), self.checkpoint_path()?)
             .with_stats_agg([
                 StatsAgg::new(NUM_ACTIONS, Agg::count_star()),
@@ -46,22 +43,25 @@ impl CheckpointWriter {
             ]);
         let written = PlanBuilder::write_parquet([actions], write)?;
         let statistics = written.clone().project(
-            Expr::struct_from([col!(NUM_ACTIONS), col!(NUM_ADDS), col!("size")]),
-            STATISTICS_SCHEMA.clone(),
+            Expr::struct_from([
+                Expr::struct_from([col!(NUM_ACTIONS), col!(NUM_ADDS), col!("size")]),
+                null_lit(ROOT_SCHEMA.clone()),
+            ]),
+            RESULT_SCHEMA.clone(),
         )?;
         let root = written.project(
-            Expr::struct_from(
-                FILE_META_SCHEMA
-                    .fields()
-                    .map(|field| Expr::column([field.name()])),
-            ),
-            FILE_META_SCHEMA.clone(),
+            Expr::struct_from([
+                null_lit(STATISTICS_SCHEMA.clone()),
+                Expr::struct_from([
+                    col!("location"),
+                    col!("size"),
+                    col!("last_modified"),
+                    lit(checkpoint_schema),
+                ]),
+            ]),
+            RESULT_SCHEMA.clone(),
         )?;
-        PlanBuilder::union_all([
-            result_rows(statistics, "statistics", None)?,
-            result_rows(root, "root", checkpoint_schema)?,
-        ])?
-        .build()
+        PlanBuilder::union_all([statistics, root])?.build()
     }
 
     /// Consumes a complete checkpoint-plan result and serializes the `_last_checkpoint` hint.
@@ -100,43 +100,18 @@ impl CheckpointWriter {
             )
             .into());
         }
-        let root = rows
+        let (root, schema) = rows
             .root
             .ok_or_else(|| KernelError::checkpoint_write("Missing checkpoint root"))?;
-        let bytes = self.serialize_checkpoint_hint(&statistics, &root, rows.schema)?;
+        let bytes = self.serialize_checkpoint_hint(&statistics, &root, schema)?;
         Ok((root, statistics, bytes))
     }
-}
-
-fn result_rows(
-    input: PlanBuilder,
-    name: &str,
-    schema: Option<String>,
-) -> KernelResult<PlanBuilder> {
-    let expression = Expr::struct_from(RESULT_SCHEMA.fields().map(|field| {
-        if field.name() == name {
-            Expr::struct_from(
-                input
-                    .schema()
-                    .fields()
-                    .map(|field| Expr::column([field.name()])),
-            )
-        } else if field.name() == "checkpoint_schema" {
-            schema
-                .clone()
-                .map_or_else(|| null_lit(DataType::STRING), lit)
-        } else {
-            null_lit(field.data_type().clone())
-        }
-    }));
-    input.project(expression, RESULT_SCHEMA.clone())
 }
 
 #[derive(Default)]
 struct CheckpointResult {
     statistics: Option<LastCheckpointHintStats>,
-    root: Option<FileMeta>,
-    schema: Option<SchemaRef>,
+    root: Option<(FileMeta, SchemaRef)>,
 }
 
 impl RowVisitor for CheckpointResult {
@@ -149,7 +124,7 @@ impl RowVisitor for CheckpointResult {
                 column_name!("root.location"),
                 column_name!("root.size"),
                 column_name!("root.last_modified"),
-                column_name!("checkpoint_schema"),
+                column_name!("root.checkpoint_schema"),
             ]
         });
         (
@@ -200,17 +175,17 @@ impl RowVisitor for CheckpointResult {
                         ));
                     }
                 }
-                (None, None, None, Some(location), Some(size), Some(modified), schema) => {
+                (None, None, None, Some(location), Some(size), Some(modified), Some(schema)) => {
                     let root = FileMeta::new(
                         url::Url::parse(location)?,
                         modified,
                         size.try_into()
                             .map_err(|_| KernelError::checkpoint_write("Negative root size"))?,
                     );
-                    if self.root.replace(root).is_some() {
+                    let schema = serde_json::from_str(schema)?;
+                    if self.root.replace((root, schema)).is_some() {
                         return Err(KernelError::checkpoint_write("Duplicate checkpoint root"));
                     }
-                    self.schema = schema.map(serde_json::from_str).transpose()?;
                 }
                 _ => {
                     return Err(KernelError::checkpoint_write(

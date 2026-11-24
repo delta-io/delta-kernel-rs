@@ -27,7 +27,7 @@ impl CheckpointWriter {
         &self,
         stats: &LastCheckpointHintStats,
         root_file: &FileMeta,
-        checkpoint_schema: Option<SchemaRef>,
+        checkpoint_schema: SchemaRef,
     ) -> KernelResult<Vec<u8>> {
         if stats.num_actions < stats.num_of_add_files
             || stats.num_of_add_files < 0
@@ -62,7 +62,8 @@ impl CheckpointWriter {
             parts: None,
             size_in_bytes: Some(stats.size_in_bytes),
             num_of_add_files: Some(stats.num_of_add_files),
-            checkpoint_schema,
+            checkpoint_schema: checkpoint_schema_json(&checkpoint_schema)?
+                .map(|_| checkpoint_schema),
             checkpoint_files: Some(vec![CheckpointFileStatus {
                 path: root.filename,
                 length: root_size,
