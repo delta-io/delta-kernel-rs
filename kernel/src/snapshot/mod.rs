@@ -62,8 +62,6 @@ use crate::metrics::{
 };
 use crate::path::ParsedLogPath;
 #[cfg(feature = "declarative-plans")]
-use crate::plans::ir::nodes::FileType;
-#[cfg(feature = "declarative-plans")]
 use crate::plans::{IoOperation, Operation as PlanOperation, PlanBuilder, file_meta_from_batches};
 use crate::row_tracking::{ROW_TRACKING_DOMAIN_NAME, parse_row_tracking_high_water_mark};
 use crate::scan::ScanBuilder;
@@ -2037,7 +2035,7 @@ impl Snapshot {
         let write_result: Result<_> = (|| {
             #[cfg(feature = "declarative-plans")]
             if let Some(executor) = &executor {
-                let plan = writer.declarative_checkpoint_plan(engine, FileType::Parquet)?;
+                let plan = writer.declarative_checkpoint_plan(engine)?;
                 let result = executor.execute_op(PlanOperation::QueryPlan(plan))?;
                 let (file_meta, statistics, bytes) = writer.checkpoint_info_from_result(result)?;
                 hint_bytes = bytes;

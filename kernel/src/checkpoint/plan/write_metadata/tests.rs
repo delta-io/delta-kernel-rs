@@ -12,7 +12,6 @@ use crate::arrow::record_batch::RecordBatch;
 use crate::checkpoint::CheckpointWriter;
 use crate::committer::FileSystemCommitter;
 use crate::crc::{Crc, FileStats, FileStatsState};
-use crate::engine::PanicEngine;
 use crate::engine::arrow_conversion::TryFromArrow as _;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use crate::engine::arrow_utils::parse_json_impl;
