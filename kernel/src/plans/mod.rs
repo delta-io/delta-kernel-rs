@@ -169,9 +169,13 @@ pub trait PlanExecutor: AsAny {
     }
 }
 
-/// Typed execution helpers for concrete executors and [`dyn PlanExecutor`](PlanExecutor).
+/// Executes plans as typed Rust values for kernel consumers.
+///
+/// Use this extension with concrete executors or [`dyn PlanExecutor`](PlanExecutor) to decode
+/// terminal rows without writing visitors or getters. The output type supplies the schema,
+/// decoder, and row count requirements. The plan schema must match the requested type.
 pub trait PlanExecutorExt: PlanExecutor {
-    /// Executes a plan and decodes its requested output, checking schema and row counts.
+    /// Executes a plan for a kernel consumer and decodes its terminal rows into the requested type.
     ///
     /// A row requires exactly one result; an optional row allows at most one; vectors accept any
     /// count. Batches are decoded in order, stopping at the first error. A row or optional row

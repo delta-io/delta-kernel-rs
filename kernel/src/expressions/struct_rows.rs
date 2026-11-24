@@ -1,4 +1,26 @@
-//! Collection and cardinality rules for struct rows.
+//! Collects struct rows into typed Rust values without handwritten visitors or getters.
+//!
+//! [`TryFromStructRows`] accepts fallible [`StructData`] rows or engine batches and decodes each
+//! row through `TryFrom<StructData>`, often derived with `TryFromStructData`. A required value
+//! accepts exactly one row, `Option<T>` accepts at most one, and `Vec<T>` accepts any count.
+//! Collection stops at the first source, decoding, or row count error.
+//!
+//! ```rust
+//! # #![cfg(feature = "internal-api")]
+//! use delta_kernel::delta_kernel_derive::{IntoStructData, ToSchema, TryFromStructData};
+//! use delta_kernel::expressions::{StructData, TryFromStructRows};
+//!
+//! #[derive(Debug, PartialEq, ToSchema, IntoStructData, TryFromStructData)]
+//! struct Item {
+//!     id: i32,
+//! }
+//!
+//! let rows = vec![Item { id: 7 }, Item { id: 11 }]
+//!     .into_iter()
+//!     .map(|item| Ok(StructData::from(item)));
+//! let items = Vec::<Item>::collect_into(rows).unwrap();
+//! assert_eq!(items, vec![Item { id: 7 }, Item { id: 11 }]);
+//! ```
 
 use delta_kernel_derive::internal_api;
 
