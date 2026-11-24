@@ -31,6 +31,7 @@ use crate::{
 };
 
 fn checkpoint_table(
+    v2: bool,
     state: &str,
     oversized_schema: bool,
 ) -> Result<(TestTable, SnapshotRef, SyncEngine), Box<dyn std::error::Error>> {
@@ -40,8 +41,13 @@ fn checkpoint_table(
         LogState::with_latest_version(2)
             .maybe_with_checkpoint_at((state == "predecessor").then_some(1))
     };
+    let features = FeatureSet::new().domain_metadata();
     let builder = TestTableBuilder::new()
-        .with_features(FeatureSet::new().domain_metadata())
+        .with_features(if v2 {
+            features.v2_checkpoint()
+        } else {
+            features
+        })
         .with_log_state(log_state)
         .with_data(1, 1);
     let builder = if oversized_schema {
@@ -100,7 +106,13 @@ fn canonical_actions(mut rows: Vec<Value>) -> Vec<Value> {
 }
 
 fn reconciled_rows(writer: &CheckpointWriter, engine: &dyn Engine) -> KernelResult<Vec<Value>> {
-    let batches = writer
+    let mut reference = writer.clone();
+    reference.schema_context.stats_config.write_stats_as_struct = writer
+        .snapshot
+        .table_properties()
+        .checkpoint_write_stats_as_struct
+        .unwrap_or(true);
+    let batches = reference
         .checkpoint_data(engine)?
         .map(|batch| batch?.apply_selection_vector()?.try_into_record_batch())
         .collect::<KernelResult<Vec<_>>>()?;
@@ -113,6 +125,8 @@ fn reconciled_rows(writer: &CheckpointWriter, engine: &dyn Engine) -> KernelResu
                 if name == "remove" {
                     action.remove("stats");
                     action.remove("tags");
+                } else if !writer.schema_context.is_v2 {
+                    action.remove("stats_parsed");
                 }
             }
         }
@@ -121,26 +135,33 @@ fn reconciled_rows(writer: &CheckpointWriter, engine: &dyn Engine) -> KernelResu
 }
 
 #[rstest]
-#[case::empty("empty", false)]
-#[case::mixed("mixed", false)]
-#[case::predecessor("predecessor", false)]
-#[case::nullable_json_and_native_dv_stats("native_stats", false)]
-#[case::variant_native_and_json_stats("variant_stats", false)]
-#[case::oversized_schema("empty", true)]
+#[case::v1_empty(false, "empty", false)]
+#[case::v1_mixed(false, "mixed", false)]
+#[case::v1_predecessor(false, "predecessor", false)]
+#[case::v1_nullable_json_and_native_dv_stats(false, "native_stats", false)]
+#[case::v1_variant_native_and_json_stats(false, "variant_stats", false)]
+#[case::v2_empty(true, "empty", false)]
+#[case::v2_mixed(true, "mixed", false)]
+#[case::v2_predecessor(true, "predecessor", false)]
+#[case::v2_nullable_json_and_native_dv_stats(true, "native_stats", false)]
+#[case::v2_variant_native_and_json_stats(true, "variant_stats", false)]
+#[case::oversized_schema(false, "empty", true)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
+    #[case] v2: bool,
     #[case] state: &str,
     #[case] oversized_schema: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_table, snapshot, engine) = if matches!(state, "native_stats" | "variant_stats") {
         crate::checkpoint::plan::tests::checkpoint_representation_table(
+            v2,
             true,
             false,
             state == "variant_stats",
         )
         .await?
     } else {
-        checkpoint_table(state, oversized_schema)?
+        checkpoint_table(v2, state, oversized_schema)?
     };
     let writer = snapshot.clone().create_checkpoint_writer(&engine)?;
     let log = snapshot.log_segment().log_root.clone();
@@ -157,16 +178,24 @@ async fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
     let mut expected = reconciled_rows(&writer, &engine)?;
     assert_eq!(
         expected.len(),
-        match state {
+        (match state {
             "empty" => 2,
             "native_stats" | "variant_stats" => 5,
             _ => 6,
-        }
+        }) + usize::from(v2),
     );
     let expected_adds = expected
         .iter()
         .filter(|row| row.get("add").is_some())
         .count();
+    assert_eq!(
+        expected_adds,
+        match state {
+            "empty" => 0,
+            "native_stats" | "variant_stats" => 3,
+            _ => 1,
+        }
+    );
 
     let plan = writer.declarative_checkpoint_plan(&engine)?;
     assert_eq!(
@@ -245,11 +274,13 @@ async fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
     );
     let returned_schema: StructType = serde_json::from_str(internal_schema)?;
     assert_eq!(&returned_schema, disk_schema.as_ref());
-    assert!(
-        disk_schema
-            .field_at(&crate::expressions::column_name!("add.stats_parsed"))
-            .is_err()
-    );
+    if !v2 {
+        assert!(
+            disk_schema
+                .field_at(&crate::expressions::column_name!("add.stats_parsed"))
+                .is_err()
+        );
+    }
     let DataType::Struct(remove) = disk_schema.field("remove").unwrap().data_type() else {
         panic!("remove must be a struct");
     };
@@ -314,6 +345,15 @@ async fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
         }
         assert_eq!(expected_adds, 3);
     }
+    let checkpoint_metadata = actual
+        .iter()
+        .filter_map(|row| row.get("checkpointMetadata"))
+        .collect::<Vec<_>>();
+    assert_eq!(checkpoint_metadata.len(), usize::from(v2));
+    if let Some(metadata) = checkpoint_metadata.first() {
+        assert_eq!(metadata["version"].as_u64(), Some(snapshot.version()));
+    }
+    assert!(actual.iter().all(|row| row.get("sidecar").is_none()));
     for row in &actual {
         for name in ["add", "remove"] {
             if let Some(action) = row.get(name) {
@@ -345,6 +385,7 @@ async fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
         }),
     );
     let hint: LastCheckpointHint = serde_json::from_slice(&bytes)?;
+    assert!(hint.v2_checkpoint.is_none());
     assert!(hint.applies_to(&[ParsedLogPath::new(descriptor).unwrap()]));
     if let Some(previous) = previous_hint {
         assert_eq!(file_bytes(&engine, &hint_path)?, previous);
@@ -426,7 +467,6 @@ async fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
 }
 
 #[rstest]
-#[case::v2(true, false, "This plan requires a V1 checkpoint writer")]
 #[case::v1_structured_stats(false, true, "V1 checkpoint plans require JSON-only statistics")]
 fn checkpoint_rejects_unsupported_output_before_engine_access(
     #[case] v2: bool,
@@ -468,18 +508,27 @@ fn checkpoint_rejects_unsupported_output_before_engine_access(
 }
 
 #[rstest]
-#[case::missing(None, None, true)]
-#[case::matching(Some(1), Some(1), true)]
-#[case::too_few(Some(1), Some(0), false)]
-#[case::too_many(Some(1), Some(2), false)]
-#[case::stale(Some(0), Some(0), true)]
-#[case::indeterminate(Some(1), None, true)]
+#[case::v1_missing(false, None, None, true)]
+#[case::v1_matching(false, Some(1), Some(1), true)]
+#[case::v1_too_few(false, Some(1), Some(0), false)]
+#[case::v1_too_many(false, Some(1), Some(2), false)]
+#[case::v1_stale(false, Some(0), Some(0), true)]
+#[case::v1_indeterminate(false, Some(1), None, true)]
+#[case::v2_matching(true, Some(1), Some(1), true)]
+#[case::v2_too_many(true, Some(1), Some(2), false)]
+#[case::v2_indeterminate(true, Some(1), None, true)]
 fn checkpoint_validates_add_count_against_crc(
+    #[case] v2: bool,
     #[case] crc_version: Option<Version>,
     #[case] expected_adds: Option<i64>,
     #[case] succeeds: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let table = TestTableBuilder::new()
+        .with_features(if v2 {
+            FeatureSet::new().v2_checkpoint()
+        } else {
+            FeatureSet::new()
+        })
         .with_log_state(LogState::with_latest_version(1))
         .with_data(1, 1)
         .build()?;
@@ -577,7 +626,7 @@ fn checkpoint_statistics_decoder_validates_counts_and_root(
     #[case] arms: &[&str],
     #[case] expected_error: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_table, snapshot, engine) = checkpoint_table("empty", false)?;
+    let (_table, snapshot, engine) = checkpoint_table(false, "empty", false)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
     let statistics = json!({"num_actions": counts[0], "num_of_add_files": counts[1], "size_in_bytes": counts[2]});
     let root = json!({"location": writer.checkpoint_path()?, "size": 17, "last_modified": 19,
@@ -672,22 +721,31 @@ fn checkpoint_statistics_decoder_validates_counts_and_root(
 
 #[rstest]
 #[case::wrong_version(
+    false,
     "00000000000000000001.checkpoint.parquet",
     17,
     "Checkpoint root does not match this writer"
 )]
 #[case::wrong_directory(
+    false,
     "other/00000000000000000000.checkpoint.parquet",
     17,
     "Checkpoint root does not match this writer"
 )]
-#[case::negative_size("00000000000000000000.checkpoint.parquet", -1, "Negative root size")]
+#[case::negative_size(false, "00000000000000000000.checkpoint.parquet", -1, "Negative root size")]
+#[case::inline_v2_mismatched_bytes(
+    true,
+    "00000000000000000000.checkpoint.parquet",
+    16,
+    "Checkpoint byte count does not match root file"
+)]
 fn checkpoint_statistics_decoder_rejects_invalid_root(
+    #[case] v2: bool,
     #[case] path: &str,
     #[case] size: i64,
     #[case] expected_error: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_table, snapshot, engine) = checkpoint_table("empty", false)?;
+    let (_table, snapshot, engine) = checkpoint_table(v2, "empty", false)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
     let rows = [
         json!({"statistics":{"num_actions":1,"num_of_add_files":0,"size_in_bytes":17}}),
@@ -724,7 +782,7 @@ fn checkpoint_schema_respects_length_limit(
         name,
         DataType::STRING,
     )])?);
-    let (_table, snapshot, engine) = checkpoint_table("empty", false)?;
+    let (_table, snapshot, engine) = checkpoint_table(false, "empty", false)?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
     let bytes = writer.serialize_checkpoint_hint(
         &crate::checkpoint::LastCheckpointHintStats {
