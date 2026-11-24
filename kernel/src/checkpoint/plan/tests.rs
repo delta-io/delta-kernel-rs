@@ -15,10 +15,11 @@ use crate::action_reconciliation::file_metadata::{
 use crate::action_reconciliation::log_replay::ActionReconciliationProcessor;
 use crate::action_reconciliation::plan::VERSION;
 use crate::action_reconciliation::plan::action_set::ActionSet;
+use crate::actions::CHECKPOINT_METADATA_NAME;
 use crate::arrow::array::{AsArray as _, StringArray};
 use crate::arrow::compute::{filter_record_batch, is_not_null, is_null, or};
 use crate::arrow::record_batch::RecordBatch;
-use crate::checkpoint::CheckpointSpec;
+use crate::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use crate::engine::PanicEngine;
 use crate::engine::arrow_conversion::TryFromArrow as _;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
@@ -40,9 +41,12 @@ fn select_checkpoint_actions(
     batches
         .iter()
         .map(|batch| {
+            let include_metadata = actions == ActionSet::ALL
+                && batch.column_by_name(CHECKPOINT_METADATA_NAME).is_some();
             let selected = batch.project(
                 &actions
                     .output_action_names()
+                    .chain(include_metadata.then_some(CHECKPOINT_METADATA_NAME))
                     .map(|name| batch.schema().index_of(name).unwrap())
                     .collect::<Vec<_>>(),
             )?;
@@ -72,10 +76,11 @@ fn assert_checkpoint_plan(
     plan: Plan,
     actions: ActionSet,
     expected: &[RecordBatch],
+    is_v2: bool,
 ) -> KernelResult<Vec<RecordBatch>> {
     let schema = plan.schema.clone();
     let actual = execute(engine, plan)?;
-    let expected = checkpoint_reference_batches(engine, expected, actions)?;
+    let expected = checkpoint_reference_batches(engine, expected, actions, is_v2)?;
     assert_eq!(
         schema.as_ref(),
         &StructType::try_from_arrow(expected[0].schema())?
@@ -89,6 +94,7 @@ fn checkpoint_reference_batches(
     engine: &dyn Engine,
     batches: &[RecordBatch],
     actions: ActionSet,
+    is_v2: bool,
 ) -> KernelResult<Vec<RecordBatch>> {
     select_checkpoint_actions(batches, actions)?
         .into_iter()
@@ -97,9 +103,10 @@ fn checkpoint_reference_batches(
             let mut patch = ProjectionStructPatchBuilder::new(&input);
             if actions.live_adds {
                 patch = patch.replace_expr_at(["add"], "dataChange", lit(false));
-                if input
-                    .field_at(&crate::expressions::column_name!("add.stats_parsed"))
-                    .is_ok()
+                if !is_v2
+                    && input
+                        .field_at(&crate::expressions::column_name!("add.stats_parsed"))
+                        .is_ok()
                 {
                     patch = patch.drop_at(["add"], "stats_parsed");
                 }
@@ -124,9 +131,15 @@ fn checkpoint_reference_batches(
 #[case("partition_cm/name")]
 #[case("app-txn-no-checkpoint")]
 #[case("app-txn-checkpoint")]
+#[case("v2-checkpoints-parquet-with-sidecars")]
+#[case("v2-checkpoints-json-with-sidecars")]
+#[case("v2-checkpoints-parquet-without-sidecars")]
+#[case("v2-checkpoints-json-without-sidecars")]
 #[case("v1-single-part-struct-stats-only")]
 #[case("v1-multi-part-struct-stats-only")]
 #[case("v1-multi-part-partitioned-struct-stats-only")]
+#[case("v2-json-sidecars-struct-stats-only")]
+#[case("v2-parquet-sidecars-struct-stats-only")]
 fn checkpoint_plan_matches_existing_checkpoint_data(
     #[case] table: &str,
     #[values(false, true)] with_tail: bool,
@@ -170,11 +183,12 @@ fn checkpoint_plan_matches_existing_checkpoint_data(
         .checkpoint_data(engine.as_ref())?
         .map(|data| selected_batch(data?))
         .collect::<KernelResult<Vec<_>>>()?;
-    if writer
-        .snapshot
-        .table_properties()
-        .checkpoint_write_stats_as_struct
-        == Some(true)
+    if !writer.schema_context.is_v2
+        && writer
+            .snapshot
+            .table_properties()
+            .checkpoint_write_stats_as_struct
+            == Some(true)
     {
         ::test_utils::assert_result_error_with_message(
             writer.declarative_checkpoint_data_plan(&PanicEngine),
@@ -194,7 +208,13 @@ fn checkpoint_plan_matches_existing_checkpoint_data(
                 std::fs::remove_dir_all(sidecars)?;
             }
         }
-        assert_checkpoint_plan(engine.as_ref(), plan, actions, &expected)?;
+        assert_checkpoint_plan(
+            engine.as_ref(),
+            plan,
+            actions,
+            &expected,
+            writer.schema_context.is_v2,
+        )?;
     }
     Ok(())
 }
@@ -263,17 +283,24 @@ fn add(path: &str, dv_offset: Option<i32>) -> Value {
 }
 
 #[rstest]
-#[case::v1(32, false)]
-#[case::no_indexed_columns(0, false)]
-#[case::clustering_not_indexed(0, true)]
+#[case::v1(false, false, 32, false)]
+#[case::v2_inline(true, false, 32, false)]
+#[case::v2_sidecars(true, true, 32, false)]
+#[case::no_indexed_columns(false, false, 0, false)]
+#[case::clustering_not_indexed(false, false, 0, true)]
 #[tokio::test]
 async fn checkpoint_plan_reconciles_all_groups_and_retains_after_replay(
+    #[case] v2: bool,
+    #[case] sidecars: bool,
     #[case] indexed_columns: i32,
     #[case] clustered: bool,
     #[values(false, true)] structured_stats: bool,
     #[values(None, Some(100i64))] txn_cutoff: Option<i64>,
 ) -> KernelResult<(), Box<dyn std::error::Error>> {
-    let features = FeatureSet::new().deletion_vectors().domain_metadata();
+    let mut features = FeatureSet::new().deletion_vectors().domain_metadata();
+    if v2 {
+        features = features.v2_checkpoint();
+    }
     let builder = TestTableBuilder::new()
         .with_features(features)
         .with_table_config(
@@ -301,7 +328,15 @@ async fn checkpoint_plan_reconciles_all_groups_and_retains_after_replay(
         "maxValues":{"long_col":7},"nullCount":{"long_col":0}})
         .to_string()
     );
-    let spec = CheckpointSpec::V1;
+    let spec = if sidecars {
+        CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+            file_actions_per_sidecar_hint: Some(1),
+        })
+    } else if v2 {
+        CheckpointSpec::V2(V2CheckpointConfig::NoSidecar)
+    } else {
+        CheckpointSpec::V1
+    };
 
     metadata["id"] = json!("new");
     protocol["protocol"]["writerFeatures"]
@@ -362,7 +397,7 @@ async fn checkpoint_plan_reconciles_all_groups_and_retains_after_replay(
     assert_eq!(snapshot.log_segment().checkpoint_version, Some(1));
     let writer = snapshot.create_checkpoint_writer(&engine)?;
     let expected = existing_checkpoint_data(&writer, &engine, 100, txn_cutoff)?;
-    if structured_stats {
+    if !v2 && structured_stats {
         ::test_utils::assert_result_error_with_message(
             writer.declarative_checkpoint_data_plan(&PanicEngine),
             "V1 checkpoint plans require JSON-only statistics",
@@ -370,7 +405,7 @@ async fn checkpoint_plan_reconciles_all_groups_and_retains_after_replay(
         return Ok(());
     }
     // Fixed-cutoff checks exercise the shared retention expressions on fully replayed actions.
-    // The fixture comparisons above exercise the public factory with real cutoffs.
+    // The fixture comparisons above exercise the public V1 and V2 factories with real cutoffs.
     let plan = writer
         .metadata_planner(ActionSet::ALL)?
         .with_checkpoint_info(writer.snapshot.checkpoint_info(&engine)?)
@@ -381,7 +416,10 @@ async fn checkpoint_plan_reconciles_all_groups_and_retains_after_replay(
         ))?
         .project_patch(checkpoint_file_projection)?
         .build()?;
-    let actual = assert_checkpoint_plan(&engine, plan, ActionSet::ALL, &expected)?;
+    let actual = assert_checkpoint_plan(&engine, plan, ActionSet::ALL, &expected, v2)?;
+    if v2 {
+        return Ok(());
+    }
     let result = json_rows(&actual, true)?;
 
     // The relation is directly writable using the existing ParquetHandler. Reload the resulting
@@ -405,7 +443,8 @@ async fn checkpoint_plan_reconciles_all_groups_and_retains_after_replay(
             &checkpoint_reference_batches(
                 &engine,
                 &existing_checkpoint_data(&reloaded_writer, &engine, 100, txn_cutoff)?,
-                ActionSet::ALL
+                ActionSet::ALL,
+                false,
             )?,
             true
         )?,
@@ -415,6 +454,7 @@ async fn checkpoint_plan_reconciles_all_groups_and_retains_after_replay(
 }
 
 pub(super) async fn checkpoint_representation_table(
+    v2: bool,
     compatible: bool,
     write_struct: bool,
     with_variant: bool,
@@ -430,8 +470,13 @@ pub(super) async fn checkpoint_representation_table(
     } else {
         schema
     };
+    let features = FeatureSet::new().deletion_vectors();
     let table = TestTableBuilder::new()
-        .with_features(FeatureSet::new().deletion_vectors())
+        .with_features(if v2 {
+            features.v2_checkpoint()
+        } else {
+            features
+        })
         .with_schema(schema)
         .with_partition_columns(["part_long"])
         .with_table_config(
@@ -508,6 +553,9 @@ pub(super) async fn checkpoint_representation_table(
         )?
     };
     let mut input = vec![protocol.to_string(), metadata.to_string()];
+    if v2 {
+        input.push(json!({"checkpointMetadata":{"version":0}}).to_string());
+    }
     for (path, id) in [("native.parquet", 10), ("base.parquet", 20)] {
         let mut row = file(path, id);
         row["add"]["stats_parsed"] = if compatible {
@@ -575,13 +623,14 @@ pub(super) async fn checkpoint_representation_table(
 #[rstest]
 #[tokio::test]
 async fn checkpoint_uses_declared_metadata_representations(
+    #[values(false, true)] v2: bool,
     #[values(false, true)] compatible: bool,
     #[values(false, true)] write_json: bool,
     #[values(false, true)] write_struct: bool,
     #[values(false, true)] parsed_partitions: bool,
 ) -> KernelResult<(), Box<dyn std::error::Error>> {
     let (_table, snapshot, engine) =
-        checkpoint_representation_table(compatible, write_struct, false).await?;
+        checkpoint_representation_table(v2, compatible, write_struct, false).await?;
     let mut writer = snapshot.clone().create_checkpoint_writer(&engine)?;
     let shape = snapshot.checkpoint_info(&engine)?;
     let mut stats = if write_struct {
@@ -695,10 +744,13 @@ async fn checkpoint_uses_declared_metadata_representations(
             assert_eq!(row["add"].get("stats_parsed").is_some(), write_struct);
             if write_struct {
                 assert_eq!(row["add"]["stats_parsed"]["numRecords"], 10);
+                if row["add"]["path"] == "base.parquet" {
+                    assert_eq!(row["add"]["stats_parsed"]["minValues"]["value"], 200);
+                }
             }
         }
     }
-    if write_struct {
+    if !v2 && write_struct {
         ::test_utils::assert_result_error_with_message(
             writer.declarative_checkpoint_data_plan(&PanicEngine),
             "V1 checkpoint plans require JSON-only statistics",
@@ -708,11 +760,27 @@ async fn checkpoint_uses_declared_metadata_representations(
     let plan = writer.declarative_checkpoint_data_plan(&engine)?;
     let actual = execute(&engine, plan)?;
     if let Some(expected) = expected {
-        let expected = checkpoint_reference_batches(&engine, &expected, ActionSet::ALL)?;
-        let formatted = crate::arrow::util::pretty::pretty_format_batches(&expected)?.to_string();
-        let mut lines = formatted.lines().collect::<Vec<_>>();
-        ::test_utils::sort_lines!(lines);
-        ::test_utils::assert_batches_sorted_eq!(lines, &actual);
+        let expected = checkpoint_reference_batches(&engine, &expected, ActionSet::ALL, v2)?;
+        if v2 && write_json && write_struct {
+            let mut expected = json_rows(&expected, true)?;
+            for row in &mut expected {
+                if row["add"].is_null() {
+                    continue;
+                }
+                let json: Value = serde_json::from_str(row["add"]["stats"].as_str().unwrap())?;
+                for bound in ["minValues", "maxValues"] {
+                    row["add"]["stats_parsed"][bound]["value"] = json[bound]["value"].clone();
+                }
+            }
+            expected.sort_by_cached_key(Value::to_string);
+            assert_eq!(json_rows(&actual, true)?, expected);
+        } else {
+            let formatted =
+                crate::arrow::util::pretty::pretty_format_batches(&expected)?.to_string();
+            let mut lines = formatted.lines().collect::<Vec<_>>();
+            ::test_utils::sort_lines!(lines);
+            ::test_utils::assert_batches_sorted_eq!(lines, &actual);
+        }
     }
     let actual_rows = json_rows(&actual, true)?;
     for (path, id) in [
@@ -724,8 +792,18 @@ async fn checkpoint_uses_declared_metadata_representations(
             .iter()
             .find(|row| row["add"]["path"] == path)
             .unwrap();
-        assert!(row["add"].get("stats_parsed").is_none());
-        assert!(row["add"].get("partitionValues_parsed").is_none());
+        assert_eq!(row["add"].get("stats_parsed").is_some(), v2 && write_struct);
+        if v2 && write_struct {
+            let expected = if compatible && !write_json && id == 20 {
+                200
+            } else {
+                id
+            };
+            assert_eq!(row["add"]["stats_parsed"]["minValues"]["value"], expected);
+            assert_eq!(row["add"]["partitionValues_parsed"]["part_long"], id);
+        } else {
+            assert!(row["add"].get("partitionValues_parsed").is_none());
+        }
         if write_json {
             let stats: Value = serde_json::from_str(row["add"]["stats"].as_str().unwrap())?;
             assert_eq!(stats["minValues"]["value"], id);
@@ -743,6 +821,10 @@ async fn checkpoint_uses_declared_metadata_representations(
 }
 
 #[rstest]
+#[case("v2-checkpoints-json-with-sidecars")]
+#[case("v2-checkpoints-parquet-with-sidecars")]
+#[case("v2-checkpoints-json-without-sidecars")]
+#[case("v2-checkpoints-parquet-without-sidecars")]
 #[case("app-txn-checkpoint")]
 fn checkpoint_source_reads_requested_actions(
     #[case] table: &str,
