@@ -3,8 +3,7 @@
 Kernel emits most metrics as `tracing` spans. A connector installs `ReportGeneratorLayer`
 (`reporter.rs`), which turns each span carrying the `report` field into a `MetricEvent`
 (`events.rs`) and hands it to the connector's `MetricsReporter`. Kernel does no aggregation.
-Scan planning passes an explicit report and emits `ScanPlanGenerationCompleted` directly for every
-outcome.
+Scan planning builds an owned report locally and hands it to a completion span for every outcome.
 
 ## Two mechanisms
 
@@ -18,6 +17,12 @@ The difference is *when a metric's values are known*:
 `from_attrs` builds the event from a span's fields. It reads them with a `Visit` (the trait whose
 `record_*` methods receive one field at a time). Emit events run one `Visit` over the whole struct;
 span-based events reuse small per-field helpers like `MetricId::from_attrs`, each a `Visit` inside.
+
+Scan planning moves its completed report into the existing visitor on a short
+`scan.plan_generation_completed` span. The normal layer filtering and `on_close` delivery apply;
+the report is delivered after the extension lock is released. This handoff keeps the rich report
+intact without recording its fields individually. Closing the helper span preserves the planning
+duration already in the report.
 
 ## Failure events
 

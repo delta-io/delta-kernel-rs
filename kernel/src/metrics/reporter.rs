@@ -3,12 +3,14 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use tracing::field::{Field, Visit};
+use tracing::field::{Empty, Field, Visit};
 use tracing::span::{Attributes, Id, Record};
-use tracing::{Level, Span, Subscriber, event, warn};
-use tracing_subscriber::Layer;
+use tracing::{Level, Span, Subscriber, event, info_span, warn};
 use tracing_subscriber::layer::Context;
+use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::{Layer, Registry};
 
+use super::ScanPlanReport;
 use super::events::{
     CheckpointWriteSuccess, ChecksumWriteSuccess, CrcReadSuccess, DomainMetadataLoadSuccess,
     JsonReadCompleted, LastCheckpointReadCompleted, LogSegmentLoadSuccess, MetricEvent,
@@ -64,6 +66,7 @@ impl MetricsReporter for LoggingMetricsReporter {
 ///
 /// Typically added to a subscriber via
 /// [`super::WithMetricsReporterLayer::with_metrics_reporter_layer`].
+/// Scan-plan report handoff requires a subscriber backed by [`Registry`].
 #[derive(Debug)]
 pub struct ReportGeneratorLayer {
     reporter: Arc<dyn MetricsReporter>,
@@ -73,14 +76,6 @@ impl ReportGeneratorLayer {
     /// Create a new layer that forwards metric events to the given reporter.
     pub fn new(reporter: Arc<dyn MetricsReporter>) -> Self {
         Self { reporter }
-    }
-
-    #[allow(dead_code, reason = "Used by scan planning.")]
-    pub(crate) fn current_reporter() -> Option<Arc<dyn MetricsReporter>> {
-        tracing::dispatcher::get_default(|dispatch| {
-            let layer = dispatch.downcast_ref::<Self>()?;
-            Some(layer.reporter.clone())
-        })
     }
 
     /// Apply `record` to the visitor stashed on `span`, then drain its pending warnings. Warnings
@@ -102,6 +97,20 @@ impl ReportGeneratorLayer {
             warn!("{w}");
         }
     }
+}
+
+/// Hand an owned scan-plan report to the normal tracing completion path.
+#[allow(dead_code, reason = "Used by scan planning.")]
+pub(crate) fn emit_scan_plan_completed(report: ScanPlanReport) {
+    let span = info_span!("scan.plan_generation_completed", report = Empty);
+    let _ = span.with_subscriber(|(id, dispatch)| {
+        let registry = dispatch.downcast_ref::<Registry>()?;
+        let span = registry.span(id)?;
+        let mut extensions = span.extensions_mut();
+        let visitor = extensions.get_mut::<EventVisitor>()?;
+        visitor.event = Some(MetricEvent::ScanPlanGenerationCompleted(report));
+        Some(())
+    });
 }
 
 impl<S> Layer<S> for ReportGeneratorLayer
@@ -331,11 +340,13 @@ mod tests {
     use tracing::field::Empty;
     use tracing::subscriber::with_default;
     use tracing::{info, info_span, instrument};
+    use tracing_subscriber::filter::LevelFilter;
     use tracing_subscriber::fmt::layer;
-    use tracing_subscriber::layer::SubscriberExt as _;
-    use tracing_subscriber::registry;
+    use tracing_subscriber::layer::{Identity, SubscriberExt as _};
+    use tracing_subscriber::{Layer, Registry, registry, reload};
     use uuid::Uuid;
 
+    use super::{ReportGeneratorLayer, emit_scan_plan_completed};
     use crate::metrics::events::{
         SNAPSHOT_COMPLETED_SPAN, SnapshotLoadMetricContext, emit_log_segment_load_failure,
         emit_protocol_metadata_load_failure,
@@ -343,7 +354,7 @@ mod tests {
     use crate::metrics::{
         CheckpointOutputStats, CheckpointProcessingStats, CheckpointWriteMode,
         CheckpointWriteOutcome, CheckpointWriteStats, CrcReadFailureReason,
-        LastCheckpointReadOutcome, MetricEvent, MetricId,
+        LastCheckpointReadOutcome, MetricEvent, MetricId, ScanPlanOutcome, ScanPlanReport,
         WithMetricsReporterLayer as _,
     };
     use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
@@ -422,6 +433,46 @@ mod tests {
         assert!(
             logs.contains("Invalid field 'failure_reason' recorded on crc_read_completed span")
         );
+    }
+
+    #[rstest::rstest]
+    fn scan_plan_completion_respects_filter_and_reload(
+        #[values(false, true)] accepted: bool,
+        #[values(false, true)] reload_wrapped: bool,
+    ) {
+        ensure_metrics_compatible_global_subscriber();
+        let reporter = Arc::new(CapturingReporter::default());
+        let reporting = ReportGeneratorLayer::new(reporter.clone());
+        let reporting: Box<dyn Layer<Registry> + Send + Sync> = if reload_wrapped {
+            Box::new(reload::Layer::new(reporting).0)
+        } else {
+            Box::new(reporting)
+        };
+        let level = if accepted {
+            LevelFilter::INFO
+        } else {
+            LevelFilter::OFF
+        };
+        let subscriber = registry()
+            .with(reporting.with_filter(level))
+            .with(Identity::new().with_filter(LevelFilter::INFO));
+        let report = ScanPlanReport {
+            operation_id: MetricId::new(),
+            correlation_id: None,
+            outcome: ScanPlanOutcome::Plan,
+            duration_ns: 17,
+            checkpoint: None,
+            metadata_planning: Default::default(),
+        };
+        with_default(subscriber, || emit_scan_plan_completed(report));
+        let events = reporter.events();
+        match (accepted, events.as_slice()) {
+            (false, []) => {}
+            (true, [MetricEvent::ScanPlanGenerationCompleted(report)]) => {
+                assert_eq!(report.duration_ns, 17);
+            }
+            _ => panic!("unexpected scan-plan completions: {events:?}"),
+        }
     }
 
     #[rstest::rstest]

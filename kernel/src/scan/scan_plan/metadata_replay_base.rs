@@ -59,8 +59,19 @@ impl MetadataReplayBase {
         })
     }
 
+    /// Starting state selected for metadata replay.
+    pub(in crate::scan) fn kind(&self) -> ReplayBase {
+        match self {
+            Self::Crc { .. } => ReplayBase::Crc,
+            Self::Checkpoint {
+                version: Some(_), ..
+            } => ReplayBase::Checkpoint,
+            Self::Checkpoint { version: None, .. } => ReplayBase::Empty,
+        }
+    }
+
     /// Exclusive lower bound for commit replay; `None` replays all available commits.
-    pub(super) fn version(&self) -> Option<Version> {
+    pub(in crate::scan) fn version(&self) -> Option<Version> {
         match self {
             Self::Crc { version, .. } => Some(*version),
             Self::Checkpoint { version, .. } => *version,
@@ -114,11 +125,17 @@ mod tests {
         let crc = Some(crc);
         let snapshot = Arc::new(Snapshot::new_with_crc(segment, config, crc, false, false)?);
         let scan = snapshot.scan_builder().build()?;
-        let base =
-            MetadataReplayBase::try_new(&scan.snapshot, &engine, &mut ScanPlanReport::new())?;
+        let mut report = ScanPlanReport::new();
+        let base = MetadataReplayBase::try_new(&scan.snapshot, &engine, &mut report)?;
+        let kind = if has_all_files {
+            ReplayBase::Crc
+        } else {
+            ReplayBase::Checkpoint
+        };
+        assert_eq!(base.kind(), kind);
+        assert_eq!(report.metadata_planning.replay_base, Some(kind));
+        assert_eq!(report.metadata_planning.base_version, Some(version));
         assert_eq!(base.version(), Some(version));
-        let is_crc = matches!(base, MetadataReplayBase::Crc { .. });
-        assert_eq!(is_crc, has_all_files);
         assert_eq!(
             scan.snapshot.cached_checkpoint_info().is_some(),
             !has_all_files

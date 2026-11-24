@@ -67,7 +67,7 @@ use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::events::emit_scan_metadata_completed;
 #[cfg(feature = "declarative-plans")]
 use crate::metrics::{
-    MetadataPlanningReport, MetricEvent, ReportGeneratorLayer, ScanPlanOutcome, ScanPlanReport,
+    MetadataPlanningReport, ScanPlanOutcome, ScanPlanReport, reporter::emit_scan_plan_completed,
 };
 use crate::metrics::{MetricId, ScanType};
 use crate::parallel::sequential_phase::SequentialPhase;
@@ -1534,7 +1534,6 @@ impl Scan {
         engine: &dyn Engine,
     ) -> KernelResult<Option<Plan>> {
         let start = Instant::now();
-        let reporter = ReportGeneratorLayer::current_reporter();
         let mut report = ScanPlanReport {
             correlation_id: self.correlation_id.clone(),
             metadata_planning: MetadataPlanningReport {
@@ -1552,9 +1551,7 @@ impl Scan {
             Err(_) => ScanPlanOutcome::Error,
         };
         report.duration_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        if let Some(reporter) = reporter {
-            reporter.report(MetricEvent::ScanPlanGenerationCompleted(report));
-        }
+        emit_scan_plan_completed(report);
         result
     }
 
@@ -1587,8 +1584,12 @@ impl Scan {
         let mut planner = scan_plan::MetadataPlanner::try_from_scan(self)?;
         report.metadata_planning = planner.report();
         let base = scan_plan::MetadataReplayBase::try_new(&self.snapshot, engine, report)?;
+        let replay_base = base.kind();
+        let base_version = base.version();
         let result = self.build_metadata_scan_plan_with(base, &mut planner);
         report.metadata_planning = planner.report();
+        report.metadata_planning.replay_base = Some(replay_base);
+        report.metadata_planning.base_version = base_version;
         result
     }
 

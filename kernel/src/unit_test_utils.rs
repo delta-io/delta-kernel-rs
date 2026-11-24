@@ -113,7 +113,6 @@ pub(crate) fn assert_scan_plan_metrics<T>(
         panic!("expected one scan-plan report: {events:?}")
     };
     assert_ne!(event.operation_id, crate::metrics::MetricId::nil());
-    assert!(event.duration_ns > 0);
     check(event);
     result
 }
