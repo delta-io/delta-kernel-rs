@@ -1,15 +1,18 @@
 //! Shared allocation tracking for allocation-heavy Kernel metadata using stable `GlobalAlloc`.
 //!
-//! Participating storage always allocates through [`KERNEL_ALLOCATOR`]. Its requested-byte limit
-//! is disabled by default. Set or clear the limit with [`KernelAllocator::set_limit`], or the FFI
-//! `kernel_memory_set_limit` entry point. No scopes, per-operation owners, or builder options are
-//! needed; usage follows the backing allocations until they are freed, across calls and threads.
+//! Install [`KernelAllocator`] as the global allocator to track standard containers, dependency
+//! allocations, and Rust-owned Arrow buffers. Its requested-byte limit is disabled by default.
+//! Set or clear it through [`KERNEL_ALLOCATOR`] or the FFI `kernel_memory_set_limit` entry point.
+//! Usage follows backing allocations until they are freed, across calls and threads.
 //!
-//! The limit covers participating storage, not process RSS or allocations through other
-//! allocators, including engine-owned Arrow/Parquet buffers and parser-private scratch space.
+//! Fallible allocation APIs return errors on rejection. Infallible paths, including dependency
+//! allocations, can still invoke Rust's allocation-error handler. The limit covers requested Rust
+//! allocations through this hook, rather than RSS, direct libc allocations, or memory mappings.
 //!
 //! ```no_run
-//! # use delta_kernel::{Engine, Snapshot, memory::KERNEL_ALLOCATOR};
+//! # use delta_kernel::{Engine, Snapshot, memory::{KERNEL_ALLOCATOR, KernelAllocator}};
+//! #[global_allocator]
+//! static ALLOCATOR: KernelAllocator = KernelAllocator::new();
 //! # fn example(engine: &dyn Engine) -> delta_kernel::Result<()> {
 //! KERNEL_ALLOCATOR.set_limit(Some(64 * 1024 * 1024))
 //!     .map_err(delta_kernel::KernelError::from)?;

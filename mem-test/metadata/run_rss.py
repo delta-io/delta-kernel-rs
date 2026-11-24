@@ -58,7 +58,7 @@ def main():
                     for outcome, committed in zip(run["results"], published):
                         if "Err" in outcome and committed:
                             raise AssertionError("failed operation published a commit")
-                    if args.warmup and run["after_cleanup"]["kernel_live"] != run["baseline"]["kernel_live"]:
+                    if args.warmup and not run.get("global_allocator") and run["after_cleanup"]["kernel_live"] != run["baseline"]["kernel_live"]:
                         raise AssertionError("participating allocations did not return to the warmed baseline")
                     if cap and run["after_cleanup"]["kernel_peak"] > cap * 1024 * 1024:
                         raise AssertionError("shared cap exceeded")

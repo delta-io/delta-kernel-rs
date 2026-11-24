@@ -1,4 +1,4 @@
-use std::alloc::{GlobalAlloc, Layout};
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::error::Error;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,11 +14,13 @@ mod declarative;
 static CALLS: AtomicUsize = AtomicUsize::new(0);
 static FAIL_AT: AtomicUsize = AtomicUsize::new(0);
 static REJECTED: AtomicUsize = AtomicUsize::new(0);
-static PROBE: Probe = Probe;
+#[global_allocator]
+static ALLOCATOR: delta_kernel::memory::KernelAllocator<Probe> =
+    delta_kernel::memory::KernelAllocator::with_backing(Probe);
 
 struct Probe;
 
-// SAFETY: Successful storage and layouts are forwarded unchanged to Kernel's allocator.
+// SAFETY: Successful storage and original layouts are forwarded unchanged to System.
 unsafe impl GlobalAlloc for Probe {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let call = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -26,10 +28,10 @@ unsafe impl GlobalAlloc for Probe {
             REJECTED.fetch_add(1, Ordering::Relaxed);
             return std::ptr::null_mut();
         }
-        unsafe { KERNEL_ALLOCATOR.alloc(layout) }
+        unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { KERNEL_ALLOCATOR.dealloc(ptr, layout) }
+        unsafe { System.dealloc(ptr, layout) }
     }
 }
 
@@ -38,7 +40,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let phase = args.first().ok_or("missing phase")?.as_str();
     let shape = args.get(1).ok_or("missing shape")?.as_str();
     let fail_at: usize = args.get(2).ok_or("missing failure ordinal")?.parse()?;
-    arrow_buffer::alloc::install_default_allocator(&PROBE)?;
     KERNEL_ALLOCATOR.set_limit(None)?;
     if phase == "lifecycle" {
         return lifecycle_probe(shape, fail_at);
@@ -126,6 +127,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     } else {
         result?;
     }
+    drop((rows, input, value));
     assert_eq!(KERNEL_ALLOCATOR.usage().reserved, baseline);
     println!(
         "{}",

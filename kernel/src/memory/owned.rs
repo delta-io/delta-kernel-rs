@@ -1,44 +1,46 @@
+use std::alloc::{Layout, alloc};
 use std::ops::{Deref, DerefMut};
 
-use allocator_api2::boxed::Box as AllocBox;
-
-use super::allocator::ContainerAllocator;
-use super::{MemoryResult, MetadataVec};
+use super::{KERNEL_ALLOCATOR, MemoryResult};
 
 /// An owned metadata payload using the shared Kernel allocator.
 ///
 /// Use [`Self::try_new`] at fallible boundaries. Infallible conversions and cloning have Rust's
 /// ordinary allocation-error behavior if the allocator rejects their allocation.
-pub struct Owned<T>(AllocBox<T, ContainerAllocator>);
+pub struct Owned<T>(Box<T>);
 
 impl<T> Owned<T> {
     /// Allocate a payload, returning an error if its allocation cannot be reserved.
     pub fn try_new(value: T) -> MemoryResult<Self> {
-        let mut values = MetadataVec::new();
-        values.try_reserve_exact(1)?;
-        values.try_push(value)?;
-        // Exact capacity avoids a potentially allocating shrink during boxing.
-        let (ptr, allocator) =
-            AllocBox::into_raw_with_allocator(values.into_vec().into_boxed_slice());
-        // SAFETY: A single-element slice has its element's layout and preserves the allocator.
-        Ok(Self(unsafe {
-            AllocBox::from_raw_in(ptr.cast::<T>(), allocator)
-        }))
+        let layout = Layout::new::<T>();
+        if layout.size() == 0 {
+            return Ok(Self(Box::new(value)));
+        }
+        // SAFETY: The nonzero layout describes T. Box takes ownership only after initialization,
+        // using the same process allocator for its eventual deallocation.
+        let pointer = unsafe { alloc(layout) }.cast::<T>();
+        if pointer.is_null() {
+            return Err(KERNEL_ALLOCATOR.allocation_error());
+        }
+        unsafe {
+            pointer.write(value);
+            Ok(Self(Box::from_raw(pointer)))
+        }
     }
 
     /// Move out the value and release its tracked allocation.
     pub fn into_inner(self) -> T {
-        AllocBox::into_inner(self.0)
+        *self.0
     }
 }
 impl<T> From<T> for Owned<T> {
     fn from(value: T) -> Self {
-        Self(AllocBox::new_in(value, ContainerAllocator))
+        Self(Box::new(value))
     }
 }
 impl<T> From<Box<T>> for Owned<T> {
     fn from(value: Box<T>) -> Self {
-        Self::from(*value)
+        Self(value)
     }
 }
 impl<T: Clone> Clone for Owned<T> {

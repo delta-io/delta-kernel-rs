@@ -10,7 +10,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use delta_kernel::committer::FileSystemCommitter;
@@ -69,7 +69,8 @@ unsafe impl GlobalAlloc for Tracking {
 }
 
 #[global_allocator]
-static ALLOCATOR: Tracking = Tracking;
+static ALLOCATOR: delta_kernel::memory::KernelAllocator<Tracking> =
+    delta_kernel::memory::KernelAllocator::with_backing(Tracking);
 
 #[derive(Clone, Copy, Default, Serialize)]
 struct Observation {
@@ -191,6 +192,7 @@ pub(crate) fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let cap: usize = args.get(2).ok_or("missing cap")?.parse()?;
     let concurrency: usize = args.get(3).ok_or("missing concurrency")?.parse()?;
+    let no_headroom = std::env::var("KERNEL_MEMORY_NO_HEADROOM").as_deref() == Ok("1");
     let repetitions: usize = args
         .get(4)
         .map(|value| value.parse())
@@ -208,17 +210,21 @@ pub(crate) fn main() -> Result<(), Box<dyn std::error::Error>> {
         let url = try_parse_uri(warmup.to_str().ok_or("warmup path")?)?;
         lifecycle(url.as_str(), &|_| {})?;
     }
-    KERNEL_ALLOCATOR.set_limit((cap != 0).then_some(cap))?;
-    let gate = Arc::new(Barrier::new(concurrency + 2));
+    let gate = Arc::new(AtomicBool::new(false));
+    let ready = Arc::new(AtomicUsize::new(0));
     let stop = Arc::new(AtomicBool::new(false));
     let stages = Arc::new(Mutex::new(Vec::with_capacity(
-        concurrency * repetitions * 16,
+        concurrency * repetitions * 32,
     )));
     let sample_thread = {
+        let ready = ready.clone();
         let gate = gate.clone();
         let stop = stop.clone();
         std::thread::spawn(move || {
-            gate.wait();
+            ready.fetch_add(1, Ordering::Release);
+            while !gate.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
             let mut samples = Samples::default();
             while !stop.load(Ordering::Relaxed) {
                 let observation = Observation::get(start);
@@ -239,6 +245,12 @@ pub(crate) fn main() -> Result<(), Box<dyn std::error::Error>> {
             samples
         })
     };
+    let after_stage = std::env::var("KERNEL_MEMORY_LIMIT_AFTER_STAGE").ok();
+    let stage_headroom: usize = std::env::var("KERNEL_MEMORY_STAGE_HEADROOM")
+        .ok()
+        .map(|value| value.parse())
+        .transpose()?
+        .unwrap_or(0);
     let mut workers = Vec::with_capacity(concurrency);
     for worker in 0..concurrency {
         let table = try_parse_uri(
@@ -248,25 +260,24 @@ pub(crate) fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         let gate = gate.clone();
         let stages = stages.clone();
+        let after_stage = after_stage.clone();
+        let ready = ready.clone();
         workers.push(std::thread::spawn(move || {
-            gate.wait();
             let mut outcomes = Vec::with_capacity(repetitions);
+            ready.fetch_add(1, Ordering::Release);
+            while !gate.load(Ordering::Acquire) { std::hint::spin_loop(); }
             for iteration in 0..repetitions {
                 let last_stage = Cell::new("start");
                 let record = |name| {
                     last_stage.set(name);
-                    if std::env::var("KERNEL_MEMORY_LIMIT_AFTER_STAGE").as_deref() == Ok(name) {
+                    if after_stage.as_deref() == Some(name) {
                         assert_eq!(concurrency, 1, "stage limit injection requires one worker");
-                        let headroom = std::env::var("KERNEL_MEMORY_STAGE_HEADROOM")
-                            .unwrap_or_else(|_| "0".into())
-                            .parse::<usize>()
-                            .unwrap();
                         KERNEL_ALLOCATOR
                             .set_limit(Some(
                                 KERNEL_ALLOCATOR
                                     .usage()
                                     .reserved
-                                    .checked_add(headroom)
+                                    .checked_add(stage_headroom)
                                     .unwrap(),
                             ))
                             .unwrap();
@@ -303,7 +314,7 @@ pub(crate) fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
                 record("owners_dropped");
                 outcomes.push((
-                    result.map_err(|error| error.to_string()),
+                    result,
                     failure,
                     elapsed_us,
                 ));
@@ -311,27 +322,39 @@ pub(crate) fn main() -> Result<(), Box<dyn std::error::Error>> {
             outcomes
         }));
     }
+    while ready.load(Ordering::Acquire) != concurrency + 1 {
+        std::hint::spin_loop();
+    }
+    drop(stages.lock().unwrap());
+    let mut outcomes = Vec::with_capacity(concurrency * repetitions);
+    KERNEL_ALLOCATOR.reset_peak();
+    let cap = if no_headroom {
+        KERNEL_ALLOCATOR.usage().reserved
+    } else {
+        cap
+    };
+    KERNEL_ALLOCATOR.set_limit((cap != 0).then_some(cap))?;
     PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
     WINDOW_PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
     let baseline = Observation::get(start);
-    gate.wait();
-    let outcomes: Vec<_> = workers
-        .into_iter()
-        .flat_map(|worker| worker.join().unwrap())
-        .collect();
+    gate.store(true, Ordering::Release);
+    for worker in workers {
+        outcomes.extend(worker.join().unwrap());
+    }
     let cleaned = Observation::get(start);
+    let usage = KERNEL_ALLOCATOR.usage();
+    KERNEL_ALLOCATOR.set_limit(None)?;
     stop.store(true, Ordering::Relaxed);
     let samples = sample_thread.join().unwrap();
     capture_vm_map("after_threads_joined")?;
     let before_relief = Observation::get(start);
     let relieved_bytes = allocator_relief();
     let after_relief = Observation::get(start);
-    let usage = KERNEL_ALLOCATOR.usage();
     let mut results = Vec::new();
     let mut failures = Vec::new();
     let mut elapsed_us = Vec::new();
     for (result, failure, elapsed) in outcomes {
-        results.push(result);
+        results.push(result.map_err(|error| error.to_string()));
         failures.push(failure);
         elapsed_us.push(elapsed);
     }
@@ -344,7 +367,7 @@ pub(crate) fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let report = serde_json::json!({
-        "kind": "fresh_process_rss", "cap_bytes": cap, "concurrency": concurrency,
+        "kind": "fresh_process_rss", "global_allocator": true, "cap_bytes": cap, "concurrency": concurrency,
         "repetitions": repetitions, "operation_elapsed_us": elapsed_us,
         "mode": std::env::var("KERNEL_MEMORY_MODE").unwrap_or_else(|_| "imperative".into()),
         "warmup_enabled": warmed, "cold_baseline": cold_baseline,
@@ -356,7 +379,7 @@ pub(crate) fn main() -> Result<(), Box<dyn std::error::Error>> {
         "kernel_rejections": usage.rejected,
         "results": results, "failures": failures, "recovery": recovery,
         "stages": *stages.lock().unwrap(),
-        "measurement": "No DHAT. RSS is OS resident bytes; Rust counts are requested layouts. Samples are adjacent atomic/OS observations, not a transactionally consistent snapshot. Fixture preparation and copies ran in other processes. A zero cap disables participating limits.",
+        "measurement": "No DHAT. RSS is OS resident bytes; Rust counts are requested layouts. Samples are adjacent atomic/OS observations, not a transactionally consistent snapshot. Fixture preparation and copies ran in other processes. A zero cap disables the global Rust limit. Caller diagnostics remain live in the returned report.",
     });
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())

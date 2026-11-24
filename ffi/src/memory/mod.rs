@@ -1,13 +1,14 @@
-//! Shared allocation tracking and optional enforcement for Kernel metadata storage.
+//! Shared global Rust allocation tracking and optional enforcement.
 
 use delta_kernel::memory::{KERNEL_ALLOCATOR, MemoryUsage};
 
 use crate::OptionalValue;
 
-/// Requested-byte counters for participating Kernel metadata allocations.
+/// Requested-byte counters for allocations through the installed Kernel global allocator.
 ///
-/// This excludes engine-owned buffers and allocations using other allocators. The peak is
-/// historical and can exceed a limit enabled after that peak occurred.
+/// This includes standard Rust containers and Rust-owned dependency buffers. Direct libc
+/// allocations, memory mappings, and allocator overhead are excluded. Historical peaks can exceed
+/// limits enabled after those peaks occurred.
 #[repr(C)]
 #[derive(Debug)]
 pub struct FfiMemoryUsage {
@@ -15,7 +16,7 @@ pub struct FfiMemoryUsage {
     pub limit: OptionalValue<usize>,
     /// Outstanding requested bytes, including in-flight reservations.
     pub reserved: usize,
-    /// Maximum reserved bytes since initialization.
+    /// Maximum reserved bytes since initialization or peak reset.
     pub peak: usize,
     /// Requests rejected by the configured limit.
     pub rejected: usize,
@@ -32,12 +33,14 @@ impl From<MemoryUsage> for FfiMemoryUsage {
     }
 }
 
-/// Set or clear the shared metadata allocation limit.
+/// Set or clear the shared global Rust allocation limit.
 ///
-/// The first call initializes and counts fixed canonical schemas. Tracking is always enabled.
+/// The default `global-allocator` feature installs the hook. Rust applications that disable it
+/// must install `KernelAllocator` themselves. The first call initializes fixed canonical schemas.
 /// `None` disables enforcement. A limit below current usage returns
 /// false and preserves the previous limit. Successful updates apply to all threads and existing
-/// allocations without resetting counters. This does not bound total native memory or RSS.
+/// allocations without resetting counters. Fallible allocation APIs return errors on rejection;
+/// infallible paths can invoke Rust's allocation-error handler. This does not bound total RSS.
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_memory_set_limit(limit: OptionalValue<usize>) -> bool {
     KERNEL_ALLOCATOR.set_limit(limit.into()).is_ok()

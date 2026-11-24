@@ -25,10 +25,11 @@ STAGES = [
 ]
 
 
-def run_worker(binary, root, cap, concurrency, repetitions, query, stage, timeout):
+def run_worker(binary, root, cap, concurrency, repetitions, query, stage, timeout, no_headroom=False):
     env = dict(os.environ, KERNEL_MEMORY_MODE="declarative", KERNEL_MEMORY_RECOVERY="1",
                KERNEL_MEMORY_QUERY=json.dumps(query), KERNEL_MEMORY_LIMIT_AFTER_STAGE=stage,
-               KERNEL_MEMORY_STAGE_HEADROOM="0", RUST_BACKTRACE="1")
+               KERNEL_MEMORY_STAGE_HEADROOM="0", KERNEL_MEMORY_NO_HEADROOM="1" if no_headroom else "0",
+               RUST_BACKTRACE="1")
     result = subprocess.run(
         [str(binary), "worker", str(root), str(cap), str(concurrency), str(repetitions)],
         env=env, text=True, capture_output=True, timeout=timeout,
@@ -43,8 +44,11 @@ def run_worker(binary, root, cap, concurrency, repetitions, query, stage, timeou
 
 def validate(run, fixture, query, require_success):
     baseline = run["baseline"]["kernel_live"]
-    assert run["after_cleanup"]["kernel_live"] == baseline, "query allocations retained after cleanup"
-    if run["concurrency"] == 1:
+    # Global tracking includes retained caller diagnostics and thread/harness allocations. Exact
+    # owner release is tested in Rust and C; the per-container baseline assertion is inapplicable.
+    if not run.get("global_allocator"):
+        assert run["after_cleanup"]["kernel_live"] == baseline, "query allocations retained after cleanup"
+    if run["concurrency"] == 1 and not run.get("global_allocator"):
         for stage in run["stages"]:
             if stage["name"] == "owners_dropped":
                 assert stage["kernel_live"] == baseline, "iteration retained query allocations"
@@ -76,7 +80,8 @@ def validate(run, fixture, query, require_success):
             assert not outcome["declarative_commit_supported"]
     recovery = run["recovery"]
     assert "Ok" in recovery["result"], f"retry after clearing cap failed: {recovery['result']}"
-    assert recovery["after_cleanup"]["kernel_live"] == baseline, "retry retained query allocations"
+    if not run.get("global_allocator"):
+        assert recovery["after_cleanup"]["kernel_live"] == baseline, "retry retained query allocations"
 
 
 def summarize(run):
@@ -112,6 +117,8 @@ def main():
     parser.add_argument("--repetitions", type=int, default=2)
     parser.add_argument("--failure-stages", nargs="*", choices=STAGES, default=[])
     parser.add_argument("--timeout", type=int, default=120)
+    parser.add_argument("--record-infallible-gaps", action="store_true",
+                        help="Record allocation aborts in pressure probes separately; unlimited/fit runs must pass")
     args = parser.parse_args()
     if min([args.repetitions, *args.concurrency]) <= 0:
         parser.error("repetitions and concurrency must be positive")
@@ -123,8 +130,8 @@ def main():
     if not tables or not queries:
         parser.error("selection contains no tables or queries")
     report = {"manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
-              "binary": str(args.binary), "fixtures": {}, "runs": [], "failures": [],
-              "scope": "Declarative driver construction/encoding only; no terminal-plan execution or commit. Rust/RSS measurements include local reference-engine work and caller query construction. Warmup peaks are historical. A sampled ratio is not allocation-stack attribution."}
+              "binary": str(args.binary), "fixtures": {}, "runs": [], "failures": [], "recoverability_gaps": [],
+              "scope": "Declarative driver construction/encoding only; no terminal-plan execution or commit. Rust/RSS measurements include local reference-engine work and caller query construction. Global-allocator builds also track caller diagnostics, so exact per-container cleanup baselines do not apply. Allocation aborts in pressure probes are recoverability gaps, not successful error returns. A sampled ratio is not allocation-stack attribution."}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     receipts = args.output.with_suffix(".receipts.jsonl")
     receipts.write_text("")
@@ -163,8 +170,8 @@ def main():
                             try:
                                 run = run_worker(args.binary, root, cap, concurrency,
                                                  1 if stage else args.repetitions,
-                                                 query["query"], stage, args.timeout)
-                                row = dict(label, cap_bytes=cap, stage=stage,
+                                                 query["query"], stage, args.timeout, mode == "no_headroom")
+                                row = dict(label, cap_bytes=run["cap_bytes"], stage=stage,
                                            receipt_line=len(report["runs"]) + 1)
                                 with receipts.open("a") as stream:
                                     stream.write(json.dumps(dict(row, receipt=run)) + "\n")
@@ -183,7 +190,7 @@ def main():
                                     peak = run["after_cleanup"]["kernel_peak"]
                                     modes.extend([
                                         ("fit", max(2 * concurrency * peak, baseline + 65536), ""),
-                                        ("pressure", max(baseline, peak // 2), ""),
+                                        ("pressure", max(baseline + 65536, baseline + (peak - baseline) // 2) if run.get("global_allocator") else max(baseline, peak // 2), ""),
                                         ("no_headroom", baseline, ""),
                                     ])
                                     if concurrency == 1:
@@ -193,8 +200,14 @@ def main():
                                 if mode == "no_headroom":
                                     assert summary["successes"] == 0, "workload succeeded without any allocation headroom"
                             except (AssertionError, RuntimeError, subprocess.TimeoutExpired) as error:
-                                report["failures"].append(dict(label, error=str(error)))
-                                print(json.dumps(dict(label, failure=str(error))), flush=True)
+                                message = str(error)
+                                gap = (args.record_infallible_gaps and mode not in ["unlimited", "fit"]
+                                       and isinstance(error, RuntimeError)
+                                       and message.startswith(("worker exit -6:", "worker exit 134:"))
+                                       and "memory allocation" in message)
+                                bucket = "recoverability_gaps" if gap else "failures"
+                                report[bucket].append(dict(label, error=str(error)))
+                                print(json.dumps(dict(label, **{bucket: str(error)})), flush=True)
                                 if reference is None:
                                     break
                             write_report(args.output, report)

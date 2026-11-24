@@ -1,24 +1,22 @@
 use std::io::{self, Write};
 use std::ops::{Deref, DerefMut};
 
-use allocator_api2::vec::Vec as AllocVec;
 use serde::Serialize;
 
-use super::allocator::ContainerAllocator;
 use super::{KERNEL_ALLOCATOR, MemoryError, MemoryResult};
 
-/// An allocator-aware vector with fallible growth methods.
+/// A standard vector with fallible growth methods returning Kernel memory errors.
 ///
-/// The backing allocation is charged by capacity. Allocations owned by `T` must independently
-/// use the allocator; an ordinary `String` here does not charge its contents. Infallible
-/// conversions and cloning retain Rust's ordinary allocation-error behavior on exhaustion.
+/// When [`KernelAllocator`](super::KernelAllocator) is installed, backing storage and allocations
+/// owned by elements use the same global limit. Infallible conversions and cloning retain Rust's
+/// ordinary allocation-error behavior on exhaustion.
 #[derive(Debug)]
-pub struct MetadataVec<T>(AllocVec<T, ContainerAllocator>);
+pub struct MetadataVec<T>(Vec<T>);
 
 impl<T> MetadataVec<T> {
     /// Create empty storage using the shared Kernel allocator.
     pub fn new() -> Self {
-        Self(AllocVec::new_in(ContainerAllocator))
+        Self(Vec::new())
     }
 
     /// Append `value`, returning an error without changing the elements if growth fails.
@@ -67,10 +65,6 @@ impl<T> MetadataVec<T> {
     /// Return the number of elements the current allocation can hold.
     pub fn capacity(&self) -> usize {
         self.0.capacity()
-    }
-
-    pub(super) fn into_vec(self) -> AllocVec<T, ContainerAllocator> {
-        self.0
     }
 
     fn check_capacity(&self, additional: usize) -> MemoryResult<()> {
@@ -148,7 +142,8 @@ impl MetadataString {
 /// Serialize an existing value directly into a budgeted output buffer.
 ///
 /// An output allocation failure returns `AllocationFailed`, including on the first write. Source
-/// values, serializer internals, and error construction are outside this output-buffer accounting.
+/// values and serializer internals also use the process allocator. An output reservation failure
+/// is returned without allocating a serializer I/O error.
 pub fn try_to_json<T: Serialize + ?Sized>(value: &T) -> MemoryResult<MetadataBytes> {
     let mut bytes = MetadataBytes::new();
     write_json(&mut bytes, value)?;
@@ -163,10 +158,11 @@ pub(crate) fn write_json<T: Serialize + ?Sized>(
         bytes,
         failure: None,
     };
-    match serde_json::to_writer(&mut writer, value) {
-        Ok(()) => Ok(()),
-        Err(_) => Err(writer.failure.unwrap_or(MemoryError::Serialization)),
+    let result = serde_json::to_writer(&mut writer, value);
+    if let Some(error) = writer.failure {
+        return Err(error);
     }
+    result.map_err(|_| MemoryError::Serialization)
 }
 
 struct JsonWriter<'a> {
@@ -176,10 +172,11 @@ struct JsonWriter<'a> {
 
 impl Write for JsonWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.bytes.try_extend_from_slice(bytes).map_err(|error| {
-            self.failure = Some(error);
-            io::Error::from(io::ErrorKind::OutOfMemory)
-        })?;
+        if self.failure.is_none() {
+            self.failure = self.bytes.try_extend_from_slice(bytes).err();
+        }
+        // serde_json boxes I/O errors. Once allocation fails, discard subsequent output and
+        // report the saved failure from write_json without allocating another error object.
         Ok(bytes.len())
     }
 
@@ -211,68 +208,14 @@ impl std::fmt::Display for MetadataString {
     }
 }
 
-/// An owning iterator retaining charged capacity until it is dropped.
-#[derive(Debug)]
-pub struct IntoIter<T> {
-    values: MetadataVec<T>,
-    front: usize,
-    back: usize,
-}
+/// A standard vector iterator retaining its allocation until it is dropped.
+pub type IntoIter<T> = std::vec::IntoIter<T>;
 
-impl<T> Iterator for IntoIter<T> {
-    type Item = T;
-    fn next(&mut self) -> Option<T> {
-        if self.front == self.back {
-            return None;
-        }
-        let index = self.front;
-        self.front += 1;
-        // SAFETY: Only [front, back) is initialized. The cursor excludes this element before
-        // transferring ownership, and the backing vector has length zero to prevent double drop.
-        Some(unsafe { self.values.0.as_ptr().add(index).read() })
-    }
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.back - self.front;
-        (len, Some(len))
-    }
-}
-impl<T> ExactSizeIterator for IntoIter<T> {}
-impl<T> std::iter::FusedIterator for IntoIter<T> {}
-impl<T> DoubleEndedIterator for IntoIter<T> {
-    fn next_back(&mut self) -> Option<T> {
-        if self.front == self.back {
-            return None;
-        }
-        self.back -= 1;
-        // SAFETY: The decremented cursor identifies one initialized, unconsumed element.
-        Some(unsafe { self.values.0.as_ptr().add(self.back).read() })
-    }
-}
-impl<T> Drop for IntoIter<T> {
-    fn drop(&mut self) {
-        // SAFETY: Only the remaining range is initialized. Slice drop also handles unwinding
-        // while dropping an element; the zero-length vector then frees the backing allocation.
-        unsafe {
-            let remaining = std::ptr::slice_from_raw_parts_mut(
-                self.values.0.as_mut_ptr().add(self.front),
-                self.back - self.front,
-            );
-            std::ptr::drop_in_place(remaining);
-        }
-    }
-}
 impl<T> IntoIterator for MetadataVec<T> {
     type Item = T;
     type IntoIter = IntoIter<T>;
-    fn into_iter(mut self) -> Self::IntoIter {
-        let back = self.len();
-        // SAFETY: The iterator becomes the owner of the initialized range and drops its elements.
-        unsafe { self.0.set_len(0) };
-        IntoIter {
-            values: self,
-            front: 0,
-            back,
-        }
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
     }
 }
 
@@ -309,12 +252,12 @@ impl<T> Default for MetadataVec<T> {
 }
 impl<T> From<Vec<T>> for MetadataVec<T> {
     fn from(values: Vec<T>) -> Self {
-        values.into_iter().collect()
+        Self(values)
     }
 }
 impl<T> FromIterator<T> for MetadataVec<T> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        let mut values = AllocVec::new_in(ContainerAllocator);
+        let mut values = Vec::new();
         values.extend(iter);
         Self(values)
     }

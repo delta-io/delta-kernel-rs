@@ -8,8 +8,8 @@ use super::MetadataString;
 
 /// Immutable tracked text, shared without copying its payload across clones and threads.
 ///
-/// The small `Arc` control block uses Rust's global allocator; the string's capacity uses the
-/// shared Kernel allocator. Use fallible constructors when enforcing a limit.
+/// Both the `Arc` control block and text use Rust's global allocator. The text constructors
+/// reserve fallibly; creating the `Arc` control block retains its infallible allocation behavior.
 #[derive(Clone, Default, Eq, PartialEq)]
 pub struct SharedString(Arc<MetadataString>);
 

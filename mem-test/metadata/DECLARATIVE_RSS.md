@@ -6,21 +6,24 @@ relations, and write-state encoding. Executor execution and full declarative com
 this benchmark. The local reference engine used for snapshot discovery adds its own parsing and
 Arrow buffers to process measurements.
 
-The shared allocator tracks participating backing allocations even when enforcement is disabled.
-Historical peaks include temporary old-plus-new capacity during growth. Query objects, returned
-wire bytes, and reference-counted schema text retain their charge until their final release.
-Fixed canonical schema caches remain charged after all query owners are dropped; compare repeated
-workloads against a matching warmed baseline when checking leaks.
+The installed global Rust allocator tracks standard collections, dependency objects, and Rust-owned
+Arrow buffers even when enforcement is disabled. Query objects, returned wire bytes, and shared
+schema text retain their charge until final release. Fixed canonical caches remain charged.
+Global counters also include caller diagnostics and harness storage; exact payload ownership and
+release are checked separately by the Rust and generated-C tests.
 
 ## Metrics
 
-- **Kernel requested bytes**: reservations made through `KERNEL_ALLOCATOR`. A configured limit
-  bounds this counter, including allocations in flight. It excludes storage using other allocators.
-- **Live Rust heap**: requested layouts observed by the benchmark executable's diagnostic
-  `GlobalAlloc`. Kernel itself does not install that allocator.
-- **DHAT global peak**: live allocations at the profiler's single simultaneous heap peak. Attribution
-  by allocation stack estimates the share using Kernel's allocator. A profile started after snapshot
-  creation excludes earlier live allocations and cannot establish whole-lifecycle coverage.
+- **Global Rust reservations** (`kernel_live` / `kernel_peak` in receipts): requested bytes through
+  the installed `KernelAllocator`, including requests in flight. Reallocation reserves a complete
+  replacement before invoking the backing allocator, so its peak can conservatively exceed the
+  actual live heap peak even when the backing allocator grows in place.
+- **Live Rust heap**: requested layouts observed independently by the benchmark's inner diagnostic
+  allocator. These count actual successful backing requests and reallocation size changes. They
+  exclude direct libc/C++ allocations and memory mappings.
+- **DHAT global peak**: live allocations at the profiler's single simultaneous heap peak. A profile
+  started after snapshot creation excludes earlier live allocations. Run with enforcement disabled:
+  profiler bookkeeping also allocates through the process hook.
 - **RSS**: resident process pages, including allocator caches, reusable pages, code, and stacks.
 - **macOS physical footprint**: the OS pressure charge. Reusable malloc pages can remain resident
   while carrying a much smaller physical-footprint charge.
@@ -40,14 +43,17 @@ sharing the same limit.
 
 Use a fresh process for each table/limit/concurrency combination. Generate and copy fixtures before
 measurement. Compare unlimited tracking against configured limits, verify errors do not publish a
-commit, and verify query allocations return to the warmed baseline after joining workers. Keep
-latency, live-heap, and OS-memory measurements together; the allocator counter alone does not
+commit, and check typed memory errors separately from allocation aborts. The global matrix retains
+caller diagnostic data after releasing query owners; use the ownership tests for exact release
+assertions. Keep latency, live-heap, and OS-memory measurements together; the allocator counter alone does not
 establish total native-memory coverage.
 
 ## Measured results
 
 The [local lifecycle matrix](LIFECYCLE_CHECKS.md#validated-results) records simultaneous-peak heap
 attribution across table, query, and generated plan shapes, together with pressure, recovery,
-concurrency, and exact wide-tail checks. Its [compact receipts](LIFECYCLE_RESULTS.json) record the
-manifests, executable hash, and measurement boundaries. Coverage varies substantially by workload;
-a schema-heavy profile cannot establish coverage for an Arrow-heavy one.
+concurrency, and exact wide-tail checks.
+[Current validation](../arrow-allocator-poc/PROCESS_GLOBAL_VALIDATION.json) records the installed
+hook and recovery gaps. The [historical receipts](LIFECYCLE_RESULTS.json) describe the earlier
+per-container accounting and preserve their original executable hashes and boundaries. Those
+coverage fractions are not measurements of the global hook.

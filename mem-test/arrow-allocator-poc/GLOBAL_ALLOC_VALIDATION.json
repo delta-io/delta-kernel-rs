@@ -1,5 +1,5 @@
 {
-  "implementation": "Explicit std::alloc::GlobalAlloc backend with private allocator-api2 fallible containers; no process-global allocator replacement.",
+  "implementation": "Historical explicit std::alloc::GlobalAlloc backend with private allocator-api2 containers; not installed as the global hook.",
   "platform": "macOS-26.7.1-arm64-arm-64bit",
   "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
   "workspace_msrv": "1.95",
@@ -157,5 +157,6 @@
     "Arrow array/schema objects, ArrayData trees, buffer ownership objects, and other ordinary dependency allocations remain outside enforcement.",
     "Ordinary infallible allocation paths retain allocation-error-handler behavior; GlobalAlloc alone does not make them recoverable.",
     "Correctness-run timings do not establish p99.9 latency or performance regressions."
-  ]
+  ],
+  "current_validation": "PROCESS_GLOBAL_VALIDATION.json"
 }

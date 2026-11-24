@@ -14,7 +14,8 @@ use delta_kernel::transaction::UpdateTableOperation;
 use serde::Serialize;
 
 #[global_allocator]
-static ALLOCATOR: dhat::Alloc = dhat::Alloc;
+static ALLOCATOR: delta_kernel::memory::KernelAllocator<dhat::Alloc> =
+    delta_kernel::memory::KernelAllocator::with_backing(dhat::Alloc);
 
 #[derive(Serialize)]
 struct Stage {

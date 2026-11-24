@@ -88,11 +88,47 @@ static size_t global_lifecycle(struct KernelStringSlice path, HandleSharedExtern
                              bool enforce, size_t limit, size_t initial_peak, bool reject) {
   struct ExternResultHandleExclusiveSnapshotBuilder builder = get_snapshot_builder(path, engine);
   assert(builder.tag == OkHandleExclusiveSnapshotBuilder);
-  struct Load load = {builder.ok, NULL, reject};
+  struct Load load = {builder.ok, NULL, false};
   struct KernelOwnedBytes plan_bytes = {0};
   pthread_t thread;
   assert(pthread_create(&thread, NULL, load_snapshot, &load) == 0);
   assert(pthread_join(thread, NULL) == 0);
+  if (reject) {
+    struct KernelStringSlice info = {"global-ffi", 10};
+    struct ExternResultHandleExclusiveUpdateTableTransactionBuilder txn_builder =
+        new_update_table_txn_builder(load.snapshot, KernelUpdateTableOperationAlterTable,
+                                     info, false, engine);
+    assert(txn_builder.tag == OkHandleExclusiveUpdateTableTransactionBuilder);
+    struct FfiStringMapEntry entry = {{"poc.global", 10}, {"true", 4}};
+    FfiStringMap properties = {&entry, 1};
+    txn_builder = update_table_txn_builder_with_table_properties_added(txn_builder.ok, &properties, engine);
+    assert(txn_builder.tag == OkHandleExclusiveUpdateTableTransactionBuilder);
+    struct ExternResultHandleExclusiveUpdateTableTransaction txn =
+        update_table_txn_builder_build(txn_builder.ok, engine);
+    assert(txn.tag == OkHandleExclusiveUpdateTableTransaction);
+    struct ExternResultHandleSharedWriteState state = update_table_txn_write_state(txn.ok, engine);
+    assert(state.tag == OkHandleSharedWriteState);
+    struct FfiMemoryUsage before, after;
+    assert(kernel_memory_usage(&before));
+    struct OptionalValueusize cap = {Someusize, {.some = before.reserved}};
+    assert(kernel_memory_set_limit(cap));
+    struct ExternResultNullableCvoid encoded = write_state_encode(state.ok, observe_encoded, engine);
+    assert(encoded.tag == ErrNullableCvoid);
+    assert((uintptr_t)encoded.err == MemoryBudgetError + 1);
+    assert(kernel_memory_usage(&after));
+    assert(after.reserved == before.reserved && after.rejected > before.rejected);
+    struct OptionalValueusize unlimited = {Noneusize, {.some = 0}};
+    assert(kernel_memory_set_limit(unlimited));
+    encoded = write_state_encode(state.ok, observe_encoded, engine);
+    assert(encoded.tag == OkNullableCvoid);
+    free_write_state(state.ok);
+    free_update_table_txn(txn.ok);
+    free_snapshot(load.snapshot);
+    free_engine(engine);
+    assert(kernel_memory_usage(&after));
+    printf("C FFI global zero-headroom write encoding rejected and recovered; rejected=%zu\n", after.rejected);
+    return after.reserved;
+  }
   if (!load.reject) {
     struct ExternResultHandleSharedScan scan = scan_builder_build(scan_builder(load.snapshot), engine);
     assert(scan.tag == OkHandleSharedScan);
@@ -138,8 +174,12 @@ static size_t global_lifecycle(struct KernelStringSlice path, HandleSharedExtern
   if (!load.reject) {
     assert(kernel_memory_usage(&usage));
     assert(usage.reserved >= plan_bytes.len && plan_bytes.len > 0);
+    struct OptionalValueusize release_cap = {Someusize, {.some = usage.reserved}};
+    assert(kernel_memory_set_limit(release_cap));
     assert(pthread_create(&thread, NULL, release_plan_bytes, &plan_bytes) == 0);
     assert(pthread_join(thread, NULL) == 0);
+    struct OptionalValueusize restored = {enforce ? Someusize : Noneusize, {.some = limit}};
+    assert(kernel_memory_set_limit(restored));
   }
   assert(kernel_memory_usage(&usage));
   if (enforce) {
@@ -174,7 +214,7 @@ int main(int argc, char **argv) {
   assert(kernel_memory_usage(&initial));
   bool reject = enforce && limit == 0;
   if (reject) limit = initial.reserved;
-  if (enforce) {
+  if (enforce && !reject) {
     struct OptionalValueusize cap = {Someusize, {.some = limit}};
     assert(kernel_memory_set_limit(cap));
   }
@@ -183,14 +223,14 @@ int main(int argc, char **argv) {
   struct ErrorAllocators errors = {NULL, kernel_error, delta_error};
   size_t retained = 0;
   for (int pass = 0; pass < (reject ? 1 : 2); ++pass) {
-    if (enforce) {
+    if (enforce && !reject) {
       struct OptionalValueusize cap = {Someusize, {.some = limit}};
       assert(kernel_memory_set_limit(cap));
     }
     struct ExternResultHandleSharedExternEngine engine = get_default_engine(path, &errors);
     assert(engine.tag == OkHandleSharedExternEngine);
     size_t current = global_lifecycle(path, engine.ok, enforce, limit, initial.peak, reject);
-    if (pass > 0 || reject) assert(current == (reject ? initial.reserved : retained));
+    if (pass > 0) assert(current == retained);
     retained = current;
   }
   return 0;

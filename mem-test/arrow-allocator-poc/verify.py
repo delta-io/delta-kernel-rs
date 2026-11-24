@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check allocation ownership and inject errors at each participating Arrow allocation."""
+"""Check global allocation ownership and survey fallible versus infallible failure paths."""
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -44,6 +44,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binaries", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--record-infallible-gaps", action="store_true",
+                        help="Record allocation aborts separately instead of failing the survey")
     args = parser.parse_args()
     directory = args.binaries.resolve()
     receipts = [invoke(directory / "allocation_checks", [case]) for case in CHECKS]
@@ -66,13 +68,17 @@ def main():
                     receipts.extend(sequence)
         finally:
             shutil.rmtree(source)
-    failures = [receipt for receipt in receipts if not receipt["ok"]]
+    gaps = [receipt for receipt in receipts if not receipt["ok"]
+            and receipt.get("exit") in [-6, 134]
+            and "memory allocation" in receipt.get("stderr", "")]
+    failures = [receipt for receipt in receipts if not receipt["ok"]
+                and (not args.record_infallible_gaps or receipt not in gaps)]
     report = {"checks": len(receipts), "injected_errors": sum(
         receipt.get("injected", False) for receipt in receipts
-    ), "failures": failures, "receipts": receipts}
+    ), "failures": failures, "recoverability_gaps": gaps, "receipts": receipts}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n")
-    print(json.dumps({key: report[key] for key in ["checks", "injected_errors", "failures"]}))
+    print(json.dumps({key: report[key] for key in ["checks", "injected_errors", "failures", "recoverability_gaps"]}))
     raise SystemExit(bool(failures))
 
 
