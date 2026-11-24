@@ -6,7 +6,7 @@ use rstest::rstest;
 use serde_json::{Value, json};
 use url::Url;
 
-use super::CHECKPOINT_SCHEMA_THRESHOLD;
+use super::{CHECKPOINT_SCHEMA_THRESHOLD, json_checksum};
 use crate::arrow::array::StringArray;
 use crate::arrow::record_batch::RecordBatch;
 use crate::checkpoint::CheckpointWriter;
@@ -344,6 +344,7 @@ async fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
 
     let bytes = writer.last_checkpoint_bytes_from_result(data_result(batches))?;
     let value: Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(value["checksum"], json_checksum::json_checksum(&value));
     assert_eq!(
         value,
         json!({
@@ -361,7 +362,7 @@ async fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
             }],
             "tags": null,
             "v2Checkpoint": null,
-            "checksum": null,
+            "checksum": value["checksum"],
         }),
     );
     let hint: LastCheckpointHint = serde_json::from_slice(&bytes)?;
