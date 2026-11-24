@@ -6,14 +6,15 @@ use super::CheckpointWriter;
 use crate::action_reconciliation::RetentionCalculator as _;
 use crate::action_reconciliation::plan::action_set::ActionSet;
 use crate::action_reconciliation::plan::{MetadataPlanner, VERSION};
-use crate::expressions::{Expression as Expr, Predicate, col, lit};
+use crate::actions::{CHECKPOINT_METADATA_FIELD, CHECKPOINT_METADATA_NAME, CheckpointMetadata};
+use crate::expressions::{Expression as Expr, Predicate, Scalar, col, lit, null_lit};
 use crate::plans::{Plan, PlanBuilder};
 use crate::scan::{PartitionValuesOptions, StatsOptions};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::{Engine, KernelError, KernelResult};
 
 impl CheckpointWriter {
-    /// Builds the rows for a single-part V1 checkpoint.
+    /// Builds rows for a single-part V1 or inline V2 checkpoint, based on the table features.
     ///
     /// Shares source planning and typed metadata conversion with scans. File writing and
     /// publication remain with the caller. Collation-stat sampling is unsupported.
@@ -22,19 +23,46 @@ impl CheckpointWriter {
     }
 
     fn checkpoint_actions(&self, engine: &dyn Engine) -> KernelResult<PlanBuilder> {
-        if self.schema_context.is_v2 {
-            return Err(KernelError::unsupported(
-                "This plan requires a V1 checkpoint writer",
-            ));
-        }
-        self.metadata_planner(ActionSet::ALL)?
+        let actions = self
+            .metadata_planner(ActionSet::ALL)?
             .with_checkpoint_shape(self.snapshot.checkpoint_info(engine)?)
             .replay()?
             .filter(Predicate::and(
                 file_retention_predicate(self.deleted_file_retention_timestamp()?),
                 non_content_retention_predicate(self.get_transaction_expiration_timestamp()?),
             ))?
-            .project_patch(checkpoint_file_projection)
+            .project_patch(|patch| {
+                let patch = checkpoint_file_projection(patch);
+                if self.schema_context.is_v2 {
+                    patch.append(
+                        CHECKPOINT_METADATA_FIELD.clone(),
+                        null_lit(CHECKPOINT_METADATA_FIELD.data_type().clone()),
+                    )
+                } else {
+                    patch
+                }
+            })?;
+        if !self.schema_context.is_v2 {
+            return Ok(actions);
+        }
+        let checkpoint_metadata: Scalar = CheckpointMetadata {
+            version: self.version,
+            tags: None,
+        }
+        .into();
+        let row = actions
+            .schema()
+            .fields()
+            .map(|field| {
+                if field.name() == CHECKPOINT_METADATA_NAME {
+                    checkpoint_metadata.clone()
+                } else {
+                    Scalar::null(field.data_type().clone())
+                }
+            })
+            .collect();
+        let metadata = PlanBuilder::values(actions.schema().clone(), vec![row])?;
+        PlanBuilder::union_all([actions, metadata])
     }
 
     /// Configures metadata replay using this writer's output representations and schemas.

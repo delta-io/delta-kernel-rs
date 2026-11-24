@@ -1,4 +1,4 @@
-//! Complete `_last_checkpoint` metadata for single-part V1 checkpoints.
+//! Complete `_last_checkpoint` metadata for classic single-part checkpoints.
 
 use std::sync::LazyLock;
 
@@ -7,7 +7,7 @@ use serde::Serialize;
 mod json_checksum;
 mod write;
 
-use super::super::{CheckpointWriter, LastCheckpointHintStats};
+use super::super::{CheckpointWriter, LastCheckpointHintStats, V2CheckpointConfig};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::schema::{SchemaRef, lazy_schema_ref};
@@ -54,7 +54,12 @@ impl CheckpointWriter {
         }
         let root_size = i64::try_from(root_file.size)
             .map_err(|_| KernelError::checkpoint_write("Checkpoint root size exceeds i64"))?;
-        if stats.size_in_bytes != root_size {
+        let has_sidecars = self.schema_context.is_v2
+            && matches!(
+                &self.v2_checkpoint_config,
+                V2CheckpointConfig::WithSidecar { .. }
+            );
+        if stats.size_in_bytes < root_size || (!has_sidecars && stats.size_in_bytes != root_size) {
             return Err(KernelError::checkpoint_write(
                 "Checkpoint byte count does not match root file",
             ));
@@ -68,6 +73,7 @@ impl CheckpointWriter {
             checkpoint_schema,
             checksum: None,
             tags: None,
+            // Classic filenames do not use the UUID checkpoint locator.
             v2_checkpoint: None,
             #[cfg(feature = "adaptive-metadata-in-dev")]
             checkpoint_type: None,

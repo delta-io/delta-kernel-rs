@@ -13,6 +13,7 @@ use crate::action_reconciliation::file_metadata::{
 use crate::action_reconciliation::log_replay::ActionReconciliationProcessor;
 use crate::action_reconciliation::plan::VERSION;
 use crate::action_reconciliation::plan::action_set::ActionSet;
+use crate::actions::CHECKPOINT_METADATA_NAME;
 use crate::arrow::array::{AsArray as _, StringArray};
 use crate::arrow::compute::{filter_record_batch, is_not_null, is_null, or};
 use crate::arrow::record_batch::RecordBatch;
@@ -37,9 +38,12 @@ fn select_checkpoint_actions(
     batches
         .iter()
         .map(|batch| {
+            let include_metadata = actions == ActionSet::ALL
+                && batch.column_by_name(CHECKPOINT_METADATA_NAME).is_some();
             let selected = batch.project(
                 &actions
                     .output_action_names()
+                    .chain(include_metadata.then_some(CHECKPOINT_METADATA_NAME))
                     .map(|name| batch.schema().index_of(name).unwrap())
                     .collect::<Vec<_>>(),
             )?;
@@ -118,6 +122,10 @@ fn checkpoint_reference_batches(
 #[case("v1-single-part-struct-stats-only")]
 #[case("v1-multi-part-struct-stats-only")]
 #[case("v1-multi-part-partitioned-struct-stats-only")]
+#[case("v2-checkpoints-json-without-sidecars")]
+#[case("v2-checkpoints-parquet-without-sidecars")]
+#[case("v2-checkpoints-json-with-sidecars")]
+#[case("v2-checkpoints-parquet-with-sidecars")]
 fn checkpoint_plan_matches_existing_checkpoint_data(
     #[case] table: &str,
     #[values(false, true)] with_tail: bool,
