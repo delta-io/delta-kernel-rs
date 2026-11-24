@@ -14,6 +14,7 @@ use crate::arrow::array::{
     Array, ArrayRef, GenericByteArray, OffsetSizeTrait, RecordBatch, RunArray, StringViewArray,
     StructArray,
 };
+#[cfg(feature = "declarative-plans")]
 use crate::arrow::buffer::NullBuffer;
 use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{
@@ -323,6 +324,7 @@ impl EngineData for ArrowEngineData {
         true
     }
 
+    #[cfg(feature = "declarative-plans")]
     fn is_null(&self, name: &ColumnName) -> KernelResult<Vec<bool>> {
         require!(
             !name.path().is_empty(),
@@ -581,11 +583,13 @@ mod tests {
 
     use super::{ArrowEngineData, extract_record_batch};
     use crate::actions::{LOG_PROTOCOL_SCHEMA, Metadata, Protocol, get_commit_schema};
+    #[cfg(feature = "declarative-plans")]
+    use crate::arrow::array::new_null_array;
     use crate::arrow::array::types::{Int32Type, Int64Type};
     use crate::arrow::array::{
         Array, ArrayRef, AsArray, BinaryArray, BooleanArray, Int32Array, Int64Array,
         LargeBinaryArray, LargeStringArray, ListArray, ListViewArray, MapArray, RecordBatch,
-        RunArray, StringArray, StringViewArray, StructArray, new_null_array,
+        RunArray, StringArray, StringViewArray, StructArray,
     };
     use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{
@@ -1620,6 +1624,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "declarative-plans")]
     #[rstest]
     #[case::primitive(
         Arc::new(Int32Array::from(vec![Some(1), None, Some(2), None])),
@@ -1664,6 +1669,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "declarative-plans")]
     #[rstest]
     #[case::struct_column(&["nested"], Ok([true, false, false, false]))]
     #[case::inner_struct(&["nested", "inner"], Ok([true, true, false, false]))]

@@ -526,7 +526,7 @@ pub trait RowVisitor {
 
 /// Any type that an engine wants to return as "data" needs to implement this trait. The bulk of the
 /// work is in the [`EngineData::visit_rows`] method. See the docs for that method for more details.
-/// Use [`EngineData::is_null`] to inspect struct nullability without extracting leaf values.
+/// With `declarative-plans`, use `EngineData::is_null` to inspect struct nullability.
 /// ```rust
 /// # use std::any::Any;
 /// # use delta_kernel::KernelResult;
@@ -570,6 +570,7 @@ pub trait RowVisitor {
 ///   fn has_field(&self, name: &ColumnName) -> bool {
 ///     todo!() // determine whether the field exists in the data
 ///   }
+///   #[cfg(feature = "declarative-plans")]
 ///   fn is_null(&self, name: &ColumnName) -> KernelResult<Vec<bool>> {
 ///     todo!() // check each row for nullness of the selected field or a struct ancestor
 ///   }
@@ -652,6 +653,7 @@ pub trait EngineData: AsAny {
     /// Returns an error if the path is empty, a field is missing, or a
     /// non-final path component is not a struct. The full path must be validated even when an
     /// ancestor is null.
+    #[cfg(feature = "declarative-plans")]
     fn is_null(&self, name: &ColumnName) -> KernelResult<Vec<bool>>;
 }
 
