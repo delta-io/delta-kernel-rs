@@ -1,4 +1,4 @@
-${base_context}
+${project_guidance}
 
 ${review_rules}
 
@@ -37,8 +37,8 @@ For each new/changed logic path identified in Step 1, determine:
 
 For delta-kernel-rs changes, check coverage of these scenarios where relevant:
 - **Normal commits** — basic read/write with commit JSON files
-- **Checkpoints** — V1 Parquet, V2 multi-part, checkpoint at version 0
-- **CRC files** — `.crc` sidecar validation
+- **Checkpoints** — V1 and V2 specs; classic, multi-part, and UUID-named files; checkpoint at version 0
+- **CRC files** — version checksum (`.crc`) file validation
 - **Log compaction** — compacted commit files
 - **Time travel** — reading at specific versions
 - **Empty tables** — table with metadata but no data files
@@ -56,7 +56,7 @@ Beyond just existence, evaluate test quality:
 - Are tests **independent**? (no ordering dependencies between tests)
 - Is **rstest** used for parameterized cases instead of copy-pasted tests?
 - Do integration tests use **realistic table fixtures** or synthetic minimal ones?
-- Are **error messages** asserted, not just error types?
+- Do negative tests identify the **specific error** (code, variant, or stable message substring), not just that some error occurred?
 - Are there **flaky patterns**? Anything depending on timing we don't fully control is a red flag:
   - Timestamp comparisons that assume ordering
   - `sleep` calls of various forms
@@ -68,9 +68,10 @@ Beyond just existence, evaluate test quality:
 Tests should exercise the **contract**, not merely follow the shape of the code. Key principles:
 - The code needs clear enough contracts (via types, doc comments, naming) that you can write reasonable test cases _without_ looking at the implementation. If it doesn't, stop and flag that as the real problem.
 - Don't replicate the code's control flow in the test — that just verifies the code does what it currently does, not what it _should_ do.
-- **Don't match on specific error messages** — error messages can change as strings are refined or internal control flow evolves. This is an anti-pattern because you don't want to update a zillion negative tests just because a string changed. Error enum variants are better when fine-grained enough; error codes (if available) are ideal.
-- When a test fails, assess _very carefully_ whether the test is wrong or the code under test is wrong. The worst outcome is silently adjusting a test to match buggy behavior (and then adjusting more broken tests to match the new bug).
-- **STOP and ask for help** if there's ANY uncertainty about where the real problem lies, if a simple fix blows up into complex/wide-ranging changes, or if you find yourself iterating.
+- **Assert errors at the most stable level available** -- use a code or variant when it identifies
+  the specific failure, otherwise a stable substring via `assert_result_error_with_message`.
+  Exact full-message matches are brittle. Neither a variant assertion nor a stable substring
+  assertion is a defect by itself.
 - Recognize that many helpers receive more than adequate coverage from the code that uses them, assuming that code is well-tested. Don't demand dedicated tests for every helper.
 
 ## Output Format

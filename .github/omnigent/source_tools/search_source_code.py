@@ -8,7 +8,7 @@ from typing import Literal
 
 from omnigent_client import tool
 
-Repository = Literal["pr", "delta"]
+Repository = Literal["pr", "delta", "guidance"]
 
 
 def _implementation():
@@ -31,7 +31,7 @@ def search_source_code(
     """Search source text for a fixed, case-sensitive string.
 
     Args:
-        repository: Search the exact PR checkout or read-only Delta reference.
+        repository: Search the PR checkout, Delta reference, or trusted guidance snapshot.
         query: Fixed text to find; regular expressions are not accepted.
         path: Optional repository-relative file or directory path.
         max_results: Maximum matching lines to return, from 1 through 500.
