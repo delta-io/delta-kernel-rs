@@ -5,7 +5,7 @@ use delta_kernel::engine_data::FilteredEngineData;
 
 use super::committed::commit_result_to_committed_handle;
 use super::*;
-use crate::delta_types::FfiStringMap;
+use crate::delta_types::{FfiStringArray, FfiStringMap};
 
 /// A handle for an update-table transaction (`Transaction<UpdateTable>`).
 ///
@@ -376,6 +376,29 @@ pub unsafe extern "C" fn update_table_txn_builder_with_table_properties_added(
     let engine = unsafe { engine.as_ref() };
     let result = unsafe { properties.try_to_hash_map() }
         .map(|properties| Box::new(builder.with_table_properties_added(properties)).into());
+    unsafe { result.into_extern_result(&engine) }
+}
+
+/// Adds requested table-property removals from a borrowed string array. Repeated calls accumulate
+/// keys.
+///
+/// Copies keys before returning a replacement builder, or a decoding error. Build rejects Delta
+/// property removals and overlap with additions. An absent ordinary key is a successful no-op.
+///
+/// # Safety
+///
+/// All handles and nested string slices must be valid for this call. Borrows `keys` and `engine`
+/// and unconditionally consumes `builder`, including on errors.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn update_table_txn_builder_with_table_properties_removed(
+    builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
+    keys: FfiStringArray,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
+    let builder = unsafe { *builder.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    let result = unsafe { keys.try_to_strings() }
+        .map(|keys| Box::new(builder.with_table_properties_removed(keys)).into());
     unsafe { result.into_extern_result(&engine) }
 }
 

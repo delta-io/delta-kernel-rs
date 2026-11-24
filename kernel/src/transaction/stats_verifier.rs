@@ -110,7 +110,7 @@ impl ColumnStatsValidator {
 }
 
 /// Build a stat column path: `stats.{category}.{column_path}`.
-fn build_stat_path(column: &ColumnName, category: &str) -> ColumnName {
+pub(super) fn build_stat_path(column: &ColumnName, category: &str) -> ColumnName {
     let mut path = vec!["stats".to_string(), category.to_string()];
     path.extend(column.iter().map(|s| s.to_string()));
     ColumnName::new(path)
@@ -181,7 +181,7 @@ static NUM_RECORDS_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
 });
 
 /// Select the predefined static type array for a given column data type.
-fn column_types_for(dt: &DataType) -> KernelResult<&'static ColumnNamesAndTypes> {
+pub(super) fn column_types_for(dt: &DataType) -> KernelResult<&'static ColumnNamesAndTypes> {
     match dt {
         #[cfg(feature = "udt-in-dev")]
         DataType::UserDefined(_) => Err(KernelError::unsupported("UDT min/max statistics")),

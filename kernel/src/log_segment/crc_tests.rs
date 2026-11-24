@@ -867,8 +867,9 @@ async fn test_lagging_checkpoint_action_defers_to_crc_pm() {
         .assert_p_m(None, crc_config.protocol(), crc_config.metadata());
 }
 
-// A CRC bounds P&M replay. A checkpoint action outside that replay, or omitted by its projection,
-// is resolved by following the newest commit's pointer.
+// A CRC-seeded pruned replay captures the latest checkpoint action only when it reads the pointed
+// manifest commit, which must be after the CRC. Otherwise the snapshot follows the newest commit's
+// pointer.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[rstest]
 #[case::pointed_commit_after_crc(pm_commit_actions(), self_pointing_manifest_commit(1), 1)]
@@ -896,10 +897,8 @@ async fn test_crc_seeded_replay_follows_pointer_to_checkpoint_action(
         .build()
         .await;
     test.assert_p_m(None, config.protocol(), config.metadata());
-    // Imperative replay projects checkpoint actions from commits after the CRC; the declarative
-    // P&M plan only projects the top-level P&M actions.
-    let expected_captured_version =
-        (pointed_version > 0 && !cfg!(feature = "declarative-plans")).then_some(pointed_version);
+    // Replay projects checkpoint actions only from the commits after the CRC.
+    let expected_captured_version = (pointed_version > 0).then_some(pointed_version);
     assert_eq!(
         test.captured_checkpoint_action()
             .map(|action| action.version),

@@ -255,6 +255,8 @@ pub trait KernelPredicateEvaluator {
                     None
                 }
             },
+            // Not evaluated for skipping; returning `None` never prunes, so it is always safe.
+            UnaryPredicateOp::HasUriScheme => None,
         }
     }
 

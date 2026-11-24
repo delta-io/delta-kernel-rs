@@ -635,7 +635,7 @@ async fn checkpoint_retains_successful_sidecar_output_after_write_failure(
     let files = engine
         .inner
         .storage_handler()
-        .list_from(&sidecar_dir)?
+        .list_from(&sidecar_dir, None)?
         .collect::<KernelResult<Vec<_>>>()?;
     assert_eq!(files.len(), fail_at - 1 + usize::from(write_before_error));
     let stored_bytes: u64 = files.iter().map(|file| file.size).sum();
@@ -1089,8 +1089,12 @@ struct ControlledStorageHandler {
 }
 
 impl StorageHandler for ControlledStorageHandler {
-    fn list_from(&self, path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
-        self.inner.list_from(path)
+    fn list_from(
+        &self,
+        path: &Url,
+        end: Option<&Url>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+        self.inner.list_from(path, end)
     }
 
     fn read_files(

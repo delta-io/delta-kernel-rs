@@ -546,6 +546,21 @@ impl Metadata {
         self
     }
 
+    /// Returns a new Metadata with the given configuration keys removed.
+    ///
+    /// Missing keys are ignored. All other configuration entries and metadata fields are
+    /// preserved.
+    #[internal_api]
+    pub(crate) fn with_configuration_keys_unset(
+        mut self,
+        keys: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Self {
+        for key in keys {
+            self.configuration.remove(key.as_ref());
+        }
+        self
+    }
+
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_unchecked(
@@ -1682,27 +1697,28 @@ impl<'de> Deserialize<'de> for CheckpointAction {
 fn content_sidecar_element(type_str: &str, sidecar: Sidecar) -> KernelResult<Scalar> {
     let sidecar: StructData = sidecar.into();
     let fields = std::iter::once(StructField::not_null("type", DataType::STRING))
-        .chain(sidecar.fields().iter().cloned());
+        .chain(sidecar.fields().cloned());
     let values = std::iter::once(Scalar::from(type_str))
         .chain(sidecar.values().iter().cloned())
         .collect();
-    let fields = StructType::try_new(fields)?.into_fields().collect();
-    Ok(Scalar::Struct(StructData::try_new(fields, values)?))
+    let schema = Arc::new(StructType::try_new(fields)?);
+    Ok(Scalar::Struct(StructData::try_new(schema, values)?))
 }
 
 /// Wrap a single element `value` into a full union struct matching the checkpoint array's element
 /// type: the field named `field_name` holds `value`, every other field is a typed null.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 fn checkpoint_action_union_element(field_name: &str, value: Scalar) -> KernelResult<Scalar> {
-    let fields: Vec<StructField> = CHECKPOINT_ACTION_ELEMENT_SCHEMA.fields().cloned().collect();
     require!(
-        fields.iter().any(|f| f.name() == field_name),
+        CHECKPOINT_ACTION_ELEMENT_SCHEMA
+            .fields()
+            .any(|f| f.name() == field_name),
         KernelError::generic(format!(
             "checkpoint union element field {field_name:?} not found in element schema"
         ))
     );
-    let values = fields
-        .iter()
+    let values = CHECKPOINT_ACTION_ELEMENT_SCHEMA
+        .fields()
         .map(|field| {
             if field.name() == field_name {
                 value.clone()
@@ -1711,7 +1727,10 @@ fn checkpoint_action_union_element(field_name: &str, value: Scalar) -> KernelRes
             }
         })
         .collect();
-    Ok(Scalar::Struct(StructData::try_new(fields, values)?))
+    Ok(Scalar::Struct(StructData::try_new(
+        CHECKPOINT_ACTION_ELEMENT_SCHEMA.clone(),
+        values,
+    )?))
 }
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -3257,7 +3276,7 @@ mod tests {
         let Scalar::Struct(struct_data) = &scalar else {
             panic!("Expected struct scalar, got {scalar}");
         };
-        let field_names: Vec<_> = struct_data.fields().iter().map(|f| f.name()).collect();
+        let field_names: Vec<_> = struct_data.fields().map(|f| f.name()).collect();
         assert_eq!(field_names, ["provider", "options"]);
         assert_eq!(struct_data.values()[0], Scalar::from("parquet"));
 
@@ -3517,7 +3536,7 @@ mod tests {
 
         let add: Add = serde_json::from_str(json).unwrap();
         let data: StructData = add.clone().into();
-        StructData::try_new(data.fields().to_vec(), data.values().to_vec())
+        StructData::try_new(data.schema().clone(), data.values().to_vec())
             .expect("complete add must match its derived schema");
         assert_eq!(
             add.partition_values,

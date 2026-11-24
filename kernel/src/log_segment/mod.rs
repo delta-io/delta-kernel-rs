@@ -428,6 +428,8 @@ impl LogSegment {
     /// The checkpoint schema from the `_last_checkpoint` hint, when the hint describes the selected
     /// checkpoint (see [`Self::checkpoint_hint`]) and carried a `checkpointSchema`. `None`
     /// otherwise -- the caller then reads the checkpoint footer instead.
+    // TODO(#4048): `applies_to` matches only version and naming, so this schema can describe an
+    // earlier classic-named file that another writer replaced, and hide the new file's sidecars.
     pub(crate) fn checkpoint_hint_schema(&self) -> Option<SchemaRef> {
         self.checkpoint_hint()?.checkpoint_schema.clone()
     }
@@ -1394,16 +1396,18 @@ impl LogSegment {
         Ok(actions)
     }
 
+    /// Scan files for `paths`, each tagged with file-constant `version` set to `version_of(path)`.
     #[cfg(feature = "declarative-plans")]
     fn version_tagged_scan_files<'a>(
         paths: impl IntoIterator<Item = &'a ParsedLogPath>,
+        version_of: impl Fn(&ParsedLogPath) -> KernelResult<i64>,
     ) -> KernelResult<Vec<ScanFile>> {
         paths
             .into_iter()
             .map(|path| {
                 Ok(ScanFile {
                     meta: path.location.clone(),
-                    file_constants: vec![Scalar::Long(path.version_as_i64()?)],
+                    file_constants: vec![Scalar::Long(version_of(path)?)],
                 })
             })
             .collect()
@@ -1419,7 +1423,10 @@ impl LogSegment {
         &self,
         use_compactions: bool,
     ) -> KernelResult<Vec<ScanFile>> {
-        Self::version_tagged_scan_files(self.scan_commit_paths(use_compactions))
+        Self::version_tagged_scan_files(
+            self.scan_commit_paths(use_compactions),
+            ParsedLogPath::version_as_i64,
+        )
     }
 
     /// Returns the checkpoint parts tagged with file-constant `version`, paired with the single
@@ -1444,7 +1451,10 @@ impl LogSegment {
         } else {
             FileType::Parquet
         };
-        Ok(Some((file_type, Self::version_tagged_scan_files(parts)?)))
+        Ok(Some((
+            file_type,
+            Self::version_tagged_scan_files(parts, ParsedLogPath::version_as_i64)?,
+        )))
     }
 
     /// Determines the file actions schema and extracts sidecar file references for checkpoints.
@@ -1466,6 +1476,7 @@ impl LogSegment {
         engine: &dyn Engine,
     ) -> KernelResult<(Option<SchemaRef>, Vec<FileMeta>)> {
         // Hint schema from `_last_checkpoint` avoids footer reads when available.
+        // TODO(#4048): a stale hint schema without a `sidecar` column hides the file's sidecars.
         let hint_schema = self.checkpoint_hint_schema();
 
         // All parts of a multi-part checkpoint belong to the same table version and follow

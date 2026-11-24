@@ -199,7 +199,12 @@ pub type SchemaStructPatchBuilder = crate::struct_patch::StructPatchBuilder<Stru
 /// [`delta_kernel_derive::ToSchema`] derive macro.
 #[internal_api]
 pub(crate) trait ToSchema {
-    fn to_schema() -> StructType;
+    fn to_schema() -> StructType {
+        Self::schema_ref().as_ref().clone()
+    }
+
+    /// Returns the schema cached for this concrete type.
+    fn schema_ref() -> &'static SchemaRef;
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq, From)]
@@ -2862,11 +2867,6 @@ impl DataType {
         fields: impl IntoIterator<Item = KernelResult<StructField, E>>,
     ) -> KernelResult<Self> {
         StructType::try_from_results(fields).map(Self::from)
-    }
-
-    /// Create a new struct type with the given fields without validating them.
-    pub(crate) fn struct_type_unchecked(fields: impl IntoIterator<Item = StructField>) -> Self {
-        StructType::new_unchecked(fields).into()
     }
 
     /// Create a new unshredded [`DataType::Variant`]. This data type is a struct of two not-null
