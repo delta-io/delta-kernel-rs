@@ -733,8 +733,10 @@ fn map_has_key(map: &ArrayRef, key: &ArrayRef) -> KernelResult<BooleanArray> {
     let row_of_each_entry: UInt32Array = (0..map.len())
         .flat_map(|row| std::iter::repeat_n(row as u32, entries_in_row(row)))
         .collect();
-    let entry_keys = map.keys().slice(first_entry, row_of_each_entry.len());
-    let (entry_keys, key) = align_comparison_operands(entry_keys, key.clone())?;
+    // View layouts share their bytes, so `take` repeats each key without copying it per entry.
+    let entry_keys =
+        arrow_convert_to_view_type(map.keys().slice(first_entry, row_of_each_entry.len()))?;
+    let key = arrow_convert_to_view_type(key.clone())?;
     let key_for_each_entry = take(key.as_ref(), &row_of_each_entry, None)?;
 
     // Compare all entries at once, then check each row for at least one match.
@@ -3436,6 +3438,12 @@ mod tests {
         create_map_batch(keys, vec![0, 2, 2], None)
     }
 
+    fn assert_invalid_expression<T: std::fmt::Debug>(result: &KernelResult<T>) {
+        let is_invalid_expression =
+            matches!(result, Err(KernelError::InvalidExpressionEvaluation(_)));
+        assert!(is_invalid_expression, "{result:?}");
+    }
+
     fn create_nested_key_map_batch() -> RecordBatch {
         let field = Arc::new(ArrowField::new("x", ArrowDataType::Int32, false));
         let keys = StructArray::from(vec![(
@@ -3470,9 +3478,7 @@ mod tests {
         let batch = create_accessor_map_batch();
         let expr = Expr::map_len(input);
         let result = evaluate_expression(&expr, &batch, result_type.as_ref());
-        let is_invalid_expression =
-            matches!(result, Err(KernelError::InvalidExpressionEvaluation(_)));
-        assert!(is_invalid_expression, "{result:?}");
+        assert_invalid_expression(&result);
     }
 
     #[rstest]
@@ -3498,6 +3504,11 @@ mod tests {
 
     #[rstest]
     #[case::sliced_batch(create_accessor_map_batch().slice(1, 3), col!("k"), vec![None, None, Some(true)])]
+    #[case::sliced_batch_after_entries(
+        create_map_batch(Arc::new(StringArray::from(vec!["a", "b", "c"])), vec![0, 1, 2, 3], None).slice(1, 2),
+        lit("c"),
+        vec![Some(false), Some(true)],
+    )]
     #[case::empty_batch(create_accessor_map_batch().slice(0, 0), lit("a"), vec![])]
     #[case::null_map_owning_entries(
         create_map_batch(Arc::new(StringArray::from(vec!["a", "b"])), vec![0, 1, 2], Some(vec![true, false])),
@@ -3567,9 +3578,7 @@ mod tests {
     ) {
         let pred = Pred::map_has_key(map, key);
         let result = evaluate_predicate(&pred, &batch, inverted);
-        let is_invalid_expression =
-            matches!(result, Err(KernelError::InvalidExpressionEvaluation(_)));
-        assert!(is_invalid_expression, "{result:?}");
+        assert_invalid_expression(&result);
     }
 
     #[test]
@@ -3577,9 +3586,7 @@ mod tests {
         let batch = create_accessor_map_batch();
         let key: ArrayRef = Arc::new(StringArray::from(vec!["a"]));
         let result = map_has_key(batch.column(0), &key);
-        let is_invalid_expression =
-            matches!(result, Err(KernelError::InvalidExpressionEvaluation(_)));
-        assert!(is_invalid_expression, "{result:?}");
+        assert_invalid_expression(&result);
     }
 
     // ==================== MapToStruct Tests ====================
@@ -4126,7 +4133,7 @@ mod tests {
         let result_type = DataType::from(output_schema);
         let expr = Expr::map_to_struct(col!("s"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type));
-        assert!(result.is_err());
+        assert_invalid_expression(&result);
     }
 
     /// An empty-string map value casts via `empty_string_partition_cast`: `""` for string, empty

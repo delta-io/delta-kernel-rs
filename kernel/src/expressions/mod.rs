@@ -140,7 +140,7 @@ pub enum BinaryPredicateOp {
     /// a NULL key yields NULL. An entry whose value is NULL still counts as present.
     ///
     /// Map keys must have a non-nested type. Keys compare with the same equality as
-    /// [`Equal`](Self::Equal).
+    /// [`Equal`](Self::Equal). A non-map left operand or a key of a different type is an error.
     MapHasKey,
 }
 
@@ -201,7 +201,7 @@ pub enum UnaryExpressionOp {
     // so.
     UriEncodeFileLocation,
     /// `MAP_LEN(map)`: the number of entries in a map, as an INTEGER. A NULL map yields NULL. An
-    /// empty map yields `0`.
+    /// empty map yields `0`. A non-map input is an error.
     MapLen,
 }
 
