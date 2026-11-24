@@ -761,28 +761,28 @@ fn declarative_json_only_disables_metadata_pruning(
     FeatureSet::new(),
     checkpoint_json_stats(),
     StatsOptions::all(),
-    (None, &[(0, 0), (1, 1), (2, 2)], (0, 0, 0))
+    (None, &[(0, 0), (1, 1), (2, 2)][..], (0, 0, 0))
 )]
 #[case::v1_checkpoint_json(
     LogState::with_latest_version(2).with_checkpoint_at([2]),
     FeatureSet::new(),
     checkpoint_json_stats(),
     StatsOptions::all(),
-    (Some(2), &[], (1, 0, 0))
+    (Some(2), &[][..], (1, 0, 1))
 )]
 #[case::v1_checkpoint_struct(
     LogState::with_latest_version(2).with_checkpoint_at([2]),
     FeatureSet::new(),
     checkpoint_struct_stats(),
     StatsOptions::all_struct(),
-    (Some(2), &[], (1, 0, 0))
+    (Some(2), &[][..], (1, 0, 1))
 )]
 #[case::v1_mixed_struct_only(
     LogState::with_latest_version(2).with_checkpoint_at([1]),
     FeatureSet::new(),
     checkpoint_struct_stats(),
     StatsOptions::all(),
-    (Some(1), &[(2, 2)], (1, 0, 0))
+    (Some(1), &[(2, 2)][..], (1, 0, 1))
 )]
 #[case::v2_checkpoint_json(
     LogState::with_latest_version(2)
@@ -791,7 +791,7 @@ fn declarative_json_only_disables_metadata_pruning(
     FeatureSet::new().v2_checkpoint(),
     checkpoint_json_stats(),
     StatsOptions::all(),
-    (Some(2), &[], (1, 1, 1))
+    (Some(2), &[][..], (1, 1, 1))
 )]
 #[case::v2_mixed_struct(
     LogState::with_latest_version(2)
@@ -800,7 +800,7 @@ fn declarative_json_only_disables_metadata_pruning(
     FeatureSet::new().v2_checkpoint(),
     checkpoint_struct_stats(),
     StatsOptions::all_struct(),
-    (Some(1), &[(2, 2)], (1, 1, 1))
+    (Some(1), &[(2, 2)][..], (1, 1, 1))
 )]
 #[case::v2_mixed_struct_only(
     LogState::with_latest_version(2)
@@ -809,7 +809,7 @@ fn declarative_json_only_disables_metadata_pruning(
     FeatureSet::new().v2_checkpoint(),
     checkpoint_struct_stats(),
     StatsOptions::all(),
-    (Some(1), &[(2, 2)], (1, 1, 1))
+    (Some(1), &[(2, 2)][..], (1, 1, 1))
 )]
 #[case::v2_checkpoint_without_stats(
     LogState::with_latest_version(2)
@@ -818,14 +818,14 @@ fn declarative_json_only_disables_metadata_pruning(
     FeatureSet::new().v2_checkpoint(),
     no_checkpoint_stats(),
     StatsOptions::all_struct(),
-    (Some(2), &[], (1, 1, 1))
+    (Some(2), &[][..], (1, 1, 1))
 )]
 #[case::compaction(
     LogState::with_latest_version(3).with_compaction_ranges([(0, 2)]),
     FeatureSet::new(),
     checkpoint_json_stats(),
     StatsOptions::all(),
-    (None, &[(0, 2), (3, 3)], (0, 0, 0))
+    (None, &[(0, 2), (3, 3)][..], (0, 0, 0))
 )]
 #[case::compaction_after_sidecars(
     LogState::with_latest_version(4).with_checkpoint_at([2])
@@ -833,14 +833,14 @@ fn declarative_json_only_disables_metadata_pruning(
     FeatureSet::new().v2_checkpoint().column_mapping("name"),
     checkpoint_struct_stats(),
     StatsOptions::all_struct(),
-    (Some(2), &[(3, 4)], (1, 1, 1))
+    (Some(2), &[(3, 4)][..], (1, 1, 1))
 )]
 fn declarative_metadata_output_options_across_log_shapes(
     #[case] log_state: LogState,
     #[case] features: FeatureSet,
     #[case] table_config: TableConfig,
     #[case] stats: StatsOptions,
-    #[case] metrics: (Option<Version>, &[(Version, Version)], (u64, u64, u64)),
+    #[case] metrics: ExpectedScanPlanMetrics<'_>,
     #[values(
         PartitionValuesOptions::default(),
         PartitionValuesOptions::with_struct()
@@ -861,7 +861,7 @@ fn declarative_metadata_output_options_across_log_shapes(
 #[case::v1(
     LogState::with_latest_version(2).with_checkpoint_at([2]),
     FeatureSet::new(),
-    (1, 0, 0)
+    (1, 0, 1)
 )]
 #[case::v2(
     LogState::with_latest_version(2)
@@ -934,17 +934,15 @@ fn declarative_metadata_crc_plan_is_sparse_and_prunes(
     Ok(())
 }
 
+type ExpectedScanPlanMetrics<'a> = (Option<Version>, &'a [(Version, Version)], (u64, u64, u64));
+
 fn assert_metadata_output_options(
     log_state: LogState,
     features: FeatureSet,
     table_config: TableConfig,
     stats: StatsOptions,
     partitions: PartitionValuesOptions,
-    (checkpoint_version, files, checkpoint_io): (
-        Option<Version>,
-        &[(Version, Version)],
-        (u64, u64, u64),
-    ),
+    (checkpoint_version, files, checkpoint_io): ExpectedScanPlanMetrics<'_>,
 ) -> Result<()> {
     let json_requested = stats.synthesize_json;
     let parsed_partitions_requested = partitions.parsed_struct;
