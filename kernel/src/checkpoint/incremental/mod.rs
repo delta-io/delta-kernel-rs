@@ -1,12 +1,12 @@
 //! All-or-nothing V2 sidecar reuse.
 //!
 //! Root summaries establish base compatibility before a single streaming tail replay. Reuse
-//! requires no inherited Removes, allowlisted operations and tail-local input identities.
+//! requires retained inherited tombstones, allowlisted operations and tail-local input identities.
 //! An unsafe tail continues into inherited sidecars through the same reconciler, preserving
 //! already-written tail output. Successful reuse never opens inherited sidecars.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use itertools::Itertools as _;
@@ -14,7 +14,9 @@ use url::Url;
 
 use self::eligibility::TailEligibility;
 use super::metrics::{CheckpointMetrics, CheckpointPhase};
-use super::{CheckpointWriter, ReusedSidecars, WrittenCheckpointInfo};
+use super::{
+    CheckpointWriter, MIN_REMOVE_DELETION_TIMESTAMP_TAG, ReusedSidecars, WrittenCheckpointInfo,
+};
 use crate::action_reconciliation::RetentionCalculator as _;
 use crate::action_reconciliation::file_metadata::build_checkpoint_transform;
 use crate::actions::visitors::SidecarVisitor;
@@ -43,11 +45,26 @@ impl CheckpointWriter {
         file_actions_per_sidecar_hint: usize,
         metrics: CheckpointMetrics,
     ) -> KernelResult<WrittenCheckpointInfo> {
+        let target_file_count = self
+            .snapshot
+            .crc_at_version()
+            .and_then(|crc| crc.file_stats())
+            .map(|stats| stats.num_files());
+        let Some(target_file_count) =
+            target_file_count.filter(|_| self.snapshot.is_built_as_latest())
+        else {
+            return self.write_v2_checkpoint_with_sidecars(
+                engine,
+                file_actions_per_sidecar_hint,
+                metrics,
+            );
+        };
         let now_ms = current_time_ms()?;
+        let file_retention = self.deleted_file_retention_timestamp()?;
         let Some(ReusableBase {
             captured_root,
             inherited,
-        }) = self.read_reusable_base(engine, &metrics, now_ms)?
+        }) = self.read_reusable_base(engine, &metrics, now_ms, file_retention)?
         else {
             return self.write_v2_checkpoint_with_sidecars(
                 engine,
@@ -58,7 +75,6 @@ impl CheckpointWriter {
         let log_segment = self.snapshot.log_segment();
 
         // Tail output and inherited rows must use the same retention cutoffs.
-        let file_retention = self.deleted_file_retention_timestamp()?;
         let txn_retention = self.get_transaction_expiration_timestamp()?;
 
         let inherited_files: Vec<_> = inherited
@@ -67,6 +83,8 @@ impl CheckpointWriter {
             .map(|reference| reference.file_meta.clone())
             .collect();
         let reuse_allowed = Arc::new(AtomicBool::new(true));
+        let sidecars_started = Arc::new(AtomicUsize::new(0));
+        let inherited_sidecar_count = inherited.references.len();
         let mut tail = TailEligibility::new(
             engine,
             self.read_schema.clone(),
@@ -94,15 +112,26 @@ impl CheckpointWriter {
         })
         .fuse();
 
-        // Tail exhaustion makes reuse_allowed final. Base actions are older than the tail, so
-        // reconciled tail output stays valid whether or not the base is expanded.
+        // The tail outcome and actual output count select reuse before the base is expanded.
+        // Reconciled tail output stays valid on either branch because base actions are older.
         let base_actions = std::iter::once_with({
             let parquet = engine.parquet_handler();
             let read_schema = self.read_schema.clone();
             let metrics = metrics.clone();
             let reuse_allowed = reuse_allowed.clone();
+            let sidecars_started = sidecars_started.clone();
             move || {
-                let reuse = reuse_allowed.load(Ordering::Relaxed);
+                let candidate_sidecars =
+                    inherited_sidecar_count.checked_add(sidecars_started.load(Ordering::Relaxed));
+                let reuse = reuse_allowed.load(Ordering::Relaxed)
+                    && candidate_sidecars.is_some_and(|count| {
+                        density_allows_reuse(
+                            target_file_count,
+                            count,
+                            file_actions_per_sidecar_hint,
+                        )
+                    });
+                reuse_allowed.store(reuse, Ordering::Relaxed);
                 let sidecars: Box<dyn KernelResultIterator<ActionsBatch>> = if reuse {
                     Box::new(std::iter::empty())
                 } else {
@@ -139,6 +168,7 @@ impl CheckpointWriter {
                     ReusedSidecars::default()
                 }
             },
+            Some(sidecars_started),
             metrics,
         )
     }
@@ -148,6 +178,7 @@ impl CheckpointWriter {
         engine: &dyn Engine,
         metrics: &CheckpointMetrics,
         now_ms: i64,
+        file_retention_timestamp: i64,
     ) -> KernelResult<Option<ReusableBase>> {
         let log_segment = self.snapshot.log_segment();
         let [base] = log_segment.listed.checkpoint_parts.as_slice() else {
@@ -227,8 +258,7 @@ impl CheckpointWriter {
         let Some(tags) = root_summary.checkpoint_metadata_tags else {
             return Ok(None);
         };
-        let Some((num_adds, expected_sidecar_schema, sidecar_size)) = trusted_base_summary(&tags)
-        else {
+        let Some(summary) = trusted_base_summary(&tags, file_retention_timestamp) else {
             return Ok(None);
         };
         let context = &self.schema_context;
@@ -238,7 +268,7 @@ impl CheckpointWriter {
             &context.stats_schema,
             context.partition_schema.as_ref(),
         )?;
-        if &expected_sidecar_schema != output_schema.project(&["add", "remove"])?.as_ref() {
+        if &summary.sidecar_schema != output_schema.project(&["add", "remove"])?.as_ref() {
             return Ok(None);
         }
         let mut seen_sidecar_locations = HashSet::new();
@@ -253,7 +283,7 @@ impl CheckpointWriter {
                 .checked_add(reference.file_meta.size)
                 .ok_or_else(|| KernelError::invalid_checkpoint("sidecar sizes overflow"))?;
         }
-        if referenced_size != sidecar_size {
+        if referenced_size != summary.sidecar_size {
             return Ok(None);
         }
 
@@ -261,7 +291,9 @@ impl CheckpointWriter {
             captured_root,
             inherited: ReusedSidecars {
                 references: references.references,
-                num_adds,
+                num_adds: summary.num_adds,
+                num_removes: summary.num_removes,
+                min_remove_deletion_timestamp: summary.min_remove_deletion_timestamp,
             },
         }))
     }
@@ -270,6 +302,13 @@ impl CheckpointWriter {
 struct ReusableBase {
     captured_root: Vec<ActionsBatch>,
     inherited: ReusedSidecars,
+}
+
+fn density_allows_reuse(num_files: i64, num_sidecars: usize, hint: usize) -> bool {
+    let Ok(num_files) = u128::try_from(num_files) else {
+        return false;
+    };
+    hint > 0 && num_sidecars > 0 && 2 * num_files >= (num_sidecars as u128) * (hint as u128)
 }
 
 fn sidecar_is_recent(modification_time: i64, now_ms: i64) -> bool {
@@ -320,12 +359,42 @@ impl RowVisitor for RootSummary {
     }
 }
 
-fn trusted_base_summary(tags: &HashMap<String, String>) -> Option<(i64, StructType, u64)> {
+struct BaseSummary {
+    num_adds: i64,
+    num_removes: i64,
+    min_remove_deletion_timestamp: Option<i64>,
+    sidecar_schema: StructType,
+    sidecar_size: u64,
+}
+
+fn trusted_base_summary(
+    tags: &HashMap<String, String>,
+    file_retention_timestamp: i64,
+) -> Option<BaseSummary> {
     let num_actions: i64 = tags.get(SIDECAR_NUM_ACTIONS_TAG)?.parse().ok()?;
     let num_adds: i64 = tags.get(CHECKPOINT_NUM_ADD_FILES_TAG)?.parse().ok()?;
     let size_in_bytes: u64 = tags.get(SIDECAR_SIZE_IN_BYTES_TAG)?.parse().ok()?;
     let schema = serde_json::from_str(tags.get(SIDECAR_FILE_SCHEMA_TAG)?).ok()?;
-    (num_actions >= 0 && num_actions == num_adds).then_some((num_adds, schema, size_in_bytes))
+    let num_removes = num_actions.checked_sub(num_adds)?;
+    if num_adds < 0 || num_removes < 0 {
+        return None;
+    }
+    let minimum = if num_removes == 0 {
+        None
+    } else {
+        let minimum: i64 = tags.get(MIN_REMOVE_DELETION_TIMESTAMP_TAG)?.parse().ok()?;
+        if minimum <= file_retention_timestamp {
+            return None;
+        }
+        Some(minimum)
+    };
+    Some(BaseSummary {
+        num_adds,
+        num_removes,
+        min_remove_deletion_timestamp: minimum,
+        sidecar_schema: schema,
+        sidecar_size: size_in_bytes,
+    })
 }
 
 /// Collects base sidecar references, preserving null-valued tags that `Sidecar` drops.

@@ -329,6 +329,8 @@ mod tests {
             actions_count: 1,
             add_actions_count: 1,
             remove_actions_count: 0,
+            #[cfg(feature = "incremental-checkpoints-in-dev")]
+            min_remove_deletion_timestamp: None,
         };
         let mut batches = std::iter::once(Ok(batch)).chain(std::iter::once_with(|| {
             panic!("read past the first Add batch")

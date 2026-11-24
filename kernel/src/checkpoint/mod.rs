@@ -105,6 +105,7 @@
 //! [`Snapshot::checkpoint`]: crate::Snapshot::checkpoint
 //! [`Snapshot::create_checkpoint_writer`]: crate::Snapshot::create_checkpoint_writer
 use std::collections::HashMap;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use itertools::Itertools;
@@ -277,6 +278,9 @@ struct CheckpointSchemaContext {
 /// the caller does not provide an explicit hint.
 pub const DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT: usize = 50_000;
 
+#[cfg(feature = "incremental-checkpoints-in-dev")]
+const MIN_REMOVE_DELETION_TIMESTAMP_TAG: &str = "kernel.minRemoveDeletionTimestamp";
+
 /// Specifies the checkpoint format and behavior.
 #[derive(Debug)]
 pub enum CheckpointSpec {
@@ -327,9 +331,12 @@ pub enum V2CheckpointConfig {
     },
     /// Reuse all eligible sidecars from the previous V2 checkpoint. Each tail commit must
     /// declare a supported operation, and its file actions must leave inherited state unchanged.
-    /// The base must report exact counts, zero retained Removes and a compatible sidecar schema;
-    /// every inherited sidecar must be less than 24 hours old. Otherwise, construct a full
-    /// checkpoint. Successful reuse never reads inherited sidecar objects.
+    /// The base must report exact counts, a compatible sidecar schema and sufficient retention
+    /// metadata for inherited Removes. Every inherited sidecar must be less than 24 hours old.
+    /// Reuse requires a snapshot built as latest with complete at-version CRC file statistics.
+    /// If the candidate averages fewer live files per sidecar than half the effective sizing
+    /// hint, or another eligibility check fails, construct a full checkpoint. Successful reuse
+    /// never reads inherited sidecar objects.
     ///
     /// Operation classification relies on supported writer conventions, as incremental CRC
     /// replay does. Operation names alone are not a protocol-wide guarantee of fresh file paths.
@@ -591,6 +598,8 @@ impl CheckpointWriter {
                 actions_count: batch.actions_count,
                 add_actions_count: batch.add_actions_count,
                 remove_actions_count: batch.remove_actions_count,
+                #[cfg(feature = "incremental-checkpoints-in-dev")]
+                min_remove_deletion_timestamp: batch.min_remove_deletion_timestamp,
             })
         });
 
@@ -674,6 +683,7 @@ impl CheckpointWriter {
             file_actions_per_sidecar_hint,
             data,
             ReusedSidecars::default,
+            None,
             metrics,
         )
     }
@@ -684,6 +694,7 @@ impl CheckpointWriter {
         file_actions_per_sidecar_hint: usize,
         (data_iter, output_schema): (ActionReconciliationIterator, SchemaRef),
         reused_sidecars: impl FnOnce() -> ReusedSidecars,
+        sidecars_started: Option<Arc<AtomicUsize>>,
         metrics: CheckpointMetrics,
     ) -> KernelResult<WrittenCheckpointInfo> {
         let iter_state = data_iter.state();
@@ -704,6 +715,7 @@ impl CheckpointWriter {
                 file_actions_per_sidecar_hint,
                 self.snapshot.table_root(),
                 self.snapshot.version(),
+                sidecars_started.clone(),
                 &metrics,
             )? {
                 sidecar_references.push(SidecarReference {
@@ -755,11 +767,12 @@ impl CheckpointWriter {
         let tags = {
             let num_adds =
                 checked_sum_action_counts(iter_state.add_actions_count(), reused.num_adds)?;
-            Some(HashMap::from([
+            let num_removes =
+                checked_sum_action_counts(iter_state.remove_actions_count(), reused.num_removes)?;
+            let mut tags = HashMap::from([
                 (
                     SIDECAR_NUM_ACTIONS_TAG.to_owned(),
-                    checked_sum_action_counts(num_adds, iter_state.remove_actions_count())?
-                        .to_string(),
+                    checked_sum_action_counts(num_adds, num_removes)?.to_string(),
                 ),
                 (
                     SIDECAR_SIZE_IN_BYTES_TAG.to_owned(),
@@ -773,7 +786,21 @@ impl CheckpointWriter {
                     SIDECAR_FILE_SCHEMA_TAG.to_owned(),
                     serde_json::to_string(&output_schema.project(&["add", "remove"])?)?,
                 ),
-            ]))
+            ]);
+            let minimum = match (
+                reused.min_remove_deletion_timestamp,
+                iter_state.min_remove_deletion_timestamp(),
+            ) {
+                (Some(inherited), Some(written)) => Some(inherited.min(written)),
+                (inherited, written) => inherited.or(written),
+            };
+            if let Some(minimum) = minimum {
+                tags.insert(
+                    MIN_REMOVE_DELETION_TIMESTAMP_TAG.to_owned(),
+                    minimum.to_string(),
+                );
+            }
+            Some(tags)
         };
         #[cfg(not(feature = "incremental-checkpoints-in-dev"))]
         let tags = None;
@@ -807,15 +834,22 @@ impl CheckpointWriter {
             sidecar_count,
             &metrics,
         )?;
-        // The generated metadata row and inherited Adds bypass output replay.
+        // The generated metadata row and inherited actions bypass output replay.
+        let inherited_actions = checked_sum_action_counts(reused.num_adds, reused.num_removes)?;
         info.last_checkpoint_stats.num_actions = checked_sum_action_counts(
             info.last_checkpoint_stats.num_actions,
-            checked_sum_action_counts(reused.num_adds, 1)?,
+            checked_sum_action_counts(inherited_actions, 1)?,
         )?;
         info.last_checkpoint_stats.num_of_add_files = checked_sum_action_counts(
             info.last_checkpoint_stats.num_of_add_files,
             reused.num_adds,
         )?;
+        let inherited_removes = u64::try_from(reused.num_removes)
+            .map_err(|_| KernelError::internal_error("Negative inherited Remove count"))?;
+        info.num_remove_files = info
+            .num_remove_files
+            .checked_add(inherited_removes)
+            .ok_or_else(|| KernelError::checkpoint_write("Remove count overflow"))?;
         info.num_reused_sidecars = num_reused_sidecars;
         Ok(info)
     }
@@ -917,6 +951,8 @@ impl CheckpointWriter {
             actions_count: 1,
             add_actions_count: 0,
             remove_actions_count: 0,
+            #[cfg(feature = "incremental-checkpoints-in-dev")]
+            min_remove_deletion_timestamp: None,
         })
     }
 
@@ -1022,10 +1058,15 @@ fn write_single_sidecar(
     file_actions_per_sidecar_hint: usize,
     table_root: &Url,
     version: Version,
+    sidecars_started: Option<Arc<AtomicUsize>>,
     metrics: &CheckpointMetrics,
 ) -> KernelResult<Option<(String, FileMeta)>> {
-    let mut iter =
-        SingleSidecarDataIterator::new(splitter.clone(), file_actions_per_sidecar_hint)?.peekable();
+    let mut iter = SingleSidecarDataIterator::new(
+        splitter.clone(),
+        file_actions_per_sidecar_hint,
+        sidecars_started,
+    )?
+    .peekable();
     if iter.peek().is_none() {
         return Ok(None);
     }
@@ -1043,8 +1084,10 @@ fn write_single_sidecar(
 #[derive(Default)]
 struct ReusedSidecars {
     references: Vec<SidecarReference>,
-    // Reuse requires an Add-only base.
     num_adds: i64,
+    num_removes: i64,
+    #[cfg(feature = "incremental-checkpoints-in-dev")]
+    min_remove_deletion_timestamp: Option<i64>,
 }
 
 fn checked_sum_action_counts(left: i64, right: i64) -> KernelResult<i64> {

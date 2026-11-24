@@ -59,7 +59,7 @@ fn generate_checkpoint_parts(
     let mut sidecar_index = 1usize;
     loop {
         let mut single_sidecar_iter =
-            SingleSidecarDataIterator::new(splitter.clone(), file_actions_per_sidecar_hint)?
+            SingleSidecarDataIterator::new(splitter.clone(), file_actions_per_sidecar_hint, None)?
                 .peekable();
         if single_sidecar_iter.peek().is_some() {
             let sidecar_url = sidecars_base.join(&format!("sidecar_{sidecar_index}.parquet"))?;
@@ -656,7 +656,7 @@ async fn test_splitter_no_file_actions() -> Result<()> {
         Default::default(),
     )?;
 
-    let iter = SingleSidecarDataIterator::new(splitter.clone(), usize::MAX)?;
+    let iter = SingleSidecarDataIterator::new(splitter.clone(), usize::MAX, None)?;
     let total_file_rows: usize = iter.map(|batch| batch.unwrap().len()).sum();
     assert_eq!(total_file_rows, 0, "should have no file-action rows");
 
@@ -734,7 +734,7 @@ fn test_single_sidecar_data_iterator_rejects_zero_max_file_actions_hint() {
     let splitter =
         SidecarSplitter::new_mut_shared(iter, &ArrowEvaluationHandler, schema, Default::default())
             .unwrap();
-    let result = SingleSidecarDataIterator::new(splitter, 0);
+    let result = SingleSidecarDataIterator::new(splitter, 0, None);
     assert!(result.is_err());
     let err = result.err().unwrap();
     assert!(

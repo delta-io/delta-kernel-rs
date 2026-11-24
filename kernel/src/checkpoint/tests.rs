@@ -18,11 +18,16 @@ use crate::arrow::array::{
     Array, AsArray, Int64Array, MapArray, RecordBatch, StructArray, create_array,
 };
 use crate::arrow::datatypes::{DataType, Field, Schema};
+#[cfg(feature = "incremental-checkpoints-in-dev")]
+use crate::arrow::json::writer::{JsonArray, WriterBuilder};
 use crate::checkpoint::{
     CHECKPOINT_ACTIONS_SCHEMA_V2, CheckpointWriter, LastCheckpointHintStats,
     create_last_checkpoint_data,
 };
-#[cfg(feature = "adaptive-metadata-in-dev")]
+#[cfg(any(
+    feature = "adaptive-metadata-in-dev",
+    feature = "incremental-checkpoints-in-dev"
+))]
 use crate::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
@@ -31,6 +36,8 @@ use crate::log_replay::HasSelectionVector;
 use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
+#[cfg(feature = "incremental-checkpoints-in-dev")]
+use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::schema::{DataType as KernelDataType, StructField, schema_ref};
 use crate::table_features::TableFeature;
 use crate::transaction::UpdateTableOperation;
@@ -240,6 +247,54 @@ pub(super) async fn write_commit_to_store(
     let content = json_lines.join("\n");
     let commit_path = delta_path_for_version(version, "json");
     store.put(&commit_path, content.into()).await?;
+    Ok(())
+}
+
+#[cfg(feature = "incremental-checkpoints-in-dev")]
+pub(super) async fn parquet_rows(store: &InMemory, path: &str) -> Vec<Value> {
+    let bytes = store
+        .get(&Path::from(path))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let batches = ParquetRecordBatchReaderBuilder::try_new(bytes)
+        .unwrap()
+        .build()
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    let mut writer = WriterBuilder::new().build::<_, JsonArray>(Vec::new());
+    writer
+        .write_batches(&batches.iter().collect::<Vec<_>>())
+        .unwrap();
+    writer.finish().unwrap();
+    serde_json::from_slice(&writer.into_inner()).unwrap()
+}
+
+// These checkpoint fixtures use zero-byte Adds. Materialize a protocol-valid checksum without
+// requiring incremental CRC replay to support the operation under test (for example RESTORE).
+#[cfg(feature = "incremental-checkpoints-in-dev")]
+pub(super) async fn write_crc_to_store(
+    store: &Arc<InMemory>,
+    snapshot: &Snapshot,
+    num_files: usize,
+) -> KernelResult<()> {
+    let crc = json!({
+        "tableSizeBytes": 0,
+        "numFiles": num_files,
+        "numMetadata": 1,
+        "numProtocol": 1,
+        "metadata": snapshot.table_configuration().metadata(),
+        "protocol": snapshot.table_configuration().protocol(),
+    });
+    store
+        .put(
+            &delta_path_for_version(snapshot.version(), "crc"),
+            serde_json::to_vec(&crc)?.into(),
+        )
+        .await?;
     Ok(())
 }
 
@@ -1419,5 +1474,91 @@ async fn test_checkpoint_with_varchar_metadata_on_field() -> Result<()> {
         .build(&engine)?
         .checkpoint(&engine, None)?;
 
+    Ok(())
+}
+
+#[cfg(feature = "incremental-checkpoints-in-dev")]
+#[rstest::rstest]
+#[case::no_removes(vec![], false, None)]
+#[case::maximum_is_retained(vec![Some(i64::MAX)], false, Some(i64::MAX))]
+#[case::expired_is_omitted(vec![Some(0), Some(i64::MAX)], false, Some(i64::MAX))]
+#[case::missing_is_expired(vec![None], false, None)]
+#[case::missing_is_retained_as_zero(vec![None, Some(i64::MAX)], true, Some(0))]
+#[case::minimum_across_removes(vec![Some(i64::MAX), Some(100), Some(200)], true, Some(100))]
+#[tokio::test]
+async fn full_sidecar_checkpoint_summarizes_only_retained_remove_timestamps(
+    #[case] timestamps: Vec<Option<i64>>,
+    #[case] long_retention: bool,
+    #[case] expected_minimum: Option<i64>,
+) -> Result<()> {
+    let (store, _) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+    let metadata = if long_retention {
+        create_metadata_action_with_config(HashMap::from([(
+            "delta.deletedFileRetentionDuration".into(),
+            "interval 36500 days".into(),
+        )]))
+    } else {
+        create_metadata_action()
+    };
+    let mut actions = vec![
+        metadata,
+        create_v2_checkpoint_protocol_action(),
+        create_add_action("A"),
+    ];
+    actions.extend(timestamps.iter().enumerate().map(|(i, timestamp)| {
+        Action::Remove(crate::actions::Remove {
+            path: format!("old-{i}"),
+            deletion_timestamp: *timestamp,
+            ..Default::default()
+        })
+    }));
+    write_commit_to_store(&store, actions, 0).await?;
+    Snapshot::builder_for("memory:///")
+        .build(&engine)?
+        .checkpoint(
+            &engine,
+            Some(&CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+                file_actions_per_sidecar_hint: Some(1),
+            })),
+        )?;
+    let root = parquet_rows(&store, "_delta_log/00000000000000000000.checkpoint.parquet").await;
+    let tags = &root
+        .iter()
+        .find_map(|row| row.get("checkpointMetadata"))
+        .unwrap()["tags"];
+    let expected_tag = expected_minimum.map(|timestamp| timestamp.to_string());
+    assert_eq!(
+        tags["kernel.minRemoveDeletionTimestamp"].as_str(),
+        expected_tag.as_deref()
+    );
+    let mut actual_removes = Vec::new();
+    for path in root
+        .iter()
+        .filter_map(|row| row["sidecar"]["path"].as_str())
+    {
+        let rows = parquet_rows(&store, &format!("_delta_log/_sidecars/{path}")).await;
+        actual_removes.extend(rows.into_iter().filter_map(|row| {
+            row.get("remove").map(|remove| {
+                (
+                    remove["path"].as_str().unwrap().to_owned(),
+                    remove["deletionTimestamp"].as_i64(),
+                )
+            })
+        }));
+    }
+    actual_removes.sort_unstable();
+    let expected_removes: Vec<_> = timestamps
+        .into_iter()
+        .enumerate()
+        .filter(|(_, timestamp)| long_retention || timestamp.unwrap_or(0) == i64::MAX)
+        .map(|(i, timestamp)| (format!("old-{i}"), timestamp))
+        .collect();
+    assert_eq!(actual_removes, expected_removes);
+    assert_eq!(
+        tags["sidecarNumActions"],
+        (1 + actual_removes.len()).to_string()
+    );
+    assert_eq!(tags["numOfAddFiles"], "1");
     Ok(())
 }

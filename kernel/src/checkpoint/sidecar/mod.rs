@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use itertools::Itertools;
@@ -317,12 +318,14 @@ pub(super) struct SingleSidecarDataIterator {
     /// because we operate on whole `EngineData` batches, which cannot be split.
     max_file_actions_hint: usize,
     yielded_row_count: usize,
+    sidecars_started: Option<Arc<AtomicUsize>>,
 }
 
 impl SingleSidecarDataIterator {
     pub(super) fn new(
         splitter: Arc<Mutex<SidecarSplitter>>,
         max_file_actions_hint: usize,
+        sidecars_started: Option<Arc<AtomicUsize>>,
     ) -> KernelResult<Self> {
         if max_file_actions_hint == 0 {
             return Err(KernelError::checkpoint_write(
@@ -333,6 +336,7 @@ impl SingleSidecarDataIterator {
             splitter,
             max_file_actions_hint,
             yielded_row_count: 0,
+            sidecars_started,
         })
     }
 }
@@ -359,6 +363,17 @@ impl Iterator for SingleSidecarDataIterator {
         };
         match splitter.next_file_actions_batch() {
             Some(Ok(file_batch)) => {
+                // Count a partial sidecar before another pull can reach the base decision.
+                if self.yielded_row_count == 0
+                    && let Some(counter) = &self.sidecars_started
+                    && counter
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                            count.checked_add(1)
+                        })
+                        .is_err()
+                {
+                    return Some(Err(KernelError::checkpoint_write("Sidecar count overflow")));
+                }
                 self.yielded_row_count += file_batch.len();
                 Some(Ok(file_batch))
             }
