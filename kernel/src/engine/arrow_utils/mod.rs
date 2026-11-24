@@ -18,8 +18,8 @@ use self::file_type_validation::validate_file_values_for_read;
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::{
     Array as ArrowArray, ArrayRef as ArrowArrayRef, GenericListArray, GenericListViewArray,
-    MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, RecordBatchOptions, StringArray,
-    StructArray, make_array, new_empty_array, new_null_array,
+    MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StringArray, StructArray, make_array,
+    new_empty_array, new_null_array,
 };
 use crate::arrow::buffer::NullBuffer;
 use crate::arrow::compute::{CastOptions, cast_with_options};
@@ -1263,7 +1263,7 @@ pub(crate) fn fix_record_batch_nested_null_masks(batch: RecordBatch) -> KernelRe
     Ok(RecordBatch::try_new_with_options(
         schema,
         columns,
-        &RecordBatchOptions::new().with_row_count(Some(row_count)),
+        &crate::arrow::array::RecordBatchOptions::new().with_row_count(Some(row_count)),
     )?)
 }
 
@@ -1420,25 +1420,33 @@ fn decode_with_arrow_json<'a>(
     for (json, row_number) in json_strings.zip(1..) {
         let line = json.unwrap_or(missing_input);
         let consumed = decoder.decode(line.as_bytes())?;
-        if consumed != line.len() || decoder.has_partial_record() || decoder.len() != row_number {
+        // did we fail to decode the whole line, or was the line partial
+        if consumed != line.len() || decoder.has_partial_record() {
+            return Err(KernelError::Generic(format!(
+                "Malformed JSON: Multiple, partial, or 0 JSON objects on row {row_number}"
+            )));
+        }
+        // did we decode exactly one record
+        if decoder.len() != row_number {
             return Err(KernelError::Generic(format!(
                 "Malformed JSON: Multiple, partial, or 0 JSON objects on row {row_number}"
             )));
         }
     }
-    let batch = decoder.flush()?.ok_or_else(|| {
-        KernelError::generic(
-            "Malformed JSON: exited parse_json_impl without deserializing anything useful",
-        )
-    })?;
-    require!(
-        batch.num_rows() == num_rows,
-        KernelError::generic(format!(
-            "Unexpected number of rows decoded. Got {}, expected {num_rows}",
-            batch.num_rows()
-        ))
-    );
-    Ok(batch.column(0).clone())
+    // Get the final batch out
+    if let Some(batch) = decoder.flush()? {
+        if batch.num_rows() != num_rows {
+            return Err(KernelError::Generic(format!(
+                "Unexpected number of rows decoded. Got {}, expected{}",
+                batch.num_rows(),
+                num_rows
+            )));
+        }
+        return Ok(batch.column(0).clone());
+    }
+    Err(KernelError::generic(
+        "Malformed JSON: exited parse_json_impl without deserializing anything useful",
+    ))
 }
 
 /// Rewrites failure-prone primitives (`Timestamp`, `TimestampNtz`, `Date`, `Decimal`) to

@@ -2935,15 +2935,19 @@ mod tests {
     }
 
     #[rstest]
-    fn test_parse_json_present_object_requires_non_null_field(
-        #[values("{}", r#"{"a":null}"#)] invalid: &str,
+    #[case::required_long(schema_ref! { not_null "a": LONG }, r#"{"a":1}"#)]
+    #[case::required_date(schema_ref! { not_null "a": DATE }, r#"{"a":"1970-01-02"}"#)]
+    fn test_parse_json_invalid_required_field_nulls_batch(
+        #[case] output_schema: SchemaRef,
+        #[case] valid: &str,
+        #[values("{}", r#"{"a":null}"#, r#"{"a":"invalid"}"#)] invalid: &str,
     ) {
         let batch = RecordBatch::try_from_iter([(
             "json_col",
-            Arc::new(StringArray::from(vec![invalid, r#"{"a":1}"#])) as ArrayRef,
+            Arc::new(StringArray::from(vec![invalid, valid])) as ArrayRef,
         )])
         .unwrap();
-        let expr = Expr::parse_json(col!("json_col"), schema_ref! { not_null "a": LONG });
+        let expr = Expr::parse_json(col!("json_col"), output_schema);
         let result = evaluate_expression(&expr, &batch, None).expect("parses permissively");
         assert_eq!(result.len(), 2);
         assert_eq!(result.null_count(), 2);
