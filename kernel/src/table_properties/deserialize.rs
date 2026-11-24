@@ -159,8 +159,21 @@ pub(crate) fn parse_column_names(s: &str) -> Option<Vec<ColumnName>> {
 
 /// Deserialize an interval string of the form "interval 5 days" into an `Option<Duration>`.
 /// Returns `Some` if successfully parses, and `None` otherwise.
+///
+/// Tokens after the first `<number> <unit>` pair are ignored, so this is for reading values that
+/// are already stored. Use [`parse_interval_strict`] to validate values being written.
 pub(crate) fn parse_interval(s: &str) -> Option<Duration> {
-    parse_interval_impl(s).ok()
+    parse_interval_prefix(s)
+        .ok()
+        .map(|(duration, _rest)| duration)
+}
+
+/// Like [`parse_interval`], but rejects trailing tokens such as the `1 hour` in
+/// `interval 7 days 1 hour`. Spark sums compound intervals, so ignoring the tail would store a
+/// value that Spark and kernel interpret differently.
+pub(crate) fn parse_interval_strict(s: &str) -> Option<Duration> {
+    let (duration, mut rest) = parse_interval_prefix(s).ok()?;
+    rest.next().is_none().then_some(duration)
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -193,7 +206,9 @@ pub enum ParseIntervalError {
 /// https://github.com/delta-io/delta-rs/blob/d4f18b3ae9d616e771b5d0e0fa498d0086fd91eb/crates/core/src/table/config.rs#L474
 ///
 /// See issue delta-kernel-rs/#507 for details: https://github.com/delta-io/delta-kernel-rs/issues/507
-fn parse_interval_impl(value: &str) -> Result<Duration, ParseIntervalError> {
+fn parse_interval_prefix(
+    value: &str,
+) -> Result<(Duration, std::str::SplitWhitespace<'_>), ParseIntervalError> {
     let mut it = value.split_whitespace();
     if it.next() != Some("interval") {
         return Err(ParseIntervalError::NotAnInterval(value.to_string()));
@@ -214,18 +229,18 @@ fn parse_interval_impl(value: &str) -> Result<Duration, ParseIntervalError> {
     // convert to u64 since Duration expects it
     let number = number as u64; // non-negative i64 => always safe
 
-    let duration = match it
+    let unit = it
         .next()
-        .ok_or_else(|| ParseIntervalError::NotAnInterval(value.to_string()))?
-    {
-        "nanosecond" | "nanoseconds" => Duration::from_nanos(number),
-        "microsecond" | "microseconds" => Duration::from_micros(number),
-        "millisecond" | "milliseconds" => Duration::from_millis(number),
-        "second" | "seconds" => Duration::from_secs(number),
-        "minute" | "minutes" => Duration::from_secs(number * SECONDS_PER_MINUTE),
-        "hour" | "hours" => Duration::from_secs(number * SECONDS_PER_HOUR),
-        "day" | "days" => Duration::from_secs(number * SECONDS_PER_DAY),
-        "week" | "weeks" => Duration::from_secs(number * SECONDS_PER_WEEK),
+        .ok_or_else(|| ParseIntervalError::NotAnInterval(value.to_string()))?;
+    let seconds_per_unit = match unit {
+        "nanosecond" | "nanoseconds" => return Ok((Duration::from_nanos(number), it)),
+        "microsecond" | "microseconds" => return Ok((Duration::from_micros(number), it)),
+        "millisecond" | "milliseconds" => return Ok((Duration::from_millis(number), it)),
+        "second" | "seconds" => 1,
+        "minute" | "minutes" => SECONDS_PER_MINUTE,
+        "hour" | "hours" => SECONDS_PER_HOUR,
+        "day" | "days" => SECONDS_PER_DAY,
+        "week" | "weeks" => SECONDS_PER_WEEK,
         unit @ ("month" | "months") => {
             return Err(ParseIntervalError::UnsupportedInterval(unit.to_string()));
         }
@@ -233,8 +248,11 @@ fn parse_interval_impl(value: &str) -> Result<Duration, ParseIntervalError> {
             return Err(ParseIntervalError::UnknownUnit(unit.to_string()));
         }
     };
+    let seconds = number
+        .checked_mul(seconds_per_unit)
+        .ok_or_else(|| ParseIntervalError::UnsupportedInterval(value.to_string()))?;
 
-    Ok(duration)
+    Ok((Duration::from_secs(seconds), it))
 }
 
 #[cfg(test)]
@@ -262,6 +280,31 @@ mod tests {
         assert_eq!(parse_non_negative::<i64>("12").unwrap(), 12);
         assert_eq!(parse_non_negative::<i64>("0").unwrap(), 0);
         assert_eq!(parse_non_negative::<i64>("-12"), None);
+    }
+
+    #[rstest]
+    #[case::compound("interval 7 days 1 hour")]
+    #[case::trailing_garbage("interval 7 days foo")]
+    #[case::overflow("interval 9223372036854775807 days")]
+    fn parse_interval_strict_rejects(#[case] value: &str) {
+        assert_eq!(parse_interval_strict(value), None);
+    }
+
+    #[test]
+    fn parse_interval_strict_accepts_single_component() {
+        assert_eq!(
+            parse_interval_strict("interval 7 days"),
+            Some(Duration::from_secs(7 * 86400))
+        );
+    }
+
+    #[test]
+    fn parse_interval_ignores_trailing_tokens_and_rejects_overflow() {
+        assert_eq!(
+            parse_interval("interval 7 days 1 hour"),
+            Some(Duration::from_secs(7 * 86400))
+        );
+        assert_eq!(parse_interval("interval 9223372036854775807 days"), None);
     }
 
     #[test]
@@ -350,22 +393,25 @@ mod tests {
     #[test]
     fn test_invalid_parse_interval() {
         assert_eq!(
-            parse_interval_impl("whatever").err().unwrap().to_string(),
+            parse_interval_prefix("whatever").err().unwrap().to_string(),
             "'whatever' is not an interval".to_string()
         );
 
         assert_eq!(
-            parse_interval_impl("interval").err().unwrap().to_string(),
+            parse_interval_prefix("interval").err().unwrap().to_string(),
             "'interval' is not an interval".to_string()
         );
 
         assert_eq!(
-            parse_interval_impl("interval 2").err().unwrap().to_string(),
+            parse_interval_prefix("interval 2")
+                .err()
+                .unwrap()
+                .to_string(),
             "'interval 2' is not an interval".to_string()
         );
 
         assert_eq!(
-            parse_interval_impl("interval 2 months")
+            parse_interval_prefix("interval 2 months")
                 .err()
                 .unwrap()
                 .to_string(),
@@ -373,7 +419,7 @@ mod tests {
         );
 
         assert_eq!(
-            parse_interval_impl("interval 2 years")
+            parse_interval_prefix("interval 2 years")
                 .err()
                 .unwrap()
                 .to_string(),
@@ -381,7 +427,7 @@ mod tests {
         );
 
         assert_eq!(
-            parse_interval_impl("interval two years")
+            parse_interval_prefix("interval two years")
                 .err()
                 .unwrap()
                 .to_string(),
@@ -389,7 +435,7 @@ mod tests {
         );
 
         assert_eq!(
-            parse_interval_impl("interval -25 hours")
+            parse_interval_prefix("interval -25 hours")
                 .err()
                 .unwrap()
                 .to_string(),

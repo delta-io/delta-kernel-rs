@@ -312,13 +312,15 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
         engine: &dyn Engine,
         committer: Box<dyn Committer>,
     ) -> Result<Transaction<UpdateTable, MODE>> {
-        self.validate()?;
-        let transaction = try_new_update_table(self, committer, engine)?;
+        let properties_added = self.validate()?;
+        let transaction = try_new_update_table(self, committer, engine, properties_added)?;
         transaction.validate_domain_metadata_operations()?;
         Ok(transaction)
     }
 
-    fn validate(&self) -> KernelResult<()> {
+    /// Validates the builder and returns the canonicalized property additions that the retention
+    /// check ran against.
+    fn validate(&self) -> KernelResult<HashMap<String, String>> {
         let operation = &self.local_state.operation;
         operation
             .validate()
@@ -399,7 +401,7 @@ impl<MODE: ExecutionMode> TransactionBuilder<UpdateTable, MODE> {
                 .configuration(),
             &properties_added,
         )?;
-        Ok(())
+        Ok(properties_added)
     }
 }
 
@@ -407,6 +409,7 @@ fn try_new_update_table<MODE: ExecutionMode>(
     builder: UpdateTableTransactionBuilder<MODE>,
     committer: Box<dyn Committer>,
     engine: &dyn Engine,
+    validated_properties_added: HashMap<String, String>,
 ) -> Result<Transaction<UpdateTable, MODE>> {
     let TransactionBuilder {
         common_state,
@@ -417,7 +420,7 @@ fn try_new_update_table<MODE: ExecutionMode>(
         snapshot: read_snapshot,
         operation,
         schema_changes,
-        properties_added,
+        properties_added: _,
         properties_removed,
         domain_metadata_removals,
         is_blind_append,
@@ -469,21 +472,16 @@ fn try_new_update_table<MODE: ExecutionMode>(
         Some(changes) => apply_schema_changes(effective_table_config, changes)?,
         None => effective_table_config,
     };
-    let properties_added = if properties_added.is_empty() {
-        HashMap::new()
+    // ALTER TABLE always keeps requested adds (Spark always rewrites Metadata for SET
+    // TBLPROPERTIES). Data operations drop identical values so Metadata is emitted only when
+    // a value actually changes.
+    let properties_added = if is_alter {
+        validated_properties_added
     } else {
-        let validated = validate_and_canonicalize_properties_added(&properties_added)?;
-        // ALTER TABLE always keeps requested adds (Spark always rewrites Metadata for SET
-        // TBLPROPERTIES). Data operations drop identical values so Metadata is emitted only when
-        // a value actually changes.
-        if is_alter {
-            validated
-        } else {
-            filter_out_unchanged_properties(
-                effective_table_config.metadata().configuration(),
-                validated,
-            )
-        }
+        filter_out_unchanged_properties(
+            effective_table_config.metadata().configuration(),
+            validated_properties_added,
+        )
     };
     let has_property_adds = !properties_added.is_empty();
     // ALTER TABLE always keeps requested removals (Spark always rewrites Metadata for UNSET

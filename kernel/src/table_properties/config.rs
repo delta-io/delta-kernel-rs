@@ -6,7 +6,9 @@
 
 use std::collections::HashMap;
 
-use super::deserialize::{parse_bool, parse_column_names, parse_interval, parse_positive_int};
+use super::deserialize::{
+    parse_bool, parse_column_names, parse_interval_strict, parse_positive_int,
+};
 use super::{
     APPEND_ONLY, AUTO_COMPACT, CHECKPOINT_INTERVAL, CHECKPOINT_POLICY,
     CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT, COLUMN_MAPPING_MAX_COLUMN_ID,
@@ -26,7 +28,7 @@ use super::{
 use crate::table_features::{ColumnMappingMode, SET_TABLE_FEATURE_SUPPORTED_PREFIX};
 use crate::{KernelError, KernelResult};
 
-/// Spark / protocol defaults used when a retention key is absent from the merged configuration.
+/// Spark / protocol defaults used when a retention key is absent from the table properties.
 pub(crate) const DEFAULT_LOG_RETENTION_DURATION: &str = "interval 30 days";
 pub(crate) const DEFAULT_DELETED_FILE_RETENTION_DURATION: &str = "interval 1 week";
 
@@ -37,7 +39,10 @@ enum PropertyAccess {
     Editable(fn(&str) -> bool),
     /// Accepted on CREATE with value validation; rejected on UPDATE until protocol prep exists.
     CreateOnly(fn(&str) -> bool),
-    /// Known but never settable by connectors through property APIs.
+    /// Known to kernel but not settable through property APIs. Either kernel owns the value (for
+    /// example `delta.columnMapping.maxColumnId`, which kernel advances itself when columns are
+    /// added) or kernel does not yet support the behavior the key controls (for example
+    /// `delta.autoOptimize.autoCompact`).
     Recognized,
 }
 
@@ -67,55 +72,6 @@ const fn recognized(key: &'static str) -> TablePropertyDef {
         key,
         access: PropertyAccess::Recognized,
     }
-}
-
-fn validate_bool(value: &str) -> bool {
-    parse_bool(value).is_some()
-}
-
-fn validate_positive_int(value: &str) -> bool {
-    parse_positive_int(value).is_some()
-}
-
-fn validate_interval(value: &str) -> bool {
-    parse_interval(value).is_some()
-}
-
-fn validate_column_names(value: &str) -> bool {
-    parse_column_names(value).is_some()
-}
-
-fn validate_data_skipping_num_indexed_cols(value: &str) -> bool {
-    DataSkippingNumIndexedCols::try_from(value).is_ok()
-}
-
-fn validate_compression_codec(value: &str) -> bool {
-    value.parse::<ParquetCompressionCodec>().is_ok()
-}
-
-/// Accepts protocol values `"1.0.0"` and `"2.MINOR.PATCH"` with numeric MINOR/PATCH.
-fn validate_parquet_format_version(value: &str) -> bool {
-    if value == "1.0.0" {
-        return true;
-    }
-    let mut parts = value.split('.');
-    match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some("2"), Some(minor), Some(patch), None) => {
-            !minor.is_empty()
-                && !patch.is_empty()
-                && minor.chars().all(|c| c.is_ascii_digit())
-                && patch.chars().all(|c| c.is_ascii_digit())
-        }
-        _ => false,
-    }
-}
-
-fn validate_column_mapping_mode(value: &str) -> bool {
-    value.parse::<ColumnMappingMode>().is_ok()
-}
-
-fn validate_checkpoint_policy(value: &str) -> bool {
-    value.parse::<CheckpointPolicy>().is_ok()
 }
 
 const EDITABLE_CONFIG_PROPERTIES: &[TablePropertyDef] = &[
@@ -184,13 +140,6 @@ const KNOWN_DELTA_PROPERTY_GROUPS: &[&[TablePropertyDef]] = &[
     OTHER_RECOGNIZED_PROPERTIES,
 ];
 
-fn find_property_def(key: &str) -> Option<&'static TablePropertyDef> {
-    KNOWN_DELTA_PROPERTY_GROUPS
-        .iter()
-        .flat_map(|group| group.iter())
-        .find(|def| key.eq_ignore_ascii_case(def.key))
-}
-
 pub(crate) fn is_delta_property_key(key: &str) -> bool {
     key.get(..DELTA_PROPERTY_PREFIX.len())
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(DELTA_PROPERTY_PREFIX))
@@ -207,10 +156,96 @@ pub(crate) fn strip_table_feature_signal_prefix(key: &str) -> Option<&str> {
     is_table_feature_signal_key(key).then(|| &key[SET_TABLE_FEATURE_SUPPORTED_PREFIX.len()..])
 }
 
+/// Validates and normalizes one batch of CREATE properties (one `with_table_properties` call).
+///
+/// Two entries for the same `delta.*` key (including exact duplicates and case variants) are
+/// rejected. Duplicate non-`delta.*` keys keep the last value. Callers merge batches in call order
+/// so a later batch overrides an earlier one for the same canonical key.
+pub(crate) fn validate_and_normalize_property_batch_for_create(
+    batch: impl IntoIterator<Item = (String, String)>,
+) -> KernelResult<HashMap<String, String>> {
+    normalize_property_batch(batch, PropertySetOperation::Create)
+}
+
+/// Validates and normalizes one batch of UPDATE properties (one `with_table_properties_added`
+/// call), with the same duplicate handling and merge contract as
+/// [`validate_and_normalize_property_batch_for_create`].
+pub(crate) fn validate_and_normalize_property_batch_for_update(
+    batch: impl IntoIterator<Item = (String, String)>,
+) -> KernelResult<HashMap<String, String>> {
+    normalize_property_batch(batch, PropertySetOperation::Update)
+}
+
+/// Rejects `table_properties` where log retention is shorter than deleted-file retention.
+///
+/// Absent keys use the protocol defaults (`interval 30 days` and `interval 1 week`). Matches
+/// Spark's `validateTombstoneAndLogRetentionDurationCompatibility`. Present values must be valid
+/// intervals, including values that were already stored on the table. This is the CREATE check;
+/// UPDATE goes through [`validate_retention_for_property_adds`].
+pub(crate) fn validate_log_and_deleted_file_retention(
+    table_properties: &HashMap<String, String>,
+) -> KernelResult<()> {
+    check_log_and_deleted_file_retention(table_properties, PropertySetOperation::Create)
+}
+
+/// UPDATE variant of [`validate_log_and_deleted_file_retention`] that checks the retention pair
+/// resulting from applying `validated_adds` on top of `existing`.
+///
+/// Skips the check unless `validated_adds` sets a retention key, so updates to unrelated
+/// properties do not fail on retention values the caller never touched (Spark behaves the same).
+pub(crate) fn validate_retention_for_property_adds(
+    existing: &HashMap<String, String>,
+    validated_adds: &HashMap<String, String>,
+) -> KernelResult<()> {
+    let sets_log = validated_adds.contains_key(LOG_RETENTION_DURATION);
+    let sets_deleted = validated_adds.contains_key(DELETED_FILE_RETENTION_DURATION);
+    if !sets_log && !sets_deleted {
+        return Ok(());
+    }
+
+    let mut resulting = existing.clone();
+    resulting.extend(
+        validated_adds
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    check_log_and_deleted_file_retention(&resulting, PropertySetOperation::Update)
+}
+
+// === Helpers ===
+
 #[derive(Clone, Copy)]
 enum PropertySetOperation {
     Create,
     Update,
+}
+
+impl PropertySetOperation {
+    /// Builds the error kind that matches the operation: generic for CREATE, invalid transaction
+    /// state for an update of an existing table.
+    fn error(self, message: String) -> KernelError {
+        match self {
+            Self::Create => KernelError::generic(message),
+            Self::Update => KernelError::invalid_transaction_state(message),
+        }
+    }
+
+    /// Error for a recognized `delta.*` key that this operation may not set.
+    fn cannot_set(self, key: &str) -> KernelError {
+        self.error(match self {
+            Self::Create => {
+                format!("Setting delta property '{key}' is not supported during CREATE TABLE")
+            }
+            Self::Update => format!("Cannot modify the table property '{key}'"),
+        })
+    }
+}
+
+fn find_property_def(key: &str) -> Option<&'static TablePropertyDef> {
+    KNOWN_DELTA_PROPERTY_GROUPS
+        .iter()
+        .flat_map(|group| group.iter())
+        .find(|def| key.eq_ignore_ascii_case(def.key))
 }
 
 fn validate_and_normalize_property(
@@ -227,33 +262,29 @@ fn validate_and_normalize_property(
 
     if strip_check_constraint_prefix(&key.to_ascii_lowercase()).is_some() {
         return Err(match operation {
-            PropertySetOperation::Create => KernelError::generic(format!(
+            PropertySetOperation::Create => operation.error(format!(
                 "Setting CHECK constraint property '{key}' is not supported during CREATE TABLE"
             )),
-            PropertySetOperation::Update => KernelError::invalid_transaction_state(format!(
-                "Cannot modify the table property '{key}'"
-            )),
+            PropertySetOperation::Update => operation.cannot_set(&key),
         });
     }
 
     if is_table_feature_signal_key(&key) {
-        return Err(match operation {
-            PropertySetOperation::Create => KernelError::generic(format!(
-                "Feature signal '{key}' must be handled before property normalization"
-            )),
-            PropertySetOperation::Update => KernelError::invalid_transaction_state(format!(
-                "Protocol changes via '{key}' are not supported on existing tables"
-            )),
-        });
+        return Err(operation.error(match operation {
+            PropertySetOperation::Create => {
+                format!("Feature signal '{key}' must be handled before property normalization")
+            }
+            PropertySetOperation::Update => {
+                format!("Protocol changes via '{key}' are not supported on existing tables")
+            }
+        }));
     }
 
     let Some(def) = find_property_def(&key) else {
         return Err(match operation {
-            PropertySetOperation::Create => KernelError::generic(format!(
-                "Setting delta property '{key}' is not supported during CREATE TABLE"
-            )),
+            PropertySetOperation::Create => operation.cannot_set(&key),
             PropertySetOperation::Update => {
-                KernelError::invalid_transaction_state(format!("Unknown configuration key '{key}'"))
+                operation.error(format!("Unknown configuration key '{key}'"))
             }
         });
     };
@@ -264,30 +295,16 @@ fn validate_and_normalize_property(
             PropertyAccess::Editable(validate) | PropertyAccess::CreateOnly(validate),
         )
         | (PropertySetOperation::Update, PropertyAccess::Editable(validate)) => validate,
-        _ => {
-            return Err(match operation {
-                PropertySetOperation::Create => KernelError::generic(format!(
-                    "Setting delta property '{}' is not supported during CREATE TABLE",
-                    def.key
-                )),
-                PropertySetOperation::Update => KernelError::invalid_transaction_state(format!(
-                    "Cannot modify the table property '{}'",
-                    def.key
-                )),
-            });
-        }
+        _ => return Err(operation.cannot_set(def.key)),
     };
 
     if !validate(&value) {
-        return Err(match operation {
-            PropertySetOperation::Create => {
-                KernelError::generic(format!("Invalid value '{value}' for '{}'", def.key))
+        return Err(operation.error(match operation {
+            PropertySetOperation::Create => format!("Invalid value '{value}' for '{}'", def.key),
+            PropertySetOperation::Update => {
+                format!("Invalid value '{value}' for table property '{}'", def.key)
             }
-            PropertySetOperation::Update => KernelError::invalid_transaction_state(format!(
-                "Invalid value '{value}' for table property '{}'",
-                def.key
-            )),
-        });
+        }));
     }
 
     Ok((def.key.to_string(), value))
@@ -299,7 +316,8 @@ fn validate_and_normalize_property(
 /// `delta.*` keys (config and feature-enablement) are rewritten to their canonical form and
 /// value-validated. Unknown `delta.*` keys, kernel-managed keys, CHECK constraints, and malformed
 /// values are rejected. Feature signals must be partitioned out before calling this.
-pub(crate) fn validate_and_normalize_property_for_create(
+#[cfg(test)]
+fn validate_and_normalize_property_for_create(
     key: impl Into<String>,
     value: impl Into<String>,
 ) -> KernelResult<(String, String)> {
@@ -312,67 +330,53 @@ pub(crate) fn validate_and_normalize_property_for_create(
 /// editable `delta.*` keys are rewritten to their canonical form and value-validated. Unknown
 /// `delta.*` keys, non-editable keys, CHECK constraints, feature signals, and malformed values are
 /// rejected.
-pub(crate) fn validate_and_normalize_property_for_update(
+#[cfg(test)]
+fn validate_and_normalize_property_for_update(
     key: impl Into<String>,
     value: impl Into<String>,
 ) -> KernelResult<(String, String)> {
     validate_and_normalize_property(key, value, PropertySetOperation::Update)
 }
 
-/// Rejects a merged configuration where log retention is shorter than deleted-file retention.
-///
-/// Absent keys use the protocol defaults (`interval 30 days` and `interval 1 week`). Matches
-/// Spark's `validateTombstoneAndLogRetentionDurationCompatibility`. Present but unparseable values
-/// are rejected.
-pub(crate) fn validate_log_and_deleted_file_retention(
-    configuration: &HashMap<String, String>,
-) -> KernelResult<()> {
-    check_log_and_deleted_file_retention(configuration, KernelError::generic)
-}
-
-/// Retention cross-check for UPDATE after property adds have been validated.
-///
-/// Runs only when `validated_adds` sets a retention key (Spark checks only then). Absent keys use
-/// the protocol defaults. A stored value that this crate's interval parser cannot read is rejected
-/// with an error that names that stored value.
-pub(crate) fn validate_retention_for_property_adds(
-    existing: &HashMap<String, String>,
-    validated_adds: &HashMap<String, String>,
-) -> KernelResult<()> {
-    let sets_log = validated_adds.contains_key(LOG_RETENTION_DURATION);
-    let sets_deleted = validated_adds.contains_key(DELETED_FILE_RETENTION_DURATION);
-    if !sets_log && !sets_deleted {
-        return Ok(());
+fn normalize_property_batch(
+    batch: impl IntoIterator<Item = (String, String)>,
+    operation: PropertySetOperation,
+) -> KernelResult<HashMap<String, String>> {
+    let mut normalized = HashMap::new();
+    for (key, value) in batch {
+        let (canonical, value) = validate_and_normalize_property(key, value, operation)?;
+        if normalized.insert(canonical.clone(), value).is_some()
+            && is_delta_property_key(&canonical)
+        {
+            return Err(operation.error(format!(
+                "Conflicting spellings of table property '{canonical}' in the same request"
+            )));
+        }
     }
-
-    let mut merged = existing.clone();
-    merged.extend(
-        validated_adds
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone())),
-    );
-    check_log_and_deleted_file_retention(&merged, KernelError::invalid_transaction_state)
+    Ok(normalized)
 }
 
+/// Checks that log retention is at least deleted-file retention, resolving absent keys to the
+/// protocol defaults. Errors are built for `operation`.
 fn check_log_and_deleted_file_retention(
-    configuration: &HashMap<String, String>,
-    make_error: fn(String) -> KernelError,
+    table_properties: &HashMap<String, String>,
+    operation: PropertySetOperation,
 ) -> KernelResult<()> {
-    let (log_raw, log) = retention_duration_for_comparison(
-        configuration,
+    let (log_raw, log) = retention_or_default(
+        table_properties,
         LOG_RETENTION_DURATION,
         DEFAULT_LOG_RETENTION_DURATION,
-        make_error,
+        operation,
     )?;
-    let (deleted_raw, deleted) = retention_duration_for_comparison(
-        configuration,
+    let (deleted_raw, deleted) = retention_or_default(
+        table_properties,
         DELETED_FILE_RETENTION_DURATION,
         DEFAULT_DELETED_FILE_RETENTION_DURATION,
-        make_error,
+        operation,
     )?;
 
     if log < deleted {
-        let log_present = configuration.contains_key(LOG_RETENTION_DURATION);
+        let log_present = table_properties.contains_key(LOG_RETENTION_DURATION);
         let message = if log_present {
             format!(
                 "The table property {LOG_RETENTION_DURATION}({log_raw}) needs to be greater than \
@@ -384,83 +388,76 @@ fn check_log_and_deleted_file_retention(
                  less than or equal to {LOG_RETENTION_DURATION}({log_raw})."
             )
         };
-        return Err(make_error(message));
+        return Err(operation.error(message));
     }
     Ok(())
 }
 
-fn retention_duration_for_comparison(
-    configuration: &HashMap<String, String>,
+fn retention_or_default(
+    table_properties: &HashMap<String, String>,
     key: &str,
     default: &str,
-    make_error: fn(String) -> KernelError,
-) -> KernelResult<(String, std::time::Duration)> {
-    let parsed_default = || {
-        parse_interval(default).ok_or_else(|| {
-            KernelError::internal_error(format!("invalid built-in retention default '{default}'"))
-        })
-    };
-    let Some(raw) = configuration.get(key).map(String::as_str) else {
-        return Ok((default.to_string(), parsed_default()?));
-    };
-    if let Some(duration) = parse_interval(raw) {
-        return Ok((raw.to_string(), duration));
-    }
-    Err(make_error(format!(
-        "Invalid value '{raw}' for table property '{key}'"
-    )))
-}
-
-/// Validates and normalizes properties for CREATE, rejecting conflicting spellings of the same
-/// canonical key (including exact duplicates).
-pub(crate) fn validate_and_normalize_properties_for_create(
-    properties: impl IntoIterator<Item = (String, String)>,
-) -> KernelResult<HashMap<String, String>> {
-    insert_normalized_properties(
-        properties,
-        PropertySetOperation::Create,
-        KernelError::generic,
-        /* reject_non_delta_conflicts= */ true,
-    )
-}
-
-/// Validates and normalizes one UPDATE property batch.
-///
-/// Conflicting `delta.*` spellings (including exact duplicates) are rejected. Non-`delta.*`
-/// duplicates keep the last value. Callers merge batches so a later batch can overwrite an earlier
-/// one for the same canonical key.
-pub(crate) fn validate_and_normalize_property_batch_for_update(
-    batch: impl IntoIterator<Item = (String, String)>,
-) -> KernelResult<HashMap<String, String>> {
-    insert_normalized_properties(
-        batch,
-        PropertySetOperation::Update,
-        KernelError::invalid_transaction_state,
-        /* reject_non_delta_conflicts= */ false,
-    )
-}
-
-fn insert_normalized_properties(
-    properties: impl IntoIterator<Item = (String, String)>,
     operation: PropertySetOperation,
-    conflict_error: fn(String) -> KernelError,
-    reject_non_delta_conflicts: bool,
-) -> KernelResult<HashMap<String, String>> {
-    let mut normalized = HashMap::new();
-    for (key, value) in properties {
-        let (canonical, value) = match operation {
-            PropertySetOperation::Create => validate_and_normalize_property_for_create(key, value)?,
-            PropertySetOperation::Update => validate_and_normalize_property_for_update(key, value)?,
-        };
-        if let Some(_prev) = normalized.insert(canonical.clone(), value)
-            && (reject_non_delta_conflicts || is_delta_property_key(&canonical))
-        {
-            return Err(conflict_error(format!(
-                "Conflicting spellings of table property '{canonical}' in the same request"
-            )));
-        }
+) -> KernelResult<(String, std::time::Duration)> {
+    let Some(raw) = table_properties.get(key) else {
+        let duration = parse_interval_strict(default).ok_or_else(|| {
+            KernelError::internal_error(format!("invalid built-in retention default '{default}'"))
+        })?;
+        return Ok((default.to_string(), duration));
+    };
+    let duration = parse_interval_strict(raw).ok_or_else(|| {
+        operation.error(format!("Invalid value '{raw}' for table property '{key}'"))
+    })?;
+    Ok((raw.clone(), duration))
+}
+
+fn validate_bool(value: &str) -> bool {
+    parse_bool(value).is_some()
+}
+
+fn validate_positive_int(value: &str) -> bool {
+    parse_positive_int(value).is_some()
+}
+
+fn validate_interval(value: &str) -> bool {
+    parse_interval_strict(value).is_some()
+}
+
+fn validate_column_names(value: &str) -> bool {
+    parse_column_names(value).is_some()
+}
+
+fn validate_data_skipping_num_indexed_cols(value: &str) -> bool {
+    DataSkippingNumIndexedCols::try_from(value).is_ok()
+}
+
+fn validate_compression_codec(value: &str) -> bool {
+    value.parse::<ParquetCompressionCodec>().is_ok()
+}
+
+/// Accepts protocol values `"1.0.0"` and `"2.MINOR.PATCH"` with numeric MINOR/PATCH.
+fn validate_parquet_format_version(value: &str) -> bool {
+    if value == "1.0.0" {
+        return true;
     }
-    Ok(normalized)
+    let mut parts = value.split('.');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("2"), Some(minor), Some(patch), None) => {
+            !minor.is_empty()
+                && !patch.is_empty()
+                && minor.chars().all(|c| c.is_ascii_digit())
+                && patch.chars().all(|c| c.is_ascii_digit())
+        }
+        _ => false,
+    }
+}
+
+fn validate_column_mapping_mode(value: &str) -> bool {
+    value.parse::<ColumnMappingMode>().is_ok()
+}
+
+fn validate_checkpoint_policy(value: &str) -> bool {
+    value.parse::<CheckpointPolicy>().is_ok()
 }
 
 #[cfg(test)]
@@ -568,6 +565,16 @@ mod tests {
         "not-a-number",
         "Invalid value 'not-a-number' for table property"
     )]
+    #[case::compound_interval(
+        "delta.deletedFileRetentionDuration",
+        "interval 7 days 24 hours",
+        "Invalid value 'interval 7 days 24 hours' for table property"
+    )]
+    #[case::trailing_interval_garbage(
+        "delta.logRetentionDuration",
+        "interval 7 days foo",
+        "Invalid value 'interval 7 days foo' for table property"
+    )]
     #[case::invalid_set_transaction_retention(
         "delta.setTransactionRetentionDuration",
         "not-an-interval",
@@ -616,6 +623,11 @@ mod tests {
         "delta.checkpointInterval",
         "abc",
         "Invalid value 'abc' for 'delta.checkpointInterval'"
+    )]
+    #[case::compound_interval(
+        "delta.deletedFileRetentionDuration",
+        "interval 7 days 24 hours",
+        "Invalid value 'interval 7 days 24 hours' for 'delta.deletedFileRetentionDuration'"
     )]
     #[case::constraint(
         "delta.constraints.positive_id",
@@ -801,6 +813,57 @@ mod tests {
             ),
             "error={error}"
         );
+    }
+
+    #[rstest]
+    #[case::compound_log(LOG_RETENTION_DURATION, "interval 7 days 24 hours")]
+    #[case::compound_deleted(DELETED_FILE_RETENTION_DURATION, "interval 7 days 24 hours")]
+    #[case::trailing_garbage(LOG_RETENTION_DURATION, "interval 7 days foo")]
+    fn update_retention_check_rejects_compound_existing_untouched_side(
+        #[case] existing_key: &str,
+        #[case] existing_value: &str,
+    ) {
+        let key_being_set = if existing_key == LOG_RETENTION_DURATION {
+            DELETED_FILE_RETENTION_DURATION
+        } else {
+            LOG_RETENTION_DURATION
+        };
+        let existing = HashMap::from([(existing_key.to_string(), existing_value.to_string())]);
+        let adds = HashMap::from([(key_being_set.to_string(), "interval 7 days".to_string())]);
+        let error = validate_retention_for_property_adds(&existing, &adds).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                KernelError::InvalidTransactionState(message)
+                if message.contains(&format!("Invalid value '{existing_value}' for table property '{existing_key}'"))
+            ),
+            "error={error}"
+        );
+    }
+
+    #[test]
+    fn batch_normalization_rejects_conflicting_delta_spellings_but_keeps_last_user_value() {
+        for operation in [
+            validate_and_normalize_property_batch_for_create,
+            validate_and_normalize_property_batch_for_update,
+        ] {
+            let error = operation([
+                ("DELTA.checkpointInterval".to_string(), "10".to_string()),
+                ("delta.checkpointInterval".to_string(), "20".to_string()),
+            ])
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("Conflicting spellings"),
+                "error={error}"
+            );
+
+            let normalized = operation([
+                ("app.owner".to_string(), "a".to_string()),
+                ("app.owner".to_string(), "b".to_string()),
+            ])
+            .unwrap();
+            assert_eq!(normalized["app.owner"], "b");
+        }
     }
 
     #[test]

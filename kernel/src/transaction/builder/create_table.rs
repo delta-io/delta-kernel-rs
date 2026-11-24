@@ -45,7 +45,7 @@ use crate::table_properties::{
     ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
     MATERIALIZED_ROW_ID_COLUMN_NAME, ROW_TRACKING_SUSPENDED, TableProperties,
     is_table_feature_signal_key, strip_table_feature_signal_prefix,
-    validate_and_normalize_properties_for_create, validate_log_and_deleted_file_retention,
+    validate_and_normalize_property_batch_for_create, validate_log_and_deleted_file_retention,
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
@@ -769,7 +769,7 @@ fn maybe_apply_column_mapping_for_table_create(
 /// auto-enablement is handled separately by [`maybe_auto_enable_property_driven_features`]
 /// called after validation.
 fn validate_extract_table_features_and_properties(
-    properties: HashMap<String, String>,
+    property_batches: Vec<Vec<(String, String)>>,
 ) -> KernelResult<ValidatedTableProperties> {
     let mut reader_features = Vec::new();
     let mut writer_features = Vec::new();
@@ -778,9 +778,15 @@ fn validate_extract_table_features_and_properties(
     // Feature signals (delta.feature.X=supported) are processed but not stored in metadata
     // Feature signals are removed from the properties map. Prefix match is case-insensitive so
     // mixed-case keys do not fall through to property normalization.
-    let (feature_signals, properties): (HashMap<_, _>, HashMap<_, _>) = properties
-        .into_iter()
-        .partition(|(k, _)| is_table_feature_signal_key(k));
+    let mut feature_signals = HashMap::new();
+    let mut batches = Vec::with_capacity(property_batches.len());
+    for batch in property_batches {
+        let (signals, properties): (Vec<_>, Vec<_>) = batch
+            .into_iter()
+            .partition(|(k, _)| is_table_feature_signal_key(k));
+        feature_signals.extend(signals);
+        batches.push(properties);
+    }
 
     // Process and validate feature signals
     for (key, value) in &feature_signals {
@@ -796,16 +802,16 @@ fn validate_extract_table_features_and_properties(
             )));
         }
 
-        // Parse feature name to TableFeature (unknown features become TableFeature::Unknown)
-        let feature: TableFeature = feature_name
-            .parse()
-            .unwrap_or_else(|_| TableFeature::Unknown(feature_name.to_string()));
-
-        if !ALLOWED_DELTA_FEATURES.contains(&feature) {
+        // Feature names are matched case-insensitively and resolve to the canonical feature.
+        let Some(feature) = ALLOWED_DELTA_FEATURES
+            .iter()
+            .find(|feature| feature.as_ref().eq_ignore_ascii_case(feature_name))
+            .cloned()
+        else {
             return Err(KernelError::generic(format!(
                 "Enabling feature '{feature_name}' via '{key}' is not supported during CREATE TABLE"
             )));
-        }
+        };
 
         // VariantShredding requires VariantType as a dependency
         if feature == TableFeature::VariantShredding {
@@ -820,7 +826,12 @@ fn validate_extract_table_features_and_properties(
         add_feature_to_lists(feature, &mut reader_features, &mut writer_features);
     }
 
-    let normalized = validate_and_normalize_properties_for_create(properties)?;
+    // Canonicalize within each call, then merge in call order so a later call overrides an
+    // earlier one regardless of key spelling.
+    let mut normalized = HashMap::new();
+    for batch in batches {
+        normalized.extend(validate_and_normalize_property_batch_for_create(batch)?);
+    }
     validate_log_and_deleted_file_retention(&normalized)?;
 
     Ok(ValidatedTableProperties {
@@ -845,7 +856,8 @@ pub type CreateTableTransactionBuilder<MODE = Imperative> = TransactionBuilder<C
 pub struct CreateTableBuilderState {
     path: String,
     schema: SchemaRef,
-    table_properties: HashMap<String, String>,
+    /// One entry per `with_table_properties` call, in call order.
+    table_properties: Vec<Vec<(String, String)>>,
     data_layout: DataLayout,
 }
 
@@ -866,7 +878,7 @@ impl TransactionBuilder<CreateTable> {
             local_state: CreateTableBuilderState {
                 path: path.as_ref().to_string(),
                 schema,
-                table_properties: HashMap::new(),
+                table_properties: Vec::new(),
                 data_layout: DataLayout::None,
             },
             _mode: PhantomData,
@@ -883,7 +895,9 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
     /// listed in `ALLOWED_DELTA_FEATURES`.
     ///
     /// This method can be called multiple times. If a property key already exists from a
-    /// previous call, the new value will overwrite the old one.
+    /// previous call, the new value will overwrite the old one. For `delta.*` keys this holds
+    /// across spellings (`DELTA.checkpointInterval` overrides `delta.checkpointInterval`). Within a
+    /// single call, two entries for the same `delta.*` key are rejected at [`build()`].
     ///
     /// # Arguments
     ///
@@ -914,9 +928,13 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
         K: Into<String>,
         V: Into<String>,
     {
-        self.local_state
-            .table_properties
-            .extend(properties.into_iter().map(|(k, v)| (k.into(), v.into())));
+        let batch: Vec<(String, String)> = properties
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect();
+        if !batch.is_empty() {
+            self.local_state.table_properties.push(batch);
+        }
         self
     }
 
@@ -1215,6 +1233,13 @@ mod tests {
     };
     use crate::{Error, KernelError, Result};
 
+    /// Validates `properties` as a single `with_table_properties` call.
+    fn validate_properties(
+        properties: HashMap<String, String>,
+    ) -> KernelResult<ValidatedTableProperties> {
+        validate_extract_table_features_and_properties(vec![properties.into_iter().collect()])
+    }
+
     fn test_schema() -> SchemaRef {
         schema_ref! { not_null "id": INTEGER }
     }
@@ -1424,8 +1449,8 @@ mod tests {
                 .with_table_properties([("key1", "value1")]);
 
         assert_eq!(
-            builder.local_state.table_properties.get("key1"),
-            Some(&"value1".to_string())
+            builder.local_state.table_properties,
+            vec![vec![("key1".to_string(), "value1".to_string())]]
         );
     }
 
@@ -1439,12 +1464,11 @@ mod tests {
                 .with_table_properties([("key2", "value2")]);
 
         assert_eq!(
-            builder.local_state.table_properties.get("key1"),
-            Some(&"value1".to_string())
-        );
-        assert_eq!(
-            builder.local_state.table_properties.get("key2"),
-            Some(&"value2".to_string())
+            builder.local_state.table_properties,
+            vec![
+                vec![("key1".to_string(), "value1".to_string())],
+                vec![("key2".to_string(), "value2".to_string())],
+            ]
         );
     }
 
@@ -1455,7 +1479,7 @@ mod tests {
     #[case::bare_prefix("delta.constraints.")]
     fn create_table_rejects_check_constraint_properties(#[case] key: &str) {
         let properties = HashMap::from([(key.to_string(), "amount > 0".to_string())]);
-        let result = validate_extract_table_features_and_properties(properties);
+        let result = validate_properties(properties);
         assert_result_error_with_message(result, "Setting CHECK constraint property");
     }
 
@@ -1487,7 +1511,7 @@ mod tests {
     fn test_validate_supported_properties() {
         // Empty properties are allowed
         let properties = HashMap::new();
-        let result = validate_extract_table_features_and_properties(properties);
+        let result = validate_properties(properties);
         assert!(result.is_ok());
         let validated = result.unwrap();
         assert!(validated.properties.is_empty());
@@ -1498,7 +1522,7 @@ mod tests {
         let mut properties = HashMap::new();
         properties.insert("myapp.version".to_string(), "1.0".to_string());
         properties.insert("custom.setting".to_string(), "value".to_string());
-        let result = validate_extract_table_features_and_properties(properties);
+        let result = validate_properties(properties);
         assert!(result.is_ok());
         let validated = result.unwrap();
         assert_eq!(validated.properties.len(), 2);
@@ -1516,7 +1540,7 @@ mod tests {
     fn test_parquet_format_version_accepted() {
         let properties =
             HashMap::from([(PARQUET_FORMAT_VERSION.to_string(), "2.12.0".to_string())]);
-        let validated = validate_extract_table_features_and_properties(properties).unwrap();
+        let validated = validate_properties(properties).unwrap();
         assert_eq!(
             validated.properties.get(PARQUET_FORMAT_VERSION),
             Some(&"2.12.0".to_string()),
@@ -1532,7 +1556,7 @@ mod tests {
     #[case::stats_columns_single(DATA_SKIPPING_STATS_COLUMNS, "a")]
     fn test_data_skipping_properties_accepted(#[case] key: &str, #[case] value: &str) {
         let properties = HashMap::from([(key.to_string(), value.to_string())]);
-        let validated = validate_extract_table_features_and_properties(properties).unwrap();
+        let validated = validate_properties(properties).unwrap();
         assert_eq!(validated.properties.get(key), Some(&value.to_string()));
         assert!(validated.reader_features.is_empty());
         assert!(validated.writer_features.is_empty());
@@ -1554,7 +1578,7 @@ mod tests {
             (ENABLE_EXPIRED_LOG_CLEANUP.to_string(), "true".to_string()),
             (CHECKPOINT_INTERVAL.to_string(), "10".to_string()),
         ]);
-        let validated = validate_extract_table_features_and_properties(properties).unwrap();
+        let validated = validate_properties(properties).unwrap();
         assert_eq!(
             validated.properties.get(LOG_RETENTION_DURATION),
             Some(&"interval 30 days".to_string()),
@@ -1586,7 +1610,7 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
+        let mut validated = validate_properties(properties).unwrap();
 
         maybe_enable_v2_checkpoint_for_policy(&mut validated);
 
@@ -1609,7 +1633,7 @@ mod tests {
     fn test_create_canonicalizes_case_insensitive_delta_keys() {
         let properties =
             HashMap::from([("DELTA.checkpointInterval".to_string(), "10".to_string())]);
-        let validated = validate_extract_table_features_and_properties(properties).unwrap();
+        let validated = validate_properties(properties).unwrap();
         assert_eq!(
             validated.properties.get(CHECKPOINT_INTERVAL),
             Some(&"10".to_string())
@@ -1621,41 +1645,79 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_create_rejects_conflicting_spellings_of_same_delta_key() {
-        assert_result_error_with_message(
-            validate_extract_table_features_and_properties(HashMap::from([
-                ("DELTA.checkpointInterval".to_string(), "1".to_string()),
-                ("delta.checkpointInterval".to_string(), "42".to_string()),
-            ])),
-            "Conflicting spellings of table property 'delta.checkpointInterval'",
-        );
-    }
-
-    #[test]
-    fn test_create_accepts_mixed_case_feature_signal_prefix() {
-        let properties = HashMap::from([(
-            "DELTA.feature.deletionVectors".to_string(),
-            "supported".to_string(),
-        )]);
-        let validated = validate_extract_table_features_and_properties(properties).unwrap();
+    #[rstest]
+    #[case::mixed_prefix("DELTA.feature.deletionVectors")]
+    #[case::upper_suffix("delta.feature.DELETIONVECTORS")]
+    #[case::all_upper("DELTA.FEATURE.DELETIONVECTORS")]
+    fn test_create_accepts_mixed_case_feature_signal(#[case] key: &str) {
+        let properties = HashMap::from([(key.to_string(), "supported".to_string())]);
+        let validated = validate_properties(properties).unwrap();
         assert!(
             validated
                 .reader_features
                 .contains(&TableFeature::DeletionVectors)
         );
         assert!(
+            validated
+                .writer_features
+                .contains(&TableFeature::DeletionVectors)
+        );
+        assert!(
             !validated
                 .properties
                 .keys()
-                .any(|key| key.eq_ignore_ascii_case("DELTA.feature.deletionVectors"))
+                .any(|stored| stored.eq_ignore_ascii_case(key))
+        );
+    }
+
+    #[test]
+    fn test_create_later_call_overrides_earlier_call_across_key_spellings() {
+        let validated = validate_extract_table_features_and_properties(vec![
+            vec![("DELTA.checkpointInterval".to_string(), "10".to_string())],
+            vec![("delta.checkpointInterval".to_string(), "20".to_string())],
+        ])
+        .unwrap();
+        assert_eq!(validated.properties[CHECKPOINT_INTERVAL], "20");
+        assert_eq!(validated.properties.len(), 1);
+    }
+
+    #[test]
+    fn test_create_rejects_conflicting_spellings_within_one_call() {
+        assert_result_error_with_message(
+            validate_extract_table_features_and_properties(vec![vec![
+                ("DELTA.checkpointInterval".to_string(), "10".to_string()),
+                ("delta.checkpointInterval".to_string(), "20".to_string()),
+            ]]),
+            "Conflicting spellings of table property 'delta.checkpointInterval'",
+        );
+    }
+
+    #[rstest]
+    #[case::compound_deleted(
+        DELETED_FILE_RETENTION_DURATION,
+        "interval 7 days 24 hours",
+        "Invalid value 'interval 7 days 24 hours' for 'delta.deletedFileRetentionDuration'"
+    )]
+    #[case::trailing_garbage(
+        LOG_RETENTION_DURATION,
+        "interval 30 days foo",
+        "Invalid value 'interval 30 days foo' for 'delta.logRetentionDuration'"
+    )]
+    fn test_create_rejects_non_single_component_intervals(
+        #[case] key: &str,
+        #[case] value: &str,
+        #[case] expected: &str,
+    ) {
+        assert_result_error_with_message(
+            validate_properties(HashMap::from([(key.to_string(), value.to_string())])),
+            expected,
         );
     }
 
     #[test]
     fn test_create_rejects_invalid_property_values() {
         assert_result_error_with_message(
-            validate_extract_table_features_and_properties(HashMap::from([(
+            validate_properties(HashMap::from([(
                 CHECKPOINT_INTERVAL.to_string(),
                 "abc".to_string(),
             )])),
@@ -1665,7 +1727,7 @@ mod tests {
 
     #[test]
     fn test_create_rejects_incompatible_retention_durations() {
-        let result = validate_extract_table_features_and_properties(HashMap::from([
+        let result = validate_properties(HashMap::from([
             (
                 LOG_RETENTION_DURATION.to_string(),
                 "interval 1 days".to_string(),
@@ -1694,7 +1756,7 @@ mod tests {
         let mut properties = HashMap::new();
         properties.insert(ENABLE_ICEBERG_COMPAT_V1.to_string(), "true".to_string());
         assert_result_error_with_message(
-            validate_extract_table_features_and_properties(properties),
+            validate_properties(properties),
             "Setting delta property 'delta.enableIcebergCompatV1' is not supported",
         );
 
@@ -1704,7 +1766,7 @@ mod tests {
             "supported".to_string(),
         )]);
         assert_result_error_with_message(
-            validate_extract_table_features_and_properties(properties),
+            validate_properties(properties),
             "Enabling feature 'identityColumns' via 'delta.feature.identityColumns' is not supported",
         );
 
@@ -1714,7 +1776,7 @@ mod tests {
             "supported".to_string(),
         )]);
         assert_result_error_with_message(
-            validate_extract_table_features_and_properties(properties),
+            validate_properties(properties),
             "Enabling feature 'clustering' via 'delta.feature.clustering' is not supported",
         );
 
@@ -1723,7 +1785,7 @@ mod tests {
         properties.insert("myapp.version".to_string(), "1.0".to_string());
         properties.insert(ENABLE_ICEBERG_COMPAT_V1.to_string(), "true".to_string());
         assert_result_error_with_message(
-            validate_extract_table_features_and_properties(properties),
+            validate_properties(properties),
             "Setting delta property 'delta.enableIcebergCompatV1' is not supported",
         );
     }
@@ -1991,7 +2053,7 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
+        let mut validated = validate_properties(properties).unwrap();
 
         maybe_auto_enable_property_driven_features(&mut validated);
 
@@ -2031,7 +2093,7 @@ mod tests {
     fn test_feature_signal_accepted(#[case] feature: TableFeature, #[case] feature_name: &str) {
         let key = format!("delta.feature.{feature_name}");
         let properties = HashMap::from([(key, "supported".to_string())]);
-        let validated = validate_extract_table_features_and_properties(properties).unwrap();
+        let validated = validate_properties(properties).unwrap();
 
         assert!(
             validated.properties.is_empty(),
@@ -2068,7 +2130,7 @@ mod tests {
         let key = format!("delta.feature.{feature_name}");
         let properties = HashMap::from([(key.clone(), "supported".to_string())]);
         assert_result_error_with_message(
-            validate_extract_table_features_and_properties(properties),
+            validate_properties(properties),
             &format!(
                 "Enabling feature '{feature_name}' via '{key}' is not supported during CREATE TABLE"
             ),
@@ -2081,7 +2143,7 @@ mod tests {
             "delta.feature.variantShredding".to_string(),
             "supported".to_string(),
         )]);
-        let validated = validate_extract_table_features_and_properties(properties).unwrap();
+        let validated = validate_properties(properties).unwrap();
 
         assert!(
             validated
@@ -2301,7 +2363,7 @@ mod tests {
             "delta.feature.catalogManaged".to_string(),
             "supported".to_string(),
         )]);
-        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
+        let mut validated = validate_properties(properties).unwrap();
         maybe_auto_enable_property_driven_features(&mut validated);
         maybe_enable_ict_for_catalog_managed(&mut validated).unwrap();
 
@@ -2330,7 +2392,7 @@ mod tests {
                 "true".to_string(),
             ),
         ]);
-        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
+        let mut validated = validate_properties(properties).unwrap();
         maybe_auto_enable_property_driven_features(&mut validated);
         maybe_enable_ict_for_catalog_managed(&mut validated).unwrap();
 
@@ -2358,7 +2420,7 @@ mod tests {
         #[case] properties: HashMap<String, String>,
         #[case] expect_enablement_property: bool,
     ) {
-        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
+        let mut validated = validate_properties(properties).unwrap();
         maybe_auto_enable_property_driven_features(&mut validated);
 
         assert!(
@@ -2405,11 +2467,9 @@ mod tests {
         #[case] canonical_key: &str,
         #[case] feature: TableFeature,
     ) {
-        let mut validated = validate_extract_table_features_and_properties(HashMap::from([(
-            input_key.to_string(),
-            value.to_string(),
-        )]))
-        .unwrap();
+        let mut validated =
+            validate_properties(HashMap::from([(input_key.to_string(), value.to_string())]))
+                .unwrap();
         maybe_auto_enable_property_driven_features(&mut validated);
 
         assert!(
@@ -2439,7 +2499,7 @@ mod tests {
                 "false".to_string(),
             ),
         ]);
-        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
+        let mut validated = validate_properties(properties).unwrap();
         maybe_auto_enable_property_driven_features(&mut validated);
         let err = maybe_enable_ict_for_catalog_managed(&mut validated).unwrap_err();
         assert!(
@@ -2525,7 +2585,7 @@ mod tests {
         for (k, v) in extra_props {
             props.insert(k.to_string(), v.to_string());
         }
-        let mut validated = validate_extract_table_features_and_properties(props).unwrap();
+        let mut validated = validate_properties(props).unwrap();
 
         // === V3 dependency defaults ===
         maybe_enable_iceberg_compat_v3_dependencies(&mut validated).unwrap();
@@ -2679,7 +2739,7 @@ mod tests {
         // `top` and `inner` StructFields, so feeding it through the V3 create path must
         // surface the pre-population error.
         let schema = Arc::new(build_complex_nested_kernel_schema(nested_ids_meta_key));
-        let mut validated = validate_extract_table_features_and_properties(HashMap::from([(
+        let mut validated = validate_properties(HashMap::from([(
             ENABLE_ICEBERG_COMPAT_V3.to_string(),
             "true".to_string(),
         )]))
@@ -2698,7 +2758,7 @@ mod tests {
     #[test]
     fn test_create_table_v3_supported_but_not_enabled_skips_nested_ids() {
         let schema = build_iceberg_compat_test_schema();
-        let mut validated = validate_extract_table_features_and_properties(HashMap::from([
+        let mut validated = validate_properties(HashMap::from([
             (
                 "delta.feature.icebergCompatV3".to_string(),
                 "supported".to_string(),
@@ -2738,7 +2798,7 @@ mod tests {
         let schema = build_iceberg_compat_test_schema();
         let props: HashMap<String, String> =
             HashMap::from([(ENABLE_ICEBERG_COMPAT_V2.to_string(), "true".to_string())]);
-        let mut validated = validate_extract_table_features_and_properties(props).unwrap();
+        let mut validated = validate_properties(props).unwrap();
 
         maybe_enable_iceberg_compat_v2_dependencies(&mut validated).unwrap();
         assert_eq!(
