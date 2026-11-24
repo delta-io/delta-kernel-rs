@@ -110,8 +110,8 @@ pub(crate) fn convert_append_metadata_to_root_entry_batch(
     // TODO(#2866): This method doesn't allow for caching standard checks and expressions.
     // we should have some sort of struct wrapper to avoid reconstruction.
 
-    // Iceberg V4 requires a null `specId` and `partition` for an unpartitioned file, which is all
-    // this path writes, so reject partitioned tables until this path supports them.
+    // Iceberg V4 requires a null `specId` and no partition tuple for an unpartitioned file, which
+    // is all this path produces, so reject partitioned tables until this path supports them.
     if !partition_columns.is_empty() {
         return Err(KernelError::unsupported(format!(
             "AMT root writes do not yet support partitioned tables; partition columns: \
