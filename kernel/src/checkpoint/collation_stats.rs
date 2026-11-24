@@ -578,7 +578,11 @@ mod tests {
                 let (content, _) = writer.declarative_v2_checkpoint_data_plans(&engine)?;
                 content
             } else {
-                writer.declarative_checkpoint_data_plan(&engine)?
+                test_utils::assert_result_error_with_message(
+                    writer.declarative_checkpoint_data_plan(&crate::engine::PanicEngine),
+                    "V1 checkpoint plans require JSON-only statistics",
+                );
+                return Ok(());
             };
             // Declarative output keeps dynamic collation keys in JSON, without sampling.
             assert!(source_collation_stats(&plan.schema).is_none());
