@@ -1691,6 +1691,7 @@ version = "0.30.1"
 dependencies = [
  "proc-macro2",
  "quote",
+ "rstest",
  "syn",
 ]
 

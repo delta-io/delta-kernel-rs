@@ -8,6 +8,23 @@ use syn::{
     parse_macro_input,
 };
 
+mod export;
+
+/// Wraps a fallible C export with Kernel panic containment and connector error allocation.
+///
+/// The signature stays `ExternResult<T>`; Rust infers the body's `Result` error type.
+/// `error_allocator = engine` borrows an engine handle; `error_allocator = builder.engine`
+/// clones the selected field from an opaque handle. An explicit expression can borrow a callback
+/// table. Acquisition runs once before the catcher and retains the allocator through error
+/// conversion. All operation work belongs in the body, with explicit unsafe blocks.
+/// Intended for use inside `delta_kernel_ffi`.
+#[proc_macro_attribute]
+pub fn ffi_export(attr: TokenStream, item: TokenStream) -> TokenStream {
+    export::expand(attr.into(), item.into())
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
 struct HandleDescriptorParams {
     target: Type,
     mutable: bool,
