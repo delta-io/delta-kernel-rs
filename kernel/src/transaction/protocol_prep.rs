@@ -673,6 +673,19 @@ fn protocol_with_features(
             }
         }
     }
+    // Writer-only enablement must not force a reader upgrade. When no reader features are being
+    // recorded, keep the table's current reader version and leave `readerFeatures` absent, so a
+    // legacy reader-v1/v2 client is not needlessly locked out (PROTOCOL.md: writer-only features
+    // do not raise reader requirements). Promote to the table-features reader version only when
+    // there is at least one reader feature to list.
+    if reader.is_empty() && current.min_reader_version() < TABLE_FEATURES_MIN_READER_VERSION {
+        return Protocol::try_new(
+            current.min_reader_version(),
+            TABLE_FEATURES_MIN_WRITER_VERSION,
+            None::<Vec<TableFeature>>,
+            Some(writer),
+        );
+    }
     Protocol::try_new_modern(reader, writer)
 }
 
@@ -902,6 +915,38 @@ mod tests {
                 .table_config
                 .is_feature_supported(&TableFeature::TypeWidening),
             !existing.contains(&TableFeature::TypeWideningPreview),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_protocol_for_update_writer_only_feature_keeps_legacy_reader_version() -> Result<()> {
+        // Enabling a writer-only feature (CDF) on a legacy (1, 2) table must bump only the writer
+        // version to the table-features version, leaving the reader version and readerFeatures
+        // untouched so reader v1/v2 clients are not locked out.
+        let before = MockTableConfigurationBuilder::new()
+            .with_protocol(MockProtocolBuilder::new().with_versions(1, 2).build())
+            .build();
+        let after = MockTableConfigurationBuilder::new()
+            .with_properties([(ENABLE_CHANGE_DATA_FEED, "true")])
+            .with_protocol(MockProtocolBuilder::new().with_versions(1, 2).build())
+            .build();
+
+        let result = prepare_protocol_for_update(&before, after, &[])?;
+        assert!(result.should_emit_protocol);
+
+        let protocol = result.table_config.protocol();
+        assert_eq!(protocol.min_reader_version(), 1);
+        assert_eq!(
+            protocol.min_writer_version(),
+            TABLE_FEATURES_MIN_WRITER_VERSION
+        );
+        assert!(protocol.reader_features().is_none());
+        assert!(
+            protocol
+                .writer_features()
+                .unwrap()
+                .contains(&TableFeature::ChangeDataFeed)
         );
         Ok(())
     }

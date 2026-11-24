@@ -759,10 +759,8 @@ mod tests {
     use crate::snapshot::Snapshot;
     use crate::table_features::TableFeature;
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    use crate::table_properties::ENABLE_DELETION_VECTORS;
-    use crate::table_properties::{
-        ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
-    };
+    use crate::table_properties::{ENABLE_DELETION_VECTORS, ENABLE_IN_COMMIT_TIMESTAMPS};
+    use crate::table_properties::{ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3};
     use crate::transaction::create_table::create_table;
     use crate::transaction::{SchemaOperation, UpdateTableOperation};
     use crate::unit_test_utils::{copy_test_table, load_test_table, test_schema_flat};

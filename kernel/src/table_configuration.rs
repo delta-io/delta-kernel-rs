@@ -3006,6 +3006,29 @@ mod test {
     }
 
     #[test]
+    fn snapshot_load_allows_variant_shredding_preview_without_ga_variant_type() {
+        // A table that lists `variantShredding-preview` with only `variantType-preview` (no GA
+        // `variantType`) must load: the preview shredding feature carries no GA requirement.
+        let config = MockTableConfigurationBuilder::new()
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([
+                        TableFeature::VariantTypePreview,
+                        TableFeature::VariantShreddingPreview,
+                    ])
+                    .build(),
+            )
+            .build();
+
+        assert!(
+            config
+                .ensure_operation_supported(Operation::SnapshotLoad)
+                .is_ok()
+        );
+        assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
+    }
+
+    #[test]
     fn test_ensure_operation_supported_writes() {
         let config = MockTableConfigurationBuilder::new()
             .with_protocol(

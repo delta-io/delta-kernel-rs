@@ -780,10 +780,14 @@ static VARIANT_SHREDDING_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+// Preview shredding carries no static variant-type requirement, mirroring delta-spark: a table may
+// list `variantShredding-preview` alongside `variantType-preview` without GA `variantType`, and
+// such tables must still load. GA `variantType` is only pulled in for GA `variantShredding`, and
+// only on the write path (see `prepare_protocol_for_update`), never as a read-path requirement.
 static VARIANT_SHREDDING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
-    feature_requirements: &[FeatureRequirement::Supported(TableFeature::VariantType)],
+    feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
