@@ -68,6 +68,7 @@ pub(super) enum Action {
 }
 
 result_row! { struct ReversedActionFields { remove: Option<Remove>, add: Option<Add> } }
+result_row! { struct Parent { action: Action } }
 
 #[derive(Debug, PartialEq, IntoStructData, TryFromStructData)]
 enum RenamedAction {
@@ -267,37 +268,39 @@ fn variant_collection_errors_follow_consumption_order<T: Debug>(
         Err(KernelError::generic("late variant error"))
     };
     let batches = vec![first_batch, late_batch];
-    let error = convert(batches).unwrap_err();
-    if invalid_variant {
-        assert!(matches!(
-            error.without_backtrace(),
-            KernelError::InvalidStructData(_)
-        ));
+    let expected_message = if invalid_variant {
+        "found active variants []"
     } else {
-        assert!(matches!(
-            error.without_backtrace(),
-            KernelError::ScalarConversion(_)
-        ));
-    }
+        "exactly one row"
+    };
+    assert_result_error_with_message(convert(batches), expected_message);
 }
 
 #[rstest]
 #[case::required_payloads(Action::schema_ref().clone(), Action::try_from,
-    vec![Scalar::from(Add { id: 1 }), Scalar::from(Remove { id: 2 })])]
+    vec![Scalar::from(Add { id: 1 }), Scalar::from(Remove { id: 2 })], "scalar")]
 #[case::nullable_payloads(NullableAction::schema_ref().clone(), NullableAction::try_from,
-    vec![Scalar::from(NullableRow { id: None }), Scalar::from(Remove { id: 42 })])]
+    vec![Scalar::from(NullableRow { id: None }), Scalar::from(Remove { id: 42 })], "scalar")]
 #[case::named_collection(Action::schema_ref().clone(), |row| RequiredActions::collect_into([Ok(row)]),
-    vec![Scalar::from(Add { id: 1 }), Scalar::from(Remove { id: 2 })])]
+    vec![Scalar::from(Add { id: 1 }), Scalar::from(Remove { id: 2 })], "scalar")]
+#[case::nested_parent(Action::schema_ref().clone(), |row| Vec::<Parent>::collect_into([
+    Ok(Parent { action: Action::Add(Add { id: 0 }) }.into()),
+    StructData::try_new(Parent::schema_ref().clone(), vec![Scalar::Struct(row)]),
+]),
+    vec![Scalar::from(Add { id: 1 }), Scalar::from(Remove { id: 2 })], "[1].action")]
 fn variant_decoders_report_neither_and_both_fields<T: Debug>(
     #[case] schema: SchemaRef,
     #[case] decode: fn(StructData) -> KernelResult<T>,
     #[case] payloads: Vec<Scalar>,
+    #[case] path: &str,
     #[values(false, true)] both: bool,
 ) -> KernelResult<()> {
     let expected: Vec<_> = schema.fields().map(|field| field.name().as_str()).collect();
     let actual = if both { expected.clone() } else { vec![] };
-    let message =
-        format!("Expected exactly one non-null variant among {expected:?}; found {actual:?}");
+    let message = format!(
+        "Cannot convert {path}: expected exactly one non-null variant \
+         among {expected:?}, found active variants {actual:?}"
+    );
     let values = if both {
         payloads
     } else {
@@ -362,11 +365,7 @@ where
     };
     let actual = execute_rows::<T>(batches);
     if nullable == removed {
-        assert!(matches!(
-            actual.unwrap_err().without_backtrace(),
-            KernelError::InvalidStructData(message)
-                if message.contains("Expected exactly one non-null variant")
-        ));
+        assert_result_error_with_message(actual, "exactly one non-null variant among");
     } else {
         assert_eq!(actual?, expected(nullable));
     }

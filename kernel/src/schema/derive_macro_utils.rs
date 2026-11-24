@@ -224,9 +224,10 @@ impl StructDataFields {
             (first, second) => {
                 let expected: Vec<_> = self.expected.fields().map(StructField::name).collect();
                 let actual: Vec<_> = first.into_iter().chain(second).chain(names).collect();
-                return Err(KernelError::invalid_struct_data(format!(
-                    "Expected exactly one non-null variant among {expected:?}; found {actual:?}",
-                )));
+                return Err(KernelError::scalar_conversion(
+                    format!("exactly one non-null variant among {expected:?}"),
+                    format!("active variants {actual:?}"),
+                ));
             }
         };
         drop(names);
