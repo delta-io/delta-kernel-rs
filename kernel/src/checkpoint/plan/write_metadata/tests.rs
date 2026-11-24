@@ -154,7 +154,12 @@ async fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_table, snapshot, engine) = if matches!(state, "native_stats" | "variant_stats") {
         crate::checkpoint::plan::tests::checkpoint_representation_table(
-            v2, true, false, false, true,
+            v2,
+            true,
+            false,
+            false,
+            true,
+            state == "variant_stats",
         )
         .await?
     } else {
