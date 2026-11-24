@@ -81,6 +81,7 @@ pub(crate) const FILE_TYPE_WRITE_LOCATION: &str = "delta.fileType.writeLocation"
 ///
 /// Reference: <https://github.com/delta-io/delta/blob/master/spark/src/main/scala/org/apache/spark/sql/delta/DeltaConfig.scala>
 #[derive(Debug, Clone, Eq, PartialEq, Default)]
+#[non_exhaustive]
 pub struct TableProperties {
     /// true for this Delta table to be append-only. If append-only, existing records cannot be
     /// deleted, and existing values cannot be updated. See [append-only tables] in the protocol.

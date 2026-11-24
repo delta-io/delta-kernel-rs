@@ -1,9 +1,7 @@
 //! Registry of known `delta.*` table properties: canonical names, editability on
 //! existing-table updates, and value validators for property-set APIs.
 
-use super::deserialize::{
-    parse_bool, parse_column_names, parse_interval, parse_non_negative, parse_positive_int,
-};
+use super::deserialize::{parse_bool, parse_column_names, parse_interval, parse_positive_int};
 use super::{
     APPEND_ONLY, AUTO_COMPACT, CHECKPOINT_INTERVAL, CHECKPOINT_POLICY,
     CHECKPOINT_WRITE_STATS_AS_JSON, CHECKPOINT_WRITE_STATS_AS_STRUCT, COLUMN_MAPPING_MAX_COLUMN_ID,
@@ -96,10 +94,6 @@ fn validate_parquet_format_version(value: &str) -> bool {
     }
 }
 
-fn validate_non_negative_long(value: &str) -> bool {
-    parse_non_negative::<i64>(value).is_some()
-}
-
 /// Empty means no formats. Otherwise a comma-separated list of exact format names.
 fn validate_universal_formats(value: &str) -> bool {
     value.is_empty()
@@ -127,14 +121,6 @@ const EDITABLE_CONFIG_PROPERTIES: &[TablePropertyDef] = &[
     editable(PARQUET_COMPRESSION_CODEC, validate_compression_codec),
     editable(SET_TRANSACTION_RETENTION_DURATION, validate_interval),
     editable(PARQUET_FORMAT_VERSION, validate_parquet_format_version),
-    editable(
-        IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
-        validate_non_negative_long,
-    ),
-    editable(
-        IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP,
-        validate_non_negative_long,
-    ),
     editable(UNIVERSAL_FORMAT_ENABLED_FORMATS, validate_universal_formats),
 ];
 
@@ -159,11 +145,18 @@ const FEATURE_ENABLEMENT_PROPERTIES: &[TablePropertyDef] = &[
 ];
 
 /// Kernel-managed keys. Writers must not set these directly.
+///
+/// The ICT enablement version/timestamp are stamped by the kernel when in-commit timestamps turn
+/// on (see [`crate::transaction::protocol_prep::with_ict_enablement_info`]), which bypasses this
+/// registry. Letting callers set them directly would corrupt ICT provenance and timestamp-based
+/// time travel, so they are recognized but not editable.
 const KERNEL_MANAGED_PROPERTIES: &[TablePropertyDef] = &[
     recognized(COLUMN_MAPPING_MAX_COLUMN_ID),
     recognized(MATERIALIZED_ROW_ID_COLUMN_NAME),
     recognized(MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME),
     recognized(ROW_TRACKING_SUSPENDED),
+    recognized(IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION),
+    recognized(IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP),
 ];
 
 const OTHER_RECOGNIZED_PROPERTIES: &[TablePropertyDef] = &[
@@ -313,11 +306,6 @@ mod tests {
         "iceberg,hudi",
         "delta.universalFormat.enabledFormats"
     )]
-    #[case::in_commit_timestamp_enablement_version(
-        "delta.inCommitTimestampEnablementVersion",
-        "5",
-        "delta.inCommitTimestampEnablementVersion"
-    )]
     fn accepts_editable_and_user_properties(
         #[case] key: &str,
         #[case] value: &str,
@@ -381,10 +369,15 @@ mod tests {
         "delta",
         "Invalid value 'delta' for table property"
     )]
-    #[case::negative_in_commit_timestamp_enablement_version(
+    #[case::in_commit_timestamp_enablement_version_not_editable(
         "delta.inCommitTimestampEnablementVersion",
-        "-1",
-        "Invalid value '-1' for table property"
+        "5",
+        "Cannot modify the table property 'delta.inCommitTimestampEnablementVersion'"
+    )]
+    #[case::in_commit_timestamp_enablement_timestamp_not_editable(
+        "delta.inCommitTimestampEnablementTimestamp",
+        "1700000000000",
+        "Cannot modify the table property 'delta.inCommitTimestampEnablementTimestamp'"
     )]
     fn rejects_unsupported_or_invalid(
         #[case] key: &str,
@@ -432,8 +425,6 @@ mod tests {
                 "delta.dataSkippingStatsColumns",
                 "delta.deletedFileRetentionDuration",
                 "delta.enableExpiredLogCleanup",
-                "delta.inCommitTimestampEnablementTimestamp",
-                "delta.inCommitTimestampEnablementVersion",
                 "delta.logRetentionDuration",
                 "delta.parquet.compression.codec",
                 "delta.parquet.format.version",

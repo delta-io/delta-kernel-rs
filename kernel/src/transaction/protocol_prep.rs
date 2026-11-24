@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::actions::Protocol;
 use crate::schema::Schema;
+use crate::schema::validation::validate_cdf_column_names;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     ColumnMappingMode, FeatureRequirement, LEGACY_WRITER_FEATURES,
@@ -214,13 +215,18 @@ pub(crate) fn prepare_protocol_for_update(
         &mut reader_features,
         &mut writer_features,
     );
-    // The preview feature is skipped when the GA feature is already in the protocol, so an
-    // opted-in GA table keeps its protocol unchanged.
-    let variant_shredding_ga_enabled = reader_features.contains(&TableFeature::VariantShredding)
-        || writer_features.contains(&TableFeature::VariantShredding);
-    if table_properties.enable_variant_shredding == Some(true) && !variant_shredding_ga_enabled {
+    // Enabling shredding opts in to GA variantShredding, which PROTOCOL.md requires in both
+    // feature lists. A table already on GA or the preview keeps its protocol unchanged, so clients
+    // that only know the preview are not locked out.
+    let variant_shredding_satisfied = [
+        TableFeature::VariantShredding,
+        TableFeature::VariantShreddingPreview,
+    ]
+    .iter()
+    .any(|f| reader_features.contains(f) || writer_features.contains(f));
+    if table_properties.enable_variant_shredding == Some(true) && !variant_shredding_satisfied {
         add_feature_to_lists(
-            TableFeature::VariantShreddingPreview,
+            TableFeature::VariantShredding,
             &mut reader_features,
             &mut writer_features,
         );
@@ -263,6 +269,8 @@ pub(crate) fn prepare_protocol_for_update(
     } else {
         after
     };
+    reject_newly_enabled_hudi_uniform(before, &table_config)?;
+    reject_cdf_reserved_columns(before, &table_config)?;
     validate_universal_format(&table_config)?;
     // Reject enablement that Kernel cannot write (for example IcebergCompatV1).
     table_config.ensure_write_supported()?;
@@ -372,6 +380,45 @@ fn reject_existing_table_toggles(
         return Err(KernelError::unsupported(
             "Enabling or disabling Iceberg writer compatibility on an existing table is not supported",
         ));
+    }
+    Ok(())
+}
+
+/// Rejects newly enabling the `hudi` UniForm format on an existing table.
+///
+/// Spark gates Hudi UniForm on checks Kernel does not implement yet (no deletion vectors; no
+/// NullType, Byte, Short, TimestampNTZ or geospatial columns), so Kernel could otherwise commit a
+/// state Spark considers invalid. Tables that already have `hudi` keep working.
+fn reject_newly_enabled_hudi_uniform(
+    before: &TableConfiguration,
+    after: &TableConfiguration,
+) -> KernelResult<()> {
+    let has_hudi = |config: &TableConfiguration| {
+        config
+            .metadata()
+            .configuration()
+            .get(UNIVERSAL_FORMAT_ENABLED_FORMATS)
+            .is_some_and(|formats| formats.split(',').map(str::trim).any(|f| f == "hudi"))
+    };
+    if has_hudi(after) && !has_hudi(before) {
+        return Err(KernelError::unsupported(
+            "Enabling 'hudi' universal format on an existing table is not supported yet",
+        ));
+    }
+    Ok(())
+}
+
+/// Rejects CDF-reserved column names (`_change_type`, `_commit_version`, `_commit_timestamp`) in
+/// the final schema when this transaction newly enables Change Data Feed. Without this check a
+/// later `TableChanges` read fails on duplicate fields.
+fn reject_cdf_reserved_columns(
+    before: &TableConfiguration,
+    after: &TableConfiguration,
+) -> KernelResult<()> {
+    let newly_enabled = after.is_feature_enabled(&TableFeature::ChangeDataFeed)
+        && !before.is_feature_enabled(&TableFeature::ChangeDataFeed);
+    if newly_enabled {
+        validate_cdf_column_names(after.logical_schema().as_ref(), after.column_mapping_mode())?;
     }
     Ok(())
 }
@@ -738,6 +785,7 @@ mod tests {
     use crate::table_features::{
         SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE, TableFeature,
     };
+    use crate::table_properties::{ENABLE_CHANGE_DATA_FEED, ENABLE_VARIANT_SHREDDING};
     use crate::unit_test_utils::{
         MockProtocolBuilder, MockTableConfigurationBuilder, assert_result_error_with_message,
         test_schema_flat_with_column_mapping,
@@ -856,6 +904,55 @@ mod tests {
             !existing.contains(&TableFeature::TypeWideningPreview),
         );
         Ok(())
+    }
+
+    #[test]
+    fn prepare_protocol_for_update_variant_shredding_keeps_existing_preview() -> Result<()> {
+        let before = MockTableConfigurationBuilder::new()
+            .with_properties([(ENABLE_VARIANT_SHREDDING, "true")])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([
+                        TableFeature::VariantType,
+                        TableFeature::VariantShreddingPreview,
+                    ])
+                    .build(),
+            )
+            .build();
+        let result = prepare_protocol_for_update(&before, before.clone(), &[])?;
+        assert!(!result.should_emit_protocol);
+        assert!(
+            result
+                .table_config
+                .is_feature_supported(&TableFeature::VariantShreddingPreview)
+        );
+        assert!(
+            !result
+                .table_config
+                .is_feature_supported(&TableFeature::VariantShredding)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_protocol_for_update_rejects_cdf_reserved_column_when_newly_enabled() {
+        let reserved_schema = schema_ref! { nullable "_change_type": STRING };
+        let before = MockTableConfigurationBuilder::new()
+            .with_schema(reserved_schema.clone())
+            .build();
+        let after = MockTableConfigurationBuilder::new()
+            .with_schema(reserved_schema)
+            .with_properties([(ENABLE_CHANGE_DATA_FEED, "true")])
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::ChangeDataFeed])
+                    .build(),
+            )
+            .build();
+        assert_result_error_with_message(
+            prepare_protocol_for_update(&before, after, &[]),
+            "reserved for Change Data Feed",
+        );
     }
 
     #[test]

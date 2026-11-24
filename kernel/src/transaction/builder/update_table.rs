@@ -1675,7 +1675,7 @@ mod tests {
     }
 
     #[test]
-    fn with_table_properties_added_enables_variant_shredding_preview() -> Result<()> {
+    fn with_table_properties_added_enables_variant_shredding_ga() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let transaction = snapshot
             .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
@@ -1683,9 +1683,9 @@ mod tests {
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
         let config = &transaction.effective_table_config;
-        assert!(config.is_feature_supported(&TableFeature::VariantShreddingPreview));
+        assert!(config.is_feature_supported(&TableFeature::VariantShredding));
         assert!(config.is_feature_supported(&TableFeature::VariantType));
-        assert!(!config.is_feature_supported(&TableFeature::VariantShredding));
+        assert!(!config.is_feature_supported(&TableFeature::VariantShreddingPreview));
         Ok(())
     }
 
@@ -1723,13 +1723,19 @@ mod tests {
     }
 
     #[test]
-    fn with_table_properties_added_accepts_hudi_universal_format() -> Result<()> {
+    fn with_table_properties_added_rejects_hudi_universal_format_on_existing_table() -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
-        let transaction = snapshot
+        let error = snapshot
             .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
             .with_table_properties_added([("delta.universalFormat.enabledFormats", "hudi")])
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
-        assert!(transaction.should_emit_metadata);
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("'hudi' universal format on an existing table is not supported"),
+            "error={error}"
+        );
         Ok(())
     }
 
