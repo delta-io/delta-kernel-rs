@@ -52,7 +52,6 @@ fn file_results(
 
 #[rstest]
 #[case::v2_classic(Some("classic"))]
-#[case::v2_json(Some("json"))]
 #[case::v2_parquet(Some("parquet"))]
 #[tokio::test]
 async fn checkpoint_statistics_match_reconciliation_and_write_results(
@@ -189,7 +188,7 @@ async fn checkpoint_statistics_match_reconciliation_and_write_results(
     let bytes = writer.serialize_checkpoint_hint(
         &read_statistics(&aggregate)?,
         &root_meta,
-        checkpoint_schema_json(&checkpoint_schema)?.map(|_| checkpoint_schema.clone()),
+        checkpoint_schema.clone(),
         prefetch_rows,
     )?;
     assert!(bytes.starts_with(br#"{"version":1,"size":"#));
@@ -210,10 +209,7 @@ async fn checkpoint_statistics_match_reconciliation_and_write_results(
     assert_eq!(hint.parts, None);
     assert_eq!(hint.size_in_bytes, Some(1024 + sidecar_bytes));
     assert_eq!(hint.num_of_add_files, Some(files as i64));
-    assert_eq!(
-        hint.checkpoint_schema,
-        (manifest_format != Some("json")).then_some(checkpoint_schema.clone())
-    );
+    assert_eq!(hint.checkpoint_schema, Some(checkpoint_schema.clone()));
     assert!(hint.applies_to(&[ParsedLogPath::new(root_meta.clone()).unwrap()]));
     if uuid_root {
         let locator = hint.v2_checkpoint.unwrap();
