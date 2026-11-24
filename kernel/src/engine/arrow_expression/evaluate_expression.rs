@@ -46,7 +46,7 @@ use crate::expressions::{
     OpaqueExpression, OpaquePredicate, Predicate, Scalar, UnaryExpression, UnaryExpressionOp,
     UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
-use crate::path_encoding::{scheme_len, uri_decode_path, uri_encode_path};
+use crate::path_encoding::{scheme_len, uri_decode_path, uri_encode_path_for_dbr};
 use crate::schema::{DataType, PrimitiveType, StructField, StructType, ToSchema as _};
 
 #[internal_api]
@@ -448,7 +448,7 @@ fn resolve_delta_file_path(path: &str, root: &Url) -> KernelResult<Url> {
                 "Delta action path must be table-relative: {path}"
             )));
         }
-        let encoded = uri_encode_path(&decoded);
+        let encoded = uri_encode_path_for_dbr(&decoded);
         root.join(encoded.as_ref())
             .map_err(|error| KernelError::generic(error.to_string()))?
     };
@@ -473,7 +473,7 @@ fn path_info_from_url(root: &Url, absolute_path: Url) -> KernelResult<(String, O
         .map(|relative| {
             let decoded = uri_decode_path(relative)
                 .ok_or_else(|| KernelError::generic("relative URL path is not valid UTF-8"))?;
-            Ok::<String, KernelError>(uri_encode_path(&decoded).into_owned())
+            Ok::<String, KernelError>(uri_encode_path_for_dbr(&decoded).into_owned())
         })
         .transpose()?;
     Ok((absolute_path.to_string(), relative_path))

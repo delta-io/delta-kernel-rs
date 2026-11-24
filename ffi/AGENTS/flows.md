@@ -101,6 +101,18 @@ In-Commit Timestamp is unavailable from retained CRC state. Domain-metadata and 
 FFI reads also use an unscoped reader, preserving the engine's cancellation and timeout behavior.
 The C API signatures do not expose reader state or a cancellation token.
 
+`snapshot_reachable_data_files_plan(snapshot, engine, cut_version)` returns owned proto bytes for
+one snapshot's reachable-path relation, with `absolute_path` and nullable `relative_path` columns.
+It is intended for connectors to compose with candidate sources such as inventory. The optional cut
+version is resolved by the caller; `None` means scan required history from version 0. It does not
+list candidates, classify clones, or delete files. Free the returned bytes with `free_kernel_bytes`.
+
+`snapshot_reachable_data_files_plan(snapshot, engine, cut_version)` returns owned serialized plan bytes
+with `absolute_path` and nullable `relative_path` for one snapshot's reachable files. Connectors can
+execute and join this relation with their own candidate source, including inventory. Kernel does not
+list candidates or delete files. `cut_version=None` starts required history at version 0. Free the
+bytes with `free_kernel_bytes`.
+
 `snapshot_data_files_to_delete_plan(snapshot, engine, mode, now_ms, retention_ms, anchor_version)`
 returns `OptionalValue<KernelOwnedBytes>` containing a serialized `Operation::QueryPlan`, or `None`
 when the LITE range is statically empty; a present plan can still yield zero rows. `Full` requires

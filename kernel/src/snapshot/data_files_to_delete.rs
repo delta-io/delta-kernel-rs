@@ -182,8 +182,10 @@ impl Snapshot {
 
     /// Builds this snapshot's reachable-file paths as a composable plan relation.
     ///
-    /// Paths are absolute URLs. This internal API accepts one snapshot at a time and has no
-    /// shallow-clone semantics; connectors can combine its result with other protected-path sets.
+    /// The plan emits `absolute_path` and nullable `relative_path` columns. Relative paths use the
+    /// same reserved-ASCII escaping and raw non-ASCII form as DBR path strings. This helper accepts
+    /// one snapshot at a time and has no shallow-clone semantics; connectors can combine
+    /// its result with other protected-path sets.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[tracing::instrument(
@@ -198,6 +200,12 @@ impl Snapshot {
         cut_version: Option<Version>,
     ) -> Result<PlanBuilder> {
         ensure_cleanup_supported(self)?;
+        if !self.built_as_latest {
+            return Err(KernelError::generic(
+                "reachable-data-files plan requires a snapshot built at the latest version",
+            )
+            .into());
+        }
         if let Some(version) = cut_version.filter(|version| *version > self.version()) {
             return Err(KernelError::generic(format!(
                 "retention cut version {version} is newer than snapshot version {}",

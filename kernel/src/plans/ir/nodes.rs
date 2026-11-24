@@ -67,7 +67,7 @@ pub static FILE_META_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 /// Output schema of [`ListFiles`]: absolute `absolute_path`, table-relative `relative_path`, size
 /// in bytes, and `last_modified` in milliseconds since the Unix epoch.
 ///
-/// `relative_path` uses the URI path encoding used by Delta action paths.
+/// `relative_path` uses DBR's path-string form: URI-reserved ASCII is escaped, non-ASCII is raw.
 pub static LIST_FILES_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     not_null "absolute_path": STRING,
     not_null "relative_path": STRING,
@@ -78,7 +78,7 @@ pub static LIST_FILES_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 /// Recursively lists files beneath a hierarchical table-root URL.
 ///
 /// The engine performs the listing. It returns one row per file, with `absolute_path` as an
-/// absolute URL and `relative_path` as the URI-encoded path relative to `base_url`. Ordering is
+/// absolute URL and `relative_path` in DBR's path-string form relative to `base_url`. Ordering is
 /// unspecified.
 /// Directory and connector-specific filtering is applied by downstream plan operators or by the
 /// connector after compiling the plan.

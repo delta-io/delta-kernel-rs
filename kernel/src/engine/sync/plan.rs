@@ -35,7 +35,7 @@ use crate::engine::arrow_utils::{
 };
 use crate::expressions::{ArrayData, ColumnName, PredicateRef, Scalar};
 use crate::object_store::DynObjectStore;
-use crate::path_encoding::{uri_decode_path, uri_encode_path};
+use crate::path_encoding::{uri_decode_path, uri_encode_path_for_dbr};
 use crate::plans::ir::nodes::{
     DynamicScan, FILE_META_SCHEMA, FileType, LIST_FILES_SCHEMA, ListFiles, Operator, Project,
     RelationId, RelationRef, ScanFile, ScanJson, ScanParquet, SemiJoin, Values, WriteJson,
@@ -419,7 +419,7 @@ impl SyncPlanExecutor {
                     )));
                 }
                 // Match Delta action-path encoding so listing and log paths join consistently.
-                let relative_path = uri_encode_path(&raw_relative_path).into_owned();
+                let relative_path = uri_encode_path_for_dbr(&raw_relative_path).into_owned();
                 let absolute_path = list_files
                     .base_url
                     .join(&relative_path)
@@ -838,14 +838,18 @@ mod tests {
     }
 
     #[test]
-    fn list_files_recursively_emits_encoded_relative_paths() -> KernelResult<()> {
+    fn list_files_recursively_emits_dbr_compatible_paths() -> KernelResult<()> {
         let executor = SyncPlanExecutor::new(Some(Arc::new(InMemory::new())));
         let root = Url::parse("memory:///table/")?;
         let file = Url::parse("memory:///table/part=one/a%20b%25.parquet")?;
+        let unicode_file = Url::parse("memory:///table/M%C3%BCnchen/file.parquet")?;
         let log_file = Url::parse("memory:///table/_delta_log/00000000000000000000.json")?;
         executor
             .storage
             .put(&file, Bytes::from_static(b"data"), false)?;
+        executor
+            .storage
+            .put(&unicode_file, Bytes::from_static(b"unicode"), false)?;
         executor
             .storage
             .put(&log_file, Bytes::from_static(b"{}"), false)?;
@@ -878,6 +882,7 @@ mod tests {
         assert_eq!(
             actual_absolute_paths,
             [
+                "memory:///table/M%C3%BCnchen/file.parquet",
                 "memory:///table/_delta_log/00000000000000000000.json",
                 "memory:///table/part=one/a%20b%25.parquet",
             ]
@@ -899,6 +904,7 @@ mod tests {
         assert_eq!(
             actual,
             [
+                "München/file.parquet",
                 "_delta_log/00000000000000000000.json",
                 "part=one/a%20b%25.parquet",
             ]

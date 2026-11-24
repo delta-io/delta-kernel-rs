@@ -95,13 +95,59 @@ fn snapshot_data_files_to_delete_plan_impl(
         .into())
 }
 
+/// Build one snapshot's reachable-path relation as serialized QueryPlan bytes.
+///
+/// Connectors can compose this plan with their own candidate relation, including file inventory,
+/// then apply connector-specific protections and deletion. `cut_version` is the retention boundary:
+/// live Adds are replayed from the selected checkpoint/CRC, Add DVs and CDC at or after the cut are
+/// protected, and Remove paths/DVs strictly after the cut are protected. `None` starts the history
+/// scan at version 0. The plan has non-null `absolute_path` and nullable `relative_path` columns.
+///
+/// # Safety
+///
+/// `snapshot` and `engine` must be valid handles. The `cut_version` tag must be a valid C enum
+/// variant. The snapshot must be freshly built at its latest visible version. The function borrows
+/// both handles and clones the snapshot reference for this call.
+#[cfg(feature = "declarative-plans")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapshot_reachable_data_files_plan(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+    cut_version: OptionalValue<u64>,
+) -> ExternResult<KernelOwnedBytes> {
+    let snapshot = unsafe { snapshot.clone_as_arc() };
+    let extern_engine = unsafe { engine.as_ref() };
+    let inner_engine = extern_engine.engine();
+    let result = snapshot_reachable_data_files_plan_impl(
+        &snapshot,
+        inner_engine.as_ref(),
+        cut_version.into(),
+    );
+    unsafe { result.into_extern_result(&extern_engine) }
+}
+
+#[cfg(feature = "declarative-plans")]
+fn snapshot_reachable_data_files_plan_impl(
+    snapshot: &SnapshotRef,
+    engine: &dyn Engine,
+    cut_version: Option<Version>,
+) -> delta_kernel::Result<KernelOwnedBytes> {
+    let plan = snapshot
+        .get_reachable_data_files(engine, cut_version)?
+        .build()?;
+    Ok(Operation::QueryPlan(plan).to_proto_bytes().into())
+}
+
 #[cfg(all(test, feature = "declarative-plans"))]
 mod tests {
     use delta_kernel::plans::proto::operation as proto_op;
     use prost::Message as _;
     use test_utils::{TestAction, actions_to_string};
 
-    use super::{FfiDataFilesToDeleteMode, snapshot_data_files_to_delete_plan};
+    use super::{
+        FfiDataFilesToDeleteMode, snapshot_data_files_to_delete_plan,
+        snapshot_reachable_data_files_plan,
+    };
     use crate::error::FFIKernelError;
     use crate::ffi_test_utils::{assert_extern_result_error_contains, ok_or_panic, setup_snapshot};
     use crate::{OptionalValue, free_engine, free_snapshot};
@@ -134,6 +180,35 @@ mod tests {
             operation.op,
             Some(proto_op::operation::Op::QueryPlan(_))
         ));
+
+        unsafe {
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
+    }
+
+    #[tokio::test]
+    async fn returns_serialized_reachable_paths_plan() {
+        let (engine, snapshot) = setup_snapshot(actions_to_string(vec![
+            TestAction::Metadata,
+            TestAction::Add("part-1.parquet".to_owned()),
+        ]))
+        .await
+        .unwrap();
+
+        let result = unsafe {
+            snapshot_reachable_data_files_plan(
+                snapshot.shallow_copy(),
+                engine.shallow_copy(),
+                OptionalValue::None,
+            )
+        };
+        let bytes = unsafe { ok_or_panic(result).into_vec() };
+        let operation = proto_op::Operation::decode(bytes.as_slice()).unwrap();
+        let Some(proto_op::operation::Op::QueryPlan(plan)) = operation.op else {
+            panic!("expected a reachable-path QueryPlan");
+        };
+        assert!(!plan.nodes.is_empty());
 
         unsafe {
             free_snapshot(snapshot);

@@ -1,7 +1,7 @@
-//! URI percent-encoding of raw path components, matching Hadoop's `Path.toUri().toString()`.
+//! Path escaping for Delta actions, URL construction, and plan join keys.
 //!
-//! Used both when encoding a filesystem path into `add.path` (Hive-style partition paths) and
-//! when resolving a raw, table-relative AMT path against the table root. Also detects whether a
+//! `uri_encode_path` retains Kernel's existing URL-safe encoding for writes. The plan-only DBR
+//! canonicalizer preserves non-ASCII characters in relative path strings. Also detects whether a
 //! location has a URI scheme, which decides whether it is absolute or relative.
 
 use std::borrow::Cow;
@@ -9,15 +9,8 @@ use std::borrow::Cow;
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 use url::Url;
 
-/// Characters encoded by [`uri_encode_path`]: `%`, space, and ASCII chars illegal in a
-/// URI path, plus all ASCII controls via [`CONTROLS`]. Non-ASCII UTF-8 bytes are ALSO
-/// percent-encoded by `utf8_percent_encode` (each byte of the UTF-8 sequence becomes
-/// `%XX`), even though they are not in the [`AsciiSet`]. For example:
-/// `uri_encode_path("München") == "M%C3%BCnchen"`, because `ü` is `0xC3 0xBC` in UTF-8.
-///
-/// TODO(#2423): Delta-Spark leaves non-ASCII bytes raw in `add.path` (e.g. `München`
-/// stays as `München`). Our current behavior diverges — revisit once kernel matches
-/// Delta-Spark's `add.path` encoding for non-ASCII.
+/// Characters encoded by [`uri_encode_path`]: `%`, space, URI-reserved ASCII and all controls.
+/// Non-ASCII UTF-8 bytes are percent-encoded to keep their representation safe in a URL.
 pub(crate) const HADOOP_URI_PATH_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'"')
@@ -35,13 +28,64 @@ pub(crate) const HADOOP_URI_PATH_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'|')
     .add(b'}');
 
-/// URI percent-encodes a raw path component so it can be embedded in a URL path, matching
-/// Hadoop `Path.toUri().toString()`. Unreserved characters (including `/`, `.`, and `:`) pass
-/// through, so path separators and relative segments are preserved; the characters in
-/// [`HADOOP_URI_PATH_ENCODE_SET`] and all non-ASCII bytes are percent-encoded. Returns
-/// [`Cow::Borrowed`] when no encoding is needed (zero-allocation fast path).
+/// Percent-encodes a raw path component for URL construction, including non-ASCII UTF-8 bytes.
 pub(crate) fn uri_encode_path(path: &str) -> Cow<'_, str> {
     utf8_percent_encode(path, HADOOP_URI_PATH_ENCODE_SET).into()
+}
+
+/// Encodes URI-reserved ASCII bytes while preserving non-ASCII characters as DBR does in paths.
+/// Use this only for the new plan relations' relative-path join keys; URL serialization remains
+/// the responsibility of `Url`.
+#[cfg(any(feature = "declarative-plans", test))]
+pub(crate) fn uri_encode_path_for_dbr(path: &str) -> Cow<'_, str> {
+    if !path.bytes().any(needs_dbr_path_encoding) {
+        return Cow::Borrowed(path);
+    }
+    let mut encoded = String::with_capacity(path.len());
+    let mut copied_through = 0;
+    for (index, character) in path.char_indices() {
+        if !character.is_ascii() || !needs_dbr_path_encoding(character as u8) {
+            continue;
+        }
+        encoded.push_str(&path[copied_through..index]);
+        let byte = character as u8;
+        encoded.push('%');
+        encoded.push(hex_digit(byte >> 4));
+        encoded.push(hex_digit(byte & 0x0f));
+        copied_through = index + 1;
+    }
+    encoded.push_str(&path[copied_through..]);
+    Cow::Owned(encoded)
+}
+
+#[cfg(any(feature = "declarative-plans", test))]
+fn needs_dbr_path_encoding(byte: u8) -> bool {
+    byte <= 0x20
+        || byte == 0x7f
+        || matches!(
+            byte,
+            b'"' | b'#'
+                | b'%'
+                | b'<'
+                | b'>'
+                | b'?'
+                | b'['
+                | b'\\'
+                | b']'
+                | b'^'
+                | b'`'
+                | b'{'
+                | b'|'
+                | b'}'
+        )
+}
+
+#[cfg(any(feature = "declarative-plans", test))]
+fn hex_digit(nibble: u8) -> char {
+    match nibble {
+        0..=9 => (b'0' + nibble) as char,
+        _ => (b'A' + nibble - 10) as char,
+    }
 }
 
 /// Percent-decodes a URI path component back into its raw form. Returns `None` if the decoded
@@ -97,9 +141,6 @@ mod tests {
 
     use super::*;
 
-    /// Every ASCII byte: chars in `HADOOP_URI_PATH_ENCODE_SET` (space, `"`, `#`, `%`, `<`,
-    /// `>`, `?`, `[`, `\`, `]`, `^`, backtick, `{`, `|`, `}`) plus all controls encode to
-    /// `%XX`; everything else passes through unchanged.
     #[test]
     fn test_uri_encode_path_every_ascii_byte() {
         let must_encode: &[u8] = b" \"#%<>?[\\]^`{|}";
@@ -145,5 +186,11 @@ mod tests {
         let result = uri_encode_path(input);
         assert_eq!(result, input);
         assert!(matches!(result, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn dbr_path_encoding_preserves_non_ascii_and_escapes_reserved_ascii() {
+        assert_eq!(uri_encode_path_for_dbr("München"), "München");
+        assert_eq!(uri_encode_path_for_dbr("München/a b%"), "München/a%20b%25");
     }
 }

@@ -160,8 +160,8 @@ pub enum UnaryExpressionOp {
     /// The input is a struct containing `table_root: STRING` and `path: STRING`. The result is a
     /// struct with `absolute_path: STRING` and `relative_path: STRING`, nullable when
     /// the absolute path is outside `table_root`. Relative Delta action paths are resolved against
-    /// the root; absolute URLs are preserved. This keeps log-action paths joinable with directory
-    /// listing paths inside an engine-executable plan.
+    /// the root; absolute URLs are preserved. The relative path escapes reserved ASCII but keeps
+    /// non-ASCII characters raw to match DBR path strings, so log-action paths join listing paths.
     ResolveFilePath,
     /// Resolve a deletion-vector descriptor against its table root.
     ///

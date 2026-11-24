@@ -2060,7 +2060,7 @@ fn resolve_file_path_returns_absolute_and_relative_urls() {
         absolute_path.value(0),
         "s3://bucket/table/data/M%C3%BCnchen.parquet"
     );
-    assert_eq!(relative_path.value(0), "data/M%C3%BCnchen.parquet");
+    assert_eq!(relative_path.value(0), "data/München.parquet");
 }
 
 #[test]
