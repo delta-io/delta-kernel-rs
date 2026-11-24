@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use crate::crc::{Crc, CrcDelta};
+use crate::crc::{Crc, CrcWrapper};
 use crate::utils::require;
 use crate::{KernelError, KernelResult, Version};
 
@@ -70,103 +70,44 @@ pub enum CrcSource {
 }
 
 /// The newest [`Crc`] a snapshot resolved, at or before the snapshot's version. It is one CRC,
-/// kept in memory so later queries and CRC writes can reuse it. A present CRC is either:
+/// read from disk (or computed) at most once; keeping it lets later queries and CRC writes reuse
+/// the already-parsed state instead of re-reading it. A retained CRC is one of:
 /// - at the snapshot version: authoritative, servable at zero I/O via [`Self::at_version`];
-/// - stale (older): available through [`Self::as_ref`] for reuse, never served as authoritative.
+/// - stale (older): kept only as a base for [`Self::base`], never served as authoritative.
 ///
-/// The CRC carries its disk origin; this type derives its source relative to the snapshot version
-/// and records lookup outcomes when no CRC is present.
+/// The wrapper carries the original checksum-file version. The snapshot derives its source from
+/// that origin and records lookup outcomes when no CRC is present.
 ///
 /// [`Snapshot`]: super::Snapshot
 #[derive(Debug, Clone)]
-pub(crate) enum SnapshotCrc {
-    Present {
-        crc: Arc<Crc>,
-        snapshot_version: Version,
-    },
-    Missing,
-    Unusable,
-    Unknown,
+pub(super) struct SnapshotCrc {
+    crc: CrcWrapper,
+    snapshot_version: Version,
 }
 
 impl SnapshotCrc {
-    /// Wraps an in-memory CRC without changing its disk origin.
-    pub(crate) fn new(crc: Arc<Crc>) -> Self {
-        Self::Present {
-            snapshot_version: crc.version,
-            crc,
-        }
-    }
-
-    /// Validates a connector's source claim without changing CRC acceptance or contents.
-    pub(crate) fn from_parts(
-        crc: Option<Arc<Crc>>,
-        snapshot_version: Version,
-        source: CrcSource,
-    ) -> Self {
-        match crc {
-            Some(mut crc) => {
-                let on_disk_version = match source {
-                    CrcSource::AtVersion { crc_version }
-                        if crc_version == crc.version && crc.version == snapshot_version =>
-                    {
-                        Some(crc.version)
-                    }
-                    CrcSource::Reconstructed {
-                        on_disk_version,
-                        crc_version,
-                    } if crc_version == crc.version
-                        && on_disk_version < crc.version
-                        && crc.version == snapshot_version =>
-                    {
-                        Some(on_disk_version)
-                    }
-                    CrcSource::Stale {
-                        on_disk_version,
-                        crc_version,
-                    } if crc_version == crc.version
-                        && on_disk_version <= crc.version
-                        && crc.version < snapshot_version =>
-                    {
-                        Some(on_disk_version)
-                    }
-                    _ => None,
-                };
-                if crc.on_disk_version != on_disk_version {
-                    Arc::make_mut(&mut crc).on_disk_version = on_disk_version;
-                }
-                Self::Present {
-                    crc,
-                    snapshot_version,
-                }
-            }
-            None => match source {
-                CrcSource::Missing => Self::Missing,
-                CrcSource::Unusable => Self::Unusable,
-                _ => Self::Unknown,
-            },
-        }
-    }
-
-    /// Records a checksum file successfully written at the CRC's version.
-    pub(crate) fn from_written_crc(mut crc: Arc<Crc>) -> Self {
-        if crc.on_disk_version != Some(crc.version) {
-            Arc::make_mut(&mut crc).on_disk_version = Some(crc.version);
-        }
-        Self::new(crc)
-    }
-
-    /// Checks the existing CRC version bounds for a snapshot, preserving its disk origin.
-    pub(crate) fn for_snapshot(
-        mut self,
+    /// Wrap the CRC a snapshot at `snapshot_version` resolved. A retained CRC must sit in
+    /// `[checkpoint_version, snapshot_version]`. Its original on-disk version may predate the
+    /// checkpoint but cannot exceed the retained CRC version.
+    pub(super) fn try_new(
+        crc: CrcWrapper,
         snapshot_version: Version,
         checkpoint_version: Option<Version>,
     ) -> KernelResult<Self> {
-        if let Self::Present {
+        if let CrcWrapper::Present {
             crc,
-            snapshot_version: version,
-        } = &mut self
+            on_disk_version,
+        } = &crc
         {
+            if let Some(on_disk_version) = on_disk_version {
+                require!(
+                    *on_disk_version <= crc.version,
+                    KernelError::internal_error(format!(
+                        "On-disk CRC version {on_disk_version} is ahead of retained CRC version {}",
+                        crc.version
+                    ))
+                );
+            }
             require!(
                 crc.version <= snapshot_version,
                 KernelError::internal_error(format!(
@@ -181,82 +122,61 @@ impl SnapshotCrc {
                     crc.version
                 ))
             );
-            *version = snapshot_version;
         }
-        Ok(self)
+        Ok(Self {
+            crc,
+            snapshot_version,
+        })
     }
 
-    /// Applies a committed delta only to an at-version CRC, keeping stale CRCs unchanged.
-    pub(crate) fn apply_commit(&self, delta: CrcDelta, version: Version) -> Self {
-        match self.at_version() {
-            Some(crc) => Self::new(Arc::new(crc.as_ref().clone().apply(delta, version))),
-            None => self.clone(),
-        }
-    }
-
-    /// Keeps only the at-version CRC for checkpoint and hint derivations.
-    pub(crate) fn retain_at_version(&self) -> Self {
-        match self {
-            Self::Present { .. } if self.at_version().is_none() => Self::Unknown,
-            _ => self.clone(),
-        }
-    }
-
-    pub(crate) fn source(&self) -> CrcSource {
-        match self {
-            Self::Present {
+    pub(super) fn source(&self) -> CrcSource {
+        match &self.crc {
+            CrcWrapper::Present {
                 crc,
-                snapshot_version,
-            } => match crc.on_disk_version {
-                Some(on_disk_version) if crc.version < *snapshot_version => CrcSource::Stale {
-                    on_disk_version,
-                    crc_version: crc.version,
-                },
-                Some(on_disk_version) if on_disk_version == *snapshot_version => {
-                    CrcSource::AtVersion {
-                        crc_version: crc.version,
+                on_disk_version: Some(on_disk_version),
+            } => {
+                let crc_version = crc.version;
+                let on_disk_version = *on_disk_version;
+                if crc_version < self.snapshot_version {
+                    CrcSource::Stale {
+                        on_disk_version,
+                        crc_version,
                     }
+                } else if on_disk_version < crc_version {
+                    CrcSource::Reconstructed {
+                        on_disk_version,
+                        crc_version,
+                    }
+                } else {
+                    CrcSource::AtVersion { crc_version }
                 }
-                Some(on_disk_version) => CrcSource::Reconstructed {
-                    on_disk_version,
-                    crc_version: crc.version,
-                },
-                None => CrcSource::Unknown,
-            },
-            Self::Missing => CrcSource::Missing,
-            Self::Unusable => CrcSource::Unusable,
-            Self::Unknown => CrcSource::Unknown,
+            }
+            CrcWrapper::Present {
+                on_disk_version: None,
+                ..
+            }
+            | CrcWrapper::Unknown => CrcSource::Unknown,
+            CrcWrapper::Missing => CrcSource::Missing,
+            CrcWrapper::Unusable => CrcSource::Unusable,
         }
     }
 
-    /// Returns the in-memory CRC only when its version matches the snapshot version.
-    pub(crate) fn at_version(&self) -> Option<&Arc<Crc>> {
-        match self {
-            Self::Present {
-                crc,
-                snapshot_version,
-            } if crc.version == *snapshot_version => Some(crc),
-            _ => None,
-        }
+    pub(super) fn retained(&self) -> &CrcWrapper {
+        &self.crc
     }
 
-    /// Returns the in-memory CRC, which may be older than the snapshot version.
-    pub(crate) fn as_ref(&self) -> Option<&Arc<Crc>> {
-        match self {
-            Self::Present { crc, .. } => Some(crc),
-            _ => None,
-        }
+    /// The CRC iff it sits exactly at the snapshot version, so its cached values are authoritative
+    /// at zero I/O. Returns `None` for a stale CRC.
+    pub(super) fn at_version(&self) -> Option<&Arc<Crc>> {
+        self.crc
+            .as_ref()
+            .filter(|crc| crc.version == self.snapshot_version)
     }
 
-    #[cfg(test)]
-    pub(crate) fn try_new(
-        crc: Option<Arc<Crc>>,
-        snapshot_version: Version,
-        checkpoint_version: Option<Version>,
-        source: CrcSource,
-    ) -> KernelResult<Self> {
-        Self::from_parts(crc, snapshot_version, source)
-            .for_snapshot(snapshot_version, checkpoint_version)
+    /// The held CRC, at-version or stale, for callers that reuse it regardless of version
+    /// (e.g. checksum writes).
+    pub(super) fn base(&self) -> Option<&Arc<Crc>> {
+        self.crc.as_ref()
     }
 }
 
@@ -279,86 +199,58 @@ mod tests {
         })
     }
 
-    #[test]
-    fn new_rejects_crc_ahead_of_snapshot() {
+    #[rstest::rstest]
+    #[case::ahead_of_snapshot(6, None, None, "is ahead of snapshot version")]
+    #[case::below_checkpoint(2, Some(3), None, "is below checkpoint version")]
+    #[case::ahead_of_retained_crc(5, None, Some(6), "is ahead of retained CRC version")]
+    fn new_rejects_invalid_argument_combinations(
+        #[case] crc_version: Version,
+        #[case] checkpoint_version: Option<Version>,
+        #[case] on_disk_version: Option<Version>,
+        #[case] expected_error: &str,
+    ) {
+        let crc = CrcWrapper::Present {
+            crc: crc_at(crc_version),
+            on_disk_version,
+        };
         assert_result_error_with_message(
-            SnapshotCrc::try_new(Some(crc_at(6)), 5, None, CrcSource::Unknown),
-            "is ahead of snapshot version",
-        );
-    }
-
-    #[test]
-    fn new_rejects_crc_below_checkpoint() {
-        assert_result_error_with_message(
-            SnapshotCrc::try_new(Some(crc_at(2)), 5, Some(3), CrcSource::Unknown),
-            "is below checkpoint version",
+            SnapshotCrc::try_new(crc, 5, checkpoint_version),
+            expected_error,
         );
     }
 
     #[test]
     fn new_accepts_crc_at_checkpoint() {
-        let holder = SnapshotCrc::try_new(Some(crc_at(3)), 5, Some(3), CrcSource::Unknown).unwrap();
-        assert_eq!(holder.as_ref().map(|c| c.version), Some(3));
+        let holder = SnapshotCrc::try_new(Some(crc_at(3)).into(), 5, Some(3)).unwrap();
+        assert_eq!(holder.base().map(|c| c.version), Some(3));
     }
 
     #[test]
     fn at_version_serves_crc_matching_snapshot_version() {
-        let holder = SnapshotCrc::try_new(Some(crc_at(5)), 5, None, CrcSource::Unknown).unwrap();
+        let holder = SnapshotCrc::try_new(Some(crc_at(5)).into(), 5, None).unwrap();
         assert_eq!(holder.at_version().map(|c| c.version), Some(5));
-        assert_eq!(holder.as_ref().map(|c| c.version), Some(5));
+        assert_eq!(holder.base().map(|c| c.version), Some(5));
     }
 
     #[test]
     fn stale_crc_is_base_but_not_at_version() {
-        let holder = SnapshotCrc::try_new(Some(crc_at(3)), 5, None, CrcSource::Unknown).unwrap();
+        let holder = SnapshotCrc::try_new(Some(crc_at(3)).into(), 5, None).unwrap();
         assert!(holder.at_version().is_none());
-        assert_eq!(holder.as_ref().map(|c| c.version), Some(3));
+        assert_eq!(holder.base().map(|c| c.version), Some(3));
     }
 
     #[test]
     fn none_holder_serves_nothing() {
-        let holder = SnapshotCrc::try_new(None, 5, None, CrcSource::Unknown).unwrap();
+        let holder = SnapshotCrc::try_new(CrcWrapper::Unknown, 5, None).unwrap();
         assert!(holder.at_version().is_none());
-        assert!(holder.as_ref().is_none());
-    }
-
-    #[rstest::rstest]
-    #[case::reconstructed_at_disk_version(Some(5), CrcSource::Reconstructed { on_disk_version: 5, crc_version: 5 })]
-    #[case::reconstructed_with_future_disk_version(Some(5), CrcSource::Reconstructed { on_disk_version: 6, crc_version: 5 })]
-    #[case::missing_with_crc(Some(5), CrcSource::Missing)]
-    #[case::unusable_with_crc(Some(3), CrcSource::Unusable)]
-    #[case::at_version_without_crc(None, CrcSource::AtVersion { crc_version: 5 })]
-    #[case::at_version_with_stale_crc(Some(3), CrcSource::AtVersion { crc_version: 3 })]
-    #[case::stale_with_newer_disk_version(Some(3), CrcSource::Stale { on_disk_version: 4, crc_version: 3 })]
-    #[case::stale_at_snapshot(Some(5), CrcSource::Stale { on_disk_version: 3, crc_version: 5 })]
-    #[case::stale_without_crc(None, CrcSource::Stale { on_disk_version: 3, crc_version: 5 })]
-    #[case::reconstructed_with_stale_crc(Some(4), CrcSource::Reconstructed { on_disk_version: 3, crc_version: 4 })]
-    #[case::reconstructed_without_crc(None, CrcSource::Reconstructed { on_disk_version: 3, crc_version: 5 })]
-    #[case::at_version_wrong_crc_version(Some(5), CrcSource::AtVersion { crc_version: 4 })]
-    #[case::reconstructed_wrong_crc_version(Some(5), CrcSource::Reconstructed { on_disk_version: 1, crc_version: 4 })]
-    #[case::stale_wrong_crc_version(Some(3), CrcSource::Stale { on_disk_version: 1, crc_version: 2 })]
-    fn inconsistent_provenance_is_unknown_without_changing_crc(
-        #[case] crc_version: Option<Version>,
-        #[case] source: CrcSource,
-    ) {
-        // Given an in-memory checksum and an incompatible provenance claim.
-        let crc = crc_version.map(crc_at);
-
-        // When the checksum and provenance are used to construct a snapshot's CRC state.
-        let state = SnapshotCrc::try_new(crc.clone(), 5, None, source).unwrap();
-
-        // Then only telemetry is discarded; CRC retention and construction success are unchanged.
-        assert_eq!(state.source(), CrcSource::Unknown);
-        assert_eq!(state.as_ref(), crc.as_ref());
+        assert!(holder.base().is_none());
     }
 
     #[test]
     fn replayed_crc_carries_origin_across_snapshot_versions_without_copying() {
         // Given a CRC read at version 10 and advanced in memory to version 13.
-        let mut crc = crc_at(10);
-        Arc::make_mut(&mut crc).on_disk_version = Some(10);
-        let original = SnapshotCrc::new(crc);
-        let advanced = original.apply_commit(CrcDelta::default(), 13);
+        let crc = CrcWrapper::from_file(crc_at(10)).map_crc(|_| crc_at(13));
+        let advanced = SnapshotCrc::try_new(crc.clone(), 13, Some(12)).unwrap();
         assert_eq!(
             advanced.source(),
             CrcSource::Reconstructed {
@@ -366,9 +258,8 @@ mod tests {
                 crc_version: 13
             }
         );
-
         // When a newer snapshot uses the same CRC without replaying it again.
-        let stale = advanced.clone().for_snapshot(14, None).unwrap();
+        let stale = SnapshotCrc::try_new(crc, 14, Some(12)).unwrap();
 
         // Then classification changes without copying or changing the CRC or its disk origin.
         assert_eq!(
@@ -378,65 +269,10 @@ mod tests {
                 crc_version: 13
             }
         );
+        assert!(stale.at_version().is_none());
         assert!(Arc::ptr_eq(
-            stale.as_ref().unwrap(),
-            advanced.as_ref().unwrap()
+            stale.base().unwrap(),
+            advanced.at_version().unwrap()
         ));
-        assert_eq!(stale.as_ref().unwrap().on_disk_version, Some(10));
-        assert_eq!(stale.as_ref().unwrap().version, 13);
-        assert_eq!(original.source(), CrcSource::AtVersion { crc_version: 10 });
-        assert_eq!(
-            advanced.source(),
-            CrcSource::Reconstructed {
-                on_disk_version: 10,
-                crc_version: 13
-            }
-        );
-    }
-
-    #[rstest::rstest]
-    #[case::unchanged(CrcSource::Reconstructed { on_disk_version: 1, crc_version: 3 }, Some(1))]
-    #[case::omitted(CrcSource::Unknown, None)]
-    #[case::inconsistent(CrcSource::Missing, None)]
-    fn hint_claim_does_not_change_shared_crc_origin(
-        #[case] claim: CrcSource,
-        #[case] expected_origin: Option<Version>,
-    ) {
-        // Given a shared CRC with known disk origin.
-        let mut crc = crc_at(3);
-        Arc::make_mut(&mut crc).on_disk_version = Some(1);
-
-        // When a hint supplies matching, omitted, or inconsistent telemetry.
-        let imported = SnapshotCrc::from_parts(Some(crc.clone()), 3, claim);
-        let imported_crc = imported.as_ref().unwrap();
-
-        // Then only the imported origin changes; matching telemetry preserves sharing.
-        assert_eq!(imported_crc.on_disk_version, expected_origin);
-        assert_eq!(crc.on_disk_version, Some(1));
-        assert_eq!(imported_crc, &crc);
-        assert_eq!(Arc::ptr_eq(imported_crc, &crc), expected_origin == Some(1));
-    }
-
-    #[test]
-    fn writing_crc_updates_origin_without_changing_original_snapshot() {
-        // Given an in-memory CRC reconstructed from a version 1 checksum.
-        let mut crc = crc_at(3);
-        Arc::make_mut(&mut crc).on_disk_version = Some(1);
-        let original = SnapshotCrc::new(crc.clone());
-
-        // When a checksum file is successfully written at version 3.
-        let written = SnapshotCrc::from_written_crc(crc);
-
-        // Then the new snapshot reports that file, while the original keeps its observation.
-        assert_eq!(written.source(), CrcSource::AtVersion { crc_version: 3 });
-        assert_eq!(written.as_ref().unwrap().on_disk_version, Some(3));
-        assert_eq!(
-            original.source(),
-            CrcSource::Reconstructed {
-                on_disk_version: 1,
-                crc_version: 3
-            }
-        );
-        assert_eq!(original.as_ref(), written.as_ref());
     }
 }

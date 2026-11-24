@@ -61,9 +61,8 @@ The hint preserves build-time freshness, not current freshness, a matching check
 the selected checkpoint type when known, and an at-version CRC. Stale CRCs are omitted.
 Checksum telemetry is preserved for an exported CRC and for absent-CRC observations such as
 `Missing` or `Unusable`. Omitting a stale CRC resets its provenance to `Unknown`.
-Input hints may omit telemetry; the snapshot then reports `Unknown`. Inconsistent telemetry also
-reports `Unknown` and does not affect whether the hint is accepted. CRC validation and retention
-are independent of telemetry. See `FfiSnapshotHint` for the claim rules.
+Input hints may omit telemetry and the snapshot then reports `Unknown`. Building the snapshot
+rejects an inconsistent claim. See `FfiSnapshotHint` for the claim rules.
 
 The `last_checkpoint` and `crc` fields in `FfiSnapshotHint` use borrowed nullable pointers.
 `checkpoint_type` and `crc_source` are inline `OptionalValue` fields, with `None` meaning unknown.

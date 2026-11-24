@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tracing::{debug, error, instrument};
 
 use super::{IncrementalReplay, PreparedSnapshot, Snapshot};
-use crate::log_segment::LogSegment;
+use crate::log_segment::{LogSegment, PmResolution};
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::metrics::{
     SnapshotLoadMetricContext, emit_log_segment_load, emit_log_segment_load_failure,
@@ -290,30 +290,29 @@ impl Snapshot {
         // matching the fresh path.
         let pm_start = std::time::Instant::now();
         let base_crc = combined_log_segment
-            .pick_latest_base_crc(engine, Some(&existing_snapshot.crc))
+            .pick_latest_base_crc(engine, existing_snapshot.crc.retained())
             .inspect_err(|_| {
                 emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
             })?;
-        let base_crc_version = base_crc.as_ref().map(|crc| crc.version);
         let crc_at_version = combined_log_segment
-            .try_build_crc_within_budget(engine, &base_crc, incremental_replay)
+            .try_build_crc_within_budget(engine, base_crc.as_ref(), incremental_replay)
             .inspect_err(|_| {
                 emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
             })?;
 
         let existing_table_config = existing_snapshot.table_configuration();
-        let crc_at_target = crc_at_version.is_some();
-        let (crc, resolution) = match crc_at_version {
-            Some((crc, mut resolution)) => {
+        let resolution = match &crc_at_version {
+            Some((crc, source)) => {
                 // If we were able to build a new CRC, then re-use it for TableConfiguration
                 // creation, keeping only the P&M that changed.
+                let mut resolution = PmResolution::from_crc(crc, *source);
                 resolution
                     .metadata
                     .take_if(|m| m == existing_table_config.metadata());
                 resolution
                     .protocol
                     .take_if(|p| p == existing_table_config.protocol());
-                (crc, resolution)
+                resolution
             }
             None => {
                 // No incremental CRC to reuse: there was no base CRC, or advancing it was out of
@@ -325,20 +324,19 @@ impl Snapshot {
                     .filter(|c| c.version > existing_snapshot_version);
                 // TODO(#3421): Classify missing replay-file failures as Delta errors using the
                 // incremental replay context, preserving the original error sources.
-                let resolution = combined_log_segment
+                combined_log_segment
                     .segment_after_version(existing_snapshot_version)
                     .read_protocol_metadata_opt(engine, newer_base)
                     .inspect_err(|_| {
                         emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
-                    })?;
-                (base_crc, resolution)
+                    })?
             }
         };
         emit_protocol_metadata_load(metric_context, resolution.source, pm_start.elapsed());
         debug!(
             source = ?resolution.source,
-            ?base_crc_version,
-            crc_at_target,
+            base_crc_version = ?base_crc.as_ref().map(|crc| crc.version),
+            crc_at_target = crc_at_version.is_some(),
             metadata_resolved = resolution.metadata.is_some(),
             protocol_resolved = resolution.protocol.is_some(),
             "Resolved incremental snapshot metadata"
@@ -352,8 +350,11 @@ impl Snapshot {
         )?;
 
         tracing::Span::current().record("version", table_configuration.version());
-        let crc =
-            Self::validate_configuration_and_crc(combined_log_segment, &table_configuration, crc)?;
+        let crc = Self::validate_configuration_and_crc(
+            combined_log_segment,
+            &table_configuration,
+            base_crc.map_crc(|base| crc_at_version.map_or(base, |(crc, _)| crc)),
+        )?;
         let log_segment = current_segment
             .take()
             .ok_or_else(|| KernelError::internal_error("Missing prepared log segment"))?;
@@ -1947,11 +1948,10 @@ mod tests {
         let snapshot_a = if known_provenance {
             snapshot_a
         } else {
-            Arc::new(Snapshot::new_with_crc_and_source(
+            Arc::new(Snapshot::new_with_crc(
                 snapshot_a.log_segment().clone(),
                 snapshot_a.table_configuration().clone(),
                 snapshot_a.base_crc().cloned(),
-                CrcSource::Unknown,
                 false, /* built_as_latest */
                 false, /* skipped_new_checkpoints */
             )?)
@@ -1960,7 +1960,8 @@ mod tests {
         // When an intermediate snapshot advances with CRC replay disabled, the retained CRC
         // stays at version 3 while the snapshot moves to version 4.
         let snapshot_a = if stale_intermediate {
-            let stale = Snapshot::builder_from(snapshot_a)
+            let prior_source = snapshot_a.crc_source();
+            let stale = Snapshot::builder_from(snapshot_a.clone())
                 .at_version(4)
                 .with_incremental_crc_replay(IncrementalReplay::Disabled)
                 .build(ctx.engine.as_ref())?;
@@ -1968,6 +1969,11 @@ mod tests {
             // Then the stale CRC keeps its disk origin, including an unknown origin.
             assert_eq!(stale.version(), 4);
             assert_eq!(stale.base_crc().map(|crc| crc.version), Some(3));
+            assert!(Arc::ptr_eq(
+                stale.base_crc().unwrap(),
+                snapshot_a.crc_at_version().unwrap(),
+            ));
+            assert_eq!(snapshot_a.crc_source(), prior_source);
             assert!(stale.crc_at_version().is_none());
             assert_eq!(
                 stale.crc_source(),

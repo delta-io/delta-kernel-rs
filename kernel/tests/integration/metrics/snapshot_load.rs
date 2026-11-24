@@ -17,7 +17,9 @@ use delta_kernel::metrics::SnapshotLoadType;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::snapshot::IncrementalReplay;
 #[cfg(feature = "internal-api")]
-use delta_kernel::snapshot::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness};
+use delta_kernel::snapshot::{
+    CrcSource, PublicationWatermark, SnapshotHint, SnapshotHintFreshness,
+};
 use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
@@ -156,8 +158,13 @@ fn snapshot_to_hint_round_trip_without_storage_io(
 }
 
 #[cfg(feature = "internal-api")]
-#[test]
-fn external_snapshot_hint_accepts_parsed_advanced_crc() -> delta_kernel::Result<()> {
+#[rstest]
+#[case::omitted(None)]
+#[case::unknown(Some(CrcSource::Unknown))]
+#[case::reconstructed(Some(CrcSource::Reconstructed { on_disk_version: 1, crc_version: 2 }))]
+fn external_snapshot_hint_accepts_parsed_advanced_crc(
+    #[case] claim: Option<CrcSource>,
+) -> delta_kernel::Result<()> {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(2).with_crc_at([1]))
         .with_data(1, 1)
@@ -195,18 +202,20 @@ fn external_snapshot_hint_accepts_parsed_advanced_crc() -> delta_kernel::Result<
         snapshot.table_configuration().protocol().clone(),
         snapshot.table_configuration().metadata().clone(),
         snapshot.log_segment().checkpoint_hint().cloned(),
-        Some(parsed_crc),
+        Some(parsed_crc.clone()),
         SnapshotHintFreshness::Latest,
         None,
-        None,
+        claim,
     )?;
+    assert_eq!(hint.crc_source(), claim);
     reporter.reset();
 
     let hinted = Snapshot::builder_for(table.table_root())
         .with_snapshot_hint(hint)
         .build(&engine)?;
 
-    assert_eq!(hinted.crc_at_version().unwrap().version, hinted.version());
+    assert_eq!(hinted.crc_source(), claim.unwrap_or(CrcSource::Unknown));
+    assert!(Arc::ptr_eq(hinted.crc_at_version().unwrap(), &parsed_crc));
     assert_eq!(reporter.list_calls.get(), 0);
     assert_eq!(reporter.json_read_calls.get(), 0);
     assert_eq!(reporter.parquet_read_calls.get(), 0);

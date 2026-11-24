@@ -106,20 +106,20 @@ mod tests {
     use super::*;
 
     #[rstest::rstest]
-    #[case::at_version(CrcSource::AtVersion { crc_version: 3 })]
-    #[case::reconstructed(CrcSource::Reconstructed { on_disk_version: 0, crc_version: 3 })]
-    #[case::stale(CrcSource::Stale { on_disk_version: 0, crc_version: 3 })]
-    #[case::missing(CrcSource::Missing)]
-    #[case::unusable(CrcSource::Unusable)]
-    #[case::unknown(CrcSource::Unknown)]
-    fn provenance_conversion_preserves_source(#[case] source: CrcSource) {
-        // Given a checksum source, including its disk and in-memory versions when present.
-        let ffi = FfiCrcSource::from(source);
-
-        // When the source crosses the FFI boundary and is converted back.
-        let round_trip = CrcSource::from(ffi);
-
-        // Then the source and its payload are preserved.
-        assert_eq!(round_trip, source);
+    #[case::at_version(CrcSource::AtVersion { crc_version: 3 }, FfiCrcSource::AtVersion { crc_version: 3 })]
+    #[case::reconstructed(CrcSource::Reconstructed { on_disk_version: 1, crc_version: 3 }, FfiCrcSource::Reconstructed { on_disk_version: 1, crc_version: 3 })]
+    #[case::stale(CrcSource::Stale { on_disk_version: 1, crc_version: 3 }, FfiCrcSource::Stale { on_disk_version: 1, crc_version: 3 })]
+    #[case::missing(CrcSource::Missing, FfiCrcSource::Missing)]
+    #[case::unusable(CrcSource::Unusable, FfiCrcSource::Unusable)]
+    #[case::unknown(CrcSource::Unknown, FfiCrcSource::Unknown)]
+    fn provenance_conversion_preserves_variant_and_versions(
+        #[case] source: CrcSource,
+        #[case] expected: FfiCrcSource,
+    ) {
+        // Given equivalent Rust and C checksum sources with distinct disk and in-memory versions.
+        // When converting each representation independently.
+        // Then both conversions preserve the variant and each version.
+        assert_eq!(FfiCrcSource::from(source), expected);
+        assert_eq!(CrcSource::from(expected), source);
     }
 }

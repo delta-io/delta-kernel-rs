@@ -2425,11 +2425,6 @@ fn build_rejects_internally_supplied_hint_for_existing_snapshot_builder() {
 #[case::unusable(None, Some(CrcSource::Unusable), CrcSource::Unusable)]
 #[case::unknown(Some(2), Some(CrcSource::Unknown), CrcSource::Unknown)]
 #[case::unknown_absent(None, Some(CrcSource::Unknown), CrcSource::Unknown)]
-#[case::inconsistent(Some(2), Some(CrcSource::Missing), CrcSource::Unknown)]
-#[case::future_disk_version(Some(2), Some(CrcSource::Reconstructed { on_disk_version: 3, crc_version: 2 }), CrcSource::Unknown)]
-#[case::at_version_wrong_crc_version(Some(2), Some(CrcSource::AtVersion { crc_version: 1 }), CrcSource::Unknown)]
-#[case::reconstructed_wrong_crc_version(Some(2), Some(CrcSource::Reconstructed { on_disk_version: 0, crc_version: 1 }), CrcSource::Unknown)]
-#[case::stale_at_version(Some(2), Some(CrcSource::Stale { on_disk_version: 0, crc_version: 2 }), CrcSource::Unknown)]
 #[case::omitted(Some(2), None, CrcSource::Unknown)]
 #[case::omitted_absent(None, None, CrcSource::Unknown)]
 fn checksum_telemetry_round_trips_without_changing_hint_state(
@@ -2465,7 +2460,7 @@ fn checksum_telemetry_round_trips_without_changing_hint_state(
     let rebuilt = rebuild_through_visitor(&snapshot, &engine);
     let observed = unsafe { snapshot_crc_source(rebuilt.shallow_copy()) };
 
-    // Then telemetry survives, invalid claims become Unknown, and CRC presence is unchanged.
+    // Then the supplied telemetry and CRC presence survive the round trip.
     assert_eq!(observed, expected.into());
     let rebuilt_ref = unsafe { rebuilt.as_ref() };
     assert_eq!(
@@ -2478,4 +2473,38 @@ fn checksum_telemetry_round_trips_without_changing_hint_state(
         free_snapshot(snapshot);
         free_engine(engine);
     }
+}
+
+#[rstest::rstest]
+#[case::at_version_without_crc(false, CrcSource::AtVersion { crc_version: 2 })]
+#[case::future_disk_version(true, CrcSource::Reconstructed { on_disk_version: 3, crc_version: 2 })]
+fn snapshot_hint_rejects_inconsistent_crc_source(
+    #[case] with_crc: bool,
+    #[case] source: CrcSource,
+) {
+    let engine = test_engine();
+    let paths = [FfiLogPath::new(
+        slice("memory:///hinted-table/_delta_log/00000000000000000002.checkpoint.parquet"),
+        123,
+        456,
+    )];
+    let mut crc = empty_crc();
+    crc.version = 2;
+    let hint = FfiSnapshotHint {
+        crc: if with_crc { &crc } else { std::ptr::null() },
+        crc_source: Some(FfiCrcSource::from(source)).into(),
+        ..test_snapshot_hint(&paths, 2, FfiSnapshotHintFreshness::Unverified)
+    };
+    let builder = unsafe {
+        ok_or_panic(snapshot_builder_with_snapshot_hint(
+            test_builder(&engine),
+            &hint,
+        ))
+    };
+    assert_extern_result_error_contains(
+        unsafe { snapshot_builder_build(builder) },
+        FFIKernelError::InvalidSnapshotHint,
+        "CRC source",
+    );
+    unsafe { free_engine(engine) };
 }

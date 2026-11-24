@@ -11,6 +11,7 @@ use crate::arrow::error::ArrowError;
 #[cfg(feature = "default-engine-base")]
 use crate::object_store;
 use crate::schema::{DataType, StructType};
+use crate::snapshot::CrcSource;
 use crate::table_properties::ParseIntervalError;
 
 mod delta_error;
@@ -201,6 +202,16 @@ pub enum SnapshotHintError {
     /// The supplied CRC metadata differs from the hint metadata.
     #[error("Invalid snapshot hint: CRC metadata does not match snapshot hint metadata")]
     CrcMetadata,
+    /// The supplied checksum provenance is inconsistent with the hinted CRC.
+    #[error(
+        "Invalid snapshot hint: CRC source {claim:?} is inconsistent with hinted CRC version {crc_version:?}"
+    )]
+    CrcSourceMismatch {
+        /// Provenance supplied by the connector.
+        claim: CrcSource,
+        /// Version of the supplied CRC, or `None` if omitted.
+        crc_version: Option<Version>,
+    },
     /// A connector reported invalid snapshot-hint state, optionally with an underlying error.
     #[error("Invalid snapshot hint: {message}")]
     Connector {

@@ -24,7 +24,7 @@ use crate::schema::{
     ColumnDefault, GeneratedColumn, MapType, SchemaRef, SchemaStructPatchBuilder, StructField,
     lazy_schema_ref,
 };
-use crate::snapshot::{Snapshot, SnapshotCrc, SnapshotRef};
+use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 #[cfg(feature = "check-constraints-in-dev")]
@@ -1373,7 +1373,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
                 let snapshot = Snapshot::new_with_crc(
                     log_segment,
                     self.effective_table_config,
-                    SnapshotCrc::new(Arc::new(crc)),
+                    Some(Arc::new(crc)),
                     true,  /* built_as_latest */
                     false, /* skipped_new_checkpoints */
                 )?;

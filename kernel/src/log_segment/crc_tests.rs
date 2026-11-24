@@ -18,14 +18,14 @@ use super::LogSegment;
 use crate::actions::{CheckpointAction, LastManifestCommit};
 use crate::actions::{DomainMetadata, Format, Metadata, Protocol, SetTransaction};
 use crate::crc::{
-    Crc, DomainMetadataState, FileSizeHistogram, SetTransactionState, try_read_crc_file,
+    Crc, CrcWrapper, DomainMetadataState, FileSizeHistogram, SetTransactionState, try_read_crc_file,
 };
 use crate::engine::CancellableEngine;
 use crate::engine::sync::SyncEngine;
 use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::path::ParsedLogPath;
-use crate::snapshot::{CrcSource, IncrementalReplay, SnapshotBuilder, SnapshotCrc, SnapshotRef};
+use crate::snapshot::{CrcSource, IncrementalReplay, SnapshotBuilder, SnapshotRef};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::table_configuration::TableConfiguration;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -510,10 +510,9 @@ impl BuiltCrcTest {
         let log_root = self.url.join("_delta_log/").unwrap();
         let log_segment =
             LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
-        let retained = in_memory_base
-            .map(|crc| SnapshotCrc::from_parts(Some(crc.clone()), crc.version, CrcSource::Unknown));
+        let retained = in_memory_base.cloned().into();
         Ok(log_segment
-            .pick_latest_base_crc(engine, retained.as_ref())?
+            .pick_latest_base_crc(engine, &retained)?
             .as_ref()
             .map(|crc| crc.version))
     }
@@ -1530,7 +1529,9 @@ async fn test_full_replay_across_two_commits_propagates_all_state() {
 // Tests: incremental-replay budget gate
 // ============================================================================
 
-// Commits 0-3 (target v3) with an optional CRC at `crc_version`.
+// Commits 0-3 (target v3) with an optional CRC file at `crc_version`, so distance = 3 -
+// crc_version. CRC already at the target (distance 0): used regardless of mode, even Disabled.
+// Stale CRC (distance >= 1): advancement depends on the budget.
 #[rstest]
 #[case::at_target_disabled(Some(3), false, IncrementalReplay::Disabled, CrcSource::AtVersion { crc_version: 3 })]
 #[case::disabled_stale(Some(1), false, IncrementalReplay::Disabled, CrcSource::Stale { on_disk_version: 1, crc_version: 1 })]
@@ -1658,33 +1659,29 @@ async fn pick_latest_base_crc_preserves_source_and_cancellation(
     }
     let engine = CancellableEngine::new(&built.engine, token);
 
-    let retained_source = if known_source {
-        CrcSource::AtVersion {
-            crc_version: base.version,
-        }
-    } else {
-        CrcSource::Unknown
+    let retained = CrcWrapper::Present {
+        crc: base.clone(),
+        on_disk_version: known_source.then_some(base.version),
     };
-    let retained = SnapshotCrc::from_parts(Some(base.clone()), base.version, retained_source);
 
     // When the baseline is selected, reading a newer disk candidate may be cancelled.
-    let result = segment.pick_latest_base_crc(&engine, Some(&retained));
+    let result = segment.pick_latest_base_crc(&engine, &retained);
 
     // Then cancellation propagates; otherwise selection preserves or establishes the source.
     if cancelled && disk_version == Some(1) {
         assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
     } else {
-        let selected = result.unwrap();
-        assert_eq!(selected.as_ref().unwrap().version, expected_version);
+        let CrcWrapper::Present {
+            crc,
+            on_disk_version,
+        } = result.unwrap()
+        else {
+            panic!("expected a retained CRC");
+        };
+        assert_eq!(crc.version, expected_version);
         assert_eq!(
-            selected.source(),
-            if expected_version == base.version {
-                retained_source
-            } else {
-                CrcSource::AtVersion {
-                    crc_version: expected_version,
-                }
-            }
+            on_disk_version,
+            (expected_version != base.version || known_source).then_some(expected_version)
         );
     }
 }

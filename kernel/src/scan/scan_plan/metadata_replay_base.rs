@@ -64,7 +64,6 @@ mod tests {
     use crate::plans::Operation as PlanOperation;
     use crate::plans::ir::nodes::Operator;
     use crate::scan::scan_plan::tests::log_segment;
-    use crate::snapshot::CrcSource;
     use crate::unit_test_utils::load_test_table;
 
     #[rstest]
@@ -95,14 +94,7 @@ mod tests {
         let segment = snapshot.log_segment().clone();
         let config = snapshot.table_configuration().clone();
         let crc = Some(crc);
-        let snapshot = Arc::new(Snapshot::new_with_crc_and_source(
-            segment,
-            config,
-            crc,
-            CrcSource::Unknown,
-            false,
-            false,
-        )?);
+        let snapshot = Arc::new(Snapshot::new_with_crc(segment, config, crc, false, false)?);
         let scan = snapshot.scan_builder().build()?;
         let base = MetadataReplayBase::try_new(&scan.snapshot, &engine)?;
         assert_eq!(base.version(), Some(version));
@@ -148,14 +140,7 @@ mod tests {
         let paths: Vec<_> = commits.iter().map(String::as_str).collect();
         let segment = log_segment(log_root, &paths, None);
         let config = target.table_configuration().clone();
-        let snapshot = Arc::new(Snapshot::new_with_crc_and_source(
-            segment,
-            config,
-            crc,
-            CrcSource::Unknown,
-            false,
-            false,
-        )?);
+        let snapshot = Arc::new(Snapshot::new_with_crc(segment, config, crc, false, false)?);
         let scan = snapshot.scan_builder().build()?;
         let plan = scan.declarative_metadata_scan_plan(
             &DelegatingEngine::new(engine.clone()).without_plan_executor(),

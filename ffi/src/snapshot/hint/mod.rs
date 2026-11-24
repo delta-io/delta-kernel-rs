@@ -104,8 +104,8 @@ pub struct FfiSnapshotHint {
     /// C callers must set the tag explicitly, using `NoneFfiSelectedCheckpointType` when absent:
     /// a zero-initialized field is an invalid `Some` payload.
     pub checkpoint_type: OptionalValue<FfiSelectedCheckpointType>,
-    /// Optional checksum telemetry. `None` means unknown. It does not change CRC validation,
-    /// retention, or snapshot success. An inconsistent claim is reported as `Unknown`.
+    /// An omitted or `Unknown` source is valid with or without a CRC.
+    /// Building the snapshot rejects a claim inconsistent with the supplied CRC.
     /// `Missing` and `Unusable` require no CRC. `AtVersion` requires an at-version CRC;
     /// `Reconstructed` requires an at-version CRC and an older `on_disk_version`.
     /// The reported `crc_version` must match the hinted CRC.

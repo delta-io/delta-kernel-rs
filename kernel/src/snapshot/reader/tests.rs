@@ -9,7 +9,6 @@ use crate::crc::{DomainMetadataState, SetTransactionState};
 use crate::engine::CancellableEngine;
 use crate::engine::sync::SyncEngine;
 use crate::metrics::MetricEvent;
-use crate::snapshot::CrcSource;
 use crate::unit_test_utils::{
     CapturingReporter, TestCancellationToken, install_thread_local_metrics_reporter,
 };
@@ -99,7 +98,7 @@ fn reader_crc_cache_respects_completeness(
         crc.domain_metadata_state = DomainMetadataState::Partial(domains);
         crc.set_transaction_state = SetTransactionState::Partial(transactions);
         Arc::get_mut(&mut snapshot).unwrap().crc =
-            SnapshotCrc::try_new(Some(Arc::new(crc)), 0, None, CrcSource::Unknown).unwrap();
+            SnapshotCrc::try_new(Some(Arc::new(crc)).into(), 0, None).unwrap();
     }
     let reader = snapshot.reader().with_cancellation_token(Arc::new(
         TestCancellationToken::cancelled(),

@@ -6,14 +6,14 @@ use delta_kernel_derive::internal_api;
 
 use crate::actions::{Metadata, Protocol};
 use crate::checkpoint::SelectedCheckpointType;
-use crate::crc::Crc;
+use crate::crc::{Crc, CrcWrapper};
 use crate::error::SnapshotHintError;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_path::LogPath;
 use crate::log_segment::{LogSegment, validate_catalog_version_bounds};
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::path::{DELTA_LOG_DIR_WITH_SLASH, ParsedLogPath};
-use crate::snapshot::{CrcSource, IncrementalReplay, SnapshotCrc, SnapshotRef};
+use crate::snapshot::{CrcSource, IncrementalReplay, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::{require, try_parse_uri};
 use crate::{KernelError, KernelResult, Result, Snapshot, Version};
@@ -115,8 +115,12 @@ impl SnapshotHint {
     /// `None` when unknown. It is used only when the checkpoint's naming and the table protocol do
     /// not decide the type, and the checkpoint's contents replace it once discovery reads them.
     ///
-    /// `crc_source` supplies optional telemetry. It never changes CRC selection or whether
-    /// the hint is accepted. An absent or inconsistent claim is reported as `Unknown`.
+    /// An omitted or [`Unknown`](CrcSource::Unknown) source is valid with or without a CRC.
+    /// [`Missing`](CrcSource::Missing) and [`Unusable`](CrcSource::Unusable) require an absent CRC.
+    /// A present CRC may be [`AtVersion`](CrcSource::AtVersion) or
+    /// [`Reconstructed`](CrcSource::Reconstructed) from an earlier disk version. Its claimed
+    /// version must match the CRC. Building the snapshot rejects any inconsistent claim,
+    /// including [`Stale`](CrcSource::Stale), with [`SnapshotHintError::CrcSourceMismatch`].
     ///
     /// # Errors
     ///
@@ -275,6 +279,10 @@ impl SnapshotHint {
             .and_then(Option::as_deref)
             .map(|info| info.last_checkpoint())
             .or(last_checkpoint_hint);
+        let source = match snapshot.crc_source() {
+            CrcSource::Stale { .. } => CrcSource::Unknown,
+            source => source,
+        };
         Ok(Self {
             version: snapshot.version(),
             log_segment_files: segment.listed.clone(),
@@ -282,7 +290,7 @@ impl SnapshotHint {
             metadata: snapshot.table_configuration().metadata().clone(),
             last_checkpoint_hint: last_checkpoint_hint.cloned(),
             crc: snapshot.crc_at_version().cloned(),
-            crc_source: Some(snapshot.crc.retain_at_version().source()),
+            crc_source: Some(source),
             checkpoint_type: snapshot.known_checkpoint_type(),
             freshness: if snapshot.is_built_as_latest() {
                 SnapshotHintFreshness::Latest
@@ -419,15 +427,50 @@ impl SnapshotHint {
             );
         }
 
+        let crc = crc_from_hint(crc, crc_source.unwrap_or(CrcSource::Unknown))?;
         let mut snapshot = Snapshot::new_with_crc(
             log_segment,
             table_configuration,
-            SnapshotCrc::from_parts(crc, version, crc_source.unwrap_or(CrcSource::Unknown)),
+            crc,
             built_as_latest,
             false, /* skipped_new_checkpoints */
         )?;
         snapshot.retained_checkpoint_type = checkpoint_type;
         Ok(snapshot.into())
+    }
+}
+
+/// Validates a hint's source claim against its optional in-memory CRC.
+///
+/// - Case 1: `Unknown` is valid with or without a CRC.
+/// - Case 2: `Missing` and `Unusable` require an absent CRC.
+/// - Case 3: `AtVersion` requires an in-memory CRC at the claimed checksum-file version.
+/// - Case 4: `Reconstructed` requires an in-memory CRC at `crc_version` and a strictly earlier
+///   `on_disk_version`.
+/// - Case 5: Reject all other combinations, including `Stale`. A hinted CRC must be at the hint's
+///   snapshot version.
+fn crc_from_hint(crc: Option<Arc<Crc>>, claim: CrcSource) -> KernelResult<CrcWrapper> {
+    let crc_version = crc.as_ref().map(|crc| crc.version);
+    match (crc, claim) {
+        (crc, CrcSource::Unknown) => Ok(crc.into()),
+        (None, CrcSource::Missing) => Ok(CrcWrapper::Missing),
+        (None, CrcSource::Unusable) => Ok(CrcWrapper::Unusable),
+        (Some(crc), CrcSource::AtVersion { crc_version }) if crc.version == crc_version => {
+            Ok(CrcWrapper::from_file(crc))
+        }
+        (
+            Some(crc),
+            CrcSource::Reconstructed {
+                on_disk_version,
+                crc_version,
+            },
+        ) if crc.version == crc_version && on_disk_version < crc_version => {
+            Ok(CrcWrapper::Present {
+                crc,
+                on_disk_version: Some(on_disk_version),
+            })
+        }
+        _ => Err(SnapshotHintError::CrcSourceMismatch { claim, crc_version }.into()),
     }
 }
 
@@ -577,7 +620,7 @@ mod tests {
             version: hint_version,
             ..Default::default()
         });
-        let snapshot = Snapshot::new_with_crc_and_source(
+        let snapshot = Snapshot::new_with_crc(
             LogSegment::try_new(
                 hint.log_segment_files,
                 snapshot.log_segment().log_root.clone(),
@@ -586,7 +629,6 @@ mod tests {
             )?,
             snapshot.table_configuration().clone(),
             snapshot.crc_at_version().cloned(),
-            CrcSource::Unknown,
             false,
             false,
         )?;
@@ -688,7 +730,7 @@ mod tests {
                 "{table_root}_delta_log/00000000000000000000.\
                  00000000000000000001.compacted.json"
             )));
-        let snapshot = Snapshot::new_with_crc_and_source(
+        let snapshot = Snapshot::new_with_crc(
             LogSegment::try_new(
                 hint.log_segment_files,
                 snapshot.log_segment().log_root.clone(),
@@ -697,7 +739,6 @@ mod tests {
             )?,
             snapshot.table_configuration().clone(),
             None,
-            CrcSource::Unknown,
             false,
             false,
         )?;
@@ -1243,6 +1284,7 @@ mod tests {
         let (engine, table_root, _snapshot, mut hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         hint.crc = None;
+        hint.crc_source = None;
 
         let hinted = SnapshotBuilder::new_for(table_root)
             .with_snapshot_hint(hint)
@@ -1281,6 +1323,7 @@ mod tests {
             Arc::make_mut(hint.crc.as_mut().unwrap()).protocol = protocol;
         } else {
             hint.crc = None;
+            hint.crc_source = None;
         }
 
         let result = SnapshotBuilder::new_for(table_root)
@@ -1348,6 +1391,7 @@ mod tests {
         ));
         hint.version = 0;
         hint.crc = None;
+        hint.crc_source = None;
         hint.last_checkpoint_hint = None;
         let (ascending_commit_files, checkpoint_parts) = if include_replay_commit {
             (vec![staged.clone()], vec![])
@@ -1448,6 +1492,7 @@ mod tests {
         let (engine, table_root, _snapshot, mut hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         hint.crc = None;
+        hint.crc_source = None;
         hint.log_segment_files.ascending_commit_files.remove(0);
 
         assert_hint_error(
@@ -1488,6 +1533,42 @@ mod tests {
                 .contains("latest_commit_file version 0 does not match end_version 1")
         );
         Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::reconstructed_at_disk_version(Some(5), CrcSource::Reconstructed { on_disk_version: 5, crc_version: 5 })]
+    #[case::reconstructed_with_future_disk_version(Some(5), CrcSource::Reconstructed { on_disk_version: 6, crc_version: 5 })]
+    #[case::missing_with_crc(Some(5), CrcSource::Missing)]
+    #[case::unusable_with_crc(Some(3), CrcSource::Unusable)]
+    #[case::at_version_without_crc(None, CrcSource::AtVersion { crc_version: 5 })]
+    #[case::stale_with_newer_disk_version(Some(3), CrcSource::Stale { on_disk_version: 4, crc_version: 3 })]
+    #[case::stale_at_snapshot(Some(5), CrcSource::Stale { on_disk_version: 3, crc_version: 5 })]
+    #[case::stale_without_crc(None, CrcSource::Stale { on_disk_version: 3, crc_version: 5 })]
+    #[case::reconstructed_without_crc(None, CrcSource::Reconstructed { on_disk_version: 3, crc_version: 5 })]
+    #[case::at_version_wrong_crc_version(Some(5), CrcSource::AtVersion { crc_version: 4 })]
+    #[case::reconstructed_wrong_crc_version(Some(5), CrcSource::Reconstructed { on_disk_version: 1, crc_version: 4 })]
+    #[case::stale_wrong_crc_version(Some(3), CrcSource::Stale { on_disk_version: 1, crc_version: 2 })]
+    fn hint_rejects_inconsistent_crc_source(
+        #[case] crc_version: Option<Version>,
+        #[case] source: CrcSource,
+    ) {
+        let err = crc_from_hint(
+            crc_version.map(|version| {
+                Arc::new(Crc {
+                    version,
+                    ..Default::default()
+                })
+            }),
+            source,
+        )
+        .unwrap_err();
+        let KernelError::SnapshotHint(err) = err else {
+            panic!("expected invalid snapshot hint")
+        };
+        assert!(matches!(
+            *err, SnapshotHintError::CrcSourceMismatch { claim, crc_version: actual }
+                if claim == source && actual == crc_version
+        ));
     }
 
     #[rstest::rstest]
@@ -1616,6 +1697,7 @@ mod tests {
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         hint.version -= 1;
         hint.crc = None;
+        hint.crc_source = None;
 
         assert_log_segment_hint_error(
             SnapshotBuilder::new_for(table_root)

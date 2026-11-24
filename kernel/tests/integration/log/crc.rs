@@ -18,7 +18,9 @@ use delta_kernel::metrics::{ChecksumWriteResolutionMode, MetricEvent};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::schema::{SchemaRef, schema_ref};
-use delta_kernel::snapshot::{ChecksumWriteResult, IncrementalReplay, Snapshot, SnapshotRef};
+use delta_kernel::snapshot::{
+    ChecksumWriteResult, CrcSource, IncrementalReplay, Snapshot, SnapshotRef,
+};
 #[cfg(feature = "internal-api")]
 use delta_kernel::snapshot::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness};
 use delta_kernel::transaction::create_table::create_table;
@@ -63,6 +65,7 @@ async fn test_get_file_stats_from_crc() -> delta_kernel::Result<()> {
 
 #[tokio::test]
 async fn test_get_file_stats_no_crc() -> delta_kernel::Result<()> {
+    // Given a table created without a checksum-file lookup.
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = schema_ref! {
@@ -70,12 +73,19 @@ async fn test_get_file_stats_no_crc() -> delta_kernel::Result<()> {
         nullable "value": STRING,
     };
 
-    let _ = create_table(&table_path, schema, "Test/1.0", true)
+    let created = create_table(&table_path, schema, "Test/1.0", true)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    assert_eq!(created.crc_source(), CrcSource::Unknown);
+
+    // When a fresh load searches storage for a checksum.
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    // Then the absent checksum is Missing, rather than an unobserved disk origin.
+    assert_eq!(snapshot.crc_source(), CrcSource::Missing);
+    assert_eq!(created.crc_source(), CrcSource::Unknown);
     assert_eq!(snapshot.version(), 0);
 
     let file_stats = snapshot.get_file_stats_if_present();
@@ -1417,6 +1427,7 @@ async fn test_write_checksum_rejects_file_actions_with_unsafe_operation(
     #[case] replay: IncrementalReplay,
     #[values("ANALYZE STATS", "Manual Update", "UNKNOWN", "SET TBLPROPERTIES")] operation: &str,
 ) -> delta_kernel::Result<()> {
+    // Given file actions that prevent complete CRC statistics.
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let snap = create_table_and_commit(&table_path, engine.as_ref())?
         .post_commit_snapshot()
@@ -1447,9 +1458,25 @@ async fn test_write_checksum_rejects_file_actions_with_unsafe_operation(
     .await?
     .unwrap_committed();
 
+    // When the snapshot resolves its checksum with or without incremental replay.
     let fresh = Snapshot::builder_for(&table_path)
         .with_incremental_crc_replay(replay)
         .build(engine.as_ref())?;
+    // Then checksum provenance is independent of statistics completeness.
+    let expected_source = if with_checkpoint {
+        CrcSource::Missing
+    } else if replay == IncrementalReplay::Unlimited {
+        CrcSource::Reconstructed {
+            on_disk_version: 0,
+            crc_version: 2,
+        }
+    } else {
+        CrcSource::Stale {
+            on_disk_version: 0,
+            crc_version: 0,
+        }
+    };
+    assert_eq!(fresh.crc_source(), expected_source);
     assert_eq!(fresh.version(), 2);
     assert_eq!(
         fresh.crc_at_version().is_some(),
@@ -1463,6 +1490,8 @@ async fn test_write_checksum_rejects_file_actions_with_unsafe_operation(
         fresh.write_checksum(engine.as_ref()),
         &format!("unsupported operation {operation:?}"),
     );
+
+    assert_eq!(fresh.crc_source(), expected_source);
 
     Ok(())
 }
