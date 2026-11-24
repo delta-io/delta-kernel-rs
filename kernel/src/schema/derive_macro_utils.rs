@@ -28,12 +28,21 @@ use crate::{KernelError, KernelResult};
 #[internal_api]
 pub(crate) trait ToDataType {
     fn to_data_type() -> DataType;
+
+    /// Compares with `to_data_type()`; implementations may avoid constructing the type.
+    fn matches_data_type(actual: &DataType) -> bool {
+        actual == &Self::to_data_type()
+    }
 }
 
 // Blanket impl for all types that implement `ToSchema`
 impl<T: ToSchema> ToDataType for T {
     fn to_data_type() -> DataType {
         T::to_schema().into()
+    }
+
+    fn matches_data_type(actual: &DataType) -> bool {
+        matches!(actual, DataType::Struct(actual) if actual.as_ref() == T::schema_ref().as_ref())
     }
 }
 

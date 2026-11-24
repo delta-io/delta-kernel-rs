@@ -23,11 +23,12 @@ impl<T: TryFromStructRows> RowVisitor for StructVisitor<'_, T> {
         }
         let schema = T::Row::schema_ref();
         (0..row_count).try_for_each(|row| {
-            let values = schema
+            let mut values = Vec::with_capacity(schema.num_fields());
+            schema
                 .fields()
                 .zip(getters)
                 .map(|(field, getter)| read_scalar(*getter, row, field))
-                .collect::<KernelResult<_>>()?;
+                .try_for_each(|value| value.map(|value| values.push(value)))?;
             T::push(self.state, StructData::try_new(schema.clone(), values)?)
         })
     }
