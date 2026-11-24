@@ -10,10 +10,7 @@ pub(in crate::scan) enum MetadataReplayBase {
     /// Complete live file state from a CRC at least as new as the checkpoint.
     Crc { version: Version, files: Vec<Add> },
     /// Checkpoint replay base, or an empty base when no checkpoint exists.
-    Checkpoint {
-        version: Option<Version>,
-        info: Option<Arc<CheckpointInfo>>,
-    },
+    Checkpoint { info: Option<Arc<CheckpointInfo>> },
 }
 
 impl MetadataReplayBase {
@@ -53,29 +50,7 @@ impl MetadataReplayBase {
         } else {
             None
         };
-        Ok(Self::Checkpoint {
-            version: checkpoint_version,
-            info,
-        })
-    }
-
-    /// Starting state selected for metadata replay.
-    pub(in crate::scan) fn kind(&self) -> ReplayBase {
-        match self {
-            Self::Crc { .. } => ReplayBase::Crc,
-            Self::Checkpoint {
-                version: Some(_), ..
-            } => ReplayBase::Checkpoint,
-            Self::Checkpoint { version: None, .. } => ReplayBase::Empty,
-        }
-    }
-
-    /// Exclusive lower bound for commit replay; `None` replays all available commits.
-    pub(in crate::scan) fn version(&self) -> Option<Version> {
-        match self {
-            Self::Crc { version, .. } => Some(*version),
-            Self::Checkpoint { version, .. } => *version,
-        }
+        Ok(Self::Checkpoint { info })
     }
 }
 
@@ -132,10 +107,12 @@ mod tests {
         } else {
             ReplayBase::Checkpoint
         };
-        assert_eq!(base.kind(), kind);
+        assert_eq!(
+            matches!(base, MetadataReplayBase::Crc { .. }),
+            has_all_files
+        );
         assert_eq!(report.metadata_planning.replay_base, Some(kind));
         assert_eq!(report.metadata_planning.base_version, Some(version));
-        assert_eq!(base.version(), Some(version));
         assert_eq!(
             scan.snapshot.cached_checkpoint_info().is_some(),
             !has_all_files

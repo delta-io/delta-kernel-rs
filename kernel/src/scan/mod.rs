@@ -1587,16 +1587,10 @@ impl Scan {
             return Ok(None);
         }
 
-        let mut planner = scan_plan::MetadataPlanner::try_from_scan(self)?;
+        let planner = scan_plan::MetadataPlanner::try_from_scan(self)?;
         report.metadata_planning = planner.report();
         let base = scan_plan::MetadataReplayBase::try_new(&self.snapshot, engine, report)?;
-        let replay_base = base.kind();
-        let base_version = base.version();
-        let result = self.build_metadata_scan_plan_with(base, &mut planner);
-        report.metadata_planning = planner.report();
-        report.metadata_planning.replay_base = Some(replay_base);
-        report.metadata_planning.base_version = base_version;
-        result
+        self.build_metadata_scan_plan_with(base, planner, report)
     }
 
     #[cfg(feature = "declarative-plans")]

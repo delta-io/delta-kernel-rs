@@ -28,6 +28,7 @@ use crate::checkpoint::CheckpointInfo;
 use crate::expressions::{ColumnName, Predicate, lit};
 #[cfg(test)]
 use crate::expressions::{Expression as Expr, expr};
+use crate::metrics::ScanPlanReport;
 use crate::plans::ir::plan::Plan;
 #[cfg(test)]
 use crate::schema::{
@@ -59,24 +60,20 @@ impl<'a> MetadataPlanner<'a> {
             .flatten();
 
         let adds_actions = ActionSet::live_adds();
-        Ok(Self::new(
-            scan.snapshot.log_segment(),
-            adds_actions,
-            !scan.snapshot.has_adaptive_metadata(),
-        )
-        .with_stats(scan.stats.clone())
-        .with_stats_schemas(
-            scan.stats
-                .json_synthesis_schema(scan.snapshot.table_configuration())?
-                .or_else(|| scan.state_info.physical_stats_read_schema().cloned()),
-            scan.state_info.physical_stats_output_schema().cloned(),
-        )
-        .with_partition_values(
-            scan.partition_values_options.clone(),
-            parsed_partition_schema.cloned(),
-        )
-        .with_read_collations(scan.needs_collation_stats_schema())
-        .with_stats_filter(stats_filter))
+        Ok(Self::new(adds_actions)
+            .with_stats(scan.stats.clone())
+            .with_stats_schemas(
+                scan.stats
+                    .json_synthesis_schema(scan.snapshot.table_configuration())?
+                    .or_else(|| scan.state_info.physical_stats_read_schema().cloned()),
+                scan.state_info.physical_stats_output_schema().cloned(),
+            )
+            .with_partition_values(
+                scan.partition_values_options.clone(),
+                parsed_partition_schema.cloned(),
+            )
+            .with_read_collations(scan.needs_collation_stats_schema())
+            .with_stats_filter(stats_filter))
     }
 }
 
@@ -93,25 +90,25 @@ impl Scan {
     pub(super) fn build_metadata_scan_plan_with(
         &self,
         base: MetadataReplayBase,
-        planner: &mut MetadataPlanner<'_>,
+        planner: MetadataPlanner<'_>,
+        report: &mut ScanPlanReport,
     ) -> KernelResult<Option<Plan>> {
         let state = &self.state_info;
         if state.physical_predicate == PhysicalPredicate::StaticSkipAll {
             return Ok(None);
         }
 
-        let base_version = base.version();
-        let checkpoint = match base {
-            MetadataReplayBase::Crc { version, files } => planner.crc_adds(version, files),
-            MetadataReplayBase::Checkpoint { info, .. } => {
-                planner.checkpoint_info = info;
-                planner.checkpoint_actions()
-            }
-        }?;
-        // Keep commit removes through replay so they cancel older adds before selecting live files.
-        let commits = planner.commit_actions(base_version)?;
-        planner
-            .replay_actions(commits, checkpoint)?
+        let segment = self.snapshot.log_segment();
+        let planner = match base {
+            MetadataReplayBase::Crc { version, files } => planner.with_crc(version, files),
+            MetadataReplayBase::Checkpoint { info } => planner.with_checkpoint(segment, info),
+        };
+        let planned = planner
+            .with_commits(segment, !self.snapshot.has_adaptive_metadata())
+            .replay();
+        report.metadata_planning = planned.metrics;
+        planned
+            .result?
             .project_patch(|patch| patch.drop(VERSION))?
             .build_opt()
     }
@@ -123,10 +120,9 @@ impl Scan {
         planner: &MetadataPlanner<'_>,
     ) -> KernelResult<Option<Plan>> {
         let base = MetadataReplayBase::Checkpoint {
-            version: self.snapshot.log_segment().checkpoint_version,
             info: shape.into().cloned().map(Arc::new),
         };
-        self.build_metadata_scan_plan_with(base, &mut planner.clone())
+        self.build_metadata_scan_plan_with(base, planner.clone(), &mut ScanPlanReport::new())
     }
 }
 // === Helpers ===
@@ -891,8 +887,9 @@ mod tests {
         let planner = MetadataPlanner::try_from_scan(&scan)?;
         let file_shape = shape(CheckpointKind::Inline, planner.stats_schema.clone());
         let plan = planner
-            .with_checkpoint_info(Arc::new(file_shape))
-            .checkpoint_actions()?
+            .with_checkpoint(scan.snapshot.log_segment(), Arc::new(file_shape))
+            .replay()
+            .result?
             .build()?;
         assert_eq!(tags(&plan), ["values"]);
         Ok(())
@@ -945,8 +942,9 @@ mod tests {
             ..shape(CheckpointKind::Inline, None)
         };
         let plan = MetadataPlanner::try_from_scan(&scan)?
-            .with_checkpoint_info(Arc::new(file_shape.clone()))
-            .checkpoint_actions()?
+            .with_checkpoint(scan.snapshot.log_segment(), Arc::new(file_shape.clone()))
+            .replay()
+            .result?
             .build()?;
         assert_eq!(add_struct(leaf_read_schema(&plan)), &*ADD_SCHEMA);
         let batches = declarative_metadata(&scan, &SyncEngine::new_with_store(store))?;

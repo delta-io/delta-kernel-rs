@@ -117,15 +117,13 @@ async fn replay_selects_latest_action_without_retention(
         .then(|| snapshot.checkpoint_info(&engine))
         .transpose()?
         .flatten();
-    let mut planner = MetadataPlanner::new(
-        snapshot.log_segment(),
-        actions,
-        !snapshot.has_adaptive_metadata(),
-    )
-    .with_stats(StatsOptions::json_only())
-    .with_checkpoint_info(checkpoint_info);
-    let state = planner.replay()?;
-    let report = planner.report();
+    let planned = MetadataPlanner::new(actions)
+        .with_checkpoint(snapshot.log_segment(), checkpoint_info)
+        .with_commits(snapshot.log_segment(), !snapshot.has_adaptive_metadata())
+        .with_stats(StatsOptions::json_only())
+        .replay();
+    let state = planned.result?;
+    let report = planned.metrics;
     assert!(report.stats.synthesize_json);
     assert!(!report.partition_values.parsed_struct);
     assert_eq!(report.partition_values.timestamp_timezone, None);
@@ -253,14 +251,19 @@ async fn replay_selects_latest_action_without_retention(
 }
 
 #[rstest]
-#[case::compaction(ReplayBase::Empty, true, false, Some((0, 5)), 13)]
-#[case::crc_tail(ReplayBase::Crc, false, false, Some((4, 5)), 10)]
-#[case::checkpoint_without_tail(ReplayBase::Checkpoint, false, false, None, 0)]
-#[case::partial_failure(ReplayBase::Empty, false, true, Some((0, 5)), 30)]
+#[case::compaction(ReplayBase::Empty, true, false, true, Some((0, 5)), 13)]
+#[case::commits_only(ReplayBase::Empty, false, false, true, Some((0, 5)), 30)]
+#[case::crc_tail(ReplayBase::Crc, false, false, true, Some((4, 5)), 10)]
+#[case::crc_partial_failure(ReplayBase::Crc, false, true, true, Some((4, 5)), 10)]
+#[case::checkpoint_without_tail(ReplayBase::Checkpoint, false, false, true, None, 0)]
+#[case::checkpoint_only(ReplayBase::Checkpoint, false, false, false, None, 0)]
+#[case::no_sources(ReplayBase::Empty, false, false, false, None, 0)]
+#[case::partial_failure(ReplayBase::Empty, false, true, true, Some((0, 5)), 30)]
 fn report_retains_selected_inputs(
     #[case] base: ReplayBase,
     #[case] compaction: bool,
     #[case] fail: bool,
+    #[case] commits: bool,
     #[case] expected_range: Option<(u64, u64)>,
     #[case] expected_bytes: u64,
 ) {
@@ -301,19 +304,24 @@ fn report_retains_selected_inputs(
     } else {
         ActionSet::live_adds()
     };
-    let mut planner = MetadataPlanner::new(&segment, actions, compaction)
-        .with_stats_filter(fail.then(|| col!("missing").eq(lit(0))));
-    let result = if base == ReplayBase::Crc {
-        let _ = planner.crc_adds(3, vec![]).unwrap();
-        planner.commit_actions(Some(3))
-    } else {
-        planner.replay()
+    let planner =
+        MetadataPlanner::new(actions).with_stats_filter(fail.then(|| col!("missing").eq(lit(0))));
+    let planner = match base {
+        ReplayBase::Crc => planner.with_crc(3, vec![]),
+        ReplayBase::Checkpoint => planner.with_checkpoint(&segment, None),
+        ReplayBase::Empty => planner,
     };
-    assert_eq!(result.is_err(), fail);
-    if let Err(error) = result {
+    let planner = if commits {
+        planner.with_commits(&segment, compaction)
+    } else {
+        planner
+    };
+    let planned = planner.replay();
+    assert_eq!(planned.result.is_err(), fail);
+    if let Err(error) = planned.result {
         assert!(error.to_string().contains("missing"));
     }
-    let report = planner.report();
+    let report = planned.metrics;
     assert_eq!(report.replay_base, Some(base));
     assert_eq!(
         report.base_version,
