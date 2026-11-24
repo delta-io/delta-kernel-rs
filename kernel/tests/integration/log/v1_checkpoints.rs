@@ -49,6 +49,13 @@ async fn test_snapshot_checkpoint_on_v1_table(
     .await?;
 
     let version = snapshot.version();
+    if declarative && write_struct == Some(true) {
+        test_utils::assert_result_error_with_message(
+            snapshot.checkpoint(checkpoint_engine.as_ref(), spec.as_ref()),
+            "V1 checkpoint plans require JSON-only statistics",
+        );
+        return Ok(());
+    }
     snapshot.checkpoint(checkpoint_engine.as_ref(), spec.as_ref())?;
 
     let ckpt_path = load_existing_single_file_checkpoint_path(&table_path, version);

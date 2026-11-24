@@ -38,6 +38,7 @@ use delta_kernel::{
     checkpoint::CheckpointNaming,
     engine::{plans::PlanBasedEngine, sync::plan::SyncPlanExecutor},
     plans::{Operation, PlanExecutor as _},
+    transaction::UpdateTableOperation,
 };
 use rstest::rstest;
 use rstest_reuse::apply;
@@ -1263,6 +1264,16 @@ async fn declarative_checkpoint_after_replace_table_with_incompatible_native_met
     .await?;
     let table_url = Url::from_directory_path(&table_path).unwrap();
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let snapshot = if matches!(&spec, CheckpointSpec::V1) {
+        snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([("delta.checkpoint.writeStatsAsStruct", "false")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot()
+    } else {
+        snapshot
+    };
     let executor = Arc::new(SyncPlanExecutor::new(None));
     let planning_engine = PlanBasedEngine::new(Some(engine.clone()), executor.clone());
     let writer = snapshot.create_checkpoint_writer(&planning_engine)?;

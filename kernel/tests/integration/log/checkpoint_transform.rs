@@ -476,7 +476,7 @@ async fn test_checkpoint_partition_values_parsed_with_column_mapping(
 
     let checkpoint_engine = checkpoint_engine(engine.clone(), Some(store.clone()), declarative);
 
-    // Version 0: protocol + metadata with column mapping and writeStatsAsStruct=true
+    // Version 0: protocol + metadata with column mapping
     let protocol = json!({
         "protocol": {
             "minReaderVersion": 3,
@@ -485,7 +485,7 @@ async fn test_checkpoint_partition_values_parsed_with_column_mapping(
             "writerFeatures": ["columnMapping"]
         }
     });
-    let metadata = json!({
+    let mut metadata = json!({
         "metaData": {
             "id": "test-table",
             "format": { "provider": "parquet", "options": {} },
@@ -500,6 +500,12 @@ async fn test_checkpoint_partition_values_parsed_with_column_mapping(
             "createdTime": 1587968585495i64
         }
     });
+    if declarative {
+        metadata["metaData"]["configuration"]
+            .as_object_mut()
+            .unwrap()
+            .remove("delta.checkpoint.writeStatsAsStruct");
+    }
     write_commit(&store, &format!("{protocol}\n{metadata}"), 0).await?;
 
     // Version 1: write data for partition category=books
@@ -523,7 +529,7 @@ async fn test_checkpoint_partition_values_parsed_with_column_mapping(
     )
     .await?;
 
-    // Create checkpoint with writeStatsAsStruct=true
+    // Create checkpoint with parsed partition values
     let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
     snapshot.checkpoint(checkpoint_engine.as_ref(), None)?;
 
