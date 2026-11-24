@@ -1890,10 +1890,10 @@ impl Snapshot {
     ///
     /// With `declarative-plans`, an engine providing a plan executor uses one plan for all
     /// checkpoint files and counts, followed by atomic publication of Kernel-generated
-    /// `_last_checkpoint` bytes. Errors on this route never fall back to handlers. V2 always
-    /// uses sidecars: `NoSidecar` is unsupported and the executor chooses sidecar grouping,
-    /// regardless of `file_actions_per_sidecar_hint`. Engines without an executor retain the
-    /// handler-based behavior, including inline V2 checkpoints and the sidecar-size hint.
+    /// `_last_checkpoint` bytes. Errors on this route never fall back to handlers. V2 honors
+    /// `NoSidecar`; without an explicit spec it uses sidecars. The executor chooses sidecar
+    /// grouping regardless of `file_actions_per_sidecar_hint`. Engines without an executor retain
+    /// the handler-based behavior, including inline V2 checkpoints and the sidecar-size hint.
     /// Detailed processing, Remove, and sidecar metrics are available only on the handler-based
     /// route; both routes report total bytes, Add actions, and checkpoint actions.
     ///
@@ -1996,19 +1996,10 @@ impl Snapshot {
 
         #[cfg(feature = "declarative-plans")]
         let executor = engine.plan_executor();
-        #[cfg(feature = "declarative-plans")]
-        if executor.is_some()
-            && matches!(
-                spec,
-                Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar))
-            )
-        {
-            return Err(
-                KernelError::unsupported("Declarative V2 checkpoints require sidecars").into(),
-            );
-        }
-
         let mode = match spec {
+            Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar)) => {
+                CheckpointWriteMode::V2WithoutSidecars
+            }
             Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar { .. })) => {
                 CheckpointWriteMode::V2WithSidecars
             }
@@ -2028,6 +2019,18 @@ impl Snapshot {
         };
         let _metrics_report = metrics.report_on_drop(span.clone());
         let writer = Arc::clone(self).create_checkpoint_writer(engine)?;
+        #[cfg(feature = "declarative-plans")]
+        let writer = if executor.is_some() && v2_supported {
+            let config = match spec {
+                Some(CheckpointSpec::V2(config)) => config.clone(),
+                _ => V2CheckpointConfig::WithSidecar {
+                    file_actions_per_sidecar_hint: None,
+                },
+            };
+            writer.with_v2_checkpoint_config(config)
+        } else {
+            writer
+        };
 
         #[cfg(feature = "declarative-plans")]
         let mut hint_bytes = Vec::new();

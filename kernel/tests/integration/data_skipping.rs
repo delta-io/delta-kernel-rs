@@ -1255,6 +1255,10 @@ async fn declarative_checkpoint_after_replace_table_with_incompatible_native_met
     let executor = Arc::new(SyncPlanExecutor::new(None));
     let planning_engine = PlanBasedEngine::new(Some(engine.clone()), executor.clone());
     let writer = snapshot.create_checkpoint_writer(&planning_engine)?;
+    let writer = match &spec {
+        CheckpointSpec::V2(config) => writer.with_v2_checkpoint_config(config.clone()),
+        _ => writer,
+    };
     let writer = if format == FileType::Json {
         writer.with_checkpoint_naming(CheckpointNaming::Uuid)
     } else {
