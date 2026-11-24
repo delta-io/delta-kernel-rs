@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::checkpoint::CheckpointNaming;
-use crate::plans::ir::nodes::{FILE_META_SCHEMA, FileType, WriteParquet};
+use crate::plans::ir::nodes::{Agg, FILE_META_SCHEMA, FileType, StatsAgg, WriteParquet};
 use crate::plans::{Plan, PlanResult};
 use crate::{DeltaError, Engine, Result};
 
@@ -46,7 +46,10 @@ impl CheckpointWriter {
                 "Classic-named checkpoints require Parquet",
             ));
         }
-        let (actions, counts, sidecars) = if self.schema_context.is_v2 {
+        if !self.schema_context.is_v2 {
+            return self.v1_checkpoint_plan(engine);
+        }
+        let (actions, counts, sidecars) = {
             let (content, non_content) = self.v2_checkpoint_actions(engine)?;
             let counts = action_counts(content.clone(), true)?;
             let sidecars = PlanBuilder::write_parquet_files(
@@ -71,10 +74,6 @@ impl CheckpointWriter {
             )?;
             let counts = PlanBuilder::union_all([counts, action_counts(manifest.clone(), false)?])?;
             (manifest, counts, Some(sidecars))
-        } else {
-            let actions = self.checkpoint_actions(engine)?;
-            let counts = action_counts(actions.clone(), true)?;
-            (actions, counts, None)
         };
         let root_path = if uuid_root {
             let extension = match format {
@@ -173,6 +172,34 @@ impl CheckpointWriter {
             self.serialize_checkpoint_hint(&statistics, &root, rows.schema, rows.prefetch)?;
         Ok((root, statistics, bytes))
     }
+
+    fn v1_checkpoint_plan(&self, engine: &dyn Engine) -> KernelResult<Plan> {
+        let actions = self.checkpoint_actions(engine)?;
+        let checkpoint_schema = checkpoint_schema_json(actions.schema())?;
+        let write = WriteParquet::new(actions.schema().clone(), self.checkpoint_path()?)
+            .with_stats_agg([
+                StatsAgg::new(NUM_ACTIONS, Agg::count_star()),
+                StatsAgg::new(NUM_ADDS, Agg::count(column_name!("add"))),
+            ]);
+        let written = PlanBuilder::write_parquet([actions], write)?;
+        let statistics = written.clone().project(
+            Expr::struct_from([col!(NUM_ACTIONS), col!(NUM_ADDS), col!("size")]),
+            STATISTICS_SCHEMA.clone(),
+        )?;
+        let root = written.project(
+            Expr::struct_from(
+                FILE_META_SCHEMA
+                    .fields()
+                    .map(|field| Expr::column([field.name()])),
+            ),
+            FILE_META_SCHEMA.clone(),
+        )?;
+        PlanBuilder::union_all([
+            result_rows(statistics, "statistics", None)?,
+            result_rows(root, "root", checkpoint_schema)?,
+        ])?
+        .build()
+    }
 }
 
 fn result_rows(
@@ -240,61 +267,84 @@ impl RowVisitor for CheckpointResult {
     fn visit<'a>(&mut self, count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         for row in 0..count {
             let actions: Option<i64> = getters[0].get_opt(row, NUM_ACTIONS)?;
+            let adds: Option<i64> = getters[1].get_opt(row, NUM_ADDS)?;
+            let bytes: Option<i64> = getters[2].get_opt(row, NUM_BYTES)?;
             let location: Option<&str> = getters[3].get_opt(row, "location")?;
+            let size: Option<i64> = getters[4].get_opt(row, "size")?;
+            let modified: Option<i64> = getters[5].get_opt(row, "last_modified")?;
             let sidecar: Option<bool> = getters[6].get_opt(row, "is_sidecar")?;
-            if usize::from(actions.is_some())
-                + usize::from(location.is_some())
-                + usize::from(sidecar.is_some())
-                != 1
-            {
-                return Err(KernelError::checkpoint_write(
-                    "Invalid checkpoint result row",
-                ));
-            }
-            if let Some(num_actions) = actions {
-                let stats = LastCheckpointHintStats {
-                    num_actions,
-                    num_of_add_files: getters[1].get(row, NUM_ADDS)?,
-                    size_in_bytes: getters[2].get(row, NUM_BYTES)?,
-                };
-                if stats.num_actions < stats.num_of_add_files
-                    || stats.num_of_add_files < 0
-                    || stats.size_in_bytes < 0
-                    || self.statistics.replace(stats).is_some()
-                {
+            let json: Option<&str> = getters[7].get_opt(row, "json")?;
+            let schema: Option<&str> = getters[8].get_opt(row, "checkpoint_schema")?;
+            match (
+                actions, adds, bytes, location, size, modified, sidecar, json, schema,
+            ) {
+                (
+                    Some(num_actions),
+                    Some(num_of_add_files),
+                    Some(size_in_bytes),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ) => {
+                    let stats = LastCheckpointHintStats {
+                        num_actions,
+                        num_of_add_files,
+                        size_in_bytes,
+                    };
+                    if stats.num_actions < stats.num_of_add_files
+                        || stats.num_of_add_files < 0
+                        || stats.size_in_bytes < 0
+                        || self.statistics.replace(stats).is_some()
+                    {
+                        return Err(KernelError::checkpoint_write(
+                            "Invalid or duplicate checkpoint statistics",
+                        ));
+                    }
+                }
+                (
+                    None,
+                    None,
+                    None,
+                    Some(location),
+                    Some(size),
+                    Some(modified),
+                    None,
+                    None,
+                    schema,
+                ) => {
+                    let root = FileMeta::new(
+                        url::Url::parse(location)?,
+                        modified,
+                        size.try_into()
+                            .map_err(|_| KernelError::checkpoint_write("Negative root size"))?,
+                    );
+                    if self.root.replace(root).is_some() {
+                        return Err(KernelError::checkpoint_write("Duplicate checkpoint root"));
+                    }
+                    self.schema = schema.map(serde_json::from_str).transpose()?;
+                }
+                (None, None, None, None, None, None, Some(sidecar), json, None) => {
+                    if sidecar {
+                        collect_prefetch(
+                            &mut self.prefetch.sidecar_files,
+                            json,
+                            LAST_CHECKPOINT_SIDECARS_THRESHOLD,
+                        )?;
+                    } else {
+                        collect_prefetch(
+                            &mut self.prefetch.non_file_actions,
+                            json,
+                            LAST_CHECKPOINT_NON_FILE_ACTIONS_THRESHOLD,
+                        )?;
+                    }
+                }
+                _ => {
                     return Err(KernelError::checkpoint_write(
-                        "Invalid or duplicate checkpoint statistics",
+                        "Invalid checkpoint result row",
                     ));
-                }
-            }
-            if let Some(location) = location {
-                let size: i64 = getters[4].get(row, "size")?;
-                let root = FileMeta::new(
-                    url::Url::parse(location)?,
-                    getters[5].get(row, "last_modified")?,
-                    size.try_into()
-                        .map_err(|_| KernelError::checkpoint_write("Negative root size"))?,
-                );
-                if self.root.replace(root).is_some() {
-                    return Err(KernelError::checkpoint_write("Duplicate checkpoint root"));
-                }
-                let schema: Option<&str> = getters[8].get_opt(row, "checkpoint_schema")?;
-                self.schema = schema.map(serde_json::from_str).transpose()?;
-            }
-            if let Some(sidecar) = sidecar {
-                let json: Option<&str> = getters[7].get_opt(row, "json")?;
-                if sidecar {
-                    collect_prefetch(
-                        &mut self.prefetch.sidecar_files,
-                        json,
-                        LAST_CHECKPOINT_SIDECARS_THRESHOLD,
-                    )?;
-                } else {
-                    collect_prefetch(
-                        &mut self.prefetch.non_file_actions,
-                        json,
-                        LAST_CHECKPOINT_NON_FILE_ACTIONS_THRESHOLD,
-                    )?;
                 }
             }
         }
