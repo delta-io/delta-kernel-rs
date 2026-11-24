@@ -1667,8 +1667,7 @@ impl Snapshot {
             .into());
         }
         let segment = self.log_compaction_segment(start_version, end_version)?;
-        let actions = MetadataPlanner::new(ActionSet::ALL)
-            .with_commits(&segment, true)
+        let actions = MetadataPlanner::new(&segment, None, ActionSet::ALL, true)
             .with_stats(StatsOptions::json_only())
             .replay()
             .result?

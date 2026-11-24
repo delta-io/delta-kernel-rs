@@ -7,12 +7,16 @@ use url::Url;
 
 use super::action_set::ActionSet;
 use super::*;
-use crate::actions::{DomainMetadata, SetTransaction, get_all_actions_schema};
+use crate::actions::{Add, DomainMetadata, SetTransaction, get_all_actions_schema};
 use crate::arrow::compute::{concat_batches, filter_record_batch, is_not_null};
-use crate::checkpoint::{CheckpointSpec, V2CheckpointConfig};
+use crate::checkpoint::{
+    CheckpointInfo, CheckpointSpec, SelectedCheckpointType, V2CheckpointConfig,
+};
+use crate::crc::Crc;
 use crate::engine::arrow_conversion::TryIntoArrow;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{col, lit};
+use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::ReplayBase;
@@ -117,11 +121,14 @@ async fn replay_selects_latest_action_without_retention(
         .then(|| snapshot.checkpoint_info(&engine))
         .transpose()?
         .flatten();
-    let planned = MetadataPlanner::new(actions)
-        .with_checkpoint(snapshot.log_segment(), checkpoint_info)
-        .with_commits(snapshot.log_segment(), !snapshot.has_adaptive_metadata())
-        .with_stats(StatsOptions::json_only())
-        .replay();
+    let planned = MetadataPlanner::new(
+        snapshot.log_segment(),
+        checkpoint_info,
+        actions,
+        !snapshot.has_adaptive_metadata(),
+    )
+    .with_stats(StatsOptions::json_only())
+    .replay();
     let state = planned.result?;
     let report = planned.metrics;
     assert!(report.stats.synthesize_json);
@@ -251,33 +258,57 @@ async fn replay_selects_latest_action_without_retention(
 }
 
 #[rstest]
-#[case::compaction(ReplayBase::Empty, true, false, true, Some((0, 5)), 13)]
-#[case::commits_only(ReplayBase::Empty, false, false, true, Some((0, 5)), 30)]
-#[case::crc_tail(ReplayBase::Crc, false, false, true, Some((4, 5)), 10)]
-#[case::crc_partial_failure(ReplayBase::Crc, false, true, true, Some((4, 5)), 10)]
-#[case::checkpoint_without_tail(ReplayBase::Checkpoint, false, false, true, None, 0)]
-#[case::checkpoint_only(ReplayBase::Checkpoint, false, false, false, None, 0)]
-#[case::no_sources(ReplayBase::Empty, false, false, false, None, 0)]
-#[case::partial_failure(ReplayBase::Empty, false, true, true, Some((0, 5)), 30)]
+#[case::compaction((None, None), ActionSet::live_adds(), true, false, true,
+    ReplayBase::Empty, (Some((0, 5)), 13))]
+#[case::commits_only((None, None), ActionSet::live_adds(), false, false, true,
+    ReplayBase::Empty, (Some((0, 5)), 30))]
+#[case::crc_tail((Some(2), Some((3, Some(1)))), ActionSet::live_adds(), false, false, true,
+    ReplayBase::Crc, (Some((4, 5)), 10))]
+#[case::empty_all_files((Some(2), Some((3, Some(0)))), ActionSet::live_adds(), false, false, true,
+    ReplayBase::Crc, (Some((4, 5)), 10))]
+#[case::equal_crc((Some(2), Some((2, Some(1)))), ActionSet::live_adds(), false, false, true,
+    ReplayBase::Crc, (Some((3, 5)), 15))]
+#[case::stale_crc((Some(2), Some((1, Some(1)))), ActionSet::live_adds(), false, false, true,
+    ReplayBase::Checkpoint, (Some((3, 5)), 15))]
+#[case::missing_all_files((Some(2), Some((3, None))), ActionSet::live_adds(), false, false, true,
+    ReplayBase::Checkpoint, (Some((3, 5)), 15))]
+#[case::tombstones((Some(2), Some((3, Some(1)))), ActionSet::live_adds_with_tombstones(),
+    false, false, true, ReplayBase::Checkpoint, (Some((3, 5)), 15))]
+#[case::mixed_actions((Some(2), Some((3, Some(1)))), ActionSet::ALL, false, false, true,
+    ReplayBase::Checkpoint, (Some((3, 5)), 15))]
+#[case::noncontent((Some(2), Some((3, Some(1)))), ActionSet { protocol: true, ..Default::default() },
+    false, false, true, ReplayBase::Checkpoint, (Some((3, 5)), 15))]
+#[case::checkpoint_without_tail((Some(5), None), ActionSet { protocol: true, ..Default::default() },
+    false, false, true, ReplayBase::Checkpoint, (None, 0))]
+#[case::checkpoint_only((Some(5), None), ActionSet::live_adds(), false, false, false,
+    ReplayBase::Checkpoint, (None, 0))]
+#[case::no_sources((None, None), ActionSet::live_adds(), false, false, false,
+    ReplayBase::Empty, (None, 0))]
+#[case::partial_failure((None, None), ActionSet::live_adds(), false, true, true,
+    ReplayBase::Empty, (Some((0, 5)), 30))]
+#[case::crc_partial_failure((Some(2), Some((3, Some(1)))), ActionSet::live_adds(), false, true, true,
+    ReplayBase::Crc, (Some((4, 5)), 10))]
 fn report_retains_selected_inputs(
-    #[case] base: ReplayBase,
+    #[case] sources: (Option<u64>, Option<(u64, Option<usize>)>),
+    #[case] actions: ActionSet,
     #[case] compaction: bool,
     #[case] fail: bool,
     #[case] commits: bool,
-    #[case] expected_range: Option<(u64, u64)>,
-    #[case] expected_bytes: u64,
+    #[case] base: ReplayBase,
+    #[case] expected_work: (Option<(u64, u64)>, u64),
 ) {
-    let checkpoint = base == ReplayBase::Checkpoint;
+    let (checkpoint_version, crc) = sources;
+    let (expected_range, expected_bytes) = expected_work;
     let file =
         |name: &str, size| create_log_path_with_size(&format!("memory:///_delta_log/{name}"), size);
     let segment = LogSegment {
         end_version: 5,
-        checkpoint_version: checkpoint.then_some(5),
+        checkpoint_version,
         log_root: Url::parse("memory:///_delta_log/").unwrap(),
         last_checkpoint_metadata: None,
         listed: LogSegmentFiles {
             ascending_commit_files: (0..=5)
-                .filter(|_| !checkpoint)
+                .filter(|_| commits)
                 .map(|version| file(&format!("{version:020}.json"), 5))
                 .collect(),
             ascending_compaction_files: compaction
@@ -289,34 +320,42 @@ fn report_retains_selected_inputs(
                 })
                 .into_iter()
                 .collect(),
-            checkpoint_parts: checkpoint
-                .then(|| file("00000000000000000005.checkpoint.parquet", 1))
+            checkpoint_parts: checkpoint_version
+                .map(|version| file(&format!("{version:020}.checkpoint.parquet"), 1))
                 .into_iter()
                 .collect(),
             ..Default::default()
         },
     };
-    let actions = if checkpoint {
-        ActionSet {
-            protocol: true,
-            ..Default::default()
-        }
-    } else {
-        ActionSet::live_adds()
-    };
-    let planner =
-        MetadataPlanner::new(actions).with_stats_filter(fail.then(|| col!("missing").eq(lit(0))));
-    let planner = match base {
-        ReplayBase::Crc => planner.with_crc(3, vec![]),
-        ReplayBase::Checkpoint => planner.with_checkpoint(&segment, None),
-        ReplayBase::Empty => planner,
-    };
-    let planner = if commits {
-        planner.with_commits(&segment, compaction)
-    } else {
-        planner
-    };
-    let planned = planner.replay();
+    let crc = crc.map(|(version, count)| Crc {
+        version,
+        all_files: count.map(|count| {
+            vec![
+                Add {
+                    path: "data.parquet".into(),
+                    ..Default::default()
+                };
+                count
+            ]
+        }),
+        ..Default::default()
+    });
+    let checkpoint_info = checkpoint_version.map(|version| {
+        Arc::new(CheckpointInfo {
+            checkpoint_type: SelectedCheckpointType::V1,
+            leaf_checkpoint_schema: get_all_actions_schema().clone(),
+            sidecars: Arc::from([]),
+            size_in_bytes: 1,
+            last_checkpoint: Box::new(LastCheckpointHint {
+                version,
+                ..Default::default()
+            }),
+        })
+    });
+    let planned = MetadataPlanner::new(&segment, checkpoint_info, actions, compaction)
+        .with_crc(crc.as_ref())
+        .with_stats_filter(fail.then(|| col!("missing").eq(lit(0))))
+        .replay();
     assert_eq!(planned.result.is_err(), fail);
     if let Err(error) = planned.result {
         assert!(error.to_string().contains("missing"));
@@ -325,11 +364,11 @@ fn report_retains_selected_inputs(
     assert_eq!(report.replay_base, Some(base));
     assert_eq!(
         report.base_version,
-        match base {
-            ReplayBase::Crc => Some(3),
-            ReplayBase::Checkpoint => Some(5),
-            ReplayBase::Empty => None,
-        },
+        if base == ReplayBase::Crc {
+            crc.as_ref().map(|crc| crc.version)
+        } else {
+            checkpoint_version
+        }
     );
     assert_eq!(
         (report.commit_start_version, report.commit_end_version),

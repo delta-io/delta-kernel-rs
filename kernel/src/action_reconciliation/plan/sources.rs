@@ -311,12 +311,16 @@ mod tests {
 
         // When: selected checkpoint actions are planned from the same resolved checkpoint
         // information.
-        let plan = MetadataPlanner::new(actions)
-            .with_checkpoint(snapshot.log_segment(), checkpoint_info)
-            .with_stats(StatsOptions::json_only())
-            .replay()
-            .result?
-            .build()?;
+        let plan = MetadataPlanner::new(
+            snapshot.log_segment(),
+            checkpoint_info,
+            actions,
+            !snapshot.has_adaptive_metadata(),
+        )
+        .with_stats(StatsOptions::json_only())
+        .replay()
+        .result?
+        .build()?;
         // Then: file-action reads always use a complete static sidecar list.
         assert!(
             plan.nodes

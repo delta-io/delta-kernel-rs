@@ -61,7 +61,7 @@ pub struct ScanPlanReport {
     // === Log replay ===
     pub replay_base: OptionalValue<ReplayBase>,
     pub base_version: OptionalValue<u64>,
-    /// Null when no checkpoint was used.
+    /// Null when no checkpoint discovery metrics were collected.
     pub checkpoint: *const FfiCheckpointMetrics,
     pub commit_start_version: OptionalValue<u64>,
     pub commit_end_version: OptionalValue<u64>,
