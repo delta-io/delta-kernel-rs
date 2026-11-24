@@ -1136,7 +1136,7 @@ impl RowVisitor for ColumnFileCounter {
 /// Visitor behind [`validate_and_assign_first_row_ids`].
 ///
 /// Errors if a leaf entry is not `Data`, has an unknown status, is live and non-`Added` with a null
-/// `sequenceNumber`, or needs a `firstRowId` but has a negative `recordCount`, or if assignment
+/// `sequenceNumber`, or has a null `firstRowId` and a negative `recordCount`, or if assignment
 /// overflows `i64`.
 struct LeafEntryVisitor {
     /// Next unassigned `firstRowId`.
@@ -2921,15 +2921,29 @@ mod tests {
     #[rstest]
     #[case::negative(-1, "negative")]
     #[case::overflow(i64::MAX, "overflow")]
-    fn leaf_added_entry_bad_record_count_errors(
+    fn leaf_null_first_row_id_entry_bad_record_count_errors(
         #[case] record_count: i64,
         #[case] expected_message: &str,
+        #[values(
+            TrackingStatus::Added,
+            TrackingStatus::Existing,
+            TrackingStatus::Modified,
+            TrackingStatus::Deleted,
+            TrackingStatus::Replaced
+        )]
+        status: TrackingStatus,
+        #[values(false, true)] removed: bool,
     ) {
-        // An Added entry needing firstRowId assignment rejects a negative recordCount and a row-ID
-        // overflow (seed 100 + i64::MAX).
+        // Every entry with a null firstRowId takes part in assignment, whatever its status and
+        // even when the manifest deletion vector removes it, so each rejects a negative
+        // recordCount and a row-ID overflow (seed 100 + i64::MAX).
         let engine = SyncEngine::new();
-        let entry = leaf_entry("a.parquet", 1, record_count, None, None, None);
-        let mut ctx = LeafReadContext::new(&engine, &valid_parent(), None, &read_ctx()).unwrap();
+        let entry = with_status(
+            leaf_entry("a.parquet", 1, record_count, Some(3), Some(9), None),
+            status,
+        );
+        let dv = removed.then(|| MumblingBitmap::deserialize(mumbling_bitmap(&[0])).unwrap());
+        let mut ctx = LeafReadContext::new(&engine, &valid_parent(), dv, &read_ctx()).unwrap();
         let result =
             ctx.convert_leaf_entries_to_add_actions(entry_batch(&engine, &[entry]).as_ref());
         assert_result_error_with_message(result, expected_message);
