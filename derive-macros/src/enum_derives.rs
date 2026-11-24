@@ -92,21 +92,20 @@ pub(super) fn into_struct_data(input: &DeriveInput) -> Result<TokenStream, Error
 }
 
 pub(super) fn try_from_struct_data(struct_name: &Ident, variants: &[Variant<'_>]) -> TokenStream {
-    let arms = variants.iter().map(|variant| {
+    let arms = variants.iter().enumerate().map(|(index, variant)| {
         let ident = variant.ident;
-        let field_name = &variant.name;
         let payload = variant.payload;
         quote! {
-            #field_name => <#payload as TryFrom<delta_kernel::expressions::Scalar>>::try_from(value)
+            #index => <#payload as TryFrom<delta_kernel::expressions::Scalar>>::try_from(value)
                 .map(Self::#ident),
         }
     });
     let payloads = variants.iter().map(|v| v.payload);
     let result = quote! {{
-        let (name, value) = fields.take_variant()?;
-        match name {
+        let (index, name, value) = fields.take_variant()?;
+        match index {
             #(#arms)*
-            _ => Err(delta_kernel::KernelError::internal_error("Unknown variant field")),
+            _ => Err(delta_kernel::KernelError::internal_error("Unknown variant field index")),
         }.map_err(|error| delta_kernel::error::add_scalar_path_context(error, name))?
     }};
     super::struct_data_decoder(struct_name, payloads, result)

@@ -209,10 +209,10 @@ pub(crate) struct StructDataFields {
 }
 
 impl StructDataFields {
-    /// Consumes a variant row, returning its sole non-null field and value.
+    /// Consumes the sole non-null variant, returning its expected-schema index, name, and value.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub(crate) fn take_variant(&mut self) -> KernelResult<(&'static str, Scalar)> {
+    pub(crate) fn take_variant(&mut self) -> KernelResult<(usize, &'static str, Scalar)> {
         let mut names = self
             .actual
             .fields()
@@ -230,16 +230,15 @@ impl StructDataFields {
             }
         };
         drop(names);
-        let name = self
+        let (index, field) = self
             .expected
-            .field(name)
-            .ok_or_else(|| KernelError::scalar_conversion("known variant field", name))?
-            .name()
-            .as_str();
+            .field_with_index(name)
+            .ok_or_else(|| KernelError::scalar_conversion("known variant field", name))?;
+        let name = field.name().as_str();
         for field in self.expected.fields().filter(|field| field.name() != name) {
             self.take_field::<Scalar>(field.name())?;
         }
-        Ok((name, self.take_field(name)?))
+        Ok((index, name, self.take_field(name)?))
     }
 
     /// Creates a field decoder after checking that the value count matches both schemas.

@@ -662,12 +662,12 @@ fn try_from_struct_rows_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
                         row,
                         <Self::Row as delta_kernel::schema::ToSchema>::schema_ref(),
                     )?;
-                    let (name, value) = fields.take_variant()?;
-                    match name {
-                        #(stringify!(#names) => <#types as delta_kernel::expressions::TryFromStructRows>::push(
+                    let (index, name, value) = fields.take_variant()?;
+                    match index {
+                        #(#indices => <#types as delta_kernel::expressions::TryFromStructRows>::push(
                             &mut state.#indices, value.try_into()?,
                         ),)*
-                        _ => Err(delta_kernel::KernelError::internal_error("Unknown variant field")),
+                        _ => Err(delta_kernel::KernelError::internal_error("Unknown variant field index")),
                     }.map_err(|error| delta_kernel::error::add_scalar_path_context(error, name))?;
                     fields.finish()
                 }
