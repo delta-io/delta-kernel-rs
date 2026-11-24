@@ -10,9 +10,9 @@ use std::sync::{Arc, LazyLock};
 use crate::actions::NUM_RECORDS;
 use crate::content_tree::{
     CONTENT_TYPE, ContentTreeNodeEntry, DataContentType, DataFileFormat, FILE_FORMAT,
-    FILE_SEQUENCE_NUMBER, FILE_SIZE_IN_BYTES, FIRST_ROW_ID, LOCATION, PARTITION_SPEC_ID,
-    RECORD_COUNT, SEQUENCE_NUMBER, TRACKING, TRACKING_SNAPSHOT_ID, TRACKING_STATUS, TrackingInfo,
-    TrackingStatus, struct_expr_from_schema,
+    FILE_SEQUENCE_NUMBER, FILE_SIZE_IN_BYTES, FIRST_ROW_ID, LOCATION, RECORD_COUNT,
+    SEQUENCE_NUMBER, TRACKING, TRACKING_SNAPSHOT_ID, TRACKING_STATUS, TrackingInfo, TrackingStatus,
+    struct_expr_from_schema,
 };
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{ColumnName, Expression, lit};
@@ -80,7 +80,7 @@ static REQUIRED_NON_NULL_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(
 /// (one `Data` entry per input row), suitable for serializing as an AMT root manifest.
 ///
 /// Each input row is a newly added file, producing an [`TrackingStatus::Added`] `Data` entry
-/// (`fileFormat` parquet, `specId` 0 -- unpartitioned tables only). Both `sequenceNumber` and
+/// (`fileFormat` parquet, `specId` null -- unpartitioned tables only). Both `sequenceNumber` and
 /// `fileSequenceNumber` take the input `defaultRowCommitVersion`; remaining entry fields are null,
 /// and statistics and partition values are omitted from the output schema.
 ///
@@ -110,8 +110,8 @@ pub(crate) fn convert_append_metadata_to_root_entry_batch(
     // TODO(#2866): This method doesn't allow for caching standard checks and expressions.
     // we should have some sort of struct wrapper to avoid reconstruction.
 
-    // `specId` 0 below is only correct for an unpartitioned table (a partitioned table's spec 0 is
-    // its real partition spec), so reject partitioned tables until this path supports them.
+    // Iceberg V4 requires a null `specId` and `partition` for an unpartitioned file, which is all
+    // this path writes, so reject partitioned tables until this path supports them.
     if !partition_columns.is_empty() {
         return Err(KernelError::unsupported(format!(
             "AMT root writes do not yet support partitioned tables; partition columns: \
@@ -209,9 +209,9 @@ fn build_content_tree_entry_expression(
         LOCATION => Some(projections.location.clone()),
         FILE_FORMAT => Some(lit(DataFileFormat::Parquet)),
         TRACKING => Some(tracking.clone()),
-        // `specId` 0 is safe here because the caller rejects partitioned tables. TODO(#3320): carry
-        // the table's actual spec id once the write path supports partitioned AMT tables.
-        PARTITION_SPEC_ID => Some(lit(0i32)),
+        // `specId` falls through to null, as Iceberg V4 requires for an unpartitioned file; the
+        // caller rejects partitioned tables. TODO(#3320): carry the table's spec id once the write
+        // path supports partitioned AMT tables.
         RECORD_COUNT => Some(projections.record_count.clone()),
         FILE_SIZE_IN_BYTES => Some(projections.file_size_in_bytes.clone()),
         _ => None,
@@ -378,7 +378,7 @@ mod tests {
                 replaced_positions: None,
             },
             deletion_vector: None,
-            spec_id: Some(0),
+            spec_id: None,
             partition: None,
             sort_order_id: None,
             record_count: num_records,
