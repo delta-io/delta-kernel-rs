@@ -6,7 +6,7 @@
 //! connector keeps that state and the callback code alive for every use.
 
 use std::backtrace::BacktraceStatus;
-use std::error::Error as _;
+use std::error::Error as StdError;
 use std::ffi::c_void;
 
 use delta_kernel::{Error, KernelError};
@@ -15,13 +15,23 @@ use super::FFIKernelError;
 use crate::delta_types::{FfiStringMap, FfiStringMapEntry};
 use crate::{FfiSlice, KernelStringSlice, OptionalValue, kernel_string_slice};
 
-/// Kernel error code and diagnostic message.
+/// Kernel error code and diagnostic details.
+///
+/// Use the code to classify the error. Diagnostic text is unredacted and may contain user data.
+/// All strings and arrays are borrowed for the allocation callback.
 #[repr(C)]
 pub struct KernelErrorInfo {
     /// Numeric code identifying the kind of Kernel error.
     pub code: FFIKernelError,
     /// Rendered diagnostic message, without a trailing NUL.
+    ///
+    /// For [`KernelError::Backtraced`], this includes the wrapper's backtrace.
     pub message: KernelStringSlice,
+    /// Rendered source messages, ordered from the immediate cause to the root cause.
+    ///
+    /// Each entry uses the source's `Display` output. A [`KernelError::Backtraced`] source
+    /// includes its own backtrace and is followed by its inner error, so messages can repeat.
+    pub sources: FfiSlice<KernelStringSlice>,
 }
 
 /// Delta catalog condition and diagnostic details.
@@ -40,10 +50,12 @@ pub struct DeltaErrorInfo {
     pub message: KernelStringSlice,
     /// Construction-site Rust backtrace, absent when capture is disabled or unsupported.
     ///
-    /// Capture follows Rust's environment settings or [`super::enable_error_backtraces`]. The
-    /// trace belongs to the original error; converting it for FFI does not capture another stack.
+    /// Capture follows Rust's environment settings; see [`delta_kernel::DeltaError::backtrace`].
+    /// The trace belongs to the original error; converting it for FFI does not capture another
+    /// stack.
     pub backtrace: OptionalValue<KernelStringSlice>,
-    /// Rendered source messages, ordered from the immediate cause to the root cause.
+    /// Rendered source messages, with the same ordering and rendering as
+    /// [`KernelErrorInfo::sources`].
     pub sources: FfiSlice<KernelStringSlice>,
 }
 
@@ -60,9 +72,9 @@ pub struct ErrorAllocators {
     pub context: *mut c_void,
     /// Creates a connector error object from the Kernel error information in the second argument.
     ///
-    /// The information pointer is non-null. It and its message bytes are valid only until the
-    /// callback returns. If the connector needs the information afterward, it must copy it into
-    /// memory it owns. The callback must not modify or free the supplied information.
+    /// The information pointer is non-null. It, the source array, and all referenced strings are
+    /// valid only until the callback returns. If the connector needs the information afterward,
+    /// it must copy it into memory it owns. The callback must not modify or free the information.
     ///
     /// Return a pointer to the connector's error object, or NULL if allocation fails. Kernel
     /// returns this pointer unchanged to the caller.
@@ -70,10 +82,9 @@ pub struct ErrorAllocators {
         unsafe extern "C" fn(*mut c_void, *const KernelErrorInfo) -> *mut c_void,
     /// Creates a connector error object from the Delta error information in the second argument.
     ///
-    /// The information pointer is non-null. It, the parameter array, and all referenced strings
-    /// are valid only until the callback returns. If the connector needs any of this information
-    /// afterward, it must copy it into memory it owns. The callback must not modify or free the
-    /// supplied information.
+    /// The information pointer is non-null. It, the arrays, and all referenced strings are valid
+    /// only until the callback returns. If the connector needs any of this information afterward,
+    /// it must copy it into memory it owns. The callback must not modify or free the information.
     ///
     /// Return a pointer to the connector's error object, or NULL if allocation fails. Kernel
     /// returns this pointer unchanged to the caller.
@@ -95,9 +106,15 @@ impl ErrorAllocators {
     /// requirements. The callback must follow its field's memory access and ownership rules.
     pub unsafe fn allocate_kernel_error(&self, error: KernelError) -> *mut c_void {
         let message = error.to_string();
+        let sources = source_messages(&error);
+        let source_slices: Vec<_> = sources
+            .iter()
+            .map(|source| kernel_string_slice!(source))
+            .collect();
         let descriptor = KernelErrorInfo {
             code: error.into(),
             message: kernel_string_slice!(message),
+            sources: unsafe { FfiSlice::new_unsafe(&source_slices) },
         };
         unsafe { (self.allocate_kernel_error)(self.context, &descriptor) }
     }
@@ -119,12 +136,7 @@ impl ErrorAllocators {
                 let message = error.message();
                 let backtrace = (error.backtrace().status() == BacktraceStatus::Captured)
                     .then(|| error.backtrace().to_string());
-                let mut sources = Vec::new();
-                let mut source = error.source();
-                while let Some(cause) = source {
-                    sources.push(cause.to_string());
-                    source = cause.source();
-                }
+                let sources = source_messages(&error);
                 let source_slices: Vec<_> = sources
                     .iter()
                     .map(|source| kernel_string_slice!(source))
@@ -158,12 +170,24 @@ impl ErrorAllocators {
     }
 }
 
+fn source_messages(error: &dyn StdError) -> Vec<String> {
+    let mut sources = Vec::new();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        sources.push(cause.to_string());
+        source = cause.source();
+    }
+    sources
+}
+
 #[cfg(test)]
 mod tests {
-    use std::backtrace::BacktraceStatus;
+    use std::backtrace::{Backtrace, BacktraceStatus};
     use std::ffi::c_void;
+    use std::process::Command;
     use std::sync::Arc;
 
+    use delta_kernel::snapshot::SnapshotHintError;
     use delta_kernel::{DeltaError, DeltaErrorCondition, Engine, Error, KernelError};
     use rstest::rstest;
 
@@ -198,6 +222,11 @@ mod tests {
         error: *const KernelErrorInfo,
     ) -> *mut c_void {
         let error = unsafe { &*error };
+        let output = unsafe { &mut *context.cast::<Capture>() };
+        output.sources = unsafe { error.sources.try_as_slice().unwrap() }
+            .iter()
+            .map(|source| unsafe { source.try_to_string().unwrap() })
+            .collect();
         unsafe {
             capture(
                 context,
@@ -258,6 +287,66 @@ mod tests {
         fn error_allocator(&self) -> &dyn AllocateError {
             &self.allocators
         }
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "Miri cannot spawn subprocesses; this test executes no unsafe code"
+    )]
+    fn delta_backtrace_environment_settings() {
+        for (lib_backtrace, backtrace, captured) in [
+            (None, None, false),
+            (None, Some("1"), true),
+            (Some("0"), Some("1"), false),
+            (Some("1"), Some("0"), true),
+        ] {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "error::allocation::tests::delta_backtrace_survives_allocation",
+                    "--nocapture",
+                ])
+                .env_remove("RUST_LIB_BACKTRACE")
+                .env_remove("RUST_BACKTRACE")
+                .env("DELTA_KERNEL_TEST_CAPTURE_BACKTRACE", captured.to_string());
+            if let Some(value) = lib_backtrace {
+                command.env("RUST_LIB_BACKTRACE", value);
+            }
+            if let Some(value) = backtrace {
+                command.env("RUST_BACKTRACE", value);
+            }
+            let output = command.output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "RUST_LIB_BACKTRACE={lib_backtrace:?}, RUST_BACKTRACE={backtrace:?}:\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(
+                stdout.contains("1 passed"),
+                "child did not run the test: {stdout}"
+            );
+        }
+    }
+
+    #[test]
+    fn delta_backtrace_survives_allocation() {
+        let mut output = Capture::default();
+        let allocators = ErrorAllocators {
+            context: std::ptr::from_mut(&mut output).cast(),
+            allocate_kernel_error: kernel,
+            allocate_delta_error: delta,
+        };
+        let error = DeltaError::path_does_not_exist("memory:///table/", None);
+        let captured = error.backtrace().status() == BacktraceStatus::Captured;
+        if let Ok(expected) = std::env::var("DELTA_KERNEL_TEST_CAPTURE_BACKTRACE") {
+            assert_eq!(captured, expected.parse::<bool>().unwrap());
+        }
+        let expected = captured.then(|| error.backtrace().to_string());
+        unsafe { allocators.allocate_error(error.into()) };
+        assert_eq!(output.backtrace, expected);
     }
 
     #[derive(Clone, Copy)]
@@ -373,8 +462,11 @@ mod tests {
         assert_eq!(output.sources, expected_sources);
     }
 
-    #[test]
-    fn delta_sources_preserve_the_complete_cause_chain_after_allocation() {
+    #[rstest]
+    fn sources_preserve_the_complete_cause_chain_after_allocation(
+        #[values(false, true)] delta_error: bool,
+        #[values(false, true)] backtraced_source: bool,
+    ) {
         let mut output = Capture::default();
         let allocators = ErrorAllocators {
             context: std::ptr::from_mut(&mut output).cast(),
@@ -384,14 +476,65 @@ mod tests {
         let source = KernelError::GenericError {
             source: Box::new(KernelError::MissingVersion(7)),
         };
-        let expected = vec![
+        let mut expected = vec![
             source.to_string(),
             KernelError::MissingVersion(7).to_string(),
         ];
-        let error = DeltaError::path_does_not_exist("memory:///table/", Some(Box::new(source)));
-        unsafe { allocators.allocate_error(error.into()) };
+        let source = if backtraced_source {
+            let source = KernelError::Backtraced {
+                source: Box::new(source),
+                backtrace: Box::new(Backtrace::disabled()),
+            };
+            expected.insert(0, source.to_string());
+            source
+        } else {
+            source
+        };
+        let expected_message = if delta_error {
+            DeltaError::path_does_not_exist("memory:///table/", None).message()
+        } else {
+            "Invalid snapshot hint: invalid hint".to_string()
+        };
+        let error = if delta_error {
+            DeltaError::path_does_not_exist("memory:///table/", Some(Box::new(source))).into()
+        } else {
+            KernelError::from(SnapshotHintError::Connector {
+                message: "invalid hint".into(),
+                source: Some(Box::new(source)),
+            })
+            .into()
+        };
+        unsafe { allocators.allocate_error(error) };
         assert_eq!(output.sources, expected);
-        assert!(!output.fields.last().unwrap().1.contains("Missing version"));
+        assert_eq!(output.fields.last().unwrap().1, expected_message);
+    }
+
+    #[test]
+    fn snapshot_hint_causes_remain_distinguishable_after_allocation() {
+        let mut output = Capture::default();
+        let allocators = ErrorAllocators {
+            context: std::ptr::from_mut(&mut output).cast(),
+            allocate_kernel_error: kernel,
+            allocate_delta_error: delta,
+        };
+        let mut diagnostics = Vec::new();
+        for cause in [KernelError::MissingVersion(7), KernelError::EmptyLog] {
+            let expected_source = cause.to_string();
+            let error = KernelError::from(SnapshotHintError::LogSegment {
+                source: Box::new(cause),
+            });
+            unsafe { allocators.allocate_kernel_error(error) };
+            assert_eq!(output.sources, [expected_source]);
+            diagnostics.push((output.fields.clone(), output.sources.clone()));
+        }
+        assert_eq!(output.calls, 2);
+        assert_eq!(diagnostics[0].0, diagnostics[1].0);
+        assert_eq!(diagnostics[0].0[0].1, "InvalidSnapshotHint");
+        assert_eq!(
+            diagnostics[0].0[1].1,
+            "Invalid snapshot hint: supplied log files do not form a valid log segment"
+        );
+        assert_ne!(diagnostics[0].1, diagnostics[1].1);
     }
     #[rstest]
     fn successful_result_does_not_allocate(#[values(false, true)] top_level: bool) {

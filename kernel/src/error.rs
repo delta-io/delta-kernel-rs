@@ -4,7 +4,6 @@ use std::backtrace::{Backtrace, BacktraceStatus};
 use std::convert::Infallible;
 use std::num::ParseIntError;
 use std::str::Utf8Error;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::Version;
 #[cfg(feature = "default-engine-base")]
@@ -19,16 +18,6 @@ mod delta_error_condition;
 
 pub use delta_error::{DeltaError, DeltaErrorParameter};
 pub use delta_error_condition::DeltaErrorCondition;
-
-/// Enables construction-site error backtraces independently of Rust's environment settings.
-///
-/// This process-wide, idempotent setting affects errors created afterward and cannot be disabled.
-/// It enables capture for every [`DeltaError`] and for [`KernelError::with_backtrace`]; it does not
-/// add backtraces to other Kernel errors. Without this call, capture follows `RUST_LIB_BACKTRACE`
-/// and `RUST_BACKTRACE`. Capture still requires platform support and can be expensive.
-pub fn enable_error_backtraces() {
-    FORCE_ERROR_BACKTRACES.store(true, Ordering::Relaxed);
-}
 
 /// An error returned by a Delta Kernel operation.
 #[derive(Debug, thiserror::Error)]
@@ -233,10 +222,7 @@ impl From<SnapshotHintError> for KernelError {
 #[non_exhaustive]
 #[derive(thiserror::Error, Debug)]
 pub enum KernelError {
-    /// This is an error that includes a backtrace. To have a particular type of error include such
-    /// backtrace (when RUST_BACKTRACE=1), annotate the error with `#[error(transparent)]` and then
-    /// add the error type and enum variant to the `from_with_backtrace!` macro invocation
-    /// below. See IOError for an example.
+    /// An error paired with a backtrace captured by [`KernelError::with_backtrace`].
     #[error("{source}\n{backtrace}")]
     Backtraced {
         source: Box<Self>,
@@ -693,10 +679,12 @@ impl KernelError {
         }
     }
 
-    /// Captures a backtrace when enabled through the environment or [`enable_error_backtraces`].
+    /// Captures a backtrace when enabled by Rust's backtrace environment settings.
+    ///
+    /// See [`Backtrace::capture`] for configuration and platform support.
     #[must_use]
     pub fn with_backtrace(self) -> Self {
-        let backtrace = capture_error_backtrace();
+        let backtrace = Backtrace::capture();
         match backtrace.status() {
             BacktraceStatus::Captured => Self::Backtraced {
                 source: Box::new(self),
@@ -748,15 +736,5 @@ impl From<object_store::Error> for KernelError {
 impl From<Infallible> for KernelError {
     fn from(value: Infallible) -> Self {
         match value {}
-    }
-}
-
-static FORCE_ERROR_BACKTRACES: AtomicBool = AtomicBool::new(false);
-
-fn capture_error_backtrace() -> Backtrace {
-    if FORCE_ERROR_BACKTRACES.load(Ordering::Relaxed) {
-        Backtrace::force_capture()
-    } else {
-        Backtrace::capture()
     }
 }

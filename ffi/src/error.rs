@@ -11,16 +11,6 @@ pub mod allocation;
 
 pub use allocation::ErrorAllocators;
 
-/// Enables construction-site error backtraces independently of Rust's environment settings.
-///
-/// Call during application initialization to capture subsequent Delta errors and Kernel errors
-/// that request a backtrace. This setting is process-wide, idempotent, and permanent. It leaves
-/// existing errors unchanged. See [`delta_kernel::error::enable_error_backtraces`].
-#[unsafe(no_mangle)]
-pub extern "C" fn enable_error_backtraces() {
-    delta_kernel::error::enable_error_backtraces();
-}
-
 // We explicitly assign integer values to the error codes here because C and Rust are inconsistent
 // about values for "typedefed" features. Rust reserves the numbers for them regardless, so
 // `EngineDataTypeError` will be `3` whether or not `default-engine-base` is on becasue `ArrowError`
@@ -429,64 +419,7 @@ impl From<EngineExecError> for KernelError {
 
 #[cfg(test)]
 mod error_code_tests {
-    use std::backtrace::{Backtrace, BacktraceStatus};
-    use std::process::Command;
-
     use super::*;
-
-    #[test]
-    #[cfg_attr(miri, ignore = "Miri cannot spawn subprocesses")]
-    fn enabling_error_backtraces_overrides_the_environment() {
-        const CHILD: &str = "DELTA_KERNEL_ERROR_BACKTRACE_CONFIG_TEST";
-        if std::env::var_os(CHILD).is_none() {
-            let output = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "error::error_code_tests::enabling_error_backtraces_overrides_the_environment",
-                    "--nocapture",
-                ])
-                .env(CHILD, "1")
-                .env("RUST_LIB_BACKTRACE", "0")
-                .env("RUST_BACKTRACE", "0")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            return;
-        }
-
-        assert_eq!(Backtrace::capture().status(), BacktraceStatus::Disabled);
-        let before = delta_kernel::DeltaError::path_does_not_exist("memory:///table/", None);
-        enable_error_backtraces();
-        enable_error_backtraces();
-        let after = delta_kernel::DeltaError::path_does_not_exist("memory:///table/", None);
-        assert_eq!(before.backtrace().status(), BacktraceStatus::Disabled);
-        assert_eq!(after.backtrace().status(), BacktraceStatus::Captured);
-        assert!(
-            after
-                .backtrace()
-                .to_string()
-                .contains("enabling_error_backtraces_overrides_the_environment")
-        );
-        assert!(matches!(
-            KernelError::generic("diagnostic").with_backtrace(),
-            KernelError::Backtraced { .. }
-        ));
-        assert_eq!(
-            std::thread::spawn(|| {
-                delta_kernel::DeltaError::path_does_not_exist("memory:///worker/", None)
-                    .backtrace()
-                    .status()
-            })
-            .join()
-            .unwrap(),
-            BacktraceStatus::Captured
-        );
-        assert_eq!(std::env::var("RUST_LIB_BACKTRACE").unwrap(), "0");
-    }
 
     fn exec_error(etype: FFIKernelError, message: &str) -> EngineExecError {
         let message: Handle<ExclusiveRustString> = Box::new(message.to_string()).into();

@@ -4,7 +4,7 @@ use std::backtrace::Backtrace;
 use std::error::Error as StdError;
 use std::fmt;
 
-use super::{BoxedError, DeltaErrorCondition, capture_error_backtrace};
+use super::{BoxedError, DeltaErrorCondition};
 use crate::Version;
 use crate::schema::StructType;
 use crate::table_properties::LOG_RETENTION_DURATION;
@@ -99,8 +99,9 @@ impl DeltaError {
 
     /// Returns the backtrace captured when this error was constructed.
     ///
-    /// Capture follows `RUST_LIB_BACKTRACE` and `RUST_BACKTRACE` unless
-    /// [`super::enable_error_backtraces`] enables it independently of the environment.
+    /// Every construction calls [`Backtrace::capture`]. Set `RUST_LIB_BACKTRACE` (or
+    /// `RUST_BACKTRACE` when it is unset) before the first backtrace capture; Rust caches the
+    /// environment setting. Capture also requires platform support.
     pub fn backtrace(&self) -> &Backtrace {
         &self.backtrace
     }
@@ -310,7 +311,7 @@ impl DeltaError {
             condition,
             parameters: parameters.into_boxed_slice(),
             source,
-            backtrace: capture_error_backtrace(),
+            backtrace: Backtrace::capture(),
         }
     }
 }
