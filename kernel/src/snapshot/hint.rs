@@ -248,12 +248,11 @@ impl SnapshotHint {
         self.last_checkpoint_hint.as_ref()
     }
 
-    /// Returns the retained CRC state, if present.
+    /// Returns the in-memory CRC state, if present.
     ///
     /// Hints exported by [`Snapshot::to_snapshot_hint`] retain only CRC state at the snapshot
     /// version. Connector-provided inputs are checked when the snapshot is built.
-    /// A returned CRC does not imply that a CRC file exists on disk at that version; commits may
-    /// have been incrementally replayed in memory on top of an older-versioned CRC.
+    /// See [`Self::crc_source`] for its on-disk origin.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn crc(&self) -> Option<&Crc> {

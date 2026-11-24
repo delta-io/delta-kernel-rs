@@ -391,9 +391,15 @@ async fn built_as_latest_is_inherited_by_derived_snapshots(
     let base_is_latest = !base_snap_time_travel_to_latest || kind == TableKind::CatalogManaged;
     assert_eq!(base.is_built_as_latest(), base_is_latest);
     let expected_provenance = if replay == IncrementalReplay::Unlimited {
-        CrcSource::Reconstructed { on_disk_version: 0 }
+        CrcSource::Reconstructed {
+            on_disk_version: 0,
+            crc_version: LATEST_VERSION,
+        }
     } else {
-        CrcSource::Stale { on_disk_version: 0 }
+        CrcSource::Stale {
+            on_disk_version: 0,
+            crc_version: 0,
+        }
     };
     assert_eq!(base.crc_source(), expected_provenance);
 
@@ -415,7 +421,12 @@ async fn built_as_latest_is_inherited_by_derived_snapshots(
     let (crc_result, after_checksum) = after_checkpoint.write_checksum(engine.as_ref())?;
     assert_eq!(crc_result, ChecksumWriteResult::Written);
     assert_eq!(after_checksum.is_built_as_latest(), base_is_latest);
-    assert_eq!(after_checksum.crc_source(), CrcSource::AtVersion);
+    assert_eq!(
+        after_checksum.crc_source(),
+        CrcSource::AtVersion {
+            crc_version: LATEST_VERSION
+        }
+    );
 
     // publish() (catalog-managed only) also inherits the base's flag.
     if kind == TableKind::CatalogManaged {
@@ -431,9 +442,15 @@ async fn built_as_latest_is_inherited_by_derived_snapshots(
     assert_eq!(
         post_commit.crc_source(),
         if replay == IncrementalReplay::Unlimited {
-            CrcSource::Reconstructed { on_disk_version: 0 }
+            CrcSource::Reconstructed {
+                on_disk_version: 0,
+                crc_version: 4,
+            }
         } else {
-            CrcSource::Stale { on_disk_version: 0 }
+            CrcSource::Stale {
+                on_disk_version: 0,
+                crc_version: 0,
+            }
         },
     );
 

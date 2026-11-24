@@ -261,7 +261,7 @@ impl Snapshot {
         log_segment: LogSegment,
         table_configuration: TableConfiguration,
     ) -> Result<Self> {
-        let crc = SnapshotCrc::from_parts(None, table_configuration.version(), CrcSource::Unknown);
+        let crc = SnapshotCrc::Unknown;
         Self::new_with_crc(
             log_segment,
             table_configuration,
@@ -271,9 +271,8 @@ impl Snapshot {
         )
     }
 
-    /// Constructs a snapshot from resolved CRC state, classifying its source for the target
-    /// version. The CRC state carries its disk origin through derivations; callers do not
-    /// recompute it.
+    /// Constructs a snapshot from resolved CRC state, checking its bounds at the target version.
+    /// The CRC carries its disk origin through derivations.
     ///
     /// `built_as_latest` records whether the build confirmed this is the latest version
     /// (best-effort). See [`Snapshot::built_as_latest`]. `skipped_new_checkpoints` records the last
@@ -811,10 +810,10 @@ impl Snapshot {
         same_files.then(|| self.known_checkpoint_type()).flatten()
     }
 
-    /// Returns retained checksum provenance without performing engine I/O.
+    /// Returns checksum provenance without performing engine I/O.
     ///
-    /// The value records what snapshot construction observed about checksum files; it does not
-    /// depend on whether the checksum carries complete file statistics.
+    /// A snapshot hint can supply the connector's observation. Kernel checks that claim against
+    /// the hint's CRC and version. Provenance is independent of file-statistics completeness.
     pub fn crc_source(&self) -> CrcSource {
         self.crc.source()
     }
@@ -855,9 +854,7 @@ impl Snapshot {
         self.crc.at_version()
     }
 
-    /// Returns the CRC kept in memory, which may be older than [`Self::version`].
-    /// A returned CRC does not imply that a CRC file exists on disk at that version; commits may
-    /// have been incrementally replayed in memory on top of an older-versioned CRC.
+    /// Returns the in-memory CRC, which may be older than [`Self::version`].
     ///
     /// Prefer [`Self::crc_at_version`] for authoritative queries.
     /// Replaying `allFiles` from this CRC requires applying commits newer than its version.
@@ -1804,7 +1801,7 @@ impl Snapshot {
                 let new_snapshot = Arc::new(Snapshot::new_with_crc(
                     new_log_segment,
                     self.table_configuration().clone(),
-                    SnapshotCrc::from_file(crc),
+                    SnapshotCrc::from_written_crc(crc),
                     self.built_as_latest,
                     self.skipped_new_checkpoints,
                 )?);
@@ -3762,9 +3759,9 @@ mod tests {
     }
 
     #[rstest]
-    #[case::at_version(Some(2), CrcSource::AtVersion, CrcSource::Reconstructed { on_disk_version: 2 })]
-    #[case::reconstructed(Some(2), CrcSource::Reconstructed { on_disk_version: 0 }, CrcSource::Reconstructed { on_disk_version: 0 })]
-    #[case::stale(Some(0), CrcSource::Stale { on_disk_version: 0 }, CrcSource::Stale { on_disk_version: 0 })]
+    #[case::at_version(Some(2), CrcSource::AtVersion { crc_version: 2 }, CrcSource::Reconstructed { on_disk_version: 2, crc_version: 3 })]
+    #[case::reconstructed(Some(2), CrcSource::Reconstructed { on_disk_version: 0, crc_version: 2 }, CrcSource::Reconstructed { on_disk_version: 0, crc_version: 3 })]
+    #[case::stale(Some(0), CrcSource::Stale { on_disk_version: 0, crc_version: 0 }, CrcSource::Stale { on_disk_version: 0, crc_version: 0 })]
     #[case::unknown_stale(Some(0), CrcSource::Unknown, CrcSource::Unknown)]
     #[case::missing(None, CrcSource::Missing, CrcSource::Missing)]
     #[case::unusable(None, CrcSource::Unusable, CrcSource::Unusable)]

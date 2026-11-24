@@ -10,7 +10,7 @@ Key files and call sequences for the exported FFI flows. The boundary rules are 
   with their backing storage and conversions colocated
 - `src/snapshot/builder.rs` -- snapshot builders and their configuration
 - `src/snapshot/hint/` -- typed snapshot-hint input and callback export
-- `src/snapshot/snapshot_crc.rs` -- retained checksum provenance getter and value types
+- `src/snapshot/snapshot_crc.rs` -- checksum provenance getter and value types
 - `src/handle.rs` -- opaque handle system for passing Rust objects across FFI
 - `src/column_default.rs` -- column-default (`allowColumnDefaults`) reads and the write-path ack
 - `src/scan.rs` -- scan FFI interface
@@ -65,10 +65,10 @@ Input hints may omit telemetry; the snapshot then reports `Unknown`. Inconsisten
 reports `Unknown` and does not affect whether the hint is accepted. CRC validation and retention
 are independent of telemetry. See `FfiSnapshotHint` for the claim rules.
 
-Optional fields in `FfiSnapshotHint` use borrowed nullable pointers: `last_checkpoint`, `crc`,
-`checkpoint_type`, and `crc_source`. Null means absent. A null checkpoint type means unknown,
-not that no checkpoint was selected. A supplied type is advisory; naming and protocol take
-precedence, and checkpoint discovery replaces it with the observed type.
+The `last_checkpoint` and `crc` fields in `FfiSnapshotHint` use borrowed nullable pointers.
+`checkpoint_type` and `crc_source` are inline `OptionalValue` fields, with `None` meaning unknown.
+An unknown checkpoint type does not mean no checkpoint was selected. A supplied type is advisory;
+naming and protocol take precedence, and checkpoint discovery replaces it with the observed type.
 
 Export includes an explicit publication watermark,
 preserving absence even when published commits are not represented by the retained paths.
@@ -94,11 +94,13 @@ the type is known from the checkpoint's naming, the table protocol, the snapshot
 discovery. Otherwise it resolves the type through the same snapshot cache as
 `snapshot_checkpoint_info` and declarative scan planning.
 
-`snapshot_crc_source(snapshot, out)` writes the retained `FfiCrcSource` without I/O. It records
+`snapshot_crc_source(snapshot)` returns the snapshot's `FfiCrcSource` by value without I/O. It records
 what construction observed about checksum files, independently of whether file stats are available.
-`Reconstructed` and `Stale` carry the original `on_disk_version`; see `CrcSource` for the variant
-semantics and how to derive the cumulative commit count for `Reconstructed`. The count is not
-publicly derivable for `Stale`. Observations stay fixed after construction.
+`AtVersion`, `Reconstructed`, and `Stale` carry `crc_version`. `Reconstructed` and `Stale` also carry
+the original `on_disk_version`; their difference gives the cumulative number of incorporated
+commits. For `Stale`, subtract `crc_version` from the snapshot version to obtain the remaining gap.
+The returned value owns its version information and does not borrow the snapshot. Observations stay
+fixed after construction.
 
 Snapshot accessors (`ffi/src/lib.rs`) include no-I/O reads such as `version` and
 `snapshot_file_stats`, which returns `OptionalValue<FfiFileStats>` (scalar
@@ -108,7 +110,7 @@ the same file stats: it invokes one callback with borrowed `i64` slices for bin 
 counts, and total bytes; callers must copy values they retain after the callback.
 
 `snapshot_timestamp` uses a synchronous `SnapshotReader` and may read commit JSON when the
-In-Commit Timestamp is unavailable from retained CRC state. Domain-metadata and transaction-version
+In-Commit Timestamp is unavailable from in-memory CRC state. Domain-metadata and transaction-version
 FFI reads also use an unscoped reader, preserving the engine's cancellation and timeout behavior.
 The C API signatures do not expose reader state or a cancellation token.
 

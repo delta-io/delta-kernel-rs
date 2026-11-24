@@ -13,7 +13,7 @@ use crate::handle::Handle;
 use crate::log_path::LogPathArray;
 use crate::panic::catch_panic;
 use crate::snapshot::snapshot_crc::FfiCrcSource;
-use crate::{NullableCvoid, SharedExternEngine, SharedSnapshot};
+use crate::{NullableCvoid, OptionalValue, SharedExternEngine, SharedSnapshot};
 
 mod export;
 
@@ -90,27 +90,30 @@ pub struct FfiSnapshotHint {
     /// Optional `_last_checkpoint` state. Null means absent.
     pub last_checkpoint: *const FfiLastCheckpoint,
     /// Optional CRC state at `version`. Null means absent; older or newer CRCs are rejected.
-    /// A retained CRC does not imply that a CRC file exists on disk at that version; commits may
-    /// have been incrementally replayed in memory on top of an older-versioned CRC.
+    /// This is in-memory state; see `crc_source` for its on-disk origin.
     pub crc: *const FfiCrc,
     /// Whether to infer publication from paths or preserve an explicit observation.
     ///
     /// Export always uses an explicit variant, never `InferFromLogPaths`.
     pub publication_watermark: FfiPublicationWatermark,
-    /// The spec of the checkpoint selected from `log_paths`, if known. Null means unknown, not
+    /// The spec of the checkpoint selected from `log_paths`, if known. `None` means unknown, not
     /// that no checkpoint was selected. Kernel uses it only when the checkpoint's naming and the
     /// table protocol do not decide the type, and the checkpoint's contents replace it once read.
     ///
     /// A claim inconsistent with naming or protocol is ignored.
-    pub checkpoint_type: *const FfiSelectedCheckpointType,
-    /// Optional checksum telemetry. Null means unknown. It does not change CRC validation,
+    /// C callers must set the tag explicitly, using `NoneFfiSelectedCheckpointType` when absent:
+    /// a zero-initialized field is an invalid `Some` payload.
+    pub checkpoint_type: OptionalValue<FfiSelectedCheckpointType>,
+    /// Optional checksum telemetry. `None` means unknown. It does not change CRC validation,
     /// retention, or snapshot success. An inconsistent claim is reported as `Unknown`.
     /// `Missing` and `Unusable` require no CRC. `AtVersion` requires an at-version CRC;
     /// `Reconstructed` requires an at-version CRC and an older `on_disk_version`.
+    /// The reported `crc_version` must match the hinted CRC.
     /// `Stale` is inconsistent with hints, which only accept at-version CRCs.
     /// Export includes the observation, but omitting a stale CRC resets its provenance to
     /// `Unknown`.
-    pub crc_source: *const FfiCrcSource,
+    /// C callers must set the tag explicitly, using `NoneFfiCrcSource` when absent.
+    pub crc_source: OptionalValue<FfiCrcSource>,
 }
 
 fn invalid_with_source(message: impl Into<String>, source: KernelError) -> KernelError {
@@ -177,10 +180,10 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
         last_checkpoint_hint,
         crc,
         freshness,
-        unsafe { value.checkpoint_type.as_ref() }
+        Option::<&FfiSelectedCheckpointType>::from(&value.checkpoint_type)
             .copied()
             .map(Into::into),
-        unsafe { value.crc_source.as_ref() }
+        Option::<&FfiCrcSource>::from(&value.crc_source)
             .copied()
             .map(Into::into),
     )?;

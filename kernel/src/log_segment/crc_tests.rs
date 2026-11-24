@@ -1532,14 +1532,14 @@ async fn test_full_replay_across_two_commits_propagates_all_state() {
 
 // Commits 0-3 (target v3) with an optional CRC at `crc_version`.
 #[rstest]
-#[case::at_target_disabled(Some(3), false, IncrementalReplay::Disabled, CrcSource::AtVersion)]
-#[case::disabled_stale(Some(1), false, IncrementalReplay::Disabled, CrcSource::Stale { on_disk_version: 1 })]
-#[case::up_to_zero(Some(1), false, IncrementalReplay::UpToCommits(0), CrcSource::Stale { on_disk_version: 1 })]
-#[case::interior(Some(2), false, IncrementalReplay::UpToCommits(5), CrcSource::Reconstructed { on_disk_version: 2 })]
-#[case::at_budget(Some(1), false, IncrementalReplay::UpToCommits(2), CrcSource::Reconstructed { on_disk_version: 1 })]
-#[case::over_budget(Some(1), false, IncrementalReplay::UpToCommits(1), CrcSource::Stale { on_disk_version: 1 })]
-#[case::unlimited(Some(0), false, IncrementalReplay::Unlimited, CrcSource::Reconstructed { on_disk_version: 0 })]
-#[case::unlimited_stale(Some(1), false, IncrementalReplay::Unlimited, CrcSource::Reconstructed { on_disk_version: 1 })]
+#[case::at_target_disabled(Some(3), false, IncrementalReplay::Disabled, CrcSource::AtVersion { crc_version: 3 })]
+#[case::disabled_stale(Some(1), false, IncrementalReplay::Disabled, CrcSource::Stale { on_disk_version: 1, crc_version: 1 })]
+#[case::up_to_zero(Some(1), false, IncrementalReplay::UpToCommits(0), CrcSource::Stale { on_disk_version: 1, crc_version: 1 })]
+#[case::interior(Some(2), false, IncrementalReplay::UpToCommits(5), CrcSource::Reconstructed { on_disk_version: 2, crc_version: 3 })]
+#[case::at_budget(Some(1), false, IncrementalReplay::UpToCommits(2), CrcSource::Reconstructed { on_disk_version: 1, crc_version: 3 })]
+#[case::over_budget(Some(1), false, IncrementalReplay::UpToCommits(1), CrcSource::Stale { on_disk_version: 1, crc_version: 1 })]
+#[case::unlimited(Some(0), false, IncrementalReplay::Unlimited, CrcSource::Reconstructed { on_disk_version: 0, crc_version: 3 })]
+#[case::unlimited_stale(Some(1), false, IncrementalReplay::Unlimited, CrcSource::Reconstructed { on_disk_version: 1, crc_version: 3 })]
 #[case::missing(None, false, IncrementalReplay::Unlimited, CrcSource::Missing)]
 #[case::unusable(Some(3), true, IncrementalReplay::Unlimited, CrcSource::Unusable)]
 #[tokio::test]
@@ -1570,7 +1570,7 @@ async fn test_stale_crc_advanced_only_within_replay_budget(
     // Then the checksum version and disk observation agree with the replay result.
     let expected_crc_version = matches!(
         expected_source,
-        CrcSource::AtVersion | CrcSource::Reconstructed { .. }
+        CrcSource::AtVersion { .. } | CrcSource::Reconstructed { .. }
     )
     .then_some(3);
     assert_eq!(snapshot.version(), 3);
@@ -1659,7 +1659,9 @@ async fn pick_latest_base_crc_preserves_source_and_cancellation(
     let engine = CancellableEngine::new(&built.engine, token);
 
     let retained_source = if known_source {
-        CrcSource::AtVersion
+        CrcSource::AtVersion {
+            crc_version: base.version,
+        }
     } else {
         CrcSource::Unknown
     };
@@ -1679,7 +1681,9 @@ async fn pick_latest_base_crc_preserves_source_and_cancellation(
             if expected_version == base.version {
                 retained_source
             } else {
-                CrcSource::AtVersion
+                CrcSource::AtVersion {
+                    crc_version: expected_version,
+                }
             }
         );
     }

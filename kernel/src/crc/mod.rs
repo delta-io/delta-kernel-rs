@@ -67,11 +67,14 @@ use crate::{KernelError, KernelResult, Version};
 /// This struct and its fields are marked `pub`, but the `crc` module is only re-exported as `pub`
 /// when the `internal-api` feature is enabled (otherwise `pub(crate)`). See `kernel/src/lib.rs`.
 // TODO: rename `Crc` to `CrcState` to align with `FileStatsState`, `SetTransactionState`, etc.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct Crc {
     // ===== Required fields =====
     /// The table version this CRC describes.
     pub version: Version,
+    /// Original checksum-file version, preserved through in-memory replay. This observation is
+    /// not part of the file contents or CRC equality. `None` means no disk origin is known.
+    pub(crate) on_disk_version: Option<Version>,
     /// The table [`Metadata`] at this version.
     pub metadata: Metadata,
     /// The table [`Protocol`] at this version.
@@ -144,6 +147,7 @@ impl Crc {
     ) -> KernelResult<Self> {
         let crc = Self {
             version,
+            on_disk_version: None,
             metadata,
             protocol,
             file_stats_state,
@@ -225,6 +229,30 @@ impl Crc {
         self.last_manifest_commit_opt.as_ref()
     }
 }
+
+// Equality compares table state, independently of how its checksum was obtained.
+impl PartialEq for Crc {
+    fn eq(&self, other: &Self) -> bool {
+        let equal = self.version == other.version
+            && self.metadata == other.metadata
+            && self.protocol == other.protocol
+            && self.file_stats_state == other.file_stats_state
+            && self.in_commit_timestamp_opt == other.in_commit_timestamp_opt
+            && self.set_transaction_state == other.set_transaction_state
+            && self.domain_metadata_state == other.domain_metadata_state
+            && self.all_files == other.all_files
+            && self.txn_id == other.txn_id
+            && self.num_deleted_records_opt == other.num_deleted_records_opt
+            && self.num_deletion_vectors_opt == other.num_deletion_vectors_opt
+            && self.deleted_record_counts_histogram_opt
+                == other.deleted_record_counts_histogram_opt;
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let equal = equal && self.last_manifest_commit_opt == other.last_manifest_commit_opt;
+        equal
+    }
+}
+
+impl Eq for Crc {}
 
 /// Refuses to serialize a degraded (non-`Complete`) CRC, so an invalid state can never
 /// round-trip through disk.
@@ -737,6 +765,7 @@ mod tests {
         Crc, CrcRaw, DeletedRecordCountsHistogram, DomainMetadataState,
         ENABLE_IN_COMMIT_TIMESTAMPS, FileStats, FileStatsState, SetTransactionState,
     };
+    use crate::Version;
     #[cfg(feature = "adaptive-metadata-in-dev")]
     use crate::actions::LastManifestCommit;
     use crate::actions::{Add, DomainMetadata, Protocol, SetTransaction};
@@ -868,6 +897,35 @@ mod tests {
             crc.domain_metadata_state,
             DomainMetadataState::Partial(HashMap::new())
         );
+    }
+
+    #[rstest]
+    #[case::unknown(None)]
+    #[case::reconstructed(Some(1))]
+    #[case::at_version(Some(3))]
+    fn disk_origin_does_not_change_equality_or_serialized_contents(
+        #[case] on_disk_version: Option<Version>,
+    ) {
+        // Given identical CRC contents with different disk-origin observations.
+        let mut original = crc_with(
+            SetTransactionState::default(),
+            DomainMetadataState::default(),
+        );
+        original.version = 3;
+        let mut observed = original.clone();
+        observed.on_disk_version = on_disk_version;
+
+        // When serializing the observed CRC and parsing its contents without a file read.
+        let bytes = serde_json::to_vec(&observed).unwrap();
+        let parsed = Crc::try_from_json_bytes(&bytes, observed.version).unwrap();
+
+        // Then telemetry affects neither contents nor equality and is not inferred from JSON.
+        assert_eq!(observed, original);
+        assert_eq!(bytes, serde_json::to_vec(&original).unwrap());
+        assert_eq!(parsed, original);
+        assert_eq!(parsed.on_disk_version, None);
+        observed.version += 1;
+        assert_ne!(observed, original);
     }
 
     #[test]

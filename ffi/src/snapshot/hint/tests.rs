@@ -280,8 +280,8 @@ fn test_snapshot_hint(
         last_checkpoint: std::ptr::null(),
         crc: std::ptr::null(),
         publication_watermark: FfiPublicationWatermark::InferFromLogPaths,
-        checkpoint_type: std::ptr::null(),
-        crc_source: std::ptr::null(),
+        checkpoint_type: OptionalValue::None,
+        crc_source: OptionalValue::None,
     }
 }
 
@@ -496,7 +496,7 @@ fn hint_checkpoint_type_round_trips_without_io(#[case] checkpoint_type: FfiSelec
         reader_features: feature_list(),
         writer_features: feature_list(),
     };
-    hint.checkpoint_type = &checkpoint_type;
+    hint.checkpoint_type = OptionalValue::Some(checkpoint_type);
     let builder = unsafe {
         ok_or_panic(snapshot_builder_with_snapshot_hint(
             test_builder(&engine),
@@ -1635,8 +1635,8 @@ fn aggregate_with_rejects_null_nonempty_log_path_array() {
         last_checkpoint: std::ptr::null(),
         crc: std::ptr::null(),
         publication_watermark: FfiPublicationWatermark::InferFromLogPaths,
-        checkpoint_type: std::ptr::null(),
-        crc_source: std::ptr::null(),
+        checkpoint_type: OptionalValue::None,
+        crc_source: OptionalValue::None,
     };
     let result = unsafe { snapshot_builder_with_snapshot_hint(builder, &hint) };
     assert_extern_result_error_contains(
@@ -2419,18 +2419,22 @@ fn build_rejects_internally_supplied_hint_for_existing_snapshot_builder() {
 }
 
 #[rstest::rstest]
-#[case::at_version(Some(2), CrcSource::AtVersion, CrcSource::AtVersion)]
-#[case::reconstructed(Some(2), CrcSource::Reconstructed { on_disk_version: 0 }, CrcSource::Reconstructed { on_disk_version: 0 })]
-#[case::missing(None, CrcSource::Missing, CrcSource::Missing)]
-#[case::unusable(None, CrcSource::Unusable, CrcSource::Unusable)]
-#[case::unknown(Some(2), CrcSource::Unknown, CrcSource::Unknown)]
-#[case::unknown_absent(None, CrcSource::Unknown, CrcSource::Unknown)]
-#[case::inconsistent(Some(2), CrcSource::Missing, CrcSource::Unknown)]
-#[case::future_disk_version(Some(2), CrcSource::Reconstructed { on_disk_version: 3 }, CrcSource::Unknown)]
-#[case::stale_at_version(Some(2), CrcSource::Stale { on_disk_version: 0 }, CrcSource::Unknown)]
+#[case::at_version(Some(2), Some(CrcSource::AtVersion { crc_version: 2 }), CrcSource::AtVersion { crc_version: 2 })]
+#[case::reconstructed(Some(2), Some(CrcSource::Reconstructed { on_disk_version: 0, crc_version: 2 }), CrcSource::Reconstructed { on_disk_version: 0, crc_version: 2 })]
+#[case::missing(None, Some(CrcSource::Missing), CrcSource::Missing)]
+#[case::unusable(None, Some(CrcSource::Unusable), CrcSource::Unusable)]
+#[case::unknown(Some(2), Some(CrcSource::Unknown), CrcSource::Unknown)]
+#[case::unknown_absent(None, Some(CrcSource::Unknown), CrcSource::Unknown)]
+#[case::inconsistent(Some(2), Some(CrcSource::Missing), CrcSource::Unknown)]
+#[case::future_disk_version(Some(2), Some(CrcSource::Reconstructed { on_disk_version: 3, crc_version: 2 }), CrcSource::Unknown)]
+#[case::at_version_wrong_crc_version(Some(2), Some(CrcSource::AtVersion { crc_version: 1 }), CrcSource::Unknown)]
+#[case::reconstructed_wrong_crc_version(Some(2), Some(CrcSource::Reconstructed { on_disk_version: 0, crc_version: 1 }), CrcSource::Unknown)]
+#[case::stale_at_version(Some(2), Some(CrcSource::Stale { on_disk_version: 0, crc_version: 2 }), CrcSource::Unknown)]
+#[case::omitted(Some(2), None, CrcSource::Unknown)]
+#[case::omitted_absent(None, None, CrcSource::Unknown)]
 fn checksum_telemetry_round_trips_without_changing_hint_state(
     #[case] crc_version: Option<u64>,
-    #[case] source: CrcSource,
+    #[case] source: Option<CrcSource>,
     #[case] expected: CrcSource,
 ) {
     // Given an upstream-valid hint with optional CRC telemetry.
@@ -2443,10 +2447,10 @@ fn checksum_telemetry_round_trips_without_changing_hint_state(
     .map(|path| FfiLogPath::new(slice(path), 123, 456));
     let mut crc = empty_crc();
     crc.version = 2;
-    let ffi_provenance = source.into();
+    let ffi_provenance = source.map(Into::into).into();
     let hint = FfiSnapshotHint {
         crc: crc_version.map_or(std::ptr::null(), |_| &crc),
-        crc_source: &ffi_provenance,
+        crc_source: ffi_provenance,
         ..test_snapshot_hint(&paths, 2, FfiSnapshotHintFreshness::Unverified)
     };
 
@@ -2459,11 +2463,10 @@ fn checksum_telemetry_round_trips_without_changing_hint_state(
     };
     let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
     let rebuilt = rebuild_through_visitor(&snapshot, &engine);
-    let mut observed = std::mem::MaybeUninit::uninit();
-    unsafe { snapshot_crc_source(rebuilt.shallow_copy(), observed.as_mut_ptr()) };
+    let observed = unsafe { snapshot_crc_source(rebuilt.shallow_copy()) };
 
     // Then telemetry survives, invalid claims become Unknown, and CRC presence is unchanged.
-    assert_eq!(unsafe { observed.assume_init() }, expected.into());
+    assert_eq!(observed, expected.into());
     let rebuilt_ref = unsafe { rebuilt.as_ref() };
     assert_eq!(
         rebuilt_ref.crc_at_version().map(|crc| crc.version),

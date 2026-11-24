@@ -36,13 +36,15 @@ pub(crate) fn try_read_crc_file(
         })?
         .inspect_err(record_storage_failure)?;
     tracing::Span::current().record("bytes_read", data.len() as u64);
-    Crc::try_from_json_bytes(&data, crc_path.version).inspect_err(|_| {
+    let mut crc = Crc::try_from_json_bytes(&data, crc_path.version).inspect_err(|_| {
         record_failure_reason(if data.is_empty() {
             CrcReadFailureReason::Empty
         } else {
             CrcReadFailureReason::Parsing
         });
-    })
+    })?;
+    crc.on_disk_version = Some(crc_path.version);
+    Ok(crc)
 }
 
 /// Read an optional CRC, propagating cancellation and ignoring other read failures.
@@ -144,6 +146,7 @@ mod tests {
 
     #[test]
     fn test_read_crc_file() {
+        // Given a checksum file and a reporter capturing its read.
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
@@ -151,10 +154,11 @@ mod tests {
         let table_root = test_table_root("./tests/data/crc-full/");
         let crc_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
 
-        // Read and parse the CRC file
+        // When reading and parsing the checksum file.
         let crc = try_read_crc_file(&engine, &crc_path).unwrap();
 
-        // Verify basic fields
+        // Then its disk origin, contents, and read telemetry are captured.
+        assert_eq!(crc.on_disk_version, Some(crc_path.version));
         let stats = crc.file_stats().unwrap();
         assert_eq!(stats.table_size_bytes(), 5259);
         assert_eq!(stats.num_files(), 10);

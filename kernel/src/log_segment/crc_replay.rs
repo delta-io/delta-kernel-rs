@@ -38,7 +38,7 @@ use crate::schema::{
     ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec, SchemaRef, StructField,
     StructType, column_name, lazy_schema_ref,
 };
-use crate::snapshot::{CrcSource, IncrementalReplay, SnapshotCrc};
+use crate::snapshot::{IncrementalReplay, SnapshotCrc};
 use crate::utils::require;
 use crate::{Engine, FileMeta, KernelError, KernelResult, RowVisitor, Version};
 
@@ -106,33 +106,34 @@ impl LogSegment {
         let advanced = Arc::new(self.build_crc_from_base(engine, base_crc)?);
         let resolution =
             PmResolution::from_crc(&advanced, ProtocolMetadataSource::CrcAdvancedByReplay);
-        Ok(Some((
-            base.with_replayed_crc(advanced, self.end_version),
-            resolution,
-        )))
+        Ok(Some((SnapshotCrc::new(advanced), resolution)))
     }
 
-    /// Picks the newest usable CRC, preserving source information for a retained CRC.
-    /// Falls back to the retained CRC on a failed disk read, except cancellation, and drops a
+    /// Picks the newest usable CRC, preserving the in-memory CRC's disk origin.
+    /// Falls back to the in-memory CRC on a failed disk read, except cancellation, and drops a
     /// selected CRC below the checkpoint. Absence observations describe this segment's listing.
     pub(crate) fn pick_latest_base_crc(
         &self,
         engine: &dyn Engine,
-        retained: Option<&SnapshotCrc>,
+        in_memory_base: Option<&SnapshotCrc>,
     ) -> KernelResult<SnapshotCrc> {
-        let in_memory_base = retained.and_then(SnapshotCrc::as_ref);
+        let in_memory_crc = in_memory_base.and_then(SnapshotCrc::as_ref);
         let preferred_disk_crc = self
             .listed
             .latest_crc_file
             .as_ref()
-            .filter(|f| in_memory_base.is_none_or(|m| f.version > m.version));
+            .filter(|f| in_memory_crc.is_none_or(|m| f.version > m.version));
         let disk_crc = preferred_disk_crc
             .map(|file| read_crc_file_or_none(engine, file))
             .transpose()?
             .flatten();
         let selected = disk_crc
-            .map(SnapshotCrc::from_file)
-            .or_else(|| retained.filter(|state| state.as_ref().is_some()).cloned())
+            .map(SnapshotCrc::new)
+            .or_else(|| {
+                in_memory_base
+                    .filter(|state| state.as_ref().is_some())
+                    .cloned()
+            })
             .filter(|state| {
                 state.as_ref().is_some_and(|crc| {
                     self.checkpoint_version
@@ -140,12 +141,11 @@ impl LogSegment {
                 })
             });
         Ok(selected.unwrap_or_else(|| {
-            let source = if self.listed.latest_crc_file.is_some() {
-                CrcSource::Unusable
+            if self.listed.latest_crc_file.is_some() {
+                SnapshotCrc::Unusable
             } else {
-                CrcSource::Missing
-            };
-            SnapshotCrc::from_parts(None, self.end_version, source)
+                SnapshotCrc::Missing
+            }
         }))
     }
 
