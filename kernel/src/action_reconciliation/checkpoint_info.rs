@@ -731,10 +731,13 @@ mod tests {
         let exec = CountingExecutor::new();
 
         // When: checkpoint metadata is resolved from the hint.
-        let checkpoint_info = CheckpointInfo::resolve(&exec, &segment)
-            .unwrap()
-            .result
-            .unwrap();
+        let resolved = CheckpointInfo::resolve(&exec, &segment).unwrap();
+        let metrics = resolved.metrics;
+        let checkpoint_info = resolved.result.unwrap();
+        assert_eq!(metrics.source, Some(CheckpointSource::Resolved));
+        assert_eq!(metrics.root_footer_calls, 0);
+        assert_eq!(metrics.sidecar_footer_calls, 1);
+        assert_eq!(metrics.metadata_query_calls, 0);
 
         // Then: only the missing sidecar schema requires I/O.
         assert_eq!(checkpoint_info.kind(), CheckpointKind::Manifest);
@@ -1197,6 +1200,14 @@ mod tests {
         // When: a getter initializes metadata, followed by another reader.
         let info = resolve_checkpoint_info(&snapshot, &counted);
         let cached = resolve_checkpoint_info(&snapshot, &counted);
+        let resolved = snapshot.checkpoint_info_with_metrics(&counted).unwrap();
+        let metrics = resolved.metrics;
+        assert_eq!(metrics.source, Some(CheckpointSource::SnapshotCache));
+        assert_eq!(metrics.root_footer_calls, 0);
+        assert_eq!(metrics.sidecar_footer_calls, 0);
+        assert_eq!(metrics.metadata_query_calls, 0);
+        assert!(Arc::ptr_eq(&resolved.result.unwrap(), &cached));
+        assert!(Arc::ptr_eq(metrics.info.as_ref().unwrap(), &cached));
 
         // Then: readers share one complete result, whose allocations count toward snapshot size.
         assert!(Arc::ptr_eq(&info, &cached));
@@ -1269,6 +1280,18 @@ mod tests {
         };
         assert!(snapshot.known_checkpoint_type().is_none());
         assert!(read(&snapshot, &missing).is_err());
+        let resolved = snapshot.checkpoint_info_with_metrics(&missing).unwrap();
+        assert!(resolved.result.is_err());
+        let metrics = resolved.metrics;
+        assert_eq!(
+            Some(metrics.version),
+            snapshot.log_segment().checkpoint_version
+        );
+        assert!(metrics.info.is_none());
+        assert!(metrics.source.is_none());
+        assert_eq!(metrics.root_footer_calls, 0);
+        assert_eq!(metrics.sidecar_footer_calls, 0);
+        assert_eq!(metrics.metadata_query_calls, 0);
         assert!(snapshot.cached_checkpoint_info().is_none());
 
         // When: a working executor retries the same getter.
@@ -1410,10 +1433,15 @@ mod tests {
         let exec = CountingExecutor::new();
 
         // When: discovery reads the malformed metadata.
-        let error = CheckpointInfo::resolve(&exec, &segment)
-            .unwrap()
-            .result
-            .unwrap_err();
+        let resolved = CheckpointInfo::resolve(&exec, &segment).unwrap();
+        let metrics = resolved.metrics;
+        let error = resolved.result.unwrap_err();
+        assert_eq!(metrics.version, root.version);
+        assert!(metrics.info.is_none());
+        assert_eq!(metrics.source, Some(CheckpointSource::Resolved));
+        assert_eq!(metrics.root_footer_calls, 0);
+        assert_eq!(metrics.sidecar_footer_calls, 0);
+        assert_eq!(metrics.metadata_query_calls, 1);
 
         // Then: resolution reports the specific metadata error.
         assert!(error.to_string().contains(expected_error), "{error}");
@@ -1490,6 +1518,7 @@ mod tests {
                 .is_some()
         );
         assert!(matches!(snapshot.cached_checkpoint_info(), Some(None)));
+        assert!(snapshot.checkpoint_info_with_metrics(&engine).is_none());
 
         // Then: the getters share the cached absence without requiring an executor.
         assert_eq!(
@@ -1715,7 +1744,19 @@ mod tests {
                 .declarative_metadata_scan_plan(&engine)
                 .unwrap_err()
         } else {
-            snapshot.reader().get_checkpoint_info(&engine).unwrap_err()
+            let resolved = snapshot.checkpoint_info_with_metrics(&engine).unwrap();
+            let metrics = resolved.metrics;
+            assert_eq!(
+                Some(metrics.version),
+                snapshot.log_segment().checkpoint_version
+            );
+            assert_eq!(metrics.checkpoint_type, snapshot.known_checkpoint_type());
+            assert!(metrics.info.is_none());
+            assert_eq!(metrics.source, Some(CheckpointSource::Resolved));
+            assert_eq!(metrics.root_footer_calls, 0);
+            assert_eq!(metrics.sidecar_footer_calls, 0);
+            assert_eq!(metrics.metadata_query_calls, 1);
+            resolved.result.unwrap_err()
         };
 
         // Then: the partial result is discarded, so the getter can retry the complete read.
