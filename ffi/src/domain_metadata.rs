@@ -1,10 +1,10 @@
 use delta_kernel::KernelResult;
 use delta_kernel::snapshot::Snapshot;
+use delta_kernel_ffi_macros::ffi_export;
 
-use crate::error::{ExternResult, IntoExternResult};
+use crate::error::ExternResult;
 use crate::expressions::kernel_visitor::NullTypeTag;
 use crate::handle::Handle;
-use crate::panic::catch_panic;
 use crate::{
     AllocateStringFn, ExternEngine, KernelStringSlice, NullableCvoid, OptionalValue,
     SharedExternEngine, SharedSnapshot, TryFromStringSlice, kernel_string_slice,
@@ -22,6 +22,7 @@ const _: [(); 1] = [(); (ROW_TRACKING_INITIAL_HIGH_WATER_MARK
 /// # Safety
 ///
 /// Caller is responsible for passing in a valid handle
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_domain_metadata(
     snapshot: Handle<SharedSnapshot>,
@@ -29,14 +30,10 @@ pub unsafe extern "C" fn get_domain_metadata(
     engine: Handle<SharedExternEngine>,
     allocate_fn: AllocateStringFn,
 ) -> ExternResult<NullableCvoid> {
-    let result = catch_panic(|| {
-        let snapshot = unsafe { snapshot.as_ref() };
-        let engine = unsafe { engine.as_ref() };
-        let domain = unsafe { String::try_from_slice(&domain) };
-
-        get_domain_metadata_impl(snapshot, domain, engine, allocate_fn)
-    });
-    unsafe { result.into_extern_result(&engine.as_ref()) }
+    let snapshot = unsafe { snapshot.as_ref() };
+    let engine = unsafe { engine.as_ref() };
+    let domain = unsafe { String::try_from_slice(&domain) };
+    get_domain_metadata_impl(snapshot, domain, engine, allocate_fn)
 }
 
 fn get_domain_metadata_impl(
@@ -61,20 +58,18 @@ fn get_domain_metadata_impl(
 /// # Safety
 ///
 /// Caller is responsible for passing valid snapshot and engine handles.
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_row_tracking_high_water_mark(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<OptionalValue<i64>> {
-    let result = catch_panic(|| {
-        let engine_ref = unsafe { engine.as_ref() };
-        let snapshot = unsafe { snapshot.as_ref() };
-        snapshot
-            .reader()
-            .get_row_tracking_high_water_mark(engine_ref.engine().as_ref())
-            .map(OptionalValue::from)
-    });
-    unsafe { result.into_extern_result(&engine.as_ref()) }
+    let engine_ref = unsafe { engine.as_ref() };
+    let snapshot = unsafe { snapshot.as_ref() };
+    snapshot
+        .reader()
+        .get_row_tracking_high_water_mark(engine_ref.engine().as_ref())
+        .map(OptionalValue::from)
 }
 
 /// Signature of the callback invoked once per clustering column by
@@ -121,6 +116,7 @@ pub type ClusteringColumnVisitor = extern "C" fn(
 /// Caller is responsible for passing in a valid snapshot and engine handle, a valid
 /// `engine_context` opaque pointer forwarded to each `visitor` invocation, and a valid
 /// `visitor` function pointer.
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_clustering_columns(
     snapshot: Handle<SharedSnapshot>,
@@ -128,12 +124,9 @@ pub unsafe extern "C" fn visit_clustering_columns(
     engine_context: NullableCvoid,
     visitor: ClusteringColumnVisitor,
 ) -> ExternResult<OptionalValue<usize>> {
-    let result = catch_panic(|| {
-        let snapshot = unsafe { snapshot.as_ref() };
-        let engine = unsafe { engine.as_ref() };
-        visit_clustering_columns_impl(snapshot, engine, engine_context, visitor)
-    });
-    unsafe { result.into_extern_result(&engine.as_ref()) }
+    let snapshot = unsafe { snapshot.as_ref() };
+    let engine = unsafe { engine.as_ref() };
+    visit_clustering_columns_impl(snapshot, engine, engine_context, visitor)
 }
 
 fn visit_clustering_columns_impl(
@@ -170,6 +163,7 @@ fn visit_clustering_columns_impl(
 /// # Safety
 ///
 /// Caller is responsible for passing in a valid handle
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_domain_metadata(
     snapshot: Handle<SharedSnapshot>,
@@ -181,13 +175,9 @@ pub unsafe extern "C" fn visit_domain_metadata(
         configuration: KernelStringSlice,
     ),
 ) -> ExternResult<bool> {
-    let result = catch_panic(|| {
-        let snapshot = unsafe { snapshot.as_ref() };
-        let engine = unsafe { engine.as_ref() };
-
-        visit_domain_metadata_impl(snapshot, engine, engine_context, visitor)
-    });
-    unsafe { result.into_extern_result(&engine.as_ref()) }
+    let snapshot = unsafe { snapshot.as_ref() };
+    let engine = unsafe { engine.as_ref() };
+    visit_domain_metadata_impl(snapshot, engine, engine_context, visitor)
 }
 
 fn visit_domain_metadata_impl(
