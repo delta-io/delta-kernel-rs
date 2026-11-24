@@ -27,7 +27,7 @@ use delta_kernel::{
     EngineData, KernelError, KernelResult, PlanBuilder, PlanExecutor, PlanExecutorExt, PlanResult,
 };
 use rstest::rstest;
-use test_utils::{IntoArray, generate_batch};
+use test_utils::{IntoArray, assert_result_error_with_message, generate_batch};
 
 macro_rules! result_row {
     ($(#[$attr:meta])* $vis:vis struct $name:ident { $($fields:tt)* }) => {
@@ -358,15 +358,29 @@ fn schema_mismatch_is_rejected_before_execution(#[case] actual: StructType) -> K
     Ok(())
 }
 
+fn null_batch<T: ToSchema>() -> RecordBatch {
+    let schema = empty_batch::<T>().unwrap().schema();
+    generate_batch(
+        schema
+            .fields()
+            .iter()
+            .map(|field| (field.name(), new_null_array(field.data_type(), 1))),
+    )
+    .unwrap()
+}
+
 #[rstest]
-#[case::missing(vec![("id", vec![1].into_arrow_array())])]
-#[case::wrong_type(vec![("id", vec!["one"].into_arrow_array()), ("label", new_null_array(&ArrowDataType::Utf8, 1))])]
-#[case::required_null(vec![("id", new_null_array(&ArrowDataType::Int32, 1)), ("label", new_null_array(&ArrowDataType::Utf8, 1))])]
-fn invalid_batch_fields_are_rejected(#[case] columns: Vec<(&str, ArrayRef)>) -> KernelResult<()> {
-    let batch = generate_batch(columns)?;
-    let result = execute_result::<Vec<TestRow>>(data(vec![Ok(batch)]), TestRow::schema_ref());
-    assert!(result.is_err());
-    Ok(())
+#[case::missing(execute_rows::<Vec<TestRow>>, generate_batch([("id", vec![1].into_arrow_array())]).unwrap(), "Column label not found")]
+#[case::wrong_type(execute_rows::<Vec<TestRow>>, generate_batch([("id", vec!["one"].into_arrow_array()), ("label", new_null_array(&ArrowDataType::Utf8, 1))]).unwrap(), "Type mismatch on id: expected int")]
+#[case::required_null(execute_rows::<Vec<TestRow>>, null_batch::<TestRow>(), "field \"id\" cannot be null")]
+#[case::required_null_list(execute_rows::<Vec<StringList>>, null_batch::<StringList>(), "field \"tags\" cannot be null")]
+#[case::required_null_map(execute_rows::<Vec<StringMap>>, null_batch::<StringMap>(), "field \"attrs\" cannot be null")]
+fn invalid_batch_fields_are_rejected<T: Debug>(
+    #[case] convert: fn(Vec<KernelResult<RecordBatch>>) -> KernelResult<Vec<T>>,
+    #[case] batch: RecordBatch,
+    #[case] expected_message: &str,
+) {
+    assert_result_error_with_message(convert(vec![Ok(batch)]), expected_message);
 }
 
 #[derive(Debug, PartialEq, DeriveToSchema, TryFromStructData)]

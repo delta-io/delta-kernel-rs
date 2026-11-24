@@ -17,8 +17,8 @@ impl<T: TryFromStructRows> RowVisitor for StructVisitor<'_, T> {
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
         if getters.len() != T::Row::leaf_columns().as_ref().0.len() {
-            return Err(KernelError::missing_column(
-                "Expected one getter for each result leaf",
+            return Err(KernelError::internal_error(
+                "Result getter count disagrees with the validated leaf schema",
             ));
         }
         let schema = T::Row::schema_ref();
@@ -123,8 +123,9 @@ fn read_scalar<'a>(
             ))
         }),
         _ => {
-            return Err(KernelError::unsupported(format!(
-                "Plan result field {name}"
+            return Err(KernelError::internal_error(format!(
+                "Unexpected type {} for result field {name} after schema validation",
+                field.data_type()
             )));
         }
     };
