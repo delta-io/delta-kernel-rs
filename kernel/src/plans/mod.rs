@@ -37,7 +37,42 @@
 //!
 //! Every operator, expression, and predicate a plan contains must be handled; returning an error
 //! for an unsupported one is fine, and kernel surfaces it to the caller. The sync engine's
-//! `SyncPlanExecutor` is a complete reference implementation.
+//! `SyncPlanExecutor` is a functionally complete test engine. Where SQL engines differ, on
+//! floating-point ordering for instance, it does not define the semantics an engine must match;
+//! the rules below and each operator's docs do.
+//!
+//! # Semantics and responsibilities
+//!
+//! A [`Plan`] from [`PlanBuilder::build`] is schema-valid: every column reference resolves, every
+//! operator has the input count its docs state, and every operator that reshapes rows carries its
+//! declared output schema. An executor may rely on that instead of re-validating the graph. It must
+//! still return an error for any operator, expression, or predicate it does not support.
+//!
+//! Declared schemas fix field names, order, nesting, and types, and an executor must reproduce them
+//! exactly. Declared nullability describes kernel's output; an executor need not enforce it
+//! at interior nodes. Wherever kernel depends on a value being non-NULL, the plan carries an
+//! explicit `IS NOT NULL` filter or guard, so an executor whose analyzer widens interior columns to
+//! nullable changes no result, and one that rejects a NULL there early is also conformant. Kernel
+//! itself relies on nullability only at the terminal result it consumes: it reads the fields it
+//! requires with non-null accessors, and a NULL there is an error. A scan may therefore return NULL
+//! for a missing field even where `schema` declares it non-nullable; see [`ScanParquet`].
+//!
+//! Kernel performs no implicit type coercion. Join keys and union inputs have identical declared
+//! types on both sides, and kernel inserts explicit casts where it needs a different type. Join
+//! keys contain no floating-point, map, variant, or user-defined type at any nesting level, and a
+//! [`SemiJoin`] always has at least one key pair, so no plan expresses a cross product. Key
+//! equality is NULL-safe at every nesting level.
+//!
+//! Arithmetic follows ANSI SQL where ANSI defines the operation: integer overflow in
+//! [`BinaryExpressionOp`] arithmetic, [`PrefixSum`], and [`Agg::sum`] is an error, never a silent
+//! wrap, and integer division by zero is an error. Kernel-built plans contain no
+//! [`CastExpression`]; plan serialization lowers one to an unknown expression executors may reject.
+//!
+//! No operator output is ordered unless its docs say so, and no aggregate depends on input order.
+//! Kernel uses [`Agg::first_non_null`] only where every non-NULL candidate is equally acceptable.
+//!
+//! Executors may reorder, fold, prune, and share subplans. The one caveat is that multiple writes
+//! to one destination are undefined; see [`WriteJson`].
 //!
 //! # Consuming terminal results
 //!
@@ -52,12 +87,21 @@
 //!
 //! Connectors should use this native path when they own the result and adapting it through
 //! [`EngineData`] adds no semantic value. The native path must preserve the plan's relational
-//! semantics and declared output schema. Schema validation, streaming behavior, error propagation,
-//! and cancellation must work the same way as they do on the generic path.
+//! semantics and declared output schema, and apply the terminal-result nullability rule above at
+//! the connector's own result boundary. Streaming behavior, error propagation, and cancellation
+//! must work the same way as they do on the generic path.
 //!
 //! The generic [`PlanExecutor`] path remains required for operations whose results kernel consumes.
 //!
 //! [`Scan::declarative_metadata_scan_plan`]: crate::scan::Scan::declarative_metadata_scan_plan
+//! [`ScanParquet`]: ir::nodes::ScanParquet
+//! [`SemiJoin`]: ir::nodes::SemiJoin
+//! [`WriteJson`]: ir::nodes::WriteJson
+//! [`PrefixSum`]: ir::nodes::PrefixSum
+//! [`Agg::sum`]: ir::nodes::Agg::sum
+//! [`Agg::first_non_null`]: ir::nodes::Agg::first_non_null
+//! [`BinaryExpressionOp`]: crate::expressions::BinaryExpressionOp
+//! [`CastExpression`]: crate::expressions::CastExpression
 //!
 //! # Where to look
 //!
@@ -130,6 +174,22 @@ pub trait ScopedPlanExecutor: PlanExecutor {
     fn execute_and_retain(&self, name: &str, plan: Plan) -> KernelResult<RelationRef>;
 }
 
+// OPEN QUESTION #2: What does a NULL in a field the plan's schema declares non-nullable mean at a
+// terminal result? DSv2 performs no check: it hands kernel Arrow batches whose nullability flags
+// come from Catalyst's analysis, after dropping rows whose every field is NULL, and kernel errors
+// when a visitor reads a required field that is NULL.
+// OPTION 1 (chosen; matches DSv2): An error when kernel reads the field. Kernel's row visitors
+//   already read required fields with non-null accessors, so no new check is needed, and a result
+//   that would otherwise drop or misread a file fails loudly. Cons: the error is late and generic,
+//   a required field kernel never reads can hold NULL unnoticed, and an interior node that needs
+//   a non-null value for correctness is not covered; the plan must carry its own guard there. No
+//   kernel plan has such a node.
+// OPTION 2: Accept the NULL as a value. Lenient toward engines that cannot express non-nullable
+//   schemas. Cons: a malformed Delta log or an engine bug yields a wrong result instead of an
+//   error.
+// OPTION 3: Error in the executor, before kernel reads the batch. Earliest detection. Cons: every
+//   executor must add a per-batch nullability check that kernel does not otherwise need, and DSv2
+//   would need one today.
 /// The result of executing an [`Operation`].
 ///
 /// Each variant describes a different shape of output that a plan can possibly produce.
