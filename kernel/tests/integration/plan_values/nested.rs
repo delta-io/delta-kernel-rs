@@ -33,7 +33,6 @@ result_row! { pub(super) struct SimpleNestedRow { pub(super) nested: FlatRow } }
 result_row! { struct RequiredParent { before: i32, nested: NullableChild, after: i32 } }
 result_row! { struct OptionalParent { before: i32, nested: Option<NullableChild>, after: i32 } }
 result_row! { #[derive(Default)] pub(super) struct EmptyRow {} }
-result_row! { #[derive(Default)] pub(super) struct EmptyNested { nested: EmptyRow } }
 result_row! { struct NullableChild { child: Option<FlatRow> } }
 result_row! { pub(super) struct NullableDescendant { nested: NullableChild } }
 #[derive(Debug, PartialEq, DeriveToSchema, TryFromStructData)]
@@ -178,38 +177,8 @@ fn empty_top_level_rows_remain_supported(#[values(0, 1, 2)] count: usize) -> Ker
     Ok(())
 }
 
-result_row! { struct OptionalEmptyNested { nested: Option<EmptyRow> } }
-
-#[rstest]
-#[case::required(|nested: Option<EmptyRow>| nested.map(|nested| EmptyNested { nested }))]
-#[case::optional(|nested| Some(OptionalEmptyNested { nested }))]
-fn empty_nested_structs_follow_parent_validity<T>(
-    #[case] expected: fn(Option<EmptyRow>) -> Option<T>,
-    #[values(false, true)] present: bool,
-) -> KernelResult<()>
-where
-    T: ToSchema + TryFrom<StructData, Error = KernelError> + Debug + PartialEq,
-{
-    let nested = StructArray::new_empty_fields(1, Some(NullBuffer::from(vec![present])));
-    let batch =
-        RecordBatch::try_from_iter_with_nullable([("nested", Arc::new(nested) as ArrayRef, true)])?;
-    let actual = super::execute_result::<Vec<T>>(data(vec![Ok(batch)]), T::schema_ref());
-    match expected(present.then_some(EmptyRow {})) {
-        Some(expected) => assert_eq!(actual?, vec![expected]),
-        None => assert!(matches!(
-            actual.unwrap_err().without_backtrace(),
-            KernelError::InvalidStructData(message) if message.contains("nested")
-        )),
-    }
-    Ok(())
-}
-
 #[rstest]
 #[case::optional_parent(execute_rows::<Vec<OptionalParent>>, OptionalParent::to_schema)]
-#[case::empty_parent(execute_rows::<Vec<EmptyNested>>, EmptyNested::to_schema)]
-#[case::optional_empty_parent(
-    execute_rows::<Vec<OptionalEmptyNested>>, OptionalEmptyNested::to_schema,
-)]
 #[case::nullable_descendant(
     execute_rows::<Vec<NullableDescendant>>, NullableDescendant::to_schema,
 )]

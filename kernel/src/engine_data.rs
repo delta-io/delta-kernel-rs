@@ -572,7 +572,7 @@ pub trait RowVisitor {
 ///   }
 ///   #[cfg(feature = "declarative-plans")]
 ///   fn is_null(&self, name: &ColumnName) -> KernelResult<Vec<bool>> {
-///     todo!() // check each row for nullness of the selected field or a struct ancestor
+///     todo!() // return one logical nullness flag per row for the selected field
 ///   }
 /// }
 /// ```

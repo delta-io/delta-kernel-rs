@@ -122,6 +122,7 @@ pub(crate) fn ensure_supported(field: &StructField) -> KernelResult<()> {
                 && map.value_type() == &DataType::STRING
                 && !map.value_contains_null()
         }
+        DataType::Struct(fields) if fields.num_fields() == 0 => false,
         DataType::Struct(fields) => {
             for field in fields.fields() {
                 ensure_supported(field)?;

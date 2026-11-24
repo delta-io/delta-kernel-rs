@@ -49,6 +49,7 @@ result_row! { struct Containers {
 } }
 result_row! { struct IntegerList { value: Vec<i32> } }
 result_row! { struct NestedStruct { value: Option<TestRow> } }
+result_row! { struct NestedEmptyStruct { nested: nested::EmptyRow } }
 result_row! { struct NestedList { value: Vec<Vec<String>> } }
 result_row! { struct NestedMap { value: HashMap<String, TestRow> } }
 result_row! { struct NullableList { value: Vec<Option<String>> } }
@@ -495,6 +496,7 @@ fn string_lists_reject_null_elements_with_hidden_bytes(
 #[case::nullable_struct(execute_rows::<Vec<NestedStruct>>, Some(empty_batch::<NestedStruct> as fn() -> _))]
 #[case::nullable_map_values(execute_rows::<Vec<NullableMap>>, None)]
 #[case::unsupported_descendant(execute_rows::<Vec<nested::UnsupportedDescendant>>, None)]
+#[case::nested_zero_field_struct(execute_rows::<Vec<NestedEmptyStruct>>, None)]
 fn schema_support_controls_empty_results_and_stream_errors<T: Debug>(
     #[case] convert: fn(Vec<KernelResult<RecordBatch>>) -> KernelResult<Vec<T>>,
     #[case] batch: Option<fn() -> KernelResult<RecordBatch>>,

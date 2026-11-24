@@ -183,7 +183,7 @@ pub trait PlanExecutorExt: PlanExecutor {
     /// requested schema, including field nullability and metadata.
     ///
     /// Supports numbers, booleans, strings, binary, dates, string lists, string maps, and nested
-    /// structs. A null struct masks its children, including their required fields.
+    /// structs with fields. Null structs mask their children, including required fields.
     /// List elements and map values must be non-nullable in the schema, even for empty streams.
     /// String-list source schemas must declare non-null elements; batches are also checked.
     /// Required nulls and null string-list elements return errors. Null map entries are dropped;
