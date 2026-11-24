@@ -1576,6 +1576,7 @@ impl From<FfiHistoryCommitType> for HistoryCommitType {
 /// # Safety
 ///
 /// Caller is responsible for passing a valid `log_root` string slice and a valid engine handle.
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_earliest_commit(
     engine: Handle<SharedExternEngine>,
@@ -1585,13 +1586,12 @@ pub unsafe extern "C" fn get_earliest_commit(
 ) -> ExternResult<Version> {
     let engine_ref = unsafe { engine.as_ref() };
     let log_root = unsafe { unwrap_and_parse_path_as_url(log_root) };
-    let result = get_earliest_commit_impl(
+    get_earliest_commit_impl(
         engine_ref,
         log_root,
         earliest_ratified_commit_version,
         commit_type,
-    );
-    unsafe { result.into_extern_result(&engine_ref) }
+    )
 }
 
 fn get_earliest_commit_impl(
@@ -1640,6 +1640,7 @@ impl From<CommitAt> for FfiCommitAt {
 /// # Safety
 ///
 /// Caller is responsible for passing a valid snapshot handle and a valid engine handle.
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn latest_version_as_of(
     snapshot: Handle<SharedSnapshot>,
@@ -1649,14 +1650,13 @@ pub unsafe extern "C" fn latest_version_as_of(
 ) -> ExternResult<FfiCommitAt> {
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot = unsafe { snapshot.as_ref() };
-    let result = kernel_latest_version_as_of(
+    kernel_latest_version_as_of(
         snapshot,
         engine_ref.engine().as_ref(),
         timestamp,
         commit_type.into(),
     )
-    .map(FfiCommitAt::from);
-    unsafe { result.into_extern_result(&engine_ref) }
+    .map(FfiCommitAt::from)
 }
 
 /// Get the first commit (version and timestamp) within `snapshot`'s version range with a
@@ -1670,6 +1670,7 @@ pub unsafe extern "C" fn latest_version_as_of(
 /// # Safety
 ///
 /// Caller is responsible for passing a valid snapshot handle and a valid engine handle.
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn first_version_after(
     snapshot: Handle<SharedSnapshot>,
@@ -1679,14 +1680,13 @@ pub unsafe extern "C" fn first_version_after(
 ) -> ExternResult<FfiCommitAt> {
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot = unsafe { snapshot.as_ref() };
-    let result = kernel_first_version_after(
+    kernel_first_version_after(
         snapshot,
         engine_ref.engine().as_ref(),
         timestamp,
         commit_type.into(),
     )
-    .map(FfiCommitAt::from);
-    unsafe { result.into_extern_result(&engine_ref) }
+    .map(FfiCommitAt::from)
 }
 
 /// Get the logical schema of the specified snapshot
