@@ -475,11 +475,12 @@ fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
     actual_actions.extend(content);
     assert_eq!(canonical_actions(actual_actions), expected_actions);
     let mut value: Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(value["checksum"], json_checksum::json_checksum(&value));
     let mut expected_hint = json!({
         "version": writer.version, "size": legacy_count + sidecars.len() as i64,
         "parts": null, "sizeInBytes": root.size + sidecar_bytes,
         "numOfAddFiles": if state == "empty" { 0 } else { 1 },
-        "checkpointSchema": root_schema, "tags": null, "v2Checkpoint": null, "checksum": null,
+        "checkpointSchema": root_schema, "tags": null, "v2Checkpoint": null, "checksum": value["checksum"],
     });
     if naming == CheckpointNaming::Uuid {
         let actions = non_content

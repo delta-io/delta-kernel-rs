@@ -9,6 +9,7 @@ use std::sync::{Arc, LazyLock};
 
 use serde::de::DeserializeOwned;
 
+mod json_checksum;
 mod write;
 
 use super::super::{CheckpointWriter, LastCheckpointHintStats, V2CheckpointConfig};
@@ -208,7 +209,7 @@ impl CheckpointWriter {
         v2.path = root.filename.clone();
         v2.size_in_bytes = Some(root_size);
         v2.modification_time = Some(root_file.last_modified);
-        let hint = LastCheckpointHint {
+        let mut hint = LastCheckpointHint {
             version: self.snapshot.version(),
             size: stats.num_actions,
             parts: None,
@@ -232,6 +233,7 @@ impl CheckpointWriter {
             #[cfg(feature = "adaptive-metadata-in-dev")]
             amt_checkpoint: None,
         };
+        hint.checksum = Some(json_checksum::json_checksum(&serde_json::to_value(&hint)?));
         Ok(serde_json::to_vec(&hint)?)
     }
 }
