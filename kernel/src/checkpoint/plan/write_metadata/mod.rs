@@ -12,11 +12,8 @@ use serde::de::DeserializeOwned;
 mod write;
 
 use super::super::{CheckpointWriter, LastCheckpointHintStats, V2CheckpointConfig};
-use crate::action_reconciliation::plan::action_set::ActionSet;
-use crate::actions::{
-    CHECKPOINT_METADATA_FIELD, CHECKPOINT_METADATA_NAME, SIDECAR_FIELD, SIDECAR_FILE_SCHEMA_TAG,
-    Sidecar,
-};
+use crate::action_reconciliation::plan::action_set::{ActionSet, ActionSource};
+use crate::actions::{CHECKPOINT_METADATA_FIELD, SIDECAR_FIELD, SIDECAR_FILE_SCHEMA_TAG, Sidecar};
 use crate::engine_data::TypedGetData as _;
 use crate::expressions::{
     ColumnName, Expression as Expr, Predicate, Scalar, UnaryExpressionOp, col, column_name, lit,
@@ -110,47 +107,37 @@ impl CheckpointWriter {
     }
 
     // Bound each complete hint list independently before returning any action JSON to Kernel.
-    fn last_checkpoint_prefetch(actions: PlanBuilder) -> KernelResult<PlanBuilder> {
-        let non_file_names = ActionSet {
-            live_adds: false,
-            include_tombstones: false,
-            ..ActionSet::ALL
-        }
-        .output_action_names()
-        .chain([CHECKPOINT_METADATA_NAME])
-        .filter(|name| actions.schema().contains(name))
-        .collect::<Vec<_>>();
+    fn last_checkpoint_prefetch(&self, actions: PlanBuilder) -> KernelResult<PlanBuilder> {
         let non_content_schema = Arc::new(StructType::try_new(
-            actions
-                .schema()
-                .fields()
-                .filter(|field| non_file_names.contains(&field.name().as_str()))
-                .cloned(),
+            ActionSet {
+                live_adds: false,
+                include_tombstones: false,
+                ..ActionSet::ALL
+            }
+            .schema(ActionSource::Checkpoint)?
+            .fields()
+            .cloned()
+            .chain([CHECKPOINT_METADATA_FIELD.clone()]),
         )?);
         let non_content = actions
             .clone()
             .filter(Predicate::or_from(
-                non_file_names
-                    .iter()
-                    .map(|name| Expr::column([*name]).is_not_null()),
+                non_content_schema
+                    .fields()
+                    .map(|field| Expr::column([field.name()]).is_not_null()),
             ))?
             .project(
-                Expr::struct_from(
+                Expr::struct_from([Expr::struct_from(
                     non_content_schema
                         .fields()
                         .map(|field| Expr::column([field.name()])),
-                ),
-                non_content_schema,
+                )]),
+                Arc::new(schema! { not_null "action": (non_content_schema.clone()) }),
             )?;
-        let schema = Arc::new(schema! { not_null "action": (non_content.schema().clone()) });
-        let expr = Expr::struct_from([Expr::struct_from(
-            non_content
-                .schema()
-                .fields()
-                .map(|field| Expr::column([field.name()])),
-        )]);
-        let non_content = non_content.project(expr, schema)?;
-        let sidecars = if actions.schema().contains("sidecar") {
+        let sidecars = if matches!(
+            &self.v2_checkpoint_config,
+            V2CheckpointConfig::WithSidecar { .. }
+        ) {
             actions.filter(col!("sidecar.path").is_not_null())?
         } else {
             PlanBuilder::values(Arc::new(schema! { (&SIDECAR_FIELD) }), vec![])?

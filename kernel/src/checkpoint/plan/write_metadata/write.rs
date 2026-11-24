@@ -4,21 +4,25 @@ use url::Url;
 
 use super::*;
 use crate::checkpoint::{CheckpointNaming, V2CheckpointConfig};
-use crate::plans::ir::nodes::{Agg, FILE_META_SCHEMA, FileType, StatsAgg, WriteParquet};
+use crate::plans::ir::nodes::{Agg, FILE_META_SCHEMA, StatsAgg, WriteParquet};
 use crate::plans::{Plan, PlanResult};
 use crate::{DeltaError, Engine, Result};
 
+static ROOT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    ..(FILE_META_SCHEMA.fields()),
+    not_null "checkpoint_schema": STRING,
+};
+
 static RESULT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     nullable "statistics": (STATISTICS_SCHEMA.clone()),
-    nullable "root": (FILE_META_SCHEMA.clone()),
+    nullable "root": (ROOT_SCHEMA.clone()),
     nullable "prefetch": (PREFETCH_SCHEMA.clone()),
-    nullable "checkpoint_schema": STRING,
 };
 
 impl CheckpointWriter {
     /// Chooses root naming for declarative checkpoint plans.
     ///
-    /// Classic Parquet is the default. UUID roots require V2 and support JSON or Parquet.
+    /// Classic Parquet is the default. UUID roots require V2.
     pub fn with_checkpoint_naming(mut self, naming: CheckpointNaming) -> Self {
         self.checkpoint_naming = naming;
         self
@@ -27,8 +31,7 @@ impl CheckpointWriter {
     /// Selects inline file actions or sidecars for declarative V2 writes.
     ///
     /// Inline file actions are the default. Sidecars require a V2 table. The executor chooses
-    /// sidecar grouping; a nonzero file-action hint does not constrain those groups. JSON roots
-    /// require sidecars.
+    /// sidecar grouping; a nonzero file-action hint does not constrain those groups.
     pub fn with_v2_checkpoint_config(mut self, config: V2CheckpointConfig) -> Self {
         self.v2_checkpoint_config = config;
         self
@@ -37,26 +40,17 @@ impl CheckpointWriter {
     /// Builds one plan that writes a checkpoint and computes all `_last_checkpoint` inputs.
     ///
     /// V1 and V2 default to a single classic-named Parquet file. V2 supports sidecars through
-    /// [`Self::with_v2_checkpoint_config`] and UUID-named JSON or Parquet roots through
+    /// [`Self::with_v2_checkpoint_config`] and UUID-named Parquet roots through
     /// [`Self::with_checkpoint_naming`]. Counts share the rows used by the writes, and byte totals
-    /// use completed file descriptors. JSON roots require sidecars. All output depends on the
+    /// use completed file descriptors. All output depends on the
     /// successful root write. Execute once and pass the complete result to
     /// [`Self::last_checkpoint_bytes_from_result`], then atomically publish the returned bytes.
     /// Collation-specific bounds remain in JSON stats, without a separate sampling query.
-    pub fn declarative_checkpoint_plan(
-        &self,
-        engine: &dyn Engine,
-        format: FileType,
-    ) -> KernelResult<Plan> {
+    pub fn declarative_checkpoint_plan(&self, engine: &dyn Engine) -> KernelResult<Plan> {
         let uuid_root = self.checkpoint_naming == CheckpointNaming::Uuid;
         if uuid_root && !self.schema_context.is_v2 {
             return Err(KernelError::unsupported(
                 "UUID-named checkpoints require V2",
-            ));
-        }
-        if !uuid_root && format != FileType::Parquet {
-            return Err(KernelError::unsupported(
-                "Classic-named checkpoints require Parquet",
             ));
         }
         let with_sidecars = matches!(
@@ -78,18 +72,9 @@ impl CheckpointWriter {
                 "file_actions_per_sidecar_hint must be greater than 0",
             ));
         }
-        if !with_sidecars && format != FileType::Parquet {
-            return Err(KernelError::unsupported(
-                "JSON checkpoint roots require sidecars",
-            ));
-        }
         let root_path = if uuid_root {
-            let extension = match format {
-                FileType::Json => "json",
-                FileType::Parquet => "parquet",
-            };
             self.snapshot.log_segment().log_root.join(&format!(
-                "{:020}.checkpoint.{}.{extension}",
+                "{:020}.checkpoint.{}.parquet",
                 self.version,
                 uuid::Uuid::new_v4(),
             ))?
@@ -125,28 +110,42 @@ impl CheckpointWriter {
             let counts = PlanBuilder::union_all([counts, action_counts(manifest.clone(), false)?])?;
             (manifest, counts, Some(sidecars))
         };
-        let checkpoint_schema = if format == FileType::Parquet {
-            checkpoint_schema_json(actions.schema())?
-        } else {
-            None
-        };
-        let root = match format {
-            FileType::Json => PlanBuilder::write_json([actions.clone()], root_path, false, false),
-            FileType::Parquet => PlanBuilder::write_parquet(
-                [actions.clone()],
-                WriteParquet::new(actions.schema().clone(), root_path),
-            ),
-        }?;
+        let checkpoint_schema = serde_json::to_string(actions.schema())?;
+        let root = PlanBuilder::write_parquet(
+            [actions.clone()],
+            WriteParquet::new(actions.schema().clone(), root_path),
+        )?;
         let totals = checkpoint_totals(counts, sidecars, Some(root.clone()))?;
-        let mut results = vec![
-            result_rows(totals, "statistics", None)?,
-            result_rows(root.clone(), "root", checkpoint_schema)?,
-        ];
+        let statistics = totals.project(
+            Expr::struct_from([
+                Expr::struct_from([col!(NUM_ACTIONS), col!(NUM_ADDS), col!(NUM_BYTES)]),
+                null_lit(ROOT_SCHEMA.clone()),
+                null_lit(PREFETCH_SCHEMA.clone()),
+            ]),
+            RESULT_SCHEMA.clone(),
+        )?;
+        let root_result = root.clone().project(
+            Expr::struct_from([
+                null_lit(STATISTICS_SCHEMA.clone()),
+                Expr::struct_from([
+                    col!("location"),
+                    col!("size"),
+                    col!("last_modified"),
+                    lit(checkpoint_schema),
+                ]),
+                null_lit(PREFETCH_SCHEMA.clone()),
+            ]),
+            RESULT_SCHEMA.clone(),
+        )?;
+        let mut results = vec![statistics, root_result];
         if uuid_root {
-            results.push(result_rows(
-                Self::last_checkpoint_prefetch(actions)?,
-                "prefetch",
-                None,
+            results.push(self.last_checkpoint_prefetch(actions)?.project(
+                Expr::struct_from([
+                    null_lit(STATISTICS_SCHEMA.clone()),
+                    null_lit(ROOT_SCHEMA.clone()),
+                    Expr::struct_from([col!("is_sidecar"), col!("json")]),
+                ]),
+                RESULT_SCHEMA.clone(),
             )?);
         }
         // EXISTS on the completed root prevents hint inputs escaping before every write succeeds.
@@ -173,7 +172,6 @@ impl CheckpointWriter {
         let mut rows = CheckpointResult {
             statistics: None,
             root: None,
-            schema: None,
             prefetch: LastCheckpointV2 {
                 path: String::new(),
                 size_in_bytes: None,
@@ -202,11 +200,10 @@ impl CheckpointWriter {
             )
             .into());
         }
-        let root = rows
+        let (root, schema) = rows
             .root
             .ok_or_else(|| KernelError::checkpoint_write("Missing checkpoint root"))?;
-        let bytes =
-            self.serialize_checkpoint_hint(&statistics, &root, rows.schema, rows.prefetch)?;
+        let bytes = self.serialize_checkpoint_hint(&statistics, &root, schema, rows.prefetch)?;
         Ok((root, statistics, bytes))
     }
 
@@ -216,33 +213,42 @@ impl CheckpointWriter {
         root_path: Url,
     ) -> KernelResult<Plan> {
         let actions = self.checkpoint_actions(engine)?;
-        let checkpoint_schema = checkpoint_schema_json(actions.schema())?;
+        let checkpoint_schema = serde_json::to_string(actions.schema())?;
         let write = WriteParquet::new(actions.schema().clone(), root_path).with_stats_agg([
             StatsAgg::new(NUM_ACTIONS, Agg::count_star()),
             StatsAgg::new(NUM_ADDS, Agg::count(column_name!("add"))),
         ]);
         let written = PlanBuilder::write_parquet([actions.clone()], write)?;
         let statistics = written.clone().project(
-            Expr::struct_from([col!(NUM_ACTIONS), col!(NUM_ADDS), col!("size")]),
-            STATISTICS_SCHEMA.clone(),
+            Expr::struct_from([
+                Expr::struct_from([col!(NUM_ACTIONS), col!(NUM_ADDS), col!("size")]),
+                null_lit(ROOT_SCHEMA.clone()),
+                null_lit(PREFETCH_SCHEMA.clone()),
+            ]),
+            RESULT_SCHEMA.clone(),
         )?;
         let root = written.project(
-            Expr::struct_from(
-                FILE_META_SCHEMA
-                    .fields()
-                    .map(|field| Expr::column([field.name()])),
-            ),
-            FILE_META_SCHEMA.clone(),
+            Expr::struct_from([
+                null_lit(STATISTICS_SCHEMA.clone()),
+                Expr::struct_from([
+                    col!("location"),
+                    col!("size"),
+                    col!("last_modified"),
+                    lit(checkpoint_schema),
+                ]),
+                null_lit(PREFETCH_SCHEMA.clone()),
+            ]),
+            RESULT_SCHEMA.clone(),
         )?;
-        let mut results = vec![
-            result_rows(statistics, "statistics", None)?,
-            result_rows(root.clone(), "root", checkpoint_schema)?,
-        ];
+        let mut results = vec![statistics, root.clone()];
         if self.checkpoint_naming == CheckpointNaming::Uuid {
-            results.push(result_rows(
-                Self::last_checkpoint_prefetch(actions)?,
-                "prefetch",
-                None,
+            results.push(self.last_checkpoint_prefetch(actions)?.project(
+                Expr::struct_from([
+                    null_lit(STATISTICS_SCHEMA.clone()),
+                    null_lit(ROOT_SCHEMA.clone()),
+                    Expr::struct_from([col!("is_sidecar"), col!("json")]),
+                ]),
+                RESULT_SCHEMA.clone(),
             )?);
             return PlanBuilder::union_all(results)?
                 .semi_join(root, [], [])?
@@ -252,34 +258,9 @@ impl CheckpointWriter {
     }
 }
 
-fn result_rows(
-    input: PlanBuilder,
-    name: &str,
-    schema: Option<String>,
-) -> KernelResult<PlanBuilder> {
-    let expression = Expr::struct_from(RESULT_SCHEMA.fields().map(|field| {
-        if field.name() == name {
-            Expr::struct_from(
-                input
-                    .schema()
-                    .fields()
-                    .map(|field| Expr::column([field.name()])),
-            )
-        } else if field.name() == "checkpoint_schema" {
-            schema
-                .clone()
-                .map_or_else(|| null_lit(DataType::STRING), lit)
-        } else {
-            null_lit(field.data_type().clone())
-        }
-    }));
-    input.project(expression, RESULT_SCHEMA.clone())
-}
-
 struct CheckpointResult {
     statistics: Option<LastCheckpointHintStats>,
-    root: Option<FileMeta>,
-    schema: Option<SchemaRef>,
+    root: Option<(FileMeta, SchemaRef)>,
     prefetch: LastCheckpointV2,
 }
 
@@ -295,7 +276,7 @@ impl RowVisitor for CheckpointResult {
                 column_name!("root.last_modified"),
                 column_name!("prefetch.is_sidecar"),
                 column_name!("prefetch.json"),
-                column_name!("checkpoint_schema"),
+                column_name!("root.checkpoint_schema"),
             ]
         });
         (
@@ -363,7 +344,7 @@ impl RowVisitor for CheckpointResult {
                     Some(modified),
                     None,
                     None,
-                    schema,
+                    Some(schema),
                 ) => {
                     let root = FileMeta::new(
                         url::Url::parse(location)?,
@@ -371,10 +352,10 @@ impl RowVisitor for CheckpointResult {
                         size.try_into()
                             .map_err(|_| KernelError::checkpoint_write("Negative root size"))?,
                     );
-                    if self.root.replace(root).is_some() {
+                    let schema = serde_json::from_str(schema)?;
+                    if self.root.replace((root, schema)).is_some() {
                         return Err(KernelError::checkpoint_write("Duplicate checkpoint root"));
                     }
-                    self.schema = schema.map(serde_json::from_str).transpose()?;
                 }
                 (None, None, None, None, None, None, Some(sidecar), json, None) => {
                     if sidecar {

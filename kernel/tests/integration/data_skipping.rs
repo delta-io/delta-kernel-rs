@@ -37,7 +37,7 @@ use delta_kernel::{KernelError, Snapshot, SnapshotRef};
 use delta_kernel::{
     checkpoint::CheckpointNaming,
     engine::{plans::PlanBasedEngine, sync::plan::SyncPlanExecutor},
-    plans::{Operation, PlanExecutor as _, ir::nodes::FileType},
+    plans::{Operation, PlanExecutor as _},
 };
 use rstest::rstest;
 use rstest_reuse::apply;
@@ -1236,18 +1236,21 @@ async fn scan_with_replace_table_schema_change(
 
 #[cfg(feature = "declarative-plans")]
 #[rstest]
-#[case::v1(CheckpointSpec::V1, FileType::Parquet)]
-#[case::inline(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar), FileType::Parquet)]
-#[case::sidecars_parquet(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+#[case::v1(CheckpointSpec::V1, CheckpointNaming::Classic)]
+#[case::inline(
+    CheckpointSpec::V2(V2CheckpointConfig::NoSidecar),
+    CheckpointNaming::Classic
+)]
+#[case::sidecars_classic(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
     file_actions_per_sidecar_hint: Some(1),
-}), FileType::Parquet)]
-#[case::sidecars_json(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+}), CheckpointNaming::Classic)]
+#[case::sidecars_uuid(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
     file_actions_per_sidecar_hint: Some(1),
-}), FileType::Json)]
+}), CheckpointNaming::Uuid)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn declarative_checkpoint_after_replace_table_with_incompatible_native_metadata(
     #[case] spec: CheckpointSpec,
-    #[case] format: FileType,
+    #[case] naming: CheckpointNaming,
     #[values(false, true)] old_json_stats: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_tmp_dir, table_path, engine) = replace_table_schema_change(
@@ -1267,12 +1270,8 @@ async fn declarative_checkpoint_after_replace_table_with_incompatible_native_met
         CheckpointSpec::V2(config) => writer.with_v2_checkpoint_config(config.clone()),
         _ => writer,
     };
-    let writer = if format == FileType::Json {
-        writer.with_checkpoint_naming(CheckpointNaming::Uuid)
-    } else {
-        writer
-    };
-    let plan = writer.declarative_checkpoint_plan(&planning_engine, format)?;
+    let writer = writer.with_checkpoint_naming(naming);
+    let plan = writer.declarative_checkpoint_plan(&planning_engine)?;
     let bytes = writer
         .last_checkpoint_bytes_from_result(executor.execute_op(Operation::QueryPlan(plan))?)?;
     std::fs::write(
