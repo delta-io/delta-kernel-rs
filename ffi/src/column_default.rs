@@ -15,8 +15,9 @@
 
 use delta_kernel::KernelResult;
 use delta_kernel::transaction::Transaction;
+use delta_kernel_ffi_macros::ffi_export;
 
-use crate::error::{ExternResult, IntoExternResult};
+use crate::error::ExternResult;
 use crate::handle::Handle;
 use crate::transaction::ExclusiveUpdateTableTransaction;
 use crate::{KernelStringSlice, NullableCvoid, SharedExternEngine, kernel_string_slice};
@@ -67,6 +68,7 @@ pub type ColumnDefaultVisitor = extern "C" fn(
 /// Caller is responsible for passing valid transaction and engine handles, a valid
 /// `engine_context` pointer passed through to each `visitor` invocation, and a valid `visitor`
 /// function pointer. This call borrows `txn` and `engine`. The caller retains ownership.
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_visit_top_level_column_defaults(
     txn: Handle<ExclusiveUpdateTableTransaction>,
@@ -74,10 +76,8 @@ pub unsafe extern "C" fn update_table_txn_visit_top_level_column_defaults(
     engine_context: NullableCvoid,
     visitor: ColumnDefaultVisitor,
 ) -> ExternResult<usize> {
-    let engine = unsafe { engine.as_ref() };
     let txn = unsafe { txn.as_ref() };
-    let result = visit_top_level_column_defaults_impl(txn, engine_context, visitor);
-    unsafe { result.into_extern_result(&engine) }
+    visit_top_level_column_defaults_impl(txn, engine_context, visitor)
 }
 
 fn visit_top_level_column_defaults_impl(
