@@ -326,6 +326,7 @@ static LAST_CHECKPOINT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     nullable "numOfAddFiles": LONG,
 };
 
+#[cfg(feature = "memory-budget")]
 pub(crate) fn initialize_schemas() {
     for schema in [
         &LAST_CHECKPOINT_SCHEMA,

@@ -13,7 +13,7 @@ def main():
     root = Path(__file__).resolve().parents[2]
     target = Path(os.environ.get("KERNEL_MEMORY_TARGET", root / "target")).resolve()
     subprocess.run(
-        ["cargo", "+1.95.0", "build", "--offline", "--locked", "-p", "delta_kernel_ffi",
+        ["cargo", "+1.100.0", "build", "--offline", "--locked", "-p", "delta_kernel_ffi",
          "--features", "declarative-plans,vendored-protoc", "--target-dir", str(target)],
         cwd=root, env=dict(os.environ, CARGO_TARGET_DIR=str(target)), check=True,
     )

@@ -1,6 +1,6 @@
 {
   "implementation": "Historical std::alloc::Allocator backend; compiler and hashes below describe that implementation.",
-  "current_validation": "PROCESS_GLOBAL_VALIDATION.json",
+  "current_validation": "ALLOCATOR_API_VALIDATION.json",
   "platform": "macOS-26.7.1-arm64-arm-64bit",
   "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
   "scope": "Declarative snapshot discovery, checkpoint resolution, query/schema and scan-plan construction, wire encoding, write-relation staging and write-state encoding, and owner release. Includes local reference-engine execution and caller query construction. Excludes terminal metadata-plan execution and declarative commit. Heap coverage is live requested Rust bytes at the simultaneous peak, not RSS or foreign-memory coverage.",

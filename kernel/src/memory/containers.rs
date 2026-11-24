@@ -3,20 +3,20 @@ use std::ops::{Deref, DerefMut};
 
 use serde::Serialize;
 
-use super::{KERNEL_ALLOCATOR, MemoryError, MemoryResult};
+use super::{MemoryError, MemoryResult, storage};
 
 /// A standard vector with fallible growth methods returning Kernel memory errors.
 ///
-/// When [`KernelAllocator`](super::KernelAllocator) is installed, backing storage and allocations
-/// owned by elements use the same global limit. Infallible conversions and cloning retain Rust's
-/// ordinary allocation-error behavior on exhaustion.
+/// The `memory-budget` feature selects the explicit shared allocator for backing storage.
+/// Allocations owned by elements participate only when they select that allocator themselves.
+/// Infallible conversions and cloning retain ordinary allocation-error behavior on exhaustion.
 #[derive(Debug)]
-pub struct MetadataVec<T>(Vec<T>);
+pub struct MetadataVec<T>(storage::Vector<T>);
 
 impl<T> MetadataVec<T> {
     /// Create empty storage using the shared Kernel allocator.
     pub fn new() -> Self {
-        Self(Vec::new())
+        Self(storage::vector())
     }
 
     /// Append `value`, returning an error without changing the elements if growth fails.
@@ -26,7 +26,7 @@ impl<T> MetadataVec<T> {
         Ok(())
     }
 
-    /// Reserve space using geometric growth; existing and replacement blocks overlap in the cap.
+    /// Reserve space using geometric growth; the budget reserves only additional capacity.
     pub fn try_reserve(&mut self, additional: usize) -> MemoryResult<()> {
         self.check_capacity(additional)?;
         self.0
@@ -79,7 +79,7 @@ impl<T> MetadataVec<T> {
     }
 
     fn allocation_error(&self) -> MemoryError {
-        KERNEL_ALLOCATOR.allocation_error()
+        super::allocation_error()
     }
 }
 
@@ -209,7 +209,7 @@ impl std::fmt::Display for MetadataString {
 }
 
 /// A standard vector iterator retaining its allocation until it is dropped.
-pub type IntoIter<T> = std::vec::IntoIter<T>;
+pub type IntoIter<T> = storage::IntoIter<T>;
 
 impl<T> IntoIterator for MetadataVec<T> {
     type Item = T;
@@ -252,12 +252,12 @@ impl<T> Default for MetadataVec<T> {
 }
 impl<T> From<Vec<T>> for MetadataVec<T> {
     fn from(values: Vec<T>) -> Self {
-        Self(values)
+        Self(storage::from_vector(values))
     }
 }
 impl<T> FromIterator<T> for MetadataVec<T> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        let mut values = Vec::new();
+        let mut values = storage::vector();
         values.extend(iter);
         Self(values)
     }

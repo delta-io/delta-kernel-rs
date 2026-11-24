@@ -10,31 +10,27 @@ use delta_kernel::arrow::ffi::FFI_ArrowArray;
 use delta_kernel::arrow::json::ReaderBuilder;
 use delta_kernel::memory::KERNEL_ALLOCATOR;
 
-#[global_allocator]
-static ALLOCATOR: delta_kernel::memory::KernelAllocator = delta_kernel::memory::KernelAllocator::new();
-
 type CheckResult = Result<(), Box<dyn Error>>;
 
 fn main() -> CheckResult {
-    std::thread::spawn(|| {}).join().unwrap();
+    arrow_buffer::alloc::install_default_allocator(&KERNEL_ALLOCATOR)?;
     KERNEL_ALLOCATOR.set_limit(None)?;
     let case = std::env::args().nth(1).ok_or("missing check name")?;
     let baseline = KERNEL_ALLOCATOR.usage().reserved;
     match case.as_str() {
         "buffer_growth_and_release" => {
+            KERNEL_ALLOCATOR.set_limit(Some(baseline + 128))?;
             let mut buffer = MutableBuffer::try_with_capacity(100)?;
             buffer.try_extend_from_slice(b"preserved after failed growth")?;
             assert_eq!(KERNEL_ALLOCATOR.usage().reserved, baseline + 128);
             let ptr = buffer.as_ptr();
-            KERNEL_ALLOCATOR.set_limit(Some(KERNEL_ALLOCATOR.usage().reserved))?;
             assert!(buffer.try_reserve(1024).is_err());
             assert_eq!(buffer.as_ptr(), ptr);
             assert_eq!(buffer.as_slice(), b"preserved after failed growth");
-            KERNEL_ALLOCATOR.set_limit(None)?;
             let buffer = Buffer::from(buffer);
             let shared = buffer.slice(10);
             drop(buffer);
-            assert!(KERNEL_ALLOCATOR.usage().reserved >= baseline + 128);
+            assert_eq!(KERNEL_ALLOCATOR.usage().reserved, baseline + 128);
             KERNEL_ALLOCATOR.set_limit(None)?;
             std::thread::spawn(move || drop(shared))
                 .join()
@@ -54,6 +50,7 @@ fn main() -> CheckResult {
         "imported_vector" => {
             let values = vec![1u64, 2, 3];
             let ptr = values.as_ptr();
+            KERNEL_ALLOCATOR.set_limit(Some(baseline))?;
             let buffer = Buffer::from_vec(values);
             let values = buffer
                 .into_vec::<u64>()
@@ -66,12 +63,12 @@ fn main() -> CheckResult {
             values.try_extend_from_slice(&[1, 2, 3])?;
             let pointer = values.as_ptr();
             assert_eq!(KERNEL_ALLOCATOR.usage().reserved, baseline + 64);
-            let buffer = Buffer::from_vec(values);
+            let buffer = Buffer::from(values);
             assert_eq!(buffer.as_ptr(), pointer.cast());
             let buffer = buffer
                 .into_vec::<u64>()
-                .expect("standard global vector lost ownership");
-            assert_eq!(buffer.as_slice(), &[1, 2, 3]);
+                .expect_err("custom allocation escaped into a Global vector");
+            assert_eq!(buffer.typed_data::<u64>(), &[1, 2, 3]);
             assert_eq!(KERNEL_ALLOCATOR.usage().reserved, baseline + 64);
             std::thread::spawn(move || drop(buffer))
                 .join()
@@ -83,11 +80,9 @@ fn main() -> CheckResult {
             let array = Int64Array::new(Buffer::from(buffer).into(), None);
             let mut exported = FFI_ArrowArray::new(&array.to_data());
             drop(array);
-            let retained = KERNEL_ALLOCATOR.usage().reserved;
-            assert!(retained >= baseline + 128);
-            KERNEL_ALLOCATOR.set_limit(Some(retained))?;
+            assert_eq!(KERNEL_ALLOCATOR.usage().reserved, baseline + 128);
+            KERNEL_ALLOCATOR.set_limit(Some(baseline + 128))?;
             assert!(MutableBuffer::try_with_capacity(64).is_err());
-            KERNEL_ALLOCATOR.set_limit(None)?;
             std::thread::spawn(move || {
                 let release = exported.release().expect("missing C release callback");
                 // SAFETY: exported owns this live Arrow C Data array and is released exactly once.
@@ -102,10 +97,9 @@ fn main() -> CheckResult {
         }
         "json_decoder_initialization" => {
             let builder = ReaderBuilder::new(schema());
-            KERNEL_ALLOCATOR.set_limit(Some(KERNEL_ALLOCATOR.usage().reserved))?;
-            let result = builder.build_decoder();
-            KERNEL_ALLOCATOR.set_limit(None)?;
-            let error = result
+            KERNEL_ALLOCATOR.set_limit(Some(baseline))?;
+            let error = builder
+                .build_decoder()
                 .err()
                 .ok_or("decoder unexpectedly fit")?;
             assert!(matches!(error, ArrowError::MemoryError(_)), "{error}");
@@ -115,12 +109,12 @@ fn main() -> CheckResult {
             let mut decoder = ReaderBuilder::new(schema()).build_decoder()?;
             let live = KERNEL_ALLOCATOR.usage().reserved;
             KERNEL_ALLOCATOR.set_limit(Some(live))?;
-            let result = decoder.decode(input.as_bytes());
-            KERNEL_ALLOCATOR.set_limit(None)?;
-            let error = result.expect_err("growth unexpectedly fit");
+            let error = decoder
+                .decode(input.as_bytes())
+                .expect_err("growth unexpectedly fit");
             assert!(matches!(error, ArrowError::MemoryError(_)), "{error}");
             drop(decoder);
-            assert_eq!(KERNEL_ALLOCATOR.usage().reserved, baseline + input.capacity());
+            assert_eq!(KERNEL_ALLOCATOR.usage().reserved, baseline);
             KERNEL_ALLOCATOR.set_limit(None)?;
             let mut decoder = ReaderBuilder::new(schema()).build_decoder()?;
             assert_eq!(decoder.decode(input.as_bytes())?, input.len());
@@ -130,18 +124,16 @@ fn main() -> CheckResult {
             let mut decoder = ReaderBuilder::new(schema()).build_decoder()?;
             decoder.decode(br#"{"value":"data"}"#)?;
             KERNEL_ALLOCATOR.set_limit(Some(KERNEL_ALLOCATOR.usage().reserved))?;
-            let result = decoder.flush();
-            KERNEL_ALLOCATOR.set_limit(None)?;
-            let error = result.expect_err("output unexpectedly fit");
+            let error = decoder.flush().expect_err("output unexpectedly fit");
             assert!(matches!(error, ArrowError::MemoryError(_)), "{error}");
         }
         "json_serialize" => {
             let rows = [serde_json::json!({"value": "x".repeat(128 * 1024)})];
             let mut decoder = ReaderBuilder::new(schema()).build_decoder()?;
             KERNEL_ALLOCATOR.set_limit(Some(KERNEL_ALLOCATOR.usage().reserved))?;
-            let result = decoder.serialize(&rows);
-            KERNEL_ALLOCATOR.set_limit(None)?;
-            let error = result.expect_err("serialization unexpectedly fit");
+            let error = decoder
+                .serialize(&rows)
+                .expect_err("serialization unexpectedly fit");
             assert!(matches!(error, ArrowError::MemoryError(_)), "{error}");
         }
         _ => return Err("unknown check".into()),

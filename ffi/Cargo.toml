@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 readme.workspace = true
 version.workspace = true
-rust-version.workspace = true
+rust-version = "1.100"
 build = "build.rs"
 
 # for cargo-release
@@ -31,8 +31,10 @@ tracing-core = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", optional = true, features = [ "json" ] }
 url = "2"
 serde_json = "1.0.142"
+peak_alloc = { version = "0.3.0", optional = true }
 delta_kernel = { path = "../kernel", default-features = false, features = [
   "internal-api",
+  "memory-budget",
 ] }
 delta_kernel_default_engine = { path = "../default-engine", default-features = false, optional = true }
 delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.30.1" }
@@ -56,7 +58,7 @@ itertools = "0.14.0"
 rstest = "0.23"
 
 [features]
-default = ["default-engine-rustls", "arrow", "global-allocator"]
+default = ["default-engine-rustls", "arrow"]
 default-engine-native-tls = ["delta_kernel/default-engine-base", "dep:delta_kernel_default_engine", "delta_kernel_default_engine/native-tls", "default-engine-base"]
 default-engine-rustls = ["delta_kernel/default-engine-base", "dep:delta_kernel_default_engine", "delta_kernel_default_engine/rustls", "default-engine-base"]
 delta-kernel-unity-catalog = [ "dep:delta-kernel-unity-catalog", "dep:unity-catalog-delta-client-api" ]
@@ -89,8 +91,5 @@ udt-in-dev = ["delta_kernel/udt-in-dev"]
 # Experimental, in-development feature flag gating Iceberg V4 adaptive metadata tree support.
 adaptive-metadata-in-dev = ["delta_kernel/adaptive-metadata-in-dev"]
 
-# Install Kernel's shared limiting allocator for this library's Rust allocations. Disable this
-# feature when a Rust embedding application installs its own KernelAllocator.
-global-allocator = []
-# Compatibility alias for callers that enabled allocation tracking explicitly.
-alloc-tracking = ["global-allocator"]
+# Optional process-wide Rust allocation diagnostics; never rejects an allocation.
+alloc-tracking = ["dep:peak_alloc"]

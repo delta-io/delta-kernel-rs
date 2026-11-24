@@ -2,8 +2,14 @@ use rustc_version::{Channel, version_meta};
 
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(NIGHTLY_CHANNEL)");
+    let compiler = version_meta().unwrap();
+    if cfg!(feature = "memory-budget") && (compiler.semver.major, compiler.semver.minor) < (1, 100)
+    {
+        println!("cargo::error=the memory-budget feature requires stable Rust 1.100 or newer");
+        std::process::exit(1);
+    }
     // note if we're on the nightly channel so we can enable doc_auto_cfg if so
-    if let Channel::Nightly = version_meta().unwrap().channel {
+    if let Channel::Nightly = compiler.channel {
         println!("cargo:rustc-cfg=NIGHTLY_CHANNEL");
     }
 

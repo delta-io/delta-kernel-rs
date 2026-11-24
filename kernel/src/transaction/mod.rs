@@ -172,6 +172,7 @@ static TAGS_AND_CLUSTERING_PROVIDER_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = lazy
     (&ADD_FILE_CLUSTERING_PROVIDER_FIELD),
 };
 
+#[cfg(feature = "memory-budget")]
 pub(crate) fn initialize_schemas() {
     for schema in [
         &BASE_ADD_FILES_SCHEMA,

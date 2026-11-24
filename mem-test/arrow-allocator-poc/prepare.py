@@ -41,7 +41,7 @@ def main():
     lock = here / "Cargo.lock"
     if not lock.exists():
         shutil.copyfile(here.parents[1] / "Cargo.lock", lock)
-    command = ["cargo", "+1.95.0", "build", "--offline", "--manifest-path",
+    command = ["cargo", "+1.100.0", "build", "--offline", "--manifest-path",
                str(here / "Cargo.toml"), "--config", str(config), "--release"]
     print(f"CARGO_TARGET_DIR={shlex.quote(str(directory / 'target'))} "
           f"CARGO_PROFILE_RELEASE_DEBUG=1 {shlex.join(command)}")

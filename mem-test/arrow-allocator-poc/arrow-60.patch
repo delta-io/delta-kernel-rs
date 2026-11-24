@@ -1,3 +1,36 @@
+--- a/arrow-array/Cargo.toml
++++ b/arrow-array/Cargo.toml
+@@ -11,7 +11,7 @@
+
+ [package]
+ edition = "2024"
+-rust-version = "1.88"
++rust-version = "1.100"
+ name = "arrow-array"
+ version = "60.0.0"
+ authors = ["Apache Arrow <dev@arrow.apache.org>"]
+--- a/arrow-array/src/array/mod.rs
++++ b/arrow-array/src/array/mod.rs
+@@ -1021,6 +1021,19 @@
+     make_array(data)
+ }
+
++/// Create an empty array while propagating buffer allocation failures.
++pub fn try_new_empty_array(data_type: &DataType) -> Result<ArrayRef, arrow_schema::ArrowError> {
++    Ok(make_array(ArrayData::try_new_empty(data_type)?))
++}
++
++/// Create a null array while propagating buffer allocation failures.
++pub fn try_new_null_array(
++    data_type: &DataType,
++    length: usize,
++) -> Result<ArrayRef, arrow_schema::ArrowError> {
++    Ok(make_array(ArrayData::try_new_null(data_type, length)?))
++}
++
+ /// Creates a new array of `data_type` of length `length` filled
+ /// entirely of `NULL` values
+ ///
 --- a/arrow-buffer/Cargo.toml
 +++ b/arrow-buffer/Cargo.toml
 @@ -11,7 +11,7 @@
@@ -5,71 +38,179 @@
  [package]
  edition = "2024"
 -rust-version = "1.88"
-+rust-version = "1.95"
++rust-version = "1.100"
  name = "arrow-buffer"
  version = "60.0.0"
  authors = ["Apache Arrow <dev@arrow.apache.org>"]
-@@ -241,3 +241,4 @@
- [lints.rustdoc.all]
- level = "warn"
- priority = -1
-+
---- a/arrow-buffer/src/alloc/fallible.rs
-+++ b/arrow-buffer/src/alloc/fallible.rs
-@@ -0,0 +1,42 @@
-+// SPDX-License-Identifier: Apache-2.0
-+//! Fallible growth helpers for standard vectors used by the JSON decoder.
-+
-+/// A failed fallible container reservation.
-+#[derive(Debug)]
-+pub struct AllocationError;
-+
-+impl std::fmt::Display for AllocationError {
-+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-+        f.write_str("memory allocation failed")
-+    }
-+}
-+impl std::error::Error for AllocationError {}
-+
-+/// Create a standard vector with fallibly reserved initial capacity.
-+pub fn try_vec<T>(capacity: usize) -> Result<Vec<T>, AllocationError> {
-+    let mut values = Vec::new();
-+    values.try_reserve_exact(capacity).map_err(|_| AllocationError)?;
-+    Ok(values)
-+}
-+
-+/// Fallible convenience methods for standard vectors.
-+pub trait TryVecExt<T> {
-+    /// Reserve capacity before appending an element.
-+    fn try_push(&mut self, value: T) -> Result<(), AllocationError>;
-+    /// Reserve capacity before copying elements.
-+    fn try_extend_from_slice(&mut self, values: &[T]) -> Result<(), AllocationError>
-+    where T: Clone;
-+}
-+impl<T> TryVecExt<T> for Vec<T> {
-+    fn try_push(&mut self, value: T) -> Result<(), AllocationError> {
-+        self.try_reserve(1).map_err(|_| AllocationError)?;
-+        self.push(value);
-+        Ok(())
-+    }
-+    fn try_extend_from_slice(&mut self, values: &[T]) -> Result<(), AllocationError>
-+    where T: Clone {
-+        self.try_reserve(values.len()).map_err(|_| AllocationError)?;
-+        self.extend_from_slice(values);
-+        Ok(())
-+    }
-+}
 --- a/arrow-buffer/src/alloc/mod.rs
 +++ b/arrow-buffer/src/alloc/mod.rs
 @@ -23,6 +23,8 @@
  use std::sync::Arc;
 
  mod alignment;
-+mod fallible;
-+pub use fallible::{AllocationError, TryVecExt, try_vec};
++mod shared;
++pub use shared::{AllocatorVec, SharedAllocator, TryVecExt, install_default_allocator, try_vec};
 
  pub use alignment::ALIGNMENT;
 
+@@ -35,7 +37,7 @@
+ /// Mode of deallocating memory regions
+ pub(crate) enum Deallocation {
+     /// An allocation using [`std::alloc`]
+-    Standard(Layout),
++    Standard(Layout, SharedAllocator),
+     /// An allocation from an external source like the FFI interface
+     /// Deallocation will happen on `Allocation::drop`
+     /// The size of the allocation is tracked here separately only
+@@ -46,7 +48,7 @@
+ impl Debug for Deallocation {
+     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+         match self {
+-            Deallocation::Standard(layout) => {
++            Deallocation::Standard(layout, _) => {
+                 write!(f, "Deallocation::Standard {layout:?}")
+             }
+             Deallocation::Custom(_, size) => {
+@@ -64,7 +66,7 @@
+     fn test_size_of_deallocation() {
+         assert_eq!(
+             std::mem::size_of::<Deallocation>(),
+-            3 * std::mem::size_of::<usize>()
++            4 * std::mem::size_of::<usize>()
+         );
+     }
+ }
+--- a/arrow-buffer/src/alloc/shared.rs
++++ b/arrow-buffer/src/alloc/shared.rs
+@@ -0,0 +1,128 @@
++// SPDX-License-Identifier: Apache-2.0
++
++//! Allocator injection for the local Kernel allocation experiment.
++
++use std::alloc::{AllocError, Allocator, Global, Layout};
++use std::fmt;
++use std::panic::RefUnwindSafe;
++use std::ptr::NonNull;
++use std::sync::OnceLock;
++
++type BackingAllocator = dyn Allocator + Send + Sync + RefUnwindSafe;
++
++static DEFAULT_ALLOCATOR: OnceLock<&'static BackingAllocator> = OnceLock::new();
++
++/// Install the allocator used by subsequently created participating Arrow storage.
++/// Existing storage retains the allocator that created it.
++pub fn install_default_allocator(allocator: &'static BackingAllocator) -> Result<(), &'static str> {
++    DEFAULT_ALLOCATOR
++        .set(allocator)
++        .map_err(|_| "Arrow allocator is already installed")
++}
++
++/// A copyable owner reference retained by an allocation until its final release.
++#[derive(Clone, Copy)]
++pub struct SharedAllocator(Option<&'static BackingAllocator>);
++
++impl SharedAllocator {
++    /// The system allocator for storage imported from ordinary Rust vectors.
++    pub const fn global() -> Self {
++        Self(None)
++    }
++
++    /// Whether this allocation can be returned to an ordinary Rust vector.
++    pub fn is_global(self) -> bool {
++        self.0.is_none()
++    }
++
++    fn backing(self) -> &'static BackingAllocator {
++        self.0.unwrap_or(&Global)
++    }
++}
++
++impl Default for SharedAllocator {
++    fn default() -> Self {
++        Self(DEFAULT_ALLOCATOR.get().copied())
++    }
++}
++
++impl fmt::Debug for SharedAllocator {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("SharedAllocator")
++            .field("global", &self.is_global())
++            .finish()
++    }
++}
++
++// SAFETY: Each operation uses the same retained allocator and forwards the caller's layouts.
++unsafe impl Allocator for SharedAllocator {
++    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
++        self.backing().allocate(layout)
++    }
++    fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
++        self.backing().allocate_zeroed(layout)
++    }
++    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
++        unsafe { self.backing().deallocate(ptr, layout) }
++    }
++    unsafe fn grow(
++        &self,
++        ptr: NonNull<u8>,
++        old: Layout,
++        new: Layout,
++    ) -> Result<NonNull<[u8]>, AllocError> {
++        unsafe { self.backing().grow(ptr, old, new) }
++    }
++    unsafe fn grow_zeroed(
++        &self,
++        ptr: NonNull<u8>,
++        old: Layout,
++        new: Layout,
++    ) -> Result<NonNull<[u8]>, AllocError> {
++        unsafe { self.backing().grow_zeroed(ptr, old, new) }
++    }
++    unsafe fn shrink(
++        &self,
++        ptr: NonNull<u8>,
++        old: Layout,
++        new: Layout,
++    ) -> Result<NonNull<[u8]>, AllocError> {
++        unsafe { self.backing().shrink(ptr, old, new) }
++    }
++}
++
++/// Scratch storage using the allocator selected when the vector is created.
++pub type AllocatorVec<T> = Vec<T, SharedAllocator>;
++
++/// Allocate a fallible scratch vector with exact initial capacity.
++pub fn try_vec<T>(capacity: usize) -> Result<AllocatorVec<T>, AllocError> {
++    let mut values = Vec::new_in(SharedAllocator::default());
++    values.try_reserve_exact(capacity).map_err(|_| AllocError)?;
++    Ok(values)
++}
++
++/// Fallible growth operations used by the JSON decoder.
++pub trait TryVecExt<T> {
++    /// Append after reserving enough capacity through the retained allocator.
++    fn try_push(&mut self, value: T) -> Result<(), AllocError>;
++    /// Copy a slice after reserving enough capacity through the retained allocator.
++    fn try_extend_from_slice(&mut self, values: &[T]) -> Result<(), AllocError>
++    where
++        T: Clone;
++}
++
++impl<T> TryVecExt<T> for AllocatorVec<T> {
++    fn try_push(&mut self, value: T) -> Result<(), AllocError> {
++        self.try_reserve(1).map_err(|_| AllocError)?;
++        self.push(value);
++        Ok(())
++    }
++    fn try_extend_from_slice(&mut self, values: &[T]) -> Result<(), AllocError>
++    where
++        T: Clone,
++    {
++        self.try_reserve(values.len()).map_err(|_| AllocError)?;
++        self.extend_from_slice(values);
++        Ok(())
++    }
++}
 --- a/arrow-buffer/src/buffer/boolean.rs
 +++ b/arrow-buffer/src/buffer/boolean.rs
 @@ -151,6 +151,16 @@
@@ -91,34 +232,227 @@
      /// Invokes `f` with indexes `0..len` collecting the boolean results into a new `BooleanBuffer`
 --- a/arrow-buffer/src/buffer/immutable.rs
 +++ b/arrow-buffer/src/buffer/immutable.rs
-@@ -152,6 +152,17 @@
-         buffer.into()
-     }
+@@ -145,11 +145,18 @@
 
-+    /// Copy a slice after fallibly reserving its backing buffer.
+     /// Initializes a [Buffer] from a slice of items.
+     pub fn from_slice_ref<U: ArrowNativeType, T: AsRef<[U]>>(items: T) -> Self {
++        Self::try_from_slice_ref(items).unwrap_or_else(|error| panic!("{error}"))
++    }
++
++    /// Copy a slice into allocator-owned storage, returning allocation failures.
 +    pub fn try_from_slice_ref<U: ArrowNativeType, T: AsRef<[U]>>(
 +        items: T,
 +    ) -> Result<Self, super::mutable::MutableBufferError> {
-+        let slice = items.as_ref();
-+        let capacity = std::mem::size_of_val(slice);
+         let slice = items.as_ref();
+         let capacity = std::mem::size_of_val(slice);
+-        let mut buffer = MutableBuffer::with_capacity(capacity);
+-        buffer.extend_from_slice(slice);
+-        buffer.into()
 +        let mut buffer = MutableBuffer::try_with_capacity(capacity)?;
 +        buffer.try_extend_from_slice(slice)?;
 +        Ok(buffer.into())
-+    }
-+
+     }
+
      /// Creates a buffer from an existing memory region.
-     ///
-     /// Ownership of the memory is tracked via reference counting
---- a/arrow-buffer/src/buffer/mutable.rs
-+++ b/arrow-buffer/src/buffer/mutable.rs
-@@ -131,6 +131,7 @@
-     reservation: TrackedReservation,
+@@ -436,7 +443,8 @@
+     /// 3. The buffer is shared
+     pub fn into_vec<T: ArrowNativeType>(self) -> Result<Vec<T>, Self> {
+         let layout = match self.data.deallocation() {
+-            Deallocation::Standard(l) => l,
++            Deallocation::Standard(l, allocator) if allocator.is_global() => l,
++            Deallocation::Standard(..) => return Err(self),
+             Deallocation::Custom(..) => return Err(self),
+         };
+
+@@ -512,6 +520,12 @@
+ impl<const N: usize> From<&[u8; N]> for Buffer {
+     fn from(p: &[u8; N]) -> Self {
+         Self::from_slice_ref(p)
++    }
++}
++
++impl<T: ArrowNativeType> From<crate::alloc::AllocatorVec<T>> for Buffer {
++    fn from(values: crate::alloc::AllocatorVec<T>) -> Self {
++        MutableBuffer::from(values).into()
+     }
  }
 
+--- a/arrow-buffer/src/buffer/mutable.rs
++++ b/arrow-buffer/src/buffer/mutable.rs
+@@ -15,7 +15,8 @@
+ // specific language governing permissions and limitations
+ // under the License.
+
+-use std::alloc::Layout;
++use crate::alloc::SharedAllocator;
++use std::alloc::{Allocator, Layout};
+ use std::mem;
+ use std::ptr::NonNull;
+
+@@ -125,10 +126,30 @@
+     // invariant: len <= capacity
+     len: usize,
+     layout: Layout,
++    allocator: SharedAllocator,
+
+     /// Memory reservation for tracking memory usage
+     #[cfg(feature = "pool")]
+     reservation: TrackedReservation,
++}
 +
++impl<T: ArrowNativeType> From<crate::alloc::AllocatorVec<T>> for MutableBuffer {
++    fn from(values: crate::alloc::AllocatorVec<T>) -> Self {
++        let mut values = std::mem::ManuallyDrop::new(values);
++        let allocator = *values.allocator();
++        let data = unsafe { NonNull::new_unchecked(values.as_mut_ptr().cast()) };
++        let len = std::mem::size_of_val(values.as_slice());
++        // SAFETY: A live Vec has already validated this element/capacity layout.
++        let layout = unsafe { Layout::array::<T>(values.capacity()).unwrap_unchecked() };
++        Self {
++            data,
++            len,
++            layout,
++            allocator,
++            #[cfg(feature = "pool")]
++            reservation: TrackedReservation::default(),
++        }
++    }
+ }
+
  impl MutableBuffer {
-     /// Allocate a new [MutableBuffer] with initial capacity to be at least `capacity`.
-     ///
+@@ -163,11 +184,15 @@
+             .ok_or(MutableBufferError::LayoutError)?;
+         let layout = Layout::from_size_align(capacity, ALIGNMENT)
+             .map_err(|_| MutableBufferError::LayoutError)?;
++        let allocator = SharedAllocator::default();
+         let data = match layout.size() {
+             0 => dangling_ptr(),
+             _ => {
+                 // Safety: Verified size != 0
+-                let raw_ptr = unsafe { std::alloc::alloc(layout) };
++                let raw_ptr = allocator
++                    .allocate(layout)
++                    .map(|ptr| ptr.cast::<u8>().as_ptr())
++                    .unwrap_or(std::ptr::null_mut());
+                 match NonNull::new(raw_ptr) {
+                     Some(ptr) => ptr,
+                     None => return Err(MutableBufferError::AllocationError(layout)),
+@@ -178,6 +203,7 @@
+             data,
+             len: 0,
+             layout,
++            allocator,
+             #[cfg(feature = "pool")]
+             reservation: TrackedReservation::default(),
+         })
+@@ -206,11 +232,15 @@
+     pub fn try_from_len_zeroed(len: usize) -> Result<Self, MutableBufferError> {
+         let layout =
+             Layout::from_size_align(len, ALIGNMENT).map_err(|_| MutableBufferError::LayoutError)?;
++        let allocator = SharedAllocator::default();
+         let data = match layout.size() {
+             0 => dangling_ptr(),
+             _ => {
+                 // Safety: Verified size != 0
+-                let raw_ptr = unsafe { std::alloc::alloc_zeroed(layout) };
++                let raw_ptr = allocator
++                    .allocate_zeroed(layout)
++                    .map(|ptr| ptr.cast::<u8>().as_ptr())
++                    .unwrap_or(std::ptr::null_mut());
+                 match NonNull::new(raw_ptr) {
+                     Some(ptr) => ptr,
+                     None => return Err(MutableBufferError::AllocationError(layout)),
+@@ -221,6 +251,7 @@
+             data,
+             len,
+             layout,
++            allocator,
+             #[cfg(feature = "pool")]
+             reservation: TrackedReservation::default(),
+         })
+@@ -228,8 +259,8 @@
+
+     /// Allocates a new [MutableBuffer] from given `Bytes`.
+     pub(crate) fn from_bytes(bytes: Bytes) -> Result<Self, Bytes> {
+-        let layout = match bytes.deallocation() {
+-            Deallocation::Standard(layout) => *layout,
++        let (layout, allocator) = match bytes.deallocation() {
++            Deallocation::Standard(layout, allocator) => (*layout, *allocator),
+             Deallocation::Custom(..) => return Err(bytes),
+         };
+
+@@ -244,6 +275,7 @@
+             data,
+             len,
+             layout,
++            allocator,
+             #[cfg(feature = "pool")]
+             reservation,
+         })
+@@ -427,22 +459,22 @@
+         if new_layout.size() == 0 {
+             if self.layout.size() != 0 {
+                 // Safety: data was allocated with layout
+-                unsafe { std::alloc::dealloc(self.as_mut_ptr(), self.layout) };
++                unsafe { self.allocator.deallocate(self.data, self.layout) };
+                 self.layout = new_layout;
+             }
+             return Ok(());
+         }
+
+         let data = match self.layout.size() {
+-            // Safety: new_layout is not empty
+-            0 => unsafe { std::alloc::alloc(new_layout) },
+-            // Safety: verified new layout is valid and not empty
+-            _ => unsafe { std::alloc::realloc(self.as_mut_ptr(), self.layout, capacity) },
++            0 => self.allocator.allocate(new_layout),
++            _ if capacity >= self.layout.size() => unsafe {
++                self.allocator.grow(self.data, self.layout, new_layout)
++            },
++            _ => unsafe { self.allocator.shrink(self.data, self.layout, new_layout) },
+         };
+-        self.data = match NonNull::new(data) {
+-            Some(ptr) => ptr,
+-            None => return Err(MutableBufferError::AllocationError(new_layout)),
+-        };
++        self.data = data
++            .map_err(|_| MutableBufferError::AllocationError(new_layout))?
++            .cast();
+         self.layout = new_layout;
+         #[cfg(feature = "pool")]
+         self.reservation.resize(self.layout.size());
+@@ -588,7 +620,13 @@
+
+     #[inline]
+     pub(super) fn into_buffer(self) -> Buffer {
+-        let bytes = unsafe { Bytes::new(self.data, self.len, Deallocation::Standard(self.layout)) };
++        let bytes = unsafe {
++            Bytes::new(
++                self.data,
++                self.len,
++                Deallocation::Standard(self.layout, self.allocator),
++            )
++        };
+         #[cfg(feature = "pool")]
+         bytes.reservation.replace(self.reservation.take());
+         std::mem::forget(self);
+@@ -982,6 +1020,7 @@
+             data,
+             len,
+             layout,
++            allocator: SharedAllocator::global(),
+             #[cfg(feature = "pool")]
+             reservation: TrackedReservation::default(),
+         }
+@@ -1194,7 +1233,7 @@
+     fn drop(&mut self) {
+         if self.layout.size() != 0 {
+             // Safety: data was allocated with standard allocator with given layout
+-            unsafe { std::alloc::dealloc(self.data.as_ptr().cast(), self.layout) };
++            unsafe { self.allocator.deallocate(self.data, self.layout) };
+         }
+     }
+ }
 --- a/arrow-buffer/src/buffer/null.rs
 +++ b/arrow-buffer/src/buffer/null.rs
 @@ -49,6 +49,14 @@
@@ -136,6 +470,30 @@
      }
 
      /// Create a new [`NullBuffer`] of length `len` where all values are valid
+--- a/arrow-buffer/src/buffer/scalar.rs
++++ b/arrow-buffer/src/buffer/scalar.rs
+@@ -191,7 +191,7 @@
+         let is_aligned = buffer.as_ptr().align_offset(align) == 0;
+
+         match buffer.deallocation() {
+-            Deallocation::Standard(_) => assert!(
++            Deallocation::Standard(..) => assert!(
+                 is_aligned,
+                 "Memory pointer is not aligned with the specified scalar type"
+             ),
+@@ -211,6 +211,12 @@
+ impl<T: ArrowNativeType> From<OffsetBuffer<T>> for ScalarBuffer<T> {
+     fn from(value: OffsetBuffer<T>) -> Self {
+         value.into_inner()
++    }
++}
++
++impl<T: ArrowNativeType> From<crate::alloc::AllocatorVec<T>> for ScalarBuffer<T> {
++    fn from(values: crate::alloc::AllocatorVec<T>) -> Self {
++        Buffer::from(values).into()
+     }
+ }
+
 --- a/arrow-buffer/src/builder/boolean.rs
 +++ b/arrow-buffer/src/builder/boolean.rs
 @@ -57,9 +57,27 @@
@@ -169,6 +527,130 @@
      }
 
      /// Creates a new `BooleanBufferBuilder` from [`MutableBuffer`] of `len`
+--- a/arrow-buffer/src/bytes.rs
++++ b/arrow-buffer/src/bytes.rs
+@@ -20,6 +20,7 @@
+ //! Note that this is a low-level functionality of this crate.
+
+ use core::slice;
++use std::alloc::Allocator;
+ use std::ptr::NonNull;
+ use std::{fmt::Debug, fmt::Formatter};
+
+@@ -97,7 +98,7 @@
+
+     pub(crate) fn capacity(&self) -> usize {
+         match self.deallocation {
+-            Deallocation::Standard(layout) => layout.size(),
++            Deallocation::Standard(layout, _) => layout.size(),
+             // we only know the size of the custom allocation
+             // its underlying capacity might be larger
+             Deallocation::Custom(_, size) => size,
+@@ -133,19 +134,17 @@
+         new_len: usize,
+         on_reallocated: impl FnOnce(NonNull<u8>),
+     ) -> Result<(), ()> {
+-        if let Deallocation::Standard(old_layout) = self.deallocation {
++        if let Deallocation::Standard(old_layout, allocator) = self.deallocation {
+             if old_layout.size() == new_len {
+                 return Ok(()); // Nothing to do
+             }
+
+             if let Ok(new_layout) = std::alloc::Layout::from_size_align(new_len, old_layout.align())
+             {
+-                let old_ptr = self.ptr.as_ptr();
+-
+                 let new_ptr = match new_layout.size() {
+                     0 => {
+                         // SAFETY: Verified that old_layout.size != new_len (0)
+-                        unsafe { std::alloc::dealloc(self.ptr.as_ptr(), old_layout) };
++                        unsafe { allocator.deallocate(self.ptr, old_layout) };
+                         Some(dangling_ptr())
+                     }
+                     // SAFETY: the call to `realloc` is safe if all the following hold (from https://doc.rust-lang.org/stable/std/alloc/trait.GlobalAlloc.html#method.realloc):
+@@ -153,13 +152,21 @@
+                     // * `old_layout` must be the same layout that was used to allocate that block of memory (same)
+                     // * `new_len` must be greater than zero
+                     // * `new_len`, when rounded up to the nearest multiple of `layout.align()`, must not overflow `isize` (guaranteed by the success of `Layout::from_size_align`)
+-                    _ => NonNull::new(unsafe { std::alloc::realloc(old_ptr, old_layout, new_len) }),
++                    _ => unsafe {
++                        if new_len >= old_layout.size() {
++                            allocator.grow(self.ptr, old_layout, new_layout)
++                        } else {
++                            allocator.shrink(self.ptr, old_layout, new_layout)
++                        }
++                    }
++                    .ok()
++                    .map(|ptr| ptr.cast()),
+                 };
+
+                 if let Some(ptr) = new_ptr {
+                     self.ptr = ptr;
+                     self.len = new_len;
+-                    self.deallocation = Deallocation::Standard(new_layout);
++                    self.deallocation = Deallocation::Standard(new_layout, allocator);
+                     on_reallocated(ptr);
+
+                     #[cfg(feature = "pool")]
+@@ -191,9 +198,9 @@
+     #[inline]
+     fn drop(&mut self) {
+         match &self.deallocation {
+-            Deallocation::Standard(layout) => match layout.size() {
++            Deallocation::Standard(layout, allocator) => match layout.size() {
+                 0 => {} // Nothing to do
+-                _ => unsafe { std::alloc::dealloc(self.ptr.as_ptr(), *layout) },
++                _ => unsafe { allocator.deallocate(self.ptr, *layout) },
+             },
+             // The automatic drop implementation will free the memory once the reference count reaches zero
+             Deallocation::Custom(_allocation, _size) => (),
+@@ -277,7 +284,7 @@
+                 Bytes::new(
+                     NonNull::new(ptr).unwrap(),
+                     1024,
+-                    Deallocation::Standard(layout),
++                    Deallocation::Standard(layout, crate::alloc::SharedAllocator::global()),
+                 )
+             };
+
+@@ -311,7 +318,7 @@
+                     let bytes = Bytes::new(
+                         NonNull::new(ptr).unwrap(),
+                         1024,
+-                        Deallocation::Standard(layout),
++                        Deallocation::Standard(layout, crate::alloc::SharedAllocator::global()),
+                     );
+
+                     bytes.claim(&pool);
+--- a/arrow-cast/src/cast/mod.rs
++++ b/arrow-cast/src/cast/mod.rs
+@@ -799,7 +799,7 @@
+         return Ok(make_array(array.to_data()));
+     }
+     match (from_type, to_type) {
+-        (Null, _) => Ok(new_null_array(to_type, array.len())),
++        (Null, _) => try_new_null_array(to_type, array.len()),
+         (RunEndEncoded(index_type, _), _) => match index_type.data_type() {
+             Int16 => run_end_encoded_cast::<Int16Type>(array, to_type, cast_options),
+             Int32 => run_end_encoded_cast::<Int32Type>(array, to_type, cast_options),
+@@ -2428,7 +2428,7 @@
+         Utf8View => value_to_string_view(array, cast_options),
+         Utf8 => value_to_string::<i32>(array, cast_options),
+         LargeUtf8 => value_to_string::<i64>(array, cast_options),
+-        Null => Ok(new_null_array(to_type, array.len())),
++        Null => try_new_null_array(to_type, array.len()),
+         _ => Err(ArrowError::CastError(format!(
+             "Casting from {from_type} to {to_type} not supported"
+         ))),
+@@ -2529,7 +2529,7 @@
+             cast_string_to_decimal::<D, i32>(array, *precision, *scale, cast_options)
+         }
+         LargeUtf8 => cast_string_to_decimal::<D, i64>(array, *precision, *scale, cast_options),
+-        Null => Ok(new_null_array(to_type, array.len())),
++        Null => try_new_null_array(to_type, array.len()),
+         _ => Err(ArrowError::CastError(format!(
+             "Casting from {from_type} to {to_type} not supported"
+         ))),
 --- a/arrow-data/Cargo.toml
 +++ b/arrow-data/Cargo.toml
 @@ -11,7 +11,7 @@
@@ -176,7 +658,7 @@
  [package]
  edition = "2024"
 -rust-version = "1.88"
-+rust-version = "1.95"
++rust-version = "1.100"
  name = "arrow-data"
  version = "60.0.0"
  authors = ["Apache Arrow <dev@arrow.apache.org>"]
@@ -195,7 +677,7 @@
 +    capacity: usize,
 +) -> Result<[MutableBuffer; 2], ArrowError> {
 +    let buffer = |bytes| {
-+        MutableBuffer::try_with_capacity(bytes).map_err(|_| ArrowError::MemoryError(String::new()))
++        MutableBuffer::try_with_capacity(bytes).map_err(|e| ArrowError::MemoryError(e.to_string()))
 +    };
 +    let bytes = |width| {
 +        capacity
@@ -330,8 +812,8 @@
 +    /// Construct null array data while propagating buffer allocation failures.
 +    pub fn try_new_null(data_type: &DataType, len: usize) -> Result<Self, ArrowError> {
 +        let bit_len = len.div_ceil(8);
-+        let allocation_error = |_error: arrow_buffer::buffer::MutableBufferError| {
-+            ArrowError::MemoryError(String::new())
++        let allocation_error = |error: arrow_buffer::buffer::MutableBufferError| {
++            ArrowError::MemoryError(error.to_string())
 +        };
 +        let zeroed = |len: usize| {
 +            MutableBuffer::try_from_len_zeroed(len)
@@ -556,16 +1038,6 @@
      }
 
      /// Verifies that the buffers meet the minimum alignment requirements for the data type
---- a/arrow-data/src/transform/fixed_binary.rs
-+++ b/arrow-data/src/transform/fixed_binary.rs
-@@ -40,6 +40,6 @@
-     let values_buffer = &mut mutable.buffer1;
-     values_buffer
-         .try_extend_zeros(len * size)
--        .map_err(|e| arrow_schema::ArrowError::MemoryError(e.to_string()))?;
-+        .map_err(|_| arrow_schema::ArrowError::MemoryError(String::new()))?;
-     Ok(())
- }
 --- a/arrow-data/src/transform/mod.rs
 +++ b/arrow-data/src/transform/mod.rs
 @@ -350,16 +350,20 @@
@@ -582,7 +1054,7 @@
 +        .and_then(|n| n.checked_mul(mem::size_of::<Offset>()))
 +        .ok_or_else(|| ArrowError::MemoryError("array offset capacity overflow".into()))?;
 +    let mut buffer = MutableBuffer::try_with_capacity(offset_bytes)
-+        .map_err(|_| ArrowError::MemoryError(String::new()))?;
++        .map_err(|e| ArrowError::MemoryError(e.to_string()))?;
 +    // The initial offset fits in the reserved buffer.
      buffer.push(Offset::zero());
 -
@@ -592,7 +1064,7 @@
 -        MutableBuffer::new(binary_size * mem::size_of::<u8>()),
 -    ]
 +        MutableBuffer::try_with_capacity(binary_size)
-+            .map_err(|_| ArrowError::MemoryError(String::new()))?,
++            .map_err(|e| ArrowError::MemoryError(e.to_string()))?,
 +    ])
  }
 
@@ -658,182 +1130,12 @@
 +            .then(|| {
 +                let null_bytes = bit_util::ceil(array_capacity, 8);
 +                MutableBuffer::try_from_len_zeroed(null_bytes)
-+                    .map_err(|_| ArrowError::MemoryError(String::new()))
++                    .map_err(|e| ArrowError::MemoryError(e.to_string()))
 +            })
 +            .transpose()?;
 
          let extend_values = match &data_type {
              DataType::Dictionary(_, _) => {
-@@ -848,7 +852,7 @@
-         let nulls = self.data.null_buffer();
-         nulls
-             .try_resize(bit_len, 0)
--            .map_err(|e| ArrowError::MemoryError(e.to_string()))?;
-+            .map_err(|_| ArrowError::MemoryError(String::new()))?;
-         self.data.null_count += len;
-         (self.extend_nulls)(&mut self.data, len)?;
-         Ok(())
---- a/arrow-data/src/transform/primitive.rs
-+++ b/arrow-data/src/transform/primitive.rs
-@@ -56,6 +56,6 @@
-     mutable
-         .buffer1
-         .try_extend_zeros(len * size_of::<T>())
--        .map_err(|e| arrow_schema::ArrowError::MemoryError(e.to_string()))?;
-+        .map_err(|_| arrow_schema::ArrowError::MemoryError(String::new()))?;
-     Ok(())
- }
---- a/arrow-data/src/transform/run.rs
-+++ b/arrow-data/src/transform/run.rs
-@@ -71,7 +71,7 @@
-                 .data
-                 .buffer1
-                 .try_extend_from_slice(new_value.to_byte_slice())
--                .map_err(|e| ArrowError::MemoryError(e.to_string()))?;
-+                .map_err(|_| ArrowError::MemoryError(String::new()))?;
-         }};
-     }
-
---- a/arrow-data/src/transform/union.rs
-+++ b/arrow-data/src/transform/union.rs
-@@ -87,7 +87,7 @@
-     mutable
-         .buffer1
-         .try_extend_from_slice(&vec![first_type_id; len])
--        .map_err(|e| ArrowError::MemoryError(e.to_string()))?;
-+        .map_err(|_| ArrowError::MemoryError(String::new()))?;
-
-     // Dense: extend offsets pointing into the first child, then extend nulls in that child
-     let child_offset = mutable.child_data[0].len();
-@@ -114,7 +114,7 @@
-     mutable
-         .buffer1
-         .try_extend_from_slice(&vec![first_type_id; len])
--        .map_err(|e| ArrowError::MemoryError(e.to_string()))?;
-+        .map_err(|_| ArrowError::MemoryError(String::new()))?;
-
-     // Sparse: extend nulls in ALL children
-     for child in &mut mutable.child_data {
---- a/arrow-data/src/transform/utils.rs
-+++ b/arrow-data/src/transform/utils.rs
-@@ -37,7 +37,7 @@
- ) -> Result<(), ArrowError> {
-     buffer
-         .try_reserve(std::mem::size_of_val(offsets))
--        .map_err(|e| ArrowError::MemoryError(e.to_string()))?;
-+        .map_err(|_| ArrowError::MemoryError(String::new()))?;
-     // Snapshot the length so we can roll back partial writes on overflow.
-     let original_len = buffer.len();
-     for window in offsets.windows(2) {
---- a/arrow-array/Cargo.toml
-+++ b/arrow-array/Cargo.toml
-@@ -11,7 +11,7 @@
-
- [package]
- edition = "2024"
--rust-version = "1.88"
-+rust-version = "1.95"
- name = "arrow-array"
- version = "60.0.0"
- authors = ["Apache Arrow <dev@arrow.apache.org>"]
---- a/arrow-array/src/array/fixed_size_binary_array.rs
-+++ b/arrow-array/src/array/fixed_size_binary_array.rs
-@@ -465,7 +465,7 @@
-                     if let Some(capacity) = iter_size_hint.checked_mul(len) {
-                         buffer
-                             .try_reserve(capacity)
--                            .map_err(|e| ArrowError::MemoryError(e.to_string()))?;
-+                            .map_err(|_| ArrowError::MemoryError(String::new()))?;
-                     }
-                     let prepend_zeros = slice.len().checked_mul(prepend).ok_or_else(|| {
-                         ArrowError::InvalidArgumentError(format!(
-@@ -475,16 +475,16 @@
-                     })?;
-                     buffer
-                         .try_extend_zeros(prepend_zeros)
--                        .map_err(|e| ArrowError::MemoryError(e.to_string()))?;
-+                        .map_err(|_| ArrowError::MemoryError(String::new()))?;
-                 }
-                 bit_util::set_bit(null_buf.as_slice_mut(), len);
-                 buffer
-                     .try_extend_from_slice(slice)
--                    .map_err(|e| ArrowError::MemoryError(e.to_string()))?;
-+                    .map_err(|_| ArrowError::MemoryError(String::new()))?;
-             } else if let Some(size) = value_size {
-                 buffer
-                     .try_extend_zeros(size)
--                    .map_err(|e| ArrowError::MemoryError(e.to_string()))?;
-+                    .map_err(|_| ArrowError::MemoryError(String::new()))?;
-             } else {
-                 prepend += 1;
-             }
-@@ -648,13 +648,13 @@
-                 if let Some(capacity) = iter_size_hint.checked_mul(len) {
-                     buffer
-                         .try_reserve(capacity)
--                        .map_err(|e| ArrowError::MemoryError(e.to_string()))?;
-+                        .map_err(|_| ArrowError::MemoryError(String::new()))?;
-                 }
-             }
-
-             buffer
-                 .try_extend_from_slice(slice)
--                .map_err(|e| ArrowError::MemoryError(e.to_string()))?;
-+                .map_err(|_| ArrowError::MemoryError(String::new()))?;
-
-             len += 1;
-
---- a/arrow-array/src/array/mod.rs
-+++ b/arrow-array/src/array/mod.rs
-@@ -1021,6 +1021,19 @@
-     make_array(data)
- }
-
-+/// Create an empty array while propagating buffer allocation failures.
-+pub fn try_new_empty_array(data_type: &DataType) -> Result<ArrayRef, arrow_schema::ArrowError> {
-+    Ok(make_array(ArrayData::try_new_empty(data_type)?))
-+}
-+
-+/// Create a null array while propagating buffer allocation failures.
-+pub fn try_new_null_array(
-+    data_type: &DataType,
-+    length: usize,
-+) -> Result<ArrayRef, arrow_schema::ArrowError> {
-+    Ok(make_array(ArrayData::try_new_null(data_type, length)?))
-+}
-+
- /// Creates a new array of `data_type` of length `length` filled
- /// entirely of `NULL` values
- ///
---- a/arrow-cast/src/cast/mod.rs
-+++ b/arrow-cast/src/cast/mod.rs
-@@ -799,7 +799,7 @@
-         return Ok(make_array(array.to_data()));
-     }
-     match (from_type, to_type) {
--        (Null, _) => Ok(new_null_array(to_type, array.len())),
-+        (Null, _) => try_new_null_array(to_type, array.len()),
-         (RunEndEncoded(index_type, _), _) => match index_type.data_type() {
-             Int16 => run_end_encoded_cast::<Int16Type>(array, to_type, cast_options),
-             Int32 => run_end_encoded_cast::<Int32Type>(array, to_type, cast_options),
-@@ -2428,7 +2428,7 @@
-         Utf8View => value_to_string_view(array, cast_options),
-         Utf8 => value_to_string::<i32>(array, cast_options),
-         LargeUtf8 => value_to_string::<i64>(array, cast_options),
--        Null => Ok(new_null_array(to_type, array.len())),
-+        Null => try_new_null_array(to_type, array.len()),
-         _ => Err(ArrowError::CastError(format!(
-             "Casting from {from_type} to {to_type} not supported"
-         ))),
-@@ -2529,7 +2529,7 @@
-             cast_string_to_decimal::<D, i32>(array, *precision, *scale, cast_options)
-         }
-         LargeUtf8 => cast_string_to_decimal::<D, i64>(array, *precision, *scale, cast_options),
--        Null => Ok(new_null_array(to_type, array.len())),
-+        Null => try_new_null_array(to_type, array.len()),
-         _ => Err(ArrowError::CastError(format!(
-             "Casting from {from_type} to {to_type} not supported"
-         ))),
 --- a/arrow-json/Cargo.toml
 +++ b/arrow-json/Cargo.toml
 @@ -11,7 +11,7 @@
@@ -841,7 +1143,7 @@
  [package]
  edition = "2024"
 -rust-version = "1.88"
-+rust-version = "1.95"
++rust-version = "1.100"
  name = "arrow-json"
  version = "60.0.0"
  authors = ["Apache Arrow <dev@arrow.apache.org>"]
@@ -962,7 +1264,7 @@
 +        let mut child_pos = try_vec(
 +            pos.len()
 +                .checked_mul(expected)
-+                .ok_or_else(|| allocation_error(arrow_buffer::alloc::AllocationError))?,
++                .ok_or_else(|| allocation_error(std::alloc::AllocError))?,
 +        )
 +        .map_err(allocation_error)?;
 
@@ -1129,17 +1431,17 @@
  }
 --- a/arrow-json/src/reader/serializer.rs
 +++ b/arrow-json/src/reader/serializer.rs
-@@ -16,6 +16,8 @@
+@@ -16,20 +16,34 @@
  // under the License.
 
  use crate::reader::tape::TapeElement;
-+use arrow_buffer::alloc::AllocationError;
-+use arrow_buffer::alloc::TryVecExt;
++use arrow_buffer::alloc::{AllocatorVec, TryVecExt};
  use lexical_core::FormattedSize;
  use serde_core::ser::{
      Impossible, SerializeMap, SerializeSeq, SerializeStruct, SerializeTuple, SerializeTupleStruct,
-@@ -23,13 +25,25 @@
+ };
  use serde_core::{Serialize, Serializer};
++use std::alloc::AllocError;
 
  #[derive(Debug)]
 -pub struct SerializerError(String);
@@ -1148,8 +1450,8 @@
 +    Allocation,
 +}
 +
-+impl From<AllocationError> for SerializerError {
-+    fn from(_: AllocationError) -> Self {
++impl From<AllocError> for SerializerError {
++    fn from(_: AllocError) -> Self {
 +        Self::Allocation
 +    }
 +}
@@ -1175,6 +1477,33 @@
      }
  }
 
+@@ -46,20 +60,20 @@
+ ///
+ /// Heavily based on <https://serde.rs/impl-serializer.html>
+ pub struct TapeSerializer<'a> {
+-    elements: &'a mut Vec<TapeElement>,
++    elements: &'a mut AllocatorVec<TapeElement>,
+
+     /// A buffer of parsed string data
+-    bytes: &'a mut Vec<u8>,
++    bytes: &'a mut AllocatorVec<u8>,
+
+     /// Offsets into `data`
+-    offsets: &'a mut Vec<usize>,
++    offsets: &'a mut AllocatorVec<usize>,
+ }
+
+ impl<'a> TapeSerializer<'a> {
+     pub fn new(
+-        elements: &'a mut Vec<TapeElement>,
+-        bytes: &'a mut Vec<u8>,
+-        offsets: &'a mut Vec<usize>,
++        elements: &'a mut AllocatorVec<TapeElement>,
++        bytes: &'a mut AllocatorVec<u8>,
++        offsets: &'a mut AllocatorVec<usize>,
+     ) -> Self {
+         Self {
+             elements,
 @@ -68,11 +82,12 @@
          }
      }
@@ -1424,13 +1753,13 @@
 +
 +//! Fallible backing storage for the JSON decoder's variable-size output.
 +
-+use arrow_buffer::alloc::AllocationError;
++use std::alloc::AllocError;
 +use std::marker::PhantomData;
 +
 +use arrow_array::{
 +    ArrowPrimitiveType, BooleanArray, GenericStringArray, OffsetSizeTrait, PrimitiveArray,
 +};
-+use arrow_buffer::alloc::{TryVecExt, try_vec};
++use arrow_buffer::alloc::{AllocatorVec, TryVecExt, try_vec};
 +use arrow_buffer::{BooleanBuffer, Buffer, MutableBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 +use arrow_schema::ArrowError;
 +
@@ -1458,14 +1787,14 @@
 +    pub(super) fn append_null(&mut self) -> Result<(), ArrowError> {
 +        if self.buffer.is_none() {
 +            let mut buffer = MutableBuffer::try_from_len_zeroed(self.capacity.div_ceil(8))
-+                .map_err(|_| allocation_error(AllocationError))?;
++                .map_err(|_| allocation_error(AllocError))?;
 +            buffer.as_slice_mut().fill(0xff);
 +            self.buffer = Some(buffer);
 +        }
 +        let buffer = self
 +            .buffer
 +            .as_mut()
-+            .ok_or_else(|| allocation_error(AllocationError))?;
++            .ok_or_else(|| allocation_error(AllocError))?;
 +        buffer.as_slice_mut()[self.len / 8] &= !(1 << (self.len % 8));
 +        self.len += 1;
 +        Ok(())
@@ -1479,8 +1808,8 @@
 +}
 +
 +pub(super) struct StringBuilder<O: OffsetSizeTrait> {
-+    values: Vec<u8>,
-+    offsets: Vec<O>,
++    values: AllocatorVec<u8>,
++    offsets: AllocatorVec<O>,
 +    validity: Validity,
 +}
 +
@@ -1488,7 +1817,7 @@
 +    pub(super) fn new(rows: usize, bytes: usize) -> Result<Self, ArrowError> {
 +        let mut offsets = try_vec(
 +            rows.checked_add(1)
-+                .ok_or_else(|| allocation_error(AllocationError))?,
++                .ok_or_else(|| allocation_error(AllocError))?,
 +        )
 +        .map_err(allocation_error)?;
 +        offsets
@@ -1506,7 +1835,7 @@
 +            .values
 +            .len()
 +            .checked_add(value.len())
-+            .ok_or_else(|| allocation_error(AllocationError))?;
++            .ok_or_else(|| allocation_error(AllocError))?;
 +        let offset = O::from_usize(len).ok_or(ArrowError::OffsetOverflowError(len))?;
 +        self.values
 +            .try_extend_from_slice(value.as_bytes())
@@ -1536,7 +1865,7 @@
 +}
 +
 +pub(super) struct PrimitiveBuilder<P: ArrowPrimitiveType> {
-+    values: Vec<P::Native>,
++    values: AllocatorVec<P::Native>,
 +    validity: Validity,
 +    marker: PhantomData<P>,
 +}
@@ -1566,7 +1895,7 @@
 +}
 +
 +pub(super) struct BooleanBuilder {
-+    values: Vec<u8>,
++    values: AllocatorVec<u8>,
 +    validity: Validity,
 +}
 +
@@ -1683,13 +2012,30 @@
  use arrow_schema::{ArrowError, DataType, Fields};
 
  use crate::reader::tape::{Tape, TapeElement};
+@@ -28,14 +28,14 @@
+ /// Reusable buffer for tape positions, indexed by (field_idx, row_idx).
+ /// A value of 0 indicates the field is absent for that row.
+ struct FieldTapePositions {
+-    data: Vec<u32>,
++    data: arrow_buffer::alloc::AllocatorVec<u32>,
+     row_count: usize,
+ }
+
+ impl FieldTapePositions {
+     fn new() -> Self {
+         Self {
+-            data: Vec::new(),
++            data: Vec::new_in(arrow_buffer::alloc::SharedAllocator::default()),
+             row_count: 0,
+         }
+     }
 @@ -47,6 +47,9 @@
              ))
          })?;
          self.data.clear();
 +        self.data
 +            .try_reserve(total_len)
-+            .map_err(|_| super::tape::allocation_error(arrow_buffer::alloc::AllocationError))?;
++            .map_err(|_| super::tape::allocation_error(std::alloc::AllocError))?;
          self.data.resize(total_len, 0);
          self.row_count = row_count;
          Ok(())
@@ -1727,19 +2073,45 @@
  // under the License.
 
  use crate::reader::serializer::TapeSerializer;
-+use arrow_buffer::alloc::AllocationError;
-+use arrow_buffer::alloc::{TryVecExt, try_vec};
++use arrow_buffer::alloc::{AllocatorVec, TryVecExt, try_vec};
  use arrow_schema::ArrowError;
  use memchr::memchr2;
  use serde_core::Serialize;
++use std::alloc::AllocError;
  use std::fmt::Write;
 +
-+pub(super) fn allocation_error(_: AllocationError) -> ArrowError {
-+    ArrowError::MemoryError(String::new())
++pub(super) fn allocation_error(_: AllocError) -> ArrowError {
++    ArrowError::MemoryError("Arrow allocator rejected allocation".into())
 +}
 
  /// We decode JSON to a flattened tape representation,
  /// allowing for efficient traversal of the JSON data
+@@ -317,7 +323,7 @@
+ #[derive(Debug)]
+ pub struct TapeDecoder {
+     /// The decoded elements
+-    elements: Vec<TapeElement>,
++    elements: AllocatorVec<TapeElement>,
+
+     /// The number of rows decoded, including any in progress if `!stack.is_empty()`
+     cur_row: usize,
+@@ -335,13 +341,13 @@
+     ///
+     /// Note: if part way through a record, i.e. `stack` is not empty,
+     /// this may contain truncated UTF-8 data
+-    bytes: Vec<u8>,
++    bytes: AllocatorVec<u8>,
+
+     /// Offsets into `data`
+-    offsets: Vec<usize>,
++    offsets: AllocatorVec<usize>,
+
+     /// A stack of [`DecoderState`]
+-    stack: Vec<DecoderState>,
++    stack: AllocatorVec<DecoderState>,
+ }
+
+ /// Configuration for a `TapeDecoder`.
 @@ -357,29 +363,49 @@
 
  impl TapeDecoder {
@@ -1767,20 +2139,20 @@
 -        Self {
 +        let fields = num_fields
 +            .checked_mul(2)
-+            .ok_or_else(|| allocation_error(AllocationError))?;
++            .ok_or_else(|| allocation_error(AllocError))?;
 +        let tokens_per_row = fields
 +            .checked_add(2)
-+            .ok_or_else(|| allocation_error(AllocationError))?;
++            .ok_or_else(|| allocation_error(AllocError))?;
 +        let offset_capacity = batch_size
 +            .checked_mul(fields)
 +            .and_then(|n| n.checked_add(1))
-+            .ok_or_else(|| allocation_error(AllocationError))?;
++            .ok_or_else(|| allocation_error(AllocError))?;
 +        let element_capacity = batch_size
 +            .checked_mul(tokens_per_row)
-+            .ok_or_else(|| allocation_error(AllocationError))?;
++            .ok_or_else(|| allocation_error(AllocError))?;
 +        let byte_capacity = fields
 +            .checked_mul(8)
-+            .ok_or_else(|| allocation_error(AllocationError))?;
++            .ok_or_else(|| allocation_error(AllocError))?;
 +        let mut offsets = try_vec(offset_capacity).map_err(allocation_error)?;
 +        offsets.try_push(0).map_err(allocation_error)?;
 +        let mut elements = try_vec(element_capacity).map_err(allocation_error)?;
@@ -2009,7 +2381,7 @@
 -            .map_err(|e| ArrowError::JsonError(e.to_string()))?;
 +            .map_err(|e| match e {
 +                crate::reader::serializer::SerializerError::Allocation => {
-+                    allocation_error(AllocationError)
++                    allocation_error(AllocError)
 +                }
 +                crate::reader::serializer::SerializerError::Message(message) => {
 +                    ArrowError::JsonError(message)
@@ -2036,7 +2408,7 @@
 
  /// Writes `c` as UTF-8 to `out`
 -fn write_char(c: char, out: &mut Vec<u8>) {
-+fn write_char(c: char, out: &mut Vec<u8>) -> Result<(), ArrowError> {
++fn write_char(c: char, out: &mut AllocatorVec<u8>) -> Result<(), ArrowError> {
      let mut t = [0; 4];
 -    out.extend_from_slice(c.encode_utf8(&mut t).as_bytes());
 +    out.try_extend_from_slice(c.encode_utf8(&mut t).as_bytes())
@@ -2109,80 +2481,6 @@
      for &(array_idx, row_idx) in indices {
          let list = interleaved.arrays[array_idx];
          let start = list.offsets()[row_idx].as_usize();
---- a/arrow-select/src/zip.rs
-+++ b/arrow-select/src/zip.rs
-@@ -542,7 +542,7 @@
-         let mut bytes = MutableBuffer::with_capacity(0);
-         bytes
-             .try_repeat_slice_n_times(value, number_of_true)
--            .map_err(|e| ArrowError::MemoryError(e.to_string()))?;
-+            .map_err(|_| ArrowError::MemoryError(String::new()))?;
-
-         let bytes = Buffer::from(bytes);
-
-@@ -567,7 +567,7 @@
-         let mut bytes = MutableBuffer::with_capacity(0);
-         bytes
-             .try_repeat_slice_n_times(value, number_of_values)
--            .map_err(|e| ArrowError::MemoryError(e.to_string()))?;
-+            .map_err(|_| ArrowError::MemoryError(String::new()))?;
-         let bytes = Buffer::from(bytes);
-
-         Ok((bytes, offsets))
-@@ -613,7 +613,7 @@
-                 // Push false value `repeat_count` times
-                 mutable
-                     .try_repeat_slice_n_times(falsy_val, false_repeat_count)
--                    .map_err(|e| ArrowError::MemoryError(e.to_string()))?;
-+                    .map_err(|_| ArrowError::MemoryError(String::new()))?;
-
-                 for _ in 0..false_repeat_count {
-                     offset_buffer_builder.push_length(falsy_len)
-@@ -624,7 +624,7 @@
-             // fill with truthy values
-             mutable
-                 .try_repeat_slice_n_times(truthy_val, true_repeat_count)
--                .map_err(|e| ArrowError::MemoryError(e.to_string()))?;
-+                .map_err(|_| ArrowError::MemoryError(String::new()))?;
-
-             for _ in 0..true_repeat_count {
-                 offset_buffer_builder.push_length(truthy_len)
-@@ -638,7 +638,7 @@
-             // Copy the first item from the 'falsy' array into the output buffer.
-             mutable
-                 .try_repeat_slice_n_times(falsy_val, false_repeat_count)
--                .map_err(|e| ArrowError::MemoryError(e.to_string()))?;
-+                .map_err(|_| ArrowError::MemoryError(String::new()))?;
-
-             for _ in 0..false_repeat_count {
-                 offset_buffer_builder.push_length(falsy_len)
-@@ -820,7 +820,7 @@
-                                     view_falsy.to_byte_slice(),
-                                     false_repeat_count,
-                                 )
--                                .map_err(|e| ArrowError::MemoryError(e.to_string()))?;
-+                                .map_err(|_| ArrowError::MemoryError(String::new()))?;
-                         }
-                         let true_repeat_count = end - start;
-                         mutable
-@@ -828,7 +828,7 @@
-                                 truthy_view.to_byte_slice(),
-                                 true_repeat_count,
-                             )
--                            .map_err(|e| ArrowError::MemoryError(e.to_string()))?;
-+                            .map_err(|_| ArrowError::MemoryError(String::new()))?;
-                         filled = end;
-                         Ok(())
-                     },
-@@ -838,7 +838,7 @@
-                     let false_repeat_count = predicate.len() - filled;
-                     mutable
-                         .try_repeat_slice_n_times(view_falsy.to_byte_slice(), false_repeat_count)
--                        .map_err(|e| ArrowError::MemoryError(e.to_string()))?;
-+                        .map_err(|_| ArrowError::MemoryError(String::new()))?;
-                 }
-
-                 let bytes = Buffer::from(mutable);
 --- a/parquet/Cargo.toml
 +++ b/parquet/Cargo.toml
 @@ -11,7 +11,7 @@
@@ -2190,7 +2488,7 @@
  [package]
  edition = "2024"
 -rust-version = "1.88"
-+rust-version = "1.95"
++rust-version = "1.100"
  name = "parquet"
  version = "60.0.0"
  authors = ["Apache Arrow <dev@arrow.apache.org>"]
@@ -2380,50 +2678,24 @@
                              batch_levels,
 --- a/parquet/src/errors.rs
 +++ b/parquet/src/errors.rs
-@@ -31,6 +31,8 @@
- #[derive(Debug)]
- #[non_exhaustive]
- pub enum ParquetError {
-+    /// A backing allocation was rejected.
-+    MemoryAllocation,
-     /// General Parquet error.
-     /// Returned when code violates normal workflow of working with Parquet files.
-     General(String),
-@@ -61,6 +63,7 @@
- impl std::fmt::Display for ParquetError {
-     fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
-         match &self {
-+            ParquetError::MemoryAllocation => fmt.write_str("Memory allocation failed"),
-             ParquetError::General(message) => {
-                 write!(fmt, "Parquet error: {message}")
-             }
-@@ -129,6 +132,7 @@
- #[cfg(feature = "arrow")]
- impl From<ArrowError> for ParquetError {
-     fn from(e: ArrowError) -> ParquetError {
-+        if matches!(e, ArrowError::MemoryError(_)) { return ParquetError::MemoryAllocation; }
-         ParquetError::External(Box::new(e))
-     }
- }
-@@ -144,6 +148,13 @@
- impl From<ring::error::Unspecified> for ParquetError {
-     fn from(e: ring::error::Unspecified) -> ParquetError {
-         ParquetError::External(Box::new(e))
-+    }
-+}
-+
-+#[cfg(feature = "arrow")]
-+impl From<arrow_buffer::buffer::MutableBufferError> for ParquetError {
-+    fn from(_error: arrow_buffer::buffer::MutableBufferError) -> Self {
-+        Self::MemoryAllocation
+@@ -147,6 +147,13 @@
      }
  }
 
-@@ -199,6 +210,13 @@
++#[cfg(feature = "arrow")]
++impl From<arrow_buffer::buffer::MutableBufferError> for ParquetError {
++    fn from(error: arrow_buffer::buffer::MutableBufferError) -> Self {
++        Self::External(Box::new(ArrowError::MemoryError(error.to_string())))
++    }
++}
++
+ /// A specialized `Result` for Parquet errors.
+ pub type Result<T, E = ParquetError> = result::Result<T, E>;
+
+@@ -199,6 +206,12 @@
  #[cfg(feature = "arrow")]
  impl From<ParquetError> for ArrowError {
      fn from(p: ParquetError) -> Self {
-+        if matches!(p, ParquetError::MemoryAllocation) { return Self::MemoryError(String::new()); }
 +        if let ParquetError::External(source) = &p
 +            && let Some(ArrowError::MemoryError(message)) = source.downcast_ref::<ArrowError>()
 +        {

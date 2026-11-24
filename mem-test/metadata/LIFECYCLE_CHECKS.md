@@ -7,8 +7,9 @@ encoding, and final ownership release. It never executes the returned terminal m
 commits a declarative transaction.
 
 The local reference engine does execute the discovery operations that Kernel needs to build a
-snapshot. Those operations allocate Rust-owned Arrow buffers and objects. With the global hook, those
-allocations participate in the same limit. Foreign engine allocations remain outside it.
+snapshot. Those operations allocate Rust-owned Arrow buffers and objects. The Arrow experiment opts selected
+buffers and parser storage into the explicit allocator. Ordinary dependency objects and foreign
+engine allocations remain outside that budget.
 
 ## Workload dimensions
 
@@ -33,18 +34,18 @@ counts, DAG depth, maximum input fan-in, JSON/Parquet source counts, and wire le
 From the repository root:
 
 ```sh
-CARGO_PROFILE_RELEASE_DEBUG=1 cargo +1.95.0 build --locked --release -p mem-test \
+CARGO_PROFILE_RELEASE_DEBUG=1 cargo +1.100.0 build --locked --release -p mem-test \
   --features declarative-benchmark --example rss_lifecycle --example kernel_lifecycle
 
 python3 mem-test/metadata/run_matrix.py \
-  --binary target/release/examples/rss_lifecycle --record-infallible-gaps --output /tmp/kernel-matrix.json \
+  --binary target/release/examples/rss_lifecycle --output /tmp/kernel-matrix.json \
   --failure-stages declarative_snapshot_ready_mock_engine_included declarative_query_built \
   declarative_scan_state_built declarative_metadata_plan_built_no_execution \
   declarative_metadata_plan_proto_live_no_execution declarative_transaction_relations_staged
 
 python3 mem-test/metadata/run_matrix.py \
   --binary target/release/examples/rss_lifecycle --manifest mem-test/metadata/lifecycle_stress.json \
-  --concurrency 1 --record-infallible-gaps --output /tmp/kernel-stress.json
+  --concurrency 1 --output /tmp/kernel-stress.json
 ```
 
 Use `--tables` / `--queries` to select named profiles. `--concurrency` defaults to `1 4` and
@@ -60,16 +61,14 @@ need less memory than was already retained at the injection point.
 
 ## Assertions and receipts
 
-Strict runs fail on process aborts, timeouts, unexpected errors, observed limit overruns, or failed
-recovery. `--record-infallible-gaps` records allocation aborts in pressure probes separately;
-unlimited and generous-limit failures still fail. These gaps are not successful memory-error
-returns. Returned allocation errors must be typed and have a recorded rejected reservation.
-Every worker that returns a receipt clears the limit and retries.
+Runs fail on process aborts, timeouts, unexpected errors, observed limit overruns, failed owner
+release, or failed recovery. Returned allocation errors must be typed and have a rejected
+reservation. Every worker that returns a receipt clears the limit and retries. No abort-recording
+mode weakens the recovery assertions.
 
-Global counters include caller query construction, retained result diagnostics, and harness/thread
-storage. Their cleanup total cannot be compared to the historical per-container baseline. Rust
-and generated-C tests check exact allocation ownership, including foreign-thread release under a
-full budget and retry after a rejected write-state encoding.
+The explicit allocator counts participating storage independently of ordinary caller diagnostics
+and thread/harness allocations. Rust and generated-C tests also check exact ownership, foreign-
+thread release under a full budget, and retry after rejected write-state encoding.
 
 Unlimited and generous-limit runs must succeed, capture the expected snapshot version, and encode
 write state. Constant-false filters must produce no metadata plan; other profiles must produce a
@@ -102,10 +101,14 @@ for the difference between requested heap bytes, RSS, and physical footprint.
 
 ## Validated results
 
-[Current validation](../arrow-allocator-poc/PROCESS_GLOBAL_VALIDATION.json) records the installed
-Rust 1.95 global hook, atomic-counter tests, C lifecycle, and recovery-gap survey. The
-[earlier stable-backend validation](../arrow-allocator-poc/GLOBAL_ALLOC_VALIDATION.json) used an
-explicit per-container backend; its coverage fractions do not describe the installed global hook.
+[Current validation](../arrow-allocator-poc/ALLOCATOR_API_VALIDATION.json) records normal Kernel
+on stable 1.95 and the explicit allocator/FFI build on stable 1.100, atomic-counter tests, and strict
+recovery checks. The `memory-budget` feature is excluded from the 1.95 feature set and always
+enabled by FFI. Neither build uses nightly compiler APIs.
+
+[Global-hook validation](../arrow-allocator-poc/PROCESS_GLOBAL_VALIDATION.json) is historical. Its
+pressure aborts are the reason that process-global rejection was removed. Its same-stream counter
+comparisons and peak ratios do not describe the current explicit allocator's coverage.
 
 [The original results](LIFECYCLE_RESULTS.json) record the manifest and executable hashes, platform,
 check counts, and simultaneous-peak heap attribution for the published-dependency baseline build.

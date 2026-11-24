@@ -1,23 +1,22 @@
-use std::alloc::{GlobalAlloc, Layout, System};
+use std::alloc::{AllocError, Allocator, Global, Layout};
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::{MemoryError, MemoryResult};
 
-/// A global Rust allocator with shared requested-byte tracking and an optional limit.
+/// An explicit allocator with one shared requested-byte budget across threads and FFI calls.
 ///
-/// Install one instance with `#[global_allocator]`. Standard containers then participate without
-/// carrying an allocator. Every instance uses the same counters and limit across threads and FFI.
-/// Fallible calls such as `Vec::try_reserve` return errors when an allocation is rejected;
-/// infallible allocation calls retain Rust's allocation-error-handler behavior.
-#[derive(Clone, Copy, Debug)]
-pub struct KernelAllocator<A = System> {
-    backing: A,
+/// Available with `memory-budget` on stable Rust 1.100 or newer. Participating containers select
+/// this allocator and use fallible growth; ordinary process allocations are never rejected by it.
+/// Infallible constructors on allocator-backed containers retain allocation-error-handler behavior.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KernelAllocator {
+    _private: (),
 }
 
-/// Access to the shared global allocator's counters and configuration.
+/// Shared allocator instance for participating Kernel metadata storage.
 ///
-/// Rust applications install a [`KernelAllocator`] as their global allocator. The FFI crate does
-/// this with its `global-allocator` feature. Enforcement is disabled until a limit is configured.
+/// Enforcement is disabled until [`KernelAllocator::set_limit`] configures a limit.
 pub static KERNEL_ALLOCATOR: KernelAllocator = KernelAllocator::new();
 
 /// A coherent observation of the shared allocator's requested-byte counters.
@@ -27,7 +26,7 @@ pub struct MemoryUsage {
     pub limit: Option<usize>,
     /// Outstanding requested bytes, including allocations currently in flight.
     pub reserved: usize,
-    /// Largest reserved count since initialization or peak reset, including old-plus-new growth.
+    /// Largest requested-byte reservation since initialization or peak reset.
     pub peak: usize,
     /// Requests rejected before calling the backing allocator.
     pub rejected: usize,
@@ -36,25 +35,9 @@ pub struct MemoryUsage {
 static STATE: State = State::new();
 
 impl KernelAllocator {
-    /// Create a global allocator backed by the system allocator.
+    /// Create a handle to the shared allocator without changing its counters or limit.
     pub const fn new() -> Self {
-        Self { backing: System }
-    }
-}
-
-impl Default for KernelAllocator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<A> KernelAllocator<A> {
-    /// Wrap a backing allocator without changing the shared limit or counters.
-    ///
-    /// This supports instrumentation around the system allocator. The backing implementation must
-    /// not delegate directly back to this allocator through `std::alloc::alloc`.
-    pub const fn with_backing(backing: A) -> Self {
-        Self { backing }
+        Self { _private: () }
     }
 
     /// Set or clear the shared limit without resetting usage or historical counters.
@@ -113,7 +96,7 @@ impl<A> KernelAllocator<A> {
         let limit = STATE.limit.load(Ordering::Relaxed);
         match STATE
             .reserved
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
                 reserved.checked_add(bytes).filter(|next| *next <= limit)
             }) {
             Ok(previous) => {
@@ -124,7 +107,7 @@ impl<A> KernelAllocator<A> {
                 let _ =
                     STATE
                         .rejected
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |rejected| {
+                        .try_update(Ordering::Relaxed, Ordering::Relaxed, |rejected| {
                             Some(rejected.saturating_add(1))
                         });
                 None
@@ -139,49 +122,83 @@ impl<A> KernelAllocator<A> {
     pub(super) fn allocate_with(
         &self,
         layout: Layout,
-        backing: impl FnOnce(Layout) -> *mut u8,
-    ) -> *mut u8 {
-        let Some(reservation) = self.reserve(layout.size()) else {
-            return std::ptr::null_mut();
-        };
-        let allocation = backing(layout);
-        if !allocation.is_null() {
-            std::mem::forget(reservation);
-        }
-        allocation
+        backing: impl FnOnce(Layout) -> Result<NonNull<[u8]>, AllocError>,
+    ) -> Result<NonNull<[u8]>, AllocError> {
+        let reservation = self.reserve(layout.size()).ok_or(AllocError)?;
+        let allocation = backing(layout)?;
+        std::mem::forget(reservation);
+        Ok(NonNull::slice_from_raw_parts(
+            allocation.cast(),
+            layout.size(),
+        ))
+    }
+
+    fn resize_with(
+        &self,
+        old_layout: Layout,
+        new_layout: Layout,
+        backing: impl FnOnce() -> Result<NonNull<[u8]>, AllocError>,
+    ) -> Result<NonNull<[u8]>, AllocError> {
+        let growth = new_layout.size().saturating_sub(old_layout.size());
+        let reservation = self.reserve(growth).ok_or(AllocError)?;
+        let allocation = backing()?;
+        self.release(old_layout.size().saturating_sub(new_layout.size()));
+        std::mem::forget(reservation);
+        Ok(NonNull::slice_from_raw_parts(
+            allocation.cast(),
+            new_layout.size(),
+        ))
     }
 }
 
-// SAFETY: Storage and its original layouts are forwarded to the retained backing allocator.
-// Reservations finish before backing calls and are rolled back on failure. Reallocation reserves
-// a complete replacement before invoking the backing allocator, including possible in-place growth.
-unsafe impl<A: GlobalAlloc> GlobalAlloc for KernelAllocator<A> {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        self.allocate_with(layout, |layout| unsafe { self.backing.alloc(layout) })
+// SAFETY: Global supplies aligned storage. Exposing exactly the charged length ensures fitting
+// layouts retain the same charge. Failed backing calls roll back reservations and preserve old
+// storage. Growth reserves only the size delta; allocator-internal copies are outside this budget.
+unsafe impl Allocator for KernelAllocator {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        self.allocate_with(layout, |layout| Global.allocate(layout))
     }
 
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        self.allocate_with(layout, |layout| unsafe {
-            self.backing.alloc_zeroed(layout)
+    fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        self.allocate_with(layout, |layout| Global.allocate_zeroed(layout))
+    }
+
+    unsafe fn grow(
+        &self,
+        pointer: NonNull<u8>,
+        old_layout: Layout,
+        new_layout: Layout,
+    ) -> Result<NonNull<[u8]>, AllocError> {
+        self.resize_with(old_layout, new_layout, || unsafe {
+            Global.grow(pointer, old_layout, new_layout)
         })
     }
 
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let Some(reservation) = self.reserve(new_size) else {
-            return std::ptr::null_mut();
-        };
-        // SAFETY: The caller provides a live block, its original layout, and a valid new size.
-        let resized = unsafe { self.backing.realloc(ptr, layout, new_size) };
-        if !resized.is_null() {
-            self.release(layout.size());
-            std::mem::forget(reservation);
-        }
-        resized
+    unsafe fn grow_zeroed(
+        &self,
+        pointer: NonNull<u8>,
+        old_layout: Layout,
+        new_layout: Layout,
+    ) -> Result<NonNull<[u8]>, AllocError> {
+        self.resize_with(old_layout, new_layout, || unsafe {
+            Global.grow_zeroed(pointer, old_layout, new_layout)
+        })
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: The caller supplies a live allocation and the layout used to allocate it.
-        unsafe { self.backing.dealloc(ptr, layout) };
+    unsafe fn shrink(
+        &self,
+        pointer: NonNull<u8>,
+        old_layout: Layout,
+        new_layout: Layout,
+    ) -> Result<NonNull<[u8]>, AllocError> {
+        self.resize_with(old_layout, new_layout, || unsafe {
+            Global.shrink(pointer, old_layout, new_layout)
+        })
+    }
+
+    unsafe fn deallocate(&self, pointer: NonNull<u8>, layout: Layout) {
+        // SAFETY: The caller provides a live block and a fitting layout from this allocator.
+        unsafe { Global.deallocate(pointer, layout) };
         self.release(layout.size());
     }
 }

@@ -1,31 +1,29 @@
-//! Shared allocation tracking for allocation-heavy Kernel metadata using stable `GlobalAlloc`.
+//! Fallible metadata storage with an optional explicit allocator budget.
 //!
-//! Install [`KernelAllocator`] as the global allocator to track standard containers, dependency
-//! allocations, and Rust-owned Arrow buffers. Its requested-byte limit is disabled by default.
-//! Set or clear it through [`KERNEL_ALLOCATOR`] or the FFI `kernel_memory_set_limit` entry point.
-//! Usage follows backing allocations until they are freed, across calls and threads.
+//! Normal builds use standard containers on stable Rust 1.95. The `memory-budget` feature requires
+//! stable Rust 1.100 and selects one shared `std::alloc::Allocator` for participating storage.
+//! FFI enables that feature. No process-global limiting allocator or nightly compiler is required.
+//! Charges follow backing storage across calls, shared owners, threads, and FFI release functions.
 //!
-//! Fallible allocation APIs return errors on rejection. Infallible paths, including dependency
-//! allocations, can still invoke Rust's allocation-error handler. The limit covers requested Rust
-//! allocations through this hook, rather than RSS, direct libc allocations, or memory mappings.
+//! Budget rejection is recoverable at fallible allocation sites. Ordinary dependency allocations
+//! remain outside this budget; infallible operations on allocator-backed storage can still invoke
+//! the allocation-error handler. The limit is not a bound on RSS or all native memory.
 //!
 //! ```no_run
-//! # use delta_kernel::{Engine, Snapshot, memory::{KERNEL_ALLOCATOR, KernelAllocator}};
-//! #[global_allocator]
-//! static ALLOCATOR: KernelAllocator = KernelAllocator::new();
-//! # fn example(engine: &dyn Engine) -> delta_kernel::Result<()> {
+//! # #[cfg(feature = "memory-budget")]
+//! # fn example(engine: &dyn delta_kernel::Engine) -> delta_kernel::Result<()> {
+//! use delta_kernel::{Snapshot, memory::KERNEL_ALLOCATOR};
 //! KERNEL_ALLOCATOR.set_limit(Some(64 * 1024 * 1024))
 //!     .map_err(delta_kernel::KernelError::from)?;
 //! let snapshot = Snapshot::builder_for("file:///table/").build(engine)?;
-//! let scan = snapshot.scan_builder().build()?;
-//! for batch in scan.scan_metadata(engine)? {
-//!     let _batch = batch?;
-//! }
-//! assert!(KERNEL_ALLOCATOR.usage().reserved <= 64 * 1024 * 1024);
+//! let _scan = snapshot.scan_builder().build()?;
 //! # Ok(())
 //! # }
 //! ```
 
+#[cfg(feature = "memory-budget")]
+// Cargo's package MSRV does not describe this opt-in backend's Rust 1.100 requirement.
+#[allow(clippy::incompatible_msrv)]
 mod allocator;
 mod containers;
 mod json;
@@ -35,9 +33,13 @@ pub(crate) mod ordered_map;
 mod output;
 mod owned;
 mod shared_string;
-#[cfg(test)]
+#[cfg_attr(feature = "memory-budget", allow(clippy::incompatible_msrv))]
+mod storage;
+#[cfg(all(test, feature = "memory-budget"))]
+#[allow(clippy::incompatible_msrv)]
 mod tests;
 
+#[cfg(feature = "memory-budget")]
 pub use allocator::{KERNEL_ALLOCATOR, KernelAllocator, MemoryUsage};
 pub use containers::{IntoIter, MetadataBytes, MetadataString, MetadataVec, try_to_json};
 pub use json::{JsonValue, try_parse_json};
@@ -93,6 +95,7 @@ impl From<MemoryError> for crate::KernelError {
 
 // Fixed canonical schemas have infallible constructors. Complete their initialization before any
 // cap can be published; query-sized schema construction uses the fallible storage paths.
+#[cfg(feature = "memory-budget")]
 fn initialize_schemas() {
     static INITIALIZED: std::sync::Once = std::sync::Once::new();
     INITIALIZED.call_once(|| {
@@ -123,4 +126,11 @@ pub(crate) fn decode_json<T: serde::de::DeserializeOwned>(input: &[u8]) -> crate
         Some(failure) => failure.into(),
         None => crate::KernelError::MalformedJson(error),
     })
+}
+
+fn allocation_error() -> MemoryError {
+    #[cfg(feature = "memory-budget")]
+    return KERNEL_ALLOCATOR.allocation_error();
+    #[cfg(not(feature = "memory-budget"))]
+    MemoryError::AllocationFailed { limit: usize::MAX }
 }

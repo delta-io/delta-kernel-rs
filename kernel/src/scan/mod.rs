@@ -943,6 +943,7 @@ static RESTORED_ADD_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     },
 };
 
+#[cfg(feature = "memory-budget")]
 pub(crate) fn initialize_schemas() {
     for schema in [
         &COMMIT_READ_SCHEMA,

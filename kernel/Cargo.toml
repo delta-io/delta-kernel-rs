@@ -97,6 +97,8 @@ optional = true
 [features]
 # no default features
 default = []
+# Internal explicit allocator backend; requires stable Rust 1.100 or newer.
+memory-budget = []
 # internal-api will make everything marked #[internal_api] public.
 internal-api = []
 # prettyprint enables Arrow pretty-print helpers (test/example oriented).

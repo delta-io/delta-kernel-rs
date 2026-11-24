@@ -1,59 +1,52 @@
 # Declarative driver memory measurements
 
-Measure the lifecycle that retains driver metadata: snapshot discovery and schema parsing,
-checkpoint resolution, scan planning, plan serialization, transaction preparation with opaque
-relations, and write-state encoding. Executor execution and full declarative commit are outside
-this benchmark. The local reference engine used for snapshot discovery adds its own parsing and
-Arrow buffers to process measurements.
+Measure snapshot discovery and schema parsing, checkpoint resolution, scan planning, plan
+serialization, transaction preparation with opaque relations, write-state encoding, and release.
+Terminal metadata-plan execution and full declarative commit are outside this benchmark. The
+local reference engine adds its parsing, Arrow objects, and buffers to process measurements.
 
-The installed global Rust allocator tracks standard collections, dependency objects, and Rust-owned
-Arrow buffers even when enforcement is disabled. Query objects, returned wire bytes, and shared
-schema text retain their charge until final release. Fixed canonical caches remain charged.
-Global counters also include caller diagnostics and harness storage; exact payload ownership and
-release are checked separately by the Rust and generated-C tests.
+Kernel's explicit allocator counts participating storage independently of a tracking-only global
+allocator. Only the explicit allocator can reject requests. The global tracker never enforces a
+limit, so ordinary dependency or diagnostic allocations are not denied by Kernel's budget.
 
 ## Metrics
 
-- **Global Rust reservations** (`kernel_live` / `kernel_peak` in receipts): requested bytes through
-  the installed `KernelAllocator`, including requests in flight. Reallocation reserves a complete
-  replacement before invoking the backing allocator, so its peak can conservatively exceed the
-  actual live heap peak even when the backing allocator grows in place.
-- **Live Rust heap**: requested layouts observed independently by the benchmark's inner diagnostic
-  allocator. These count actual successful backing requests and reallocation size changes. They
-  exclude direct libc/C++ allocations and memory mappings.
-- **DHAT global peak**: live allocations at the profiler's single simultaneous heap peak. A profile
-  started after snapshot creation excludes earlier live allocations. Run with enforcement disabled:
-  profiler bookkeeping also allocates through the process hook.
+- **Kernel reservations** (`kernel_live` / `kernel_peak`): participating requested bytes, including
+  pending allocations and growth deltas. Shrink reductions apply after success. These counters do
+  not charge a hypothetical full replacement during `realloc`; allocator-internal copy transients
+  remain outside this limit.
+- **Live Rust heap**: successful requested layouts observed by the diagnostic global allocator.
+  This includes Kernel, the local reference engine, and the caller/harness. It excludes direct
+  libc/C++ allocations and mappings that bypass that global hook.
+- **DHAT global peak**: allocations live at one simultaneous requested-heap peak. Compare Kernel
+  counters and allocation stacks at that same instant. Do not divide independent peak counters
+  and call the result coverage. Profile with enforcement disabled.
 - **RSS**: resident process pages, including allocator caches, reusable pages, code, and stacks.
-- **macOS physical footprint**: the OS pressure charge. Reusable malloc pages can remain resident
-  while carrying a much smaller physical-footprint charge.
+- **macOS physical footprint**: the OS pressure charge, which can differ substantially from RSS
+  when resident allocator pages are reusable.
 
-RSS and live requested heap bytes are different measurements. In particular, freed reusable malloc
-pages can remain in RSS and serve later allocations. Their residency is not evidence of untracked
-live allocations or of an equal additional OOM risk. Do not subtract independent high-water marks
-to infer simultaneous overhead.
+Live Rust bytes and Kernel charges must be compared at the same observation. Requests in flight
+can temporarily make reservations exceed materialized participating storage. The tracking-only
+global hook measures successful public allocation calls; it cannot observe every transient inside
+system `realloc`, or prove that no native allocations bypass the hook.
 
-## Cases
+Freed reusable malloc pages can remain resident and serve later allocations. Their residency does
+not imply untracked live storage or an equal additional OOM risk. Conversely, moving reallocation
+can copy old data before freeing it; zero swap does not make that transient free. Requested-byte
+budgets do not establish a hard RSS or OOM-pressure bound.
 
-The exact tail fixture contains 10,000 top-level columns / 30,000 schema fields, 11,301,270 bytes of
-schema JSON, 1,000 initial files, one checkpoint, and 10,000 tail commits. Include all stats columns
-and structured output to exercise derived-schema and plan-wire storage. Also vary action stats
-payload size and parsed-stats checkpoints, and run a smaller fixture with concurrent requests
-sharing the same limit.
+## Cases and boundaries
 
-Use a fresh process for each table/limit/concurrency combination. Generate and copy fixtures before
-measurement. Compare unlimited tracking against configured limits, verify errors do not publish a
-commit, and check typed memory errors separately from allocation aborts. The global matrix retains
-caller diagnostic data after releasing query owners; use the ownership tests for exact release
-assertions. Keep latency, live-heap, and OS-memory measurements together; the allocator counter alone does not
-establish total native-memory coverage.
+The exact tail fixture contains 10,000 top-level columns / 30,000 schema fields, 11,301,270 schema-
+JSON bytes, 1,000 initial files, one checkpoint, and 10,000 tail commits. Also vary statistics,
+action sizes/counts, parsed-stats checkpoints, query shape, and concurrent requests sharing a cap.
 
-## Measured results
+Use fresh processes for baseline and constrained runs, with fixture preparation/copies outside
+measurement. Verify typed errors, exact participating-owner release, successful retry, and absence
+of unintended commits. Process aborts fail the checks. Include sample counts with latency results;
+small correctness samples do not establish performance percentiles.
 
-The [local lifecycle matrix](LIFECYCLE_CHECKS.md#validated-results) records simultaneous-peak heap
-attribution across table, query, and generated plan shapes, together with pressure, recovery,
-concurrency, and exact wide-tail checks.
-[Current validation](../arrow-allocator-poc/PROCESS_GLOBAL_VALIDATION.json) records the installed
-hook and recovery gaps. The [historical receipts](LIFECYCLE_RESULTS.json) describe the earlier
-per-container accounting and preserve their original executable hashes and boundaries. Those
-coverage fractions are not measurements of the global hook.
+[Current explicit-backend validation](../arrow-allocator-poc/ALLOCATOR_API_VALIDATION.json) and
+[lifecycle checks](LIFECYCLE_CHECKS.md) document the tested compiler/feature combinations. Historical
+results retain their original provenance. In particular, the removed process-global limiting hook
+and its coverage observations are not measurements of the explicit allocator.

@@ -238,5 +238,8 @@
     "Current serial stage observations agree exactly with an independent requested-Rust-byte tracker. This is not a new simultaneous-peak allocation-stack attribution or an RSS coverage fraction.",
     "Terminal metadata-plan execution and declarative commit are not exercised by this lifecycle.",
     "Correctness-run timings with one repetition cannot establish p99.9 latency or performance regressions."
-  ]
+  ],
+  "current_validation": "ALLOCATOR_API_VALIDATION.json",
+  "historical": true,
+  "superseded_reason": "Process-global rejection exposed ordinary infallible allocations to abort. Replaced by an explicit opt-in Allocator backend with Kernel MSRV 1.95 and budgeting/FFI MSRV 1.100."
 }

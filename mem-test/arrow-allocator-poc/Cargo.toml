@@ -4,7 +4,7 @@
 name = "kernel-arrow-allocator-poc"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.100"
 publish = false
 
 [features]
@@ -13,7 +13,7 @@ declarative-benchmark = []
 
 [dependencies]
 arrow-buffer = "=60.0.0"
-delta_kernel = { path = "../../kernel", features = ["arrow-60", "default-engine-base", "internal-api", "test-utils", "declarative-plans", "vendored-protoc"] }
+delta_kernel = { path = "../../kernel", features = ["arrow-60", "default-engine-base", "internal-api", "test-utils", "memory-budget", "declarative-plans", "vendored-protoc"] }
 delta_kernel_default_engine = { path = "../../default-engine", features = ["rustls"] }
 test_utils = { path = "../../test-utils", default-features = false, features = ["arrow-60"] }
 dhat = "0.3"

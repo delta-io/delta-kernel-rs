@@ -145,7 +145,8 @@ jobs:
           tool: cargo-msrv
       - name: verify-msrv
         run: |
-          cargo msrv --path kernel/ verify --all-features
+          kernel_msrv_features="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json, sys; p = next(p for p in json.load(sys.stdin)["packages"] if p["name"] == "delta_kernel"); print(",".join(f for f in p["features"] if f != "memory-budget"))')"
+          cargo msrv --path kernel/ verify --features "$kernel_msrv_features"
           cargo msrv --path derive-macros/ verify --all-features
           cargo msrv --path ffi/ verify --all-features
           cargo msrv --path ffi-proc-macros/ verify --all-features

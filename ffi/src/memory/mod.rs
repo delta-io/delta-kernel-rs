@@ -1,14 +1,14 @@
-//! Shared global Rust allocation tracking and optional enforcement.
+//! Shared explicit allocation tracking and optional enforcement for Kernel metadata.
 
 use delta_kernel::memory::{KERNEL_ALLOCATOR, MemoryUsage};
 
 use crate::OptionalValue;
 
-/// Requested-byte counters for allocations through the installed Kernel global allocator.
+/// Requested-byte counters for storage using Kernel's explicit allocator.
 ///
-/// This includes standard Rust containers and Rust-owned dependency buffers. Direct libc
-/// allocations, memory mappings, and allocator overhead are excluded. Historical peaks can exceed
-/// limits enabled after those peaks occurred.
+/// Ordinary process allocations and foreign engine buffers are outside this budget. Counters
+/// include pending growth reservations. Historical peaks can exceed limits enabled after those
+/// peaks occurred.
 #[repr(C)]
 #[derive(Debug)]
 pub struct FfiMemoryUsage {
@@ -33,14 +33,14 @@ impl From<MemoryUsage> for FfiMemoryUsage {
     }
 }
 
-/// Set or clear the shared global Rust allocation limit.
+/// Set or clear the shared allocation limit for participating Kernel metadata.
 ///
-/// The default `global-allocator` feature installs the hook. Rust applications that disable it
-/// must install `KernelAllocator` themselves. The first call initializes fixed canonical schemas.
+/// FFI enables Kernel's `memory-budget` feature and requires stable Rust 1.100. No process-global
+/// limiting allocator is installed. The first call initializes fixed canonical schemas.
 /// `None` disables enforcement. A limit below current usage returns
 /// false and preserves the previous limit. Successful updates apply to all threads and existing
 /// allocations without resetting counters. Fallible allocation APIs return errors on rejection;
-/// infallible paths can invoke Rust's allocation-error handler. This does not bound total RSS.
+/// only participating storage is limited. This does not bound total native memory or RSS.
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_memory_set_limit(limit: OptionalValue<usize>) -> bool {
     KERNEL_ALLOCATOR.set_limit(limit.into()).is_ok()

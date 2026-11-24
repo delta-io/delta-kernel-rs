@@ -1,0 +1,329 @@
+{
+  "implementation": "Opt-in explicit std::alloc::Allocator with atomic shared accounting; ordinary process allocations are never rejected by Kernel. No allocator-api2 or nightly compiler API.",
+  "recorded_at_utc": "2026-11-24T03:06:54.359958+00:00",
+  "platform": "macOS-26.7.1-arm64-arm-64bit",
+  "toolchains": {
+    "1.95.0": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: aarch64-apple-darwin\nrelease: 1.95.0\nLLVM version: 22.1.2",
+    "1.100.0": "rustc 1.100.0 (0ef1bc386 2026-11-09)\nbinary: rustc\ncommit-hash: 0ef1bc386059596dada8fb65b50425aab2ea637a\ncommit-date: 2026-11-09\nhost: aarch64-apple-darwin\nrelease: 1.100.0\nLLVM version: 23.1.5"
+  },
+  "msrv": {
+    "normal_kernel": "1.95",
+    "kernel_memory_budget_feature": "1.100",
+    "ffi_package": "1.100",
+    "ffi_always_enables_kernel_memory_budget": true,
+    "nightly_compiler_required": false,
+    "core_without_budgeting": "Standard Vec/Box selected by private storage aliases; schema/log/plan logic is shared.",
+    "core_with_budgeting": "Vec<T, KernelAllocator> and Box<T, KernelAllocator> using stable Allocator APIs.",
+    "cargo_feature_msrv_policy": "Cargo has no per-feature MSRV. Build script rejects memory-budget on Rust <1.100; CI verifies Kernel public features at 1.95 and FFI at its package MSRV.",
+    "verified_rejections": [
+      "Kernel memory-budget on 1.95 has a clear build-script diagnostic",
+      "FFI on 1.95 is rejected by Cargo package rust-version"
+    ],
+    "public_kernel_1_95_test_summary": "Summary [ 176.912s] 16961 tests run: 16961 passed, 29 skipped",
+    "workspace_all_features_1_100_test_summary": "Summary [ 202.947s] 22377 tests run: 22377 passed, 38 skipped"
+  },
+  "source": {
+    "parent_commit": "0041fc2cec8e1cb5da06438f37cc7ec04a437d33",
+    "allocator_harness_and_configuration_sha256": "89fdf14bb3ebfa3a40f56cd746ba38e269f86562cad6094b9eb301f286b2d83c",
+    "source_digest_algorithm": "SHA256 of each sorted relative UTF-8 path, NUL, contents, NUL.",
+    "source_input_files": [
+      ".github/workflows/build.yml",
+      "Cargo.lock",
+      "Cargo.toml",
+      "ffi/Cargo.toml",
+      "ffi/src/alloc_stats.rs",
+      "ffi/src/memory/mod.rs",
+      "ffi/tests/memory.rs",
+      "kernel/Cargo.toml",
+      "kernel/build.rs",
+      "kernel/src/actions/mod.rs",
+      "kernel/src/checkpoint/mod.rs",
+      "kernel/src/memory/allocator.rs",
+      "kernel/src/memory/containers.rs",
+      "kernel/src/memory/json.rs",
+      "kernel/src/memory/keys.rs",
+      "kernel/src/memory/mod.rs",
+      "kernel/src/memory/ordered_map.rs",
+      "kernel/src/memory/output.rs",
+      "kernel/src/memory/owned.rs",
+      "kernel/src/memory/shared_string.rs",
+      "kernel/src/memory/storage.rs",
+      "kernel/src/memory/tests.rs",
+      "kernel/src/scan/mod.rs",
+      "kernel/src/transaction/mod.rs",
+      "mem-test/Cargo.toml",
+      "mem-test/arrow-allocator-poc/Cargo.toml",
+      "mem-test/arrow-allocator-poc/checks.rs",
+      "mem-test/arrow-allocator-poc/fault.rs",
+      "mem-test/arrow-allocator-poc/heap.rs",
+      "mem-test/arrow-allocator-poc/prepare.py",
+      "mem-test/arrow-allocator-poc/rss.rs",
+      "mem-test/arrow-allocator-poc/verify.py",
+      "mem-test/examples/kernel_lifecycle.rs",
+      "mem-test/examples/rss_lifecycle.rs",
+      "mem-test/metadata/run_ffi_lifecycle.py",
+      "mem-test/metadata/run_matrix.py"
+    ],
+    "arrow_version": "60.0.0",
+    "arrow_patch_sha256": "cb3c08e21ae9b2a00c12b500b8794d05ef08947dec97cbb028f180bf9f8f0279",
+    "clean_reapplied_patch_matching_source_and_manifest_files": 415,
+    "poc_cargo_lock_sha256": "6f045fd99445c418222fbb6f832378d7c043d2856ec2daa62e7ec9e802d7f001"
+  },
+  "binary_sha256": {
+    "rss_lifecycle": "540dd24a8eb8808156a15dd4ef225dc31dcd456a86048c6cfc1459be53d94e8a",
+    "kernel_lifecycle": "89486a34bdf8836b77c3230c46b14b8d2e05854401b313ad1ad4f1b4e93f413a",
+    "allocation_checks": "8f4c30ac6e4e330a33bd5f05ea5e14f7bae83a67dc86a54d53b0b3a0079026d3",
+    "fault_probe": "ffb12db90dbe46372abcab11414a82e9321fdde330ba0addb629a24c751b5ffe"
+  },
+  "accounting": {
+    "shared_reservations": "Atomic CAS; frees use fetch_sub; configuration, snapshots, and peak resets use an allocation-free atomic gate.",
+    "growth": "Reserve only max(new_size-old_size,0), roll back on failure, release shrink reduction after success.",
+    "scope": "Participating allocator-backed storage, including retained owners across calls/threads/FFI. Ordinary dependency/caller/native allocations are outside enforcement.",
+    "process_global_allocator": "Tracking only in measurement executables and optional FFI diagnostics; no process-global rejection hook."
+  },
+  "normal_validation": {
+    "public_kernel_tests_1_95_passed": 16961,
+    "public_kernel_tests_1_95_skipped": 29,
+    "workspace_tests_1_100_passed": 22377,
+    "workspace_tests_1_100_skipped": 38,
+    "compiler_diagnostic_test_included": true,
+    "workspace_retry_note": "Initial sandboxed run could not bind a loopback port for an existing HTTP mock. Full suite passed with that sandbox restriction lifted; no test source changed.",
+    "format": true,
+    "workspace_clippy_warnings_denied": true,
+    "workspace_rustdoc_warnings_denied": true,
+    "workspace_doctests": true,
+    "public_kernel_1_95_rustdoc_and_doctests": true,
+    "no_default_feature_aliases_passed": 4,
+    "generated_c_actual_cdylib_lifecycle": true,
+    "generated_c_log_sha256": "4d926a69949c9ec4d5742fc37dd75310a8ca36f5ecfb28fcdf4209d2c5929d2f",
+    "atomic_contention_tests": "Sixteen explicit allocator vectors admit exactly four 1-KiB blocks under 4-KiB headroom. Four workers race with 2,000 limit updates. Ordinary global Vec/String/Box allocations remain usable at zero Kernel headroom."
+  },
+  "allocation_fault_checks": {
+    "checks": 360,
+    "injected_typed_errors": 326,
+    "abort_or_other_failures": 0,
+    "result_sha256": "d2babd25db5d6155253730a8827db3cfae4b33a5d2e5da5740728f44272f8df5"
+  },
+  "matrix": {
+    "manifest_sha256": "6f175db457a1cbb5a251d2a89b0a5e509c8ee8d6324f82e4e80c5db19feb85a3",
+    "result_sha256": "4a8e3872424d0aaefc2de2197d263c6e73940927c1ba959b1651118c73d195c6",
+    "receipts_sha256": "e4eca324fea4c3b4583a2df8dbff5f0b2a0e5014ee49ea7e0e8f0ffde1ade82e",
+    "returned_processes": 2354,
+    "returned_operations": 4382,
+    "successful_operations": 1966,
+    "typed_allocation_errors": 2416,
+    "allocation_abort_failures": 0,
+    "other_failures": 0,
+    "compatible_table_query_pairs": 169,
+    "concurrency": [
+      1,
+      4
+    ],
+    "repetitions": 1,
+    "distinct_plan_shapes": 21,
+    "elapsed_seconds": 153.722,
+    "checks": "Strict typed-error, active-limit, participating-owner release, and retry checks. No abort-recording override."
+  },
+  "exact_tail_stress": {
+    "manifest_sha256": "775a54bf91321147161f1eddd82c9901454072895b65410658f197e200fd4229",
+    "result_sha256": "499d3d0d9d401949104171f16bb2defcfc7d1b5cdae6c7f6d76b7405194f93da",
+    "receipts_sha256": "38350034a1411a9277653f557e2770da6c4a0130867d2867bb112cbdd02db65b",
+    "returned_processes": 30,
+    "returned_operations": 30,
+    "successful_operations": 8,
+    "typed_allocation_errors": 22,
+    "allocation_abort_failures": 0,
+    "other_failures": 0,
+    "compatible_table_query_pairs": 3,
+    "concurrency": [
+      1
+    ],
+    "repetitions": 1,
+    "distinct_plan_shapes": 2,
+    "elapsed_seconds": 74.295,
+    "checks": "Strict typed-error, active-limit, participating-owner release, and retry checks. No abort-recording override."
+  },
+  "exact_tail_fixture": {
+    "width": 10000,
+    "schema_fields": 30000,
+    "schema_json_bytes": 11301270,
+    "initial_files": 1000,
+    "checkpoints": 1,
+    "tail_commits": 10000
+  },
+  "exact_tail_unprofiled_peaks": [
+    {
+      "query": "all_columns",
+      "kernel_requested_reservation_peak_bytes": 223653531,
+      "total_requested_rust_heap_peak_bytes": 253900314,
+      "os_rss_high_water_bytes": 454967296
+    },
+    {
+      "query": "narrow_projection",
+      "kernel_requested_reservation_peak_bytes": 74868147,
+      "total_requested_rust_heap_peak_bytes": 212604069,
+      "os_rss_high_water_bytes": 317816832
+    },
+    {
+      "query": "wide_or",
+      "kernel_requested_reservation_peak_bytes": 266234159,
+      "total_requested_rust_heap_peak_bytes": 304553702,
+      "os_rss_high_water_bytes": 518160384
+    }
+  ],
+  "selected_dependency_tests_passed": 2248,
+  "dependency_tests": {
+    "arrow-buffer": {
+      "passed": 359,
+      "summary": "Summary [   2.410s] 359 tests run: 359 passed, 0 skipped"
+    },
+    "arrow-data": {
+      "passed": 53,
+      "summary": "Summary [   0.420s] 53 tests run: 53 passed, 0 skipped"
+    },
+    "arrow-array": {
+      "passed": 766,
+      "summary": "Summary [   5.209s] 766 tests run: 766 passed, 1 skipped"
+    },
+    "arrow-select": {
+      "passed": 429,
+      "summary": "Summary [   3.738s] 429 tests run: 429 passed, 0 skipped"
+    },
+    "arrow-cast": {
+      "passed": 422,
+      "summary": "Summary [   2.473s] 422 tests run: 422 passed, 0 skipped"
+    },
+    "arrow-json": {
+      "passed": 141,
+      "summary": "Summary [   0.809s] 141 tests run: 141 passed, 0 skipped"
+    },
+    "parquet": {
+      "passed": 78,
+      "summary": "Summary [   0.392s] 78 tests run: 78 passed, 1356 skipped"
+    }
+  },
+  "dependency_fixture_note": "Arrow JSON fixtures omitted by the crate archive were copied from the existing validated upstream checkout; Parquet uses PARQUET_TEST_DATA pointing to the existing upstream fixture checkout. No dependency test code was changed.",
+  "experimental_harness_clippy": true,
+  "fresh_heap_profiles": [
+    {
+      "workload": "deep_schema",
+      "profile_sha256": "040d5a4c5c278c863749c950cd045657e02e3fb4f165a44f248c08fc67e20d3c",
+      "attribution_sha256": "dc0cb2e0118cc3de04c6008eaa6d81b3d98d24b6eb8613cd37f653f4fc41ea00",
+      "total_profiled_requested_rust_bytes_at_peak": 2903156,
+      "bytes_attributed_to_kernel_allocator_stacks_at_same_peak": 2361436,
+      "fraction_attributed_to_kernel_allocator_stacks": 0.8134030689360131,
+      "disjoint_stack_groups_bytes": {
+        "kernel_allocator": 2361436,
+        "other": 334726,
+        "schema_structures": 199670,
+        "log_descriptors_and_urls": 3555,
+        "arrow_objects_schemas_and_decoder_state": 2250,
+        "metadata_strings": 1519
+      }
+    },
+    {
+      "workload": "dense_struct_stats",
+      "profile_sha256": "073bdeb1afe8740e70bbd2da7014bfccbabb519290e6f10fb5082dc566637335",
+      "attribution_sha256": "cbd00ea75af5757ed477b21f54ad99c058275560838f2797a86b970eed3db057",
+      "total_profiled_requested_rust_bytes_at_peak": 7635471,
+      "bytes_attributed_to_kernel_allocator_stacks_at_same_peak": 6676215,
+      "fraction_attributed_to_kernel_allocator_stacks": 0.8743684574271843,
+      "disjoint_stack_groups_bytes": {
+        "kernel_allocator": 6676215,
+        "schema_structures": 789223,
+        "other": 84279,
+        "arrow_objects_schemas_and_decoder_state": 68935,
+        "log_descriptors_and_urls": 9271,
+        "metadata_strings": 7548
+      }
+    },
+    {
+      "workload": "exact_wide_tail_narrow",
+      "profile_sha256": "49422496d45ee1c0271db004af3d52db4fe0c2cfaaa54300cc81e3081acac492",
+      "attribution_sha256": "94c46427c3e91e9bbbf4380130ec41b6d0f4b4d705258b7c2d08f605ecd1a22d",
+      "total_profiled_requested_rust_bytes_at_peak": 212865703,
+      "bytes_attributed_to_kernel_allocator_stacks_at_same_peak": 7090186,
+      "fraction_attributed_to_kernel_allocator_stacks": 0.033308259151545894,
+      "disjoint_stack_groups_bytes": {
+        "arrow_objects_schemas_and_decoder_state": 138392714,
+        "arrow_buffers_and_parser": 53605104,
+        "other": 11596163,
+        "kernel_allocator": 7090186,
+        "log_descriptors_and_urls": 2180605,
+        "schema_structures": 931
+      }
+    },
+    {
+      "workload": "large_action_stats",
+      "profile_sha256": "59618f6a7bdb018c09f887448661737a0fd2108ef615e7b9927e10b6d7d87a8d",
+      "attribution_sha256": "a76f305b1131f36bebeae3c38b57b19b3f8b31e2e2d70effbb9143919e6fe0fb",
+      "total_profiled_requested_rust_bytes_at_peak": 1342352,
+      "bytes_attributed_to_kernel_allocator_stacks_at_same_peak": 1242826,
+      "fraction_attributed_to_kernel_allocator_stacks": 0.9258570032301513,
+      "disjoint_stack_groups_bytes": {
+        "kernel_allocator": 1242826,
+        "arrow_objects_schemas_and_decoder_state": 62050,
+        "arrow_buffers_and_parser": 25984,
+        "other": 6423,
+        "log_descriptors_and_urls": 2765,
+        "schema_structures": 2304
+      }
+    },
+    {
+      "workload": "long_tail",
+      "profile_sha256": "ea4ef11a319195136b11c74c678a15cb2b8856d703057196807359c25a65f145",
+      "attribution_sha256": "e64b2c84c248a742aee4a8985a5cd50df5a549132ea70853f8d3e37be1eda089",
+      "total_profiled_requested_rust_bytes_at_peak": 18994927,
+      "bytes_attributed_to_kernel_allocator_stacks_at_same_peak": 660810,
+      "fraction_attributed_to_kernel_allocator_stacks": 0.03478876228374028,
+      "disjoint_stack_groups_bytes": {
+        "arrow_objects_schemas_and_decoder_state": 12709166,
+        "arrow_buffers_and_parser": 5365104,
+        "kernel_allocator": 660810,
+        "log_descriptors_and_urls": 218605,
+        "other": 40311,
+        "schema_structures": 931
+      }
+    },
+    {
+      "workload": "many_actions",
+      "profile_sha256": "40e5b0a1a9e5965a0833889379f02741da08a170e78a079e6bd016f163b4e2fb",
+      "attribution_sha256": "c6a057645353790fdb157ba69d8bf74939bf1bed8f1fb97b11fe778ac8c6d2bd",
+      "total_profiled_requested_rust_bytes_at_peak": 2206386,
+      "bytes_attributed_to_kernel_allocator_stacks_at_same_peak": 2060332,
+      "fraction_attributed_to_kernel_allocator_stacks": 0.9338039672115396,
+      "disjoint_stack_groups_bytes": {
+        "kernel_allocator": 2060332,
+        "arrow_objects_schemas_and_decoder_state": 108818,
+        "arrow_buffers_and_parser": 25744,
+        "other": 6423,
+        "log_descriptors_and_urls": 2765,
+        "schema_structures": 2304
+      }
+    },
+    {
+      "workload": "wide_schema",
+      "profile_sha256": "1f830965d91e9a9aec0461a40fadc06abab1b97a3dbd2a33c002b622ea423cc8",
+      "attribution_sha256": "ec4953a6f01c07c173517c74d6ec6cdd19dfbfbfd74b2f59267e147773cbbd31",
+      "total_profiled_requested_rust_bytes_at_peak": 23936420,
+      "bytes_attributed_to_kernel_allocator_stacks_at_same_peak": 20830972,
+      "fraction_attributed_to_kernel_allocator_stacks": 0.8702626374370103,
+      "disjoint_stack_groups_bytes": {
+        "kernel_allocator": 20830972,
+        "schema_structures": 2830302,
+        "other": 240622,
+        "metadata_strings": 25903,
+        "log_descriptors_and_urls": 6371,
+        "arrow_objects_schemas_and_decoder_state": 2250
+      }
+    }
+  ],
+  "limitations": [
+    "This is a participating-storage budget, not a bound on total native memory or RSS. Arrow ownership graphs and other ordinary Rust/native allocations remain outside enforcement.",
+    "Infallible constructors or cloning on allocator-backed storage retain allocation-error-handler behavior. Strict lifecycle tests exercise converted fallible paths; they are not a proof that every public infallible Kernel API is recoverable.",
+    "DHAT stack groups attribute live requested allocations, not exact enforced charge at that same instant. Pending growth, canonical allocations before profiler start, and internal realloc copies affect comparison. No exact budget-counter callback at the global heap peak was captured.",
+    "Unprofiled Rust/RSS totals include the local reference engine and harness. Independent peak ratios do not measure coverage; profiler behavior/timing can differ from unprofiled runs.",
+    "Terminal metadata-plan execution and declarative commit are outside this lifecycle.",
+    "One repetition per correctness case does not establish latency percentiles or performance regressions."
+  ]
+}

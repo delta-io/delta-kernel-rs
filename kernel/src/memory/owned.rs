@@ -1,31 +1,17 @@
-use std::alloc::{Layout, alloc};
 use std::ops::{Deref, DerefMut};
 
-use super::{KERNEL_ALLOCATOR, MemoryResult};
+use super::{MemoryResult, storage};
 
 /// An owned metadata payload using the shared Kernel allocator.
 ///
 /// Use [`Self::try_new`] at fallible boundaries. Infallible conversions and cloning have Rust's
 /// ordinary allocation-error behavior if the allocator rejects their allocation.
-pub struct Owned<T>(Box<T>);
+pub struct Owned<T>(storage::Owned<T>);
 
 impl<T> Owned<T> {
     /// Allocate a payload, returning an error if its allocation cannot be reserved.
     pub fn try_new(value: T) -> MemoryResult<Self> {
-        let layout = Layout::new::<T>();
-        if layout.size() == 0 {
-            return Ok(Self(Box::new(value)));
-        }
-        // SAFETY: The nonzero layout describes T. Box takes ownership only after initialization,
-        // using the same process allocator for its eventual deallocation.
-        let pointer = unsafe { alloc(layout) }.cast::<T>();
-        if pointer.is_null() {
-            return Err(KERNEL_ALLOCATOR.allocation_error());
-        }
-        unsafe {
-            pointer.write(value);
-            Ok(Self(Box::from_raw(pointer)))
-        }
+        storage::try_boxed(value).map(Self)
     }
 
     /// Move out the value and release its tracked allocation.
@@ -35,11 +21,14 @@ impl<T> Owned<T> {
 }
 impl<T> From<T> for Owned<T> {
     fn from(value: T) -> Self {
-        Self(Box::new(value))
+        Self(storage::boxed(value))
     }
 }
 impl<T> From<Box<T>> for Owned<T> {
     fn from(value: Box<T>) -> Self {
+        #[cfg(feature = "memory-budget")]
+        return Self::from(*value);
+        #[cfg(not(feature = "memory-budget"))]
         Self(value)
     }
 }

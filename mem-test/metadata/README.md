@@ -1,83 +1,79 @@
-# Global Rust allocator POC
+# Explicit allocator budget
 
-Kernel exposes one stable `GlobalAlloc` implementation. Standard `Vec`, `String`, `Box`, `Arc`,
-hash tables, and Rust-owned Arrow storage use it when installed. Containers carry no allocator
-instance, and there are no operation budgets or thread-local allocation policies. Rust 1.95 is
-sufficient; `allocator-api2` is not used.
+Kernel's normal build keeps its stable Rust 1.95 MSRV. The internal `memory-budget` feature
+requires stable Rust 1.100 and selects `std::alloc::Allocator` for participating metadata storage.
+The FFI package declares Rust 1.100 and enables that feature. Neither configuration needs nightly.
+Cargo has no per-feature MSRV metadata, so the feature requirement is documented and checked by
+Kernel's build script. Kernel with all features enabled requires 1.100.
 
-Rust applications install the hook once:
+Private storage aliases and constructors select standard containers on 1.95 or allocator-backed
+containers with the feature. Schema, log, statistics, and declarative-plan logic is shared.
+The allocator is explicit; Kernel does not install a process-global limiting allocator.
+
+## Configure
+
+With `memory-budget` enabled, Rust callers use one shared instance:
 
 ```rust
-use delta_kernel::memory::{KERNEL_ALLOCATOR, KernelAllocator};
+use delta_kernel::memory::KERNEL_ALLOCATOR;
 
-#[global_allocator]
-static ALLOCATOR: KernelAllocator = KernelAllocator::new();
-
-let existing = KERNEL_ALLOCATOR.usage();
-KERNEL_ALLOCATOR.set_limit(Some(existing.reserved + 256 * 1024 * 1024))?;
-// Existing Snapshot / Scan / Transaction calls use the shared limit.
+KERNEL_ALLOCATOR.set_limit(Some(256 * 1024 * 1024))?;
+// Existing Snapshot / Scan / Transaction calls use participating storage.
+let usage = KERNEL_ALLOCATOR.usage();
 KERNEL_ALLOCATOR.set_limit(None)?;
 ```
 
-The FFI crate installs it through its default `global-allocator` feature. The existing
-`kernel_memory_set_limit` and `kernel_memory_usage` functions configure and observe the same
-state. Rust embedding applications with their own allocator must disable that feature and install
-`KernelAllocator::with_backing(...)` around their backing allocator. `alloc-tracking` is a
-compatibility alias for installing the hook.
+Enforcement defaults to disabled. FFI callers use `kernel_memory_set_limit` and
+`kernel_memory_usage`; no allocator installation or operation scope is required. Charges follow
+backing allocations until final release, including retained schema references and C release
+callbacks on another thread. The optional FFI `alloc-tracking` feature installs a separate,
+tracking-only process allocator for diagnostic native-byte getters; it never rejects allocations.
 
-Tracking starts with Rust allocation, and enforcement defaults to disabled. Reservations use a
-CAS loop; frees use an atomic subtraction. An allocation-free reader/writer gate coordinates limit
-changes and coherent snapshots with concurrent reservations. The backing allocator runs outside
-the gate. Reallocation reserves a full replacement while the old block is charged, then delegates
-to the backing allocator so it can resize in place. Reservation peaks can therefore exceed the
-actual live heap peak. Failed backing calls roll back their reservations.
+Reservations use atomic compare-and-swap; frees use atomic subtraction. An allocation-free atomic
+reader/writer gate coordinates configuration, snapshots, and peak resets. Backing allocations run
+outside the gate. Growth reserves only `new_size - old_size`, and shrinking releases its reduction
+only after success. Failed backing operations roll back reservations and preserve old storage.
+Allocator-internal copying can still require transient memory outside this requested-byte budget.
 
-Charges follow the actual allocation until deallocation, including across retained snapshot
-references, calls, threads, and C release callbacks. This tracks Rust array/schema objects,
-`ArrayData` child vectors, buffer ownership objects, and ordinary strings that bypassed the
-per-container experiment. Direct libc/C++ allocations, memory mappings, allocator overhead,
-retained allocator pages, and stacks are outside this requested-byte limit.
+## Fallibility and coverage
 
-## Recoverable failures
+Converted storage paths use fallible growth and return `MemoryError`. The fallible box helper uses
+`Allocator::allocate` and transfers initialized storage to a Box with the same allocator;
+`Box::try_new_in` is not needed. JSON output and FFI memory-error reporting avoid allocating an
+additional budgeted diagnostic after failure.
 
-`Vec::try_reserve`, `String::try_reserve`, and other fallible allocation APIs return errors when
-the global allocator returns null. Kernel's container helpers use standard containers and map
-those errors to its memory error. Its fallible box helper uses the process allocation functions.
-JSON output records a failed reservation and discards subsequent output before returning the saved
-error; this avoids allocating serde_json's boxed I/O error. FFI memory errors use static message
-bytes, so reporting them needs no additional Rust allocation.
+The explicit allocator does not reject ordinary Rust allocations in dependencies, callers,
+reference-engine objects, or error formatting. Infallible constructors and cloning on participating
+allocator-backed storage still have Rust's allocation-error behavior: this feature does not make
+every infallible Rust API recoverable. The lifecycle checks exercise converted fallible paths;
+process aborts fail those checks.
 
-Recovery remains incomplete. Infallible paths such as `Arc::new`, ordinary `Box::new`, and
-unconverted dependency calls can abort when denied. Installing the hook makes those allocations
-tracked and limited; it does not turn their callers into fallible APIs. Pressure surveys record
-these aborts separately from successful memory-error returns.
+The budget covers participating requested storage, not all native memory or RSS. Rust allocations
+outside participating containers, Arrow array/schema ownership objects, foreign engine buffers,
+direct libc/C++ allocations, mappings, stacks, and allocator-retained pages require separate
+measurement. The [Arrow experiment](../arrow-allocator-poc/README.md) extends participation to
+selected buffer payloads and parser scratch storage without installing a global rejection hook.
 
 ## Local checks
 
-The [lifecycle matrix](LIFECYCLE_CHECKS.md) varies schema shape, logs/actions/statistics, query
-shape, declarative plan shape, and concurrency. Both published dependencies and the
-[Arrow fallible-API experiment](../arrow-allocator-poc/README.md) use the same installed allocator.
-The dependency patch changes fallibility; it is unnecessary for routing allocations to the hook.
-
 ```sh
-CARGO_PROFILE_RELEASE_DEBUG=1 cargo +1.95.0 build --locked --release -p mem-test \
+CARGO_PROFILE_RELEASE_DEBUG=1 cargo +1.100.0 build --locked --release -p mem-test \
   --features declarative-benchmark --example rss_lifecycle --example kernel_lifecycle
 
 python3 mem-test/metadata/run_matrix.py \
-  --binary target/release/examples/rss_lifecycle --record-infallible-gaps \
-  --output /tmp/kernel-global-matrix.json
+  --binary target/release/examples/rss_lifecycle --output /tmp/kernel-allocator-matrix.json
 
 python3 mem-test/metadata/run_ffi_lifecycle.py
 ```
 
-Omit `--record-infallible-gaps` to make any pressure-process abort fail the run. Unlimited and
-fit-budget failures always fail the run. The C harness exercises the generated ABI, zero-headroom
-write-state encoding failure and retry, and foreign-thread byte release under a full budget.
-Rust tests also race standard-container reservations and limit changes across threads.
+The [matrix](LIFECYCLE_CHECKS.md) varies schema shape, logs/actions/statistics, query and plan shape,
+and concurrency. Tracking-only baseline runs measure successful live Rust allocations through a
+separate process allocator. Fresh constrained workers limit only participating Kernel storage.
+Each returned allocation error must be typed; owners must release their charges, and clearing the
+limit must allow retry. Aborts, leaks, limit overruns, and unexpected failures fail the runner.
 
-[Current validation](../arrow-allocator-poc/PROCESS_GLOBAL_VALIDATION.json) separates normal runs,
-recoverable pressure failures, and abort gaps. The older result files preserve their original
-compiler, source, and binary hashes. They describe the historical per-container implementation.
-RSS and physical-footprint interpretation is covered in [the measurement notes](DECLARATIVE_RSS.md).
-Use unprofiled RSS workers for limit experiments; run DHAT profiles with enforcement disabled,
-since profiler bookkeeping also uses the process allocator.
+[Current validation](../arrow-allocator-poc/ALLOCATOR_API_VALIDATION.json) records the feature/MSRV
+split and strict recovery checks. `PROCESS_GLOBAL_VALIDATION.json` preserves the rejected global
+limiting-hook experiment; its recoverability gaps and coverage claims do not describe this backend.
+Other historical result files retain their original compiler, source, and executable hashes.
+[Rust heap and RSS notes](DECLARATIVE_RSS.md) distinguish requested storage from resident pages.

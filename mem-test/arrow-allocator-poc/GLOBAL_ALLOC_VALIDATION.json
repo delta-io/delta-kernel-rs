@@ -158,5 +158,5 @@
     "Ordinary infallible allocation paths retain allocation-error-handler behavior; GlobalAlloc alone does not make them recoverable.",
     "Correctness-run timings do not establish p99.9 latency or performance regressions."
   ],
-  "current_validation": "PROCESS_GLOBAL_VALIDATION.json"
+  "current_validation": "ALLOCATOR_API_VALIDATION.json"
 }

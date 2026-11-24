@@ -1,63 +1,71 @@
-//! FFI access to the installed global Rust allocator's requested-byte counters.
+//! FFI access to `peak_alloc`'s process-wide Rust allocation counters.
 //!
-//! Direct libc allocations, memory mappings, and allocator overhead are excluded. Counters and
-//! limits are shared across threads; resetting the peak does not isolate a particular request.
+//! # Scope
+//!
+//! Counters record requested allocation sizes only, so they are a lower bound on process RSS:
+//! C/`mmap` allocations and allocator overhead are not included. Values are process-global and
+//! advisory, rather than measurements for a single operation. `peak_alloc` uses relaxed atomic
+//! operations to update its counters. Its peak reset is not coordinated with allocation, so callers
+//! must serialize a reset against native work when they require a meaningful post-reset peak.
 
-#[cfg(feature = "global-allocator")]
-use delta_kernel::memory::KERNEL_ALLOCATOR;
-#[cfg(feature = "global-allocator")]
-use delta_kernel::memory::KernelAllocator;
+#[cfg(feature = "alloc-tracking")]
+use peak_alloc::PeakAlloc;
 
-#[cfg(feature = "global-allocator")]
+#[cfg(feature = "alloc-tracking")]
 #[global_allocator]
-static GLOBAL_ALLOC: KernelAllocator = KernelAllocator::new();
+static GLOBAL_ALLOC: PeakAlloc = PeakAlloc;
 
 /// Whether this library was built with allocation tracking.
 ///
 /// The `*_native_bytes` getters return zero when this is false.
 #[unsafe(no_mangle)]
 pub extern "C" fn alloc_tracking_enabled() -> bool {
-    cfg!(feature = "global-allocator")
+    cfg!(feature = "alloc-tracking")
 }
 
-/// Peak requested-byte reservations since the library was loaded or reset.
+/// Reported peak simultaneously live native bytes since the library was loaded or reset.
 ///
-/// This includes in-flight requests and conservative old-plus-new reallocation reservations.
-/// Values are shared across threads and exclude direct libc allocations and memory mappings.
-/// Returns zero when built without `global-allocator`.
+/// The value is process-wide, not per-operation, and counts requested Rust allocation sizes only.
+/// Returns zero when built without `alloc-tracking`.
 #[unsafe(no_mangle)]
 pub extern "C" fn peak_native_bytes() -> u64 {
     cfg_select! {
-        feature = "global-allocator" => KERNEL_ALLOCATOR.usage().peak as u64,
+        feature = "alloc-tracking" => GLOBAL_ALLOC.peak_usage() as u64,
         _ => 0,
     }
 }
 
-/// Current requested Rust bytes, including allocation reservations still in flight.
+/// Native bytes currently live (allocated but not yet freed).
 ///
-/// This is shared across threads and excludes allocator overhead. Returns zero when
-/// built without `global-allocator`.
+/// The value is process-wide and counts requested Rust allocation sizes only. Returns zero when
+/// built without `alloc-tracking`.
 #[unsafe(no_mangle)]
 pub extern "C" fn current_native_bytes() -> u64 {
     cfg_select! {
-        feature = "global-allocator" => KERNEL_ALLOCATOR.usage().reserved as u64,
+        feature = "alloc-tracking" => GLOBAL_ALLOC.current_usage() as u64,
         _ => 0,
     }
 }
 
-/// Reset the historical requested-byte peak to current usage and return the previous peak.
+/// Resets the peak to the current live total and returns the peak sampled immediately before reset.
 ///
-/// The reset excludes new reservations; concurrent frees can only reduce usage. Values are shared.
-/// Returns zero when this library does not install the global allocator.
+/// This is process-global and cannot provide a per-task baseline while allocation is concurrent.
+/// `peak_alloc` samples and resets separately, so concurrent allocation can cause the returned
+/// value to understate the cleared peak and leave the reported peak lower than the current total.
+/// Returns zero when built without `alloc-tracking`.
 #[unsafe(no_mangle)]
 pub extern "C" fn reset_peak_native_bytes() -> u64 {
     cfg_select! {
-        feature = "global-allocator" => KERNEL_ALLOCATOR.reset_peak() as u64,
+        feature = "alloc-tracking" => {
+            let previous_peak = GLOBAL_ALLOC.peak_usage() as u64;
+            GLOBAL_ALLOC.reset_peak_usage();
+            previous_peak
+        }
         _ => 0,
     }
 }
 
-#[cfg(all(test, not(feature = "global-allocator")))]
+#[cfg(all(test, not(feature = "alloc-tracking")))]
 mod disabled_tests {
     use super::{
         alloc_tracking_enabled, current_native_bytes, peak_native_bytes, reset_peak_native_bytes,
@@ -72,7 +80,7 @@ mod disabled_tests {
     }
 }
 
-#[cfg(all(test, feature = "global-allocator"))]
+#[cfg(all(test, feature = "alloc-tracking"))]
 mod global_allocator_tests {
     use super::{
         alloc_tracking_enabled, current_native_bytes, peak_native_bytes, reset_peak_native_bytes,

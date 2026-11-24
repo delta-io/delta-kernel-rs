@@ -305,6 +305,7 @@ pub(crate) fn get_all_actions_schema() -> &'static SchemaRef {
     &ALL_ACTIONS_SCHEMA
 }
 
+#[cfg(feature = "memory-budget")]
 pub(crate) fn initialize_schemas() {
     let _ = get_all_actions_schema();
     for schema in [
