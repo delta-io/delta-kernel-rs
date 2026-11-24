@@ -10,7 +10,7 @@ use delta_kernel_default_engine::executor::tokio::{
 };
 use delta_kernel_ffi::handle::Handle;
 use delta_kernel_ffi::{KernelStringSlice, OptionalValue, TryFromStringSlice, kernel_string_slice};
-use delta_kernel_ffi_macros::handle_descriptor;
+use delta_kernel_ffi_macros::{ffi_export, handle_descriptor};
 use delta_kernel_unity_catalog::UCCommitter;
 use tracing::trace;
 use unity_catalog_delta_client_api::{
@@ -18,7 +18,7 @@ use unity_catalog_delta_client_api::{
     UpdateTableRequest as ClientUpdateTableRequest,
 };
 
-use crate::error::{ErrorAllocators, ExternResult, IntoExternResult as _};
+use crate::error::{ErrorAllocators, ExternResult};
 use crate::transaction::MutableCommitter;
 use crate::{ExclusiveRustString, NullableCvoid};
 
@@ -219,6 +219,7 @@ impl<C: UpdateTableClient + 'static> Committer for FfiUCCommitter<C> {
 ///  Caller is responsible for passing a valid pointer to a SharedFfiUCCommitClient, obtained via
 ///  calling [`get_uc_commit_client`], valid KernelStringSlices for `table_id`, `catalog`,
 ///  `schema`, and `table_name`.
+#[ffi_export(error_allocator = unsafe { &*error_allocators })]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_uc_committer(
     commit_client: Handle<SharedFfiUCCommitClient>,
@@ -228,8 +229,7 @@ pub unsafe extern "C" fn get_uc_committer(
     table_name: KernelStringSlice,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<Handle<MutableCommitter>> {
-    let result = get_uc_committer_impl(commit_client, table_id, catalog, schema, table_name);
-    unsafe { result.into_extern_result(&*error_allocators) }
+    get_uc_committer_impl(commit_client, table_id, catalog, schema, table_name)
 }
 
 fn get_uc_committer_impl(
