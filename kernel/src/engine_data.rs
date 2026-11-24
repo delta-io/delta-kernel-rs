@@ -643,12 +643,12 @@ pub trait EngineData: AsAny {
     /// each non-leaf element of the path must be a struct field at that level.
     fn has_field(&self, name: &ColumnName) -> bool;
 
-    /// Returns a nullness flag for each row of the selected column, including struct ancestors.
+    /// Returns the selected column's own logical nullness flag for each row.
     ///
     /// Paths use the same field names as [`Self::visit_rows`] and [`Self::has_field`], and may
     /// select a struct. A present struct whose fields are all null is not itself null.
-    /// Returns exactly `self.len()` flags in row order; `true` means null, including through
-    /// any null struct ancestor.
+    /// Returns exactly `self.len()` flags in row order; `true` means null. Ancestor masks are
+    /// not combined here. Callers must check parent structs before reading their children.
     ///
     /// Returns an error if the path is empty, a field is missing, or a
     /// non-final path component is not a struct. The full path must be validated even when an

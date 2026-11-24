@@ -14,8 +14,6 @@ use crate::arrow::array::{
     Array, ArrayRef, GenericByteArray, OffsetSizeTrait, RecordBatch, RunArray, StringViewArray,
     StructArray,
 };
-#[cfg(feature = "declarative-plans")]
-use crate::arrow::buffer::NullBuffer;
 use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef, Schema as ArrowSchema,
@@ -326,31 +324,28 @@ impl EngineData for ArrowEngineData {
 
     #[cfg(feature = "declarative-plans")]
     fn is_null(&self, name: &ColumnName) -> KernelResult<Vec<bool>> {
-        require!(
-            !name.path().is_empty(),
-            KernelError::missing_column("Column path must not be empty")
-        );
-        let (_, _, nulls) = name.path().iter().enumerate().try_fold(
-            (self.data.schema_ref().fields(), self.data.columns(), None),
-            |(fields, columns, nulls), (depth, component)| -> KernelResult<_> {
-                let (index, _) = fields.find(component.as_str()).ok_or_else(|| {
-                    KernelError::missing_column(format!(
-                        "Column {name}: field {component} not found"
-                    ))
-                })?;
-                let column = &columns[index];
-                let nulls = NullBuffer::union(nulls.as_ref(), column.logical_nulls().as_ref());
-                if depth + 1 == name.path().len() {
-                    return Ok((fields, columns, nulls));
-                }
+        let (first, rest) = name
+            .path()
+            .split_first()
+            .ok_or_else(|| KernelError::missing_column("Column path must not be empty"))?;
+        let column = self.data.column_by_name(first).ok_or_else(|| {
+            KernelError::missing_column(format!("Column {name}: field {first} not found"))
+        })?;
+        let (_, column) = rest.iter().try_fold(
+            (first, column),
+            |(parent, column), field| -> KernelResult<_> {
                 let nested = column.as_struct_opt().ok_or_else(|| {
                     KernelError::unexpected_column_type(format!(
-                        "Column {name}: field {component} is not a struct"
+                        "Column {name}: field {parent} is not a struct"
                     ))
                 })?;
-                Ok((nested.fields(), nested.columns(), nulls))
+                let column = nested.column_by_name(field).ok_or_else(|| {
+                    KernelError::missing_column(format!("Column {name}: field {field} not found"))
+                })?;
+                Ok((field, column))
             },
         )?;
+        let nulls = column.logical_nulls();
         Ok((0..self.len())
             .map(|row| nulls.as_ref().is_some_and(|nulls| nulls.is_null(row)))
             .collect())
@@ -1653,7 +1648,7 @@ mod tests {
             (
                 Arc::new(parent) as ArrayRef,
                 ColumnName::new(["value", "leaf"]),
-                [true, expected[1], true, expected[3]],
+                expected,
             )
         } else {
             (column, column_name!("value"), expected)
@@ -1672,8 +1667,8 @@ mod tests {
     #[cfg(feature = "declarative-plans")]
     #[rstest]
     #[case::struct_column(&["nested"], Ok([true, false, false, false]))]
-    #[case::inner_struct(&["nested", "inner"], Ok([true, true, false, false]))]
-    #[case::leaf(&["nested", "inner", "leaf"], Ok([true, true, true, false]))]
+    #[case::inner_struct(&["nested", "inner"], Ok([false, true, false, false]))]
+    #[case::leaf(&["nested", "inner", "leaf"], Ok([false, false, true, false]))]
     #[case::literal_dot(&["a.b"], Ok([false, false, true, false]))]
     #[case::empty_path(&[], Err("path must not be empty"))]
     #[case::missing(&["missing"], Err("field missing not found"))]
