@@ -409,20 +409,32 @@ async fn checkpoint_plan_reconciles_all_groups_and_retains_after_replay(
 pub(super) async fn checkpoint_representation_table(
     compatible: bool,
     write_struct: bool,
+    with_variant: bool,
 ) -> KernelResult<(TestTable, SnapshotRef, SyncEngine), Box<dyn std::error::Error>> {
+    let schema = partitioned_schema().project(&["value", "part_long", "part_int"])?;
+    let schema = if with_variant {
+        schema
+            .add([::test_utils::top_level_variant_schema()
+                .field("col")
+                .unwrap()
+                .clone()])?
+            .project(&["value", "part_long", "part_int", "col"])?
+    } else {
+        schema
+    };
     let table = TestTableBuilder::new()
         .with_features(FeatureSet::new().deletion_vectors())
-        .with_schema(
-            partitioned_schema()
-                .project(&["value", "part_long", "part_int"])
-                .unwrap(),
-        )
+        .with_schema(schema)
         .with_partition_columns(["part_long"])
         .with_table_config(
             TableConfig::new()
                 .write_stats_as_json(true)
                 .write_stats_as_struct(write_struct)
-                .data_skipping_stats_columns(["value"]),
+                .data_skipping_stats_columns(
+                    ["value", "col"]
+                        .into_iter()
+                        .filter(|name| with_variant || *name == "value"),
+                ),
         )
         .build()
         .unwrap();
@@ -435,8 +447,15 @@ pub(super) async fn checkpoint_representation_table(
     let protocol = json!({"protocol": snapshot.table_configuration().protocol()});
     let writer = snapshot.create_checkpoint_writer(&engine)?;
     let stats = |id: i64| {
-        json!({"numRecords":10,"minValues":{"value":id},
-        "maxValues":{"value":id},"nullCount":{"value":0}})
+        let mut stats = json!({"numRecords":10,"minValues":{"value":id},
+            "maxValues":{"value":id},"nullCount":{"value":0}});
+        if with_variant {
+            stats["nullCount"]["col"] = json!(2);
+            for bound in ["minValues", "maxValues"] {
+                stats[bound]["col"] = json!({"metadata":"010000", "value":"0c0a"});
+            }
+        }
+        stats
     };
     let file = |path: &str, id: i64| {
         let mut row = add(path, (path == "native.parquet").then_some(0));
@@ -446,10 +465,32 @@ pub(super) async fn checkpoint_representation_table(
             json_stats[field]["part_int"] = json!(id + 100);
         }
         json_stats["nullCount"]["part_int"] = json!(0);
+        if with_variant {
+            // Protocol VARIANT-statistics example: preserve these Z85 bounds as opaque JSON.
+            json_stats["minValues"]["col"] =
+                json!("0S&u501fk+ze0(tB98CpzF6vU0rJl95HpNdvjbtatpi(cu0wW^cTu");
+            json_stats["maxValues"]["col"] =
+                json!("0S&u500&]LC42A9vqZe}wb#-i1}-a+cT!xdbWhT9cTx}7v<+K");
+        }
         row["add"]["stats"] = json!(format!(" {json_stats} "));
         row
     };
-    let available = if compatible {
+    let available = if with_variant {
+        let bounds = schema! {
+            nullable "value": INTEGER,
+            nullable "col": { not_null "metadata": BINARY, not_null "value": BINARY },
+        };
+        build_checkpoint_read_schema(
+            &writer.schema_context.checkpoint_base_schema,
+            &schema! {
+                nullable "numRecords": LONG,
+                nullable "minValues": (bounds.clone()),
+                nullable "maxValues": (bounds),
+                nullable "nullCount": { nullable "value": LONG, nullable "col": LONG },
+            },
+            writer.schema_context.partition_schema.as_deref(),
+        )?
+    } else if compatible {
         writer.read_schema.clone()
     } else {
         build_checkpoint_read_schema(
@@ -495,6 +536,31 @@ pub(super) async fn checkpoint_representation_table(
         .build(&engine)
         .unwrap();
     assert_eq!(snapshot.log_segment().checkpoint_version, Some(0));
+    if with_variant {
+        let shape = snapshot.checkpoint_info(&engine)?.unwrap();
+        for bound in ["minValues", "maxValues"] {
+            let field =
+                shape
+                    .leaf_checkpoint_schema
+                    .field_at(&crate::expressions::ColumnName::new([
+                        "add",
+                        "stats_parsed",
+                        bound,
+                        "col",
+                    ]))?;
+            let crate::schema::DataType::Struct(variant) = field.data_type() else {
+                panic!("native VARIANT bounds must have a physical struct");
+            };
+            assert_eq!(
+                variant.field("metadata").unwrap().data_type(),
+                &crate::schema::DataType::BINARY
+            );
+            assert_eq!(
+                variant.field("value").unwrap().data_type(),
+                &crate::schema::DataType::BINARY
+            );
+        }
+    }
     Ok((table, snapshot, engine))
 }
 
@@ -507,7 +573,7 @@ async fn checkpoint_uses_declared_metadata_representations(
     #[values(false, true)] parsed_partitions: bool,
 ) -> KernelResult<(), Box<dyn std::error::Error>> {
     let (_table, snapshot, engine) =
-        checkpoint_representation_table(compatible, write_struct).await?;
+        checkpoint_representation_table(compatible, write_struct, false).await?;
     let mut writer = snapshot.clone().create_checkpoint_writer(&engine)?;
     let shape = snapshot.checkpoint_info(&engine)?;
     let mut stats = if write_struct {

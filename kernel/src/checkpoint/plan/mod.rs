@@ -52,9 +52,9 @@ impl CheckpointWriter {
         let config = self.snapshot.table_configuration();
         let segment = self.snapshot.log_segment();
         let parsed_partitions = write_stats_as_struct.unwrap_or(true);
+        // JSON VARIANT bounds require Z85 encoding.
         let stats = StatsOptions {
             synthesize_json: context.stats_config.write_stats_as_json,
-            variant_min_max: true,
             #[cfg(feature = "geo-type-in-dev")]
             geometry_min_max: true,
             ..StatsOptions::json_only()

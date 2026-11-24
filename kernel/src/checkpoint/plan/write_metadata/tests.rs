@@ -125,14 +125,20 @@ fn reconciled_rows(writer: &CheckpointWriter, engine: &dyn Engine) -> KernelResu
 #[case::mixed("mixed", false)]
 #[case::predecessor("predecessor", false)]
 #[case::nullable_json_and_native_dv_stats("native_stats", false)]
+#[case::variant_native_and_json_stats("variant_stats", false)]
 #[case::oversized_schema("empty", true)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
     #[case] state: &str,
     #[case] oversized_schema: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_table, snapshot, engine) = if state == "native_stats" {
-        crate::checkpoint::plan::tests::checkpoint_representation_table(true, false).await?
+    let (_table, snapshot, engine) = if matches!(state, "native_stats" | "variant_stats") {
+        crate::checkpoint::plan::tests::checkpoint_representation_table(
+            true,
+            false,
+            state == "variant_stats",
+        )
+        .await?
     } else {
         checkpoint_table(state, oversized_schema)?
     };
@@ -153,7 +159,7 @@ async fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
         expected.len(),
         match state {
             "empty" => 2,
-            "native_stats" => 5,
+            "native_stats" | "variant_stats" => 5,
             _ => 6,
         }
     );
@@ -247,13 +253,20 @@ async fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
     let persisted = reader.build()?.collect::<Result<Vec<_>, _>>()?;
     let actual = canonical_actions(json_rows(&persisted, false)?);
     assert_eq!(actual, expected);
-    if state == "native_stats" {
+    if matches!(state, "native_stats" | "variant_stats") {
         let native = actual
             .iter()
             .find(|row| row["add"]["path"] == "native.parquet")
             .unwrap();
         let stats: Value = serde_json::from_str(native["add"]["stats"].as_str().unwrap())?;
         assert_eq!(stats["numRecords"], 10);
+        assert_eq!(stats["minValues"]["value"], 10);
+        assert_eq!(stats["maxValues"]["value"], 10);
+        if state == "variant_stats" {
+            assert_eq!(stats["nullCount"]["col"], 2);
+            assert!(stats["minValues"].get("col").is_none());
+            assert!(stats["maxValues"].get("col").is_none());
+        }
         assert_eq!(native["add"]["deletionVector"]["cardinality"], 1);
         let original = actual
             .iter()
@@ -264,6 +277,17 @@ async fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
         assert!(original_json.ends_with(' '));
         let stats: Value = serde_json::from_str(original_json)?;
         assert_eq!(stats["minValues"]["part_int"], 120);
+        if state == "variant_stats" {
+            assert_eq!(stats["nullCount"]["col"], 2);
+            assert_eq!(
+                stats["minValues"]["col"],
+                "0S&u501fk+ze0(tB98CpzF6vU0rJl95HpNdvjbtatpi(cu0wW^cTu"
+            );
+            assert_eq!(
+                stats["maxValues"]["col"],
+                "0S&u500&]LC42A9vqZe}wb#-i1}-a+cT!xdbWhT9cTx}7v<+K"
+            );
+        }
         assert_eq!(expected_adds, 3);
     }
     for row in &actual {
