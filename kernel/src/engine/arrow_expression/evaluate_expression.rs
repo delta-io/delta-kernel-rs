@@ -1271,7 +1271,7 @@ mod tests {
         Predicate as Pred, StructData, col, column_expr_ref, column_pred, expr, lit, null_lit,
     };
     use crate::schema::{
-        ArrayType, DataType, MapType, StructField, StructType, schema, schema_ref,
+        ArrayType, DataType, MapType, SchemaRef, StructField, StructType, schema, schema_ref,
     };
     use crate::unit_test_utils::assert_result_error_with_message;
 
@@ -2911,20 +2911,40 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_parse_json_null_input_with_required_field_nulls_batch() {
+    #[rstest]
+    #[case::required_long(schema_ref! { not_null "a": LONG }, r#"{"a":1}"#,
+        Arc::new(Int64Array::from(vec![1])))]
+    #[case::required_date(schema_ref! { not_null "a": DATE }, r#"{"a":"1970-01-02"}"#,
+        Arc::new(Date32Array::from(vec![1])))]
+    fn test_parse_json_null_root_preserves_required_field(
+        #[case] output_schema: SchemaRef,
+        #[case] valid: &str,
+        #[case] expected: ArrayRef,
+    ) {
         let batch = RecordBatch::try_from_iter([(
             "json_col",
-            Arc::new(StringArray::from(vec![None, Some(r#"{"a":1}"#)])) as ArrayRef,
+            Arc::new(StringArray::from(vec![None, Some("null"), Some(valid)])) as ArrayRef,
         )])
         .unwrap();
-        let output_schema = schema_ref! { not_null "a": LONG };
         let expr = Expr::parse_json(col!("json_col"), output_schema);
-
         let result = evaluate_expression(&expr, &batch, None).expect("parses permissively");
+        let parsed = result.as_struct();
+        assert_eq!(parsed.len(), 3);
+        assert!(parsed.is_null(0) && parsed.is_null(1) && parsed.is_valid(2));
+        assert_eq!(parsed.column(0).slice(2, 1).as_ref(), expected.as_ref());
+    }
 
-        // TODO(#3116): Decode only present inputs so a required field in a NULL row does not
-        // discard valid rows from the same batch.
+    #[rstest]
+    fn test_parse_json_present_object_requires_non_null_field(
+        #[values("{}", r#"{"a":null}"#)] invalid: &str,
+    ) {
+        let batch = RecordBatch::try_from_iter([(
+            "json_col",
+            Arc::new(StringArray::from(vec![invalid, r#"{"a":1}"#])) as ArrayRef,
+        )])
+        .unwrap();
+        let expr = Expr::parse_json(col!("json_col"), schema_ref! { not_null "a": LONG });
+        let result = evaluate_expression(&expr, &batch, None).expect("parses permissively");
         assert_eq!(result.len(), 2);
         assert_eq!(result.null_count(), 2);
     }

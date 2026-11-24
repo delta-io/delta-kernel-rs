@@ -251,7 +251,10 @@ async fn checkpoint_preserves_missing_empty_and_populated_stats_shapes()
         &table_url,
         engine.as_ref(),
         snapshot.version(),
-        &[("delta.checkpoint.writeStatsAsStruct", "true")],
+        &[
+            ("delta.checkpoint.writeStatsAsStruct", "true"),
+            ("delta.checkpoint.writeStatsAsJson", "false"),
+        ],
     )?;
 
     let actions = [
@@ -303,6 +306,7 @@ async fn checkpoint_preserves_missing_empty_and_populated_stats_shapes()
     let add_rows = BooleanArray::from_iter((0..add.len()).map(|row| Some(add.is_valid(row))));
     let checkpoint_adds = filter_record_batch(&checkpoint, &add_rows)?;
     let add = get_column!(checkpoint_adds, "add", StructArray);
+    assert!(add.column_by_name("stats").is_none());
     let paths = get_column!(add, "path", StringArray);
     let stats_parsed = get_column!(add, STATS_PARSED, StructArray);
     let mut validity: Vec<_> = (0..add.len())

@@ -152,6 +152,7 @@ message CaseWhenExpression {
   Expression else_expr = 2;
 }
 
+// See delta_kernel::expressions::ParseJsonExpression for NULL-input and parse-failure semantics.
 message ParseJsonExpression {
   Expression json_expr = 1;
   delta.kernel.schema.StructType output_schema = 2;
