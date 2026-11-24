@@ -488,6 +488,14 @@ fn try_new_update_table<MODE: ExecutionMode>(
         .iter()
         .map(|(key, value)| parse_feature_signal(key, value, "UPDATE TABLE"))
         .collect::<KernelResult<Vec<_>>>()?;
+    // Converting a path-based table to catalogManaged needs an UpgradeToCatalogManaged commit,
+    // which Kernel does not emit yet.
+    if feature_signals.contains(&TableFeature::CatalogManaged) {
+        return Err(KernelError::unsupported(
+            "Enabling catalogManaged on an existing table is not supported yet",
+        )
+        .into());
+    }
     let has_schema_changes = schema_changes.is_some();
     effective_table_config = match schema_changes {
         Some(changes) => apply_schema_changes(effective_table_config, changes)?,
@@ -532,13 +540,24 @@ fn try_new_update_table<MODE: ExecutionMode>(
     }
 
     // Property-driven feature enablement may upgrade the protocol and apply metadata side effects.
-    let protocol_prep =
-        prepare_protocol_for_update(&read_table_config, effective_table_config, &feature_signals)?;
-    effective_table_config = protocol_prep.table_config;
-    should_emit_metadata |= protocol_prep.metadata_side_effects;
-    let should_emit_protocol = protocol_prep.should_emit_protocol;
-    if should_emit_protocol {
-        should_emit_metadata = true;
+    // Plain data writes skip it so they never touch the protocol.
+    let mut should_emit_protocol = false;
+    if has_schema_changes
+        || has_property_adds
+        || has_property_removes
+        || !feature_signals.is_empty()
+    {
+        let protocol_prep = prepare_protocol_for_update(
+            &read_table_config,
+            effective_table_config,
+            &feature_signals,
+        )?;
+        effective_table_config = protocol_prep.table_config;
+        should_emit_metadata |= protocol_prep.metadata_side_effects;
+        should_emit_protocol = protocol_prep.should_emit_protocol;
+        if should_emit_protocol {
+            should_emit_metadata = true;
+        }
     }
     if operation == UpdateTableOperation::AlterTable && !should_emit_metadata {
         return Err(KernelError::invalid_transaction_state(
@@ -1730,39 +1749,18 @@ mod tests {
     }
 
     #[test]
-    fn with_table_properties_added_catalog_managed_sets_ict_enablement_property() -> Result<()> {
-        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
-        let transaction = snapshot
-            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
-            .with_table_properties_added([("delta.feature.catalogManaged", "supported")])
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
-        let config = &transaction.effective_table_config;
-        assert!(config.is_feature_supported(&TableFeature::CatalogManaged));
-        assert!(config.is_feature_supported(&TableFeature::InCommitTimestamp));
-        assert_eq!(
-            config
-                .metadata()
-                .configuration()
-                .get(ENABLE_IN_COMMIT_TIMESTAMPS)
-                .map(String::as_str),
-            Some("true")
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn with_table_properties_added_catalog_managed_rejects_explicit_ict_disable() -> Result<()> {
+    fn with_table_properties_added_rejects_catalog_managed_signal_on_existing_table() -> Result<()>
+    {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let error = snapshot
             .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
-            .with_table_properties_added([
-                ("delta.feature.catalogManaged", "supported"),
-                ("delta.enableInCommitTimestamps", "false"),
-            ])
+            .with_table_properties_added([("delta.feature.catalogManaged", "supported")])
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
             .unwrap_err();
         assert!(
-            error.to_string().contains("Catalog-managed tables require"),
+            error
+                .to_string()
+                .contains("Enabling catalogManaged on an existing table is not supported"),
             "error={error}"
         );
         Ok(())

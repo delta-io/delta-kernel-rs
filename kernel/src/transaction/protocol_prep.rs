@@ -86,7 +86,6 @@ const UPDATE_PROPERTY_DRIVEN_FEATURES: &[TableFeature] = &[
     TableFeature::AppendOnly,
     TableFeature::ChangeDataFeed,
     TableFeature::DeletionVectors,
-    TableFeature::TypeWidening,
     TableFeature::InCommitTimestamp,
     TableFeature::RowTracking,
     TableFeature::ColumnMapping,
@@ -222,6 +221,18 @@ pub(crate) fn prepare_protocol_for_update(
     if table_properties.enable_variant_shredding == Some(true) && !variant_shredding_ga_enabled {
         add_feature_to_lists(
             TableFeature::VariantShreddingPreview,
+            &mut reader_features,
+            &mut writer_features,
+        );
+    }
+    // Clients that only know typeWidening-preview cannot read GA typeWidening, so a table already
+    // on the preview keeps its protocol.
+    let type_widening_preview_enabled = reader_features
+        .contains(&TableFeature::TypeWideningPreview)
+        || writer_features.contains(&TableFeature::TypeWideningPreview);
+    if table_properties.enable_type_widening == Some(true) && !type_widening_preview_enabled {
+        add_feature_to_lists(
+            TableFeature::TypeWidening,
             &mut reader_features,
             &mut writer_features,
         );
@@ -823,6 +834,28 @@ mod tests {
                 .unwrap()
                 .contains(&TableFeature::TimestampWithoutTimezone)
         );
+    }
+
+    #[rstest]
+    #[case::preview_present_keeps_protocol(&[TableFeature::TypeWideningPreview], false)]
+    #[case::no_preview_adds_ga(&[], true)]
+    fn prepare_protocol_for_update_type_widening_respects_preview(
+        #[case] existing: &[TableFeature],
+        #[case] expect_protocol_change: bool,
+    ) -> Result<()> {
+        let before = MockTableConfigurationBuilder::new()
+            .with_properties([("delta.enableTypeWidening", "true")])
+            .with_protocol(MockProtocolBuilder::new().with_features(existing).build())
+            .build();
+        let result = prepare_protocol_for_update(&before, before.clone(), &[])?;
+        assert_eq!(result.should_emit_protocol, expect_protocol_change);
+        assert_eq!(
+            result
+                .table_config
+                .is_feature_supported(&TableFeature::TypeWidening),
+            !existing.contains(&TableFeature::TypeWideningPreview),
+        );
+        Ok(())
     }
 
     #[test]
