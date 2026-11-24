@@ -1,4 +1,4 @@
-//! One execution writes a V1 checkpoint and returns complete hint inputs to Kernel.
+//! One execution writes a single-part checkpoint and returns complete hint inputs to Kernel.
 
 use std::sync::LazyLock;
 
@@ -22,18 +22,13 @@ static RESULT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 };
 
 impl CheckpointWriter {
-    /// Builds one plan that writes a classic Parquet V1 checkpoint and computes its hint inputs.
+    /// Builds one plan that writes a classic Parquet checkpoint and computes its hint inputs.
     ///
+    /// Table features select V1 or inline V2 content. V2 includes fresh checkpoint metadata.
     /// Counts cover the rows written, and the completed file descriptor supplies the byte size.
     /// Execute once and pass the complete result to [`Self::last_checkpoint_bytes_from_result`],
-    /// then atomically publish the returned `_last_checkpoint` bytes. V2 writers are rejected
-    /// before planning reads.
+    /// then atomically publish the returned `_last_checkpoint` bytes.
     pub fn declarative_checkpoint_plan(&self, engine: &dyn Engine) -> KernelResult<Plan> {
-        if self.schema_context.is_v2 {
-            return Err(KernelError::unsupported(
-                "This plan requires a V1 checkpoint writer",
-            ));
-        }
         let actions = self.checkpoint_actions(engine)?;
         let checkpoint_schema = serde_json::to_string(actions.schema())?;
         let write = WriteParquet::new(actions.schema().clone(), self.checkpoint_path()?)

@@ -55,7 +55,7 @@ fn checkpoint_engine(engine: SyncEngine, declarative: bool) -> DelegatingEngine 
     }
 }
 
-fn write_v1_checkpoint(
+fn write_single_part_checkpoint(
     snapshot: &Arc<Snapshot>,
     engine: &dyn Engine,
     declarative: bool,
@@ -787,17 +787,26 @@ fn create_add_action_with_stats(path: &str, num_records: i64) -> Action {
 }
 
 #[rstest::rstest]
-#[case::imperative(false)]
-#[cfg_attr(feature = "declarative-plans", case::declarative(true))]
+#[case::imperative_v1(false, false)]
+#[case::imperative_v2(true, false)]
+#[cfg_attr(feature = "declarative-plans", case::declarative_v1(false, true))]
+#[cfg_attr(feature = "declarative-plans", case::declarative_v2(true, true))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_snapshot_checkpoint(#[case] declarative: bool) -> Result<()> {
+async fn test_snapshot_checkpoint(#[case] v2: bool, #[case] declarative: bool) -> Result<()> {
     let (store, _) = new_in_memory_store();
     let engine = checkpoint_engine(SyncEngine::new_with_store(store.clone()), declarative);
 
     // Version 0: metadata & protocol
     write_commit_to_store(
         &store,
-        vec![create_metadata_action(), create_basic_protocol_action()],
+        vec![
+            create_metadata_action(),
+            if v2 {
+                create_v2_checkpoint_protocol_action()
+            } else {
+                create_basic_protocol_action()
+            },
+        ],
         0,
     )
     .await?;
@@ -852,16 +861,16 @@ async fn test_snapshot_checkpoint(#[case] declarative: bool) -> Result<()> {
     let table_root = Url::parse("memory:///").map_err(KernelError::from)?;
     let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
 
-    write_v1_checkpoint(&snapshot, &engine, declarative)?;
+    write_single_part_checkpoint(&snapshot, &engine, declarative)?;
 
-    // First checkpoint: 1 metadata + 1 protocol + 5 add + 3 remove = 10, numOfAddFiles = 5
+    // First checkpoint: 1 metadata + 1 protocol + 5 adds + 3 removes, plus V2 metadata.
     let checkpoint_path = Path::from("_delta_log/00000000000000000004.checkpoint.parquet");
     let checkpoint_size = store
         .head(&checkpoint_path)
         .await
         .map_err(KernelError::from)?
         .size;
-    assert_last_checkpoint_contents(&store, 4, 10, 5, checkpoint_size).await?;
+    assert_last_checkpoint_contents(&store, 4, 10 + u64::from(v2), 5, checkpoint_size).await?;
 
     // Version 5: add 2 files, remove 1
     write_commit_to_store(
@@ -880,16 +889,16 @@ async fn test_snapshot_checkpoint(#[case] declarative: bool) -> Result<()> {
 
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
 
-    write_v1_checkpoint(&snapshot, &engine, declarative)?;
+    write_single_part_checkpoint(&snapshot, &engine, declarative)?;
 
-    // Second checkpoint: 1 metadata + 1 protocol + 7 add + 4 remove = 13, numOfAddFiles = 7
+    // Second checkpoint: 1 metadata + 1 protocol + 7 adds + 4 removes, plus V2 metadata.
     let checkpoint_path = Path::from("_delta_log/00000000000000000006.checkpoint.parquet");
     let checkpoint_size = store
         .head(&checkpoint_path)
         .await
         .map_err(KernelError::from)?
         .size;
-    assert_last_checkpoint_contents(&store, 6, 13, 7, checkpoint_size).await?;
+    assert_last_checkpoint_contents(&store, 6, 13 + u64::from(v2), 7, checkpoint_size).await?;
 
     Ok(())
 }
