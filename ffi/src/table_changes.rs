@@ -267,7 +267,7 @@ pub unsafe extern "C" fn table_changes_scan_execute(
 ) -> ExternResult<Handle<SharedScanTableChangesIterator>> {
     let table_changes_scan = unsafe { table_changes_scan.as_ref() };
     let engine = unsafe { engine.clone_as_arc() };
-    table_changes_scan_execute_impl(table_changes_scan, engine.clone())
+    table_changes_scan_execute_impl(table_changes_scan, engine)
 }
 
 fn table_changes_scan_execute_impl(

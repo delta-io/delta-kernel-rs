@@ -121,7 +121,7 @@ pub unsafe extern "C" fn read_parquet_file(
     let engine = unsafe { engine.clone_as_arc() };
     let physical_schema = unsafe { physical_schema.clone_as_arc() };
     let path = unsafe { TryFromStringSlice::try_from_slice(&file.path) };
-    read_parquet_file_impl(engine.clone(), path, file, physical_schema)
+    read_parquet_file_impl(engine, path, file, physical_schema)
 }
 
 fn read_parquet_file_impl(
@@ -172,7 +172,7 @@ pub unsafe extern "C" fn new_expression_evaluator(
     let input_schema = unsafe { input_schema.clone_as_arc() };
     let output_type: DataType = unsafe { output_type.as_ref() }.clone().into();
     let expression = Arc::new(expression.clone());
-    new_expression_evaluator_impl(engine.clone(), input_schema, expression, output_type)
+    new_expression_evaluator_impl(engine, input_schema, expression, output_type)
 }
 
 fn new_expression_evaluator_impl(
