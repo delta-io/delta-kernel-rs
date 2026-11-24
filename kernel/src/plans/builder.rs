@@ -49,7 +49,7 @@ use super::ir::nodes::{
 };
 use super::ir::plan::{Plan, PlanNode};
 use crate::expressions::{ColumnName, Expression, ExpressionRef, PredicateRef, Scalar, StructData};
-use crate::schema::{SchemaRef, ToSchema};
+use crate::schema::{DataType, PrimitiveType, SchemaRef, StructType, ToSchema};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::utils::CollectInto;
 use crate::{KernelError, KernelResult};
@@ -181,7 +181,9 @@ impl PlanBuilder {
     /// Inline literal rows. See [`Values`] for the row encoding. Empty `rows` yields the absent
     /// relation.
     ///
-    /// Produces an error when any row's width differs from `schema`'s top-level field count.
+    /// Produces an error when a row's width differs from `schema`'s top-level field count, a
+    /// scalar's type differs from its field's type, or a NULL occupies a field declared
+    /// non-nullable.
     ///
     /// # Example
     /// ```
@@ -202,6 +204,22 @@ impl PlanBuilder {
                     row.len(),
                     Vec::from_iter(schema.fields().map(|f| f.name())),
                 )));
+            }
+            for (field, scalar) in schema.fields().zip(row) {
+                if scalar.is_null() && !field.is_nullable() {
+                    return Err(KernelError::generic(format!(
+                        "values: row {i} has NULL in non-nullable field `{}`",
+                        field.name()
+                    )));
+                }
+                let scalar_type = scalar.data_type();
+                if !same_data_type_in_order(&scalar_type, field.data_type()) {
+                    return Err(KernelError::generic(format!(
+                        "values: row {i} field `{}` has type {scalar_type} but schema declares {}",
+                        field.name(),
+                        field.data_type()
+                    )));
+                }
             }
         }
         Ok(Values::new(schema, rows).into())
@@ -557,8 +575,10 @@ impl PlanBuilder {
     ///
     /// Keys are columns (e.g. [`column_name!`](crate::expressions::column_name)), matched pairwise.
     ///
-    /// Produces an error when the probe and build key counts differ, or a probe/build key is absent
-    /// from its input schema.
+    /// Produces an error when there is no key pair, the probe and build key counts differ, a key is
+    /// absent from its input schema, a probe key's type differs from its build key's type, or a key
+    /// contains a floating-point, map, variant, or user-defined type at any nesting level. See
+    /// [`SemiJoin`] for the key semantics.
     ///
     /// # Example
     /// ```
@@ -593,6 +613,22 @@ impl PlanBuilder {
         self.semi_join_impl(build, true, probe_keys, build_keys)
     }
 
+    // OPEN QUESTION #4: Must a probe key and its build key have exactly the same type, or should
+    // executors widen (for example INTEGER probe keys against LONG build keys)? DSv2 does not check
+    // key types: it compiles each pair to a null-safe equality over unresolved attributes, and
+    // Catalyst widens mismatched numeric types and accepts any comparable type, floats included.
+    // Kernel never emits such keys, so that path is untested.
+    // OPTION 1 (chosen): Exact match, checked here. One rule every executor already satisfies, and
+    //   kernel builds both sides of every join, so it can align types explicitly where they differ.
+    //   The check is free and gives one behavior across engines. Cons: a producer joining
+    //   differently typed columns needs a `Project` that aligns them first, which today also means
+    //   settling OPEN QUESTION #3 on casts in plans.
+    // OPTION 2: Numeric widening. Fewer explicit casts in kernel's plans. Cons: every executor must
+    //   implement one widening table, including DECIMAL precision and scale rules, and the
+    //   coercion is invisible in the plan because neither side's schema changes.
+    // OPTION 3 (matches DSv2): No kernel check; the engine's analyzer decides. Cons: an engine
+    //   without implicit coercion errors where DSv2 widens, so one plan behaves differently per
+    //   engine, and DSv2's leniency is Catalyst's default rather than a decision.
     fn semi_join_impl(
         self,
         build: PlanBuilder,
@@ -610,8 +646,24 @@ impl PlanBuilder {
                 build_keys.len(),
             )));
         }
+        if probe_keys.is_empty() {
+            return Err(KernelError::generic(
+                "join: requires at least one key pair; a keyless join would be a cross product",
+            ));
+        }
         check_columns_resolve(self.schema(), &probe_keys, "join probe")?;
         check_columns_resolve(build.schema(), &build_keys, "join build")?;
+        for (probe_key, build_key) in probe_keys.iter().zip(&build_keys) {
+            let probe_type = self.schema().field_at(probe_key)?.data_type();
+            let build_type = build.schema().field_at(build_key)?.data_type();
+            if !same_data_type_in_order(probe_type, build_type) {
+                return Err(KernelError::generic(format!(
+                    "join: probe key `{probe_key}` has type {probe_type} but build key \
+                     `{build_key}` has type {build_type}; key types must match exactly",
+                )));
+            }
+            check_join_key_type(probe_type, probe_key)?;
+        }
         // An uninhabited probe always produces an uninhabited result; forward it unchanged.
         let PlanBuilderRoot::Present(probe) = self.0 else {
             return Ok(self);
@@ -637,7 +689,8 @@ impl PlanBuilder {
     /// Unordered bag union of `inputs` into a [`UnionAll`]. All inputs must share the same schema;
     /// absent inputs are dropped, and a lone present input is forwarded unchanged.
     ///
-    /// Produces an error when `inputs` is empty, or two inputs have differing schemas.
+    /// Produces an error when `inputs` is empty, or two inputs' schemas differ, including in field
+    /// order at any depth.
     ///
     /// # Example
     /// ```
@@ -657,7 +710,11 @@ impl PlanBuilder {
                 "union_all: requires at least one input",
             ));
         };
-        if let Some(i) = inputs.iter().position(|b| b.schema() != &schema) {
+        // `StructType` equality ignores field order; a positional union cannot.
+        if let Some(i) = inputs
+            .iter()
+            .position(|b| !same_schema_in_order(b.schema(), &schema))
+        {
             return Err(KernelError::generic(format!(
                 "union_all: input {i} has a schema differing from input 0: {:?} vs {:?}",
                 inputs[i].schema(),
@@ -757,6 +814,65 @@ fn check_columns_resolve<'a>(
     Ok(())
 }
 
+/// Error when `data_type` contains, at any nesting level, a type without a stable equality for
+/// hashing and matching keys: floating-point (NaN, signed zeros), map (unordered entries),
+/// variant, and user-defined types.
+fn check_join_key_type(data_type: &DataType, key: &ColumnName) -> KernelResult<()> {
+    let reject = |what: &str| -> KernelResult<()> {
+        Err(KernelError::generic(format!(
+            "join: key `{key}` contains {what}; join keys may not contain floating-point, map, \
+             variant, or user-defined types"
+        )))
+    };
+    match data_type {
+        DataType::Primitive(PrimitiveType::Float | PrimitiveType::Double) => {
+            reject("a floating-point type")
+        }
+        DataType::Map(_) => reject("a map"),
+        DataType::Variant(_) => reject("a variant"),
+        DataType::UserDefined(_) => reject("a user-defined type"),
+        DataType::Struct(fields) | DataType::File(fields) => fields
+            .fields()
+            .try_for_each(|field| check_join_key_type(field.data_type(), key)),
+        DataType::Array(array) => check_join_key_type(&array.element_type, key),
+        DataType::Primitive(_) => Ok(()),
+    }
+}
+
+/// Whether `a` and `b` are equal and, where they contain structs, declare fields in the same order
+/// at every depth. `DataType` equality alone is order-insensitive for struct fields.
+fn same_data_type_in_order(a: &DataType, b: &DataType) -> bool {
+    a == b && same_type_in_order(a, b)
+}
+
+/// [`same_data_type_in_order`] for two schemas.
+fn same_schema_in_order(a: &StructType, b: &StructType) -> bool {
+    a == b
+        && a.fields()
+            .zip(b.fields())
+            .all(|(x, y)| x.name() == y.name() && same_type_in_order(x.data_type(), y.data_type()))
+}
+
+fn same_type_in_order(a: &DataType, b: &DataType) -> bool {
+    match (a, b) {
+        (DataType::Struct(a), DataType::Struct(b))
+        | (DataType::Variant(a), DataType::Variant(b))
+        | (DataType::File(a), DataType::File(b)) => same_schema_in_order(a, b),
+        (DataType::Array(a), DataType::Array(b)) => {
+            same_type_in_order(&a.element_type, &b.element_type)
+        }
+        (DataType::Map(a), DataType::Map(b)) => {
+            same_type_in_order(&a.key_type, &b.key_type)
+                && same_type_in_order(&a.value_type, &b.value_type)
+        }
+        (DataType::UserDefined(a), DataType::UserDefined(b)) => {
+            same_type_in_order(a.sql_type(), b.sql_type())
+        }
+        // Equal non-container types (established by the caller) have no field order.
+        _ => true,
+    }
+}
+
 /// Error unless each of `names` is a top-level, non-metadata field of `schema`. A file-constant is
 /// one scalar broadcast into a top-level field, so nested paths and engine-generated metadata
 /// columns are rejected.
@@ -793,7 +909,8 @@ mod tests {
     use crate::expressions::{Expression, Predicate, col, column_name, expr, lit};
     use crate::plans::ir::nodes::FileType;
     use crate::schema::{
-        DataType, MetadataColumnSpec, StructField, StructType, schema, schema_ref,
+        ArrayType, DataType, MapType, MetadataColumnSpec, StructField, StructType, UserDefinedType,
+        schema, schema_ref,
     };
 
     /// A single-file scan (present), no file-constant columns -- the trivial scan fixture.
@@ -821,11 +938,33 @@ mod tests {
         }
     }
 
-    /// A one-row (all-null) `Values` source over `schema` -- the common present-source fixture.
-    /// (Empty rows would collapse to absent.)
+    /// A one-row `Values` source over `schema` -- the common present-source fixture. Nullable
+    /// fields hold NULL and non-nullable fields hold a placeholder of their type. (Empty rows would
+    /// collapse to absent.)
     fn vals(schema: SchemaRef) -> PlanBuilder {
-        let row = Vec::from_iter(schema.fields().map(|f| Scalar::null(f.data_type().clone())));
+        let row = Vec::from_iter(schema.fields().map(placeholder_scalar));
         PlanBuilder::values(schema, vec![row]).unwrap()
+    }
+
+    /// NULL for a nullable field, otherwise a value of the field's type, since `Values` rejects a
+    /// NULL in a non-nullable field.
+    fn placeholder_scalar(field: &StructField) -> Scalar {
+        if field.is_nullable() {
+            return Scalar::null(field.data_type().clone());
+        }
+        match field.data_type() {
+            DataType::Primitive(PrimitiveType::String) => "".into(),
+            DataType::Primitive(PrimitiveType::Long) => 0i64.into(),
+            DataType::Primitive(PrimitiveType::Integer) => 0i32.into(),
+            DataType::Primitive(PrimitiveType::Boolean) => false.into(),
+            DataType::Struct(fields) => {
+                let values = Vec::from_iter(fields.fields().map(placeholder_scalar));
+                Scalar::Struct(
+                    StructData::try_new(Arc::new(fields.as_ref().clone()), values).unwrap(),
+                )
+            }
+            other => unimplemented!("no placeholder for non-nullable {other}"),
+        }
     }
 
     /// The absent (uninhabited) relation over `schema`.
@@ -836,6 +975,38 @@ mod tests {
     /// The absent (uninhabited) relation over `id_schema`.
     fn absent_src() -> PlanBuilder {
         absent_over(id_schema())
+    }
+
+    /// `{ k: key_type }`: the one-column schema the key-type rejection cases join or union on.
+    fn k_schema(key_type: DataType) -> SchemaRef {
+        Arc::new(StructType::try_new([StructField::nullable("k", key_type)]).unwrap())
+    }
+
+    /// Joins two `{ k: key_type }` sources on `k`, so the key type alone decides acceptance.
+    fn self_join_on(key_type: DataType) -> KernelResult<PlanBuilder> {
+        let schema = k_schema(key_type);
+        vals(Arc::clone(&schema)).semi_join(vals(schema), [column_name!("k")], [column_name!("k")])
+    }
+
+    /// `{ a: long, b: long }` and its field-swapped twin. They are equal as `StructType`s, which
+    /// ignore field order, so they exercise the order-sensitive checks.
+    fn ab_struct() -> SchemaRef {
+        schema_ref! { nullable "a": LONG, nullable "b": LONG }
+    }
+
+    fn ba_struct() -> SchemaRef {
+        schema_ref! { nullable "b": LONG, nullable "a": LONG }
+    }
+
+    /// `{ s: inner }`, nesting `inner` one level down.
+    fn nested(inner: SchemaRef) -> SchemaRef {
+        Arc::new(StructType::try_new([StructField::nullable("s", inner.as_ref().clone())]).unwrap())
+    }
+
+    fn udt(sql_type: impl Into<DataType>) -> DataType {
+        UserDefinedType::try_new(sql_type, HashMap::new())
+            .unwrap()
+            .into()
     }
 
     /// Build `builder` and assert its nodes match `expected` one-for-one in order, each described
@@ -1110,9 +1281,9 @@ mod tests {
     #[case::semi_join_absent_build(
         vals(id_schema()).semi_join(absent_src(), [column_name!("id")], [column_name!("id")]))]
     #[case::semi_join_absent_probe(
-        absent_src().semi_join(vals(x_schema()), [column_name!("id")], [column_name!("x")]))]
+        absent_src().semi_join(vals(id_schema()), [column_name!("id")], [column_name!("id")]))]
     #[case::anti_join_absent_probe(
-        absent_src().anti_join(vals(x_schema()), [column_name!("id")], [column_name!("x")]))]
+        absent_src().anti_join(vals(id_schema()), [column_name!("id")], [column_name!("id")]))]
     #[case::union_all_of_absent(PlanBuilder::union_all([absent_src(), absent_src()]))]
     fn collapses_to_absent(#[case] builder: KernelResult<PlanBuilder>) -> KernelResult<()> {
         assert!(builder?.build_opt()?.is_none()); // absent has no plan to run
@@ -1154,6 +1325,26 @@ mod tests {
             [column_name!("id")],
         )?;
         assert_plan(anti, &[(&[], "values")]);
+        Ok(())
+    }
+
+    #[test]
+    fn semi_join_accepts_struct_keys_of_strings_and_integers() -> KernelResult<()> {
+        let schema = schema_ref! {
+            nullable "key": {
+                nullable "path": STRING,
+                nullable "offset": INTEGER,
+            },
+        };
+        let join = vals(Arc::clone(&schema)).semi_join(
+            vals(schema),
+            [column_name!("key")],
+            [column_name!("key")],
+        )?;
+        assert_plan(
+            join,
+            &[(&[], "values"), (&[], "values"), (&[0, 1], "semi_join")],
+        );
         Ok(())
     }
 
@@ -1343,11 +1534,12 @@ mod tests {
         #[values(false, true)] inverted: bool,
     ) -> KernelResult<()> {
         let probe = vals(id_schema());
-        let build = vals(x_schema());
+        // A differently named key shows the output schema comes from the probe side alone.
+        let build = vals(schema_ref! { nullable "key": STRING });
         let joined = if inverted {
-            probe.anti_join(build, [column_name!("id")], [column_name!("x")])?
+            probe.anti_join(build, [column_name!("id")], [column_name!("key")])?
         } else {
-            probe.semi_join(build, [column_name!("id")], [column_name!("x")])?
+            probe.semi_join(build, [column_name!("id")], [column_name!("key")])?
         };
         assert_eq!(joined.schema(), &id_schema());
 
@@ -1570,9 +1762,25 @@ mod tests {
         || vals(id_schema()).prefix_sum(column_name!("id"), "offset"))]
     #[case::prefix_sum_duplicate_output("Duplicate field name",
         || vals(x_schema()).prefix_sum(column_name!("x"), "x"))]
+    // values
+    #[case::values_null_in_non_nullable("NULL in non-nullable field `id`",
+        || PlanBuilder::values(schema_ref! { not_null "id": LONG }, vec![vec![Scalar::null(DataType::LONG)]]))]
+    #[case::values_wrong_scalar_type("has type integer but schema declares long",
+        || PlanBuilder::values(x_schema(), vec![vec![1i32.into()]]))]
+    #[case::values_reordered_struct_scalar("has type struct<b: long, a: long>", || {
+        let nulls = vec![Scalar::null(DataType::LONG), Scalar::null(DataType::LONG)];
+        let swapped = Scalar::Struct(StructData::try_new(ba_struct(), nulls)?);
+        PlanBuilder::values(nested(ab_struct()), vec![vec![swapped]])
+    })]
     // union
     #[case::union_schema_disagrees("differing",
         || PlanBuilder::union_all([vals(id_schema()), vals(x_schema())]))]
+    #[case::union_reordered_fields("differing",
+        || PlanBuilder::union_all([vals(ab_struct()), vals(ba_struct())]))]
+    #[case::union_nested_reordered_fields("differing",
+        || PlanBuilder::union_all([vals(nested(ab_struct())), vals(nested(ba_struct()))]))]
+    #[case::union_nested_udt_reordered_fields("differing",
+        || PlanBuilder::union_all([vals(k_schema(udt(ab_struct()))), vals(k_schema(udt(ba_struct())))]))]
     #[case::union_empty("at least one input", || PlanBuilder::union_all([]))]
     // semi-join keys
     #[case::join_unknown_probe_key("join probe: column `nope`",
@@ -1581,6 +1789,28 @@ mod tests {
         || vals(id_schema()).anti_join(vals(x_schema()), [column_name!("id")], [column_name!("nope")]))]
     #[case::join_key_arity("must match",
         || vals(id_schema()).semi_join(vals(x_schema()), [column_name!("id")], [column_name!("x"), column_name!("x")]))]
+    #[case::join_keyless("at least one key pair",
+        || vals(id_schema()).semi_join(vals(id_schema()), Vec::<ColumnName>::new(), Vec::<ColumnName>::new()))]
+    #[case::anti_join_keyless("at least one key pair",
+        || vals(id_schema()).anti_join(vals(id_schema()), Vec::<ColumnName>::new(), Vec::<ColumnName>::new()))]
+    #[case::join_key_type_mismatch("key types must match exactly",
+        || vals(id_schema()).semi_join(vals(x_schema()), [column_name!("id")], [column_name!("x")]))]
+    #[case::anti_join_key_type_mismatch("key types must match exactly",
+        || vals(id_schema()).anti_join(vals(x_schema()), [column_name!("id")], [column_name!("x")]))]
+    #[case::join_key_reordered_struct("key types must match exactly",
+        || vals(nested(ab_struct())).semi_join(vals(nested(ba_struct())), [column_name!("s")], [column_name!("s")]))]
+    #[case::join_key_float("contains a floating-point type", || self_join_on(DataType::FLOAT))]
+    #[case::join_key_double("contains a floating-point type", || self_join_on(DataType::DOUBLE))]
+    #[case::join_key_array_of_float("contains a floating-point type",
+        || self_join_on(DataType::from(ArrayType::new(DataType::FLOAT, true))))]
+    #[case::join_key_struct_with_double("contains a floating-point type",
+        || self_join_on(DataType::from(StructType::try_new([StructField::nullable("f", DataType::DOUBLE)]).unwrap())))]
+    #[case::join_key_map("contains a map",
+        || self_join_on(DataType::from(MapType::new(DataType::STRING, DataType::STRING, false))))]
+    #[case::join_key_variant("contains a variant", || self_join_on(DataType::unshredded_variant()))]
+    #[case::join_key_udt("contains a user-defined type", || self_join_on(udt(DataType::STRING)))]
+    #[case::join_key_float_absent_probe("contains a floating-point type",
+        || absent_over(k_schema(DataType::FLOAT)).semi_join(vals(k_schema(DataType::FLOAT)), [column_name!("k")], [column_name!("k")]))]
     // dynamic scan file constants
     #[case::dynamic_scan_missing_source("`version`", || build_dynamic_scan_with_schemas(
         dynamic_scan_input_missing("version"),

@@ -27,7 +27,9 @@ use crate::{FileMeta, KernelError, KernelResult};
 ///
 /// An operator that reshapes its rows (a source, projection, aggregation, or file scan) carries a
 /// caller-declared `schema` field holding its output schema. File writes emit [`FILE_META_SCHEMA`].
-/// The remaining operators inherit an input's schema; each payload's docs name which input.
+/// The remaining operators inherit an input's schema; each payload's docs name which input. Rules
+/// shared by every operator (what a declared schema promises, nullability, type exactness, and
+/// ordering) are in the [plans module docs](crate::plans#semantics-and-responsibilities).
 #[derive(Debug, Clone, Display, From)]
 #[strum(serialize_all = "snake_case")]
 pub enum Operator {
@@ -184,6 +186,21 @@ impl From<FileMeta> for ScanFile {
     }
 }
 
+// OPEN QUESTION #1: When a file lacks a field that `schema` declares non-nullable, should the scan
+// error or produce NULL? DSv2 does both: its JSON scan widens the data schema to nullable, so a
+// missing field reads as NULL, while Spark's Parquet reader rejects a file that lacks a required
+// column.
+// OPTION 1: Error. Malformed metadata fails at the read, which is what the default engine's Parquet
+//   reader and DSv2's Parquet path do. Cons: engines whose readers widen the data schema to
+//   nullable (DSv2's JSON path, for instance) need a post-scan check that kernel never relies on.
+// OPTION 2: NULL for every missing field. Engine-agnostic, and consistent with declared nullability
+//   describing kernel's output rather than an engine check. Cons: a corrupt log surfaces later, at
+//   a guard or the terminal result, with a less specific error, and DSv2's Parquet path would have
+//   to stop rejecting such files.
+// OPTION 3 (chosen; matches DSv2): NULL, with an error permitted for non-nullable fields. Kernel
+//   depends on neither behavior, so every existing engine stays conformant without code changes.
+//   Cons: a successful scan does not prove required fields were present; only kernel's guards and
+//   the terminal read do, and the error for malformed metadata differs by engine and file format.
 /// Reads Parquet `files` into row batches matching `schema`. The engine returns exactly the
 /// columns named by `schema`, in schema order.
 ///
@@ -209,13 +226,15 @@ impl From<FileMeta> for ScanFile {
 ///      the same field id.
 ///    - **Field name**: otherwise, or if no Parquet column has the requested field id, match by
 ///      column name.
-///    - **No match**: the output column is filled with NULLs when the field is nullable, or an
-///      error is returned when it is non-nullable.
+///    - **No match**: the output column is filled with NULLs. When `schema` declares the field
+///      non-nullable, the engine may instead return an error. Kernel depends on neither choice: it
+///      guards the values it needs explicitly (see [Semantics and responsibilities]).
 ///
 /// Parquet columns not referenced by any `schema` field are ignored.
 ///
 /// [Metadata columns]: #metadata-columns
 /// [File-constant columns]: #file-constant-columns
+/// [Semantics and responsibilities]: crate::plans#semantics-and-responsibilities
 /// [`StructField::create_metadata_column`]: crate::schema::StructField::create_metadata_column
 /// [`MetadataColumnSpec::RowIndex`]: crate::schema::MetadataColumnSpec::RowIndex
 /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey::ParquetFieldId
@@ -277,8 +296,8 @@ pub struct ScanParquet {
 ///
 /// Column resolution matches [`ScanParquet`]: metadata columns, then file-constant columns
 /// (see [`Self::file_constant_columns`] and [`ScanFile::file_constants`]), then fields read from
-/// each JSON line. Missing JSON fields produce NULL for nullable `schema` fields and an error for
-/// non-nullable fields.
+/// each JSON line. Missing JSON fields produce NULL; for a field `schema` declares non-nullable,
+/// the engine may instead return an error, as for [`ScanParquet`].
 ///
 /// Output row order is unspecified: the engine is free to read `files` in any order, in
 /// parallel, and to interleave rows from different files.
@@ -302,6 +321,10 @@ pub struct ScanJson {
 /// row. Nested struct values are encoded as [`Scalar::Struct`], and array / map
 /// values as [`Scalar::Array`] / [`Scalar::Map`]; nested leaves are not flattened
 /// into the row vec.
+///
+/// [`PlanBuilder::values`](crate::PlanBuilder::values) rejects a row whose width differs from
+/// `schema`, a scalar whose type differs from its field, and a NULL in a field declared
+/// non-nullable, so every row satisfies the declared schema.
 ///
 /// # Example (flat)
 ///
@@ -400,8 +423,12 @@ where
 ///
 /// `expr` must be a struct constructor or struct patch whose fields match `schema`. It is
 /// evaluated with `schema` as its output struct type: the struct's fields are the output
-/// columns, `schema` supplies names and nullability, and any type or arity mismatch is an error.
-/// Downstream nodes see the logical field names declared in `schema`.
+/// columns and `schema` supplies names and nullability. [`PlanBuilder::project`] checks only that
+/// `expr`'s column references resolve against the input; a type or arity mismatch between `expr`
+/// and `schema` is an evaluation error. Downstream nodes see the logical field names declared in
+/// `schema`.
+///
+/// [`PlanBuilder::project`]: crate::PlanBuilder::project
 ///
 /// A struct patch carries the input struct through field by field, naming only the columns that
 /// change -- replacing or dropping existing fields and injecting new ones -- while everything else
@@ -438,8 +465,9 @@ pub struct Project {
     pub schema: SchemaRef,
 }
 
-/// Keeps input rows where `predicate` evaluates true (SQL null semantics).
-/// Output schema is the input schema unchanged.
+/// Keeps input rows where `predicate` evaluates to TRUE and drops rows where it evaluates to
+/// FALSE or NULL, as SQL `WHERE` does. Output schema is the input schema unchanged; output row
+/// order is unspecified.
 #[derive(Debug, Clone)]
 pub struct Filter {
     pub predicate: PredicateRef,
@@ -867,7 +895,8 @@ impl Agg {
     }
 
     /// The sum of non-NULL LONG values in each group, or NULL if the group has no non-NULL value.
-    /// The output is always a nullable LONG, with default name matching `value`.
+    /// The output is always a nullable LONG, with default name matching `value`. A sum that
+    /// overflows LONG is an error.
     ///
     /// ```text
     /// [3, NULL, 5, 1] -> 9
@@ -1143,7 +1172,8 @@ impl TryFrom<AggregateBuilder> for Aggregate {
 /// The output for row `i` is `SUM(input[0..i])`, or `0` for `i=0`. NULL inputs do not contribute
 /// and produce NULL outputs for their respective rows. Zero-valued inputs are valid but produce
 /// duplicate outputs (because they do not increase the value of the sum). Input rows are consumed
-/// exactly once in any order and output rows can be produced in any order.
+/// exactly once in any order and output rows can be produced in any order. A sum that overflows
+/// LONG is an error.
 ///
 /// # Output schema
 ///
@@ -1237,7 +1267,14 @@ impl PrefixSum {
 /// build side. This is analogous to set intersection and set difference,
 /// respectively.
 ///
-/// The output schema is the same as the probe input's schema.
+/// The output schema is the same as the probe input's schema, and output row order is
+/// unspecified.
+///
+/// Keys are matched pairwise with NULL-safe equality at every nesting level, so a NULL probe key
+/// matches a NULL build key. Each probe key has the same declared type as its build key, there is
+/// at least one key pair, and no key contains a floating-point, map, variant, or user-defined type
+/// at any nesting level; [`PlanBuilder::semi_join`](crate::PlanBuilder::semi_join) rejects
+/// anything else.
 ///
 /// # Example
 ///
@@ -1270,8 +1307,10 @@ pub struct SemiJoin {
 }
 
 /// The unordered bag union of N input relations. All rows of all inputs appear in the
-/// output, in arbitrary order. All input schemas must agree, and the output schema
-/// is the common schema of the inputs.
+/// output, in arbitrary order. All inputs declare the same schema, with identical field names,
+/// order, types, and nullability at every depth, which
+/// [`PlanBuilder::union_all`](crate::PlanBuilder::union_all) checks; the output schema is that
+/// shared schema.
 ///
 /// # Example
 ///

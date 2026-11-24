@@ -205,7 +205,8 @@ impl UnaryExpressionOp {
 ///
 /// Both operands share a numeric type and the result takes that type. Kernel inserts no implicit
 /// casts, so widening a result (decimal precision or scale, for instance) needs an explicit
-/// [`Expression::cast`] to match a declared output type.
+/// [`Expression::cast`] to match a declared output type. Integer overflow is an error, never a
+/// silent wrap, as in ANSI SQL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BinaryExpressionOp {
     /// `left + right`.
@@ -468,8 +469,25 @@ pub struct ParseJsonExpression {
     pub output_schema: SchemaRef,
 }
 
-/// An expression that casts a child expression to a target type, following SQL `CAST` semantics: a
-/// value that cannot be represented in the target type evaluates to NULL rather than erroring.
+// OPEN QUESTION #3: Should `CastExpression` keep `TRY_CAST` semantics (NULL on failure) or adopt
+// ANSI `CAST` semantics (error on failure) inside a plan, or are casts out of scope for plan
+// executors? Kernel's plan producers do not emit casts, and plan serialization lowers `Cast` to an
+// unknown expression, which DSv2 rejects as unsupported. Kernel's own evaluators apply `TRY_CAST`
+// where casts do occur: data-skipping predicates and content-tree conversion.
+// OPTION 1 (chosen; matches DSv2): Out of scope for plan executors. Executors may reject a `Cast`,
+//   and a producer that needs one in a plan must add it to the plan serialization and settle the
+//   semantics then. Cons: the question is deferred, not answered, and an in-process executor that
+//   receives `Expression::Cast` directly inherits the `TRY_CAST` rule below without a plan-level
+//   contract.
+// OPTION 2: `TRY_CAST` everywhere. No engine changes, and in data-skipping predicates a NULL
+//   already means "unknown", which keeps the file. Cons: inconsistent with the overflow rule for
+//   arithmetic, and a producer casting untrusted input would hide corruption as NULL.
+// OPTION 3: ANSI `CAST` everywhere. One error rule for every expression, and DSv2's own
+//   type-alignment casts already run in ANSI mode. Cons: a breaking change for kernel's evaluators,
+//   and a statistics value that does not fit the cast type would fail the whole scan instead of
+//   keeping the file.
+/// An expression that casts a child expression to a target type, following `TRY_CAST` semantics:
+/// a value that cannot be represented in the target type evaluates to NULL rather than erroring.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CastExpression {
     /// The expression whose value is cast.
@@ -1106,7 +1124,7 @@ impl Expression {
         Self::MapToStruct(MapToStructExpression::new(map_expr, options))
     }
 
-    /// Creates a new cast of `expr` to `target`, following SQL `CAST` semantics (unrepresentable
+    /// Creates a new cast of `expr` to `target`, following `TRY_CAST` semantics (unrepresentable
     /// values become NULL). See [`CastExpression`].
     pub fn cast(expr: impl Into<Expression>, target: DataType) -> Self {
         Self::Cast(CastExpression::new(expr, target))
