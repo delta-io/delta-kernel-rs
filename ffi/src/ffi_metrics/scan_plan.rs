@@ -64,20 +64,16 @@ pub struct ScanPlanReport {
     pub compaction_file_count: u64,
 }
 
-pub(super) fn with_event<F: FnOnce(MetricEvent)>(
-    event: &kernel::ScanPlanReport,
-    failed: bool,
-    f: F,
-) {
+pub(super) fn with_event<F: FnOnce(MetricEvent)>(event: &kernel::ScanPlanReport, f: F) {
     extern "C" fn accept<F: FnOnce(MetricEvent)>(
         context: NullableCvoid,
         info: *const FfiCheckpointInfo,
     ) {
         let Some(context) = context else { return };
         // Safety: visit invokes this callback synchronously with the live context below.
-        let (event, failed, callback) = unsafe {
+        let (event, callback) = unsafe {
             &mut *context
-                .cast::<(&kernel::ScanPlanReport, bool, Option<F>)>()
+                .cast::<(&kernel::ScanPlanReport, Option<F>)>()
                 .as_ptr()
         };
         let Some(f) = callback.take() else { return };
@@ -181,17 +177,13 @@ pub(super) fn with_event<F: FnOnce(MetricEvent)>(
             commit_total_size_bytes: metadata.commit_total_size_bytes,
             compaction_file_count: metadata.compaction_file_count,
         };
-        f(if *failed {
-            MetricEvent::ScanPlanGenerationFailure(&record)
-        } else {
-            MetricEvent::ScanPlanGenerationSuccess(&record)
-        });
+        f(MetricEvent::ScanPlanGenerationCompleted(&record));
     }
     let info = event
         .checkpoint
         .as_ref()
         .and_then(|metrics| metrics.info.as_deref());
-    let mut context = (event, failed, Some(f));
+    let mut context = (event, Some(f));
     if let Err(error) = visit(info, Some(NonNull::from(&mut context).cast()), accept::<F>) {
         tracing::warn!(%error, "Failed to convert scan-plan metric checkpoint information");
     }
@@ -269,18 +261,12 @@ mod tests {
             },
         };
         let metadata = &event.metadata_planning;
-        let source = if failed {
-            kernel::MetricEvent::ScanPlanGenerationFailure(event.clone())
-        } else {
-            kernel::MetricEvent::ScanPlanGenerationSuccess(event.clone())
-        };
+        let source = kernel::MetricEvent::ScanPlanGenerationCompleted(event.clone());
         let mut visits = 0;
         with_ffi_event(&source, |ffi| {
             visits += 1;
-            let record = match (ffi, failed) {
-                (MetricEvent::ScanPlanGenerationSuccess(record), false)
-                | (MetricEvent::ScanPlanGenerationFailure(record), true) => record,
-                _ => panic!("expected matching scan-plan metric"),
+            let MetricEvent::ScanPlanGenerationCompleted(record) = ffi else {
+                panic!("expected scan-plan metric");
             };
             // Safety: the record and all nested storage are borrowed for this callback.
             let record = unsafe { &*record };

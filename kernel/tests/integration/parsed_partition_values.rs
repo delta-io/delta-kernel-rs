@@ -1002,15 +1002,9 @@ fn different_scans_require_timezone_support_only_for_timestamp_partitions(
         let events: Vec<_> = reporter
             .events()
             .into_iter()
-            .filter(|event| {
-                matches!(
-                    event,
-                    MetricEvent::ScanPlanGenerationSuccess(_)
-                        | MetricEvent::ScanPlanGenerationFailure(_)
-                )
-            })
+            .filter(|event| matches!(event, MetricEvent::ScanPlanGenerationCompleted(_)))
             .collect();
-        let [MetricEvent::ScanPlanGenerationFailure(event)] = events.as_slice() else {
+        let [MetricEvent::ScanPlanGenerationCompleted(event)] = events.as_slice() else {
             panic!("expected one scan-plan failure: {events:?}");
         };
         assert_eq!(event.outcome, ScanPlanOutcome::Error);

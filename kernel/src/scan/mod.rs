@@ -1553,11 +1553,7 @@ impl Scan {
         };
         report.duration_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
         if let Some(reporter) = reporter {
-            reporter.report(if result.is_err() {
-                MetricEvent::ScanPlanGenerationFailure(report)
-            } else {
-                MetricEvent::ScanPlanGenerationSuccess(report)
-            });
+            reporter.report(MetricEvent::ScanPlanGenerationCompleted(report));
         }
         result
     }

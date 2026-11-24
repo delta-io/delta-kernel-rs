@@ -735,9 +735,7 @@ pub enum MetricEvent {
     ChecksumWriteFailure(ChecksumWriteFailure),
     LastCheckpointReadCompleted(LastCheckpointReadCompleted),
     /// Callback-scoped borrowed scan-plan report.
-    ScanPlanGenerationSuccess(*const ScanPlanReport),
-    /// Callback-scoped borrowed scan-plan report.
-    ScanPlanGenerationFailure(*const ScanPlanReport),
+    ScanPlanGenerationCompleted(*const ScanPlanReport),
 }
 
 fn duration_ns(duration: std::time::Duration) -> u64 {
@@ -763,7 +761,7 @@ impl MetricEvent {
     pub(crate) fn from_kernel(event: &kernel::MetricEvent) -> Option<Self> {
         use kernel::MetricEvent as K;
         Some(match event {
-            K::ScanPlanGenerationSuccess(_) | K::ScanPlanGenerationFailure(_) => return None,
+            K::ScanPlanGenerationCompleted(_) => return None,
             K::LogSegmentLoadSuccess(kernel::LogSegmentLoadSuccess {
                 operation_id,
                 correlation_id,
@@ -1069,10 +1067,8 @@ impl MetricEvent {
 
 /// Invoke `f` with the FFI [`MetricEvent`] built from `event`.
 pub(crate) fn with_ffi_event(event: &kernel::MetricEvent, f: impl FnOnce(MetricEvent)) {
-    if let kernel::MetricEvent::ScanPlanGenerationSuccess(report) = event {
-        scan_plan::with_event(report, false, f);
-    } else if let kernel::MetricEvent::ScanPlanGenerationFailure(report) = event {
-        scan_plan::with_event(report, true, f);
+    if let kernel::MetricEvent::ScanPlanGenerationCompleted(report) = event {
+        scan_plan::with_event(report, f);
     } else if let Some(event) = MetricEvent::from_kernel(event) {
         f(event);
     }

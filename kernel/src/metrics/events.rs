@@ -115,8 +115,7 @@ pub enum MetricEvent {
     JsonReadCompleted(JsonReadCompleted),
     ParquetReadCompleted(ParquetReadCompleted),
     ScanMetadataCompleted(ScanMetadataCompleted),
-    ScanPlanGenerationSuccess(ScanPlanReport),
-    ScanPlanGenerationFailure(ScanPlanReport),
+    ScanPlanGenerationCompleted(ScanPlanReport),
     StorageListCompleted(StorageListCompleted),
     StorageReadCompleted(StorageReadCompleted),
     StorageCopyCompleted(StorageCopyCompleted),
@@ -146,8 +145,7 @@ impl MetricEvent {
             | Self::ProtocolMetadataLoadSuccess(_)
             | Self::ProtocolMetadataLoadFailure(_)
             | Self::ScanMetadataCompleted(_)
-            | Self::ScanPlanGenerationSuccess(_)
-            | Self::ScanPlanGenerationFailure(_)
+            | Self::ScanPlanGenerationCompleted(_)
             | Self::StorageListCompleted(_)
             | Self::StorageReadCompleted(_)
             | Self::StorageCopyCompleted(_) => {}
@@ -177,9 +175,7 @@ impl MetricEvent {
             Self::ProtocolMetadataLoadSuccess(_) => Err(ProtocolMetadataLoadSuccess::SPAN_NAME),
             Self::SetTransactionLoadSuccess(_) => Err(SetTransactionLoadSuccess::SPAN_NAME),
             Self::LastCheckpointReadCompleted(_) => Err(LastCheckpointReadCompleted::SPAN_NAME),
-            Self::ScanPlanGenerationSuccess(_) | Self::ScanPlanGenerationFailure(_) => {
-                Err(ScanPlanReport::SPAN_NAME)
-            }
+            Self::ScanPlanGenerationCompleted(_) => Err(ScanPlanReport::SPAN_NAME),
             Self::ScanMetadataCompleted(_) => Err(ScanMetadataCompleted::SPAN_NAME),
             Self::JsonReadCompleted(_) => Err(JsonReadCompleted::SPAN_NAME),
             Self::ParquetReadCompleted(_) => Err(ParquetReadCompleted::SPAN_NAME),
@@ -215,9 +211,7 @@ impl MetricEvent {
             Self::LastCheckpointReadCompleted(_) => Err(LastCheckpointReadCompleted::SPAN_NAME),
             Self::CheckpointWriteSuccess(_) => Err(CheckpointWriteSuccess::SPAN_NAME),
             Self::ChecksumWriteSuccess(_) => Err(ChecksumWriteSuccess::SPAN_NAME),
-            Self::ScanPlanGenerationSuccess(_) | Self::ScanPlanGenerationFailure(_) => {
-                Err(ScanPlanReport::SPAN_NAME)
-            }
+            Self::ScanPlanGenerationCompleted(_) => Err(ScanPlanReport::SPAN_NAME),
             Self::ScanMetadataCompleted(_) => Err(ScanMetadataCompleted::SPAN_NAME),
             Self::JsonReadCompleted(_) => Err(JsonReadCompleted::SPAN_NAME),
             Self::ParquetReadCompleted(_) => Err(ParquetReadCompleted::SPAN_NAME),
@@ -348,8 +342,7 @@ impl MetricEvent {
             | Self::JsonReadCompleted(_)
             | Self::ParquetReadCompleted(_)
             | Self::ScanMetadataCompleted(_)
-            | Self::ScanPlanGenerationSuccess(_)
-            | Self::ScanPlanGenerationFailure(_)
+            | Self::ScanPlanGenerationCompleted(_)
             | Self::StorageListCompleted(_)
             | Self::StorageReadCompleted(_)
             | Self::StorageCopyCompleted(_)) => e,
@@ -382,8 +375,7 @@ impl fmt::Display for MetricEvent {
             Self::JsonReadCompleted(e) => e.fmt(f),
             Self::ParquetReadCompleted(e) => e.fmt(f),
             Self::ScanMetadataCompleted(e) => e.fmt(f),
-            Self::ScanPlanGenerationSuccess(e) => write!(f, "ScanPlanGenerationSuccess({e})"),
-            Self::ScanPlanGenerationFailure(e) => write!(f, "ScanPlanGenerationFailure({e})"),
+            Self::ScanPlanGenerationCompleted(e) => write!(f, "ScanPlanGenerationCompleted({e})"),
             Self::StorageListCompleted(e) => e.fmt(f),
             Self::StorageReadCompleted(e) => e.fmt(f),
             Self::StorageCopyCompleted(e) => e.fmt(f),
