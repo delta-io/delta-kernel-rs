@@ -2,12 +2,12 @@
 
 use delta_kernel::KernelResult;
 use delta_kernel::checkpoint::{CheckpointInfo, CheckpointKind};
+use delta_kernel_ffi_macros::ffi_export;
 
 use super::FfiSelectedCheckpointType;
 use crate::delta_types::{CheckpointBacking, FfiLastCheckpoint};
-use crate::error::{ExternResult, IntoExternResult};
+use crate::error::ExternResult;
 use crate::handle::Handle;
-use crate::panic::catch_panic;
 use crate::{
     KernelStringSlice, NullableCvoid, OptionalValue, SharedExternEngine, SharedSnapshot,
     kernel_string_slice,
@@ -69,20 +69,18 @@ impl From<CheckpointKind> for FfiCheckpointKind {
 /// The snapshot and engine handles are borrowed and must remain valid for this call.
 /// During discovery, the executor must not request checkpoint information recursively on the
 /// same snapshot: that call would wait for initialization already in progress.
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_checkpoint_type(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<OptionalValue<FfiSelectedCheckpointType>> {
-    let result = catch_panic(|| {
-        let snapshot = unsafe { snapshot.as_ref() };
-        let engine = unsafe { engine.as_ref() };
-        snapshot
-            .reader()
-            .get_checkpoint_type(engine.engine().as_ref())
-            .map(|checkpoint_type| checkpoint_type.map(Into::into).into())
-    });
-    unsafe { result.into_extern_result(&engine.as_ref()) }
+    let snapshot = unsafe { snapshot.as_ref() };
+    let engine = unsafe { engine.as_ref() };
+    snapshot
+        .reader()
+        .get_checkpoint_type(engine.engine().as_ref())
+        .map(|checkpoint_type| checkpoint_type.map(Into::into).into())
 }
 
 /// Resolves the selected checkpoint and invokes `visitor` once with its complete summary.
@@ -100,6 +98,7 @@ pub unsafe extern "C" fn snapshot_checkpoint_type(
 /// and its lock is released before the callback runs.
 /// During initialization, the plan executor must not call this function recursively on the same
 /// snapshot: the recursive call would wait for the initialization already in progress.
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_checkpoint_info(
     snapshot: Handle<SharedSnapshot>,
@@ -107,16 +106,13 @@ pub unsafe extern "C" fn snapshot_checkpoint_info(
     context: NullableCvoid,
     visitor: CheckpointInfoVisitor,
 ) -> ExternResult<bool> {
-    let result = catch_panic(|| {
-        let snapshot = unsafe { snapshot.as_ref() };
-        let engine = unsafe { engine.as_ref() };
-        snapshot
-            .reader()
-            .get_checkpoint_info(engine.engine().as_ref())
-            .and_then(|info| visit(info.as_deref(), context, visitor))
-            .map(|()| true)
-    });
-    unsafe { result.into_extern_result(&engine.as_ref()) }
+    let snapshot = unsafe { snapshot.as_ref() };
+    let engine = unsafe { engine.as_ref() };
+    snapshot
+        .reader()
+        .get_checkpoint_info(engine.engine().as_ref())
+        .and_then(|info| visit(info.as_deref(), context, visitor))
+        .map(|()| true)
 }
 
 fn visit(
