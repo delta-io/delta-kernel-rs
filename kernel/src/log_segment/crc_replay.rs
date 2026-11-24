@@ -25,7 +25,7 @@ use crate::actions::visitors::{
 };
 use crate::actions::{
     ADD_NAME, COMMIT_INFO_NAME, DOMAIN_METADATA_FIELD, DomainMetadata, METADATA_FIELD,
-    PROTOCOL_FIELD, REMOVE_NAME, SET_TRANSACTION_FIELD, SetTransaction,
+    PROTOCOL_FIELD, Protocol, REMOVE_NAME, SET_TRANSACTION_FIELD, SetTransaction,
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::{LAST_MANIFEST_COMMIT_FIELD, LastManifestCommit};
@@ -41,6 +41,8 @@ use crate::schema::{
     StructType, column_name, lazy_schema_ref,
 };
 use crate::snapshot::IncrementalReplay;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::{Engine, FileMeta, KernelError, KernelResult, RowVisitor, Version};
 
@@ -160,7 +162,12 @@ impl LogSegment {
                 FileSizeHistogram::create_empty_with_boundaries(h.sorted_bin_boundaries().to_vec())
             })
             .transpose()?;
-        let delta = self.build_crc_delta_from_base(engine, base_crc.version, seed_histogram)?;
+        let delta = self.build_crc_delta_from_base(
+            engine,
+            base_crc.version,
+            &base_crc.protocol,
+            seed_histogram,
+        )?;
         Ok(base_crc.clone().apply(delta, self.end_version))
     }
 
@@ -221,15 +228,17 @@ impl LogSegment {
         require!(first.version == 0, KernelError::MissingVersion(0));
         let delta = self.replay_commits_into_crc_delta(
             engine,
-            self.listed.ascending_commit_files.iter(),
+            &self.listed.ascending_commit_files,
+            None,
             Some(FileSizeHistogram::create_default()),
         )?;
         Ok(delta.into_complete_crc(self.end_version))
     }
 
     /// Build a `CrcDelta` covering commits `(base_version, self.end_version]` via reverse
-    /// log replay. `seed_histogram` is an empty histogram with the same bin boundaries as
-    /// the downstream base CRC, or `None` to skip histogram tracking on the delta.
+    /// log replay. `base_protocol` is the table protocol at `base_version`. `seed_histogram` is an
+    /// empty histogram with the same bin boundaries as the downstream base CRC, or `None` to skip
+    /// histogram tracking on the delta.
     ///
     /// Errors if `base_version >= self.end_version` or if the segment is missing the
     /// commit at `base_version + 1` (i.e. has a gap above `base_version`).
@@ -237,6 +246,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         base_version: Version,
+        base_protocol: &Protocol,
         seed_histogram: Option<FileSizeHistogram>,
     ) -> KernelResult<CrcDelta> {
         require!(
@@ -248,14 +258,10 @@ impl LogSegment {
             ))
         );
 
-        let deltas: Vec<_> = self
-            .listed
-            .ascending_commit_files
-            .iter()
-            .filter(|c| c.version > base_version)
-            .collect();
+        let commits = &self.listed.ascending_commit_files;
+        let tail = &commits[commits.partition_point(|c| c.version <= base_version)..];
 
-        let first_above = deltas.first().map(|c| c.version);
+        let first_above = tail.first().map(|c| c.version);
         require!(
             first_above == Some(base_version + 1),
             KernelError::internal_error(format!(
@@ -266,30 +272,34 @@ impl LogSegment {
             ))
         );
 
-        self.replay_commits_into_crc_delta(engine, deltas.into_iter(), seed_histogram)
+        self.replay_commits_into_crc_delta(
+            engine,
+            tail,
+            Some((base_version, base_protocol)),
+            seed_histogram,
+        )
     }
 
     /// Replay the given commits into a [`CrcDelta`]. The shared core of
     /// [`Self::build_crc_delta_from_base`] and [`Self::build_crc_from_version_zero`].
-    /// `ascending_commits` are taken oldest-first; `seed_histogram` is an empty histogram with the
-    /// downstream base's bin boundaries, or `None` to skip histogram tracking.
-    fn replay_commits_into_crc_delta<'a>(
+    /// `ascending_commits` are taken oldest-first. `base` is the version and table protocol that
+    /// the commits follow, or `None` when they start at version 0. `seed_histogram` is an empty
+    /// histogram with the downstream base's bin boundaries, or `None` to skip histogram tracking.
+    #[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_variables))]
+    fn replay_commits_into_crc_delta(
         &self,
         engine: &dyn Engine,
-        ascending_commits: impl DoubleEndedIterator<Item = &'a ParsedLogPath>,
+        ascending_commits: &[ParsedLogPath],
+        base: Option<(Version, &Protocol)>,
         seed_histogram: Option<FileSizeHistogram>,
     ) -> KernelResult<CrcDelta> {
         // Replay newest-first: ICT capture reads from the newest commit only.
-        let descending_commits: Vec<&ParsedLogPath> = ascending_commits.rev().collect();
-        let locations: Vec<FileMeta> = descending_commits
+        let locations: Vec<FileMeta> = ascending_commits
             .iter()
+            .rev()
             .map(|c| c.location.clone())
             .collect();
         let mut acc = CrcReplayAccumulator::new(seed_histogram);
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        if let Some(oldest) = descending_commits.last() {
-            acc.first_replayed_version = oldest.version;
-        }
         let batches =
             engine
                 .json_handler()
@@ -306,12 +316,36 @@ impl LogSegment {
         // will trigger it.
         acc.process_commit_file_end();
 
-        let delta = acc.into_crc_delta();
+        #[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_mut))]
+        let mut delta = acc.into_crc_delta();
         #[cfg(feature = "adaptive-metadata-in-dev")]
         if let (Some(newest), Some(last_manifest_commit)) =
-            (descending_commits.first(), &delta.last_manifest_commit)
+            (ascending_commits.last(), &delta.last_manifest_commit)
         {
             last_manifest_commit.ensure_at_or_before(newest.version)?;
+            // A manifest commit may record its file changes only in its tree, so replay cannot
+            // count them. The newest pointer names the newest manifest commit, and a pointer on a
+            // table without adaptiveMetadata means nothing.
+            let base_version = base.map(|(version, _)| version);
+            let has_adaptive_metadata = delta
+                .protocol
+                .as_ref()
+                .or(base.map(|(_, protocol)| protocol))
+                .is_some_and(|protocol| {
+                    protocol.has_table_feature(&TableFeature::AdaptiveMetadataPreview)
+                });
+            if has_adaptive_metadata
+                && base_version.is_none_or(|version| {
+                    last_manifest_commit.may_have_tree_only_file_actions_after(version)
+                })
+            {
+                debug!(
+                    "CRC reverse-replay: manifest commit at {} may record files only in its \
+                     manifest; defaulting to non-incremental-safe",
+                    last_manifest_commit.version
+                );
+                delta.is_incremental_safe = false;
+            }
         }
         Ok(delta)
     }
@@ -333,11 +367,6 @@ struct CrcReplayAccumulator {
     /// be derived from `current_file_url` alone, since after the first batch the URL is
     /// `Some` but we're still on the newest commit until a transition.
     is_first_commit: bool,
-
-    /// Version of the oldest replayed commit. A manifest commit below it is already reflected in
-    /// the base. Defaults to 0, which treats every manifest commit as replayed.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    first_replayed_version: Version,
 
     /// URL of the commit file currently being processed. Drives commit-boundary detection:
     /// a different URL on a later batch means we've moved to an older commit.
@@ -378,8 +407,6 @@ impl CrcReplayAccumulator {
                 ..Default::default()
             },
             is_first_commit: true,
-            #[cfg(feature = "adaptive-metadata-in-dev")]
-            first_replayed_version: 0,
             current_file_url: None,
             current_commit_saw_file_action: false,
             current_commit_operation: None,
@@ -479,22 +506,6 @@ impl CrcReplayAccumulator {
         }
         self.current_commit_operation = operation.map(str::to_owned);
         self.current_commit_saw_commit_info = true;
-        // Replay misses file changes only for a replayed manifest commit whose tree covers its own
-        // version. Every commit from a manifest commit onward carries its pointer, so checking each
-        // one finds a replayed manifest commit hidden behind a newer one.
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        if self.delta.is_incremental_safe
-            && let Some(pointer) = &last_manifest_commit
-            && pointer.files_only_in_manifest()
-            && u64::try_from(pointer.version).is_ok_and(|v| v >= self.first_replayed_version)
-        {
-            debug!(
-                "CRC reverse-replay: manifest commit at {} records files only in its manifest; \
-                 defaulting to non-incremental-safe",
-                pointer.version
-            );
-            self.delta.is_incremental_safe = false;
-        }
         if self.is_first_commit {
             self.delta.in_commit_timestamp = ict;
             #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1472,7 +1483,7 @@ mod tests {
         .unwrap();
         for base in [0, 5] {
             assert_result_error_with_message(
-                segment.build_crc_delta_from_base(&engine, base, None),
+                segment.build_crc_delta_from_base(&engine, base, &Protocol::default(), None),
                 "must be strictly less than end_version",
             );
         }

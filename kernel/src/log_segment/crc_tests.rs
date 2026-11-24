@@ -25,6 +25,8 @@ use crate::engine::sync::SyncEngine;
 use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::path::ParsedLogPath;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::snapshot::ChecksumWriteResult;
 use crate::snapshot::{IncrementalReplay, SnapshotBuilder, SnapshotRef};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::table_configuration::TableConfiguration;
@@ -1360,10 +1362,6 @@ async fn test_adds_and_removes_accumulate() {
 #[case::remove_no_size(vec![commit_info("WRITE", None), remove("orphan", None)])]
 #[case::add_with_unsafe_op(vec![commit_info("ANALYZE STATS", None), add("a", 100)])]
 #[case::add_with_no_commit_info(vec![add("a", 100)])]
-#[cfg_attr(
-    feature = "adaptive-metadata-in-dev",
-    case::manifest_commit(vec![last_manifest_commit_info(1, 1)])
-)]
 #[tokio::test]
 async fn test_trips_indeterminate(#[case] v1_actions: Vec<Value>) {
     // Base carries DM + txn entries so we can verify the indeterminate trip is scoped
@@ -1409,18 +1407,24 @@ async fn test_replay_rejects_last_manifest_commit_newer_than_newest_commit() {
     );
 }
 
-// Replay misses file changes only for a replayed manifest commit whose tree covers its own version
-// (`contentRootVersion == version`). A pointer at or below the base is already reflected in the
-// base, and adds after a manifest commit's `contentRootVersion` are in the log, so replay counts
-// them. Each case lists the commits after the base CRC at version 0.
+// A manifest commit may record its file changes only in its tree, so on an adaptiveMetadata table
+// replay cannot count file stats once a manifest commit follows the base. Without adaptiveMetadata
+// the pointer means nothing. Each case lists the commits after the base CRC at version 0.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[rstest]
-#[case::pointer_at_or_below_base(vec![vec![last_manifest_commit_info(0, 0)]], Some(0))]
-#[case::manifest_commit_with_older_content_root_counts_its_adds(
-    vec![vec![write_with_last_manifest_commit(1, 0), add("a", 100)]],
+#[case::manifest_commit_at_base_counts_later_adds(
+    amt_protocol(),
+    vec![vec![write_with_last_manifest_commit(0, 0), add("a", 100)]],
     Some(1)
 )]
+#[case::manifest_commit_after_base(amt_protocol(), vec![vec![last_manifest_commit_info(1, 1)]], None)]
+#[case::manifest_commit_with_older_content_root_is_indeterminate(
+    amt_protocol(),
+    vec![vec![write_with_last_manifest_commit(1, 0), add("a", 100)]],
+    None
+)]
 #[case::manifest_commit_inside_replay_range(
+    amt_protocol(),
     vec![
         vec![commit_info("WRITE", None), add("a", 100)],
         vec![last_manifest_commit_info(2, 2)],
@@ -1429,6 +1433,7 @@ async fn test_replay_rejects_last_manifest_commit_newer_than_newest_commit() {
     None
 )]
 #[case::manifest_commit_hidden_behind_newer_one(
+    amt_protocol(),
     vec![
         vec![last_manifest_commit_info(1, 1)],
         vec![last_manifest_commit_info(1, 1)],
@@ -1436,8 +1441,19 @@ async fn test_replay_rejects_last_manifest_commit_newer_than_newest_commit() {
     ],
     None
 )]
+#[case::pointer_without_adaptive_metadata_is_ignored(
+    protocol_a(),
+    vec![vec![write_with_last_manifest_commit(1, 1), add("a", 100)]],
+    Some(1)
+)]
+#[case::adaptive_metadata_enabled_inside_replay_range(
+    protocol_a(),
+    vec![vec![protocol(amt_protocol())], vec![last_manifest_commit_info(2, 2)]],
+    None
+)]
 #[tokio::test]
 async fn test_manifest_commit_file_stats(
+    #[case] base_protocol: Protocol,
     #[case] commits: Vec<Vec<Value>>,
     #[case] expected_num_files: Option<i64>,
 ) {
@@ -1445,12 +1461,41 @@ async fn test_manifest_commit_file_stats(
     for (version, commit) in (1..).zip(commits) {
         test = test.commit(version, commit);
     }
-    let crc = test
-        .build()
-        .await
-        .incrementally_build_crc(&crc_complete_empty_dm_set_txn())
-        .unwrap();
+    let base = Crc {
+        protocol: base_protocol,
+        ..crc_complete_empty_dm_set_txn()
+    };
+    let crc = test.build().await.incrementally_build_crc(&base).unwrap();
     assert_eq!(crc.file_stats().map(|s| s.num_files()), expected_num_files);
+}
+
+// Without adaptiveMetadata, a `lastManifestCommit` after a checkpoint means nothing, so the
+// checksum built from the checkpoint still counts the tail's adds.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[tokio::test]
+async fn test_checksum_from_checkpoint_ignores_pointer_without_adaptive_metadata() {
+    let built = CrcReadTest::new()
+        .v2_checkpoint(0, protocol_a(), metadata_a())
+        .commit(1, [write_with_last_manifest_commit(1, 1), add("a", 100)])
+        .build()
+        .await;
+    let snapshot = built.snapshot_latest_with_replay(IncrementalReplay::Disabled);
+    assert_eq!(snapshot.log_segment().checkpoint_version, Some(0));
+    let (result, snapshot) = snapshot.write_checksum(&built.engine).unwrap();
+    assert_eq!(result, ChecksumWriteResult::Written);
+    assert_eq!(
+        snapshot.get_file_stats_if_present().map(|s| s.num_files()),
+        Some(1)
+    );
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn amt_protocol() -> Protocol {
+    Protocol::try_new_modern(
+        ["v2Checkpoint", "adaptiveMetadata-preview"],
+        ["v2Checkpoint", "adaptiveMetadata-preview"],
+    )
+    .unwrap()
 }
 
 // A WRITE commitInfo carrying `lastManifestCommit`, so replay counts the commit's file actions.

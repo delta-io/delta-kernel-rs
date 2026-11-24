@@ -90,10 +90,10 @@ fn table_with_checkpoint_action(
     (engine, snapshot)
 }
 
-/// Writes the CRC at manifest commit `version`: the CRC before it, with that commit's in-commit
-/// timestamp and `lastManifestCommit`. The file stats carry over unchanged only because the
-/// stand-in manifest tree has no files. Like kernel's CRC writer, it ignores the `txn` entries in
-/// the commit's checkpoint action (TODO(#2866)).
+/// Writes the CRC at manifest commit `version` by copying the CRC at `version - 1` and setting that
+/// commit's in-commit timestamp and `lastManifestCommit`. The file stats carry over unchanged only
+/// because the stand-in manifest tree has no files. Like kernel's CRC writer, it ignores the `txn`
+/// entries in the commit's checkpoint action (TODO(#2866)).
 fn write_manifest_commit_crc(engine: &SyncEngine, table_root: &Url, version: Version) {
     let snapshot_at = |version| {
         Snapshot::builder_for(table_root.clone())
@@ -101,16 +101,15 @@ fn write_manifest_commit_crc(engine: &SyncEngine, table_root: &Url, version: Ver
             .build(engine)
             .unwrap()
     };
+    let previous_crc = snapshot_at(version - 1)
+        .resolve_crc_for_write(engine, &Span::none())
+        .unwrap();
     let manifest_commit = snapshot_at(version);
     let crc = Crc {
         version,
         in_commit_timestamp_opt: manifest_commit.get_in_commit_timestamp(engine).unwrap(),
         last_manifest_commit_opt: manifest_commit.last_manifest_commit(engine).unwrap(),
-        ..snapshot_at(version - 1)
-            .resolve_crc_for_write(engine, &Span::none())
-            .unwrap()
-            .as_ref()
-            .clone()
+        ..previous_crc.as_ref().clone()
     };
     let path = ParsedLogPath::new_crc(table_root, version).unwrap();
     try_write_crc_file(engine, &path.location, &crc).unwrap();

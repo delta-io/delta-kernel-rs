@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::path::ParsedLogPath;
 use delta_kernel::schema::{DataType, StructField, schema_ref};
 use delta_kernel::snapshot::{Snapshot, SnapshotRef};
 use delta_kernel::transaction::{Transaction, UpdateTableOperation, UpdateTableTransactionBuilder};
@@ -433,15 +434,16 @@ async fn test_no_checksum_after_manifest_commit(
 
 /// `lastManifestCommit` round-trips through a CRC: a fresh snapshot reads it from the CRC at the
 /// manifest commit, the next log commit adds a file and carries the pointer forward, and that
-/// commit's checksum counts the file and records the pointer.
+/// commit's checksum adds the file to the totals and records the pointer.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_last_manifest_commit_carried_through_crc()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (engine, _temp_dir, table_url, snapshot) =
         setup_adaptive_metadata_table("last_manifest_commit_through_crc").await?;
-    begin_with_data_change(snapshot, &engine, true)?
-        .commit(&engine)?
-        .unwrap_post_commit_snapshot()
+    // A file in v1 gives the CRCs nonzero totals, so the v3 CRC must build on them.
+    let batch = simple_id_batch(&snapshot.schema(), vec![0]);
+    write_batch_to_table(&snapshot, &engine, batch, HashMap::new())
+        .await?
         .write_checksum(&engine)?;
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let file = FileMeta {
@@ -466,12 +468,16 @@ async fn test_last_manifest_commit_carried_through_crc()
         commit_info_at(&table_url, 3)?["lastManifestCommit"],
         expected_last_manifest_commit
     );
+    let base_crc = read_crc(&table_url, 2)?;
+    assert_eq!(base_crc["numFiles"], 1);
     let crc = read_crc(&table_url, 3)?;
     assert_eq!(crc["lastManifestCommit"], expected_last_manifest_commit);
     let adds = read_actions_from_commit(&table_url, 3, "add")?;
     assert_eq!(adds.len(), 1);
-    assert_eq!(crc["numFiles"], 1);
-    assert_eq!(crc["tableSizeBytes"], adds[0]["size"]);
+    assert_eq!(crc["numFiles"], 2);
+    let base_bytes = base_crc["tableSizeBytes"].as_u64().unwrap();
+    let added_bytes = adds[0]["size"].as_u64().unwrap();
+    assert_eq!(crc["tableSizeBytes"], base_bytes + added_bytes);
     Ok(())
 }
 
@@ -491,10 +497,11 @@ fn write_updated_crc_for_manifest_commit(
 }
 
 fn crc_path(table_url: &Url, version: u64) -> PathBuf {
-    table_url
+    ParsedLogPath::new_crc(table_url, version)
+        .unwrap()
+        .location
         .to_file_path()
         .expect("file url")
-        .join(format!("_delta_log/{version:020}.crc"))
 }
 
 fn read_crc(

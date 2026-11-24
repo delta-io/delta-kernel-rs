@@ -29,23 +29,23 @@ fn file_keys(paths: &[&str]) -> HashSet<FileActionKey> {
 }
 
 #[rstest]
-#[case::content_root_at_base(
+#[case::manifest_commit_at_base(
     vec![TestCommit::add("a.parquet").manifest_commit(1), TestCommit::add("b.parquet")],
     2,
     1,
     Some(&["b.parquet"][..])
 )]
-#[case::content_root_at_target(
+#[case::manifest_commit_at_target(
     vec![TestCommit::add("a.parquet"), TestCommit::add("b.parquet").manifest_commit(2)],
     2,
     1,
     None
 )]
-#[case::lagging_content_root_at_base(
+#[case::lagging_content_root_after_base(
     vec![TestCommit::add("a.parquet"), TestCommit::add("b.parquet").manifest_commit(1)],
     2,
     1,
-    Some(&["b.parquet"][..])
+    None
 )]
 #[case::manifest_commit_after_time_travel_target(
     vec![TestCommit::add("a.parquet"), TestCommit::add("b.parquet").manifest_commit(2)],
@@ -53,7 +53,7 @@ fn file_keys(paths: &[&str]) -> HashSet<FileActionKey> {
     0,
     Some(&["a.parquet"][..])
 )]
-fn falls_back_iff_content_root_in_range(
+fn falls_back_iff_manifest_commit_in_range(
     #[case] commits: Vec<TestCommit>,
     #[case] target_version: Version,
     #[case] base_version: Version,

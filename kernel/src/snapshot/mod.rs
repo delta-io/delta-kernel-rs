@@ -1749,8 +1749,9 @@ impl Snapshot {
     ///   reconstruction in the future), or if `delta.enableInCommitTimestamps` is `true` but
     ///   `inCommitTimestampOpt` is absent. On an adaptiveMetadata table, kernel cannot count the
     ///   files in a manifest tree, so this also fails once the table has a manifest commit, unless
-    ///   a CRC at or after the newest manifest commit exists to build on. Such a CRC must come from
-    ///   a writer that knows the tree's files.
+    ///   there is a CRC to build on that is at or after the newest manifest commit and at or after
+    ///   the snapshot's checkpoint, if it has one. Such a CRC must come from a writer that knows
+    ///   the tree's files.
     /// - The underlying read error if in-commit timestamps are enabled but the timestamp cannot be
     ///   read from the commit file.
     /// - I/O errors from the engine's storage handler if the write fails.
@@ -1892,10 +1893,13 @@ impl Snapshot {
                 return Ok(Arc::new(crc));
             }
             // Replay the tail commits first: a non-incremental tail dooms file stats no matter
-            // what the checkpoint holds, so skip the larger checkpoint read in that case.
+            // what the checkpoint holds, so skip the larger checkpoint read in that case. The
+            // checkpoint's protocol is not read yet. This snapshot's protocol is the same after
+            // the tail's protocol changes are applied, which is the only use replay has for it.
             let delta = log_segment.build_crc_delta_from_base(
                 engine,
                 checkpoint_version,
+                self.table_configuration().protocol(),
                 Some(FileSizeHistogram::create_default()),
             )?;
             require!(
@@ -1909,10 +1913,12 @@ impl Snapshot {
             // may be older than the checkpoint, and a newer one can hide an older one, so any
             // pointer means the checkpoint may reference a tree.
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            require_no_manifest_tree_at_checkpoint(
-                checkpoint_version,
-                delta.last_manifest_commit.as_ref(),
-            )?;
+            if self.has_adaptive_metadata() {
+                require_no_manifest_tree_at_checkpoint(
+                    checkpoint_version,
+                    delta.last_manifest_commit.as_ref(),
+                )?;
+            }
             let base = self.build_crc_from_checkpoint(engine)?;
             // The tail delta carries v_end's ICT, which `apply` sets on the result.
             return Ok(Arc::new(base.apply(delta, end)));
