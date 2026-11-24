@@ -524,8 +524,11 @@ fn try_new_update_table<MODE: ExecutionMode>(
     let has_property_removes = !properties_removed.is_empty();
     let mut should_emit_metadata = has_schema_changes || has_property_adds || has_property_removes;
     if has_property_adds || has_property_removes {
-        effective_table_config =
-            apply_table_property_changes(effective_table_config, properties_added, properties_removed)?;
+        effective_table_config = apply_table_property_changes(
+            effective_table_config,
+            properties_added,
+            properties_removed,
+        )?;
     }
 
     // Property-driven feature enablement may upgrade the protocol and apply metadata side effects.
@@ -1476,7 +1479,7 @@ mod tests {
     #[test]
     fn with_table_properties_added_rejects_deletion_vectors_on_iceberg_compat_v2_table()
     -> Result<()> {
-        let engine = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let engine = Arc::new(SyncEngine::in_memory());
         let snapshot = create_table("memory:///", test_schema_flat(), "test-engine", true)
             .with_table_properties([
                 ("delta.enableIcebergCompatV2", "true"),
@@ -1767,7 +1770,7 @@ mod tests {
 
     #[test]
     fn with_table_properties_added_rejects_ict_disable_on_catalog_managed_table() -> Result<()> {
-        let engine = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let engine = Arc::new(SyncEngine::in_memory());
         let snapshot = create_table("memory:///", test_schema_flat(), "test-engine", true)
             .with_table_properties([("delta.feature.catalogManaged", "supported")])
             .build(engine.as_ref(), Box::new(PublishingCatalogCommitter))?
@@ -1796,7 +1799,7 @@ mod tests {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
     fn with_table_properties_added_enables_iceberg_native_v4_fills_dv_and_ict() -> Result<()> {
-        let engine = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let engine = Arc::new(SyncEngine::in_memory());
         let snapshot = create_table("memory:///", test_schema_flat(), "test-engine", true)
             .with_table_properties([
                 ("delta.columnMapping.mode", "id"),
@@ -1831,7 +1834,7 @@ mod tests {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[test]
     fn with_table_properties_added_rejects_iceberg_native_v4_with_dv_disabled() -> Result<()> {
-        let engine = Arc::new(SyncEngine::new_with_store(Arc::new(InMemory::new())));
+        let engine = Arc::new(SyncEngine::in_memory());
         let snapshot = create_table("memory:///", test_schema_flat(), "test-engine", true)
             .with_table_properties([
                 ("delta.columnMapping.mode", "id"),
