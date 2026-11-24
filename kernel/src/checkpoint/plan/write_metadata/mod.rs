@@ -1,14 +1,11 @@
-//! Complete `_last_checkpoint` metadata for classic single-part checkpoints.
+//! Complete `_last_checkpoint` metadata for single-part V1 checkpoints.
 
 use std::sync::LazyLock;
 
-use serde::Serialize;
-
-mod json_checksum;
 mod write;
 
-use super::super::{CheckpointWriter, LastCheckpointHintStats, V2CheckpointConfig};
-use crate::last_checkpoint_hint::LastCheckpointHint;
+use super::super::{CheckpointWriter, LastCheckpointHintStats};
+use crate::last_checkpoint_hint::{CheckpointFileStatus, LastCheckpointHint};
 use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::schema::{SchemaRef, lazy_schema_ref};
 use crate::{FileMeta, KernelError, KernelResult};
@@ -54,12 +51,7 @@ impl CheckpointWriter {
         }
         let root_size = i64::try_from(root_file.size)
             .map_err(|_| KernelError::checkpoint_write("Checkpoint root size exceeds i64"))?;
-        let has_sidecars = self.schema_context.is_v2
-            && matches!(
-                &self.v2_checkpoint_config,
-                V2CheckpointConfig::WithSidecar { .. }
-            );
-        if stats.size_in_bytes < root_size || (!has_sidecars && stats.size_in_bytes != root_size) {
+        if stats.size_in_bytes != root_size {
             return Err(KernelError::checkpoint_write(
                 "Checkpoint byte count does not match root file",
             ));
@@ -71,6 +63,12 @@ impl CheckpointWriter {
             size_in_bytes: Some(stats.size_in_bytes),
             num_of_add_files: Some(stats.num_of_add_files),
             checkpoint_schema,
+            checkpoint_files: Some(vec![CheckpointFileStatus {
+                path: root.filename,
+                length: root_size,
+                is_dir: false,
+                modification_time: root_file.last_modified,
+            }]),
             checksum: None,
             tags: None,
             // Classic filenames do not use the UUID checkpoint locator.
@@ -80,28 +78,8 @@ impl CheckpointWriter {
             #[cfg(feature = "adaptive-metadata-in-dev")]
             amt_checkpoint: None,
         };
-        let mut file = CheckpointHintFile {
-            hint,
-            checkpoint_files: Some([serde_json::json!({
-                "path": root.filename,
-                "length": root_size,
-                "isDir": false,
-                "modificationTime": root_file.last_modified,
-            })]),
-        };
-        file.hint.checksum = Some(json_checksum::json_checksum(&serde_json::to_value(&file)?));
-        Ok(serde_json::to_vec(&file)?)
+        Ok(serde_json::to_vec(&hint)?)
     }
-}
-
-// Keep the public, portable hint type unchanged while writing the optional file-status hint.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CheckpointHintFile {
-    #[serde(flatten)]
-    hint: LastCheckpointHint,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    checkpoint_files: Option<[serde_json::Value; 1]>,
 }
 
 fn checkpoint_schema_json(schema: &SchemaRef) -> KernelResult<Option<String>> {

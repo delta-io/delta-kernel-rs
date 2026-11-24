@@ -287,7 +287,7 @@ pub enum CheckpointSpec {
 ///
 /// Note: "File actions" here means `add` and `remove` actions. "Non-file actions" means
 /// the rest (`protocol`, `metaData`, `txn`, etc.).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum V2CheckpointConfig {
     /// Write a V2 checkpoint without sidecar files.
     NoSidecar,
@@ -376,8 +376,6 @@ pub struct CheckpointWriter {
 
     schema_context: CheckpointSchemaContext,
     read_schema: SchemaRef,
-    #[cfg(feature = "declarative-plans")]
-    v2_checkpoint_config: V2CheckpointConfig,
 }
 
 impl RetentionCalculator for CheckpointWriter {
@@ -410,8 +408,6 @@ impl CheckpointWriter {
             snapshot,
             schema_context,
             read_schema,
-            #[cfg(feature = "declarative-plans")]
-            v2_checkpoint_config: V2CheckpointConfig::NoSidecar,
         })
     }
 

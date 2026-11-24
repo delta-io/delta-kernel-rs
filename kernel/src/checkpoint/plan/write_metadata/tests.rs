@@ -6,7 +6,7 @@ use rstest::rstest;
 use serde_json::{Value, json};
 use url::Url;
 
-use super::{CHECKPOINT_SCHEMA_THRESHOLD, checkpoint_schema_json, json_checksum};
+use super::{CHECKPOINT_SCHEMA_THRESHOLD, checkpoint_schema_json};
 use crate::arrow::array::StringArray;
 use crate::arrow::record_batch::RecordBatch;
 use crate::checkpoint::CheckpointWriter;
@@ -31,7 +31,6 @@ use crate::{
 };
 
 fn checkpoint_table(
-    v2: bool,
     state: &str,
 ) -> Result<(TestTable, SnapshotRef, SyncEngine), Box<dyn std::error::Error>> {
     let log_state = if state == "empty" {
@@ -40,13 +39,8 @@ fn checkpoint_table(
         LogState::with_latest_version(2)
             .maybe_with_checkpoint_at((state == "predecessor").then_some(1))
     };
-    let features = FeatureSet::new().domain_metadata();
     let table = TestTableBuilder::new()
-        .with_features(if v2 {
-            features.v2_checkpoint()
-        } else {
-            features
-        })
+        .with_features(FeatureSet::new().domain_metadata())
         .with_log_state(log_state)
         .with_data(1, 1)
         .build()?;
@@ -117,17 +111,13 @@ fn reconciled_rows(writer: &CheckpointWriter, engine: &dyn Engine) -> KernelResu
 }
 
 #[rstest]
-#[case::v1_empty(false, "empty")]
-#[case::v1_mixed(false, "mixed")]
-#[case::v1_predecessor(false, "predecessor")]
-#[case::v2_empty(true, "empty")]
-#[case::v2_mixed(true, "mixed")]
-#[case::v2_predecessor(true, "predecessor")]
+#[case::empty("empty")]
+#[case::mixed("mixed")]
+#[case::predecessor("predecessor")]
 fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
-    #[case] v2: bool,
     #[case] state: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_table, snapshot, engine) = checkpoint_table(v2, state)?;
+    let (_table, snapshot, engine) = checkpoint_table(state)?;
     let writer = snapshot.clone().create_checkpoint_writer(&engine)?;
     let log = snapshot.log_segment().log_root.clone();
     let hint_path = log.join("_last_checkpoint")?;
@@ -141,15 +131,11 @@ fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
         .then(|| file_bytes(&engine, &hint_path))
         .transpose()?;
     let expected = reconciled_rows(&writer, &engine)?;
-    assert_eq!(
-        expected.len(),
-        (if state == "empty" { 2 } else { 6 }) + usize::from(v2)
-    );
+    assert_eq!(expected.len(), if state == "empty" { 2 } else { 6 });
     let expected_adds = expected
         .iter()
         .filter(|row| row.get("add").is_some())
         .count();
-    assert_eq!(expected_adds, usize::from(state != "empty"));
 
     let plan = writer.declarative_checkpoint_plan(&engine, FileType::Parquet)?;
     assert_eq!(
@@ -229,15 +215,6 @@ fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
     let persisted = reader.build()?.collect::<Result<Vec<_>, _>>()?;
     let actual = canonical_actions(json_rows(&persisted, false)?);
     assert_eq!(actual, expected);
-    let checkpoint_metadata = actual
-        .iter()
-        .filter_map(|row| row.get("checkpointMetadata"))
-        .collect::<Vec<_>>();
-    assert_eq!(checkpoint_metadata.len(), usize::from(v2));
-    if let Some(metadata) = checkpoint_metadata.first() {
-        assert_eq!(metadata["version"].as_u64(), Some(snapshot.version()));
-    }
-    assert!(actual.iter().all(|row| row.get("sidecar").is_none()));
     for row in &actual {
         for name in ["add", "remove"] {
             if let Some(action) = row.get(name) {
@@ -248,7 +225,6 @@ fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
 
     let bytes = writer.last_checkpoint_bytes_from_result(data_result(batches))?;
     let value: Value = serde_json::from_slice(&bytes)?;
-    assert_eq!(value["checksum"], json_checksum::json_checksum(&value));
     assert_eq!(
         value,
         json!({
@@ -266,11 +242,10 @@ fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
             }],
             "tags": null,
             "v2Checkpoint": null,
-            "checksum": value["checksum"],
+            "checksum": null,
         }),
     );
     let hint: LastCheckpointHint = serde_json::from_slice(&bytes)?;
-    assert!(hint.v2_checkpoint.is_none());
     assert!(hint.applies_to(&[ParsedLogPath::new(descriptor).unwrap()]));
     if let Some(previous) = previous_hint {
         assert_eq!(file_bytes(&engine, &hint_path)?, previous);
@@ -343,10 +318,12 @@ fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
 }
 
 #[rstest]
-#[case::v1(false)]
-#[case::v2(true)]
-fn checkpoint_rejects_json_before_engine_access(
+#[case::json(false, FileType::Json, "V1 checkpoints require Parquet")]
+#[case::v2(true, FileType::Parquet, "This plan requires a V1 checkpoint writer")]
+fn checkpoint_rejects_unsupported_format_and_table_before_engine_access(
     #[case] v2: bool,
+    #[case] format: FileType,
+    #[case] expected_error: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let table = TestTableBuilder::new()
         .with_features(if v2 {
@@ -364,8 +341,8 @@ fn checkpoint_rejects_json_before_engine_access(
         .collect::<KernelResult<Vec<_>>>()?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
     ::test_utils::assert_result_error_with_message(
-        writer.declarative_checkpoint_plan(&PanicEngine, FileType::Json),
-        "Classic-named checkpoints require Parquet",
+        writer.declarative_checkpoint_plan(&PanicEngine, format),
+        expected_error,
     );
     assert_eq!(
         engine
@@ -378,27 +355,18 @@ fn checkpoint_rejects_json_before_engine_access(
 }
 
 #[rstest]
-#[case::v1_missing(false, None, None, true)]
-#[case::v1_matching(false, Some(1), Some(1), true)]
-#[case::v1_too_few(false, Some(1), Some(0), false)]
-#[case::v1_too_many(false, Some(1), Some(2), false)]
-#[case::v1_stale(false, Some(0), Some(0), true)]
-#[case::v1_indeterminate(false, Some(1), None, true)]
-#[case::v2_matching(true, Some(1), Some(1), true)]
-#[case::v2_too_many(true, Some(1), Some(2), false)]
-#[case::v2_indeterminate(true, Some(1), None, true)]
+#[case::missing(None, None, true)]
+#[case::matching(Some(1), Some(1), true)]
+#[case::too_few(Some(1), Some(0), false)]
+#[case::too_many(Some(1), Some(2), false)]
+#[case::stale(Some(0), Some(0), true)]
+#[case::indeterminate(Some(1), None, true)]
 fn checkpoint_validates_add_count_against_crc(
-    #[case] v2: bool,
     #[case] crc_version: Option<Version>,
     #[case] expected_adds: Option<i64>,
     #[case] succeeds: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let table = TestTableBuilder::new()
-        .with_features(if v2 {
-            FeatureSet::new().v2_checkpoint()
-        } else {
-            FeatureSet::new()
-        })
         .with_log_state(LogState::with_latest_version(1))
         .with_data(1, 1)
         .build()?;
@@ -495,7 +463,7 @@ fn checkpoint_statistics_decoder_validates_counts_and_root(
     #[case] arms: &[&str],
     #[case] expected_error: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_table, snapshot, engine) = checkpoint_table(false, "empty")?;
+    let (_table, snapshot, engine) = checkpoint_table("empty")?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
     let statistics = json!({"num_actions": counts[0], "num_of_add_files": counts[1], "size_in_bytes": counts[2]});
     let root = json!({"location": writer.checkpoint_path()?, "size": 17, "last_modified": 19});
@@ -586,31 +554,22 @@ fn checkpoint_statistics_decoder_validates_counts_and_root(
 
 #[rstest]
 #[case::wrong_version(
-    false,
     "00000000000000000001.checkpoint.parquet",
     17,
     "Checkpoint root does not match this writer"
 )]
 #[case::wrong_directory(
-    false,
     "other/00000000000000000000.checkpoint.parquet",
     17,
     "Checkpoint root does not match this writer"
 )]
-#[case::negative_size(false, "00000000000000000000.checkpoint.parquet", -1, "Negative root size")]
-#[case::inline_v2_mismatched_bytes(
-    true,
-    "00000000000000000000.checkpoint.parquet",
-    16,
-    "Checkpoint byte count does not match root file"
-)]
+#[case::negative_size("00000000000000000000.checkpoint.parquet", -1, "Negative root size")]
 fn checkpoint_statistics_decoder_rejects_invalid_root(
-    #[case] v2: bool,
     #[case] path: &str,
     #[case] size: i64,
     #[case] expected_error: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_table, snapshot, engine) = checkpoint_table(v2, "empty")?;
+    let (_table, snapshot, engine) = checkpoint_table("empty")?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
     let rows = [
         json!({"statistics":{"num_actions":1,"num_of_add_files":0,"size_in_bytes":17}}),

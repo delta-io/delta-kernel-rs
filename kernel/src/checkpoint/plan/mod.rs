@@ -6,63 +6,35 @@ use super::CheckpointWriter;
 use crate::action_reconciliation::RetentionCalculator as _;
 use crate::action_reconciliation::plan::action_set::ActionSet;
 use crate::action_reconciliation::plan::{MetadataPlanner, VERSION};
-use crate::actions::{CHECKPOINT_METADATA_FIELD, CHECKPOINT_METADATA_NAME, CheckpointMetadata};
-use crate::expressions::{Expression as Expr, Predicate, Scalar, col, lit, null_lit};
+use crate::expressions::{Expression as Expr, Predicate, col, lit};
 use crate::plans::{Plan, PlanBuilder};
 use crate::scan::{PartitionValuesOptions, StatsOptions};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::{Engine, KernelError, KernelResult};
 
 impl CheckpointWriter {
-    /// Builds rows for a single-part V1 or inline V2 checkpoint, based on the table features.
+    /// Builds the rows for a single-part V1 checkpoint.
     ///
     /// Shares source planning and typed metadata conversion with scans. File writing and
-    /// publication remain with the caller. Collation-stat sampling is unsupported.
+    /// publication remain with the caller. Output statistics use the JSON representation.
     pub fn declarative_checkpoint_data_plan(&self, engine: &dyn Engine) -> KernelResult<Plan> {
         self.checkpoint_actions(engine)?.build()
     }
 
     fn checkpoint_actions(&self, engine: &dyn Engine) -> KernelResult<PlanBuilder> {
-        let actions = self
-            .metadata_planner(ActionSet::ALL)?
+        if self.schema_context.is_v2 {
+            return Err(KernelError::unsupported(
+                "This plan requires a V1 checkpoint writer",
+            ));
+        }
+        self.metadata_planner(ActionSet::ALL)?
             .with_checkpoint_shape(self.snapshot.checkpoint_info(engine)?)
             .replay()?
             .filter(Predicate::and(
                 file_retention_predicate(self.deleted_file_retention_timestamp()?),
                 non_content_retention_predicate(self.get_transaction_expiration_timestamp()?),
             ))?
-            .project_patch(|patch| {
-                let patch = checkpoint_file_projection(patch);
-                if self.schema_context.is_v2 {
-                    patch.append(
-                        CHECKPOINT_METADATA_FIELD.clone(),
-                        null_lit(CHECKPOINT_METADATA_FIELD.data_type().clone()),
-                    )
-                } else {
-                    patch
-                }
-            })?;
-        if !self.schema_context.is_v2 {
-            return Ok(actions);
-        }
-        let checkpoint_metadata: Scalar = CheckpointMetadata {
-            version: self.version,
-            tags: None,
-        }
-        .into();
-        let row = actions
-            .schema()
-            .fields()
-            .map(|field| {
-                if field.name() == CHECKPOINT_METADATA_NAME {
-                    checkpoint_metadata.clone()
-                } else {
-                    Scalar::null(field.data_type().clone())
-                }
-            })
-            .collect();
-        let metadata = PlanBuilder::values(actions.schema().clone(), vec![row])?;
-        PlanBuilder::union_all([actions, metadata])
+            .project_patch(checkpoint_file_projection)
     }
 
     /// Configures metadata replay using this writer's output representations and schemas.
@@ -70,39 +42,31 @@ impl CheckpointWriter {
         let context = &self.schema_context;
         let config = self.snapshot.table_configuration();
         let segment = self.snapshot.log_segment();
-        let write_struct = context.stats_config.write_stats_as_struct;
-        if write_struct && config.has_collations_feature() {
-            return Err(KernelError::unsupported(
-                "Declarative checkpoint prototype does not implement collation-stat sampling",
-            ));
-        }
+        let parsed_partitions = self
+            .snapshot
+            .table_properties()
+            .checkpoint_write_stats_as_struct
+            .unwrap_or(true);
         let stats = StatsOptions {
             synthesize_json: context.stats_config.write_stats_as_json,
-            // JSON synthesis preserves native bounds; structured output uses the writer's schema.
             variant_min_max: true,
             #[cfg(feature = "geo-type-in-dev")]
             geometry_min_max: true,
-            ..if write_struct {
-                StatsOptions::all()
-            } else {
-                StatsOptions::json_only()
-            }
+            ..StatsOptions::json_only()
         };
         Ok(MetadataPlanner::new(segment, actions, false)
-            .with_stats_schemas(
-                stats
-                    .json_synthesis_schema(config)?
-                    .or_else(|| write_struct.then(|| context.stats_schema.clone())),
-                write_struct.then(|| context.stats_schema.clone()),
-            )
+            .with_stats_schemas(stats.json_synthesis_schema(config)?, None)
             .with_read_collations(stats.synthesize_json && config.has_collations_feature())
             .with_stats(stats)
             .with_partition_values(
                 PartitionValuesOptions {
-                    parsed_struct: write_struct,
+                    parsed_struct: parsed_partitions,
                     ..Default::default()
                 },
-                context.partition_schema.clone().filter(|_| write_struct),
+                context
+                    .partition_schema
+                    .clone()
+                    .filter(|_| parsed_partitions),
             ))
     }
 }

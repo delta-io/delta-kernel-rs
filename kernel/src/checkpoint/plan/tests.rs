@@ -13,7 +13,6 @@ use crate::action_reconciliation::file_metadata::{
 use crate::action_reconciliation::log_replay::ActionReconciliationProcessor;
 use crate::action_reconciliation::plan::VERSION;
 use crate::action_reconciliation::plan::action_set::ActionSet;
-use crate::actions::CHECKPOINT_METADATA_NAME;
 use crate::arrow::array::{AsArray as _, StringArray};
 use crate::arrow::compute::{filter_record_batch, is_not_null, is_null, or};
 use crate::arrow::record_batch::RecordBatch;
@@ -38,12 +37,9 @@ fn select_checkpoint_actions(
     batches
         .iter()
         .map(|batch| {
-            let include_metadata = actions == ActionSet::ALL
-                && batch.column_by_name(CHECKPOINT_METADATA_NAME).is_some();
             let selected = batch.project(
                 &actions
                     .output_action_names()
-                    .chain(include_metadata.then_some(CHECKPOINT_METADATA_NAME))
                     .map(|name| batch.schema().index_of(name).unwrap())
                     .collect::<Vec<_>>(),
             )?;
@@ -98,6 +94,12 @@ fn checkpoint_reference_batches(
             let mut patch = ProjectionStructPatchBuilder::new(&input);
             if actions.live_adds {
                 patch = patch.replace_expr_at(["add"], "dataChange", lit(false));
+                if input
+                    .field_at(&crate::expressions::column_name!("add.stats_parsed"))
+                    .is_ok()
+                {
+                    patch = patch.drop_at(["add"], "stats_parsed");
+                }
             }
             if actions.include_tombstones {
                 patch = patch
@@ -122,15 +124,10 @@ fn checkpoint_reference_batches(
 #[case("v1-single-part-struct-stats-only")]
 #[case("v1-multi-part-struct-stats-only")]
 #[case("v1-multi-part-partitioned-struct-stats-only")]
-#[case("v2-checkpoints-json-without-sidecars")]
-#[case("v2-checkpoints-parquet-without-sidecars")]
-#[case("v2-checkpoints-json-with-sidecars")]
-#[case("v2-checkpoints-parquet-with-sidecars")]
 fn checkpoint_plan_matches_existing_checkpoint_data(
     #[case] table: &str,
     #[values(false, true)] with_tail: bool,
     #[values(false, true)] json_stats: bool,
-    #[values(false, true)] struct_stats: bool,
 ) -> KernelResult<(), Box<dyn std::error::Error>> {
     let (table_root, _tempdir) = copy_test_table(table)?;
     let engine = Arc::new(SyncEngine::new());
@@ -161,7 +158,11 @@ fn checkpoint_plan_matches_existing_checkpoint_data(
     }
     let mut writer = snapshot.create_checkpoint_writer(engine.as_ref())?;
     writer.schema_context.stats_config.write_stats_as_json = json_stats;
-    writer.schema_context.stats_config.write_stats_as_struct = struct_stats;
+    writer.schema_context.stats_config.write_stats_as_struct = writer
+        .snapshot
+        .table_properties()
+        .checkpoint_write_stats_as_struct
+        .unwrap_or(true);
     let expected = writer
         .checkpoint_data(engine.as_ref())?
         .map(|data| selected_batch(data?))
@@ -401,7 +402,7 @@ async fn checkpoint_uses_declared_metadata_representations(
         .with_table_config(
             TableConfig::new()
                 .write_stats_as_json(true)
-                .write_stats_as_struct(true),
+                .write_stats_as_struct(write_struct),
         )
         .build()
         .unwrap();
@@ -549,9 +550,11 @@ async fn checkpoint_uses_declared_metadata_representations(
             .iter()
             .find(|row| row["add"]["path"] == path)
             .unwrap();
+        assert!(row["add"].get("stats_parsed").is_none());
         if write_struct {
-            assert_eq!(row["add"]["stats_parsed"]["minValues"]["value"], id);
             assert_eq!(row["add"]["partitionValues_parsed"]["part_long"], id);
+        } else {
+            assert!(row["add"].get("partitionValues_parsed").is_none());
         }
         if write_json {
             let stats: Value = serde_json::from_str(row["add"]["stats"].as_str().unwrap())?;

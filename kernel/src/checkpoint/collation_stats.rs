@@ -832,8 +832,6 @@ mod tests {
             snapshot,
             schema_context,
             read_schema,
-            #[cfg(feature = "declarative-plans")]
-            v2_checkpoint_config: crate::checkpoint::V2CheckpointConfig::NoSidecar,
         })
     }
 
