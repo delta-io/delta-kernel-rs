@@ -1239,20 +1239,18 @@ async fn create_partitioned_stats_table<E: TaskExecutor>(
     Ok(snapshot2)
 }
 
-/// On a V2 table (table with `v2Checkpoint` feature), passing either `None` or
-/// `Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar))` to `snapshot.checkpoint()` produces
-/// a V2 classic checkpoint with no sidecars.
-#[rstest::rstest]
+/// Explicit NoSidecar writes inline V2 in both modes; executor defaults use sidecars.
+#[apply(checkpoint_modes)]
 #[case::none(None)]
 #[case::v2_no_sidecar(Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar)))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_snapshot_checkpoint_default_on_v2_table(
     #[case] spec: Option<CheckpointSpec>,
+    declarative: bool,
 ) -> delta_kernel::Result<()> {
     let schema = get_simple_schema();
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
-    // Declarative V2 rejects inline checkpoints.
-    let checkpoint_engine = checkpoint_engine(engine.clone(), None, false);
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     let mut snapshot = create_table_and_load_snapshot(
         &table_path,
         schema.clone(),
@@ -1272,11 +1270,7 @@ async fn test_snapshot_checkpoint_default_on_v2_table(
     snapshot.checkpoint(checkpoint_engine.as_ref(), spec.as_ref())?;
 
     let sidecars_dir = std::path::Path::new(&table_path).join("_delta_log/_sidecars");
-    assert!(
-        !sidecars_dir.exists(),
-        "_sidecars directory should not exist for a no-sidecar V2 checkpoint, found: {}",
-        sidecars_dir.display()
-    );
+    assert_eq!(sidecars_dir.exists(), declarative && spec.is_none());
 
     // V2 checkpoint must contain a `checkpointMetadata` column.
     let ckpt_path = load_existing_single_file_checkpoint_path(&table_path, version);

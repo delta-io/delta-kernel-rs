@@ -14,8 +14,10 @@
 //! | No v2Checkpoint | V1, without [`CheckpointMetadata`] | Classic-named Parquet |
 //! | v2Checkpoint | V2, with [`CheckpointMetadata`] | Classic-named Parquet |
 //!
-//! With `declarative-plans`, V2 writes use sidecars. A custom declarative writer can opt into
-//! UUID-named JSON or Parquet roots through `CheckpointWriter::with_checkpoint_naming`.
+//! A declarative writer defaults to a single-part checkpoint. V2 writers can select sidecars
+//! with `CheckpointWriter::with_v2_checkpoint_config` and UUID-named JSON or Parquet roots with
+//! `CheckpointWriter::with_checkpoint_naming`. `Snapshot::checkpoint` keeps sidecars as its V2
+//! executor default and honors an explicit `V2CheckpointConfig::NoSidecar`.
 //! Handler-based V2 writes support inline file actions or sidecars.
 //!
 //! For more information on the V1/V2 specifications, see the following protocol section:
@@ -390,9 +392,9 @@ pub struct CheckpointWriter {
     schema_context: CheckpointSchemaContext,
     read_schema: SchemaRef,
     #[cfg(feature = "declarative-plans")]
-    v2_checkpoint_config: V2CheckpointConfig,
-    #[cfg(feature = "declarative-plans")]
     checkpoint_naming: CheckpointNaming,
+    #[cfg(feature = "declarative-plans")]
+    v2_checkpoint_config: V2CheckpointConfig,
 }
 
 impl RetentionCalculator for CheckpointWriter {
@@ -426,9 +428,9 @@ impl CheckpointWriter {
             schema_context,
             read_schema,
             #[cfg(feature = "declarative-plans")]
-            v2_checkpoint_config: V2CheckpointConfig::NoSidecar,
-            #[cfg(feature = "declarative-plans")]
             checkpoint_naming: CheckpointNaming::default(),
+            #[cfg(feature = "declarative-plans")]
+            v2_checkpoint_config: V2CheckpointConfig::NoSidecar,
         })
     }
 

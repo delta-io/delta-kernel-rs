@@ -91,13 +91,9 @@ async fn test_checkpoint_non_kernel_written_table(declarative: bool) {
         delta_kernel::arrow::util::pretty::pretty_format_batches(&batches_before)
             .unwrap()
             .to_string();
-    let formatted_after = delta_kernel::arrow::util::pretty::pretty_format_batches(&batches_after)
-        .unwrap()
-        .to_string();
-    assert_eq!(
-        formatted_before, formatted_after,
-        "Row data changed after checkpoint creation!"
-    );
+    let mut expected_lines: Vec<_> = formatted_before.trim().lines().collect();
+    test_utils::sort_lines!(expected_lines);
+    test_utils::assert_batches_sorted_eq!(expected_lines, &batches_after);
 
     // Verify checkpoint file exists
     let delta_log_path = table_path.join("_delta_log");

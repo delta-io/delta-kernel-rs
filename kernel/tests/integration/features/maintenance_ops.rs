@@ -252,21 +252,6 @@ async fn checkpoint_crc_writes_reject_unsupported_table_features(
     let checkpoint_result = snapshot
         .checkpoint(checkpoint_engine.as_ref(), checkpoint_spec.as_ref())
         .map(|_| ());
-    let checkpoint_result = if declarative
-        && matches!(
-            &checkpoint_spec,
-            Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar))
-        ) {
-        assert_result_error_with_message(
-            checkpoint_result,
-            "Declarative V2 checkpoints require sidecars",
-        );
-        snapshot
-            .checkpoint(engine.as_ref(), checkpoint_spec.as_ref())
-            .map(|_| ())
-    } else {
-        checkpoint_result
-    };
     assert_result_error_with_message(checkpoint_result, expected_feature);
 
     let initial_event_count = reporter.events().len();
