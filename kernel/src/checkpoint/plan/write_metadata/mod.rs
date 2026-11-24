@@ -21,8 +21,8 @@ use crate::expressions::{
     ColumnName, Expression as Expr, Scalar, UnaryExpressionOp, col, column_name, lit, null_lit,
 };
 use crate::last_checkpoint_hint::{
-    LAST_CHECKPOINT_NON_FILE_ACTIONS_THRESHOLD, LAST_CHECKPOINT_SIDECARS_THRESHOLD,
-    CheckpointFileStatus, LastCheckpointHint, LastCheckpointV2,
+    CheckpointFileStatus, LAST_CHECKPOINT_NON_FILE_ACTIONS_THRESHOLD,
+    LAST_CHECKPOINT_SIDECARS_THRESHOLD, LastCheckpointHint, LastCheckpointV2,
 };
 use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::plans::ir::nodes::Agg;
@@ -218,12 +218,14 @@ impl CheckpointWriter {
             num_of_add_files: Some(stats.num_of_add_files),
             checkpoint_schema: checkpoint_schema_json(&checkpoint_schema)?
                 .map(|_| checkpoint_schema),
-            checkpoint_files: (!uuid_root).then(|| vec![CheckpointFileStatus {
-                path: root.filename,
-                length: root_size,
-                is_dir: false,
-                modification_time: root_file.last_modified,
-            }]),
+            checkpoint_files: (!uuid_root).then(|| {
+                vec![CheckpointFileStatus {
+                    path: root.filename,
+                    length: root_size,
+                    is_dir: false,
+                    modification_time: root_file.last_modified,
+                }]
+            }),
             checksum: None,
             tags: None,
             v2_checkpoint: uuid_root.then_some(v2),
