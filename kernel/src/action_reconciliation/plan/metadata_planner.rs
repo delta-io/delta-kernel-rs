@@ -278,13 +278,12 @@ impl<'a> MetadataPlanner<'a> {
         let (patch, stats_kind) = match (self.stats_schema.as_ref(), get_type_of(STATS_PARSED)) {
             // Parsed statistics are requested and present in the file
             (Some(required_stats), Some(DataType::Struct(file_parsed_stats)))
-                if !prefer_json_stats
-                    && LogSegment::structs_have_compatible_types(
-                        file_parsed_stats,
-                        required_stats,
-                        STATS_PARSED,
-                        CheckpointFieldKind::Stats,
-                    ) =>
+                if LogSegment::structs_have_compatible_types(
+                    file_parsed_stats,
+                    required_stats,
+                    STATS_PARSED,
+                    CheckpointFieldKind::Stats,
+                ) =>
             {
                 let stats_schema = required_stats.clone().try_fold_with(
                     source_collation_stats(file_schema).filter(|_| self.read_collations),
@@ -296,8 +295,12 @@ impl<'a> MetadataPlanner<'a> {
                     },
                 )?;
                 let stats_parsed_field = StructField::nullable(STATS_PARSED, stats_schema);
-                let patch = patch.drop(STATS).insert_after(STATS, stats_parsed_field);
-                (patch, StatsKind::Struct)
+                let (patch, stats_kind) = if prefer_json_stats {
+                    (patch, StatsKind::Both)
+                } else {
+                    (patch.drop(STATS), StatsKind::Struct)
+                };
+                (patch.insert_after(STATS, stats_parsed_field), stats_kind)
             }
             // Json stats are used either by the dataskipping filter or are requested by the user
             _ if self.stats.synthesize_json || self.stats_schema.is_some() => {
@@ -336,8 +339,8 @@ impl<'a> MetadataPlanner<'a> {
         Ok((Arc::new(read_schema), stats_kind, has_struct_partitions))
     }
 
-    /// Adds structured metadata needed by the stats filter or requested output when the source
-    /// could not provide compatible native fields.
+    /// Normalizes statistics and prepares structured metadata needed by the stats filter or
+    /// requested output.
     ///
     /// * JSON stats are parsed with `stats_schema`, retaining JSON when requested alongside them.
     /// * `add.partitionValues_parsed` is inserted when parsed partition values is not already
@@ -349,6 +352,23 @@ impl<'a> MetadataPlanner<'a> {
         mut stats: StatsKind,
         has_struct_partitions: bool,
     ) -> KernelResult<(PlanBuilder, StatsKind)> {
+        let plan = if stats == StatsKind::Both {
+            stats = StatsKind::Json;
+            plan.project_patch(|patch| {
+                // Normalize before parsing so existing JSON also controls pruning.
+                let native_json =
+                    Expr::unary(UnaryExpressionOp::TO_JSON, col!(ADD_NAME, STATS_PARSED));
+                patch
+                    .replace_expr_at(
+                        [ADD_NAME],
+                        STATS,
+                        Expr::coalesce([col!(ADD_NAME, STATS), native_json]),
+                    )
+                    .drop_at([ADD_NAME], STATS_PARSED)
+            })?
+        } else {
+            plan
+        };
         let parse_for_filter = self.stats_filter.is_some();
         let should_parse_stats =
             stats == StatsKind::Json && (!self.stats.synthesize_json || parse_for_filter);

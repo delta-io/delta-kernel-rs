@@ -40,13 +40,18 @@ impl CheckpointWriter {
     /// Configures metadata replay using this writer's output representations and schemas.
     fn metadata_planner(&self, actions: ActionSet) -> KernelResult<MetadataPlanner<'_>> {
         let context = &self.schema_context;
-        let config = self.snapshot.table_configuration();
-        let segment = self.snapshot.log_segment();
-        let parsed_partitions = self
+        let write_stats_as_struct = self
             .snapshot
             .table_properties()
-            .checkpoint_write_stats_as_struct
-            .unwrap_or(true);
+            .checkpoint_write_stats_as_struct;
+        if !context.is_v2 && write_stats_as_struct == Some(true) {
+            return Err(KernelError::unsupported(
+                "V1 checkpoint plans require JSON-only statistics",
+            ));
+        }
+        let config = self.snapshot.table_configuration();
+        let segment = self.snapshot.log_segment();
+        let parsed_partitions = write_stats_as_struct.unwrap_or(true);
         let stats = StatsOptions {
             synthesize_json: context.stats_config.write_stats_as_json,
             variant_min_max: true,

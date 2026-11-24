@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use ::test_utils::table_builder::{FeatureSet, LogState, TestTable, TestTableBuilder};
+use ::test_utils::table_builder::{FeatureSet, LogState, TableConfig, TestTable, TestTableBuilder};
 use bytes::Bytes;
 use rstest::rstest;
 use serde_json::{Value, json};
@@ -124,12 +124,18 @@ fn reconciled_rows(writer: &CheckpointWriter, engine: &dyn Engine) -> KernelResu
 #[case::empty("empty", false)]
 #[case::mixed("mixed", false)]
 #[case::predecessor("predecessor", false)]
+#[case::nullable_json_and_native_dv_stats("native_stats", false)]
 #[case::oversized_schema("empty", true)]
-fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
     #[case] state: &str,
     #[case] oversized_schema: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_table, snapshot, engine) = checkpoint_table(state, oversized_schema)?;
+    let (_table, snapshot, engine) = if state == "native_stats" {
+        crate::checkpoint::plan::tests::checkpoint_representation_table(true, false).await?
+    } else {
+        checkpoint_table(state, oversized_schema)?
+    };
     let writer = snapshot.clone().create_checkpoint_writer(&engine)?;
     let log = snapshot.log_segment().log_root.clone();
     let hint_path = log.join("_last_checkpoint")?;
@@ -143,7 +149,14 @@ fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
         .then(|| file_bytes(&engine, &hint_path))
         .transpose()?;
     let expected = reconciled_rows(&writer, &engine)?;
-    assert_eq!(expected.len(), if state == "empty" { 2 } else { 6 });
+    assert_eq!(
+        expected.len(),
+        match state {
+            "empty" => 2,
+            "native_stats" => 5,
+            _ => 6,
+        }
+    );
     let expected_adds = expected
         .iter()
         .filter(|row| row.get("add").is_some())
@@ -234,6 +247,25 @@ fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
     let persisted = reader.build()?.collect::<Result<Vec<_>, _>>()?;
     let actual = canonical_actions(json_rows(&persisted, false)?);
     assert_eq!(actual, expected);
+    if state == "native_stats" {
+        let native = actual
+            .iter()
+            .find(|row| row["add"]["path"] == "native.parquet")
+            .unwrap();
+        let stats: Value = serde_json::from_str(native["add"]["stats"].as_str().unwrap())?;
+        assert_eq!(stats["numRecords"], 10);
+        assert_eq!(native["add"]["deletionVector"]["cardinality"], 1);
+        let original = actual
+            .iter()
+            .find(|row| row["add"]["path"] == "base.parquet")
+            .unwrap();
+        let original_json = original["add"]["stats"].as_str().unwrap();
+        assert!(original_json.starts_with(' '));
+        assert!(original_json.ends_with(' '));
+        let stats: Value = serde_json::from_str(original_json)?;
+        assert_eq!(stats["minValues"]["part_int"], 120);
+        assert_eq!(expected_adds, 3);
+    }
     for row in &actual {
         for name in ["add", "remove"] {
             if let Some(action) = row.get(name) {
@@ -323,7 +355,7 @@ fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
         )?,
         expected
     );
-    if state != "empty" {
+    if matches!(state, "mixed" | "predecessor") {
         assert_eq!(
             reloaded.reader().get_app_id_version("app", &engine)?,
             Some(1)
@@ -336,11 +368,22 @@ fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
     Ok(())
 }
 
-#[test]
-fn checkpoint_rejects_v2_before_engine_access() -> Result<(), Box<dyn std::error::Error>> {
-    let table = TestTableBuilder::new()
-        .with_features(FeatureSet::new().v2_checkpoint())
-        .build()?;
+#[rstest]
+#[case::v2(true, false, "This plan requires a V1 checkpoint writer")]
+#[case::v1_structured_stats(false, true, "V1 checkpoint plans require JSON-only statistics")]
+fn checkpoint_rejects_unsupported_output_before_engine_access(
+    #[case] v2: bool,
+    #[case] structured_stats: bool,
+    #[case] expected_error: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let builder = TestTableBuilder::new()
+        .with_table_config(TableConfig::new().write_stats_as_struct(structured_stats));
+    let table = if v2 {
+        builder.with_features(FeatureSet::new().v2_checkpoint())
+    } else {
+        builder
+    }
+    .build()?;
     let engine = SyncEngine::new_with_store(table.store().clone());
     let snapshot = Snapshot::builder_for(table.table_root()).build(&engine)?;
     let log = snapshot.log_segment().log_root.clone();
@@ -350,8 +393,12 @@ fn checkpoint_rejects_v2_before_engine_access() -> Result<(), Box<dyn std::error
         .collect::<KernelResult<Vec<_>>>()?;
     let writer = snapshot.create_checkpoint_writer(&engine)?;
     ::test_utils::assert_result_error_with_message(
+        writer.declarative_checkpoint_data_plan(&PanicEngine),
+        expected_error,
+    );
+    ::test_utils::assert_result_error_with_message(
         writer.declarative_checkpoint_plan(&PanicEngine),
-        "This plan requires a V1 checkpoint writer",
+        expected_error,
     );
     assert_eq!(
         engine

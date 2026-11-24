@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use ::test_utils::add_commit;
-use ::test_utils::table_builder::{FeatureSet, TableConfig, TestTableBuilder, partitioned_schema};
+use ::test_utils::table_builder::{
+    FeatureSet, TableConfig, TestTable, TestTableBuilder, partitioned_schema,
+};
 use itertools::Itertools as _;
 use rstest::rstest;
 use serde_json::{Value, json};
@@ -17,6 +19,7 @@ use crate::arrow::array::{AsArray as _, StringArray};
 use crate::arrow::compute::{filter_record_batch, is_not_null, is_null, or};
 use crate::arrow::record_batch::RecordBatch;
 use crate::checkpoint::CheckpointSpec;
+use crate::engine::PanicEngine;
 use crate::engine::arrow_conversion::TryFromArrow as _;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use crate::engine::arrow_utils::parse_json_impl;
@@ -24,7 +27,7 @@ use crate::engine::sync::SyncEngine;
 use crate::schema::{StructType, schema};
 use crate::unit_test_utils::copy_test_table;
 use crate::unit_test_utils::plans::{execute_plan as execute, json_rows};
-use crate::{FilteredEngineData, Snapshot};
+use crate::{FilteredEngineData, Snapshot, SnapshotRef};
 
 fn selected_batch(data: FilteredEngineData) -> KernelResult<RecordBatch> {
     data.apply_selection_vector()?.try_into_record_batch()
@@ -167,6 +170,18 @@ fn checkpoint_plan_matches_existing_checkpoint_data(
         .checkpoint_data(engine.as_ref())?
         .map(|data| selected_batch(data?))
         .collect::<KernelResult<Vec<_>>>()?;
+    if writer
+        .snapshot
+        .table_properties()
+        .checkpoint_write_stats_as_struct
+        == Some(true)
+    {
+        ::test_utils::assert_result_error_with_message(
+            writer.declarative_checkpoint_data_plan(&PanicEngine),
+            "V1 checkpoint plans require JSON-only statistics",
+        );
+        return Ok(());
+    }
     for (plan, actions) in checkpoint_plans(&writer, engine.as_ref())? {
         if !actions.contains_content_actions() {
             let sidecars = writer
@@ -339,6 +354,13 @@ async fn checkpoint_plan_reconciles_all_groups_and_retains_after_replay(
     assert_eq!(snapshot.log_segment().checkpoint_version, Some(1));
     let writer = snapshot.create_checkpoint_writer(&engine)?;
     let expected = existing_checkpoint_data(&writer, &engine, 100, txn_cutoff)?;
+    if structured_stats {
+        ::test_utils::assert_result_error_with_message(
+            writer.declarative_checkpoint_data_plan(&PanicEngine),
+            "V1 checkpoint plans require JSON-only statistics",
+        );
+        return Ok(());
+    }
     // Fixed-cutoff checks exercise the shared retention expressions on fully replayed actions.
     // The fixture comparisons above exercise the public factory with real cutoffs.
     let plan = writer
@@ -384,25 +406,23 @@ async fn checkpoint_plan_reconciles_all_groups_and_retains_after_replay(
     Ok(())
 }
 
-#[rstest]
-#[tokio::test]
-async fn checkpoint_uses_declared_metadata_representations(
-    #[values(false, true)] compatible: bool,
-    #[values(false, true)] write_json: bool,
-    #[values(false, true)] write_struct: bool,
-    #[values(false, true)] parsed_partitions: bool,
-) -> KernelResult<(), Box<dyn std::error::Error>> {
+pub(super) async fn checkpoint_representation_table(
+    compatible: bool,
+    write_struct: bool,
+) -> KernelResult<(TestTable, SnapshotRef, SyncEngine), Box<dyn std::error::Error>> {
     let table = TestTableBuilder::new()
+        .with_features(FeatureSet::new().deletion_vectors())
         .with_schema(
             partitioned_schema()
-                .project(&["value", "part_long"])
+                .project(&["value", "part_long", "part_int"])
                 .unwrap(),
         )
         .with_partition_columns(["part_long"])
         .with_table_config(
             TableConfig::new()
                 .write_stats_as_json(true)
-                .write_stats_as_struct(write_struct),
+                .write_stats_as_struct(write_struct)
+                .data_skipping_stats_columns(["value"]),
         )
         .build()
         .unwrap();
@@ -415,13 +435,18 @@ async fn checkpoint_uses_declared_metadata_representations(
     let protocol = json!({"protocol": snapshot.table_configuration().protocol()});
     let writer = snapshot.create_checkpoint_writer(&engine)?;
     let stats = |id: i64| {
-        json!({"numRecords":1,"minValues":{"value":id},
+        json!({"numRecords":10,"minValues":{"value":id},
         "maxValues":{"value":id},"nullCount":{"value":0}})
     };
     let file = |path: &str, id: i64| {
-        let mut row = add(path, None);
+        let mut row = add(path, (path == "native.parquet").then_some(0));
         row["add"]["partitionValues"] = json!({"part_long":id.to_string()});
-        row["add"]["stats"] = json!(stats(id).to_string());
+        let mut json_stats = stats(id);
+        for field in ["minValues", "maxValues"] {
+            json_stats[field]["part_int"] = json!(id + 100);
+        }
+        json_stats["nullCount"]["part_int"] = json!(0);
+        row["add"]["stats"] = json!(format!(" {json_stats} "));
         row
     };
     let available = if compatible {
@@ -437,10 +462,13 @@ async fn checkpoint_uses_declared_metadata_representations(
     for (path, id) in [("native.parquet", 10), ("base.parquet", 20)] {
         let mut row = file(path, id);
         row["add"]["stats_parsed"] = if compatible {
-            stats(id)
+            stats(if path == "base.parquet" { 200 } else { id })
         } else {
             json!({"minValues":{"value":"incompatible"}})
         };
+        if compatible && path == "native.parquet" {
+            row["add"]["stats"] = Value::Null;
+        }
         row["add"]["partitionValues_parsed"] = if compatible {
             json!({"part_long":id})
         } else {
@@ -466,6 +494,20 @@ async fn checkpoint_uses_declared_metadata_representations(
     let snapshot = Snapshot::builder_for(table.table_root())
         .build(&engine)
         .unwrap();
+    assert_eq!(snapshot.log_segment().checkpoint_version, Some(0));
+    Ok((table, snapshot, engine))
+}
+
+#[rstest]
+#[tokio::test]
+async fn checkpoint_uses_declared_metadata_representations(
+    #[values(false, true)] compatible: bool,
+    #[values(false, true)] write_json: bool,
+    #[values(false, true)] write_struct: bool,
+    #[values(false, true)] parsed_partitions: bool,
+) -> KernelResult<(), Box<dyn std::error::Error>> {
+    let (_table, snapshot, engine) =
+        checkpoint_representation_table(compatible, write_struct).await?;
     let mut writer = snapshot.clone().create_checkpoint_writer(&engine)?;
     let shape = snapshot.checkpoint_info(&engine)?;
     let mut stats = if write_struct {
@@ -475,7 +517,7 @@ async fn checkpoint_uses_declared_metadata_representations(
     };
     stats.synthesize_json = write_json;
     let context = &writer.schema_context;
-    let state = MetadataPlanner::new(snapshot.log_segment(), ActionSet::ALL, false)
+    let planner = MetadataPlanner::new(snapshot.log_segment(), ActionSet::ALL, false)
         .with_checkpoint_shape(shape)
         .with_stats(stats)
         .with_stats_schemas(
@@ -491,9 +533,8 @@ async fn checkpoint_uses_declared_metadata_representations(
                 .partition_schema
                 .clone()
                 .filter(|_| parsed_partitions),
-        )
-        .replay()?;
-    let plan = state.build()?;
+        );
+    let plan = planner.replay()?.build()?;
     for row in json_rows(&execute(&engine, plan)?, true)? {
         let expected_version = i64::from(row["add"]["path"] == "tail.parquet");
         assert_eq!(row[VERSION], expected_version);
@@ -514,31 +555,90 @@ async fn checkpoint_uses_declared_metadata_representations(
         );
         if write_json {
             let stats: Value = serde_json::from_str(row["add"]["stats"].as_str().unwrap())?;
+            assert_eq!(stats["numRecords"], 10);
             assert_eq!(stats["minValues"]["value"], id);
+            if row["add"]["path"] != "native.parquet" || !compatible {
+                assert_eq!(stats["minValues"]["part_int"], id + 100);
+                assert!(row["add"]["stats"].as_str().unwrap().starts_with(' '));
+                assert!(row["add"]["stats"].as_str().unwrap().ends_with(' '));
+            }
         }
         if write_struct {
-            assert_eq!(row["add"]["stats_parsed"]["minValues"]["value"], id);
+            assert_eq!(row["add"]["stats_parsed"]["numRecords"], 10);
+            let expected = if compatible && !write_json && id == 20 {
+                200
+            } else {
+                id
+            };
+            assert_eq!(row["add"]["stats_parsed"]["minValues"]["value"], expected);
+        }
+        if row["add"]["path"] == "native.parquet" {
+            assert_eq!(row["add"]["deletionVector"]["cardinality"], 1);
         }
         if parsed_partitions {
             assert_eq!(row["add"]["partitionValues_parsed"]["part_long"], id);
         }
     }
+    if compatible && write_json {
+        let plan = planner
+            .with_stats_filter(Some(
+                col!("add.stats_parsed.minValues.value").lt(lit(25i32)),
+            ))
+            .replay()?
+            .build()?;
+        let rows = json_rows(&execute(&engine, plan)?, true)?;
+        assert_eq!(
+            rows.iter()
+                .filter_map(|row| row["add"]["path"].as_str())
+                .sorted()
+                .collect::<Vec<_>>(),
+            ["base.parquet", "native.parquet"],
+        );
+        if write_struct {
+            let base = rows
+                .iter()
+                .find(|row| row["add"]["path"] == "base.parquet")
+                .unwrap();
+            assert_eq!(base["add"]["stats_parsed"]["minValues"]["value"], 20);
+        }
+    }
     writer.schema_context.stats_config.write_stats_as_json = write_json;
     writer.schema_context.stats_config.write_stats_as_struct = write_struct;
+    let expected = compatible
+        .then(|| {
+            writer
+                .checkpoint_data(&engine)?
+                .map(|data| selected_batch(data?))
+                .collect::<KernelResult<Vec<_>>>()
+        })
+        .transpose()?;
+    if let Some(expected) = &expected {
+        for row in json_rows(expected, true)? {
+            if row["add"].is_null() {
+                continue;
+            }
+            assert_eq!(row["add"].get("stats").is_some(), write_json);
+            assert_eq!(row["add"].get("stats_parsed").is_some(), write_struct);
+            if write_struct {
+                assert_eq!(row["add"]["stats_parsed"]["numRecords"], 10);
+            }
+        }
+    }
+    if write_struct {
+        ::test_utils::assert_result_error_with_message(
+            writer.declarative_checkpoint_data_plan(&PanicEngine),
+            "V1 checkpoint plans require JSON-only statistics",
+        );
+        return Ok(());
+    }
     let plan = writer.declarative_checkpoint_data_plan(&engine)?;
     let actual = execute(&engine, plan)?;
-    if compatible {
-        let expected = writer
-            .checkpoint_data(&engine)?
-            .map(|data| selected_batch(data?))
-            .collect::<KernelResult<Vec<_>>>()?;
-        assert_eq!(
-            json_rows(&actual, true)?,
-            json_rows(
-                &checkpoint_reference_batches(&engine, &expected, ActionSet::ALL)?,
-                true
-            )?
-        );
+    if let Some(expected) = expected {
+        let expected = checkpoint_reference_batches(&engine, &expected, ActionSet::ALL)?;
+        let formatted = crate::arrow::util::pretty::pretty_format_batches(&expected)?.to_string();
+        let mut lines = formatted.lines().collect::<Vec<_>>();
+        ::test_utils::sort_lines!(lines);
+        ::test_utils::assert_batches_sorted_eq!(lines, &actual);
     }
     let actual_rows = json_rows(&actual, true)?;
     for (path, id) in [
@@ -551,11 +651,7 @@ async fn checkpoint_uses_declared_metadata_representations(
             .find(|row| row["add"]["path"] == path)
             .unwrap();
         assert!(row["add"].get("stats_parsed").is_none());
-        if write_struct {
-            assert_eq!(row["add"]["partitionValues_parsed"]["part_long"], id);
-        } else {
-            assert!(row["add"].get("partitionValues_parsed").is_none());
-        }
+        assert!(row["add"].get("partitionValues_parsed").is_none());
         if write_json {
             let stats: Value = serde_json::from_str(row["add"]["stats"].as_str().unwrap())?;
             assert_eq!(stats["minValues"]["value"], id);
