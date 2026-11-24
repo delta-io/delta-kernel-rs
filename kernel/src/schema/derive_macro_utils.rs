@@ -203,33 +203,48 @@ impl<T: ToNullableContainerType> GetNullableContainerStructField for Option<T> {
 /// not allocate or maintain path state.
 #[internal_api]
 pub(crate) struct StructDataFields {
-    expected: SchemaRef,
+    expected: &'static SchemaRef,
     actual: SchemaRef,
     values: Vec<Option<Scalar>>,
 }
 
 impl StructDataFields {
-    /// Creates a field decoder after requiring exactly one non-null value in the row.
+    /// Consumes a variant row, returning its sole non-null field and value.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-    pub(crate) fn try_new_variant(data: StructData, expected: SchemaRef) -> KernelResult<Self> {
-        let count = data
-            .values()
-            .iter()
-            .filter(|value| !value.is_null())
-            .count();
-        require!(
-            count == 1,
-            KernelError::invalid_struct_data(format!(
-                "Expected exactly one non-null variant, found {count}",
-            ))
-        );
-        Self::try_new(data, expected)
+    pub(crate) fn take_variant(&mut self) -> KernelResult<(&'static str, Scalar)> {
+        let mut names = self
+            .actual
+            .fields()
+            .zip(&self.values)
+            .filter(|(_, value)| value.as_ref().is_some_and(|value| !value.is_null()))
+            .map(|(field, _)| field.name());
+        let name = match (names.next(), names.next()) {
+            (Some(name), None) => name,
+            (first, second) => {
+                let expected: Vec<_> = self.expected.fields().map(StructField::name).collect();
+                let actual: Vec<_> = first.into_iter().chain(second).chain(names).collect();
+                return Err(KernelError::invalid_struct_data(format!(
+                    "Expected exactly one non-null variant among {expected:?}; found {actual:?}",
+                )));
+            }
+        };
+        drop(names);
+        let name = self
+            .expected
+            .field(name)
+            .ok_or_else(|| KernelError::scalar_conversion("known variant field", name))?
+            .name()
+            .as_str();
+        for field in self.expected.fields().filter(|field| field.name() != name) {
+            self.take_field::<Scalar>(field.name())?;
+        }
+        Ok((name, self.take_field(name)?))
     }
 
     /// Creates a field decoder after checking that the value count matches both schemas.
     #[internal_api]
-    pub(crate) fn try_new(data: StructData, expected: SchemaRef) -> KernelResult<Self> {
+    pub(crate) fn try_new(data: StructData, expected: &'static SchemaRef) -> KernelResult<Self> {
         let (actual, values) = data.into_parts();
         require!(
             actual.num_fields() == values.len(),

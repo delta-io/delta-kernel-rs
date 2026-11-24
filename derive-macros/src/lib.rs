@@ -499,12 +499,10 @@ pub fn into_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
         }
     });
 
-    struct_data_encoder(
-        struct_name,
-        quote! { #(#field_types: Into<delta_kernel::expressions::Scalar>,)* },
-        quote! { vec![ #(#field_values),* ] },
-    )
-    .into()
+    let bounds = quote! { #(#field_types: Into<delta_kernel::expressions::Scalar>,)* };
+    let values = quote! { vec![ #(#field_values),* ] };
+    let output = struct_data_encoder(struct_name, bounds, values);
+    output.into()
 }
 
 fn struct_data_encoder(
@@ -565,10 +563,9 @@ pub fn try_from_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro
 
 fn try_from_struct_data_impl(input: &DeriveInput) -> Result<TokenStream, Error> {
     if matches!(input.data, Data::Enum(_)) {
-        return Ok(enum_derives::try_from_struct_data(
-            &input.ident,
-            &enum_derives::variants(input)?,
-        ));
+        let variants = enum_derives::variants(input)?;
+        let output = enum_derives::try_from_struct_data(&input.ident, &variants);
+        return Ok(output);
     }
     let struct_name = &input.ident;
     let fields = try_from_struct_data_fields(&input.data, "TryFromStructData", struct_name.span())?;
@@ -585,14 +582,11 @@ fn try_from_struct_data_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
             )
         })?;
 
-    Ok(struct_data_decoder(
-        struct_name,
-        field_types,
-        quote! { try_new },
-        quote! { Self {
-            #(#field_idents: fields.take_field(stringify!(#schema_field_names))?,)*
-        } },
-    ))
+    let result = quote! { Self {
+        #(#field_idents: fields.take_field(stringify!(#schema_field_names))?,)*
+    } };
+    let output = struct_data_decoder(struct_name, field_types, result);
+    Ok(output)
 }
 
 /// Derives collection of mixed rows into a struct with named payload fields.
@@ -637,7 +631,7 @@ fn try_from_struct_rows_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
     let row_name = format_ident!("__{}Row", name);
     let indices: Vec<_> = (0..fields.len()).map(syn::Index::from).collect();
     let where_clause = &input.generics.where_clause;
-    Ok(quote! {
+    let output = quote! {
         const _: () = {
             #[doc(hidden)]
             #[allow(dead_code)]
@@ -664,18 +658,17 @@ fn try_from_struct_rows_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
                     state: &mut Self::State,
                     row: delta_kernel::expressions::StructData,
                 ) -> delta_kernel::KernelResult<()> {
-                    let mut fields = delta_kernel::schema::derive_macro_utils::StructDataFields::try_new_variant(
+                    let mut fields = delta_kernel::schema::derive_macro_utils::StructDataFields::try_new(
                         row,
-                        <Self::Row as delta_kernel::schema::ToSchema>::schema_ref().clone(),
+                        <Self::Row as delta_kernel::schema::ToSchema>::schema_ref(),
                     )?;
-                    #(
-                        let value: delta_kernel::expressions::Scalar = fields.take_field(stringify!(#names))?;
-                        if !value.is_null() {
-                            <#types as delta_kernel::expressions::TryFromStructRows>::push(
-                                &mut state.#indices, value.try_into()?,
-                            ).map_err(|error| delta_kernel::error::add_scalar_path_context(error, stringify!(#names)))?;
-                        }
-                    )*
+                    let (name, value) = fields.take_variant()?;
+                    match name {
+                        #(stringify!(#names) => <#types as delta_kernel::expressions::TryFromStructRows>::push(
+                            &mut state.#indices, value.try_into()?,
+                        ),)*
+                        _ => Err(delta_kernel::KernelError::internal_error("Unknown variant field")),
+                    }.map_err(|error| delta_kernel::error::add_scalar_path_context(error, name))?;
                     fields.finish()
                 }
 
@@ -688,13 +681,13 @@ fn try_from_struct_rows_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
                 }
             }
         };
-    })
+    };
+    Ok(output)
 }
 
 fn struct_data_decoder(
     struct_name: &Ident,
     field_types: impl IntoIterator<Item = impl quote::ToTokens>,
-    constructor: TokenStream,
     result: TokenStream,
 ) -> TokenStream {
     let field_types = field_types.into_iter();
@@ -712,9 +705,9 @@ fn struct_data_decoder(
                 value: delta_kernel::expressions::StructData,
             ) -> delta_kernel::KernelResult<Self> {
                 let mut fields =
-                    delta_kernel::schema::derive_macro_utils::StructDataFields::#constructor(
+                    delta_kernel::schema::derive_macro_utils::StructDataFields::try_new(
                         value,
-                        <#struct_name as delta_kernel::schema::ToSchema>::schema_ref().clone(),
+                        <#struct_name as delta_kernel::schema::ToSchema>::schema_ref(),
                     )?;
                 let result = #result;
                 fields.finish()?;

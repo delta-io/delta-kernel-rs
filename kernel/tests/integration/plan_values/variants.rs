@@ -10,7 +10,7 @@ use delta_kernel::expressions::{Scalar, StructData, TryFromStructRows};
 use delta_kernel::schema::{SchemaRef, ToSchema, schema};
 use delta_kernel::{KernelError, KernelResult};
 use rstest::rstest;
-use test_utils::IntoArray;
+use test_utils::{IntoArray, assert_result_error_with_message};
 
 use super::nested::{EmptyRow, nested_array};
 use super::{CustomRow, data, execute_result, optional, singleton};
@@ -255,12 +255,18 @@ fn variant_collection_errors_follow_consumption_order<T: Debug>(
     vec![Scalar::from(Add { id: 1 }), Scalar::from(Remove { id: 2 })])]
 #[case::nullable_payloads(NullableAction::schema_ref().clone(), NullableAction::try_from,
     vec![Scalar::from(NullableRow { id: None }), Scalar::from(EmptyRow {})])]
-fn named_enum_decoder_rejects_neither_and_both_variants<T: Debug>(
+#[case::named_collection(Action::schema_ref().clone(), |row| RequiredActions::collect_into([Ok(row)]),
+    vec![Scalar::from(Add { id: 1 }), Scalar::from(Remove { id: 2 })])]
+fn variant_decoders_report_neither_and_both_fields<T: Debug>(
     #[case] schema: SchemaRef,
     #[case] decode: fn(StructData) -> KernelResult<T>,
     #[case] payloads: Vec<Scalar>,
     #[values(false, true)] both: bool,
 ) -> KernelResult<()> {
+    let expected: Vec<_> = schema.fields().map(|field| field.name().as_str()).collect();
+    let actual = if both { expected.clone() } else { vec![] };
+    let message =
+        format!("Expected exactly one non-null variant among {expected:?}; found {actual:?}");
     let values = if both {
         payloads
     } else {
@@ -270,12 +276,7 @@ fn named_enum_decoder_rejects_neither_and_both_variants<T: Debug>(
             .collect()
     };
     let row = StructData::try_new(schema, values)?;
-    let error = decode(row).unwrap_err();
-    assert!(matches!(
-        error.without_backtrace(),
-        KernelError::InvalidStructData(message)
-            if message.contains("Expected exactly one non-null variant")
-    ));
+    assert_result_error_with_message(decode(row), &message);
     Ok(())
 }
 

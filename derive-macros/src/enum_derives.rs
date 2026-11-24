@@ -76,40 +76,40 @@ pub(super) fn into_struct_data(input: &DeriveInput) -> Result<TokenStream, Error
         quote! { #struct_name::#ident(value) => values[#index] =
         delta_kernel::expressions::Scalar::Struct(value.into()), }
     });
-    Ok(super::struct_data_encoder(
-        struct_name,
-        quote! { #(#payloads: Into<delta_kernel::expressions::StructData>,)* },
-        quote! {{
-            let mut values: ::std::vec::Vec<_> = schema.fields().map(|field|
+    let bounds = quote! { #(#payloads: Into<delta_kernel::expressions::StructData>,)* };
+    let values = quote! {{
+        let mut values: ::std::vec::Vec<_> = schema
+            .fields()
+            .map(|field| {
                 delta_kernel::expressions::Scalar::Null(field.data_type().clone())
-            ).collect();
-            match value { #(#arms)* }
-            values
-        }},
-    ))
+            })
+            .collect();
+        match value { #(#arms)* }
+        values
+    }};
+    let output = super::struct_data_encoder(struct_name, bounds, values);
+    Ok(output)
 }
 
 pub(super) fn try_from_struct_data(struct_name: &Ident, variants: &[Variant<'_>]) -> TokenStream {
-    let conversions = variants.iter().map(|variant| {
+    let arms = variants.iter().map(|variant| {
         let ident = variant.ident;
         let field_name = &variant.name;
         let payload = variant.payload;
         quote! {
-            .or(fields.take_field::<Option<#payload>>(#field_name)?.map(Self::#ident))
+            #field_name => <#payload as TryFrom<delta_kernel::expressions::Scalar>>::try_from(value)
+                .map(Self::#ident),
         }
     });
-    super::struct_data_decoder(
-        struct_name,
-        variants.iter().map(|v| v.payload),
-        quote! { try_new_variant },
-        quote! {
-            None #(#conversions)* .ok_or_else(||
-                delta_kernel::KernelError::invalid_struct_data(
-                    "Expected exactly one non-null variant, found 0",
-                )
-            )?
-        },
-    )
+    let payloads = variants.iter().map(|v| v.payload);
+    let result = quote! {{
+        let (name, value) = fields.take_variant()?;
+        match name {
+            #(#arms)*
+            _ => Err(delta_kernel::KernelError::internal_error("Unknown variant field")),
+        }.map_err(|error| delta_kernel::error::add_scalar_path_context(error, name))?
+    }};
+    super::struct_data_decoder(struct_name, payloads, result)
 }
 
 fn schema_name(ident: &Ident, attributes: &[Attribute]) -> Result<LitStr, Error> {
@@ -131,16 +131,17 @@ fn schema_name(ident: &Ident, attributes: &[Attribute]) -> Result<LitStr, Error>
             ));
         }
     }
-    Ok(name.unwrap_or_else(|| {
-        let ident = ident.unraw();
-        let camel = super::get_schema_name(&ident).to_string();
-        let mut characters = camel.chars();
-        let lower_camel = characters
-            .next()
-            .map(|c| c.to_lowercase().collect::<String>() + characters.as_str())
-            .unwrap_or_default();
-        LitStr::new(&lower_camel, ident.span())
-    }))
+    if let Some(name) = name {
+        return Ok(name);
+    }
+    let ident = ident.unraw();
+    let camel = super::get_schema_name(&ident).to_string();
+    let mut characters = camel.chars();
+    let lower_camel = characters
+        .next()
+        .map(|c| c.to_lowercase().collect::<String>() + characters.as_str())
+        .unwrap_or_default();
+    Ok(LitStr::new(&lower_camel, ident.span()))
 }
 
 #[cfg(test)]
