@@ -22,7 +22,11 @@ use crate::committer::FileSystemCommitter;
 use crate::crc::{Crc, FileStats, FileStatsState};
 #[cfg(feature = "declarative-plans")]
 use crate::engine::DelegatingEngine;
+#[cfg(feature = "declarative-plans")]
+use crate::engine::plans::PlanBasedEngine;
 use crate::engine::sync::SyncEngine;
+#[cfg(feature = "declarative-plans")]
+use crate::engine::sync::plan::SyncPlanExecutor;
 #[cfg(feature = "declarative-plans")]
 use crate::expressions::Scalar;
 use crate::object_store::ObjectStoreExt as _;
@@ -30,7 +34,7 @@ use crate::object_store::memory::InMemory;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::Operator;
 #[cfg(feature = "declarative-plans")]
-use crate::plans::{Operation, PlanExecutor, PlanResult};
+use crate::plans::{Operation, PlanExecutor, PlanExecutorCapabilities, PlanResult};
 use crate::schema::SchemaRef;
 use crate::table_features::TableFeature;
 use crate::transaction::UpdateTableOperation;
@@ -38,6 +42,8 @@ use crate::unit_test_utils::adaptive_metadata_fixtures::{
     checkpoint_line, commit_info_line, last_manifest_commit_info, pointer,
     protocol_and_metadata_lines, txn_line,
 };
+#[cfg(feature = "declarative-plans")]
+use crate::unit_test_utils::plans::IOOnlyPlanExecutor;
 use crate::unit_test_utils::{
     adaptive_metadata_table_configuration, parse_json_batch, test_schema_flat_with_column_mapping,
 };
@@ -292,6 +298,14 @@ fn non_plan_engine(store: Arc<InMemory>) -> impl Engine {
     engine
 }
 
+#[cfg(feature = "declarative-plans")]
+fn io_only_engine(store: Arc<InMemory>) -> PlanBasedEngine {
+    PlanBasedEngine::new(
+        None,
+        Arc::new(IOOnlyPlanExecutor(SyncPlanExecutor::new(Some(store)))),
+    )
+}
+
 // SyncEngine with its plan executor, so replay takes the plan path.
 #[cfg(feature = "declarative-plans")]
 fn plan_engine(store: Arc<InMemory>) -> impl Engine {
@@ -312,6 +326,8 @@ macro_rules! on_both_paths {
 #[tokio::test]
 async fn test_load_resolves_pm_from_manifest_commit_checkpoint_action() {
     on_both_paths!(check_manifest_commit_checkpoint());
+    #[cfg(feature = "declarative-plans")]
+    check_manifest_commit_checkpoint(io_only_engine).await;
 }
 
 // A single commit whose only P&M is a checkpoint action. The build succeeds only if P&M came from
@@ -1006,7 +1022,29 @@ struct RecordingPlanExecutor {
 }
 
 #[cfg(feature = "declarative-plans")]
+#[rstest]
+#[case::full(Arc::new(SyncPlanExecutor::default()), PlanExecutorCapabilities::Full)]
+#[case::io_only(
+    Arc::new(IOOnlyPlanExecutor(SyncPlanExecutor::default())),
+    PlanExecutorCapabilities::IoOnly
+)]
+fn recording_executor_preserves_capabilities(
+    #[case] inner: Arc<dyn PlanExecutor>,
+    #[case] expected: PlanExecutorCapabilities,
+) {
+    let executor = RecordingPlanExecutor {
+        inner,
+        plans: Arc::default(),
+    };
+    assert_eq!(executor.capabilities(), expected);
+}
+
+#[cfg(feature = "declarative-plans")]
 impl PlanExecutor for RecordingPlanExecutor {
+    fn capabilities(&self) -> PlanExecutorCapabilities {
+        self.inner.capabilities()
+    }
+
     fn execute_op(&self, op: Operation) -> KernelResult<PlanResult> {
         if let Operation::QueryPlan(plan) = &op {
             let versions = plan
@@ -1074,6 +1112,8 @@ async fn check_standalone_checkpoint_above_pointed_commit<E: Engine>(
 #[tokio::test]
 async fn segment_ending_on_checkpoint_ignores_its_checkpoint_action_rows() {
     on_both_paths!(check_segment_ending_on_checkpoint());
+    #[cfg(feature = "declarative-plans")]
+    check_segment_ending_on_checkpoint(io_only_engine).await;
 }
 
 async fn check_segment_ending_on_checkpoint<E: Engine>(
@@ -1122,6 +1162,8 @@ async fn incremental_update_resolves_latest_checkpoint_action(
         &new_commit,
         expected_version
     ));
+    #[cfg(feature = "declarative-plans")]
+    assert_incremental_update_action(&new_commit, expected_version, io_only_engine).await;
 }
 
 async fn assert_incremental_update_action<E: Engine>(

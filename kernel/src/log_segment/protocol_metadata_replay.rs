@@ -41,7 +41,7 @@ use crate::plans::ir::nodes::FileType;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::plan::Plan;
 #[cfg(feature = "declarative-plans")]
-use crate::plans::{Operation, PlanBuilder, PlanExecutor};
+use crate::plans::{Operation, PlanBuilder, PlanExecutor, PlanExecutorCapabilities};
 #[cfg(feature = "declarative-plans")]
 use crate::schema::SchemaRef;
 use crate::schema::{
@@ -363,7 +363,14 @@ impl LogSegment {
         let checkpoint = self
             .create_checkpoint_stream(engine, checkpoint_schema, checkpoint_predicate, None, None)?
             .actions;
-        let batches = commits.chain(checkpoint);
+        let batches = commits
+            .chain(checkpoint)
+            // An empty batch has no file path from which to derive a commit version.
+            // TODO(#4101): Handle empty batch of EngineData in kernel-rs, then remove this filter.
+            .filter(|batch| match batch {
+                Ok(batch) => !batch.actions.is_empty(),
+                Err(_) => true,
+            });
         Ok(batches.map(move |batch| {
             let batch = batch?;
             // A log file's versions are parsed from its `_file`; a checkpoint batch uses the
@@ -431,11 +438,13 @@ enum PmReader {
 }
 
 impl PmReader {
-    /// Returns a plan reader when `engine` has a plan executor, otherwise a file reader.
+    /// Returns a plan reader for a fully capable executor, otherwise a file reader.
     #[cfg_attr(not(feature = "declarative-plans"), allow(unused_variables))]
     fn for_engine(engine: &dyn Engine) -> Self {
         #[cfg(feature = "declarative-plans")]
-        if let Some(executor) = engine.plan_executor() {
+        if let Some(executor) = engine.plan_executor()
+            && executor.capabilities() == PlanExecutorCapabilities::Full
+        {
             return Self::Plan(executor);
         }
         Self::Files
@@ -1380,6 +1389,60 @@ mod tests {
             result.is_err(),
             "plan failure must surface, not fall back to legacy replay"
         );
+    }
+
+    mod empty_batches {
+        use std::sync::Arc;
+
+        use rstest::rstest;
+        use test_utils::assert_result_error_with_message;
+
+        use crate::arrow::record_batch::RecordBatch;
+        use crate::engine::arrow_conversion::TryIntoArrow as _;
+        use crate::engine::arrow_data::ArrowEngineData;
+        use crate::unit_test_utils::load_test_table;
+        use crate::unit_test_utils::recording_reads::RecordingReads;
+        use crate::{EngineData, KernelError};
+
+        #[rstest]
+        #[case::before_actions(false)]
+        #[case::before_error(true)]
+        fn imperative_pm_handles_empty_batches(#[case] inject_error: bool) {
+            let (inner, expected, _tempdir) = load_test_table("app-txn-no-checkpoint").unwrap();
+            let mut reads = RecordingReads::new(None);
+            let config = Arc::get_mut(&mut reads).unwrap();
+            config.inner = inner;
+            config.expected_token = None;
+            config.transform_json_batches = Some(Box::new(move |schema, batches| {
+                let empty: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+                    RecordBatch::new_empty(Arc::new(schema.as_ref().try_into_arrow()?)),
+                ));
+                let error =
+                    inject_error.then(|| Err(KernelError::generic("injected JSON read error")));
+                Ok(Box::new(
+                    std::iter::once(Ok(empty)).chain(error).chain(batches),
+                ))
+            }));
+            let engine = reads.engine();
+
+            let result = expected
+                .log_segment()
+                .read_protocol_metadata_opt(&engine, None);
+
+            if inject_error {
+                assert_result_error_with_message(result, "injected JSON read error");
+            } else {
+                let actual = result.unwrap();
+                assert_eq!(
+                    actual.protocol.as_ref(),
+                    Some(expected.table_configuration().protocol())
+                );
+                assert_eq!(
+                    actual.metadata.as_ref(),
+                    Some(expected.table_configuration().metadata())
+                );
+            }
+        }
     }
 
     // `rstest` cases glob-import their parent module, where `test_log::test` would shadow `test`.

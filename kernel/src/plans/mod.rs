@@ -92,6 +92,21 @@ use crate::{
     ParquetFooter, RowVisitor as _,
 };
 
+/// Execution capabilities declared by a [`PlanExecutor`].
+///
+/// Kernel uses this declaration to select between declarative and imperative execution. It does
+/// not restrict handler I/O or explicitly requested plan execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanExecutorCapabilities {
+    /// Supports I/O operations and general relational plans.
+    Full,
+    /// Supports I/O operations and file-scan plans.
+    ///
+    /// This includes single-node JSON and Parquet scans and empty [`ir::nodes::Values`] plans
+    /// produced for empty reads.
+    IoOnly,
+}
+
 /// Provides the ability to execute declarative plans to the Delta Kernel.
 ///
 /// This gives the kernel the ability to execute data-intensive operations by constructing a
@@ -99,6 +114,14 @@ use crate::{
 pub trait PlanExecutor: AsAny {
     /// Executes the given declarative plan and returns the result.
     fn execute_op(&self, op: Operation) -> KernelResult<PlanResult>;
+
+    /// Returns the executor's declared capabilities.
+    ///
+    /// Defaults to [`PlanExecutorCapabilities::Full`]. The returned value must remain constant
+    /// throughout the executor's lifetime.
+    fn capabilities(&self) -> PlanExecutorCapabilities {
+        PlanExecutorCapabilities::Full
+    }
 
     /// Reads a parquet file's footer (schema and, in future, row-group stats) via a
     /// [`IoOperation::ParquetFooter`] op.

@@ -2,6 +2,7 @@
 //! execution to happen outside of Rust).
 use std::sync::Arc;
 
+use delta_kernel::plans::PlanExecutorCapabilities;
 use delta_kernel::plans::proto::schema as proto_schema;
 use delta_kernel::schema::StructType;
 use delta_kernel::{KernelError, KernelResult, Operation, ParquetFooter, PlanExecutor, PlanResult};
@@ -35,11 +36,12 @@ pub type CExecuteOpFn = extern "C" fn(
 
 /// A [`PlanExecutor`] implementation that forwards each [`Operation`] to a C callback.
 ///
-/// Constructed and managed via [`get_plan_executor`](super::get_plan_executor) and
-/// [`free_plan_executor`](super::free_plan_executor).
+/// Constructed via [`get_plan_executor`](super::get_plan_executor), and released via
+/// [`free_plan_executor`](super::free_plan_executor) when not consumed by an engine.
 pub struct FfiPlanExecutor {
     context: NullableCvoid,
     callback: CExecuteOpFn,
+    capabilities: PlanExecutorCapabilities,
 }
 
 impl FfiPlanExecutor {
@@ -47,8 +49,16 @@ impl FfiPlanExecutor {
     ///
     /// The `context` pointer and `callback` must satisfy the thread-safety and lifetime
     /// requirements documented on [`get_plan_executor`](super::get_plan_executor).
-    pub(crate) fn new(context: NullableCvoid, callback: CExecuteOpFn) -> Self {
-        Self { context, callback }
+    pub(crate) fn new(
+        context: NullableCvoid,
+        callback: CExecuteOpFn,
+        capabilities: PlanExecutorCapabilities,
+    ) -> Self {
+        Self {
+            context,
+            callback,
+            capabilities,
+        }
     }
 }
 
@@ -57,6 +67,10 @@ unsafe impl Send for FfiPlanExecutor {}
 unsafe impl Sync for FfiPlanExecutor {}
 
 impl PlanExecutor for FfiPlanExecutor {
+    fn capabilities(&self) -> PlanExecutorCapabilities {
+        self.capabilities
+    }
+
     fn execute_op(&self, op: Operation) -> KernelResult<PlanResult> {
         let plan_proto_bytes = op.to_proto_bytes();
         let plan_proto_slice = kernel_bytes_slice!(plan_proto_bytes);
@@ -116,9 +130,9 @@ mod tests {
     use super::*;
     use crate::error::{EngineExecError, FFIKernelError};
     use crate::handle::Handle;
-    use crate::plans::get_plan_executor;
     use crate::plans::iter::{CBytesIterator, CEngineDataIterator, CFileMetaIterator};
     use crate::plans::result::CParquetFooter;
+    use crate::plans::{FfiPlanExecutorCapabilities, get_plan_executor};
     use crate::{
         ExclusiveEngineData, ExclusiveRustString, OptionalValue, allocate_kernel_bytes,
         kernel_bytes_slice,
@@ -147,7 +161,9 @@ mod tests {
     fn try_execute_dummy_op(expected_plan_result: CPlanResult) -> KernelResult<PlanResult> {
         let cell: Mutex<Option<CPlanResult>> = Mutex::new(Some(expected_plan_result));
         let context = Some(NonNull::from_ref(&cell).cast());
-        let executor = unsafe { get_plan_executor(context, mock_execute_op) };
+        let executor = unsafe {
+            get_plan_executor(context, mock_execute_op, FfiPlanExecutorCapabilities::Full)
+        };
         let plan_executor: Arc<dyn PlanExecutor> = unsafe { executor.into_inner() };
 
         // Construct a dummy op because we don't actually care about the plan bytes here.
@@ -188,7 +204,8 @@ mod tests {
             unsafe { out.write(EngineExecResult::Failure(err)) };
         }
 
-        let executor = unsafe { get_plan_executor(None, fail_execute_op) };
+        let executor =
+            unsafe { get_plan_executor(None, fail_execute_op, FfiPlanExecutorCapabilities::Full) };
         let plan_executor: Arc<dyn PlanExecutor> = unsafe { executor.into_inner() };
 
         let url = Url::parse("memory:///table/").unwrap();
@@ -213,7 +230,8 @@ mod tests {
         ) {
         }
 
-        let executor = unsafe { get_plan_executor(None, noop_execute_op) };
+        let executor =
+            unsafe { get_plan_executor(None, noop_execute_op, FfiPlanExecutorCapabilities::Full) };
         let plan_executor: Arc<dyn PlanExecutor> = unsafe { executor.into_inner() };
 
         let url = Url::parse("memory:///table/").unwrap();
@@ -341,7 +359,8 @@ mod tests {
             unsafe { out.write(EngineExecResult::Success(CPlanResult::Unit)) };
         }
 
-        let executor = unsafe { get_plan_executor(None, validate_op) };
+        let executor =
+            unsafe { get_plan_executor(None, validate_op, FfiPlanExecutorCapabilities::Full) };
         let plan_executor: Arc<dyn PlanExecutor> = unsafe { executor.into_inner() };
 
         let url = Url::parse("memory:///table/").unwrap();
