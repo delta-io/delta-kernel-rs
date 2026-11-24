@@ -197,20 +197,6 @@ impl<T: ToNullableContainerType> GetNullableContainerStructField for Option<T> {
     }
 }
 
-/// Requires exactly one non-null payload in a mixed row.
-#[allow(unused)]
-#[internal_api]
-pub(crate) fn validate_variant(values: &[Scalar]) -> KernelResult<()> {
-    let count = values.iter().filter(|value| !value.is_null()).count();
-    require!(
-        count == 1,
-        KernelError::invalid_struct_data(format!(
-            "Expected exactly one non-null variant, found {count}",
-        ))
-    );
-    Ok(())
-}
-
 /// Named fields consumed by the [`delta_kernel_derive::TryFromStructData`] macro.
 ///
 /// Field conversion errors acquire their path element as they unwind. Successful conversion does
@@ -223,6 +209,24 @@ pub(crate) struct StructDataFields {
 }
 
 impl StructDataFields {
+    /// Creates a field decoder after requiring exactly one non-null value in the row.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn try_new_variant(data: StructData, expected: SchemaRef) -> KernelResult<Self> {
+        let count = data
+            .values()
+            .iter()
+            .filter(|value| !value.is_null())
+            .count();
+        require!(
+            count == 1,
+            KernelError::invalid_struct_data(format!(
+                "Expected exactly one non-null variant, found {count}",
+            ))
+        );
+        Self::try_new(data, expected)
+    }
+
     /// Creates a field decoder after checking that the value count matches both schemas.
     #[internal_api]
     pub(crate) fn try_new(data: StructData, expected: SchemaRef) -> KernelResult<Self> {
@@ -250,10 +254,11 @@ impl StructDataFields {
 
     /// Consumes the named field, checks its schema nullability, and decodes its value.
     #[internal_api]
-    pub(crate) fn take_field<T: TryFrom<Scalar, Error = KernelError>>(
-        &mut self,
-        field_name: &str,
-    ) -> KernelResult<T> {
+    pub(crate) fn take_field<T>(&mut self, field_name: &str) -> KernelResult<T>
+    where
+        T: TryFrom<Scalar>,
+        KernelError: From<T::Error>,
+    {
         let expected = self.expected.field(field_name).ok_or_else(|| {
             KernelError::InternalError(format!(
                 "Derived schema does not contain generated field {field_name:?}"
@@ -289,7 +294,20 @@ impl StructDataFields {
             )
         );
 
-        T::try_from(value).map_err(|error| add_scalar_path_context(error, field_name))
+        if let Scalar::Null(actual_type) = &value {
+            require!(
+                actual_type == expected.data_type(),
+                add_scalar_path_context(
+                    KernelError::scalar_conversion(
+                        expected.data_type().kind_name(),
+                        actual_type.kind_name(),
+                    ),
+                    field_name,
+                )
+            );
+        }
+
+        T::try_from(value).map_err(|error| add_scalar_path_context(error.into(), field_name))
     }
 
     /// Verifies that every named field was consumed.

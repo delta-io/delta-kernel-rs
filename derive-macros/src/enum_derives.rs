@@ -2,7 +2,8 @@ use std::collections::HashSet;
 
 use proc_macro2::{Ident, TokenStream};
 use quote::quote;
-use syn::{Data, DeriveInput, Error, Fields, LitStr, Type};
+use syn::ext::IdentExt;
+use syn::{Attribute, Data, DeriveInput, Error, Fields, LitStr, Type};
 
 pub(super) struct Variant<'a> {
     ident: &'a Ident,
@@ -39,7 +40,7 @@ pub(super) fn variants(input: &DeriveInput) -> Result<Vec<Variant<'_>>, Error> {
                     ));
                 }
             };
-            let name = crate::schema_name(&variant.ident, &variant.attrs)?;
+            let name = schema_name(&variant.ident, &variant.attrs)?;
             if !names.insert(name.value().to_lowercase()) {
                 return Err(Error::new(name.span(), "duplicate enum schema field name"));
             }
@@ -100,9 +101,7 @@ pub(super) fn try_from_struct_data(struct_name: &Ident, variants: &[Variant<'_>]
     super::struct_data_decoder(
         struct_name,
         variants.iter().map(|v| v.payload),
-        quote! {
-            delta_kernel::schema::derive_macro_utils::validate_variant(value.values())?;
-        },
+        quote! { try_new_variant },
         quote! {
             None #(#conversions)* .ok_or_else(||
                 delta_kernel::KernelError::invalid_struct_data(
@@ -113,11 +112,59 @@ pub(super) fn try_from_struct_data(struct_name: &Ident, variants: &[Variant<'_>]
     )
 }
 
+fn schema_name(ident: &Ident, attributes: &[Attribute]) -> Result<LitStr, Error> {
+    let mut name = None;
+    for attribute in attributes
+        .iter()
+        .filter(|a| a.path().is_ident("schema_rename"))
+    {
+        let value = attribute.meta.require_name_value().map_err(|_| {
+            Error::new_spanned(attribute, "expected #[schema_rename = \"fieldName\"]")
+        })?;
+        let expr = &value.value;
+        let value = syn::parse2::<LitStr>(quote! { #expr })
+            .map_err(|_| Error::new_spanned(attribute, "schema name must be a string"))?;
+        if value.value().is_empty() || name.replace(value).is_some() {
+            return Err(Error::new_spanned(
+                attribute,
+                "schema name must be nonempty and specified once",
+            ));
+        }
+    }
+    Ok(name.unwrap_or_else(|| {
+        let ident = ident.unraw();
+        let camel = super::get_schema_name(&ident).to_string();
+        let mut characters = camel.chars();
+        let lower_camel = characters
+            .next()
+            .map(|c| c.to_lowercase().collect::<String>() + characters.as_str())
+            .unwrap_or_default();
+        LitStr::new(&lower_camel, ident.span())
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    #[case("struct AddFile {}", Some("addFile"))]
+    #[case(r#"#[schema_rename = "add"] struct AddedFile {}"#, Some("add"))]
+    #[case(r#"#[schema_rename = ""] struct Row {}"#, None)]
+    #[case("#[schema_rename = 3] struct Row {}", None)]
+    #[case(r#"#[schema_rename = "a"] #[schema_rename = "b"] struct Row {}"#, None)]
+    fn enum_variant_name(#[case] input: &str, #[case] expected: Option<&str>) {
+        let input = syn::parse_str::<DeriveInput>(input).unwrap();
+        assert_eq!(
+            schema_name(&input.ident, &input.attrs)
+                .ok()
+                .map(|name| name.value())
+                .as_deref(),
+            expected
+        );
+    }
 
     const ONE_PAYLOAD: &str = "enum variants must contain exactly one unnamed struct payload";
     const NO_GENERICS: &str = "struct-data enums do not support generic parameters";

@@ -30,8 +30,7 @@ use crate::KernelResultIterator;
 #[cfg(feature = "declarative-plans")]
 use crate::engine_data::{EngineData, RowVisitor as _};
 use crate::error::add_scalar_path_context;
-use crate::schema::derive_macro_utils::validate_variant;
-use crate::schema::{SchemaRef, ToSchema};
+use crate::schema::ToSchema;
 use crate::{KernelError, KernelResult};
 
 #[cfg(feature = "declarative-plans")]
@@ -161,38 +160,6 @@ fn decode_row<T: TryFrom<StructData, Error = KernelError>>(
     T::try_from(row).map_err(|error| add_scalar_path_context(error, format!("[{index}]")))
 }
 
-/// Groups a mixed row into the collection matching each non-null payload field.
-#[internal_api]
-pub(crate) fn group_struct_row<const N: usize>(
-    state: &mut (usize, [Vec<StructData>; N]),
-    row: StructData,
-    schema: &SchemaRef,
-) -> KernelResult<()> {
-    let index = state.0;
-    let groups = &mut state.1;
-    let (actual, values) = row.into_parts();
-    if actual != *schema || values.len() != schema.num_fields() {
-        return Err(KernelError::invalid_struct_data(
-            "Incompatible mixed-row payload schema",
-        ));
-    }
-    validate_variant(&values)
-        .map_err(|error| add_scalar_path_context(error, format!("[{index}]")))?;
-    for (field, value) in actual
-        .fields()
-        .zip(values)
-        .filter(|(_, value)| !value.is_null())
-    {
-        let group = schema
-            .index_of(field.name())
-            .and_then(|index| groups.get_mut(index))
-            .ok_or_else(|| KernelError::internal_error("Missing payload group"))?;
-        group.push(value.try_into()?);
-    }
-    state.0 += 1;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::ops::RangeInclusive;
@@ -202,7 +169,8 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::schema::{StructField, StructType};
+    use crate::schema::{DataType, StructField, StructType};
+    use crate::unit_test_utils::assert_result_error_with_message;
 
     #[derive(Clone, Debug, PartialEq, ToSchema, IntoStructData, TryFromStructData)]
     struct Added {
@@ -234,20 +202,27 @@ mod tests {
     }
 
     #[rstest]
-    #[case::declared_order(false, None)]
-    #[case::reordered(true, None)]
-    #[case::unknown(false, Some("other"))]
+    #[case::declared_order(false, None, false)]
+    #[case::reordered(true, None, false)]
+    #[case::unknown(false, Some("other"), false)]
+    #[case::wrong_null_type(false, None, true)]
     fn named_collections_resolve_struct_payloads_by_name(
         #[case] reverse: bool,
         #[case] extra: Option<&str>,
+        #[case] wrong_null_type: bool,
     ) -> KernelResult<()> {
+        let removed_type = if wrong_null_type {
+            DataType::STRING
+        } else {
+            Added::schema_ref().clone().into()
+        };
         let mut fields = vec![
             StructField::nullable("added", Added::schema_ref().clone()),
-            StructField::nullable("removed", Added::schema_ref().clone()),
+            StructField::nullable("removed", removed_type.clone()),
         ];
         let mut values = vec![
             Added { id: 7 }.into(),
-            crate::expressions::Scalar::Null(Added::schema_ref().clone().into()),
+            crate::expressions::Scalar::Null(removed_type),
         ];
         if reverse {
             fields.reverse();
@@ -263,7 +238,9 @@ mod tests {
             let row = StructData::try_new(Arc::new(schema), values)?;
             Changes::collect_into([Ok(row)])
         });
-        if extra.is_some() {
+        if wrong_null_type {
+            assert_result_error_with_message(result, "removed: expected struct, found string");
+        } else if extra.is_some() {
             assert!(result.is_err());
         } else {
             assert_eq!(

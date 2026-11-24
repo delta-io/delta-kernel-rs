@@ -180,9 +180,8 @@ pub trait PlanExecutorExt: PlanExecutor {
     /// A row requires exactly one result; an optional row allows at most one; vectors accept any
     /// count. Derived collections apply these counts independently to each named payload field.
     /// Batches are decoded in order, stopping at the first error. A row or optional row decodes at
-    /// most two rows; later batches may remain unread. Named collections group the rows before
-    /// decoding each field. The plan's schema must equal the requested schema, including field
-    /// nullability and metadata.
+    /// most two rows; later batches may remain unread. The plan's schema must equal the requested
+    /// schema, including field nullability and metadata.
     ///
     /// Supports numbers, booleans, strings, binary, dates, string lists, string maps, and nested
     /// structs with fields. Null structs mask their children, including required fields.

@@ -187,10 +187,11 @@ fn named_collections_use_manual_decoders(
     #[values(1, 2)] count: usize,
     #[values(false, true)] split: bool,
 ) {
-    let batches = if split { vec![1; count] } else { vec![count] }
+    let mut batches: Batches = if split { vec![1; count] } else { vec![count] }
         .into_iter()
         .map(|count| Ok(batch(&vec![Some(-1); count], &vec![None; count])))
         .collect();
+    batches.push(Err(KernelError::generic("late decoder error")));
     let error = collect(batches).unwrap_err();
     assert!(matches!(
         error.without_backtrace(), KernelError::Generic(message)
@@ -217,32 +218,30 @@ where
 }
 
 #[rstest]
-#[case::named_collection(execute_rows::<RequiredActions>, true)]
-#[case::named_enum(execute_rows::<Action>, false)]
+#[case::named_collection(execute_rows::<RequiredActions>)]
+#[case::named_enum(execute_rows::<Action>)]
 fn variant_collection_errors_follow_consumption_order<T: Debug>(
     #[case] convert: fn(Batches) -> KernelResult<T>,
-    #[case] grouped: bool,
     #[values(false, true)] invalid_variant: bool,
+    #[values(false, true)] late_malformed_variant: bool,
 ) {
-    let batches = vec![
-        Ok(if invalid_variant {
-            batch(&[None], &[None])
-        } else {
-            batch(&[Some(1), Some(2)], &[None, None])
-        }),
-        Err(KernelError::generic("late variant error")),
-    ];
+    let first_batch = Ok(if invalid_variant {
+        batch(&[None], &[None])
+    } else {
+        batch(&[Some(1), Some(2)], &[None, None])
+    });
+    let late_batch = if late_malformed_variant {
+        Ok(batch(&[Some(3)], &[Some(4)]))
+    } else {
+        Err(KernelError::generic("late variant error"))
+    };
+    let batches = vec![first_batch, late_batch];
     let error = convert(batches).unwrap_err();
     if invalid_variant {
         assert!(matches!(
             error.without_backtrace(),
             KernelError::InvalidStructData(_)
         ));
-    } else if grouped {
-        assert!(
-            matches!(error.without_backtrace(), KernelError::Generic(message)
-                if message == "late variant error")
-        );
     } else {
         assert!(matches!(
             error.without_backtrace(),

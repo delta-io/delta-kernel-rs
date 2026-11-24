@@ -163,16 +163,16 @@ fn validate_single_segment(segment: &str, span: Span) -> Result<(), Error> {
 )]
 pub fn derive_to_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
-    to_schema_impl(&input)
-        .unwrap_or_else(Error::into_compile_error)
-        .into()
-}
-
-fn to_schema_impl(input: &DeriveInput) -> Result<TokenStream, Error> {
     let struct_ident = &input.ident;
     let schema_fields = match &input.data {
-        Data::Enum(_) => enum_derives::schema_fields(&enum_derives::variants(input)?),
-        _ => gen_schema_fields(&input.data, struct_ident.span())?,
+        Data::Enum(_) => {
+            enum_derives::variants(&input).map(|variants| enum_derives::schema_fields(&variants))
+        }
+        _ => gen_schema_fields(&input.data, struct_ident.span()),
+    };
+    let schema_fields = match schema_fields {
+        Ok(fields) => fields,
+        Err(error) => return error.into_compile_error().into(),
     };
     let output = quote! {
         #[automatically_derived]
@@ -199,52 +199,7 @@ fn to_schema_impl(input: &DeriveInput) -> Result<TokenStream, Error> {
             }
         }
     };
-    Ok(output)
-}
-
-fn schema_name(ident: &Ident, attributes: &[Attribute]) -> Result<syn::LitStr, Error> {
-    let mut name = None;
-    for attribute in attributes
-        .iter()
-        .filter(|a| a.path().is_ident("schema_rename"))
-    {
-        let Meta::NameValue(value) = &attribute.meta else {
-            return Err(Error::new_spanned(
-                attribute,
-                "expected #[schema_rename = \"fieldName\"]",
-            ));
-        };
-        let Expr::Lit(ExprLit {
-            lit: Lit::Str(value),
-            ..
-        }) = &value.value
-        else {
-            return Err(Error::new_spanned(
-                attribute,
-                "schema name must be a string",
-            ));
-        };
-        if value.value().is_empty() || name.replace(value.clone()).is_some() {
-            return Err(Error::new_spanned(
-                attribute,
-                "schema name must be nonempty and specified once",
-            ));
-        }
-    }
-    Ok(name.unwrap_or_else(|| {
-        let original = ident.to_string();
-        let ident = Ident::new(
-            original.strip_prefix("r#").unwrap_or(&original),
-            ident.span(),
-        );
-        let camel = get_schema_name(&ident).to_string();
-        let mut characters = camel.chars();
-        let lower_camel = characters
-            .next()
-            .map(|c| c.to_lowercase().collect::<String>() + characters.as_str())
-            .unwrap_or_default();
-        syn::LitStr::new(&lower_camel, ident.span())
-    }))
+    proc_macro::TokenStream::from(output)
 }
 
 // turn our struct name into the schema name, goes from snake_case to camelCase
@@ -633,7 +588,7 @@ fn try_from_struct_data_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
     Ok(struct_data_decoder(
         struct_name,
         field_types,
-        quote! {},
+        quote! { try_new },
         quote! { Self {
             #(#field_idents: fields.take_field(stringify!(#schema_field_names))?,)*
         } },
@@ -680,51 +635,54 @@ fn try_from_struct_rows_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
     }
 
     let row_name = format_ident!("__{}Row", name);
-    let field_count = fields.len();
-    let row_input: DeriveInput = syn::parse2(quote! {
-        pub struct #row_name {
-            #(#[allow(dead_code)]
-            #idents: ::std::option::Option<
-                <#types as delta_kernel::expressions::TryFromStructRows>::Row
-            >,)*
-        }
-    })?;
-    let schema_impl = to_schema_impl(&row_input)?;
-    let decoder_impl = try_from_struct_data_impl(&row_input)?;
+    let indices: Vec<_> = (0..fields.len()).map(syn::Index::from).collect();
     let where_clause = &input.generics.where_clause;
     Ok(quote! {
         const _: () = {
             #[doc(hidden)]
-            #row_input
-            #schema_impl
-            #decoder_impl
+            #[allow(dead_code)]
+            #[derive(
+                delta_kernel::delta_kernel_derive::ToSchema,
+                delta_kernel::delta_kernel_derive::TryFromStructData,
+            )]
+            pub struct #row_name {
+                #(#idents: ::std::option::Option<
+                    <#types as delta_kernel::expressions::TryFromStructRows>::Row
+                >,)*
+            }
 
             #[automatically_derived]
             impl delta_kernel::expressions::TryFromStructRows for #name #where_clause {
                 type Row = #row_name;
-                type State = (usize, [::std::vec::Vec<delta_kernel::expressions::StructData>; #field_count]);
+                type State = (#(<#types as delta_kernel::expressions::TryFromStructRows>::State,)*);
 
                 fn new_state() -> Self::State {
-                    (0, ::std::array::from_fn(|_| ::std::vec::Vec::new()))
+                    (#(<#types as delta_kernel::expressions::TryFromStructRows>::new_state(),)*)
                 }
 
                 fn push(
                     state: &mut Self::State,
                     row: delta_kernel::expressions::StructData,
                 ) -> delta_kernel::KernelResult<()> {
-                    delta_kernel::expressions::group_struct_row(
-                        state,
+                    let mut fields = delta_kernel::schema::derive_macro_utils::StructDataFields::try_new_variant(
                         row,
-                        <Self::Row as delta_kernel::schema::ToSchema>::schema_ref(),
-                    )
+                        <Self::Row as delta_kernel::schema::ToSchema>::schema_ref().clone(),
+                    )?;
+                    #(
+                        let value: delta_kernel::expressions::Scalar = fields.take_field(stringify!(#names))?;
+                        if !value.is_null() {
+                            <#types as delta_kernel::expressions::TryFromStructRows>::push(
+                                &mut state.#indices, value.try_into()?,
+                            ).map_err(|error| delta_kernel::error::add_scalar_path_context(error, stringify!(#names)))?;
+                        }
+                    )*
+                    fields.finish()
                 }
 
                 fn finish(state: Self::State) -> delta_kernel::KernelResult<Self> {
-                    let (_, [#(#idents),*]) = state;
+                    let (#(#idents,)*) = state;
                     Ok(Self {
-                        #(#idents: <#types as delta_kernel::expressions::TryFromStructRows>::collect_into(
-                            #idents.into_iter().map(::core::result::Result::Ok),
-                        )
+                        #(#idents: <#types as delta_kernel::expressions::TryFromStructRows>::finish(#idents)
                             .map_err(|error| delta_kernel::error::add_scalar_path_context(error, stringify!(#names)))?,)*
                     })
                 }
@@ -736,7 +694,7 @@ fn try_from_struct_rows_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
 fn struct_data_decoder(
     struct_name: &Ident,
     field_types: impl IntoIterator<Item = impl quote::ToTokens>,
-    validation: TokenStream,
+    constructor: TokenStream,
     result: TokenStream,
 ) -> TokenStream {
     let field_types = field_types.into_iter();
@@ -753,9 +711,8 @@ fn struct_data_decoder(
             fn try_from(
                 value: delta_kernel::expressions::StructData,
             ) -> delta_kernel::KernelResult<Self> {
-                #validation
                 let mut fields =
-                    delta_kernel::schema::derive_macro_utils::StructDataFields::try_new(
+                    delta_kernel::schema::derive_macro_utils::StructDataFields::#constructor(
                         value,
                         <#struct_name as delta_kernel::schema::ToSchema>::schema_ref().clone(),
                     )?;
@@ -1092,23 +1049,6 @@ mod tests {
         assert_eq!(
             internal_api_impl(input).unwrap().to_string(),
             expected.to_string()
-        );
-    }
-
-    #[rstest]
-    #[case("struct AddFile {}", Some("addFile"))]
-    #[case(r#"#[schema_rename = "add"] struct AddedFile {}"#, Some("add"))]
-    #[case(r#"#[schema_rename = ""] struct Row {}"#, None)]
-    #[case("#[schema_rename = 3] struct Row {}", None)]
-    #[case(r#"#[schema_rename = "a"] #[schema_rename = "b"] struct Row {}"#, None)]
-    fn enum_variant_name(#[case] input: &str, #[case] expected: Option<&str>) {
-        let input = syn::parse_str::<DeriveInput>(input).unwrap();
-        assert_eq!(
-            schema_name(&input.ident, &input.attrs)
-                .ok()
-                .map(|name| name.value())
-                .as_deref(),
-            expected
         );
     }
 
