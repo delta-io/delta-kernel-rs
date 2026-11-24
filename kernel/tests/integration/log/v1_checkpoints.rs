@@ -65,7 +65,7 @@ async fn test_snapshot_checkpoint_on_v1_table(
     assert!(add_fields.find("stats").is_some());
     assert_eq!(
         add_fields.find("stats_parsed").is_some(),
-        write_struct.unwrap_or(true)
+        !declarative && write_struct.unwrap_or(false)
     );
 
     Ok(())

@@ -95,12 +95,6 @@ fn checkpoint_batches(
 ) -> KernelResult<Vec<RecordBatch>> {
     #[cfg(feature = "declarative-plans")]
     if engine.plan_executor().is_some() {
-        if writer.schema_context.is_v2 {
-            let (content, non_content) = writer.declarative_v2_checkpoint_data_plans(engine)?;
-            let mut batches = execute_plan(engine, content)?;
-            batches.extend(execute_plan(engine, non_content)?);
-            return Ok(batches);
-        }
         return execute_plan(engine, writer.declarative_checkpoint_data_plan(engine)?);
     }
     writer
@@ -113,7 +107,7 @@ fn assert_checkpoint_actions(batches: &[RecordBatch], expected: &[(&str, Option<
     let mut actions = Vec::new();
     for batch in batches {
         for (field, column) in batch.schema_ref().fields().iter().zip(batch.columns()) {
-            // Reconstruction plans leave the manifest's checkpointMetadata to the writer.
+            // These assertions compare log actions; V2 checkpoint metadata is checked separately.
             if field.name() == "checkpointMetadata" {
                 continue;
             }
@@ -1354,7 +1348,11 @@ async fn test_stats_config_round_trip(
     write_commit_to_store(
         &store,
         vec![
-            create_basic_protocol_action(),
+            if declarative {
+                create_v2_checkpoint_protocol_action()
+            } else {
+                create_basic_protocol_action()
+            },
             create_metadata_with_stats_config(json1, struct1),
         ],
         0,
@@ -1417,7 +1415,11 @@ async fn test_stats_config_round_trip_partitioned(
     write_commit_to_store(
         &store,
         vec![
-            create_basic_protocol_action(),
+            if declarative {
+                create_v2_checkpoint_protocol_action()
+            } else {
+                create_basic_protocol_action()
+            },
             create_metadata_with_stats_config_and_partitions(
                 json1,
                 struct1,
@@ -1534,7 +1536,11 @@ async fn test_checkpoint_with_varchar_metadata_on_field(#[case] declarative: boo
     write_commit_to_store(
         &store,
         vec![
-            create_basic_protocol_action(),
+            if declarative {
+                create_v2_checkpoint_protocol_action()
+            } else {
+                create_basic_protocol_action()
+            },
             Action::Metadata(
                 Metadata::try_new(
                     Some("test".into()),
