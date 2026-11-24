@@ -33,6 +33,7 @@ enum OpType {
   Equal,
   Distinct,
   In,
+  MapHasKey,
 };
 enum LitType {
   Integer,
@@ -76,7 +77,7 @@ enum VariadicType {
   Coalesce,
   ArrayConstructor,
 };
-enum UnaryType { Not, IsNull, HasUriScheme, UriEncodeFileLocation };
+enum UnaryType { Not, IsNull, HasUriScheme, UriEncodeFileLocation, MapLen };
 typedef struct {
   void* ref;
   enum ExpressionType type;
@@ -230,6 +231,7 @@ DEFINE_BINOP(visit_expr_gt, GreaterThan)
 DEFINE_BINOP(visit_expr_eq, Equal)
 DEFINE_BINOP(visit_expr_distinct, Distinct)
 DEFINE_BINOP(visit_expr_in, In)
+DEFINE_BINOP(visit_expr_map_has_key, MapHasKey)
 #undef DEFINE_BINOP
 
 /*************************************************************
@@ -497,6 +499,7 @@ void visit_expr_unary(void* data,
 DEFINE_UNARY(visit_expr_is_null, IsNull)
 DEFINE_UNARY(visit_expr_has_uri_scheme, HasUriScheme)
 DEFINE_UNARY(visit_expr_uri_encode_file_location, UriEncodeFileLocation)
+DEFINE_UNARY(visit_expr_map_len, MapLen)
 DEFINE_UNARY(visit_expr_not, Not)
 #undef DEFINE_UNARY
 
@@ -562,11 +565,13 @@ ExpressionItemList construct_expression(SharedExpression* expression) {
     .visit_is_null = visit_expr_is_null,
     .visit_has_uri_scheme = visit_expr_has_uri_scheme,
     .visit_uri_encode_file_location = visit_expr_uri_encode_file_location,
+    .visit_map_len = visit_expr_map_len,
     .visit_lt = visit_expr_lt,
     .visit_gt = visit_expr_gt,
     .visit_eq = visit_expr_eq,
     .visit_distinct = visit_expr_distinct,
     .visit_in = visit_expr_in,
+    .visit_map_has_key = visit_expr_map_has_key,
     .visit_add = visit_expr_add,
     .visit_minus = visit_expr_minus,
     .visit_multiply = visit_expr_multiply,
@@ -618,11 +623,13 @@ ExpressionItemList construct_predicate(SharedPredicate* predicate) {
     .visit_is_null = visit_expr_is_null,
     .visit_has_uri_scheme = visit_expr_has_uri_scheme,
     .visit_uri_encode_file_location = visit_expr_uri_encode_file_location,
+    .visit_map_len = visit_expr_map_len,
     .visit_lt = visit_expr_lt,
     .visit_gt = visit_expr_gt,
     .visit_eq = visit_expr_eq,
     .visit_distinct = visit_expr_distinct,
     .visit_in = visit_expr_in,
+    .visit_map_has_key = visit_expr_map_has_key,
     .visit_add = visit_expr_add,
     .visit_minus = visit_expr_minus,
     .visit_multiply = visit_expr_multiply,
