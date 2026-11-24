@@ -29,10 +29,15 @@ def _load_module(name):
     return module
 
 
+SHARED_DIR = Path(__file__).parents[1] / "reviewer" / "shared"
+_PREPARE_REVIEWER = _load_module("prepare_reviewer")
+
+
 def _configured_prompt(path: Path) -> str:
+    """Return the instructions a reviewer loads: its `REVIEW.md` with shared blocks expanded."""
     config = yaml.safe_load(path.read_text())
-    instructions = config["instructions"]
-    return path.with_name(instructions).read_text().strip()
+    instructions = path.with_name(config["instructions"]).read_text()
+    return _PREPARE_REVIEWER.expand_instructions(instructions, SHARED_DIR).strip()
 
 
 DIFF = """\
@@ -264,60 +269,58 @@ class InlineReviewTest(unittest.TestCase):
                     or "untrusted text" in prompt
                 )
 
-    def test_shared_policies_reach_parent_and_child_reviewers(self) -> None:
+    def test_shared_blocks_reach_the_reviewers_they_apply_to(self) -> None:
         omnigent_dir = Path(__file__).parents[1]
         reviewer_dir = omnigent_dir / "reviewer"
         reviewer_contract = (reviewer_dir / "REVIEW.md").read_text()
         workflow = (omnigent_dir.parent / "workflows" / "ai-review.yml").read_text()
-        review_policy = _load_module("review_policy")
-        for policy in (
-            review_policy.KNOWN_ISSUE_POLICY.strip(),
-            review_policy.PREVIOUS_REVIEW_POLICY.strip(),
-        ):
-            self.assertIn(policy, reviewer_contract)
-            self.assertIn(policy, _configured_prompt(reviewer_dir / "config.yaml"))
-            for agent_dir in (reviewer_dir / "agents").iterdir():
-                if not agent_dir.is_dir():
-                    continue
-                with self.subTest(agent=agent_dir.name, policy=policy.partition("\n")[0]):
-                    self.assertIn(policy, (agent_dir / "REVIEW.md").read_text())
-                    self.assertIn(policy, _configured_prompt(agent_dir / "config.yaml"))
-        description_policy = review_policy.PR_DESCRIPTION_POLICY.strip()
-        self.assertIn(description_policy, reviewer_contract)
+        orchestrator = _configured_prompt(reviewer_dir / "config.yaml")
+        children = {
+            path.parent.name: _configured_prompt(path)
+            for path in sorted((reviewer_dir / "agents").glob("*/config.yaml"))
+        }
+        self.assertTrue(children)
+
+        review_rules = (SHARED_DIR / "review_rules.md").read_text().strip()
+        for heading in ("## Known issue handling", "## Previous AI review handling"):
+            self.assertIn(heading, review_rules)
+        project_guidance = (SHARED_DIR / "project_guidance.md").read_text().strip()
+        self.assertEqual(orchestrator.count(review_rules), 1)
+        self.assertNotIn(project_guidance, orchestrator)
+        for agent, instructions in children.items():
+            with self.subTest(agent=agent, block="review_rules and project_guidance"):
+                self.assertEqual(instructions.count(review_rules), 1)
+                self.assertEqual(instructions.count(project_guidance), 1)
+
+        description_policy = (SHARED_DIR / "pr_description.md").read_text().strip()
+        self.assertIn("## PR description accuracy", description_policy)
+        self.assertEqual(orchestrator.count(description_policy), 1)
         self.assertIn("Always dispatch\n`docs-reviewer`", reviewer_contract)
-        self.assertIn("only the PR title and description", reviewer_contract)
-        for agent in (
-            "docs-reviewer",
-        ):
-            with self.subTest(agent=agent, policy="PR description accuracy"):
-                agent_dir = reviewer_dir / "agents" / agent
-                self.assertIn(description_policy, (agent_dir / "REVIEW.md").read_text())
-                self.assertIn(description_policy, _configured_prompt(agent_dir / "config.yaml"))
-        for agent in (
-            "architecture-reviewer",
-            "delta-protocol-reviewer",
-            "disprove-reviewer",
-            "maintainer-claude-reviewer",
-            "maintainer-codex-reviewer",
-            "test-coverage-reviewer",
-        ):
-            with self.subTest(agent=agent, policy="single description reviewer"):
-                agent_dir = reviewer_dir / "agents" / agent
-                self.assertNotIn(description_policy, (agent_dir / "REVIEW.md").read_text())
+        self.assertIn("including rustdoc the diff does not touch", reviewer_contract)
+        for agent, instructions in children.items():
+            with self.subTest(agent=agent, block="pr_description"):
+                self.assertEqual(
+                    instructions.count(description_policy), int(agent == "docs-reviewer")
+                )
+
+        maintainer = (SHARED_DIR / "maintainer.md").read_text().strip()
+        ci_environment = (SHARED_DIR / "ci_environment.md").read_text().strip()
+        for agent, instructions in children.items():
+            with self.subTest(agent=agent, block="maintainer and ci_environment"):
+                self.assertEqual(
+                    instructions.count(maintainer), int(agent.startswith("maintainer-"))
+                )
+                self.assertEqual(
+                    instructions.count(ci_environment), int(agent != "disprove-reviewer")
+                )
+
+        for standing_rule in ("reviewer/shared", "{review_rules}", "pass each the diff"):
+            with self.subTest(absent_from_orchestrator_task=standing_rule):
+                self.assertNotIn(standing_rule, workflow)
+        self.assertIn("python3 .github/omnigent/prepare_reviewer.py", workflow)
         self.assertIn(
-            "PR_DESCRIPTION_POLICY,",
-            workflow,
+            "printf 'project_doc_max_bytes = 0\\n' > \"$HOME/.codex/config.toml\"", workflow
         )
-        self.assertIn("known_issue_policy = KNOWN_ISSUE_POLICY.strip()", workflow)
-        self.assertIn(
-            "previous_review_policy = PREVIOUS_REVIEW_POLICY.strip()", workflow
-        )
-        self.assertIn(
-            "pr_description_policy = PR_DESCRIPTION_POLICY.strip()", workflow
-        )
-        self.assertEqual(workflow.count("{known_issue_policy}"), 1)
-        self.assertEqual(workflow.count("{previous_review_policy}"), 1)
-        self.assertEqual(workflow.count("{pr_description_policy}"), 1)
         self.assertIn("[PR description truncated at 4096 characters", workflow)
         self.assertIn("format_review_history", workflow)
         self.assertIn("OMNIGENT_BOT_LOGIN: ${{ vars.OMNIGENT_BOT_LOGIN }}", workflow)
@@ -412,6 +415,27 @@ class InlineReviewTest(unittest.TestCase):
                 ("kernel/src/example.rs", 10, "RIGHT"),
                 ("kernel/src/example.rs", 11, "RIGHT"),
                 ("kernel/src/example.rs", 12, "RIGHT"),
+            },
+        )
+
+    def test_diff_positions_count_lines_as_git_does(self) -> None:
+        diff = (
+            "diff --git a/kernel/src/breaks.rs b/kernel/src/breaks.rs\n"
+            "--- a/kernel/src/breaks.rs\n"
+            "+++ b/kernel/src/breaks.rs\n"
+            "@@ -1,3 +1,3 @@\n"
+            " first\x0cstill first\u2028still first\r\n"
+            "-second\rstill second\n"
+            "+replacement\n"
+            " third\n"
+        )
+        self.assertEqual(
+            self.inline_review.diff_positions(diff),
+            {
+                ("kernel/src/breaks.rs", 1, "RIGHT"),
+                ("kernel/src/breaks.rs", 2, "LEFT"),
+                ("kernel/src/breaks.rs", 2, "RIGHT"),
+                ("kernel/src/breaks.rs", 3, "RIGHT"),
             },
         )
 
@@ -1045,6 +1069,141 @@ class InlineReviewTest(unittest.TestCase):
         self.assertEqual(unmapped, [])
         self.assertEqual(duplicates, [])
 
+    def test_left_positions_from_a_different_stack_base_remain_in_review_body(self) -> None:
+        review = (
+            "### Blocker1\nDeleted parent line.\n\n### Nit1\nChild change.\n\n## Summary\nReview."
+        )
+        findings = [
+            {
+                "id": finding_id,
+                "path": "kernel/src/example.rs",
+                "line": 9,
+                "side": side,
+                "body": body,
+            }
+            for finding_id, side, body in (
+                ("Blocker1", "LEFT", "Deleted parent line."),
+                ("Nit1", "RIGHT", "Child change."),
+            )
+        ]
+        for review_diff, expected_unmapped in (
+            (None, []),
+            (DIFF, []),
+            (DIFF.replace("old_call();", "parent_call();"), ["Blocker1"]),
+        ):
+            with self.subTest(review_diff=review_diff):
+                payload, unmapped, _ = self.inline_review.build_review_payload(
+                    review=review,
+                    findings=findings,
+                    diff=DIFF + FILE_LIFECYCLE_DIFF,
+                    review_diff=review_diff,
+                    head_sha="f" * 40,
+                    run_url="https://github.com/delta-io/delta-kernel-rs/actions/runs/1",
+                )
+                self.assertEqual(unmapped, expected_unmapped)
+                self.assertEqual(len(payload["comments"]), 2 - len(expected_unmapped))
+                self.assertEqual("### Blocker1" in payload["body"], bool(expected_unmapped))
+                self.assertNotIn("### Nit1", payload["body"])
+
+    def test_github_only_positions_are_not_published_inline(self) -> None:
+        payload, unmapped, _ = self.inline_review.build_review_payload(
+            review="### Nit1\nAncestor change.",
+            findings=[{
+                "id": "Nit1", "path": "kernel/src/example.rs", "line": 50,
+                "side": "RIGHT", "body": "Ancestor change.",
+            }],
+            diff=DIFF + "@@ -50 +50 @@\n-ancestor_old();\n+ancestor_new();\n",
+            review_diff=DIFF,
+            head_sha="f" * 40,
+            run_url="https://github.com/delta-io/delta-kernel-rs/actions/runs/1",
+        )
+
+        self.assertEqual(payload["comments"], [])
+        self.assertEqual(unmapped, ["Nit1"])
+        self.assertIn("### Nit1", payload["body"])
+
+    def test_workflow_inline_rejection_preserves_prose_and_json_only_findings(self) -> None:
+        repo_root = Path(__file__).resolve().parents[3]
+        workflow = yaml.safe_load((repo_root / ".github/workflows/ai-review.yml").read_text())
+        publish_step = next(
+            step
+            for job in workflow["jobs"].values()
+            for step in job["steps"]
+            if step.get("name") == "Post inline review"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "review_output.txt").write_text(
+                "## Blocking issues\n### Blocker1\nDeleted parent line.\n\n"
+                "## Non-blocking notes\n### Nit1\nChild change.\n\n## Summary\nNeeds review."
+            )
+            findings = [
+                {
+                    "id": finding_id,
+                    "path": "kernel/src/example.rs",
+                    "line": 9,
+                    "side": side,
+                    "body": body,
+                }
+                for finding_id, side, body in (
+                    ("Blocker1", "LEFT", "Deleted parent line."),
+                    ("Nit1", "RIGHT", "Child change."),
+                    ("Nit2", "RIGHT", "JSON-only finding."),
+                )
+            ]
+            (root / "inline_findings.json").write_text(json.dumps(findings))
+            (root / "github_pr_diff.txt").write_text(DIFF)
+            (root / "pr_diff.txt").write_text(DIFF.replace("old_call();", "parent_call();"))
+            (root / "pr_history.json").write_text("{}")
+            (root / "trusted_bot_logins.json").write_text('["github-actions"]')
+            (root / "python3").symlink_to(sys.executable)
+            gh = root / "gh"
+            gh.write_text(
+                f"#!{sys.executable}\n"
+                "import os, pathlib, sys\n"
+                "root = pathlib.Path(os.environ['TEST_ROOT'])\n"
+                "if sys.argv[1] == 'api':\n"
+                "    payload = pathlib.Path(sys.argv[sys.argv.index('--input') + 1])\n"
+                "    (root / 'submitted.json').write_text(payload.read_text())\n"
+                "    raise SystemExit(1)\n"
+                "assert sys.argv[1:3] == ['pr', 'comment']\n"
+                "body = pathlib.Path(sys.argv[sys.argv.index('--body-file') + 1])\n"
+                "(root / 'published.md').write_text(body.read_text())\n"
+            )
+            gh.chmod(0o700)
+            result = subprocess.run(
+                [
+                    "bash", "-euo", "pipefail", "-c",
+                    publish_step["run"].replace("/tmp/", f"{root}/"),
+                ],
+                cwd=repo_root,
+                env={
+                    **os.environ,
+                    "PATH": f"{root}:{os.environ['PATH']}",
+                    "TEST_ROOT": str(root),
+                    "HEAD_SHA": "f" * 40,
+                    "PR_NUMBER": "2",
+                    "REPO": "delta-io/delta-kernel-rs",
+                    "RUN_URL": "https://github.com/delta-io/delta-kernel-rs/actions/runs/1",
+                },
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            submitted = json.loads((root / "submitted.json").read_text())
+            self.assertEqual(len(submitted["comments"]), 2)
+            self.assertTrue(all(comment["side"] == "RIGHT" for comment in submitted["comments"]))
+            self.assertIn("### Blocker1", submitted["body"])
+            self.assertNotIn("### Nit1", submitted["body"])
+            self.assertNotIn("JSON-only finding.", submitted["body"])
+            published = (root / "published.md").read_text()
+            for finding in (
+                "### Blocker1", "Deleted parent line.", "### Nit1", "Child change.",
+                "### Nit2", "JSON-only finding.", "kernel/src/example.rs", "RIGHT, line 9",
+            ):
+                self.assertIn(finding, published)
+
     def test_exact_duplicate_inline_body_is_skipped_without_new_comments(self) -> None:
         review = "## Summary\nNo new findings."
         prior_body = self.review_publish.format_review_body(
@@ -1169,7 +1328,17 @@ class InlineReviewTest(unittest.TestCase):
             }
             paths["review"].write_text("## Summary\nNo findings.")
             paths["findings"].write_text("[]")
-            paths["diff"].write_text(DIFF)
+            paths["diff"].write_bytes(
+                (
+                    "diff --git a/kernel/src/breaks.rs b/kernel/src/breaks.rs\n"
+                    "--- a/kernel/src/breaks.rs\n"
+                    "+++ b/kernel/src/breaks.rs\n"
+                    "@@ -1,2 +1,2 @@\n"
+                    " first\rstill first\n"
+                    "-second\n"
+                    "+replacement\n"
+                ).encode()
+            )
             paths["history"].write_text("not JSON")
             paths["trusted"].write_text('["github-actions"]')
             arguments = [
@@ -1198,9 +1367,14 @@ class InlineReviewTest(unittest.TestCase):
                 str(paths["skip"]),
             ]
 
-            with patch.object(sys, "argv", arguments):
+            with patch.object(sys, "argv", arguments), patch.object(
+                self.inline_review,
+                "build_review_payload",
+                wraps=self.inline_review.build_review_payload,
+            ) as build_review_payload:
                 self.inline_review.main()
 
+            self.assertIn(" first\rstill first\n", build_review_payload.call_args.kwargs["diff"])
             self.assertEqual(json.loads(paths["output"].read_text())["comments"], [])
             self.assertEqual(paths["unmapped"].read_text(), "")
             self.assertEqual(paths["duplicate"].read_text(), "")

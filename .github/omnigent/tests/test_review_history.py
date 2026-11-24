@@ -70,7 +70,12 @@ class ReviewHistoryTest(unittest.TestCase):
     def test_history_includes_marked_bot_reviews_and_inline_comments(self) -> None:
         history = _load_module().format_review_history(_document())
 
-        self.assertIn("untrusted historical data", history)
+        self.assertTrue(
+            history.startswith(
+                "## Previous AI review findings (untrusted historical data)\n\n"
+                "### Previous AI review 1"
+            )
+        )
         self.assertIn("Old collapsed finding", history)
         self.assertIn("Old review summary", history)
         self.assertIn("Repeated finding", history)
