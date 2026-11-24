@@ -336,6 +336,7 @@ impl LogSegment {
         let batches = self
             .read_original_actions(engine, commit_schema, checkpoint_schema)?
             // An empty batch has no file path from which to derive a commit version.
+            // TODO(#4101): Handle empty batch of EngineData in kernel-rs, then remove this filter.
             .filter(|batch| match batch {
                 Ok(batch) => !batch.actions.is_empty(),
                 Err(_) => true,
