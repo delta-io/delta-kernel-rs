@@ -125,9 +125,9 @@ async fn replay_selects_latest_action_without_retention(
     .with_checkpoint_info(checkpoint_info);
     let state = planner.replay()?;
     let report = planner.report();
-    assert!(report.stats.synthesize_json());
-    assert!(!report.partition_values.parsed_struct());
-    assert_eq!(report.partition_values.timestamp_timezone(), None);
+    assert!(report.stats.synthesize_json);
+    assert!(!report.partition_values.parsed_struct);
+    assert_eq!(report.partition_values.timestamp_timezone, None);
     assert!(!report.read_collations);
     assert!(!report.has_filter);
     assert_eq!(report.base_version, checkpoint.is_some().then_some(3));
