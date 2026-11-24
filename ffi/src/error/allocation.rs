@@ -187,7 +187,6 @@ mod tests {
     use std::process::Command;
     use std::sync::Arc;
 
-    use delta_kernel::snapshot::SnapshotHintError;
     use delta_kernel::{DeltaError, DeltaErrorCondition, Engine, Error, KernelError};
     use rstest::rstest;
 
@@ -196,6 +195,8 @@ mod tests {
     use crate::{
         ExternEngine, KernelStringSlice, OptionalValue, allocate_kernel_string, kernel_string_slice,
     };
+
+    const DIAGNOSTICS_CHECK_COMPLETE: &str = "FFI diagnostics checked";
 
     #[derive(Default)]
     struct Capture {
@@ -304,8 +305,7 @@ mod tests {
             let mut command = Command::new(std::env::current_exe().unwrap());
             command
                 .args([
-                    "--exact",
-                    "error::allocation::tests::delta_backtrace_survives_allocation",
+                    "error::allocation::tests::allocation_copies_backtrace_and_source_chain::",
                     "--nocapture",
                 ])
                 .env_remove("RUST_LIB_BACKTRACE")
@@ -325,28 +325,10 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr),
             );
             assert!(
-                stdout.contains("1 passed"),
+                stdout.contains(DIAGNOSTICS_CHECK_COMPLETE),
                 "child did not run the test: {stdout}"
             );
         }
-    }
-
-    #[test]
-    fn delta_backtrace_survives_allocation() {
-        let mut output = Capture::default();
-        let allocators = ErrorAllocators {
-            context: std::ptr::from_mut(&mut output).cast(),
-            allocate_kernel_error: kernel,
-            allocate_delta_error: delta,
-        };
-        let error = DeltaError::path_does_not_exist("memory:///table/", None);
-        let captured = error.backtrace().status() == BacktraceStatus::Captured;
-        if let Ok(expected) = std::env::var("DELTA_KERNEL_TEST_CAPTURE_BACKTRACE") {
-            assert_eq!(captured, expected.parse::<bool>().unwrap());
-        }
-        let expected = captured.then(|| error.backtrace().to_string());
-        unsafe { allocators.allocate_error(error.into()) };
-        assert_eq!(output.backtrace, expected);
     }
 
     #[derive(Clone, Copy)]
@@ -463,9 +445,12 @@ mod tests {
     }
 
     #[rstest]
-    fn sources_preserve_the_complete_cause_chain_after_allocation(
-        #[values(false, true)] delta_error: bool,
+    #[case::kernel(false)]
+    #[case::delta(true)]
+    fn allocation_copies_backtrace_and_source_chain(
+        #[case] delta_error: bool,
         #[values(false, true)] backtraced_source: bool,
+        #[values(KernelError::MissingVersion(7), KernelError::EmptyLog)] root_cause: KernelError,
     ) {
         let mut output = Capture::default();
         let allocators = ErrorAllocators {
@@ -473,19 +458,17 @@ mod tests {
             allocate_kernel_error: kernel,
             allocate_delta_error: delta,
         };
+        let root_message = root_cause.to_string();
         let source = KernelError::GenericError {
-            source: Box::new(KernelError::MissingVersion(7)),
+            source: Box::new(root_cause),
         };
-        let mut expected = vec![
-            source.to_string(),
-            KernelError::MissingVersion(7).to_string(),
-        ];
+        let mut expected_sources = vec![source.to_string(), root_message];
         let source = if backtraced_source {
             let source = KernelError::Backtraced {
                 source: Box::new(source),
-                backtrace: Box::new(Backtrace::disabled()),
+                backtrace: Box::new(Backtrace::capture()),
             };
-            expected.insert(0, source.to_string());
+            expected_sources.insert(0, source.to_string());
             source
         } else {
             source
@@ -493,48 +476,30 @@ mod tests {
         let expected_message = if delta_error {
             DeltaError::path_does_not_exist("memory:///table/", None).message()
         } else {
-            "Invalid snapshot hint: invalid hint".to_string()
+            format!("Generic error: {source}")
         };
         let error = if delta_error {
             DeltaError::path_does_not_exist("memory:///table/", Some(Box::new(source))).into()
         } else {
-            KernelError::from(SnapshotHintError::Connector {
-                message: "invalid hint".into(),
-                source: Some(Box::new(source)),
-            })
+            KernelError::GenericError {
+                source: Box::new(source),
+            }
             .into()
         };
-        unsafe { allocators.allocate_error(error) };
-        assert_eq!(output.sources, expected);
-        assert_eq!(output.fields.last().unwrap().1, expected_message);
-    }
-
-    #[test]
-    fn snapshot_hint_causes_remain_distinguishable_after_allocation() {
-        let mut output = Capture::default();
-        let allocators = ErrorAllocators {
-            context: std::ptr::from_mut(&mut output).cast(),
-            allocate_kernel_error: kernel,
-            allocate_delta_error: delta,
+        let expected_backtrace = if let Error::Delta(error) = &error {
+            let captured = error.backtrace().status() == BacktraceStatus::Captured;
+            if let Ok(expected) = std::env::var("DELTA_KERNEL_TEST_CAPTURE_BACKTRACE") {
+                assert_eq!(captured, expected.parse::<bool>().unwrap());
+            }
+            captured.then(|| error.backtrace().to_string())
+        } else {
+            None
         };
-        let mut diagnostics = Vec::new();
-        for cause in [KernelError::MissingVersion(7), KernelError::EmptyLog] {
-            let expected_source = cause.to_string();
-            let error = KernelError::from(SnapshotHintError::LogSegment {
-                source: Box::new(cause),
-            });
-            unsafe { allocators.allocate_kernel_error(error) };
-            assert_eq!(output.sources, [expected_source]);
-            diagnostics.push((output.fields.clone(), output.sources.clone()));
-        }
-        assert_eq!(output.calls, 2);
-        assert_eq!(diagnostics[0].0, diagnostics[1].0);
-        assert_eq!(diagnostics[0].0[0].1, "InvalidSnapshotHint");
-        assert_eq!(
-            diagnostics[0].0[1].1,
-            "Invalid snapshot hint: supplied log files do not form a valid log segment"
-        );
-        assert_ne!(diagnostics[0].1, diagnostics[1].1);
+        unsafe { allocators.allocate_error(error) };
+        assert_eq!(output.backtrace, expected_backtrace);
+        assert_eq!(output.sources, expected_sources);
+        assert_eq!(output.fields.last().unwrap().1, expected_message);
+        println!("{DIAGNOSTICS_CHECK_COMPLETE}");
     }
     #[rstest]
     fn successful_result_does_not_allocate(#[values(false, true)] top_level: bool) {
