@@ -16,7 +16,7 @@ use crate::table_properties::ParseIntervalError;
 mod delta_error;
 mod delta_error_condition;
 
-pub use delta_error::{DeltaError, DeltaErrorParameter};
+pub use delta_error::{DeltaError, DeltaErrorContext, DeltaErrorParameter};
 pub use delta_error_condition::DeltaErrorCondition;
 
 /// An error returned by a Delta Kernel operation.
