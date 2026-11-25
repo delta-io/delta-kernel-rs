@@ -127,10 +127,10 @@ def outcome(role=ARCH, candidate_id="C1", state="retained", final_id="Blocker1",
     }
 
 
-def checker_events(batch, verdicts=None):
-    if verdicts is None:
-        verdicts = [{"batch_id": entry["batch_id"], "decision": "CONFIRMED"} for entry in batch]
-    return role_events(CHECKER_ROLE, verdicts, batch=batch)
+def checker_events(batch, decisions=None):
+    if decisions is None:
+        decisions = [{"batch_id": entry["batch_id"], "decision": "CONFIRMED"} for entry in batch]
+    return role_events(CHECKER_ROLE, decisions, batch=batch)
 
 
 class ReviewEvidenceTest(unittest.TestCase):
@@ -282,14 +282,14 @@ class ReviewEvidenceTest(unittest.TestCase):
                 [(ARCH, c) for c in arch] + [(DOCS, c) for c in docs if c["severity"] != "Nit"], 1
             )
         ]
-        verdicts = [
+        decisions = [
             {"batch_id": entry["batch_id"], "decision": verdict}
             for entry, verdict in zip(batch, (
                 "CONFIRMED", "DISPROVED", "NITPICK", "CONFIRMED", "CONFIRMED",
             ))
         ]
         events = empty_events({ARCH: role_events(ARCH, arch), DOCS: role_events(DOCS, docs)})
-        events += checker_events(batch, verdicts)
+        events += checker_events(batch, decisions)
         record = evidence(events, outcomes=[
             outcome(), outcome(ARCH, "C2", "dropped", None, "The premise was disproved."),
             outcome(DOCS, "C1", "downgraded", "Nit1", "Only a small correction is needed."),
@@ -323,18 +323,27 @@ class ReviewEvidenceTest(unittest.TestCase):
                 self.assertFalse(record["complete"])
                 self.assertIn("checker", " ".join(record["reasons"]).lower())
 
-    def test_contested_correctness_remains_partial_with_a_visible_known_blocker(self):
+    def test_contested_checker_decision_is_complete_only_with_a_nonblocking_final_finding(self):
         batch = [{"batch_id": "check1", "role": ARCH, "id": "C1"}]
         events = empty_events({ARCH: role_events(ARCH, [candidate()])})
         events += checker_events(batch, [{"batch_id": "check1", "decision": "CONTESTED"}])
-        record = evidence(
-            events, outcomes=[outcome()], published=publication([final("Blocker1", "Blocker")]),
-        )
+        for finding_id, severity, state, complete in (
+            ("Blocker1", "Blocker", "retained", False),
+            ("ShouldFix1", "Should Fix", "downgraded", True),
+        ):
+            with self.subTest(severity=severity):
+                record = evidence(
+                    events,
+                    outcomes=[outcome(state=state, final_id=finding_id, reason="Human judgment.")],
+                    published=publication([final(finding_id, severity)]),
+                )
 
-        self.assertFalse(record["complete"])
-        self.assertIn("contested", " ".join(record["reasons"]))
-        self.assertEqual(record["candidates"][0]["final_id"], "Blocker1")
-        self.assertTrue(record["candidates"][0]["url"])
+                self.assertEqual(record["complete"], complete, record["reasons"])
+                self.assertEqual(record["candidates"][0]["checker"]["decision"], "CONTESTED")
+                self.assertEqual(record["candidates"][0]["final_id"], finding_id)
+                self.assertTrue(record["candidates"][0]["url"])
+                if not complete:
+                    self.assertIn("CONTESTED", " ".join(record["reasons"]))
 
     def test_nits_require_accounting_and_dropped_candidates_require_a_reason(self):
         events = empty_events({ARCH: role_events(ARCH, [candidate(severity="Nit")])})
