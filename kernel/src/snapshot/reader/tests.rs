@@ -8,7 +8,10 @@ use super::super::snapshot_crc::SnapshotCrc;
 use crate::crc::{DomainMetadataState, SetTransactionState};
 use crate::engine::CancellableEngine;
 use crate::engine::sync::SyncEngine;
-use crate::metrics::MetricEvent;
+use crate::metrics::{
+    DomainMetadataLoadCompleted, DomainMetadataLoadOutcome, MetricEvent,
+    SetTransactionLoadCompleted, SetTransactionLoadOutcome,
+};
 use crate::unit_test_utils::{
     CapturingReporter, TestCancellationToken, install_thread_local_metrics_reporter,
 };
@@ -175,17 +178,50 @@ fn reader_preserves_metadata_metrics_and_errors(#[values(false, true)] cancelled
     let mut metadata_events = 0;
     for event in &events {
         let failed = match event {
-            MetricEvent::DomainMetadataLoadSuccess(e) => {
-                assert!(!e.from_cache);
-                assert_eq!(e.num_domains_returned, 0);
+            MetricEvent::DomainMetadataLoadCompleted(
+                e @ DomainMetadataLoadCompleted {
+                    outcome: DomainMetadataLoadOutcome::Success { .. },
+                    ..
+                },
+            ) => {
+                let DomainMetadataLoadOutcome::Success {
+                    from_cache: metric_e_from_cache,
+                    num_domains_returned: metric_e_num_domains_returned,
+                    ..
+                } = &e.outcome
+                else {
+                    panic!("unexpected metric outcome");
+                };
+                assert!(!(*metric_e_from_cache));
+                assert_eq!((*metric_e_num_domains_returned), 0);
                 false
             }
-            MetricEvent::SetTransactionLoadSuccess(e) => {
-                assert!(!e.from_cache);
-                assert!(e.found);
+            MetricEvent::SetTransactionLoadCompleted(
+                e @ SetTransactionLoadCompleted {
+                    outcome: SetTransactionLoadOutcome::Success { .. },
+                    ..
+                },
+            ) => {
+                let SetTransactionLoadOutcome::Success {
+                    from_cache: metric_e_from_cache,
+                    found: metric_e_found,
+                    ..
+                } = &e.outcome
+                else {
+                    panic!("unexpected metric outcome");
+                };
+                assert!(!(*metric_e_from_cache));
+                assert!((*metric_e_found));
                 false
             }
-            MetricEvent::DomainMetadataLoadFailure | MetricEvent::SetTransactionLoadFailure => true,
+            MetricEvent::DomainMetadataLoadCompleted(DomainMetadataLoadCompleted {
+                outcome: DomainMetadataLoadOutcome::Error,
+                ..
+            })
+            | MetricEvent::SetTransactionLoadCompleted(SetTransactionLoadCompleted {
+                outcome: SetTransactionLoadOutcome::Error,
+                ..
+            }) => true,
             _ => continue,
         };
         assert_eq!(failed, cancelled);

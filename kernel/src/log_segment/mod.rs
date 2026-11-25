@@ -33,9 +33,7 @@ use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
 use crate::log_replay::ActionsBatch;
 #[internal_api]
 use crate::log_segment_files::LogSegmentFiles;
-use crate::metrics::{
-    SnapshotLoadMetricContext, emit_log_segment_load, emit_log_segment_load_failure,
-};
+use crate::metrics::{LogSegmentLoadOutcome, SnapshotLoadMetricContext, emit_log_segment_load};
 use crate::path::LogPathFileType::*;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::path::LogRoot;
@@ -506,7 +504,7 @@ impl LogSegment {
     ///
     /// [`Snapshot`]: crate::snapshot::Snapshot
     ///
-    /// Reports metrics: `LogSegmentLoadSuccess` or `LogSegmentLoadFailure`.
+    /// Reports metrics: `LogSegmentLoadCompleted`.
     #[internal_api]
     #[tracing::instrument(
         name = "log_segment.for_snapshot",
@@ -533,10 +531,19 @@ impl LogSegment {
                 time_travel_version,
             )
         };
-        let log_segment = build()
-            .inspect_err(|_| emit_log_segment_load_failure(&metric_context, start.elapsed()))?;
+        let log_segment = build().inspect_err(|_| {
+            emit_log_segment_load(
+                &metric_context,
+                LogSegmentLoadOutcome::Error,
+                start.elapsed(),
+            )
+        })?;
 
-        emit_log_segment_load(&metric_context, &log_segment, start.elapsed());
+        emit_log_segment_load(
+            &metric_context,
+            LogSegmentLoadOutcome::success(&log_segment),
+            start.elapsed(),
+        );
         Ok(log_segment)
     }
 

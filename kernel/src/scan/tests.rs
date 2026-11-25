@@ -3069,7 +3069,7 @@ mod scan_metadata_completed_tests {
         let MetricEvent::ScanMetadataCompleted(e) = get_scan_event(&reporter) else {
             panic!("expected ScanMetadataCompleted");
         };
-        assert_eq!(e.correlation_id.as_deref(), correlation_id);
+        assert_eq!(e.context.correlation_id.as_deref(), correlation_id);
     }
 
     #[test]

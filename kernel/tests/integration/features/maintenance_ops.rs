@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 use delta_kernel::Snapshot;
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::metrics::{ChecksumWriteResolutionMode, MetricEvent};
+use delta_kernel::metrics::{
+    ChecksumWriteCompleted, ChecksumWriteOutcome, ChecksumWriteResolutionMode, MetricEvent,
+};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::schema_ref;
 use delta_kernel::snapshot::{CheckpointWriteResult, ChecksumWriteResult};
@@ -216,8 +218,16 @@ async fn checkpoint_crc_writes_reject_unsupported_table_features(
         .into_iter()
         .skip(initial_event_count)
         .collect();
-    let [MetricEvent::ChecksumWriteFailure(event)] = events.as_slice() else {
-        panic!("expected one ChecksumWriteFailure event");
+    let [
+        MetricEvent::ChecksumWriteCompleted(
+            event @ ChecksumWriteCompleted {
+                outcome: ChecksumWriteOutcome::Error,
+                ..
+            },
+        ),
+    ] = events.as_slice()
+    else {
+        panic!("expected one ChecksumWriteCompleted event");
     };
     assert_eq!(
         event.resolution_mode,

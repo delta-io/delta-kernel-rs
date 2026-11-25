@@ -347,7 +347,7 @@ mod tests {
                 _ => None,
             })
             .expect("ScanMetadataCompleted emitted");
-        assert_eq!(event.table_type, TableType::CatalogManaged);
+        assert_eq!(event.context.table_type, TableType::CatalogManaged);
         assert_eq!(event.scan_type, ScanType::ParallelPhase);
     }
 }

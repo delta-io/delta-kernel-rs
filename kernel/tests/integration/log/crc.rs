@@ -14,7 +14,9 @@ use delta_kernel::crc::{Crc, DomainMetadataState, SetTransactionState};
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::{DelegatingEngine, PanicEngine};
-use delta_kernel::metrics::{ChecksumWriteResolutionMode, MetricEvent};
+use delta_kernel::metrics::{
+    ChecksumWriteCompleted, ChecksumWriteOutcome, ChecksumWriteResolutionMode, MetricEvent,
+};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::schema::{SchemaRef, schema_ref};
@@ -1266,12 +1268,27 @@ async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_p
         .filter(|event| {
             matches!(
                 event,
-                MetricEvent::ChecksumWriteSuccess(_) | MetricEvent::ChecksumWriteFailure(_)
+                MetricEvent::ChecksumWriteCompleted(ChecksumWriteCompleted {
+                    outcome: ChecksumWriteOutcome::Written { .. }
+                        | ChecksumWriteOutcome::AlreadyExists,
+                    ..
+                }) | MetricEvent::ChecksumWriteCompleted(ChecksumWriteCompleted {
+                    outcome: ChecksumWriteOutcome::Error,
+                    ..
+                })
             )
         })
         .collect();
-    let [MetricEvent::ChecksumWriteFailure(event)] = events.as_slice() else {
-        panic!("expected one ChecksumWriteFailure event");
+    let [
+        MetricEvent::ChecksumWriteCompleted(
+            event @ ChecksumWriteCompleted {
+                outcome: ChecksumWriteOutcome::Error,
+                ..
+            },
+        ),
+    ] = events.as_slice()
+    else {
+        panic!("expected one ChecksumWriteCompleted event");
     };
     assert_eq!(event.resolution_mode, ChecksumWriteResolutionMode::Full);
     assert!(event.duration > Duration::ZERO);

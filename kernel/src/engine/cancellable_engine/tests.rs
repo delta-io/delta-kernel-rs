@@ -13,7 +13,11 @@ use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::EngineDataArrowExt;
 use crate::engine::sync::SyncEngine;
 use crate::engine::{CancellableEngine, DelegatingEngine};
-use crate::metrics::{MeteredDeltaEngine, MetricEvent};
+use crate::metrics::{
+    LogSegmentLoadCompleted, LogSegmentLoadOutcome, MeteredDeltaEngine, MetricEvent,
+    ProtocolMetadataLoadCompleted, ProtocolMetadataLoadOutcome, SnapshotBuildCompleted,
+    SnapshotBuildOutcome,
+};
 use crate::schema::{ColumnName, schema_ref};
 use crate::transaction::create_table::create_table;
 use crate::transaction::data_layout::DataLayout;
@@ -262,34 +266,53 @@ fn cancelled_snapshot_reports_correlated_failure_with_metered_handlers(
     let failure = events
         .iter()
         .filter_map(|event| match event {
-            MetricEvent::SnapshotBuildFailure(failure) => Some(failure),
+            MetricEvent::SnapshotBuildCompleted(
+                failure @ SnapshotBuildCompleted {
+                    outcome: SnapshotBuildOutcome::Error,
+                    ..
+                },
+            ) => Some(failure),
             _ => None,
         })
         .exactly_one()
         .unwrap();
     assert_eq!(
-        failure.correlation_id.as_deref(),
+        failure.context.correlation_id.as_deref(),
         Some("cancelled-snapshot")
     );
     let stage_failure = events.iter().find_map(|event| match event {
-        MetricEvent::LogSegmentLoadFailure(event) if read == Read::List => {
-            Some((event.operation_id, event.correlation_id.as_deref()))
-        }
-        MetricEvent::ProtocolMetadataLoadFailure(event) if read != Read::List => {
-            Some((event.operation_id, event.correlation_id.as_deref()))
-        }
+        MetricEvent::LogSegmentLoadCompleted(
+            event @ LogSegmentLoadCompleted {
+                outcome: LogSegmentLoadOutcome::Error,
+                ..
+            },
+        ) if read == Read::List => Some((
+            event.context.operation_id,
+            event.context.correlation_id.as_deref(),
+        )),
+        MetricEvent::ProtocolMetadataLoadCompleted(
+            event @ ProtocolMetadataLoadCompleted {
+                outcome: ProtocolMetadataLoadOutcome::Error,
+                ..
+            },
+        ) if read != Read::List => Some((
+            event.context.operation_id,
+            event.context.correlation_id.as_deref(),
+        )),
         _ => None,
     });
     assert_eq!(
         stage_failure,
-        Some((failure.operation_id, Some("cancelled-snapshot"))),
+        Some((failure.context.operation_id, Some("cancelled-snapshot"))),
         "{events:?}"
     );
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, MetricEvent::SnapshotBuildSuccess(_)))
-    );
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        MetricEvent::SnapshotBuildCompleted(SnapshotBuildCompleted {
+            outcome: SnapshotBuildOutcome::Success { .. },
+            ..
+        })
+    )));
 }
 
 /// Checks nested read overrides, cumulative HEAD preflight, and unscoped storage writes.

@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex};
 use delta_kernel::Snapshot;
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::metrics::{MetricEvent, MetricsReporter, TableType, TransactionCommitSuccess};
+use delta_kernel::metrics::{
+    MetricEvent, MetricsReporter, TableType, TransactionCommitCompleted, TransactionCommitOutcome,
+};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::{DataType, StructField, schema_ref};
 use delta_kernel::transaction::create_table::create_table;
@@ -27,13 +29,19 @@ use crate::common::write_utils::{
     create_dv_table_with_files, get_scan_files, sequential_dv_descriptors,
 };
 
-/// Reporter that keeps the last `TransactionCommitSuccess` for field-level assertions.
+/// Reporter that keeps the last successful transaction completion for field assertions.
 #[derive(Debug, Default)]
-struct LastCommitSuccess(Mutex<Option<TransactionCommitSuccess>>);
+struct LastCommitSuccess(Mutex<Option<TransactionCommitCompleted>>);
 
 impl MetricsReporter for LastCommitSuccess {
     fn report(&self, event: MetricEvent) {
-        if let MetricEvent::TransactionCommitSuccess(success) = event {
+        if let MetricEvent::TransactionCommitCompleted(
+            success @ TransactionCommitCompleted {
+                outcome: TransactionCommitOutcome::Success { .. },
+                ..
+            },
+        ) = event
+        {
             *self.0.lock().unwrap() = Some(success);
         }
     }
@@ -41,7 +49,7 @@ impl MetricsReporter for LastCommitSuccess {
 
 impl LastCommitSuccess {
     /// Returns the last captured commit-success event, panicking if none was recorded.
-    fn take_success(&self) -> TransactionCommitSuccess {
+    fn take_success(&self) -> TransactionCommitCompleted {
         self.0
             .lock()
             .unwrap()
@@ -90,16 +98,20 @@ async fn commit_append_emits_success_metrics(
     .unwrap_committed();
 
     let success = reporter.take_success();
-    assert_eq!(success.table_type, TableType::PathBased);
-    assert_eq!(success.commit_version, 1);
-    assert_eq!(success.num_add_files, 1);
-    assert!(success.add_files_bytes > 0);
-    assert_eq!(success.num_remove_files, 0);
-    assert_eq!(success.remove_files_bytes, 0);
-    assert_eq!(success.operation.as_deref(), Some(operation));
-    assert_eq!(success.data_change, data_change);
-    assert_eq!(success.is_blind_append, is_blind_append);
-    assert!(success.total_duration >= success.prepare_duration + success.committer_duration);
+    assert_eq!(success.context.table_type, TableType::PathBased);
+
+    let TransactionCommitOutcome::Success { stats } = &success.outcome else {
+        panic!("unexpected metric outcome");
+    };
+    assert_eq!(stats.commit_version, 1);
+    assert_eq!(stats.num_add_files, 1);
+    assert!(stats.add_files_bytes > 0);
+    assert_eq!(stats.num_remove_files, 0);
+    assert_eq!(stats.remove_files_bytes, 0);
+    assert_eq!(stats.operation.as_deref(), Some(operation));
+    assert_eq!(stats.data_change, data_change);
+    assert_eq!(stats.is_blind_append, is_blind_append);
+    assert!(success.duration >= stats.prepare_duration + stats.committer_duration);
     Ok(())
 }
 
@@ -125,11 +137,15 @@ async fn empty_update_commit_preserves_explicit_data_change(
         .unwrap_committed();
 
     let success = reporter.take_success();
-    assert_eq!(success.data_change, data_change);
-    assert_eq!(success.operation.as_deref(), Some("WRITE"));
-    assert_eq!(success.commit_version, 1);
-    assert_eq!(success.num_add_files, 0);
-    assert_eq!(success.num_remove_files, 0);
+
+    let TransactionCommitOutcome::Success { stats } = &success.outcome else {
+        panic!("unexpected metric outcome");
+    };
+    assert_eq!(stats.data_change, data_change);
+    assert_eq!(stats.operation.as_deref(), Some("WRITE"));
+    assert_eq!(stats.commit_version, 1);
+    assert_eq!(stats.num_add_files, 0);
+    assert_eq!(stats.num_remove_files, 0);
     let fresh = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     assert_eq!(fresh.schema().contains("added"), schema_change);
     Ok(())
@@ -173,7 +189,11 @@ async fn commit_reports_added_file_count_not_batch_count() -> delta_kernel::Resu
     txn.commit(engine.as_ref())?.unwrap_committed();
 
     let success = reporter.take_success();
-    assert_eq!(success.num_add_files, 4);
+
+    let TransactionCommitOutcome::Success { stats } = &success.outcome else {
+        panic!("unexpected metric outcome");
+    };
+    assert_eq!(stats.num_add_files, 4);
     Ok(())
 }
 
@@ -191,8 +211,15 @@ async fn commit_success_carries_correlation_id() -> delta_kernel::Result<()> {
         .unwrap_committed();
 
     let success = reporter.take_success();
-    assert_eq!(success.commit_version, 0);
-    assert_eq!(success.correlation_id.as_deref(), Some("commit-req-1"));
+
+    let TransactionCommitOutcome::Success { stats } = &success.outcome else {
+        panic!("unexpected metric outcome");
+    };
+    assert_eq!(stats.commit_version, 0);
+    assert_eq!(
+        success.context.correlation_id.as_deref(),
+        Some("commit-req-1")
+    );
     Ok(())
 }
 
@@ -222,8 +249,12 @@ async fn create_table_builder_carries_correlation_id(
         .unwrap_committed();
 
     let success = reporter.take_success();
-    assert_eq!(success.commit_version, 0);
-    assert_eq!(success.correlation_id.as_deref(), expected);
+
+    let TransactionCommitOutcome::Success { stats } = &success.outcome else {
+        panic!("unexpected metric outcome");
+    };
+    assert_eq!(stats.commit_version, 0);
+    assert_eq!(success.context.correlation_id.as_deref(), expected);
     Ok(())
 }
 
@@ -261,9 +292,13 @@ async fn alter_table_builder_carries_correlation_id(
         .unwrap_committed();
 
     let success = reporter.take_success();
-    assert_eq!(success.commit_version, 1);
-    assert_eq!(success.correlation_id.as_deref(), expected);
-    assert!(!success.data_change);
+
+    let TransactionCommitOutcome::Success { stats } = &success.outcome else {
+        panic!("unexpected metric outcome");
+    };
+    assert_eq!(stats.commit_version, 1);
+    assert_eq!(success.context.correlation_id.as_deref(), expected);
+    assert!(!stats.data_change);
     Ok(())
 }
 
@@ -330,7 +365,7 @@ async fn commit_success_carries_table_type(
 
     let success = reporter.take_success();
     assert_eq!(
-        success.table_type,
+        success.context.table_type,
         TableType::from_catalog_managed(catalog_managed)
     );
     Ok(())
@@ -380,7 +415,11 @@ async fn commit_dv_update_reports_updated_file_count_not_batch_count() -> delta_
     txn.commit(engine.as_ref())?.unwrap_committed();
 
     let success = reporter.take_success();
-    assert_eq!(success.num_dv_updates, 3);
+
+    let TransactionCommitOutcome::Success { stats } = &success.outcome else {
+        panic!("unexpected metric outcome");
+    };
+    assert_eq!(stats.num_dv_updates, 3);
     Ok(())
 }
 
@@ -420,6 +459,10 @@ async fn commit_dv_update_accumulates_file_count_across_calls() -> delta_kernel:
     txn.commit(engine.as_ref())?.unwrap_committed();
 
     let success = reporter.take_success();
-    assert_eq!(success.num_dv_updates, 2);
+
+    let TransactionCommitOutcome::Success { stats } = &success.outcome else {
+        panic!("unexpected metric outcome");
+    };
+    assert_eq!(stats.num_dv_updates, 2);
     Ok(())
 }

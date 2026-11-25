@@ -543,7 +543,7 @@ mod tests {
         let correlation_for = |phase: ScanType| {
             reporter.events().into_iter().find_map(|e| match e {
                 MetricEvent::ScanMetadataCompleted(s) if s.scan_type == phase => {
-                    Some(s.correlation_id)
+                    Some(s.context.correlation_id)
                 }
                 _ => None,
             })
@@ -1147,7 +1147,7 @@ mod tests {
                 MetricEvent::ScanMetadataCompleted(s)
                     if s.scan_type == ScanType::SequentialPhase =>
                 {
-                    Some(s.operation_id)
+                    Some(s.context.operation_id)
                 }
                 _ => None,
             })
@@ -1165,7 +1165,7 @@ mod tests {
             .into_iter()
             .find_map(|e| match e {
                 MetricEvent::ScanMetadataCompleted(s) if s.scan_type == ScanType::ParallelPhase => {
-                    Some(s.operation_id)
+                    Some(s.context.operation_id)
                 }
                 _ => None,
             })

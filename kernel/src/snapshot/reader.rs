@@ -141,7 +141,7 @@ impl<'a> SnapshotReader<'a> {
     /// commits after a stale CRC with complete transaction state, skipping the checkpoint, or to
     /// replay the full log when no such CRC is available.
     ///
-    /// Reports `SetTransactionLoadSuccess` or `SetTransactionLoadFailure`. Returns read,
+    /// Reports `SetTransactionLoadCompleted`. Returns read,
     /// retention-property, or cancellation errors.
     pub fn get_app_id_version(
         &self,
@@ -226,7 +226,7 @@ impl<'a> SnapshotReader<'a> {
     /// reconcile them against its map, skipping the checkpoint, or replays the full log when no
     /// such CRC is available.
     ///
-    /// Reports `DomainMetadataLoadSuccess` or `DomainMetadataLoadFailure`. Returns read or
+    /// Reports `DomainMetadataLoadCompleted`. Returns read or
     /// cancellation errors.
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[internal_api]

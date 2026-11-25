@@ -7,7 +7,10 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::{Committer, FileSystemCommitter};
-use delta_kernel::metrics::{MetricEvent, TableType};
+use delta_kernel::metrics::{
+    LogSegmentLoadCompleted, LogSegmentLoadOutcome, MetricEvent, ProtocolMetadataLoadCompleted,
+    ProtocolMetadataLoadOutcome, SnapshotBuildCompleted, SnapshotBuildOutcome, TableType,
+};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{Engine, Snapshot};
 use rstest::rstest;
@@ -66,9 +69,9 @@ async fn test_metric_events_carry_table_type(
     assert_table_types(
         &reporter.events(),
         &[
-            "LogSegmentLoadSuccess",
-            "ProtocolMetadataLoadSuccess",
-            "SnapshotBuildSuccess",
+            "LogSegmentLoadCompleted",
+            "ProtocolMetadataLoadCompleted",
+            "SnapshotBuildCompleted",
             "ScanMetadataCompleted",
         ],
         expected,
@@ -98,7 +101,7 @@ async fn test_snapshot_failure_events_carry_table_type(#[case] catalog_managed: 
     let expected = TableType::from_catalog_managed(catalog_managed);
     assert_table_types(
         &reporter.events(),
-        &["LogSegmentLoadFailure", "SnapshotBuildFailure"],
+        &["LogSegmentLoadCompleted", "SnapshotBuildCompleted"],
         expected,
     );
 }
@@ -129,7 +132,7 @@ async fn test_protocol_metadata_load_failure_carries_table_type(#[case] catalog_
     let expected = TableType::from_catalog_managed(catalog_managed);
     assert_table_types(
         &reporter.events(),
-        &["ProtocolMetadataLoadFailure", "SnapshotBuildFailure"],
+        &["ProtocolMetadataLoadCompleted", "SnapshotBuildCompleted"],
         expected,
     );
 }
@@ -167,15 +170,15 @@ async fn test_build_events_carry_requested_table_type_across_protocol_mismatch(
     let result = builder.build(engine.as_ref());
     let expected_build_event = if create_catalog_managed && !explicit_version {
         assert!(result.is_err());
-        "SnapshotBuildFailure"
+        "SnapshotBuildCompleted"
     } else {
         assert_eq!(result?.version(), 0);
-        "SnapshotBuildSuccess"
+        "SnapshotBuildCompleted"
     };
 
     assert_table_types(
         &reporter.events(),
-        &["ProtocolMetadataLoadSuccess", expected_build_event],
+        &["ProtocolMetadataLoadCompleted", expected_build_event],
         expected,
     );
     Ok(())
@@ -215,17 +218,45 @@ fn table_types(events: &[MetricEvent]) -> Vec<(&'static str, TableType)> {
     events
         .iter()
         .filter_map(|e| match e {
-            MetricEvent::LogSegmentLoadSuccess(e) => Some(("LogSegmentLoadSuccess", e.table_type)),
-            MetricEvent::LogSegmentLoadFailure(e) => Some(("LogSegmentLoadFailure", e.table_type)),
-            MetricEvent::ProtocolMetadataLoadSuccess(e) => {
-                Some(("ProtocolMetadataLoadSuccess", e.table_type))
+            MetricEvent::LogSegmentLoadCompleted(
+                e @ LogSegmentLoadCompleted {
+                    outcome: LogSegmentLoadOutcome::Success { .. },
+                    ..
+                },
+            ) => Some(("LogSegmentLoadCompleted", e.context.table_type)),
+            MetricEvent::LogSegmentLoadCompleted(
+                e @ LogSegmentLoadCompleted {
+                    outcome: LogSegmentLoadOutcome::Error,
+                    ..
+                },
+            ) => Some(("LogSegmentLoadCompleted", e.context.table_type)),
+            MetricEvent::ProtocolMetadataLoadCompleted(
+                e @ ProtocolMetadataLoadCompleted {
+                    outcome: ProtocolMetadataLoadOutcome::Success { .. },
+                    ..
+                },
+            ) => Some(("ProtocolMetadataLoadCompleted", e.context.table_type)),
+            MetricEvent::ProtocolMetadataLoadCompleted(
+                e @ ProtocolMetadataLoadCompleted {
+                    outcome: ProtocolMetadataLoadOutcome::Error,
+                    ..
+                },
+            ) => Some(("ProtocolMetadataLoadCompleted", e.context.table_type)),
+            MetricEvent::SnapshotBuildCompleted(
+                e @ SnapshotBuildCompleted {
+                    outcome: SnapshotBuildOutcome::Success { .. },
+                    ..
+                },
+            ) => Some(("SnapshotBuildCompleted", e.context.table_type)),
+            MetricEvent::SnapshotBuildCompleted(
+                e @ SnapshotBuildCompleted {
+                    outcome: SnapshotBuildOutcome::Error,
+                    ..
+                },
+            ) => Some(("SnapshotBuildCompleted", e.context.table_type)),
+            MetricEvent::ScanMetadataCompleted(e) => {
+                Some(("ScanMetadataCompleted", e.context.table_type))
             }
-            MetricEvent::ProtocolMetadataLoadFailure(e) => {
-                Some(("ProtocolMetadataLoadFailure", e.table_type))
-            }
-            MetricEvent::SnapshotBuildSuccess(e) => Some(("SnapshotBuildSuccess", e.table_type)),
-            MetricEvent::SnapshotBuildFailure(e) => Some(("SnapshotBuildFailure", e.table_type)),
-            MetricEvent::ScanMetadataCompleted(e) => Some(("ScanMetadataCompleted", e.table_type)),
             _ => None,
         })
         .collect()

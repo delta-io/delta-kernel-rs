@@ -129,7 +129,9 @@ mod tests {
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::engine_data::FilteredEngineData;
     use delta_kernel::expressions::ColumnName;
-    use delta_kernel::metrics::MetricEvent;
+    use delta_kernel::metrics::{
+        MetricEvent, TransactionCommitCompleted, TransactionCommitOutcome,
+    };
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
@@ -2310,13 +2312,22 @@ mod tests {
             .events()
             .into_iter()
             .find_map(|event| match event {
-                MetricEvent::TransactionCommitSuccess(metrics) => Some(metrics),
+                MetricEvent::TransactionCommitCompleted(
+                    metrics @ TransactionCommitCompleted {
+                        outcome: TransactionCommitOutcome::Success { .. },
+                        ..
+                    },
+                ) => Some(metrics),
                 _ => None,
             })
             .expect("create-table commit metrics");
-        assert_eq!(metrics.data_change, expected_data_change);
-        assert_eq!(metrics.num_add_files, 0);
-        assert_eq!(metrics.num_remove_files, 0);
+
+        let TransactionCommitOutcome::Success { stats } = &metrics.outcome else {
+            panic!("unexpected metric outcome");
+        };
+        assert_eq!(stats.data_change, expected_data_change);
+        assert_eq!(stats.num_add_files, 0);
+        assert_eq!(stats.num_remove_files, 0);
 
         // Verify by opening a snapshot of the created table
         let snap =
@@ -3325,13 +3336,22 @@ mod tests {
             .events()
             .into_iter()
             .find_map(|event| match event {
-                MetricEvent::TransactionCommitSuccess(metrics) => Some(metrics),
+                MetricEvent::TransactionCommitCompleted(
+                    metrics @ TransactionCommitCompleted {
+                        outcome: TransactionCommitOutcome::Success { .. },
+                        ..
+                    },
+                ) => Some(metrics),
                 _ => None,
             })
             .expect("update-table commit metrics");
-        assert_eq!(metrics.data_change, data_change);
-        assert_eq!(metrics.num_add_files, 0);
-        assert_eq!(metrics.num_remove_files, 0);
+
+        let TransactionCommitOutcome::Success { stats } = &metrics.outcome else {
+            panic!("unexpected metric outcome");
+        };
+        assert_eq!(stats.data_change, data_change);
+        assert_eq!(stats.num_add_files, 0);
+        assert_eq!(stats.num_remove_files, 0);
         unsafe { free_engine(engine) };
     }
 

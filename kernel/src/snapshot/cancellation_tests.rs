@@ -9,7 +9,11 @@ use url::Url;
 
 use super::IncrementalReplay;
 use crate::engine::sync::SyncEngine;
-use crate::metrics::{LogSegmentLoadType, MetricEvent, SnapshotLoadType};
+use crate::metrics::{
+    LogSegmentLoadCompleted, LogSegmentLoadOutcome, LogSegmentLoadType, MetricEvent,
+    ProtocolMetadataLoadCompleted, ProtocolMetadataLoadOutcome, SnapshotBuildCompleted,
+    SnapshotBuildOutcome, SnapshotLoadType,
+};
 use crate::unit_test_utils::recording_reads::{Read, RecordingReads};
 use crate::unit_test_utils::{
     CapturingReporter, copy_test_table, install_thread_local_metrics_reporter,
@@ -157,30 +161,52 @@ fn only_cancelled_crc_read_blocks_incremental_snapshot_build(
         .filter(|event| {
             matches!(
                 event,
-                MetricEvent::ProtocolMetadataLoadFailure(_) | MetricEvent::SnapshotBuildFailure(_)
+                MetricEvent::ProtocolMetadataLoadCompleted(ProtocolMetadataLoadCompleted {
+                    outcome: ProtocolMetadataLoadOutcome::Error,
+                    ..
+                }) | MetricEvent::SnapshotBuildCompleted(SnapshotBuildCompleted {
+                    outcome: SnapshotBuildOutcome::Error,
+                    ..
+                })
             )
         })
         .collect();
     let [
-        MetricEvent::ProtocolMetadataLoadFailure(pm),
-        MetricEvent::SnapshotBuildFailure(build),
+        MetricEvent::ProtocolMetadataLoadCompleted(
+            pm @ ProtocolMetadataLoadCompleted {
+                outcome: ProtocolMetadataLoadOutcome::Error,
+                ..
+            },
+        ),
+        MetricEvent::SnapshotBuildCompleted(
+            build @ SnapshotBuildCompleted {
+                outcome: SnapshotBuildOutcome::Error,
+                ..
+            },
+        ),
     ] = failures.as_slice()
     else {
         panic!("expected one protocol/metadata and snapshot failure: {events:?}");
     };
-    assert_eq!(pm.operation_id, build.operation_id);
+    assert_eq!(pm.context.operation_id, build.context.operation_id);
     assert_eq!(
-        pm.correlation_id.as_deref(),
+        pm.context.correlation_id.as_deref(),
         Some("incremental-crc-failure")
     );
-    assert_eq!(pm.correlation_id, build.correlation_id);
+    assert_eq!(pm.context.correlation_id, build.context.correlation_id);
     assert_eq!(pm.load_type, LogSegmentLoadType::Incremental);
     assert_eq!(build.load_type, SnapshotLoadType::Incremental);
     assert!(pm.duration >= delay);
     assert!(build.duration >= pm.duration);
     assert!(!events.iter().any(|event| matches!(
         event,
-        MetricEvent::ProtocolMetadataLoadSuccess(_) | MetricEvent::SnapshotBuildSuccess(_)
+        MetricEvent::ProtocolMetadataLoadCompleted(ProtocolMetadataLoadCompleted {
+            outcome: ProtocolMetadataLoadOutcome::Success { .. },
+            ..
+        }) | MetricEvent::SnapshotBuildCompleted(SnapshotBuildCompleted {
+            outcome: SnapshotBuildOutcome::Success { .. },
+            ..
+        })
     )));
 }
 
@@ -217,12 +243,24 @@ fn engine_reported_cancellation_without_token_preserves_failure_duration(
     let (duration, load_type) = events
         .iter()
         .find_map(|event| match (failed_read, event) {
-            (Read::List, MetricEvent::LogSegmentLoadFailure(event)) => {
-                Some((event.duration, event.load_type))
-            }
-            (Read::Crc, MetricEvent::ProtocolMetadataLoadFailure(event)) => {
-                Some((event.duration, event.load_type))
-            }
+            (
+                Read::List,
+                MetricEvent::LogSegmentLoadCompleted(
+                    event @ LogSegmentLoadCompleted {
+                        outcome: LogSegmentLoadOutcome::Error,
+                        ..
+                    },
+                ),
+            ) => Some((event.duration, event.load_type)),
+            (
+                Read::Crc,
+                MetricEvent::ProtocolMetadataLoadCompleted(
+                    event @ ProtocolMetadataLoadCompleted {
+                        outcome: ProtocolMetadataLoadOutcome::Error,
+                        ..
+                    },
+                ),
+            ) => Some((event.duration, event.load_type)),
             _ => None,
         })
         .expect("expected a metric for the failed operation");
@@ -237,7 +275,7 @@ fn engine_reported_cancellation_without_token_preserves_failure_duration(
     );
     assert!(matches!(
         events.last(),
-        Some(MetricEvent::SnapshotBuildFailure(event)) if event.duration >= duration
+        Some(MetricEvent::SnapshotBuildCompleted(event)) if event.duration >= duration
     ));
 }
 

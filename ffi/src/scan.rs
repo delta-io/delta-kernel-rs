@@ -1328,7 +1328,7 @@ mod scan_builder_tests {
                 .collect();
             assert_eq!(completions.len(), 1);
             assert_eq!(
-                completions[0].correlation_id.as_deref(),
+                completions[0].context.correlation_id.as_deref(),
                 if clear { None } else { Some("scan-request") },
             );
             unsafe { free_scan(scan) };

@@ -10,10 +10,16 @@
 //! Events with an `operation_id` use [`MetricId`] for correlation. Handler and file-read events,
 //! including `_last_checkpoint` reads, do not carry an operation ID.
 //!
+//! Events with outcome enums keep elapsed time and other attempt-wide measurements outside
+//! their outcome. Each operation has its own outcome enum: result-specific fields appear only
+//! in the variant where they apply. [`MetricContext`] holds shared identity and table labels.
+//!
 //! # Example: Implementing a Custom MetricsReporter
 //!
 //! ```
-//! use delta_kernel::metrics::{MetricsReporter, MetricEvent};
+//! use delta_kernel::metrics::{
+//!     LogSegmentLoadOutcome, MetricEvent, MetricsReporter, SnapshotBuildOutcome,
+//! };
 //!
 //! #[derive(Debug)]
 //! struct LoggingReporter;
@@ -21,15 +27,19 @@
 //! impl MetricsReporter for LoggingReporter {
 //!     fn report(&self, event: MetricEvent) {
 //!         match event {
-//!             MetricEvent::LogSegmentLoadSuccess(e) => {
-//!                 println!("Log segment loaded in {:?}: {} commits", e.duration, e.num_commit_files);
+//!             MetricEvent::LogSegmentLoadCompleted(e) => {
+//!                 if let LogSegmentLoadOutcome::Success { stats } = e.outcome {
+//!                     println!("Loaded {} commits in {:?}", stats.num_commit_files, e.duration);
+//!                 }
 //!             }
-//!             MetricEvent::SnapshotBuildSuccess(e) => {
-//!                 println!("Snapshot completed: v{} in {:?}", e.version, e.duration);
-//!             }
-//!             MetricEvent::SnapshotBuildFailure(e) => {
-//!                 println!("Snapshot {} failed after {:?}", e.operation_id, e.duration);
-//!             }
+//!             MetricEvent::SnapshotBuildCompleted(e) => match e.outcome {
+//!                 SnapshotBuildOutcome::Success { version } => {
+//!                     println!("Snapshot v{} completed in {:?}", version, e.duration);
+//!                 }
+//!                 SnapshotBuildOutcome::Error => {
+//!                     println!("Snapshot {} failed after {:?}", e.context.operation_id, e.duration);
+//!                 }
+//!             },
 //!             _ => {}
 //!         }
 //!     }
@@ -89,22 +99,20 @@ mod streaming_metrics_iterator;
 use std::sync::Arc;
 
 pub use events::{
-    CheckpointOutputStats, CheckpointProcessingStats, CheckpointWriteFailure, CheckpointWriteMode,
-    CheckpointWriteOutcome, CheckpointWriteStats, CheckpointWriteSuccess, ChecksumWriteFailure,
-    ChecksumWriteOutcome, ChecksumWriteResolutionMode, ChecksumWriteSuccess, CommitFailureReason,
-    CrcReadSuccess, DomainMetadataLoadSuccess, JsonReadCompleted, LastCheckpointReadCompleted,
-    LastCheckpointReadOutcome, LogSegmentLoadFailure, LogSegmentLoadSuccess, LogSegmentLoadType,
-    MetricEvent, MetricId, ParquetReadCompleted, ProtocolMetadataLoadFailure,
-    ProtocolMetadataLoadSuccess, ProtocolMetadataSource, ScanMetadataCompleted, ScanType,
-    SetTransactionLoadSuccess, SnapshotBuildFailure, SnapshotBuildSuccess,
+    CheckpointOutputStats, CheckpointProcessingStats, CheckpointWriteCompleted,
+    CheckpointWriteMode, CheckpointWriteOutcome, CheckpointWriteStats, ChecksumWriteCompleted,
+    ChecksumWriteOutcome, ChecksumWriteResolutionMode, CommitFailureReason, CrcReadCompleted,
+    CrcReadOutcome, DomainMetadataLoadCompleted, DomainMetadataLoadOutcome, JsonReadCompleted,
+    LastCheckpointReadCompleted, LastCheckpointReadOutcome, LogSegmentLoadCompleted,
+    LogSegmentLoadOutcome, LogSegmentLoadStats, LogSegmentLoadType, MetricContext, MetricEvent,
+    MetricId, ParquetReadCompleted, ProtocolMetadataLoadCompleted, ProtocolMetadataLoadOutcome,
+    ProtocolMetadataSource, ScanMetadataCompleted, ScanType, SetTransactionLoadCompleted,
+    SetTransactionLoadOutcome, SnapshotBuildCompleted, SnapshotBuildOutcome,
     SnapshotLoadMetricContext, SnapshotLoadType, StorageCopyCompleted, StorageListCompleted,
-    StorageReadCompleted, TableType, TransactionCommitFailure, TransactionCommitSuccess,
-    emit_json_read_completed, emit_parquet_read_completed,
+    StorageReadCompleted, TableType, TransactionCommitCompleted, TransactionCommitOutcome,
+    TransactionCommitStats, emit_json_read_completed, emit_parquet_read_completed,
 };
-pub(crate) use events::{
-    emit_log_segment_load, emit_log_segment_load_failure, emit_protocol_metadata_load,
-    emit_protocol_metadata_load_failure,
-};
+pub(crate) use events::{emit_log_segment_load, emit_protocol_metadata_load};
 pub use frame_reporter::{ENABLE_CALL_FRAME_FIELD, FrameReporter, FrameReporterLayer};
 pub use metered_engine::MeteredDeltaEngine;
 pub use metered_json::MeteredJsonHandler;

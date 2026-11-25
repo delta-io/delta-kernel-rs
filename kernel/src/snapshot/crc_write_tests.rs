@@ -11,7 +11,9 @@ use crate::committer::FileSystemCommitter;
 use crate::crc::FileStatsState;
 use crate::engine::DelegatingEngine;
 use crate::engine::sync::SyncEngine;
-use crate::metrics::{ChecksumWriteOutcome, ChecksumWriteResolutionMode, MetricEvent};
+use crate::metrics::{
+    ChecksumWriteCompleted, ChecksumWriteOutcome, ChecksumWriteResolutionMode, MetricEvent,
+};
 use crate::path::ParsedLogPath;
 use crate::schema::{DataType, StructField, StructType};
 use crate::transaction::UpdateTableOperation;
@@ -69,7 +71,14 @@ fn write_events(reporter: &CapturingReporter) -> Vec<MetricEvent> {
         .filter(|event| {
             matches!(
                 event,
-                MetricEvent::ChecksumWriteSuccess(_) | MetricEvent::ChecksumWriteFailure(_)
+                MetricEvent::ChecksumWriteCompleted(ChecksumWriteCompleted {
+                    outcome: ChecksumWriteOutcome::Written { .. }
+                        | ChecksumWriteOutcome::AlreadyExists,
+                    ..
+                }) | MetricEvent::ChecksumWriteCompleted(ChecksumWriteCompleted {
+                    outcome: ChecksumWriteOutcome::Error,
+                    ..
+                })
             )
         })
         .collect()
@@ -97,8 +106,14 @@ fn crc_write_reports_utf8_bytes_and_completes_while_snapshot_is_alive(
 
     let events = write_events(&reporter);
     assert_eq!(events.len(), initial_write_count + 1);
-    let MetricEvent::ChecksumWriteSuccess(event) = &events[initial_write_count] else {
-        panic!("expected ChecksumWriteSuccess");
+    let MetricEvent::ChecksumWriteCompleted(
+        event @ ChecksumWriteCompleted {
+            outcome: ChecksumWriteOutcome::Written { .. } | ChecksumWriteOutcome::AlreadyExists,
+            ..
+        },
+    ) = &events[initial_write_count]
+    else {
+        panic!("expected ChecksumWriteCompleted");
     };
     assert_eq!(event.resolution_mode, expected_mode);
     assert!(event.duration > Duration::ZERO);
@@ -149,8 +164,14 @@ fn crc_write_already_exists_reports_no_bytes(
 
     let events = write_events(&reporter);
     assert_eq!(events.len(), 2);
-    let MetricEvent::ChecksumWriteSuccess(event) = &events[1] else {
-        panic!("expected ChecksumWriteSuccess");
+    let MetricEvent::ChecksumWriteCompleted(
+        event @ ChecksumWriteCompleted {
+            outcome: ChecksumWriteOutcome::Written { .. } | ChecksumWriteOutcome::AlreadyExists,
+            ..
+        },
+    ) = &events[1]
+    else {
+        panic!("expected ChecksumWriteCompleted");
     };
     assert_eq!(event.outcome, ChecksumWriteOutcome::AlreadyExists);
     assert_eq!(event.resolution_mode, expected_mode);
@@ -195,8 +216,14 @@ fn crc_write_resolution_or_validation_error_retains_mode_and_duration(
     let elapsed = start.elapsed();
     let events = write_events(&reporter);
     assert_eq!(events.len(), initial_write_count + 1);
-    let MetricEvent::ChecksumWriteFailure(event) = &events[initial_write_count] else {
-        panic!("expected ChecksumWriteFailure");
+    let MetricEvent::ChecksumWriteCompleted(
+        event @ ChecksumWriteCompleted {
+            outcome: ChecksumWriteOutcome::Error,
+            ..
+        },
+    ) = &events[initial_write_count]
+    else {
+        panic!("expected ChecksumWriteCompleted");
     };
     assert_eq!(event.resolution_mode, expected_mode);
     assert!(event.duration > Duration::ZERO);
@@ -218,8 +245,14 @@ fn crc_write_snapshot_update_error_reports_failure_after_successful_put() -> Res
     assert!(engine.storage_handler().head(&path.location).is_ok());
     let events = write_events(&reporter);
     assert_eq!(events.len(), 1);
-    let MetricEvent::ChecksumWriteFailure(event) = &events[0] else {
-        panic!("expected ChecksumWriteFailure");
+    let MetricEvent::ChecksumWriteCompleted(
+        event @ ChecksumWriteCompleted {
+            outcome: ChecksumWriteOutcome::Error,
+            ..
+        },
+    ) = &events[0]
+    else {
+        panic!("expected ChecksumWriteCompleted");
     };
     assert_eq!(event.resolution_mode, ChecksumWriteResolutionMode::Cached);
     assert!(event.duration > Duration::ZERO);
@@ -297,14 +330,31 @@ fn crc_write_duration_includes_storage_even_on_error(
     let events = write_events(&reporter);
     assert_eq!(events.len(), initial_write_count + 1);
     let (resolution_mode, duration) = match (&events[initial_write_count], fail) {
-        (MetricEvent::ChecksumWriteSuccess(event), false) => {
+        (
+            MetricEvent::ChecksumWriteCompleted(
+                event @ ChecksumWriteCompleted {
+                    outcome:
+                        ChecksumWriteOutcome::Written { .. } | ChecksumWriteOutcome::AlreadyExists,
+                    ..
+                },
+            ),
+            false,
+        ) => {
             assert!(matches!(
                 event.outcome,
                 ChecksumWriteOutcome::Written { .. }
             ));
             (event.resolution_mode, event.duration)
         }
-        (MetricEvent::ChecksumWriteFailure(event), true) => (event.resolution_mode, event.duration),
+        (
+            MetricEvent::ChecksumWriteCompleted(
+                event @ ChecksumWriteCompleted {
+                    outcome: ChecksumWriteOutcome::Error,
+                    ..
+                },
+            ),
+            true,
+        ) => (event.resolution_mode, event.duration),
         (event, _) => panic!("unexpected checksum write event: {event:?}"),
     };
     assert_eq!(resolution_mode, expected_mode);
