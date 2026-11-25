@@ -146,55 +146,36 @@ fn reader_no_io_getters_can_succeed_after_cancellation() {
 }
 
 #[test]
-fn rebinding_shared_snapshot_keeps_other_readers_identity() {
+fn domain_reads_use_the_current_request_and_table_labels() {
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let engine = SyncEngine::new();
+    let original_id = "original";
+    let original_path = "/tables/original";
     let snapshot = Snapshot::builder_for("tests/data/app-txn-no-checkpoint")
-        .with_table_id("original")
-        .with_metric_table_path("/tables/original")
+        .with_correlation_id("initial-build")
+        .with_table_id(original_id)
+        .with_metric_table_path(original_path)
         .build(&engine)
         .unwrap();
-    let rebound = snapshot.clone().with_metric_table_id(Some("other".into()));
+    let inherited = Snapshot::builder_from(snapshot.clone())
+        .build(&engine)
+        .unwrap();
+    let rebound = inherited.clone().with_metric_table_id(Some("other".into()));
     let cleared = Snapshot::builder_from(rebound.clone().with_metric_table_id(None))
         .with_metric_table_path("")
         .build(&engine)
         .unwrap();
-    for view in [&rebound, &cleared, &snapshot] {
+    let original_labels = (Some(original_id), Some(original_path));
+    let reads_to_make = [
+        ("first", &snapshot, original_labels),
+        ("second", &snapshot, original_labels),
+        ("inherited", &inherited, original_labels),
+        ("rebound", &rebound, (Some("other"), Some(original_path))),
+        ("cleared", &cleared, (None, None)),
+    ];
+    for (request, view, _) in reads_to_make {
         view.reader()
-            .get_domain_metadata("missing", &engine)
-            .unwrap();
-    }
-    let ids: Vec<_> = reporter
-        .events()
-        .into_iter()
-        .filter_map(|event| match event {
-            MetricEvent::DomainMetadataLoadSuccess(e) => Some((e.table_id, e.table_path)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        ids,
-        [
-            (Some("other".into()), Some("/tables/original".into())),
-            (None, None),
-            (Some("original".into()), Some("/tables/original".into())),
-        ]
-    );
-}
-
-#[test]
-fn domain_reads_use_the_current_request_on_a_shared_snapshot() {
-    let reporter = Arc::new(CapturingReporter::default());
-    let _guard = install_thread_local_metrics_reporter(reporter.clone());
-    let engine = SyncEngine::new();
-    let snapshot = Snapshot::builder_for("tests/data/app-txn-no-checkpoint")
-        .with_correlation_id("initial-build")
-        .build(&engine)
-        .unwrap();
-    for request in ["first", "second"] {
-        snapshot
-            .reader()
             .with_correlation_id(request)
             .get_domain_metadata("missing", &engine)
             .unwrap();
@@ -203,16 +184,17 @@ fn domain_reads_use_the_current_request_on_a_shared_snapshot() {
         .events()
         .into_iter()
         .filter_map(|event| match event {
-            MetricEvent::DomainMetadataLoadSuccess(read) => {
-                Some((read.operation_id, read.correlation_id))
-            }
+            MetricEvent::DomainMetadataLoadSuccess(read) => Some(read),
             _ => None,
         })
         .collect();
-    assert_eq!(reads.len(), 2);
-    assert_ne!(reads[0].0, reads[1].0);
-    assert_eq!(reads[0].1.as_deref(), Some("first"));
-    assert_eq!(reads[1].1.as_deref(), Some("second"));
+    assert_eq!(reads.len(), reads_to_make.len());
+    assert_ne!(reads[0].operation_id, reads[1].operation_id);
+    for (read, (request, _, (table_id, table_path))) in reads.iter().zip(reads_to_make) {
+        assert_eq!(read.correlation_id.as_deref(), Some(request));
+        assert_eq!(read.table_id.as_deref(), table_id);
+        assert_eq!(read.table_path.as_deref(), table_path);
+    }
 }
 
 /// Reader delegation preserves metadata success/failure metrics and validation errors.

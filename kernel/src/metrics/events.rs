@@ -129,69 +129,69 @@ pub enum MetricEvent {
     StorageCopyCompleted(StorageCopyCompleted),
 }
 
+#[derive(Default)]
+pub(super) struct ReadMetricIdentity<'a> {
+    pub(super) operation_id: Option<MetricId>,
+    pub(super) correlation_id: Option<&'a str>,
+    pub(super) table_id: Option<&'a str>,
+    pub(super) table_path: Option<&'a str>,
+}
+
 impl MetricEvent {
     /// The opaque table identifier supplied by the caller for this operation.
     pub fn table_id(&self) -> Option<&str> {
-        match self {
-            Self::SnapshotBuildSuccess(e) => e.table_id.as_deref(),
-            Self::ProtocolMetadataLoadSuccess(e) => e.table_id.as_deref(),
-            Self::DomainMetadataLoadSuccess(e) => e.table_id.as_deref(),
-            Self::DomainMetadataLoadFailure { table_id, .. } => table_id.as_deref(),
-            Self::CrcReadSuccess(e) => e.table_id.as_deref(),
-            Self::CrcReadFailure { table_id, .. } => table_id.as_deref(),
-            Self::LogSegmentLoadSuccess(e) => e.table_id.as_deref(),
-            Self::LogSegmentLoadFailure(e) => e.table_id.as_deref(),
-            Self::ProtocolMetadataLoadFailure(e) => e.table_id.as_deref(),
-            Self::SnapshotBuildFailure(e) => e.table_id.as_deref(),
-            Self::LastCheckpointReadCompleted(e) => e.table_id.as_deref(),
-            Self::ScanMetadataCompleted(e) => e.table_id.as_deref(),
-            _ => None,
-        }
+        self.read_identity().table_id
     }
 
     /// The table root label supplied by the caller for this operation.
     pub fn table_path(&self) -> Option<&str> {
-        match self {
-            Self::SnapshotBuildSuccess(e) => e.table_path.as_deref(),
-            Self::ProtocolMetadataLoadSuccess(e) => e.table_path.as_deref(),
-            Self::DomainMetadataLoadSuccess(e) => e.table_path.as_deref(),
-            Self::DomainMetadataLoadFailure { table_path, .. } => table_path.as_deref(),
-            Self::CrcReadSuccess(e) => e.table_path.as_deref(),
-            Self::CrcReadFailure { table_path, .. } => table_path.as_deref(),
-            Self::LogSegmentLoadSuccess(e) => e.table_path.as_deref(),
-            Self::LogSegmentLoadFailure(e) => e.table_path.as_deref(),
-            Self::ProtocolMetadataLoadFailure(e) => e.table_path.as_deref(),
-            Self::SnapshotBuildFailure(e) => e.table_path.as_deref(),
-            Self::LastCheckpointReadCompleted(e) => e.table_path.as_deref(),
-            _ => None,
-        }
+        self.read_identity().table_path
     }
 
-    pub(super) fn read_operation_ids(&self) -> (Option<MetricId>, Option<&str>) {
-        let (operation_id, correlation_id) = match self {
-            Self::SnapshotBuildSuccess(e) => (e.operation_id, &e.correlation_id),
-            Self::SnapshotBuildFailure(e) => (e.operation_id, &e.correlation_id),
-            Self::LogSegmentLoadSuccess(e) => (e.operation_id, &e.correlation_id),
-            Self::LogSegmentLoadFailure(e) => (e.operation_id, &e.correlation_id),
-            Self::ProtocolMetadataLoadSuccess(e) => (e.operation_id, &e.correlation_id),
-            Self::ProtocolMetadataLoadFailure(e) => (e.operation_id, &e.correlation_id),
-            Self::LastCheckpointReadCompleted(e) => (e.operation_id, &e.correlation_id),
-            Self::CrcReadSuccess(e) => (e.operation_id, &e.correlation_id),
-            Self::DomainMetadataLoadSuccess(e) => (e.operation_id, &e.correlation_id),
-            Self::ScanMetadataCompleted(e) => (e.operation_id, &e.correlation_id),
+    pub(super) fn read_identity(&self) -> ReadMetricIdentity<'_> {
+        macro_rules! identity {
+            ($event:ident) => {
+                (
+                    $event.operation_id,
+                    &$event.correlation_id,
+                    &$event.table_id,
+                    &$event.table_path,
+                )
+            };
+        }
+        let (operation_id, correlation_id, table_id, table_path) = match self {
+            Self::SnapshotBuildSuccess(e) => identity!(e),
+            Self::SnapshotBuildFailure(e) => identity!(e),
+            Self::LogSegmentLoadSuccess(e) => identity!(e),
+            Self::LogSegmentLoadFailure(e) => identity!(e),
+            Self::ProtocolMetadataLoadSuccess(e) => identity!(e),
+            Self::ProtocolMetadataLoadFailure(e) => identity!(e),
+            Self::LastCheckpointReadCompleted(e) => identity!(e),
+            Self::CrcReadSuccess(e) => identity!(e),
+            Self::DomainMetadataLoadSuccess(e) => identity!(e),
+            Self::ScanMetadataCompleted(e) => {
+                (e.operation_id, &e.correlation_id, &e.table_id, &None)
+            }
             Self::CrcReadFailure {
                 operation_id,
                 correlation_id,
-                ..
+                table_id,
+                table_path,
             }
             | Self::DomainMetadataLoadFailure {
                 operation_id,
                 correlation_id,
-                ..
-            } => (*operation_id, correlation_id),
-            _ => return (None, None),
+                table_id,
+                table_path,
+            } => (*operation_id, correlation_id, table_id, table_path),
+            _ => return ReadMetricIdentity::default(),
         };
-        (Some(operation_id), correlation_id.as_deref())
+        ReadMetricIdentity {
+            operation_id: Some(operation_id),
+            correlation_id: correlation_id.as_deref(),
+            table_id: table_id.as_deref(),
+            table_path: table_path.as_deref(),
+        }
     }
 
     /// Set the wall-clock duration on lifecycle events.

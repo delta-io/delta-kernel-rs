@@ -1280,63 +1280,86 @@ mod scan_builder_tests {
     };
 
     #[rstest]
-    #[case::preserves_id(false, None)]
-    #[case::clears_id(true, None)]
-    #[case::invalid_utf8(false, Some(b"\xff".as_ptr().cast()))]
-    #[case::null_pointer(false, Some(std::ptr::null()))]
+    #[case::default(None, None, Some("initial-label"))]
+    #[case::overridden(Some("scan-label"), None, Some("scan-label"))]
+    #[case::cleared(Some(""), None, None)]
+    #[case::invalid_utf8(None, Some(b"\xff".as_ptr().cast()), None)]
+    #[case::null_pointer(None, Some(std::ptr::null()), None)]
     #[tokio::test]
-    async fn scan_builder_correlation_id_copies_input_and_consumes_builder_on_error(
-        #[case] clear: bool,
-        #[case] invalid_correlation_id_ptr: Option<*const c_char>,
+    async fn scan_builder_labels_reach_metrics_and_consume_builder_on_error(
+        #[case] override_label: Option<&str>,
+        #[case] invalid_ptr: Option<*const c_char>,
+        #[case] expected: Option<&str>,
+        #[values(false, true)] table_id: bool,
     ) {
         let (engine, snapshot) = setup_snapshot(actions_to_string(vec![TestAction::Metadata]))
             .await
             .unwrap();
+        let initial_label = String::from("initial-label");
+        let snapshot = if table_id {
+            unsafe {
+                ok_or_panic(crate::snapshot_with_table_id(
+                    snapshot,
+                    engine.shallow_copy(),
+                    kernel_string_slice!(initial_label),
+                ))
+            }
+        } else {
+            snapshot
+        };
         let snapshot_owner = unsafe { snapshot.clone_as_arc() };
         let baseline = Arc::strong_count(&snapshot_owner);
-        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
+        let mut builder = unsafe { scan_builder(snapshot.shallow_copy()) };
         assert_eq!(Arc::strong_count(&snapshot_owner), baseline + 1);
-        let initial_id = "initial-request";
-        let builder = unsafe {
-            ok_or_panic(scan_builder_with_correlation_id(
-                builder,
-                engine.shallow_copy(),
-                kernel_string_slice!(initial_id),
-            ))
+        if !table_id {
+            builder = unsafe {
+                ok_or_panic(scan_builder_with_correlation_id(
+                    builder,
+                    engine.shallow_copy(),
+                    kernel_string_slice!(initial_label),
+                ))
+            };
+        }
+        drop(initial_label);
+
+        let set_label = if table_id {
+            super::scan_builder_with_table_id
+        } else {
+            scan_builder_with_correlation_id
         };
-        let mut id = String::from("scan-request");
-        let correlation_id = match invalid_correlation_id_ptr {
-            Some(ptr) => KernelStringSlice { ptr, len: 1 },
-            None => kernel_string_slice!(id),
-        };
-        let result = unsafe {
-            scan_builder_with_correlation_id(builder, engine.shallow_copy(), correlation_id)
-        };
-        id.clear();
-        drop(id);
-        if let Some(correlation_id_ptr) = invalid_correlation_id_ptr {
-            let expected = if correlation_id_ptr.is_null() {
+        if let Some(ptr) = invalid_ptr {
+            let invalid_slice = || KernelStringSlice { ptr, len: 1 };
+            let expected_error = if ptr.is_null() {
                 FFIKernelError::GenericError
             } else {
                 FFIKernelError::Utf8Error
             };
-            assert_extern_result_error_with_message(result, expected, None);
-        } else {
-            let builder = ok_or_panic(result);
-            let builder = if clear {
-                unsafe {
-                    ok_or_panic(scan_builder_with_correlation_id(
-                        builder,
+            if table_id {
+                let result = unsafe {
+                    crate::snapshot_with_table_id(
+                        snapshot_owner.clone().into(),
                         engine.shallow_copy(),
-                        KernelStringSlice {
-                            ptr: std::ptr::null(),
-                            len: 0,
-                        },
-                    ))
-                }
-            } else {
-                builder
-            };
+                        invalid_slice(),
+                    )
+                };
+                assert_extern_result_error_with_message(result, expected_error, None);
+                assert_eq!(Arc::strong_count(&snapshot_owner), baseline + 1);
+            }
+            let result = unsafe { set_label(builder, engine.shallow_copy(), invalid_slice()) };
+            assert_extern_result_error_with_message(result, expected_error, None);
+        } else {
+            if let Some(label) = override_label.map(String::from) {
+                let label_slice = if label.is_empty() {
+                    KernelStringSlice {
+                        ptr: std::ptr::null(),
+                        len: 0,
+                    }
+                } else {
+                    kernel_string_slice!(label)
+                };
+                builder =
+                    unsafe { ok_or_panic(set_label(builder, engine.shallow_copy(), label_slice)) };
+            }
             let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
             let reporter = Arc::new(CapturingReporter::default());
             let _guard = install_thread_local_metrics_reporter(reporter.clone());
@@ -1354,99 +1377,17 @@ mod scan_builder_tests {
                 })
                 .collect();
             assert_eq!(completions.len(), 1);
-            assert_eq!(
-                completions[0].correlation_id.as_deref(),
-                if clear { None } else { Some("scan-request") },
-            );
+            let label = if table_id {
+                &completions[0].table_id
+            } else {
+                &completions[0].correlation_id
+            };
+            assert_eq!(label.as_deref(), expected);
             unsafe { free_scan(scan) };
         }
         assert_eq!(Arc::strong_count(&snapshot_owner), baseline);
         unsafe {
             free_snapshot(snapshot);
-            free_engine(engine);
-        }
-    }
-
-    #[rstest]
-    #[tokio::test]
-    async fn scan_table_id_setter_consumes_builder_on_error(
-        #[values(std::ptr::null(), b"\xff".as_ptr().cast())] ptr: *const c_char,
-    ) {
-        let (engine, snapshot) = setup_snapshot(actions_to_string(vec![TestAction::Metadata]))
-            .await
-            .unwrap();
-        let owner = unsafe { snapshot.clone_as_arc() };
-        let baseline = Arc::strong_count(&owner);
-        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
-        assert_eq!(Arc::strong_count(&owner), baseline + 1);
-        let result = unsafe {
-            super::scan_builder_with_table_id(
-                builder,
-                engine.shallow_copy(),
-                KernelStringSlice { ptr, len: 1 },
-            )
-        };
-        let expected = if ptr.is_null() {
-            FFIKernelError::GenericError
-        } else {
-            FFIKernelError::Utf8Error
-        };
-        assert_extern_result_error_with_message(result, expected, None);
-        assert_eq!(Arc::strong_count(&owner), baseline);
-        unsafe {
-            free_snapshot(snapshot);
-            free_engine(engine);
-        }
-    }
-
-    #[rstest]
-    #[case::inherited(None, Some("snapshot-table"))]
-    #[case::overridden(Some("scan-table"), Some("scan-table"))]
-    #[case::cleared(Some(""), None)]
-    #[tokio::test]
-    async fn scan_metrics_use_snapshot_or_scan_table_id(
-        #[case] override_id: Option<&str>,
-        #[case] expected: Option<&str>,
-    ) {
-        let (engine, snapshot) = setup_snapshot(actions_to_string(vec![TestAction::Metadata]))
-            .await
-            .unwrap();
-        let table_id = String::from("snapshot-table");
-        let labeled = unsafe {
-            ok_or_panic(crate::snapshot_with_table_id(
-                snapshot,
-                engine.shallow_copy(),
-                kernel_string_slice!(table_id),
-            ))
-        };
-        drop(table_id);
-        let mut builder = unsafe { scan_builder(labeled.shallow_copy()) };
-        if let Some(id) = override_id {
-            builder = unsafe {
-                ok_or_panic(super::scan_builder_with_table_id(
-                    builder,
-                    engine.shallow_copy(),
-                    kernel_string_slice!(id),
-                ))
-            };
-        }
-        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
-        let reporter = Arc::new(CapturingReporter::default());
-        let _guard = install_thread_local_metrics_reporter(reporter.clone());
-        unsafe { scan.as_ref() }
-            .scan_metadata(unsafe { engine.as_ref() }.engine().as_ref())
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        let events = reporter.events();
-        let mut scans = events
-            .iter()
-            .filter(|e| matches!(e, MetricEvent::ScanMetadataCompleted(_)));
-        assert_eq!(scans.next().unwrap().table_id(), expected);
-        assert!(scans.next().is_none());
-        unsafe {
-            free_scan(scan);
-            free_snapshot(labeled);
             free_engine(engine);
         }
     }

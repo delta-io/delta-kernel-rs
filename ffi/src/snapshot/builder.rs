@@ -526,52 +526,52 @@ mod tests {
     use crate::{free_engine, free_snapshot, kernel_string_slice};
 
     #[rstest]
-    fn correlation_id_setter_copies_input_and_consumes_builder_on_error(
+    #[case::correlation(snapshot_builder_with_correlation_id, |b: &FfiSnapshotBuilder| b.correlation_id.clone(), None)]
+    #[case::table_id(snapshot_builder_with_table_id, |b: &FfiSnapshotBuilder| b.table_id.clone(), Some(""))]
+    #[case::table_path(snapshot_builder_with_metric_table_path, |b: &FfiSnapshotBuilder| b.table_path.clone(), Some(""))]
+    fn snapshot_builder_label_setter_copies_input_and_consumes_builder_on_error(
+        #[case] set_label: unsafe extern "C" fn(
+            Handle<ExclusiveSnapshotBuilder>,
+            KernelStringSlice,
+        )
+            -> ExternResult<Handle<ExclusiveSnapshotBuilder>>,
+        #[case] read_label: fn(&FfiSnapshotBuilder) -> Option<String>,
+        #[case] cleared: Option<&str>,
         #[values(false, true)] fail: bool,
-        #[values(std::ptr::null(), b"\xff".as_ptr().cast())] correlation_id_ptr: *const c_char,
+        #[values(std::ptr::null(), b"\xff".as_ptr().cast())] ptr: *const c_char,
     ) {
         let engine = error_only_engine_handle();
         let table_root = "memory:///table/";
         let engine_owner = unsafe { engine.clone_as_arc() };
         let baseline = Arc::strong_count(&engine_owner);
-        let builder = unsafe {
+        let mut builder = unsafe {
             ok_or_panic(get_snapshot_builder(
                 kernel_string_slice!(table_root),
                 engine.shallow_copy(),
             ))
         };
         assert_eq!(Arc::strong_count(&engine_owner), baseline + 1);
-        let mut id = String::from("request-1");
-        let builder = unsafe {
-            ok_or_panic(snapshot_builder_with_correlation_id(
+        for expected in ["label-1", "label-2"] {
+            let mut label = String::from(expected);
+            builder = unsafe { ok_or_panic(set_label(builder, kernel_string_slice!(label))) };
+            label.clear();
+            assert_eq!(
+                read_label(unsafe { builder.as_ref() }).as_deref(),
+                Some(expected)
+            );
+        }
+
+        let result = unsafe {
+            set_label(
                 builder,
-                kernel_string_slice!(id),
-            ))
+                KernelStringSlice {
+                    ptr,
+                    len: usize::from(fail),
+                },
+            )
         };
-        id.clear();
-        assert_eq!(
-            unsafe { builder.as_ref() }.correlation_id.as_deref(),
-            Some("request-1")
-        );
-        id.push_str("request-2");
-        let builder = unsafe {
-            ok_or_panic(snapshot_builder_with_correlation_id(
-                builder,
-                kernel_string_slice!(id),
-            ))
-        };
-        drop(id);
-        assert_eq!(
-            unsafe { builder.as_ref() }.correlation_id.as_deref(),
-            Some("request-2")
-        );
-        let id = KernelStringSlice {
-            ptr: correlation_id_ptr,
-            len: usize::from(fail),
-        };
-        let result = unsafe { snapshot_builder_with_correlation_id(builder, id) };
         if fail {
-            let expected = if correlation_id_ptr.is_null() {
+            let expected = if ptr.is_null() {
                 FFIKernelError::GenericError
             } else {
                 FFIKernelError::Utf8Error
@@ -579,70 +579,10 @@ mod tests {
             assert_extern_result_error_with_message(result, expected, None);
         } else {
             let builder = ok_or_panic(result);
-            assert!(unsafe { builder.as_ref() }.correlation_id.is_none());
+            assert_eq!(read_label(unsafe { builder.as_ref() }).as_deref(), cleared);
             unsafe { free_snapshot_builder(builder) };
         }
         assert_eq!(Arc::strong_count(&engine_owner), baseline);
-        unsafe { free_engine(engine) };
-    }
-
-    #[rstest]
-    #[case::table_id(snapshot_builder_with_table_id)]
-    #[case::table_path(snapshot_builder_with_metric_table_path)]
-    fn table_label_setter_consumes_builder_on_error(
-        #[case] set_label: unsafe extern "C" fn(
-            Handle<ExclusiveSnapshotBuilder>,
-            KernelStringSlice,
-        )
-            -> ExternResult<Handle<ExclusiveSnapshotBuilder>>,
-        #[values(std::ptr::null(), b"\xff".as_ptr().cast())] ptr: *const c_char,
-    ) {
-        let engine = error_only_engine_handle();
-        let table_root = "memory:///table/";
-        let engine_owner = unsafe { engine.clone_as_arc() };
-        let baseline = Arc::strong_count(&engine_owner);
-        let builder = unsafe {
-            ok_or_panic(get_snapshot_builder(
-                kernel_string_slice!(table_root),
-                engine.shallow_copy(),
-            ))
-        };
-        assert_eq!(Arc::strong_count(&engine_owner), baseline + 1);
-        let result = unsafe { set_label(builder, KernelStringSlice { ptr, len: 1 }) };
-        let expected = if ptr.is_null() {
-            FFIKernelError::GenericError
-        } else {
-            FFIKernelError::Utf8Error
-        };
-        assert_extern_result_error_with_message(result, expected, None);
-        assert_eq!(Arc::strong_count(&engine_owner), baseline);
-        unsafe { free_engine(engine) };
-    }
-
-    #[rstest]
-    #[tokio::test]
-    async fn snapshot_table_id_setter_consumes_handle_on_error(
-        #[values(std::ptr::null(), b"\xff".as_ptr().cast())] ptr: *const c_char,
-    ) {
-        let (engine, snapshot) = setup_snapshot(actions_to_string(vec![TestAction::Metadata]))
-            .await
-            .unwrap();
-        let owner = unsafe { snapshot.clone_as_arc() };
-        let baseline = Arc::strong_count(&owner);
-        let result = unsafe {
-            snapshot_with_table_id(
-                snapshot,
-                engine.shallow_copy(),
-                KernelStringSlice { ptr, len: 1 },
-            )
-        };
-        let expected = if ptr.is_null() {
-            FFIKernelError::GenericError
-        } else {
-            FFIKernelError::Utf8Error
-        };
-        assert_extern_result_error_with_message(result, expected, None);
-        assert_eq!(Arc::strong_count(&owner), baseline - 1);
         unsafe { free_engine(engine) };
     }
 
