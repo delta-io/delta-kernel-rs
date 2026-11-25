@@ -9,7 +9,7 @@ from collections.abc import Collection
 from typing import Any
 
 from markdown_utils import markdown_lines
-from review_publish import BOT_MARKER, FINDING_FEEDBACK_FOOTER, strip_review_body
+from review_publish import BOT_MARKER, FINDING_FEEDBACK_FOOTER, REVIEW_HEADER, strip_review_body
 
 MAX_HISTORY_CHARS = 12_000
 MAX_ENTRY_CHARS = 6_000
@@ -240,6 +240,8 @@ def _entry_blockers(
     comment: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     body = entry.get("body", "")
+    if body.lstrip().removeprefix(BOT_MARKER).lstrip().startswith(REVIEW_HEADER):
+        body = strip_review_body(body)
     lines = [
         (offset, line) for offset, line, fence in markdown_lines(body) if fence is None
     ]
@@ -270,6 +272,11 @@ def _entry_blockers(
     boundaries = [
         offset for offset, line in lines
         if _ANY_FINDING_LINE.match(line) or re.match(r"^#{1,6}\s+", line)
+        or re.fullmatch(
+            r"(?:\d+\.\s+\*\*(?:Blocking issues|Non-blocking notes|Summary)\*\*\s*:?|"
+            r"(?:Blocking issues|Non-blocking notes|Summary)\s*:)\s*",
+            line, re.IGNORECASE,
+        )
     ]
     summary_start = body.find("<summary>Review Summary</summary>")
     summary_end = body.find("</details>", summary_start) if summary_start >= 0 else -1
@@ -295,9 +302,12 @@ def _entry_blockers(
         if comment is not None:
             finding["source_comment_id"] = comment.get("id", comment.get("fullDatabaseId"))
             for key in ("path", "side"):
-                if isinstance(comment.get(key), str):
-                    finding[key] = comment[key]
-            line_number = comment.get("line") or comment.get("originalLine")
+                value = comment.get(key)
+                if not isinstance(value, str):
+                    value = metadata.get(key)
+                if isinstance(value, str):
+                    finding[key] = value
+            line_number = comment.get("line") or comment.get("originalLine") or metadata.get("line")
             if isinstance(line_number, int) and not isinstance(line_number, bool):
                 finding["line"] = line_number
         findings.append(finding)

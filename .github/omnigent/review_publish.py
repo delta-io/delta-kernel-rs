@@ -148,13 +148,42 @@ def format_review_summary(
     counts_available: bool = True,
     checks_url: str | None = None,
     coverage: dict[str, Any] | None = None,
+    verdict: dict[str, Any] | None = None,
 ) -> str:
-    """Build the main AI review Conversation comment from findings with confirmed comment URLs."""
+    """Build Markdown for the main AI review Conversation comment.
+
+    Count final findings with confirmed comment URLs and link Blocker and Should Fix comments
+    from Review Summary. If verdict is supplied, include its advisory status, coverage marker
+    and reasons for incomplete review work.
+    """
     confirmed = [finding for finding in findings if finding.get("url")]
     counts = Counter(finding["severity"] for finding in confirmed)
     headline = f"**{_finding_counts(counts)}**" if counts_available else "Finding counts unavailable."
-    parts = [BOT_MARKER, f"## {AI_REVIEW_TITLE}", headline]
-    if coverage is not None and not coverage.get("complete"):
+    title = f"## AI Review - {verdict['status']}" if verdict else "## AI Review"
+    reviewed = f"Reviewed `{head_sha[:8]}`"
+    if verdict:
+        reviewed += " · Full Coverage ✓" if verdict["coverage_full"] else " · Partial Coverage ⚠"
+    parts = [BOT_MARKER, title, headline, reviewed]
+    if verdict and not verdict["coverage_full"]:
+        rows = []
+        for reason in verdict["reasons"]:
+            message = reason["message"]
+            if reason.get("url"):
+                message += f" [Earlier finding]({reason['url']})"
+            rows.append("- " + message)
+        if coverage is not None and not coverage.get("complete"):
+            rows.append(
+                f"- Diff input: {coverage.get('full_files', 0)} of "
+                f"{coverage.get('total_files', 0)} files fully delivered; "
+                f"{coverage.get('partial_files', 0)} partial and "
+                f"{coverage.get('omitted_files', 0)} omitted. "
+                f"[Diff details in Checks]({checks_url or run_url})."
+            )
+        parts.append(
+            "<details><summary>Partial Coverage Details</summary>\n\n"
+            + "\n".join(rows) + "\n\n</details>"
+        )
+    if verdict is None and coverage is not None and not coverage.get("complete"):
         parts.append(
             f"Review input truncated: {coverage.get('full_files', 0)} of "
             f"{coverage.get('total_files', 0)} file sections fully included; "
@@ -162,8 +191,8 @@ def format_review_summary(
             f"{coverage.get('omitted_files', 0)} omitted. "
             f"[Diff details in Checks]({checks_url or run_url})."
         )
-    if errors:
-        parts.append("Publication incomplete: " + " ".join(dict.fromkeys(errors)))
+    if errors and verdict is None:
+        parts.append("Posting review comments is incomplete: " + " ".join(dict.fromkeys(errors)))
     parts.append(
         "<details><summary>Assessment Summary</summary>\n\n"
         + (overview.strip() or "See the full AI review in Checks.")
@@ -209,8 +238,41 @@ def format_diff_coverage(coverage: dict[str, Any]) -> str:
     return "\n\n".join(parts)
 
 
+def format_status_check(verdict: dict[str, Any]) -> str:
+    """Build the status section for the AI Review Summary Check Run report."""
+    coverage = "Full Coverage ✓" if verdict["coverage_full"] else "Partial Coverage ⚠"
+    parts = [
+        f"## AI Review - {verdict['status']}",
+        f"**{_finding_counts(verdict['counts'])}**",
+        f"Reviewed `{verdict['head_sha'][:8]}` · {coverage}",
+    ]
+    for reason in verdict["reasons"]:
+        text = reason["message"]
+        if reason.get("url"):
+            text += f" [Earlier finding]({reason['url']})"
+        parts.append("- " + text)
+    if verdict["sensitive_paths"]:
+        parts.append("Sensitive areas: " + ", ".join(
+            f"<code>{escape(path)}</code>" for path in verdict["sensitive_paths"]
+        ))
+    if verdict["breaking_change"]:
+        parts.append("The PR declares a breaking change.")
+    return "\n\n".join(parts)
+
+
 def _finding_counts(counts) -> str:
     blockers, should_fix, nits = (counts[severity] for severity in ("Blocker", "Should Fix", "Nit"))
     blocker_label = "Blocker" if blockers == 1 else "Blockers"
     nit_label = "Nit" if nits == 1 else "Nits"
     return f"🛑 {blockers} {blocker_label} · 🔧 {should_fix} Should Fix · 💡 {nits} {nit_label}"
+
+
+def bound_check_summary(summary: str, report_url: str, limit: int = 60_000) -> str:
+    """Link an oversized Check Run report to the artifact containing its complete text."""
+    if len(summary.encode("utf-8")) <= limit:
+        return summary
+    return (
+        "The complete AI review and coverage report exceed GitHub's display limit. "
+        f"[Open the full report]({report_url}) in the run's evidence artifact "
+        "(retained for seven days)."
+    )

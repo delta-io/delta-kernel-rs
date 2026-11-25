@@ -259,6 +259,7 @@ def publish_findings(
             errors.append("The main comment write could not be confirmed.")
             return record
     record["main_url"] = _url(main)
+    record["main_comment_id"] = main.get("id")
     github_pr_patch_positions = diff_positions(github_pr_patch)
     pr_change_patch_positions = (
         diff_positions(pr_change_patch) if pr_change_patch is not None else github_pr_patch_positions
@@ -289,9 +290,15 @@ def publish_findings(
                 or github_pr_patch_sections.get(finding["path"]) == pr_change_patch_sections.get(finding["path"])
             )
         )
-        metadata = {**source, "id": finding["id"], "fingerprint": finding["fingerprint"]}
+        metadata = {
+            **source, "id": finding["id"], "fingerprint": finding["fingerprint"],
+            "path": finding["path"], "line": finding["line"], "side": finding["side"],
+        }
+        encoded_metadata = json.dumps(metadata, sort_keys=True).replace(
+            "<", "\\u003c"
+        ).replace(">", "\\u003e")
         body = (
-            f"{BOT_MARKER}\n<!-- ai-review-finding {json.dumps(metadata, sort_keys=True)} -->\n"
+            f"{BOT_MARKER}\n<!-- ai-review-finding {encoded_metadata} -->\n"
             + format_finding(finding, head_sha=head_sha, main_url=record["main_url"])
         )
         path = inline_path if can_inline else issue_path

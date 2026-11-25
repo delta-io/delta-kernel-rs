@@ -1552,14 +1552,48 @@ jobs:
             --output /tmp/review_execution.json \
             --check-output /tmp/check-summary.txt
 
+      - name: Publish reviewed commit status
+        if: >-
+          always() && steps.creds.outputs.available == 'true' &&
+          steps.context.outputs.review_marker != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          REVIEW_RUN_ID: ${{ github.run_id }}
+          HEAD_SHA: ${{ steps.context.outputs.head_sha }}
+          PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
+          OUTPUT_MODE: ${{ needs.authorize.outputs.output_mode }}
+          REPO: ${{ github.repository }}
+          RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          set -euo pipefail
+          python3 .github/omnigent/review_verdict.py \
+            --coverage /tmp/diff_coverage.json \
+            --completion /tmp/review_execution.json \
+            --publication /tmp/publication_record.json \
+            --history /tmp/review_history_evidence.json \
+            --metadata /tmp/pr_meta.json \
+            --review /tmp/review_output_complete.txt \
+            --head-sha "$HEAD_SHA" \
+            --run-id "$REVIEW_RUN_ID" \
+            --repository "$REPO" \
+            --pr-number "$PR_NUMBER" \
+            --run-url "$RUN_URL" \
+            --mode "$OUTPUT_MODE" \
+            --output /tmp/review_verdict.json \
+            --check-output /tmp/check-summary.txt
+
       - name: Retain reviewer execution evidence
+        id: execution-artifact
         if: >-
           always() && steps.creds.outputs.available == 'true' &&
           steps.context.outputs.review_marker != ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: ai-review-execution-${{ needs.authorize.outputs.pr_number }}-${{ github.run_id }}
-          path: /tmp/review_execution.json
+          path: |
+            /tmp/review_execution.json
+            /tmp/check-summary.txt
+            /tmp/diff_coverage.json
           retention-days: 7
           if-no-files-found: error
 
@@ -1608,6 +1642,8 @@ jobs:
           PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
           REPO: ${{ github.repository }}
           REVIEW_READY: ${{ steps.review.outputs.review_text != '' }}
+          REVIEW_ATTEMPTED: ${{ steps.context.outputs.review_marker != '' }}
+          EVIDENCE_ARTIFACT_URL: ${{ steps.execution-artifact.outputs.artifact-url }}
           RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         run: |
           set -euo pipefail
@@ -1627,6 +1663,30 @@ jobs:
                 > "$summary_file"
             fi
           fi
+
+          if [ -s /tmp/review_verdict.json ]; then
+            title="$(python3 -c 'import json; print("AI Review - " + json.load(open("/tmp/review_verdict.json"))["status"])')"
+          elif [ "${REVIEW_ATTEMPTED:-false}" = "true" ]; then
+            title="AI Review - NO VERDICT"
+            printf '\n\nAdvisory status evidence is unavailable.\n' >> "$summary_file"
+          fi
+
+          export CHECK_SUMMARY_FILE="$summary_file"
+          export FULL_REPORT_URL="${EVIDENCE_ARTIFACT_URL:-$RUN_URL}"
+          python3 - <<'PYEOF'
+          import os
+          import pathlib
+          import sys
+
+          sys.path.insert(0, ".github/omnigent")
+          from review_publish import bound_check_summary
+
+          summary = pathlib.Path(os.environ["CHECK_SUMMARY_FILE"]).read_text()
+          pathlib.Path("/tmp/github-check-summary.txt").write_text(
+              bound_check_summary(summary, os.environ["FULL_REPORT_URL"])
+          )
+          PYEOF
+          summary_file=/tmp/github-check-summary.txt
 
           jq -n \
             --rawfile summary "$summary_file" \

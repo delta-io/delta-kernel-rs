@@ -168,6 +168,30 @@ class ReviewHistoryTest(unittest.TestCase):
                 self.assertIn("Broken contract.", blocker["body"])
                 self.assertNotIn("Context.", blocker["body"])
 
+    def test_legacy_summary_and_wrapper_are_excluded_from_blocker_claim_identity(self):
+        module = _load_module()
+        for summary in ("## Summary", "3. **Summary**", "Summary:"):
+            with self.subTest(summary=summary):
+                document = _evidence_document()
+                pr = document["data"]["repository"]["pullRequest"]
+                pr["comments"]["nodes"].clear()
+                review = pr["reviews"]["nodes"][0]
+                review["comments"]["nodes"].clear()
+                review["body"] = (
+                    f"{module.BOT_MARKER}\n{module.REVIEW_HEADER}\n\n"
+                    "<details><summary>Show review</summary>\n\n"
+                    f"### Blocker1\nA retained defect.\n\n{summary}\nPatch context.\n\n"
+                    "</details>\n\n---\n"
+                    "<sub>Automated review - [workflow run]"
+                    "(https://github.com/example/project/actions/runs/1)</sub>"
+                )
+                evidence = module.history_evidence(document)
+                self.assertTrue(evidence["complete"], evidence["reasons"])
+                self.assertEqual(
+                    module.canonical_finding_body(evidence["blockers"][0]["body"]),
+                    "a retained defect.",
+                )
+
     def test_standalone_finding_metadata_and_full_reviewed_sha_are_trusted_sources(self) -> None:
         module = _load_module()
         for metadata in (True, False):

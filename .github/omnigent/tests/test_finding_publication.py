@@ -17,7 +17,9 @@ try:
         publish_findings, review_overview,
     )
     from review_history import canonical_finding_body
-    from review_publish import BOT_MARKER, format_finding, format_review_summary, strip_review_body
+    from review_publish import (
+        BOT_MARKER, bound_check_summary, format_finding, format_review_summary, strip_review_body,
+    )
 finally:
     sys.path.pop(0)
 
@@ -488,6 +490,26 @@ class FindingPublicationTest(unittest.TestCase):
         github = FakeGitHub()
         publish(github, [], coverage=coverage)
         self.assertNotIn("Review input truncated", github.issues[0]["body"])
+
+    def test_large_coverage_report_links_complete_artifact_within_check_api_budget(self):
+        coverage = {
+            "base_sha": "b" * 40, "head_sha": HEAD_SHA,
+            "total_bytes": 500_000, "delivered_bytes": 100_000, "complete": False,
+            "total_files": 1300, "full_files": 0, "partial_files": 0, "omitted_files": 1300,
+            "files": [{"path": f"directory/{i}/" + "x" * 170, "status": "omitted"}
+                      for i in range(1300)],
+        }
+        record = {"findings": [], "errors": [], "coverage": coverage}
+        full = publication_check("PR context.", record)
+        self.assertGreater(len(full.encode()), 65_535)
+        url = RUN_URL + "/artifacts/123"
+        summary = bound_check_summary(full, url)
+        self.assertLess(len(summary.encode()), 60_000)
+        self.assertIn(url, summary)
+        self.assertIn("seven days", summary)
+        self.assertIn("directory/1299/", full)
+        self.assertEqual(bound_check_summary("A complete short report.", url),
+                         "A complete short report.")
 
     def test_legacy_unknown_severity_split_does_not_fabricate_zeroes(self):
         body = format_review_summary(
