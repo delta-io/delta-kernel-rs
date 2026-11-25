@@ -175,8 +175,8 @@ def format_review_summary(
             rows.append("- " + message)
         if coverage is not None and not coverage.get("complete"):
             rows.append(
-                f"- Diff input: {coverage.get('full_files', 0)} of "
-                f"{coverage.get('total_files', 0)} files fully delivered; "
+                f"- Subagent patch excerpt: {coverage.get('full_files', 0)} of "
+                f"{coverage.get('total_files', 0)} file sections fully included; "
                 f"{coverage.get('partial_files', 0)} partial and "
                 f"{coverage.get('omitted_files', 0)} omitted. "
                 f"[Diff details in Checks]({checks_url or run_url})."
