@@ -974,6 +974,10 @@ fn assert_metadata_output_options(
         || declarative_metadata(&scan, &engine),
         |event| {
             assert_eq!(event.outcome, ScanPlanOutcome::Plan);
+            assert_eq!(
+                event.table_id,
+                scan.snapshot.table_configuration().metadata().id()
+            );
             let report = &event.metadata_planning;
             assert_eq!(report.stats, scan.stats);
             assert_eq!(report.partition_values, scan.partition_values_options);
@@ -1538,6 +1542,10 @@ fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> Resu
         || scan.declarative_metadata_scan_plan(&no_plan_engine),
         |event| {
             assert_eq!(event.outcome, ScanPlanOutcome::Error);
+            assert_eq!(
+                event.table_id,
+                scan.snapshot.table_configuration().metadata().id()
+            );
             let report = &event.metadata_planning;
             assert_eq!(report.stats, scan.stats);
             assert_eq!(report.partition_values, scan.partition_values_options);
@@ -1563,6 +1571,10 @@ fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> Resu
             || scan.declarative_metadata_scan_plan(&no_plan_engine),
             |event| {
                 assert_eq!(event.outcome, ScanPlanOutcome::Empty);
+                assert_eq!(
+                    event.table_id,
+                    scan.snapshot.table_configuration().metadata().id()
+                );
                 assert!(event.metadata_planning.replay_base.is_none());
                 assert!(event.checkpoint.is_none());
             },

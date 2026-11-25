@@ -458,6 +458,7 @@ mod tests {
             .with(Identity::new().with_filter(LevelFilter::INFO));
         let report = ScanPlanReport {
             operation_id: MetricId::new(),
+            table_id: "table-test".into(),
             correlation_id: None,
             outcome: ScanPlanOutcome::Plan,
             duration_ns: 17,
@@ -470,6 +471,7 @@ mod tests {
         match (accepted, events.as_slice()) {
             (false, []) => {}
             (true, [MetricEvent::ScanPlanGenerationCompleted(report)]) => {
+                assert_eq!(report.table_id, "table-test");
                 assert_eq!(report.duration_ns, 17);
                 assert_eq!(report.num_plan_nodes, 3);
             }

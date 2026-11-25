@@ -95,6 +95,8 @@ pub struct MetadataPlanningReport {
 pub struct ScanPlanReport {
     /// Identity of this planning attempt.
     pub operation_id: MetricId,
+    /// Table identifier from the snapshot's metadata.
+    pub table_id: String,
     /// Caller-supplied correlation identity.
     pub correlation_id: Option<Arc<str>>,
     /// Terminal planning result.
@@ -116,6 +118,7 @@ impl ScanPlanReport {
     pub(crate) fn new() -> Self {
         Self {
             operation_id: MetricId::new(),
+            table_id: String::new(),
             correlation_id: None,
             outcome: ScanPlanOutcome::Error,
             duration_ns: 0,
@@ -130,12 +133,14 @@ impl fmt::Display for ScanPlanReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "ScanPlanReport(operation_id={}, outcome={:?}, duration_ns={}, num_plan_nodes={}, \
+            "ScanPlanReport(operation_id={}, table_id={:?}, outcome={:?}, \
+             duration_ns={}, num_plan_nodes={}, \
              total_json_bytes={}, total_parquet_bytes={}, \
              replay_base={:?}, base_version={:?}, has_filter={}, read_collations={}, \
              commit_start_version={:?}, commit_end_version={:?}, \
              commit_total_size_bytes={}, compaction_file_count={}",
             self.operation_id,
+            self.table_id,
             self.outcome,
             self.duration_ns,
             self.num_plan_nodes,

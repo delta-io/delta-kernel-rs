@@ -1534,7 +1534,9 @@ impl Scan {
         engine: &dyn Engine,
     ) -> KernelResult<Option<Plan>> {
         let start = Instant::now();
+        let metadata = self.snapshot.table_configuration().metadata();
         let mut report = ScanPlanReport {
+            table_id: metadata.id().to_owned(),
             correlation_id: self.correlation_id.clone(),
             metadata_planning: MetadataPlanningReport {
                 stats: self.stats.clone(),

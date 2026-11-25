@@ -37,6 +37,7 @@ pub enum ReplayBase {
 pub struct ScanPlanReport {
     // === Operation ===
     pub operation_id: MetricId,
+    pub table_id: KernelStringSlice,
     pub correlation_id: KernelStringSlice,
     pub outcome: ScanPlanOutcome,
     pub duration_ns: u64,
@@ -122,8 +123,10 @@ pub(super) fn with_event<F: FnOnce(MetricEvent)>(event: &kernel::ScanPlanReport,
                 metadata_query_calls: metrics.metadata_query_calls,
                 duration_ns: metrics.duration_ns,
             });
+        let table_id = &event.table_id;
         let record = ScanPlanReport {
             operation_id: event.operation_id.into(),
+            table_id: kernel_string_slice!(table_id),
             correlation_id: correlation_id_slice(event.correlation_id.as_deref()),
             outcome: match event.outcome {
                 kernel::ScanPlanOutcome::Plan => ScanPlanOutcome::Plan,
@@ -221,6 +224,7 @@ mod tests {
         };
         let event = kernel::ScanPlanReport {
             operation_id: kernel::MetricId::new(),
+            table_id: "table-test".into(),
             correlation_id: Some("scan-test".into()),
             outcome: if failed {
                 kernel::ScanPlanOutcome::Error
@@ -263,6 +267,10 @@ mod tests {
                 panic!("expected scan-plan metric");
             };
             assert_eq!(record.operation_id.bytes, event.operation_id.as_bytes());
+            assert_eq!(
+                unsafe { String::try_from_slice(&record.table_id) }.unwrap(),
+                "table-test"
+            );
             assert_eq!(
                 unsafe { String::try_from_slice(&record.correlation_id) }.unwrap(),
                 "scan-test"
