@@ -105,7 +105,8 @@ pub enum MetricEvent {
     SetTransactionLoadSuccess(SetTransactionLoadSuccess),
     SetTransactionLoadFailure,
     CrcReadSuccess(CrcReadSuccess),
-    CrcReadFailure,
+    CrcReadFailure(CrcReadFailure),
+    CheckpointPartsMissing(CheckpointPartsMissing),
     LastCheckpointReadCompleted(LastCheckpointReadCompleted),
     CheckpointWriteSuccess(CheckpointWriteSuccess),
     CheckpointWriteFailure(CheckpointWriteFailure),
@@ -151,10 +152,12 @@ impl MetricEvent {
             Self::TransactionCommitFailure(_)
             | Self::DomainMetadataLoadFailure
             | Self::SetTransactionLoadFailure
-            | Self::CrcReadFailure => {}
+            | Self::CrcReadFailure(_) => {}
 
             // Read events have no duration field.
-            Self::JsonReadCompleted(_) | Self::ParquetReadCompleted(_) => {}
+            Self::JsonReadCompleted(_)
+            | Self::ParquetReadCompleted(_)
+            | Self::CheckpointPartsMissing(_) => {}
         }
     }
 
@@ -173,6 +176,7 @@ impl MetricEvent {
             Self::SetTransactionLoadSuccess(_) => Err(SetTransactionLoadSuccess::SPAN_NAME),
             Self::LastCheckpointReadCompleted(_) => Err(LastCheckpointReadCompleted::SPAN_NAME),
             Self::ScanMetadataCompleted(_) => Err(ScanMetadataCompleted::SPAN_NAME),
+            Self::CheckpointPartsMissing(_) => Err(CheckpointPartsMissing::SPAN_NAME),
             Self::JsonReadCompleted(_) => Err(JsonReadCompleted::SPAN_NAME),
             Self::ParquetReadCompleted(_) => Err(ParquetReadCompleted::SPAN_NAME),
             Self::StorageListCompleted(_)
@@ -186,7 +190,7 @@ impl MetricEvent {
             Self::TransactionCommitFailure(_) => Err(TransactionCommitSuccess::SPAN_NAME),
             Self::DomainMetadataLoadFailure => Err(DomainMetadataLoadSuccess::SPAN_NAME),
             Self::SetTransactionLoadFailure => Err(SetTransactionLoadSuccess::SPAN_NAME),
-            Self::CrcReadFailure => Err(CrcReadSuccess::SPAN_NAME),
+            Self::CrcReadFailure(_) => Err(CrcReadSuccess::SPAN_NAME),
             Self::CheckpointWriteFailure(_) => Err(CheckpointWriteSuccess::SPAN_NAME),
             Self::ChecksumWriteFailure(_) => Err(ChecksumWriteSuccess::SPAN_NAME),
         }
@@ -208,6 +212,7 @@ impl MetricEvent {
             Self::CheckpointWriteSuccess(_) => Err(CheckpointWriteSuccess::SPAN_NAME),
             Self::ChecksumWriteSuccess(_) => Err(ChecksumWriteSuccess::SPAN_NAME),
             Self::ScanMetadataCompleted(_) => Err(ScanMetadataCompleted::SPAN_NAME),
+            Self::CheckpointPartsMissing(_) => Err(CheckpointPartsMissing::SPAN_NAME),
             Self::JsonReadCompleted(_) => Err(JsonReadCompleted::SPAN_NAME),
             Self::ParquetReadCompleted(_) => Err(ParquetReadCompleted::SPAN_NAME),
             Self::StorageListCompleted(_)
@@ -221,7 +226,7 @@ impl MetricEvent {
             Self::TransactionCommitFailure(_) => Err(TransactionCommitSuccess::SPAN_NAME),
             Self::DomainMetadataLoadFailure => Err(DomainMetadataLoadSuccess::SPAN_NAME),
             Self::SetTransactionLoadFailure => Err(SetTransactionLoadSuccess::SPAN_NAME),
-            Self::CrcReadFailure => Err(CrcReadSuccess::SPAN_NAME),
+            Self::CrcReadFailure(_) => Err(CrcReadSuccess::SPAN_NAME),
             Self::CheckpointWriteFailure(_) => Err(CheckpointWriteSuccess::SPAN_NAME),
             Self::ChecksumWriteFailure(_) => Err(ChecksumWriteSuccess::SPAN_NAME),
         }
@@ -232,6 +237,13 @@ impl MetricEvent {
             return e.record_str(name, value);
         }
         if name == "failure_reason" {
+            if matches!(self, Self::CrcReadSuccess(_) | Self::CrcReadFailure(_)) {
+                let reason = value.parse::<CrcReadFailureReason>();
+                *self = Self::CrcReadFailure(CrcReadFailure {
+                    reason: reason.unwrap_or(CrcReadFailureReason::Error),
+                });
+                return reason.map(|_| ()).map_err(|_| CrcReadSuccess::SPAN_NAME);
+            }
             if let Self::TransactionCommitSuccess(e) = self {
                 let operation_id = e.operation_id;
                 let table_type = e.table_type;
@@ -292,7 +304,9 @@ impl MetricEvent {
             }
             Self::DomainMetadataLoadSuccess(_) => Self::DomainMetadataLoadFailure,
             Self::SetTransactionLoadSuccess(_) => Self::SetTransactionLoadFailure,
-            Self::CrcReadSuccess(_) => Self::CrcReadFailure,
+            Self::CrcReadSuccess(_) => Self::CrcReadFailure(CrcReadFailure {
+                reason: CrcReadFailureReason::Error,
+            }),
             Self::LastCheckpointReadCompleted(mut e) => {
                 if e.outcome == LastCheckpointReadOutcome::Unknown {
                     e.outcome = LastCheckpointReadOutcome::Error;
@@ -322,9 +336,10 @@ impl MetricEvent {
             | Self::TransactionCommitFailure(_)
             | Self::DomainMetadataLoadFailure
             | Self::SetTransactionLoadFailure
-            | Self::CrcReadFailure
+            | Self::CrcReadFailure(_)
             | Self::CheckpointWriteFailure(_)
             | Self::ChecksumWriteFailure(_)
+            | Self::CheckpointPartsMissing(_)
             | Self::JsonReadCompleted(_)
             | Self::ParquetReadCompleted(_)
             | Self::ScanMetadataCompleted(_)
@@ -351,7 +366,8 @@ impl fmt::Display for MetricEvent {
             Self::SetTransactionLoadSuccess(e) => e.fmt(f),
             Self::SetTransactionLoadFailure => f.write_str("SetTransactionLoadFailure"),
             Self::CrcReadSuccess(e) => e.fmt(f),
-            Self::CrcReadFailure => f.write_str("CrcReadFailure"),
+            Self::CrcReadFailure(e) => e.fmt(f),
+            Self::CheckpointPartsMissing(e) => e.fmt(f),
             Self::LastCheckpointReadCompleted(e) => e.fmt(f),
             Self::CheckpointWriteSuccess(e) => e.fmt(f),
             Self::CheckpointWriteFailure(e) => e.fmt(f),
@@ -1494,6 +1510,99 @@ impl fmt::Display for CrcReadSuccess {
             "CrcReadSuccess(duration={duration:?}, bytes={bytes_read})"
         )
     }
+}
+
+/// Why an attempted CRC read could not provide a usable checksum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, StrumDisplay, AsRefStr, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum CrcReadFailureReason {
+    /// Storage reported that the requested CRC file was absent.
+    NotFound,
+    /// Storage returned no data or a zero-byte file.
+    Empty,
+    /// The file could not be decoded or failed CRC validation.
+    Parsing,
+    /// Storage returned another error, or no specific reason was recorded.
+    Error,
+    /// The read was cancelled; cancellation propagates instead of falling back.
+    Cancelled,
+}
+
+/// An attempted CRC read failed. Non-cancellation failures allow the caller to replay the log.
+///
+/// An absent CRC in a log listing does not cause a read attempt or emit this event.
+#[derive(Debug, Clone)]
+pub struct CrcReadFailure {
+    /// The reason the CRC could not be used.
+    pub reason: CrcReadFailureReason,
+}
+
+impl fmt::Display for CrcReadFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CrcReadFailure(reason={})", self.reason)
+    }
+}
+
+/// A checkpoint candidate was unusable because referenced parts were missing.
+///
+/// This is a discovery diagnostic, not the outcome of the enclosing snapshot operation. Kernel
+/// may select another checkpoint or replay commits; a hint with no usable checkpoint can fail.
+/// Use log-segment and snapshot completion events to observe the enclosing operation's outcome.
+#[derive(Debug, Clone)]
+pub struct CheckpointPartsMissing {
+    /// Version of the incomplete checkpoint.
+    pub version: u64,
+    /// Number of parts required by the checkpoint file names or hint.
+    pub expected_parts: u64,
+    /// Number of distinct, nonempty parts found for this checkpoint candidate.
+    pub found_parts: u64,
+}
+
+impl CheckpointPartsMissing {
+    pub(crate) const SPAN_NAME: &'static str = "checkpoint_parts_missing";
+
+    pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
+        let mut event = Self {
+            version: 0,
+            expected_parts: 0,
+            found_parts: 0,
+        };
+        attrs.record(&mut event);
+        event
+    }
+}
+
+impl Visit for CheckpointPartsMissing {
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        match field.name() {
+            "version" => self.version = value,
+            "expected_parts" => self.expected_parts = value,
+            "found_parts" => self.found_parts = value,
+            _ => {}
+        }
+    }
+
+    fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
+}
+
+impl fmt::Display for CheckpointPartsMissing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "CheckpointPartsMissing(version={}, expected_parts={}, found_parts={})",
+            self.version, self.expected_parts, self.found_parts
+        )
+    }
+}
+
+pub(crate) fn emit_checkpoint_parts_missing(version: u64, expected_parts: u64, found_parts: u64) {
+    let _span = tracing::info_span!(
+        CheckpointPartsMissing::SPAN_NAME,
+        report = tracing::field::Empty,
+        version,
+        expected_parts,
+        found_parts,
+    );
 }
 
 // ====================================================================

@@ -11,7 +11,7 @@
 //!
 //! [`LogSegment`]: crate::log_segment::LogSegment
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
@@ -19,6 +19,7 @@ use tracing::{debug, info, instrument, warn};
 use url::Url;
 
 use crate::last_checkpoint_hint::LastCheckpointHint;
+use crate::metrics::emit_checkpoint_parts_missing;
 use crate::path::LogPathFileType::*;
 use crate::path::{CheckpointInstance, LogPathFileType, ParsedLogPath};
 use crate::{KernelError, KernelResult, KernelResultIterator, StorageHandler, Version};
@@ -361,6 +362,27 @@ impl ListingAccumulator {
     /// only the latest commit.
     fn select_checkpoint_for_group(&mut self, version: Version) {
         let pending_checkpoint_parts = std::mem::take(&mut self.pending_checkpoint_parts);
+        // Grouping retains only contiguous prefixes, so count listed parts before it discards
+        // candidates with a missing first or middle part.
+        let mut multipart_parts: HashMap<u32, HashSet<u32>> = HashMap::new();
+        for part in &pending_checkpoint_parts {
+            if let MultiPartCheckpoint {
+                part_num,
+                num_parts,
+            } = part.file_type
+            {
+                multipart_parts
+                    .entry(num_parts)
+                    .or_default()
+                    .insert(part_num);
+            }
+        }
+        for (expected_parts, parts) in multipart_parts {
+            let found_parts = parts.len() as u64;
+            if found_parts < u64::from(expected_parts) {
+                emit_checkpoint_parts_missing(version, u64::from(expected_parts), found_parts);
+            }
+        }
         let Some((_, complete_checkpoint)) = group_checkpoint_parts(pending_checkpoint_parts)
             .into_iter()
             .filter(|(instance, part_files)| instance.is_complete(part_files))
@@ -663,13 +685,39 @@ impl LogSegmentFiles {
         log_tail: Vec<ParsedLogPath>,
         end_version: Option<Version>,
     ) -> KernelResult<Self> {
-        let listed_files = Self::list(
+        let mut hinted_checkpoint_seen = false;
+        let files = list_delta_log_from_storage(
             storage,
             log_root,
+            checkpoint_metadata.version,
+            end_version.unwrap_or(Version::MAX),
+        )?
+        .inspect(|file| {
+            if let Ok(file) = file {
+                hinted_checkpoint_seen |= file.location.size > 0
+                    && checkpoint_metadata.applies_to(std::slice::from_ref(file));
+            }
+        });
+        let listed_files = Self::build_log_segment_files(
+            files,
             log_tail,
-            Some(checkpoint_metadata.version),
+            checkpoint_metadata.version,
             end_version,
+            CheckpointHandling::Adopt,
         )?;
+        // An AMT hint refers to a manifest commit rather than a checkpoint file.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let expects_checkpoint_file = checkpoint_metadata.amt_checkpoint.is_none();
+        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+        let expects_checkpoint_file = true;
+        if expects_checkpoint_file && !hinted_checkpoint_seen {
+            let expected_parts = if checkpoint_metadata.v2_checkpoint.is_some() {
+                1
+            } else {
+                checkpoint_metadata.parts.unwrap_or(1) as u64
+            };
+            emit_checkpoint_parts_missing(checkpoint_metadata.version, expected_parts, 0);
+        }
 
         let Some(latest_checkpoint) = listed_files.checkpoint_parts.last() else {
             // The segment has no checkpoint version yet starts at the hinted version: the

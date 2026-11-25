@@ -552,6 +552,24 @@ void print_metric(MetricEvent event) {
 
   case MetricEventCrcReadFailure:
     PM_START(CrcReadFailure);
+    CrcReadFailure crf = event.crc_read_failure;
+    printf("  reason:");
+    switch (crf.reason) {
+    case CrcReadFailureReasonNotFound: printf(" NotFound,\n"); break;
+    case CrcReadFailureReasonEmpty: printf(" Empty,\n"); break;
+    case CrcReadFailureReasonParsing: printf(" Parsing,\n"); break;
+    case CrcReadFailureReasonError: printf(" Error,\n"); break;
+    case CrcReadFailureReasonCancelled: printf(" Cancelled,\n"); break;
+    }
+    PM_END;
+    return;
+
+  case MetricEventCheckpointPartsMissing:
+    PM_START(CheckpointPartsMissing);
+    CheckpointPartsMissing cpm = event.checkpoint_parts_missing;
+    PM_U64(cpm, version);
+    PM_U64(cpm, expected_parts);
+    PM_U64(cpm, found_parts);
     PM_END;
     return;
 

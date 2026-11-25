@@ -6,11 +6,14 @@ use url::Url;
 use super::*;
 use crate::engine::sync::SyncEngine;
 use crate::engine::{CancellableEngine, DelegatingEngine, RelaxedCounter};
+use crate::metrics::MetricEvent;
 use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path as ObjectPath;
 use crate::path::tests::multipart_checkpoint_name;
-use crate::unit_test_utils::TestCancellationToken;
+use crate::unit_test_utils::{
+    CapturingReporter, TestCancellationToken, install_thread_local_metrics_reporter,
+};
 use crate::{Engine as _, FileMeta, KernelResultIterator, StorageHandler};
 
 // size markers used to identify commit sources in tests
@@ -1334,6 +1337,168 @@ async fn test_list_ignoring_checkpoints_keeps_commits_and_crc() {
 }
 
 // ---------------------------------------------------------------------------
+#[rstest]
+#[case::missing_first(&[2, 3])]
+#[case::missing_middle(&[1, 3])]
+#[case::missing_last(&[1, 2])]
+#[case::complete(&[1, 2, 3])]
+#[tokio::test]
+async fn multipart_checkpoint_reports_missing_parts_and_preserves_fallback(
+    #[case] present_parts: &[u32],
+    #[values(false, true)] backward_scan: bool,
+) {
+    let mut log_files: Vec<_> = (0..=6)
+        .map(|v| (v, LogPathFileType::Commit, CommitSource::Filesystem))
+        .collect();
+    log_files.push((
+        3,
+        LogPathFileType::ClassicCheckpoint,
+        CommitSource::Filesystem,
+    ));
+    log_files.extend(present_parts.iter().map(|&part_num| {
+        (
+            5,
+            LogPathFileType::MultiPartCheckpoint {
+                part_num,
+                num_parts: 3,
+            },
+            CommitSource::Filesystem,
+        )
+    }));
+    let (storage, log_root) = create_storage(log_files).await;
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
+    let listed = if backward_scan {
+        LogSegmentFiles::list_with_backward_checkpoint_scan(storage.as_ref(), &log_root, vec![], 6)
+    } else {
+        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], None, None)
+    }
+    .unwrap();
+
+    let complete = present_parts.len() == 3;
+    let expected_checkpoint = if complete { 5 } else { 3 };
+    assert_eq!(listed.checkpoint_parts[0].version, expected_checkpoint);
+    assert_eq!(
+        listed
+            .ascending_commit_files
+            .iter()
+            .map(|file| file.version)
+            .collect::<Vec<_>>(),
+        ((expected_checkpoint + 1)..=6).collect::<Vec<_>>()
+    );
+    let missing_parts: Vec<_> = reporter
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            MetricEvent::CheckpointPartsMissing(event) => {
+                Some((event.version, event.expected_parts, event.found_parts))
+            }
+            _ => None,
+        })
+        .collect();
+    let expected = if complete {
+        vec![]
+    } else {
+        vec![(5, 3, present_parts.len() as u64)]
+    };
+    assert_eq!(missing_parts, expected);
+}
+
+#[rstest]
+#[case::all_parts_absent(&[], false)]
+#[case::missing_first(&[2, 3], false)]
+#[case::empty_parts(&[1, 2, 3], true)]
+#[case::complete(&[1, 2, 3], false)]
+#[tokio::test]
+async fn hint_reports_missing_checkpoint_parts_before_fallback_or_failure(
+    #[case] present_parts: &[u32],
+    #[case] empty_parts: bool,
+    #[values(None, Some(5), Some(6))] alternate_checkpoint: Option<Version>,
+) {
+    let hint = LastCheckpointHint {
+        version: 5,
+        parts: Some(3),
+        ..Default::default()
+    };
+    let mut log_files: Vec<_> = (5..=7)
+        .map(|v| (v, LogPathFileType::Commit, CommitSource::Filesystem))
+        .collect();
+    log_files.extend(present_parts.iter().map(|&part_num| {
+        (
+            5,
+            LogPathFileType::MultiPartCheckpoint {
+                part_num,
+                num_parts: 3,
+            },
+            CommitSource::Filesystem,
+        )
+    }));
+    if let Some(version) = alternate_checkpoint {
+        log_files.push((
+            version,
+            LogPathFileType::ClassicCheckpoint,
+            CommitSource::Filesystem,
+        ));
+    }
+    let (storage, log_root) = create_storage(log_files).await;
+    if empty_parts {
+        for &part in present_parts {
+            let name = multipart_checkpoint_name(5, part, 3);
+            storage
+                .put(&log_root.join(&name).unwrap(), bytes::Bytes::new(), true)
+                .unwrap();
+        }
+    }
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
+    let listed = LogSegmentFiles::list_with_checkpoint_hint(
+        &hint,
+        storage.as_ref(),
+        &log_root,
+        vec![],
+        None,
+    );
+
+    let found_parts = if empty_parts {
+        0
+    } else {
+        present_parts.len() as u64
+    };
+    let complete = found_parts == 3;
+    if complete || alternate_checkpoint.is_some() {
+        let expected_checkpoint = alternate_checkpoint.unwrap_or(5);
+        assert_eq!(
+            listed.unwrap().checkpoint_parts[0].version,
+            expected_checkpoint
+        );
+    } else {
+        assert!(
+            listed
+                .unwrap_err()
+                .to_string()
+                .contains("Had a _last_checkpoint hint but didn't find any checkpoints")
+        );
+    }
+    let missing_parts: Vec<_> = reporter
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            MetricEvent::CheckpointPartsMissing(event) => {
+                Some((event.version, event.expected_parts, event.found_parts))
+            }
+            _ => None,
+        })
+        .collect();
+    let expected = if complete {
+        vec![]
+    } else {
+        vec![(5, 3, found_parts)]
+    };
+    assert_eq!(missing_parts, expected);
+}
+
 // find_complete_checkpoint_version direct unit tests
 // (other cases already covered by tests above)
 // ---------------------------------------------------------------------------

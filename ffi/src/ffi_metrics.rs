@@ -540,6 +540,56 @@ pub struct CrcReadSuccess {
     pub duration_ns: u64,
 }
 
+/// Why a CRC file could not be read or parsed.
+///
+/// cbindgen:prefix-with-name=true
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum CrcReadFailureReason {
+    /// Storage reported that the CRC file was absent.
+    NotFound,
+    /// The CRC read returned no data.
+    Empty,
+    /// The CRC contents could not be parsed or validated.
+    Parsing,
+    /// The read failed for another reason.
+    Error,
+    /// The read was cancelled.
+    Cancelled,
+}
+
+impl From<kernel::CrcReadFailureReason> for CrcReadFailureReason {
+    fn from(reason: kernel::CrcReadFailureReason) -> Self {
+        match reason {
+            kernel::CrcReadFailureReason::NotFound => Self::NotFound,
+            kernel::CrcReadFailureReason::Empty => Self::Empty,
+            kernel::CrcReadFailureReason::Parsing => Self::Parsing,
+            kernel::CrcReadFailureReason::Error => Self::Error,
+            kernel::CrcReadFailureReason::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+/// A CRC file read or parse failed. Non-cancellation failures allow log replay.
+#[repr(C)]
+pub struct CrcReadFailure {
+    /// Why the CRC could not be used.
+    pub reason: CrcReadFailureReason,
+}
+
+/// A checkpoint candidate was rejected because referenced parts were missing.
+///
+/// This reports discovery of missing parts, not whether the enclosing snapshot build succeeded.
+#[repr(C)]
+pub struct CheckpointPartsMissing {
+    /// Version of the incomplete checkpoint.
+    pub version: u64,
+    /// Number of parts required by the checkpoint file name or hint.
+    pub expected_parts: u64,
+    /// Number of usable parts found in the listing.
+    pub found_parts: u64,
+}
+
 /// A [`delta_kernel::Snapshot::write_checksum`] call succeeded.
 #[repr(C)]
 pub struct ChecksumWriteSuccess {
@@ -683,7 +733,7 @@ pub enum MetricEvent {
     SetTransactionLoadSuccess(SetTransactionLoadSuccess),
     SetTransactionLoadFailure,
     CrcReadSuccess(CrcReadSuccess),
-    CrcReadFailure,
+    CrcReadFailure(CrcReadFailure),
     JsonReadCompleted(JsonReadCompleted),
     ParquetReadCompleted(ParquetReadCompleted),
     ScanMetadataCompleted(ScanMetadataCompleted),
@@ -695,6 +745,7 @@ pub enum MetricEvent {
     ChecksumWriteSuccess(ChecksumWriteSuccess),
     ChecksumWriteFailure(ChecksumWriteFailure),
     LastCheckpointReadCompleted(LastCheckpointReadCompleted),
+    CheckpointPartsMissing(CheckpointPartsMissing),
 }
 
 fn duration_ns(duration: std::time::Duration) -> u64 {
@@ -888,7 +939,20 @@ impl MetricEvent {
                 bytes_read: *bytes_read,
                 duration_ns: duration_ns(*duration),
             }),
-            K::CrcReadFailure => Self::CrcReadFailure,
+            K::CrcReadFailure(kernel::CrcReadFailure { reason }) => {
+                Self::CrcReadFailure(CrcReadFailure {
+                    reason: (*reason).into(),
+                })
+            }
+            K::CheckpointPartsMissing(kernel::CheckpointPartsMissing {
+                version,
+                expected_parts,
+                found_parts,
+            }) => Self::CheckpointPartsMissing(CheckpointPartsMissing {
+                version: *version,
+                expected_parts: *expected_parts,
+                found_parts: *found_parts,
+            }),
             K::LastCheckpointReadCompleted(kernel::LastCheckpointReadCompleted {
                 outcome,
                 duration,
@@ -1035,6 +1099,45 @@ mod tests {
 
     use super::*;
     use crate::TryFromStringSlice;
+
+    #[rstest]
+    #[case(kernel::CrcReadFailureReason::NotFound, CrcReadFailureReason::NotFound)]
+    #[case(kernel::CrcReadFailureReason::Empty, CrcReadFailureReason::Empty)]
+    #[case(kernel::CrcReadFailureReason::Parsing, CrcReadFailureReason::Parsing)]
+    #[case(kernel::CrcReadFailureReason::Error, CrcReadFailureReason::Error)]
+    #[case(
+        kernel::CrcReadFailureReason::Cancelled,
+        CrcReadFailureReason::Cancelled
+    )]
+    fn crc_read_failure_conversion_preserves_reason(
+        #[case] reason: kernel::CrcReadFailureReason,
+        #[case] expected: CrcReadFailureReason,
+    ) {
+        let event = kernel::MetricEvent::CrcReadFailure(kernel::CrcReadFailure { reason });
+        with_ffi_event(&event, |event| {
+            let MetricEvent::CrcReadFailure(event) = event else {
+                panic!("expected CrcReadFailure");
+            };
+            assert_eq!(event.reason, expected);
+        });
+    }
+
+    #[test]
+    fn checkpoint_parts_missing_conversion_preserves_counts() {
+        let event = kernel::MetricEvent::CheckpointPartsMissing(kernel::CheckpointPartsMissing {
+            version: 17,
+            expected_parts: 3,
+            found_parts: 2,
+        });
+        with_ffi_event(&event, |event| {
+            let MetricEvent::CheckpointPartsMissing(event) = event else {
+                panic!("expected CheckpointPartsMissing");
+            };
+            assert_eq!(event.version, 17);
+            assert_eq!(event.expected_parts, 3);
+            assert_eq!(event.found_parts, 2);
+        });
+    }
 
     #[rstest]
     #[case(
