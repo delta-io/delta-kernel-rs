@@ -426,6 +426,36 @@ mod tests {
         let snapshot =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
+        {
+            let reporter = Arc::new(test_utils::CapturingReporter::default());
+            let _guard =
+                crate::ffi_test_utils::install_thread_local_metrics_reporter(reporter.clone());
+            let domain = "missing";
+            for request in ["first", "second", ""] {
+                let result = unsafe {
+                    get_domain_metadata_with_correlation_id(
+                        snapshot.shallow_copy(),
+                        kernel_string_slice!(domain),
+                        engine.shallow_copy(),
+                        allocate_str,
+                        kernel_string_slice!(request),
+                    )
+                };
+                assert!(ok_or_panic(result).is_none());
+            }
+            let reads: Vec<_> = reporter
+                .events()
+                .into_iter()
+                .filter_map(|event| match event {
+                    delta_kernel::metrics::MetricEvent::DomainMetadataLoadSuccess(read) => {
+                        Some(read.correlation_id)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(reads, [Some("first".into()), Some("second".into()), None]);
+        }
+
         let get_domain_metadata_helper = |domain: &str| unsafe {
             get_domain_metadata(
                 snapshot.shallow_copy(),
