@@ -345,8 +345,7 @@ mod tests {
         CheckpointOutputStats, CheckpointProcessingStats, CheckpointWriteMode,
         CheckpointWriteOutcome, CheckpointWriteStats, CrcReadFailureReason,
         LastCheckpointReadOutcome, MetricEvent, MetricId, ScanPlanOutcome, ScanPlanReport,
-        WithMetricsReporterLayer as _,
-        emit_scan_plan_completed,
+        WithMetricsReporterLayer as _, emit_scan_plan_completed,
     };
     use crate::scan::{PartitionValuesOptions, StatsOptions};
     use crate::schema::schema_ref;
