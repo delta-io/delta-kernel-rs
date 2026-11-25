@@ -6,11 +6,12 @@ import os
 from pathlib import Path, PurePosixPath
 from typing import Iterator, Literal
 
-Repository = Literal["pr", "delta"]
+Repository = Literal["pr", "delta", "guidance"]
 
 _ROOT_ENV = {
     "pr": "PR_SOURCE_ROOT",
     "delta": "DELTA_SOURCE_ROOT",
+    "guidance": "GUIDANCE_SOURCE_ROOT",
 }
 _MAX_FILE_BYTES = 2_000_000
 _MAX_OUTPUT_CHARS = 40_000
@@ -21,7 +22,7 @@ _MAX_SCANNED_FILES = 20_000
 def _source_root(repository: Repository) -> Path:
     env_name = _ROOT_ENV.get(repository)
     if env_name is None:
-        raise ValueError("repository must be 'pr' or 'delta'")
+        raise ValueError("repository must be 'pr', 'delta', or 'guidance'")
     raw_root = os.environ.get(env_name)
     if not raw_root:
         raise ValueError(f"{env_name} is not configured")
@@ -63,6 +64,18 @@ def _read_text(path: Path) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+def _lines(text: str) -> list[str]:
+    """Split text into the lines Git counts: a line ends at a newline and nowhere else.
+
+    `str.splitlines` also breaks at form feeds and other separators, which would shift every
+    later line number away from the number GitHub shows.
+    """
+    lines = text.split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    return [line.removesuffix("\r") for line in lines]
+
+
 def _iter_files(root: Path, target: Path) -> Iterator[Path]:
     candidates = [target] if target.is_file() else target.rglob("*")
     for candidate in candidates:
@@ -84,10 +97,13 @@ def read_source_file(
     start_line: int = 1,
     line_count: int = 400,
 ) -> str:
-    """Read bounded, line-numbered text from a source file.
+    """Read complete, numbered lines within the output limit.
+
+    Continue from the returned "Next line" cursor until "End of file". A line too long to return
+    produces an error that names the line to continue from.
 
     Args:
-        repository: Read from the exact PR checkout or read-only Delta reference.
+        repository: Read from the PR checkout, Delta reference, or trusted guidance snapshot.
         path: Repository-relative POSIX path to a text file.
         start_line: First line to return, using one-based numbering.
         line_count: Number of lines to return, from 1 through 1000.
@@ -98,10 +114,25 @@ def read_source_file(
         _, target = _resolve(repository, path)
         if not target.is_file():
             raise ValueError("path is not a file")
-        lines = _read_text(target).splitlines()
-        selected = lines[start_line - 1 : start_line - 1 + line_count]
-        numbered = [f"{start_line + index}\t{line}" for index, line in enumerate(selected)]
-        return _bounded("\n".join(numbered))
+        lines = _lines(_read_text(target))
+        numbered = []
+        body_chars = 0
+        next_line = start_line
+        for index in range(start_line - 1, min(start_line - 1 + line_count, len(lines))):
+            line = f"{index + 1}\t{lines[index]}"
+            footer = "End of file." if index + 1 == len(lines) else f"Next line: {index + 2}"
+            if body_chars + len(line) + 1 + len(footer) > _MAX_OUTPUT_CHARS:
+                if not numbered:
+                    raise ValueError(
+                        f"source line {index + 1} exceeds the {_MAX_OUTPUT_CHARS}-character "
+                        f"output limit; continue from line {index + 2}"
+                    )
+                break
+            numbered.append(line)
+            body_chars += len(line) + 1
+            next_line = index + 2
+        footer = "End of file." if next_line > len(lines) else f"Next line: {next_line}"
+        return "\n".join([*numbered, footer])
     except (OSError, TypeError, ValueError) as exc:
         return f"Error: {exc}"
 
@@ -114,7 +145,7 @@ def list_source_files(
     """List files recursively below a source-tree path.
 
     Args:
-        repository: List the exact PR checkout or read-only Delta reference.
+        repository: List the PR checkout, Delta reference, or trusted guidance snapshot.
         path: Optional repository-relative file or directory path.
         max_entries: Maximum paths to return, from 1 through 1000.
     """
@@ -141,7 +172,7 @@ def search_source_code(
     """Search source text for a fixed, case-sensitive string.
 
     Args:
-        repository: Search the exact PR checkout or read-only Delta reference.
+        repository: Search the PR checkout, Delta reference, or trusted guidance snapshot.
         query: Fixed text to find; regular expressions are not accepted.
         path: Optional repository-relative file or directory path.
         max_results: Maximum matching lines to return, from 1 through 500.
@@ -169,7 +200,7 @@ def search_source_code(
             if b"\x00" in data:
                 continue
             relative = candidate.relative_to(root).as_posix()
-            lines = data.decode("utf-8", errors="replace").splitlines()
+            lines = _lines(data.decode("utf-8", errors="replace"))
             for line_number, line in enumerate(lines, 1):
                 if query in line:
                     results.append(f"{relative}:{line_number}: {line[:500]}")

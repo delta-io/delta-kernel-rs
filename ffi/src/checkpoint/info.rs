@@ -7,6 +7,7 @@ use super::FfiSelectedCheckpointType;
 use crate::delta_types::{CheckpointBacking, FfiLastCheckpoint};
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
+use crate::panic::catch_panic;
 use crate::{
     KernelStringSlice, NullableCvoid, OptionalValue, SharedExternEngine, SharedSnapshot,
     kernel_string_slice,
@@ -73,13 +74,15 @@ pub unsafe extern "C" fn snapshot_checkpoint_type(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<OptionalValue<FfiSelectedCheckpointType>> {
-    let snapshot = unsafe { snapshot.as_ref() };
-    let engine = unsafe { engine.as_ref() };
-    let result = snapshot
-        .reader()
-        .get_checkpoint_type(engine.engine().as_ref())
-        .map(|checkpoint_type| checkpoint_type.map(Into::into).into());
-    unsafe { result.into_extern_result(&engine) }
+    let result = catch_panic(|| {
+        let snapshot = unsafe { snapshot.as_ref() };
+        let engine = unsafe { engine.as_ref() };
+        snapshot
+            .reader()
+            .get_checkpoint_type(engine.engine().as_ref())
+            .map(|checkpoint_type| checkpoint_type.map(Into::into).into())
+    });
+    unsafe { result.into_extern_result(&engine.as_ref()) }
 }
 
 /// Resolves the selected checkpoint and invokes `visitor` once with its complete summary.
@@ -104,14 +107,16 @@ pub unsafe extern "C" fn snapshot_checkpoint_info(
     context: NullableCvoid,
     visitor: CheckpointInfoVisitor,
 ) -> ExternResult<bool> {
-    let snapshot = unsafe { snapshot.as_ref() };
-    let engine = unsafe { engine.as_ref() };
-    let result = snapshot
-        .reader()
-        .get_checkpoint_info(engine.engine().as_ref())
-        .and_then(|info| visit(info.as_deref(), context, visitor))
-        .map(|()| true);
-    unsafe { result.into_extern_result(&engine) }
+    let result = catch_panic(|| {
+        let snapshot = unsafe { snapshot.as_ref() };
+        let engine = unsafe { engine.as_ref() };
+        snapshot
+            .reader()
+            .get_checkpoint_info(engine.engine().as_ref())
+            .and_then(|info| visit(info.as_deref(), context, visitor))
+            .map(|()| true)
+    });
+    unsafe { result.into_extern_result(&engine.as_ref()) }
 }
 
 fn visit(

@@ -374,6 +374,9 @@ class ReviewScopeTest(unittest.TestCase):
         for body, review_base in cases:
             with self.subTest(review_base=review_base), tempfile.TemporaryDirectory() as directory:
                 temp = Path(directory)
+                guidance = temp / "guidance"
+                guidance.mkdir()
+                (guidance / "AGENTS.md").write_text("Test project rules.\n")
                 (temp / "pr_meta.json").write_text(json.dumps(_metadata(body)))
                 (temp / "pr_history.json").write_text("{}")
                 (temp / "pr_review_comments.json").write_text("[]")
@@ -409,6 +412,8 @@ class ReviewScopeTest(unittest.TestCase):
                         "TEST_ROOT": str(temp),
                         "GITHUB_OUTPUT": str(temp / "github-output"),
                         "OUTPUT_MODE": "inline",
+                        "GUIDANCE_SOURCE_ROOT": str(guidance),
+                        "GITHUB_SHA": GITHUB_BASE,
                         "REPO": REPOSITORY,
                     },
                     capture_output=True,
@@ -420,7 +425,7 @@ class ReviewScopeTest(unittest.TestCase):
                     self.assertIn("no PR link", (temp / "check-summary.txt").read_text())
                     self.assertIn(f"head_sha={HEAD}", (temp / "github-output").read_text())
                     self.assertFalse((temp / "api-calls").exists())
-                    self.assertFalse((temp / "review_prompt.txt").exists())
+                    self.assertFalse((temp / "orchestrator_task.md").exists())
                     check_step = next(
                         step
                         for job in workflow["jobs"].values()
@@ -470,16 +475,17 @@ class ReviewScopeTest(unittest.TestCase):
                 output = (temp / "github-output").read_text()
                 self.assertIn(f"base_sha={GITHUB_BASE}\n", output)
                 self.assertIn(f"review_base_sha={review_base}\n", output)
-                for name in ("review_prompt.txt", "reviewer_context.txt"):
+                for name in ("orchestrator_task.md", "child_task_pr_data.md"):
                     prompt = (temp / name).read_text()
                     self.assertIn(f"**Review base SHA:** {review_base}", prompt)
                     self.assertIn(f"**GitHub base SHA:** {GITHUB_BASE}", prompt)
+                    self.assertNotIn("**Stats:**", prompt)
                     if review_base != GITHUB_BASE:
                         self.assertIn(
                             "Changes inherited from ancestor PRs are context only", prompt
                         )
                         self.assertIn("Check effects on unchanged callers", prompt)
-                        if name == "reviewer_context.txt":
+                        if name == "child_task_pr_data.md":
                             self.assertLess(
                                 prompt.index("## Review scope"),
                                 prompt.index("untrusted review data"),

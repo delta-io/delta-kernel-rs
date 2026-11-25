@@ -1,4 +1,4 @@
-//! Recording handlers for cancellation tests across adapter and snapshot read paths.
+//! Recording handlers for tests across adapter and snapshot read paths.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -26,7 +26,7 @@ pub(crate) enum Read {
     Footer,
 }
 
-/// Records scopes at the real engine's read boundaries; all data comes from the inner handlers.
+/// Records scopes at the real engine's read boundaries and can transform JSON read batches.
 pub(crate) struct RecordingReads {
     /// Engine supplying fixture data and delegated operations.
     pub(crate) inner: Arc<dyn Engine>,
@@ -40,9 +40,15 @@ pub(crate) struct RecordingReads {
     pub(crate) cancel_delay: Duration,
     /// Cancels the test token after each JSON iterator item.
     pub(crate) cancel_json_after_batch: bool,
+    /// Transforms the delegated JSON stream, for example to inject empty batches or errors.
+    pub(crate) transform_json_batches: Option<Box<JsonBatchTransform>>,
     /// Read boundaries observed in call order.
     pub(crate) events: Mutex<Vec<Read>>,
 }
+
+type JsonBatchTransform = dyn Fn(SchemaRef, FileDataReadResultIterator) -> KernelResult<FileDataReadResultIterator>
+    + Send
+    + Sync;
 
 impl RecordingReads {
     /// Creates a recorder that can cancel at a selected read boundary.
@@ -55,6 +61,7 @@ impl RecordingReads {
             cancel_on,
             cancel_delay: Duration::ZERO,
             cancel_json_after_batch: false,
+            transform_json_batches: None,
             events: Mutex::new(Vec::new()),
         })
     }
@@ -179,7 +186,11 @@ impl JsonHandler for RecordingReads {
         let batches = self
             .inner
             .json_handler()
-            .read_json_files_with_cancellation(files, schema, predicate, token)?;
+            .read_json_files_with_cancellation(files, schema.clone(), predicate, token)?;
+        let batches = match &self.transform_json_batches {
+            Some(transform) => transform(schema, batches)?,
+            None => batches,
+        };
         if self.cancel_json_after_batch {
             let token = self.token.clone();
             Ok(Box::new(batches.inspect(move |_| token.cancel())))

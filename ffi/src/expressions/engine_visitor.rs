@@ -195,7 +195,7 @@ pub struct EngineExpressionVisitor {
     /// Visits the `ParseJson` expression belonging to the list identified by `sibling_list_id`.
     /// The sub-expression (JSON string) will be in a _one_ item list identified by
     /// `child_list_id`. The `output_schema` handle specifies the schema to parse the JSON
-    /// into.
+    /// into. See [`ParseJsonExpression`] for NULL-input and parse-failure semantics.
     pub visit_parse_json: VisitParseJsonFn,
     /// Visits a `MapToStruct` expression. The sub-expression is in the one-item list identified by
     /// `child_list_id`. `options` and its contents are borrowed for the duration of the callback.

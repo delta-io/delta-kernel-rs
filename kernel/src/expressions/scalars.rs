@@ -400,6 +400,13 @@ impl StructData {
 
         for (f, a) in schema.fields().zip(&values) {
             let matches_type = match (f.data_type(), a) {
+                (expected, Scalar::Null(actual)) => expected == actual,
+                (DataType::Array(expected), Scalar::Array(actual)) => {
+                    expected.as_ref() == actual.array_type()
+                }
+                (DataType::Map(expected), Scalar::Map(actual)) => {
+                    expected.as_ref() == actual.map_type()
+                }
                 (DataType::Struct(expected), Scalar::Struct(actual)) => {
                     expected.as_ref() == actual.schema.as_ref()
                 }
@@ -918,10 +925,12 @@ impl<T: TryFrom<Scalar, Error = KernelError> + ToDataType> TryFrom<Scalar> for O
     fn try_from(scalar: Scalar) -> KernelResult<Self> {
         match scalar {
             Scalar::Null(data_type) => {
-                let expected = T::to_data_type();
                 require!(
-                    data_type == expected,
-                    KernelError::scalar_conversion(expected.kind_name(), data_type.kind_name())
+                    T::matches_data_type(&data_type),
+                    KernelError::scalar_conversion(
+                        T::to_data_type().kind_name(),
+                        data_type.kind_name()
+                    )
                 );
                 Ok(None)
             }
@@ -1430,7 +1439,7 @@ mod tests {
     use super::*;
     use crate::Predicate as Pred;
     use crate::expressions::{BinaryPredicateOp, col, lit};
-    use crate::schema::{ToSchema, lazy_schema_ref, schema_ref};
+    use crate::schema::{ColumnNamesAndTypes, ToSchema, lazy_schema_ref, schema, schema_ref};
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::assert_result_error_with_message;
 
@@ -2692,16 +2701,31 @@ mod tests {
         assert_result_error_with_message(i64::try_from(scalar), expected);
     }
 
-    #[test]
-    fn null_option_requires_matching_element_data_type() {
-        assert_eq!(
-            Option::<i32>::try_from(Scalar::null(DataType::INTEGER)).unwrap(),
-            None
-        );
-        assert_result_error_with_message(
-            Option::<i32>::try_from(Scalar::null(DataType::STRING)),
-            "expected integer, found string",
-        );
+    #[rstest]
+    #[case::integer(Option::<i32>::try_from, DataType::INTEGER, None)]
+    #[case::wrong_primitive(Option::<i32>::try_from, DataType::STRING, Some("expected integer, found string"))]
+    #[case::derived_struct(Option::<Address>::try_from, Address::to_schema().into(), None)]
+    #[case::wrong_struct_type(Option::<Address>::try_from, DataType::STRING, Some("expected struct, found string"))]
+    #[case::reordered_fields(Option::<Address>::try_from,
+        schema! { nullable "zip": INTEGER, not_null "city": STRING }.into(), None)]
+    #[case::changed_nullability(Option::<Address>::try_from,
+        schema! { nullable "city": STRING, nullable "zip": INTEGER }.into(),
+        Some("expected struct, found struct"))]
+    #[case::changed_metadata(Option::<Address>::try_from,
+        schema! {
+            (StructField::not_null("city", DataType::STRING).with_metadata([("key", "value")])),
+            nullable "zip": INTEGER,
+        }.into(), Some("expected struct, found struct"))]
+    fn null_option_requires_matching_element_data_type<T: Debug>(
+        #[case] decode: fn(Scalar) -> KernelResult<Option<T>>,
+        #[case] data_type: DataType,
+        #[case] expected_error: Option<&str>,
+    ) {
+        let result = decode(Scalar::null(data_type));
+        match expected_error {
+            Some(message) => assert_result_error_with_message(result, message),
+            None => assert!(result.unwrap().is_none()),
+        }
     }
 
     #[test]
@@ -2743,6 +2767,12 @@ mod tests {
                 not_null "values": { STRING => nullable STRING }
             };
             &SCHEMA_INFO
+        }
+
+        fn leaf_columns() -> &'static ColumnNamesAndTypes {
+            static LEAF_COLUMNS: LazyLock<ColumnNamesAndTypes> =
+                LazyLock::new(|| NullableMapValues::schema_ref().leaves(None));
+            &LEAF_COLUMNS
         }
     }
 
@@ -2907,6 +2937,12 @@ mod tests {
                     nullable "aExtra": STRING,
                 };
                 &SCHEMA
+            }
+
+            fn leaf_columns() -> &'static ColumnNamesAndTypes {
+                static LEAF_COLUMNS: LazyLock<ColumnNamesAndTypes> =
+                    LazyLock::new(|| Row::schema_ref().leaves(None));
+                &LEAF_COLUMNS
             }
         }
 

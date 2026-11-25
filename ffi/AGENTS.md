@@ -470,11 +470,11 @@ There are two error directions, with opposite message owners:
 
 #### Kernel and Delta errors returned to the engine
 
-`ErrorAllocators` carries a connector context and both allocation callbacks. `KernelErrorInfo`
-contains a numeric code and message; `DeltaErrorInfo` contains the catalog condition, optional
-SQLSTATE, named parameters, and message. Callbacks copy any information they need after returning
-and return their own error object as `void*`, or NULL if allocation fails. Kernel returns that
-pointer unchanged in `ExternResult::Err` and never reads or frees it.
+`ErrorAllocators` carries a connector context and both allocation callbacks. The error information
+records in `src/error/allocation.rs` document the classification fields and borrowed diagnostics.
+Callbacks copy any information they need after returning and return their own error object as
+`void*`, or NULL if allocation fails. Kernel returns that pointer unchanged in `ExternResult::Err`
+and never reads or frees it.
 
 Engine constructors accept `*const ErrorAllocators` and copy the table into builders and engines.
 The table pointer must be valid for the constructor call; callback code and context must remain
@@ -533,7 +533,9 @@ pub unsafe extern "C" fn set_metadata(
     entries: CMetadataEntries,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<bool> {
-    let result = unsafe { set_metadata_impl(builder, entries) };
+    let result = crate::panic::catch_panic(|| unsafe {
+        set_metadata_impl(builder, entries)
+    });
     unsafe { result.into_extern_result(&*error_allocators) }
 }
 
@@ -571,6 +573,21 @@ error channels and often reduces a precise failure to a generic "visitor failed"
 iterators, each next call may return its own error. After a terminal error, the API must state
 whether the iterator can be retried or is poisoned. No callback may unwind across the C ABI.
 
+#### Panic boundaries
+
+Every top-level `extern "C"` export returning `ExternResult` must wrap its entire operation in
+`crate::panic::catch_panic`. Only error allocator acquisition and lifetime retention belong before
+the catcher. Inside the inline closure, first convert consumed handles to Rust owners with
+`into_inner()`, then perform all parsing, validation, allocation, kernel/engine calls, mutation,
+serialization, and operation-local cleanup. Keep individual unsafe operations explicit.
+
+The safe catcher returns a Rust `Result`; convert it through `IntoExternResult` in a separate
+`unsafe` block afterward. Reuse existing tracing and error allocation. Do not add boundary macros,
+panic hooks, or abort handling.
+
+Catching a panic does not roll back state. Discard failed work and reconcile uncertain commit
+outcomes before retrying.
+
 ### Review checklist for new FFI APIs
 
 Before approving a new boundary type or function, answer:
@@ -597,6 +614,8 @@ Before approving a new boundary type or function, answer:
 16. Does opaque encoded state cross as bytes, with compatibility checked when required?
 17. Does the C header communicate the same ownership, nullability, and mutation semantics as the
     Rust documentation?
+18. Does each top-level C export returning `ExternResult` follow the
+    [panic boundary policy](#panic-boundaries)?
 
 ## Source layout
 

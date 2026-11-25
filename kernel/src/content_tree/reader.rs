@@ -5,10 +5,10 @@
 //! entries become `Add` actions, its live `DataManifest` entries are expanded into the `Add`
 //! actions of the leaf manifests they reference (minus the leaf entries removed by the root entry's
 //! manifest deletion vector), and every other root entry is dropped. A leaf manifest may contain
-//! only `Data` entries and errors otherwise. JSON statistics, partition values, and tags are not
-//! yet carried across (see the per-field TODOs); the entry data that flows into the action is the
-//! file location, size, row-tracking numbers, deletion vector, and, when the caller requests them,
-//! the Delta stats as `Add.stats_parsed` (see [`StatsRead`]).
+//! only `Data` entries and errors otherwise. JSON statistics and partition values are not yet
+//! carried across (see the per-field TODOs); the entry data that flows into the action is the file
+//! location, size, row-tracking numbers, deletion vector, tags, and, when the caller requests
+//! them, the Delta stats as `Add.stats_parsed` (see [`StatsRead`]).
 //! `modificationTime` and `dataChange` have no AMT source and are supplied by the caller via
 //! [`ReadContext`].
 
@@ -32,8 +32,8 @@ use crate::content_tree::{
     AMT_FORMAT_VERSION, COLUMN_FILES, CONTENT_TYPE, ColumnFile, ContentTreeNodeEntry,
     DV_INFO_COLUMNS, DataContentType, DataFileFormat, FILE_FORMAT, FILE_SIZE_IN_BYTES,
     FIRST_ROW_ID, FORMAT_VERSION, LOCATION, MANIFEST_DV, MANIFEST_INFO, MODIFIED_SNAPSHOT_ID,
-    PARTITION_SPEC_ID, RECORD_COUNT, SEQUENCE_NUMBER, TRACKING, TRACKING_COLUMNS, TRACKING_STATUS,
-    TrackingInfo, TrackingStatus, struct_expr_from_schema,
+    PARTITION_SPEC_ID, RECORD_COUNT, SEQUENCE_NUMBER, TAGS, TRACKING, TRACKING_COLUMNS,
+    TRACKING_STATUS, TrackingInfo, TrackingStatus, struct_expr_from_schema,
 };
 use crate::engine_data::{
     EngineData, FilteredEngineData, GetData, RowVisitor, StructList, TypedGetData as _,
@@ -45,7 +45,7 @@ use crate::expressions::{
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DATA_CHANGE_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, DELETION_VECTOR_NAME,
-    MODIFICATION_TIME_NAME, PARTITION_VALUES_NAME, PATH_NAME, SIZE_NAME,
+    MODIFICATION_TIME_NAME, PARTITION_VALUES_NAME, PATH_NAME, SIZE_NAME, TAGS_NAME,
 };
 use crate::schema::{
     ArrayType, ColumnNamesAndTypes, DataType, MapType, MetadataColumnSpec, SchemaRef, StructField,
@@ -930,8 +930,7 @@ fn build_entry_to_add_expression(
     )?));
 
     // `struct_expr_from_schema` fills every unmatched (nullable) field with a typed null, so
-    // `stats`, `tags`, and `clusteringProvider` fall through to null.
-    // TODO(#2866): carry tags across from the entry.
+    // `stats` and `clusteringProvider` fall through to null.
     let add = struct_expr_from_schema(&ctx.action_schema(), |name| {
         Some(match name {
             n if n == PATH_NAME => Expression::coalesce([
@@ -942,6 +941,7 @@ fn build_entry_to_add_expression(
             // path carries a partition spec.
             n if n == PARTITION_VALUES_NAME => empty_partition_values.clone(),
             n if n == SIZE_NAME => Expression::column([FILE_SIZE_IN_BYTES]),
+            n if n == TAGS_NAME => Expression::column([TAGS]),
             // The AMT entry carries neither of these; both come from the caller's `ReadContext`.
             n if n == MODIFICATION_TIME_NAME => lit(ctx.modification_time),
             n if n == DATA_CHANGE_NAME => lit(ctx.data_change),
@@ -1379,6 +1379,7 @@ impl RowVisitor for LeafEntryVisitor<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::slice;
 
     use rstest::rstest;
@@ -1395,7 +1396,7 @@ mod tests {
     use crate::actions::{
         Add, LOG_ADD_SCHEMA, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
     };
-    use crate::arrow::array::{AsArray as _, RecordBatch};
+    use crate::arrow::array::{Array as _, AsArray as _, RecordBatch};
     use crate::arrow::compute::concat_batches;
     use crate::arrow::datatypes::Int64Type;
     use crate::content_tree::dv_conversion::extract_deletion_vector_content;
@@ -1403,7 +1404,8 @@ mod tests {
     use crate::content_tree::test_utils::{
         action_paths, added_data_entry, data_manifest_entry, entry_batch, entry_batch_with_stats,
         mumbling_bitmap, struct_batch, test_dv_info, with_field, write_manifest,
-        write_manifest_with_stats, x_full_stats, x_full_stats_value, x_stats, x_upper_bound_stats,
+        write_manifest_with_stats, write_manifest_without_tags, x_full_stats, x_full_stats_value,
+        x_stats, x_upper_bound_stats,
     };
     use crate::content_tree::{
         DeletionVectorInfo, LOWER_BOUND, ManifestInfo, NAN_VALUE_COUNT, NULL_VALUE_COUNT,
@@ -2044,6 +2046,86 @@ mod tests {
             .get_row_indexes(&engine, &table_root())
             .unwrap();
         assert_eq!(row_indexes, Some(vec![1, 5, 10]));
+    }
+
+    /// A root or leaf entry's `tags` are carried into `Add.tags`, including null tag values.
+    #[rstest]
+    fn read_add_actions_from_amt_carries_tags_into_add(#[values(false, true)] in_leaf: bool) {
+        let engine = SyncEngine::in_memory();
+        let tags = [
+            Some(HashMap::from([
+                (
+                    "INSERTION_TIME".to_string(),
+                    Some("1795008428560000".to_string()),
+                ),
+                ("NULL_VALUED".to_string(), None),
+            ])),
+            Some(HashMap::new()),
+            None,
+        ];
+        let entries: Vec<_> = tags
+            .iter()
+            .zip(0..)
+            .map(|(tags, i)| {
+                let path = format!("{i}.parquet");
+                let mut entry = if in_leaf {
+                    leaf_entry(&path, 100, 10, Some(1), Some(5), Some(10 * i))
+                } else {
+                    added_data_entry(&path, 100, 10, 10 * i, 5)
+                };
+                entry.tags = tags.clone();
+                entry
+            })
+            .collect();
+        let checkpoint = if in_leaf {
+            let leaf = write_leaf(&engine, "metadata/leaf.parquet", &entries, 5, 0);
+            write_root(&engine, &[leaf])
+        } else {
+            write_root(&engine, &entries)
+        };
+
+        let batches = read_tree(&engine, &checkpoint).unwrap();
+        let actual: Vec<_> = batches.iter().flat_map(add_tags).collect();
+        assert_eq!(actual, tags);
+    }
+
+    #[test]
+    fn read_add_actions_from_amt_reads_missing_tags_column_as_null_tags() {
+        let engine = SyncEngine::in_memory();
+        let location = table_root().join(ROOT_PATH).unwrap();
+        let entries = [added_data_entry("a.parquet", 100, 10, 0, 5)];
+        let root = write_manifest_without_tags(&engine, location, &entries);
+        let footer = engine.parquet_handler().read_parquet_footer(&root).unwrap();
+        assert!(footer.schema.field(TAGS).is_none());
+        let checkpoint = checkpoint_action_with_root(ROOT_PATH, root.size as i64, 1).unwrap();
+
+        let actual = read_tree(&engine, &checkpoint).unwrap();
+        let expected = expected_adds(&engine, &[("a.parquet", 100, 0, 5)]);
+        assert_eq!(actual, vec![expected]);
+    }
+
+    /// The `add.tags` of each row of `batch`.
+    fn add_tags(batch: &RecordBatch) -> Vec<Option<HashMap<String, Option<String>>>> {
+        let tags = batch
+            .column_by_name(ADD_NAME)
+            .unwrap()
+            .as_struct()
+            .column_by_name(TAGS_NAME)
+            .unwrap()
+            .as_map();
+        (0..tags.len())
+            .map(|row| {
+                tags.is_valid(row).then(|| {
+                    let entries = tags.value(row);
+                    let keys = entries.column(0).as_string::<i32>();
+                    let values = entries.column(1).as_string::<i32>();
+                    keys.iter()
+                        .zip(values)
+                        .map(|(key, value)| (key.unwrap().to_string(), value.map(str::to_string)))
+                        .collect()
+                })
+            })
+            .collect()
     }
 
     #[rstest]

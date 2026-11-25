@@ -16,6 +16,8 @@ use super::{
     require_pointed_checkpoint_action,
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::Version;
+#[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::visitors::LastManifestCommitVisitor;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::{CHECKPOINT_ACTION_FIELD, CheckpointAction, LastManifestCommit};
@@ -39,7 +41,7 @@ use crate::plans::ir::nodes::FileType;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::plan::Plan;
 #[cfg(feature = "declarative-plans")]
-use crate::plans::{Operation, PlanBuilder, PlanExecutor};
+use crate::plans::{Operation, PlanBuilder, PlanExecutor, PlanExecutorCapabilities};
 #[cfg(feature = "declarative-plans")]
 use crate::schema::SchemaRef;
 use crate::schema::{
@@ -48,9 +50,7 @@ use crate::schema::{
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::table_features::TableFeature;
-use crate::{
-    Engine, EngineData, KernelError, KernelResult, KernelResultIterator, Version, version_as_i64,
-};
+use crate::{Engine, EngineData, KernelError, KernelResult, KernelResultIterator, version_as_i64};
 
 impl LogSegment {
     /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
@@ -206,14 +206,14 @@ impl LogSegment {
         let (commit_paths, extra_actions) =
             (segment.commit_paths(self), segment.extra_actions(self)?);
         #[cfg(not(feature = "adaptive-metadata-in-dev"))]
-        let (commit_paths, extra_actions) = (
-            self.original_commit_paths(None, self.end_version),
-            Vec::new(),
-        );
+        let (commit_paths, extra_actions) = (self.find_commit_cover_paths(None), Vec::new());
         let schema = pm_plan_schema(&extra_actions)?;
 
         let commits = PlanBuilder::scan_json(
-            Self::version_tagged_scan_files(commit_paths)?,
+            // A log compaction holds the P&M in effect at its last version, so it ranks there.
+            Self::version_tagged_scan_files(commit_paths, |path| {
+                version_as_i64(path.last_version())
+            })?,
             &["version"],
             schema.clone(),
         )?;
@@ -330,9 +330,9 @@ impl LogSegment {
         Ok(batches)
     }
 
-    /// Reads the original commits in `segment` and the checkpoint, tagging each batch with its
-    /// version. Each commit file projects its checkpoint action, so replay captures the pointed one
-    /// if it reaches that row before it stops.
+    /// Reads the commit cover of `segment` and the checkpoint, tagging each batch with the version
+    /// it ranks at. Each commit file projects its checkpoint action, so replay captures the pointed
+    /// one if it reaches that row before it stops.
     fn read_pm_batches(
         &self,
         engine: &dyn Engine,
@@ -352,7 +352,7 @@ impl LogSegment {
         #[cfg(feature = "adaptive-metadata-in-dev")]
         let commit_paths = segment.commit_paths(self);
         #[cfg(not(feature = "adaptive-metadata-in-dev"))]
-        let commit_paths = self.original_commit_paths(None, self.end_version);
+        let commit_paths = self.find_commit_cover_paths(None);
         let commit_files = commit_paths
             .into_iter()
             .map(|path| path.location.clone())
@@ -363,23 +363,38 @@ impl LogSegment {
         let checkpoint = self
             .create_checkpoint_stream(engine, checkpoint_schema, checkpoint_predicate, None, None)?
             .actions;
-        let batches = commits.chain(checkpoint);
+        let batches = commits
+            .chain(checkpoint)
+            // An empty batch has no file path from which to derive a commit version.
+            // TODO(#4101): Handle empty batch of EngineData in kernel-rs, then remove this filter.
+            .filter(|batch| match batch {
+                Ok(batch) => !batch.actions.is_empty(),
+                Err(_) => true,
+            });
         Ok(batches.map(move |batch| {
             let batch = batch?;
-            // A commit's version is parsed from its `_file`; a checkpoint batch uses the constant.
-            let version = if batch.is_log_batch {
-                batch_version(batch.actions.as_ref())? as i64
-            } else {
-                checkpoint_version.ok_or_else(|| {
+            // A log file's versions are parsed from its `_file`; a checkpoint batch uses the
+            // constant.
+            let log_path = batch
+                .is_log_batch
+                .then(|| batch_log_path(batch.actions.as_ref()))
+                .transpose()?;
+            let rank_version = match &log_path {
+                Some(path) => version_as_i64(path.last_version())?,
+                None => checkpoint_version.ok_or_else(|| {
                     KernelError::internal_error("checkpoint batch without a version")
-                })?
+                })?,
             };
-            // Commit batches carry the checkpoint action and `commitInfo`.
+            // Only commit files carry the checkpoint action and `commitInfo`; log compactions carry
+            // neither.
             #[cfg(feature = "adaptive-metadata-in-dev")]
-            let commit_version = batch.is_log_batch.then_some(version);
+            let commit_version = log_path
+                .filter(|path| path.is_commit())
+                .map(|path| version_as_i64(path.version))
+                .transpose()?;
             Ok(VersionedBatch {
-                protocol_version: Some(version),
-                metadata_version: Some(version),
+                protocol_version: Some(rank_version),
+                metadata_version: Some(rank_version),
                 #[cfg(feature = "adaptive-metadata-in-dev")]
                 checkpoint_commit_version: commit_version,
                 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -387,6 +402,20 @@ impl LogSegment {
                 actions: batch.actions,
             })
         }))
+    }
+
+    /// The commit cover, newest first. When a log compaction covers the newest commit, that commit
+    /// is also read as its own file, since compactions drop `commitInfo` and checkpoint actions.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn pm_commit_cover_paths(&self) -> Vec<&ParsedLogPath> {
+        let mut paths = self.find_commit_cover_paths(None);
+        if let Some(newest_commit) = self.newest_commit_after_checkpoint()
+            && paths.first() != Some(&newest_commit)
+        {
+            // Put it first so replay reads the pointer even if it stops early.
+            paths.insert(0, newest_commit);
+        }
+        paths
     }
 
     /// The newest commit after the checkpoint, if any.
@@ -409,11 +438,13 @@ enum PmReader {
 }
 
 impl PmReader {
-    /// Returns a plan reader when `engine` has a plan executor, otherwise a file reader.
+    /// Returns a plan reader for a fully capable executor, otherwise a file reader.
     #[cfg_attr(not(feature = "declarative-plans"), allow(unused_variables))]
     fn for_engine(engine: &dyn Engine) -> Self {
         #[cfg(feature = "declarative-plans")]
-        if let Some(executor) = engine.plan_executor() {
+        if let Some(executor) = engine.plan_executor()
+            && executor.capabilities() == PlanExecutorCapabilities::Full
+        {
             return Self::Plan(executor);
         }
         Self::Files
@@ -487,14 +518,18 @@ impl PmReader {
     }
 
     /// Whether replay must read the newest commit of `log_segment` before it can choose the older
-    /// files, because a plan fixes its files before it runs.
+    /// files: a plan fixes its files before it runs, and a log compaction can hide the pointed
+    /// commit's checkpoint action from a single pass of file reads.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     fn reads_newest_commit_first(&self, log_segment: &LogSegment) -> bool {
         log_segment.newest_commit_after_checkpoint().is_some()
             && match self {
                 #[cfg(feature = "declarative-plans")]
                 Self::Plan(_) => true,
-                Self::Files => false,
+                Self::Files => log_segment
+                    .pm_commit_cover_paths()
+                    .iter()
+                    .any(|path| !path.is_commit()),
             }
     }
 }
@@ -507,8 +542,10 @@ enum PmReplaySegment {
     WholeSegment,
     /// Only the newest commit.
     NewestCommit,
-    /// The commits after `oldest_exclusive` (all when `None`), except the newest. Also keeps
-    /// the checkpoint action in the manifest commit at `manifest_commit`.
+    /// The commits after `oldest_exclusive` (all when `None`), except the newest. The manifest
+    /// commit at `manifest_commit` is read as its own file, so a log compaction cannot hide its
+    /// checkpoint action. Unlike the newest commit, it splits its compaction instead of being read
+    /// next to it: read ahead of a newer compaction, it would let replay stop before that one.
     OlderCommits {
         oldest_exclusive: Option<Version>,
         manifest_commit: Option<Version>,
@@ -556,14 +593,17 @@ impl PmReplaySegment {
     /// The commit files the replay reads from `log_segment`.
     fn commit_paths(self, log_segment: &LogSegment) -> Vec<&ParsedLogPath> {
         match self {
-            Self::WholeSegment => log_segment.original_commit_paths(None, log_segment.end_version),
+            Self::WholeSegment => log_segment.pm_commit_cover_paths(),
             Self::NewestCommit => Vec::from_iter(log_segment.newest_commit_after_checkpoint()),
             Self::OlderCommits {
-                oldest_exclusive, ..
+                oldest_exclusive,
+                manifest_commit,
             } => match log_segment.end_version.checked_sub(1) {
-                Some(newest_inclusive) => {
-                    log_segment.original_commit_paths(oldest_exclusive, newest_inclusive)
-                }
+                Some(newest_inclusive) => log_segment.find_commit_cover_paths_in_range(
+                    oldest_exclusive,
+                    newest_inclusive,
+                    manifest_commit.as_slice(),
+                ),
                 // A segment ending at version 0 has no commits older than its newest.
                 None => Vec::new(),
             },
@@ -768,6 +808,8 @@ impl PmCandidate {
             return false;
         }
         // A checkpoint action's P&M can be older than its commit, so check version, not presence.
+        // Stopping at a compaction is safe: every file left to read is older than its first
+        // version.
         let version = batch.protocol_version.max(batch.metadata_version);
         is_final(&self.protocol, version) && is_final(&self.metadata, version)
     }
@@ -829,7 +871,7 @@ impl PmCandidate {
         let version = version_as_i64(version)?;
         // Actions from commits before the pointed one are stale, so the filter drops them. `merge`
         // keeps the newest action replay read, so an older one is left only when the pointed commit
-        // has none of its own.
+        // has none of its own, or a log compaction hides it.
         let checkpoint = self
             .checkpoint
             .take()
@@ -897,8 +939,8 @@ fn resolve_pm_batches(
     Ok(resolved)
 }
 
-/// Parses the log version from a batch's `_file` metadata column.
-fn batch_version(data: &dyn EngineData) -> KernelResult<Version> {
+/// Parses the log file a batch came from out of its `_file` metadata column.
+fn batch_log_path(data: &dyn EngineData) -> KernelResult<ParsedLogPath<Url>> {
     #[derive(Default)]
     struct FilePathVisitor {
         file: Option<String>,
@@ -928,7 +970,6 @@ fn batch_version(data: &dyn EngineData) -> KernelResult<Version> {
     let url = Url::parse(&file)
         .map_err(|e| KernelError::internal_error(format!("batch has invalid _file {file}: {e}")))?;
     ParsedLogPath::new(url)
-        .map(|path| path.version)
         .ok_or_else(|| KernelError::internal_error(format!("batch from non-log file {file}")))
 }
 
@@ -1348,6 +1389,60 @@ mod tests {
             result.is_err(),
             "plan failure must surface, not fall back to legacy replay"
         );
+    }
+
+    mod empty_batches {
+        use std::sync::Arc;
+
+        use rstest::rstest;
+        use test_utils::assert_result_error_with_message;
+
+        use crate::arrow::record_batch::RecordBatch;
+        use crate::engine::arrow_conversion::TryIntoArrow as _;
+        use crate::engine::arrow_data::ArrowEngineData;
+        use crate::unit_test_utils::load_test_table;
+        use crate::unit_test_utils::recording_reads::RecordingReads;
+        use crate::{EngineData, KernelError};
+
+        #[rstest]
+        #[case::before_actions(false)]
+        #[case::before_error(true)]
+        fn imperative_pm_handles_empty_batches(#[case] inject_error: bool) {
+            let (inner, expected, _tempdir) = load_test_table("app-txn-no-checkpoint").unwrap();
+            let mut reads = RecordingReads::new(None);
+            let config = Arc::get_mut(&mut reads).unwrap();
+            config.inner = inner;
+            config.expected_token = None;
+            config.transform_json_batches = Some(Box::new(move |schema, batches| {
+                let empty: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+                    RecordBatch::new_empty(Arc::new(schema.as_ref().try_into_arrow()?)),
+                ));
+                let error =
+                    inject_error.then(|| Err(KernelError::generic("injected JSON read error")));
+                Ok(Box::new(
+                    std::iter::once(Ok(empty)).chain(error).chain(batches),
+                ))
+            }));
+            let engine = reads.engine();
+
+            let result = expected
+                .log_segment()
+                .read_protocol_metadata_opt(&engine, None);
+
+            if inject_error {
+                assert_result_error_with_message(result, "injected JSON read error");
+            } else {
+                let actual = result.unwrap();
+                assert_eq!(
+                    actual.protocol.as_ref(),
+                    Some(expected.table_configuration().protocol())
+                );
+                assert_eq!(
+                    actual.metadata.as_ref(),
+                    Some(expected.table_configuration().metadata())
+                );
+            }
+        }
     }
 
     // `rstest` cases glob-import their parent module, where `test_log::test` would shadow `test`.

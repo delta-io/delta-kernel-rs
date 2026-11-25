@@ -148,6 +148,15 @@ impl<'a> ListItem<'a> {
             .to_string()
     }
 
+    /// Iterates over this list's elements, preserving nulls.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = Option<&'a str>> + use<'a> {
+        let values = self.values;
+        self.offsets
+            .clone()
+            .map(move |index| values.is_valid(index).then(|| values.value(index)))
+    }
+
     pub fn materialize(&self) -> Vec<String> {
         self.offsets
             .clone()
@@ -187,6 +196,16 @@ impl<'a> MapItem<'a> {
     pub(crate) fn keys(&self) -> impl Iterator<Item = &'a str> + use<'a> {
         let keys = self.keys;
         self.offsets.clone().map(move |idx| keys.value(idx))
+    }
+
+    /// Iterates over non-null entries in storage order.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (&'a str, &'a str)> + use<'a> {
+        let (keys, values) = (self.keys, self.values);
+        self.offsets
+            .clone()
+            .filter(move |&index| values.is_valid(index))
+            .map(move |index| (keys.value(index), values.value(index)))
     }
 
     pub fn materialize(&self) -> HashMap<String, String> {
