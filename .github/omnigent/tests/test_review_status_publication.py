@@ -127,7 +127,7 @@ class ReviewStatusPublicationTest(unittest.TestCase):
         self.assertFalse(status["status_requirements_met"])
         self.assertEqual(status["counts"]["Should Fix"], 1)
         main = github.issues[0]["body"]
-        self.assertIn("AI Review - NO VERDICT", main)
+        self.assertIn("🤖 AI Review 🧐 - NO VERDICT", main)
         self.assertIn("A candidate finding remains contested.", main)
         self.assertIn(arguments["publication"]["findings"][0]["url"], main)
 
@@ -187,7 +187,7 @@ class ReviewStatusPublicationTest(unittest.TestCase):
         review_status = publish_status(github, arguments)
         self.assertEqual(review_status["status"], "NO VERDICT")
         main = github.issues[0]["body"]
-        order = ["AI Review - NO VERDICT", "🛑 1 Blocker", "Reviewed",
+        order = ["🤖 AI Review 🧐 - NO VERDICT", "🛑 1 Blocker", "Reviewed",
                  "Status requirements unmet", "<summary>Unmet status requirements",
                  "<summary>Assessment Summary", "<summary>Review Summary", "<sub>[Full AI review"]
         offsets = [main.index(part) for part in order]

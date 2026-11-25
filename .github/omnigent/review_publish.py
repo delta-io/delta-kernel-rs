@@ -159,7 +159,9 @@ def format_review_summary(
     confirmed = [finding for finding in findings if finding.get("url")]
     counts = Counter(finding["severity"] for finding in confirmed)
     headline = f"**{_finding_counts(counts)}**" if counts_available else "Finding counts unavailable."
-    title = f"## AI Review - {review_status['status']}" if review_status else "## AI Review"
+    title = f"## {AI_REVIEW_TITLE}"
+    if review_status:
+        title += f" - {review_status['status']}"
     reviewed = f"Reviewed `{head_sha[:8]}`"
     if review_status:
         reviewed += (
@@ -248,7 +250,7 @@ def format_status_check(review_status: dict[str, Any]) -> str:
         else "Status requirements unmet"
     )
     parts = [
-        f"## AI Review - {review_status['status']}",
+        f"## {AI_REVIEW_TITLE} - {review_status['status']}",
         f"**{_finding_counts(review_status['counts'])}**",
         f"Reviewed `{review_status['head_sha'][:8]}` · {records}",
     ]
