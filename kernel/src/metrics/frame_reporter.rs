@@ -99,6 +99,7 @@ mod tests {
     };
     use crate::last_checkpoint_hint::LastCheckpointHint;
     use crate::log_segment_files::LogSegmentFiles;
+    use crate::metrics::MetricId;
     use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
     use crate::unit_test_utils::{TestCancellationToken, copy_test_table, load_test_table};
     use crate::{Engine as _, KernelError, Snapshot};
@@ -375,6 +376,7 @@ mod tests {
                 &log_root,
                 vec![],
                 None,
+                MetricId::nil(),
             );
             if cancelled {
                 assert!(matches!(result, Err(KernelError::Cancelled)));

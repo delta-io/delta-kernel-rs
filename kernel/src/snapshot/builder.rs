@@ -1255,6 +1255,117 @@ pub(super) mod tests {
         Ok(())
     }
 
+    #[rstest::rstest]
+    #[case::forward(None, None, false)]
+    #[case::backward(Some(0), None, false)]
+    #[case::partial_hint(None, Some(0), false)]
+    #[case::missing_hint(None, Some(2), false)]
+    #[case::incremental(None, None, true)]
+    #[test_log::test(tokio::test)]
+    async fn checkpoint_diagnostics_share_snapshot_operation_id(
+        #[case] target: Option<Version>,
+        #[case] hint_version: Option<Version>,
+        #[case] incremental: bool,
+    ) -> KernelResult<(), Box<dyn std::error::Error>> {
+        let (engine, store, table_root) = setup_test();
+        create_table(&store, &table_root).await?;
+        let base = if incremental {
+            Some(
+                SnapshotBuilder::new_for(&table_root)
+                    .at_version(0)
+                    .build(engine.as_ref())?,
+            )
+        } else {
+            None
+        };
+        let checkpoint_version = if incremental { 1 } else { 0 };
+        // An incomplete checkpoint is never parsed, so nonempty placeholder content is enough.
+        store
+            .put(
+                &Path::from(format!(
+                    "_delta_log/{checkpoint_version:020}.checkpoint.0000000002.0000000002.parquet"
+                )),
+                "incomplete checkpoint".into(),
+            )
+            .await?;
+        if let Some(version) = hint_version {
+            store
+                .put(
+                    &Path::from("_delta_log/_last_checkpoint"),
+                    json!({"version": version, "size": 1, "parts": 2})
+                        .to_string()
+                        .into(),
+                )
+                .await?;
+        }
+
+        let mut previous_id = None;
+        for _ in 0..2 {
+            let (reporter, _guard) = measuring_reporter();
+            let result = if let Some(base) = &base {
+                SnapshotBuilder::new_from(base.clone()).build(engine.as_ref())
+            } else {
+                SnapshotBuilder::new_for(&table_root)
+                    .fold_with(target, SnapshotBuilder::at_version)
+                    .build(engine.as_ref())
+            };
+            let failed = hint_version.is_some();
+            if failed {
+                assert!(
+                    matches!(
+                        &result,
+                        Err(Error::Kernel(KernelError::InvalidCheckpoint(_)))
+                    ),
+                    "{result:?}"
+                );
+            } else {
+                assert_eq!(result?.version(), target.unwrap_or(1));
+            }
+
+            let events = reporter.events();
+            let diagnostic_ids: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    MetricEvent::CheckpointPartsMissing(event) => Some(event.operation_id),
+                    _ => None,
+                })
+                .collect();
+            let [operation_id] = diagnostic_ids.as_slice() else {
+                panic!("expected one checkpoint diagnostic: {events:?}");
+            };
+            assert_ne!(*operation_id, MetricId::nil());
+            assert_ne!(Some(*operation_id), previous_id);
+            previous_id = Some(*operation_id);
+
+            let completed: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    MetricEvent::LogSegmentLoadSuccess(event) => {
+                        Some(("log_segment", false, event.operation_id))
+                    }
+                    MetricEvent::LogSegmentLoadFailure(event) => {
+                        Some(("log_segment", true, event.operation_id))
+                    }
+                    MetricEvent::SnapshotBuildSuccess(event) => {
+                        Some(("snapshot", false, event.operation_id))
+                    }
+                    MetricEvent::SnapshotBuildFailure(event) => {
+                        Some(("snapshot", true, event.operation_id))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                completed,
+                [
+                    ("log_segment", failed, *operation_id),
+                    ("snapshot", failed, *operation_id),
+                ]
+            );
+        }
+        Ok(())
+    }
+
     pub(in crate::snapshot) mod catalog_managed_tests {
         use rstest::rstest;
         use test_utils::{

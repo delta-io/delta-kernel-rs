@@ -1569,10 +1569,13 @@ pub enum CheckpointPartsMissingSource {
 /// Each incomplete candidate is reported at most once per discovery pass. Later loads or refreshes
 /// may report it again; deduplicate repeated candidates when using these events for alerting.
 ///
-/// This event has no `operation_id`. Use log-segment and snapshot completion events to observe
-/// whether fallback succeeded or the enclosing operation failed.
+/// The `operation_id` joins diagnostics to the enclosing snapshot and log-segment completion
+/// events, which report whether fallback succeeded or the operation failed. Standalone
+/// snapshot-hint construction uses an independent ID for its discovery pass.
 #[derive(Debug, Clone)]
 pub struct CheckpointPartsMissing {
+    /// ID of the enclosing snapshot load or standalone discovery operation.
+    pub operation_id: MetricId,
     /// How the incomplete checkpoint candidate was discovered.
     pub source: CheckpointPartsMissingSource,
     /// Version of the incomplete checkpoint.
@@ -1588,6 +1591,7 @@ impl CheckpointPartsMissing {
 
     pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
         let mut event = Self {
+            operation_id: MetricId::nil(),
             source: CheckpointPartsMissingSource::Unknown,
             version: 0,
             expected_parts: 0,
@@ -1616,15 +1620,19 @@ impl Visit for CheckpointPartsMissing {
         }
     }
 
-    fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        if let Some(id) = record_operation_id(field, value, Self::SPAN_NAME) {
+            self.operation_id = id;
+        }
+    }
 }
 
 impl fmt::Display for CheckpointPartsMissing {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "CheckpointPartsMissing(source={}, version={}, expected_parts={}, found_parts={})",
-            self.source, self.version, self.expected_parts, self.found_parts
+            "CheckpointPartsMissing(id={}, source={}, version={}, expected_parts={}, found_parts={})",
+            self.operation_id, self.source, self.version, self.expected_parts, self.found_parts
         )
     }
 }
@@ -2507,6 +2515,7 @@ pub(crate) fn emit_checkpoint_parts_missing(event: &CheckpointPartsMissing) {
         tracing::Level::INFO,
         CheckpointPartsMissing::SPAN_NAME,
         report = tracing::field::Empty,
+        operation_id = %event.operation_id,
         source = event.source.as_ref(),
         version = event.version,
         expected_parts = event.expected_parts,

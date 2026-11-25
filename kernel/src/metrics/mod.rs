@@ -8,8 +8,7 @@
 //! that opt in with [`ENABLE_CALL_FRAME_FIELD`]. It does not create or modify [`MetricEvent`]s.
 //!
 //! Events with an `operation_id` use [`MetricId`] for correlation. Handler and file-read events,
-//! including `_last_checkpoint` reads, and checkpoint-discovery diagnostics do not carry an
-//! operation ID.
+//! including `_last_checkpoint` reads, do not carry an operation ID.
 //!
 //! # Example: Implementing a Custom MetricsReporter
 //!

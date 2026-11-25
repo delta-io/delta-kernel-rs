@@ -208,8 +208,9 @@ listed multipart candidates, including those at a hinted version. It reports `hi
 hint version has no checkpoint file, or only an empty classic or V2 file.
 
 An older checkpoint can still support fallback when no complete checkpoint exists at the same or a
-later version. The event has no `operation_id`; use snapshot and log-segment completion events to observe
-whether fallback succeeded. See its rustdoc for part-count semantics.
+later version. Use `operation_id` to join diagnostics to snapshot and log-segment completion events
+and observe whether fallback succeeded. Standalone snapshot-hint construction uses an independent
+discovery ID. See its rustdoc for part-count semantics.
 
 Use [LastCheckpointReadCompleted](https://docs.rs/delta_kernel/latest/delta_kernel/metrics/struct.LastCheckpointReadCompleted.html)
 to count `_last_checkpoint` read attempts and record their duration by outcome. A missing or invalid

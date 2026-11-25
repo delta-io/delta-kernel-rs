@@ -420,8 +420,10 @@ mod tests {
     ) {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        let operation_id = MetricId::new();
         // The emitter and direct span attributes must produce the same diagnostic.
         emit_checkpoint_parts_missing(&CheckpointPartsMissing {
+            operation_id,
             source: expected,
             version: 5,
             expected_parts: 3,
@@ -432,6 +434,7 @@ mod tests {
             let span = info_span!(
                 "checkpoint_parts_missing",
                 report = Empty,
+                operation_id = %operation_id,
                 source,
                 version = 5_u64,
                 expected_parts = 3_u64,
@@ -451,7 +454,7 @@ mod tests {
             assert_eq!(
                 event.to_string(),
                 format!(
-                    "CheckpointPartsMissing(source={expected}, version=5, \
+                    "CheckpointPartsMissing(id={operation_id}, source={expected}, version=5, \
                      expected_parts=3, found_parts=0)"
                 )
             );

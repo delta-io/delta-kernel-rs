@@ -11,7 +11,7 @@ use super::{IncrementalReplay, PreparedSnapshot, Snapshot};
 use crate::log_segment::{LogSegment, PmResolution};
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::metrics::{
-    SnapshotLoadMetricContext, emit_log_segment_load, emit_log_segment_load_failure,
+    MetricId, SnapshotLoadMetricContext, emit_log_segment_load, emit_log_segment_load_failure,
     emit_protocol_metadata_load, emit_protocol_metadata_load_failure,
 };
 use crate::path::ParsedLogPath;
@@ -202,6 +202,7 @@ impl Snapshot {
             log_tail,
             requested_version,
             checkpoint_handling,
+            metric_context.operation_id,
         )
         .inspect_err(|_| {
             emit_log_segment_load_failure(metric_context, segment_load_start.elapsed())
@@ -388,6 +389,7 @@ impl Snapshot {
         log_tail: Vec<ParsedLogPath>,
         requested_version: Option<Version>,
         checkpoint_handling: CheckpointHandling,
+        operation_id: MetricId,
     ) -> Result<NewSegment> {
         let log_root = existing_log_segment.log_root.clone();
         let storage = engine.storage_handler();
@@ -416,6 +418,7 @@ impl Snapshot {
             Some(listing_start),
             requested_version,
             checkpoint_handling,
+            operation_id,
         )?;
 
         // NB: we need to check both checkpoints and commits since we filter commits at and below

@@ -20,7 +20,7 @@ use url::Url;
 
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::metrics::{
-    CheckpointPartsMissing, CheckpointPartsMissingSource, emit_checkpoint_parts_missing,
+    CheckpointPartsMissing, CheckpointPartsMissingSource, MetricId, emit_checkpoint_parts_missing,
 };
 use crate::path::LogPathFileType::*;
 use crate::path::{CheckpointInstance, LogPathFileType, ParsedLogPath};
@@ -292,8 +292,9 @@ pub(crate) enum CheckpointHandling {
 ///
 /// Groups are flushed (processed) when we encounter a file with a different version or
 /// reach EOF, at which point we check for complete checkpoints and update our state.
-#[derive(Default)]
 struct ListingAccumulator {
+    /// Operation that owns the checkpoint diagnostics collected during this listing.
+    operation_id: MetricId,
     /// The result being built up
     output: LogSegmentFiles,
     /// Staging area for checkpoint parts at the current version group; always empty when iteration
@@ -311,6 +312,23 @@ struct ListingAccumulator {
 }
 
 impl ListingAccumulator {
+    fn new(
+        operation_id: MetricId,
+        end_version: Option<Version>,
+        checkpoint_handling: CheckpointHandling,
+    ) -> Self {
+        Self {
+            operation_id,
+            output: LogSegmentFiles::default(),
+            pending_checkpoint_parts: Vec::new(),
+            incomplete_checkpoints: Vec::new(),
+            missing_hint: None,
+            end_version,
+            group_version: None,
+            checkpoint_handling,
+        }
+    }
+
     fn process_filesystem_file(&mut self, file: ParsedLogPath, log_tail_start: Option<Version>) {
         // Even an overridden commit closes the preceding filesystem version group.
         self.maybe_flush_and_advance(file.version);
@@ -420,6 +438,7 @@ impl ListingAccumulator {
             let found_parts = parts.len() as u64;
             if found_parts < u64::from(expected_parts) {
                 self.incomplete_checkpoints.push(CheckpointPartsMissing {
+                    operation_id: self.operation_id,
                     source: CheckpointPartsMissingSource::Listing,
                     version,
                     expected_parts: u64::from(expected_parts),
@@ -497,18 +516,16 @@ impl LogSegmentFiles {
     ///   the lower bound (inclusive) for log_tail entries included in the result
     /// - `end_version`: upper bound (inclusive) on versions to include, `None` means no bound
     /// - `checkpoint_handling`: whether complete checkpoints replace the replay base
+    /// - `operation_id`: enclosing snapshot load or standalone discovery operation
     pub(crate) fn build_log_segment_files(
         fs_files: impl KernelResultIterator<ParsedLogPath>,
         log_tail: Vec<ParsedLogPath>,
         start_version: Version,
         end_version: Option<Version>,
         checkpoint_handling: CheckpointHandling,
+        operation_id: MetricId,
     ) -> KernelResult<Self> {
-        let acc = ListingAccumulator {
-            end_version,
-            checkpoint_handling,
-            ..Default::default()
-        };
+        let acc = ListingAccumulator::new(operation_id, end_version, checkpoint_handling);
         Self::build_with_accumulator(fs_files, log_tail, start_version, acc)
     }
 
@@ -635,6 +652,7 @@ impl LogSegmentFiles {
         log_tail: Vec<ParsedLogPath>,
         start_version: Option<Version>,
         end_version: Option<Version>,
+        operation_id: MetricId,
     ) -> KernelResult<Self> {
         Self::list_with_checkpoint_handling(
             storage,
@@ -643,6 +661,7 @@ impl LogSegmentFiles {
             start_version,
             end_version,
             CheckpointHandling::Adopt,
+            operation_id,
         )
     }
 
@@ -653,17 +672,14 @@ impl LogSegmentFiles {
         start_version: Option<Version>,
         end_version: Option<Version>,
         checkpoint_handling: CheckpointHandling,
+        operation_id: MetricId,
     ) -> KernelResult<Self> {
         Self::list_impl(
             storage,
             log_root,
             log_tail,
             start_version,
-            ListingAccumulator {
-                end_version,
-                checkpoint_handling,
-                ..Default::default()
-            },
+            ListingAccumulator::new(operation_id, end_version, checkpoint_handling),
         )
     }
 
@@ -681,17 +697,16 @@ impl LogSegmentFiles {
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         end_version: Option<Version>,
+        operation_id: MetricId,
     ) -> KernelResult<Self> {
-        let mut acc = ListingAccumulator {
-            end_version,
-            ..Default::default()
-        };
+        let mut acc = ListingAccumulator::new(operation_id, end_version, CheckpointHandling::Adopt);
         #[cfg(feature = "adaptive-metadata-in-dev")]
         let expects_checkpoint_file = checkpoint_metadata.amt_checkpoint.is_none();
         #[cfg(not(feature = "adaptive-metadata-in-dev"))]
         let expects_checkpoint_file = true;
         if expects_checkpoint_file {
             acc.missing_hint = Some(CheckpointPartsMissing {
+                operation_id,
                 source: CheckpointPartsMissingSource::Hint,
                 version: checkpoint_metadata.version,
                 expected_parts: if checkpoint_metadata.v2_checkpoint.is_some() {
@@ -789,6 +804,7 @@ impl LogSegmentFiles {
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         end_version: Version,
+        operation_id: MetricId,
     ) -> KernelResult<Self> {
         // Scan backward in 1000-version windows, collecting ALL file types, until a complete
         // checkpoint is found or the log is exhausted.
@@ -811,10 +827,11 @@ impl LogSegmentFiles {
                 },
             );
             if let Err(error) = listed {
-                let mut acc = ListingAccumulator {
-                    end_version: Some(end_version),
-                    ..Default::default()
-                };
+                let mut acc = ListingAccumulator::new(
+                    operation_id,
+                    Some(end_version),
+                    CheckpointHandling::Adopt,
+                );
                 for file in window_files {
                     acc.process_filesystem_file(file, None);
                 }
@@ -844,6 +861,7 @@ impl LogSegmentFiles {
             start,
             Some(end_version),
             CheckpointHandling::Adopt,
+            operation_id,
         )
     }
 

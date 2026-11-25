@@ -610,9 +610,12 @@ impl From<kernel::CheckpointPartsMissingSource> for CheckpointPartsMissingSource
 /// Discovery may still use an older checkpoint and replay subsequent commits. A missing or empty
 /// classic or V2 hint target reports one expected part and zero found parts.
 /// Later loads or refreshes may report the same candidate again; deduplicate repeats for alerting.
-/// This event has no operation ID; use snapshot and log-segment completion events for outcomes.
+/// The operation ID joins diagnostics to snapshot and log-segment completion events for outcomes.
+/// Standalone snapshot-hint construction uses an independent discovery ID.
 #[repr(C)]
 pub struct CheckpointPartsMissing {
+    /// ID of the enclosing snapshot load or standalone discovery operation.
+    pub operation_id: MetricId,
     /// How the incomplete checkpoint candidate was discovered.
     pub source: CheckpointPartsMissingSource,
     /// Version of the incomplete checkpoint.
@@ -978,11 +981,13 @@ impl MetricEvent {
                 })
             }
             K::CheckpointPartsMissing(kernel::CheckpointPartsMissing {
+                operation_id,
                 source,
                 version,
                 expected_parts,
                 found_parts,
             }) => Self::CheckpointPartsMissing(CheckpointPartsMissing {
+                operation_id: (*operation_id).into(),
                 source: (*source).into(),
                 version: *version,
                 expected_parts: *expected_parts,
@@ -1171,11 +1176,13 @@ mod tests {
         kernel::CheckpointPartsMissingSource::Unknown,
         CheckpointPartsMissingSource::Unknown
     )]
-    fn checkpoint_parts_missing_conversion_preserves_source_and_counts(
+    fn checkpoint_parts_missing_conversion_preserves_id_source_and_counts(
         #[case] source: kernel::CheckpointPartsMissingSource,
         #[case] expected: CheckpointPartsMissingSource,
     ) {
+        let operation_id = kernel::MetricId::new();
         let event = kernel::MetricEvent::CheckpointPartsMissing(kernel::CheckpointPartsMissing {
+            operation_id,
             source,
             version: 17,
             expected_parts: 3,
@@ -1185,6 +1192,7 @@ mod tests {
             let MetricEvent::CheckpointPartsMissing(event) = event else {
                 panic!("expected CheckpointPartsMissing");
             };
+            assert_eq!(event.operation_id.bytes, operation_id.as_bytes());
             assert_eq!(event.source, expected);
             assert_eq!(event.version, 17);
             assert_eq!(event.expected_parts, 3);

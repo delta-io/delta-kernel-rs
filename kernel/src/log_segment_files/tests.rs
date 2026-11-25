@@ -258,7 +258,15 @@ fn list_and_destructure(
     Option<ParsedLogPath>,
     Option<Version>,
 ) {
-    let r = LogSegmentFiles::list(storage, log_root, log_tail, start_version, end_version).unwrap();
+    let r = LogSegmentFiles::list(
+        storage,
+        log_root,
+        log_tail,
+        start_version,
+        end_version,
+        MetricId::nil(),
+    )
+    .unwrap();
     (
         r.ascending_commit_files,
         r.ascending_compaction_files,
@@ -748,9 +756,14 @@ async fn backward_scan_single_checkpoint_cases(
     let (storage, log_root) = create_storage(log_files).await;
     let counter = CountingStorageHandler::new(storage);
 
-    let result =
-        LogSegmentFiles::list_with_backward_checkpoint_scan(&counter, &log_root, vec![], 1005)
-            .unwrap();
+    let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
+        &counter,
+        &log_root,
+        vec![],
+        1005,
+        MetricId::nil(),
+    )
+    .unwrap();
 
     assert_eq!(counter.call_count(), expected_listings);
 
@@ -879,6 +892,7 @@ async fn backward_scan_multipart_checkpoint_cases(
         &log_root,
         vec![],
         end_version,
+        MetricId::nil(),
     )
     .unwrap();
 
@@ -931,6 +945,7 @@ async fn backward_scan_with_log_tail_derives_lower_bound_from_checkpoint() {
         &log_root,
         log_tail,
         10,
+        MetricId::nil(),
     )
     .unwrap();
 
@@ -981,6 +996,7 @@ async fn backward_scan_with_log_tail_starting_before_checkpoint() {
         &log_root,
         log_tail,
         8,
+        MetricId::nil(),
     )
     .unwrap();
 
@@ -1023,6 +1039,7 @@ async fn backward_scan_log_tail_defines_latest_version() {
         &log_root,
         log_tail,
         5,
+        MetricId::nil(),
     )
     .unwrap();
 
@@ -1079,8 +1096,15 @@ async fn test_zero_byte_commit_kept_in_listing() {
     ];
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
-    let result =
-        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(2)).unwrap();
+    let result = LogSegmentFiles::list(
+        storage.as_ref(),
+        &log_root,
+        vec![],
+        Some(0),
+        Some(2),
+        MetricId::nil(),
+    )
+    .unwrap();
     assert_eq!(result.ascending_commit_files.len(), 3);
     assert_eq!(result.ascending_commit_files[0].version, 0);
     assert_eq!(result.ascending_commit_files[1].version, 1);
@@ -1109,10 +1133,24 @@ async fn test_zero_byte_compaction_skipped_commits_used(#[case] use_backward_sca
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
     let result = if use_backward_scan {
-        LogSegmentFiles::list_with_backward_checkpoint_scan(storage.as_ref(), &log_root, vec![], 4)
-            .unwrap()
+        LogSegmentFiles::list_with_backward_checkpoint_scan(
+            storage.as_ref(),
+            &log_root,
+            vec![],
+            4,
+            MetricId::nil(),
+        )
+        .unwrap()
     } else {
-        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(4)).unwrap()
+        LogSegmentFiles::list(
+            storage.as_ref(),
+            &log_root,
+            vec![],
+            Some(0),
+            Some(4),
+            MetricId::nil(),
+        )
+        .unwrap()
     };
 
     assert!(
@@ -1164,12 +1202,26 @@ async fn checkpoint_listing_reports_missing_parts_and_preserves_fallback(
     }
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
     let reporter = Arc::new(CapturingReporter::default());
+    let operation_id = MetricId::new();
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
     let result = if use_backward_scan {
-        LogSegmentFiles::list_with_backward_checkpoint_scan(storage.as_ref(), &log_root, vec![], 10)
+        LogSegmentFiles::list_with_backward_checkpoint_scan(
+            storage.as_ref(),
+            &log_root,
+            vec![],
+            10,
+            operation_id,
+        )
     } else {
-        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(10))
+        LogSegmentFiles::list(
+            storage.as_ref(),
+            &log_root,
+            vec![],
+            Some(0),
+            Some(10),
+            operation_id,
+        )
     }
     .unwrap();
 
@@ -1197,6 +1249,7 @@ async fn checkpoint_listing_reports_missing_parts_and_preserves_fallback(
         .map(|&(expected, found)| (CheckpointPartsMissingSource::Listing, 9, expected, found))
         .collect();
     assert_eq!(missing_checkpoint_diagnostics(&reporter), expected);
+    assert_checkpoint_operation_id(&reporter, operation_id);
 }
 
 // v2.crc is 0 bytes -> kept (CRC is optional, may report size 0 on some platforms)
@@ -1211,8 +1264,15 @@ async fn test_zero_byte_crc_kept() {
     ];
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
-    let result =
-        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(2)).unwrap();
+    let result = LogSegmentFiles::list(
+        storage.as_ref(),
+        &log_root,
+        vec![],
+        Some(0),
+        Some(2),
+        MetricId::nil(),
+    )
+    .unwrap();
 
     // The 0-byte CRC at v2 is kept (latest_crc_file tracks the highest version)
     let crc = result.latest_crc_file.unwrap();
@@ -1235,9 +1295,14 @@ async fn test_zero_byte_checkpoint_backward_scan_crosses_windows() {
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
     let counter = CountingStorageHandler::new(storage);
 
-    let result =
-        LogSegmentFiles::list_with_backward_checkpoint_scan(&counter, &log_root, vec![], 1005)
-            .unwrap();
+    let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
+        &counter,
+        &log_root,
+        vec![],
+        1005,
+        MetricId::nil(),
+    )
+    .unwrap();
 
     // Needed 2 windows because the 0-byte checkpoint at v1005 was skipped
     assert_eq!(counter.call_count(), 2);
@@ -1391,6 +1456,7 @@ async fn test_list_ignoring_checkpoints_keeps_commits_and_crc() {
         Some(0),
         Some(5),
         CheckpointHandling::Ignore,
+        MetricId::nil(),
     )
     .unwrap();
 
@@ -1404,6 +1470,14 @@ async fn test_list_ignoring_checkpoints_keeps_commits_and_crc() {
     );
     assert!(result.checkpoint_parts.is_empty());
     assert_eq!(result.latest_crc_file.unwrap().version, 4);
+}
+
+fn assert_checkpoint_operation_id(reporter: &CapturingReporter, expected: MetricId) {
+    for event in reporter.events() {
+        if let MetricEvent::CheckpointPartsMissing(event) = event {
+            assert_eq!(event.operation_id, expected);
+        }
+    }
 }
 
 fn missing_checkpoint_parts(reporter: &CapturingReporter) -> Vec<(u64, u64, u64)> {
@@ -1468,6 +1542,7 @@ async fn hint_reports_missing_checkpoint_parts_before_fallback_or_failure(
     }
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
     let reporter = Arc::new(CapturingReporter::default());
+    let operation_id = MetricId::new();
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
     let listed = LogSegmentFiles::list_with_checkpoint_hint(
@@ -1476,6 +1551,7 @@ async fn hint_reports_missing_checkpoint_parts_before_fallback_or_failure(
         &log_root,
         vec![],
         None,
+        operation_id,
     );
 
     let found_parts = if empty_parts {
@@ -1507,6 +1583,7 @@ async fn hint_reports_missing_checkpoint_parts_before_fallback_or_failure(
         vec![(source, 5, 3, found_parts)]
     };
     assert_eq!(missing_checkpoint_diagnostics(&reporter), expected);
+    assert_checkpoint_operation_id(&reporter, operation_id);
 }
 
 #[rstest]
@@ -1544,6 +1621,7 @@ async fn checkpoint_diagnostics_skip_superseded_and_ignored_candidates(
         None,
         None,
         handling,
+        MetricId::nil(),
     )
     .unwrap();
 
@@ -1622,6 +1700,7 @@ fn failed_listing_reports_only_completed_incomplete_checkpoint_groups(
     #[case] expected: &[(u64, u64, u64)],
 ) {
     let reporter = Arc::new(CapturingReporter::default());
+    let operation_id = MetricId::new();
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let files = files
         .into_iter()
@@ -1640,6 +1719,7 @@ fn failed_listing_reports_only_completed_incomplete_checkpoint_groups(
         0,
         None,
         CheckpointHandling::Adopt,
+        operation_id,
     );
 
     assert!(matches!(
@@ -1651,6 +1731,7 @@ fn failed_listing_reports_only_completed_incomplete_checkpoint_groups(
             .iter()
             .all(|(source, ..)| *source == CheckpointPartsMissingSource::Listing)
     );
+    assert_checkpoint_operation_id(&reporter, operation_id);
 }
 
 #[rstest]
@@ -1685,6 +1766,7 @@ async fn backward_scan_preserves_completed_window_diagnostics_on_later_failure(
     let (storage, log_root) = create_storage(files).await;
     let storage = CountingStorageHandler::new(storage).with_failure(failure);
     let reporter = Arc::new(CapturingReporter::default());
+    let operation_id = MetricId::new();
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
     let result = LogSegmentFiles::list_with_backward_checkpoint_scan(
@@ -1692,6 +1774,7 @@ async fn backward_scan_preserves_completed_window_diagnostics_on_later_failure(
         &log_root,
         vec![],
         end_version,
+        operation_id,
     );
 
     assert!(matches!(
@@ -1706,6 +1789,7 @@ async fn backward_scan_preserves_completed_window_diagnostics_on_later_failure(
         .map(|&version| (CheckpointPartsMissingSource::Listing, version, 3, 1))
         .collect();
     assert_eq!(missing_checkpoint_diagnostics(&reporter), expected);
+    assert_checkpoint_operation_id(&reporter, operation_id);
 }
 
 #[rstest]
@@ -1754,8 +1838,14 @@ async fn failed_hint_listing_reports_only_known_missing_targets(
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
-    let result =
-        LogSegmentFiles::list_with_checkpoint_hint(&hint, &storage, &log_root, vec![], None);
+    let result = LogSegmentFiles::list_with_checkpoint_hint(
+        &hint,
+        &storage,
+        &log_root,
+        vec![],
+        None,
+        MetricId::nil(),
+    );
 
     assert!(matches!(
         result, Err(KernelError::FileNotFound(path)) if path == "listing failed"
@@ -1813,6 +1903,7 @@ async fn hinted_checkpoint_presence_is_independent_of_checkpoint_shape(
         &log_root,
         vec![],
         None,
+        MetricId::nil(),
     );
 
     let expected = if checkpoint_is_empty == Some(false) {
@@ -2155,6 +2246,7 @@ async fn last_checkpoint_hint_applies_iff_it_names_the_selected_checkpoint(
         &log_root,
         vec![],
         None,
+        MetricId::nil(),
     )
     .unwrap();
 
