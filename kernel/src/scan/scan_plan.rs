@@ -5,7 +5,6 @@
 //! newest-action-wins replay.
 
 use std::borrow::Cow;
-#[cfg(test)]
 use std::sync::Arc;
 
 use super::data_skipping::as_sql_data_skipping_predicate_with_stats_columns;
@@ -23,11 +22,11 @@ use crate::action_reconciliation::plan::action_set::ActionSet;
 use crate::actions::{ADD_NAME, STATS_PARSED};
 #[cfg(test)]
 use crate::actions::{ADD_SCHEMA, REMOVE_NAME};
-#[cfg(test)]
 use crate::checkpoint::CheckpointInfo;
 use crate::expressions::{ColumnName, Predicate, lit};
 #[cfg(test)]
 use crate::expressions::{Expression as Expr, expr};
+use crate::metrics::ScanPlanReport;
 use crate::plans::ir::plan::Plan;
 #[cfg(test)]
 use crate::schema::{
@@ -37,16 +36,16 @@ use crate::transforms::{ExpressionTransform, transform_output_type};
 #[cfg(test)]
 use crate::utils::FoldWithOption as _;
 
-mod metadata_replay_base;
-
-pub(super) use metadata_replay_base::MetadataReplayBase;
 // === Internal column names ===
 
 #[cfg(test)]
 const IS_ADD: &str = "is_add";
 
 impl<'a> MetadataPlanner<'a> {
-    pub(super) fn try_from_scan(scan: &'a Scan) -> KernelResult<Self> {
+    pub(super) fn try_from_scan(
+        scan: &'a Scan,
+        checkpoint_info: Option<Arc<CheckpointInfo>>,
+    ) -> KernelResult<Self> {
         let enable_metadata_filter =
             !scan.stats.synthesize_json || scan.state_info.physical_stats_output_schema().is_some();
         let stats_filter = enable_metadata_filter
@@ -61,9 +60,11 @@ impl<'a> MetadataPlanner<'a> {
         let adds_actions = ActionSet::live_adds();
         Ok(Self::new(
             scan.snapshot.log_segment(),
+            checkpoint_info,
             adds_actions,
             !scan.snapshot.has_adaptive_metadata(),
         )
+        .with_crc(scan.snapshot.base_crc().map(Arc::as_ref))
         .with_stats(scan.stats.clone())
         .with_stats_schemas(
             scan.stats
@@ -92,41 +93,28 @@ impl Scan {
     )]
     pub(super) fn build_metadata_scan_plan_with(
         &self,
-        base: MetadataReplayBase,
-        planner: &mut MetadataPlanner<'_>,
+        planner: MetadataPlanner<'_>,
+        report: &mut ScanPlanReport,
     ) -> KernelResult<Option<Plan>> {
         let state = &self.state_info;
         if state.physical_predicate == PhysicalPredicate::StaticSkipAll {
             return Ok(None);
         }
 
-        let base_version = base.version();
-        let checkpoint = match base {
-            MetadataReplayBase::Crc { version, files } => planner.crc_adds(version, files),
-            MetadataReplayBase::Checkpoint { info, .. } => {
-                planner.checkpoint_info = info;
-                planner.checkpoint_actions()
-            }
-        }?;
-        // Keep commit removes through replay so they cancel older adds before selecting live files.
-        let commits = planner.commit_actions(base_version)?;
-        planner
-            .replay_actions(commits, checkpoint)?
+        let planned = planner.replay();
+        report.metadata_planning = planned.metrics;
+        planned
+            .plan?
             .project_patch(|patch| patch.drop(VERSION))?
             .build_opt()
     }
 
     #[cfg(test)]
-    fn build_metadata_scan_plan<'a>(
+    fn build_metadata_scan_plan(
         &self,
-        shape: impl Into<Option<&'a CheckpointInfo>>,
         planner: &MetadataPlanner<'_>,
     ) -> KernelResult<Option<Plan>> {
-        let base = MetadataReplayBase::Checkpoint {
-            version: self.snapshot.log_segment().checkpoint_version,
-            info: shape.into().cloned().map(Arc::new),
-        };
-        self.build_metadata_scan_plan_with(base, &mut planner.clone())
+        self.build_metadata_scan_plan_with(planner.clone(), &mut ScanPlanReport::new())
     }
 }
 // === Helpers ===
@@ -461,7 +449,10 @@ mod tests {
         );
         let scan = mock_snapshot(segment)?.scan_builder().build()?;
         let plan = scan
-            .build_metadata_scan_plan(&shape, &MetadataPlanner::try_from_scan(&scan)?)?
+            .build_metadata_scan_plan(&MetadataPlanner::try_from_scan(
+                &scan,
+                Some(Arc::new(shape)),
+            )?)?
             .expect("non-empty");
 
         let mut expected: Vec<&str> = COMMIT_ARM_TAGS.to_vec();
@@ -499,11 +490,9 @@ mod tests {
             )?,
             ..shape(kind, None)
         };
-        let mut planner = MetadataPlanner::try_from_scan(&scan)?;
+        let mut planner = MetadataPlanner::try_from_scan(&scan, Some(Arc::new(shape)))?;
         planner.actions.include_tombstones = include_tombstones;
-        let plan = scan
-            .build_metadata_scan_plan(&shape, &planner)?
-            .expect("non-empty");
+        let plan = scan.build_metadata_scan_plan(&planner)?.expect("non-empty");
 
         let checkpoint_schema = leaf_read_schema(&plan);
         assert_eq!(checkpoint_schema.contains(REMOVE_NAME), include_tombstones);
@@ -577,10 +566,10 @@ mod tests {
             leaf_checkpoint_schema: Arc::new(leaf_checkpoint_schema),
             ..shape(kind, None)
         };
-        let planner = MetadataPlanner::try_from_scan(&scan)?;
-        assert_eq!(planner.report().read_collations, preserve_json);
-        assert!(!planner.report().has_filter);
-        let plan = scan.build_metadata_scan_plan(&shape, &planner)?.unwrap();
+        let planned = MetadataPlanner::try_from_scan(&scan, Some(Arc::new(shape)))?.replay();
+        assert_eq!(planned.metrics.read_collations, preserve_json);
+        assert!(!planned.metrics.has_filter);
+        let plan = planned.plan?.build()?;
         let read_schema = leaf_read_schema(&plan);
         assert_eq!(source_collation_stats(read_schema).is_some(), preserve_json);
         assert_eq!(
@@ -602,7 +591,7 @@ mod tests {
         );
         let scan = mock_snapshot(segment)?.scan_builder().build()?;
         let plan = scan
-            .build_metadata_scan_plan(None, &MetadataPlanner::try_from_scan(&scan)?)?
+            .build_metadata_scan_plan(&MetadataPlanner::try_from_scan(&scan, None)?)?
             .expect("non-empty");
         let mut expected = COMMIT_ARM_TAGS.to_vec();
         expected.push("project"); // drop version
@@ -633,7 +622,10 @@ mod tests {
         let segment = log_segment(log_root(), &[], Some(checkpoint_path(file_type)));
         let scan = mock_snapshot(segment)?.scan_builder().build()?;
         let plan = scan
-            .build_metadata_scan_plan(&shape, &MetadataPlanner::try_from_scan(&scan)?)?
+            .build_metadata_scan_plan(&MetadataPlanner::try_from_scan(
+                &scan,
+                Some(Arc::new(shape)),
+            )?)?
             .expect("non-empty");
         assert_eq!(tags(&plan), checkpoint_arm_tags);
         Ok(())
@@ -644,7 +636,7 @@ mod tests {
         let segment = log_segment(log_root(), &[], None);
         let scan = mock_snapshot(segment)?.scan_builder().build()?;
         assert!(
-            scan.build_metadata_scan_plan(None, &MetadataPlanner::try_from_scan(&scan)?)?
+            scan.build_metadata_scan_plan(&MetadataPlanner::try_from_scan(&scan, None)?)?
                 .is_none()
         );
         Ok(())
@@ -662,11 +654,11 @@ mod tests {
             PhysicalPredicate::StaticSkipAll
         );
         assert!(
-            scan.build_metadata_scan_plan(
-                &shape(CheckpointKind::Inline, None),
-                &MetadataPlanner::try_from_scan(&scan)?,
-            )?
-            .is_none()
+            scan.build_metadata_scan_plan(&MetadataPlanner::try_from_scan(
+                &scan,
+                Some(Arc::new(shape(CheckpointKind::Inline, None)))
+            )?,)?
+                .is_none()
         );
         Ok(())
     }
@@ -888,11 +880,13 @@ mod tests {
             .scan_builder()
             .with_stats(StatsOptions::all_struct())
             .build()?;
-        let planner = MetadataPlanner::try_from_scan(&scan)?;
-        let file_shape = shape(CheckpointKind::Inline, planner.stats_schema.clone());
-        let plan = planner
-            .with_checkpoint_info(Arc::new(file_shape))
-            .checkpoint_actions()?
+        let file_shape = shape(
+            CheckpointKind::Inline,
+            scan.state_info.physical_stats_read_schema().cloned(),
+        );
+        let plan = MetadataPlanner::try_from_scan(&scan, Some(Arc::new(file_shape)))?
+            .replay()
+            .plan?
             .build()?;
         assert_eq!(tags(&plan), ["values"]);
         Ok(())
@@ -944,9 +938,9 @@ mod tests {
             leaf_checkpoint_schema: file_schema,
             ..shape(CheckpointKind::Inline, None)
         };
-        let plan = MetadataPlanner::try_from_scan(&scan)?
-            .with_checkpoint_info(Arc::new(file_shape.clone()))
-            .checkpoint_actions()?
+        let plan = MetadataPlanner::try_from_scan(&scan, Some(Arc::new(file_shape.clone())))?
+            .replay()
+            .plan?
             .build()?;
         assert_eq!(add_struct(leaf_read_schema(&plan)), &*ADD_SCHEMA);
         let batches = declarative_metadata(&scan, &SyncEngine::new_with_store(store))?;
@@ -996,10 +990,10 @@ mod tests {
             ))))
             .build()?;
         let plan = scan
-            .build_metadata_scan_plan(
-                &shape(CheckpointKind::Inline, None),
-                &MetadataPlanner::try_from_scan(&scan)?,
-            )?
+            .build_metadata_scan_plan(&MetadataPlanner::try_from_scan(
+                &scan,
+                Some(Arc::new(shape(CheckpointKind::Inline, None))),
+            )?)?
             .expect("non-empty");
 
         let engine = SyncEngine::new_with_store(store);

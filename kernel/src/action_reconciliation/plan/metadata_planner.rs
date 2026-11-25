@@ -11,6 +11,7 @@ use crate::actions::{
 };
 use crate::checkpoint::CheckpointInfo;
 use crate::checkpoint::collation_stats::source_collation_stats;
+use crate::crc::Crc;
 use crate::expressions::{
     ColumnName, Expression as Expr, Predicate, UnaryExpressionOp, col, column_name, expr,
 };
@@ -37,10 +38,11 @@ const IS_ADD: &str = "is_add";
 /// 4. Projects metadata after filtering into the stats and partition shape requested by the user.
 #[derive(Clone)]
 pub(crate) struct MetadataPlanner<'a> {
-    pub(crate) segment: &'a LogSegment,
+    segment: &'a LogSegment,
+    checkpoint_info: Option<Arc<CheckpointInfo>>,
     use_compactions: bool,
+    crc: Option<&'a Crc>,
     pub(crate) actions: ActionSet,
-    pub(crate) checkpoint_info: Option<Arc<CheckpointInfo>>,
     pub(crate) stats: StatsOptions,
     pub(crate) partitions: PartitionValuesOptions,
     pub(crate) stats_schema: Option<SchemaRef>,
@@ -48,7 +50,12 @@ pub(crate) struct MetadataPlanner<'a> {
     pub(crate) parsed_partition_schema: Option<SchemaRef>,
     pub(crate) read_collations: bool,
     pub(crate) stats_filter: Option<Predicate>,
-    report: MetadataPlanningReport,
+}
+
+/// A metadata plan result and the metrics collected while building it.
+pub(crate) struct MetadataPlanResult {
+    pub(crate) plan: KernelResult<PlanBuilder>,
+    pub(crate) metrics: MetadataPlanningReport,
 }
 
 /// The statistics representation present in a metadata plan.
@@ -61,13 +68,20 @@ enum StatsKind {
 }
 
 impl<'a> MetadataPlanner<'a> {
-    /// Binds the source context for one metadata plan. Callers supply resolved metadata schemas.
-    pub(crate) fn new(segment: &'a LogSegment, actions: ActionSet, use_compactions: bool) -> Self {
+    /// Configures replay of the segment using caller-resolved checkpoint information.
+    /// Checkpoint content reads require information unless an eligible CRC supplies the base.
+    pub(crate) fn new(
+        segment: &'a LogSegment,
+        checkpoint_info: Option<Arc<CheckpointInfo>>,
+        actions: ActionSet,
+        use_compactions: bool,
+    ) -> Self {
         Self {
             segment,
+            checkpoint_info,
             use_compactions,
+            crc: None,
             actions,
-            checkpoint_info: None,
             stats: StatsOptions::none(),
             partitions: PartitionValuesOptions::default(),
             stats_schema: None,
@@ -75,26 +89,12 @@ impl<'a> MetadataPlanner<'a> {
             parsed_partition_schema: None,
             read_collations: false,
             stats_filter: None,
-            report: MetadataPlanningReport::default(),
         }
     }
 
-    /// Returns metadata planning metrics, including partial state on error.
-    pub(crate) fn report(&self) -> MetadataPlanningReport {
-        MetadataPlanningReport {
-            stats: self.stats.clone(),
-            partition_values: self.partitions.clone(),
-            read_collations: self.read_collations,
-            has_filter: self.stats_filter.is_some(),
-            ..self.report.clone()
-        }
-    }
-
-    pub(crate) fn with_checkpoint_info(
-        mut self,
-        checkpoint_info: impl Into<Option<Arc<CheckpointInfo>>>,
-    ) -> Self {
-        self.checkpoint_info = checkpoint_info.into();
+    /// Supplies a CRC candidate; replay checks its completeness, version, and requested actions.
+    pub(crate) fn with_crc(mut self, crc: Option<&'a Crc>) -> Self {
+        self.crc = crc;
         self
     }
 
@@ -135,31 +135,64 @@ impl<'a> MetadataPlanner<'a> {
         self
     }
 
-    // TODO(#4107): Consume the configured planner in replay instead of mutating source builders.
-    /// Reconstructs requested actions with the configured stats and partition representations.
+    /// Consumes this planner to reconstruct requested actions, returning the plan result and
+    /// metrics. Selects an eligible CRC as the base, otherwise the checkpoint or commits alone.
     /// Uses the caller's resolved schemas and options; sources supply `version`.
     /// Checkpoint file actions require a resolved shape. Winning domain deletions are retained.
-    pub(crate) fn replay(&mut self) -> KernelResult<PlanBuilder> {
-        self.report.replay_base = Some(if self.segment.checkpoint_version.is_some() {
-            ReplayBase::Checkpoint
+    /// Metrics retain observations made before an error.
+    pub(crate) fn replay(self) -> MetadataPlanResult {
+        let mut metrics = self.report();
+        let plan = self.replay_plan(&mut metrics);
+        MetadataPlanResult { plan, metrics }
+    }
+
+    fn replay_plan(&self, metrics: &mut MetadataPlanningReport) -> KernelResult<PlanBuilder> {
+        let crc = Self::crc_base(self.crc, self.segment.checkpoint_version, self.actions);
+        let (replay_base, base_version) = match (crc, self.segment.checkpoint_version) {
+            (Some((version, _)), _) => (ReplayBase::Crc, Some(version)),
+            (None, Some(version)) => (ReplayBase::Checkpoint, Some(version)),
+            (None, None) => (ReplayBase::Empty, None),
+        };
+        metrics.replay_base = Some(replay_base);
+        metrics.base_version = base_version;
+        let commits = self.commit_actions(base_version, metrics)?;
+        let checkpoint = if let Some((version, files)) = crc {
+            self.crc_adds(version, files.to_vec())?
         } else {
-            ReplayBase::Empty
-        });
-        self.report.base_version = self.segment.checkpoint_version;
-        let commits = self.commit_actions(self.segment.checkpoint_version)?;
-        let checkpoint = self.checkpoint_actions()?;
+            self.checkpoint_actions(metrics)?
+        };
         self.replay_actions(commits, checkpoint)
+    }
+
+    fn report(&self) -> MetadataPlanningReport {
+        MetadataPlanningReport {
+            stats: self.stats.clone(),
+            partition_values: self.partitions.clone(),
+            read_collations: self.read_collations,
+            has_filter: self.stats_filter.is_some(),
+            ..Default::default()
+        }
+    }
+
+    /// Returns an eligible CRC base for the requested replay actions.
+    pub(crate) fn crc_base(
+        crc: Option<&Crc>,
+        checkpoint_version: Option<Version>,
+        actions: ActionSet,
+    ) -> Option<(Version, &[Add])> {
+        let crc = crc?;
+        if actions != ActionSet::live_adds() {
+            return None;
+        }
+        if checkpoint_version.is_some_and(|version| crc.version < version) {
+            return None;
+        }
+        Some((crc.version, crc.all_files()?))
     }
 
     /// Builds normalized live adds from a CRC with the supplied version and action key.
     /// Requires [`ActionSet::live_adds`].
-    pub(crate) fn crc_adds(
-        &mut self,
-        version: Version,
-        files: Vec<Add>,
-    ) -> KernelResult<PlanBuilder> {
-        self.report.replay_base = Some(ReplayBase::Crc);
-        self.report.base_version = Some(version);
+    fn crc_adds(&self, version: Version, files: Vec<Add>) -> KernelResult<PlanBuilder> {
         self.build_metadata_plan(ActionSource::Crc, None, |schema| {
             sources::crc_arm(files, version, self.actions, schema)
         })
@@ -188,27 +221,20 @@ impl<'a> MetadataPlanner<'a> {
     /// fields above. Parsed fields are omitted when unrequested or their schema is absent.
     /// JSON stats are retained or synthesized only when requested.
     /// Without tombstones, remove fields are omitted from the read, filter, and key.
-    pub(crate) fn checkpoint_actions(&mut self) -> KernelResult<PlanBuilder> {
-        self.report.replay_base = Some(if self.segment.checkpoint_version.is_some() {
-            ReplayBase::Checkpoint
-        } else {
-            ReplayBase::Empty
-        });
-        self.report.base_version = self.segment.checkpoint_version;
+    fn checkpoint_actions(
+        &self,
+        metrics: &mut MetadataPlanningReport,
+    ) -> KernelResult<PlanBuilder> {
         let checkpoint_info = self.checkpoint_info.as_deref();
-        let mut report = std::mem::take(&mut self.report);
-        let result =
-            self.build_metadata_plan(ActionSource::Checkpoint, checkpoint_info, |schema| {
-                sources::checkpoint_actions(
-                    self.segment,
-                    checkpoint_info,
-                    self.actions,
-                    schema,
-                    &mut report,
-                )
-            });
-        self.report = report;
-        result
+        self.build_metadata_plan(ActionSource::Checkpoint, checkpoint_info, |schema| {
+            sources::checkpoint_actions(
+                self.segment,
+                checkpoint_info,
+                self.actions,
+                schema,
+                metrics,
+            )
+        })
     }
 
     /// Builds commit actions and identity keys needed to reconstruct the requested state.
@@ -232,22 +258,20 @@ impl<'a> MetadataPlanner<'a> {
     /// Parsed fields are omitted when unrequested or their schema is absent.
     /// JSON stats are retained or synthesized only when requested.
     /// Unrequested tombstones retain their rows and keys for replay without the remove payload.
-    pub(crate) fn commit_actions(
-        &mut self,
+    fn commit_actions(
+        &self,
         base_version: Option<Version>,
+        metrics: &mut MetadataPlanningReport,
     ) -> KernelResult<PlanBuilder> {
-        let mut report = std::mem::take(&mut self.report);
-        let result = self.build_metadata_plan(ActionSource::Commit, None, |schema| {
+        self.build_metadata_plan(ActionSource::Commit, None, |schema| {
             sources::commit_arm(
                 self.segment,
                 base_version,
                 schema,
                 self.use_compactions,
-                &mut report,
+                metrics,
             )
-        });
-        self.report = report;
-        result
+        })
     }
 
     /// Reads and filters selected actions, attaches their identity key, then prepares metadata.
@@ -444,7 +468,7 @@ impl<'a> MetadataPlanner<'a> {
     /// Commit versions must be strictly newer than the base. Retention is left to the consumer.
     /// Non-content actions aggregate together. Content actions aggregate the tail and anti-join the
     /// base; when only JSON commits exist, the builder eliminates the empty base and anti-join.
-    pub(crate) fn replay_actions(
+    fn replay_actions(
         &self,
         commits: PlanBuilder,
         checkpoint: PlanBuilder,

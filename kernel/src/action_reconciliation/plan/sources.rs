@@ -146,7 +146,6 @@ mod tests {
 
     use super::*;
     use crate::action_reconciliation::plan::MetadataPlanner;
-    use crate::action_reconciliation::plan::action_set::ACTION_KEY;
     use crate::actions::visitors::SidecarVisitor;
     use crate::arrow::array::{BooleanArray, Int64Array, RecordBatch};
     use crate::arrow::compute::filter_record_batch;
@@ -314,13 +313,13 @@ mod tests {
         // information.
         let plan = MetadataPlanner::new(
             snapshot.log_segment(),
+            checkpoint_info,
             actions,
             !snapshot.has_adaptive_metadata(),
         )
         .with_stats(StatsOptions::json_only())
-        .with_checkpoint_info(checkpoint_info)
-        .checkpoint_actions()?
-        .project_patch(|patch| patch.drop(ACTION_KEY))?
+        .replay()
+        .plan?
         .build()?;
         // Then: file-action reads always use a complete static sidecar list.
         assert!(

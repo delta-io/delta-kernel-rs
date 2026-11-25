@@ -46,6 +46,8 @@ use url::Url;
 
 use self::data_skipping::as_checkpoint_skipping_predicate;
 use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
+#[cfg(feature = "declarative-plans")]
+use crate::action_reconciliation::plan::action_set::ActionSet;
 use crate::actions::deletion_vector::{
     DeletionVectorDescriptor, deletion_treemap_to_bools, split_vector,
 };
@@ -1587,16 +1589,22 @@ impl Scan {
             return Ok(None);
         }
 
-        let mut planner = scan_plan::MetadataPlanner::try_from_scan(self)?;
-        report.metadata_planning = planner.report();
-        let base = scan_plan::MetadataReplayBase::try_new(&self.snapshot, engine, report)?;
-        let replay_base = base.kind();
-        let base_version = base.version();
-        let result = self.build_metadata_scan_plan_with(base, &mut planner);
-        report.metadata_planning = planner.report();
-        report.metadata_planning.replay_base = Some(replay_base);
-        report.metadata_planning.base_version = base_version;
-        result
+        let use_crc = scan_plan::MetadataPlanner::crc_base(
+            self.snapshot.base_crc().map(Arc::as_ref),
+            self.snapshot.log_segment().checkpoint_version,
+            ActionSet::live_adds(),
+        )
+        .is_some();
+        let checkpoint_info = if !use_crc
+            && let Some(resolved) = self.snapshot.checkpoint_info_with_metrics(engine)
+        {
+            report.checkpoint = Some(resolved.metrics);
+            Some(resolved.result?)
+        } else {
+            None
+        };
+        let planner = scan_plan::MetadataPlanner::try_from_scan(self, checkpoint_info)?;
+        self.build_metadata_scan_plan_with(planner, report)
     }
 
     #[cfg(feature = "declarative-plans")]
