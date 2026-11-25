@@ -1,8 +1,8 @@
-"""Prepare separate diff excerpts for child reviewers and the orchestrator.
+"""Prepare independent PR change patch excerpts for subagents and the orchestrator.
 
-Keep the complete changed-path list and measure which bytes and files enter the child
-reviewer tasks. Limit author text separately. Fit the orchestrator's task instructions,
-metadata, description, earlier reviews, path list and diff excerpt within its task limit.
+Record which patch bytes and file sections enter Reviewer and Checker subagent task messages.
+Limit the PR description excerpt separately. Fit the orchestrator's complete initial task message
+within the command-argument byte limit, reserving its other text before adding the patch excerpt.
 """
 
 from __future__ import annotations
@@ -12,9 +12,10 @@ import re
 from pathlib import Path
 from typing import Any
 
-CHILD_DIFF_BYTES = 100_000
-PARENT_DIFF_BYTES = 80_000
-DESCRIPTION_BYTES = 8_192
+MAX_SUBAGENT_PATCH_EXCERPT_BYTES = 100_000
+MAX_ORCHESTRATOR_PATCH_EXCERPT_BYTES = 80_000
+MAX_PR_DESCRIPTION_EXCERPT_BYTES = 8_192
+MAX_ORCHESTRATOR_INITIAL_TASK_MESSAGE_BYTES = 120_000
 CHANGED_PATHS_FILE = Path("/tmp/ai_review_changed_paths.json")
 _SHA = re.compile(r"[0-9a-f]{40}")
 _STACK_HEADING = re.compile(
@@ -33,17 +34,19 @@ _STACK_ITEM = re.compile(
 )
 
 
-def prepare_inputs(
-    diff: bytes, raw_description: str, base_sha: str, head_sha: str
+def prepare_review_inputs(
+    pr_change_patch_bytes: bytes, raw_pr_description: str, base_sha: str, head_sha: str
 ) -> dict[str, Any]:
-    """Return bounded author text, the child-reviewer diff and file/byte coverage."""
+    """Return PR description and subagent patch excerpts with their byte and file coverage."""
     if not _SHA.fullmatch(base_sha) or not _SHA.fullmatch(head_sha):
         raise ValueError("review coverage requires exact base and head SHAs")
-    author = strip_stack_header(raw_description)
-    description = utf8_prefix(author.encode("utf-8"), DESCRIPTION_BYTES)
-    child_diff = utf8_prefix(diff, CHILD_DIFF_BYTES)
-    delivered = len(child_diff.encode("utf-8"))
-    files = file_sections(diff)
+    author_description = strip_stack_header(raw_pr_description)
+    pr_description_excerpt_text = utf8_prefix(
+        author_description.encode("utf-8"), MAX_PR_DESCRIPTION_EXCERPT_BYTES
+    )
+    subagent_patch_excerpt_text = utf8_prefix(pr_change_patch_bytes, MAX_SUBAGENT_PATCH_EXCERPT_BYTES)
+    delivered = len(subagent_patch_excerpt_text.encode("utf-8"))
+    files = file_sections(pr_change_patch_bytes)
     for section in files:
         section["status"] = (
             "full" if section["end"] <= delivered
@@ -51,8 +54,8 @@ def prepare_inputs(
             else "omitted"
         )
     coverage = {
-        "base_sha": base_sha, "head_sha": head_sha, "total_bytes": len(diff),
-        "delivered_bytes": delivered, "complete": delivered == len(diff),
+        "base_sha": base_sha, "head_sha": head_sha, "total_bytes": len(pr_change_patch_bytes),
+        "delivered_bytes": delivered, "complete": delivered == len(pr_change_patch_bytes),
         "total_files": len(files),
         "full_files": sum(section["status"] == "full" for section in files),
         "partial_files": sum(section["status"] == "partial" for section in files),
@@ -60,25 +63,34 @@ def prepare_inputs(
         "files": files,
     }
     return {
-        "description": description,
-        "description_truncated": len(description.encode("utf-8")) < len(author.encode("utf-8")),
-        "child_diff": child_diff,
+        "pr_description_excerpt_text": pr_description_excerpt_text,
+        "pr_description_truncated": (
+            len(pr_description_excerpt_text.encode("utf-8")) < len(author_description.encode("utf-8"))
+        ),
+        "subagent_patch_excerpt_text": subagent_patch_excerpt_text,
         "coverage": coverage,
     }
 
 
-def parent_prompt(
-    prefix: str, diff: bytes, coverage: dict[str, Any], *, limit: int = 120_000
+def build_orchestrator_task_message(
+    task_text_without_patch: str,
+    pr_change_patch_bytes: bytes,
+    coverage: dict[str, Any],
+    *,
+    limit: int = MAX_ORCHESTRATOR_INITIAL_TASK_MESSAGE_BYTES,
 ) -> str:
-    """Build the orchestrator task with its path list reserved before the diff excerpt.
+    """Build the initial orchestrator task message within its UTF-8 byte limit.
 
-    Keep the task-specific instructions and PR metadata in prefix. If the complete path list
-    cannot fit, name the list_changed_paths tool so the orchestrator can read every path in
-    pages. The limit bounds this first task message, not later tool results or static rules.
+    Keep run-specific instructions, PR metadata, the description and earlier AI review text in
+    task_text_without_patch. If the complete changed-path list cannot fit, name the
+    list_changed_paths tool so the orchestrator can read every path in pages. Role instructions,
+    tool definitions and later tool results are outside the initial task message limit.
     """
-    prefix_bytes = len(prefix.encode("utf-8"))
+    prefix_bytes = len(task_text_without_patch.encode("utf-8"))
     if prefix_bytes > limit:
-        raise ValueError("fixed orchestrator instructions exceed the prompt byte limit")
+        raise ValueError(
+            "orchestrator task text without the patch exceeds the initial-message byte limit"
+        )
     paths = "\n".join(
         json.dumps(section["path"], ensure_ascii=False) for section in coverage["files"]
     )
@@ -92,17 +104,17 @@ def parent_prompt(
     if prefix_bytes + len(manifest.encode("utf-8")) > limit:
         manifest = "\nlist_changed_paths"
     if prefix_bytes + len(manifest.encode("utf-8")) > limit:
-        return prefix
+        return task_text_without_patch
     head, tail = "\n## PR Diff\n\n```diff\n", "\n```\n"
     remaining = limit - prefix_bytes - len((manifest + head + tail).encode("utf-8"))
     if remaining < 0:
-        return prefix + manifest
-    excerpt = utf8_prefix(diff, min(PARENT_DIFF_BYTES, remaining))
-    return prefix + manifest + head + excerpt + tail
+        return task_text_without_patch + manifest
+    excerpt = utf8_prefix(pr_change_patch_bytes, min(MAX_ORCHESTRATOR_PATCH_EXCERPT_BYTES, remaining))
+    return task_text_without_patch + manifest + head + excerpt + tail
 
 
 def list_changed_paths(offset: int = 0, max_entries: int = 500) -> str:
-    """Read one page of changed paths and whether the child diff contains each file."""
+    """Read changed paths and each file section's inclusion in the subagent patch excerpt."""
     if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
         raise ValueError("offset must be a nonnegative integer")
     if (
@@ -135,14 +147,14 @@ def list_changed_paths(offset: int = 0, max_entries: int = 500) -> str:
     }, ensure_ascii=True)
 
 
-def strip_stack_header(description: str) -> str:
+def strip_stack_header(pr_description_excerpt_text: str) -> str:
     """Remove only a leading generated git-stack navigation block terminated by its divider."""
-    lines = description.splitlines(keepends=True)
+    lines = pr_description_excerpt_text.splitlines(keepends=True)
     first = 0
     while first < len(lines) and not lines[first].strip():
         first += 1
     if first == len(lines) or not _STACK_HEADING.fullmatch(lines[first].strip()):
-        return description
+        return pr_description_excerpt_text
     items = []
     has_generated_link = False
     has_incremental_link = False
@@ -154,7 +166,7 @@ def strip_stack_header(description: str) -> str:
         if re.fullmatch(r"\s*-{3,}\s*", line):
             if items and has_generated_link and (not has_unlinked_branch or has_incremental_link):
                 return "".join(lines[index + 1:]).lstrip("\r\n")
-            return description
+            return pr_description_excerpt_text
         if _INCREMENTAL_LINK.fullmatch(line):
             has_generated_link = True
             has_incremental_link = True
@@ -164,32 +176,32 @@ def strip_stack_header(description: str) -> str:
         elif re.fullmatch(r"[ \t]*[-*] stack/[^\s]+", line):
             has_unlinked_branch = True
         else:
-            return description
-    return description
+            return pr_description_excerpt_text
+    return pr_description_excerpt_text
 
 
 def utf8_prefix(data: bytes, limit: int) -> str:
     """Return a UTF-8 prefix without splitting a code point or replacing source bytes."""
     if limit < 0:
         raise ValueError("byte limit must be nonnegative")
-    prefix = data[:limit]
+    task_text_without_patch = data[:limit]
     try:
-        return prefix.decode("utf-8")
+        return task_text_without_patch.decode("utf-8")
     except UnicodeDecodeError as error:
-        if error.reason == "unexpected end of data" and error.end == len(prefix):
-            return prefix[:error.start].decode("utf-8")
+        if error.reason == "unexpected end of data" and error.end == len(task_text_without_patch):
+            return task_text_without_patch[:error.start].decode("utf-8")
         raise ValueError("review input contains invalid UTF-8") from error
 
 
-def file_sections(diff: bytes) -> list[dict[str, Any]]:
-    """Return each Git file section's path and raw byte interval in existing diff order."""
-    starts = [match.start() for match in re.finditer(rb"(?m)^diff --git ", diff)]
-    if diff and not starts:
+def file_sections(pr_change_patch_bytes: bytes) -> list[dict[str, Any]]:
+    """Return each file section's path and raw byte interval in PR change patch order."""
+    starts = [match.start() for match in re.finditer(rb"(?m)^diff --git ", pr_change_patch_bytes)]
+    if pr_change_patch_bytes and not starts:
         raise ValueError("scoped diff contains no Git file sections")
     files = []
     for index, start in enumerate(starts):
-        end = starts[index + 1] if index + 1 < len(starts) else len(diff)
-        section = diff[start:end]
+        end = starts[index + 1] if index + 1 < len(starts) else len(pr_change_patch_bytes)
+        section = pr_change_patch_bytes[start:end]
         lines = section.split(b"\n")
         old = new = renamed = None
         for line in lines[1:]:
