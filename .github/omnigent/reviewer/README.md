@@ -383,6 +383,24 @@ PR change patch and shared PR task text with seven-day retention.
 | `/tmp/review_execution.json` | Execution-record step | Check Run displays its tables; Actions retains the record for seven days. |
 | `/tmp/review_status.json` | Status computation | Actions retains the advisory status, counted findings and unmet status requirements. |
 
+### When stack ancestry is ambiguous
+
+If the declared parent's history cannot establish this PR's boundary, `review_scope.py` raises
+`AmbiguousStackRange` with the parent, reason and suggested fix. The failed scope step prevents
+model dispatch; the workflow does not substitute a wider range. An always-run step calls
+[`scope_publication.py`](../scope_publication.py) to post one repair comment per commit on the PR's
+Conversation tab. It names the parent and asks the author to rebase onto it, push and comment
+`/review inline`. The `AI Review Summary` Check Run shows the same text. There is no main AI review
+comment or finding thread because no review ran.
+
+Reruns reuse the existing GitHub Actions comment, updating it if the parent declaration or repair
+instructions change. Each run separately records the PR number, head commit, declared parent,
+reason, workflow URL and comment URL when confirmed in `/tmp/review_scope_outcome.json`. The
+Actions run retains that outcome as a scope artifact for seven days. Invalid descriptions,
+proven empty child ranges and API failures keep their own diagnostics and produce no ancestry
+repair comment.
+
+## Review input limits
 ## Review execution record
 
 The orchestrator dispatches every configured Reviewer subagent. A specialist with no applicable
