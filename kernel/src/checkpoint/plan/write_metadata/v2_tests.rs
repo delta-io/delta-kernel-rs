@@ -106,6 +106,9 @@ fn persisted_rows(
 
 fn canonical_actions(mut rows: Vec<Value>) -> Vec<Value> {
     for row in &mut rows {
+        if let Some(stats) = row["add"]["stats"].as_str() {
+            row["add"]["stats"] = serde_json::from_str(stats).expect("valid add stats JSON");
+        }
         row.as_object_mut()
             .unwrap()
             .retain(|_, value| !value.is_null());

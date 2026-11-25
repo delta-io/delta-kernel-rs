@@ -300,17 +300,12 @@ impl<'a> MetadataPlanner<'a> {
         let (patch, stats_kind) = match (stats_schema.as_ref(), get_type_of(STATS_PARSED)) {
             // Parsed statistics are requested and present in the file
             (Some(required_stats), Some(DataType::Struct(file_parsed_stats)))
-                if (prefer_json_stats
-                    && LogSegment::structs_have_compatible_types(
-                        file_parsed_stats,
-                        required_stats,
-                        STATS_PARSED,
-                        CheckpointFieldKind::Stats,
-                    ))
-                    || LogSegment::schema_has_compatible_stats_parsed(
-                        file_schema,
-                        required_stats,
-                    ) =>
+                if LogSegment::structs_have_compatible_types(
+                    file_parsed_stats,
+                    required_stats,
+                    STATS_PARSED,
+                    CheckpointFieldKind::Stats,
+                ) =>
             {
                 let stats_schema = required_stats.clone().try_fold_with(
                     source_collation_stats(file_schema).filter(|_| self.read_collations),
