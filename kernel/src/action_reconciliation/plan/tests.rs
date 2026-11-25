@@ -12,13 +12,18 @@ use crate::arrow::compute::{concat_batches, filter_record_batch, is_not_null};
 use crate::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use crate::engine::arrow_conversion::TryIntoArrow;
 use crate::engine::sync::SyncEngine;
+use crate::expressions::{col, lit};
+use crate::log_segment::LogSegment;
+use crate::log_segment_files::LogSegmentFiles;
+use crate::metrics::ReplayBase;
+use crate::plans::ir::nodes::Operator;
 use crate::scan::StatsOptions;
 use crate::schema::schema_ref;
 use crate::table_features::TableFeature;
 use crate::unit_test_utils::plans::execute_plan;
 use crate::unit_test_utils::{
     Action, LocalMockTable, MockProtocolBuilder, MockTableConfigurationBuilder, create_add_action,
-    create_remove_action,
+    create_log_path_with_size, create_remove_action,
 };
 use crate::{KernelError, Result, Snapshot};
 
@@ -97,6 +102,14 @@ async fn replay_selects_latest_action_without_retention(
             Action::DomainMetadata(domain_deletion),
         ])
         .await;
+    let expected_start = if checkpoint.is_some() { 4 } else { 0 };
+    let mut expected_bytes = 0;
+    for version in expected_start..=5 {
+        let path = table
+            .table_root()
+            .join(format!("_delta_log/{version:020}.json"));
+        expected_bytes += std::fs::metadata(path).unwrap().len();
+    }
     // When: shared replay reads the requested actions using complete checkpoint discovery.
     let snapshot = build_snapshot!(VersionTarget::Latest, &table_root, &engine);
     let checkpoint_info = actions
@@ -104,14 +117,33 @@ async fn replay_selects_latest_action_without_retention(
         .then(|| snapshot.checkpoint_info(&engine))
         .transpose()?
         .flatten();
-    let state = MetadataPlanner::new(
+    let mut planner = MetadataPlanner::new(
         snapshot.log_segment(),
         actions,
         !snapshot.has_adaptive_metadata(),
     )
     .with_stats(StatsOptions::json_only())
-    .with_checkpoint_info(checkpoint_info)
-    .replay()?;
+    .with_checkpoint_info(checkpoint_info);
+    let state = planner.replay()?;
+    let report = planner.report();
+    assert!(report.stats.synthesize_json);
+    assert!(!report.partition_values.parsed_struct);
+    assert_eq!(report.partition_values.timestamp_timezone, None);
+    assert!(!report.read_collations);
+    assert!(!report.has_filter);
+    assert_eq!(report.base_version, checkpoint.is_some().then_some(3));
+    assert_eq!(report.commit_start_version, Some(expected_start));
+    assert_eq!(report.commit_end_version, Some(5));
+    assert_eq!(report.compaction_file_count, 0);
+    assert_eq!(report.commit_total_size_bytes, expected_bytes);
+    assert_eq!(
+        report.replay_base,
+        Some(if checkpoint.is_some() {
+            ReplayBase::Checkpoint
+        } else {
+            ReplayBase::Empty
+        })
+    );
     // Then: each requested payload and version comes from its latest action.
     let names = actions.output_action_names().collect::<Vec<_>>();
     let schema = schema_ref! {
@@ -121,6 +153,19 @@ async fn replay_selects_latest_action_without_retention(
     assert_eq!(state.schema(), &schema);
     let file_version =
         (remove_version.unwrap_or(1) as i64).max(if checkpoint.is_some() { 3 } else { 0 });
+    let plan = state.build()?;
+    let parquet_bytes: u64 = plan
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.op {
+            Operator::ScanParquet(scan) => Some(&scan.files),
+            _ => None,
+        })
+        .flatten()
+        .map(|file| file.meta.size)
+        .sum();
+    assert_eq!(report.total_json_bytes, expected_bytes);
+    assert_eq!(report.total_parquet_bytes, parquet_bytes);
     let actual = concat_batches(
         &Arc::new(
             schema
@@ -128,7 +173,7 @@ async fn replay_selects_latest_action_without_retention(
                 .try_into_arrow()
                 .map_err(KernelError::from)?,
         ),
-        &execute_plan(&engine, state.build()?)?,
+        &execute_plan(&engine, plan)?,
     )
     .map_err(KernelError::from)?
     .normalize(".", Some(1))
@@ -205,4 +250,84 @@ async fn replay_selects_latest_action_without_retention(
     }
     assert_eq!(checked_rows, actual.num_rows());
     Ok(())
+}
+
+#[rstest]
+#[case::compaction(ReplayBase::Empty, true, false, Some((0, 5)), 13)]
+#[case::crc_tail(ReplayBase::Crc, false, false, Some((4, 5)), 10)]
+#[case::checkpoint_without_tail(ReplayBase::Checkpoint, false, false, None, 0)]
+#[case::partial_failure(ReplayBase::Empty, false, true, Some((0, 5)), 30)]
+fn report_retains_selected_inputs(
+    #[case] base: ReplayBase,
+    #[case] compaction: bool,
+    #[case] fail: bool,
+    #[case] expected_range: Option<(u64, u64)>,
+    #[case] expected_bytes: u64,
+) {
+    let checkpoint = base == ReplayBase::Checkpoint;
+    let file =
+        |name: &str, size| create_log_path_with_size(&format!("memory:///_delta_log/{name}"), size);
+    let segment = LogSegment {
+        end_version: 5,
+        checkpoint_version: checkpoint.then_some(5),
+        log_root: Url::parse("memory:///_delta_log/").unwrap(),
+        last_checkpoint_metadata: None,
+        listed: LogSegmentFiles {
+            ascending_commit_files: (0..=5)
+                .filter(|_| !checkpoint)
+                .map(|version| file(&format!("{version:020}.json"), 5))
+                .collect(),
+            ascending_compaction_files: compaction
+                .then(|| {
+                    file(
+                        "00000000000000000000.00000000000000000005.compacted.json",
+                        13,
+                    )
+                })
+                .into_iter()
+                .collect(),
+            checkpoint_parts: checkpoint
+                .then(|| file("00000000000000000005.checkpoint.parquet", 1))
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        },
+    };
+    let actions = if checkpoint {
+        ActionSet {
+            protocol: true,
+            ..Default::default()
+        }
+    } else {
+        ActionSet::live_adds()
+    };
+    let mut planner = MetadataPlanner::new(&segment, actions, compaction)
+        .with_stats_filter(fail.then(|| col!("missing").eq(lit(0))));
+    let result = if base == ReplayBase::Crc {
+        let _ = planner.crc_adds(3, vec![]).unwrap();
+        planner.commit_actions(Some(3))
+    } else {
+        planner.replay()
+    };
+    assert_eq!(result.is_err(), fail);
+    if let Err(error) = result {
+        assert!(error.to_string().contains("missing"));
+    }
+    let report = planner.report();
+    assert_eq!(report.replay_base, Some(base));
+    assert_eq!(
+        report.base_version,
+        match base {
+            ReplayBase::Crc => Some(3),
+            ReplayBase::Checkpoint => Some(5),
+            ReplayBase::Empty => None,
+        },
+    );
+    assert_eq!(
+        (report.commit_start_version, report.commit_end_version),
+        expected_range.unzip(),
+    );
+    assert_eq!(report.commit_total_size_bytes, expected_bytes);
+    assert_eq!(report.compaction_file_count, u64::from(compaction));
+    assert_eq!(report.has_filter, fail);
 }

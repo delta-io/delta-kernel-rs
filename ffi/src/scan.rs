@@ -5,6 +5,8 @@ use std::collections::hash_map::Entry;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
+#[cfg(feature = "tracing")]
+use delta_kernel::scan::StructStats;
 use delta_kernel::scan::state::{DvInfo, ScanFile};
 use delta_kernel::scan::{PartitionValuesOptions, Scan, ScanBuilder, ScanMetadata, StatsOptions};
 use delta_kernel::schema::{MetadataKey, MetadataValue};
@@ -72,13 +74,28 @@ pub enum FfiStatsOptions {
 }
 
 impl FfiStatsOptions {
+    /// Builds a view using column paths borrowed for the enclosing callback.
+    #[cfg(feature = "tracing")]
+    pub(crate) fn from_kernel(stats: &StatsOptions, columns: FfiColumnNameArray) -> Self {
+        match stats.struct_stats() {
+            StructStats::None if stats.synthesize_json() => Self::JsonOnly,
+            StructStats::None => Self::None,
+            StructStats::AllIndexed { .. } if stats.synthesize_json() => Self::All,
+            StructStats::AllIndexed { extra_indexed } if extra_indexed.is_empty() => {
+                Self::AllStruct
+            }
+            StructStats::AllIndexed { .. } => Self::AllStructWithExtraIndexed(columns),
+            StructStats::Columns { .. } => Self::StructColumns(columns),
+        }
+    }
+
     /// Copy borrowed logical column paths into owned kernel options.
     ///
     /// # Safety
     ///
     /// Column arrays and all nested slices must follow the [`crate::FfiSlice`] contract and
     /// remain valid for this call. Path segments are field names, not dotted strings.
-    unsafe fn try_to_kernel(&self) -> KernelResult<StatsOptions> {
+    pub(crate) unsafe fn try_to_kernel(&self) -> KernelResult<StatsOptions> {
         Ok(match self {
             Self::JsonOnly => StatsOptions::json_only(),
             Self::AllStruct => StatsOptions::all_struct(),

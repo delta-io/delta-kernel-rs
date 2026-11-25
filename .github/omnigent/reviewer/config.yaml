@@ -57,7 +57,7 @@ guardrails:
         path: omnigent.policies.builtins.orchestration.headless_subagent_purpose_guard
         arguments:
           allowed_purposes: [review, explore, search]
-    # See "How a child task is assembled" in README.md. Keep this hook last because
+    # See "How a subagent task message is assembled" in README.md. Keep this hook last because
     # later policies cannot recognize a rewritten dispatch without its tool name.
     append_child_task_body:
       type: function

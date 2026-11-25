@@ -470,11 +470,11 @@ There are two error directions, with opposite message owners:
 
 #### Kernel and Delta errors returned to the engine
 
-`ErrorAllocators` carries a connector context and both allocation callbacks. `KernelErrorInfo`
-contains a numeric code and message; `DeltaErrorInfo` contains the catalog condition, optional
-SQLSTATE, named parameters, and message. Callbacks copy any information they need after returning
-and return their own error object as `void*`, or NULL if allocation fails. Kernel returns that
-pointer unchanged in `ExternResult::Err` and never reads or frees it.
+`ErrorAllocators` carries a connector context and both allocation callbacks. The error information
+records in `src/error/allocation.rs` document the classification fields and borrowed diagnostics.
+Callbacks copy any information they need after returning and return their own error object as
+`void*`, or NULL if allocation fails. Kernel returns that pointer unchanged in `ExternResult::Err`
+and never reads or frees it.
 
 Engine constructors accept `*const ErrorAllocators` and copy the table into builders and engines.
 The table pointer must be valid for the constructor call; callback code and context must remain

@@ -9,6 +9,8 @@ use delta_kernel::engine::DelegatingEngine;
 #[cfg(feature = "declarative-plans")]
 use delta_kernel::engine::sync::plan::SyncPlanExecutor;
 use delta_kernel::expressions::{Predicate, PredicateRef, expr};
+#[cfg(feature = "declarative-plans")]
+use delta_kernel::metrics::{MetricEvent, ReplayBase, ScanPlanOutcome};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt};
@@ -30,6 +32,8 @@ use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::log_compaction::write_compaction_from_commits;
 use test_utils::table_builder::{FeatureSet, LogState, TestTableBuilder, all_features_cm_name};
+#[cfg(feature = "declarative-plans")]
+use test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
 use test_utils::{
     JsonReadCapture, add_commit, assert_result_error_with_message, begin_transaction,
     compacted_log_path_for_versions, into_record_batch, load_test_data, read_scan,
@@ -103,9 +107,45 @@ async fn snapshot_replay_and_non_amt_scans_use_compactions(
                     .any(|path| path.path().ends_with(".compacted.json"))
             );
             if use_plan {
+                let reporter = Arc::new(CapturingReporter::default());
+                let guard = install_thread_local_metrics_reporter(reporter.clone());
                 let plan = scan
                     .declarative_metadata_scan_plan(engine.as_ref())?
                     .unwrap();
+                drop(guard);
+                let events: Vec<_> = reporter
+                    .events()
+                    .into_iter()
+                    .filter(|event| matches!(event, MetricEvent::ScanPlanGenerationCompleted(_)))
+                    .collect();
+                let [MetricEvent::ScanPlanGenerationCompleted(event)] = events.as_slice() else {
+                    panic!("expected one scan-plan completion: {events:?}");
+                };
+                assert_eq!(event.outcome, ScanPlanOutcome::Plan);
+                let report = &event.metadata_planning;
+                // Kernel-written CRCs omit allFiles, so they cannot replace the replay base.
+                assert_eq!(
+                    report.replay_base,
+                    Some(if checkpoint {
+                        ReplayBase::Checkpoint
+                    } else {
+                        ReplayBase::Empty
+                    })
+                );
+                assert_eq!(report.base_version, checkpoint.then_some(1));
+                assert_eq!(
+                    report.commit_start_version,
+                    Some(if checkpoint { 2 } else { 0 })
+                );
+                assert_eq!(report.commit_end_version, Some(version));
+                assert_eq!(report.compaction_file_count, 1);
+                assert_eq!(event.checkpoint.is_some(), checkpoint);
+                if let Some(checkpoint) = &event.checkpoint {
+                    assert!(checkpoint.duration_ns <= event.duration_ns);
+                    assert_eq!(checkpoint.version, 1);
+                    let info = checkpoint.info.as_ref().unwrap();
+                    assert_eq!(info.last_checkpoint().version(), checkpoint.version);
+                }
                 assert!(plan_uses_compaction(&plan));
                 let batches = SyncPlanExecutor::new(Some(table.store().clone()))
                     .execute_op(Operation::QueryPlan(plan))?

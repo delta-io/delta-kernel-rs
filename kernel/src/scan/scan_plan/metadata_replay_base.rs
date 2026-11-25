@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crate::actions::Add;
 use crate::checkpoint::CheckpointInfo;
+use crate::metrics::{ReplayBase, ScanPlanReport};
 use crate::{Engine, KernelResult, Snapshot, Version};
 
 /// Reconciled table state from which metadata replay starts.
@@ -18,7 +19,11 @@ pub(in crate::scan) enum MetadataReplayBase {
 impl MetadataReplayBase {
     /// Select the newest eligible metadata base and resolve checkpoint information only when
     /// needed.
-    pub(in crate::scan) fn try_new(snapshot: &Snapshot, engine: &dyn Engine) -> KernelResult<Self> {
+    pub(in crate::scan) fn try_new(
+        snapshot: &Snapshot,
+        engine: &dyn Engine,
+        report: &mut ScanPlanReport,
+    ) -> KernelResult<Self> {
         let checkpoint_version = snapshot.log_segment().checkpoint_version;
         // Keep replay eligibility independent of SnapshotCrc's validation.
         if let Some((version, files)) = snapshot
@@ -28,21 +33,45 @@ impl MetadataReplayBase {
                 checkpoint_version.is_none_or(|checkpoint| *version >= checkpoint)
             })
         {
+            report.metadata_planning.replay_base = Some(ReplayBase::Crc);
+            report.metadata_planning.base_version = Some(version);
             return Ok(Self::Crc {
                 version,
                 files: files.to_vec(),
             });
         }
 
-        let info = snapshot.checkpoint_info(engine)?;
+        report.metadata_planning.replay_base = Some(if checkpoint_version.is_some() {
+            ReplayBase::Checkpoint
+        } else {
+            ReplayBase::Empty
+        });
+        report.metadata_planning.base_version = checkpoint_version;
+        let info = if let Some(resolved) = snapshot.checkpoint_info_with_metrics(engine) {
+            report.checkpoint = Some(resolved.metrics);
+            Some(resolved.result?)
+        } else {
+            None
+        };
         Ok(Self::Checkpoint {
             version: checkpoint_version,
             info,
         })
     }
 
+    /// Starting state selected for metadata replay.
+    pub(in crate::scan) fn kind(&self) -> ReplayBase {
+        match self {
+            Self::Crc { .. } => ReplayBase::Crc,
+            Self::Checkpoint {
+                version: Some(_), ..
+            } => ReplayBase::Checkpoint,
+            Self::Checkpoint { version: None, .. } => ReplayBase::Empty,
+        }
+    }
+
     /// Exclusive lower bound for commit replay; `None` replays all available commits.
-    pub(super) fn version(&self) -> Option<Version> {
+    pub(in crate::scan) fn version(&self) -> Option<Version> {
         match self {
             Self::Crc { version, .. } => Some(*version),
             Self::Checkpoint { version, .. } => *version,
@@ -64,7 +93,7 @@ mod tests {
     use crate::plans::Operation as PlanOperation;
     use crate::plans::ir::nodes::Operator;
     use crate::scan::scan_plan::tests::log_segment;
-    use crate::unit_test_utils::load_test_table;
+    use crate::unit_test_utils::{assert_scan_plan_metrics, load_test_table};
 
     #[rstest]
     #[case::without_checkpoint(4, None, true)]
@@ -96,10 +125,17 @@ mod tests {
         let crc = Some(crc);
         let snapshot = Arc::new(Snapshot::new_with_crc(segment, config, crc, false, false)?);
         let scan = snapshot.scan_builder().build()?;
-        let base = MetadataReplayBase::try_new(&scan.snapshot, &engine)?;
+        let mut report = ScanPlanReport::new();
+        let base = MetadataReplayBase::try_new(&scan.snapshot, &engine, &mut report)?;
+        let kind = if has_all_files {
+            ReplayBase::Crc
+        } else {
+            ReplayBase::Checkpoint
+        };
+        assert_eq!(base.kind(), kind);
+        assert_eq!(report.metadata_planning.replay_base, Some(kind));
+        assert_eq!(report.metadata_planning.base_version, Some(version));
         assert_eq!(base.version(), Some(version));
-        let is_crc = matches!(base, MetadataReplayBase::Crc { .. });
-        assert_eq!(is_crc, has_all_files);
         assert_eq!(
             scan.snapshot.cached_checkpoint_info().is_some(),
             !has_all_files
@@ -142,9 +178,30 @@ mod tests {
         let config = target.table_configuration().clone();
         let snapshot = Arc::new(Snapshot::new_with_crc(segment, config, crc, false, false)?);
         let scan = snapshot.scan_builder().build()?;
-        let plan = scan.declarative_metadata_scan_plan(
-            &DelegatingEngine::new(engine.clone()).without_plan_executor(),
+        let mut num_plan_nodes = 0;
+        let plan = assert_scan_plan_metrics(
+            || {
+                scan.declarative_metadata_scan_plan(
+                    &DelegatingEngine::new(engine.clone()).without_plan_executor(),
+                )
+            },
+            |event| {
+                num_plan_nodes = event.num_plan_nodes;
+                let report = &event.metadata_planning;
+                assert_eq!(report.replay_base, Some(ReplayBase::Crc));
+                assert_eq!(report.base_version, Some(version));
+                assert!(event.checkpoint.is_none());
+                let bounds = (target_version > version).then_some((version + 1, target_version));
+                assert_eq!(
+                    report.commit_start_version.zip(report.commit_end_version),
+                    bounds
+                );
+            },
         )?;
+        assert_eq!(
+            num_plan_nodes,
+            plan.as_ref().map_or(0, |plan| plan.nodes.len() as u64)
+        );
         if expected_rows == 0 {
             assert!(plan.is_none());
             return Ok(());

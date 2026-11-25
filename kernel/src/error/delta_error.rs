@@ -97,10 +97,11 @@ impl DeltaError {
         self.to_string()
     }
 
-    /// Returns the backtrace captured at construction, subject to Rust's backtrace configuration.
+    /// Returns the backtrace captured when this error was constructed.
     ///
-    /// Every construction calls [`Backtrace::capture`] with no per-error opt-out. Capture is
-    /// disabled unless `RUST_BACKTRACE` or `RUST_LIB_BACKTRACE` enables it.
+    /// Every construction calls [`Backtrace::capture`]. Set `RUST_LIB_BACKTRACE` (or
+    /// `RUST_BACKTRACE` when it is unset) before the first backtrace capture; Rust caches the
+    /// environment setting. Capture also requires platform support.
     pub fn backtrace(&self) -> &Backtrace {
         &self.backtrace
     }

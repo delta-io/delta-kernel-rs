@@ -27,7 +27,7 @@ use crate::checkpoint::collation_stats::{
 use crate::checkpoint::metrics::{CheckpointMetrics, CheckpointPhase};
 use crate::committer::CatalogCommit;
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::content_tree::read_checkpoint_action;
+use crate::content_tree::{AmtStatsRequest, read_checkpoint_action};
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
 use crate::log_replay::ActionsBatch;
@@ -1052,10 +1052,10 @@ impl LogSegment {
     /// by the actions it carries, and the commits and checkpoint files at or below that version are
     /// not read.
     ///
-    /// `table_root` resolves the action's manifest locations. When `stats_parsed` is set, the
-    /// checkpoint's adds carry `stats_schema` as `add.stats_parsed`, read from the content tree's
-    /// `content_stats`. Those are keyed by the checkpoint's schema, so the caller sets it only when
-    /// `stats_schema` is derived from that same schema; otherwise the tree's adds carry no stats.
+    /// `table_root` resolves the action's manifest locations. `stats_schema` is the physical stats
+    /// schema the caller replays with. `amt_stats_request` reads it from the content tree's
+    /// `content_stats` as `add.stats_parsed` (see [`AmtStatsRequest::for_checkpoint`]); without it,
+    /// the tree's adds carry no stats.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn read_actions_with_checkpoint_action(
@@ -1066,7 +1066,7 @@ impl LogSegment {
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
         stats_schema: Option<&StructType>,
-        stats_parsed: bool,
+        amt_stats_request: Option<AmtStatsRequest<'_>>,
     ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
         let version = Version::try_from(checkpoint.version())
             .ok()
@@ -1106,14 +1106,16 @@ impl LogSegment {
                 .collect::<Vec<_>>(),
             commit_read_schema,
         )?;
-        let stats_parsed_schema = stats_schema.filter(|_| stats_parsed);
-        let has_stats_parsed = stats_parsed_schema.is_some();
+        let has_stats_parsed = amt_stats_request.is_some();
         let mut add_fields = Vec::new();
         if needs_json_stats_fallback(&checkpoint_read_schema, stats_schema, has_stats_parsed) {
             add_fields.push(StructField::nullable("stats", DataType::STRING));
         }
-        if let Some(schema) = stats_parsed_schema {
-            add_fields.push(StructField::nullable("stats_parsed", schema.clone()));
+        if let Some(amt_stats_request) = &amt_stats_request {
+            add_fields.push(StructField::nullable(
+                "stats_parsed",
+                amt_stats_request.schema().clone(),
+            ));
         }
         let checkpoint_read_schema =
             augment_checkpoint_read_schema(&checkpoint_read_schema, add_fields, false)?;
@@ -1123,7 +1125,7 @@ impl LogSegment {
             checkpoint,
             &LogRoot::new(table_root.clone())?,
             checkpoint_read_schema.clone(),
-            stats_parsed_schema,
+            amt_stats_request.as_ref(),
         )
         .map_err(KernelError::generic_err)?;
         Ok(ActionsWithCheckpointInfo {

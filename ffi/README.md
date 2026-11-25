@@ -211,12 +211,20 @@ Builders and engines copy the table, so the table itself need only live through 
 Callback code and connector context must remain valid for every call, including concurrent calls
 when the engine is shared. Standalone FFI functions borrow an allocator table directly.
 
-Kernel errors provide `KernelErrorInfo` (numeric code and message). Delta errors provide
-`DeltaErrorInfo` (condition, optional SQLSTATE, named parameters, and message). Callbacks must copy
-any information they retain after returning. Each callback returns a connector-owned error object
-as `void*`, or NULL if allocation fails. `ExternResult::Err` returns that pointer unchanged; the
-connector frees it. Callbacks must not unwind across FFI. See `examples/common/kernel_utils.c` for
-both callbacks and their shared registration table.
+Kernel errors provide `KernelErrorInfo` (numeric code, message, and source messages). Delta errors
+provide `DeltaErrorInfo` (condition, optional SQLSTATE, named parameters, message, optional
+construction-site backtrace, and source messages). Configure capture through Rust's environment
+settings before the first capture; see
+[`DeltaError::backtrace`](https://docs.rs/delta_kernel/latest/delta_kernel/error/struct.DeltaError.html#method.backtrace).
+Kernel error messages retain their existing rendering, including any backtrace wrapper; Delta
+errors expose their backtrace separately from the catalog message.
 
-This changes constructor and standalone function signatures and removes the `EngineError` layout
-requirement. Rebuild bindings against the generated headers and supply both callbacks.
+Callbacks must copy any information they retain after returning, including the borrowed diagnostic
+strings and arrays. Each callback returns a connector-owned error object as `void*`, or NULL if
+allocation fails. `ExternResult::Err` returns that pointer unchanged; the connector frees it.
+Callbacks must not unwind across FFI. See `examples/common/kernel_utils.c` for both callbacks and
+their shared registration table.
+
+Rebuild bindings against the generated headers and supply both callbacks. Changes to the
+`KernelErrorInfo` or `DeltaErrorInfo` C layouts require rebuilding native libraries and bindings
+together.

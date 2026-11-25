@@ -26,7 +26,7 @@ pub(crate) enum Read {
     Footer,
 }
 
-/// Records scopes at the real engine's read boundaries and can transform JSON read batches.
+/// Records read scopes, with optional byte-read overrides and JSON stream transforms.
 pub(crate) struct RecordingReads {
     /// Engine supplying fixture data and delegated operations.
     pub(crate) inner: Arc<dyn Engine>,
@@ -40,11 +40,16 @@ pub(crate) struct RecordingReads {
     pub(crate) cancel_delay: Duration,
     /// Cancels the test token after each JSON iterator item.
     pub(crate) cancel_json_after_batch: bool,
+    /// Overrides byte reads after recording; only valid for reads without a cancellation token.
+    pub(crate) override_byte_reads: Option<Box<ByteReadOverride>>,
     /// Transforms the delegated JSON stream, for example to inject empty batches or errors.
     pub(crate) transform_json_batches: Option<Box<JsonBatchTransform>>,
     /// Read boundaries observed in call order.
     pub(crate) events: Mutex<Vec<Read>>,
 }
+
+type ByteReadOverride =
+    dyn Fn(Vec<FileSlice>) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> + Send + Sync;
 
 type JsonBatchTransform = dyn Fn(SchemaRef, FileDataReadResultIterator) -> KernelResult<FileDataReadResultIterator>
     + Send
@@ -61,6 +66,7 @@ impl RecordingReads {
             cancel_on,
             cancel_delay: Duration::ZERO,
             cancel_json_after_batch: false,
+            override_byte_reads: None,
             transform_json_batches: None,
             events: Mutex::new(Vec::new()),
         })
@@ -143,6 +149,13 @@ impl StorageHandler for RecordingReads {
             Read::Hint
         };
         self.record(read, &token)?;
+        if let Some(read) = &self.override_byte_reads {
+            assert!(
+                token.is_none(),
+                "byte-read overrides require an unscoped read"
+            );
+            return read(files);
+        }
         self.inner
             .storage_handler()
             .read_files_with_cancellation(files, token)

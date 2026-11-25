@@ -559,9 +559,17 @@ void print_metric(MetricEvent event) {
 
   case MetricEventCrcReadFailure:
     PM_START(CrcReadFailure);
-    ReadFailure crf = event.crc_read_failure;
+    CrcReadFailure crf = event.crc_read_failure;
     PM_ID(crf, operation_id);
     PM_SLICE(crf, correlation_id);
+    printf("  reason:");
+    switch (crf.reason) {
+    case CrcReadFailureReasonNotFound: printf(" NotFound,\n"); break;
+    case CrcReadFailureReasonEmpty: printf(" Empty,\n"); break;
+    case CrcReadFailureReasonParsing: printf(" Parsing,\n"); break;
+    case CrcReadFailureReasonError: printf(" Error,\n"); break;
+    case CrcReadFailureReasonCancelled: printf(" Cancelled,\n"); break;
+    }
     PM_END;
     return;
 

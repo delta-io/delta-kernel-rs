@@ -92,6 +92,31 @@ impl CapturingReporter {
     }
 }
 
+/// Checks the single scan-plan completion emitted by a test operation.
+#[cfg(feature = "declarative-plans")]
+pub(crate) fn assert_scan_plan_metrics<T>(
+    generate: impl FnOnce() -> T,
+    check: impl FnOnce(&crate::metrics::ScanPlanReport),
+) -> T {
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    let result = generate();
+    let events = reporter.events();
+    let reports: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            MetricEvent::ScanPlanGenerationCompleted(event) => Some(event),
+            _ => None,
+        })
+        .collect();
+    let [event] = reports.as_slice() else {
+        panic!("expected one scan-plan report: {events:?}")
+    };
+    assert_ne!(event.operation_id, crate::metrics::MetricId::nil());
+    check(event);
+    result
+}
+
 /// Whether an event reports storage listing, copying, or a storage, JSON, or Parquet read.
 pub(crate) fn is_io_event(event: &MetricEvent) -> bool {
     match event {
@@ -115,10 +140,11 @@ pub(crate) fn is_io_event(event: &MetricEvent) -> bool {
         | MetricEvent::SetTransactionLoadSuccess(_)
         | MetricEvent::SetTransactionLoadFailure
         | MetricEvent::CrcReadSuccess(_)
-        | MetricEvent::CrcReadFailure { .. }
+        | MetricEvent::CrcReadFailure(_)
         | MetricEvent::LastCheckpointReadCompleted(_)
         | MetricEvent::ChecksumWriteSuccess(_)
         | MetricEvent::ChecksumWriteFailure(_)
+        | MetricEvent::ScanPlanGenerationCompleted(_)
         | MetricEvent::ScanMetadataCompleted(_) => false,
     }
 }
