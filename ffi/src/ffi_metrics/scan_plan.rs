@@ -38,6 +38,7 @@ pub struct ScanPlanReport {
     // === Operation ===
     pub operation_id: MetricId,
     pub table_id: KernelStringSlice,
+    pub table_path: KernelStringSlice,
     pub correlation_id: KernelStringSlice,
     pub outcome: ScanPlanOutcome,
     pub duration_ns: u64,
@@ -113,9 +114,11 @@ pub(super) fn with_event<F: FnOnce(MetricEvent)>(event: &kernel::ScanPlanReport,
                 duration_ns: metrics.duration_ns,
             });
         let table_id = &event.table_id;
+        let table_path = &event.table_path;
         let record = ScanPlanReport {
             operation_id: event.operation_id.into(),
             table_id: kernel_string_slice!(table_id),
+            table_path: kernel_string_slice!(table_path),
             correlation_id: correlation_id_slice(event.correlation_id.as_deref()),
             outcome: match event.outcome {
                 kernel::ScanPlanOutcome::Plan => ScanPlanOutcome::Plan,
@@ -224,6 +227,7 @@ mod tests {
         let event = kernel::ScanPlanReport {
             operation_id: kernel::MetricId::new(),
             table_id: "table-test".into(),
+            table_path: "s3://bucket/table%20path/".into(),
             correlation_id: Some("scan-test".into()),
             outcome: if failed {
                 kernel::ScanPlanOutcome::Error
@@ -269,6 +273,10 @@ mod tests {
             assert_eq!(
                 unsafe { String::try_from_slice(&record.table_id) }.unwrap(),
                 "table-test"
+            );
+            assert_eq!(
+                unsafe { String::try_from_slice(&record.table_path) }.unwrap(),
+                "s3://bucket/table%20path/"
             );
             assert_eq!(
                 unsafe { String::try_from_slice(&record.correlation_id) }.unwrap(),

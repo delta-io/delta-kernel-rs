@@ -477,6 +477,7 @@ mod tests {
         let report = ScanPlanReport {
             operation_id: MetricId::new(),
             table_id: "table-test".into(),
+            table_path: "s3://bucket/table%20path/".into(),
             correlation_id: with_checkpoint.then(|| Arc::from("")),
             outcome: ScanPlanOutcome::Plan,
             duration_ns: 17,

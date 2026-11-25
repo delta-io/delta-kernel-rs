@@ -115,6 +115,8 @@ pub struct ScanPlanReport {
     pub operation_id: MetricId,
     /// Table identifier from the snapshot's metadata.
     pub table_id: String,
+    /// Table-root URL from the snapshot.
+    pub table_path: String,
     /// Caller-supplied correlation identity.
     pub correlation_id: Option<Arc<str>>,
     /// Terminal planning result.
@@ -148,6 +150,7 @@ impl ScanPlanReport {
         Self {
             operation_id,
             table_id: String::new(),
+            table_path: String::new(),
             correlation_id: None,
             outcome: ScanPlanOutcome::Error,
             duration_ns: 0,
@@ -173,6 +176,7 @@ pub(crate) fn emit_scan_plan_completed(report: &ScanPlanReport) {
         report = Empty,
         operation_id = %report.operation_id,
         table_id = report.table_id.as_str(),
+        table_path = report.table_path.as_str(),
         correlation_id = report.correlation_id.as_deref(),
         outcome = report.outcome.as_ref(),
         duration_ns = report.duration_ns,
@@ -266,6 +270,7 @@ impl ScanPlanReport {
         let metadata = &mut self.metadata_planning;
         match name {
             "table_id" => self.table_id = value.to_owned(),
+            "table_path" => self.table_path = value.to_owned(),
             "correlation_id" => self.correlation_id = Some(value.into()),
             "outcome" => self.outcome = value.parse().map_err(|_| ())?,
             "replay_base" => metadata.replay_base = Some(value.parse().map_err(|_| ())?),
@@ -371,7 +376,8 @@ impl fmt::Display for ScanPlanReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "ScanPlanReport(operation_id={}, table_id={:?}, correlation_id={:?}, outcome={:?}, \
+            "ScanPlanReport(operation_id={}, table_id={:?}, table_path={:?}, \
+             correlation_id={:?}, outcome={:?}, \
              duration_ns={}, num_plan_nodes={}, \
              total_json_bytes={}, total_parquet_bytes={}, \
              replay_base={:?}, base_version={:?}, has_filter={}, read_collations={}, \
@@ -379,6 +385,7 @@ impl fmt::Display for ScanPlanReport {
              commit_total_size_bytes={}, compaction_file_count={}",
             self.operation_id,
             self.table_id,
+            self.table_path,
             self.correlation_id,
             self.outcome,
             self.duration_ns,

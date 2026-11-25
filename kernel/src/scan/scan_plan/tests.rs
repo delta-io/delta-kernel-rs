@@ -978,6 +978,7 @@ fn assert_metadata_output_options(
                 event.table_id,
                 scan.snapshot.table_configuration().metadata().id()
             );
+            assert_eq!(event.table_path, scan.snapshot.table_root().as_str());
             let report = &event.metadata_planning;
             assert_eq!(report.stats, scan.stats);
             assert_eq!(report.partition_values, scan.partition_values_options);
@@ -1543,6 +1544,7 @@ fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> Resu
                 event.table_id,
                 scan.snapshot.table_configuration().metadata().id()
             );
+            assert_eq!(event.table_path, scan.snapshot.table_root().as_str());
             let report = &event.metadata_planning;
             assert_eq!(report.stats, scan.stats);
             assert_eq!(report.partition_values, scan.partition_values_options);
@@ -1572,6 +1574,7 @@ fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> Resu
                     event.table_id,
                     scan.snapshot.table_configuration().metadata().id()
                 );
+                assert_eq!(event.table_path, scan.snapshot.table_root().as_str());
                 assert!(event.metadata_planning.replay_base.is_none());
                 assert!(event.checkpoint.is_none());
             },
