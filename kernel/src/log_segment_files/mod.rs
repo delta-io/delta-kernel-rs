@@ -19,7 +19,9 @@ use tracing::{debug, info, instrument, warn};
 use url::Url;
 
 use crate::last_checkpoint_hint::LastCheckpointHint;
-use crate::metrics::{CheckpointPartsMissing, CheckpointPartsMissingSource};
+use crate::metrics::{
+    CheckpointPartsMissing, CheckpointPartsMissingSource, emit_checkpoint_parts_missing,
+};
 use crate::path::LogPathFileType::*;
 use crate::path::{CheckpointInstance, LogPathFileType, ParsedLogPath};
 use crate::{KernelError, KernelResult, KernelResultIterator, StorageHandler, Version};
@@ -326,6 +328,23 @@ struct ListingAccumulator {
 }
 
 impl ListingAccumulator {
+    fn process_filesystem_file(&mut self, file: ParsedLogPath, log_tail_start: Option<Version>) {
+        // Even an overridden commit closes the preceding filesystem version group.
+        self.maybe_flush_and_advance(file.version);
+
+        // Track published commits even when the catalog's log tail overrides them.
+        if file.file_type == Commit {
+            self.output.max_published_version =
+                self.output.max_published_version.max(Some(file.version));
+        }
+
+        // The catalog is authoritative for commits; non-commit files still come from storage.
+        if file.is_commit() && log_tail_start.is_some_and(|start| file.version >= start) {
+            return;
+        }
+        self.process_file(file);
+    }
+
     fn process_file(&mut self, file: ParsedLogPath) {
         let usable = should_process_log_file(&file);
         // Empty multipart files still identify a candidate whose usable parts may all be absent.
@@ -476,7 +495,7 @@ impl ListingAccumulator {
 
     fn emit_incomplete_checkpoints(&mut self) {
         for missing in self.incomplete_checkpoints.drain(..) {
-            missing.emit();
+            emit_checkpoint_parts_missing(&missing);
         }
     }
 }
@@ -814,14 +833,12 @@ impl LogSegmentFiles {
                     ..Default::default()
                 };
                 for file in window_files {
-                    acc.maybe_flush_and_advance(file.version);
-                    acc.process_file(file);
+                    acc.process_filesystem_file(file, None);
                 }
                 // A newer window's boundary must not complete the failed window's partial group.
                 acc.discard_unfinished_group();
                 for file in windows.into_iter().rev().flatten() {
-                    acc.maybe_flush_and_advance(file.version);
-                    acc.process_file(file);
+                    acc.process_filesystem_file(file, None);
                 }
                 acc.finish();
                 return Err(error);
@@ -869,25 +886,7 @@ impl LogSegmentFiles {
         // filesystem — the log_tail only provides commit files.
         for file_result in fs_files {
             let file = file_result.inspect_err(|_| acc.report_failed_listing())?;
-            // Even an overridden commit closes the preceding filesystem version group.
-            acc.maybe_flush_and_advance(file.version);
-
-            // Track max published commit version from ALL filesystem Commit files,
-            // including those that will be skipped because log_tail takes precedence.
-            if matches!(file.file_type, LogPathFileType::Commit) {
-                acc.output.max_published_version =
-                    acc.output.max_published_version.max(Some(file.version));
-            }
-
-            // Skip filesystem commits at versions covered by the log_tail (the log_tail
-            // is authoritative for commits). Non-commit files are always kept.
-            if file.is_commit()
-                && log_tail_start_version.is_some_and(|tail_start| file.version >= tail_start)
-            {
-                continue;
-            }
-
-            acc.process_file(file);
+            acc.process_filesystem_file(file, log_tail_start_version);
         }
 
         // Phase 2: Process log_tail entries. We do this after Phase 1 because log_tail commits

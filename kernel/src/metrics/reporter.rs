@@ -332,8 +332,8 @@ mod tests {
     use uuid::Uuid;
 
     use crate::metrics::events::{
-        SNAPSHOT_COMPLETED_SPAN, SnapshotLoadMetricContext, emit_log_segment_load_failure,
-        emit_protocol_metadata_load_failure,
+        SNAPSHOT_COMPLETED_SPAN, SnapshotLoadMetricContext, emit_checkpoint_parts_missing,
+        emit_log_segment_load_failure, emit_protocol_metadata_load_failure,
     };
     use crate::metrics::{
         CheckpointOutputStats, CheckpointPartsMissing, CheckpointPartsMissingSource,
@@ -420,6 +420,14 @@ mod tests {
     ) {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        // The emitter and direct span attributes must produce the same diagnostic.
+        emit_checkpoint_parts_missing(&CheckpointPartsMissing {
+            source: expected,
+            version: 5,
+            expected_parts: 3,
+            found_parts: 0,
+        });
+        assert_eq!(reporter.events().len(), 1);
         {
             let span = info_span!(
                 "checkpoint_parts_missing",
@@ -438,39 +446,16 @@ mod tests {
             info!(error = %"enclosing failure does not change the diagnostic");
         }
         let events = reporter.events();
-        assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0].to_string(),
-            format!(
-                "CheckpointPartsMissing(source={expected}, version=5, \
-                 expected_parts=3, found_parts=0)"
-            )
-        );
-    }
-
-    #[rstest::rstest]
-    fn checkpoint_diagnostic_emits_source(
-        #[values(
-            CheckpointPartsMissingSource::Listing,
-            CheckpointPartsMissingSource::Hint,
-            CheckpointPartsMissingSource::Unknown
-        )]
-        source: CheckpointPartsMissingSource,
-    ) {
-        let reporter = Arc::new(CapturingReporter::default());
-        let _guard = install_thread_local_metrics_reporter(reporter.clone());
-        CheckpointPartsMissing {
-            source,
-            version: 5,
-            expected_parts: 3,
-            found_parts: 0,
+        assert_eq!(events.len(), 2);
+        for event in events {
+            assert_eq!(
+                event.to_string(),
+                format!(
+                    "CheckpointPartsMissing(source={expected}, version=5, \
+                     expected_parts=3, found_parts=0)"
+                )
+            );
         }
-        .emit();
-        let events = reporter.events();
-        let [MetricEvent::CheckpointPartsMissing(event)] = events.as_slice() else {
-            panic!("expected one checkpoint diagnostic: {events:?}");
-        };
-        assert_eq!(event.source, source);
     }
 
     #[test]
