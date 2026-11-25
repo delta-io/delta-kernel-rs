@@ -1669,8 +1669,8 @@ impl Snapshot {
         let segment = self.log_compaction_segment(start_version, end_version)?;
         let actions = MetadataPlanner::new(&segment, None, ActionSet::ALL, true)
             .with_stats(StatsOptions::json_only())
-            .replay()?
-            .plan
+            .replay()
+            .plan?
             .project_patch(|patch| {
                 // Replay ignores dataChange in compacted state; use true for both file actions.
                 patch

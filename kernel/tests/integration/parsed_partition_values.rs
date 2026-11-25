@@ -14,7 +14,7 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::{ColumnName, Expression, Predicate, Scalar, expr};
 #[cfg(feature = "declarative-plans")]
-use delta_kernel::metrics::{MetricEvent, ReplayBase, ScanPlanOutcome};
+use delta_kernel::metrics::{MetricEvent, ScanPlanOutcome};
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::parquet::arrow::ArrowWriter;
@@ -1013,11 +1013,8 @@ fn different_scans_require_timezone_support_only_for_timestamp_partitions(
         assert_eq!(report.partition_values.parsed_struct(), parsed_struct);
         assert_eq!(report.partition_values.timestamp_timezone(), Some(tz));
         assert!(!report.has_filter);
-        assert_eq!(
-            report.replay_base,
-            (!timestamp_partitioned).then_some(ReplayBase::Checkpoint)
-        );
-        assert_eq!(report.base_version, (!timestamp_partitioned).then_some(1));
+        assert_eq!(report.replay_base, None);
+        assert_eq!(report.base_version, None);
         assert_eq!(event.checkpoint.is_some(), !timestamp_partitioned);
         if let Some(checkpoint) = &event.checkpoint {
             assert!(checkpoint.duration_ns <= event.duration_ns);

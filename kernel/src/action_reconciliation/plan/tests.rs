@@ -128,8 +128,8 @@ async fn replay_selects_latest_action_without_retention(
         !snapshot.has_adaptive_metadata(),
     )
     .with_stats(StatsOptions::json_only())
-    .replay()?;
-    let state = planned.plan;
+    .replay();
+    let state = planned.plan?;
     let report = planned.metrics;
     assert!(report.stats.synthesize_json);
     assert!(!report.partition_values.parsed_struct);
@@ -357,10 +357,11 @@ fn report_retains_selected_inputs(
         .with_stats_filter(fail.then(|| col!("missing").eq(lit(0))))
         .replay();
     if fail {
-        assert!(planned.err().unwrap().to_string().contains("missing"));
-        return;
+        assert!(planned.plan.err().unwrap().to_string().contains("missing"));
+    } else {
+        assert!(planned.plan.is_ok());
     }
-    let report = planned.unwrap().metrics;
+    let report = planned.metrics;
     assert_eq!(report.replay_base, Some(base));
     assert_eq!(
         report.base_version,

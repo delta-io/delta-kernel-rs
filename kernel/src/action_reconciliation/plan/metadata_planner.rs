@@ -52,9 +52,9 @@ pub(crate) struct MetadataPlanner<'a> {
     pub(crate) stats_filter: Option<Predicate>,
 }
 
-/// A metadata plan and its metrics.
+/// A metadata plan result and the metrics collected while building it.
 pub(crate) struct MetadataPlanResult {
-    pub(crate) plan: PlanBuilder,
+    pub(crate) plan: KernelResult<PlanBuilder>,
     pub(crate) metrics: MetadataPlanningReport,
 }
 
@@ -135,27 +135,33 @@ impl<'a> MetadataPlanner<'a> {
         self
     }
 
-    /// Reconstructs requested actions with the configured stats and partition representations.
+    /// Consumes this planner to reconstruct requested actions, returning the plan result and
+    /// metrics. Selects an eligible CRC as the base, otherwise the checkpoint or commits alone.
     /// Uses the caller's resolved schemas and options; sources supply `version`.
     /// Checkpoint file actions require a resolved shape. Winning domain deletions are retained.
-    pub(crate) fn replay(self) -> KernelResult<MetadataPlanResult> {
-        let crc = self.crc_base();
+    /// Metrics retain observations made before an error.
+    pub(crate) fn replay(self) -> MetadataPlanResult {
+        let mut metrics = self.report();
+        let plan = self.replay_plan(&mut metrics);
+        MetadataPlanResult { plan, metrics }
+    }
+
+    fn replay_plan(&self, metrics: &mut MetadataPlanningReport) -> KernelResult<PlanBuilder> {
+        let crc = Self::crc_base(self.crc, self.segment.checkpoint_version, self.actions);
         let (replay_base, base_version) = match (crc, self.segment.checkpoint_version) {
             (Some((version, _)), _) => (ReplayBase::Crc, Some(version)),
             (None, Some(version)) => (ReplayBase::Checkpoint, Some(version)),
             (None, None) => (ReplayBase::Empty, None),
         };
-        let mut metrics = self.report();
         metrics.replay_base = Some(replay_base);
         metrics.base_version = base_version;
-        let commits = self.commit_actions(base_version, &mut metrics)?;
+        let commits = self.commit_actions(base_version, metrics)?;
         let checkpoint = if let Some((version, files)) = crc {
             self.crc_adds(version, files.to_vec())?
         } else {
-            self.checkpoint_actions(&mut metrics)?
+            self.checkpoint_actions(metrics)?
         };
-        let plan = self.replay_actions(commits, checkpoint)?;
-        Ok(MetadataPlanResult { plan, metrics })
+        self.replay_actions(commits, checkpoint)
     }
 
     fn report(&self) -> MetadataPlanningReport {
@@ -168,12 +174,16 @@ impl<'a> MetadataPlanner<'a> {
         }
     }
 
-    fn crc_base(&self) -> Option<(Version, &[Add])> {
-        let crc = self.crc?;
-        if self.actions != ActionSet::live_adds() {
+    /// Returns an eligible CRC base for the requested replay actions.
+    pub(crate) fn crc_base(
+        crc: Option<&Crc>,
+        checkpoint_version: Option<Version>,
+        actions: ActionSet,
+    ) -> Option<(Version, &[Add])> {
+        let crc = crc?;
+        if actions != ActionSet::live_adds() {
             return None;
         }
-        let checkpoint_version = self.segment.checkpoint_version;
         if checkpoint_version.is_some_and(|version| crc.version < version) {
             return None;
         }

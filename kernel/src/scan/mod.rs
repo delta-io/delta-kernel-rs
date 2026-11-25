@@ -46,6 +46,8 @@ use url::Url;
 
 use self::data_skipping::as_checkpoint_skipping_predicate;
 use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
+#[cfg(feature = "declarative-plans")]
+use crate::action_reconciliation::plan::action_set::ActionSet;
 use crate::actions::deletion_vector::{
     DeletionVectorDescriptor, deletion_treemap_to_bools, split_vector,
 };
@@ -67,7 +69,7 @@ use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::events::emit_scan_metadata_completed;
 #[cfg(feature = "declarative-plans")]
 use crate::metrics::{
-    MetadataPlanningReport, ReplayBase, ScanPlanOutcome, ScanPlanReport, emit_scan_plan_completed,
+    MetadataPlanningReport, ScanPlanOutcome, ScanPlanReport, emit_scan_plan_completed,
 };
 use crate::metrics::{MetricId, ScanType};
 use crate::parallel::sequential_phase::SequentialPhase;
@@ -1507,8 +1509,9 @@ impl Scan {
     /// Planning shares cached checkpoint metadata with
     /// [`crate::snapshot::SnapshotReader::get_checkpoint_info`], resolving the complete layout and
     /// leaf schema on first use or waiting for in-progress resolution. Manifest plans use the
-    /// resolved sidecar list. A statically empty scan skips checkpoint discovery. Returns `None`
-    /// when no Delta metadata matches this scan.
+    /// resolved sidecar list. A CRC at least as new as the checkpoint with `allFiles`, or a
+    /// statically empty scan, skips checkpoint discovery. Returns `None` when no Delta metadata
+    /// matches this scan.
     ///
     /// This method returns the metadata plan without executing it. A connector that consumes the
     /// resulting live `add` rows may run the plan through the generic
@@ -1586,15 +1589,20 @@ impl Scan {
             return Ok(None);
         }
 
-        let checkpoint_info =
-            if let Some(resolved) = self.snapshot.checkpoint_info_with_metrics(engine) {
-                report.metadata_planning.replay_base = Some(ReplayBase::Checkpoint);
-                report.metadata_planning.base_version = Some(resolved.metrics.version);
-                report.checkpoint = Some(resolved.metrics);
-                Some(resolved.result?)
-            } else {
-                None
-            };
+        let use_crc = scan_plan::MetadataPlanner::crc_base(
+            self.snapshot.base_crc().map(Arc::as_ref),
+            self.snapshot.log_segment().checkpoint_version,
+            ActionSet::live_adds(),
+        )
+        .is_some();
+        let checkpoint_info = if !use_crc
+            && let Some(resolved) = self.snapshot.checkpoint_info_with_metrics(engine)
+        {
+            report.checkpoint = Some(resolved.metrics);
+            Some(resolved.result?)
+        } else {
+            None
+        };
         let planner = scan_plan::MetadataPlanner::try_from_scan(self, checkpoint_info)?;
         self.build_metadata_scan_plan_with(planner, report)
     }

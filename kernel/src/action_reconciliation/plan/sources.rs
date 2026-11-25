@@ -318,8 +318,8 @@ mod tests {
             !snapshot.has_adaptive_metadata(),
         )
         .with_stats(StatsOptions::json_only())
-        .replay()?
-        .plan
+        .replay()
+        .plan?
         .build()?;
         // Then: file-action reads always use a complete static sidecar list.
         assert!(
