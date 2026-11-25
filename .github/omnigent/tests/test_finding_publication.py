@@ -356,7 +356,7 @@ class FindingPublicationTest(unittest.TestCase):
     def test_cut_diff_shows_file_totals_and_keeps_missing_paths_in_checks(self):
         coverage = {
             "base_sha": "b" * 40, "head_sha": HEAD_SHA,
-            "total_bytes": 120_000, "delivered_bytes": 100_000, "complete": False,
+            "total_bytes": 120_000, "excerpt_bytes": 100_000, "complete": False,
             "total_files": 3, "full_files": 1, "partial_files": 1, "omitted_files": 1,
             "files": [
                 {"path": "full.rs", "status": "full"},
@@ -368,7 +368,7 @@ class FindingPublicationTest(unittest.TestCase):
         record = publish(github, [finding()], coverage=coverage)
         self.assertTrue(record["complete"])
         main = github.issues[0]["body"]
-        self.assertIn("1 of 3 files fully delivered; 1 partial and 1 omitted", main)
+        self.assertIn("1 of 3 file sections fully included; 1 partial and 1 omitted", main)
         self.assertNotIn("Full Coverage", main)
         self.assertNotIn("Partial Coverage", main)
         self.assertNotIn("missing.rs", main)

@@ -58,7 +58,7 @@ class DiffCoverageTest(unittest.TestCase):
                     self.assertEqual(coverage["base_sha"], base_sha)
                     self.assertEqual(coverage["head_sha"], HEAD)
                     self.assertEqual(coverage["total_bytes"], size)
-                    self.assertEqual(coverage["delivered_bytes"], 100_000)
+                    self.assertEqual(coverage["excerpt_bytes"], 100_000)
                     self.assertEqual(coverage["complete"], complete)
                     self.assertLessEqual(len(prepared["subagent_patch_excerpt_text"].encode()), 100_000)
                     self.assertEqual(coverage["partial_files"], int(not complete))
@@ -84,7 +84,7 @@ class DiffCoverageTest(unittest.TestCase):
     def test_byte_limit_does_not_split_utf8_diff_or_description(self):
         raw = file_diff(size=99_999) + "é".encode()
         prepared = diff_coverage.prepare_review_inputs(raw, "é" * 5000, BASE, HEAD)
-        self.assertEqual(prepared["coverage"]["delivered_bytes"], 99_999)
+        self.assertEqual(prepared["coverage"]["excerpt_bytes"], 99_999)
         self.assertNotIn("�", prepared["subagent_patch_excerpt_text"])
         self.assertEqual(len(prepared["pr_description_excerpt_text"].encode()), 8192)
         self.assertTrue(prepared["pr_description_truncated"])

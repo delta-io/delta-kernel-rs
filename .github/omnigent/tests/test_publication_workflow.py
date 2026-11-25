@@ -65,7 +65,7 @@ class PublicationWorkflowTest(unittest.TestCase):
             )
             (root / "diff_coverage.json").write_text(json.dumps({
                 "base_sha": "b" * 40, "head_sha": "a" * 40, "complete": True,
-                "total_bytes": len(diff), "delivered_bytes": len(diff),
+                "total_bytes": len(diff), "excerpt_bytes": len(diff),
                 "total_files": 1, "full_files": 1, "partial_files": 0, "omitted_files": 0,
                 "files": [{"path": "file.rs", "start": 0, "end": len(diff), "status": "full"}],
             }))
