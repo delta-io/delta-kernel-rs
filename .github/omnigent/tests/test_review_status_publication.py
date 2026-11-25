@@ -163,8 +163,9 @@ class ReviewStatusPublicationTest(unittest.TestCase):
                 review_status = publish_status(github, arguments)
                 self.assertEqual(review_status["status"], "APPROVED WITH FEEDBACK")
                 self.assertEqual(review_status["counts"][severity], 1)
-                self.assertIn("New finding comments: 0 · Reused finding comments: 1",
-                              publication_check(REVIEW, arguments["publication"]))
+                self.assertEqual(arguments["publication"]["findings"][0]["delivery"], "reused")
+                self.assertNotIn("New finding comments:",
+                                 publication_check(REVIEW, arguments["publication"]))
                 main = github.issues[0]["body"]
                 self.assertIn("Status requirements met", main)
                 self.assertNotIn("Unmet status requirements", main)
@@ -239,8 +240,8 @@ class ReviewStatusPublicationTest(unittest.TestCase):
                 self.assertIsNone(output["delivery"])
                 self.assertEqual(output["placement"], mode)
                 report = publication_check(REVIEW, arguments["publication"])
-                self.assertIn(f"Findings in {mode} report: 1", report)
-                self.assertIn("New finding comments: 0 · Reused finding comments: 0", report)
+                self.assertIn("A concrete retained claim.", report)
+                self.assertNotIn("New finding comments:", report)
 
     def test_workflow_cli_retains_filtered_status_and_neutral_check_mirrors_it(self):
         repository = Path(__file__).resolve().parents[3]
@@ -301,12 +302,10 @@ class ReviewStatusPublicationTest(unittest.TestCase):
                         self.assertIn("A concrete retained claim.", final_check)
                         self.assertIn(prior_url, final_check)
                         self.assertIn("1 Blocker", final_check)
-                        self.assertIn(
-                            "New finding comments: 0 · Reused finding comments: 0", final_check
-                        )
-                        self.assertIn("Earlier finding references: 1", final_check)
+                        self.assertIn("Earlier final **[Blocker 1]**", final_check)
                     else:
-                        self.assertIn("New finding comments: 1 · Reused finding comments: 0", final_check)
+                        self.assertEqual(retained["delivery"], "new")
+                    self.assertNotIn("New finding comments:", final_check)
                     gh = root / "gh"
                     gh.write_text(
                         "#!/usr/bin/env python3\nimport pathlib, shutil, sys\n"

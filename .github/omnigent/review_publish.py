@@ -257,6 +257,12 @@ def format_status_check(review_status: dict[str, Any]) -> str:
         if reason.get("url"):
             text += f" [Earlier finding]({reason['url']})"
         parts.append("- " + text)
+    for finding in review_status.get("findings", []):
+        if finding.get("placement") == "history" and finding.get("url"):
+            parts.append(
+                f"Earlier final **{finding_label(finding['id'])}**: "
+                f"[Finding comment]({finding['url']})"
+            )
     if review_status["sensitive_paths"]:
         parts.append("Sensitive areas: " + ", ".join(
             f"<code>{escape(path)}</code>" for path in review_status["sensitive_paths"]
