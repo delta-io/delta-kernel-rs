@@ -75,6 +75,8 @@
 //! [`Engine`]: crate::Engine
 
 pub(crate) mod events;
+mod scan_plan;
+pub use scan_plan::{CheckpointMetrics, CheckpointSource, MetadataPlanningReport, ReplayBase};
 mod frame_reporter;
 mod metered_engine;
 mod metered_json;

@@ -7,6 +7,8 @@ use crate::actions::{ADD_NAME, Add, LOG_ADD_SCHEMA};
 use crate::checkpoint::{CheckpointInfo, CheckpointKind};
 use crate::expressions::{column_name, lit};
 use crate::log_segment::LogSegment;
+use crate::metrics::MetadataPlanningReport;
+use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::plans::ir::nodes::{FileType, ScanFile};
 use crate::schema::{DataType, SchemaRef, StructField};
 use crate::{KernelError, KernelResult, PlanBuilder, Version};
@@ -19,18 +21,28 @@ pub(crate) fn checkpoint_actions(
     checkpoint_info: Option<&CheckpointInfo>,
     actions: ActionSet,
     schema: SchemaRef,
+    report: &mut MetadataPlanningReport,
 ) -> KernelResult<PlanBuilder> {
     let Some((file_type, parts)) = segment.checkpoint_version_tagged_scan_files()? else {
         // The plan builder eliminates this empty relation from replay unions.
         return PlanBuilder::values(schema, vec![]);
     };
-    let scan = match file_type {
-        FileType::Json => PlanBuilder::scan_json,
-        FileType::Parquet => PlanBuilder::scan_parquet,
+    let mut scan = |files: Vec<ScanFile>, file_type, schema| {
+        let total = match file_type {
+            FileType::Json => &mut report.total_json_bytes,
+            FileType::Parquet => &mut report.total_parquet_bytes,
+        };
+        for file in &files {
+            *total = total.saturating_add(file.meta.size);
+        }
+        match file_type {
+            FileType::Json => PlanBuilder::scan_json(files, &[VERSION], schema),
+            FileType::Parquet => PlanBuilder::scan_parquet(files, &[VERSION], schema),
+        }
     };
     if !actions.contains_content_actions() {
         return if actions.contains_non_content_actions() {
-            scan(parts, &[VERSION], schema)
+            scan(parts, file_type, schema)
         } else {
             PlanBuilder::values(schema, vec![])
         };
@@ -38,7 +50,7 @@ pub(crate) fn checkpoint_actions(
     let info = checkpoint_info
         .ok_or_else(|| KernelError::schema("File reads require checkpoint information"))?;
     if info.kind() == CheckpointKind::Inline {
-        return scan(parts, &[VERSION], schema);
+        return scan(parts, file_type, schema);
     }
     let constants = parts
         .first()
@@ -48,13 +60,13 @@ pub(crate) fn checkpoint_actions(
         meta: file.clone(),
         file_constants: constants.clone(),
     });
-    let sidecar_files = PlanBuilder::scan_parquet(sidecars, &[VERSION], schema.clone())?;
+    let sidecar_files = scan(sidecars.collect(), FileType::Parquet, schema.clone())?;
     if !actions.contains_non_content_actions() {
         return Ok(sidecar_files);
     }
     PlanBuilder::union_all([
         sidecar_files.filter(actions.content_predicate(ActionSource::Checkpoint))?,
-        scan(parts, &[VERSION], schema)?.filter(actions.non_content_predicate())?,
+        scan(parts, file_type, schema)?.filter(actions.non_content_predicate())?,
     ])
 }
 
@@ -94,6 +106,7 @@ pub(crate) fn commit_arm(
     base_version: Option<Version>,
     schema: SchemaRef,
     use_compactions: bool,
+    report: &mut MetadataPlanningReport,
 ) -> KernelResult<PlanBuilder> {
     let commit_files = match base_version {
         Some(version) => log_segment
@@ -101,6 +114,25 @@ pub(crate) fn commit_arm(
             .commit_cover_version_tagged_scan_files(use_compactions)?,
         None => log_segment.commit_cover_version_tagged_scan_files(use_compactions)?,
     };
+    // The selected commit cover is newest first.
+    for file in &commit_files {
+        report.total_json_bytes = report.total_json_bytes.saturating_add(file.meta.size);
+        let Some(path) = ParsedLogPath::new(file.meta.location.clone()) else {
+            continue;
+        };
+        let end = match path.file_type {
+            LogPathFileType::CompactedCommit { hi } => {
+                report.compaction_file_count += 1;
+                hi
+            }
+            _ => path.version,
+        };
+        report.commit_start_version = Some(path.version);
+        report.commit_end_version.get_or_insert(end);
+        report.commit_total_size_bytes = report
+            .commit_total_size_bytes
+            .saturating_add(file.meta.size);
+    }
     PlanBuilder::scan_json(commit_files, &[VERSION], schema)
 }
 

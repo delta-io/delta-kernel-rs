@@ -15,6 +15,7 @@ use crate::expressions::{
     ColumnName, Expression as Expr, Predicate, UnaryExpressionOp, col, column_name, expr,
 };
 use crate::log_segment::LogSegment;
+use crate::metrics::{MetadataPlanningReport, ReplayBase};
 use crate::scan::{PartitionValuesOptions, StatsOptions, map_to_struct_options};
 use crate::schema::{
     CheckpointFieldKind, DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
@@ -47,6 +48,7 @@ pub(crate) struct MetadataPlanner<'a> {
     pub(crate) parsed_partition_schema: Option<SchemaRef>,
     pub(crate) read_collations: bool,
     pub(crate) stats_filter: Option<Predicate>,
+    report: MetadataPlanningReport,
 }
 
 /// The statistics representation present in a metadata plan.
@@ -73,6 +75,18 @@ impl<'a> MetadataPlanner<'a> {
             parsed_partition_schema: None,
             read_collations: false,
             stats_filter: None,
+            report: MetadataPlanningReport::default(),
+        }
+    }
+
+    /// Returns metadata planning metrics, including partial state on error.
+    pub(crate) fn report(&self) -> MetadataPlanningReport {
+        MetadataPlanningReport {
+            stats: self.stats.clone(),
+            partition_values: self.partitions.clone(),
+            read_collations: self.read_collations,
+            has_filter: self.stats_filter.is_some(),
+            ..self.report.clone()
         }
     }
 
@@ -121,10 +135,17 @@ impl<'a> MetadataPlanner<'a> {
         self
     }
 
+    // TODO(#4107): Consume the configured planner in replay instead of mutating source builders.
     /// Reconstructs requested actions with the configured stats and partition representations.
     /// Uses the caller's resolved schemas and options; sources supply `version`.
     /// Checkpoint file actions require a resolved shape. Winning domain deletions are retained.
-    pub(crate) fn replay(&self) -> KernelResult<PlanBuilder> {
+    pub(crate) fn replay(&mut self) -> KernelResult<PlanBuilder> {
+        self.report.replay_base = Some(if self.segment.checkpoint_version.is_some() {
+            ReplayBase::Checkpoint
+        } else {
+            ReplayBase::Empty
+        });
+        self.report.base_version = self.segment.checkpoint_version;
         let commits = self.commit_actions(self.segment.checkpoint_version)?;
         let checkpoint = self.checkpoint_actions()?;
         self.replay_actions(commits, checkpoint)
@@ -132,7 +153,13 @@ impl<'a> MetadataPlanner<'a> {
 
     /// Builds normalized live adds from a CRC with the supplied version and action key.
     /// Requires [`ActionSet::live_adds`].
-    pub(crate) fn crc_adds(&self, version: Version, files: Vec<Add>) -> KernelResult<PlanBuilder> {
+    pub(crate) fn crc_adds(
+        &mut self,
+        version: Version,
+        files: Vec<Add>,
+    ) -> KernelResult<PlanBuilder> {
+        self.report.replay_base = Some(ReplayBase::Crc);
+        self.report.base_version = Some(version);
         self.build_metadata_plan(ActionSource::Crc, None, |schema| {
             sources::crc_arm(files, version, self.actions, schema)
         })
@@ -161,11 +188,27 @@ impl<'a> MetadataPlanner<'a> {
     /// fields above. Parsed fields are omitted when unrequested or their schema is absent.
     /// JSON stats are retained or synthesized only when requested.
     /// Without tombstones, remove fields are omitted from the read, filter, and key.
-    pub(crate) fn checkpoint_actions(&self) -> KernelResult<PlanBuilder> {
+    pub(crate) fn checkpoint_actions(&mut self) -> KernelResult<PlanBuilder> {
+        self.report.replay_base = Some(if self.segment.checkpoint_version.is_some() {
+            ReplayBase::Checkpoint
+        } else {
+            ReplayBase::Empty
+        });
+        self.report.base_version = self.segment.checkpoint_version;
         let checkpoint_info = self.checkpoint_info.as_deref();
-        self.build_metadata_plan(ActionSource::Checkpoint, checkpoint_info, |schema| {
-            sources::checkpoint_actions(self.segment, checkpoint_info, self.actions, schema)
-        })
+        let mut report = std::mem::take(&mut self.report);
+        let result =
+            self.build_metadata_plan(ActionSource::Checkpoint, checkpoint_info, |schema| {
+                sources::checkpoint_actions(
+                    self.segment,
+                    checkpoint_info,
+                    self.actions,
+                    schema,
+                    &mut report,
+                )
+            });
+        self.report = report;
+        result
     }
 
     /// Builds commit actions and identity keys needed to reconstruct the requested state.
@@ -190,12 +233,21 @@ impl<'a> MetadataPlanner<'a> {
     /// JSON stats are retained or synthesized only when requested.
     /// Unrequested tombstones retain their rows and keys for replay without the remove payload.
     pub(crate) fn commit_actions(
-        &self,
+        &mut self,
         base_version: Option<Version>,
     ) -> KernelResult<PlanBuilder> {
-        self.build_metadata_plan(ActionSource::Commit, None, |schema| {
-            sources::commit_arm(self.segment, base_version, schema, self.use_compactions)
-        })
+        let mut report = std::mem::take(&mut self.report);
+        let result = self.build_metadata_plan(ActionSource::Commit, None, |schema| {
+            sources::commit_arm(
+                self.segment,
+                base_version,
+                schema,
+                self.use_compactions,
+                &mut report,
+            )
+        });
+        self.report = report;
+        result
     }
 
     /// Reads and filters selected actions, attaches their identity key, then prepares metadata.
