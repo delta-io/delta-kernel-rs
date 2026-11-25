@@ -62,7 +62,7 @@ def previous_inline_comments(
     """Return inline comments belonging to marked bot-authored reviews."""
     comments: list[dict[str, str | int]] = []
     for review in _review_nodes(document):
-        if not _is_marked_bot_entry(review, trusted_bot_logins):
+        if not is_marked_bot_entry(review, trusted_bot_logins):
             continue
         for comment in _nodes(review.get("comments")):
             path = comment.get("path")
@@ -102,12 +102,38 @@ def canonical_finding_body(body: str) -> str:
     return _normalize(_FINDING_PREFIX.sub("", body.strip()))
 
 
+def is_marked_bot_entry(
+    entry: Any, trusted_bot_logins: Collection[str] = DEFAULT_TRUSTED_BOT_LOGINS
+) -> bool:
+    """Return whether a trusted bot authored a comment or review with the AI review marker."""
+    if not isinstance(entry, dict):
+        return False
+    author = entry.get("author")
+    body = entry.get("body")
+    author_login = _normalize_bot_login(
+        author.get("login") if isinstance(author, dict) else None
+    )
+    trusted_logins = {
+        normalized
+        for login in trusted_bot_logins
+        if (normalized := _normalize_bot_login(login))
+    }
+    return (
+        isinstance(author, dict)
+        and author.get("__typename") == "Bot"
+        and bool(author_login)
+        and author_login in trusted_logins
+        and isinstance(body, str)
+        and body.lstrip().startswith(BOT_MARKER)
+    )
+
+
 def _bot_review_entries(
     document: Any, trusted_bot_logins: Collection[str]
 ) -> list[str]:
     entries: list[tuple[str, str]] = []
     for comment in _issue_comment_nodes(document):
-        if _is_marked_bot_entry(comment, trusted_bot_logins):
+        if is_marked_bot_entry(comment, trusted_bot_logins):
             entries.append(
                 (
                     _timestamp(comment, "createdAt"),
@@ -115,7 +141,7 @@ def _bot_review_entries(
                 )
             )
     for review in _review_nodes(document):
-        if not _is_marked_bot_entry(review, trusted_bot_logins):
+        if not is_marked_bot_entry(review, trusted_bot_logins):
             continue
         parts = [_clean_published_body(review["body"])]
         for comment in _nodes(review.get("comments")):
@@ -139,34 +165,9 @@ def _bot_review_bodies(
 ) -> list[str]:
     bodies: list[str] = []
     for entry in [*_issue_comment_nodes(document), *_review_nodes(document)]:
-        if _is_marked_bot_entry(entry, trusted_bot_logins):
+        if is_marked_bot_entry(entry, trusted_bot_logins):
             bodies.append(_clean_published_body(entry["body"]))
     return bodies
-
-
-def _is_marked_bot_entry(
-    entry: Any, trusted_bot_logins: Collection[str]
-) -> bool:
-    if not isinstance(entry, dict):
-        return False
-    author = entry.get("author")
-    body = entry.get("body")
-    author_login = _normalize_bot_login(
-        author.get("login") if isinstance(author, dict) else None
-    )
-    trusted_logins = {
-        normalized
-        for login in trusted_bot_logins
-        if (normalized := _normalize_bot_login(login))
-    }
-    return (
-        isinstance(author, dict)
-        and author.get("__typename") == "Bot"
-        and bool(author_login)
-        and author_login in trusted_logins
-        and isinstance(body, str)
-        and body.lstrip().startswith(BOT_MARKER)
-    )
 
 
 def _normalize_bot_login(login: Any) -> str:

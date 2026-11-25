@@ -1,0 +1,43 @@
+name: AI Review Comment Resolver
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+  workflow_call:
+    inputs:
+      pr:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: PR number to recheck after resolving threads or adding reactions
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: write
+
+concurrency:
+  group: ai-review-comment-resolver-${{ github.event.pull_request.number || inputs.pr }}
+  cancel-in-progress: false
+
+jobs:
+  evaluate:
+    name: Evaluate AI review feedback
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # Use the caller's base or dispatch ref, never the PR head.
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check inline AI findings
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr }}
+          MIN_ADDRESSED_PERCENT: ${{ vars.AI_REVIEW_MIN_ADDRESSED_PERCENT || '100' }}
+        run: python3 .github/omnigent/review_feedback.py
