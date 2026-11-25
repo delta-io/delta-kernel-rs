@@ -517,6 +517,8 @@ void print_metric(MetricEvent event) {
   case MetricEventDomainMetadataLoadSuccess:
     PM_START(DomainMetadataLoadSuccess);
     DomainMetadataLoadSuccess dmls = event.domain_metadata_load_success;
+    PM_ID(dmls, operation_id);
+    PM_SLICE(dmls, correlation_id);
     PM_BOOL(dmls, from_cache);
     PM_U64(dmls, num_domains_returned);
     PM_U64(dmls, duration_ns);
@@ -525,6 +527,9 @@ void print_metric(MetricEvent event) {
 
   case MetricEventDomainMetadataLoadFailure:
     PM_START(DomainMetadataLoadFailure);
+    ReadFailure dmlf = event.domain_metadata_load_failure;
+    PM_ID(dmlf, operation_id);
+    PM_SLICE(dmlf, correlation_id);
     PM_END;
     return;
 
@@ -545,6 +550,8 @@ void print_metric(MetricEvent event) {
   case MetricEventCrcReadSuccess:
     PM_START(CrcReadSuccess);
     CrcReadSuccess crs = event.crc_read_success;
+    PM_ID(crs, operation_id);
+    PM_SLICE(crs, correlation_id);
     PM_U64(crs, bytes_read);
     PM_U64(crs, duration_ns);
     PM_END;
@@ -552,6 +559,9 @@ void print_metric(MetricEvent event) {
 
   case MetricEventCrcReadFailure:
     PM_START(CrcReadFailure);
+    ReadFailure crf = event.crc_read_failure;
+    PM_ID(crf, operation_id);
+    PM_SLICE(crf, correlation_id);
     PM_END;
     return;
 
@@ -676,6 +686,8 @@ void print_metric(MetricEvent event) {
   case MetricEventLastCheckpointReadCompleted:
     PM_START(LastCheckpointReadCompleted);
     LastCheckpointReadCompleted hint = event.last_checkpoint_read_completed;
+    PM_ID(hint, operation_id);
+    PM_SLICE(hint, correlation_id);
     printf("  outcome:");
     switch (hint.outcome) {
     case LastCheckpointReadOutcomeSuccess: printf(" Success,\n"); break;
