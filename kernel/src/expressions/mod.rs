@@ -442,10 +442,22 @@ pub struct CaseWhenExpression {
 /// inverse of [`UnaryExpressionOp::ToJson`] except for the sub-millisecond timestamp precision
 /// that operator discards unless `full_precision_timestamps` is set.
 ///
+/// A SQL NULL input or the JSON literal `null` produces a NULL struct. Required fields are
+/// checked only for present objects.
+///
+/// For `p = ParseJson(input)` with a nullable `a: BIGINT` and successful batch decoding:
+///
+/// | Input          | `p`         | `p IS NULL` | `COALESCE(p, {a: 42})` |
+/// | -------------- | ----------- | ----------- | ---------------------- |
+/// | SQL `NULL`     | `NULL`      | `true`      | `{a: 42}`              |
+/// | `'{}'`         | `{a: NULL}` | `false`     | `{a: NULL}`            |
+/// | `'{"a":null}'` | `{a: NULL}` | `false`     | `{a: NULL}`            |
+/// | `'{"a":1}'`    | `{a: 1}`    | `false`     | `{a: 1}`               |
+///
 /// Unparseable input must degrade to NULL rather than fail the query, because kernel parses
 /// `add.stats` with this operator and data skipping reads null stats as "include the file". The
-/// required part is that it does not error; whether a given row comes back as a null struct or as a
-/// struct of null fields is unspecified, since data skipping treats the two alike.
+/// required part is that it does not error; whether an unparseable row comes back as a null struct
+/// or as a struct of null fields is unspecified, since data skipping treats the two alike.
 ///
 /// An empty string is not valid JSON here, so it is unparseable. This operator does not share
 /// [`MapToStructExpression`]'s empty-string-to-NULL behavior. It is SQL `from_json(json_expr,
@@ -458,8 +470,7 @@ pub struct CaseWhenExpression {
 /// decoding them as strings and safe-casting back, so a bad value in one of those degrades to a
 /// NULL for that field alone. Anything the workaround does not cover, namely structurally invalid
 /// JSON and a type mismatch on any other leaf, falls back to nulling the entire batch rather than
-/// the offending row. A NULL input decodes as `{}`, leaving every field NULL without disturbing the
-/// rest of the batch.
+/// the offending row.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ParseJsonExpression {
     /// The expression that evaluates to a STRING column containing JSON objects.

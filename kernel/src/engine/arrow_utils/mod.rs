@@ -18,8 +18,8 @@ use self::file_type_validation::validate_file_values_for_read;
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::{
     Array as ArrowArray, ArrayRef as ArrowArrayRef, GenericListArray, GenericListViewArray,
-    MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, RecordBatchOptions, StringArray,
-    StructArray, make_array, new_null_array,
+    MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StringArray, StructArray, make_array,
+    new_empty_array, new_null_array,
 };
 use crate::arrow::buffer::NullBuffer;
 use crate::arrow::compute::{CastOptions, cast_with_options};
@@ -1263,7 +1263,7 @@ pub(crate) fn fix_record_batch_nested_null_masks(batch: RecordBatch) -> KernelRe
     Ok(RecordBatch::try_new_with_options(
         schema,
         columns,
-        &RecordBatchOptions::new().with_row_count(Some(row_count)),
+        &crate::arrow::array::RecordBatchOptions::new().with_row_count(Some(row_count)),
     )?)
 }
 
@@ -1339,64 +1339,86 @@ pub(crate) fn parse_json_impl(
     json_strings: &dyn ArrowArray,
     schema: SchemaRef,
 ) -> KernelResult<RecordBatch> {
+    // A RecordBatch holds top-level columns and requires every row to have a present root.
+    parse_json_struct(json_strings, &schema, false).map(RecordBatch::from)
+}
+
+/// Parses JSON objects into a nullable struct column.
+///
+/// See [`ParseJsonExpression`](crate::expressions::ParseJsonExpression) for NULL-input examples.
+///
+/// # Errors
+///
+/// Returns an error if the input is not a string array or the batch cannot be decoded.
+pub(crate) fn parse_json_to_struct(
+    json_strings: &dyn ArrowArray,
+    schema: SchemaRef,
+) -> KernelResult<StructArray> {
+    parse_json_struct(json_strings, &schema, true)
+}
+
+/// Decodes one struct per string, validating required children only under present parents.
+fn parse_json_struct(
+    json_strings: &dyn ArrowArray,
+    schema: &StructType,
+    nullable_root: bool,
+) -> KernelResult<StructArray> {
+    let target_fields = ArrowSchema::try_from_kernel(schema)?.fields;
+    // Decode failure-prone leaves as strings so a bad timestamp, date, or decimal can be
+    // safe-cast to NULL without losing other values in the batch.
+    let decode_fields = match StringifyFailureProneLeaves.transform_struct(schema) {
+        Cow::Borrowed(_) => target_fields.clone(),
+        Cow::Owned(relaxed) => ArrowSchema::try_from_kernel(&relaxed)?.fields,
+    };
+    let root = ArrowField::new_struct("parsed", decode_fields, nullable_root);
     let num_rows = json_strings.len();
-    match json_strings.data_type() {
+    let decoded = match json_strings.data_type() {
         ArrowDataType::Utf8 => {
-            parse_json_inner(json_strings.as_string::<i32>().iter(), num_rows, schema)
+            decode_with_arrow_json(json_strings.as_string::<i32>().iter(), num_rows, root)
         }
         ArrowDataType::LargeUtf8 => {
-            parse_json_inner(json_strings.as_string::<i64>().iter(), num_rows, schema)
+            decode_with_arrow_json(json_strings.as_string::<i64>().iter(), num_rows, root)
         }
         ArrowDataType::Utf8View => {
-            parse_json_inner(json_strings.as_string_view().iter(), num_rows, schema)
+            decode_with_arrow_json(json_strings.as_string_view().iter(), num_rows, root)
         }
         dt => Err(KernelError::generic(format!(
             "Expected string array for JSON parsing, got {dt}"
         ))),
-    }
+    }?;
+    let parsed = cast_array_to_type(
+        decoded,
+        &ArrowDataType::Struct(target_fields),
+        &CastOptions {
+            safe: true,
+            ..Default::default()
+        },
+    )?;
+    parsed
+        .as_struct_opt()
+        .cloned()
+        .ok_or_else(|| KernelError::internal_error("JSON decoder returned a non-struct array"))
 }
 
-fn parse_json_inner<'a>(
-    json_strings: impl Iterator<Item = Option<&'a str>>,
-    num_rows: usize,
-    schema: SchemaRef,
-) -> KernelResult<RecordBatch> {
-    // arrow-json's typed Timestamp/TimestampNtz/Date/Decimal decoders fail the entire batch
-    // on a single bad cell, so rewrite those leaves to `String` first and safe-cast back to
-    // the target type. `Cow::Borrowed` means nothing was rewritten; skip the cast pass.
-    match StringifyFailureProneLeaves.transform_struct(schema.as_ref()) {
-        Cow::Borrowed(_) => {
-            let arrow_target = Arc::new(ArrowSchema::try_from_kernel(schema.as_ref())?);
-            decode_with_arrow_json(json_strings, num_rows, arrow_target)
-        }
-        Cow::Owned(relaxed) => {
-            let arrow_target = Arc::new(ArrowSchema::try_from_kernel(schema.as_ref())?);
-            let arrow_relaxed = Arc::new(ArrowSchema::try_from_kernel(&relaxed)?);
-            let decoded = decode_with_arrow_json(json_strings, num_rows, arrow_relaxed)?;
-            safe_cast_back(decoded, &arrow_target)
-        }
-    }
-}
-
-/// Runs arrow-json's typed `Decoder` against the given schema and returns the resulting
-/// `RecordBatch`. Each input string must contain exactly one JSON object; missing inputs
-/// (`None`) decode as `{}` so the row stays present with all-NULL fields.
+/// Decodes a single root struct per input string. A missing input is a JSON null for a nullable
+/// root and an empty object when decoding the top-level columns of a record batch.
 fn decode_with_arrow_json<'a>(
     json_strings: impl Iterator<Item = Option<&'a str>>,
     num_rows: usize,
-    schema: ArrowSchemaRef,
-) -> KernelResult<RecordBatch> {
+    root: ArrowField,
+) -> KernelResult<ArrowArrayRef> {
     if num_rows == 0 {
-        return Ok(RecordBatch::new_empty(schema));
+        return Ok(new_empty_array(root.data_type()));
     }
 
-    let mut decoder = ReaderBuilder::new(schema)
+    let missing_input = if root.is_nullable() { "null" } else { "{}" };
+    let mut decoder = ReaderBuilder::new_with_field(root)
         .with_batch_size(num_rows)
         .with_coerce_primitive(true)
         .build_decoder()?;
 
     for (json, row_number) in json_strings.zip(1..) {
-        let line = json.unwrap_or("{}");
+        let line = json.unwrap_or(missing_input);
         let consumed = decoder.decode(line.as_bytes())?;
         // did we fail to decode the whole line, or was the line partial
         if consumed != line.len() || decoder.has_partial_record() {
@@ -1420,7 +1442,7 @@ fn decode_with_arrow_json<'a>(
                 num_rows
             )));
         }
-        return Ok(batch);
+        return Ok(batch.column(0).clone());
     }
     Err(KernelError::generic(
         "Malformed JSON: exited parse_json_impl without deserializing anything useful",
@@ -1456,26 +1478,6 @@ impl<'a> SchemaTransform<'a> for StringifyFailureProneLeaves {
     fn transform_variant(&mut self, stype: &'a StructType) -> Cow<'a, StructType> {
         Cow::Borrowed(stype)
     }
-}
-
-/// Safe-casts each column of `decoded` back to its target type. `safe: true` produces
-/// per-cell NULL on parse failure rather than failing the whole batch.
-fn safe_cast_back(decoded: RecordBatch, target: &ArrowSchemaRef) -> KernelResult<RecordBatch> {
-    let opts = CastOptions {
-        safe: true,
-        ..Default::default()
-    };
-    let (_, columns, row_count) = decoded.into_parts();
-    let columns = columns
-        .into_iter()
-        .zip(target.fields().iter())
-        .map(|(arr, field)| cast_array_to_type(arr, field.data_type(), &opts))
-        .collect::<KernelResult<Vec<_>>>()?;
-    Ok(RecordBatch::try_new_with_options(
-        target.clone(),
-        columns,
-        &RecordBatchOptions::new().with_row_count(Some(row_count)),
-    )?)
 }
 
 /// Casts each column to the type of the `target` field at the same position, so the columns can be
@@ -1915,6 +1917,15 @@ mod tests {
         assert_eq!(batch.num_rows(), 1);
         let long_col = batch.column(0).as_string::<i32>();
         assert_eq!(long_col.value(0), long_string);
+    }
+
+    #[rstest]
+    fn test_parse_json_record_batch_rejects_null_row_with_required_field(
+        #[values(None, Some("null"))] missing: Option<&str>,
+    ) {
+        let input = StringArray::from(vec![missing, Some(r#"{"a":1}"#)]);
+        let schema = schema_ref! { not_null "a": LONG };
+        assert!(parse_json_impl(&input, schema).is_err());
     }
 
     #[test]

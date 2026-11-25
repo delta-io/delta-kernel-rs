@@ -719,7 +719,7 @@ mod tests {
 
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
-    use crate::arrow::array::StructArray;
+    use crate::arrow::array::{AsArray, StructArray};
     use crate::arrow::buffer::{BooleanBuffer, NullBuffer};
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field};
     use crate::engine::sync::get_bytes;
@@ -1068,6 +1068,62 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(values.iter().collect::<Vec<_>>(), [Some(7)]);
+        Ok(())
+    }
+
+    #[test]
+    fn project_parse_json_preserves_null_root_and_coalesce_fallback() -> KernelResult<()> {
+        let stats_schema = schema_ref! { nullable "numRecords": LONG };
+        let output_schema = schema_ref! { nullable "stats_parsed": (stats_schema.clone()) };
+        let plan = PlanBuilder::values(
+            schema_ref! { nullable "stats": STRING },
+            vec![
+                vec![Scalar::null(DataType::STRING)],
+                vec!["{}".into()],
+                vec![r#"{"numRecords":7}"#.into()],
+            ],
+        )?
+        .project(
+            Expression::struct_from([Expression::parse_json(col!("stats"), stats_schema.clone())]),
+            output_schema,
+        )?
+        .project(
+            Expression::struct_from([
+                col!("stats_parsed"),
+                Predicate::is_null(col!("stats_parsed")).into(),
+                Expression::coalesce([
+                    col!("stats_parsed"),
+                    Expression::parse_json(lit(r#"{"numRecords":42}"#), stats_schema.clone()),
+                ]),
+            ]),
+            schema_ref! {
+                nullable "parsed": (stats_schema.clone()),
+                not_null "missing": BOOLEAN,
+                nullable "with_fallback": (stats_schema),
+            },
+        )?
+        .build()?;
+        let batches = SyncPlanExecutor::default().eval_plan(plan, None)?;
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 3);
+        let parsed = batch.column(0).as_struct();
+        assert_eq!(parsed.null_count(), 1);
+        assert!(parsed.is_null(0));
+        assert_eq!(
+            parsed.column(0).as_ref(),
+            &Int64Array::from(vec![None, None, Some(7)]),
+        );
+        assert_eq!(
+            batch.column(1).as_ref(),
+            &BooleanArray::from(vec![true, false, false]),
+        );
+        let with_fallback = batch.column(2).as_struct();
+        assert_eq!(with_fallback.null_count(), 0);
+        assert_eq!(
+            with_fallback.column(0).as_ref(),
+            &Int64Array::from(vec![Some(42), None, Some(7)]),
+        );
         Ok(())
     }
 
