@@ -136,9 +136,11 @@ impl CommitRange {
 
     /// Iterator over the range's commit files in ascending version order.
     ///
-    /// With `fail_on_data_loss` enabled, the iterator returns an error when a later observed commit
-    /// proves a version in the requested range is missing, and ends after that error. Otherwise,
-    /// available files are yielded across gaps.
+    /// With `fail_on_data_loss` enabled, a missing start version yields
+    /// [`KernelError::StartVersionNotFound`] and a later gap yields
+    /// [`KernelError::MissingVersion`]. Either is reported only when a later observed commit
+    /// proves it, and the iterator ends after that error. Otherwise, available files are
+    /// yielded across gaps.
     ///
     /// Returns [`KernelError::CommitRange`] if the range was not built with
     /// [`CommitOrdering::AscendingOrder`].
@@ -1482,9 +1484,13 @@ mod tests {
         assert_eq!(files.next().unwrap().unwrap().version, 5);
         assert_eq!(files.next().unwrap().unwrap().version, 6);
         match missing_version.filter(|_| fail_on_data_loss) {
-            Some(expected) => assert!(
-                matches!(files.next().unwrap(), Err(KernelError::MissingVersion(actual)) if actual == expected)
-            ),
+            Some(expected) => {
+                let error = files.next().unwrap().unwrap_err();
+                assert!(
+                    matches!(error.without_backtrace(), KernelError::MissingVersion(actual) if *actual == expected),
+                    "{error:?}"
+                );
+            }
             None => assert!(files.next().is_none()),
         }
         assert!(files.next().is_none());

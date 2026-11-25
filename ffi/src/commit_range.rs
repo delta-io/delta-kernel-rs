@@ -616,7 +616,8 @@ fn commit_range_commit_files_impl(
 /// Call `engine_visitor` once with the next commit file, returning `true` if a file was yielded
 /// and `false` once the iterator is exhausted. When the range was built with `fail_on_data_loss`
 /// enabled, a missing start version or a gap through the range's end version surfaces as an error
-/// from this call. Iteration is fused after the first error: later calls return `false`.
+/// from this call, provided an observed later commit proves the gap. Iteration is fused after the
+/// first error: later calls return `false`.
 ///
 /// The [`FfiCommitFile`] pointer and the location string it references are valid only until the
 /// visitor returns. The visitor must not retain them.
@@ -1227,35 +1228,60 @@ mod tests {
     }
 
     #[rstest]
-    #[case::no_fail_on_data_loss_skips_gap(vec![0, 1, 3], None, false, &[0, 1, 3], None)]
+    #[case::no_fail_on_data_loss_skips_gap(vec![0, 1, 3], 0, None, false, &[0, 1, 3], None)]
     #[case::fail_on_data_loss_reports_gap(
         vec![0, 1, 3],
+        0,
         None,
         true,
         &[0, 1],
-        Some("Table version 2 is missing or unavailable for this log operation.")
+        Some((
+            FFIKernelError::MissingVersionError,
+            "Table version 2 is missing or unavailable for this log operation."
+        ))
     )]
-    #[case::fail_on_data_loss_ends_without_proven_gap(vec![0, 1], Some(2), true, &[0, 1], None)]
+    #[case::fail_on_data_loss_ends_without_proven_gap(vec![0, 1], 0, Some(2), true, &[0, 1], None)]
     #[case::fail_on_data_loss_reports_proven_missing_end_version(
         vec![0, 1, 3],
+        0,
         Some(2),
         true,
         &[0, 1],
-        Some("Table version 2 is missing or unavailable for this log operation.")
+        Some((
+            FFIKernelError::MissingVersionError,
+            "Table version 2 is missing or unavailable for this log operation."
+        ))
     )]
+    #[case::empty_table(vec![], 0, Some(2), true, &[], None)]
+    #[case::empty_range(vec![0, 1], 2, None, true, &[], None)]
+    #[case::reversed_start_present(vec![2, 3], 2, Some(1), true, &[], None)]
+    #[case::reversed_empty(vec![1], 2, Some(1), true, &[], None)]
+    #[case::reversed_start_missing(
+        vec![3],
+        2,
+        Some(1),
+        true,
+        &[],
+        Some((
+            FFIKernelError::StartVersionNotFound,
+            "Start version 2 is not available; earliest available version is 3."
+        ))
+    )]
+    #[case::reversed_start_missing_without_data_loss_check(vec![3], 2, Some(1), false, &[], None)]
     #[tokio::test]
-    async fn test_commit_range_commit_files_relaxed_range_with_gap(
+    async fn test_commit_range_commit_files_relaxed_range(
         #[case] commit_versions: Vec<Version>,
+        #[case] start_version: Version,
         #[case] end_version: Option<Version>,
         #[case] fail_on_data_loss: bool,
         #[case] expected_versions: &[Version],
-        #[case] expected_error: Option<&str>,
+        #[case] expected_error: Option<(FFIKernelError, &str)>,
     ) -> KernelResult<()> {
         let (engine, table_root) = setup_engine_with_commit_versions(commit_versions).await;
         let mut builder = unsafe {
             ok_or_panic(commit_range_builder_for(
                 kernel_string_slice!(table_root),
-                0,
+                start_version,
                 engine.shallow_copy(),
             ))
         };
@@ -1300,11 +1326,9 @@ mod tests {
             commit_range_commit_files_next(iter.shallow_copy(), ctx, commit_file_visitor)
         };
         match expected_error {
-            Some(message) => assert_extern_result_error_with_message(
-                last,
-                FFIKernelError::MissingVersionError,
-                Some(message),
-            ),
+            Some((error, message)) => {
+                assert_extern_result_error_with_message(last, error, Some(message));
+            }
             None => assert!(!ok_or_panic(last)),
         }
         // Exhausted, or fused after the error.

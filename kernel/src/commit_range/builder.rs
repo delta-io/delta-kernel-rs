@@ -115,7 +115,9 @@ impl CommitRangeBuilder {
     ///
     /// When `true`, a missing start version or a gap through the end version surfaces as an error
     /// when `CommitRange::commit_files` reaches it, provided an observed later commit proves the
-    /// gap. When `false`, available commit files are yielded across gaps.
+    /// gap. Without an explicit end version or maximum catalog version, the range ends at the
+    /// last listed commit, so a trailing gap cannot be detected. When `false`, available commit
+    /// files are yielded across gaps.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn with_fail_on_data_loss(mut self, fail_on_data_loss: bool) -> Self {
@@ -156,21 +158,31 @@ impl CommitRangeBuilder {
             fail_on_data_loss,
         } = self;
         let configured_end_version = end_version.or(max_catalog_version);
-        let (mut commit_files, end_version, first_version_after_end) = match snapshot {
+        let ResolvedCommitFiles {
+            mut commit_files,
+            end_version,
+            first_version_after_end,
+        } = match snapshot {
             Some(snapshot) => Self::resolve_snapshot_files(
                 snapshot,
                 log_tail,
                 start_version,
                 configured_end_version,
             )?,
-            None => Self::list_commit_files(
+            None if commit_range_validation => Self::list_commit_files(
+                engine,
+                &log_root,
+                log_tail,
+                start_version,
+                configured_end_version,
+            )?,
+            None => Self::list_relaxed_commit_files(
                 engine,
                 &log_root,
                 log_tail,
                 start_version,
                 configured_end_version,
                 max_catalog_version,
-                commit_range_validation,
             )?,
         };
 
@@ -226,7 +238,7 @@ impl CommitRangeBuilder {
         log_tail: Vec<ParsedLogPath>,
         start_version: Version,
         configured_end_version: Option<Version>,
-    ) -> KernelResult<(Vec<ParsedLogPath>, Version, Option<Version>)> {
+    ) -> KernelResult<ResolvedCommitFiles> {
         let log_segment = snapshot.log_segment();
         let end_version = configured_end_version.unwrap_or(log_segment.end_version);
         let tail_start_version = log_tail.first().map(|path| path.version);
@@ -240,7 +252,11 @@ impl CommitRangeBuilder {
             .filter(|path| path.version >= start_version && path.version <= end_version)
             .collect();
         commit_files.sort_unstable_by_key(|path| path.version);
-        Ok((commit_files, end_version, None))
+        Ok(ResolvedCommitFiles {
+            commit_files,
+            end_version,
+            first_version_after_end: None,
+        })
     }
 
     fn list_commit_files(
@@ -249,19 +265,7 @@ impl CommitRangeBuilder {
         log_tail: Vec<ParsedLogPath>,
         start_version: Version,
         configured_end_version: Option<Version>,
-        max_catalog_version: Option<Version>,
-        commit_range_validation: bool,
-    ) -> KernelResult<(Vec<ParsedLogPath>, Version, Option<Version>)> {
-        if !commit_range_validation {
-            return Self::list_relaxed_commit_files(
-                engine,
-                log_root,
-                log_tail,
-                start_version,
-                configured_end_version,
-                max_catalog_version,
-            );
-        }
+    ) -> KernelResult<ResolvedCommitFiles> {
         let commit_files = LogSegmentFiles::list_commits(
             engine.storage_handler().as_ref(),
             log_root,
@@ -272,7 +276,11 @@ impl CommitRangeBuilder {
         .ascending_commit_files;
         let last_version = commit_files.last().ok_or(KernelError::EmptyLog)?.version;
         let end_version = configured_end_version.unwrap_or(last_version);
-        Ok((commit_files, end_version, None))
+        Ok(ResolvedCommitFiles {
+            commit_files,
+            end_version,
+            first_version_after_end: None,
+        })
     }
 
     fn list_relaxed_commit_files(
@@ -282,7 +290,7 @@ impl CommitRangeBuilder {
         start_version: Version,
         configured_end_version: Option<Version>,
         max_catalog_version: Option<Version>,
-    ) -> KernelResult<(Vec<ParsedLogPath>, Version, Option<Version>)> {
+    ) -> KernelResult<ResolvedCommitFiles> {
         let tail_start = log_tail
             .iter()
             .find(|file| file.version >= start_version)
@@ -335,7 +343,11 @@ impl CommitRangeBuilder {
         let end_version = configured_end_version
             .or_else(|| commit_files.last().map(|file| file.version))
             .unwrap_or(start_version);
-        Ok((commit_files, end_version, first_version_after_end))
+        Ok(ResolvedCommitFiles {
+            commit_files,
+            end_version,
+            first_version_after_end,
+        })
     }
 
     fn validate_complete_range(
@@ -381,6 +393,12 @@ pub enum CommitOrdering {
     AscendingOrder,
     /// Yield commits in decreasing version order (e.g. `v=N, v=N-1, ..., v=0`).
     DescendingOrder,
+}
+
+struct ResolvedCommitFiles {
+    commit_files: Vec<ParsedLogPath>,
+    end_version: Version,
+    first_version_after_end: Option<Version>,
 }
 
 fn validate_version_range(start: Version, end: Version) -> KernelResult<()> {
