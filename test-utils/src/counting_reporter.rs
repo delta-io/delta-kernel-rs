@@ -427,7 +427,6 @@ impl MetricsReporter for CountingReporter {
             | MetricEvent::ProtocolMetadataLoadFailure(_)
             | MetricEvent::LogSegmentLoadFailure(_)
             | MetricEvent::CrcReadFailure(_)
-            | MetricEvent::CheckpointPartsMissing(_)
             | MetricEvent::CheckpointWriteSuccess(_)
             | MetricEvent::CheckpointWriteFailure(_)
             | MetricEvent::ChecksumWriteSuccess(_)

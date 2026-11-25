@@ -91,17 +91,14 @@ mod tests {
     use tracing_subscriber::layer::SubscriberExt as _;
 
     use super::*;
-    use crate::engine::CancellableEngine;
+    use crate::Snapshot;
     use crate::engine::sync::SyncEngine;
     use crate::history_manager::{
         HistoryCommitType, first_version_after, get_earliest_commit, latest_version_as_of,
         timestamp_range_to_versions,
     };
-    use crate::last_checkpoint_hint::LastCheckpointHint;
-    use crate::log_segment_files::LogSegmentFiles;
     use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
-    use crate::unit_test_utils::{TestCancellationToken, copy_test_table, load_test_table};
-    use crate::{Engine as _, KernelError, Snapshot};
+    use crate::unit_test_utils::{copy_test_table, load_test_table};
 
     #[derive(Clone, Debug, PartialEq)]
     enum FrameEvent {
@@ -349,54 +346,6 @@ mod tests {
                 "try_new_from_log_segment",
                 "log_seg.load_p_m",
             ],
-        );
-    }
-
-    #[rstest::rstest]
-    fn hinted_checkpoint_listing_reports_balanced_frames(#[values(false, true)] cancelled: bool) {
-        let (table_url, _tempdir) = copy_test_table("v1-multi-part-struct-stats-only").unwrap();
-        let engine = SyncEngine::new();
-        let token = Arc::new(TestCancellationToken::default());
-        if cancelled {
-            token.cancel();
-        }
-        let engine = CancellableEngine::new(&engine, token);
-        let hint = LastCheckpointHint {
-            version: 5,
-            parts: Some(3),
-            ..Default::default()
-        };
-        let log_root = table_url.join("_delta_log/").unwrap();
-
-        let events = capture(|| {
-            let result = LogSegmentFiles::list_with_checkpoint_hint(
-                &hint,
-                engine.storage_handler().as_ref(),
-                &log_root,
-                vec![],
-                None,
-            );
-            if cancelled {
-                assert!(matches!(result, Err(KernelError::Cancelled)));
-            } else {
-                assert_eq!(result.unwrap().checkpoint_parts.len(), 3);
-            }
-        });
-
-        let callstacks = entered_callstacks(&events);
-        assert_contains_callstack(&callstacks, &["log.list"]);
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(
-                    event,
-                    FrameEvent::Enter {
-                        name: "log.list",
-                        ..
-                    }
-                ))
-                .count(),
-            1,
         );
     }
 

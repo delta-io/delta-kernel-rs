@@ -8,8 +8,7 @@
 //! that opt in with [`ENABLE_CALL_FRAME_FIELD`]. It does not create or modify [`MetricEvent`]s.
 //!
 //! Events with an `operation_id` use [`MetricId`] for correlation. Handler and file-read events,
-//! including `_last_checkpoint` reads, and checkpoint-discovery diagnostics do not carry an
-//! operation ID.
+//! including `_last_checkpoint` reads, do not carry an operation ID.
 //!
 //! # Example: Implementing a Custom MetricsReporter
 //!
@@ -88,22 +87,22 @@ mod streaming_metrics_iterator;
 use std::sync::Arc;
 
 pub use events::{
-    CheckpointOutputStats, CheckpointPartsMissing, CheckpointPartsMissingSource,
-    CheckpointProcessingStats, CheckpointWriteFailure, CheckpointWriteMode, CheckpointWriteOutcome,
-    CheckpointWriteStats, CheckpointWriteSuccess, ChecksumWriteFailure, ChecksumWriteOutcome,
-    ChecksumWriteResolutionMode, ChecksumWriteSuccess, CommitFailureReason, CrcReadFailure,
-    CrcReadFailureReason, CrcReadSuccess, DomainMetadataLoadSuccess, JsonReadCompleted,
-    LastCheckpointReadCompleted, LastCheckpointReadOutcome, LogSegmentLoadFailure,
-    LogSegmentLoadSuccess, LogSegmentLoadType, MetricEvent, MetricId, ParquetReadCompleted,
-    ProtocolMetadataLoadFailure, ProtocolMetadataLoadSuccess, ProtocolMetadataSource,
-    ScanMetadataCompleted, ScanType, SetTransactionLoadSuccess, SnapshotBuildFailure,
-    SnapshotBuildSuccess, SnapshotLoadMetricContext, SnapshotLoadType, StorageCopyCompleted,
-    StorageListCompleted, StorageReadCompleted, TableType, TransactionCommitFailure,
-    TransactionCommitSuccess, emit_json_read_completed, emit_parquet_read_completed,
+    CheckpointOutputStats, CheckpointProcessingStats, CheckpointWriteFailure, CheckpointWriteMode,
+    CheckpointWriteOutcome, CheckpointWriteStats, CheckpointWriteSuccess, ChecksumWriteFailure,
+    ChecksumWriteOutcome, ChecksumWriteResolutionMode, ChecksumWriteSuccess, CommitFailureReason,
+    CrcReadFailure, CrcReadFailureReason, CrcReadSuccess, DomainMetadataLoadSuccess,
+    JsonReadCompleted, LastCheckpointReadCompleted, LastCheckpointReadOutcome,
+    LogSegmentLoadFailure, LogSegmentLoadSuccess, LogSegmentLoadType, MetricEvent, MetricId,
+    ParquetReadCompleted, ProtocolMetadataLoadFailure, ProtocolMetadataLoadSuccess,
+    ProtocolMetadataSource, ScanMetadataCompleted, ScanType, SetTransactionLoadSuccess,
+    SnapshotBuildFailure, SnapshotBuildSuccess, SnapshotLoadMetricContext, SnapshotLoadType,
+    StorageCopyCompleted, StorageListCompleted, StorageReadCompleted, TableType,
+    TransactionCommitFailure, TransactionCommitSuccess, emit_json_read_completed,
+    emit_parquet_read_completed,
 };
 pub(crate) use events::{
-    emit_checkpoint_parts_missing, emit_log_segment_load, emit_log_segment_load_failure,
-    emit_protocol_metadata_load, emit_protocol_metadata_load_failure,
+    emit_log_segment_load, emit_log_segment_load_failure, emit_protocol_metadata_load,
+    emit_protocol_metadata_load_failure,
 };
 pub use frame_reporter::{ENABLE_CALL_FRAME_FIELD, FrameReporter, FrameReporterLayer};
 pub use metered_engine::MeteredDeltaEngine;

@@ -30,8 +30,6 @@ use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpoint
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::metrics::MetricEvent;
 use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
@@ -57,8 +55,6 @@ use crate::unit_test_utils::{
     Action, assert_batch_matches, assert_result_error_with_message, create_log_path,
     create_log_path_with_size, load_test_table, string_array_to_engine_data,
 };
-#[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
 #[cfg(feature = "geo-type-in-dev")]
 use crate::unit_test_utils::{geography_type, geometry_type};
 use crate::{
@@ -6149,9 +6145,6 @@ async fn amt_last_checkpoint_hint_bounds_listing(
         .collect_vec();
     let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
 
-    let reporter = Arc::new(CapturingReporter::default());
-    let _guard = install_thread_local_metrics_reporter(reporter.clone());
-
     let log_segment = LogSegment::for_snapshot_impl(
         storage.as_ref(),
         log_root,
@@ -6167,12 +6160,6 @@ async fn amt_last_checkpoint_hint_bounds_listing(
         }
         Err(message) => assert_result_error_with_message(log_segment, message),
     }
-    assert!(
-        reporter
-            .events()
-            .iter()
-            .all(|event| !matches!(event, MetricEvent::CheckpointPartsMissing(_)))
-    );
 }
 
 // With an AMT hint, a snapshot is built from the commits at and after the hinted version alone:
