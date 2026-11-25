@@ -60,7 +60,9 @@ pub mod delta_types;
 mod domain_metadata;
 pub use domain_metadata::{
     ROW_TRACKING_INITIAL_HIGH_WATER_MARK, get_domain_metadata,
-    snapshot_row_tracking_high_water_mark,
+    get_domain_metadata_with_correlation_id, snapshot_row_tracking_high_water_mark,
+    snapshot_row_tracking_high_water_mark_with_correlation_id,
+    visit_clustering_columns_with_correlation_id, visit_domain_metadata_with_correlation_id,
 };
 pub mod engine_data;
 pub mod engine_funcs;
@@ -94,7 +96,8 @@ pub use snapshot::{
     get_snapshot_builder, get_snapshot_builder_from, snapshot_builder_build,
     snapshot_builder_with_correlation_id, snapshot_builder_with_incremental_crc_replay,
     snapshot_builder_with_log_tail, snapshot_builder_with_max_catalog_version,
-    snapshot_builder_with_table_id, snapshot_builder_with_version, snapshot_with_table_id,
+    snapshot_builder_with_metric_table_path, snapshot_builder_with_table_id,
+    snapshot_builder_with_version, snapshot_with_table_id,
 };
 
 #[cfg(test)]
@@ -302,7 +305,6 @@ impl KernelStringSlice {
         Ok(value.to_string())
     }
 
-    #[cfg(feature = "tracing")]
     pub(crate) fn empty() -> Self {
         KernelStringSlice {
             ptr: NonNull::<u8>::dangling().as_ptr().cast(),

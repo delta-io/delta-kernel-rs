@@ -511,7 +511,11 @@ impl BuiltCrcTest {
         let log_segment =
             LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
         Ok(log_segment
-            .pick_latest_base_crc(engine, in_memory_base, None)?
+            .pick_latest_base_crc(
+                engine,
+                in_memory_base,
+                &crate::metrics::SnapshotLoadMetricContext::for_test(),
+            )?
             .map(|c| c.version))
     }
 
@@ -520,7 +524,7 @@ impl BuiltCrcTest {
         try_read_crc_file(
             &self.engine,
             &ParsedLogPath::create_parsed_crc(&self.url, version),
-            None,
+            &crate::metrics::SnapshotLoadMetricContext::for_test(),
         )
     }
 

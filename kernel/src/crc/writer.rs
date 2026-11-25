@@ -147,7 +147,12 @@ mod tests {
 
         try_write_crc_file(&engine, crc_path.location.as_url(), &crc).unwrap();
 
-        let read_back = try_read_crc_file(&engine, &crc_path, None).unwrap();
+        let read_back = try_read_crc_file(
+            &engine,
+            &crc_path,
+            &crate::metrics::SnapshotLoadMetricContext::for_test(),
+        )
+        .unwrap();
         assert_eq!(read_back, crc);
         assert_eq!(read_back.version, version);
     }

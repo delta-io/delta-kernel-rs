@@ -114,7 +114,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         in_memory_base: Option<&Arc<Crc>>,
-        table_id: Option<&str>,
+        context: &crate::metrics::SnapshotLoadMetricContext,
     ) -> KernelResult<Option<Arc<Crc>>> {
         let preferred_disk_crc = self
             .listed
@@ -122,7 +122,7 @@ impl LogSegment {
             .as_ref()
             .filter(|f| in_memory_base.is_none_or(|m| f.version > m.version));
         let disk_crc = preferred_disk_crc
-            .map(|file| read_crc_file_or_none(engine, file, table_id))
+            .map(|file| read_crc_file_or_none(engine, file, context))
             .transpose()?
             .flatten();
         Ok(disk_crc.or_else(|| in_memory_base.cloned()).filter(|crc| {
@@ -136,7 +136,11 @@ impl LogSegment {
     /// stale (older than `end_version`).
     #[cfg(all(test, feature = "adaptive-metadata-in-dev"))]
     pub(crate) fn read_latest_crc(&self, engine: &dyn Engine) -> KernelResult<Option<Arc<Crc>>> {
-        self.pick_latest_base_crc(engine, /* in_memory_base */ None, None)
+        self.pick_latest_base_crc(
+            engine,
+            /* in_memory_base */ None,
+            &crate::metrics::SnapshotLoadMetricContext::for_test(),
+        )
     }
 
     /// Produce a fresh `Crc` at `self.end_version` by reverse-replaying the commits in

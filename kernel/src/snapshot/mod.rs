@@ -136,6 +136,7 @@ pub enum CheckpointWriteResult {
 /// [snapshot management guide]: https://docs.delta.io/kernel/rust/reading/time_travel.html
 pub struct Snapshot {
     pub(crate) metric_table_id: Option<Arc<str>>,
+    pub(crate) metric_table_path: Option<Arc<str>>,
     span: tracing::Span,
     log_segment: LogSegment,
     table_configuration: TableConfiguration,
@@ -222,17 +223,27 @@ struct PreparedSnapshot {
 impl Snapshot {
     /// Associate subsequent read metrics with the caller's table identifier. Other handles to
     /// this snapshot retain their original identifier.
-    pub fn with_metric_table_id(mut self: Arc<Self>, table_id: Option<Arc<str>>) -> Arc<Self> {
-        let table_id = table_id.filter(|id| !id.is_empty());
-        if self.metric_table_id != table_id {
+    pub fn with_metric_table_id(self: Arc<Self>, table_id: Option<Arc<str>>) -> Arc<Self> {
+        let table_path = self.metric_table_path.clone();
+        self.with_metric_table_identity(table_id.filter(|id| !id.is_empty()), table_path)
+    }
+
+    fn with_metric_table_identity(
+        mut self: Arc<Self>,
+        table_id: Option<Arc<str>>,
+        table_path: Option<Arc<str>>,
+    ) -> Arc<Self> {
+        if self.metric_table_id != table_id || self.metric_table_path != table_path {
             if let Some(snapshot) = Arc::get_mut(&mut self) {
                 snapshot.metric_table_id = table_id;
+                snapshot.metric_table_path = table_path;
             } else {
                 return Self::reuse_with_build_metadata(
                     &self,
                     self.built_as_latest,
                     self.skipped_new_checkpoints,
                     table_id,
+                    table_path,
                 );
             }
         }
@@ -360,6 +371,7 @@ impl Snapshot {
         Self {
             span,
             metric_table_id: None,
+            metric_table_path: None,
             log_segment,
             table_configuration,
             crc,
@@ -555,7 +567,7 @@ impl Snapshot {
         // Step 1: read the latest on-disk CRC and, if usable, advance it to the end version
         //         (or use it as-is when already there) per `incremental_replay`.
         let base_crc = log_segment
-            .pick_latest_base_crc(engine, None, metric_context.table_id.as_deref())
+            .pick_latest_base_crc(engine, None, metric_context)
             .inspect_err(|_| {
                 emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
             })?;
@@ -1102,6 +1114,7 @@ impl Snapshot {
         &self,
         domain: &str,
         engine: &dyn Engine,
+        correlation_id: Option<&str>,
     ) -> KernelResult<Option<String>> {
         if domain.starts_with(INTERNAL_DOMAIN_PREFIX) {
             return Err(KernelError::generic(
@@ -1109,7 +1122,7 @@ impl Snapshot {
             ));
         }
 
-        self.get_domain_metadata_internal(domain, engine)
+        self.get_domain_metadata_internal(domain, engine, correlation_id)
     }
 
     /// Get the row-tracking high-water mark for this snapshot.
@@ -1120,8 +1133,12 @@ impl Snapshot {
     ///
     /// Reads domain metadata, potentially replaying the log, and returns an error if the metadata
     /// cannot be read or its JSON configuration is malformed.
-    fn get_row_tracking_high_water_mark(&self, engine: &dyn Engine) -> KernelResult<Option<i64>> {
-        self.get_domain_metadata_internal(ROW_TRACKING_DOMAIN_NAME, engine)?
+    fn get_row_tracking_high_water_mark(
+        &self,
+        engine: &dyn Engine,
+        correlation_id: Option<&str>,
+    ) -> KernelResult<Option<i64>> {
+        self.get_domain_metadata_internal(ROW_TRACKING_DOMAIN_NAME, engine, correlation_id)?
             .map(|config| parse_row_tracking_high_water_mark(&config))
             .transpose()
     }
@@ -1147,8 +1164,11 @@ impl Snapshot {
     fn get_clustering_column_infos(
         &self,
         engine: &dyn Engine,
+        correlation_id: Option<&str>,
     ) -> KernelResult<Option<Vec<ClusteringColumnInfo>>> {
-        let Some(physical_columns) = self.get_physical_clustering_columns(engine)? else {
+        let Some(physical_columns) =
+            self.get_physical_clustering_columns(engine, correlation_id)?
+        else {
             return Ok(None);
         };
         let column_mapping_mode = self.table_configuration.column_mapping_mode();
@@ -1183,8 +1203,9 @@ impl Snapshot {
     fn get_physical_clustering_columns(
         &self,
         engine: &dyn Engine,
+        correlation_id: Option<&str>,
     ) -> KernelResult<Option<Vec<ColumnName>>> {
-        match self.get_clustering_domain_metadata(engine)? {
+        match self.get_clustering_domain_metadata(engine, correlation_id)? {
             Some(config) => Ok(Some(parse_clustering_columns(&config)?)),
             None => Ok(None),
         }
@@ -1195,7 +1216,11 @@ impl Snapshot {
     /// Returns `Ok(None)` when the `ClusteredTable` feature is absent on the protocol, or when
     /// the domain has no current entry. The JSON has the shape
     /// `{"clusteringColumns":[["col1"],["addr","city"], ...]}` with physical column names.
-    fn get_clustering_domain_metadata(&self, engine: &dyn Engine) -> KernelResult<Option<String>> {
+    fn get_clustering_domain_metadata(
+        &self,
+        engine: &dyn Engine,
+        correlation_id: Option<&str>,
+    ) -> KernelResult<Option<String>> {
         if !self
             .table_configuration
             .protocol()
@@ -1203,7 +1228,7 @@ impl Snapshot {
         {
             return Ok(None);
         }
-        self.get_domain_metadata_internal(CLUSTERING_DOMAIN_NAME, engine)
+        self.get_domain_metadata_internal(CLUSTERING_DOMAIN_NAME, engine, correlation_id)
     }
 
     /// Load domain metadata: if Complete in the CRC, answer from the cache; else if every
@@ -1217,12 +1242,13 @@ impl Snapshot {
         name = DOMAIN_METADATA_LOADED_SPAN,
         skip_all,
         err,
-        fields(report, from_cache, num_domains_returned, table_id = self.metric_table_id.as_deref().unwrap_or(""))
+        fields(report, operation_id = %MetricId::new(), correlation_id = correlation_id.unwrap_or(""), from_cache, num_domains_returned, table_id = self.metric_table_id.as_deref().unwrap_or(""), table_path = self.metric_table_path.as_deref().unwrap_or(""))
     )]
     fn get_domain_metadatas_internal(
         &self,
         engine: &dyn Engine,
         domains: Option<&HashSet<&str>>,
+        correlation_id: Option<&str>,
     ) -> KernelResult<DomainMetadataMap> {
         fn record_metric(from_cache: bool, num_domains_returned: usize) {
             let span = tracing::Span::current();
@@ -1317,8 +1343,13 @@ impl Snapshot {
         &self,
         domain: &str,
         engine: &dyn Engine,
+        correlation_id: Option<&str>,
     ) -> KernelResult<Option<String>> {
-        let mut map = self.get_domain_metadatas_internal(engine, Some(&HashSet::from([domain])))?;
+        let mut map = self.get_domain_metadatas_internal(
+            engine,
+            Some(&HashSet::from([domain])),
+            correlation_id,
+        )?;
         Ok(map.remove(domain).map(|dm| dm.configuration().to_owned()))
     }
 
@@ -1326,8 +1357,12 @@ impl Snapshot {
     ///
     /// Internal (`delta.*`) domains are filtered out.
     #[allow(unused)]
-    fn get_all_domain_metadata(&self, engine: &dyn Engine) -> KernelResult<Vec<DomainMetadata>> {
-        let all_metadata = self.get_domain_metadatas_internal(engine, None)?;
+    fn get_all_domain_metadata(
+        &self,
+        engine: &dyn Engine,
+        correlation_id: Option<&str>,
+    ) -> KernelResult<Vec<DomainMetadata>> {
+        let all_metadata = self.get_domain_metadatas_internal(engine, None, correlation_id)?;
         Ok(all_metadata
             .into_values()
             .filter(|domain| !domain.is_internal())
@@ -3049,27 +3084,30 @@ mod tests {
 
         let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
 
-        assert_eq!(snapshot.get_domain_metadata("domain1", &engine)?, None);
         assert_eq!(
-            snapshot.get_domain_metadata("domain2", &engine)?,
+            snapshot.get_domain_metadata("domain1", &engine, None)?,
+            None
+        );
+        assert_eq!(
+            snapshot.get_domain_metadata("domain2", &engine, None)?,
             Some("domain2_commit1".to_string())
         );
         assert_eq!(
-            snapshot.get_domain_metadata("domain3", &engine)?,
+            snapshot.get_domain_metadata("domain3", &engine, None)?,
             Some("domain3_commit0".to_string())
         );
         let err = snapshot
-            .get_domain_metadata("delta.domain3", &engine)
+            .get_domain_metadata("delta.domain3", &engine, None)
             .unwrap_err();
         assert!(matches!(err, KernelError::Generic(msg) if
                 msg == "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain"));
 
         assert_eq!(
-            snapshot.get_domain_metadata_internal("delta.domain3", &engine)?,
+            snapshot.get_domain_metadata_internal("delta.domain3", &engine, None)?,
             Some("domain3_commit1".to_string())
         );
 
-        let mut metadata = snapshot.get_all_domain_metadata(&engine)?;
+        let mut metadata = snapshot.get_all_domain_metadata(&engine, None)?;
         metadata.sort_by(|a, b| a.domain().cmp(b.domain()));
 
         let mut expected = vec![
@@ -3139,7 +3177,7 @@ mod tests {
         .await;
 
         let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-        let result = snapshot.get_row_tracking_high_water_mark(&engine);
+        let result = snapshot.get_row_tracking_high_water_mark(&engine, None);
         if let Some(expected_error) = expected_error {
             assert_result_error_with_message(result, expected_error);
         } else {
@@ -3826,7 +3864,7 @@ mod tests {
             .commit(&engine)
             .unwrap();
         let snapshot = Snapshot::builder_for("memory:///").build(&engine).unwrap();
-        let result = snapshot.get_clustering_column_infos(&engine).unwrap();
+        let result = snapshot.get_clustering_column_infos(&engine, None).unwrap();
 
         match expected_logical {
             None => assert_eq!(result, None),

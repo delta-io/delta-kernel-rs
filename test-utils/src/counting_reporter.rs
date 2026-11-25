@@ -489,9 +489,10 @@ mod tests {
         reporter.report(MetricEvent::LastCheckpointReadCompleted(
             delta_kernel::metrics::LastCheckpointReadCompleted {
                 table_id: None,
+                table_path: None,
                 operation_id: delta_kernel::metrics::MetricId::new(),
                 correlation_id: None,
-                log_path: "/_delta_log/".into(),
+
                 outcome,
                 duration: dur(),
             },
@@ -582,6 +583,7 @@ mod tests {
                 SnapshotCompletionStatus::Success => {
                     reporter.report(MetricEvent::SnapshotBuildSuccess(SnapshotBuildSuccess {
                         table_id: None,
+                        table_path: None,
                         operation_id: MetricId::new(),
                         table_type: TableType::PathBased,
                         correlation_id: None,
@@ -593,6 +595,7 @@ mod tests {
                 SnapshotCompletionStatus::Failure => {
                     reporter.report(MetricEvent::SnapshotBuildFailure(SnapshotBuildFailure {
                         table_id: None,
+                        table_path: None,
                         operation_id: MetricId::new(),
                         table_type: TableType::PathBased,
                         correlation_id: None,
@@ -618,6 +621,7 @@ mod tests {
         let reporter = CountingReporter::new();
         reporter.report(MetricEvent::LogSegmentLoadSuccess(LogSegmentLoadSuccess {
             table_id: None,
+            table_path: None,
             operation_id: MetricId::new(),
             table_type: TableType::PathBased,
             correlation_id: None,
@@ -640,6 +644,7 @@ mod tests {
         let reporter = CountingReporter::new();
         reporter.report(MetricEvent::LogSegmentLoadSuccess(LogSegmentLoadSuccess {
             table_id: None,
+            table_path: None,
             operation_id: MetricId::new(),
             table_type: TableType::PathBased,
             correlation_id: None,
@@ -658,12 +663,18 @@ mod tests {
     fn report_crc_read_completed_increments_crc_counters() {
         let reporter = CountingReporter::new();
         reporter.report(MetricEvent::CrcReadSuccess(CrcReadSuccess {
+            operation_id: delta_kernel::metrics::MetricId::new(),
+            correlation_id: None,
             table_id: None,
+            table_path: None,
             duration: dur(),
             bytes_read: 512,
         }));
         reporter.report(MetricEvent::CrcReadSuccess(CrcReadSuccess {
+            operation_id: delta_kernel::metrics::MetricId::new(),
+            correlation_id: None,
             table_id: None,
+            table_path: None,
             duration: dur(),
             bytes_read: 256,
         }));
@@ -676,7 +687,10 @@ mod tests {
         let reporter = CountingReporter::new();
         reporter.report(MetricEvent::DomainMetadataLoadSuccess(
             DomainMetadataLoadSuccess {
+                operation_id: delta_kernel::metrics::MetricId::new(),
+                correlation_id: None,
                 table_id: None,
+                table_path: None,
                 from_cache: true,
                 num_domains_returned: 3,
                 duration: dur(),
@@ -684,7 +698,10 @@ mod tests {
         ));
         reporter.report(MetricEvent::DomainMetadataLoadSuccess(
             DomainMetadataLoadSuccess {
+                operation_id: delta_kernel::metrics::MetricId::new(),
+                correlation_id: None,
                 table_id: None,
+                table_path: None,
                 from_cache: false,
                 num_domains_returned: 1,
                 duration: dur(),
@@ -775,6 +792,7 @@ mod tests {
         reporter.report(MetricEvent::ProtocolMetadataLoadSuccess(
             ProtocolMetadataLoadSuccess {
                 table_id: None,
+                table_path: None,
                 operation_id: MetricId::new(),
                 table_type: TableType::PathBased,
                 correlation_id: None,
@@ -816,6 +834,7 @@ mod tests {
         }));
         reporter.report(MetricEvent::LogSegmentLoadSuccess(LogSegmentLoadSuccess {
             table_id: None,
+            table_path: None,
             operation_id: MetricId::new(),
             table_type: TableType::PathBased,
             correlation_id: None,
@@ -827,13 +846,19 @@ mod tests {
             crc_versions_behind: Some(0),
         }));
         reporter.report(MetricEvent::CrcReadSuccess(CrcReadSuccess {
+            operation_id: delta_kernel::metrics::MetricId::new(),
+            correlation_id: None,
             table_id: None,
+            table_path: None,
             duration: dur(),
             bytes_read: 512,
         }));
         reporter.report(MetricEvent::DomainMetadataLoadSuccess(
             DomainMetadataLoadSuccess {
+                operation_id: delta_kernel::metrics::MetricId::new(),
+                correlation_id: None,
                 table_id: None,
+                table_path: None,
                 from_cache: true,
                 num_domains_returned: 2,
                 duration: dur(),
@@ -848,6 +873,7 @@ mod tests {
         ));
         reporter.report(MetricEvent::SnapshotBuildSuccess(SnapshotBuildSuccess {
             table_id: None,
+            table_path: None,
             operation_id: MetricId::new(),
             table_type: TableType::PathBased,
             correlation_id: None,
@@ -857,6 +883,7 @@ mod tests {
         }));
         reporter.report(MetricEvent::SnapshotBuildFailure(SnapshotBuildFailure {
             table_id: None,
+            table_path: None,
             operation_id: MetricId::new(),
             table_type: TableType::PathBased,
             correlation_id: None,
@@ -912,7 +939,12 @@ mod tests {
     #[test]
     fn report_load_failures_increment_failure_counters() {
         let reporter = CountingReporter::new();
-        reporter.report(MetricEvent::DomainMetadataLoadFailure { table_id: None });
+        reporter.report(MetricEvent::DomainMetadataLoadFailure {
+            operation_id: delta_kernel::metrics::MetricId::new(),
+            correlation_id: None,
+            table_id: None,
+            table_path: None,
+        });
         reporter.report(MetricEvent::SetTransactionLoadFailure);
         assert_eq!(reporter.domain_metadata_load_failures.get(), 1);
         assert_eq!(reporter.set_transaction_load_failures.get(), 1);

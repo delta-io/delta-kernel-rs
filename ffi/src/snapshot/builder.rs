@@ -33,6 +33,7 @@ pub struct FfiSnapshotBuilder {
     version: Option<Version>,
     correlation_id: Option<String>,
     table_id: Option<String>,
+    table_path: Option<String>,
     incremental_replay: IncrementalReplay,
     log_tail: Vec<LogPath>,
     max_catalog_version: Option<Version>,
@@ -199,6 +200,34 @@ pub unsafe extern "C" fn snapshot_builder_with_table_id(
     unsafe { result.into_extern_result(&engine.as_ref()) }
 }
 
+/// Attach a table root label suitable for telemetry to this snapshot build's metric events.
+///
+/// Supply a path without credentials or tokens. Copies the label before returning. Repeated calls
+/// replace the previous value; an empty value clears it. Invalid UTF-8 or a null pointer with
+/// nonzero length returns an error.
+///
+/// # Safety
+///
+/// `builder` must be a valid handle. It is consumed on both success and error and must not be
+/// used or freed afterward. The caller owns the returned builder on success. `table_path`
+/// is borrowed for this call. If its pointer is non-null, it must address `len` readable bytes
+/// until the call returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapshot_builder_with_metric_table_path(
+    builder: Handle<ExclusiveSnapshotBuilder>,
+    table_path: KernelStringSlice,
+) -> ExternResult<Handle<ExclusiveSnapshotBuilder>> {
+    let mut builder = unsafe { builder.into_inner() };
+    let engine = builder.engine.clone();
+    let result = catch_panic(|| {
+        unsafe { table_path.try_to_string() }.map(|path| {
+            builder.table_path = Some(path);
+            builder.into()
+        })
+    });
+    unsafe { result.into_extern_result(&engine.as_ref()) }
+}
+
 /// Return a snapshot whose subsequent read metrics use the caller's table identifier.
 /// An empty identifier clears it. Other handles retain their original identity.
 ///
@@ -357,6 +386,7 @@ fn make_snapshot_builder(
         version: None,
         correlation_id: None,
         table_id: None,
+        table_path: None,
         incremental_replay: IncrementalReplay::Disabled,
         log_tail: Vec::new(),
         max_catalog_version: None,
@@ -382,6 +412,7 @@ fn snapshot_builder_build_impl(
         version,
         correlation_id,
         table_id,
+        table_path,
         incremental_replay,
         log_tail,
         max_catalog_version,
@@ -393,6 +424,7 @@ fn snapshot_builder_build_impl(
         version: Option<Version>,
         correlation_id: Option<String>,
         table_id: Option<String>,
+        table_path: Option<String>,
         incremental_replay: IncrementalReplay,
         log_tail: Vec<LogPath>,
         max_catalog_version: Option<Version>,
@@ -413,6 +445,7 @@ fn snapshot_builder_build_impl(
             version,
             correlation_id,
             table_id,
+            table_path,
             incremental_replay,
             log_tail,
             max_catalog_version,
@@ -424,6 +457,9 @@ fn snapshot_builder_build_impl(
         }
         if let Some(id) = table_id {
             builder = builder.with_table_id(id);
+        }
+        if let Some(path) = table_path {
+            builder = builder.with_metric_table_path(path);
         }
         if let Some(version) = version {
             builder = builder.at_version(version);
@@ -444,6 +480,7 @@ fn snapshot_builder_build_impl(
         version,
         correlation_id,
         table_id,
+        table_path,
         incremental_replay,
         log_tail,
         max_catalog_version,
@@ -581,6 +618,14 @@ mod tests {
                 kernel_string_slice!(table_id),
             ))
         };
+        let label = String::from("memory:///tables/example");
+        let builder = unsafe {
+            ok_or_panic(snapshot_builder_with_metric_table_path(
+                builder,
+                kernel_string_slice!(label),
+            ))
+        };
+        drop(label);
         let builder = if fail {
             unsafe { snapshot_builder_with_version(builder, 99) }
         } else {
@@ -600,6 +645,7 @@ mod tests {
         }
         let mut completions = 0;
         for event in reporter.events() {
+            let table_path = event.table_path().map(str::to_owned);
             let table_id = event.table_id().map(str::to_owned);
             let correlation_id = match event {
                 MetricEvent::SnapshotBuildSuccess(event) => {
@@ -618,6 +664,7 @@ mod tests {
                 MetricEvent::ProtocolMetadataLoadFailure(event) => event.correlation_id,
                 _ => continue,
             };
+            assert_eq!(table_path.as_deref(), Some("memory:///tables/example"));
             assert_eq!(table_id.as_deref(), Some("opaque/table"));
             assert_eq!(correlation_id.as_deref(), Some("snapshot-request"));
         }

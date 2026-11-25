@@ -1,7 +1,6 @@
 //! Access to snapshot metadata that may require storage reads.
 
 use std::collections::HashSet;
-#[cfg(feature = "declarative-plans")]
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
@@ -51,6 +50,7 @@ use crate::{CancellationTokenRef, Engine, KernelResult};
 pub struct SnapshotReader<'a> {
     /// Immutable table state shared independently of this read scope.
     snapshot: &'a Snapshot,
+    correlation_id: Option<Arc<str>>,
     /// Optional token bound to each getter's handler-backed reads.
     cancellation_token: Option<CancellationTokenRef>,
 }
@@ -114,6 +114,13 @@ impl<'a> SnapshotReader<'a> {
         self.read(engine, |snapshot, engine| snapshot.checkpoint_info(engine))
     }
 
+    /// Attach the current caller's request identifier to domain metadata reads on this reader.
+    /// An empty value clears it. Other readers of the snapshot keep their own attribution.
+    pub fn with_correlation_id(mut self, id: impl Into<Arc<str>>) -> Self {
+        self.correlation_id = Some(id.into()).filter(|id| !id.is_empty());
+        self
+    }
+
     /// Sets the cancellation token for this reader's handler-backed reads.
     ///
     /// Each call replaces the reader's token binding. Passing `None` clears an existing binding.
@@ -163,7 +170,7 @@ impl<'a> SnapshotReader<'a> {
         engine: &dyn Engine,
     ) -> KernelResult<Option<String>> {
         self.read(engine, |snapshot, engine| {
-            snapshot.get_domain_metadata(domain, engine)
+            snapshot.get_domain_metadata(domain, engine, self.correlation_id.as_deref())
         })
     }
 
@@ -176,7 +183,9 @@ impl<'a> SnapshotReader<'a> {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<i64>> {
-        self.read(engine, Snapshot::get_row_tracking_high_water_mark)
+        self.read(engine, |snapshot, engine| {
+            snapshot.get_row_tracking_high_water_mark(engine, self.correlation_id.as_deref())
+        })
     }
 
     /// Returns this version's timestamp in milliseconds since the Unix epoch.
@@ -200,7 +209,9 @@ impl<'a> SnapshotReader<'a> {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<Vec<ClusteringColumnInfo>>> {
-        self.read(engine, Snapshot::get_clustering_column_infos)
+        self.read(engine, |snapshot, engine| {
+            snapshot.get_clustering_column_infos(engine, self.correlation_id.as_deref())
+        })
     }
 
     /// Returns physical clustering column names in domain order.
@@ -215,7 +226,9 @@ impl<'a> SnapshotReader<'a> {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<Vec<ColumnName>>> {
-        self.read(engine, Snapshot::get_physical_clustering_columns)
+        self.read(engine, |snapshot, engine| {
+            snapshot.get_physical_clustering_columns(engine, self.correlation_id.as_deref())
+        })
     }
 
     /// Returns current metadata for `domains`, or all domains when the filter is `None`.
@@ -236,7 +249,7 @@ impl<'a> SnapshotReader<'a> {
         domains: Option<&HashSet<&str>>,
     ) -> KernelResult<DomainMetadataMap> {
         self.read(engine, |snapshot, engine| {
-            snapshot.get_domain_metadatas_internal(engine, domains)
+            snapshot.get_domain_metadatas_internal(engine, domains, self.correlation_id.as_deref())
         })
     }
 
@@ -252,7 +265,7 @@ impl<'a> SnapshotReader<'a> {
         engine: &dyn Engine,
     ) -> KernelResult<Option<String>> {
         self.read(engine, |snapshot, engine| {
-            snapshot.get_domain_metadata_internal(domain, engine)
+            snapshot.get_domain_metadata_internal(domain, engine, self.correlation_id.as_deref())
         })
     }
 
@@ -265,7 +278,9 @@ impl<'a> SnapshotReader<'a> {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Vec<DomainMetadata>> {
-        self.read(engine, Snapshot::get_all_domain_metadata)
+        self.read(engine, |snapshot, engine| {
+            snapshot.get_all_domain_metadata(engine, self.correlation_id.as_deref())
+        })
     }
 
     /// Returns this version's In-Commit Timestamp (ICT), or `None` when ICT is disabled.
@@ -282,6 +297,7 @@ impl<'a> SnapshotReader<'a> {
     pub(super) fn new(snapshot: &'a Snapshot) -> Self {
         Self {
             snapshot,
+            correlation_id: None,
             cancellation_token: None,
         }
     }

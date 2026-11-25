@@ -176,6 +176,7 @@ impl Snapshot {
                     built_as_latest,
                     existing_snapshot.skipped_new_checkpoints,
                     metric_context.table_id.clone(),
+                    metric_context.table_path.clone(),
                 ));
             }
             // Case B: incremental path only moves forward.
@@ -220,6 +221,7 @@ impl Snapshot {
                     built_as_latest,
                     skipped_new_checkpoints,
                     metric_context.table_id.clone(),
+                    metric_context.table_path.clone(),
                 ));
             }
             NewSegment::Rebuild(new_log_segment) => {
@@ -292,11 +294,7 @@ impl Snapshot {
         // matching the fresh path.
         let pm_start = std::time::Instant::now();
         let base_crc = combined_log_segment
-            .pick_latest_base_crc(
-                engine,
-                existing_snapshot.base_crc(),
-                metric_context.table_id.as_deref(),
-            )
+            .pick_latest_base_crc(engine, existing_snapshot.base_crc(), metric_context)
             .inspect_err(|_| {
                 emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
             })?;
@@ -594,8 +592,10 @@ impl Snapshot {
         built_as_latest: bool,
         skipped_new_checkpoints: bool,
         table_id: Option<Arc<str>>,
+        table_path: Option<Arc<str>>,
     ) -> Arc<Snapshot> {
         if existing.metric_table_id == table_id
+            && existing.metric_table_path == table_path
             && existing.built_as_latest == built_as_latest
             && existing.skipped_new_checkpoints == skipped_new_checkpoints
         {
@@ -604,6 +604,7 @@ impl Snapshot {
         Arc::new(Self {
             span: existing.span.clone(),
             metric_table_id: table_id,
+            metric_table_path: table_path,
             log_segment: existing.log_segment.clone(),
             table_configuration: existing.table_configuration.clone(),
             crc: existing.crc.clone(),

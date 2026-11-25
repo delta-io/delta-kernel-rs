@@ -152,10 +152,14 @@ fn rebinding_shared_snapshot_keeps_other_readers_identity() {
     let engine = SyncEngine::new();
     let snapshot = Snapshot::builder_for("tests/data/app-txn-no-checkpoint")
         .with_table_id("original")
+        .with_metric_table_path("/tables/original")
         .build(&engine)
         .unwrap();
     let rebound = snapshot.clone().with_metric_table_id(Some("other".into()));
-    let cleared = rebound.clone().with_metric_table_id(None);
+    let cleared = Snapshot::builder_from(rebound.clone().with_metric_table_id(None))
+        .with_metric_table_path("")
+        .build(&engine)
+        .unwrap();
     for view in [&rebound, &cleared, &snapshot] {
         view.reader()
             .get_domain_metadata("missing", &engine)
@@ -165,11 +169,50 @@ fn rebinding_shared_snapshot_keeps_other_readers_identity() {
         .events()
         .into_iter()
         .filter_map(|event| match event {
-            MetricEvent::DomainMetadataLoadSuccess(e) => Some(e.table_id),
+            MetricEvent::DomainMetadataLoadSuccess(e) => Some((e.table_id, e.table_path)),
             _ => None,
         })
         .collect();
-    assert_eq!(ids, [Some("other".into()), None, Some("original".into())]);
+    assert_eq!(
+        ids,
+        [
+            (Some("other".into()), Some("/tables/original".into())),
+            (None, None),
+            (Some("original".into()), Some("/tables/original".into())),
+        ]
+    );
+}
+
+#[test]
+fn domain_reads_use_the_current_request_on_a_shared_snapshot() {
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    let engine = SyncEngine::new();
+    let snapshot = Snapshot::builder_for("tests/data/app-txn-no-checkpoint")
+        .with_correlation_id("initial-build")
+        .build(&engine)
+        .unwrap();
+    for request in ["first", "second"] {
+        snapshot
+            .reader()
+            .with_correlation_id(request)
+            .get_domain_metadata("missing", &engine)
+            .unwrap();
+    }
+    let reads: Vec<_> = reporter
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            MetricEvent::DomainMetadataLoadSuccess(read) => {
+                Some((read.operation_id, read.correlation_id))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reads.len(), 2);
+    assert_ne!(reads[0].0, reads[1].0);
+    assert_eq!(reads[0].1.as_deref(), Some("first"));
+    assert_eq!(reads[1].1.as_deref(), Some("second"));
 }
 
 /// Reader delegation preserves metadata success/failure metrics and validation errors.
@@ -213,7 +256,7 @@ fn reader_preserves_metadata_metrics_and_errors(#[values(false, true)] cancelled
                 assert!(e.found);
                 false
             }
-            MetricEvent::DomainMetadataLoadFailure { table_id } => {
+            MetricEvent::DomainMetadataLoadFailure { table_id, .. } => {
                 assert_eq!(table_id.as_deref(), Some("reader-table"));
                 true
             }
