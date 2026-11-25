@@ -373,11 +373,20 @@ mod tests {
         String::from_utf8(bytes).unwrap()
     }
 
-    #[test]
-    fn logging_reporter_preserves_read_identity() {
+    #[rstest::rstest]
+    fn logging_reporter_preserves_read_identity(
+        #[values(
+            tracing::Level::ERROR,
+            tracing::Level::WARN,
+            tracing::Level::INFO,
+            tracing::Level::DEBUG,
+            tracing::Level::TRACE
+        )]
+        level: tracing::Level,
+    ) {
         let operation_id = MetricId::new();
         let logs = capture_logs(|| {
-            let reporter = LoggingMetricsReporter::new(tracing::Level::INFO);
+            let reporter = LoggingMetricsReporter::new(level);
             reporter.report(MetricEvent::LastCheckpointReadCompleted(
                 LastCheckpointReadCompleted {
                     operation_id,
@@ -388,14 +397,88 @@ mod tests {
                     duration: Duration::from_millis(1),
                 },
             ));
+            reporter.report(MetricEvent::CrcReadFailure {
+                operation_id,
+                correlation_id: Some("request-1".into()),
+                table_id: Some("orders".into()),
+                table_path: Some("/tables/orders".into()),
+            });
+            reporter.report(MetricEvent::DomainMetadataLoadFailure {
+                operation_id,
+                correlation_id: None,
+                table_id: Some("orders".into()),
+                table_path: None,
+            });
         });
-        assert!(
-            logs.contains(&format!("operation_id={operation_id}")),
-            "{logs}"
-        );
-        assert!(logs.contains("correlation_id=\"request-1\""), "{logs}");
-        assert!(logs.contains("table_id=\"orders\""), "{logs}");
-        assert!(logs.contains("table_path=\"/tables/orders\""), "{logs}");
+        let entries: Vec<_> = logs.lines().collect();
+        let [hint, crc, domain] = entries.as_slice() else {
+            panic!("expected three read metrics: {logs}");
+        };
+        assert!(hint.contains("LastCheckpointReadCompleted"));
+        assert!(crc.contains("CrcReadFailure"));
+        assert!(domain.contains("DomainMetadataLoadFailure"));
+        for line in &entries {
+            assert!(
+                line.contains(&format!("operation_id={operation_id}")),
+                "{line}"
+            );
+            assert!(line.contains("table_id=\"orders\""), "{line}");
+        }
+        for line in [hint, crc] {
+            assert!(line.contains("correlation_id=\"request-1\""), "{line}");
+            assert!(line.contains("table_path=\"/tables/orders\""), "{line}");
+        }
+        assert!(!domain.contains("correlation_id="), "{domain}");
+        assert!(!domain.contains("table_path="), "{domain}");
+    }
+
+    #[test]
+    fn logging_reporter_groups_crc_and_snapshot_stages() {
+        let capture = Arc::new(CapturingReporter::default());
+        {
+            let _guard = install_thread_local_metrics_reporter(capture.clone());
+            let engine = crate::engine::sync::SyncEngine::new();
+            crate::Snapshot::builder_for("tests/data/crc-full")
+                .with_correlation_id("request-1")
+                .with_table_id("orders")
+                .with_metric_table_path("/tables/orders")
+                .build(&engine)
+                .unwrap();
+        }
+        let events = capture.events();
+        let operation_id = events
+            .iter()
+            .find_map(|event| match event {
+                MetricEvent::SnapshotBuildSuccess(event) => Some(event.operation_id),
+                _ => None,
+            })
+            .expect("snapshot build metric");
+        let logs = capture_logs(|| {
+            let reporter = LoggingMetricsReporter::new(tracing::Level::INFO);
+            for event in events {
+                reporter.report(event);
+            }
+        });
+        for stage in [
+            "LogSegmentLoadSuccess",
+            "CrcReadSuccess",
+            "ProtocolMetadataLoadSuccess",
+            "SnapshotBuildSuccess",
+        ] {
+            let line = logs
+                .lines()
+                .find(|line| line.contains(stage))
+                .unwrap_or_else(|| {
+                    panic!("missing {stage} metric in {logs}");
+                });
+            assert!(
+                line.contains(&format!("operation_id={operation_id}")),
+                "{line}"
+            );
+            assert!(line.contains("correlation_id=\"request-1\""), "{line}");
+            assert!(line.contains("table_id=\"orders\""), "{line}");
+            assert!(line.contains("table_path=\"/tables/orders\""), "{line}");
+        }
     }
 
     #[rstest::rstest]

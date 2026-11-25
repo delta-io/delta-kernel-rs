@@ -622,7 +622,7 @@ impl ScanBuilder {
     ///
     /// The default is inherited from the snapshot. An empty value clears the inherited identifier.
     /// The identifier is passed to parallel scan phases in memory, and is omitted when
-    /// [`ParallelState`](crate::scan::ParallelState) is reconstructed from serialized bytes.
+    /// [`ParallelState`] is reconstructed from serialized bytes.
     pub fn with_table_id(mut self, table_id: impl Into<Arc<str>>) -> Self {
         self.table_id = Some(table_id.into()).filter(|id| !id.is_empty());
         self
