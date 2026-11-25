@@ -1,87 +1,373 @@
-# AI reviewer instructions and tasks
+# AI review architecture and terminology
 
-The orchestrator in this directory dispatches the child reviewers under `agents/` and consolidates
-their findings. Every reviewer, orchestrator or child, starts with two texts:
+[`ai-review.yml`](../../workflows/ai-review.yml) runs an orchestrator model and specialist review
+models. Python prepares their inputs and output requests; workflow steps create GitHub comments,
+Checks or saved reports. This document defines those responsibilities and the text exchanged.
 
-- **Instructions** are static for a given reviewer at a given workflow revision. They are the
-  reviewer's `REVIEW.md`. They define its role, what counts as a finding, and how to report one.
-  Omnigent sends them ahead of the conversation: as the system prompt for Claude reviewers and as
-  developer instructions for Codex reviewers.
-- **The task** is the reviewer's first message. It tells the reviewer what to do in this run and
-  gives it the material to work on.
+## Components
 
-For example, `architecture-reviewer` gets the same `REVIEW.md` on every pull request. Its task
-starts with an assignment such as "Review the architecture of this change." The workflow then
-appends prior AI review history when there is any, and the pull request's metadata, description,
-and diff. The two maintainer reviewers also get root `AGENTS.md` in their task. `AGENTS.md`
-contains rules, but it travels in the task because the workflow selects its version for each run.
+| Component | Responsibility |
+| --- | --- |
+| GitHub Actions workflow | Shell commands fetch PR inputs and call GitHub; Python builds task messages, validates model output and prepares requests/reports. |
+| Omnigent | Start model sessions, supply tools and carry assignments/results between sessions. |
+| Orchestrator | Select Reviewer subagents, assign their work, request checking and write the orchestrator report. |
+| Reviewer subagent | A separate model session reviewing architecture, protocol, maintainer concerns, tests or docs. |
+| Checker subagent | The separate `disprove-reviewer` model session that challenges supplied candidate findings. |
 
-A reviewer receives more input after it starts:
+## Message glossary
 
-- At startup, Omnigent gives the reviewer the definitions of the tools it may call, such as
-  `read_source_file`.
-- During the review, tool results enter the conversation. For a change under `ffi/`, a maintainer
-  reviewer has root `AGENTS.md` in its task, and `ffi/AGENTS.md` arrives when it reads that file
-  with `repository: guidance`.
-- During coordination, the orchestrator receives each child's findings. It sends candidate
-  findings to `disprove-reviewer` in that reviewer's assignment and receives its verdicts.
+Use **role instructions** for the separate standing role text, and **task message** for a
+session's initial run-specific message. A task message can itself contain instructions. These
+terms distinguish how text reaches the model; they do not claim that all rules live outside the
+task message.
 
-To decide where a piece of text belongs, ask when the reviewer needs to learn it:
+| Term | Definition | Concrete example |
+| --- | --- | --- |
+| Role instructions | Standing rules for a model role, loaded from its configured `REVIEW.md` with shared text expanded. | The Docs role checks documentation against code. |
+| Assignment | The request the orchestrator writes for a particular subagent, before Python appends the shared PR task text and any maintainer guidance. | "Review PR #1234's documentation for accuracy." |
+| Task message | The initial run-specific message delivered to a model session. | That Docs assignment plus PR metadata, reviewed SHA, description, earlier AI review text and patch excerpt. |
+| Shared PR task text | Text appended to each subagent assignment: optional review-range instructions, earlier AI review text, PR metadata, description excerpt and patch excerpt. | Python writes it to `/tmp/child_task_pr_data.md`. |
+| Child task body (implementation term) | Text appended after an assignment: shared PR task text, preceded by trusted root `AGENTS.md` for the two maintainer roles. | The `append_child_task_body()` hook and its error messages use this term. |
+| Response format instructions | Requirements for the response's run-specific start/end markers and, in inline mode, finding-location JSON. | The workflow's `output_contract` variable contains these instructions. |
+| Trusted project guidance | Project rules selected from the trusted workflow revision. | Root `AGENTS.md`, appended inside the two maintainer task messages. |
+| Tool definition | A callable tool's name, parameters and usage description supplied to a model. | `read_source_file(repository, path, start_line=1, line_count=400)`. |
+| Tool call | A model's request to execute a tool with particular arguments. | Read line 6 of `integration-tests/Cargo.toml` from `repository="pr"`. |
+| Tool result | The content or error returned by executing one tool call. | A numbered source line followed by `Next line: 7`, or `Error: ...`. |
+| Reviewer result | A Reviewer subagent's completed report of candidate findings or no findings. | The Docs subagent reports that a command omits the separate integration-test workspace. |
+| Candidate finding | A specific problem proposed before the orchestrator's checking and final selection. | The Docs subagent's concern about that command. |
+| Checker decision | The Checker's judgment of one supplied candidate finding. | `CONFIRMED`, `DISPROVED`, `NITPICK` or `CONTESTED`. |
+| Checker result | The Checker subagent's completed report of decisions, evidence and assessments of proposed fixes. | For each supplied candidate finding, `disprove-reviewer` returns a decision, its supporting evidence and an assessment of the proposed fix. |
+| Final finding | A problem included in the orchestrator report. | The documentation correction after the orchestrator selects it. |
+| Orchestrator report | The Markdown findings and summary returned by the orchestrator, before the workflow formats GitHub comments. | The final findings selected from the reviewer results and checker result, followed by a summary. |
 
-| The reviewer needs it | Where it goes | Example |
-|---|---|---|
-| On every run | Instructions | "Check for duplicate findings." |
-| For this run | Task | The findings from the last AI review of this pull request |
-| For some changes only | A tool read | The contents of `ffi/AGENTS.md` |
+Omnigent can deliver a Reviewer result or Checker result inside a tool-result message. A
+`read_source_file` tool result contains source evidence.
 
-## Where each text comes from
+## Review flow
 
-| Text | Contents, in order | Where it comes from |
-|---|---|---|
-| Orchestrator instructions | [`REVIEW.md`](REVIEW.md) with its shared blocks expanded | Checked in. [`config.yaml`](config.yaml) names it under `instructions`. |
-| Orchestrator task | PR metadata and description; orchestration notes, prior AI reviews, and the output contract; PR diff | The "Collect PR data and build reviewer tasks" step in [`ai-review.yml`](../../workflows/ai-review.yml) writes `/tmp/orchestrator_task.md`. The "Run AI review" step passes it to `omnigent run -p`. |
-| Child instructions | `agents/<name>/REVIEW.md` with its shared blocks expanded | Checked in. `agents/<name>/config.yaml` names it under `instructions`. |
-| Child task | Assignment; root `AGENTS.md` for the two maintainer reviewers; PR data | The orchestrator writes the assignment. [`child_task.py`](../child_task.py) supplies the rest, called the child task body. |
+Boxes identify components or external data providers. Text between boxes names the information
+passed between them. Numbers identify operations in this explanation; they are not runtime IDs.
+Omnigent is the runtime that starts model sessions, supplies their tools and carries messages
+between them. Every ORCHESTRATOR box below represents the same model session at a later step.
 
-Changing a `REVIEW.md` or a shared block changes CI review behavior. Most of a task is the pull
-request's own text, which the PR author controls and reviewers treat as untrusted data.
+```text
++-------------------------------------------+     +-------------------------------------------+
+| TRUSTED WORKFLOW REVISION                 |     | GITHUB AND REFERENCE DATA                 |
+| Workflow/Python, config.yaml, REVIEW.md,  |     | PR metadata, original description, patch, |
+| shared instruction text and AGENTS.md     |     | earlier AI reviews, PR/Delta source       |
++-------------------------------------------+     +-------------------------------------------+
+                      | selected code/instructions                      | review data
+                      +------------------------+------------------------+
+                                               v
+             +-------------------------------------------------------------------+
+             | (1) GITHUB ACTIONS WORKFLOW: shell and Python helpers             |
+             | Select review base/head; fetch PR data; prepare message text.     |
+             | Save the PR patch and task text as files on the Actions runner.   |
+             | Start Omnigent with the orchestrator configuration and task.      |
+             +-------------------------------------------------------------------+
+                                               | role instructions + initial task message
+                                               v
+             +-------------------------------------------------------------------+
+             | (2) ORCHESTRATOR MODEL SESSION                                    |
+             | Select relevant Reviewer subagents; docs-reviewer is required.    |
+             | Write an assignment for each selected role.                       |
+             +-------------------------------------------------------------------+
+                                               | sys_session_send: role + assignment
+                                               v
+             +-------------------------------------------------------------------+
+             | (3) OMNIGENT DISPATCH + child_task.py                             |
+             | Task message = assignment + optional guidance                     |
+             |                + shared PR task text.                             |
+             | Include trusted root AGENTS.md for the two maintainer roles only. |
+             | Start each selected subagent with its configured instructions.    |
+             +-------------------------------------------------------------------+
+                                               | task message for each selected role
+        (4) AVAILABLE REVIEWER SUBAGENTS: DOCS + OTHER SELECTED RELEVANT ROLES
+                                               |
+       +---------------+---------------+-------+-------+---------------+---------------+
+       |               |               |               |               |               |
+       v               v               v               v               v               v
++-------------+ +-------------+ +-------------+ +-------------+ +-------------+ +-------------+
+| ARCHITECTURE| | DELTA       | | CLAUDE      | | CODEX       | | TEST        | | DOCS        |
+|             | | PROTOCOL    | | MAINTAINER  | | MAINTAINER  | | COVERAGE    | | (required)  |
+| Reviewer    | | Reviewer    | | Reviewer    | | Reviewer    | | Reviewer    | | Reviewer    |
+| subagent    | | subagent    | | subagent    | | subagent    | | subagent    | | subagent    |
++-------------+ +-------------+ +-------------+ +-------------+ +-------------+ +-------------+
+       |               |               |               |               |               |
+       +---------------+---------------+-------+-------+---------------+---------------+
+                                               | reviewer results: candidate findings or none
+                                               v
++-----------------------------------------------------+     +---------------------------------+
+| (5) ORCHESTRATOR MODEL SESSION                      |---->| CHECKER SUBAGENT                |
+| Collect reviewer results; build a candidate list.   |     | disprove-reviewer               |
+| Before keeping Blocker/Should Fix, request one      |     | Challenge supplied claims.      |
+| checker task containing the candidate list.         |<----| Return a checker result.        |
++-----------------------------------------------------+     +---------------------------------+
+                                               | candidate findings + checker result
+                                               v
+             +-------------------------------------------------------------------+
+             | (6) ORCHESTRATOR MODEL SESSION                                    |
+             | Merge duplicates; select findings; write the orchestrator report. |
+             +-------------------------------------------------------------------+
+                                               | orchestrator report + optional inline-location JSON
+                                               v
+             +-------------------------------------------------------------------+
+             | (7) GITHUB ACTIONS WORKFLOW: shell and Python helpers             |
+             | Python checks and extracts the orchestrator report.               |
+             | inline_review.py builds requests; review_publish.py formats text. |
+             | Workflow shell calls gh; attempts AI Review Summary Check Run.    |
+             +-------------------------------------------------------------------+
+                                               | output mode selects report location
+              +--------------------------------+--------------------------------+
+              v                                v                                v
++---------------------------+    +---------------------------+    +---------------------------+
+| GITHUB: INLINE MODE       |    | GITHUB: COMMENT OR        |    | ACTIONS: SUMMARY OR       |
+| One COMMENT review body   |    | COLLAPSED MODE            |    | ARTIFACT MODE             |
+| plus inline code comments |    | One Conversation comment  |    | Job summary or artifact   |
++---------------------------+    +---------------------------+    +---------------------------+
+```
 
-The **trusted workflow revision** is the commit the workflow itself runs from (`GITHUB_SHA`).
-Automatic reviews and `/review` comment runs use the tip of the repository's default branch,
-whatever branch the pull request targets, and never the pull request's head. A manual dispatch
-uses the ref the dispatcher selects.
+When credentials and the reviewed head are available, the workflow attempts to create the
+`AI Review Summary` Check Run in the PR's Checks tab, with GitHub conclusion `neutral`.
 
-## Review scope for stacked PRs
+The outgoing checker task message contains the candidate-finding list; the checker result contains
+decisions, evidence and assessments of proposed fixes. The orchestrator instructions require this
+checker task before publishing any Blocker or Should Fix, and prohibit separate checker calls per
+reviewer or per finding. The checker runs in its own model session, separately from the Reviewer
+subagents. Separate sessions can use the same underlying model.
 
-PR authors using git stack should keep the generated stack list in their PR description up to
-date, including the link to the immediate parent PR. The parent and child PRs must be opened in the
-same repository; their head branches can live in forks. For an unmerged parent, the child must
-inherit the parent's current head, or the workflow stops with a neutral PR check explaining that
-the stack needs synchronizing. This avoids guessing which changes belong to the child after a parent
-advances or is rewritten.
-Scope decisions are logged in the workflow run. If resolution stops, the author should follow the
-neutral check's instructions to refresh the description or synchronize the stack, then retry.
-See [`resolve_review_base`](../review_scope.py) for the boundary selection rules. Published scoped
-reviews identify their reviewed commit range.
+The orchestrator must select Docs and the other relevant reviewers.
+Before returning an orchestrator report for publication, it must receive completed
+results from at least one maintainer and one other Reviewer subagent.
+A failed reviewer gets one retry after the other in-flight reviewers finish.
+The orchestrator waits for every dispatched reviewer to finish or exhaust that retry,
+and for any required checker result. It lists reviewers still unavailable after
+retry in the Summary. These are model instructions; workflow Python does not
+independently verify reviewer completion.
 
-Inline publication validates positions against GitHub's PR diff. LEFT-side findings stay in the
-collapsed review when that file's scoped and GitHub diff sections differ. If GitHub rejects an
-inline review, the fallback comment retains the findings intended for inline publication.
+### Source reads during model review
+
+A Reviewer or Checker subagent can request more source text while reviewing. A source read
+returns file text to the requesting session. That intermediate tool result is separate from the
+Reviewer or Checker subagent's completed report to the orchestrator.
+
+```text
++--------------------------------+                    +---------------------------------------+
+| REVIEWER OR CHECKER SUBAGENT   | -- tool call ----> | READ-ONLY PYTHON SOURCE TOOLS         |
+| Choose file and line range.    |                    | Read from selected source tree.       |
+| Read returned numbered lines.  | <-- tool result -- | Return numbered text or an error.     |
++--------------------------------+                    +---------------------------------------+
+                                                                          | repository selector
+              +--------------------------------+--------------------------+-----+
+              v                                v                                v
++---------------------------+    +---------------------------+    +---------------------------+
+| repository: pr            |    | repository: delta         |    | repository: guidance      |
+| Reviewed PR head          |    | Delta reference source    |    | Trusted workflow revision |
++---------------------------+    +---------------------------+    +---------------------------+
+```
+
+### Reviewer roles
+
+| Diagram label | Omnigent configuration identifier | Review focus |
+| --- | --- | --- |
+| Architecture | `architecture-reviewer` | APIs, abstractions and module boundaries. |
+| Delta protocol | `delta-protocol-reviewer` | Changed behavior against the Delta specification. |
+| Claude maintainer | `maintainer-claude-reviewer` | Rust/Delta behavior and project conventions. |
+| Codex maintainer | `maintainer-codex-reviewer` | The maintainer checklist using the configured Codex model. |
+| Test coverage | `test-coverage-reviewer` | Missing cases and meaningful assertions. |
+| Docs | `docs-reviewer` | PR title/description and documentation accuracy. |
+| Checker | `disprove-reviewer` | Evidence for or against supplied candidate findings. |
+
+## Where each message comes from
+
+| Message | Contents, in order | Producer |
+| --- | --- | --- |
+| Orchestrator role instructions | [`REVIEW.md`](REVIEW.md) with shared blocks expanded | Checked in; [`config.yaml`](config.yaml) selects `instructions`. |
+| Orchestrator task message | PR metadata/description; run-specific rules, earlier AI review text and response format instructions; patch excerpt | The "Collect PR data and build reviewer tasks" step in [`ai-review.yml`](../../workflows/ai-review.yml). The "Run AI review" step passes the text to `omnigent run -p`. |
+| Subagent role instructions | `agents/<role>/REVIEW.md` with shared blocks expanded | Checked in; that role's `config.yaml` selects `instructions`. |
+| Reviewer subagent task message | Orchestrator assignment; trusted root `AGENTS.md` for the two maintainer roles; shared PR task text | The orchestrator writes the assignment; [`child_task.py`](../child_task.py) appends the remaining text. |
+| Checker subagent task message | Orchestrator assignment containing candidate findings; shared PR task text | The same dispatch hook appends the shared PR task text to the checker assignment. |
+
+Changing `REVIEW.md` or a shared block changes model instructions. A task message also contains
+run-specific instructions, but the PR description, patch and earlier AI review text remain
+untrusted data.
+
+The **trusted workflow revision** is the commit the workflow runs from (`GITHUB_SHA`). Automatic
+reviews and `/review` comment runs use the tip of the repository's default branch, regardless of
+the PR's target branch. A manual dispatch uses the ref the dispatcher selects. This revision
+selects the workflow, model configuration, role instructions and project guidance. The
+**reviewed PR head** separately selects the source code under review.
+
+Omnigent sends role instructions ahead of the conversation: as a system prompt for Claude
+sessions and developer instructions for Codex sessions. Tool definitions are supplied separately;
+later tool results and messages join the conversation after the initial task message.
+
+### One worked example
+
+This is an illustrative review of a fictional PR, not a transcript or a reported defect. The
+source-file excerpt and source-tool result format below are shown for `integration-tests/Cargo.toml`.
+
+1. Fictional PR #1234 adds this sentence to documentation:
+
+   > Run `cargo test --workspace` to run all integration tests.
+
+2. Omnigent loads the Docs role instructions from its configured `REVIEW.md`. An actual
+   instruction in that role is: "Review all documentation touched by or relevant to recent code
+   changes in the PR."
+3. The orchestrator writes the assignment: "Review PR #1234's documentation for accuracy."
+   `child_task.py` appends the shared PR task text, producing the Docs task message. It includes
+   the reviewed commit and the changed sentence. Docs does not automatically receive root
+   `AGENTS.md`; it can read trusted guidance through a tool when needed.
+4. The Docs subagent makes this tool call:
+
+```python
+read_source_file(
+    repository="pr",
+    path="integration-tests/Cargo.toml",
+    start_line=6,
+    line_count=1,
+)
+```
+
+5. The source tool returns numbered file lines and a continuation cursor. Numbers below are
+   separated from source text by a tab, matching the tool's return format:
+
+```text
+6	[workspace]
+Next line: 7
+```
+
+6. The Docs subagent returns a candidate finding: "The command runs tests in the root workspace,
+   but `integration-tests` declares a separate workspace. Run that workspace separately."
+   The orchestrator receives this reviewer result, applies the checker policy where required,
+   and decides whether to include the correction in the orchestrator report. Python prepares the
+   comment request or report; the workflow's output steps create the selected GitHub objects
+   or saved report.
+
+## PR change patch and stacked PRs
+
+The **PR change patch** is the fetched patch for the selected review base and reviewed PR head,
+before shortening it for task messages. For a stacked PR, the selected base excludes inherited
+parent-PR changes:
+
+```text
+main:        A
+              \
+parent PR:     P1 -- P2
+                     \
+this PR:              C1 -- C2
+
+Review base: P2                   Reviewed PR head: C2
+PR change patch: changes between P2 and C2; excludes inherited P1/P2 changes
+```
+
+The **GitHub PR patch** is the comparison against GitHub's PR base. It can include parent-PR
+changes that the selected review range excludes. Inline-comment validation needs this patch
+because GitHub uses it to determine valid comment locations. For ordinary PRs, the two ranges
+coincide.
+
+PR authors using git stack must keep the generated stack list and immediate-parent PR link up
+to date. Parent and child PRs must belong to the same repository; the declared parent may already
+be merged. Head branches can live in forks. An unmerged parent's current head must be an ancestor
+of the child. Otherwise the workflow
+stops model review and creates a neutral Check Run explaining the boundary problem. Follow that
+check's instructions to refresh the description or synchronize the stack, then retry.
+[`resolve_review_base`](../review_scope.py) selects the boundary and logs its decision.
+
+A **patch excerpt** is the leading portion of the fetched PR change patch inserted into task
+messages. Selecting the commit range happens before applying the excerpt's byte limit.
+`pr_change_patch_bytes` in the workflow holds the fetched patch; `pr_change_patch_excerpt_text`
+holds the decoded excerpt. Neither a fetched patch nor a model's successful return proves every
+changed line was examined.
+
+## Input limits
+
+The workflow applies these limits while preparing the initial task messages:
+
+| Workflow local | What it limits | Value |
+| --- | --- | --- |
+| `max_patch_excerpt_bytes` | Raw PR change patch bytes, before decoding; the same excerpt is included in orchestrator and subagent task messages. | 80,000 bytes |
+| `max_orchestrator_initial_task_message_bytes` | The entire initial orchestrator task message, encoded as UTF-8. | 120,000 bytes |
+| `pr_description_excerpt_text` | The original PR description, before adding any truncation warning. | 4,096 Python characters |
+
+The patch excerpt omits the assignment and other PR data. Subagent task messages contain their
+assignments, shared PR task text and optional maintainer guidance; the task builder does not apply a
+combined 120,000-byte limit to those messages. Source-tool reads can return additional context
+later in the conversation.
+
+The 120,000-byte guard protects the single `omnigent run -p` command argument. On Linux with
+4 KiB pages, one argument is limited to 131,072 bytes including its trailing NUL. Separate role
+instructions, tool definitions and later conversation are outside this initial-message guard.
+It is not the model's context-window limit. The patch cap is an input-size policy, without a
+measured review-quality optimum established by this workflow.
+
+The workflow takes the description's first 4,096 characters without removing generated stack
+navigation. A long stack header can therefore crowd out author-written text. A patch exceeding
+80,000 bytes gets a truncation warning. If the orchestrator's initial task message exceeds
+120,000 UTF-8 bytes, the workflow stops before starting the orchestrator.
+
+## GitHub comments, Checks and saved reports
+
+| Term | GitHub object and visible location |
+| --- | --- |
+| Inline review comment | A file/line comment starting a discussion thread in Files changed. |
+| Review body | The text submitted with a GitHub review, separate from its inline comments. The workflow uses the `COMMENT` review event. |
+| PR Conversation comment | A top-level comment in the PR's Conversation timeline, without a file/line anchor. |
+| `AI Review Summary` Check Run | The commit-specific result in the PR's Checks tab, with GitHub conclusion `neutral`. |
+| Actions artifact | Downloadable files attached to a workflow run. |
+
+In `inline` mode, [`inline_review.py`](../inline_review.py) builds one `COMMENT` review body
+plus at most 12 inline finding comments. Findings without selected or usable locations remain in
+the folded review body. LEFT-side findings stay in that body when the file's PR change patch
+and GitHub PR patch differ. If GitHub rejects the inline review, the workflow posts the folded
+fallback as a Conversation comment, preserving the intended inline findings.
+
+In `collapsed` or `comment` mode, the workflow posts one Conversation comment containing the
+report. [`review_publish.py`](../review_publish.py) formats the comment body. In `summary`
+mode, the workflow writes the report to its Actions job summary. In `artifact` mode, it uploads
+`review_output.txt`, `pr_diff.txt` and `child_task_pr_data.md` with seven-day retention. Exact
+repeat reports or inline findings can be suppressed by the history/deduplication code.
+
+When credentials and the reviewed head are available, the workflow attempts to create
+an `AI Review Summary` Check Run. It shows the validated orchestrator report when one
+is available. If review-range selection fails, it shows the resolver's error. Otherwise,
+it shows a generic unavailable message and a link to the workflow run for diagnostics.
+Its GitHub conclusion is `neutral`; this does not mean that the AI approved the PR.
+
+### Files on the Actions runner
+
+`/tmp/` paths below are local to the Actions runner. Only the artifact files listed above are
+uploaded in artifact mode.
+
+| Runner file | Writer | Consumer and purpose |
+| --- | --- | --- |
+| `/tmp/pr_meta.json` | GitHub fetch step | Task builder and range resolver read original metadata/description and commit identities. |
+| `/tmp/pr_history.json` | History fetch step | History code prepares earlier AI review text and checks for exact repeats. |
+| `/tmp/pr_review_comments.json` | Review-comment fetch step | History code associates earlier inline comments with diff sides. |
+| `/tmp/pr_diff.txt` | Selected-range fetch | Task builder reads the PR change patch; inline code also checks locations against it. |
+| `/tmp/github_pr_diff.txt` | GitHub PR patch fetch, in inline mode | Inline code checks locations against GitHub's comparison. |
+| `/tmp/orchestrator_task.md` | Task builder | Workflow passes the initial task text to `omnigent run -p`. |
+| `/tmp/child_task_pr_data.md` | Task builder | Dispatch hook appends shared PR task text to subagent assignments. |
+| `/tmp/child_task_root_guidance.md` | Task builder | Dispatch hook adds trusted root guidance for the two maintainer roles. |
+| `/tmp/review_raw_output.txt` | Model-run step | Validation step extracts the marked orchestrator report. |
+| `/tmp/review_output.txt` | Validation step | Comment, job-summary, artifact and Check Run steps read the extracted orchestrator report. |
+| `/tmp/inline_findings.json` | Validation step | Inline code reads requested finding locations. |
+| `/tmp/check-summary.txt` | Review-range resolution failure or Check Run fallback | Check Run step reads the resolver error or generic unavailable message. |
 
 ## Shared instruction blocks
 
-Each `REVIEW.md` keeps its reviewer's own instructions inline and shows, in reading order,
-everything that reviewer receives. Text that several reviewers share is stored once under
-[`shared/`](shared), and a `REVIEW.md` names it with a placeholder line. The line
-`${review_rules}` stands for `shared/review_rules.md`.
+Each `REVIEW.md` contains that role's instructions in reading order, including placeholders for
+shared instruction blocks. Text that several roles share is stored once under [`shared/`](shared),
+and a `REVIEW.md` names it with a placeholder line. The line `${review_rules}` stands for
+`shared/review_rules.md`.
 
 | Block | Contents | Included by |
 |---|---|---|
-| `${project_guidance}` | Where project rules live, which sources are untrusted, and the limits on convention-only findings | Every child |
-| `${review_rules}` | Known issue handling and previous AI review handling | Every reviewer |
+| `${project_guidance}` | Where project rules live, which sources are untrusted, and the limits on convention-only findings | Every subagent |
+| `${review_rules}` | Known issue handling and previous AI review handling | Orchestrator, Reviewer subagents and Checker subagent |
 | `${pr_description}` | PR description accuracy | The orchestrator and `docs-reviewer` |
 | `${maintainer}` | The maintainer role and review criteria | Both maintainer reviewers |
-| `${ci_environment}` | CI restrictions | Every child except `disprove-reviewer` |
+| `${ci_environment}` | CI restrictions | Every subagent except `disprove-reviewer` |
 
 For example, `agents/docs-reviewer/REVIEW.md` reads:
 
@@ -110,51 +396,10 @@ python3 .github/omnigent/prepare_reviewer.py /tmp/reviewer
 ```
 
 The "Expand reviewer instructions" step in `ai-review.yml` runs the same command and uses the copy
-in place of the checked-out directory. To see exactly what a reviewer receives, read its
-`REVIEW.md` in the copy.
+in place of the checked-out directory. To inspect a role's expanded instructions, read its
+`REVIEW.md` in the prepared copy.
 
-## Example: what `architecture-reviewer` receives
-
-Its **instructions** are `agents/architecture-reviewer/REVIEW.md` after expansion. The outline
-below lists the sections; the right column gives the shared block or a summary.
-
-```text
-## Project guidance                ${project_guidance}
-## Known issue handling            ${review_rules}
-## Previous AI review handling     ${review_rules}
-You are a senior systems architect reviewing Rust codebases ...
-## Your Mission                    evaluate only the shape of the change
-## What you do NOT review          line-level bugs, style, test coverage
-## Output Format                   at most 5 findings
-## Anatomy of a strong finding
-## CI environment note             ${ci_environment}
-```
-
-Nothing in the instructions refers to a particular pull request. They give the model its role,
-its scope, its output format, and its restrictions.
-
-Its **task** is one string, built for each run:
-
-```text
-Review the architecture of this change.               assignment, written by the orchestrator
-## PR data (untrusted)
-[prior AI reviews, or a sentence saying none exist]
-## PR Metadata                                        title, branches, and commit SHAs
-## PR Description                                     written by the PR author
-## PR Diff                                            at most 80,000 bytes
-```
-
-The first line is the assignment. The orchestrator chooses it, so it differs between children.
-Everything after it is the child task body. When the workflow reviews only a stacked PR's
-changes, the review scope precedes the PR data. A maintainer reviewer's task has one more section,
-between the assignment and the PR data:
-
-```text
-## Root AGENTS.md (trusted workflow revision <sha>)
-[root AGENTS.md]
-```
-
-## How a child task is assembled
+## How a subagent task message is assembled
 
 1. The "Stage trusted project guidance" step copies the guidance `.md` files committed at the
    trusted workflow revision into a new directory and exports its path as `GUIDANCE_SOURCE_ROOT`.
@@ -164,9 +409,9 @@ between the assignment and the PR data:
    orchestrator task.
 3. The "Run AI review" step starts the orchestrator with its instructions and its task.
 4. The orchestrator calls `sys_session_send` with only an assignment in `args.input`. The dispatch
-   hook `append_child_task_body()`, registered in `config.yaml`, appends the PR data file. For a
+   hook `append_child_task_body()`, registered in `config.yaml`, appends the shared PR task text. For a
    reviewer listed under `root_guidance_agents` in `config.yaml`, the hook puts the root guidance
-   file first. Omnigent then starts the child with its instructions and that task. A missing
+   file first. Omnigent then starts the subagent with its instructions and that task. A missing
    assignment or file denies the dispatch.
 
 `config.yaml` lists the hook after the two policies that guard dispatches: the cap on dispatches
@@ -200,9 +445,9 @@ relying on it. A file read returns complete lines and ends with a `Next line: N`
 Root `AGENTS.md` must be nonempty UTF-8; `tests/test_child_task.py` checks the repository's copy.
 The workflow sends the whole file, whatever its size.
 
-The dispatch hook is the only path by which `AGENTS.md` reaches a reviewer. Codex would otherwise
-add the `AGENTS.md` files between its working directory and the repository root to every session
-it starts, so the workflow sets `project_doc_max_bytes = 0` in the Codex configuration.
+The dispatch hook controls which task messages automatically include root `AGENTS.md`. Codex
+would otherwise add `AGENTS.md` files between its working directory and the repository root to
+every session it starts, so the workflow sets `project_doc_max_bytes = 0` in the Codex configuration.
 
 A convention-only finding must cite a rule, concern a change visible in the diff, and omit issues
 that configured linters enforce. The orchestrator merges these findings by rule and publishes at
@@ -214,7 +459,7 @@ Run `prepare_reviewer.py` with a destination directory that does not exist yet. 
 tools in the expanded copy as the workflow's "Materialize read-only source tools" step does,
 then set `PR_SOURCE_ROOT`, `DELTA_SOURCE_ROOT`, and `GUIDANCE_SOURCE_ROOT`.
 
-To run one child, load its `config.yaml` from the copy and send it a task: an assignment followed
+To run one subagent, load its `config.yaml` from the copy and send it a task: an assignment followed
 by the output of `build_pr_data()`. For a maintainer reviewer, put the output of
 `build_root_guidance()` between them. To run the orchestrator, also put `.github/omnigent` on
 `PYTHONPATH` so Omnigent can import `child_task`, and write the two files that `config.yaml` names
@@ -304,5 +549,6 @@ pull request. The file has no size limit: the workflow sends it whole.
 Codex adds the `AGENTS.md` files it finds between its working directory and the repository root to
 every session. The reviewers run inside the checkout, so each Codex reviewer would receive root
 `AGENTS.md` that way: `disprove-reviewer`, which is not meant to get it, and the Codex maintainer
-a second time. Setting `project_doc_max_bytes = 0` leaves the dispatch hook as the only path, so
-`config.yaml` alone decides which reviewers receive the file.
+a second time. Setting `project_doc_max_bytes = 0` leaves the dispatch hook as the only automatic
+inclusion, so `config.yaml` decides which task messages receive the file. Reviewers can still
+request guidance through source tools.
