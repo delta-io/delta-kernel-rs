@@ -410,12 +410,12 @@ pub struct CaseWhenExpression {
 ///
 /// For `p = ParseJson(input)` with a nullable `a: BIGINT` and successful batch decoding:
 ///
-/// | Input | `p` | `p IS NULL` | `COALESCE(p, {a: 42})` |
-/// | --- | --- | --- | --- |
-/// | SQL `NULL` | `NULL` | `true` | `{a: 42}` |
-/// | `'{}'` | `{a: NULL}` | `false` | `{a: NULL}` |
-/// | `'{"a":null}'` | `{a: NULL}` | `false` | `{a: NULL}` |
-/// | `'{"a":1}'` | `{a: 1}` | `false` | `{a: 1}` |
+/// | Input          | `p`         | `p IS NULL` | `COALESCE(p, {a: 42})` |
+/// | -------------- | ----------- | ----------- | ---------------------- |
+/// | SQL `NULL`     | `NULL`      | `true`      | `{a: 42}`              |
+/// | `'{}'`         | `{a: NULL}` | `false`     | `{a: NULL}`            |
+/// | `'{"a":null}'` | `{a: NULL}` | `false`     | `{a: NULL}`            |
+/// | `'{"a":1}'`    | `{a: 1}`    | `false`     | `{a: 1}`               |
 ///
 /// Unparseable input must degrade to NULL rather than fail the query, because kernel parses
 /// `add.stats` with this operator and data skipping reads null stats as "include the file". The
