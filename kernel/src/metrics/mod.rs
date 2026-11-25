@@ -76,6 +76,8 @@
 
 pub(crate) mod events;
 mod scan_plan;
+#[cfg(feature = "declarative-plans")]
+pub(crate) use scan_plan::emit_scan_plan_completed;
 pub use scan_plan::{
     CheckpointMetrics, CheckpointSource, MetadataPlanningReport, ReplayBase, ScanPlanOutcome,
     ScanPlanReport,

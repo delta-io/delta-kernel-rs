@@ -99,18 +99,7 @@ pub(super) fn with_event<F: FnOnce(MetricEvent)>(event: &kernel::ScanPlanReport,
             .collect();
         // Safety: columns and all nested storage remain alive until the callback returns.
         let columns = unsafe { FfiColumnNameArray::new_unsafe(&columns) };
-        let stats = match metadata.stats.struct_stats() {
-            StructStats::None if metadata.stats.synthesize_json() => FfiStatsOptions::JsonOnly,
-            StructStats::None => FfiStatsOptions::None,
-            StructStats::AllIndexed { .. } if metadata.stats.synthesize_json() => {
-                FfiStatsOptions::All
-            }
-            StructStats::AllIndexed { extra_indexed } if extra_indexed.is_empty() => {
-                FfiStatsOptions::AllStruct
-            }
-            StructStats::AllIndexed { .. } => FfiStatsOptions::AllStructWithExtraIndexed(columns),
-            StructStats::Columns { .. } => FfiStatsOptions::StructColumns(columns),
-        };
+        let stats = FfiStatsOptions::from_kernel(&metadata.stats, columns);
         let metrics = event
             .checkpoint
             .as_ref()
@@ -199,11 +188,21 @@ mod tests {
     #[case::columns(StatsOptions::struct_columns(vec![column_name!("nested", "field.with.dot")]))]
     #[case::extra(StatsOptions::all_struct_with_extra_indexed(vec![column_name!("nested", "field")]))]
     #[case::none(StatsOptions::none())]
+    #[case::json(StatsOptions::json_only())]
+    #[case::all(StatsOptions::all())]
+    #[case::all_struct(StatsOptions::all_struct())]
     #[tokio::test]
     async fn callback_preserves_borrowed_paths_and_optional_values(
         #[case] stats: StatsOptions,
         #[values(None, Some(false), Some(true))] resolved: Option<bool>,
         #[values(false, true)] failed: bool,
+        #[values(
+            (None, None),
+            (Some(kernel::ReplayBase::Crc), Some(ReplayBase::Crc)),
+            (Some(kernel::ReplayBase::Checkpoint), Some(ReplayBase::Checkpoint)),
+            (Some(kernel::ReplayBase::Empty), Some(ReplayBase::Empty)),
+        )]
+        replay_base: (Option<kernel::ReplayBase>, Option<ReplayBase>),
     ) {
         let with_checkpoint = resolved.is_some();
         let info = if resolved == Some(true) {
@@ -248,7 +247,7 @@ mod tests {
                     .with_timestamp_timezone("UTC"),
                 read_collations: failed,
                 has_filter: !failed,
-                replay_base: with_checkpoint.then_some(kernel::ReplayBase::Checkpoint),
+                replay_base: replay_base.0,
                 base_version: with_checkpoint.then_some(0),
                 commit_start_version: with_checkpoint.then_some(0),
                 commit_end_version: with_checkpoint.then_some(0),
@@ -290,25 +289,11 @@ mod tests {
             assert_eq!(record.read_collations, failed);
             assert_eq!(record.has_filter, !failed);
             assert_eq!(record.base_version, with_checkpoint.then_some(0).into());
-            match (&record.stats, metadata.stats.struct_stats()) {
-                (FfiStatsOptions::StructColumns(columns), StructStats::Columns { requested }) => {
-                    assert_eq!(
-                        &unsafe { columns.try_to_column_names() }.unwrap(),
-                        requested
-                    );
-                }
-                (
-                    FfiStatsOptions::AllStructWithExtraIndexed(columns),
-                    StructStats::AllIndexed { extra_indexed },
-                ) => {
-                    assert_eq!(
-                        &unsafe { columns.try_to_column_names() }.unwrap(),
-                        extra_indexed
-                    );
-                }
-                (FfiStatsOptions::None, StructStats::None) => {}
-                _ => panic!("incorrect stats options"),
-            }
+            assert_eq!(record.replay_base, replay_base.1.into());
+            assert_eq!(
+                unsafe { record.stats.try_to_kernel() }.unwrap(),
+                metadata.stats
+            );
             assert!(matches!(
                 record.partition_values,
                 FfiPartitionValuesOptions::WithStruct

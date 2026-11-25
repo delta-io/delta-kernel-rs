@@ -1066,6 +1066,8 @@ impl MetricEvent {
 }
 
 /// Invoke `f` with the FFI [`MetricEvent`] built from `event`.
+///
+/// If scan-plan checkpoint conversion fails, log a warning without invoking `f`.
 pub(crate) fn with_ffi_event(event: &kernel::MetricEvent, f: impl FnOnce(MetricEvent)) {
     if let kernel::MetricEvent::ScanPlanGenerationCompleted(report) = event {
         scan_plan::with_event(report, f);

@@ -1007,10 +1007,7 @@ fn assert_metadata_output_options(
             );
             if let Some(checkpoint) = checkpoint {
                 let cached = scan.snapshot.cached_checkpoint_info().unwrap();
-                assert!(Arc::ptr_eq(
-                    checkpoint.info.as_ref().unwrap(),
-                    cached.as_ref().unwrap()
-                ));
+                assert_eq!(checkpoint.info.as_deref(), cached.as_deref());
             }
             assert_eq!(
                 report.commit_start_version,

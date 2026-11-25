@@ -67,7 +67,7 @@ use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::events::emit_scan_metadata_completed;
 #[cfg(feature = "declarative-plans")]
 use crate::metrics::{
-    MetadataPlanningReport, ScanPlanOutcome, ScanPlanReport, reporter::emit_scan_plan_completed,
+    MetadataPlanningReport, ScanPlanOutcome, ScanPlanReport, emit_scan_plan_completed,
 };
 use crate::metrics::{MetricId, ScanType};
 use crate::parallel::sequential_phase::SequentialPhase;
@@ -1556,7 +1556,7 @@ impl Scan {
             Err(_) => ScanPlanOutcome::Error,
         };
         report.duration_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        emit_scan_plan_completed(report);
+        emit_scan_plan_completed(&report);
         result
     }
 
