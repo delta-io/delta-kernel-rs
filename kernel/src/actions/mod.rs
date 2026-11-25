@@ -1539,6 +1539,8 @@ impl LastManifestCommit {
 /// which the checkpoint is complete. For manifest commits, the checkpoint action also contains
 /// the table protocol and metadata, making the commit self-contained with respect to P+M.
 ///
+/// Each app id and each domain appears at most once across the inline entries and the sidecars.
+///
 /// Example manifest-commit JSON:
 /// ```json
 /// { "checkpoint": [
@@ -1936,6 +1938,16 @@ impl CheckpointAction {
     #[internal_api]
     pub(crate) fn version(&self) -> i64 {
         self.version
+    }
+
+    /// The checkpoint version as a [`Version`], failing if it is negative.
+    pub(crate) fn checkpoint_version(&self) -> KernelResult<Version> {
+        Version::try_from(self.version).map_err(|_| {
+            KernelError::invalid_checkpoint(format!(
+                "checkpoint action version {} is negative",
+                self.version
+            ))
+        })
     }
 
     /// Convert the referenced root manifest into a [`FileMeta`] for engine I/O.
