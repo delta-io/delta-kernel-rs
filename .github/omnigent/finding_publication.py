@@ -72,7 +72,7 @@ class GitHub:
 
 
 def collect_findings(review: str, structured: Any) -> tuple[list[dict[str, Any]], list[str]]:
-    """Read final findings from model-written JSON and prose, including PR-wide findings.
+    """Read final findings from the orchestrator report's JSON and Markdown, including PR-wide findings.
 
     The structured finding body takes precedence for a matching ID. Invalid file/line coordinates
     require a Conversation comment; an invalid finding ID or body produces an explicit error.
@@ -146,7 +146,7 @@ def collect_findings(review: str, structured: Any) -> tuple[list[dict[str, Any]]
 
 
 def review_overview(review: str) -> str:
-    """Extract the model's PR summary, ignoring example headings inside code fences."""
+    """Extract the PR summary from the orchestrator report, ignoring fenced example headings."""
     boundaries = _review_sections(review)
     for index, (offset, line) in enumerate(boundaries):
         if re.fullmatch(r"(?:#{1,4}\s+|\d+\.\s+\*\*)(?:PR )?Summary(?:\*\*)?\s*:?\s*", line):
@@ -177,7 +177,7 @@ def _review_sections(review: str) -> list[tuple[int, str]]:
 
 def publish_findings(
     *, github: Any, repository: str, pr_number: int, head_sha: str, run_url: str,
-    review: str, structured: Any, diff: str, review_diff: str | None,
+    review: str, structured: Any, github_pr_patch: str, pr_change_patch: str | None,
     trusted_bot_logins: list[str], mode: str = "inline", placement: str = "inline-or-conversation",
 ) -> dict[str, Any]:
     """Post or reuse finding comments and update the main AI review comment for one commit.
@@ -201,7 +201,7 @@ def publish_findings(
     }
     if mode in {"summary", "artifact"}:
         for finding in findings:
-            finding.update(head_sha=head_sha, placement=mode, url=run_url, delivery="new")
+            finding.update(head_sha=head_sha, placement=mode, url=None, delivery=None)
         record["complete"] = not errors
         return record
     prefix = f"repos/{repository}"
@@ -254,10 +254,14 @@ def publish_findings(
                 errors.append("The main comment write could not be confirmed.")
                 return record
     record["main_url"] = _url(main)
-    allowed = diff_positions(diff)
-    reviewed = diff_positions(review_diff) if review_diff is not None else allowed
-    github_sections = _diff_sections(diff)
-    scoped_sections = _diff_sections(review_diff) if review_diff is not None else github_sections
+    github_pr_patch_positions = diff_positions(github_pr_patch)
+    pr_change_patch_positions = (
+        diff_positions(pr_change_patch) if pr_change_patch is not None else github_pr_patch_positions
+    )
+    github_pr_patch_sections = _diff_sections(github_pr_patch)
+    pr_change_patch_sections = (
+        _diff_sections(pr_change_patch) if pr_change_patch is not None else github_pr_patch_sections
+    )
     for finding in findings:
         finding.update(head_sha=head_sha, url=None, delivery=None)
         existing = _existing(finding, issues, inline)
@@ -274,10 +278,10 @@ def publish_findings(
         position = finding["path"], finding["line"], finding["side"]
         can_inline = (
             mode == "inline" and placement == "inline-or-conversation"
-            and position in allowed and position in reviewed
+            and position in github_pr_patch_positions and position in pr_change_patch_positions
             and (
                 finding["side"] != "LEFT"
-                or github_sections.get(finding["path"]) == scoped_sections.get(finding["path"])
+                or github_pr_patch_sections.get(finding["path"]) == pr_change_patch_sections.get(finding["path"])
             )
         )
         metadata = {**source, "id": finding["id"], "fingerprint": finding["fingerprint"]}
@@ -361,7 +365,9 @@ def publication_check(review: str, record: dict[str, Any]) -> str:
         finding.get("delivery") for finding in record["findings"] if finding.get("url")
     )
     parts = [complete_review(review, record["findings"]), "## Finding publication",
-             f"New destinations: {totals['new']} · Reused destinations: {totals['reused']}"]
+             f"New finding comments: {totals['new']} · Reused finding comments: {totals['reused']}"]
+    if record.get("mode") in {"summary", "artifact"}:
+        parts.append(f"Report output: {record['mode']}. No PR comments requested.")
     parts.extend(f"- {error}" for error in record["errors"])
     return "\n\n".join(parts) + "\n"
 
@@ -436,14 +442,14 @@ def _existing(
 
 
 def main() -> None:
-    """Post the validated review and save comment records and Check Run text to files."""
+    """Publish final findings from the orchestrator report and save publication records."""
     parser = argparse.ArgumentParser(description=__doc__)
     for name in (
-        "review", "findings", "diff", "trusted-bot-logins", "output",
+        "review", "findings", "github-pr-patch", "trusted-bot-logins", "output",
         "check-output", "full-review-output",
     ):
         parser.add_argument(f"--{name}", type=Path, required=True)
-    parser.add_argument("--review-diff", type=Path)
+    parser.add_argument("--pr-change-patch", type=Path)
     for name in ("head-sha", "run-url", "repository", "mode"):
         parser.add_argument(f"--{name}", required=True)
     parser.add_argument("--pr-number", type=int, required=True)
@@ -457,10 +463,10 @@ def main() -> None:
         github=GitHub(), repository=args.repository, pr_number=args.pr_number,
         head_sha=args.head_sha, run_url=args.run_url, review=review,
         structured=json.loads(args.findings.read_text()),
-        diff=args.diff.read_bytes().decode("utf-8", errors="replace"),
-        review_diff=(
-            args.review_diff.read_bytes().decode("utf-8", errors="replace")
-            if args.review_diff else None
+        github_pr_patch=args.github_pr_patch.read_bytes().decode("utf-8", errors="replace"),
+        pr_change_patch=(
+            args.pr_change_patch.read_bytes().decode("utf-8", errors="replace")
+            if args.pr_change_patch else None
         ),
         trusted_bot_logins=json.loads(args.trusted_bot_logins.read_text()),
         mode=args.mode, placement=args.placement,

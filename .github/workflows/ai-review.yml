@@ -1012,13 +1012,6 @@ jobs:
           max_orchestrator_initial_task_message_bytes = 120_000
           review_marker = os.environ["REVIEW_MARKER"]
           review_base_sha = os.environ["REVIEW_BASE_SHA"]
-          start_marker = f"<!-- AI_REVIEW_START_{review_marker} -->"
-          end_marker = f"<!-- AI_REVIEW_END_{review_marker} -->"
-          output_contract = (
-              f"Begin your response with the exact marker {start_marker} on its own "
-              f"line, then the review. End with the exact marker {end_marker} on its "
-              "own line."
-          )
           output_contract = inline_prompt_instructions(review_marker)
           pr_metadata = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
           history_path = pathlib.Path("/tmp/pr_history.json")
@@ -1432,8 +1425,8 @@ jobs:
           python3 .github/omnigent/finding_publication.py \
             --review /tmp/review_output.txt \
             --findings /tmp/inline_findings.json \
-            --diff /tmp/github_pr_diff.txt \
-            --review-diff /tmp/pr_diff.txt \
+            --github-pr-patch /tmp/github_pr_diff.txt \
+            --pr-change-patch /tmp/pr_diff.txt \
             --head-sha "$HEAD_SHA" \
             --run-url "$RUN_URL" \
             --repository "$REPO" \
