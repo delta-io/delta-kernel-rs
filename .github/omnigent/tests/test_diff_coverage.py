@@ -47,11 +47,11 @@ def stack_header(*, decorated: bool = False) -> str:
 
 
 class DiffCoverageTest(unittest.TestCase):
-    def test_exact_child_budget_and_one_extra_byte_for_both_review_scopes(self):
+    def test_exact_subagent_patch_budget_and_one_extra_byte_for_both_review_ranges(self):
         for base_sha in (BASE, CHILD_BASE):
             for size, complete in ((100_000, True), (100_001, False)):
                 with self.subTest(base_sha=base_sha, size=size):
-                    prepared = diff_coverage.prepare_inputs(
+                    prepared = diff_coverage.prepare_review_inputs(
                         file_diff(size=size), "Author.", base_sha, HEAD
                     )
                     coverage = prepared["coverage"]
@@ -60,14 +60,14 @@ class DiffCoverageTest(unittest.TestCase):
                     self.assertEqual(coverage["total_bytes"], size)
                     self.assertEqual(coverage["delivered_bytes"], 100_000)
                     self.assertEqual(coverage["complete"], complete)
-                    self.assertLessEqual(len(prepared["child_diff"].encode()), 100_000)
+                    self.assertLessEqual(len(prepared["subagent_patch_excerpt_text"].encode()), 100_000)
                     self.assertEqual(coverage["partial_files"], int(not complete))
 
     def test_mid_file_cut_preserves_partial_and_omitted_paths_in_original_order(self):
         first = file_diff("first.rs", 90_000)
         second = file_diff("second.rs", 20_000)
         third = file_diff("last.rs")
-        coverage = diff_coverage.prepare_inputs(first + second + third, "", BASE, HEAD)["coverage"]
+        coverage = diff_coverage.prepare_review_inputs(first + second + third, "", BASE, HEAD)["coverage"]
         self.assertEqual(coverage["total_files"], 3)
         self.assertEqual(
             [item["path"] for item in coverage["files"]], ["first.rs", "second.rs", "last.rs"]
@@ -83,11 +83,11 @@ class DiffCoverageTest(unittest.TestCase):
 
     def test_byte_limit_does_not_split_utf8_diff_or_description(self):
         raw = file_diff(size=99_999) + "é".encode()
-        prepared = diff_coverage.prepare_inputs(raw, "é" * 5000, BASE, HEAD)
+        prepared = diff_coverage.prepare_review_inputs(raw, "é" * 5000, BASE, HEAD)
         self.assertEqual(prepared["coverage"]["delivered_bytes"], 99_999)
-        self.assertNotIn("�", prepared["child_diff"])
-        self.assertEqual(len(prepared["description"].encode()), 8192)
-        self.assertTrue(prepared["description_truncated"])
+        self.assertNotIn("�", prepared["subagent_patch_excerpt_text"])
+        self.assertEqual(len(prepared["pr_description_excerpt_text"].encode()), 8192)
+        self.assertTrue(prepared["pr_description_truncated"])
         self.assertEqual(diff_coverage.utf8_prefix("é".encode(), 1), "")
 
     def test_only_recognized_leading_generated_stack_header_is_removed(self):
@@ -97,10 +97,10 @@ class DiffCoverageTest(unittest.TestCase):
                 with self.subTest(decorated=decorated, newline=newline):
                     header = stack_header(decorated=decorated).replace("\n", newline)
                     raw = header + author
-                    prepared = diff_coverage.prepare_inputs(file_diff(), raw, BASE, HEAD)
-                    self.assertEqual(prepared["description"], author)
+                    prepared = diff_coverage.prepare_review_inputs(file_diff(), raw, BASE, HEAD)
+                    self.assertEqual(prepared["pr_description_excerpt_text"], author)
                     self.assertTrue(raw.startswith(header))
-                    self.assertFalse(prepared["description_truncated"])
+                    self.assertFalse(prepared["pr_description_truncated"])
 
     def test_generated_navigation_preserves_unpublished_descendants_and_this_pr_suffix(self):
         for suffix in ("<- _this PR_", "(this PR)"):
@@ -133,41 +133,41 @@ class DiffCoverageTest(unittest.TestCase):
 
     def test_author_text_is_budgeted_after_generated_navigation(self):
         raw = stack_header() + "A" * 8192
-        prepared = diff_coverage.prepare_inputs(file_diff(), raw, BASE, HEAD)
-        self.assertEqual(prepared["description"], "A" * 8192)
-        self.assertFalse(prepared["description_truncated"])
-        prepared = diff_coverage.prepare_inputs(file_diff(), raw + "B", BASE, HEAD)
-        self.assertTrue(prepared["description_truncated"])
+        prepared = diff_coverage.prepare_review_inputs(file_diff(), raw, BASE, HEAD)
+        self.assertEqual(prepared["pr_description_excerpt_text"], "A" * 8192)
+        self.assertFalse(prepared["pr_description_truncated"])
+        prepared = diff_coverage.prepare_review_inputs(file_diff(), raw + "B", BASE, HEAD)
+        self.assertTrue(prepared["pr_description_truncated"])
 
-    def test_late_child_hunk_is_delivered_and_parent_still_sees_complete_manifest(self):
+    def test_late_pr_hunk_reaches_subagents_and_orchestrator_gets_all_changed_paths(self):
         first = file_diff("first.rs", 85_000)
         late = file_diff("late_child.rs", 10_000)
         omitted = file_diff("omitted.rs", 10_000)
         raw = first + late + omitted
-        prepared = diff_coverage.prepare_inputs(raw, "author", CHILD_BASE, HEAD)
-        parent = diff_coverage.parent_prompt("Instructions.", raw, prepared["coverage"])
-        self.assertIn("diff --git a/late_child.rs", prepared["child_diff"])
+        prepared = diff_coverage.prepare_review_inputs(raw, "author", CHILD_BASE, HEAD)
+        parent = diff_coverage.build_orchestrator_task_message("Instructions.", raw, prepared["coverage"])
+        self.assertIn("diff --git a/late_child.rs", prepared["subagent_patch_excerpt_text"])
         self.assertIn('"late_child.rs"', parent)
         self.assertIn('"omitted.rs"', parent)
         self.assertNotIn("diff --git a/late_child.rs", parent)
         self.assertLessEqual(len(parent.encode()), 120_000)
 
-    def test_parent_budget_reserves_manifest_and_handles_multibyte_prefix(self):
+    def test_orchestrator_message_reserves_changed_paths_and_counts_utf8_bytes(self):
         raw = file_diff("é.rs", 100_001)
-        coverage = diff_coverage.prepare_inputs(raw, "", BASE, HEAD)["coverage"]
+        coverage = diff_coverage.prepare_review_inputs(raw, "", BASE, HEAD)["coverage"]
         prefix = "é" * 30_000
-        parent = diff_coverage.parent_prompt(prefix, raw, coverage)
+        parent = diff_coverage.build_orchestrator_task_message(prefix, raw, coverage)
         self.assertTrue(parent.startswith(prefix))
         self.assertIn('"é.rs"', parent)
         self.assertLessEqual(len(parent.encode()), 120_000)
-        with self.assertRaisesRegex(ValueError, "fixed orchestrator"):
-            diff_coverage.parent_prompt("a" * 120_001, raw, coverage)
+        with self.assertRaisesRegex(ValueError, "task text without the patch"):
+            diff_coverage.build_orchestrator_task_message("a" * 120_001, raw, coverage)
 
     def test_huge_manifest_uses_paged_tool_and_all_paths_remain_retrievable(self):
         paths = [f"directory/{index:04d}/" + "x" * 170 + ".rs" for index in range(1300)]
         raw = b"".join(file_diff(path) for path in paths)
-        coverage = diff_coverage.prepare_inputs(raw, "", BASE, HEAD)["coverage"]
-        parent = diff_coverage.parent_prompt("Instructions.", raw, coverage)
+        coverage = diff_coverage.prepare_review_inputs(raw, "", BASE, HEAD)["coverage"]
+        parent = diff_coverage.build_orchestrator_task_message("Instructions.", raw, coverage)
         self.assertIn("list_changed_paths", parent)
         self.assertLessEqual(len(parent.encode()), 120_000)
         with tempfile.TemporaryDirectory() as directory:
@@ -201,8 +201,8 @@ class DiffCoverageTest(unittest.TestCase):
         )
         sections = diff_coverage.file_sections(raw)
         self.assertEqual(sections[0]["path"], 'dir/café\tline\nname\\quoted".rs')
-        prepared = diff_coverage.prepare_inputs(raw, "", BASE, HEAD)
-        parent = diff_coverage.parent_prompt("Instructions.", raw, prepared["coverage"])
+        prepared = diff_coverage.prepare_review_inputs(raw, "", BASE, HEAD)
+        parent = diff_coverage.build_orchestrator_task_message("Instructions.", raw, prepared["coverage"])
         self.assertIn("\\tline\\nname", parent)
 
     def test_rename_deletion_binary_and_space_paths_keep_one_section_each(self):
@@ -223,15 +223,15 @@ class DiffCoverageTest(unittest.TestCase):
         )
 
     def test_empty_diff_is_complete_and_malformed_input_fails_explicitly(self):
-        coverage = diff_coverage.prepare_inputs(b"", "", BASE, HEAD)["coverage"]
+        coverage = diff_coverage.prepare_review_inputs(b"", "", BASE, HEAD)["coverage"]
         self.assertTrue(coverage["complete"])
         self.assertEqual(coverage["total_files"], 0)
         with self.assertRaisesRegex(ValueError, "Git file sections"):
-            diff_coverage.prepare_inputs(b"not a diff", "", BASE, HEAD)
+            diff_coverage.prepare_review_inputs(b"not a diff", "", BASE, HEAD)
         with self.assertRaisesRegex(ValueError, "UTF-8"):
-            diff_coverage.prepare_inputs(file_diff() + b"\xff", "", BASE, HEAD)
+            diff_coverage.prepare_review_inputs(file_diff() + b"\xff", "", BASE, HEAD)
         with self.assertRaisesRegex(ValueError, "SHAs"):
-            diff_coverage.prepare_inputs(file_diff(), "", "bad", HEAD)
+            diff_coverage.prepare_review_inputs(file_diff(), "", "bad", HEAD)
 
     def test_source_tool_wrapper_reads_installed_library_without_repo_imports(self):
         root = Path(__file__).parents[1]

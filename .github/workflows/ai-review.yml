@@ -1002,7 +1002,7 @@ jobs:
 
           sys.path.insert(0, ".github/omnigent")
           from inline_review import inline_prompt_instructions
-          from diff_coverage import parent_prompt, prepare_inputs
+          from diff_coverage import build_orchestrator_task_message, prepare_review_inputs
           from review_history import (
               DEFAULT_TRUSTED_BOT_LOGINS,
               attach_inline_comment_sides,
@@ -1035,19 +1035,20 @@ jobs:
               history_document, trusted_bot_logins
           )
           pr_change_patch_bytes = pathlib.Path("/tmp/pr_diff.txt").read_bytes()
-          inputs = prepare_inputs(
-              pr_change_patch_bytes, pr_metadata.get("body") or "", review_base_sha, pr_metadata["head"]["sha"]
+          prepared_review_inputs = prepare_review_inputs(
+              pr_change_patch_bytes, pr_metadata.get("body") or "",
+              review_base_sha, pr_metadata["head"]["sha"],
           )
-          pr_description_excerpt_text = inputs["description"]
-          if inputs["description_truncated"]:
+          pr_description_excerpt_text = prepared_review_inputs["pr_description_excerpt_text"]
+          if prepared_review_inputs["pr_description_truncated"]:
               pr_description_excerpt_text += "\n\n[PR description truncated at 8192 UTF-8 bytes by the workflow.]"
-          pr_change_patch_excerpt_text = inputs["child_diff"]
-          coverage = inputs["coverage"]
+          subagent_patch_excerpt_text = prepared_review_inputs["subagent_patch_excerpt_text"]
+          coverage = prepared_review_inputs["coverage"]
           pathlib.Path("/tmp/ai_review_changed_paths.json").write_text(json.dumps(coverage))
           pathlib.Path("/tmp/diff_coverage.json").write_text(json.dumps(coverage))
           print(
               f"Review range {review_base_sha}...{pr_metadata['head']['sha']}: "
-              f"{coverage['delivered_bytes']}/{coverage['total_bytes']} child diff bytes; "
+              f"{coverage['delivered_bytes']}/{coverage['total_bytes']} subagent patch excerpt bytes; "
               f"{coverage['full_files']} full, {coverage['partial_files']} partial, "
               f"{coverage['omitted_files']} omitted files."
           )
@@ -1069,7 +1070,7 @@ jobs:
               if review_base_sha != pr_metadata["base"]["sha"]
               else ""
           )
-          # Child task body: the dispatch hook in child_task.py appends the PR data to the
+          # Subagent task message: the dispatch hook in child_task.py appends the PR data to the
           # assignment the orchestrator writes, preceded by root AGENTS.md for the reviewers
           # that reviewer/config.yaml lists under root_guidance_agents.
           pathlib.Path("/tmp/child_task_root_guidance.md").write_text(
@@ -1082,13 +1083,13 @@ jobs:
           pathlib.Path("/tmp/child_task_pr_data.md").write_text(
               review_scope + build_pr_data(
                   meta=pr_metadata, review_base_sha=review_base_sha,
-                  body=pr_description_excerpt_text, diff=pr_change_patch_excerpt_text,
+                  body=pr_description_excerpt_text, diff=subagent_patch_excerpt_text,
                   review_history=prior_ai_review_text, truncation_note=truncation_note,
               ),
               encoding="utf-8",
           )
 
-          # Orchestrator task: per-run rules, PR data, and the output contract. It uses the
+          # Orchestrator task message: per-run rules, PR data, and the output contract. It uses the
           # review history during consolidation.
           pr_metadata_and_description = format_pr_metadata_and_description(
               pr_metadata, pr_description_excerpt_text, review_base_sha=review_base_sha
@@ -1145,7 +1146,9 @@ jobs:
           Do not downgrade a finding to bypass a failed gate.
 
           """
-          orchestrator_initial_task_text = parent_prompt(orchestrator_initial_task_text, pr_change_patch_bytes, coverage)
+          orchestrator_initial_task_text = build_orchestrator_task_message(
+              orchestrator_initial_task_text, pr_change_patch_bytes, coverage
+          )
           pathlib.Path("/tmp/orchestrator_task.md").write_text(orchestrator_initial_task_text, encoding="utf-8")
           PYEOF
 

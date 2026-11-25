@@ -430,12 +430,12 @@ class ReviewScopeTest(unittest.TestCase):
                     text=True,
                 )
                 if large_diff and result.returncode == 0:
-                    parent_prompt = (temp / "orchestrator_task.md").read_text()
+                    build_orchestrator_task_message = (temp / "orchestrator_task.md").read_text()
                     child_prompt = (temp / "child_task_pr_data.md").read_text()
-                    self.assertIn("late_child.rs", parent_prompt)
+                    self.assertIn("late_child.rs", build_orchestrator_task_message)
                     self.assertIn("late_child_change();", child_prompt)
-                    self.assertNotIn("late_child_change();", parent_prompt)
-                    self.assertLessEqual(len(parent_prompt.encode()), 120_000)
+                    self.assertNotIn("late_child_change();", build_orchestrator_task_message)
+                    self.assertLessEqual(len(build_orchestrator_task_message.encode()), 120_000)
                 if review_base is None:
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn("::error::Cannot select", result.stdout)
