@@ -240,7 +240,7 @@ impl MetricEvent {
             if matches!(self, Self::CrcReadSuccess(_) | Self::CrcReadFailure(_)) {
                 let reason = value.parse::<CrcReadFailureReason>();
                 *self = Self::CrcReadFailure(CrcReadFailure {
-                    reason: reason.unwrap_or(CrcReadFailureReason::Unknown),
+                    reason: reason.unwrap_or(CrcReadFailureReason::Error),
                 });
                 return reason.map(|_| ()).map_err(|_| CrcReadSuccess::SPAN_NAME);
             }
@@ -305,7 +305,7 @@ impl MetricEvent {
             Self::DomainMetadataLoadSuccess(_) => Self::DomainMetadataLoadFailure,
             Self::SetTransactionLoadSuccess(_) => Self::SetTransactionLoadFailure,
             Self::CrcReadSuccess(_) => Self::CrcReadFailure(CrcReadFailure {
-                reason: CrcReadFailureReason::Unknown,
+                reason: CrcReadFailureReason::Error,
             }),
             Self::LastCheckpointReadCompleted(mut e) => {
                 if e.outcome == LastCheckpointReadOutcome::Unknown {
@@ -1523,12 +1523,10 @@ pub enum CrcReadFailureReason {
     Empty,
     /// The file could not be decoded or failed CRC validation.
     Parsing,
-    /// Storage returned another error.
+    /// The read failed for another reason.
     Error,
     /// The read was cancelled; cancellation propagates instead of falling back.
     Cancelled,
-    /// The reason was not recorded or its metric label was unrecognized.
-    Unknown,
 }
 
 /// An attempted CRC read failed. Non-cancellation failures allow the caller to replay the log.

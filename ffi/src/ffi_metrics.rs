@@ -556,8 +556,6 @@ pub enum CrcReadFailureReason {
     Error,
     /// The read was cancelled.
     Cancelled,
-    /// The reason was unrecorded, unrecognized, or is unavailable to this binding.
-    Unknown,
 }
 
 impl From<kernel::CrcReadFailureReason> for CrcReadFailureReason {
@@ -566,9 +564,8 @@ impl From<kernel::CrcReadFailureReason> for CrcReadFailureReason {
             kernel::CrcReadFailureReason::NotFound => Self::NotFound,
             kernel::CrcReadFailureReason::Empty => Self::Empty,
             kernel::CrcReadFailureReason::Parsing => Self::Parsing,
-            kernel::CrcReadFailureReason::Error => Self::Error,
             kernel::CrcReadFailureReason::Cancelled => Self::Cancelled,
-            _ => Self::Unknown,
+            _ => Self::Error,
         }
     }
 }
@@ -1149,7 +1146,6 @@ mod tests {
         kernel::CrcReadFailureReason::Cancelled,
         CrcReadFailureReason::Cancelled
     )]
-    #[case(kernel::CrcReadFailureReason::Unknown, CrcReadFailureReason::Unknown)]
     fn crc_read_failure_conversion_preserves_reason(
         #[case] reason: kernel::CrcReadFailureReason,
         #[case] expected: CrcReadFailureReason,

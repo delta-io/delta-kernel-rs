@@ -363,14 +363,14 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case(None, CrcReadFailureReason::Unknown)]
+    #[case(None, CrcReadFailureReason::Error)]
     #[case(Some("not_found"), CrcReadFailureReason::NotFound)]
     #[case(Some("empty"), CrcReadFailureReason::Empty)]
     #[case(Some("parsing"), CrcReadFailureReason::Parsing)]
     #[case(Some("error"), CrcReadFailureReason::Error)]
     #[case(Some("cancelled"), CrcReadFailureReason::Cancelled)]
-    #[case(Some("unknown"), CrcReadFailureReason::Unknown)]
-    #[case(Some("future_reason"), CrcReadFailureReason::Unknown)]
+    #[case(Some("unknown"), CrcReadFailureReason::Error)]
+    #[case(Some("future_reason"), CrcReadFailureReason::Error)]
     fn crc_failure_preserves_recorded_reason(
         #[case] label: Option<&str>,
         #[case] expected: CrcReadFailureReason,
