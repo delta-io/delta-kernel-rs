@@ -336,8 +336,8 @@ In `summary` mode, the workflow writes the complete report to its Actions job su
 PR comments.
 
 When credentials and the reviewed PR head are available, the workflow attempts to create an
-`AI Review Summary` Check Run. It includes all parsed final findings and publication results when
-available. If review-range selection fails, it shows the resolver's error. Otherwise, it shows a
+`AI Review Summary` Check Run. It includes all parsed final findings when available.
+If review-range selection fails, it shows the resolver's error. Otherwise, it shows a
 generic unavailable message and a workflow-run link for diagnostics. Its GitHub conclusion is
 `neutral`; this does not mean the AI approved the PR.
 
@@ -373,14 +373,16 @@ locations GitHub rejects. LEFT-side findings use Conversation comments when the 
 sections differ. The workflow does not limit the number of inline finding comments.
 
 `finding_publication.py` checks earlier bot comments before posting another copy of a finding.
-If a write times out, it rereads GitHub comments before deciding whether another write is needed.
+An explicitly rejected inline write can fall back to a Conversation comment. A write whose
+response is lost remains unconfirmed, without an automatic read-back or retry.
 The main comment counts each final finding with a confirmed new or reused comment URL once.
 A comment URL establishes delivery, not correctness. Unconfirmed writes produce an explicit
 posting error instead of a successful count.
 
 The command writes finding IDs, severities, reviewed SHA, comment URLs and posting errors to
 `/tmp/publication_record.json`. The workflow uses that file to build the Check Run report.
-The report lists new and reused comment counts separately from the number of final findings.
+The Check Run includes all final findings. Posting errors appear in the workflow log and main
+comment; the Check Run does not add a separate comment-delivery summary.
 `summary` and `artifact` modes record their selected report output without posting finding comments.
 
 ### Main AI review comment format
@@ -419,6 +421,25 @@ It is absent when there are none. Nits count in the headline and have individual
 no rows in that disclosure. All disclosures start closed. A posting failure can replace the
 count line with `Finding counts unavailable.` and adds an explanation. The Check Run includes
 all final findings, including findings supplied only in structured model output.
+
+### Individual finding comment format
+
+Inline and Conversation finding comments use the same format. Keep the claim, explanation and
+suggested fix visible. Reviewer attribution, the reviewed commit and the main-comment link use
+small text above the feedback prompt. Machine-readable IDs such as `ShouldFix1` are displayed as
+labels such as `[Should Fix 1]`.
+
+```markdown
+**[Should Fix 1]** <one-paragraph claim>
+
+**Explanation:** <evidence and reasoning supporting the claim>
+
+**Suggested fix:** <the proposed correction>
+
+---
+<sub>Raised by: <reviewer names> · Reviewed `<short SHA>` · [AI Review](<main URL>)</sub><br>
+<sub>Feedback: react 👍 if helpful, 👎 if unhelpful or incorrect, or 👀 if out of scope.</sub>
+```
 
 ## Shared instruction blocks
 

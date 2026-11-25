@@ -138,7 +138,7 @@ class FindingPublicationTest(unittest.TestCase):
         self.assertEqual(retained["aliases"], ["Nit2"])
         self.assertIn("🛑 0 Blockers · 🔧 0 Should Fix · 💡 1 Nit", github.issues[0]["body"])
         check = publication_check("## PR Summary\nChanges a call.", record)
-        self.assertIn("New finding comments: 1 · Reused finding comments: 0", check)
+        self.assertNotIn("## Finding publication", check)
         self.assertEqual(check.count("A retained claim."), 1)
 
     def test_published_main_comment_unwraps_its_workflow_metadata(self):
@@ -226,6 +226,17 @@ class FindingPublicationTest(unittest.TestCase):
         self.assertEqual(len(github.inline), 1)
         self.assertIn("Finding counts unavailable", github.issues[0]["body"])
 
+    def test_invalid_locations_and_whitespace_ids_do_not_abort_valid_siblings(self):
+        for side, finding_id in (([], "ShouldFix1"), ({}, "ShouldFix1"),
+                                 ("RIGHT", "Should\tFix1")):
+            with self.subTest(side=side, finding_id=finding_id):
+                github = FakeGitHub()
+                entry = dict(finding(finding_id, "A separate advisory concern."), side=side)
+                record = publish(github, [entry, finding()])
+                self.assertTrue(record["complete"], record["errors"])
+                self.assertEqual([item["id"] for item in record["findings"]], ["ShouldFix1", "Nit1"])
+                self.assertTrue(all(item["url"] for item in record["findings"]))
+
     def test_rejected_inline_and_structured_only_finding_use_visible_fallback(self):
         github = FakeGitHub()
         github.failures["Nit1"] = "reject"
@@ -236,15 +247,18 @@ class FindingPublicationTest(unittest.TestCase):
         self.assertNotIn("<details>", github.issues[1]["body"])
         check = publication_check("## PR Summary\nChanges a call.", record)
         self.assertIn("JSON-only claim.", check)
-        self.assertIn("New finding comments: 1", check)
+        self.assertNotIn("New finding comments:", check)
 
-    def test_lost_accepted_response_is_reconciled_without_fallback_duplicate(self):
+    def test_lost_response_stays_unconfirmed_without_readback_or_fallback(self):
         github = FakeGitHub()
         github.failures["Nit1"] = "ambiguous-posted"
         record = publish(github, [finding()])
-        self.assertTrue(record["complete"], record["errors"])
+        self.assertFalse(record["complete"])
         self.assertEqual(len(github.inline), 1)
         self.assertEqual(len(github.issues), 1)
+        self.assertIsNone(record["findings"][0]["url"])
+        self.assertIn("could not be confirmed", record["findings"][0]["error"])
+        self.assertEqual(len(github.reads), 3)
 
     def test_unobserved_write_stays_incomplete_and_retry_reuses_prior_success(self):
         github = FakeGitHub()
@@ -271,7 +285,7 @@ class FindingPublicationTest(unittest.TestCase):
                 self.assertEqual(len(github.inline), 1)
                 self.assertEqual(second["findings"][0]["delivery"], "reused")
                 check = publication_check("review", second)
-                self.assertIn("New finding comments: 0 · Reused finding comments: 1", check)
+                self.assertNotIn("## Finding publication", check)
                 main = github.issues[-1]["body"]
                 self.assertEqual("existing thread" in main, severity != "Nit")
 
@@ -310,8 +324,8 @@ class FindingPublicationTest(unittest.TestCase):
                 self.assertIsNone(record["findings"][0]["delivery"])
                 check = publication_check("## PR Summary\nChanges a call.", record)
                 self.assertIn("A retained claim.", check)
-                self.assertIn("New finding comments: 0 · Reused finding comments: 0", check)
-                self.assertIn("No PR comments requested.", check)
+                self.assertNotIn("## Finding publication", check)
+                self.assertNotIn("Report output:", check)
 
     def test_conversation_modes_and_setting_preserve_each_finding(self):
         for mode, placement in (("comment", "inline-or-conversation"),
@@ -334,14 +348,29 @@ class FindingPublicationTest(unittest.TestCase):
         _, errors = collect_findings("review", [dict(finding(), severity="Blocker")])
         self.assertTrue(errors)
 
-    def test_inline_detail_folding_preserves_attribution_and_conversation_visibility(self):
-        item = finding(body="Claim.\n\nEvidence.\n\nRaised by: protocol-reviewer\n\nSuggested fix: use x.")
-        inline = format_finding(item, head_sha=HEAD_SHA, main_url=RUN_URL, collapsed=True)
-        conversation = format_finding(item, head_sha=HEAD_SHA, main_url=RUN_URL)
-        self.assertIn("<summary>Details</summary>", inline)
-        self.assertNotIn("<details>", conversation)
-        self.assertIn("Raised by: protocol-reviewer · Reviewed", inline)
-        self.assertEqual(canonical_finding_body(inline), canonical_finding_body(conversation))
+    def test_visible_explanation_and_fix_preserve_attribution_and_finding_identity(self):
+        bodies = (
+            "Claim.\n\nEvidence.\n\nRaised by: protocol-reviewer\n\nSuggested fix: use x.",
+            "Claim.\n\nExplanation: Evidence.\n\nSuggested fix: use x.\n\nRaised by: protocol-reviewer",
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                comment = format_finding(finding(body=body), head_sha=HEAD_SHA, main_url=RUN_URL)
+                self.assertNotIn("<details>", comment)
+                self.assertIn("**Explanation:**", comment)
+                self.assertIn("Evidence.", comment)
+                self.assertIn("**Suggested fix:** use x.", comment)
+                self.assertIn("<sub>Raised by: protocol-reviewer · Reviewed", comment)
+                self.assertIn("</sub><br>\n<sub>Feedback:", comment)
+                self.assertEqual(canonical_finding_body(comment), canonical_finding_body(body))
+
+    def test_finding_fields_inside_code_examples_are_not_reformatted_or_moved(self):
+        example = "```text\nRaised by: example\nSuggested fix: example\n```"
+        body = f"Claim.\n\n{example}\n\nSuggested fix: use x.\n\nRaised by: docs-reviewer"
+        comment = format_finding(finding(body=body), head_sha=HEAD_SHA, main_url=RUN_URL)
+        self.assertIn(example, comment)
+        self.assertIn("<sub>Raised by: docs-reviewer · Reviewed", comment)
+        self.assertEqual(canonical_finding_body(comment), canonical_finding_body(body))
 
     def test_pr_summary_legacy_summary_and_structured_only_check_text(self):
         for heading in ("## PR Summary", "## Summary", "### Summary", "3. **Summary**"):

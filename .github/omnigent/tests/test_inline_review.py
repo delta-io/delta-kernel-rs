@@ -1061,7 +1061,7 @@ class InlineReviewTest(unittest.TestCase):
                     "path": "kernel/src/example.rs",
                     "line": 10,
                     "side": "RIGHT",
-                    "body": "**Nit1** Finding." + self.inline_review.INLINE_FEEDBACK_FOOTER,
+                    "body": "**Nit1** Finding." + self.inline_review.FINDING_FEEDBACK_FOOTER,
                 }
             ],
         )

@@ -99,7 +99,8 @@ Each finding must include:
 - a stable ID (`Blocker1`, `Blocker2`, ...; `ShouldFix1`, `ShouldFix2`, ...; `Nit1`, `Nit2`, ...),
   with each finding beginning on its own `### <ID>` Markdown heading;
 - the file/line, diff hunk, or PR title/description section reference;
-- the concrete failure or maintenance cost;
+- a first paragraph stating the concrete failure or maintenance cost;
+- `Explanation:` with the evidence and reasoning supporting that claim;
 - `Raised by: <agent names>` with all agents that flagged that issue;
 - `Suggested fix:` with a concrete change. Include a short code snippet when
   it makes the fix clearer; omit snippets for trivial one-line fixes.
@@ -126,8 +127,8 @@ The orchestrator report should read like a concise human code review:
   "critical", "significant", or "comprehensive" unless the diff proves it;
 - avoid filler transitions such as "it is important to note", "additionally",
   "overall", "in summary", and "the key takeaway";
-- avoid repeated bold-label lists except for the required `Raised by:` and
-  `Suggested fix:` lines;
+- use `Explanation:`, `Suggested fix:` and `Raised by:` to identify each finding's supporting
+  text, proposed correction and reviewer attribution;
 - keep sentences direct and specific. If there is no useful finding, say so
   plainly and stop.
 

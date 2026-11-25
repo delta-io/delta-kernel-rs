@@ -6,7 +6,8 @@ import re
 from collections.abc import Collection
 from typing import Any
 
-from review_publish import BOT_MARKER, INLINE_FEEDBACK_FOOTER, strip_review_body
+from markdown_utils import markdown_lines
+from review_publish import BOT_MARKER, FINDING_FEEDBACK_FOOTER, strip_review_body
 
 MAX_HISTORY_CHARS = 12_000
 MAX_ENTRY_CHARS = 6_000
@@ -99,15 +100,30 @@ def is_duplicate_review(
 
 def canonical_finding_body(body: str) -> str:
     """Normalize an inline finding body for exact cross-run comparison."""
-    body = body.strip().removesuffix(INLINE_FEEDBACK_FOOTER)
+    body = body.strip().removesuffix(FINDING_FEEDBACK_FOOTER)
+    body = re.sub(
+        r"\n+---\n<sub>(?:Raised by: [^\n]+ · )?Reviewed `[0-9a-f]+` · "
+        r"\[AI Review\]\([^\n]+\)</sub><br>\n<sub>Feedback: [^\n]+</sub>\s*$",
+        "", body,
+    )
     body = body.removeprefix(BOT_MARKER).lstrip()
     body = re.sub(r"^<!-- ai-review-finding \{[^\n]*\} -->\s*", "", body)
     body = re.sub(
         r"\n+(?:Raised by: [^\n]+ · )?Reviewed `[0-9a-f]+` · \[AI Review\]\([^\n]+\)\s*$",
         "", body,
     )
-    body = re.sub(r"(?im)^Raised by:\s*[^\n]+\n?", "", body)
     body = body.replace("<details><summary>Details</summary>", "").replace("</details>", "")
+    lines = []
+    for _, line, fence in markdown_lines(body):
+        if fence is None:
+            if re.match(r"^(?:\*\*)?Raised by(?:\*\*)?:", line, re.I):
+                continue
+            line = re.sub(
+                r"^(?:\*\*)?(?:Explanation|Suggested fix)(?:\*\*)?:[ \t]*"
+                r"(?:\*\*)?[ \t]*", "", line, flags=re.I,
+            )
+        lines.append(line)
+    body = "".join(lines)
     return _normalize(_FINDING_PREFIX.sub("", body.strip()))
 
 
