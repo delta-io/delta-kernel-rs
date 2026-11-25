@@ -19,7 +19,7 @@ use tracing::{debug, info, instrument, warn};
 use url::Url;
 
 use crate::last_checkpoint_hint::LastCheckpointHint;
-use crate::metrics::{CheckpointPartsMissing, emit_checkpoint_parts_missing};
+use crate::metrics::CheckpointPartsMissing;
 use crate::path::LogPathFileType::*;
 use crate::path::{CheckpointInstance, LogPathFileType, ParsedLogPath};
 use crate::{KernelError, KernelResult, KernelResultIterator, StorageHandler, Version};
@@ -280,7 +280,7 @@ pub(crate) enum CheckpointHandling {
     /// Adopt the latest complete checkpoint and discard the files it covers.
     #[default]
     Adopt,
-    /// Recognize complete checkpoints without adopting them, retaining all listed commits.
+    /// Retain all listed commits without adopting checkpoints.
     Ignore,
 }
 
@@ -301,7 +301,7 @@ struct ListingAccumulator {
     /// Staging area for checkpoint parts at the current version group; always empty when iteration
     /// ends
     pending_checkpoint_parts: Vec<ParsedLogPath>,
-    /// Incomplete candidates retained until the final replay base is known.
+    /// Incomplete candidates newer than the adopted replay checkpoint.
     incomplete_checkpoints: Vec<CheckpointPartsMissing>,
     /// End-version bound used in process_file() to filter CompactedCommit files
     end_version: Option<Version>,
@@ -366,31 +366,33 @@ impl ListingAccumulator {
     /// only the latest commit.
     fn select_checkpoint_for_group(&mut self, version: Version) {
         let pending_checkpoint_parts = std::mem::take(&mut self.pending_checkpoint_parts);
-        if self.checkpoint_handling == CheckpointHandling::Adopt {
-            // Grouping retains only contiguous prefixes, so count raw candidates before it
-            // discards a missing first or middle part. Empty files identify but do not fill parts.
-            let mut multipart_parts: HashMap<u32, HashSet<u32>> = HashMap::new();
-            for part in &pending_checkpoint_parts {
-                if let MultiPartCheckpoint {
-                    part_num,
-                    num_parts,
-                } = part.file_type
-                {
-                    let parts = multipart_parts.entry(num_parts).or_default();
-                    if part.location.size > 0 {
-                        parts.insert(part_num);
-                    }
+        if self.checkpoint_handling == CheckpointHandling::Ignore {
+            // TODO(#3269): Track ignored checkpoints outside the active LogSegment.
+            return;
+        }
+        // Grouping retains only contiguous prefixes, so count raw candidates before it
+        // discards a missing first or middle part. Empty files identify but do not fill parts.
+        let mut multipart_parts: HashMap<u32, HashSet<u32>> = HashMap::new();
+        for part in &pending_checkpoint_parts {
+            if let MultiPartCheckpoint {
+                part_num,
+                num_parts,
+            } = part.file_type
+            {
+                let parts = multipart_parts.entry(num_parts).or_default();
+                if part.location.size > 0 {
+                    parts.insert(part_num);
                 }
             }
-            for (expected_parts, parts) in multipart_parts {
-                let found_parts = parts.len() as u64;
-                if found_parts < u64::from(expected_parts) {
-                    self.incomplete_checkpoints.push(CheckpointPartsMissing {
-                        version,
-                        expected_parts: u64::from(expected_parts),
-                        found_parts,
-                    });
-                }
+        }
+        for (expected_parts, parts) in multipart_parts {
+            let found_parts = parts.len() as u64;
+            if found_parts < u64::from(expected_parts) {
+                self.incomplete_checkpoints.push(CheckpointPartsMissing {
+                    version,
+                    expected_parts: u64::from(expected_parts),
+                    found_parts,
+                });
             }
         }
         let usable_parts = pending_checkpoint_parts
@@ -404,11 +406,6 @@ impl ListingAccumulator {
         else {
             return;
         };
-        if self.checkpoint_handling == CheckpointHandling::Ignore {
-            // TODO(#3269): Return `complete_checkpoint` separately so `Snapshot` can
-            //              track it outside its active `LogSegment`.
-            return;
-        }
         self.incomplete_checkpoints.clear();
         self.output.checkpoint_parts = complete_checkpoint;
         // Keep the commit at the checkpoint version (if any) before clearing all older commits.
@@ -433,19 +430,8 @@ impl ListingAccumulator {
     }
 
     fn emit_incomplete_checkpoints(&mut self) {
-        let checkpoint_version = self
-            .output
-            .checkpoint_parts
-            .first()
-            .map(|part| part.version);
         for missing in self.incomplete_checkpoints.drain(..) {
-            if checkpoint_version.is_none_or(|version| missing.version > version) {
-                emit_checkpoint_parts_missing(
-                    missing.version,
-                    missing.expected_parts,
-                    missing.found_parts,
-                );
-            }
+            missing.emit();
         }
     }
 }
@@ -738,23 +724,6 @@ impl LogSegmentFiles {
                         || matches!(file.file_type, MultiPartCheckpoint { .. }));
             },
         )?;
-        // An AMT hint refers to a manifest commit rather than a checkpoint file.
-        #[cfg(feature = "adaptive-metadata-in-dev")]
-        let expects_checkpoint_file = checkpoint_metadata.amt_checkpoint.is_none();
-        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
-        let expects_checkpoint_file = true;
-        if expects_checkpoint_file
-            && listed_files.checkpoint_parts.is_empty()
-            && !hinted_checkpoint_candidate_seen
-        {
-            let expected_parts = if checkpoint_metadata.v2_checkpoint.is_some() {
-                1
-            } else {
-                checkpoint_metadata.parts.unwrap_or(1) as u64
-            };
-            emit_checkpoint_parts_missing(checkpoint_metadata.version, expected_parts, 0);
-        }
-
         let Some(latest_checkpoint) = listed_files.checkpoint_parts.last() else {
             // The segment has no checkpoint version yet starts at the hinted version: the
             // manifest commit's checkpoint action supplies the state before it.
@@ -763,6 +732,23 @@ impl LogSegmentFiles {
             {
                 validate_amt_listing(&listed_files, checkpoint_metadata, manifest_commit_version)?;
                 return Ok(listed_files);
+            }
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            let expects_checkpoint_file = checkpoint_metadata.amt_checkpoint.is_none();
+            #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+            let expects_checkpoint_file = true;
+            if expects_checkpoint_file && !hinted_checkpoint_candidate_seen {
+                let expected_parts = if checkpoint_metadata.v2_checkpoint.is_some() {
+                    1
+                } else {
+                    checkpoint_metadata.parts.unwrap_or(1) as u64
+                };
+                CheckpointPartsMissing {
+                    version: checkpoint_metadata.version,
+                    expected_parts,
+                    found_parts: 0,
+                }
+                .emit();
             }
             // The hint names a checkpoint that no longer exists, and because the listing started
             // at the hinted version, no checkpoint exists at or after it either. The log was

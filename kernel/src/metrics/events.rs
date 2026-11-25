@@ -1567,6 +1567,16 @@ pub struct CheckpointPartsMissing {
 impl CheckpointPartsMissing {
     pub(crate) const SPAN_NAME: &'static str = "checkpoint_parts_missing";
 
+    pub(crate) fn emit(&self) {
+        let _span = tracing::info_span!(
+            CheckpointPartsMissing::SPAN_NAME,
+            report = tracing::field::Empty,
+            version = self.version,
+            expected_parts = self.expected_parts,
+            found_parts = self.found_parts,
+        );
+    }
+
     pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
         let mut event = Self {
             version: 0,
@@ -1599,16 +1609,6 @@ impl fmt::Display for CheckpointPartsMissing {
             self.version, self.expected_parts, self.found_parts
         )
     }
-}
-
-pub(crate) fn emit_checkpoint_parts_missing(version: u64, expected_parts: u64, found_parts: u64) {
-    let _span = tracing::info_span!(
-        CheckpointPartsMissing::SPAN_NAME,
-        report = tracing::field::Empty,
-        version,
-        expected_parts,
-        found_parts,
-    );
 }
 
 // ====================================================================
