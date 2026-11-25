@@ -1,8 +1,8 @@
 //! Snapshot checksum provenance, available without engine I/O.
 
-use delta_kernel::snapshot::CrcSource;
+use delta_kernel::snapshot::{CrcOrigin, CrcProvenance, CrcSource};
 
-use crate::{Handle, SharedSnapshot};
+use crate::{Handle, OptionalValue, SharedSnapshot};
 
 /// How an in-memory checksum relates to an observed checksum file. See [`CrcSource`].
 ///
@@ -99,6 +99,71 @@ impl From<FfiCrcSource> for CrcSource {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_crc_source(snapshot: Handle<SharedSnapshot>) -> FfiCrcSource {
     unsafe { snapshot.as_ref() }.crc_source().into()
+}
+
+/// How Kernel acquired the CRC contents before incremental replay.
+///
+/// cbindgen:prefix-with-name=true
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum FfiCrcOrigin {
+    /// Read from a checksum file.
+    File,
+    /// Supplied in a connector hint.
+    SnapshotHint,
+    /// Computed by CREATE TABLE.
+    CreateTable,
+    /// Reconstructed from a checkpoint.
+    Checkpoint,
+    /// Reconstructed from commit history starting at version zero.
+    CommitHistory,
+}
+
+/// Owned version information for a checksum retained by a snapshot.
+#[repr(C)]
+pub struct FfiCrcProvenance {
+    /// Where Kernel acquired the initial in-memory CRC.
+    pub origin: FfiCrcOrigin,
+    /// Version described by the retained CRC, including subsequent incremental replay.
+    pub crc_version: u64,
+    /// Checksum-file version known from reads, successful writes, or the hint's disk claim.
+    pub on_disk_version: OptionalValue<u64>,
+}
+
+impl From<CrcProvenance> for FfiCrcProvenance {
+    fn from(value: CrcProvenance) -> Self {
+        let origin = match value.origin {
+            CrcOrigin::File => FfiCrcOrigin::File,
+            CrcOrigin::SnapshotHint => FfiCrcOrigin::SnapshotHint,
+            CrcOrigin::CreateTable => FfiCrcOrigin::CreateTable,
+            CrcOrigin::Checkpoint => FfiCrcOrigin::Checkpoint,
+            CrcOrigin::CommitHistory => FfiCrcOrigin::CommitHistory,
+        };
+        Self {
+            origin,
+            crc_version: value.crc_version,
+            on_disk_version: value.on_disk_version.into(),
+        }
+    }
+}
+
+/// Copies the retained in-memory CRC's provenance to `out`, including for a stale CRC.
+/// Returns true when a value was written. With no retained CRC it returns false and leaves
+/// `out` untouched. See [`snapshot_crc_source`] for the snapshot's disk observation.
+///
+/// # Safety
+/// The snapshot must remain valid for the call. `out` must be aligned and writable for one
+/// `FfiCrcProvenance`. Its previous contents may be uninitialized.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapshot_crc_provenance(
+    snapshot: Handle<SharedSnapshot>,
+    out: *mut FfiCrcProvenance,
+) -> bool {
+    let Some(provenance) = (unsafe { snapshot.as_ref() }).crc_provenance() else {
+        return false;
+    };
+    unsafe { out.write(provenance.into()) };
+    true
 }
 
 #[cfg(test)]

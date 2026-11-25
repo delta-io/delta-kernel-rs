@@ -32,7 +32,9 @@ use crate::ffi_test_utils::{
     assert_extern_result_error_with_message, install_thread_local_metrics_reporter, ok_or_panic,
 };
 use crate::log_path::FfiLogPath;
-use crate::snapshot::snapshot_crc::snapshot_crc_source;
+use crate::snapshot::snapshot_crc::{
+    FfiCrcOrigin, FfiCrcProvenance, snapshot_crc_provenance, snapshot_crc_source,
+};
 use crate::{
     FfiFileStats, FfiIncrementalReplay, FfiLogSegmentStats, KernelI64Slice, KernelStringSlice,
     OptionalValue, SharedExternEngine, engine_to_handle, free_engine, free_snapshot,
@@ -2462,6 +2464,22 @@ fn checksum_telemetry_round_trips_without_changing_hint_state(
 
     // Then the supplied telemetry and CRC presence survive the round trip.
     assert_eq!(observed, expected.into());
+    let mut detail = std::mem::MaybeUninit::<FfiCrcProvenance>::uninit();
+    let present = unsafe { snapshot_crc_provenance(rebuilt.shallow_copy(), detail.as_mut_ptr()) };
+    assert_eq!(present, crc_version.is_some());
+    if present {
+        let detail = unsafe { detail.assume_init() };
+        assert_eq!(detail.origin, FfiCrcOrigin::SnapshotHint);
+        assert_eq!(detail.crc_version, 2);
+        let disk = match expected {
+            CrcSource::AtVersion { crc_version } => Some(crc_version),
+            CrcSource::Reconstructed {
+                on_disk_version, ..
+            } => Some(on_disk_version),
+            _ => None,
+        };
+        assert_eq!(Option::from(detail.on_disk_version), disk);
+    }
     let rebuilt_ref = unsafe { rebuilt.as_ref() };
     assert_eq!(
         rebuilt_ref.crc_at_version().map(|crc| crc.version),

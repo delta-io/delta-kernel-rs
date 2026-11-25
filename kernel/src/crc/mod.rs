@@ -17,11 +17,11 @@
 #![allow(unreachable_pub)]
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
 mod delta;
 mod file_size_histogram;
 mod file_stats;
+mod provenance;
 mod reader;
 mod state;
 mod writer;
@@ -35,6 +35,8 @@ pub use file_stats::FileStats;
 pub(crate) use file_stats::{
     FileStatsDelta, FileStatsPolicy, is_incremental_safe_operation, size_to_u64,
 };
+pub(crate) use provenance::CrcWithProvenance;
+pub use provenance::{CrcOrigin, CrcProvenance};
 pub(crate) use reader::read_crc_file_or_none;
 #[cfg(test)]
 pub(crate) use reader::try_read_crc_file;
@@ -49,66 +51,6 @@ use crate::actions::LastManifestCommit;
 use crate::actions::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
 use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
 use crate::{KernelError, KernelResult, Version};
-
-/// CRC state available for replay and the observation that produced it.
-#[derive(Debug, Clone)]
-pub(crate) enum CrcWrapper {
-    /// A CRC retained in memory, possibly advanced beyond its original checksum file.
-    Present {
-        crc: Arc<Crc>,
-        on_disk_version: Option<Version>,
-    },
-    /// No checksum file was found in the listed version range.
-    Missing,
-    /// The listed checksum file was unusable and there was no usable retained CRC.
-    Unusable,
-    /// No CRC is retained and no checksum-file observation is available.
-    Unknown,
-}
-
-impl CrcWrapper {
-    /// Records a CRC successfully read from or written to its version's checksum file.
-    pub(crate) fn from_file(crc: Arc<Crc>) -> Self {
-        Self::Present {
-            on_disk_version: Some(crc.version),
-            crc,
-        }
-    }
-
-    pub(crate) fn as_ref(&self) -> Option<&Arc<Crc>> {
-        match self {
-            Self::Present { crc, .. } => Some(crc),
-            _ => None,
-        }
-    }
-
-    /// Updates the retained CRC in memory, preserving its original checksum-file version.
-    pub(crate) fn map_crc(self, update: impl FnOnce(Arc<Crc>) -> Arc<Crc>) -> Self {
-        match self {
-            Self::Present {
-                crc,
-                on_disk_version,
-            } => Self::Present {
-                crc: update(crc),
-                on_disk_version,
-            },
-            absent => absent,
-        }
-    }
-}
-
-/// A CRC supplied without an observation of its checksum file has unknown disk origin.
-impl From<Option<Arc<Crc>>> for CrcWrapper {
-    fn from(crc: Option<Arc<Crc>>) -> Self {
-        match crc {
-            Some(crc) => Self::Present {
-                crc,
-                on_disk_version: None,
-            },
-            None => Self::Unknown,
-        }
-    }
-}
 
 // ============================================================================
 // Crc: in-memory representation

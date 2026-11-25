@@ -18,7 +18,8 @@ use super::LogSegment;
 use crate::actions::{CheckpointAction, LastManifestCommit};
 use crate::actions::{DomainMetadata, Format, Metadata, Protocol, SetTransaction};
 use crate::crc::{
-    Crc, CrcWrapper, DomainMetadataState, FileSizeHistogram, SetTransactionState, try_read_crc_file,
+    Crc, CrcWithProvenance, DomainMetadataState, FileSizeHistogram, SetTransactionState,
+    try_read_crc_file,
 };
 use crate::engine::CancellableEngine;
 use crate::engine::sync::SyncEngine;
@@ -497,7 +498,10 @@ impl BuiltCrcTest {
         let log_root = self.url.join("_delta_log/").unwrap();
         let log_segment =
             LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
-        log_segment.build_crc_from_base(&self.engine, base)
+        let base = CrcWithProvenance::from_snapshot_hint(Arc::new(base.clone()), None);
+        log_segment
+            .build_crc_from_base(&self.engine, &base)
+            .map(|crc| crc.crc().as_ref().clone())
     }
 
     /// List with the fixture engine, then read the CRC with `engine` and `in_memory_base`.
@@ -510,11 +514,11 @@ impl BuiltCrcTest {
         let log_root = self.url.join("_delta_log/").unwrap();
         let log_segment =
             LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
-        let retained = in_memory_base.cloned().into();
+        let retained =
+            in_memory_base.map(|crc| CrcWithProvenance::from_snapshot_hint(crc.clone(), None));
         Ok(log_segment
-            .pick_latest_base_crc(engine, &retained)?
-            .as_ref()
-            .map(|crc| crc.version))
+            .pick_latest_base_crc(engine, retained.as_ref())?
+            .map(|crc| crc.version()))
     }
 
     /// Read the on-disk CRC at `version` from this test's log.
@@ -610,7 +614,7 @@ impl BuiltCrcTest {
             LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
         let crc = log_segment.read_latest_crc(&self.engine).unwrap();
         log_segment
-            .read_protocol_metadata_opt(&self.engine, crc.as_ref())
+            .read_protocol_metadata_opt(&self.engine, crc.as_ref().map(CrcWithProvenance::crc))
             .unwrap()
             .captured_checkpoint_action
     }
@@ -1659,28 +1663,20 @@ async fn pick_latest_base_crc_preserves_source_and_cancellation(
     }
     let engine = CancellableEngine::new(&built.engine, token);
 
-    let retained = CrcWrapper::Present {
-        crc: base.clone(),
-        on_disk_version: known_source.then_some(base.version),
-    };
+    let retained =
+        CrcWithProvenance::from_snapshot_hint(base.clone(), known_source.then_some(base.version));
 
     // When the baseline is selected, reading a newer disk candidate may be cancelled.
-    let result = segment.pick_latest_base_crc(&engine, &retained);
+    let result = segment.pick_latest_base_crc(&engine, Some(&retained));
 
     // Then cancellation propagates; otherwise selection preserves or establishes the source.
     if cancelled && disk_version == Some(1) {
         assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
     } else {
-        let CrcWrapper::Present {
-            crc,
-            on_disk_version,
-        } = result.unwrap()
-        else {
-            panic!("expected a retained CRC");
-        };
-        assert_eq!(crc.version, expected_version);
+        let crc = result.unwrap().expect("expected an in-memory CRC");
+        assert_eq!(crc.version(), expected_version);
         assert_eq!(
-            on_disk_version,
+            crc.on_disk_version(),
             (expected_version != base.version || known_source).then_some(expected_version)
         );
     }

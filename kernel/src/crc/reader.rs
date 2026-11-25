@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use tracing::instrument;
 
-use super::Crc;
+use super::{Crc, CrcWithProvenance};
 use crate::metrics::CrcReadFailureReason;
 use crate::metrics::events::CRC_READ_COMPLETED_SPAN;
 use crate::path::{AsUrl as _, ParsedLogPath};
@@ -52,9 +52,9 @@ pub(crate) fn try_read_crc_file(
 pub(crate) fn read_crc_file_or_none(
     engine: &dyn Engine,
     crc_file: &ParsedLogPath,
-) -> KernelResult<Option<Arc<Crc>>> {
+) -> KernelResult<Option<CrcWithProvenance>> {
     match try_read_crc_file(engine, crc_file) {
-        Ok(crc) => Ok(Some(Arc::new(crc))),
+        Ok(crc) => Ok(Some(CrcWithProvenance::from_file(Arc::new(crc)))),
         Err(error) if matches!(error.without_backtrace(), KernelError::Cancelled) => Err(error),
         Err(_) => Ok(None),
     }
@@ -125,7 +125,7 @@ mod tests {
         if cancelled {
             assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
         } else {
-            assert_eq!(result.unwrap().map(|crc| crc.version), expected);
+            assert_eq!(result.unwrap().map(|crc| crc.version()), expected);
         }
         let reason = if cancelled {
             Some(CrcReadFailureReason::Cancelled)

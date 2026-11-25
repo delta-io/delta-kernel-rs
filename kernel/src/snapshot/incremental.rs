@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use tracing::{debug, error, instrument};
 
-use super::{IncrementalReplay, PreparedSnapshot, Snapshot};
+use super::{IncrementalReplay, PreparedSnapshot, Snapshot, SnapshotCrc};
+use crate::crc::CrcWithProvenance;
 use crate::log_segment::{LogSegment, PmResolution};
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::metrics::{
@@ -290,7 +291,7 @@ impl Snapshot {
         // matching the fresh path.
         let pm_start = std::time::Instant::now();
         let base_crc = combined_log_segment
-            .pick_latest_base_crc(engine, existing_snapshot.crc.as_ref())
+            .pick_latest_base_crc(engine, existing_snapshot.crc.base())
             .inspect_err(|_| {
                 emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
             })?;
@@ -305,7 +306,7 @@ impl Snapshot {
             Some((crc, source)) => {
                 // If we were able to build a new CRC, then re-use it for TableConfiguration
                 // creation, keeping only the P&M that changed.
-                let mut resolution = PmResolution::from_crc(crc, *source);
+                let mut resolution = PmResolution::from_crc(crc.crc(), *source);
                 resolution
                     .metadata
                     .take_if(|m| m == existing_table_config.metadata());
@@ -321,12 +322,12 @@ impl Snapshot {
                 // newer than the existing snapshot (else the existing snapshot is the baseline).
                 let newer_base = base_crc
                     .as_ref()
-                    .filter(|c| c.version > existing_snapshot_version);
+                    .filter(|crc| crc.version() > existing_snapshot_version);
                 // TODO(#3421): Classify missing replay-file failures as Delta errors using the
                 // incremental replay context, preserving the original error sources.
                 combined_log_segment
                     .segment_after_version(existing_snapshot_version)
-                    .read_protocol_metadata_opt(engine, newer_base)
+                    .read_protocol_metadata_opt(engine, newer_base.map(CrcWithProvenance::crc))
                     .inspect_err(|_| {
                         emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
                     })?
@@ -335,7 +336,7 @@ impl Snapshot {
         emit_protocol_metadata_load(metric_context, resolution.source, pm_start.elapsed());
         debug!(
             source = ?resolution.source,
-            base_crc_version = ?base_crc.as_ref().map(|crc| crc.version),
+            base_crc_version = ?base_crc.as_ref().map(|crc| crc.version()),
             crc_at_target = crc_at_version.is_some(),
             metadata_resolved = resolution.metadata.is_some(),
             protocol_resolved = resolution.protocol.is_some(),
@@ -353,7 +354,10 @@ impl Snapshot {
         let crc = Self::validate_configuration_and_crc(
             combined_log_segment,
             &table_configuration,
-            base_crc.map_crc(|base| crc_at_version.map_or(base, |(crc, _)| crc)),
+            SnapshotCrc::from_lookup(
+                crc_at_version.map(|(crc, _)| crc).or(base_crc),
+                combined_log_segment.listed.latest_crc_file.is_some(),
+            ),
         )?;
         let log_segment = current_segment
             .take()
@@ -2026,6 +2030,13 @@ mod tests {
         // baseline's provenance, including Unknown, survives.
         assert_eq!(updated.version(), 5);
         assert_eq!(updated.crc_at_version().map(|c| c.version), expected_crc_v);
+        let detail = updated.crc_provenance().unwrap();
+        if known_provenance || listed_new_disk_crc == Some(false) {
+            assert_eq!(detail.origin, crate::snapshot::CrcOrigin::File);
+        } else {
+            assert_eq!(detail.origin, crate::snapshot::CrcOrigin::SnapshotHint);
+        }
+        assert_eq!(detail.crc_version, expected_crc_v.unwrap_or(3));
         assert_eq!(
             updated.crc_source(),
             if known_provenance || listed_new_disk_crc == Some(false) {

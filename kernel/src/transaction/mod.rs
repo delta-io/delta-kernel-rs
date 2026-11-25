@@ -11,7 +11,7 @@ use crate::actions::{
     Protocol, SetTransaction, TIGHT_BOUNDS,
 };
 use crate::committer::{CommitMetadata, CommitProtocolMetadata, CommitType, Committer};
-use crate::crc::{CrcDelta, FileStatsDelta};
+use crate::crc::{CrcDelta, CrcWithProvenance, FileStatsDelta};
 use crate::error::KernelError;
 use crate::expressions::ColumnName;
 use crate::log_segment::LogSegment;
@@ -1373,7 +1373,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
                 let snapshot = Snapshot::new_with_crc(
                     log_segment,
                     self.effective_table_config,
-                    Some(Arc::new(crc)),
+                    CrcWithProvenance::from_create_table(Arc::new(crc)),
                     true,  /* built_as_latest */
                     false, /* skipped_new_checkpoints */
                 )?;

@@ -6,14 +6,14 @@ use delta_kernel_derive::internal_api;
 
 use crate::actions::{Metadata, Protocol};
 use crate::checkpoint::SelectedCheckpointType;
-use crate::crc::{Crc, CrcWrapper};
+use crate::crc::{Crc, CrcWithProvenance};
 use crate::error::SnapshotHintError;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_path::LogPath;
 use crate::log_segment::{LogSegment, validate_catalog_version_bounds};
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::path::{DELTA_LOG_DIR_WITH_SLASH, ParsedLogPath};
-use crate::snapshot::{CrcSource, IncrementalReplay, SnapshotRef};
+use crate::snapshot::{CrcSource, IncrementalReplay, SnapshotCrc, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::{require, try_parse_uri};
 use crate::{KernelError, KernelResult, Result, Snapshot, Version};
@@ -121,6 +121,8 @@ impl SnapshotHint {
     /// [`Reconstructed`](CrcSource::Reconstructed) from an earlier disk version. Its claimed
     /// version must match the CRC. Building the snapshot rejects any inconsistent claim,
     /// including [`Stale`](CrcSource::Stale), with [`SnapshotHintError::CrcSourceMismatch`].
+    /// The in-memory origin is [`SnapshotHint`](super::CrcOrigin::SnapshotHint) for every
+    /// accepted CRC. Its disk observation comes from the supplied claim.
     ///
     /// # Errors
     ///
@@ -279,18 +281,15 @@ impl SnapshotHint {
             .and_then(Option::as_deref)
             .map(|info| info.last_checkpoint())
             .or(last_checkpoint_hint);
-        let source = match snapshot.crc_source() {
-            CrcSource::Stale { .. } => CrcSource::Unknown,
-            source => source,
-        };
+        let crc = snapshot.crc.only_current();
         Ok(Self {
             version: snapshot.version(),
             log_segment_files: segment.listed.clone(),
             protocol: snapshot.table_configuration().protocol().clone(),
             metadata: snapshot.table_configuration().metadata().clone(),
             last_checkpoint_hint: last_checkpoint_hint.cloned(),
-            crc: snapshot.crc_at_version().cloned(),
-            crc_source: Some(source),
+            crc: crc.base().map(|crc| crc.crc().clone()),
+            crc_source: Some(crc.source()),
             checkpoint_type: snapshot.known_checkpoint_type(),
             freshness: if snapshot.is_built_as_latest() {
                 SnapshotHintFreshness::Latest
@@ -449,14 +448,17 @@ impl SnapshotHint {
 ///   `on_disk_version`.
 /// - Case 5: Reject all other combinations, including `Stale`. A hinted CRC must be at the hint's
 ///   snapshot version.
-fn crc_from_hint(crc: Option<Arc<Crc>>, claim: CrcSource) -> KernelResult<CrcWrapper> {
+fn crc_from_hint(crc: Option<Arc<Crc>>, claim: CrcSource) -> KernelResult<SnapshotCrc> {
     let crc_version = crc.as_ref().map(|crc| crc.version);
     match (crc, claim) {
-        (crc, CrcSource::Unknown) => Ok(crc.into()),
-        (None, CrcSource::Missing) => Ok(CrcWrapper::Missing),
-        (None, CrcSource::Unusable) => Ok(CrcWrapper::Unusable),
+        (None, CrcSource::Unknown) => Ok(SnapshotCrc::NoObservation),
+        (Some(crc), CrcSource::Unknown) => {
+            Ok(CrcWithProvenance::from_snapshot_hint(crc, None).into())
+        }
+        (None, CrcSource::Missing) => Ok(SnapshotCrc::Missing),
+        (None, CrcSource::Unusable) => Ok(SnapshotCrc::Unusable),
         (Some(crc), CrcSource::AtVersion { crc_version }) if crc.version == crc_version => {
-            Ok(CrcWrapper::from_file(crc))
+            Ok(CrcWithProvenance::from_snapshot_hint(crc, Some(crc_version)).into())
         }
         (
             Some(crc),
@@ -465,10 +467,7 @@ fn crc_from_hint(crc: Option<Arc<Crc>>, claim: CrcSource) -> KernelResult<CrcWra
                 crc_version,
             },
         ) if crc.version == crc_version && on_disk_version < crc_version => {
-            Ok(CrcWrapper::Present {
-                crc,
-                on_disk_version: Some(on_disk_version),
-            })
+            Ok(CrcWithProvenance::from_snapshot_hint(crc, Some(on_disk_version)).into())
         }
         _ => Err(SnapshotHintError::CrcSourceMismatch { claim, crc_version }.into()),
     }
@@ -628,7 +627,7 @@ mod tests {
                 hint.last_checkpoint_hint,
             )?,
             snapshot.table_configuration().clone(),
-            snapshot.crc_at_version().cloned(),
+            snapshot.crc.clone(),
             false,
             false,
         )?;

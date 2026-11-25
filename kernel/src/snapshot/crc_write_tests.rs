@@ -6,9 +6,11 @@ use rstest::rstest;
 use url::Url;
 
 use super::snapshot_crc::SnapshotCrc;
-use super::{ChecksumWriteResult, CrcSource, IncrementalReplay, SnapshotRef};
+use super::{
+    ChecksumWriteResult, CrcOrigin, CrcProvenance, CrcSource, IncrementalReplay, SnapshotRef,
+};
 use crate::committer::FileSystemCommitter;
-use crate::crc::FileStatsState;
+use crate::crc::{CrcWithProvenance, FileStatsState};
 use crate::engine::DelegatingEngine;
 use crate::engine::sync::SyncEngine;
 use crate::metrics::{ChecksumWriteOutcome, ChecksumWriteResolutionMode, MetricEvent};
@@ -103,6 +105,13 @@ fn crc_write_reports_utf8_bytes_and_completes_while_snapshot_is_alive(
     let engine = SyncEngine::in_memory();
     let snapshot = snapshot_for_root(&engine, root)?;
     assert_eq!(snapshot.crc_source(), expected_source);
+    let origin = match root {
+        CrcRoot::Cached => CrcOrigin::CreateTable,
+        CrcRoot::StaleCrc => CrcOrigin::File,
+        CrcRoot::VersionZero => CrcOrigin::CommitHistory,
+        CrcRoot::Checkpoint => CrcOrigin::Checkpoint,
+    };
+    let initial_provenance = snapshot.crc_provenance();
     let initial_write_count = write_events(&reporter).len();
 
     // When its checksum is written successfully.
@@ -118,6 +127,18 @@ fn crc_write_reports_utf8_bytes_and_completes_while_snapshot_is_alive(
         }
     );
     assert_eq!(snapshot.crc_source(), expected_source);
+    assert_eq!(snapshot.crc_provenance(), initial_provenance);
+    assert_eq!(
+        updated.crc_provenance(),
+        Some(CrcProvenance {
+            origin,
+            crc_version: snapshot.version(),
+            on_disk_version: Some(snapshot.version()),
+        })
+    );
+    let fresh = Snapshot::builder_for("memory:///").build(&engine)?;
+    assert_eq!(fresh.crc_source(), updated.crc_source());
+    assert_eq!(fresh.crc_provenance().unwrap().origin, CrcOrigin::File);
 
     if let Some(cached) = snapshot.crc_at_version() {
         assert!(Arc::ptr_eq(updated.crc_at_version().unwrap(), cached));
@@ -148,6 +169,63 @@ fn crc_write_reports_utf8_bytes_and_completes_while_snapshot_is_alive(
         }
     );
     assert!(updated.crc_at_version().is_some());
+    Ok(())
+}
+
+#[test]
+fn checkpoint_crc_keeps_its_origin_after_write_and_replay_until_imported_as_a_hint() -> Result<()> {
+    let engine = SyncEngine::in_memory();
+    let created = create_snapshot(&engine)?;
+    created.checkpoint(&engine, None)?;
+    let commit = |s: SnapshotRef| -> Result<SnapshotRef> {
+        Ok(s.update_table(UpdateTableOperation::Write, "test", true)
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?
+            .unwrap_post_commit_snapshot())
+    };
+    commit(created)?;
+
+    // The checksum write reconstructs v0 from its checkpoint and applies commit v1.
+    let snapshot = Snapshot::builder_for("memory:///").build(&engine)?;
+    assert!(snapshot.crc_provenance().is_none());
+    let (_, written) = snapshot.write_checksum(&engine)?;
+    let detail = CrcProvenance {
+        origin: CrcOrigin::Checkpoint,
+        crc_version: 1,
+        on_disk_version: Some(1),
+    };
+    assert_eq!(written.crc_provenance(), Some(detail));
+    assert_eq!(
+        written.crc_source(),
+        CrcSource::AtVersion { crc_version: 1 }
+    );
+
+    let advanced = commit(written)?;
+    assert_eq!(
+        advanced.crc_provenance(),
+        Some(CrcProvenance {
+            crc_version: 2,
+            ..detail
+        })
+    );
+    let source = CrcSource::Reconstructed {
+        on_disk_version: 1,
+        crc_version: 2,
+    };
+    assert_eq!(advanced.crc_source(), source);
+
+    let imported = Snapshot::builder_for("memory:///")
+        .with_snapshot_hint(advanced.to_snapshot_hint()?)
+        .build(&engine)?;
+    assert_eq!(
+        imported.crc_provenance(),
+        Some(CrcProvenance {
+            origin: CrcOrigin::SnapshotHint,
+            crc_version: 2,
+            on_disk_version: Some(1),
+        })
+    );
+    assert_eq!(imported.crc_source(), source);
     Ok(())
 }
 
@@ -216,8 +294,12 @@ fn crc_write_resolution_or_validation_error_retains_mode_and_duration(
             unsupported_operation: None,
         };
         let version = snapshot.version();
-        let retained = snapshot.crc.as_ref().clone().map_crc(|_| Arc::new(crc));
-        Arc::get_mut(&mut snapshot).unwrap().crc = SnapshotCrc::try_new(retained, version, None)?;
+        let retained = CrcWithProvenance::from_snapshot_hint(
+            Arc::new(crc),
+            snapshot.crc.base().unwrap().on_disk_version(),
+        );
+        Arc::get_mut(&mut snapshot).unwrap().crc =
+            SnapshotCrc::try_new(retained.into(), version, None)?;
     } else {
         // Corrupt the required commit after loading the snapshot so resolution itself fails.
         let path = ParsedLogPath::new_commit(snapshot.table_root(), snapshot.version())?;

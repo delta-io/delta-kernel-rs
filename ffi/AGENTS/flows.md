@@ -99,7 +99,9 @@ what construction observed about checksum files, independently of whether file s
 the original `on_disk_version`; their difference gives the cumulative number of incorporated
 commits. For `Stale`, subtract `crc_version` from the snapshot version to obtain the remaining gap.
 The returned value owns its version information and does not borrow the snapshot. Observations stay
-fixed after construction.
+fixed after construction. `snapshot_crc_provenance(snapshot, out)` copies the retained CRC's
+origin, current CRC version, and known disk version to caller-owned storage.
+It returns false when there is no retained CRC.
 
 Snapshot accessors (`ffi/src/lib.rs`) include no-I/O reads such as `version` and
 `snapshot_file_stats`, which returns `OptionalValue<FfiFileStats>` (scalar
