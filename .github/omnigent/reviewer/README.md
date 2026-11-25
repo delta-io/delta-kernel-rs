@@ -90,7 +90,7 @@ between them. Every ORCHESTRATOR box below represents the same model session at 
        v               v               v               v               v               v
 +-------------+ +-------------+ +-------------+ +-------------+ +-------------+ +-------------+
 | ARCHITECTURE| | DELTA       | | CLAUDE      | | CODEX       | | TEST        | | DOCS        |
-|             | | PROTOCOL    | | MAINTAINER  | | MAINTAINER  | | COVERAGE    | | (required)  |
+|             | | PROTOCOL    | | MAINTAINER  | | MAINTAINER  | | COVERAGE    | |             |
 | Reviewer    | | Reviewer    | | Reviewer    | | Reviewer    | | Reviewer    | | Reviewer    |
 | subagent    | | subagent    | | subagent    | | subagent    | | subagent    | | subagent    |
 +-------------+ +-------------+ +-------------+ +-------------+ +-------------+ +-------------+
@@ -377,6 +377,9 @@ PR change patch and shared PR task text with seven-day retention.
 | `/tmp/publication_record.json` | Publication step | Records final findings, confirmed comment URLs and posting errors. |
 | `/tmp/review_output_complete.txt` | Publication step | Summary, artifact and Check Run outputs include all parsed final findings. |
 | `/tmp/check-summary.txt` | Publication step or diagnostic path | Check Run reads the assessment and findings, resolver error or generic unavailable message. |
+| `/tmp/review_observations.jsonl` | `observe_review()` | Execution-record builder reads filtered dispatch, session and result-event metadata. |
+| `/tmp/review_accounting.json` | Validation step | Execution-record builder reads the orchestrator's consolidation outcomes. |
+| `/tmp/review_execution.json` | Execution-record step | Check Run displays its tables; Actions retains the record for seven days. |
 
 ## Reviewer results, Checker results and consolidation outcomes
 
@@ -418,14 +421,6 @@ other Reviewer subagent must return completed results. Every dispatched subagent
 exhaust its retry, and every required Checker result must arrive. A report can satisfy that rule
 while the execution record remains incomplete because a configured Reviewer stayed unavailable.
 The execution record reports that gap after publication; it does not suppress those comments.
-
-| Runner file | Writer and purpose | Where maintainers read the result |
-|---|---|---|
-| `/tmp/review_observations.jsonl` | `observe_review` appends filtered dispatch, session and result-event metadata. | Combined into the execution record; result prose is discarded. |
-| `/tmp/review_accounting.json` | The workflow extracts the orchestrator's consolidation outcomes. | The execution record includes each candidate finding's outcome. |
-| `/tmp/publication_record.json` | `finding_publication.py` records finding-comment URLs and posting errors. | Finding links appear in the Check Run and execution record. Artifact mode also uploads this file. |
-| `/tmp/review_execution.json` | `review_evidence.py` combines subagent attempts, Checker decisions, consolidation outcomes and publication results. | Downloadable execution artifact on the Actions run, retained for seven days. |
-| `/tmp/check-summary.txt` | Python appends subagent-attempt and candidate-finding tables to the orchestrator report. | `AI Review Summary` in the PR's Checks tab. Its GitHub conclusion stays `neutral`. |
 
 The execution artifact excludes full model responses, environment values and full tool payloads.
 [`history_evidence()`](../review_history.py) separately records earlier final Blockers from
