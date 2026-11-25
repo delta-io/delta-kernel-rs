@@ -10,11 +10,11 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 
 use super::events::{
-    CheckpointWriteSuccess, ChecksumWriteSuccess, CrcReadSuccess, DomainMetadataLoadSuccess,
-    JsonReadCompleted, LastCheckpointReadCompleted, LogSegmentLoadSuccess, MetricEvent,
-    ParquetReadCompleted, ProtocolMetadataLoadSuccess, STORAGE_SPAN, ScanMetadataCompleted,
-    SetTransactionLoadSuccess, SnapshotBuildSuccess, TransactionCommitSuccess,
-    storage_metric_from_attrs,
+    CheckpointActionComputed, CheckpointWriteSuccess, ChecksumWriteSuccess, CrcReadSuccess,
+    DomainMetadataLoadSuccess, JsonReadCompleted, LastCheckpointReadCompleted,
+    LogSegmentLoadSuccess, MetricEvent, ParquetReadCompleted, ProtocolMetadataLoadSuccess,
+    STORAGE_SPAN, ScanMetadataCompleted, SetTransactionLoadSuccess, SnapshotBuildSuccess,
+    TransactionCommitSuccess, storage_metric_from_attrs,
 };
 
 // ====================================================================
@@ -149,6 +149,9 @@ where
             )),
             ScanMetadataCompleted::SPAN_NAME => Some(MetricEvent::ScanMetadataCompleted(
                 ScanMetadataCompleted::from_attrs(attrs),
+            )),
+            CheckpointActionComputed::SPAN_NAME => Some(MetricEvent::CheckpointActionComputed(
+                CheckpointActionComputed::from_attrs(attrs),
             )),
             STORAGE_SPAN => storage_metric_from_attrs(attrs),
             _ => None,
@@ -333,9 +336,9 @@ mod tests {
         emit_protocol_metadata_load_failure,
     };
     use crate::metrics::{
-        CheckpointOutputStats, CheckpointProcessingStats, CheckpointWriteMode,
-        CheckpointWriteOutcome, CheckpointWriteStats, LastCheckpointReadOutcome, MetricEvent,
-        MetricId, WithMetricsReporterLayer as _,
+        CheckpointEntrySource, CheckpointOutputStats, CheckpointProcessingStats,
+        CheckpointWriteMode, CheckpointWriteOutcome, CheckpointWriteStats,
+        LastCheckpointReadOutcome, MetricEvent, MetricId, TableType, WithMetricsReporterLayer as _,
     };
     use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
 
@@ -399,6 +402,54 @@ mod tests {
         };
         assert_eq!(event.outcome, expected);
         assert!(event.duration > Duration::ZERO);
+    }
+
+    #[rstest::rstest]
+    #[case::set("req", Some("req"))]
+    #[case::empty_is_none("", None)]
+    fn checkpoint_action_computed_decodes_span_fields(
+        #[case] correlation_id: &str,
+        #[case] expected_correlation_id: Option<&str>,
+    ) {
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        let id = MetricId::new();
+        drop(info_span!(
+            "txn.checkpoint_action_computed",
+            report = Empty,
+            operation_id = %id,
+            correlation_id,
+            is_catalog_managed = true,
+            commit_version = 7u64,
+            txn_source = CheckpointEntrySource::Crc.as_ref(),
+            domain_metadata_source = CheckpointEntrySource::SidecarsInlined.as_ref(),
+            num_log_commits_replayed = 3u64,
+            num_txn_sidecars_kept = 2u64,
+            num_domain_metadata_sidecars_kept = 5u64,
+            num_txn_sidecars_read = 4u64,
+            num_domain_metadata_sidecars_read = 6u64,
+            duration_ns = 11u64,
+        ));
+
+        let events = reporter.events();
+        let [MetricEvent::CheckpointActionComputed(event)] = events.as_slice() else {
+            panic!("expected one checkpoint action computed metric: {events:?}");
+        };
+        assert_eq!(event.operation_id, id);
+        assert_eq!(event.correlation_id.as_deref(), expected_correlation_id);
+        assert_eq!(event.table_type, TableType::CatalogManaged);
+        assert_eq!(event.commit_version, 7);
+        assert_eq!(event.txn_source, CheckpointEntrySource::Crc);
+        assert_eq!(
+            event.domain_metadata_source,
+            CheckpointEntrySource::SidecarsInlined
+        );
+        assert_eq!(event.num_log_commits_replayed, 3);
+        assert_eq!(event.num_txn_sidecars_kept, 2);
+        assert_eq!(event.num_domain_metadata_sidecars_kept, 5);
+        assert_eq!(event.num_txn_sidecars_read, 4);
+        assert_eq!(event.num_domain_metadata_sidecars_read, 6);
+        assert_eq!(event.duration, Duration::from_nanos(11));
     }
 
     #[test]
