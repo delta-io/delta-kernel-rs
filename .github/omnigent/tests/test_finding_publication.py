@@ -90,7 +90,7 @@ def publish(github, findings, **kwargs):
     arguments = dict(
         github=github, repository="example/project", pr_number=1, head_sha=HEAD_SHA,
         run_url=RUN_URL, review="## PR Summary\nChanges a call.", structured=findings,
-        diff=DIFF, review_diff=DIFF, trusted_bot_logins=["github-actions"],
+        github_pr_patch=DIFF, pr_change_patch=DIFF, trusted_bot_logins=["github-actions"],
     )
     arguments.update(kwargs)
     return publish_findings(**arguments)
@@ -136,7 +136,7 @@ class FindingPublicationTest(unittest.TestCase):
         self.assertEqual(retained["aliases"], ["Nit2"])
         self.assertIn("0 Blockers · 0 Should Fix · 1 Nits", github.issues[0]["body"])
         check = publication_check("## PR Summary\nChanges a call.", record)
-        self.assertIn("New destinations: 1 · Reused destinations: 0", check)
+        self.assertIn("New finding comments: 1 · Reused finding comments: 0", check)
         self.assertEqual(check.count("A retained claim."), 1)
 
     def test_published_main_comment_unwraps_its_workflow_metadata(self):
@@ -172,20 +172,20 @@ class FindingPublicationTest(unittest.TestCase):
     def test_publisher_cli_preserves_embedded_carriage_returns_in_both_diff_inputs(self):
         raw_diff = DIFF.replace("+new\n", "+first\rstill first\n").encode()
         wider_diff = DIFF.replace("@@ -1,2 +1,2 @@", "@@ -1,3 +1,3 @@") + " third\n"
-        for raw_input in ("diff", "review-diff"):
+        for raw_input in ("github-pr-patch", "pr-change-patch"):
             with self.subTest(raw_input=raw_input), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 paths = {
                     name: root / name
                     for name in (
-                        "review", "findings", "diff", "review-diff", "trusted-bot-logins",
+                        "review", "findings", "github-pr-patch", "pr-change-patch", "trusted-bot-logins",
                         "output", "check-output", "full-review-output",
                     )
                 }
                 paths["review"].write_text("## PR Summary\nChanges a call.")
                 paths["findings"].write_text(json.dumps([finding(line=3)]))
                 paths["trusted-bot-logins"].write_text('["github-actions"]')
-                for name in ("diff", "review-diff"):
+                for name in ("github-pr-patch", "pr-change-patch"):
                     paths[name].write_bytes(raw_diff if name == raw_input else wider_diff.encode())
                 arguments = ["finding_publication.py"]
                 for name, path in paths.items():
@@ -234,7 +234,7 @@ class FindingPublicationTest(unittest.TestCase):
         self.assertNotIn("<details>", github.issues[1]["body"])
         check = publication_check("## PR Summary\nChanges a call.", record)
         self.assertIn("JSON-only claim.", check)
-        self.assertIn("New destinations: 1", check)
+        self.assertIn("New finding comments: 1", check)
 
     def test_lost_accepted_response_is_reconciled_without_fallback_duplicate(self):
         github = FakeGitHub()
@@ -269,7 +269,7 @@ class FindingPublicationTest(unittest.TestCase):
                 self.assertEqual(len(github.inline), 1)
                 self.assertEqual(second["findings"][0]["delivery"], "reused")
                 check = publication_check("review", second)
-                self.assertIn("New destinations: 0 · Reused destinations: 1", check)
+                self.assertIn("New finding comments: 0 · Reused finding comments: 1", check)
                 main = github.issues[-1]["body"]
                 self.assertEqual("existing thread" in main, severity != "Nit")
 
@@ -296,7 +296,7 @@ class FindingPublicationTest(unittest.TestCase):
         self.assertFalse(record["complete"])
         self.assertEqual(github.writes, [])
 
-    def test_summary_and_artifact_modes_record_destinations_without_posting(self):
+    def test_summary_and_artifact_modes_preserve_findings_without_claiming_comment_delivery(self):
         for mode in ("summary", "artifact"):
             with self.subTest(mode=mode):
                 github = FakeGitHub()
@@ -304,6 +304,12 @@ class FindingPublicationTest(unittest.TestCase):
                 self.assertTrue(record["complete"])
                 self.assertEqual(github.writes, [])
                 self.assertEqual(record["findings"][0]["placement"], mode)
+                self.assertIsNone(record["findings"][0]["url"])
+                self.assertIsNone(record["findings"][0]["delivery"])
+                check = publication_check("## PR Summary\nChanges a call.", record)
+                self.assertIn("A retained claim.", check)
+                self.assertIn("New finding comments: 0 · Reused finding comments: 0", check)
+                self.assertIn("No PR comments requested.", check)
 
     def test_conversation_modes_and_setting_preserve_each_finding(self):
         for mode, placement in (("comment", "inline-or-conversation"),
