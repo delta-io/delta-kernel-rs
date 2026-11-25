@@ -36,7 +36,7 @@ use crate::{KernelError, KernelResult};
 #[cfg(feature = "declarative-plans")]
 pub(crate) mod engine_rows;
 
-/// Collects struct rows into a row, optional row, or vector.
+/// Collects struct rows into a row, optional row, vector, or named payload collections.
 #[internal_api]
 pub(crate) trait TryFromStructRows: Sized {
     /// The input row type whose schema is used for decoding.
@@ -76,7 +76,11 @@ pub(crate) trait TryFromStructRows: Sized {
         let mut state = Self::new_state();
         batches.try_for_each(|batch| {
             let batch = batch?;
-            engine_rows::StructVisitor::<Self> { state: &mut state }.visit_rows_of(batch.as_ref())
+            engine_rows::StructVisitor::<Self> {
+                batch: batch.as_ref(),
+                state: &mut state,
+            }
+            .visit_rows_of(batch.as_ref())
         })?;
         Self::finish(state)
     }
@@ -159,11 +163,14 @@ fn decode_row<T: TryFrom<StructData, Error = KernelError>>(
 #[cfg(test)]
 mod tests {
     use std::ops::RangeInclusive;
+    use std::sync::Arc;
 
-    use delta_kernel_derive::{IntoStructData, ToSchema, TryFromStructData};
+    use delta_kernel_derive::{IntoStructData, ToSchema, TryFromStructData, TryFromStructRows};
     use rstest::rstest;
 
     use super::*;
+    use crate::schema::{DataType, StructField, StructType};
+    use crate::unit_test_utils::assert_result_error_with_message;
 
     #[derive(Clone, Debug, PartialEq, ToSchema, IntoStructData, TryFromStructData)]
     struct Added {
@@ -186,5 +193,64 @@ mod tests {
         } else {
             assert!(result.unwrap_err().to_string().contains("row"));
         }
+    }
+
+    #[derive(Debug, PartialEq, TryFromStructRows)]
+    struct Changes {
+        added: Added,
+        removed: Vec<Added>,
+    }
+
+    #[rstest]
+    #[case::declared_order(false, None, false, false)]
+    #[case::reordered(true, None, false, false)]
+    #[case::wrong_null_type(false, None, true, false)]
+    #[case::active_field_renamed(false, Some("other"), false, false)]
+    #[case::non_struct_active_payload(false, None, false, true)]
+    fn named_collections_resolve_struct_payloads_by_name(
+        #[case] reverse: bool,
+        #[case] renamed_active: Option<&str>,
+        #[case] wrong_null_type: bool,
+        #[case] non_struct_active: bool,
+    ) -> KernelResult<()> {
+        let active = if non_struct_active {
+            crate::expressions::Scalar::Integer(7)
+        } else {
+            Added { id: 7 }.into()
+        };
+        let removed_type = if wrong_null_type {
+            DataType::STRING
+        } else {
+            Added::schema_ref().clone().into()
+        };
+        let mut fields = vec![
+            StructField::nullable(renamed_active.unwrap_or("added"), active.data_type()),
+            StructField::nullable("removed", removed_type.clone()),
+        ];
+        let mut values = vec![active, crate::expressions::Scalar::Null(removed_type)];
+        if reverse {
+            fields.reverse();
+            values.reverse();
+        }
+        let result = StructType::try_new(fields).and_then(|schema| {
+            let row = StructData::try_new(Arc::new(schema), values)?;
+            Changes::collect_into([Ok(row)])
+        });
+        if wrong_null_type {
+            assert_result_error_with_message(result, "removed: expected struct, found string");
+        } else if let Some(name) = renamed_active {
+            assert_result_error_with_message(result, &format!("known variant field, found {name}"));
+        } else if non_struct_active {
+            assert_result_error_with_message(result, "added: expected StructData, found integer");
+        } else {
+            assert_eq!(
+                result?,
+                Changes {
+                    added: Added { id: 7 },
+                    removed: vec![]
+                }
+            );
+        }
+        Ok(())
     }
 }

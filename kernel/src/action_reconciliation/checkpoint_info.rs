@@ -4,24 +4,20 @@
 //! leaf schema, and portable hint.
 
 use std::borrow::Cow;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
-use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
     CHECKPOINT_METADATA_FIELD, CHECKPOINT_METADATA_NAME, CHECKPOINT_NUM_ADD_FILES_TAG,
     CheckpointMetadata, SIDECAR_FIELD, SIDECAR_FILE_SCHEMA_TAG, SIDECAR_NAME, Sidecar,
 };
 use crate::checkpoint::{CHECKPOINT_ACTIONS_SCHEMA_V2, CheckpointInfo, SelectedCheckpointType};
-use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::expressions::{ColumnName, Predicate, col};
+use crate::expressions::{Predicate, col};
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
 use crate::log_segment::LogSegment;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::plans::ir::nodes::FileType;
-use crate::plans::{Operation, PlanBuilder, PlanExecutor};
-use crate::schema::{
-    ColumnNamesAndTypes, DataType, SchemaRef, StructType, ToSchema as _, schema_ref,
-};
+use crate::plans::{PlanBuilder, PlanExecutor, PlanExecutorExt as _};
+use crate::schema::{SchemaRef, StructType, schema_ref};
 use crate::{FileMeta, KernelError, KernelResult};
 
 impl CheckpointInfo {
@@ -234,48 +230,18 @@ fn collect_checkpoint_metadata(
     }?
     .filter(predicate)?
     .build()?;
-    let data = exec.execute_op(Operation::QueryPlan(plan))?.into_data()?;
-    let mut sidecars = SidecarVisitor::default();
-    let mut metadata = CheckpointMetadataVisitor::default();
-    for batch in data {
-        let batch = batch?;
-        sidecars.visit_rows_of(batch.as_ref())?;
-        metadata.visit_rows_of(batch.as_ref())?;
+    #[derive(delta_kernel_derive::TryFromStructRows)]
+    struct CheckpointRows {
+        sidecar: Vec<Sidecar>,
+        checkpoint_metadata: Vec<CheckpointMetadata>,
     }
-    Ok((sidecars.sidecars, metadata.0))
-}
-
-#[derive(Default)]
-struct CheckpointMetadataVisitor(Option<CheckpointMetadata>);
-
-impl RowVisitor for CheckpointMetadataVisitor {
-    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        static COLUMNS: LazyLock<ColumnNamesAndTypes> =
-            LazyLock::new(|| CheckpointMetadata::to_schema().leaves(CHECKPOINT_METADATA_NAME));
-        COLUMNS.as_ref()
+    let mut rows: CheckpointRows = exec.execute_plan_into(plan)?;
+    if rows.checkpoint_metadata.len() > 1 {
+        return Err(KernelError::invalid_checkpoint(
+            "Duplicate checkpointMetadata",
+        ));
     }
-
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
-        let [version, tags] = getters else {
-            return Err(KernelError::internal_error(
-                "Expected checkpoint metadata getters",
-            ));
-        };
-        for row in 0..row_count {
-            if let Some(version) = version.get_opt(row, "checkpointMetadata.version")? {
-                if self.0.is_some() {
-                    return Err(KernelError::invalid_checkpoint(
-                        "Duplicate checkpointMetadata action",
-                    ));
-                }
-                self.0 = Some(CheckpointMetadata {
-                    version,
-                    tags: tags.get_opt(row, "checkpointMetadata.tags")?,
-                });
-            }
-        }
-        Ok(())
-    }
+    Ok((rows.sidecar, rows.checkpoint_metadata.pop()))
 }
 
 #[cfg(test)]
@@ -303,7 +269,7 @@ mod tests {
     use crate::log_segment_files::LogSegmentFiles;
     use crate::path::LogPathFileType;
     use crate::plans::ir::nodes::Operator;
-    use crate::plans::{IoOperation, PlanResult};
+    use crate::plans::{IoOperation, Operation, PlanResult};
     use crate::schema::{schema, schema_ref};
     use crate::unit_test_utils::{
         copy_test_table, create_log_path, create_log_path_with_size, load_test_table,
@@ -1286,13 +1252,15 @@ mod tests {
     }
 
     #[rstest]
-    #[case::duplicate(true, "Duplicate checkpointMetadata action")]
-    #[case::version_mismatch(false, "Checkpoint metadata version mismatch")]
+    #[case::duplicate("duplicate", "Duplicate checkpointMetadata")]
+    #[case::version_mismatch("version_mismatch", "Checkpoint metadata version mismatch")]
+    #[case::multiple_actions("multiple_actions", "exactly one non-null variant")]
     fn invalid_checkpoint_metadata_is_rejected(
-        #[case] duplicate: bool,
+        #[case] scenario: &str,
         #[case] expected_error: &str,
+        #[values(None, Some(1))] rows_in_batch: Option<usize>,
     ) {
-        // Given: an unhinted root with duplicate metadata or a mismatched metadata version.
+        // Given: an unhinted root with invalid checkpoint metadata actions.
         let (table_root, _tempdir) = copy_test_table("v2-checkpoints-json-with-sidecars").unwrap();
         let snapshot = Snapshot::builder_for(table_root)
             .build(&SyncEngine::new())
@@ -1306,14 +1274,27 @@ mod tests {
             .iter_mut()
             .find_map(|action| action.get_mut(CHECKPOINT_METADATA_NAME))
             .unwrap();
-        if duplicate {
-            let duplicate = serde_json::json!({"checkpointMetadata": metadata.clone()});
-            lines.push(duplicate);
-        } else {
-            metadata["version"] = serde_json::json!(root.version + 1);
+        match scenario {
+            "duplicate" => {
+                let duplicate = serde_json::json!({"checkpointMetadata": metadata.clone()});
+                lines.push(duplicate);
+            }
+            "version_mismatch" => metadata["version"] = serde_json::json!(root.version + 1),
+            "multiple_actions" => {
+                let metadata = metadata.clone();
+                let sidecar = lines
+                    .iter_mut()
+                    .find(|action| action.get(SIDECAR_NAME).is_some())
+                    .unwrap();
+                sidecar[CHECKPOINT_METADATA_NAME] = metadata;
+            }
+            _ => unreachable!(),
         }
         write_checkpoint_actions(&path, &lines);
-        let exec = CountingExecutor::new();
+        let exec = CountingExecutor {
+            rows_in_batch,
+            ..CountingExecutor::new()
+        };
 
         // When: discovery reads the malformed metadata.
         let error = CheckpointInfo::resolve(&exec, &segment).unwrap_err();
@@ -1666,23 +1647,5 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(path, content).unwrap();
-    }
-    #[rstest]
-    fn checkpoint_metadata_rejects_wrong_getter_count(#[values(0, 1, 3)] count: usize) {
-        // Given: a metadata batch with the wrong number of getters.
-        let getters = vec![&() as &dyn GetData<'_>; count];
-        let mut visitor = CheckpointMetadataVisitor::default();
-
-        // When: the visitor attempts to consume it.
-        let error = visitor.visit(1, &getters).unwrap_err();
-
-        // Then: validation fails before retaining metadata.
-        assert!(
-            error
-                .to_string()
-                .contains("Expected checkpoint metadata getters"),
-            "{error}"
-        );
-        assert!(visitor.0.is_none());
     }
 }

@@ -2,15 +2,25 @@ use StagedAction::{Add, AddWithStats, Remove};
 use rstest::rstest;
 
 use super::*;
+use crate::EngineData;
 use crate::arrow::compute::concat_batches;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::sync::plan::SyncPlanExecutor;
-use crate::expressions::{col, lit};
-use crate::plans::{Operation, PlanExecutor, ScopedPlanExecutor};
+use crate::expressions::{Scalar, col, lit};
+use crate::plans::{Operation, PlanExecutor, PlanExecutorExt as _, PlanResult, ScopedPlanExecutor};
 use crate::schema::{SchemaStructPatchBuilder, schema_ref};
 use crate::transaction::declarative::test_utils::{
     STATS_SCHEMA, StagedAction, Stats, fields_input, make_ref,
 };
+
+// Control batch boundaries and late errors while exercising typed execution and validation.
+struct StreamPlanExecutor(std::sync::Mutex<Option<PlanResult>>);
+
+impl PlanExecutor for StreamPlanExecutor {
+    fn execute_op(&self, _op: Operation) -> KernelResult<PlanResult> {
+        Ok(self.0.lock().unwrap().take().unwrap())
+    }
+}
 
 fn run_checks(checks: CheckList, actions: &[StagedAction]) -> KernelResult<()> {
     let executor = SyncPlanExecutor::default().get_scoped();
@@ -24,10 +34,8 @@ fn run_checks(checks: CheckList, actions: &[StagedAction]) -> KernelResult<()> {
         }
     }
     let plan = build_plan(&adds, &removes, &checks, &STATS_SCHEMA)?;
-    let results = executor
-        .execute_op(Operation::QueryPlan(plan))?
-        .into_data()?;
-    validate_result(results, &checks)
+    let summary = executor.execute_plan_into(plan)?;
+    validate_result(summary, &checks)
 }
 
 fn assert_result(result: KernelResult<()>, expected_error: Option<&str>) -> KernelResult<()> {
@@ -261,11 +269,9 @@ fn clustering_statistics_identify_failing_physical_column(
         ])?),
     ];
     let plan = build_plan(&[source], &[], &checks, &stats_schema)?;
-    assert_eq!(plan.schema, *RESULT_SCHEMA);
-    let results = executor
-        .execute_op(Operation::QueryPlan(plan))?
-        .into_data()?;
-    let result = validate_result(results, &checks);
+    assert_eq!(plan.schema, *CheckResults::schema_ref());
+    let summary = executor.execute_plan_into(plan)?;
+    let result = validate_result(summary, &checks);
     if let Some(column) = expected_column {
         let error = result.unwrap_err();
         assert!(error.to_string().contains("AddFile for 'part'"), "{error}");
@@ -296,7 +302,7 @@ fn common_input_schema_keeps_table_statistics_independently_of_checks() -> Kerne
         Box::new(AppendOnlyCheck),
     ] {
         let plan = build_plan(&[], &[], &[check], &stats_schema)?;
-        assert_eq!(plan.schema, *RESULT_SCHEMA);
+        assert_eq!(plan.schema, *CheckResults::schema_ref());
     }
     Ok(())
 }
@@ -361,28 +367,27 @@ fn empty_inputs(#[values(false, true)] with_source: bool) -> KernelResult<()> {
         vec![]
     };
     let plan = build_plan(&sources, &[], &checks, &STATS_SCHEMA)?;
-    let results = executor
-        .execute_op(Operation::QueryPlan(plan))?
-        .into_data()?;
-    validate_result(results, &checks)
+    let summary = executor.execute_plan_into(plan)?;
+    validate_result(summary, &checks)
 }
 
 #[rstest]
-#[case::no_batches(&[], false, Some("Expected exactly one pre-commit validation row, but got 0"))]
-#[case::empty_batch(&[0], false, Some("Expected exactly one pre-commit validation row, but got 0"))]
+#[case::no_batches(&[], false, Some("expected exactly one row, found 0 rows"))]
+#[case::empty_batch(&[0], false, Some("expected exactly one row, found 0 rows"))]
 #[case::one_row(&[1], false, None)]
 #[case::leading_empty_batch(&[0, 1], false, None)]
 #[case::trailing_empty_batch(&[1, 0], false, None)]
 #[case::surrounding_empty_batches(&[0, 1, 0], false, None)]
 #[case::multiple_rows_in_batch(&[2], false,
-    Some("Expected exactly one pre-commit validation row, but got 2"))]
+    Some("expected exactly one row, found at least 2 rows"))]
 #[case::multiple_rows_across_batches(&[1, 1], false,
-    Some("Expected exactly one pre-commit validation row, but got 2"))]
+    Some("expected exactly one row, found at least 2 rows"))]
 #[case::late_stream_error(&[1], true, Some("late stream error"))]
 #[case::late_stream_error_after_empty(&[1, 0], true, Some("late stream error"))]
-#[case::late_stream_error_after_multiple_rows(&[1, 1], true, Some("late stream error"))]
+#[case::late_stream_error_after_multiple_rows(&[1, 1], true,
+    Some("expected exactly one row, found at least 2 rows"))]
 #[case::first_stream_error(&[], true, Some("late stream error"))]
-fn summary_stream_exhaustion(
+fn summary_stream_cardinality_and_errors(
     #[case] batch_sizes: &[usize],
     #[case] late_error: bool,
     #[case] expected_error: Option<&str>,
@@ -401,7 +406,7 @@ fn summary_stream_exhaustion(
     )?;
     let plan = build_plan(&[source], &[], &checks, &STATS_SCHEMA)?;
     let template = executor
-        .execute_op(Operation::QueryPlan(plan))?
+        .execute_plan(plan.clone())?
         .into_data()?
         .next()
         .unwrap()?
@@ -416,7 +421,12 @@ fn summary_stream_exhaustion(
     if late_error {
         stream.push(Err(KernelError::generic("late stream error")));
     }
-    let result = validate_result(stream.into_iter(), &checks);
+    let executor = StreamPlanExecutor(std::sync::Mutex::new(Some(PlanResult::Data(Box::new(
+        stream.into_iter(),
+    )))));
+    let result = executor
+        .execute_plan_into::<CheckResults>(plan)
+        .and_then(|summary| validate_result(summary, &checks));
     let expected_error = expected_error.or(invalid_size.then_some("negative size -1"));
     if let Some(message) = expected_error {
         let error = result.unwrap_err();
@@ -425,4 +435,30 @@ fn summary_stream_exhaustion(
         result?;
     }
     Ok(())
+}
+
+#[rstest]
+#[case::add_first(false, "AddFile for 'added' has negative size -1")]
+#[case::remove_first(true, "RemoveFile for 'removed' has negative size -1")]
+fn check_priority_follows_check_list(
+    #[case] reverse: bool,
+    #[case] expected_error: &str,
+) -> KernelResult<()> {
+    let mut checks: CheckList = vec![
+        Box::new(AddFileFieldsCheck),
+        Box::new(RemoveFileFieldsCheck),
+    ];
+    if reverse {
+        checks.reverse();
+    }
+    assert_result(
+        run_checks(
+            checks,
+            &[
+                Add(Some("added"), Some(-1), Some(1)),
+                Remove(Some("removed"), Some(-1)),
+            ],
+        ),
+        Some(expected_error),
+    )
 }
