@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use delta_kernel_derive::internal_api;
+
 use super::SelectedCheckpointType;
 use crate::FileMeta;
 use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -18,9 +20,9 @@ pub enum CheckpointKind {
 
 /// Complete layout and portable metadata for the checkpoint selected by a snapshot.
 ///
-/// Scan planning and [`crate::snapshot::SnapshotReader::get_checkpoint_info`] share discovery of
+/// Scan planning and [`crate::snapshot::SnapshotReader`] share discovery of
 /// the checkpoint type, complete sidecar list, leaf schema, and portable hint. This type is not
-/// serialized; [`LastCheckpointHint`] describes the portable fields. Layout discovery does not
+/// serialized; the last-checkpoint hint describes the portable fields. Layout discovery does not
 /// validate every required checkpoint action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointInfo {
@@ -57,7 +59,7 @@ impl CheckpointInfo {
     /// Returns the resolved sidecar count, or part count for an inline checkpoint.
     pub fn leaf_file_count(&self) -> usize {
         if self.sidecars.is_empty() {
-            self.last_checkpoint.parts.unwrap_or(1)
+            self.last_checkpoint().parts.unwrap_or(1)
         } else {
             self.sidecars.len()
         }
@@ -69,7 +71,8 @@ impl CheckpointInfo {
     }
 
     /// Returns the bounded portable hint produced by complete resolution.
-    pub fn last_checkpoint(&self) -> &LastCheckpointHint {
+    #[internal_api]
+    pub(crate) fn last_checkpoint(&self) -> &LastCheckpointHint {
         &self.last_checkpoint
     }
 }

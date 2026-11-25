@@ -75,6 +75,13 @@
 //! [`Engine`]: crate::Engine
 
 pub(crate) mod events;
+mod scan_plan;
+#[cfg(any(feature = "declarative-plans", test))]
+pub(crate) use scan_plan::emit_scan_plan_completed;
+pub use scan_plan::{
+    CheckpointMetrics, CheckpointSource, MetadataPlanningReport, ReplayBase, ScanPlanOutcome,
+    ScanPlanReport,
+};
 mod frame_reporter;
 mod metered_engine;
 mod metered_json;
@@ -90,14 +97,15 @@ pub use events::{
     CheckpointOutputStats, CheckpointProcessingStats, CheckpointWriteFailure, CheckpointWriteMode,
     CheckpointWriteOutcome, CheckpointWriteStats, CheckpointWriteSuccess, ChecksumWriteFailure,
     ChecksumWriteOutcome, ChecksumWriteResolutionMode, ChecksumWriteSuccess, CommitFailureReason,
-    CrcReadSuccess, DomainMetadataLoadSuccess, JsonReadCompleted, LastCheckpointReadCompleted,
-    LastCheckpointReadOutcome, LogSegmentLoadFailure, LogSegmentLoadSuccess, LogSegmentLoadType,
-    MetricEvent, MetricId, ParquetReadCompleted, ProtocolMetadataLoadFailure,
-    ProtocolMetadataLoadSuccess, ProtocolMetadataSource, ScanMetadataCompleted, ScanType,
-    SetTransactionLoadSuccess, SnapshotBuildFailure, SnapshotBuildSuccess,
-    SnapshotLoadMetricContext, SnapshotLoadType, StorageCopyCompleted, StorageListCompleted,
-    StorageReadCompleted, TableType, TransactionCommitFailure, TransactionCommitSuccess,
-    emit_json_read_completed, emit_parquet_read_completed,
+    CrcReadFailure, CrcReadFailureReason, CrcReadSuccess, DomainMetadataLoadSuccess,
+    JsonReadCompleted, LastCheckpointReadCompleted, LastCheckpointReadOutcome,
+    LogSegmentLoadFailure, LogSegmentLoadSuccess, LogSegmentLoadType, MetricEvent, MetricId,
+    ParquetReadCompleted, ProtocolMetadataLoadFailure, ProtocolMetadataLoadSuccess,
+    ProtocolMetadataSource, ScanMetadataCompleted, ScanType, SetTransactionLoadSuccess,
+    SnapshotBuildFailure, SnapshotBuildSuccess, SnapshotLoadMetricContext, SnapshotLoadType,
+    StorageCopyCompleted, StorageListCompleted, StorageReadCompleted, TableType,
+    TransactionCommitFailure, TransactionCommitSuccess, emit_json_read_completed,
+    emit_parquet_read_completed,
 };
 pub(crate) use events::{
     emit_log_segment_load, emit_log_segment_load_failure, emit_protocol_metadata_load,

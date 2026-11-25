@@ -154,8 +154,8 @@ pub unsafe extern "C" fn commit_range_builder_with_max_catalog_version(
 /// When `false`, [`commit_range_builder_build`] lists the available commits without validating the
 /// start version or contiguity; [`commit_range_commit_files_next`] then reports gaps lazily
 /// according to [`commit_range_builder_with_fail_on_data_loss`]. Such a relaxed range cannot be
-/// read with [`commit_range_commits`], which returns a `CommitRangeError`. Even when `false`,
-/// build fails with `EmptyLogError` if no commits are listed in the range.
+/// read with [`commit_range_commits`], which returns a `CommitRangeError`. Empty and reversed
+/// ranges are allowed when validation is disabled.
 ///
 /// # Safety
 ///
@@ -174,10 +174,11 @@ pub unsafe extern "C" fn commit_range_builder_with_commit_range_validation(
 /// Set whether [`commit_range_commit_files_next`] fails on missing versions. This is by default
 /// `true` when you construct a builder.
 ///
-/// When `true`, a missing start version or any gap through the range's end version, including one
-/// after the last listed file, surfaces as an error when the commit-files iterator reaches it.
-/// Without an explicit end version, the range ends at the last listed commit, so a trailing gap
-/// cannot be detected. When `false`, available commit files are yielded across gaps.
+/// When `true`, a missing start version or a gap through the range's end version surfaces as an
+/// error when the commit-files iterator reaches it, provided an observed later commit proves the
+/// gap. Without an explicit end version or maximum catalog version, the range ends at the last
+/// listed commit, so a trailing gap cannot be detected. When `false`, available commit files are
+/// yielded across gaps.
 ///
 /// # Safety
 ///
@@ -196,9 +197,10 @@ pub unsafe extern "C" fn commit_range_builder_with_fail_on_data_loss(
 /// Consume the builder and return a [`CommitRange`]. After calling, the builder pointer is no
 /// longer valid. The builder is always freed by this call, whether or not it succeeds.
 ///
-/// Returns an error if the resolved version range is invalid (start > end), the listed commits
-/// are non-contiguous, or the requested start version is unavailable. With commit range
-/// validation disabled, contiguity and start-version availability are not checked.
+/// With commit range validation enabled, returns an error if the resolved version range is invalid
+/// (start > end), no commits are available, the listed commits are non-contiguous, or the requested
+/// start version is unavailable. Disabling validation allows empty and reversed ranges and defers
+/// gap checks to [`commit_range_commit_files_next`].
 ///
 /// # Safety
 ///
@@ -1233,8 +1235,9 @@ mod tests {
         &[0, 1],
         Some("Table version 2 is missing or unavailable for this log operation.")
     )]
-    #[case::fail_on_data_loss_reports_missing_end_version(
-        vec![0, 1],
+    #[case::fail_on_data_loss_ends_without_proven_gap(vec![0, 1], Some(2), true, &[0, 1], None)]
+    #[case::fail_on_data_loss_reports_proven_missing_end_version(
+        vec![0, 1, 3],
         Some(2),
         true,
         &[0, 1],

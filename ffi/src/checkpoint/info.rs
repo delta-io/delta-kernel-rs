@@ -5,12 +5,13 @@ use delta_kernel::checkpoint::{CheckpointInfo, CheckpointKind};
 
 use super::FfiSelectedCheckpointType;
 use crate::delta_types::{CheckpointBacking, FfiLastCheckpoint};
-use crate::error::{ExternResult, IntoExternResult};
-use crate::handle::Handle;
-use crate::panic::catch_panic;
+use crate::{KernelStringSlice, NullableCvoid, kernel_string_slice};
+#[cfg(feature = "declarative-plans")]
 use crate::{
-    KernelStringSlice, NullableCvoid, OptionalValue, SharedExternEngine, SharedSnapshot,
-    kernel_string_slice,
+    OptionalValue, SharedExternEngine, SharedSnapshot,
+    error::{ExternResult, IntoExternResult},
+    handle::Handle,
+    panic::catch_panic,
 };
 
 /// Complete borrowed checkpoint summary passed to [`CheckpointInfoVisitor`].
@@ -69,6 +70,7 @@ impl From<CheckpointKind> for FfiCheckpointKind {
 /// The snapshot and engine handles are borrowed and must remain valid for this call.
 /// During discovery, the executor must not request checkpoint information recursively on the
 /// same snapshot: that call would wait for initialization already in progress.
+#[cfg(feature = "declarative-plans")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_checkpoint_type(
     snapshot: Handle<SharedSnapshot>,
@@ -100,6 +102,7 @@ pub unsafe extern "C" fn snapshot_checkpoint_type(
 /// and its lock is released before the callback runs.
 /// During initialization, the plan executor must not call this function recursively on the same
 /// snapshot: the recursive call would wait for the initialization already in progress.
+#[cfg(feature = "declarative-plans")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_checkpoint_info(
     snapshot: Handle<SharedSnapshot>,
@@ -113,19 +116,20 @@ pub unsafe extern "C" fn snapshot_checkpoint_info(
         snapshot
             .reader()
             .get_checkpoint_info(engine.engine().as_ref())
-            .and_then(|info| visit(info.as_deref(), context, visitor))
+            .and_then(|info| visit(info.as_deref(), |info| visitor(context, info)))
             .map(|()| true)
     });
     unsafe { result.into_extern_result(&engine.as_ref()) }
 }
 
-fn visit(
+/// Invoke a callback while the checkpoint record and all nested backing storage are alive.
+#[allow(dead_code, reason = "Used by discovery or tracing.")]
+pub(crate) fn visit(
     info: Option<&CheckpointInfo>,
-    context: NullableCvoid,
-    visitor: CheckpointInfoVisitor,
+    visitor: impl FnOnce(*const FfiCheckpointInfo),
 ) -> KernelResult<()> {
     let Some(info) = info else {
-        visitor(context, std::ptr::null());
+        visitor(std::ptr::null());
         return Ok(());
     };
     let schema = serde_json::to_string(info.leaf_schema())?;
@@ -138,12 +142,12 @@ fn visit(
         last_checkpoint: checkpoint.as_ffi(),
         kind: info.kind().into(),
     };
-    visitor(context, &value);
+    visitor(&value);
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(all(test, feature = "declarative-plans"))]
+pub(super) mod tests {
     use std::ptr::NonNull;
     use std::sync::Arc;
 
@@ -355,7 +359,7 @@ mod tests {
     /// Builds handles from a snapshot hint, returning the checkpoint root's size. Every case runs
     /// without I/O except V1: discovery reads a classic-named checkpoint's footer, so that case
     /// writes a real checkpoint to in-memory storage.
-    async fn checkpoint_handles(
+    pub(crate) async fn checkpoint_handles(
         checkpoint: Option<FfiSelectedCheckpointType>,
         manifest: bool,
         invalid_size: bool,

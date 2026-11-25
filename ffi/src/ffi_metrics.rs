@@ -9,7 +9,9 @@
 //! - Operation ids are UUIDs in kernel (see [`MetricId`]). Here we report the raw 16 bytes of the
 //!   UUID.
 
+mod scan_plan;
 use delta_kernel::metrics as kernel;
+pub use scan_plan::*;
 
 use crate::{KernelStringSlice, kernel_string_slice};
 
@@ -517,10 +519,10 @@ impl From<kernel::CheckpointWriteStats> for CheckpointWriteStats {
     }
 }
 
-/// Identifiers of a failed CRC or domain metadata read.
+/// Identifiers of a failed domain metadata read.
 #[repr(C)]
 pub struct ReadFailure {
-    /// Operation ID of the snapshot build for CRC reads, or of the domain metadata read.
+    /// Unique ID for this domain metadata read.
     pub operation_id: MetricId,
     /// Caller-supplied request identifier. Empty when omitted.
     pub correlation_id: KernelStringSlice,
@@ -555,6 +557,47 @@ pub struct CrcReadSuccess {
     pub correlation_id: KernelStringSlice,
     pub bytes_read: u64,
     pub duration_ns: u64,
+}
+
+/// Why a CRC file could not be read or parsed.
+///
+/// cbindgen:prefix-with-name=true
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum CrcReadFailureReason {
+    /// Storage reported that the CRC file was absent.
+    NotFound,
+    /// Storage returned no data or a zero-byte file.
+    Empty,
+    /// The CRC contents could not be parsed or validated.
+    Parsing,
+    /// The read failed for another reason.
+    Error,
+    /// The read was cancelled.
+    Cancelled,
+}
+
+impl From<kernel::CrcReadFailureReason> for CrcReadFailureReason {
+    fn from(reason: kernel::CrcReadFailureReason) -> Self {
+        match reason {
+            kernel::CrcReadFailureReason::NotFound => Self::NotFound,
+            kernel::CrcReadFailureReason::Empty => Self::Empty,
+            kernel::CrcReadFailureReason::Parsing => Self::Parsing,
+            kernel::CrcReadFailureReason::Cancelled => Self::Cancelled,
+            _ => Self::Error,
+        }
+    }
+}
+
+/// A CRC file read or parse failed. Non-cancellation failures allow log replay.
+#[repr(C)]
+pub struct CrcReadFailure {
+    /// Operation ID of the snapshot build that requested this CRC.
+    pub operation_id: MetricId,
+    /// Caller-supplied request identifier. Empty when omitted.
+    pub correlation_id: KernelStringSlice,
+    /// Why the CRC could not be used.
+    pub reason: CrcReadFailureReason,
 }
 
 /// A [`delta_kernel::Snapshot::write_checksum`] call succeeded.
@@ -704,7 +747,7 @@ pub enum MetricEvent {
     SetTransactionLoadSuccess(SetTransactionLoadSuccess),
     SetTransactionLoadFailure,
     CrcReadSuccess(CrcReadSuccess),
-    CrcReadFailure(ReadFailure),
+    CrcReadFailure(CrcReadFailure),
     JsonReadCompleted(JsonReadCompleted),
     ParquetReadCompleted(ParquetReadCompleted),
     ScanMetadataCompleted(ScanMetadataCompleted),
@@ -716,6 +759,8 @@ pub enum MetricEvent {
     ChecksumWriteSuccess(ChecksumWriteSuccess),
     ChecksumWriteFailure(ChecksumWriteFailure),
     LastCheckpointReadCompleted(LastCheckpointReadCompleted),
+    /// Scan-plan report with callback-scoped borrowed fields.
+    ScanPlanGenerationCompleted(ScanPlanReport),
 }
 
 fn duration_ns(duration: std::time::Duration) -> u64 {
@@ -737,9 +782,11 @@ impl MetricEvent {
     /// Build an FFI event from a kernel event. Note that this event is only valid as long as the
     /// passed argument is still alive, since we might make `KernelStringSlices` out of some
     /// fields.
-    pub(crate) fn from_kernel(event: &kernel::MetricEvent) -> Self {
+    /// Scan-plan events need temporary backing storage and are handled by `with_ffi_event`.
+    pub(crate) fn from_kernel(event: &kernel::MetricEvent) -> Option<Self> {
         use kernel::MetricEvent as K;
-        match event {
+        Some(match event {
+            K::ScanPlanGenerationCompleted(_) => return None,
             K::LogSegmentLoadSuccess(kernel::LogSegmentLoadSuccess {
                 operation_id,
                 correlation_id,
@@ -923,12 +970,14 @@ impl MetricEvent {
                 bytes_read: *bytes_read,
                 duration_ns: duration_ns(*duration),
             }),
-            K::CrcReadFailure {
+            K::CrcReadFailure(kernel::CrcReadFailure {
                 operation_id,
                 correlation_id,
-            } => Self::CrcReadFailure(ReadFailure {
+                reason,
+            }) => Self::CrcReadFailure(CrcReadFailure {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
+                reason: (*reason).into(),
             }),
             K::LastCheckpointReadCompleted(kernel::LastCheckpointReadCompleted {
                 operation_id,
@@ -1059,16 +1108,19 @@ impl MetricEvent {
                 processing_stats: (*processing_stats).into(),
                 output_stats: (*output_stats).into(),
             }),
-        }
+        })
     }
 }
 
 /// Invoke `f` with the FFI [`MetricEvent`] built from `event`.
-pub(crate) fn with_ffi_event<R>(
-    event: &kernel::MetricEvent,
-    f: impl FnOnce(MetricEvent) -> R,
-) -> R {
-    f(MetricEvent::from_kernel(event))
+///
+/// If scan-plan checkpoint conversion fails, log a warning without invoking `f`.
+pub(crate) fn with_ffi_event(event: &kernel::MetricEvent, f: impl FnOnce(MetricEvent)) {
+    if let kernel::MetricEvent::ScanPlanGenerationCompleted(report) = event {
+        scan_plan::with_event(report, f);
+    } else if let Some(event) = MetricEvent::from_kernel(event) {
+        f(event);
+    }
 }
 
 #[cfg(test)]
@@ -1080,6 +1132,32 @@ mod tests {
 
     use super::*;
     use crate::TryFromStringSlice;
+
+    #[rstest]
+    #[case(kernel::CrcReadFailureReason::NotFound, CrcReadFailureReason::NotFound)]
+    #[case(kernel::CrcReadFailureReason::Empty, CrcReadFailureReason::Empty)]
+    #[case(kernel::CrcReadFailureReason::Parsing, CrcReadFailureReason::Parsing)]
+    #[case(kernel::CrcReadFailureReason::Error, CrcReadFailureReason::Error)]
+    #[case(
+        kernel::CrcReadFailureReason::Cancelled,
+        CrcReadFailureReason::Cancelled
+    )]
+    fn crc_read_failure_conversion_preserves_reason(
+        #[case] reason: kernel::CrcReadFailureReason,
+        #[case] expected: CrcReadFailureReason,
+    ) {
+        let event = kernel::MetricEvent::CrcReadFailure(kernel::CrcReadFailure {
+            operation_id: kernel::MetricId::new(),
+            correlation_id: None,
+            reason,
+        });
+        with_ffi_event(&event, |event| {
+            let MetricEvent::CrcReadFailure(event) = event else {
+                panic!("expected CrcReadFailure");
+            };
+            assert_eq!(event.reason, expected);
+        });
+    }
 
     #[rstest]
     #[case(
@@ -1149,10 +1227,11 @@ mod tests {
                 bytes_read: 42,
                 duration: Duration::ZERO,
             }),
-            (true, true) => K::CrcReadFailure {
+            (true, true) => K::CrcReadFailure(kernel::CrcReadFailure {
                 operation_id,
                 correlation_id,
-            },
+                reason: kernel::CrcReadFailureReason::Parsing,
+            }),
             (false, false) => K::DomainMetadataLoadSuccess(kernel::DomainMetadataLoadSuccess {
                 operation_id,
                 correlation_id,
@@ -1173,8 +1252,10 @@ mod tests {
                 (false, false, MetricEvent::DomainMetadataLoadSuccess(read)) => {
                     (read.operation_id, read.correlation_id)
                 }
-                (true, true, MetricEvent::CrcReadFailure(read))
-                | (false, true, MetricEvent::DomainMetadataLoadFailure(read)) => {
+                (true, true, MetricEvent::CrcReadFailure(read)) => {
+                    (read.operation_id, read.correlation_id)
+                }
+                (false, true, MetricEvent::DomainMetadataLoadFailure(read)) => {
                     (read.operation_id, read.correlation_id)
                 }
                 _ => panic!("unexpected read metric"),
