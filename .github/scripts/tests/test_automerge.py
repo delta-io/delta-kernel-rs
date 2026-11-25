@@ -153,6 +153,18 @@ def _remove_label(node: dict) -> None:
     )
 
 
+def _replace_requester(node: dict) -> None:
+    _remove_label(node)
+    node["labels"]["nodes"] = [{"name": "automerge"}]
+    node["timelineItems"]["nodes"].append(
+        {
+            "__typename": "LabeledEvent",
+            "actor": {"login": CONTRIBUTOR},
+            "label": {"name": "automerge"},
+        }
+    )
+
+
 class ReconcileTest(unittest.TestCase):
     def reconcile(self, fake: FakeGitHub) -> str:
         return automerge.reconcile(fake, REPOSITORY, 2)
@@ -209,8 +221,22 @@ class ReconcileTest(unittest.TestCase):
         fake.failures["EnableAutoMerge"] = [GitHubError("Pull request is in clean status")]
         message = self.reconcile(fake)
         self.assertEqual(fake.mutations(), ["EnableAutoMerge", "Enqueue"])
-        self.assertEqual(fake.calls[-2][1], {"id": "PR_node", "head": HEAD})
+        (variables,) = [v for operation, v in fake.calls if operation == "Enqueue"]
+        self.assertEqual(variables, {"id": "PR_node", "head": HEAD})
         self.assertIn("in the merge queue", message)
+
+    def test_revoked_or_unauthorized_request_does_not_enqueue(self) -> None:
+        cases = {
+            "removed label": (_remove_label, "revoked"),
+            "unauthorized reapplication": (_replace_requester, "without write permission"),
+        }
+        for scenario, (change, expected) in cases.items():
+            with self.subTest(scenario=scenario):
+                fake = FakeGitHub(_node(), {CONTRIBUTOR: "read"})
+                fake.on["EnableAutoMerge"] = change
+                fake.failures["EnableAutoMerge"] = [GitHubError("rejected")]
+                self.assert_not_honored(fake, expected)
+                self.assertEqual(fake.mutations(), ["EnableAutoMerge"])
 
     def test_rejected_requests_are_reported_once_without_retry(self) -> None:
         fake = FakeGitHub(_node())
@@ -237,15 +263,50 @@ class ReconcileTest(unittest.TestCase):
         self.assertIn("waiting to merge", message)
 
     def test_label_removed_during_request_cancels_the_merge(self) -> None:
-        fake = FakeGitHub(_node(body=_stack_body()))
-        fake.on["EnableAutoMerge"] = _remove_label
-        message = self.reconcile(fake)
-        self.assertEqual(
-            fake.mutations(), ["UpdateDescription", "EnableAutoMerge", "DisableAutoMerge"]
+        for operation, cancel in [("EnableAutoMerge", "DisableAutoMerge"), ("Enqueue", "Dequeue")]:
+            with self.subTest(operation=operation):
+                fake = FakeGitHub(_node(body=_stack_body()))
+                if operation == "Enqueue":
+                    fake.failures["EnableAutoMerge"] = [GitHubError("rejected")]
+                fake.on[operation] = _remove_label
+                message = self.reconcile(fake)
+                self.assertEqual(fake.mutations()[-2:], [operation, cancel])
+                self.assertIsNone(fake.node["autoMergeRequest"])
+                self.assertIsNone(fake.node["mergeQueueEntry"])
+                self.assertIn("label was removed", message)
+                self.assertIn("Cancelled the merge request", message)
+
+    def test_unauthorized_reapplication_during_request_cancels_the_merge(self) -> None:
+        for operation, cancel in [("EnableAutoMerge", "DisableAutoMerge"), ("Enqueue", "Dequeue")]:
+            with self.subTest(operation=operation):
+                fake = FakeGitHub(_node(), {CONTRIBUTOR: "read"})
+                if operation == "Enqueue":
+                    fake.failures["EnableAutoMerge"] = [GitHubError("rejected")]
+                fake.on[operation] = _replace_requester
+                self.assert_not_honored(fake, "without write permission", "Cancelled")
+                self.assertEqual(fake.mutations()[-2:], [operation, cancel])
+                self.assertIsNone(fake.node["autoMergeRequest"])
+                self.assertIsNone(fake.node["mergeQueueEntry"])
+
+    def test_successful_request_without_active_intent_reports_recovery(self) -> None:
+        fake = FakeGitHub(_node())
+        fake.on["PullRequestState"] = lambda node: node.update(autoMergeRequest=None)
+        self.assert_not_honored(
+            fake, "accepted the merge request but reports none", automerge.RECOVERY
         )
-        self.assertIsNone(fake.node["autoMergeRequest"])
-        self.assertIn("label was removed", message)
-        self.assertIn("Cancelled the merge request", message)
+        self.assertEqual(fake.mutations(), ["EnableAutoMerge"])
+
+    def test_merge_completed_after_request_is_reported_without_cancellation(self) -> None:
+        fake = FakeGitHub(_node())
+
+        def complete_merge(node: dict) -> None:
+            if node["autoMergeRequest"] is not None:
+                node.update(state="MERGED", merged=True, autoMergeRequest=None)
+                _remove_label(node)
+
+        fake.on["PullRequestState"] = complete_merge
+        self.assertIn("The PR is merged", self.reconcile(fake))
+        self.assertEqual(fake.mutations(), ["EnableAutoMerge"])
 
     def test_description_write_failure_stops_before_requesting_merge(self) -> None:
         fake = FakeGitHub(_node(body=_stack_body()))
@@ -288,6 +349,21 @@ class ReconcileTest(unittest.TestCase):
         fake = FakeGitHub(_node(labels=(), events=(LABELED, UNLABELED), queued=True))
         fake.failures["Dequeue"] = [GitHubError("locked")]
         self.assert_not_honored(fake, "Could not cancel", "in the merge queue")
+
+    def test_dequeue_error_does_not_skip_disabling_waiting(self) -> None:
+        fake = FakeGitHub(_node(labels=(), events=(LABELED, UNLABELED), waiting=True, queued=True))
+        fake.failures["Dequeue"] = [GitHubError("locked")]
+        self.assert_not_honored(fake, "Could not cancel", "in the merge queue")
+        self.assertEqual(fake.mutations(), ["Dequeue", "DisableAutoMerge"])
+        self.assertIsNone(fake.node["autoMergeRequest"])
+
+    def test_label_removal_on_unsupported_base_still_cancels(self) -> None:
+        for state in [{"waiting": True}, {"queued": True}]:
+            with self.subTest(**state):
+                fake = FakeGitHub(_node(labels=(), base_ref="release/0.20", **state))
+                self.assertIn("Cancelled the merge request", self.reconcile(fake))
+                self.assertIsNone(fake.node["autoMergeRequest"])
+                self.assertIsNone(fake.node["mergeQueueEntry"])
 
     def test_duplicate_label_event_after_arming_does_nothing(self) -> None:
         fake = FakeGitHub(_node(events=(LABELED, UNLABELED, LABELED), waiting=True))
@@ -375,11 +451,21 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(fake.node["body"], SUFFIX)
 
     def test_review_scope_lookup_failure_skips_cleanup_but_requests_merge(self) -> None:
-        fake = FakeGitHub(_node(body=_stack_body(parent=1)))
-        message = self.reconcile(fake)
-        self.assertEqual(fake.mutations(), ["EnableAutoMerge"])
-        self.assertEqual(fake.node["body"], _stack_body(parent=1))
-        self.assertIn("left unchanged", message)
+        endpoint = f"repos/{REPOSITORY}/pulls/1"
+        cases = {
+            "API failure": {},
+            "missing head": {endpoint: {}},
+            "null head": {endpoint: {"head": None}},
+        }
+        for scenario, rest in cases.items():
+            with self.subTest(scenario=scenario):
+                fake = FakeGitHub(_node(body=_stack_body(parent=1)), rest=rest)
+                with self.assertLogs("automerge", level="INFO") as logs:
+                    message = self.reconcile(fake)
+                self.assertEqual(fake.mutations(), ["EnableAutoMerge"])
+                self.assertEqual(fake.node["body"], _stack_body(parent=1))
+                self.assertIn("left unchanged", message)
+                self.assertIn("Cannot resolve the AI review scope", "\n".join(logs.output))
 
 
 class GhClientTest(unittest.TestCase):

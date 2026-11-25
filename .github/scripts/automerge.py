@@ -135,8 +135,7 @@ def reconcile(github: GitHub, repository: str, number: int) -> str:
     if pr.state != "OPEN":
         return f"The PR is {pr.state.lower()}; nothing to reconcile."
 
-    requester = _active_requester(pr)
-    if requester is None:
+    if _authorized_requester(github, repository, pr) is None:
         cancelled = _cancel(github, repository, pr)
         if LABEL in pr.labels:
             raise AutomergeError(
@@ -144,12 +143,6 @@ def reconcile(github: GitHub, repository: str, number: int) -> str:
                 + RECOVERY
             )
         return cancelled
-    if not _has_write(github, repository, requester):
-        cancelled = _cancel(github, repository, pr)
-        raise AutomergeError(
-            f"{requester} applied '{LABEL}' without write permission, so the merge request is not "
-            f"honored; {cancelled} A maintainer with write access must apply the label."
-        )
     if pr.is_draft:
         raise AutomergeError(f"The PR is a draft. Mark it ready for review first. {RECOVERY}")
     if pr.base_ref != SUPPORTED_BASE:
@@ -162,14 +155,28 @@ def reconcile(github: GitHub, repository: str, number: int) -> str:
     cleanup = _clean_description(github, repository, pr)
     _request_merge(github, repository, pr)
     pr = _read(github, repository, number)
-    if _active_requester(pr) is None:
+    if pr.merged:
+        return f"{cleanup} The PR is merged."
+    if _authorized_requester(github, repository, pr) is None:
         cancelled = _cancel(github, repository, pr)
         return f"{cleanup} The label was removed while requesting the merge; {cancelled}"
-    if not pr.armed and not pr.merged:
+    if not pr.armed:
         raise AutomergeError(
             f"{cleanup} GitHub accepted the merge request but reports none. {RECOVERY}"
         )
     return f"{cleanup} The PR is {pr.merge_state}."
+
+
+def _authorized_requester(github: GitHub, repository: str, pr: PullRequest) -> str | None:
+    """Return the active requester, or None if absent; cancel and reject unauthorized intent."""
+    requester = _active_requester(pr)
+    if requester is not None and not _has_write(github, repository, requester):
+        cancelled = _cancel(github, repository, pr)
+        raise AutomergeError(
+            f"{requester} applied '{LABEL}' without write permission, so the merge request is not "
+            f"honored; {cancelled} A maintainer with write access must apply the label."
+        )
+    return requester
 
 
 def _active_requester(pr: PullRequest) -> str | None:
@@ -238,7 +245,12 @@ def _request_merge(github: GitHub, repository: str, pr: PullRequest) -> None:
             rejections.append(str(error))
             _LOG.info("Merge request rejected: %s", error)
         current = _read(github, repository, pr.number)
-        if current.armed or current.merged:
+        if current.merged:
+            return
+        if _authorized_requester(github, repository, current) is None:
+            cancelled = _cancel(github, repository, current)
+            raise AutomergeError(f"The merge request was revoked; {cancelled} {RECOVERY}")
+        if current.armed:
             return
         if current.head != pr.head:
             raise AutomergeError(
@@ -252,13 +264,12 @@ def _cancel(github: GitHub, repository: str, pr: PullRequest) -> str:
     """Best-effort cancellation of waiting and queued state; GitHub may already be merging."""
     if not pr.armed:
         return "No merge request is active."
-    try:
-        if pr.queued:
-            github.graphql(DEQUEUE, {"id": pr.id})
-        if pr.waiting:
-            github.graphql(DISABLE_AUTO_MERGE, {"id": pr.id})
-    except GitHubError as error:
-        _LOG.info("Cancellation rejected: %s", error)
+    for active, mutation in ((pr.queued, DEQUEUE), (pr.waiting, DISABLE_AUTO_MERGE)):
+        if active:
+            try:
+                github.graphql(mutation, {"id": pr.id})
+            except GitHubError as error:
+                _LOG.info("Cancellation rejected: %s", error)
     current = _read(github, repository, pr.number)
     if current.merged:
         return "GitHub completed the merge before it could be cancelled."
