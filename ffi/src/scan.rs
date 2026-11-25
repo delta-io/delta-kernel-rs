@@ -327,6 +327,33 @@ pub unsafe extern "C" fn scan_builder_with_correlation_id(
     unsafe { result.into_extern_result(&engine) }
 }
 
+/// Attach a caller-supplied table identifier to this scan's metadata metric events.
+///
+/// Copies the identifier before returning. Repeated calls replace the previous value; an empty
+/// value clears it. Invalid UTF-8 or a null pointer with nonzero length returns an error.
+/// Like [`ScanBuilder::with_table_id`], this identifier does not survive serialization of
+/// parallel scan state.
+///
+/// # Safety
+///
+/// `builder` and `engine` must be valid handles. This call borrows `engine` and consumes `builder`
+/// on both success and error. The input builder must not be used or freed afterward; the caller
+/// owns the returned builder on success. `table_id` is borrowed for this call. If its
+/// pointer is non-null, it must address `len` readable bytes until the call returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn scan_builder_with_table_id(
+    builder: Handle<ExclusiveScanBuilder>,
+    engine: Handle<SharedExternEngine>,
+    table_id: KernelStringSlice,
+) -> ExternResult<Handle<ExclusiveScanBuilder>> {
+    let builder = unsafe { builder.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    let result = catch_panic(|| {
+        unsafe { table_id.try_to_string() }.map(|id| Box::new(builder.with_table_id(id)).into())
+    });
+    unsafe { result.into_extern_result(&engine) }
+}
+
 /// Apply a predicate to an [`ExclusiveScanBuilder`] for data skipping and row-level filtering.
 ///
 /// Consumes the `builder` handle and returns a new handle with the predicate applied. The

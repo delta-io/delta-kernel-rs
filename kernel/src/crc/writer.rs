@@ -147,7 +147,7 @@ mod tests {
 
         try_write_crc_file(&engine, crc_path.location.as_url(), &crc).unwrap();
 
-        let read_back = try_read_crc_file(&engine, &crc_path).unwrap();
+        let read_back = try_read_crc_file(&engine, &crc_path, None).unwrap();
         assert_eq!(read_back, crc);
         assert_eq!(read_back.version, version);
     }

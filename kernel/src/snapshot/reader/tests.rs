@@ -145,6 +145,33 @@ fn reader_no_io_getters_can_succeed_after_cancellation() {
     );
 }
 
+#[test]
+fn rebinding_shared_snapshot_keeps_other_readers_identity() {
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    let engine = SyncEngine::new();
+    let snapshot = Snapshot::builder_for("tests/data/app-txn-no-checkpoint")
+        .with_table_id("original")
+        .build(&engine)
+        .unwrap();
+    let rebound = snapshot.clone().with_metric_table_id(Some("other".into()));
+    let cleared = rebound.clone().with_metric_table_id(None);
+    for view in [&rebound, &cleared, &snapshot] {
+        view.reader()
+            .get_domain_metadata("missing", &engine)
+            .unwrap();
+    }
+    let ids: Vec<_> = reporter
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            MetricEvent::DomainMetadataLoadSuccess(e) => Some(e.table_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, [Some("other".into()), None, Some("original".into())]);
+}
+
 /// Reader delegation preserves metadata success/failure metrics and validation errors.
 #[rstest]
 fn reader_preserves_metadata_metrics_and_errors(#[values(false, true)] cancelled: bool) {
@@ -153,6 +180,7 @@ fn reader_preserves_metadata_metrics_and_errors(#[values(false, true)] cancelled
     let engine = SyncEngine::new();
     let snapshot = Snapshot::builder_for("tests/data/app-txn-no-checkpoint")
         .with_correlation_id("reader-metadata")
+        .with_table_id("reader-table")
         .build(&engine)
         .unwrap();
     let token = Arc::new(TestCancellationToken::default());
@@ -186,10 +214,7 @@ fn reader_preserves_metadata_metrics_and_errors(#[values(false, true)] cancelled
                 false
             }
             MetricEvent::DomainMetadataLoadFailure { table_id } => {
-                assert_eq!(
-                    table_id.as_deref(),
-                    Some(snapshot.table_configuration().metadata().id())
-                );
+                assert_eq!(table_id.as_deref(), Some("reader-table"));
                 true
             }
             MetricEvent::SetTransactionLoadFailure => true,

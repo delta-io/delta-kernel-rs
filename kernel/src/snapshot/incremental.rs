@@ -175,6 +175,7 @@ impl Snapshot {
                     &existing_snapshot,
                     built_as_latest,
                     existing_snapshot.skipped_new_checkpoints,
+                    metric_context.table_id.clone(),
                 ));
             }
             // Case B: incremental path only moves forward.
@@ -218,6 +219,7 @@ impl Snapshot {
                     &existing_snapshot,
                     built_as_latest,
                     skipped_new_checkpoints,
+                    metric_context.table_id.clone(),
                 ));
             }
             NewSegment::Rebuild(new_log_segment) => {
@@ -290,7 +292,11 @@ impl Snapshot {
         // matching the fresh path.
         let pm_start = std::time::Instant::now();
         let base_crc = combined_log_segment
-            .pick_latest_base_crc(engine, existing_snapshot.base_crc())
+            .pick_latest_base_crc(
+                engine,
+                existing_snapshot.base_crc(),
+                metric_context.table_id.as_deref(),
+            )
             .inspect_err(|_| {
                 emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
             })?;
@@ -332,16 +338,7 @@ impl Snapshot {
                     })?
             }
         };
-        let metadata = resolution
-            .metadata
-            .as_ref()
-            .unwrap_or_else(|| existing_table_config.metadata());
-        emit_protocol_metadata_load(
-            metric_context,
-            resolution.source,
-            metadata.id(),
-            pm_start.elapsed(),
-        );
+        emit_protocol_metadata_load(metric_context, resolution.source, pm_start.elapsed());
         debug!(
             source = ?resolution.source,
             base_crc_version = ?base_crc.as_ref().map(|crc| crc.version),
@@ -592,18 +589,21 @@ impl Snapshot {
     ///
     /// The source is unchanged. Populated caches are preserved, and uninitialized cache cells
     /// resolve independently.
-    fn reuse_with_build_metadata(
+    pub(super) fn reuse_with_build_metadata(
         existing: &Arc<Snapshot>,
         built_as_latest: bool,
         skipped_new_checkpoints: bool,
+        table_id: Option<Arc<str>>,
     ) -> Arc<Snapshot> {
-        if existing.built_as_latest == built_as_latest
+        if existing.metric_table_id == table_id
+            && existing.built_as_latest == built_as_latest
             && existing.skipped_new_checkpoints == skipped_new_checkpoints
         {
             return existing.clone();
         }
         Arc::new(Self {
             span: existing.span.clone(),
+            metric_table_id: table_id,
             log_segment: existing.log_segment.clone(),
             table_configuration: existing.table_configuration.clone(),
             crc: existing.crc.clone(),

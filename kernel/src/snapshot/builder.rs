@@ -56,6 +56,7 @@ pub struct SnapshotBuilder<Mode = FromTableRoot> {
     /// Opaque, caller-supplied id recorded on this build's metric events. Not interpreted by
     /// kernel; set via [`with_correlation_id`](Self::with_correlation_id).
     correlation_id: Option<Arc<str>>,
+    table_id: Option<Arc<str>>,
     /// Optional cooperative cancellation token for this build's handler-backed reads.
     cancellation_token: Option<CancellationTokenRef>,
     // Carries the zero-sized typestate that limits mode-specific methods at compile time.
@@ -150,6 +151,7 @@ impl SnapshotBuilder<FromTableRoot> {
             snapshot_hint: None,
             operation_id: MetricId::new(),
             correlation_id: None,
+            table_id: None,
             cancellation_token: None,
             mode: PhantomType::default(),
         }
@@ -183,6 +185,7 @@ impl SnapshotBuilder<FromTableRoot> {
 
 impl SnapshotBuilder<FromSnapshot> {
     pub(crate) fn new_from(existing_snapshot: SnapshotRef) -> Self {
+        let table_id = existing_snapshot.metric_table_id.clone();
         Self {
             table_root: None,
             existing_snapshot: Some(existing_snapshot),
@@ -194,6 +197,7 @@ impl SnapshotBuilder<FromSnapshot> {
             snapshot_hint: None,
             operation_id: MetricId::new(),
             correlation_id: None,
+            table_id,
             cancellation_token: None,
             mode: PhantomType::default(),
         }
@@ -320,6 +324,12 @@ impl<Mode> SnapshotBuilder<Mode> {
         self
     }
 
+    /// Attach the caller's opaque table identifier to read metrics. An empty value clears it.
+    pub fn with_table_id(mut self, table_id: impl Into<Arc<str>>) -> Self {
+        self.table_id = Some(table_id.into()).filter(|id| !id.is_empty());
+        self
+    }
+
     // ============================================================================
     // Terminal: build the Snapshot
     // ============================================================================
@@ -358,7 +368,7 @@ impl<Mode> SnapshotBuilder<Mode> {
     #[instrument(
         name = SNAPSHOT_COMPLETED_SPAN,
         skip_all,
-        fields(path = %self.table_path(), report, enable_call_frame, version = tracing::field::Empty, table_id = tracing::field::Empty, operation_id = %self.operation_id, is_catalog_managed = self.max_catalog_version.is_some(), correlation_id = self.correlation_id.as_deref().unwrap_or(""), load_type = self.load_type().as_ref()),
+        fields(path = %self.table_path(), report, enable_call_frame, version = tracing::field::Empty, table_id = self.table_id.as_deref().unwrap_or(""), operation_id = %self.operation_id, is_catalog_managed = self.max_catalog_version.is_some(), correlation_id = self.correlation_id.as_deref().unwrap_or(""), load_type = self.load_type().as_ref()),
         err
     )]
     pub fn build(self, engine: &dyn Engine) -> Result<SnapshotRef> {
@@ -389,6 +399,7 @@ impl<Mode> SnapshotBuilder<Mode> {
             snapshot_hint,
             operation_id,
             correlation_id,
+            table_id,
             cancellation_token,
             mode: _,
         } = self;
@@ -397,6 +408,7 @@ impl<Mode> SnapshotBuilder<Mode> {
             operation_id,
             is_catalog_managed: max_catalog_version.is_some(),
             correlation_id,
+            table_id: table_id.clone(),
             load_type,
         };
 
@@ -493,9 +505,8 @@ impl<Mode> SnapshotBuilder<Mode> {
 
         // Post-build validations for catalog-managed tables
         Self::validate_catalog_managed_build_result(&snapshot, version, max_catalog_version)?;
-        tracing::Span::current().record("table_id", snapshot.table_configuration().metadata().id());
         tracing::Span::current().record("version", snapshot.version());
-        Ok(snapshot)
+        Ok(snapshot.with_metric_table_id(table_id))
     }
 
     // ============================================================================
@@ -1219,8 +1230,12 @@ pub(super) mod tests {
         create_table(&store, &table_root).await?;
 
         let (reporter, _guard) = measuring_reporter();
-        let snapshot = SnapshotBuilder::new_for(table_root)
+        SnapshotBuilder::new_for(table_root)
             .fold_with(correlation_id, SnapshotBuilder::with_correlation_id)
+            .fold_with(
+                correlation_id.map(|_| "opaque-table"),
+                SnapshotBuilder::with_table_id,
+            )
             .build(engine.as_ref())?;
 
         // The build event and its snapshot-load child events must all carry the id, since they
@@ -1242,8 +1257,9 @@ pub(super) mod tests {
             .unwrap();
         assert_eq!(
             build.table_id.as_deref(),
-            Some(snapshot.table_configuration().metadata().id())
+            correlation_id.map(|_| "opaque-table")
         );
+        assert_eq!(hint.table_id, build.table_id);
         assert_eq!(hint.operation_id, build.operation_id);
         assert_eq!(hint.correlation_id.as_deref(), correlation_id);
         assert!(hint.log_path.ends_with("/_delta_log/"));

@@ -135,6 +135,7 @@ pub enum CheckpointWriteResult {
 ///
 /// [snapshot management guide]: https://docs.delta.io/kernel/rust/reading/time_travel.html
 pub struct Snapshot {
+    pub(crate) metric_table_id: Option<Arc<str>>,
     span: tracing::Span,
     log_segment: LogSegment,
     table_configuration: TableConfiguration,
@@ -219,6 +220,25 @@ struct PreparedSnapshot {
 }
 
 impl Snapshot {
+    /// Associate subsequent read metrics with the caller's table identifier. Other handles to
+    /// this snapshot retain their original identifier.
+    pub fn with_metric_table_id(mut self: Arc<Self>, table_id: Option<Arc<str>>) -> Arc<Self> {
+        let table_id = table_id.filter(|id| !id.is_empty());
+        if self.metric_table_id != table_id {
+            if let Some(snapshot) = Arc::get_mut(&mut self) {
+                snapshot.metric_table_id = table_id;
+            } else {
+                return Self::reuse_with_build_metadata(
+                    &self,
+                    self.built_as_latest,
+                    self.skipped_new_checkpoints,
+                    table_id,
+                );
+            }
+        }
+        self
+    }
+
     // ============================================================================
     // Construction entry points
     // ============================================================================
@@ -339,6 +359,7 @@ impl Snapshot {
         };
         Self {
             span,
+            metric_table_id: None,
             log_segment,
             table_configuration,
             crc,
@@ -533,9 +554,11 @@ impl Snapshot {
 
         // Step 1: read the latest on-disk CRC and, if usable, advance it to the end version
         //         (or use it as-is when already there) per `incremental_replay`.
-        let base_crc = log_segment.read_latest_crc(engine).inspect_err(|_| {
-            emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
-        })?;
+        let base_crc = log_segment
+            .pick_latest_base_crc(engine, None, metric_context.table_id.as_deref())
+            .inspect_err(|_| {
+                emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
+            })?;
         let crc_at_version = log_segment
             .try_build_crc_within_budget(engine, base_crc.as_ref(), incremental_replay)
             .inspect_err(|_| {
@@ -586,7 +609,7 @@ impl Snapshot {
             (Some(_), None) => return fail(KernelError::MissingProtocol),
             (None, None) => return fail(KernelError::MissingMetadataAndProtocol),
         };
-        emit_protocol_metadata_load(metric_context, source, metadata.id(), pm_start.elapsed());
+        emit_protocol_metadata_load(metric_context, source, pm_start.elapsed());
         debug!(
             ?source,
             base_crc_version = ?base_crc.as_ref().map(|crc| crc.version),
@@ -1194,14 +1217,13 @@ impl Snapshot {
         name = DOMAIN_METADATA_LOADED_SPAN,
         skip_all,
         err,
-        fields(report, from_cache, num_domains_returned, table_id)
+        fields(report, from_cache, num_domains_returned, table_id = self.metric_table_id.as_deref().unwrap_or(""))
     )]
     fn get_domain_metadatas_internal(
         &self,
         engine: &dyn Engine,
         domains: Option<&HashSet<&str>>,
     ) -> KernelResult<DomainMetadataMap> {
-        tracing::Span::current().record("table_id", self.table_configuration().metadata().id());
         fn record_metric(from_cache: bool, num_domains_returned: usize) {
             let span = tracing::Span::current();
             span.record("from_cache", from_cache);

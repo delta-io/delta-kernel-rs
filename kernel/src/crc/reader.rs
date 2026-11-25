@@ -18,10 +18,11 @@ use crate::{Engine, KernelError, KernelResult};
 /// replay.
 ///
 /// Reports metrics: `CrcReadSuccess` or `CrcReadFailure`.
-#[instrument(name = CRC_READ_COMPLETED_SPAN, err(level = "warn"), skip_all, fields(report, enable_call_frame, bytes_read, table_id, path = ?crc_path.location.location))]
+#[instrument(name = CRC_READ_COMPLETED_SPAN, err(level = "warn"), skip_all, fields(report, enable_call_frame, bytes_read, table_id = table_id.unwrap_or(""), path = ?crc_path.location.location))]
 pub(crate) fn try_read_crc_file(
     engine: &dyn Engine,
     crc_path: &ParsedLogPath,
+    table_id: Option<&str>,
 ) -> KernelResult<Crc> {
     let storage = engine.storage_handler();
     let url = crc_path.location.as_url().clone();
@@ -30,9 +31,7 @@ pub(crate) fn try_read_crc_file(
         .next()
         .ok_or_else(|| KernelError::generic("CRC file read returned no data"))??;
     tracing::Span::current().record("bytes_read", data.len() as u64);
-    let crc = Crc::try_from_json_bytes(&data, crc_path.version)?;
-    tracing::Span::current().record("table_id", crc.metadata.id());
-    Ok(crc)
+    Crc::try_from_json_bytes(&data, crc_path.version)
 }
 
 /// Read an optional CRC, propagating cancellation and ignoring other read failures.
@@ -42,8 +41,9 @@ pub(crate) fn try_read_crc_file(
 pub(crate) fn read_crc_file_or_none(
     engine: &dyn Engine,
     crc_file: &ParsedLogPath,
+    table_id: Option<&str>,
 ) -> KernelResult<Option<Arc<Crc>>> {
-    match try_read_crc_file(engine, crc_file) {
+    match try_read_crc_file(engine, crc_file, table_id) {
         Ok(crc) => Ok(Some(Arc::new(crc))),
         Err(KernelError::Cancelled) => Err(KernelError::Cancelled),
         Err(_) => Ok(None),
@@ -91,7 +91,7 @@ mod tests {
             token.cancel();
         }
         let engine = CancellableEngine::new(&SyncEngine::new(), token);
-        let result = read_crc_file_or_none(&engine, &crc_path);
+        let result = read_crc_file_or_none(&engine, &crc_path, None);
         if cancelled {
             assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
         } else {
@@ -109,7 +109,7 @@ mod tests {
         let crc_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
 
         // Read and parse the CRC file
-        let crc = try_read_crc_file(&engine, &crc_path).unwrap();
+        let crc = try_read_crc_file(&engine, &crc_path, None).unwrap();
 
         // Verify basic fields
         let stats = crc.file_stats().unwrap();
@@ -234,13 +234,16 @@ mod tests {
         let table_root = test_table_root("./tests/data/crc-malformed/");
         let crc_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
 
-        assert_result_error_with_message(try_read_crc_file(&engine, &crc_path), "expected value");
+        assert_result_error_with_message(
+            try_read_crc_file(&engine, &crc_path, None),
+            "expected value",
+        );
 
         let events = reporter.events();
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, MetricEvent::CrcReadFailure)),
+                .any(|e| matches!(e, MetricEvent::CrcReadFailure { .. })),
             "expected CrcReadFailure when JSON parse fails"
         );
         assert!(

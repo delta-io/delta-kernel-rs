@@ -1591,6 +1591,7 @@ mod tests {
             MetricId::new(),
             false,
             None,
+            None,
             ScanType::Full,
             Duration::ZERO,
         );

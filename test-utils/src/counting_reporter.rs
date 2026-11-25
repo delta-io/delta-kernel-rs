@@ -426,7 +426,7 @@ impl MetricsReporter for CountingReporter {
             MetricEvent::ProtocolMetadataLoadSuccess(_)
             | MetricEvent::ProtocolMetadataLoadFailure(_)
             | MetricEvent::LogSegmentLoadFailure(_)
-            | MetricEvent::CrcReadFailure
+            | MetricEvent::CrcReadFailure { .. }
             | MetricEvent::CheckpointWriteSuccess(_)
             | MetricEvent::CheckpointWriteFailure(_)
             | MetricEvent::ChecksumWriteSuccess(_)
@@ -488,6 +488,7 @@ mod tests {
         let reporter = CountingReporter::new();
         reporter.report(MetricEvent::LastCheckpointReadCompleted(
             delta_kernel::metrics::LastCheckpointReadCompleted {
+                table_id: None,
                 operation_id: delta_kernel::metrics::MetricId::new(),
                 correlation_id: None,
                 log_path: "/_delta_log/".into(),
@@ -591,6 +592,7 @@ mod tests {
                 }
                 SnapshotCompletionStatus::Failure => {
                     reporter.report(MetricEvent::SnapshotBuildFailure(SnapshotBuildFailure {
+                        table_id: None,
                         operation_id: MetricId::new(),
                         table_type: TableType::PathBased,
                         correlation_id: None,
@@ -615,6 +617,7 @@ mod tests {
     fn report_log_segment_loaded_increments_log_replay_counters() {
         let reporter = CountingReporter::new();
         reporter.report(MetricEvent::LogSegmentLoadSuccess(LogSegmentLoadSuccess {
+            table_id: None,
             operation_id: MetricId::new(),
             table_type: TableType::PathBased,
             correlation_id: None,
@@ -636,6 +639,7 @@ mod tests {
     fn report_log_segment_loaded_without_crc_does_not_increment_crc_counter() {
         let reporter = CountingReporter::new();
         reporter.report(MetricEvent::LogSegmentLoadSuccess(LogSegmentLoadSuccess {
+            table_id: None,
             operation_id: MetricId::new(),
             table_type: TableType::PathBased,
             correlation_id: None,
@@ -811,6 +815,7 @@ mod tests {
             duration: dur(),
         }));
         reporter.report(MetricEvent::LogSegmentLoadSuccess(LogSegmentLoadSuccess {
+            table_id: None,
             operation_id: MetricId::new(),
             table_type: TableType::PathBased,
             correlation_id: None,
@@ -851,6 +856,7 @@ mod tests {
             duration: dur(),
         }));
         reporter.report(MetricEvent::SnapshotBuildFailure(SnapshotBuildFailure {
+            table_id: None,
             operation_id: MetricId::new(),
             table_type: TableType::PathBased,
             correlation_id: None,

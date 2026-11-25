@@ -245,6 +245,7 @@ impl From<kernel::SnapshotLoadType> for SnapshotLoadType {
 /// A log segment was loaded.
 #[repr(C)]
 pub struct LogSegmentLoadSuccess {
+    pub table_id: KernelStringSlice,
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
@@ -263,6 +264,7 @@ pub struct LogSegmentLoadSuccess {
 /// Listing the log segment failed.
 #[repr(C)]
 pub struct LogSegmentLoadFailure {
+    pub table_id: KernelStringSlice,
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
@@ -310,6 +312,7 @@ pub struct ProtocolMetadataLoadSuccess {
 /// Reading protocol and metadata from the log failed.
 #[repr(C)]
 pub struct ProtocolMetadataLoadFailure {
+    pub table_id: KernelStringSlice,
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
@@ -333,6 +336,7 @@ pub struct SnapshotBuildSuccess {
 /// Building a snapshot failed.
 #[repr(C)]
 pub struct SnapshotBuildFailure {
+    pub table_id: KernelStringSlice,
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
@@ -604,6 +608,7 @@ impl From<kernel::LastCheckpointReadOutcome> for LastCheckpointReadOutcome {
 /// A `_last_checkpoint` read attempt completed.
 #[repr(C)]
 pub struct LastCheckpointReadCompleted {
+    pub table_id: KernelStringSlice,
     /// Result of reading and validating the hint.
     pub outcome: LastCheckpointReadOutcome,
     /// Wall-clock time from entry through return, including parsing and validation, in
@@ -635,6 +640,7 @@ pub struct ParquetReadCompleted {
 /// field semantics.
 #[repr(C)]
 pub struct ScanMetadataCompleted {
+    pub table_id: KernelStringSlice,
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
@@ -693,7 +699,7 @@ pub enum MetricEvent {
     SetTransactionLoadSuccess(SetTransactionLoadSuccess),
     SetTransactionLoadFailure,
     CrcReadSuccess(CrcReadSuccess),
-    CrcReadFailure,
+    CrcReadFailure(KernelStringSlice),
     JsonReadCompleted(JsonReadCompleted),
     ParquetReadCompleted(ParquetReadCompleted),
     ScanMetadataCompleted(ScanMetadataCompleted),
@@ -730,6 +736,7 @@ impl MetricEvent {
         use kernel::MetricEvent as K;
         match event {
             K::LogSegmentLoadSuccess(kernel::LogSegmentLoadSuccess {
+                table_id,
                 operation_id,
                 correlation_id,
                 table_type,
@@ -740,6 +747,7 @@ impl MetricEvent {
                 crc_versions_behind,
                 duration,
             }) => Self::LogSegmentLoadSuccess(LogSegmentLoadSuccess {
+                table_id: optional_string_slice(table_id.as_deref()),
                 operation_id: (*operation_id).into(),
                 correlation_id: optional_string_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
@@ -753,12 +761,14 @@ impl MetricEvent {
                 crc_versions_behind: crc_versions_behind.unwrap_or(0),
             }),
             K::LogSegmentLoadFailure(kernel::LogSegmentLoadFailure {
+                table_id,
                 operation_id,
                 correlation_id,
                 table_type,
                 load_type,
                 duration,
             }) => Self::LogSegmentLoadFailure(LogSegmentLoadFailure {
+                table_id: optional_string_slice(table_id.as_deref()),
                 operation_id: (*operation_id).into(),
                 correlation_id: optional_string_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
@@ -783,12 +793,14 @@ impl MetricEvent {
                 duration_ns: duration_ns(*duration),
             }),
             K::ProtocolMetadataLoadFailure(kernel::ProtocolMetadataLoadFailure {
+                table_id,
                 operation_id,
                 correlation_id,
                 table_type,
                 load_type,
                 duration,
             }) => Self::ProtocolMetadataLoadFailure(ProtocolMetadataLoadFailure {
+                table_id: optional_string_slice(table_id.as_deref()),
                 operation_id: (*operation_id).into(),
                 correlation_id: optional_string_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
@@ -813,12 +825,14 @@ impl MetricEvent {
                 duration_ns: duration_ns(*duration),
             }),
             K::SnapshotBuildFailure(kernel::SnapshotBuildFailure {
+                table_id,
                 operation_id,
                 correlation_id,
                 table_type,
                 load_type,
                 duration,
             }) => Self::SnapshotBuildFailure(SnapshotBuildFailure {
+                table_id: optional_string_slice(table_id.as_deref()),
                 operation_id: (*operation_id).into(),
                 correlation_id: optional_string_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
@@ -908,14 +922,18 @@ impl MetricEvent {
                 bytes_read: *bytes_read,
                 duration_ns: duration_ns(*duration),
             }),
-            K::CrcReadFailure => Self::CrcReadFailure,
+            K::CrcReadFailure { table_id } => {
+                Self::CrcReadFailure(optional_string_slice(table_id.as_deref()))
+            }
             K::LastCheckpointReadCompleted(kernel::LastCheckpointReadCompleted {
+                table_id,
                 operation_id,
                 correlation_id,
                 log_path,
                 outcome,
                 duration,
             }) => Self::LastCheckpointReadCompleted(LastCheckpointReadCompleted {
+                table_id: optional_string_slice(table_id.as_deref()),
                 operation_id: (*operation_id).into(),
                 correlation_id: optional_string_slice(correlation_id.as_deref()),
                 log_path: optional_string_slice(Some(log_path)),
@@ -953,6 +971,7 @@ impl MetricEvent {
                 bytes_read: *bytes_read,
             }),
             K::ScanMetadataCompleted(kernel::ScanMetadataCompleted {
+                table_id,
                 operation_id,
                 correlation_id,
                 table_type,
@@ -970,6 +989,7 @@ impl MetricEvent {
                 action_transform_time,
                 predicate_eval_time,
             }) => Self::ScanMetadataCompleted(ScanMetadataCompleted {
+                table_id: optional_string_slice(table_id.as_deref()),
                 operation_id: (*operation_id).into(),
                 correlation_id: optional_string_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
@@ -1090,6 +1110,7 @@ mod tests {
         let operation_id = kernel::MetricId::new();
         let event =
             kernel::MetricEvent::LastCheckpointReadCompleted(kernel::LastCheckpointReadCompleted {
+                table_id: None,
                 operation_id,
                 correlation_id: Some("lookup".into()),
                 log_path: "/_delta_log/".into(),
@@ -1505,6 +1526,7 @@ mod tests {
     fn from_kernel_scan_metadata_completed_maps_all_fields() {
         let id = kernel::MetricId::new();
         let event = kernel::MetricEvent::ScanMetadataCompleted(kernel::ScanMetadataCompleted {
+            table_id: None,
             operation_id: id,
             correlation_id: Some("scan-req".into()),
             table_type: kernel::TableType::CatalogManaged,
@@ -1588,6 +1610,7 @@ mod tests {
     fn from_kernel_log_segment_load_success_carries_correlation_id_and_table_type() {
         let id = kernel::MetricId::new();
         let event = kernel::MetricEvent::LogSegmentLoadSuccess(kernel::LogSegmentLoadSuccess {
+            table_id: None,
             operation_id: id,
             correlation_id: Some("req-42".into()),
             table_type: kernel::TableType::CatalogManaged,
@@ -1644,6 +1667,7 @@ mod tests {
         let id = kernel::MetricId::new();
         let duration = Duration::from_nanos(duration_ns);
         let snapshot = kernel::MetricEvent::SnapshotBuildFailure(kernel::SnapshotBuildFailure {
+            table_id: None,
             operation_id: id,
             correlation_id: None,
             table_type: kernel::TableType::PathBased,
@@ -1660,6 +1684,7 @@ mod tests {
 
         let log_segment =
             kernel::MetricEvent::LogSegmentLoadFailure(kernel::LogSegmentLoadFailure {
+                table_id: None,
                 operation_id: id,
                 correlation_id: None,
                 table_type: kernel::TableType::PathBased,
@@ -1675,6 +1700,7 @@ mod tests {
 
         let protocol_metadata =
             kernel::MetricEvent::ProtocolMetadataLoadFailure(kernel::ProtocolMetadataLoadFailure {
+                table_id: None,
                 operation_id: id,
                 correlation_id: None,
                 table_type: kernel::TableType::PathBased,
@@ -1712,6 +1738,7 @@ mod tests {
     #[test]
     fn from_kernel_log_segment_load_success_unset_correlation_id_is_empty_slice() {
         let event = kernel::MetricEvent::LogSegmentLoadSuccess(kernel::LogSegmentLoadSuccess {
+            table_id: None,
             operation_id: kernel::MetricId::new(),
             correlation_id: None,
             table_type: kernel::TableType::PathBased,

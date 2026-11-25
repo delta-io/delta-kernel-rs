@@ -94,7 +94,7 @@ pub use snapshot::{
     get_snapshot_builder, get_snapshot_builder_from, snapshot_builder_build,
     snapshot_builder_with_correlation_id, snapshot_builder_with_incremental_crc_replay,
     snapshot_builder_with_log_tail, snapshot_builder_with_max_catalog_version,
-    snapshot_builder_with_version,
+    snapshot_builder_with_table_id, snapshot_builder_with_version, snapshot_with_table_id,
 };
 
 #[cfg(test)]

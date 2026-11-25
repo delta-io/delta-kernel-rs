@@ -133,6 +133,7 @@ impl ScanMetrics {
         operation_id: MetricId,
         is_catalog_managed: bool,
         correlation_id: Option<Arc<str>>,
+        table_id: Option<Arc<str>>,
         scan_type: ScanType,
         duration: Duration,
     ) -> ScanMetadataCompleted {
@@ -140,6 +141,7 @@ impl ScanMetrics {
             operation_id,
             table_type: TableType::from_catalog_managed(is_catalog_managed),
             correlation_id,
+            table_id,
             scan_type,
             duration,
             num_add_files_seen: self.num_add_files_seen.load(Ordering::Relaxed),
@@ -220,7 +222,14 @@ mod tests {
 
         metrics.reset_counters();
 
-        let event = metrics.to_event(MetricId::new(), false, None, ScanType::Full, Duration::ZERO);
+        let event = metrics.to_event(
+            MetricId::new(),
+            false,
+            None,
+            None,
+            ScanType::Full,
+            Duration::ZERO,
+        );
         assert_eq!(event.num_add_files_seen, 0);
         assert_eq!(event.num_add_files_seen_from_delta_files, 0);
         assert_eq!(event.num_selected_add_files, 0);

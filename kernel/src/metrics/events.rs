@@ -105,7 +105,7 @@ pub enum MetricEvent {
     SetTransactionLoadSuccess(SetTransactionLoadSuccess),
     SetTransactionLoadFailure,
     CrcReadSuccess(CrcReadSuccess),
-    CrcReadFailure,
+    CrcReadFailure { table_id: Option<Arc<str>> },
     LastCheckpointReadCompleted(LastCheckpointReadCompleted),
     CheckpointWriteSuccess(CheckpointWriteSuccess),
     CheckpointWriteFailure(CheckpointWriteFailure),
@@ -120,9 +120,7 @@ pub enum MetricEvent {
 }
 
 impl MetricEvent {
-    /// Opaque identifier for grouping events by table. A caller's correlation id groups events
-    /// by action, which may span several tables. Kernel reads use the id from the table's
-    /// metadata when available.
+    /// The opaque table identifier supplied by the caller for this operation.
     pub fn table_id(&self) -> Option<&str> {
         match self {
             Self::SnapshotBuildSuccess(e) => e.table_id.as_deref(),
@@ -130,6 +128,13 @@ impl MetricEvent {
             Self::DomainMetadataLoadSuccess(e) => e.table_id.as_deref(),
             Self::DomainMetadataLoadFailure { table_id } => table_id.as_deref(),
             Self::CrcReadSuccess(e) => e.table_id.as_deref(),
+            Self::CrcReadFailure { table_id } => table_id.as_deref(),
+            Self::LogSegmentLoadSuccess(e) => e.table_id.as_deref(),
+            Self::LogSegmentLoadFailure(e) => e.table_id.as_deref(),
+            Self::ProtocolMetadataLoadFailure(e) => e.table_id.as_deref(),
+            Self::SnapshotBuildFailure(e) => e.table_id.as_deref(),
+            Self::LastCheckpointReadCompleted(e) => e.table_id.as_deref(),
+            Self::ScanMetadataCompleted(e) => e.table_id.as_deref(),
             _ => None,
         }
     }
@@ -165,7 +170,7 @@ impl MetricEvent {
             Self::TransactionCommitFailure(_)
             | Self::DomainMetadataLoadFailure { .. }
             | Self::SetTransactionLoadFailure
-            | Self::CrcReadFailure => {}
+            | Self::CrcReadFailure { .. } => {}
 
             // Read events have no duration field.
             Self::JsonReadCompleted(_) | Self::ParquetReadCompleted(_) => {}
@@ -200,7 +205,7 @@ impl MetricEvent {
             Self::TransactionCommitFailure(_) => Err(TransactionCommitSuccess::SPAN_NAME),
             Self::DomainMetadataLoadFailure { .. } => Err(DomainMetadataLoadSuccess::SPAN_NAME),
             Self::SetTransactionLoadFailure => Err(SetTransactionLoadSuccess::SPAN_NAME),
-            Self::CrcReadFailure => Err(CrcReadSuccess::SPAN_NAME),
+            Self::CrcReadFailure { .. } => Err(CrcReadSuccess::SPAN_NAME),
             Self::CheckpointWriteFailure(_) => Err(CheckpointWriteSuccess::SPAN_NAME),
             Self::ChecksumWriteFailure(_) => Err(ChecksumWriteSuccess::SPAN_NAME),
         }
@@ -235,23 +240,13 @@ impl MetricEvent {
             Self::TransactionCommitFailure(_) => Err(TransactionCommitSuccess::SPAN_NAME),
             Self::DomainMetadataLoadFailure { .. } => Err(DomainMetadataLoadSuccess::SPAN_NAME),
             Self::SetTransactionLoadFailure => Err(SetTransactionLoadSuccess::SPAN_NAME),
-            Self::CrcReadFailure => Err(CrcReadSuccess::SPAN_NAME),
+            Self::CrcReadFailure { .. } => Err(CrcReadSuccess::SPAN_NAME),
             Self::CheckpointWriteFailure(_) => Err(CheckpointWriteSuccess::SPAN_NAME),
             Self::ChecksumWriteFailure(_) => Err(ChecksumWriteSuccess::SPAN_NAME),
         }
     }
 
     pub(crate) fn record_str(&mut self, name: &str, value: &str) -> Result<(), &'static str> {
-        if name == "table_id" {
-            match self {
-                Self::SnapshotBuildSuccess(e) => &mut e.table_id,
-                Self::DomainMetadataLoadSuccess(e) => &mut e.table_id,
-                Self::CrcReadSuccess(e) => &mut e.table_id,
-                _ => return Ok(()),
-            }
-            .replace(value.into());
-            return Ok(());
-        }
         if let Self::LastCheckpointReadCompleted(e) = self {
             return e.record_str(name, value);
         }
@@ -286,6 +281,7 @@ impl MetricEvent {
             Self::LogSegmentLoadSuccess(e) => Self::LogSegmentLoadFailure(LogSegmentLoadFailure {
                 operation_id: e.operation_id,
                 table_type: e.table_type,
+                table_id: e.table_id,
                 correlation_id: e.correlation_id,
                 load_type: e.load_type,
                 duration: e.duration,
@@ -294,6 +290,7 @@ impl MetricEvent {
                 Self::ProtocolMetadataLoadFailure(ProtocolMetadataLoadFailure {
                     operation_id: e.operation_id,
                     table_type: e.table_type,
+                    table_id: e.table_id,
                     correlation_id: e.correlation_id,
                     load_type: e.load_type,
                     duration: e.duration,
@@ -302,6 +299,7 @@ impl MetricEvent {
             Self::SnapshotBuildSuccess(e) => Self::SnapshotBuildFailure(SnapshotBuildFailure {
                 operation_id: e.operation_id,
                 table_type: e.table_type,
+                table_id: e.table_id,
                 correlation_id: e.correlation_id,
                 load_type: e.load_type,
                 duration: e.duration,
@@ -318,7 +316,9 @@ impl MetricEvent {
                 table_id: e.table_id,
             },
             Self::SetTransactionLoadSuccess(_) => Self::SetTransactionLoadFailure,
-            Self::CrcReadSuccess(_) => Self::CrcReadFailure,
+            Self::CrcReadSuccess(e) => Self::CrcReadFailure {
+                table_id: e.table_id,
+            },
             Self::LastCheckpointReadCompleted(mut e) => {
                 if e.outcome == LastCheckpointReadOutcome::Unknown {
                     e.outcome = LastCheckpointReadOutcome::Error;
@@ -348,7 +348,7 @@ impl MetricEvent {
             | Self::TransactionCommitFailure(_)
             | Self::DomainMetadataLoadFailure { .. }
             | Self::SetTransactionLoadFailure
-            | Self::CrcReadFailure
+            | Self::CrcReadFailure { .. }
             | Self::CheckpointWriteFailure(_)
             | Self::ChecksumWriteFailure(_)
             | Self::JsonReadCompleted(_)
@@ -377,7 +377,7 @@ impl fmt::Display for MetricEvent {
             Self::SetTransactionLoadSuccess(e) => e.fmt(f),
             Self::SetTransactionLoadFailure => f.write_str("SetTransactionLoadFailure"),
             Self::CrcReadSuccess(e) => e.fmt(f),
-            Self::CrcReadFailure => f.write_str("CrcReadFailure"),
+            Self::CrcReadFailure { .. } => f.write_str("CrcReadFailure"),
             Self::LastCheckpointReadCompleted(e) => e.fmt(f),
             Self::CheckpointWriteSuccess(e) => e.fmt(f),
             Self::CheckpointWriteFailure(e) => e.fmt(f),
@@ -778,6 +778,7 @@ where
 /// All fields are set at emit time (creation attrs).
 #[derive(Debug, Clone)]
 pub struct LogSegmentLoadSuccess {
+    pub table_id: Option<Arc<str>>,
     pub operation_id: MetricId,
     /// Opaque, caller-supplied id for joining this operation's metric events to the caller's
     /// own request or operation id.
@@ -810,6 +811,7 @@ impl LogSegmentLoadSuccess {
     /// The default seed [`Self::from_attrs`] populates from span fields.
     fn empty() -> Self {
         Self {
+            table_id: None,
             operation_id: MetricId::nil(),
             correlation_id: None,
             table_type: TableType::from_catalog_managed(false),
@@ -838,6 +840,7 @@ impl Visit for LogSegmentLoadSuccess {
 
     fn record_str(&mut self, field: &Field, value: &str) {
         match field.name() {
+            "table_id" if !value.is_empty() => self.table_id = Some(value.into()),
             CORRELATION_ID_FIELD if !value.is_empty() => self.correlation_id = Some(value.into()),
             "load_type" => self.load_type = LogSegmentLoadType::parse_or_unknown(value),
             _ => {}
@@ -879,6 +882,7 @@ impl fmt::Display for LogSegmentLoadSuccess {
             num_checkpoint_files,
             num_compaction_files,
             crc_versions_behind,
+            ..
         } = self;
         write!(
             f,
@@ -894,6 +898,7 @@ impl fmt::Display for LogSegmentLoadSuccess {
 /// Listing the log segment for a snapshot failed.
 #[derive(Debug, Clone)]
 pub struct LogSegmentLoadFailure {
+    pub table_id: Option<Arc<str>>,
     pub operation_id: MetricId,
     /// Opaque, caller-supplied id for joining this operation's metric events to the caller's
     /// own request or operation id.
@@ -1003,7 +1008,7 @@ impl Visit for ProtocolMetadataLoadSuccess {
 
     fn record_str(&mut self, field: &Field, value: &str) {
         match field.name() {
-            "table_id" => self.table_id = Some(value.into()),
+            "table_id" if !value.is_empty() => self.table_id = Some(value.into()),
             CORRELATION_ID_FIELD if !value.is_empty() => self.correlation_id = Some(value.into()),
             "load_type" => self.load_type = LogSegmentLoadType::parse_or_unknown(value),
             "pm_source" => self.source = ProtocolMetadataSource::parse_or_unknown(value),
@@ -1047,6 +1052,7 @@ impl fmt::Display for ProtocolMetadataLoadSuccess {
 /// Reading protocol and metadata from the log failed.
 #[derive(Debug, Clone)]
 pub struct ProtocolMetadataLoadFailure {
+    pub table_id: Option<Arc<str>>,
     pub operation_id: MetricId,
     /// Opaque, caller-supplied id for joining this operation's metric events to the caller's
     /// own request or operation id.
@@ -1099,7 +1105,7 @@ impl SnapshotBuildSuccess {
 
     pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
         Self {
-            table_id: None,
+            table_id: table_id_from_attrs(attrs),
             operation_id: MetricId::from_attrs(attrs),
             table_type: TableType::from_catalog_managed(read_is_catalog_managed(attrs)),
             correlation_id: correlation_id_from_attrs(attrs),
@@ -1149,6 +1155,7 @@ impl fmt::Display for SnapshotBuildSuccess {
 /// Building a snapshot failed.
 #[derive(Debug, Clone)]
 pub struct SnapshotBuildFailure {
+    pub table_id: Option<Arc<str>>,
     pub operation_id: MetricId,
     /// Opaque, caller-supplied id for joining this operation's metric events to the caller's
     /// own request or operation id.
@@ -1379,9 +1386,9 @@ pub struct DomainMetadataLoadSuccess {
 impl DomainMetadataLoadSuccess {
     pub(crate) const SPAN_NAME: &'static str = DOMAIN_METADATA_LOADED_SPAN;
 
-    pub(crate) fn from_attrs(_attrs: &Attributes<'_>) -> Self {
+    pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
         Self {
-            table_id: None,
+            table_id: table_id_from_attrs(attrs),
             from_cache: false,
             num_domains_returned: 0,
             duration: Duration::default(),
@@ -1504,9 +1511,9 @@ pub struct CrcReadSuccess {
 impl CrcReadSuccess {
     pub(crate) const SPAN_NAME: &'static str = CRC_READ_COMPLETED_SPAN;
 
-    pub(crate) fn from_attrs(_attrs: &Attributes<'_>) -> Self {
+    pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
         Self {
-            table_id: None,
+            table_id: table_id_from_attrs(attrs),
             bytes_read: 0,
             duration: Duration::default(),
         }
@@ -1574,6 +1581,7 @@ pub enum LastCheckpointReadOutcome {
 /// and invalid hints normally allow the caller to fall back to listing the log.
 #[derive(Debug, Clone)]
 pub struct LastCheckpointReadCompleted {
+    pub table_id: Option<Arc<str>>,
     /// Snapshot build that requested this hint.
     pub operation_id: MetricId,
     /// Opaque id supplied by the caller of the enclosing snapshot build.
@@ -1592,6 +1600,7 @@ impl LastCheckpointReadCompleted {
 
     pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
         Self {
+            table_id: table_id_from_attrs(attrs),
             operation_id: MetricId::from_attrs(attrs),
             correlation_id: correlation_id_from_attrs(attrs),
             log_path: Arc::from(""),
@@ -1937,6 +1946,7 @@ impl fmt::Display for TableType {
 pub struct SnapshotLoadMetricContext {
     pub(crate) operation_id: MetricId,
     pub(crate) correlation_id: Option<Arc<str>>,
+    pub(crate) table_id: Option<Arc<str>>,
     pub(crate) is_catalog_managed: bool,
     pub(crate) load_type: SnapshotLoadType,
 }
@@ -1947,6 +1957,7 @@ impl SnapshotLoadMetricContext {
     /// asserting on the id.
     pub(crate) fn for_test() -> Self {
         Self {
+            table_id: None,
             operation_id: MetricId::nil(),
             correlation_id: None,
             is_catalog_managed: false,
@@ -1995,19 +2006,29 @@ pub(crate) const CORRELATION_ID_FIELD: &str = "correlation_id";
 /// Extract the optional caller-supplied correlation id from span attributes; empty or absent
 /// yields `None`.
 pub(crate) fn correlation_id_from_attrs(attrs: &Attributes<'_>) -> Option<Arc<str>> {
-    #[derive(Default)]
-    struct CorrelationIdVisitor(Option<Arc<str>>);
-    impl Visit for CorrelationIdVisitor {
+    optional_id_from_attrs(attrs, CORRELATION_ID_FIELD)
+}
+
+fn table_id_from_attrs(attrs: &Attributes<'_>) -> Option<Arc<str>> {
+    optional_id_from_attrs(attrs, "table_id")
+}
+
+fn optional_id_from_attrs(attrs: &Attributes<'_>, name: &'static str) -> Option<Arc<str>> {
+    struct IdVisitor {
+        name: &'static str,
+        value: Option<Arc<str>>,
+    }
+    impl Visit for IdVisitor {
         fn record_str(&mut self, field: &Field, value: &str) {
-            if field.name() == CORRELATION_ID_FIELD && !value.is_empty() {
-                self.0 = Some(value.into());
+            if field.name() == self.name && !value.is_empty() {
+                self.value = Some(value.into());
             }
         }
         fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
     }
-    let mut v = CorrelationIdVisitor::default();
-    attrs.record(&mut v);
-    v.0
+    let mut visitor = IdVisitor { name, value: None };
+    attrs.record(&mut visitor);
+    visitor.value
 }
 
 pub(crate) fn load_type_from_attrs(attrs: &Attributes<'_>) -> SnapshotLoadType {
@@ -2035,6 +2056,7 @@ pub(crate) fn load_type_from_attrs(attrs: &Attributes<'_>) -> SnapshotLoadType {
 /// phase-local, while `peak_hash_set_size` is the whole-scan high-water mark.
 #[derive(Debug, Clone)]
 pub struct ScanMetadataCompleted {
+    pub table_id: Option<Arc<str>>,
     // === Set on span creation ===
     /// Unique ID to correlate this scan with other events.
     pub operation_id: MetricId,
@@ -2083,6 +2105,7 @@ impl ScanMetadataCompleted {
         let mut v = ScanMetadataCompletedAttrs::default();
         attrs.record(&mut v);
         Self {
+            table_id: table_id_from_attrs(attrs),
             operation_id: MetricId(v.operation_id),
             table_type: TableType::from_catalog_managed(v.is_catalog_managed),
             correlation_id: v.correlation_id,
@@ -2122,6 +2145,7 @@ impl fmt::Display for ScanMetadataCompleted {
             dedup_visitor_time,
             action_transform_time,
             predicate_eval_time,
+            ..
         } = self;
         write!(
             f,
@@ -2410,6 +2434,7 @@ pub(crate) fn emit_scan_metadata_completed(e: &ScanMetadataCompleted) {
         operation_id = %e.operation_id,
         is_catalog_managed = e.table_type.is_catalog_managed(),
         correlation_id = e.correlation_id.as_deref().unwrap_or(""),
+        table_id = e.table_id.as_deref().unwrap_or(""),
         scan_type = %e.scan_type,
         duration_ns = e.duration.as_nanos() as u64,
         num_add_files_seen = e.num_add_files_seen,
@@ -2441,6 +2466,7 @@ pub(crate) fn emit_log_segment_load(
         operation_id = %ctx.operation_id,
         is_catalog_managed = ctx.is_catalog_managed,
         correlation_id = ctx.correlation_id.as_deref().unwrap_or(""),
+        table_id = ctx.table_id.as_deref().unwrap_or(""),
         load_type = ctx.load_type.as_ref(),
         num_commit_files = segment.listed.ascending_commit_files.len() as u64,
         num_checkpoint_files = segment.listed.checkpoint_parts.len() as u64,
@@ -2462,6 +2488,7 @@ pub(crate) fn emit_log_segment_load_failure(ctx: &SnapshotLoadMetricContext, dur
         operation_id = %ctx.operation_id,
         is_catalog_managed = ctx.is_catalog_managed,
         correlation_id = ctx.correlation_id.as_deref().unwrap_or(""),
+        table_id = ctx.table_id.as_deref().unwrap_or(""),
         load_type = ctx.load_type.as_ref(),
         duration_ns = duration.as_nanos() as u64,
     );
@@ -2474,7 +2501,6 @@ pub(crate) fn emit_log_segment_load_failure(ctx: &SnapshotLoadMetricContext, dur
 pub(crate) fn emit_protocol_metadata_load(
     ctx: &SnapshotLoadMetricContext,
     source: ProtocolMetadataSource,
-    table_id: &str,
     duration: Duration,
 ) {
     let _span = tracing::span!(
@@ -2484,9 +2510,9 @@ pub(crate) fn emit_protocol_metadata_load(
         operation_id = %ctx.operation_id,
         is_catalog_managed = ctx.is_catalog_managed,
         correlation_id = ctx.correlation_id.as_deref().unwrap_or(""),
+        table_id = ctx.table_id.as_deref().unwrap_or(""),
         load_type = ctx.load_type.as_ref(),
         pm_source = source.as_ref(),
-        table_id,
         duration_ns = duration.as_nanos() as u64,
     );
 }
@@ -2506,6 +2532,7 @@ pub(crate) fn emit_protocol_metadata_load_failure(
         operation_id = %ctx.operation_id,
         is_catalog_managed = ctx.is_catalog_managed,
         correlation_id = ctx.correlation_id.as_deref().unwrap_or(""),
+        table_id = ctx.table_id.as_deref().unwrap_or(""),
         load_type = ctx.load_type.as_ref(),
         duration_ns = duration.as_nanos() as u64,
     );
@@ -2572,6 +2599,7 @@ mod tests {
         assert_eq!(static_label, label);
         assert_eq!(label.parse::<LastCheckpointReadOutcome>().unwrap(), outcome);
         let mut event = MetricEvent::LastCheckpointReadCompleted(LastCheckpointReadCompleted {
+            table_id: None,
             operation_id: MetricId::new(),
             correlation_id: None,
             log_path: "/_delta_log/".into(),
@@ -2799,6 +2827,7 @@ mod tests {
             (
                 "LogSegmentLoadFailure",
                 MetricEvent::LogSegmentLoadFailure(LogSegmentLoadFailure {
+                    table_id: None,
                     operation_id,
                     correlation_id: correlation_id.clone(),
                     table_type,
@@ -2809,6 +2838,7 @@ mod tests {
             (
                 "ProtocolMetadataLoadFailure",
                 MetricEvent::ProtocolMetadataLoadFailure(ProtocolMetadataLoadFailure {
+                    table_id: None,
                     operation_id,
                     correlation_id: correlation_id.clone(),
                     table_type,
@@ -2819,6 +2849,7 @@ mod tests {
             (
                 "SnapshotBuildFailure",
                 MetricEvent::SnapshotBuildFailure(SnapshotBuildFailure {
+                    table_id: None,
                     operation_id,
                     correlation_id: correlation_id.clone(),
                     table_type,

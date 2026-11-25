@@ -446,7 +446,7 @@ impl LastCheckpointHint {
     #[instrument(
         name = LAST_CHECKPOINT_READ_SPAN,
         skip_all,
-        fields(report, outcome, enable_call_frame, operation_id = %context.operation_id, correlation_id = context.correlation_id.as_deref().unwrap_or(""), log_path),
+        fields(report, outcome, enable_call_frame, operation_id = %context.operation_id, table_id = context.table_id.as_deref().unwrap_or(""), correlation_id = context.correlation_id.as_deref().unwrap_or(""), log_path),
         err
     )]
     pub(crate) fn try_read(
