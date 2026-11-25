@@ -275,7 +275,7 @@ impl StatsRead {
             Some(skipping.predicate.clone()),
             Some(&self.schema),
             self.expression.clone(),
-            // The content tree carries no partition values yet (see #3320).
+            // TODO(#3320): pass partition values once the content tree carries them.
             None,
             Arc::new(null_lit(DataType::BOOLEAN)),
             // No root entry is a Remove whose partition predicate needs guarding.
@@ -3310,22 +3310,30 @@ mod tests {
         Scalar::Struct(StructData::try_new(schema, vec![Scalar::Struct(leaf)]).unwrap())
     }
 
+    /// The only column of the table whose leaves [`filter_leaf`] filters.
+    const TABLE_COLUMN: &str = "c";
+
     /// Whether the leaf filter reads or skips a leaf.
     #[derive(Debug, PartialEq)]
-    enum Leaf {
+    enum LeafReadState {
         Read,
         Skipped,
     }
 
     /// Whether the leaf filter for `predicate` reads or skips the leaf of a root `DataManifest`
     /// entry referencing 3 leaf entries, with as many rows as its stats' `value_count`, whose
-    /// stats for its table's only column `c` (of type `data_type`) are `stats`. `None` stands for
-    /// an entry without stats.
-    fn filter_leaf(data_type: DataType, stats: Option<ColumnStats>, predicate: Pred) -> Leaf {
+    /// stats for [`TABLE_COLUMN`] (of type `data_type`) are `stats`. `None` stands for an entry
+    /// without stats.
+    fn filter_leaf(
+        data_type: DataType,
+        stats: Option<ColumnStats>,
+        predicate: Pred,
+    ) -> LeafReadState {
         let engine = SyncEngine::new();
-        let table = StructType::new_unchecked([field_with_id("c", data_type.clone(), true, 1)]);
-        let schema = delta_stats_schema("c", data_type);
-        let request = skipping_request(&schema, predicate, "c");
+        let table =
+            StructType::new_unchecked([field_with_id(TABLE_COLUMN, data_type.clone(), true, 1)]);
+        let schema = delta_stats_schema(TABLE_COLUMN, data_type);
+        let request = skipping_request(&schema, predicate, TABLE_COLUMN);
         let stats_read = StatsRead::from_physical_schema(&table, &request).unwrap();
         let content_stats = stats_read.content_stats.clone().unwrap();
         let mut entry = data_manifest_entry("leaf.parquet", 1, TrackingStatus::Added);
@@ -3343,8 +3351,8 @@ mod tests {
         let filter = stats_read.leaf_filter(&engine, root_schema).unwrap();
         let keep = filter.apply(batch.as_ref()).unwrap();
         match keep.as_slice() {
-            [true] => Leaf::Read,
-            [false] => Leaf::Skipped,
+            [true] => LeafReadState::Read,
+            [false] => LeafReadState::Skipped,
             keep => panic!("expected one row, got {keep:?}"),
         }
     }
@@ -3362,57 +3370,57 @@ mod tests {
     #[case::gt_above_max(
         DataType::LONG,
         Some(LONG_STATS),
-        Pred::gt(col!("c"), lit(100i64)),
-        Leaf::Skipped
+        Pred::gt(col!(TABLE_COLUMN), lit(100i64)),
+        LeafReadState::Skipped
     )]
     #[case::lt_above_min(
         DataType::LONG,
         Some(LONG_STATS),
-        Pred::lt(col!("c"), lit(5i64)),
-        Leaf::Read
+        Pred::lt(col!(TABLE_COLUMN), lit(5i64)),
+        LeafReadState::Read
     )]
     #[case::eq_outside_bounds(
         DataType::LONG,
         Some(LONG_STATS),
-        Pred::eq(col!("c"), lit(10i64)),
-        Leaf::Skipped
+        Pred::eq(col!(TABLE_COLUMN), lit(10i64)),
+        LeafReadState::Skipped
     )]
     #[case::eq_inside_bounds(
         DataType::LONG,
         Some(LONG_STATS),
-        Pred::eq(col!("c"), lit(5i64)),
-        Leaf::Read
+        Pred::eq(col!(TABLE_COLUMN), lit(5i64)),
+        LeafReadState::Read
     )]
     #[case::not_gt_below_min(
         DataType::LONG,
         Some(LONG_STATS),
-        Pred::not(Pred::gt(col!("c"), lit(0i64))),
-        Leaf::Skipped
+        Pred::not(Pred::gt(col!(TABLE_COLUMN), lit(0i64))),
+        LeafReadState::Skipped
     )]
     #[case::and_one_arm_rules_out(
         DataType::LONG,
         Some(LONG_STATS),
-        Pred::and(Pred::gt(col!("c"), lit(0i64)), Pred::gt(col!("c"), lit(100i64))),
-        Leaf::Skipped
+        Pred::and(Pred::gt(col!(TABLE_COLUMN), lit(0i64)), Pred::gt(col!(TABLE_COLUMN), lit(100i64))),
+        LeafReadState::Skipped
     )]
     #[case::or_one_arm_matches(
         DataType::LONG,
         Some(LONG_STATS),
-        Pred::or(Pred::lt(col!("c"), lit(0i64)), Pred::lt(col!("c"), lit(5i64))),
-        Leaf::Read
+        Pred::or(Pred::lt(col!(TABLE_COLUMN), lit(0i64)), Pred::lt(col!(TABLE_COLUMN), lit(5i64))),
+        LeafReadState::Read
     )]
-    #[case::no_stats(DataType::LONG, None, Pred::gt(col!("c"), lit(100i64)), Leaf::Read)]
+    #[case::no_stats(DataType::LONG, None, Pred::gt(col!(TABLE_COLUMN), lit(100i64)), LeafReadState::Read)]
     #[case::unreferenced_column(
         DataType::LONG,
         Some(LONG_STATS),
         Pred::gt(col!("other"), lit(100i64)),
-        Leaf::Read
+        LeafReadState::Read
     )]
     #[case::is_null_without_nulls(
         DataType::LONG,
         Some(LONG_STATS),
-        Pred::is_null(col!("c")),
-        Leaf::Skipped
+        Pred::is_null(col!(TABLE_COLUMN)),
+        LeafReadState::Skipped
     )]
     #[case::is_null_with_nulls(
         DataType::LONG,
@@ -3420,8 +3428,8 @@ mod tests {
             null_value_count: 4,
             ..LONG_STATS
         }),
-        Pred::is_null(col!("c")),
-        Leaf::Read
+        Pred::is_null(col!(TABLE_COLUMN)),
+        LeafReadState::Read
     )]
     #[case::is_not_null_all_null(
         DataType::LONG,
@@ -3431,8 +3439,8 @@ mod tests {
             null_value_count: 10,
             ..LONG_STATS
         }),
-        Pred::is_not_null(col!("c")),
-        Leaf::Skipped
+        Pred::is_not_null(col!(TABLE_COLUMN)),
+        LeafReadState::Skipped
     )]
     #[case::is_not_null_null_count_equals_entry_count(
         DataType::LONG,
@@ -3441,8 +3449,8 @@ mod tests {
             null_value_count: 3,
             ..LONG_STATS
         }),
-        Pred::is_not_null(col!("c")),
-        Leaf::Read
+        Pred::is_not_null(col!(TABLE_COLUMN)),
+        LeafReadState::Read
     )]
     #[case::string_above_max(
         DataType::STRING,
@@ -3451,14 +3459,14 @@ mod tests {
             upper_bound: "banana".into(),
             ..LONG_STATS
         }),
-        Pred::eq(col!("c"), lit("cherry")),
-        Leaf::Skipped
+        Pred::eq(col!(TABLE_COLUMN), lit("cherry")),
+        LeafReadState::Skipped
     )]
     #[case::double_without_nan(
         DataType::DOUBLE,
         Some(DOUBLE_STATS),
-        Pred::gt(col!("c"), lit(10.0f64)),
-        Leaf::Skipped
+        Pred::gt(col!(TABLE_COLUMN), lit(10.0f64)),
+        LeafReadState::Skipped
     )]
     #[case::double_with_nan(
         DataType::DOUBLE,
@@ -3466,8 +3474,8 @@ mod tests {
             nan_value_count: Some(2),
             ..DOUBLE_STATS
         }),
-        Pred::gt(col!("c"), lit(10.0f64)),
-        Leaf::Read
+        Pred::gt(col!(TABLE_COLUMN), lit(10.0f64)),
+        LeafReadState::Read
     )]
     #[case::double_unknown_nan_count(
         DataType::DOUBLE,
@@ -3475,8 +3483,8 @@ mod tests {
             nan_value_count: None,
             ..DOUBLE_STATS
         }),
-        Pred::gt(col!("c"), lit(10.0f64)),
-        Leaf::Read
+        Pred::gt(col!(TABLE_COLUMN), lit(10.0f64)),
+        LeafReadState::Read
     )]
     #[case::double_below_min_with_nan(
         DataType::DOUBLE,
@@ -3484,14 +3492,14 @@ mod tests {
             nan_value_count: Some(2),
             ..DOUBLE_STATS
         }),
-        Pred::lt(col!("c"), lit(0.5f64)),
-        Leaf::Read
+        Pred::lt(col!(TABLE_COLUMN), lit(0.5f64)),
+        LeafReadState::Read
     )]
     #[case::double_below_min_without_nan(
         DataType::DOUBLE,
         Some(DOUBLE_STATS),
-        Pred::lt(col!("c"), lit(0.5f64)),
-        Leaf::Skipped
+        Pred::lt(col!(TABLE_COLUMN), lit(0.5f64)),
+        LeafReadState::Skipped
     )]
     #[case::double_negative_zero_against_positive_zero(
         DataType::DOUBLE,
@@ -3500,8 +3508,8 @@ mod tests {
             upper_bound: Scalar::Double(-0.0),
             ..DOUBLE_STATS
         }),
-        Pred::ge(col!("c"), lit(0.0f64)),
-        Leaf::Skipped
+        Pred::ge(col!(TABLE_COLUMN), lit(0.0f64)),
+        LeafReadState::Skipped
     )]
     #[case::timestamp_above_max_by_more_than_a_millisecond(
         DataType::TIMESTAMP,
@@ -3510,8 +3518,8 @@ mod tests {
             upper_bound: Scalar::Timestamp(TS_MAX),
             ..LONG_STATS
         }),
-        Pred::gt(col!("c"), Scalar::Timestamp(TS_MAX + 1_000)),
-        Leaf::Skipped
+        Pred::gt(col!(TABLE_COLUMN), Scalar::Timestamp(TS_MAX + 1_000)),
+        LeafReadState::Skipped
     )]
     #[case::timestamp_above_max_by_less_than_a_millisecond(
         DataType::TIMESTAMP,
@@ -3520,14 +3528,14 @@ mod tests {
             upper_bound: Scalar::Timestamp(TS_MAX),
             ..LONG_STATS
         }),
-        Pred::gt(col!("c"), Scalar::Timestamp(TS_MAX + 100)),
-        Leaf::Read
+        Pred::gt(col!(TABLE_COLUMN), Scalar::Timestamp(TS_MAX + 100)),
+        LeafReadState::Read
     )]
     fn leaf_filter_reads_only_leaves_the_stats_cannot_rule_out(
         #[case] data_type: DataType,
         #[case] stats: Option<ColumnStats>,
         #[case] predicate: Pred,
-        #[case] expected: Leaf,
+        #[case] expected: LeafReadState,
     ) {
         assert_eq!(filter_leaf(data_type, stats, predicate), expected);
     }

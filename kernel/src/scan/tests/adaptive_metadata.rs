@@ -21,16 +21,17 @@ use crate::engine::arrow_data::EngineDataArrowExt as _;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{Predicate as Pred, Scalar, col, lit};
 use crate::scan::{Scan, ScanMetadata};
-use crate::schema::{SchemaRef, schema_ref};
+use crate::schema::{SchemaRef, StructType, schema_ref};
 use crate::table_features::ColumnMappingMode;
 use crate::transaction::BASE_ADD_FILES_SCHEMA;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
     checkpoint_action_with_root, commit_file_changes, commit_files, commit_root_manifest,
-    commit_root_manifest_file, create_adaptive_metadata_table, setup_adaptive_metadata_table,
+    commit_root_manifest_file, create_adaptive_metadata_table, protocol_and_metadata_lines,
+    setup_adaptive_metadata_table, write_commit_after_manifest_commit,
     write_manifest_commit_keeping_pm,
 };
 use crate::unit_test_utils::{
-    assert_result_error_with_message, string_array_to_engine_data,
+    assert_result_error_with_message, parse_json_batch, string_array_to_engine_data,
     test_schema_flat_with_column_mapping,
 };
 use crate::{Engine, EngineData, FileMeta, KernelResult, Snapshot, Version};
@@ -319,8 +320,12 @@ fn data_skipping_prunes_commit_files_but_keeps_tree_files_without_stats() {
     assert_eq!(paths, strings(&["high.parquet", "tree.parquet"]));
 }
 
-#[test]
-fn data_skipping_prunes_tree_files_by_content_stats() {
+/// Tree files are pruned by their `content_stats`, which are matched to the table's columns by
+/// field ID, so a schema change after the checkpoint action still prunes them.
+#[rstest]
+#[case::checkpoint_schema(false)]
+#[case::schema_changed_after_checkpoint(true)]
+fn data_skipping_prunes_tree_files_by_content_stats(#[case] change_schema: bool) {
     let (engine, _) = setup_adaptive_metadata_table();
     let entries = [
         added_data_entry("low.parquet", 1, 1, 0, 0),
@@ -333,7 +338,19 @@ fn data_skipping_prunes_tree_files_by_content_stats() {
     ];
     let location = table_root().join("metadata/root.parquet").unwrap();
     let root = write_manifest_with_stats(&engine, location, &entries, &x_full_stats(), stats);
-    let version = commit_root_manifest_file(&engine, &table_root(), root);
+    let mut version = commit_root_manifest_file(&engine, &table_root(), root);
+    if change_schema {
+        // Drops `name`, keeping `id` and its field ID.
+        let id = test_schema_flat_with_column_mapping()
+            .field("id")
+            .unwrap()
+            .clone();
+        let lines = protocol_and_metadata_lines(Arc::new(StructType::new_unchecked([id])), &[]);
+        let data = parse_json_batch(lines.lines().collect::<Vec<_>>().into());
+        write_commit_after_manifest_commit(&engine, &table_root(), version + 1, version, data)
+            .unwrap();
+        version += 1;
+    }
 
     let predicate = Arc::new(Pred::gt(col!("id"), lit(100i64)));
     let scan = snapshot_at(&engine, version)
@@ -349,14 +366,26 @@ fn data_skipping_prunes_tree_files_by_content_stats() {
     assert_eq!(paths, strings(&["high.parquet"]));
 }
 
+/// What scanning the table of `data_skipping_skips_leaf_manifests_by_root_content_stats` yields.
+#[derive(Debug)]
+enum LeafScan {
+    /// The missing leaf is skipped, and the scan returns these paths.
+    Paths(&'static [&'static str]),
+    /// The missing leaf is read, which fails the scan.
+    ReadsMissingLeaf,
+}
+
 /// Leaf manifests are skipped by their root entries' `content_stats`. The leaf ruled out by the
 /// predicate does not exist, so reading it fails the scan: without a predicate, no leaf is skipped.
 #[rstest]
-#[case::predicate(Some(Pred::gt(col!("id"), lit(100i64))), Some(&["high.parquet"][..]))]
-#[case::no_predicate(None, None)]
+#[case::predicate(
+    Some(Pred::gt(col!("id"), lit(100i64))),
+    LeafScan::Paths(&["high.parquet"])
+)]
+#[case::no_predicate(None, LeafScan::ReadsMissingLeaf)]
 fn data_skipping_skips_leaf_manifests_by_root_content_stats(
     #[case] predicate: Option<Pred>,
-    #[case] expected: Option<&[&str]>,
+    #[case] expected: LeafScan,
 ) {
     let (engine, _) = setup_adaptive_metadata_table();
     let mut low = data_manifest_entry("metadata/missing.parquet", 1, TrackingStatus::Added);
@@ -386,8 +415,8 @@ fn data_skipping_skips_leaf_manifests_by_root_content_stats(
     let paths: KernelResult<Vec<String>> =
         get_files_for_scan(scan, &engine).map(|paths| paths.into_iter().sorted().collect());
     match expected {
-        Some(expected) => assert_eq!(paths.unwrap(), strings(expected)),
-        None => assert!(
+        LeafScan::Paths(expected) => assert_eq!(paths.unwrap(), strings(expected)),
+        LeafScan::ReadsMissingLeaf => assert!(
             paths.is_err(),
             "reading the missing leaf should fail: {paths:?}"
         ),
