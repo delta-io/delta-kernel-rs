@@ -7,14 +7,14 @@ use delta_kernel::{
     EngineData, Expression, ExpressionEvaluator, ExpressionRef, FileDataReadResultIterator,
     KernelError, KernelResult,
 };
-use delta_kernel_ffi_macros::handle_descriptor;
+use delta_kernel_ffi_macros::{ffi_export, handle_descriptor};
 use tracing::trace;
 use url::Url;
 
 use super::handle::Handle;
 use crate::{
-    ExclusiveEngineData, ExternEngine, ExternResult, IntoExternResult, KernelStringSlice,
-    NullableCvoid, SharedExternEngine, SharedSchema, TryFromStringSlice,
+    ExclusiveEngineData, ExternEngine, ExternResult, KernelStringSlice, NullableCvoid,
+    SharedExternEngine, SharedSchema, TryFromStringSlice,
 };
 
 #[repr(C)]
@@ -67,6 +67,7 @@ impl FileReadResultIterator {
 /// [`free_read_result_iter`]. The visitor function pointer must be non-null.
 ///
 /// [`free_engine_data`]: crate::free_engine_data
+#[ffi_export(error_allocator = data.engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn read_result_next(
     mut data: Handle<ExclusiveFileReadResultIterator>,
@@ -77,8 +78,7 @@ pub unsafe extern "C" fn read_result_next(
     ),
 ) -> ExternResult<bool> {
     let iter = unsafe { data.as_mut() };
-    let result = read_result_next_impl(iter, engine_context, engine_visitor);
-    unsafe { result.into_extern_result(iter.engine.error_allocator()) }
+    read_result_next_impl(iter, engine_context, engine_visitor)
 }
 
 fn read_result_next_impl(
@@ -111,6 +111,7 @@ pub unsafe extern "C" fn free_read_result_iter(data: Handle<ExclusiveFileReadRes
 ///
 /// # Safety
 /// Caller is responsible for calling with a valid `ExternEngineHandle` and `FileMeta`
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn read_parquet_file(
     engine: Handle<SharedExternEngine>, // TODO Does this cause a free?
@@ -120,8 +121,7 @@ pub unsafe extern "C" fn read_parquet_file(
     let engine = unsafe { engine.clone_as_arc() };
     let physical_schema = unsafe { physical_schema.clone_as_arc() };
     let path = unsafe { TryFromStringSlice::try_from_slice(&file.path) };
-    let res = read_parquet_file_impl(engine.clone(), path, file, physical_schema);
-    unsafe { res.into_extern_result(&engine.as_ref()) }
+    read_parquet_file_impl(engine, path, file, physical_schema)
 }
 
 fn read_parquet_file_impl(
@@ -159,6 +159,7 @@ pub struct SharedExpressionEvaluator;
 ///
 /// # Safety
 /// Caller is responsible for calling with a valid `Engine`, `Expression`, and `SharedSchema`s
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn new_expression_evaluator(
     engine: Handle<SharedExternEngine>,
@@ -171,8 +172,7 @@ pub unsafe extern "C" fn new_expression_evaluator(
     let input_schema = unsafe { input_schema.clone_as_arc() };
     let output_type: DataType = unsafe { output_type.as_ref() }.clone().into();
     let expression = Arc::new(expression.clone());
-    let res = new_expression_evaluator_impl(engine.clone(), input_schema, expression, output_type);
-    unsafe { res.into_extern_result(&engine.as_ref()) }
+    new_expression_evaluator_impl(engine, input_schema, expression, output_type)
 }
 
 fn new_expression_evaluator_impl(
@@ -204,17 +204,16 @@ pub unsafe extern "C" fn free_expression_evaluator(evaluator: Handle<SharedExpre
 ///
 /// # Safety
 /// Caller is responsible for calling with a valid `Engine`, `ExclusiveEngineData`, and `Evaluator`
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn evaluate_expression(
     engine: Handle<SharedExternEngine>,
     batch: &mut Handle<ExclusiveEngineData>,
     evaluator: Handle<SharedExpressionEvaluator>,
 ) -> ExternResult<Handle<ExclusiveEngineData>> {
-    let engine = unsafe { engine.clone_as_arc() };
     let batch = unsafe { batch.as_mut() };
     let evaluator = unsafe { evaluator.clone_as_arc() };
-    let res = evaluate_expression_impl(batch, evaluator.as_ref());
-    unsafe { res.into_extern_result(&engine.as_ref()) }
+    evaluate_expression_impl(batch, evaluator.as_ref())
 }
 
 fn evaluate_expression_impl(

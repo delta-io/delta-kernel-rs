@@ -8,7 +8,7 @@ use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::table_changes::TableChanges;
 use delta_kernel::table_changes::scan::TableChangesScan;
 use delta_kernel::{EngineData, KernelError, KernelResult, Version};
-use delta_kernel_ffi_macros::handle_descriptor;
+use delta_kernel_ffi_macros::{ffi_export, handle_descriptor};
 use tracing::{debug, trace};
 use url::Url;
 
@@ -17,9 +17,8 @@ use crate::engine_data::ArrowFFIData;
 use crate::expressions::kernel_visitor::{KernelExpressionVisitorState, unwrap_kernel_predicate};
 use crate::scan::EnginePredicate;
 use crate::{
-    AllocateStringFn, ExternEngine, ExternResult, IntoExternResult, KernelStringSlice,
-    NullableCvoid, SharedExternEngine, SharedSchema, kernel_string_slice,
-    unwrap_and_parse_path_as_url,
+    AllocateStringFn, ExternEngine, ExternResult, KernelStringSlice, NullableCvoid,
+    SharedExternEngine, SharedSchema, kernel_string_slice, unwrap_and_parse_path_as_url,
 };
 
 #[handle_descriptor(target=TableChanges, mutable=true, sized=true)]
@@ -35,6 +34,7 @@ pub struct ExclusiveTableChanges;
 /// # Safety
 ///
 /// Caller is responsible for passing valid handles and path pointer.
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn table_changes_from_version(
     path: KernelStringSlice,
@@ -43,8 +43,7 @@ pub unsafe extern "C" fn table_changes_from_version(
 ) -> ExternResult<Handle<ExclusiveTableChanges>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let engine = unsafe { engine.as_ref() };
-    let result = table_changes_impl(url, engine, start_version, None);
-    unsafe { result.into_extern_result(&engine) }
+    table_changes_impl(url, engine, start_version, None)
 }
 
 /// Get the table changes from the specified table between two versions
@@ -57,6 +56,7 @@ pub unsafe extern "C" fn table_changes_from_version(
 /// # Safety
 ///
 /// Caller is responsible for passing valid handles and path pointer.
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn table_changes_between_versions(
     path: KernelStringSlice,
@@ -66,8 +66,7 @@ pub unsafe extern "C" fn table_changes_between_versions(
 ) -> ExternResult<Handle<ExclusiveTableChanges>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let engine = unsafe { engine.as_ref() };
-    let result = table_changes_impl(url, engine, start_version, end_version.into());
-    unsafe { result.into_extern_result(&engine) }
+    table_changes_impl(url, engine, start_version, end_version.into())
 }
 
 fn table_changes_impl(
@@ -158,6 +157,7 @@ pub struct SharedTableChangesScan;
 /// # Safety
 ///
 /// Caller is responsible for passing a valid table changes pointer, and engine pointer
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn table_changes_scan(
     table_changes: Handle<ExclusiveTableChanges>,
@@ -165,8 +165,7 @@ pub unsafe extern "C" fn table_changes_scan(
     predicate: Option<&mut EnginePredicate>,
 ) -> ExternResult<Handle<SharedTableChangesScan>> {
     let table_changes = unsafe { table_changes.into_inner() };
-    let result = table_changes_scan_impl(*table_changes, predicate);
-    unsafe { result.into_extern_result(&engine.as_ref()) }
+    table_changes_scan_impl(*table_changes, predicate)
 }
 
 fn table_changes_scan_impl(
@@ -260,6 +259,7 @@ impl Drop for ScanTableChangesIterator {
 /// # Safety
 ///
 /// Engine is responsible for passing a valid [`SharedExternEngine`] and [`SharedTableChangesScan`]
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn table_changes_scan_execute(
     table_changes_scan: Handle<SharedTableChangesScan>,
@@ -267,8 +267,7 @@ pub unsafe extern "C" fn table_changes_scan_execute(
 ) -> ExternResult<Handle<SharedScanTableChangesIterator>> {
     let table_changes_scan = unsafe { table_changes_scan.as_ref() };
     let engine = unsafe { engine.clone_as_arc() };
-    let result = table_changes_scan_execute_impl(table_changes_scan, engine.clone());
-    unsafe { result.into_extern_result(&engine.as_ref()) }
+    table_changes_scan_execute_impl(table_changes_scan, engine)
 }
 
 fn table_changes_scan_execute_impl(
@@ -305,13 +304,13 @@ pub unsafe extern "C" fn free_scan_table_changes_iter(
 ///
 /// The iterator must be valid (returned by [`table_changes_scan_execute`]) and not yet freed
 /// by [`free_scan_table_changes_iter`].
+#[ffi_export(error_allocator = data.engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn scan_table_changes_next(
     data: Handle<SharedScanTableChangesIterator>,
 ) -> ExternResult<*mut ArrowFFIData> {
     let data = unsafe { data.as_ref() };
-    let result = scan_table_changes_next_impl(data);
-    unsafe { result.into_extern_result(&data.engine.as_ref()) }
+    scan_table_changes_next_impl(data)
 }
 
 fn scan_table_changes_next_impl(

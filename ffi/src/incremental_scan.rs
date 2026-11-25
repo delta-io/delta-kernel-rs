@@ -38,7 +38,7 @@ use delta_kernel::incremental_scan::{IncrementalScanStream, IncrementalScanSumma
 use delta_kernel::log_replay::FileActionKey;
 use delta_kernel::snapshot::SnapshotRef;
 use delta_kernel::{KernelError, KernelResult, PredicateRef, Result, Version};
-use delta_kernel_ffi_macros::handle_descriptor;
+use delta_kernel_ffi_macros::{ffi_export, handle_descriptor};
 
 #[cfg(feature = "default-engine-base")]
 use crate::engine_data::ArrowFFIData;
@@ -47,7 +47,7 @@ use crate::handle::Handle;
 use crate::scan::{CTransforms, ScanMetadataArrowResult};
 use crate::scan::{EnginePredicate, decode_engine_predicate};
 use crate::{
-    ExternEngine, ExternResult, IntoExternResult, KernelStringSlice, NullableCvoid, OptionalValue,
+    ExternEngine, ExternResult, KernelStringSlice, NullableCvoid, OptionalValue,
     SharedExternEngine, SharedSnapshot, kernel_string_slice,
 };
 
@@ -128,16 +128,15 @@ pub unsafe extern "C" fn snapshot_incremental_scan_builder(
 /// `builder` and `engine` must be valid handles. The `builder` handle must not be used after this
 /// call. `predicate` must be a valid, non-null [`EnginePredicate`] whose `visitor` and `predicate`
 /// fields are safe to call and read.
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn incremental_scan_builder_with_predicate(
     builder: Handle<ExclusiveIncrementalScanBuilder>,
     engine: Handle<SharedExternEngine>,
     predicate: &mut EnginePredicate,
 ) -> ExternResult<Handle<ExclusiveIncrementalScanBuilder>> {
-    let engine = unsafe { engine.as_ref() };
     let builder = unsafe { builder.into_inner() };
-    let result = incremental_scan_builder_with_predicate_impl(*builder, predicate);
-    unsafe { result.into_extern_result(&engine) }
+    incremental_scan_builder_with_predicate_impl(*builder, predicate)
 }
 
 fn incremental_scan_builder_with_predicate_impl(
@@ -164,14 +163,13 @@ fn incremental_scan_builder_with_predicate_impl(
 /// # Safety
 ///
 /// Caller must pass a valid builder pointer and must not use it again after this call.
+#[ffi_export(error_allocator = builder.engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn incremental_scan_builder_build(
     builder: Handle<ExclusiveIncrementalScanBuilder>,
 ) -> ExternResult<OptionalValue<Handle<SharedIncrementalScanStream>>> {
     let builder = unsafe { builder.into_inner() };
-    let engine = builder.engine.clone();
-    let result = incremental_scan_builder_build_impl(*builder);
-    unsafe { result.into_extern_result(&engine.as_ref()) }
+    incremental_scan_builder_build_impl(*builder)
 }
 
 fn incremental_scan_builder_build_impl(
@@ -224,13 +222,13 @@ pub unsafe extern "C" fn free_incremental_scan_builder(
 ///
 /// Caller must pass a valid stream handle.
 #[cfg(feature = "default-engine-base")]
+#[ffi_export(error_allocator = stream.engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn incremental_scan_stream_next_arrow(
     stream: Handle<SharedIncrementalScanStream>,
 ) -> ExternResult<*mut ScanMetadataArrowResult> {
     let stream = unsafe { stream.as_ref() };
-    let result = incremental_scan_stream_next_arrow_impl(stream);
-    unsafe { result.into_extern_result(&stream.engine.as_ref()) }
+    incremental_scan_stream_next_arrow_impl(stream)
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -284,14 +282,13 @@ fn next_arrow_batch(
 /// # Safety
 ///
 /// Caller must pass a valid stream handle and must not use it again after this call.
+#[ffi_export(error_allocator = stream.engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn incremental_scan_stream_into_summary(
     stream: Handle<SharedIncrementalScanStream>,
 ) -> ExternResult<Handle<SharedIncrementalScanSummary>> {
     let inner_stream = unsafe { stream.into_inner() };
-    let engine = inner_stream.engine.clone();
-    let result = incremental_scan_stream_into_summary_impl(&inner_stream);
-    unsafe { result.into_extern_result(&engine.as_ref()) }
+    incremental_scan_stream_into_summary_impl(&inner_stream)
 }
 
 fn incremental_scan_stream_into_summary_impl(

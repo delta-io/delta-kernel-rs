@@ -7,9 +7,9 @@ use delta_kernel::actions::deletion_vector_writer::{
     DeletionVectorWriteResult, KernelDeletionVector, StreamingDeletionVectorWriter,
 };
 use delta_kernel::{KernelError, KernelResult};
-use delta_kernel_ffi_macros::handle_descriptor;
+use delta_kernel_ffi_macros::{ffi_export, handle_descriptor};
 
-use crate::error::{EngineExecResult, ErrorAllocators, ExternResult, IntoExternResult};
+use crate::error::{EngineExecResult, ErrorAllocators, ExternResult};
 use crate::handle::{BoxExt, Handle};
 use crate::{FfiSlice, KernelBytesSlice, NullableCvoid};
 
@@ -108,6 +108,7 @@ pub extern "C" fn new_deletion_vector() -> Handle<ExclusiveDeletionVector> {
 /// `indexes` must address that many aligned, initialized u64 values readable for this call.
 /// `error_allocators` must point to a valid table for this call, with callbacks and context
 /// satisfying `ErrorAllocators`'s contract. No input memory is retained after the call.
+#[ffi_export(error_allocator = unsafe { &*error_allocators })]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn deletion_vector_add_indexes(
     vector: &mut Handle<ExclusiveDeletionVector>,
@@ -122,12 +123,13 @@ pub unsafe extern "C" fn deletion_vector_add_indexes(
                 "DV row indexes must not exceed i64::MAX",
             ));
         }
-        // SAFETY: the caller prevents concurrent access; validation completed before mutation.
+        // SAFETY: the caller prevents concurrent access; validation completed before
+        // mutation.
         unsafe { vector.as_mut() }.add_deleted_row_indexes(rows);
         Ok(true)
     })();
     // SAFETY: the allocator table, context, and callbacks are valid for this call.
-    unsafe { result.into_extern_result(&*error_allocators) }
+    result
 }
 
 /// Consumes an abandoned deletion vector without serializing it.
@@ -156,6 +158,7 @@ pub unsafe extern "C" fn free_deletion_vector(vector: Handle<ExclusiveDeletionVe
 /// handle. No caller record is retained, including when it was stack-allocated in a helper.
 /// `error_allocators` must point to a valid table for this call, with callbacks and context
 /// satisfying `ErrorAllocators`'s contract.
+#[ffi_export(error_allocator = unsafe { &*error_allocators })]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn new_dv_writer(
     output: &FfiDvWriterOutput,
@@ -172,8 +175,9 @@ pub unsafe extern "C" fn new_dv_writer(
             write: output.write,
             flush: output.flush,
         })));
-        // SAFETY: DvWriter owns this stable allocation and drops the serializer's borrow before
-        // freeing it. The private pointer is never exposed or used while the borrow is active.
+        // SAFETY: DvWriter owns this stable allocation and drops the serializer's borrow
+        // before freeing it. The private pointer is never exposed or used
+        // while the borrow is active.
         let writer = StreamingDeletionVectorWriter::new(unsafe { output.as_mut() });
         Ok(Box::new(DvWriter {
             writer: Some(writer),
@@ -183,7 +187,7 @@ pub unsafe extern "C" fn new_dv_writer(
         .into())
     })();
     // SAFETY: the allocator table, context, and callbacks are valid for this call.
-    unsafe { result.into_extern_result(&*error_allocators) }
+    result
 }
 
 /// Serializes one complete vector, returning its offset, size, and cardinality.
@@ -201,17 +205,20 @@ pub unsafe extern "C" fn new_dv_writer(
 /// a valid owned handle created with `new_deletion_vector`; do not use or free it after this call.
 /// The output's lifetime/threading contract applies. `error_allocators` must point to a valid
 /// table for this call, with callbacks and context satisfying `ErrorAllocators`'s contract.
+#[ffi_export(error_allocator = unsafe { &*error_allocators })]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dv_writer_write(
     writer: &mut Handle<ExclusiveDvWriter>,
     vector: Handle<ExclusiveDeletionVector>,
     error_allocators: *const ErrorAllocators,
 ) -> ExternResult<FfiDvWriteResult> {
-    // SAFETY: the caller transfers the live vector exactly once. Consume before any fallible check
-    // so it is dropped on failed-writer, serialization, and output errors alike.
+    // SAFETY: the caller transfers the live vector exactly once. Consume before any
+    // fallible check so it is dropped on failed-writer, serialization, and
+    // output errors alike.
     let vector = unsafe { vector.into_inner() };
     let result: KernelResult<_> = (|| {
-        // SAFETY: the caller supplies a valid handle and prevents concurrent/re-entrant access.
+        // SAFETY: the caller supplies a valid handle and prevents concurrent/re-entrant
+        // access.
         let writer = unsafe { writer.as_mut() };
         if writer.failed {
             return Err(KernelError::invalid_transaction_state(
@@ -226,7 +233,7 @@ pub unsafe extern "C" fn dv_writer_write(
         result.map(FfiDvWriteResult::from)
     })();
     // SAFETY: the allocator table, context, and callbacks are valid for this call.
-    unsafe { result.into_extern_result(&*error_allocators) }
+    result
 }
 
 /// Finalizes and consumes the writer, flushing its output.
@@ -241,6 +248,7 @@ pub unsafe extern "C" fn dv_writer_write(
 /// `writer` must be a valid owned handle, and its output must still satisfy its lifetime/threading
 /// contract. Do not use or free the handle again. `error_allocators` must point to a valid table
 /// for this call, with callbacks and context satisfying `ErrorAllocators`'s contract.
+#[ffi_export(error_allocator = unsafe { &*error_allocators })]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dv_writer_finalize(
     writer: Handle<ExclusiveDvWriter>,
@@ -260,7 +268,7 @@ pub unsafe extern "C" fn dv_writer_finalize(
             .and_then(StreamingDeletionVectorWriter::finalize)
     };
     // SAFETY: the allocator table, context, and callbacks are valid for this call.
-    unsafe { result.map(|()| true).into_extern_result(&*error_allocators) }
+    result.map(|()| true)
 }
 
 /// Abandons and consumes a writer without flushing or freeing its caller-owned output.

@@ -4,15 +4,15 @@ use delta_kernel::commit_range::{CommitAction, CommitRange, DeltaAction as Kerne
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::snapshot::SnapshotRef;
 use delta_kernel::{KernelError, KernelResult, KernelResultIterator, LogPath, Version};
-use delta_kernel_ffi_macros::handle_descriptor;
+use delta_kernel_ffi_macros::{ffi_export, handle_descriptor};
 use url::Url;
 
 use crate::engine_funcs::{ExclusiveFileReadResultIterator, FileReadResultIterator};
 use crate::handle::Handle;
 use crate::log_path::{FfiLogPath, LogPathArray};
 use crate::{
-    ExternEngine, ExternResult, IntoExternResult, KernelStringSlice, NullableCvoid,
-    SharedExternEngine, SharedSnapshot, unwrap_and_parse_path_as_url,
+    ExternEngine, ExternResult, KernelStringSlice, NullableCvoid, SharedExternEngine,
+    SharedSnapshot, unwrap_and_parse_path_as_url,
 };
 
 /// An opaque, shared handle owning a [`CommitRange`] produced by
@@ -74,17 +74,16 @@ fn make_commit_range_builder(
 /// # Safety
 ///
 /// Caller is responsible for passing a valid path and engine handle.
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn commit_range_builder_for(
     path: KernelStringSlice,
     start_version: Version,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveCommitRangeBuilder>> {
-    let engine_ref = unsafe { engine.as_ref() };
     let engine_arc = unsafe { engine.clone_as_arc() };
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
-    let result = url.map(|url| make_commit_range_builder(url, start_version, engine_arc));
-    unsafe { result.into_extern_result(&engine_ref) }
+    url.map(|url| make_commit_range_builder(url, start_version, engine_arc))
 }
 
 /// Pin the end version of the range. When omitted, the range extends to the latest committed
@@ -116,6 +115,7 @@ pub unsafe extern "C" fn commit_range_builder_with_end_version(
 /// Caller must pass a valid builder handle. The builder is consumed unconditionally and must not
 /// be used or freed after this call. On error, the builder is dropped. The log-tail array and its
 /// contents must remain valid for the duration of this call.
+#[ffi_export(error_allocator = builder.engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn commit_range_builder_with_log_tail(
     builder: Handle<ExclusiveCommitRangeBuilder>,
@@ -123,13 +123,11 @@ pub unsafe extern "C" fn commit_range_builder_with_log_tail(
     max_catalog_version: Version,
 ) -> ExternResult<Handle<ExclusiveCommitRangeBuilder>> {
     let mut builder = unsafe { builder.into_inner() };
-    let engine = builder.engine.clone();
-    let result = unsafe { log_tail.log_paths() }.map(|paths| {
+    unsafe { log_tail.log_paths() }.map(|paths| {
         builder.log_tail = paths;
         builder.max_catalog_version = Some(max_catalog_version);
         builder.into()
-    });
-    unsafe { result.into_extern_result(&engine.as_ref()) }
+    })
 }
 
 /// Set the maximum catalog-ratified version on the builder.
@@ -203,14 +201,13 @@ pub unsafe extern "C" fn commit_range_builder_with_fail_on_data_loss(
 /// # Safety
 ///
 /// Caller must pass a valid builder pointer and must not use it again after this call.
+#[ffi_export(error_allocator = builder.engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn commit_range_builder_build(
     builder: Handle<ExclusiveCommitRangeBuilder>,
 ) -> ExternResult<Handle<SharedCommitRange>> {
     let builder_box = unsafe { builder.into_inner() };
-    let engine = builder_box.engine.clone();
-    let result = commit_range_builder_build_impl(*builder_box);
-    unsafe { result.into_extern_result(&engine.as_ref()) }
+    commit_range_builder_build_impl(*builder_box)
 }
 
 fn commit_range_builder_build_impl(
@@ -364,16 +361,15 @@ pub unsafe extern "C" fn commit_action_timestamp(commit_action: Handle<SharedCom
 ///
 /// [`read_result_next`]: crate::engine_funcs::read_result_next
 /// [`free_read_result_iter`]: crate::engine_funcs::free_read_result_iter
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn commit_action_get_actions(
     commit_action: Handle<SharedCommitAction>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveFileReadResultIterator>> {
-    let engine_ref = unsafe { engine.as_ref() };
     let commit_action = unsafe { commit_action.as_ref() };
     let engine_arc = unsafe { engine.clone_as_arc() };
-    let result = commit_action_get_actions_impl(commit_action, engine_arc);
-    unsafe { result.into_extern_result(&engine_ref) }
+    commit_action_get_actions_impl(commit_action, engine_arc)
 }
 
 fn commit_action_get_actions_impl(
@@ -428,6 +424,7 @@ pub struct SharedCommitActionsIterator;
 ///
 /// Caller is responsible for passing valid handles, and an `actions` pointer to `actions_len`
 /// valid [`DeltaAction`] values.
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn commit_range_commits(
     commit_range: Handle<SharedCommitRange>,
@@ -435,12 +432,10 @@ pub unsafe extern "C" fn commit_range_commits(
     actions: *const DeltaAction,
     actions_len: usize,
 ) -> ExternResult<Handle<SharedCommitActionsIterator>> {
-    let engine_ref = unsafe { engine.as_ref() };
     let commit_range = unsafe { commit_range.as_ref() };
     let engine_arc = unsafe { engine.clone_as_arc() };
     let actions = unsafe { parse_actions(actions, actions_len) };
-    let result = commit_range_commits_impl(commit_range, engine_arc, None, actions);
-    unsafe { result.into_extern_result(&engine_ref) }
+    commit_range_commits_impl(commit_range, engine_arc, None, actions)
 }
 
 /// Like [`commit_range_commits`], but seeds the iterator's protocol/metadata from `start_snapshot`.
@@ -458,6 +453,7 @@ pub unsafe extern "C" fn commit_range_commits(
 ///
 /// Caller is responsible for passing valid handles, and an `actions` pointer to `actions_len`
 /// valid [`DeltaAction`] values.
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn commit_range_commits_with_snapshot(
     commit_range: Handle<SharedCommitRange>,
@@ -466,13 +462,11 @@ pub unsafe extern "C" fn commit_range_commits_with_snapshot(
     actions: *const DeltaAction,
     actions_len: usize,
 ) -> ExternResult<Handle<SharedCommitActionsIterator>> {
-    let engine_ref = unsafe { engine.as_ref() };
     let commit_range = unsafe { commit_range.as_ref() };
     let engine_arc = unsafe { engine.clone_as_arc() };
     let start_snapshot = unsafe { start_snapshot.clone_as_arc() };
     let actions = unsafe { parse_actions(actions, actions_len) };
-    let result = commit_range_commits_impl(commit_range, engine_arc, Some(start_snapshot), actions);
-    unsafe { result.into_extern_result(&engine_ref) }
+    commit_range_commits_impl(commit_range, engine_arc, Some(start_snapshot), actions)
 }
 
 fn commit_range_commits_impl(
@@ -499,6 +493,7 @@ fn commit_range_commits_impl(
 ///
 /// The iterator must be valid (returned by [`commit_range_commits`]) and not yet freed by
 /// [`free_commit_actions_iter`]. The visitor function pointer must be non-null.
+#[ffi_export(error_allocator = data.engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn commit_range_commits_next(
     data: Handle<SharedCommitActionsIterator>,
@@ -509,8 +504,7 @@ pub unsafe extern "C" fn commit_range_commits_next(
     ),
 ) -> ExternResult<bool> {
     let data = unsafe { data.as_ref() };
-    let result = commit_range_commits_next_impl(data, engine_context, engine_visitor);
-    unsafe { result.into_extern_result(&data.engine.as_ref()) }
+    commit_range_commits_next_impl(data, engine_context, engine_visitor)
 }
 
 fn commit_range_commits_next_impl(
@@ -587,16 +581,15 @@ pub struct SharedCommitFilesIterator;
 /// # Safety
 ///
 /// Caller is responsible for passing valid handles.
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn commit_range_commit_files(
     commit_range: Handle<SharedCommitRange>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedCommitFilesIterator>> {
-    let engine_ref = unsafe { engine.as_ref() };
     let commit_range = unsafe { commit_range.as_ref() };
     let engine_arc = unsafe { engine.clone_as_arc() };
-    let result = commit_range_commit_files_impl(commit_range, engine_arc);
-    unsafe { result.into_extern_result(&engine_ref) }
+    commit_range_commit_files_impl(commit_range, engine_arc)
 }
 
 fn commit_range_commit_files_impl(
@@ -622,6 +615,7 @@ fn commit_range_commit_files_impl(
 /// # Safety
 ///
 /// Caller must pass a valid iterator handle and `engine_visitor`.
+#[ffi_export(error_allocator = data.engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn commit_range_commit_files_next(
     data: Handle<SharedCommitFilesIterator>,
@@ -629,8 +623,7 @@ pub unsafe extern "C" fn commit_range_commit_files_next(
     engine_visitor: extern "C" fn(engine_context: NullableCvoid, commit_file: *const FfiCommitFile),
 ) -> ExternResult<bool> {
     let data = unsafe { data.as_ref() };
-    let result = commit_range_commit_files_next_impl(data, engine_context, engine_visitor);
-    unsafe { result.into_extern_result(&data.engine.as_ref()) }
+    commit_range_commit_files_next_impl(data, engine_context, engine_visitor)
 }
 
 fn commit_range_commit_files_next_impl(
