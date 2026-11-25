@@ -29,15 +29,18 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{Engine, Snapshot, SnapshotRef};
 use rstest::rstest;
-use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use test_utils::delta_kernel_default_engine::executor::tokio::{
+    TokioBackgroundExecutor, TokioMultiThreadExecutor,
+};
 use test_utils::delta_kernel_default_engine::json::DefaultJsonHandler;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::log_compaction::write_compaction_from_commits;
 use test_utils::{
-    TestAction, actions_to_string, actions_to_string_catalog_managed,
+    CountingReporter, TestAction, actions_to_string, actions_to_string_catalog_managed,
     actions_to_string_partitioned, add_commit, add_staged_commit, assert_result_error_with_message,
     create_log_path, create_table_and_load_snapshot, delta_path_for_version, get_column,
-    into_record_batch, test_table_setup_mt, write_batch_to_table,
+    install_thread_local_metrics_reporter, into_record_batch, test_table_setup_mt,
+    write_batch_to_table,
 };
 use url::Url;
 
@@ -2288,11 +2291,11 @@ async fn column_free_predicate_keeps_all_added_files() -> Result<(), Box<dyn std
 // The two paths parse stats differently: a full scan reads pre-parsed `stats_parsed` (from a
 // checkpoint), while the incremental path parses `add.stats` JSON via `for_raw_action_batch`.
 //
-// The incremental scan reads only raw commit JSON and never touches checkpoints, so it cannot
-// serve a range predating a checkpoint (the target snapshot's log segment drops pre-checkpoint
-// commit JSON). The checkpoint therefore sits at the base version: the full scan at the base
-// prunes via the checkpoint's `stats_parsed`, the incremental delta over `(base, target]` prunes
-// via JSON, and `full_scan(base) union live_adds` must equal `full_scan(target)`.
+// The incremental scan reads only raw commit JSON and never touches checkpoints, so by default it
+// cannot serve a range predating a checkpoint (the target snapshot's log segment drops
+// pre-checkpoint commit JSON). The checkpoint therefore sits at the base version: the full scan at
+// the base prunes via the checkpoint's `stats_parsed`, the incremental delta over `(base, target]`
+// prunes via JSON, and `full_scan(base) union live_adds` must equal `full_scan(target)`.
 
 // Single-column `id: integer` table.
 fn id_schema() -> Arc<StructType> {
@@ -2428,6 +2431,267 @@ async fn predicate_pushdown_reconciled_with_base_matches_full_scan_across_checkp
         reconciled, target_paths,
         "base full scan plus incremental live_adds must equal the full scan at the target"
     );
+
+    Ok(())
+}
+
+// === Ranges across a checkpoint ===
+//
+// The target's log segment holds only the commits after its checkpoint. With
+// `read_commits_across_checkpoints`, the scan lists the earlier in-range commits from
+// `_delta_log/`; without it, the scan returns `None` for such a range.
+
+fn setup_test_mt() -> (
+    Arc<InMemory>,
+    Arc<DefaultEngine<TokioMultiThreadExecutor>>,
+    Url,
+) {
+    let storage = Arc::new(InMemory::new());
+    let table_root = Url::parse("memory:///").unwrap();
+    let executor = Arc::new(TokioMultiThreadExecutor::new(
+        tokio::runtime::Handle::current(),
+    ));
+    let engine = Arc::new(
+        DefaultEngineBuilder::new(storage.clone())
+            .with_task_executor(executor)
+            .build(),
+    );
+    (storage, engine, table_root)
+}
+
+// v1 adds A and B, v2 removes A, v3 re-adds A and adds C, v4 removes B.
+fn re_add_commits() -> Vec<Vec<TestAction>> {
+    vec![
+        vec![
+            TestAction::Add("A".to_string()),
+            TestAction::Add("B".to_string()),
+        ],
+        vec![TestAction::Remove("A".to_string())],
+        vec![
+            TestAction::Add("A".to_string()),
+            TestAction::Add("C".to_string()),
+        ],
+        vec![TestAction::Remove("B".to_string())],
+    ]
+}
+
+// Writes v0 (metadata) and `commits` as v1, v2, ..., then checkpoints at `checkpoint_version`.
+async fn write_table_with_checkpoint(
+    storage: &InMemory,
+    engine: &dyn Engine,
+    table_url: &Url,
+    commits: Vec<Vec<TestAction>>,
+    checkpoint_version: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let table_root = table_url.as_str();
+    add_commit(
+        table_root,
+        storage,
+        0,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+    for (version, actions) in (1..).zip(commits) {
+        add_commit(table_root, storage, version, actions_to_string(actions)).await?;
+    }
+    Snapshot::builder_for(table_url.clone())
+        .at_version(checkpoint_version)
+        .build(engine)?
+        .checkpoint(engine, None)?;
+    Ok(())
+}
+
+#[rstest]
+#[case::checkpoint_at_start(1)]
+#[case::checkpoint_inside(2)]
+#[case::checkpoint_at_target(4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reads_commits_across_checkpoint(
+    #[case] checkpoint_version: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test_mt();
+    write_table_with_checkpoint(
+        storage.as_ref(),
+        engine.as_ref(),
+        &table_url,
+        re_add_commits(),
+        checkpoint_version,
+    )
+    .await?;
+    let target = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    assert_eq!(target.version(), 4);
+
+    assert!(
+        target
+            .clone()
+            .incremental_scan_builder(0)
+            .build(engine.as_ref())?
+            .is_none(),
+        "without the option, a range across a checkpoint is not served"
+    );
+
+    let listing = unwrap_listing(
+        target
+            .incremental_scan_builder(0)
+            .read_commits_across_checkpoints()
+            .build(engine.as_ref())?,
+    );
+    assert_eq!(
+        listing.summary.live_adds,
+        HashSet::from([key("A"), key("C")])
+    );
+    assert_eq!(live_add_count(&listing), 2);
+    assert_eq!(listing.summary.removes, HashSet::from([key("B")]));
+
+    Ok(())
+}
+
+// The option lists `_delta_log/` only when the target's log segment does not cover the range.
+#[rstest]
+#[case::covered(2, 0)]
+#[case::across_checkpoint(0, 1)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lists_delta_log_only_when_segment_does_not_cover_range(
+    #[case] base_version: u64,
+    #[case] expected_scan_list_calls: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, setup_engine, table_url) = setup_test_mt();
+    write_table_with_checkpoint(
+        storage.as_ref(),
+        setup_engine.as_ref(),
+        &table_url,
+        re_add_commits(),
+        2,
+    )
+    .await?;
+
+    // Build the target snapshot after installing the reporter: cloning a span opened under the
+    // global subscriber from inside the thread-local one panics.
+    let reporter = Arc::new(CountingReporter::new());
+    let engine = DefaultEngineBuilder::new(storage).build();
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    let target = Snapshot::builder_for(table_url).build(&engine)?;
+    let snapshot_list_calls = reporter.list_calls.get();
+
+    let result = target
+        .incremental_scan_builder(base_version)
+        .read_commits_across_checkpoints()
+        .build(&engine)?;
+
+    assert!(result.is_some());
+    assert_eq!(
+        reporter.list_calls.get() - snapshot_list_calls,
+        expected_scan_list_calls
+    );
+
+    Ok(())
+}
+
+// When `_delta_log/` lacks an in-range commit at or before the checkpoint, the scan returns `None`.
+#[rstest]
+#[case::start_vacuumed(&[1])]
+#[case::gap(&[2])]
+#[case::checkpoint_commit_missing(&[3])]
+#[case::all_vacuumed(&[1, 2, 3])]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn returns_none_when_commits_before_checkpoint_are_missing(
+    #[case] deleted_versions: &[u64],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test_mt();
+    write_table_with_checkpoint(
+        storage.as_ref(),
+        engine.as_ref(),
+        &table_url,
+        re_add_commits(),
+        3,
+    )
+    .await?;
+    for version in deleted_versions {
+        storage
+            .delete(&delta_path_for_version(*version, "json"))
+            .await?;
+    }
+    let target = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+
+    let result = target
+        .incremental_scan_builder(0)
+        .read_commits_across_checkpoints()
+        .build(engine.as_ref())?;
+
+    assert!(result.is_none());
+
+    Ok(())
+}
+
+// Catalog-managed: the commits up to the checkpoint are published and come from the listing. The
+// staged commits after it reach the scan only through the target's log tail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reads_published_and_staged_commits_across_checkpoint()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test_mt();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string_catalog_managed(vec![TestAction::Metadata]),
+    )
+    .await?;
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        1,
+        actions_to_string(vec![TestAction::Add("A".to_string())]),
+    )
+    .await?;
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        2,
+        actions_to_string(vec![TestAction::Add("B".to_string())]),
+    )
+    .await?;
+    Snapshot::builder_for(table_url.clone())
+        .with_max_catalog_version(2)
+        .build(engine.as_ref())?
+        .checkpoint(engine.as_ref(), None)?;
+    let staged3 = add_staged_commit(
+        table_root,
+        storage.as_ref(),
+        3,
+        actions_to_string(vec![TestAction::Add("C".to_string())]),
+    )
+    .await?;
+    let staged4 = add_staged_commit(
+        table_root,
+        storage.as_ref(),
+        4,
+        actions_to_string(vec![TestAction::Remove("A".to_string())]),
+    )
+    .await?;
+
+    let log_tail = vec![
+        create_log_path(&table_url, staged3),
+        create_log_path(&table_url, staged4),
+    ];
+    let target = Snapshot::builder_for(table_url.clone())
+        .with_log_tail(log_tail)
+        .with_max_catalog_version(4)
+        .build(engine.as_ref())?;
+    assert_eq!(target.version(), 4);
+
+    let listing = unwrap_listing(
+        target
+            .incremental_scan_builder(0)
+            .read_commits_across_checkpoints()
+            .build(engine.as_ref())?,
+    );
+    assert_eq!(
+        listing.summary.live_adds,
+        HashSet::from([key("B"), key("C")])
+    );
+    assert_eq!(listing.summary.removes, HashSet::from([key("A")]));
 
     Ok(())
 }

@@ -6,10 +6,12 @@ use std::sync::{Arc, LazyLock};
 
 use url::Url;
 
+use crate::commit_range::CommitRange;
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor};
 use crate::expressions::{ColumnName, column_name};
 use crate::log_replay::deduplicator::{Deduplicator, FileActionInfo};
 use crate::log_replay::{FileActionDeduplicator, FileActionKey};
+use crate::path::ParsedLogPath;
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::{
     COMMIT_READ_SCHEMA, PartitionValuesOptions, PhysicalPredicate, map_to_struct_options,
@@ -32,6 +34,7 @@ pub struct IncrementalScanBuilder {
     base_version: Version,
     predicate: Option<PredicateRef>,
     partition_values_options: PartitionValuesOptions,
+    read_commits_across_checkpoints: bool,
 }
 
 impl IncrementalScanBuilder {
@@ -42,6 +45,7 @@ impl IncrementalScanBuilder {
             base_version,
             predicate: None,
             partition_values_options: PartitionValuesOptions::default(),
+            read_commits_across_checkpoints: false,
         }
     }
 
@@ -79,17 +83,30 @@ impl IncrementalScanBuilder {
         self
     }
 
+    /// Also serve ranges that start at or before the target snapshot's checkpoint, by listing
+    /// `_delta_log/` for the in-range commits that the target's log segment does not hold.
+    ///
+    /// This costs one `_delta_log/` listing, and only when the target's log segment does not
+    /// cover `(base_version, target_version]`. Without this option, [`Self::build`] returns
+    /// `None` for such ranges.
+    pub fn read_commits_across_checkpoints(mut self) -> Self {
+        self.read_commits_across_checkpoints = true;
+        self
+    }
+
     /// Build the incremental scan stream, or `None` if the range cannot be served from commit
     /// JSONs (consumers should fall back to a full scan via [`crate::Snapshot::scan_builder`]).
     /// That happens when the target snapshot's commit list does not cover
-    /// `(base_version, target_version]`, or when some commit in the range may record file actions
+    /// `(base_version, target_version]` and [`Self::read_commits_across_checkpoints`] cannot
+    /// list the rest, or when some commit in the range may record file actions
     /// outside its commit JSON (e.g. adaptiveMetadata manifest commits). TODO(#2866): serve such
     /// ranges by reading their file actions from the metadata tree instead of returning `None`.
     ///
     /// Does not re-list `_delta_log/`: walks the target snapshot's already-validated commit
     /// list and clips it to `(base_version, target_version]`. For catalog-managed tables
     /// that's important — the snapshot's `log_tail` carries staged commits that a fresh
-    /// storage listing would miss.
+    /// storage listing would miss. The exception is [`Self::read_commits_across_checkpoints`],
+    /// which lists the in-range commits at or before the target's checkpoint.
     ///
     /// Validates only the target's reader features via [`Operation::Scan`]. By the protocol's
     /// feature-immutability rule, the target's `readerFeatures` is a superset of every
@@ -110,8 +127,9 @@ impl IncrementalScanBuilder {
     pub fn build(self, engine: &dyn Engine) -> Result<Option<IncrementalScanStream>> {
         // TODO(#2493): the version validation, the snapshot-commit-list extraction and
         // clipping below, and the "snapshot covers the range" check should all be replaced
-        // by a single `CommitRangeBuilder::from_snapshot(...).build(engine)` call once
-        // that primitive lands. https://github.com/delta-io/delta-kernel-rs/issues/2493
+        // by a single `CommitRange::builder_from(...).build(engine)` call once it can also
+        // list the commits at or before the snapshot's checkpoint.
+        // https://github.com/delta-io/delta-kernel-rs/issues/2493
         let target_version = self.target_snapshot.version();
         require!(
             self.base_version < target_version,
@@ -142,7 +160,8 @@ impl IncrementalScanBuilder {
             .table_configuration()
             .ensure_operation_supported(Operation::Scan)?;
 
-        // TODO(#2493): replace this block with `CommitRange` once it exists.
+        // TODO(#2493): replace this block with one `CommitRange::builder_from(...)` call once it
+        // can also list the commits at or before the snapshot's checkpoint.
         // Today we use the snapshot's already-validated commit list rather than re-listing
         // storage. This is correct for catalog-managed tables: the snapshot's log_segment
         // includes any staged/ratified-but-unpublished commits passed in via `with_log_tail`,
@@ -158,9 +177,20 @@ impl IncrementalScanBuilder {
         // TODO(#2493): this "snapshot covers range" check becomes a typed error from
         // `CommitRange::build` (e.g. `KernelError::CommitsUnavailable { missing: Range<Version>
         // }`), pattern-matched here to return `None`.
-        if snapshot_first_version.is_none_or(|v| v > start_version) {
+        let listed_commits = if snapshot_first_version.is_some_and(|v| v <= start_version) {
+            Vec::new()
+        } else if self.read_commits_across_checkpoints {
+            // The segment holds every commit after the target's checkpoint, so the missing
+            // commits end at the checkpoint version. A checkpoint exists only for a published
+            // version, so a plain listing finds them all without the catalog's log tail.
+            let end_version = snapshot_first_version.map_or(target_version, |v| v - 1);
+            match self.list_published_commits(engine, start_version, end_version)? {
+                Some(commits) => commits,
+                None => return Ok(None),
+            }
+        } else {
             return Ok(None);
-        }
+        };
 
         // TODO(#2866): derive in-range manifest commits' file changes from the metadata tree
         // instead of falling back.
@@ -179,9 +209,13 @@ impl IncrementalScanBuilder {
         // commits, instead of paying first-byte latency once per commit serially.
         // Newest-first order gives `FileActionDeduplicator` newest-wins semantics across
         // the range.
-        let commit_locations: Vec<FileMeta> = snapshot_commits
+        let commit_locations: Vec<FileMeta> = listed_commits
             .iter()
-            .filter(|c| c.version >= start_version && c.version <= target_version)
+            .chain(
+                snapshot_commits
+                    .iter()
+                    .filter(|c| c.version >= start_version && c.version <= target_version),
+            )
             .rev()
             .map(|c| c.location.clone())
             .collect();
@@ -206,6 +240,29 @@ impl IncrementalScanBuilder {
                 .table_configuration()
                 .dv_normalization_root(),
         }))
+    }
+
+    /// Lists the published commits in `[start_version, end_version]` from `_delta_log/`, or
+    /// returns `None` if any of them is missing.
+    fn list_published_commits(
+        &self,
+        engine: &dyn Engine,
+        start_version: Version,
+        end_version: Version,
+    ) -> Result<Option<Vec<ParsedLogPath>>> {
+        let range = match CommitRange::builder_for(self.target_snapshot.table_root(), start_version)
+            .with_end_version(end_version)
+            .build(engine)
+        {
+            Ok(range) => range,
+            Err(
+                KernelError::StartVersionNotFound { .. }
+                | KernelError::MissingVersion(_)
+                | KernelError::EmptyLog,
+            ) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(Some(range.commit_files()?.collect::<KernelResult<_>>()?))
     }
 
     /// Lowers `self.predicate` into the per-batch skipping strategy applied to live Adds.
