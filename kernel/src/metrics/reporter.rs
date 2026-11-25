@@ -461,6 +461,7 @@ mod tests {
             correlation_id: None,
             outcome: ScanPlanOutcome::Plan,
             duration_ns: 17,
+            num_plan_nodes: 3,
             checkpoint: None,
             metadata_planning: Default::default(),
         };
@@ -470,6 +471,7 @@ mod tests {
             (false, []) => {}
             (true, [MetricEvent::ScanPlanGenerationCompleted(report)]) => {
                 assert_eq!(report.duration_ns, 17);
+                assert_eq!(report.num_plan_nodes, 3);
             }
             _ => panic!("unexpected scan-plan completions: {events:?}"),
         }

@@ -1014,6 +1014,11 @@ fn assert_metadata_output_options(
             );
             assert_eq!(report.commit_end_version, files.last().map(|(_, hi)| *hi));
             assert_eq!(report.commit_total_size_bytes == 0, files.is_empty());
+            assert_eq!(report.total_json_bytes, report.commit_total_size_bytes);
+            assert_eq!(
+                report.total_parquet_bytes == 0,
+                checkpoint_version.is_none()
+            );
             assert_eq!(
                 report.compaction_file_count,
                 files.iter().filter(|(lo, hi)| lo != hi).count() as u64

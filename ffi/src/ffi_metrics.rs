@@ -734,8 +734,8 @@ pub enum MetricEvent {
     ChecksumWriteSuccess(ChecksumWriteSuccess),
     ChecksumWriteFailure(ChecksumWriteFailure),
     LastCheckpointReadCompleted(LastCheckpointReadCompleted),
-    /// Callback-scoped borrowed scan-plan report.
-    ScanPlanGenerationCompleted(*const ScanPlanReport),
+    /// Scan-plan report with callback-scoped borrowed fields.
+    ScanPlanGenerationCompleted(ScanPlanReport),
 }
 
 fn duration_ns(duration: std::time::Duration) -> u64 {

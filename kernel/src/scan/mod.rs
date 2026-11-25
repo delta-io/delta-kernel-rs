@@ -1546,7 +1546,10 @@ impl Scan {
         };
         let result = self.declarative_metadata_scan_plan_inner(engine, &mut report);
         report.outcome = match &result {
-            Ok(Some(_)) => ScanPlanOutcome::Plan,
+            Ok(Some(plan)) => {
+                report.num_plan_nodes = plan.nodes.len() as u64;
+                ScanPlanOutcome::Plan
+            }
             Ok(None) => ScanPlanOutcome::Empty,
             Err(_) => ScanPlanOutcome::Error,
         };

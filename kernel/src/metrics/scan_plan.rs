@@ -101,6 +101,8 @@ pub struct ScanPlanReport {
     pub outcome: ScanPlanOutcome,
     /// Wall-clock planning duration.
     pub duration_ns: u64,
+    /// Nodes in the returned plan, or zero when no plan is returned.
+    pub num_plan_nodes: u64,
     /// Checkpoint used for replay, absent for CRC and commit-only replay.
     pub checkpoint: Option<CheckpointMetrics>,
     /// Metadata planning metrics.
@@ -117,6 +119,7 @@ impl ScanPlanReport {
             correlation_id: None,
             outcome: ScanPlanOutcome::Error,
             duration_ns: 0,
+            num_plan_nodes: 0,
             checkpoint: None,
             metadata_planning: MetadataPlanningReport::default(),
         }
@@ -127,13 +130,17 @@ impl fmt::Display for ScanPlanReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "ScanPlanReport(operation_id={}, outcome={:?}, duration_ns={}, \
+            "ScanPlanReport(operation_id={}, outcome={:?}, duration_ns={}, num_plan_nodes={}, \
+             total_json_bytes={}, total_parquet_bytes={}, \
              replay_base={:?}, base_version={:?}, has_filter={}, read_collations={}, \
              commit_start_version={:?}, commit_end_version={:?}, \
              commit_total_size_bytes={}, compaction_file_count={}",
             self.operation_id,
             self.outcome,
             self.duration_ns,
+            self.num_plan_nodes,
+            self.metadata_planning.total_json_bytes,
+            self.metadata_planning.total_parquet_bytes,
             self.metadata_planning.replay_base,
             self.metadata_planning.base_version,
             self.metadata_planning.has_filter,

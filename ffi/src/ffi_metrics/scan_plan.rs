@@ -31,8 +31,8 @@ pub enum ReplayBase {
     Empty,
 }
 
-/// A scan-plan-generation attempt. The record, checkpoint pointer, strings, and column paths are
-/// borrowed only for the metric callback; copy every retained value before returning.
+/// A scan-plan-generation report. Checkpoint data, strings, and column paths are borrowed only
+/// for the metric callback; copy every retained value before returning.
 #[repr(C)]
 pub struct ScanPlanReport {
     // === Operation ===
@@ -50,6 +50,11 @@ pub struct ScanPlanReport {
     pub partition_timezone: OptionalValue<KernelStringSlice>,
     pub read_collations: bool,
     pub has_filter: bool,
+
+    // === Plan ===
+    pub num_plan_nodes: u64,
+    pub total_json_bytes: u64,
+    pub total_parquet_bytes: u64,
 
     // === Log replay ===
     pub replay_base: OptionalValue<ReplayBase>,
@@ -150,6 +155,9 @@ pub(super) fn with_event<F: FnOnce(MetricEvent)>(event: &kernel::ScanPlanReport,
                 .into(),
             read_collations: metadata.read_collations,
             has_filter: metadata.has_filter,
+            num_plan_nodes: event.num_plan_nodes,
+            total_json_bytes: metadata.total_json_bytes,
+            total_parquet_bytes: metadata.total_parquet_bytes,
             replay_base: metadata
                 .replay_base
                 .map(|base| match base {
@@ -167,7 +175,7 @@ pub(super) fn with_event<F: FnOnce(MetricEvent)>(event: &kernel::ScanPlanReport,
             commit_total_size_bytes: metadata.commit_total_size_bytes,
             compaction_file_count: metadata.compaction_file_count,
         };
-        f(MetricEvent::ScanPlanGenerationCompleted(&record));
+        f(MetricEvent::ScanPlanGenerationCompleted(record));
     }) {
         tracing::warn!(%error, "Failed to convert scan-plan metric checkpoint information");
     }
@@ -220,6 +228,7 @@ mod tests {
                 kernel::ScanPlanOutcome::Plan
             },
             duration_ns: 19,
+            num_plan_nodes: 13,
             checkpoint: with_checkpoint.then_some(kernel::CheckpointMetrics {
                 version: 0,
                 info,
@@ -241,6 +250,8 @@ mod tests {
                 commit_end_version: with_checkpoint.then_some(0),
                 commit_total_size_bytes: 0,
                 compaction_file_count: 0,
+                total_json_bytes: 31,
+                total_parquet_bytes: 47,
             },
         };
         let metadata = &event.metadata_planning;
@@ -251,8 +262,6 @@ mod tests {
             let MetricEvent::ScanPlanGenerationCompleted(record) = ffi else {
                 panic!("expected scan-plan metric");
             };
-            // Safety: the record and all nested storage are borrowed for this callback.
-            let record = unsafe { &*record };
             assert_eq!(record.operation_id.bytes, event.operation_id.as_bytes());
             assert_eq!(
                 unsafe { String::try_from_slice(&record.correlation_id) }.unwrap(),
@@ -267,6 +276,9 @@ mod tests {
                 }
             );
             assert_eq!(record.duration_ns, 19);
+            assert_eq!(record.num_plan_nodes, 13);
+            assert_eq!(record.total_json_bytes, 31);
+            assert_eq!(record.total_parquet_bytes, 47);
             assert_eq!(record.read_collations, failed);
             assert_eq!(record.has_filter, !failed);
             assert_eq!(record.base_version, with_checkpoint.then_some(0).into());

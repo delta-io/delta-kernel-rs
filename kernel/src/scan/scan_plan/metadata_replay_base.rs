@@ -178,6 +178,7 @@ mod tests {
         let config = target.table_configuration().clone();
         let snapshot = Arc::new(Snapshot::new_with_crc(segment, config, crc, false, false)?);
         let scan = snapshot.scan_builder().build()?;
+        let mut num_plan_nodes = 0;
         let plan = assert_scan_plan_metrics(
             || {
                 scan.declarative_metadata_scan_plan(
@@ -185,6 +186,7 @@ mod tests {
                 )
             },
             |event| {
+                num_plan_nodes = event.num_plan_nodes;
                 let report = &event.metadata_planning;
                 assert_eq!(report.replay_base, Some(ReplayBase::Crc));
                 assert_eq!(report.base_version, Some(version));
@@ -196,6 +198,10 @@ mod tests {
                 );
             },
         )?;
+        assert_eq!(
+            num_plan_nodes,
+            plan.as_ref().map_or(0, |plan| plan.nodes.len() as u64)
+        );
         if expected_rows == 0 {
             assert!(plan.is_none());
             return Ok(());
