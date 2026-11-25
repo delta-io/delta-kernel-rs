@@ -33,6 +33,7 @@ use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
 use crate::log_replay::ActionsBatch;
 #[internal_api]
 use crate::log_segment_files::LogSegmentFiles;
+use crate::log_segment_files::{HintedListing, MissingCheckpointPolicy};
 use crate::metrics::{
     SnapshotLoadMetricContext, emit_log_segment_load, emit_log_segment_load_failure,
 };
@@ -508,12 +509,7 @@ impl LogSegment {
     ///
     /// Reports metrics: `LogSegmentLoadSuccess` or `LogSegmentLoadFailure`.
     #[internal_api]
-    #[tracing::instrument(
-        name = "log_segment.for_snapshot",
-        skip_all,
-        fields(enable_call_frame),
-        err
-    )]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn for_snapshot(
         storage: &dyn StorageHandler,
         log_root: Url,
@@ -521,16 +517,41 @@ impl LogSegment {
         time_travel_version: impl Into<Option<Version>>,
         metric_context: SnapshotLoadMetricContext,
     ) -> Result<Self> {
-        let time_travel_version = time_travel_version.into();
+        Self::load_for_snapshot(
+            storage,
+            log_root,
+            log_tail,
+            time_travel_version.into(),
+            metric_context,
+            MissingCheckpointPolicy::Reject,
+        )
+    }
+
+    /// Builds a fresh snapshot segment under the caller's checkpoint recovery policy.
+    #[tracing::instrument(
+        name = "log_segment.for_snapshot",
+        skip_all,
+        fields(enable_call_frame),
+        err
+    )]
+    pub(crate) fn load_for_snapshot(
+        storage: &dyn StorageHandler,
+        log_root: Url,
+        log_tail: Vec<ParsedLogPath>,
+        time_travel_version: Option<Version>,
+        metric_context: SnapshotLoadMetricContext,
+        missing_checkpoint: MissingCheckpointPolicy,
+    ) -> Result<Self> {
         let start = std::time::Instant::now();
         let build = || {
             let checkpoint_hint = LastCheckpointHint::try_read(storage, &log_root)?;
-            Self::for_snapshot_impl(
+            Self::discover_for_snapshot(
                 storage,
                 log_root,
                 log_tail,
                 checkpoint_hint,
                 time_travel_version,
+                missing_checkpoint,
             )
         };
         let log_segment = build()
@@ -551,13 +572,14 @@ impl LogSegment {
             .map(|crc| self.end_version - crc.version)
     }
 
-    // factored out for testing
-    pub(crate) fn for_snapshot_impl(
+    /// Discovers the replay segment using a hint already read from storage.
+    fn discover_for_snapshot(
         storage: &dyn StorageHandler,
         log_root: Url,
         log_tail: Vec<ParsedLogPath>,
         checkpoint_hint: Option<LastCheckpointHint>,
         time_travel_version: Option<Version>,
+        missing_checkpoint: MissingCheckpointPolicy,
     ) -> Result<Self> {
         // The end_version is the time_travel_version, if present
         // TODO: When max catalog version is implemented, we would use that as end_version if
@@ -583,13 +605,19 @@ impl LogSegment {
 
         let listed_files = match (usable_hint, end_version) {
             // Cases 1 and 2
-            (Some(cp), end_version) => LogSegmentFiles::list_with_checkpoint_hint(
+            (Some(cp), end_version) => match LogSegmentFiles::list_with_checkpoint_hint(
                 cp,
                 storage,
                 &log_root,
                 log_tail,
                 end_version,
-            )?,
+                missing_checkpoint,
+            )? {
+                HintedListing::Listed(files) => files,
+                HintedListing::Recovered { files, target } => {
+                    return Self::try_new_for_snapshot(files, log_root, Some(target), None);
+                }
+            },
             // Case 3
             (None, Some(end)) => LogSegmentFiles::list_with_backward_checkpoint_scan(
                 storage, &log_root, log_tail, end,

@@ -4,7 +4,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{ArrayRef, Int32Array};
+use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::committer::{Committer, FileSystemCommitter};
+use delta_kernel::object_store::ObjectStoreExt;
+use delta_kernel::object_store::path::Path;
 use delta_kernel::schema::{DataType, schema, schema_ref};
 use delta_kernel::snapshot::{
     CheckpointWriteResult, ChecksumWriteResult, IncrementalReplay, SnapshotBuilder,
@@ -15,9 +18,10 @@ use rstest::rstest;
 use serde_json::json;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
+use test_utils::table_builder::{LogState, TestTableBuilder};
 use test_utils::{
     TestCatalogCommitter, add_commit, assert_result_error_with_message, engine_store_setup,
-    insert_data_with, test_table_setup_mt,
+    insert_data_with, read_scan, test_table_setup_mt,
 };
 
 /// The newest version of the table built by [`setup_multi_version_table`].
@@ -470,4 +474,53 @@ struct SnapshotLoadProtocolCase {
     reader_features: &'static [&'static str],
     writer_features: &'static [&'static str],
     expected_error: Option<&'static str>,
+}
+
+#[rstest]
+#[case::older_checkpoint(Some(1))]
+#[case::all_commits(None)]
+#[tokio::test(flavor = "multi_thread")]
+async fn recover_pinned_snapshot_after_hinted_checkpoint_disappears(
+    #[case] older_checkpoint: Option<Version>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let table = TestTableBuilder::new()
+        .with_log_state(LogState::with_latest_version(5).maybe_with_checkpoint_at(older_checkpoint))
+        .with_schema(schema_ref! { nullable "id": INTEGER })
+        .with_data(1, 2)
+        .build()?;
+    let engine = Arc::new(table.engine());
+    let pinned = || Snapshot::builder_for(table.table_root()).at_version(4);
+    let before = pinned().build(engine.as_ref())?;
+    let expected = pretty_format_batches(&read_scan(
+        &before.clone().scan_builder().build()?,
+        engine.clone(),
+    )?)?
+    .to_string();
+    let mut expected: Vec<_> = expected.lines().collect();
+    sort_lines!(expected);
+    let hint = Path::from("_delta_log/_last_checkpoint");
+    table
+        .store()
+        .put(&hint, json!({"version": 3, "size": 1}).to_string().into())
+        .await?;
+    if older_checkpoint.is_some() {
+        // Recovery must use the surviving checkpoint when retention has removed commit zero.
+        table
+            .store()
+            .delete(&test_utils::delta_path_for_version(0, "json"))
+            .await?;
+    }
+    assert_result_error_with_message(
+        pinned().build(engine.as_ref()),
+        "Had a _last_checkpoint hint but didn't find any checkpoints",
+    );
+    let recovered = pinned()
+        .recover_missing_checkpoint()
+        .build(engine.as_ref())?;
+    assert_eq!(recovered.version(), before.version());
+    assert_batches_sorted_eq!(
+        expected,
+        &read_scan(&recovered.scan_builder().build()?, engine)?
+    );
+    Ok(())
 }
