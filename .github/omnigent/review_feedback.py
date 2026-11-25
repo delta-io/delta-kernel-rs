@@ -5,8 +5,13 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from collections.abc import Collection
 
-from review_history import is_marked_bot_entry
+from review_history import (
+    DEFAULT_TRUSTED_BOT_LOGINS,
+    is_marked_bot_entry,
+    trusted_review_bot_logins,
+)
 
 
 REVIEW_THREADS_QUERY = """
@@ -43,7 +48,11 @@ CHECK_NAME = "AI Review Comment Resolver"
 MAX_LISTED_FINDINGS = 20
 
 
-def evaluate_feedback(threads: list[dict], minimum_percent: int) -> tuple[bool, str]:
+def evaluate_feedback(
+    threads: list[dict],
+    minimum_percent: int,
+    trusted_bot_logins: Collection[str] = DEFAULT_TRUSTED_BOT_LOGINS,
+) -> tuple[bool, str]:
     """Return the threshold result and a summary with links to outstanding findings."""
     total = 0
     outstanding = []
@@ -53,7 +62,10 @@ def evaluate_feedback(threads: list[dict], minimum_percent: int) -> tuple[bool, 
             continue
         comment = comments[0]
         review = comment["pullRequestReview"]
-        if not is_marked_bot_entry(review) or comment["author"] != review["author"]:
+        if (
+            not is_marked_bot_entry(review, trusted_bot_logins)
+            or comment["author"] != review["author"]
+        ):
             continue
 
         total += 1
@@ -70,7 +82,7 @@ def evaluate_feedback(threads: list[dict], minimum_percent: int) -> tuple[bool, 
             outstanding.append(f"- [Inline finding]({comment['url']}) — {' and '.join(missing)}.")
 
     if total == 0:
-        return True, "No inline AI review findings from `github-actions[bot]`."
+        return True, "No inline AI review findings from the configured review bots."
 
     addressed = total - len(outstanding)
     passed = addressed * 100 >= minimum_percent * total
@@ -81,11 +93,13 @@ def evaluate_feedback(threads: list[dict], minimum_percent: int) -> tuple[bool, 
     if outstanding:
         summary += "\n\n" + "\n".join(outstanding[:MAX_LISTED_FINDINGS])
     if len(outstanding) > MAX_LISTED_FINDINGS:
-        summary += f"\n\n{len(outstanding) - MAX_LISTED_FINDINGS} more findings need attention."
+        summary += (
+            f"\n\nShowing {MAX_LISTED_FINDINGS} of {len(outstanding)} findings that need attention."
+        )
     return passed, summary
 
 
-def main() -> int:
+def main() -> None:
     """Evaluate a PR and publish the result on its head commit."""
     try:
         pr = int(os.environ["PR_NUMBER"])
@@ -114,7 +128,8 @@ def main() -> int:
     pull_requests = [page["data"]["repository"]["pullRequest"] for page in pages]
     head_sha = pull_requests[0]["headRefOid"]
     threads = [thread for pull in pull_requests for thread in pull["reviewThreads"]["nodes"]]
-    passed, summary = evaluate_feedback(threads, minimum_percent)
+    trusted_bot_logins = trusted_review_bot_logins(os.environ.get("OMNIGENT_BOT_LOGIN", ""))
+    passed, summary = evaluate_feedback(threads, minimum_percent, trusted_bot_logins)
 
     with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
         handle.write(summary + "\n")
@@ -136,8 +151,7 @@ def main() -> int:
         text=True,
         check=True,
     )
-    return 0 if passed else 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

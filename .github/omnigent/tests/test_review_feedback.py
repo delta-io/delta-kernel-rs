@@ -1,10 +1,14 @@
+import json
+import os
 import pathlib
 import sys
+import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from review_feedback import evaluate_feedback
+from review_feedback import CHECK_NAME, MAX_LISTED_FINDINGS, evaluate_feedback, main
 from review_publish import BOT_MARKER
 
 
@@ -73,6 +77,94 @@ class TestReviewFeedback(unittest.TestCase):
         passed, summary = evaluate_feedback(threads, 100)
         self.assertTrue(passed)
         self.assertIn("No inline AI review findings", summary)
+
+
+    def test_outstanding_findings_summary_limits_links(self):
+        findings = [thread(i, resolved=False) for i in range(MAX_LISTED_FINDINGS + 1)]
+
+        passed, summary = evaluate_feedback(findings, 100)
+
+        self.assertFalse(passed)
+        self.assertEqual(summary.count("[Inline finding]"), MAX_LISTED_FINDINGS)
+        self.assertIn("resolve the thread and react with 👍, 👎, or 👀", summary)
+        self.assertIn(f"Showing {MAX_LISTED_FINDINGS} of {len(findings)} findings", summary)
+
+
+class TestReviewFeedbackMain(unittest.TestCase):
+    def test_publishes_check_from_all_pages_including_configured_app(self):
+        repo = "delta-io/delta-kernel-rs"
+        app_bot = {"__typename": "Bot", "login": "omnigent-example[bot]"}
+        head_sha = "d" * 40
+        pages = [
+            {
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "headRefOid": head_sha,
+                            "reviewThreads": {"nodes": [finding]},
+                        }
+                    }
+                }
+            }
+            for finding in (
+                thread(1, reactions=[("EYES", 1)]),
+                thread(2, author=app_bot, resolved=False),
+            )
+        ]
+        for minimum, conclusion in (("50", "success"), ("51", "failure")):
+            with (
+                self.subTest(minimum=minimum),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                summary_path = pathlib.Path(directory) / "summary.md"
+                env = {
+                    "PR_NUMBER": "1",
+                    "MIN_ADDRESSED_PERCENT": minimum,
+                    "OMNIGENT_BOT_LOGIN": " Omnigent-Example[bot] ",
+                    "GITHUB_REPOSITORY": repo,
+                    "GITHUB_SERVER_URL": "https://github.com",
+                    "GITHUB_RUN_ID": "123",
+                    "GITHUB_STEP_SUMMARY": str(summary_path),
+                }
+                with (
+                    patch.dict(os.environ, env),
+                    patch("review_feedback.subprocess.check_output") as query,
+                    patch("review_feedback.subprocess.run") as publish,
+                ):
+                    query.return_value = json.dumps(pages).encode()
+                    self.assertIsNone(main())
+
+                query.assert_called_once()
+                for option in ("--paginate", "--slurp", "pr=1"):
+                    self.assertIn(option, query.call_args.args[0])
+                publish.assert_called_once()
+                self.assertIn(f"repos/{repo}/check-runs", publish.call_args.args[0])
+                self.assertTrue(publish.call_args.kwargs["check"])
+                check = json.loads(publish.call_args.kwargs["input"])
+                self.assertEqual(check["name"], CHECK_NAME)
+                self.assertEqual(check["head_sha"], head_sha)
+                self.assertEqual(check["conclusion"], conclusion)
+                self.assertIn("1 of 2 inline AI review findings", check["output"]["summary"])
+                self.assertIn("#discussion_r2", check["output"]["summary"])
+                self.assertEqual(
+                    summary_path.read_text(encoding="utf-8"), check["output"]["summary"] + "\n"
+                )
+
+    def test_invalid_input_stops_before_querying_github(self):
+        for pr, minimum, error in (
+            ("unknown", "100", "positive integer"),
+            ("0", "100", "positive integer"),
+            ("1", "1.5", "integer from 0 to 100"),
+            ("1", "101", "integer from 0 to 100"),
+        ):
+            with (
+                self.subTest(pr=pr, minimum=minimum),
+                patch.dict(os.environ, {"PR_NUMBER": pr, "MIN_ADDRESSED_PERCENT": minimum}),
+                patch("review_feedback.subprocess.check_output") as query,
+            ):
+                with self.assertRaisesRegex(SystemExit, error):
+                    main()
+                query.assert_not_called()
 
 
 if __name__ == "__main__":

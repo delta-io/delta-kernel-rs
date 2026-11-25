@@ -38,6 +38,7 @@ jobs:
       - name: Check inline AI findings
         env:
           GH_TOKEN: ${{ github.token }}
+          OMNIGENT_BOT_LOGIN: ${{ vars.OMNIGENT_BOT_LOGIN }}
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr }}
           MIN_ADDRESSED_PERCENT: ${{ vars.AI_REVIEW_MIN_ADDRESSED_PERCENT || '100' }}
         run: python3 .github/omnigent/review_feedback.py

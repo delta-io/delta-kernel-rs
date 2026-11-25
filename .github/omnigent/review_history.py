@@ -102,6 +102,13 @@ def canonical_finding_body(body: str) -> str:
     return _normalize(_FINDING_PREFIX.sub("", body.strip()))
 
 
+def trusted_review_bot_logins(app_login: str) -> frozenset[str]:
+    """Return the AI review bot logins, including the configured GitHub App."""
+    if app_login := _normalize_bot_login(app_login):
+        return DEFAULT_TRUSTED_BOT_LOGINS | {app_login}
+    return DEFAULT_TRUSTED_BOT_LOGINS
+
+
 def is_marked_bot_entry(
     entry: Any, trusted_bot_logins: Collection[str] = DEFAULT_TRUSTED_BOT_LOGINS
 ) -> bool:

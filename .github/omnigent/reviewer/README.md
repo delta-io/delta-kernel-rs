@@ -229,15 +229,17 @@ Each published inline finding includes feedback instructions: react 👍 for hel
 unhelpful or incorrect, or 👀 for out of scope. The footer is excluded from exact finding
 deduplication.
 
-The [AI Review Comment Resolver](../../workflows/ai-review-comment-resolver.yml) counts a
-`github-actions[bot]` inline AI finding as addressed when its thread is resolved and the
-original comment has at least one of those reactions. Set the repository Actions variable
-`AI_REVIEW_MIN_ADDRESSED_PERCENT` to an integer from 0 to 100. The default is 100%. The check
-passes when the addressed percentage meets the minimum or the PR has no matching findings.
+The [AI Review Comment Resolver](../../workflows/ai-review-comment-resolver.yml) counts inline
+findings from `github-actions[bot]` and the bot configured in `OMNIGENT_BOT_LOGIN`. A finding
+counts as addressed once its thread is resolved and its original comment has one of those
+reactions. Set the repository Actions variable `AI_REVIEW_MIN_ADDRESSED_PERCENT` to an integer
+from 0 to 100. The default is 100%. The PR check passes when the addressed percentage meets
+the minimum or the PR has no matching findings.
 
-The resolver runs on PR updates and after the AI review workflow posts inline findings. To
-refresh the check after resolving threads or adding reactions, run **AI Review Comment
-Resolver** from the Actions tab and enter the PR number.
+The resolver publishes the check when a PR opens or updates and after the AI review workflow
+posts inline findings. To refresh the result after resolving threads or adding reactions, run
+**AI Review Comment Resolver** from the Actions tab and enter the PR number. The workflow job
+reports whether publication succeeded. The PR check reports whether the threshold was met.
 
 ## Tools
 
