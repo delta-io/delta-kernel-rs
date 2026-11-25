@@ -10,6 +10,7 @@ use delta_kernel::schema::{
 use delta_kernel::transaction::{Transaction, UpdateTableOperation};
 use delta_kernel::{KernelError, KernelResult, Snapshot};
 use rstest::rstest;
+use rstest_reuse::apply;
 use serde_json::json;
 use test_utils::{
     add_commit, begin_transaction, begin_transaction_with, create_add_files_metadata, create_table,
@@ -17,7 +18,7 @@ use test_utils::{
 };
 use url::Url;
 
-use crate::common::write_utils::get_scan_files;
+use crate::common::write_utils::{checkpoint_engine, checkpoint_modes, get_scan_files};
 
 const GENERATED_COLUMNS_FEATURE: &[&str] = &["generatedColumns"];
 const EVENT_YEAR: &[(&str, &str)] = &[("event_year", "YEAR(event_time)")];
@@ -113,12 +114,14 @@ fn generated_column_pairs(generated_columns: &[GeneratedColumn]) -> Vec<(&str, &
         .collect()
 }
 
-#[rstest]
+#[apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshot_and_transaction_return_stored_generated_columns_in_schema_order(
+    declarative: bool,
     #[values(false, true)] checkpoint: bool,
 ) -> delta_kernel::Result<()> {
     let (_tmp, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     let table_url = write_table(
         &table_path,
         GENERATED_COLUMNS_FEATURE,
@@ -128,7 +131,7 @@ async fn snapshot_and_transaction_return_stored_generated_columns_in_schema_orde
 
     let mut snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     if checkpoint {
-        snapshot.checkpoint(engine.as_ref(), None)?;
+        snapshot.checkpoint(checkpoint_engine.as_ref(), None)?;
         // A reloaded snapshot reads Metadata from the checkpoint instead of the commit.
         snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     }

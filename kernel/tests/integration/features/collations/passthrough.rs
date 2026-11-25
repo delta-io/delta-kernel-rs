@@ -26,6 +26,7 @@ use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::transaction::create_table::create_table;
 use rstest::rstest;
+use rstest_reuse::apply;
 use serde_json::{Value, json};
 use test_utils::{
     add_commit, assert_result_error_with_message, read_add_infos, read_scan, test_table_setup,
@@ -36,7 +37,9 @@ use super::{
     annotated_field, assert_rows, committer, create_fixture, generated_table, mapped_bounds,
     physical_name, physical_path, rewrite_as_preview_table,
 };
-use crate::common::write_utils::{resolve_json_path, rewrite_commit};
+use crate::common::write_utils::{
+    checkpoint_engine, checkpoint_modes, resolve_json_path, rewrite_commit,
+};
 
 fn assert_annotations(logical: &StructType, physical: &StructType, mapped: bool) {
     for (logical, physical) in logical.fields().zip(physical.fields()) {
@@ -526,9 +529,8 @@ async fn crc_and_time_travel_keep_schema_and_protocol_at_each_version(
 }
 
 /// Preserves hints through append, ALTER, checkpoints and CRCs (RFC: "Collation versions").
-#[rstest]
+#[apply(checkpoint_modes)]
 #[case::v1(CheckpointSpec::V1, false)]
-#[case::v2_inline(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar), true)]
 #[case::v2_sidecars(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
     file_actions_per_sidecar_hint: Some(1),
 }), true)]
@@ -537,6 +539,7 @@ async fn collation_domain_hints_survive_append_alter_checkpoint_and_crc(
     #[case] spec: CheckpointSpec,
     #[case] v2: bool,
     #[values(false, true)] preview: bool,
+    declarative: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp, path, engine) = test_table_setup_mt()?;
     let fixture = generated_table(false, &["name"]);
@@ -583,8 +586,11 @@ async fn collation_domain_hints_survive_append_alter_checkpoint_and_crc(
             Some(configuration.clone())
         );
     }
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     assert_eq!(
-        altered.checkpoint(engine.as_ref(), Some(&spec))?.0,
+        altered
+            .checkpoint(checkpoint_engine.as_ref(), Some(&spec))?
+            .0,
         CheckpointWriteResult::Written
     );
     let checkpointed = Snapshot::builder_for(&path).build(engine.as_ref())?;
@@ -617,6 +623,20 @@ async fn collation_domain_hints_survive_append_alter_checkpoint_and_crc(
         Some(configuration)
     );
     Ok(())
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn collation_domain_hints_survive_inline_checkpoint_and_crc(
+    #[values(false, true)] preview: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    collation_domain_hints_survive_append_alter_checkpoint_and_crc(
+        CheckpointSpec::V2(V2CheckpointConfig::NoSidecar),
+        true,
+        preview,
+        false,
+    )
+    .await
 }
 
 /// Rejects invalid CREATE/ALTER annotations (RFC: "Specifying collations in the table schema").
@@ -750,9 +770,8 @@ async fn snapshot_loading_requires_collation_feature_for_annotated_schema(
 }
 
 /// Preserves sparse, versioned bounds through checkpoints (RFC: "Per-file Statistics").
-#[rstest]
+#[apply(checkpoint_modes)]
 #[case::v1(CheckpointSpec::V1, false)]
-#[case::v2_inline(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar), true)]
 #[case::v2_sidecars(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
     file_actions_per_sidecar_hint: Some(1),
 }), true)]
@@ -762,6 +781,7 @@ async fn checkpoint_repeatedly_preserves_multiple_identifiers_and_sparse_bounds(
     #[case] v2: bool,
     #[values("none", "name", "id")] mapping: &str,
     #[values((true, false), (false, true), (true, true))] stats_mode: (bool, bool),
+    declarative: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp, path, engine) = test_table_setup_mt()?;
     let (write_json, write_struct) = stats_mode;
@@ -802,9 +822,12 @@ async fn checkpoint_repeatedly_preserves_multiple_identifiers_and_sparse_bounds(
         .into_iter()
         .map(|add| (add.path, add.stats.unwrap()))
         .collect();
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     for round in 0..3 {
         assert_eq!(
-            snapshot.checkpoint(engine.as_ref(), Some(&spec))?.0,
+            snapshot
+                .checkpoint(checkpoint_engine.as_ref(), Some(&spec))?
+                .0,
             CheckpointWriteResult::Written
         );
         snapshot = Snapshot::builder_for(&path).build(engine.as_ref())?;
@@ -846,6 +869,22 @@ async fn checkpoint_repeatedly_preserves_multiple_identifiers_and_sparse_bounds(
         }
     }
     Ok(())
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inline_checkpoint_repeatedly_preserves_multiple_identifiers_and_sparse_bounds(
+    #[values("none", "name", "id")] mapping: &str,
+    #[values((true, false), (false, true), (true, true))] stats_mode: (bool, bool),
+) -> Result<(), Box<dyn std::error::Error>> {
+    checkpoint_repeatedly_preserves_multiple_identifiers_and_sparse_bounds(
+        CheckpointSpec::V2(V2CheckpointConfig::NoSidecar),
+        true,
+        mapping,
+        stats_mode,
+        false,
+    )
+    .await
 }
 
 fn remove_null_padding(value: &mut Value) {

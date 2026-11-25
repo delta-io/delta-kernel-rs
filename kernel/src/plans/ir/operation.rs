@@ -51,7 +51,9 @@ pub enum IoOperation {
     /// as [`PlanResult::Bytes`](crate::plans::PlanResult::Bytes) in the same order as the input
     /// slices, with one Bytes buffer per file slice.
     ReadBytes { files: Vec<FileSlice> },
-    /// Write raw bytes to a file at the given URL.
+    /// Atomically write raw bytes to a file at the given URL.
+    ///
+    /// Readers must see either the complete previous contents or the complete new contents.
     ///
     /// Returns [`PlanResult::Unit`](crate::plans::PlanResult::Unit) on success. If `overwrite`
     /// is false and the file already exists, the executor should return

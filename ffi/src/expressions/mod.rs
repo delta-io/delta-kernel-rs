@@ -37,6 +37,8 @@ pub struct SharedPredicate;
 pub struct FfiMapToStructOptions {
     /// Reader timezone for offset-less timestamps, or `None` for UTC.
     pub timestamp_timezone: OptionalValue<KernelStringSlice>,
+    /// Invalid values become null; invalid schemas and timezone configuration still fail.
+    pub null_on_invalid: bool,
 }
 
 impl FfiMapToStructOptions {
@@ -46,6 +48,7 @@ impl FfiMapToStructOptions {
             timestamp_timezone: timestamp_timezone
                 .map(|timezone| kernel_string_slice!(timezone))
                 .into(),
+            null_on_invalid: options.null_on_invalid(),
         }
     }
 
@@ -53,11 +56,11 @@ impl FfiMapToStructOptions {
         let timestamp_timezone = Option::<&KernelStringSlice>::from(&self.timestamp_timezone)
             .map(|timezone| unsafe { timezone.try_to_string() })
             .transpose()?;
-        Ok(
-            timestamp_timezone.map_or_else(MapToStructOptions::default, |timezone| {
+        Ok(timestamp_timezone
+            .map_or_else(MapToStructOptions::default, |timezone| {
                 MapToStructOptions::default().with_timestamp_timezone(timezone)
-            }),
-        )
+            })
+            .with_null_on_invalid(self.null_on_invalid))
     }
 }
 

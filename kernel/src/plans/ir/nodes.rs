@@ -25,7 +25,7 @@ use crate::{FileMeta, KernelError, KernelResult};
 ///
 /// An operator that reshapes its rows (a source, projection, aggregation, or file scan) carries a
 /// caller-declared `schema` field holding its output schema. File writes emit [`FILE_META_SCHEMA`]
-/// followed by any configured statistics; see [`WriteParquet`].
+/// or [`FILES_META_SCHEMA`], followed by any configured statistics; see [`WriteParquet`].
 /// The remaining operators inherit an input's schema; each payload's docs name which input.
 #[derive(Debug, Clone, Display, From)]
 #[strum(serialize_all = "snake_case")]
@@ -53,6 +53,7 @@ pub enum Operator {
     UnionAll(UnionAll),
     WriteJson(WriteJson),
     WriteParquet(WriteParquet),
+    WriteParquetFiles(WriteParquetFiles),
 }
 
 /// File metadata returned by [`WriteJson`] and [`WriteParquet`]: the fully qualified `location`,
@@ -61,6 +62,12 @@ pub static FILE_META_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     not_null "location": STRING,
     not_null "size": LONG,
     not_null "last_modified": LONG,
+};
+
+/// Per-file output of [`WriteParquetFiles`], including the name relative to its base URL.
+pub static FILES_META_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    not_null "file_name": STRING,
+    ..(FILE_META_SCHEMA.fields()),
 };
 
 /// Writes all rows from its inputs to one newline-delimited JSON file at `file_path`.
@@ -82,9 +89,9 @@ pub static FILE_META_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 ///   checkpoints, should never be empty). It is recommended that implementors reject such inputs
 ///   with an error, however kernel does not rely on such behavior and will perform its own
 ///   pre-write validations to ensure this does not happen.
-/// - Behavior can be undefined if a single plan contains multiple writes to the same destination,
-///   because execution order is unspecified and executors may optimize away common table
-///   expressions.
+/// - Kernel will never emit a plan with distinct write nodes targeting the same destination.
+/// - All consumers of a shared write node must reuse its completed result, including after
+///   optimization. Consuming that node again must not repeat the write.
 ///
 /// # Ordering Example
 ///
@@ -212,6 +219,54 @@ impl StatsAgg {
             name: name.into(),
             agg,
         }
+    }
+}
+
+/// Writes input rows to engine-sized Parquet files and returns [`FILES_META_SCHEMA`] per file.
+///
+/// Every input column is written, with schema and metadata as in [`WriteParquet`]. Empty input
+/// produces no files or rows.
+/// Each file is atomically created without overwriting. Engines choose file boundaries and replace
+/// the template's single `{uuid}` with a fresh UUID per file. Shared consumers of this node must
+/// observe the same files; they must not execute the write independently.
+///
+/// Invalid `FILE` values must be rejected before publishing any file. Storage failures may leave
+/// completed files, but must not publish a partially serialized file. Input row order is
+/// unspecified.
+#[derive(Debug, Clone)]
+pub struct WriteParquetFiles {
+    /// Physical schema of all input columns, including file metadata.
+    pub write_schema: SchemaRef,
+    /// Hierarchical directory URL ending in `/`, without a query or fragment.
+    pub base_url: Url,
+    /// File name containing one `{uuid}`; other characters must be ASCII letters, digits, `-`,
+    /// `_`, or `.`, for example `part-{uuid}.parquet`.
+    pub file_name_template: String,
+}
+
+impl WriteParquetFiles {
+    pub(crate) fn validate_destination(&self) -> KernelResult<()> {
+        if self.base_url.cannot_be_a_base()
+            || !self.base_url.path().ends_with('/')
+            || self.base_url.query().is_some()
+            || self.base_url.fragment().is_some()
+        {
+            return Err(KernelError::generic(
+                "WriteParquetFiles base URL must be hierarchical, end in `/`, and have no query or fragment",
+            ));
+        }
+        if self.file_name_template.matches("{uuid}").count() != 1
+            || !self
+                .file_name_template
+                .replace("{uuid}", "")
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        {
+            return Err(KernelError::generic(
+                "WriteParquetFiles requires one {uuid} and only letters, digits, `-`, `_`, or `.`",
+            ));
+        }
+        Ok(())
     }
 }
 
