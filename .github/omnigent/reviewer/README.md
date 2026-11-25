@@ -392,8 +392,9 @@ candidate finding through checking and final selection.
 The orchestrator sends all Blocker and Should Fix candidate findings in one Checker assignment.
 Each Reviewer subagent/ID pair receives a distinct batch ID such as `check1`. The Checker result
 contains a decision for every batch ID. If that candidate set is empty, the orchestrator skips
-the Checker subagent. Nits bypass checking. The Checker result records each batch ID and its `decision` in a `decisions` list. `CONFIRMED` means that the Checker supports the
-claim; it does not establish that a GitHub comment exists.
+the Checker subagent. Nits bypass checking. The Checker result records each batch ID and its
+`decision` in a `decisions` list. `CONFIRMED` means that the Checker supports the claim; it does not establish that a GitHub comment exists. A `CONTESTED` decision is a completed
+decision. Its candidate finding can be dropped or retained only as a nonblocking final finding.
 
 The orchestrator returns a consolidation outcome for every candidate finding, including Nits:
 `retained` keeps it, `downgraded` lowers its severity, `merged` combines it with another concern,

@@ -241,6 +241,11 @@ def build_execution_record(
             reasons.append(
                 f"Candidate finding {key[0]}/{key[1]} contradicts its Checker decision."
             )
+        if checker.get("decision") == "CONTESTED" and final["severity"] == "Blocker":
+            reasons.append(
+                f"Candidate finding {key[0]}/{key[1]} remains a Blocker "
+                "despite its CONTESTED Checker decision."
+            )
         initial_rank = _SEVERITIES[candidate["severity"]]
         final_rank = _SEVERITIES[final["severity"]]
         if state == "downgraded" and final_rank >= initial_rank:
@@ -441,8 +446,6 @@ def _validate_checker_decisions(attempts, candidates, expected_candidates, reaso
     for batch_id, key in candidates_by_batch_id.items():
         decision = checker_decisions.get(batch_id)
         candidates[key]["checker"] = {"batch_id": batch_id, "decision": decision}
-        if decision == "CONTESTED":
-            reasons.append(f"Candidate finding {key[0]}/{key[1]} remains contested.")
 
 
 def _publication_findings(publication, head_sha, reasons):
