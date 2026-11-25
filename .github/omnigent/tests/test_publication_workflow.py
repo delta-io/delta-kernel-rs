@@ -63,6 +63,12 @@ class PublicationWorkflowTest(unittest.TestCase):
                 "diff --git a/file.rs b/file.rs\n--- a/file.rs\n+++ b/file.rs\n"
                 "@@ -1 +1 @@\n-old\n+new\n"
             )
+            (root / "diff_coverage.json").write_text(json.dumps({
+                "base_sha": "b" * 40, "head_sha": "a" * 40, "complete": True,
+                "total_bytes": len(diff), "delivered_bytes": len(diff),
+                "total_files": 1, "full_files": 1, "partial_files": 0, "omitted_files": 0,
+                "files": [{"path": "file.rs", "start": 0, "end": len(diff), "status": "full"}],
+            }))
             for name in ("pr_diff.txt", "github_pr_diff.txt"):
                 (root / name).write_text(diff)
             (root / "trusted_bot_logins.json").write_text('["github-actions"]')
