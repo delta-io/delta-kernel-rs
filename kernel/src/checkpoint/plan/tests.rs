@@ -365,7 +365,7 @@ async fn checkpoint_plan_reconciles_all_groups_and_retains_after_replay(
     // The fixture comparisons above exercise the public factory with real cutoffs.
     let plan = writer
         .metadata_planner(ActionSet::ALL)?
-        .with_checkpoint_shape(writer.snapshot.checkpoint_info(&engine)?)
+        .with_checkpoint_info(writer.snapshot.checkpoint_info(&engine)?)
         .replay()?
         .filter(Predicate::and(
             file_retention_predicate(100),
@@ -584,7 +584,7 @@ async fn checkpoint_uses_declared_metadata_representations(
     stats.synthesize_json = write_json;
     let context = &writer.schema_context;
     let planner = MetadataPlanner::new(snapshot.log_segment(), ActionSet::ALL, false)
-        .with_checkpoint_shape(shape)
+        .with_checkpoint_info(shape)
         .with_stats(stats)
         .with_stats_schemas(
             (write_struct || write_json).then(|| context.stats_schema.clone()),
@@ -803,7 +803,7 @@ fn checkpoint_source_reads_requested_actions(
         std::fs::remove_dir_all(sidecars)?;
     }
     let plan = MetadataPlanner::new(snapshot.log_segment(), actions, false)
-        .with_checkpoint_shape(shape)
+        .with_checkpoint_info(shape)
         .replay()?
         .build()?;
     assert_eq!(json_rows(&execute(&engine, plan)?, true)?, expected);

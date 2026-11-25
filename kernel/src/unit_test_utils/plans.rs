@@ -40,7 +40,6 @@ impl PlanExecutor for IOOnlyPlanExecutor {
     }
 }
 
-
 /// Executes a declarative plan and returns its Arrow batches.
 pub(crate) fn execute_plan(engine: &dyn Engine, plan: Plan) -> KernelResult<Vec<RecordBatch>> {
     engine

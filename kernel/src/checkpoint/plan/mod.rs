@@ -28,7 +28,7 @@ impl CheckpointWriter {
             ));
         }
         self.metadata_planner(ActionSet::ALL)?
-            .with_checkpoint_shape(self.snapshot.checkpoint_info(engine)?)
+            .with_checkpoint_info(self.snapshot.checkpoint_info(engine)?)
             .replay()?
             .filter(Predicate::and(
                 file_retention_predicate(self.deleted_file_retention_timestamp()?),
