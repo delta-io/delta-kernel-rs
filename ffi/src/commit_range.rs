@@ -616,8 +616,7 @@ fn commit_range_commit_files_impl(
 /// Call `engine_visitor` once with the next commit file, returning `true` if a file was yielded
 /// and `false` once the iterator is exhausted. When the range was built with `fail_on_data_loss`
 /// enabled, a missing start version or a gap through the range's end version surfaces as an error
-/// from this call, provided an observed later commit proves the gap. Iteration is fused after the
-/// first error: later calls return `false`.
+/// from this call. Iteration is fused after the first error: later calls return `false`.
 ///
 /// The [`FfiCommitFile`] pointer and the location string it references are valid only until the
 /// visitor returns. The visitor must not retain them.
