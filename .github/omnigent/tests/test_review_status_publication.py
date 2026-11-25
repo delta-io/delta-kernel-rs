@@ -60,7 +60,10 @@ def history_from_github(github):
     return history_evidence(document)
 
 
-def pipeline(github, severity=None, *, head_sha=HEAD, mode="inline", findings=None):
+def pipeline(
+    github, severity=None, *, head_sha=HEAD, mode="inline", findings=None,
+    checker_decision="CONFIRMED",
+):
     history = history_from_github(github)
     coverage = prepare_review_inputs(DIFF.encode(), "Author context.", "f" * 40, head_sha)["coverage"]
     entries = [] if severity is None else [{
@@ -82,7 +85,9 @@ def pipeline(github, severity=None, *, head_sha=HEAD, mode="inline", findings=No
         for i, item in enumerate(candidates, 1) if item["severity"] != "Nit"
     ]
     if batch:
-        events += checker_events(batch)
+        events += checker_events(batch, [
+            {"batch_id": item["batch_id"], "decision": checker_decision} for item in batch
+        ])
     outcomes = [outcome(ARCH, item["id"], final_id=final["id"])
                 for item, final in zip(candidates, publication["findings"])]
     with tempfile.TemporaryDirectory() as directory:
@@ -111,6 +116,21 @@ def publish_status(github, arguments, *, mode="inline"):
 
 
 class ReviewStatusPublicationTest(unittest.TestCase):
+    def test_completed_contested_checker_decision_prevents_a_decisive_advisory_status(self):
+        github = FakeGitHub()
+        arguments = pipeline(github, "Should Fix", checker_decision="CONTESTED")
+
+        self.assertTrue(arguments["completion"]["complete"], arguments["completion"]["reasons"])
+        status = publish_status(github, arguments)
+
+        self.assertEqual(status["status"], "NO VERDICT")
+        self.assertFalse(status["status_requirements_met"])
+        self.assertEqual(status["counts"]["Should Fix"], 1)
+        main = github.issues[0]["body"]
+        self.assertIn("AI Review - NO VERDICT", main)
+        self.assertIn("A candidate finding remains contested.", main)
+        self.assertIn(arguments["publication"]["findings"][0]["url"], main)
+
     def test_three_heads_and_silent_current_blocker_on_both_publication_paths(self):
         for mode in ("inline", "comment"):
             with self.subTest(mode=mode):
