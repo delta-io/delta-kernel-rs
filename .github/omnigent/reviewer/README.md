@@ -62,7 +62,9 @@ advances or is rewritten.
 Scope decisions are logged in the workflow run. If resolution stops, the author should follow the
 neutral check's instructions to refresh the description or synchronize the stack, then retry.
 See [`resolve_review_base`](../review_scope.py) for the boundary selection rules. Published scoped
-reviews identify their reviewed commit range.
+reviews identify their reviewed commit range. The `automerge` workflow removes the stack list from
+a description only when `resolve_review_base` already returns the GitHub base for it, so the
+cleanup cannot widen a later review; see [CONTRIBUTING.md](../../../CONTRIBUTING.md).
 
 Inline publication validates positions against GitHub's PR diff. LEFT-side findings stay in the
 collapsed review when that file's scoped and GitHub diff sections differ. If GitHub rejects an

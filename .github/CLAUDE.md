@@ -81,3 +81,19 @@ verify the pending changelog against every PR since the previous Kernel release.
 `fetch-depth: 0` on that checkout. The regression tests run on every pull request, while live
 verification is restricted to branches whose names start with `release/`; otherwise the window
 between merging a release PR and pushing its tag could block unrelated pull requests.
+
+## `automerge` label controller
+
+`automerge.yml` runs `.github/scripts/automerge.py` on `pull_request_target` label events with a
+write-capable token. It must execute only trusted `main` code: never check out or run the PR head.
+Every decision reads live PR state rather than the event payload, so stale or duplicate deliveries
+reconcile to the same result, and the per-PR concurrency group must keep `cancel-in-progress`
+false so an in-flight mutation is never abandoned.
+
+Keep `stack_description.py` strict. It recognizes one complete generated prefix at offset zero and
+returns a slice boundary; the caller writes `body[end:]` and nothing else. Do not add heuristics
+that search for a heading or terminator farther down, admit prose or unknown rows, normalize
+whitespace or line endings, or rewrite retained content. An unrecognized description is an
+accepted miss, never a failing check. `.github/scripts/tests/fixtures/stack_descriptions.json`
+holds historical descriptions with their expected boundaries; extend it when the grammar changes.
+CONTRIBUTING.md owns the contributor-facing rules.
