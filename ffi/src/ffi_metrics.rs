@@ -298,7 +298,6 @@ impl From<kernel::ProtocolMetadataSource> for ProtocolMetadataSource {
 /// Protocol and metadata actions were read from the log.
 #[repr(C)]
 pub struct ProtocolMetadataLoadSuccess {
-    /// Borrowed opaque table identifier, empty when unavailable.
     pub table_id: KernelStringSlice,
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
@@ -322,7 +321,6 @@ pub struct ProtocolMetadataLoadFailure {
 /// A snapshot was built successfully.
 #[repr(C)]
 pub struct SnapshotBuildSuccess {
-    /// Borrowed opaque table identifier, empty when unavailable.
     pub table_id: KernelStringSlice,
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
@@ -527,7 +525,6 @@ pub struct DomainMetadataLoadSuccess {
     pub from_cache: bool,
     pub num_domains_returned: u64,
     pub duration_ns: u64,
-    /// Borrowed opaque table identifier, empty when unavailable.
     pub table_id: KernelStringSlice,
 }
 
@@ -544,7 +541,6 @@ pub struct SetTransactionLoadSuccess {
 pub struct CrcReadSuccess {
     pub bytes_read: u64,
     pub duration_ns: u64,
-    /// Borrowed opaque table identifier, empty when unavailable.
     pub table_id: KernelStringSlice,
 }
 
