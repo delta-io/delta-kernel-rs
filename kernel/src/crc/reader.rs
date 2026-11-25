@@ -18,7 +18,7 @@ use crate::{Engine, KernelError, KernelResult};
 /// replay.
 ///
 /// Reports metrics: `CrcReadSuccess` or `CrcReadFailure`.
-#[instrument(name = CRC_READ_COMPLETED_SPAN, err(level = "warn"), skip_all, fields(report, enable_call_frame, bytes_read, path = ?crc_path.location.location))]
+#[instrument(name = CRC_READ_COMPLETED_SPAN, err(level = "warn"), skip_all, fields(report, enable_call_frame, bytes_read, table_id, path = ?crc_path.location.location))]
 pub(crate) fn try_read_crc_file(
     engine: &dyn Engine,
     crc_path: &ParsedLogPath,
@@ -30,7 +30,9 @@ pub(crate) fn try_read_crc_file(
         .next()
         .ok_or_else(|| KernelError::generic("CRC file read returned no data"))??;
     tracing::Span::current().record("bytes_read", data.len() as u64);
-    Crc::try_from_json_bytes(&data, crc_path.version)
+    let crc = Crc::try_from_json_bytes(&data, crc_path.version)?;
+    tracing::Span::current().record("table_id", crc.metadata.id());
+    Ok(crc)
 }
 
 /// Read an optional CRC, propagating cancellation and ignoring other read failures.

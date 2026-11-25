@@ -358,7 +358,7 @@ impl<Mode> SnapshotBuilder<Mode> {
     #[instrument(
         name = SNAPSHOT_COMPLETED_SPAN,
         skip_all,
-        fields(path = %self.table_path(), report, enable_call_frame, version = tracing::field::Empty, operation_id = %self.operation_id, is_catalog_managed = self.max_catalog_version.is_some(), correlation_id = self.correlation_id.as_deref().unwrap_or(""), load_type = self.load_type().as_ref()),
+        fields(path = %self.table_path(), report, enable_call_frame, version = tracing::field::Empty, table_id = tracing::field::Empty, operation_id = %self.operation_id, is_catalog_managed = self.max_catalog_version.is_some(), correlation_id = self.correlation_id.as_deref().unwrap_or(""), load_type = self.load_type().as_ref()),
         err
     )]
     pub fn build(self, engine: &dyn Engine) -> Result<SnapshotRef> {
@@ -493,6 +493,7 @@ impl<Mode> SnapshotBuilder<Mode> {
 
         // Post-build validations for catalog-managed tables
         Self::validate_catalog_managed_build_result(&snapshot, version, max_catalog_version)?;
+        tracing::Span::current().record("table_id", snapshot.table_configuration().metadata().id());
         tracing::Span::current().record("version", snapshot.version());
         Ok(snapshot)
     }
@@ -1218,13 +1219,34 @@ pub(super) mod tests {
         create_table(&store, &table_root).await?;
 
         let (reporter, _guard) = measuring_reporter();
-        let _ = SnapshotBuilder::new_for(table_root)
+        let snapshot = SnapshotBuilder::new_for(table_root)
             .fold_with(correlation_id, SnapshotBuilder::with_correlation_id)
             .build(engine.as_ref())?;
 
         // The build event and its snapshot-load child events must all carry the id, since they
         // ride the same SnapshotLoadMetricContext.
         let events = reporter.events();
+        let build = events
+            .iter()
+            .find_map(|e| match e {
+                MetricEvent::SnapshotBuildSuccess(s) => Some(s),
+                _ => None,
+            })
+            .unwrap();
+        let hint = events
+            .iter()
+            .find_map(|e| match e {
+                MetricEvent::LastCheckpointReadCompleted(h) => Some(h),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            build.table_id.as_deref(),
+            Some(snapshot.table_configuration().metadata().id())
+        );
+        assert_eq!(hint.operation_id, build.operation_id);
+        assert_eq!(hint.correlation_id.as_deref(), correlation_id);
+        assert!(hint.log_path.ends_with("/_delta_log/"));
         let id_of = |pick: fn(&MetricEvent) -> Option<&Option<Arc<str>>>| {
             events
                 .iter()

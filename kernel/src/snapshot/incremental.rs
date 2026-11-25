@@ -332,7 +332,16 @@ impl Snapshot {
                     })?
             }
         };
-        emit_protocol_metadata_load(metric_context, resolution.source, pm_start.elapsed());
+        let metadata = resolution
+            .metadata
+            .as_ref()
+            .unwrap_or_else(|| existing_table_config.metadata());
+        emit_protocol_metadata_load(
+            metric_context,
+            resolution.source,
+            metadata.id(),
+            pm_start.elapsed(),
+        );
         debug!(
             source = ?resolution.source,
             base_crc_version = ?base_crc.as_ref().map(|crc| crc.version),

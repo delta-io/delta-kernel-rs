@@ -586,7 +586,7 @@ impl Snapshot {
             (Some(_), None) => return fail(KernelError::MissingProtocol),
             (None, None) => return fail(KernelError::MissingMetadataAndProtocol),
         };
-        emit_protocol_metadata_load(metric_context, source, pm_start.elapsed());
+        emit_protocol_metadata_load(metric_context, source, metadata.id(), pm_start.elapsed());
         debug!(
             ?source,
             base_crc_version = ?base_crc.as_ref().map(|crc| crc.version),
@@ -1194,13 +1194,14 @@ impl Snapshot {
         name = DOMAIN_METADATA_LOADED_SPAN,
         skip_all,
         err,
-        fields(report, from_cache, num_domains_returned)
+        fields(report, from_cache, num_domains_returned, table_id)
     )]
     fn get_domain_metadatas_internal(
         &self,
         engine: &dyn Engine,
         domains: Option<&HashSet<&str>>,
     ) -> KernelResult<DomainMetadataMap> {
+        tracing::Span::current().record("table_id", self.table_configuration().metadata().id());
         fn record_metric(from_cache: bool, num_domains_returned: usize) {
             let span = tracing::Span::current();
             span.record("from_cache", from_cache);
@@ -2832,7 +2833,12 @@ mod tests {
 
         let engine = SyncEngine::new();
         let storage = engine.storage_handler();
-        let cp = LastCheckpointHint::try_read(storage.as_ref(), &url).unwrap();
+        let cp = LastCheckpointHint::try_read(
+            storage.as_ref(),
+            &url,
+            &SnapshotLoadMetricContext::for_test(),
+        )
+        .unwrap();
         assert!(cp.is_none());
     }
 
@@ -2886,8 +2892,12 @@ mod tests {
         let engine = SyncEngine::new_with_store(store);
         let storage = engine.storage_handler();
         let url = Url::parse("memory:///invalid/").expect("valid url");
-        let invalid =
-            LastCheckpointHint::try_read(storage.as_ref(), &url).expect("read last checkpoint");
+        let invalid = LastCheckpointHint::try_read(
+            storage.as_ref(),
+            &url,
+            &SnapshotLoadMetricContext::for_test(),
+        )
+        .expect("read last checkpoint");
         assert!(invalid.is_none())
     }
 
@@ -2921,8 +2931,12 @@ mod tests {
         // valid, invalid and valid with tags.
         for (path_prefix, _, expected_result) in test_cases {
             let url = Url::parse(&format!("memory:///{path_prefix}/")).expect("valid url");
-            let result =
-                LastCheckpointHint::try_read(storage.as_ref(), &url).expect("read last checkpoint");
+            let result = LastCheckpointHint::try_read(
+                storage.as_ref(),
+                &url,
+                &SnapshotLoadMetricContext::for_test(),
+            )
+            .expect("read last checkpoint");
             assert_eq!(result, expected_result);
         }
     }

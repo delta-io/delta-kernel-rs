@@ -185,7 +185,14 @@ fn reader_preserves_metadata_metrics_and_errors(#[values(false, true)] cancelled
                 assert!(e.found);
                 false
             }
-            MetricEvent::DomainMetadataLoadFailure | MetricEvent::SetTransactionLoadFailure => true,
+            MetricEvent::DomainMetadataLoadFailure { table_id } => {
+                assert_eq!(
+                    table_id.as_deref(),
+                    Some(snapshot.table_configuration().metadata().id())
+                );
+                true
+            }
+            MetricEvent::SetTransactionLoadFailure => true,
             _ => continue,
         };
         assert_eq!(failed, cancelled);
