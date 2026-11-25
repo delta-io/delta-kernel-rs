@@ -36,13 +36,14 @@ For each candidate finding:
 
 - The burden of proof is on the candidate finding.
 - Do not add new findings.
-- Return a verdict for every candidate. The previous AI review rule does not let you skip one:
+- Return a Checker decision for every candidate finding. The previous AI review rule does not
+  let you skip one:
   when a candidate repeats a previous finding, say so in its evidence.
 - Do not use the original reviewer's confidence as evidence.
 - If a claim depends on code outside the visible diff, inspect that code with
   the read-only source tools. Mark it `CONTESTED` if the required evidence is
   unavailable or inconclusive.
-- Keep each verdict to 2-5 sentences with concrete evidence.
+- Keep each Checker decision to 2-5 sentences with concrete evidence.
 
 ## Output Format
 
@@ -57,13 +58,15 @@ For each candidate:
 
 ## Batch accounting
 
-The orchestrator's task includes an `AI_REVIEW_CHECK_BATCH` block. Its `batch_id` identifies
-one originating reviewer's candidate; keep that ID even when candidates describe the same
-issue. Return a disposition for every batch ID exactly once. Append this field without a fence:
+Your assignment includes an `AI_REVIEW_CHECK_BATCH` block. Each `batch_id` identifies one
+Reviewer subagent's candidate finding; keep that ID even when candidate findings describe the
+same issue. Return a Checker decision for every batch ID exactly once. Append this field to
+your Checker result without a code fence:
 
-<!-- AI_REVIEW_DISPOSITIONS -->
-{"dispositions":[{"batch_id":"check1","verdict":"CONFIRMED"}]}
-<!-- AI_REVIEW_DISPOSITIONS_END -->
+<!-- AI_REVIEW_CHECKER_DECISIONS -->
+{"decisions":[{"batch_id":"check1","decision":"CONFIRMED"}]}
+<!-- AI_REVIEW_CHECKER_DECISIONS_END -->
 
-Use only `CONFIRMED`, `DISPROVED`, `NITPICK`, or `CONTESTED`. Your prose may explain each verdict;
-the field records which candidates were checked. Do not add candidates or omit repeated ones.
+The `decisions` entries record your Checker decisions in their `decision` fields. Use only
+`CONFIRMED`, `DISPROVED`, `NITPICK`, or `CONTESTED`. Explain each decision in your prose. Do not
+add candidate findings or omit repeated ones.

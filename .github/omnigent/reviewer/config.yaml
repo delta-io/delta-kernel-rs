@@ -64,10 +64,10 @@ guardrails:
         path: review_evidence.observe_review
         arguments:
           path: /tmp/review_observations.jsonl
-          # The workflow binds the actual run, head and roster after scope resolution.
+          # The workflow supplies the run ID, reviewed head SHA and configured Reviewer roles.
           run_id: runtime-validation
           head_sha: '0000000000000000000000000000000000000000'
-          required_roles: []
+          configured_reviewer_roles: []
     # See "How a subagent task message is assembled" in README.md. Keep this hook last because
     # later policies cannot recognize a rewritten dispatch without its tool name.
     append_child_task_body:

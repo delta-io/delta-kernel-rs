@@ -47,7 +47,7 @@ class ReviewEvidenceWorkflowTest(unittest.TestCase):
             self.assertEqual(arguments["run_id"], "123")
             roles = config["tools"]["agents"]
             self.assertEqual(
-                arguments["required_roles"], [r for r in roles if r != "disprove-reviewer"]
+                arguments["configured_reviewer_roles"], [r for r in roles if r != "disprove-reviewer"]
             )
             self.assertEqual((root / "review_observations.jsonl").read_text(), "")
             connection = {
@@ -69,10 +69,10 @@ class ReviewEvidenceWorkflowTest(unittest.TestCase):
             self.assertEqual(collect.returncode, 0, collect.stdout + collect.stderr)
             record = json.loads((root / "review_execution.json").read_text())
             self.assertEqual(record["run_id"], "123")
-            self.assertEqual(record["required_roles"], arguments["required_roles"])
+            self.assertEqual(record["configured_reviewer_roles"], arguments["configured_reviewer_roles"])
             self.assertFalse(record["complete"])
             self.assertTrue(
-                any("no valid task result recorded" in reason for reason in record["reasons"])
+                any("No valid Reviewer result" in reason for reason in record["reasons"])
             )
             summary = (root / "check-summary.txt").read_text()
             self.assertIn("Review execution", summary)
