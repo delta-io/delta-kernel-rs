@@ -35,8 +35,8 @@ use crate::common::read_utils::read_row_tracking_scan;
 #[cfg(feature = "declarative-plans")]
 use crate::common::write_utils::write_log_compaction;
 use crate::common::write_utils::{
-    create_dv_update_transaction, get_scan_files, set_table_properties,
-    write_deletion_vector_to_store,
+    checkpoint_engine, checkpoint_modes, create_dv_update_transaction, get_scan_files,
+    set_table_properties, write_deletion_vector_to_store,
 };
 
 /// Helper function to create a simple table with row tracking enabled.
@@ -1499,8 +1499,11 @@ async fn test_read_row_ids_multiple_commits() -> delta_kernel::Result<()> {
 /// the same background thread (deadlock). `TokioMultiThreadExecutor` uses `block_in_place()`
 /// instead, which requires a multi-threaded runtime to delegate work to other workers.
 /// Writes use the standard `TokioBackgroundExecutor` engine, matching all other tests in this file.
+#[rstest_reuse::apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_read_row_tracking_values_after_checkpoint() -> delta_kernel::Result<()> {
+async fn test_read_row_tracking_values_after_checkpoint(
+    declarative: bool,
+) -> delta_kernel::Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_dir = tempdir().map_err(KernelError::from)?;
     let (schema, table_url, engine, _store) =
@@ -1517,8 +1520,9 @@ async fn test_read_row_tracking_values_after_checkpoint() -> delta_kernel::Resul
     // Checkpoint at version 1. Uses TokioMultiThreadExecutor to avoid the nested block_on
     // deadlock that occurs with TokioBackgroundExecutor during checkpoint's lazy I/O.
     let mt_engine = create_default_engine_mt_executor(&table_url)?;
+    let checkpoint_engine = checkpoint_engine(mt_engine.clone(), None, declarative);
     let snapshot = Snapshot::builder_for(table_url.clone()).build(mt_engine.as_ref())?;
-    snapshot.checkpoint(mt_engine.as_ref(), None)?;
+    snapshot.checkpoint(checkpoint_engine.as_ref(), None)?;
 
     // Fresh snapshot loaded from the checkpoint must return the same row IDs.
     let fresh_snapshot = Snapshot::builder_for(table_url.clone()).build(mt_engine.as_ref())?;

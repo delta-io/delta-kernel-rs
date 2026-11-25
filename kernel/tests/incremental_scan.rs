@@ -13,6 +13,8 @@ use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::DelegatingEngine;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
+#[cfg(feature = "declarative-plans")]
+use delta_kernel::engine::sync::plan::SyncPlanExecutor;
 use delta_kernel::expressions::{Predicate as Pred, PredicateRef, Scalar, expr};
 use delta_kernel::incremental_scan::{
     IncrementalListing, IncrementalListingAgainstBase, IncrementalScanStream,
@@ -2338,10 +2340,22 @@ fn full_scan_surviving_paths(
 // Reconciling a base full scan with the incremental delta reproduces a full scan at the target,
 // even though the base prunes via the checkpoint's `stats_parsed` while the incremental delta
 // prunes via `add.stats` JSON. Guards the stats-parsing divergence the two paths could exhibit.
+#[cfg_attr(feature = "declarative-plans", rstest(declarative => [false, true]))]
+#[cfg_attr(not(feature = "declarative-plans"), rstest(declarative => [false]))]
 #[tokio::test(flavor = "multi_thread")]
-async fn predicate_pushdown_reconciled_with_base_matches_full_scan_across_checkpoint()
--> Result<(), Box<dyn std::error::Error>> {
+async fn predicate_pushdown_reconciled_with_base_matches_full_scan_across_checkpoint(
+    declarative: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = DelegatingEngine::new(engine.clone()).without_plan_executor();
+    #[cfg(feature = "declarative-plans")]
+    let checkpoint_engine = if declarative {
+        checkpoint_engine.with_plan_executor(Arc::new(SyncPlanExecutor::new(None)))
+    } else {
+        checkpoint_engine
+    };
+    #[cfg(not(feature = "declarative-plans"))]
+    let _ = declarative;
     let table_url = Url::from_directory_path(&table_path).map_err(|_| "invalid table path")?;
     let schema = id_schema();
     let mut snapshot =
@@ -2357,7 +2371,7 @@ async fn predicate_pushdown_reconciled_with_base_matches_full_scan_across_checkp
         )
         .await?;
     }
-    let (_, snapshot) = snapshot.checkpoint(engine.as_ref(), None)?;
+    let (_, snapshot) = snapshot.checkpoint(&checkpoint_engine, None)?;
     let base_version = snapshot.version();
 
     // Files added after the checkpoint: id 35, 45. These live only in raw commit JSON.

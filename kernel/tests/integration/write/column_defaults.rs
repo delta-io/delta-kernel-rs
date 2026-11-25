@@ -25,6 +25,7 @@ use delta_kernel::transaction::create_table::create_table as kernel_create_table
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{Engine, KernelError, KernelResult, Snapshot};
 use rstest::rstest;
+use rstest_reuse::apply;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::{
@@ -35,7 +36,9 @@ use test_utils::{
 };
 use url::Url;
 
-use crate::common::write_utils::load_existing_single_file_checkpoint_path;
+use crate::common::write_utils::{
+    checkpoint_engine, checkpoint_modes, load_existing_single_file_checkpoint_path,
+};
 
 async fn setup_unpartitioned_table(
     name: &str,
@@ -842,12 +845,13 @@ async fn test_defaulted_clustering_column_round_trips_with_stats() -> delta_kern
     Ok(())
 }
 
-#[rstest]
+#[apply(checkpoint_modes)]
 #[case::cm_none("none")]
 #[case::cm_name("name")]
 #[case::cm_id("id")]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_column_default_round_trips_with_column_mapping_and_checkpoint(
+    declarative: bool,
     #[case] column_mapping_mode: &str,
 ) -> KernelResult<(), Box<dyn std::error::Error>> {
     let base = schema! {
@@ -857,6 +861,7 @@ async fn test_column_default_round_trips_with_column_mapping_and_checkpoint(
     };
     let schema = schema_with_column_defaults(&base, HashMap::from([("c", "42"), ("p", "7")]))?;
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     let mut table_properties = vec![("delta.checkpoint.writeStatsAsStruct", "true")];
     if column_mapping_mode != "none" {
         table_properties.push(("delta.columnMapping.mode", column_mapping_mode));
@@ -931,7 +936,7 @@ async fn test_column_default_round_trips_with_column_mapping_and_checkpoint(
     );
 
     let checkpoint_version = post_commit_snapshot.version();
-    post_commit_snapshot.checkpoint(engine.as_ref(), None)?;
+    post_commit_snapshot.checkpoint(checkpoint_engine.as_ref(), None)?;
     let checkpoint_path =
         load_existing_single_file_checkpoint_path(&table_path, checkpoint_version);
     let checkpoint_reader =

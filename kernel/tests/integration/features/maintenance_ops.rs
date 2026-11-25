@@ -11,7 +11,6 @@ use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::schema_ref;
 use delta_kernel::snapshot::{CheckpointWriteResult, ChecksumWriteResult};
 use delta_kernel::transaction::create_table::create_table;
-use rstest::rstest;
 use serde_json::json;
 use test_utils::{
     CapturingReporter, add_commit, assert_result_error_with_message,
@@ -19,15 +18,19 @@ use test_utils::{
 };
 use url::Url;
 
-#[rstest]
+use crate::common::write_utils::{checkpoint_engine, checkpoint_modes};
+
+#[rstest_reuse::apply(checkpoint_modes)]
 #[case::v1_checkpoint(false)]
 #[case::v2_checkpoint(true)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_checkpoint_and_checksum_return_updated_snapshots(
     #[case] v2_checkpoint: bool,
+    declarative: bool,
 ) -> delta_kernel::Result<()> {
     // ===== GIVEN =====
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     let schema = schema_ref! { nullable "id": INTEGER };
     let mut builder = create_table(&table_path, schema, "test_engine", true);
     if v2_checkpoint {
@@ -46,7 +49,7 @@ async fn test_checkpoint_and_checksum_return_updated_snapshots(
     assert!(seg.listed.latest_crc_file.is_none());
 
     // ===== WHEN: we checkpoint =====
-    let (_, snapshot_w_ckpt) = snapshot.checkpoint(engine.as_ref(), None)?;
+    let (_, snapshot_w_ckpt) = snapshot.checkpoint(checkpoint_engine.as_ref(), None)?;
     let seg = snapshot_w_ckpt.log_segment();
 
     // ===== THEN =====
@@ -79,12 +82,16 @@ async fn test_checkpoint_and_checksum_return_updated_snapshots(
     Ok(())
 }
 
-#[rstest]
+#[rstest_reuse::apply(checkpoint_modes)]
 #[case::v1_checkpoint(false)]
 #[case::v2_checkpoint(true)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_checkpoint_already_exists(#[case] v2_checkpoint: bool) -> delta_kernel::Result<()> {
+async fn test_checkpoint_already_exists(
+    #[case] v2_checkpoint: bool,
+    declarative: bool,
+) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     let schema = schema_ref! { nullable "id": INTEGER };
     let mut builder = create_table(&table_path, schema, "test_engine", true);
     if v2_checkpoint {
@@ -97,11 +104,11 @@ async fn test_checkpoint_already_exists(#[case] v2_checkpoint: bool) -> delta_ke
     let snapshot = committed.post_commit_snapshot().unwrap();
 
     // First checkpoint writes successfully
-    let (result, snapshot_w_ckpt) = snapshot.checkpoint(engine.as_ref(), None)?;
+    let (result, snapshot_w_ckpt) = snapshot.checkpoint(checkpoint_engine.as_ref(), None)?;
     assert_eq!(result, CheckpointWriteResult::Written);
 
     // Calling checkpoint again on the returned snapshot detects the existing checkpoint
-    let (result, unchanged) = snapshot_w_ckpt.checkpoint(engine.as_ref(), None)?;
+    let (result, unchanged) = snapshot_w_ckpt.checkpoint(checkpoint_engine.as_ref(), None)?;
     assert_eq!(result, CheckpointWriteResult::AlreadyExists);
     assert_eq!(unchanged.version(), snapshot_w_ckpt.version());
 
@@ -111,56 +118,98 @@ async fn test_checkpoint_already_exists(#[case] v2_checkpoint: bool) -> delta_ke
         fresh.log_segment().checkpoint_version,
         Some(snapshot.version())
     );
-    let (result, _) = fresh.checkpoint(engine.as_ref(), None)?;
+    let (result, _) = fresh.checkpoint(checkpoint_engine.as_ref(), None)?;
     assert_eq!(result, CheckpointWriteResult::AlreadyExists);
 
     Ok(())
 }
 
-#[rstest]
-#[case::unknown_writer_only_no_spec(&[], &["futureFeature"], None)]
-#[case::unknown_writer_only_v1(&[], &["futureFeature"], Some(CheckpointSpec::V1))]
+#[rstest_reuse::apply(checkpoint_modes)]
+#[case::unknown_writer_only_no_spec(&[], &["futureFeature"], None, "futureFeature")]
+#[case::unknown_writer_only_v1(&[], &["futureFeature"], Some(CheckpointSpec::V1), "futureFeature")]
 #[case::unknown_writer_only_v2(
     &["v2Checkpoint"],
     &["v2Checkpoint", "futureFeature"],
-    Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar))
+    Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar)),
+    "futureFeature"
 )]
 #[case::unknown_writer_only_v2_sidecar(
     &["v2Checkpoint"],
     &["v2Checkpoint", "futureFeature"],
     Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
         file_actions_per_sidecar_hint: None,
-    }))
+    })),
+    "futureFeature"
 )]
 #[case::mixed_writer_only_no_spec(
     &["deletionVectors"],
     &["deletionVectors", "futureFeature"],
-    None
+    None,
+    "futureFeature"
 )]
 #[case::mixed_writer_only_v1(
     &["deletionVectors"],
     &["deletionVectors", "futureFeature"],
-    Some(CheckpointSpec::V1)
+    Some(CheckpointSpec::V1),
+    "futureFeature"
 )]
 #[case::mixed_writer_only_v2(
     &["deletionVectors", "v2Checkpoint"],
     &["deletionVectors", "v2Checkpoint", "futureFeature"],
-    Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar))
+    Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar)),
+    "futureFeature"
 )]
 #[case::mixed_writer_only_v2_sidecar(
     &["deletionVectors", "v2Checkpoint"],
     &["deletionVectors", "v2Checkpoint", "futureFeature"],
     Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
         file_actions_per_sidecar_hint: None,
-    }))
+    })),
+    "futureFeature"
+)]
+#[cfg_attr(
+    feature = "geo-type-in-dev",
+    case::geospatial_no_spec(&["geospatial"], &["geospatial"], None, "geospatial")
+)]
+#[cfg_attr(
+    feature = "geo-type-in-dev",
+    case::geospatial_v1(
+        &["geospatial"],
+        &["geospatial"],
+        Some(CheckpointSpec::V1),
+        "geospatial"
+    )
+)]
+#[cfg_attr(
+    feature = "geo-type-in-dev",
+    case::geospatial_v2(
+        &["geospatial", "v2Checkpoint"],
+        &["geospatial", "v2Checkpoint"],
+        Some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar)),
+        "geospatial"
+    )
+)]
+#[cfg_attr(
+    feature = "geo-type-in-dev",
+    case::geospatial_v2_sidecar(
+        &["geospatial", "v2Checkpoint"],
+        &["geospatial", "v2Checkpoint"],
+        Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+            file_actions_per_sidecar_hint: None,
+        })),
+        "geospatial"
+    )
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn checkpoint_crc_writes_reject_unsupported_table_features(
     #[case] reader_features: &[&str],
     #[case] writer_features: &[&str],
     #[case] checkpoint_spec: Option<CheckpointSpec>,
+    #[case] expected_feature: &str,
+    declarative: bool,
 ) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     let table_url = Url::from_directory_path(&table_path).unwrap();
     let store = LocalFileSystem::new();
     let schema_string = json!({
@@ -201,15 +250,15 @@ async fn checkpoint_crc_writes_reject_unsupported_table_features(
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     let checkpoint_result = snapshot
-        .checkpoint(engine.as_ref(), checkpoint_spec.as_ref())
+        .checkpoint(checkpoint_engine.as_ref(), checkpoint_spec.as_ref())
         .map(|_| ());
-    assert_result_error_with_message(checkpoint_result, "futureFeature");
+    assert_result_error_with_message(checkpoint_result, expected_feature);
 
     let initial_event_count = reporter.events().len();
     let start = Instant::now();
     let checksum_result = snapshot.write_checksum(engine.as_ref()).map(|_| ());
     let elapsed = start.elapsed();
-    assert_result_error_with_message(checksum_result, "futureFeature");
+    assert_result_error_with_message(checksum_result, expected_feature);
 
     let events: Vec<_> = reporter
         .events()

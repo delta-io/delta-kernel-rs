@@ -31,6 +31,7 @@ use delta_kernel::transaction::create_table::{CreateTableTransaction, create_tab
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{Engine, ReferencedFilePath, resolve_file_uri};
 use rstest::rstest;
+use rstest_reuse::apply;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::{
@@ -39,7 +40,7 @@ use test_utils::{
 };
 use url::Url;
 
-use crate::common::write_utils::read_parquet_root_schema;
+use crate::common::write_utils::{checkpoint_engine, checkpoint_modes, read_parquet_root_schema};
 
 /// The `(uri, offset, size, inline)` fields of a non-null `file` value.
 type Value<'a> = (Option<&'a str>, Option<i64>, Option<i64>, Option<&'a [u8]>);
@@ -688,6 +689,7 @@ fn scan_file_count(
 async fn write_file_skipping_table(
     properties: &[(&str, &str)],
     checkpoint: Option<CheckpointSpec>,
+    declarative: bool,
 ) -> Result<
     (
         tempfile::TempDir,
@@ -722,7 +724,8 @@ async fn write_file_skipping_table(
     let mut snapshot =
         write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
     if let Some(spec) = checkpoint {
-        snapshot.checkpoint(engine.as_ref(), Some(&spec))?;
+        let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
+        snapshot.checkpoint(checkpoint_engine.as_ref(), Some(&spec))?;
         snapshot = Snapshot::builder_for(snapshot.table_root().clone()).build(engine.as_ref())?;
     }
     Ok((tmp_dir, engine, snapshot))
@@ -730,9 +733,10 @@ async fn write_file_skipping_table(
 
 /// A predicate on a `file` sub-field also skips data files in an incremental scan, a parallel
 /// scan, and a Change Data Feed scan. Only the second data file has a file larger than 100.
-#[rstest]
+#[apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_predicate_on_file_sub_field_skips_files_in_other_scans(
+    declarative: bool,
     #[values("incremental", "parallel", "change_data_feed")] scan: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // An incremental scan and a Change Data Feed scan read commits. A parallel scan reads file
@@ -746,7 +750,8 @@ async fn test_predicate_on_file_sub_field_skips_files_in_other_scans(
         ),
         _ => (&[("delta.enableChangeDataFeed", "true")][..], None),
     };
-    let (_tmp_dir, engine, snapshot) = write_file_skipping_table(properties, checkpoint).await?;
+    let (_tmp_dir, engine, snapshot) =
+        write_file_skipping_table(properties, checkpoint, declarative).await?;
     let predicate = || Arc::new(Pred::from_expr(expr!(col("c.size") > 100i64)));
     let kept = match scan {
         "incremental" => {
@@ -815,7 +820,7 @@ async fn test_predicate_on_file_sub_field_skips_files_in_other_scans(
 ///
 /// (Predicates resolve only leaf columns, so a predicate on the whole `file` column, like one on a
 /// whole struct, is rejected when the scan is built.)
-#[rstest]
+#[apply(checkpoint_modes)]
 #[case::uri_eq(Pred::from_expr(expr!(col("c.uri") == "s3://bucket/b.png")), 1)]
 #[case::uri_missing(Pred::from_expr(expr!(col("c.uri") == "s3://bucket/missing.png")), 0)]
 #[case::size_gt(Pred::from_expr(expr!(col("c.size") > 100i64)), 1)]
@@ -830,6 +835,7 @@ async fn test_predicate_on_file_sub_field_skips_files_in_other_scans(
 #[case::checksum_eq(Pred::from_expr(expr!(col("c.checksum") == "MD5:x")), 2)]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_predicate_on_file_sub_field_skips_files(
+    declarative: bool,
     #[case] predicate: Pred,
     #[case] expected: usize,
     #[values("none", "id", "name")] cm_mode: &str,
@@ -842,7 +848,8 @@ async fn test_predicate_on_file_sub_field_skips_files(
         ("delta.checkpoint.writeStatsAsJson", "false"),
     ];
     let checkpoint = checkpoint.then_some(CheckpointSpec::V1);
-    let (_tmp_dir, engine, snapshot) = write_file_skipping_table(&properties, checkpoint).await?;
+    let (_tmp_dir, engine, snapshot) =
+        write_file_skipping_table(&properties, checkpoint, declarative).await?;
     let files = scan_file_count(&snapshot, engine.as_ref(), predicate.clone())?;
     assert_eq!(files, expected, "{predicate:?}");
     Ok(())
