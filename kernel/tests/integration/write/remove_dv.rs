@@ -1057,8 +1057,11 @@ async fn test_remove_scanned_file_sets_extended_metadata(
     Ok(())
 }
 
+#[rstest]
 #[tokio::test]
-async fn test_update_deletion_vectors_adds_expected_entries() -> delta_kernel::Result<()> {
+async fn test_update_deletion_vectors_adds_expected_entries(
+    #[values(false, true)] data_change: bool,
+) -> delta_kernel::Result<()> {
     // This test verifies that deletion vector updates write proper Remove and Add actions
     // to the transaction log.
     //
@@ -1081,7 +1084,7 @@ async fn test_update_deletion_vectors_adds_expected_entries() -> delta_kernel::R
     // - Remove action has the OLD DV descriptor with all 5 fields
     // - Add action has the NEW DV descriptor with all 5 fields
     // - All file metadata is preserved (size, stats, tags, partitionValues)
-    // - dataChange is properly set to true
+    // - dataChange comes from the transaction, not from the scanned add's stored value
     // - deletionTimestamp matches commit timestamp
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -1090,7 +1093,7 @@ async fn test_update_deletion_vectors_adds_expected_entries() -> delta_kernel::R
     // Create transaction with DV update mode enabled
     let mut txn = snapshot
         .clone()
-        .update_table(UpdateTableOperation::Update, "test engine", true)
+        .update_table(UpdateTableOperation::Update, "test engine", data_change)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
     // Build scan and collect all scan metadata
@@ -1208,7 +1211,7 @@ async fn test_update_deletion_vectors_adds_expected_entries() -> delta_kernel::R
                 Some(file_path),
                 "Remove path should match"
             );
-            assert_eq!(remove["dataChange"].as_bool(), Some(true));
+            assert_eq!(remove["dataChange"].as_bool(), Some(data_change));
             assert_eq!(
                 remove["deletionTimestamp"].as_i64(),
                 Some(commit_timestamp),
@@ -1271,7 +1274,7 @@ async fn test_update_deletion_vectors_adds_expected_entries() -> delta_kernel::R
                 Some(file_path),
                 "Add path should match"
             );
-            assert_eq!(add["dataChange"].as_bool(), Some(true));
+            assert_eq!(add["dataChange"].as_bool(), Some(data_change));
 
             // Verify NEW deletion vector in add action
             let new_dv = add["deletionVector"]

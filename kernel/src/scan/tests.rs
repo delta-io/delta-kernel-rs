@@ -1,16 +1,22 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use ::test_utils::table_builder::{DataLayoutConfig, LogState, TableConfig, TestTableBuilder};
-use ::test_utils::{assert_result_error_with_message, get_column, load_test_data};
+use ::test_utils::{
+    METADATA, add_commit, assert_result_error_with_message, delta_path_for_version, get_column,
+    load_test_data, record_batch_to_bytes,
+};
 use bytes::Bytes;
 use rstest::rstest;
 use url::Url;
 
 use super::*;
-use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, STATS_PARSED};
-use crate::arrow::array::{Array, BooleanArray, Int64Array, StringArray, StructArray};
+use crate::actions::{
+    MAX_VALUES, METADATA_NAME, MIN_VALUES, NULL_COUNT, NUM_RECORDS, PROTOCOL_NAME, STATS_PARSED,
+};
+use crate::arrow::array::{Array, AsArray, BooleanArray, Int64Array, StringArray, StructArray};
 use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema as ArrowSchema};
 use crate::arrow::record_batch::RecordBatch;
@@ -18,11 +24,13 @@ use crate::arrow::util::display::array_value_to_string;
 use crate::committer::FileSystemCommitter;
 use crate::engine::DelegatingEngine;
 use crate::engine::arrow_data::ArrowEngineData;
+use crate::engine::arrow_utils::parse_json_impl;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{
     Expression as Expr, Predicate as Pred, Scalar, col, column_name, column_pred, expr, lit,
 };
+use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
@@ -717,6 +725,115 @@ fn test_scan_metadata_from_same_version() {
         .unwrap();
 
     assert_eq!(new_files.len(), 1);
+}
+
+fn add_with_data_change(path: &str, data_change: bool) -> String {
+    format!(
+        r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":1,"modificationTime":1,"dataChange":{data_change}}}}}"#
+    )
+}
+
+/// Maps each selected scan file path to its `fileConstantValues.dataChange` value.
+fn scan_files_data_change(scan_metadata: Vec<ScanMetadata>) -> HashMap<String, bool> {
+    let mut data_change_by_path = HashMap::new();
+    for scan_files in scan_metadata.into_iter().map(selected_scan_files) {
+        let batch = RecordBatch::from(ArrowEngineData::try_from_engine_data(scan_files).unwrap());
+        let paths = batch.column_by_name("path").unwrap().as_string::<i32>();
+        let data_change = batch
+            .column_by_name("fileConstantValues")
+            .unwrap()
+            .as_struct()
+            .column_by_name("dataChange")
+            .unwrap()
+            .as_boolean();
+        for row in 0..batch.num_rows() {
+            assert!(data_change.is_valid(row), "null dataChange at row {row}");
+            data_change_by_path.insert(paths.value(row).to_string(), data_change.value(row));
+        }
+    }
+    data_change_by_path
+}
+
+/// Scan rows carry each live add's stored `dataChange`, whether it is replayed from a commit, a
+/// checkpoint, or cached scan metadata passed to `scan_metadata_from`.
+#[rstest]
+fn scan_metadata_preserves_stored_add_data_change(
+    #[values(false, true)] with_checkpoint: bool,
+    #[values(false, true)] from_cached_metadata: bool,
+) {
+    let table_root = "memory:///";
+    let store = Arc::new(InMemory::new());
+    let engine = SyncEngine::new_with_store(store.clone());
+    let version_0: Vec<String> = METADATA
+        .lines()
+        .map(String::from)
+        .chain([
+            add_with_data_change("v0_true.parquet", true),
+            add_with_data_change("v0_false.parquet", false),
+        ])
+        .collect();
+    futures::executor::block_on(async {
+        add_commit(table_root, store.as_ref(), 0, version_0.join("\n")).await?;
+        add_commit(
+            table_root,
+            store.as_ref(),
+            1,
+            add_with_data_change("v1_false.parquet", false),
+        )
+        .await
+    })
+    .unwrap();
+    if with_checkpoint {
+        let schema = crate::actions::get_all_actions_schema()
+            .project(&[PROTOCOL_NAME, METADATA_NAME, ADD_NAME])
+            .unwrap();
+        let checkpoint = parse_json_impl(&StringArray::from(version_0), schema).unwrap();
+        futures::executor::block_on(async {
+            store
+                .put(
+                    &delta_path_for_version(0, "checkpoint.parquet"),
+                    record_batch_to_bytes(&checkpoint).into(),
+                )
+                .await?;
+            // Without the commit, version 0 can only be replayed from the checkpoint.
+            store.delete(&delta_path_for_version(0, "json")).await
+        })
+        .unwrap();
+    }
+
+    let scan = Snapshot::builder_for(table_root)
+        .build(&engine)
+        .unwrap()
+        .scan_builder()
+        .build()
+        .unwrap();
+    let scan_metadata: Vec<_> = if from_cached_metadata {
+        let cached: Vec<_> = Snapshot::builder_for(table_root)
+            .at_version(0)
+            .build(&engine)
+            .unwrap()
+            .scan_builder()
+            .build()
+            .unwrap()
+            .scan_metadata(&engine)
+            .unwrap()
+            .map_ok(selected_scan_files)
+            .try_collect()
+            .unwrap();
+        scan.scan_metadata_from(&engine, 0, cached, None)
+            .unwrap()
+            .try_collect()
+            .unwrap()
+    } else {
+        scan.scan_metadata(&engine).unwrap().try_collect().unwrap()
+    };
+
+    let expected = HashMap::from([
+        ("v0_true.parquet".to_string(), true),
+        ("v0_false.parquet".to_string(), false),
+        ("v1_false.parquet".to_string(), false),
+    ]);
+    assert_eq!(scan_files_data_change(scan_metadata), expected);
 }
 
 /// `scan_metadata_from` derives `partitionValues_parsed` from the string map, both for cached

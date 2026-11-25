@@ -844,7 +844,6 @@ pub(crate) static PARTITION_VALUES_NAME: &str = "partitionValues";
 pub(crate) static SIZE_NAME: &str = "size";
 #[cfg(feature = "adaptive-metadata-in-dev")]
 pub(crate) static MODIFICATION_TIME_NAME: &str = "modificationTime";
-#[cfg(feature = "adaptive-metadata-in-dev")]
 pub(crate) static DATA_CHANGE_NAME: &str = "dataChange";
 #[cfg(feature = "adaptive-metadata-in-dev")]
 pub(crate) static DELETION_VECTOR_NAME: &str = "deletionVector";
@@ -870,6 +869,7 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
         nullable DEFAULT_ROW_COMMIT_VERSION_NAME: LONG,
         nullable TAGS_NAME: { STRING => nullable STRING },
         nullable CLUSTERING_PROVIDER_NAME: STRING,
+        nullable DATA_CHANGE_NAME: BOOLEAN,
     },
 };
 
@@ -1000,6 +1000,7 @@ fn get_add_transform_expr(
             column_expr_ref!("add.defaultRowCommitVersion"),
             column_expr_ref!("add.tags"),
             column_expr_ref!("add.clusteringProvider"),
+            column_expr_ref!("add.dataChange"),
         ])),
     ];
 
@@ -1045,6 +1046,7 @@ pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
                 column_expr_ref!("fileConstantValues.partitionValues"),
                 column_expr_ref!("size"),
                 column_expr_ref!("modificationTime"),
+                column_expr_ref!("fileConstantValues.dataChange"),
                 column_expr_ref!("stats"),
                 column_expr_ref!("fileConstantValues.tags"),
                 column_expr_ref!("deletionVector"),

@@ -196,7 +196,7 @@ impl<T> FilteredRowVisitor for ScanFileVisitor<'_, T> {
         rows: RowIndexIterator<'_>,
     ) -> KernelResult<()> {
         require!(
-            getters.len() == 14,
+            getters.len() == 15,
             KernelError::InternalError(format!(
                 "Wrong number of ScanFileVisitor getters: {}",
                 getters.len()

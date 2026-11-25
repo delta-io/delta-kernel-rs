@@ -914,6 +914,7 @@ static RESTORED_ADD_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
         not_null "partitionValues": { STRING => nullable STRING },
         not_null "size": LONG,
         nullable "modificationTime": LONG,
+        nullable "dataChange": BOOLEAN,
         nullable "stats": STRING,
         nullable "tags": { STRING => nullable STRING },
         nullable "deletionVector": (DeletionVectorDescriptor::to_schema()),
@@ -1928,9 +1929,15 @@ impl Scan {
 ///      baseRowId: long,
 ///      defaultRowCommitVersion: long,
 ///      clusteringProvider: string,
+///      dataChange: boolean,
 ///    }
 /// }
 /// ```
+///
+/// `fileConstantValues.dataChange` is the `dataChange` stored on the add action that the row was
+/// replayed from. Checkpoint writers may rewrite that value, so it is not a stable per-file
+/// property. Kernel write paths that consume scan rows, such as `remove_files` and
+/// deletion-vector updates, ignore it and use the transaction's `data_change` instead.
 pub fn scan_row_schema() -> SchemaRef {
     log_replay::SCAN_ROW_SCHEMA.clone()
 }

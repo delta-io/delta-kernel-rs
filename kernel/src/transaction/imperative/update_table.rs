@@ -327,9 +327,7 @@ fn nullable_restored_add_schema() -> &'static SchemaRef {
 static NULLABLE_ADD_LOG_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| schema_with_all_fields_nullable(&LOG_ADD_SCHEMA).into());
 
-/// Returns the schema for nullable restored add actions with dataChange field.
-/// This schema extends the nullable restored add schema with a dataChange boolean field
-/// that indicates whether the add action represents a logical data change.
+/// Returns the nullable `LOG_ADD_SCHEMA` used for the add actions written by DV updates.
 fn nullable_add_log_schema() -> &'static SchemaRef {
     &NULLABLE_ADD_LOG_SCHEMA
 }
@@ -423,8 +421,9 @@ impl<STATE> Transaction<STATE, Imperative> {
             nullable_restored_add_schema().clone().into(),
         )?;
         #[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_mut))]
+        // The written add takes the transaction's `data_change`, not the scan row's stored value.
         let mut add_patch = ExpressionStructPatchBuilder::new_nested(["add"])
-            .insert_after("modificationTime", lit(self.data_change));
+            .replace("dataChange", lit(self.data_change));
         // Kernel does not populate adaptive-metadata-tree back references on writes, so emit a null
         // to keep the produced struct aligned with the `backReference` field of LOG_ADD_SCHEMA.
         #[cfg(feature = "adaptive-metadata-in-dev")]
