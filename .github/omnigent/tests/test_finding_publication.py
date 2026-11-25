@@ -462,6 +462,35 @@ class FindingPublicationTest(unittest.TestCase):
                 self.assertIn("## Overall assessment\n\nAssessment.", report)
                 self.assertIn(f"### {heading}\n\nA retained claim.", report)
 
+    def test_cut_diff_shows_file_totals_and_keeps_missing_paths_in_checks(self):
+        coverage = {
+            "base_sha": "b" * 40, "head_sha": HEAD_SHA,
+            "total_bytes": 120_000, "delivered_bytes": 100_000, "complete": False,
+            "total_files": 3, "full_files": 1, "partial_files": 1, "omitted_files": 1,
+            "files": [
+                {"path": "full.rs", "status": "full"},
+                {"path": "partial.rs", "status": "partial"},
+                {"path": "missing.rs", "status": "omitted"},
+            ],
+        }
+        github = FakeGitHub()
+        record = publish(github, [finding()], coverage=coverage)
+        self.assertTrue(record["complete"])
+        main = github.issues[0]["body"]
+        self.assertIn("1 of 3 files fully delivered; 1 partial and 1 omitted", main)
+        self.assertNotIn("Full Coverage", main)
+        self.assertNotIn("Partial Coverage", main)
+        self.assertNotIn("missing.rs", main)
+        check = publication_check("Context.", record)
+        self.assertIn("100000 of 120000", check)
+        self.assertIn("partial.rs", check)
+        self.assertIn("missing.rs", check)
+        self.assertIn(HEAD_SHA, check)
+        coverage.update(complete=True)
+        github = FakeGitHub()
+        publish(github, [], coverage=coverage)
+        self.assertNotIn("Review input truncated", github.issues[0]["body"])
+
     def test_legacy_unknown_severity_split_does_not_fabricate_zeroes(self):
         body = format_review_summary(
             overview="Legacy review.", head_sha=HEAD_SHA, findings=[], run_url=RUN_URL,

@@ -20,7 +20,9 @@ from typing import Any
 from inline_review import diff_positions, diff_sections
 from markdown_utils import markdown_lines
 from review_history import canonical_finding_body
-from review_publish import BOT_MARKER, finding_label, format_finding, format_review_summary
+from review_publish import (
+    BOT_MARKER, finding_label, format_diff_coverage, format_finding, format_review_summary,
+)
 
 _ID = re.compile(r"\[?(Blocker|Should\s*Fix|Nit)\s*([1-9][0-9]*)\]?", re.I)
 _HEADING = re.compile(r"^#{2,4}\s+(\[?(?:Blocker|Should\s*Fix|Nit)\s*[1-9][0-9]*\]?)(.*)$", re.I)
@@ -190,6 +192,7 @@ def publish_findings(
     *, github: Any, repository: str, pr_number: int, head_sha: str, run_url: str,
     review: str, structured: Any, github_pr_patch: str, pr_change_patch: str | None,
     trusted_bot_logins: list[str], mode: str = "inline", placement: str = "inline-or-conversation",
+    coverage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Post or reuse finding comments and update the main AI review comment for one commit.
 
@@ -208,7 +211,7 @@ def publish_findings(
     findings, errors = collect_findings(review, structured)
     record: dict[str, Any] = {
         "head_sha": head_sha, "run_url": run_url, "mode": mode, "findings": findings,
-        "errors": errors, "complete": False, "main_url": None,
+        "errors": errors, "complete": False, "main_url": None, "coverage": coverage,
     }
     if mode in {"summary", "artifact"}:
         for finding in findings:
@@ -328,7 +331,7 @@ def publish_findings(
     summary = format_review_summary(
         overview=review_overview(review), head_sha=head_sha, findings=findings,
         run_url=run_url, errors=errors, counts_available=not errors,
-        checks_url=f"https://github.com/{repository}/pull/{pr_number}/checks",
+        checks_url=f"https://github.com/{repository}/pull/{pr_number}/checks", coverage=coverage,
     )
     final_body = summary.replace(BOT_MARKER, f"{BOT_MARKER}\n{main_marker}", 1)
     try:
@@ -340,8 +343,11 @@ def publish_findings(
 
 
 def publication_check(review: str, record: dict[str, Any]) -> str:
-    """Build the AI Review Summary Check Run report from all final findings."""
-    return complete_review(review, record["findings"]) + "\n"
+    """Build the AI Review Summary Check Run report from final findings and patch coverage."""
+    parts = [complete_review(review, record["findings"])]
+    if record.get("coverage") is not None:
+        parts.append(format_diff_coverage(record["coverage"]))
+    return "\n\n".join(parts) + "\n"
 
 
 def _identity(value: Any) -> tuple[str, str]:
@@ -422,6 +428,7 @@ def main() -> None:
     ):
         parser.add_argument(f"--{name}", type=Path, required=True)
     parser.add_argument("--pr-change-patch", type=Path)
+    parser.add_argument("--coverage", type=Path)
     for name in ("head-sha", "run-url", "repository", "mode"):
         parser.add_argument(f"--{name}", required=True)
     parser.add_argument("--pr-number", type=int, required=True)
@@ -442,6 +449,7 @@ def main() -> None:
         ),
         trusted_bot_logins=json.loads(args.trusted_bot_logins.read_text()),
         mode=args.mode, placement=args.placement,
+        coverage=json.loads(args.coverage.read_text()) if args.coverage else None,
     )
     args.output.write_text(json.dumps(record, indent=2) + "\n")
     for error in record["errors"]:

@@ -28,6 +28,7 @@ async: true
 cancellable: true
 timers: true
 
+# The workflow installs list_changed_paths in tools/python for local tool discovery.
 tools:
   # Reviewer sub-agents -- see agents/<name>/config.yaml. All are read-only
   # reviewers pointed at the same gateway as the orchestrator.

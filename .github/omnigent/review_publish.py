@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections import Counter
+from html import escape
 from typing import Any
 
 from markdown_utils import markdown_lines
@@ -146,12 +148,21 @@ def format_review_summary(
     errors: list[str] | None = None,
     counts_available: bool = True,
     checks_url: str | None = None,
+    coverage: dict[str, Any] | None = None,
 ) -> str:
     """Build the main AI review Conversation comment from findings with confirmed comment URLs."""
     confirmed = [finding for finding in findings if finding.get("url")]
     counts = Counter(finding["severity"] for finding in confirmed)
     headline = f"**{_finding_counts(counts)}**" if counts_available else "Finding counts unavailable."
     parts = [BOT_MARKER, f"## {AI_REVIEW_TITLE}", headline]
+    if coverage is not None and not coverage.get("complete"):
+        parts.append(
+            f"Review input truncated: {coverage.get('full_files', 0)} of "
+            f"{coverage.get('total_files', 0)} files fully delivered; "
+            f"{coverage.get('partial_files', 0)} partial and "
+            f"{coverage.get('omitted_files', 0)} omitted. "
+            f"[Diff details in Checks]({checks_url or run_url})."
+        )
     if errors:
         parts.append("Publication incomplete: " + " ".join(dict.fromkeys(errors)))
     parts.append(
@@ -179,6 +190,22 @@ def format_review_summary(
     parts.append(
         f"<sub>Reviewed `{head_sha[:8]}` · [Full AI review → Checks]({checks_url})"
         f" · [Workflow run]({run_url})</sub>"
+    )
+    return "\n\n".join(parts)
+
+
+def format_diff_coverage(coverage: dict[str, Any]) -> str:
+    """Build Check Run text listing diff bytes and files missing from child tasks."""
+    parts = [
+        "## Diff coverage",
+        f"Reviewed range: `{coverage['base_sha']}...{coverage['head_sha']}`",
+        f"Delivered {coverage['delivered_bytes']} of {coverage['total_bytes']} UTF-8 bytes; "
+        f"{coverage['full_files']} full, {coverage['partial_files']} partial, "
+        f"{coverage['omitted_files']} omitted files.",
+    ]
+    parts.extend(
+        f"- {entry['status'].capitalize()}: <code>{escape(json.dumps(entry['path']))}</code>"
+        for entry in coverage["files"] if entry["status"] != "full"
     )
     return "\n\n".join(parts)
 
