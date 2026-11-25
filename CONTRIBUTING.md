@@ -123,7 +123,8 @@ Our trunk branch is named `main`. Here's the typical workflow:
 2. Run `cargo t --all-features --all-targets` to get started testing, and run `cargo +nightly fmt`.
 3. Ensure you have added or run the appropriate tests for your PR.
 4. If the PR is unfinished, add '[WIP]' in your PR title, e.g., '[WIP] Your PR title ...'.
-5. Be sure to keep the PR description updated to reflect all changes.
+5. Write the PR description with the [PR description guide](AGENTS/pr_description.md), and keep it
+   updated to reflect all changes.
 
 #### PR Title Formatting
 

@@ -10,7 +10,7 @@ We recognize that AI coding assistants are part of many developers' workflows. T
 
 **Understand and own your changes.** Every change you push and every review you leave reflects on your professional character and reputation – regardless of whether you used tools like AI. If you use AI tools to assist with code generation, you must fully understand every line of the resulting contribution. You should be able to explain the design, justify implementation choices, and debug issues during review. If you cannot, the contribution is not ready to submit. 
 
-Additionally, please **write your own PR description** and ensure it is crisp, complete, and correct.
+**Own your PR description.** You may use AI tools to draft it, following the [PR description guide](AGENTS/pr_description.md). You remain responsible for every sentence: the reason the PR exists must come from you, never from a tool filling a gap; every claim must match the diff; and you must be able to defend it in review. A description that misstates the change is treated like code that does not work.
 
 **Call out unknowns.** If there are any parts of the change you are less confident about – AI generated or otherwise – leave comments on your own PR explaining the concern and what steps you took to verify correctness. Reviewers can then focus their attention where it matters most.
 

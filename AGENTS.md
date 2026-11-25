@@ -16,6 +16,7 @@ automatically.
 |---|---|
 | Any change under `ffi/` | `ffi/AGENTS.md` |
 | Any change under `.github/` | `.github/CLAUDE.md` |
+| Writing or updating a PR description | `AGENTS/pr_description.md` |
 | Any user-guide edit | `docs/user-guide/CLAUDE.md` |
 | Writing or changing a test, test helper, or test table | `AGENTS/testing.md` |
 | Adding test data under `kernel/tests/data/` | `kernel/tests/README.md` |
@@ -315,9 +316,9 @@ Examples: `feat: add checkpoint stream support`, `fix: handle empty log segment`
 Breaking change examples: `feat!: make_physical takes column mapping and sets parquet field ids`,
 `chore!: remove the arrow-55 feature`
 
-**Description:** follow the template in `.github/PULL_REQUEST_TEMPLATE.md`. Err on the
-side of simplicity: don't list every change. Focus on key API changes, functionality,
-and data flow. Keep it concise.
+**Description:** follow the headings in `.github/PULL_REQUEST_TEMPLATE.md`. The rules for each
+section, worked examples, and the recipe agents follow when drafting a description are in
+`AGENTS/pr_description.md`.
 
 ## Deep Context
 
