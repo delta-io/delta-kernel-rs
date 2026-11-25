@@ -279,35 +279,47 @@ check's instructions to refresh the description or synchronize the stack, then r
 
 A **patch excerpt** is the leading portion of the fetched PR change patch inserted into task
 messages. Selecting the commit range happens before applying the excerpt's byte limit.
-`pr_change_patch_bytes` in the workflow holds the fetched patch; `pr_change_patch_excerpt_text`
-holds the decoded excerpt. Neither a fetched patch nor a model's successful return proves every
+`pr_change_patch_bytes` in the workflow holds the fetched patch; `subagent_patch_excerpt_text`
+holds the excerpt included in subagent task messages. Neither a fetched patch nor a model's successful return proves every
 changed line was examined.
 
 ## Input limits
 
-The workflow applies these limits while preparing the initial task messages:
+[`diff_coverage.py`](../diff_coverage.py) prepares independent patch excerpts from the PR change
+patch. Byte limits measure UTF-8 text, not characters or model tokens.
 
-| Workflow local | What it limits | Value |
-| --- | --- | --- |
-| `max_patch_excerpt_bytes` | Raw PR change patch bytes, before decoding; the same excerpt is included in orchestrator and subagent task messages. | 80,000 bytes |
-| `max_orchestrator_initial_task_message_bytes` | The entire initial orchestrator task message, encoded as UTF-8. | 120,000 bytes |
-| `pr_description_excerpt_text` | The original PR description, before adding any truncation warning. | 4,096 Python characters |
+| Input | Limit | What the limit includes |
+|---|---|---|
+| Patch excerpt in each subagent task message, including the Checker | 100,000 bytes | Leading PR change patch bytes in Git's file order. |
+| Patch excerpt in the initial orchestrator task message | Up to 80,000 bytes | Patch text, reduced further when the complete initial task message has less room. |
+| Complete initial orchestrator task message | 120,000 bytes | Run-specific instructions, PR metadata, description excerpt, earlier AI review text, changed paths and patch excerpt. |
+| PR description excerpt | 8,192 bytes | Author text after recognized generated GitStack navigation is removed. |
 
-The patch excerpt omits the assignment and other PR data. Subagent task messages contain their
-assignments, shared PR task text and optional maintainer guidance; the task builder does not apply a
-combined 120,000-byte limit to those messages. Source-tool reads can return additional context
-later in the conversation.
+`prepare_review_inputs()` prepares the subagent patch excerpt. It records every changed path and
+its byte interval in `/tmp/diff_coverage.json`, marking each file section fully included, partly
+included or omitted. These measurements describe the supplied patch excerpt; they do not prove
+which changed lines a model examined or whether it found every defect.
+
+`build_orchestrator_task_message()` reserves the other task-message text and complete changed-path
+list before adding the orchestrator's patch excerpt. If the path list cannot fit,
+`list_changed_paths` reads it in pages from `/tmp/ai_review_changed_paths.json`. A source-file read
+provides context without expanding the changed lines eligible for new findings.
+
+Subagent task messages contain assignments, shared PR task text and optional maintainer guidance.
+The task builder applies no combined 120,000-byte limit to those messages. Role instructions,
+tool definitions and later tool results are outside the initial task-message limits. Review-range
+selection reads the complete original PR description before excerpt preparation.
+
+If the subagent patch excerpt is truncated, the main AI review comment reports file counts between
+its reviewed-commit line and PR Summary. The `AI Review Summary` Check Run and workflow log list
+partly included and omitted paths, selected commit SHAs and supplied/total bytes. An uncut patch
+adds no truncation notice.
 
 The 120,000-byte guard protects the single `omnigent run -p` command argument. On Linux with
 4 KiB pages, one argument is limited to 131,072 bytes including its trailing NUL. Separate role
 instructions, tool definitions and later conversation are outside this initial-message guard.
-It is not the model's context-window limit. The patch cap is an input-size policy, without a
+It is not the model's context-window limit. Patch excerpt limits are input-size policies, without a
 measured review-quality optimum established by this workflow.
-
-The workflow takes the description's first 4,096 characters without removing generated stack
-navigation. A long stack header can therefore crowd out author-written text. A patch exceeding
-80,000 bytes gets a truncation warning. If the orchestrator's initial task message exceeds
-120,000 UTF-8 bytes, the workflow stops before starting the orchestrator.
 
 ## GitHub comments, Checks and saved reports
 
@@ -362,31 +374,6 @@ PR change patch and shared PR task text with seven-day retention.
 | `/tmp/publication_record.json` | Publication step | Records final findings, confirmed comment URLs and posting errors. |
 | `/tmp/review_output_complete.txt` | Publication step | Summary, artifact and Check Run outputs include all parsed final findings. |
 | `/tmp/check-summary.txt` | Publication step or diagnostic path | Check Run reads the assessment and findings, resolver error or generic unavailable message. |
-
-## Review input limits
-
-[`diff_coverage.py`](../diff_coverage.py) prepares independent text limits from the exact resolved
-base-to-head diff. The byte limits measure UTF-8 text, not characters or model tokens.
-
-| Input | Limit | What the limit includes |
-|---|---|---|
-| Diff in each child task, including the checker | 100,000 bytes | The first diff bytes in Git's file order; instructions and assignments are separate. |
-| Diff in the orchestrator task | Up to 80,000 bytes | The diff excerpt only, reduced further when the complete task has less room. |
-| Complete orchestrator task | 120,000 bytes | Task-specific instructions, PR metadata/description, earlier reviews, path list and diff. |
-| PR author's description | 8,192 bytes | Author text after recognized generated GitStack navigation is removed. |
-
-`prepare_inputs()` cuts the child diff and records every changed path and its byte interval in
-`/tmp/diff_coverage.json`. Each path is marked fully included, partly included or omitted.
-`parent_prompt()` reserves the orchestrator's non-diff text and complete path list before adding
-its separate diff excerpt. If the path list cannot fit, `list_changed_paths` reads it in pages
-from `/tmp/ai_review_changed_paths.json`. A source-file read provides context and does not add
-another changed line to the review's scope. Static reviewer instructions and later tool results
-are separate from the initial task limit. Stack resolution reads the complete original PR body.
-
-If the child diff is cut, the main AI review comment reports file counts between its reviewed
-commit line and PR Summary. The AI Review Summary Check Run and workflow log list partly included
-and omitted paths, reviewed SHAs and delivered/total bytes. An uncut diff adds no notice.
-These measurements describe the supplied diff, not whether the reviewers found every defect.
 
 ### Finding comments and confirmed comment URLs
 
@@ -509,47 +496,6 @@ python3 .github/omnigent/prepare_reviewer.py /tmp/reviewer
 The "Expand reviewer instructions" step in `ai-review.yml` runs the same command and uses the copy
 in place of the checked-out directory. To inspect a role's expanded instructions, read its
 `REVIEW.md` in the prepared copy.
-
-## Example: what `architecture-reviewer` receives
-
-Its **instructions** are `agents/architecture-reviewer/REVIEW.md` after expansion. The outline
-below lists the sections; the right column gives the shared block or a summary.
-
-```text
-## Project guidance                ${project_guidance}
-## Known issue handling            ${review_rules}
-## Previous AI review handling     ${review_rules}
-You are a senior systems architect reviewing Rust codebases ...
-## Your Mission                    evaluate only the shape of the change
-## What you do NOT review          line-level bugs, style, test coverage
-## Output Format                   at most 5 findings
-## Anatomy of a strong finding
-## CI environment note             ${ci_environment}
-```
-
-Nothing in the instructions refers to a particular pull request. They give the model its role,
-its scope, its output format, and its restrictions.
-
-Its **task** is one string, built for each run:
-
-```text
-Review the architecture of this change.               assignment, written by the orchestrator
-## PR data (untrusted)
-[prior AI reviews, or a sentence saying none exist]
-## PR Metadata                                        title, branches, and commit SHAs
-## PR Description                                     written by the PR author
-## PR Diff                                            excerpt; see Review input limits
-```
-
-The first line is the assignment. The orchestrator chooses it, so it differs between children.
-Everything after it is the child task body. When the workflow reviews only a stacked PR's
-changes, the review scope precedes the PR data. A maintainer reviewer's task has one more section,
-between the assignment and the PR data:
-
-```text
-## Root AGENTS.md (trusted workflow revision <sha>)
-[root AGENTS.md]
-```
 
 ## How a subagent task message is assembled
 
