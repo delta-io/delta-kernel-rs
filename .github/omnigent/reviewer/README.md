@@ -70,7 +70,7 @@ between them. Every ORCHESTRATOR box below represents the same model session at 
                                                v
              +-------------------------------------------------------------------+
              | (2) ORCHESTRATOR MODEL SESSION                                    |
-             | Dispatch every configured Reviewer subagent.    |
+             | Dispatch every configured Reviewer subagent.                      |
              | Write an assignment for each configured Reviewer role.                       |
              +-------------------------------------------------------------------+
                                                | sys_session_send: role + assignment
@@ -381,7 +381,7 @@ PR change patch and shared PR task text with seven-day retention.
 | `/tmp/review_accounting.json` | Validation step | Execution-record builder reads the orchestrator's consolidation outcomes. |
 | `/tmp/review_execution.json` | Execution-record step | Check Run displays its tables; Actions retains the record for seven days. |
 
-## Reviewer results, Checker results and consolidation outcomes
+## Review execution record
 
 The orchestrator dispatches every configured Reviewer subagent. A specialist with no applicable
 concern returns a Reviewer result with an explicit empty candidate-finding list. Each candidate

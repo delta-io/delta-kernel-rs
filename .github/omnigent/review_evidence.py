@@ -312,8 +312,8 @@ def _observe(event: dict[str, Any], allowed: set[str]) -> dict[str, Any] | None:
     if phase == "tool_call":
         row.update(kind="dispatch", dispatch_id=uuid.uuid4().hex)
         if role == CHECKER_ROLE:
-            child = args.get("args") or {}
-            batch, valid = _metadata(child.get("input"), "CHECK_BATCH", "candidates", allowed)
+            subagent_arguments = args.get("args") or {}
+            batch, valid = _metadata(subagent_arguments.get("input"), "CHECK_BATCH", "candidates", allowed)
             row.update(checker_batch=batch, metadata_valid=valid)
         return row
     if phase != "tool_result":
@@ -380,7 +380,7 @@ def _build_attempts(
                             and a["title"] == event.get("title") and not a["session_id"]), None)
             if attempt is None:
                 reasons.append(
-                    "Omnigent accepted a child session without a recorded dispatch request."
+                    "Omnigent accepted a subagent session without a recorded dispatch request."
                 )
                 continue
             session_id = event.get("session_id")
