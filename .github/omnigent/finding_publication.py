@@ -21,7 +21,9 @@ from typing import Any
 from inline_review import _diff_sections, diff_positions
 from markdown_utils import markdown_lines
 from review_history import canonical_finding_body
-from review_publish import BOT_MARKER, format_diff_coverage, format_finding, format_review_summary
+from review_publish import (
+    BOT_MARKER, finding_label, format_diff_coverage, format_finding, format_review_summary,
+)
 
 _ID = re.compile(r"\[?(Blocker|Should\s*Fix|Nit)\s*([1-9][0-9]*)\]?", re.I)
 _HEADING = re.compile(r"^#{2,4}\s+(\[?(?:Blocker|Should\s*Fix|Nit)\s*[1-9][0-9]*\]?)(.*)$", re.I)
@@ -255,6 +257,7 @@ def publish_findings(
                 errors.append("The main comment write could not be confirmed.")
                 return record
     record["main_url"] = _url(main)
+    record["main_comment_id"] = main.get("id")
     github_pr_patch_positions = diff_positions(github_pr_patch)
     pr_change_patch_positions = (
         diff_positions(pr_change_patch) if pr_change_patch is not None else github_pr_patch_positions
@@ -285,9 +288,15 @@ def publish_findings(
                 or github_pr_patch_sections.get(finding["path"]) == pr_change_patch_sections.get(finding["path"])
             )
         )
-        metadata = {**source, "id": finding["id"], "fingerprint": finding["fingerprint"]}
+        metadata = {
+            **source, "id": finding["id"], "fingerprint": finding["fingerprint"],
+            "path": finding["path"], "line": finding["line"], "side": finding["side"],
+        }
+        encoded_metadata = json.dumps(metadata, sort_keys=True).replace(
+            "<", "\\u003c"
+        ).replace(">", "\\u003e")
         body = (
-            f"{BOT_MARKER}\n<!-- ai-review-finding {json.dumps(metadata, sort_keys=True)} -->\n"
+            f"{BOT_MARKER}\n<!-- ai-review-finding {encoded_metadata} -->\n"
             + format_finding(
                 finding, head_sha=head_sha, main_url=record["main_url"], collapsed=can_inline
             )
@@ -362,11 +371,32 @@ def publish_findings(
 
 def publication_check(review: str, record: dict[str, Any]) -> str:
     """Build the AI Review Summary Check Run report with findings and comment-posting results."""
+    confirmed = [finding for finding in record["findings"] if finding.get("url")]
     totals = Counter(
-        finding.get("delivery") for finding in record["findings"] if finding.get("url")
+        delivery for delivery, _ in {
+            (finding.get("delivery"), finding["url"]) for finding in confirmed
+            if finding.get("placement") in {"inline", "conversation"}
+        }
     )
-    parts = [complete_review(review, record["findings"]), "## Finding publication",
+    parts = [complete_review(review, record["findings"]), "## Finding comments and reports",
              f"New finding comments: {totals['new']} · Reused finding comments: {totals['reused']}"]
+    for mode in ("summary", "artifact"):
+        entries = sum(finding.get("placement") == mode for finding in confirmed)
+        if entries:
+            parts.append(f"Findings in {mode} report: {entries}")
+    references = sum(finding.get("placement") == "history" for finding in confirmed)
+    if references:
+        parts.append(f"Earlier finding references: {references}")
+    labels = {
+        "inline": "Inline review comment", "conversation": "PR Conversation comment",
+        "summary": "Workflow summary entry", "artifact": "Artifact report entry",
+        "history": "Earlier finding",
+    }
+    for finding in confirmed:
+        label = labels.get(finding.get("placement"), "Finding link")
+        parts.append(
+            f"- **{finding_label(finding['id'])}** [{label}]({finding['url']})"
+        )
     if record.get("mode") in {"summary", "artifact"}:
         parts.append(f"Report output: {record['mode']}. No PR comments requested.")
     parts.extend(f"- {error}" for error in record["errors"])

@@ -78,7 +78,9 @@ class ReviewEvidenceWorkflowTest(unittest.TestCase):
             self.assertIn("Review execution", summary)
             self.assertIn("Incomplete", summary)
             artifact = steps["Retain reviewer execution evidence"]["with"]["path"]
-            self.assertEqual(artifact, "/tmp/review_execution.json")
+            self.assertEqual(artifact.splitlines(), [
+                "/tmp/review_execution.json", "/tmp/check-summary.txt", "/tmp/diff_coverage.json"
+            ])
 
     def test_malformed_accounting_stays_incomplete_and_is_removed_from_human_review(self):
         repository = Path(__file__).resolve().parents[3]

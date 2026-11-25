@@ -9,7 +9,7 @@ from collections.abc import Collection
 from typing import Any
 
 from markdown_utils import markdown_lines
-from review_publish import BOT_MARKER, INLINE_FEEDBACK_FOOTER, strip_review_body
+from review_publish import BOT_MARKER, INLINE_FEEDBACK_FOOTER, REVIEW_HEADER, strip_review_body
 
 MAX_HISTORY_CHARS = 12_000
 MAX_ENTRY_CHARS = 6_000
@@ -156,13 +156,41 @@ def is_duplicate_review(
     review: str,
     document: Any,
     trusted_bot_logins: Collection[str] = DEFAULT_TRUSTED_BOT_LOGINS,
+    *,
+    head_sha: str | None = None,
 ) -> bool:
-    """Return whether the same complete review was already published by the bot."""
-    current = _normalize(_clean_published_body(review))
-    return bool(current) and any(
-        _normalize(entry) == current
-        for entry in _bot_review_bodies(document, trusted_bot_logins)
-    )
+    """Return whether an identical rendered summary already names this full commit SHA.
+
+    Compare the complete body, including status, coverage, reasons and workflow links.
+    Unknown or conflicting commit identity cannot suppress a summary on a requested rerun.
+    """
+    if not isinstance(head_sha, str) or not _FULL_SHA.fullmatch(head_sha) or not review.strip():
+        return False
+    for entry in [*_issue_comment_nodes(document), *_review_nodes(document)]:
+        if (not _is_marked_bot_entry(entry, trusted_bot_logins)
+                or entry["body"].strip() != review.strip()):
+            continue
+        shas = set()
+        commit = entry.get("commit")
+        if isinstance(commit, dict) and isinstance(commit.get("oid"), str):
+            if _FULL_SHA.fullmatch(commit["oid"]):
+                shas.add(commit["oid"])
+        prefix = entry["body"].lstrip().removeprefix(BOT_MARKER).lstrip()
+        if match := _PUBLISHED_METADATA.match(prefix):
+            try:
+                metadata = json.loads(match[1])
+            except ValueError:
+                metadata = None
+            if isinstance(metadata, dict):
+                sha = metadata.get("head_sha")
+                if isinstance(sha, str) and _FULL_SHA.fullmatch(sha):
+                    shas.add(sha)
+        for _, line, fence in markdown_lines(entry["body"]):
+            if fence is None and (match := re.match(r"^Reviewed `([0-9a-f]{40})`", line)):
+                shas.add(match[1])
+        if shas == {head_sha}:
+            return True
+    return False
 
 
 def canonical_finding_body(body: str) -> str:
@@ -264,6 +292,8 @@ def _entry_blockers(
     comment: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     body = entry.get("body", "")
+    if body.lstrip().removeprefix(BOT_MARKER).lstrip().startswith(REVIEW_HEADER):
+        body = strip_review_body(body)
     lines = [
         (offset, line) for offset, line, fence in markdown_lines(body) if fence is None
     ]
@@ -294,6 +324,11 @@ def _entry_blockers(
     boundaries = [
         offset for offset, line in lines
         if _ANY_FINDING_LINE.match(line) or re.match(r"^#{1,6}\s+", line)
+        or re.fullmatch(
+            r"(?:\d+\.\s+\*\*(?:Blocking issues|Non-blocking notes|Summary)\*\*\s*:?|"
+            r"(?:Blocking issues|Non-blocking notes|Summary)\s*:)\s*",
+            line, re.IGNORECASE,
+        )
     ]
     summary_start = body.find("<summary>Review Summary</summary>")
     summary_end = body.find("</details>", summary_start) if summary_start >= 0 else -1
@@ -319,9 +354,12 @@ def _entry_blockers(
         if comment is not None:
             finding["source_comment_id"] = comment.get("id", comment.get("fullDatabaseId"))
             for key in ("path", "side"):
-                if isinstance(comment.get(key), str):
-                    finding[key] = comment[key]
-            line_number = comment.get("line") or comment.get("originalLine")
+                value = comment.get(key)
+                if not isinstance(value, str):
+                    value = metadata.get(key)
+                if isinstance(value, str):
+                    finding[key] = value
+            line_number = comment.get("line") or comment.get("originalLine") or metadata.get("line")
             if isinstance(line_number, int) and not isinstance(line_number, bool):
                 finding["line"] = line_number
         findings.append(finding)

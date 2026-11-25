@@ -1142,6 +1142,7 @@ class InlineReviewTest(unittest.TestCase):
                                         "login": "github-actions",
                                     },
                                     "body": prior_body,
+                                    "commit": {"oid": "f" * 40},
                                     "comments": {"nodes": []},
                                 }
                             ]
@@ -1155,16 +1156,22 @@ class InlineReviewTest(unittest.TestCase):
             findings=[],
             diff=DIFF,
             head_sha="f" * 40,
-            run_url="https://github.com/delta-io/delta-kernel-rs/actions/runs/2",
+            run_url="https://github.com/delta-io/delta-kernel-rs/actions/runs/1",
             history=history,
         )
 
         self.assertTrue(self.inline_review.should_skip_inline_review(payload, history))
 
+        payload["commit_id"] = "e" * 40
+        self.assertFalse(self.inline_review.should_skip_inline_review(payload, history))
+        payload.pop("commit_id")
+        self.assertFalse(self.inline_review.should_skip_inline_review(payload, history))
+        payload["commit_id"] = "f" * 40
+
         payload["comments"].append({"body": "new finding"})
         self.assertFalse(self.inline_review.should_skip_inline_review(payload, history))
 
-    def test_duplicate_review_round_trip_uses_published_inline_body(self) -> None:
+    def test_requested_rerun_keeps_summary_while_reusing_inline_finding(self) -> None:
         review = "### Nit1\nRepeated finding.\n\n## Summary\nNo new findings."
         finding = {
             "id": "Nit1",
@@ -1193,6 +1200,7 @@ class InlineReviewTest(unittest.TestCase):
                                         "login": "github-actions",
                                     },
                                     "body": first_payload["body"],
+                                    "commit": {"oid": "f" * 40},
                                     "comments": {
                                         "nodes": [
                                             {
@@ -1223,7 +1231,8 @@ class InlineReviewTest(unittest.TestCase):
         )
 
         self.assertEqual(duplicates, ["Nit1"])
-        self.assertTrue(
+        self.assertEqual(next_payload["comments"], [])
+        self.assertFalse(
             self.inline_review.should_skip_inline_review(next_payload, history)
         )
 

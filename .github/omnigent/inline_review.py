@@ -410,13 +410,15 @@ def should_skip_inline_review(
     history: Any,
     trusted_bot_logins: Collection[str] = DEFAULT_TRUSTED_BOT_LOGINS,
 ) -> bool:
-    """Return whether a comment-free inline payload repeats a prior review body."""
+    """Skip only an identical comment-free summary proven to cover the payload's commit."""
     comments = payload.get("comments")
     body = payload.get("body")
     return (
         comments == []
         and isinstance(body, str)
-        and is_duplicate_review(body, history, trusted_bot_logins)
+        and is_duplicate_review(
+            body, history, trusted_bot_logins, head_sha=payload.get("commit_id"),
+        )
     )
 
 

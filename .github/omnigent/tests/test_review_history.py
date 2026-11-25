@@ -168,6 +168,30 @@ class ReviewHistoryTest(unittest.TestCase):
                 self.assertIn("Broken contract.", blocker["body"])
                 self.assertNotIn("Context.", blocker["body"])
 
+    def test_legacy_summary_and_wrapper_are_excluded_from_blocker_claim_identity(self):
+        module = _load_module()
+        for summary in ("## Summary", "3. **Summary**", "Summary:"):
+            with self.subTest(summary=summary):
+                document = _evidence_document()
+                pr = document["data"]["repository"]["pullRequest"]
+                pr["comments"]["nodes"].clear()
+                review = pr["reviews"]["nodes"][0]
+                review["comments"]["nodes"].clear()
+                review["body"] = (
+                    f"{module.BOT_MARKER}\n{module.REVIEW_HEADER}\n\n"
+                    "<details><summary>Show review</summary>\n\n"
+                    f"### Blocker1\nA retained defect.\n\n{summary}\nPatch context.\n\n"
+                    "</details>\n\n---\n"
+                    "<sub>Automated review - [workflow run]"
+                    "(https://github.com/example/project/actions/runs/1)</sub>"
+                )
+                evidence = module.history_evidence(document)
+                self.assertTrue(evidence["complete"], evidence["reasons"])
+                self.assertEqual(
+                    module.canonical_finding_body(evidence["blockers"][0]["body"]),
+                    "a retained defect.",
+                )
+
     def test_standalone_finding_metadata_and_full_reviewed_sha_are_trusted_sources(self) -> None:
         module = _load_module()
         for metadata in (True, False):
@@ -532,11 +556,64 @@ class ReviewHistoryTest(unittest.TestCase):
             "https://github.com/delta-io/delta-kernel-rs/actions/runs/1",
             collapsed=True,
         )
+        entry = document["data"]["repository"]["pullRequest"]["comments"]["nodes"][0]
+        metadata = json.dumps({"head_sha": "a" * 40})
+        entry["body"] = entry["body"].replace(
+            module.BOT_MARKER,
+            f"{module.BOT_MARKER}\n<!-- ai-review-main {metadata} -->",
+            1,
+        )
 
-        self.assertTrue(module.is_duplicate_review("Old collapsed finding", document))
+        self.assertTrue(module.is_duplicate_review(entry["body"], document, head_sha="a" * 40))
+        self.assertFalse(module.is_duplicate_review(entry["body"], document))
+        self.assertFalse(module.is_duplicate_review("Old collapsed finding", document,
+                                                  head_sha="a" * 40))
         self.assertIn("Old collapsed finding", module.format_review_history(document))
         self.assertNotIn("<details>", module.format_review_history(document))
         self.assertFalse(module.is_duplicate_review("New finding", document))
+
+    def test_same_pr_summary_does_not_suppress_changed_status_coverage_or_reasons(self):
+        module = _load_module()
+        document = _document()
+        entry = document["data"]["repository"]["pullRequest"]["comments"]["nodes"][0]
+        metadata = json.dumps({"head_sha": "a" * 40})
+        body = (
+            f"{module.BOT_MARKER}\n<!-- ai-review-main {metadata} -->\n"
+            "## AI Review - NO VERDICT\n\nReviewed `aaaaaaaa` · Partial Coverage\n\n"
+            "<details><summary>Partial Coverage Details</summary>\nMissing reviewer.\n</details>\n"
+            "<details><summary>PR Summary</summary>\nSame change context.\n</details>\n"
+            "[Workflow run](https://github.com/example/project/actions/runs/1)"
+        )
+        entry["body"] = body
+
+        self.assertTrue(module.is_duplicate_review(body, document, head_sha="a" * 40))
+        for before, after in (
+            ("NO VERDICT", "APPROVED"),
+            ("Partial Coverage", "Full Coverage"),
+            ("Missing reviewer.", "Earlier Blocker has not been rechecked on this commit."),
+            ("actions/runs/1", "actions/runs/2"),
+        ):
+            with self.subTest(changed=before):
+                self.assertFalse(module.is_duplicate_review(
+                    body.replace(before, after), document, head_sha="a" * 40,
+                ))
+
+    def test_summary_retry_requires_the_same_known_full_sha(self):
+        module = _load_module()
+        document = _document()
+        entry = document["data"]["repository"]["pullRequest"]["reviews"]["nodes"][0]
+        entry["commit"] = {"oid": "a" * 40}
+        body = entry["body"]
+
+        self.assertTrue(module.is_duplicate_review(body, document, head_sha="a" * 40))
+        self.assertFalse(module.is_duplicate_review(body, document, head_sha="b" * 40))
+        self.assertFalse(module.is_duplicate_review(body, document, head_sha="aaaaaaaa"))
+        entry.pop("commit")
+        self.assertFalse(module.is_duplicate_review(body, document, head_sha="a" * 40))
+        entry["body"] = body + "\nReviewed `" + "a" * 40 + "`"
+        self.assertTrue(module.is_duplicate_review(entry["body"], document, head_sha="a" * 40))
+        entry["commit"] = {"oid": "b" * 40}
+        self.assertFalse(module.is_duplicate_review(entry["body"], document, head_sha="a" * 40))
 
     def test_history_is_newest_first_and_bounded(self) -> None:
         module = _load_module()

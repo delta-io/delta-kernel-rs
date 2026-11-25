@@ -17,7 +17,9 @@ try:
         publish_findings, review_overview,
     )
     from review_history import canonical_finding_body
-    from review_publish import BOT_MARKER, format_finding, format_review_summary, strip_review_body
+    from review_publish import (
+        BOT_MARKER, bound_check_summary, format_finding, format_review_summary, strip_review_body,
+    )
 finally:
     sys.path.pop(0)
 
@@ -134,7 +136,7 @@ class FindingPublicationTest(unittest.TestCase):
         retained = record["findings"][0]
         self.assertEqual(retained["id"], "Nit1")
         self.assertEqual(retained["aliases"], ["Nit2"])
-        self.assertIn("0 Blockers · 0 Should Fix · 1 Nits", github.issues[0]["body"])
+        self.assertIn("0 Blockers · 0 Should Fix · 1 Nit", github.issues[0]["body"])
         check = publication_check("## PR Summary\nChanges a call.", record)
         self.assertIn("New finding comments: 1 · Reused finding comments: 0", check)
         self.assertEqual(check.count("A retained claim."), 1)
@@ -310,6 +312,13 @@ class FindingPublicationTest(unittest.TestCase):
                 self.assertIn("A retained claim.", check)
                 self.assertIn("New finding comments: 0 · Reused finding comments: 0", check)
                 self.assertIn("No PR comments requested.", check)
+                for report in (record, {key: value for key, value in record.items() if key != "mode"}):
+                    check = publication_check("Review context.", report)
+                    self.assertIn(
+                        "New finding comments: 0 · Reused finding comments: 0", check
+                    )
+                    self.assertIn(f"Findings in {mode} report: 1", check)
+                    self.assertNotIn("New finding comments: 1", check)
 
     def test_conversation_modes_and_setting_preserve_each_finding(self):
         for mode, placement in (("comment", "inline-or-conversation"),
@@ -381,6 +390,26 @@ class FindingPublicationTest(unittest.TestCase):
         github = FakeGitHub()
         publish(github, [], coverage=coverage)
         self.assertNotIn("Review input truncated", github.issues[0]["body"])
+
+    def test_large_coverage_report_links_complete_artifact_within_check_api_budget(self):
+        coverage = {
+            "base_sha": "b" * 40, "head_sha": HEAD_SHA,
+            "total_bytes": 500_000, "delivered_bytes": 100_000, "complete": False,
+            "total_files": 1300, "full_files": 0, "partial_files": 0, "omitted_files": 1300,
+            "files": [{"path": f"directory/{i}/" + "x" * 170, "status": "omitted"}
+                      for i in range(1300)],
+        }
+        record = {"findings": [], "errors": [], "coverage": coverage}
+        full = publication_check("PR context.", record)
+        self.assertGreater(len(full.encode()), 65_535)
+        url = RUN_URL + "/artifacts/123"
+        summary = bound_check_summary(full, url)
+        self.assertLess(len(summary.encode()), 60_000)
+        self.assertIn(url, summary)
+        self.assertIn("seven days", summary)
+        self.assertIn("directory/1299/", full)
+        self.assertEqual(bound_check_summary("A complete short report.", url),
+                         "A complete short report.")
 
     def test_legacy_unknown_severity_split_does_not_fabricate_zeroes(self):
         body = format_review_summary(
