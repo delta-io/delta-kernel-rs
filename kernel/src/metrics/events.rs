@@ -120,8 +120,9 @@ pub enum MetricEvent {
 }
 
 impl MetricEvent {
-    /// Delta metadata id when this event observed it. Early log discovery and failed
-    /// metadata reads may complete before the id is known.
+    /// Opaque identifier for grouping events by table. A caller's correlation id groups events
+    /// by action, which may span several tables. Kernel reads use the id from the table's
+    /// metadata when available.
     pub fn table_id(&self) -> Option<&str> {
         match self {
             Self::SnapshotBuildSuccess(e) => e.table_id.as_deref(),
@@ -957,7 +958,7 @@ impl ProtocolMetadataSource {
 /// All fields are set at emit time (creation attrs).
 #[derive(Debug, Clone)]
 pub struct ProtocolMetadataLoadSuccess {
-    /// Delta metadata id observed by this read.
+    /// Opaque identifier of the table being read, when known.
     pub table_id: Option<Arc<str>>,
     pub operation_id: MetricId,
     /// Opaque, caller-supplied id for joining this operation's metric events to the caller's
@@ -1076,7 +1077,7 @@ pub(crate) const SNAPSHOT_COMPLETED_SPAN: &str = "snap.build";
 /// A snapshot was built successfully.
 #[derive(Debug, Clone)]
 pub struct SnapshotBuildSuccess {
-    /// Delta metadata id observed by this read.
+    /// Opaque identifier of the table being read, when known.
     pub table_id: Option<Arc<str>>,
     // === Set on span creation ===
     pub operation_id: MetricId,
@@ -1365,7 +1366,7 @@ pub(crate) const DOMAIN_METADATA_LOADED_SPAN: &str = "snap.get_domain_metadata";
 /// system (`delta.*`) domains such as clustering or row tracking.
 #[derive(Debug, Clone)]
 pub struct DomainMetadataLoadSuccess {
-    /// Delta metadata id observed by this read.
+    /// Opaque identifier of the table being read, when known.
     pub table_id: Option<Arc<str>>,
     // === Set during span lifetime ===
     pub from_cache: bool,
@@ -1491,7 +1492,7 @@ pub(crate) const CRC_READ_COMPLETED_SPAN: &str = "crc_read_completed";
 /// A CRC file was read and parsed successfully. `bytes_read` is the raw byte count from storage.
 #[derive(Debug, Clone)]
 pub struct CrcReadSuccess {
-    /// Delta metadata id observed by this read.
+    /// Opaque identifier of the table being read, when known.
     pub table_id: Option<Arc<str>>,
     // === Set during span lifetime ===
     pub bytes_read: u64,

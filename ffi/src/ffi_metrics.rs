@@ -298,14 +298,14 @@ impl From<kernel::ProtocolMetadataSource> for ProtocolMetadataSource {
 /// Protocol and metadata actions were read from the log.
 #[repr(C)]
 pub struct ProtocolMetadataLoadSuccess {
+    /// Borrowed opaque table identifier, empty when unavailable.
+    pub table_id: KernelStringSlice,
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
     pub load_type: LogSegmentLoadType,
     pub source: ProtocolMetadataSource,
     pub duration_ns: u64,
-    /// Borrowed Delta metadata id, empty when unavailable.
-    pub table_id: KernelStringSlice,
 }
 
 /// Reading protocol and metadata from the log failed.
@@ -322,14 +322,14 @@ pub struct ProtocolMetadataLoadFailure {
 /// A snapshot was built successfully.
 #[repr(C)]
 pub struct SnapshotBuildSuccess {
+    /// Borrowed opaque table identifier, empty when unavailable.
+    pub table_id: KernelStringSlice,
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
     pub load_type: SnapshotLoadType,
     pub version: u64,
     pub duration_ns: u64,
-    /// Borrowed Delta metadata id, empty when unavailable.
-    pub table_id: KernelStringSlice,
 }
 
 /// Building a snapshot failed.
@@ -527,7 +527,7 @@ pub struct DomainMetadataLoadSuccess {
     pub from_cache: bool,
     pub num_domains_returned: u64,
     pub duration_ns: u64,
-    /// Borrowed Delta metadata id, empty when unavailable.
+    /// Borrowed opaque table identifier, empty when unavailable.
     pub table_id: KernelStringSlice,
 }
 
@@ -544,7 +544,7 @@ pub struct SetTransactionLoadSuccess {
 pub struct CrcReadSuccess {
     pub bytes_read: u64,
     pub duration_ns: u64,
-    /// Borrowed Delta metadata id, empty when unavailable.
+    /// Borrowed opaque table identifier, empty when unavailable.
     pub table_id: KernelStringSlice,
 }
 
@@ -1559,7 +1559,7 @@ mod tests {
         let id = kernel::MetricId::new();
         let event =
             kernel::MetricEvent::ProtocolMetadataLoadSuccess(kernel::ProtocolMetadataLoadSuccess {
-                table_id: None,
+                table_id: Some("catalog/table-17".into()),
                 operation_id: id,
                 correlation_id: Some("pm-req".into()),
                 table_type: kernel::TableType::CatalogManaged,
@@ -1567,6 +1567,7 @@ mod tests {
                 source: kernel::ProtocolMetadataSource::CrcAdvancedByReplay,
                 duration: Duration::from_nanos(53),
             });
+        assert_eq!(event.table_id(), Some("catalog/table-17"));
         with_ffi_event(&event, |ffi| {
             let MetricEvent::ProtocolMetadataLoadSuccess(e) = ffi else {
                 panic!("expected ProtocolMetadataLoadSuccess");
@@ -1577,6 +1578,8 @@ mod tests {
             let cid: &str =
                 unsafe { TryFromStringSlice::try_from_slice(&e.correlation_id).unwrap() };
             assert_eq!(cid, "pm-req");
+            let table: &str = unsafe { TryFromStringSlice::try_from_slice(&e.table_id).unwrap() };
+            assert_eq!(table, "catalog/table-17");
             assert_eq!(
                 discriminant(&e.source),
                 discriminant(&ProtocolMetadataSource::CrcAdvancedByReplay)
