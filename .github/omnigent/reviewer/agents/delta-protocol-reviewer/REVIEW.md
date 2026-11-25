@@ -87,3 +87,5 @@ End your review with a **Summary** section:
 8. **EngineData access**: In delta-kernel-rs, EngineData must never be downcast to concrete types in production code. Always use the visitor pattern (`visit_rows`, `GetData`). Flag any violation immediately.
 
 ${ci_environment}
+
+${candidate_results}

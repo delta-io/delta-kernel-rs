@@ -54,3 +54,16 @@ For each candidate:
 **Evidence**: <2-5 sentences>
 **Fix assessment**: <whether the proposed fix is appropriate, incomplete, or risky>
 ```
+
+## Batch accounting
+
+The orchestrator's task includes an `AI_REVIEW_CHECK_BATCH` block. Its `batch_id` identifies
+one originating reviewer's candidate; keep that ID even when candidates describe the same
+issue. Return a disposition for every batch ID exactly once. Append this field without a fence:
+
+<!-- AI_REVIEW_DISPOSITIONS -->
+{"dispositions":[{"batch_id":"check1","verdict":"CONFIRMED"}]}
+<!-- AI_REVIEW_DISPOSITIONS_END -->
+
+Use only `CONFIRMED`, `DISPROVED`, `NITPICK`, or `CONTESTED`. Your prose may explain each verdict;
+the field records which candidates were checked. Do not add candidates or omit repeated ones.

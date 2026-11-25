@@ -125,3 +125,5 @@ For each:
 - **Check both positive and negative paths** — happy path coverage is necessary but not sufficient. Error paths and edge cases are where bugs hide.
 
 ${ci_environment}
+
+${candidate_results}

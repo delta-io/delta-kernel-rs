@@ -31,9 +31,10 @@ replace, or use a placeholder for the appended text. Any reviewer can read proje
 guidance remain proposals, not governing policy for that review. Other reviewers read a project rule
 before they rely on it. Reviewers may use their bounded read-only source tools to inspect
 surrounding PR or Delta files. They do not open PRs, post comments, edit or execute files, run shell
-commands, read environment variables, or make network calls. Always dispatch `docs-reviewer`. Ask it
+commands, read environment variables, or make network calls. Dispatch every configured Reviewer subagent, even for narrow changes. A specialist may return
+an explicit empty Reviewer result when its domain does not apply. Ask `docs-reviewer`
 to check the PR title, the PR description, and any documentation this change affects, including
-rustdoc the diff does not touch. Dispatch the other relevant reviewers concurrently in the same
+rustdoc the diff does not touch. Dispatch the Reviewer subagents concurrently in the same
 batch, respecting the reviewer roster cap; supervise via the inbox, never busy-poll.
 
 ## Act in the same turn you announce
@@ -57,13 +58,25 @@ have completed. Do not emit a marked review until every dispatch has produced a 
 its retry and every required Checker result has arrived.
 
 ## Disprove gate
-Before publishing any Blocker or Should Fix, run `disprove-reviewer` on the
-candidate finding list. Dispatch exactly one `disprove-reviewer` call for the
-whole batch, with `args.purpose: "review"`; do not spawn one disprove reviewer
-per agent or per finding. Give it only compact, structured candidate findings,
-the agents that raised each finding, the cited diff excerpt/reference, and the
-proposed fix. Do not include the original reviewer reasoning beyond the
-candidate claim. Wait for the disprove gate before final consolidation.
+
+Collect each primary's `AI_REVIEW_CANDIDATES` field. IDs are local to the originating reviewer;
+identify a candidate finding by its reviewer name and local ID. Do not discard or merge them
+before the checker batch. If any primary returned a Blocker or Should Fix candidate finding, dispatch
+exactly one `disprove-reviewer` call covering their union. Do not call the checker for an empty
+union or create one checker call per finding.
+
+Assign each distinct candidate finding a batch ID such as `check1`, so the checker can distinguish
+local IDs such as `C1` from different reviewers. Include the
+following metadata in the checker dispatch's `args.input`, without a code fence, alongside the
+candidate findings, primary reviewer names, cited evidence and proposed fixes:
+
+<!-- AI_REVIEW_CHECK_BATCH -->
+{"candidates":[{"batch_id":"check1","role":"architecture-reviewer","id":"C1"}]}
+<!-- AI_REVIEW_CHECK_BATCH_END -->
+
+Use `args.purpose: "review"`. Do not include original reviewer reasoning beyond each candidate
+claim. Wait for every batch disposition before final consolidation. Keep `CONTESTED` explicit;
+a disputed correctness claim cannot establish an advisory approval.
 
 Apply each Checker decision as follows:
 - `CONFIRMED`: keep the finding in the orchestrator report.
@@ -113,6 +126,16 @@ and a separate Conversation comment otherwise. There is no limit on the number o
 Keep the separate limit on convention-only findings. Repeated findings that still apply belong in
 this output. The publication code reuses their existing bot comments instead of posting another
 copy.
+
+## Consolidation accounting
+
+Account for every candidate from each observed primary return, including Nits. Your task
+supplies a machine-readable accounting block for the final response. Map each candidate to
+one final finding ID, or give an explicit omission reason. Use `retained`, `downgraded`, `merged`,
+or `dropped`; merged candidates may share a final ID. A dropped candidate has no final ID.
+Keep the checker's disposition separate from your consolidation decision. A repeated finding
+kept on this commit maps to its final ID even when the publisher reuses an existing thread.
+Do not invent candidates, checker decisions, or returned reviewers to complete the record.
 
 ## Final writing pass
 Before returning the orchestrator report, polish its wording. This pass may rewrite wording only;
