@@ -424,7 +424,7 @@ impl<STATE> Transaction<STATE, Imperative> {
         )?;
         #[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_mut))]
         let mut add_patch = ExpressionStructPatchBuilder::new_nested(["add"])
-            .insert_after("modificationTime", lit(self.data_change));
+            .replace("dataChange", lit(self.data_change));
         // Kernel does not populate adaptive-metadata-tree back references on writes, so emit a null
         // to keep the produced struct aligned with the `backReference` field of LOG_ADD_SCHEMA.
         #[cfg(feature = "adaptive-metadata-in-dev")]

@@ -63,6 +63,7 @@ The underlying data conforms to the schema returned by `scan_row_schema()`:
      baseRowId: long,
      defaultRowCommitVersion: long,
      clusteringProvider: string,
+     dataChange: boolean,
    }
 }
 ```

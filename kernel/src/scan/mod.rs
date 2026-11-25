@@ -912,6 +912,7 @@ static RESTORED_ADD_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
         not_null "partitionValues": { STRING => nullable STRING },
         not_null "size": LONG,
         nullable "modificationTime": LONG,
+        nullable "dataChange": BOOLEAN,
         nullable "stats": STRING,
         nullable "tags": { STRING => nullable STRING },
         nullable "deletionVector": (DeletionVectorDescriptor::to_schema()),
@@ -1921,6 +1922,7 @@ impl Scan {
 ///      baseRowId: long,
 ///      defaultRowCommitVersion: long,
 ///      clusteringProvider: string,
+///      dataChange: boolean,
 ///    }
 /// }
 /// ```
