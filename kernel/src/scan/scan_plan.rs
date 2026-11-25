@@ -103,10 +103,10 @@ impl Scan {
             return Ok(None);
         }
 
-        let planned = planner.replay();
+        let planned = planner.replay()?;
         report.metadata_planning = planned.metrics;
         planned
-            .result?
+            .plan
             .project_patch(|patch| patch.drop(VERSION))?
             .build_opt()
     }
@@ -568,10 +568,10 @@ mod tests {
             leaf_checkpoint_schema: Arc::new(leaf_checkpoint_schema),
             ..shape(kind, None)
         };
-        let planned = MetadataPlanner::try_from_scan(&scan, Some(Arc::new(shape)))?.replay();
+        let planned = MetadataPlanner::try_from_scan(&scan, Some(Arc::new(shape)))?.replay()?;
         assert_eq!(planned.metrics.read_collations, preserve_json);
         assert!(!planned.metrics.has_filter);
-        let plan = planned.result?.build()?;
+        let plan = planned.plan.build()?;
         let read_schema = leaf_read_schema(&plan);
         assert_eq!(source_collation_stats(read_schema).is_some(), preserve_json);
         assert_eq!(
@@ -887,8 +887,8 @@ mod tests {
             scan.state_info.physical_stats_read_schema().cloned(),
         );
         let plan = MetadataPlanner::try_from_scan(&scan, Some(Arc::new(file_shape)))?
-            .replay()
-            .result?
+            .replay()?
+            .plan
             .build()?;
         assert_eq!(tags(&plan), ["values"]);
         Ok(())
@@ -941,8 +941,8 @@ mod tests {
             ..shape(CheckpointKind::Inline, None)
         };
         let plan = MetadataPlanner::try_from_scan(&scan, Some(Arc::new(file_shape.clone())))?
-            .replay()
-            .result?
+            .replay()?
+            .plan
             .build()?;
         assert_eq!(add_struct(leaf_read_schema(&plan)), &*ADD_SCHEMA);
         let batches = declarative_metadata(&scan, &SyncEngine::new_with_store(store))?;

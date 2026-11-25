@@ -211,10 +211,19 @@ impl<'a> MetadataPlanner<'a> {
     /// fields above. Parsed fields are omitted when unrequested or their schema is absent.
     /// JSON stats are retained or synthesized only when requested.
     /// Without tombstones, remove fields are omitted from the read, filter, and key.
-    fn checkpoint_actions(&self, metrics: &mut MetadataPlanningReport) -> KernelResult<PlanBuilder> {
+    fn checkpoint_actions(
+        &self,
+        metrics: &mut MetadataPlanningReport,
+    ) -> KernelResult<PlanBuilder> {
         let checkpoint_info = self.checkpoint_info.as_deref();
         self.build_metadata_plan(ActionSource::Checkpoint, checkpoint_info, |schema| {
-            sources::checkpoint_actions(self.segment, checkpoint_info, self.actions, schema, metrics)
+            sources::checkpoint_actions(
+                self.segment,
+                checkpoint_info,
+                self.actions,
+                schema,
+                metrics,
+            )
         })
     }
 

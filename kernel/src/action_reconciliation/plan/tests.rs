@@ -128,8 +128,8 @@ async fn replay_selects_latest_action_without_retention(
         !snapshot.has_adaptive_metadata(),
     )
     .with_stats(StatsOptions::json_only())
-    .replay();
-    let state = planned.result?;
+    .replay()?;
+    let state = planned.plan;
     let report = planned.metrics;
     assert!(report.stats.synthesize_json);
     assert!(!report.partition_values.parsed_struct);
@@ -284,9 +284,9 @@ async fn replay_selects_latest_action_without_retention(
     ReplayBase::Checkpoint, (None, 0))]
 #[case::no_sources((None, None), ActionSet::live_adds(), false, false, false,
     ReplayBase::Empty, (None, 0))]
-#[case::partial_failure((None, None), ActionSet::live_adds(), false, true, true,
+#[case::normalization_failure((None, None), ActionSet::live_adds(), false, true, true,
     ReplayBase::Empty, (Some((0, 5)), 30))]
-#[case::crc_partial_failure((Some(2), Some((3, Some(1)))), ActionSet::live_adds(), false, true, true,
+#[case::crc_normalization_failure((Some(2), Some((3, Some(1)))), ActionSet::live_adds(), false, true, true,
     ReplayBase::Crc, (Some((4, 5)), 10))]
 fn report_retains_selected_inputs(
     #[case] sources: (Option<u64>, Option<(u64, Option<usize>)>),
@@ -356,11 +356,11 @@ fn report_retains_selected_inputs(
         .with_crc(crc.as_ref())
         .with_stats_filter(fail.then(|| col!("missing").eq(lit(0))))
         .replay();
-    assert_eq!(planned.result.is_err(), fail);
-    if let Err(error) = planned.result {
-        assert!(error.to_string().contains("missing"));
+    if fail {
+        assert!(planned.err().unwrap().to_string().contains("missing"));
+        return;
     }
-    let report = planned.metrics;
+    let report = planned.unwrap().metrics;
     assert_eq!(report.replay_base, Some(base));
     assert_eq!(
         report.base_version,

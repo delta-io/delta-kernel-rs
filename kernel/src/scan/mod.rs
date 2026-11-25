@@ -67,8 +67,7 @@ use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::events::emit_scan_metadata_completed;
 #[cfg(feature = "declarative-plans")]
 use crate::metrics::{
-    MetadataPlanningReport, ReplayBase, ScanPlanOutcome, ScanPlanReport,
-    emit_scan_plan_completed,
+    MetadataPlanningReport, ReplayBase, ScanPlanOutcome, ScanPlanReport, emit_scan_plan_completed,
 };
 use crate::metrics::{MetricId, ScanType};
 use crate::parallel::sequential_phase::SequentialPhase;
