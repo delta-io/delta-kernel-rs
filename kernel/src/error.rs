@@ -222,10 +222,7 @@ impl From<SnapshotHintError> for KernelError {
 #[non_exhaustive]
 #[derive(thiserror::Error, Debug)]
 pub enum KernelError {
-    /// This is an error that includes a backtrace. To have a particular type of error include such
-    /// backtrace (when RUST_BACKTRACE=1), annotate the error with `#[error(transparent)]` and then
-    /// add the error type and enum variant to the `from_with_backtrace!` macro invocation
-    /// below. See IOError for an example.
+    /// An error paired with a backtrace captured by [`KernelError::with_backtrace`].
     #[error("{source}\n{backtrace}")]
     Backtraced {
         source: Box<Self>,
@@ -696,7 +693,9 @@ impl KernelError {
         }
     }
 
-    // Capture a backtrace when the error is constructed.
+    /// Captures a backtrace when enabled by Rust's backtrace environment settings.
+    ///
+    /// See [`Backtrace::capture`] for configuration and platform support.
     #[must_use]
     pub fn with_backtrace(self) -> Self {
         let backtrace = Backtrace::capture();
