@@ -11,6 +11,8 @@ use crate::schema::PrimitiveType::{
     Binary, Boolean, Byte, Date, Decimal, Double, Float, Integer, Long, Short,
     String as StringType, Timestamp, TimestampNtz,
 };
+#[cfg(feature = "geo-type-in-dev")]
+use crate::schema::PrimitiveType::{Geography, Geometry};
 use crate::schema::{DataType, try_collect_column_defaults};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
@@ -31,26 +33,19 @@ const V3_CHECKS: &[IcebergCompatCheck] = &[
 ];
 
 pub(super) fn is_v3_supported_type(dt: &DataType) -> bool {
-    matches!(
-        dt,
+    match dt {
         DataType::Primitive(
-            Byte | Short
-                | Integer
-                | Long
-                | Float
-                | Double
-                | Boolean
-                | Binary
-                | StringType
-                | Date
-                | Timestamp
-                | TimestampNtz
-                | Decimal(_)
-        ) | DataType::Array(_)
-            | DataType::Map(_)
-            | DataType::Struct(_)
-            | DataType::Variant(_)
-    )
+            Byte | Short | Integer | Long | Float | Double | Boolean | Binary | StringType | Date
+            | Timestamp | TimestampNtz | Decimal(_),
+        )
+        | DataType::Array(_)
+        | DataType::Map(_)
+        | DataType::Struct(_)
+        | DataType::Variant(_) => true,
+        #[cfg(feature = "geo-type-in-dev")]
+        DataType::Primitive(Geometry(_) | Geography(_)) => true,
+        _ => false,
+    }
 }
 
 fn check_v3_supported_types(tc: &TableConfiguration) -> KernelResult<()> {
@@ -155,6 +150,23 @@ mod tests {
                 is_v3_supported_type(&dt),
                 "nested {dt} should be V3-supported"
             );
+        }
+        #[cfg(feature = "geo-type-in-dev")]
+        {
+            use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
+            let geospatial = [
+                DataType::from(GeometryType::try_new("EPSG:4326").unwrap()),
+                DataType::from(
+                    GeographyType::try_new("EPSG:4326", EdgeInterpolationAlgorithm::Spherical)
+                        .unwrap(),
+                ),
+            ];
+            for dt in geospatial {
+                assert!(
+                    is_v3_supported_type(&dt),
+                    "geospatial {dt} should be V3-supported"
+                );
+            }
         }
     }
 
