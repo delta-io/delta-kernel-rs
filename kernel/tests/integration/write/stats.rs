@@ -15,13 +15,14 @@ use delta_kernel::expressions::{ColumnName, expr};
 use delta_kernel::schema::{DataType, StructType, schema_ref};
 use delta_kernel::table_features::{ColumnMappingMode, get_any_level_column_physical_name};
 use delta_kernel::{Predicate as Pred, Snapshot};
+use rstest_reuse::apply;
 use test_utils::{
     create_table_and_load_snapshot, read_actions_from_commit, test_table_setup,
     test_table_setup_mt, write_batch_to_table,
 };
 use url::Url;
 
-use crate::common::write_utils::set_table_properties;
+use crate::common::write_utils::{checkpoint_engine, checkpoint_modes, set_table_properties};
 
 /// Builds a RecordBatch with schema (id: long, tags: array<string>, props: map<string, long>,
 /// v: variant). Each row gets one entry in tags, one entry in props, and a simple integer variant.
@@ -118,9 +119,10 @@ fn complex_type_batch(schema: &StructType, ids: &[i64], nulls: Option<&[bool]>) 
 /// statistics for those columns while excluding them from minValues/maxValues. Then writes a
 /// second file and scans with a predicate to verify data skipping works e2e. Parameterized
 /// over column mapping mode and whether a checkpoint is taken before the scan.
-#[rstest::rstest]
+#[apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_write_stats_for_complex_type_columns(
+    declarative: bool,
     #[values(
         ColumnMappingMode::None,
         ColumnMappingMode::Id,
@@ -144,6 +146,7 @@ async fn test_write_stats_for_complex_type_columns(
         ColumnMappingMode::Name => "name",
     };
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
     let snapshot = create_table_and_load_snapshot(
         &table_path,
         schema.clone(),
@@ -220,7 +223,7 @@ async fn test_write_stats_for_complex_type_columns(
 
     // Optionally checkpoint to verify stats survive the checkpoint round-trip
     let scan_snapshot = if use_checkpoint {
-        snapshot2.checkpoint(engine.as_ref(), None)?;
+        snapshot2.checkpoint(checkpoint_engine.as_ref(), None)?;
         Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?
     } else {
         snapshot2

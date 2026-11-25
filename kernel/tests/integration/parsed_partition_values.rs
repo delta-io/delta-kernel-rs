@@ -1,5 +1,7 @@
 //! Integration tests for parsed partition-value output (`partitionValues_parsed`).
 
+#![allow(clippy::too_many_arguments)]
+
 use std::fs::File;
 use std::sync::Arc;
 
@@ -27,6 +29,7 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{Engine, Snapshot, SnapshotRef};
 use rstest::rstest;
+use rstest_reuse::apply;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::table_builder::{
     DataLayoutConfig, FeatureSet, LogState, TableConfig, TestTableBuilder, partitioned,
@@ -38,6 +41,8 @@ use test_utils::{
     test_context, test_table_setup_mt,
 };
 use url::Url;
+
+use crate::common::write_utils::{checkpoint_engine, checkpoint_modes};
 
 /// Typed partition values use physical names across column mapping modes, with or without a
 /// checkpoint.
@@ -400,10 +405,11 @@ fn add_action(path: &str, p_str: &str, p_bin: &str, p_int: &str) -> String {
 /// commit) or read from a kernel-written checkpoint's native `partitionValues_parsed` column: the
 /// checkpoint reconstructs that column with the same cast, so a checkpoint never changes the value
 /// a scan surfaces. The `native_checkpoint` axis exercises both sources.
-#[rstest]
+#[apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn parsed_partition_values_read_foreign_empty_string(
     #[values(false, true)] native_checkpoint: bool,
+    declarative: bool,
 ) {
     let temp_dir = tempfile::tempdir().unwrap();
     let table_path = temp_dir.path().join("foreign-empty-string");
@@ -423,7 +429,10 @@ async fn parsed_partition_values_read_foreign_empty_string(
         let snapshot = Snapshot::builder_for(url.clone())
             .build(engine.as_ref())
             .unwrap();
-        snapshot.checkpoint(engine.as_ref(), None).unwrap();
+        let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
+        snapshot
+            .checkpoint(checkpoint_engine.as_ref(), None)
+            .unwrap();
     }
 
     // Confirm the scan reads from the intended source: the checkpoint axis must actually place a
@@ -485,9 +494,12 @@ fn collect_path(paths: &mut Vec<String>, scan_file: ScanFile) {
 /// - the same holds for the binary column (`p_bin`), whose "" reconstructs as empty bytes.
 ///
 /// The checkpoint axis verifies that native parsed checkpoint values preserve these semantics.
-#[rstest]
+#[apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn empty_string_partition_pruning(#[values(false, true)] native_checkpoint: bool) {
+async fn empty_string_partition_pruning(
+    #[values(false, true)] native_checkpoint: bool,
+    declarative: bool,
+) {
     let temp_dir = tempfile::tempdir().unwrap();
     let table_path = temp_dir.path().join("empty-string-pruning");
     let url = write_foreign_partition_table(
@@ -504,7 +516,10 @@ async fn empty_string_partition_pruning(#[values(false, true)] native_checkpoint
         let snapshot = Snapshot::builder_for(url.clone())
             .build(engine.as_ref())
             .unwrap();
-        snapshot.checkpoint(engine.as_ref(), None).unwrap();
+        let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
+        snapshot
+            .checkpoint(checkpoint_engine.as_ref(), None)
+            .unwrap();
     }
 
     let surviving = |predicate: Predicate| -> Vec<String> {
@@ -564,7 +579,7 @@ async fn empty_string_partition_pruning(#[values(false, true)] native_checkpoint
     );
 }
 
-#[rstest]
+#[apply(checkpoint_modes)]
 #[case::default_utc(None, "2024-01-15 12:30:45.123456", "2024-01-15T12:30:45.123456Z")]
 #[case::explicit_utc(
     Some("UTC"),
@@ -618,6 +633,7 @@ async fn offset_less_timestamp_partition_read_with_json_and_checkpoint(
     #[values("none", "id", "name")] cm_mode: &str,
     #[case] expected_ts: &str,
     #[values(false, true)] write_parsed_partition: bool,
+    declarative: bool,
 ) {
     // === Init a table with one file in a checkpoint and one in JSON ===
     let (_temp_dir, table_path, engine) = test_table_setup_mt().unwrap();
@@ -639,7 +655,10 @@ async fn offset_less_timestamp_partition_read_with_json_and_checkpoint(
     let snapshot = Snapshot::builder_for(&table_path)
         .build(engine.as_ref())
         .unwrap();
-    snapshot.checkpoint(engine.as_ref(), None).unwrap();
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
+    snapshot
+        .checkpoint(checkpoint_engine.as_ref(), None)
+        .unwrap();
 
     insert_raw_timestamp_partitions(
         &snapshot,
@@ -738,7 +757,7 @@ async fn offset_less_timestamp_partition_read_with_json_and_checkpoint(
     );
 }
 
-#[rstest]
+#[apply(checkpoint_modes)]
 #[case::utc_before(
     Predicate::from_expr(expr!(
         col("p_ts") < lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))
@@ -839,6 +858,7 @@ async fn offset_less_timestamp_partition_predicates_with_json_and_checkpoint(
     #[case] write_parsed_partition: bool,
     #[values(false, true)] parsed_struct_on_scan: bool,
     #[values("none", "id", "name")] cm_mode: &str,
+    declarative: bool,
 ) {
     let (_temp_dir, table_path, engine) = test_table_setup_mt().unwrap();
     let snapshot = create_timestamp_partition_table_with_parsed_partition(
@@ -865,7 +885,10 @@ async fn offset_less_timestamp_partition_predicates_with_json_and_checkpoint(
     let snapshot = Snapshot::builder_for(&table_path)
         .build(engine.as_ref())
         .unwrap();
-    snapshot.checkpoint(engine.as_ref(), None).unwrap();
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
+    snapshot
+        .checkpoint(checkpoint_engine.as_ref(), None)
+        .unwrap();
 
     insert_raw_timestamp_partitions(
         &snapshot,

@@ -20,6 +20,7 @@ use delta_kernel::schema::{DataType, MetadataValue, StructField, schema, schema_
 use delta_kernel::table_features::{ColumnMappingMode, get_any_level_column_physical_name};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{Engine, FileMeta, Snapshot};
+use rstest_reuse::apply;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::{
@@ -32,7 +33,8 @@ use test_utils::{
 use url::Url;
 
 use crate::common::write_utils::{
-    assert_min_max_stats, get_parquet_field_id, resolve_struct_field, set_table_properties,
+    assert_min_max_stats, checkpoint_engine, checkpoint_modes, get_parquet_field_id,
+    resolve_struct_field, set_table_properties,
 };
 
 /// 1. Creates a table with the given column mapping mode
@@ -41,12 +43,13 @@ use crate::common::write_utils::{
 /// 4. Reads a parquet footer to verify physical names/IDs
 /// 5. Reads data back to verify correctness
 /// 6. Removes files and verifies remove.stats matches the original add.stats
-#[rstest::rstest]
+#[apply(checkpoint_modes)]
 #[case::cm_none(ColumnMappingMode::None)]
 #[case::cm_id(ColumnMappingMode::Id)]
 #[case::cm_name(ColumnMappingMode::Name)]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_column_mapping_write(
+    declarative: bool,
     #[case] cm_mode: ColumnMappingMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -63,6 +66,8 @@ async fn test_column_mapping_write(
             )))
             .build(),
     );
+
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
 
     // Step 1: Create table
     let mode_str = match cm_mode {
@@ -113,7 +118,7 @@ async fn test_column_mapping_write(
 
     // Step 3: Checkpoint and verify add.stats uses correct column names
     let snapshot_for_checkpoint = latest_snapshot.clone();
-    snapshot_for_checkpoint.checkpoint(engine.as_ref(), None)?;
+    snapshot_for_checkpoint.checkpoint(checkpoint_engine.as_ref(), None)?;
     let ckpt_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let add_actions = read_add_infos(&ckpt_snapshot, engine.as_ref())?;
     let mut all_stats: Vec<_> = add_actions
@@ -278,7 +283,7 @@ async fn test_column_mapping_write(
 
     // Step 6: Remove files and verify remove.stats matches original add.stats
     {
-        let original_add_stats: Vec<serde_json::Value> =
+        let mut original_add_stats: Vec<serde_json::Value> =
             add_actions.iter().filter_map(|a| a.stats.clone()).collect();
         assert!(
             !original_add_stats.is_empty(),
@@ -292,7 +297,7 @@ async fn test_column_mapping_write(
             "Expected at least one remove action"
         );
 
-        let remove_stats: Vec<serde_json::Value> = remove_actions
+        let mut remove_stats: Vec<serde_json::Value> = remove_actions
             .iter()
             .filter_map(|r| {
                 r["stats"]
@@ -300,6 +305,8 @@ async fn test_column_mapping_write(
                     .map(|s| serde_json::from_str(s).unwrap())
             })
             .collect();
+        original_add_stats.sort_by_cached_key(serde_json::Value::to_string);
+        remove_stats.sort_by_cached_key(serde_json::Value::to_string);
         assert_eq!(
             remove_stats, original_add_stats,
             "remove.stats should match original add.stats"

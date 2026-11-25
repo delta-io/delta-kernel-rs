@@ -19,6 +19,7 @@ mod supported {
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::transaction::create_table::create_table as create_table_transaction;
     use rstest::rstest;
+    use rstest_reuse::apply;
     use test_utils::{
         get_column, read_actions_from_commit, test_read, test_table_setup, test_table_setup_mt,
         write_batch_to_table,
@@ -26,12 +27,14 @@ mod supported {
 
     use super::*;
     use crate::common::read_utils::read_parquet_file;
-    use crate::common::write_utils::load_existing_single_file_checkpoint_path;
+    use crate::common::write_utils::{
+        checkpoint_engine, checkpoint_modes, load_existing_single_file_checkpoint_path,
+    };
 
     /// Unpartitioned blind-append round-trip for both interval families, covering null / zero /
     /// negative values in a nested schema. Also verifies that ordinary columns retain their full
     /// statistics while the interval column gets only `nullCount`.
-    #[rstest]
+    #[apply(checkpoint_modes)]
     #[case::year_month(
         DataType::INTERVAL_YEAR_MONTH,
         Arc::new(Int32Array::from(vec![Some(0), Some(30), None, Some(-18)])) as ArrayRef,
@@ -42,6 +45,7 @@ mod supported {
     )]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_append_interval_roundtrip(
+        declarative: bool,
         #[case] interval: DataType,
         #[case] column: ArrayRef,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -54,6 +58,7 @@ mod supported {
         };
 
         let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+        let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
         let snapshot = create_table_transaction(&table_path, schema.clone(), "Test/1.0", true)
             .with_table_properties([("delta.checkpoint.writeStatsAsStruct", "true")])
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
@@ -146,7 +151,7 @@ mod supported {
             Some(&serde_json::json!("d"))
         );
 
-        snapshot.checkpoint(engine.as_ref(), None)?;
+        snapshot.checkpoint(checkpoint_engine.as_ref(), None)?;
         let checkpoint_path =
             load_existing_single_file_checkpoint_path(&table_path, snapshot.version());
         let checkpoint_batch = read_parquet_file(&checkpoint_path);

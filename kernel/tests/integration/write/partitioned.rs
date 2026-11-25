@@ -24,10 +24,12 @@ use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use rstest::rstest;
+use rstest_reuse::apply;
 use test_utils::{get_column, read_scan, test_table_setup_mt, write_batch_to_table};
 use url::Url;
 
 use crate::common::read_utils::read_parquet_file;
+use crate::common::write_utils::{checkpoint_engine, checkpoint_modes};
 
 // ==============================================================================
 // Tests
@@ -35,12 +37,13 @@ use crate::common::read_utils::read_parquet_file;
 
 /// Writes one row with a normal everyday value for every partition column type, reads it
 /// back, checkpoints, reloads from checkpoint, and verifies the values survive both paths.
-#[rstest]
+#[apply(checkpoint_modes)]
 #[case::cm_none(ColumnMappingMode::None)]
 #[case::cm_name(ColumnMappingMode::Name)]
 #[case::cm_id(ColumnMappingMode::Id)]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_write_partitioned_normal_values_roundtrip(
+    declarative: bool,
     #[case] cm_mode: ColumnMappingMode,
     #[values(true, false)] write_partition_values_parsed: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -127,7 +130,7 @@ async fn test_write_partitioned_normal_values_roundtrip(
     // ===== Step 4: Scan and verify values survive checkpoint + reload. =====
     // This is the only step affected by `write_partition_values_parsed`: the
     // post-checkpoint scan reads back through `partitionValues_parsed`.
-    verify_and_checkpoint(&snapshot, engine, assert_normal_values)?;
+    verify_and_checkpoint(&snapshot, engine, declarative, assert_normal_values)?;
 
     Ok(())
 }
@@ -503,12 +506,13 @@ async fn materialized_partitioned_interval_roundtrip(
 
 /// Writes one row with all null partition values, reads it back, checkpoints, reloads
 /// from checkpoint, and verifies every partition column is null in both reads.
-#[rstest]
+#[apply(checkpoint_modes)]
 #[case::cm_none(ColumnMappingMode::None)]
 #[case::cm_name(ColumnMappingMode::Name)]
 #[case::cm_id(ColumnMappingMode::Id)]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_write_partitioned_null_values_roundtrip(
+    declarative: bool,
     #[case] cm_mode: ColumnMappingMode,
     #[values(true, false)] write_partition_values_parsed: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -553,7 +557,12 @@ async fn test_write_partitioned_null_values_roundtrip(
     // ===== Step 4: Scan and verify all-null values survive checkpoint + reload. =====
     // This is the only step affected by `write_partition_values_parsed`: the
     // post-checkpoint scan reads back through `partitionValues_parsed`.
-    verify_and_checkpoint(&snapshot, engine, assert_all_partition_columns_null)?;
+    verify_and_checkpoint(
+        &snapshot,
+        engine,
+        declarative,
+        assert_all_partition_columns_null,
+    )?;
 
     Ok(())
 }
@@ -577,7 +586,7 @@ macro_rules! platform_path {
 /// string `a<char>b`, so `add.path` must start with `p=a<encoded>b/` (the encoded partition
 /// directory plus its trailing separator) and end in `.parquet`. The `partitionValues` map
 /// should carry the raw value unchanged.
-#[rstest]
+#[apply(checkpoint_modes)]
 // === Chars in both Hive and URI sets: Hive `%XX` -> URI `%25XX` (double-encoded) ===
 #[case::percent("a%b", "p=a%2525b/")]
 #[case::quote("a\"b", "p=a%2522b/")]
@@ -611,6 +620,7 @@ macro_rules! platform_path {
 #[case::del("a\x7Fb", "p=a%257Fb/")]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_write_partitioned_path_encodes_special_chars(
+    declarative: bool,
     #[case] value: &str,
     #[case] expected_path_prefix: &str,
     #[values(
@@ -666,7 +676,7 @@ async fn test_write_partitioned_path_encodes_special_chars(
     }
 
     // ===== Step 5: Scan and verify the row round-trips across checkpoint + reload. =====
-    verify_and_checkpoint(&snapshot, engine, |sorted| {
+    verify_and_checkpoint(&snapshot, engine, declarative, |sorted| {
         assert_eq!(sorted.num_rows(), 1);
         assert_eq!(
             sorted
@@ -1119,12 +1129,14 @@ async fn setup_and_write(
 fn verify_and_checkpoint(
     snapshot: &Arc<Snapshot>,
     engine: Arc<dyn delta_kernel::Engine>,
+    declarative: bool,
     assert_fn: impl Fn(&RecordBatch),
 ) -> Result<(), Box<dyn std::error::Error>> {
     let sorted = read_sorted(snapshot, engine.clone())?;
     assert_fn(&sorted);
 
-    snapshot.checkpoint(engine.as_ref(), None)?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
+    snapshot.checkpoint(checkpoint_engine.as_ref(), None)?;
     let reloaded = Snapshot::builder_for(snapshot.table_root()).build(engine.as_ref())?;
     let sorted = read_sorted(&reloaded, engine)?;
     assert_fn(&sorted);

@@ -10,6 +10,7 @@ use super::*;
 use crate::actions::{DomainMetadata, SetTransaction, get_all_actions_schema};
 use crate::arrow::compute::{concat_batches, filter_record_batch, is_not_null};
 use crate::checkpoint::{CheckpointSpec, V2CheckpointConfig};
+use crate::engine::DelegatingEngine;
 use crate::engine::arrow_conversion::TryIntoArrow;
 use crate::engine::sync::SyncEngine;
 use crate::scan::StatsOptions;
@@ -84,8 +85,11 @@ async fn replay_selects_latest_action_without_retention(
         }
         table.commit(actions).await;
         if version == 3 && checkpoint.is_some() {
+            // Preserve input flags independently of declarative checkpoint output shaping.
+            let checkpoint_engine =
+                DelegatingEngine::new(Arc::new(SyncEngine::new())).without_plan_executor();
             build_snapshot!(VersionTarget::Latest, &table_root, &engine)
-                .checkpoint(&engine, checkpoint.as_ref())?;
+                .checkpoint(&checkpoint_engine, checkpoint.as_ref())?;
         }
     }
     features.push(TableFeature::ChangeDataFeed);

@@ -6,6 +6,12 @@ ensure that they are acting as a "connector" for the kernel APIs, thereby
 allowing us to test the exact same engine interfaces that any connector
 implemented on top of delta-kernel-rs would be using.
 
+Checkpoint specs use `Snapshot::checkpoint` on temporary copies of their tables. With the
+`declarative-plans` feature, a plan-backed engine writes V1 or sidecar-based V2 checkpoints
+and publishes the complete `_last_checkpoint` hint. After removing older JSON commits, the
+runner compares all checkpoint actions and companion reads with the source table. Snapshot
+specs validate protocol, metadata, transaction versions, and domain metadata expectations.
+
 ## Authoring a DAT case locally
 
 CI downloads a published DAT corpus, pinned to a version in `build.rs`. To create

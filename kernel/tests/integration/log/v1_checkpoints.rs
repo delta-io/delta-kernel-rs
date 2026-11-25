@@ -3,28 +3,42 @@
 use std::collections::HashMap;
 
 use delta_kernel::arrow::array::RecordBatchReader;
+use delta_kernel::arrow::datatypes::DataType;
 use delta_kernel::checkpoint::CheckpointSpec;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use test_utils::{create_table_and_load_snapshot, test_table_setup_mt, write_batch_to_table};
 
 use crate::common::write_utils::{
-    get_simple_schema, load_existing_single_file_checkpoint_path, simple_id_batch,
+    checkpoint_engine, checkpoint_modes, get_simple_schema,
+    load_existing_single_file_checkpoint_path, simple_id_batch,
 };
 
 /// On a V1 table (no `v2Checkpoint` feature), passing either `None` or
 /// `Some(CheckpointSpec::V1)` to `snapshot.checkpoint()` produces a V1 checkpoint: the main
 /// parquet schema must not contain a `checkpointMetadata` column.
-#[rstest::rstest]
+#[rstest_reuse::apply(checkpoint_modes)]
 #[case::none(None)]
 #[case::v1(Some(CheckpointSpec::V1))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_snapshot_checkpoint_on_v1_table(
     #[case] spec: Option<CheckpointSpec>,
+    #[values(None, Some(true), Some(false))] write_struct: Option<bool>,
+    declarative: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = get_simple_schema();
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
+    let properties = write_struct
+        .map(|enabled| {
+            (
+                "delta.checkpoint.writeStatsAsStruct",
+                if enabled { "true" } else { "false" },
+            )
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
     let mut snapshot =
-        create_table_and_load_snapshot(&table_path, schema.clone(), engine.as_ref(), &[])?;
+        create_table_and_load_snapshot(&table_path, schema.clone(), engine.as_ref(), &properties)?;
 
     snapshot = write_batch_to_table(
         &snapshot,
@@ -35,7 +49,14 @@ async fn test_snapshot_checkpoint_on_v1_table(
     .await?;
 
     let version = snapshot.version();
-    snapshot.checkpoint(engine.as_ref(), spec.as_ref())?;
+    if declarative && write_struct == Some(true) {
+        test_utils::assert_result_error_with_message(
+            snapshot.checkpoint(checkpoint_engine.as_ref(), spec.as_ref()),
+            "V1 checkpoint plans require JSON-only statistics",
+        );
+        return Ok(());
+    }
+    snapshot.checkpoint(checkpoint_engine.as_ref(), spec.as_ref())?;
 
     let ckpt_path = load_existing_single_file_checkpoint_path(&table_path, version);
     let file = std::fs::File::open(&ckpt_path)?;
@@ -44,6 +65,14 @@ async fn test_snapshot_checkpoint_on_v1_table(
     assert!(
         schema.field_with_name("checkpointMetadata").is_err(),
         "V1 checkpoint must not contain `checkpointMetadata` column, found schema: {schema:?}"
+    );
+    let DataType::Struct(add_fields) = schema.field_with_name("add")?.data_type() else {
+        panic!("checkpoint add must be a struct");
+    };
+    assert!(add_fields.find("stats").is_some());
+    assert_eq!(
+        add_fields.find("stats_parsed").is_some(),
+        !declarative && write_struct.unwrap_or(false)
     );
 
     Ok(())

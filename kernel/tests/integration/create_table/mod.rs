@@ -31,6 +31,8 @@ use rstest::rstest;
 use serde_json::Value;
 use test_utils::{assert_result_error_with_message, test_table_setup, test_table_setup_mt};
 
+use crate::common::write_utils::{checkpoint_engine, checkpoint_modes};
+
 /// Helper to create a simple two-column schema for tests.
 /// Shared with sub-modules.
 pub(crate) fn simple_schema() -> KernelResult<Arc<StructType>> {
@@ -324,15 +326,17 @@ async fn test_create_table_empty_schema_succeeds() -> delta_kernel::Result<()> {
 /// schema is a corner the writer can plausibly mishandle. This test creates an empty
 /// table, checkpoints immediately, then reloads from scratch to confirm the schema
 /// survives the round-trip across all column-mapping modes.
-#[rstest]
+#[rstest_reuse::apply(checkpoint_modes)]
 #[case::no_cm(None)]
 #[case::cm_name(Some("name"))]
 #[case::cm_id(Some("id"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_create_table_empty_schema_checkpoint_round_trip(
     #[case] cm_mode: Option<&str>,
+    declarative: bool,
 ) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
 
     let schema = schema_ref! {};
     let mut builder = create_table(&table_path, schema, "EmptySchemaApp/0.1.0", true);
@@ -346,7 +350,7 @@ async fn test_create_table_empty_schema_checkpoint_round_trip(
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     let v0 = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let (_, _ckpt_snapshot) = v0.checkpoint(engine.as_ref(), None)?;
+    let (_, _ckpt_snapshot) = v0.checkpoint(checkpoint_engine.as_ref(), None)?;
 
     let reloaded = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     assert_eq!(reloaded.version(), 0);

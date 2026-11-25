@@ -8,7 +8,7 @@ use std::path::Path;
 use acceptance::acceptance_workloads::LoadedTestCase;
 use acceptance::acceptance_workloads::workload::execute_and_validate_workload;
 
-const UNSUPPORTED_SPEC_TYPES: &[&str] = &["cdf", "checkpoint", "crc", "write"];
+const UNSUPPORTED_SPEC_TYPES: &[&str] = &["cdf", "crc", "write"];
 
 fn corpus_relative_spec_id(spec_path: &Path, corpus_root: &Path) -> Result<String, String> {
     let relative = spec_path.strip_prefix(corpus_root).map_err(|_| {

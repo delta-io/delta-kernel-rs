@@ -33,7 +33,15 @@ use delta_kernel::schema::{
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{KernelError, Snapshot, SnapshotRef};
+#[cfg(feature = "declarative-plans")]
+use delta_kernel::{
+    checkpoint::CheckpointNaming,
+    engine::{plans::PlanBasedEngine, sync::plan::SyncPlanExecutor},
+    plans::{Operation, PlanExecutor as _},
+    transaction::UpdateTableOperation,
+};
 use rstest::rstest;
+use rstest_reuse::apply;
 use serde::Serialize;
 use serde_json::{Value, json};
 use test_utils::delta_kernel_default_engine::DefaultEngine;
@@ -45,7 +53,7 @@ use test_utils::{
 };
 use url::Url;
 
-use crate::common::write_utils::set_table_properties;
+use crate::common::write_utils::{checkpoint_engine, checkpoint_modes, set_table_properties};
 
 type TestEngine = DefaultEngine<TokioMultiThreadExecutor>;
 
@@ -82,8 +90,9 @@ fn long_batch(schema: &SchemaRef, c0_start: i64, rows: i64) -> RecordBatch {
 /// Creates a fresh table with `dataSkippingNumIndexedCols=2`, writes three add-files with
 /// disjoint `c0`/`c1` ranges, then checkpoints. Returns `(temp_dir, table_path, engine)`.
 /// The `temp_dir` keeps the on-disk table alive for the duration of the test.
-async fn build_capped_table_with_checkpoint()
--> Result<(tempfile::TempDir, String, Arc<TestEngine>), Box<dyn std::error::Error>> {
+async fn build_capped_table_with_checkpoint(
+    declarative: bool,
+) -> Result<(tempfile::TempDir, String, Arc<TestEngine>), Box<dyn std::error::Error>> {
     let schema = capped_schema();
     let (tmp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = Url::from_directory_path(&table_path)
@@ -113,7 +122,8 @@ async fn build_capped_table_with_checkpoint()
         .await?;
     }
 
-    snapshot.checkpoint(engine.as_ref(), None)?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
+    snapshot.checkpoint(checkpoint_engine.as_ref(), None)?;
     Ok((tmp_dir, table_path, engine))
 }
 
@@ -203,45 +213,49 @@ fn surviving_paths(
 //   file C: c0 in [100, 109], c1 in [200, 209]
 //   c2/c3/c4: past-cap, no stats.
 
-#[rstest]
+#[apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn all_in_cap_prunes(
     #[values(false, true)] use_parallel: bool,
+    declarative: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_tmp_dir, table_path, engine) = build_capped_table_with_checkpoint().await?;
+    let (_tmp_dir, table_path, engine) = build_capped_table_with_checkpoint(declarative).await?;
     let pred = Arc::new(Pred::from_expr(expr!(col("c0") > 60i64)));
     assert_eq!(surviving_files(&table_path, engine, pred, use_parallel)?, 1);
     Ok(())
 }
 
-#[rstest]
+#[apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn all_in_cap_keeps_all(
     #[values(false, true)] use_parallel: bool,
+    declarative: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_tmp_dir, table_path, engine) = build_capped_table_with_checkpoint().await?;
+    let (_tmp_dir, table_path, engine) = build_capped_table_with_checkpoint(declarative).await?;
     let pred = Arc::new(Pred::from_expr(expr!(col("c0") > 0i64)));
     assert_eq!(surviving_files(&table_path, engine, pred, use_parallel)?, 3);
     Ok(())
 }
 
-#[rstest]
+#[apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn all_past_cap_keeps_all(
     #[values(false, true)] use_parallel: bool,
+    declarative: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_tmp_dir, table_path, engine) = build_capped_table_with_checkpoint().await?;
+    let (_tmp_dir, table_path, engine) = build_capped_table_with_checkpoint(declarative).await?;
     let pred = Arc::new(Pred::from_expr(expr!(col("c4") > 1_000_000i64)));
     assert_eq!(surviving_files(&table_path, engine, pred, use_parallel)?, 3);
     Ok(())
 }
 
-#[rstest]
+#[apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mixed_and_in_cap_prunes(
     #[values(false, true)] use_parallel: bool,
+    declarative: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_tmp_dir, table_path, engine) = build_capped_table_with_checkpoint().await?;
+    let (_tmp_dir, table_path, engine) = build_capped_table_with_checkpoint(declarative).await?;
     // c0 > 60 prunes files A and B; c4 > 50 is past-cap and folds to NULL.
     // AND(false, NULL) = false keeps the prune; AND(true, NULL) = NULL keeps file C.
     let pred = Arc::new(Pred::from_expr(expr!(and(
@@ -252,12 +266,13 @@ async fn mixed_and_in_cap_prunes(
     Ok(())
 }
 
-#[rstest]
+#[apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mixed_or_keeps_all(
     #[values(false, true)] use_parallel: bool,
+    declarative: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_tmp_dir, table_path, engine) = build_capped_table_with_checkpoint().await?;
+    let (_tmp_dir, table_path, engine) = build_capped_table_with_checkpoint(declarative).await?;
     // c0 > 1000 would prune all 3 by max; c4 > 50 is past-cap and folds to NULL.
     // OR(false, NULL) = NULL keeps every file.
     let pred = Arc::new(Pred::from_expr(expr!(or(
@@ -268,12 +283,13 @@ async fn mixed_or_keeps_all(
     Ok(())
 }
 
-#[rstest]
+#[apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn boundary_c1_prunes_all(
     #[values(false, true)] use_parallel: bool,
+    declarative: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_tmp_dir, table_path, engine) = build_capped_table_with_checkpoint().await?;
+    let (_tmp_dir, table_path, engine) = build_capped_table_with_checkpoint(declarative).await?;
     // c1 max across files is 209 < 250 so the in-cap arm rules out everything.
     // c2 > 50 is past-cap and folds to NULL; AND(false, NULL) = false everywhere.
     let pred = Arc::new(Pred::from_expr(expr!(and(
@@ -291,6 +307,7 @@ async fn boundary_c1_prunes_all(
 /// original `add.stats` verbatim, so the past-cap stats survive into the checkpoint.
 async fn build_table_with_past_cap_stats(
     checkpoint: bool,
+    declarative: bool,
 ) -> Result<(tempfile::TempDir, String, Arc<TestEngine>), Box<dyn std::error::Error>> {
     let schema = capped_schema();
     let (tmp_dir, table_path, engine) = test_table_setup_mt()?;
@@ -317,7 +334,8 @@ async fn build_table_with_past_cap_stats(
         &[("delta.dataSkippingNumIndexedCols", "2")],
     )?;
     if checkpoint {
-        snapshot.checkpoint(engine.as_ref(), None)?;
+        let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
+        snapshot.checkpoint(checkpoint_engine.as_ref(), None)?;
     }
     Ok((tmp_dir, table_path, engine))
 }
@@ -428,7 +446,7 @@ async fn past_cap_column_surfaces_in_stats_parsed_output(
     #[case] stats: StatsOptions,
     #[case] expected_min_fields: &[&str],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_tmp_dir, table_path, engine) = build_table_with_past_cap_stats(false).await?;
+    let (_tmp_dir, table_path, engine) = build_table_with_past_cap_stats(false, false).await?;
     let url = delta_kernel::try_parse_uri(&table_path)?;
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
     let scan = snapshot.scan_builder().with_stats(stats).build()?;
@@ -440,7 +458,7 @@ async fn past_cap_column_surfaces_in_stats_parsed_output(
 }
 
 /// The checkpoint case verifies JSON recovery when struct stats omit the past-cap column.
-#[rstest]
+#[apply(checkpoint_modes)]
 #[case::json_commits(false)]
 #[case::checkpoint(true)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -454,8 +472,10 @@ async fn past_cap_stats_column_enables_pruning(
         StatsOptions::struct_columns(vec![column_name!("c2")])
     )]
     bypass_stats: StatsOptions,
+    declarative: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_tmp_dir, table_path, engine) = build_table_with_past_cap_stats(checkpoint).await?;
+    let (_tmp_dir, table_path, engine) =
+        build_table_with_past_cap_stats(checkpoint, declarative).await?;
     let predicate = || Arc::new(Pred::from_expr(expr!(col("c2") > 60i64)));
 
     let default_survivors = surviving_paths_with_stats(
@@ -746,15 +766,23 @@ async fn extended_year_timestamp_stats_dont_collapse_skipping(
 ///           bad stats had blanked the whole v1 batch during checkpoint write.
 ///   file_C: would-survive predicate via JSON `parse_json`, but the v3 Remove suppresses
 ///           it during log replay.
-#[rstest]
+#[apply(checkpoint_modes)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn extended_year_timestamp_round_trip_via_checkpoint_and_remove(
     #[values(false, true)] use_parallel: bool,
+    declarative: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // writeStatsAsStruct makes the checkpoint materialize stats_parsed, the column where the
     // safe-cast result lands.
     let (_tmp_dir, table_path, engine, table_url, store) =
-        timestamp_stats_table_setup(&[("delta.checkpoint.writeStatsAsStruct", "true")])?;
+        timestamp_stats_table_setup(if declarative {
+            &[
+                ("delta.checkpoint.writeStatsAsStruct", "true"),
+                ("delta.feature.v2Checkpoint", "supported"),
+            ]
+        } else {
+            &[("delta.checkpoint.writeStatsAsStruct", "true")]
+        })?;
     let table_url_string = table_url.to_string();
 
     // v1: file_A + file_B + file_E in one commit. The shared batch is what makes the
@@ -804,7 +832,9 @@ async fn extended_year_timestamp_round_trip_via_checkpoint_and_remove(
     // Checkpoint at v1: build_stats_parsed_expr COALESCE evaluates parse_json on the v1
     // batch and materializes stats_parsed with file_B's EventTime safe-cast to NULL.
     let snapshot_v1 = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    snapshot_v1.checkpoint(engine.as_ref(), None)?;
+    let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
+    let checkpoint_spec = declarative.then_some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar));
+    snapshot_v1.checkpoint(checkpoint_engine.as_ref(), checkpoint_spec.as_ref())?;
 
     // v2: file_C via JSON commit, post-checkpoint. Reads still see this as JSON stats and
     // run parse_json at scan time.
@@ -911,9 +941,142 @@ async fn millisecond_truncated_timestamp_stats_dont_overprune(
     Ok(())
 }
 
+async fn replace_table_schema_change(
+    old_schema: SchemaRef,
+    checkpoint_spec: Option<&CheckpointSpec>,
+    write_struct: bool,
+    old_json_stats: bool,
+    declarative: bool,
+) -> Result<(tempfile::TempDir, String, Arc<TestEngine>), Box<dyn std::error::Error>> {
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+
+    let old_partition = if old_schema.field("part").unwrap().data_type() == &DataType::STRING {
+        "not-an-integer"
+    } else {
+        "1"
+    };
+    let old_value = if old_schema.field("value").unwrap().data_type() == &DataType::STRING {
+        json!("not-an-integer")
+    } else {
+        json!(10)
+    };
+    let builder = create_table(&table_path, old_schema, "Test/1.0", true)
+        .with_data_layout(DataLayout::partitioned(["part"]))
+        .with_table_properties([
+            (
+                "delta.checkpoint.writeStatsAsStruct",
+                write_struct.to_string(),
+            ),
+            (
+                "delta.checkpoint.writeStatsAsJson",
+                old_json_stats.to_string(),
+            ),
+        ]);
+    let builder = if matches!(checkpoint_spec, Some(CheckpointSpec::V1)) {
+        builder
+    } else {
+        builder.with_table_properties([("delta.feature.v2Checkpoint", "supported")])
+    };
+    builder
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+
+    let store: Arc<delta_kernel::object_store::DynObjectStore> = Arc::new(LocalFileSystem::new());
+    let table_url = Url::from_directory_path(&table_path)
+        .map_err(|_| "table_path should be a valid file URL")?;
+
+    // Commit 2 writes addFiles using `old_schema`.
+    let old_paths = ["old-1.parquet", "old-2.parquet", "old-3.parquet"];
+    let old_adds = [
+        json!({
+            "commitInfo": {
+                "timestamp": 1700000000000i64,
+                "operation": "WRITE",
+                "version": 1,
+            }
+        }),
+        add_file_action(old_paths[0], 201, old_partition, old_value.clone())?,
+        add_file_action(old_paths[1], 202, old_partition, old_value.clone())?,
+        add_file_action(old_paths[2], 203, old_partition, old_value)?,
+    ];
+    add_commit(
+        table_url.as_str(),
+        store.as_ref(),
+        1,
+        old_adds.map(|action| action.to_string()).join("\n"),
+    )
+    .await?;
+
+    if let Some(spec) = checkpoint_spec {
+        let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
+        Snapshot::builder_for(table_url.clone())
+            .build(engine.as_ref())?
+            .checkpoint(checkpoint_engine.as_ref(), Some(spec))?;
+    }
+
+    // Commit 3 replaces the table metadata and removes the addFiles.
+    let replacement_schema = schema! {
+        not_null "part": LONG,
+        nullable "value": LONG,
+    };
+    let replacement = [
+        json!({
+            "commitInfo": {
+                "timestamp": 1700000001000i64,
+                "operation": "CREATE OR REPLACE TABLE",
+                "version": 2,
+            }
+        }),
+        json!({
+            "metaData": {
+                "id": "replacement-table",
+                "format": { "provider": "parquet", "options": {} },
+                "schemaString": serde_json::to_string(&replacement_schema)?,
+                "partitionColumns": ["part"],
+                "configuration": { "delta.checkpoint.writeStatsAsStruct": write_struct.to_string() },
+                "createdTime": 1700000001000i64,
+            }
+        }),
+        remove_file_action(old_paths[0])?,
+        remove_file_action(old_paths[1])?,
+        remove_file_action(old_paths[2])?,
+    ];
+    add_commit(
+        table_url.as_str(),
+        store.as_ref(),
+        2,
+        replacement.map(|action| action.to_string()).join("\n"),
+    )
+    .await?;
+
+    // Commit 4 writes addFiles with distinct partition values and statistics.
+    let new_adds = [
+        json!({
+            "commitInfo": {
+                "timestamp": 1700000002000i64,
+                "operation": "WRITE",
+                "version": 3,
+            }
+        }),
+        add_file_action("new-1.parquet", 101, "1", 10)?,
+        add_file_action("new-2.parquet", 102, "2", 20)?,
+        add_file_action("new-3.parquet", 103, "3", 30)?,
+    ];
+    add_commit(
+        table_url.as_str(),
+        store.as_ref(),
+        3,
+        new_adds.map(|action| action.to_string()).join("\n"),
+    )
+    .await?;
+
+    Ok((_tmp_dir, table_path, engine))
+}
+
 /// Replace table may change partition and data column types. A scan after replacement should
 /// remain compatible with the old addFiles.
-#[rstest]
+#[apply(checkpoint_modes)]
 #[case::partition(
     Arc::new(Pred::from_expr(expr!(col("part") == 1i64))),
     &["new-1.parquet"],
@@ -940,140 +1103,26 @@ async fn scan_with_replace_table_schema_change(
     #[case] expected_active_bytes: u64,
     #[values(false, true)] use_parallel: bool,
     #[values(false, true)] checkpoint_old_add: bool,
+    declarative: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
-
-    // Commit 1 creates the table with a string partition column.
     let old_schema = schema_ref! {
         nullable "part": STRING,
         nullable "value": STRING,
     };
-    create_table(&table_path, old_schema, "Test/1.0", true)
-        .with_data_layout(DataLayout::partitioned(["part"]))
-        .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
-        .unwrap_post_commit_snapshot();
-
+    let checkpoint_spec = CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+        file_actions_per_sidecar_hint: Some(1),
+    });
+    let (_tmp_dir, table_path, engine) = replace_table_schema_change(
+        old_schema,
+        checkpoint_old_add.then_some(&checkpoint_spec),
+        false,
+        true,
+        declarative,
+    )
+    .await?;
     let store: Arc<delta_kernel::object_store::DynObjectStore> = Arc::new(LocalFileSystem::new());
     let table_url = Url::from_directory_path(&table_path)
         .map_err(|_| "table_path should be a valid file URL")?;
-
-    // Commit 2 writes addFiles using `old_schema`.
-    let old_paths = ["old-1.parquet", "old-2.parquet", "old-3.parquet"];
-    let old_adds = [
-        json!({
-            "commitInfo": {
-                "timestamp": 1700000000000i64,
-                "operation": "WRITE",
-                "version": 1,
-            }
-        }),
-        add_file_action(
-            old_paths[0],
-            201,                           /* size */
-            "not-an-integer-partition-1",  /* partition_value */
-            "not-an-integer-data-value-1", /* data_value */
-        )?,
-        add_file_action(
-            old_paths[1],
-            202,                           /* size */
-            "not-an-integer-partition-2",  /* partition_value */
-            "not-an-integer-data-value-2", /* data_value */
-        )?,
-        add_file_action(
-            old_paths[2],
-            203,                           /* size */
-            "not-an-integer-partition-3",  /* partition_value */
-            "not-an-integer-data-value-3", /* data_value */
-        )?,
-    ];
-    add_commit(
-        table_url.as_str(),
-        store.as_ref(),
-        1,
-        old_adds.map(|action| action.to_string()).join("\n"),
-    )
-    .await?;
-
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    if checkpoint_old_add {
-        let checkpoint_spec = CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
-            file_actions_per_sidecar_hint: Some(1),
-        });
-        snapshot.checkpoint(engine.as_ref(), Some(&checkpoint_spec))?;
-    }
-
-    // Commit 3 replaces the table metadata and removes the addFiles.
-    let replacement_schema = schema! {
-        nullable "part": LONG,
-        nullable "value": LONG,
-    };
-    let replacement = [
-        json!({
-            "commitInfo": {
-                "timestamp": 1700000001000i64,
-                "operation": "CREATE OR REPLACE TABLE",
-                "version": 2,
-            }
-        }),
-        json!({
-            "metaData": {
-                "id": "replacement-table",
-                "format": { "provider": "parquet", "options": {} },
-                "schemaString": serde_json::to_string(&replacement_schema)?,
-                "partitionColumns": ["part"],
-                "configuration": {},
-                "createdTime": 1700000001000i64,
-            }
-        }),
-        remove_file_action(old_paths[0])?,
-        remove_file_action(old_paths[1])?,
-        remove_file_action(old_paths[2])?,
-    ];
-    add_commit(
-        table_url.as_str(),
-        store.as_ref(),
-        2,
-        replacement.map(|action| action.to_string()).join("\n"),
-    )
-    .await?;
-
-    // Commit 4 writes addFiles with distinct partition values and statistics.
-    let new_adds = [
-        json!({
-            "commitInfo": {
-                "timestamp": 1700000002000i64,
-                "operation": "WRITE",
-                "version": 3,
-            }
-        }),
-        add_file_action(
-            "new-1.parquet",
-            101, /* size */
-            "1", /* partition_value */
-            10,  /* data_value */
-        )?,
-        add_file_action(
-            "new-2.parquet",
-            102, /* size */
-            "2", /* partition_value */
-            20,  /* data_value */
-        )?,
-        add_file_action(
-            "new-3.parquet",
-            103, /* size */
-            "3", /* partition_value */
-            30,  /* data_value */
-        )?,
-    ];
-    add_commit(
-        table_url.as_str(),
-        store.as_ref(),
-        3,
-        new_adds.map(|action| action.to_string()).join("\n"),
-    )
-    .await?;
 
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
@@ -1174,7 +1223,8 @@ async fn scan_with_replace_table_schema_change(
         let checkpoint_spec = CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
             file_actions_per_sidecar_hint: Some(1),
         });
-        snapshot.checkpoint(engine.as_ref(), Some(&checkpoint_spec))?;
+        let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
+        snapshot.checkpoint(checkpoint_engine.as_ref(), Some(&checkpoint_spec))?;
     }
     let error = surviving_paths(&table_path, engine, predicate, use_parallel)
         .expect_err("an active incompatible add file should fail the scan");
@@ -1182,6 +1232,78 @@ async fn scan_with_replace_table_schema_change(
         error.downcast_ref::<KernelError>(),
         Some(KernelError::ParseError(_, _))
     ));
+    Ok(())
+}
+
+#[cfg(feature = "declarative-plans")]
+#[rstest]
+#[case::v1(CheckpointSpec::V1, CheckpointNaming::Classic)]
+#[case::inline(
+    CheckpointSpec::V2(V2CheckpointConfig::NoSidecar),
+    CheckpointNaming::Classic
+)]
+#[case::sidecars_classic(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+    file_actions_per_sidecar_hint: Some(1),
+}), CheckpointNaming::Classic)]
+#[case::sidecars_uuid(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+    file_actions_per_sidecar_hint: Some(1),
+}), CheckpointNaming::Uuid)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn declarative_checkpoint_after_replace_table_with_incompatible_native_metadata(
+    #[case] spec: CheckpointSpec,
+    #[case] naming: CheckpointNaming,
+    #[values(false, true)] old_json_stats: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_tmp_dir, table_path, engine) = replace_table_schema_change(
+        schema_ref! { nullable "part": STRING, nullable "value": STRING },
+        Some(&spec),
+        true,
+        old_json_stats,
+        false,
+    )
+    .await?;
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let snapshot = if matches!(&spec, CheckpointSpec::V1) {
+        snapshot
+            .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+            .with_table_properties_added([("delta.checkpoint.writeStatsAsStruct", "false")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot()
+    } else {
+        snapshot
+    };
+    let executor = Arc::new(SyncPlanExecutor::new(None));
+    let planning_engine = PlanBasedEngine::new(Some(engine.clone()), executor.clone());
+    let writer = snapshot.create_checkpoint_writer(&planning_engine)?;
+    let writer = match &spec {
+        CheckpointSpec::V2(config) => writer.with_v2_checkpoint_config(config.clone()),
+        _ => writer,
+    };
+    let writer = writer.with_checkpoint_naming(naming);
+    let plan = writer.declarative_checkpoint_plan(&planning_engine)?;
+    let bytes = writer
+        .last_checkpoint_bytes_from_result(executor.execute_op(Operation::QueryPlan(plan))?)?;
+    std::fs::write(
+        table_url
+            .join("_delta_log/_last_checkpoint")?
+            .to_file_path()
+            .unwrap(),
+        bytes,
+    )?;
+    assert_eq!(
+        surviving_paths(
+            &table_path,
+            engine,
+            Arc::new(Pred::from_expr(expr!(and(
+                col("part") == 1i64,
+                col("value") == 10i64
+            )))),
+            false,
+        )?,
+        ["new-1.parquet"]
+    );
     Ok(())
 }
 
@@ -1433,7 +1555,7 @@ fn value_stats_json(num_records: i64, null_count: i64, bounds: Option<(i64, i64)
     )
 }
 
-#[rstest]
+#[apply(checkpoint_modes)]
 // Two representative operators: `=` exercises the direct null-intolerant arm of
 // `eval_sql_where` and `!=` the NOT-wrapped arm. The not-all-null guard is operator-agnostic, and
 // the unit test `test_all_null_pruning_all_comparison_ops` covers all six operators at the rewrite
@@ -1451,22 +1573,32 @@ async fn all_null_files_pruned_regardless_of_source(
     )]
     source: AllNullSource,
     #[values(false, true)] use_parallel: bool,
+    declarative: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
     let schema = schema_ref! { nullable "value": LONG };
     // For the struct-stats cases, also disable `writeStatsAsJson` so the checkpoint carries ONLY
     // `stats_parsed`. That forces the scan to read the pre-parsed struct (no JSON fallback),
-    // genuinely validating that path. The JSON-stats case keeps the defaults
-    // (`writeStatsAsJson=true`, `writeStatsAsStruct=false`), so its checkpoint carries only JSON
-    // stats. Either way the all-null file's `nullCount` survives into the checkpoint.
+    // validating that path. The JSON-stats case explicitly disables structured stats. Either way
+    // the all-null file's `nullCount` survives into the checkpoint.
     let table_properties: &[(&str, &str)] = match source {
         AllNullSource::CheckpointStructStats | AllNullSource::Both => &[
             ("delta.checkpoint.writeStatsAsStruct", "true"),
             ("delta.checkpoint.writeStatsAsJson", "false"),
         ],
-        AllNullSource::CommitOnly | AllNullSource::CheckpointJsonStats => &[],
+        AllNullSource::CheckpointJsonStats => &[("delta.checkpoint.writeStatsAsStruct", "false")],
+        AllNullSource::CommitOnly => &[],
     };
-    let _ = create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), table_properties)?;
+    let mut table_properties = table_properties.to_vec();
+    let structured_checkpoint = matches!(
+        source,
+        AllNullSource::CheckpointStructStats | AllNullSource::Both
+    );
+    if declarative && structured_checkpoint {
+        table_properties.push(("delta.feature.v2Checkpoint", "supported"));
+    }
+    let _ =
+        create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), &table_properties)?;
     let store: Arc<delta_kernel::object_store::DynObjectStore> = Arc::new(LocalFileSystem::new());
     let table_url = Url::from_directory_path(&table_path)
         .map_err(|_| "table_path should be a valid file URL")?;
@@ -1498,7 +1630,10 @@ async fn all_null_files_pruned_regardless_of_source(
     // Checkpoint so the all-null file (and the kept file) are sourced from the checkpoint parquet.
     if use_checkpoint {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-        snapshot.checkpoint(engine.as_ref(), None)?;
+        let checkpoint_engine = checkpoint_engine(engine.clone(), None, declarative);
+        let checkpoint_spec = (declarative && structured_checkpoint)
+            .then_some(CheckpointSpec::V2(V2CheckpointConfig::NoSidecar));
+        snapshot.checkpoint(checkpoint_engine.as_ref(), checkpoint_spec.as_ref())?;
     }
 
     // v2: post-checkpoint JSON commit adding an all-null file (the delta-log source).
