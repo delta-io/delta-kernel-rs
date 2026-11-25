@@ -345,10 +345,10 @@ impl EngineData for ArrowEngineData {
                 Ok((field, column))
             },
         )?;
-        let nulls = column.logical_nulls();
-        Ok((0..self.len())
-            .map(|row| nulls.as_ref().is_some_and(|nulls| nulls.is_null(row)))
-            .collect())
+        Ok(match column.logical_nulls() {
+            Some(nulls) => nulls.iter().map(|valid| !valid).collect(),
+            None => vec![false; self.len()],
+        })
     }
 }
 
