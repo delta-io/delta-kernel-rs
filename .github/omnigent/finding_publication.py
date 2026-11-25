@@ -381,7 +381,7 @@ def publication_check(review: str, record: dict[str, Any]) -> str:
     parts = [complete_review(review, record["findings"]), "## Finding comments and reports",
              f"New finding comments: {totals['new']} · Reused finding comments: {totals['reused']}"]
     for mode in ("summary", "artifact"):
-        entries = sum(finding.get("placement") == mode for finding in confirmed)
+        entries = sum(finding.get("placement") == mode for finding in record["findings"])
         if entries:
             parts.append(f"Findings in {mode} report: {entries}")
     references = sum(finding.get("placement") == "history" for finding in confirmed)

@@ -579,8 +579,8 @@ class ReviewHistoryTest(unittest.TestCase):
         metadata = json.dumps({"head_sha": "a" * 40})
         body = (
             f"{module.BOT_MARKER}\n<!-- ai-review-main {metadata} -->\n"
-            "## AI Review - NO VERDICT\n\nReviewed `aaaaaaaa` · Partial Coverage\n\n"
-            "<details><summary>Partial Coverage Details</summary>\nMissing reviewer.\n</details>\n"
+            "## AI Review - NO VERDICT\n\nReviewed `aaaaaaaa` · Status requirements unmet\n\n"
+            "<details><summary>Unmet status requirements</summary>\nMissing reviewer.\n</details>\n"
             "<details><summary>PR Summary</summary>\nSame change context.\n</details>\n"
             "[Workflow run](https://github.com/example/project/actions/runs/1)"
         )
@@ -589,7 +589,7 @@ class ReviewHistoryTest(unittest.TestCase):
         self.assertTrue(module.is_duplicate_review(body, document, head_sha="a" * 40))
         for before, after in (
             ("NO VERDICT", "APPROVED"),
-            ("Partial Coverage", "Full Coverage"),
+            ("Status requirements unmet", "Status requirements met"),
             ("Missing reviewer.", "Earlier Blocker has not been rechecked on this commit."),
             ("actions/runs/1", "actions/runs/2"),
         ):

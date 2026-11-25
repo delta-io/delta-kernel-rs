@@ -5,7 +5,7 @@ from __future__ import annotations
 import unittest
 
 from test_review_status_publication import (
-    HEAD, FakeGitHub, compute_verdict, history_from_github, pipeline, publish_status,
+    HEAD, FakeGitHub, compute_review_status, history_from_github, pipeline, publish_status,
 )
 
 CLAIM = "A concrete retained claim."
@@ -21,7 +21,7 @@ class ReviewIdentityTest(unittest.TestCase):
         github = FakeGitHub()
         first = publish_status(github, pipeline(github, "Blocker"))
         arguments = pipeline(github, findings=[finding("other.rs")])
-        result = compute_verdict(**arguments)
+        result = compute_review_status(**arguments)
 
         self.assertTrue(arguments["completion"]["complete"], arguments["completion"]["reasons"])
         self.assertEqual(result["status"], "NOT APPROVED")
@@ -33,7 +33,7 @@ class ReviewIdentityTest(unittest.TestCase):
         github = FakeGitHub()
         first = publish_status(github, pipeline(github, "Blocker"))
         arguments = pipeline(github, head_sha=SECOND, findings=[finding("other.rs")])
-        result = compute_verdict(**arguments)
+        result = compute_review_status(**arguments)
 
         self.assertTrue(arguments["completion"]["complete"], arguments["completion"]["reasons"])
         self.assertEqual(result["status"], "NO VERDICT")
@@ -45,7 +45,7 @@ class ReviewIdentityTest(unittest.TestCase):
         github = FakeGitHub()
         publish_status(github, pipeline(github, "Blocker"))
         arguments = pipeline(github, findings=[finding("file.rs", line=2)])
-        result = compute_verdict(**arguments)
+        result = compute_review_status(**arguments)
 
         self.assertEqual(result["status"], "NOT APPROVED")
         self.assertEqual(result["counts"]["Blocker"], 2)
@@ -68,7 +68,7 @@ class ReviewIdentityTest(unittest.TestCase):
             {(item["path"], item["line"], item["side"]) for item in history["blockers"]},
             {("first.rs", 5, "LEFT"), ("second.rs", 9, "RIGHT")},
         )
-        result = compute_verdict(**pipeline(github, findings=[finding("third.rs", line=7)]))
+        result = compute_review_status(**pipeline(github, findings=[finding("third.rs", line=7)]))
         self.assertEqual(result["counts"]["Blocker"], 3)
         self.assertEqual(
             {item["path"] for item in result["findings"]}, {"first.rs", "second.rs", "third.rs"},
@@ -85,7 +85,7 @@ class ReviewIdentityTest(unittest.TestCase):
         self.assertTrue(history["complete"], history["reasons"])
         self.assertNotIn("path", history["blockers"][0])
         arguments = pipeline(github, head_sha=SECOND, findings=[finding("other.rs")])
-        result = compute_verdict(**arguments)
+        result = compute_review_status(**arguments)
 
         self.assertEqual(result["status"], "NOT APPROVED")
         self.assertEqual(result["counts"]["Blocker"], 1)
@@ -99,7 +99,7 @@ class ReviewIdentityTest(unittest.TestCase):
         self.assertEqual(current["delivery"], "reused")
         self.assertEqual(current["url"], first["findings"][0]["url"])
         current["line"] = 20
-        result = compute_verdict(**arguments)
+        result = compute_review_status(**arguments)
 
         self.assertEqual(result["status"], "NOT APPROVED")
         self.assertEqual(result["counts"]["Blocker"], 1)

@@ -451,38 +451,46 @@ The report lists new and reused comment counts separately from the number of fin
 
 ## Advisory status for the reviewed commit
 
-[`compute_verdict()`](../review_verdict.py) runs after comments have been posted and reviewer
-results have been recorded. It combines the diff coverage, reviewer/checker task records,
-candidate-to-final mappings, confirmed finding-comment URLs and earlier Blockers for the exact
-reviewed commit. Missing required information takes precedence over the finding counts.
+[`compute_review_status()`](../review_status.py) reads the patch-excerpt coverage record,
+Reviewer results, Checker decisions, candidate-to-final mappings and finding output records.
+PR comment modes record confirmed new or reused finding-comment URLs. `summary` and `artifact`
+modes record the selected report placement without comment URLs or delivery claims. Missing required
+records take precedence over finding counts.
 
 | Status in the comment/check report | Meaning |
 |---|---|
-| `NO VERDICT` | Required input, task results, finding mappings, earlier-review history or comment-posting results are incomplete, or a correctness claim remains contested. |
-| `NOT APPROVED` | Those records are complete and there is a current Blocker. |
+| `NO VERDICT` | Required input, result, finding-mapping, earlier-review-history or finding-output records are incomplete, or a Checker decision remains contested. |
+| `NOT APPROVED` | Those records are complete and the counted findings include a Blocker. |
 | `APPROVED WITH FEEDBACK` | Those records are complete, with Should Fix or Nit findings but no Blocker. |
-| `APPROVED` | Those records are complete and contain no final findings. |
+| `APPROVED` | Those records are complete and contain no counted findings. |
 
-An earlier Blocker for the same commit remains in the count when a rerun omits it. A Blocker
-on an earlier commit without a current result gives a linked `NO VERDICT` reason and stays
-outside current counts. Reusing a finding's comment does not remove the finding from the count.
-These statuses do not submit a GitHub review or replace human approval. The `AI Review Summary`
-Check Run always has GitHub conclusion `neutral`.
+The counts include the current orchestrator report's final findings and any earlier run's final
+Blockers for the same commit that the current report omits. A Blocker on an earlier commit
+without a matching current result gives a linked `NO VERDICT` reason and stays outside current
+counts. Reusing a finding's comment does not remove the finding from the count. These statuses
+do not submit a GitHub review or replace human approval. The `AI Review Summary` Check Run
+always has GitHub conclusion `neutral`.
 
-`publish_verdict()` updates this run's existing main AI review comment in PR comment modes.
-The command's `main()` writes `/tmp/review_verdict.json`, adds status data to
-`/tmp/review_execution.json`, and rebuilds the
-full Check Run report from the final finding list. The seven-day execution artifact includes
-that JSON record, `/tmp/diff_coverage.json` and the complete `/tmp/check-summary.txt`. If the report
-exceeds GitHub's display limit, the Check Run links to the complete artifact.
+The status record's `status_requirements_met` field is true when the patch-excerpt, execution,
+history and publication records satisfy the status rules and no Checker decision remains
+contested. A contested Checker decision is a completed decision that prevents a decisive advisory
+status. Patch-excerpt coverage separately measures the PR change patch bytes supplied to subagent
+task messages. These records do not prove that every changed line was examined.
+
+`publish_review_status()` updates this run's existing main AI review comment in PR comment modes.
+It returns without posting a PR comment in `summary` and `artifact` modes. The command writes
+`/tmp/review_status.json`, adds status data to `/tmp/review_execution.json`, and rebuilds the
+full Check Run report from the counted findings. The seven-day execution artifact includes
+`review_execution.json`, `/tmp/diff_coverage.json` and the complete `/tmp/check-summary.txt`.
+If the report exceeds GitHub's display limit, the Check Run links to the complete artifact.
 
 ### Main AI review comment format
 
 [`format_review_summary()`](../review_publish.py) is the single renderer for the main comment.
 The orchestrator supplies the PR summary and final finding text. Python supplies counts, links,
 the reviewed commit and the layout below. Angle-bracket placeholders stand for generated text;
-hidden bot identifiers are omitted from this example. With full coverage, the reviewed line
-says `Full Coverage ✓` and Partial Coverage Details is absent.
+hidden bot identifiers are omitted from this example. When all status requirements are met, the reviewed line says `Status requirements met`.
+The Unmet status requirements disclosure appears only when a requirement is unmet.
 
 ```markdown
 ## AI Review - <advisory status>
@@ -491,9 +499,9 @@ says `Full Coverage ✓` and Partial Coverage Details is absent.
 
 **2 Blockers · 1 Should Fix · 2 Nits**
 
-Reviewed `<short commit SHA>` · Partial Coverage ⚠
+Reviewed `<short commit SHA>` · Status requirements unmet
 
-<details><summary>Partial Coverage Details</summary>
+<details><summary>Unmet status requirements</summary>
 
 - <specific missing input, reviewer task result, checker decision or comment URL>
 
@@ -516,12 +524,13 @@ Reviewed `<short commit SHA>` · Partial Coverage ⚠
 [Full AI review → Checks](<PR checks URL>) · [Workflow run](<workflow run URL>)
 ```
 
-`Review Summary` links every final Blocker and Should Fix finding, including reused comments.
-It is absent when there are none. Nits count in the headline and have individual comments, but
-no rows in that disclosure. All disclosures start closed. Missing required information produces `NO VERDICT` with Partial Coverage Details. Known Blockers
-still appear in the count and Review Summary. A posting failure can also show
-`Finding counts unavailable.` in place of the count line. The Check Run includes
-all final findings, including findings supplied only in structured model output.
+`Review Summary` links every counted Blocker and Should Fix finding, including reused comments
+and retained earlier final Blockers. It is absent when there are none. Nits count in the headline
+and have individual comments, but no rows in that disclosure. All disclosures start closed.
+Missing required records produce `NO VERDICT` with an Unmet status requirements disclosure.
+Known Blockers still appear in the count and Review Summary. A posting failure can also show
+`Finding counts unavailable.` in place of the count line. The Check Run includes all counted
+findings, including final findings supplied only in structured model output.
 
 ## Shared instruction blocks
 

@@ -378,8 +378,8 @@ class FindingPublicationTest(unittest.TestCase):
         self.assertTrue(record["complete"])
         main = github.issues[0]["body"]
         self.assertIn("1 of 3 file sections fully included; 1 partial and 1 omitted", main)
-        self.assertNotIn("Full Coverage", main)
-        self.assertNotIn("Partial Coverage", main)
+        self.assertNotIn("Status requirements met", main)
+        self.assertNotIn("Status requirements unmet", main)
         self.assertNotIn("missing.rs", main)
         check = publication_check("Context.", record)
         self.assertIn("100000 of 120000", check)
