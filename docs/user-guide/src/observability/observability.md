@@ -191,8 +191,6 @@ storage call may serve multiple higher-level operations.
 | `StorageCopyCompleted` | `duration` | A storage copy/rename call. |
 | `JsonReadCompleted` | `num_files`, `bytes_read` | One `JsonHandler::read_json_files` call completed. `bytes_read` is the sum of on-disk file sizes. |
 | `ParquetReadCompleted` | `num_files`, `bytes_read` | One `ParquetHandler::read_parquet_files` call completed. `bytes_read` is the sum of on-disk file sizes. |
-| `CrcReadSuccess` | `duration`, `bytes_read` | One CRC file read and parsed successfully. `bytes_read` is the raw byte count from storage. |
-| `CrcReadFailure` | none | A CRC file read or parse failed. Non-cancellation failures allow log replay. |
 
 > [!NOTE]
 > If you implement a custom `JsonHandler` or `ParquetHandler`, call
@@ -200,14 +198,29 @@ storage call may serve multiple higher-level operations.
 > `emit_parquet_read_completed` once per read call so connectors that install
 > the metrics layer still see those events from your handler.
 
+### CRC and domain metadata reads
+
+CRC reads during a snapshot build share its operation and correlation IDs. Domain metadata reads
+get a fresh operation ID and use the correlation ID supplied on the reader for that request.
+See [SnapshotBuilder](https://docs.rs/delta_kernel/latest/delta_kernel/snapshot/struct.SnapshotBuilder.html)
+and [SnapshotReader](https://docs.rs/delta_kernel/latest/delta_kernel/snapshot/struct.SnapshotReader.html)
+for the correlation ID setters.
+
+| Event | Fields | What it measures |
+|-------|--------|------------------|
+| `CrcReadSuccess` | `operation_id`, `correlation_id`, `table_id`, `table_path`, `duration`, `bytes_read` | One CRC file read and parsed successfully. `bytes_read` is the raw byte count from storage. |
+| `CrcReadFailure` | `operation_id`, `correlation_id`, `table_id`, `table_path` | A CRC file read or parse failed. Non-cancellation failures allow log replay. |
+| `DomainMetadataLoadSuccess` | `operation_id`, `correlation_id`, `table_id`, `table_path`, `duration`, `from_cache`, `num_domains_returned` | One domain metadata read completed. |
+| `DomainMetadataLoadFailure` | `operation_id`, `correlation_id`, `table_id`, `table_path` | A domain metadata read failed. |
+
 ### Checkpoint hint reads
 
 Use [LastCheckpointReadCompleted](https://docs.rs/delta_kernel/latest/delta_kernel/metrics/struct.LastCheckpointReadCompleted.html)
 to count `_last_checkpoint` read attempts and record their duration by outcome. A missing or invalid
 hint normally leads to log listing. A file-not-found error returned directly by storage propagates
 instead of falling back, but still reports `NotFound`. Use snapshot events to measure snapshot
-failures separately from hint availability. The event has no `operation_id`; see its rustdoc for
-outcome and timing semantics.
+failures separately from hint availability. The hint event shares the snapshot build's
+`operation_id`, optional `correlation_id`, and optional table labels.
 
 ### Checksum write events
 
@@ -221,17 +234,18 @@ for the call's behavior.
 ## Correlating events with MetricId
 
 Several events include an `operation_id` field of type `MetricId`. This is a
-UUID that uniquely identifies an operation instance. All events from the same
-snapshot load share the same `MetricId`, so you can group them to reconstruct
-a timeline:
+UUID that uniquely identifies an operation instance. The following events share
+a `MetricId` when they belong to the same snapshot build:
 
-1. `LogSegmentLoadSuccess` or `LogSegmentLoadFailure` (listing the log segment)
-2. `ProtocolMetadataLoadSuccess` or `ProtocolMetadataLoadFailure` (reading protocol and metadata)
-3. `SnapshotBuildSuccess` or `SnapshotBuildFailure` (final outcome and total duration)
+- `LogSegmentLoadSuccess` or `LogSegmentLoadFailure` (listing the log segment)
+- `ProtocolMetadataLoadSuccess` or `ProtocolMetadataLoadFailure` (reading protocol and metadata)
+- `LastCheckpointReadCompleted` and `CrcReadSuccess` or `CrcReadFailure`, when those reads occur
+- `SnapshotBuildSuccess` or `SnapshotBuildFailure` (final outcome and total duration)
 
-Each step emits a success or failure variant carrying the shared `operation_id`. When a
-step fails, the snapshot build fails too, so the terminal `SnapshotBuildFailure` carries
-the same id and you can see which step broke from the buffered group.
+Group these events by `operation_id` to inspect a build's stages and outcome. A connector may also
+supply a `correlation_id` to associate the build with its own request, and `table_id` and
+`table_path` labels to group builds by table. The table labels are optional and supplied by the
+connector. Scan metadata events can also carry the table ID from the snapshot or scan builder.
 
 You can store the `MetricId` in your monitoring system as a trace ID or
 correlation key. Because everything flows through `tracing`, you can also

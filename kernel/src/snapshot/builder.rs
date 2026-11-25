@@ -328,14 +328,18 @@ impl<Mode> SnapshotBuilder<Mode> {
         self
     }
 
-    /// Attach the caller's opaque table identifier to read metrics. An empty value clears it.
+    /// Attach the caller's opaque table identifier to read metrics.
+    ///
+    /// [`Snapshot::builder_from`] inherits the identifier from the input snapshot. Pass an empty
+    /// value to clear it.
     pub fn with_table_id(mut self, table_id: impl Into<Arc<str>>) -> Self {
         self.table_id = Some(table_id.into()).filter(|id| !id.is_empty());
         self
     }
 
     /// Attach a table root label to snapshot read metrics. Supply a path suitable for
-    /// telemetry, without credentials or access tokens. An empty value clears the label.
+    /// telemetry, without credentials or access tokens. [`Snapshot::builder_from`] inherits the
+    /// label from the input snapshot. Pass an empty value to clear it.
     pub fn with_metric_table_path(mut self, path: impl Into<Arc<str>>) -> Self {
         self.metric_table_path = Some(path.into()).filter(|path| !path.is_empty());
         self

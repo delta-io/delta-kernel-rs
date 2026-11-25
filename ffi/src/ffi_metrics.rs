@@ -532,22 +532,22 @@ impl From<kernel::CheckpointWriteStats> for CheckpointWriteStats {
 /// Identifiers of a failed CRC or domain metadata read.
 #[repr(C)]
 pub struct ReadFailure {
-    pub operation_id: MetricId,
-    pub correlation_id: KernelStringSlice,
     pub table_id: KernelStringSlice,
     pub table_path: KernelStringSlice,
+    pub operation_id: MetricId,
+    pub correlation_id: KernelStringSlice,
 }
 
 /// A domain metadata load completed.
 #[repr(C)]
 pub struct DomainMetadataLoadSuccess {
+    pub table_id: KernelStringSlice,
+    pub table_path: KernelStringSlice,
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub from_cache: bool,
     pub num_domains_returned: u64,
     pub duration_ns: u64,
-    pub table_id: KernelStringSlice,
-    pub table_path: KernelStringSlice,
 }
 
 /// A `SetTransaction` (app id) load completed.
@@ -561,12 +561,12 @@ pub struct SetTransactionLoadSuccess {
 /// A CRC file was read and parsed successfully.
 #[repr(C)]
 pub struct CrcReadSuccess {
+    pub table_id: KernelStringSlice,
+    pub table_path: KernelStringSlice,
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub bytes_read: u64,
     pub duration_ns: u64,
-    pub table_id: KernelStringSlice,
-    pub table_path: KernelStringSlice,
 }
 
 /// A [`delta_kernel::Snapshot::write_checksum`] call succeeded.
@@ -631,15 +631,15 @@ impl From<kernel::LastCheckpointReadOutcome> for LastCheckpointReadOutcome {
 pub struct LastCheckpointReadCompleted {
     pub table_id: KernelStringSlice,
     pub table_path: KernelStringSlice,
+    /// Id of the snapshot build that requested this read.
+    pub operation_id: MetricId,
+    /// Borrowed caller-supplied id, empty when absent.
+    pub correlation_id: KernelStringSlice,
     /// Result of reading and validating the hint.
     pub outcome: LastCheckpointReadOutcome,
     /// Wall-clock time from entry through return, including parsing and validation, in
     /// nanoseconds.
     pub duration_ns: u64,
-    /// Id of the snapshot build that requested this read.
-    pub operation_id: MetricId,
-    /// Borrowed caller-supplied id, empty when absent.
-    pub correlation_id: KernelStringSlice,
 }
 
 /// A `JsonHandler::read_json_files` call completed.

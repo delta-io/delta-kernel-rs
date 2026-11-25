@@ -42,15 +42,29 @@ impl LoggingMetricsReporter {
 }
 
 impl MetricsReporter for LoggingMetricsReporter {
-    fn report(&self, event: MetricEvent) {
+    fn report(&self, metric: MetricEvent) {
+        let (operation_id, correlation_id) = metric.read_operation_ids();
         // event! needs a constant level. Detach from the parent span so the log line carries the
         // event payload alone, not the span context that produced it.
+        macro_rules! log_metric {
+            ($level:expr) => {
+                event!(
+                    parent: Span::none(),
+                    $level,
+                    operation_id = operation_id.map(tracing::field::display),
+                    correlation_id,
+                    table_id = metric.table_id(),
+                    table_path = metric.table_path(),
+                    "{metric}"
+                )
+            };
+        }
         match self.level {
-            Level::ERROR => event!(parent: Span::none(), Level::ERROR, "{}", event),
-            Level::WARN => event!(parent: Span::none(), Level::WARN, "{}", event),
-            Level::INFO => event!(parent: Span::none(), Level::INFO, "{}", event),
-            Level::DEBUG => event!(parent: Span::none(), Level::DEBUG, "{}", event),
-            Level::TRACE => event!(parent: Span::none(), Level::TRACE, "{}", event),
+            Level::ERROR => log_metric!(Level::ERROR),
+            Level::WARN => log_metric!(Level::WARN),
+            Level::INFO => log_metric!(Level::INFO),
+            Level::DEBUG => log_metric!(Level::DEBUG),
+            Level::TRACE => log_metric!(Level::TRACE),
         }
     }
 }
@@ -328,14 +342,15 @@ mod tests {
     use tracing_subscriber::registry;
     use uuid::Uuid;
 
+    use super::{LoggingMetricsReporter, MetricsReporter as _};
     use crate::metrics::events::{
         SNAPSHOT_COMPLETED_SPAN, SnapshotLoadMetricContext, emit_log_segment_load_failure,
         emit_protocol_metadata_load_failure,
     };
     use crate::metrics::{
         CheckpointOutputStats, CheckpointProcessingStats, CheckpointWriteMode,
-        CheckpointWriteOutcome, CheckpointWriteStats, LastCheckpointReadOutcome, MetricEvent,
-        MetricId, WithMetricsReporterLayer as _,
+        CheckpointWriteOutcome, CheckpointWriteStats, LastCheckpointReadCompleted,
+        LastCheckpointReadOutcome, MetricEvent, MetricId, WithMetricsReporterLayer as _,
     };
     use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
 
@@ -356,6 +371,31 @@ mod tests {
         with_default(subscriber, f);
         let bytes = logs.lock().unwrap().clone();
         String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn logging_reporter_preserves_read_identity() {
+        let operation_id = MetricId::new();
+        let logs = capture_logs(|| {
+            let reporter = LoggingMetricsReporter::new(tracing::Level::INFO);
+            reporter.report(MetricEvent::LastCheckpointReadCompleted(
+                LastCheckpointReadCompleted {
+                    operation_id,
+                    correlation_id: Some("request-1".into()),
+                    table_id: Some("orders".into()),
+                    table_path: Some("/tables/orders".into()),
+                    outcome: LastCheckpointReadOutcome::NotFound,
+                    duration: Duration::from_millis(1),
+                },
+            ));
+        });
+        assert!(
+            logs.contains(&format!("operation_id={operation_id}")),
+            "{logs}"
+        );
+        assert!(logs.contains("correlation_id=\"request-1\""), "{logs}");
+        assert!(logs.contains("table_id=\"orders\""), "{logs}");
+        assert!(logs.contains("table_path=\"/tables/orders\""), "{logs}");
     }
 
     #[rstest::rstest]

@@ -167,6 +167,33 @@ impl MetricEvent {
         }
     }
 
+    pub(super) fn read_operation_ids(&self) -> (Option<MetricId>, Option<&str>) {
+        let (operation_id, correlation_id) = match self {
+            Self::SnapshotBuildSuccess(e) => (e.operation_id, &e.correlation_id),
+            Self::SnapshotBuildFailure(e) => (e.operation_id, &e.correlation_id),
+            Self::LogSegmentLoadSuccess(e) => (e.operation_id, &e.correlation_id),
+            Self::LogSegmentLoadFailure(e) => (e.operation_id, &e.correlation_id),
+            Self::ProtocolMetadataLoadSuccess(e) => (e.operation_id, &e.correlation_id),
+            Self::ProtocolMetadataLoadFailure(e) => (e.operation_id, &e.correlation_id),
+            Self::LastCheckpointReadCompleted(e) => (e.operation_id, &e.correlation_id),
+            Self::CrcReadSuccess(e) => (e.operation_id, &e.correlation_id),
+            Self::DomainMetadataLoadSuccess(e) => (e.operation_id, &e.correlation_id),
+            Self::ScanMetadataCompleted(e) => (e.operation_id, &e.correlation_id),
+            Self::CrcReadFailure {
+                operation_id,
+                correlation_id,
+                ..
+            }
+            | Self::DomainMetadataLoadFailure {
+                operation_id,
+                correlation_id,
+                ..
+            } => (*operation_id, correlation_id),
+            _ => return (None, None),
+        };
+        (Some(operation_id), correlation_id.as_deref())
+    }
+
     /// Set the wall-clock duration on lifecycle events.
     pub(crate) fn set_duration_if_applicable(&mut self, d: Duration) {
         match self {

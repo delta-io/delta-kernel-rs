@@ -250,6 +250,12 @@ impl Snapshot {
         self
     }
 
+    fn inherit_metric_table_identity(mut self, source: &Self) -> Self {
+        self.metric_table_id.clone_from(&source.metric_table_id);
+        self.metric_table_path.clone_from(&source.metric_table_path);
+        self
+    }
+
     // ============================================================================
     // Construction entry points
     // ============================================================================
@@ -735,7 +741,8 @@ impl Snapshot {
                 .or_else(|| self.checkpoint_action.get().cloned().flatten()),
             #[cfg(feature = "adaptive-metadata-in-dev")]
             last_manifest_commit,
-        ))
+        )
+        .inherit_metric_table_identity(self))
     }
 
     // ============================================================================
@@ -1780,13 +1787,16 @@ impl Snapshot {
             Ok(bytes_written) => {
                 info!("Wrote CRC file at {}", crc_path.location);
                 let new_log_segment = self.log_segment.try_new_with_crc_file(crc_path)?;
-                let new_snapshot = Arc::new(Snapshot::new_with_crc(
-                    new_log_segment,
-                    self.table_configuration().clone(),
-                    Some(crc),
-                    self.built_as_latest,
-                    self.skipped_new_checkpoints,
-                )?);
+                let new_snapshot = Arc::new(
+                    Snapshot::new_with_crc(
+                        new_log_segment,
+                        self.table_configuration().clone(),
+                        Some(crc),
+                        self.built_as_latest,
+                        self.skipped_new_checkpoints,
+                    )?
+                    .inherit_metric_table_identity(self),
+                );
                 tracing::Span::current().record("bytes_written", bytes_written);
                 Ok((ChecksumWriteResult::Written, new_snapshot))
             }
@@ -2117,7 +2127,7 @@ impl Snapshot {
             false, /* skipped_new_checkpoints */
         )?;
         new_snapshot.retained_checkpoint_type = Some(checkpoint_type);
-        let new_snapshot = Arc::new(new_snapshot);
+        let new_snapshot = Arc::new(new_snapshot.inherit_metric_table_identity(self));
         span.record(
             "size_in_bytes",
             info.last_checkpoint_stats.size_in_bytes as u64,
@@ -2213,13 +2223,16 @@ impl Snapshot {
             return Ok(Arc::clone(self));
         };
 
-        Ok(Arc::new(Snapshot::new_with_crc(
-            log_segment,
-            self.table_configuration().clone(),
-            self.base_crc().cloned(),
-            self.built_as_latest,
-            self.skipped_new_checkpoints,
-        )?))
+        Ok(Arc::new(
+            Snapshot::new_with_crc(
+                log_segment,
+                self.table_configuration().clone(),
+                self.base_crc().cloned(),
+                self.built_as_latest,
+                self.skipped_new_checkpoints,
+            )?
+            .inherit_metric_table_identity(self),
+        ))
     }
 }
 
@@ -2427,7 +2440,8 @@ mod tests {
     ) {
         // GIVEN: staged paths for commits 1 and 2, with publication recorded for neither,
         // one, or both commits.
-        let source = snapshot_with_staged_commits(max_published_version, crc_version, observed_crc);
+        let source = snapshot_with_staged_commits(max_published_version, crc_version, observed_crc)
+            .with_metric_table_identity(Some("orders".into()), Some("/tables/orders".into()));
         let engine = engine_with_published_commits();
         let original_segment = source.log_segment().clone();
         let committer = RecordingPublishCommitter::default();
@@ -2438,6 +2452,8 @@ mod tests {
         // THEN: request publication only for unpublished commits; keep version, metadata, and CRC.
         assert_eq!(*committer.calls.borrow(), expected_calls);
         assert_eq!(published.version(), source.version());
+        assert_eq!(published.metric_table_id, source.metric_table_id);
+        assert_eq!(published.metric_table_path, source.metric_table_path);
         assert_eq!(
             published.table_configuration(),
             source.table_configuration()
@@ -3689,6 +3705,84 @@ mod tests {
         // THEN
         assert_eq!(post_commit_snapshot.version(), next_version);
         assert_eq!(post_commit_snapshot.log_segment().end_version, next_version);
+    }
+
+    #[test]
+    fn snapshot_write_results_preserve_read_metric_identity() -> Result<()> {
+        use crate::metrics::MetricEvent;
+        use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
+
+        let engine = SyncEngine::in_memory();
+        let root = "memory:///orders/";
+        let metadata = schema_ref! { nullable "id": INTEGER };
+        create_table(root, metadata, "test", true)
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?
+            .unwrap_committed();
+
+        let source = Snapshot::builder_for(root)
+            .with_table_id("orders")
+            .with_metric_table_path("/tables/orders")
+            .build(&engine)?;
+        let committed = source
+            .update_table(UpdateTableOperation::Write, "test", false)
+            .with_table_properties_added([("test.property", "value")])
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?
+            .unwrap_post_commit_snapshot();
+        let (checkpoint_result, checkpointed) = committed.checkpoint(&engine, None)?;
+        assert!(matches!(checkpoint_result, CheckpointWriteResult::Written));
+        let (checksum_result, checksummed) = checkpointed.write_checksum(&engine)?;
+        assert!(matches!(checksum_result, ChecksumWriteResult::Written));
+
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        for snapshot in [committed, checkpointed, checksummed] {
+            assert_eq!(
+                snapshot.metric_table_path.as_deref(),
+                Some("/tables/orders")
+            );
+            snapshot
+                .scan_builder()
+                .build()?
+                .scan_metadata(&engine)?
+                .collect::<KernelResult<Vec<_>>>()?;
+        }
+        let scans = reporter
+            .events()
+            .into_iter()
+            .filter(|event| matches!(event, MetricEvent::ScanMetadataCompleted(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(scans.len(), 3);
+        assert!(scans.iter().all(|event| event.table_id() == Some("orders")));
+
+        let refreshed = Snapshot::builder_for(root)
+            .with_table_id("orders")
+            .with_metric_table_path("/tables/orders")
+            .build(&engine)?;
+        let crc_reads = reporter
+            .events()
+            .into_iter()
+            .filter(|event| matches!(event, MetricEvent::CrcReadSuccess(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(crc_reads.len(), 1);
+        assert_eq!(crc_reads[0].table_id(), Some("orders"));
+        assert_eq!(crc_reads[0].table_path(), Some("/tables/orders"));
+
+        let latest = Snapshot::builder_from(refreshed).build(&engine)?;
+        assert_eq!(latest.metric_table_id.as_deref(), Some("orders"));
+        assert_eq!(latest.metric_table_path.as_deref(), Some("/tables/orders"));
+        let reattributed = Snapshot::builder_from(latest.clone())
+            .with_table_id("alternate-orders")
+            .with_metric_table_path("")
+            .build(&engine)?;
+        assert_eq!(
+            reattributed.metric_table_id.as_deref(),
+            Some("alternate-orders")
+        );
+        assert_eq!(reattributed.metric_table_path, None);
+        assert_eq!(latest.metric_table_id.as_deref(), Some("orders"));
+        Ok(())
     }
 
     // A post-commit snapshot built from a parent holding a stale base (not an at-version CRC)

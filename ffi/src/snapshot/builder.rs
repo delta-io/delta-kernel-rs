@@ -189,9 +189,9 @@ pub unsafe extern "C" fn snapshot_builder_with_table_id(
     builder: Handle<ExclusiveSnapshotBuilder>,
     table_id: KernelStringSlice,
 ) -> ExternResult<Handle<ExclusiveSnapshotBuilder>> {
-    let mut builder = unsafe { builder.into_inner() };
-    let engine = builder.engine.clone();
+    let engine = unsafe { builder.as_ref() }.engine.clone();
     let result = catch_panic(|| {
+        let mut builder = unsafe { builder.into_inner() };
         unsafe { table_id.try_to_string() }.map(|id| {
             builder.table_id = Some(id);
             builder.into()
@@ -217,9 +217,9 @@ pub unsafe extern "C" fn snapshot_builder_with_metric_table_path(
     builder: Handle<ExclusiveSnapshotBuilder>,
     table_path: KernelStringSlice,
 ) -> ExternResult<Handle<ExclusiveSnapshotBuilder>> {
-    let mut builder = unsafe { builder.into_inner() };
-    let engine = builder.engine.clone();
+    let engine = unsafe { builder.as_ref() }.engine.clone();
     let result = catch_panic(|| {
+        let mut builder = unsafe { builder.into_inner() };
         unsafe { table_path.try_to_string() }.map(|path| {
             builder.table_path = Some(path);
             builder.into()
@@ -241,8 +241,8 @@ pub unsafe extern "C" fn snapshot_with_table_id(
     engine: Handle<SharedExternEngine>,
     table_id: KernelStringSlice,
 ) -> ExternResult<Handle<SharedSnapshot>> {
-    let snapshot = unsafe { snapshot.into_inner() };
     let result = catch_panic(|| {
+        let snapshot = unsafe { snapshot.into_inner() };
         unsafe { table_id.try_to_string() }
             .map(|id| snapshot.with_metric_table_id(Some(id.into())).into())
     });
@@ -583,6 +583,66 @@ mod tests {
             unsafe { free_snapshot_builder(builder) };
         }
         assert_eq!(Arc::strong_count(&engine_owner), baseline);
+        unsafe { free_engine(engine) };
+    }
+
+    #[rstest]
+    #[case::table_id(snapshot_builder_with_table_id)]
+    #[case::table_path(snapshot_builder_with_metric_table_path)]
+    fn table_label_setter_consumes_builder_on_error(
+        #[case] set_label: unsafe extern "C" fn(
+            Handle<ExclusiveSnapshotBuilder>,
+            KernelStringSlice,
+        )
+            -> ExternResult<Handle<ExclusiveSnapshotBuilder>>,
+        #[values(std::ptr::null(), b"\xff".as_ptr().cast())] ptr: *const c_char,
+    ) {
+        let engine = error_only_engine_handle();
+        let table_root = "memory:///table/";
+        let engine_owner = unsafe { engine.clone_as_arc() };
+        let baseline = Arc::strong_count(&engine_owner);
+        let builder = unsafe {
+            ok_or_panic(get_snapshot_builder(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
+        assert_eq!(Arc::strong_count(&engine_owner), baseline + 1);
+        let result = unsafe { set_label(builder, KernelStringSlice { ptr, len: 1 }) };
+        let expected = if ptr.is_null() {
+            FFIKernelError::GenericError
+        } else {
+            FFIKernelError::Utf8Error
+        };
+        assert_extern_result_error_with_message(result, expected, None);
+        assert_eq!(Arc::strong_count(&engine_owner), baseline);
+        unsafe { free_engine(engine) };
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn snapshot_table_id_setter_consumes_handle_on_error(
+        #[values(std::ptr::null(), b"\xff".as_ptr().cast())] ptr: *const c_char,
+    ) {
+        let (engine, snapshot) = setup_snapshot(actions_to_string(vec![TestAction::Metadata]))
+            .await
+            .unwrap();
+        let owner = unsafe { snapshot.clone_as_arc() };
+        let baseline = Arc::strong_count(&owner);
+        let result = unsafe {
+            snapshot_with_table_id(
+                snapshot,
+                engine.shallow_copy(),
+                KernelStringSlice { ptr, len: 1 },
+            )
+        };
+        let expected = if ptr.is_null() {
+            FFIKernelError::GenericError
+        } else {
+            FFIKernelError::Utf8Error
+        };
+        assert_extern_result_error_with_message(result, expected, None);
+        assert_eq!(Arc::strong_count(&owner), baseline - 1);
         unsafe { free_engine(engine) };
     }
 

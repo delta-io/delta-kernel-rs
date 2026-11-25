@@ -346,9 +346,9 @@ pub unsafe extern "C" fn scan_builder_with_table_id(
     engine: Handle<SharedExternEngine>,
     table_id: KernelStringSlice,
 ) -> ExternResult<Handle<ExclusiveScanBuilder>> {
-    let builder = unsafe { builder.into_inner() };
     let engine = unsafe { engine.as_ref() };
     let result = catch_panic(|| {
+        let builder = unsafe { builder.into_inner() };
         unsafe { table_id.try_to_string() }.map(|id| Box::new(builder.with_table_id(id)).into())
     });
     unsafe { result.into_extern_result(&engine) }
@@ -1361,6 +1361,38 @@ mod scan_builder_tests {
             unsafe { free_scan(scan) };
         }
         assert_eq!(Arc::strong_count(&snapshot_owner), baseline);
+        unsafe {
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn scan_table_id_setter_consumes_builder_on_error(
+        #[values(std::ptr::null(), b"\xff".as_ptr().cast())] ptr: *const c_char,
+    ) {
+        let (engine, snapshot) = setup_snapshot(actions_to_string(vec![TestAction::Metadata]))
+            .await
+            .unwrap();
+        let owner = unsafe { snapshot.clone_as_arc() };
+        let baseline = Arc::strong_count(&owner);
+        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
+        assert_eq!(Arc::strong_count(&owner), baseline + 1);
+        let result = unsafe {
+            super::scan_builder_with_table_id(
+                builder,
+                engine.shallow_copy(),
+                KernelStringSlice { ptr, len: 1 },
+            )
+        };
+        let expected = if ptr.is_null() {
+            FFIKernelError::GenericError
+        } else {
+            FFIKernelError::Utf8Error
+        };
+        assert_extern_result_error_with_message(result, expected, None);
+        assert_eq!(Arc::strong_count(&owner), baseline);
         unsafe {
             free_snapshot(snapshot);
             free_engine(engine);
