@@ -12,6 +12,7 @@ use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_path::LogPath;
 use crate::log_segment::{LogSegment, validate_catalog_version_bounds};
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
+use crate::metrics::MetricId;
 use crate::path::{DELTA_LOG_DIR_WITH_SLASH, ParsedLogPath};
 use crate::snapshot::{IncrementalReplay, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
@@ -104,6 +105,9 @@ impl SnapshotHint {
     /// supplied locations. Snapshot construction performs the remaining consistency and
     /// table-configuration validation.
     ///
+    /// Checkpoint diagnostics share an operation ID for this constructor call; later snapshot
+    /// builds use their own operation IDs.
+    ///
     /// Local table roots, including `file:` URLs, are resolved and canonicalized through the
     /// local filesystem and must refer to an existing directory.
     ///
@@ -148,6 +152,7 @@ impl SnapshotHint {
             0,
             None,
             CheckpointHandling::Adopt,
+            MetricId::new(),
         )?;
         match publication_watermark {
             PublicationWatermark::InferFromLogPaths => {}
@@ -689,6 +694,55 @@ mod tests {
             snapshot.log_segment().listed.ascending_compaction_files,
         );
         Ok(())
+    }
+
+    #[test]
+    fn snapshot_hint_diagnostics_share_one_fresh_operation_id_per_construction() {
+        let (reporter, _guard) = measuring_reporter();
+        for _ in 0..2 {
+            let log_paths = [
+                "00000000000000000000.json",
+                "00000000000000000001.json",
+                "00000000000000000002.json",
+                "00000000000000000001.checkpoint.0000000001.0000000003.parquet",
+                "00000000000000000002.checkpoint.0000000001.0000000003.parquet",
+            ]
+            .into_iter()
+            .map(|filename| {
+                let path = format!("memory:///target/_delta_log/{filename}");
+                LogPath::try_new(create_log_path_with_size(&path, 1).location).unwrap()
+            })
+            .collect();
+            SnapshotHint::try_new(
+                "memory:///target/",
+                2,
+                PublicationWatermark::InferFromLogPaths,
+                log_paths,
+                Protocol::default(),
+                Metadata::default(),
+                None,
+                None,
+                SnapshotHintFreshness::Unverified,
+                None,
+            )
+            .unwrap();
+        }
+
+        let diagnostics: Vec<_> = reporter
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                MetricEvent::CheckpointPartsMissing(event) => Some(event),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(diagnostics.len(), 4);
+        for pass in diagnostics.as_chunks::<2>().0 {
+            assert_ne!(pass[0].operation_id, MetricId::nil());
+            assert_eq!(pass[0].operation_id, pass[1].operation_id);
+            assert_eq!([pass[0].version, pass[1].version], [1, 2]);
+        }
+        assert_ne!(diagnostics[0].operation_id, diagnostics[2].operation_id);
     }
 
     #[rstest::rstest]

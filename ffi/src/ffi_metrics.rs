@@ -577,6 +577,49 @@ pub struct CrcReadFailure {
     pub reason: CrcReadFailureReason,
 }
 
+/// How checkpoint discovery found a missing or incomplete checkpoint candidate.
+///
+/// cbindgen:prefix-with-name=true
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum CheckpointPartsMissingSource {
+    /// A listed multipart candidate had missing or empty parts.
+    Listing,
+    /// A file-backed hint version had no checkpoint file, or only an empty classic or V2 file.
+    Hint,
+}
+
+impl From<kernel::CheckpointPartsMissingSource> for CheckpointPartsMissingSource {
+    fn from(source: kernel::CheckpointPartsMissingSource) -> Self {
+        match source {
+            kernel::CheckpointPartsMissingSource::Listing => Self::Listing,
+            kernel::CheckpointPartsMissingSource::Hint => Self::Hint,
+        }
+    }
+}
+
+/// A checkpoint candidate had missing or empty parts with no complete candidate at the same or a
+/// later version.
+///
+/// Discovery may still use an older checkpoint and replay subsequent commits. A missing or empty
+/// classic or V2 hint target reports one expected part and zero found parts.
+/// Later loads or refreshes may report the same candidate again; deduplicate repeats for alerting.
+/// The operation ID joins diagnostics to snapshot and log-segment completion events for outcomes.
+/// Standalone snapshot-hint construction uses an independent discovery ID.
+#[repr(C)]
+pub struct CheckpointPartsMissing {
+    /// ID of the enclosing snapshot load or standalone discovery operation.
+    pub operation_id: MetricId,
+    /// How the incomplete checkpoint candidate was discovered.
+    pub source: CheckpointPartsMissingSource,
+    /// Version of the incomplete checkpoint.
+    pub version: u64,
+    /// Number of parts required by the checkpoint file name or hint.
+    pub expected_parts: u64,
+    /// Number of distinct, nonempty parts found for this checkpoint candidate.
+    pub found_parts: u64,
+}
+
 /// A [`delta_kernel::Snapshot::write_checksum`] call succeeded.
 #[repr(C)]
 pub struct ChecksumWriteSuccess {
@@ -732,6 +775,7 @@ pub enum MetricEvent {
     ChecksumWriteSuccess(ChecksumWriteSuccess),
     ChecksumWriteFailure(ChecksumWriteFailure),
     LastCheckpointReadCompleted(LastCheckpointReadCompleted),
+    CheckpointPartsMissing(CheckpointPartsMissing),
 }
 
 fn duration_ns(duration: std::time::Duration) -> u64 {
@@ -930,6 +974,19 @@ impl MetricEvent {
                     reason: (*reason).into(),
                 })
             }
+            K::CheckpointPartsMissing(kernel::CheckpointPartsMissing {
+                operation_id,
+                source,
+                version,
+                expected_parts,
+                found_parts,
+            }) => Self::CheckpointPartsMissing(CheckpointPartsMissing {
+                operation_id: (*operation_id).into(),
+                source: (*source).into(),
+                version: *version,
+                expected_parts: *expected_parts,
+                found_parts: *found_parts,
+            }),
             K::LastCheckpointReadCompleted(kernel::LastCheckpointReadCompleted {
                 outcome,
                 duration,
@@ -1096,6 +1153,39 @@ mod tests {
                 panic!("expected CrcReadFailure");
             };
             assert_eq!(event.reason, expected);
+        });
+    }
+
+    #[rstest]
+    #[case(
+        kernel::CheckpointPartsMissingSource::Listing,
+        CheckpointPartsMissingSource::Listing
+    )]
+    #[case(
+        kernel::CheckpointPartsMissingSource::Hint,
+        CheckpointPartsMissingSource::Hint
+    )]
+    fn checkpoint_parts_missing_conversion_preserves_id_source_and_counts(
+        #[case] source: kernel::CheckpointPartsMissingSource,
+        #[case] expected: CheckpointPartsMissingSource,
+    ) {
+        let operation_id = kernel::MetricId::new();
+        let event = kernel::MetricEvent::CheckpointPartsMissing(kernel::CheckpointPartsMissing {
+            operation_id,
+            source,
+            version: 17,
+            expected_parts: 3,
+            found_parts: 2,
+        });
+        with_ffi_event(&event, |event| {
+            let MetricEvent::CheckpointPartsMissing(event) = event else {
+                panic!("expected CheckpointPartsMissing");
+            };
+            assert_eq!(event.operation_id.bytes, operation_id.as_bytes());
+            assert_eq!(event.source, expected);
+            assert_eq!(event.version, 17);
+            assert_eq!(event.expected_parts, 3);
+            assert_eq!(event.found_parts, 2);
         });
     }
 

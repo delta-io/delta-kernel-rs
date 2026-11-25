@@ -200,7 +200,17 @@ storage call may serve multiple higher-level operations.
 > `emit_parquet_read_completed` once per read call so connectors that install
 > the metrics layer still see those events from your handler.
 
-### Checkpoint hint reads
+### Checkpoint discovery and hint reads
+
+Use [CheckpointPartsMissing](https://docs.rs/delta_kernel/latest/delta_kernel/metrics/struct.CheckpointPartsMissing.html)
+to diagnose incomplete checkpoint candidates. The `source` field reports `listing` for physically
+listed multipart candidates, including those at a hinted version. It reports `hint` when a file-backed
+hint version has no checkpoint file, or only an empty classic or V2 file.
+
+An older checkpoint can still support fallback when no complete checkpoint exists at the same or a
+later version. Use `operation_id` to join diagnostics to snapshot and log-segment completion events
+and observe whether fallback succeeded. Standalone snapshot-hint construction uses an independent
+discovery ID. See its rustdoc for part-count semantics.
 
 Use [LastCheckpointReadCompleted](https://docs.rs/delta_kernel/latest/delta_kernel/metrics/struct.LastCheckpointReadCompleted.html)
 to count `_last_checkpoint` read attempts and record their duration by outcome. A missing or invalid

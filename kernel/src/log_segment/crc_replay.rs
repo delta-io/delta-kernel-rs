@@ -809,6 +809,7 @@ mod tests {
     use super::*;
     use crate::crc::{DomainMetadataState, FileStats, FileStatsState, SetTransactionState};
     use crate::engine::sync::SyncEngine;
+    use crate::metrics::MetricId;
     use crate::object_store::memory::InMemory;
     use crate::table_features::TableFeature;
 
@@ -1359,6 +1360,7 @@ mod tests {
             vec![],
             None,
             Some(2),
+            MetricId::nil(),
         )
         .unwrap();
 
@@ -1438,6 +1440,7 @@ mod tests {
             vec![],
             None,
             Some(0),
+            MetricId::nil(),
         )
         .unwrap();
         for base in [0, 5] {
@@ -1468,6 +1471,7 @@ mod tests {
             vec![],
             None,
             Some(1),
+            MetricId::nil(),
         )
         .unwrap();
         assert!(matches!(

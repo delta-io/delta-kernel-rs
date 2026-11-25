@@ -10,11 +10,11 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 
 use super::events::{
-    CheckpointWriteSuccess, ChecksumWriteSuccess, CrcReadSuccess, DomainMetadataLoadSuccess,
-    JsonReadCompleted, LastCheckpointReadCompleted, LogSegmentLoadSuccess, MetricEvent,
-    ParquetReadCompleted, ProtocolMetadataLoadSuccess, STORAGE_SPAN, ScanMetadataCompleted,
-    SetTransactionLoadSuccess, SnapshotBuildSuccess, TransactionCommitSuccess,
-    storage_metric_from_attrs,
+    CheckpointPartsMissing, CheckpointWriteSuccess, ChecksumWriteSuccess, CrcReadSuccess,
+    DomainMetadataLoadSuccess, JsonReadCompleted, LastCheckpointReadCompleted,
+    LogSegmentLoadSuccess, MetricEvent, ParquetReadCompleted, ProtocolMetadataLoadSuccess,
+    STORAGE_SPAN, ScanMetadataCompleted, SetTransactionLoadSuccess, SnapshotBuildSuccess,
+    TransactionCommitSuccess, storage_metric_from_attrs,
 };
 
 // ====================================================================
@@ -133,6 +133,9 @@ where
             CrcReadSuccess::SPAN_NAME => Some(MetricEvent::CrcReadSuccess(
                 CrcReadSuccess::from_attrs(attrs),
             )),
+            CheckpointPartsMissing::SPAN_NAME => {
+                CheckpointPartsMissing::from_attrs(attrs).map(MetricEvent::CheckpointPartsMissing)
+            }
             LastCheckpointReadCompleted::SPAN_NAME => {
                 Some(MetricEvent::LastCheckpointReadCompleted(
                     LastCheckpointReadCompleted::from_attrs(attrs),
@@ -329,13 +332,14 @@ mod tests {
     use uuid::Uuid;
 
     use crate::metrics::events::{
-        SNAPSHOT_COMPLETED_SPAN, SnapshotLoadMetricContext, emit_log_segment_load_failure,
-        emit_protocol_metadata_load_failure,
+        SNAPSHOT_COMPLETED_SPAN, SnapshotLoadMetricContext, emit_checkpoint_parts_missing,
+        emit_log_segment_load_failure, emit_protocol_metadata_load_failure,
     };
     use crate::metrics::{
-        CheckpointOutputStats, CheckpointProcessingStats, CheckpointWriteMode,
-        CheckpointWriteOutcome, CheckpointWriteStats, CrcReadFailureReason,
-        LastCheckpointReadOutcome, MetricEvent, MetricId, WithMetricsReporterLayer as _,
+        CheckpointOutputStats, CheckpointPartsMissing, CheckpointPartsMissingSource,
+        CheckpointProcessingStats, CheckpointWriteMode, CheckpointWriteOutcome,
+        CheckpointWriteStats, CrcReadFailureReason, LastCheckpointReadOutcome, MetricEvent,
+        MetricId, WithMetricsReporterLayer as _,
     };
     use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
 
@@ -401,6 +405,66 @@ mod tests {
             events[0].to_string(),
             format!("CrcReadFailure(reason={expected})")
         );
+    }
+
+    #[rstest::rstest]
+    #[case(Some("listing"), Some(CheckpointPartsMissingSource::Listing))]
+    #[case(Some("hint"), Some(CheckpointPartsMissingSource::Hint))]
+    #[case(None, None)]
+    #[case(Some("unknown"), None)]
+    #[case(Some(""), None)]
+    #[case(Some("future_source"), None)]
+    fn checkpoint_diagnostic_preserves_creation_fields_and_requires_valid_source(
+        #[case] source: Option<&str>,
+        #[case] expected: Option<CheckpointPartsMissingSource>,
+    ) {
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        let operation_id = MetricId::new();
+        // The emitter and direct span attributes must produce the same diagnostic.
+        if let Some(source) = expected {
+            emit_checkpoint_parts_missing(&CheckpointPartsMissing {
+                operation_id,
+                source,
+                version: 5,
+                expected_parts: 3,
+                found_parts: 0,
+            });
+            assert_eq!(reporter.events().len(), 1);
+        }
+        {
+            let span = info_span!(
+                "checkpoint_parts_missing",
+                report = Empty,
+                operation_id = %operation_id,
+                source,
+                version = 5_u64,
+                expected_parts = 3_u64,
+                found_parts = 0_u64,
+                extra_count = 99_u64,
+                extra_debug = ?"ignored",
+            );
+            let _entered = span.enter();
+            span.record("source", "runtime_source_must_be_ignored");
+            span.record("version", 100_u64);
+            span.record("found_parts", true);
+            info!(error = %"enclosing failure does not change the diagnostic");
+        }
+        let events = reporter.events();
+        let Some(expected) = expected else {
+            assert!(events.is_empty());
+            return;
+        };
+        assert_eq!(events.len(), 2);
+        for event in events {
+            assert_eq!(
+                event.to_string(),
+                format!(
+                    "CheckpointPartsMissing(id={operation_id}, source={expected}, version=5, \
+                     expected_parts=3, found_parts=0)"
+                )
+            );
+        }
     }
 
     #[test]

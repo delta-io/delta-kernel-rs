@@ -22,6 +22,7 @@ use crate::crc::{
 };
 use crate::engine::CancellableEngine;
 use crate::engine::sync::SyncEngine;
+use crate::metrics::MetricId;
 use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::path::ParsedLogPath;
@@ -495,8 +496,15 @@ impl BuiltCrcTest {
     fn incrementally_build_crc(&self, base: &Crc) -> KernelResult<Crc> {
         let storage = self.engine.storage_handler();
         let log_root = self.url.join("_delta_log/").unwrap();
-        let log_segment =
-            LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
+        let log_segment = LogSegment::for_snapshot_impl(
+            storage.as_ref(),
+            log_root,
+            vec![],
+            None,
+            None,
+            MetricId::nil(),
+        )
+        .unwrap();
         log_segment.build_crc_from_base(&self.engine, base)
     }
 
@@ -508,8 +516,15 @@ impl BuiltCrcTest {
     ) -> KernelResult<Option<Version>> {
         let storage = self.engine.storage_handler();
         let log_root = self.url.join("_delta_log/").unwrap();
-        let log_segment =
-            LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
+        let log_segment = LogSegment::for_snapshot_impl(
+            storage.as_ref(),
+            log_root,
+            vec![],
+            None,
+            None,
+            MetricId::nil(),
+        )
+        .unwrap();
         Ok(log_segment
             .pick_latest_base_crc(engine, in_memory_base)?
             .map(|c| c.version))
@@ -604,8 +619,15 @@ impl BuiltCrcTest {
     fn captured_checkpoint_action(&self) -> Option<Arc<CheckpointAction>> {
         let storage = self.engine.storage_handler();
         let log_root = self.url.join("_delta_log/").unwrap();
-        let log_segment =
-            LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
+        let log_segment = LogSegment::for_snapshot_impl(
+            storage.as_ref(),
+            log_root,
+            vec![],
+            None,
+            None,
+            MetricId::nil(),
+        )
+        .unwrap();
         let crc = log_segment.read_latest_crc(&self.engine).unwrap();
         log_segment
             .read_protocol_metadata_opt(&self.engine, crc.as_ref())

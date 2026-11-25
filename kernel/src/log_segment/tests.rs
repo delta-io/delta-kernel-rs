@@ -30,6 +30,8 @@ use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpoint
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::metrics::MetricEvent;
 use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
@@ -55,6 +57,8 @@ use crate::unit_test_utils::{
     Action, assert_batch_matches, assert_result_error_with_message, create_log_path,
     create_log_path_with_size, load_test_table, string_array_to_engine_data,
 };
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
 #[cfg(feature = "geo-type-in-dev")]
 use crate::unit_test_utils::{geography_type, geometry_type};
 use crate::{
@@ -166,7 +170,15 @@ async fn write_parquet_to_store(
 pub(crate) fn latest_log_segment(table_root: &Url, engine: &dyn Engine) -> LogSegment {
     let log_root = table_root.join("_delta_log/").unwrap();
     let storage = engine.storage_handler();
-    LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap()
+    LogSegment::for_snapshot_impl(
+        storage.as_ref(),
+        log_root,
+        vec![],
+        None,
+        None,
+        MetricId::nil(),
+    )
+    .unwrap()
 }
 
 /// Writes all actions to a _delta_log parquet checkpoint file in the store.
@@ -512,6 +524,7 @@ async fn build_snapshot_with_uuid_checkpoint_parquet() {
         vec![], // log_tail
         None,
         None,
+        MetricId::nil(),
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -549,6 +562,7 @@ async fn build_snapshot_with_uuid_checkpoint_json() {
         vec![], // log_tail
         None,
         None,
+        MetricId::nil(),
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -595,6 +609,7 @@ async fn build_snapshot_with_correct_last_uuid_checkpoint() {
         vec![], // log_tail
         Some(checkpoint_metadata),
         None,
+        MetricId::nil(),
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -640,6 +655,7 @@ async fn build_snapshot_with_multiple_incomplete_multipart_checkpoints() {
         vec![], // log_tail
         None,
         None,
+        MetricId::nil(),
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -682,6 +698,7 @@ async fn build_snapshot_with_out_of_date_last_checkpoint() {
         vec![], // log_tail
         Some(checkpoint_metadata),
         None,
+        MetricId::nil(),
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -729,6 +746,7 @@ async fn build_snapshot_with_correct_last_multipart_checkpoint() {
         vec![], // log_tail
         Some(checkpoint_metadata),
         None,
+        MetricId::nil(),
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -776,6 +794,7 @@ async fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
         vec![], // log_tail
         Some(checkpoint_metadata),
         None,
+        MetricId::nil(),
     );
     assert_result_error_with_message(
         log_segment,
@@ -830,6 +849,7 @@ async fn build_snapshot_applies_checkpoint_hint_iff_it_names_the_selected_checkp
         vec![], // log_tail
         Some(checkpoint_metadata),
         None,
+        MetricId::nil(),
     )
     .unwrap();
 
@@ -894,6 +914,7 @@ async fn build_snapshot_with_missing_checkpoint_part_no_hint() {
         vec![], // log_tail
         None,
         None,
+        MetricId::nil(),
     )
     .unwrap();
 
@@ -943,6 +964,7 @@ async fn build_snapshot_with_out_of_date_last_checkpoint_and_incomplete_recent_c
         vec![], // log_tail
         Some(checkpoint_metadata),
         None,
+        MetricId::nil(),
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -983,6 +1005,7 @@ async fn build_snapshot_without_checkpoints() {
         vec![], // log_tail
         None,
         None,
+        MetricId::nil(),
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -1003,6 +1026,7 @@ async fn build_snapshot_without_checkpoints() {
         vec![], // log_tail
         None,
         Some(2),
+        MetricId::nil(),
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -1048,6 +1072,7 @@ async fn build_snapshot_with_checkpoint_greater_than_time_travel_version() {
         vec![], // log_tail
         Some(checkpoint_metadata),
         Some(4),
+        MetricId::nil(),
     )
     .unwrap();
     let commit_files = log_segment.listed.ascending_commit_files;
@@ -1089,6 +1114,7 @@ async fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
         vec![], // log_tail
         Some(checkpoint_metadata),
         Some(4),
+        MetricId::nil(),
     )
     .unwrap();
 
@@ -1111,8 +1137,15 @@ async fn build_snapshot_time_travel_no_checkpoint_falls_back_to_v0(
     let paths: Vec<Path> = (0..=5).map(|v| delta_path_for_version(v, "json")).collect();
     let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
 
-    let log_segment =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], hint, Some(5)).unwrap();
+    let log_segment = LogSegment::for_snapshot_impl(
+        storage.as_ref(),
+        log_root,
+        vec![],
+        hint,
+        Some(5),
+        MetricId::nil(),
+    )
+    .unwrap();
 
     let commit_files = log_segment.listed.ascending_commit_files;
     let checkpoint_parts = log_segment.listed.checkpoint_parts;
@@ -1138,8 +1171,15 @@ async fn build_snapshot_time_travel_no_hint_checkpoint_at_end_version_included()
     )
     .await;
 
-    let log_segment =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, Some(5)).unwrap();
+    let log_segment = LogSegment::for_snapshot_impl(
+        storage.as_ref(),
+        log_root,
+        vec![],
+        None,
+        Some(5),
+        MetricId::nil(),
+    )
+    .unwrap();
 
     let commit_files = log_segment.listed.ascending_commit_files;
     let checkpoint_parts = log_segment.listed.checkpoint_parts;
@@ -2046,6 +2086,7 @@ async fn create_segment_for(segment: LogSegmentConfig<'_>) -> LogSegment {
         staged_commits_log_tail,
         None,
         segment.version_to_load,
+        MetricId::nil(),
     )
     .unwrap()
 }
@@ -2069,6 +2110,7 @@ async fn test_list_log_files_with_version() -> KernelResult<()> {
         vec![], // log_tail
         Some(0),
         None,
+        MetricId::nil(),
     )?;
     let latest_crc = result.latest_crc_file.unwrap();
     assert_eq!(
@@ -2556,6 +2598,7 @@ async fn test_commit_cover_zero_byte_compaction_uses_commits() {
         vec![],
         None,
         None,
+        MetricId::nil(),
     )
     .unwrap();
 
@@ -6145,12 +6188,16 @@ async fn amt_last_checkpoint_hint_bounds_listing(
         .collect_vec();
     let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
 
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
     let log_segment = LogSegment::for_snapshot_impl(
         storage.as_ref(),
         log_root,
         vec![], // log_tail
         Some(hint),
         end_version,
+        MetricId::nil(),
     );
     match expected {
         Ok((checkpoint_version, commits)) => {
@@ -6160,6 +6207,12 @@ async fn amt_last_checkpoint_hint_bounds_listing(
         }
         Err(message) => assert_result_error_with_message(log_segment, message),
     }
+    assert!(
+        reporter
+            .events()
+            .iter()
+            .all(|event| !matches!(event, MetricEvent::CheckpointPartsMissing(_)))
+    );
 }
 
 // With an AMT hint, a snapshot is built from the commits at and after the hinted version alone:
@@ -6224,9 +6277,15 @@ async fn snapshot_checkpoint_gap_preserves_replay_context(#[case] target: Option
         None,
     )
     .await;
-    let error =
-        LogSegment::for_snapshot_impl(storage.as_ref(), log_root.clone(), vec![], None, target)
-            .unwrap_err();
+    let error = LogSegment::for_snapshot_impl(
+        storage.as_ref(),
+        log_root.clone(),
+        vec![],
+        None,
+        target,
+        MetricId::nil(),
+    )
+    .unwrap_err();
     let Error::Delta(error) = error else {
         panic!("expected Delta error")
     };
@@ -6312,7 +6371,8 @@ async fn snapshot_commit_gap_reports_full_replay_sequence(
     }
     let (storage, root) = build_log_with_paths_and_checkpoint(&files, None).await;
     let error =
-        LogSegment::for_snapshot_impl(storage.as_ref(), root, vec![], None, None).unwrap_err();
+        LogSegment::for_snapshot_impl(storage.as_ref(), root, vec![], None, None, MetricId::nil())
+            .unwrap_err();
     let Error::Delta(error) = error else {
         panic!("expected Delta gap")
     };

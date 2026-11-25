@@ -564,6 +564,21 @@ void print_metric(MetricEvent event) {
     PM_END;
     return;
 
+  case MetricEventCheckpointPartsMissing:
+    PM_START(CheckpointPartsMissing);
+    CheckpointPartsMissing cpm = event.checkpoint_parts_missing;
+    PM_ID(cpm, operation_id);
+    printf("  source:");
+    switch (cpm.source) {
+    case CheckpointPartsMissingSourceListing: printf(" Listing,\n"); break;
+    case CheckpointPartsMissingSourceHint: printf(" Hint,\n"); break;
+    }
+    PM_U64(cpm, version);
+    PM_U64(cpm, expected_parts);
+    PM_U64(cpm, found_parts);
+    PM_END;
+    return;
+
   case MetricEventCheckpointWriteSuccess:
     PM_START(CheckpointWriteSuccess);
     CheckpointWriteSuccess cps = event.checkpoint_write_success;

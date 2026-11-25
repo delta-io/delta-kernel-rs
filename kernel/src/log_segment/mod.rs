@@ -34,7 +34,7 @@ use crate::log_replay::ActionsBatch;
 #[internal_api]
 use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::{
-    SnapshotLoadMetricContext, emit_log_segment_load, emit_log_segment_load_failure,
+    MetricId, SnapshotLoadMetricContext, emit_log_segment_load, emit_log_segment_load_failure,
 };
 use crate::path::LogPathFileType::*;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -531,6 +531,7 @@ impl LogSegment {
                 log_tail,
                 checkpoint_hint,
                 time_travel_version,
+                metric_context.operation_id,
             )
         };
         let log_segment = build()
@@ -558,6 +559,7 @@ impl LogSegment {
         log_tail: Vec<ParsedLogPath>,
         checkpoint_hint: Option<LastCheckpointHint>,
         time_travel_version: Option<Version>,
+        operation_id: MetricId,
     ) -> Result<Self> {
         // The end_version is the time_travel_version, if present
         // TODO: When max catalog version is implemented, we would use that as end_version if
@@ -589,13 +591,20 @@ impl LogSegment {
                 &log_root,
                 log_tail,
                 end_version,
+                operation_id,
             )?,
             // Case 3
             (None, Some(end)) => LogSegmentFiles::list_with_backward_checkpoint_scan(
-                storage, &log_root, log_tail, end,
+                storage,
+                &log_root,
+                log_tail,
+                end,
+                operation_id,
             )?,
             // Case 4
-            (None, None) => LogSegmentFiles::list(storage, &log_root, log_tail, None, None)?,
+            (None, None) => {
+                LogSegmentFiles::list(storage, &log_root, log_tail, None, None, operation_id)?
+            }
         };
 
         Self::try_new_for_snapshot(listed_files, log_root, time_travel_version, checkpoint_hint)
