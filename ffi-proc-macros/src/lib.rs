@@ -8,7 +8,7 @@ use syn::{
     parse_macro_input,
 };
 
-mod export;
+mod ffi_export;
 
 /// Wraps a fallible C export with Kernel panic containment and connector error allocation.
 ///
@@ -20,7 +20,7 @@ mod export;
 /// Intended for use inside `delta_kernel_ffi`.
 #[proc_macro_attribute]
 pub fn ffi_export(attr: TokenStream, item: TokenStream) -> TokenStream {
-    export::expand(attr.into(), item.into())
+    ffi_export::expand(attr.into(), item.into())
         .unwrap_or_else(Error::into_compile_error)
         .into()
 }
