@@ -17,7 +17,7 @@ from review_history import (
     is_duplicate_review,
     previous_inline_comments,
 )
-from review_publish import INLINE_FEEDBACK_FOOTER
+from review_publish import FINDING_FEEDBACK_FOOTER
 from review_publish import format_review_body as _format_review_body
 
 INLINE_FINDING_FIELDS = ("id", "path", "line", "side", "body")
@@ -264,7 +264,7 @@ def build_review_payload(
                 "path": path,
                 "line": line,
                 "side": side,
-                "body": f"**{finding_id}** {body}{INLINE_FEEDBACK_FOOTER}",
+                "body": f"**{finding_id}** {body}{FINDING_FEEDBACK_FOOTER}",
             }
         )
 

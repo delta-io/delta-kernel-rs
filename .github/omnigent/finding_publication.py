@@ -14,7 +14,6 @@ import hashlib
 import json
 import re
 import subprocess
-from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -128,7 +127,7 @@ def collect_findings(review: str, structured: Any) -> tuple[list[dict[str, Any]]
             isinstance(path, str) and path and len(path) <= 500 and not path.startswith("/")
             and ".." not in Path(path).parts and "\x00" not in path
             and isinstance(line, int) and not isinstance(line, bool) and line > 0
-            and side in {"LEFT", "RIGHT"}
+            and isinstance(side, str) and side in {"LEFT", "RIGHT"}
         ):
             path, line, side = None, None, None
         finding.update(path=path, line=line, side=side)
@@ -182,9 +181,9 @@ def publish_findings(
 ) -> dict[str, Any]:
     """Post or reuse finding comments and update the main AI review comment for one commit.
 
-    Return final findings with confirmed comment URLs and posting errors. After a failed write,
-    read GitHub comments before trying another comment location. Summary and artifact modes
-    return report records without posting PR comments.
+    Return final findings with confirmed comment URLs and posting errors. An unobserved write
+    remains unconfirmed without an automatic retry. Summary and artifact modes return report
+    records without posting PR comments.
     """
     if not re.fullmatch(r"[0-9a-f]{40}", head_sha):
         raise ValueError("invalid head SHA")
@@ -243,16 +242,8 @@ def publish_findings(
             if not _url(main) or not isinstance(main.get("id"), int):
                 raise PublicationError("Main comment URL was not returned")
         except PublicationError:
-            try:
-                issues, inline = history()
-                main = next(
-                    (item for item in issues if _metadata(item, _MAIN_MARKER) == source), None
-                )
-            except PublicationError:
-                main = None
-            if main is None or not _url(main) or not isinstance(main.get("id"), int):
-                errors.append("The main comment write could not be confirmed.")
-                return record
+            errors.append("The main comment write could not be confirmed.")
+            return record
     record["main_url"] = _url(main)
     github_pr_patch_positions = diff_positions(github_pr_patch)
     pr_change_patch_positions = (
@@ -287,9 +278,7 @@ def publish_findings(
         metadata = {**source, "id": finding["id"], "fingerprint": finding["fingerprint"]}
         body = (
             f"{BOT_MARKER}\n<!-- ai-review-finding {json.dumps(metadata, sort_keys=True)} -->\n"
-            + format_finding(
-                finding, head_sha=head_sha, main_url=record["main_url"], collapsed=can_inline
-            )
+            + format_finding(finding, head_sha=head_sha, main_url=record["main_url"])
         )
         path = inline_path if can_inline else issue_path
         payload = {"body": body}
@@ -303,31 +292,15 @@ def publish_findings(
             if not _url(destination):
                 raise PublicationError("Finding URL was not returned")
         except PublicationError as error:
-            try:
-                issues, inline = history()
-                destination = _existing(finding, issues, inline)
-            except PublicationError:
-                destination = None
-                error = PublicationError("Publication reconciliation failed")
-            if destination is None and can_inline and not error.ambiguous:
+            destination = None
+            if can_inline and not error.ambiguous:
                 try:
-                    body = (
-                        f"{BOT_MARKER}\n<!-- ai-review-finding "
-                        f"{json.dumps(metadata, sort_keys=True)} -->\n"
-                        + format_finding(
-                            finding, head_sha=head_sha, main_url=record["main_url"]
-                        )
-                    )
                     destination = github.write("POST", issue_path, {"body": body})
                     can_inline = False
                     if not _url(destination):
                         raise PublicationError("Fallback URL was not returned")
                 except PublicationError:
-                    try:
-                        issues, inline = history()
-                        destination = _existing(finding, issues, inline)
-                    except PublicationError:
-                        destination = None
+                    destination = None
             if destination is None or not _url(destination):
                 finding["error"] = "The finding write could not be confirmed."
                 errors.append(f"{finding['id']}: publication could not be confirmed.")
@@ -349,33 +322,20 @@ def publish_findings(
     try:
         github.write("PATCH", f"{prefix}/issues/comments/{main['id']}", {"body": final_body})
     except PublicationError:
-        try:
-            observed = github.read(f"{prefix}/issues/comments/{main['id']}")
-        except PublicationError:
-            observed = {}
-        if observed.get("body") != final_body:
-            errors.append("The final main comment could not be confirmed.")
+        errors.append("The final main comment could not be confirmed.")
     record["complete"] = not errors and all(finding.get("url") for finding in findings)
     return record
 
 
 def publication_check(review: str, record: dict[str, Any]) -> str:
-    """Build the AI Review Summary Check Run report with findings and comment-posting results."""
-    totals = Counter(
-        finding.get("delivery") for finding in record["findings"] if finding.get("url")
-    )
-    parts = [complete_review(review, record["findings"]), "## Finding publication",
-             f"New finding comments: {totals['new']} · Reused finding comments: {totals['reused']}"]
-    if record.get("mode") in {"summary", "artifact"}:
-        parts.append(f"Report output: {record['mode']}. No PR comments requested.")
-    parts.extend(f"- {error}" for error in record["errors"])
-    return "\n\n".join(parts) + "\n"
+    """Build the AI Review Summary Check Run report from all final findings."""
+    return complete_review(review, record["findings"]) + "\n"
 
 
 def _identity(value: Any) -> tuple[str, str]:
     if not isinstance(value, str) or (match := _ID.fullmatch(value.strip())) is None:
         raise ValueError("invalid final finding ID")
-    category = match[1].replace(" ", "").casefold()
+    category = re.sub(r"\s+", "", match[1]).casefold()
     severity = {"blocker": "Blocker", "shouldfix": "Should Fix", "nit": "Nit"}[category]
     return severity.replace(" ", "") + match[2], severity
 
@@ -472,6 +432,8 @@ def main() -> None:
         mode=args.mode, placement=args.placement,
     )
     args.output.write_text(json.dumps(record, indent=2) + "\n")
+    for error in record["errors"]:
+        print(f"::warning::{error}")
     args.check_output.write_text(publication_check(review, record))
     args.full_review_output.write_text(complete_review(review, record["findings"]) + "\n")
 

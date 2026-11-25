@@ -6,13 +6,15 @@ import re
 from collections import Counter
 from typing import Any
 
+from markdown_utils import markdown_lines
+
 
 BOT_MARKER = "<!-- ai-review-bot -->"
-INLINE_FEEDBACK_FOOTER = (
-    "\n\n---\n"
-    "<sub>Feedback: react 👍 if helpful, 👎 if unhelpful or incorrect, "
-    "or 👀 if out of scope.</sub>"
+FINDING_FEEDBACK_PROMPT = (
+    "Feedback: react 👍 if helpful, 👎 if unhelpful or incorrect, "
+    "or 👀 if out of scope."
 )
+FINDING_FEEDBACK_FOOTER = f"\n\n---\n<sub>{FINDING_FEEDBACK_PROMPT}</sub>"
 REVIEW_HEADER = "## AI Review <sub>(draft - human review required)</sub>"
 _REVIEW_FOOTER = re.compile(
     r"\n+---\n+<sub>Automated review - \[workflow run\]\([^\n]+\)</sub>\s*$"
@@ -117,22 +119,37 @@ def finding_label(finding_id: str) -> str:
 
 
 def format_finding(
-    finding: dict[str, Any], *, head_sha: str, main_url: str, collapsed: bool = False
+    finding: dict[str, Any], *, head_sha: str, main_url: str
 ) -> str:
-    """Build one finding comment, optionally folding inline detail under a Details disclosure."""
-    body = finding["body"].strip()
-    attribution = re.findall(r"(?im)^Raised by:\s*([^\n]+)\s*$", body)
-    body = re.sub(r"(?im)^Raised by:\s*[^\n]+\n?", "", body).strip()
+    """Keep finding text visible and put review metadata above the feedback prompt in a small footer."""
+    attribution = []
+    lines = []
+    for _, line, fence in markdown_lines(finding["body"].strip()):
+        field = re.match(
+            r"^(?:\*\*)?(Explanation|Suggested fix|Raised by)(?:\*\*)?:[ \t]*"
+            r"(?:\*\*)?[ \t]*(.*)", line, re.I,
+        ) if fence is None else None
+        if field:
+            label = field[1].casefold()
+            if label == "raised by":
+                attribution.append(field[2].strip())
+                continue
+            label = "Explanation" if label == "explanation" else "Suggested fix"
+            line = f"**{label}:** {field[2]}\n"
+        lines.append(line)
+    body = "".join(lines).strip()
     claim, separator, detail = body.partition("\n\n")
     text = f"**{finding_label(finding['id'])}** {claim}"
     if separator:
-        text += (
-            f"\n\n<details><summary>Details</summary>\n\n{detail}\n\n</details>"
-            if collapsed else f"\n\n{detail}"
-        )
+        if not detail.startswith(("**Explanation:**", "**Suggested fix:**")):
+            detail = "**Explanation:**\n\n" + detail
+        text += f"\n\n{detail}"
     raised_by = f"Raised by: {', '.join(attribution)} · " if attribution else ""
-    footer = INLINE_FEEDBACK_FOOTER if collapsed else ""
-    return f"{text}\n\n{raised_by}Reviewed `{head_sha[:8]}` · [AI Review]({main_url}){footer}"
+    return (
+        f"{text}\n\n---\n"
+        f"<sub>{raised_by}Reviewed `{head_sha[:8]}` · [AI Review]({main_url})</sub><br>\n"
+        f"<sub>{FINDING_FEEDBACK_PROMPT}</sub>"
+    )
 
 
 def format_review_summary(
