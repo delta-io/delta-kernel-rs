@@ -1546,16 +1546,33 @@ impl fmt::Display for CrcReadFailure {
     }
 }
 
-/// Checkpoint discovery found missing or empty parts without a usable replacement checkpoint.
+/// How checkpoint discovery found a missing or incomplete checkpoint candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, StrumDisplay, AsRefStr, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+#[non_exhaustive]
+pub enum CheckpointPartsMissingSource {
+    /// A listed multipart candidate had missing or empty parts, including an all-empty set.
+    Listing,
+    /// A file-backed checkpoint hint named a missing or unusable target.
+    Hint,
+    /// The source was not recorded or its metric label was unrecognized.
+    Unknown,
+}
+
+/// Checkpoint discovery found missing or empty parts in a checkpoint candidate.
 ///
-/// Reports incomplete multipart candidates newer than the selected checkpoint. A file-backed
-/// hint with no usable checkpoint also emits this event; an absent or empty classic or V2 target
-/// reports one expected part and zero found parts. Listings that ignore checkpoints emit nothing.
+/// Reports incomplete candidates for which discovery found no complete checkpoint at the same
+/// or a later version. Discovery may still use an older checkpoint and replay subsequent commits.
+/// The [`Self::source`] distinguishes listed multipart candidates from file-backed hints with no
+/// usable target. An absent or empty classic or V2 hint target reports one expected part and zero
+/// found parts. Listings that ignore checkpoints emit nothing.
 ///
 /// This event has no `operation_id`. Use log-segment and snapshot completion events to observe
 /// whether fallback succeeded or the enclosing operation failed.
 #[derive(Debug, Clone)]
 pub struct CheckpointPartsMissing {
+    /// How the incomplete checkpoint candidate was discovered.
+    pub source: CheckpointPartsMissingSource,
     /// Version of the incomplete checkpoint.
     pub version: u64,
     /// Number of parts required by the checkpoint file names or hint.
@@ -1571,6 +1588,7 @@ impl CheckpointPartsMissing {
         let _span = tracing::info_span!(
             CheckpointPartsMissing::SPAN_NAME,
             report = tracing::field::Empty,
+            source = self.source.as_ref(),
             version = self.version,
             expected_parts = self.expected_parts,
             found_parts = self.found_parts,
@@ -1579,6 +1597,7 @@ impl CheckpointPartsMissing {
 
     pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
         let mut event = Self {
+            source: CheckpointPartsMissingSource::Unknown,
             version: 0,
             expected_parts: 0,
             found_parts: 0,
@@ -1589,6 +1608,14 @@ impl CheckpointPartsMissing {
 }
 
 impl Visit for CheckpointPartsMissing {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "source" {
+            self.source = value
+                .parse()
+                .unwrap_or(CheckpointPartsMissingSource::Unknown);
+        }
+    }
+
     fn record_u64(&mut self, field: &Field, value: u64) {
         match field.name() {
             "version" => self.version = value,
@@ -1605,8 +1632,8 @@ impl fmt::Display for CheckpointPartsMissing {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "CheckpointPartsMissing(version={}, expected_parts={}, found_parts={})",
-            self.version, self.expected_parts, self.found_parts
+            "CheckpointPartsMissing(source={}, version={}, expected_parts={}, found_parts={})",
+            self.source, self.version, self.expected_parts, self.found_parts
         )
     }
 }

@@ -88,9 +88,9 @@ mod streaming_metrics_iterator;
 use std::sync::Arc;
 
 pub use events::{
-    CheckpointOutputStats, CheckpointPartsMissing, CheckpointProcessingStats,
-    CheckpointWriteFailure, CheckpointWriteMode, CheckpointWriteOutcome, CheckpointWriteStats,
-    CheckpointWriteSuccess, ChecksumWriteFailure, ChecksumWriteOutcome,
+    CheckpointOutputStats, CheckpointPartsMissing, CheckpointPartsMissingSource,
+    CheckpointProcessingStats, CheckpointWriteFailure, CheckpointWriteMode, CheckpointWriteOutcome,
+    CheckpointWriteStats, CheckpointWriteSuccess, ChecksumWriteFailure, ChecksumWriteOutcome,
     ChecksumWriteResolutionMode, ChecksumWriteSuccess, CommitFailureReason, CrcReadFailure,
     CrcReadFailureReason, CrcReadSuccess, DomainMetadataLoadSuccess, JsonReadCompleted,
     LastCheckpointReadCompleted, LastCheckpointReadOutcome, LogSegmentLoadFailure,

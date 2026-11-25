@@ -580,13 +580,40 @@ pub struct CrcReadFailure {
     pub reason: CrcReadFailureReason,
 }
 
-/// A checkpoint candidate was rejected because referenced parts were missing.
+/// How checkpoint discovery found a missing or incomplete checkpoint candidate.
 ///
-/// This reports discovery of missing parts, not whether the enclosing snapshot build succeeded.
-/// A missing hinted classic or V2 checkpoint reports one expected part and zero found parts.
+/// cbindgen:prefix-with-name=true
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum CheckpointPartsMissingSource {
+    /// A listed multipart candidate had missing or empty parts.
+    Listing,
+    /// A file-backed checkpoint hint named a missing or unusable target.
+    Hint,
+    /// The source was unrecorded, unrecognized, or is unavailable to this binding.
+    Unknown,
+}
+
+impl From<kernel::CheckpointPartsMissingSource> for CheckpointPartsMissingSource {
+    fn from(source: kernel::CheckpointPartsMissingSource) -> Self {
+        match source {
+            kernel::CheckpointPartsMissingSource::Listing => Self::Listing,
+            kernel::CheckpointPartsMissingSource::Hint => Self::Hint,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// A checkpoint candidate had missing or empty parts with no complete candidate at the same or a
+/// later version.
+///
+/// Discovery may still use an older checkpoint and replay subsequent commits. A missing or empty
+/// classic or V2 hint target reports one expected part and zero found parts.
 /// This event has no operation ID; use snapshot and log-segment completion events for outcomes.
 #[repr(C)]
 pub struct CheckpointPartsMissing {
+    /// How the incomplete checkpoint candidate was discovered.
+    pub source: CheckpointPartsMissingSource,
     /// Version of the incomplete checkpoint.
     pub version: u64,
     /// Number of parts required by the checkpoint file name or hint.
@@ -950,10 +977,12 @@ impl MetricEvent {
                 })
             }
             K::CheckpointPartsMissing(kernel::CheckpointPartsMissing {
+                source,
                 version,
                 expected_parts,
                 found_parts,
             }) => Self::CheckpointPartsMissing(CheckpointPartsMissing {
+                source: (*source).into(),
                 version: *version,
                 expected_parts: *expected_parts,
                 found_parts: *found_parts,
@@ -1128,9 +1157,25 @@ mod tests {
         });
     }
 
-    #[test]
-    fn checkpoint_parts_missing_conversion_preserves_counts() {
+    #[rstest]
+    #[case(
+        kernel::CheckpointPartsMissingSource::Listing,
+        CheckpointPartsMissingSource::Listing
+    )]
+    #[case(
+        kernel::CheckpointPartsMissingSource::Hint,
+        CheckpointPartsMissingSource::Hint
+    )]
+    #[case(
+        kernel::CheckpointPartsMissingSource::Unknown,
+        CheckpointPartsMissingSource::Unknown
+    )]
+    fn checkpoint_parts_missing_conversion_preserves_source_and_counts(
+        #[case] source: kernel::CheckpointPartsMissingSource,
+        #[case] expected: CheckpointPartsMissingSource,
+    ) {
         let event = kernel::MetricEvent::CheckpointPartsMissing(kernel::CheckpointPartsMissing {
+            source,
             version: 17,
             expected_parts: 3,
             found_parts: 2,
@@ -1139,6 +1184,7 @@ mod tests {
             let MetricEvent::CheckpointPartsMissing(event) = event else {
                 panic!("expected CheckpointPartsMissing");
             };
+            assert_eq!(event.source, expected);
             assert_eq!(event.version, 17);
             assert_eq!(event.expected_parts, 3);
             assert_eq!(event.found_parts, 2);

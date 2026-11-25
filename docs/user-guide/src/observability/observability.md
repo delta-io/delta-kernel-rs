@@ -192,7 +192,7 @@ storage call may serve multiple higher-level operations.
 | `JsonReadCompleted` | `num_files`, `bytes_read` | One `JsonHandler::read_json_files` call completed. `bytes_read` is the sum of on-disk file sizes. |
 | `ParquetReadCompleted` | `num_files`, `bytes_read` | One `ParquetHandler::read_parquet_files` call completed. `bytes_read` is the sum of on-disk file sizes. |
 | `CrcReadSuccess` | `duration`, `bytes_read` | One CRC file read and parsed successfully. `bytes_read` is the raw byte count from storage. |
-| `CrcReadFailure` | `reason` | An attempted CRC read failed. The reason distinguishes missing files, empty reads, parsing or validation failures, storage errors, and cancellation. Non-cancellation failures allow log replay. |
+| `CrcReadFailure` | `reason` | An attempted CRC read failed. The reason distinguishes missing files, empty reads, parsing or validation failures, storage errors, and cancellation. An unset or unrecognized reason reports `unknown`. Non-cancellation failures allow log replay. |
 
 > [!NOTE]
 > If you implement a custom `JsonHandler` or `ParquetHandler`, call
@@ -203,9 +203,11 @@ storage call may serve multiple higher-level operations.
 ### Checkpoint discovery and hint reads
 
 Use [CheckpointPartsMissing](https://docs.rs/delta_kernel/latest/delta_kernel/metrics/struct.CheckpointPartsMissing.html)
-to diagnose incomplete multipart checkpoints and unusable single-file checkpoint hints. A missing
-classic or V2 hint target reports one expected part and zero found parts. The event has no
-`operation_id`; use snapshot and log-segment completion events to observe whether fallback succeeded.
+to diagnose incomplete checkpoint candidates. The `source` field distinguishes physically listed
+multipart candidates (`listing`) from missing or unusable file-backed hint targets (`hint`). An older
+checkpoint can still support fallback when no complete checkpoint exists at the same or a later
+version. The event has no `operation_id`; use snapshot and log-segment completion events to observe
+whether fallback succeeded. See its rustdoc for part-count semantics.
 
 Use [LastCheckpointReadCompleted](https://docs.rs/delta_kernel/latest/delta_kernel/metrics/struct.LastCheckpointReadCompleted.html)
 to count `_last_checkpoint` read attempts and record their duration by outcome. A missing or invalid

@@ -336,9 +336,10 @@ mod tests {
         emit_protocol_metadata_load_failure,
     };
     use crate::metrics::{
-        CheckpointOutputStats, CheckpointProcessingStats, CheckpointWriteMode,
-        CheckpointWriteOutcome, CheckpointWriteStats, CrcReadFailureReason,
-        LastCheckpointReadOutcome, MetricEvent, MetricId, WithMetricsReporterLayer as _,
+        CheckpointOutputStats, CheckpointPartsMissing, CheckpointPartsMissingSource,
+        CheckpointProcessingStats, CheckpointWriteMode, CheckpointWriteOutcome,
+        CheckpointWriteStats, CrcReadFailureReason, LastCheckpointReadOutcome, MetricEvent,
+        MetricId, WithMetricsReporterLayer as _,
     };
     use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
 
@@ -406,14 +407,24 @@ mod tests {
         );
     }
 
-    #[test]
-    fn checkpoint_diagnostic_preserves_creation_fields_and_formats_counts() {
+    #[rstest::rstest]
+    #[case(None, CheckpointPartsMissingSource::Unknown)]
+    #[case(Some("listing"), CheckpointPartsMissingSource::Listing)]
+    #[case(Some("hint"), CheckpointPartsMissingSource::Hint)]
+    #[case(Some("unknown"), CheckpointPartsMissingSource::Unknown)]
+    #[case(Some(""), CheckpointPartsMissingSource::Unknown)]
+    #[case(Some("future_source"), CheckpointPartsMissingSource::Unknown)]
+    fn checkpoint_diagnostic_preserves_creation_fields_and_formats_counts(
+        #[case] source: Option<&str>,
+        #[case] expected: CheckpointPartsMissingSource,
+    ) {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
         {
             let span = info_span!(
                 "checkpoint_parts_missing",
                 report = Empty,
+                source,
                 version = 5_u64,
                 expected_parts = 3_u64,
                 found_parts = 0_u64,
@@ -421,6 +432,7 @@ mod tests {
                 extra_debug = ?"ignored",
             );
             let _entered = span.enter();
+            span.record("source", "runtime_source_must_be_ignored");
             span.record("version", 100_u64);
             span.record("found_parts", true);
             info!(error = %"enclosing failure does not change the diagnostic");
@@ -429,8 +441,36 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(
             events[0].to_string(),
-            "CheckpointPartsMissing(version=5, expected_parts=3, found_parts=0)"
+            format!(
+                "CheckpointPartsMissing(source={expected}, version=5, \
+                 expected_parts=3, found_parts=0)"
+            )
         );
+    }
+
+    #[rstest::rstest]
+    fn checkpoint_diagnostic_emits_source(
+        #[values(
+            CheckpointPartsMissingSource::Listing,
+            CheckpointPartsMissingSource::Hint,
+            CheckpointPartsMissingSource::Unknown
+        )]
+        source: CheckpointPartsMissingSource,
+    ) {
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        CheckpointPartsMissing {
+            source,
+            version: 5,
+            expected_parts: 3,
+            found_parts: 0,
+        }
+        .emit();
+        let events = reporter.events();
+        let [MetricEvent::CheckpointPartsMissing(event)] = events.as_slice() else {
+            panic!("expected one checkpoint diagnostic: {events:?}");
+        };
+        assert_eq!(event.source, source);
     }
 
     #[test]

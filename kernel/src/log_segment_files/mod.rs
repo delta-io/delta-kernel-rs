@@ -11,7 +11,7 @@
 //!
 //! [`LogSegment`]: crate::log_segment::LogSegment
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
@@ -19,7 +19,7 @@ use tracing::{debug, info, instrument, warn};
 use url::Url;
 
 use crate::last_checkpoint_hint::LastCheckpointHint;
-use crate::metrics::CheckpointPartsMissing;
+use crate::metrics::{CheckpointPartsMissing, CheckpointPartsMissingSource};
 use crate::path::LogPathFileType::*;
 use crate::path::{CheckpointInstance, LogPathFileType, ParsedLogPath};
 use crate::{KernelError, KernelResult, KernelResultIterator, StorageHandler, Version};
@@ -160,6 +160,19 @@ fn group_checkpoint_parts(
         }
     }
     checkpoints
+}
+
+/// Selects a complete checkpoint from one version group, ignoring empty files.
+fn select_complete_checkpoint(parts: Vec<ParsedLogPath>) -> Option<Vec<ParsedLogPath>> {
+    let usable_parts = parts
+        .into_iter()
+        .filter(|part| part.location.size > 0)
+        .collect();
+    group_checkpoint_parts(usable_parts)
+        .into_iter()
+        .filter(|(instance, parts)| instance.is_complete(parts))
+        .max_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, parts)| parts)
 }
 
 /// Returns the version of the latest complete checkpoint in `files`, or `None` if no complete
@@ -303,6 +316,8 @@ struct ListingAccumulator {
     pending_checkpoint_parts: Vec<ParsedLogPath>,
     /// Incomplete candidates newer than the adopted replay checkpoint.
     incomplete_checkpoints: Vec<CheckpointPartsMissing>,
+    /// A file-backed hint whose version has not yet been exhausted or satisfied by a candidate.
+    missing_hint: Option<CheckpointPartsMissing>,
     /// End-version bound used in process_file() to filter CompactedCommit files
     end_version: Option<Version>,
     /// The version of the current group being accumulated
@@ -324,6 +339,13 @@ impl ListingAccumulator {
             }
             CompactedCommit { .. } => (), // Failed the bounds check above
             ClassicCheckpoint | UuidCheckpoint | MultiPartCheckpoint { .. } => {
+                if self
+                    .missing_hint
+                    .as_ref()
+                    .is_some_and(|hint| hint.version == file.version)
+                {
+                    self.missing_hint = None;
+                }
                 self.pending_checkpoint_parts.push(file)
             }
             Crc => {
@@ -356,6 +378,13 @@ impl ListingAccumulator {
             }
             _ => {} // same version, no flush needed
         }
+        if self
+            .missing_hint
+            .as_ref()
+            .is_some_and(|hint| hint.version < file_version)
+        {
+            self.incomplete_checkpoints.extend(self.missing_hint.take());
+        }
     }
 
     /// Selects this version's checkpoint. Any of a version's complete checkpoints (see
@@ -372,7 +401,7 @@ impl ListingAccumulator {
         }
         // Grouping retains only contiguous prefixes, so count raw candidates before it
         // discards a missing first or middle part. Empty files identify but do not fill parts.
-        let mut multipart_parts: HashMap<u32, HashSet<u32>> = HashMap::new();
+        let mut multipart_parts: BTreeMap<u32, HashSet<u32>> = BTreeMap::new();
         for part in &pending_checkpoint_parts {
             if let MultiPartCheckpoint {
                 part_num,
@@ -389,21 +418,14 @@ impl ListingAccumulator {
             let found_parts = parts.len() as u64;
             if found_parts < u64::from(expected_parts) {
                 self.incomplete_checkpoints.push(CheckpointPartsMissing {
+                    source: CheckpointPartsMissingSource::Listing,
                     version,
                     expected_parts: u64::from(expected_parts),
                     found_parts,
                 });
             }
         }
-        let usable_parts = pending_checkpoint_parts
-            .into_iter()
-            .filter(|part| part.location.size > 0)
-            .collect();
-        let Some((_, complete_checkpoint)) = group_checkpoint_parts(usable_parts)
-            .into_iter()
-            .filter(|(instance, part_files)| instance.is_complete(part_files))
-            .max_by(|(a, _), (b, _)| a.cmp(b))
-        else {
+        let Some(complete_checkpoint) = select_complete_checkpoint(pending_checkpoint_parts) else {
             return;
         };
         self.incomplete_checkpoints.clear();
@@ -427,6 +449,29 @@ impl ListingAccumulator {
         {
             self.output.latest_crc_file = None;
         }
+    }
+
+    /// Finalize an exhausted listing, including its last version group and any absent hint.
+    fn finish(&mut self) {
+        if let Some(version) = self.group_version.take() {
+            self.select_checkpoint_for_group(version);
+        }
+        self.incomplete_checkpoints.extend(self.missing_hint.take());
+        self.emit_incomplete_checkpoints();
+    }
+
+    /// Keep known complete replacements without diagnosing an unfinished multipart group.
+    fn discard_unfinished_group(&mut self) {
+        if select_complete_checkpoint(std::mem::take(&mut self.pending_checkpoint_parts)).is_some()
+        {
+            self.incomplete_checkpoints.clear();
+        }
+        self.group_version = None;
+    }
+
+    fn report_failed_listing(&mut self) {
+        self.discard_unfinished_group();
+        self.emit_incomplete_checkpoints();
     }
 
     fn emit_incomplete_checkpoints(&mut self) {
@@ -457,87 +502,12 @@ impl LogSegmentFiles {
         end_version: Option<Version>,
         checkpoint_handling: CheckpointHandling,
     ) -> KernelResult<Self> {
-        // `validate_catalog_managed_log_tail` enforces that log_tail is only commits, and
-        // LogSegment checks no gaps/duplicates, so we don't duplicate that here
-        debug_assert!(
-            log_tail.iter().all(|entry| entry.is_commit()),
-            "log_tail should only contain commits"
-        );
-
-        let log_tail_start_version = log_tail.first().map(|f| f.version);
-        let end = end_version.unwrap_or(Version::MAX);
-
-        let mut acc = ListingAccumulator {
+        let acc = ListingAccumulator {
             end_version,
             checkpoint_handling,
             ..Default::default()
         };
-
-        // Phase 1: Stream filesystem files lazily (no collect).
-        // We always list from the filesystem even when the log_tail covers the entire commit
-        // range, because non-commit files (CRC, checkpoints, compactions) only exist on the
-        // filesystem — the log_tail only provides commit files.
-        for file_result in fs_files {
-            let file = file_result.inspect_err(|_| acc.emit_incomplete_checkpoints())?;
-
-            // Track max published commit version from ALL filesystem Commit files,
-            // including those that will be skipped because log_tail takes precedence.
-            if matches!(file.file_type, LogPathFileType::Commit) {
-                acc.output.max_published_version =
-                    acc.output.max_published_version.max(Some(file.version));
-            }
-
-            // Skip filesystem commits at versions covered by the log_tail (the log_tail
-            // is authoritative for commits). Non-commit files are always kept.
-            if file.is_commit()
-                && log_tail_start_version.is_some_and(|tail_start| file.version >= tail_start)
-            {
-                continue;
-            }
-
-            acc.maybe_flush_and_advance(file.version);
-            acc.process_file(file);
-        }
-
-        // Phase 2: Process log_tail entries. We do this after Phase 1 because log_tail commits
-        // start at log_tail_start_version and are in ascending version order — they always extend
-        // (or overlap with, but supersede) the filesystem-listed commits. Processing them after
-        // Phase 1 maintains ascending version order throughout, which is required by the checkpoint
-        // grouping logic. Note that Phase 1 already skipped filesystem commits at log_tail
-        // versions, so there's no duplication here.
-        //
-        // log_tail entries at versions before a checkpoint may still be included
-        // here - LogSegment::try_new is the safeguard that filters those out unconditionally
-        let filtered_log_tail = log_tail
-            .into_iter()
-            .filter(|entry| entry.version >= start_version && entry.version <= end);
-        for file in filtered_log_tail {
-            // Track max published version for published commits from the log_tail
-            if matches!(file.file_type, LogPathFileType::Commit) {
-                acc.output.max_published_version =
-                    acc.output.max_published_version.max(Some(file.version));
-            }
-
-            acc.maybe_flush_and_advance(file.version);
-            acc.process_file(file);
-        }
-
-        // Flush the final group
-        if let Some(gv) = acc.group_version {
-            acc.select_checkpoint_for_group(gv);
-        }
-
-        // Since ascending_commit_files is cleared when a checkpoint is adopted, a non-empty list
-        // contains only commits after the most recent adopted checkpoint. The last element is the
-        // highest version commit overall, so we update latest_commit_file to it. If it's empty,
-        // we keep the value set at the checkpoint (if a commit existed at the checkpoint version),
-        // or remains None.
-        if let Some(commit_file) = acc.output.ascending_commit_files.last() {
-            acc.output.latest_commit_file = Some(commit_file.clone());
-        }
-
-        acc.emit_incomplete_checkpoints();
-        Ok(acc.output)
+        Self::build_with_accumulator(fs_files, log_tail, start_version, acc)
     }
 
     pub(crate) fn ascending_commit_files(&self) -> &Vec<ParsedLogPath> {
@@ -682,14 +652,16 @@ impl LogSegmentFiles {
         end_version: Option<Version>,
         checkpoint_handling: CheckpointHandling,
     ) -> KernelResult<Self> {
-        Self::list_with_inspector(
+        Self::list_impl(
             storage,
             log_root,
             log_tail,
             start_version,
-            end_version,
-            checkpoint_handling,
-            |_| {},
+            ListingAccumulator {
+                end_version,
+                checkpoint_handling,
+                ..Default::default()
+            },
         )
     }
 
@@ -708,21 +680,32 @@ impl LogSegmentFiles {
         log_tail: Vec<ParsedLogPath>,
         end_version: Option<Version>,
     ) -> KernelResult<Self> {
-        let mut hinted_checkpoint_candidate_seen = false;
-        let listed_files = Self::list_with_inspector(
+        let mut acc = ListingAccumulator {
+            end_version,
+            ..Default::default()
+        };
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        let expects_checkpoint_file = checkpoint_metadata.amt_checkpoint.is_none();
+        #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+        let expects_checkpoint_file = true;
+        if expects_checkpoint_file {
+            acc.missing_hint = Some(CheckpointPartsMissing {
+                source: CheckpointPartsMissingSource::Hint,
+                version: checkpoint_metadata.version,
+                expected_parts: if checkpoint_metadata.v2_checkpoint.is_some() {
+                    1
+                } else {
+                    checkpoint_metadata.parts.unwrap_or(1) as u64
+                },
+                found_parts: 0,
+            });
+        }
+        let listed_files = Self::list_impl(
             storage,
             log_root,
             log_tail,
             Some(checkpoint_metadata.version),
-            end_version,
-            CheckpointHandling::Adopt,
-            |file| {
-                // Multipart candidates, including all-empty sets, report their own part counts.
-                hinted_checkpoint_candidate_seen |= file.version == checkpoint_metadata.version
-                    && file.is_checkpoint()
-                    && (file.location.size > 0
-                        || matches!(file.file_type, MultiPartCheckpoint { .. }));
-            },
+            acc,
         )?;
         let Some(latest_checkpoint) = listed_files.checkpoint_parts.last() else {
             // The segment has no checkpoint version yet starts at the hinted version: the
@@ -732,23 +715,6 @@ impl LogSegmentFiles {
             {
                 validate_amt_listing(&listed_files, checkpoint_metadata, manifest_commit_version)?;
                 return Ok(listed_files);
-            }
-            #[cfg(feature = "adaptive-metadata-in-dev")]
-            let expects_checkpoint_file = checkpoint_metadata.amt_checkpoint.is_none();
-            #[cfg(not(feature = "adaptive-metadata-in-dev"))]
-            let expects_checkpoint_file = true;
-            if expects_checkpoint_file && !hinted_checkpoint_candidate_seen {
-                let expected_parts = if checkpoint_metadata.v2_checkpoint.is_some() {
-                    1
-                } else {
-                    checkpoint_metadata.parts.unwrap_or(1) as u64
-                };
-                CheckpointPartsMissing {
-                    version: checkpoint_metadata.version,
-                    expected_parts,
-                    found_parts: 0,
-                }
-                .emit();
             }
             // The hint names a checkpoint that no longer exists, and because the listing started
             // at the hinted version, no checkpoint exists at or after it either. The log was
@@ -833,8 +799,33 @@ impl LogSegmentFiles {
         let mut upper = end_version + 1;
         while upper > 0 {
             let lower = upper.saturating_sub(BACKWARD_SCAN_WINDOW_SIZE);
-            let window_files: Vec<_> =
-                list_delta_log_from_storage(storage, log_root, lower, upper - 1)?.try_collect()?;
+            let mut window_files = Vec::new();
+            let listed = list_delta_log_from_storage(storage, log_root, lower, upper - 1).and_then(
+                |mut files| {
+                    files.try_for_each(|file| {
+                        window_files.push(file?);
+                        Ok(())
+                    })
+                },
+            );
+            if let Err(error) = listed {
+                let mut acc = ListingAccumulator {
+                    end_version: Some(end_version),
+                    ..Default::default()
+                };
+                for file in window_files {
+                    acc.maybe_flush_and_advance(file.version);
+                    acc.process_file(file);
+                }
+                // A newer window's boundary must not complete the failed window's partial group.
+                acc.discard_unfinished_group();
+                for file in windows.into_iter().rev().flatten() {
+                    acc.maybe_flush_and_advance(file.version);
+                    acc.process_file(file);
+                }
+                acc.finish();
+                return Err(error);
+            }
 
             found_checkpoint_version = find_complete_checkpoint_version(&window_files);
             windows.push(window_files);
@@ -856,23 +847,97 @@ impl LogSegmentFiles {
         )
     }
 
-    #[instrument(name = "log.list", skip_all, fields(enable_call_frame, start = ?start_version, end = ?end_version), err)]
-    fn list_with_inspector(
+    fn build_with_accumulator(
+        fs_files: impl KernelResultIterator<ParsedLogPath>,
+        log_tail: Vec<ParsedLogPath>,
+        start_version: Version,
+        mut acc: ListingAccumulator,
+    ) -> KernelResult<Self> {
+        // `validate_catalog_managed_log_tail` enforces that log_tail is only commits, and
+        // LogSegment checks no gaps/duplicates, so we don't duplicate that here
+        debug_assert!(
+            log_tail.iter().all(|entry| entry.is_commit()),
+            "log_tail should only contain commits"
+        );
+
+        let log_tail_start_version = log_tail.first().map(|f| f.version);
+        let end = acc.end_version.unwrap_or(Version::MAX);
+
+        // Phase 1: Stream filesystem files lazily (no collect).
+        // We always list from the filesystem even when the log_tail covers the entire commit
+        // range, because non-commit files (CRC, checkpoints, compactions) only exist on the
+        // filesystem — the log_tail only provides commit files.
+        for file_result in fs_files {
+            let file = file_result.inspect_err(|_| acc.report_failed_listing())?;
+            // Even an overridden commit closes the preceding filesystem version group.
+            acc.maybe_flush_and_advance(file.version);
+
+            // Track max published commit version from ALL filesystem Commit files,
+            // including those that will be skipped because log_tail takes precedence.
+            if matches!(file.file_type, LogPathFileType::Commit) {
+                acc.output.max_published_version =
+                    acc.output.max_published_version.max(Some(file.version));
+            }
+
+            // Skip filesystem commits at versions covered by the log_tail (the log_tail
+            // is authoritative for commits). Non-commit files are always kept.
+            if file.is_commit()
+                && log_tail_start_version.is_some_and(|tail_start| file.version >= tail_start)
+            {
+                continue;
+            }
+
+            acc.process_file(file);
+        }
+
+        // Phase 2: Process log_tail entries. We do this after Phase 1 because log_tail commits
+        // start at log_tail_start_version and are in ascending version order — they always extend
+        // (or overlap with, but supersede) the filesystem-listed commits. Processing them after
+        // Phase 1 maintains ascending version order throughout, which is required by the checkpoint
+        // grouping logic. Note that Phase 1 already skipped filesystem commits at log_tail
+        // versions, so there's no duplication here.
+        //
+        // log_tail entries at versions before a checkpoint may still be included
+        // here - LogSegment::try_new is the safeguard that filters those out unconditionally
+        let filtered_log_tail = log_tail
+            .into_iter()
+            .filter(|entry| entry.version >= start_version && entry.version <= end);
+        for file in filtered_log_tail {
+            // Track max published version for published commits from the log_tail
+            if matches!(file.file_type, LogPathFileType::Commit) {
+                acc.output.max_published_version =
+                    acc.output.max_published_version.max(Some(file.version));
+            }
+
+            acc.maybe_flush_and_advance(file.version);
+            acc.process_file(file);
+        }
+
+        acc.finish();
+
+        // Since ascending_commit_files is cleared when a checkpoint is adopted, a non-empty list
+        // contains only commits after the most recent adopted checkpoint. The last element is the
+        // highest version commit overall, so we update latest_commit_file to it. If it's empty,
+        // we keep the value set at the checkpoint (if a commit existed at the checkpoint version),
+        // or remains None.
+        if let Some(commit_file) = acc.output.ascending_commit_files.last() {
+            acc.output.latest_commit_file = Some(commit_file.clone());
+        }
+
+        Ok(acc.output)
+    }
+
+    #[instrument(name = "log.list", skip_all, fields(enable_call_frame, start = ?start_version, end = ?acc.end_version), err)]
+    fn list_impl(
         storage: &dyn StorageHandler,
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         start_version: Option<Version>,
-        end_version: Option<Version>,
-        checkpoint_handling: CheckpointHandling,
-        mut inspect: impl FnMut(&ParsedLogPath) + Send,
+        acc: ListingAccumulator,
     ) -> KernelResult<Self> {
         let start = start_version.unwrap_or(0);
-        let end = end_version.unwrap_or(Version::MAX);
-        let files = list_delta_log_from_storage(storage, log_root, start, end)?.inspect(|file| {
-            if let Ok(file) = file {
-                inspect(file);
-            }
-        });
-        Self::build_log_segment_files(files, log_tail, start, end_version, checkpoint_handling)
+        let end = acc.end_version.unwrap_or(Version::MAX);
+        let files = list_delta_log_from_storage(storage, log_root, start, end)?;
+        Self::build_with_accumulator(files, log_tail, start, acc)
     }
 }

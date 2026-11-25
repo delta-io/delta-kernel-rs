@@ -7,7 +7,7 @@ use url::Url;
 use super::*;
 use crate::engine::sync::SyncEngine;
 use crate::engine::{CancellableEngine, DelegatingEngine, RelaxedCounter};
-use crate::metrics::MetricEvent;
+use crate::metrics::{CheckpointPartsMissingSource, MetricEvent};
 use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path as ObjectPath;
@@ -148,10 +148,18 @@ fn assert_source(commit: &ParsedLogPath, expected_source: CommitSource) {
 /// items consumed from the returned iterators. Used to verify that
 /// `list_with_backward_checkpoint_scan` issues the expected number of storage listing requests,
 /// and that listing terminates without consuming files past the version-named region.
+/// Optional faults exercise the real discovery code through failing storage calls or iterators.
 struct CountingStorageHandler {
     inner: Arc<dyn StorageHandler>,
     list_from_count: RelaxedCounter,
     items_listed: Arc<RelaxedCounter>,
+    failure: Option<ListingFailure>,
+}
+
+#[derive(Clone, Copy)]
+enum ListingFailure {
+    Request { call: u64 },
+    Iterator { call: u64, after_items: usize },
 }
 
 impl CountingStorageHandler {
@@ -160,7 +168,13 @@ impl CountingStorageHandler {
             inner,
             list_from_count: RelaxedCounter::default(),
             items_listed: Arc::new(RelaxedCounter::default()),
+            failure: None,
         }
+    }
+
+    fn with_failure(mut self, failure: ListingFailure) -> Self {
+        self.failure = Some(failure);
+        self
     }
 
     fn call_count(&self) -> u64 {
@@ -179,8 +193,24 @@ impl StorageHandler for CountingStorageHandler {
         end: Option<&Url>,
     ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
         self.list_from_count.inc();
+        let fail_after = match self.failure {
+            Some(ListingFailure::Request { call }) if call == self.call_count() => {
+                return Err(KernelError::file_not_found("listing failed"));
+            }
+            Some(ListingFailure::Iterator { call, after_items }) if call == self.call_count() => {
+                Some(after_items)
+            }
+            _ => None,
+        };
         let items_listed = self.items_listed.clone();
         let iter = self.inner.list_from(path, end)?;
+        let iter: Box<dyn KernelResultIterator<FileMeta>> = if let Some(after_items) = fail_after {
+            Box::new(iter.take(after_items).chain(std::iter::once(Err(
+                KernelError::file_not_found("listing failed"),
+            ))))
+        } else {
+            iter
+        };
         Ok(Box::new(iter.inspect(move |_| {
             items_listed.inc();
         })))
@@ -1406,13 +1436,25 @@ async fn multipart_checkpoint_reports_missing_parts_and_preserves_fallback(
 }
 
 fn missing_checkpoint_parts(reporter: &CapturingReporter) -> Vec<(u64, u64, u64)> {
+    missing_checkpoint_diagnostics(reporter)
+        .into_iter()
+        .map(|(_, version, expected, found)| (version, expected, found))
+        .collect()
+}
+
+fn missing_checkpoint_diagnostics(
+    reporter: &CapturingReporter,
+) -> Vec<(CheckpointPartsMissingSource, u64, u64, u64)> {
     reporter
         .events()
         .into_iter()
         .filter_map(|event| match event {
-            MetricEvent::CheckpointPartsMissing(event) => {
-                Some((event.version, event.expected_parts, event.found_parts))
-            }
+            MetricEvent::CheckpointPartsMissing(event) => Some((
+                event.source,
+                event.version,
+                event.expected_parts,
+                event.found_parts,
+            )),
             _ => None,
         })
         .collect()
@@ -1483,13 +1525,17 @@ async fn hint_reports_missing_checkpoint_parts_before_fallback_or_failure(
             "Had a _last_checkpoint hint but didn't find any checkpoints",
         );
     }
-    let missing_parts = missing_checkpoint_parts(&reporter);
     let expected = if complete || alternate_checkpoint.is_some() {
         vec![]
     } else {
-        vec![(5, 3, found_parts)]
+        let source = if present_parts.is_empty() {
+            CheckpointPartsMissingSource::Hint
+        } else {
+            CheckpointPartsMissingSource::Listing
+        };
+        vec![(source, 5, 3, found_parts)]
     };
-    assert_eq!(missing_parts, expected);
+    assert_eq!(missing_checkpoint_diagnostics(&reporter), expected);
 }
 
 #[rstest]
@@ -1542,20 +1588,84 @@ async fn checkpoint_diagnostics_skip_superseded_and_ignored_candidates(
     );
 }
 
-#[test]
-fn failed_listing_reports_only_completed_incomplete_checkpoint_groups() {
+#[rstest]
+#[case::unfinished_group(
+    vec![
+        parse_log_path(&multipart_checkpoint_name(5, 1, 3)),
+        parse_log_path("00000000000000000006.json"),
+        parse_log_path(&multipart_checkpoint_name(7, 1, 3)),
+    ],
+    &[],
+    &[(5, 3, 1)]
+)]
+#[case::overridden_commit_closes_group(
+    vec![
+        parse_log_path(&multipart_checkpoint_name(5, 1, 3)),
+        parse_log_path("00000000000000000005.json"),
+        parse_log_path("00000000000000000006.json"),
+    ],
+    &[6, 7],
+    &[(5, 3, 1)]
+)]
+#[case::pending_classic_replacement(
+    vec![
+        parse_log_path(&multipart_checkpoint_name(5, 1, 3)),
+        parse_log_path("00000000000000000006.checkpoint.parquet"),
+        parse_log_path("00000000000000000006.json"),
+    ],
+    &[],
+    &[]
+)]
+#[case::flushed_classic_replacement(
+    vec![
+        parse_log_path(&multipart_checkpoint_name(5, 1, 3)),
+        parse_log_path("00000000000000000006.checkpoint.parquet"),
+        parse_log_path("00000000000000000006.json"),
+        parse_log_path("00000000000000000007.json"),
+    ],
+    &[],
+    &[]
+)]
+#[case::pending_multipart_replacement(
+    vec![
+        parse_log_path(&multipart_checkpoint_name(5, 1, 3)),
+        parse_log_path(&multipart_checkpoint_name(6, 1, 2)),
+        parse_log_path(&multipart_checkpoint_name(6, 2, 2)),
+        parse_log_path("00000000000000000006.json"),
+    ],
+    &[],
+    &[]
+)]
+#[case::unfinished_replacement(
+    vec![
+        parse_log_path(&multipart_checkpoint_name(5, 1, 3)),
+        parse_log_path(&multipart_checkpoint_name(6, 1, 3)),
+        parse_log_path("00000000000000000006.json"),
+    ],
+    &[],
+    &[(5, 3, 1)]
+)]
+fn failed_listing_reports_only_completed_incomplete_checkpoint_groups(
+    #[case] files: Vec<ParsedLogPath>,
+    #[case] log_tail_versions: &[u64],
+    #[case] expected: &[(u64, u64, u64)],
+) {
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
-    let files = vec![
-        Ok(parse_log_path(&multipart_checkpoint_name(5, 1, 3))),
-        Ok(parse_log_path("00000000000000000006.json")),
-        Ok(parse_log_path(&multipart_checkpoint_name(7, 1, 3))),
-        Err(KernelError::file_not_found("listing failed")),
-    ];
+    let files = files
+        .into_iter()
+        .map(Ok)
+        .chain(std::iter::once(Err(KernelError::file_not_found(
+            "listing failed",
+        ))));
+    let log_tail = log_tail_versions
+        .iter()
+        .map(|version| parse_log_path(&format!("{version:020}.json")))
+        .collect();
 
     let result = LogSegmentFiles::build_log_segment_files(
-        files.into_iter(),
-        vec![],
+        files,
+        log_tail,
         0,
         None,
         CheckpointHandling::Adopt,
@@ -1564,7 +1674,200 @@ fn failed_listing_reports_only_completed_incomplete_checkpoint_groups() {
     assert!(matches!(
         result, Err(KernelError::FileNotFound(path)) if path == "listing failed"
     ));
-    assert_eq!(missing_checkpoint_parts(&reporter), [(5, 3, 1)]);
+    assert_eq!(missing_checkpoint_parts(&reporter), expected);
+    assert!(
+        missing_checkpoint_diagnostics(&reporter)
+            .iter()
+            .all(|(source, ..)| *source == CheckpointPartsMissingSource::Listing)
+    );
+}
+
+#[rstest]
+#[case::request(ListingFailure::Request { call: 2 })]
+#[case::iterator(ListingFailure::Iterator { call: 2, after_items: 0 })]
+#[tokio::test]
+async fn backward_scan_preserves_completed_window_diagnostics_on_later_failure(
+    #[case] failure: ListingFailure,
+) {
+    let (storage, log_root) = create_storage(vec![(
+        1500,
+        LogPathFileType::MultiPartCheckpoint {
+            part_num: 1,
+            num_parts: 3,
+        },
+        CommitSource::Filesystem,
+    )])
+    .await;
+    let storage = CountingStorageHandler::new(storage).with_failure(failure);
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
+    let result =
+        LogSegmentFiles::list_with_backward_checkpoint_scan(&storage, &log_root, vec![], 2005);
+
+    assert!(matches!(
+        result, Err(KernelError::FileNotFound(path)) if path == "listing failed"
+    ));
+    assert_eq!(storage.call_count(), 2);
+    assert_eq!(
+        missing_checkpoint_diagnostics(&reporter),
+        [(CheckpointPartsMissingSource::Listing, 1500, 3, 1)],
+    );
+}
+
+#[tokio::test]
+async fn backward_scan_failure_reports_closed_groups_and_discards_unfinished_group() {
+    let mut files: Vec<_> = [500, 700, 1500]
+        .into_iter()
+        .map(|version| {
+            (
+                version,
+                LogPathFileType::MultiPartCheckpoint {
+                    part_num: 1,
+                    num_parts: 3,
+                },
+                CommitSource::Filesystem,
+            )
+        })
+        .collect();
+    files.push((501, LogPathFileType::Commit, CommitSource::Filesystem));
+    let (storage, log_root) = create_storage(files).await;
+    let storage = CountingStorageHandler::new(storage).with_failure(ListingFailure::Iterator {
+        call: 2,
+        after_items: 3,
+    });
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
+    let result =
+        LogSegmentFiles::list_with_backward_checkpoint_scan(&storage, &log_root, vec![], 2005);
+
+    assert!(matches!(
+        result, Err(KernelError::FileNotFound(path)) if path == "listing failed"
+    ));
+    assert_eq!(storage.call_count(), 2);
+    assert_eq!(
+        missing_checkpoint_diagnostics(&reporter),
+        [
+            (CheckpointPartsMissingSource::Listing, 500, 3, 1),
+            (CheckpointPartsMissingSource::Listing, 1500, 3, 1),
+        ],
+    );
+}
+
+#[rstest]
+#[case::pending_hint(false, None)]
+#[case::completed_hint(true, None)]
+#[case::empty_replacement(true, Some(true))]
+#[case::complete_replacement(true, Some(false))]
+#[tokio::test]
+async fn failed_hint_listing_reports_only_known_missing_targets(
+    #[case] hint_version_closed: bool,
+    #[case] replacement_is_empty: Option<bool>,
+    #[values(false, true)] v2_hint: bool,
+    #[values(false, true)] empty_target_present: bool,
+) {
+    let hint = if v2_hint {
+        hint_naming_uuid(
+            "00000000000000000005.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.parquet",
+        )
+    } else {
+        LastCheckpointHint {
+            version: 5,
+            ..Default::default()
+        }
+    };
+    let mut files = vec![(5, LogPathFileType::Commit, false)];
+    if empty_target_present {
+        let kind = if v2_hint {
+            LogPathFileType::UuidCheckpoint
+        } else {
+            LogPathFileType::ClassicCheckpoint
+        };
+        files.push((5, kind, true));
+    }
+    if hint_version_closed {
+        files.push((6, LogPathFileType::Commit, false));
+    }
+    if let Some(empty) = replacement_is_empty {
+        files.push((6, LogPathFileType::ClassicCheckpoint, empty));
+    }
+    let after_items = files.len();
+    let (storage, log_root) = create_storage_with_empty_files(files).await;
+    let storage = CountingStorageHandler::new(storage).with_failure(ListingFailure::Iterator {
+        call: 1,
+        after_items,
+    });
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
+    let result =
+        LogSegmentFiles::list_with_checkpoint_hint(&hint, &storage, &log_root, vec![], None);
+
+    assert!(matches!(
+        result, Err(KernelError::FileNotFound(path)) if path == "listing failed"
+    ));
+    let expected = if hint_version_closed && replacement_is_empty != Some(false) {
+        vec![(CheckpointPartsMissingSource::Hint, 5, 1, 0)]
+    } else {
+        vec![]
+    };
+    assert_eq!(missing_checkpoint_diagnostics(&reporter), expected);
+}
+
+#[rstest]
+#[case::both_incomplete(false, false)]
+#[case::complete_alternate(false, true)]
+#[case::both_empty(true, false)]
+#[tokio::test]
+async fn multipart_diagnostics_are_ordered_and_suppressed_by_complete_alternates(
+    #[case] empty_parts: bool,
+    #[case] complete_alternate: bool,
+) {
+    let mut files: Vec<_> = (0..=6)
+        .map(|version| (version, LogPathFileType::Commit, false))
+        .collect();
+    files.push((3, LogPathFileType::ClassicCheckpoint, false));
+    for num_parts in [3, 2] {
+        files.push((
+            5,
+            LogPathFileType::MultiPartCheckpoint {
+                part_num: 1,
+                num_parts,
+            },
+            empty_parts,
+        ));
+    }
+    if complete_alternate {
+        files.push((
+            5,
+            LogPathFileType::MultiPartCheckpoint {
+                part_num: 2,
+                num_parts: 2,
+            },
+            false,
+        ));
+    }
+    let (storage, log_root) = create_storage_with_empty_files(files).await;
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
+    let result = LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], None, None).unwrap();
+
+    let expected = if complete_alternate {
+        vec![]
+    } else {
+        let found = if empty_parts { 0 } else { 1 };
+        vec![
+            (CheckpointPartsMissingSource::Listing, 5, 2, found),
+            (CheckpointPartsMissingSource::Listing, 5, 3, found),
+        ]
+    };
+    assert_eq!(missing_checkpoint_diagnostics(&reporter), expected);
+    assert_eq!(
+        result.checkpoint_parts[0].version,
+        if complete_alternate { 5 } else { 3 }
+    );
 }
 
 #[rstest]
