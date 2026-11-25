@@ -27,6 +27,7 @@ task message.
 | Assignment | The request the orchestrator writes for a particular subagent, before Python appends the shared PR task text and any maintainer guidance. | "Review PR #1234's documentation for accuracy." |
 | Task message | The initial run-specific message delivered to a model session. | That Docs assignment plus PR metadata, reviewed SHA, description, earlier AI review text and patch excerpt. |
 | Shared PR task text | Text appended to each subagent assignment: optional review-range instructions, earlier AI review text, PR metadata, description excerpt and patch excerpt. | Python writes it to `/tmp/child_task_pr_data.md`. |
+| Child task body (implementation term) | Text appended after an assignment: shared PR task text, preceded by trusted root `AGENTS.md` for the two maintainer roles. | The `append_child_task_body()` hook and its error messages use this term. |
 | Response format instructions | Requirements for the response's run-specific start/end markers and, in inline mode, finding-location JSON. | The workflow's `output_contract` variable contains these instructions. |
 | Trusted project guidance | Project rules selected from the trusted workflow revision. | Root `AGENTS.md`, appended inside the two maintainer task messages. |
 | Tool definition | A callable tool's name, parameters and usage description supplied to a model. | `read_source_file(repository, path, start_line=1, line_count=400)`. |
@@ -135,11 +136,14 @@ checker task before publishing any Blocker or Should Fix, and prohibit separate 
 reviewer or per finding. The checker runs in its own model session, separately from the Reviewer
 subagents. Separate sessions can use the same underlying model.
 
-The orchestrator must select Docs and the other relevant reviewers. Its
-instructions allow advice after at least one maintainer and one other Reviewer subagent finish.
-A failed reviewer gets one retry, after other in-flight reviewers finish. The orchestrator must
-wait for dispatched reviewers to finish or exhaust that retry, and for required checker results.
-These are model instructions; workflow Python does not independently prove every role finished.
+The orchestrator must select Docs and the other relevant reviewers.
+Before returning an orchestrator report for publication, it must receive completed
+results from at least one maintainer and one other Reviewer subagent.
+A failed reviewer gets one retry after the other in-flight reviewers finish.
+The orchestrator waits for every dispatched reviewer to finish or exhaust that retry,
+and for any required checker result. It lists reviewers still unavailable after
+retry in the Summary. These are model instructions; workflow Python does not
+independently verify reviewer completion.
 
 ### Source reads during model review
 
@@ -324,9 +328,11 @@ mode, the workflow writes the report to its Actions job summary. In `artifact` m
 `review_output.txt`, `pr_diff.txt` and `child_task_pr_data.md` with seven-day retention. Exact
 repeat reports or inline findings can be suppressed by the history/deduplication code.
 
-When credentials and the reviewed head are available, the workflow also attempts to create the
-`AI Review Summary` Check Run. It contains the validated report or failure diagnostics. A
-`neutral` conclusion is the GitHub check result, not a statement that the AI approved the PR.
+When credentials and the reviewed head are available, the workflow attempts to create
+an `AI Review Summary` Check Run. It shows the validated orchestrator report when one
+is available. If review-range selection fails, it shows the resolver's error. Otherwise,
+it shows a generic unavailable message and a link to the workflow run for diagnostics.
+Its GitHub conclusion is `neutral`; this does not mean that the AI approved the PR.
 
 ### Files on the Actions runner
 
@@ -346,7 +352,7 @@ uploaded in artifact mode.
 | `/tmp/review_raw_output.txt` | Model-run step | Validation step extracts the marked orchestrator report. |
 | `/tmp/review_output.txt` | Validation step | Comment, job-summary, artifact and Check Run steps read the extracted orchestrator report. |
 | `/tmp/inline_findings.json` | Validation step | Inline code reads requested finding locations. |
-| `/tmp/check-summary.txt` | Diagnostic paths, when needed | Check Run step reads failure details. |
+| `/tmp/check-summary.txt` | Review-range resolution failure or Check Run fallback | Check Run step reads the resolver error or generic unavailable message. |
 
 ## Shared instruction blocks
 
