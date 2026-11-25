@@ -1,13 +1,6 @@
-# Reconciles a PR's native merge request with its `automerge` label. The label is the merge
-# request: its latest active application must come from an actor with write access. Before asking
-# GitHub to merge when ready, the controller removes a recognized generated git-stack prefix from
-# the description once; applying the label declares the description final. Removing the label
-# cancels waiting or dequeues where GitHub still allows it. Readiness stays with GitHub's required
-# checks, reviews, and merge queue; nothing here bypasses them. CONTRIBUTING.md has the
-# contributor-facing rules.
-#
-# pull_request_target runs in the base repository with a write-capable token so fork PRs work. It
-# must only execute trusted base-branch code: never check out or run the PR head.
+# Optional label-driven merge requests; CONTRIBUTING.md owns usage and description finality.
+# pull_request_target has a write-capable token for fork PRs. Execute only trusted main code,
+# never the PR head.
 name: Automerge
 
 on:
@@ -17,8 +10,7 @@ on:
 permissions: {}
 
 concurrency:
-  # Serialize runs per PR without cancelling an in-flight mutation. Each run reads live state, so
-  # a stale delivery cannot restore an older label application over current intent.
+  # Let in-flight mutations finish; each run reconciles live label state.
   group: automerge-${{ github.event.pull_request.number }}
   cancel-in-progress: false
 

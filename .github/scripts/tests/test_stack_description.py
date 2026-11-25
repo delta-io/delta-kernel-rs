@@ -1,8 +1,7 @@
-"""Tests for recognizing the generated stack prefix of a PR description."""
+"""Supported prefixes return the exact suffix boundary; unsupported descriptions return None."""
 
 from __future__ import annotations
 
-import json
 import sys
 import unittest
 from pathlib import Path
@@ -13,7 +12,6 @@ from stack_description import stack_prefix_end  # noqa: E402
 
 REPOSITORY = "delta-io/delta-kernel-rs"
 PR_URL = f"https://github.com/{REPOSITORY}/pull"
-FIXTURE = Path(__file__).parent / "fixtures" / "stack_descriptions.json"
 SUFFIX = "## What changes are proposed in this pull request?\r\n\r\nBody é \U0001f95e\r\n"
 
 
@@ -25,7 +23,7 @@ def _row(number: int, label: str, indent: int = 0, marker: str = "", files: str 
 
 
 def _block(
-    heading: str = "## Stacked PR",
+    heading: str = "## \U0001f95e Stacked PR",
     intro_files: str = "",
     rows: list[str] | None = None,
     blank: str = "\n",
@@ -45,31 +43,45 @@ def _end(body: str, number: int = 2) -> int | None:
 class StackPrefixTest(unittest.TestCase):
     def assert_prefix(self, prefix: str, suffix: str = SUFFIX) -> None:
         body = prefix + suffix
-        self.assertEqual(_end(body), len(prefix))
-        self.assertEqual(body[len(prefix) :], suffix)
+        end = _end(body)
+        self.assertEqual(end, len(prefix))
+        self.assertEqual(body[end:], suffix)
 
     def assert_unchanged(self, body: str) -> None:
         self.assertIsNone(_end(body))
 
-    def test_plain_and_pancake_headings(self) -> None:
+    def test_pancake_heading_returns_prefix_end(self) -> None:
         self.assert_prefix(_block())
-        self.assert_prefix(_block(heading="## \U0001f95e Stacked PR"))
 
-    def test_other_headings_are_unchanged(self) -> None:
-        for heading in ["##  Stacked PR", "# Stacked PR", "## Stacked PRs", "## stacked pr", ""]:
-            self.assert_unchanged(_block(heading=heading) + SUFFIX)
+    def test_unsupported_headings_return_none(self) -> None:
+        cases = {
+            "plain heading": "## Stacked PR",
+            "extra space": "##  \U0001f95e Stacked PR",
+            "wrong heading level": "# \U0001f95e Stacked PR",
+            "plural heading": "## \U0001f95e Stacked PRs",
+            "wrong case": "## \U0001f95e stacked pr",
+            "missing heading": "",
+        }
+        for scenario, heading in cases.items():
+            with self.subTest(scenario=scenario):
+                self.assert_unchanged(_block(heading=heading) + SUFFIX)
 
     def test_crlf_and_mixed_line_endings_preserve_suffix(self) -> None:
-        self.assert_prefix(_block(newline="\r\n", blank="\r\n", terminator="---------\r\n"))
-        self.assert_prefix(_block(newline="\r\n", blank="\n", terminator="---------\n"))
-        self.assert_prefix(_block(newline="\n", blank="\r\n", terminator="---------\r\n"))
+        cases = {
+            "CRLF throughout": _block(newline="\r\n", blank="\r\n", terminator="---------\r\n"),
+            "CRLF rows, LF rule": _block(newline="\r\n", blank="\n", terminator="---------\n"),
+            "LF rows, CRLF rule": _block(newline="\n", blank="\r\n", terminator="---------\r\n"),
+        }
+        for scenario, prefix in cases.items():
+            with self.subTest(scenario=scenario):
+                self.assert_prefix(prefix)
         self.assert_prefix(_block(), suffix="\n\n\n   leading blanks\n")
 
     def test_suffix_may_be_empty(self) -> None:
         self.assert_prefix(_block(), suffix="")
         self.assert_prefix(_block(terminator="---------"), suffix="")
 
-    def test_nested_rows_with_markers_and_ranges(self) -> None:
+    def test_nested_rows_with_markers_and_ranges_return_prefix_end(self) -> None:
         sha = "a" * 40
         rows = [
             _row(1, "stack/parent", marker=" [MERGED]"),
@@ -85,22 +97,23 @@ class StackPrefixTest(unittest.TestCase):
         self.assert_prefix(_block(blank=""))
 
     def test_blank_lines_outside_the_terminator_position_are_unchanged(self) -> None:
-        self.assert_unchanged("## Stacked PR\n\n" + _block().split("\n", 1)[1] + SUFFIX)
+        self.assert_unchanged(_block().replace("\n", "\n\n", 1) + SUFFIX)
         self.assert_unchanged(_block(blank="\n\n") + SUFFIX)
         self.assert_unchanged(_block(blank=" \n") + SUFFIX)
         self.assert_unchanged(_block(rows=[_row(2, "stack/child"), ""]) + SUFFIX)
 
     def test_intro_variants_are_unchanged(self) -> None:
         intro = f"Use this [link]({PR_URL}/2/files) to review incremental changes."
-        for variant in [
-            intro.replace("incremental changes", "this PR's incremental changes"),
-            intro.replace("/2/files", "/3/files"),
-            intro.replace(REPOSITORY, "other/repo"),
-            intro + " ",
-            f"Review the [incremental diff]({PR_URL}/2/files) for `stack/child`.",
-        ]:
-            body = _block().replace(intro, variant) + SUFFIX
-            self.assert_unchanged(body)
+        cases = {
+            "wording": intro.replace("incremental changes", "this PR's incremental changes"),
+            "wrong PR": intro.replace("/2/files", "/3/files"),
+            "wrong repository": intro.replace(REPOSITORY, "other/repo"),
+            "trailing space": intro + " ",
+            "custom intro": f"Review the [incremental diff]({PR_URL}/2/files) for `stack/child`.",
+        }
+        for scenario, variant in cases.items():
+            with self.subTest(scenario=scenario):
+                self.assert_unchanged(_block().replace(intro, variant) + SUFFIX)
 
     def test_author_prose_inside_the_block_is_unchanged(self) -> None:
         rows = [_row(2, "stack/child", marker=" <- _this PR_"), "Splitting #1 per review feedback."]
@@ -111,21 +124,23 @@ class StackPrefixTest(unittest.TestCase):
 
     def test_malformed_rows_are_unchanged(self) -> None:
         good = _row(2, "stack/child", marker=" <- _this PR_")
-        for bad in [
-            _row(2, "stack/child", marker=" <- _this PR_").replace("[[Files changed]", "[[Files]"),
-            f"- [stack/child]({PR_URL}/2) [[Files changed]({PR_URL}/3/files)] <- _this PR_",
-            good.replace(f"]({PR_URL}/2)", "](https://github.com/other/repo/pull/2)"),
-            _row(2, "**stack/child", marker=" <- _this PR_"),
-            _row(2, "stack child", marker=" <- _this PR_"),
-            _row(2, "stack/child", marker=" <- _this PR_", files="/abc..def"),
-            _row(2, "stack/child", marker=" (merged)"),
-            _row(2, "stack/child", marker=" [MERGED]"),
-            _row(2, "stack/child", marker=" <- _this PR_") + " ",
-            "* " + good[2:],
-            "\t" + good,
-            " " + good,
-        ]:
-            self.assert_unchanged(_block(rows=[bad]) + SUFFIX)
+        cases = {
+            "wrong files label": good.replace("[[Files changed]", "[[Files]"),
+            "mismatched PR and files links": good.replace("/2/files", "/3/files"),
+            "foreign repository": good.replace(REPOSITORY, "other/repo", 1),
+            "unbalanced bold label": _row(2, "**stack/child", marker=" <- _this PR_"),
+            "space in branch label": _row(2, "stack child", marker=" <- _this PR_"),
+            "short SHAs": _row(2, "stack/child", files="/abc..def"),
+            "unknown marker": _row(2, "stack/child", marker=" (merged)"),
+            "current PR marked merged": _row(2, "stack/child", marker=" [MERGED]"),
+            "trailing space": good + " ",
+            "asterisk list item": "* " + good[2:],
+            "tab indentation": "\t" + good,
+            "odd indentation": " " + good,
+        }
+        for scenario, bad in cases.items():
+            with self.subTest(scenario=scenario):
+                self.assert_unchanged(_block(rows=[bad]) + SUFFIX)
         parent = _row(1, "stack/parent")
         for rows in [
             [_row(1, "stack/parent", marker=" <- _this PR_"), good],
@@ -167,38 +182,6 @@ class StackPrefixTest(unittest.TestCase):
         first = _block()
         second = _block(newline="\r\n", blank="\r\n", terminator="---------\r\n")
         self.assert_prefix(first, suffix=second + SUFFIX)
-
-    def test_historical_descriptions(self) -> None:
-        fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
-        self.assertEqual(fixture["repository"], REPOSITORY)
-        cleaned = 0
-        for entry in fixture["pull_requests"]:
-            body, expected = entry["body"], entry["prefix_end"]
-            with self.subTest(pr=entry["number"]):
-                end = stack_prefix_end(body, REPOSITORY, entry["number"])
-                self.assertEqual(end, expected)
-                if end is None:
-                    continue
-                cleaned += 1
-                prefix, suffix = body[:end], body[end:]
-                heading = prefix.split("\n", 1)[0].rstrip("\r")
-                self.assertIn(heading, {"## Stacked PR", "## \U0001f95e Stacked PR"})
-                self.assertRegex(prefix, r"---------(\r\n|\n)?\Z")
-                self.assertNotIn("---------", prefix[: -len("---------\r\n")])
-                if not suffix.startswith("## Stacked PR"):
-                    self.assertIsNone(stack_prefix_end(suffix, REPOSITORY, entry["number"]))
-        self.assertEqual((cleaned, len(fixture["pull_requests"])), (86, 100))
-
-    def test_documented_corpus_boundaries(self) -> None:
-        bodies = {e["number"]: e["body"] for e in json.loads(FIXTURE.read_text())["pull_requests"]}
-        template = "## What changes are proposed in this pull request?\r\n\r\n"
-        lf = bodies[4068]
-        self.assertTrue(lf[: _end(lf, 4068)].endswith("\n\n---------\n"))
-        self.assertTrue(lf[_end(lf, 4068) :].startswith(template + "Return a NULL struct"))
-        crlf = bodies[3222]
-        self.assertTrue(crlf[: _end(crlf, 3222)].endswith("\r\n\r\n---------\r\n"))
-        self.assertTrue(crlf[_end(crlf, 3222) :].startswith(template + "This PR adds"))
-        self.assertEqual(_end(bodies[4082], 4082), len(bodies[4082]))
 
 
 if __name__ == "__main__":

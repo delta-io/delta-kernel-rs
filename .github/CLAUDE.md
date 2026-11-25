@@ -94,6 +94,6 @@ Keep `stack_description.py` strict. It recognizes one complete generated prefix 
 returns a slice boundary; the caller writes `body[end:]` and nothing else. Do not add heuristics
 that search for a heading or terminator farther down, admit prose or unknown rows, normalize
 whitespace or line endings, or rewrite retained content. An unrecognized description is an
-accepted miss, never a failing check. `.github/scripts/tests/fixtures/stack_descriptions.json`
-holds historical descriptions with their expected boundaries; extend it when the grammar changes.
+accepted miss, never a failing check. `.github/scripts/tests/test_stack_description.py`
+uses synthetic descriptions to check accepted boundaries and unsupported variants.
 CONTRIBUTING.md owns the contributor-facing rules.

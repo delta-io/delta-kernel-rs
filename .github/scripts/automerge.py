@@ -1,11 +1,8 @@
-"""Reconcile a pull request's native merge request with its `automerge` label.
+"""Request or cancel native merge-when-ready for the `automerge` label.
 
-Applying the label requests GitHub's merge-when-ready behavior and declares the description
-final. The controller reads live PR state, authorizes the latest active label application,
-removes a recognized generated stack prefix once, and then asks GitHub to merge when its
-required checks and reviews pass. Removing the label cancels waiting or dequeues where GitHub
-still allows it. Every decision uses live state, so stale or duplicate events reconcile to the
-same result. See CONTRIBUTING.md for the contributor-facing contract.
+Authorize its latest active application, clean a supported stack prefix once, then request merging.
+Read live state on every run; already waiting/queued PRs skip cleanup. CONTRIBUTING.md owns the
+description-finality and cancellation rules.
 """
 
 from __future__ import annotations
@@ -200,6 +197,10 @@ def _has_write(github: GitHub, repository: str, login: str) -> bool:
 
 
 def _clean_description(github: GitHub, repository: str, pr: PullRequest) -> str:
+    """Clean a supported prefix only when the AI review base is the GitHub base.
+
+    Skipping cleanup allows merging. A failed write raises AutomergeError to stop the request.
+    """
     end = stack_prefix_end(pr.body, repository, pr.number)
     if end is None:
         return "The description has no supported generated stack prefix."

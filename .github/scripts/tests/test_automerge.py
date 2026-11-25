@@ -44,7 +44,7 @@ def _stack_body(parent: int | None = None) -> str:
         f"{indent}- [**stack/child**]({PR_URL}/2) [[Files changed]({PR_URL}/2/files)] <- _this PR_"
     )
     intro = f"Use this [link]({PR_URL}/2/files) to review incremental changes."
-    return "\n".join(["## Stacked PR", intro, *rows]) + "\n\n---------\n" + SUFFIX
+    return "\n".join(["## \U0001f95e Stacked PR", intro, *rows]) + "\n\n---------\n" + SUFFIX
 
 
 def _node(
@@ -176,10 +176,19 @@ class ReconcileTest(unittest.TestCase):
         self.assertIn("Removed the generated stack prefix", message)
         self.assertIn("waiting to merge", message)
 
-    def test_unsupported_or_already_clean_description_is_not_written(self) -> None:
-        prose = "## Stacked PR\n\nSplitting #1 per review feedback.\n\n---\n" + SUFFIX
-        for body in [SUFFIX, "", prose]:
-            with self.subTest(body=body):
+    def test_unsupported_or_clean_description_is_preserved_without_blocking_merge(self) -> None:
+        prose = "## \U0001f95e Stacked PR\n\nSplitting #1 per review feedback.\n\n---\n" + SUFFIX
+        cases = {
+            "already clean": SUFFIX,
+            "empty": "",
+            "author prose": prose,
+            "plain heading": _stack_body().replace("\U0001f95e ", "", 1),
+            "extra heading space": _stack_body().replace("## ", "##  ", 1),
+            "changed intro": _stack_body().replace("incremental", "scoped", 1),
+            "different terminator": _stack_body().replace("\n---------\n", "\n---\n", 1),
+        }
+        for scenario, body in cases.items():
+            with self.subTest(scenario=scenario):
                 fake = FakeGitHub(_node(body=body))
                 message = self.reconcile(fake)
                 self.assertEqual(fake.mutations(), ["EnableAutoMerge"])

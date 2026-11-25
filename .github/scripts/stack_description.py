@@ -1,11 +1,20 @@
-"""Recognize the generated git-stack prefix at the start of a PR description.
+"""Recognize one complete git-stack prefix at character zero.
 
-The recognizer admits one leading block in the layout git stack writes: a heading, the
-incremental-review sentence for the current PR, linked stack rows, at most one blank line, and
-the exact terminator. Every line must match; author prose, unknown markup, a missing terminator,
-or a link that disagrees with the repository or PR identity leaves the whole description
-unchanged. The caller slices the original string at the returned boundary, so retained content
-keeps its bytes, whitespace, and line endings.
+For repository a/b and PR 2, the minimal supported block is:
+    ## \U0001f95e Stacked PR
+    Use this [link](https://github.com/a/b/pull/2/files) to review incremental changes.
+    - [branch](https://github.com/a/b/pull/2) [[Files changed](https://github.com/a/b/pull/2/files)]
+    ---------
+
+The heading must exactly match _HEADING, including the pancake. Rows use single-token labels
+(optionally bold), two-space indentation steps, and optional markers from the constants below.
+Both links in each row must name the same PR in this repository, with exactly one row for the
+current PR. File links may include /base..head ranges with 7-40 lowercase hex digits per SHA.
+Zero or one empty line may precede the terminator; LF, CRLF, and mixed endings are accepted.
+
+Any mismatch, such as `## Stacked PR`, `---`, or prose between rows, returns None. The controller
+then skips the description write and still requests merging. Otherwise, it writes body[end:],
+preserving all remaining content, whitespace, line endings, and any later stack section.
 """
 
 from __future__ import annotations
@@ -13,7 +22,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterator
 
-_HEADINGS = frozenset({"## Stacked PR", "## \U0001f95e Stacked PR"})
+_HEADING = "## \U0001f95e Stacked PR"
 _TERMINATOR = "---------"
 _CURRENT_PR_MARKERS = frozenset(
     {" ← _this PR_", " <- _this PR_", " <- this PR", " - _this PR_", " (this PR)"}
@@ -23,12 +32,7 @@ _RANGE = r"(?:/[0-9a-f]{7,40}\.\.[0-9a-f]{7,40})?"
 
 
 def stack_prefix_end(body: str, repository: str, number: int) -> int | None:
-    """Return the offset where the description continues after its generated stack prefix.
-
-    Return None when the description does not start with a complete supported prefix for this
-    repository and PR, including when it has already been cleaned. `body[end:]` is the exact
-    retained description; it may be empty when the prefix was the whole description.
-    """
+    """Return the prefix's end offset, or None if any required line is unsupported."""
     pull_url = re.escape(f"https://github.com/{repository}/pull/")
     intro = re.compile(
         rf"Use this \[link\]\({pull_url}{number}/files{_RANGE}\) to review incremental changes\."
@@ -40,7 +44,7 @@ def stack_prefix_end(body: str, repository: str, number: int) -> int | None:
     lines = _lines(body)
 
     content, _ = next(lines, ("", 0))
-    if content not in _HEADINGS:
+    if content != _HEADING:
         return None
     content, _ = next(lines, ("", 0))
     if intro.fullmatch(content) is None:

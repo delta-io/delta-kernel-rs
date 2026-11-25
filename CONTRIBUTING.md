@@ -139,29 +139,26 @@ Examples:
 
 #### Merging with the `automerge` label
 
-Maintainers merge a PR by applying the `automerge` label. The label asks GitHub to merge the PR
-once its required checks and code-owner approvals pass; it does not bypass either, and it has no
-effect unless the person who applied it has write access. Removing the label cancels the pending
-merge where GitHub still allows it. A merge that has already started cannot be stopped.
+Maintainers can optionally apply `automerge` to request merging into `main` once required checks
+and reviews pass. Only applications by someone with write access count. Removing the label
+cancels pending waiting or queue membership where GitHub still allows it; a merge already in
+progress cannot be stopped.
 
-Applying the label declares the PR description final. The squash commit message is the PR
-description, so before requesting the merge, a workflow reads the description once, removes the
-block that `git stack` generates at the top when it recognizes that block exactly, and writes the
-rest back unchanged. While the label is present, do not edit the description and do not re-run
-`git stack` on the PR: the workflow replaces the whole description from the copy it read, and an
-edit saved in that window is lost. To revise the description, remove the label, wait for the
-`Automerge` workflow run to finish, confirm the PR is no longer waiting or queued, make the edit,
-and apply the label again.
+Before requesting the merge, the workflow removes one supported leading `git stack` block from
+the description, which becomes the squash commit message. The block must start with the exact
+`## 🥞 Stacked PR` heading, standard introduction, linked stack rows, and the `---------` rule; see
+[`stack_description.py`](.github/scripts/stack_description.py) for the accepted syntax.
+Unsupported variants stay unchanged and do not block merging, so stack text may remain in the
+commit message. The workflow also keeps the block if removing it could change the AI review base
+at the inspected commits.
 
-The cleanup is deliberately narrow. It removes only the exact generated block, starting on the
-first line and ending at its `---------` rule, and only when the AI reviewer no longer needs the
-stack list to scope its review: a stack root, or a child synced after its parent merged into
-`main`.
-Anything else, including hand-edited stack sections, is left untouched and merges as written.
+Applying the label declares the description final. While the label is present, do not edit the
+description or run `git stack` on the PR: the workflow replaces the whole description from the
+copy it read, so concurrent edits can be lost. To edit, remove the label, wait for the `Automerge`
+run to finish, confirm the PR is no longer waiting or queued, then edit and reapply the label.
 
-If the `Automerge` run reports an error, for example because the PR was a draft or its head changed
-while the merge was being requested, fix the cause, then remove and reapply the label. The workflow
-does not re-arm on its own after GitHub drops a pending merge.
+If `Automerge` reports an error, fix the cause, then remove and reapply the label. A failed
+description write stops the merge request. The workflow does not re-arm a request GitHub drops.
 
 #### PR Testing
 
