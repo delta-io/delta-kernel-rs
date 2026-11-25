@@ -40,8 +40,8 @@ def compute_review_status(
     """Return the reviewed commit's advisory status, counted findings and incomplete records.
 
     PR comment modes require confirmed finding-comment URLs. Summary and artifact modes record
-    the selected report placement without comment URLs or delivery claims. These records establish where
-    a finding is reported; they do not establish whether its claim is correct.
+    the selected report placement without comment URLs or delivery claims. These records establish
+    where a finding is reported; they do not establish whether its claim is correct.
 
     Count earlier final Blockers for the same commit when the current orchestrator report omits
     them. An earlier-commit Blocker without a matching current result gives NO VERDICT and stays
@@ -216,7 +216,7 @@ def _completion_reasons(completion, head_sha, run_id, reasons):
                 )
                 continue
             if isinstance(checker, dict) and checker.get("decision") == "CONTESTED":
-                _reason(reasons, "correctness_contested", "A correctness claim remains contested.")
+                _reason(reasons, "correctness_contested", "A candidate finding remains contested.")
             if candidate.get("severity") in ("Blocker", "Should Fix") and (
                 not isinstance(checker, dict)
                 or checker.get("decision") not in ("CONFIRMED", "DISPROVED", "NITPICK", "CONTESTED")

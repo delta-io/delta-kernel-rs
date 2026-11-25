@@ -117,6 +117,7 @@ between them. Every ORCHESTRATOR box below represents the same model session at 
              | Python checks and extracts the orchestrator report.               |
              | finding_publication.py posts or reuses each finding comment.      |
              | review_publish.py formats the main comment and finding comments.  |
+             | Python computes advisory status from recorded review results.     |
              | Workflow attempts the AI Review Summary Check Run.                |
              +-------------------------------------------------------------------+
                                                | output mode selects report location
@@ -380,6 +381,7 @@ PR change patch and shared PR task text with seven-day retention.
 | `/tmp/review_observations.jsonl` | `observe_review()` | Execution-record builder reads filtered dispatch, session and result-event metadata. |
 | `/tmp/review_accounting.json` | Validation step | Execution-record builder reads the orchestrator's consolidation outcomes. |
 | `/tmp/review_execution.json` | Execution-record step | Check Run displays its tables; Actions retains the record for seven days. |
+| `/tmp/review_status.json` | Status computation | Actions retains the advisory status, counted findings and unmet status requirements. |
 
 ## Review execution record
 
@@ -491,8 +493,9 @@ If the report exceeds GitHub's display limit, the Check Run links to the complet
 [`format_review_summary()`](../review_publish.py) is the single renderer for the main comment.
 The orchestrator supplies the assessment summary and final finding text. Python supplies counts, links,
 the reviewed commit and the layout below. Angle-bracket placeholders stand for generated text;
-hidden bot identifiers are omitted from this example. When all status requirements are met, the reviewed line says `Status requirements met`.
-The Unmet status requirements disclosure appears only when a requirement is unmet.
+Hidden bot identifiers are omitted from this example. When all status requirements are met, the
+reviewed line says `Status requirements met`. The Unmet status requirements disclosure appears
+only when a requirement is unmet.
 
 ```markdown
 ## 🤖 AI Review 🧐 - <advisory status>
