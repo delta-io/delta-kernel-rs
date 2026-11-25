@@ -1234,23 +1234,23 @@ async fn test_non_contiguous_log() {
         LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 0, None);
     assert!(matches!(
         log_segment_res,
-        Err(KernelError::MissingVersion(1))
+        Err(Error::Kernel(KernelError::MissingVersion(1)))
     ));
 
     let log_segment_res =
         LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 1, None);
     assert!(matches!(
         log_segment_res,
-        Err(KernelError::StartVersionNotFound {
+        Err(Error::Kernel(KernelError::StartVersionNotFound {
             requested: 1,
             earliest: 2
-        })
+        }))
     ));
 
     let log_segment_res = LogSegment::for_table_changes(storage.as_ref(), log_root, 0, Some(1));
     assert!(matches!(
         log_segment_res,
-        Err(KernelError::MissingVersion(1))
+        Err(Error::Kernel(KernelError::MissingVersion(1)))
     ));
 }
 
@@ -6397,7 +6397,9 @@ async fn snapshot_checkpoint_gap_preserves_replay_context(#[case] target: Option
     ));
     assert!(matches!(
         LogSegment::for_table_changes(storage.as_ref(), log_root, 4, Some(7)),
-        Err(KernelError::MissingVersion(_)) | Err(KernelError::StartVersionNotFound { .. }),
+        Err(Error::Kernel(
+            KernelError::MissingVersion(_) | KernelError::StartVersionNotFound { .. }
+        )),
     ));
 }
 

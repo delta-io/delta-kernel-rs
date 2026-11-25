@@ -31,7 +31,7 @@ use crate::unit_test_utils::{
     Action, LocalMockTable, MockProtocolBuilder, MockTableConfigurationBuilder,
     assert_result_error_with_message,
 };
-use crate::{Engine, Error, KernelError, KernelResult, Predicate, Result, Version};
+use crate::{Engine, Error, KernelError, Predicate, Result, Version};
 
 fn get_schema() -> SchemaRef {
     schema_ref! {
@@ -157,9 +157,9 @@ fn get_segment(
     path: &Path,
     start_version: Version,
     end_version: impl Into<Option<Version>>,
-) -> KernelResult<Vec<ParsedLogPath>> {
+) -> Result<Vec<ParsedLogPath>> {
     let table_root = url::Url::from_directory_path(path).unwrap();
-    let log_root = table_root.join("_delta_log/")?;
+    let log_root = table_root.join("_delta_log/").map_err(KernelError::from)?;
     let log_segment = LogSegment::for_table_changes(
         engine.storage_handler().as_ref(),
         log_root,

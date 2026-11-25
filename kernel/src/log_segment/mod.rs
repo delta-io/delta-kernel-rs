@@ -662,7 +662,7 @@ impl LogSegment {
         log_root: Url,
         start_version: Version,
         end_version: impl Into<Option<Version>>,
-    ) -> KernelResult<Self> {
+    ) -> Result<Self> {
         Self::for_table_changes_with_log_tail(storage, log_root, start_version, end_version, vec![])
     }
 
@@ -673,7 +673,7 @@ impl LogSegment {
         start_version: Version,
         end_version: impl Into<Option<Version>>,
         log_tail: Vec<ParsedLogPath>,
-    ) -> KernelResult<Self> {
+    ) -> Result<Self> {
         let end_version = end_version.into();
         if let Some(end_version) = end_version
             && start_version > end_version
@@ -706,7 +706,12 @@ impl LogSegment {
             start_version,
             listed_files.ascending_commit_files().first(),
         )?;
-        LogSegment::try_new(listed_files, log_root, end_version, None)
+        Ok(LogSegment::try_new(
+            listed_files,
+            log_root,
+            end_version,
+            None,
+        )?)
     }
 
     #[allow(unused)]

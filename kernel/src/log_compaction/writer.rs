@@ -11,7 +11,7 @@ use crate::log_replay::HasSelectionVector;
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::table_properties::TableProperties;
-use crate::{Engine, KernelError, KernelResult, SnapshotRef, Version};
+use crate::{Engine, Error, KernelError, KernelResult, Result, SnapshotRef, Version};
 
 /// Determine if log compaction should be performed based on the commit version and
 /// compaction interval.
@@ -96,17 +96,14 @@ impl LogCompactionWriter {
     /// Get an iterator over the compaction data to be written
     ///
     /// Performs action reconciliation for the version range specified in the constructor
-    pub fn compaction_data(
-        &mut self,
-        engine: &dyn Engine,
-    ) -> KernelResult<ActionReconciliationIterator> {
+    pub fn compaction_data(&mut self, engine: &dyn Engine) -> Result<ActionReconciliationIterator> {
         // Validate that the requested version range is within the snapshot's range
         let snapshot_end_version = self.snapshot.version();
         if self.end_version > snapshot_end_version {
-            return Err(KernelError::generic(format!(
+            return Err(Error::Kernel(KernelError::generic(format!(
                 "End version {} exceeds snapshot version {}",
                 self.end_version, snapshot_end_version
-            )));
+            ))));
         }
 
         // Create a log segment specifically for the compaction range
