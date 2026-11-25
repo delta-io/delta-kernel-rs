@@ -1926,6 +1926,11 @@ impl Scan {
 ///    }
 /// }
 /// ```
+///
+/// `fileConstantValues.dataChange` is the `dataChange` stored on the add action that the row was
+/// replayed from. Checkpoint writers may rewrite that value, so it is not a stable per-file
+/// property. Kernel write paths that consume scan rows, such as `remove_files` and
+/// deletion-vector updates, ignore it and use the transaction's `data_change` instead.
 pub fn scan_row_schema() -> SchemaRef {
     log_replay::SCAN_ROW_SCHEMA.clone()
 }

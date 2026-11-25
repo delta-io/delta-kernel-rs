@@ -68,6 +68,9 @@ The underlying data conforms to the schema returned by `scan_row_schema()`:
 }
 ```
 
+`fileConstantValues.dataChange` is the `dataChange` stored on the add action that the row was
+replayed from. `remove_files()` ignores it and writes the transaction's `data_change` instead.
+
 You don't need to construct this data yourself. The scan produces it for you.
 For full details on working with `scan_metadata()`, see
 [Advanced Reads with scan_metadata()](../reading/scan_metadata.md).

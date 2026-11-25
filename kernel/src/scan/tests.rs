@@ -747,6 +747,7 @@ fn scan_files_data_change(scan_metadata: Vec<ScanMetadata>) -> HashMap<String, b
             .unwrap()
             .as_boolean();
         for row in 0..batch.num_rows() {
+            assert!(data_change.is_valid(row), "null dataChange at row {row}");
             data_change_by_path.insert(paths.value(row).to_string(), data_change.value(row));
         }
     }
