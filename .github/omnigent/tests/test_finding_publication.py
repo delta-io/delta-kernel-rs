@@ -108,7 +108,7 @@ class FindingPublicationTest(unittest.TestCase):
         self.assertEqual(len(github.issues), 4)
         self.assertTrue(all(item["url"] for item in record["findings"]))
         main = github.issues[0]["body"]
-        order = ["## AI Review", "🛑 0 Blockers · 🔧 1 Should Fix · 💡 4 Nits", "Reviewed",
+        order = ["## 🤖 AI Review 🧐", "🛑 0 Blockers · 🔧 1 Should Fix · 💡 4 Nits", "Reviewed",
                  "<summary>PR Summary", "<summary>Review Summary", "<sub>[Full AI review"]
         offsets = [main.index(part) for part in order]
         self.assertEqual(offsets, sorted(offsets))

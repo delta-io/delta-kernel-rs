@@ -393,7 +393,7 @@ the reviewed commit and the layout below. Angle-bracket placeholders stand for g
 hidden bot identifiers are omitted from this example.
 
 ```markdown
-## AI Review
+## 🤖 AI Review 🧐
 
 **🛑 2 Blockers · 🔧 1 Should Fix · 💡 2 Nits**
 
