@@ -83,6 +83,9 @@ pub(crate) struct ActionReconciliationBatch {
     pub(crate) add_actions_count: i64,
     /// The number of retained remove actions in the batch.
     pub(crate) remove_actions_count: i64,
+    /// The earliest effective deletion timestamp among retained remove actions in the batch.
+    #[cfg(feature = "incremental-checkpoints-in-dev")]
+    pub(crate) min_remove_deletion_timestamp: Option<i64>,
 }
 
 impl HasSelectionVector for ActionReconciliationBatch {
@@ -91,13 +94,29 @@ impl HasSelectionVector for ActionReconciliationBatch {
     }
 }
 
-/// Counts of selected actions in batches consumed from an [`ActionReconciliationIterator`].
-#[derive(Debug, Default)]
+/// Statistics for selected actions in batches consumed from an [`ActionReconciliationIterator`].
+#[derive(Debug)]
+#[cfg_attr(not(feature = "incremental-checkpoints-in-dev"), derive(Default))]
 pub struct ActionReconciliationIteratorState {
     actions_count: AtomicI64,
     add_actions_count: AtomicI64,
     remove_actions_count: AtomicI64,
+    #[cfg(feature = "incremental-checkpoints-in-dev")]
+    min_remove_deletion_timestamp: AtomicI64,
     is_exhausted: AtomicBool,
+}
+
+#[cfg(feature = "incremental-checkpoints-in-dev")]
+impl Default for ActionReconciliationIteratorState {
+    fn default() -> Self {
+        Self {
+            actions_count: AtomicI64::new(0),
+            add_actions_count: AtomicI64::new(0),
+            remove_actions_count: AtomicI64::new(0),
+            min_remove_deletion_timestamp: AtomicI64::new(i64::MAX),
+            is_exhausted: AtomicBool::new(false),
+        }
+    }
 }
 
 impl ActionReconciliationIteratorState {
@@ -118,6 +137,16 @@ impl ActionReconciliationIteratorState {
         self.remove_actions_count.load(Ordering::Acquire)
     }
 
+    /// Returns the earliest effective deletion timestamp of retained Removes in consumed batches.
+    ///
+    /// Missing timestamps contribute zero. Returns `None` when no Removes have been selected;
+    /// `i64::MAX` remains a valid timestamp.
+    #[cfg(feature = "incremental-checkpoints-in-dev")]
+    pub(crate) fn min_remove_deletion_timestamp(&self) -> Option<i64> {
+        (self.remove_actions_count() > 0)
+            .then(|| self.min_remove_deletion_timestamp.load(Ordering::Acquire))
+    }
+
     /// True if the iterator has been exhausted (all batches processed)
     pub fn is_exhausted(&self) -> bool {
         self.is_exhausted.load(Ordering::Acquire)
@@ -129,8 +158,8 @@ impl ActionReconciliationIteratorState {
         Self {
             actions_count: AtomicI64::new(actions_count),
             add_actions_count: AtomicI64::new(add_actions_count),
-            remove_actions_count: AtomicI64::new(0),
             is_exhausted: AtomicBool::new(true),
+            ..Self::default()
         }
     }
 }
@@ -158,6 +187,17 @@ impl ActionReconciliationIterator {
         Arc::clone(&self.state)
     }
 
+    /// Shares counters with an input continuation.
+    /// Supply fresh state before polling this iterator or sharing its [`Self::state`] handle.
+    #[cfg(feature = "incremental-checkpoints-in-dev")]
+    pub(crate) fn with_shared_state(
+        mut self,
+        state: Arc<ActionReconciliationIteratorState>,
+    ) -> Self {
+        self.state = state;
+        self
+    }
+
     /// Helper to transform a batch: update metrics and extract filtered data
     fn transform_batch(
         &mut self,
@@ -174,6 +214,12 @@ impl ActionReconciliationIterator {
             self.state
                 .add_actions_count
                 .fetch_add(batch.add_actions_count, Ordering::Release);
+            #[cfg(feature = "incremental-checkpoints-in-dev")]
+            if let Some(timestamp) = batch.min_remove_deletion_timestamp {
+                self.state
+                    .min_remove_deletion_timestamp
+                    .fetch_min(timestamp, Ordering::Release);
+            }
             self.state
                 .remove_actions_count
                 .fetch_add(batch.remove_actions_count, Ordering::Release);
@@ -243,6 +289,8 @@ impl ActionReconciliationProcessor {
             actions_count: visitor.actions_count,
             add_actions_count: visitor.add_actions_count,
             remove_actions_count: visitor.remove_actions_count,
+            #[cfg(feature = "incremental-checkpoints-in-dev")]
+            min_remove_deletion_timestamp: visitor.min_remove_deletion_timestamp,
         })
     }
 
@@ -277,7 +325,8 @@ impl ActionReconciliationProcessor {
 ///   deletionTimestamp > minimumFileRetentionTimestamp Omitted Actions:
 /// - Any file action (add/remove) with the same (path, dvId) as a previously processed action
 /// - All remove actions with deletionTimestamp ≤ minimumFileRetentionTimestamp
-/// - All remove actions with missing deletionTimestamp (defaults to 0)
+///
+/// Missing deletionTimestamp values use 0 when applying the retention cutoff.
 ///
 /// The resulting filtered file actions represents files present in the table (add actions) and
 /// unexpired tombstones required for vacuum operations (remove actions).
@@ -320,6 +369,8 @@ pub(crate) struct ActionReconciliationVisitor<'seen> {
     add_actions_count: i64,
     // i64 to match the other action counters
     remove_actions_count: i64,
+    #[cfg(feature = "incremental-checkpoints-in-dev")]
+    min_remove_deletion_timestamp: Option<i64>,
     // i64 for comparison with remove.deletionTimestamp
     minimum_file_retention_timestamp: i64,
     // Flag to track if we've seen a protocol action so we can keep only the first protocol action
@@ -411,6 +462,8 @@ impl ActionReconciliationVisitor<'_> {
             actions_count: 0,
             add_actions_count: 0,
             remove_actions_count: 0,
+            #[cfg(feature = "incremental-checkpoints-in-dev")]
+            min_remove_deletion_timestamp: None,
             minimum_file_retention_timestamp,
             seen_protocol,
             seen_metadata,
@@ -418,31 +471,6 @@ impl ActionReconciliationVisitor<'_> {
             seen_domains,
             txn_expiration_timestamp,
         }
-    }
-
-    /// Determines if a remove action tombstone has expired and should be excluded.
-    ///
-    /// A remove action includes a deletion_timestamp indicating when the deletion occurred.
-    /// Physical files are deleted lazily after a user-defined expiration time. Remove actions
-    /// are kept to allow concurrent readers to read snapshots at older versions.
-    ///
-    /// Tombstone expiration rules:
-    /// - If deletion_timestamp <= minimum_file_retention_timestamp: Expired (exclude)
-    /// - If deletion_timestamp > minimum_file_retention_timestamp: Valid (include)
-    /// - If deletion_timestamp is missing: Defaults to 0, treated as expired (exclude)
-    fn is_expired_tombstone<'a>(
-        &self,
-        i: usize,
-        getter: &'a dyn GetData<'a>,
-    ) -> KernelResult<bool> {
-        // Ideally this should never be zero, but we are following the same behavior as Delta
-        // Spark and the Java Kernel.
-        // Note: When remove.deletion_timestamp is not present (defaulting to 0), the remove action
-        // will be excluded as it will be treated as expired.
-        let deletion_timestamp = getter.get_opt(i, Self::REMOVE_DELETION_TIMESTAMP.name)?;
-        let deletion_timestamp = deletion_timestamp.unwrap_or(0i64);
-
-        Ok(deletion_timestamp <= self.minimum_file_retention_timestamp)
     }
 
     /// Processes a potential file action to determine if it should be included.
@@ -476,10 +504,22 @@ impl ActionReconciliationVisitor<'_> {
         } else if is_add {
             self.add_actions_count += 1;
             true
-        } else if self.is_expired_tombstone(i, getters[Self::REMOVE_DELETION_TIMESTAMP.index])? {
-            false
         } else {
+            // Normalize missing timestamps before both retention filtering and aggregation.
+            let deletion_timestamp: i64 = getters[Self::REMOVE_DELETION_TIMESTAMP.index]
+                .get_opt(i, Self::REMOVE_DELETION_TIMESTAMP.name)?
+                .unwrap_or(0);
+            if deletion_timestamp <= self.minimum_file_retention_timestamp {
+                return Ok(Some(false));
+            }
             self.remove_actions_count += 1;
+            #[cfg(feature = "incremental-checkpoints-in-dev")]
+            {
+                let minimum = self
+                    .min_remove_deletion_timestamp
+                    .get_or_insert(deletion_timestamp);
+                *minimum = (*minimum).min(deletion_timestamp);
+            }
             true
         };
         Ok(Some(is_valid))
@@ -891,6 +931,114 @@ mod tests {
             })
             .sum();
         assert_eq!(selected_rows as i64, state.actions_count());
+        Ok(())
+    }
+
+    #[cfg(feature = "incremental-checkpoints-in-dev")]
+    #[rstest::rstest]
+    #[case::empty_stream(0, vec![], 0, None)]
+    #[case::no_removes(
+        0,
+        vec![concat!(
+            r#"{"add":{"path":"active","partitionValues":{},"size":1,"#,
+            r#""modificationTime":1,"dataChange":true}}"#,
+        )],
+        0,
+        None,
+    )]
+    #[case::retained_mixed_timestamps(
+        100,
+        vec![
+            r#"{"remove":{"path":"first","deletionTimestamp":300,"dataChange":true}}"#,
+            r#"{"remove":{"path":"second","deletionTimestamp":200,"dataChange":true}}"#,
+            r#"{"remove":{"path":"third","deletionTimestamp":400,"dataChange":true}}"#,
+            r#"{"remove":{"path":"fourth","deletionTimestamp":150,"dataChange":true}}"#,
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+        ],
+        4,
+        Some(150),
+    )]
+    #[case::expired_and_duplicates_excluded(
+        100,
+        vec![
+            r#"{"remove":{"path":"expired","deletionTimestamp":99,"dataChange":true}}"#,
+            r#"{"remove":{"path":"expired","deletionTimestamp":200,"dataChange":true}}"#,
+            concat!(
+                r#"{"add":{"path":"active","partitionValues":{},"size":1,"#,
+                r#""modificationTime":1,"dataChange":true}}"#,
+            ),
+            r#"{"remove":{"path":"active","deletionTimestamp":101,"dataChange":true}}"#,
+            r#"{"remove":{"path":"retained","deletionTimestamp":300,"dataChange":true}}"#,
+            r#"{"remove":{"path":"retained","deletionTimestamp":101,"dataChange":true}}"#,
+            r#"{"remove":{"path":"boundary","deletionTimestamp":100,"dataChange":true}}"#,
+            r#"{"remove":{"path":"missing","dataChange":true}}"#,
+        ],
+        1,
+        Some(300),
+    )]
+    #[case::all_expired(
+        100,
+        vec![
+            r#"{"remove":{"path":"expired","deletionTimestamp":99,"dataChange":true}}"#,
+            r#"{"remove":{"path":"boundary","deletionTimestamp":100,"dataChange":true}}"#,
+            r#"{"remove":{"path":"missing","dataChange":true}}"#,
+        ],
+        0,
+        None,
+    )]
+    #[case::missing_timestamp_retained(
+        -1,
+        vec![
+            r#"{"remove":{"path":"timestamped","deletionTimestamp":10,"dataChange":true}}"#,
+            r#"{"remove":{"path":"missing","dataChange":true}}"#,
+        ],
+        2,
+        Some(0),
+    )]
+    #[case::max_timestamp_retained(
+        0,
+        vec![
+            concat!(
+                r#"{"remove":{"path":"maximum","deletionTimestamp":9223372036854775807,"#,
+                r#""dataChange":true}}"#,
+            ),
+            concat!(
+                r#"{"remove":{"path":"also_maximum","deletionTimestamp":9223372036854775807,"#,
+                r#""dataChange":true}}"#,
+            ),
+        ],
+        2,
+        Some(i64::MAX),
+    )]
+    fn reconciliation_min_remove_deletion_timestamp(
+        #[case] minimum_file_retention_timestamp: i64,
+        #[case] input_rows: Vec<&str>,
+        #[case] expected_remove_count: i64,
+        #[case] expected_minimum: Option<i64>,
+        #[values(1, 2, usize::MAX)] rows_per_batch: usize,
+    ) -> KernelResult<()> {
+        let mut processor =
+            ActionReconciliationProcessor::new(minimum_file_retention_timestamp, None, None);
+        let processed_batches: Vec<_> = input_rows
+            .chunks(rows_per_batch)
+            .map(|rows| processor.process_actions_batch(create_batch(rows.to_vec())?))
+            .try_collect()?;
+        if let [batch] = processed_batches.as_slice() {
+            assert_eq!(batch.remove_actions_count, expected_remove_count);
+            assert_eq!(batch.min_remove_deletion_timestamp, expected_minimum);
+        }
+
+        let iterator =
+            ActionReconciliationIterator::new(Box::new(processed_batches.into_iter().map(Ok)));
+        let state = iterator.state();
+        assert_eq!(state.min_remove_deletion_timestamp(), None);
+        assert!(!state.is_exhausted());
+
+        let _: Vec<_> = iterator.try_collect()?;
+
+        assert!(state.is_exhausted());
+        assert_eq!(state.remove_actions_count(), expected_remove_count);
+        assert_eq!(state.min_remove_deletion_timestamp(), expected_minimum);
         Ok(())
     }
 

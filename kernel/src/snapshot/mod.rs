@@ -1922,6 +1922,7 @@ impl Snapshot {
         skip_all,
         fields(report, operation_id = %MetricId::new(), version = self.version(), outcome, mode,
             duration_ns, size_in_bytes, num_add_files, num_remove_files, num_actions, num_sidecars,
+            num_reused_sidecars,
             log_tail_input_duration_ns, checkpoint_input_duration_ns, reconciliation_duration_ns,
             stats_transform_duration_ns, output_preparation_duration_ns,
             num_actions_from_log_tail, num_actions_from_checkpoint,
@@ -1962,10 +1963,17 @@ impl Snapshot {
                         "CheckpointSpec::V2 requires the v2Checkpoint table feature to be supported",
                     )));
                 }
-                if let V2CheckpointConfig::WithSidecar {
-                    file_actions_per_sidecar_hint: Some(0),
-                } = cfg
-                {
+                let invalid_sidecar_hint = match cfg {
+                    V2CheckpointConfig::WithSidecar {
+                        file_actions_per_sidecar_hint: Some(0),
+                    } => true,
+                    #[cfg(feature = "incremental-checkpoints-in-dev")]
+                    V2CheckpointConfig::ReuseEligibleSidecars {
+                        file_actions_per_sidecar_hint: Some(0),
+                    } => true,
+                    _ => false,
+                };
+                if invalid_sidecar_hint {
                     return Err(Error::Kernel(KernelError::checkpoint_write(
                         "file_actions_per_sidecar_hint must be greater than 0",
                     )));
@@ -1985,6 +1993,10 @@ impl Snapshot {
             Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar { .. })) => {
                 CheckpointWriteMode::V2WithSidecars
             }
+            #[cfg(feature = "incremental-checkpoints-in-dev")]
+            Some(CheckpointSpec::V2(V2CheckpointConfig::ReuseEligibleSidecars { .. })) => {
+                CheckpointWriteMode::V2ReusingEligibleSidecars
+            }
             _ if v2_supported => CheckpointWriteMode::V2WithoutSidecars,
             _ => CheckpointWriteMode::V1,
         };
@@ -1995,6 +2007,14 @@ impl Snapshot {
         let writer = Arc::clone(self).create_checkpoint_writer(engine)?;
 
         let write_result = match spec {
+            #[cfg(feature = "incremental-checkpoints-in-dev")]
+            Some(CheckpointSpec::V2(V2CheckpointConfig::ReuseEligibleSidecars {
+                file_actions_per_sidecar_hint,
+            })) => {
+                let hint =
+                    file_actions_per_sidecar_hint.unwrap_or(DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT);
+                writer.write_v2_checkpoint_reusing_all_sidecars(engine, hint, metrics.clone())
+            }
             Some(CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
                 file_actions_per_sidecar_hint,
             })) => {
@@ -2042,9 +2062,9 @@ impl Snapshot {
                 .into());
             }
             CheckpointWriteMode::V1 => SelectedCheckpointType::V1,
-            CheckpointWriteMode::V2WithoutSidecars | CheckpointWriteMode::V2WithSidecars => {
-                SelectedCheckpointType::V2
-            }
+            CheckpointWriteMode::V2WithoutSidecars
+            | CheckpointWriteMode::V2WithSidecars
+            | CheckpointWriteMode::V2ReusingEligibleSidecars => SelectedCheckpointType::V2,
         };
         let new_log_segment = self
             .log_segment
@@ -2071,6 +2091,7 @@ impl Snapshot {
         span.record("num_remove_files", info.num_remove_files);
         span.record("num_actions", info.last_checkpoint_stats.num_actions as u64);
         span.record("num_sidecars", info.num_sidecars);
+        span.record("num_reused_sidecars", info.num_reused_sidecars);
         Ok((CheckpointWriteResult::Written, new_snapshot))
     }
 

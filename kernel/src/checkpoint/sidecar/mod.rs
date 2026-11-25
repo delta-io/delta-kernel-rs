@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use itertools::Itertools;
@@ -21,6 +23,13 @@ const SIDECAR_SCHEMA_SIZE_IN_BYTES: &str = "sizeInBytes";
 const SIDECAR_SCHEMA_MODIFICATION_TIME: &str = "modificationTime";
 const SIDECAR_SCHEMA_TAGS: &str = "tags";
 
+/// A sidecar reference, including null-valued tags that the shared `Sidecar` action drops.
+pub(super) struct SidecarReference {
+    pub path: String,
+    pub file_meta: FileMeta,
+    pub tags: Option<HashMap<String, Option<String>>>,
+}
+
 /// Creates a single [`EngineData`] batch containing one row per sidecar file.
 ///
 /// Each row has the `sidecar` field populated and all other fields set to null.
@@ -31,13 +40,13 @@ const SIDECAR_SCHEMA_TAGS: &str = "tags";
 /// # Parameters
 /// - `engine`: Implementation of [`Engine`] apis.
 /// - `checkpoint_data_schema`: The checkpoint data schema.
-/// - `sidecar_metas`: Pairs of (sidecar filename, FileMeta) for each sidecar file.
+/// - `sidecars`: References to reused and newly written sidecars.
 pub(super) fn create_sidecar_action_batch(
     engine: &dyn Engine,
     checkpoint_data_schema: &SchemaRef,
-    sidecar_metas: &[(String, FileMeta)],
+    sidecars: &[SidecarReference],
 ) -> KernelResult<Option<Box<dyn EngineData>>> {
-    if sidecar_metas.is_empty() {
+    if sidecars.is_empty() {
         return Ok(None);
     }
 
@@ -63,10 +72,10 @@ pub(super) fn create_sidecar_action_batch(
         .collect();
 
     // Build one row per sidecar.
-    let rows: Vec<Vec<Scalar>> = sidecar_metas
+    let rows: Vec<Vec<Scalar>> = sidecars
         .iter()
-        .map(|(filename, meta)| -> KernelResult<Vec<Scalar>> {
-            let size_in_bytes = meta.size_as_i64()?;
+        .map(|reference| -> KernelResult<Vec<Scalar>> {
+            let size_in_bytes = reference.file_meta.size_as_i64()?;
 
             // Sidecar struct values, ordered to match `sidecar_schema`.
             let values: Vec<Scalar> = sidecar_schema
@@ -74,14 +83,15 @@ pub(super) fn create_sidecar_action_batch(
                 .map(|field| match field.name().as_str() {
                     // Per the protocol, implementations are encouraged to store only
                     // the file's name for the `path` field.
-                    SIDECAR_SCHEMA_PATH => Ok(Scalar::from(filename.clone())),
+                    SIDECAR_SCHEMA_PATH => Ok(Scalar::from(reference.path.clone())),
                     SIDECAR_SCHEMA_SIZE_IN_BYTES => Ok(Scalar::from(size_in_bytes)),
-                    SIDECAR_SCHEMA_MODIFICATION_TIME => Ok(Scalar::from(meta.last_modified)),
-                    // Sidecar tags are protocol details; we can let connectors specify them
-                    // in the future if there is a need. For now we leave it as null.
-                    // We explicitly fill it with `Scalar::Null` here, since
-                    // `StructData::try_new` requires one value per schema field.
-                    SIDECAR_SCHEMA_TAGS => Ok(Scalar::Null(field.data_type().clone())),
+                    SIDECAR_SCHEMA_MODIFICATION_TIME => {
+                        Ok(Scalar::from(reference.file_meta.last_modified))
+                    }
+                    SIDECAR_SCHEMA_TAGS => Ok(reference
+                        .tags
+                        .clone()
+                        .map_or_else(|| Scalar::Null(field.data_type().clone()), Scalar::from)),
                     other => Err(KernelError::CheckpointWrite(format!(
                         "Unexpected sidecar field: {other}"
                     ))),
@@ -308,12 +318,14 @@ pub(super) struct SingleSidecarDataIterator {
     /// because we operate on whole `EngineData` batches, which cannot be split.
     max_file_actions_hint: usize,
     yielded_row_count: usize,
+    sidecars_started: Option<Arc<AtomicUsize>>,
 }
 
 impl SingleSidecarDataIterator {
     pub(super) fn new(
         splitter: Arc<Mutex<SidecarSplitter>>,
         max_file_actions_hint: usize,
+        sidecars_started: Option<Arc<AtomicUsize>>,
     ) -> KernelResult<Self> {
         if max_file_actions_hint == 0 {
             return Err(KernelError::checkpoint_write(
@@ -324,6 +336,7 @@ impl SingleSidecarDataIterator {
             splitter,
             max_file_actions_hint,
             yielded_row_count: 0,
+            sidecars_started,
         })
     }
 }
@@ -350,6 +363,17 @@ impl Iterator for SingleSidecarDataIterator {
         };
         match splitter.next_file_actions_batch() {
             Some(Ok(file_batch)) => {
+                // Count a partial sidecar before another pull can reach the base decision.
+                if self.yielded_row_count == 0
+                    && let Some(counter) = &self.sidecars_started
+                    && counter
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                            count.checked_add(1)
+                        })
+                        .is_err()
+                {
+                    return Some(Err(KernelError::checkpoint_write("Sidecar count overflow")));
+                }
                 self.yielded_row_count += file_batch.len();
                 Some(Ok(file_batch))
             }

@@ -119,6 +119,15 @@ impl CheckpointMetrics {
         };
         rows.fetch_add(batch.actions.len() as u64, Ordering::Relaxed);
     }
+
+    #[cfg(feature = "incremental-checkpoints-in-dev")]
+    pub(crate) fn record_checkpoint_rows(&self, rows: usize) {
+        if let Some(counters) = &self.0 {
+            counters
+                .num_actions_from_checkpoint
+                .fetch_add(rows as u64, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Timed sections of checkpoint input, processing, and verification.
@@ -137,8 +146,9 @@ pub(crate) enum CheckpointPhase {
     /// checkpoint.
     CheckpointInput,
     /// Processing each received batch with `ActionReconciliationProcessor`, before dropping batches
-    /// with no selected rows. Includes action deduplication, retention checks, and selection-vector
-    /// construction. Input iterator calls have already completed.
+    /// with no selected rows. Includes sidecar-reuse eligibility checks, action deduplication,
+    /// retention checks, and selection-vector construction. Input iterator calls have already
+    /// completed.
     Reconciliation,
     /// Evaluating statistics and partition-value transforms on reconciled batches with selected
     /// rows, including wrapping the result in `FilteredEngineData`. Excludes evaluator setup and

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rstest::rstest;
 use serde_json::json;
@@ -55,17 +56,24 @@ fn generate_checkpoint_parts(
     )?;
 
     let sidecars_base = writer.snapshot.log_segment().log_root.join("_sidecars/")?;
+    let starts = Arc::new(AtomicUsize::new(0));
     let mut sidecar_files = Vec::new();
     let mut sidecar_index = 1usize;
     loop {
-        let mut single_sidecar_iter =
-            SingleSidecarDataIterator::new(splitter.clone(), file_actions_per_sidecar_hint)?
-                .peekable();
+        let mut single_sidecar_iter = SingleSidecarDataIterator::new(
+            splitter.clone(),
+            file_actions_per_sidecar_hint,
+            Some(starts.clone()),
+        )?
+        .peekable();
         if single_sidecar_iter.peek().is_some() {
+            let expected_starts = sidecar_files.len() + 1;
+            assert_eq!(starts.load(Ordering::Relaxed), expected_starts);
             let sidecar_url = sidecars_base.join(&format!("sidecar_{sidecar_index}.parquet"))?;
             engine
                 .parquet_handler()
                 .write_parquet_file(sidecar_url.clone(), Box::new(single_sidecar_iter))?;
+            assert_eq!(starts.load(Ordering::Relaxed), expected_starts);
             sidecar_files.push(sidecar_url);
             sidecar_index += 1;
         }
@@ -74,6 +82,7 @@ fn generate_checkpoint_parts(
             break;
         }
     }
+    assert_eq!(starts.load(Ordering::Relaxed), sidecar_files.len());
 
     let non_file_batches = Arc::into_inner(splitter)
         .expect("splitter Arc should have no other references")
@@ -656,9 +665,11 @@ async fn test_splitter_no_file_actions() -> Result<()> {
         Default::default(),
     )?;
 
-    let iter = SingleSidecarDataIterator::new(splitter.clone(), usize::MAX)?;
+    let starts = Arc::new(AtomicUsize::new(0));
+    let iter = SingleSidecarDataIterator::new(splitter.clone(), usize::MAX, Some(starts.clone()))?;
     let total_file_rows: usize = iter.map(|batch| batch.unwrap().len()).sum();
     assert_eq!(total_file_rows, 0, "should have no file-action rows");
+    assert_eq!(starts.load(Ordering::Relaxed), 0);
 
     assert!(splitter.lock().expect("splitter lock").is_exhausted());
 
@@ -734,7 +745,7 @@ fn test_single_sidecar_data_iterator_rejects_zero_max_file_actions_hint() {
     let splitter =
         SidecarSplitter::new_mut_shared(iter, &ArrowEvaluationHandler, schema, Default::default())
             .unwrap();
-    let result = SingleSidecarDataIterator::new(splitter, 0);
+    let result = SingleSidecarDataIterator::new(splitter, 0, None);
     assert!(result.is_err());
     let err = result.err().unwrap();
     assert!(

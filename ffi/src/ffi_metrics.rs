@@ -112,6 +112,8 @@ pub enum CheckpointWriteMode {
     V2WithoutSidecars,
     /// V2 sidecar-writing path, which can produce zero sidecars if there are no file actions.
     V2WithSidecars,
+    /// V2 checkpoint attempted all-or-nothing reuse of eligible inherited sidecars.
+    V2ReusingEligibleSidecars,
 }
 
 impl From<kernel::CheckpointWriteMode> for CheckpointWriteMode {
@@ -121,6 +123,9 @@ impl From<kernel::CheckpointWriteMode> for CheckpointWriteMode {
             kernel::CheckpointWriteMode::V1 => Self::V1,
             kernel::CheckpointWriteMode::V2WithoutSidecars => Self::V2WithoutSidecars,
             kernel::CheckpointWriteMode::V2WithSidecars => Self::V2WithSidecars,
+            kernel::CheckpointWriteMode::V2ReusingEligibleSidecars => {
+                Self::V2ReusingEligibleSidecars
+            }
         }
     }
 }
@@ -430,7 +435,8 @@ pub struct CheckpointProcessingStats {
     /// Includes schema/footer reads, sidecar-reference extraction, decoding, waits, and final
     /// or failing iterator calls, including for JSON main checkpoints.
     pub checkpoint_input_duration_ns: u64,
-    /// Time reconciling actions and constructing selection vectors, in nanoseconds.
+    /// Time checking reuse eligibility, reconciling actions and building selection vectors,
+    /// in nanoseconds.
     pub reconciliation_duration_ns: u64,
     /// Time evaluating statistics and partition-value transforms for checkpoint output,
     /// in nanoseconds. Reuses or converts existing statistics.
@@ -442,8 +448,8 @@ pub struct CheckpointProcessingStats {
     /// Input Delta log actions from original commit files after the previous checkpoint,
     /// or from version zero when there is no previous checkpoint.
     pub num_actions_from_log_tail: u64,
-    /// Input Delta log actions from the previous checkpoint and its sidecars.
-    /// Zero when there is no previous checkpoint.
+    /// Input Delta log action rows received from the previous checkpoint and its sidecars.
+    /// Includes rows reread on fallback. Zero when there is no previous checkpoint.
     pub num_actions_from_checkpoint: u64,
 }
 
@@ -503,6 +509,8 @@ pub struct CheckpointWriteStats {
     pub num_actions: u64,
     /// Total sidecars referenced by the completed checkpoint.
     pub num_sidecars: u64,
+    /// Inherited sidecar files referenced without being rewritten. Zero on full fallback.
+    pub num_reused_sidecars: u64,
 }
 
 impl From<kernel::CheckpointWriteStats> for CheckpointWriteStats {
@@ -513,6 +521,7 @@ impl From<kernel::CheckpointWriteStats> for CheckpointWriteStats {
             num_remove_files: stats.num_remove_files,
             num_actions: stats.num_actions,
             num_sidecars: stats.num_sidecars,
+            num_reused_sidecars: stats.num_reused_sidecars,
         }
     }
 }
@@ -1085,6 +1094,10 @@ mod tests {
         kernel::CheckpointWriteMode::V2WithSidecars,
         CheckpointWriteMode::V2WithSidecars
     )]
+    #[case::v2_reusing_eligible(
+        kernel::CheckpointWriteMode::V2ReusingEligibleSidecars,
+        CheckpointWriteMode::V2ReusingEligibleSidecars
+    )]
     fn from_kernel_checkpoint_written_preserves_stats(
         #[case] mode: kernel::CheckpointWriteMode,
         #[case] expected_mode: CheckpointWriteMode,
@@ -1101,9 +1114,19 @@ mod tests {
         let (bytes, adds, removes, actions, sidecars) = if zero_stats {
             (0, 0, 0, 0, 0)
         } else {
-            let sidecars = u64::from(mode == kernel::CheckpointWriteMode::V2WithSidecars) * 2;
+            let sidecars = u64::from(matches!(
+                mode,
+                kernel::CheckpointWriteMode::V2WithSidecars
+                    | kernel::CheckpointWriteMode::V2ReusingEligibleSidecars
+            )) * 2;
             (101, 3, 5, 11 + sidecars, sidecars)
         };
+        let reused_sidecars =
+            if matches!(mode, kernel::CheckpointWriteMode::V2ReusingEligibleSidecars) {
+                sidecars / 2
+            } else {
+                0
+            };
         let event = kernel::MetricEvent::CheckpointWriteSuccess(kernel::CheckpointWriteSuccess {
             operation_id,
             version: 42,
@@ -1114,6 +1137,7 @@ mod tests {
                     num_remove_files: removes,
                     num_actions: actions,
                     num_sidecars: sidecars,
+                    num_reused_sidecars: reused_sidecars,
                 },
             },
             mode,
@@ -1149,6 +1173,7 @@ mod tests {
                         num_remove_files: removes,
                         num_actions: actions,
                         num_sidecars: sidecars,
+                        num_reused_sidecars: reused_sidecars,
                     },
                 }
             );
@@ -1163,6 +1188,10 @@ mod tests {
     #[case::with_sidecars(
         kernel::CheckpointWriteMode::V2WithSidecars,
         CheckpointWriteMode::V2WithSidecars
+    )]
+    #[case::v2_reusing_eligible(
+        kernel::CheckpointWriteMode::V2ReusingEligibleSidecars,
+        CheckpointWriteMode::V2ReusingEligibleSidecars
     )]
     fn from_kernel_checkpoint_nonwritten_preserves_mode_and_duration(
         #[case] mode: kernel::CheckpointWriteMode,
