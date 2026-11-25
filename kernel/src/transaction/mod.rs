@@ -1599,6 +1599,7 @@ mod tests {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     mod manifest_commit_tests;
 
+    use std::backtrace::Backtrace;
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -1833,7 +1834,9 @@ mod tests {
     }
 
     /// A mock committer that always returns an IOError, used to test the retryable error path.
-    struct IoErrorCommitter;
+    struct IoErrorCommitter {
+        with_backtrace: bool,
+    }
 
     impl Committer for IoErrorCommitter {
         fn commit(
@@ -1842,9 +1845,15 @@ mod tests {
             _actions: Box<dyn KernelResultIterator<FilteredEngineData> + '_>,
             _commit_metadata: CommitMetadata,
         ) -> KernelResult<CommitResponse> {
-            Err(KernelError::IOError(std::io::Error::other(
-                "simulated IO error",
-            )))
+            let error = KernelError::IOError(std::io::Error::other("simulated IO error"));
+            Err(if self.with_backtrace {
+                KernelError::Backtraced {
+                    source: Box::new(error),
+                    backtrace: Box::new(Backtrace::force_capture()),
+                }
+            } else {
+                error
+            })
         }
         fn is_catalog_committer(&self) -> bool {
             false
@@ -3124,12 +3133,17 @@ mod tests {
     // kernel/tests/features/dv.rs and kernel/tests/write/remove_dv.rs, which exercise
     // the full deletion vector write workflow including the DvMatchVisitor logic.
 
-    #[test]
-    fn test_commit_io_error_returns_retryable_transaction() -> Result<()> {
+    #[rstest]
+    fn test_commit_io_error_returns_retryable_transaction(
+        #[values(false, true)] with_backtrace: bool,
+    ) -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let mut txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
-            .build(engine.as_ref(), Box::new(IoErrorCommitter))?;
+            .build(
+                engine.as_ref(),
+                Box::new(IoErrorCommitter { with_backtrace }),
+            )?;
         add_dummy_file(&mut txn);
         let result = txn.commit(engine.as_ref())?;
         assert!(
@@ -3137,11 +3151,17 @@ mod tests {
             "Expected Retryable, got: {result:?}"
         );
         if let CommitResult::Retryable(retryable) = result {
+            assert_eq!(
+                matches!(retryable.error, KernelError::Backtraced { .. }),
+                with_backtrace
+            );
             assert!(
                 retryable.error.to_string().contains("simulated IO error"),
                 "Unexpected error: {}",
                 retryable.error
             );
+            let result = retryable.transaction.commit(engine.as_ref())?;
+            assert!(matches!(result, CommitResult::Retryable(_)));
         }
         Ok(())
     }
@@ -3590,14 +3610,19 @@ mod tests {
         })
     }
 
-    #[test]
-    fn test_commit_io_error_emits_retryable_io_failure_metric() -> Result<()> {
+    #[rstest]
+    fn test_commit_io_error_emits_retryable_io_failure_metric(
+        #[values(false, true)] with_backtrace: bool,
+    ) -> Result<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
         let mut txn = snapshot
             .update_table(UpdateTableOperation::Write, "test-engine", true)
-            .build(engine.as_ref(), Box::new(IoErrorCommitter))?;
+            .build(
+                engine.as_ref(),
+                Box::new(IoErrorCommitter { with_backtrace }),
+            )?;
         add_dummy_file(&mut txn);
         let result = txn.commit(engine.as_ref())?;
         assert!(matches!(result, CommitResult::Retryable(_)));

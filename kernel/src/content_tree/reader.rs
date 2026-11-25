@@ -38,7 +38,11 @@ use crate::content_tree::{
 use crate::engine_data::{
     EngineData, FilteredEngineData, GetData, RowVisitor, StructList, TypedGetData as _,
 };
-use crate::expressions::{ArrayData, ColumnName, Expression, MapData, Scalar, expr, lit};
+use crate::expressions::{
+    ArrayData, ColumnName, Expression, ExpressionRef, MapData, PredicateRef, Scalar, expr, lit,
+    null_lit,
+};
+use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DATA_CHANGE_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, DELETION_VECTOR_NAME,
     MODIFICATION_TIME_NAME, PARTITION_VALUES_NAME, PATH_NAME, SIZE_NAME, TAGS_NAME,
@@ -48,6 +52,7 @@ use crate::schema::{
     StructType, ToSchema as _,
 };
 use crate::table_features::column_mapping_mode;
+use crate::utils::require;
 use crate::{
     Engine, ExpressionEvaluator, FileDataReadResultIterator, FileMeta, KernelError, KernelResult,
     KernelResultIterator, Result,
@@ -56,7 +61,9 @@ use crate::{
 /// Reads the `Add` actions for every live data file in an AMT checkpoint's content tree.
 ///
 /// Reads the root manifest eagerly and returns the `Add` actions of its live `Data` entries and of
-/// every live leaf manifest it references.
+/// every live leaf manifest it references. When `ctx` carries a [`SkippingPredicate`], a leaf
+/// manifest whose root entry's `content_stats` rule out the predicate is not read (see
+/// [`StatsRead::leaf_filter`]).
 ///
 /// # Parameters
 /// - `engine`: provides the parquet and evaluation handlers.
@@ -83,6 +90,10 @@ pub(crate) fn read_add_actions_from_amt(
     let root = checkpoint.root_filemeta(table_root)?;
     let schemas = ManifestReadSchema::new(ctx.content_stats());
     let converter = make_root_entry_converter(engine, ctx)?;
+    let leaf_filter = ctx
+        .stats
+        .as_ref()
+        .and_then(|stats| stats.leaf_filter(engine, schemas.root.clone()));
     let mut root_actions = Vec::new();
     let mut leaves = LeafRefVisitor::new(table_root);
     let batches = engine
@@ -95,7 +106,11 @@ pub(crate) fn read_add_actions_from_amt(
         )?;
     for batch in batches {
         let batch = batch?;
-        leaves.visit_rows_of(batch.as_ref())?;
+        let keep = match &leaf_filter {
+            Some(filter) => filter.apply(batch.as_ref())?,
+            None => vec![true; batch.len()],
+        };
+        leaves.visit_batch(batch.as_ref(), keep)?;
         root_actions.push(converter.convert(batch.as_ref(), RemovedEntries::default())?);
     }
     let leaf_actions =
@@ -154,32 +169,121 @@ impl ReadContext {
 /// and `recordCount`.
 pub(crate) struct StatsRead {
     /// The physical Delta stats schema: the type of `Add.stats_parsed`.
-    schema: StructType,
+    schema: SchemaRef,
     /// The `content_stats` backing [`Self::schema`] (see [`projected_stats_schema`]), or `None`
     /// when none of its stats are recorded in `content_stats`.
     content_stats: Option<StructType>,
     /// Evaluates an entry row to its `Add.stats_parsed`.
-    expression: Expression,
+    expression: ExpressionRef,
+    /// The predicate leaf manifests are skipped by, or `None` to read every leaf.
+    skipping: Option<SkippingPredicate>,
+}
+
+/// The Delta stats to read from an AMT checkpoint's content tree as `Add.stats_parsed`, and the
+/// scan predicate to skip the tree's leaf manifests by.
+pub(crate) struct AmtStatsRequest<'a> {
+    /// The physical Delta stats schema: the type of `Add.stats_parsed`.
+    schema: &'a StructType,
+    skipping: Option<SkippingPredicate>,
+}
+
+impl<'a> AmtStatsRequest<'a> {
+    /// Requests the physical Delta stats `schema` (see [`StatsRead::try_new`] for its
+    /// requirements), skipping the leaf manifests whose stats rule out `predicate`. The
+    /// predicate's references to columns outside `stats_columns` cannot rule out a leaf.
+    pub(crate) fn new(
+        schema: &'a StructType,
+        predicate: Option<PredicateRef>,
+        stats_columns: &HashSet<ColumnName>,
+    ) -> Self {
+        let skipping = predicate.map(|predicate| SkippingPredicate {
+            predicate,
+            stats_columns: stats_columns.clone(),
+        });
+        Self { schema, skipping }
+    }
+
+    /// The physical Delta stats schema: the type of `Add.stats_parsed`.
+    pub(crate) fn schema(&self) -> &'a StructType {
+        self.schema
+    }
+}
+
+/// A scan predicate over physical column names, with the physical leaf columns whose stats can
+/// rule out a leaf manifest.
+#[derive(Clone)]
+struct SkippingPredicate {
+    predicate: PredicateRef,
+    stats_columns: HashSet<ColumnName>,
 }
 
 impl StatsRead {
-    /// Plans reading the physical Delta stats `schema` from `checkpoint`'s content tree.
+    /// Plans reading the stats `request` asks for from `checkpoint`'s content tree.
     ///
     /// `content_stats` is keyed by Parquet field ID, which the Delta stats schema does not carry,
     /// so the IDs come from the checkpoint's own metadata: the schema the manifests were written
-    /// with. Every column of `schema` must therefore be a column of the checkpoint's physical
-    /// schema, in the same order and with the same type.
-    pub(crate) fn try_new(checkpoint: &CheckpointAction, schema: StructType) -> Result<Self> {
+    /// with. Every column of the requested schema must therefore be a column of the checkpoint's
+    /// physical schema, in the same order and with the same type.
+    pub(crate) fn try_new(
+        checkpoint: &CheckpointAction,
+        request: &AmtStatsRequest<'_>,
+    ) -> Result<Self> {
         let metadata = checkpoint.metadata();
         let mode = column_mapping_mode(checkpoint.protocol(), &metadata.parse_table_properties());
         let physical_schema = metadata.parse_schema()?.make_physical(mode)?;
-        let content_stats = projected_stats_schema(&physical_schema, &schema)?;
-        let expression = parsed_stats_expression(&physical_schema, &schema)?;
+        Ok(Self::from_physical_schema(&physical_schema, request)?)
+    }
+
+    /// Like [`Self::try_new`], with the field IDs taken from `physical_schema`, the physical
+    /// schema the manifests were written with.
+    fn from_physical_schema(
+        physical_schema: &StructType,
+        request: &AmtStatsRequest<'_>,
+    ) -> KernelResult<Self> {
+        let schema = request.schema;
+        let content_stats = projected_stats_schema(physical_schema, schema)?;
+        let expression = parsed_stats_expression(physical_schema, schema)?;
         Ok(Self {
-            schema,
+            schema: Arc::new(schema.clone()),
             content_stats: (content_stats.num_fields() > 0).then_some(content_stats),
-            expression,
+            expression: Arc::new(expression),
+            skipping: request.skipping.clone(),
         })
+    }
+
+    /// Builds the filter deciding which root manifest entries' leaves to read, over root batches of
+    /// `root_schema`, or `None` to read every leaf.
+    ///
+    /// The filter converts each root entry's `content_stats` into Delta stats with
+    /// [`Self::expression`], the same conversion that fills `Add.stats_parsed`, and evaluates the
+    /// predicate over them with the Delta [`DataSkippingFilter`]. A `DataManifest` entry's stats
+    /// aggregate those of the leaf's entries, and the Delta V4 metadata RFC requires an aggregate
+    /// to be null when any entry lacks that stat, so they bound every row of the leaf.
+    ///
+    /// A filter that cannot be built is not an error: skipping is an optimization, and the leaf's
+    /// files still pass through data skipping during log replay.
+    fn leaf_filter(
+        &self,
+        engine: &dyn Engine,
+        root_schema: SchemaRef,
+    ) -> Option<DataSkippingFilter> {
+        let skipping = self.skipping.as_ref()?;
+        // Without `content_stats` every converted stat is null, so no leaf could be ruled out.
+        self.content_stats.as_ref()?;
+        DataSkippingFilter::new(
+            engine,
+            Some(skipping.predicate.clone()),
+            Some(&self.schema),
+            self.expression.clone(),
+            // TODO(#3320): pass partition values once the content tree carries them.
+            None,
+            Arc::new(null_lit(DataType::BOOLEAN)),
+            // No root entry is a Remove whose partition predicate needs guarding.
+            Arc::new(lit(true)),
+            root_schema,
+            &skipping.stats_columns,
+            None,
+        )
     }
 }
 
@@ -198,6 +302,8 @@ struct LeafRef {
     format_version: i32,
     /// Whether the root entry carries a non-empty `columnFiles` list: column updates to the leaf.
     has_column_files: bool,
+    /// Whether the root entry's stats rule out every row of the leaf, so it is not read.
+    skipped: bool,
 }
 
 /// The columns [`LeafRef::try_from_getters`] reads, in getter order: the root entry's own fields
@@ -259,6 +365,7 @@ impl LeafRef {
             manifest_dv,
             format_version: fields[3].get(row, FORMAT_VERSION)?,
             has_column_files: has_column_files(fields[4].get_struct_list(row, COLUMN_FILES)?)?,
+            skipped: false,
         })
     }
 
@@ -610,12 +717,12 @@ struct LeafToAddActions {
 }
 
 impl LeafToAddActions {
-    /// Validates and reads all the leaves, with `read_schema` (see [`ManifestReadSchema::leaf`]),
-    /// stopping when `cancellation_token` is cancelled.
+    /// Validates and reads the leaves not [skipped](LeafRef::skipped), with `read_schema` (see
+    /// [`ManifestReadSchema::leaf`]), stopping when `cancellation_token` is cancelled.
     ///
     /// # Errors
     /// Returns an error if two leaves share a location (their batches could not be told apart), if
-    /// a leaf cannot yet be read (see [`LeafRef::check_readable`]), if a leaf's
+    /// a leaf to read cannot yet be read (see [`LeafRef::check_readable`]), if a leaf's
     /// context cannot be built (see [`LeafReadContext::new`]), or if the engine fails to start the
     /// read.
     fn try_new(
@@ -634,6 +741,7 @@ impl LeafToAddActions {
         }
         let (pending, files): (VecDeque<_>, Vec<_>) = leaves
             .into_iter()
+            .filter(|leaf| !leaf.skipped)
             .map(|leaf| {
                 leaf.check_readable()?;
                 let location = leaf.file_meta.location.to_string();
@@ -840,7 +948,7 @@ fn build_entry_to_add_expression(
             n if n == DELETION_VECTOR_NAME => add_deletion_vector_expression(),
             n if n == BASE_ROW_ID_NAME => sources.base_row_id.clone(),
             n if n == DEFAULT_ROW_COMMIT_VERSION_NAME => sources.default_row_commit_version.clone(),
-            n if n == STATS_PARSED => ctx.stats.as_ref()?.expression.clone(),
+            n if n == STATS_PARSED => ctx.stats.as_ref()?.expression.as_ref().clone(),
             _ => return None,
         })
     })?;
@@ -975,6 +1083,9 @@ struct LeafRefVisitor<'u> {
     /// The table root URL relative leaf locations resolve against.
     table_root: &'u Url,
     leaves: Vec<LeafRef>,
+    /// The leaf filter output of the batch [`Self::visit_batch`] is visiting, empty otherwise: row
+    /// `i`'s leaf is [skipped](LeafRef::skipped) when `keep[i]` is false.
+    keep: Vec<bool>,
 }
 
 impl<'u> LeafRefVisitor<'u> {
@@ -982,7 +1093,24 @@ impl<'u> LeafRefVisitor<'u> {
         Self {
             table_root,
             leaves: Vec::new(),
+            keep: Vec::new(),
         }
+    }
+
+    /// Collects the leaves of one root batch, skipping those whose row `keep` deselects.
+    fn visit_batch(&mut self, batch: &dyn EngineData, keep: Vec<bool>) -> KernelResult<()> {
+        require!(
+            keep.len() == batch.len(),
+            KernelError::internal_error(format!(
+                "leaf filter selected {} rows of a root batch of {}",
+                keep.len(),
+                batch.len()
+            ))
+        );
+        self.keep = keep;
+        let result = self.visit_rows_of(batch);
+        self.keep.clear();
+        result
     }
 }
 
@@ -1010,7 +1138,11 @@ impl RowVisitor for LeafRefVisitor<'_> {
             if !TrackingStatus::try_from_repr(status)?.is_live() {
                 continue;
             }
-            let leaf = LeafRef::try_from_getters(row, &getters[1..], self.table_root)?;
+            let mut leaf = LeafRef::try_from_getters(row, &getters[1..], self.table_root)?;
+            let keep = self.keep.get(row).copied().ok_or_else(|| {
+                KernelError::internal_error("LeafRefVisitor visited a row outside `visit_batch`")
+            })?;
+            leaf.skipped = !keep;
             self.leaves.push(leaf);
         }
         Ok(())
@@ -1268,17 +1400,22 @@ mod tests {
     use crate::arrow::compute::concat_batches;
     use crate::arrow::datatypes::Int64Type;
     use crate::content_tree::dv_conversion::extract_deletion_vector_content;
+    use crate::content_tree::stats::field_with_id;
     use crate::content_tree::test_utils::{
-        action_paths, added_data_entry, data_manifest_entry, entry_batch, mumbling_bitmap,
-        struct_batch, test_dv_info, with_field, write_manifest, write_manifest_with_stats,
-        write_manifest_without_tags, x_full_stats, x_full_stats_value, x_upper_bound_stats,
+        action_paths, added_data_entry, data_manifest_entry, entry_batch, entry_batch_with_stats,
+        mumbling_bitmap, struct_batch, test_dv_info, with_field, write_manifest,
+        write_manifest_with_stats, write_manifest_without_tags, x_full_stats, x_full_stats_value,
+        x_stats, x_upper_bound_stats,
     };
-    use crate::content_tree::{DeletionVectorInfo, ManifestInfo};
+    use crate::content_tree::{
+        DeletionVectorInfo, LOWER_BOUND, ManifestInfo, NAN_VALUE_COUNT, NULL_VALUE_COUNT,
+        UPPER_BOUND, VALUE_COUNT,
+    };
     use crate::engine::DelegatingEngine;
     use crate::engine::arrow_conversion::TryFromArrow as _;
     use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
     use crate::engine::sync::SyncEngine;
-    use crate::expressions::StructData;
+    use crate::expressions::{Predicate as Pred, StructData, col};
     use crate::scan::state::DvInfo;
     use crate::schema::{StructType, schema_ref};
     use crate::unit_test_utils::adaptive_metadata_fixtures::checkpoint_action_with_root;
@@ -1395,7 +1532,8 @@ mod tests {
         let table_root = Url::parse("memory:///table/").unwrap();
         let mut visitor = LeafRefVisitor::new(&table_root);
         for entries in batches {
-            visitor.visit_rows_of(entry_batch(&engine, entries).as_ref())?;
+            let batch = entry_batch(&engine, entries);
+            visitor.visit_batch(batch.as_ref(), vec![true; batch.len()])?;
         }
         Ok(visitor.leaves)
     }
@@ -1503,7 +1641,24 @@ mod tests {
         let entry = data_manifest_entry("leaf.parquet", 1, TrackingStatus::Existing);
         let batch = struct_batch(&engine, &[with_field(&entry.into(), path, value)]);
         let mut visitor = LeafRefVisitor::new(&table_root);
-        assert_result_error_with_message(visitor.visit_rows_of(batch.as_ref()), message);
+        assert_result_error_with_message(
+            visitor.visit_batch(batch.as_ref(), vec![true; batch.len()]),
+            message,
+        );
+    }
+
+    #[test]
+    fn leaf_ref_visitor_does_not_reuse_selection_outside_visit_batch() {
+        let engine = SyncEngine::new();
+        let table_root = Url::parse("memory:///table/").unwrap();
+        let entry = data_manifest_entry("leaf.parquet", 1, TrackingStatus::Existing);
+        let batch = entry_batch(&engine, &[entry]);
+        let mut visitor = LeafRefVisitor::new(&table_root);
+        visitor.visit_batch(batch.as_ref(), vec![false]).unwrap();
+        assert_result_error_with_message(
+            visitor.visit_rows_of(batch.as_ref()),
+            "visited a row outside `visit_batch`",
+        );
     }
 
     // === Manifest read schemas ===
@@ -1747,9 +1902,9 @@ mod tests {
             StructField::nullable(MAX_VALUES, phys_id),
             StructField::nullable(TIGHT_BOUNDS, DataType::BOOLEAN),
         ]);
+        let request = AmtStatsRequest::new(&stats_schema, None, &HashSet::new());
         let ctx = ReadContext {
-            stats: with_stats
-                .then(|| StatsRead::try_new(&checkpoint, stats_schema.clone()).unwrap()),
+            stats: with_stats.then(|| StatsRead::try_new(&checkpoint, &request).unwrap()),
             ..read_ctx()
         };
 
@@ -3073,5 +3228,414 @@ mod tests {
     /// against the surviving `Add` rows.
     fn filtered_to_batch(filtered: FilteredEngineData) -> Box<dyn EngineData> {
         filtered.apply_selection_vector().unwrap()
+    }
+
+    // === Leaf skipping ===
+
+    /// Requests `schema`, skipping leaves by `predicate` over the physical column `stats_column`.
+    fn skipping_request<'a>(
+        schema: &'a StructType,
+        predicate: Pred,
+        stats_column: &str,
+    ) -> AmtStatsRequest<'a> {
+        let stats_columns = HashSet::from([ColumnName::new([stats_column])]);
+        AmtStatsRequest::new(schema, Some(Arc::new(predicate)), &stats_columns)
+    }
+
+    /// The scan's physical Delta stats schema over the single column `column` of type `data_type`.
+    fn delta_stats_schema(column: &str, data_type: DataType) -> StructType {
+        let columns = |data_type: DataType| {
+            StructType::new_unchecked([StructField::nullable(column, data_type)])
+        };
+        StructType::new_unchecked([
+            StructField::nullable(NUM_RECORDS, DataType::LONG),
+            StructField::nullable(NULL_COUNT, columns(DataType::LONG)),
+            StructField::nullable(MIN_VALUES, columns(data_type.clone())),
+            StructField::nullable(MAX_VALUES, columns(data_type)),
+            StructField::nullable(TIGHT_BOUNDS, DataType::BOOLEAN),
+        ])
+    }
+
+    /// The `content_stats` of a table's only column.
+    struct ColumnStats {
+        lower_bound: Scalar,
+        upper_bound: Scalar,
+        value_count: i64,
+        null_value_count: i64,
+        /// Read only for a floating-point column; `None` stands for an unknown count.
+        nan_value_count: Option<i64>,
+    }
+
+    /// LONG stats over `[1, 9]` across 10 values, none null.
+    const LONG_STATS: ColumnStats = ColumnStats {
+        lower_bound: Scalar::Long(1),
+        upper_bound: Scalar::Long(9),
+        value_count: 10,
+        null_value_count: 0,
+        nan_value_count: None,
+    };
+
+    /// DOUBLE stats over `[1.0, 9.5]` across 10 values, none null or NaN.
+    const DOUBLE_STATS: ColumnStats = ColumnStats {
+        lower_bound: Scalar::Double(1.0),
+        upper_bound: Scalar::Double(9.5),
+        value_count: 10,
+        null_value_count: 0,
+        nan_value_count: Some(0),
+    };
+
+    /// A `content_stats` value of type `content_stats` whose single leaf holds `stats`, or a null
+    /// value when `stats` is `None`.
+    fn leaf_stats(content_stats: &StructType, stats: Option<&ColumnStats>) -> Scalar {
+        let Some(stats) = stats else {
+            return Scalar::Null(content_stats.clone().into());
+        };
+        let leaf_field = content_stats.fields().next().unwrap();
+        let DataType::Struct(leaf) = leaf_field.data_type() else {
+            panic!("leaf stats must be a struct");
+        };
+        let values = leaf.fields().map(|field| match field.name().as_str() {
+            LOWER_BOUND => stats.lower_bound.clone(),
+            UPPER_BOUND => stats.upper_bound.clone(),
+            VALUE_COUNT => Scalar::Long(stats.value_count),
+            NULL_VALUE_COUNT => Scalar::Long(stats.null_value_count),
+            NAN_VALUE_COUNT => stats
+                .nan_value_count
+                .map_or(Scalar::Null(DataType::LONG), Scalar::Long),
+            other => panic!("unexpected leaf stat '{other}'"),
+        });
+        let leaf =
+            StructData::try_new(schema_ref! { ..(leaf.fields()) }, values.collect()).unwrap();
+        let schema = schema_ref! { (leaf_field.clone()) };
+        Scalar::Struct(StructData::try_new(schema, vec![Scalar::Struct(leaf)]).unwrap())
+    }
+
+    /// The only column of the table whose leaves [`filter_leaf`] filters.
+    const TABLE_COLUMN: &str = "c";
+
+    /// Whether the leaf filter reads or skips a leaf.
+    #[derive(Debug, PartialEq)]
+    enum LeafReadState {
+        Read,
+        Skipped,
+    }
+
+    /// Whether the leaf filter for `predicate` reads or skips the leaf of a root `DataManifest`
+    /// entry referencing 3 leaf entries, with as many rows as its stats' `value_count`, whose
+    /// stats for [`TABLE_COLUMN`] (of type `data_type`) are `stats`. `None` stands for an entry
+    /// without stats.
+    fn filter_leaf(
+        data_type: DataType,
+        stats: Option<ColumnStats>,
+        predicate: Pred,
+    ) -> LeafReadState {
+        let engine = SyncEngine::new();
+        let table =
+            StructType::new_unchecked([field_with_id(TABLE_COLUMN, data_type.clone(), true, 1)]);
+        let schema = delta_stats_schema(TABLE_COLUMN, data_type);
+        let request = skipping_request(&schema, predicate, TABLE_COLUMN);
+        let stats_read = StatsRead::from_physical_schema(&table, &request).unwrap();
+        let content_stats = stats_read.content_stats.clone().unwrap();
+        let mut entry = data_manifest_entry("leaf.parquet", 1, TrackingStatus::Added);
+        entry.record_count = 3;
+        if let Some(stats) = &stats {
+            entry.manifest_info.as_mut().unwrap().added_rows_count = stats.value_count;
+        }
+        let batch = entry_batch_with_stats(
+            &engine,
+            &[entry],
+            &content_stats,
+            vec![leaf_stats(&content_stats, stats.as_ref())],
+        );
+        let root_schema = ManifestReadSchema::new(Some(content_stats)).root;
+        let filter = stats_read.leaf_filter(&engine, root_schema).unwrap();
+        let keep = filter.apply(batch.as_ref()).unwrap();
+        match keep.as_slice() {
+            [true] => LeafReadState::Read,
+            [false] => LeafReadState::Skipped,
+            keep => panic!("expected one row, got {keep:?}"),
+        }
+    }
+
+    /// Microseconds of `4.000500s`: a timestamp a millisecond-truncated max stat would record as
+    /// `4.000s`.
+    const TS_MAX: i64 = 4_000_500;
+
+    /// The root `DataManifest` entry's `content_stats` aggregate every row of its leaf, so a leaf
+    /// is read only when they cannot rule out the predicate. The stats are converted to Delta
+    /// stats and evaluated with Delta's data skipping rules, so the conversion's losses show up
+    /// here: a max is treated as possibly truncated to milliseconds, and comparisons against a
+    /// signed zero are decided in total order, as for Delta file stats.
+    #[rstest]
+    #[case::gt_above_max(
+        DataType::LONG,
+        Some(LONG_STATS),
+        Pred::gt(col!(TABLE_COLUMN), lit(100i64)),
+        LeafReadState::Skipped
+    )]
+    #[case::lt_above_min(
+        DataType::LONG,
+        Some(LONG_STATS),
+        Pred::lt(col!(TABLE_COLUMN), lit(5i64)),
+        LeafReadState::Read
+    )]
+    #[case::eq_outside_bounds(
+        DataType::LONG,
+        Some(LONG_STATS),
+        Pred::eq(col!(TABLE_COLUMN), lit(10i64)),
+        LeafReadState::Skipped
+    )]
+    #[case::eq_inside_bounds(
+        DataType::LONG,
+        Some(LONG_STATS),
+        Pred::eq(col!(TABLE_COLUMN), lit(5i64)),
+        LeafReadState::Read
+    )]
+    #[case::not_gt_below_min(
+        DataType::LONG,
+        Some(LONG_STATS),
+        Pred::not(Pred::gt(col!(TABLE_COLUMN), lit(0i64))),
+        LeafReadState::Skipped
+    )]
+    #[case::and_one_arm_rules_out(
+        DataType::LONG,
+        Some(LONG_STATS),
+        Pred::and(Pred::gt(col!(TABLE_COLUMN), lit(0i64)), Pred::gt(col!(TABLE_COLUMN), lit(100i64))),
+        LeafReadState::Skipped
+    )]
+    #[case::or_one_arm_matches(
+        DataType::LONG,
+        Some(LONG_STATS),
+        Pred::or(Pred::lt(col!(TABLE_COLUMN), lit(0i64)), Pred::lt(col!(TABLE_COLUMN), lit(5i64))),
+        LeafReadState::Read
+    )]
+    #[case::no_stats(DataType::LONG, None, Pred::gt(col!(TABLE_COLUMN), lit(100i64)), LeafReadState::Read)]
+    #[case::unreferenced_column(
+        DataType::LONG,
+        Some(LONG_STATS),
+        Pred::gt(col!("other"), lit(100i64)),
+        LeafReadState::Read
+    )]
+    #[case::is_null_without_nulls(
+        DataType::LONG,
+        Some(LONG_STATS),
+        Pred::is_null(col!(TABLE_COLUMN)),
+        LeafReadState::Skipped
+    )]
+    #[case::is_null_with_nulls(
+        DataType::LONG,
+        Some(ColumnStats {
+            null_value_count: 4,
+            ..LONG_STATS
+        }),
+        Pred::is_null(col!(TABLE_COLUMN)),
+        LeafReadState::Read
+    )]
+    #[case::is_not_null_all_null(
+        DataType::LONG,
+        Some(ColumnStats {
+            lower_bound: Scalar::Null(DataType::LONG),
+            upper_bound: Scalar::Null(DataType::LONG),
+            null_value_count: 10,
+            ..LONG_STATS
+        }),
+        Pred::is_not_null(col!(TABLE_COLUMN)),
+        LeafReadState::Skipped
+    )]
+    #[case::is_not_null_null_count_equals_entry_count(
+        DataType::LONG,
+        Some(ColumnStats {
+            value_count: 1000,
+            null_value_count: 3,
+            ..LONG_STATS
+        }),
+        Pred::is_not_null(col!(TABLE_COLUMN)),
+        LeafReadState::Read
+    )]
+    #[case::string_above_max(
+        DataType::STRING,
+        Some(ColumnStats {
+            lower_bound: "apple".into(),
+            upper_bound: "banana".into(),
+            ..LONG_STATS
+        }),
+        Pred::eq(col!(TABLE_COLUMN), lit("cherry")),
+        LeafReadState::Skipped
+    )]
+    #[case::double_without_nan(
+        DataType::DOUBLE,
+        Some(DOUBLE_STATS),
+        Pred::gt(col!(TABLE_COLUMN), lit(10.0f64)),
+        LeafReadState::Skipped
+    )]
+    #[case::double_with_nan(
+        DataType::DOUBLE,
+        Some(ColumnStats {
+            nan_value_count: Some(2),
+            ..DOUBLE_STATS
+        }),
+        Pred::gt(col!(TABLE_COLUMN), lit(10.0f64)),
+        LeafReadState::Read
+    )]
+    #[case::double_unknown_nan_count(
+        DataType::DOUBLE,
+        Some(ColumnStats {
+            nan_value_count: None,
+            ..DOUBLE_STATS
+        }),
+        Pred::gt(col!(TABLE_COLUMN), lit(10.0f64)),
+        LeafReadState::Read
+    )]
+    #[case::double_below_min_with_nan(
+        DataType::DOUBLE,
+        Some(ColumnStats {
+            nan_value_count: Some(2),
+            ..DOUBLE_STATS
+        }),
+        Pred::lt(col!(TABLE_COLUMN), lit(0.5f64)),
+        LeafReadState::Read
+    )]
+    #[case::double_below_min_without_nan(
+        DataType::DOUBLE,
+        Some(DOUBLE_STATS),
+        Pred::lt(col!(TABLE_COLUMN), lit(0.5f64)),
+        LeafReadState::Skipped
+    )]
+    #[case::double_negative_zero_against_positive_zero(
+        DataType::DOUBLE,
+        Some(ColumnStats {
+            lower_bound: Scalar::Double(-0.0),
+            upper_bound: Scalar::Double(-0.0),
+            ..DOUBLE_STATS
+        }),
+        Pred::ge(col!(TABLE_COLUMN), lit(0.0f64)),
+        LeafReadState::Skipped
+    )]
+    #[case::timestamp_above_max_by_more_than_a_millisecond(
+        DataType::TIMESTAMP,
+        Some(ColumnStats {
+            lower_bound: Scalar::Timestamp(0),
+            upper_bound: Scalar::Timestamp(TS_MAX),
+            ..LONG_STATS
+        }),
+        Pred::gt(col!(TABLE_COLUMN), Scalar::Timestamp(TS_MAX + 1_000)),
+        LeafReadState::Skipped
+    )]
+    #[case::timestamp_above_max_by_less_than_a_millisecond(
+        DataType::TIMESTAMP,
+        Some(ColumnStats {
+            lower_bound: Scalar::Timestamp(0),
+            upper_bound: Scalar::Timestamp(TS_MAX),
+            ..LONG_STATS
+        }),
+        Pred::gt(col!(TABLE_COLUMN), Scalar::Timestamp(TS_MAX + 100)),
+        LeafReadState::Read
+    )]
+    fn leaf_filter_reads_only_leaves_the_stats_cannot_rule_out(
+        #[case] data_type: DataType,
+        #[case] stats: Option<ColumnStats>,
+        #[case] predicate: Pred,
+        #[case] expected: LeafReadState,
+    ) {
+        assert_eq!(filter_leaf(data_type, stats, predicate), expected);
+    }
+
+    /// The Delta stats schema of the checkpoint's `id` column (physically `phys_id`).
+    fn phys_id_stats_schema() -> StructType {
+        delta_stats_schema("phys_id", DataType::LONG)
+    }
+
+    /// Writes a root of two `DataManifest` entries whose `phys_id` stats are `[1, 9]` and
+    /// `[200, 300]`. The first references `low`, which the test never writes; the second
+    /// references a leaf holding `high.parquet` (10 rows, `firstRowId` 1000).
+    fn write_root_of_ranged_leaves(
+        engine: &dyn Engine,
+        low: ContentTreeNodeEntry,
+    ) -> CheckpointAction {
+        let high = write_leaf(
+            engine,
+            "metadata/high.parquet",
+            &[leaf_entry("high.parquet", 100, 10, None, None, None)],
+            5,
+            1000,
+        );
+        let stats = vec![
+            x_stats(&x_full_stats(), &[1, 9, 10, 0]),
+            x_stats(&x_full_stats(), &[200, 300, 10, 0]),
+        ];
+        let location = table_root().join(ROOT_PATH).unwrap();
+        let root =
+            write_manifest_with_stats(engine, location, &[low, high], &x_full_stats(), stats);
+        checkpoint_action_with_root(ROOT_PATH, root.size as i64, 1).unwrap()
+    }
+
+    /// A live `DataManifest` entry referencing a leaf manifest that does not exist.
+    fn missing_leaf() -> ContentTreeNodeEntry {
+        let mut entry = data_manifest_entry("metadata/missing.parquet", 1, TrackingStatus::Added);
+        entry.tracking = parent_tracking(Some(1), Some(5), Some(5), Some(0));
+        entry
+    }
+
+    /// Reads the tree of `checkpoint` with `predicate` over `phys_id`, returning the selected
+    /// `Add` rows' paths and base row IDs.
+    fn read_tree_skipping(
+        engine: &dyn Engine,
+        checkpoint: &CheckpointAction,
+        predicate: Pred,
+    ) -> Result<Vec<(String, i64)>> {
+        let schema = phys_id_stats_schema();
+        let stats =
+            StatsRead::try_new(checkpoint, &skipping_request(&schema, predicate, "phys_id"))?;
+        let ctx = ReadContext {
+            stats: Some(stats),
+            ..read_ctx()
+        };
+        let mut adds = Vec::new();
+        for batch in read_add_actions_from_amt(engine, checkpoint, &ctx, None)? {
+            let batch = filtered_to_batch(batch?).try_into_record_batch()?;
+            let add = batch.column_by_name(ADD_NAME).unwrap().as_struct();
+            let paths = add.column_by_name(PATH_NAME).unwrap().as_string::<i32>();
+            let base_row_ids = add.column_by_name(BASE_ROW_ID_NAME).unwrap();
+            let base_row_ids = base_row_ids.as_primitive::<Int64Type>();
+            for row in 0..batch.num_rows() {
+                adds.push((paths.value(row).to_string(), base_row_ids.value(row)));
+            }
+        }
+        Ok(adds)
+    }
+
+    /// A leaf whose root entry's stats rule out the predicate is never read: here it does not
+    /// exist, so reading it fails. The leaf that is read keeps its row IDs.
+    #[test]
+    fn read_add_actions_from_amt_never_reads_skipped_leaves() {
+        let engine = SyncEngine::in_memory();
+        let checkpoint = write_root_of_ranged_leaves(&engine, missing_leaf());
+
+        let skipped =
+            read_tree_skipping(&engine, &checkpoint, Pred::gt(col!("phys_id"), lit(100i64)));
+        assert_eq!(skipped.unwrap(), vec![("high.parquet".to_string(), 1000)]);
+
+        let read = read_tree_skipping(&engine, &checkpoint, Pred::lt(col!("phys_id"), lit(100i64)));
+        assert!(
+            read.is_err(),
+            "reading the missing leaf should fail: {read:?}"
+        );
+    }
+
+    #[test]
+    fn read_add_actions_from_amt_rejects_unreadable_leaf_only_when_not_skipped() {
+        let engine = SyncEngine::in_memory();
+        let mut unreadable = missing_leaf();
+        unreadable.manifest_info.as_mut().unwrap().format_version = 0;
+        let checkpoint = write_root_of_ranged_leaves(&engine, unreadable);
+
+        let skipped =
+            read_tree_skipping(&engine, &checkpoint, Pred::gt(col!("phys_id"), lit(100i64)));
+        assert_eq!(skipped.unwrap(), vec![("high.parquet".to_string(), 1000)]);
+
+        assert_result_error_with_message(
+            read_tree_skipping(&engine, &checkpoint, Pred::lt(col!("phys_id"), lit(100i64))),
+            "only supports format version",
+        );
     }
 }
