@@ -21,6 +21,19 @@ _HORIZONTAL_RULE = re.compile(r" {0,3}(?:(?:-\s*){3,}|(?:\*\s*){3,}|(?:_\s*){3,}
 _LOG = logging.getLogger(__name__)
 
 
+class AmbiguousStackRange(ValueError):
+    """The workflow cannot select a review base from the declared parent PR's ancestry."""
+
+    def __init__(self, parent_number: int, reason: str):
+        super().__init__(reason)
+        self.parent_number = parent_number
+        self.reason = reason
+        self.suggested_fix = (
+            f"rebase this PR's branch onto PR #{parent_number}'s current head, push the branch, "
+            "then comment `/review inline`"
+        )
+
+
 def resolve_review_base(
     metadata: dict,
     repository: str,
@@ -35,8 +48,9 @@ def resolve_review_base(
     Use the GitHub base when it contains the inherited parent head, or when both it and
     the child inherit the parent's merge result, including after squash merges.
 
-    Raise ValueError for ambiguous descriptions, empty scopes, divergent parent/child
-    histories, or a base-branch merge that would inflate the scoped diff.
+    Raise AmbiguousStackRange for divergent parent/child histories or a base-branch merge
+    that would inflate the PR change patch. Invalid descriptions and empty review ranges
+    raise ValueError.
     API failures propagate instead of widening the review. The declared parent
     relationship remains author supplied; ancestry cannot establish its completeness.
     """
@@ -91,7 +105,8 @@ def resolve_review_base(
     if review_base == head_sha:
         raise ValueError("no child changes remain after the stack parent")
     if parent_comparison["status"] != "ahead" or review_base != parent_head:
-        raise ValueError(
+        raise AmbiguousStackRange(
+            int(parent_number),
             "stack parent and child histories have diverged; sync the stack before reviewing"
         )
     boundary_fork = compare(github_base, review_base)["merge_base_commit"]["sha"]
@@ -102,7 +117,8 @@ def resolve_review_base(
         return github_base
     head_fork = compare(github_base, head_sha)["merge_base_commit"]["sha"]
     if head_fork != boundary_fork:
-        raise ValueError(
+        raise AmbiguousStackRange(
+            int(parent_number),
             "child merged base-branch changes absent from its parent; refresh the stack"
         )
     _LOG.info("Review scope: inherited parent PR #%s head %s", parent_number, review_base)
@@ -174,11 +190,25 @@ def _main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--metadata", type=Path, required=True)
     parser.add_argument("--repository", required=True)
+    parser.add_argument(
+        "--outcome", type=Path, help="Write ambiguous-ancestry diagnostics for the repair comment"
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     try:
         metadata = json.loads(args.metadata.read_text())
         review_base = resolve_review_base(metadata, args.repository, _github_json)
+    except AmbiguousStackRange as error:
+        if args.outcome:
+            args.outcome.write_text(json.dumps({
+                "outcome": "ambiguous_ancestry",
+                "pr_number": metadata["number"],
+                "head_sha": metadata["head"]["sha"],
+                "parent_number": error.parent_number,
+                "reason": error.reason,
+                "suggested_fix": error.suggested_fix,
+            }, indent=2) + "\n")
+        raise SystemExit(f"Cannot resolve PR review scope: {error}") from error
     except (KeyError, TypeError, ValueError, subprocess.CalledProcessError) as error:
         raise SystemExit(f"Cannot resolve PR review scope: {error}") from error
     print(review_base)

@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -134,14 +135,16 @@ class ReviewScopeTest(unittest.TestCase):
         self.responses[f"repos/{REPOSITORY}/compare/{ADVANCED}...{HEAD}"] = _comparison(
             PARENT, "diverged"
         )
-        with self.assertRaisesRegex(ValueError, "diverged.*sync"):
+        with self.assertRaisesRegex(self.module.AmbiguousStackRange, "diverged.*sync") as raised:
             self.resolve(_stack_body(f"[parent]({PR_URL}/1)"))
+        self.assertEqual(raised.exception.parent_number, 1)
+        self.assertIn("/review inline", raised.exception.suggested_fix)
 
     def test_child_merging_main_without_parent_stops_inflated_scope(self) -> None:
         self.responses[f"repos/{REPOSITORY}/compare/{GITHUB_BASE}...{HEAD}"] = _comparison(
             MERGE, "diverged"
         )
-        with self.assertRaisesRegex(ValueError, "base-branch changes"):
+        with self.assertRaisesRegex(self.module.AmbiguousStackRange, "base-branch changes"):
             self.resolve(_stack_body(f"[parent]({PR_URL}/1)"))
 
     def test_squash_merged_parent_is_excluded_until_merge_result_is_inherited(self) -> None:
@@ -514,6 +517,168 @@ class ReviewScopeTest(unittest.TestCase):
                         self.assertNotIn("+ancestor_change();", prompt)
                 self.assertIn("+ancestor_change();", (temp / "github_pr_diff.txt").read_text())
 
+    def test_workflow_only_notifies_for_typed_ancestry_failures_and_reuses_same_sha(self) -> None:
+        repo_root = Path(__file__).resolve().parents[3]
+        workflow = yaml.safe_load((repo_root / ".github/workflows/ai-review.yml").read_text())
+        steps = {
+            step.get("name"): step
+            for job in workflow["jobs"].values() for step in job["steps"]
+        }
+        context = steps["Collect PR data and build reviewer tasks"]["run"]
+        context = "read -r base_sha" + context.split("read -r base_sha", 1)[1]
+        notify = steps["Publish ambiguous stack guidance"]
+        retain = steps["Retain ambiguous ancestry outcome"]
+        check = steps["Publish non-blocking PR check"]
+        for step in (notify, retain):
+            self.assertIn("always()", step["if"])
+            self.assertIn("scope_outcome == 'ambiguous_ancestry'", step["if"])
+        self.assertIn("review_scope_outcome.json", retain["with"]["path"])
+        for name in ("Run AI review", "Materialize PR source reference"):
+            self.assertNotIn("always()", steps[name]["if"])
+        run_url = f"https://github.com/{REPOSITORY}/actions/runs/1"
+        parent_body = _stack_body(f"[parent]({PR_URL}/1)", PARENT)
+        for scenario in ("rewritten", "base_merge", "empty", "invalid", "api_failure", "merged"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                responses = json.loads(json.dumps(self.responses))
+                if scenario == "rewritten":
+                    responses[f"repos/{REPOSITORY}/compare/{PARENT}...{HEAD}"] = _comparison(
+                        FORK, "diverged"
+                    )
+                elif scenario == "base_merge":
+                    responses[f"repos/{REPOSITORY}/compare/{GITHUB_BASE}...{HEAD}"] = _comparison(
+                        MERGE, "diverged"
+                    )
+                elif scenario == "empty":
+                    responses[f"repos/{REPOSITORY}/compare/{PARENT}...{HEAD}"] = _comparison(
+                        HEAD, "behind"
+                    )
+                elif scenario == "merged":
+                    responses[f"repos/{REPOSITORY}/pulls/1"].update(
+                        merged_at="2026-11-21T00:00:00Z", merge_commit_sha=MERGE
+                    )
+                    responses[f"repos/{REPOSITORY}/compare/{GITHUB_BASE}...{PARENT}"] = _comparison(
+                        PARENT, "behind"
+                    )
+                (root / "responses.json").write_text(json.dumps(responses))
+                (root / "pr_meta.json").write_text(json.dumps(_metadata(
+                    _stack_body("unlinked parent") if scenario == "invalid" else parent_body
+                )))
+                for name, contents in (
+                    ("pr_history.json", "{}"), ("pr_review_comments.json", "[]"),
+                ):
+                    (root / name).write_text(contents)
+                (root / "github-output").touch()
+                (root / "python3").symlink_to(sys.executable)
+                guidance = root / "guidance"
+                guidance.mkdir()
+                (guidance / "AGENTS.md").write_text("Project rules.\n")
+                gh = root / "gh"
+                gh.write_text(f"#!{sys.executable}\n" + textwrap.dedent("""\
+                    import json, os, pathlib, sys
+                    root = pathlib.Path(os.environ['TEST_ROOT'])
+                    endpoint = next(arg for arg in sys.argv if arg.startswith('repos/'))
+                    method = 'GET'
+                    if '--method' in sys.argv:
+                        method = sys.argv[sys.argv.index('--method') + 1]
+                    with (root / 'api-calls').open('a') as calls:
+                        suffix = ' DIFF' if '-H' in sys.argv else ''
+                        calls.write(method + ' ' + endpoint + suffix + '\\n')
+                    if os.environ['SCENARIO'] == 'api_failure':
+                        raise SystemExit(1)
+                    if '/issues/' in endpoint:
+                        comments_file = root / 'comments.json'
+                        comments = []
+                        if comments_file.exists():
+                            comments = json.loads(comments_file.read_text())
+                        if method == 'POST':
+                            comment = json.load(sys.stdin)
+                            comment.update(
+                                id=1, user={'login': 'github-actions[bot]', 'type': 'Bot'},
+                                html_url='https://github.com/example/project/pull/2#issuecomment-1',
+                            )
+                            comments.append(comment)
+                            comments_file.write_text(json.dumps(comments))
+                            print(json.dumps(comment))
+                        elif method == 'PATCH':
+                            comments[0].update(json.load(sys.stdin))
+                            comments_file.write_text(json.dumps(comments))
+                            print(json.dumps(comments[0]))
+                        else:
+                            print(json.dumps(comments))
+                    elif method == 'POST':
+                        print('{}')
+                    elif '-H' in sys.argv:
+                        print('diff --git a/child.rs b/child.rs\\n'
+                              '--- a/child.rs\\n+++ b/child.rs\\n'
+                              '@@ -0,0 +1 @@\\n+child_change();\\n')
+                    else:
+                        responses = json.loads((root / 'responses.json').read_text())
+                        print(json.dumps(responses[endpoint]))
+                    """))
+                gh.chmod(0o700)
+                env = {
+                    **os.environ, "PATH": f"{root}:{os.environ['PATH']}", "TEST_ROOT": str(root),
+                    "SCENARIO": scenario, "GITHUB_OUTPUT": str(root / "github-output"),
+                    "OUTPUT_MODE": "inline", "GUIDANCE_SOURCE_ROOT": str(guidance),
+                    "GITHUB_SHA": GITHUB_BASE, "REPO": REPOSITORY, "RUN_URL": run_url,
+                    "HEAD_SHA": HEAD, "PR_NUMBER": "2", "BOT_TOKEN": "", "REVIEW_READY": "false",
+                    "REVIEW_ATTEMPTED": "false", "SCOPE_OUTCOME": "",
+                }
+
+                def run(script):
+                    return subprocess.run(
+                        ["bash", "-euo", "pipefail", "-c", script.replace("/tmp/", f"{root}/")],
+                        cwd=repo_root, env=env, capture_output=True, text=True,
+                    )
+
+                for attempt in range(2 if scenario in {"rewritten", "base_merge"} else 1):
+                    env["RUN_URL"] = run_url.rsplit("/", 1)[0] + f"/{attempt + 1}"
+                    result = run(context)
+                    output = (root / "github-output").read_text()
+                    if scenario == "merged":
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertIn(f"review_base_sha={GITHUB_BASE}", output)
+                        self.assertIn("review_marker=", output)
+                        self.assertTrue((root / "orchestrator_task.md").exists())
+                        break
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn("review_marker=", output)
+                    self.assertFalse((root / "orchestrator_task.md").exists())
+                    outcome_file = root / "review_scope_outcome.json"
+                    if scenario not in {"rewritten", "base_merge"}:
+                        self.assertFalse(outcome_file.exists())
+                        self.assertNotIn("scope_outcome=", output)
+                        self.assertFalse((root / "comments.json").exists())
+                        break
+                    self.assertIn("scope_outcome=ambiguous_ancestry", output)
+                    record = json.loads(outcome_file.read_text())
+                    self.assertEqual(record["pr_number"], 2)
+                    self.assertEqual(record["parent_number"], 1)
+                    self.assertEqual(record["head_sha"], HEAD)
+                    self.assertTrue(record["reason"])
+                    self.assertIn("/review inline", record["suggested_fix"])
+                    guidance_result = run(notify["run"])
+                    self.assertEqual(guidance_result.returncode, 0, guidance_result.stderr)
+                    record = json.loads(outcome_file.read_text())
+                    self.assertEqual(record["run_url"], env["RUN_URL"])
+                    self.assertTrue(record["comment_url"])
+                    env["SCOPE_OUTCOME"] = "ambiguous_ancestry"
+                    check_result = run(check["run"])
+                    self.assertEqual(check_result.returncode, 0, check_result.stderr)
+                    payload = json.loads((root / "check-run.json").read_text())
+                    self.assertEqual(payload["conclusion"], "neutral")
+                    comments = json.loads((root / "comments.json").read_text())
+                    self.assertEqual(len(comments), 1)
+                    comment_text = comments[0]["body"].split("\n", 1)[1]
+                    self.assertEqual(payload["output"]["summary"], comment_text)
+                    self.assertIn("**AI review did not run.**", comment_text)
+                    self.assertNotIn("## AI Review", comment_text)
+                calls = (root / "api-calls").read_text() if (root / "api-calls").exists() else ""
+                if scenario != "merged":
+                    self.assertNotIn(" DIFF", calls)
+                    self.assertNotIn("/pulls/2/reviews", calls)
+
 
 class GitReviewScopeTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -582,8 +747,14 @@ class GitReviewScopeTest(unittest.TestCase):
                 self.assertEqual(
                     self.git("diff", "--name-only", f"{original}...{child}"), "child.py"
                 )
-                with self.assertRaisesRegex(ValueError, "diverged.*sync"):
+                with self.assertRaisesRegex(
+                    self.module.AmbiguousStackRange, "diverged.*sync"
+                ) as raised:
                     self.module.resolve_review_base(metadata, REPOSITORY, self.get_json)
+                self.assertEqual(raised.exception.parent_number, 1)
+                self.assertIn(
+                    "this PR's branch onto PR #1's current head", raised.exception.suggested_fix
+                )
 
     def test_merge_commit_parent_uses_github_base_before_child_sync(self) -> None:
         parent_files = {**self.grandparent_files, "parent.py": "parent\n"}
