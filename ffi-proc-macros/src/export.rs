@@ -61,13 +61,13 @@ pub(super) fn expand(args: TokenStream, item: TokenStream) -> Result<TokenStream
         return Err(Error::new_spanned(result, "expected `ExternResult<T>`"));
     }
     let body = &function.block;
-    let retained = Ident::new("__ffi_allocator", Span::mixed_site());
+    let error_allocator = Ident::new("__ffi_allocator", Span::mixed_site());
     let caught = Ident::new("__ffi_result", Span::mixed_site());
     let catch = quote_spanned!(signature.ident.span() => crate::panic::catch_panic(|| #body));
     function.block = syn::parse2(quote!({
-        let #retained = #allocator;
+        let #error_allocator = #allocator;
         let #caught = #catch;
-        unsafe { crate::error::IntoExternResult::into_extern_result(#caught, &#retained) }
+        unsafe { crate::error::IntoExternResult::into_extern_result(#caught, &#error_allocator) }
     }))?;
     Ok(quote!(#function))
 }
