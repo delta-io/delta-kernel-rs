@@ -1,0 +1,38 @@
+# Optional label-driven merge requests; CONTRIBUTING.md owns usage and description finality.
+# pull_request_target has a write-capable token for fork PRs. Execute only trusted main code,
+# never the PR head.
+name: Automerge
+
+on:
+  pull_request_target:
+    types: [labeled, unlabeled]
+
+permissions: {}
+
+concurrency:
+  # Let in-flight mutations finish; each run reconciles live label state.
+  group: automerge-${{ github.event.pull_request.number }}-${{ github.event.label.name }}
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    if: github.event.label.name == 'automerge'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+      - name: Reconcile merge request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: python3 .github/scripts/automerge.py --repository "$REPO" --pr "$PR_NUMBER"

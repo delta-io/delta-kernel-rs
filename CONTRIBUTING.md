@@ -137,6 +137,29 @@ Examples:
 - new feature PR: "feat: new API for snapshot.update()"
 - bugfix PR: "fix: correctly apply DV in read-table example"
 
+#### Merging with the `automerge` label
+
+Maintainers can optionally apply `automerge` to request merging into `main` once required checks
+and reviews pass. Only applications by someone with write access count. Removing the label
+cancels pending waiting or queue membership where GitHub still allows it; a merge already in
+progress cannot be stopped.
+
+Before requesting the merge, the workflow removes one supported leading `git stack` block from
+the description, which becomes the squash commit message. The block must start with the exact
+`## 🥞 Stacked PR` heading, standard introduction, linked stack rows, and the `---------` rule; see
+[`stack_description.py`](.github/scripts/stack_description.py) for the accepted syntax.
+Unsupported variants stay unchanged and do not block merging, so stack text may remain in the
+commit message. The workflow also keeps the block if removing it could change the AI review base
+at the inspected commits.
+
+Applying the label declares the description final. While the label is present, do not edit the
+description or run `git stack` on the PR: the workflow replaces the whole description from the
+copy it read, so concurrent edits can be lost. To edit, remove the label, wait for the `Automerge`
+run to finish, confirm the PR is no longer waiting or queued, then edit and reapply the label.
+
+If `Automerge` reports an error, fix the cause, then remove and reapply the label. A failed
+description write stops the merge request. The workflow does not re-arm a request GitHub drops.
+
 #### PR Testing
 
 Please make sure to add test cases that check the changes thoroughly including negative and positive cases if possible.
