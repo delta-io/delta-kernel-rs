@@ -4,7 +4,7 @@ mod test_utils;
 
 use precommit::{
     AddFileFieldsCheck, AppendOnlyCheck, CheckList, ClusteringStatsCheck, NumRecordsCheck,
-    RemoveFileFieldsCheck,
+    PartitionValuesCheck, RemoveFileFieldsCheck,
 };
 
 use super::{CommitResult, Declarative, Transaction, UpdateTable};
@@ -73,6 +73,9 @@ impl<S> Transaction<S, Declarative> {
         let mut checks: CheckList = vec![
             Box::new(AddFileFieldsCheck),
             Box::new(RemoveFileFieldsCheck),
+            Box::new(PartitionValuesCheck::new(
+                self.effective_table_config.physical_partition_columns(),
+            )?),
         ];
 
         if self.data_change
@@ -156,8 +159,10 @@ mod tests {
     use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
     use crate::engine::sync::plan::SyncPlanExecutor;
+    use crate::expressions::{MapData, Scalar};
+    use crate::plans::PlanBuilder;
     use crate::scan::scan_row_schema;
-    use crate::schema::{ToSchema, schema_ref};
+    use crate::schema::{DataType, MapType, ToSchema, schema_ref};
     use crate::transaction::UpdateTableOperation;
     use crate::transaction::create_table::create_table;
     use crate::transaction::data_layout::DataLayout;
@@ -197,7 +202,7 @@ mod tests {
         .with_execution_mode::<Declarative>()
         .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()))?;
         let checks = txn.file_action_checks()?;
-        let mut expected = vec!["add_fields", "remove_fields"];
+        let mut expected = vec!["add_fields", "remove_fields", "add_partition_values"];
         if append_only && data_change {
             expected.push("append_only_no_removes");
         }
@@ -237,7 +242,7 @@ mod tests {
         .with_data_layout(layout)
         .with_execution_mode::<Declarative>()
         .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()))?;
-        let mut expected = vec!["add_fields", "remove_fields"];
+        let mut expected = vec!["add_fields", "remove_fields", "add_partition_values"];
         if !columns.is_empty() {
             expected.push("add_clustering_stats");
         }
@@ -257,6 +262,72 @@ mod tests {
             &checks,
             txn.stats_schema()?.as_ref(),
         )?;
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::no_mapping_logical_key("none", false, true)]
+    #[case::name_mapping_physical_key("name", true, true)]
+    #[case::name_mapping_logical_key("name", false, false)]
+    fn partition_values_check_uses_physical_partition_columns(
+        #[case] column_mapping: &str,
+        #[case] use_physical_key: bool,
+        #[case] is_valid: bool,
+    ) -> Result<()> {
+        let tempdir = tempfile::tempdir().map_err(KernelError::from)?;
+        let mut txn = create_table(
+            tempdir.path().to_string_lossy(),
+            schema_ref! { nullable "id": LONG, nullable "part": STRING },
+            "test-engine",
+            true,
+        )
+        .with_table_properties([("delta.columnMapping.mode", column_mapping)])
+        .with_data_layout(DataLayout::partitioned(["part"]))
+        .with_execution_mode::<Declarative>()
+        .build(&SyncEngine::new(), Box::new(FileSystemCommitter::new()))?;
+        let physical_columns: Vec<String> = txn
+            .effective_table_config
+            .physical_partition_columns()
+            .collect();
+        let key = if use_physical_key {
+            physical_columns[0].clone()
+        } else {
+            "part".to_owned()
+        };
+        let stats_schema = txn.stats_schema()?;
+        let partition_values = MapData::try_new(
+            MapType::new(DataType::STRING, DataType::STRING, true),
+            [(key, "a")],
+        )?;
+        let adds = PlanBuilder::values(
+            schema_ref! {
+                nullable "path": STRING,
+                nullable "partitionValues": { STRING => nullable STRING },
+                nullable "size": LONG,
+                nullable "modificationTime": LONG,
+                nullable "stats": (stats_schema.clone()),
+            },
+            vec![vec![
+                "part".into(),
+                Scalar::Map(partition_values),
+                1i64.into(),
+                1i64.into(),
+                Scalar::Null(DataType::from(stats_schema)),
+            ]],
+        )?
+        .build()?;
+        let executor = SyncPlanExecutor::default().get_scoped();
+        txn.add_files_ref(executor.execute_and_retain("adds", adds)?);
+        let result = txn.validate_file_actions(&executor);
+        if is_valid {
+            result?;
+        } else {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error, KernelError::InvalidPartitionValues(_)),
+                "{error}"
+            );
+        }
         Ok(())
     }
 

@@ -330,6 +330,85 @@ impl StagedDataCheck for ClusteringStatsCheck {
     }
 }
 
+/// Requires every staged add to have a non-null `partitionValues` map whose keys are exactly the
+/// table's physical partition columns. A key with a NULL value still counts as present.
+/// The materialized error contains the add `path` and the number of map entries, which is null
+/// when the map is null.
+pub(in crate::transaction::declarative) struct PartitionValuesCheck {
+    columns: Vec<String>,
+    num_columns: i32,
+}
+
+/// The failing file and the number of entries in its `partitionValues` map.
+#[derive(ToSchema, TryFromStructData)]
+pub(in crate::transaction::declarative) struct PartitionValuesError {
+    path: Option<String>,
+    num_keys: Option<i32>,
+}
+
+impl PartitionValuesCheck {
+    /// Creates a check for the table's physical partition column names, which may be empty.
+    pub(in crate::transaction::declarative) fn new(
+        columns: impl IntoIterator<Item = String>,
+    ) -> KernelResult<Self> {
+        let columns: Vec<String> = columns.into_iter().collect();
+        let num_columns = i32::try_from(columns.len()).map_err(|_| {
+            KernelError::internal_error(
+                "Too many partition columns for partition values validation",
+            )
+        })?;
+        Ok(Self {
+            columns,
+            num_columns,
+        })
+    }
+}
+
+impl StagedDataCheck for PartitionValuesCheck {
+    type ErrorInfo = PartitionValuesError;
+
+    const NAME: &'static str = "add_partition_values";
+
+    fn project_error(&self) -> Expression {
+        // A map with exactly N entries that contains all N expected keys has no other keys. The
+        // explicit null test comes first because MAP_LEN and MAP_HAS_KEY yield NULL for a null
+        // map. For a non-null map and non-null keys, both yield non-null results.
+        let partition_values = || col!("add.partitionValues");
+        let mut mismatches = vec![
+            Predicate::is_null(partition_values()),
+            Predicate::ne(partition_values().map_len(), lit(self.num_columns)),
+        ];
+        for column in &self.columns {
+            mismatches.push(Predicate::not(Predicate::map_has_key(
+                partition_values(),
+                lit(column.as_str()),
+            )));
+        }
+        let is_failed = Predicate::and(
+            Predicate::is_not_null(col!("add")),
+            Predicate::or_from(mismatches),
+        );
+        Expression::struct_with_nullability_from(
+            [col!("add.path"), partition_values().map_len()],
+            Expression::from(is_failed),
+        )
+    }
+
+    fn build_error(&self, sample: PartitionValuesError) -> KernelResult<KernelError> {
+        let context = file_context(sample.path.as_deref());
+        let Some(num_keys) = sample.num_keys else {
+            return Ok(KernelError::invalid_transaction_state(format!(
+                "AddFile {context} is missing required field 'partitionValues'"
+            )));
+        };
+        Ok(KernelError::invalid_partition_values(format!(
+            "AddFile {context} has {num_keys} partitionValues keys that do not match the table's \
+             physical partition columns [{}]",
+            self.columns.join(", ")
+        )))
+    }
+}
+
 fn file_context(path: Option<&str>) -> String {
     path.map(|p| format!("for '{p}'"))
         .unwrap_or_else(|| "with missing path".to_owned())

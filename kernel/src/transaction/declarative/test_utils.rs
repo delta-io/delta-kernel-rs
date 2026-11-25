@@ -4,9 +4,9 @@ use crate::KernelResult;
 use crate::arrow::array::RecordBatch;
 use crate::engine::arrow_data::{EngineDataArrowExt, fix_nested_null_masks};
 use crate::engine::sync::plan::ScopedSyncPlanExecutor;
-use crate::expressions::{Expression, Scalar, StructData, col, lit};
+use crate::expressions::{Expression, MapData, Scalar, StructData, col, lit};
 use crate::plans::{Operation, PlanBuilder, PlanExecutor, RelationRef};
-use crate::schema::{DataType, SchemaRef, lazy_schema_ref, schema_ref};
+use crate::schema::{DataType, MapType, SchemaRef, lazy_schema_ref, schema_ref};
 
 /// Table-specific statistics schema used by the staged-action fixtures.
 pub(super) static STATS_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
@@ -16,12 +16,17 @@ pub(super) static STATS_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     nullable "maxValues": { nullable "physical.id": LONG },
 };
 
-/// Metadata actions accepted by the shared staged-relation fixtures.
+/// Partition values of an add, where `None` is a null map.
+pub(super) type PartitionValues = Option<&'static [(&'static str, Option<&'static str>)]>;
+
+/// Metadata actions accepted by the shared staged-relation fixtures. Adds other than
+/// `AddWithPartitionValues` have an empty `partitionValues` map.
 #[derive(Debug)]
 pub(super) enum StagedAction {
     Add(Option<&'static str>, Option<i64>, Option<i64>),
     Remove(Option<&'static str>, Option<i64>),
     AddWithStats(&'static str, Stats),
+    AddWithPartitionValues(&'static str, PartitionValues),
 }
 
 /// Statistics for the physical column named `physical.id`; `null_parent` masks the stats struct.
@@ -41,6 +46,10 @@ pub(super) fn make_ref(
 ) -> KernelResult<RelationRef> {
     let (name, input) = match action {
         StagedAction::Add(path, size, modified) => ("adds", fields_input(*path, *size, *modified)?),
+        StagedAction::AddWithPartitionValues(path, partition_values) => (
+            "adds",
+            add_input(Some(path), Some(1), Some(1), *partition_values)?,
+        ),
         StagedAction::Remove(path, size) => (
             "removes",
             PlanBuilder::values(
@@ -65,19 +74,23 @@ pub(super) fn make_ref(
                     leaf(stats.max)?,
                 ],
             )?);
-            let schema = schema_ref! {
-                nullable "path": STRING, nullable "size": LONG, nullable "modificationTime": LONG,
-                nullable "stats": (stats_schema),
-            };
+            let schema = add_schema();
             let mut input = PlanBuilder::values(
                 schema.clone(),
-                vec![vec![(*path).into(), 1i64.into(), 1i64.into(), values]],
+                vec![vec![
+                    (*path).into(),
+                    partition_values_scalar(Some(&[]))?,
+                    1i64.into(),
+                    1i64.into(),
+                    values,
+                ]],
             )?;
             if stats.null_parent {
                 // Exercise populated child buffers under a null parent.
                 input = input.project(
                     Expression::struct_from([
                         col!("path"),
+                        col!("partitionValues"),
                         col!("size"),
                         col!("modificationTime"),
                         Expression::struct_with_nullability_from(
@@ -108,24 +121,51 @@ pub(super) fn make_ref(
     executor.create_ref(name, schema, batch)
 }
 
-/// Builds a single metadata row with the supplied optional field values.
+/// Builds a single metadata row with the supplied optional field values and an empty
+/// `partitionValues` map.
 pub(super) fn fields_input(
     path: Option<&str>,
     size: Option<i64>,
     modified: Option<i64>,
 ) -> KernelResult<PlanBuilder> {
+    add_input(path, size, modified, Some(&[]))
+}
+
+fn add_input(
+    path: Option<&str>,
+    size: Option<i64>,
+    modified: Option<i64>,
+    partition_values: PartitionValues,
+) -> KernelResult<PlanBuilder> {
     PlanBuilder::values(
-        schema_ref! {
-            nullable "path": STRING, nullable "size": LONG, nullable "modificationTime": LONG,
-            nullable "stats": (STATS_SCHEMA.clone()),
-        },
+        add_schema(),
         vec![vec![
             string(path),
+            partition_values_scalar(partition_values)?,
             long(size),
             long(modified),
             Scalar::Null(DataType::from(STATS_SCHEMA.clone())),
         ]],
     )
+}
+
+fn add_schema() -> SchemaRef {
+    schema_ref! {
+        nullable "path": STRING,
+        nullable "partitionValues": { STRING => nullable STRING },
+        nullable "size": LONG,
+        nullable "modificationTime": LONG,
+        nullable "stats": (STATS_SCHEMA.clone()),
+    }
+}
+
+fn partition_values_scalar(partition_values: PartitionValues) -> KernelResult<Scalar> {
+    let map_type = MapType::new(DataType::STRING, DataType::STRING, true);
+    let Some(entries) = partition_values else {
+        return Ok(Scalar::Null(map_type.into()));
+    };
+    let pairs = entries.iter().map(|(key, value)| (*key, string(*value)));
+    Ok(Scalar::Map(MapData::try_new(map_type, pairs)?))
 }
 
 fn string(value: Option<&str>) -> Scalar {
