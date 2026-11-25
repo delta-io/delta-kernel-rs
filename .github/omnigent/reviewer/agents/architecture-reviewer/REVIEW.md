@@ -67,3 +67,5 @@ or two of them is an opinion:
    visibility; cite the sibling you found, or say you looked and found none.
 
 ${ci_environment}
+
+${candidate_results}

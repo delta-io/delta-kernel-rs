@@ -375,6 +375,56 @@ PR change patch and shared PR task text with seven-day retention.
 | `/tmp/review_output_complete.txt` | Publication step | Summary, artifact and Check Run outputs include all parsed final findings. |
 | `/tmp/check-summary.txt` | Publication step or diagnostic path | Check Run step reads the full report and posting results, resolver error or generic unavailable message. |
 
+## Reviewer task results and candidate-finding tracking
+
+All configured primary reviewers run. A specialist with no applicable concern returns an
+explicit empty candidate-finding list. Each proposed concern receives a reviewer-local ID such
+as `C1`, where `C` means candidate. `docs-reviewer/C1` and `maintainer-codex-reviewer/C1` identify
+different concerns. This pair lets Python check that no proposed concern disappeared when the
+orchestrator combined reviewers' results.
+
+The orchestrator sends all proposed Blocker and Should Fix findings in one checker batch, as
+required by its instructions. Each reviewer/ID pair receives a distinct batch ID such as `check1`.
+`disprove-reviewer` returns a decision for every batch ID. There are zero checker batches when
+no Blocker or Should Fix was proposed, otherwise one batch for the complete set. Nits bypass
+this checker task. A checker decision of `CONFIRMED` concerns the claim; it does not confirm
+that a GitHub comment was posted.
+
+The orchestrator returns a candidate-to-final mapping for every proposed concern, including Nits:
+`retained` keeps it, `downgraded` lowers its severity, `merged` combines it with another concern,
+and `dropped` removes it with a reason. The other outcomes name a final finding ID. For example,
+`docs-reviewer/C1` and `maintainer-codex-reviewer/C1` can both map to `ShouldFix1`, with a reason
+explaining the combination. Python then posts or reuses one comment and counts one final finding.
+
+[`observe_review()`](../review_evidence.py) records Omnigent session-dispatch and task-result
+events without modifying the tool calls. A **reviewer attempt** is a dispatched task; retries
+remain separate attempts. A **reviewer task result** is the response Omnigent delivers for a
+child session. The observer records when it receives the event, not the reviewer's actual
+execution end time. An empty inbox, the overall process exit, or the orchestrator saying
+"everyone finished" cannot substitute for that result.
+
+[`build_evidence()`](../review_evidence.py) matches task results to accepted child-session IDs
+and reviewer roles. It checks that each candidate finding has the required checker decision,
+final-finding mapping and confirmed comment URL, or an explicit summary/artifact report output.
+Missing or conflicting events, mappings or comment results leave the record incomplete. The
+orchestrator can still return useful advice after the minimum reviewer quorum described in
+[`REVIEW.md`](REVIEW.md) completes; that does not make the execution record complete.
+
+| Runner file | Writer and purpose | Where maintainers read the result |
+|---|---|---|
+| `/tmp/review_observations.jsonl` | `observe_review` appends filtered child-session event metadata. | Combined into the execution record; raw model prose is discarded. |
+| `/tmp/review_accounting.json` | The workflow extracts the orchestrator's candidate-to-final mapping. | The execution record includes each proposed concern's outcome. |
+| `/tmp/publication_record.json` | `finding_publication.py` records finding-comment URLs and posting errors. | Finding links appear in the Check Run and execution record. Artifact mode also uploads this file. |
+| `/tmp/review_execution.json` | `review_evidence.py` combines attempts, checker decisions, finding mappings and comment results. | Downloadable execution artifact on the Actions run, retained for seven days. |
+| `/tmp/check-summary.txt` | Python appends reviewer-attempt and candidate-finding tables to the full review. | `AI Review Summary` in the PR's Checks tab. Its GitHub conclusion stays `neutral`. |
+
+The execution artifact excludes full model responses, environment values and tool payloads.
+[`history_evidence()`](../review_history.py) separately records trusted earlier Blockers and the
+commits they reviewed. Failed history requests, missing pages, clipped text or unknown Blocker
+origins leave history incomplete. Finding an earlier concern does not establish that it still
+applies to a different commit.
+
+
 ### Finding comments and confirmed comment URLs
 
 With `FINDING_PLACEMENT=inline-or-conversation`, the workflow's `inline` mode attaches each final
@@ -448,6 +498,7 @@ and a `REVIEW.md` names it with a placeholder line. The line `${review_rules}` s
 | `${pr_description}` | PR description accuracy | The orchestrator and `docs-reviewer` |
 | `${maintainer}` | The maintainer role and review criteria | Both maintainer reviewers |
 | `${ci_environment}` | CI restrictions | Every subagent except `disprove-reviewer` |
+| `${candidate_results}` | Explicit candidate IDs and severities, including empty returns | Every primary reviewer |
 
 For example, `agents/docs-reviewer/REVIEW.md` reads:
 
@@ -494,10 +545,10 @@ in place of the checked-out directory. To inspect a role's expanded instructions
    file first. Omnigent then starts the subagent with its instructions and that task. A missing
    assignment or file denies the dispatch.
 
-`config.yaml` lists the hook after the two policies that guard dispatches: the cap on dispatches
-per turn and the check that each dispatch declares a purpose. Omnigent passes a rewritten dispatch
-to later policies without its tool name, so a policy listed after the hook would not recognize the
-dispatch and would allow it.
+`config.yaml` checks the per-turn dispatch limit and purpose, records the original dispatch,
+then appends the child task body. The observer returns only ALLOW and cannot rewrite arguments
+or bypass either guard. Omnigent passes a rewritten dispatch to later policies without its tool
+name, so the appending hook remains last.
 
 ## Project guidance
 
