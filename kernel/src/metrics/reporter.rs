@@ -362,12 +362,14 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case(None, CrcReadFailureReason::Error)]
+    #[case(None, CrcReadFailureReason::Unknown)]
     #[case(Some("not_found"), CrcReadFailureReason::NotFound)]
     #[case(Some("empty"), CrcReadFailureReason::Empty)]
     #[case(Some("parsing"), CrcReadFailureReason::Parsing)]
     #[case(Some("error"), CrcReadFailureReason::Error)]
     #[case(Some("cancelled"), CrcReadFailureReason::Cancelled)]
+    #[case(Some("unknown"), CrcReadFailureReason::Unknown)]
+    #[case(Some("future_reason"), CrcReadFailureReason::Unknown)]
     fn crc_failure_preserves_recorded_reason(
         #[case] label: Option<&str>,
         #[case] expected: CrcReadFailureReason,
@@ -375,18 +377,23 @@ mod tests {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
         {
-            let span = info_span!("crc_read_completed", report = Empty, failure_reason = Empty);
+            let span = info_span!(
+                "crc_read_completed",
+                report = Empty,
+                bytes_read = Empty,
+                failure_reason = Empty
+            );
             let _entered = span.enter();
             if let Some(label) = label {
                 span.record("failure_reason", label);
-                let static_label: &'static str = expected.into();
-                assert_eq!(static_label, label);
             }
             info!(
                 failure_reason = "wrong",
                 "log fields must not overwrite metric fields"
             );
             info!(error = %"injected error");
+            span.record("bytes_read", 100_u64);
+            span.record("failure_reason", false);
         }
         let events = reporter.events();
         let [MetricEvent::CrcReadFailure(event)] = events.as_slice() else {
@@ -394,8 +401,35 @@ mod tests {
         };
         assert_eq!(event.reason, expected);
         assert_eq!(
-            event.to_string(),
+            events[0].to_string(),
             format!("CrcReadFailure(reason={expected})")
+        );
+    }
+
+    #[test]
+    fn checkpoint_diagnostic_preserves_creation_fields_and_formats_counts() {
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        {
+            let span = info_span!(
+                "checkpoint_parts_missing",
+                report = Empty,
+                version = 5_u64,
+                expected_parts = 3_u64,
+                found_parts = 0_u64,
+                extra_count = 99_u64,
+                extra_debug = ?"ignored",
+            );
+            let _entered = span.enter();
+            span.record("version", 100_u64);
+            span.record("found_parts", true);
+            info!(error = %"enclosing failure does not change the diagnostic");
+        }
+        let events = reporter.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].to_string(),
+            "CheckpointPartsMissing(version=5, expected_parts=3, found_parts=0)"
         );
     }
 

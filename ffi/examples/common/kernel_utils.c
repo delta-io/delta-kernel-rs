@@ -560,6 +560,7 @@ void print_metric(MetricEvent event) {
     case CrcReadFailureReasonParsing: printf(" Parsing,\n"); break;
     case CrcReadFailureReasonError: printf(" Error,\n"); break;
     case CrcReadFailureReasonCancelled: printf(" Cancelled,\n"); break;
+    case CrcReadFailureReasonUnknown: printf(" Unknown,\n"); break;
     }
     PM_END;
     return;

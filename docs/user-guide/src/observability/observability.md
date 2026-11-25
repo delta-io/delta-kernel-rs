@@ -193,7 +193,6 @@ storage call may serve multiple higher-level operations.
 | `ParquetReadCompleted` | `num_files`, `bytes_read` | One `ParquetHandler::read_parquet_files` call completed. `bytes_read` is the sum of on-disk file sizes. |
 | `CrcReadSuccess` | `duration`, `bytes_read` | One CRC file read and parsed successfully. `bytes_read` is the raw byte count from storage. |
 | `CrcReadFailure` | `reason` | An attempted CRC read failed. The reason distinguishes missing files, empty reads, parsing or validation failures, storage errors, and cancellation. Non-cancellation failures allow log replay. |
-| `CheckpointPartsMissing` | `version`, `expected_parts`, `found_parts` | Checkpoint discovery found missing parts. Snapshot and log-segment completion events report whether fallback succeeded or the operation failed. |
 
 > [!NOTE]
 > If you implement a custom `JsonHandler` or `ParquetHandler`, call
@@ -201,7 +200,12 @@ storage call may serve multiple higher-level operations.
 > `emit_parquet_read_completed` once per read call so connectors that install
 > the metrics layer still see those events from your handler.
 
-### Checkpoint hint reads
+### Checkpoint discovery and hint reads
+
+Use [CheckpointPartsMissing](https://docs.rs/delta_kernel/latest/delta_kernel/metrics/struct.CheckpointPartsMissing.html)
+to diagnose incomplete multipart checkpoints and unusable single-file checkpoint hints. A missing
+classic or V2 hint target reports one expected part and zero found parts. The event has no
+`operation_id`; use snapshot and log-segment completion events to observe whether fallback succeeded.
 
 Use [LastCheckpointReadCompleted](https://docs.rs/delta_kernel/latest/delta_kernel/metrics/struct.LastCheckpointReadCompleted.html)
 to count `_last_checkpoint` read attempts and record their duration by outcome. A missing or invalid

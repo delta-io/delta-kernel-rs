@@ -240,7 +240,7 @@ impl MetricEvent {
             if matches!(self, Self::CrcReadSuccess(_) | Self::CrcReadFailure(_)) {
                 let reason = value.parse::<CrcReadFailureReason>();
                 *self = Self::CrcReadFailure(CrcReadFailure {
-                    reason: reason.unwrap_or(CrcReadFailureReason::Error),
+                    reason: reason.unwrap_or(CrcReadFailureReason::Unknown),
                 });
                 return reason.map(|_| ()).map_err(|_| CrcReadSuccess::SPAN_NAME);
             }
@@ -305,7 +305,7 @@ impl MetricEvent {
             Self::DomainMetadataLoadSuccess(_) => Self::DomainMetadataLoadFailure,
             Self::SetTransactionLoadSuccess(_) => Self::SetTransactionLoadFailure,
             Self::CrcReadSuccess(_) => Self::CrcReadFailure(CrcReadFailure {
-                reason: CrcReadFailureReason::Error,
+                reason: CrcReadFailureReason::Unknown,
             }),
             Self::LastCheckpointReadCompleted(mut e) => {
                 if e.outcome == LastCheckpointReadOutcome::Unknown {
@@ -1515,6 +1515,7 @@ impl fmt::Display for CrcReadSuccess {
 /// Why an attempted CRC read could not provide a usable checksum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, StrumDisplay, AsRefStr, IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
+#[non_exhaustive]
 pub enum CrcReadFailureReason {
     /// Storage reported that the requested CRC file was absent.
     NotFound,
@@ -1522,10 +1523,12 @@ pub enum CrcReadFailureReason {
     Empty,
     /// The file could not be decoded or failed CRC validation.
     Parsing,
-    /// Storage returned another error, or no specific reason was recorded.
+    /// Storage returned another error.
     Error,
     /// The read was cancelled; cancellation propagates instead of falling back.
     Cancelled,
+    /// The reason was not recorded or its metric label was unrecognized.
+    Unknown,
 }
 
 /// An attempted CRC read failed. Non-cancellation failures allow the caller to replay the log.
@@ -1543,11 +1546,14 @@ impl fmt::Display for CrcReadFailure {
     }
 }
 
-/// A checkpoint candidate was unusable because referenced parts were missing.
+/// Checkpoint discovery found missing or empty parts without a usable replacement checkpoint.
 ///
-/// This is a discovery diagnostic, not the outcome of the enclosing snapshot operation. Kernel
-/// may select another checkpoint or replay commits; a hint with no usable checkpoint can fail.
-/// Use log-segment and snapshot completion events to observe the enclosing operation's outcome.
+/// Reports incomplete multipart candidates newer than the selected checkpoint. A file-backed
+/// hint with no usable checkpoint also emits this event; an absent or empty classic or V2 target
+/// reports one expected part and zero found parts. Listings that ignore checkpoints emit nothing.
+///
+/// This event has no `operation_id`. Use log-segment and snapshot completion events to observe
+/// whether fallback succeeded or the enclosing operation failed.
 #[derive(Debug, Clone)]
 pub struct CheckpointPartsMissing {
     /// Version of the incomplete checkpoint.
