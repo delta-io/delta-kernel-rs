@@ -52,6 +52,9 @@ pub(crate) struct LastCheckpointHint {
     pub(crate) num_of_add_files: Option<i64>,
     /// The schema of the checkpoint file.
     pub(crate) checkpoint_schema: Option<SchemaRef>,
+    /// File statuses for the checkpoint, when included by the writer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) checkpoint_files: Option<Vec<CheckpointFileStatus>>,
     /// The checksum of the last checkpoint JSON.
     pub(crate) checksum: Option<String>,
     /// Additional metadata about the last checkpoint.
@@ -91,6 +94,16 @@ pub(crate) struct LastCheckpointHint {
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) amt_checkpoint: Option<AmtCheckpoint>,
+}
+
+/// A checkpoint file status embedded in `_last_checkpoint`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CheckpointFileStatus {
+    pub(crate) path: String,
+    pub(crate) length: i64,
+    pub(crate) is_dir: bool,
+    pub(crate) modification_time: i64,
 }
 
 /// The checkpoint format recorded in a `_last_checkpoint` hint's `checkpointType` field.
@@ -308,6 +321,7 @@ impl LastCheckpointHint {
             size_in_bytes,
             num_of_add_files,
             checkpoint_schema,
+            checkpoint_files: None,
             checksum,
             tags,
             v2_checkpoint,

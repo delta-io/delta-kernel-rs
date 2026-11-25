@@ -25,12 +25,15 @@ use crate::checkpoint::{
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use crate::committer::FileSystemCommitter;
+use crate::engine::DelegatingEngine;
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::sync::SyncEngine;
 use crate::log_replay::HasSelectionVector;
 use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
+#[cfg(feature = "declarative-plans")]
+use crate::plans::{IoOperation, Operation};
 use crate::schema::{DataType as KernelDataType, StructField, schema_ref};
 use crate::table_features::TableFeature;
 use crate::transaction::UpdateTableOperation;
@@ -41,7 +44,48 @@ use crate::unit_test_utils::{
     adaptive_metadata_table_configuration, test_schema_flat_with_column_mapping,
 };
 pub(super) use crate::unit_test_utils::{create_add_action, create_remove_action};
-use crate::{Error, FileMeta, KernelError, KernelResult, LogPath, Result, Snapshot};
+use crate::{Engine, Error, FileMeta, KernelError, KernelResult, LogPath, Result, Snapshot};
+
+fn checkpoint_engine(engine: SyncEngine, declarative: bool) -> DelegatingEngine {
+    let engine = DelegatingEngine::new(Arc::new(engine));
+    if declarative {
+        engine
+    } else {
+        engine.without_plan_executor()
+    }
+}
+
+fn write_single_part_checkpoint(
+    snapshot: &Arc<Snapshot>,
+    engine: &dyn Engine,
+    declarative: bool,
+) -> Result<()> {
+    #[cfg(feature = "declarative-plans")]
+    if declarative {
+        let writer = snapshot.clone().create_checkpoint_writer(engine)?;
+        let executor = engine.require_plan_executor()?;
+        let result = executor.execute_op(Operation::QueryPlan(
+            writer.declarative_checkpoint_plan(engine)?,
+        ))?;
+        let bytes = writer.last_checkpoint_bytes_from_result(result)?;
+        executor
+            .execute_op(Operation::IoOperation(IoOperation::write_bytes(
+                snapshot
+                    .log_segment()
+                    .log_root
+                    .join("_last_checkpoint")
+                    .map_err(KernelError::from)?,
+                bytes.into(),
+                true,
+            )))?
+            .into_unit()?;
+        return Ok(());
+    }
+    #[cfg(not(feature = "declarative-plans"))]
+    let _ = declarative;
+    snapshot.checkpoint(engine, None)?;
+    Ok(())
+}
 
 #[rstest::rstest]
 #[case::default_retention(
@@ -310,13 +354,14 @@ async fn assert_last_checkpoint_contents(
     expected_size_in_bytes: u64,
 ) -> KernelResult<()> {
     let last_checkpoint_data = read_last_checkpoint_file(store).await?;
-    let expected_data = json!({
-        "version": expected_version,
-        "size": expected_size,
-        "sizeInBytes": expected_size_in_bytes,
-        "numOfAddFiles": expected_num_add_files,
-    });
-    assert_eq!(last_checkpoint_data, expected_data);
+    for (name, expected) in [
+        ("version", expected_version),
+        ("size", expected_size),
+        ("sizeInBytes", expected_size_in_bytes),
+        ("numOfAddFiles", expected_num_add_files),
+    ] {
+        assert_eq!(last_checkpoint_data[name], json!(expected), "{name}");
+    }
     Ok(())
 }
 
@@ -741,15 +786,27 @@ fn create_add_action_with_stats(path: &str, num_records: i64) -> Action {
     })
 }
 
+#[rstest::rstest]
+#[case::imperative_v1(false, false)]
+#[case::imperative_v2(true, false)]
+#[cfg_attr(feature = "declarative-plans", case::declarative_v1(false, true))]
+#[cfg_attr(feature = "declarative-plans", case::declarative_v2(true, true))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_snapshot_checkpoint() -> Result<()> {
+async fn test_snapshot_checkpoint(#[case] v2: bool, #[case] declarative: bool) -> Result<()> {
     let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = checkpoint_engine(SyncEngine::new_with_store(store.clone()), declarative);
 
     // Version 0: metadata & protocol
     write_commit_to_store(
         &store,
-        vec![create_metadata_action(), create_basic_protocol_action()],
+        vec![
+            create_metadata_action(),
+            if v2 {
+                create_v2_checkpoint_protocol_action()
+            } else {
+                create_basic_protocol_action()
+            },
+        ],
         0,
     )
     .await?;
@@ -804,16 +861,16 @@ async fn test_snapshot_checkpoint() -> Result<()> {
     let table_root = Url::parse("memory:///").map_err(KernelError::from)?;
     let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
 
-    snapshot.checkpoint(&engine, None)?;
+    write_single_part_checkpoint(&snapshot, &engine, declarative)?;
 
-    // First checkpoint: 1 metadata + 1 protocol + 5 add + 3 remove = 10, numOfAddFiles = 5
+    // First checkpoint: 1 metadata + 1 protocol + 5 adds + 3 removes, plus V2 metadata.
     let checkpoint_path = Path::from("_delta_log/00000000000000000004.checkpoint.parquet");
     let checkpoint_size = store
         .head(&checkpoint_path)
         .await
         .map_err(KernelError::from)?
         .size;
-    assert_last_checkpoint_contents(&store, 4, 10, 5, checkpoint_size).await?;
+    assert_last_checkpoint_contents(&store, 4, 10 + u64::from(v2), 5, checkpoint_size).await?;
 
     // Version 5: add 2 files, remove 1
     write_commit_to_store(
@@ -832,16 +889,16 @@ async fn test_snapshot_checkpoint() -> Result<()> {
 
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
 
-    snapshot.checkpoint(&engine, None)?;
+    write_single_part_checkpoint(&snapshot, &engine, declarative)?;
 
-    // Second checkpoint: 1 metadata + 1 protocol + 7 add + 4 remove = 13, numOfAddFiles = 7
+    // Second checkpoint: 1 metadata + 1 protocol + 7 adds + 4 removes, plus V2 metadata.
     let checkpoint_path = Path::from("_delta_log/00000000000000000006.checkpoint.parquet");
     let checkpoint_size = store
         .head(&checkpoint_path)
         .await
         .map_err(KernelError::from)?
         .size;
-    assert_last_checkpoint_contents(&store, 6, 13, 7, checkpoint_size).await?;
+    assert_last_checkpoint_contents(&store, 6, 13 + u64::from(v2), 7, checkpoint_size).await?;
 
     Ok(())
 }

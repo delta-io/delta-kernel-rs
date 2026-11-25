@@ -573,7 +573,7 @@ mod tests {
 
     #[rstest]
     #[case::struct_only_source(false)]
-    #[case::existing_json_wins(true)]
+    #[case::both_representations(true)]
     #[tokio::test]
     async fn read_adds_only_collations_to_the_ordinary_stats_projection(
         #[case] has_json: bool,
@@ -669,17 +669,20 @@ mod tests {
             let stats_json = actual[0]["add"]["stats"].as_str().unwrap();
             assert_eq!(
                 serde_json::from_str::<Value>(stats_json).map_err(KernelError::from)?,
-                if has_json {
-                    expected.clone()
-                } else {
-                    source_stats
-                }
+                source_stats
             );
-            if has_json {
-                assert_eq!(stats_json, expected.to_string());
-            }
             if parsed {
-                assert_eq!(actual[0]["add"]["stats_parsed"], rows[0]["stats_parsed"]);
+                assert_eq!(
+                    actual[0]["add"]["stats_parsed"],
+                    json!({
+                        "numRecords":2, "minValues":{"indexed":3}, "tightBounds":false,
+                    })
+                );
+                assert!(
+                    actual[0]["add"]["stats_parsed"]
+                        .get(COLLATION_STATS)
+                        .is_none()
+                );
             }
         }
         Ok(())
@@ -832,6 +835,8 @@ mod tests {
             snapshot,
             schema_context,
             read_schema,
+            #[cfg(feature = "declarative-plans")]
+            v2_checkpoint_config: crate::checkpoint::V2CheckpointConfig::NoSidecar,
         })
     }
 
