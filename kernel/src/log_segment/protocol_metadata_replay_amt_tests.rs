@@ -1734,7 +1734,7 @@ async fn snapshot_with_crc_at_version_serves_last_manifest_commit_from_crc(
     Some("checkpoint 0 may not list the files of adaptiveMetadata manifest commit 0")
 )]
 #[case::manifest_commit_after_checkpoint(
-    vec![pointerless_pm_commit(), commit_info(Some(pointer(1, 1)))],
+    vec![pointerless_pm_commit(), checkpoint_commit(1, &[], one_column_schema())],
     Some("commits after the checkpoint are not incremental-safe")
 )]
 #[case::no_manifest_commit(vec![pointerless_pm_commit()], None)]

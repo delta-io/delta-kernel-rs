@@ -1476,7 +1476,14 @@ async fn test_manifest_commit_file_stats(
 async fn test_checksum_from_checkpoint_ignores_pointer_without_adaptive_metadata() {
     let built = CrcReadTest::new()
         .v2_checkpoint(0, protocol_a(), metadata_a())
-        .commit(1, [write_with_last_manifest_commit(1, 1), add("a", 100)])
+        .commit(
+            1,
+            [
+                write_with_last_manifest_commit(1, 1),
+                add("a", 100),
+                amt_checkpoint_action(1, protocol_a(), metadata_a()),
+            ],
+        )
         .build()
         .await;
     let snapshot = built.snapshot_latest_with_replay(IncrementalReplay::Disabled);
