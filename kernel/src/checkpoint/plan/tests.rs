@@ -80,7 +80,18 @@ fn assert_checkpoint_plan(
         schema.as_ref(),
         &StructType::try_from_arrow(expected[0].schema())?
     );
-    assert_eq!(json_rows(&actual, true)?, json_rows(&expected, true)?);
+    let mut actual_rows = json_rows(&actual, true)?;
+    let mut expected_rows = json_rows(&expected, true)?;
+    for rows in [&mut actual_rows, &mut expected_rows] {
+        for row in rows.iter_mut() {
+            if let Some(stats) = row["add"]["stats"].as_str() {
+                row["add"]["stats"] = serde_json::from_str(stats)?;
+            }
+            row.sort_all_objects();
+        }
+        rows.sort_by_cached_key(Value::to_string);
+    }
+    assert_eq!(actual_rows, expected_rows);
     Ok(actual)
 }
 
@@ -466,7 +477,7 @@ pub(super) async fn checkpoint_representation_table(
         }
         json_stats["nullCount"]["part_int"] = json!(0);
         if with_variant {
-            // Protocol VARIANT-statistics example: preserve these Z85 bounds as opaque JSON.
+            // Existing Z85 bounds make native versus JSON source selection observable.
             json_stats["minValues"]["col"] =
                 json!("0S&u501fk+ze0(tB98CpzF6vU0rJl95HpNdvjbtatpi(cu0wW^cTu");
             json_stats["maxValues"]["col"] =
@@ -613,6 +624,7 @@ async fn checkpoint_uses_declared_metadata_representations(
             "tail.parquet" => 30,
             path => panic!("unexpected add {path}"),
         };
+        let expected_bound = if compatible && id == 20 { 200 } else { id };
         assert_eq!(row["add"].get("stats").is_some(), write_json);
         assert_eq!(row["add"].get("stats_parsed").is_some(), write_struct);
         assert_eq!(
@@ -622,8 +634,8 @@ async fn checkpoint_uses_declared_metadata_representations(
         if write_json {
             let stats: Value = serde_json::from_str(row["add"]["stats"].as_str().unwrap())?;
             assert_eq!(stats["numRecords"], 10);
-            assert_eq!(stats["minValues"]["value"], id);
-            if row["add"]["path"] != "native.parquet" || !compatible {
+            assert_eq!(stats["minValues"]["value"], expected_bound);
+            if !compatible || id == 30 {
                 assert_eq!(stats["minValues"]["part_int"], id + 100);
                 assert!(row["add"]["stats"].as_str().unwrap().starts_with(' '));
                 assert!(row["add"]["stats"].as_str().unwrap().ends_with(' '));
@@ -631,12 +643,10 @@ async fn checkpoint_uses_declared_metadata_representations(
         }
         if write_struct {
             assert_eq!(row["add"]["stats_parsed"]["numRecords"], 10);
-            let expected = if compatible && !write_json && id == 20 {
-                200
-            } else {
-                id
-            };
-            assert_eq!(row["add"]["stats_parsed"]["minValues"]["value"], expected);
+            assert_eq!(
+                row["add"]["stats_parsed"]["minValues"]["value"],
+                expected_bound
+            );
         }
         if row["add"]["path"] == "native.parquet" {
             assert_eq!(row["add"]["deletionVector"]["cardinality"], 1);
@@ -658,14 +668,14 @@ async fn checkpoint_uses_declared_metadata_representations(
                 .filter_map(|row| row["add"]["path"].as_str())
                 .sorted()
                 .collect::<Vec<_>>(),
-            ["base.parquet", "native.parquet"],
+            ["native.parquet"],
         );
         if write_struct {
-            let base = rows
+            let native = rows
                 .iter()
-                .find(|row| row["add"]["path"] == "base.parquet")
+                .find(|row| row["add"]["path"] == "native.parquet")
                 .unwrap();
-            assert_eq!(base["add"]["stats_parsed"]["minValues"]["value"], 20);
+            assert_eq!(native["add"]["stats_parsed"]["minValues"]["value"], 10);
         }
     }
     writer.schema_context.stats_config.write_stats_as_json = write_json;
@@ -701,10 +711,37 @@ async fn checkpoint_uses_declared_metadata_representations(
     let actual = execute(&engine, plan)?;
     if let Some(expected) = expected {
         let expected = checkpoint_reference_batches(&engine, &expected, ActionSet::ALL)?;
-        let formatted = crate::arrow::util::pretty::pretty_format_batches(&expected)?.to_string();
-        let mut lines = formatted.lines().collect::<Vec<_>>();
-        ::test_utils::sort_lines!(lines);
-        ::test_utils::assert_batches_sorted_eq!(lines, &actual);
+        if write_json {
+            let mut expected = json_rows(&expected, true)?;
+            let mut actual = json_rows(&actual, true)?;
+            for row in &mut expected {
+                let bound = match row["add"]["path"].as_str() {
+                    Some("native.parquet") => 10,
+                    Some("base.parquet") => 200,
+                    _ => continue,
+                };
+                row["add"]["stats"] = json!({"numRecords":10,"nullCount":{"value":0},
+                    "minValues":{"value":bound},"maxValues":{"value":bound}});
+            }
+            for row in &mut actual {
+                if matches!(
+                    row["add"]["path"].as_str(),
+                    Some("native.parquet" | "base.parquet")
+                ) {
+                    row["add"]["stats"] =
+                        serde_json::from_str(row["add"]["stats"].as_str().unwrap())?;
+                }
+            }
+            expected.sort_by_cached_key(Value::to_string);
+            actual.sort_by_cached_key(Value::to_string);
+            assert_eq!(actual, expected);
+        } else {
+            let formatted =
+                crate::arrow::util::pretty::pretty_format_batches(&expected)?.to_string();
+            let mut lines = formatted.lines().collect::<Vec<_>>();
+            ::test_utils::sort_lines!(lines);
+            ::test_utils::assert_batches_sorted_eq!(lines, &actual);
+        }
     }
     let actual_rows = json_rows(&actual, true)?;
     for (path, id) in [
@@ -720,7 +757,10 @@ async fn checkpoint_uses_declared_metadata_representations(
         assert!(row["add"].get("partitionValues_parsed").is_none());
         if write_json {
             let stats: Value = serde_json::from_str(row["add"]["stats"].as_str().unwrap())?;
-            assert_eq!(stats["minValues"]["value"], id);
+            assert_eq!(
+                stats["minValues"]["value"],
+                if compatible && id == 20 { 200 } else { id }
+            );
         }
     }
     assert_eq!(

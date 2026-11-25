@@ -154,7 +154,7 @@ async fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
         .any(|file| file.location == hint_path)
         .then(|| file_bytes(&engine, &hint_path))
         .transpose()?;
-    let expected = reconciled_rows(&writer, &engine)?;
+    let mut expected = reconciled_rows(&writer, &engine)?;
     assert_eq!(
         expected.len(),
         match state {
@@ -245,6 +245,11 @@ async fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
     );
     let returned_schema: StructType = serde_json::from_str(internal_schema)?;
     assert_eq!(&returned_schema, disk_schema.as_ref());
+    assert!(
+        disk_schema
+            .field_at(&crate::expressions::column_name!("add.stats_parsed"))
+            .is_err()
+    );
     let DataType::Struct(remove) = disk_schema.field("remove").unwrap().data_type() else {
         panic!("remove must be a struct");
     };
@@ -252,7 +257,33 @@ async fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
     assert!(remove.field("tags").is_none());
     let persisted = reader.build()?.collect::<Result<Vec<_>, _>>()?;
     let actual = canonical_actions(json_rows(&persisted, false)?);
-    assert_eq!(actual, expected);
+    let mut comparable = actual.clone();
+    if matches!(state, "native_stats" | "variant_stats") {
+        for row in &mut expected {
+            let bound = match row["add"]["path"].as_str() {
+                Some("native.parquet") => 10,
+                Some("base.parquet") => 200,
+                _ => continue,
+            };
+            let mut stats = json!({"numRecords":10,"nullCount":{"value":0},
+                "minValues":{"value":bound},"maxValues":{"value":bound}});
+            if state == "variant_stats" {
+                stats["nullCount"]["col"] = json!(2);
+            }
+            row["add"]["stats"] = stats;
+        }
+        for row in &mut comparable {
+            if matches!(
+                row["add"]["path"].as_str(),
+                Some("native.parquet" | "base.parquet")
+            ) {
+                row["add"]["stats"] = serde_json::from_str(row["add"]["stats"].as_str().unwrap())?;
+            }
+        }
+        expected.sort_by_cached_key(Value::to_string);
+        comparable.sort_by_cached_key(Value::to_string);
+    }
+    assert_eq!(comparable, expected);
     if matches!(state, "native_stats" | "variant_stats") {
         let native = actual
             .iter()
@@ -272,21 +303,14 @@ async fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
             .iter()
             .find(|row| row["add"]["path"] == "base.parquet")
             .unwrap();
-        let original_json = original["add"]["stats"].as_str().unwrap();
-        assert!(original_json.starts_with(' '));
-        assert!(original_json.ends_with(' '));
-        let stats: Value = serde_json::from_str(original_json)?;
-        assert_eq!(stats["minValues"]["part_int"], 120);
+        let stats: Value = serde_json::from_str(original["add"]["stats"].as_str().unwrap())?;
+        assert_eq!(stats["minValues"]["value"], 200);
+        assert_eq!(stats["maxValues"]["value"], 200);
+        assert!(stats["minValues"].get("part_int").is_none());
         if state == "variant_stats" {
             assert_eq!(stats["nullCount"]["col"], 2);
-            assert_eq!(
-                stats["minValues"]["col"],
-                "0S&u501fk+ze0(tB98CpzF6vU0rJl95HpNdvjbtatpi(cu0wW^cTu"
-            );
-            assert_eq!(
-                stats["maxValues"]["col"],
-                "0S&u500&]LC42A9vqZe}wb#-i1}-a+cT!xdbWhT9cTx}7v<+K"
-            );
+            assert!(stats["minValues"].get("col").is_none());
+            assert!(stats["maxValues"].get("col").is_none());
         }
         assert_eq!(expected_adds, 3);
     }
@@ -372,13 +396,22 @@ async fn checkpoint_plan_persists_statistics_and_reloads_without_older_commits(
         reloaded.table_configuration().protocol(),
         snapshot.table_configuration().protocol()
     );
-    assert_eq!(
-        reconciled_rows(
-            &reloaded.clone().create_checkpoint_writer(&engine)?,
-            &engine
-        )?,
-        expected
-    );
+    let mut reloaded_rows = reconciled_rows(
+        &reloaded.clone().create_checkpoint_writer(&engine)?,
+        &engine,
+    )?;
+    if matches!(state, "native_stats" | "variant_stats") {
+        for row in &mut reloaded_rows {
+            if matches!(
+                row["add"]["path"].as_str(),
+                Some("native.parquet" | "base.parquet")
+            ) {
+                row["add"]["stats"] = serde_json::from_str(row["add"]["stats"].as_str().unwrap())?;
+            }
+        }
+        reloaded_rows.sort_by_cached_key(Value::to_string);
+    }
+    assert_eq!(reloaded_rows, expected);
     if matches!(state, "mixed" | "predecessor") {
         assert_eq!(
             reloaded.reader().get_app_id_version("app", &engine)?,

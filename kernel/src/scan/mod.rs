@@ -163,9 +163,9 @@ pub use crate::parallel::parallel_scan_metadata::{
 ///   constructors, this is the only one that stops kernel from reading stats from parquet at all.
 #[derive(Clone, Debug)]
 pub struct StatsOptions {
-    /// Whether to emit JSON stats in declarative metadata plans, synthesizing them from compatible
-    /// structured stats when the source has no JSON. When false, declarative plans omit JSON stats
-    /// from every source.
+    /// Whether to emit JSON stats in declarative metadata plans. Compatible native stats are
+    /// serialized to JSON; otherwise existing JSON is retained. When false, declarative plans
+    /// omit JSON stats from every source.
     ///
     /// Imperative scans use this flag only for synthesis from structured checkpoint stats;
     /// existing JSON from commits and checkpoints without compatible structured stats passes
