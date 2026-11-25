@@ -434,15 +434,13 @@ impl LastCheckpointHint {
 
     /// Reads and validates the `_last_checkpoint` hint.
     ///
-    /// Returns `Ok(None)` for an empty or invalid hint, or a file-not-found error from the read
-    /// iterator. A file-not-found error returned directly by [`StorageHandler::read_files`]
-    /// propagates instead. Both forms of absence report [`LastCheckpointReadOutcome::NotFound`].
-    /// Other errors, including cancellation, propagate.
+    /// Returns `Ok(None)` for a [missing](KernelError::FileNotFound), empty or invalid hint. Other
+    /// errors, including [cancellation](KernelError::Cancelled), propagate.
     ///
     /// Emits one [`LastCheckpointReadCompleted`](crate::metrics::LastCheckpointReadCompleted)
-    /// event per call when metrics reporting is enabled.
-    // TODO(#1047): weird that we propagate FileNotFound as part of the iterator instead of top-
-    // level result coming from storage.read_files
+    /// event per call when metrics reporting is enabled. Empty or invalid hints report
+    /// [`LastCheckpointReadOutcome::Invalid`], while a file-not-found error reports
+    /// [`LastCheckpointReadOutcome::NotFound`].
     #[instrument(
         name = LAST_CHECKPOINT_READ_SPAN,
         skip_all,
@@ -454,14 +452,7 @@ impl LastCheckpointHint {
         log_root: &Url,
     ) -> KernelResult<Option<LastCheckpointHint>> {
         let file_path = Self::path(log_root)?;
-        let mut files = storage
-            .read_files(vec![(file_path, None)])
-            .inspect_err(|err| {
-                if matches!(err, KernelError::FileNotFound(_)) {
-                    record_read_outcome(LastCheckpointReadOutcome::NotFound);
-                }
-            })?;
-        match files.next() {
+        match storage.read_small_file((file_path, None)).transpose() {
             Some(Ok(data)) => {
                 let result = Self::from_bytes_with_oversized_fields_dropped(&data)
                     .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
@@ -633,7 +624,7 @@ mod tests {
     #[case::top_level_not_found(
         ReadBehavior::TopLevelNotFound,
         LastCheckpointReadOutcome::NotFound,
-        true
+        false
     )]
     #[case::top_level_error(ReadBehavior::TopLevelError, LastCheckpointReadOutcome::Error, true)]
     #[case::iterator_not_found(

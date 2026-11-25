@@ -1513,8 +1513,6 @@ pub enum LastCheckpointReadOutcome {
     /// The hint was parsed and retained. It may still name a checkpoint the caller cannot use.
     Success,
     /// Storage reported that the hint file was absent.
-    ///
-    /// An iterator-level file-not-found returns no hint; a top-level storage error propagates.
     NotFound,
     /// The hint was empty, malformed, or discarded by hint validation.
     Invalid,
