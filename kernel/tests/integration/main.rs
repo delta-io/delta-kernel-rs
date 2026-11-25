@@ -20,5 +20,11 @@ mod log;
 mod metrics;
 mod parsed_partition_values;
 mod parsed_stats;
+#[cfg(all(
+    feature = "declarative-plans",
+    feature = "arrow-conversion",
+    feature = "arrow-expression"
+))]
+mod plan_values;
 mod read;
 mod write;

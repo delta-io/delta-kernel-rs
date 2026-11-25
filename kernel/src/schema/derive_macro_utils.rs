@@ -28,12 +28,21 @@ use crate::{KernelError, KernelResult};
 #[internal_api]
 pub(crate) trait ToDataType {
     fn to_data_type() -> DataType;
+
+    /// Compares with `to_data_type()`; implementations may avoid constructing the type.
+    fn matches_data_type(actual: &DataType) -> bool {
+        actual == &Self::to_data_type()
+    }
 }
 
 // Blanket impl for all types that implement `ToSchema`
 impl<T: ToSchema> ToDataType for T {
     fn to_data_type() -> DataType {
         T::to_schema().into()
+    }
+
+    fn matches_data_type(actual: &DataType) -> bool {
+        matches!(actual, DataType::Struct(actual) if actual.as_ref() == T::schema_ref().as_ref())
     }
 }
 
@@ -200,6 +209,8 @@ pub(crate) struct StructDataFields {
 }
 
 impl StructDataFields {
+    /// Creates a field decoder after checking that the value count matches both schemas.
+    #[internal_api]
     pub(crate) fn try_new(data: StructData, expected: SchemaRef) -> KernelResult<Self> {
         let (actual, values) = data.into_parts();
         require!(
@@ -223,6 +234,8 @@ impl StructDataFields {
         })
     }
 
+    /// Consumes the named field, checks its schema nullability, and decodes its value.
+    #[internal_api]
     pub(crate) fn take_field<T: TryFrom<Scalar, Error = KernelError>>(
         &mut self,
         field_name: &str,
@@ -266,6 +279,7 @@ impl StructDataFields {
     }
 
     /// Verifies that every named field was consumed.
+    #[internal_api]
     pub(crate) fn finish(self) -> KernelResult<()> {
         let mut extra: Vec<_> = self
             .actual
