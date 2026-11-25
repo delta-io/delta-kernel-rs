@@ -4,13 +4,12 @@ use std::sync::Arc;
 
 use delta_kernel::snapshot::{IncrementalReplay, Snapshot, SnapshotHint, SnapshotRef};
 use delta_kernel::{Engine, KernelResult, LogPath, Version};
-use delta_kernel_ffi_macros::handle_descriptor;
+use delta_kernel_ffi_macros::{ffi_export, handle_descriptor};
 use url::Url;
 
 use super::hint;
-use crate::error::{ExternResult, IntoExternResult};
+use crate::error::ExternResult;
 use crate::handle::Handle;
-use crate::panic::catch_panic;
 use crate::{
     ExternEngine, KernelStringSlice, SharedExternEngine, SharedSnapshot, log_path,
     unwrap_and_parse_path_as_url,
@@ -79,19 +78,16 @@ impl From<FfiIncrementalReplay> for IncrementalReplay {
 /// # Safety
 ///
 /// Caller is responsible for passing a valid path and engine handle.
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_snapshot_builder(
     path: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveSnapshotBuilder>> {
-    let engine_ref = unsafe { engine.as_ref() };
     let engine_arc = unsafe { engine.clone_as_arc() };
-    let result = catch_panic(|| {
-        let url = unsafe { unwrap_and_parse_path_as_url(path) }?;
-        let source = FfiSnapshotBuilderSource::TableRoot(url);
-        make_snapshot_builder(source, engine_arc)
-    });
-    unsafe { result.into_extern_result(&engine_ref) }
+    let url = unsafe { unwrap_and_parse_path_as_url(path) }?;
+    let source = FfiSnapshotBuilderSource::TableRoot(url);
+    make_snapshot_builder(source, engine_arc)
 }
 
 /// Get a builder for incrementally updating an existing snapshot.
@@ -104,21 +100,18 @@ pub unsafe extern "C" fn get_snapshot_builder(
 /// # Safety
 ///
 /// Caller is responsible for passing valid handles.
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_snapshot_builder_from(
     prev_snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveSnapshotBuilder>> {
-    let engine_ref = unsafe { engine.as_ref() };
     let engine_arc = unsafe { engine.clone_as_arc() };
     let snapshot_arc = unsafe { prev_snapshot.clone_as_arc() };
-    let result = catch_panic(|| {
-        make_snapshot_builder(
-            FfiSnapshotBuilderSource::ExistingSnapshot(snapshot_arc),
-            engine_arc,
-        )
-    });
-    unsafe { result.into_extern_result(&engine_ref) }
+    make_snapshot_builder(
+        FfiSnapshotBuilderSource::ExistingSnapshot(snapshot_arc),
+        engine_arc,
+    )
 }
 
 /// Sets an explicit target version on a snapshot builder. When omitted, a hinted build uses the
@@ -155,20 +148,17 @@ pub unsafe extern "C" fn snapshot_builder_with_version(
 /// used or freed afterward. The caller owns the returned builder on success. `correlation_id`
 /// is borrowed for this call. If its pointer is non-null, it must address `len` readable bytes
 /// until the call returns.
+#[ffi_export(error_allocator = builder.engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_builder_with_correlation_id(
     builder: Handle<ExclusiveSnapshotBuilder>,
     correlation_id: KernelStringSlice,
 ) -> ExternResult<Handle<ExclusiveSnapshotBuilder>> {
     let mut builder = unsafe { builder.into_inner() };
-    let engine = builder.engine.clone();
-    let result = catch_panic(|| {
-        unsafe { correlation_id.try_to_string() }.map(|id| {
-            builder.correlation_id = Some(id).filter(|id| !id.is_empty());
-            builder.into()
-        })
-    });
-    unsafe { result.into_extern_result(&engine.as_ref()) }
+    unsafe { correlation_id.try_to_string() }.map(|id| {
+        builder.correlation_id = Some(id).filter(|id| !id.is_empty());
+        builder.into()
+    })
 }
 
 /// Set the replay mode for advancing a stale CRC during a fresh or incremental snapshot build.
@@ -213,19 +203,14 @@ pub unsafe extern "C" fn snapshot_builder_with_incremental_crc_replay(
 /// be used or freed after this call. On error, the builder is dropped. The `log_tail` array and its
 /// contents must follow the [`crate::FfiSlice`] contract and remain valid for the duration of this
 /// call.
+#[ffi_export(error_allocator = builder.engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_builder_with_log_tail(
     builder: Handle<ExclusiveSnapshotBuilder>,
     log_tail: log_path::LogPathArray,
 ) -> ExternResult<Handle<ExclusiveSnapshotBuilder>> {
     let mut builder = unsafe { builder.into_inner() };
-    let engine_arc = builder.engine.clone();
-    let engine_ref = engine_arc.as_ref();
-    let result = catch_panic(|| {
-        unsafe { snapshot_builder_with_log_tail_impl(&mut builder, log_tail) }
-            .map(|_| builder.into())
-    });
-    unsafe { result.into_extern_result(&engine_ref) }
+    unsafe { snapshot_builder_with_log_tail_impl(&mut builder, log_tail) }.map(|_| builder.into())
 }
 
 /// Bound the snapshot version to what the catalog has ratified.
@@ -271,16 +256,13 @@ pub unsafe extern "C" fn snapshot_builder_with_max_catalog_version(
 /// # Safety
 ///
 /// Caller must pass a valid builder pointer and must not use it again after this call.
+#[ffi_export(error_allocator = builder.engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_builder_build(
-    mut builder: Handle<ExclusiveSnapshotBuilder>,
+    builder: Handle<ExclusiveSnapshotBuilder>,
 ) -> ExternResult<Handle<SharedSnapshot>> {
-    // Clone the engine Arc before consuming the handle so we can still use it for error reporting
-    let engine_arc = unsafe { builder.as_mut() }.engine.clone();
-    let engine_ref = engine_arc.as_ref();
     let builder_box = unsafe { builder.into_inner() };
-    let result = catch_panic(|| snapshot_builder_build_impl(*builder_box));
-    unsafe { result.into_extern_result(&engine_ref) }
+    snapshot_builder_build_impl(*builder_box)
 }
 
 /// Free a snapshot builder without building a snapshot (e.g. on an error path).

@@ -24,7 +24,7 @@ use delta_kernel::object_store::ObjectStore;
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::{CheckpointWriteResult, LogSegmentStats, Snapshot, SnapshotRef};
 use delta_kernel::{Engine, EngineData, FileStats, KernelResult, Version};
-use delta_kernel_ffi_macros::handle_descriptor;
+use delta_kernel_ffi_macros::{ffi_export, handle_descriptor};
 use tracing::trace;
 use url::Url;
 #[cfg(feature = "default-engine-base")]
@@ -32,8 +32,6 @@ use {
     delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor,
     std::collections::HashMap, std::num::NonZero,
 };
-
-use crate::panic::catch_panic;
 
 // cbindgen doesn't understand our use of feature flags here, and by default it parses `mod handle`
 // twice. So we tell it to ignore one of the declarations to avoid double-definition errors.
@@ -1322,21 +1320,19 @@ pub unsafe extern "C" fn free_snapshot(snapshot: Handle<SharedSnapshot>) {
 ///
 /// Caller is responsible for passing valid handles. The `spec` pointer, if non-null, must point
 /// to a valid `FfiCheckpointSpec` for the duration of the call.
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn checkpoint_snapshot(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
     spec: Option<&FfiCheckpointSpec>,
 ) -> ExternResult<FfiCheckpointWriteResult> {
-    let result = catch_panic(|| {
-        let engine_ref = unsafe { engine.as_ref() };
-        let snapshot_ref: SnapshotRef = unsafe { snapshot.clone_as_arc() };
-        let kernel_spec = spec.map(|s| s.to_kernel());
-        snapshot_ref
-            .checkpoint(engine_ref.engine().as_ref(), kernel_spec.as_ref())
-            .map(|(result, updated)| FfiCheckpointWriteResult::from_kernel(result, updated))
-    });
-    unsafe { result.into_extern_result(&engine.as_ref()) }
+    let engine_ref = unsafe { engine.as_ref() };
+    let snapshot_ref: SnapshotRef = unsafe { snapshot.clone_as_arc() };
+    let kernel_spec = spec.map(|s| s.to_kernel());
+    snapshot_ref
+        .checkpoint(engine_ref.engine().as_ref(), kernel_spec.as_ref())
+        .map(|(result, updated)| FfiCheckpointWriteResult::from_kernel(result, updated))
 }
 
 /// Publish unpublished catalog commits on a catalog-managed snapshot.
@@ -1355,6 +1351,7 @@ pub unsafe extern "C" fn checkpoint_snapshot(
 ///
 /// All handles must be valid. This call borrows `snapshot` and `engine` and unconditionally
 /// consumes `committer`, including on error. Do not use or free `committer` afterward.
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_publish_with_committer(
     snapshot: Handle<SharedSnapshot>,
@@ -1363,13 +1360,10 @@ pub unsafe extern "C" fn snapshot_publish_with_committer(
 ) -> ExternResult<Handle<SharedSnapshot>> {
     let engine_ref = unsafe { engine.as_ref() };
     let committer = unsafe { committer.into_inner() };
-    let result = catch_panic(move || {
-        let snapshot_ref: SnapshotRef = unsafe { snapshot.clone_as_arc() };
-        snapshot_ref
-            .publish(engine_ref.engine().as_ref(), committer.as_ref())
-            .map(|updated| updated.into())
-    });
-    unsafe { result.into_extern_result(&engine_ref) }
+    let snapshot_ref: SnapshotRef = unsafe { snapshot.clone_as_arc() };
+    snapshot_ref
+        .publish(engine_ref.engine().as_ref(), committer.as_ref())
+        .map(|updated| updated.into())
 }
 
 /// Get the version of the specified snapshot
@@ -1395,19 +1389,17 @@ pub unsafe extern "C" fn version(snapshot: Handle<SharedSnapshot>) -> u64 {
 /// # Safety
 ///
 /// Caller is responsible for passing valid snapshot handle and engine handle.
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_timestamp(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<i64> {
-    let result = catch_panic(|| {
-        let engine_ref = unsafe { engine.as_ref() };
-        let snapshot = unsafe { snapshot.as_ref() };
-        snapshot
-            .reader()
-            .get_timestamp(engine_ref.engine().as_ref())
-    });
-    unsafe { result.into_extern_result(&engine.as_ref()) }
+    let engine_ref = unsafe { engine.as_ref() };
+    let snapshot = unsafe { snapshot.as_ref() };
+    snapshot
+        .reader()
+        .get_timestamp(engine_ref.engine().as_ref())
 }
 
 /// Statistics for the original commit files in a snapshot's log segment.
@@ -1445,16 +1437,14 @@ impl From<LogSegmentStats> for FfiLogSegmentStats {
 /// # Safety
 ///
 /// Caller must pass valid snapshot and engine handles, and retain ownership of both handles.
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_log_segment_stats(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<FfiLogSegmentStats> {
-    let result = catch_panic(|| {
-        let snapshot = unsafe { snapshot.as_ref() };
-        snapshot.log_segment_stats().map(FfiLogSegmentStats::from)
-    });
-    unsafe { result.into_extern_result(&engine.as_ref()) }
+    let snapshot = unsafe { snapshot.as_ref() };
+    snapshot.log_segment_stats().map(FfiLogSegmentStats::from)
 }
 
 /// File-level statistics for a snapshot, sourced from the snapshot's CRC.

@@ -2,16 +2,16 @@
 
 use delta_kernel::snapshot::{SnapshotHint, SnapshotHintError, SnapshotHintFreshness};
 use delta_kernel::{KernelError, KernelResult, Version};
+use delta_kernel_ffi_macros::ffi_export;
 
 use super::builder::{ExclusiveSnapshotBuilder, FfiSnapshotBuilder, FfiSnapshotBuilderSource};
 use crate::checkpoint::FfiSelectedCheckpointType;
 use crate::delta_types::{
     FfiCrc, FfiLastCheckpoint, FfiMetadata, FfiProtocol, FfiPublicationWatermark,
 };
-use crate::error::{ExternResult, IntoExternResult};
+use crate::error::ExternResult;
 use crate::handle::Handle;
 use crate::log_path::LogPathArray;
-use crate::panic::catch_panic;
 use crate::{NullableCvoid, OptionalValue, SharedExternEngine, SharedSnapshot};
 
 mod export;
@@ -34,6 +34,7 @@ mod export;
 /// The snapshot and engine handles are borrowed and must remain valid throughout the call. The
 /// callback must not free or consume either handle, retain any borrowed pointer, or unwind across
 /// the FFI boundary. The hint and all nested storage expire when the callback returns.
+#[ffi_export(error_allocator = engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_to_snapshot_hint(
     snapshot: Handle<SharedSnapshot>,
@@ -41,14 +42,11 @@ pub unsafe extern "C" fn snapshot_to_snapshot_hint(
     context: NullableCvoid,
     visitor: SnapshotHintVisitor,
 ) -> ExternResult<bool> {
-    let result = catch_panic(|| {
-        let snapshot = unsafe { snapshot.as_ref() };
-        snapshot
-            .to_snapshot_hint()
-            .and_then(|hint| export::visit(&hint, context, visitor))
-            .map(|()| true)
-    });
-    unsafe { result.into_extern_result(&engine.as_ref()) }
+    let snapshot = unsafe { snapshot.as_ref() };
+    snapshot
+        .to_snapshot_hint()
+        .and_then(|hint| export::visit(&hint, context, visitor))
+        .map(|()| true)
 }
 
 /// Receives one complete borrowed hint. All nested storage expires when the callback returns.
@@ -206,18 +204,14 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
 /// The builder is consumed unconditionally and must not be used or freed after this call. Every
 /// enum must have a valid tag. Every selected pointer must be aligned and address initialized
 /// storage for its declared element count, and all such storage must remain valid for this call.
+#[ffi_export(error_allocator = builder.engine)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_builder_with_snapshot_hint(
     builder: Handle<ExclusiveSnapshotBuilder>,
     value: &FfiSnapshotHint,
 ) -> ExternResult<Handle<ExclusiveSnapshotBuilder>> {
     let mut builder = unsafe { builder.into_inner() };
-    let engine = builder.engine.clone();
-    let result = catch_panic(|| {
-        unsafe { snapshot_builder_with_snapshot_hint_impl(&mut builder, value) }
-            .map(|_| builder.into())
-    });
-    unsafe { result.into_extern_result(&engine.as_ref()) }
+    unsafe { snapshot_builder_with_snapshot_hint_impl(&mut builder, value) }.map(|_| builder.into())
 }
 
 #[cfg(test)]
