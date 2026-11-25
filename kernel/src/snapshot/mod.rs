@@ -715,7 +715,7 @@ impl Snapshot {
 
         // `crc_delta` covers what the transaction committed, so it advances an at-version CRC;
         // a stale base is carried forward unadvanced.
-        let new_crc = self.crc.retained().clone().map_crc(|crc| {
+        let new_crc = self.crc.as_ref().clone().map_crc(|crc| {
             if crc.version == read_version {
                 Arc::new(crc.as_ref().clone().apply(crc_delta, new_version))
             } else {
@@ -2116,7 +2116,7 @@ impl Snapshot {
         {
             CrcWrapper::Unknown
         } else {
-            self.crc.retained().clone()
+            self.crc.as_ref().clone()
         };
         let mut new_snapshot = Snapshot::new_with_crc(
             new_log_segment,
@@ -2225,7 +2225,7 @@ impl Snapshot {
         Ok(Arc::new(Snapshot::new_with_crc(
             log_segment,
             self.table_configuration().clone(),
-            self.crc.retained().clone(),
+            self.crc.as_ref().clone(),
             self.built_as_latest,
             self.skipped_new_checkpoints,
         )?))

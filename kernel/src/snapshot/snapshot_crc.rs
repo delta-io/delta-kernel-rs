@@ -161,10 +161,6 @@ impl SnapshotCrc {
         }
     }
 
-    pub(super) fn retained(&self) -> &CrcWrapper {
-        &self.crc
-    }
-
     /// The CRC iff it sits exactly at the snapshot version, so its cached values are authoritative
     /// at zero I/O. Returns `None` for a stale CRC.
     pub(super) fn at_version(&self) -> Option<&Arc<Crc>> {
@@ -177,6 +173,12 @@ impl SnapshotCrc {
     /// (e.g. checksum writes).
     pub(super) fn base(&self) -> Option<&Arc<Crc>> {
         self.crc.as_ref()
+    }
+}
+
+impl AsRef<CrcWrapper> for SnapshotCrc {
+    fn as_ref(&self) -> &CrcWrapper {
+        &self.crc
     }
 }
 

@@ -216,7 +216,7 @@ fn crc_write_resolution_or_validation_error_retains_mode_and_duration(
             unsupported_operation: None,
         };
         let version = snapshot.version();
-        let retained = snapshot.crc.retained().clone().map_crc(|_| Arc::new(crc));
+        let retained = snapshot.crc.as_ref().clone().map_crc(|_| Arc::new(crc));
         Arc::get_mut(&mut snapshot).unwrap().crc = SnapshotCrc::try_new(retained, version, None)?;
     } else {
         // Corrupt the required commit after loading the snapshot so resolution itself fails.
