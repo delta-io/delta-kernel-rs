@@ -18,10 +18,11 @@ use crate::{Engine, KernelError, KernelResult};
 /// replay.
 ///
 /// Reports metrics: `CrcReadSuccess` or `CrcReadFailure`.
-#[instrument(name = CRC_READ_COMPLETED_SPAN, err(level = "warn"), skip_all, fields(report, enable_call_frame, bytes_read, path = ?crc_path.location.location))]
+#[instrument(name = CRC_READ_COMPLETED_SPAN, err(level = "warn"), skip_all, fields(report, enable_call_frame, bytes_read, operation_id = %context.operation_id, correlation_id = context.correlation_id.as_deref().unwrap_or(""), path = ?crc_path.location.location))]
 pub(crate) fn try_read_crc_file(
     engine: &dyn Engine,
     crc_path: &ParsedLogPath,
+    context: &crate::metrics::SnapshotLoadMetricContext,
 ) -> KernelResult<Crc> {
     let storage = engine.storage_handler();
     let url = crc_path.location.as_url().clone();
@@ -40,8 +41,9 @@ pub(crate) fn try_read_crc_file(
 pub(crate) fn read_crc_file_or_none(
     engine: &dyn Engine,
     crc_file: &ParsedLogPath,
+    context: &crate::metrics::SnapshotLoadMetricContext,
 ) -> KernelResult<Option<Arc<Crc>>> {
-    match try_read_crc_file(engine, crc_file) {
+    match try_read_crc_file(engine, crc_file, context) {
         Ok(crc) => Ok(Some(Arc::new(crc))),
         Err(KernelError::Cancelled) => Err(KernelError::Cancelled),
         Err(_) => Ok(None),
@@ -89,7 +91,11 @@ mod tests {
             token.cancel();
         }
         let engine = CancellableEngine::new(&SyncEngine::new(), token);
-        let result = read_crc_file_or_none(&engine, &crc_path);
+        let result = read_crc_file_or_none(
+            &engine,
+            &crc_path,
+            &crate::metrics::SnapshotLoadMetricContext::for_test(),
+        );
         if cancelled {
             assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
         } else {
@@ -106,8 +112,13 @@ mod tests {
         let table_root = test_table_root("./tests/data/crc-full/");
         let crc_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
 
+        let context = crate::metrics::SnapshotLoadMetricContext {
+            operation_id: crate::metrics::MetricId::new(),
+            correlation_id: Some("snapshot-read".into()),
+            ..crate::metrics::SnapshotLoadMetricContext::for_test()
+        };
         // Read and parse the CRC file
-        let crc = try_read_crc_file(&engine, &crc_path).unwrap();
+        let crc = try_read_crc_file(&engine, &crc_path, &context).unwrap();
 
         // Verify basic fields
         let stats = crc.file_stats().unwrap();
@@ -220,7 +231,9 @@ mod tests {
             .filter(|e| matches!(e, MetricEvent::CrcReadSuccess(_)))
             .collect();
         assert_eq!(crc_events.len(), 1);
-        assert!(matches!(&crc_events[0], MetricEvent::CrcReadSuccess(e) if e.bytes_read > 0));
+        assert!(
+            matches!(&crc_events[0], MetricEvent::CrcReadSuccess(e) if e.bytes_read > 0 && e.operation_id == context.operation_id && e.correlation_id == context.correlation_id)
+        );
     }
 
     #[test]
@@ -232,13 +245,21 @@ mod tests {
         let table_root = test_table_root("./tests/data/crc-malformed/");
         let crc_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
 
-        assert_result_error_with_message(try_read_crc_file(&engine, &crc_path), "expected value");
+        let context = crate::metrics::SnapshotLoadMetricContext {
+            operation_id: crate::metrics::MetricId::new(),
+            correlation_id: Some("snapshot-read".into()),
+            ..crate::metrics::SnapshotLoadMetricContext::for_test()
+        };
+        assert_result_error_with_message(
+            try_read_crc_file(&engine, &crc_path, &context),
+            "expected value",
+        );
 
         let events = reporter.events();
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, MetricEvent::CrcReadFailure)),
+                .any(|e| matches!(e, MetricEvent::CrcReadFailure { operation_id, correlation_id, .. } if *operation_id == context.operation_id && correlation_id == &context.correlation_id)),
             "expected CrcReadFailure when JSON parse fails"
         );
         assert!(

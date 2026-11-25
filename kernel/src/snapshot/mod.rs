@@ -533,9 +533,11 @@ impl Snapshot {
 
         // Step 1: read the latest on-disk CRC and, if usable, advance it to the end version
         //         (or use it as-is when already there) per `incremental_replay`.
-        let base_crc = log_segment.read_latest_crc(engine).inspect_err(|_| {
-            emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
-        })?;
+        let base_crc = log_segment
+            .pick_latest_base_crc(engine, None, metric_context)
+            .inspect_err(|_| {
+                emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
+            })?;
         let crc_at_version = log_segment
             .try_build_crc_within_budget(engine, base_crc.as_ref(), incremental_replay)
             .inspect_err(|_| {
@@ -1079,6 +1081,7 @@ impl Snapshot {
         &self,
         domain: &str,
         engine: &dyn Engine,
+        correlation_id: Option<&str>,
     ) -> KernelResult<Option<String>> {
         if domain.starts_with(INTERNAL_DOMAIN_PREFIX) {
             return Err(KernelError::generic(
@@ -1086,7 +1089,7 @@ impl Snapshot {
             ));
         }
 
-        self.get_domain_metadata_internal(domain, engine)
+        self.get_domain_metadata_internal(domain, engine, correlation_id)
     }
 
     /// Get the row-tracking high-water mark for this snapshot.
@@ -1097,8 +1100,12 @@ impl Snapshot {
     ///
     /// Reads domain metadata, potentially replaying the log, and returns an error if the metadata
     /// cannot be read or its JSON configuration is malformed.
-    fn get_row_tracking_high_water_mark(&self, engine: &dyn Engine) -> KernelResult<Option<i64>> {
-        self.get_domain_metadata_internal(ROW_TRACKING_DOMAIN_NAME, engine)?
+    fn get_row_tracking_high_water_mark(
+        &self,
+        engine: &dyn Engine,
+        correlation_id: Option<&str>,
+    ) -> KernelResult<Option<i64>> {
+        self.get_domain_metadata_internal(ROW_TRACKING_DOMAIN_NAME, engine, correlation_id)?
             .map(|config| parse_row_tracking_high_water_mark(&config))
             .transpose()
     }
@@ -1124,8 +1131,11 @@ impl Snapshot {
     fn get_clustering_column_infos(
         &self,
         engine: &dyn Engine,
+        correlation_id: Option<&str>,
     ) -> KernelResult<Option<Vec<ClusteringColumnInfo>>> {
-        let Some(physical_columns) = self.get_physical_clustering_columns(engine)? else {
+        let Some(physical_columns) =
+            self.get_physical_clustering_columns(engine, correlation_id)?
+        else {
             return Ok(None);
         };
         let column_mapping_mode = self.table_configuration.column_mapping_mode();
@@ -1160,8 +1170,9 @@ impl Snapshot {
     fn get_physical_clustering_columns(
         &self,
         engine: &dyn Engine,
+        correlation_id: Option<&str>,
     ) -> KernelResult<Option<Vec<ColumnName>>> {
-        match self.get_clustering_domain_metadata(engine)? {
+        match self.get_clustering_domain_metadata(engine, correlation_id)? {
             Some(config) => Ok(Some(parse_clustering_columns(&config)?)),
             None => Ok(None),
         }
@@ -1172,7 +1183,11 @@ impl Snapshot {
     /// Returns `Ok(None)` when the `ClusteredTable` feature is absent on the protocol, or when
     /// the domain has no current entry. The JSON has the shape
     /// `{"clusteringColumns":[["col1"],["addr","city"], ...]}` with physical column names.
-    fn get_clustering_domain_metadata(&self, engine: &dyn Engine) -> KernelResult<Option<String>> {
+    fn get_clustering_domain_metadata(
+        &self,
+        engine: &dyn Engine,
+        correlation_id: Option<&str>,
+    ) -> KernelResult<Option<String>> {
         if !self
             .table_configuration
             .protocol()
@@ -1180,7 +1195,7 @@ impl Snapshot {
         {
             return Ok(None);
         }
-        self.get_domain_metadata_internal(CLUSTERING_DOMAIN_NAME, engine)
+        self.get_domain_metadata_internal(CLUSTERING_DOMAIN_NAME, engine, correlation_id)
     }
 
     /// Load domain metadata: if Complete in the CRC, answer from the cache; else if every
@@ -1194,12 +1209,13 @@ impl Snapshot {
         name = DOMAIN_METADATA_LOADED_SPAN,
         skip_all,
         err,
-        fields(report, from_cache, num_domains_returned)
+        fields(report, operation_id = %MetricId::new(), correlation_id = correlation_id.unwrap_or(""), from_cache, num_domains_returned)
     )]
     fn get_domain_metadatas_internal(
         &self,
         engine: &dyn Engine,
         domains: Option<&HashSet<&str>>,
+        correlation_id: Option<&str>,
     ) -> KernelResult<DomainMetadataMap> {
         fn record_metric(from_cache: bool, num_domains_returned: usize) {
             let span = tracing::Span::current();
@@ -1294,8 +1310,13 @@ impl Snapshot {
         &self,
         domain: &str,
         engine: &dyn Engine,
+        correlation_id: Option<&str>,
     ) -> KernelResult<Option<String>> {
-        let mut map = self.get_domain_metadatas_internal(engine, Some(&HashSet::from([domain])))?;
+        let mut map = self.get_domain_metadatas_internal(
+            engine,
+            Some(&HashSet::from([domain])),
+            correlation_id,
+        )?;
         Ok(map.remove(domain).map(|dm| dm.configuration().to_owned()))
     }
 
@@ -1303,8 +1324,12 @@ impl Snapshot {
     ///
     /// Internal (`delta.*`) domains are filtered out.
     #[allow(unused)]
-    fn get_all_domain_metadata(&self, engine: &dyn Engine) -> KernelResult<Vec<DomainMetadata>> {
-        let all_metadata = self.get_domain_metadatas_internal(engine, None)?;
+    fn get_all_domain_metadata(
+        &self,
+        engine: &dyn Engine,
+        correlation_id: Option<&str>,
+    ) -> KernelResult<Vec<DomainMetadata>> {
+        let all_metadata = self.get_domain_metadatas_internal(engine, None, correlation_id)?;
         Ok(all_metadata
             .into_values()
             .filter(|domain| !domain.is_internal())
@@ -2832,7 +2857,12 @@ mod tests {
 
         let engine = SyncEngine::new();
         let storage = engine.storage_handler();
-        let cp = LastCheckpointHint::try_read(storage.as_ref(), &url).unwrap();
+        let cp = LastCheckpointHint::try_read(
+            storage.as_ref(),
+            &url,
+            &SnapshotLoadMetricContext::for_test(),
+        )
+        .unwrap();
         assert!(cp.is_none());
     }
 
@@ -2886,8 +2916,12 @@ mod tests {
         let engine = SyncEngine::new_with_store(store);
         let storage = engine.storage_handler();
         let url = Url::parse("memory:///invalid/").expect("valid url");
-        let invalid =
-            LastCheckpointHint::try_read(storage.as_ref(), &url).expect("read last checkpoint");
+        let invalid = LastCheckpointHint::try_read(
+            storage.as_ref(),
+            &url,
+            &SnapshotLoadMetricContext::for_test(),
+        )
+        .expect("read last checkpoint");
         assert!(invalid.is_none())
     }
 
@@ -2921,8 +2955,12 @@ mod tests {
         // valid, invalid and valid with tags.
         for (path_prefix, _, expected_result) in test_cases {
             let url = Url::parse(&format!("memory:///{path_prefix}/")).expect("valid url");
-            let result =
-                LastCheckpointHint::try_read(storage.as_ref(), &url).expect("read last checkpoint");
+            let result = LastCheckpointHint::try_read(
+                storage.as_ref(),
+                &url,
+                &SnapshotLoadMetricContext::for_test(),
+            )
+            .expect("read last checkpoint");
             assert_eq!(result, expected_result);
         }
     }
@@ -3013,27 +3051,30 @@ mod tests {
 
         let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
 
-        assert_eq!(snapshot.get_domain_metadata("domain1", &engine)?, None);
         assert_eq!(
-            snapshot.get_domain_metadata("domain2", &engine)?,
+            snapshot.get_domain_metadata("domain1", &engine, None)?,
+            None
+        );
+        assert_eq!(
+            snapshot.get_domain_metadata("domain2", &engine, None)?,
             Some("domain2_commit1".to_string())
         );
         assert_eq!(
-            snapshot.get_domain_metadata("domain3", &engine)?,
+            snapshot.get_domain_metadata("domain3", &engine, None)?,
             Some("domain3_commit0".to_string())
         );
         let err = snapshot
-            .get_domain_metadata("delta.domain3", &engine)
+            .get_domain_metadata("delta.domain3", &engine, None)
             .unwrap_err();
         assert!(matches!(err, KernelError::Generic(msg) if
                 msg == "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain"));
 
         assert_eq!(
-            snapshot.get_domain_metadata_internal("delta.domain3", &engine)?,
+            snapshot.get_domain_metadata_internal("delta.domain3", &engine, None)?,
             Some("domain3_commit1".to_string())
         );
 
-        let mut metadata = snapshot.get_all_domain_metadata(&engine)?;
+        let mut metadata = snapshot.get_all_domain_metadata(&engine, None)?;
         metadata.sort_by(|a, b| a.domain().cmp(b.domain()));
 
         let mut expected = vec![
@@ -3103,7 +3144,7 @@ mod tests {
         .await;
 
         let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-        let result = snapshot.get_row_tracking_high_water_mark(&engine);
+        let result = snapshot.get_row_tracking_high_water_mark(&engine, None);
         if let Some(expected_error) = expected_error {
             assert_result_error_with_message(result, expected_error);
         } else {
@@ -3790,7 +3831,7 @@ mod tests {
             .commit(&engine)
             .unwrap();
         let snapshot = Snapshot::builder_for("memory:///").build(&engine).unwrap();
-        let result = snapshot.get_clustering_column_infos(&engine).unwrap();
+        let result = snapshot.get_clustering_column_infos(&engine, None).unwrap();
 
         match expected_logical {
             None => assert_eq!(result, None),

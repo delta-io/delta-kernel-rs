@@ -517,9 +517,18 @@ impl From<kernel::CheckpointWriteStats> for CheckpointWriteStats {
     }
 }
 
+/// Identifiers of a failed CRC or domain metadata read.
+#[repr(C)]
+pub struct ReadFailure {
+    pub operation_id: MetricId,
+    pub correlation_id: KernelStringSlice,
+}
+
 /// A domain metadata load completed.
 #[repr(C)]
 pub struct DomainMetadataLoadSuccess {
+    pub operation_id: MetricId,
+    pub correlation_id: KernelStringSlice,
     pub from_cache: bool,
     pub num_domains_returned: u64,
     pub duration_ns: u64,
@@ -536,6 +545,8 @@ pub struct SetTransactionLoadSuccess {
 /// A CRC file was read and parsed successfully.
 #[repr(C)]
 pub struct CrcReadSuccess {
+    pub operation_id: MetricId,
+    pub correlation_id: KernelStringSlice,
     pub bytes_read: u64,
     pub duration_ns: u64,
 }
@@ -605,6 +616,10 @@ pub struct LastCheckpointReadCompleted {
     /// Wall-clock time from entry through return, including parsing and validation, in
     /// nanoseconds.
     pub duration_ns: u64,
+    /// Id of the snapshot build that requested this read.
+    pub operation_id: MetricId,
+    /// Borrowed caller-supplied id, empty when absent.
+    pub correlation_id: KernelStringSlice,
 }
 
 /// A `JsonHandler::read_json_files` call completed.
@@ -679,11 +694,11 @@ pub enum MetricEvent {
     TransactionCommitSuccess(TransactionCommitSuccess),
     TransactionCommitFailure(TransactionCommitFailure),
     DomainMetadataLoadSuccess(DomainMetadataLoadSuccess),
-    DomainMetadataLoadFailure,
+    DomainMetadataLoadFailure(ReadFailure),
     SetTransactionLoadSuccess(SetTransactionLoadSuccess),
     SetTransactionLoadFailure,
     CrcReadSuccess(CrcReadSuccess),
-    CrcReadFailure,
+    CrcReadFailure(ReadFailure),
     JsonReadCompleted(JsonReadCompleted),
     ParquetReadCompleted(ParquetReadCompleted),
     ScanMetadataCompleted(ScanMetadataCompleted),
@@ -705,6 +720,15 @@ fn duration_ns(duration: std::time::Duration) -> u64 {
 /// unset. The slice is valid only as long as the source kernel event is alive.
 fn correlation_id_slice(correlation_id: Option<&str>) -> KernelStringSlice {
     match correlation_id {
+        // Safety: the borrowed str lives as long as the source event, which outlives both the FFI
+        // event and the callback it is passed to.
+        Some(id) => unsafe { KernelStringSlice::new_unsafe(id) },
+        None => KernelStringSlice::empty(),
+    }
+}
+
+fn optional_string_slice(value: Option<&str>) -> KernelStringSlice {
+    match value {
         // Safety: the borrowed str lives as long as the source event, which outlives both the FFI
         // event and the callback it is passed to.
         Some(id) => unsafe { KernelStringSlice::new_unsafe(id) },
@@ -862,15 +886,25 @@ impl MetricEvent {
                 reason: (*reason).into(),
             }),
             K::DomainMetadataLoadSuccess(kernel::DomainMetadataLoadSuccess {
+                operation_id,
+                correlation_id,
                 from_cache,
                 num_domains_returned,
                 duration,
             }) => Self::DomainMetadataLoadSuccess(DomainMetadataLoadSuccess {
+                operation_id: (*operation_id).into(),
+                correlation_id: optional_string_slice(correlation_id.as_deref()),
                 from_cache: *from_cache,
                 num_domains_returned: *num_domains_returned,
                 duration_ns: duration_ns(*duration),
             }),
-            K::DomainMetadataLoadFailure => Self::DomainMetadataLoadFailure,
+            K::DomainMetadataLoadFailure {
+                operation_id,
+                correlation_id,
+            } => Self::DomainMetadataLoadFailure(ReadFailure {
+                operation_id: (*operation_id).into(),
+                correlation_id: optional_string_slice(correlation_id.as_deref()),
+            }),
             K::SetTransactionLoadSuccess(kernel::SetTransactionLoadSuccess {
                 from_cache,
                 found,
@@ -882,17 +916,31 @@ impl MetricEvent {
             }),
             K::SetTransactionLoadFailure => Self::SetTransactionLoadFailure,
             K::CrcReadSuccess(kernel::CrcReadSuccess {
+                operation_id,
+                correlation_id,
                 bytes_read,
                 duration,
             }) => Self::CrcReadSuccess(CrcReadSuccess {
+                operation_id: (*operation_id).into(),
+                correlation_id: optional_string_slice(correlation_id.as_deref()),
                 bytes_read: *bytes_read,
                 duration_ns: duration_ns(*duration),
             }),
-            K::CrcReadFailure => Self::CrcReadFailure,
+            K::CrcReadFailure {
+                operation_id,
+                correlation_id,
+            } => Self::CrcReadFailure(ReadFailure {
+                operation_id: (*operation_id).into(),
+                correlation_id: optional_string_slice(correlation_id.as_deref()),
+            }),
             K::LastCheckpointReadCompleted(kernel::LastCheckpointReadCompleted {
+                operation_id,
+                correlation_id,
                 outcome,
                 duration,
             }) => Self::LastCheckpointReadCompleted(LastCheckpointReadCompleted {
+                operation_id: (*operation_id).into(),
+                correlation_id: optional_string_slice(correlation_id.as_deref()),
                 outcome: (*outcome).into(),
                 duration_ns: duration_ns(*duration),
             }),
@@ -1061,8 +1109,12 @@ mod tests {
         #[case] outcome: kernel::LastCheckpointReadOutcome,
         #[case] expected: LastCheckpointReadOutcome,
     ) {
+        let operation_id = kernel::MetricId::new();
         let event =
             kernel::MetricEvent::LastCheckpointReadCompleted(kernel::LastCheckpointReadCompleted {
+                operation_id,
+                correlation_id: Some("lookup".into()),
+
                 outcome,
                 duration: Duration::from_nanos(17),
             });
@@ -1072,6 +1124,10 @@ mod tests {
             };
             assert_eq!(event.outcome, expected);
             assert_eq!(event.duration_ns, 17);
+            assert_eq!(event.operation_id.bytes, operation_id.as_bytes());
+            let correlation: &str =
+                unsafe { TryFromStringSlice::try_from_slice(&event.correlation_id).unwrap() };
+            assert_eq!(correlation, "lookup");
         });
     }
 

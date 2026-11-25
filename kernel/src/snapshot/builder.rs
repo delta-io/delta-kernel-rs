@@ -1225,6 +1225,22 @@ pub(super) mod tests {
         // The build event and its snapshot-load child events must all carry the id, since they
         // ride the same SnapshotLoadMetricContext.
         let events = reporter.events();
+        let build = events
+            .iter()
+            .find_map(|e| match e {
+                MetricEvent::SnapshotBuildSuccess(s) => Some(s),
+                _ => None,
+            })
+            .unwrap();
+        let hint = events
+            .iter()
+            .find_map(|e| match e {
+                MetricEvent::LastCheckpointReadCompleted(h) => Some(h),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(hint.operation_id, build.operation_id);
+        assert_eq!(hint.correlation_id.as_deref(), correlation_id);
         let id_of = |pick: fn(&MetricEvent) -> Option<&Option<Arc<str>>>| {
             events
                 .iter()

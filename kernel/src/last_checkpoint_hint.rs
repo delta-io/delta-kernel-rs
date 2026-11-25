@@ -13,8 +13,8 @@ use crate::actions::CheckpointAction;
 use crate::actions::{
     CheckpointMetadata, DomainMetadata, Metadata, Protocol, SetTransaction, Sidecar,
 };
-use crate::metrics::LastCheckpointReadOutcome;
 use crate::metrics::events::LAST_CHECKPOINT_READ_SPAN;
+use crate::metrics::{LastCheckpointReadOutcome, SnapshotLoadMetricContext};
 use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::schema::SchemaRef;
 use crate::{FileMeta, KernelError, KernelResult, StorageHandler, Version};
@@ -446,12 +446,13 @@ impl LastCheckpointHint {
     #[instrument(
         name = LAST_CHECKPOINT_READ_SPAN,
         skip_all,
-        fields(report, outcome, enable_call_frame),
+        fields(report, outcome, enable_call_frame, operation_id = %context.operation_id, correlation_id = context.correlation_id.as_deref().unwrap_or("")),
         err
     )]
     pub(crate) fn try_read(
         storage: &dyn StorageHandler,
         log_root: &Url,
+        context: &SnapshotLoadMetricContext,
     ) -> KernelResult<Option<LastCheckpointHint>> {
         let file_path = Self::path(log_root)?;
         let mut files = storage
@@ -651,7 +652,11 @@ mod tests {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
         let log_root = Url::parse("memory:///_delta_log/").unwrap();
-        let result = LastCheckpointHint::try_read(&TestStorageHandler(Some(behavior)), &log_root);
+        let result = LastCheckpointHint::try_read(
+            &TestStorageHandler(Some(behavior)),
+            &log_root,
+            &SnapshotLoadMetricContext::for_test(),
+        );
         assert_eq!(result.is_err(), returns_error);
         if !returns_error {
             assert_eq!(
@@ -667,7 +672,14 @@ mod tests {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
         let log_root = Url::parse("data:text/plain,not-a-directory").unwrap();
-        assert!(LastCheckpointHint::try_read(&TestStorageHandler(None), &log_root).is_err());
+        assert!(
+            LastCheckpointHint::try_read(
+                &TestStorageHandler(None),
+                &log_root,
+                &SnapshotLoadMetricContext::for_test()
+            )
+            .is_err()
+        );
         assert_read_outcome(&reporter, LastCheckpointReadOutcome::Error);
     }
 
@@ -914,7 +926,12 @@ mod tests {
             .unwrap();
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
-        let hint = LastCheckpointHint::try_read(storage.as_ref(), &log_root).unwrap();
+        let hint = LastCheckpointHint::try_read(
+            storage.as_ref(),
+            &log_root,
+            &SnapshotLoadMetricContext::for_test(),
+        )
+        .unwrap();
         assert_eq!(hint.is_some(), retained, "{json}");
         assert_read_outcome(
             &reporter,
@@ -1452,8 +1469,12 @@ mod tests {
 
         let (engine, snapshot, _tempdir) = load_test_table(table)?;
         let seg = snapshot.log_segment();
-        let hint = LastCheckpointHint::try_read(engine.storage_handler().as_ref(), &seg.log_root)?
-            .expect("table has a _last_checkpoint");
+        let hint = LastCheckpointHint::try_read(
+            engine.storage_handler().as_ref(),
+            &seg.log_root,
+            &SnapshotLoadMetricContext::for_test(),
+        )?
+        .expect("table has a _last_checkpoint");
         let v2 = hint.v2_checkpoint.as_ref().expect("V2 checkpoint hint");
 
         // Version, checkpoint file path, and sidecar paths are this table's exact identity.
@@ -1655,7 +1676,11 @@ mod tests {
             &engine,
             Arc::new(crate::unit_test_utils::TestCancellationToken::cancelled()),
         );
-        let result = LastCheckpointHint::try_read(engine.storage_handler().as_ref(), &log_root);
+        let result = LastCheckpointHint::try_read(
+            engine.storage_handler().as_ref(),
+            &log_root,
+            &SnapshotLoadMetricContext::for_test(),
+        );
         assert!(matches!(result, Err(KernelError::Cancelled)));
         assert_read_outcome(&reporter, LastCheckpointReadOutcome::Error);
     }
