@@ -1090,7 +1090,7 @@ fn prefetch_lists_are_complete_or_omitted(
             null_metadata,
             null_add,
             crate::expressions::StructData::try_new(
-                Remove::to_schema().fields().cloned().collect(),
+                Arc::new(Remove::to_schema()),
                 Remove::to_schema()
                     .fields()
                     .map(|field| match field.name().as_str() {
