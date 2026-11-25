@@ -102,15 +102,18 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case("crc-full", 0, Some(0))]
-    #[case("crc-malformed", 0, None)]
-    #[case("crc-full", 999, None)]
+    #[case("crc-full", 0, Some(0), None)]
+    #[case("crc-malformed", 0, None, Some(CrcReadFailureReason::Parsing))]
+    #[case("crc-full", 999, None, Some(CrcReadFailureReason::NotFound))]
     fn optional_crc_read_preserves_cancellation(
         #[case] fixture: &str,
         #[case] version: u64,
         #[case] expected: Option<u64>,
+        #[case] expected_reason: Option<CrcReadFailureReason>,
         #[values(false, true)] cancelled: bool,
     ) {
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
         let table_root = test_table_root(&format!("./tests/data/{fixture}/"));
         let crc_path = ParsedLogPath::create_parsed_crc(&table_root, version);
         let token = Arc::new(TestCancellationToken::default());
@@ -123,6 +126,19 @@ mod tests {
             assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
         } else {
             assert_eq!(result.unwrap().map(|crc| crc.version), expected);
+        }
+        let reason = if cancelled {
+            Some(CrcReadFailureReason::Cancelled)
+        } else {
+            expected_reason
+        };
+        if let Some(reason) = reason {
+            assert_failure_reason(&reporter, reason);
+        } else {
+            assert!(matches!(
+                reporter.events().as_slice(),
+                [MetricEvent::CrcReadSuccess(_)]
+            ));
         }
     }
 

@@ -548,7 +548,7 @@ pub struct CrcReadSuccess {
 pub enum CrcReadFailureReason {
     /// Storage reported that the CRC file was absent.
     NotFound,
-    /// The CRC read returned no data.
+    /// Storage returned no data or a zero-byte file.
     Empty,
     /// The CRC contents could not be parsed or validated.
     Parsing,
