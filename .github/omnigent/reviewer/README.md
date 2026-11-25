@@ -276,16 +276,35 @@ coincide.
 PR authors using git stack must keep the generated stack list and immediate-parent PR link up
 to date. Parent and child PRs must belong to the same repository; the declared parent may already
 be merged. Head branches can live in forks. An unmerged parent's current head must be an ancestor
-of the child. Otherwise the workflow
-stops model review and creates a neutral Check Run explaining the boundary problem. Follow that
-check's instructions to refresh the description or synchronize the stack, then retry.
+of the child. If the resolver cannot establish the review base, the workflow stops before
+starting model sessions and creates a neutral Check Run explaining the range-selection problem.
+For ambiguous ancestry, it also posts the repair comment described below.
 [`resolve_review_base`](../review_scope.py) selects the boundary and logs its decision.
 
 A **patch excerpt** is the leading portion of the fetched PR change patch inserted into task
 messages. Selecting the commit range happens before applying the excerpt's byte limit.
 `pr_change_patch_bytes` in the workflow holds the fetched patch; `subagent_patch_excerpt_text`
-holds the excerpt included in subagent task messages. Neither a fetched patch nor a model's successful return proves every
-changed line was examined.
+holds the excerpt included in subagent task messages. Neither a fetched patch nor a model's
+successful return proves every changed line was examined.
+
+### When stack ancestry is ambiguous
+
+If the declared parent PR's ancestry cannot establish this PR's review base,
+`review_scope.resolve_review_base()` raises `AmbiguousStackRange` with the parent PR number,
+reason and suggested repair. The failed review-range resolution stops the workflow before it
+starts model sessions. An always-run step calls [`scope_publication.py`](../scope_publication.py)
+to post one repair PR Conversation comment per PR head commit. The comment names the declared
+parent PR and asks the author to rebase this PR's branch onto that parent PR's current head,
+push the branch and comment `/review inline`. The `AI Review Summary` Check Run shows the same
+repair text with GitHub conclusion `neutral`. No orchestrator report or final findings are
+produced.
+
+Reruns reuse the existing GitHub Actions bot comment, updating it if the parent declaration or
+repair instructions change. Each run separately records the PR number, PR head commit, declared
+parent PR number, reason, workflow URL and comment URL when confirmed in
+`/tmp/review_scope_outcome.json`. The Actions run retains that outcome as a scope artifact for
+seven days. Invalid descriptions, empty review ranges and API failures keep their own
+diagnostics and produce no ancestry repair comment.
 
 ## Input limits
 
@@ -382,27 +401,8 @@ PR change patch and shared PR task text with seven-day retention.
 | `/tmp/review_accounting.json` | Validation step | Execution-record builder reads the orchestrator's consolidation outcomes. |
 | `/tmp/review_execution.json` | Execution-record step | Check Run displays its tables; Actions retains the record for seven days. |
 | `/tmp/review_status.json` | Status computation | Actions retains the advisory status, counted findings and unmet status requirements. |
+| `/tmp/review_scope_outcome.json` | Range resolver and repair-comment publisher | Actions retains the skipped-review outcome and confirmed repair-comment URL for seven days. |
 
-### When stack ancestry is ambiguous
-
-If the declared parent PR's ancestry cannot establish this PR's review base,
-`review_scope.resolve_review_base()` raises `AmbiguousStackRange` with the parent PR number,
-reason and suggested repair. The failed review-range resolution stops the workflow before it
-starts model sessions. An always-run step calls [`scope_publication.py`](../scope_publication.py)
-to post one repair PR Conversation comment per PR head commit. The comment names the declared
-parent PR and asks the author to rebase this PR's branch onto that parent PR's current head,
-push the branch and comment `/review inline`. The `AI Review Summary` Check Run shows the same
-repair text with GitHub conclusion `neutral`. No orchestrator report or final findings are
-produced.
-
-Reruns reuse the existing GitHub Actions bot comment, updating it if the parent declaration or
-repair instructions change. Each run separately records the PR number, PR head commit, declared
-parent PR number, reason, workflow URL and comment URL when confirmed in
-`/tmp/review_scope_outcome.json`. The Actions run retains that outcome as a scope artifact for
-seven days. Invalid descriptions, empty review ranges and API failures keep their own
-diagnostics and produce no ancestry repair comment.
-
-## Review input limits
 ## Review execution record
 
 The orchestrator dispatches every configured Reviewer subagent. A specialist with no applicable
