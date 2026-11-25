@@ -321,7 +321,7 @@ class InlineReviewTest(unittest.TestCase):
         self.assertIn(
             "printf 'project_doc_max_bytes = 0\\n' > \"$HOME/.codex/config.toml\"", workflow
         )
-        self.assertIn("[PR description truncated at 4096 characters", workflow)
+        self.assertIn("[PR description truncated at 8192 UTF-8 bytes", workflow)
         self.assertIn("format_review_history", workflow)
         self.assertIn("OMNIGENT_BOT_LOGIN: ${{ vars.OMNIGENT_BOT_LOGIN }}", workflow)
         self.assertIn("OMNIGENT_BOT_APP_ID: ${{ vars.OMNIGENT_BOT_APP_ID }}", workflow)

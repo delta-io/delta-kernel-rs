@@ -477,7 +477,10 @@ jobs:
           reviewer_root = pathlib.Path(".github/omnigent/reviewer")
           agent_root = pathlib.Path(".github/omnigent/reviewer/agents")
           config_paths = list(agent_root.glob("*/config.yaml"))
-          entrypoints = list(entrypoint_root.glob("*.py"))
+          entrypoints = [
+              path for path in entrypoint_root.glob("*.py")
+              if path.name != "list_changed_paths.py"
+          ]
           if not implementation.is_file() or not entrypoints or not config_paths:
               raise SystemExit("AI reviewer source tool or agent configs are missing.")
 
@@ -494,6 +497,14 @@ jobs:
               for entrypoint in entrypoints:
                   shutil.copyfile(entrypoint, target_dir / entrypoint.name)
 
+          # The orchestrator can page through the complete scoped path manifest.
+          shutil.copyfile(
+              ".github/omnigent/diff_coverage.py", reviewer_root / "lib/diff_coverage.py"
+          )
+          shutil.copyfile(
+              entrypoint_root / "list_changed_paths.py",
+              reviewer_root / "tools/python/list_changed_paths.py",
+          )
           print(f"Installed read-only source tools in {len(tool_roots)} bundle locations.")
           PYEOF
 
@@ -656,6 +667,8 @@ jobs:
 
           manager = ToolManager(reviewer, workdir=reviewer_root, sandbox_enabled=False)
           tool_names = set(manager.get_tool_names())
+          if "list_changed_paths" not in tool_names:
+              raise SystemExit("The orchestrator's scoped path reader is missing.")
           if "sys_session_create" in tool_names:
               print("::error::sys_session_create must not be exposed to the AI reviewer.")
               sys.exit(1)
@@ -989,6 +1002,7 @@ jobs:
 
           sys.path.insert(0, ".github/omnigent")
           from inline_review import inline_prompt_instructions
+          from diff_coverage import parent_prompt, prepare_inputs
           from review_history import (
               DEFAULT_TRUSTED_BOT_LOGINS,
               attach_inline_comment_sides,
@@ -997,19 +1011,9 @@ jobs:
           from child_task import (
               build_pr_data,
               build_root_guidance,
-              format_pr_diff,
               format_pr_metadata_and_description,
           )
 
-          # Both task builders use this prefix of the fetched PR change patch. Count raw bytes
-          # before decoding; the patch excerpt excludes assignment text and other PR data.
-          max_patch_excerpt_bytes = 80_000
-
-          # The initial task message is one omnigent run -p argument. On Linux with 4 KiB pages,
-          # an argument is limited to 131,072 bytes including its trailing NUL. Leave headroom
-          # below that bound and count the entire initial task message in UTF-8 bytes.
-          # Role instructions, tool definitions and later conversation are outside this cap.
-          max_orchestrator_initial_task_message_bytes = 120_000
           review_marker = os.environ["REVIEW_MARKER"]
           review_base_sha = os.environ["REVIEW_BASE_SHA"]
           output_contract = inline_prompt_instructions(review_marker)
@@ -1030,22 +1034,30 @@ jobs:
           prior_ai_review_text = format_review_history(
               history_document, trusted_bot_logins
           )
-          raw_pr_description = pr_metadata.get("body") or ""
-          pr_description_excerpt_text = raw_pr_description[:4096]
-          if len(raw_pr_description) > len(pr_description_excerpt_text):
-              pr_description_excerpt_text += (
-                  "\n\n[PR description truncated at 4096 characters by the workflow.]"
-              )
           pr_change_patch_bytes = pathlib.Path("/tmp/pr_diff.txt").read_bytes()
-          truncated = len(pr_change_patch_bytes) > max_patch_excerpt_bytes
-          pr_change_patch_excerpt_text = pr_change_patch_bytes[:max_patch_excerpt_bytes].decode(
-              "utf-8", errors="replace"
+          inputs = prepare_inputs(
+              pr_change_patch_bytes, pr_metadata.get("body") or "", review_base_sha, pr_metadata["head"]["sha"]
           )
+          pr_description_excerpt_text = inputs["description"]
+          if inputs["description_truncated"]:
+              pr_description_excerpt_text += "\n\n[PR description truncated at 8192 UTF-8 bytes by the workflow.]"
+          pr_change_patch_excerpt_text = inputs["child_diff"]
+          coverage = inputs["coverage"]
+          pathlib.Path("/tmp/ai_review_changed_paths.json").write_text(json.dumps(coverage))
+          pathlib.Path("/tmp/diff_coverage.json").write_text(json.dumps(coverage))
+          print(
+              f"Review range {review_base_sha}...{pr_metadata['head']['sha']}: "
+              f"{coverage['delivered_bytes']}/{coverage['total_bytes']} child diff bytes; "
+              f"{coverage['full_files']} full, {coverage['partial_files']} partial, "
+              f"{coverage['omitted_files']} omitted files."
+          )
+          for entry in coverage["files"]:
+              if entry["status"] != "full":
+                  print(json.dumps(entry, ensure_ascii=True))
           truncation_note = (
-              "\n\n[Diff truncated at 80000 bytes by the workflow. Use the "
-              "read-only PR source tools for additional context.]"
-              if truncated
-              else ""
+              "\n\n[Diff truncated at 100000 bytes by the workflow. Use read-only source "
+              "tools for context; the visible diff bounds new findings.]"
+              if not coverage["complete"] else ""
           )
           review_scope = (
               "## Review scope\n"
@@ -1132,16 +1144,9 @@ jobs:
           Failed agents: comma-separated checked-in agent names, or none
           Do not downgrade a finding to bypass a failed gate.
 
-          {format_pr_diff(pr_change_patch_excerpt_text, truncation_note)}
           """
-          if (
-              len(orchestrator_initial_task_text.encode("utf-8"))
-              > max_orchestrator_initial_task_message_bytes
-          ):
-              raise SystemExit("Orchestrator task exceeds the 120000-byte execution limit.")
-          pathlib.Path("/tmp/orchestrator_task.md").write_text(
-              orchestrator_initial_task_text, encoding="utf-8"
-          )
+          orchestrator_initial_task_text = parent_prompt(orchestrator_initial_task_text, pr_change_patch_bytes, coverage)
+          pathlib.Path("/tmp/orchestrator_task.md").write_text(orchestrator_initial_task_text, encoding="utf-8")
           PYEOF
 
       # This GitHub-generated archive is untrusted reference data. Nothing from it may be executed.
@@ -1427,6 +1432,7 @@ jobs:
             --findings /tmp/inline_findings.json \
             --github-pr-patch /tmp/github_pr_diff.txt \
             --pr-change-patch /tmp/pr_diff.txt \
+            --coverage /tmp/diff_coverage.json \
             --head-sha "$HEAD_SHA" \
             --run-url "$RUN_URL" \
             --repository "$REPO" \
