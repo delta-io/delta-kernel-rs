@@ -4,12 +4,12 @@ use std::backtrace::Backtrace;
 use std::error::Error as StdError;
 use std::fmt;
 
-use super::{BoxedError, DeltaErrorCondition};
+use super::{BoxedError, DeltaErrorCondition, KernelError};
+#[cfg(any(test, feature = "test-utils"))]
+use crate::KernelResult;
 use crate::Version;
 use crate::schema::StructType;
 use crate::table_properties::LOG_RETENTION_DURATION;
-#[cfg(any(test, feature = "test-utils"))]
-use crate::{KernelError, KernelResult};
 
 /// A catalog-defined Delta failure that terminates the current operation.
 ///
@@ -104,6 +104,35 @@ impl DeltaError {
     /// environment setting. Capture also requires platform support.
     pub fn backtrace(&self) -> &Backtrace {
         &self.backtrace
+    }
+
+    /// Consumes this error and returns its immediate cause, if present.
+    pub fn into_source(self) -> Option<BoxedError> {
+        self.source
+    }
+
+    /// Extracts the first underlying [`KernelError`] through Delta errors and diagnostic contexts.
+    ///
+    /// Success preserves the Kernel error's payload and backtrace, discarding the outer Delta
+    /// errors and diagnostic contexts. If the chain ends or reaches any other error type, returns
+    /// this Delta error unchanged, even if that type exposes a Kernel error through
+    /// [`StdError::source`]. Such sources can only be borrowed, so they cannot be extracted.
+    ///
+    /// ```
+    /// use delta_kernel::{DeltaError, KernelError};
+    ///
+    /// let error = DeltaError::path_does_not_exist("table", Some(Box::new(KernelError::EmptyLog)));
+    /// assert!(matches!(error.try_into_kernel_error(), Ok(KernelError::EmptyLog)));
+    ///
+    /// let error = DeltaError::path_does_not_exist("table", None);
+    /// let original = error.try_into_kernel_error().unwrap_err();
+    /// assert_eq!(original.parameters()[0].value(), "table");
+    /// ```
+    pub fn try_into_kernel_error(mut self) -> std::result::Result<KernelError, Self> {
+        match take_kernel_error(&mut self.source) {
+            Some(error) => Ok(error),
+            None => Err(self),
+        }
     }
 
     /// Creates a `DELTA_PATH_DOES_NOT_EXIST` error for a table root that does not exist or has no
@@ -278,7 +307,7 @@ impl DeltaError {
 
     /// Adds diagnostic context ahead of the original source without changing catalog metadata.
     pub(crate) fn with_context(mut self, context: String) -> Self {
-        self.source = Some(Box::new(DiagnosticContext {
+        self.source = Some(Box::new(DeltaErrorContext {
             context,
             source: self.source.take(),
         }));
@@ -317,11 +346,21 @@ impl DeltaError {
 }
 
 /// Operation context retained in the diagnostic source chain, outside the catalog message.
+///
+/// Kernel attaches these frames to [`DeltaError`] sources. Downcast an owned source to this type
+/// and use [`Self::into_source`] to remove a frame while retaining ownership of its cause.
 #[derive(Debug, thiserror::Error)]
 #[error("{context}")]
-struct DiagnosticContext {
+pub struct DeltaErrorContext {
     context: String,
     source: Option<BoxedError>,
+}
+
+impl DeltaErrorContext {
+    /// Consumes this diagnostic frame and returns its immediate cause, if present.
+    pub fn into_source(self) -> Option<BoxedError> {
+        self.source
+    }
 }
 
 /// Renders the catalog message, inserting parameter values verbatim.
@@ -376,6 +415,29 @@ impl DeltaErrorParameter {
     }
 }
 
+fn take_kernel_error(mut source: &mut Option<BoxedError>) -> Option<KernelError> {
+    loop {
+        let error = source.as_ref()?;
+        if error.is::<KernelError>() {
+            // Leave every frame intact until the owned Kernel error can be removed.
+            return match source.take()?.downcast::<KernelError>() {
+                Ok(error) => Some(*error),
+                Err(error) => {
+                    *source = Some(error);
+                    None
+                }
+            };
+        }
+        source = if error.is::<DeltaError>() {
+            &mut source.as_mut()?.downcast_mut::<DeltaError>()?.source
+        } else if error.is::<DeltaErrorContext>() {
+            &mut source.as_mut()?.downcast_mut::<DeltaErrorContext>()?.source
+        } else {
+            return None;
+        };
+    }
+}
+
 fn render_template(
     template: &str,
     parameters: &[DeltaErrorParameter],
@@ -406,10 +468,109 @@ mod tests {
 
     use rstest::rstest;
 
-    use super::{DeltaError, DeltaErrorParameter, render_template};
+    use super::{DeltaError, DeltaErrorContext, DeltaErrorParameter, render_template};
     use crate::schema::StructType;
     use crate::table_features::ColumnMappingMode;
     use crate::{BoxedError, DeltaErrorCondition, Error, KernelError, Result};
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("opaque context")]
+    struct OpaqueContext(#[source] BoxedError);
+
+    #[rstest]
+    fn extracts_kernel_error_through_delta_errors_and_contexts(
+        #[values(0, 1, 8)] depth: usize,
+        #[values(false, true)] backtraced: bool,
+    ) {
+        let payload = String::from("retained payload");
+        let original_payload = payload.as_ptr();
+        let kernel = KernelError::Generic(payload);
+        let backtrace = Box::new(Backtrace::force_capture());
+        let original_backtrace = std::ptr::from_ref(backtrace.as_ref());
+        let kernel = if backtraced {
+            KernelError::Backtraced {
+                source: Box::new(kernel),
+                backtrace,
+            }
+        } else {
+            kernel
+        };
+        let mut delta = DeltaError::path_does_not_exist("table", Some(Box::new(kernel)));
+        for _ in 0..depth {
+            delta = DeltaError::invalid_version(-1, Some(Box::new(delta)))
+                .with_context("operation".into());
+        }
+
+        let kernel = delta.try_into_kernel_error().unwrap();
+
+        let KernelError::Generic(payload) = kernel.without_backtrace() else {
+            panic!("expected retained payload");
+        };
+        assert_eq!(payload, "retained payload");
+        assert_eq!(payload.as_ptr(), original_payload);
+        if backtraced {
+            let KernelError::Backtraced { backtrace, .. } = kernel else {
+                panic!("expected retained backtrace");
+            };
+            assert!(std::ptr::eq(backtrace.as_ref(), original_backtrace));
+        } else {
+            assert!(matches!(kernel, KernelError::Generic(_)));
+        }
+    }
+
+    #[rstest]
+    #[case::no_source(None)]
+    #[case::foreign_source(Some(Box::new(io::Error::other("foreign cause")) as BoxedError))]
+    #[case::opaque_kernel(Some(Box::new(OpaqueContext(Box::new(KernelError::EmptyLog))) as BoxedError))]
+    #[case::empty_nested_delta(Some(Box::new(DeltaError::invalid_version(-1, None)) as BoxedError))]
+    fn failed_extraction_preserves_original_error(
+        #[case] source: Option<BoxedError>,
+        #[values(0, 1, 8)] depth: usize,
+    ) {
+        let mut delta = DeltaError::path_does_not_exist("table", source);
+        for _ in 0..depth {
+            delta = delta.with_context("operation".into());
+        }
+        let debug = format!("{delta:?}");
+        let source_address = delta.source().map(std::ptr::from_ref);
+
+        let original = delta.try_into_kernel_error().unwrap_err();
+
+        assert_eq!(format!("{original:?}"), debug);
+        match (source_address, original.source()) {
+            (Some(address), Some(source)) => assert!(std::ptr::eq(source, address)),
+            (None, None) => {}
+            _ => panic!("source changed"),
+        }
+    }
+
+    #[rstest]
+    fn into_source_moves_immediate_cause(
+        #[values(false, true)] diagnostic_context: bool,
+        #[values(false, true)] has_source: bool,
+    ) {
+        let source = has_source.then(|| Box::new(KernelError::Generic("cause".into())));
+        let original_address = source.as_deref().map(std::ptr::from_ref);
+        let source = source.map(|source| source as BoxedError);
+        let source = if diagnostic_context {
+            DeltaErrorContext {
+                context: "operation".into(),
+                source,
+            }
+            .into_source()
+        } else {
+            DeltaError::path_does_not_exist("table", source).into_source()
+        };
+
+        match (original_address, source) {
+            (Some(address), Some(source)) => {
+                let kernel = source.downcast::<KernelError>().unwrap();
+                assert!(std::ptr::eq(kernel.as_ref(), address));
+            }
+            (None, None) => {}
+            _ => panic!("source changed"),
+        }
+    }
 
     struct LimitedWriter {
         remaining_bytes: usize,
