@@ -10,7 +10,7 @@ use crate::actions::{
     ADD_FIELD, ADD_NAME, ADD_SCHEMA, Add, REMOVE_NAME, STATS_PARSED, get_all_actions_schema,
 };
 use crate::checkpoint::CheckpointInfo;
-use crate::checkpoint::collation_stats::source_collation_stats;
+use crate::checkpoint::collation_stats::{COLLATION_STATS, source_collation_stats};
 use crate::expressions::{
     ColumnName, Expression as Expr, Predicate, UnaryExpressionOp, col, column_name, expr,
 };
@@ -326,17 +326,30 @@ impl<'a> MetadataPlanner<'a> {
 
         // Decide what kind of stats to read from the file by transforming `ADD_SCHEMA` based on the
         // `file_schema` and table-derived stats schema.
-        let prefer_json_stats = self.stats.synthesize_json && file_add_schema.contains(STATS);
-        let (patch, stats_kind) = match (self.stats_schema.as_ref(), get_type_of(STATS_PARSED)) {
+        // Source collation identifiers and bound types can differ from the sampled output schema.
+        let stats_schema = self
+            .stats_schema
+            .as_ref()
+            .map(|stats| {
+                if self.read_collations && stats.contains(COLLATION_STATS) {
+                    SchemaStructPatchBuilder::new()
+                        .drop(COLLATION_STATS)
+                        .build(stats)
+                        .map(Arc::new)
+                } else {
+                    Ok(stats.clone())
+                }
+            })
+            .transpose()?;
+        let (patch, stats_kind) = match (stats_schema.as_ref(), get_type_of(STATS_PARSED)) {
             // Parsed statistics are requested and present in the file
             (Some(required_stats), Some(DataType::Struct(file_parsed_stats)))
-                if !prefer_json_stats
-                    && LogSegment::structs_have_compatible_types(
-                        file_parsed_stats,
-                        required_stats,
-                        STATS_PARSED,
-                        CheckpointFieldKind::Stats,
-                    ) =>
+                if LogSegment::structs_have_compatible_types(
+                    file_parsed_stats,
+                    required_stats,
+                    STATS_PARSED,
+                    CheckpointFieldKind::Stats,
+                ) =>
             {
                 let stats_schema = required_stats.clone().try_fold_with(
                     source_collation_stats(file_schema).filter(|_| self.read_collations),
@@ -388,8 +401,8 @@ impl<'a> MetadataPlanner<'a> {
         Ok((Arc::new(read_schema), stats_kind, has_struct_partitions))
     }
 
-    /// Adds structured metadata needed by the stats filter or requested output when the source
-    /// could not provide compatible native fields.
+    /// Normalizes statistics and prepares structured metadata needed by the stats filter or
+    /// requested output.
     ///
     /// * JSON stats are parsed with `stats_schema`, retaining JSON when requested alongside them.
     /// * `add.partitionValues_parsed` is inserted when parsed partition values is not already
@@ -519,8 +532,22 @@ impl<'a> MetadataPlanner<'a> {
                     match (read_stats, output_stats_schema) {
                         (_, None) => patch.drop_at([ADD_NAME], STATS_PARSED),
                         (Some(read), Some(output)) if read != output.as_ref() => {
-                            let mut parent = vec![ADD_NAME.into(), STATS_PARSED.into()];
-                            Self::project_filter_only_stats(patch, read, output, &mut parent)
+                            if self.read_collations && output.contains(COLLATION_STATS) {
+                                // Parse to the sampled shape without relabeling source identifiers.
+                                let json = Expr::unary(
+                                    UnaryExpressionOp::TO_JSON,
+                                    col!(ADD_NAME, STATS_PARSED),
+                                );
+                                patch.replace_at(
+                                    [ADD_NAME],
+                                    STATS_PARSED,
+                                    StructField::nullable(STATS_PARSED, output.clone()),
+                                    Expr::parse_json(json, output.clone()),
+                                )
+                            } else {
+                                let mut parent = vec![ADD_NAME.into(), STATS_PARSED.into()];
+                                Self::project_filter_only_stats(patch, read, output, &mut parent)
+                            }
                         }
                         _ => patch,
                     }

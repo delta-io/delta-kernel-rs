@@ -164,7 +164,12 @@ fn assert_metadata_eq(
         writer.finish()?;
         let mut rows: Vec<Value> = serde_json::from_slice(&writer.into_inner())?;
         // Map entry order is immaterial; retain nulls, values, and duplicate rows.
-        rows.iter_mut().for_each(Value::sort_all_objects);
+        for row in &mut rows {
+            if let Some(stats) = row[STATS].as_str() {
+                row[STATS] = serde_json::from_str(stats)?;
+            }
+            row.sort_all_objects();
+        }
         rows.sort_by_cached_key(Value::to_string);
         Ok(rows)
     }
