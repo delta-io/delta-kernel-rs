@@ -49,7 +49,7 @@ use super::ir::nodes::{
 };
 use super::ir::plan::{Plan, PlanNode};
 use crate::expressions::{ColumnName, Expression, ExpressionRef, PredicateRef, Scalar, StructData};
-use crate::schema::{SchemaRef, ToSchema};
+use crate::schema::{DataType, SchemaRef, StructType, ToSchema};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::utils::CollectInto;
 use crate::{KernelError, KernelResult};
@@ -634,8 +634,9 @@ impl PlanBuilder {
         Ok(Self::present(schema, node, vec![probe, build]))
     }
 
-    /// Unordered bag union of `inputs` into a [`UnionAll`]. All inputs must share the same schema;
-    /// absent inputs are dropped, and a lone present input is forwarded unchanged.
+    /// Unordered bag union of `inputs` into a [`UnionAll`]. All inputs must share the same schema,
+    /// including nested field order; absent inputs are dropped, and a lone present input is
+    /// forwarded unchanged.
     ///
     /// Produces an error when `inputs` is empty, or two inputs have differing schemas.
     ///
@@ -657,7 +658,10 @@ impl PlanBuilder {
                 "union_all: requires at least one input",
             ));
         };
-        if let Some(i) = inputs.iter().position(|b| b.schema() != &schema) {
+        if let Some(i) = inputs
+            .iter()
+            .position(|b| b.schema() != &schema || !schema_field_order_matches(b.schema(), &schema))
+        {
             return Err(KernelError::generic(format!(
                 "union_all: input {i} has a schema differing from input 0: {:?} vs {:?}",
                 inputs[i].schema(),
@@ -740,6 +744,33 @@ impl From<Values> for PlanBuilder {
     }
 }
 
+// Schema equality ignores field order, but unions forward columns by position.
+fn schema_field_order_matches(left: &StructType, right: &StructType) -> bool {
+    left.fields().zip(right.fields()).all(|(left, right)| {
+        left.name() == right.name() && type_field_order_matches(left.data_type(), right.data_type())
+    })
+}
+
+fn type_field_order_matches(left: &DataType, right: &DataType) -> bool {
+    match (left, right) {
+        (DataType::Struct(left), DataType::Struct(right))
+        | (DataType::Variant(left), DataType::Variant(right))
+        | (DataType::File(left), DataType::File(right)) => schema_field_order_matches(left, right),
+        (DataType::Array(left), DataType::Array(right)) => {
+            type_field_order_matches(left.element_type(), right.element_type())
+        }
+        (DataType::Map(left), DataType::Map(right)) => {
+            type_field_order_matches(left.key_type(), right.key_type())
+                && type_field_order_matches(left.value_type(), right.value_type())
+        }
+        #[cfg(feature = "udt-in-dev")]
+        (DataType::UserDefined(left), DataType::UserDefined(right)) => {
+            type_field_order_matches(left.sql_type(), right.sql_type())
+        }
+        _ => true,
+    }
+}
+
 /// Error if any of `cols` fails to resolve against `schema` (nested paths supported).
 fn check_columns_resolve<'a>(
     schema: &SchemaRef,
@@ -793,7 +824,8 @@ mod tests {
     use crate::expressions::{Expression, Predicate, col, column_name, expr, lit};
     use crate::plans::ir::nodes::FileType;
     use crate::schema::{
-        DataType, MetadataColumnSpec, StructField, StructType, schema, schema_ref,
+        ArrayType, DataType, MapType, MetadataColumnSpec, StructField, StructType, schema,
+        schema_ref,
     };
 
     /// A single-file scan (present), no file-constant columns -- the trivial scan fixture.
@@ -1036,6 +1068,69 @@ mod tests {
             &[(&[], "values")],
         );
         Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::top_level(Arc::new)]
+    #[case::nested(|s| schema_ref! { nullable "nested": (s) })]
+    #[case::array(|s| schema_ref! { nullable "items": (ArrayType::new(s, true)) })]
+    #[case::map_key(|s| schema_ref! {
+        nullable "entries": (MapType::new(s, DataType::LONG, true))
+    })]
+    #[case::map_value(|s| schema_ref! {
+        nullable "entries": (MapType::new(DataType::STRING, s, true))
+    })]
+    #[case::array_of_maps(|s| schema_ref! {
+        nullable "items": (ArrayType::new(MapType::new(DataType::STRING, s, true), true))
+    })]
+    fn union_all_requires_matching_field_order(
+        #[case] wrap: fn(StructType) -> SchemaRef,
+        #[values(false, true)] reordered: bool,
+        #[values(false, true)] first_absent: bool,
+        #[values(false, true)] second_absent: bool,
+    ) -> KernelResult<()> {
+        let schema = schema! { nullable "a": LONG, nullable "b": LONG };
+        let other = if reordered {
+            schema! { nullable "b": LONG, nullable "a": LONG }
+        } else {
+            schema.clone()
+        };
+        let (schema, other) = (wrap(schema), wrap(other));
+        // Ordinary schema equality ignores field order, including in nested structs.
+        assert_eq!(schema, other);
+        let input = |schema, absent| {
+            if absent {
+                absent_over(schema)
+            } else {
+                vals(schema)
+            }
+        };
+        let result =
+            PlanBuilder::union_all([input(schema, first_absent), input(other, second_absent)]);
+        if reordered {
+            assert_result_error_with_message(result, "input 1 has a schema differing from input 0");
+        } else {
+            assert_eq!(
+                result?.build_opt()?.is_none(),
+                first_absent && second_absent
+            );
+        }
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::name(StructField::nullable("other", DataType::LONG))]
+    #[case::type_change(StructField::nullable("id", DataType::STRING))]
+    #[case::nullability(StructField::not_null("id", DataType::LONG))]
+    #[case::metadata(StructField::nullable("id", DataType::LONG)
+        .with_metadata([("key", "value")]))]
+    fn union_all_rejects_differing_fields(#[case] other: StructField) {
+        let first = vals(schema_ref! { nullable "id": LONG });
+        let second = vals(Arc::new(StructType::new_unchecked([other])));
+        assert_result_error_with_message(
+            PlanBuilder::union_all([first, second]),
+            "input 1 has a schema differing from input 0",
+        );
     }
 
     #[rstest::rstest]
