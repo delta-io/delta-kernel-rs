@@ -36,7 +36,7 @@ use crate::engine::arrow_conversion::{LIST_ARRAY_ROOT, TryFromKernel, TryIntoArr
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpressionOpAdaptor, ArrowOpaquePredicateOpAdaptor,
 };
-use crate::engine::arrow_utils::{list_type_with_element, parse_json_impl, prim_array_cmp};
+use crate::engine::arrow_utils::{list_type_with_element, parse_json_to_struct, prim_array_cmp};
 use crate::engine::ensure_data_types::{ValidationMode, ensure_data_types};
 use crate::error::{KernelError, KernelResult};
 use crate::expressions::{
@@ -399,10 +399,10 @@ pub fn evaluate_expression(
             let json_arr = evaluate_expression(&p.json_expr, batch, Some(&DataType::STRING))?;
             // Coarser backstop for genuinely malformed JSON (incomplete records, unmatched
             // braces, etc.). Cell-level type-parse failures in failure-prone leaves
-            // (Timestamp/Date/Decimal) are handled inside `parse_json_impl` itself, which
+            // (Timestamp/Date/Decimal) are handled inside `parse_json_to_struct` itself, which
             // converts them to per-cell NULL rather than failing the batch.
-            match parse_json_impl(json_arr.as_ref(), p.output_schema.clone()) {
-                Ok(batch) => Ok(Arc::new(StructArray::from(batch)) as ArrayRef),
+            match parse_json_to_struct(json_arr.as_ref(), p.output_schema.clone()) {
+                Ok(parsed) => Ok(Arc::new(parsed) as ArrayRef),
                 Err(e) => {
                     warn!(
                         "Failed to parse JSON stats as {}: {e}. Using null stats.",
@@ -1369,7 +1369,7 @@ mod tests {
         Predicate as Pred, StructData, col, column_expr_ref, column_pred, expr, lit, null_lit,
     };
     use crate::schema::{
-        ArrayType, DataType, MapType, StructField, StructType, schema, schema_ref,
+        ArrayType, DataType, MapType, SchemaRef, StructField, StructType, schema, schema_ref,
     };
     use crate::unit_test_utils::assert_result_error_with_message;
 
@@ -2934,8 +2934,7 @@ mod tests {
         assert_eq!(result.value(0), r#"{"b":"abcd","l":[1,2],"n":{"z":7}}"#);
     }
 
-    /// An empty string is not valid JSON, so it does not parse to an empty struct. A NULL input
-    /// decodes as `{}` and leaves the batch intact.
+    /// An empty string is not valid JSON, so it does not parse to an empty struct.
     ///
     /// Nulling the whole batch for one unparseable row is a limitation rather than a guarantee: the
     /// `arrow-json` error names no row, so the fallback can only blanket the array it was given,
@@ -2944,7 +2943,6 @@ mod tests {
     #[case::empty_string(vec![Some("")], 1)]
     #[case::malformed(vec![Some("{not json")], 1)]
     #[case::one_bad_input_nulls_whole_batch(vec![Some(""), Some(r#"{"a":1}"#)], 2)]
-    #[case::null_input_is_empty_object(vec![None], 0)]
     fn test_parse_json_permissively_nulls_unparseable_batches(
         #[case] input: Vec<Option<&str>>,
         #[case] expected_null_count: usize,
@@ -3129,32 +3127,109 @@ mod tests {
         assert_eq!(y_col.values(), &[2, 4]);
     }
 
-    #[test]
-    fn test_parse_json_with_nulls() {
-        let schema = ArrowSchema::new(vec![ArrowField::new("json_col", ArrowDataType::Utf8, true)]);
-        // NULL JSON strings are treated as empty objects {}
-        let json_strings = StringArray::from(vec![Some(r#"{"a": 1}"#), None, Some(r#"{"a": 3}"#)]);
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json_strings)]).unwrap();
-
+    #[rstest]
+    fn test_parse_json_preserves_null_inputs(
+        #[values(ArrowDataType::Utf8, ArrowDataType::LargeUtf8, ArrowDataType::Utf8View)]
+        input_type: ArrowDataType,
+        #[values(0, 1)] offset: usize,
+    ) {
+        let json_strings = StringArray::from(vec![
+            Some(r#"{"a":1}"#),
+            None,
+            Some("{}"),
+            Some(r#"{"a":null}"#),
+            Some(r#"{"a":3}"#),
+            None,
+        ]);
+        let json_strings = cast(&json_strings, &input_type).unwrap().slice(offset, 5);
+        let batch = RecordBatch::try_from_iter([("json_col", json_strings)]).unwrap();
         let output_schema = schema_ref! { nullable "a": LONG };
-
-        let expr = Expr::parse_json(col!("json_col"), output_schema);
+        let expr = Expr::parse_json(col!("json_col"), output_schema.clone());
         let result = evaluate_expression(&expr, &batch, None).unwrap();
+        let result = result.as_struct();
+        assert_eq!(result.len(), 5);
+        let values = [Some(1), None, None, None, Some(3), None];
+        assert_eq!(
+            result.column(0).as_ref(),
+            &Int64Array::from(values[offset..offset + 5].to_vec()),
+        );
 
-        let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
-        assert_eq!(struct_result.len(), 3);
+        let nulls = BooleanArray::from(vec![false, true, false, false, false, true]);
+        let is_null = evaluate_predicate(&Pred::is_null(expr.clone()), &batch, false).unwrap();
+        assert_eq!(is_null, nulls.slice(offset, 5));
 
-        let a_col = struct_result
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        // Row 0 has value 1, row 1 is null (from empty {}), row 2 has value 3
-        assert!(!a_col.is_null(0));
-        assert_eq!(a_col.value(0), 1);
-        assert!(a_col.is_null(1)); // NULL JSON string -> empty object -> null field
-        assert!(!a_col.is_null(2));
-        assert_eq!(a_col.value(2), 3);
+        let fallback = Expr::parse_json(lit(r#"{"a":42}"#), output_schema);
+        let coalesced =
+            evaluate_expression(&Expr::coalesce([expr, fallback]), &batch, None).unwrap();
+        let values = [Some(1), Some(42), None, None, Some(3), Some(42)];
+        assert_eq!(coalesced.null_count(), 0);
+        assert_eq!(
+            coalesced.as_struct().column(0).as_ref(),
+            &Int64Array::from(values[offset..offset + 5].to_vec()),
+        );
+    }
+
+    #[rstest]
+    #[case::required_long(schema_ref! { not_null "a": LONG }, r#"{"a":1}"#,
+        Arc::new(Int64Array::from(vec![1])))]
+    #[case::required_date(schema_ref! { not_null "a": DATE }, r#"{"a":"1970-01-02"}"#,
+        Arc::new(Date32Array::from(vec![1])))]
+    fn test_parse_json_null_root_preserves_required_field(
+        #[case] output_schema: SchemaRef,
+        #[case] valid: &str,
+        #[case] expected: ArrayRef,
+    ) {
+        let batch = RecordBatch::try_from_iter([(
+            "json_col",
+            Arc::new(StringArray::from(vec![None, Some("null"), Some(valid)])) as ArrayRef,
+        )])
+        .unwrap();
+        let expr = Expr::parse_json(col!("json_col"), output_schema);
+        let result = evaluate_expression(&expr, &batch, None).expect("parses permissively");
+        let parsed = result.as_struct();
+        assert_eq!(parsed.len(), 3);
+        assert!(parsed.is_null(0) && parsed.is_null(1) && parsed.is_valid(2));
+        assert_eq!(parsed.column(0).slice(2, 1).as_ref(), expected.as_ref());
+    }
+
+    #[rstest]
+    #[case::required_long(schema_ref! { not_null "a": LONG }, r#"{"a":1}"#)]
+    #[case::required_date(schema_ref! { not_null "a": DATE }, r#"{"a":"1970-01-02"}"#)]
+    fn test_parse_json_invalid_required_field_nulls_batch(
+        #[case] output_schema: SchemaRef,
+        #[case] valid: &str,
+        #[values("{}", r#"{"a":null}"#, r#"{"a":"invalid"}"#)] invalid: &str,
+    ) {
+        let batch = RecordBatch::try_from_iter([(
+            "json_col",
+            Arc::new(StringArray::from(vec![invalid, valid])) as ArrayRef,
+        )])
+        .unwrap();
+        let expr = Expr::parse_json(col!("json_col"), output_schema);
+        let result = evaluate_expression(&expr, &batch, None).expect("parses permissively");
+        assert_eq!(result.len(), 2);
+        assert_eq!(result.null_count(), 2);
+    }
+
+    #[rstest]
+    #[case::empty(vec![])]
+    #[case::all_null(vec![None, None])]
+    #[case::mixed(vec![Some("{}"), None, Some("{}")])]
+    fn test_parse_json_empty_schema_preserves_nulls_and_rows(#[case] input: Vec<Option<&str>>) {
+        let nulls: Vec<_> = input.iter().map(Option::is_none).collect();
+        let batch = RecordBatch::try_from_iter([(
+            "json_col",
+            Arc::new(StringArray::from(input)) as ArrayRef,
+        )])
+        .unwrap();
+        let expr = Expr::parse_json(col!("json_col"), Arc::new(StructType::new_unchecked([])));
+        let result = evaluate_expression(&expr, &batch, None).unwrap();
+        assert_eq!(result.len(), nulls.len());
+        assert_eq!(result.as_struct().num_columns(), 0);
+        assert_eq!(
+            evaluate_predicate(&Pred::is_null(expr), &batch, false).unwrap(),
+            BooleanArray::from(nulls),
+        );
     }
 
     #[test]

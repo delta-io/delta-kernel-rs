@@ -59,6 +59,38 @@
 //!
 //! [`Scan::declarative_metadata_scan_plan`]: crate::scan::Scan::declarative_metadata_scan_plan
 //!
+//! Data results can be collected into Rust types that implement `ToSchema` and
+//! `TryFrom<StructData, Error = KernelError>`, either manually or with these derives:
+//!
+//! ```rust
+//! use delta_kernel::delta_kernel_derive::{ToSchema, TryFromStructData};
+//! # use delta_kernel::plans::{Plan, PlanExecutor, PlanExecutorExt};
+//! # use delta_kernel::KernelResult;
+//!
+//! #[derive(ToSchema, TryFromStructData)]
+//! struct Row {
+//!     id: i64,
+//! }
+//!
+//! # fn one_row(executor: &dyn PlanExecutor, plan: Plan) -> KernelResult<()> {
+//! let row: Row = executor.execute_plan_into(plan)?;
+//! # Ok(())
+//! # }
+//! # fn multiple(executor: &dyn PlanExecutor, plan: Plan) -> KernelResult<()> {
+//! let rows: Vec<Row> = executor.execute_plan_into(plan)?;
+//! # Ok(())
+//! # }
+//! # fn optional(executor: &dyn PlanExecutor, plan: Plan) -> KernelResult<()> {
+//! let row: Option<Row> = executor.execute_plan_into(plan)?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! These conversions decode batches in order and stop at the first error. Converting to a struct
+//! requires exactly one total row; `Option<T>` permits zero or one. Both decode at most two rows.
+//! The plan output schema must exactly match the requested schema, including field nullability
+//! and metadata. Callers must project out unwanted fields.
+//!
 //! # Where to look
 //!
 //! - [`PlanBuilder`] builds plans through a fluent, schema-validating API, each method documenting
@@ -85,8 +117,9 @@ pub use ir::plan::Plan;
 pub use ir::{IoOperation, Operation};
 
 use crate::engine_data::TypedGetData as _;
-use crate::expressions::{ColumnName, column_name};
-use crate::schema::DataType;
+use crate::expressions::struct_rows::engine_rows;
+use crate::expressions::{ColumnName, TryFromStructRows, column_name};
+use crate::schema::{DataType, ToSchema};
 use crate::{
     AsAny, EngineData, FileMeta, GetData, KernelError, KernelResult, KernelResultIterator,
     ParquetFooter, RowVisitor as _,
@@ -123,6 +156,11 @@ pub trait PlanExecutor: AsAny {
         PlanExecutorCapabilities::Full
     }
 
+    /// Executes a query plan through [`Self::execute_op`].
+    fn execute_plan(&self, plan: Plan) -> KernelResult<PlanResult> {
+        self.execute_op(Operation::QueryPlan(plan))
+    }
+
     /// Reads a parquet file's footer (schema and, in future, row-group stats) via a
     /// [`IoOperation::ParquetFooter`] op.
     fn read_parquet_footer(&self, file: FileMeta) -> KernelResult<ParquetFooter> {
@@ -130,6 +168,42 @@ pub trait PlanExecutor: AsAny {
             .into_parquet_footer()
     }
 }
+
+/// Executes plans as typed Rust values for kernel consumers.
+///
+/// Use this extension with concrete executors or [`dyn PlanExecutor`](PlanExecutor) to decode
+/// terminal rows without writing visitors or getters. The output type supplies the schema,
+/// decoder, and row count requirements. The plan schema must match the requested type.
+pub trait PlanExecutorExt: PlanExecutor {
+    /// Executes a plan for a kernel consumer and decodes its terminal rows into the requested type.
+    ///
+    /// A row requires exactly one result; an optional row allows at most one; vectors accept any
+    /// count. Batches are decoded in order, stopping at the first error. A row or optional row
+    /// decodes at most two rows; later batches may remain unread. The plan's schema must equal the
+    /// requested schema, including field nullability and metadata.
+    ///
+    /// Supports numbers, booleans, strings, binary, dates, string lists, and string maps.
+    /// List elements and map values must be non-nullable in the schema, even for empty streams.
+    /// String-list source schemas must declare non-null elements; batches are also checked.
+    /// Required nulls and null string-list elements return errors. Null map entries are dropped;
+    /// duplicate-key results are unspecified. Other collections, decimals, and timestamps are
+    /// unsupported, including for empty streams.
+    fn execute_plan_into<T: TryFromStructRows>(&self, plan: Plan) -> KernelResult<T> {
+        let schema = <T::Row as ToSchema>::schema_ref();
+        for field in schema.fields() {
+            engine_rows::ensure_supported(field)?;
+        }
+        if &plan.schema != schema {
+            return Err(KernelError::invalid_struct_data(format!(
+                "Plan output schema does not match requested schema.\nExpected:\n{schema}\nActual:\n{}",
+                plan.schema
+            )));
+        }
+        T::collect_batches(self.execute_plan(plan)?.into_data()?)
+    }
+}
+
+impl<E: PlanExecutor + ?Sized> PlanExecutorExt for E {}
 
 /// A [`PlanExecutor`] that can retain relations within its own lifetime.
 ///

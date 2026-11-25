@@ -79,6 +79,23 @@ message WriteJsonNode {
   bool ordered = 4;
 }
 
+message WriteParquetNode {
+  string file_path = 1;
+  // All input columns in order, with matching names, types and nullability; supplies file metadata.
+  delta.kernel.schema.StructType write_schema = 2;
+  bool overwrite = 3;
+  bool ordered = 4;
+  message StatsAgg {
+    string name = 1;
+    Agg agg = 2;
+  }
+  // Named aggregates over all input rows; output columns follow file metadata.
+  repeated StatsAgg stats_agg = 5;
+  // Output schema of the relation containing file descriptors (location, size, last_modified)
+  // and configured aggregate statistics; resolved by PlanBuilder::write_parquet.
+  delta.kernel.schema.StructType output_schema = 6;
+}
+
 enum FileType {
   FILE_TYPE_UNSPECIFIED = 0;
   FILE_TYPE_PARQUET = 1;
@@ -178,6 +195,7 @@ message Operator {
     PrefixSumNode prefix_sum = 12;
     // Sinks (write nodes)
     WriteJsonNode write_json = 11;
+    WriteParquetNode write_parquet = 13;
   }
 }
 

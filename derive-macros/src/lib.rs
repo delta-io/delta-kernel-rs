@@ -174,6 +174,14 @@ pub fn derive_to_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStre
                     });
                 &SCHEMA_INFO
             }
+
+            fn leaf_columns() -> &'static delta_kernel::schema::ColumnNamesAndTypes {
+                static LEAF_COLUMNS: ::std::sync::LazyLock<delta_kernel::schema::ColumnNamesAndTypes> =
+                    ::std::sync::LazyLock::new(|| {
+                        <#struct_ident as delta_kernel::schema::ToSchema>::schema_ref().leaves(None)
+                    });
+                &LEAF_COLUMNS
+            }
         }
     };
     proc_macro::TokenStream::from(output)
