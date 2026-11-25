@@ -393,9 +393,7 @@ hidden bot identifiers are omitted from this example.
 ```markdown
 ## AI Review
 
----
-
-**2 Blockers · 1 Should Fix · 2 Nits**
+**🛑 2 Blockers · 🔧 1 Should Fix · 💡 2 Nits**
 
 Reviewed `<short commit SHA>`
 
@@ -413,7 +411,7 @@ Reviewed `<short commit SHA>`
 
 </details>
 
-[Full AI review → Checks](<PR checks URL>) · [Workflow run](<workflow run URL>)
+<sub>[Full AI review → Checks](<PR checks URL>) · [Workflow run](<workflow run URL>)</sub>
 ```
 
 `Review Summary` links every final Blocker and Should Fix finding, including reused comments.
