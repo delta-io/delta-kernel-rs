@@ -20,13 +20,12 @@ from review_history import (
 from review_publish import INLINE_FEEDBACK_FOOTER
 from review_publish import format_review_body as _format_review_body
 
-MAX_INLINE_FINDINGS = 12
 INLINE_FINDING_FIELDS = ("id", "path", "line", "side", "body")
 INLINE_FINDING_SIDES = ("LEFT", "RIGHT")
 _FINDING_HEADING_MARKER = "###"
 _FINDING_HEADING_TEMPLATE = f"{_FINDING_HEADING_MARKER} <ID>"
 _REVIEW_SECTION_NAMES = ("Blocking issues", "Non-blocking notes", "Summary")
-_FINDING_ID = re.compile(r"(?:Blocker|Nit)[1-9][0-9]*")
+_FINDING_ID = re.compile(r"(?:Blocker|ShouldFix|Nit)[1-9][0-9]*")
 _FINDING_HEADING = re.compile(
     rf"^{re.escape(_FINDING_HEADING_MARKER)}\s+({_FINDING_ID.pattern})\b"
 )
@@ -68,10 +67,6 @@ def extract_inline_findings(
     findings = document["findings"]
     if not isinstance(findings, list):
         raise ValueError("inline review findings must be a list")
-    if len(findings) > MAX_INLINE_FINDINGS:
-        raise ValueError(
-            f"inline review contains more than {MAX_INLINE_FINDINGS} findings"
-        )
 
     clean_review = (review[:start_index] + review[end_index + len(end) :]).strip()
     if not clean_review:
@@ -123,12 +118,11 @@ and the machine-readable block inside the outer review markers:
 Do not close the outer review before the machine-readable block. For a completed
 review, the outer review end marker must be the final line of your response.
 
-Include entries for up to {MAX_INLINE_FINDINGS} Blocker/Nit findings, prioritizing
-blockers and then the most useful notes. Findings omitted from this block remain
-in the collapsed review. Start every human-readable finding on its own Markdown
+Include every final retained Blocker, Should Fix and Nit in this block. Use null
+for path, line and side when no usable changed line exists. Start every finding on its own Markdown
 heading matching `{_FINDING_HEADING_TEMPLATE}`, using the same ID in this block.
 Keep the Summary to an overall assessment rather than repeating finding details.
-Use IDs matching `{_FINDING_ID.pattern}` (for example, `Blocker1` or `Nit1`) and
+Use IDs matching `{_FINDING_ID.pattern}` (for example, `Blocker1`, `ShouldFix1` or `Nit1`) and
 do not add an entry for the Summary. Use the repository-relative path with no
 backticks. Use {INLINE_FINDING_SIDES[1]} and the head-file line
 number for additions or context; use {INLINE_FINDING_SIDES[0]} and the base-file

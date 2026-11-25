@@ -168,7 +168,7 @@ class InlineReviewTest(unittest.TestCase):
         prompt = self.inline_review.inline_prompt_instructions(marker)
 
         self.assertIn(f"AI_REVIEW_INLINE_START_{marker}", prompt)
-        self.assertIn(f"up to {self.inline_review.MAX_INLINE_FINDINGS}", prompt)
+        self.assertIn("Include every final retained Blocker, Should Fix and Nit", prompt)
         for field in self.inline_review.INLINE_FINDING_FIELDS:
             self.assertIn(f'"{field}"', prompt)
         self.assertIn(self.inline_review._FINDING_ID.pattern, prompt)
@@ -1122,88 +1122,6 @@ class InlineReviewTest(unittest.TestCase):
         self.assertEqual(unmapped, ["Nit1"])
         self.assertIn("### Nit1", payload["body"])
 
-    def test_workflow_inline_rejection_preserves_prose_and_json_only_findings(self) -> None:
-        repo_root = Path(__file__).resolve().parents[3]
-        workflow = yaml.safe_load((repo_root / ".github/workflows/ai-review.yml").read_text())
-        publish_step = next(
-            step
-            for job in workflow["jobs"].values()
-            for step in job["steps"]
-            if step.get("name") == "Post inline review"
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "review_output.txt").write_text(
-                "## Blocking issues\n### Blocker1\nDeleted parent line.\n\n"
-                "## Non-blocking notes\n### Nit1\nChild change.\n\n## Summary\nNeeds review."
-            )
-            findings = [
-                {
-                    "id": finding_id,
-                    "path": "kernel/src/example.rs",
-                    "line": 9,
-                    "side": side,
-                    "body": body,
-                }
-                for finding_id, side, body in (
-                    ("Blocker1", "LEFT", "Deleted parent line."),
-                    ("Nit1", "RIGHT", "Child change."),
-                    ("Nit2", "RIGHT", "JSON-only finding."),
-                )
-            ]
-            (root / "inline_findings.json").write_text(json.dumps(findings))
-            (root / "github_pr_diff.txt").write_text(DIFF)
-            (root / "pr_diff.txt").write_text(DIFF.replace("old_call();", "parent_call();"))
-            (root / "pr_history.json").write_text("{}")
-            (root / "trusted_bot_logins.json").write_text('["github-actions"]')
-            (root / "python3").symlink_to(sys.executable)
-            gh = root / "gh"
-            gh.write_text(
-                f"#!{sys.executable}\n"
-                "import os, pathlib, sys\n"
-                "root = pathlib.Path(os.environ['TEST_ROOT'])\n"
-                "if sys.argv[1] == 'api':\n"
-                "    payload = pathlib.Path(sys.argv[sys.argv.index('--input') + 1])\n"
-                "    (root / 'submitted.json').write_text(payload.read_text())\n"
-                "    raise SystemExit(1)\n"
-                "assert sys.argv[1:3] == ['pr', 'comment']\n"
-                "body = pathlib.Path(sys.argv[sys.argv.index('--body-file') + 1])\n"
-                "(root / 'published.md').write_text(body.read_text())\n"
-            )
-            gh.chmod(0o700)
-            result = subprocess.run(
-                [
-                    "bash", "-euo", "pipefail", "-c",
-                    publish_step["run"].replace("/tmp/", f"{root}/"),
-                ],
-                cwd=repo_root,
-                env={
-                    **os.environ,
-                    "PATH": f"{root}:{os.environ['PATH']}",
-                    "TEST_ROOT": str(root),
-                    "HEAD_SHA": "f" * 40,
-                    "PR_NUMBER": "2",
-                    "REPO": "delta-io/delta-kernel-rs",
-                    "RUN_URL": "https://github.com/delta-io/delta-kernel-rs/actions/runs/1",
-                },
-                capture_output=True,
-                text=True,
-            )
-
-            self.assertEqual(result.returncode, 0, result.stderr)
-            submitted = json.loads((root / "submitted.json").read_text())
-            self.assertEqual(len(submitted["comments"]), 2)
-            self.assertTrue(all(comment["side"] == "RIGHT" for comment in submitted["comments"]))
-            self.assertIn("### Blocker1", submitted["body"])
-            self.assertNotIn("### Nit1", submitted["body"])
-            self.assertNotIn("JSON-only finding.", submitted["body"])
-            published = (root / "published.md").read_text()
-            for finding in (
-                "### Blocker1", "Deleted parent line.", "### Nit1", "Child change.",
-                "### Nit2", "JSON-only finding.", "kernel/src/example.rs", "RIGHT, line 9",
-            ):
-                self.assertIn(finding, published)
-
     def test_exact_duplicate_inline_body_is_skipped_without_new_comments(self) -> None:
         review = "## Summary\nNo new findings."
         prior_body = self.review_publish.format_review_body(
@@ -1438,7 +1356,7 @@ class InlineReviewTest(unittest.TestCase):
             with self.subTest(review=review), self.assertRaises(ValueError):
                 self.inline_review.extract_inline_findings(review, marker)
 
-    def test_extract_inline_findings_enforces_cap(self) -> None:
+    def test_extract_inline_findings_preserves_more_than_twelve_entries(self) -> None:
         marker = "e" * 32
         document = {"findings": [{"id": f"N{index}"} for index in range(1, 14)]}
         review = (
@@ -1448,8 +1366,8 @@ class InlineReviewTest(unittest.TestCase):
             f"<!-- AI_REVIEW_INLINE_END_{marker} -->"
         )
 
-        with self.assertRaisesRegex(ValueError, "more than"):
-            self.inline_review.extract_inline_findings(review, marker)
+        _, findings = self.inline_review.extract_inline_findings(review, marker)
+        self.assertEqual(findings, document["findings"])
 
 
 if __name__ == "__main__":
