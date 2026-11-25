@@ -29,7 +29,7 @@ task message.
 | Task message | The initial run-specific message delivered to a model session. | That Docs assignment plus PR metadata, reviewed SHA, description, earlier AI review text and patch excerpt. |
 | Shared PR task text | Text appended to each subagent assignment: optional review-range instructions, earlier AI review text, PR metadata, description excerpt and patch excerpt. | Python writes it to `/tmp/child_task_pr_data.md`. |
 | Child task body (implementation term) | Text appended after an assignment: shared PR task text, preceded by trusted root `AGENTS.md` for the two maintainer roles. | The `append_child_task_body()` hook and its error messages use this term. |
-| Response format instructions | Requirements for the response's run-specific start/end markers and, in inline mode, finding-location JSON. | The workflow's `output_contract` variable contains these instructions. |
+| Response format instructions | Requirements for the response's run-specific start/end markers and final-finding JSON with optional locations. | The workflow's `output_contract` variable contains these instructions. |
 | Trusted project guidance | Project rules selected from the trusted workflow revision. | Root `AGENTS.md`, appended inside the two maintainer task messages. |
 | Tool definition | A callable tool's name, parameters and usage description supplied to a model. | `read_source_file(repository, path, start_line=1, line_count=400)`. |
 | Tool call | A model's request to execute a tool with particular arguments. | Read line 6 of `integration-tests/Cargo.toml` from `repository="pr"`. |
