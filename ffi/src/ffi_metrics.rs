@@ -1522,6 +1522,37 @@ mod tests {
         });
     }
 
+    #[rstest]
+    #[case::present(Some("table-17"))]
+    #[case::absent(None)]
+    fn read_failure_callbacks_preserve_table_id(#[case] id: Option<&str>) {
+        for event in [
+            kernel::MetricEvent::DomainMetadataLoadFailure {
+                table_id: id.map(Into::into),
+            },
+            kernel::MetricEvent::CrcReadFailure {
+                table_id: id.map(Into::into),
+            },
+        ] {
+            assert_eq!(event.table_id(), id);
+            with_ffi_event(&event, |ffi| {
+                let slice = match (&event, ffi) {
+                    (
+                        kernel::MetricEvent::DomainMetadataLoadFailure { .. },
+                        MetricEvent::DomainMetadataLoadFailure(slice),
+                    )
+                    | (
+                        kernel::MetricEvent::CrcReadFailure { .. },
+                        MetricEvent::CrcReadFailure(slice),
+                    ) => slice,
+                    _ => panic!("unexpected FFI event for {event:?}"),
+                };
+                let actual: &str = unsafe { TryFromStringSlice::try_from_slice(&slice).unwrap() };
+                assert_eq!(actual, id.unwrap_or_default());
+            });
+        }
+    }
+
     #[test]
     fn from_kernel_scan_metadata_completed_maps_all_fields() {
         let id = kernel::MetricId::new();

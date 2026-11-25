@@ -1368,6 +1368,58 @@ mod scan_builder_tests {
     }
 
     #[rstest]
+    #[case::inherited(None, Some("snapshot-table"))]
+    #[case::overridden(Some("scan-table"), Some("scan-table"))]
+    #[case::cleared(Some(""), None)]
+    #[tokio::test]
+    async fn scan_metrics_use_snapshot_or_scan_table_id(
+        #[case] override_id: Option<&str>,
+        #[case] expected: Option<&str>,
+    ) {
+        let (engine, snapshot) = setup_snapshot(actions_to_string(vec![TestAction::Metadata]))
+            .await
+            .unwrap();
+        let table_id = String::from("snapshot-table");
+        let labeled = unsafe {
+            ok_or_panic(crate::snapshot_with_table_id(
+                snapshot,
+                engine.shallow_copy(),
+                kernel_string_slice!(table_id),
+            ))
+        };
+        drop(table_id);
+        let mut builder = unsafe { scan_builder(labeled.shallow_copy()) };
+        if let Some(id) = override_id {
+            builder = unsafe {
+                ok_or_panic(super::scan_builder_with_table_id(
+                    builder,
+                    engine.shallow_copy(),
+                    kernel_string_slice!(id),
+                ))
+            };
+        }
+        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        unsafe { scan.as_ref() }
+            .scan_metadata(unsafe { engine.as_ref() }.engine().as_ref())
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let events = reporter.events();
+        let mut scans = events
+            .iter()
+            .filter(|e| matches!(e, MetricEvent::ScanMetadataCompleted(_)));
+        assert_eq!(scans.next().unwrap().table_id(), expected);
+        assert!(scans.next().is_none());
+        unsafe {
+            free_scan(scan);
+            free_snapshot(labeled);
+            free_engine(engine);
+        }
+    }
+
+    #[rstest]
     #[tokio::test]
     async fn scan_snapshot_handles_have_independent_lifetimes(
         #[values(false, true)] release_scan_first: bool,
