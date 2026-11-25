@@ -6,8 +6,8 @@
 use std::cmp::Ordering;
 
 use super::{
-    BinaryPredicate, BinaryPredicateOp, Expression, OpaquePredicateOp, Predicate, Scalar,
-    ScalarExpressionEvaluator,
+    BinaryPredicate, BinaryPredicateOp, ColumnName, Expression, OpaquePredicateOp, Predicate,
+    Scalar, ScalarExpressionEvaluator,
 };
 use crate::KernelResult;
 use crate::kernel_predicates::{
@@ -31,9 +31,12 @@ use crate::kernel_predicates::{
 /// shows that the column holds only nulls. Kernel never substitutes binary bounds or another
 /// version's, and every other scan keeps every file.
 ///
-/// An [`EvaluationHandler`](crate::EvaluationHandler) evaluates the comparison by reading its
-/// [`CollatedComparison`]. `engine::arrow_expression::collation::CollationEvaluationHandler`
-/// does so over Arrow data.
+/// The result is a [`Predicate::Opaque`], which an
+/// [`EvaluationHandler`](crate::EvaluationHandler) evaluates from two pieces. It downcasts the
+/// predicate's `op` to [`CollatedComparison`] for the
+/// [`collation`](CollatedComparison::collation), and passes the predicate's `exprs` to
+/// [`CollatedComparison::compared`] for the wrapped comparison.
+/// `engine::arrow_expression::collation::CollationEvaluationHandler` does so over Arrow data.
 ///
 /// ```
 /// # use delta_kernel::expressions::{col, collated_comparison, lit};
@@ -49,9 +52,9 @@ pub fn collated_comparison(collation: impl Into<String>, comparison: Predicate) 
 
 /// The [`OpaquePredicateOp`] of a [`collated_comparison`], holding its collation identifier.
 ///
-/// An engine that evaluates the predicate itself downcasts the op of an
-/// [`OpaquePredicate`](super::OpaquePredicate) to this type and reads the comparison from the
-/// predicate's arguments:
+/// An engine that evaluates the predicate itself downcasts the `op` of an
+/// [`OpaquePredicate`](super::OpaquePredicate) to this type for the collation, and passes the
+/// predicate's `exprs` to [`compared`](Self::compared) for the comparison:
 ///
 /// ```
 /// # use std::cmp::Ordering;
@@ -117,6 +120,18 @@ impl CollatedComparison {
             literal,
             negated,
         })
+    }
+
+    /// Returns the column and the wrapped comparison when the arguments of a collated comparison
+    /// compare a direct column reference, the only kind a scan skips files for.
+    pub(crate) fn compared_column(exprs: &[Expression]) -> Option<(&ColumnName, &Predicate)> {
+        let [Expression::Predicate(comparison)] = exprs else {
+            return None;
+        };
+        let Expression::Column(column) = Self::compared(exprs)?.value() else {
+            return None;
+        };
+        Some((column, comparison.as_ref()))
     }
 }
 

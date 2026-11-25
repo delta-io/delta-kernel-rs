@@ -216,11 +216,16 @@ return a [`CollationEvaluationHandler`] for it from your Engine's `evaluation_ha
 [collation module rustdoc](https://docs.rs/delta_kernel/latest/delta_kernel/engine/arrow_expression/collation/index.html)
 has a complete example. `DefaultEngine` can't take a custom evaluation handler, so
 [assemble](../connector/implementing_engine.md#assemble-the-engine) an Engine that reuses
-`DefaultEngine`'s other handlers. If your Engine evaluates predicates itself, read the collation
-and the comparison from the predicate's [`CollatedComparison`]. If your Engine can't evaluate
-collated comparisons, don't pass one: the scan fails, or skips no files when the handler rejects
-the predicate up front. Skip files in your connector or derive a conservative predicate instead,
-as described below.
+`DefaultEngine`'s other handlers.
+
+If your Engine evaluates predicates itself, a collated comparison reaches it as an opaque
+predicate. To read the collation identifier, downcast the predicate's `op` to
+[`CollatedComparison`] and call `collation()`. To read the wrapped comparison, pass the
+predicate's `exprs` to `CollatedComparison::compared`.
+
+If your Engine can't evaluate collated comparisons, don't pass one: the scan fails, or skips no
+files when the handler rejects the predicate up front. Skip files in your connector or derive a
+conservative predicate instead, as described below.
 
 [`collated_comparison`]: https://docs.rs/delta_kernel/latest/delta_kernel/expressions/fn.collated_comparison.html
 [`CollatedComparison`]: https://docs.rs/delta_kernel/latest/delta_kernel/expressions/struct.CollatedComparison.html

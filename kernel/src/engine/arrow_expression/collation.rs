@@ -61,7 +61,10 @@ use std::sync::Arc;
 
 use super::ArrowEvaluationHandler;
 use super::evaluate_expression::evaluate_expression;
-use super::opaque::{ArrowOpaquePredicateOp, ArrowOpaquePredicateOpAdaptor};
+use super::opaque::{ArrowOpaquePredicateOp, new_arrow_opaque_predicate};
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub use super::test_collator::AsciiCaseInsensitive;
 use crate::arrow::array::{Array as _, AsArray as _, BooleanArray, RecordBatch, StringArray};
 use crate::arrow::buffer::NullBuffer;
 use crate::arrow::compute::{cast, not};
@@ -170,20 +173,29 @@ impl<'a> ExpressionTransform<'a> for BindCollator<'_> {
         let Some(collated) = predicate.op.any_ref().downcast_ref::<CollatedComparison>() else {
             return self.recurse_into_pred_opaque(predicate);
         };
-        let op = ArrowOpaquePredicateOpAdaptor(Box::new(BoundCollatedComparison {
+        let bound = BoundCollatedComparison {
             collation: collated.collation().to_owned(),
             collator: Arc::clone(self.0),
-        }));
+        };
         // Also bind collated comparisons nested in the compared value.
         let exprs = self.recurse_into_pred_opaque(predicate).into_owned().exprs;
-        Cow::Owned(OpaquePredicate::new(Arc::new(op), exprs))
+        Cow::Owned(new_arrow_opaque_predicate(bound, exprs))
     }
 }
 
 /// A collated comparison bound to the collator that evaluates it.
+///
+/// [`BindCollator`] puts this op in place of the [`CollatedComparison`] of a predicate and keeps
+/// the predicate's arguments, which hold the wrapped comparison.
 #[derive(Debug)]
 struct BoundCollatedComparison {
+    /// The identifier of the collation to compare under, taken from the [`CollatedComparison`]:
+    /// `icu.UNICODE_CI.75.1` for
+    /// `collated_comparison("icu.UNICODE_CI.75.1", col!("name").eq(lit("alice")))`. Every
+    /// [`ArrowCollator::compare`] call receives it, and the collator selects the collation by it.
     collation: String,
+    /// The collator of the handler that bound the comparison. One collator implements every
+    /// collation of its engine, so comparisons under different collations share it.
     collator: Arc<dyn ArrowCollator>,
 }
 
@@ -283,6 +295,8 @@ impl ArrowOpaquePredicateOp for BoundCollatedComparison {
     }
 }
 
+/// Reads the wrapped comparison from the arguments of a collated comparison. Fails for any
+/// predicate that `collated_comparison` does not accept.
 fn compared(args: &[Expression]) -> KernelResult<Compared<'_>> {
     CollatedComparison::compared(args).ok_or_else(|| {
         KernelError::unsupported(format!(
@@ -290,35 +304,6 @@ fn compared(args: &[Expression]) -> KernelResult<Compared<'_>> {
              possibly negated: {args:?}"
         ))
     })
-}
-
-/// Test collator: ASCII case-insensitive under the one collation it names, an error for any
-/// other. Returns FALSE for null values, like a selection mask.
-#[cfg(any(test, feature = "test-utils"))]
-#[doc(hidden)]
-#[derive(Debug)]
-pub struct AsciiCaseInsensitive(pub &'static str);
-
-#[cfg(any(test, feature = "test-utils"))]
-impl ArrowCollator for AsciiCaseInsensitive {
-    fn compare(
-        &self,
-        collation: &str,
-        ordering: Ordering,
-        values: &StringArray,
-        literal: &str,
-    ) -> KernelResult<BooleanArray> {
-        require!(
-            collation == self.0,
-            KernelError::unsupported(format!("Unknown collation '{collation}'"))
-        );
-        let literal = literal.to_ascii_lowercase();
-        let matches = |value: &str| value.to_ascii_lowercase().cmp(&literal) == ordering;
-        Ok(values
-            .iter()
-            .map(|value| Some(value.is_some_and(matches)))
-            .collect())
-    }
 }
 
 #[cfg(test)]
@@ -348,6 +333,8 @@ mod tests {
         }
     }
 
+    /// Evaluates `comparison` under [`COLLATION`] over a batch whose `name` column holds `names`,
+    /// with `collator` bound to it.
     fn evaluate(
         comparison: Predicate,
         names: ArrayRef,

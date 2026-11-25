@@ -636,6 +636,8 @@ impl<'a> DataSkippingPredicateCreator<'a> {
         }
     }
 
+    /// Rewrites collated comparisons over the `statsWithCollation` bounds that `stats_schema`
+    /// holds.
     fn with_collation_bounds(mut self, stats_schema: Option<&'a StructType>) -> Self {
         self.stats_schema = stats_schema;
         self
@@ -657,27 +659,12 @@ impl<'a> DataSkippingPredicateCreator<'a> {
         exprs: &[Expr],
         inverted: bool,
     ) -> Option<Pred> {
-        let compared = CollatedComparison::compared(exprs)?;
-        let Expr::Column(column) = compared.value() else {
-            return None;
-        };
+        let (column, comparison) = CollatedComparison::compared_column(exprs)?;
         let creator = DataSkippingPredicateCreator {
             collation: Some(collated.collation()),
             ..*self
         };
-        let literal = Scalar::from(compared.literal());
-        let inverted = inverted != compared.negated();
-        let comparison = match compared.ordering() {
-            Ordering::Less => {
-                DataSkippingPredicateEvaluator::eval_pred_lt(&creator, column, &literal, inverted)
-            }
-            Ordering::Equal => {
-                DataSkippingPredicateEvaluator::eval_pred_eq(&creator, column, &literal, inverted)
-            }
-            Ordering::Greater => {
-                DataSkippingPredicateEvaluator::eval_pred_gt(&creator, column, &literal, inverted)
-            }
-        }?;
+        let comparison = creator.eval_pred(comparison, inverted)?;
         // An opaque predicate gets no SQL WHERE null check, so skip an all-null column here. A
         // comparison to NULL is NULL under every collation, negated or not.
         let not_all_null = DataSkippingPredicateEvaluator::eval_pred_is_null(self, column, true);

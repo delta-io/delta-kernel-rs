@@ -2000,7 +2000,9 @@ fn checkpoint_pushdown_non_stat_arm_folds_to_null_literal() {
 
 // === Collated comparisons ===
 
+/// The collation that the test files record bounds under.
 const COLLATION: &str = "test.ASCII_CI.1";
+/// The row count of every test file.
 const FILE_ROWS: i64 = 2;
 
 /// Like [`collated_skipping_predicate_with_stats_columns`], with the null counts of both columns.
@@ -2073,6 +2075,7 @@ fn all_null_stats(column: &ColumnName) -> HashMap<ColumnName, Scalar> {
     stats
 }
 
+/// The path of the null count of `column` in a file's stats.
 fn null_count(column: &ColumnName) -> ColumnName {
     column_name!("stats_parsed", NULL_COUNT).join(column)
 }
@@ -2086,21 +2089,33 @@ fn collated(ordering: Ordering, column: impl Into<Expr>, literal: &str, inverted
     )
 }
 
+/// Where a collated comparison is negated.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Negation {
+    /// `collated_comparison(name < 'c')`
+    None,
+    /// `NOT collated_comparison(name < 'c')`
+    Outside,
+    /// `collated_comparison(NOT name < 'c')`
+    Within,
+}
+
 #[rstest]
 fn collated_comparison_skips_exactly_the_files_that_cannot_match(
     #[values(Ordering::Less, Ordering::Equal, Ordering::Greater)] ordering: Ordering,
-    #[values(false, true)] inverted: bool,
-    #[values(false, true)] negated_within: bool,
+    #[values(Negation::None, Negation::Outside, Negation::Within)] negation: Negation,
     #[values(column_name!("name"), column_name!("nested.name"))] column: ColumnName,
 ) {
     // Sorted case-insensitively, which differs from byte order: a file is kept or skipped
     // correctly only if both the bounds and the comparison follow the collation.
     let values = ["a", "B", "c", "D"];
     let compare = |a: &str, b: &str| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase());
+    let inverted = negation != Negation::None;
     for literal in values {
-        let pred = match (inverted, negated_within) {
-            (true, false) => Pred::not(collated(ordering, column.clone(), literal, false)),
-            _ => collated(ordering, column.clone(), literal, inverted),
+        let pred = match negation {
+            Negation::None => collated(ordering, column.clone(), literal, false),
+            Negation::Outside => Pred::not(collated(ordering, column.clone(), literal, false)),
+            Negation::Within => collated(ordering, column.clone(), literal, true),
         };
         let skipping_pred = collated_skipping_predicate(&pred, COLLATION).unwrap();
         // A null value matches no comparison, negated or not.

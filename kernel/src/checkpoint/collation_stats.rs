@@ -66,12 +66,14 @@ pub(crate) fn build_collation_stats_read_transform(
         return Ok(None);
     };
     let parsed_path = column_name!("add.stats_parsed");
-    let target = requested.field_at(&parsed_path).ok();
-    let stats = match target.map(StructField::data_type) {
-        Some(DataType::Struct(stats)) => Some(stats.as_ref()),
-        Some(_) => return Err(KernelError::schema("stats_parsed must be a struct")),
+    let target = match requested.field_at(&parsed_path).ok() {
+        Some(field) => match field.data_type() {
+            DataType::Struct(stats) => Some((field, stats.as_ref())),
+            _ => return Err(KernelError::schema("stats_parsed must be a struct")),
+        },
         None => None,
     };
+    let stats = target.map(|(_, stats)| stats);
     let raw_field =
         StructField::nullable("stats_parsed", set_collation_stats(stats, source.clone())?);
     let read_schema = Arc::new(
@@ -92,17 +94,12 @@ pub(crate) fn build_collation_stats_read_transform(
         json.clone(),
     );
     patch = match target {
-        Some(field) => {
-            let DataType::Struct(stats) = field.data_type() else {
-                return Err(KernelError::schema("stats_parsed must be a struct"));
-            };
-            patch.replace_at(
-                ["add"],
-                "stats_parsed",
-                field.clone(),
-                Expression::parse_json(json, Arc::new(stats.as_ref().clone())),
-            )
-        }
+        Some((field, stats)) => patch.replace_at(
+            ["add"],
+            "stats_parsed",
+            field.clone(),
+            Expression::parse_json(json, Arc::new(stats.clone())),
+        ),
         None => patch.drop_at(["add"], "stats_parsed"),
     };
     let (output_schema, expression) = patch.build()?;

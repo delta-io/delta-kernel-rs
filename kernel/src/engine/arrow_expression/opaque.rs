@@ -1,8 +1,11 @@
+use std::sync::Arc;
+
 use derive_more::Deref;
 
 use crate::arrow::array::{ArrayRef, BooleanArray, RecordBatch};
 use crate::expressions::{
-    Expression, OpaqueExpressionOp, OpaquePredicateOp, Predicate, Scalar, ScalarExpressionEvaluator,
+    Expression, OpaqueExpressionOp, OpaquePredicate, OpaquePredicateOp, Predicate, Scalar,
+    ScalarExpressionEvaluator,
 };
 use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -118,8 +121,17 @@ impl ArrowOpaquePredicate for Predicate {
         op: T,
         exprs: impl IntoIterator<Item = Expression>,
     ) -> Predicate {
-        Predicate::opaque(ArrowOpaquePredicateOpAdaptor(Box::new(op)), exprs)
+        Predicate::Opaque(new_arrow_opaque_predicate(op, exprs))
     }
+}
+
+/// Creates the opaque predicate behind [`ArrowOpaquePredicate::arrow_opaque`].
+pub(super) fn new_arrow_opaque_predicate(
+    op: impl ArrowOpaquePredicateOp,
+    exprs: impl IntoIterator<Item = Expression>,
+) -> OpaquePredicate {
+    let op = ArrowOpaquePredicateOpAdaptor(Box::new(op));
+    OpaquePredicate::new(Arc::new(op), exprs)
 }
 
 /// Adaptor that implements [`OpaquePredicateOp`] on behalf of all [`ArrowOpaqueExpressionOp`], and
@@ -165,9 +177,7 @@ impl OpaqueExpressionOp for ArrowOpaqueExpressionOpAdaptor {
 /// from `&dyn OpaquePredicateOp` to the concrete `ArrowOpaquePredicateOpAdaptor` type that
 /// implements both traits, and extract its inner `dyn ArrowOpaquePredicateOp`.
 #[derive(Debug, Deref)]
-pub(crate) struct ArrowOpaquePredicateOpAdaptor(
-    #[deref(forward)] pub(super) Box<dyn ArrowOpaquePredicateOp>,
-);
+pub(crate) struct ArrowOpaquePredicateOpAdaptor(#[deref(forward)] Box<dyn ArrowOpaquePredicateOp>);
 
 impl PartialEq for ArrowOpaquePredicateOpAdaptor {
     fn eq(&self, other: &Self) -> bool {

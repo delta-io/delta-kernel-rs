@@ -23,6 +23,9 @@ pub mod evaluate_expression;
 pub mod opaque;
 mod timestamp_timezone;
 
+#[cfg(any(test, feature = "test-utils"))]
+mod test_collator;
+
 #[cfg(test)]
 mod tests;
 

@@ -8,7 +8,7 @@ use crate::KernelResult;
 use crate::actions::{COLLATION_STATS, MAX_VALUES, MIN_VALUES};
 use crate::checkpoint::collation_stats::set_collation_stats;
 use crate::expressions::collation::CollatedComparison;
-use crate::expressions::{ColumnName, Expression, OpaquePredicate};
+use crate::expressions::{ColumnName, OpaquePredicate};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::transforms::{ExpressionTransform, transform_output_type};
@@ -74,8 +74,7 @@ impl<'a> ExpressionTransform<'a> for CollatedColumns<'a> {
 
     fn transform_pred_opaque(&mut self, predicate: &'a OpaquePredicate) {
         if let Some(collated) = predicate.op.any_ref().downcast_ref::<CollatedComparison>()
-            && let Some(compared) = CollatedComparison::compared(&predicate.exprs)
-            && let Expression::Column(column) = compared.value()
+            && let Some((column, _)) = CollatedComparison::compared_column(&predicate.exprs)
         {
             self.0
                 .entry(collated.collation())
@@ -90,7 +89,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::expressions::{Predicate, col, collated_comparison, lit};
+    use crate::expressions::{Expression, Predicate, col, collated_comparison, lit};
     use crate::scan::StatsOptions;
     use crate::scan::state_info::tests::get_state_info_with_stats;
     use crate::schema::schema_ref;
@@ -98,6 +97,8 @@ mod tests {
 
     const COLLATION: &str = "test.ASCII_CI.1";
 
+    /// The stats schema that a scan with `predicate` reads, over a table with a LONG `id`, a
+    /// STRING `name`, a nested STRING `nested.child`, and a file-type `file` column.
     fn read_schema(
         partitions: Vec<String>,
         predicate: Predicate,
@@ -133,6 +134,7 @@ mod tests {
         .cloned()
     }
 
+    /// `column = 'bob'` under `collation`.
     fn equals(column: Expression, collation: &str) -> Predicate {
         collated_comparison(collation, column.eq(lit("bob")))
     }

@@ -370,15 +370,19 @@ async fn collated_predicates_prune_files_without_losing_matches(
         &snapshot.clone().scan_builder().build()?,
         engine.clone(),
     )?);
-    let candidate_rows = |predicate: Predicate| -> Result<_, Box<dyn std::error::Error>> {
-        let scan = snapshot
-            .clone()
-            .scan_builder()
-            .with_stats(stats.clone())
-            .with_predicate(Arc::new(predicate))
-            .build()?;
-        Ok(rows(&read_scan(&scan, engine.clone())?))
-    };
+    let candidate_rows =
+        |stats: &StatsOptions, predicate: Predicate| -> Result<_, Box<dyn std::error::Error>> {
+            let scan = snapshot
+                .clone()
+                .scan_builder()
+                .with_stats(stats.clone())
+                .with_predicate(Arc::new(predicate))
+                .build()?;
+            Ok(rows(&read_scan(&scan, engine.clone())?))
+        };
+    // With stats disabled, the scan skips no files, whatever bounds they record.
+    let alice = Filter::CaseInsensitiveEqual("alice").kernel_predicate();
+    assert_eq!(candidate_rows(&StatsOptions::none(), alice)?, all_rows);
     let not = |filter| Filter::Not(Box::new(filter));
     for (original, kept_rows) in [
         (Filter::CaseInsensitiveEqual("alice"), 3),
@@ -389,12 +393,12 @@ async fn collated_predicates_prune_files_without_losing_matches(
         (not(compound(true)), 7),
         (not(compound(false)), 1),
     ] {
-        let candidates = candidate_rows(original.kernel_predicate())?;
+        let candidates = candidate_rows(&stats, original.kernel_predicate())?;
         // With bounds under another identifier, only the binary `id` comparison can skip.
         let expected_candidates = if stats_id == SYNTHETIC_ID {
             kept_rows
         } else {
-            candidate_rows(original.conservative_predicate(false))?.len()
+            candidate_rows(&stats, original.conservative_predicate(false))?.len()
         };
         assert_eq!(candidates.len(), expected_candidates, "{original:?}");
         let matching = |rows: &[(i32, String)]| -> Vec<_> {
@@ -459,11 +463,9 @@ async fn collated_predicate_skips_a_file_whose_column_holds_only_nulls(
     Ok(())
 }
 
-#[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn collated_predicates_prune_sidecar_files_in_sequential_and_parallel_scan_metadata(
-    #[values(false, true)] parallel: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn collated_predicates_prune_the_same_sidecar_files_in_sequential_and_parallel_scan_metadata()
+-> Result<(), Box<dyn std::error::Error>> {
     let (_temp, path, engine) = test_table_setup_mt()?;
     let fixture = synthetic_fixture(Some(SYNTHETIC_ID), Operation::Equal);
     let properties = [("delta.feature.v2Checkpoint", "supported")];
@@ -479,8 +481,13 @@ async fn collated_predicates_prune_sidecar_files_in_sequential_and_parallel_scan
             Filter::CaseInsensitiveEqual("alice").kernel_predicate(),
         ))
         .build()?;
-    let kept = collect_scan_paths(&scan, with_collator(engine, SYNTHETIC_ID), parallel)?;
-    assert_eq!(kept.len(), 2);
+    let engine = with_collator(engine, SYNTHETIC_ID);
+    let mut sequential = collect_scan_paths(&scan, engine.clone(), false)?;
+    let mut parallel = collect_scan_paths(&scan, engine, true)?;
+    sequential.sort();
+    parallel.sort();
+    assert_eq!(sequential.len(), 2);
+    assert_eq!(parallel, sequential);
     Ok(())
 }
 

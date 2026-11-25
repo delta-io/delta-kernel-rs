@@ -385,6 +385,7 @@ fn data_skipping_prunes_tree_files_by_content_stats(
     assert_eq!(paths, strings(expected));
 }
 
+/// Wraps `engine` so that it evaluates comparisons under [`COLLATION`] ASCII case-insensitively.
 fn with_collator(engine: SyncEngine) -> impl Engine {
     let evaluation = CollationEvaluationHandler::new(Arc::new(AsciiCaseInsensitive(COLLATION)));
     DelegatingEngine::new(Arc::new(engine)).with_evaluation_handler(Arc::new(evaluation))
