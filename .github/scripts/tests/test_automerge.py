@@ -254,6 +254,27 @@ class ReconcileTest(unittest.TestCase):
         self.assert_not_honored(fake, f"head changed from {HEAD} to {NEW_HEAD}", automerge.RECOVERY)
         self.assertEqual(fake.mutations(), ["EnableAutoMerge"])
 
+    def test_target_change_stops_enqueue_or_cancels_waiting(self) -> None:
+        cases = {
+            "retargeted": ({"baseRefName": "release/0.20"}, "only supports PRs targeting main"),
+            "draft": ({"isDraft": True}, "draft"),
+            "closed": ({"state": "CLOSED"}, "closed"),
+        }
+        for scenario, (changes, expected) in cases.items():
+            for rejected in (False, True):
+                with self.subTest(scenario=scenario, enable_rejected=rejected):
+                    fake = FakeGitHub(_node())
+                    fake.on["EnableAutoMerge"] = lambda node: node.update(changes)
+                    if rejected:
+                        fake.failures["EnableAutoMerge"] = [GitHubError("rejected")]
+                    self.assert_not_honored(fake, expected)
+                    mutations = ["EnableAutoMerge"]
+                    if not rejected:
+                        mutations.append("DisableAutoMerge")
+                    self.assertEqual(fake.mutations(), mutations)
+                    self.assertIsNone(fake.node["autoMergeRequest"])
+                    self.assertIsNone(fake.node["mergeQueueEntry"])
+
     def test_request_error_with_armed_server_state_is_accepted(self) -> None:
         fake = FakeGitHub(_node())
         fake.on["EnableAutoMerge"] = lambda node: node.update(autoMergeRequest={"enabledAt": "t"})
@@ -450,6 +471,15 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(fake.mutations(), ["UpdateDescription", "EnableAutoMerge"])
         self.assertEqual(fake.node["body"], SUFFIX)
 
+    def test_later_stack_section_that_would_break_review_prevents_cleanup(self) -> None:
+        later = _stack_body().replace("/2", "/3").replace(" <- _this PR_", "")
+        body = _stack_body() + later
+        fake = FakeGitHub(_node(body=body))
+        message = self.reconcile(fake)
+        self.assertEqual(fake.mutations(), ["EnableAutoMerge"])
+        self.assertEqual(fake.node["body"], body)
+        self.assertIn("left unchanged", message)
+
     def test_review_scope_lookup_failure_skips_cleanup_but_requests_merge(self) -> None:
         endpoint = f"repos/{REPOSITORY}/pulls/1"
         cases = {
@@ -491,6 +521,22 @@ class GhClientTest(unittest.TestCase):
         with patch("subprocess.run", return_value=not_found):
             with self.assertRaisesRegex(GitHubError, "404"):
                 automerge.GhClient().rest("repos/x/y/collaborators/z/permission")
+
+    def test_malformed_success_responses_are_errors(self) -> None:
+        cases = {
+            "invalid JSON": "not JSON",
+            "empty response": "",
+            "non-object response": "[]",
+            "missing data": "{}",
+            "null data": '{"data": null}',
+            "non-object data": '{"data": []}',
+        }
+        for scenario, stdout in cases.items():
+            with self.subTest(scenario=scenario):
+                completed = subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
+                with patch("subprocess.run", return_value=completed):
+                    with self.assertRaises(GitHubError):
+                        automerge.GhClient().graphql(automerge.UPDATE_DESCRIPTION, {})
 
 
 if __name__ == "__main__":

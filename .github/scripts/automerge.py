@@ -143,12 +143,7 @@ def reconcile(github: GitHub, repository: str, number: int) -> str:
                 + RECOVERY
             )
         return cancelled
-    if pr.is_draft:
-        raise AutomergeError(f"The PR is a draft. Mark it ready for review first. {RECOVERY}")
-    if pr.base_ref != SUPPORTED_BASE:
-        raise AutomergeError(
-            f"'{LABEL}' only supports PRs targeting {SUPPORTED_BASE}, not {pr.base_ref}."
-        )
+    _require_supported_target(github, repository, pr)
     if pr.armed:
         return f"The PR is already {pr.merge_state}; the description is left as is."
 
@@ -160,6 +155,7 @@ def reconcile(github: GitHub, repository: str, number: int) -> str:
     if _authorized_requester(github, repository, pr) is None:
         cancelled = _cancel(github, repository, pr)
         return f"{cleanup} The label was removed while requesting the merge; {cancelled}"
+    _require_supported_target(github, repository, pr)
     if not pr.armed:
         raise AutomergeError(
             f"{cleanup} GitHub accepted the merge request but reports none. {RECOVERY}"
@@ -177,6 +173,20 @@ def _authorized_requester(github: GitHub, repository: str, pr: PullRequest) -> s
             f"honored; {cancelled} A maintainer with write access must apply the label."
         )
     return requester
+
+
+def _require_supported_target(github: GitHub, repository: str, pr: PullRequest) -> None:
+    """Cancel and reject requests for closed PRs, drafts, or unsupported base branches."""
+    if pr.state != "OPEN":
+        reason = f"The PR is {pr.state.lower()}."
+    elif pr.is_draft:
+        reason = "The PR is a draft. Mark it ready for review first."
+    elif pr.base_ref != SUPPORTED_BASE:
+        reason = f"'{LABEL}' only supports PRs targeting {SUPPORTED_BASE}, not {pr.base_ref}."
+    else:
+        return
+    cancelled = _cancel(github, repository, pr)
+    raise AutomergeError(f"{reason} {cancelled} {RECOVERY}")
 
 
 def _active_requester(pr: PullRequest) -> str | None:
@@ -204,7 +214,7 @@ def _has_write(github: GitHub, repository: str, login: str) -> bool:
 
 
 def _clean_description(github: GitHub, repository: str, pr: PullRequest) -> str:
-    """Clean a supported prefix only when the AI review base is the GitHub base.
+    """Clean a prefix only if the original and retained bodies use the GitHub review base.
 
     Skipping cleanup allows merging. A failed write raises AutomergeError to stop the request.
     """
@@ -213,17 +223,17 @@ def _clean_description(github: GitHub, repository: str, pr: PullRequest) -> str:
         return "The description has no supported generated stack prefix."
     metadata = {
         "number": pr.number,
-        "body": pr.body,
         "head": {"sha": pr.head},
         "base": {"sha": pr.base_sha},
     }
     try:
-        review_base = resolve_review_base(metadata, repository, github.rest)
+        for description in (pr.body, pr.body[end:]):
+            metadata["body"] = description
+            if resolve_review_base(metadata, repository, github.rest) != pr.base_sha:
+                return "The stack list still scopes AI review; the description is left unchanged."
     except (KeyError, TypeError, ValueError, GitHubError) as error:
         _LOG.info("Cannot resolve the AI review scope: %s", error)
-        review_base = None
-    if review_base != pr.base_sha:
-        return "The stack list still scopes AI review, so the description is left unchanged."
+        return "Could not resolve the AI review scope, so the description is left unchanged."
     try:
         github.graphql(UPDATE_DESCRIPTION, {"id": pr.id, "body": pr.body[end:]})
     except GitHubError as error:
@@ -250,6 +260,7 @@ def _request_merge(github: GitHub, repository: str, pr: PullRequest) -> None:
         if _authorized_requester(github, repository, current) is None:
             cancelled = _cancel(github, repository, current)
             raise AutomergeError(f"The merge request was revoked; {cancelled} {RECOVERY}")
+        _require_supported_target(github, repository, current)
         if current.armed:
             return
         if current.head != pr.head:
@@ -316,7 +327,10 @@ class GhClient:
         response = self._run(["gh", "api", "graphql", "--input", "-"], payload)
         if response.get("errors"):
             raise GitHubError("; ".join(error.get("message", "") for error in response["errors"]))
-        return response.get("data") or {}
+        data = response.get("data")
+        if not isinstance(data, dict):
+            raise GitHubError("GitHub GraphQL response has no data object")
+        return data
 
     def rest(self, endpoint: str) -> dict:
         return self._run(["gh", "api", endpoint])
@@ -325,12 +339,17 @@ class GhClient:
     def _run(command: list[str], stdin: str | None = None) -> dict:
         result = subprocess.run(command, input=stdin, capture_output=True, text=True, check=False)
         try:
-            response = json.loads(result.stdout) if result.stdout.strip() else {}
-        except json.JSONDecodeError:
+            response = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            if result.returncode == 0:
+                raise GitHubError("gh api returned invalid JSON") from error
             response = {}
         if result.returncode != 0:
-            messages = [error.get("message", "") for error in response.get("errors", [])]
+            errors = response.get("errors", []) if isinstance(response, dict) else []
+            messages = [error.get("message", "") for error in errors]
             raise GitHubError("; ".join(messages) or result.stderr.strip() or "gh api failed")
+        if not isinstance(response, dict):
+            raise GitHubError("gh api returned a non-object JSON response")
         return response
 
 
