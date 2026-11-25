@@ -387,9 +387,7 @@ impl Snapshot {
         engine: &dyn Engine,
     ) -> Option<CheckpointResolveResult> {
         let start = Instant::now();
-        let checkpoint_type = self.known_checkpoint_type();
         let mut resolved = self.checkpoint_info_inner(engine)?;
-        resolved.metrics.checkpoint_type = checkpoint_type;
         resolved.metrics.info = resolved.result.as_ref().ok().cloned();
         resolved.metrics.duration_ns =
             u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);

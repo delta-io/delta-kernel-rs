@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::Version;
-use crate::checkpoint::{CheckpointInfo, SelectedCheckpointType};
+use crate::checkpoint::CheckpointInfo;
 
 /// Checkpoint discovery path reached by an attempt, independently of success or failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,8 +22,6 @@ pub enum CheckpointSource {
 pub struct CheckpointMetrics {
     /// Selected checkpoint version, retained on failure.
     pub version: Version,
-    /// Checkpoint type known before discovery, retained on failure.
-    pub checkpoint_type: Option<SelectedCheckpointType>,
     /// Shared resolved information, absent if discovery failed.
     pub info: Option<Arc<CheckpointInfo>>,
     /// Discovery path reached by this attempt, absent until a source is reached.

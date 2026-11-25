@@ -120,7 +120,6 @@ pub unsafe extern "C" fn snapshot_checkpoint_info(
             .map(|()| true)
     });
     unsafe { result.into_extern_result(&engine.as_ref()) }
-
 }
 
 /// Invoke a callback while the checkpoint record and all nested backing storage are alive.

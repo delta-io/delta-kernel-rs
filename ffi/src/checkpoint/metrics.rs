@@ -2,7 +2,7 @@
 
 use delta_kernel::metrics::CheckpointSource;
 
-use super::{FfiCheckpointInfo, FfiSelectedCheckpointType};
+use super::FfiCheckpointInfo;
 use crate::OptionalValue;
 
 /// Checkpoint discovery path reached by an attempt, independently of success or failure.
@@ -35,8 +35,6 @@ impl From<CheckpointSource> for FfiCheckpointSource {
 pub struct FfiCheckpointMetrics {
     /// Selected version, retained if discovery fails.
     pub version: u64,
-    /// Type known at selection time; the resolved type is available in `info`.
-    pub checkpoint_type: OptionalValue<FfiSelectedCheckpointType>,
     /// Null if discovery did not produce checkpoint information.
     pub info: *const FfiCheckpointInfo,
     pub source: OptionalValue<FfiCheckpointSource>,

@@ -1750,7 +1750,6 @@ mod tests {
                 Some(metrics.version),
                 snapshot.log_segment().checkpoint_version
             );
-            assert_eq!(metrics.checkpoint_type, snapshot.known_checkpoint_type());
             assert!(metrics.info.is_none());
             assert_eq!(metrics.source, Some(CheckpointSource::Resolved));
             assert_eq!(metrics.root_footer_calls, 0);
