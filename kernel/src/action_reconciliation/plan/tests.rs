@@ -16,6 +16,7 @@ use crate::expressions::{col, lit};
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::ReplayBase;
+use crate::plans::ir::nodes::Operator;
 use crate::scan::StatsOptions;
 use crate::schema::schema_ref;
 use crate::table_features::TableFeature;
@@ -152,6 +153,19 @@ async fn replay_selects_latest_action_without_retention(
     assert_eq!(state.schema(), &schema);
     let file_version =
         (remove_version.unwrap_or(1) as i64).max(if checkpoint.is_some() { 3 } else { 0 });
+    let plan = state.build()?;
+    let parquet_bytes: u64 = plan
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.op {
+            Operator::ScanParquet(scan) => Some(&scan.files),
+            _ => None,
+        })
+        .flatten()
+        .map(|file| file.meta.size)
+        .sum();
+    assert_eq!(report.total_json_bytes, expected_bytes);
+    assert_eq!(report.total_parquet_bytes, parquet_bytes);
     let actual = concat_batches(
         &Arc::new(
             schema
@@ -159,7 +173,7 @@ async fn replay_selects_latest_action_without_retention(
                 .try_into_arrow()
                 .map_err(KernelError::from)?,
         ),
-        &execute_plan(&engine, state.build()?)?,
+        &execute_plan(&engine, plan)?,
     )
     .map_err(KernelError::from)?
     .normalize(".", Some(1))

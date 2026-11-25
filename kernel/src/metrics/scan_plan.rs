@@ -71,4 +71,8 @@ pub struct MetadataPlanningReport {
     pub commit_total_size_bytes: u64,
     /// Selected compaction files, each counted once.
     pub compaction_file_count: u64,
+    /// Combined size of the selected JSON inputs, including checkpoint roots.
+    pub total_json_bytes: u64,
+    /// Combined size of the selected Parquet inputs.
+    pub total_parquet_bytes: u64,
 }

@@ -196,9 +196,19 @@ impl<'a> MetadataPlanner<'a> {
         });
         self.report.base_version = self.segment.checkpoint_version;
         let checkpoint_info = self.checkpoint_info.as_deref();
-        self.build_metadata_plan(ActionSource::Checkpoint, checkpoint_info, |schema| {
-            sources::checkpoint_actions(self.segment, checkpoint_info, self.actions, schema)
-        })
+        let mut report = std::mem::take(&mut self.report);
+        let result =
+            self.build_metadata_plan(ActionSource::Checkpoint, checkpoint_info, |schema| {
+                sources::checkpoint_actions(
+                    self.segment,
+                    checkpoint_info,
+                    self.actions,
+                    schema,
+                    &mut report,
+                )
+            });
+        self.report = report;
+        result
     }
 
     /// Builds commit actions and identity keys needed to reconstruct the requested state.
