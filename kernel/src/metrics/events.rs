@@ -106,6 +106,7 @@ pub enum MetricEvent {
     SetTransactionLoadFailure,
     CrcReadSuccess(CrcReadSuccess),
     CrcReadFailure(CrcReadFailure),
+    CheckpointPartsMissing(CheckpointPartsMissing),
     LastCheckpointReadCompleted(LastCheckpointReadCompleted),
     CheckpointWriteSuccess(CheckpointWriteSuccess),
     CheckpointWriteFailure(CheckpointWriteFailure),
@@ -154,7 +155,9 @@ impl MetricEvent {
             | Self::CrcReadFailure(_) => {}
 
             // Read events have no duration field.
-            Self::JsonReadCompleted(_) | Self::ParquetReadCompleted(_) => {}
+            Self::JsonReadCompleted(_)
+            | Self::ParquetReadCompleted(_)
+            | Self::CheckpointPartsMissing(_) => {}
         }
     }
 
@@ -173,6 +176,7 @@ impl MetricEvent {
             Self::SetTransactionLoadSuccess(_) => Err(SetTransactionLoadSuccess::SPAN_NAME),
             Self::LastCheckpointReadCompleted(_) => Err(LastCheckpointReadCompleted::SPAN_NAME),
             Self::ScanMetadataCompleted(_) => Err(ScanMetadataCompleted::SPAN_NAME),
+            Self::CheckpointPartsMissing(_) => Err(CheckpointPartsMissing::SPAN_NAME),
             Self::JsonReadCompleted(_) => Err(JsonReadCompleted::SPAN_NAME),
             Self::ParquetReadCompleted(_) => Err(ParquetReadCompleted::SPAN_NAME),
             Self::StorageListCompleted(_)
@@ -208,6 +212,7 @@ impl MetricEvent {
             Self::CheckpointWriteSuccess(_) => Err(CheckpointWriteSuccess::SPAN_NAME),
             Self::ChecksumWriteSuccess(_) => Err(ChecksumWriteSuccess::SPAN_NAME),
             Self::ScanMetadataCompleted(_) => Err(ScanMetadataCompleted::SPAN_NAME),
+            Self::CheckpointPartsMissing(_) => Err(CheckpointPartsMissing::SPAN_NAME),
             Self::JsonReadCompleted(_) => Err(JsonReadCompleted::SPAN_NAME),
             Self::ParquetReadCompleted(_) => Err(ParquetReadCompleted::SPAN_NAME),
             Self::StorageListCompleted(_)
@@ -334,6 +339,7 @@ impl MetricEvent {
             | Self::CrcReadFailure(_)
             | Self::CheckpointWriteFailure(_)
             | Self::ChecksumWriteFailure(_)
+            | Self::CheckpointPartsMissing(_)
             | Self::JsonReadCompleted(_)
             | Self::ParquetReadCompleted(_)
             | Self::ScanMetadataCompleted(_)
@@ -361,6 +367,7 @@ impl fmt::Display for MetricEvent {
             Self::SetTransactionLoadFailure => f.write_str("SetTransactionLoadFailure"),
             Self::CrcReadSuccess(e) => e.fmt(f),
             Self::CrcReadFailure(e) => e.fmt(f),
+            Self::CheckpointPartsMissing(e) => e.fmt(f),
             Self::LastCheckpointReadCompleted(e) => e.fmt(f),
             Self::CheckpointWriteSuccess(e) => e.fmt(f),
             Self::CheckpointWriteFailure(e) => e.fmt(f),
@@ -1539,6 +1546,87 @@ impl fmt::Display for CrcReadFailure {
     }
 }
 
+/// How checkpoint discovery found a missing or incomplete checkpoint candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, StrumDisplay, AsRefStr, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+#[non_exhaustive]
+pub enum CheckpointPartsMissingSource {
+    /// A listed multipart candidate had missing or empty parts, including an all-empty set.
+    Listing,
+    /// A file-backed checkpoint hint named a missing or unusable target.
+    Hint,
+    /// The source was not recorded or its metric label was unrecognized.
+    Unknown,
+}
+
+/// Checkpoint discovery found missing or empty parts in a checkpoint candidate.
+///
+/// Reports incomplete candidates for which discovery found no complete checkpoint at the same
+/// or a later version. Discovery may still use an older checkpoint and replay subsequent commits.
+/// The [`Self::source`] distinguishes listed multipart candidates from file-backed hints with no
+/// usable target. An absent or empty classic or V2 hint target reports one expected part and zero
+/// found parts. Listings that ignore checkpoints emit nothing.
+///
+/// This event has no `operation_id`. Use log-segment and snapshot completion events to observe
+/// whether fallback succeeded or the enclosing operation failed.
+#[derive(Debug, Clone)]
+pub struct CheckpointPartsMissing {
+    /// How the incomplete checkpoint candidate was discovered.
+    pub source: CheckpointPartsMissingSource,
+    /// Version of the incomplete checkpoint.
+    pub version: u64,
+    /// Number of parts required by the checkpoint file names or hint.
+    pub expected_parts: u64,
+    /// Number of distinct, nonempty parts found for this checkpoint candidate.
+    pub found_parts: u64,
+}
+
+impl CheckpointPartsMissing {
+    pub(crate) const SPAN_NAME: &'static str = "checkpoint_parts_missing";
+
+    pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
+        let mut event = Self {
+            source: CheckpointPartsMissingSource::Unknown,
+            version: 0,
+            expected_parts: 0,
+            found_parts: 0,
+        };
+        attrs.record(&mut event);
+        event
+    }
+}
+
+impl Visit for CheckpointPartsMissing {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "source" {
+            self.source = value
+                .parse()
+                .unwrap_or(CheckpointPartsMissingSource::Unknown);
+        }
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        match field.name() {
+            "version" => self.version = value,
+            "expected_parts" => self.expected_parts = value,
+            "found_parts" => self.found_parts = value,
+            _ => {}
+        }
+    }
+
+    fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
+}
+
+impl fmt::Display for CheckpointPartsMissing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "CheckpointPartsMissing(source={}, version={}, expected_parts={}, found_parts={})",
+            self.source, self.version, self.expected_parts, self.found_parts
+        )
+    }
+}
+
 // ====================================================================
 // LastCheckpointRead
 // ====================================================================
@@ -2408,6 +2496,19 @@ pub(crate) fn emit_scan_metadata_completed(e: &ScanMetadataCompleted) {
         dedup_visitor_time_ns = e.dedup_visitor_time.as_nanos() as u64,
         action_transform_time_ns = e.action_transform_time.as_nanos() as u64,
         predicate_eval_time_ns = e.predicate_eval_time.as_nanos() as u64,
+    );
+}
+
+/// Emit a [`MetricEvent::CheckpointPartsMissing`] via a tracing span.
+pub(crate) fn emit_checkpoint_parts_missing(event: &CheckpointPartsMissing) {
+    let _span = tracing::span!(
+        tracing::Level::INFO,
+        CheckpointPartsMissing::SPAN_NAME,
+        report = tracing::field::Empty,
+        source = event.source.as_ref(),
+        version = event.version,
+        expected_parts = event.expected_parts,
+        found_parts = event.found_parts,
     );
 }
 
