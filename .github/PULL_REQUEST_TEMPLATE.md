@@ -1,6 +1,7 @@
 <!--
-A good description says why the change exists, what behavior changes, and how you know it works,
-in that order. Full guide with examples, for people and agents: AGENTS/pr_description.md.
+Prepare human and AI reviewers: explain why the change exists, what behavior changes, how data
+moves through the affected components, the relevant design decisions, and what was verified.
+Full guide with examples, for authors and agents: AGENTS/pr_description.md.
 Sections marked optional can be deleted; the others are required.
 -->
 
@@ -21,11 +22,10 @@ Not: a file list or a walk through the diff.
 
 ### Call path and data flow
 <!--
-Optional. Give the reviewer the bigger picture: how this change fits the existing flow and, where it
-helps, a visual of how data moves through it. Use it for changes in a shared path (e.g. snapshot
-load, log replay, scan, commit). Show where the change is reached from, what data enters and leaves
-at that point (before and after), and which phase owns it. An indented tree of up to 25 lines, a
-short sequence diagram, or three sentences; mark what changed. Not: function bodies or a file list.
+Optional. Include when a reviewer would otherwise need to reconstruct how the change fits the
+existing flow. Show the entry point, what data enters and leaves the changed step (before and
+after), who owns it, and who consumes the result. Use prose, a worked example, or a short diagram;
+include unchanged components when they explain the change. Avoid function bodies and file lists.
 -->
 
 ### This PR affects the following public APIs
@@ -38,8 +38,9 @@ additive API, say why it is not breaking. Breaking changes need `!` in the title
 
 ### Design notes
 <!--
-Optional. Delete if none. Only decisions the code does not show: why this approach, what you
-rejected and why, the invariant the change relies on.
+Optional. Explain material design decisions, constraints, invariants, or scope choices that help a
+reviewer evaluate the approach. Say why this approach fits the problem and why relevant alternatives
+were rejected. Delete if there is no material rationale to add.
 -->
 
 ## How do you know it works?

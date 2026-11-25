@@ -3,6 +3,11 @@
 How to write a pull request description for this repository. Read it before opening a PR or
 generating a description.
 
+Prepare human and AI reviewers before they open the diff: explain why the change is needed, how
+the affected components and data fit together, and which design decisions matter to the review.
+AI tools may draft this context under the [AI Policy](../AI_POLICY.md); the author reviews and owns
+the result.
+
 ## How to read this file
 
 The file has two parts. Part 1, "About descriptions", is about the file and about descriptions in
@@ -32,13 +37,16 @@ start, what was verified, what is out of scope.
 Write for a reader who has not seen the issue, has no hallway context, and will read the body
 months from now.
 
-### What only the author knows
+### What reviewers need before reading the diff
 
-Ask for what the diff cannot show and skip what it can. The diff shows which files changed and how
-the code works. It does not show what was wrong before, what that cost and for whom, which
-alternatives were rejected, which invariant the change relies on, what was tested and what was not,
-or which PR a stacked PR builds on. Those are the contents of a good description, and they map onto
-the template sections in Part 2.
+Give reviewers context they would otherwise have to reconstruct from the source and discussion.
+Explain the problem and its cost, the behavior after the change, how data moves through the
+affected components, the reasons for material design decisions, and what was verified. For a
+stacked PR, explain which parent it builds on and what this PR contributes.
+
+Use the diff to verify the description. An overview can connect behavior across several files or
+explain unchanged callers and consumers that matter to the change. Keep it focused on the
+relationships a reviewer needs to understand; avoid a file inventory or a line-by-line walkthrough.
 
 ### Length and format
 
@@ -63,8 +71,10 @@ Gather these inputs before writing anything, in this order:
    exists, write `TODO: why this PR exists` under Why and stop; never invent a reason.
 2. Decisions made while implementing: alternatives rejected and why. These are the candidate
    Design notes; the author keeps or deletes each one.
-3. Test names from the diff (added or changed `fn` items in test modules). Describe the behaviors
-   they pin down; do not summarize test files.
+3. Relevant tests and recorded validation results from the implementation session or CI, including
+   tests that were not changed. Identify the behaviors covered, what actually ran, the results,
+   and material failures or gaps. Report added coverage separately from executed validation; if
+   execution evidence is unavailable, say so.
 4. The `cargo semver-checks` result and the `breaking-change` label, to fill or demand the public
    API section.
 5. The changed functions, their callers, and the data at the changed point, to draft the call
@@ -75,7 +85,8 @@ without the author's review.
 
 Pre-submit checklist:
 
-- Both required headings present; optional sections deleted when empty.
+- Required headings present: `## Why`, `## What changes`, and `## How do you know it works?`.
+- Optional sections deleted when empty.
 - Public API section present when the title has `!` or the label is `breaking-change`.
 - Every test name in the testing section exists in the diff or the repository.
 - No banned phrases in testing: "all tests pass", "existing tests" without test names, "UTs".
@@ -223,7 +234,7 @@ A file list. It gives a reading order, not a behavior.
 The main implementation idea is: (1) build the plan from the schema, (2) walk the plan nodes,
 (3) emit the validation operators ...
 ```
-A mechanism walkthrough. The diff shows this; the description should say what the result is.
+Names implementation steps without explaining what the resulting validation does for the caller.
 
 ```text
 - Impact: a retried reviewer starts from the same input as a first attempt.
@@ -233,18 +244,15 @@ Labeled bullets that restate each other. One sentence carries the same informati
 
 ### Section `### Call path and data flow`
 
-Optional. This section gives the reviewer the bigger picture: how the change fits the existing
-flow and, where it helps, a visual of how data moves through it. Use it when the change sits in a
-shared path, such as snapshot load, log replay, scan, or commit. Show three things: where the
-change is reached from (entry point down to the changed function), what data enters and leaves at
-that point, and which phase owns it. Use an indented ASCII tree of up to 25 lines, a short sequence
-diagram, or three sentences, and mark what changed. Do not paste function bodies or a file list.
+Optional. Include this section when a reviewer would otherwise need to reconstruct how the change
+fits the existing flow. Show where the change is reached from, what data enters and leaves at that
+point, and which component or phase owns the data. Include unchanged callers and consumers when
+they explain the behavior or constraints of the change.
 
-Data flow is usually the more useful half. In the last 200 merged PRs, authors who explained a flow
-did it with before/after tables and worked examples (15 PRs), not with call trees (none); the
-kernel's bugs are a wrong cover, a duplicated action, or a dropped null mask, and a reviewer checks
-those against the data. Placement adds the most for feature and refactor PRs in snapshot load,
-scan, or commit paths.
+Choose the view that makes the change easiest to check. A before/after example shows how a log
+cover, action, or null mask changes. A short call tree or sequence diagram shows how components
+interact. Prose can explain either. Mark what changed and keep enough surrounding context to make
+the path understandable; avoid pasted function bodies and file inventories.
 
 Good, data flow (a fix to JSON parsing of NULL inputs):
 
@@ -374,23 +382,22 @@ The template comment left in place. The heading renders with no text.
 
 ### Section `### Design notes`
 
-Optional, and empty for most PRs: in the last 200 merged PRs, 20 contained a decision the diff
-cannot show. Include the section only when one of these holds: the obvious alternative was weighed;
-the change relies on an invariant the code does not enforce; or a deliberate scope cut leaves a
-known gap. One to four lines is the usual length.
+Optional. Include this section when a design decision, constraint, invariant, or scope choice helps
+a reviewer evaluate the approach. Explain why the approach fits the problem and why relevant
+alternatives were rejected. Explain important invariants even when the code enforces them if the
+reason for the invariant is unclear. Scale the detail to the decision; omit the section when there
+is no material rationale to add, and do not invent alternatives to fill it.
 
 Forms that work:
 
 - A decision: "Chose X over Y because Z." Use concrete names.
-- Rejected alternatives, only when two or more were weighed: a "Rejected:" list, each item with
-  its reason.
+- Rejected alternatives that were considered: a "Rejected:" list, each item with its reason.
 - An invariant: "X holds because Y." Lasting contracts go in rustdoc; keep here only what the
   reviewer of this change needs.
 - A scope cut: "Not included: X (#N), because Z."
 
-Not: a pros/cons table (no PR in 200 needed one; a choice between two designs is not a score),
-mechanism narration, pseudo-code, numbered implementation steps, or Impact/Benefit bullets that
-restate the diff.
+Keep the explanation focused on reasons and constraints. Implementation steps without their
+rationale and Impact/Benefit bullets that restate each other do not explain a design decision.
 
 Good:
 
