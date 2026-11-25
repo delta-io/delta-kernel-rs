@@ -151,23 +151,6 @@ mod tests {
                 "nested {dt} should be V3-supported"
             );
         }
-        #[cfg(feature = "geo-type-in-dev")]
-        {
-            use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
-            let geospatial = [
-                DataType::from(GeometryType::try_new("EPSG:4326").unwrap()),
-                DataType::from(
-                    GeographyType::try_new("EPSG:4326", EdgeInterpolationAlgorithm::Spherical)
-                        .unwrap(),
-                ),
-            ];
-            for dt in geospatial {
-                assert!(
-                    is_v3_supported_type(&dt),
-                    "geospatial {dt} should be V3-supported"
-                );
-            }
-        }
     }
 
     #[test]
@@ -182,6 +165,79 @@ mod tests {
         // Iceberg has no equivalent of the `file` type in released versions, so it is not on the
         // V3 allowlist.
         assert!(!is_v3_supported_type(&DataType::file_type()));
+    }
+}
+
+#[cfg(all(test, feature = "geo-type-in-dev"))]
+mod geospatial_tests {
+    use rstest::rstest;
+
+    use super::is_v3_supported_type;
+    use crate::schema::{
+        ColumnMetadataKey, DataType, EdgeInterpolationAlgorithm, MetadataValue, StructField, schema,
+    };
+    use crate::table_features::{ColumnMappingMode, Operation, TableFeature};
+    use crate::table_properties::{ENABLE_ICEBERG_COMPAT_V3, ENABLE_ROW_TRACKING};
+    use crate::unit_test_utils::{
+        MockProtocolBuilder, MockTableConfigurationBuilder, geography_type, geometry_type,
+    };
+
+    fn geometry() -> DataType {
+        geometry_type("EPSG:4326")
+    }
+
+    fn geography() -> DataType {
+        geography_type("EPSG:4326", EdgeInterpolationAlgorithm::Spherical)
+    }
+
+    #[rstest]
+    fn is_v3_supported_type_accepts_geospatial(#[values(geometry(), geography())] dt: DataType) {
+        assert!(
+            is_v3_supported_type(&dt),
+            "geospatial {dt} should be V3-supported"
+        );
+    }
+
+    /// The type check also runs when a table configuration is loaded, so an icebergCompatV3 table
+    /// with a geospatial column must load and be scannable.
+    #[rstest]
+    fn v3_table_configuration_loads_with_geospatial_column(
+        #[values(geometry(), geography())] dt: DataType,
+    ) {
+        let geo_column = StructField::nullable("geo", dt).add_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(1),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("col-1".to_string()),
+            ),
+        ]);
+        let table_configuration = MockTableConfigurationBuilder::new()
+            .with_schema(schema! { (geo_column), })
+            .with_properties([
+                (ENABLE_ICEBERG_COMPAT_V3, "true"),
+                (ENABLE_ROW_TRACKING, "true"),
+            ])
+            .with_column_mapping(ColumnMappingMode::Name)
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([
+                        TableFeature::IcebergCompatV3,
+                        TableFeature::ColumnMapping,
+                        TableFeature::RowTracking,
+                        TableFeature::DomainMetadata,
+                        TableFeature::GeospatialType,
+                    ])
+                    .build(),
+            )
+            .build();
+
+        assert!(table_configuration.is_feature_enabled(&TableFeature::IcebergCompatV3));
+        table_configuration
+            .ensure_operation_supported(Operation::Scan)
+            .unwrap();
     }
 }
 
