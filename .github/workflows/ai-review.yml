@@ -1048,7 +1048,7 @@ jobs:
           pathlib.Path("/tmp/diff_coverage.json").write_text(json.dumps(coverage))
           print(
               f"Review range {review_base_sha}...{pr_metadata['head']['sha']}: "
-              f"{coverage['delivered_bytes']}/{coverage['total_bytes']} subagent patch excerpt bytes; "
+              f"{coverage['excerpt_bytes']}/{coverage['total_bytes']} subagent patch excerpt bytes; "
               f"{coverage['full_files']} full, {coverage['partial_files']} partial, "
               f"{coverage['omitted_files']} omitted files."
           )
@@ -1064,7 +1064,8 @@ jobs:
               "## Review scope\n"
               "This PR is part of a stack. Review defects introduced by this child's changes. "
               "Changes inherited from ancestor PRs are context only. Check effects on unchanged "
-              "callers and use source tools for child changes beyond any diff truncation. "
+              "callers and use source tools for surrounding context. Findings about code must "
+              "concern changes visible in the patch excerpt. "
               "The parent relationship is author supplied; the boundary comes from GitHub "
               "ancestry.\n\n"
               if review_base_sha != pr_metadata["base"]["sha"]
