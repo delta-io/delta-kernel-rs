@@ -451,17 +451,53 @@ The Check Run includes all final findings. Posting errors appear in the workflow
 comment; the Check Run does not add a separate comment-delivery summary.
 `summary` and `artifact` modes record their selected report output without posting finding comments.
 
+## Advisory status for the reviewed commit
+
+[`compute_verdict()`](../review_verdict.py) runs after comments have been posted and reviewer
+results have been recorded. It combines the diff coverage, reviewer/checker task records,
+candidate-to-final mappings, confirmed finding-comment URLs and earlier Blockers for the exact
+reviewed commit. Missing required information takes precedence over the finding counts.
+
+| Status in the comment/check report | Meaning |
+|---|---|
+| `NO VERDICT` | Required input, task results, finding mappings, earlier-review history or comment-posting results are incomplete, or a correctness claim remains contested. |
+| `NOT APPROVED` | Those records are complete and there is a current Blocker. |
+| `APPROVED WITH FEEDBACK` | Those records are complete, with Should Fix or Nit findings but no Blocker. |
+| `APPROVED` | Those records are complete and contain no final findings. |
+
+An earlier Blocker for the same commit remains in the count when a rerun omits it. A Blocker
+on an earlier commit without a current result gives a linked `NO VERDICT` reason and stays
+outside current counts. Reusing a finding's comment does not remove the finding from the count.
+These statuses do not submit a GitHub review or replace human approval. The `AI Review Summary`
+Check Run always has GitHub conclusion `neutral`.
+
+`publish_verdict()` updates this run's existing main AI review comment in PR comment modes.
+The command's `main()` writes `/tmp/review_verdict.json`, adds status data to
+`/tmp/review_execution.json`, and rebuilds the
+full Check Run report from the final finding list. The seven-day execution artifact includes
+that JSON record, `/tmp/diff_coverage.json` and the complete `/tmp/check-summary.txt`. If the report
+exceeds GitHub's display limit, the Check Run links to the complete artifact.
+
 ### Main AI review comment format
 
 [`format_review_summary()`](../review_publish.py) is the single renderer for the main comment.
 The orchestrator supplies the assessment summary and final finding text. Python supplies counts, links,
 the reviewed commit and the layout below. Angle-bracket placeholders stand for generated text;
-hidden bot identifiers are omitted from this example.
+hidden bot identifiers are omitted from this example. With full coverage, the reviewed line
+says `Full Coverage ✓` and Partial Coverage Details is absent.
 
 ```markdown
-## 🤖 AI Review 🧐
+## 🤖 AI Review 🧐 - <advisory status>
 
 **🛑 2 Blockers · 🔧 1 Should Fix · 💡 2 Nits**
+
+Reviewed `<short commit SHA>` · Partial Coverage ⚠
+
+<details><summary>Partial Coverage Details</summary>
+
+- <specific missing input, reviewer task result, checker decision or comment URL>
+
+</details>
 
 <details><summary>Assessment Summary</summary>
 
@@ -483,8 +519,9 @@ hidden bot identifiers are omitted from this example.
 
 `Review Summary` links every final Blocker and Should Fix finding, including reused comments.
 It is absent when there are none. Nits count in the headline and have individual comments, but
-no rows in that disclosure. All disclosures start closed. A posting failure can replace the
-count line with `Finding counts unavailable.` and adds an explanation. The Check Run includes
+no rows in that disclosure. All disclosures start closed. Missing required information produces `NO VERDICT` with Partial Coverage Details. Known Blockers
+still appear in the count and Review Summary. A posting failure can also show
+`Finding counts unavailable.` in place of the count line. The Check Run includes
 all final findings, including findings supplied only in structured model output.
 
 ### Individual finding comment format
