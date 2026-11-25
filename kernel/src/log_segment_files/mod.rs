@@ -164,20 +164,6 @@ fn group_checkpoint_parts(
     checkpoints
 }
 
-fn has_file_content(file: &ParsedLogPath) -> bool {
-    file.location.size > 0
-}
-
-/// Selects a complete checkpoint from one version group, ignoring empty files.
-fn select_complete_checkpoint(parts: Vec<ParsedLogPath>) -> Option<Vec<ParsedLogPath>> {
-    let usable_parts = parts.into_iter().filter(has_file_content).collect();
-    group_checkpoint_parts(usable_parts)
-        .into_iter()
-        .filter(|(instance, parts)| instance.is_complete(parts))
-        .max_by(|(a, _), (b, _)| a.cmp(b))
-        .map(|(_, parts)| parts)
-}
-
 /// Returns the version of the latest complete checkpoint in `files`, or `None` if no complete
 /// checkpoint exists. Skips 0-byte checkpoint files so they don't count toward completeness.
 fn find_complete_checkpoint_version(ascending_files: &[ParsedLogPath]) -> Option<Version> {
@@ -317,7 +303,7 @@ struct ListingAccumulator {
     incomplete_checkpoints: Vec<CheckpointPartsMissing>,
     /// A file-backed hint whose version has not yet been exhausted or satisfied by a candidate.
     missing_hint: Option<CheckpointPartsMissing>,
-    /// End-version bound used in process_file() to filter CompactedCommit files
+    /// Inclusive upper bound on listed versions; also filters `CompactedCommit` files.
     end_version: Option<Version>,
     /// The version of the current group being accumulated
     group_version: Option<Version>,
@@ -936,4 +922,18 @@ impl LogSegmentFiles {
         let files = list_delta_log_from_storage(storage, log_root, start, end)?;
         Self::build_with_accumulator(files, log_tail, start, acc)
     }
+}
+
+fn has_file_content(file: &ParsedLogPath) -> bool {
+    file.location.size > 0
+}
+
+/// Selects a complete checkpoint from one version group, ignoring empty files.
+fn select_complete_checkpoint(parts: Vec<ParsedLogPath>) -> Option<Vec<ParsedLogPath>> {
+    let usable_parts = parts.into_iter().filter(has_file_content).collect();
+    group_checkpoint_parts(usable_parts)
+        .into_iter()
+        .filter(|(instance, parts)| instance.is_complete(parts))
+        .max_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, parts)| parts)
 }

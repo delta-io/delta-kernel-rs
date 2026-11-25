@@ -588,7 +588,7 @@ pub struct CrcReadFailure {
 pub enum CheckpointPartsMissingSource {
     /// A listed multipart candidate had missing or empty parts.
     Listing,
-    /// A file-backed checkpoint hint named a missing or unusable target.
+    /// A file-backed hint version had no checkpoint file, or only an empty classic or V2 file.
     Hint,
     /// The source was unrecorded, unrecognized, or is unavailable to this binding.
     Unknown,
@@ -609,6 +609,7 @@ impl From<kernel::CheckpointPartsMissingSource> for CheckpointPartsMissingSource
 ///
 /// Discovery may still use an older checkpoint and replay subsequent commits. A missing or empty
 /// classic or V2 hint target reports one expected part and zero found parts.
+/// Later loads or refreshes may report the same candidate again; deduplicate repeats for alerting.
 /// This event has no operation ID; use snapshot and log-segment completion events for outcomes.
 #[repr(C)]
 pub struct CheckpointPartsMissing {
@@ -618,7 +619,7 @@ pub struct CheckpointPartsMissing {
     pub version: u64,
     /// Number of parts required by the checkpoint file name or hint.
     pub expected_parts: u64,
-    /// Number of usable parts found in the listing.
+    /// Number of distinct, nonempty parts found for this checkpoint candidate.
     pub found_parts: u64,
 }
 

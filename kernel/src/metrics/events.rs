@@ -1553,7 +1553,7 @@ impl fmt::Display for CrcReadFailure {
 pub enum CheckpointPartsMissingSource {
     /// A listed multipart candidate had missing or empty parts, including an all-empty set.
     Listing,
-    /// A file-backed checkpoint hint named a missing or unusable target.
+    /// A file-backed hint version had no checkpoint file, or only an empty classic or V2 file.
     Hint,
     /// The source was not recorded or its metric label was unrecognized.
     Unknown,
@@ -1563,9 +1563,11 @@ pub enum CheckpointPartsMissingSource {
 ///
 /// Reports incomplete candidates for which discovery found no complete checkpoint at the same
 /// or a later version. Discovery may still use an older checkpoint and replay subsequent commits.
-/// The [`Self::source`] distinguishes listed multipart candidates from file-backed hints with no
-/// usable target. An absent or empty classic or V2 hint target reports one expected part and zero
-/// found parts. Listings that ignore checkpoints emit nothing.
+/// An absent or empty classic or V2 hint target reports one expected part and zero found parts.
+/// Listings that ignore checkpoints emit nothing.
+///
+/// Each incomplete candidate is reported at most once per discovery pass. Later loads or refreshes
+/// may report it again; deduplicate repeated candidates when using these events for alerting.
 ///
 /// This event has no `operation_id`. Use log-segment and snapshot completion events to observe
 /// whether fallback succeeded or the enclosing operation failed.
