@@ -37,17 +37,23 @@ pub struct SequentialScanMetadata {
     operation_id: MetricId,
     /// Opaque, caller-supplied correlation id propagated to both phases' metric events.
     correlation_id: Option<Arc<str>>,
+    table_id: Option<Arc<str>>,
     start: Instant,
     span: Span,
 }
 
 impl SequentialScanMetadata {
-    pub(crate) fn new(sequential: SequentialPhase, correlation_id: Option<Arc<str>>) -> Self {
+    pub(crate) fn new(
+        sequential: SequentialPhase,
+        correlation_id: Option<Arc<str>>,
+        table_id: Option<Arc<str>>,
+    ) -> Self {
         let operation_id = MetricId::new();
         Self {
             sequential,
             operation_id,
             correlation_id,
+            table_id,
             start: Instant::now(),
             // TODO: Associate a unique scan ID with this span to correlate sequential and parallel
             // phases
@@ -63,6 +69,7 @@ impl SequentialScanMetadata {
                     self.operation_id,
                     processor.is_catalog_managed(),
                     self.correlation_id,
+                    self.table_id,
                     ScanType::SequentialPhase,
                     self.start.elapsed(),
                 );
@@ -77,6 +84,7 @@ impl SequentialScanMetadata {
                     self.operation_id,
                     processor.is_catalog_managed(),
                     self.correlation_id.clone(),
+                    self.table_id.clone(),
                     ScanType::SequentialPhase,
                     self.start.elapsed(),
                 );
@@ -91,6 +99,7 @@ impl SequentialScanMetadata {
                         inner: processor,
                         operation_id: self.operation_id,
                         correlation_id: self.correlation_id,
+                        table_id: self.table_id,
                         parallel_start: Instant::now(),
                     }),
                     files,
@@ -121,6 +130,7 @@ pub struct ParallelState {
     /// survive the serialization boundary; a reconstructed state carries `None` (tracked in
     /// #2736).
     correlation_id: Option<Arc<str>>,
+    table_id: Option<Arc<str>>,
     /// Start time for the parallel phase, set when this state is created.
     parallel_start: Instant,
 }
@@ -162,6 +172,7 @@ impl ParallelState {
             self.operation_id,
             self.inner.is_catalog_managed(),
             self.correlation_id.clone(),
+            self.table_id.clone(),
             ScanType::ParallelPhase,
             self.parallel_start.elapsed(),
         );
@@ -210,6 +221,7 @@ impl ParallelState {
             // reconstructed state starts a fresh operation_id and has no correlation_id (#2736).
             operation_id: MetricId::new(),
             correlation_id: None,
+            table_id: None,
             parallel_start: Instant::now(),
         })
     }

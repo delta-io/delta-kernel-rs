@@ -191,8 +191,8 @@ events share the enclosing snapshot build's operation and correlation IDs.
 | `StorageCopyCompleted` | `duration` | A storage copy/rename call. |
 | `JsonReadCompleted` | `num_files`, `bytes_read` | One `JsonHandler::read_json_files` call completed. `bytes_read` is the sum of on-disk file sizes. |
 | `ParquetReadCompleted` | `num_files`, `bytes_read` | One `ParquetHandler::read_parquet_files` call completed. `bytes_read` is the sum of on-disk file sizes. |
-| `CrcReadSuccess` | `operation_id`, `correlation_id`, `duration`, `bytes_read` | One CRC file read and parsed successfully. `bytes_read` is the raw byte count from storage. |
-| `CrcReadFailure` | `operation_id`, `correlation_id`, `reason` | An attempted CRC read failed. The reason distinguishes missing files, empty reads, parsing or validation failures, storage errors, and cancellation. An unset or unrecognized reason reports `error`. Non-cancellation failures allow log replay. |
+| `CrcReadSuccess` | `operation_id`, `correlation_id`, `table_id`, `table_path`, `duration`, `bytes_read` | One CRC file read and parsed successfully. `bytes_read` is the raw byte count from storage. |
+| `CrcReadFailure` | `operation_id`, `correlation_id`, `table_id`, `table_path`, `reason` | An attempted CRC read failed. The reason distinguishes missing files, empty reads, parsing or validation failures, storage errors, and cancellation. An unset or unrecognized reason reports `error`. Non-cancellation failures allow log replay. |
 
 > [!NOTE]
 > If you implement a custom `JsonHandler` or `ParquetHandler`, call
@@ -203,8 +203,8 @@ events share the enclosing snapshot build's operation and correlation IDs.
 ### Domain metadata reads
 
 `DomainMetadataLoadSuccess` and `DomainMetadataLoadFailure` carry an operation ID, the
-optional correlation ID from the current [SnapshotReader](https://docs.rs/delta_kernel/latest/delta_kernel/snapshot/struct.SnapshotReader.html).
-Success also reports the duration, cache use,
+optional correlation ID from the current [SnapshotReader](https://docs.rs/delta_kernel/latest/delta_kernel/snapshot/struct.SnapshotReader.html),
+and the optional `table_id` and `table_path`. Success also reports the duration, cache use,
 and number of domains returned.
 
 ### Checkpoint hint reads
@@ -214,7 +214,7 @@ to count `_last_checkpoint` read attempts and record their duration by outcome. 
 hint normally leads to log listing. A file-not-found error returned directly by storage propagates
 instead of falling back, but still reports `NotFound`. Use snapshot events to measure snapshot
 failures separately from hint availability. The hint event shares the snapshot build's
-`operation_id` and optional `correlation_id`.
+`operation_id`, optional `correlation_id`, and optional table labels.
 
 ### Checksum write events
 
@@ -236,7 +236,8 @@ load share the same `MetricId`:
 3. `SnapshotBuildSuccess` or `SnapshotBuildFailure` (final outcome and total duration)
 
 Checkpoint hint and CRC reads use that same ID when they occur. Connectors can also supply
-a `correlation_id` for their request.
+a `correlation_id` for their request and `table_id` and `table_path` labels for the table.
+Scan metadata events carry the table ID from the snapshot or scan builder when supplied.
 
 You can store the `MetricId` in your monitoring system as a trace ID or
 correlation key. Because everything flows through `tracing`, you can also

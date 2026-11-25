@@ -32,6 +32,8 @@ pub struct FfiSnapshotBuilder {
     pub(super) source: FfiSnapshotBuilderSource,
     version: Option<Version>,
     correlation_id: Option<String>,
+    table_id: Option<String>,
+    table_path: Option<String>,
     incremental_replay: IncrementalReplay,
     log_tail: Vec<LogPath>,
     max_catalog_version: Option<Version>,
@@ -167,6 +169,82 @@ pub unsafe extern "C" fn snapshot_builder_with_correlation_id(
             builder.correlation_id = Some(id).filter(|id| !id.is_empty());
             builder.into()
         })
+    });
+    unsafe { result.into_extern_result(&engine.as_ref()) }
+}
+
+/// Attach a caller-supplied table identifier to this snapshot build's metric events.
+///
+/// Copies the identifier before returning. Repeated calls replace the previous value; an empty
+/// value clears it. Invalid UTF-8 or a null pointer with nonzero length returns an error.
+///
+/// # Safety
+///
+/// `builder` must be a valid handle. It is consumed on both success and error and must not be
+/// used or freed afterward. The caller owns the returned builder on success. `table_id`
+/// is borrowed for this call. If its pointer is non-null, it must address `len` readable bytes
+/// until the call returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapshot_builder_with_table_id(
+    builder: Handle<ExclusiveSnapshotBuilder>,
+    table_id: KernelStringSlice,
+) -> ExternResult<Handle<ExclusiveSnapshotBuilder>> {
+    let engine = unsafe { builder.as_ref() }.engine.clone();
+    let result = catch_panic(|| {
+        let mut builder = unsafe { builder.into_inner() };
+        unsafe { table_id.try_to_string() }.map(|id| {
+            builder.table_id = Some(id);
+            builder.into()
+        })
+    });
+    unsafe { result.into_extern_result(&engine.as_ref()) }
+}
+
+/// Attach a table root label suitable for telemetry to this snapshot build's metric events.
+///
+/// Supply a path without credentials or tokens. Copies the label before returning. Repeated calls
+/// replace the previous value; an empty value clears it. Invalid UTF-8 or a null pointer with
+/// nonzero length returns an error.
+///
+/// # Safety
+///
+/// `builder` must be a valid handle. It is consumed on both success and error and must not be
+/// used or freed afterward. The caller owns the returned builder on success. `table_path`
+/// is borrowed for this call. If its pointer is non-null, it must address `len` readable bytes
+/// until the call returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapshot_builder_with_metric_table_path(
+    builder: Handle<ExclusiveSnapshotBuilder>,
+    table_path: KernelStringSlice,
+) -> ExternResult<Handle<ExclusiveSnapshotBuilder>> {
+    let engine = unsafe { builder.as_ref() }.engine.clone();
+    let result = catch_panic(|| {
+        let mut builder = unsafe { builder.into_inner() };
+        unsafe { table_path.try_to_string() }.map(|path| {
+            builder.table_path = Some(path);
+            builder.into()
+        })
+    });
+    unsafe { result.into_extern_result(&engine.as_ref()) }
+}
+
+/// Return a snapshot whose subsequent read metrics use the caller's table identifier.
+/// An empty identifier clears it. Other handles retain their original identity.
+///
+/// # Safety
+///
+/// The snapshot handle is consumed on success and error. The engine and UTF-8 slice
+/// must remain valid for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapshot_with_table_id(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+    table_id: KernelStringSlice,
+) -> ExternResult<Handle<SharedSnapshot>> {
+    let result = catch_panic(|| {
+        let snapshot = unsafe { snapshot.into_inner() };
+        unsafe { table_id.try_to_string() }
+            .map(|id| snapshot.with_metric_table_id(Some(id.into())).into())
     });
     unsafe { result.into_extern_result(&engine.as_ref()) }
 }
@@ -307,6 +385,8 @@ fn make_snapshot_builder(
         source,
         version: None,
         correlation_id: None,
+        table_id: None,
+        table_path: None,
         incremental_replay: IncrementalReplay::Disabled,
         log_tail: Vec::new(),
         max_catalog_version: None,
@@ -331,6 +411,8 @@ fn snapshot_builder_build_impl(
         source,
         version,
         correlation_id,
+        table_id,
+        table_path,
         incremental_replay,
         log_tail,
         max_catalog_version,
@@ -341,6 +423,8 @@ fn snapshot_builder_build_impl(
     struct BuildOptions {
         version: Option<Version>,
         correlation_id: Option<String>,
+        table_id: Option<String>,
+        table_path: Option<String>,
         incremental_replay: IncrementalReplay,
         log_tail: Vec<LogPath>,
         max_catalog_version: Option<Version>,
@@ -360,6 +444,8 @@ fn snapshot_builder_build_impl(
         let BuildOptions {
             version,
             correlation_id,
+            table_id,
+            table_path,
             incremental_replay,
             log_tail,
             max_catalog_version,
@@ -368,6 +454,12 @@ fn snapshot_builder_build_impl(
         builder = builder.with_incremental_crc_replay(incremental_replay);
         if let Some(correlation_id) = correlation_id {
             builder = builder.with_correlation_id(correlation_id);
+        }
+        if let Some(id) = table_id {
+            builder = builder.with_table_id(id);
+        }
+        if let Some(path) = table_path {
+            builder = builder.with_metric_table_path(path);
         }
         if let Some(version) = version {
             builder = builder.at_version(version);
@@ -387,6 +479,8 @@ fn snapshot_builder_build_impl(
     let options = BuildOptions {
         version,
         correlation_id,
+        table_id,
+        table_path,
         incremental_replay,
         log_tail,
         max_catalog_version,
@@ -432,52 +526,52 @@ mod tests {
     use crate::{free_engine, free_snapshot, kernel_string_slice};
 
     #[rstest]
-    fn correlation_id_setter_copies_input_and_consumes_builder_on_error(
+    #[case::correlation(snapshot_builder_with_correlation_id, |b: &FfiSnapshotBuilder| b.correlation_id.clone(), None)]
+    #[case::table_id(snapshot_builder_with_table_id, |b: &FfiSnapshotBuilder| b.table_id.clone(), Some(""))]
+    #[case::table_path(snapshot_builder_with_metric_table_path, |b: &FfiSnapshotBuilder| b.table_path.clone(), Some(""))]
+    fn snapshot_builder_label_setter_copies_input_and_consumes_builder_on_error(
+        #[case] set_label: unsafe extern "C" fn(
+            Handle<ExclusiveSnapshotBuilder>,
+            KernelStringSlice,
+        )
+            -> ExternResult<Handle<ExclusiveSnapshotBuilder>>,
+        #[case] read_label: fn(&FfiSnapshotBuilder) -> Option<String>,
+        #[case] cleared: Option<&str>,
         #[values(false, true)] fail: bool,
-        #[values(std::ptr::null(), b"\xff".as_ptr().cast())] correlation_id_ptr: *const c_char,
+        #[values(std::ptr::null(), b"\xff".as_ptr().cast())] ptr: *const c_char,
     ) {
         let engine = error_only_engine_handle();
         let table_root = "memory:///table/";
         let engine_owner = unsafe { engine.clone_as_arc() };
         let baseline = Arc::strong_count(&engine_owner);
-        let builder = unsafe {
+        let mut builder = unsafe {
             ok_or_panic(get_snapshot_builder(
                 kernel_string_slice!(table_root),
                 engine.shallow_copy(),
             ))
         };
         assert_eq!(Arc::strong_count(&engine_owner), baseline + 1);
-        let mut id = String::from("request-1");
-        let builder = unsafe {
-            ok_or_panic(snapshot_builder_with_correlation_id(
+        for expected in ["label-1", "label-2"] {
+            let mut label = String::from(expected);
+            builder = unsafe { ok_or_panic(set_label(builder, kernel_string_slice!(label))) };
+            label.clear();
+            assert_eq!(
+                read_label(unsafe { builder.as_ref() }).as_deref(),
+                Some(expected)
+            );
+        }
+
+        let result = unsafe {
+            set_label(
                 builder,
-                kernel_string_slice!(id),
-            ))
+                KernelStringSlice {
+                    ptr,
+                    len: usize::from(fail),
+                },
+            )
         };
-        id.clear();
-        assert_eq!(
-            unsafe { builder.as_ref() }.correlation_id.as_deref(),
-            Some("request-1")
-        );
-        id.push_str("request-2");
-        let builder = unsafe {
-            ok_or_panic(snapshot_builder_with_correlation_id(
-                builder,
-                kernel_string_slice!(id),
-            ))
-        };
-        drop(id);
-        assert_eq!(
-            unsafe { builder.as_ref() }.correlation_id.as_deref(),
-            Some("request-2")
-        );
-        let id = KernelStringSlice {
-            ptr: correlation_id_ptr,
-            len: usize::from(fail),
-        };
-        let result = unsafe { snapshot_builder_with_correlation_id(builder, id) };
         if fail {
-            let expected = if correlation_id_ptr.is_null() {
+            let expected = if ptr.is_null() {
                 FFIKernelError::GenericError
             } else {
                 FFIKernelError::Utf8Error
@@ -485,7 +579,7 @@ mod tests {
             assert_extern_result_error_with_message(result, expected, None);
         } else {
             let builder = ok_or_panic(result);
-            assert!(unsafe { builder.as_ref() }.correlation_id.is_none());
+            assert_eq!(read_label(unsafe { builder.as_ref() }).as_deref(), cleared);
             unsafe { free_snapshot_builder(builder) };
         }
         assert_eq!(Arc::strong_count(&engine_owner), baseline);
@@ -517,6 +611,21 @@ mod tests {
             ))
         };
         drop(id);
+        let table_id = "opaque/table";
+        let builder = unsafe {
+            ok_or_panic(snapshot_builder_with_table_id(
+                builder,
+                kernel_string_slice!(table_id),
+            ))
+        };
+        let label = String::from("memory:///tables/example");
+        let builder = unsafe {
+            ok_or_panic(snapshot_builder_with_metric_table_path(
+                builder,
+                kernel_string_slice!(label),
+            ))
+        };
+        drop(label);
         let builder = if fail {
             unsafe { snapshot_builder_with_version(builder, 99) }
         } else {
@@ -536,6 +645,8 @@ mod tests {
         }
         let mut completions = 0;
         for event in reporter.events() {
+            let table_path = event.table_path().map(str::to_owned);
+            let table_id = event.table_id().map(str::to_owned);
             let correlation_id = match event {
                 MetricEvent::SnapshotBuildSuccess(event) => {
                     completions += 1;
@@ -553,6 +664,8 @@ mod tests {
                 MetricEvent::ProtocolMetadataLoadFailure(event) => event.correlation_id,
                 _ => continue,
             };
+            assert_eq!(table_path.as_deref(), Some("memory:///tables/example"));
+            assert_eq!(table_id.as_deref(), Some("opaque/table"));
             assert_eq!(correlation_id.as_deref(), Some("snapshot-request"));
         }
         assert_eq!(completions, 1);

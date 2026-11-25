@@ -56,6 +56,8 @@ pub struct SnapshotBuilder<Mode = FromTableRoot> {
     /// Opaque, caller-supplied id recorded on this build's metric events. Not interpreted by
     /// kernel; set via [`with_correlation_id`](Self::with_correlation_id).
     correlation_id: Option<Arc<str>>,
+    table_id: Option<Arc<str>>,
+    metric_table_path: Option<Arc<str>>,
     /// Optional cooperative cancellation token for this build's handler-backed reads.
     cancellation_token: Option<CancellationTokenRef>,
     // Carries the zero-sized typestate that limits mode-specific methods at compile time.
@@ -150,6 +152,8 @@ impl SnapshotBuilder<FromTableRoot> {
             snapshot_hint: None,
             operation_id: MetricId::new(),
             correlation_id: None,
+            table_id: None,
+            metric_table_path: None,
             cancellation_token: None,
             mode: PhantomType::default(),
         }
@@ -183,6 +187,8 @@ impl SnapshotBuilder<FromTableRoot> {
 
 impl SnapshotBuilder<FromSnapshot> {
     pub(crate) fn new_from(existing_snapshot: SnapshotRef) -> Self {
+        let table_id = existing_snapshot.metric_table_id.clone();
+        let table_path = existing_snapshot.metric_table_path.clone();
         Self {
             table_root: None,
             existing_snapshot: Some(existing_snapshot),
@@ -194,6 +200,8 @@ impl SnapshotBuilder<FromSnapshot> {
             snapshot_hint: None,
             operation_id: MetricId::new(),
             correlation_id: None,
+            table_id,
+            metric_table_path: table_path,
             cancellation_token: None,
             mode: PhantomType::default(),
         }
@@ -320,6 +328,23 @@ impl<Mode> SnapshotBuilder<Mode> {
         self
     }
 
+    /// Attach the caller's opaque table identifier to read metrics.
+    ///
+    /// [`Snapshot::builder_from`] inherits the identifier from the input snapshot. Pass an empty
+    /// value to clear it.
+    pub fn with_table_id(mut self, table_id: impl Into<Arc<str>>) -> Self {
+        self.table_id = Some(table_id.into()).filter(|id| !id.is_empty());
+        self
+    }
+
+    /// Attach a table root label to snapshot read metrics. Supply a path suitable for
+    /// telemetry, without credentials or access tokens. [`Snapshot::builder_from`] inherits the
+    /// label from the input snapshot. Pass an empty value to clear it.
+    pub fn with_metric_table_path(mut self, path: impl Into<Arc<str>>) -> Self {
+        self.metric_table_path = Some(path.into()).filter(|path| !path.is_empty());
+        self
+    }
+
     // ============================================================================
     // Terminal: build the Snapshot
     // ============================================================================
@@ -358,7 +383,7 @@ impl<Mode> SnapshotBuilder<Mode> {
     #[instrument(
         name = SNAPSHOT_COMPLETED_SPAN,
         skip_all,
-        fields(path = %self.table_path(), report, enable_call_frame, version = tracing::field::Empty, operation_id = %self.operation_id, is_catalog_managed = self.max_catalog_version.is_some(), correlation_id = self.correlation_id.as_deref().unwrap_or(""), load_type = self.load_type().as_ref()),
+        fields(path = %self.table_path(), report, enable_call_frame, version = tracing::field::Empty, table_id = self.table_id.as_deref().unwrap_or(""), table_path = self.metric_table_path.as_deref().unwrap_or(""), operation_id = %self.operation_id, is_catalog_managed = self.max_catalog_version.is_some(), correlation_id = self.correlation_id.as_deref().unwrap_or(""), load_type = self.load_type().as_ref()),
         err
     )]
     pub fn build(self, engine: &dyn Engine) -> Result<SnapshotRef> {
@@ -389,6 +414,8 @@ impl<Mode> SnapshotBuilder<Mode> {
             snapshot_hint,
             operation_id,
             correlation_id,
+            table_id,
+            metric_table_path: table_path,
             cancellation_token,
             mode: _,
         } = self;
@@ -397,6 +424,8 @@ impl<Mode> SnapshotBuilder<Mode> {
             operation_id,
             is_catalog_managed: max_catalog_version.is_some(),
             correlation_id,
+            table_id: table_id.clone(),
+            table_path: table_path.clone(),
             load_type,
         };
 
@@ -494,7 +523,7 @@ impl<Mode> SnapshotBuilder<Mode> {
         // Post-build validations for catalog-managed tables
         Self::validate_catalog_managed_build_result(&snapshot, version, max_catalog_version)?;
         tracing::Span::current().record("version", snapshot.version());
-        Ok(snapshot)
+        Ok(snapshot.with_metric_table_identity(table_id, table_path))
     }
 
     // ============================================================================
@@ -1218,8 +1247,16 @@ pub(super) mod tests {
         create_table(&store, &table_root).await?;
 
         let (reporter, _guard) = measuring_reporter();
-        let _ = SnapshotBuilder::new_for(table_root)
+        SnapshotBuilder::new_for(table_root)
             .fold_with(correlation_id, SnapshotBuilder::with_correlation_id)
+            .fold_with(
+                correlation_id.map(|_| "opaque-table"),
+                SnapshotBuilder::with_table_id,
+            )
+            .fold_with(
+                correlation_id.map(|_| "/tables/example"),
+                SnapshotBuilder::with_metric_table_path,
+            )
             .build(engine.as_ref())?;
 
         // The build event and its snapshot-load child events must all carry the id, since they
@@ -1239,6 +1276,16 @@ pub(super) mod tests {
                 _ => None,
             })
             .unwrap();
+        assert_eq!(
+            build.table_id.as_deref(),
+            correlation_id.map(|_| "opaque-table")
+        );
+        assert_eq!(
+            build.table_path.as_deref(),
+            correlation_id.map(|_| "/tables/example")
+        );
+        assert_eq!(hint.table_path, build.table_path);
+        assert_eq!(hint.table_id, build.table_id);
         assert_eq!(hint.operation_id, build.operation_id);
         assert_eq!(hint.correlation_id.as_deref(), correlation_id);
         let id_of = |pick: fn(&MetricEvent) -> Option<&Option<Arc<str>>>| {

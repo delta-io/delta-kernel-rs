@@ -175,6 +175,8 @@ impl Snapshot {
                     &existing_snapshot,
                     built_as_latest,
                     existing_snapshot.skipped_new_checkpoints,
+                    metric_context.table_id.clone(),
+                    metric_context.table_path.clone(),
                 ));
             }
             // Case B: incremental path only moves forward.
@@ -218,6 +220,8 @@ impl Snapshot {
                     &existing_snapshot,
                     built_as_latest,
                     skipped_new_checkpoints,
+                    metric_context.table_id.clone(),
+                    metric_context.table_path.clone(),
                 ));
             }
             NewSegment::Rebuild(new_log_segment) => {
@@ -583,18 +587,24 @@ impl Snapshot {
     ///
     /// The source is unchanged. Populated caches are preserved, and uninitialized cache cells
     /// resolve independently.
-    fn reuse_with_build_metadata(
+    pub(super) fn reuse_with_build_metadata(
         existing: &Arc<Snapshot>,
         built_as_latest: bool,
         skipped_new_checkpoints: bool,
+        table_id: Option<Arc<str>>,
+        table_path: Option<Arc<str>>,
     ) -> Arc<Snapshot> {
-        if existing.built_as_latest == built_as_latest
+        if existing.metric_table_id == table_id
+            && existing.metric_table_path == table_path
+            && existing.built_as_latest == built_as_latest
             && existing.skipped_new_checkpoints == skipped_new_checkpoints
         {
             return existing.clone();
         }
         Arc::new(Self {
             span: existing.span.clone(),
+            metric_table_id: table_id,
+            metric_table_path: table_path,
             log_segment: existing.log_segment.clone(),
             table_configuration: existing.table_configuration.clone(),
             crc: existing.crc.clone(),

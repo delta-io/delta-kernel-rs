@@ -43,15 +43,29 @@ impl LoggingMetricsReporter {
 }
 
 impl MetricsReporter for LoggingMetricsReporter {
-    fn report(&self, event: MetricEvent) {
+    fn report(&self, metric: MetricEvent) {
+        let identity = metric.read_identity();
         // event! needs a constant level. Detach from the parent span so the log line carries the
         // event payload alone, not the span context that produced it.
+        macro_rules! log_metric {
+            ($level:expr) => {
+                event!(
+                    parent: Span::none(),
+                    $level,
+                    operation_id = identity.operation_id.map(tracing::field::display),
+                    correlation_id = identity.correlation_id,
+                    table_id = identity.table_id,
+                    table_path = identity.table_path,
+                    "{metric}"
+                )
+            };
+        }
         match self.level {
-            Level::ERROR => event!(parent: Span::none(), Level::ERROR, "{}", event),
-            Level::WARN => event!(parent: Span::none(), Level::WARN, "{}", event),
-            Level::INFO => event!(parent: Span::none(), Level::INFO, "{}", event),
-            Level::DEBUG => event!(parent: Span::none(), Level::DEBUG, "{}", event),
-            Level::TRACE => event!(parent: Span::none(), Level::TRACE, "{}", event),
+            Level::ERROR => log_metric!(Level::ERROR),
+            Level::WARN => log_metric!(Level::WARN),
+            Level::INFO => log_metric!(Level::INFO),
+            Level::DEBUG => log_metric!(Level::DEBUG),
+            Level::TRACE => log_metric!(Level::TRACE),
         }
     }
 }
@@ -335,7 +349,7 @@ mod tests {
     use tracing_subscriber::{Layer, Registry, registry, reload};
     use uuid::Uuid;
 
-    use super::ReportGeneratorLayer;
+    use super::{LoggingMetricsReporter, MetricsReporter as _, ReportGeneratorLayer};
     use crate::checkpoint::{CheckpointInfo, SelectedCheckpointType};
     use crate::metrics::events::{
         SNAPSHOT_COMPLETED_SPAN, SnapshotLoadMetricContext, emit_log_segment_load_failure,
@@ -368,6 +382,89 @@ mod tests {
         with_default(subscriber, f);
         let bytes = logs.lock().unwrap().clone();
         String::from_utf8(bytes).unwrap()
+    }
+
+    #[rstest::rstest]
+    fn logging_reporter_preserves_read_identity(
+        #[values(
+            tracing::Level::ERROR,
+            tracing::Level::WARN,
+            tracing::Level::INFO,
+            tracing::Level::DEBUG,
+            tracing::Level::TRACE
+        )]
+        level: tracing::Level,
+    ) {
+        let capture = Arc::new(CapturingReporter::default());
+        {
+            let _guard = install_thread_local_metrics_reporter(capture.clone());
+            let engine = crate::engine::sync::SyncEngine::new();
+            crate::Snapshot::builder_for("tests/data/crc-full")
+                .with_correlation_id("request-1")
+                .with_table_id("orders")
+                .with_metric_table_path("/tables/orders")
+                .build(&engine)
+                .unwrap();
+        }
+        let mut events = capture.events();
+        let operation_id = events
+            .iter()
+            .find_map(|event| match event {
+                MetricEvent::SnapshotBuildSuccess(event) => Some(event.operation_id),
+                _ => None,
+            })
+            .expect("snapshot build metric");
+        events.extend([
+            MetricEvent::CrcReadFailure(crate::metrics::CrcReadFailure {
+                operation_id,
+                correlation_id: Some("request-1".into()),
+                table_id: Some("orders".into()),
+                table_path: Some("/tables/orders".into()),
+                reason: crate::metrics::CrcReadFailureReason::Parsing,
+            }),
+            MetricEvent::DomainMetadataLoadFailure {
+                operation_id: MetricId::new(),
+                correlation_id: None,
+                table_id: Some("orders".into()),
+                table_path: None,
+            },
+        ]);
+        let logs = capture_logs(|| {
+            let reporter = LoggingMetricsReporter::new(level);
+            for event in events {
+                reporter.report(event);
+            }
+        });
+        for kind in [
+            "LastCheckpointReadCompleted",
+            "LogSegmentLoadSuccess",
+            "CrcReadSuccess",
+            "ProtocolMetadataLoadSuccess",
+            "SnapshotBuildSuccess",
+            "CrcReadFailure",
+        ] {
+            let line = logs
+                .lines()
+                .find(|line| line.contains(kind))
+                .unwrap_or_else(|| {
+                    panic!("missing {kind} metric in {logs}");
+                });
+            assert!(
+                line.contains(&format!("operation_id={operation_id}")),
+                "{line}"
+            );
+            assert!(line.contains("correlation_id=\"request-1\""), "{line}");
+            assert!(line.contains("table_id=\"orders\""), "{line}");
+            assert!(line.contains("table_path=\"/tables/orders\""), "{line}");
+        }
+        let domain = logs
+            .lines()
+            .find(|line| line.contains("DomainMetadataLoadFailure"))
+            .expect("domain failure metric");
+        assert!(domain.contains("operation_id="), "{domain}");
+        assert!(domain.contains("table_id=\"orders\""), "{domain}");
+        assert!(!domain.contains("correlation_id="), "{domain}");
+        assert!(!domain.contains("table_path="), "{domain}");
     }
 
     #[rstest::rstest]

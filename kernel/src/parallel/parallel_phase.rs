@@ -518,6 +518,7 @@ mod tests {
         let scan = snapshot
             .scan_builder()
             .with_correlation_id("scan-corr-xyz")
+            .with_table_id("scan-table")
             .build()?;
         let mut sequential = scan.parallel_scan_metadata(engine.clone())?;
         for sm in sequential.by_ref() {
@@ -543,6 +544,14 @@ mod tests {
         let correlation_for = |phase: ScanType| {
             reporter.events().into_iter().find_map(|e| match e {
                 MetricEvent::ScanMetadataCompleted(s) if s.scan_type == phase => {
+                    assert_eq!(
+                        s.table_id.as_deref(),
+                        if with_serde && phase == ScanType::ParallelPhase {
+                            None
+                        } else {
+                            Some("scan-table")
+                        }
+                    );
                     Some(s.correlation_id)
                 }
                 _ => None,

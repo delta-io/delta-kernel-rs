@@ -532,6 +532,7 @@ pub struct ScanBuilder {
     predicate: Option<PredicateRef>,
     stats: StatsOptions,
     correlation_id: Option<Arc<str>>,
+    table_id: Option<Arc<str>>,
     without_row_transforms: bool,
     partition_values_options: PartitionValuesOptions,
     cancellation_token: Option<CancellationTokenRef>,
@@ -553,8 +554,10 @@ impl std::fmt::Debug for ScanBuilder {
 impl ScanBuilder {
     /// Create a new [`ScanBuilder`] instance.
     pub fn new(snapshot: impl Into<SnapshotRef>) -> Self {
+        let snapshot = snapshot.into();
         Self {
-            snapshot: snapshot.into(),
+            table_id: snapshot.metric_table_id.clone(),
+            snapshot,
             logical_read_schema: None,
             predicate: None,
             stats: StatsOptions::default(),
@@ -649,6 +652,16 @@ impl ScanBuilder {
     /// [`ParallelState`]: crate::scan::ParallelState
     pub fn with_correlation_id(mut self, correlation_id: impl Into<Arc<str>>) -> Self {
         self.correlation_id = Some(correlation_id.into()).filter(|id| !id.is_empty());
+        self
+    }
+
+    /// Attach the caller's opaque table identifier to read metrics.
+    ///
+    /// The default is inherited from the snapshot. An empty value clears the inherited identifier.
+    /// The identifier is passed to parallel scan phases in memory, and is omitted when
+    /// [`ParallelState`] is reconstructed from serialized bytes.
+    pub fn with_table_id(mut self, table_id: impl Into<Arc<str>>) -> Self {
+        self.table_id = Some(table_id.into()).filter(|id| !id.is_empty());
         self
     }
 
@@ -767,6 +780,7 @@ impl ScanBuilder {
             state_info: Arc::new(state_info),
             stats: self.stats,
             correlation_id: self.correlation_id,
+            table_id: self.table_id,
             partition_values_options: self.partition_values_options,
             cancellation_token: self.cancellation_token,
         })
@@ -1059,6 +1073,7 @@ pub struct Scan {
     state_info: Arc<StateInfo>,
     stats: StatsOptions,
     correlation_id: Option<Arc<str>>,
+    table_id: Option<Arc<str>>,
     partition_values_options: PartitionValuesOptions,
     /// Scan-local token for cached metadata checks and I/O; `None` retains engine I/O
     /// cancellation.
@@ -1468,6 +1483,7 @@ impl Scan {
         let operation_id = MetricId::new();
         let is_catalog_managed = self.snapshot.table_configuration().is_catalog_managed();
         let correlation_id = self.correlation_id.clone();
+        let table_id = self.table_id.clone();
 
         let (iter, metrics) = match self.state_info.physical_predicate {
             PhysicalPredicate::StaticSkipAll => {
@@ -1492,6 +1508,7 @@ impl Scan {
                 operation_id,
                 is_catalog_managed,
                 correlation_id,
+                table_id,
                 ScanType::Full,
                 start.elapsed(),
             );
@@ -1853,6 +1870,7 @@ impl Scan {
         Ok(SequentialScanMetadata::new(
             sequential,
             self.correlation_id.clone(),
+            self.table_id.clone(),
         ))
     }
 

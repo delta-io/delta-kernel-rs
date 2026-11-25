@@ -247,6 +247,8 @@ impl From<kernel::SnapshotLoadType> for SnapshotLoadType {
 /// A log segment was loaded.
 #[repr(C)]
 pub struct LogSegmentLoadSuccess {
+    pub table_id: KernelStringSlice,
+    pub table_path: KernelStringSlice,
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
@@ -265,6 +267,8 @@ pub struct LogSegmentLoadSuccess {
 /// Listing the log segment failed.
 #[repr(C)]
 pub struct LogSegmentLoadFailure {
+    pub table_id: KernelStringSlice,
+    pub table_path: KernelStringSlice,
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
@@ -300,6 +304,8 @@ impl From<kernel::ProtocolMetadataSource> for ProtocolMetadataSource {
 /// Protocol and metadata actions were read from the log.
 #[repr(C)]
 pub struct ProtocolMetadataLoadSuccess {
+    pub table_id: KernelStringSlice,
+    pub table_path: KernelStringSlice,
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
@@ -311,6 +317,8 @@ pub struct ProtocolMetadataLoadSuccess {
 /// Reading protocol and metadata from the log failed.
 #[repr(C)]
 pub struct ProtocolMetadataLoadFailure {
+    pub table_id: KernelStringSlice,
+    pub table_path: KernelStringSlice,
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
@@ -322,6 +330,8 @@ pub struct ProtocolMetadataLoadFailure {
 /// A snapshot was built successfully.
 #[repr(C)]
 pub struct SnapshotBuildSuccess {
+    pub table_id: KernelStringSlice,
+    pub table_path: KernelStringSlice,
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
@@ -333,6 +343,8 @@ pub struct SnapshotBuildSuccess {
 /// Building a snapshot failed.
 #[repr(C)]
 pub struct SnapshotBuildFailure {
+    pub table_id: KernelStringSlice,
+    pub table_path: KernelStringSlice,
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
@@ -522,6 +534,8 @@ impl From<kernel::CheckpointWriteStats> for CheckpointWriteStats {
 /// Identifiers of a failed domain metadata read.
 #[repr(C)]
 pub struct ReadFailure {
+    pub table_id: KernelStringSlice,
+    pub table_path: KernelStringSlice,
     /// Unique ID for this domain metadata read.
     pub operation_id: MetricId,
     /// Caller-supplied request identifier. Empty when omitted.
@@ -531,6 +545,8 @@ pub struct ReadFailure {
 /// A domain metadata load completed.
 #[repr(C)]
 pub struct DomainMetadataLoadSuccess {
+    pub table_id: KernelStringSlice,
+    pub table_path: KernelStringSlice,
     /// Unique ID for this domain metadata read.
     pub operation_id: MetricId,
     /// Caller-supplied request identifier. Empty when omitted.
@@ -551,6 +567,8 @@ pub struct SetTransactionLoadSuccess {
 /// A CRC file was read and parsed successfully.
 #[repr(C)]
 pub struct CrcReadSuccess {
+    pub table_id: KernelStringSlice,
+    pub table_path: KernelStringSlice,
     /// Operation ID of the snapshot build that requested this CRC.
     pub operation_id: MetricId,
     /// Caller-supplied request identifier. Empty when omitted.
@@ -592,6 +610,8 @@ impl From<kernel::CrcReadFailureReason> for CrcReadFailureReason {
 /// A CRC file read or parse failed. Non-cancellation failures allow log replay.
 #[repr(C)]
 pub struct CrcReadFailure {
+    pub table_id: KernelStringSlice,
+    pub table_path: KernelStringSlice,
     /// Operation ID of the snapshot build that requested this CRC.
     pub operation_id: MetricId,
     /// Caller-supplied request identifier. Empty when omitted.
@@ -660,15 +680,17 @@ impl From<kernel::LastCheckpointReadOutcome> for LastCheckpointReadOutcome {
 /// A `_last_checkpoint` read attempt completed.
 #[repr(C)]
 pub struct LastCheckpointReadCompleted {
+    pub table_id: KernelStringSlice,
+    pub table_path: KernelStringSlice,
+    /// Id of the snapshot build that requested this read.
+    pub operation_id: MetricId,
+    /// Borrowed caller-supplied id, empty when absent.
+    pub correlation_id: KernelStringSlice,
     /// Result of reading and validating the hint.
     pub outcome: LastCheckpointReadOutcome,
     /// Wall-clock time from entry through return, including parsing and validation, in
     /// nanoseconds.
     pub duration_ns: u64,
-    /// Id of the snapshot build that requested this read.
-    pub operation_id: MetricId,
-    /// Borrowed caller-supplied id, empty when absent.
-    pub correlation_id: KernelStringSlice,
 }
 
 /// A `JsonHandler::read_json_files` call completed.
@@ -689,6 +711,7 @@ pub struct ParquetReadCompleted {
 /// field semantics.
 #[repr(C)]
 pub struct ScanMetadataCompleted {
+    pub table_id: KernelStringSlice,
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
@@ -767,10 +790,10 @@ fn duration_ns(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
-/// Borrow the caller-supplied correlation id as a [`KernelStringSlice`], or an empty slice when
+/// Borrow an optional UTF-8 field as a [`KernelStringSlice`], or an empty slice when
 /// unset. The slice is valid only as long as the source kernel event is alive.
-fn correlation_id_slice(correlation_id: Option<&str>) -> KernelStringSlice {
-    match correlation_id {
+fn optional_string_slice(value: Option<&str>) -> KernelStringSlice {
+    match value {
         // Safety: the borrowed str lives as long as the source event, which outlives both the FFI
         // event and the callback it is passed to.
         Some(id) => unsafe { KernelStringSlice::new_unsafe(id) },
@@ -788,6 +811,8 @@ impl MetricEvent {
         Some(match event {
             K::ScanPlanGenerationCompleted(_) => return None,
             K::LogSegmentLoadSuccess(kernel::LogSegmentLoadSuccess {
+                table_id,
+                table_path,
                 operation_id,
                 correlation_id,
                 table_type,
@@ -798,8 +823,10 @@ impl MetricEvent {
                 crc_versions_behind,
                 duration,
             }) => Self::LogSegmentLoadSuccess(LogSegmentLoadSuccess {
+                table_id: optional_string_slice(table_id.as_deref()),
+                table_path: optional_string_slice(table_path.as_deref()),
                 operation_id: (*operation_id).into(),
-                correlation_id: correlation_id_slice(correlation_id.as_deref()),
+                correlation_id: optional_string_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
                 load_type: (*load_type).into(),
                 duration_ns: duration_ns(*duration),
@@ -811,19 +838,25 @@ impl MetricEvent {
                 crc_versions_behind: crc_versions_behind.unwrap_or(0),
             }),
             K::LogSegmentLoadFailure(kernel::LogSegmentLoadFailure {
+                table_id,
+                table_path,
                 operation_id,
                 correlation_id,
                 table_type,
                 load_type,
                 duration,
             }) => Self::LogSegmentLoadFailure(LogSegmentLoadFailure {
+                table_id: optional_string_slice(table_id.as_deref()),
+                table_path: optional_string_slice(table_path.as_deref()),
                 operation_id: (*operation_id).into(),
-                correlation_id: correlation_id_slice(correlation_id.as_deref()),
+                correlation_id: optional_string_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
                 load_type: (*load_type).into(),
                 duration_ns: duration_ns(*duration),
             }),
             K::ProtocolMetadataLoadSuccess(kernel::ProtocolMetadataLoadSuccess {
+                table_id,
+                table_path,
                 operation_id,
                 correlation_id,
                 table_type,
@@ -831,27 +864,35 @@ impl MetricEvent {
                 source,
                 duration,
             }) => Self::ProtocolMetadataLoadSuccess(ProtocolMetadataLoadSuccess {
+                table_id: optional_string_slice(table_id.as_deref()),
+                table_path: optional_string_slice(table_path.as_deref()),
                 operation_id: (*operation_id).into(),
-                correlation_id: correlation_id_slice(correlation_id.as_deref()),
+                correlation_id: optional_string_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
                 load_type: (*load_type).into(),
                 source: (*source).into(),
                 duration_ns: duration_ns(*duration),
             }),
             K::ProtocolMetadataLoadFailure(kernel::ProtocolMetadataLoadFailure {
+                table_id,
+                table_path,
                 operation_id,
                 correlation_id,
                 table_type,
                 load_type,
                 duration,
             }) => Self::ProtocolMetadataLoadFailure(ProtocolMetadataLoadFailure {
+                table_id: optional_string_slice(table_id.as_deref()),
+                table_path: optional_string_slice(table_path.as_deref()),
                 operation_id: (*operation_id).into(),
-                correlation_id: correlation_id_slice(correlation_id.as_deref()),
+                correlation_id: optional_string_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
                 load_type: (*load_type).into(),
                 duration_ns: duration_ns(*duration),
             }),
             K::SnapshotBuildSuccess(kernel::SnapshotBuildSuccess {
+                table_id,
+                table_path,
                 operation_id,
                 correlation_id,
                 table_type,
@@ -859,22 +900,28 @@ impl MetricEvent {
                 version,
                 duration,
             }) => Self::SnapshotBuildSuccess(SnapshotBuildSuccess {
+                table_id: optional_string_slice(table_id.as_deref()),
+                table_path: optional_string_slice(table_path.as_deref()),
                 operation_id: (*operation_id).into(),
-                correlation_id: correlation_id_slice(correlation_id.as_deref()),
+                correlation_id: optional_string_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
                 load_type: (*load_type).into(),
                 version: *version,
                 duration_ns: duration_ns(*duration),
             }),
             K::SnapshotBuildFailure(kernel::SnapshotBuildFailure {
+                table_id,
+                table_path,
                 operation_id,
                 correlation_id,
                 table_type,
                 load_type,
                 duration,
             }) => Self::SnapshotBuildFailure(SnapshotBuildFailure {
+                table_id: optional_string_slice(table_id.as_deref()),
+                table_path: optional_string_slice(table_path.as_deref()),
                 operation_id: (*operation_id).into(),
-                correlation_id: correlation_id_slice(correlation_id.as_deref()),
+                correlation_id: optional_string_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
                 load_type: (*load_type).into(),
                 duration_ns: duration_ns(*duration),
@@ -902,7 +949,7 @@ impl MetricEvent {
                 };
                 Self::TransactionCommitSuccess(TransactionCommitSuccess {
                     operation_id: (*operation_id).into(),
-                    correlation_id: correlation_id_slice(correlation_id.as_deref()),
+                    correlation_id: optional_string_slice(correlation_id.as_deref()),
                     table_type: (*table_type).into(),
                     commit_version: *commit_version,
                     num_add_files: *num_add_files,
@@ -925,19 +972,23 @@ impl MetricEvent {
                 reason,
             }) => Self::TransactionCommitFailure(TransactionCommitFailure {
                 operation_id: (*operation_id).into(),
-                correlation_id: correlation_id_slice(correlation_id.as_deref()),
+                correlation_id: optional_string_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
                 reason: (*reason).into(),
             }),
             K::DomainMetadataLoadSuccess(kernel::DomainMetadataLoadSuccess {
                 operation_id,
                 correlation_id,
+                table_id,
+                table_path,
                 from_cache,
                 num_domains_returned,
                 duration,
             }) => Self::DomainMetadataLoadSuccess(DomainMetadataLoadSuccess {
                 operation_id: (*operation_id).into(),
-                correlation_id: correlation_id_slice(correlation_id.as_deref()),
+                correlation_id: optional_string_slice(correlation_id.as_deref()),
+                table_id: optional_string_slice(table_id.as_deref()),
+                table_path: optional_string_slice(table_path.as_deref()),
                 from_cache: *from_cache,
                 num_domains_returned: *num_domains_returned,
                 duration_ns: duration_ns(*duration),
@@ -945,9 +996,13 @@ impl MetricEvent {
             K::DomainMetadataLoadFailure {
                 operation_id,
                 correlation_id,
+                table_id,
+                table_path,
             } => Self::DomainMetadataLoadFailure(ReadFailure {
                 operation_id: (*operation_id).into(),
-                correlation_id: correlation_id_slice(correlation_id.as_deref()),
+                correlation_id: optional_string_slice(correlation_id.as_deref()),
+                table_id: optional_string_slice(table_id.as_deref()),
+                table_path: optional_string_slice(table_path.as_deref()),
             }),
             K::SetTransactionLoadSuccess(kernel::SetTransactionLoadSuccess {
                 from_cache,
@@ -962,31 +1017,43 @@ impl MetricEvent {
             K::CrcReadSuccess(kernel::CrcReadSuccess {
                 operation_id,
                 correlation_id,
+                table_id,
+                table_path,
                 bytes_read,
                 duration,
             }) => Self::CrcReadSuccess(CrcReadSuccess {
                 operation_id: (*operation_id).into(),
-                correlation_id: correlation_id_slice(correlation_id.as_deref()),
+                correlation_id: optional_string_slice(correlation_id.as_deref()),
+                table_id: optional_string_slice(table_id.as_deref()),
+                table_path: optional_string_slice(table_path.as_deref()),
                 bytes_read: *bytes_read,
                 duration_ns: duration_ns(*duration),
             }),
             K::CrcReadFailure(kernel::CrcReadFailure {
                 operation_id,
                 correlation_id,
+                table_id,
+                table_path,
                 reason,
             }) => Self::CrcReadFailure(CrcReadFailure {
                 operation_id: (*operation_id).into(),
-                correlation_id: correlation_id_slice(correlation_id.as_deref()),
+                correlation_id: optional_string_slice(correlation_id.as_deref()),
+                table_id: optional_string_slice(table_id.as_deref()),
+                table_path: optional_string_slice(table_path.as_deref()),
                 reason: (*reason).into(),
             }),
             K::LastCheckpointReadCompleted(kernel::LastCheckpointReadCompleted {
+                table_id,
+                table_path,
                 operation_id,
                 correlation_id,
                 outcome,
                 duration,
             }) => Self::LastCheckpointReadCompleted(LastCheckpointReadCompleted {
+                table_id: optional_string_slice(table_id.as_deref()),
+                table_path: optional_string_slice(table_path.as_deref()),
                 operation_id: (*operation_id).into(),
-                correlation_id: correlation_id_slice(correlation_id.as_deref()),
+                correlation_id: optional_string_slice(correlation_id.as_deref()),
                 outcome: (*outcome).into(),
                 duration_ns: duration_ns(*duration),
             }),
@@ -1021,6 +1088,7 @@ impl MetricEvent {
                 bytes_read: *bytes_read,
             }),
             K::ScanMetadataCompleted(kernel::ScanMetadataCompleted {
+                table_id,
                 operation_id,
                 correlation_id,
                 table_type,
@@ -1038,8 +1106,9 @@ impl MetricEvent {
                 action_transform_time,
                 predicate_eval_time,
             }) => Self::ScanMetadataCompleted(ScanMetadataCompleted {
+                table_id: optional_string_slice(table_id.as_deref()),
                 operation_id: (*operation_id).into(),
-                correlation_id: correlation_id_slice(correlation_id.as_deref()),
+                correlation_id: optional_string_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
                 scan_type: (*scan_type).into(),
                 duration_ns: duration_ns(*duration),
@@ -1149,6 +1218,8 @@ mod tests {
         let event = kernel::MetricEvent::CrcReadFailure(kernel::CrcReadFailure {
             operation_id: kernel::MetricId::new(),
             correlation_id: None,
+            table_id: None,
+            table_path: None,
             reason,
         });
         with_ffi_event(&event, |event| {
@@ -1187,6 +1258,8 @@ mod tests {
         let operation_id = kernel::MetricId::new();
         let event =
             kernel::MetricEvent::LastCheckpointReadCompleted(kernel::LastCheckpointReadCompleted {
+                table_id: None,
+                table_path: None,
                 operation_id,
                 correlation_id: Some("lookup".into()),
 
@@ -1220,21 +1293,29 @@ mod tests {
 
         let operation_id = kernel::MetricId::new();
         let correlation_id = request.map(Into::into);
+        let expected_table_id = request.map(|_| "table-17");
+        let expected_table_path = request.map(|_| "/tables/example");
         let event = match (crc, failed) {
             (true, false) => K::CrcReadSuccess(kernel::CrcReadSuccess {
                 operation_id,
                 correlation_id,
+                table_id: expected_table_id.map(Into::into),
+                table_path: expected_table_path.map(Into::into),
                 bytes_read: 42,
                 duration: Duration::ZERO,
             }),
             (true, true) => K::CrcReadFailure(kernel::CrcReadFailure {
                 operation_id,
                 correlation_id,
+                table_id: expected_table_id.map(Into::into),
+                table_path: expected_table_path.map(Into::into),
                 reason: kernel::CrcReadFailureReason::Parsing,
             }),
             (false, false) => K::DomainMetadataLoadSuccess(kernel::DomainMetadataLoadSuccess {
                 operation_id,
                 correlation_id,
+                table_id: expected_table_id.map(Into::into),
+                table_path: expected_table_path.map(Into::into),
                 from_cache: false,
                 num_domains_returned: 0,
                 duration: Duration::ZERO,
@@ -1242,28 +1323,47 @@ mod tests {
             (false, true) => K::DomainMetadataLoadFailure {
                 operation_id,
                 correlation_id,
+                table_id: expected_table_id.map(Into::into),
+                table_path: expected_table_path.map(Into::into),
             },
         };
         with_ffi_event(&event, |event| {
-            let (id, correlation) = match (crc, failed, event) {
-                (true, false, MetricEvent::CrcReadSuccess(read)) => {
-                    (read.operation_id, read.correlation_id)
-                }
-                (false, false, MetricEvent::DomainMetadataLoadSuccess(read)) => {
-                    (read.operation_id, read.correlation_id)
-                }
-                (true, true, MetricEvent::CrcReadFailure(read)) => {
-                    (read.operation_id, read.correlation_id)
-                }
-                (false, true, MetricEvent::DomainMetadataLoadFailure(read)) => {
-                    (read.operation_id, read.correlation_id)
-                }
+            let (id, correlation, table_id, table_path) = match (crc, failed, event) {
+                (true, false, MetricEvent::CrcReadSuccess(read)) => (
+                    read.operation_id,
+                    read.correlation_id,
+                    read.table_id,
+                    read.table_path,
+                ),
+                (false, false, MetricEvent::DomainMetadataLoadSuccess(read)) => (
+                    read.operation_id,
+                    read.correlation_id,
+                    read.table_id,
+                    read.table_path,
+                ),
+                (true, true, MetricEvent::CrcReadFailure(read)) => (
+                    read.operation_id,
+                    read.correlation_id,
+                    read.table_id,
+                    read.table_path,
+                ),
+                (false, true, MetricEvent::DomainMetadataLoadFailure(read)) => (
+                    read.operation_id,
+                    read.correlation_id,
+                    read.table_id,
+                    read.table_path,
+                ),
                 _ => panic!("unexpected read metric"),
             };
             let correlation: &str =
                 unsafe { TryFromStringSlice::try_from_slice(&correlation).unwrap() };
             assert_eq!(id.bytes, operation_id.as_bytes());
             assert_eq!(correlation, request.unwrap_or_default());
+            let table_id: &str = unsafe { TryFromStringSlice::try_from_slice(&table_id).unwrap() };
+            let table_path: &str =
+                unsafe { TryFromStringSlice::try_from_slice(&table_path).unwrap() };
+            assert_eq!(table_id, expected_table_id.unwrap_or_default());
+            assert_eq!(table_path, expected_table_path.unwrap_or_default());
         });
     }
 
@@ -1659,6 +1759,7 @@ mod tests {
     fn from_kernel_scan_metadata_completed_maps_all_fields() {
         let id = kernel::MetricId::new();
         let event = kernel::MetricEvent::ScanMetadataCompleted(kernel::ScanMetadataCompleted {
+            table_id: None,
             operation_id: id,
             correlation_id: Some("scan-req".into()),
             table_type: kernel::TableType::CatalogManaged,
@@ -1709,6 +1810,8 @@ mod tests {
         let id = kernel::MetricId::new();
         let event =
             kernel::MetricEvent::ProtocolMetadataLoadSuccess(kernel::ProtocolMetadataLoadSuccess {
+                table_id: Some("catalog/table-17".into()),
+                table_path: Some("/tables/example".into()),
                 operation_id: id,
                 correlation_id: Some("pm-req".into()),
                 table_type: kernel::TableType::CatalogManaged,
@@ -1716,6 +1819,7 @@ mod tests {
                 source: kernel::ProtocolMetadataSource::CrcAdvancedByReplay,
                 duration: Duration::from_nanos(53),
             });
+        assert_eq!(event.table_id(), Some("catalog/table-17"));
         with_ffi_event(&event, |ffi| {
             let MetricEvent::ProtocolMetadataLoadSuccess(e) = ffi else {
                 panic!("expected ProtocolMetadataLoadSuccess");
@@ -1726,6 +1830,8 @@ mod tests {
             let cid: &str =
                 unsafe { TryFromStringSlice::try_from_slice(&e.correlation_id).unwrap() };
             assert_eq!(cid, "pm-req");
+            let table: &str = unsafe { TryFromStringSlice::try_from_slice(&e.table_id).unwrap() };
+            assert_eq!(table, "catalog/table-17");
             assert_eq!(
                 discriminant(&e.source),
                 discriminant(&ProtocolMetadataSource::CrcAdvancedByReplay)
@@ -1738,6 +1844,8 @@ mod tests {
     fn from_kernel_log_segment_load_success_carries_correlation_id_and_table_type() {
         let id = kernel::MetricId::new();
         let event = kernel::MetricEvent::LogSegmentLoadSuccess(kernel::LogSegmentLoadSuccess {
+            table_id: None,
+            table_path: None,
             operation_id: id,
             correlation_id: Some("req-42".into()),
             table_type: kernel::TableType::CatalogManaged,
@@ -1770,6 +1878,8 @@ mod tests {
     #[test]
     fn from_kernel_snapshot_hint_load_type_maps_to_appended_ffi_variant() {
         let event = kernel::MetricEvent::SnapshotBuildSuccess(kernel::SnapshotBuildSuccess {
+            table_id: None,
+            table_path: None,
             operation_id: kernel::MetricId::new(),
             correlation_id: None,
             table_type: kernel::TableType::PathBased,
@@ -1793,6 +1903,8 @@ mod tests {
         let id = kernel::MetricId::new();
         let duration = Duration::from_nanos(duration_ns);
         let snapshot = kernel::MetricEvent::SnapshotBuildFailure(kernel::SnapshotBuildFailure {
+            table_id: None,
+            table_path: None,
             operation_id: id,
             correlation_id: None,
             table_type: kernel::TableType::PathBased,
@@ -1809,6 +1921,8 @@ mod tests {
 
         let log_segment =
             kernel::MetricEvent::LogSegmentLoadFailure(kernel::LogSegmentLoadFailure {
+                table_id: None,
+                table_path: None,
                 operation_id: id,
                 correlation_id: None,
                 table_type: kernel::TableType::PathBased,
@@ -1824,6 +1938,8 @@ mod tests {
 
         let protocol_metadata =
             kernel::MetricEvent::ProtocolMetadataLoadFailure(kernel::ProtocolMetadataLoadFailure {
+                table_id: None,
+                table_path: None,
                 operation_id: id,
                 correlation_id: None,
                 table_type: kernel::TableType::PathBased,
@@ -1861,6 +1977,8 @@ mod tests {
     #[test]
     fn from_kernel_log_segment_load_success_unset_correlation_id_is_empty_slice() {
         let event = kernel::MetricEvent::LogSegmentLoadSuccess(kernel::LogSegmentLoadSuccess {
+            table_id: None,
+            table_path: None,
             operation_id: kernel::MetricId::new(),
             correlation_id: None,
             table_type: kernel::TableType::PathBased,

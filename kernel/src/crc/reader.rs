@@ -19,7 +19,7 @@ use crate::{Engine, KernelError, KernelResult};
 /// replay.
 ///
 /// Reports metrics: `CrcReadSuccess` or `CrcReadFailure`.
-#[instrument(name = CRC_READ_COMPLETED_SPAN, err(level = "warn"), skip_all, fields(report, enable_call_frame, bytes_read, failure_reason, operation_id = %context.operation_id, correlation_id = context.correlation_id.as_deref().unwrap_or(""), path = ?crc_path.location.location))]
+#[instrument(name = CRC_READ_COMPLETED_SPAN, err(level = "warn"), skip_all, fields(report, enable_call_frame, bytes_read, failure_reason, operation_id = %context.operation_id, correlation_id = context.correlation_id.as_deref().unwrap_or(""), table_id = context.table_id.as_deref().unwrap_or(""), table_path = context.table_path.as_deref().unwrap_or(""), path = ?crc_path.location.location))]
 pub(crate) fn try_read_crc_file(
     engine: &dyn Engine,
     crc_path: &ParsedLogPath,
@@ -275,6 +275,7 @@ mod tests {
             .filter(|e| matches!(e, MetricEvent::CrcReadSuccess(_)))
             .collect();
         assert_eq!(crc_events.len(), 1);
+        assert_eq!(crc_events[0].table_path(), context.table_path.as_deref());
         assert!(
             matches!(&crc_events[0], MetricEvent::CrcReadSuccess(e) if e.bytes_read > 0 && e.operation_id == context.operation_id && e.correlation_id == context.correlation_id)
         );
@@ -350,6 +351,7 @@ mod tests {
         SnapshotLoadMetricContext {
             operation_id: crate::metrics::MetricId::new(),
             correlation_id: Some("snapshot-read".into()),
+            table_path: Some("/tables/example".into()),
             ..SnapshotLoadMetricContext::for_test()
         }
     }
@@ -363,7 +365,8 @@ mod tests {
         assert!(
             matches!(events.as_slice(), [MetricEvent::CrcReadFailure(event)] if event.reason == expected
                 && event.operation_id == context.operation_id
-                && event.correlation_id == context.correlation_id),
+                && event.correlation_id == context.correlation_id
+                && event.table_path == context.table_path),
             "expected one CRC failure with reason {expected}: {events:?}"
         );
     }

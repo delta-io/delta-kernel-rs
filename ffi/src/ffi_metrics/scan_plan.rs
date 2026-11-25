@@ -3,7 +3,7 @@
 use delta_kernel::metrics as kernel;
 use delta_kernel::scan::StructStats;
 
-use super::{MetricEvent, MetricId, correlation_id_slice};
+use super::{MetricEvent, MetricId, optional_string_slice};
 use crate::checkpoint::{FfiCheckpointMetrics, visit};
 use crate::delta_types::{FfiColumnName, FfiColumnNameArray};
 use crate::scan::{FfiPartitionValuesOptions, FfiStatsOptions};
@@ -119,7 +119,7 @@ pub(super) fn with_event<F: FnOnce(MetricEvent)>(event: &kernel::ScanPlanReport,
             operation_id: event.operation_id.into(),
             table_id: kernel_string_slice!(table_id),
             table_path: kernel_string_slice!(table_path),
-            correlation_id: correlation_id_slice(event.correlation_id.as_deref()),
+            correlation_id: optional_string_slice(event.correlation_id.as_deref()),
             outcome: match event.outcome {
                 kernel::ScanPlanOutcome::Plan => ScanPlanOutcome::Plan,
                 kernel::ScanPlanOutcome::Empty => ScanPlanOutcome::Empty,
