@@ -315,7 +315,7 @@ tool definitions and later tool results are outside the initial task-message lim
 selection reads the complete original PR description before excerpt preparation.
 
 If the subagent patch excerpt is truncated, the main AI review comment reports file counts between
-its reviewed-commit line and PR Summary. The `AI Review Summary` Check Run and workflow log list
+its reviewed-commit line and Assessment Summary. The `AI Review Summary` Check Run and workflow log list
 partly included and omitted paths, selected commit SHAs and supplied/total bytes. An uncut patch
 adds no truncation notice.
 
@@ -494,7 +494,7 @@ If the report exceeds GitHub's display limit, the Check Run links to the complet
 The orchestrator supplies the assessment summary and final finding text. Python supplies counts, links,
 the reviewed commit and the layout below. Angle-bracket placeholders stand for generated text;
 Hidden bot identifiers are omitted from this example. When all status requirements are met, the
-reviewed line says `Status requirements met`. The Unmet status requirements disclosure appears
+status line says `Status requirements met`. The Unmet status requirements disclosure appears
 only when a requirement is unmet.
 
 ```markdown
@@ -502,7 +502,7 @@ only when a requirement is unmet.
 
 **🛑 2 Blockers · 🔧 1 Should Fix · 💡 2 Nits**
 
-Reviewed `<short commit SHA>` · Status requirements unmet
+Status requirements unmet
 
 <details><summary>Unmet status requirements</summary>
 

@@ -162,13 +162,12 @@ def format_review_summary(
     title = f"## {AI_REVIEW_TITLE}"
     if review_status:
         title += f" - {review_status['status']}"
-    reviewed = f"Reviewed `{head_sha[:8]}`"
+    parts = [BOT_MARKER, title, headline]
     if review_status:
-        reviewed += (
-            " · Status requirements met" if review_status["status_requirements_met"]
-            else " · Status requirements unmet"
+        parts.append(
+            "Status requirements met" if review_status["status_requirements_met"]
+            else "Status requirements unmet"
         )
-    parts = [BOT_MARKER, title, headline, reviewed]
     if review_status and not review_status["status_requirements_met"]:
         rows = []
         for reason in review_status["reasons"]:

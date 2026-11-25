@@ -187,12 +187,13 @@ class ReviewStatusPublicationTest(unittest.TestCase):
         review_status = publish_status(github, arguments)
         self.assertEqual(review_status["status"], "NO VERDICT")
         main = github.issues[0]["body"]
-        order = ["🤖 AI Review 🧐 - NO VERDICT", "🛑 1 Blocker", "Reviewed",
+        order = ["🤖 AI Review 🧐 - NO VERDICT", "🛑 1 Blocker",
                  "Status requirements unmet", "<summary>Unmet status requirements",
-                 "<summary>Assessment Summary", "<summary>Review Summary", "<sub>[Full AI review"]
+                 "<summary>Assessment Summary", "<summary>Review Summary", "<sub>Reviewed", "Full AI review"]
         offsets = [main.index(part) for part in order]
         self.assertEqual(offsets, sorted(offsets))
         self.assertNotIn("\n---\n", main)
+        self.assertEqual(main.count("Reviewed `"), 1)
         self.assertTrue(main.endswith(f"[Workflow run]({RUN_URL})</sub>"))
         self.assertIn("[Blocker 1]", main)
         self.assertEqual(len(github.inline), 1)
