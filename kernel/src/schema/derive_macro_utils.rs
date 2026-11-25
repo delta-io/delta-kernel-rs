@@ -203,15 +203,48 @@ impl<T: ToNullableContainerType> GetNullableContainerStructField for Option<T> {
 /// not allocate or maintain path state.
 #[internal_api]
 pub(crate) struct StructDataFields {
-    expected: SchemaRef,
+    expected: &'static SchemaRef,
     actual: SchemaRef,
     values: Vec<Option<Scalar>>,
 }
 
 impl StructDataFields {
+    /// Consumes the sole non-null variant, returning its expected-schema index, name, and value.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn take_variant(&mut self) -> KernelResult<(usize, &'static str, Scalar)> {
+        let mut names = self
+            .actual
+            .fields()
+            .zip(&self.values)
+            .filter(|(_, value)| value.as_ref().is_some_and(|value| !value.is_null()))
+            .map(|(field, _)| field.name());
+        let name = match (names.next(), names.next()) {
+            (Some(name), None) => name,
+            (first, second) => {
+                let expected: Vec<_> = self.expected.fields().map(StructField::name).collect();
+                let actual: Vec<_> = first.into_iter().chain(second).chain(names).collect();
+                return Err(KernelError::scalar_conversion(
+                    format!("exactly one non-null variant among {expected:?}"),
+                    format!("active variants {actual:?}"),
+                ));
+            }
+        };
+        drop(names);
+        let (index, field) = self
+            .expected
+            .field_with_index(name)
+            .ok_or_else(|| KernelError::scalar_conversion("known variant field", name))?;
+        let name = field.name().as_str();
+        for field in self.expected.fields().filter(|field| field.name() != name) {
+            self.take_field::<Scalar>(field.name())?;
+        }
+        Ok((index, name, self.take_field(name)?))
+    }
+
     /// Creates a field decoder after checking that the value count matches both schemas.
     #[internal_api]
-    pub(crate) fn try_new(data: StructData, expected: SchemaRef) -> KernelResult<Self> {
+    pub(crate) fn try_new(data: StructData, expected: &'static SchemaRef) -> KernelResult<Self> {
         let (actual, values) = data.into_parts();
         require!(
             actual.num_fields() == values.len(),
@@ -234,12 +267,14 @@ impl StructDataFields {
         })
     }
 
-    /// Consumes the named field, checks its schema nullability, and decodes its value.
+    /// Consumes the named field, checks its schema nullability and a null scalar's exact data type,
+    /// and decodes its value.
     #[internal_api]
-    pub(crate) fn take_field<T: TryFrom<Scalar, Error = KernelError>>(
-        &mut self,
-        field_name: &str,
-    ) -> KernelResult<T> {
+    pub(crate) fn take_field<T>(&mut self, field_name: &str) -> KernelResult<T>
+    where
+        T: TryFrom<Scalar>,
+        KernelError: From<T::Error>,
+    {
         let expected = self.expected.field(field_name).ok_or_else(|| {
             KernelError::InternalError(format!(
                 "Derived schema does not contain generated field {field_name:?}"
@@ -275,7 +310,20 @@ impl StructDataFields {
             )
         );
 
-        T::try_from(value).map_err(|error| add_scalar_path_context(error, field_name))
+        if let Scalar::Null(actual_type) = &value {
+            require!(
+                actual_type == expected.data_type(),
+                add_scalar_path_context(
+                    KernelError::scalar_conversion(
+                        expected.data_type().kind_name(),
+                        actual_type.kind_name(),
+                    ),
+                    field_name,
+                )
+            );
+        }
+
+        T::try_from(value).map_err(|error| add_scalar_path_context(error.into(), field_name))
     }
 
     /// Verifies that every named field was consumed.

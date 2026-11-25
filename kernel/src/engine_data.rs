@@ -526,6 +526,7 @@ pub trait RowVisitor {
 
 /// Any type that an engine wants to return as "data" needs to implement this trait. The bulk of the
 /// work is in the [`EngineData::visit_rows`] method. See the docs for that method for more details.
+/// With `declarative-plans`, use `EngineData::is_null` to inspect struct nullability.
 /// ```rust
 /// # use std::any::Any;
 /// # use delta_kernel::KernelResult;
@@ -568,6 +569,10 @@ pub trait RowVisitor {
 ///   }
 ///   fn has_field(&self, name: &ColumnName) -> bool {
 ///     todo!() // determine whether the field exists in the data
+///   }
+///   #[cfg(feature = "declarative-plans")]
+///   fn is_null(&self, name: &ColumnName) -> KernelResult<Vec<bool>> {
+///     todo!() // return one logical nullness flag per row for the selected field
 ///   }
 /// }
 /// ```
@@ -637,6 +642,19 @@ pub trait EngineData: AsAny {
     /// For a top-level field named `"foo"`, use `column_name!("foo")`. For nested fields,
     /// each non-leaf element of the path must be a struct field at that level.
     fn has_field(&self, name: &ColumnName) -> bool;
+
+    /// Returns the selected column's own logical nullness flag for each row.
+    ///
+    /// Paths use the same field names as [`Self::visit_rows`] and [`Self::has_field`], and may
+    /// select a struct. A present struct whose fields are all null is not itself null.
+    /// Returns exactly `self.len()` flags in row order; `true` means null. Ancestor masks are
+    /// not combined here. Callers must check parent structs before reading their children.
+    ///
+    /// Returns an error if the path is empty, a field is missing, or a
+    /// non-final path component is not a struct. The full path must be validated even when an
+    /// ancestor is null.
+    #[cfg(feature = "declarative-plans")]
+    fn is_null(&self, name: &ColumnName) -> KernelResult<Vec<bool>>;
 }
 
 /// Evaluates a predicate on the batch, extracts the resulting selection vector, and applies

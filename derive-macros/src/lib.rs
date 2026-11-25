@@ -11,6 +11,7 @@ use syn::{
     Lit, Meta, PathArguments, Token, Type, Visibility, parse_macro_input,
 };
 
+mod enum_derives;
 mod expr_macro;
 mod schema_macro;
 
@@ -124,13 +125,16 @@ fn validate_single_segment(segment: &str, span: Span) -> Result<(), Error> {
     Ok(())
 }
 
-/// Derive a `delta_kernel::schemas::ToSchema` implementation for the annotated struct. The actual
+/// Derive a `delta_kernel::schemas::ToSchema` implementation for a struct or enum. The actual
 /// field names in the schema (and therefore of the struct members) are all mandated by the Delta
 /// spec, and so the user of this macro is responsible for ensuring that
 /// e.g. `Metadata::schema_string` is the snake_case-ified version of `schemaString` from [Delta's
 /// Change Metadata](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#change-metadata)
 /// action (this macro allows the use of standard rust snake_case, and will convert to the correct
 /// delta schema camelCase version).
+///
+/// `#[schema_rename = "name"]` overrides an enum variant's lower-camel field name.
+/// Enum variants each wrap one struct, with one nullable schema field per variant.
 ///
 /// Supported field attributes:
 /// - `#[field_id = N]`: Sets the Parquet field ID for this field. `N` must be in `0..=i32::MAX`
@@ -149,15 +153,26 @@ fn validate_single_segment(segment: &str, span: Span) -> Result<(), Error> {
 /// NOTE: `TryFromStructData` rejects skipped fields because it cannot reconstruct them.
 #[proc_macro_derive(
     ToSchema,
-    attributes(allow_null_container_values, field_id, nested_field_id, skip_schema)
+    attributes(
+        allow_null_container_values,
+        field_id,
+        nested_field_id,
+        skip_schema,
+        schema_rename
+    )
 )]
 pub fn derive_to_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
-    let struct_ident = input.ident;
-
-    let schema_fields = match gen_schema_fields(&input.data, struct_ident.span()) {
-        Ok(tokens) => tokens,
-        Err(e) => return e.to_compile_error().into(),
+    let struct_ident = &input.ident;
+    let schema_fields = match &input.data {
+        Data::Enum(_) => {
+            enum_derives::variants(&input).map(|variants| enum_derives::schema_fields(&variants))
+        }
+        _ => gen_schema_fields(&input.data, struct_ident.span()),
+    };
+    let schema_fields = match schema_fields {
+        Ok(fields) => fields,
+        Err(error) => return error.into_compile_error().into(),
     };
     let output = quote! {
         #[automatically_derived]
@@ -443,7 +458,7 @@ fn gen_schema_fields(data: &Data, span: Span) -> Result<TokenStream, Error> {
     Ok(quote! { #(#fields),* })
 }
 
-/// Derive `From` conversions into `StructData` and `Scalar` for a rust struct.
+/// Derive `From` conversions into `StructData` and `Scalar` for a Rust struct or enum.
 ///
 /// Emits both:
 /// - `From<Self> for StructData` — field values via `.into()`, schema from `ToSchema`
@@ -452,9 +467,18 @@ fn gen_schema_fields(data: &Data, span: Span) -> Result<TokenStream, Error> {
 /// Honors `#[skip_schema]`, producing the same field set as `ToSchema`, and
 /// `#[allow_null_container_values]`, preserving nullable map values in the scalar type. Every
 /// schema field type must implement `Into<Scalar>` (and the struct must implement `ToSchema`).
-#[proc_macro_derive(IntoStructData, attributes(allow_null_container_values, skip_schema))]
+/// Enum variants each wrap one struct; inactive variants become typed nulls.
+#[proc_macro_derive(
+    IntoStructData,
+    attributes(allow_null_container_values, skip_schema, schema_rename)
+)]
 pub fn into_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
+    if matches!(input.data, Data::Enum(_)) {
+        return enum_derives::into_struct_data(&input)
+            .unwrap_or_else(Error::into_compile_error)
+            .into();
+    }
     let struct_name = &input.ident;
 
     let fields = match schema_fields(&input.data, "IntoStructData", struct_name.span()) {
@@ -475,18 +499,28 @@ pub fn into_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
         }
     });
 
-    let expanded = quote! {
+    let bounds = quote! { #(#field_types: Into<delta_kernel::expressions::Scalar>,)* };
+    let values = quote! { vec![ #(#field_values),* ] };
+    let output = struct_data_encoder(struct_name, bounds, values);
+    output.into()
+}
+
+fn struct_data_encoder(
+    struct_name: &Ident,
+    bounds: TokenStream,
+    values: TokenStream,
+) -> TokenStream {
+    quote! {
         #[automatically_derived]
         impl From<#struct_name> for delta_kernel::expressions::StructData
         where
             #struct_name: delta_kernel::schema::ToSchema,
-            #(#field_types: Into<delta_kernel::expressions::Scalar>,)*
+            #bounds
         {
             fn from(value: #struct_name) -> Self {
-                Self::from_values_unchecked(
-                    <#struct_name as delta_kernel::schema::ToSchema>::schema_ref().clone(),
-                    vec![ #(#field_values),* ],
-                )
+                let schema = <#struct_name as delta_kernel::schema::ToSchema>::schema_ref().clone();
+                let values = #values;
+                Self::from_values_unchecked(schema, values)
             }
         }
 
@@ -499,13 +533,11 @@ pub fn into_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
                 Self::Struct(value.into())
             }
         }
-    };
-
-    proc_macro::TokenStream::from(expanded)
+    }
 }
 
 /// Derive the inverse of [`IntoStructData`](macro@IntoStructData): `TryFrom` conversions from
-/// `StructData` and `Scalar` for a rust struct.
+/// `StructData` and `Scalar` for a Rust struct or enum.
 ///
 /// Emits both:
 /// - `TryFrom<StructData> for Self` — values matched by schema field name and converted via each
@@ -517,9 +549,10 @@ pub fn into_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
 /// conversion cannot infer a value or schema for a field omitted by `ToSchema`.
 /// `#[allow_null_container_values]` is rejected because its map scalar type cannot be converted
 /// by the standard `HashMap` conversion.
+/// Enum variants each wrap one struct, and exactly one variant must be non-null.
 #[proc_macro_derive(
     TryFromStructData,
-    attributes(allow_null_container_values, skip_schema)
+    attributes(allow_null_container_values, skip_schema, schema_rename)
 )]
 pub fn try_from_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -529,6 +562,11 @@ pub fn try_from_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro
 }
 
 fn try_from_struct_data_impl(input: &DeriveInput) -> Result<TokenStream, Error> {
+    if matches!(input.data, Data::Enum(_)) {
+        let variants = enum_derives::variants(input)?;
+        let output = enum_derives::try_from_struct_data(&input.ident, &variants);
+        return Ok(output);
+    }
     let struct_name = &input.ident;
     let fields = try_from_struct_data_fields(&input.data, "TryFromStructData", struct_name.span())?;
     let (field_idents, field_types): (Vec<_>, Vec<_>) =
@@ -544,7 +582,118 @@ fn try_from_struct_data_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
             )
         })?;
 
-    Ok(quote! {
+    let result = quote! { Self {
+        #(#field_idents: fields.take_field(stringify!(#schema_field_names))?,)*
+    } };
+    let output = struct_data_decoder(struct_name, field_types, result);
+    Ok(output)
+}
+
+/// Derives collection of mixed rows into a struct with named payload fields.
+///
+/// Field names become camelCase schema names. Each field is collected independently:
+/// `T` requires exactly one row, `Option<T>` allows at most one, and `Vec<T>` accepts any count.
+/// Every input row must contain exactly one non-null payload.
+///
+/// The derive generates an internal input row type whose schema is cached through `ToSchema`.
+/// Collector structs must use concrete field types. Payload rows need both struct and scalar
+/// conversions, as generated by `TryFromStructData`.
+#[proc_macro_derive(TryFromStructRows)]
+pub fn try_from_struct_rows_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    try_from_struct_rows_impl(&input)
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
+fn try_from_struct_rows_impl(input: &DeriveInput) -> Result<TokenStream, Error> {
+    let name = &input.ident;
+    if !input.generics.params.is_empty() {
+        return Err(Error::new_spanned(
+            &input.generics,
+            "TryFromStructRows requires a concrete collector without generic parameters",
+        ));
+    }
+    let fields = try_from_struct_data_fields(&input.data, "TryFromStructRows", name.span())?;
+    let (idents, types): (Vec<_>, Vec<_>) =
+        fields.iter().map(|field| (&field.ident, &field.ty)).unzip();
+    let names: Vec<_> = fields
+        .iter()
+        .map(|field| field.ident.as_ref().map(get_schema_name))
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    for field in names.iter().flatten() {
+        if !seen.insert(field.to_string().to_lowercase()) {
+            return Err(Error::new(field.span(), "duplicate schema field name"));
+        }
+    }
+
+    let row_name = format_ident!("__{}Row", name);
+    let indices: Vec<_> = (0..fields.len()).map(syn::Index::from).collect();
+    let where_clause = &input.generics.where_clause;
+    let output = quote! {
+        const _: () = {
+            #[doc(hidden)]
+            #[allow(dead_code)]
+            #[derive(
+                delta_kernel::delta_kernel_derive::ToSchema,
+                delta_kernel::delta_kernel_derive::TryFromStructData,
+            )]
+            pub struct #row_name {
+                #(#idents: ::std::option::Option<
+                    <#types as delta_kernel::expressions::TryFromStructRows>::Row
+                >,)*
+            }
+
+            #[automatically_derived]
+            impl delta_kernel::expressions::TryFromStructRows for #name #where_clause {
+                type Row = #row_name;
+                type State = (#(<#types as delta_kernel::expressions::TryFromStructRows>::State,)*);
+
+                fn new_state() -> Self::State {
+                    (#(<#types as delta_kernel::expressions::TryFromStructRows>::new_state(),)*)
+                }
+
+                fn push(
+                    state: &mut Self::State,
+                    row: delta_kernel::expressions::StructData,
+                ) -> delta_kernel::KernelResult<()> {
+                    let mut fields = delta_kernel::schema::derive_macro_utils::StructDataFields::try_new(
+                        row,
+                        <Self::Row as delta_kernel::schema::ToSchema>::schema_ref(),
+                    )?;
+                    let (index, name, value) = fields.take_variant()?;
+                    match index {
+                        #(#indices => value.try_into().and_then(|row| {
+                            <#types as delta_kernel::expressions::TryFromStructRows>::push(
+                                &mut state.#indices, row,
+                            )
+                        }),)*
+                        _ => Err(delta_kernel::KernelError::internal_error("Unknown variant field index")),
+                    }.map_err(|error| delta_kernel::error::add_scalar_path_context(error, name))?;
+                    fields.finish()
+                }
+
+                fn finish(state: Self::State) -> delta_kernel::KernelResult<Self> {
+                    let (#(#idents,)*) = state;
+                    Ok(Self {
+                        #(#idents: <#types as delta_kernel::expressions::TryFromStructRows>::finish(#idents)
+                            .map_err(|error| delta_kernel::error::add_scalar_path_context(error, stringify!(#names)))?,)*
+                    })
+                }
+            }
+        };
+    };
+    Ok(output)
+}
+
+fn struct_data_decoder(
+    struct_name: &Ident,
+    field_types: impl IntoIterator<Item = impl quote::ToTokens>,
+    result: TokenStream,
+) -> TokenStream {
+    let field_types = field_types.into_iter();
+    quote! {
         #[automatically_derived]
         impl TryFrom<delta_kernel::expressions::StructData> for #struct_name
         where
@@ -560,11 +709,9 @@ fn try_from_struct_data_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
                 let mut fields =
                     delta_kernel::schema::derive_macro_utils::StructDataFields::try_new(
                         value,
-                        <#struct_name as delta_kernel::schema::ToSchema>::schema_ref().clone(),
+                        <#struct_name as delta_kernel::schema::ToSchema>::schema_ref(),
                     )?;
-                let result = Self {
-                    #(#field_idents: fields.take_field(stringify!(#schema_field_names))?,)*
-                };
+                let result = #result;
                 fields.finish()?;
                 Ok(result)
             }
@@ -589,7 +736,7 @@ fn try_from_struct_data_impl(input: &DeriveInput) -> Result<TokenStream, Error> 
                 }
             }
         }
-    })
+    }
 }
 
 /// Expose a `macro_rules!` declaration as a public macro at its declaration site.
@@ -804,6 +951,24 @@ mod tests {
     use syn::parse_quote;
 
     use super::*;
+
+    #[rstest]
+    #[case::generic(
+        "struct Rows<T> { values: Vec<T> }",
+        "TryFromStructRows requires a concrete collector without generic parameters"
+    )]
+    #[case::normalized_casefold_collision(
+        "struct Rows { a_b: Vec<i32>, ab: Vec<i32> }",
+        "duplicate schema field name"
+    )]
+    fn try_from_struct_rows_rejects_invalid_collectors(
+        #[case] source: &str,
+        #[case] expected: &str,
+    ) {
+        let input = syn::parse_str::<DeriveInput>(source).unwrap();
+        let error = try_from_struct_rows_impl(&input).unwrap_err();
+        assert_eq!(error.to_string(), expected);
+    }
 
     fn implementation_name(input: &Item) -> Ident {
         let Item::Macro(item) = input else {

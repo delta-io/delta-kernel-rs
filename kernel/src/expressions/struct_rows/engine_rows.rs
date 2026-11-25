@@ -1,12 +1,17 @@
 //! Decodes engine batches one struct row at a time through existing leaf getters.
 
+use std::sync::Arc;
+
 use super::TryFromStructRows;
-use crate::engine_data::{GetData, RowVisitor};
+use crate::engine_data::{EngineData, GetData, RowVisitor};
 use crate::expressions::{ArrayData, MapData, Scalar, StructData};
-use crate::schema::{ColumnName, DataType, PrimitiveType, StructField, ToSchema};
+use crate::schema::{
+    ColumnName, DataType, PrimitiveType, SchemaRef, StructField, StructType, ToSchema,
+};
 use crate::{KernelError, KernelResult};
 
 pub(super) struct StructVisitor<'a, T: TryFromStructRows> {
+    pub(super) batch: &'a dyn EngineData,
     pub(super) state: &'a mut T::State,
 }
 
@@ -22,16 +27,79 @@ impl<T: TryFromStructRows> RowVisitor for StructVisitor<'_, T> {
             ));
         }
         let schema = T::Row::schema_ref();
-        (0..row_count).try_for_each(|row| {
-            let mut values = Vec::with_capacity(schema.num_fields());
-            schema
-                .fields()
-                .zip(getters)
-                .map(|(field, getter)| read_scalar(*getter, row, field))
-                .try_for_each(|value| value.map(|value| values.push(value)))?;
-            T::push(self.state, StructData::try_new(schema.clone(), values)?)
-        })
+        let fields = read_fields(
+            self.batch,
+            schema,
+            &mut ColumnName::default(),
+            &mut getters.iter().copied(),
+        )?;
+        (0..row_count)
+            .try_for_each(|row| T::push(self.state, read_struct_row(schema, &fields, row)?))
     }
+}
+
+enum FieldReader<'a> {
+    Leaf(&'a dyn GetData<'a>),
+    Struct {
+        schema: SchemaRef,
+        fields: Vec<FieldReader<'a>>,
+        nulls: Vec<bool>,
+    },
+}
+
+fn read_fields<'a>(
+    batch: &dyn EngineData,
+    schema: &'a StructType,
+    path: &mut ColumnName,
+    getters: &mut impl Iterator<Item = &'a dyn GetData<'a>>,
+) -> KernelResult<Vec<FieldReader<'a>>> {
+    schema
+        .fields()
+        .map(|field| {
+            if let DataType::Struct(children) = field.data_type() {
+                path.path_mut().push(field.name().clone());
+                let nulls = batch.is_null(path)?;
+                let fields = read_fields(batch, children, path, getters)?;
+                path.path_mut().pop();
+                Ok(FieldReader::Struct {
+                    schema: Arc::new(children.as_ref().clone()),
+                    fields,
+                    nulls,
+                })
+            } else {
+                Ok(FieldReader::Leaf(getters.next().ok_or_else(|| {
+                    KernelError::missing_column("Missing result column getter")
+                })?))
+            }
+        })
+        .collect()
+}
+
+fn read_struct_row(
+    schema: &SchemaRef,
+    fields: &[FieldReader<'_>],
+    row: usize,
+) -> KernelResult<StructData> {
+    let mut values = Vec::with_capacity(schema.num_fields());
+    schema
+        .fields()
+        .zip(fields)
+        .map(|(field, reader)| match reader {
+            FieldReader::Leaf(getter) => read_scalar(*getter, row, field),
+            FieldReader::Struct {
+                schema,
+                fields,
+                nulls,
+            } => {
+                if nulls[row] {
+                    Ok(Scalar::Null(field.data_type().clone()))
+                } else {
+                    read_struct_row(schema, fields, row).map(Scalar::Struct)
+                }
+            }
+        })
+        .try_for_each(|value| value.map(|value| values.push(value)))?;
+    StructData::try_new(schema.clone(), values)
 }
 
 pub(crate) fn ensure_supported(field: &StructField) -> KernelResult<()> {
@@ -54,7 +122,13 @@ pub(crate) fn ensure_supported(field: &StructField) -> KernelResult<()> {
                 && map.value_type() == &DataType::STRING
                 && !map.value_contains_null()
         }
-        DataType::Struct(_) => false,
+        DataType::Struct(fields) if fields.num_fields() == 0 => false,
+        DataType::Struct(fields) => {
+            for field in fields.fields() {
+                ensure_supported(field)?;
+            }
+            true
+        }
         DataType::Primitive(
             PrimitiveType::Timestamp
             | PrimitiveType::TimestampNtz
