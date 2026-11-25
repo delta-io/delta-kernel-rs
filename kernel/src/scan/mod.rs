@@ -1560,7 +1560,6 @@ impl Scan {
                     self.snapshot.table_root(),
                     COMMIT_READ_SCHEMA.clone(),
                     checkpoint_schema,
-                    physical_stats_read_schema,
                     amt_stats_request,
                 );
         }

@@ -132,12 +132,13 @@ fn read_tree_adds(
         modification_time: 1,
         data_change: false,
         stats: stats_request
-            .map(|request| StatsRead::try_new(checkpoint, request))
+            .map(|request| StatsRead::try_new(checkpoint, request.schema()))
             .transpose()?,
     };
     let projector = ActionProjector::try_new(engine, ADD_NAME, ctx.add_schema(), read_schema)?;
+    let skipping = stats_request.and_then(AmtStatsRequest::skipping);
     // The engine's handlers carry any cancellation token bound to this read.
-    let adds = read_add_actions_from_amt(engine, checkpoint, &ctx, None)?;
+    let adds = read_add_actions_from_amt(engine, checkpoint, &ctx, skipping, None)?;
     Ok(Box::new(adds.map(move |batch| {
         // `ActionsBatch` does not take a `FilteredEngineData` yet, so drop the deselected rows
         // here; otherwise replay would read them as live adds.
@@ -284,7 +285,6 @@ mod tests {
                 &table_root(),
                 commit_schema,
                 checkpoint_schema,
-                None,
                 None,
             )?
             .actions
