@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import patch
 
@@ -97,7 +98,7 @@ class FakeGitHub:
         self.permissions = {MAINTAINER: "write", **(permissions or {})}
         self.rest_responses = rest or {}
         self.failures: dict[str, list[Exception]] = {}
-        self.on: dict[str, callable] = {}
+        self.on: dict[str, Callable[[dict], None]] = {}
         self.calls: list[tuple[str, object]] = []
 
     def graphql(self, query: str, variables: dict) -> dict:

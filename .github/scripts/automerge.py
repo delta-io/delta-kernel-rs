@@ -16,7 +16,7 @@ import logging
 import re
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
@@ -109,7 +109,7 @@ class PullRequest:
     labels: set[str]
     waiting: bool
     queued: bool
-    label_events: list[tuple[str, str | None, str]] = field(default_factory=list)
+    label_events: list[tuple[str, str | None, str]]
 
     @property
     def armed(self) -> bool:

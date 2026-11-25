@@ -155,7 +155,8 @@ and apply the label again.
 
 The cleanup is deliberately narrow. It removes only the exact generated block, starting on the
 first line and ending at its `---------` rule, and only when the AI reviewer no longer needs the
-stack list to scope its review (a stack root, or a child whose parent has merged into `main`).
+stack list to scope its review: a stack root, or a child synced after its parent merged into
+`main`.
 Anything else, including hand-edited stack sections, is left untouched and merges as written.
 
 If the `Automerge` run reports an error, for example because the PR was a draft or its head changed
