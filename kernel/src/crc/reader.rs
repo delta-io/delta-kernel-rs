@@ -84,16 +84,17 @@ mod tests {
     use url::Url;
 
     use super::*;
+    use crate::KernelResultIterator;
     use crate::actions::{Format, Metadata, Protocol};
     use crate::engine::sync::SyncEngine;
-    use crate::engine::{CancellableEngine, DelegatingEngine, PanicEngine};
+    use crate::engine::{CancellableEngine, DelegatingEngine};
     use crate::metrics::MetricEvent;
     use crate::path::ParsedLogPath;
     use crate::table_features::TableFeature;
+    use crate::unit_test_utils::recording_reads::RecordingReads;
     use crate::unit_test_utils::{
         CapturingReporter, TestCancellationToken, install_thread_local_metrics_reporter,
     };
-    use crate::{FileMeta, FileSlice, KernelResultIterator, StorageHandler};
 
     fn test_table_root(dir: &str) -> url::Url {
         let path = std::fs::canonicalize(PathBuf::from(dir)).unwrap();
@@ -269,8 +270,7 @@ mod tests {
     ) {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
-        let engine = DelegatingEngine::new(Arc::new(PanicEngine))
-            .with_storage_handler(Arc::new(TestStorageHandler(behavior)));
+        let engine = crc_engine(behavior);
         let root = Url::parse("memory:///").unwrap();
         let crc_path = ParsedLogPath::create_parsed_crc(&root, 0);
 
@@ -291,13 +291,11 @@ mod tests {
     ) {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
-        let engine = DelegatingEngine::new(Arc::new(PanicEngine)).with_storage_handler(Arc::new(
-            TestStorageHandler(ReadBehavior::Error {
-                reason,
-                in_iterator,
-                backtraced,
-            }),
-        ));
+        let engine = crc_engine(ReadBehavior::Error {
+            reason,
+            in_iterator,
+            backtraced,
+        });
         let root = Url::parse("memory:///").unwrap();
         let crc_path = ParsedLogPath::create_parsed_crc(&root, 0);
 
@@ -312,20 +310,19 @@ mod tests {
         assert_failure_reason(&reporter, reason);
     }
 
+    fn crc_engine(behavior: ReadBehavior) -> DelegatingEngine {
+        let mut reads = RecordingReads::new(None);
+        let config = Arc::get_mut(&mut reads).unwrap();
+        config.expected_token = None;
+        config.override_byte_reads = Some(Box::new(move |_| behavior.read_files()));
+        reads.engine()
+    }
+
     fn assert_failure_reason(reporter: &CapturingReporter, expected: CrcReadFailureReason) {
         let events = reporter.events();
-        let reasons: Vec<_> = events
-            .iter()
-            .filter_map(|event| match event {
-                MetricEvent::CrcReadFailure(event) => Some(event.reason),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(reasons, [expected]);
         assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, MetricEvent::CrcReadSuccess(_)))
+            matches!(events.as_slice(), [MetricEvent::CrcReadFailure(event)] if event.reason == expected),
+            "expected one CRC failure with reason {expected}: {events:?}"
         );
     }
 
@@ -340,14 +337,9 @@ mod tests {
         },
     }
 
-    struct TestStorageHandler(ReadBehavior);
-
-    impl StorageHandler for TestStorageHandler {
-        fn read_files(
-            &self,
-            _files: Vec<FileSlice>,
-        ) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
-            match self.0 {
+    impl ReadBehavior {
+        fn read_files(self) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> {
+            match self {
                 ReadBehavior::Data(data) => {
                     Ok(Box::new(std::iter::once(Ok(Bytes::from_static(data)))))
                 }
@@ -377,30 +369,6 @@ mod tests {
                     }
                 }
             }
-        }
-
-        fn list_from(
-            &self,
-            _path: &Url,
-            _end: Option<&Url>,
-        ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
-            panic!("list_from should not be called");
-        }
-
-        fn put(&self, _path: &Url, _data: Bytes, _overwrite: bool) -> KernelResult<()> {
-            panic!("put should not be called");
-        }
-
-        fn copy_atomic(&self, _src: &Url, _dest: &Url) -> KernelResult<()> {
-            panic!("copy_atomic should not be called");
-        }
-
-        fn head(&self, _path: &Url) -> KernelResult<FileMeta> {
-            panic!("head should not be called");
-        }
-
-        fn delete(&self, _path: &Url) -> KernelResult<()> {
-            panic!("delete should not be called");
         }
     }
 }
