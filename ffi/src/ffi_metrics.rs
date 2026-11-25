@@ -587,8 +587,6 @@ pub enum CheckpointPartsMissingSource {
     Listing,
     /// A file-backed hint version had no checkpoint file, or only an empty classic or V2 file.
     Hint,
-    /// The source was unrecorded, unrecognized, or is unavailable to this binding.
-    Unknown,
 }
 
 impl From<kernel::CheckpointPartsMissingSource> for CheckpointPartsMissingSource {
@@ -596,7 +594,6 @@ impl From<kernel::CheckpointPartsMissingSource> for CheckpointPartsMissingSource
         match source {
             kernel::CheckpointPartsMissingSource::Listing => Self::Listing,
             kernel::CheckpointPartsMissingSource::Hint => Self::Hint,
-            _ => Self::Unknown,
         }
     }
 }
@@ -1167,10 +1164,6 @@ mod tests {
     #[case(
         kernel::CheckpointPartsMissingSource::Hint,
         CheckpointPartsMissingSource::Hint
-    )]
-    #[case(
-        kernel::CheckpointPartsMissingSource::Unknown,
-        CheckpointPartsMissingSource::Unknown
     )]
     fn checkpoint_parts_missing_conversion_preserves_id_source_and_counts(
         #[case] source: kernel::CheckpointPartsMissingSource,

@@ -133,9 +133,9 @@ where
             CrcReadSuccess::SPAN_NAME => Some(MetricEvent::CrcReadSuccess(
                 CrcReadSuccess::from_attrs(attrs),
             )),
-            CheckpointPartsMissing::SPAN_NAME => Some(MetricEvent::CheckpointPartsMissing(
-                CheckpointPartsMissing::from_attrs(attrs),
-            )),
+            CheckpointPartsMissing::SPAN_NAME => {
+                CheckpointPartsMissing::from_attrs(attrs).map(MetricEvent::CheckpointPartsMissing)
+            }
             LastCheckpointReadCompleted::SPAN_NAME => {
                 Some(MetricEvent::LastCheckpointReadCompleted(
                     LastCheckpointReadCompleted::from_attrs(attrs),
@@ -408,28 +408,30 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case(None, CheckpointPartsMissingSource::Unknown)]
-    #[case(Some("listing"), CheckpointPartsMissingSource::Listing)]
-    #[case(Some("hint"), CheckpointPartsMissingSource::Hint)]
-    #[case(Some("unknown"), CheckpointPartsMissingSource::Unknown)]
-    #[case(Some(""), CheckpointPartsMissingSource::Unknown)]
-    #[case(Some("future_source"), CheckpointPartsMissingSource::Unknown)]
-    fn checkpoint_diagnostic_preserves_creation_fields_and_formats_counts(
+    #[case(Some("listing"), Some(CheckpointPartsMissingSource::Listing))]
+    #[case(Some("hint"), Some(CheckpointPartsMissingSource::Hint))]
+    #[case(None, None)]
+    #[case(Some("unknown"), None)]
+    #[case(Some(""), None)]
+    #[case(Some("future_source"), None)]
+    fn checkpoint_diagnostic_preserves_creation_fields_and_requires_valid_source(
         #[case] source: Option<&str>,
-        #[case] expected: CheckpointPartsMissingSource,
+        #[case] expected: Option<CheckpointPartsMissingSource>,
     ) {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
         let operation_id = MetricId::new();
         // The emitter and direct span attributes must produce the same diagnostic.
-        emit_checkpoint_parts_missing(&CheckpointPartsMissing {
-            operation_id,
-            source: expected,
-            version: 5,
-            expected_parts: 3,
-            found_parts: 0,
-        });
-        assert_eq!(reporter.events().len(), 1);
+        if let Some(source) = expected {
+            emit_checkpoint_parts_missing(&CheckpointPartsMissing {
+                operation_id,
+                source,
+                version: 5,
+                expected_parts: 3,
+                found_parts: 0,
+            });
+            assert_eq!(reporter.events().len(), 1);
+        }
         {
             let span = info_span!(
                 "checkpoint_parts_missing",
@@ -449,6 +451,10 @@ mod tests {
             info!(error = %"enclosing failure does not change the diagnostic");
         }
         let events = reporter.events();
+        let Some(expected) = expected else {
+            assert!(events.is_empty());
+            return;
+        };
         assert_eq!(events.len(), 2);
         for event in events {
             assert_eq!(

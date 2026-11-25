@@ -10,8 +10,8 @@
 //! lets connectors convert a value to its `&'static str` metric-label string via `.into()`
 //! instead of maintaining their own variant-to-string `match`.
 //!
-//! Event construction is infallible: a malformed span field warns and falls back to a
-//! default rather than failing the operation being observed.
+//! Decoding never fails the operation being observed. Malformed fields use a default or
+//! suppress an event whose kind cannot be determined.
 
 use std::fmt;
 use std::str::FromStr;
@@ -1547,14 +1547,11 @@ impl fmt::Display for CrcReadFailure {
 /// How checkpoint discovery found a missing or incomplete checkpoint candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, StrumDisplay, AsRefStr, IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
-#[non_exhaustive]
 pub enum CheckpointPartsMissingSource {
     /// A listed multipart candidate had missing or empty parts, including an all-empty set.
     Listing,
     /// A file-backed hint version had no checkpoint file, or only an empty classic or V2 file.
     Hint,
-    /// The source was not recorded or its metric label was unrecognized.
-    Unknown,
 }
 
 /// Checkpoint discovery found missing or empty parts in a checkpoint candidate.
@@ -1587,25 +1584,32 @@ pub struct CheckpointPartsMissing {
 impl CheckpointPartsMissing {
     pub(crate) const SPAN_NAME: &'static str = "checkpoint_parts_missing";
 
-    pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
-        let mut event = Self {
-            operation_id: MetricId::nil(),
-            source: CheckpointPartsMissingSource::Unknown,
-            version: 0,
-            expected_parts: 0,
-            found_parts: 0,
-        };
-        attrs.record(&mut event);
-        event
+    pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Option<Self> {
+        let mut fields = CheckpointPartsMissingAttrs::default();
+        attrs.record(&mut fields);
+        Some(Self {
+            operation_id: MetricId(fields.operation_id),
+            source: fields.source?,
+            version: fields.version,
+            expected_parts: fields.expected_parts,
+            found_parts: fields.found_parts,
+        })
     }
 }
 
-impl Visit for CheckpointPartsMissing {
+#[derive(Default)]
+struct CheckpointPartsMissingAttrs {
+    operation_id: Uuid,
+    source: Option<CheckpointPartsMissingSource>,
+    version: u64,
+    expected_parts: u64,
+    found_parts: u64,
+}
+
+impl Visit for CheckpointPartsMissingAttrs {
     fn record_str(&mut self, field: &Field, value: &str) {
         if field.name() == "source" {
-            self.source = value
-                .parse()
-                .unwrap_or(CheckpointPartsMissingSource::Unknown);
+            self.source = value.parse().ok();
         }
     }
 
@@ -1619,8 +1623,8 @@ impl Visit for CheckpointPartsMissing {
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-        if let Some(id) = record_operation_id(field, value, Self::SPAN_NAME) {
-            self.operation_id = id;
+        if let Some(id) = record_operation_id(field, value, CheckpointPartsMissing::SPAN_NAME) {
+            self.operation_id = id.0;
         }
     }
 }

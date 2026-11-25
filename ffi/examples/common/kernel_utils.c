@@ -572,7 +572,6 @@ void print_metric(MetricEvent event) {
     switch (cpm.source) {
     case CheckpointPartsMissingSourceListing: printf(" Listing,\n"); break;
     case CheckpointPartsMissingSourceHint: printf(" Hint,\n"); break;
-    case CheckpointPartsMissingSourceUnknown: printf(" Unknown,\n"); break;
     }
     PM_U64(cpm, version);
     PM_U64(cpm, expected_parts);
