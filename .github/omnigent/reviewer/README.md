@@ -367,8 +367,8 @@ counts and links. [`review_publish.py`](../review_publish.py) formats the commen
 mode attempts inline placement; `comment` and `collapsed` modes use Conversation finding comments.
 
 In `summary` mode, the workflow writes the complete report to its Actions job summary. In
-`artifact` mode, it uploads the report and supporting files listed below. These modes create no
-PR comments.
+`artifact` mode, it uploads the report and supporting files listed below. These modes create no main AI review comment or finding comments.
+The ancestry repair step described above runs independently of output mode.
 
 When credentials and the reviewed PR head are available, the workflow attempts to create an
 `AI Review Summary` Check Run. It includes all parsed final findings and publication results when
