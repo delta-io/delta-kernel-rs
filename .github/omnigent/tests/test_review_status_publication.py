@@ -17,13 +17,13 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 try:
-    import review_verdict
-    from diff_coverage import prepare_inputs
+    import review_status
+    from diff_coverage import prepare_review_inputs
     from finding_publication import PublicationError, publication_check, publish_findings
-    from review_evidence import build_evidence, execution_summary, observe_review
+    from review_evidence import build_execution_record, execution_summary, observe_review
     from review_history import history_evidence
     from review_publish import format_review_summary
-    from review_verdict import compute_verdict, publish_verdict
+    from review_status import compute_review_status, publish_review_status
 finally:
     sys.path.pop(0)
 
@@ -62,7 +62,7 @@ def history_from_github(github):
 
 def pipeline(github, severity=None, *, head_sha=HEAD, mode="inline", findings=None):
     history = history_from_github(github)
-    coverage = prepare_inputs(DIFF.encode(), "Author context.", "f" * 40, head_sha)["coverage"]
+    coverage = prepare_review_inputs(DIFF.encode(), "Author context.", "f" * 40, head_sha)["coverage"]
     entries = [] if severity is None else [{
         "id": severity.replace(" ", "") + "1", "body": "A concrete retained claim.",
         "path": "file.rs", "line": 1, "side": "RIGHT",
@@ -71,7 +71,7 @@ def pipeline(github, severity=None, *, head_sha=HEAD, mode="inline", findings=No
         entries = findings
     publication = publish_findings(
         github=github, repository="example/project", pr_number=1, head_sha=head_sha,
-        run_url=RUN_URL, review=REVIEW, structured=entries, diff=DIFF, review_diff=DIFF,
+        run_url=RUN_URL, review=REVIEW, structured=entries, github_pr_patch=DIFF, pr_change_patch=DIFF,
         trusted_bot_logins=["github-actions"], mode=mode, coverage=coverage,
     )
     candidates = [candidate(f"C{i}", item["severity"])
@@ -88,25 +88,25 @@ def pipeline(github, severity=None, *, head_sha=HEAD, mode="inline", findings=No
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "observations.jsonl"
         observer = observe_review(
-            path=str(path), run_id=RUN_ID, head_sha=head_sha, required_roles=ROLES,
+            path=str(path), run_id=RUN_ID, head_sha=head_sha, configured_reviewer_roles=ROLES,
         )
         for event in events:
             observer(event)
         observations = [json.loads(line) for line in path.read_text().splitlines()]
-    completion = build_evidence(
+    completion = build_execution_record(
         observations, {"outcomes": outcomes}, publication, history,
-        run_id=RUN_ID, head_sha=head_sha, required_roles=ROLES,
+        run_id=RUN_ID, head_sha=head_sha, configured_reviewer_roles=ROLES,
     )
     return dict(head_sha=head_sha, run_id=RUN_ID, coverage=coverage, completion=completion,
                 publication=publication, history=history)
 
 
 def publish_status(github, arguments, *, mode="inline"):
-    verdict = compute_verdict(**arguments)
-    return publish_verdict(
+    review_status = compute_review_status(**arguments)
+    return publish_review_status(
         github=github, repository="example/project", pr_number=1,
         publication=arguments["publication"], review=REVIEW, run_url=RUN_URL,
-        verdict=verdict, coverage=arguments["coverage"], mode=mode,
+        review_status=review_status, coverage=arguments["coverage"], mode=mode,
     )
 
 
@@ -129,7 +129,7 @@ class ReviewStatusPublicationTest(unittest.TestCase):
                 self.assertEqual(silent["counts"]["Blocker"], 1)
                 self.assertEqual(third["counts"]["Blocker"], 0)
                 main = github.issues[-1]["body"]
-                self.assertIn("Partial Coverage ⚠", main)
+                self.assertIn("Status requirements unmet", main)
                 self.assertIn("Earlier Blocker has not been rechecked on this commit.", main)
                 self.assertNotIn("<summary>Review Summary", main)
                 self.assertEqual(len(github.inline), int(mode == "inline"))
@@ -140,14 +140,14 @@ class ReviewStatusPublicationTest(unittest.TestCase):
                 github = FakeGitHub()
                 publish_status(github, pipeline(github, severity))
                 arguments = pipeline(github, severity)
-                verdict = publish_status(github, arguments)
-                self.assertEqual(verdict["status"], "APPROVED WITH FEEDBACK")
-                self.assertEqual(verdict["counts"][severity], 1)
+                review_status = publish_status(github, arguments)
+                self.assertEqual(review_status["status"], "APPROVED WITH FEEDBACK")
+                self.assertEqual(review_status["counts"][severity], 1)
                 self.assertIn("New finding comments: 0 · Reused finding comments: 1",
                               publication_check(REVIEW, arguments["publication"]))
                 main = github.issues[0]["body"]
-                self.assertIn("Full Coverage ✓", main)
-                self.assertNotIn("Partial Coverage Details", main)
+                self.assertIn("Status requirements met", main)
+                self.assertNotIn("Unmet status requirements", main)
                 self.assertEqual("existing thread" in main, severity == "Should Fix")
                 entries = [{key: item.get(key) for key in ("id", "body", "path", "line", "side")}
                            for item in arguments["publication"]["findings"]]
@@ -163,12 +163,12 @@ class ReviewStatusPublicationTest(unittest.TestCase):
         arguments["completion"]["reasons"] = [
             "Required reviewer docs-reviewer has no valid return."
         ]
-        verdict = publish_status(github, arguments)
-        self.assertEqual(verdict["status"], "NO VERDICT")
+        review_status = publish_status(github, arguments)
+        self.assertEqual(review_status["status"], "NO VERDICT")
         main = github.issues[0]["body"]
         order = ["AI Review - NO VERDICT", "---", "1 Blocker", "Reviewed",
-                 "Partial Coverage ⚠", "<summary>Partial Coverage Details",
-                 "<summary>PR Summary", "<summary>Review Summary", "Full AI review"]
+                 "Status requirements unmet", "<summary>Unmet status requirements",
+                 "<summary>Assessment Summary", "<summary>Review Summary", "Full AI review"]
         offsets = [main.index(part) for part in order]
         self.assertEqual(offsets, sorted(offsets))
         self.assertIn("[Blocker 1]", main)
@@ -177,26 +177,48 @@ class ReviewStatusPublicationTest(unittest.TestCase):
     def test_mismatched_publication_never_rewrites_another_heads_summary(self):
         github = FakeGitHub()
         arguments = pipeline(github)
-        verdict = compute_verdict(**arguments)
+        review_status = compute_review_status(**arguments)
         before = copy.deepcopy(github.writes)
         wrong = dict(arguments["publication"], head_sha="d" * 40)
-        publish_verdict(
+        publish_review_status(
             github=github, repository="example/project", pr_number=1, publication=wrong,
-            review=REVIEW, run_url=RUN_URL, verdict=verdict, coverage=arguments["coverage"],
+            review=REVIEW, run_url=RUN_URL, review_status=review_status, coverage=arguments["coverage"],
             mode="inline",
         )
         self.assertEqual(github.writes, before)
-        self.assertEqual(verdict["status"], "NO VERDICT")
+        self.assertEqual(review_status["status"], "NO VERDICT")
 
     def test_unconfirmed_status_update_stays_no_verdict(self):
         github = FakeGitHub()
         arguments = pipeline(github)
         with patch.object(github, "write", side_effect=PublicationError("unobserved")):
-            verdict = publish_status(github, arguments)
-        self.assertEqual(verdict["status"], "NO VERDICT")
+            review_status = publish_status(github, arguments)
+        self.assertEqual(review_status["status"], "NO VERDICT")
+        self.assertFalse(review_status["status_requirements_met"])
+        self.assertTrue(arguments["coverage"]["complete"])
         self.assertTrue(
-            any(r["code"] == "status_publication_unconfirmed" for r in verdict["reasons"])
+            any(r["code"] == "status_publication_unconfirmed" for r in review_status["reasons"])
         )
+
+    def test_report_modes_record_findings_without_creating_or_updating_pr_comments(self):
+        for mode in ("summary", "artifact"):
+            with self.subTest(mode=mode):
+                github = FakeGitHub()
+                arguments = pipeline(github, "Blocker", mode=mode)
+                status = publish_status(github, arguments, mode=mode)
+                self.assertEqual(status["status"], "NOT APPROVED")
+                self.assertTrue(status["status_requirements_met"])
+                self.assertEqual(status["counts"]["Blocker"], 1)
+                self.assertEqual(github.writes, [])
+                self.assertEqual(github.issues, [])
+                self.assertEqual(github.inline, [])
+                output = status["findings"][0]
+                self.assertIsNone(output["url"])
+                self.assertIsNone(output["delivery"])
+                self.assertEqual(output["placement"], mode)
+                report = publication_check(REVIEW, arguments["publication"])
+                self.assertIn(f"Findings in {mode} report: 1", report)
+                self.assertIn("New finding comments: 0 · Reused finding comments: 0", report)
 
     def test_workflow_cli_retains_filtered_status_and_neutral_check_mirrors_it(self):
         repository = Path(__file__).resolve().parents[3]
@@ -240,9 +262,9 @@ class ReviewStatusPublicationTest(unittest.TestCase):
                     ]
                     with (
                         patch.object(sys, "argv", argv),
-                        patch.object(review_verdict, "GitHub", return_value=github),
+                        patch.object(review_status, "GitHub", return_value=github),
                     ):
-                        review_verdict.main()
+                        review_status.main()
                     record = json.loads((root / "review_execution.json").read_text())
                     self.assertEqual(record["review_status"]["status"], expected_status)
                     self.assertTrue(record["review_status"]["breaking_change"])
@@ -284,7 +306,7 @@ class ReviewStatusPublicationTest(unittest.TestCase):
                     sent = json.loads((root / "sent-check.json").read_text())
                     self.assertEqual(sent["conclusion"], "neutral")
                     self.assertEqual(sent["output"]["title"], f"AI Review - {expected_status}")
-                    self.assertIn("Full Coverage ✓", sent["output"]["summary"])
+                    self.assertIn("Status requirements met", sent["output"]["summary"])
                     if historical_blocker:
                         self.assertIn(prior_url, sent["output"]["summary"])
                         self.assertIn("A concrete retained claim.", sent["output"]["summary"])

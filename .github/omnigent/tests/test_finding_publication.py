@@ -284,7 +284,7 @@ class FindingPublicationTest(unittest.TestCase):
         self.assertEqual(record["errors"], ["Invalid final finding heading: ### Blocker0."])
         self.assertEqual([item["id"] for item in record["findings"]], ["Nit1"])
         self.assertTrue(record["findings"][0]["url"])
-        self.assertIn("Publication incomplete:", github.issues[0]["body"])
+        self.assertIn("Posting review comments is incomplete:", github.issues[0]["body"])
         self.assertIn("Invalid final finding heading: ### Blocker0.", github.issues[0]["body"])
         self.assertIn("Finding counts unavailable", github.issues[0]["body"])
 
@@ -478,8 +478,8 @@ class FindingPublicationTest(unittest.TestCase):
         self.assertTrue(record["complete"])
         main = github.issues[0]["body"]
         self.assertIn("1 of 3 file sections fully included; 1 partial and 1 omitted", main)
-        self.assertNotIn("Full Coverage", main)
-        self.assertNotIn("Partial Coverage", main)
+        self.assertNotIn("Status requirements met", main)
+        self.assertNotIn("Status requirements unmet", main)
         self.assertNotIn("missing.rs", main)
         check = publication_check("Context.", record)
         self.assertIn("100000 of 120000", check)

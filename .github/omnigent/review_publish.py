@@ -148,25 +148,28 @@ def format_review_summary(
     counts_available: bool = True,
     checks_url: str | None = None,
     coverage: dict[str, Any] | None = None,
-    verdict: dict[str, Any] | None = None,
+    review_status: dict[str, Any] | None = None,
 ) -> str:
     """Build Markdown for the main AI review Conversation comment.
 
-    Count final findings with confirmed comment URLs and link Blocker and Should Fix comments
-    from Review Summary. If verdict is supplied, include its advisory status, coverage marker
-    and reasons for incomplete review work.
+    Count findings with confirmed comment URLs and link Blocker and Should Fix findings from Review
+    Summary, including earlier final Blockers retained by the status computation. If
+    review_status is supplied, include its advisory status and whether advisory status requirements are met.
     """
     confirmed = [finding for finding in findings if finding.get("url")]
     counts = Counter(finding["severity"] for finding in confirmed)
     headline = f"**{_finding_counts(counts)}**" if counts_available else "Finding counts unavailable."
-    title = f"## AI Review - {verdict['status']}" if verdict else "## AI Review"
+    title = f"## AI Review - {review_status['status']}" if review_status else "## AI Review"
     reviewed = f"Reviewed `{head_sha[:8]}`"
-    if verdict:
-        reviewed += " · Full Coverage ✓" if verdict["coverage_full"] else " · Partial Coverage ⚠"
+    if review_status:
+        reviewed += (
+            " · Status requirements met" if review_status["status_requirements_met"]
+            else " · Status requirements unmet"
+        )
     parts = [BOT_MARKER, title, headline, reviewed]
-    if verdict and not verdict["coverage_full"]:
+    if review_status and not review_status["status_requirements_met"]:
         rows = []
-        for reason in verdict["reasons"]:
+        for reason in review_status["reasons"]:
             message = reason["message"]
             if reason.get("url"):
                 message += f" [Earlier finding]({reason['url']})"
@@ -180,10 +183,10 @@ def format_review_summary(
                 f"[Diff details in Checks]({checks_url or run_url})."
             )
         parts.append(
-            "<details><summary>Partial Coverage Details</summary>\n\n"
+            "<details><summary>Unmet status requirements</summary>\n\n"
             + "\n".join(rows) + "\n\n</details>"
         )
-    if verdict is None and coverage is not None and not coverage.get("complete"):
+    if review_status is None and coverage is not None and not coverage.get("complete"):
         parts.append(
             f"Review input truncated: {coverage.get('full_files', 0)} of "
             f"{coverage.get('total_files', 0)} file sections fully included; "
@@ -191,7 +194,7 @@ def format_review_summary(
             f"{coverage.get('omitted_files', 0)} omitted. "
             f"[Diff details in Checks]({checks_url or run_url})."
         )
-    if errors and verdict is None:
+    if errors and review_status is None:
         parts.append("Posting review comments is incomplete: " + " ".join(dict.fromkeys(errors)))
     parts.append(
         "<details><summary>Assessment Summary</summary>\n\n"
@@ -238,24 +241,27 @@ def format_diff_coverage(coverage: dict[str, Any]) -> str:
     return "\n\n".join(parts)
 
 
-def format_status_check(verdict: dict[str, Any]) -> str:
+def format_status_check(review_status: dict[str, Any]) -> str:
     """Build the status section for the AI Review Summary Check Run report."""
-    coverage = "Full Coverage ✓" if verdict["coverage_full"] else "Partial Coverage ⚠"
+    records = (
+        "Status requirements met" if review_status["status_requirements_met"]
+        else "Status requirements unmet"
+    )
     parts = [
-        f"## AI Review - {verdict['status']}",
-        f"**{_finding_counts(verdict['counts'])}**",
-        f"Reviewed `{verdict['head_sha'][:8]}` · {coverage}",
+        f"## AI Review - {review_status['status']}",
+        f"**{_finding_counts(review_status['counts'])}**",
+        f"Reviewed `{review_status['head_sha'][:8]}` · {records}",
     ]
-    for reason in verdict["reasons"]:
+    for reason in review_status["reasons"]:
         text = reason["message"]
         if reason.get("url"):
             text += f" [Earlier finding]({reason['url']})"
         parts.append("- " + text)
-    if verdict["sensitive_paths"]:
+    if review_status["sensitive_paths"]:
         parts.append("Sensitive areas: " + ", ".join(
-            f"<code>{escape(path)}</code>" for path in verdict["sensitive_paths"]
+            f"<code>{escape(path)}</code>" for path in review_status["sensitive_paths"]
         ))
-    if verdict["breaking_change"]:
+    if review_status["breaking_change"]:
         parts.append("The PR declares a breaking change.")
     return "\n\n".join(parts)
 

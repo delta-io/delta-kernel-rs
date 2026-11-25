@@ -1,7 +1,7 @@
 """Compute a commit's advisory AI review status and update the main PR comment.
 
-Use diff coverage, reviewer/checker task results, candidate-to-final mappings, earlier
-Blockers and confirmed finding-comment URLs. Missing required records give NO VERDICT.
+Use patch-excerpt coverage, Reviewer results, Checker decisions, candidate-to-final mappings,
+earlier final Blockers and finding output records. Missing required records give NO VERDICT.
 The command updates the main AI review Conversation comment, writes status JSON through
 --output and rebuilds the AI Review Summary Check Run report. The workflow creates that
 Check Run with GitHub conclusion neutral.
@@ -33,21 +33,25 @@ _PROTOCOL_MODULES = {
 }
 
 
-def compute_verdict(
+def compute_review_status(
     *, head_sha: str, run_id: str, coverage: Any, completion: Any, publication: Any,
     history: Any, breaking_change: bool = False,
 ) -> dict[str, Any]:
-    """Return one run's advisory status, current findings and missing records for head_sha.
+    """Return the reviewed commit's advisory status, counted findings and incomplete records.
 
-    A confirmed comment URL establishes that a finding comment exists, not that its claim is
-    correct. Keep known Blockers from earlier reviews of the same commit when a rerun omits
-    them. A Blocker on an earlier commit without a matching current result gives NO VERDICT
-    and stays outside the current finding counts.
+    PR comment modes require confirmed finding-comment URLs. Summary and artifact modes record
+    the selected report placement without comment URLs or delivery claims. These records establish where
+    a finding is reported; they do not establish whether its claim is correct.
+
+    Count earlier final Blockers for the same commit when the current orchestrator report omits
+    them. An earlier-commit Blocker without a matching current result gives NO VERDICT and stays
+    outside the current counts. status_requirements_met means the records satisfy the status rules,
+    including an uncontested Checker decision. It does not prove every changed line was examined.
     """
     reasons: list[dict[str, str]] = []
     if not _valid_sha(head_sha) or not isinstance(run_id, str) or not run_id:
         _reason(reasons, "run_identity_invalid", "The reviewed run or commit is unavailable.")
-    scoped_paths = _coverage_reasons(coverage, head_sha, reasons)
+    changed_paths = _coverage_reasons(coverage, head_sha, reasons)
     _completion_reasons(completion, head_sha, run_id, reasons)
     findings = _current_findings(publication, head_sha, run_id, reasons)
     prior = _history_blockers(history, reasons)
@@ -93,21 +97,24 @@ def compute_verdict(
         status = "APPROVED"
     return {
         "head_sha": head_sha, "run_id": run_id, "status": status,
-        "coverage_full": not reasons, "reasons": reasons, "findings": findings,
+        "status_requirements_met": not reasons, "reasons": reasons, "findings": findings,
         "counts": {severity: counts[severity] for severity in _SEVERITIES},
-        "sensitive_paths": _sensitive_paths(scoped_paths), "breaking_change": breaking_change,
+        "sensitive_paths": _sensitive_paths(changed_paths), "breaking_change": breaking_change,
     }
 
 
 def _coverage_reasons(coverage, head_sha, reasons):
     if not isinstance(coverage, dict):
-        _reason(reasons, "input_coverage_unavailable", "Scoped input coverage is unavailable.")
+        _reason(
+            reasons, "input_coverage_unavailable",
+            "The patch-excerpt coverage record is unavailable.",
+        )
         return []
     if (coverage.get("head_sha") != head_sha or not _valid_sha(coverage.get("head_sha"))
             or not _valid_sha(coverage.get("base_sha"))):
         _reason(
             reasons, "input_scope_mismatch",
-            "Input coverage names a different or unknown range.",
+            "The patch-excerpt coverage record names a different or unknown review range.",
         )
         return []
     total, delivered = coverage.get("total_bytes"), coverage.get("delivered_bytes")
@@ -130,24 +137,30 @@ def _coverage_reasons(coverage, head_sha, reasons):
                              ("omitted_files", "omitted"))
     )
     if not valid_bytes or not valid_totals:
-        _reason(reasons, "coverage_record_incomplete", "The scoped coverage record is incomplete.")
+        _reason(
+            reasons, "coverage_record_incomplete",
+            "The patch-excerpt coverage record is incomplete.",
+        )
     if (coverage.get("complete") is not True or not valid_bytes or delivered != total
             or measured["partial"] or measured["omitted"]):
         _reason(
             reasons, "diff_incomplete",
-            "The reviewers did not receive the complete scoped diff.",
+            "Subagent task messages did not include the complete PR change patch.",
         )
     return [item["path"] for item in files]
 
 
 def _completion_reasons(completion, head_sha, run_id, reasons):
     if not isinstance(completion, dict):
-        _reason(reasons, "execution_unavailable", "Reviewer completion evidence is unavailable.")
+        _reason(
+            reasons, "execution_unavailable",
+            "The Reviewer and Checker result record is unavailable.",
+        )
         return
     if completion.get("head_sha") != head_sha or completion.get("run_id") != run_id:
         _reason(
             reasons, "execution_identity_mismatch",
-            "Reviewer execution names another run or commit.",
+            "The Reviewer and Checker result record names another run or commit.",
         )
     details = completion.get("reasons")
     if completion.get("complete") is not True or not isinstance(details, list) or details:
@@ -159,13 +172,16 @@ def _completion_reasons(completion, head_sha, run_id, reasons):
             for message in messages:
                 _reason(reasons, "execution_detail", message)
         else:
-            _reason(reasons, "execution_incomplete", "Required reviewer or checker work is incomplete.")
-    roles, attempts = completion.get("required_roles"), completion.get("attempts")
+            _reason(
+                reasons, "execution_incomplete",
+                "Required Reviewer results or Checker decisions are incomplete.",
+            )
+    roles, attempts = completion.get("configured_reviewer_roles"), completion.get("attempts")
     if (not isinstance(roles, list) or not roles or not all(isinstance(role, str) for role in roles)
             or len(set(roles)) != len(roles) or not isinstance(attempts, list)):
         _reason(
             reasons, "reviewer_returns_unavailable",
-            "The required reviewer returns are unavailable.",
+            "The required Reviewer results are unavailable.",
         )
     else:
         for role in roles:
@@ -199,15 +215,15 @@ def _completion_reasons(completion, head_sha, run_id, reasons):
                     "Candidate accounting is unavailable.",
                 )
                 continue
-            if isinstance(checker, dict) and checker.get("verdict") == "CONTESTED":
+            if isinstance(checker, dict) and checker.get("decision") == "CONTESTED":
                 _reason(reasons, "correctness_contested", "A correctness claim remains contested.")
             if candidate.get("severity") in ("Blocker", "Should Fix") and (
                 not isinstance(checker, dict)
-                or checker.get("verdict") not in ("CONFIRMED", "DISPROVED", "NITPICK", "CONTESTED")
+                or checker.get("decision") not in ("CONFIRMED", "DISPROVED", "NITPICK", "CONTESTED")
             ):
                 _reason(
                     reasons, "checker_incomplete",
-                    "A required checker disposition is unavailable.",
+                    "A required Checker decision is unavailable.",
                 )
     if "rule_evaluation" in completion:
         rules = completion["rule_evaluation"]
@@ -219,7 +235,7 @@ def _current_findings(publication, head_sha, run_id, reasons):
     if not isinstance(publication, dict):
         _reason(
             reasons, "publication_unavailable",
-            "The JSON record of final findings and output URLs is unavailable.",
+            "The final finding output record is unavailable.",
         )
         return []
     run_url = publication.get("run_url")
@@ -233,13 +249,13 @@ def _current_findings(publication, head_sha, run_id, reasons):
     if not identity_valid:
         _reason(
             reasons, "publication_identity_mismatch",
-            "The finding-comment record names another workflow run or reviewed commit.",
+            "The finding output record names another workflow run or reviewed commit.",
         )
     errors = publication.get("errors")
     if publication.get("complete") is not True or not isinstance(errors, list) or errors:
         _reason(
             reasons, "publication_incomplete",
-            "Posting review comments or the report was incomplete or could not be confirmed.",
+            "The finding output record is incomplete or contains unconfirmed comment writes.",
         )
     raw_findings = publication.get("findings")
     if not isinstance(raw_findings, list):
@@ -248,6 +264,7 @@ def _current_findings(publication, head_sha, run_id, reasons):
             "The final finding list is unavailable.",
         )
         return []
+    report_mode = publication.get("mode") in ("summary", "artifact")
     findings, seen = [], set()
     for raw in raw_findings:
         if not isinstance(raw, dict):
@@ -258,10 +275,15 @@ def _current_findings(publication, head_sha, run_id, reasons):
             continue
         finding_id, severity = raw.get("id"), raw.get("severity")
         match = _FINAL_ID.fullmatch(finding_id) if isinstance(finding_id, str) else None
+        output_valid = (
+            raw.get("placement") == publication["mode"]
+            and raw.get("url") is None and raw.get("delivery") is None
+            if report_mode else _valid_url(raw.get("url"))
+        )
         if (match is None or severity not in _SEVERITIES
                 or match[1].replace("ShouldFix", "Should Fix") != severity
                 or raw.get("head_sha") != head_sha or not _valid_sha(raw.get("head_sha"))
-                or not _valid_url(raw.get("url"))):
+                or not output_valid):
             _reason(
                 reasons, "finding_unconfirmed",
                 "A final finding's comment/report record is missing or invalid.",
@@ -278,9 +300,9 @@ def _current_findings(publication, head_sha, run_id, reasons):
         if not isinstance(finding.get("body"), str) or not finding["body"].strip():
             _reason(
                 reasons, "finding_body_unavailable",
-                "A retained finding's claim is unavailable.",
+                "A final finding's text is unavailable.",
             )
-            finding["body"] = "Retained finding; see its confirmed discussion."
+            finding["body"] = "Finding text is unavailable."
         finding["fingerprint"] = _fingerprint(finding)
         findings.append(finding)
     return findings
@@ -288,11 +310,11 @@ def _current_findings(publication, head_sha, run_id, reasons):
 
 def _history_blockers(history, reasons):
     if not isinstance(history, dict):
-        _reason(reasons, "history_unavailable", "Trusted review history is unavailable.")
+        _reason(reasons, "history_unavailable", "Earlier AI review history is unavailable.")
         return []
     details = history.get("reasons")
     if history.get("complete") is not True or not isinstance(details, list) or details:
-        _reason(reasons, "history_incomplete", "Trusted review history is incomplete.")
+        _reason(reasons, "history_incomplete", "Earlier AI review history is incomplete.")
     if isinstance(details, list):
         messages = {
             "history_unavailable": "Earlier review history could not be fetched.",
@@ -439,15 +461,15 @@ def _reason(reasons, code, message, url=None):
     reasons.append(value)
 
 
-def publish_verdict(
+def publish_review_status(
     *, github: Any, repository: str, pr_number: int, publication: Any, review: str, run_url: str,
-    verdict: dict[str, Any], coverage: Any, mode: str,
+    review_status: dict[str, Any], coverage: Any, mode: str,
 ) -> dict[str, Any]:
     """Update this run's main AI review Conversation comment with its status and findings.
 
     Check the recorded commit, run URL, mode and comment ID before updating GitHub. If the
-    updated text cannot be confirmed, change verdict in place to NO VERDICT. Summary and
-    artifact modes return without posting a PR comment.
+    updated text cannot be confirmed, set review_status to NO VERDICT and mark its status requirements
+    unmet. Summary and artifact modes return without posting a PR comment.
     """
     if (not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository)
             or isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number < 1):
@@ -455,31 +477,31 @@ def publish_verdict(
     if mode not in {"inline", "comment", "collapsed", "summary", "artifact"}:
         raise ValueError("invalid publication mode")
     if mode in {"summary", "artifact"}:
-        return verdict
+        return review_status
     publication = publication if isinstance(publication, dict) else {}
-    expected_run_url = f"https://github.com/{repository}/actions/runs/{verdict['run_id']}"
+    expected_run_url = f"https://github.com/{repository}/actions/runs/{review_status['run_id']}"
     if (
-        publication.get("head_sha") != verdict["head_sha"]
+        publication.get("head_sha") != review_status["head_sha"]
         or publication.get("run_url") != run_url or run_url != expected_run_url
         or publication.get("mode") != mode
     ):
-        _status_publication_gap(verdict)
-        return verdict
+        _status_publication_gap(review_status)
+        return review_status
     comment_id = publication.get("main_comment_id")
     if not isinstance(comment_id, int) or isinstance(comment_id, bool) or comment_id < 1:
-        _status_publication_gap(verdict)
-        return verdict
+        _status_publication_gap(review_status)
+        return review_status
     endpoint = f"repos/{repository}/issues/comments/{comment_id}"
 
     def rendered():
         body = format_review_summary(
-            overview=review_overview(review), head_sha=verdict["head_sha"],
-            findings=verdict["findings"], run_url=run_url,
+            overview=review_overview(review), head_sha=review_status["head_sha"],
+            findings=review_status["findings"], run_url=run_url,
             counts_available=not publication.get("errors"),
             checks_url=f"https://github.com/{repository}/pull/{pr_number}/checks",
-            coverage=coverage if isinstance(coverage, dict) else None, verdict=verdict,
+            coverage=coverage if isinstance(coverage, dict) else None, review_status=review_status,
         )
-        source = {"head_sha": verdict["head_sha"], "run_url": run_url}
+        source = {"head_sha": review_status["head_sha"], "run_url": run_url}
         marker = f"<!-- ai-review-main {json.dumps(source, sort_keys=True)} -->"
         return body.replace(BOT_MARKER, BOT_MARKER + "\n" + marker, 1)
 
@@ -494,20 +516,20 @@ def publish_verdict(
         except PublicationError:
             observed = {}
         if not isinstance(observed, dict) or observed.get("body") != body:
-            _status_publication_gap(verdict)
+            _status_publication_gap(review_status)
             try:
                 github.write("PATCH", endpoint, {"body": rendered()})
             except PublicationError:
                 pass
-    return verdict
+    return review_status
 
 
-def _status_publication_gap(verdict):
+def _status_publication_gap(review_status):
     _reason(
-        verdict["reasons"], "status_publication_unconfirmed",
+        review_status["reasons"], "status_publication_unconfirmed",
         "Python could not confirm the main AI review comment's status update.",
     )
-    verdict.update(status="NO VERDICT", coverage_full=False)
+    review_status.update(status="NO VERDICT", status_requirements_met=False)
 
 
 def _load_json(path):
@@ -520,9 +542,10 @@ def _load_json(path):
 def main() -> None:
     """Read the run's records and write the advisory status JSON and full Check Run report.
 
-    Update the main AI review comment and the file named by --output. Add status data to the
-    execution JSON, then rebuild --check-output from the final findings and comment URLs,
-    including known same-commit Blockers omitted by the model on a rerun.
+    In PR comment modes, update the main AI review comment. Write --output, add status data to
+    the execution JSON and rebuild --check-output from the counted findings and their output
+    URLs. These findings include earlier final Blockers for the same commit that the current
+    orchestrator report omits.
     """
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("coverage", "completion", "publication", "history", "metadata", "review",
@@ -541,35 +564,36 @@ def main() -> None:
     coverage, completion, publication = (
         _load_json(args.coverage), _load_json(args.completion), _load_json(args.publication)
     )
-    verdict = compute_verdict(
+    review_status = compute_review_status(
         head_sha=args.head_sha, run_id=args.run_id, coverage=coverage, completion=completion,
         publication=publication, history=_load_json(args.history), breaking_change=breaking,
     )
     review = args.review.read_text() if args.review.is_file() else "Review text is unavailable."
-    publish_verdict(
+    publish_review_status(
         github=GitHub(), repository=args.repository, pr_number=args.pr_number,
         publication=publication, review=review,
-        run_url=args.run_url, verdict=verdict, coverage=coverage, mode=args.mode,
+        run_url=args.run_url, review_status=review_status, coverage=coverage, mode=args.mode,
     )
-    args.output.write_text(json.dumps(verdict, indent=2) + "\n")
+    args.output.write_text(json.dumps(review_status, indent=2) + "\n")
     if isinstance(completion, dict):
         completion["review_status"] = {
-            key: value for key, value in verdict.items() if key != "findings"
+            key: value for key, value in review_status.items() if key != "findings"
         }
         completion["review_status"]["findings"] = [
             {key: finding.get(key) for key in (
                 "id", "severity", "head_sha", "url", "placement", "delivery",
                 "source_finding_id", "source_review_id", "source_comment_id",
             )}
-            for finding in verdict["findings"]
+            for finding in review_status["findings"]
         ]
         args.completion.write_text(json.dumps(completion, indent=2) + "\n")
     errors = publication.get("errors") if isinstance(publication, dict) else None
     check_record = {
-        "findings": verdict["findings"],
+        "findings": review_status["findings"],
+        "mode": publication.get("mode") if isinstance(publication, dict) else None,
         "errors": [error for error in errors if isinstance(error, str)]
         if isinstance(errors, list)
-        else ["The JSON record of final findings and output URLs is unavailable."],
+        else ["The final finding output record is unavailable."],
         "coverage": coverage,
     }
     try:
@@ -579,7 +603,7 @@ def main() -> None:
         full_review = publication_check(review, check_record)
     if isinstance(completion, dict):
         full_review += "\n\n" + execution_summary(completion)
-    args.check_output.write_text(format_status_check(verdict) + "\n\n---\n\n" + full_review)
+    args.check_output.write_text(format_status_check(review_status) + "\n\n---\n\n" + full_review)
 
 
 if __name__ == "__main__":

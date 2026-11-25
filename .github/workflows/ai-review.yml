@@ -1566,7 +1566,7 @@ jobs:
           RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         run: |
           set -euo pipefail
-          python3 .github/omnigent/review_verdict.py \
+          python3 .github/omnigent/review_status.py \
             --coverage /tmp/diff_coverage.json \
             --completion /tmp/review_execution.json \
             --publication /tmp/publication_record.json \
@@ -1579,7 +1579,7 @@ jobs:
             --pr-number "$PR_NUMBER" \
             --run-url "$RUN_URL" \
             --mode "$OUTPUT_MODE" \
-            --output /tmp/review_verdict.json \
+            --output /tmp/review_status.json \
             --check-output /tmp/check-summary.txt
 
       - name: Retain reviewer execution evidence
@@ -1664,8 +1664,8 @@ jobs:
             fi
           fi
 
-          if [ -s /tmp/review_verdict.json ]; then
-            title="$(python3 -c 'import json; print("AI Review - " + json.load(open("/tmp/review_verdict.json"))["status"])')"
+          if [ -s /tmp/review_status.json ]; then
+            title="$(python3 -c 'import json; print("AI Review - " + json.load(open("/tmp/review_status.json"))["status"])')"
           elif [ "${REVIEW_ATTEMPTED:-false}" = "true" ]; then
             title="AI Review - NO VERDICT"
             printf '\n\nAdvisory status evidence is unavailable.\n' >> "$summary_file"
