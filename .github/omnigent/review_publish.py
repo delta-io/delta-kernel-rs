@@ -158,7 +158,7 @@ def format_review_summary(
     if coverage is not None and not coverage.get("complete"):
         parts.append(
             f"Review input truncated: {coverage.get('full_files', 0)} of "
-            f"{coverage.get('total_files', 0)} files fully delivered; "
+            f"{coverage.get('total_files', 0)} file sections fully included; "
             f"{coverage.get('partial_files', 0)} partial and "
             f"{coverage.get('omitted_files', 0)} omitted. "
             f"[Diff details in Checks]({checks_url or run_url})."
@@ -195,11 +195,11 @@ def format_review_summary(
 
 
 def format_diff_coverage(coverage: dict[str, Any]) -> str:
-    """Build Check Run text listing diff bytes and files missing from child tasks."""
+    """Describe the subagent patch excerpt's byte count and partly included or omitted file sections."""
     parts = [
-        "## Diff coverage",
+        "## Subagent patch excerpt",
         f"Reviewed range: `{coverage['base_sha']}...{coverage['head_sha']}`",
-        f"Delivered {coverage['delivered_bytes']} of {coverage['total_bytes']} UTF-8 bytes; "
+        f"Includes {coverage['excerpt_bytes']} of {coverage['total_bytes']} UTF-8 patch bytes; "
         f"{coverage['full_files']} full, {coverage['partial_files']} partial, "
         f"{coverage['omitted_files']} omitted files.",
     ]

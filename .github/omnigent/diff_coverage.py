@@ -45,17 +45,17 @@ def prepare_review_inputs(
         author_description.encode("utf-8"), MAX_PR_DESCRIPTION_EXCERPT_BYTES
     )
     subagent_patch_excerpt_text = utf8_prefix(pr_change_patch_bytes, MAX_SUBAGENT_PATCH_EXCERPT_BYTES)
-    delivered = len(subagent_patch_excerpt_text.encode("utf-8"))
+    excerpt_bytes = len(subagent_patch_excerpt_text.encode("utf-8"))
     files = file_sections(pr_change_patch_bytes)
     for section in files:
         section["status"] = (
-            "full" if section["end"] <= delivered
-            else "partial" if section["start"] < delivered
+            "full" if section["end"] <= excerpt_bytes
+            else "partial" if section["start"] < excerpt_bytes
             else "omitted"
         )
     coverage = {
         "base_sha": base_sha, "head_sha": head_sha, "total_bytes": len(pr_change_patch_bytes),
-        "delivered_bytes": delivered, "complete": delivered == len(pr_change_patch_bytes),
+        "excerpt_bytes": excerpt_bytes, "complete": excerpt_bytes == len(pr_change_patch_bytes),
         "total_files": len(files),
         "full_files": sum(section["status"] == "full" for section in files),
         "partial_files": sum(section["status"] == "partial" for section in files),
