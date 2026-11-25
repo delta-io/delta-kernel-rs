@@ -334,8 +334,8 @@ mod tests {
     };
     use crate::metrics::{
         CheckpointOutputStats, CheckpointProcessingStats, CheckpointWriteMode,
-        CheckpointWriteOutcome, CheckpointWriteStats, LastCheckpointReadOutcome, MetricEvent,
-        MetricId, WithMetricsReporterLayer as _,
+        CheckpointWriteOutcome, CheckpointWriteStats, CrcReadFailureReason,
+        LastCheckpointReadOutcome, MetricEvent, MetricId, WithMetricsReporterLayer as _,
     };
     use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
 
@@ -356,6 +356,63 @@ mod tests {
         with_default(subscriber, f);
         let bytes = logs.lock().unwrap().clone();
         String::from_utf8(bytes).unwrap()
+    }
+
+    #[rstest::rstest]
+    #[case(None, CrcReadFailureReason::Error)]
+    #[case(Some("not_found"), CrcReadFailureReason::NotFound)]
+    #[case(Some("empty"), CrcReadFailureReason::Empty)]
+    #[case(Some("parsing"), CrcReadFailureReason::Parsing)]
+    #[case(Some("error"), CrcReadFailureReason::Error)]
+    #[case(Some("cancelled"), CrcReadFailureReason::Cancelled)]
+    #[case(Some("unknown"), CrcReadFailureReason::Error)]
+    #[case(Some("future_reason"), CrcReadFailureReason::Error)]
+    fn crc_failure_preserves_recorded_reason(
+        #[case] label: Option<&str>,
+        #[case] expected: CrcReadFailureReason,
+    ) {
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        {
+            let span = info_span!(
+                "crc_read_completed",
+                report = Empty,
+                bytes_read = Empty,
+                failure_reason = Empty
+            );
+            let _entered = span.enter();
+            if let Some(label) = label {
+                span.record("failure_reason", label);
+            }
+            info!(
+                failure_reason = "wrong",
+                "log fields must not overwrite metric fields"
+            );
+            info!(error = %"injected error");
+            span.record("bytes_read", 100_u64);
+            span.record("failure_reason", false);
+        }
+        let events = reporter.events();
+        let [MetricEvent::CrcReadFailure(event)] = events.as_slice() else {
+            panic!("expected one CRC failure metric: {events:?}");
+        };
+        assert_eq!(event.reason, expected);
+        assert_eq!(
+            events[0].to_string(),
+            format!("CrcReadFailure(reason={expected})")
+        );
+    }
+
+    #[test]
+    fn crc_invalid_reason_warns_after_releasing_extension_lock() {
+        let logs = capture_logs(|| {
+            let span = info_span!("crc_read_completed", report = Empty, failure_reason = Empty);
+            let _entered = span.enter();
+            span.record("failure_reason", "not_a_reason");
+        });
+        assert!(
+            logs.contains("Invalid field 'failure_reason' recorded on crc_read_completed span")
+        );
     }
 
     #[rstest::rstest]

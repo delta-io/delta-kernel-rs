@@ -192,7 +192,7 @@ storage call may serve multiple higher-level operations.
 | `JsonReadCompleted` | `num_files`, `bytes_read` | One `JsonHandler::read_json_files` call completed. `bytes_read` is the sum of on-disk file sizes. |
 | `ParquetReadCompleted` | `num_files`, `bytes_read` | One `ParquetHandler::read_parquet_files` call completed. `bytes_read` is the sum of on-disk file sizes. |
 | `CrcReadSuccess` | `duration`, `bytes_read` | One CRC file read and parsed successfully. `bytes_read` is the raw byte count from storage. |
-| `CrcReadFailure` | none | A CRC file read or parse failed. Non-cancellation failures allow log replay. |
+| `CrcReadFailure` | `reason` | An attempted CRC read failed. The reason distinguishes missing files, empty reads, parsing or validation failures, storage errors, and cancellation. An unset or unrecognized reason reports `error`. Non-cancellation failures allow log replay. |
 
 > [!NOTE]
 > If you implement a custom `JsonHandler` or `ParquetHandler`, call

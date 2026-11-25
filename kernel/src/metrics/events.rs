@@ -105,7 +105,7 @@ pub enum MetricEvent {
     SetTransactionLoadSuccess(SetTransactionLoadSuccess),
     SetTransactionLoadFailure,
     CrcReadSuccess(CrcReadSuccess),
-    CrcReadFailure,
+    CrcReadFailure(CrcReadFailure),
     LastCheckpointReadCompleted(LastCheckpointReadCompleted),
     CheckpointWriteSuccess(CheckpointWriteSuccess),
     CheckpointWriteFailure(CheckpointWriteFailure),
@@ -151,7 +151,7 @@ impl MetricEvent {
             Self::TransactionCommitFailure(_)
             | Self::DomainMetadataLoadFailure
             | Self::SetTransactionLoadFailure
-            | Self::CrcReadFailure => {}
+            | Self::CrcReadFailure(_) => {}
 
             // Read events have no duration field.
             Self::JsonReadCompleted(_) | Self::ParquetReadCompleted(_) => {}
@@ -186,7 +186,7 @@ impl MetricEvent {
             Self::TransactionCommitFailure(_) => Err(TransactionCommitSuccess::SPAN_NAME),
             Self::DomainMetadataLoadFailure => Err(DomainMetadataLoadSuccess::SPAN_NAME),
             Self::SetTransactionLoadFailure => Err(SetTransactionLoadSuccess::SPAN_NAME),
-            Self::CrcReadFailure => Err(CrcReadSuccess::SPAN_NAME),
+            Self::CrcReadFailure(_) => Err(CrcReadSuccess::SPAN_NAME),
             Self::CheckpointWriteFailure(_) => Err(CheckpointWriteSuccess::SPAN_NAME),
             Self::ChecksumWriteFailure(_) => Err(ChecksumWriteSuccess::SPAN_NAME),
         }
@@ -221,7 +221,7 @@ impl MetricEvent {
             Self::TransactionCommitFailure(_) => Err(TransactionCommitSuccess::SPAN_NAME),
             Self::DomainMetadataLoadFailure => Err(DomainMetadataLoadSuccess::SPAN_NAME),
             Self::SetTransactionLoadFailure => Err(SetTransactionLoadSuccess::SPAN_NAME),
-            Self::CrcReadFailure => Err(CrcReadSuccess::SPAN_NAME),
+            Self::CrcReadFailure(_) => Err(CrcReadSuccess::SPAN_NAME),
             Self::CheckpointWriteFailure(_) => Err(CheckpointWriteSuccess::SPAN_NAME),
             Self::ChecksumWriteFailure(_) => Err(ChecksumWriteSuccess::SPAN_NAME),
         }
@@ -232,6 +232,13 @@ impl MetricEvent {
             return e.record_str(name, value);
         }
         if name == "failure_reason" {
+            if matches!(self, Self::CrcReadSuccess(_) | Self::CrcReadFailure(_)) {
+                let reason = value.parse::<CrcReadFailureReason>();
+                *self = Self::CrcReadFailure(CrcReadFailure {
+                    reason: reason.unwrap_or(CrcReadFailureReason::Error),
+                });
+                return reason.map(|_| ()).map_err(|_| CrcReadSuccess::SPAN_NAME);
+            }
             if let Self::TransactionCommitSuccess(e) = self {
                 let operation_id = e.operation_id;
                 let table_type = e.table_type;
@@ -292,7 +299,9 @@ impl MetricEvent {
             }
             Self::DomainMetadataLoadSuccess(_) => Self::DomainMetadataLoadFailure,
             Self::SetTransactionLoadSuccess(_) => Self::SetTransactionLoadFailure,
-            Self::CrcReadSuccess(_) => Self::CrcReadFailure,
+            Self::CrcReadSuccess(_) => Self::CrcReadFailure(CrcReadFailure {
+                reason: CrcReadFailureReason::Error,
+            }),
             Self::LastCheckpointReadCompleted(mut e) => {
                 if e.outcome == LastCheckpointReadOutcome::Unknown {
                     e.outcome = LastCheckpointReadOutcome::Error;
@@ -322,7 +331,7 @@ impl MetricEvent {
             | Self::TransactionCommitFailure(_)
             | Self::DomainMetadataLoadFailure
             | Self::SetTransactionLoadFailure
-            | Self::CrcReadFailure
+            | Self::CrcReadFailure(_)
             | Self::CheckpointWriteFailure(_)
             | Self::ChecksumWriteFailure(_)
             | Self::JsonReadCompleted(_)
@@ -351,7 +360,7 @@ impl fmt::Display for MetricEvent {
             Self::SetTransactionLoadSuccess(e) => e.fmt(f),
             Self::SetTransactionLoadFailure => f.write_str("SetTransactionLoadFailure"),
             Self::CrcReadSuccess(e) => e.fmt(f),
-            Self::CrcReadFailure => f.write_str("CrcReadFailure"),
+            Self::CrcReadFailure(e) => e.fmt(f),
             Self::LastCheckpointReadCompleted(e) => e.fmt(f),
             Self::CheckpointWriteSuccess(e) => e.fmt(f),
             Self::CheckpointWriteFailure(e) => e.fmt(f),
@@ -1493,6 +1502,38 @@ impl fmt::Display for CrcReadSuccess {
             f,
             "CrcReadSuccess(duration={duration:?}, bytes={bytes_read})"
         )
+    }
+}
+
+/// Why an attempted CRC read could not provide a usable checksum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, StrumDisplay, AsRefStr, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+#[non_exhaustive]
+pub enum CrcReadFailureReason {
+    /// Storage reported that the requested CRC file was absent.
+    NotFound,
+    /// Storage returned no data or a zero-byte file.
+    Empty,
+    /// The file could not be decoded or failed CRC validation.
+    Parsing,
+    /// The read failed for another reason.
+    Error,
+    /// The read was cancelled; cancellation propagates instead of falling back.
+    Cancelled,
+}
+
+/// An attempted CRC read failed. Non-cancellation failures allow the caller to replay the log.
+///
+/// An absent CRC in a log listing does not cause a read attempt or emit this event.
+#[derive(Debug, Clone)]
+pub struct CrcReadFailure {
+    /// The reason the CRC could not be used.
+    pub reason: CrcReadFailureReason,
+}
+
+impl fmt::Display for CrcReadFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CrcReadFailure(reason={})", self.reason)
     }
 }
 
