@@ -11,7 +11,7 @@ Contributor disclosures belong in [`AI_POLICY.md`](../../../AI_POLICY.md).
 | --- | --- |
 | GitHub Actions workflow | Shell commands fetch PR inputs and call GitHub; Python builds task messages, validates model output and prepares requests/reports. |
 | Omnigent | Start model sessions, supply tools and carry assignments/results between sessions. |
-| Orchestrator | Select Reviewer subagents, assign their work, request checking and write the orchestrator report. |
+| Orchestrator | Dispatch every configured Reviewer subagent, assign their work, request checking and write the orchestrator report. |
 | Reviewer subagent | A separate model session reviewing architecture, protocol, maintainer concerns, tests or docs. |
 | Checker subagent | The separate `disprove-reviewer` model session that challenges supplied candidate findings. |
 
@@ -70,8 +70,8 @@ between them. Every ORCHESTRATOR box below represents the same model session at 
                                                v
              +-------------------------------------------------------------------+
              | (2) ORCHESTRATOR MODEL SESSION                                    |
-             | Select relevant Reviewer subagents; docs-reviewer is required.    |
-             | Write an assignment for each selected role.                       |
+             | Dispatch every configured Reviewer subagent.    |
+             | Write an assignment for each configured Reviewer role.                       |
              +-------------------------------------------------------------------+
                                                | sys_session_send: role + assignment
                                                v
@@ -82,8 +82,8 @@ between them. Every ORCHESTRATOR box below represents the same model session at 
              | Include trusted root AGENTS.md for the two maintainer roles only. |
              | Start each selected subagent with its configured instructions.    |
              +-------------------------------------------------------------------+
-                                               | task message for each selected role
-        (4) AVAILABLE REVIEWER SUBAGENTS: DOCS + OTHER SELECTED RELEVANT ROLES
+                                               | task message for each configured Reviewer role
+        (4) CONFIGURED REVIEWER SUBAGENTS: DISPATCH EVERY ROLE
                                                |
        +---------------+---------------+-------+-------+---------------+---------------+
        |               |               |               |               |               |
@@ -139,14 +139,17 @@ checker task before publishing any Blocker or Should Fix, and prohibit separate 
 reviewer or per finding. The checker runs in its own model session, separately from the Reviewer
 subagents. Separate sessions can use the same underlying model.
 
-The orchestrator must select Docs and the other relevant reviewers.
-Before returning an orchestrator report for publication, it must receive completed
-results from at least one maintainer and one other Reviewer subagent.
-A failed reviewer gets one retry after the other in-flight reviewers finish.
-The orchestrator waits for every dispatched reviewer to finish or exhaust that retry,
-and for any required checker result. It lists reviewers still unavailable after
-retry in the Summary. These are model instructions; workflow Python does not
-independently verify reviewer completion.
+The orchestrator dispatches every configured Reviewer subagent, including Docs. Before returning
+an orchestrator report for publication, it must receive completed results from at least one
+maintainer and one other Reviewer subagent. A failed reviewer gets one retry after the other
+in-flight reviewers finish. The orchestrator waits for every dispatched reviewer to finish or
+exhaust that retry, and for any required Checker result. It lists reviewers still unavailable
+after retry in the Summary.
+
+These publication requirements are model instructions. After publication, Python independently
+records whether every configured Reviewer result and required Checker decision arrived. Missing
+results leave the execution record incomplete even when the report met the publication quorum.
+See [Review execution record](#review-execution-record).
 
 ### Source reads during model review
 
@@ -375,55 +378,60 @@ PR change patch and shared PR task text with seven-day retention.
 | `/tmp/review_output_complete.txt` | Publication step | Summary, artifact and Check Run outputs include all parsed final findings. |
 | `/tmp/check-summary.txt` | Publication step or diagnostic path | Check Run reads the assessment and findings, resolver error or generic unavailable message. |
 
-## Reviewer task results and candidate-finding tracking
+## Reviewer results, Checker results and consolidation outcomes
 
-All configured primary reviewers run. A specialist with no applicable concern returns an
-explicit empty candidate-finding list. Each proposed concern receives a reviewer-local ID such
-as `C1`, where `C` means candidate. `docs-reviewer/C1` and `maintainer-codex-reviewer/C1` identify
-different concerns. This pair lets Python check that no proposed concern disappeared when the
-orchestrator combined reviewers' results.
+The orchestrator dispatches every configured Reviewer subagent. A specialist with no applicable
+concern returns a Reviewer result with an explicit empty candidate-finding list. Each candidate
+finding receives a reviewer-local ID such as `C1`. `docs-reviewer/C1` and
+`maintainer-codex-reviewer/C1` identify different concerns. Python uses that pair to track each
+candidate finding through checking and final selection.
 
-The orchestrator sends all proposed Blocker and Should Fix findings in one checker batch, as
-required by its instructions. Each reviewer/ID pair receives a distinct batch ID such as `check1`.
-`disprove-reviewer` returns a decision for every batch ID. There are zero checker batches when
-no Blocker or Should Fix was proposed, otherwise one batch for the complete set. Nits bypass
-this checker task. A checker decision of `CONFIRMED` concerns the claim; it does not confirm
-that a GitHub comment was posted.
+The orchestrator sends all Blocker and Should Fix candidate findings in one Checker assignment.
+Each Reviewer subagent/ID pair receives a distinct batch ID such as `check1`. The Checker result
+contains a decision for every batch ID. If that candidate set is empty, the orchestrator skips
+the Checker subagent. Nits bypass checking. The Checker result records each batch ID and its `decision` in a `decisions` list. `CONFIRMED` means that the Checker supports the
+claim; it does not establish that a GitHub comment exists.
 
-The orchestrator returns a candidate-to-final mapping for every proposed concern, including Nits:
+The orchestrator returns a consolidation outcome for every candidate finding, including Nits:
 `retained` keeps it, `downgraded` lowers its severity, `merged` combines it with another concern,
 and `dropped` removes it with a reason. The other outcomes name a final finding ID. For example,
 `docs-reviewer/C1` and `maintainer-codex-reviewer/C1` can both map to `ShouldFix1`, with a reason
 explaining the combination. Python then posts or reuses one comment and counts one final finding.
 
-[`observe_review()`](../review_evidence.py) records Omnigent session-dispatch and task-result
-events without modifying the tool calls. A **reviewer attempt** is a dispatched task; retries
-remain separate attempts. A **reviewer task result** is the response Omnigent delivers for a
-child session. The observer records when it receives the event, not the reviewer's actual
-execution end time. An empty inbox, the overall process exit, or the orchestrator saying
-"everyone finished" cannot substitute for that result.
+[`observe_review()`](../review_evidence.py) records dispatches, accepted session IDs and subagent
+result events from Omnigent without modifying the tool calls. A **subagent attempt** is one
+dispatch to a Reviewer or Checker session; a retry is a separate attempt. A result event can
+contain a completed Reviewer result, a completed Checker result or a failure. The observer
+records when it receives each event. It does not know the subagent's actual execution end time.
+An empty inbox, the overall process exit or an orchestrator statement cannot establish that a
+Reviewer or Checker result arrived.
 
-[`build_evidence()`](../review_evidence.py) matches task results to accepted child-session IDs
-and reviewer roles. It checks that each candidate finding has the required checker decision,
-final-finding mapping and confirmed comment URL, or an explicit summary/artifact report output.
-Missing or conflicting events, mappings or comment results leave the record incomplete. The
-orchestrator can still return useful advice after the minimum reviewer quorum described in
-[`REVIEW.md`](REVIEW.md) completes; that does not make the execution record complete.
+After finding publication, [`build_execution_record()`](../review_evidence.py) matches result events to
+accepted session IDs and configured roles. It checks each candidate finding's Checker decision
+when required, consolidation outcome and final finding's confirmed comment URL or selected
+summary/artifact output. Missing or conflicting events, mappings or publication results leave
+the execution record incomplete. A complete record requires a valid Reviewer result from every
+configured Reviewer subagent.
+
+The orchestrator report follows a separate publication rule: at least one maintainer and one
+other Reviewer subagent must return completed results. Every dispatched subagent must finish or
+exhaust its retry, and every required Checker result must arrive. A report can satisfy that rule
+while the execution record remains incomplete because a configured Reviewer stayed unavailable.
+The execution record reports that gap after publication; it does not suppress those comments.
 
 | Runner file | Writer and purpose | Where maintainers read the result |
 |---|---|---|
-| `/tmp/review_observations.jsonl` | `observe_review` appends filtered child-session event metadata. | Combined into the execution record; raw model prose is discarded. |
-| `/tmp/review_accounting.json` | The workflow extracts the orchestrator's candidate-to-final mapping. | The execution record includes each proposed concern's outcome. |
+| `/tmp/review_observations.jsonl` | `observe_review` appends filtered dispatch, session and result-event metadata. | Combined into the execution record; result prose is discarded. |
+| `/tmp/review_accounting.json` | The workflow extracts the orchestrator's consolidation outcomes. | The execution record includes each candidate finding's outcome. |
 | `/tmp/publication_record.json` | `finding_publication.py` records finding-comment URLs and posting errors. | Finding links appear in the Check Run and execution record. Artifact mode also uploads this file. |
-| `/tmp/review_execution.json` | `review_evidence.py` combines attempts, checker decisions, finding mappings and comment results. | Downloadable execution artifact on the Actions run, retained for seven days. |
-| `/tmp/check-summary.txt` | Python appends reviewer-attempt and candidate-finding tables to the full review. | `AI Review Summary` in the PR's Checks tab. Its GitHub conclusion stays `neutral`. |
+| `/tmp/review_execution.json` | `review_evidence.py` combines subagent attempts, Checker decisions, consolidation outcomes and publication results. | Downloadable execution artifact on the Actions run, retained for seven days. |
+| `/tmp/check-summary.txt` | Python appends subagent-attempt and candidate-finding tables to the orchestrator report. | `AI Review Summary` in the PR's Checks tab. Its GitHub conclusion stays `neutral`. |
 
-The execution artifact excludes full model responses, environment values and tool payloads.
-[`history_evidence()`](../review_history.py) separately records trusted earlier Blockers and the
-commits they reviewed. Failed history requests, missing pages, clipped text or unknown Blocker
-origins leave history incomplete. Finding an earlier concern does not establish that it still
-applies to a different commit.
-
+The execution artifact excludes full model responses, environment values and full tool payloads.
+[`history_evidence()`](../review_history.py) separately records earlier final Blockers from
+trusted bot comments and the commits they reviewed. Failed history requests, missing pages,
+clipped text or unknown Blocker origins leave history incomplete. An earlier final finding does
+not establish that the concern still applies to a different commit.
 
 ### Finding comments and confirmed comment URLs
 
@@ -516,7 +524,7 @@ and a `REVIEW.md` names it with a placeholder line. The line `${review_rules}` s
 | `${pr_description}` | PR description accuracy | The orchestrator and `docs-reviewer` |
 | `${maintainer}` | The maintainer role and review criteria | Both maintainer reviewers |
 | `${ci_environment}` | CI restrictions | Every subagent except `disprove-reviewer` |
-| `${candidate_results}` | Explicit candidate IDs and severities, including empty returns | Every primary reviewer |
+| `${candidate_results}` | Explicit candidate IDs and severities, including empty returns | Every Reviewer subagent |
 
 For example, `agents/docs-reviewer/REVIEW.md` reads:
 

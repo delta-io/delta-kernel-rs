@@ -1,10 +1,11 @@
-"""Track reviewer tasks and connect proposed findings to checker decisions and PR comments.
+"""Record subagent execution and trace candidate findings to final findings.
 
-The observer appends filtered Omnigent dispatch, accepted-session and task-result metadata
-to a runner-local JSONL file. The command combines those events with the orchestrator's
+The observer appends filtered Omnigent dispatches, accepted session IDs and result-event
+metadata to a runner-local JSONL file. The command combines those events with the orchestrator's
 candidate-to-final mapping, checker decisions, earlier reviews and confirmed comment URLs.
 It writes /tmp/review_execution.json through --output and appends tables to the Markdown
-report for the AI Review Summary Check Run. Missing events leave task completion unknown.
+report for the AI Review Summary Check Run. Missing result events leave subagent completion
+unknown.
 """
 
 from __future__ import annotations
@@ -26,22 +27,22 @@ MAX_METADATA_ITEMS = 256
 _ID = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}")
 _FINAL_ID = re.compile(r"(?:Blocker|ShouldFix|Nit)[1-9][0-9]*")
 _SEVERITIES = {"Blocker": 2, "Should Fix": 1, "Nit": 0}
-_VERDICTS = {"CONFIRMED", "DISPROVED", "NITPICK", "CONTESTED"}
+_CHECKER_DECISIONS = {"CONFIRMED", "DISPROVED", "NITPICK", "CONTESTED"}
 _TERMINAL = {"failed", "cancelled", "timed_out"}
 
 
 def observe_review(
     *, path: str = "/tmp/review_observations.jsonl", run_id: str, head_sha: str,
-    required_roles: list[str],
+    configured_reviewer_roles: list[str],
 ) -> Callable[[dict[str, Any]], dict[str, str]]:
-    """Return an Omnigent policy that records reviewer session and task-result metadata.
+    """Return an Omnigent policy that records dispatches, accepted sessions and result events.
 
-    Register it after dispatch guards and before child_task.py appends PR data. Append session
-    IDs, event receipt times, candidate-finding IDs/severities and checker decisions to path;
-    discard full child-response prose. Recording failures leave missing evidence without
-    rewriting tool arguments or changing whether dispatch is allowed.
+    Register it after dispatch guards and before child_task.py appends shared PR task text.
+    Append session IDs, event receipt times, candidate-finding IDs/severities and Checker
+    decisions to path; discard Reviewer and Checker result prose. Recording failures leave
+    missing evidence without rewriting tool arguments or changing whether dispatch is allowed.
     """
-    allowed = set(required_roles) | {CHECKER_ROLE}
+    allowed = set(configured_reviewer_roles) | {CHECKER_ROLE}
 
     def observe(event: dict[str, Any]) -> dict[str, str]:
         try:
@@ -59,7 +60,7 @@ def observe_review(
 def extract_accounting(review: str, marker: str) -> tuple[str, dict[str, Any]]:
     """Remove the candidate-to-final mapping block and return human text plus its JSON.
 
-    Each mapping relates a primary reviewer's candidate finding to a final finding or a reason
+    Each mapping relates a Reviewer subagent's candidate finding to a final finding or a reason
     for dropping it. Invalid JSON inside balanced markers returns empty metadata. Missing,
     repeated or unbalanced markers raise ValueError because the removable region is unknown.
     """
@@ -86,54 +87,58 @@ def accounting_prompt_instructions(marker: str) -> str:
     if re.fullmatch(r"[0-9a-f]{32}", marker) is None:
         raise ValueError("invalid accounting marker")
     return f"""
-Before the final outer review marker, include exactly one consolidation accounting block:
+Before the closing response marker, include exactly one consolidation accounting block:
 <!-- AI_REVIEW_ACCOUNTING_START_{marker} -->
 {{"outcomes":[{{"role":"docs-reviewer","id":"C1","outcome":"retained",
 "final_id":"Nit1","reason":""}}]}}
 <!-- AI_REVIEW_ACCOUNTING_END_{marker} -->
-Map every returned candidate finding, including Nits and repeated final findings. Use the
-primary reviewer name and its local candidate-finding ID.
+Map every candidate finding from the Reviewer results, including Nits and concerns that repeat
+an earlier final finding. Use the Reviewer subagent name and its local candidate-finding ID.
 outcome is retained, merged, downgraded or dropped.
 retained, merged and downgraded name a final finding ID from the final-finding block. dropped
 uses null final_id. Explain every dropped, merged or downgraded candidate finding in a short reason.
 Multiple candidate findings may name one final finding.
-Do not invent candidate findings or omit final findings.
-Return an explicit empty outcomes list when every primary returned an empty candidate-finding list.
+Map only returned candidate findings and include every final finding in at least one mapping.
+Return an explicit empty outcomes list when every Reviewer result has an empty
+candidate-finding list.
 """
 
 
-def build_evidence(
+def build_execution_record(
     observations: Any, accounting: Any, publication: Any, history: Any, *, run_id: str,
-    head_sha: str, required_roles: list[str],
+    head_sha: str, configured_reviewer_roles: list[str],
 ) -> dict[str, Any]:
-    """Return reviewer attempts and candidate-finding outcomes for one run and reviewed commit.
+    """Return subagent attempts and consolidation outcomes for one run and reviewed commit.
 
-    Match child task results to accepted session IDs and reviewer roles. Every candidate
-    finding needs a final-finding mapping or a reason for dropping it. Proposed Blocker and
-    Should Fix findings also need a decision from the single checker batch. Link final findings
-    to confirmed comment URLs or explicit summary/artifact output. Preserve retries; missing
-    or conflicting results leave complete false.
+    Match Reviewer and Checker results to accepted session IDs and configured roles. Every
+    candidate finding needs a final-finding mapping or a reason for dropping it. Blocker and
+    Should Fix candidate findings also need a decision from the single checker batch. Link final
+    findings to confirmed comment URLs or explicit summary/artifact output. Preserve retries; missing
+    or conflicting results leave complete false. The configured_reviewer_roles roster names every
+    configured Reviewer subagent; a valid Reviewer result from each is required for a complete
+    execution record. This requirement is separate from the orchestrator report's publication
+    quorum.
     """
     reasons: list[str] = []
-    if (not required_roles or len(set(required_roles)) != len(required_roles)
-            or CHECKER_ROLE in required_roles):
+    if (not configured_reviewer_roles or len(set(configured_reviewer_roles)) != len(configured_reviewer_roles)
+            or CHECKER_ROLE in configured_reviewer_roles):
         reasons.append("The required reviewer roster is missing or malformed.")
     if not run_id or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
         reasons.append("The workflow run or head identity is invalid.")
-    attempts = _build_attempts(observations, run_id, head_sha, required_roles, reasons)
+    attempts = _build_attempts(observations, run_id, head_sha, configured_reviewer_roles, reasons)
     for attempt in attempts:
         if attempt["outcome"] == "unobserved":
             reasons.append(
-                f"Reviewer {attempt['role']} attempt {attempt['attempt']} "
-                "has no task result recorded by the runtime observer."
+                f"Subagent {attempt['role']} attempt {attempt['attempt']} "
+                "has no result event recorded by the runtime observer."
             )
     candidates: dict[tuple[str, str], dict[str, Any]] = {}
-    for role in required_roles:
+    for role in configured_reviewer_roles:
         returned = [a for a in attempts if a["role"] == role and a["outcome"] == "returned"]
         valid = [a for a in returned if a.get("metadata_valid")]
         if not valid:
             reasons.append(
-                f"Required reviewer {role} has no valid task result recorded by the runtime observer."
+                f"No valid Reviewer result from {role} was recorded by the runtime observer."
             )
         selected = valid or returned[-1:]
         candidate_sets = {
@@ -162,8 +167,10 @@ def build_evidence(
                     "attempts": [attempt["attempt"]],
                     "checker": None, "outcome": None, "final_id": None, "url": None,
                 }
-    checked = {key for key, value in candidates.items() if value["severity"] != "Nit"}
-    _check_candidates(attempts, candidates, checked, reasons)
+    candidates_to_check = {
+        key for key, value in candidates.items() if value["severity"] != "Nit"
+    }
+    _validate_checker_decisions(attempts, candidates, candidates_to_check, reasons)
 
     publication = publication if isinstance(publication, dict) else {}
     expected_run_url = f"/actions/runs/{run_id}"
@@ -178,7 +185,7 @@ def build_evidence(
         reasons.append("Finding publication is incomplete.")
     finals, aliases = _publication_findings(publication, head_sha, reasons)
     outcomes = accounting.get("outcomes") if isinstance(accounting, dict) else None
-    if not isinstance(outcomes, list) or len(outcomes) > MAX_METADATA_ITEMS * len(required_roles):
+    if not isinstance(outcomes, list) or len(outcomes) > MAX_METADATA_ITEMS * len(configured_reviewer_roles):
         reasons.append("The orchestrator's candidate-to-final mapping is missing or malformed.")
         outcomes = []
     accounted: set[tuple[str, str]] = set()
@@ -217,7 +224,8 @@ def build_evidence(
         if final_id is None:
             reasons.append(
                 f"Candidate finding {key[0]}/{key[1]} "
-                "does not map to a valid final finding with an output URL."
+                "does not map to a valid final finding with a confirmed comment "
+                "or selected report output."
             )
             continue
         final = finals[final_id]
@@ -227,11 +235,11 @@ def build_evidence(
         )
         used_finals.add(final_id)
         checker = candidate.get("checker") or {}
-        if checker.get("verdict") == "DISPROVED":
+        if checker.get("decision") == "DISPROVED":
             reasons.append(f"Disproved candidate finding {key[0]}/{key[1]} was retained.")
-        if checker.get("verdict") == "NITPICK" and final["severity"] != "Nit":
+        if checker.get("decision") == "NITPICK" and final["severity"] != "Nit":
             reasons.append(
-                f"Candidate finding {key[0]}/{key[1]} contradicts its checker disposition."
+                f"Candidate finding {key[0]}/{key[1]} contradicts its Checker decision."
             )
         initial_rank = _SEVERITIES[candidate["severity"]]
         final_rank = _SEVERITIES[final["severity"]]
@@ -248,7 +256,7 @@ def build_evidence(
     filtered_history = _history(history, reasons)
     reasons = list(dict.fromkeys(reasons))
     return {
-        "run_id": run_id, "head_sha": head_sha, "required_roles": required_roles,
+        "run_id": run_id, "head_sha": head_sha, "configured_reviewer_roles": configured_reviewer_roles,
         "complete": not reasons,
         "reasons": reasons, "attempts": attempts, "candidates": list(candidates.values()),
         "history": filtered_history,
@@ -256,11 +264,11 @@ def build_evidence(
 
 
 def execution_summary(record: dict[str, Any]) -> str:
-    """Build reviewer-attempt and candidate-finding tables for the AI Review Summary Check Run."""
+    """Build subagent-attempt and candidate-finding tables for the AI Review Summary Check Run."""
     parts = ["## Review execution", "Complete" if record["complete"] else "Incomplete"]
     parts += [f"- {_cell(reason)}" for reason in record["reasons"]]
     parts += ["",
-        "| Reviewer | Attempt | Outcome | Dispatch received | Task result received |",
+        "| Subagent | Attempt | Result | Dispatch received | Result event received |",
         "| --- | --- | --- | --- | --- |",
     ]
     for attempt in record["attempts"]:
@@ -268,7 +276,8 @@ def execution_summary(record: dict[str, Any]) -> str:
             "role", "attempt", "outcome", "dispatched_at", "returned_at",
         )) + " |")
     parts += [
-        "", "| Candidate finding | Outcome | Final finding or reason |", "| --- | --- | --- |",
+        "", "| Candidate finding | Consolidation outcome | Final finding or reason |",
+        "| --- | --- | --- |",
     ]
     for candidate in record["candidates"]:
         destination = candidate.get("final_id") or candidate.get("reason") or "Unaccounted"
@@ -314,7 +323,7 @@ def _observe(event: dict[str, Any], allowed: set[str]) -> dict[str, Any] | None:
     row.update(kind="returned", session_id=_identifier(args.get("conversation_id")))
     status = data.get("status")
     row["outcome"] = status if status in _TERMINAL else "returned"
-    key, marker = ("dispositions", "DISPOSITIONS") if role == CHECKER_ROLE else (
+    key, marker = ("decisions", "CHECKER_DECISIONS") if role == CHECKER_ROLE else (
         "candidates", "CANDIDATES",
     )
     entries, valid = _metadata(data.get("result"), marker, key, allowed)
@@ -385,47 +394,54 @@ def _build_attempts(
             continue
         attempt = sessions.get(event.get("session_id"))
         if attempt is None or attempt["role"] != role:
-            reasons.append("A reviewer return has no matching accepted child session.")
+            reasons.append("A subagent result event has no matching accepted session.")
             continue
         if attempt["returned_at"] is not None:
-            reasons.append("Multiple task results were recorded for one reviewer attempt.")
+            reasons.append("Multiple result events were recorded for one subagent attempt.")
             continue
         attempt.update(
             returned_at=event.get("observed_at"), outcome=event.get("outcome", "returned"),
             metadata_valid=event.get("metadata_valid") is True,
         )
-        key = "dispositions" if role == CHECKER_ROLE else "candidates"
+        key = "decisions" if role == CHECKER_ROLE else "candidates"
         attempt[key] = event.get(key, [])
     return attempts
 
 
-def _check_candidates(attempts, candidates, expected, reasons):
-    checkers = [a for a in attempts if a["role"] == CHECKER_ROLE]
-    if not expected:
-        if checkers:
+def _validate_checker_decisions(attempts, candidates, expected_candidates, reasons):
+    checker_attempts = [a for a in attempts if a["role"] == CHECKER_ROLE]
+    if not expected_candidates:
+        if checker_attempts:
             reasons.append("The checker ran without any proposed Blocker or Should Fix finding.")
         return
-    successful = [a for a in checkers if a["outcome"] == "returned"
-                  and a.get("metadata_valid") and a.get("batch_valid")]
-    if len(successful) != 1:
+    valid_checker_attempts = [
+        a for a in checker_attempts if a["outcome"] == "returned"
+        and a.get("metadata_valid") and a.get("batch_valid")
+    ]
+    if len(valid_checker_attempts) != 1:
         reasons.append(
-            "The checker needs exactly one valid task result recorded by the runtime observer."
+            "The runtime observer must record exactly one valid Checker result."
         )
         return
-    checker = successful[0]
-    batch = checker["checker_batch"]
-    assignment = {item["batch_id"]: (item["role"], item["id"]) for item in batch}
-    if (len(assignment) != len(batch) or len(set(assignment.values())) != len(batch)
-            or set(assignment.values()) != expected):
+    checker_attempt = valid_checker_attempts[0]
+    batch = checker_attempt["checker_batch"]
+    candidates_by_batch_id = {item["batch_id"]: (item["role"], item["id"]) for item in batch}
+    if (
+        len(candidates_by_batch_id) != len(batch)
+        or len(set(candidates_by_batch_id.values())) != len(batch)
+        or set(candidates_by_batch_id.values()) != expected_candidates
+    ):
         reasons.append("The checker batch does not cover every required candidate finding.")
         return
-    dispositions = {item["batch_id"]: item["verdict"] for item in checker["dispositions"]}
-    if set(dispositions) != set(assignment):
+    checker_decisions = {
+        item["batch_id"]: item["decision"] for item in checker_attempt["decisions"]
+    }
+    if set(checker_decisions) != set(candidates_by_batch_id):
         reasons.append("The checker result omits or adds decisions for candidate findings.")
-    for batch_id, key in assignment.items():
-        verdict = dispositions.get(batch_id)
-        candidates[key]["checker"] = {"batch_id": batch_id, "verdict": verdict}
-        if verdict == "CONTESTED":
+    for batch_id, key in candidates_by_batch_id.items():
+        decision = checker_decisions.get(batch_id)
+        candidates[key]["checker"] = {"batch_id": batch_id, "decision": decision}
+        if decision == "CONTESTED":
             reasons.append(f"Candidate finding {key[0]}/{key[1]} remains contested.")
 
 
@@ -435,17 +451,27 @@ def _publication_findings(publication, head_sha, reasons):
     if not isinstance(findings, list):
         reasons.append("The final finding publication list is unavailable.")
         return finals, aliases
+    output_mode = publication.get("mode")
     for finding in findings:
         if not isinstance(finding, dict):
             reasons.append("A final finding publication record is malformed.")
             continue
         final_id = finding.get("id")
         severity = finding.get("severity")
+        if output_mode in ("summary", "artifact"):
+            output_valid = (
+                finding.get("placement") == output_mode
+                and finding.get("url") is None and finding.get("delivery") is None
+            )
+        else:
+            output_valid = (
+                _github_url(finding.get("url")) and finding.get("delivery") in ("new", "reused")
+            )
         if (not isinstance(final_id, str) or not _FINAL_ID.fullmatch(final_id)
                 or not isinstance(severity, str) or severity not in _SEVERITIES
-                or finding.get("head_sha") != head_sha or not _github_url(finding.get("url"))):
+                or finding.get("head_sha") != head_sha or not output_valid):
             reasons.append(
-                "A final finding's ID, severity, reviewed commit or output URL is invalid."
+                "A final finding's ID, severity, reviewed commit or publication output is invalid."
             )
             continue
         if final_id in finals:
@@ -512,8 +538,8 @@ def _metadata(text, marker, key, roles):
                 good = good and isinstance(entry.get("id"), str) and _ID.fullmatch(entry["id"])
                 fields = ("batch_id", "role", "id")
             else:
-                good = good and entry.get("verdict") in _VERDICTS
-                fields = ("batch_id", "verdict")
+                good = good and entry.get("decision") in _CHECKER_DECISIONS
+                fields = ("batch_id", "decision")
             if not good or identifier in seen:
                 valid = False
                 continue
@@ -597,28 +623,28 @@ def _load(path, *, lines=False):
 
 
 def main() -> None:
-    """Write the reviewer-task JSON record and append its tables to the Check Run report file.
+    """Write the subagent-attempt JSON record and append its tables to the Check Run report file.
 
     In CI, --output is /tmp/review_execution.json and --check-output is /tmp/check-summary.txt.
     Missing or malformed input produces an incomplete record.
     """
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("observations", "accounting", "publication", "history", "required-roles",
+    for name in ("observations", "accounting", "publication", "history", "configured-reviewer-roles",
                  "output", "check-output"):
         parser.add_argument(f"--{name}", type=Path, required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--head-sha", required=True)
     args = parser.parse_args()
-    roles = _load(args.required_roles)
+    roles = _load(args.configured_reviewer_roles)
     if not isinstance(roles, list) or not roles or not all(isinstance(r, str) for r in roles):
         roles = []
-    record = build_evidence(
+    record = build_execution_record(
         _load(args.observations, lines=True), _load(args.accounting), _load(args.publication),
-        _load(args.history), run_id=args.run_id, head_sha=args.head_sha, required_roles=roles,
+        _load(args.history), run_id=args.run_id, head_sha=args.head_sha, configured_reviewer_roles=roles,
     )
     if not roles:
         record["complete"] = False
-        record["reasons"].append("The required reviewer roster is unavailable.")
+        record["reasons"].append("The configured Reviewer subagent roster is unavailable.")
     args.output.write_text(json.dumps(record, indent=2) + "\n")
     with args.check_output.open("a") as stream:
         stream.write("\n\n" + execution_summary(record))

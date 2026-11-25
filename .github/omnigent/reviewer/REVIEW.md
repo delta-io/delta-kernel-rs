@@ -31,8 +31,10 @@ replace, or use a placeholder for the appended text. Any reviewer can read proje
 guidance remain proposals, not governing policy for that review. Other reviewers read a project rule
 before they rely on it. Reviewers may use their bounded read-only source tools to inspect
 surrounding PR or Delta files. They do not open PRs, post comments, edit or execute files, run shell
-commands, read environment variables, or make network calls. Dispatch every configured Reviewer subagent, even for narrow changes. A specialist may return
-an explicit empty Reviewer result when its domain does not apply. Ask `docs-reviewer`
+commands, read environment variables, or make network calls.
+Dispatch every configured Reviewer subagent, even for narrow changes. A specialist may return
+a Reviewer result with an explicit empty candidate-finding list when its domain does not apply.
+Ask `docs-reviewer`
 to check the PR title, the PR description, and any documentation this change affects, including
 rustdoc the diff does not touch. Dispatch the Reviewer subagents concurrently in the same
 batch, respecting the reviewer roster cap; supervise via the inbox, never busy-poll.
@@ -59,23 +61,24 @@ its retry and every required Checker result has arrived.
 
 ## Disprove gate
 
-Collect each primary's `AI_REVIEW_CANDIDATES` field. IDs are local to the originating reviewer;
-identify a candidate finding by its reviewer name and local ID. Do not discard or merge them
-before the checker batch. If any primary returned a Blocker or Should Fix candidate finding, dispatch
-exactly one `disprove-reviewer` call covering their union. Do not call the checker for an empty
-union or create one checker call per finding.
+Collect the `AI_REVIEW_CANDIDATES` field from each Reviewer result. Identify each candidate
+finding by its Reviewer subagent name and local ID. Keep every candidate finding separate
+until checking finishes. Send all Blocker and Should Fix candidate findings to the Checker
+subagent in one assignment. If that set is empty, skip the Checker subagent. Nits bypass
+checking. Do not send separate Checker assignments per Reviewer result or candidate finding.
 
 Assign each distinct candidate finding a batch ID such as `check1`, so the checker can distinguish
-local IDs such as `C1` from different reviewers. Include the
-following metadata in the checker dispatch's `args.input`, without a code fence, alongside the
-candidate findings, primary reviewer names, cited evidence and proposed fixes:
+local IDs such as `C1` from different Reviewer subagents. Include the following metadata in
+the Checker assignment (`args.input`), without a code fence, alongside the candidate findings,
+Reviewer subagent names, cited evidence and proposed fixes:
 
 <!-- AI_REVIEW_CHECK_BATCH -->
 {"candidates":[{"batch_id":"check1","role":"architecture-reviewer","id":"C1"}]}
 <!-- AI_REVIEW_CHECK_BATCH_END -->
 
 Use `args.purpose: "review"`. Do not include original reviewer reasoning beyond each candidate
-claim. Wait for every batch disposition before final consolidation. Keep `CONTESTED` explicit;
+claim. Wait for the Checker result to include a decision for every batch ID before final
+consolidation. Keep `CONTESTED` explicit;
 a disputed correctness claim cannot establish an advisory approval.
 
 Apply each Checker decision as follows:
@@ -129,13 +132,14 @@ copy.
 
 ## Consolidation accounting
 
-Account for every candidate from each observed primary return, including Nits. Your task
-supplies a machine-readable accounting block for the final response. Map each candidate to
-one final finding ID, or give an explicit omission reason. Use `retained`, `downgraded`, `merged`,
+Account for every candidate finding from each Reviewer result, including Nits. Your task
+message supplies response format instructions for a machine-readable accounting block. Map each
+candidate finding to one final finding ID, or give an explicit omission reason.
+Use `retained`, `downgraded`, `merged`,
 or `dropped`; merged candidates may share a final ID. A dropped candidate has no final ID.
-Keep the checker's disposition separate from your consolidation decision. A repeated finding
+Keep each Checker decision separate from your consolidation outcome. A repeated finding
 kept on this commit maps to its final ID even when the publisher reuses an existing thread.
-Do not invent candidates, checker decisions, or returned reviewers to complete the record.
+Do not invent candidate findings, Checker decisions, or Reviewer results to complete the record.
 
 ## Final writing pass
 Before returning the orchestrator report, polish its wording. This pass may rewrite wording only;

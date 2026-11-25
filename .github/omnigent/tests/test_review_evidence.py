@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).parents[1]))
 try:
     import review_evidence
     from review_evidence import (
-        CHECKER_ROLE, accounting_prompt_instructions, build_evidence, execution_summary,
+        CHECKER_ROLE, accounting_prompt_instructions, build_execution_record, execution_summary,
         extract_accounting, observe_review,
     )
 finally:
@@ -45,7 +45,7 @@ def role_events(role, candidates=None, *, attempt=1, output=None, batch=None, st
         "agent": role, "title": title, "args": {"input": assignment, "purpose": "review"},
     }
     if output is None:
-        marker, key = ("DISPOSITIONS", "dispositions") if role == CHECKER_ROLE else (
+        marker, key = ("CHECKER_DECISIONS", "decisions") if role == CHECKER_ROLE else (
             "CANDIDATES", "candidates",
         )
         output = metadata(marker, key, candidates or [])
@@ -82,7 +82,7 @@ def observe(events):
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "observations.jsonl"
         policy = observe_review(
-            path=str(path), run_id=RUN_ID, head_sha=HEAD_SHA, required_roles=ROLES,
+            path=str(path), run_id=RUN_ID, head_sha=HEAD_SHA, configured_reviewer_roles=ROLES,
         )
         for event in events:
             original = copy.deepcopy(event)
@@ -108,11 +108,11 @@ def final(finding_id, severity, *, delivery="new", aliases=None):
 
 
 def evidence(events=None, *, outcomes=None, published=None, history=None):
-    return build_evidence(
+    return build_execution_record(
         observe(empty_events() if events is None else events), {"outcomes": outcomes or []},
         publication() if published is None else published,
         {"complete": True, "reasons": [], "blockers": []} if history is None else history,
-        run_id=RUN_ID, head_sha=HEAD_SHA, required_roles=ROLES,
+        run_id=RUN_ID, head_sha=HEAD_SHA, configured_reviewer_roles=ROLES,
     )
 
 
@@ -129,12 +129,12 @@ def outcome(role=ARCH, candidate_id="C1", state="retained", final_id="Blocker1",
 
 def checker_events(batch, verdicts=None):
     if verdicts is None:
-        verdicts = [{"batch_id": entry["batch_id"], "verdict": "CONFIRMED"} for entry in batch]
+        verdicts = [{"batch_id": entry["batch_id"], "decision": "CONFIRMED"} for entry in batch]
     return role_events(CHECKER_ROLE, verdicts, batch=batch)
 
 
 class ReviewEvidenceTest(unittest.TestCase):
-    def test_all_primaries_return_explicit_empty_results_without_a_checker(self):
+    def test_all_reviewers_return_explicit_empty_results_without_a_checker(self):
         record = evidence()
 
         self.assertTrue(record["complete"], record["reasons"])
@@ -184,7 +184,7 @@ class ReviewEvidenceTest(unittest.TestCase):
         self.assertEqual(retained["attempts"], [1])
         reasons = " ".join(record["reasons"])
         self.assertIn("conflicting candidate-finding lists", reasons)
-        self.assertIn("checker", reasons)
+        self.assertIn("Checker result", reasons)
         self.assertIn("has no consolidation outcome", reasons)
 
     def test_conflicting_retry_severities_preserve_the_strongest_candidate_and_partial_state(self):
@@ -207,7 +207,7 @@ class ReviewEvidenceTest(unittest.TestCase):
                 retained = record["candidates"][0]
                 self.assertEqual(retained["severity"], "Blocker")
                 self.assertEqual(retained["attempts"], [1, 2])
-                self.assertEqual(retained["checker"]["verdict"], "CONFIRMED")
+                self.assertEqual(retained["checker"]["decision"], "CONFIRMED")
                 self.assertEqual(retained["final_id"], "Blocker1")
                 self.assertIn("conflicting severities", " ".join(record["reasons"]))
 
@@ -242,7 +242,7 @@ class ReviewEvidenceTest(unittest.TestCase):
         record = evidence(events)
 
         self.assertFalse(record["complete"])
-        self.assertIn("attempt 2 has no task result recorded", " ".join(record["reasons"]))
+        self.assertIn("attempt 2 has no result event recorded", " ".join(record["reasons"]))
 
     def test_missing_or_malformed_candidate_metadata_leaves_completion_partial(self):
         invalid_outputs = (
@@ -283,7 +283,7 @@ class ReviewEvidenceTest(unittest.TestCase):
             )
         ]
         verdicts = [
-            {"batch_id": entry["batch_id"], "verdict": verdict}
+            {"batch_id": entry["batch_id"], "decision": verdict}
             for entry, verdict in zip(batch, (
                 "CONFIRMED", "DISPROVED", "NITPICK", "CONFIRMED", "CONFIRMED",
             ))
@@ -311,7 +311,7 @@ class ReviewEvidenceTest(unittest.TestCase):
         self.assertIsNone(candidates[DOCS, "C3"]["checker"])
         self.assertIn("The premise was disproved.", execution_summary(record))
 
-    def test_blocker_requires_observed_checker_and_every_disposition(self):
+    def test_blocker_requires_a_checker_result_and_every_checker_decision(self):
         batch = [{"batch_id": "check1", "role": ARCH, "id": "C1"}]
         base = empty_events({ARCH: role_events(ARCH, [candidate()])})
         for extra in ([], checker_events(batch, [])):
@@ -326,7 +326,7 @@ class ReviewEvidenceTest(unittest.TestCase):
     def test_contested_correctness_remains_partial_with_a_visible_known_blocker(self):
         batch = [{"batch_id": "check1", "role": ARCH, "id": "C1"}]
         events = empty_events({ARCH: role_events(ARCH, [candidate()])})
-        events += checker_events(batch, [{"batch_id": "check1", "verdict": "CONTESTED"}])
+        events += checker_events(batch, [{"batch_id": "check1", "decision": "CONTESTED"}])
         record = evidence(
             events, outcomes=[outcome()], published=publication([final("Blocker1", "Blocker")]),
         )
@@ -354,9 +354,9 @@ class ReviewEvidenceTest(unittest.TestCase):
     def test_observation_size_limit_is_explicit_in_the_completion_record(self):
         with patch.object(review_evidence, "MAX_EVENTS_BYTES", 1):
             observations = observe(role_events(DOCS))
-        record = build_evidence(
+        record = build_execution_record(
             observations, {"outcomes": []}, publication(), {"complete": True},
-            run_id=RUN_ID, head_sha=HEAD_SHA, required_roles=ROLES,
+            run_id=RUN_ID, head_sha=HEAD_SHA, configured_reviewer_roles=ROLES,
         )
 
         self.assertFalse(record["complete"])
@@ -370,14 +370,67 @@ class ReviewEvidenceTest(unittest.TestCase):
             with self.subTest(published=published):
                 self.assertFalse(evidence(published=published)["complete"])
 
+    def test_summary_and_artifact_outputs_complete_without_claiming_comment_delivery(self):
+        events = empty_events({ARCH: role_events(ARCH, [candidate(severity="Nit")])})
+        for mode in ("summary", "artifact"):
+            with self.subTest(mode=mode):
+                finding = {
+                    **final("Nit1", "Nit"), "placement": mode, "url": None, "delivery": None,
+                }
+                published = {**publication([finding]), "mode": mode}
+
+                record = evidence(
+                    events, outcomes=[outcome(final_id="Nit1")], published=published,
+                )
+
+                self.assertTrue(record["complete"], record["reasons"])
+                retained = record["candidates"][0]
+                self.assertEqual(retained["final_id"], "Nit1")
+                self.assertEqual(retained["placement"], mode)
+                self.assertIsNone(retained["url"])
+                self.assertIsNone(retained["delivery"])
+
+    def test_pr_comment_outputs_require_a_confirmed_comment_url_and_delivery(self):
+        events = empty_events({ARCH: role_events(ARCH, [candidate(severity="Nit")])})
+        for mode in ("inline", "comment", "collapsed"):
+            for invalid in ({"url": None}, {"url": "unknown"}, {"delivery": None}):
+                with self.subTest(mode=mode, invalid=invalid):
+                    finding = {**final("Nit1", "Nit"), **invalid}
+                    record = evidence(
+                        events, outcomes=[outcome(final_id="Nit1")],
+                        published={**publication([finding]), "mode": mode},
+                    )
+
+                    self.assertFalse(record["complete"])
+                    self.assertIn("invalid", " ".join(record["reasons"]))
+
+    def test_report_outputs_reject_inconsistent_comment_metadata(self):
+        events = empty_events({ARCH: role_events(ARCH, [candidate(severity="Nit")])})
+        for mode in ("summary", "artifact"):
+            for invalid in (
+                {"url": "https://github.com/example/project/pull/1#discussion-1"},
+                {"delivery": "new"}, {"placement": "inline"},
+            ):
+                with self.subTest(mode=mode, invalid=invalid):
+                    finding = {
+                        **final("Nit1", "Nit"), "placement": mode,
+                        "url": None, "delivery": None, **invalid,
+                    }
+                    record = evidence(
+                        events, outcomes=[outcome(final_id="Nit1")],
+                        published={**publication([finding]), "mode": mode},
+                    )
+
+                    self.assertFalse(record["complete"])
+
     def test_wrong_run_or_head_cannot_supply_execution_or_publication_evidence(self):
         for key, value in (("run_id", "other"), ("head_sha", "b" * 40)):
             with self.subTest(key=key):
                 observations = observe(empty_events())
                 observations[0][key] = value
-                record = build_evidence(
+                record = build_execution_record(
                     observations, {"outcomes": []}, publication(), {"complete": True},
-                    run_id=RUN_ID, head_sha=HEAD_SHA, required_roles=ROLES,
+                    run_id=RUN_ID, head_sha=HEAD_SHA, configured_reviewer_roles=ROLES,
                 )
                 self.assertFalse(record["complete"])
         self.assertFalse(evidence(published={**publication(), "head_sha": "b" * 40})["complete"])
@@ -443,10 +496,10 @@ class ReviewEvidenceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             paths = {name: root / name for name in (
-                "observations", "accounting", "publication", "history", "required-roles",
+                "observations", "accounting", "publication", "history", "configured-reviewer-roles",
                 "output", "check-output",
             )}
-            paths["required-roles"].write_text(json.dumps(ROLES))
+            paths["configured-reviewer-roles"].write_text(json.dumps(ROLES))
             paths["check-output"].write_text("Existing full review.\n")
             args = ["review_evidence.py", "--run-id", RUN_ID, "--head-sha", HEAD_SHA]
             for name, path in paths.items():

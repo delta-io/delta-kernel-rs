@@ -1029,7 +1029,7 @@ jobs:
           reviewer_config = yaml.safe_load(
               pathlib.Path(".github/omnigent/reviewer/config.yaml").read_text()
           )
-          required_roles = [
+          configured_reviewer_roles = [
               role for role in reviewer_config["tools"]["agents"] if role != "disprove-reviewer"
           ]
           pr_metadata = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
@@ -1122,8 +1122,10 @@ jobs:
           The PR diff is included below. Fan the review out to your reviewer
           sub-agents per your roster, collect their findings, and consolidate
           them into one review following your output contract.
-          Required primary reviewers: {', '.join(required_roles)}. Dispatch all of them;
-          an explicit empty candidate list is a valid completed specialist review.
+          Configured Reviewer subagents: {', '.join(configured_reviewer_roles)}. Dispatch all of them.
+          A specialist with no applicable concern returns an explicit empty candidate-finding list.
+          The execution record requires valid Reviewer results from every configured role;
+          publication still follows the reviewer quorum and retry rules below.
 
           Each reviewer can use the bounded read-only source tools to inspect
           the exact PR source tree (`repository: pr`), the read-only Delta checkout
@@ -1155,11 +1157,11 @@ jobs:
           Track every dispatched reviewer by name. An empty inbox does not
           prove that all in-flight reviewers have completed. Do not emit a
           marked review until every dispatch has produced a result or exhausted
-          its retry and every required disprove gate has returned a verdict.
+          its retry and every required Checker result has arrived.
 
           Emit those markers only after every dispatched reviewer completed or
           exhausted its retry, reviewer quorum was reached, and every required
-          disprove gate returned a verdict. If quorum or a required gate fails,
+          Checker result arrived. If quorum or required checking fails,
           do not emit the start or end markers. Output only:
           <!-- AI_REVIEW_INCOMPLETE -->
           Failure code: dispatch_failed|reviewer_failed|disprove_failed|timeout|other
@@ -1195,7 +1197,7 @@ jobs:
           identity = {
               "run_id": os.environ["REVIEW_RUN_ID"],
               "head_sha": os.environ["HEAD_SHA"],
-              "required_roles": roles,
+              "configured_reviewer_roles": roles,
           }
           config["guardrails"]["policies"]["record_review_evidence"]["function"]["arguments"] = {
               "path": "/tmp/review_observations.jsonl", **identity,
@@ -1544,7 +1546,7 @@ jobs:
             --accounting /tmp/review_accounting.json \
             --publication /tmp/publication_record.json \
             --history /tmp/review_history_evidence.json \
-            --required-roles /tmp/required_reviewers.json \
+            --configured-reviewer-roles /tmp/required_reviewers.json \
             --run-id "$REVIEW_RUN_ID" \
             --head-sha "$HEAD_SHA" \
             --output /tmp/review_execution.json \
