@@ -167,7 +167,7 @@ def format_review_summary(
     confirmed = [finding for finding in findings if finding.get("url")]
     counts = Counter(finding["severity"] for finding in confirmed)
     headline = f"**{_finding_counts(counts)}**" if counts_available else "Finding counts unavailable."
-    parts = [BOT_MARKER, f"## {AI_REVIEW_TITLE}", headline, f"Reviewed `{head_sha[:8]}`"]
+    parts = [BOT_MARKER, f"## {AI_REVIEW_TITLE}", headline]
     if errors:
         parts.append("Publication incomplete: " + " ".join(dict.fromkeys(errors)))
     parts.append(
@@ -192,7 +192,10 @@ def format_review_summary(
             + "\n\n</details>"
         )
     checks_url = checks_url or run_url
-    parts.append(f"<sub>[Full AI review → Checks]({checks_url}) · [Workflow run]({run_url})</sub>")
+    parts.append(
+        f"<sub>Reviewed `{head_sha[:8]}` · [Full AI review → Checks]({checks_url})"
+        f" · [Workflow run]({run_url})</sub>"
+    )
     return "\n\n".join(parts)
 
 

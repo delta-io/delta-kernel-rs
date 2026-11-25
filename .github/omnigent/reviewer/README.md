@@ -397,8 +397,6 @@ hidden bot identifiers are omitted from this example.
 
 **🛑 2 Blockers · 🔧 1 Should Fix · 💡 2 Nits**
 
-Reviewed `<short commit SHA>`
-
 <details><summary>PR Summary</summary>
 
 <one paragraph explaining what the PR changes>
@@ -413,7 +411,8 @@ Reviewed `<short commit SHA>`
 
 </details>
 
-<sub>[Full AI review → Checks](<PR checks URL>) · [Workflow run](<workflow run URL>)</sub>
+<sub>Reviewed `<short SHA>` · [Full AI review → Checks](<PR checks URL>)
+· [Workflow run](<workflow run URL>)</sub>
 ```
 
 `Review Summary` links every final Blocker and Should Fix finding, including reused comments.
