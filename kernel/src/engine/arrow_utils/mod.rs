@@ -34,6 +34,7 @@ use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::ensure_data_types::DataTypeCompat;
 use crate::engine_data::FilteredEngineData;
 use crate::parquet::arrow::arrow_reader::ArrowReaderMetadata;
+use crate::parquet::arrow::arrow_writer::{ArrowWriter, ArrowWriterOptions};
 use crate::parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ProjectionMask};
 use crate::parquet::file::metadata::RowGroupMetaData;
 use crate::parquet::schema::types::SchemaDescriptor;
@@ -1672,6 +1673,22 @@ pub(crate) fn fixup_json_read(
 ) -> KernelResult<ArrowEngineData> {
     let data = reorder_struct_array(batch.into(), reorder_indices, None, Some(file_location))?;
     Ok(data.into())
+}
+
+/// Encodes batches as one complete Parquet file using the supplied writer options.
+#[internal_api]
+pub(crate) fn to_parquet_bytes(
+    schema: ArrowSchemaRef,
+    options: ArrowWriterOptions,
+    batches: impl KernelResultIterator<RecordBatch>,
+) -> KernelResult<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut writer = ArrowWriter::try_new_with_options(&mut bytes, schema, options)?;
+    for batch in batches {
+        writer.write(&batch?)?;
+    }
+    writer.close()?; // writer must be closed to write the footer
+    Ok(bytes)
 }
 
 /// Builds the [`ReorderIndex`] vec for post-processing JSON read batches.
