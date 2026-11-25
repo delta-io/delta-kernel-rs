@@ -142,6 +142,8 @@ use crate::{
 pub(crate) mod collation_stats;
 mod info;
 pub(crate) mod metrics;
+#[cfg(feature = "declarative-plans")]
+mod plan;
 mod sidecar;
 #[cfg(all(test, feature = "declarative-plans"))]
 mod spec_tests;
