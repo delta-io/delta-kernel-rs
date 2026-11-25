@@ -108,10 +108,12 @@ class FindingPublicationTest(unittest.TestCase):
         self.assertEqual(len(github.issues), 4)
         self.assertTrue(all(item["url"] for item in record["findings"]))
         main = github.issues[0]["body"]
-        order = ["## AI Review", "---", "0 Blockers · 1 Should Fix · 4 Nits", "Reviewed",
-                 "<summary>PR Summary", "<summary>Review Summary", "Full AI review"]
+        order = ["## AI Review", "🛑 0 Blockers · 🔧 1 Should Fix · 💡 4 Nits", "Reviewed",
+                 "<summary>PR Summary", "<summary>Review Summary", "<sub>[Full AI review"]
         offsets = [main.index(part) for part in order]
         self.assertEqual(offsets, sorted(offsets))
+        self.assertNotIn("\n---\n", main)
+        self.assertTrue(main.endswith(f"[Workflow run]({RUN_URL})</sub>"))
         self.assertNotIn("Coverage", main)
         self.assertNotIn("VERDICT", main)
         self.assertEqual(main.count("[Should Fix 1]"), 1)
@@ -134,7 +136,7 @@ class FindingPublicationTest(unittest.TestCase):
         retained = record["findings"][0]
         self.assertEqual(retained["id"], "Nit1")
         self.assertEqual(retained["aliases"], ["Nit2"])
-        self.assertIn("0 Blockers · 0 Should Fix · 1 Nits", github.issues[0]["body"])
+        self.assertIn("🛑 0 Blockers · 🔧 0 Should Fix · 💡 1 Nit", github.issues[0]["body"])
         check = publication_check("## PR Summary\nChanges a call.", record)
         self.assertIn("New finding comments: 1 · Reused finding comments: 0", check)
         self.assertEqual(check.count("A retained claim."), 1)

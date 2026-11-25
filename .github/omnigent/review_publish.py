@@ -148,13 +148,8 @@ def format_review_summary(
     """Build the main AI review Conversation comment from findings with confirmed comment URLs."""
     confirmed = [finding for finding in findings if finding.get("url")]
     counts = Counter(finding["severity"] for finding in confirmed)
-    headline = (
-        f"**{counts['Blocker']} Blockers · {counts['Should Fix']} Should Fix · "
-        f"{counts['Nit']} Nits**"
-        if counts_available
-        else "Finding counts unavailable."
-    )
-    parts = [BOT_MARKER, "## AI Review", "---", headline, f"Reviewed `{head_sha[:8]}`"]
+    headline = f"**{_finding_counts(counts)}**" if counts_available else "Finding counts unavailable."
+    parts = [BOT_MARKER, "## AI Review", headline, f"Reviewed `{head_sha[:8]}`"]
     if errors:
         parts.append("Publication incomplete: " + " ".join(dict.fromkeys(errors)))
     parts.append(
@@ -179,5 +174,12 @@ def format_review_summary(
             + "\n\n</details>"
         )
     checks_url = checks_url or run_url
-    parts.append(f"[Full AI review → Checks]({checks_url}) · [Workflow run]({run_url})")
+    parts.append(f"<sub>[Full AI review → Checks]({checks_url}) · [Workflow run]({run_url})</sub>")
     return "\n\n".join(parts)
+
+
+def _finding_counts(counts) -> str:
+    blockers, should_fix, nits = (counts[severity] for severity in ("Blocker", "Should Fix", "Nit"))
+    blocker_label = "Blocker" if blockers == 1 else "Blockers"
+    nit_label = "Nit" if nits == 1 else "Nits"
+    return f"🛑 {blockers} {blocker_label} · 🔧 {should_fix} Should Fix · 💡 {nits} {nit_label}"
