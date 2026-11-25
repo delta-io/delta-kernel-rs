@@ -1197,6 +1197,21 @@ impl TableConfiguration {
         self.ensure_operation_supported(Operation::Write)
     }
 
+    /// Returns an error if the table has a feature the kernel can only load. Metadata reads and
+    /// log maintenance call this because they don't go through the scan and write checks.
+    pub(crate) fn ensure_no_load_only_features(&self) -> KernelResult<()> {
+        let mut features = self
+            .get_enabled_writer_features()
+            .into_iter()
+            .chain(self.get_enabled_reader_features());
+        match features.find(TableFeature::is_load_only) {
+            Some(feature) => Err(KernelError::unsupported(format!(
+                "Feature '{feature}' is not supported"
+            ))),
+            None => Ok(()),
+        }
+    }
+
     /// Internal helper for read operations (Scan, Cdf, SnapshotLoad)
     fn ensure_read_supported(&self, operation: Operation) -> Result<()> {
         check_reader_version_range(&self.protocol)?;
@@ -1450,12 +1465,10 @@ mod test {
         ColumnMappingMode, FeatureType, Operation, TABLE_FEATURES_MIN_READER_VERSION,
         TABLE_FEATURES_MIN_WRITER_VERSION, TableFeature,
     };
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    use crate::table_properties::ENABLE_ICEBERG_NATIVE_V4;
     use crate::table_properties::{
         ENABLE_DELETION_VECTORS, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
-        ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
-        TableProperties,
+        ENABLE_ICEBERG_COMPAT_V3, ENABLE_ICEBERG_NATIVE_V4, ENABLE_IN_COMMIT_TIMESTAMPS,
+        ENABLE_ROW_TRACKING, TableProperties,
     };
     use crate::unit_test_utils::{
         MockProtocolBuilder, MockTableConfigurationBuilder, assert_result_error_with_message,
@@ -3078,20 +3091,113 @@ mod test {
         );
     }
 
-    #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+    /// A column-mapped table with `adaptive_metadata` and all its dependencies. When given,
+    /// `iceberg_native_v4` is enabled and listed first among the writer features, so write
+    /// checks reach it before `adaptive_metadata`.
+    fn load_only_table_config(
+        adaptive_metadata: &TableFeature,
+        iceberg_native_v4: Option<&TableFeature>,
+    ) -> TableConfiguration {
+        let mut properties = all_adaptive_metadata_props();
+        if iceberg_native_v4.is_some() {
+            properties.push((ENABLE_ICEBERG_NATIVE_V4, "true"));
+        }
+        let writer_features = iceberg_native_v4
+            .into_iter()
+            .chain([adaptive_metadata])
+            .cloned()
+            .chain(all_adaptive_metadata_deps());
+        MockTableConfigurationBuilder::new()
+            .with_schema(test_schema_for_column_mapping(Some(ColumnMappingMode::Id)))
+            .with_properties(properties)
+            .with_column_mapping(ColumnMappingMode::Id)
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_reader_features([
+                        adaptive_metadata.clone(),
+                        TableFeature::ColumnMapping,
+                        TableFeature::DeletionVectors,
+                    ])
+                    .with_writer_features(writer_features)
+                    .build(),
+            )
+            .build()
+    }
+
+    #[rstest]
+    #[case::released(TableFeature::AdaptiveMetadata)]
+    #[case::dev(TableFeature::AdaptiveMetadataDev)]
+    #[cfg_attr(
+        not(feature = "adaptive-metadata-in-dev"),
+        case::preview(TableFeature::AdaptiveMetadataPreview)
+    )]
+    fn adaptive_metadata_loads_but_blocks_scans_cdf_and_writes(#[case] feature: TableFeature) {
+        let config = load_only_table_config(&feature, None);
+        config
+            .ensure_operation_supported(Operation::SnapshotLoad)
+            .expect("snapshot load is supported");
+        for (result, suffix) in [
+            (config.ensure_operation_supported(Operation::Scan), ""),
+            (
+                config.ensure_operation_supported(Operation::Cdf),
+                " for CDF",
+            ),
+            (
+                config.ensure_operation_supported(Operation::Write),
+                " for writes",
+            ),
+            (
+                config.ensure_no_load_only_features().map_err(Into::into),
+                "",
+            ),
+        ] {
+            assert_result_error_with_message(
+                result,
+                &format!("Feature '{feature}' is not supported{suffix}"),
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::released(TableFeature::IcebergNativeV4, TableFeature::AdaptiveMetadata)]
+    #[case::dev(TableFeature::IcebergNativeV4Dev, TableFeature::AdaptiveMetadataDev)]
+    #[cfg_attr(
+        not(feature = "adaptive-metadata-in-dev"),
+        case::preview(
+            TableFeature::IcebergNativeV4Preview,
+            TableFeature::AdaptiveMetadataPreview
+        )
+    )]
+    fn iceberg_native_v4_loads_but_blocks_writes(
+        #[case] iceberg_native_v4: TableFeature,
+        #[case] adaptive_metadata: TableFeature,
+    ) {
+        let config = load_only_table_config(&adaptive_metadata, Some(&iceberg_native_v4));
+        config
+            .ensure_operation_supported(Operation::SnapshotLoad)
+            .expect("snapshot load is supported");
+        assert_result_error_with_message(
+            config.ensure_operation_supported(Operation::Write),
+            &format!("Feature '{iceberg_native_v4}' is not supported for writes"),
+        );
+        assert_result_error_with_message(
+            config.ensure_no_load_only_features(),
+            &format!("Feature '{iceberg_native_v4}' is not supported"),
+        );
+    }
+
     #[test]
-    fn snapshot_load_rejects_adaptive_metadata_without_cargo_feature() {
+    fn ensure_no_load_only_features_accepts_supported_features() {
         let config = MockTableConfigurationBuilder::new()
             .with_protocol(
                 MockProtocolBuilder::new()
-                    .with_features([TableFeature::AdaptiveMetadataPreview])
+                    .with_features([TableFeature::DeletionVectors])
                     .build(),
             )
             .build();
-        assert_result_error_with_message(
-            config.ensure_operation_supported(Operation::SnapshotLoad),
-            "Feature 'adaptiveMetadata-preview' is not supported",
-        );
+        config
+            .ensure_no_load_only_features()
+            .expect("no load-only features");
     }
 
     #[test]

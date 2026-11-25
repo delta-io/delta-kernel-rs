@@ -135,6 +135,12 @@ pub(crate) enum TableFeature {
     #[strum(serialize = "icebergNativeV4-preview")]
     #[serde(rename = "icebergNativeV4-preview")]
     IcebergNativeV4Preview,
+    /// Released name of the feature previewed by [`Self::IcebergNativeV4Preview`].
+    IcebergNativeV4,
+    /// In-development name of the feature previewed by [`Self::IcebergNativeV4Preview`].
+    #[strum(serialize = "icebergNativeV4-dev")]
+    #[serde(rename = "icebergNativeV4-dev")]
+    IcebergNativeV4Dev,
     /// The Clustered Table feature facilitates the physical clustering of rows
     /// that share similar values on a predefined set of clustering columns.
     #[strum(serialize = "clustering")]
@@ -207,6 +213,12 @@ pub(crate) enum TableFeature {
     #[strum(serialize = "adaptiveMetadata-preview")]
     #[serde(rename = "adaptiveMetadata-preview")]
     AdaptiveMetadataPreview,
+    /// Released name of the feature previewed by [`Self::AdaptiveMetadataPreview`].
+    AdaptiveMetadata,
+    /// In-development name of the feature previewed by [`Self::AdaptiveMetadataPreview`].
+    #[strum(serialize = "adaptiveMetadata-dev")]
+    #[serde(rename = "adaptiveMetadata-dev")]
+    AdaptiveMetadataDev,
     /// Geospatial type support (geometry and geography columns)
     #[strum(serialize = "geospatial")]
     #[serde(rename = "geospatial")]
@@ -552,15 +564,13 @@ static ICEBERG_COMPAT_V3_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
-/// IcebergNativeV4 native interop. Spec: delta-io/delta#7374.
-///
-/// TODO(#2866): gated by `adaptive-metadata-in-dev` until adaptiveMetadata is fully supported.
-static ICEBERG_NATIVE_V4_PREVIEW_INFO: FeatureInfo = FeatureInfo {
-    feature_type: FeatureType::WriterOnly,
-    min_legacy_version: None,
-    feature_requirements: &[
+/// Requirements of an Iceberg-native V4 feature whose table uses `adaptive_metadata`.
+const fn iceberg_native_v4_requirements(
+    adaptive_metadata: TableFeature,
+) -> [FeatureRequirement; 11] {
+    [
         // adaptiveMetadata transitively enforces the structural dependencies.
-        FeatureRequirement::Enabled(TableFeature::AdaptiveMetadataPreview),
+        FeatureRequirement::Enabled(adaptive_metadata),
         FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV1),
         FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV2),
         FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV3),
@@ -574,15 +584,88 @@ static ICEBERG_NATIVE_V4_PREVIEW_INFO: FeatureInfo = FeatureInfo {
             check_iceberg_native_v4_allowed_writer_features(protocol, properties)
                 .map_err(Into::into)
         }),
-    ],
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    kernel_support: KernelSupport::Supported,
-    #[cfg(not(feature = "adaptive-metadata-in-dev"))]
-    kernel_support: KernelSupport::NotSupported,
-    enablement_check: EnablementCheck::EnabledIf(|props| {
-        props.enable_iceberg_native_v4 == Some(true)
-    }),
-};
+    ]
+}
+
+const fn iceberg_native_v4_info(
+    feature_requirements: &'static [FeatureRequirement],
+    kernel_support: KernelSupport,
+) -> FeatureInfo {
+    FeatureInfo {
+        feature_type: FeatureType::WriterOnly,
+        min_legacy_version: None,
+        feature_requirements,
+        kernel_support,
+        enablement_check: EnablementCheck::EnabledIf(|props| {
+            props.enable_iceberg_native_v4 == Some(true)
+        }),
+    }
+}
+
+static ICEBERG_NATIVE_V4_PREVIEW_REQUIREMENTS: [FeatureRequirement; 11] =
+    iceberg_native_v4_requirements(TableFeature::AdaptiveMetadataPreview);
+static ICEBERG_NATIVE_V4_REQUIREMENTS: [FeatureRequirement; 11] =
+    iceberg_native_v4_requirements(TableFeature::AdaptiveMetadata);
+static ICEBERG_NATIVE_V4_DEV_REQUIREMENTS: [FeatureRequirement; 11] =
+    iceberg_native_v4_requirements(TableFeature::AdaptiveMetadataDev);
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+const ICEBERG_NATIVE_V4_PREVIEW_SUPPORT: KernelSupport = KernelSupport::Supported;
+#[cfg(not(feature = "adaptive-metadata-in-dev"))]
+const ICEBERG_NATIVE_V4_PREVIEW_SUPPORT: KernelSupport =
+    KernelSupport::Custom(|_, _, op| snapshot_load_only(&TableFeature::IcebergNativeV4Preview, op));
+
+/// IcebergNativeV4 native interop. Spec: delta-io/delta#7374.
+///
+/// TODO(#2866): gated by `adaptive-metadata-in-dev` until adaptiveMetadata is fully supported.
+static ICEBERG_NATIVE_V4_PREVIEW_INFO: FeatureInfo = iceberg_native_v4_info(
+    &ICEBERG_NATIVE_V4_PREVIEW_REQUIREMENTS,
+    ICEBERG_NATIVE_V4_PREVIEW_SUPPORT,
+);
+
+// The in-development read and write paths only handle the preview names, so the released and
+// dev names stay load-only even with `adaptive-metadata-in-dev`.
+// TODO(#2866): support these names once call sites stop matching only the preview variant.
+static ICEBERG_NATIVE_V4_INFO: FeatureInfo = iceberg_native_v4_info(
+    &ICEBERG_NATIVE_V4_REQUIREMENTS,
+    KernelSupport::Custom(|_, _, op| snapshot_load_only(&TableFeature::IcebergNativeV4, op)),
+);
+static ICEBERG_NATIVE_V4_DEV_INFO: FeatureInfo = iceberg_native_v4_info(
+    &ICEBERG_NATIVE_V4_DEV_REQUIREMENTS,
+    KernelSupport::Custom(|_, _, op| snapshot_load_only(&TableFeature::IcebergNativeV4Dev, op)),
+);
+
+/// Support for features whose tables can be loaded for their metadata but not yet scanned or
+/// written. The messages match other features' rejections so connectors classify them the same
+/// way.
+fn snapshot_load_only(feature: &TableFeature, operation: Operation) -> KernelResult<()> {
+    let suffix = match operation {
+        Operation::SnapshotLoad => return Ok(()),
+        Operation::Scan => "",
+        Operation::Cdf => " for CDF",
+        Operation::Write => " for writes",
+    };
+    Err(KernelError::unsupported(format!(
+        "Feature '{feature}' is not supported{suffix}"
+    )))
+}
+
+impl TableFeature {
+    /// Whether the kernel can load tables with this feature for their metadata but can't scan,
+    /// write, or maintain them.
+    pub(crate) fn is_load_only(&self) -> bool {
+        match self {
+            TableFeature::AdaptiveMetadata
+            | TableFeature::AdaptiveMetadataDev
+            | TableFeature::IcebergNativeV4
+            | TableFeature::IcebergNativeV4Dev => true,
+            TableFeature::AdaptiveMetadataPreview | TableFeature::IcebergNativeV4Preview => {
+                !cfg!(feature = "adaptive-metadata-in-dev")
+            }
+            _ => false,
+        }
+    }
+}
 
 /// Writer features an `icebergNativeV4-preview` table may list.
 // TODO(#3769): The RFC does not cover fileType, geospatial, and type widening yet. Update their
@@ -590,6 +673,10 @@ static ICEBERG_NATIVE_V4_PREVIEW_INFO: FeatureInfo = FeatureInfo {
 const ICEBERG_NATIVE_V4_ALLOWED_WRITER_FEATURES: &[TableFeature] = &[
     TableFeature::IcebergNativeV4Preview,
     TableFeature::AdaptiveMetadataPreview,
+    TableFeature::IcebergNativeV4,
+    TableFeature::IcebergNativeV4Dev,
+    TableFeature::AdaptiveMetadata,
+    TableFeature::AdaptiveMetadataDev,
     TableFeature::ColumnMapping,
     TableFeature::DeletionVectors,
     TableFeature::RowTracking,
@@ -804,37 +891,17 @@ static FILE_TYPE_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+/// Requirements of an adaptive metadata feature. `column_mapping_id_mode` checks that column
+/// mapping is in `id` mode and reports the failure under the feature's own name.
 // Dependencies and mutual exclusions per the adaptiveMetadata RFC (delta-io/delta#6978) "Table
 // Feature Enablement" section. Enforcement is covered by
 // `test_adaptive_metadata_feature_requirements`.
-// TODO(#2866): drop the `adaptive-metadata-in-dev` gate once adaptiveMetadata is fully supported.
-static ADAPTIVE_METADATA_PREVIEW_INFO: FeatureInfo = FeatureInfo {
-    feature_type: FeatureType::ReaderWriter,
-    min_legacy_version: None,
-    feature_requirements: &[
+const fn adaptive_metadata_requirements(
+    column_mapping_id_mode: fn(&Protocol, &TableProperties) -> Result<()>,
+) -> [FeatureRequirement; 7] {
+    [
         FeatureRequirement::Enabled(TableFeature::ColumnMapping),
-        FeatureRequirement::Custom(|_protocol, properties| {
-            if let Some(mode) = properties
-                .column_mapping_mode
-                .filter(|mode| *mode != ColumnMappingMode::Id)
-            {
-                return Err(DeltaError::adaptive_metadata_mapping_mode(
-                    mode,
-                    Some(Box::new(KernelError::invalid_protocol(
-                        "Feature 'adaptiveMetadata-preview' requires column mapping in 'id' mode",
-                    ))),
-                )
-                .into());
-            }
-            require!(
-                properties.column_mapping_mode == Some(ColumnMappingMode::Id),
-                KernelError::invalid_protocol(
-                    "Feature 'adaptiveMetadata-preview' requires column mapping in 'id' mode"
-                )
-                .into()
-            );
-            Ok(())
-        }),
+        FeatureRequirement::Custom(column_mapping_id_mode),
         FeatureRequirement::Enabled(TableFeature::RowTracking),
         FeatureRequirement::Enabled(TableFeature::DomainMetadata),
         FeatureRequirement::Enabled(TableFeature::DeletionVectors),
@@ -843,13 +910,71 @@ static ADAPTIVE_METADATA_PREVIEW_INFO: FeatureInfo = FeatureInfo {
         // enabled, checkpoint state is carried by the `checkpoint` action rather than by V2
         // checkpoint files, so a table must not enable both.
         FeatureRequirement::NotSupported(TableFeature::V2Checkpoint),
-    ],
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    kernel_support: KernelSupport::Supported,
-    #[cfg(not(feature = "adaptive-metadata-in-dev"))]
-    kernel_support: KernelSupport::NotSupported,
-    enablement_check: EnablementCheck::AlwaysIfSupported,
-};
+    ]
+}
+
+const fn adaptive_metadata_info(
+    feature_requirements: &'static [FeatureRequirement],
+    kernel_support: KernelSupport,
+) -> FeatureInfo {
+    FeatureInfo {
+        feature_type: FeatureType::ReaderWriter,
+        min_legacy_version: None,
+        feature_requirements,
+        kernel_support,
+        enablement_check: EnablementCheck::AlwaysIfSupported,
+    }
+}
+
+static ADAPTIVE_METADATA_PREVIEW_REQUIREMENTS: [FeatureRequirement; 7] =
+    adaptive_metadata_requirements(|_protocol, properties| {
+        if let Some(mode) = properties
+            .column_mapping_mode
+            .filter(|mode| *mode != ColumnMappingMode::Id)
+        {
+            return Err(DeltaError::adaptive_metadata_mapping_mode(
+                mode,
+                Some(Box::new(KernelError::invalid_protocol(
+                    "Feature 'adaptiveMetadata-preview' requires column mapping in 'id' mode",
+                ))),
+            )
+            .into());
+        }
+        require_column_mapping_id_mode(&TableFeature::AdaptiveMetadataPreview, properties)
+    });
+static ADAPTIVE_METADATA_REQUIREMENTS: [FeatureRequirement; 7] =
+    adaptive_metadata_requirements(|_, properties| {
+        require_column_mapping_id_mode(&TableFeature::AdaptiveMetadata, properties)
+    });
+static ADAPTIVE_METADATA_DEV_REQUIREMENTS: [FeatureRequirement; 7] =
+    adaptive_metadata_requirements(|_, properties| {
+        require_column_mapping_id_mode(&TableFeature::AdaptiveMetadataDev, properties)
+    });
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+const ADAPTIVE_METADATA_PREVIEW_SUPPORT: KernelSupport = KernelSupport::Supported;
+#[cfg(not(feature = "adaptive-metadata-in-dev"))]
+const ADAPTIVE_METADATA_PREVIEW_SUPPORT: KernelSupport = KernelSupport::Custom(|_, _, op| {
+    snapshot_load_only(&TableFeature::AdaptiveMetadataPreview, op)
+});
+
+// TODO(#2866): drop the `adaptive-metadata-in-dev` gate once adaptiveMetadata is fully supported.
+static ADAPTIVE_METADATA_PREVIEW_INFO: FeatureInfo = adaptive_metadata_info(
+    &ADAPTIVE_METADATA_PREVIEW_REQUIREMENTS,
+    ADAPTIVE_METADATA_PREVIEW_SUPPORT,
+);
+
+// The in-development read and write paths only handle the preview name, so the released and dev
+// names stay load-only even with `adaptive-metadata-in-dev`.
+// TODO(#2866): support these names once call sites stop matching only the preview variant.
+static ADAPTIVE_METADATA_INFO: FeatureInfo = adaptive_metadata_info(
+    &ADAPTIVE_METADATA_REQUIREMENTS,
+    KernelSupport::Custom(|_, _, op| snapshot_load_only(&TableFeature::AdaptiveMetadata, op)),
+);
+static ADAPTIVE_METADATA_DEV_INFO: FeatureInfo = adaptive_metadata_info(
+    &ADAPTIVE_METADATA_DEV_REQUIREMENTS,
+    KernelSupport::Custom(|_, _, op| snapshot_load_only(&TableFeature::AdaptiveMetadataDev, op)),
+);
 
 // TODO(#2949): drop the `geo-type-in-dev` gate once full geospatial support ships.
 static GEOSPATIAL_TYPE_INFO: FeatureInfo = FeatureInfo {
@@ -903,6 +1028,8 @@ impl TableFeature {
             | TableFeature::FileType
             | TableFeature::FileTypePreview
             | TableFeature::AdaptiveMetadataPreview
+            | TableFeature::AdaptiveMetadata
+            | TableFeature::AdaptiveMetadataDev
             | TableFeature::GeospatialType => FeatureType::ReaderWriter,
             TableFeature::AppendOnly
             | TableFeature::DomainMetadata
@@ -918,6 +1045,8 @@ impl TableFeature {
             | TableFeature::IcebergCompatV2
             | TableFeature::IcebergCompatV3
             | TableFeature::IcebergNativeV4Preview
+            | TableFeature::IcebergNativeV4
+            | TableFeature::IcebergNativeV4Dev
             | TableFeature::ClusteredTable
             | TableFeature::MaterializePartitionColumns => FeatureType::WriterOnly,
             TableFeature::AllowColumnDefaults
@@ -958,6 +1087,8 @@ impl TableFeature {
             TableFeature::IcebergCompatV2 => &ICEBERG_COMPAT_V2_INFO,
             TableFeature::IcebergCompatV3 => &ICEBERG_COMPAT_V3_INFO,
             TableFeature::IcebergNativeV4Preview => &ICEBERG_NATIVE_V4_PREVIEW_INFO,
+            TableFeature::IcebergNativeV4 => &ICEBERG_NATIVE_V4_INFO,
+            TableFeature::IcebergNativeV4Dev => &ICEBERG_NATIVE_V4_DEV_INFO,
             TableFeature::ClusteredTable => &CLUSTERED_TABLE_INFO,
             TableFeature::MaterializePartitionColumns => &MATERIALIZE_PARTITION_COLUMNS_INFO,
             TableFeature::AllowColumnDefaults => &ALLOW_COLUMN_DEFAULTS_INFO,
@@ -980,6 +1111,8 @@ impl TableFeature {
             TableFeature::FileType => &FILE_TYPE_INFO,
             TableFeature::FileTypePreview => &FILE_TYPE_PREVIEW_INFO,
             TableFeature::AdaptiveMetadataPreview => &ADAPTIVE_METADATA_PREVIEW_INFO,
+            TableFeature::AdaptiveMetadata => &ADAPTIVE_METADATA_INFO,
+            TableFeature::AdaptiveMetadataDev => &ADAPTIVE_METADATA_DEV_INFO,
             TableFeature::GeospatialType => &GEOSPATIAL_TYPE_INFO,
 
             // Unknown features: not supported by kernel, no legacy version inference.
@@ -1148,7 +1281,12 @@ pub(crate) fn ensure_table_can_be_read(protocol: &Protocol) -> KernelResult<()> 
                     "Feature '{feature}' is not supported by kernel",
                 )));
             }
-            KernelSupport::Custom(_) => {}
+            // Without metadata there are no table properties, so custom support is judged as a
+            // scan of a table with default properties. A custom check that depends on properties
+            // would be judged wrongly here.
+            KernelSupport::Custom(check) => {
+                check(protocol, &TableProperties::default(), Operation::Scan)?
+            }
         }
     }
 
@@ -1171,9 +1309,24 @@ fn check_iceberg_native_v4_allowed_writer_features(
     Ok(())
 }
 
+fn require_column_mapping_id_mode(
+    feature: &TableFeature,
+    properties: &TableProperties,
+) -> Result<()> {
+    require!(
+        properties.column_mapping_mode == Some(ColumnMappingMode::Id),
+        KernelError::invalid_protocol(format!(
+            "Feature '{feature}' requires column mapping in 'id' mode"
+        ))
+        .into()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use strum::IntoEnumIterator as _;
 
     use super::*;
 
@@ -1333,8 +1486,6 @@ mod tests {
 
     #[test]
     fn test_roundtrip_table_features() {
-        use strum::IntoEnumIterator as _;
-
         for feature in TableFeature::iter() {
             let expected = match feature {
                 TableFeature::AppendOnly => "appendOnly",
@@ -1351,6 +1502,8 @@ mod tests {
                 TableFeature::IcebergCompatV2 => "icebergCompatV2",
                 TableFeature::IcebergCompatV3 => "icebergCompatV3",
                 TableFeature::IcebergNativeV4Preview => "icebergNativeV4-preview",
+                TableFeature::IcebergNativeV4 => "icebergNativeV4",
+                TableFeature::IcebergNativeV4Dev => "icebergNativeV4-dev",
                 TableFeature::ClusteredTable => "clustering",
                 TableFeature::MaterializePartitionColumns => "materializePartitionColumns",
                 TableFeature::CatalogManaged => "catalogManaged",
@@ -1369,6 +1522,8 @@ mod tests {
                 TableFeature::FileType => "fileType",
                 TableFeature::FileTypePreview => "fileType-preview",
                 TableFeature::AdaptiveMetadataPreview => "adaptiveMetadata-preview",
+                TableFeature::AdaptiveMetadata => "adaptiveMetadata",
+                TableFeature::AdaptiveMetadataDev => "adaptiveMetadata-dev",
                 TableFeature::AllowColumnDefaults => "allowColumnDefaults",
                 TableFeature::Collations => "collations",
                 TableFeature::CollationsPreview => "collations-preview",
@@ -1386,6 +1541,34 @@ mod tests {
 
             let deserialized: TableFeature = serde_json::from_str(&serialized).unwrap();
             assert_eq!(deserialized, feature);
+        }
+    }
+
+    #[test]
+    fn feature_type_matches_info() {
+        for feature in TableFeature::iter() {
+            assert_eq!(
+                feature.feature_type(),
+                feature.info().feature_type,
+                "{feature}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_load_only_matches_kernel_support() {
+        let protocol = Protocol::new_unchecked(3, 7, Some(vec![]), Some(vec![]));
+        let properties = TableProperties::default();
+        let allows = |feature: &TableFeature, operation| match &feature.info().kernel_support {
+            KernelSupport::Supported => true,
+            KernelSupport::NotSupported => false,
+            KernelSupport::Custom(check) => check(&protocol, &properties, operation).is_ok(),
+        };
+        for feature in TableFeature::iter() {
+            let load_only = allows(&feature, Operation::SnapshotLoad)
+                && !allows(&feature, Operation::Scan)
+                && !allows(&feature, Operation::Write);
+            assert_eq!(feature.is_load_only(), load_only, "{feature}");
         }
     }
 }

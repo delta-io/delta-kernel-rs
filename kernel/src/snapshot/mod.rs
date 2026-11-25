@@ -1632,6 +1632,7 @@ impl Snapshot {
         start_version: Version,
         end_version: Version,
     ) -> KernelResult<LogCompactionWriter> {
+        self.table_configuration().ensure_no_load_only_features()?;
         LogCompactionWriter::try_new(self, start_version, end_version)
     }
 
@@ -2153,6 +2154,7 @@ impl Snapshot {
         committer: &dyn Committer,
     ) -> Result<SnapshotRef> {
         // TODO(#3929): Emit metrics for commits submitted, metadata lookups, duration, and outcome.
+        self.table_configuration().ensure_no_load_only_features()?;
         let unpublished_catalog_commits = self.log_segment().get_unpublished_catalog_commits()?;
 
         let max_published_version = if unpublished_catalog_commits.is_empty() {
