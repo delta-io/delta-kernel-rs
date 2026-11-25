@@ -1,5 +1,74 @@
 # AI review architecture and terminology
 
+
+This document explains the review workflow, its terms and the format of its GitHub comments.
+The numbered steps identify components for design discussions. Follow the linked source for
+implementation details and [`REVIEW.md`](REVIEW.md) for the orchestrator's selection rules.
+Contributor disclosures belong in [`AI_POLICY.md`](../../../AI_POLICY.md).
+
+## Terms
+
+| Term | Meaning |
+|---|---|
+| Orchestrator | The model started by `omnigent run`. It assigns reviewer tasks, requests checks and chooses the findings for the final report. It does not call the GitHub API. |
+| Primary reviewer | An agent that examines the PR for its assigned concern. Protocol, architecture, tests, docs and Claude/Codex maintainer reviews are configured in [`config.yaml`](config.yaml). |
+| Candidate finding | A problem proposed by a primary reviewer, before checking and final selection. |
+| Checker | `disprove-reviewer`, which challenges proposed Blocker and Should Fix findings and returns `CONFIRMED`, `DISPROVED`, `NITPICK` or `CONTESTED`. |
+| Final finding | A problem the orchestrator includes in its final report after checking and combining reviewer results. Its displayed label includes severity, such as `[Should Fix 1]`. |
+| Inline review comment | A comment on a changed file and line in **Files changed**. It starts a code review thread; replies belong to that thread. |
+| PR Conversation comment | A top-level comment on the PR's **Conversation** tab, with no file/line attachment. Each finding without a usable changed line gets its own comment. |
+| Main AI review comment | A review run's summary comment on **Conversation**, with counts, the reviewed commit and links to finding comments. It is not a GitHub approval or the body of a submitted GitHub review. |
+| Confirmed comment URL | A comment URL returned by GitHub or read from an existing trusted bot comment. This establishes that the comment exists, not that its claim is correct. |
+| Check Run | A commit-specific GitHub Checks API result. This workflow creates `AI Review Summary`, opened from the PR's **Checks** tab. Its GitHub conclusion is `neutral`, so it does not approve or reject the PR. |
+
+A **Blocker** is a supported correctness, protocol or safety defect, a materially inaccurate PR
+explanation, or an undisclosed breaking change that needs correction before approval. **Should
+Fix** is a concrete advisory improvement. A **Nit** is a smaller useful correction. The full
+selection rules, including limits on convention findings, are in [`REVIEW.md`](REVIEW.md#consolidation).
+
+## Review workflow
+
+The diagram describes PR comment modes. Explicit `summary` and `artifact` modes produce their
+requested reports instead of finding comments and a main comment; they still produce a Check Run.
+
+```mermaid
+flowchart TD
+    A["1. Workflow: authorize request and prepare PR inputs"]
+    B["2. Orchestrator: assign reviewer tasks"]
+    C["3. Primary reviewers: protocol, architecture, tests, docs<br/>Claude/Codex maintainers"]
+    D["4. Disprove reviewer: challenge Blocker/Should Fix findings"]
+    E["5. Orchestrator: choose final findings"]
+    F["6. Python/workflow: post comments and Check Run report"]
+    A --> B --> C
+    C -->|"Blocker or Should Fix proposed"| D --> E
+    C -->|"Only Nits or no findings"| E
+    E --> F
+```
+
+1. **Prepare the PR inputs.** [`ai-review.yml`](../../workflows/ai-review.yml) authorizes the
+   requester and fetches the PR description, earlier bot reviews and diff. [`review_scope.py`](../review_scope.py)
+   selects the base/head commits for this PR's own changes. A scope failure stops the review.
+   [`prepare_reviewer.py`](../prepare_reviewer.py) expands checked-in reviewer instructions.
+2. **Assign reviewer tasks.** The orchestrator calls `sys_session_send` for the configured primary
+   reviewers. [`child_task.py`](../child_task.py) appends the PR data to each assignment and trusted
+   root `AGENTS.md` to the maintainer assignments. The workflow revision supplies project rules;
+   PR content is untrusted data to inspect.
+3. **Propose candidate findings.** Each primary reviewer examines the diff and reads surrounding
+   source with read-only tools. It returns proposed problems, evidence, severities and fixes.
+4. **Challenge proposed Blocker and Should Fix findings.** The orchestrator sends that entire set
+   to `disprove-reviewer` in one task. There is no checker task when that set is empty, and no
+   separate checker task per finding. This is the policy in [`REVIEW.md`](REVIEW.md#disprove-gate).
+5. **Choose final findings.** The orchestrator follows the checker decisions, combines duplicate
+   concerns and returns the PR summary and final finding text. Its final report is model output,
+   not a count of comments already posted to GitHub.
+6. **Post comments and the Check Run report.** The workflow validates the model output.
+   [`finding_publication.py`](../finding_publication.py) creates a main-comment placeholder to get
+   its URL, posts or reuses each finding comment, then updates the main comment with the final
+   counts and links. [`review_publish.py`](../review_publish.py) builds the Markdown. The workflow
+   creates the `AI Review Summary` Check Run with the full review and comment-posting results.
+
+## Reviewer instructions and task inputs
+
 [`ai-review.yml`](../../workflows/ai-review.yml) runs an orchestrator model and specialist review
 models. Python prepares their inputs and output requests; workflow steps create GitHub comments,
 Checks or saved reports. This document defines those responsibilities and the text exchanged.
@@ -353,6 +422,65 @@ uploaded in artifact mode.
 | `/tmp/review_output.txt` | Validation step | Comment, job-summary, artifact and Check Run steps read the extracted orchestrator report. |
 | `/tmp/inline_findings.json` | Validation step | Inline code reads requested finding locations. |
 | `/tmp/check-summary.txt` | Review-range resolution failure or Check Run fallback | Check Run step reads the resolver error or generic unavailable message. |
+
+## Finding comments and confirmed comment URLs
+
+With `FINDING_PLACEMENT=inline-or-conversation`, the workflow's `inline` mode attaches each final
+finding to a changed line when both the scoped review diff and GitHub's PR diff accept that
+location. That creates an inline review comment.
+Each other finding gets a separate PR Conversation comment, including PR-wide concerns and
+locations GitHub rejects. LEFT-side findings use Conversation comments when the file's two diff
+sections differ. The workflow does not limit the number of inline finding comments.
+
+`finding_publication.py` checks earlier bot comments before posting another copy of a finding.
+If a write times out, it rereads GitHub comments before deciding whether another write is needed.
+The main comment counts each final finding with a confirmed new or reused comment URL once.
+A comment URL establishes delivery, not correctness. Unconfirmed writes produce an explicit
+posting error instead of a successful count.
+
+The command writes finding IDs, severities, reviewed SHA, comment URLs and posting errors to
+`/tmp/publication_record.json`. The workflow uses that file to build the Check Run report.
+The report lists new and reused comment counts separately from the number of final findings.
+`summary` and `artifact` modes record their selected report output without posting finding comments.
+
+## Main AI review comment format
+
+[`format_review_summary()`](../review_publish.py) is the single renderer for the main comment.
+The orchestrator supplies the PR summary and final finding text. Python supplies counts, links,
+the reviewed commit and the layout below. Angle-bracket placeholders stand for generated text;
+hidden bot identifiers are omitted from this example.
+
+```markdown
+## AI Review
+
+---
+
+**2 Blockers · 1 Should Fix · 2 Nits**
+
+Reviewed `<short commit SHA>`
+
+<details><summary>PR Summary</summary>
+
+<one paragraph explaining what the PR changes>
+
+</details>
+
+<details><summary>Review Summary</summary>
+
+- **[Blocker 1]** [<one-line claim>](<finding comment URL>)
+- **[Blocker 2]** [<one-line claim>](<finding comment URL>)
+- **[Should Fix 1]** [<one-line claim>](<finding comment URL>)
+
+</details>
+
+[Full AI review → Checks](<PR checks URL>) · [Workflow run](<workflow run URL>)
+```
+
+`Review Summary` links every final Blocker and Should Fix finding, including reused comments.
+It is absent when there are none. Nits count in the headline and have individual comments, but
+no rows in that disclosure. All disclosures start closed. A posting failure can replace the
+count line with `Finding counts unavailable.` and adds an explanation. The Check Run includes
+all final findings, including findings supplied only in structured model output.
 
 ## Shared instruction blocks
 

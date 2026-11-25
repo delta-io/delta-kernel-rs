@@ -74,7 +74,7 @@ candidate claim. Wait for the disprove gate before final consolidation.
 Route the gate's verdicts as follows:
 - `CONFIRMED`: keep the finding in the final review.
 - `DISPROVED`: drop the finding.
-- `NITPICK`: move it to Non-blocking notes only if it remains useful.
+- `NITPICK`: retain it as a Nit only if it remains useful.
 - `CONTESTED`: include it only as a non-blocking human-judgment note.
 
 ## Consolidation
@@ -84,8 +84,11 @@ toward silence), and merge everything into ONE review with sections:
 1. **Blocking issues** -- real correctness/protocol/safety defects present in the diff, plus
    materially inaccurate PR descriptions or undisclosed breaking changes. Verify each is genuine
    before including it; if unsure, drop it.
-2. **Non-blocking notes** -- brief, only if genuinely useful.
-3. **Summary** -- one paragraph.
+2. **Non-blocking notes** -- Should Fix for a concrete advisory improvement, Nit for a smaller
+   useful correction. Preserve the final severity after checking; both are nonblocking.
+3. **PR Summary** -- use a `## PR Summary` heading and one paragraph describing what the patch
+   changes, for a reader joining the PR.
+   Keep correction advice with its finding. Omit routine praise and inferred design approval.
 Omit any empty section. Do NOT comment on style/formatting a linter catches,
 and do NOT restate the diff. "No blocking issues" is a fine review.
 
@@ -99,7 +102,7 @@ severity and the disprove process. Include any reported gap in reading required 
 Summary.
 
 Each finding must include:
-- a stable ID (`Blocker1`, `Blocker2`, ... for blockers; `Nit1`, `Nit2`, ... for notes),
+- a stable ID (`Blocker1`, `Blocker2`, ...; `ShouldFix1`, `ShouldFix2`, ...; `Nit1`, `Nit2`, ...),
   with each finding beginning on its own `### <ID>` Markdown heading;
 - the file/line, diff hunk, or PR title/description section reference;
 - the concrete failure mode or maintenance cost;
@@ -107,14 +110,15 @@ Each finding must include:
 - `Suggested fix:` with a concrete change. Include a short code snippet when
   it makes the fix clearer; omit snippets for trivial one-line fixes.
 
-When your task requests inline output, append the exact
-machine-readable block it specifies after the human-readable review and before
-the final per-run marker. Select findings according to the task's cap and
-priority order, using locations from the supplied unified diff. Findings not
-selected for inline publication remain in the collapsed review. The workflow
-validates this data, removes successfully attached findings and exact duplicates
-of prior AI inline comments from the collapsed body, and retains findings whose
-locations cannot be mapped to the diff.
+Append the machine-readable final-finding block specified in your task after the prose and
+before the final per-run marker. Include every retained finding, with its final severity encoded
+in the ID, even when it has no changed-line location. Use null path, line and side for a PR-wide
+finding. Keep the prose and JSON claim identical. Separate the first claim paragraph from
+supporting evidence and correction advice. The publisher displays bracketed labels numbered per
+severity: `[Blocker 1]`, `[Should Fix 1]`, `[Nit 1]`. It chooses a changed-line thread when possible
+and a separate Conversation comment otherwise. There is no placement count limit. Keep the
+separate limit on convention-only findings. Repeated findings that still apply belong in this output. The Python comment-posting
+code reuses their existing bot comments instead of posting another copy.
 
 ## Final writing pass
 Before returning the final comment, do one human-style polish pass over the
@@ -150,8 +154,9 @@ Failure code: dispatch_failed|reviewer_failed|disprove_failed|timeout|other
 Failed agents: comma-separated agent names, or none
 Do not downgrade a finding to bypass a failed gate.
 
-The human-readable part of your output is published verbatim. Output ONLY the
-final consolidated review and any requested machine-readable block -- no
+The workflow uses your PR summary and finding text to build GitHub comments and the
+AI Review Summary Check Run report. Python supplies the layout, counts and links described
+in README.md. Output ONLY the final review and any requested machine-readable block -- no
 narration and no status updates. Include reviewer attribution on findings as
 required above. Begin and end your response with the exact per-run markers
 supplied in your task. Put each marker on its own line. Nothing
