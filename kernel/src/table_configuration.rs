@@ -395,9 +395,25 @@ impl TableConfiguration {
         metadata: Metadata,
         logical_schema: SchemaRef,
     ) -> Result<Self> {
+        Self::try_new_with_schema_and_protocol(
+            base,
+            metadata,
+            logical_schema,
+            base.protocol.clone(),
+        )
+    }
+
+    /// Like [`try_new_with_schema`](Self::try_new_with_schema), but validates against `protocol`
+    /// instead of `base`'s protocol.
+    pub(crate) fn try_new_with_schema_and_protocol(
+        base: &Self,
+        metadata: Metadata,
+        logical_schema: SchemaRef,
+        protocol: Protocol,
+    ) -> Result<Self> {
         Self::try_new_inner(
             metadata,
-            base.protocol.clone(),
+            protocol,
             base.table_root.clone(),
             base.version,
             logical_schema,
@@ -2987,6 +3003,29 @@ mod test {
             config.ensure_operation_supported(Operation::SnapshotLoad),
             "Feature 'catalogManaged' requires 'inCommitTimestamp' to be enabled",
         );
+    }
+
+    #[test]
+    fn snapshot_load_allows_variant_shredding_preview_without_ga_variant_type() {
+        // A table that lists `variantShredding-preview` with only `variantType-preview` (no GA
+        // `variantType`) must load: the preview shredding feature carries no GA requirement.
+        let config = MockTableConfigurationBuilder::new()
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([
+                        TableFeature::VariantTypePreview,
+                        TableFeature::VariantShreddingPreview,
+                    ])
+                    .build(),
+            )
+            .build();
+
+        assert!(
+            config
+                .ensure_operation_supported(Operation::SnapshotLoad)
+                .is_ok()
+        );
+        assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
     }
 
     #[test]

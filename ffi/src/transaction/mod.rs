@@ -3463,9 +3463,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_table_builder_rejects_feature_enabling_property_via_ffi() -> KernelResult<()> {
+    async fn update_table_builder_enables_feature_property_via_ffi() -> KernelResult<()> {
         let (table_url, _store, engine) =
-            setup_domain_metadata_table("test_update_builder_reject_property", false).await?;
+            setup_domain_metadata_table("test_update_builder_enable_feature", false).await?;
         let snapshot =
             unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
         let builder = unsafe {
@@ -3491,12 +3491,17 @@ mod tests {
                 engine.shallow_copy(),
             )
         });
-        assert_extern_result_error_contains(
-            unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) },
-            FFIKernelError::InvalidTransactionStateError,
-            "Cannot modify the table property",
-        );
+        let txn =
+            ok_or_panic(unsafe { update_table_txn_builder_build(builder, engine.shallow_copy()) });
+        let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
+        assert_eq!(unsafe { version_and_free(committed) }, 1);
+
+        let reloaded =
+            unsafe { build_snapshot(ffi_str(table_url.as_str()), engine.shallow_copy()) };
+        let props = unsafe { reloaded.as_ref() }.table_properties();
+        assert_eq!(props.enable_change_data_feed, Some(true));
         unsafe {
+            free_snapshot(reloaded);
             free_snapshot(snapshot);
             free_engine(engine);
         }

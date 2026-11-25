@@ -766,11 +766,6 @@ async fn add_complex_type_column(
     StructField::nullable("NAME", DataType::STRING),
     "already exists"
 )]
-#[case::timestamp_ntz_without_feature(
-    &[],
-    StructField::nullable("ts", DataType::TIMESTAMP_NTZ),
-    "timestampNtz"
-)]
 #[case::non_nullable(&[], StructField::not_null("age", DataType::INTEGER), "non-nullable")]
 #[tokio::test]
 async fn add_column_failures(
@@ -789,6 +784,32 @@ async fn add_column_failures(
     assert!(err.is_err());
     assert!(err.unwrap_err().to_string().contains(error_contains));
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn add_timestamp_ntz_column_upgrades_protocol() -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
+
+    let post = snapshot
+        .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+        .add_column(StructField::nullable("ts", DataType::TIMESTAMP_NTZ))
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+
+    assert!(
+        post.table_configuration().is_feature_supported(
+            &delta_kernel::table_features::TableFeature::TimestampWithoutTimezone
+        ),
+        "adding a timestamp_ntz column must enable the timestampNtz feature"
+    );
+    let reloaded = Snapshot::builder_for(table_path).build(engine.as_ref())?;
+    assert!(reloaded.table_configuration().is_feature_supported(
+        &delta_kernel::table_features::TableFeature::TimestampWithoutTimezone
+    ));
     Ok(())
 }
 
@@ -2157,17 +2178,103 @@ async fn write_with_property_add_emits_metadata() -> delta_kernel::Result<()> {
 }
 
 #[tokio::test]
-async fn alter_table_rejects_feature_enabling_property() -> delta_kernel::Result<()> {
+async fn alter_table_enabling_ict_stamps_enablement_version_and_timestamp()
+-> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
+
+    snapshot
+        .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+        .with_table_properties_added([("delta.enableInCommitTimestamps", "true")])
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let props = reloaded.table_properties();
+    assert_eq!(props.enable_in_commit_timestamps, Some(true));
+    assert_eq!(props.in_commit_timestamp_enablement_version, Some(1));
+    assert!(props.in_commit_timestamp_enablement_timestamp.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn alter_table_disabling_ict_clears_enablement_info() -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        simple_schema(),
+        engine.as_ref(),
+        &[("delta.enableInCommitTimestamps", "true")],
+    )?;
+
+    snapshot
+        .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+        .with_table_properties_added([("delta.enableInCommitTimestamps", "false")])
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let props = reloaded.table_properties();
+    assert_eq!(props.enable_in_commit_timestamps, Some(false));
+    assert_eq!(props.in_commit_timestamp_enablement_version, None);
+    assert_eq!(props.in_commit_timestamp_enablement_timestamp, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn alter_table_rejects_enabling_column_mapping() -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot =
         create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
 
     let result = snapshot
         .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
-        .with_table_properties_added([("delta.enableChangeDataFeed", "true")])
+        .with_table_properties_added([("delta.columnMapping.mode", "name")])
         .build(engine.as_ref(), committer());
 
-    assert_result_error_with_message(result, "Cannot modify the table property");
+    assert_result_error_with_message(
+        result,
+        "Changing column mapping mode on an existing table is not supported",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn alter_table_enables_feature_property_and_upgrades_protocol() -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
+    assert_ne!(
+        snapshot.table_properties().enable_change_data_feed,
+        Some(true)
+    );
+
+    snapshot
+        .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
+        .with_table_properties_added([("delta.enableChangeDataFeed", "true")])
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(
+        reloaded.table_properties().enable_change_data_feed,
+        Some(true)
+    );
+    let protocol_actions = read_actions_from_commit(reloaded.table_root(), 1, "protocol")?;
+    assert_eq!(protocol_actions.len(), 1);
+    let writer_features = protocol_actions[0]["writerFeatures"]
+        .as_array()
+        .expect("writerFeatures array");
+    assert!(
+        writer_features
+            .iter()
+            .any(|feature| feature.as_str() == Some("changeDataFeed")),
+        "protocol={protocol_actions:?}"
+    );
     Ok(())
 }
 
