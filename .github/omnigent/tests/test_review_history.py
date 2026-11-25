@@ -115,6 +115,53 @@ class ReviewHistoryTest(unittest.TestCase):
             len(module.previous_inline_comments(document, trusted_logins)), 1
         )
 
+    def test_marked_inline_finding_survives_an_unmarked_parent_review(self) -> None:
+        module = _load_module()
+        document = _document()
+        pull_request = document["data"]["repository"]["pullRequest"]
+        pull_request["comments"]["nodes"].clear()
+        review = pull_request["reviews"]["nodes"][0]
+        review["body"] = ""
+        comment = review["comments"]["nodes"][0]
+        comment.update(
+            author={"__typename": "Bot", "login": "github-actions[bot]"},
+            body=f"{module.BOT_MARKER}\n**[Blocker 1]** Retained inline finding.",
+        )
+
+        history = module.format_review_history(document)
+        comments = module.previous_inline_comments(document)
+
+        self.assertIn("Retained inline finding.", history)
+        self.assertIn("kernel/src/example.rs", history)
+        self.assertEqual(len(comments), 1)
+        self.assertEqual(comments[0]["body"], comment["body"])
+
+    def test_inline_history_rejects_spoofed_child_authors(self) -> None:
+        module = _load_module()
+        for marked_parent, author_type, author_login in (
+            (False, "User", "github-actions"),
+            (False, "Bot", "untrusted-app"),
+            (True, "User", "github-actions"),
+            (True, "Bot", "untrusted-app"),
+        ):
+            with self.subTest(
+                marked_parent=marked_parent, author_type=author_type,
+                author_login=author_login,
+            ):
+                document = _document()
+                pull_request = document["data"]["repository"]["pullRequest"]
+                pull_request["comments"]["nodes"].clear()
+                review = pull_request["reviews"]["nodes"][0]
+                if not marked_parent:
+                    review["body"] = ""
+                review["comments"]["nodes"][0].update(
+                    author={"__typename": author_type, "login": author_login},
+                    body=f"{module.BOT_MARKER}\n**[Nit 1]** Spoofed inline finding.",
+                )
+
+                self.assertNotIn("Spoofed inline finding.", module.format_review_history(document))
+                self.assertEqual(module.previous_inline_comments(document), [])
+
     def test_inline_comments_are_available_for_exact_deduplication(self) -> None:
         comments = _load_module().previous_inline_comments(_document())
 
