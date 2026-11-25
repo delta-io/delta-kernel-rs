@@ -298,7 +298,7 @@ class InlineReviewTest(unittest.TestCase):
         description_policy = (SHARED_DIR / "pr_description.md").read_text().strip()
         self.assertIn("## PR description accuracy", description_policy)
         self.assertEqual(orchestrator.count(description_policy), 1)
-        self.assertIn("Always dispatch `docs-reviewer`", " ".join(reviewer_contract.split()))
+        self.assertIn("every configured Reviewer subagent, even for narrow changes", " ".join(reviewer_contract.split()))
         self.assertIn("including rustdoc the diff does not touch", " ".join(reviewer_contract.split()))
         for agent, instructions in children.items():
             with self.subTest(agent=agent, block="pr_description"):

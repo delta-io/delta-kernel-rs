@@ -917,9 +917,11 @@ jobs:
               repository(owner: $owner, name: $name) {
                 pullRequest(number: $number) {
                   comments(last: 30) {
+                    pageInfo { hasPreviousPage hasNextPage }
                     nodes { id url author { __typename login } body createdAt }
                   }
                   reviews(last: 30) {
+                    pageInfo { hasPreviousPage hasNextPage }
                     nodes {
                       id
                       url
@@ -928,6 +930,7 @@ jobs:
                       body
                       submittedAt
                       comments(first: 50) {
+                        pageInfo { hasPreviousPage hasNextPage }
                         nodes { fullDatabaseId url author { __typename login } path line originalLine body }
                       }
                     }
@@ -942,11 +945,13 @@ jobs:
             echo "::warning::Previous AI review history is unavailable; continuing without cross-run deduplication."
             printf '{}\n' > /tmp/pr_history.json
           fi
+          export INLINE_LOCATIONS_AVAILABLE=true
           if ! gh api \
             "repos/${REPO}/pulls/${PR_NUMBER}/comments?per_page=100&sort=created&direction=desc" \
             > /tmp/pr_review_comments.json; then
             echo "::warning::Review-comment locations are unavailable; continuing without exact inline deduplication."
             printf '[]\n' > /tmp/pr_review_comments.json
+            export INLINE_LOCATIONS_AVAILABLE=false
           fi
 
           read -r base_sha head_sha head_repo < <(
@@ -1003,6 +1008,8 @@ jobs:
           sys.path.insert(0, ".github/omnigent")
           from inline_review import inline_prompt_instructions
           from diff_coverage import build_orchestrator_task_message, prepare_review_inputs
+          from review_evidence import accounting_prompt_instructions
+          import yaml
           from review_history import (
               DEFAULT_TRUSTED_BOT_LOGINS,
               attach_inline_comment_sides,
@@ -1016,7 +1023,15 @@ jobs:
 
           review_marker = os.environ["REVIEW_MARKER"]
           review_base_sha = os.environ["REVIEW_BASE_SHA"]
-          output_contract = inline_prompt_instructions(review_marker)
+          output_contract = (
+              inline_prompt_instructions(review_marker) + accounting_prompt_instructions(review_marker)
+          )
+          reviewer_config = yaml.safe_load(
+              pathlib.Path(".github/omnigent/reviewer/config.yaml").read_text()
+          )
+          required_roles = [
+              role for role in reviewer_config["tools"]["agents"] if role != "disprove-reviewer"
+          ]
           pr_metadata = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
           history_path = pathlib.Path("/tmp/pr_history.json")
           history_document = json.loads(history_path.read_text())
@@ -1024,6 +1039,9 @@ jobs:
               pathlib.Path("/tmp/pr_review_comments.json").read_text()
           )
           attach_inline_comment_sides(history_document, review_comments)
+          history_document["_inline_locations_available"] = (
+              os.environ.get("INLINE_LOCATIONS_AVAILABLE") == "true"
+          )
           history_path.write_text(json.dumps(history_document))
           trusted_bot_logins = list(DEFAULT_TRUSTED_BOT_LOGINS)
           if omnigent_bot_login := os.environ.get("OMNIGENT_BOT_LOGIN", "").strip():
@@ -1104,6 +1122,8 @@ jobs:
           The PR diff is included below. Fan the review out to your reviewer
           sub-agents per your roster, collect their findings, and consolidate
           them into one review following your output contract.
+          Required primary reviewers: {', '.join(required_roles)}. Dispatch all of them;
+          an explicit empty candidate list is a valid completed specialist review.
 
           Each reviewer can use the bounded read-only source tools to inspect
           the exact PR source tree (`repository: pr`), the read-only Delta checkout
@@ -1151,6 +1171,39 @@ jobs:
               orchestrator_initial_task_text, pr_change_patch_bytes, coverage
           )
           pathlib.Path("/tmp/orchestrator_task.md").write_text(orchestrator_initial_task_text, encoding="utf-8")
+          PYEOF
+
+      - name: Bind reviewer execution record
+        if: >-
+          steps.creds.outputs.available == 'true' &&
+          steps.context.outputs.review_marker != ''
+        env:
+          REVIEW_RUN_ID: ${{ github.run_id }}
+          HEAD_SHA: ${{ steps.context.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import json
+          import os
+          import pathlib
+
+          import yaml
+
+          path = pathlib.Path(".github/omnigent/reviewer/config.yaml")
+          config = yaml.safe_load(path.read_text())
+          roles = [role for role in config["tools"]["agents"] if role != "disprove-reviewer"]
+          identity = {
+              "run_id": os.environ["REVIEW_RUN_ID"],
+              "head_sha": os.environ["HEAD_SHA"],
+              "required_roles": roles,
+          }
+          config["guardrails"]["policies"]["record_review_evidence"]["function"]["arguments"] = {
+              "path": "/tmp/review_observations.jsonl", **identity,
+          }
+          path.write_text(yaml.safe_dump(config, sort_keys=False))
+          pathlib.Path("/tmp/review_run.json").write_text(json.dumps(identity))
+          pathlib.Path("/tmp/required_reviewers.json").write_text(json.dumps(roles))
+          pathlib.Path("/tmp/review_observations.jsonl").write_text("")
           PYEOF
 
       # This GitHub-generated archive is untrusted reference data. Nothing from it may be executed.
@@ -1313,6 +1366,7 @@ jobs:
           sys.path.insert(0, ".github/omnigent")
           from inline_review import extract_inline_findings
           from review_publish import extract_marked_review
+          from review_evidence import extract_accounting
 
           raw = pathlib.Path("/tmp/review_raw_output.txt").read_text(errors="replace")
           marker = os.environ.get("REVIEW_MARKER", "")
@@ -1378,6 +1432,21 @@ jobs:
           if any(ord(char) < 32 and char not in "\n\t" for char in body):
               print("::error::AI review contains unsupported control characters.")
               sys.exit(1)
+
+          try:
+              body, accounting = extract_accounting(body, marker)
+          except ValueError:
+              boundaries = (
+                  f"AI_REVIEW_ACCOUNTING_START_{marker}", f"AI_REVIEW_ACCOUNTING_END_{marker}"
+              )
+              if any(boundary in body for boundary in boundaries):
+                  raise SystemExit(
+                      "Review accounting boundaries are ambiguous; refusing raw metadata publication."
+                  )
+              accounting = {}
+          if not accounting:
+              print("::warning::Review candidate accounting is unavailable; completion is partial.")
+          pathlib.Path("/tmp/review_accounting.json").write_text(json.dumps(accounting))
 
           try:
               body, findings = extract_inline_findings(body, marker)
@@ -1447,6 +1516,50 @@ jobs:
             --output /tmp/publication_record.json \
             --check-output /tmp/check-summary.txt \
             --full-review-output /tmp/review_output_complete.txt
+
+      - name: Collect reviewer execution evidence
+        if: >-
+          always() && steps.creds.outputs.available == 'true' &&
+          steps.context.outputs.review_marker != ''
+        env:
+          REVIEW_RUN_ID: ${{ github.run_id }}
+          HEAD_SHA: ${{ steps.context.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import json
+          import pathlib
+          import sys
+
+          sys.path.insert(0, ".github/omnigent")
+          from review_history import history_evidence
+
+          document = json.loads(pathlib.Path("/tmp/pr_history.json").read_text())
+          logins = json.loads(pathlib.Path("/tmp/trusted_bot_logins.json").read_text())
+          history = history_evidence(document, logins)
+          pathlib.Path("/tmp/review_history_evidence.json").write_text(json.dumps(history))
+          PYEOF
+          python3 .github/omnigent/review_evidence.py \
+            --observations /tmp/review_observations.jsonl \
+            --accounting /tmp/review_accounting.json \
+            --publication /tmp/publication_record.json \
+            --history /tmp/review_history_evidence.json \
+            --required-roles /tmp/required_reviewers.json \
+            --run-id "$REVIEW_RUN_ID" \
+            --head-sha "$HEAD_SHA" \
+            --output /tmp/review_execution.json \
+            --check-output /tmp/check-summary.txt
+
+      - name: Retain reviewer execution evidence
+        if: >-
+          always() && steps.creds.outputs.available == 'true' &&
+          steps.context.outputs.review_marker != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: ai-review-execution-${{ needs.authorize.outputs.pr_number }}-${{ github.run_id }}
+          path: /tmp/review_execution.json
+          retention-days: 7
+          if-no-files-found: error
 
       - name: Publish review summary
         if: >-
