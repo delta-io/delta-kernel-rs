@@ -117,8 +117,8 @@ def _coverage_reasons(coverage, head_sha, reasons):
             "The patch-excerpt coverage record names a different or unknown review range.",
         )
         return []
-    total, delivered = coverage.get("total_bytes"), coverage.get("delivered_bytes")
-    valid_bytes = _nonnegative(total) and _nonnegative(delivered) and delivered <= total
+    total, excerpt_bytes = coverage.get("total_bytes"), coverage.get("excerpt_bytes")
+    valid_bytes = _nonnegative(total) and _nonnegative(excerpt_bytes) and excerpt_bytes <= total
     files = coverage.get("files")
     valid_files = isinstance(files, list) and all(
         isinstance(item, dict) and _valid_path(item.get("path"))
@@ -141,7 +141,7 @@ def _coverage_reasons(coverage, head_sha, reasons):
             reasons, "coverage_record_incomplete",
             "The patch-excerpt coverage record is incomplete.",
         )
-    if (coverage.get("complete") is not True or not valid_bytes or delivered != total
+    if (coverage.get("complete") is not True or not valid_bytes or excerpt_bytes != total
             or measured["partial"] or measured["omitted"]):
         _reason(
             reasons, "diff_incomplete",

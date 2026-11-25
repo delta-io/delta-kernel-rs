@@ -494,7 +494,7 @@ class FindingPublicationTest(unittest.TestCase):
     def test_large_coverage_report_links_complete_artifact_within_check_api_budget(self):
         coverage = {
             "base_sha": "b" * 40, "head_sha": HEAD_SHA,
-            "total_bytes": 500_000, "delivered_bytes": 100_000, "complete": False,
+            "total_bytes": 500_000, "excerpt_bytes": 100_000, "complete": False,
             "total_files": 1300, "full_files": 0, "partial_files": 0, "omitted_files": 1300,
             "files": [{"path": f"directory/{i}/" + "x" * 170, "status": "omitted"}
                       for i in range(1300)],

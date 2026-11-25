@@ -60,7 +60,7 @@ def inputs(*, head_sha=HEAD, findings=None, blockers=None):
         "head_sha": head_sha, "run_id": RUN_ID,
         "coverage": {
             "head_sha": head_sha, "base_sha": BASE, "complete": True,
-            "total_bytes": 100, "delivered_bytes": 100,
+            "total_bytes": 100, "excerpt_bytes": 100,
             "total_files": 1, "full_files": 1, "partial_files": 0, "omitted_files": 0,
             "files": [{"path": "README.md", "start": 0, "end": 100, "status": "full"}],
         },
@@ -242,7 +242,7 @@ class ReviewStatusTest(unittest.TestCase):
         self.assertEqual(compute_review_status(**arguments)["status"], "NO VERDICT")
 
     def test_missing_patch_coverage_fields_prevent_approval(self):
-        for field in ("files", "base_sha", "total_files", "full_files", "delivered_bytes"):
+        for field in ("files", "base_sha", "total_files", "full_files", "excerpt_bytes"):
             with self.subTest(field=field):
                 arguments = inputs()
                 arguments["coverage"].pop(field)
@@ -269,10 +269,10 @@ class ReviewStatusTest(unittest.TestCase):
     def test_empty_patch_is_complete_and_nonempty_patch_requires_paths(self):
         arguments = inputs()
         arguments["coverage"].update(
-            total_bytes=0, delivered_bytes=0, total_files=0, full_files=0, files=[],
+            total_bytes=0, excerpt_bytes=0, total_files=0, full_files=0, files=[],
         )
         self.assertEqual(compute_review_status(**arguments)["status"], "APPROVED")
-        arguments["coverage"].update(total_bytes=100, delivered_bytes=100)
+        arguments["coverage"].update(total_bytes=100, excerpt_bytes=100)
         self.assertEqual(compute_review_status(**arguments)["status"], "NO VERDICT")
 
     def test_same_sha_history_blockers_receive_noncolliding_display_ids(self):
