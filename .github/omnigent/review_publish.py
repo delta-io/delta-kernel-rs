@@ -10,6 +10,7 @@ from markdown_utils import markdown_lines
 
 
 BOT_MARKER = "<!-- ai-review-bot -->"
+AI_REVIEW_TITLE = "🤖 AI Review 🧐"
 FINDING_FEEDBACK_PROMPT = (
     "Feedback: react 👍 if helpful, 👎 if unhelpful or incorrect, "
     "or 👀 if out of scope."
@@ -93,7 +94,7 @@ def strip_review_body(body: str) -> str:
     body = re.sub(r"^<!-- ai-review-main \{[^\n]*\} -->\s*", "", body)
     if body.startswith(REVIEW_HEADER):
         body = body[len(REVIEW_HEADER) :].lstrip()
-    elif body.startswith("## AI Review\n"):
+    elif re.match(rf"## (?:{re.escape(AI_REVIEW_TITLE)}|AI Review)(?: - [A-Z ]+)?\n", body):
         summary = re.search(
             r"<details><summary>PR Summary</summary>\s*\n(.*?)\n\s*</details>",
             body,
@@ -166,7 +167,7 @@ def format_review_summary(
     confirmed = [finding for finding in findings if finding.get("url")]
     counts = Counter(finding["severity"] for finding in confirmed)
     headline = f"**{_finding_counts(counts)}**" if counts_available else "Finding counts unavailable."
-    parts = [BOT_MARKER, "## AI Review", headline, f"Reviewed `{head_sha[:8]}`"]
+    parts = [BOT_MARKER, f"## {AI_REVIEW_TITLE}", headline, f"Reviewed `{head_sha[:8]}`"]
     if errors:
         parts.append("Publication incomplete: " + " ".join(dict.fromkeys(errors)))
     parts.append(
