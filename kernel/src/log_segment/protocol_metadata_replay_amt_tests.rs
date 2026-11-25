@@ -19,7 +19,9 @@ use crate::actions::{
 };
 use crate::arrow::array::StringArray;
 use crate::committer::FileSystemCommitter;
-use crate::crc::{Crc, CrcWithProvenance, FileStats, FileStatsState};
+#[cfg(feature = "declarative-plans")]
+use crate::crc::CrcWithProvenance;
+use crate::crc::{Crc, FileStats, FileStatsState};
 #[cfg(feature = "declarative-plans")]
 use crate::engine::DelegatingEngine;
 #[cfg(feature = "declarative-plans")]
