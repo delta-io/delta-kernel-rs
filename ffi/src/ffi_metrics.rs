@@ -534,7 +534,9 @@ impl From<kernel::CheckpointWriteStats> for CheckpointWriteStats {
 pub struct ReadFailure {
     pub table_id: KernelStringSlice,
     pub table_path: KernelStringSlice,
+    /// Operation ID of the snapshot build for CRC reads, or of the domain metadata read.
     pub operation_id: MetricId,
+    /// Caller-supplied request identifier. Empty when omitted.
     pub correlation_id: KernelStringSlice,
 }
 
@@ -543,7 +545,9 @@ pub struct ReadFailure {
 pub struct DomainMetadataLoadSuccess {
     pub table_id: KernelStringSlice,
     pub table_path: KernelStringSlice,
+    /// Unique ID for this domain metadata read.
     pub operation_id: MetricId,
+    /// Caller-supplied request identifier. Empty when omitted.
     pub correlation_id: KernelStringSlice,
     pub from_cache: bool,
     pub num_domains_returned: u64,
@@ -563,7 +567,9 @@ pub struct SetTransactionLoadSuccess {
 pub struct CrcReadSuccess {
     pub table_id: KernelStringSlice,
     pub table_path: KernelStringSlice,
+    /// Operation ID of the snapshot build that requested this CRC.
     pub operation_id: MetricId,
+    /// Caller-supplied request identifier. Empty when omitted.
     pub correlation_id: KernelStringSlice,
     pub bytes_read: u64,
     pub duration_ns: u64,
@@ -1192,6 +1198,88 @@ mod tests {
     }
 
     #[rstest]
+    #[case::crc_success(true, false)]
+    #[case::crc_failure(true, true)]
+    #[case::domain_success(false, false)]
+    #[case::domain_failure(false, true)]
+    fn read_metric_conversion_preserves_identity(
+        #[case] crc: bool,
+        #[case] failed: bool,
+        #[values(Some("request"), None)] request: Option<&str>,
+    ) {
+        use kernel::MetricEvent as K;
+
+        let operation_id = kernel::MetricId::new();
+        let correlation_id = request.map(Into::into);
+        let expected_table_id = request.map(|_| "table-17");
+        let expected_table_path = request.map(|_| "/tables/example");
+        let event = match (crc, failed) {
+            (true, false) => K::CrcReadSuccess(kernel::CrcReadSuccess {
+                operation_id,
+                correlation_id,
+                table_id: expected_table_id.map(Into::into),
+                table_path: expected_table_path.map(Into::into),
+                bytes_read: 42,
+                duration: Duration::ZERO,
+            }),
+            (true, true) => K::CrcReadFailure {
+                operation_id,
+                correlation_id,
+                table_id: expected_table_id.map(Into::into),
+                table_path: expected_table_path.map(Into::into),
+            },
+            (false, false) => K::DomainMetadataLoadSuccess(kernel::DomainMetadataLoadSuccess {
+                operation_id,
+                correlation_id,
+                table_id: expected_table_id.map(Into::into),
+                table_path: expected_table_path.map(Into::into),
+                from_cache: false,
+                num_domains_returned: 0,
+                duration: Duration::ZERO,
+            }),
+            (false, true) => K::DomainMetadataLoadFailure {
+                operation_id,
+                correlation_id,
+                table_id: expected_table_id.map(Into::into),
+                table_path: expected_table_path.map(Into::into),
+            },
+        };
+        with_ffi_event(&event, |event| {
+            let (id, correlation, table_id, table_path) = match (crc, failed, event) {
+                (true, false, MetricEvent::CrcReadSuccess(read)) => (
+                    read.operation_id,
+                    read.correlation_id,
+                    read.table_id,
+                    read.table_path,
+                ),
+                (false, false, MetricEvent::DomainMetadataLoadSuccess(read)) => (
+                    read.operation_id,
+                    read.correlation_id,
+                    read.table_id,
+                    read.table_path,
+                ),
+                (true, true, MetricEvent::CrcReadFailure(read))
+                | (false, true, MetricEvent::DomainMetadataLoadFailure(read)) => (
+                    read.operation_id,
+                    read.correlation_id,
+                    read.table_id,
+                    read.table_path,
+                ),
+                _ => panic!("unexpected read metric"),
+            };
+            let correlation: &str =
+                unsafe { TryFromStringSlice::try_from_slice(&correlation).unwrap() };
+            assert_eq!(id.bytes, operation_id.as_bytes());
+            assert_eq!(correlation, request.unwrap_or_default());
+            let table_id: &str = unsafe { TryFromStringSlice::try_from_slice(&table_id).unwrap() };
+            let table_path: &str =
+                unsafe { TryFromStringSlice::try_from_slice(&table_path).unwrap() };
+            assert_eq!(table_id, expected_table_id.unwrap_or_default());
+            assert_eq!(table_path, expected_table_path.unwrap_or_default());
+        });
+    }
+
+    #[rstest]
     #[case::v1(kernel::CheckpointWriteMode::V1, CheckpointWriteMode::V1)]
     #[case::v2_without_sidecars(
         kernel::CheckpointWriteMode::V2WithoutSidecars,
@@ -1577,47 +1665,6 @@ mod tests {
             assert_eq!(event.resolution_mode, expected_mode);
             assert_eq!(event.duration_ns, expected_duration_ns);
         });
-    }
-
-    #[rstest]
-    #[case::present(Some("table-17"))]
-    #[case::absent(None)]
-    fn read_failure_callbacks_preserve_table_identity(#[case] id: Option<&str>) {
-        for event in [
-            kernel::MetricEvent::DomainMetadataLoadFailure {
-                operation_id: kernel::MetricId::new(),
-                correlation_id: None,
-                table_id: id.map(Into::into),
-                table_path: Some("/tables/example".into()),
-            },
-            kernel::MetricEvent::CrcReadFailure {
-                operation_id: kernel::MetricId::new(),
-                correlation_id: None,
-                table_id: id.map(Into::into),
-                table_path: Some("/tables/example".into()),
-            },
-        ] {
-            assert_eq!(event.table_id(), id);
-            with_ffi_event(&event, |ffi| {
-                let read = match (&event, ffi) {
-                    (
-                        kernel::MetricEvent::DomainMetadataLoadFailure { .. },
-                        MetricEvent::DomainMetadataLoadFailure(slice),
-                    )
-                    | (
-                        kernel::MetricEvent::CrcReadFailure { .. },
-                        MetricEvent::CrcReadFailure(slice),
-                    ) => slice,
-                    _ => panic!("unexpected FFI event for {event:?}"),
-                };
-                let actual: &str =
-                    unsafe { TryFromStringSlice::try_from_slice(&read.table_id).unwrap() };
-                let path: &str =
-                    unsafe { TryFromStringSlice::try_from_slice(&read.table_path).unwrap() };
-                assert_eq!(actual, id.unwrap_or_default());
-                assert_eq!(path, "/tables/example");
-            });
-        }
     }
 
     #[test]

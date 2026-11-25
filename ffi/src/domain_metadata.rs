@@ -56,8 +56,10 @@ pub unsafe extern "C" fn get_domain_metadata(
 ///
 /// # Safety
 ///
-/// The requirements of [get_domain_metadata] apply. The identifier must remain readable for the
-/// call.
+/// The requirements of [get_domain_metadata] apply. A zero-length identifier is omitted and
+/// its pointer is ignored. A non-null pointer for a non-empty identifier must address its
+/// length in readable bytes for the call. Kernel copies the UTF-8 identifier and returns an
+/// error for invalid UTF-8 or a null pointer with nonzero length.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_domain_metadata_with_correlation_id(
     snapshot: Handle<SharedSnapshot>,
@@ -116,8 +118,8 @@ pub unsafe extern "C" fn snapshot_row_tracking_high_water_mark(
 ///
 /// # Safety
 ///
-/// The requirements of [snapshot_row_tracking_high_water_mark] apply. The identifier must remain
-/// readable for the call.
+/// The requirements of [snapshot_row_tracking_high_water_mark] apply. The correlation ID follows
+/// the slice contract of [get_domain_metadata_with_correlation_id].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snapshot_row_tracking_high_water_mark_with_correlation_id(
     snapshot: Handle<SharedSnapshot>,
@@ -200,8 +202,8 @@ pub unsafe extern "C" fn visit_clustering_columns(
 ///
 /// # Safety
 ///
-/// The requirements of [visit_clustering_columns] apply. The identifier must remain readable for
-/// the call.
+/// The requirements of [visit_clustering_columns] apply. The correlation ID follows the
+/// slice contract of [get_domain_metadata_with_correlation_id].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_clustering_columns_with_correlation_id(
     snapshot: Handle<SharedSnapshot>,
@@ -275,8 +277,8 @@ pub unsafe extern "C" fn visit_domain_metadata(
 ///
 /// # Safety
 ///
-/// The requirements of [visit_domain_metadata] apply. The identifier must remain readable for the
-/// call.
+/// The requirements of [visit_domain_metadata] apply. The correlation ID follows the
+/// slice contract of [get_domain_metadata_with_correlation_id].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_domain_metadata_with_correlation_id(
     snapshot: Handle<SharedSnapshot>,
@@ -423,38 +425,38 @@ mod tests {
             .await
             .unwrap();
 
+        // Keep a second dispatcher registered so callsite interest is evaluated across
+        // dispatchers even when another test thread has no local subscriber.
+        let _dispatch = tracing::Dispatch::new(tracing_subscriber::registry());
+        let reporter = Arc::new(test_utils::CapturingReporter::default());
+        let _guard = crate::ffi_test_utils::install_thread_local_metrics_reporter(reporter.clone());
         let snapshot =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
-        {
-            let reporter = Arc::new(test_utils::CapturingReporter::default());
-            let _guard =
-                crate::ffi_test_utils::install_thread_local_metrics_reporter(reporter.clone());
-            let domain = "missing";
-            for request in ["first", "second", ""] {
-                let result = unsafe {
-                    get_domain_metadata_with_correlation_id(
-                        snapshot.shallow_copy(),
-                        kernel_string_slice!(domain),
-                        engine.shallow_copy(),
-                        allocate_str,
-                        kernel_string_slice!(request),
-                    )
-                };
-                assert!(ok_or_panic(result).is_none());
-            }
-            let reads: Vec<_> = reporter
-                .events()
-                .into_iter()
-                .filter_map(|event| match event {
-                    delta_kernel::metrics::MetricEvent::DomainMetadataLoadSuccess(read) => {
-                        Some(read.correlation_id)
-                    }
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(reads, [Some("first".into()), Some("second".into()), None]);
+        let domain = "missing";
+        for request in ["first", "second", ""] {
+            let result = unsafe {
+                get_domain_metadata_with_correlation_id(
+                    snapshot.shallow_copy(),
+                    kernel_string_slice!(domain),
+                    engine.shallow_copy(),
+                    allocate_str,
+                    kernel_string_slice!(request),
+                )
+            };
+            assert!(ok_or_panic(result).is_none());
         }
+        let reads: Vec<_> = reporter
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                delta_kernel::metrics::MetricEvent::DomainMetadataLoadSuccess(read) => {
+                    Some(read.correlation_id)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reads, [Some("first".into()), Some("second".into()), None]);
 
         let get_domain_metadata_helper = |domain: &str| unsafe {
             get_domain_metadata(

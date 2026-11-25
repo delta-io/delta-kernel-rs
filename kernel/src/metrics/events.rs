@@ -102,7 +102,9 @@ pub enum MetricEvent {
     TransactionCommitFailure(TransactionCommitFailure),
     DomainMetadataLoadSuccess(DomainMetadataLoadSuccess),
     DomainMetadataLoadFailure {
+        /// Unique ID for this domain metadata read.
         operation_id: MetricId,
+        /// Caller-supplied request identifier.
         correlation_id: Option<Arc<str>>,
         table_id: Option<Arc<str>>,
         table_path: Option<Arc<str>>,
@@ -111,7 +113,9 @@ pub enum MetricEvent {
     SetTransactionLoadFailure,
     CrcReadSuccess(CrcReadSuccess),
     CrcReadFailure {
+        /// Operation ID of the snapshot build that requested this CRC.
         operation_id: MetricId,
+        /// Caller-supplied request identifier.
         correlation_id: Option<Arc<str>>,
         table_id: Option<Arc<str>>,
         table_path: Option<Arc<str>>,
@@ -1448,7 +1452,9 @@ pub(crate) const DOMAIN_METADATA_LOADED_SPAN: &str = "snap.get_domain_metadata";
 /// system (`delta.*`) domains such as clustering or row tracking.
 #[derive(Debug, Clone)]
 pub struct DomainMetadataLoadSuccess {
+    /// Unique ID for this domain metadata read.
     pub operation_id: MetricId,
+    /// Caller-supplied request identifier.
     pub correlation_id: Option<Arc<str>>,
     /// Opaque identifier of the table being read, when known.
     pub table_id: Option<Arc<str>>,
@@ -1580,7 +1586,9 @@ pub(crate) const CRC_READ_COMPLETED_SPAN: &str = "crc_read_completed";
 /// A CRC file was read and parsed successfully. `bytes_read` is the raw byte count from storage.
 #[derive(Debug, Clone)]
 pub struct CrcReadSuccess {
+    /// Operation ID of the snapshot build that requested this CRC.
     pub operation_id: MetricId,
+    /// Caller-supplied request identifier.
     pub correlation_id: Option<Arc<str>>,
     /// Opaque identifier of the table being read, when known.
     pub table_id: Option<Arc<str>>,

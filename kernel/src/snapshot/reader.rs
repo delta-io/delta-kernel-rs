@@ -115,7 +115,8 @@ impl<'a> SnapshotReader<'a> {
     }
 
     /// Attach the current caller's request identifier to domain metadata reads on this reader.
-    /// An empty value clears it. Other readers of the snapshot keep their own attribution.
+    /// Each domain read gets its own operation ID. An empty value clears the request identifier.
+    /// This includes the row-tracking and clustering getters that read domain metadata.
     pub fn with_correlation_id(mut self, id: impl Into<Arc<str>>) -> Self {
         self.correlation_id = Some(id.into()).filter(|id| !id.is_empty());
         self
