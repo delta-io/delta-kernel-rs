@@ -9,6 +9,7 @@ use tracing::{Level, Span, Subscriber, event, warn};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 
+use super::ScanPlanReport;
 use super::events::{
     CheckpointWriteSuccess, ChecksumWriteSuccess, CrcReadSuccess, DomainMetadataLoadSuccess,
     JsonReadCompleted, LastCheckpointReadCompleted, LogSegmentLoadSuccess, MetricEvent,
@@ -107,6 +108,9 @@ where
             return;
         };
         let event = match metadata.name() {
+            ScanPlanReport::SPAN_NAME => Some(MetricEvent::ScanPlanGenerationCompleted(
+                ScanPlanReport::from_attrs(attrs),
+            )),
             CheckpointWriteSuccess::SPAN_NAME => Some(MetricEvent::CheckpointWriteSuccess(
                 CheckpointWriteSuccess::from_attrs(attrs),
             )),
@@ -321,13 +325,18 @@ mod tests {
 
     use test_utils::{LogWriter, ensure_metrics_compatible_global_subscriber};
     use tracing::field::Empty;
+    use tracing::span::{Attributes, Id, Record};
     use tracing::subscriber::with_default;
-    use tracing::{info, info_span, instrument};
+    use tracing::{Subscriber, info, info_span, instrument};
+    use tracing_subscriber::filter::LevelFilter;
     use tracing_subscriber::fmt::layer;
-    use tracing_subscriber::layer::SubscriberExt as _;
-    use tracing_subscriber::registry;
+    use tracing_subscriber::layer::{Identity, SubscriberExt as _};
+    use tracing_subscriber::registry::LookupSpan;
+    use tracing_subscriber::{Layer, Registry, registry, reload};
     use uuid::Uuid;
 
+    use super::ReportGeneratorLayer;
+    use crate::checkpoint::{CheckpointInfo, SelectedCheckpointType};
     use crate::metrics::events::{
         SNAPSHOT_COMPLETED_SPAN, SnapshotLoadMetricContext, emit_log_segment_load_failure,
         emit_protocol_metadata_load_failure,
@@ -335,8 +344,11 @@ mod tests {
     use crate::metrics::{
         CheckpointOutputStats, CheckpointProcessingStats, CheckpointWriteMode,
         CheckpointWriteOutcome, CheckpointWriteStats, CrcReadFailureReason,
-        LastCheckpointReadOutcome, MetricEvent, MetricId, WithMetricsReporterLayer as _,
+        LastCheckpointReadOutcome, MetricEvent, MetricId, ScanPlanOutcome, ScanPlanReport,
+        WithMetricsReporterLayer as _, emit_scan_plan_completed,
     };
+    use crate::scan::{PartitionValuesOptions, StatsOptions};
+    use crate::schema::schema_ref;
     use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
 
     /// Run `f` under a subscriber that layers the metrics layer over an fmt layer capturing to a
@@ -413,6 +425,169 @@ mod tests {
         assert!(
             logs.contains("Invalid field 'failure_reason' recorded on crc_read_completed span")
         );
+    }
+
+    #[rstest::rstest]
+    fn scan_plan_completion_respects_filter_and_reload(
+        #[values(false, true)] accepted: bool,
+        #[values(false, true)] reload_wrapped: bool,
+        #[values(false, true)] with_checkpoint: bool,
+        #[values(0, 64)] schema_depth: usize,
+        #[values(
+            StatsOptions::none(),
+            StatsOptions::all_struct_with_extra_indexed(vec![crate::expressions::column_name!("nested", "a.b")]),
+            StatsOptions::struct_columns(vec![crate::expressions::column_name!("nested", "a.b")]),
+        )]
+        stats: StatsOptions,
+    ) {
+        ensure_metrics_compatible_global_subscriber();
+        let reporter = Arc::new(CapturingReporter::default());
+        let reporting = ReportGeneratorLayer::new(reporter.clone());
+        let reporting: Box<dyn Layer<Registry> + Send + Sync> = if reload_wrapped {
+            Box::new(reload::Layer::new(reporting).0)
+        } else {
+            Box::new(reporting)
+        };
+        let level = if accepted {
+            LevelFilter::INFO
+        } else {
+            LevelFilter::OFF
+        };
+        let subscriber = registry()
+            .with(reporting.with_filter(level))
+            .with(Identity::new().with_filter(LevelFilter::INFO));
+        assert!(
+            tracing::Dispatch::new(LookupOnlySubscriber(registry()))
+                .downcast_ref::<Registry>()
+                .is_none()
+        );
+        let stats = stats.with_variant_min_max_stats(true);
+        #[cfg(feature = "geo-type-in-dev")]
+        let stats = stats.with_geometry_min_max_stats(true);
+        let leaf_schema = (0..schema_depth).fold(schema_ref! {}, |schema, _| {
+            Arc::new(
+                crate::schema::StructType::try_new([crate::schema::StructField::nullable(
+                    "nested",
+                    schema.as_ref().clone(),
+                )])
+                .unwrap(),
+            )
+        });
+        let report = ScanPlanReport {
+            operation_id: MetricId::new(),
+            table_id: "table-test".into(),
+            table_path: "s3://bucket/table%20path/".into(),
+            correlation_id: with_checkpoint.then(|| Arc::from("")),
+            outcome: ScanPlanOutcome::Plan,
+            duration_ns: 17,
+            num_plan_nodes: 3,
+            checkpoint: with_checkpoint.then(|| crate::metrics::CheckpointMetrics {
+                version: 0,
+                info: Some(Arc::new(CheckpointInfo {
+                    checkpoint_type: SelectedCheckpointType::V2,
+                    leaf_checkpoint_schema: leaf_schema,
+                    sidecars: vec![crate::FileMeta {
+                        location: url::Url::parse("memory:///sidecar.parquet").unwrap(),
+                        last_modified: 23,
+                        size: 13,
+                    }]
+                    .into(),
+                    size_in_bytes: 30,
+                    last_checkpoint: Box::new(
+                        serde_json::from_value(serde_json::json!({
+                            "version": 0, "size": 2,
+                        }))
+                        .unwrap(),
+                    ),
+                })),
+                source: Some(crate::metrics::CheckpointSource::Resolved),
+                root_footer_calls: 2,
+                sidecar_footer_calls: 3,
+                metadata_query_calls: 4,
+                duration_ns: 5,
+            }),
+            metadata_planning: crate::metrics::MetadataPlanningReport {
+                stats,
+                partition_values: PartitionValuesOptions::with_struct()
+                    .with_timestamp_timezone("UTC"),
+                read_collations: true,
+                has_filter: true,
+                replay_base: Some(crate::metrics::ReplayBase::Checkpoint),
+                base_version: Some(0),
+                commit_start_version: Some(1),
+                commit_end_version: Some(2),
+                commit_total_size_bytes: 11,
+                compaction_file_count: 1,
+                total_json_bytes: 19,
+                total_parquet_bytes: 30,
+            },
+        };
+        with_default(LookupOnlySubscriber(subscriber), || {
+            emit_scan_plan_completed(&report)
+        });
+        let events = reporter.events();
+        match (accepted, events.as_slice()) {
+            (false, []) => {}
+            (true, [MetricEvent::ScanPlanGenerationCompleted(actual)]) => {
+                assert_eq!(format!("{actual:?}"), format!("{report:?}"));
+            }
+            _ => panic!("unexpected scan-plan completions: {events:?}"),
+        }
+    }
+
+    // LookupSpan support does not require exposing Registry through Subscriber::downcast_raw.
+    struct LookupOnlySubscriber<S>(S);
+
+    impl<S: Subscriber> Subscriber for LookupOnlySubscriber<S> {
+        fn on_register_dispatch(&self, dispatch: &tracing::Dispatch) {
+            self.0.on_register_dispatch(dispatch);
+        }
+        fn register_callsite(
+            &self,
+            metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            self.0.register_callsite(metadata)
+        }
+        fn max_level_hint(&self) -> Option<LevelFilter> {
+            self.0.max_level_hint()
+        }
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            self.0.enabled(metadata)
+        }
+        fn new_span(&self, attrs: &Attributes<'_>) -> Id {
+            self.0.new_span(attrs)
+        }
+        fn record(&self, span: &Id, values: &Record<'_>) {
+            self.0.record(span, values);
+        }
+        fn record_follows_from(&self, span: &Id, follows: &Id) {
+            self.0.record_follows_from(span, follows);
+        }
+        fn event(&self, event: &tracing::Event<'_>) {
+            self.0.event(event);
+        }
+        fn enter(&self, span: &Id) {
+            self.0.enter(span);
+        }
+        fn exit(&self, span: &Id) {
+            self.0.exit(span);
+        }
+        fn clone_span(&self, id: &Id) -> Id {
+            self.0.clone_span(id)
+        }
+        fn try_close(&self, id: Id) -> bool {
+            self.0.try_close(id)
+        }
+    }
+
+    impl<'a, S: Subscriber + LookupSpan<'a>> LookupSpan<'a> for LookupOnlySubscriber<S> {
+        type Data = <S as LookupSpan<'a>>::Data;
+        fn span_data(&'a self, id: &Id) -> Option<Self::Data> {
+            self.0.span_data(id)
+        }
+        fn register_filter(&mut self) -> tracing_subscriber::filter::FilterId {
+            self.0.register_filter()
+        }
     }
 
     #[rstest::rstest]

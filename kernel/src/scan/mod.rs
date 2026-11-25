@@ -65,6 +65,10 @@ use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegment};
 use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::events::emit_scan_metadata_completed;
+#[cfg(feature = "declarative-plans")]
+use crate::metrics::{
+    MetadataPlanningReport, ScanPlanOutcome, ScanPlanReport, emit_scan_plan_completed,
+};
 use crate::metrics::{MetricId, ScanType};
 use crate::parallel::sequential_phase::SequentialPhase;
 #[cfg(feature = "declarative-plans")]
@@ -161,7 +165,7 @@ pub use crate::parallel::parallel_scan_metadata::{
 /// - [`Self::all`] -- both representations.
 /// - [`Self::none`] -- neither, AND disables internal data skipping. Unlike the other four
 ///   constructors, this is the only one that stops kernel from reading stats from parquet at all.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StatsOptions {
     /// Whether to emit JSON stats in declarative metadata plans, synthesizing them from compatible
     /// structured stats when the source has no JSON. When false, declarative plans omit JSON stats
@@ -191,7 +195,7 @@ pub struct StatsOptions {
 /// when that property is absent, the first `delta.dataSkippingNumIndexedCols` leaf columns (32 by
 /// default). Extra-indexed columns fall outside that set but are known by the connector to have
 /// stats, for example because another writer generated them.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StructStats {
     /// Don't emit `stats_parsed`. Imperative scans still read predicate-referenced stats for
     /// internal data skipping unless the caller picked [`StatsOptions::none`], which
@@ -229,6 +233,27 @@ impl Default for StatsOptions {
 }
 
 impl StatsOptions {
+    /// Whether JSON statistics output is requested.
+    pub fn synthesize_json(&self) -> bool {
+        self.synthesize_json
+    }
+
+    /// Requested structured-statistics columns.
+    pub fn struct_stats(&self) -> &StructStats {
+        &self.struct_stats
+    }
+
+    /// Whether VARIANT min/max statistics are requested.
+    pub fn variant_min_max(&self) -> bool {
+        self.variant_min_max
+    }
+
+    /// Whether Geometry bounding-box statistics are requested.
+    #[cfg(feature = "geo-type-in-dev")]
+    pub fn geometry_min_max(&self) -> bool {
+        self.geometry_min_max
+    }
+
     /// JSON only. Equivalent to [`Default::default`].
     pub fn json_only() -> Self {
         Self::default()
@@ -419,7 +444,7 @@ pub enum ParsedColumnSource {
 /// behavior.
 ///
 /// Note: Not all scans support every option. See each scan builder's documentation for limitations.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PartitionValuesOptions {
     /// Whether to emit the typed `partitionValues_parsed` struct column.
     pub(crate) parsed_struct: bool,
@@ -428,6 +453,16 @@ pub struct PartitionValuesOptions {
 }
 
 impl PartitionValuesOptions {
+    /// Whether typed partition-value output is requested.
+    pub fn parsed_struct(&self) -> bool {
+        self.parsed_struct
+    }
+
+    /// Explicit timezone used to interpret TIMESTAMP partition strings.
+    pub fn timestamp_timezone(&self) -> Option<&str> {
+        self.timestamp_timezone.as_deref()
+    }
+
     /// Raw string map only, no typed struct. Equivalent to [`Default::default`].
     pub fn string_map_only() -> Self {
         Self::default()
@@ -1498,6 +1533,40 @@ impl Scan {
         &self,
         engine: &dyn Engine,
     ) -> KernelResult<Option<Plan>> {
+        let start = Instant::now();
+        let metadata = self.snapshot.table_configuration().metadata();
+        let mut report = ScanPlanReport {
+            table_id: metadata.id().to_owned(),
+            table_path: self.snapshot.table_root().as_str().to_owned(),
+            correlation_id: self.correlation_id.clone(),
+            metadata_planning: MetadataPlanningReport {
+                stats: self.stats.clone(),
+                partition_values: self.partition_values_options.clone(),
+                read_collations: self.needs_collation_stats_schema(),
+                ..Default::default()
+            },
+            ..ScanPlanReport::new()
+        };
+        let result = self.declarative_metadata_scan_plan_inner(engine, &mut report);
+        report.outcome = match &result {
+            Ok(Some(plan)) => {
+                report.num_plan_nodes = plan.nodes.len() as u64;
+                ScanPlanOutcome::Plan
+            }
+            Ok(None) => ScanPlanOutcome::Empty,
+            Err(_) => ScanPlanOutcome::Error,
+        };
+        report.duration_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        emit_scan_plan_completed(&report);
+        result
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    fn declarative_metadata_scan_plan_inner(
+        &self,
+        engine: &dyn Engine,
+        report: &mut ScanPlanReport,
+    ) -> KernelResult<Option<Plan>> {
         // TODO(#3609): Support connector-supplied timezone in declarative metadata scans.
         require!(
             !table_requires_timestamp_timezone_support(
@@ -1518,9 +1587,16 @@ impl Scan {
             return Ok(None);
         }
 
-        let planner = scan_plan::MetadataPlanner::try_from_scan(self)?;
-        let base = scan_plan::MetadataReplayBase::try_new(&self.snapshot, engine)?;
-        self.build_metadata_scan_plan_with(base, planner)
+        let mut planner = scan_plan::MetadataPlanner::try_from_scan(self)?;
+        report.metadata_planning = planner.report();
+        let base = scan_plan::MetadataReplayBase::try_new(&self.snapshot, engine, report)?;
+        let replay_base = base.kind();
+        let base_version = base.version();
+        let result = self.build_metadata_scan_plan_with(base, &mut planner);
+        report.metadata_planning = planner.report();
+        report.metadata_planning.replay_base = Some(replay_base);
+        report.metadata_planning.base_version = base_version;
+        result
     }
 
     #[cfg(feature = "declarative-plans")]
