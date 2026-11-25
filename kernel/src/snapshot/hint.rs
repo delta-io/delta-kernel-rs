@@ -737,7 +737,7 @@ mod tests {
             })
             .collect();
         assert_eq!(diagnostics.len(), 4);
-        for pass in diagnostics.chunks_exact(2) {
+        for pass in diagnostics.as_chunks::<2>().0 {
             assert_ne!(pass[0].operation_id, MetricId::nil());
             assert_eq!(pass[0].operation_id, pass[1].operation_id);
             assert_eq!([pass[0].version, pass[1].version], [1, 2]);
