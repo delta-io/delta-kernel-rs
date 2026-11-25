@@ -1,0 +1,19 @@
+id: kernel-expression-fluent-predicate
+language: Rust
+severity: warning
+message: Use the fluent predicate constructor on an explicit expression.
+note: Only explicit Expression-producing syntax is matched, but symbols/macros can still be shadowed.
+  Preserve operand order and Scalar types. Ordinary Rust == compares AST values instead of constructing
+  a predicate.
+rule:
+  pattern: Predicate::$METHOD($LHS, $RHS)
+constraints:
+  METHOD:
+    regex: ^(eq|ne|lt|le|gt|ge|distinct)$
+  LHS:
+    any:
+    - pattern: col!($$$PATH)
+    - pattern: lit($VALUE)
+    - pattern: Expression::column($PATH)
+    - pattern: Expression::literal($VALUE)
+fix: $LHS.$METHOD($RHS)

@@ -1690,7 +1690,7 @@ mod tests {
         )?;
         let second = second_scope.execute_and_retain(
             "shared",
-            PlanBuilder::values(schema.clone(), vec![vec![2i64.into()]])?.build()?,
+            PlanBuilder::values(schema, vec![vec![2i64.into()]])?.build()?,
         )?;
         assert_ne!(first.id(), second.id());
 

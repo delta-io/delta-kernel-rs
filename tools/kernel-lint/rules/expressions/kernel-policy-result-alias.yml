@@ -1,0 +1,14 @@
+id: kernel-policy-result-alias
+language: Rust
+severity: info
+message: Prefer KernelResult<T> for an exact Result<T, KernelError> type.
+note: 'Review-only: resolve the imported Result/KernelError symbols and preserve public error types/lifetimes.
+  This does not rewrite top-level Error envelopes, other error types, constructors or generic error parameters.'
+rule:
+  any:
+  - pattern:
+      context: type Alias = Result<$T, KernelError>;
+      selector: generic_type
+  - pattern:
+      context: type Alias = std::result::Result<$T, KernelError>;
+      selector: generic_type

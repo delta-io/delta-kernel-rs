@@ -1,0 +1,13 @@
+id: kernel-itertools-map-ok
+valid:
+  - 'fn f(input: Option<Result<u8, E>>) { input.map(|result| result.map(f)); }'
+  - 'fn f(input: impl Iterator<Item = Option<u8>>) { input.map(|result| result.map(f)); }'
+  - 'fn f(other: impl KernelResultIterator<u8>, input: Option<Result<u8, E>>) { input.map(|result| result.map(f)); }'
+  - 'fn f(input: impl KernelResultIterator<u8>) { input.map(|result| { log(&result); result.map(f) }); }'
+  - 'fn f(input: impl KernelResultIterator<u8>) { input.map(|result| other.map(f)); }'
+  - 'fn f(input: impl KernelResultIterator<u8>) { input.map_ok(f); }'
+  - 'fn f(input: impl KernelResultIterator<u8>) { let input = Some(Ok(1)); input.map(|result| result.map(convert)); }'
+  - 'fn f(input: impl KernelResultIterator<u8>) { let mut input: Option<Result<u8, E>> = Some(Ok(1)); input.map(|result| result.map(convert)); }'
+invalid:
+  - 'fn f(input: impl KernelResultIterator<u8>) { input.map(|result| result.map(convert)); }'
+  - 'fn f(scan_metadata: impl KernelResultIterator<Metadata>) { scan_metadata.map(|result| result.map(|metadata| metadata.scan_files)); }'

@@ -1,0 +1,16 @@
+id: kernel-schema-named-nullability
+snapshots:
+  StructField::new("id", DataType::LONG, true):
+    fixed: StructField::nullable("id", DataType::LONG)
+    labels:
+    - source: StructField::new("id", DataType::LONG, true)
+      style: primary
+      start: 0
+      end: 44
+  StructField::new(name, dtype, false):
+    fixed: StructField::not_null(name, dtype)
+    labels:
+    - source: StructField::new(name, dtype, false)
+      style: primary
+      start: 0
+      end: 36

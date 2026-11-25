@@ -1,0 +1,26 @@
+id: kernel-itertools-try-collect
+snapshots:
+  fn f() { let values = input.collect::<KernelResult<Vec<_>, OtherError>>()?; }:
+    labels:
+    - source: input.collect::<KernelResult<Vec<_>, OtherError>>()
+      style: primary
+      start: 22
+      end: 73
+  fn f() { let values = input.collect::<KernelResult<Vec<_>>>()?; }:
+    labels:
+    - source: input.collect::<KernelResult<Vec<_>>>()
+      style: primary
+      start: 22
+      end: 61
+  fn f() { let values = input.collect::<Result<Vec<_>, Error>>()?; }:
+    labels:
+    - source: input.collect::<Result<Vec<_>, Error>>()
+      style: primary
+      start: 22
+      end: 62
+  fn f() { let values = input.collect::<std::result::Result<Vec<_>, Error>>()?; }:
+    labels:
+    - source: input.collect::<std::result::Result<Vec<_>, Error>>()
+      style: primary
+      start: 22
+      end: 75

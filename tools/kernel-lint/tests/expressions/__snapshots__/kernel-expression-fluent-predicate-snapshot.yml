@@ -1,0 +1,16 @@
+id: kernel-expression-fluent-predicate
+snapshots:
+  Predicate::eq(col!("x"), lit(7_i64)):
+    fixed: col!("x").eq(lit(7_i64))
+    labels:
+    - source: Predicate::eq(col!("x"), lit(7_i64))
+      style: primary
+      start: 0
+      end: 36
+  Predicate::lt(lit(1_i64), rhs):
+    fixed: lit(1_i64).lt(rhs)
+    labels:
+    - source: Predicate::lt(lit(1_i64), rhs)
+      style: primary
+      start: 0
+      end: 30

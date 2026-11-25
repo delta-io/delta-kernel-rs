@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
+use itertools::Itertools;
 use tracing::instrument;
 
 use super::{Imperative, Transaction, UpdateTable};
@@ -110,7 +111,7 @@ impl Transaction<UpdateTable, Imperative> {
     pub fn scan_metadata_to_engine_data(
         scan_metadata: impl KernelResultIterator<crate::scan::ScanMetadata>,
     ) -> impl KernelResultIterator<FilteredEngineData> {
-        scan_metadata.map(|result| result.map(|metadata| metadata.scan_files))
+        scan_metadata.map_ok(|metadata| metadata.scan_files)
     }
 
     /// Update deletion vectors for files in the table.

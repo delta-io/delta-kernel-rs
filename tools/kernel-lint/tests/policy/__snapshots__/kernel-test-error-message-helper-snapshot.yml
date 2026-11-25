@@ -1,0 +1,36 @@
+id: kernel-test-error-message-helper
+snapshots:
+  ? |-
+    #[test]
+    fn checks() { assert!(r.is_err()); assert!(r.unwrap_err().to_string().contains("bad")); }
+  : labels:
+    - source: assert!(r.is_err());
+      style: primary
+      start: 22
+      end: 42
+    - source: assert!(r.unwrap_err().to_string().contains("bad"));
+      style: secondary
+      start: 43
+      end: 95
+    - source: '#[test]'
+      style: secondary
+      start: 0
+      end: 7
+    - source: fn checks() { assert!(r.is_err()); assert!(r.unwrap_err().to_string().contains("bad")); }
+      style: secondary
+      start: 8
+      end: 97
+  mod tests { fn helper() { assert!(r.is_err()); assert!(r.unwrap_err().to_string().contains(expected)); } }:
+    labels:
+    - source: assert!(r.is_err());
+      style: primary
+      start: 26
+      end: 46
+    - source: assert!(r.unwrap_err().to_string().contains(expected));
+      style: secondary
+      start: 47
+      end: 102
+    - source: mod tests { fn helper() { assert!(r.is_err()); assert!(r.unwrap_err().to_string().contains(expected)); } }
+      style: secondary
+      start: 0
+      end: 106

@@ -629,7 +629,7 @@ mod tests {
         ];
         let log_root = table_root.join("_delta_log/").map_err(KernelError::from)?;
         for (version, actions) in commits.iter().enumerate() {
-            let lines = actions.iter().map(|action| action.to_string()).join("\n");
+            let lines = actions.iter().map(ToString::to_string).join("\n");
             engine.storage_handler().put(
                 &log_root
                     .join(&format!("{version:020}.json"))

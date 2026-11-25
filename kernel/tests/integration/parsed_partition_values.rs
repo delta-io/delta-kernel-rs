@@ -431,9 +431,7 @@ async fn parsed_partition_values_read_foreign_empty_string(
     // silently-skipped checkpoint would re-test the JSON-commit path twice.
     let reporter = Arc::new(CountingReporter::new());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
-    let snapshot = Snapshot::builder_for(url.clone())
-        .build(engine.as_ref())
-        .unwrap();
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
     assert_eq!(
         reporter.checkpoint_files.get(),
         u64::from(native_checkpoint),
@@ -534,7 +532,7 @@ async fn empty_string_partition_pruning(#[values(false, true)] native_checkpoint
     // The empty-string value is a real "", so equality and null predicates treat it as such.
     assert_eq!(
         surviving(Predicate::from_expr(expr!(col("p_str") == ""))),
-        vec![empty.clone()],
+        vec![empty],
         "empty-string file must be kept under p_str = ''"
     );
     assert_eq!(
@@ -559,7 +557,7 @@ async fn empty_string_partition_pruning(#[values(false, true)] native_checkpoint
         surviving(Predicate::from_expr(expr!(
             col("p_bin") == lit(b"other".as_slice())
         ))),
-        vec![other.clone()],
+        vec![other],
         "empty-bytes file must be pruned under p_bin = X'6f74686572'"
     );
 }

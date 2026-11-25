@@ -4,6 +4,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
+use itertools::Itertools;
 use url::Url;
 
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor};
@@ -376,10 +377,7 @@ impl IncrementalScanStream {
     /// [`into_summary`]: Self::into_summary
     /// [`ActionsBatch`]: crate::log_replay::ActionsBatch
     pub fn into_listing(mut self) -> KernelResult<IncrementalListing> {
-        let mut add_files: Vec<FilteredEngineData> = Vec::new();
-        for item in self.by_ref() {
-            add_files.push(item?);
-        }
+        let add_files = Itertools::try_collect(&mut self)?;
         let summary = self.into_summary()?;
         Ok(IncrementalListing { summary, add_files })
     }
@@ -474,10 +472,7 @@ impl IncrementalScanStream {
         mut self,
         base_keys: impl IntoIterator<Item = &'a FileActionKey>,
     ) -> KernelResult<IncrementalListingAgainstBase> {
-        let mut add_files: Vec<FilteredEngineData> = Vec::new();
-        for item in self.by_ref() {
-            add_files.push(item?);
-        }
+        let add_files = Itertools::try_collect(&mut self)?;
         let summary = self.into_summary_against_base_iter(base_keys)?;
         Ok(IncrementalListingAgainstBase { summary, add_files })
     }
@@ -495,10 +490,7 @@ impl IncrementalScanStream {
         mut self,
         base_contains: impl Fn(&FileActionKey) -> bool,
     ) -> KernelResult<IncrementalListingAgainstBase> {
-        let mut add_files: Vec<FilteredEngineData> = Vec::new();
-        for item in self.by_ref() {
-            add_files.push(item?);
-        }
+        let add_files = Itertools::try_collect(&mut self)?;
         let summary = self.into_summary_against_base_closure(base_contains)?;
         Ok(IncrementalListingAgainstBase { summary, add_files })
     }

@@ -1,0 +1,16 @@
+id: kernel-expression-column-macro
+snapshots:
+  Expression::column(["a"]):
+    fixed: col!("a")
+    labels:
+    - source: Expression::column(["a"])
+      style: primary
+      start: 0
+      end: 25
+  Expression::column(["stats", "numRecords"]):
+    fixed: col!("stats", "numRecords")
+    labels:
+    - source: Expression::column(["stats", "numRecords"])
+      style: primary
+      start: 0
+      end: 43

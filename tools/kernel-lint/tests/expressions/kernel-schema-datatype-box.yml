@@ -1,0 +1,9 @@
+id: kernel-schema-datatype-box
+valid:
+- DataType::from(schema)
+- DataType::Decimal(Box::new(dtype))
+- OtherType::Struct(Box::new(schema))
+invalid:
+- DataType::Struct(Box::new(schema))
+- DataType::Array(Box::new(array_type))
+- DataType::Map(Box::new(map_type))

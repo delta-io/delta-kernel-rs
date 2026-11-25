@@ -1,0 +1,9 @@
+id: kernel-itertools-iterator-join
+valid:
+  - 'fn f() { let fields: Vec<_> = input.collect(); save(&fields); fields.join(","); }'
+  - 'fn f() { input.collect::<Vec<_>>().join(&[0]); }'
+  - 'fn f() { schema.field_names().cloned().collect::<Vec<_>>().join(","); }'
+  - 'fn f() { input.join(","); }'
+invalid:
+  - 'fn f() { input.map(render).collect::<Vec<_>>().join(", "); }'
+  - 'fn f() { input.collect_vec().join("\n"); }'

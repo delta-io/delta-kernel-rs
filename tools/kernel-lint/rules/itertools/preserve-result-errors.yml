@@ -1,0 +1,13 @@
+id: kernel-itertools-preserve-result-errors
+language: Rust
+severity: warning
+message: This explicit Result adapter silently discards errors; review whether the stream must preserve them.
+note: Prefer result-aware map_ok, filter_ok, filter_map_ok or flatten_ok when that matches the intended operation. These do not all have interchangeable output types. Intentional best-effort processing needs an explicit local decision; no automatic fix is provided.
+rule:
+  any:
+    - pattern: $ITER.filter_map(Result::ok)
+    - pattern: $ITER.filter_map(std::result::Result::ok)
+    - pattern: $ITER.map(Result::ok).flatten()
+    - pattern: $ITER.map(std::result::Result::ok).flatten()
+    - pattern: $ITER.flat_map(Result::into_iter)
+    - pattern: $ITER.flat_map(std::result::Result::into_iter)

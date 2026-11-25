@@ -268,18 +268,16 @@ mod tests {
     }
 
     #[test]
-    fn test_visit_wrong_getter_count() -> KernelResult<()> {
+    fn test_visit_wrong_getter_count() {
         let mut visitor = RowTrackingVisitor::new(Some(0));
         let wrong_getters: Vec<&dyn GetData<'_>> = vec![]; // No getters instead of expected count
 
         let result = visitor.visit(1, &wrong_getters);
         assert_result_error_with_message(result, "Wrong number of RowTrackingVisitor getters");
-
-        Ok(())
     }
 
     #[test]
-    fn test_visit_missing_num_records() -> KernelResult<()> {
+    fn test_visit_missing_num_records() {
         let mut visitor = RowTrackingVisitor::new(Some(0));
         let num_records_mock = MockGetData::new(vec![None]); // Missing numRecords
         let getters = create_getters(&num_records_mock);
@@ -289,8 +287,6 @@ mod tests {
             result,
             &format!("{NUM_RECORDS} must be present in Add actions when row tracking is enabled"),
         );
-
-        Ok(())
     }
 
     #[test]

@@ -1,0 +1,16 @@
+id: kernel-itertools-filter-map-ok
+snapshots:
+  fn f() { input.filter_map(|item| match item { Ok(value) => transform(value).map(Ok), Err(err) => Some(Err(err)), }); }:
+    fixed: fn f() { input.filter_map_ok(transform); }
+    labels:
+    - source: input.filter_map(|item| match item { Ok(value) => transform(value).map(Ok), Err(err) => Some(Err(err)), })
+      style: primary
+      start: 9
+      end: 115
+  fn f() { input.filter_map(|result| match result { Ok(value) => convert(value).map(Ok), Err(error) => Some(Err(error)), }); }:
+    fixed: fn f() { input.filter_map_ok(convert); }
+    labels:
+    - source: input.filter_map(|result| match result { Ok(value) => convert(value).map(Ok), Err(error) => Some(Err(error)), })
+      style: primary
+      start: 9
+      end: 121

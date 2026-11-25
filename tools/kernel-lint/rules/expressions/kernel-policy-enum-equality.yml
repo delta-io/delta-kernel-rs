@@ -1,0 +1,28 @@
+id: kernel-policy-enum-equality
+language: Rust
+severity: info
+message: Prefer equality for a simple unit enum comparison when PartialEq and borrow/move semantics permit.
+note: 'Review-only: ast-grep cannot resolve a unit variant, prove PartialEq, or establish borrow/drop
+  equivalence. Guards, bindings, OR/destructuring patterns and common Option/Result utility cases are
+  excluded. Local values and one-level field access are covered.'
+rule:
+  any:
+  - pattern: matches!($VALUE, $TYPE::$VARIANT)
+  - pattern: matches!($VALUE, $TYPE::$VARIANT,)
+  - pattern: matches!($VALUE, $VARIANT)
+  - pattern: matches!($VALUE, $VARIANT,)
+  - pattern: matches!($VALUE.$FIELD, $TYPE::$VARIANT)
+  - pattern: matches!($VALUE.$FIELD, $TYPE::$VARIANT,)
+  - pattern: matches!($VALUE.$FIELD, $VARIANT)
+  - pattern: matches!($VALUE.$FIELD, $VARIANT,)
+constraints:
+  TYPE:
+    all:
+    - regex: ^[A-Z][A-Za-z0-9_]*$
+    - not:
+        regex: ^(Option|Result|Poll|ControlFlow)$
+  VARIANT:
+    all:
+    - regex: ^[A-Z][A-Za-z0-9_]*$
+    - not:
+        regex: ^(None|Some|Ok|Err)$

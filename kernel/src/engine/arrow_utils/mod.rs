@@ -3674,11 +3674,11 @@ mod tests {
         StructArray::from(vec![
             (
                 Arc::new(ArrowField::new("b", ArrowDataType::Boolean, false)),
-                boolean.clone() as ArrowArrayRef,
+                boolean as ArrowArrayRef,
             ),
             (
                 Arc::new(ArrowField::new("c", ArrowDataType::Int32, false)),
-                int.clone() as ArrowArrayRef,
+                int as ArrowArrayRef,
             ),
         ])
     }
@@ -3752,11 +3752,11 @@ mod tests {
         let list_sa = StructArray::from(vec![
             (
                 Arc::new(ArrowField::new("b", ArrowDataType::Boolean, false)),
-                boolean.clone() as ArrowArrayRef,
+                boolean as ArrowArrayRef,
             ),
             (
                 Arc::new(ArrowField::new("c", ArrowDataType::Int32, false)),
-                int.clone() as ArrowArrayRef,
+                int as ArrowArrayRef,
             ),
         ]);
         let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 3, 6]));
@@ -4068,10 +4068,7 @@ mod tests {
                 ArrowField::new("NOTs", ArrowDataType::Utf8, true).with_metadata(arrow_fid(3));
             let noti2_field =
                 ArrowField::new("NOTi2", ArrowDataType::Int32, true).with_metadata(arrow_fid(4));
-            let parquet_schema = Arc::new(ArrowSchema::new(vec![
-                nots_field.clone(),
-                noti2_field.clone(),
-            ]));
+            let parquet_schema = Arc::new(ArrowSchema::new(vec![nots_field, noti2_field]));
             let (mask_indices, reorder_indices) =
                 get_requested_indices(&requested_schema, &parquet_schema).unwrap();
             let expect_mask: Vec<usize> = vec![];
@@ -4116,7 +4113,7 @@ mod tests {
             true,
         )]));
         let data = RecordBatch::try_new(
-            schema.clone(),
+            schema,
             vec![Arc::new(StringArray::from(vec!["string1", "string2"]))],
         )?;
         let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(data));
@@ -4138,7 +4135,7 @@ mod tests {
             true,
         )]));
         let record_batch = RecordBatch::try_new(
-            schema.clone(),
+            schema,
             vec![Arc::new(StringArray::from(vec![
                 "row0", "row1", "row2", "row3",
             ]))],
@@ -4262,7 +4259,7 @@ mod tests {
         // Write the batch to a parquet file and read it back
         let mut buffer = vec![];
         let mut writer =
-            crate::parquet::arrow::ArrowWriter::try_new(&mut buffer, schema.clone(), None).unwrap();
+            crate::parquet::arrow::ArrowWriter::try_new(&mut buffer, schema, None).unwrap();
         writer.write(&batch1).unwrap();
         writer.close().unwrap(); // writer must be closed to write footer
         let batch2 = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(buffer))

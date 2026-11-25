@@ -196,7 +196,7 @@ impl Iterator for SequentialPhase {
         let next = self
             .commit_phase
             .as_mut()
-            .and_then(|commit_phase| commit_phase.next())
+            .and_then(Iterator::next)
             .or_else(|| {
                 self.commit_phase = None;
                 self.checkpoint_manifest_phase.as_mut()?.next()

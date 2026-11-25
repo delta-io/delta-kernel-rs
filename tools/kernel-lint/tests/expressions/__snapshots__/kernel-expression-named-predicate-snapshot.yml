@@ -1,0 +1,23 @@
+id: kernel-expression-named-predicate
+snapshots:
+  Predicate::binary(BinaryPredicateOp::Distinct, lhs, rhs):
+    fixed: Predicate::distinct(lhs, rhs)
+    labels:
+    - source: Predicate::binary(BinaryPredicateOp::Distinct, lhs, rhs)
+      style: primary
+      start: 0
+      end: 56
+  Predicate::binary(BinaryPredicateOp::Equal, lhs, rhs):
+    fixed: Predicate::eq(lhs, rhs)
+    labels:
+    - source: Predicate::binary(BinaryPredicateOp::Equal, lhs, rhs)
+      style: primary
+      start: 0
+      end: 53
+  Predicate::binary(BinaryPredicateOp::LessThan, lhs, rhs):
+    fixed: Predicate::lt(lhs, rhs)
+    labels:
+    - source: Predicate::binary(BinaryPredicateOp::LessThan, lhs, rhs)
+      style: primary
+      start: 0
+      end: 56

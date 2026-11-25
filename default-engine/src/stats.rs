@@ -2334,12 +2334,11 @@ mod tests {
 
         let add = commit_data
             .lines()
-            .filter_map(|line| {
+            .find_map(|line| {
                 let action: serde_json::Value =
                     serde_json::from_str(line).expect("parse JSON line");
                 action.get("add").cloned()
             })
-            .next()
             .expect("commit 1 has an add action");
         let spark_stats: serde_json::Value =
             serde_json::from_str(add["stats"].as_str().expect("stats str"))

@@ -1,0 +1,12 @@
+id: kernel-schema-datatype-box
+language: Rust
+severity: warning
+message: Prefer DataType::from(container) to spelling its Box-backed representation.
+note: Resolve Kernel DataType and the owned container type. At impl Into<DataType> parameters passing
+  the container directly is even shorter; retain enum/representation tests.
+rule:
+  pattern: DataType::$VARIANT(Box::new($VALUE))
+constraints:
+  VARIANT:
+    regex: ^(Struct|Array|Map)$
+fix: DataType::from($VALUE)

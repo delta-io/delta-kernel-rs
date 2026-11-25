@@ -1948,10 +1948,13 @@ pub(crate) fn record_operation_id(
 ) -> Option<MetricId> {
     (field.name() == "operation_id").then(|| {
         let s = format!("{value:?}");
-        Uuid::from_str(&s).map(MetricId).unwrap_or_else(|e| {
-            warn!("Invalid uuid '{s}' on {span_name}: {e}. Using nil.");
-            MetricId::nil()
-        })
+        Uuid::from_str(&s).map_or_else(
+            |e| {
+                warn!("Invalid uuid '{s}' on {span_name}: {e}. Using nil.");
+                MetricId::nil()
+            },
+            MetricId,
+        )
     })
 }
 

@@ -1,0 +1,25 @@
+id: kernel-itertools-map-ok
+language: Rust
+severity: info
+message: Prefer map_ok over nested Iterator and Result maps.
+note: The iterator must be the function parameter explicitly declared as KernelResultIterator. Review shadowing, method resolution, imports and mapping-function capture timing before applying.
+rule:
+  all:
+    - pattern: $ITER.map(|$RESULT| $RESULT.map($MAPPER))
+    - inside:
+        kind: function_item
+        has:
+          pattern:
+            context: 'fn __kernel_lint($ITER: impl KernelResultIterator<$ITEM>) {}'
+            selector: parameter
+          stopBy: end
+        not:
+          has:
+            any:
+              - pattern: let $ITER = $INIT;
+              - pattern: let mut $ITER = $INIT;
+              - pattern: 'let $ITER: $TYPE = $INIT;'
+              - pattern: 'let mut $ITER: $TYPE = $INIT;'
+            stopBy: end
+        stopBy: end
+fix: $ITER.map_ok($MAPPER)

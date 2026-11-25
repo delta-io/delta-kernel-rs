@@ -103,7 +103,7 @@ fn extract_column_values(input: &[RecordBatch], name: &ColumnName) -> KernelResu
 
 // Thin wrapper around arrow `interleave` that converts our `&[ArrayRef]` into `&[&dyn Array]`
 fn interleave_column_values(arrays: &[ArrayRef], indices: &[InputRow]) -> KernelResult<ArrayRef> {
-    let refs = Vec::from_iter(arrays.iter().map(|c| c.as_ref()));
+    let refs = Vec::from_iter(arrays.iter().map(AsRef::as_ref));
     Ok(interleave(&refs, indices)?)
 }
 

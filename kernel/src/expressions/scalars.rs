@@ -1082,7 +1082,7 @@ impl PrimitiveType {
                 let date = NaiveDate::parse_from_str(raw, "%Y-%m-%d")
                     .map_err(|_| self.parse_error(raw))?
                     .and_hms_opt(0, 0, 0)
-                    .ok_or(self.parse_error(raw))?;
+                    .ok_or_else(|| self.parse_error(raw))?;
                 let date = Utc.from_utc_datetime(&date);
                 let days = date.signed_duration_since(DateTime::UNIX_EPOCH).num_days() as i32;
                 Ok(Scalar::Date(days))
@@ -1105,7 +1105,7 @@ impl PrimitiveType {
                 let micros = timestamp
                     .signed_duration_since(DateTime::UNIX_EPOCH)
                     .num_microseconds()
-                    .ok_or(self.parse_error(raw))?;
+                    .ok_or_else(|| self.parse_error(raw))?;
                 match self {
                     Timestamp => Ok(Scalar::Timestamp(micros)),
                     TimestampNtz => Ok(Scalar::TimestampNtz(micros)),

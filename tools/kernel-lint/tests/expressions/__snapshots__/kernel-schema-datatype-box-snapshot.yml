@@ -1,0 +1,23 @@
+id: kernel-schema-datatype-box
+snapshots:
+  DataType::Array(Box::new(array_type)):
+    fixed: DataType::from(array_type)
+    labels:
+    - source: DataType::Array(Box::new(array_type))
+      style: primary
+      start: 0
+      end: 37
+  DataType::Map(Box::new(map_type)):
+    fixed: DataType::from(map_type)
+    labels:
+    - source: DataType::Map(Box::new(map_type))
+      style: primary
+      start: 0
+      end: 33
+  DataType::Struct(Box::new(schema)):
+    fixed: DataType::from(schema)
+    labels:
+    - source: DataType::Struct(Box::new(schema))
+      style: primary
+      start: 0
+      end: 34

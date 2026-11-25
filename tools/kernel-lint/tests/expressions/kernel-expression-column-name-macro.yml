@@ -1,0 +1,10 @@
+id: kernel-expression-column-name-macro
+valid:
+- ColumnName::new(["a.b"])
+- ColumnName::new([name])
+- ColumnName::new(["a b"])
+- column_name!("a", "b")
+- ColumnName::new([])
+invalid:
+- ColumnName::new(["a"])
+- ColumnName::new(["stats", "numRecords"])

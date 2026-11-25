@@ -1,0 +1,16 @@
+id: kernel-itertools-iterator-join
+snapshots:
+  fn f() { input.collect_vec().join("\n"); }:
+    fixed: fn f() { input.join("\n"); }
+    labels:
+    - source: input.collect_vec().join("\n")
+      style: primary
+      start: 9
+      end: 39
+  fn f() { input.map(render).collect::<Vec<_>>().join(", "); }:
+    fixed: fn f() { input.map(render).join(", "); }
+    labels:
+    - source: input.map(render).collect::<Vec<_>>().join(", ")
+      style: primary
+      start: 9
+      end: 57

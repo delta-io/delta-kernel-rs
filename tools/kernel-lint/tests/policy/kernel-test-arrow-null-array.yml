@@ -1,0 +1,20 @@
+id: kernel-test-arrow-null-array
+valid:
+- '#[test]
+
+  fn checks() { let x = Arc::new(Int32Array::from(vec![Some(1i32); n])) as ArrayRef; }'
+- '#[test]
+
+  fn checks() { let x = Int32Array::from(vec![None::<i32>; n]); }'
+- '#[test]
+
+  fn checks() { let x = Arc::new(Decimal128Array::from(vec![None::<i128>; n])) as ArrayRef; }'
+- fn production() { let x = Arc::new(Int32Array::from(vec![None::<i32>; n])) as ArrayRef; }
+invalid:
+- '#[test]
+
+  fn checks() { let x = Arc::new(Int32Array::from(vec![None::<i32>; n])) as ArrayRef; }'
+- '#[test]
+
+  fn checks() { let x = Arc::new(BooleanArray::from(vec![None::<bool>; n])) as ArrayRef; }'
+- '#[test] fn check() { let x = Arc::new(Int32Array::from(vec![None as Option<i32>; n])) as ArrayRef; }'

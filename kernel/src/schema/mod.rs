@@ -1933,7 +1933,7 @@ fn validate_crs(crs: &str) -> KernelResult<()> {
         KernelError::invalid_geo_params(format!("CRS '{crs}' must not contain a comma"))
     );
 
-    let [authority, code] = crs.split(':').collect::<Vec<_>>()[..] else {
+    let Some((authority, code)) = crs.split(':').collect_tuple() else {
         return Err(KernelError::invalid_geo_params(format!(
             "CRS '{crs}' must be in 'AUTHORITY:CODE' format"
         )));
@@ -4663,7 +4663,7 @@ mod tests {
             StructField::not_null("field2", DataType::INTEGER),
             StructField::nullable("field3", DataType::BOOLEAN),
         ];
-        let struct_type = StructType::new_unchecked(fields.clone());
+        let struct_type = StructType::new_unchecked(fields);
 
         // Test fields() method returns reference iterator
         let field_names: Vec<_> = struct_type.fields().map(|f| f.name()).collect();
@@ -4798,7 +4798,7 @@ mod tests {
             StructField::nullable("field1", DataType::STRING),
             StructField::not_null("field2", DataType::INTEGER),
         ];
-        let struct_type = StructType::new_unchecked(original_fields.clone());
+        let struct_type = StructType::new_unchecked(original_fields);
 
         // Test collecting from reference iterator
         let collected_refs: Vec<&StructField> = struct_type.fields().collect();
@@ -5195,7 +5195,7 @@ mod tests {
     }
 
     #[test]
-    fn test_nested_metadata_columns_validation_struct() -> KernelResult<()> {
+    fn test_nested_metadata_columns_validation_struct() {
         // Test that metadata columns in nested structs are rejected
         let nested_field_with_metadata =
             StructField::create_metadata_column("nested_row_index", MetadataColumnSpec::RowIndex);
@@ -5216,11 +5216,10 @@ mod tests {
         ]);
 
         assert_result_error_with_message(result, "only allowed at the top level");
-        Ok(())
     }
 
     #[test]
-    fn test_nested_metadata_columns_validation_array() -> KernelResult<()> {
+    fn test_nested_metadata_columns_validation_array() {
         // Test that metadata columns in array element structs are rejected
         let nested_field_with_metadata =
             StructField::create_metadata_column("nested_row_index", MetadataColumnSpec::RowIndex);
@@ -5242,11 +5241,10 @@ mod tests {
         ]);
 
         assert_result_error_with_message(result, "only allowed at the top level");
-        Ok(())
     }
 
     #[test]
-    fn test_nested_metadata_columns_validation_map() -> KernelResult<()> {
+    fn test_nested_metadata_columns_validation_map() {
         // Test that metadata columns in map key structs or map value structs are rejected
         let nested_field_with_metadata =
             StructField::create_metadata_column("nested_row_index", MetadataColumnSpec::RowIndex);
@@ -5272,12 +5270,10 @@ mod tests {
 
             assert_result_error_with_message(result, "only allowed at the top level");
         }
-
-        Ok(())
     }
 
     #[test]
-    fn test_column_identifier_trait() -> KernelResult<()> {
+    fn test_column_identifier_trait() {
         let schema = schema! {
             nullable "regular_col": STRING,
             (StructField::create_metadata_column(
@@ -5298,7 +5294,6 @@ mod tests {
         // Test MetadataColumnSpec identifier
         assert!(schema.contains_metadata_column(&MetadataColumnSpec::RowIndex));
         assert!(!schema.contains_metadata_column(&MetadataColumnSpec::RowId));
-        Ok(())
     }
 
     #[test]
@@ -5449,7 +5444,7 @@ mod tests {
             not_null "s": (nested_struct.clone()),
             nullable "array_col": [ nullable (nested_struct.clone()) ],
             nullable "map_col": {
-                (nested_struct.clone()) => nullable (nested_struct.clone())
+                (nested_struct.clone()) => nullable (nested_struct)
             },
             nullable "a": LONG,
         };

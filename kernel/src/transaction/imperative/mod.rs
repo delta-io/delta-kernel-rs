@@ -5,6 +5,7 @@ use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
+use itertools::Itertools;
 use tracing::instrument;
 use update_table::{intermediate_dv_schema, new_dv_column_schema};
 use write_validation::RowTrackingEnablement;
@@ -419,7 +420,7 @@ impl<STATE> Transaction<STATE, Imperative> {
             .chain(domain_metadata_actions);
 
         let filtered_actions = actions
-            .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected))
+            .map_ok(FilteredEngineData::with_all_rows_selected)
             .chain(remove_actions)
             .chain(dv_update_actions);
 
@@ -1289,7 +1290,7 @@ mod tests {
             nullable NUM_RECORDS: LONG,
             nullable NULL_COUNT: (value_struct_type.clone()),
             nullable MIN_VALUES: (value_struct_type.clone()),
-            nullable MAX_VALUES: (value_struct_type.clone()),
+            nullable MAX_VALUES: (value_struct_type),
         };
         let stats_type = DataType::from(stats_schema.clone());
         let schema = schema_ref! {
@@ -1316,7 +1317,7 @@ mod tests {
                     TestFileStats::None => Scalar::Null(stats_type.clone()),
                     TestFileStats::Present | TestFileStats::AllNull => {
                         let value_struct = |v: Option<i64>| {
-                            let scalar = v.map_or(Scalar::Null(DataType::LONG), |n| n.into());
+                            let scalar = v.map_or(Scalar::Null(DataType::LONG), Into::into);
                             Scalar::Struct(
                                 StructData::try_new(value_schema.clone(), vec![scalar]).unwrap(),
                             )

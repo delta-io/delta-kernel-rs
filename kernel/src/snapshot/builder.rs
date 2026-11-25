@@ -598,8 +598,7 @@ impl<Mode> SnapshotBuilder<Mode> {
         }
 
         self.version
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "LATEST".into())
+            .map_or_else(|| "LATEST".into(), |v| v.to_string())
     }
 }
 

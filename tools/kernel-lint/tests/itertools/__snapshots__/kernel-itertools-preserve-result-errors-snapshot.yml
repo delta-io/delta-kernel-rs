@@ -1,0 +1,26 @@
+id: kernel-itertools-preserve-result-errors
+snapshots:
+  fn f() { input.filter_map(Result::ok); }:
+    labels:
+    - source: input.filter_map(Result::ok)
+      style: primary
+      start: 9
+      end: 37
+  fn f() { input.filter_map(std::result::Result::ok); }:
+    labels:
+    - source: input.filter_map(std::result::Result::ok)
+      style: primary
+      start: 9
+      end: 50
+  fn f() { input.flat_map(std::result::Result::into_iter); }:
+    labels:
+    - source: input.flat_map(std::result::Result::into_iter)
+      style: primary
+      start: 9
+      end: 55
+  fn f() { input.map(Result::ok).flatten(); }:
+    labels:
+    - source: input.map(Result::ok).flatten()
+      style: primary
+      start: 9
+      end: 40

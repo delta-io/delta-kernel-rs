@@ -143,6 +143,7 @@ mod tests {
 
     use super::*;
     use crate::KernelResult;
+    use crate::unit_test_utils::assert_result_error_with_message;
 
     #[test]
     fn test_deleted_file_retention_timestamp_with_time() -> KernelResult<()> {
@@ -174,12 +175,9 @@ mod tests {
         let large_retention = Duration::from_secs(u64::MAX);
         let result =
             deleted_file_retention_timestamp_with_time(Some(large_retention), reference_time);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Retention duration exceeds i64 millisecond range")
+        assert_result_error_with_message(
+            result,
+            "Retention duration exceeds i64 millisecond range",
         );
     }
 
@@ -189,13 +187,7 @@ mod tests {
         let reference_time = Duration::from_secs(u64::MAX);
         let retention = Duration::from_secs(1);
         let result = deleted_file_retention_timestamp_with_time(Some(retention), reference_time);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Current timestamp exceeds i64 millisecond range")
-        );
+        assert_result_error_with_message(result, "Current timestamp exceeds i64 millisecond range");
     }
 
     #[test]
@@ -234,12 +226,9 @@ mod tests {
             ..Default::default()
         };
         let result = calculate_transaction_expiration_timestamp(&properties);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Retention duration exceeds i64 millisecond range")
+        assert_result_error_with_message(
+            result,
+            "Retention duration exceeds i64 millisecond range",
         );
     }
 

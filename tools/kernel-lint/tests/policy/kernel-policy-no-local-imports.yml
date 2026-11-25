@@ -1,0 +1,9 @@
+id: kernel-policy-no-local-imports
+valid:
+- use crate::Thing; fn f() {}
+- 'mod tests { use crate::Thing; #[test] fn f() {} }'
+- macro_rules! helper { () => { use crate::Thing; } }
+invalid:
+- fn f() { use crate::Thing; go(); }
+- impl X { fn f() { use std::fmt::Debug; } }
+- fn f() { { use crate::Thing; go(); } }

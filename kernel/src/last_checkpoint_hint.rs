@@ -1151,10 +1151,7 @@ mod tests {
         };
         assert!(v2.applies_to(&[part(selected)]));
         assert!(!v2.applies_to(&[part(other)]), "wrong v2 path");
-        let v2_wrong_version = LastCheckpointHint {
-            version: 2,
-            ..v2.clone()
-        };
+        let v2_wrong_version = LastCheckpointHint { version: 2, ..v2 };
         assert!(
             !v2_wrong_version.applies_to(&[part(selected)]),
             "wrong version"

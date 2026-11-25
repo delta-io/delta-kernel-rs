@@ -1,0 +1,11 @@
+id: kernel-expression-null-literal
+language: Rust
+severity: warning
+message: Use null_lit(dtype) for a typed NULL expression.
+note: Resolve Kernel lit/Expression and Scalar. Import null_lit; preserve the exact DataType, including
+  nested nullability, decimal and timezone information.
+rule:
+  any:
+  - pattern: lit(Scalar::Null($TYPE))
+  - pattern: Expression::literal(Scalar::Null($TYPE))
+fix: null_lit($TYPE)

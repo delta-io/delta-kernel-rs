@@ -1,0 +1,45 @@
+id: kernel-expression-arithmetic-operator
+language: Rust
+severity: info
+message: Use the Expression arithmetic operator for a known binary operation.
+note: The lhs must resolve to Kernel Expression; otherwise Rust arithmetic could evaluate immediately.
+  Preserve numeric Scalar types, parentheses and constructor tests. This is ordinary Rust operator syntax,
+  not unsupported arithmetic inside expr!.
+rule:
+  pattern: Expression::binary($OP, $LHS, $RHS)
+constraints:
+  OP:
+    regex: ^BinaryExpressionOp::(Plus|Minus|Multiply|Divide)$
+  LHS:
+    any:
+    - pattern: col!($$$PATH)
+    - pattern: lit($VALUE)
+    - pattern: Expression::column($PATH)
+    - pattern: Expression::literal($VALUE)
+transform:
+  OP_NAME:
+    replace:
+      source: $OP
+      replace: '^BinaryExpressionOp::'
+      by: ''
+  PLUS:
+    replace:
+      source: $OP_NAME
+      replace: ^Plus$
+      by: +
+  MINUS:
+    replace:
+      source: $PLUS
+      replace: ^Minus$
+      by: '-'
+  MUL:
+    replace:
+      source: $MINUS
+      replace: ^Multiply$
+      by: '*'
+  SYMBOL:
+    replace:
+      source: $MUL
+      replace: ^Divide$
+      by: /
+fix: ($LHS $SYMBOL $RHS)

@@ -1,0 +1,14 @@
+id: kernel-itertools-process-results-unzip
+snapshots:
+  fn f() { input.collect::<KernelResult<Vec<_>>>()?.into_iter().unzip(); }:
+    labels:
+    - source: input.collect::<KernelResult<Vec<_>>>()?.into_iter().unzip()
+      style: primary
+      start: 9
+      end: 69
+  fn f() { input.collect::<Result<Vec<_>, Error>>()?.into_iter().unzip(); }:
+    labels:
+    - source: input.collect::<Result<Vec<_>, Error>>()?.into_iter().unzip()
+      style: primary
+      start: 9
+      end: 70

@@ -1,0 +1,23 @@
+id: kernel-expression-predicate-constant
+language: Rust
+severity: warning
+message: Use Predicate::TRUE/FALSE for a statically known boolean predicate.
+note: Resolve Kernel Predicate and retain constructor tests. Runtime bool values must keep Predicate::literal;
+  this rule does not infer a typed NULL predicate.
+rule:
+  pattern: Predicate::literal($VALUE)
+constraints:
+  VALUE:
+    regex: ^(true|false)$
+transform:
+  FIRST:
+    replace:
+      source: $VALUE
+      replace: 'true'
+      by: 'TRUE'
+  CONSTANT:
+    replace:
+      source: $FIRST
+      replace: 'false'
+      by: 'FALSE'
+fix: Predicate::$CONSTANT

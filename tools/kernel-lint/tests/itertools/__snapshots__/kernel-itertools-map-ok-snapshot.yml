@@ -1,0 +1,32 @@
+id: kernel-itertools-map-ok
+snapshots:
+  'fn f(input: impl KernelResultIterator<u8>) { input.map(|result| result.map(convert)); }':
+    fixed: 'fn f(input: impl KernelResultIterator<u8>) { input.map_ok(convert); }'
+    labels:
+    - source: input.map(|result| result.map(convert))
+      style: primary
+      start: 45
+      end: 84
+    - source: 'input: impl KernelResultIterator<u8>'
+      style: secondary
+      start: 5
+      end: 41
+    - source: 'fn f(input: impl KernelResultIterator<u8>) { input.map(|result| result.map(convert)); }'
+      style: secondary
+      start: 0
+      end: 87
+  ? 'fn f(scan_metadata: impl KernelResultIterator<Metadata>) { scan_metadata.map(|result| result.map(|metadata| metadata.scan_files)); }'
+  : fixed: 'fn f(scan_metadata: impl KernelResultIterator<Metadata>) { scan_metadata.map_ok(|metadata| metadata.scan_files); }'
+    labels:
+    - source: scan_metadata.map(|result| result.map(|metadata| metadata.scan_files))
+      style: primary
+      start: 59
+      end: 129
+    - source: 'scan_metadata: impl KernelResultIterator<Metadata>'
+      style: secondary
+      start: 5
+      end: 55
+    - source: 'fn f(scan_metadata: impl KernelResultIterator<Metadata>) { scan_metadata.map(|result| result.map(|metadata| metadata.scan_files)); }'
+      style: secondary
+      start: 0
+      end: 132

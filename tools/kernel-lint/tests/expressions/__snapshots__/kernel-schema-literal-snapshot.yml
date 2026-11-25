@@ -1,0 +1,14 @@
+id: kernel-schema-literal
+snapshots:
+  StructType::new_unchecked([StructField::not_null(NAME, dtype)]):
+    labels:
+    - source: StructType::new_unchecked([StructField::not_null(NAME, dtype)])
+      style: primary
+      start: 0
+      end: 63
+  StructType::new_unchecked([StructField::nullable("x", DataType::LONG)]):
+    labels:
+    - source: StructType::new_unchecked([StructField::nullable("x", DataType::LONG)])
+      style: primary
+      start: 0
+      end: 71

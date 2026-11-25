@@ -1,0 +1,2 @@
+matches-for-let-else = "AllTypes"
+avoid-breaking-exported-api = true

@@ -1,0 +1,23 @@
+id: kernel-ffi-no-reference-parameters
+language: Rust
+severity: warning
+message: Use explicit raw-pointer/handle contracts for new extern C parameters instead of Rust references.
+note: Structural signature policy for ffi/src. Review only new APIs/diff; never auto-change existing ABI or ownership.
+  Rust improper_ctypes checks are complementary and do not establish pointer validity/lifetimes.
+rule:
+  all:
+  - kind: function_item
+  - has:
+      kind: function_modifiers
+      has:
+        kind: extern_modifier
+        regex: extern\s+"C"
+  - has:
+      kind: parameters
+      has:
+        kind: parameter
+        has:
+          kind: reference_type
+          stopBy: end
+files:
+- ffi/src/**/*.rs

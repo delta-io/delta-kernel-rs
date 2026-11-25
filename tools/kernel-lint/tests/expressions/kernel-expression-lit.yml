@@ -1,0 +1,9 @@
+id: kernel-expression-lit
+valid:
+- lit(7_i64)
+- Expression::literal(Scalar::Null(dtype))
+- OtherExpression::literal(value)
+- 'pub fn lit(value: impl Into<Scalar>) -> Expression { Expression::literal(value) }'
+invalid:
+- Expression::literal(7_i64)
+- Expression::literal(value)

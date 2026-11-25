@@ -488,7 +488,7 @@ fn read_table_data(
     let scan = snapshot
         .scan_builder()
         .with_schema_opt(read_schema)
-        .with_predicate(predicate.clone())
+        .with_predicate(predicate)
         .build()?;
 
     sort_lines!(expected);
@@ -1921,7 +1921,7 @@ async fn test_row_index_metadata_column() -> Result<(), Box<dyn std::error::Erro
 
     let mut file_count = 0;
     let expected_row_counts = [5, 3, 4];
-    let stream = scan.execute(engine.clone())?;
+    let stream = scan.execute(engine)?;
 
     for data in stream {
         let batch = into_record_batch(data?);
@@ -2015,7 +2015,7 @@ async fn test_file_path_metadata_column() -> Result<(), Box<dyn std::error::Erro
     let mut file_count = 0;
     let expected_files = [PARQUET_FILE1, PARQUET_FILE2];
     let expected_row_counts = [3, 2];
-    let stream = scan.execute(engine.clone())?;
+    let stream = scan.execute(engine)?;
 
     for data in stream {
         let batch = into_record_batch(data?);

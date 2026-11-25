@@ -1,0 +1,12 @@
+id: kernel-policy-no-local-imports
+language: Rust
+severity: warning
+message: Move imports to file or test-module scope.
+note: AST-only scope check. Moving an import may change trait resolution or collide with another name; review and
+  move it manually. Macro token streams are not traversed as use declarations.
+rule:
+  all:
+  - kind: use_declaration
+  - inside:
+      kind: function_item
+      stopBy: end

@@ -1,0 +1,493 @@
+{
+  "schemaVersion": 1,
+  "implementation": "ast-grep 0.37.0 structural rules; no Rust type or control-flow resolution",
+  "statuses": {
+    "structural-subset": "An executable pattern exists for a documented narrow syntax shape. This is not complete semantic enforcement.",
+    "existing-clippy-partial": "Some existing Clippy checks are already configured; the whole policy is not proven.",
+    "deferred-semantic": "No executable rule is claimed; the requirement remains code review until the stated analysis exists."
+  },
+  "executableRuleCount": 34,
+  "docDerivedRules": [
+    {
+      "auditId": "DOC01",
+      "title": "Use successful-commit test helpers",
+      "origin": "guidance",
+      "status": "structural-subset",
+      "executableRuleIds": [
+        "kernel-test-commit-result-helper"
+      ],
+      "existingChecks": [],
+      "limits": "Recognizes selected test match/extraction shapes. It does not resolve CommitResult, prove helper availability, or establish that success-arm checks/custom diagnostics can be removed.",
+      "source": {
+        "file": "AGENTS.md",
+        "quote": "Use `txn.commit(engine)?.unwrap_committed()`"
+      }
+    },
+    {
+      "auditId": "DOC02",
+      "title": "Use KernelResultIterator marker",
+      "origin": "guidance",
+      "status": "structural-subset",
+      "executableRuleIds": [
+        "kernel-policy-result-iterator"
+      ],
+      "existingChecks": [],
+      "limits": "Recognizes selected explicit default-KernelResult + Send bound spellings. Aliases, generic error parameters, extra bounds and borrowed/dyn lifetimes need review.",
+      "source": {
+        "file": "AGENTS.md",
+        "quote": "Prefer the `KernelResultIterator<T>` marker trait"
+      }
+    },
+    {
+      "auditId": "DOC03",
+      "title": "Reuse canonical log-action fields and schemas",
+      "origin": "guidance",
+      "status": "structural-subset",
+      "executableRuleIds": [
+        "kernel-policy-canonical-add-field"
+      ],
+      "existingChecks": [],
+      "limits": "Only the canonical Add-field reconstruction shape is implemented. Other action fields, complete LOG_* schemas and arbitrary projections are not checked for semantic equivalence.",
+      "source": {
+        "file": "AGENTS.md",
+        "quote": "For Delta log action schemas, reuse the canonical"
+      }
+    },
+    {
+      "auditId": "DOC04",
+      "title": "No function-local imports",
+      "origin": "guidance",
+      "status": "structural-subset",
+      "executableRuleIds": [
+        "kernel-policy-no-local-imports"
+      ],
+      "existingChecks": [],
+      "limits": "Checks use declarations syntactically nested inside functions. Macro token streams/expansions are not traversed; moving an import still needs resolution/collision review.",
+      "source": {
+        "file": "AGENTS.md",
+        "quote": "Place `use` imports at the top of the file"
+      }
+    },
+    {
+      "auditId": "DOC05",
+      "title": "Use equality for simple enum comparisons",
+      "origin": "guidance",
+      "status": "structural-subset",
+      "executableRuleIds": [
+        "kernel-policy-enum-equality"
+      ],
+      "existingChecks": [],
+      "limits": "Recognizes selected simple unit-variant matches! syntax. It cannot prove PartialEq, resolved enum identity or evaluation/borrow equivalence.",
+      "source": {
+        "file": "AGENTS.md",
+        "quote": "Prefer `==` over `matches!` for simple single-variant enum comparisons."
+      }
+    },
+    {
+      "auditId": "DOC06",
+      "title": "Name literal field nullability",
+      "origin": "guidance",
+      "status": "structural-subset",
+      "executableRuleIds": [
+        "kernel-schema-named-nullability"
+      ],
+      "existingChecks": [],
+      "limits": "Recognizes named StructField::new calls with literal booleans. It cannot distinguish shadowed/Arrow types or exempt every constructor-under-test automatically.",
+      "source": {
+        "file": "AGENTS.md",
+        "quote": "Prefer `StructField::nullable` / `StructField::not_null`"
+      }
+    },
+    {
+      "auditId": "DOC07",
+      "title": "Use Into<DataType> at generic construction boundaries",
+      "origin": "guidance",
+      "status": "structural-subset",
+      "executableRuleIds": [
+        "kernel-schema-datatype-box"
+      ],
+      "existingChecks": [],
+      "limits": "Recognizes Box-backed DataType constructor spellings. Passing a container directly at impl Into<DataType> boundaries requires parameter/type resolution and remains a reviewed decision.",
+      "source": {
+        "file": "AGENTS.md",
+        "quote": "Leverage `impl Into<DataType>`"
+      }
+    },
+    {
+      "auditId": "DOC08",
+      "title": "Use the right Result alias and envelope",
+      "origin": "guidance",
+      "status": "structural-subset",
+      "executableRuleIds": [
+        "kernel-policy-result-alias"
+      ],
+      "existingChecks": [],
+      "limits": "Recognizes an explicit Result/KernelError alias spelling. It cannot select Error envelopes, rewrite third-party trait contracts, or prove generic error conversion behavior.",
+      "source": {
+        "file": "AGENTS.md",
+        "quote": "Kernel APIs use `KernelResult<T, E = KernelError>`"
+      }
+    },
+    {
+      "auditId": "DOC09",
+      "title": "Use documented expression shorthand",
+      "origin": "guidance",
+      "status": "structural-subset",
+      "executableRuleIds": [
+        "kernel-expression-column-macro",
+        "kernel-expression-lit",
+        "kernel-expression-null-literal",
+        "kernel-expression-predicate-constant"
+      ],
+      "existingChecks": [],
+      "limits": "Covers selected lit/null_lit, static boolean-predicate and simple col! patterns. Runtime values, typed Predicate::NULL inference, aliases and constructor tests need review.",
+      "source": {
+        "file": "AGENTS.md",
+        "quote": "When building expressions inline, prefer `lit(value)` and `null_lit(data_type)`"
+      }
+    },
+    {
+      "auditId": "DOC10",
+      "title": "Use schema literals with matching validation",
+      "origin": "guidance",
+      "status": "structural-subset",
+      "executableRuleIds": [
+        "kernel-schema-literal"
+      ],
+      "existingChecks": [],
+      "limits": "Only a narrow trusted single-field unchecked-schema literal pattern is implemented. General schema_ref!/lazy_schema_ref!/try_schema! rewrites and checked nested validation are not proven.",
+      "source": {
+        "file": "AGENTS.md",
+        "quote": "Prefer the `schema!` / `schema_ref!` macros"
+      }
+    },
+    {
+      "auditId": "DOC11",
+      "title": "No production panics",
+      "origin": "guidance",
+      "status": "existing-clippy-partial",
+      "executableRuleIds": [],
+      "existingChecks": [
+        "clippy::unwrap_used",
+        "clippy::expect_used",
+        "clippy::panic"
+      ],
+      "limits": "Existing Kernel configuration warns on three Clippy panic-related lints outside cfg(test). It does not establish absence of all production panics, including indexing/arithmetic and other macros.",
+      "source": {
+        "file": "AGENTS.md",
+        "quote": "NEVER panic in production code: use errors instead."
+      },
+      "existingConfiguration": "kernel/src/lib.rs",
+      "availableButNotEnabledHere": [
+        "clippy::unreachable",
+        "clippy::unimplemented",
+        "clippy::todo"
+      ]
+    },
+    {
+      "auditId": "DOC12",
+      "title": "Keep EngineData opaque outside engine adapters",
+      "origin": "guidance",
+      "status": "structural-subset",
+      "executableRuleIds": [
+        "kernel-policy-opaque-engine-data"
+      ],
+      "existingChecks": [],
+      "limits": "Path-scoped ArrowEngineData downcast shapes are checked. Other concrete types, aliases, engine-adapter boundaries and indirect downcasts are not type-resolved.",
+      "source": {
+        "file": "AGENTS.md",
+        "quote": "**EngineData is opaque:** inspect rows through the visitor APIs."
+      }
+    },
+    {
+      "auditId": "DOC13",
+      "title": "Do not assume one batch per file",
+      "origin": "guidance",
+      "status": "deferred-semantic",
+      "executableRuleIds": [],
+      "existingChecks": [],
+      "limits": "No executable check. Correct single-next use depends on the file-reader contract, remaining iterator uses and whether the caller intentionally probes or short-circuits.",
+      "source": {
+        "file": "AGENTS.md",
+        "quote": "NEVER assume one batch per file: ALWAYS iterate."
+      },
+      "deferredReason": "No executable check. Correct single-next use depends on the file-reader contract, remaining iterator uses and whether the caller intentionally probes or short-circuits."
+    },
+    {
+      "auditId": "DOC14",
+      "title": "Use Arrow null-array constructor",
+      "origin": "guidance",
+      "status": "structural-subset",
+      "executableRuleIds": [
+        "kernel-test-arrow-null-array"
+      ],
+      "existingChecks": [],
+      "limits": "Only selected primitive Arrow all-None constructors with compatible ArrayRef shapes are candidates. Exact datatypes, concrete-array consumers and constructor tests need review.",
+      "source": {
+        "file": "AGENTS/testing.md",
+        "quote": "`arrow::array::new_null_array(&arrow_type, n)`"
+      }
+    },
+    {
+      "auditId": "DOC15",
+      "title": "Use multithread setup for checkpoint tests",
+      "origin": "guidance",
+      "status": "deferred-semantic",
+      "executableRuleIds": [],
+      "existingChecks": [],
+      "limits": "No executable check. Checkpoint calls can be hidden behind helpers; proving the correct Tokio runtime and _mt setup requires call-graph/runtime context.",
+      "source": {
+        "file": "AGENTS/testing.md",
+        "quote": "Use the `_mt`"
+      },
+      "deferredReason": "No executable check. Checkpoint calls can be hidden behind helpers; proving the correct Tokio runtime and _mt setup requires call-graph/runtime context."
+    },
+    {
+      "auditId": "DOC16",
+      "title": "Parameterize repeated test flows with rstest",
+      "origin": "guidance",
+      "status": "deferred-semantic",
+      "executableRuleIds": [],
+      "existingChecks": [],
+      "limits": "No executable check. Consolidating tests requires semantic similarity and a decision about dependent cases versus independent Cartesian axes.",
+      "source": {
+        "file": "AGENTS.md",
+        "quote": "Use `rstest` when tests share the same logic"
+      },
+      "deferredReason": "No executable check. Consolidating tests requires semantic similarity and a decision about dependent cases versus independent Cartesian axes."
+    },
+    {
+      "auditId": "DOC17",
+      "title": "Do not emit tracing while holding extensions_mut lock",
+      "origin": "guidance",
+      "status": "deferred-semantic",
+      "executableRuleIds": [],
+      "existingChecks": [],
+      "limits": "No executable check. Detecting tracing re-entry while an extensions_mut lock is live needs lock-lifetime/control-flow analysis; a macro-name ban would flag safe callbacks.",
+      "source": {
+        "file": "AGENTS.md",
+        "quote": "**Tracing layer callbacks must not emit tracing events while holding a span's"
+      },
+      "deferredReason": "No executable check. Detecting tracing re-entry while an extensions_mut lock is live needs lock-lifetime/control-flow analysis; a macro-name ban would flag safe callbacks."
+    },
+    {
+      "auditId": "DOC18",
+      "title": "No Rust-reference parameters in new C APIs",
+      "origin": "guidance",
+      "status": "structural-subset",
+      "executableRuleIds": [
+        "kernel-ffi-no-reference-parameters"
+      ],
+      "existingChecks": [],
+      "limits": "Checks Rust reference types in selected extern C signatures under ffi/src. It is not an ABI migration, diff analysis, or a proof of pointer validity/lifetimes/ownership.",
+      "source": {
+        "file": "ffi/AGENTS.md",
+        "quote": "New `extern \"C\"` signatures should not use `&T`, `&mut T`, or `Option<&T>`."
+      },
+      "complementaryExistingRustLints": [
+        "improper_ctypes",
+        "improper_ctypes_definitions"
+      ]
+    },
+    {
+      "auditId": "DOC19",
+      "title": "Consume owned handles before fallible work",
+      "origin": "guidance",
+      "status": "deferred-semantic",
+      "executableRuleIds": [],
+      "existingChecks": [],
+      "limits": "No executable check. Owned-handle consumption must dominate every fallible path, while borrowed handles must remain borrowed; this requires ownership/control-flow reasoning.",
+      "source": {
+        "file": "ffi/AGENTS.md",
+        "quote": "A consumed handle is converted with"
+      },
+      "deferredReason": "No executable check. Owned-handle consumption must dominate every fallible path, while borrowed handles must remain borrowed; this requires ownership/control-flow reasoning."
+    },
+    {
+      "auditId": "DOC20",
+      "title": "No new unsafe in Miri-ignored tests",
+      "origin": "guidance",
+      "status": "structural-subset",
+      "executableRuleIds": [
+        "kernel-ffi-miri-ignored-unsafe"
+      ],
+      "existingChecks": [],
+      "limits": "Checks unsafe blocks under the exact cfg_attr(miri, ignore) attribute shape. The baseline detects new matched syntax, but cannot prove indirect Miri coverage or arbitrary added-unsafe semantics.",
+      "source": {
+        "file": "ffi/AGENTS.md",
+        "quote": "Never add new `unsafe` to a Miri-ignored test."
+      }
+    }
+  ],
+  "userSupplementedRules": [
+    {
+      "auditId": "USER01",
+      "title": "Prefer column_name! for known simple paths",
+      "origin": "user_supplement",
+      "status": "structural-subset",
+      "executableRuleIds": [
+        "kernel-expression-column-macro",
+        "kernel-expression-column-name-macro"
+      ],
+      "existingChecks": [],
+      "limits": "Only selected simple literal segment sequences are candidates. Constants, runtime strings, dotted single-segment names and aliases are deliberately not inferred.",
+      "sources": [
+        "User instruction",
+        "kernel/src/expressions/column_names.rs",
+        "AGENTS.md"
+      ]
+    },
+    {
+      "auditId": "USER02",
+      "title": "Prefer named predicate and fluent constructors",
+      "origin": "user_supplement",
+      "status": "structural-subset",
+      "executableRuleIds": [
+        "kernel-expression-fluent-predicate",
+        "kernel-expression-named-predicate"
+      ],
+      "existingChecks": [],
+      "limits": "Selected named/fluent Predicate constructor spellings are matched. No type resolution or proof about AST normalization, numeric types, aliases or operand effects is provided.",
+      "sources": [
+        "User instruction",
+        "kernel/src/expressions/mod.rs",
+        "kernel/src/expressions/mod.rs"
+      ]
+    },
+    {
+      "auditId": "USER03",
+      "title": "Prefer arithmetic operators and semantic expression builders",
+      "origin": "user_supplement",
+      "status": "structural-subset",
+      "executableRuleIds": [
+        "kernel-expression-arithmetic-operator",
+        "kernel-expression-named-variadic"
+      ],
+      "existingChecks": [],
+      "limits": "Selected arithmetic and named-variadic constructors are matched. The lhs must resolve to Kernel Expression and preserve the same AST; primitive arithmetic and runtime operator dispatch are not equivalent.",
+      "sources": [
+        "User instruction",
+        "kernel/src/expressions/mod.rs",
+        "kernel/src/expressions/mod.rs"
+      ]
+    },
+    {
+      "auditId": "USER04",
+      "title": "Encourage expr! for supported composed literal trees",
+      "origin": "user_supplement",
+      "status": "deferred-semantic",
+      "executableRuleIds": [],
+      "existingChecks": [],
+      "limits": "No executable general expr! rewrite. expr! returns Expression, has a constrained grammar, and may normalize wrappers/junctions. Composed-tree rewrites remain semantic review.",
+      "sources": [
+        "User instruction",
+        "kernel/src/expressions/macros.rs",
+        "kernel/src/expressions/macros.rs",
+        "derive-macros/src/expr_macro.rs"
+      ],
+      "deferredReason": "No executable general expr! rewrite. expr! returns Expression, has a constrained grammar, and may normalize wrappers/junctions. Composed-tree rewrites remain semantic review."
+    }
+  ],
+  "additionalRules": [
+    {
+      "ruleId": "kernel-itertools-try-collect",
+      "auditIds": [
+        "prefer_itertools_try_collect"
+      ],
+      "safeFix": false,
+      "limits": "Recognizes explicitly spelled Result<Vec<_>> collection. No type resolution: aliases, collection inference, closure error constraints and unstable method-name collisions require review. No automatic replacement is provided."
+    },
+    {
+      "ruleId": "kernel-itertools-collect-vec",
+      "auditIds": [
+        "prefer_collect_vec"
+      ],
+      "safeFix": false,
+      "limits": "Provides a replacement only when a direct file-level Itertools import exists. It does not prove that collect is the standard iterator method or that the Vec materialization is necessary. Run unnecessary-collection checks first; compile reviewed replacements."
+    },
+    {
+      "ruleId": "kernel-itertools-map-ok",
+      "auditIds": [
+        "prefer_map_ok"
+      ],
+      "safeFix": false,
+      "limits": "Requires a same-named function parameter explicitly written impl KernelResultIterator<T>; does not infer generic bounds or aliases. It does not resolve local shadowing or mapping-function capture/evaluation equivalence."
+    },
+    {
+      "ruleId": "kernel-itertools-iterator-join",
+      "auditIds": [
+        "prefer_iterator_join"
+      ],
+      "safeFix": false,
+      "limits": "Recognizes an immediately joined temporary Vec and a string-literal separator. Review item Display/Borrow equivalence, imports and destruction timing. A retained or reused Vec is deliberately not matched."
+    },
+    {
+      "ruleId": "kernel-itertools-borrowed-join",
+      "auditIds": [
+        "prefer_iterator_join"
+      ],
+      "safeFix": false,
+      "limits": "Specialized field_names().cloned().collect().join() suggestion. A reviewer must confirm Kernel StructType::field_names returns borrowed Strings; similarly named methods are not resolved by AST matching."
+    },
+    {
+      "ruleId": "kernel-itertools-preserve-result-errors",
+      "auditIds": [
+        "preserve_errors_when_flattening",
+        "prefer_result_filter_helpers"
+      ],
+      "safeFix": false,
+      "limits": "Flags only explicit Result::ok / Result::into_iter error-erasing adapters. It intentionally does not flag generic flatten() or Option pipelines. Intentional best-effort processing may keep the code with an explicit policy; different result-preserving adapters are not interchangeable fixes."
+    },
+    {
+      "ruleId": "kernel-itertools-process-results-unzip",
+      "auditIds": [
+        "prefer_process_results_unzip"
+      ],
+      "safeFix": false,
+      "limits": "Recognizes directly collected fallible pairs immediately consumed by unzip. The equivalent process_results consumer drains input, but output inference, allocation layout and partial-value Drop order need semantic review."
+    },
+    {
+      "ruleId": "kernel-itertools-exact-split-tuple",
+      "auditIds": [
+        "prefer_exact_tuple_collection"
+      ],
+      "safeFix": false,
+      "limits": "Recognizes a two-element let-else slice pattern over split(char).collect::<Vec<_>>(). Review source type and iterator purity: collect_tuple checks exact arity but consumes fewer excess items. Reject extra delimiters as before; split_once alone is not equivalent."
+    },
+    {
+      "ruleId": "kernel-itertools-filter-map-ok",
+      "auditIds": [
+        "prefer_result_filter_helpers"
+      ],
+      "safeFix": false,
+      "limits": "Recognizes a narrow Ok/Err match retaining every error. Review Result constructor resolution, Itertools availability and mapping-function captures before using the supplied replacement. Side-effectful match arms do not match."
+    },
+    {
+      "ruleId": "kernel-test-error-message-helper",
+      "auditIds": [
+        "manual_error_message_assert"
+      ],
+      "safeFix": false,
+      "limits": "Consecutive test assertions with one shared binding and a literal/simple expected message only. Add the proper unit/integration helper import. Preserve is_err-only checks, exact/variant/multi-message checks and custom diagnostics. Warning spans the first statement; no automatic deletion/rewrite is offered."
+    },
+    {
+      "ruleId": "kernel-test-get-column",
+      "auditIds": [
+        "prefer_get_column_test_helper"
+      ],
+      "safeFix": false,
+      "limits": "Test-only candidate requiring an Arrow RecordBatch/StructArray receiver and concrete array type. Keep typed/value/null/schema/order assertions after lookup and custom diagnostics. Name is constrained to a literal; verify the receiver/type and macro import before fixing."
+    },
+    {
+      "ruleId": "kernel-test-sorted-batch-helper",
+      "auditIds": [
+        "manual_sorted_batch_assert"
+      ],
+      "safeFix": false,
+      "limits": "Review-only: this test function pretty-prints batches and normalizes a Vec of complete trim().lines() before sorting. Confirm the same table rendering and ignored row/batch order before using the shared macro. Expected lines must remain sorted separately. Keep typed/schema/null/order/batch-boundary assertions and custom filtered-row comparisons."
+    }
+  ],
+  "baselinePolicy": "Existing findings are accepted by an explicit post-fix baseline. New unmatched diagnostic fingerprints/counts fail check unless locally suppressed with a reason or explicitly accepted by a reviewed refresh. Baseline acceptance is not proof of correctness.",
+  "fixPolicy": "All current metadata has safeFix=false. Replacement previews require an exact reviewed manifest; scan/check never rewrite source.",
+  "notCovered": "Workflow/documentation prose outside these 24 audited coding/test conventions is not claimed as enforced. Fixture-backed AST matching does not prove aliases, types, ownership, runtime configuration, complete call graphs or ABI correctness."
+}

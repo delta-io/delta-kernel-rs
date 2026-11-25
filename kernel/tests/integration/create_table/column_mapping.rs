@@ -17,7 +17,8 @@ use delta_kernel::table_features::{ColumnMappingMode, TableFeature};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use test_utils::{
-    column_mapping_fixtures as fixtures, create_table_and_load_snapshot, test_table_setup,
+    assert_result_error_with_message, column_mapping_fixtures as fixtures,
+    create_table_and_load_snapshot, test_table_setup,
 };
 
 use super::simple_schema;
@@ -268,13 +269,7 @@ fn test_column_mapping_invalid_mode_rejected() {
         .with_table_properties([("delta.columnMapping.mode", "invalid")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
 
-    assert!(result.is_err());
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid column mapping mode")
-    );
+    assert_result_error_with_message(result, "Invalid column mapping mode");
 }
 
 /// CREATE TABLE with column mapping disabled strips every column-mapping annotation the input

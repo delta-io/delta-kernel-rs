@@ -1134,12 +1134,10 @@ fn assert_sidecars_contain_only_file_actions(
 
         let adds = sidecar_batch
             .column_by_name("add")
-            .map(|c| valid_row_indices(c, sidecar_batch.num_rows()).len())
-            .unwrap_or(0);
+            .map_or(0, |c| valid_row_indices(c, sidecar_batch.num_rows()).len());
         let removes = sidecar_batch
             .column_by_name("remove")
-            .map(|c| valid_row_indices(c, sidecar_batch.num_rows()).len())
-            .unwrap_or(0);
+            .map_or(0, |c| valid_row_indices(c, sidecar_batch.num_rows()).len());
         per_sidecar_counts.push((adds, removes));
     }
     per_sidecar_counts.sort();
@@ -1559,7 +1557,7 @@ async fn test_v2_sidecar_default_hint_splits_at_50k() -> delta_kernel::Result<()
         .commit(engine.as_ref())?;
 
     // === Step 2: Run 60 commits of 1_000 synthetic adds each (60_000 total). ===
-    let mut snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
     for c in 0..COMMITS {
         let mut txn = begin_transaction_with(
             snapshot,

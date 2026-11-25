@@ -265,7 +265,7 @@ mod tests {
 
     use super::*;
     use crate::KernelResult;
-    use crate::expressions::{BinaryExpressionOp, col, expr};
+    use crate::expressions::{col, expr};
     use crate::schema::{DataType, PrimitiveType, schema, schema_ref};
     use crate::unit_test_utils::assert_result_error_with_message;
 
@@ -435,7 +435,7 @@ mod tests {
         let transform_spec = vec![
             FieldTransformSpec::StaticInsert {
                 insert_after: Some("col1".to_string()),
-                expr: expr.clone(),
+                expr: expr,
             },
             FieldTransformSpec::StaticDrop {
                 field_name: "col2".to_string(),
@@ -660,7 +660,7 @@ mod tests {
 
         let expected_expr = Arc::new(Expression::coalesce([
             col!("row_id_col"),
-            Expression::binary(BinaryExpressionOp::Plus, lit(4i64), col!("row_index_col")),
+            lit(4i64) + col!("row_index_col"),
         ]));
         let expr = &row_id_patch.insertions[0];
         assert_eq!(expr, &expected_expr);

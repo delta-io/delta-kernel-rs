@@ -1,0 +1,20 @@
+id: kernel-policy-result-alias
+snapshots:
+  fn f() -> Result<u32, KernelError> { work() }:
+    labels:
+    - source: Result<u32, KernelError>
+      style: primary
+      start: 10
+      end: 34
+  'struct Item<T> { value: Result<Vec<T>, KernelError> }':
+    labels:
+    - source: Result<Vec<T>, KernelError>
+      style: primary
+      start: 24
+      end: 51
+  type R<T> = std::result::Result<T, KernelError>;:
+    labels:
+    - source: std::result::Result<T, KernelError>
+      style: primary
+      start: 12
+      end: 47

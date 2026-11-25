@@ -1,0 +1,40 @@
+id: kernel-test-error-message-helper
+language: Rust
+severity: warning
+message: Use assert_result_error_with_message for the existing error substring assertion.
+note: Consecutive test assertions with one shared binding and a literal/simple expected message only. Add the proper
+  unit/integration helper import. Preserve is_err-only checks, exact/variant/multi-message checks and custom diagnostics.
+  Warning spans the first statement; no automatic deletion/rewrite is offered.
+rule:
+  all:
+  - pattern:
+      context: fn checks() { assert!($RESULT.is_err()); }
+      selector: expression_statement
+  - precedes:
+      pattern:
+        context: fn checks() { assert!($RESULT.unwrap_err().to_string().contains($MESSAGE)); }
+        selector: expression_statement
+  - matches: test-scope
+utils:
+  test-scope:
+    any:
+    - inside:
+        kind: mod_item
+        regex: (?s)^(pub(?:\([^)]*\))?\s+)?mod\s+tests\b
+        stopBy: end
+    - inside:
+        kind: function_item
+        follows:
+          kind: attribute_item
+          regex: ^#\[(test|tokio::test|rstest::rstest)(\b|\()
+          stopBy:
+            not:
+              kind: attribute_item
+        stopBy: end
+constraints:
+  RESULT:
+    kind: identifier
+  MESSAGE:
+    any:
+    - kind: string_literal
+    - kind: identifier

@@ -1286,12 +1286,8 @@ mod tests {
     #[test]
     fn test_basic_builder_creation() {
         let schema = test_schema();
-        let builder = CreateTableTransactionBuilder::new(
-            "/path/to/table",
-            schema.clone(),
-            "TestApp/1.0",
-            true,
-        );
+        let builder =
+            CreateTableTransactionBuilder::new("/path/to/table", schema, "TestApp/1.0", true);
 
         assert_eq!(builder.local_state.path, "/path/to/table");
         assert_eq!(builder.common_state.engine_info, "TestApp/1.0");
@@ -1471,7 +1467,7 @@ mod tests {
         let schema = test_schema();
         let builder = CreateTableTransactionBuilder::new(
             "/path/to/table/nested",
-            schema.clone(),
+            schema,
             "TestApp/1.0",
             true,
         );
@@ -1783,13 +1779,7 @@ mod tests {
             &mut writer_features,
         );
 
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("not found in schema")
-        );
+        assert_result_error_with_message(result, "not found in schema");
     }
 
     #[test]
@@ -2202,13 +2192,7 @@ mod tests {
 
         let columns = vec![column_name!("address.city")];
         let result = validate_partition_columns(&schema, &columns);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("must be a top-level column")
-        );
+        assert_result_error_with_message(result, "must be a top-level column");
     }
 
     #[rstest::rstest]
@@ -2234,13 +2218,7 @@ mod tests {
         };
         let columns = vec![ColumnName::new([col_name])];
         let result = validate_partition_columns(&schema, &columns);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("non-primitive type")
-        );
+        assert_result_error_with_message(result, "non-primitive type");
     }
 
     #[rstest::rstest]

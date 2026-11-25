@@ -1496,10 +1496,10 @@ mod tests {
             "CRC protocol does not match",
         );
 
-        let mut wrong_metadata = hint.clone();
+        let mut wrong_metadata = hint;
         wrong_metadata.crc = Some(Arc::new(Crc {
             metadata: Metadata::default(),
-            ..matching_crc.clone()
+            ..matching_crc
         }));
         assert_hint_error(
             SnapshotBuilder::new_for(&table_root),

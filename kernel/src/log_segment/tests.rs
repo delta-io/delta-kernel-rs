@@ -1368,7 +1368,7 @@ async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> Kernel
 #[test]
 fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> KernelResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = SyncEngine::new_with_store(store);
 
     let checkpoint_batch = sidecar_batch_with_given_paths(
         vec!["sidecarfile1.parquet", "sidecarfile2.parquet"],
@@ -2042,7 +2042,7 @@ async fn create_segment_for(segment: LogSegmentConfig<'_>) -> LogSegment {
     let staged_commits_log_tail = staged_commit_log_paths(segment.staged_commit_versions);
     LogSegment::for_snapshot_impl(
         storage.as_ref(),
-        log_root.clone(),
+        log_root,
         staged_commits_log_tail,
         None,
         segment.version_to_load,
@@ -3197,7 +3197,7 @@ async fn for_timestamp_conversion_cases(#[case] case: TimestampConversionCase) {
 
     let log_segment = LogSegment::for_timestamp_conversion(
         storage.as_ref(),
-        log_root.clone(),
+        log_root,
         end_version,
         limit.map(|l| NonZero::new(l).unwrap()),
         staged_commit_log_paths(staged),
@@ -3222,8 +3222,7 @@ async fn for_timestamp_conversion_no_commit_files() {
     )
     .await;
 
-    let res =
-        LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 0, None, vec![]);
+    let res = LogSegment::for_timestamp_conversion(storage.as_ref(), log_root, 0, None, vec![]);
     assert!(matches!(res, Err(KernelError::EmptyLog)));
 }
 
@@ -3246,7 +3245,7 @@ async fn test_latest_commit_file_field_is_captured() {
 
     let log_segment = LogSegment::for_snapshot(
         storage.as_ref(),
-        log_root.clone(),
+        log_root,
         vec![],
         None,
         SnapshotLoadMetricContext::for_test(),
@@ -3279,7 +3278,7 @@ async fn test_latest_commit_file_with_checkpoint_filtering() {
 
     let log_segment = LogSegment::for_snapshot(
         storage.as_ref(),
-        log_root.clone(),
+        log_root,
         vec![],
         None,
         SnapshotLoadMetricContext::for_test(),
@@ -3306,7 +3305,7 @@ async fn test_latest_commit_file_with_no_commits() {
 
     let log_segment = LogSegment::for_snapshot(
         storage.as_ref(),
-        log_root.clone(),
+        log_root,
         vec![],
         None,
         SnapshotLoadMetricContext::for_test(),
@@ -3336,7 +3335,7 @@ async fn test_latest_commit_file_with_checkpoint_at_same_version() {
 
     let log_segment = LogSegment::for_snapshot(
         storage.as_ref(),
-        log_root.clone(),
+        log_root,
         vec![],
         None,
         SnapshotLoadMetricContext::for_test(),
@@ -3368,7 +3367,7 @@ async fn test_latest_commit_file_edge_case_commit_before_checkpoint() {
 
     let log_segment = LogSegment::for_snapshot(
         storage.as_ref(),
-        log_root.clone(),
+        log_root,
         vec![],
         None,
         SnapshotLoadMetricContext::for_test(),
@@ -4827,7 +4826,7 @@ async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -
     let partition_schema = schema! { nullable "id": INTEGER };
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
-        read_schema.clone(),
+        read_schema,
         None,
         None,
         Some(&partition_schema),
@@ -5029,10 +5028,7 @@ async fn test_new_with_commit_published_commit() {
     let table_root = Url::parse("memory:///").unwrap();
     let new_commit = ParsedLogPath::create_parsed_published_commit(&table_root, 5);
 
-    let new_log_segment = log_segment
-        .clone()
-        .new_with_commit_appended(new_commit)
-        .unwrap();
+    let new_log_segment = log_segment.new_with_commit_appended(new_commit).unwrap();
 
     assert_eq!(new_log_segment.listed.max_published_version, Some(5));
     assert_log_segment_extended(log_segment, new_log_segment);
@@ -5048,10 +5044,7 @@ async fn test_new_with_commit_staged_commit() {
     let table_root = Url::parse("memory:///").unwrap();
     let new_commit = ParsedLogPath::create_parsed_staged_commit(&table_root, 5);
 
-    let new_log_segment = log_segment
-        .clone()
-        .new_with_commit_appended(new_commit)
-        .unwrap();
+    let new_log_segment = log_segment.new_with_commit_appended(new_commit).unwrap();
 
     assert_eq!(new_log_segment.listed.max_published_version, Some(4));
     assert_log_segment_extended(log_segment, new_log_segment);

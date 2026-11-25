@@ -2680,13 +2680,7 @@ mod tests {
             &physical_col,
             ColumnMappingMode::None,
         );
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("not found in schema")
-        );
+        assert_result_error_with_message(result, "not found in schema");
     }
 
     #[test]
@@ -2722,13 +2716,7 @@ mod tests {
             &physical_col,
             ColumnMappingMode::None,
         );
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("is not a struct or `file` type")
-        );
+        assert_result_error_with_message(result, "is not a struct or `file` type");
     }
 
     // === find_max_column_id_in_schema tests ===

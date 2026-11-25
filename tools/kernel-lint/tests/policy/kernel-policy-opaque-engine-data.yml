@@ -1,0 +1,7 @@
+id: kernel-policy-opaque-engine-data
+valid:
+- mod tests { fn check() { let x = data.as_any().downcast_ref::<ArrowEngineData>(); } }
+- fn f() { let x = data.as_any().downcast_ref::<StringArray>(); }
+invalid:
+- fn f() { let x = data.as_any().downcast_ref::<ArrowEngineData>(); }
+- fn f() { let x = data.as_any().downcast_mut::<ArrowEngineData>(); }

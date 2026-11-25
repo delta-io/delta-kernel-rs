@@ -624,7 +624,7 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
         let mut expected: Vec<_> = expected_field_groups
             .iter()
             .flat_map(|fields| fields.iter())
-            .map(|field| field.to_string())
+            .map(ToString::to_string)
             .collect();
         // Back references are part of the adaptive-metadata-tree schema; they appear as `add`
         // leaves only when that feature is enabled.

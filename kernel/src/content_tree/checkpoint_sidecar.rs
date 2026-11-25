@@ -197,7 +197,7 @@ mod tests {
             LOG_TXN_SCHEMA.clone(),
             LOG_TXN_SCHEMA.clone(),
         )
-        .and_then(|batches| batches.collect::<KernelResult<Vec<_>>>());
+        .and_then(Iterator::collect::<KernelResult<Vec<_>>>);
         assert_result_error_with_message(result, "_delta_log/_sidecars/missing.parquet");
     }
 }

@@ -573,7 +573,7 @@ async fn test_not_null_data_column_rejects_null_in_batch(
     // Create a table with a NOT NULL column.
     let schema = schema_ref! { not_null "c": (data_type.clone()) };
     let (_tmp_dir, table_path, engine) = test_table_setup()?;
-    let _ = kernel_create_table(&table_path, schema.clone(), "test/1.0", true)
+    let _ = kernel_create_table(&table_path, schema, "test/1.0", true)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 

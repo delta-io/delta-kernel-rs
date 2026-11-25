@@ -1,0 +1,23 @@
+id: kernel-expression-named-variadic
+language: Rust
+severity: warning
+message: Use the named expression builder for a known variadic operation.
+note: Resolve Kernel Expression/VariadicExpressionOp. coalesce and array delegate to these exact operations;
+  preserve source iteration/evaluation order and constructor tests.
+rule:
+  pattern: Expression::variadic(VariadicExpressionOp::$OP, $VALUES)
+constraints:
+  OP:
+    regex: ^(Coalesce|Array)$
+transform:
+  FIRST:
+    replace:
+      source: $OP
+      replace: ^Coalesce$
+      by: coalesce
+  METHOD:
+    replace:
+      source: $FIRST
+      replace: ^Array$
+      by: array
+fix: Expression::$METHOD($VALUES)
