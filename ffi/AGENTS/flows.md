@@ -10,6 +10,7 @@ Key files and call sequences for the exported FFI flows. The boundary rules are 
   with their backing storage and conversions colocated
 - `src/snapshot/builder.rs` -- snapshot builders and their configuration
 - `src/snapshot/hint/` -- typed snapshot-hint input and callback export
+- `src/snapshot/snapshot_crc.rs` -- checksum provenance value types and conversions
 - `src/handle.rs` -- opaque handle system for passing Rust objects across FFI
 - `src/column_default.rs` -- column-default (`allowColumnDefaults`) reads and the write-path ack
 - `src/scan.rs` -- scan FFI interface
@@ -56,14 +57,20 @@ engine I/O through one callback with a complete borrowed `FfiSnapshotHint`. Both
 borrowed. The callback runs once on success and is not invoked on error. All nested pointers expire
 when the callback returns; copy retained values during the callback. No hint handle is returned.
 Supply the copied values through `snapshot_builder_with_snapshot_hint` when rebuilding a snapshot.
-The hint preserves build-time freshness, not current freshness, and includes only a matching
-checkpoint hint, an at-version CRC, and the selected checkpoint's type when known. Compaction files
-are unsupported.
+The hint preserves build-time freshness, not current freshness, a matching checkpoint hint,
+the selected checkpoint type when known, and an at-version CRC. Stale CRCs are omitted.
+Checksum telemetry is preserved for an exported CRC. A snapshot hint without a CRC carries no
+provenance, including when export omits a stale CRC or the snapshot reported `Unusable`.
+A snapshot rebuilt at the hint version reports `Absent`. An imported CRC has `SnapshotHint` provenance.
+When its status was omitted, its disk version is unspecified. Installing the snapshot hint rejects
+an inconsistent claim. See `FfiSnapshotHint` for the claim rules.
 
-`FfiSnapshotHint.checkpoint_type` is an `OptionalValue<FfiSelectedCheckpointType>` for the
-checkpoint selected from the hint's log paths. `None` means unknown, not that no checkpoint was
-selected. C callers must set its tag explicitly, using `NoneFfiSelectedCheckpointType` when absent;
-a zero-initialized field is an invalid `Some` payload.
+The `last_checkpoint` and `crc` fields in `FfiSnapshotHint` use borrowed nullable pointers.
+`checkpoint_type` and `crc_provenance` are inline `OptionalValue` fields.
+Set the `crc_provenance` tag to `NoneFfiSnapshotCrcProvenance` to omit it. A zero-initialized field
+claims a current CRC from a version-0 checksum file, with an in-memory CRC version of 0.
+An unknown checkpoint type does not mean no checkpoint was selected. A supplied type is advisory;
+naming and protocol take precedence, and checkpoint discovery replaces it with the observed type.
 
 Export includes an explicit publication watermark,
 preserving absence even when published commits are not represented by the retained paths.
@@ -89,6 +96,13 @@ the type is known from the checkpoint's naming, the table protocol, the snapshot
 discovery. Otherwise it resolves the type through the same snapshot cache as
 `snapshot_checkpoint_info` and declarative scan planning.
 
+`snapshot_crc_provenance(snapshot, out)` copies the snapshot's `FfiSnapshotCrcProvenance` to caller-owned
+storage without engine I/O. Callers must allocate the complete tagged result and rebuild against
+the matching generated header. `Current` and `Stale` carry the origin, in-memory CRC version and any
+known checksum-file version. Their version difference counts cumulative commits since that file.
+For `Stale`, subtract the CRC version from the snapshot version to obtain the remaining gap.
+`Absent` and `Unusable` carry no CRC. Status is independent of file-statistics completeness.
+
 Snapshot accessors (`ffi/src/lib.rs`) include no-I/O reads such as `version` and
 `snapshot_file_stats`, which returns `OptionalValue<FfiFileStats>` (scalar
 `num_files` / `table_size_bytes` from the CRC; `None` when the snapshot has no CRC, or its CRC lacks
@@ -97,7 +111,7 @@ the same file stats: it invokes one callback with borrowed `i64` slices for bin 
 counts, and total bytes; callers must copy values they retain after the callback.
 
 `snapshot_timestamp` uses a synchronous `SnapshotReader` and may read commit JSON when the
-In-Commit Timestamp is unavailable from retained CRC state. Domain-metadata and transaction-version
+In-Commit Timestamp is unavailable from in-memory CRC state. Domain-metadata and transaction-version
 FFI reads also use an unscoped reader, preserving the engine's cancellation and timeout behavior.
 The C API signatures do not expose reader state or a cancellation token.
 

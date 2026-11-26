@@ -11,7 +11,7 @@
 // TODO(#2615): support log compaction files.
 
 use std::collections::hash_map::Entry;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
 use tracing::{instrument, warn};
 
@@ -28,8 +28,8 @@ use crate::actions::{
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::actions::{LAST_MANIFEST_COMMIT_FIELD, LastManifestCommit};
 use crate::crc::{
-    Crc, CrcDelta, FileSizeHistogram, FileStatsDelta, FileStatsPolicy, read_crc_file_or_none,
-    size_to_u64,
+    Crc, CrcDelta, CrcWithProvenance, FileSizeHistogram, FileStatsDelta, FileStatsPolicy,
+    read_crc_file_or_none, size_to_u64,
 };
 use crate::engine_data::{GetData, TypedGetData as _};
 use crate::metrics::ProtocolMetadataSource;
@@ -75,8 +75,9 @@ static REPLAY_COMMIT_INFO_FIELD: LazyLock<StructField> = LazyLock::new(|| {
 });
 
 impl LogSegment {
-    /// Try to build the CRC at this segment's `end_version` from the caller's resolved `base` CRC.
-    /// Handles three cases:
+    /// Try to build the CRC at this segment's `end_version` from the caller's resolved CRC state.
+    /// Returns the resulting in-memory CRC and its protocol/metadata source without changing the
+    /// base. Handles three cases:
     /// - Case 1: no base CRC available -> return None
     /// - Case 2: base CRC at `end_version` -> return it as-is
     /// - Case 3: stale base CRC older than `end_version` -> advance it to `end_version` when
@@ -84,16 +85,16 @@ impl LogSegment {
     pub(crate) fn try_build_crc_within_budget(
         &self,
         engine: &dyn Engine,
-        base: Option<&Arc<Crc>>,
+        base: Option<&CrcWithProvenance>,
         incremental_replay: IncrementalReplay,
-    ) -> KernelResult<Option<(Arc<Crc>, ProtocolMetadataSource)>> {
+    ) -> KernelResult<Option<(CrcWithProvenance, ProtocolMetadataSource)>> {
         let Some(base) = base else {
             return Ok(None);
         };
-        if base.version == self.end_version {
+        if base.version() == self.end_version {
             return Ok(Some((base.clone(), ProtocolMetadataSource::CrcAtTarget)));
         }
-        if !incremental_replay.should_advance(base.version, self.end_version)? {
+        if !incremental_replay.should_advance(base.version(), self.end_version)? {
             return Ok(None);
         }
         // TODO(#3421): Classify required-commit gaps and replay-file failures during CRC
@@ -101,45 +102,52 @@ impl LogSegment {
         // original error sources.
         let advanced = self.build_crc_from_base(engine, base)?;
         Ok(Some((
-            Arc::new(advanced),
+            advanced,
             ProtocolMetadataSource::CrcAdvancedByReplay,
         )))
     }
 
-    /// Pick the latest CRC to use as an advance base: this segment's on-disk CRC or
-    /// `in_memory_base`, whichever is newer, falling back to `in_memory_base` on a failed on-disk
-    /// read, except cancellation. Drops a base below the checkpoint; returns None when no candidate
-    /// remains.
+    /// Picks the newest usable CRC, preserving the in-memory CRC's disk origin.
+    /// Falls back to the in-memory CRC on a failed disk read, except cancellation, and drops a
+    /// selected CRC below the checkpoint. Absence observations describe this segment's listing.
     pub(crate) fn pick_latest_base_crc(
         &self,
         engine: &dyn Engine,
-        in_memory_base: Option<&Arc<Crc>>,
-    ) -> KernelResult<Option<Arc<Crc>>> {
-        let preferred_disk_crc = self
-            .listed
-            .latest_crc_file
-            .as_ref()
-            .filter(|f| in_memory_base.is_none_or(|m| f.version > m.version));
-        let disk_crc = preferred_disk_crc
-            .map(|file| read_crc_file_or_none(engine, file))
-            .transpose()?
-            .flatten();
-        Ok(disk_crc.or_else(|| in_memory_base.cloned()).filter(|crc| {
+        in_memory_base: Option<CrcWithProvenance>,
+    ) -> KernelResult<Option<CrcWithProvenance>> {
+        let latest_file = self.listed.latest_crc_file.as_ref();
+        let selected = match latest_file {
+            Some(file)
+                if in_memory_base
+                    .as_ref()
+                    .is_none_or(|crc| file.version > crc.version()) =>
+            {
+                read_crc_file_or_none(engine, file)?
+            }
+            _ => None,
+        }
+        .or(in_memory_base)
+        .filter(|crc| {
             self.checkpoint_version
-                .is_none_or(|ckpt| crc.version >= ckpt)
-        }))
+                .is_none_or(|checkpoint| crc.version() >= checkpoint)
+        });
+
+        Ok(selected)
     }
 
     /// Read this segment's latest on-disk CRC (`latest_crc_file`), at whatever version it sits.
-    /// Returns None when there is no CRC file or a non-cancellation read failure. The CRC may be
-    /// stale (older than `end_version`).
-    pub(crate) fn read_latest_crc(&self, engine: &dyn Engine) -> KernelResult<Option<Arc<Crc>>> {
-        self.pick_latest_base_crc(engine, /* in_memory_base */ None)
+    /// Returns no CRC when the candidate is missing or unusable. The CRC may be older than
+    /// `end_version`; snapshot construction classifies the result for the target version.
+    pub(crate) fn read_latest_crc(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<Option<CrcWithProvenance>> {
+        self.pick_latest_base_crc(engine, None)
     }
 
     /// Produce a fresh `Crc` at `self.end_version` by reverse-replaying the commits in
     /// `(base_crc.version, self.end_version]` and applying the resulting delta to
-    /// `base_crc` via [`Crc::apply`].
+    /// `base_crc` via [`CrcWithProvenance::apply`].
     #[instrument(
         name = "log_seg.build_crc_from_base",
         skip_all,
@@ -149,17 +157,18 @@ impl LogSegment {
     pub(crate) fn build_crc_from_base(
         &self,
         engine: &dyn Engine,
-        base_crc: &Crc,
-    ) -> KernelResult<Crc> {
+        base_crc: &CrcWithProvenance,
+    ) -> KernelResult<CrcWithProvenance> {
         let seed_histogram = base_crc
+            .crc()
             .file_stats()
             .and_then(|s| s.file_size_histogram())
             .map(|h| {
                 FileSizeHistogram::create_empty_with_boundaries(h.sorted_bin_boundaries().to_vec())
             })
             .transpose()?;
-        let delta = self.build_crc_delta_from_base(engine, base_crc.version, seed_histogram)?;
-        Ok(base_crc.clone().apply(delta, self.end_version))
+        let delta = self.build_crc_delta_from_base(engine, base_crc.version(), seed_histogram)?;
+        Ok(base_crc.apply(delta, self.end_version))
     }
 
     /// Build a Complete base [`Crc`] at `checkpoint_version` from this segment's checkpoint files.
@@ -1373,7 +1382,9 @@ mod tests {
             set_transaction_state: SetTransactionState::Complete(HashMap::new()),
             ..Default::default()
         };
+        let base = CrcWithProvenance::from_snapshot_hint(Arc::new(base), None);
         let crc = segment.build_crc_from_base(&engine, &base).unwrap();
+        let crc = crc.crc();
 
         // Newest-wins: v2's upgraded protocol (now carries `rowTracking` on top of v0's
         // features), v2's metadata, v2's ICT.

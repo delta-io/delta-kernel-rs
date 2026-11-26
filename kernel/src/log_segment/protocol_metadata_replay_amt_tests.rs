@@ -19,6 +19,8 @@ use crate::actions::{
 };
 use crate::arrow::array::StringArray;
 use crate::committer::FileSystemCommitter;
+#[cfg(feature = "declarative-plans")]
+use crate::crc::CrcWithProvenance;
 use crate::crc::{Crc, FileStats, FileStatsState};
 #[cfg(feature = "declarative-plans")]
 use crate::engine::DelegatingEngine;
@@ -822,7 +824,7 @@ async fn plan_replay_bounded_by_crc_or_checkpoint_runs_one_plan(
     let crc = log_segment.read_latest_crc(&engine).unwrap();
 
     let resolution = log_segment
-        .read_protocol_metadata_opt(&engine, crc.as_ref())
+        .read_protocol_metadata_opt(&engine, crc.as_ref().map(CrcWithProvenance::crc))
         .unwrap();
     assert!(resolution.protocol.is_some() && resolution.metadata.is_some());
     assert!(resolution.captured_checkpoint_action.is_none());

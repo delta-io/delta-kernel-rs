@@ -17,7 +17,9 @@ use delta_kernel::metrics::SnapshotLoadType;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::snapshot::IncrementalReplay;
 #[cfg(feature = "internal-api")]
-use delta_kernel::snapshot::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness};
+use delta_kernel::snapshot::{
+    CrcProvenance, PublicationWatermark, SnapshotCrcProvenance, SnapshotHint, SnapshotHintFreshness,
+};
 use delta_kernel::transaction::UpdateTableOperation;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
@@ -67,6 +69,7 @@ fn external_snapshot_hint_api_builds_without_storage_io() -> delta_kernel::Resul
         snapshot.log_segment().checkpoint_hint().cloned(),
         snapshot.crc_at_version().cloned(),
         SnapshotHintFreshness::Latest,
+        None,
         None,
     )?;
     reporter.reset();
@@ -155,8 +158,20 @@ fn snapshot_to_hint_round_trip_without_storage_io(
 }
 
 #[cfg(feature = "internal-api")]
-#[test]
-fn external_snapshot_hint_accepts_parsed_advanced_crc() -> delta_kernel::Result<()> {
+#[rstest]
+#[case::omitted(None)]
+#[case::no_disk_version(
+    Some(SnapshotCrcProvenance::Current(CrcProvenance::SnapshotHint {
+        crc_version: 2,
+        on_disk_version: None,
+    })),
+)]
+#[case::reconstructed(
+    Some(SnapshotCrcProvenance::Current(CrcProvenance::File { crc_version: 2, on_disk_version: 1 })),
+)]
+fn external_snapshot_hint_accepts_parsed_advanced_crc(
+    #[case] claim: Option<SnapshotCrcProvenance>,
+) -> delta_kernel::Result<()> {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(2).with_crc_at([1]))
         .with_data(1, 1)
@@ -194,17 +209,38 @@ fn external_snapshot_hint_accepts_parsed_advanced_crc() -> delta_kernel::Result<
         snapshot.table_configuration().protocol().clone(),
         snapshot.table_configuration().metadata().clone(),
         snapshot.log_segment().checkpoint_hint().cloned(),
-        Some(parsed_crc),
+        Some(parsed_crc.clone()),
         SnapshotHintFreshness::Latest,
         None,
+        claim,
     )?;
+    assert_eq!(
+        hint.crc_provenance(),
+        Some(claim.unwrap_or(SnapshotCrcProvenance::Current(
+            CrcProvenance::SnapshotHint {
+                crc_version: parsed_crc.version,
+                on_disk_version: None,
+            }
+        )))
+    );
     reporter.reset();
 
     let hinted = Snapshot::builder_for(table.table_root())
         .with_snapshot_hint(hint)
         .build(&engine)?;
 
-    assert_eq!(hinted.crc_at_version().unwrap().version, hinted.version());
+    let disk_version = match claim {
+        Some(SnapshotCrcProvenance::Current(p)) => p.on_disk_version(),
+        _ => None,
+    };
+    assert_eq!(
+        hinted.crc_provenance(),
+        SnapshotCrcProvenance::Current(CrcProvenance::SnapshotHint {
+            crc_version: 2,
+            on_disk_version: disk_version,
+        })
+    );
+    assert!(Arc::ptr_eq(hinted.crc_at_version().unwrap(), &parsed_crc));
     assert_eq!(reporter.list_calls.get(), 0);
     assert_eq!(reporter.json_read_calls.get(), 0);
     assert_eq!(reporter.parquet_read_calls.get(), 0);

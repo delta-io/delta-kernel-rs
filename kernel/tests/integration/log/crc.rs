@@ -18,7 +18,10 @@ use delta_kernel::metrics::{ChecksumWriteResolutionMode, MetricEvent};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::schema::{SchemaRef, schema_ref};
-use delta_kernel::snapshot::{ChecksumWriteResult, IncrementalReplay, Snapshot, SnapshotRef};
+use delta_kernel::snapshot::{
+    ChecksumWriteResult, CrcProvenance, IncrementalReplay, Snapshot, SnapshotCrcProvenance,
+    SnapshotRef,
+};
 #[cfg(feature = "internal-api")]
 use delta_kernel::snapshot::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness};
 use delta_kernel::transaction::create_table::create_table;
@@ -63,6 +66,7 @@ async fn test_get_file_stats_from_crc() -> delta_kernel::Result<()> {
 
 #[tokio::test]
 async fn test_get_file_stats_no_crc() -> delta_kernel::Result<()> {
+    // Given a table created without a checksum-file lookup.
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = schema_ref! {
@@ -70,12 +74,31 @@ async fn test_get_file_stats_no_crc() -> delta_kernel::Result<()> {
         nullable "value": STRING,
     };
 
-    let _ = create_table(&table_path, schema, "Test/1.0", true)
+    let created = create_table(&table_path, schema, "Test/1.0", true)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    assert_eq!(
+        created.crc_provenance(),
+        SnapshotCrcProvenance::Current(CrcProvenance::CreateTable {
+            crc_version: 0,
+            on_disk_version: None
+        })
+    );
+
+    // When a fresh load searches storage for a checksum.
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    // Then the fresh snapshot has no CRC, and the CREATE TABLE snapshot still holds its CRC.
+    assert_eq!(snapshot.crc_provenance(), SnapshotCrcProvenance::Absent);
+    assert_eq!(
+        created.crc_provenance(),
+        SnapshotCrcProvenance::Current(CrcProvenance::CreateTable {
+            crc_version: 0,
+            on_disk_version: None
+        })
+    );
     assert_eq!(snapshot.version(), 0);
 
     let file_stats = snapshot.get_file_stats_if_present();
@@ -250,6 +273,7 @@ fn test_get_all_files_preserved_via_snapshot_hint() -> delta_kernel::Result<()> 
         snapshot.log_segment().checkpoint_hint().cloned(),
         snapshot.crc_at_version().cloned(),
         SnapshotHintFreshness::Latest,
+        None,
         None,
     )?;
 
@@ -1155,6 +1179,14 @@ async fn setup_incremental_below_checkpoint_base<E: TaskExecutor>(
         .at_version(3)
         .build(engine.as_ref())?;
 
+    assert_eq!(
+        base.crc_provenance(),
+        SnapshotCrcProvenance::Stale(CrcProvenance::File {
+            crc_version: 1,
+            on_disk_version: 1,
+        })
+    );
+
     // Checkpoint at v2, above the base's CRC@1 but below the base version.
     Snapshot::builder_for(table_path)
         .at_version(2)
@@ -1179,22 +1211,24 @@ async fn test_incremental_unlimited_skips_below_checkpoint_base() -> delta_kerne
         .build(engine.as_ref())?;
     assert_eq!(updated.version(), 3);
     assert_eq!(updated.log_segment().checkpoint_version, Some(2));
+    assert_eq!(updated.crc_provenance(), SnapshotCrcProvenance::Absent);
 
     Ok(())
 }
 
-/// Regression (incremental write path): after an incremental update retains a base below a
-/// newly-listed checkpoint, `write_checksum` must skip that below-checkpoint base and resolve from
-/// the checkpoint root rather than erroring on the commits the checkpoint subsumed.
+/// Regression (incremental write path): after an incremental update drops the retained CRC below a
+/// newly-listed checkpoint, `write_checksum` must resolve from the checkpoint root rather than
+/// erroring on the commits the checkpoint subsumed.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_write_checksum_incremental_stale_base_below_new_checkpoint_resolves()
 -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let base = setup_incremental_below_checkpoint_base(&engine, &table_path).await?;
 
-    // Disabled update keeps the below-checkpoint base@1 un-advanced on the combined segment.
+    // With replay disabled, the update drops the retained CRC@1 below checkpoint@2.
     let updated = Snapshot::builder_from(base).build(engine.as_ref())?;
     assert_eq!(updated.log_segment().checkpoint_version, Some(2));
+    assert_eq!(updated.crc_provenance(), SnapshotCrcProvenance::Absent);
 
     // Case 2 must skip the below-checkpoint base and resolve from the checkpoint root.
     assert_eq!(
@@ -1416,6 +1450,7 @@ async fn test_write_checksum_rejects_file_actions_with_unsafe_operation(
     #[case] replay: IncrementalReplay,
     #[values("ANALYZE STATS", "Manual Update", "UNKNOWN", "SET TBLPROPERTIES")] operation: &str,
 ) -> delta_kernel::Result<()> {
+    // Given file actions that prevent complete CRC statistics.
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let snap = create_table_and_commit(&table_path, engine.as_ref())?
         .post_commit_snapshot()
@@ -1446,9 +1481,25 @@ async fn test_write_checksum_rejects_file_actions_with_unsafe_operation(
     .await?
     .unwrap_committed();
 
+    // When the snapshot resolves its checksum with or without incremental replay.
     let fresh = Snapshot::builder_for(&table_path)
         .with_incremental_crc_replay(replay)
         .build(engine.as_ref())?;
+    // Then checksum provenance is independent of statistics completeness.
+    let expected_status = if with_checkpoint {
+        SnapshotCrcProvenance::Absent
+    } else if replay == IncrementalReplay::Unlimited {
+        SnapshotCrcProvenance::Current(CrcProvenance::File {
+            crc_version: 2,
+            on_disk_version: 0,
+        })
+    } else {
+        SnapshotCrcProvenance::Stale(CrcProvenance::File {
+            crc_version: 0,
+            on_disk_version: 0,
+        })
+    };
+    assert_eq!(fresh.crc_provenance(), expected_status);
     assert_eq!(fresh.version(), 2);
     assert_eq!(
         fresh.crc_at_version().is_some(),
@@ -1462,6 +1513,8 @@ async fn test_write_checksum_rejects_file_actions_with_unsafe_operation(
         fresh.write_checksum(engine.as_ref()),
         &format!("unsupported operation {operation:?}"),
     );
+
+    assert_eq!(fresh.crc_provenance(), expected_status);
 
     Ok(())
 }

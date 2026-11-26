@@ -21,6 +21,7 @@ use std::collections::HashSet;
 mod delta;
 mod file_size_histogram;
 mod file_stats;
+mod provenance;
 mod reader;
 mod state;
 mod writer;
@@ -34,6 +35,8 @@ pub use file_stats::FileStats;
 pub(crate) use file_stats::{
     FileStatsDelta, FileStatsPolicy, is_incremental_safe_operation, size_to_u64,
 };
+pub use provenance::CrcProvenance;
+pub(crate) use provenance::CrcWithProvenance;
 pub(crate) use reader::read_crc_file_or_none;
 #[cfg(test)]
 pub(crate) use reader::try_read_crc_file;

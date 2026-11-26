@@ -89,6 +89,7 @@ pub mod snapshot;
 /// Preserves the `snapshot_hint` import path for Rust callers.
 #[doc(hidden)]
 pub use snapshot::hint as snapshot_hint;
+use snapshot::snapshot_crc::FfiSnapshotCrcProvenance;
 pub use snapshot::{
     ExclusiveSnapshotBuilder, FfiIncrementalReplay, FfiSnapshotBuilder, free_snapshot_builder,
     get_snapshot_builder, get_snapshot_builder_from, snapshot_builder_build,
@@ -1455,6 +1456,19 @@ pub unsafe extern "C" fn snapshot_log_segment_stats(
         snapshot.log_segment_stats().map(FfiLogSegmentStats::from)
     });
     unsafe { result.into_extern_result(&engine.as_ref()) }
+}
+
+/// Writes the snapshot-relative CRC provenance without engine I/O.
+///
+/// # Safety
+/// `snapshot` must remain valid for the call. `out` must be aligned and writable for one
+/// `FfiSnapshotCrcProvenance`. Its previous contents may be uninitialized.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapshot_crc_provenance(
+    snapshot: Handle<SharedSnapshot>,
+    out: *mut FfiSnapshotCrcProvenance,
+) {
+    unsafe { out.write(snapshot.as_ref().crc_provenance().into()) };
 }
 
 /// File-level statistics for a snapshot, sourced from the snapshot's CRC.

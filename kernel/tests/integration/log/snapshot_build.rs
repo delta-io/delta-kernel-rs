@@ -7,7 +7,8 @@ use delta_kernel::arrow::array::{ArrayRef, Int32Array};
 use delta_kernel::committer::{Committer, FileSystemCommitter};
 use delta_kernel::schema::{DataType, schema, schema_ref};
 use delta_kernel::snapshot::{
-    CheckpointWriteResult, ChecksumWriteResult, IncrementalReplay, SnapshotBuilder,
+    CheckpointWriteResult, ChecksumWriteResult, CrcProvenance, IncrementalReplay, SnapshotBuilder,
+    SnapshotCrcProvenance,
 };
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{KernelError, KernelResult, Snapshot, Version};
@@ -373,13 +374,14 @@ async fn row_tracking_configuration_rejects_only_enabled_and_suspended(
 async fn built_as_latest_is_inherited_by_derived_snapshots(
     #[values(true, false)] base_snap_time_travel_to_latest: bool,
     #[values(TableKind::FileSystem, TableKind::CatalogManaged)] kind: TableKind,
+    #[values(IncrementalReplay::Disabled, IncrementalReplay::Unlimited)] replay: IncrementalReplay,
 ) -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     setup_multi_version_table(&engine, &table_path, kind).await?;
 
     let mut builder =
         maybe_attach_max_catalog_version(Snapshot::builder_for(&table_path), LATEST_VERSION, kind)
-            .with_incremental_crc_replay(IncrementalReplay::Unlimited);
+            .with_incremental_crc_replay(replay);
     if base_snap_time_travel_to_latest {
         builder = builder.at_version(LATEST_VERSION);
     }
@@ -389,26 +391,77 @@ async fn built_as_latest_is_inherited_by_derived_snapshots(
     // version is also considered built as latest.
     let base_is_latest = !base_snap_time_travel_to_latest || kind == TableKind::CatalogManaged;
     assert_eq!(base.is_built_as_latest(), base_is_latest);
+    let expected_provenance = if replay == IncrementalReplay::Unlimited {
+        SnapshotCrcProvenance::Current(CrcProvenance::File {
+            crc_version: LATEST_VERSION,
+            on_disk_version: 0,
+        })
+    } else {
+        SnapshotCrcProvenance::Stale(CrcProvenance::File {
+            crc_version: 0,
+            on_disk_version: 0,
+        })
+    };
+    assert_eq!(base.crc_provenance(), expected_provenance);
 
     // checkpoint and write_checksum inherit the base's flag.
     let (ckpt_result, after_checkpoint) = base.checkpoint(engine.as_ref(), None)?;
     assert_eq!(ckpt_result, CheckpointWriteResult::Written);
     assert_eq!(after_checkpoint.is_built_as_latest(), base_is_latest);
+    // A new checkpoint discards a CRC older than its version, including its disk observation.
+    let expected_checkpoint_provenance = if replay == IncrementalReplay::Unlimited {
+        expected_provenance
+    } else {
+        SnapshotCrcProvenance::Absent
+    };
+    assert_eq!(
+        after_checkpoint.crc_provenance(),
+        expected_checkpoint_provenance
+    );
 
     let (crc_result, after_checksum) = after_checkpoint.write_checksum(engine.as_ref())?;
     assert_eq!(crc_result, ChecksumWriteResult::Written);
     assert_eq!(after_checksum.is_built_as_latest(), base_is_latest);
+    assert_eq!(
+        after_checksum.crc_provenance(),
+        SnapshotCrcProvenance::Current(if replay == IncrementalReplay::Unlimited {
+            CrcProvenance::File {
+                crc_version: LATEST_VERSION,
+                on_disk_version: LATEST_VERSION,
+            }
+        } else {
+            CrcProvenance::Checkpoint {
+                crc_version: LATEST_VERSION,
+                on_disk_version: Some(LATEST_VERSION),
+            }
+        })
+    );
 
     // publish() (catalog-managed only) also inherits the base's flag.
     if kind == TableKind::CatalogManaged {
         let published = base.publish(engine.as_ref(), &TestCatalogCommitter)?;
         assert_eq!(published.is_built_as_latest(), base_is_latest);
+        assert_eq!(published.crc_provenance(), expected_provenance);
     }
 
     // A post-commit snapshot is latest.
     let post_commit = append_row(base, &engine, kind, 4).await?;
     assert_eq!(post_commit.version(), 4);
     assert!(post_commit.is_built_as_latest());
+    assert_eq!(
+        post_commit.crc_provenance(),
+        if replay == IncrementalReplay::Unlimited {
+            SnapshotCrcProvenance::Current(CrcProvenance::File {
+                crc_version: 4,
+                on_disk_version: 0,
+            })
+        } else {
+            SnapshotCrcProvenance::Stale(CrcProvenance::File {
+                crc_version: 0,
+                on_disk_version: 0,
+            })
+        },
+    );
 
     Ok(())
 }

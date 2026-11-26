@@ -6,9 +6,11 @@ use rstest::rstest;
 use url::Url;
 
 use super::snapshot_crc::SnapshotCrc;
-use super::{ChecksumWriteResult, IncrementalReplay, SnapshotRef};
+use super::{
+    ChecksumWriteResult, CrcProvenance, IncrementalReplay, SnapshotCrcProvenance, SnapshotRef,
+};
 use crate::committer::FileSystemCommitter;
-use crate::crc::FileStatsState;
+use crate::crc::{CrcWithProvenance, FileStatsState};
 use crate::engine::DelegatingEngine;
 use crate::engine::sync::SyncEngine;
 use crate::metrics::{ChecksumWriteOutcome, ChecksumWriteResolutionMode, MetricEvent};
@@ -76,24 +78,82 @@ fn write_events(reporter: &CapturingReporter) -> Vec<MetricEvent> {
 }
 
 #[rstest]
-#[case::cached(CrcRoot::Cached, ChecksumWriteResolutionMode::Cached)]
-#[case::stale_crc(CrcRoot::StaleCrc, ChecksumWriteResolutionMode::Incremental)]
-#[case::version_zero(CrcRoot::VersionZero, ChecksumWriteResolutionMode::Full)]
-#[case::checkpoint(CrcRoot::Checkpoint, ChecksumWriteResolutionMode::Full)]
+#[case::cached(
+    CrcRoot::Cached,
+    ChecksumWriteResolutionMode::Cached,
+    SnapshotCrcProvenance::Current(CrcProvenance::CreateTable { crc_version: 0, on_disk_version: None })
+)]
+#[case::stale_crc(
+    CrcRoot::StaleCrc,
+    ChecksumWriteResolutionMode::Incremental,
+    SnapshotCrcProvenance::Stale(CrcProvenance::File { crc_version: 0, on_disk_version: 0 }),
+)]
+#[case::version_zero(
+    CrcRoot::VersionZero,
+    ChecksumWriteResolutionMode::Full,
+    SnapshotCrcProvenance::Absent
+)]
+#[case::checkpoint(
+    CrcRoot::Checkpoint,
+    ChecksumWriteResolutionMode::Full,
+    SnapshotCrcProvenance::Absent
+)]
 fn crc_write_reports_utf8_bytes_and_completes_while_snapshot_is_alive(
     #[case] root: CrcRoot,
     #[case] expected_mode: ChecksumWriteResolutionMode,
+    #[case] expected_status: SnapshotCrcProvenance,
 ) -> Result<()> {
+    // Given a snapshot whose CRC is cached or must be resolved from storage.
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let engine = SyncEngine::in_memory();
     let snapshot = snapshot_for_root(&engine, root)?;
+    assert_eq!(snapshot.crc_provenance(), expected_status);
     let initial_write_count = write_events(&reporter).len();
 
+    // When its checksum is written successfully.
     let start = Instant::now();
     let (result, updated) = snapshot.write_checksum(&engine)?;
     let elapsed = start.elapsed();
+    // Then only the returned snapshot records the new checksum file.
     assert_eq!(result, ChecksumWriteResult::Written);
+    let crc_version = snapshot.version();
+    let on_disk_version = Some(crc_version);
+    let written = match root {
+        CrcRoot::Cached => CrcProvenance::CreateTable {
+            crc_version,
+            on_disk_version,
+        },
+        CrcRoot::StaleCrc => CrcProvenance::File {
+            crc_version,
+            on_disk_version: crc_version,
+        },
+        CrcRoot::VersionZero => CrcProvenance::CommitHistory {
+            crc_version,
+            on_disk_version,
+        },
+        CrcRoot::Checkpoint => CrcProvenance::Checkpoint {
+            crc_version,
+            on_disk_version,
+        },
+    };
+    assert_eq!(
+        updated.crc_provenance(),
+        SnapshotCrcProvenance::Current(written)
+    );
+    assert_eq!(snapshot.crc_provenance(), expected_status);
+    let fresh = Snapshot::builder_for("memory:///").build(&engine)?;
+    assert_eq!(
+        fresh.crc_provenance(),
+        SnapshotCrcProvenance::Current(CrcProvenance::File {
+            crc_version,
+            on_disk_version: crc_version,
+        })
+    );
+
+    if let Some(cached) = snapshot.crc_at_version() {
+        assert!(Arc::ptr_eq(updated.crc_at_version().unwrap(), cached));
+    }
 
     let events = write_events(&reporter);
     assert_eq!(events.len(), initial_write_count + 1);
@@ -123,6 +183,55 @@ fn crc_write_reports_utf8_bytes_and_completes_while_snapshot_is_alive(
     Ok(())
 }
 
+#[test]
+fn checkpoint_crc_keeps_its_origin_after_write_and_replay_until_imported_as_a_hint() -> Result<()> {
+    let engine = SyncEngine::in_memory();
+    let created = create_snapshot(&engine)?;
+    created.checkpoint(&engine, None)?;
+    let commit = |s: SnapshotRef| -> Result<SnapshotRef> {
+        Ok(s.update_table(UpdateTableOperation::Write, "test", true)
+            .build(&engine, Box::new(FileSystemCommitter::new()))?
+            .commit(&engine)?
+            .unwrap_post_commit_snapshot())
+    };
+    commit(created)?;
+
+    // The checksum write reconstructs v0 from its checkpoint and applies commit v1.
+    let snapshot = Snapshot::builder_for("memory:///").build(&engine)?;
+    assert_eq!(snapshot.crc_provenance(), SnapshotCrcProvenance::Absent);
+    let (_, written) = snapshot.write_checksum(&engine)?;
+    assert_eq!(
+        written.crc_provenance(),
+        SnapshotCrcProvenance::Current(CrcProvenance::Checkpoint {
+            crc_version: 1,
+            on_disk_version: Some(1),
+        })
+    );
+
+    let advanced = commit(written)?;
+    assert_eq!(
+        advanced.crc_provenance(),
+        SnapshotCrcProvenance::Current(CrcProvenance::Checkpoint {
+            crc_version: 2,
+            on_disk_version: Some(1),
+        })
+    );
+
+    let hint = advanced.to_snapshot_hint()?;
+    assert_eq!(hint.crc_provenance(), Some(advanced.crc_provenance()));
+    let imported = Snapshot::builder_for("memory:///")
+        .with_snapshot_hint(hint)
+        .build(&engine)?;
+    assert_eq!(
+        imported.crc_provenance(),
+        SnapshotCrcProvenance::Current(CrcProvenance::SnapshotHint {
+            crc_version: 2,
+            on_disk_version: Some(1),
+        })
+    );
+    Ok(())
+}
+
 #[rstest]
 #[case::early_exists(false, ChecksumWriteResolutionMode::NotAttempted)]
 #[case::storage_race(true, ChecksumWriteResolutionMode::Cached)]
@@ -130,6 +239,7 @@ fn crc_write_already_exists_reports_no_bytes(
     #[case] use_original_snapshot: bool,
     #[case] expected_mode: ChecksumWriteResolutionMode,
 ) -> Result<()> {
+    // Given a checksum already written by this snapshot or another writer.
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let engine = SyncEngine::in_memory();
@@ -141,9 +251,19 @@ fn crc_write_already_exists_reports_no_bytes(
         updated
     };
 
+    // When writing the same checksum again.
     let start = Instant::now();
     let (result, returned) = snapshot.write_checksum(&engine)?;
     let elapsed = start.elapsed();
+    // Then the original observation survives, including an unknown disk version after a storage
+    // race.
+    assert_eq!(
+        returned.crc_provenance(),
+        SnapshotCrcProvenance::Current(CrcProvenance::CreateTable {
+            crc_version: 0,
+            on_disk_version: (!use_original_snapshot).then_some(0),
+        }),
+    );
     assert_eq!(result, ChecksumWriteResult::AlreadyExists);
     assert!(Arc::ptr_eq(&snapshot, &returned));
 
@@ -177,8 +297,16 @@ fn crc_write_resolution_or_validation_error_retains_mode_and_duration(
             unsupported_operation: None,
         };
         let version = snapshot.version();
+        let retained = CrcWithProvenance::from_snapshot_hint(
+            Arc::new(crc),
+            snapshot
+                .crc_provenance()
+                .retained()
+                .unwrap()
+                .on_disk_version(),
+        );
         Arc::get_mut(&mut snapshot).unwrap().crc =
-            SnapshotCrc::try_new(Some(Arc::new(crc)), version, None)?;
+            SnapshotCrc::try_new(retained.into(), version, None)?;
     } else {
         // Corrupt the required commit after loading the snapshot so resolution itself fails.
         let path = ParsedLogPath::new_commit(snapshot.table_root(), snapshot.version())?;
@@ -279,6 +407,7 @@ fn crc_write_duration_includes_storage_even_on_error(
     #[case] expected_mode: ChecksumWriteResolutionMode,
     #[values(false, true)] fail: bool,
 ) -> Result<()> {
+    // Given a snapshot and storage that can reject the checksum write.
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let engine = Arc::new(SyncEngine::in_memory());
@@ -292,7 +421,13 @@ fn crc_write_duration_includes_storage_even_on_error(
     let engine = DelegatingEngine::new(engine).with_storage_handler(storage);
     let initial_write_count = write_events(&reporter).len();
 
+    let original_status = snapshot.crc_provenance();
+
+    // When the checksum write succeeds or fails in storage.
     let result = snapshot.write_checksum(&engine);
+
+    // Then reporting completes and the source snapshot retains its original observation.
+    assert_eq!(snapshot.crc_provenance(), original_status);
     assert_eq!(result.is_err(), fail);
     let events = write_events(&reporter);
     assert_eq!(events.len(), initial_write_count + 1);

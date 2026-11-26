@@ -18,14 +18,17 @@ use super::LogSegment;
 use crate::actions::{CheckpointAction, LastManifestCommit};
 use crate::actions::{DomainMetadata, Format, Metadata, Protocol, SetTransaction};
 use crate::crc::{
-    Crc, DomainMetadataState, FileSizeHistogram, SetTransactionState, try_read_crc_file,
+    Crc, CrcWithProvenance, DomainMetadataState, FileSizeHistogram, SetTransactionState,
+    try_read_crc_file,
 };
 use crate::engine::CancellableEngine;
 use crate::engine::sync::SyncEngine;
 use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::path::ParsedLogPath;
-use crate::snapshot::{IncrementalReplay, SnapshotBuilder, SnapshotRef};
+use crate::snapshot::{
+    CrcProvenance, IncrementalReplay, SnapshotBuilder, SnapshotCrcProvenance, SnapshotRef,
+};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::table_configuration::TableConfiguration;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -497,7 +500,10 @@ impl BuiltCrcTest {
         let log_root = self.url.join("_delta_log/").unwrap();
         let log_segment =
             LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
-        log_segment.build_crc_from_base(&self.engine, base)
+        let base = CrcWithProvenance::from_snapshot_hint(Arc::new(base.clone()), None);
+        log_segment
+            .build_crc_from_base(&self.engine, &base)
+            .map(|crc| crc.crc().as_ref().clone())
     }
 
     /// List with the fixture engine, then read the CRC with `engine` and `in_memory_base`.
@@ -510,9 +516,11 @@ impl BuiltCrcTest {
         let log_root = self.url.join("_delta_log/").unwrap();
         let log_segment =
             LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
+        let retained =
+            in_memory_base.map(|crc| CrcWithProvenance::from_snapshot_hint(crc.clone(), None));
         Ok(log_segment
-            .pick_latest_base_crc(engine, in_memory_base)?
-            .map(|c| c.version))
+            .pick_latest_base_crc(engine, retained)?
+            .map(|crc| crc.version()))
     }
 
     /// Read the on-disk CRC at `version` from this test's log.
@@ -608,7 +616,7 @@ impl BuiltCrcTest {
             LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
         let crc = log_segment.read_latest_crc(&self.engine).unwrap();
         log_segment
-            .read_protocol_metadata_opt(&self.engine, crc.as_ref())
+            .read_protocol_metadata_opt(&self.engine, crc.as_ref().map(CrcWithProvenance::crc))
             .unwrap()
             .captured_checkpoint_action
     }
@@ -1527,36 +1535,136 @@ async fn test_full_replay_across_two_commits_propagates_all_state() {
 // Tests: incremental-replay budget gate
 // ============================================================================
 
-// Commits 0-3 (target v3) with a CRC at `crc_version`, so distance = 3 - crc_version.
-#[rstest]
-// CRC already at the target (distance 0): used regardless of mode, even Disabled.
-#[case::at_target_disabled(3, IncrementalReplay::Disabled, Some(3))]
+// Commits 0-3 (target v3) with an optional CRC file at `crc_version`, so distance = 3 -
+// crc_version. CRC already at the target (distance 0): used regardless of mode, even Disabled.
 // Stale CRC (distance >= 1): advancement depends on the budget.
-#[case::disabled_stale(1, IncrementalReplay::Disabled, None)]
-#[case::up_to_zero(1, IncrementalReplay::UpToCommits(0), None)]
-#[case::interior(2, IncrementalReplay::UpToCommits(5), Some(3))] // distance 1 < 5
-#[case::at_budget(1, IncrementalReplay::UpToCommits(2), Some(3))] // distance 2 == 2
-#[case::over_budget(1, IncrementalReplay::UpToCommits(1), None)] // distance 2 > 1
-#[case::unlimited(0, IncrementalReplay::Unlimited, Some(3))] // distance 3
+#[rstest]
+#[case::at_target_disabled(
+    Some(3),
+    false,
+    IncrementalReplay::Disabled,
+    SnapshotCrcProvenance::Current(CrcProvenance::File { crc_version: 3, on_disk_version: 3 }),
+)]
+#[case::disabled_stale(
+    Some(1),
+    false,
+    IncrementalReplay::Disabled,
+    SnapshotCrcProvenance::Stale(CrcProvenance::File { crc_version: 1, on_disk_version: 1 }),
+)]
+#[case::up_to_zero(
+    Some(1),
+    false,
+    IncrementalReplay::UpToCommits(0),
+    SnapshotCrcProvenance::Stale(CrcProvenance::File { crc_version: 1, on_disk_version: 1 }),
+)]
+#[case::interior(
+    Some(2),
+    false,
+    IncrementalReplay::UpToCommits(5),
+    SnapshotCrcProvenance::Current(CrcProvenance::File { crc_version: 3, on_disk_version: 2 }),
+)]
+#[case::at_budget(
+    Some(1),
+    false,
+    IncrementalReplay::UpToCommits(2),
+    SnapshotCrcProvenance::Current(CrcProvenance::File { crc_version: 3, on_disk_version: 1 }),
+)]
+#[case::over_budget(
+    Some(1),
+    false,
+    IncrementalReplay::UpToCommits(1),
+    SnapshotCrcProvenance::Stale(CrcProvenance::File { crc_version: 1, on_disk_version: 1 }),
+)]
+#[case::unlimited(
+    Some(0),
+    false,
+    IncrementalReplay::Unlimited,
+    SnapshotCrcProvenance::Current(CrcProvenance::File { crc_version: 3, on_disk_version: 0 }),
+)]
+#[case::unlimited_stale(
+    Some(1),
+    false,
+    IncrementalReplay::Unlimited,
+    SnapshotCrcProvenance::Current(CrcProvenance::File { crc_version: 3, on_disk_version: 1 }),
+)]
+#[case::missing(
+    None,
+    false,
+    IncrementalReplay::Unlimited,
+    SnapshotCrcProvenance::Absent
+)]
+#[case::unusable(
+    Some(3),
+    true,
+    IncrementalReplay::Unlimited,
+    SnapshotCrcProvenance::Unusable
+)]
 #[tokio::test]
 async fn test_stale_crc_advanced_only_within_replay_budget(
-    #[case] crc_version: u64,
+    #[case] crc_version: Option<Version>,
+    #[case] corrupt_crc: bool,
     #[case] mode: IncrementalReplay,
-    #[case] expected_crc_version: Option<u64>,
+    #[case] expected_status: SnapshotCrcProvenance,
+    #[values(false, true)] incremental: bool,
 ) {
-    let built = CrcReadTest::new()
+    // Given a checksum candidate and the commits needed to reach the target version.
+    let mut test = CrcReadTest::new()
         .v2_checkpoint(0, protocol_a(), metadata_a())
         .commit(1, [commit_info(DEFAULT_OPERATION, None)])
         .commit(2, [commit_info(DEFAULT_OPERATION, None)])
-        .commit(3, [commit_info(DEFAULT_OPERATION, None)])
-        .crc(crc_version, protocol_a(), metadata_a(), None)
-        .build()
-        .await;
-    let snapshot = built.snapshot_latest_with_replay(mode);
+        .commit(3, [commit_info(DEFAULT_OPERATION, None)]);
+    if let Some(version) = crc_version {
+        test = if corrupt_crc {
+            test.corrupt_crc(version)
+        } else {
+            test.crc(version, protocol_a(), metadata_a(), None)
+        };
+    }
+    let built = test.build().await;
+
+    // When the snapshot resolves the checksum under the requested replay budget.
+    let snapshot = if incremental {
+        built.snapshot_from(0, mode)
+    } else {
+        built.snapshot_latest_with_replay(mode)
+    };
+
+    // Then the checksum version and disk observation agree with the replay result.
+    let expected_crc_version =
+        matches!(expected_status, SnapshotCrcProvenance::Current(_)).then_some(3);
     assert_eq!(snapshot.version(), 3);
     assert_eq!(
         snapshot.crc_at_version().map(|c| c.version),
         expected_crc_version
+    );
+    assert_eq!(snapshot.crc_provenance(), expected_status);
+
+    let hint = snapshot.to_snapshot_hint().unwrap();
+    assert_eq!(
+        hint.crc_provenance(),
+        match expected_status {
+            SnapshotCrcProvenance::Current(_) => Some(expected_status),
+            _ => None,
+        }
+    );
+
+    // When the snapshot is rebuilt from its hint.
+    let rebuilt = Snapshot::builder_for(built.url.clone())
+        .with_snapshot_hint(hint)
+        .build(&built.engine)
+        .unwrap();
+    // Then hints preserve only at-version CRCs, as they do without telemetry.
+    assert_eq!(rebuilt.base_crc(), snapshot.crc_at_version());
+    assert_eq!(
+        rebuilt.crc_provenance(),
+        match expected_status {
+            SnapshotCrcProvenance::Current(p) =>
+                SnapshotCrcProvenance::Current(CrcProvenance::SnapshotHint {
+                    crc_version: p.crc_version(),
+                    on_disk_version: p.on_disk_version(),
+                }),
+            _ => SnapshotCrcProvenance::Absent,
+        }
     );
 }
 
@@ -1578,32 +1686,68 @@ async fn test_stale_crc_advances_past_foreign_last_manifest_commit() {
 }
 
 #[rstest]
+#[case::no_disk_crc(None, false, 0)]
+#[case::same_version_disk_crc(Some(0), false, 0)]
+#[case::newer_disk_crc(Some(1), false, 1)]
+#[case::corrupt_newer_disk_crc(Some(1), true, 0)]
 #[tokio::test]
-async fn pick_latest_base_crc_preserves_cancellation_with_in_memory_base(
-    #[values(false, true)] corrupt: bool,
+async fn pick_latest_base_crc_preserves_source_and_cancellation(
+    #[case] disk_version: Option<Version>,
+    #[case] corrupt_crc: bool,
+    #[case] expected_version: Version,
     #[values(false, true)] cancelled: bool,
+    #[values(false, true)] known_source: bool,
 ) {
-    let test = CrcReadTest::new()
+    // Given an in-memory baseline and an optional checksum candidate on disk.
+    let mut test = CrcReadTest::new()
         .commit(0, create_table_actions())
-        .crc(0, protocol_a(), metadata_a(), None)
         .commit(1, [commit_info(DEFAULT_OPERATION, None)]);
-    let test = if corrupt {
-        test.corrupt_crc(1)
-    } else {
-        test.crc(1, protocol_a(), metadata_a(), None)
-    };
+    if let Some(version) = disk_version {
+        test = if corrupt_crc {
+            test.corrupt_crc(version)
+        } else {
+            test.crc(version, protocol_a(), metadata_a(), None)
+        };
+    }
     let built = test.build().await;
-    let base = Arc::new(built.read_crc_at(0).unwrap());
+    let base = Arc::new(Crc {
+        version: 0,
+        ..Default::default()
+    });
+    let storage = built.engine.storage_handler();
+    let segment = LogSegment::for_snapshot_impl(
+        storage.as_ref(),
+        built.url.join("_delta_log/").unwrap(),
+        vec![],
+        None,
+        None,
+    )
+    .unwrap();
     let token = Arc::new(TestCancellationToken::default());
     if cancelled {
         token.cancel();
     }
     let engine = CancellableEngine::new(&built.engine, token);
-    let result = built.pick_latest_base_crc(&engine, Some(&base));
-    if cancelled {
+
+    let retained =
+        CrcWithProvenance::from_snapshot_hint(base.clone(), known_source.then_some(base.version));
+
+    // When the baseline is selected, reading a newer disk candidate may be cancelled.
+    let result = segment.pick_latest_base_crc(&engine, Some(retained));
+
+    // Then cancellation propagates; otherwise selection preserves or establishes the source.
+    if cancelled && disk_version == Some(1) {
         assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
     } else {
-        assert_eq!(result.unwrap(), Some(if corrupt { 0 } else { 1 }));
+        let (crc, provenance) = result
+            .unwrap()
+            .expect("expected an in-memory CRC")
+            .into_parts();
+        assert_eq!(crc.version, expected_version);
+        assert_eq!(
+            provenance.on_disk_version(),
+            (expected_version != base.version || known_source).then_some(expected_version)
+        );
     }
 }
 

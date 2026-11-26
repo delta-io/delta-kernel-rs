@@ -6,14 +6,14 @@ use delta_kernel_derive::internal_api;
 
 use crate::actions::{Metadata, Protocol};
 use crate::checkpoint::SelectedCheckpointType;
-use crate::crc::Crc;
+use crate::crc::{Crc, CrcWithProvenance};
 use crate::error::SnapshotHintError;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_path::LogPath;
 use crate::log_segment::{LogSegment, validate_catalog_version_bounds};
 use crate::log_segment_files::{CheckpointHandling, LogSegmentFiles};
 use crate::path::{DELTA_LOG_DIR_WITH_SLASH, ParsedLogPath};
-use crate::snapshot::{IncrementalReplay, SnapshotRef};
+use crate::snapshot::{IncrementalReplay, SnapshotCrc, SnapshotCrcProvenance, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::{require, try_parse_uri};
 use crate::{KernelError, KernelResult, Result, Snapshot, Version};
@@ -86,7 +86,7 @@ pub(crate) struct SnapshotHint {
     /// The optional CRC state resolved at `version`.
     ///
     /// This may have been advanced from an older `latest_crc_file`.
-    crc: Option<Arc<Crc>>,
+    crc: Option<CrcWithProvenance>,
     /// Whether `version` was established as latest when the hint was captured.
     freshness: SnapshotHintFreshness,
     /// The spec of the checkpoint selected from `log_segment_files`, when the hint's source knew
@@ -114,6 +114,13 @@ impl SnapshotHint {
     /// `None` when unknown. It is used only when the checkpoint's naming and the table protocol do
     /// not decide the type, and the checkpoint's contents replace it once discovery reads them.
     ///
+    /// A snapshot hint can supply a current CRC or omit it. Omitting the status with a CRC
+    /// leaves its disk version unspecified. Without a CRC, an omitted, `Absent`, or `Unusable`
+    /// status supplies no CRC provenance. Constructing the snapshot hint rejects a stale
+    /// status or a status inconsistent with the supplied CRC. Every imported CRC has
+    /// [`SnapshotHint`](super::CrcProvenance::SnapshotHint) provenance and keeps the claimed
+    /// checksum-file version, if supplied. A matching checksum path in `log_paths` is optional.
+    ///
     /// # Errors
     ///
     /// Returns an error if `table_root` is invalid,
@@ -135,6 +142,7 @@ impl SnapshotHint {
         crc: Option<Arc<Crc>>,
         freshness: SnapshotHintFreshness,
         checkpoint_type: Option<SelectedCheckpointType>,
+        crc_provenance: Option<SnapshotCrcProvenance>,
     ) -> KernelResult<Self> {
         let log_root = try_parse_uri(table_root)?.join(DELTA_LOG_DIR_WITH_SLASH)?;
         let mut parsed_paths: Vec<ParsedLogPath> = log_paths.into_iter().map(Into::into).collect();
@@ -164,7 +172,7 @@ impl SnapshotHint {
             protocol,
             metadata,
             last_checkpoint_hint,
-            crc,
+            crc: crc_from_hint(crc, crc_provenance)?,
             freshness,
             checkpoint_type,
         })
@@ -185,6 +193,19 @@ impl SnapshotHint {
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn checkpoint_type(&self) -> Option<SelectedCheckpointType> {
         self.checkpoint_type
+    }
+
+    /// Returns the provenance of the current CRC carried by this snapshot hint, if present.
+    ///
+    /// A CRC supplied without a claim has `SnapshotHint` provenance and no known disk version.
+    /// Building the snapshot verifies that a connector-supplied CRC is at the snapshot hint
+    /// version.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn crc_provenance(&self) -> Option<SnapshotCrcProvenance> {
+        self.crc
+            .as_ref()
+            .map(|pair| SnapshotCrcProvenance::Current(pair.provenance()))
     }
 
     /// Returns the version described by this hint.
@@ -235,14 +256,15 @@ impl SnapshotHint {
         self.last_checkpoint_hint.as_ref()
     }
 
-    /// Returns the retained CRC state, if present.
+    /// Returns the in-memory CRC state, if present.
     ///
     /// Hints exported by [`Snapshot::to_snapshot_hint`] retain only CRC state at the snapshot
     /// version. Connector-provided inputs are checked when the snapshot is built.
+    /// See [`Self::crc_provenance`] for its on-disk origin.
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn crc(&self) -> Option<&Crc> {
-        self.crc.as_deref()
+        self.crc.as_ref().map(|pair| pair.crc().as_ref())
     }
 
     /// Returns the freshness established when the hint was captured.
@@ -267,7 +289,10 @@ impl SnapshotHint {
             protocol: snapshot.table_configuration().protocol().clone(),
             metadata: snapshot.table_configuration().metadata().clone(),
             last_checkpoint_hint: last_checkpoint_hint.cloned(),
-            crc: snapshot.crc_at_version().cloned(),
+            crc: match snapshot.crc_provenance() {
+                SnapshotCrcProvenance::Current(_) => snapshot.crc.base_with_provenance(),
+                _ => None,
+            },
             checkpoint_type: snapshot.known_checkpoint_type(),
             freshness: if snapshot.is_built_as_latest() {
                 SnapshotHintFreshness::Latest
@@ -334,6 +359,7 @@ impl SnapshotHint {
             crc,
             freshness,
             checkpoint_type,
+            ..
         } = *self;
         let built_as_latest = freshness == SnapshotHintFreshness::Latest
             && max_catalog_version.is_none_or(|max| max <= version);
@@ -384,25 +410,29 @@ impl SnapshotHint {
         );
         let table_configuration =
             TableConfiguration::try_new(metadata, protocol, table_url, version)?;
-        if let Some(crc) = crc.as_ref() {
-            require!(
-                crc.version == version,
-                KernelError::from(SnapshotHintError::CrcVersion {
-                    crc: crc.version,
-                    hint: version,
-                })
-                .into()
-            );
-            require!(
-                crc.protocol == *table_configuration.protocol(),
-                KernelError::from(SnapshotHintError::CrcProtocol).into()
-            );
-            require!(
-                crc.metadata == *table_configuration.metadata(),
-                KernelError::from(SnapshotHintError::CrcMetadata).into()
-            );
-        }
-
+        let crc = match crc {
+            Some(pair) => {
+                let (crc, provenance) = pair.into_parts();
+                require!(
+                    crc.version == version,
+                    KernelError::from(SnapshotHintError::CrcVersion {
+                        crc: crc.version,
+                        hint: version,
+                    })
+                    .into()
+                );
+                require!(
+                    crc.protocol == *table_configuration.protocol(),
+                    KernelError::from(SnapshotHintError::CrcProtocol).into()
+                );
+                require!(
+                    crc.metadata == *table_configuration.metadata(),
+                    KernelError::from(SnapshotHintError::CrcMetadata).into()
+                );
+                CrcWithProvenance::from_snapshot_hint(crc, provenance.on_disk_version()).into()
+            }
+            None => SnapshotCrc::ABSENT,
+        };
         let mut snapshot = Snapshot::new_with_crc(
             log_segment,
             table_configuration,
@@ -412,6 +442,39 @@ impl SnapshotHint {
         )?;
         snapshot.retained_checkpoint_type = checkpoint_type;
         Ok(snapshot.into())
+    }
+}
+
+/// Validates a snapshot hint's status against its optional in-memory CRC.
+///
+/// - Case 1: No CRC. An omitted, `Absent`, or `Unusable` status leaves the snapshot hint empty.
+/// - Case 2: CRC with no status. Record `SnapshotHint` provenance with no known disk version.
+/// - Case 3: CRC with `Current` status. Its claimed CRC version must match, and any known
+///   checksum-file version must be at or before it. Keep the supplied origin until the snapshot is
+///   built.
+/// - Case 4: Reject all other combinations, including `Stale`. Snapshot construction checks that
+///   the CRC describes the snapshot hint's version.
+fn crc_from_hint(
+    crc: Option<Arc<Crc>>,
+    status: Option<SnapshotCrcProvenance>,
+) -> KernelResult<Option<CrcWithProvenance>> {
+    let crc_version = crc.as_ref().map(|crc| crc.version);
+    match (crc, status) {
+        (None, None | Some(SnapshotCrcProvenance::Absent | SnapshotCrcProvenance::Unusable)) => {
+            Ok(None)
+        }
+        (Some(crc), None) => Ok(Some(CrcWithProvenance::from_snapshot_hint(crc, None))),
+        (Some(crc), Some(SnapshotCrcProvenance::Current(provenance)))
+            if crc.version == provenance.crc_version()
+                && provenance
+                    .on_disk_version()
+                    .is_none_or(|disk| disk <= crc.version) =>
+        {
+            Ok(Some(CrcWithProvenance::from_parts(crc, provenance)))
+        }
+        (_, Some(claim)) => {
+            Err(SnapshotHintError::CrcProvenanceMismatch { claim, crc_version }.into())
+        }
     }
 }
 
@@ -456,7 +519,7 @@ mod tests {
     use crate::snapshot::builder::tests::{
         create_table, measuring_reporter, scan_paths, setup_test,
     };
-    use crate::snapshot::{FromTableRoot, SnapshotBuilder};
+    use crate::snapshot::{CrcProvenance, FromTableRoot, SnapshotBuilder};
     use crate::table_features::TableFeature;
     #[cfg(feature = "declarative-plans")]
     use crate::unit_test_utils::load_test_table;
@@ -540,7 +603,7 @@ mod tests {
         let hint = snapshot.to_snapshot_hint()?;
         assert_eq!(hint.freshness, expected);
         assert_eq!(hint.log_segment_files, snapshot.log_segment().listed);
-        assert!(hint.crc.is_none());
+        assert!(hint.crc().is_none());
         Ok(())
     }
 
@@ -569,13 +632,13 @@ mod tests {
                 hint.last_checkpoint_hint,
             )?,
             snapshot.table_configuration().clone(),
-            snapshot.crc_at_version().cloned(),
+            snapshot.crc.clone(),
             false,
             false,
         )?;
         let exported = snapshot.to_snapshot_hint()?;
         assert_eq!(exported.last_checkpoint_hint.is_some(), expected_present);
-        assert_eq!(exported.crc, snapshot.crc_at_version().cloned());
+        assert_eq!(exported.crc(), snapshot.crc_at_version().map(Arc::as_ref));
         let rebuilt = Snapshot::builder_for(table_root)
             .with_snapshot_hint(exported)
             .build(engine.as_ref())?;
@@ -718,6 +781,7 @@ mod tests {
             None,
             SnapshotHintFreshness::Unverified,
             None,
+            None,
         )
         .unwrap();
 
@@ -755,6 +819,7 @@ mod tests {
             None,
             SnapshotHintFreshness::Unverified,
             None,
+            None,
         )
         .unwrap();
 
@@ -791,6 +856,7 @@ mod tests {
             None,
             SnapshotHintFreshness::Unverified,
             None,
+            None,
         )?;
         let (engine, _store, _table_root) = setup_test();
         assert_log_segment_hint_error(
@@ -822,6 +888,7 @@ mod tests {
             None,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
             None,
         );
         assert_result_error_with_message(result, expected_error);
@@ -876,6 +943,7 @@ mod tests {
             None,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
             None,
         )
         .map_err(Error::from)
@@ -946,6 +1014,7 @@ mod tests {
             None,
             SnapshotHintFreshness::Unverified,
             None,
+            None,
         )
         .unwrap();
         let first_retained_path = hint
@@ -992,6 +1061,7 @@ mod tests {
             None,
             None,
             SnapshotHintFreshness::Unverified,
+            None,
             None,
         )
         .unwrap();
@@ -1253,7 +1323,9 @@ mod tests {
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
         hint.protocol = protocol.clone();
         if with_crc {
-            Arc::make_mut(hint.crc.as_mut().unwrap()).protocol = protocol;
+            let mut crc = hint.crc().unwrap().clone();
+            crc.protocol = protocol;
+            hint.crc = crc_from_hint(Some(Arc::new(crc)), hint.crc_provenance())?;
         } else {
             hint.crc = None;
         }
@@ -1465,30 +1537,116 @@ mod tests {
         Ok(())
     }
 
+    #[rstest::rstest]
+    #[case::future_disk_version(
+        Some(5),
+        SnapshotCrcProvenance::Current(CrcProvenance::File { crc_version: 5, on_disk_version: 6 }),
+    )]
+    #[case::absent_with_crc(Some(5), SnapshotCrcProvenance::Absent)]
+    #[case::unusable_with_crc(Some(3), SnapshotCrcProvenance::Unusable)]
+    #[case::current_without_crc(
+        None,
+        SnapshotCrcProvenance::Current(CrcProvenance::SnapshotHint {
+            crc_version: 5,
+            on_disk_version: None,
+        }),
+    )]
+    #[case::stale_with_crc(
+        Some(5),
+        SnapshotCrcProvenance::Stale(CrcProvenance::File { crc_version: 5, on_disk_version: 3 }),
+    )]
+    #[case::stale_without_crc(
+        None,
+        SnapshotCrcProvenance::Stale(CrcProvenance::File { crc_version: 5, on_disk_version: 3 }),
+    )]
+    #[case::wrong_crc_version(
+        Some(5),
+        SnapshotCrcProvenance::Current(CrcProvenance::File { crc_version: 4, on_disk_version: 1 }),
+    )]
+    fn hint_rejects_inconsistent_crc_provenance(
+        #[case] crc_version: Option<Version>,
+        #[case] status: SnapshotCrcProvenance,
+    ) {
+        let err = crc_from_hint(
+            crc_version.map(|version| {
+                Arc::new(Crc {
+                    version,
+                    ..Default::default()
+                })
+            }),
+            Some(status),
+        )
+        .unwrap_err();
+        let KernelError::SnapshotHint(err) = err else {
+            panic!("expected invalid snapshot hint")
+        };
+        assert!(matches!(
+            *err, SnapshotHintError::CrcProvenanceMismatch { claim, crc_version: actual }
+                if claim == status && actual == crc_version
+        ));
+    }
+
+    #[rstest::rstest]
     #[test_log::test(tokio::test)]
-    async fn snapshot_hint_rejects_mismatched_crc_state()
-    -> KernelResult<(), Box<dyn std::error::Error>> {
+    async fn snapshot_hint_rejects_mismatched_crc_state(
+        #[values(false, true)] with_telemetry: bool,
+    ) -> KernelResult<(), Box<dyn std::error::Error>> {
+        // Given a valid hint with or without telemetry.
         let (engine, table_root, _snapshot, hint) =
             snapshot_and_hint(SnapshotHintFreshness::Unverified).await?;
-        let matching_crc = hint.crc.as_ref().unwrap().as_ref().clone();
+        let matching_crc = hint.crc().unwrap().clone();
 
-        let mut wrong_version = hint.clone();
-        wrong_version.crc = Some(Arc::new(Crc {
+        // When the CRC version, protocol, or metadata is inconsistent with the hint,
+        // then construction reports the same upstream validation errors regardless of telemetry.
+        let claim = if with_telemetry {
+            hint.crc_provenance()
+        } else {
+            None
+        };
+        let wrong_version = Arc::new(Crc {
             version: hint.version - 1,
             ..matching_crc.clone()
-        }));
+        });
+        let wrong_version_claim = with_telemetry.then_some(SnapshotCrcProvenance::Current(
+            CrcProvenance::SnapshotHint {
+                crc_version: wrong_version.version,
+                on_disk_version: None,
+            },
+        ));
+        let paths = hint
+            .log_segment_files
+            .iter_all_paths()
+            .unique_by(|path| path.location.location.as_str())
+            .map(|p| LogPath::try_new(p.location.clone()))
+            .collect::<KernelResult<Vec<_>>>()?;
+        let wrong_version_hint = SnapshotHint::try_new(
+            &table_root,
+            hint.version,
+            hint.publication_watermark(),
+            paths,
+            hint.protocol.clone(),
+            hint.metadata.clone(),
+            hint.last_checkpoint_hint.clone(),
+            Some(wrong_version),
+            hint.freshness,
+            hint.checkpoint_type,
+            wrong_version_claim,
+        )?;
         assert_hint_error(
             SnapshotBuilder::new_for(&table_root),
-            wrong_version,
+            wrong_version_hint,
             engine.as_ref(),
             "does not match snapshot hint version",
         );
 
         let mut wrong_protocol = hint.clone();
-        wrong_protocol.crc = Some(Arc::new(Crc {
-            protocol: Protocol::try_new_legacy(1, 1)?,
-            ..matching_crc.clone()
-        }));
+        wrong_protocol.crc = crc_from_hint(
+            Some(Arc::new(Crc {
+                protocol: Protocol::try_new_legacy(1, 1)?,
+                ..matching_crc.clone()
+            })),
+            claim,
+        )?;
         assert_hint_error(
             SnapshotBuilder::new_for(&table_root),
             wrong_protocol,
@@ -1497,10 +1655,13 @@ mod tests {
         );
 
         let mut wrong_metadata = hint.clone();
-        wrong_metadata.crc = Some(Arc::new(Crc {
-            metadata: Metadata::default(),
-            ..matching_crc.clone()
-        }));
+        wrong_metadata.crc = crc_from_hint(
+            Some(Arc::new(Crc {
+                metadata: Metadata::default(),
+                ..matching_crc
+            })),
+            claim,
+        )?;
         assert_hint_error(
             SnapshotBuilder::new_for(&table_root),
             wrong_metadata,

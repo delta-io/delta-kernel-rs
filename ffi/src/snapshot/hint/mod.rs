@@ -12,6 +12,7 @@ use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::log_path::LogPathArray;
 use crate::panic::catch_panic;
+use crate::snapshot::snapshot_crc::FfiSnapshotCrcProvenance;
 use crate::{NullableCvoid, OptionalValue, SharedExternEngine, SharedSnapshot};
 
 mod export;
@@ -88,7 +89,8 @@ pub struct FfiSnapshotHint {
     pub metadata: FfiMetadata,
     /// Optional `_last_checkpoint` state. Null means absent.
     pub last_checkpoint: *const FfiLastCheckpoint,
-    /// Optional CRC state. Null means absent.
+    /// Optional CRC state at `version`. Null means absent; older or newer CRCs are rejected.
+    /// This is in-memory state; see `crc_provenance` for its on-disk origin.
     pub crc: *const FfiCrc,
     /// Whether to infer publication from paths or preserve an explicit observation.
     ///
@@ -98,9 +100,18 @@ pub struct FfiSnapshotHint {
     /// that no checkpoint was selected. Kernel uses it only when the checkpoint's naming and the
     /// table protocol do not decide the type, and the checkpoint's contents replace it once read.
     ///
+    /// A claim inconsistent with naming or protocol is ignored.
     /// C callers must set the tag explicitly, using `NoneFfiSelectedCheckpointType` when absent:
     /// a zero-initialized field is an invalid `Some` payload.
     pub checkpoint_type: OptionalValue<FfiSelectedCheckpointType>,
+    /// Optional CRC provenance. A current CRC must match the snapshot hint version. On import its
+    /// origin becomes `SnapshotHint`. A claimed disk version is preserved even if `log_paths`
+    /// omits the corresponding checksum file. Omitting the status with a CRC leaves its disk
+    /// version unspecified. Without a CRC, an omitted, `Absent`, or `Unusable` status yields a
+    /// snapshot hint with no CRC provenance. A snapshot hint cannot carry a stale CRC.
+    /// Set the tag to `NoneFfiSnapshotCrcProvenance` when omitting status.
+    /// Zero-initializing this field claims a file-backed CRC with both versions set to zero.
+    pub crc_provenance: OptionalValue<FfiSnapshotCrcProvenance>,
 }
 
 fn invalid_with_source(message: impl Into<String>, source: KernelError) -> KernelError {
@@ -170,6 +181,7 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
         Option::<&FfiSelectedCheckpointType>::from(&value.checkpoint_type)
             .copied()
             .map(Into::into),
+        Option::<&FfiSnapshotCrcProvenance>::from(&value.crc_provenance).map(Into::into),
     )?;
     builder.snapshot_hint = Some(Box::new(snapshot_hint));
     Ok(())
@@ -196,10 +208,10 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
 ///
 /// Returns `UnsupportedError` when the builder was created by
 /// [`get_snapshot_builder_from`](crate::get_snapshot_builder_from). Returns
-/// `InvalidSnapshotHint` when a supplied field cannot be decoded or a log path is outside the
-/// table log root. Compacted paths are retained; the individual commits must also be supplied.
-/// Structural log-segment and table-configuration errors are returned when the builder is built.
-/// A failed call drops the builder.
+/// `InvalidSnapshotHint` when a supplied field cannot be decoded, a log path is outside the
+/// table log root, or the supplied provenance contradicts the CRC. Compacted paths are retained;
+/// the individual commits must also be supplied. Building the snapshot validates the log segment,
+/// table configuration, and CRC version against the hint. A failed call drops the builder.
 ///
 /// # Safety
 ///
