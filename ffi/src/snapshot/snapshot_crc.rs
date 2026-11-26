@@ -1,169 +1,185 @@
 //! Snapshot checksum provenance, available without engine I/O.
 
-use delta_kernel::snapshot::{CrcOrigin, CrcProvenance, CrcSource};
+use delta_kernel::snapshot::{CrcProvenance, SnapshotCrcProvenance};
 
 use crate::{Handle, OptionalValue, SharedSnapshot};
 
-/// How an in-memory checksum relates to an observed checksum file. See [`CrcSource`].
+/// The status of the CRC retained by a snapshot. See [`SnapshotCrcProvenance`].
 ///
 /// cbindgen:prefix-with-name=true
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, PartialEq)]
 #[repr(C)]
-pub enum FfiCrcSource {
-    /// A usable on-disk checksum file was resolved at the snapshot version.
-    AtVersion {
-        /// Version of both the checksum file and the in-memory CRC, equal to the snapshot version.
-        crc_version: u64,
-    },
-    /// An on-disk checksum was advanced in memory to the snapshot version.
-    Reconstructed {
-        /// Version of the original on-disk checksum.
-        /// Subtract this from `crc_version` to obtain the cumulative number of incorporated
-        /// commits.
-        on_disk_version: u64,
-        /// Version of the in-memory CRC, equal to the snapshot version.
-        crc_version: u64,
-    },
-    /// A usable in-memory checksum is older than the snapshot version.
-    Stale {
-        /// Version of the on-disk checksum from which the in-memory CRC was read or reconstructed.
-        /// Subtract this from `crc_version` to obtain the cumulative number of incorporated
-        /// commits.
-        on_disk_version: u64,
-        /// Version of the in-memory CRC, strictly less than the snapshot version.
-        /// Subtract this from the snapshot version to obtain the remaining version gap.
-        crc_version: u64,
-    },
-    /// No checksum file was found in the snapshot's selected version range.
-    Missing,
-    /// The observed checksum candidate could not be read or validated.
+pub enum FfiSnapshotCrcProvenance {
+    /// The retained CRC describes the snapshot version.
+    Current(FfiCrcProvenance),
+    /// The retained CRC predates the snapshot version.
+    Stale(FfiCrcProvenance),
+    /// No CRC was retained and no unusable candidate was reported.
+    Absent,
+    /// A candidate was unusable and no CRC was retained.
     Unusable,
-    /// No observation of an on-disk checksum is available.
-    Unknown,
 }
 
-impl From<CrcSource> for FfiCrcSource {
-    fn from(value: CrcSource) -> Self {
-        match value {
-            CrcSource::AtVersion { crc_version } => Self::AtVersion { crc_version },
-            CrcSource::Reconstructed {
-                on_disk_version,
-                crc_version,
-            } => Self::Reconstructed {
-                on_disk_version,
-                crc_version,
-            },
-            CrcSource::Stale {
-                on_disk_version,
-                crc_version,
-            } => Self::Stale {
-                on_disk_version,
-                crc_version,
-            },
-            CrcSource::Missing => Self::Missing,
-            CrcSource::Unusable => Self::Unusable,
-            _ => Self::Unknown,
-        }
-    }
+/// Origin and versions of a retained in-memory CRC. See [`CrcProvenance`].
+///
+/// cbindgen:prefix-with-name=true
+#[derive(Debug, PartialEq)]
+#[repr(C)]
+pub enum FfiCrcProvenance {
+    /// Kernel parsed a checksum file read through the engine.
+    File {
+        /// Version described by the in-memory CRC.
+        crc_version: u64,
+        /// Known checksum-file version.
+        on_disk_version: u64,
+    },
+    /// A connector supplied the CRC contents in a snapshot hint.
+    SnapshotHint {
+        /// Version described by the in-memory CRC.
+        crc_version: u64,
+        /// Checksum-file version, if known.
+        on_disk_version: OptionalValue<u64>,
+    },
+    /// Kernel computed the initial CRC from the CREATE TABLE transaction.
+    CreateTable {
+        /// Version described by the in-memory CRC.
+        crc_version: u64,
+        /// Checksum-file version, if known.
+        on_disk_version: OptionalValue<u64>,
+    },
+    /// Kernel reconstructed the initial CRC from checkpoint contents.
+    Checkpoint {
+        /// Version described by the in-memory CRC.
+        crc_version: u64,
+        /// Checksum-file version, if known.
+        on_disk_version: OptionalValue<u64>,
+    },
+    /// Kernel reconstructed the initial CRC from commits starting at version zero.
+    CommitHistory {
+        /// Version described by the in-memory CRC.
+        crc_version: u64,
+        /// Checksum-file version, if known.
+        on_disk_version: OptionalValue<u64>,
+    },
 }
 
-impl From<FfiCrcSource> for CrcSource {
-    fn from(value: FfiCrcSource) -> Self {
-        match value {
-            FfiCrcSource::AtVersion { crc_version } => Self::AtVersion { crc_version },
-            FfiCrcSource::Reconstructed {
-                on_disk_version,
-                crc_version,
-            } => Self::Reconstructed {
-                on_disk_version,
-                crc_version,
-            },
-            FfiCrcSource::Stale {
-                on_disk_version,
-                crc_version,
-            } => Self::Stale {
-                on_disk_version,
-                crc_version,
-            },
-            FfiCrcSource::Missing => Self::Missing,
-            FfiCrcSource::Unusable => Self::Unusable,
-            FfiCrcSource::Unknown => Self::Unknown,
-        }
-    }
-}
-
-/// Returns the checksum provenance without engine I/O.
+/// Writes the snapshot-relative CRC provenance without engine I/O.
 ///
 /// # Safety
-/// `snapshot` must be valid and remain owned by the caller.
+/// `snapshot` must remain valid for the call. `out` must be aligned and writable for one
+/// `FfiSnapshotCrcProvenance`. Its previous contents may be uninitialized.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapshot_crc_source(snapshot: Handle<SharedSnapshot>) -> FfiCrcSource {
-    unsafe { snapshot.as_ref() }.crc_source().into()
+pub unsafe extern "C" fn snapshot_crc_provenance(
+    snapshot: Handle<SharedSnapshot>,
+    out: *mut FfiSnapshotCrcProvenance,
+) {
+    unsafe { out.write(snapshot.as_ref().crc_provenance().into()) };
 }
 
-/// How Kernel acquired the CRC contents before incremental replay.
-///
-/// cbindgen:prefix-with-name=true
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(C)]
-pub enum FfiCrcOrigin {
-    /// Read from a checksum file.
-    File,
-    /// Supplied in a connector hint.
-    SnapshotHint,
-    /// Computed by CREATE TABLE.
-    CreateTable,
-    /// Reconstructed from a checkpoint.
-    Checkpoint,
-    /// Reconstructed from commit history starting at version zero.
-    CommitHistory,
+impl From<SnapshotCrcProvenance> for FfiSnapshotCrcProvenance {
+    fn from(value: SnapshotCrcProvenance) -> Self {
+        match value {
+            SnapshotCrcProvenance::Current(p) => Self::Current(p.into()),
+            SnapshotCrcProvenance::Stale(p) => Self::Stale(p.into()),
+            SnapshotCrcProvenance::Absent => Self::Absent,
+            SnapshotCrcProvenance::Unusable => Self::Unusable,
+        }
+    }
 }
 
-/// Owned version information for a checksum retained by a snapshot.
-#[repr(C)]
-pub struct FfiCrcProvenance {
-    /// Where Kernel acquired the initial in-memory CRC.
-    pub origin: FfiCrcOrigin,
-    /// Version described by the retained CRC, including subsequent incremental replay.
-    pub crc_version: u64,
-    /// Checksum-file version known from reads, successful writes, or the hint's disk claim.
-    pub on_disk_version: OptionalValue<u64>,
+impl From<&FfiSnapshotCrcProvenance> for SnapshotCrcProvenance {
+    fn from(value: &FfiSnapshotCrcProvenance) -> Self {
+        match value {
+            FfiSnapshotCrcProvenance::Current(p) => Self::Current(p.into()),
+            FfiSnapshotCrcProvenance::Stale(p) => Self::Stale(p.into()),
+            FfiSnapshotCrcProvenance::Absent => Self::Absent,
+            FfiSnapshotCrcProvenance::Unusable => Self::Unusable,
+        }
+    }
 }
 
 impl From<CrcProvenance> for FfiCrcProvenance {
     fn from(value: CrcProvenance) -> Self {
-        let origin = match value.origin {
-            CrcOrigin::File => FfiCrcOrigin::File,
-            CrcOrigin::SnapshotHint => FfiCrcOrigin::SnapshotHint,
-            CrcOrigin::CreateTable => FfiCrcOrigin::CreateTable,
-            CrcOrigin::Checkpoint => FfiCrcOrigin::Checkpoint,
-            CrcOrigin::CommitHistory => FfiCrcOrigin::CommitHistory,
-        };
-        Self {
-            origin,
-            crc_version: value.crc_version,
-            on_disk_version: value.on_disk_version.into(),
+        match value {
+            CrcProvenance::File {
+                crc_version,
+                on_disk_version,
+            } => Self::File {
+                crc_version,
+                on_disk_version,
+            },
+            CrcProvenance::SnapshotHint {
+                crc_version,
+                on_disk_version,
+            } => Self::SnapshotHint {
+                crc_version,
+                on_disk_version: on_disk_version.into(),
+            },
+            CrcProvenance::CreateTable {
+                crc_version,
+                on_disk_version,
+            } => Self::CreateTable {
+                crc_version,
+                on_disk_version: on_disk_version.into(),
+            },
+            CrcProvenance::Checkpoint {
+                crc_version,
+                on_disk_version,
+            } => Self::Checkpoint {
+                crc_version,
+                on_disk_version: on_disk_version.into(),
+            },
+            CrcProvenance::CommitHistory {
+                crc_version,
+                on_disk_version,
+            } => Self::CommitHistory {
+                crc_version,
+                on_disk_version: on_disk_version.into(),
+            },
         }
     }
 }
 
-/// Copies the retained in-memory CRC's provenance to `out`, including for a stale CRC.
-/// Returns true when a value was written. With no retained CRC it returns false and leaves
-/// `out` untouched. See [`snapshot_crc_source`] for the snapshot's disk observation.
-///
-/// # Safety
-/// The snapshot must remain valid for the call. `out` must be aligned and writable for one
-/// `FfiCrcProvenance`. Its previous contents may be uninitialized.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapshot_crc_provenance(
-    snapshot: Handle<SharedSnapshot>,
-    out: *mut FfiCrcProvenance,
-) -> bool {
-    let Some(provenance) = (unsafe { snapshot.as_ref() }).crc_provenance() else {
-        return false;
-    };
-    unsafe { out.write(provenance.into()) };
-    true
+impl From<&FfiCrcProvenance> for CrcProvenance {
+    fn from(value: &FfiCrcProvenance) -> Self {
+        match value {
+            FfiCrcProvenance::File {
+                crc_version,
+                on_disk_version,
+            } => Self::File {
+                crc_version: *crc_version,
+                on_disk_version: *on_disk_version,
+            },
+            FfiCrcProvenance::SnapshotHint {
+                crc_version,
+                on_disk_version,
+            } => Self::SnapshotHint {
+                crc_version: *crc_version,
+                on_disk_version: Option::<&u64>::from(on_disk_version).copied(),
+            },
+            FfiCrcProvenance::CreateTable {
+                crc_version,
+                on_disk_version,
+            } => Self::CreateTable {
+                crc_version: *crc_version,
+                on_disk_version: Option::<&u64>::from(on_disk_version).copied(),
+            },
+            FfiCrcProvenance::Checkpoint {
+                crc_version,
+                on_disk_version,
+            } => Self::Checkpoint {
+                crc_version: *crc_version,
+                on_disk_version: Option::<&u64>::from(on_disk_version).copied(),
+            },
+            FfiCrcProvenance::CommitHistory {
+                crc_version,
+                on_disk_version,
+            } => Self::CommitHistory {
+                crc_version: *crc_version,
+                on_disk_version: Option::<&u64>::from(on_disk_version).copied(),
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -171,20 +187,46 @@ mod tests {
     use super::*;
 
     #[rstest::rstest]
-    #[case::at_version(CrcSource::AtVersion { crc_version: 3 }, FfiCrcSource::AtVersion { crc_version: 3 })]
-    #[case::reconstructed(CrcSource::Reconstructed { on_disk_version: 1, crc_version: 3 }, FfiCrcSource::Reconstructed { on_disk_version: 1, crc_version: 3 })]
-    #[case::stale(CrcSource::Stale { on_disk_version: 1, crc_version: 3 }, FfiCrcSource::Stale { on_disk_version: 1, crc_version: 3 })]
-    #[case::missing(CrcSource::Missing, FfiCrcSource::Missing)]
-    #[case::unusable(CrcSource::Unusable, FfiCrcSource::Unusable)]
-    #[case::unknown(CrcSource::Unknown, FfiCrcSource::Unknown)]
+    #[case(
+        CrcProvenance::File { crc_version: 3, on_disk_version: 1 },
+        FfiCrcProvenance::File { crc_version: 3, on_disk_version: 1 },
+    )]
+    #[case(
+        CrcProvenance::SnapshotHint { crc_version: 3, on_disk_version: None },
+        FfiCrcProvenance::SnapshotHint { crc_version: 3, on_disk_version: OptionalValue::None },
+    )]
+    #[case(
+        CrcProvenance::CreateTable { crc_version: 3, on_disk_version: Some(0) },
+        FfiCrcProvenance::CreateTable { crc_version: 3, on_disk_version: OptionalValue::Some(0) },
+    )]
+    #[case(
+        CrcProvenance::Checkpoint { crc_version: 3, on_disk_version: Some(2) },
+        FfiCrcProvenance::Checkpoint { crc_version: 3, on_disk_version: OptionalValue::Some(2) },
+    )]
+    #[case(
+        CrcProvenance::CommitHistory { crc_version: 3, on_disk_version: None },
+        FfiCrcProvenance::CommitHistory { crc_version: 3, on_disk_version: OptionalValue::None },
+    )]
     fn provenance_conversion_preserves_variant_and_versions(
-        #[case] source: CrcSource,
-        #[case] expected: FfiCrcSource,
+        #[case] provenance: CrcProvenance,
+        #[case] ffi: FfiCrcProvenance,
+        #[values(false, true)] stale: bool,
     ) {
-        // Given equivalent Rust and C checksum sources with distinct disk and in-memory versions.
+        // Given equivalent Rust and C checksum statuses with distinct disk and in-memory versions.
+        let (status, expected) = if stale {
+            (
+                SnapshotCrcProvenance::Stale(provenance),
+                FfiSnapshotCrcProvenance::Stale(ffi),
+            )
+        } else {
+            (
+                SnapshotCrcProvenance::Current(provenance),
+                FfiSnapshotCrcProvenance::Current(ffi),
+            )
+        };
         // When converting each representation independently.
         // Then both conversions preserve the variant and each version.
-        assert_eq!(FfiCrcSource::from(source), expected);
-        assert_eq!(CrcSource::from(expected), source);
+        assert_eq!(FfiSnapshotCrcProvenance::from(status), expected);
+        assert_eq!(SnapshotCrcProvenance::from(&expected), status);
     }
 }

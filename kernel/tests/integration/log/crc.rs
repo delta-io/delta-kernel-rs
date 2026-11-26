@@ -19,7 +19,8 @@ use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::schema::{SchemaRef, schema_ref};
 use delta_kernel::snapshot::{
-    ChecksumWriteResult, CrcSource, IncrementalReplay, Snapshot, SnapshotRef,
+    ChecksumWriteResult, CrcProvenance, IncrementalReplay, Snapshot, SnapshotCrcProvenance,
+    SnapshotRef,
 };
 #[cfg(feature = "internal-api")]
 use delta_kernel::snapshot::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness};
@@ -77,15 +78,27 @@ async fn test_get_file_stats_no_crc() -> delta_kernel::Result<()> {
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
-    assert_eq!(created.crc_source(), CrcSource::Unknown);
+    assert_eq!(
+        created.crc_provenance(),
+        SnapshotCrcProvenance::Current(CrcProvenance::CreateTable {
+            crc_version: 0,
+            on_disk_version: None
+        })
+    );
 
     // When a fresh load searches storage for a checksum.
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    // Then the absent checksum is Missing, rather than an unobserved disk origin.
-    assert_eq!(snapshot.crc_source(), CrcSource::Missing);
-    assert_eq!(created.crc_source(), CrcSource::Unknown);
+    // Then the fresh snapshot has no CRC, and the CREATE TABLE snapshot still holds its CRC.
+    assert_eq!(snapshot.crc_provenance(), SnapshotCrcProvenance::Absent);
+    assert_eq!(
+        created.crc_provenance(),
+        SnapshotCrcProvenance::Current(CrcProvenance::CreateTable {
+            crc_version: 0,
+            on_disk_version: None
+        })
+    );
     assert_eq!(snapshot.version(), 0);
 
     let file_stats = snapshot.get_file_stats_if_present();
@@ -1463,20 +1476,20 @@ async fn test_write_checksum_rejects_file_actions_with_unsafe_operation(
         .with_incremental_crc_replay(replay)
         .build(engine.as_ref())?;
     // Then checksum provenance is independent of statistics completeness.
-    let expected_source = if with_checkpoint {
-        CrcSource::Missing
+    let expected_status = if with_checkpoint {
+        SnapshotCrcProvenance::Absent
     } else if replay == IncrementalReplay::Unlimited {
-        CrcSource::Reconstructed {
-            on_disk_version: 0,
+        SnapshotCrcProvenance::Current(CrcProvenance::File {
             crc_version: 2,
-        }
-    } else {
-        CrcSource::Stale {
             on_disk_version: 0,
+        })
+    } else {
+        SnapshotCrcProvenance::Stale(CrcProvenance::File {
             crc_version: 0,
-        }
+            on_disk_version: 0,
+        })
     };
-    assert_eq!(fresh.crc_source(), expected_source);
+    assert_eq!(fresh.crc_provenance(), expected_status);
     assert_eq!(fresh.version(), 2);
     assert_eq!(
         fresh.crc_at_version().is_some(),
@@ -1491,7 +1504,7 @@ async fn test_write_checksum_rejects_file_actions_with_unsafe_operation(
         &format!("unsupported operation {operation:?}"),
     );
 
-    assert_eq!(fresh.crc_source(), expected_source);
+    assert_eq!(fresh.crc_provenance(), expected_status);
 
     Ok(())
 }

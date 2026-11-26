@@ -340,14 +340,26 @@ void compile_snapshot_hint_abi(void)
     .last_checkpoint = &last_checkpoint,
     .crc = &crc,
     .checkpoint_type = { .tag = NoneFfiSelectedCheckpointType },
-    .crc_source = { .tag = NoneFfiCrcSource },
+    .crc_provenance = {
+      .tag = SomeFfiSnapshotCrcProvenance,
+      .some = {
+        .tag = FfiSnapshotCrcProvenanceCurrent,
+        .current = {
+          .tag = FfiCrcProvenanceFile,
+          .file = { .crc_version = 0, .on_disk_version = 0 },
+        },
+      },
+    },
   };
   ExternResultHandleExclusiveSnapshotBuilder (*with_snapshot_hint)(
       HandleExclusiveSnapshotBuilder, const FfiSnapshotHint*) =
       snapshot_builder_with_snapshot_hint;
 
+  void (*get_crc_provenance)(HandleSharedSnapshot, FfiSnapshotCrcProvenance*) = snapshot_crc_provenance;
+
   (void)snapshot_hint;
   (void)with_snapshot_hint;
+  (void)get_crc_provenance;
   (void)concrete_log_path_slice;
   (void)concrete_string_slice;
   (void)concrete_string_map_slice;

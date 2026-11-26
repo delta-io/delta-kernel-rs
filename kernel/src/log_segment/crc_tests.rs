@@ -26,7 +26,9 @@ use crate::engine::sync::SyncEngine;
 use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::path::ParsedLogPath;
-use crate::snapshot::{CrcSource, IncrementalReplay, SnapshotBuilder, SnapshotRef};
+use crate::snapshot::{
+    CrcProvenance, IncrementalReplay, SnapshotBuilder, SnapshotCrcProvenance, SnapshotRef,
+};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::table_configuration::TableConfiguration;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1537,22 +1539,72 @@ async fn test_full_replay_across_two_commits_propagates_all_state() {
 // crc_version. CRC already at the target (distance 0): used regardless of mode, even Disabled.
 // Stale CRC (distance >= 1): advancement depends on the budget.
 #[rstest]
-#[case::at_target_disabled(Some(3), false, IncrementalReplay::Disabled, CrcSource::AtVersion { crc_version: 3 })]
-#[case::disabled_stale(Some(1), false, IncrementalReplay::Disabled, CrcSource::Stale { on_disk_version: 1, crc_version: 1 })]
-#[case::up_to_zero(Some(1), false, IncrementalReplay::UpToCommits(0), CrcSource::Stale { on_disk_version: 1, crc_version: 1 })]
-#[case::interior(Some(2), false, IncrementalReplay::UpToCommits(5), CrcSource::Reconstructed { on_disk_version: 2, crc_version: 3 })]
-#[case::at_budget(Some(1), false, IncrementalReplay::UpToCommits(2), CrcSource::Reconstructed { on_disk_version: 1, crc_version: 3 })]
-#[case::over_budget(Some(1), false, IncrementalReplay::UpToCommits(1), CrcSource::Stale { on_disk_version: 1, crc_version: 1 })]
-#[case::unlimited(Some(0), false, IncrementalReplay::Unlimited, CrcSource::Reconstructed { on_disk_version: 0, crc_version: 3 })]
-#[case::unlimited_stale(Some(1), false, IncrementalReplay::Unlimited, CrcSource::Reconstructed { on_disk_version: 1, crc_version: 3 })]
-#[case::missing(None, false, IncrementalReplay::Unlimited, CrcSource::Missing)]
-#[case::unusable(Some(3), true, IncrementalReplay::Unlimited, CrcSource::Unusable)]
+#[case::at_target_disabled(
+    Some(3),
+    false,
+    IncrementalReplay::Disabled,
+    SnapshotCrcProvenance::Current(CrcProvenance::File { crc_version: 3, on_disk_version: 3 }),
+)]
+#[case::disabled_stale(
+    Some(1),
+    false,
+    IncrementalReplay::Disabled,
+    SnapshotCrcProvenance::Stale(CrcProvenance::File { crc_version: 1, on_disk_version: 1 }),
+)]
+#[case::up_to_zero(
+    Some(1),
+    false,
+    IncrementalReplay::UpToCommits(0),
+    SnapshotCrcProvenance::Stale(CrcProvenance::File { crc_version: 1, on_disk_version: 1 }),
+)]
+#[case::interior(
+    Some(2),
+    false,
+    IncrementalReplay::UpToCommits(5),
+    SnapshotCrcProvenance::Current(CrcProvenance::File { crc_version: 3, on_disk_version: 2 }),
+)]
+#[case::at_budget(
+    Some(1),
+    false,
+    IncrementalReplay::UpToCommits(2),
+    SnapshotCrcProvenance::Current(CrcProvenance::File { crc_version: 3, on_disk_version: 1 }),
+)]
+#[case::over_budget(
+    Some(1),
+    false,
+    IncrementalReplay::UpToCommits(1),
+    SnapshotCrcProvenance::Stale(CrcProvenance::File { crc_version: 1, on_disk_version: 1 }),
+)]
+#[case::unlimited(
+    Some(0),
+    false,
+    IncrementalReplay::Unlimited,
+    SnapshotCrcProvenance::Current(CrcProvenance::File { crc_version: 3, on_disk_version: 0 }),
+)]
+#[case::unlimited_stale(
+    Some(1),
+    false,
+    IncrementalReplay::Unlimited,
+    SnapshotCrcProvenance::Current(CrcProvenance::File { crc_version: 3, on_disk_version: 1 }),
+)]
+#[case::missing(
+    None,
+    false,
+    IncrementalReplay::Unlimited,
+    SnapshotCrcProvenance::Absent
+)]
+#[case::unusable(
+    Some(3),
+    true,
+    IncrementalReplay::Unlimited,
+    SnapshotCrcProvenance::Unusable
+)]
 #[tokio::test]
 async fn test_stale_crc_advanced_only_within_replay_budget(
     #[case] crc_version: Option<Version>,
     #[case] corrupt_crc: bool,
     #[case] mode: IncrementalReplay,
-    #[case] expected_source: CrcSource,
+    #[case] expected_status: SnapshotCrcProvenance,
 ) {
     // Given a checksum candidate and the commits needed to reach the target version.
     let mut test = CrcReadTest::new()
@@ -1573,17 +1625,14 @@ async fn test_stale_crc_advanced_only_within_replay_budget(
     let snapshot = built.snapshot_latest_with_replay(mode);
 
     // Then the checksum version and disk observation agree with the replay result.
-    let expected_crc_version = matches!(
-        expected_source,
-        CrcSource::AtVersion { .. } | CrcSource::Reconstructed { .. }
-    )
-    .then_some(3);
+    let expected_crc_version =
+        matches!(expected_status, SnapshotCrcProvenance::Current(_)).then_some(3);
     assert_eq!(snapshot.version(), 3);
     assert_eq!(
         snapshot.crc_at_version().map(|c| c.version),
         expected_crc_version
     );
-    assert_eq!(snapshot.crc_source(), expected_source);
+    assert_eq!(snapshot.crc_provenance(), expected_status);
 
     // When the snapshot is rebuilt from its hint.
     let rebuilt = Snapshot::builder_for(built.url.clone())
@@ -1593,11 +1642,15 @@ async fn test_stale_crc_advanced_only_within_replay_budget(
     // Then hints preserve only at-version CRCs, as they do without telemetry.
     assert_eq!(rebuilt.base_crc(), snapshot.crc_at_version());
     assert_eq!(
-        rebuilt.crc_source(),
-        if matches!(expected_source, CrcSource::Stale { .. }) {
-            CrcSource::Unknown
-        } else {
-            expected_source
+        rebuilt.crc_provenance(),
+        match expected_status {
+            SnapshotCrcProvenance::Current(p) =>
+                SnapshotCrcProvenance::Current(CrcProvenance::SnapshotHint {
+                    crc_version: p.crc_version(),
+                    on_disk_version: p.on_disk_version(),
+                }),
+            SnapshotCrcProvenance::Stale(_) => SnapshotCrcProvenance::Absent,
+            absent => absent,
         }
     );
 }

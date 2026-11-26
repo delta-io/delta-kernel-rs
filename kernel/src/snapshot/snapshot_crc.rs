@@ -2,69 +2,28 @@
 //!
 //! [`Snapshot`]: super::Snapshot
 
-use crate::crc::{CrcDelta, CrcWithProvenance};
+use crate::crc::{CrcDelta, CrcProvenance, CrcWithProvenance};
 use crate::utils::require;
 use crate::{KernelError, KernelResult, Version};
 
-/// How the in-memory checksum relates to an observed checksum file and the snapshot version.
+/// The CRC retained by a snapshot, classified relative to the snapshot's version.
 ///
-/// Connectors reporting checksum availability can group the variants as follows:
-/// - Usable checksum at the snapshot version: [`AtVersion`](Self::AtVersion) and
-///   [`Reconstructed`](Self::Reconstructed).
-/// - No usable checksum resolved at the snapshot version: [`Stale`](Self::Stale),
-///   [`Missing`](Self::Missing), and [`Unusable`](Self::Unusable). Each variant describes only the
-///   versions loading considered.
-/// - Not established: [`Unknown`](Self::Unknown).
-///
-/// The value records observations made while resolving the snapshot, not the current contents of
-/// storage. An in-memory CRC at the snapshot version does not establish that a checksum file exists
-/// on disk at that version.
-///
-/// The source is independent of table-level file statistics: a snapshot can have a usable checksum
-/// that lacks complete file statistics.
+/// A current CRC whose known checksum-file version is older than its in-memory version
+/// incorporates commits since that file. A stale CRC can also have incorporated commits.
+/// CRC provenance is independent of file-statistics completeness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum CrcSource {
-    /// A usable on-disk checksum file was resolved at the snapshot version.
-    AtVersion {
-        /// Version of both the checksum file and the in-memory CRC, equal to the snapshot version.
-        crc_version: Version,
-    },
-    /// An older on-disk checksum was advanced in memory to the snapshot version using committed
-    /// actions.
-    Reconstructed {
-        /// Version of the original on-disk checksum, preserved across in-memory updates.
-        /// Subtract this from `crc_version` to obtain the cumulative number of incorporated
-        /// commits.
-        on_disk_version: Version,
-        /// Version of the in-memory CRC, equal to the snapshot version.
-        crc_version: Version,
-    },
-    /// A usable in-memory checksum is older than the snapshot version.
-    /// It may already incorporate commits replayed after its original on-disk version.
-    Stale {
-        /// Version of the on-disk checksum from which the in-memory CRC was read or reconstructed.
-        /// Subtract this from `crc_version` to obtain the cumulative number of incorporated
-        /// commits.
-        on_disk_version: Version,
-        /// Version of the in-memory CRC, strictly less than the snapshot version.
-        /// Subtract this from the snapshot version to obtain the remaining version gap.
-        crc_version: Version,
-    },
-    /// Loading found no checksum candidate in its listed version range and kept no in-memory
-    /// CRC. Fresh loads consider the selected checkpoint version (or zero without a checkpoint)
-    /// through the snapshot version, inclusive. Incremental loads may list only after the previous
-    /// checkpoint, or after the previous snapshot when new checkpoints are ignored. Files below
-    /// the selected checkpoint are not candidates. This does not describe unlisted versions.
-    Missing,
-    /// An observed checksum candidate was unusable and no usable baseline was resolved.
-    /// This includes read failures as well as invalid checksum contents.
+pub enum SnapshotCrcProvenance {
+    /// The in-memory CRC describes this snapshot's version.
+    Current(CrcProvenance),
+    /// The in-memory CRC predates this snapshot and is available as a replay base.
+    Stale(CrcProvenance),
+    /// The snapshot holds no CRC and has no report of an unusable candidate. This includes a
+    /// listing with no eligible checksum file, a snapshot hint without a CRC or a failure claim,
+    /// and a stale CRC discarded at a checkpoint.
+    Absent,
+    /// A checksum candidate could not be read or validated, or a snapshot hint reported such a
+    /// failure, and no CRC was retained.
     Unusable,
-    /// No observation of an on-disk checksum is available. Examples include snapshots constructed
-    /// directly by CREATE TABLE without a checksum-file lookup, connector hints without
-    /// provenance, and derived snapshots that discard a CRC at a checkpoint. It does not indicate
-    /// that loading searched for a checksum and failed to find or read it.
-    Unknown,
 }
 
 /// The newest [`Crc`](crate::crc::Crc) a snapshot resolved, at or before the snapshot's version. It
@@ -74,7 +33,8 @@ pub enum CrcSource {
 /// - stale (older): kept only as a base for [`Self::base`], never served as authoritative.
 ///
 /// The in-memory CRC carries its origin and any observed checksum-file version. The snapshot
-/// derives its source from that information and records lookup outcomes when no CRC is present.
+/// derives its status from that information. With no CRC it records whether a candidate was
+/// reported unusable.
 ///
 /// [`Snapshot`]: super::Snapshot
 #[derive(Debug, Clone)]
@@ -83,12 +43,10 @@ pub(crate) enum SnapshotCrc {
     Current(CrcWithProvenance),
     /// The CRC predates this snapshot and is available only as a replay base.
     Stale(CrcWithProvenance),
-    /// No checksum candidate was found in the listed range.
-    Missing,
-    /// An observed checksum candidate could not provide a usable baseline.
+    /// The snapshot holds no in-memory CRC and has no report of an unusable checksum candidate.
+    Absent,
+    /// The storage lookup or snapshot hint reported an unusable candidate, and no CRC was retained.
     Unusable,
-    /// No payload or applicable checksum-file observation is available.
-    NoObservation,
 }
 
 impl SnapshotCrc {
@@ -97,7 +55,7 @@ impl SnapshotCrc {
         match crc {
             Some(crc) => Self::Current(crc),
             None if candidate_listed => Self::Unusable,
-            None => Self::Missing,
+            None => Self::Absent,
         }
     }
 
@@ -144,29 +102,13 @@ impl SnapshotCrc {
         })
     }
 
-    /// Public checksum-file telemetry, flattened from snapshot state and CRC provenance.
-    pub(crate) fn source(&self) -> CrcSource {
+    /// Returns the snapshot's checksum provenance without exposing the retained CRC.
+    pub(crate) fn provenance(&self) -> SnapshotCrcProvenance {
         match self {
-            Self::Current(crc) | Self::Stale(crc) => {
-                let Some(on_disk_version) = crc.on_disk_version() else {
-                    return CrcSource::Unknown;
-                };
-                let crc_version = crc.version();
-                match self {
-                    Self::Stale(_) => CrcSource::Stale {
-                        on_disk_version,
-                        crc_version,
-                    },
-                    _ if on_disk_version < crc_version => CrcSource::Reconstructed {
-                        on_disk_version,
-                        crc_version,
-                    },
-                    _ => CrcSource::AtVersion { crc_version },
-                }
-            }
-            Self::Missing => CrcSource::Missing,
-            Self::Unusable => CrcSource::Unusable,
-            Self::NoObservation => CrcSource::Unknown,
+            Self::Current(crc) => SnapshotCrcProvenance::Current(crc.provenance()),
+            Self::Stale(crc) => SnapshotCrcProvenance::Stale(crc.provenance()),
+            Self::Absent => SnapshotCrcProvenance::Absent,
+            Self::Unusable => SnapshotCrcProvenance::Unusable,
         }
     }
 
@@ -196,10 +138,10 @@ impl SnapshotCrc {
         }
     }
 
-    /// Omits stale CRCs when deriving hints and checkpoints.
+    /// Omits stale CRCs when deriving snapshot hints and checkpoints.
     pub(crate) fn only_current(&self) -> Self {
         match self {
-            Self::Stale(_) => Self::NoObservation,
+            Self::Stale(_) => Self::Absent,
             _ => self.clone(),
         }
     }
@@ -220,10 +162,11 @@ mod tests {
     use super::*;
     use crate::crc::{Crc, CrcDelta, FileStats, FileStatsState};
 
-    // Tests can supply a CRC directly, with the same unknown disk origin as a connector hint.
+    // Tests can supply a CRC directly, with no known disk version, as in a snapshot hint without
+    // CRC provenance.
     impl From<Option<Arc<Crc>>> for SnapshotCrc {
         fn from(crc: Option<Arc<Crc>>) -> Self {
-            crc.map_or(Self::NoObservation, |crc| {
+            crc.map_or(Self::Absent, |crc| {
                 Self::Current(CrcWithProvenance::from_snapshot_hint(crc, None))
             })
         }
@@ -279,17 +222,19 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case(SnapshotCrc::NoObservation, CrcSource::Unknown)]
-    #[case(SnapshotCrc::Missing, CrcSource::Missing)]
-    #[case(SnapshotCrc::Unusable, CrcSource::Unusable)]
-    fn none_holder_serves_nothing(#[case] state: SnapshotCrc, #[case] source: CrcSource) {
+    #[case(SnapshotCrc::Absent, SnapshotCrcProvenance::Absent)]
+    #[case(SnapshotCrc::Unusable, SnapshotCrcProvenance::Unusable)]
+    fn none_holder_serves_nothing(
+        #[case] state: SnapshotCrc,
+        #[case] status: SnapshotCrcProvenance,
+    ) {
         let holder = SnapshotCrc::try_new(state, 5, None).unwrap();
         assert_eq!(
             holder
                 .apply_commit(CrcDelta::default(), 6)
                 .only_current()
-                .source(),
-            source
+                .provenance(),
+            status
         );
         assert!(holder.at_version().is_none());
         assert!(holder.base().is_none());
@@ -301,22 +246,22 @@ mod tests {
         let crc = CrcWithProvenance::from_file(crc_at(10)).apply(CrcDelta::default(), 13);
         let advanced = SnapshotCrc::try_new(crc.clone().into(), 13, Some(12)).unwrap();
         assert_eq!(
-            advanced.source(),
-            CrcSource::Reconstructed {
-                on_disk_version: 10,
-                crc_version: 13
-            }
+            advanced.provenance(),
+            SnapshotCrcProvenance::Current(CrcProvenance::File {
+                crc_version: 13,
+                on_disk_version: 10
+            })
         );
         // When a newer snapshot uses the same CRC without replaying it again.
         let stale = SnapshotCrc::try_new(crc.into(), 14, Some(12)).unwrap();
 
         // Then classification changes without copying or changing the CRC or its disk origin.
         assert_eq!(
-            stale.source(),
-            CrcSource::Stale {
-                on_disk_version: 10,
-                crc_version: 13
-            }
+            stale.provenance(),
+            SnapshotCrcProvenance::Stale(CrcProvenance::File {
+                crc_version: 13,
+                on_disk_version: 10
+            })
         );
         assert!(stale.at_version().is_none());
         let stale_provenance = stale.base().unwrap().provenance();
@@ -325,7 +270,10 @@ mod tests {
             advanced.at_version().unwrap().provenance()
         );
         assert!(stale.only_current().base().is_none());
-        assert_eq!(stale.only_current().source(), CrcSource::Unknown);
+        assert_eq!(
+            stale.only_current().provenance(),
+            SnapshotCrcProvenance::Absent
+        );
         assert!(Arc::ptr_eq(
             stale.base().unwrap().crc(),
             advanced.at_version().unwrap().crc()

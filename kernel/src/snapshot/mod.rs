@@ -102,10 +102,10 @@ pub use builder::{IncrementalReplay, IncrementalSnapshotBuilder, SnapshotBuilder
 #[internal_api]
 pub(crate) use hint::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness};
 pub use reader::SnapshotReader;
-pub use snapshot_crc::CrcSource;
 pub(crate) use snapshot_crc::SnapshotCrc;
+pub use snapshot_crc::SnapshotCrcProvenance;
 
-pub use crate::crc::{CrcOrigin, CrcProvenance};
+pub use crate::crc::CrcProvenance;
 pub use crate::error::SnapshotHintError;
 pub use crate::log_segment::LogSegmentStats;
 
@@ -265,7 +265,7 @@ impl Snapshot {
         Self::new_with_crc(
             log_segment,
             table_configuration,
-            SnapshotCrc::NoObservation,
+            SnapshotCrc::Absent,
             false, /* built_as_latest */
             false, /* skipped_new_checkpoints */
         )
@@ -790,28 +790,20 @@ impl Snapshot {
         same_files.then(|| self.known_checkpoint_type()).flatten()
     }
 
-    /// Returns checksum provenance without performing engine I/O.
+    /// Returns this snapshot's CRC provenance without performing engine I/O.
     ///
-    /// A snapshot hint can supply the connector's observation. Kernel checks that claim against
-    /// the hint's CRC and version. Provenance is independent of file-statistics completeness.
-    pub fn crc_source(&self) -> CrcSource {
-        self.crc.source()
-    }
-
-    /// Returns the origin of the retained in-memory checksum, including a stale replay base.
-    /// Compare its CRC version with [`Self::version`] to tell whether it is current.
-    /// Returns `None` when the snapshot has no CRC. [`Self::crc_source`] reports the disk
-    /// observation even when no in-memory checksum is available. Neither accessor performs I/O.
-    pub fn crc_provenance(&self) -> Option<CrcProvenance> {
-        self.crc.base().map(CrcWithProvenance::provenance)
+    /// A snapshot hint can supply the checksum-file version. Kernel checks that claim against
+    /// the snapshot hint's CRC and version. Status is independent of file-statistics completeness.
+    pub fn crc_provenance(&self) -> SnapshotCrcProvenance {
+        self.crc.provenance()
     }
 
     /// Captures retained snapshot state as an owned hint without engine I/O.
     ///
     /// The hint preserves whether this snapshot was built as latest, not whether it is still
     /// latest. Missing checkpoint hints and CRCs at this snapshot's version remain absent.
-    /// Checksum provenance is preserved for exported CRCs and absent CRC observations. Omitting a
-    /// stale CRC resets its provenance to `Unknown`.
+    /// Checksum provenance is preserved for exported CRCs. A snapshot hint that omits a stale CRC
+    /// reports [`SnapshotCrcProvenance::Absent`].
     /// Rebuild it with [`SnapshotBuilder::with_snapshot_hint`] for the same table root.
     ///
     /// Original commit and compaction paths are retained together.
@@ -2114,8 +2106,7 @@ impl Snapshot {
             .log_segment
             .try_new_with_checkpoint(checkpoint_log_path)?;
         // Carry only an at-version CRC forward: the checkpoint drops the commits below it, so a
-        // stale base could no longer be advanced over them. Dropping it leaves the checksum
-        // provenance unknown.
+        // stale base could no longer be advanced over them.
         let crc = self.crc.only_current();
         let mut new_snapshot = Snapshot::new_with_crc(
             new_log_segment,
@@ -2446,7 +2437,7 @@ mod tests {
         // THEN: request publication only for unpublished commits; keep version, metadata, and CRC.
         assert_eq!(*committer.calls.borrow(), expected_calls);
         assert_eq!(published.version(), source.version());
-        assert_eq!(published.crc_source(), source.crc_source());
+        assert_eq!(published.crc_provenance(), source.crc_provenance());
         assert_eq!(
             published.table_configuration(),
             source.table_configuration()
@@ -3734,21 +3725,49 @@ mod tests {
     }
 
     #[rstest]
-    #[case::disk_at_version(Some(2), Some(2), CrcSource::Reconstructed { on_disk_version: 2, crc_version: 3 })]
-    #[case::reconstructed(Some(2), Some(0), CrcSource::Reconstructed { on_disk_version: 0, crc_version: 3 })]
-    #[case::stale(Some(1), Some(0), CrcSource::Stale { on_disk_version: 0, crc_version: 1 })]
-    #[case::unknown_origin(Some(2), None, CrcSource::Unknown)]
-    #[case::missing(None, None, CrcSource::Missing)]
+    #[case::disk_at_version(
+        Some(2),
+        Some(2),
+        SnapshotCrcProvenance::Current(CrcProvenance::SnapshotHint {
+            crc_version: 3,
+            on_disk_version: Some(2),
+        }),
+    )]
+    #[case::reconstructed(
+        Some(2),
+        Some(0),
+        SnapshotCrcProvenance::Current(CrcProvenance::SnapshotHint {
+            crc_version: 3,
+            on_disk_version: Some(0),
+        }),
+    )]
+    #[case::stale(
+        Some(1),
+        Some(0),
+        SnapshotCrcProvenance::Stale(CrcProvenance::SnapshotHint {
+            crc_version: 1,
+            on_disk_version: Some(0),
+        }),
+    )]
+    #[case::no_disk_version(
+        Some(2),
+        None,
+        SnapshotCrcProvenance::Current(CrcProvenance::SnapshotHint {
+            crc_version: 3,
+            on_disk_version: None,
+        }),
+    )]
+    #[case::absent(None, None, SnapshotCrcProvenance::Absent)]
     fn test_new_post_commit_preserves_provenance(
         #[case] crc_version: Option<Version>,
         #[case] on_disk_version: Option<Version>,
-        #[case] expected_source: CrcSource,
+        #[case] expected_status: SnapshotCrcProvenance,
     ) {
         // Given a snapshot with an optional retained checksum and its provenance.
         let built = snapshot_with_staged_commits(Some(2), crc_version, false);
         let crc = match built.base_crc() {
             Some(crc) => CrcWithProvenance::from_snapshot_hint(crc.clone(), on_disk_version).into(),
-            None => SnapshotCrc::Missing,
+            None => SnapshotCrc::Absent,
         };
         let parent = Snapshot::new_with_crc(
             built.log_segment().clone(),
@@ -3770,7 +3789,7 @@ mod tests {
             .unwrap();
 
         // Then at-version CRCs advance and stale or absent state is retained.
-        assert_eq!(post.crc_source(), expected_source);
+        assert_eq!(post.crc_provenance(), expected_status);
     }
 
     #[test]

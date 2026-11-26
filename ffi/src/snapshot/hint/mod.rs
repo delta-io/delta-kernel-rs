@@ -12,7 +12,7 @@ use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::log_path::LogPathArray;
 use crate::panic::catch_panic;
-use crate::snapshot::snapshot_crc::FfiCrcSource;
+use crate::snapshot::snapshot_crc::FfiSnapshotCrcProvenance;
 use crate::{NullableCvoid, OptionalValue, SharedExternEngine, SharedSnapshot};
 
 mod export;
@@ -90,7 +90,7 @@ pub struct FfiSnapshotHint {
     /// Optional `_last_checkpoint` state. Null means absent.
     pub last_checkpoint: *const FfiLastCheckpoint,
     /// Optional CRC state at `version`. Null means absent; older or newer CRCs are rejected.
-    /// This is in-memory state; see `crc_source` for its on-disk origin.
+    /// This is in-memory state; see `crc_provenance` for its on-disk origin.
     pub crc: *const FfiCrc,
     /// Whether to infer publication from paths or preserve an explicit observation.
     ///
@@ -104,16 +104,13 @@ pub struct FfiSnapshotHint {
     /// C callers must set the tag explicitly, using `NoneFfiSelectedCheckpointType` when absent:
     /// a zero-initialized field is an invalid `Some` payload.
     pub checkpoint_type: OptionalValue<FfiSelectedCheckpointType>,
-    /// An omitted or `Unknown` source is valid with or without a CRC.
-    /// Building the snapshot rejects a claim inconsistent with the supplied CRC.
-    /// `Missing` and `Unusable` require no CRC. `AtVersion` requires an at-version CRC;
-    /// `Reconstructed` requires an at-version CRC and an older `on_disk_version`.
-    /// The reported `crc_version` must match the hinted CRC.
-    /// `Stale` is inconsistent with hints, which only accept at-version CRCs.
-    /// Export includes the observation, but omitting a stale CRC resets its provenance to
-    /// `Unknown`.
-    /// C callers must set the tag explicitly, using `NoneFfiCrcSource` when absent.
-    pub crc_source: OptionalValue<FfiCrcSource>,
+    /// Optional CRC provenance. A current CRC must match the snapshot hint version. On import its
+    /// origin becomes `SnapshotHint` and any supplied disk version is preserved. Omitting the
+    /// status with a CRC leaves the disk version unspecified. Without a CRC, an omitted status or
+    /// `Absent` yields `Absent`, and `Unusable` preserves a reported failure. A snapshot hint
+    /// cannot carry a stale CRC. Set the tag to `NoneFfiSnapshotCrcProvenance` when omitting
+    /// status.
+    pub crc_provenance: OptionalValue<FfiSnapshotCrcProvenance>,
 }
 
 fn invalid_with_source(message: impl Into<String>, source: KernelError) -> KernelError {
@@ -183,9 +180,7 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
         Option::<&FfiSelectedCheckpointType>::from(&value.checkpoint_type)
             .copied()
             .map(Into::into),
-        Option::<&FfiCrcSource>::from(&value.crc_source)
-            .copied()
-            .map(Into::into),
+        Option::<&FfiSnapshotCrcProvenance>::from(&value.crc_provenance).map(Into::into),
     )?;
     builder.snapshot_hint = Some(Box::new(snapshot_hint));
     Ok(())

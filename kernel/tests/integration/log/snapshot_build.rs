@@ -7,7 +7,8 @@ use delta_kernel::arrow::array::{ArrayRef, Int32Array};
 use delta_kernel::committer::{Committer, FileSystemCommitter};
 use delta_kernel::schema::{DataType, schema, schema_ref};
 use delta_kernel::snapshot::{
-    CheckpointWriteResult, ChecksumWriteResult, CrcSource, IncrementalReplay, SnapshotBuilder,
+    CheckpointWriteResult, ChecksumWriteResult, CrcProvenance, IncrementalReplay, SnapshotBuilder,
+    SnapshotCrcProvenance,
 };
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{KernelError, KernelResult, Snapshot, Version};
@@ -391,17 +392,17 @@ async fn built_as_latest_is_inherited_by_derived_snapshots(
     let base_is_latest = !base_snap_time_travel_to_latest || kind == TableKind::CatalogManaged;
     assert_eq!(base.is_built_as_latest(), base_is_latest);
     let expected_provenance = if replay == IncrementalReplay::Unlimited {
-        CrcSource::Reconstructed {
-            on_disk_version: 0,
+        SnapshotCrcProvenance::Current(CrcProvenance::File {
             crc_version: LATEST_VERSION,
-        }
-    } else {
-        CrcSource::Stale {
             on_disk_version: 0,
+        })
+    } else {
+        SnapshotCrcProvenance::Stale(CrcProvenance::File {
             crc_version: 0,
-        }
+            on_disk_version: 0,
+        })
     };
-    assert_eq!(base.crc_source(), expected_provenance);
+    assert_eq!(base.crc_provenance(), expected_provenance);
 
     // checkpoint and write_checksum inherit the base's flag.
     let (ckpt_result, after_checkpoint) = base.checkpoint(engine.as_ref(), None)?;
@@ -411,10 +412,10 @@ async fn built_as_latest_is_inherited_by_derived_snapshots(
     let expected_checkpoint_provenance = if replay == IncrementalReplay::Unlimited {
         expected_provenance
     } else {
-        CrcSource::Unknown
+        SnapshotCrcProvenance::Absent
     };
     assert_eq!(
-        after_checkpoint.crc_source(),
+        after_checkpoint.crc_provenance(),
         expected_checkpoint_provenance
     );
 
@@ -422,17 +423,25 @@ async fn built_as_latest_is_inherited_by_derived_snapshots(
     assert_eq!(crc_result, ChecksumWriteResult::Written);
     assert_eq!(after_checksum.is_built_as_latest(), base_is_latest);
     assert_eq!(
-        after_checksum.crc_source(),
-        CrcSource::AtVersion {
-            crc_version: LATEST_VERSION
-        }
+        after_checksum.crc_provenance(),
+        SnapshotCrcProvenance::Current(if replay == IncrementalReplay::Unlimited {
+            CrcProvenance::File {
+                crc_version: LATEST_VERSION,
+                on_disk_version: LATEST_VERSION,
+            }
+        } else {
+            CrcProvenance::Checkpoint {
+                crc_version: LATEST_VERSION,
+                on_disk_version: Some(LATEST_VERSION),
+            }
+        })
     );
 
     // publish() (catalog-managed only) also inherits the base's flag.
     if kind == TableKind::CatalogManaged {
         let published = base.publish(engine.as_ref(), &TestCatalogCommitter)?;
         assert_eq!(published.is_built_as_latest(), base_is_latest);
-        assert_eq!(published.crc_source(), expected_provenance);
+        assert_eq!(published.crc_provenance(), expected_provenance);
     }
 
     // A post-commit snapshot is latest.
@@ -440,17 +449,17 @@ async fn built_as_latest_is_inherited_by_derived_snapshots(
     assert_eq!(post_commit.version(), 4);
     assert!(post_commit.is_built_as_latest());
     assert_eq!(
-        post_commit.crc_source(),
+        post_commit.crc_provenance(),
         if replay == IncrementalReplay::Unlimited {
-            CrcSource::Reconstructed {
-                on_disk_version: 0,
+            SnapshotCrcProvenance::Current(CrcProvenance::File {
                 crc_version: 4,
-            }
-        } else {
-            CrcSource::Stale {
                 on_disk_version: 0,
+            })
+        } else {
+            SnapshotCrcProvenance::Stale(CrcProvenance::File {
                 crc_version: 0,
-            }
+                on_disk_version: 0,
+            })
         },
     );
 

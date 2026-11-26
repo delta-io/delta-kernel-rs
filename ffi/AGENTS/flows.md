@@ -59,13 +59,13 @@ when the callback returns; copy retained values during the callback. No hint han
 Supply the copied values through `snapshot_builder_with_snapshot_hint` when rebuilding a snapshot.
 The hint preserves build-time freshness, not current freshness, a matching checkpoint hint,
 the selected checkpoint type when known, and an at-version CRC. Stale CRCs are omitted.
-Checksum telemetry is preserved for an exported CRC and for absent-CRC observations such as
-`Missing` or `Unusable`. Omitting a stale CRC resets its provenance to `Unknown`.
-Input hints may omit telemetry and the snapshot then reports `Unknown`. Building the snapshot
-rejects an inconsistent claim. See `FfiSnapshotHint` for the claim rules.
+Checksum telemetry is preserved for an exported CRC. A snapshot hint without a CRC preserves an
+explicit `Unusable` observation and otherwise reports `Absent`, including when export omits a stale
+CRC. An imported CRC has `SnapshotHint` provenance. When its status was omitted, its disk version
+is unspecified. Building the snapshot rejects an inconsistent claim. See `FfiSnapshotHint` for the claim rules.
 
 The `last_checkpoint` and `crc` fields in `FfiSnapshotHint` use borrowed nullable pointers.
-`checkpoint_type` and `crc_source` are inline `OptionalValue` fields, with `None` meaning unknown.
+`checkpoint_type` and `crc_provenance` are inline `OptionalValue` fields.
 An unknown checkpoint type does not mean no checkpoint was selected. A supplied type is advisory;
 naming and protocol take precedence, and checkpoint discovery replaces it with the observed type.
 
@@ -93,15 +93,11 @@ the type is known from the checkpoint's naming, the table protocol, the snapshot
 discovery. Otherwise it resolves the type through the same snapshot cache as
 `snapshot_checkpoint_info` and declarative scan planning.
 
-`snapshot_crc_source(snapshot)` returns the snapshot's `FfiCrcSource` by value without I/O. It records
-what construction observed about checksum files, independently of whether file stats are available.
-`AtVersion`, `Reconstructed`, and `Stale` carry `crc_version`. `Reconstructed` and `Stale` also carry
-the original `on_disk_version`; their difference gives the cumulative number of incorporated
-commits. For `Stale`, subtract `crc_version` from the snapshot version to obtain the remaining gap.
-The returned value owns its version information and does not borrow the snapshot. Observations stay
-fixed after construction. `snapshot_crc_provenance(snapshot, out)` copies the retained CRC's
-origin, current CRC version, and known disk version to caller-owned storage.
-It returns false when there is no retained CRC.
+`snapshot_crc_provenance(snapshot, out)` copies the snapshot's `FfiSnapshotCrcProvenance` to caller-owned
+storage without engine I/O. Callers must allocate the complete tagged result and rebuild against\nthe matching generated header. `Current` and `Stale` carry the origin, in-memory CRC version and any
+known checksum-file version. Their version difference counts cumulative commits since that file.
+For `Stale`, subtract the CRC version from the snapshot version to obtain the remaining gap.
+`Absent` and `Unusable` carry no CRC. Status is independent of file-statistics completeness.
 
 Snapshot accessors (`ffi/src/lib.rs`) include no-I/O reads such as `version` and
 `snapshot_file_stats`, which returns `OptionalValue<FfiFileStats>` (scalar

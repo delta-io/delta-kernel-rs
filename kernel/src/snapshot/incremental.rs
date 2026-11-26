@@ -686,7 +686,7 @@ mod tests {
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::LogPathFileType;
     use crate::schema::schema;
-    use crate::snapshot::{CheckpointWriteResult, CrcSource, commit};
+    use crate::snapshot::{CheckpointWriteResult, CrcProvenance, SnapshotCrcProvenance, commit};
     use crate::unit_test_utils::{
         Action, CapturingReporter, install_thread_local_metrics_reporter, serialize_actions,
         string_array_to_engine_data,
@@ -1943,11 +1943,11 @@ mod tests {
             .build(ctx.engine.as_ref())?;
         assert_eq!(snapshot_a.crc_at_version().map(|c| c.version), Some(3));
         assert_eq!(
-            snapshot_a.crc_source(),
-            CrcSource::Reconstructed {
-                on_disk_version: 1,
-                crc_version: 3
-            }
+            snapshot_a.crc_provenance(),
+            SnapshotCrcProvenance::Current(CrcProvenance::File {
+                crc_version: 3,
+                on_disk_version: 1
+            })
         );
         let snapshot_a = if known_provenance {
             snapshot_a
@@ -1964,30 +1964,33 @@ mod tests {
         // When an intermediate snapshot advances with CRC replay disabled, the retained CRC
         // stays at version 3 while the snapshot moves to version 4.
         let snapshot_a = if stale_intermediate {
-            let prior_source = snapshot_a.crc_source();
+            let prior_status = snapshot_a.crc_provenance();
             let stale = Snapshot::builder_from(snapshot_a.clone())
                 .at_version(4)
                 .with_incremental_crc_replay(IncrementalReplay::Disabled)
                 .build(ctx.engine.as_ref())?;
 
-            // Then the stale CRC keeps its disk origin, including an unknown origin.
+            // Then the stale CRC keeps its origin and any known disk version.
             assert_eq!(stale.version(), 4);
             assert_eq!(stale.base_crc().map(|crc| crc.version), Some(3));
             assert!(Arc::ptr_eq(
                 stale.base_crc().unwrap(),
                 snapshot_a.crc_at_version().unwrap(),
             ));
-            assert_eq!(snapshot_a.crc_source(), prior_source);
+            assert_eq!(snapshot_a.crc_provenance(), prior_status);
             assert!(stale.crc_at_version().is_none());
             assert_eq!(
-                stale.crc_source(),
+                stale.crc_provenance(),
                 if known_provenance {
-                    CrcSource::Stale {
-                        on_disk_version: 1,
+                    SnapshotCrcProvenance::Stale(CrcProvenance::File {
                         crc_version: 3,
-                    }
+                        on_disk_version: 1,
+                    })
                 } else {
-                    CrcSource::Unknown
+                    SnapshotCrcProvenance::Stale(CrcProvenance::SnapshotHint {
+                        crc_version: 3,
+                        on_disk_version: None,
+                    })
                 }
             );
             stale
@@ -2027,32 +2030,27 @@ mod tests {
         };
 
         // Then a listed, usable newer disk checksum establishes provenance; otherwise the retained
-        // baseline's provenance, including Unknown, survives.
+        // baseline's origin and any known disk version survive.
         assert_eq!(updated.version(), 5);
         assert_eq!(updated.crc_at_version().map(|c| c.version), expected_crc_v);
-        let detail = updated.crc_provenance().unwrap();
-        if known_provenance || listed_new_disk_crc == Some(false) {
-            assert_eq!(detail.origin, crate::snapshot::CrcOrigin::File);
+        let crc_version = expected_crc_v.unwrap_or(3);
+        let provenance = if known_provenance || listed_new_disk_crc == Some(false) {
+            CrcProvenance::File {
+                crc_version,
+                on_disk_version: expected_base_version,
+            }
         } else {
-            assert_eq!(detail.origin, crate::snapshot::CrcOrigin::SnapshotHint);
-        }
-        assert_eq!(detail.crc_version, expected_crc_v.unwrap_or(3));
+            CrcProvenance::SnapshotHint {
+                crc_version,
+                on_disk_version: None,
+            }
+        };
         assert_eq!(
-            updated.crc_source(),
-            if known_provenance || listed_new_disk_crc == Some(false) {
-                if expected_crc_v.is_some() {
-                    CrcSource::Reconstructed {
-                        on_disk_version: expected_base_version,
-                        crc_version: 5,
-                    }
-                } else {
-                    CrcSource::Stale {
-                        on_disk_version: expected_base_version,
-                        crc_version: 3,
-                    }
-                }
+            updated.crc_provenance(),
+            if expected_crc_v.is_some() {
+                SnapshotCrcProvenance::Current(provenance)
             } else {
-                CrcSource::Unknown
+                SnapshotCrcProvenance::Stale(provenance)
             }
         );
         assert_eq!(
