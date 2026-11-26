@@ -325,7 +325,7 @@ impl Snapshot {
                 // TODO(#3421): Classify missing replay-file failures as Delta errors using the
                 // incremental replay context, preserving the original error sources.
                 combined_log_segment
-                    .segment_after_version(existing_snapshot_version)
+                    .segment_after_version(existing_snapshot_version)?
                     .read_protocol_metadata_opt(engine, newer_base)
                     .inspect_err(|_| {
                         emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
@@ -389,6 +389,7 @@ impl Snapshot {
         requested_version: Option<Version>,
         checkpoint_handling: CheckpointHandling,
     ) -> Result<NewSegment> {
+        existing_log_segment.require_original_commits()?;
         let log_root = existing_log_segment.log_root.clone();
         let storage = engine.storage_handler();
 

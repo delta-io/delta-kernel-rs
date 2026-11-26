@@ -153,12 +153,15 @@ impl IncrementalScanBuilder {
             .log_segment()
             .listed
             .ascending_commit_files;
-        let snapshot_first_version = snapshot_commits.first().map(|c| c.version);
 
         // TODO(#2493): this "snapshot covers range" check becomes a typed error from
         // `CommitRange::build` (e.g. `KernelError::CommitsUnavailable { missing: Range<Version>
         // }`), pattern-matched here to return `None`.
-        if snapshot_first_version.is_none_or(|v| v > start_version) {
+        if !self
+            .target_snapshot
+            .log_segment()
+            .has_original_commits(Some(self.base_version), target_version)
+        {
             return Ok(None);
         }
 
