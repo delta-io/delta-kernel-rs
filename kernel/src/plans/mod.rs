@@ -182,7 +182,8 @@ pub trait PlanExecutorExt: PlanExecutor {
     /// decodes at most two rows; later batches may remain unread. The plan's schema must equal the
     /// requested schema, including field nullability and metadata.
     ///
-    /// Supports numbers, booleans, strings, binary, dates, string lists, and string maps.
+    /// Supports numbers, booleans, strings, binary, dates, string lists, string maps, and nested
+    /// structs with fields. Null structs mask their children, including required fields.
     /// List elements and map values must be non-nullable in the schema, even for empty streams.
     /// String-list source schemas must declare non-null elements; batches are also checked.
     /// Required nulls and null string-list elements return errors. Null map entries are dropped;

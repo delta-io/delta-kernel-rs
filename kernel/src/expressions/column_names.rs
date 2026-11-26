@@ -106,6 +106,11 @@ impl ColumnName {
         &self.path
     }
 
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn path_mut(&mut self) -> &mut Vec<String> {
+        &mut self.path
+    }
+
     /// Consumes this column name and returns the path of field names.
     pub fn into_inner(self) -> Vec<String> {
         self.path

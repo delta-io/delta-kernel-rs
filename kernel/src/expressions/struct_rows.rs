@@ -76,7 +76,11 @@ pub(crate) trait TryFromStructRows: Sized {
         let mut state = Self::new_state();
         batches.try_for_each(|batch| {
             let batch = batch?;
-            engine_rows::StructVisitor::<Self> { state: &mut state }.visit_rows_of(batch.as_ref())
+            engine_rows::StructVisitor::<Self> {
+                batch: batch.as_ref(),
+                state: &mut state,
+            }
+            .visit_rows_of(batch.as_ref())
         })?;
         Self::finish(state)
     }
