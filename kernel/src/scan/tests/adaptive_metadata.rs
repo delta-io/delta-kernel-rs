@@ -11,10 +11,9 @@ use url::Url;
 
 use super::get_files_for_scan;
 use crate::arrow::array::{AsArray as _, StringArray};
-use crate::arrow::datatypes::Int64Type;
 use crate::content_tree::test_utils::{
-    added_data_entry, data_manifest_entry, write_manifest, write_manifest_with_stats, x_full_stats,
-    x_stats,
+    added_data_entry, data_manifest_entry, mumbling_bitmap, write_manifest,
+    write_manifest_with_stats, x_full_stats, x_stats,
 };
 use crate::content_tree::{ContentTreeNodeEntry, TrackingInfo, TrackingStatus};
 use crate::engine::arrow_data::EngineDataArrowExt as _;
@@ -111,8 +110,10 @@ fn scan_reads_latest_tree_then_later_commits(#[case] version: Version, #[case] e
     );
 }
 
-#[test]
-fn scan_reads_leaf_manifests() {
+#[rstest]
+#[case::no_manifest_dv(None, &["l1.parquet", "l2.parquet", "r.parquet"])]
+#[case::manifest_dv(Some(&[0][..]), &["l2.parquet", "r.parquet"])]
+fn scan_reads_leaf_manifests(#[case] manifest_dv: Option<&[u32]>, #[case] expected: &[&str]) {
     let (engine, _) = setup_adaptive_metadata_table();
     let leaf_path = "metadata/leaf.parquet";
     let leaf = write_manifest(
@@ -130,12 +131,15 @@ fn scan_reads_leaf_manifests() {
         first_row_id: Some(10),
         ..leaf_entry.tracking
     };
+    if let Some(info) = leaf_entry.manifest_info.as_mut() {
+        info.dv = manifest_dv.map(mumbling_bitmap);
+    }
     let root = [added_data_entry("r.parquet", 1, 1, 0, 1), leaf_entry];
     let version = commit_root_manifest(&engine, &table_root(), "metadata/root.parquet", &root);
 
     assert_eq!(
         scan_paths(&engine, snapshot_at(&engine, version)),
-        strings(&["l1.parquet", "l2.parquet", "r.parquet"])
+        strings(expected)
     );
 }
 
@@ -480,7 +484,7 @@ fn scan_execute_reads_files_whose_locations_need_encoding() {
             .unwrap(),
     );
     let files = [
-        ("a b.parquet", 1, "first"),
+        ("a b.parquet", 1i64, "first"),
         ("dir/c%20d.parquet", 2, "second"),
     ];
     let entries: Vec<_> = files
@@ -491,7 +495,7 @@ fn scan_execute_reads_files_whose_locations_need_encoding() {
                 .evaluation_handler()
                 .create_many(
                     physical_schema.clone(),
-                    vec![vec![Scalar::from(*id as i64), Scalar::from(*name)]],
+                    vec![vec![Scalar::from(*id), Scalar::from(*name)]],
                 )
                 .unwrap();
             // Escape each segment independently of the code under test.
@@ -513,27 +517,16 @@ fn scan_execute_reads_files_whose_locations_need_encoding() {
         .scan_builder()
         .build()
         .unwrap();
-    let rows: Vec<(i64, String)> = scan
+    let names: Vec<String> = scan
         .execute(Arc::new(engine))
         .unwrap()
         .flat_map(|data| {
             let batch = data.unwrap().try_into_record_batch().unwrap();
-            let ids = batch
-                .column_by_name("id")
-                .unwrap()
-                .as_primitive::<Int64Type>();
             let names = batch.column_by_name("name").unwrap().as_string::<i32>();
-            ids.values()
-                .iter()
-                .zip(names.iter().flatten())
-                .map(|(id, name)| (*id, name.to_string()))
-                .collect::<Vec<_>>()
+            names.iter().flatten().map(str::to_string).collect_vec()
         })
         .sorted()
         .collect();
 
-    assert_eq!(
-        rows,
-        vec![(1, "first".to_string()), (2, "second".to_string())]
-    );
+    assert_eq!(names, strings(&["first", "second"]));
 }
