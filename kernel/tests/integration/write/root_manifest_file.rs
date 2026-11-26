@@ -79,7 +79,11 @@ async fn test_with_root_manifest_file_produces_a_self_contained_checkpoint_actio
         |builder| builder,
     )?
     .with_root_manifest_file(file.clone())?;
-    txn.commit(&engine)?.unwrap_committed();
+    let snapshot = txn.commit(&engine)?.unwrap_post_commit_snapshot();
+    let ict = snapshot
+        .reader()
+        .get_in_commit_timestamp(&engine)?
+        .expect("adaptiveMetadata tables record an In-Commit Timestamp");
 
     let checkpoint_actions = read_actions_from_commit(&table_url, 1, "checkpoint")?;
     assert_eq!(checkpoint_actions.len(), 1);
@@ -93,6 +97,7 @@ async fn test_with_root_manifest_file_produces_a_self_contained_checkpoint_actio
         .expect("contentRoot entry");
     assert_eq!(content_root["path"], json!(file.location.to_string()));
     assert_eq!(content_root["sizeInBytes"], json!(1024));
+    assert_eq!(content_root["commitTimestamp"], json!(ict));
 
     let protocol = entries
         .iter()
