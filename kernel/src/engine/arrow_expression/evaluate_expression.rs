@@ -397,10 +397,8 @@ pub fn evaluate_expression(
         }
         (ParseJson(p), _) => {
             let json_arr = evaluate_expression(&p.json_expr, batch, Some(&DataType::STRING))?;
-            // Coarser backstop for genuinely malformed JSON (incomplete records, unmatched
-            // braces, etc.). Cell-level type-parse failures in failure-prone leaves
-            // (Timestamp/Date/Decimal) are handled inside `parse_json_to_struct` itself, which
-            // converts them to per-cell NULL rather than failing the batch.
+            // `parse_json_to_struct` already nulls rows that fail to decode. Unparseable stats must
+            // never fail the query, so any remaining error still degrades to all-null stats.
             match parse_json_to_struct(json_arr.as_ref(), p.output_schema.clone()) {
                 Ok(parsed) => Ok(Arc::new(parsed) as ArrayRef),
                 Err(e) => {
@@ -2934,18 +2932,19 @@ mod tests {
         assert_eq!(result.value(0), r#"{"b":"abcd","l":[1,2],"n":{"z":7}}"#);
     }
 
-    /// An empty string is not valid JSON, so it does not parse to an empty struct.
-    ///
-    /// Nulling the whole batch for one unparseable row is a limitation rather than a guarantee: the
-    /// `arrow-json` error names no row, so the fallback can only blanket the array it was given,
-    /// discarding stats from rows that parsed fine.
+    /// An empty string is not valid JSON, so it does not parse to an empty struct. A row that fails
+    /// to parse becomes NULL without affecting the other rows.
     #[rstest]
-    #[case::empty_string(vec![Some("")], 1)]
-    #[case::malformed(vec![Some("{not json")], 1)]
-    #[case::one_bad_input_nulls_whole_batch(vec![Some(""), Some(r#"{"a":1}"#)], 2)]
-    fn test_parse_json_permissively_nulls_unparseable_batches(
+    #[case::empty_string(vec![Some("")], [true])]
+    #[case::malformed(vec![Some("{not json")], [true])]
+    #[case::one_bad_input_nulls_only_its_row(vec![Some(""), Some(r#"{"a":1}"#)], [true, false])]
+    #[case::strict_leaf_mismatch(
+        vec![Some(r#"{"a":1}"#), Some(r#"{"a":"not_a_number"}"#)],
+        [false, true]
+    )]
+    fn test_parse_json_permissively_nulls_unparseable_rows<const N: usize>(
         #[case] input: Vec<Option<&str>>,
-        #[case] expected_null_count: usize,
+        #[case] expected_nulls: [bool; N],
     ) {
         let output_schema = schema_ref! {
             nullable "a": LONG,
@@ -2959,8 +2958,10 @@ mod tests {
 
         let expr = Expr::parse_json(col!("s"), output_schema);
         let result = evaluate_expression(&expr, &batch, None).expect("parses permissively");
-        assert_eq!(result.len(), input.len());
-        assert_eq!(result.null_count(), expected_null_count);
+        let nulls = (0..result.len())
+            .map(|row| result.is_null(row))
+            .collect_vec();
+        assert_eq!(nulls, expected_nulls);
     }
 
     #[test]
@@ -3195,7 +3196,7 @@ mod tests {
     #[rstest]
     #[case::required_long(schema_ref! { not_null "a": LONG }, r#"{"a":1}"#)]
     #[case::required_date(schema_ref! { not_null "a": DATE }, r#"{"a":"1970-01-02"}"#)]
-    fn test_parse_json_invalid_required_field_nulls_batch(
+    fn test_parse_json_invalid_required_field_nulls_its_row(
         #[case] output_schema: SchemaRef,
         #[case] valid: &str,
         #[values("{}", r#"{"a":null}"#, r#"{"a":"invalid"}"#)] invalid: &str,
@@ -3208,7 +3209,7 @@ mod tests {
         let expr = Expr::parse_json(col!("json_col"), output_schema);
         let result = evaluate_expression(&expr, &batch, None).expect("parses permissively");
         assert_eq!(result.len(), 2);
-        assert_eq!(result.null_count(), 2);
+        assert!(result.is_null(0) && result.is_valid(1));
     }
 
     #[rstest]
@@ -3325,28 +3326,6 @@ mod tests {
             .unwrap();
         assert_eq!(b_col.value(0), "x");
         assert_eq!(b_col.value(1), "y");
-    }
-
-    #[test]
-    fn test_parse_json_strict_leaf_errors_fall_back_to_all_null_struct() {
-        // ParseJson is used for stats parsing. Type-parse failures on strict leaves still hit
-        // the coarse swallow inside the ParseJson arm, which returns an all-null struct so
-        // data skipping degrades to "include the file" rather than failing the query.
-        // Per-cell NULLs on failure-prone leaves (Timestamp/Date/Decimal) are tested in
-        // `engine::arrow_utils::tests::test_parse_json_safe_cast_*` and do NOT go through
-        // this fallback.
-        let schema = ArrowSchema::new(vec![ArrowField::new("json_col", ArrowDataType::Utf8, true)]);
-        let json_strings: Vec<Option<&str>> = vec![Some(r#"{"a": "not_a_number"}"#)];
-        let len = json_strings.len();
-        let json_arr = StringArray::from(json_strings);
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json_arr)]).unwrap();
-
-        let output_schema = schema_ref! { nullable "a": LONG };
-        let expr = Expr::parse_json(col!("json_col"), output_schema);
-        let result = evaluate_expression(&expr, &batch, None).unwrap();
-
-        assert_eq!(result.len(), len);
-        assert_eq!(result.null_count(), len);
     }
 
     // ==================== MapToStruct Tests ====================

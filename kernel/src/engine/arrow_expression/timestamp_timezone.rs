@@ -17,6 +17,7 @@ use chrono::{FixedOffset, LocalResult, NaiveDateTime, Offset, TimeDelta, TimeZon
 use chrono_tz::Tz;
 
 use crate::arrow::compute::kernels::cast_utils::string_to_datetime;
+use crate::engine::arrow_utils::parse_normalized_fixed_offset;
 use crate::expressions::MapToStructOptions;
 use crate::{KernelError, KernelResult};
 
@@ -100,38 +101,6 @@ impl TimestampTimezone {
                 .map(|timestamp| timestamp.timestamp_micros()),
         }
     }
-}
-
-/// Parses a normalized `+HH:MM[:SS]` or `-HH:MM[:SS]` offset within the conventional `-18:00`
-/// through `+18:00` range.
-fn parse_normalized_fixed_offset(value: &str) -> Option<FixedOffset> {
-    let sign = match value.as_bytes().first()? {
-        b'+' => 1,
-        b'-' => -1,
-        _ => return None,
-    };
-    let mut components = value.get(1..)?.split(':');
-    let hours = parse_two_digits(components.next()?)?;
-    let minutes = parse_two_digits(components.next()?)?;
-    let seconds = components.next().map_or(Some(0), parse_two_digits)?;
-    if components.next().is_some()
-        || hours > 18
-        || minutes > 59
-        || seconds > 59
-        || (hours == 18 && (minutes != 0 || seconds != 0))
-    {
-        return None;
-    }
-    FixedOffset::east_opt(sign * (hours * 3_600 + minutes * 60 + seconds))
-}
-
-/// Parses exactly two ASCII decimal digits.
-fn parse_two_digits(value: &str) -> Option<i32> {
-    let [tens, ones] = value.as_bytes() else {
-        return None;
-    };
-    (tens.is_ascii_digit() && ones.is_ascii_digit())
-        .then(|| i32::from(*tens - b'0') * 10 + i32::from(*ones - b'0'))
 }
 
 /// Parses with Arrow, resolving only named-zone clock transitions that Arrow rejects.
