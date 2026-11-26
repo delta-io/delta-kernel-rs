@@ -399,58 +399,70 @@ async fn test_commit_info_omits_adaptive_metadata_fields_without_the_feature()
 /// Configures one transaction's builder.
 type Configure = fn(UpdateTableTransactionBuilder) -> UpdateTableTransactionBuilder;
 
-/// Commits transactions configured by `before`, `manifest`, then `after`, the `manifest` one as a
-/// manifest commit of a root manifest that is never read, and returns a freshly loaded snapshot.
-fn commit_around_root_manifest(
+/// Commits one transaction configured by `configure` on `snapshot` and returns the post-commit
+/// snapshot. With `manifest`, it is a manifest commit of a root manifest that is never read, named
+/// after the commit's version.
+fn commit(
     engine: &dyn Engine,
     table_url: &Url,
     snapshot: SnapshotRef,
-    before: Configure,
-    manifest: Configure,
-    after: Configure,
+    configure: Configure,
+    manifest: bool,
 ) -> std::result::Result<SnapshotRef, Box<dyn std::error::Error>> {
-    let commit = |snapshot, configure, root_manifest: Option<FileMeta>| {
-        let mut txn = begin_transaction_with(
-            snapshot,
-            engine,
-            UpdateTableOperation::Write,
-            "test-engine",
-            true,
-            configure,
-        )?;
-        if let Some(file) = root_manifest {
-            txn = txn.with_root_manifest_file(file)?;
-        }
-        Ok::<_, Box<dyn std::error::Error>>(txn.commit(engine)?.unwrap_post_commit_snapshot())
-    };
-    let root_manifest = FileMeta {
-        location: table_url.join("metadata/root-v2.parquet")?,
-        last_modified: 0,
-        size: 1024,
-    };
-    let snapshot = commit(snapshot, before, None)?;
-    let snapshot = commit(snapshot, manifest, Some(root_manifest))?;
-    commit(snapshot, after, None)?;
-    Ok(Snapshot::builder_for(table_url.clone()).build(engine)?)
+    let version = snapshot.version() + 1;
+    let mut txn = begin_transaction_with(
+        snapshot,
+        engine,
+        UpdateTableOperation::Write,
+        "test-engine",
+        true,
+        configure,
+    )?;
+    if manifest {
+        txn = txn.with_root_manifest_file(FileMeta {
+            location: table_url.join(&format!("metadata/root-v{version}.parquet"))?,
+            last_modified: 0,
+            size: 1024,
+        })?;
+    }
+    Ok(txn.commit(engine)?.unwrap_post_commit_snapshot())
 }
 
+#[rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_app_id_versions_read_across_a_root_manifest_commit()
--> std::result::Result<(), Box<dyn std::error::Error>> {
+async fn test_app_id_versions_read_across_a_root_manifest_commit(
+    #[values(false, true)] remanifest_after: bool,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (engine, _temp_dir, table_url, snapshot) =
         setup_adaptive_metadata_table("root_manifest_file_app_id_versions").await?;
 
-    // End-to-end consistency with the real writer, which also writes each `txn` to its commit: the
-    // manifest commit's checkpoint action holds `app-1` and `app-2`, and the commit after it
-    // overrides `app-1`.
-    let snapshot = commit_around_root_manifest(
+    // The manifest commit's checkpoint action holds `app-1` and `app-2`, and the commit after it
+    // overrides `app-1`. With `remanifest_after`, a second manifest commit has to fold that in.
+    let v1 = commit(
         &engine,
         &table_url,
         snapshot,
-        |builder| builder.with_transaction_id("app-1", 5),
-        |builder| builder.with_transaction_id("app-2", 7),
-        |builder| builder.with_transaction_id("app-1", 6),
+        |b| b.with_transaction_id("app-1", 5),
+        false,
     )?;
+    let v2 = commit(
+        &engine,
+        &table_url,
+        v1,
+        |b| b.with_transaction_id("app-2", 7),
+        true,
+    )?;
+    let v3 = commit(
+        &engine,
+        &table_url,
+        v2,
+        |b| b.with_transaction_id("app-1", 6),
+        false,
+    )?;
+    if remanifest_after {
+        commit(&engine, &table_url, v3, |b| b, true)?;
+    }
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
 
     assert_eq!(
         snapshot.reader().get_app_id_version("app-1", &engine)?,
@@ -467,26 +479,40 @@ async fn test_app_id_versions_read_across_a_root_manifest_commit()
     Ok(())
 }
 
+#[rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_domain_metadata_read_across_a_root_manifest_commit()
--> std::result::Result<(), Box<dyn std::error::Error>> {
+async fn test_domain_metadata_read_across_a_root_manifest_commit(
+    #[values(false, true)] remanifest_after: bool,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (engine, _temp_dir, table_url, snapshot) =
         setup_adaptive_metadata_table("root_manifest_file_domain_metadata").await?;
 
     // The manifest commit's checkpoint action holds `domain.a` and `domain.b`; the commit after it
-    // updates `domain.a` and removes `domain.b`.
-    let snapshot = commit_around_root_manifest(
+    // updates `domain.a` and removes `domain.b`. With `remanifest_after`, a second manifest commit
+    // has to fold those in.
+    let v1 = commit(
         &engine,
         &table_url,
         snapshot,
-        |builder| builder.with_domain_metadata("domain.a", "a1"),
-        |builder| builder.with_domain_metadata("domain.b", "b1"),
-        |builder| {
-            builder
-                .with_domain_metadata("domain.a", "a2")
-                .with_domain_metadata_removed("domain.b")
-        },
+        |b| b.with_domain_metadata("domain.a", "a1"),
+        false,
     )?;
+    let v2 = commit(
+        &engine,
+        &table_url,
+        v1,
+        |b| b.with_domain_metadata("domain.b", "b1"),
+        true,
+    )?;
+    let update_a_remove_b: Configure = |b| {
+        b.with_domain_metadata("domain.a", "a2")
+            .with_domain_metadata_removed("domain.b")
+    };
+    let v3 = commit(&engine, &table_url, v2, update_a_remove_b, false)?;
+    if remanifest_after {
+        commit(&engine, &table_url, v3, |b| b, true)?;
+    }
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
 
     for (domain, expected) in [
         ("domain.a", Some("a2")),
