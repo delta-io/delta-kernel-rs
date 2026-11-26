@@ -1,5 +1,6 @@
 //! Default Json handler implementation
 
+use std::collections::VecDeque;
 use std::io::BufReader;
 use std::num::NonZero;
 use std::sync::Arc;
@@ -10,8 +11,8 @@ use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use delta_kernel::arrow::json::ReaderBuilder;
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_utils::{
-    build_json_reorder_indices, fixup_json_read, json_arrow_schema, parse_json as arrow_parse_json,
-    to_json_bytes,
+    ReorderIndex, build_json_reorder_indices, fixup_json_read, json_arrow_schema,
+    parse_json as arrow_parse_json, to_json_bytes,
 };
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::object_store::path::Path;
@@ -24,10 +25,11 @@ use delta_kernel::{
     KernelError, KernelResult, KernelResultIterator, PredicateRef,
 };
 use futures::stream::{self, BoxStream};
-use futures::{StreamExt, TryStreamExt, ready};
+use futures::{FutureExt, StreamExt, TryStreamExt, ready};
+use tokio::sync::mpsc;
 use url::Url;
 
-use crate::executor::TaskExecutor;
+use crate::executor::{ScopedTask, TaskExecutor};
 
 #[derive(Debug)]
 pub struct DefaultJsonHandler<E: TaskExecutor> {
@@ -42,6 +44,7 @@ pub struct DefaultJsonHandler<E: TaskExecutor> {
     /// Limit the number of rows per batch. That is, for batch_size = N, then each RecordBatch
     /// yielded by the stream will have at most N rows.
     batch_size: NonZero<usize>,
+    parallel_json_reads: bool,
 }
 
 impl<E: TaskExecutor> DefaultJsonHandler<E> {
@@ -51,6 +54,7 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
             task_executor,
             buffer_size: super::DEFAULT_READ_BUFFER_SIZE,
             batch_size: super::DEFAULT_READ_BATCH_SIZE,
+            parallel_json_reads: false,
         }
     }
 
@@ -79,6 +83,16 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
     /// [Decoder::with_buffer_size]: delta_kernel::arrow::json::reader::Decoder
     pub fn with_batch_size(mut self, batch_size: NonZero<usize>) -> Self {
         self.batch_size = batch_size;
+        self
+    }
+
+    /// Decode JSON files in independently scheduled tasks while preserving input order.
+    ///
+    /// Disabled by default. When enabled, [`Self::with_buffer_size`] bounds the active file tasks.
+    /// Each task has a one-batch output queue in addition to its current batch and decoder buffers.
+    /// Tasks use the configured executor; parallel decoding requires a multi-threaded executor.
+    pub fn with_parallel_json_reads(mut self, enabled: bool) -> Self {
+        self.parallel_json_reads = enabled;
         self
     }
 }
@@ -124,7 +138,82 @@ async fn read_json_files_impl(
         .try_flatten()
         .map_ok(|e| -> Box<dyn EngineData> { Box::new(e) });
 
-    Ok(Box::pin(result_stream))
+    Ok(result_stream.boxed())
+}
+
+async fn read_json_files_parallel_impl<E: TaskExecutor>(
+    task_executor: Arc<E>,
+    store: Arc<DynObjectStore>,
+    files: Vec<FileMeta>,
+    physical_schema: SchemaRef,
+    batch_size: usize,
+    buffer_size: usize,
+) -> KernelResult<BoxStream<'static, KernelResult<Box<dyn EngineData>>>> {
+    if files.is_empty() {
+        return Ok(Box::pin(stream::empty()));
+    }
+
+    let arrow_schema = Arc::new(json_arrow_schema(&physical_schema)?);
+    let reorder_indices: Arc<[_]> = build_json_reorder_indices(&physical_schema)?.into();
+    let spawn_file = move |file| {
+        spawn_file_task(
+            task_executor.as_ref(),
+            store.clone(),
+            file,
+            arrow_schema.clone(),
+            reorder_indices.clone(),
+            batch_size,
+        )
+    };
+    let mut remaining = files.into_iter();
+    let mut active: VecDeque<_> = remaining
+        .by_ref()
+        .take(buffer_size)
+        .map(&spawn_file)
+        .collect();
+
+    let output = async_stream::try_stream! {
+        while let Some(mut slot) = active.pop_front() {
+            while let Some(batch) = slot.receiver.recv().await {
+                yield batch;
+            }
+            slot.task.join().await??;
+            // Retire a complete file before admitting another into the bounded window.
+            if let Some(file) = remaining.next() {
+                active.push_back(spawn_file(file));
+            }
+        }
+    };
+    Ok(output.boxed())
+}
+
+struct FileSlot {
+    receiver: mpsc::Receiver<Box<dyn EngineData>>,
+    task: ScopedTask<KernelResult<()>>,
+}
+
+fn spawn_file_task(
+    task_executor: &impl TaskExecutor,
+    store: Arc<DynObjectStore>,
+    file: FileMeta,
+    arrow_schema: ArrowSchemaRef,
+    reorder_indices: Arc<[ReorderIndex]>,
+    batch_size: usize,
+) -> FileSlot {
+    let (sender, receiver) = mpsc::channel(1);
+    let task = task_executor.spawn_joinable(async move {
+        let file_path = file.location.to_string();
+        let mut batches = open_json_file(store, arrow_schema, batch_size, file).await?;
+        while let Some(batch) = batches.next().await {
+            let batch = fixup_json_read(batch?, &reorder_indices, &file_path)?;
+            let batch: Box<dyn EngineData> = Box::new(batch);
+            if sender.send(batch).await.is_err() {
+                return Ok(());
+            }
+        }
+        Ok(())
+    });
+    FileSlot { receiver, task }
 }
 
 /// Internal async implementation of write_json_file
@@ -178,14 +267,31 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         predicate: Option<PredicateRef>,
         cancellation_token: Option<CancellationTokenRef>,
     ) -> KernelResult<FileDataReadResultIterator> {
-        let future = read_json_files_impl(
-            self.store.clone(),
-            files.to_vec(),
-            physical_schema,
-            predicate,
-            self.batch_size.get(),
-            self.buffer_size.get(),
-        );
+        let store = self.store.clone();
+        let files = files.to_vec();
+        let batch_size = self.batch_size.get();
+        let buffer_size = self.buffer_size.get();
+        let future = if self.parallel_json_reads {
+            read_json_files_parallel_impl(
+                self.task_executor.clone(),
+                store,
+                files,
+                physical_schema,
+                batch_size,
+                buffer_size,
+            )
+            .boxed()
+        } else {
+            read_json_files_impl(
+                store,
+                files,
+                physical_schema,
+                predicate,
+                batch_size,
+                buffer_size,
+            )
+            .boxed()
+        };
         super::stream_future_to_cancellable_iter(
             self.task_executor.clone(),
             future,
@@ -283,8 +389,10 @@ mod tests {
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::ops::Range;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::task::Waker;
+    use std::time::Duration;
 
     use delta_kernel::actions::get_commit_schema;
     use delta_kernel::arrow::array::{Array, AsArray, Int32Array, RecordBatch, StringArray};
@@ -296,16 +404,170 @@ mod tests {
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
         PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
     };
-    use delta_kernel::schema::schema_ref;
+    use delta_kernel::schema::{DataType as KernelDataType, StructField, StructType, schema_ref};
     use delta_kernel_default_engine_test_utils::{into_record_batch, string_array_to_engine_data};
     use futures::future;
     use itertools::Itertools;
     use serde_json::json;
     use test_utils::engine_contract::test_json_handler_file_path_contract;
+    use test_utils::{TestCancellationToken, assert_result_error_with_message};
     use tracing::info;
 
     use super::*;
     use crate::executor::tokio::{TokioBackgroundExecutor, TokioMultiThreadExecutor};
+
+    struct TrackingExecutor {
+        inner: TokioMultiThreadExecutor,
+        spawned: AtomicUsize,
+        stopped: tokio::sync::mpsc::UnboundedSender<()>,
+    }
+
+    struct NotifyOnDrop(tokio::sync::mpsc::UnboundedSender<()>);
+
+    impl Drop for NotifyOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    impl TaskExecutor for TrackingExecutor {
+        type Guard<'a> = <TokioMultiThreadExecutor as TaskExecutor>::Guard<'a>;
+
+        fn block_on<T>(&self, task: T) -> T::Output
+        where
+            T: futures::Future + Send + 'static,
+            T::Output: Send + 'static,
+        {
+            self.inner.block_on(task)
+        }
+
+        fn spawn<F>(&self, task: F)
+        where
+            F: futures::Future<Output = ()> + Send + 'static,
+        {
+            self.spawned.fetch_add(1, Ordering::SeqCst);
+            let stopped = NotifyOnDrop(self.stopped.clone());
+            self.inner.spawn(async move {
+                let _stopped = stopped;
+                task.await;
+            });
+        }
+
+        fn spawn_blocking<T, R>(&self, task: T) -> futures::future::BoxFuture<'_, KernelResult<R>>
+        where
+            T: FnOnce() -> R + Send + 'static,
+            R: Send + 'static,
+        {
+            self.inner.spawn_blocking(task)
+        }
+
+        fn enter(&self) -> Self::Guard<'_> {
+            self.inner.enter()
+        }
+    }
+
+    /// Wraps an inner store and sleeps on every ObjectStore API before forwarding.
+    /// Completes whatever was requested; never waits for a path that was not asked for.
+    #[derive(Debug)]
+    struct LatencyStore<T: ObjectStore> {
+        inner: T,
+        delay: Duration,
+    }
+
+    impl<T: ObjectStore> LatencyStore<T> {
+        fn new(inner: T, delay: Duration) -> Self {
+            Self { inner, delay }
+        }
+
+        async fn delay(&self) {
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+        }
+    }
+
+    impl<T: ObjectStore> std::fmt::Display for LatencyStore<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "LatencyStore(delay={:?})", self.delay)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<T: ObjectStore> delta_kernel::object_store::ObjectStore for LatencyStore<T> {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> ObjectStoreResult<PutResult> {
+            self.delay().await;
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            self.delay().await;
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> ObjectStoreResult<GetResult> {
+            self.delay().await;
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn get_ranges(
+            &self,
+            location: &Path,
+            ranges: &[Range<u64>],
+        ) -> ObjectStoreResult<Vec<Bytes>> {
+            self.delay().await;
+            self.inner.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, ObjectStoreResult<Path>>,
+        ) -> BoxStream<'static, ObjectStoreResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> ObjectStoreResult<ListResult> {
+            self.delay().await;
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> ObjectStoreResult<()> {
+            self.delay().await;
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
 
     /// Store wrapper that wraps an inner store to guarantee the ordering of GET requests. Note
     /// that since the keys are resolved in order, requests to subsequent keys in the order will
@@ -752,8 +1014,9 @@ mod tests {
         Ok(())
     }
 
+    #[rstest::rstest]
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-    async fn test_read_json_files_ordering() {
+    async fn test_read_json_files_ordering(#[values(false, true)] parallel: bool) {
         // this test checks that the read_json_files method returns the files in order in the
         // presence of an ObjectStore (OrderedGetStore) that resolves paths in a jumbled order:
         // 1. we set up a list of FileMetas (and some random JSON content) in order
@@ -831,7 +1094,8 @@ mod tests {
                 )),
             );
             let handler = handler
-                .with_buffer_size(NonZero::new(*buffer_size).expect("buffer_size is non-zero"));
+                .with_buffer_size(NonZero::new(*buffer_size).expect("buffer_size is non-zero"))
+                .with_parallel_json_reads(parallel);
             let physical_schema = schema_ref! { nullable "val": INTEGER };
             let data: Vec<RecordBatch> = handler
                 .read_json_files(&files, physical_schema, None)
@@ -850,6 +1114,427 @@ mod tests {
                 .collect();
             assert_eq!(all_values, (0..1000).collect_vec());
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn test_read_json_files_parallel_ordering() {
+        // Parallel impl does not issue every GET up front, so OrderedGetStore
+        // would hang. LatencyStore delays each requested GET and always completes it.
+        const N: i32 = 10_000;
+        let ordered_paths: Vec<Path> = (0..N)
+            .map(|i| Path::from(format!("test/path{i}")))
+            .collect();
+
+        let memory_store = InMemory::new();
+        for (i, path) in ordered_paths.iter().enumerate() {
+            memory_store
+                .put(path, Bytes::from(format!("{{\"val\": {i}}}")).into())
+                .await
+                .unwrap();
+        }
+
+        let store = Arc::new(LatencyStore::new(memory_store, Duration::from_millis(1)));
+        let ordered_file_meta: Vec<_> = ordered_paths
+            .iter()
+            .map(|path| {
+                let store = store.clone();
+                async move {
+                    let url = Url::parse(&format!("memory:/{path}")).unwrap();
+                    let location = Path::from(path.as_ref());
+                    let meta = store.head(&location).await.unwrap();
+                    FileMeta {
+                        location: url,
+                        last_modified: meta.last_modified.timestamp_millis(),
+                        size: meta.size,
+                    }
+                }
+            })
+            .collect();
+        let files = future::join_all(ordered_file_meta).await;
+
+        let handler = DefaultJsonHandler::new(
+            store,
+            Arc::new(TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            )),
+        )
+        .with_buffer_size(NonZero::new(1000).expect("buffer_size is non-zero"))
+        .with_parallel_json_reads(true);
+        let physical_schema = schema_ref! { nullable "val": INTEGER };
+        let data: Vec<RecordBatch> = handler
+            .read_json_files(&files, physical_schema, None)
+            .unwrap()
+            .map_ok(into_record_batch)
+            .try_collect()
+            .unwrap();
+
+        let all_values: Vec<i32> = data
+            .iter()
+            .flat_map(|batch| {
+                let val_col: &Int32Array = batch.column(0).as_primitive();
+                (0..val_col.len()).map(|i| val_col.value(i)).collect_vec()
+            })
+            .collect();
+        assert_eq!(all_values, (0..N).collect_vec());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_read_json_files_parallel_empty_files() {
+        let store = Arc::new(InMemory::new());
+        let handler = DefaultJsonHandler::new(
+            store,
+            Arc::new(TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            )),
+        )
+        .with_parallel_json_reads(true);
+        let physical_schema = schema_ref! { nullable "val": INTEGER };
+        let result: Vec<_> = handler
+            .read_json_files(&[], physical_schema, None)
+            .unwrap()
+            .try_collect()
+            .unwrap();
+        assert!(result.is_empty(), "empty file list must yield no batches");
+    }
+
+    #[rstest::rstest]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_read_json_files_parallel_bounds_tasks_and_cancels_on_drop(
+        #[values(1, 2, 10)] buffer_size: usize,
+    ) {
+        let store = Arc::new(InMemory::new());
+        let mut files = Vec::new();
+        for index in 0..5 {
+            let path = Path::from(format!("test/{index}"));
+            let contents = Bytes::from("{\"val\": 1}\n".repeat(4));
+            let size = contents.len() as u64;
+            store.put(&path, contents.into()).await.unwrap();
+            files.push(FileMeta {
+                location: Url::parse(&format!("memory:///{path}")).unwrap(),
+                last_modified: 0,
+                size,
+            });
+        }
+        let (stopped, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+        let executor = Arc::new(TrackingExecutor {
+            inner: TokioMultiThreadExecutor::new(tokio::runtime::Handle::current()),
+            spawned: AtomicUsize::new(0),
+            stopped,
+        });
+        let mut batches = read_json_files_parallel_impl(
+            executor.clone(),
+            store,
+            files,
+            schema_ref! { nullable "val": INTEGER },
+            1,
+            buffer_size,
+        )
+        .await
+        .unwrap();
+        let initial_tasks = buffer_size.min(5);
+        assert_eq!(executor.spawned.load(Ordering::SeqCst), initial_tasks);
+        for _ in 0..4 {
+            assert_eq!(batches.next().await.unwrap().unwrap().len(), 1);
+            assert_eq!(executor.spawned.load(Ordering::SeqCst), initial_tasks);
+        }
+        assert_eq!(batches.next().await.unwrap().unwrap().len(), 1);
+        let total_tasks = (initial_tasks + 1).min(5);
+        assert_eq!(executor.spawned.load(Ordering::SeqCst), total_tasks);
+        drop(batches);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for _ in 0..total_tasks {
+                notifications.recv().await.unwrap();
+            }
+        })
+        .await
+        .expect("dropping the stream must stop every admitted task");
+        assert_eq!(executor.spawned.load(Ordering::SeqCst), total_tasks);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_read_json_files_parallel_missing_file_errors() {
+        let store = Arc::new(InMemory::new());
+        let missing_path = Path::from("test/missing");
+        let url = Url::parse(&format!("memory:/{missing_path}")).unwrap();
+        let files = vec![FileMeta {
+            location: url,
+            last_modified: 0,
+            size: 100,
+        }];
+        let handler = DefaultJsonHandler::new(
+            store,
+            Arc::new(TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            )),
+        )
+        .with_parallel_json_reads(true);
+        let physical_schema = schema_ref! { nullable "val": INTEGER };
+        let result: KernelResult<Vec<_>> = handler
+            .read_json_files(&files, physical_schema, None)
+            .unwrap()
+            .try_collect();
+        assert!(result.is_err(), "missing file must produce an error");
+    }
+
+    #[rstest::rstest]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_read_json_files_parallel_later_file_errors_after_data(
+        #[values(false, true)] malformed: bool,
+    ) {
+        let store = Arc::new(InMemory::new());
+        for i in [0, 1, 3] {
+            store
+                .put(
+                    &Path::from(format!("test/{i}")),
+                    Bytes::from(format!("{{\"val\": {i}}}")).into(),
+                )
+                .await
+                .unwrap();
+        }
+        if malformed {
+            store
+                .put(&Path::from("test/2"), Bytes::from("not JSON").into())
+                .await
+                .unwrap();
+        }
+        let files: Vec<FileMeta> = (0..4)
+            .map(|i| FileMeta {
+                location: Url::parse(&format!("memory:///test/{i}")).unwrap(),
+                last_modified: 0,
+                size: 12,
+            })
+            .collect();
+        let handler = DefaultJsonHandler::new(
+            store,
+            Arc::new(TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            )),
+        )
+        .with_buffer_size(NonZero::new(2).unwrap())
+        .with_parallel_json_reads(true);
+        let physical_schema = schema_ref! { nullable "val": INTEGER };
+        let mut iter = handler
+            .read_json_files(&files, physical_schema, None)
+            .unwrap();
+        for expected in [0, 1] {
+            let batch = into_record_batch(iter.next().unwrap().unwrap());
+            let values: &Int32Array = batch.column(0).as_primitive();
+            assert_eq!(values.value(0), expected);
+        }
+        assert!(iter.next().unwrap().is_err());
+        assert!(iter.next().is_none());
+    }
+
+    #[rstest::rstest]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_read_json_files_parallel_window_sizes(#[values(1, 3, 10)] buffer_size: usize) {
+        const N: i32 = 7;
+        let store = Arc::new(InMemory::new());
+        for i in 0..N {
+            store
+                .put(
+                    &Path::from(format!("test/{i}")),
+                    Bytes::from(
+                        (i * 3..i * 3 + 3)
+                            .map(|value| format!("{{\"val\": {value}}}\n"))
+                            .collect::<String>(),
+                    )
+                    .into(),
+                )
+                .await
+                .unwrap();
+        }
+        let files: Vec<FileMeta> = (0..N)
+            .map(|i| FileMeta {
+                location: Url::parse(&format!("memory:///test/{i}")).unwrap(),
+                last_modified: 0,
+                size: 12,
+            })
+            .collect();
+        let handler = DefaultJsonHandler::new(
+            store,
+            Arc::new(TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            )),
+        )
+        .with_buffer_size(NonZero::new(buffer_size).unwrap())
+        .with_batch_size(NonZero::new(1).unwrap())
+        .with_parallel_json_reads(true);
+        let physical_schema = schema_ref! { nullable "val": INTEGER };
+        let data: Vec<RecordBatch> = handler
+            .read_json_files(&files, physical_schema, None)
+            .unwrap()
+            .map_ok(into_record_batch)
+            .try_collect()
+            .unwrap();
+        let all_values: Vec<i32> = data
+            .iter()
+            .flat_map(|batch| {
+                let val_col: &Int32Array = batch.column(0).as_primitive();
+                (0..val_col.len()).map(|i| val_col.value(i)).collect_vec()
+            })
+            .collect();
+        assert_eq!(all_values, (0..N * 3).collect_vec());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_read_json_files_parallel_with_cancelled_token() {
+        let store = Arc::new(InMemory::new());
+        store
+            .put(&Path::from("test/0"), Bytes::from(r#"{"val": 0}"#).into())
+            .await
+            .unwrap();
+        let url = Url::parse("memory:///test/0").unwrap();
+        let files = vec![FileMeta {
+            location: url,
+            last_modified: 0,
+            size: 12,
+        }];
+        let executor = Arc::new(TokioMultiThreadExecutor::new(
+            tokio::runtime::Handle::current(),
+        ));
+        let handler = DefaultJsonHandler::new(store, executor).with_parallel_json_reads(true);
+        let physical_schema = schema_ref! { nullable "val": INTEGER };
+        let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
+        let result =
+            handler.read_json_files_with_cancellation(&files, physical_schema, None, Some(token));
+        assert!(
+            matches!(result, Err(KernelError::Cancelled)),
+            "pre-cancelled token must yield Cancelled, not data"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_read_json_files_parallel_propagates_schema_conversion_error() {
+        let store = Arc::new(InMemory::new());
+        store
+            .put(&Path::from("test/0"), Bytes::from(r#"{"val": 0}"#).into())
+            .await
+            .unwrap();
+        let files = vec![FileMeta {
+            location: Url::parse("memory:///test/0").unwrap(),
+            last_modified: 0,
+            size: 12,
+        }];
+
+        // A shredded Variant is a valid kernel type but cannot be converted to an Arrow schema.
+        let shredded_variant = KernelDataType::variant_type([
+            StructField::not_null("metadata", KernelDataType::BINARY),
+            StructField::not_null("value", KernelDataType::BINARY),
+            StructField::nullable("typed_value", KernelDataType::INTEGER),
+        ])
+        .unwrap();
+        let physical_schema =
+            Arc::new(StructType::try_new([StructField::nullable("v", shredded_variant)]).unwrap());
+
+        let handler = DefaultJsonHandler::new(
+            store,
+            Arc::new(TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            )),
+        )
+        .with_parallel_json_reads(true);
+        let result = handler.read_json_files(&files, physical_schema, None);
+        assert_result_error_with_message(result, "Incorrect Variant Schema");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_read_json_files_parallel_stops_when_consumer_drops() {
+        const N: usize = 64;
+        let memory_store = InMemory::new();
+        for i in 0..N {
+            memory_store
+                .put(
+                    &Path::from(format!("test/{i}")),
+                    Bytes::from(format!("{{\"val\": {i}}}")).into(),
+                )
+                .await
+                .unwrap();
+        }
+        let store = Arc::new(LatencyStore::new(memory_store, Duration::from_millis(5)));
+        let files: Vec<FileMeta> = (0..N)
+            .map(|i| FileMeta {
+                location: Url::parse(&format!("memory:///test/{i}")).unwrap(),
+                last_modified: 0,
+                size: 12,
+            })
+            .collect();
+
+        let handler = DefaultJsonHandler::new(
+            store,
+            Arc::new(TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            )),
+        )
+        .with_buffer_size(NonZero::new(1).unwrap())
+        .with_batch_size(NonZero::new(1).unwrap())
+        .with_parallel_json_reads(true);
+        let physical_schema = schema_ref! { nullable "val": INTEGER };
+        let mut iter = handler
+            .read_json_files(&files, physical_schema, None)
+            .unwrap();
+        let first = iter.next().expect("at least one batch");
+        assert!(first.is_ok(), "first batch must succeed before drop");
+        drop(iter);
+        // Let blocked file tasks observe the closed channel and take the
+        // consumer-dropped return before the test runtime shuts down.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    #[rstest::rstest]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_read_json_files_parallel_via_builder(#[values(false, true)] background: bool) {
+        let store = Arc::new(InMemory::new());
+        for i in 0..100 {
+            store
+                .put(
+                    &Path::from(format!("test/{i}")),
+                    Bytes::from(format!("{{\"val\": {i}}}")).into(),
+                )
+                .await
+                .unwrap();
+        }
+        let files: Vec<FileMeta> = (0..100)
+            .map(|i| {
+                let url = Url::parse(&format!("memory:///test/{i}")).unwrap();
+                FileMeta {
+                    location: url,
+                    last_modified: 0,
+                    size: 12,
+                }
+            })
+            .collect();
+
+        let json_handler = if background {
+            crate::DefaultEngineBuilder::new(store)
+                .with_parallel_json_reads(true)
+                .build()
+                .json_handler()
+        } else {
+            crate::DefaultEngineBuilder::new(store)
+                .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
+                    tokio::runtime::Handle::current(),
+                )))
+                .with_parallel_json_reads(true)
+                .build()
+                .json_handler()
+        };
+        let physical_schema = schema_ref! { nullable "val": INTEGER };
+        let data: Vec<RecordBatch> = json_handler
+            .read_json_files(&files, physical_schema, None)
+            .unwrap()
+            .map_ok(into_record_batch)
+            .try_collect()
+            .unwrap();
+
+        let all_values: Vec<i32> = data
+            .iter()
+            .flat_map(|batch| {
+                let val_col: &Int32Array = batch.column(0).as_primitive();
+                (0..val_col.len()).map(|i| val_col.value(i)).collect_vec()
+            })
+            .collect();
+        assert_eq!(all_values, (0..100).collect_vec());
     }
 
     // Helper function to create test data
@@ -968,12 +1653,13 @@ mod tests {
     // Calls the shared contract helper in `engine::tests` against `DefaultJsonHandler` (the
     // matching `SyncJsonHandler` invocation lives in `engine/sync/json.rs`).
 
-    #[test]
-    fn json_handler_file_path_contract() {
+    #[rstest::rstest]
+    fn json_handler_file_path_contract(#[values(false, true)] parallel: bool) {
         let handler = DefaultJsonHandler::new(
             Arc::new(LocalFileSystem::new()),
             Arc::new(TokioBackgroundExecutor::new()),
-        );
+        )
+        .with_parallel_json_reads(parallel);
         test_json_handler_file_path_contract(&handler);
     }
 }
