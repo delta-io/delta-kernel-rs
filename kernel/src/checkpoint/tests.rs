@@ -174,7 +174,7 @@ fn test_create_last_checkpoint_data() -> KernelResult<()> {
     let add_actions_counter = 75;
     let size_in_bytes: i64 = 1024 * 1024; // 1MB
     let (store, _) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = SyncEngine::new_with_store(store);
 
     // Create last checkpoint metadata
     let last_checkpoint_batch = create_last_checkpoint_data(
@@ -683,7 +683,7 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> Result<()> {
         last_modified: 0,
         size: 100,
     };
-    let snapshot = Snapshot::builder_for(table_root.clone())
+    let snapshot = Snapshot::builder_for(table_root)
         .with_log_tail(vec![LogPath::try_new(staged_commit).unwrap()])
         .with_max_catalog_version(1)
         .build(&engine)?;

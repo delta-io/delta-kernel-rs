@@ -1653,7 +1653,7 @@ impl Scan {
                 self.state_info
                     .physical_partition_schema
                     .as_ref()
-                    .map(|s| s.as_ref()),
+                    .map(AsRef::as_ref),
                 !self.snapshot.has_adaptive_metadata(),
             )
     }

@@ -193,7 +193,7 @@ impl DataSkippingFilter {
         let skipping_evaluator = engine
             .evaluation_handler()
             .new_predicate_evaluator(
-                unified_schema.clone(),
+                unified_schema,
                 Arc::new(as_sql_data_skipping_predicate_with_stats_columns(
                     &predicate,
                     &partition_columns,
@@ -477,7 +477,7 @@ fn collect_junction_preds(
     }
     let mut keep_null = true;
     let preds: Vec<_> = preds
-        .flat_map(|p| match p {
+        .filter_map(|p| match p {
             Some(pred) => Some(pred),
             None => keep_null.then(|| {
                 keep_null = false;

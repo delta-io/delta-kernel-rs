@@ -231,7 +231,7 @@ fn test_version_filtering() {
     let snapshot_version = snapshot.version();
 
     if snapshot_version >= 1 {
-        let mut writer = LogCompactionWriter::try_new(snapshot.clone(), 0, 1).unwrap();
+        let mut writer = LogCompactionWriter::try_new(snapshot, 0, 1).unwrap();
 
         let result = writer.compaction_data(&engine);
         assert!(

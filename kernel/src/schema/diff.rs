@@ -1051,16 +1051,16 @@ mod tests {
         let diff = SchemaDiff {
             added_fields: vec![
                 FieldChange {
-                    field: top_level_field.clone(),
+                    field: top_level_field,
                     path: column_name!("name"), // Top-level (depth 1)
                 },
                 FieldChange {
-                    field: nested_field.clone(),
+                    field: nested_field,
                     path: column_name!("address.street"), // Nested (depth 2)
                 },
             ],
             removed_fields: vec![FieldChange {
-                field: deeply_nested_field.clone(),
+                field: deeply_nested_field,
                 path: column_name!("user.address.city"), // Deeply nested (depth 3)
             }],
             updated_fields: vec![],

@@ -1701,7 +1701,7 @@ mod tests {
 
         let batches: Vec<RecordBatch> = engine
             .parquet_handler()
-            .read_parquet_files(slice::from_ref(&file), schemas.leaf.clone(), None)
+            .read_parquet_files(slice::from_ref(&file), schemas.leaf, None)
             .unwrap()
             .map(|batch| batch.unwrap().try_into_record_batch().unwrap())
             .collect();

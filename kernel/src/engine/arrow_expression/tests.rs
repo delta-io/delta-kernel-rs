@@ -48,10 +48,10 @@ fn test_array_column() {
     let field = Arc::new(Field::new("item", DataType::Int32, true));
     let arr_field = Arc::new(Field::new("item", DataType::List(field.clone()), true));
 
-    let schema = Schema::new([arr_field.clone()]);
+    let schema = Schema::new([arr_field]);
 
-    let array = ListArray::new(field.clone(), offsets, Arc::new(values), None);
-    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
+    let array = ListArray::new(field, offsets, Arc::new(values), None);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)]).unwrap();
 
     let not_op = Pred::not(Pred::binary(BinaryPredicateOp::In, lit(5), col!("item")));
 
@@ -96,8 +96,8 @@ fn null_udt_scalar_uses_physical_type(#[case] sql_type: KernelDataType) {
 fn test_bad_right_type_array() {
     let values = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
     let field = Arc::new(Field::new("item", DataType::Int32, true));
-    let schema = Schema::new([field.clone()]);
-    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values.clone())]).unwrap();
+    let schema = Schema::new([field]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values)]).unwrap();
 
     let in_op = Pred::not(Pred::binary(BinaryPredicateOp::In, lit(5), col!("item")));
 
@@ -221,7 +221,7 @@ fn test_binary_predicate_with_view_types(
     let expected_ne = BooleanArray::from(vec![None, Some(true), Some(false), Some(true)]);
     assert_eq!(results, expected_ne);
 
-    let predicate_distinct = Pred::from_expr(expr!(distinct(col("col"), lit(value.clone()))));
+    let predicate_distinct = Pred::from_expr(expr!(distinct(col("col"), lit(value))));
     let results = evaluate_predicate(&predicate_distinct, &batch, false).unwrap();
     let expected_distinct =
         BooleanArray::from(vec![Some(true), Some(true), Some(false), Some(true)]);
@@ -249,7 +249,7 @@ fn test_binary_predicate_with_view_types(
 #[test]
 fn test_literal_type_array() {
     let field = Arc::new(Field::new("item", DataType::Int32, true));
-    let schema = Schema::new([field.clone()]);
+    let schema = Schema::new([field]);
     let batch = RecordBatch::new_empty(Arc::new(schema));
 
     let not_in_op = Pred::not(Pred::binary(
@@ -330,9 +330,9 @@ fn test_literal_complex_type_array() {
             vec![
                 Scalar::Integer(42),
                 array_value,
-                Scalar::null(array_type.clone()),
+                Scalar::null(array_type),
                 map_value,
-                Scalar::null(map_type.clone()),
+                Scalar::null(map_type),
             ],
         )
         .unwrap(),
@@ -340,11 +340,11 @@ fn test_literal_complex_type_array() {
     let nested_array_type = ArrayType::new(struct_type.clone(), true);
     let nested_array_value = Scalar::Array(
         ArrayData::try_new(
-            nested_array_type.clone(),
+            nested_array_type,
             vec![
                 struct_value.clone(),
-                Scalar::null(struct_type.clone()),
-                struct_value.clone(),
+                Scalar::null(struct_type),
+                struct_value,
             ],
         )
         .unwrap(),
@@ -419,10 +419,10 @@ fn test_invalid_array_sides() {
     let field = Arc::new(Field::new("item", DataType::Int32, true));
     let arr_field = Arc::new(Field::new("item", DataType::List(field.clone()), true));
 
-    let schema = Schema::new([arr_field.clone()]);
+    let schema = Schema::new([arr_field]);
 
-    let array = ListArray::new(field.clone(), offsets, Arc::new(values), None);
-    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
+    let array = ListArray::new(field, offsets, Arc::new(values), None);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)]).unwrap();
 
     let in_op = Pred::not(Pred::binary(
         BinaryPredicateOp::In,
@@ -446,9 +446,9 @@ fn test_str_arrays() {
     let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 3, 6, 9]));
     let field = Arc::new(Field::new("item", DataType::Utf8, true));
     let arr_field = Arc::new(Field::new("item", DataType::List(field.clone()), true));
-    let schema = Schema::new([arr_field.clone()]);
-    let array = ListArray::new(field.clone(), offsets, Arc::new(values), None);
-    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
+    let schema = Schema::new([arr_field]);
+    let array = ListArray::new(field, offsets, Arc::new(values), None);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)]).unwrap();
 
     let str_not_op = Pred::not(Pred::binary(
         BinaryPredicateOp::In,
@@ -478,8 +478,7 @@ fn test_str_arrays() {
 fn test_extract_column() {
     let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
     let values = Int32Array::from(vec![1, 2, 3]);
-    let batch =
-        RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(values.clone())]).unwrap();
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values.clone())]).unwrap();
     let column = col!("a");
 
     let results = evaluate_expression(&column, &batch, None).unwrap();
@@ -496,11 +495,7 @@ fn test_extract_column() {
         Arc::new(Field::new("a", DataType::Int32, false)),
         struct_values,
     )]);
-    let batch = RecordBatch::try_new(
-        Arc::new(schema.clone()),
-        vec![Arc::new(struct_array.clone())],
-    )
-    .unwrap();
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(struct_array)]).unwrap();
     let column = col!("b.a");
     let results = evaluate_expression(&column, &batch, None).unwrap();
     assert_eq!(results.as_ref(), &values);
@@ -510,7 +505,7 @@ fn test_extract_column() {
 fn test_binary_op_scalar() {
     let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
     let values = Int32Array::from(vec![1, 2, 3]);
-    let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(values)]).unwrap();
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values)]).unwrap();
     let column = col!("a");
 
     let expression = column.clone().add(lit(1));
@@ -543,7 +538,7 @@ fn test_binary_op() {
     ]);
     let values = Int32Array::from(vec![1, 2, 3]);
     let batch = RecordBatch::try_new(
-        Arc::new(schema.clone()),
+        Arc::new(schema),
         vec![Arc::new(values.clone()), Arc::new(values)],
     )
     .unwrap();
@@ -560,7 +555,7 @@ fn test_binary_op() {
     let expected = Arc::new(Int32Array::from(vec![0, 0, 0]));
     assert_eq!(results.as_ref(), expected.as_ref());
 
-    let expression = column_a.clone().mul(column_b);
+    let expression = column_a.mul(column_b);
     let results = evaluate_expression(&expression, &batch, None).unwrap();
     let expected = Arc::new(Int32Array::from(vec![1, 4, 9]));
     assert_eq!(results.as_ref(), expected.as_ref());
@@ -570,7 +565,7 @@ fn test_binary_op() {
 fn test_binary_cmp() {
     let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
     let values = Int32Array::from(vec![1, 2, 3]);
-    let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(values)]).unwrap();
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values)]).unwrap();
 
     let predicate_lt = Pred::from_expr(expr!(col("a") < 2));
     let results = evaluate_predicate(&predicate_lt, &batch, false).unwrap();
@@ -633,7 +628,7 @@ fn test_logical() {
         Field::new("b", DataType::Boolean, true),
     ]);
     let batch = RecordBatch::try_new(
-        Arc::new(schema.clone()),
+        Arc::new(schema),
         vec![
             Arc::new(BooleanArray::from(vec![t, t, f, f, t, f])),
             Arc::new(BooleanArray::from(vec![t, f, t, f, n, n])),
@@ -1797,7 +1792,7 @@ fn test_create_many_empty_rows_returns_zero_row_batch() {
         nullable "b": STRING,
     };
     let handler = ArrowEvaluationHandler;
-    let result = handler.create_many(schema.clone(), vec![]).unwrap();
+    let result = handler.create_many(schema, vec![]).unwrap();
     assert_eq!(result.len(), 0);
     let rb = result.try_into_record_batch().unwrap();
     assert_eq!(rb.num_rows(), 0);
@@ -1873,7 +1868,7 @@ fn test_create_many_nested_struct() {
 
     // Build expected inner struct column: row 1 has values, row 2 is null
     let inner_col = Arc::new(StructArray::new(
-        arrow_inner_fields.clone(),
+        arrow_inner_fields,
         vec![
             create_array!(Int32, [Some(10), None]) as ArrayRef,
             create_array!(Utf8, [Some("hello"), None]) as ArrayRef,

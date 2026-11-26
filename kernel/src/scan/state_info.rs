@@ -195,7 +195,7 @@ fn validate_metadata_columns<'a>(
                     .metadata()
                     .configuration()
                     .get("delta.rowTracking.materializedRowIdColumnName")
-                    .ok_or(KernelError::generic("No delta.rowTracking.materializedRowIdColumnName key found in metadata configuration"))?;
+                    .ok_or_else(|| KernelError::generic("No delta.rowTracking.materializedRowIdColumnName key found in metadata configuration"))?;
                 metadata_info.materialized_row_id_column_name = Some(row_id_col);
             }
             Some(MetadataColumnSpec::RowCommitVersion) => {
@@ -208,7 +208,7 @@ fn validate_metadata_columns<'a>(
                     .table_properties()
                     .materialized_row_commit_version_column_name
                     .as_ref()
-                    .ok_or(KernelError::generic(
+                    .ok_or_else(|| KernelError::generic(
                         "No delta.rowTracking.materializedRowCommitVersionColumnName key found in \
                          metadata configuration",
                     ))?;
@@ -425,102 +425,103 @@ impl StateInfo {
             {
                 // Classifier has handled this field via a transformation, just push it and move on
                 transform_spec.push(spec);
-            } else if partition_columns.contains(logical_field.name()) {
+                continue;
+            }
+            if partition_columns.contains(logical_field.name()) {
                 // push the transform for this partition column
                 transform_spec.push(FieldTransformSpec::MetadataDerivedColumn {
                     field_index: index,
                     insert_after: last_physical_field.clone(),
                 });
-            } else {
-                // Regular field field or a metadata column, figure out which and handle it
-                match logical_field.get_metadata_column_spec() {
-                    Some(MetadataColumnSpec::RowId) => {
-                        let index_column_name = match metadata_info.selected_row_index_col_name {
-                            Some(index_column_name) => index_column_name.to_string(),
-                            None => {
-                                // the index column isn't being explicitly requested, so add it to
-                                // `read_fields` so the parquet_reader will generate it, and add a
-                                // transform to drop it before returning logical data
+                continue;
+            }
+            // Regular field field or a metadata column, figure out which and handle it
+            match logical_field.get_metadata_column_spec() {
+                Some(MetadataColumnSpec::RowId) => {
+                    let index_column_name = if let Some(index_column_name) =
+                        metadata_info.selected_row_index_col_name
+                    {
+                        index_column_name.to_string()
+                    } else {
+                        // the index column isn't being explicitly requested, so add it to
+                        // `read_fields` so the parquet_reader will generate it, and add a
+                        // transform to drop it before returning logical data
 
-                                // ensure we have a column name that isn't already in our schema
-                                let index_column_name = (0..)
-                                    .map(|i| format!("row_indexes_for_row_id_{i}"))
-                                    .find(|name| logical_read_schema.field(name).is_none())
-                                    .ok_or(KernelError::generic(
-                                        "Couldn't generate row index column name",
-                                    ))?;
-                                read_fields.push(StructField::create_metadata_column(
-                                    &index_column_name,
-                                    MetadataColumnSpec::RowIndex,
-                                ));
-                                transform_spec.push(FieldTransformSpec::StaticDrop {
-                                    field_name: index_column_name.clone(),
-                                });
-                                index_column_name
-                            }
-                        };
-                        let Some(row_id_col_name) = metadata_info.materialized_row_id_column_name
-                        else {
-                            return Err(KernelError::internal_error(
-                                "Should always return a materialized_row_id_column_name if selecting row ids",
-                            ));
-                        };
-
-                        let row_id_col_name = row_id_col_name.to_string();
-                        read_fields.push(StructField::nullable(&row_id_col_name, DataType::LONG));
-                        transform_spec.push(FieldTransformSpec::GenerateRowId {
-                            field_name: row_id_col_name.clone(),
-                            row_index_field_name: index_column_name,
-                        });
-                        last_physical_field = Some(row_id_col_name);
-                    }
-                    Some(MetadataColumnSpec::RowCommitVersion) => {
-                        let Some(row_commit_version_col_name) =
-                            metadata_info.materialized_row_commit_version_column_name
-                        else {
-                            return Err(KernelError::internal_error(
-                                "missing materialized Row Commit Version column name when row \
-                                 tracking is enabled",
-                            ));
-                        };
-
-                        let row_commit_version_col_name = row_commit_version_col_name.to_string();
-                        read_fields.push(StructField::nullable(
-                            &row_commit_version_col_name,
-                            DataType::LONG,
+                        // ensure we have a column name that isn't already in our schema
+                        let index_column_name = (0..)
+                            .map(|i| format!("row_indexes_for_row_id_{i}"))
+                            .find(|name| logical_read_schema.field(name).is_none())
+                            .ok_or_else(|| {
+                                KernelError::generic("Couldn't generate row index column name")
+                            })?;
+                        read_fields.push(StructField::create_metadata_column(
+                            &index_column_name,
+                            MetadataColumnSpec::RowIndex,
                         ));
-                        transform_spec.push(FieldTransformSpec::GenerateRowCommitVersion {
-                            field_name: row_commit_version_col_name.clone(),
+                        transform_spec.push(FieldTransformSpec::StaticDrop {
+                            field_name: index_column_name.clone(),
                         });
-                        last_physical_field = Some(row_commit_version_col_name);
-                    }
-                    Some(MetadataColumnSpec::RowIndex)
-                    | Some(MetadataColumnSpec::FilePath)
-                    | None => {
-                        // note that RowIndex and FilePath are handled in the parquet reader so we
-                        // just add them as if they're normal physical
-                        // columns
-                        let physical_name = if reuse_physical_schema {
-                            logical_field.physical_name(column_mapping_mode).to_owned()
-                        } else {
-                            let field = logical_field.make_physical(column_mapping_mode)?;
-                            trace!("\n\n{logical_field:#?}\nAfter mapping: {field:#?}\n\n");
-                            let name = field.name.clone();
-                            read_fields.push(field);
-                            name
-                        };
+                        index_column_name
+                    };
+                    let Some(row_id_col_name) = metadata_info.materialized_row_id_column_name
+                    else {
+                        return Err(KernelError::internal_error(
+                            "Should always return a materialized_row_id_column_name if selecting row ids",
+                        ));
+                    };
 
-                        if !logical_field.is_metadata_column()
-                            && metadata_info.metadata_field_names.contains(&physical_name)
-                        {
-                            return Err(KernelError::Schema(format!(
-                                "Metadata column names must not match physical columns, but logical column '{}' has physical name '{}'",
-                                logical_field.name(),
-                                physical_name,
-                            )));
-                        }
-                        last_physical_field = Some(physical_name);
+                    let row_id_col_name = row_id_col_name.to_string();
+                    read_fields.push(StructField::nullable(&row_id_col_name, DataType::LONG));
+                    transform_spec.push(FieldTransformSpec::GenerateRowId {
+                        field_name: row_id_col_name.clone(),
+                        row_index_field_name: index_column_name,
+                    });
+                    last_physical_field = Some(row_id_col_name);
+                }
+                Some(MetadataColumnSpec::RowCommitVersion) => {
+                    let Some(row_commit_version_col_name) =
+                        metadata_info.materialized_row_commit_version_column_name
+                    else {
+                        return Err(KernelError::internal_error(
+                            "missing materialized Row Commit Version column name when row \
+                             tracking is enabled",
+                        ));
+                    };
+
+                    let row_commit_version_col_name = row_commit_version_col_name.to_string();
+                    read_fields.push(StructField::nullable(
+                        &row_commit_version_col_name,
+                        DataType::LONG,
+                    ));
+                    transform_spec.push(FieldTransformSpec::GenerateRowCommitVersion {
+                        field_name: row_commit_version_col_name.clone(),
+                    });
+                    last_physical_field = Some(row_commit_version_col_name);
+                }
+                Some(MetadataColumnSpec::RowIndex) | Some(MetadataColumnSpec::FilePath) | None => {
+                    // note that RowIndex and FilePath are handled in the parquet reader so we
+                    // just add them as if they're normal physical
+                    // columns
+                    let physical_name = if reuse_physical_schema {
+                        logical_field.physical_name(column_mapping_mode).to_owned()
+                    } else {
+                        let field = logical_field.make_physical(column_mapping_mode)?;
+                        trace!("\n\n{logical_field:#?}\nAfter mapping: {field:#?}\n\n");
+                        let name = field.name.clone();
+                        read_fields.push(field);
+                        name
+                    };
+
+                    if !logical_field.is_metadata_column()
+                        && metadata_info.metadata_field_names.contains(&physical_name)
+                    {
+                        return Err(KernelError::Schema(format!(
+                            "Metadata column names must not match physical columns, but logical column '{}' has physical name '{}'",
+                            logical_field.name(),
+                            physical_name,
+                        )));
                     }
+                    last_physical_field = Some(physical_name);
                 }
             }
         }
@@ -968,7 +969,7 @@ pub(crate) mod tests {
         }
 
         Ok(StateInfo::try_new(
-            schema.clone(),
+            schema,
             table_configuration.logical_schema(),
             &table_configuration,
             predicate,
@@ -1081,11 +1082,8 @@ pub(crate) mod tests {
             nullable "part2": INTEGER, // Partition
         };
 
-        let state_info = get_simple_state_info(
-            schema.clone(),
-            vec!["part1".to_string(), "part2".to_string()],
-        )
-        .unwrap();
+        let state_info =
+            get_simple_state_info(schema, vec!["part1".to_string(), "part2".to_string()]).unwrap();
 
         // Should have transforms for both partition columns
         assert!(state_info.transform_spec.is_some());
@@ -1131,7 +1129,7 @@ pub(crate) mod tests {
         let predicate = Arc::new(Pred::from_expr(expr!(col("value") > 10i64)));
 
         let state_info = get_state_info(
-            schema.clone(),
+            schema,
             vec![], // no partition columns
             Some(predicate),
             &[],            // no table features
@@ -1159,7 +1157,7 @@ pub(crate) mod tests {
             nullable "value": LONG,
         };
 
-        let state_info = get_simple_state_info(schema.clone(), vec!["date".to_string()]).unwrap();
+        let state_info = get_simple_state_info(schema, vec!["date".to_string()]).unwrap();
 
         // Should have a transform spec for the partition column
         let transform_spec = state_info.transform_spec.as_ref().unwrap();
@@ -1247,7 +1245,7 @@ pub(crate) mod tests {
         let schema = schema_ref! { nullable "id": STRING };
 
         let state_info = get_state_info(
-            schema.clone(),
+            schema,
             vec![],
             None,
             ROW_TRACKING_FEATURES,
@@ -1323,7 +1321,7 @@ pub(crate) mod tests {
         let schema = schema_ref! { nullable "row_indexes_for_row_id_0": STRING };
 
         let state_info = get_state_info(
-            schema.clone(),
+            schema,
             vec![],
             None,
             ROW_TRACKING_FEATURES,
@@ -1357,7 +1355,7 @@ pub(crate) mod tests {
         let schema = schema_ref! { nullable "id": STRING };
 
         let state_info = get_state_info(
-            schema.clone(),
+            schema,
             vec![],
             None,
             ROW_TRACKING_FEATURES,
@@ -1497,7 +1495,7 @@ pub(crate) mod tests {
     fn metadata_column_matches_read_field() {
         let schema = schema_ref! { (cm_field("id", 1, "other", DataType::STRING)) };
         let res = get_state_info(
-            schema.clone(),
+            schema,
             vec![],
             None,
             &[], // no table features
@@ -1926,9 +1924,7 @@ pub(crate) mod tests {
     /// Flat schema with `n` long columns named `c0..c{n-1}`.
     fn flat_long_schema(n: usize) -> SchemaRef {
         Arc::new(StructType::new_unchecked(
-            (0..n)
-                .map(|i| StructField::nullable(format!("c{i}"), DataType::LONG))
-                .collect::<Vec<_>>(),
+            (0..n).map(|i| StructField::nullable(format!("c{i}"), DataType::LONG)),
         ))
     }
 

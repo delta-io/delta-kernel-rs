@@ -410,7 +410,7 @@ async fn snapshot_build_cancelled_during_listing() -> KernelResult<()> {
         .without_plan_executor();
 
     let result = Snapshot::builder_for(table_root)
-        .with_cancellation_token(token.clone() as CancellationTokenRef)
+        .with_cancellation_token(token as CancellationTokenRef)
         .build(&engine);
     assert!(
         matches!(

@@ -230,7 +230,7 @@ impl TableChangesScan {
         let dv_engine_ref = engine.clone();
 
         let table_root_copy = self.table_changes.table_root().clone();
-        let physical_predicate = self.physical_predicate().clone();
+        let physical_predicate = self.physical_predicate();
 
         let result = scan_files
             .map(move |scan_file| {
@@ -456,7 +456,7 @@ mod tests {
         let predicate = Arc::new(Predicate::from_expr(expr!(col("id") > 10)));
         let scan = table_changes
             .into_scan_builder()
-            .with_schema(schema.clone())
+            .with_schema(schema)
             .with_predicate(predicate.clone())
             .build()
             .unwrap();

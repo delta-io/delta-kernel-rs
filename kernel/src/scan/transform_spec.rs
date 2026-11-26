@@ -435,7 +435,7 @@ mod tests {
         let transform_spec = vec![
             FieldTransformSpec::StaticInsert {
                 insert_after: Some("col1".to_string()),
-                expr: expr.clone(),
+                expr: expr,
             },
             FieldTransformSpec::StaticDrop {
                 field_name: "col2".to_string(),

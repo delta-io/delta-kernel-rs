@@ -238,12 +238,12 @@ fn parse_double_or_float(primitive: &PrimitiveType, raw: &str, sql: &str) -> Ker
 fn exceeds_decimal_precision(raw: &str) -> bool {
     let unsigned = raw.strip_prefix(['+', '-']).unwrap_or(raw);
     let scale = match unsigned.split_once('.') {
-        Some((_, frac)) => frac.chars().filter(|c| c.is_ascii_digit()).count(),
+        Some((_, frac)) => frac.chars().filter(char::is_ascii_digit).count(),
         None => 0,
     };
     let significant = unsigned
         .chars()
-        .filter(|c| c.is_ascii_digit())
+        .filter(char::is_ascii_digit)
         .skip_while(|&c| c == '0')
         .count();
     significant.max(scale) > 38

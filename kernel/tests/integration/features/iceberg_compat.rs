@@ -515,12 +515,11 @@ async fn v3_e2e_partitioned_writes_with_field_ids(
     let expected_cm_mode = extra_props
         .iter()
         .find(|(k, _)| *k == "delta.columnMapping.mode")
-        .map(|(_, v)| match *v {
+        .map_or(ColumnMappingMode::Name, |(_, v)| match *v {
             "id" => ColumnMappingMode::Id,
             "name" => ColumnMappingMode::Name,
             other => panic!("unexpected column mapping mode {other:?}"),
-        })
-        .unwrap_or(ColumnMappingMode::Name);
+        });
     assert_eq!(cm_mode, expected_cm_mode);
 
     // === Per-data-file validations ===
@@ -568,7 +567,7 @@ async fn v3_e2e_partitioned_writes_with_field_ids(
     }
 
     // === Exact scan contents ===
-    verify_scan_contents(final_snap.clone(), engine.clone());
+    verify_scan_contents(final_snap, engine.clone());
 }
 
 // === Helpers ===
@@ -749,9 +748,8 @@ fn build_all_null_variant_array(rows: usize) -> ArrayRef {
     let value_arr: ArrayRef = Arc::new(BinaryArray::from(value_bytes));
     let arrow_variant: ArrowDataType =
         ArrowDataType::try_from_kernel(&DataType::unshredded_variant()).unwrap();
-    let fields = match arrow_variant {
-        ArrowDataType::Struct(fields) => fields,
-        _ => panic!("variant arrow type must be struct"),
+    let ArrowDataType::Struct(fields) = arrow_variant else {
+        panic!("variant arrow type must be struct")
     };
     Arc::new(
         StructArray::try_new(fields, vec![metadata_arr, value_arr], Some(null_bitmap)).unwrap(),
@@ -1100,7 +1098,7 @@ fn find_top_level_field_in_parquet<'a>(
     root.get_fields()
         .iter()
         .find(|f| f.name() == name)
-        .map(|f| f.as_ref())
+        .map(AsRef::as_ref)
 }
 
 /// Get the parquet physical type of a top-level field (looked up by physical name). Panics if

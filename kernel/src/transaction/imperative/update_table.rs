@@ -22,7 +22,7 @@ use crate::expressions::{
 };
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::get_scan_metadata_transform_expr;
-use crate::scan::{restored_add_schema, scan_row_schema};
+use crate::scan::{ScanMetadata, restored_add_schema, scan_row_schema};
 use crate::schema::{ArrayType, SchemaRef, ToSchema, lazy_schema_ref};
 use crate::table_features::TableFeature;
 use crate::{DataType, Engine, Expression, KernelResult, KernelResultIterator};
@@ -108,7 +108,7 @@ impl Transaction<UpdateTable, Imperative> {
     /// txn.update_deletion_vectors(dv_map, files_iter)?;
     /// ```
     pub fn scan_metadata_to_engine_data(
-        scan_metadata: impl KernelResultIterator<crate::scan::ScanMetadata>,
+        scan_metadata: impl KernelResultIterator<ScanMetadata>,
     ) -> impl KernelResultIterator<FilteredEngineData> {
         scan_metadata.map(|result| result.map(|metadata| metadata.scan_files))
     }
@@ -373,7 +373,7 @@ impl<STATE> Transaction<STATE, Imperative> {
     ) -> KernelResult<impl KernelResultIterator<FilteredEngineData> + 'a> {
         // Create-table transactions should not have any DV update actions
         if self.is_create_table() && !self.staged_data_changes.dv_matched_files.is_empty() {
-            return Err(crate::error::KernelError::internal_error(
+            return Err(KernelError::internal_error(
                 "CREATE TABLE transaction cannot have DV update actions",
             ));
         }

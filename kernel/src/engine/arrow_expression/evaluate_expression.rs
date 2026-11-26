@@ -630,7 +630,7 @@ fn evaluate_case_when(
             "CASE WHEN branches must have the same type",
         ));
     }
-    let values = arrays.iter().map(|array| array.as_ref()).collect_vec();
+    let values = arrays.iter().map(AsRef::as_ref).collect_vec();
     validate_array_type(interleave(&values, &output_row_sources)?, result_type)
 }
 
@@ -1744,8 +1744,7 @@ mod tests {
         let patch = ExpressionStructPatchBuilder::new().replace("a", lit(1));
         let expr = Expr::struct_patch(patch).unwrap();
         let result =
-            evaluate_expression(&expr, &batch, Some(&DataType::from(output_schema.clone())))
-                .unwrap();
+            evaluate_expression(&expr, &batch, Some(&DataType::from(output_schema))).unwrap();
         let result = result.as_any().downcast_ref::<StructArray>().unwrap();
         validate_i32_column(result, 0, &[1, 1, 1]);
         validate_i32_column(result, 1, &[10, 20, 30]);
@@ -1965,7 +1964,7 @@ mod tests {
         let arr1 = Arc::new(Int32Array::from(vec![1, 2, 3])); // No nulls
         let arr2 = Arc::new(Int32Array::from(vec![10, 20, 30]));
 
-        let result = coalesce_arrays(&[arr1.clone(), arr2], None).unwrap();
+        let result = coalesce_arrays(&[arr1, arr2], None).unwrap();
         let result_array = result.as_any().downcast_ref::<Int32Array>().unwrap();
 
         // Result should be arr1's values (first non-null for each row)

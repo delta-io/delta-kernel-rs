@@ -460,9 +460,7 @@ fn scan_metadata_from_hint_before_checkpoint_action_rescans(
     {
         paths = metadata
             .unwrap()
-            .visit_scan_files(paths, |paths: &mut Vec<String>, file| {
-                paths.push(file.path.to_string())
-            })
+            .visit_scan_files(paths, |paths: &mut Vec<String>, file| paths.push(file.path))
             .unwrap();
     }
     paths.sort();

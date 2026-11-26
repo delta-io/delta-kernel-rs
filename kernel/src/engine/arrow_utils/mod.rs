@@ -526,225 +526,212 @@ fn get_indices(
             "Getting indices for field {} with offset {parquet_offset}, with index {parquet_index}",
             field.name()
         );
-        if let Some(KernelFieldInfo {
+        let Some(KernelFieldInfo {
             parquet_index: index,
             field: requested_field,
             ..
         }) = kernel_field_info
-        {
-            let requested_type = requested_field.data_type().physical_type();
-            // If the field is a variant, make sure the parquet schema matches the unshredded
-            // variant representation. This is to ensure that shredded reads are not
-            // performed.
-            if requested_type == &DataType::unshredded_variant() {
-                validate_parquet_variant(field)?;
-            }
-            match field.data_type() {
-                ArrowDataType::Struct(fields) => {
-                    if let DataType::Struct(requested_schema)
-                    | DataType::Variant(requested_schema)
-                    | DataType::File(requested_schema) = requested_type
-                    {
-                        let mask_before = mask_indices.len();
-                        let (parquet_advance, children) = get_indices(
-                            parquet_index + parquet_offset,
-                            requested_schema.as_ref(),
-                            fields,
-                            mask_indices,
-                        )?;
-                        // advance the number of parquet fields, but subtract 1 because the
-                        // struct will be counted by the `enumerate` call but doesn't count as
-                        // an actual index. Use saturating_sub to handle empty structs (0 fields).
-                        parquet_offset += parquet_advance.saturating_sub(1);
-                        // If no leaf columns were selected (mask unchanged), the parquet
-                        // reader will omit this struct entirely. We cannot create a Nested
-                        // entry because it would index into a column that doesn't exist.
-                        // The recursive call is still needed for the correct
-                        // `parquet_advance` value.
-                        found_fields.insert(requested_field.name());
-                        if mask_indices.len() > mask_before {
-                            reorder_indices.push(ReorderIndex::nested(index, children));
-                        } else {
-                            // The recursive call resolved all children (as nullable/missing
-                            // or the struct is empty), but no parquet leaves were selected.
-                            // Defer the Missing entry so it appears after all entries that
-                            // consume parquet input columns.
-                            debug_assert_eq!(children.len(), requested_schema.num_fields());
-                            deferred_missing.push(ReorderIndex::missing(
-                                index,
-                                Arc::new(requested_field.try_into_arrow()?),
-                            ));
-                        }
-                    } else {
-                        return Err(KernelError::unexpected_column_type(field.name()));
-                    }
-                }
-                ArrowDataType::List(list_field)
-                | ArrowDataType::LargeList(list_field)
-                | ArrowDataType::ListView(list_field)
-                | ArrowDataType::LargeListView(list_field) => {
-                    // we just want to transparently recurse into lists, need to transform the
-                    // kernel list data type into a schema
-                    if let DataType::Array(array_type) = requested_type {
-                        let requested_schema = schema! {
-                            (StructField::new(
-                                list_field.name().clone(), // so we find it in the inner call
-                                array_type.element_type.clone(),
-                                array_type.contains_null,
-                            )),
-                        };
-                        let mask_before = mask_indices.len();
-                        let (parquet_advance, mut children) = get_indices(
-                            parquet_index + parquet_offset,
-                            &requested_schema,
-                            &[list_field.clone()].into(),
-                            mask_indices,
-                        )?;
-                        // see comment above in struct match arm
-                        parquet_offset += parquet_advance - 1;
-                        found_fields.insert(requested_field.name());
-                        if mask_indices.len() <= mask_before {
-                            // No leaves selected inside this list. Defer a Missing entry.
-                            deferred_missing.push(ReorderIndex::missing(
-                                index,
-                                Arc::new(requested_field.try_into_arrow()?),
-                            ));
-                        } else if children.len() != 1 {
-                            return Err(KernelError::generic(
-                                "List call should not have generated more than one reorder index",
-                            ));
-                        } else {
-                            // safety, checked that we have 1 element
-                            let mut child = children.swap_remove(0);
-                            if let ReorderIndexTransform::Cast(element_target) = &child.transform {
-                                // The recursive plan targets the element type, but this reorder
-                                // entry consumes the outer list column. Cast the complete list so
-                                // Arrow applies the element conversion recursively while retaining
-                                // the physical list wrapper at each nesting level.
-                                let target_field: ArrowField = requested_field.try_into_arrow()?;
-                                let ArrowDataType::List(target_element_field) =
-                                    target_field.data_type()
-                                else {
-                                    return Err(KernelError::internal_error(
-                                        "Kernel array converted to a non-list Arrow type.",
-                                    ));
-                                };
-                                let target_element_field = Arc::new(
-                                    target_element_field
-                                        .as_ref()
-                                        .clone()
-                                        .with_data_type(element_target.clone()),
-                                );
-                                let target = list_type_with_element(
-                                    field.data_type(),
-                                    target_element_field,
-                                )?;
-                                child.transform = ReorderIndexTransform::Cast(target);
-                            }
-                            // the index is wrong, as it's the index from the inner schema.
-                            // Adjust it to be our index
-                            child.index = index;
-                            reorder_indices.push(child);
-                        }
-                    } else {
-                        return Err(KernelError::unexpected_column_type(list_field.name()));
-                    }
-                }
-                ArrowDataType::Map(key_val_field, _) => {
-                    match (key_val_field.data_type(), requested_type) {
-                        (ArrowDataType::Struct(inner_fields), DataType::Map(map_type)) => {
-                            let mut key_val_names =
-                                inner_fields.iter().map(|f| f.name().to_string());
-                            let key_name = key_val_names.next().ok_or_else(|| {
-                                KernelError::generic("map fields didn't include a key col")
-                            })?;
-                            let val_name = key_val_names.next().ok_or_else(|| {
-                                KernelError::generic("map fields didn't include a val col")
-                            })?;
-                            if key_val_names.next().is_some() {
-                                return Err(KernelError::generic(
-                                    "map fields had more than 2 members",
-                                ));
-                            }
-                            let inner_schema = map_type.as_struct_schema(key_name, val_name);
-                            let mask_before = mask_indices.len();
-                            let (parquet_advance, mut children) = get_indices(
-                                parquet_index + parquet_offset,
-                                &inner_schema,
-                                inner_fields,
-                                mask_indices,
-                            )?;
-
-                            // advance the number of parquet fields, but subtract 1 because the
-                            // map will be counted by the `enumerate` call but doesn't count as
-                            // an actual index.
-                            parquet_offset += parquet_advance - 1;
-                            found_fields.insert(requested_field.name());
-                            if mask_indices.len() <= mask_before {
-                                // No leaves selected inside this map. Defer a Missing entry.
-                                deferred_missing.push(ReorderIndex::missing(
-                                    index,
-                                    Arc::new(requested_field.try_into_arrow()?),
-                                ));
-                            } else if children.len() != 2 {
-                                return Err(KernelError::generic(
-                                    "Map call should have generated exactly two reorder indices",
-                                ));
-                            } else {
-                                // vec indexing is safe, we checked len above
-                                let mut num_identity_transforms = 0;
-                                if !children[0].needs_transform() {
-                                    children[0] = ReorderIndex::identity(0);
-                                    num_identity_transforms += 1;
-                                }
-                                if !children[1].needs_transform() {
-                                    children[1] = ReorderIndex::identity(1);
-                                    num_identity_transforms += 1;
-                                }
-                                let transform = match num_identity_transforms {
-                                    2 => ReorderIndex::identity(index),
-                                    _ => ReorderIndex::nested(index, children),
-                                };
-                                reorder_indices.push(transform);
-                            }
-                        }
-                        _ => {
-                            return Err(KernelError::unexpected_column_type(field.name()));
-                        }
-                    }
-                }
-                _ => {
-                    // We don't care about matching on nullability or metadata here. These can
-                    // differ between the delta schema and the parquet schema without causing
-                    // issues in reading the data. We fix them up in expression evaluation later.
-                    match super::ensure_data_types::ensure_data_types(
-                        &requested_field.data_type,
-                        field.data_type(),
-                        super::ensure_data_types::ValidationMode::TypesAndNames,
-                    )? {
-                        DataTypeCompat::Identical => {
-                            reorder_indices.push(ReorderIndex::identity(index))
-                        }
-                        DataTypeCompat::NeedsCast(target) => {
-                            reorder_indices.push(ReorderIndex::cast(index, target))
-                        }
-                        DataTypeCompat::Nested => {
-                            return Err(KernelError::internal_error(
-                                "Comparing nested types in get_indices",
-                            ));
-                        }
-                    }
-                    found_fields.insert(requested_field.name());
-                    mask_indices.push(parquet_offset + parquet_index);
-                }
-            }
-        } else {
-            // We're NOT selecting this field, but we still need to track how many leaf columns we
-            // skipped over
+        else {
+            // Track the skipped leaf columns; enumerate already counts the parent field.
             trace!("Skipping over un-selected field: {}", field.name());
-            // offset by number of inner fields. subtract one, because the enumerate still
-            // counts this logical "parent" field
             parquet_offset += count_cols(field).saturating_sub(1);
+            continue;
+        };
+        let requested_type = requested_field.data_type().physical_type();
+        // If the field is a variant, make sure the parquet schema matches the unshredded
+        // variant representation. This is to ensure that shredded reads are not
+        // performed.
+        if requested_type == &DataType::unshredded_variant() {
+            validate_parquet_variant(field)?;
+        }
+        match field.data_type() {
+            ArrowDataType::Struct(fields) => {
+                let (DataType::Struct(requested_schema)
+                | DataType::Variant(requested_schema)
+                | DataType::File(requested_schema)) = requested_type
+                else {
+                    return Err(KernelError::unexpected_column_type(field.name()));
+                };
+                let mask_before = mask_indices.len();
+                let (parquet_advance, children) = get_indices(
+                    parquet_index + parquet_offset,
+                    requested_schema.as_ref(),
+                    fields,
+                    mask_indices,
+                )?;
+                // advance the number of parquet fields, but subtract 1 because the
+                // struct will be counted by the `enumerate` call but doesn't count as
+                // an actual index. Use saturating_sub to handle empty structs (0 fields).
+                parquet_offset += parquet_advance.saturating_sub(1);
+                // If no leaf columns were selected (mask unchanged), the parquet
+                // reader will omit this struct entirely. We cannot create a Nested
+                // entry because it would index into a column that doesn't exist.
+                // The recursive call is still needed for the correct
+                // `parquet_advance` value.
+                found_fields.insert(requested_field.name());
+                if mask_indices.len() > mask_before {
+                    reorder_indices.push(ReorderIndex::nested(index, children));
+                } else {
+                    // The recursive call resolved all children (as nullable/missing
+                    // or the struct is empty), but no parquet leaves were selected.
+                    // Defer the Missing entry so it appears after all entries that
+                    // consume parquet input columns.
+                    debug_assert_eq!(children.len(), requested_schema.num_fields());
+                    deferred_missing.push(ReorderIndex::missing(
+                        index,
+                        Arc::new(requested_field.try_into_arrow()?),
+                    ));
+                }
+            }
+            ArrowDataType::List(list_field)
+            | ArrowDataType::LargeList(list_field)
+            | ArrowDataType::ListView(list_field)
+            | ArrowDataType::LargeListView(list_field) => {
+                // we just want to transparently recurse into lists, need to transform the
+                // kernel list data type into a schema
+                let DataType::Array(array_type) = requested_type else {
+                    return Err(KernelError::unexpected_column_type(list_field.name()));
+                };
+                let requested_schema = schema! {
+                    (StructField::new(
+                        list_field.name().clone(), // so we find it in the inner call
+                        array_type.element_type.clone(),
+                        array_type.contains_null,
+                    )),
+                };
+                let mask_before = mask_indices.len();
+                let (parquet_advance, mut children) = get_indices(
+                    parquet_index + parquet_offset,
+                    &requested_schema,
+                    &[list_field.clone()].into(),
+                    mask_indices,
+                )?;
+                // see comment above in struct match arm
+                parquet_offset += parquet_advance - 1;
+                found_fields.insert(requested_field.name());
+                if mask_indices.len() <= mask_before {
+                    // No leaves selected inside this list. Defer a Missing entry.
+                    deferred_missing.push(ReorderIndex::missing(
+                        index,
+                        Arc::new(requested_field.try_into_arrow()?),
+                    ));
+                } else if children.len() != 1 {
+                    return Err(KernelError::generic(
+                        "List call should not have generated more than one reorder index",
+                    ));
+                } else {
+                    // safety, checked that we have 1 element
+                    let mut child = children.swap_remove(0);
+                    if let ReorderIndexTransform::Cast(element_target) = &child.transform {
+                        // The recursive plan targets the element type, but this reorder
+                        // entry consumes the outer list column. Cast the complete list so
+                        // Arrow applies the element conversion recursively while retaining
+                        // the physical list wrapper at each nesting level.
+                        let target_field: ArrowField = requested_field.try_into_arrow()?;
+                        let ArrowDataType::List(target_element_field) = target_field.data_type()
+                        else {
+                            return Err(KernelError::internal_error(
+                                "Kernel array converted to a non-list Arrow type.",
+                            ));
+                        };
+                        let target_element_field = Arc::new(
+                            target_element_field
+                                .as_ref()
+                                .clone()
+                                .with_data_type(element_target.clone()),
+                        );
+                        let target =
+                            list_type_with_element(field.data_type(), target_element_field)?;
+                        child.transform = ReorderIndexTransform::Cast(target);
+                    }
+                    // the index is wrong, as it's the index from the inner schema.
+                    // Adjust it to be our index
+                    child.index = index;
+                    reorder_indices.push(child);
+                }
+            }
+            ArrowDataType::Map(key_val_field, _) => {
+                let (ArrowDataType::Struct(inner_fields), DataType::Map(map_type)) =
+                    (key_val_field.data_type(), requested_type)
+                else {
+                    return Err(KernelError::unexpected_column_type(field.name()));
+                };
+                let mut key_val_names = inner_fields.iter().map(|f| f.name().to_string());
+                let key_name = key_val_names
+                    .next()
+                    .ok_or_else(|| KernelError::generic("map fields didn't include a key col"))?;
+                let val_name = key_val_names
+                    .next()
+                    .ok_or_else(|| KernelError::generic("map fields didn't include a val col"))?;
+                if key_val_names.next().is_some() {
+                    return Err(KernelError::generic("map fields had more than 2 members"));
+                }
+                let inner_schema = map_type.as_struct_schema(key_name, val_name);
+                let mask_before = mask_indices.len();
+                let (parquet_advance, mut children) = get_indices(
+                    parquet_index + parquet_offset,
+                    &inner_schema,
+                    inner_fields,
+                    mask_indices,
+                )?;
+
+                // advance the number of parquet fields, but subtract 1 because the
+                // map will be counted by the `enumerate` call but doesn't count as
+                // an actual index.
+                parquet_offset += parquet_advance - 1;
+                found_fields.insert(requested_field.name());
+                if mask_indices.len() <= mask_before {
+                    // No leaves selected inside this map. Defer a Missing entry.
+                    deferred_missing.push(ReorderIndex::missing(
+                        index,
+                        Arc::new(requested_field.try_into_arrow()?),
+                    ));
+                } else if children.len() != 2 {
+                    return Err(KernelError::generic(
+                        "Map call should have generated exactly two reorder indices",
+                    ));
+                } else {
+                    // vec indexing is safe, we checked len above
+                    let mut num_identity_transforms = 0;
+                    if !children[0].needs_transform() {
+                        children[0] = ReorderIndex::identity(0);
+                        num_identity_transforms += 1;
+                    }
+                    if !children[1].needs_transform() {
+                        children[1] = ReorderIndex::identity(1);
+                        num_identity_transforms += 1;
+                    }
+                    let transform = match num_identity_transforms {
+                        2 => ReorderIndex::identity(index),
+                        _ => ReorderIndex::nested(index, children),
+                    };
+                    reorder_indices.push(transform);
+                }
+            }
+            _ => {
+                // We don't care about matching on nullability or metadata here. These can
+                // differ between the delta schema and the parquet schema without causing
+                // issues in reading the data. We fix them up in expression evaluation later.
+                match super::ensure_data_types::ensure_data_types(
+                    &requested_field.data_type,
+                    field.data_type(),
+                    super::ensure_data_types::ValidationMode::TypesAndNames,
+                )? {
+                    DataTypeCompat::Identical => {
+                        reorder_indices.push(ReorderIndex::identity(index))
+                    }
+                    DataTypeCompat::NeedsCast(target) => {
+                        reorder_indices.push(ReorderIndex::cast(index, target))
+                    }
+                    DataTypeCompat::Nested => {
+                        return Err(KernelError::internal_error(
+                            "Comparing nested types in get_indices",
+                        ));
+                    }
+                }
+                found_fields.insert(requested_field.name());
+                mask_indices.push(parquet_offset + parquet_index);
+            }
         }
     }
 
@@ -3674,11 +3661,11 @@ mod tests {
         StructArray::from(vec![
             (
                 Arc::new(ArrowField::new("b", ArrowDataType::Boolean, false)),
-                boolean.clone() as ArrowArrayRef,
+                boolean as ArrowArrayRef,
             ),
             (
                 Arc::new(ArrowField::new("c", ArrowDataType::Int32, false)),
-                int.clone() as ArrowArrayRef,
+                int as ArrowArrayRef,
             ),
         ])
     }
@@ -3752,11 +3739,11 @@ mod tests {
         let list_sa = StructArray::from(vec![
             (
                 Arc::new(ArrowField::new("b", ArrowDataType::Boolean, false)),
-                boolean.clone() as ArrowArrayRef,
+                boolean as ArrowArrayRef,
             ),
             (
                 Arc::new(ArrowField::new("c", ArrowDataType::Int32, false)),
-                int.clone() as ArrowArrayRef,
+                int as ArrowArrayRef,
             ),
         ]);
         let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 3, 6]));
@@ -4068,10 +4055,7 @@ mod tests {
                 ArrowField::new("NOTs", ArrowDataType::Utf8, true).with_metadata(arrow_fid(3));
             let noti2_field =
                 ArrowField::new("NOTi2", ArrowDataType::Int32, true).with_metadata(arrow_fid(4));
-            let parquet_schema = Arc::new(ArrowSchema::new(vec![
-                nots_field.clone(),
-                noti2_field.clone(),
-            ]));
+            let parquet_schema = Arc::new(ArrowSchema::new(vec![nots_field, noti2_field]));
             let (mask_indices, reorder_indices) =
                 get_requested_indices(&requested_schema, &parquet_schema).unwrap();
             let expect_mask: Vec<usize> = vec![];
@@ -4116,7 +4100,7 @@ mod tests {
             true,
         )]));
         let data = RecordBatch::try_new(
-            schema.clone(),
+            schema,
             vec![Arc::new(StringArray::from(vec!["string1", "string2"]))],
         )?;
         let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(data));
@@ -4138,7 +4122,7 @@ mod tests {
             true,
         )]));
         let record_batch = RecordBatch::try_new(
-            schema.clone(),
+            schema,
             vec![Arc::new(StringArray::from(vec![
                 "row0", "row1", "row2", "row3",
             ]))],
@@ -4262,7 +4246,7 @@ mod tests {
         // Write the batch to a parquet file and read it back
         let mut buffer = vec![];
         let mut writer =
-            crate::parquet::arrow::ArrowWriter::try_new(&mut buffer, schema.clone(), None).unwrap();
+            crate::parquet::arrow::ArrowWriter::try_new(&mut buffer, schema, None).unwrap();
         writer.write(&batch1).unwrap();
         writer.close().unwrap(); // writer must be closed to write footer
         let batch2 = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(buffer))

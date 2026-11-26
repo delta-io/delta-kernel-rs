@@ -512,32 +512,32 @@ impl<Mode> SnapshotBuilder<Mode> {
         // TODO(#3421): Move this Delta error classification into validate_catalog_managed_log_tail
         // when CommitRangeBuilder::build and its callers migrate to `Result`.
         validate_catalog_managed_log_tail(version, max_catalog_version, log_tail).map_err(|error| {
-            match error.without_backtrace() {
-                KernelError::LogTailVersionsNotContiguous {
-                    first_version,
-                    second_version,
-                } if first_version
-                    .checked_add(1)
-                    .is_some_and(|next| next < *second_version)
-                    && log_tail
-                        .windows(2)
-                        .all(|pair| pair[0].version < pair[1].version) =>
-                {
-                    match (log_tail.first(), log_tail.last()) {
-                        (Some(first), Some(last)) => {
-                            Error::Delta(DeltaError::versions_not_contiguous(
-                                log_tail.iter().map(|file| file.version),
-                                first.version,
-                                last.version,
-                                version.or(max_catalog_version).unwrap_or(last.version),
-                                Some(Box::new(error)),
-                            ))
-                        }
-                        _ => Error::Kernel(error),
-                    }
-                }
-                _ => Error::Kernel(error),
+            let KernelError::LogTailVersionsNotContiguous {
+                first_version,
+                second_version,
+            } = error.without_backtrace()
+            else {
+                return Error::Kernel(error);
+            };
+            if !first_version
+                .checked_add(1)
+                .is_some_and(|next| next < *second_version)
+                || !log_tail
+                    .windows(2)
+                    .all(|pair| pair[0].version < pair[1].version)
+            {
+                return Error::Kernel(error);
             }
+            let (Some(first), Some(last)) = (log_tail.first(), log_tail.last()) else {
+                return Error::Kernel(error);
+            };
+            Error::Delta(DeltaError::versions_not_contiguous(
+                log_tail.iter().map(|file| file.version),
+                first.version,
+                last.version,
+                version.or(max_catalog_version).unwrap_or(last.version),
+                Some(Box::new(error)),
+            ))
         })
     }
 
@@ -598,8 +598,7 @@ impl<Mode> SnapshotBuilder<Mode> {
         }
 
         self.version
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "LATEST".into())
+            .map_or_else(|| "LATEST".into(), |v| v.to_string())
     }
 }
 

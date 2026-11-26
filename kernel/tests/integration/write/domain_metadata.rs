@@ -117,7 +117,7 @@ async fn test_set_domain_metadata_errors() -> Result<(), Box<dyn std::error::Err
     )
     .await?;
 
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
 
     // System domain rejection
     let txn = begin_transaction(snapshot.clone(), &engine)?;
@@ -130,7 +130,7 @@ async fn test_set_domain_metadata_errors() -> Result<(), Box<dyn std::error::Err
     );
 
     // Duplicate domain rejection
-    let txn2 = begin_transaction(snapshot.clone(), &engine)?;
+    let txn2 = begin_transaction(snapshot, &engine)?;
     let res = txn2
         .with_domain_metadata("app.config".to_string(), "v1".to_string())
         .with_domain_metadata("app.config".to_string(), "v2".to_string())
@@ -165,7 +165,7 @@ async fn test_set_domain_metadata_unsupported_writer_feature()
     )
     .await?;
 
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
     let res = begin_transaction(snapshot, &engine)?
         .with_domain_metadata("app.config".to_string(), "test_config".to_string())
         .commit(&engine);
@@ -200,7 +200,7 @@ async fn test_remove_domain_metadata_unsupported_writer_feature()
     )
     .await?;
 
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
     let res = begin_transaction_with(
         snapshot,
         &engine,
@@ -293,7 +293,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
     )
     .await?;
 
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
 
     // set then remove same domain
     let err = snapshot
@@ -333,7 +333,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
 
     // remove system domain
     let err = begin_transaction_with(
-        snapshot.clone(),
+        snapshot,
         &engine,
         UpdateTableOperation::Write,
         "test-engine",

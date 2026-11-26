@@ -1286,12 +1286,8 @@ mod tests {
     #[test]
     fn test_basic_builder_creation() {
         let schema = test_schema();
-        let builder = CreateTableTransactionBuilder::new(
-            "/path/to/table",
-            schema.clone(),
-            "TestApp/1.0",
-            true,
-        );
+        let builder =
+            CreateTableTransactionBuilder::new("/path/to/table", schema, "TestApp/1.0", true);
 
         assert_eq!(builder.local_state.path, "/path/to/table");
         assert_eq!(builder.common_state.engine_info, "TestApp/1.0");
@@ -1471,7 +1467,7 @@ mod tests {
         let schema = test_schema();
         let builder = CreateTableTransactionBuilder::new(
             "/path/to/table/nested",
-            schema.clone(),
+            schema,
             "TestApp/1.0",
             true,
         );

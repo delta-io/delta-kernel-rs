@@ -1,0 +1,4 @@
+matches-for-let-else = "AllTypes"
+avoid-breaking-exported-api = true
+excessive-nesting-threshold = 5
+absolute-paths-max-segments = 1

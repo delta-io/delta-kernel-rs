@@ -443,9 +443,8 @@ async fn missing_commit_file_surfaces_error_during_iteration()
     let item = stream
         .next()
         .expect("stream should yield an error item before exhausting");
-    let err = match item {
-        Ok(_) => panic!("expected FileNotFound from the stream, got an Ok batch"),
-        Err(e) => e,
+    let Err(err) = item else {
+        panic!("expected FileNotFound from the stream, got an Ok batch")
     };
     assert!(
         matches!(err, delta_kernel::KernelError::FileNotFound(_)),
@@ -1643,7 +1642,7 @@ async fn incremental_scan_from_cached_snapshot_matches_full_scan_with_timezone(
             .iter()
             .map(|file| file.path().to_string()),
     );
-    let expected: HashSet<_> = expected_paths.iter().map(|path| path.to_string()).collect();
+    let expected: HashSet<_> = expected_paths.iter().map(ToString::to_string).collect();
     assert_eq!(base_file_list, expected);
     assert_eq!(base_file_list, target_file_list);
     Ok(())

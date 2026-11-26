@@ -53,9 +53,7 @@ fn get_default_table_config(table_root: &url::Url) -> TableConfiguration {
 
 /// Helper to create a Metadata action with the given schema and configuration
 fn metadata_action(schema: SchemaRef, configuration: HashMap<String, String>) -> Action {
-    Action::Metadata(
-        Metadata::try_new(None, None, schema.clone(), vec![], 0, configuration).unwrap(),
-    )
+    Action::Metadata(Metadata::try_new(None, None, schema, vec![], 0, configuration).unwrap())
 }
 
 /// Helper to create a Metadata action with row tracking enabled

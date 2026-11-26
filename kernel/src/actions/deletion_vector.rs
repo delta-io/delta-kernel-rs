@@ -571,9 +571,9 @@ impl DeletionVectorDescriptor {
                 let dv_data = storage
                     .read_files(vec![(path.clone(), None)])?
                     .next()
-                    .ok_or(KernelError::missing_data(format!(
-                        "No deletion vector data for {path}"
-                    )))??;
+                    .ok_or_else(|| {
+                        KernelError::missing_data(format!("No deletion vector data for {path}"))
+                    })??;
                 let dv_data_len = dv_data.len();
 
                 self.validate_framing(&dv_data, &path)?;
@@ -1746,7 +1746,7 @@ mod tests {
         let prefix = String::from("deletion_vectors");
 
         let dv_path1 = DeletionVectorPath::new(table_path.clone(), prefix.clone());
-        let dv_path2 = DeletionVectorPath::new(table_path.clone(), prefix.clone());
+        let dv_path2 = DeletionVectorPath::new(table_path, prefix);
 
         let abs_path1 = dv_path1.absolute_path().unwrap();
         let abs_path2 = dv_path2.absolute_path().unwrap();
@@ -1766,7 +1766,7 @@ mod tests {
         let prefix = String::from("dv");
         let known_uuid = uuid::Uuid::parse_str("abcdef01-2345-6789-abcd-ef0123456789").unwrap();
 
-        let dv_path = DeletionVectorPath::new_with_uuid(table_path.clone(), prefix, known_uuid);
+        let dv_path = DeletionVectorPath::new_with_uuid(table_path, prefix, known_uuid);
         let abs_path = dv_path.absolute_path().unwrap();
 
         // Verify the exact path with known UUID

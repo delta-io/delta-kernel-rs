@@ -136,7 +136,7 @@ impl ColumnName {
 /// contain arbitrary characters (including periods, spaces, etc.).
 impl<A: Into<String>> FromIterator<A> for ColumnName {
     fn from_iter<T: IntoIterator<Item = A>>(iter: T) -> Self {
-        let path = iter.into_iter().map(|s| s.into()).collect();
+        let path = iter.into_iter().map(Into::into).collect();
         Self { path }
     }
 }
