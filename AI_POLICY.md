@@ -44,6 +44,11 @@ Automated bots or agents that post AI-generated content without human review are
 
 ### Disclosures
 
+The CI reviewer sends PR titles, descriptions and code diffs to a large language model service.
+It posts automated suggestions as inline review comments or PR Conversation comments. These
+suggestions do not replace human review. See the [reviewer workflow](.github/omnigent/reviewer/README.md)
+for the comment format and the steps that produce it.
+
 AI tools were used to refine early drafts of this policy, and the final content was edited, reviewed, and approved by human maintainers.
 
 ### Sources
