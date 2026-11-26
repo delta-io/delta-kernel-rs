@@ -996,12 +996,12 @@ struct TimestampFormats {
 /// from the query value before comparing it to the max stat so it doesn't skip the wrong files.
 ///
 /// The Delta protocol does not specify how a timestamp stat is rendered, only that it is truncated
-/// to milliseconds. It recommends UTC ISO 8601 only for partition values, and writers differ:
-/// some print the session time zone's offset (e.g. `-08:00`), others print no offset.
+/// to milliseconds. Writers may print an offset, a `Z` suffix or no timezone at all. Not printing a
+/// timezone is highly discouraged, as parsing may depend on the session local timezone.
 ///
-/// We emit a literal `Z` (as for partition values) rather than `%:z`, which would spell `+00:00`.
-/// Hardcoding it is correct because the values are formatted in UTC: `arrow_conversion` accepts
-/// a timezone-annotated array only when the annotation is UTC.
+/// We emit a literal `Z` rather than `%:z`, which would spell `+00:00`. Hardcoding it is correct
+/// because the values are formatted in UTC: `arrow_conversion` accepts a timezone-annotated array
+/// only when the annotation is UTC.
 const STATS_TIMESTAMP_MILLIS_FORMATS: TimestampFormats = TimestampFormats {
     ntz: "%Y-%m-%dT%H:%M:%S%.3f",
     tz: "%Y-%m-%dT%H:%M:%S%.3fZ",
