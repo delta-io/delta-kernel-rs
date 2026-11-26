@@ -30,7 +30,7 @@ async fn json_only_table() -> KernelResult<(Arc<InMemory>, &'static str)> {
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string(vec![
+        actions_to_string([
             TestAction::Metadata,
             TestAction::AddWithSize(PARQUET_FILE1.to_string(), file_size),
         ]),

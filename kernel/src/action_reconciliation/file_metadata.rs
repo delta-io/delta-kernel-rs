@@ -201,10 +201,11 @@ pub(crate) fn build_checkpoint_read_schema(
 ///
 /// Column paths are relative to the full batch, not the nested Add struct.
 fn build_stats_parsed_expr(stats_schema: &SchemaRef) -> ExpressionRef {
-    Arc::new(Expression::coalesce([
+    let stats_expression = Expression::coalesce([
         col!(ADD_NAME, STATS_PARSED_FIELD),
         Expression::parse_json(col!(ADD_NAME, STATS_FIELD), stats_schema.clone()),
-    ]))
+    ]);
+    Arc::new(stats_expression)
 }
 
 /// Builds expression: `partitionValues_parsed = COALESCE(partitionValues_parsed,

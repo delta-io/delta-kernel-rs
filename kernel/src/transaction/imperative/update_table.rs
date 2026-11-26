@@ -542,71 +542,71 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
                 self.new_entries.push(DvUpdateEntry::null());
                 continue;
             };
-            if let Some(dv_result) = self.dv_updates.get(&path) {
-                // DVs require an accurate numRecords stat per the Delta protocol.
-                let stats: Option<String> =
-                    getters[Self::STATS_INDEX].get_opt(row_index, "stats")?;
-                let stats = stats.ok_or_else(|| {
-                    KernelError::generic(format!(
-                        "update_deletion_vectors: file {path} has no stats; \
-                         deletion vectors require an accurate {NUM_RECORDS}"
-                    ))
-                })?;
-                let mut parsed: serde_json::Value = serde_json::from_str(&stats).map_err(|e| {
-                    KernelError::generic(format!(
-                        "update_deletion_vectors: stats for {path} is not valid JSON: {e}"
-                    ))
-                })?;
-                let stats_obj = parsed.as_object_mut().ok_or_else(|| {
-                    KernelError::generic(format!(
-                        "update_deletion_vectors: stats for {path} is not a JSON object"
-                    ))
-                })?;
-                if stats_obj
-                    .get(NUM_RECORDS)
-                    .and_then(serde_json::Value::as_u64)
-                    .is_none()
-                {
-                    return Err(KernelError::generic(format!(
-                        "update_deletion_vectors: stats for {path} is missing {NUM_RECORDS} \
-                         or it is not a non-negative integer"
-                    )));
-                }
-
-                // Widen tightBounds to false (unless already false) instead of recomputing the
-                // stats.
-                let already_wide = stats_obj
-                    .get(TIGHT_BOUNDS)
-                    .and_then(serde_json::Value::as_bool)
-                    == Some(false);
-                let new_stats = if already_wide {
-                    stats
-                } else {
-                    stats_obj.insert(TIGHT_BOUNDS.to_string(), serde_json::Value::Bool(false));
-                    serde_json::to_string(&parsed).map_err(|e| {
-                        KernelError::generic(format!(
-                            "update_deletion_vectors: failed to re-serialize stats for {path}: {e}"
-                        ))
-                    })?
-                };
-                let deletion_vector = Scalar::Struct(StructData::try_new(
-                    DeletionVectorDescriptor::schema_ref().clone(),
-                    vec![
-                        Scalar::from(dv_result.storage_type.to_string()),
-                        Scalar::from(dv_result.path_or_inline_dv.clone()),
-                        Scalar::from(dv_result.offset),
-                        Scalar::from(dv_result.size_in_bytes),
-                        Scalar::from(dv_result.cardinality),
-                    ],
-                )?);
-                self.new_entries.push(DvUpdateEntry {
-                    deletion_vector,
-                    stats: Scalar::from(new_stats),
-                });
-                self.matched_file_indexes.push(row_index);
-            } else {
+            let Some(dv_result) = self.dv_updates.get(&path) else {
                 self.new_entries.push(DvUpdateEntry::null());
+                continue;
+            };
+            // DVs require an accurate numRecords stat per the Delta protocol.
+            let stats: Option<String> = getters[Self::STATS_INDEX].get_opt(row_index, "stats")?;
+            let stats = stats.ok_or_else(|| {
+                KernelError::generic(format!(
+                    "update_deletion_vectors: file {path} has no stats; \
+                     deletion vectors require an accurate {NUM_RECORDS}"
+                ))
+            })?;
+            let mut parsed: serde_json::Value = serde_json::from_str(&stats).map_err(|e| {
+                KernelError::generic(format!(
+                    "update_deletion_vectors: stats for {path} is not valid JSON: {e}"
+                ))
+            })?;
+            let stats_obj = parsed.as_object_mut().ok_or_else(|| {
+                KernelError::generic(format!(
+                    "update_deletion_vectors: stats for {path} is not a JSON object"
+                ))
+            })?;
+            if stats_obj
+                .get(NUM_RECORDS)
+                .and_then(serde_json::Value::as_u64)
+                .is_none()
+            {
+                return Err(KernelError::generic(format!(
+                    "update_deletion_vectors: stats for {path} is missing {NUM_RECORDS} \
+                     or it is not a non-negative integer"
+                )));
             }
+
+            // Widen tightBounds to false (unless already false) instead of recomputing the
+            // stats.
+            let already_wide = stats_obj
+                .get(TIGHT_BOUNDS)
+                .and_then(serde_json::Value::as_bool)
+                == Some(false);
+            let new_stats = if already_wide {
+                stats
+            } else {
+                stats_obj.insert(TIGHT_BOUNDS.to_string(), serde_json::Value::Bool(false));
+                serde_json::to_string(&parsed).map_err(|e| {
+                    KernelError::generic(format!(
+                        "update_deletion_vectors: failed to re-serialize stats for {path}: {e}"
+                    ))
+                })?
+            };
+            let deletion_vector_data = StructData::try_new(
+                DeletionVectorDescriptor::schema_ref().clone(),
+                vec![
+                    Scalar::from(dv_result.storage_type.to_string()),
+                    Scalar::from(dv_result.path_or_inline_dv.clone()),
+                    Scalar::from(dv_result.offset),
+                    Scalar::from(dv_result.size_in_bytes),
+                    Scalar::from(dv_result.cardinality),
+                ],
+            )?;
+            let deletion_vector = Scalar::Struct(deletion_vector_data);
+            self.new_entries.push(DvUpdateEntry {
+                deletion_vector,
+                stats: Scalar::from(new_stats),
+            });
+            self.matched_file_indexes.push(row_index);
         }
         // Pad with trailing null entries for any deselected rows at the end.
         self.new_entries.resize_with(num_rows, DvUpdateEntry::null);

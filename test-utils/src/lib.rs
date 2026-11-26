@@ -355,23 +355,26 @@ pub enum TestAction {
 
 // TODO: We need a better way to mock tables :)
 
-/// Convert a vector of actions into a newline delimited json string, with standard metadata
-pub fn actions_to_string(actions: Vec<TestAction>) -> String {
+/// Serializes actions in iteration order as newline-delimited JSON, with standard metadata.
+pub fn actions_to_string(actions: impl IntoIterator<Item = TestAction>) -> String {
     actions_to_string_with_metadata(actions, METADATA)
 }
 
-/// Convert a vector of actions into a newline delimited json string, with catalog-managed metadata
-pub fn actions_to_string_catalog_managed(actions: Vec<TestAction>) -> String {
+/// Serializes actions in iteration order as newline-delimited JSON, with catalog-managed metadata.
+pub fn actions_to_string_catalog_managed(actions: impl IntoIterator<Item = TestAction>) -> String {
     actions_to_string_with_metadata(actions, CATALOG_MANAGED_METADATA)
 }
 
-/// Convert a vector of actions into a newline delimited json string, with metadata including a
-/// partition column
-pub fn actions_to_string_partitioned(actions: Vec<TestAction>) -> String {
+/// Serializes actions in iteration order as newline-delimited JSON, with partition-column metadata.
+pub fn actions_to_string_partitioned(actions: impl IntoIterator<Item = TestAction>) -> String {
     actions_to_string_with_metadata(actions, METADATA_WITH_PARTITION_COLS)
 }
 
-pub fn actions_to_string_with_metadata(actions: Vec<TestAction>, metadata: &str) -> String {
+/// Serializes actions in iteration order as newline-delimited JSON, using the supplied metadata.
+pub fn actions_to_string_with_metadata(
+    actions: impl IntoIterator<Item = TestAction>,
+    metadata: &str,
+) -> String {
     actions
         .into_iter()
         .map(|test_action| match test_action {
@@ -2060,16 +2063,17 @@ pub fn read_add_infos(snapshot: &Snapshot, engine: &impl Engine) -> KernelResult
             .and_then(|c| c.as_any().downcast_ref::<StringArray>());
         let len = add_struct.len();
         for i in 0..len {
-            if let Some(path) = path_arr.and_then(|a| (!a.is_null(i)).then(|| a.value(i))) {
-                let stats = stats_arr
-                    .and_then(|a| (!a.is_null(i)).then(|| a.value(i)))
-                    .map(serde_json::from_str)
-                    .transpose()?;
-                actions.push(AddInfo {
-                    path: path.to_string(),
-                    stats,
-                });
-            }
+            let Some(path) = path_arr.and_then(|a| (!a.is_null(i)).then(|| a.value(i))) else {
+                continue;
+            };
+            let stats = stats_arr
+                .and_then(|a| (!a.is_null(i)).then(|| a.value(i)))
+                .map(serde_json::from_str)
+                .transpose()?;
+            actions.push(AddInfo {
+                path: path.to_string(),
+                stats,
+            });
         }
     }
     Ok(actions)
