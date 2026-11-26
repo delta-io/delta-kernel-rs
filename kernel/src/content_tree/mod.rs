@@ -8,8 +8,9 @@ mod action_projector;
 mod builder;
 mod checkpoint_action_stream;
 mod checkpoint_sidecar;
+mod conditions;
 mod dv_conversion;
-mod mumbling;
+pub(crate) mod mumbling;
 mod reader;
 pub(crate) mod stats;
 #[cfg(test)]
@@ -467,10 +468,13 @@ impl TrackingStatus {
         }
     }
 
-    /// Whether this entry contributes rows to reads. Live entries (`Existing`, `Added`,
-    /// `Modified`) are surfaced as `Add` actions; not-live entries (`Deleted`, `Replaced`) are not.
+    /// The statuses of entries that contribute rows to reads, surfaced as `Add` actions. Other
+    /// statuses do not.
+    pub(crate) const LIVE: [Self; 3] = [Self::Existing, Self::Added, Self::Modified];
+
+    /// Whether this entry contributes rows to reads; see [`Self::LIVE`].
     pub(crate) fn is_live(self) -> bool {
-        self == Self::Existing || self == Self::Added || self == Self::Modified
+        Self::LIVE.contains(&self)
     }
 }
 
