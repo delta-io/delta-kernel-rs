@@ -996,10 +996,10 @@ struct TimestampFormats {
 /// from the query value before comparing it to the max stat so it doesn't skip the wrong files.
 ///
 /// The `Z` is literal rather than `%:z`, which spells a zero offset `+00:00`. Both are valid ISO
-/// 8601, but every Delta writer emits `Z` (including this crate's own partition-value
-/// serialization), so matching it keeps stats parseable by readers that accept only that form.
-/// Hardcoding it is safe because a Delta `TIMESTAMP` stat is always UTC: `arrow_conversion` accepts
-/// a timezone-annotated array only when the annotation is UTC.
+/// 8601, and writers differ: Spark-based writers print the session time zone's offset, which is
+/// not always zero. `Z` matches this crate's own partition-value serialization. Hardcoding it is
+/// correct only because the values are formatted in UTC: `arrow_conversion` accepts a
+/// timezone-annotated array only when the annotation is UTC.
 const STATS_TIMESTAMP_MILLIS_FORMATS: TimestampFormats = TimestampFormats {
     ntz: "%Y-%m-%dT%H:%M:%S%.3f",
     tz: "%Y-%m-%dT%H:%M:%S%.3fZ",
@@ -2781,9 +2781,8 @@ mod tests {
         );
     }
 
-    /// A Delta `TIMESTAMP` stat is always UTC, so every spelling of the UTC annotation must render
-    /// the same literal `Z` form rather than a numeric offset a strict reader would reject. Nested
-    /// too, since arrow applies the format per array at any depth.
+    /// Every spelling of the UTC annotation must render the same literal `Z` form rather than a
+    /// numeric offset. Nested too, since arrow applies the format per array at any depth.
     #[rstest]
     fn test_to_json_renders_utc_timestamps_with_a_z_suffix(
         #[values("UTC", "Etc/UTC", "+00:00")] timezone: &str,
