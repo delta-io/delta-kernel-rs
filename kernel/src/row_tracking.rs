@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use crate::actions::{DomainMetadata, NUM_RECORDS};
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, column_name};
+#[cfg(feature = "declarative-plans")]
+use crate::schema::{SchemaRef, lazy_schema_ref};
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
 
@@ -18,6 +20,16 @@ pub struct RowTrackingDomainMetadata {
     // NB: The Delta spec does not rule out negative high water marks
     row_id_high_water_mark: i64,
 }
+
+/// The JSON key of the high-water mark in a serialized [`RowTrackingDomainMetadata`].
+#[cfg(feature = "declarative-plans")]
+pub(crate) const ROW_ID_HIGH_WATER_MARK_FIELD: &str = "rowIdHighWaterMark";
+
+/// The `parse_json` schema of a `delta.rowTracking` domain configuration.
+#[cfg(feature = "declarative-plans")]
+pub(crate) static ROW_TRACKING_CONFIGURATION_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    nullable (ROW_ID_HIGH_WATER_MARK_FIELD): LONG,
+};
 
 /// The domain name for row tracking metadata.
 pub(crate) const ROW_TRACKING_DOMAIN_NAME: &str = "delta.rowTracking";
