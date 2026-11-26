@@ -1,7 +1,7 @@
 <!--
 Prepare human and AI reviewers: explain why the change exists, what behavior changes, how data
 moves through the affected components, the relevant design decisions, and what was verified.
-Full guide with examples, for authors and agents: AGENTS/pr_description.md.
+Authoring guide and links to examples: AGENTS/pr_description.md.
 Sections marked optional can be deleted; the others are required.
 -->
 
