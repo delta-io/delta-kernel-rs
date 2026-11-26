@@ -32,7 +32,8 @@ pub use file_size_histogram::FileSizeHistogram;
 pub use file_stats::FileStats;
 #[allow(unused)]
 pub(crate) use file_stats::{
-    FileStatsDelta, FileStatsPolicy, is_incremental_safe_operation, size_to_u64,
+    FileStatsDelta, FileStatsPolicy, is_incremental_safe_operation,
+    rewrites_files_without_data_change, size_to_u64,
 };
 pub(crate) use reader::read_crc_file_or_none;
 #[cfg(test)]

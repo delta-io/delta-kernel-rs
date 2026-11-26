@@ -7,10 +7,11 @@ use std::sync::Arc;
 use delta_kernel::arrow::array::{Int32Array, RecordBatch};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
+use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::schema::schema_ref;
-use delta_kernel::transaction::CommitResult;
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
+use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
 use delta_kernel::{KernelError, Snapshot};
 use tempfile::tempdir;
 use test_utils::{
@@ -83,6 +84,72 @@ async fn test_post_commit_snapshot_create_then_insert() -> delta_kernel::Result<
         }
     }
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_post_commit_snapshot_does_not_count_stats_only_readd_twice()
+-> delta_kernel::Result<()> {
+    let temp_dir = tempdir().unwrap();
+    let table_url = Url::from_directory_path(temp_dir.path()).unwrap();
+    let engine = create_default_engine(&table_url)?;
+    let schema = get_simple_int_schema();
+    let created = match create_table_txn(
+        table_url.as_str(),
+        schema.clone(),
+        env!("CARGO_PKG_VERSION"),
+        true,
+    )
+    .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+    .commit(engine.as_ref())?
+    {
+        CommitResult::Committed(committed) => committed.post_commit_snapshot().unwrap().clone(),
+        _ => panic!("Create should succeed"),
+    };
+
+    let mut write = begin_transaction_with(
+        created,
+        engine.as_ref(),
+        UpdateTableOperation::Write,
+        "test",
+        true,
+        |builder| builder,
+    )?;
+    write.ack_column_defaults();
+    let write_context = write.write_state()?.write_context_builder().build()?;
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.as_ref().try_into_arrow().unwrap()),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .unwrap();
+    let add_metadata: RecordBatch = ArrowEngineData::try_from_engine_data(
+        engine
+            .write_parquet(&ArrowEngineData::new(batch), &write_context)
+            .await?,
+    )?
+    .into();
+    write.add_files(Box::new(ArrowEngineData::new(add_metadata.clone())));
+    let written = match write.commit(engine.as_ref())? {
+        CommitResult::Committed(committed) => committed.post_commit_snapshot().unwrap().clone(),
+        _ => panic!("Write should succeed"),
+    };
+    assert_eq!(written.get_file_stats_if_present().unwrap().num_files(), 1);
+
+    let mut readd = begin_transaction_with(
+        written,
+        engine.as_ref(),
+        UpdateTableOperation::Write,
+        "test",
+        false,
+        |builder| builder,
+    )?;
+    readd.ack_column_defaults();
+    readd.add_files(Box::new(ArrowEngineData::new(add_metadata)));
+    let readded = match readd.commit(engine.as_ref())? {
+        CommitResult::Committed(committed) => committed.post_commit_snapshot().unwrap().clone(),
+        _ => panic!("Re-add should succeed"),
+    };
+    assert_eq!(readded.get_file_stats_if_present(), None);
     Ok(())
 }
 

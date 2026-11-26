@@ -11,7 +11,7 @@ use crate::actions::{
     Protocol, SetTransaction, TIGHT_BOUNDS,
 };
 use crate::committer::{CommitMetadata, CommitProtocolMetadata, CommitType, Committer};
-use crate::crc::{CrcDelta, FileStatsDelta};
+use crate::crc::{CrcDelta, FileStatsDelta, rewrites_files_without_data_change};
 use crate::error::KernelError;
 use crate::expressions::ColumnName;
 use crate::log_segment::LogSegment;
@@ -1413,10 +1413,15 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         // enforces presence: `try_compute_for_txn` above errors with `MissingData` if any
         // add or remove row lacks `size` (see `FileStatsVisitor::visit` in
         // `kernel/src/crc/file_stats.rs`). So at this point every size is known to be
-        // present, and only operation classification can flip `is_incremental_safe`.
+        // present, and only operation classification and `dataChange=false` adds can flip
+        // `is_incremental_safe`.
         // TODO(#3714): Preserve incremental file stats for commits without add/remove actions,
         // matching replay's safety rule.
-        let is_incremental_safe = self.operation.is_incremental_safe();
+        let is_operation_safe = self.operation.is_incremental_safe();
+        let adds_may_refresh_existing_files = !self.data_change
+            && file_stats.gross_add_files > 0
+            && !rewrites_files_without_data_change(self.operation.as_str());
+        let is_incremental_safe = is_operation_safe && !adds_may_refresh_existing_files;
         Ok(CrcDelta {
             file_stats,
             protocol: self
@@ -1431,7 +1436,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
             #[cfg(feature = "adaptive-metadata-in-dev")]
             last_manifest_commit: commit_info.last_manifest_commit,
             is_incremental_safe,
-            unsupported_operation: (!is_incremental_safe)
+            unsupported_operation: (!is_operation_safe)
                 .then(|| self.operation.as_str().to_string()),
         })
     }

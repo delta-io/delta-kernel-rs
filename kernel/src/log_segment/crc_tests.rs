@@ -193,6 +193,12 @@ fn add(path: &str, size: i64) -> serde_json::Value {
     }})
 }
 
+fn add_without_data_change(path: &str, size: i64) -> serde_json::Value {
+    let mut action = add(path, size);
+    action["add"]["dataChange"] = json!(false);
+    action
+}
+
 fn remove(path: &str, size: Option<i64>) -> serde_json::Value {
     let mut obj = json!({"remove": {
         "path": path,
@@ -1360,6 +1366,8 @@ async fn test_adds_and_removes_accumulate() {
 #[case::remove_no_size(vec![commit_info("WRITE", None), remove("orphan", None)])]
 #[case::add_with_unsafe_op(vec![commit_info("ANALYZE STATS", None), add("a", 100)])]
 #[case::add_with_no_commit_info(vec![add("a", 100)])]
+#[case::write_without_data_change(vec![commit_info("WRITE", None), add_without_data_change("a", 100)])]
+#[case::merge_without_data_change(vec![commit_info("MERGE", None), add_without_data_change("a", 100)])]
 #[tokio::test]
 async fn test_trips_indeterminate(#[case] v1_actions: Vec<Value>) {
     // Base carries DM + txn entries so we can verify the indeterminate trip is scoped
@@ -1383,6 +1391,65 @@ async fn test_trips_indeterminate(#[case] v1_actions: Vec<Value>) {
     assert_eq!(
         crc.set_transaction_state.expect_complete()["app"].version,
         5
+    );
+}
+
+#[rstest]
+#[case::optimize("OPTIMIZE")]
+#[case::reorg("REORG")]
+#[case::recompression("RECOMPRESSION")]
+#[tokio::test]
+async fn test_rewrite_without_data_change_counts_new_files(#[case] operation: &str) {
+    let crc = CrcReadTest::new()
+        .commit(0, create_table_actions())
+        .commit(1, [commit_info("WRITE", None), add("a", 100)])
+        .commit(
+            2,
+            [
+                commit_info(operation, None),
+                remove("a", Some(100)),
+                add_without_data_change("b", 300),
+            ],
+        )
+        .build()
+        .await
+        .incrementally_build_crc(&crc_complete_empty_dm_set_txn())
+        .unwrap();
+    let stats = crc.file_stats().unwrap();
+    assert_eq!(stats.num_files(), 1);
+    assert_eq!(stats.table_size_bytes(), 300);
+}
+
+#[rstest]
+#[case::full_history(None)]
+#[case::from_crc(Some(1))]
+#[tokio::test]
+async fn test_write_checksum_declines_after_stats_only_readd(#[case] crc_at: Option<u64>) {
+    let mut test = CrcReadTest::new()
+        .commit(0, create_table_actions())
+        .commit(1, [commit_info("WRITE", None), add("a", 100)]);
+    if let Some(version) = crc_at {
+        test = test.crc_with_files(version, protocol_a(), metadata_a(), None, &[100]);
+    }
+    let built = test
+        .commit(
+            2,
+            [
+                commit_info("WRITE", None),
+                add_without_data_change("a", 100),
+            ],
+        )
+        .build()
+        .await;
+    let snapshot = built.snapshot_latest_with_replay(IncrementalReplay::Unlimited);
+    let result = snapshot.write_checksum(&built.engine);
+    assert!(
+        matches!(
+            &result,
+            Err(crate::Error::Kernel(error))
+                if matches!(error.without_backtrace(), KernelError::ChecksumWriteUnsupported(_))
+        ),
+        "{result:?}"
     );
 }
 

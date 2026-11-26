@@ -29,7 +29,7 @@ use crate::actions::{
 use crate::actions::{LAST_MANIFEST_COMMIT_FIELD, LastManifestCommit};
 use crate::crc::{
     Crc, CrcDelta, FileSizeHistogram, FileStatsDelta, FileStatsPolicy, read_crc_file_or_none,
-    size_to_u64,
+    rewrites_files_without_data_change, size_to_u64,
 };
 use crate::engine_data::{GetData, TypedGetData as _};
 use crate::metrics::ProtocolMetadataSource;
@@ -43,9 +43,11 @@ use crate::utils::require;
 use crate::{Engine, FileMeta, KernelError, KernelResult, RowVisitor, Version};
 
 static REPLAY_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
-    // size is the only Add leaf the visitor reads, and it is required, so its presence marks
-    // an Add row.
-    nullable ADD_NAME: { not_null "size": LONG },
+    // size is required, so its presence marks an Add row.
+    nullable ADD_NAME: {
+        not_null "size": LONG,
+        nullable "dataChange": BOOLEAN,
+    },
     // remove.size is optional, so we read remove.path (required) to know a row is a Remove
     // before reading its size.
     nullable REMOVE_NAME: {
@@ -335,6 +337,10 @@ struct CrcReplayAccumulator {
     /// `current_commit_operation` for the per-commit invariant check.
     current_commit_saw_file_action: bool,
 
+    /// True if the current commit had an add with `dataChange=false`, which a data write may
+    /// use to refresh an existing file's metadata rather than add a new file.
+    current_commit_saw_add_without_data_change: bool,
+
     // Aggregate adds and removes separately until commitInfo is known. It may follow file
     // actions, including in a later batch.
     // None marks invalid file statistics for the current commit.
@@ -368,6 +374,7 @@ impl CrcReplayAccumulator {
             is_first_commit: true,
             current_file_url: None,
             current_commit_saw_file_action: false,
+            current_commit_saw_add_without_data_change: false,
             current_commit_operation: None,
             current_commit_saw_commit_info: false,
         }
@@ -398,12 +405,18 @@ impl CrcReplayAccumulator {
             None if self.current_file_url.is_none() => FileStatsPolicy::ApplyAll,
             None => FileStatsPolicy::Unsupported,
         };
+        let adds_may_refresh_existing_files = policy == FileStatsPolicy::ApplyAll
+            && self.current_commit_saw_add_without_data_change
+            && !self
+                .current_commit_operation
+                .as_deref()
+                .is_some_and(rewrites_files_without_data_change);
+        let adds = self
+            .current_commit_adds
+            .as_ref()
+            .filter(|_| !adds_may_refresh_existing_files);
         let fs = &mut self.delta.file_stats;
-        match (
-            policy,
-            self.current_commit_adds.as_ref(),
-            self.current_commit_removes.as_ref(),
-        ) {
+        match (policy, adds, self.current_commit_removes.as_ref()) {
             (FileStatsPolicy::ApplyAll, Some(adds), Some(removes)) => {
                 fs.accumulate(adds);
                 fs.accumulate(removes);
@@ -439,6 +452,7 @@ impl CrcReplayAccumulator {
                 .clear();
         }
         self.current_commit_saw_file_action = false;
+        self.current_commit_saw_add_without_data_change = false;
         self.current_commit_operation = None;
     }
 
@@ -471,6 +485,13 @@ impl CrcReplayAccumulator {
             {
                 self.delta.last_manifest_commit = last_manifest_commit;
             }
+        }
+    }
+
+    /// Records whether an add row in the current commit has `dataChange=false`.
+    fn on_add_data_change(&mut self, data_change: Option<bool>) {
+        if data_change == Some(false) {
+            self.current_commit_saw_add_without_data_change = true;
         }
     }
 
@@ -668,15 +689,16 @@ const COL_OP: usize = 1;
 const COL_ICT: usize = 2;
 const COL_REMOVE_PATH: usize = 3;
 const COL_REMOVE_SIZE: usize = 4;
+const COL_ADD_DATA_CHANGE: usize = 5;
 #[cfg(feature = "adaptive-metadata-in-dev")]
-const COL_LMC_VERSION: usize = 5;
+const COL_LMC_VERSION: usize = 6;
 #[cfg(feature = "adaptive-metadata-in-dev")]
-const COL_LMC_CONTENT_ROOT_VERSION: usize = 6;
+const COL_LMC_CONTENT_ROOT_VERSION: usize = 7;
 /// Source-specific columns end here; the shared columns follow.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 const N_CRC_SPECIFIC_COLS: usize = COL_LMC_CONTENT_ROOT_VERSION + 1;
 #[cfg(not(feature = "adaptive-metadata-in-dev"))]
-const N_CRC_SPECIFIC_COLS: usize = COL_REMOVE_SIZE + 1;
+const N_CRC_SPECIFIC_COLS: usize = COL_ADD_DATA_CHANGE + 1;
 const N_FIXED_COLS: usize = N_CRC_SPECIFIC_COLS + N_SHARED_SINGLE_LEAF_COLS;
 
 /// Thin shim that pulls leaf values from `getters` and forwards them to the accumulator's
@@ -694,6 +716,7 @@ impl RowVisitor for CommitCrcVisitor<'_> {
                 (DataType::LONG, column_name!("commitInfo.inCommitTimestamp")),
                 (DataType::STRING, column_name!("remove.path")),
                 (DataType::LONG, column_name!("remove.size")),
+                (DataType::BOOLEAN, column_name!("add.dataChange")),
             ];
             #[cfg(feature = "adaptive-metadata-in-dev")]
             fixed.extend([
@@ -748,6 +771,10 @@ impl RowVisitor for CommitCrcVisitor<'_> {
                     getters[COL_REMOVE_SIZE].get_opt(i, "remove.size")?;
                 self.acc.on_remove(&path, remove_size)?;
             }
+
+            let add_data_change: Option<bool> =
+                getters[COL_ADD_DATA_CHANGE].get_opt(i, "add.dataChange")?;
+            self.acc.on_add_data_change(add_data_change);
 
             self.acc
                 .apply_shared_columns(i, &getters[N_CRC_SPECIFIC_COLS..])?;
