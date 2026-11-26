@@ -299,7 +299,11 @@ fn crc_write_resolution_or_validation_error_retains_mode_and_duration(
         let version = snapshot.version();
         let retained = CrcWithProvenance::from_snapshot_hint(
             Arc::new(crc),
-            snapshot.crc.base().unwrap().on_disk_version(),
+            snapshot
+                .crc_provenance()
+                .retained()
+                .unwrap()
+                .on_disk_version(),
         );
         Arc::get_mut(&mut snapshot).unwrap().crc =
             SnapshotCrc::try_new(retained.into(), version, None)?;

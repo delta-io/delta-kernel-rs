@@ -2471,6 +2471,20 @@ fn checksum_telemetry_round_trips_without_changing_hint_state(
             &hint,
         ))
     };
+    assert_eq!(
+        unsafe { builder.as_ref() }
+            .snapshot_hint
+            .as_ref()
+            .unwrap()
+            .crc_provenance(),
+        Some(status.unwrap_or(match crc_version {
+            Some(crc_version) => SnapshotCrcProvenance::Current(CrcProvenance::SnapshotHint {
+                crc_version,
+                on_disk_version: None,
+            }),
+            None => SnapshotCrcProvenance::Absent,
+        }))
+    );
     let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
     let rebuilt = rebuild_through_visitor(&snapshot, &engine);
     let mut observed = std::mem::MaybeUninit::uninit();
@@ -2530,14 +2544,8 @@ fn snapshot_hint_rejects_inconsistent_crc_provenance(
         crc_provenance: Some(FfiSnapshotCrcProvenance::from(status)).into(),
         ..test_snapshot_hint(&paths, 2, FfiSnapshotHintFreshness::Unverified)
     };
-    let builder = unsafe {
-        ok_or_panic(snapshot_builder_with_snapshot_hint(
-            test_builder(&engine),
-            &hint,
-        ))
-    };
     assert_extern_result_error_contains(
-        unsafe { snapshot_builder_build(builder) },
+        unsafe { snapshot_builder_with_snapshot_hint(test_builder(&engine), &hint) },
         FFIKernelError::InvalidSnapshotHint,
         "CRC provenance",
     );

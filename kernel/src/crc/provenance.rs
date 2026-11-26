@@ -151,12 +151,13 @@ impl CrcWithProvenance {
         &self.crc
     }
 
-    pub(crate) fn on_disk_version(&self) -> Option<Version> {
-        self.provenance.on_disk_version()
+    pub(crate) fn into_parts(self) -> (Arc<Crc>, CrcProvenance) {
+        (self.crc, self.provenance)
     }
 
-    pub(crate) fn provenance(&self) -> CrcProvenance {
-        self.provenance
+    /// Rejoins a retained CRC with the provenance that was stored for that same CRC.
+    pub(crate) fn from_parts(crc: Arc<Crc>, provenance: CrcProvenance) -> Self {
+        Self { crc, provenance }
     }
 
     /// Records the newly written checksum file while preserving how Kernel obtained its contents.

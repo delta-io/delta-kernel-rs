@@ -265,7 +265,7 @@ impl Snapshot {
         Self::new_with_crc(
             log_segment,
             table_configuration,
-            SnapshotCrc::Absent,
+            SnapshotCrc::ABSENT,
             false, /* built_as_latest */
             false, /* skipped_new_checkpoints */
         )
@@ -341,7 +341,7 @@ impl Snapshot {
         info!(parent: &span, "Created snapshot");
         #[cfg(feature = "adaptive-metadata-in-dev")]
         let last_manifest_commit = match (crc.at_version(), last_manifest_commit) {
-            (Some(crc), _) => OnceLock::from(crc.crc().last_manifest_commit_opt.clone()),
+            (Some(crc), _) => OnceLock::from(crc.last_manifest_commit_opt.clone()),
             (None, LastManifestCommitResolution::Resolved(resolved)) => OnceLock::from(resolved),
             (None, LastManifestCommitResolution::Unresolved) => OnceLock::new(),
         };
@@ -729,7 +729,7 @@ impl Snapshot {
             parent: &self.span,
             from_version = read_version,
             to_version = new_version,
-            crc_version = ?new_crc.base().map(|crc| crc.version()),
+            crc_version = ?new_crc.base().map(|crc| crc.version),
             "Constructed post-commit snapshot state"
         );
         // A successful commit means the post-commit snapshot is the latest version.
@@ -831,7 +831,7 @@ impl Snapshot {
     /// stale.
     #[internal_api]
     pub(crate) fn crc_at_version(&self) -> Option<&Arc<Crc>> {
-        self.crc.at_version().map(|crc| crc.crc())
+        self.crc.at_version()
     }
 
     /// Returns the in-memory CRC, which may be older than [`Self::version`].
@@ -839,7 +839,7 @@ impl Snapshot {
     /// Prefer [`Self::crc_at_version`] for authoritative queries.
     /// Replaying `allFiles` from this CRC requires applying commits newer than its version.
     pub(crate) fn base_crc(&self) -> Option<&Arc<Crc>> {
-        self.crc.base().map(|crc| crc.crc())
+        self.crc.base()
     }
 
     /// The stale CRC a tail-only replay can start from: [`Self::base_crc`], unless an AMT
@@ -1833,25 +1833,23 @@ impl Snapshot {
                 "Selected checksum resolution strategy"
             );
         };
-        // Case 1: an in-memory CRC at this version is ready to write as-is.
-        if let Some(crc) = self.crc.at_version() {
-            record_root("in_memory", ChecksumWriteResolutionMode::Cached);
-            return Ok(crc.clone());
-        }
-
         let end = self.version();
         let log_segment = &self.log_segment;
-
         // TODO(#2866): the replays below read only commits, so a CRC over an AMT checkpoint action
         // misses any `txn` or `domainMetadata` entry (inline or in a sidecar) that only the action
         // carries. The CRC must inline those entries or omit the fields.
 
-        // Case 2: a stale base CRC, older than this version. Advance the retained base over the
-        // tail commits (a held base is always at or above the checkpoint, so a tail exists).
-        if let Some(base) = self.crc.base() {
+        if let Some(base) = self.crc.base_with_provenance() {
+            // Case 1: an in-memory CRC at this version is ready to write as-is.
+            if self.crc.at_version().is_some() {
+                record_root("in_memory", ChecksumWriteResolutionMode::Cached);
+                return Ok(base);
+            }
+
+            // Case 2: a stale base CRC, older than this version. Advance the retained base over the
+            // tail commits (a held base is always at or above the checkpoint, so a tail exists).
             record_root("stale_crc", ChecksumWriteResolutionMode::Incremental);
-            let crc = log_segment.build_crc_from_base(engine, base)?;
-            return Ok(crc);
+            return log_segment.build_crc_from_base(engine, &base);
         }
 
         // Case 3: no CRC, but a checkpoint to root at.
@@ -3767,7 +3765,7 @@ mod tests {
         let built = snapshot_with_staged_commits(Some(2), crc_version, false);
         let crc = match built.base_crc() {
             Some(crc) => CrcWithProvenance::from_snapshot_hint(crc.clone(), on_disk_version).into(),
-            None => SnapshotCrc::Absent,
+            None => SnapshotCrc::ABSENT,
         };
         let parent = Snapshot::new_with_crc(
             built.log_segment().clone(),

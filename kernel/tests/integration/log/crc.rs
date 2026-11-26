@@ -1204,6 +1204,8 @@ async fn test_incremental_unlimited_skips_below_checkpoint_base() -> delta_kerne
     assert_eq!(updated.version(), 3);
     assert_eq!(updated.log_segment().checkpoint_version, Some(2));
 
+    assert_eq!(updated.crc_provenance(), SnapshotCrcProvenance::Absent);
+
     Ok(())
 }
 

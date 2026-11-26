@@ -113,16 +113,20 @@ impl LogSegment {
     pub(crate) fn pick_latest_base_crc(
         &self,
         engine: &dyn Engine,
-        in_memory_base: Option<&CrcWithProvenance>,
+        in_memory_base: Option<CrcWithProvenance>,
     ) -> KernelResult<Option<CrcWithProvenance>> {
         let latest_file = self.listed.latest_crc_file.as_ref();
         let selected = match latest_file {
-            Some(file) if in_memory_base.is_none_or(|crc| file.version > crc.version()) => {
+            Some(file)
+                if in_memory_base
+                    .as_ref()
+                    .is_none_or(|crc| file.version > crc.version()) =>
+            {
                 read_crc_file_or_none(engine, file)?
             }
             _ => None,
         }
-        .or_else(|| in_memory_base.cloned())
+        .or(in_memory_base)
         .filter(|crc| {
             self.checkpoint_version
                 .is_none_or(|checkpoint| crc.version() >= checkpoint)

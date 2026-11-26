@@ -214,7 +214,15 @@ fn external_snapshot_hint_accepts_parsed_advanced_crc(
         None,
         claim,
     )?;
-    assert_eq!(hint.crc_provenance(), claim);
+    assert_eq!(
+        hint.crc_provenance(),
+        Some(claim.unwrap_or(SnapshotCrcProvenance::Current(
+            CrcProvenance::SnapshotHint {
+                crc_version: parsed_crc.version,
+                on_disk_version: None,
+            }
+        )))
+    );
     reporter.reset();
 
     let hinted = Snapshot::builder_for(table.table_root())

@@ -2,7 +2,9 @@
 //!
 //! [`Snapshot`]: super::Snapshot
 
-use crate::crc::{CrcDelta, CrcProvenance, CrcWithProvenance};
+use std::sync::Arc;
+
+use crate::crc::{Crc, CrcDelta, CrcProvenance, CrcWithProvenance};
 use crate::utils::require;
 use crate::{KernelError, KernelResult, Version};
 
@@ -26,36 +28,47 @@ pub enum SnapshotCrcProvenance {
     Unusable,
 }
 
+impl SnapshotCrcProvenance {
+    pub(super) fn retained(self) -> Option<CrcProvenance> {
+        match self {
+            Self::Current(p) | Self::Stale(p) => Some(p),
+            Self::Absent | Self::Unusable => None,
+        }
+    }
+}
+
 /// The newest [`Crc`](crate::crc::Crc) a snapshot resolved, at or before the snapshot's version. It
 /// is one CRC, read from disk (or computed) at most once; keeping it lets later queries and CRC
 /// writes reuse the already-parsed state instead of re-reading it. A retained CRC is one of:
 /// - at the snapshot version: authoritative, servable at zero I/O via [`Self::at_version`];
 /// - stale (older): kept only as a base for [`Self::base`], never served as authoritative.
 ///
-/// The in-memory CRC carries its origin and any observed checksum-file version. The snapshot
-/// derives its status from that information. With no CRC it records whether a candidate was
-/// reported unusable.
+/// A retained CRC is always paired with its `Current` or `Stale` provenance. With no CRC the
+/// snapshot records whether a candidate was reported unusable.
 ///
 /// [`Snapshot`]: super::Snapshot
 #[derive(Debug, Clone)]
-pub(crate) enum SnapshotCrc {
-    /// The CRC describes this snapshot's version.
-    Current(CrcWithProvenance),
-    /// The CRC predates this snapshot and is available only as a replay base.
-    Stale(CrcWithProvenance),
-    /// The snapshot holds no in-memory CRC and has no report of an unusable checksum candidate.
-    Absent,
-    /// The storage lookup or snapshot hint reported an unusable candidate, and no CRC was retained.
-    Unusable,
+pub(crate) struct SnapshotCrc {
+    crc: Option<Arc<Crc>>,
+    provenance: SnapshotCrcProvenance,
 }
 
 impl SnapshotCrc {
+    pub(crate) const ABSENT: Self = Self {
+        crc: None,
+        provenance: SnapshotCrcProvenance::Absent,
+    };
+    pub(crate) const UNUSABLE: Self = Self {
+        crc: None,
+        provenance: SnapshotCrcProvenance::Unusable,
+    };
+
     /// Classifies an absent lookup using the version range's checksum-file observation.
     pub(crate) fn from_lookup(crc: Option<CrcWithProvenance>, candidate_listed: bool) -> Self {
         match crc {
-            Some(crc) => Self::Current(crc),
-            None if candidate_listed => Self::Unusable,
-            None => Self::Absent,
+            Some(crc) => crc.into(),
+            None if candidate_listed => Self::UNUSABLE,
+            None => Self::ABSENT,
         }
     }
 
@@ -63,85 +76,94 @@ impl SnapshotCrc {
     /// `[checkpoint_version, snapshot_version]`. Its original on-disk version may predate the
     /// checkpoint but cannot exceed the retained CRC version.
     pub(crate) fn try_new(
-        state: Self,
+        mut state: Self,
         snapshot_version: Version,
         checkpoint_version: Option<Version>,
     ) -> KernelResult<Self> {
-        let Some(crc) = state.base() else {
+        let retained = state.provenance.retained();
+        require!(
+            state.crc.as_ref().map(|crc| crc.version)
+                == retained.as_ref().map(CrcProvenance::crc_version),
+            KernelError::internal_error(
+                "Snapshot CRC provenance must match the retained CRC's presence and version"
+            )
+        );
+        let Some(provenance) = retained else {
             return Ok(state);
         };
-        if let Some(on_disk_version) = crc.on_disk_version() {
+        let crc_version = provenance.crc_version();
+        if let Some(on_disk_version) = provenance.on_disk_version() {
             require!(
-                on_disk_version <= crc.version(),
+                on_disk_version <= crc_version,
                 KernelError::internal_error(format!(
-                    "On-disk CRC version {on_disk_version} is ahead of retained CRC version {}",
-                    crc.version()
+                    "On-disk CRC version {on_disk_version} is ahead of retained CRC version \
+                     {crc_version}"
                 ))
             );
         }
         require!(
-            crc.version() <= snapshot_version,
+            crc_version <= snapshot_version,
             KernelError::internal_error(format!(
-                "CRC version {} is ahead of snapshot version {snapshot_version}",
-                crc.version()
+                "CRC version {crc_version} is ahead of snapshot version {snapshot_version}"
             ))
         );
         require!(
-            checkpoint_version.is_none_or(|checkpoint| crc.version() >= checkpoint),
+            checkpoint_version.is_none_or(|checkpoint| crc_version >= checkpoint),
             KernelError::internal_error(format!(
-                "CRC version {} is below checkpoint version {checkpoint_version:?}",
-                crc.version()
+                "CRC version {crc_version} is below checkpoint version {checkpoint_version:?}"
             ))
         );
-        Ok(match state {
-            Self::Current(crc) | Self::Stale(crc) if crc.version() == snapshot_version => {
-                Self::Current(crc)
-            }
-            Self::Current(crc) | Self::Stale(crc) => Self::Stale(crc),
-            absent => absent,
-        })
+        state.provenance = if crc_version == snapshot_version {
+            SnapshotCrcProvenance::Current(provenance)
+        } else {
+            SnapshotCrcProvenance::Stale(provenance)
+        };
+        Ok(state)
     }
 
     /// Returns the snapshot's checksum provenance without exposing the retained CRC.
     pub(crate) fn provenance(&self) -> SnapshotCrcProvenance {
-        match self {
-            Self::Current(crc) => SnapshotCrcProvenance::Current(crc.provenance()),
-            Self::Stale(crc) => SnapshotCrcProvenance::Stale(crc.provenance()),
-            Self::Absent => SnapshotCrcProvenance::Absent,
-            Self::Unusable => SnapshotCrcProvenance::Unusable,
-        }
+        self.provenance
     }
 
     /// The CRC iff it sits exactly at the snapshot version, so its cached values are authoritative
     /// at zero I/O. Returns `None` for a stale CRC.
-    pub(crate) fn at_version(&self) -> Option<&CrcWithProvenance> {
-        match self {
-            Self::Current(crc) => Some(crc),
-            _ => None,
-        }
+    pub(crate) fn at_version(&self) -> Option<&Arc<Crc>> {
+        self.crc
+            .as_ref()
+            .filter(|_| matches!(self.provenance, SnapshotCrcProvenance::Current(_)))
     }
 
     /// The held CRC, at-version or stale, for callers that reuse it regardless of version
     /// (e.g. checksum writes).
-    pub(crate) fn base(&self) -> Option<&CrcWithProvenance> {
-        match self {
-            Self::Current(crc) | Self::Stale(crc) => Some(crc),
-            _ => None,
-        }
+    pub(crate) fn base(&self) -> Option<&Arc<Crc>> {
+        self.crc.as_ref()
+    }
+
+    /// Shares the retained CRC and its provenance with incremental replay or a checksum write.
+    pub(crate) fn base_with_provenance(&self) -> Option<CrcWithProvenance> {
+        Some(CrcWithProvenance::from_parts(
+            self.crc.as_ref()?.clone(),
+            self.provenance.retained()?,
+        ))
     }
 
     /// Applies a committed delta only to a current CRC.
     pub(crate) fn apply_commit(&self, delta: CrcDelta, version: Version) -> Self {
-        match self {
-            Self::Current(crc) => Self::Current(crc.apply(delta, version)),
+        match (&self.crc, self.provenance) {
+            (Some(crc), SnapshotCrcProvenance::Current(p)) => {
+                CrcWithProvenance::from_parts(crc.clone(), p)
+                    .apply(delta, version)
+                    .into()
+            }
             _ => self.clone(),
         }
     }
 
     /// Omits stale CRCs when deriving snapshot hints and checkpoints.
     pub(crate) fn only_current(&self) -> Self {
-        match self {
-            Self::Stale(_) => Self::Absent,
+        match self.provenance {
+            SnapshotCrcProvenance::Stale(_) => Self::ABSENT,
             _ => self.clone(),
         }
     }
@@ -149,25 +171,27 @@ impl SnapshotCrc {
 
 impl From<CrcWithProvenance> for SnapshotCrc {
     fn from(crc: CrcWithProvenance) -> Self {
-        Self::Current(crc)
+        let (crc, provenance) = crc.into_parts();
+        Self {
+            crc: Some(crc),
+            provenance: SnapshotCrcProvenance::Current(provenance),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use test_utils::assert_result_error_with_message;
 
     use super::*;
-    use crate::crc::{Crc, CrcDelta, FileStats, FileStatsState};
+    use crate::crc::{FileStats, FileStatsState};
 
     // Tests can supply a CRC directly, with no known disk version, as in a snapshot hint without
     // CRC provenance.
     impl From<Option<Arc<Crc>>> for SnapshotCrc {
         fn from(crc: Option<Arc<Crc>>) -> Self {
-            crc.map_or(Self::Absent, |crc| {
-                Self::Current(CrcWithProvenance::from_snapshot_hint(crc, None))
+            crc.map_or(Self::ABSENT, |crc| {
+                CrcWithProvenance::from_snapshot_hint(crc, None).into()
             })
         }
     }
@@ -201,29 +225,53 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
+    #[case::missing_crc(
+        None,
+        SnapshotCrcProvenance::Current(CrcProvenance::File { crc_version: 5, on_disk_version: 5 }),
+    )]
+    #[case::unexpected_crc(Some(5), SnapshotCrcProvenance::Unusable)]
+    #[case::version_mismatch(
+        Some(4),
+        SnapshotCrcProvenance::Stale(CrcProvenance::File { crc_version: 3, on_disk_version: 3 }),
+    )]
+    fn new_rejects_mismatched_crc_and_provenance(
+        #[case] version: Option<Version>,
+        #[case] provenance: SnapshotCrcProvenance,
+    ) {
+        let state = SnapshotCrc {
+            crc: version.map(crc_at),
+            provenance,
+        };
+        assert_result_error_with_message(
+            SnapshotCrc::try_new(state, 5, None),
+            "must match the retained CRC's presence and version",
+        );
+    }
+
     #[test]
     fn new_accepts_crc_at_checkpoint() {
         let holder = SnapshotCrc::try_new(Some(crc_at(3)).into(), 5, Some(3)).unwrap();
-        assert_eq!(holder.base().map(|c| c.version()), Some(3));
+        assert_eq!(holder.base().map(|c| c.version), Some(3));
     }
 
     #[test]
     fn at_version_serves_crc_matching_snapshot_version() {
         let holder = SnapshotCrc::try_new(Some(crc_at(5)).into(), 5, None).unwrap();
-        assert_eq!(holder.at_version().map(|c| c.version()), Some(5));
-        assert_eq!(holder.base().map(|c| c.version()), Some(5));
+        assert_eq!(holder.at_version().map(|c| c.version), Some(5));
+        assert_eq!(holder.base().map(|c| c.version), Some(5));
     }
 
     #[test]
     fn stale_crc_is_base_but_not_at_version() {
         let holder = SnapshotCrc::try_new(Some(crc_at(3)).into(), 5, None).unwrap();
         assert!(holder.at_version().is_none());
-        assert_eq!(holder.base().map(|c| c.version()), Some(3));
+        assert_eq!(holder.base().map(|c| c.version), Some(3));
     }
 
     #[rstest::rstest]
-    #[case(SnapshotCrc::Absent, SnapshotCrcProvenance::Absent)]
-    #[case(SnapshotCrc::Unusable, SnapshotCrcProvenance::Unusable)]
+    #[case(SnapshotCrc::ABSENT, SnapshotCrcProvenance::Absent)]
+    #[case(SnapshotCrc::UNUSABLE, SnapshotCrcProvenance::Unusable)]
     fn none_holder_serves_nothing(
         #[case] state: SnapshotCrc,
         #[case] status: SnapshotCrcProvenance,
@@ -264,19 +312,17 @@ mod tests {
             })
         );
         assert!(stale.at_version().is_none());
-        let stale_provenance = stale.base().unwrap().provenance();
-        assert_eq!(
-            stale_provenance,
-            advanced.at_version().unwrap().provenance()
-        );
+        let (replay_base, provenance) = stale.base_with_provenance().unwrap().into_parts();
+        assert_eq!(Some(provenance), advanced.provenance().retained());
+        assert!(Arc::ptr_eq(&replay_base, stale.base().unwrap()));
         assert!(stale.only_current().base().is_none());
         assert_eq!(
             stale.only_current().provenance(),
             SnapshotCrcProvenance::Absent
         );
         assert!(Arc::ptr_eq(
-            stale.base().unwrap().crc(),
-            advanced.at_version().unwrap().crc()
+            stale.base().unwrap(),
+            advanced.at_version().unwrap()
         ));
     }
 }

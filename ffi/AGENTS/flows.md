@@ -62,7 +62,8 @@ the selected checkpoint type when known, and an at-version CRC. Stale CRCs are o
 Checksum telemetry is preserved for an exported CRC. A snapshot hint without a CRC preserves an
 explicit `Unusable` observation and otherwise reports `Absent`, including when export omits a stale
 CRC. An imported CRC has `SnapshotHint` provenance. When its status was omitted, its disk version
-is unspecified. Building the snapshot rejects an inconsistent claim. See `FfiSnapshotHint` for the claim rules.
+is unspecified. Installing the snapshot hint rejects an inconsistent claim. See `FfiSnapshotHint`
+for the claim rules.
 
 The `last_checkpoint` and `crc` fields in `FfiSnapshotHint` use borrowed nullable pointers.
 `checkpoint_type` and `crc_provenance` are inline `OptionalValue` fields.

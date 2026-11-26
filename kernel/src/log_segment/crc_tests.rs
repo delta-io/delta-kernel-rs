@@ -519,7 +519,7 @@ impl BuiltCrcTest {
         let retained =
             in_memory_base.map(|crc| CrcWithProvenance::from_snapshot_hint(crc.clone(), None));
         Ok(log_segment
-            .pick_latest_base_crc(engine, retained.as_ref())?
+            .pick_latest_base_crc(engine, retained)?
             .map(|crc| crc.version()))
     }
 
@@ -1605,6 +1605,7 @@ async fn test_stale_crc_advanced_only_within_replay_budget(
     #[case] corrupt_crc: bool,
     #[case] mode: IncrementalReplay,
     #[case] expected_status: SnapshotCrcProvenance,
+    #[values(false, true)] incremental: bool,
 ) {
     // Given a checksum candidate and the commits needed to reach the target version.
     let mut test = CrcReadTest::new()
@@ -1622,7 +1623,11 @@ async fn test_stale_crc_advanced_only_within_replay_budget(
     let built = test.build().await;
 
     // When the snapshot resolves the checksum under the requested replay budget.
-    let snapshot = built.snapshot_latest_with_replay(mode);
+    let snapshot = if incremental {
+        built.snapshot_from(0, mode)
+    } else {
+        built.snapshot_latest_with_replay(mode)
+    };
 
     // Then the checksum version and disk observation agree with the replay result.
     let expected_crc_version =
@@ -1634,9 +1639,18 @@ async fn test_stale_crc_advanced_only_within_replay_budget(
     );
     assert_eq!(snapshot.crc_provenance(), expected_status);
 
+    let hint = snapshot.to_snapshot_hint().unwrap();
+    assert_eq!(
+        hint.crc_provenance(),
+        Some(match expected_status {
+            SnapshotCrcProvenance::Stale(_) => SnapshotCrcProvenance::Absent,
+            other => other,
+        })
+    );
+
     // When the snapshot is rebuilt from its hint.
     let rebuilt = Snapshot::builder_for(built.url.clone())
-        .with_snapshot_hint(snapshot.to_snapshot_hint().unwrap())
+        .with_snapshot_hint(hint)
         .build(&built.engine)
         .unwrap();
     // Then hints preserve only at-version CRCs, as they do without telemetry.
@@ -1720,16 +1734,19 @@ async fn pick_latest_base_crc_preserves_source_and_cancellation(
         CrcWithProvenance::from_snapshot_hint(base.clone(), known_source.then_some(base.version));
 
     // When the baseline is selected, reading a newer disk candidate may be cancelled.
-    let result = segment.pick_latest_base_crc(&engine, Some(&retained));
+    let result = segment.pick_latest_base_crc(&engine, Some(retained));
 
     // Then cancellation propagates; otherwise selection preserves or establishes the source.
     if cancelled && disk_version == Some(1) {
         assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
     } else {
-        let crc = result.unwrap().expect("expected an in-memory CRC");
-        assert_eq!(crc.version(), expected_version);
+        let (crc, provenance) = result
+            .unwrap()
+            .expect("expected an in-memory CRC")
+            .into_parts();
+        assert_eq!(crc.version, expected_version);
         assert_eq!(
-            crc.on_disk_version(),
+            provenance.on_disk_version(),
             (expected_version != base.version || known_source).then_some(expected_version)
         );
     }

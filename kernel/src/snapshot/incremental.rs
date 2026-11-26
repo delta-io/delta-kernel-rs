@@ -291,7 +291,7 @@ impl Snapshot {
         // matching the fresh path.
         let pm_start = std::time::Instant::now();
         let base_crc = combined_log_segment
-            .pick_latest_base_crc(engine, existing_snapshot.crc.base())
+            .pick_latest_base_crc(engine, existing_snapshot.crc.base_with_provenance())
             .inspect_err(|_| {
                 emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
             })?;
