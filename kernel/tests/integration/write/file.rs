@@ -332,7 +332,7 @@ async fn test_write_rejects_invalid_file_value(
     assert!(error.contains(problem), "got: {error}");
     let data_files = walkdir::WalkDir::new(&table_path)
         .into_iter()
-        .filter_map(Result::ok)
+        .map(Result::unwrap)
         .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "parquet"))
         .count();
     assert_eq!(data_files, 0, "no data file is written");
@@ -356,7 +356,7 @@ async fn test_write_rejects_malformed_checksum() -> Result<(), Box<dyn std::erro
     assert!(error.contains("`checksum` digest"), "got: {error}");
     let data_files = walkdir::WalkDir::new(&table_path)
         .into_iter()
-        .filter_map(Result::ok)
+        .map(Result::unwrap)
         .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "parquet"))
         .count();
     assert_eq!(data_files, 0, "no data file is written");

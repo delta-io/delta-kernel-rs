@@ -1,0 +1,8 @@
+id: kernel-itertools-borrowed-join
+valid:
+  - 'fn f() { schema.field_names().join(","); }'
+  - 'fn f() { let names = schema.field_names().cloned().collect::<Vec<_>>(); save(&names); names.join(","); }'
+  - 'fn f() { schema.fields().cloned().collect::<Vec<_>>().join(","); }'
+invalid:
+  - 'fn f() { schema.field_names().cloned().collect::<Vec<_>>().join(","); }'
+  - 'fn f() { schema.field_names().cloned().collect_vec().join(", "); }'

@@ -1817,7 +1817,7 @@ mod tests {
         }
 
         let mut visitor = Visitor { values: vec![] };
-        arrow_data.visit_rows(&[ColumnName::new(["tags"])], &mut visitor)?;
+        arrow_data.visit_rows(&[column_name!("tags")], &mut visitor)?;
         assert_eq!(
             visitor.values,
             vec![
@@ -1894,7 +1894,7 @@ mod tests {
         let arrow_data = engine_data_with_items(items)?;
 
         let mut visitor = StructListVisitor::default();
-        arrow_data.visit_rows(&[ColumnName::new(["items"])], &mut visitor)?;
+        arrow_data.visit_rows(&[column_name!("items")], &mut visitor)?;
         assert_eq!(visitor.per_row, vec![vec![Some(1), Some(2)], vec![Some(3)]]);
         Ok(())
     }
@@ -1928,7 +1928,7 @@ mod tests {
         }
 
         let err = arrow_data
-            .visit_rows(&[ColumnName::new(["items"])], &mut NullableElementVisitor)
+            .visit_rows(&[column_name!("items")], &mut NullableElementVisitor)
             .expect_err("nullable elements are not visitable");
         assert!(err.to_string().contains("nullable elements"), "{err}");
         Ok(())
@@ -1962,11 +1962,11 @@ mod tests {
     }
 
     static NESTED_ELEMENT_PATH: LazyLock<ColumnNamesAndTypes> =
-        LazyLock::new(|| nt(ColumnName::new(["inner", "deep"]), DataType::INTEGER));
+        LazyLock::new(|| nt(column_name!("inner", "deep"), DataType::INTEGER));
     static ABSENT_ELEMENT_COLUMN: LazyLock<ColumnNamesAndTypes> =
-        LazyLock::new(|| nt(ColumnName::new(["nope"]), DataType::INTEGER));
+        LazyLock::new(|| nt(column_name!("nope"), DataType::INTEGER));
     static MISTYPED_ELEMENT_COLUMN: LazyLock<ColumnNamesAndTypes> =
-        LazyLock::new(|| nt(ColumnName::new(["n"]), DataType::STRING));
+        LazyLock::new(|| nt(column_name!("n"), DataType::STRING));
 
     /// A nested visitor's columns resolve against the element struct's schema, not the outer row's,
     /// so a multi-segment element path must resolve while an absent or mistyped one must error.

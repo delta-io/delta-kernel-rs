@@ -1,0 +1,11 @@
+id: kernel-itertools-collect-vec
+valid:
+  - 'fn f() { let values = input.collect::<Vec<_>>(); }'
+  - 'use itertools::Itertools; fn f() { let values = input.collect::<HashSet<_>>(); }'
+  - 'use itertools::Itertools; fn f() { let values = input.collect_vec(); }'
+  - 'use itertools::Itertools; fn f() { let text = input.collect::<Vec<_>>().join(","); }'
+  - "use itertools::Itertools; fn f(text: &str) { let [a, b] = text.split(':').collect::<Vec<_>>()[..] else { return; }; }"
+  - 'mod tests { use itertools::Itertools; fn f() { input.collect::<Vec<_>>(); } }'
+invalid:
+  - 'use itertools::Itertools; fn f() { let values = input.collect::<Vec<_>>(); }'
+  - 'use itertools::Itertools as _; fn f() { let values = input.map(convert).collect::<Vec<_>>(); }'

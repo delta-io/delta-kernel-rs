@@ -1,0 +1,9 @@
+id: kernel-policy-result-iterator
+valid:
+- 'fn f<I: Iterator<Item = KernelResult<Row>>>() {}'
+- 'fn f<I: Iterator<Item = KernelResult<Row, Other>> + Send>() {}'
+- 'fn f<I: KernelResultIterator<Row>>() {}'
+- 'fn f<I: IntoIterator<Item = KernelResult<Row>> + Send>() {}'
+invalid:
+- 'fn f<I: Iterator<Item = KernelResult<Row>> + Send>() {}'
+- fn f() -> impl Iterator<Item = KernelResult<Row>> + Send { iter }

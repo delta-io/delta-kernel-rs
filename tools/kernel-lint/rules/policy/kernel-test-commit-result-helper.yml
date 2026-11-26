@@ -1,0 +1,31 @@
+id: kernel-test-commit-result-helper
+language: Rust
+severity: warning
+message: Use unwrap_committed() or unwrap_post_commit_snapshot() for success-only commit extraction.
+note: 'Test-only structural candidate. Confirm Kernel CommitResult, helper availability and STATE: Debug; keep success-arm
+  assertions, error-case tests and useful custom failure diagnostics.'
+rule:
+  all:
+  - any:
+    - pattern: match $RESULT { CommitResult::Committed($COMMITTED) => $COMMITTED, $OTHER => panic!($$$ARGS) }
+    - pattern: match $RESULT { CommitResult::Committed($COMMITTED) => { $COMMITTED }, $OTHER => panic!($$$ARGS)
+        }
+    - pattern: match $RESULT { CommitResult::Committed($COMMITTED) => $COMMITTED.post_commit_snapshot().expect($MESSAGE).clone(),
+        $OTHER => panic!($$$ARGS) }
+  - matches: test-scope
+utils:
+  test-scope:
+    any:
+    - inside:
+        kind: mod_item
+        regex: (?s)^(pub(?:\([^)]*\))?\s+)?mod\s+tests\b
+        stopBy: end
+    - inside:
+        kind: function_item
+        follows:
+          kind: attribute_item
+          regex: ^#\[(test|tokio::test|rstest::rstest)(\b|\()
+          stopBy:
+            not:
+              kind: attribute_item
+        stopBy: end

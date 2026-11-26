@@ -1,0 +1,14 @@
+id: kernel-policy-opaque-engine-data
+snapshots:
+  fn f() { let x = data.as_any().downcast_mut::<ArrowEngineData>(); }:
+    labels:
+    - source: data.as_any().downcast_mut::<ArrowEngineData>()
+      style: primary
+      start: 17
+      end: 64
+  fn f() { let x = data.as_any().downcast_ref::<ArrowEngineData>(); }:
+    labels:
+    - source: data.as_any().downcast_ref::<ArrowEngineData>()
+      style: primary
+      start: 17
+      end: 64

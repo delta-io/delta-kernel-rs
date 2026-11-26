@@ -1,0 +1,59 @@
+{
+  "schemaVersion": 1,
+  "rules": [
+    {
+      "id": "kernel-itertools-try-collect",
+      "auditIds": ["prefer_itertools_try_collect"],
+      "safeFix": false,
+      "notes": "Recognizes explicitly spelled Result<Vec<_>> collection. No type resolution: aliases, collection inference, closure error constraints and unstable method-name collisions require review. No automatic replacement is provided."
+    },
+    {
+      "id": "kernel-itertools-collect-vec",
+      "auditIds": ["prefer_collect_vec"],
+      "safeFix": false,
+      "notes": "Provides a replacement only when a direct file-level Itertools import exists. It does not prove that collect is the standard iterator method or that the Vec materialization is necessary. Run unnecessary-collection checks first; compile reviewed replacements."
+    },
+    {
+      "id": "kernel-itertools-map-ok",
+      "auditIds": ["prefer_map_ok"],
+      "safeFix": false,
+      "notes": "Requires a same-named function parameter explicitly written impl KernelResultIterator<T>; does not infer generic bounds or aliases. It does not resolve local shadowing or mapping-function capture/evaluation equivalence."
+    },
+    {
+      "id": "kernel-itertools-iterator-join",
+      "auditIds": ["prefer_iterator_join"],
+      "safeFix": false,
+      "notes": "Recognizes an immediately joined temporary Vec and a string-literal separator. Review item Display/Borrow equivalence, imports and destruction timing. A retained or reused Vec is deliberately not matched."
+    },
+    {
+      "id": "kernel-itertools-borrowed-join",
+      "auditIds": ["prefer_iterator_join"],
+      "safeFix": false,
+      "notes": "Specialized field_names().cloned().collect().join() suggestion. A reviewer must confirm Kernel StructType::field_names returns borrowed Strings; similarly named methods are not resolved by AST matching."
+    },
+    {
+      "id": "kernel-itertools-preserve-result-errors",
+      "auditIds": ["preserve_errors_when_flattening", "prefer_result_filter_helpers"],
+      "safeFix": false,
+      "notes": "Flags only explicit Result::ok / Result::into_iter error-erasing adapters. It intentionally does not flag generic flatten() or Option pipelines. Intentional best-effort processing may keep the code with an explicit policy; different result-preserving adapters are not interchangeable fixes."
+    },
+    {
+      "id": "kernel-itertools-process-results-unzip",
+      "auditIds": ["prefer_process_results_unzip"],
+      "safeFix": false,
+      "notes": "Recognizes directly collected fallible pairs immediately consumed by unzip. The equivalent process_results consumer drains input, but output inference, allocation layout and partial-value Drop order need semantic review."
+    },
+    {
+      "id": "kernel-itertools-exact-split-tuple",
+      "auditIds": ["prefer_exact_tuple_collection"],
+      "safeFix": false,
+      "notes": "Recognizes a two-element let-else slice pattern over split(char).collect::<Vec<_>>(). Review source type and iterator purity: collect_tuple checks exact arity but consumes fewer excess items. Reject extra delimiters as before; split_once alone is not equivalent."
+    },
+    {
+      "id": "kernel-itertools-filter-map-ok",
+      "auditIds": ["prefer_result_filter_helpers"],
+      "safeFix": false,
+      "notes": "Recognizes a narrow Ok/Err match retaining every error. Review Result constructor resolution, Itertools availability and mapping-function captures before using the supplied replacement. Side-effectful match arms do not match."
+    }
+  ]
+}

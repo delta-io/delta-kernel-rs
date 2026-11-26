@@ -5,6 +5,7 @@ use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
+use itertools::Itertools;
 use tracing::instrument;
 use update_table::{intermediate_dv_schema, new_dv_column_schema};
 use write_validation::RowTrackingEnablement;
@@ -419,7 +420,7 @@ impl<STATE> Transaction<STATE, Imperative> {
             .chain(domain_metadata_actions);
 
         let filtered_actions = actions
-            .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected))
+            .map_ok(FilteredEngineData::with_all_rows_selected)
             .chain(remove_actions)
             .chain(dv_update_actions);
 

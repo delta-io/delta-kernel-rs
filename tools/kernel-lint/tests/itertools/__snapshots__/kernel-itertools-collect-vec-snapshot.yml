@@ -1,0 +1,32 @@
+id: kernel-itertools-collect-vec
+snapshots:
+  use itertools::Itertools as _; fn f() { let values = input.map(convert).collect::<Vec<_>>(); }:
+    fixed: use itertools::Itertools as _; fn f() { let values = input.map(convert).collect_vec(); }
+    labels:
+    - source: input.map(convert).collect::<Vec<_>>()
+      style: primary
+      start: 53
+      end: 91
+    - source: use itertools::Itertools as _;
+      style: secondary
+      start: 0
+      end: 30
+    - source: use itertools::Itertools as _; fn f() { let values = input.map(convert).collect::<Vec<_>>(); }
+      style: secondary
+      start: 0
+      end: 94
+  use itertools::Itertools; fn f() { let values = input.collect::<Vec<_>>(); }:
+    fixed: use itertools::Itertools; fn f() { let values = input.collect_vec(); }
+    labels:
+    - source: input.collect::<Vec<_>>()
+      style: primary
+      start: 48
+      end: 73
+    - source: use itertools::Itertools;
+      style: secondary
+      start: 0
+      end: 25
+    - source: use itertools::Itertools; fn f() { let values = input.collect::<Vec<_>>(); }
+      style: secondary
+      start: 0
+      end: 76

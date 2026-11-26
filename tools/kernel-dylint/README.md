@@ -1,7 +1,8 @@
 # Kernel Dylint rules
 
 These compiler lints resolve the defining crate, types, and functions. They catch aliases of
-Kernel APIs and ignore unrelated APIs with the same names.
+Kernel APIs and ignore unrelated APIs with the same names. The ast-grep rules in
+`../kernel-lint` provide broader structural checks without compiling the code.
 
 | Lint | Prefer |
 |---|---|
@@ -147,4 +148,5 @@ DYLINT_RUSTFLAGS='-Dkernel_named_nullability -Dkernel_expression_literal -Dkerne
 The fixture step leaves these lints at warning level to check expected diagnostics and clean
 negative examples. The production step enforces the constructor lints and suppresses the advisory
 rules; unrelated nightly warnings are unaffected. Run the manual audit above
-without `DYLINT_RUSTFLAGS` to inspect advisory findings.
+without `DYLINT_RUSTFLAGS` to inspect advisory findings. The structural lint ratchet also covers
+syntax patterns enforced in `../kernel-lint`.

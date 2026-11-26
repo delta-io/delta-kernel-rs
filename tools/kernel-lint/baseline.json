@@ -1,0 +1,3792 @@
+{
+  "schemaVersion": 1,
+  "astGrepVersion": "0.37.0",
+  "findings": [
+    {
+      "fingerprint": "00e5a54c36c8b650da94dd5991c5b8250f022518a1aa9d879c00f36655a0b63f",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/content_tree/stats.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "0242a16a1b2ad1ec389bbc8fc25a36ae33f97ac52ccbe0b5ce7d89545a2afd97",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/schema/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "0243d2d788e0e765412f35afb1d809f3f8bc2070684a99f564822a30d1f94585",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/tests/integration/log/log_compaction.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "028f7751771c4a4ccec8bc3e2da07988a9019cc606a4da7de8ea6fee0caf0d65",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/lib.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "0374764bbd94133a78a6cf9d9a99887d1842241e2a8cd2f18335c0248350c140",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "03969e5c3a2413778c917f4b70ea2c18f86e6196eedc8ce778e6f43daf10c91f",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/lib.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "03a8cddb0866a667c5b49a30e21ac0d7eec18eb3e6f2766f8179af0c6262e5bc",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "045a25d5591f483e6dfae84a5f39bec7c9146746978591664ffc0fb0e737ebc2",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/transaction/declarative/precommit/checks.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "04607cdcebe7c5803731ce44478b5a4edaa21ac5c26e684509c6dc5f03ceb8af",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/action_reconciliation/checkpoint_info.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "048a6ad22ec6705875e39002f9c080b93fe4a8c0aae390e1897becd6e9cd7dc3",
+      "ruleId": "kernel-expression-fluent-predicate",
+      "file": "kernel/src/transaction/declarative/precommit/checks.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "04b796955e6a65ebe2ef755a251bd6c3cac1cb5e351539cf82d8acef86ae017d",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/transaction/update_table.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "06639ac1da7fd7610e38d230f4f703a349205a4b4a094a2ddb7adc781deb2dbd",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "0692684afdf01b8e4b29ba2557129a1892256f9871b79cd9f112920740a3a13f",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/plans/builder.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "0722c058c88345e2af79ea59f26a4f9bde36c2a8eacd869b4d0f9390a65e8753",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/tests/integration/parsed_partition_values.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "07e758776d2fe558055c8d4ec1b0dad5b4a0bd6ae0d552f3033fd6a9ba844b7c",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/deletion_vector_writer.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "084ea310a1ecd8557525a3d3f8546e3e520b34aa9743c215822cfb97128f7966",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "08d580b1af882e05e20740e84d94ace7883e7b2a976ac42e5ace40868771c867",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/schema/metadata_key.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "093e3da4deeb8fcff332a655a634cfec59471945fd0173e40cb34354dca5d08f",
+      "ruleId": "kernel-expression-column-name-macro",
+      "file": "kernel/src/transaction/declarative/precommit/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "09c1d1205a41be7f57a713fbd153496be8ac970070347be02e2e5ffc3444c854",
+      "ruleId": "kernel-expression-lit",
+      "file": "kernel/src/expressions/mod.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "0a41115a1c31c94b4e29512964146fae353c106cc17fdc6ff9354afa3c62f906",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/log_segment/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "0abbeeaa2260946b690e1e70256d23c0fdaecef694410b416373a7fb6c744c45",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/content_tree/stats.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "0ad50f16c85848d689b851a4669a43c1cbd2a82e593c06fac89b0df101e18327",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "0ad77e74be0995b371a8b37b5851b37d4c9ec2733277fda3f061e506a065dae0",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "0afb2f315a1dcb3c00f2a98152d8d271b9e062a74e492aeb19cc1a9fa5be498a",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/action_reconciliation/plan/metadata_planner.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "0bd4e33fd4129a35d0b43bc18f7960ee13ef918532b9f3dae01b1617ce4e788a",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "0c8ad8f4d3efcebfd03d799f829eef8a3bb1cce43fec458186b48a671130a6b7",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/plans/proto/convert.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "0cc8aa8c9e8eee52c3b5578b86d2e3ecf897b004955ce21148232a2ddf0ae6e3",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/tests/integration/read/user_defined.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "0d9aa55103d8bf0b36b27b58a51d747945a6da5312d7c055b1ad57181ccbd035",
+      "ruleId": "kernel-itertools-collect-vec",
+      "file": "kernel/src/log_segment/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "0d9d7ead640fdb6d884f1e9876e564671a5f61c84ed2556154d21b3ca56c0b08",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/table_features/column_mapping.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "0da0e60acf5cad62cced250df82d81ff9445e7b983abee162a82dd32364076f4",
+      "ruleId": "kernel-itertools-iterator-join",
+      "file": "kernel/src/snapshot/builder.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "0dc3bd39ff630fef64b8ad6359249884015408d8d6110819fdc869d8d90cce04",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "0e3de1841352f7d9f6652af4fd872b2f5ab4ce44157a9308784f1579fa44031c",
+      "ruleId": "kernel-test-get-column",
+      "file": "ffi/src/scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "0e4e2fcb0f5f886f396b1d2e3586c91bf9a9ed39cf0c8cdfc4f63673f4dcaac9",
+      "ruleId": "kernel-test-get-column",
+      "file": "ffi/src/scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "0ee6633d50bd6c6a733e3397d24cbc284bb81118a4e64673f5ac85bdbbbb81d3",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/transaction/update_table.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "0efe3ab868dbebafea712dd8e700479e4a0c278e26b1dae3fe97ec220e0f077b",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/log_compaction/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "0f64e41bcf4fc02ebedf86ad4c6134a4ebdf57406719954165c5b0bc11a285c1",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/engine/sync/aggs.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "0f697a1dd1bd0bb6dc12aa824936c4d0eb643538ac2e1f38c405b05f84f479ee",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/deletion_vector_writer.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "0f9b38f238d7767a8c912eda60625340b5ad94ef0d121e0638e868aa653a11d0",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "0fbc8c212eb0d38ebe1452cc9ee564e6b8cf2af9be00a37bcf56f6816daf24b7",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/content_tree/reader.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "101ef464cebd2eb4f7919bce3639dd2990ecec56bc10a2e750ef4964e2d1b37b",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/plans/proto/convert.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "1023b0d946ac97bd66effd4957bdbf4bb9edf0e94908f21a03e41019a2642df2",
+      "ruleId": "kernel-itertools-iterator-join",
+      "file": "kernel/src/scan/tests/variant_stats.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "10410daa64add9cc16e2622e9855d7f449439ba00dd3bd01f88d0f2e30bd1eba",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/parallel/parallel_phase.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "10c09ec0f05a4379dbd86ac8968c99478cae83a8d5ccc43c395b1093911e7fab",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/history_manager/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "10ecac0d9e755b33afd9316733b2116a17a484798aaafb5d0147e12893149db2",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/incremental_scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "11ac48048205a8748cc127882432e0a8c123f7d579e0d5c1b5d54562b9697b3b",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "11b73494a11b0b10a64e26e6f8d26a3b41fc3e1e483b6d4b738ae3685907aee8",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/lib.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "121e7cdd6a547613a37152e5b53d7d3c91d6377c1adab63dc77fd8b984f3da86",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "123262fe01d53f8b1e19d4335431835b5829afb0f75822b4912de96fb70d069a",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/engine/arrow_utils/file_type_validation.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "128e20e071ae82bcd7db3024d72527faa058c119971436ee6433d2179f4be862",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "13084488ffa038ac4a831a0e9497afc76d0f99d29d1531216f21a4ac83398de4",
+      "ruleId": "kernel-itertools-iterator-join",
+      "file": "ffi/src/domain_metadata.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "1368a8b2582774d8febee45c2f3df776889402f7562630c8548c6c02ea7e885b",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "156ccc351a8f04494e9c0b0537ed2080308fe61b96f536dd72f33271f828fea2",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/incremental_scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "15ee77cefd18c46d760890a0221f9d8a8ef1c42c406d97f0a34171d43169dfe4",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "1619bd90a62450a18875f1a487f39e601d7b43ab315aa7dd1801f31d206a4e00",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "168846c33f7c3a7e7050979944f0307f316d8f22b9de33abfeb56a94cf310062",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/content_tree/stats.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "172127d866e5ed3d87b48f33e7c14117f07ee6915a3375cead0933b82d79e80c",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "17723b2cb8a2c7cba4279c1fe6719dbd8f00cf7362ea6544fa22b5bf28bdf8df",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/tests/integration/features/dv.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "1817fbeb752fd1d80c4592a0e214618d4e06d3df3eeaa0176fcd0b6fc7e4eac2",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "18446aaf711ad383bbf822beafabd289ec75f8b5d2ff31902bea6582e4f28efe",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "186f7bee187c570f564c54629697f5417339288fb7435b9222f66edf4ee7484d",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/deletion_vector_writer.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "187334233b7f93485aec12fddf945dcfabec835a492e09b4775d9ca09c99f9b8",
+      "ruleId": "kernel-expression-column-name-macro",
+      "file": "kernel/src/expressions/column_names.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "188da9f6c386d167aca35f99012454601e75a597ef62ad91a9d318f8a19e6295",
+      "ruleId": "kernel-itertools-iterator-join",
+      "file": "ffi/src/scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "18a0e509b089d7bdc4ce30b1819d8d48b55d9951646fce75b2a611366f2903b3",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/last_checkpoint_hint.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "19a78b8374834a89dff821113d1941baac86fa3e502139056482a2d5807ecaf7",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "ffi/src/snapshot/hint/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "19ee129ab80cfd5a2f5a0afed059a2169d7168b34028bb0d22ae24102e53c606",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/content_tree/stats.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "1a144c0518f0e96fe91158ef4845257571870ca10cea5fdcb136a6fcf1e750ad",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/snapshot/builder.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "1a55d528d73bac93244a7078cbf6ca3692851596595cc959f0563de9a092a294",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/transaction/builder/create_table.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "1a6a04bb623bf647aeae7660c2191720d1a419465d811805dd80e2fe2c6ae469",
+      "ruleId": "kernel-policy-enum-equality",
+      "file": "kernel/src/log_segment_files/mod.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "1a8373320d36453861b45dc13a630cf9de5fd579db635eb23947317690191641",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/transaction/imperative/write_validation/utils.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "1aab2e879ae0e41d917d1a5546d7c95d863fe0cb2992ddd1421c8b212e25e6ee",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/actions/visitors.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "1ab69a07d2f092f8b5112f170af8fb4fb71b6479e21b4e664515644a9b8277b1",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/kernel_predicates/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "1b744d0604221eb617b7d81b8d8bcd999c3f015e5e6ebeabf3fccfa3a1809de6",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/incremental_scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "1badca6bf1147b7981abdd36ee3716ba9d19ced47c7a68c7ef67dce242b12632",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/incremental_scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "1ce68ed5c003b735f1a1222e3ae0418ddddf682252885865d6e9d4ac5ec41aae",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "1d8348cb274e78f827e3408c3f270cdf764d87b5d773abcb2ec4dfcc93158ca6",
+      "ruleId": "kernel-expression-fluent-predicate",
+      "file": "kernel/src/transaction/declarative/precommit/checks.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "1df90d3c06de25bb043b32ff7fa2753a7c1098507224f67074e4a86cb71fa5e3",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "1e360bcdc6ccb00d7d1a669e556f633e1a06574269723d45102009e332cf2bfd",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/content_tree/stats.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "1e628d6a5831e3535ee773ddae9f26541aecae17ff55736a484f0c974548d35f",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "1ed99472a037f2bb71485cf5ef02b0d9dbe0ee2ed75101c07b2a703cb501dcba",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "1f19abf3f0d58efdcb7ae50c33078f11c60261cbd217b983056588e8acb0868a",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/engine/arrow_expression/tests.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "1f9797b3b2a679c4a6ac6510fbdf79fda2866f53c6b412f24b545114fadbfe9a",
+      "ruleId": "kernel-itertools-collect-vec",
+      "file": "kernel/tests/integration/features/dv.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "2029d2d7312c7314dc3cc1d9028ca98452b216a6c2b29de7bb07003fa21ba318",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/crc/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "203d989c8154ca808822bb0a0a11b53dfa03dc12b8ce4a5716531509ff8e75cf",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/engine_data.rs",
+      "count": 4
+    },
+    {
+      "fingerprint": "210ce969e44de4663a8035bf7c8e4dc6ddd71854ec385cb18c0b3a8875ba1ecd",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/tests/integration/parsed_stats.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "220f0e6024aa18e53e848759ba92ed238ed5d190c8cb0a7127d51ea6d98fa3f1",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/content_tree/reader.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "2217406da1e12cd07c23ccb959b46693d43ce15c5e965164733ddf4f02a8d364",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/ffi_tracing.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "22d126145dad864207f01aa11b1c0ae7ee67e776a273343f696c73287353c2d1",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/tests/integration/log/log_compaction.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "2337ec7ef64edfba70e37be592e1ea713a836e2bef75e4bb64fbe95cc1f29208",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/engine_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "246b70c13af30f0b15fe7c3b3c6fe1d0f803f67276b361a273077662e99c996b",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/engine/sync/plan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "24f42b1eb9f053ade6a6d762867d1dbfc484166ec3c58cac992f524beec3038b",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "24f5d1d93ec3127a6c387547a457bf77cbb5e966e855f22661c156f44f2d918a",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "255286d9e1b8b35322a83d54f48977fbae35fdf0a43f55671f87e88521ba8d64",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/actions/deletion_vector.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "25791524cf9205261d976666d12834a5078d242e6eaf52d2d5c759851bcc3514",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/engine/arrow_expression/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "25d2a73576e1a68f6804f45ceb59d11fa356694cf66f146a8cb4b2a2e1a8245b",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "25f412a0eb7699116c08770605ce48a9717e93d362eaad92d20eeed825fcc122",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/transaction/committed.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "261f8c3678643b4b8f0553820d42d4c7eeff5d0288af81ac0c57b5d9562a3f8c",
+      "ruleId": "kernel-itertools-collect-vec",
+      "file": "kernel/src/unit_test_utils.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "26333b1d482f564c515cd1ff7ffd8e6d2f07d3b26191abf2e501d39440eda09e",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "27023df93f5f594c1a4ae2aee50a1756c625a9c4f8914d10c35d5911bc393cf0",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/plans/proto/convert.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "273c927e8d2e98bf1f75f248ce2235ee36e0f7bed76a41c1c6478d0cbc3d7045",
+      "ruleId": "kernel-itertools-collect-vec",
+      "file": "kernel/tests/integration/features/row_tracking.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "27f37a403d439dc481fbad107369fccd7e721443dacea814aaa6fb49d28b2ac3",
+      "ruleId": "kernel-expression-fluent-predicate",
+      "file": "kernel/src/transaction/declarative/precommit/checks.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "288f396d108ebbe9d503e59a34051ad3db2dc9fc69ec02b13c6f0de72fdc616f",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/table_configuration.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "28a55587cd28d69be00b5ee103c9fceb784ad243cfbf92a5a2ebe72a1dc51f03",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/content_tree/builder.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "28e3709e379e81a8a0162534372abac169c368ce1884b9bafd8050c606cac4ad",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/tests/integration/log/compaction_round_trip.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "290af01edeb5d1dd227bf216fe645fd9e1f0d1b24f13bd3bca1b8b76aae33e90",
+      "ruleId": "kernel-itertools-collect-vec",
+      "file": "kernel/src/engine/arrow_utils/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "29b6889901cc36c66b244483b16c9251df7f02d664fba022541c74b5e60f3884",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/kernel_predicates/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "2a8aaa05920471bf0dd53a8e00463a2bb791db382a5e566da1963b60771659d3",
+      "ruleId": "kernel-itertools-collect-vec",
+      "file": "kernel/tests/integration/log/log_compaction.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "2aca5a45eec40ca61ab87bd210c51791c0314b3e95741f3930ac5c712dcfb96d",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/tests/integration/common/write_utils.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "2b04a15206461e8f8064beae76b8ba41baebc759d04d81fca83d023df8770f59",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/log_segment/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "2c119bcd449718903ff62aa19c4e31e8ca5992348628fbbd13d99313e82c800a",
+      "ruleId": "kernel-expression-fluent-predicate",
+      "file": "kernel/src/transaction/declarative/precommit/checks.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "2c945c773c04cd9a4c66a9938b8a1bd7b64f18e5c857e9971508aa96a8c11cbd",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/transaction/mod.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "2c9d2305623e9b885147fc38be0bec1ee948717c4b8e363556c85785a376580f",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/scan/scan_plan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "2cc2c10b2ccf0ffde810fe773868c7b1883a97e6e9bbaa0651a6c41ce8b8784a",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "2d3ec4cd356078d789bdf8e4907cfedb42ed69127af7ac9e944e62635669f2b4",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/snapshot/hint/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "2e0392180ddb6de6dd4e722977f6ae3ae91c59b5857eca8e8cd1106933919fb5",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "2e8fca9a4c3a6e1ad05cb917ca285ca9d114c8aab2e2ae8be963d2157c9efba7",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/tests/integration/read/user_defined.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "2e93500f237b5df61cc5e48d7d08f28e162898a760094400613b308b39ef9246",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "2ecb2e92fc63ef6afe3e8b1abd0ea8205ab200df75f8726ebbfef0fde22d9f96",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "2efb3ca540c8ee89c9de4a036ed117f35acdbfbbebf2a00dbe3d23f58e35ed8f",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/scan/scan_plan/metadata_replay_base.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "2f6ffd8e86715dc1acd379391cad38b9b612bde4fed016541fd8c31af3c74410",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/content_tree/reader.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "2fa3ae52249f58d0c9b29792a9a17a8c7ae20e8af48aac53d41eaa01c972a4a9",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "ffi/src/snapshot/builder.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "2fbcc50c21f28332ba92750236a1188a7dfc003554290a161e0b0f69bbf1b664",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/lib.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "2fcdf6d459ebd452c98e71099648650a93e8681d1ed08bc5dc041318cd15fb78",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/schema/metadata_key.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "303fbdf7e1d70a9fde9097a2f8698f9772736c0e0c27c16e8dccfa7e62542559",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/transaction/update_table.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "305b945bc328bb487a2502bd1458989d8dd536034a51b7cbc4744e694b854885",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/tests/integration/write/clustered.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "309e9f41828204d365b09ccaf44dc52a81bd745665d68fe4247a5184fc0ba68f",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/tests/integration/write/clustered.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "30c65e7bcdc1531aec69fc84dcf0d449b2a7b9fed9ae4ac1d48ec39cacbf9314",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "30cb5bcc2f9841d1e999cf54b45a300404fd98150de33877e06715e6e1c5ab3d",
+      "ruleId": "kernel-expression-column-name-macro",
+      "file": "kernel/src/transaction/declarative/precommit/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "314d5a941b704ce1be6084acf3bb90258096d124b532a0ab274d95fa49e2f356",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/snapshot/hint.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "317b25c73e0cfe61d9c9d23e3f40eed3ab8e931e7d8f33e679e6f39c3fa23c8c",
+      "ruleId": "kernel-test-get-column",
+      "file": "kernel/src/log_segment/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "3297284c47cebe3d88b9729313acebf9fdb66501bb554b2f2a1c2f7a781d0639",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/log_compaction/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "32bd927043b49397abc207b0093b9d0b6a635528b40dd5d01693b30f80607854",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "ffi/src/schema_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "32ed2f222cf2de64fe9135145f9c1847f432d97afa3ce6d0746bed425cc778cf",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/transaction/declarative/precommit/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "336f5672a6c74aae651b9295d8689ddebaf20ad7bf39b8e528afaabc4e0da552",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/metrics/events.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "33e9341d07f510a337e222644996695bc4ff9fcf58f5d77f69274adca5e8c018",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/clustering.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "33f07755b57d0749f6d9298e29f54a3ae50a8a35fc8d0bfb156890896810123f",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/transaction/deletion_vector_writer.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "33f24c9d27ba8d07ecf1a1583dd54bed6839dc1671b07e0211ecd2eac7fbf482",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/last_checkpoint_hint.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "3410277acae9c9f6a624c94f923d4702d2dec98ed2a58af18a020629ccedf5eb",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "347246ed6639eb3fe560b1239388b5f52dedb4f6c1af5db4cb8079cd7dbf6a1d",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/kernel_predicates/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "3505306c8fb550ac17ed85a03333ba7c613ae9823ab715fef18127cdfbdd7766",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/engine/arrow_expression/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "356b60e9befea45cbb7e4f32c8c5261cb16885738ebdf3c4a3ea0895e27777ff",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "3581c414a4b823278fea19ea5058771504a2167303d8bbe4d5c15fcf9f59166c",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/lib.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "36d4cd48988d8e6707d44c1870ac948b6ef9d96b0d6bc30c54f4eaa26e17202c",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/tests/integration/metrics/checkpoint.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "37154132e181831496a6216fc87a44189fd2cfceeb9ceddd408a06a92f5378b0",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/expressions/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "37b4cb25b28d1e2602985c45e886c3fde8456667eb42e1e620e9a73791860b2c",
+      "ruleId": "kernel-policy-enum-equality",
+      "file": "kernel/src/path.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "3836362ac751952c480c99425267502c9b0eb68c471830f8b926d66e142b808e",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/engine/arrow_expression/evaluate_expression.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "3880bfbd6449f00b02d0cb50b477f91ce89a348329a4a6768c875b7575907969",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/scan.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "38a1059dae27b9ffad8d48e45f13f92651a7d03ddc02480b93988c6070fc5e90",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/ffi_metrics.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "38e375929db2947083cbecf737dcac2ac65fce67a0d5f03a9fe72f74bfa335ac",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/action_reconciliation/plan/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "3a3fd0ce71c933cb0b18bdb10890d96b5e4522d5e9ecdb559913f55e43eb5f44",
+      "ruleId": "kernel-itertools-collect-vec",
+      "file": "kernel/tests/integration/write/remove_dv.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "3a436148b91d4ccb633f2882a46fa80767c16cefce06e22cc8c816f23fcc921e",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "3a4814c18dc3d98e5c5ce9969b292eef4d315b39f4d1c627000e2d6ad43ef913",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/engine/arrow_utils/apply_schema.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "3a9c31eabf57a85633bc450b09966b8f15cf0926671d432c8a2ea6d79cf9c6b0",
+      "ruleId": "kernel-expression-fluent-predicate",
+      "file": "kernel/src/transaction/declarative/precommit/checks.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "3ac78b7dfe05eeaee3de2753cf81951e98f22bf39b2e2cbfd0566004ef82ddb7",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/tests/integration/read/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "3ad1899a1b0b86c0e14c8be1b97a9ee52919846a73debe698d47d5ca5861e523",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "3b1c5deeeea7f2f0a05efcd4aa834b46f218a80d87b096a6f66d8ac383ad7505",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/tests/integration/log/log_compaction.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "3cb9d108bdcc01c36ae8d03fee6295a86e399aab1ac70c6a362d140afbcd5e02",
+      "ruleId": "kernel-itertools-collect-vec",
+      "file": "kernel/tests/integration/log/log_compaction.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "3cf387876b3e5492b3b982a6b7ee3bf1cc3541cd33cac09ff2652c3182ec3c7f",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "3d2a704e25ffe0877cbe4037c0d92bedc9e762530266fe12e80b6caad1af0b67",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/plans/proto/convert.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "3d35d1f43e5cd8e170739e6d27b6d569c9c4c8074aeed5b786b303d04602e9ac",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/content_tree/reader.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "3d53f842dc01f20d89b8ddf74f58e4ec64d7cc0dbd2b9176ade74046d82714a8",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "3dbcd69fd833b6aa54ac8297e6e9477b54b32a1707a8a2df232375002ac7381c",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/engine_data.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "3f11a65b361da315ebfe0d02be801558b1ea81b6cda30b2623db3c5549fe32a1",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "3f3ee1c2cf1412350256efee38c8f902b5f96bd46742acab8ae1cb546fccfc60",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/transaction/create_table.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "3f69dee8c644636cfd972951d2d1f9677bc5bbbfed9a16c10af796ab70bafad8",
+      "ruleId": "kernel-itertools-collect-vec",
+      "file": "kernel/src/scan/tests/adaptive_metadata.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "3fab5b13a3bbf74543f09e8ce0752d100ecefb5eecc29afc47c0b35d967bf49e",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/engine/sync/plan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "400de7f278bc5fa65f1b3064f990792ea66b7d33c413b2631f03a6ee5ef13fbe",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/tests/integration/metrics/checkpoint.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "4061d6b035b70c299a92de4b0784d87e19f67be8c01f5b384b9147b55d640b4e",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/last_checkpoint_hint.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "40fd27b9355f3094dcc0554aa82a015c74919aed363a9eca627c9ec580afc06a",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/kernel_predicates/tests.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "41d7ae326d03f5bbc930c12c54e1f85778e6cf447390c774e0e0cb117fdf9ca5",
+      "ruleId": "kernel-itertools-collect-vec",
+      "file": "kernel/tests/integration/features/row_tracking.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "43214d8215435380e56e2e2147a8a5763fa1533418eedcb2371e292f1659a6f7",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "4384a90bd00ed474d559bce76311ff1f65d86b8b8ecdbff6dd2569a85568e5f0",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "ffi/src/schema_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "43c1abee3ff3b6d7933506e746760ff51945efb35cebf0f744a841ab2867a9df",
+      "ruleId": "kernel-itertools-iterator-join",
+      "file": "kernel/tests/integration/log/crc.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "43c3e1e6d4bb6d37d8cd74f466fd933f662346482f7e26eac7a6f816d06bb689",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/engine/parquet_row_group_skipping.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "4400e96d31b17ff4d8d22d03e736a1d5992c06f09d9a5c5043bb4abc523bfb7f",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/engine/arrow_expression/evaluate_expression.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "442c1ac73725494e4e4e9307a50edd8b3317ba979ea7de1130c93961ac5d69ed",
+      "ruleId": "kernel-test-get-column",
+      "file": "ffi/src/scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "44d944763dffd3e72c6e1f87e55f0b23318c2d2003664aeeecb4afcee4be816b",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/plans/proto/convert.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "450f8dadd029cc4a943cf452c28902ea4600e4ae8ab26d9391db2f3ddb2555b9",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/engine/arrow_utils/file_type_validation.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "453e4f3186ef35504062545b48a03ddcae13a63e8300a9818c3b1b5d84795e65",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/kernel_predicates/parquet_stats_skipping/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "46d5a788a91169fb6b5ed3b87a66d6ec14226f9bdcbf1047c2229853894a0b7a",
+      "ruleId": "kernel-policy-enum-equality",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "470c727c142e9e682418a0d6a84a0c3577fcd196fd259aee502af64063eb5159",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/engine/arrow_utils/apply_schema.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "472279e9936f2f267af3eeba50d1eefc2ba6eb15d185f93b5e453d7d461151d8",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/engine/arrow_expression/evaluate_expression.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "4732de23af21bff2771c0b9c0d7da4e71d078bd09a6de4c35da3ce6d2ac23d91",
+      "ruleId": "kernel-policy-enum-equality",
+      "file": "ffi/src/transaction/deletion_vector_writer.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "480c56ba74dc414608473cdd83706e8ff07408e1d0903af6590e89ed964b0633",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/engine/sync/aggs.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "481da0468fbc0ba367f851e9bb1545b12900a47ea08f731a5f33366baacec281",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/engine/arrow_expression/evaluate_expression.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "486869da68b3703e83988435baa0b810c1de7d61c7d115eefc71886aaa89d62f",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/schema/column_default.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "488cb75f33ef596f257666f01f779e189a8fdcbfe363f2af42b78825e539cd2f",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/engine/arrow_expression/evaluate_expression.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "490d738cbb23ecfdbef75e4119dc9c96bf04c03d53d7206ddc0939ade4c0b3cd",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/engine/sync/plan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "49e0e46420bece8b4fc4076614a356324089014b7c1242effe18439271490d1b",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/table_features/iceberg_compat/v3.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "49ecd855207128de471369cb2d2df12b030ec447dc8be96c87e8273898898133",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/transaction/update_table.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "49f3872e6d837fa279b76ca06f4c2380d6d9c69cd630397f1a90c3a741eb4d08",
+      "ruleId": "kernel-expression-arithmetic-operator",
+      "file": "ffi/src/expressions/arrow_eval.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "4b4d5920f6f2be73fb9235b02294662d7d0cbf7957133901e42074fb32e355ac",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "4b53f3535d4c82d04e3396e74ff55889c79965da7b1a31addb27373117f3dbe8",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/snapshot/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "4b8b6e9c84bede4c1009efe53fad7ba7286faa0d69e55dbd533846ffdc5384a1",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/last_checkpoint_hint.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "4c8f64c13b5b97d1f6570ae5b6abbd7573d16298e04ccb697e4403202699784a",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/engine/arrow_utils/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "4d1b4b06ae1fc7454648425a363d4d41892e0cda1d325eceed4e135cdff2b96c",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/deletion_vector_writer.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "4d8d3bf92713a074f36c6f5d9699f3a16ad7c2ad3e7bc06de07d82a25b2587b5",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/tests/integration/metrics/snapshot_load.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "4d9e2465206e0e72515362c43716971e339bd8107ab15abc46cd34dfcab676c5",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "4da0a31f52a641f8eb1a65afd4b328dd5d428833fc6abc292ff46477dbffc663",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/tests/integration/write/column_mapping.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "4dbfbc16f2c306dbb0dffa1ad64524b15732249f7b44fef78d5f7f013bec0813",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/expressions/sql.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "4e47257a578875a8d799d83e0407d307eca9ff315eca8ffdf5cc8b152872ccad",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "4f0753f4fdbd0bbad17c2626d79c8b363b84722ba798f414332c8201905aef48",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "4f30db905182d396d786112706b7f132d5a47f08cd46c3bdce87c9b60ed13196",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/schema/file_utils.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "4fb1c5701856162d2b41e578458bf1c37314ea8787a15118cce45dd13f152f2e",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "5040b109f564922f759765b7fde011c723f4e794d0384900fe7a7229d95e6e02",
+      "ruleId": "kernel-itertools-iterator-join",
+      "file": "kernel/tests/integration/log/crc.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "505449a2bc63ea3741028cc481e75c3572336c999ab7eff68108f1f82e536424",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/log_segment/protocol_metadata_replay.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "509e6a934705a9f56ae25af00741adbd3f8d03ef48361765209a77785982033a",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/content_tree/stats.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "5105b6ebf8578c68c1c79b72a4e477899d02e387cd1c5766007375899cfa9191",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/transaction/update_table.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "5156dc230ea6fd9183541f158e061f4bd92bb3b6957a4b3b0c694cd08a53854b",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/log_compaction/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "51d3f9e75d0cd2696beb37c476a25b20a53908fcb3d1a887994e2fd1b695f1c7",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/engine/sync/prefix_sum.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "525a737d8c747a39439d845f5e4e820a25f414e526e963fcb670d1f3181fc868",
+      "ruleId": "kernel-itertools-collect-vec",
+      "file": "kernel/src/partition/validation.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "5284417f37797d2f45c53e27ee545ddedda0cb3f35c7a5ec67cc709c6e2dd533",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "52bc7f8ee0c3af61680b4711f10ea94b39ef868e922e0181bc5f552a64ae2569",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "52d3d9eab84b72fb18909d7488e8e43cc9dd27e69a9d4f2a5bb5dea8bac90be6",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/kernel_predicates/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "530e76949af90196702c953357ce163132f5b6c271c935a50198a71f3960fd0e",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "530f3881323d9853679e59c4a2831a34858b3ea26c1e5712879ca83a2b1ec554",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/engine/sync/plan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "5359e58464660987a9bffd86d294afdd18acc882c660b55ec8aa7584e7476d99",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/scan/data_skipping.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "54829bdb48f08e170b5b6a8bf8956fff6b57f09dc692ce4ca4f64e9bfb4eeded",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "54a8e619ed13688ed089a48792e620a45d0dbe66ab62e1dcaf2845bae86a8746",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "55bc3c8109e7e33750c14a928d8af541bb552bb8af89865f082d58bb50b2cd09",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/engine/arrow_expression/evaluate_expression.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "55f0eaf683fab68888ec524ef2995beda0654af981b7a3e61556020a2da4536a",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/transaction/update_table.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "55fd9ca70f4f0d2ebd6e13fe5630e40c5411a0ebf8b709e757b82bac5273f19f",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/last_checkpoint_hint.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "56018bdbc7efe4571e5699a48dea0356887c14675596aafe98ecfca5bc4521bd",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "560ddb818c2595ab36a713531cb6f7073c74eb69d35490dd85820dc6fd1c03ed",
+      "ruleId": "kernel-test-get-column",
+      "file": "kernel/tests/integration/log/checkpoint_transform.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "56c4bc866a3bf165648852eb28ce74baf2f499e9e9074a3b98e7eaa25c119eeb",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "57420afecb99f785662c985ddc3733e5f5bf5858008f0a9b24548ff92c14c720",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "5788b849eae5dcf42f996dec3b052d37c2acc424bd4dda83a9c5ab60cc703c6d",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/lib.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "57d168554476b202fe82e3f89dd134b6153618e0cc34eef62b16082cd44a5557",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/tests/integration/write/remove_dv.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "57dbd4f29bf80979c91c424318b9a12f8b61126381d09fc4a5b42af9a06ed2e8",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/log_compaction/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "58a1a54abc0463678116b3b782328b4ce0dbec22fee5bb40f7a102826af257d7",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/tests/integration/write/remove_dv.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "58b6b1044cde646f375014981129990c0ad0fe5f61459554e4daff04a15992a5",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/snapshot/builder.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "58c0ed49ce110051665909370e8e41ff1800834af016eaff6b89fa822de23382",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "5a10c4a96260cb4d4607a604d570f5533d228ad6a6182598b717b0ab0e79f015",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/transaction/declarative/precommit/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "5a6029830542fdc2ed9823bfd3f9cc085fbaac07a063b492a1cce75e7cbe8621",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "5a89bf45d0512f20f81336570afd0a3053d29621d91e8e5797eecb0b58339748",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "5ad597bf034f32a7762fa80625de1662e5bb01ebac5b831566a053ce52f44914",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/tests/integration/write/partitioned.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "5b0d76a8a10ed09c27cda307336e7487539a31ca4377136f171cb7a94f599953",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/transaction/update_table.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "5baf9bb47d970d689cb06ca868efae69dce846e382888790d4822bb66dd100bb",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "ffi/src/scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "5bf77b7a172ea2e98ffb0d0772552da3a99f151722b4644a8cbbc09260674821",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/crc/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "5c052deea46e54ceec52f3464ee6181641ff886c3256afab873697141ec124fa",
+      "ruleId": "kernel-itertools-iterator-join",
+      "file": "kernel/src/snapshot/builder.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "5cac22cf97deb4501f7ed1de2a68c5a7362211356383c016429e9f356bc728b8",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "5cdf7d794fbd34fbbf0716cde67c1c4a021ca67afb1d6cd90db1fcefacda1d1c",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/action_reconciliation/plan/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "5dd7981bbaf5151d0d2e0ccf004598d1addf9598aeaa2b9858010ad8110b9c0d",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "5e29248e9e038ff9af3e1e797481ff0c9755c9adf6843a8273f2ec70c40385e7",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "ffi/src/expressions/arrow_eval.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "5e9550911599c2cbf96a8a538959b7a62144ac29094d94ff84b4f219c315dc5f",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/content_tree/test_utils.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "5ed99715f1d96621d46ae0668a4fa6f0eba675a84c9023c136e5995881fcc8c3",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/clustering.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "5ede8ed66a2cd803dd17d42388903ee8053daddbd7b1ec83511402875dfe8904",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/engine/arrow_utils/apply_schema.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "5f5ef1b00214d7856ac72bba3d0e6124cdf28c06e46dd668d18de94dec6ee53d",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/engine/cancellable_engine/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "5fd8a5cc406556ef94333bf15eb35c5ce46cb23476125d7dcc37181b2a20c0fc",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "6055d2fe35f31f3bb1e49a78f9f9005aeb3dc86d854f273b83f15053238cb5b0",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/transaction/imperative/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "609f148b0f2bf3023948dc7934ed9b251b7933a06cabf9d06412d2efefc00411",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/engine/sync/plan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "60bd6c081b28b5b2ff982ad946bcedcfd7c8fe34f54cc5bab2282ac95b65b0b3",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/transaction/committed.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "617bebf292ad866f5bd88c2b57965fc9414bc14351e57bcb911cd4b5884ac8a4",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "618b53f241714bb1c0401789f7816cc5671c136eabe4400ef2207a8b196ff2fd",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/engine/arrow_expression/evaluate_expression.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "618f91bcf518de0918220c9659c712abfd4d4abae4aa7be4a0498f4d720d9131",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "629204816f22e7bdbdb6c0263f57dcb85cce355a32d34c502a0e11de152d9b05",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/engine/arrow_utils/file_type_validation.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "629d599d3557f7e5c0cc8caf3edad90ec0e29b707d7a14ffbfc2aaea3b597fbd",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/ffi_tracing.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "62b6116f748948b3bf1b850750869281e453dfb189761c2db816ccf0f16f6b3d",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/tests/integration/log/crc.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "62c655aadaa71870c99ad95b0f794e5f6996e22adba20612bb0c898f2cdc68f8",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/transaction/create_table.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "62da6a0d38d843f20b1472e8094d9a22fc7473e38decbb05bffa5d372017dbda",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "63c92e229363448db3e75c6e6bfbc615e143ca5d1ff286bacd07575a79d82eea",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/transaction/builder/create_table.rs",
+      "count": 4
+    },
+    {
+      "fingerprint": "63ff6f16a0a1d6199e4cfd71f95ae593769a6cc73325e0de11654a6b90d78b8b",
+      "ruleId": "kernel-itertools-collect-vec",
+      "file": "kernel/src/engine/sync/plan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "64d31317e7f5ec8b93d5e389acef40856b2a12c3d8c95a925e9957020c6f2006",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/expressions/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "6546922e357f0b5acda2aece757b1e46a1eb7428aa1985b93f742ed857a08281",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "659ba276c8cbd0133cfdb27333690bd6f022aee413cd10f419dc899917037a8a",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "ffi/src/expressions/arrow_eval.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "65ca0932b649ea4b4a8491db8a1f65269eca3432f32e2ac1f60465a2a245272e",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/transaction/deletion_vector_writer.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "66e43ddd104b2f05dd3591fc0b8903b2fd9b724d93009df260042f5d9b683aea",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/incremental_scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "66f84a16a9f42a515204c9d10ff374009dba0f33b9d685f9277d80571b7e28f8",
+      "ruleId": "kernel-expression-fluent-predicate",
+      "file": "kernel/src/engine/parquet_row_group_skipping/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "66ff993c86e8ebb8f7817b605a7138e639845e080849b7123984b51fdbe23bc9",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "6704b88d0e25e173cf5067856d9a23714478dc0306d9f9c9f6243d16001da219",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/engine/arrow_expression/evaluate_expression.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "670dee4b8d734a51f310677d5e89a46f5b5db5344cf15ee49eb5bb78f0c77e03",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 3
+    },
+    {
+      "fingerprint": "6714e9818630d79729221006e99468ab95be9dc186ef38506f84cf2a8e59d694",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/tests/integration/write/column_defaults.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "67b1f6ddcd45893c13ef93f2061600961156023cc41656a45edac1cb382d1548",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "67fe632ab9eb531c36d5552dae048b7e6f7b11361e45df9b95b64b58b4432253",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/table_configuration.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "682aa20b21e53ac65a0049dd4ec9ec750993c8ae67f5d97a2101a9b105d9fff3",
+      "ruleId": "kernel-schema-datatype-box",
+      "file": "kernel/src/content_tree/stats.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "683d11e9c9072b196e1dcf724c2132705f40e323e60216e250ffddbb01350f96",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/engine/parquet_file_type.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "6868e2920d482c4cc54dc4eb04e2f8422ecffcc67edd3afc8a88f43691eb342a",
+      "ruleId": "kernel-expression-arithmetic-operator",
+      "file": "kernel/src/expressions/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "68c79fb657bb09614b07e1b88cd8adbe76d3562f59506d690fa6f5731ded388a",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/table_features/column_mapping.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "6978c8817f9f5fe80429a2b0b060c15a433046c66a230c767260774f334670e5",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/content_tree/stats.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "69878660dae2c2e137dbebe4300a3e612b8a874fc0d099e16bfbae8e4c38b4a9",
+      "ruleId": "kernel-policy-enum-equality",
+      "file": "kernel/src/action_reconciliation/checkpoint_info.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "69ce0bf2bf6a6c17b4087459cdd85308c21db80febe95fd94b824df325a5070f",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/expressions/mod.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "6a524028551e38b1f0e65796f49d2d00bd9ebd4ef6dc55fc46337d85055565d9",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/snapshot/builder.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "6a60f9cbb0299591e8043aaca74ec5e45083c040cd9a62cfbc9a0fee47d7f28c",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/scan/scan_plan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "6b7ffd91d6208f703037c38339cca4cd3cee41a8e2507590881b8bdf84504233",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "6c45842103be58fdeb5eaf6683d4ac9f22c85f8fa7c1ea6778c95fefb88520f5",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/tests/integration/write/clustered.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "6c4ff79cd57c2b289620a151b71a79a7512688cfc91a03e3c07328eb9434987f",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/engine/arrow_utils/file_type_validation.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "6c6338ec70c228aa23febdb119e717761fee955f1e5a7d59d9ea7d2f1d3949ab",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "ffi/src/schema_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "6cfcc5235a8c88f6f82091dee5ac9126ca59de5885cd47c7958978e7a43776e6",
+      "ruleId": "kernel-itertools-collect-vec",
+      "file": "kernel/tests/integration/write/remove_dv.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "6d3a4aad19abd5a298f5290022fb369ccbf4c4343f3f83a829238eb43af5e93d",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "6dc91ab07335cb6bf5a5aa1818bcda749899a1db3d1b48498abcec8abd42b183",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/deletion_vector_writer.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "6e40cec912651dfddc06305c4ddcdd6c886bfb4120397e56ec5a654859ec8668",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/engine/arrow_utils/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "6e5953dc90044ef79f52bf467ebc2375b1df7963161d89ea7eb862e9981877d4",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/actions/visitors.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "6f7a5ee7bb3364454b3892dad68f216a23bac67ea7ab6fba77f4a3d95563956e",
+      "ruleId": "kernel-test-get-column",
+      "file": "kernel/tests/integration/features/alter_table.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "70604f49bdcde7f0ecf228ad21cb81e1211d7b3491f615946ff191938880ace4",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/content_tree/action_projector.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "70735de7423562c40414a81a52e8a015d3eceb33aac39cd00b9ec74c7c2b731f",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/actions/visitors.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "709c12bd6d2c647b02692f675a9b03ec1a53206ed1a0d2c225bf4417d7f28d8d",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/actions/deletion_vector_writer.rs",
+      "count": 6
+    },
+    {
+      "fingerprint": "712149e686f93c819fb7e5b7330ec9f3e5acf0dca5ce4a5e92b0a0752f858941",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/log_compaction/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "712ccb735792c69dd0d57b2d0846af56289a7255f51efb4aab527154ed926b9a",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/scan/data_skipping.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "71336960bc6e60707d337f0919ef12495cc7dc56039ada4e4e1334c6946c8321",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "7191c268a5b6686595bf8934a74bf92d4426f430247f9c82a4cdb4ed180df8e6",
+      "ruleId": "kernel-expression-fluent-predicate",
+      "file": "kernel/src/transaction/declarative/precommit/checks.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "71e81538190940e5d10256b4d17dff1b6228746e6300933a6e1a2b7cb91b0811",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/snapshot/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "7330bc8663411a0c9b697c7981b4415074bc5bc2e191bbf7d59c4231ad722e8c",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/content_tree/stats.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "73a615bc39858a348ccbfe6158145d752a6ecce9b9d59c71a972169d357253d0",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/table_configuration.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "741d8a7ef12a354ebf4259777beee0932212b4ce5a85f5e299dd009753909688",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/transaction/create_table.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "74c6d6620ccf301fa5aceaf6f2a759e48080d8ac28dd69218155c14c7605a7a6",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "7509a74c0edf8d5eb32c23d9624b358c800eb49cbe47a65341cb85ac6a46f2fa",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "7510f3f1d17962831af67cbbb7228fbd9126a9b0bc964665738d001ab6bb7b68",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "757b36240ef2bc2ef2e113f5340f22926a5137dee62a5ae65054c0a561b08362",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "ffi/src/log_path.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "75b96850b0c7fdfe746c06cd9349eaa037870ae6923ad5ab93cf096900564e4c",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "763e1c4f27a466f0994606953cf04d467a1c717440ebfa60c4569c20a89351aa",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/kernel_predicates/mod.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "76ac499924a065001a3ac0c15bc51b110d1b8c05b736ee3e62ce94f5bdd086ca",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/table_features/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "7713c8a039543944df468f0880f6bee48ec318c8aece6dc7dcf726ea71cf8f73",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/tests/incremental_scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "77e7316031d34bcadda761a7c09d253f584e74f2d3b84e46fbd601a0cc2285c0",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/engine/sync/parquet.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "7894d972a18d56fff90556c4624fc6fd943b000a2d347b0fadbb181922424849",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/deletion_vector_writer.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "792511d51b4e926b31ec502dc57cf63c973e5c0cddcd86d0393208cfe6322f40",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/engine/sync/parquet.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "7930da6c7ef3af3fb6d09ee33376a729a3ca445229cff188c301bdf551c92bbe",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/expressions/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "7936b17ad20ff46a7c7a8c9767bc26f01c35c7763b919c26e76b94eb15456bd5",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/schema/user_defined.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "7b3aaca12ddee23744a85bcd3e72131a5ed920256d4c359b723ceed860969453",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/table_configuration.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "7b7f735b3b79827440f6dd0e452f1597287d179c59c70dfa3d003a04aaf1a796",
+      "ruleId": "kernel-policy-enum-equality",
+      "file": "kernel/src/path.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "7b9ff3aa9cd6c5a6a1ffd520e27deacf039d9a46fd9ebd5a256b3be20dbdf7f8",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/plans/proto/convert.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "7c1daa52b2f4e1424e3cdead36bd5405fbb7178f6f7b10ff979bd7afb7618cca",
+      "ruleId": "kernel-itertools-collect-vec",
+      "file": "kernel/src/partition/validation.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "7c22e44e1eeba1179584847257aa33e6a4a129d7553d8a7ea663b4da2eb601cb",
+      "ruleId": "kernel-itertools-collect-vec",
+      "file": "kernel/src/scan/tests/adaptive_metadata.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "7cb98de36322915c3af445b3191e6ec5b40359a641a6bcafc9a1c79ebf1631fe",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/transaction/deletion_vector_writer.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "7cc399ce36ecab2acf3cc4102e0248566a0860bd86be8124000f8381976e30e2",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/table_configuration.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "7ccb398e92dd7803f4568b142a99275edc2e526276602e0d2a612f26e9cb1d91",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "7d3f7709ab14ccb386d757fa63110825c656d326638d79682ca98fe11828265d",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "7dbc15fb579f9360307aca10730c53aff8922cfa5f4052f12b1e986c2bf9e561",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/engine/arrow_utils/file_type_validation.rs",
+      "count": 3
+    },
+    {
+      "fingerprint": "7e4180eb62c2cb91968a7e0efb4971a633e88b3a95904d1ac1ef91ad5042b60e",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "7f13c513d99880c919af6ac616f99caa1a3ce8b13d0e0d2f38331e9479bae681",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/content_tree/checkpoint_sidecar.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "7f1f1c1337170a5c760810520aa766b9aa06926f99f9b1d3710542d5763c7c61",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "7f51434d6210848b85817221f59f0e276ea2d5bcc8befdd0aaa122826789fcf9",
+      "ruleId": "kernel-expression-column-name-macro",
+      "file": "kernel/src/expressions/column_names.rs",
+      "count": 3
+    },
+    {
+      "fingerprint": "80311aaedb71fb522ecf7f93b215ff8d2d296146d398597049b0f946f5cf4ae5",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/log_compaction/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "808d5a1e2115899d365d57334ae9af6631cdebe0cf7363dede0d7ec328f3cc4b",
+      "ruleId": "kernel-policy-enum-equality",
+      "file": "kernel/src/struct_patch.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "813b22bfe919c3dbbfa802b4805924092bc5486afdc6526bc41b9efcfdd40734",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/expressions/column_names.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "82128474cf7f509f5ea006669dc0e1ecb8a970b015a9b224b81002fed1a5cc3d",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/last_checkpoint_hint.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "825588ba8a6a4f4023bdf7326f58f4ff51b62e8669f4d69d6f0294cb2dd3e2e0",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/content_tree/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "829c22c21bb76938b76d8bff11cf2ff25c7a038a0c4272ebb94659e3dd681005",
+      "ruleId": "kernel-expression-fluent-predicate",
+      "file": "kernel/src/engine/sync/plan.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "838312bead9dfb8beb835a99d0ab3348503c03857cfb0c487f2503746dcb4808",
+      "ruleId": "kernel-expression-column-name-macro",
+      "file": "kernel/src/expressions/column_names.rs",
+      "count": 5
+    },
+    {
+      "fingerprint": "83d1127acdfe6aa336a1331824d6795ba29cc2e2c6968df52ccf8ce82ef8c5ea",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/expressions/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "845802bb2001bcd93840886cd87b8e7db06f03dccdc5d7aaeb793c35d99e0b47",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/transaction/update_table.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "84753a252a42fdbbee4b5d5f96faa655950e4eb2ed6038a1ace44464f270d34f",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/engine/sync/parquet.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "84ed0a7c701347d75d5e7b2e03355dcc616403aaec1cc431ed7cc9de2c35551f",
+      "ruleId": "kernel-test-get-column",
+      "file": "kernel/tests/integration/log/checkpoint_transform.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "850f3cae5b3655d272dea009ef8998adb29e39aaa6e39b838c569651ea7d1151",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/engine_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "8549a7b5558ea0d55fb20be9594273d27ea54ed6e37936ef34dbca33469c2c53",
+      "ruleId": "kernel-expression-arithmetic-operator",
+      "file": "kernel/src/expressions/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "856a1cad2b575f19d91428aa8ff6bbf317c1fceee8ac04512bd02d55509aa44e",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/table_configuration.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "8586bd63c8bb190f4cb93c32258b02a9d220a223a3848633308ddb2b1e1cedb5",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/deletion_vector_writer.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "859ffed99bff39cbdae911ab3e172e89d919d75538594c80e16c2fb6035b848c",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "88f08c9d4197ca61d9798a3c25b67915e54ac4b79657f6d0511397d84cdef423",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "89a20d5d6b633962efecd2cfed2c38c48c127ed09630993563794845a1827511",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "ffi/src/delta_types.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "8a2ddb7fe7668ba62ff0987ca674f430cece08aab19b911abd861479a8f2f0ad",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/actions/deletion_vector_writer.rs",
+      "count": 3
+    },
+    {
+      "fingerprint": "8a92ad8fe4d626cd655d1d02e225ac7f9b2fb5bd54be522044ded26ec5c836b1",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/transaction/declarative.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "8a933d8bf3f2e8f90e8ea3b33b039cfd48e4af79761c7c31d0832f43ac650545",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/tests/integration/create_table/column_mapping.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "8bba0da4b28bb82b6021548b98cb0765448a124bed9223294e111fe0c57e945f",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "ffi/src/expressions/arrow_eval.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "8c7e6a0017ab5e1112f83200dec87da039c202967b7354b363cd6817e77ff133",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "8d1e62a02ff5af58ee30d4792b5f470f6c88fd49a4e3aff679de6d3e6ceeed9c",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "8d4d4059f7b5ea3676b805a890b13c22379ae6d8f664450e34a5353c0387d7bb",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/lib.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "8d67021f820be361fd1459b66b1afda3828d48469f9fbf0673fc6802c63cee4a",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/kernel_predicates/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "8d98506dbf13b504e705510223212ad0691cd823980f00f5d0f9f4f8feb39a14",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/schema/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "8daad3c1e33c8eaf61fd4bd64392f87b307e8590eb33d5e644287956845c7bdc",
+      "ruleId": "kernel-policy-enum-equality",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "8ec1f19650e4c665c910b65b2d97034eb6506f5f516d82ede9390c3735ccfe57",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/expressions/mod.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "8f8b6bcc9f6805195ad883ccfdc6bde0c5a45fdeefe8f9d9f4cfc4c656608adc",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "8ff4bc56b031b8274ec090da94df4f32b69c938c186ced3b303fa4fe84a3777e",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/content_tree/stats.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "901d879bec2155936c68279e49d7eb846d6fd9835ab7715836f56d34a2ee4cb9",
+      "ruleId": "kernel-itertools-iterator-join",
+      "file": "kernel/tests/integration/features/iceberg_compat.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "9020bf22c560ea3f68a34ddf9fa19217ceb6db7e733f923423470c18b0862dc6",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "9168b96dc7cf5a0ee11d595f9afeba345cfa190c8ae29169ed66acc1b8466c7b",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "916b86ce3a27d916617039a1e81209c60d62963571755b558cb7dfb956dd7181",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "91d4c20d7d74a785d4482f3e4523daaf932d05c13b246d2620036a73c6a90c71",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/engine/arrow_utils/apply_schema.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "9214cb830f5111f6292ff9c6e5772e527f71a2e7cf1bc64fe95905bf8b3e55fa",
+      "ruleId": "kernel-test-get-column",
+      "file": "kernel/tests/integration/write/stats.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "92a17baf2d1aff796efa577b7e826207c4a684eaf3f568149b5b1f31289b5483",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/plans/proto/convert.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "9487fb27bf221bf028e299f2c1bf9841040b6cb03424813331d846f82d77afda",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/content_tree/stats.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "962ffcdecc948ecc7a004f3d9db4a50f2937bb15104f6866d5eea5704b7dd7cd",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "ffi/src/scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "96d9e4868fc196772b615c71c8d0ea708a4ce7802af3a2f16d7976e2f60db521",
+      "ruleId": "kernel-itertools-collect-vec",
+      "file": "kernel/src/engine/sync/plan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "96e56eedf3b190325ff19d2daf8ff7e0c72d75bc89dcece8d2d1b080b1082928",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "9762ec3c9e9e491c93ea569807d84c0a6d5b1ca05252608ab201b04f2d96c386",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/schema/void_utils.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "976ce8b9ac9d6d7705120c5b88b91078b306ea954784afb4bb19516b65dee679",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "9800d6ca022269eabf2f06e96b65ac2ae088d0bdee946b902e802d1e2e4caa7c",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/scan/tests.rs",
+      "count": 5
+    },
+    {
+      "fingerprint": "980cd75079f4d5bc9b5f96e3a6e862a7903d5b71d50135bc4a350018b48c71ef",
+      "ruleId": "kernel-schema-datatype-box",
+      "file": "kernel/src/content_tree/stats.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "980d05f89d2eb33c13a42a61c40496db375e2434d73ad33b1d70014403b23117",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/tests/integration/log/log_compaction.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "98afab3a3bcb0c5c10ef203f7dc38552c3357f1711cdcb9d994d40e381333e49",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/engine/arrow_expression/evaluate_expression.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "98b1a3934a9e99fcad5d3cbccbc7c6279d306a49f9ed5d9b6a9c2a9aeb30e521",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/log_replay/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "99c54d060226698bc3a6da3190e44a4aed5723f1d112fb25040451e80aac82b4",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/engine_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "9a7afcc820b33c4580d40985937c591192150eb3b292329448b74e2412c93a36",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/schema/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "9afd2f0700b07487d3c78c29324676a98924b3ceeac82a46e2022d369f760c74",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "9b4f61a35a7f4fca71d8aaa96396b92c91f35964ce33a04a759f8c2862439003",
+      "ruleId": "kernel-policy-enum-equality",
+      "file": "kernel/src/snapshot/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "9b9398e13a2ad61d136af371ba12c023d0e54b3e086fef154962590901e66630",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/tests/integration/log/crc.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "9bbba640f3954d1a52268a2a8da43c5007b96df6258855ae504dcfd6193bff2e",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/kernel_predicates/mod.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "9c1c0e27770d0e03b21961cbf951ed7a275ef36df931eef7765872f03a812ef1",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/tests/integration/metrics/snapshot_load.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "9c9c7ede3b61765ca406fd3b175f3564ccddfa07194dcb4b7d5d33d4bd33b0f3",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "9cacda7a1c51d2fa1fef23279eb0b9109c1f6612d879ea451acf6bd3e377aaa0",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "ffi/src/snapshot/hint/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "9cde97c584cbe9c268b2e271e7bd549d52c6174d0959cca6a06b8da22bbe2bbc",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/content_tree/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "9e0ed0b59b3b3eab8c37aab153e68f2722160e55765533d849de6782363181a7",
+      "ruleId": "kernel-expression-arithmetic-operator",
+      "file": "kernel/src/expressions/mod.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "9e8606c4e81c65f6c73b3ce11e4e91c9fe24294136c3fbdad41d2a0362aced4f",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/expressions/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "9eeb4e46caffb06cbdb755a728ae87cc738dd9767fcf1beec3ae2acaf273fe78",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/actions/deletion_vector_writer.rs",
+      "count": 3
+    },
+    {
+      "fingerprint": "9efae887f2bb064ff9c86488f0bad9a9978b4f0609540aefc4159c3ab6675cde",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "9f013e3347b4ce9f633d6e5a9e20304ed5575c1e7ddce0456db5532c4d755ddc",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/expressions/scalars.rs",
+      "count": 5
+    },
+    {
+      "fingerprint": "9f3bc518e724cbbf3814ec034bd8f4fbc7468b4cf63974b25ac1c21882c4f0b9",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "9fb0f31b84bd56c60358e1ecf86aca38a8c202399854944bdf6a95d955a3ddd5",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/tests/integration/parsed_stats.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "9fc55b19f84a46d2da150c2b9afab59cf7a3ca9145cbe89c9d2cb7ef99ddbb87",
+      "ruleId": "kernel-expression-column-name-macro",
+      "file": "kernel/src/transaction/builder/update_table.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "a03f306c97ca54cff2d4682db74efab28dbfac4b1f6fb7611098175ac9c837ac",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/actions/deletion_vector_writer.rs",
+      "count": 3
+    },
+    {
+      "fingerprint": "a1174d852878afb48ca3e7ea891b72fa0e0b840aaffed9daacce2e4c27295f82",
+      "ruleId": "kernel-itertools-collect-vec",
+      "file": "kernel/tests/integration/log/v2_checkpoints.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "a1ad537e66e6300c36a44ad18a58e13948529b2c054ebc9f37559df02894e040",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/transforms/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "a1c4d6d6e4d561058f3bf8da5f98267d558488b101110bfb34f0e4532e82a2d8",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "a2c5814487b0063d7fb3393378ca95fced2bbc062bd4175e0d24f9c91a936d2b",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/engine/arrow_expression/evaluate_expression.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "a2cd9b4683271905e13776b52037a61c98f348ea2a2a03466a71f202297cf07d",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/transaction/create_table.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "a45d7f9c82d266c58a38d8b588cd07e022b43d5fc28f3e77c8dcc52c9f737a9c",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/table_features/column_mapping.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "a4b5b94325ade293cfcab8ebe6a9f58c31032bb9b9865418cbc3e91343b0f845",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/lib.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "a4bbbea871ee48ffbafef26691830304f75836c59c2b5c7c5298c585f1e778c5",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/tests/integration/parsed_partition_values.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "a4c262414efe6188632c34254436e3fc6ad900e0db36ecbfce557e64a3db63f4",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/transaction/create_table.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "a4f13a87beec592ab964e346266e4ecbd2ebc1a77dc24e4d4d74f32c61532375",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/content_tree/reader.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "a50876be9cdca5ee48b3636a9749a66d3eb286b8c17f55dee89c63abcaf31497",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/action_reconciliation/plan/sources.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "a52144d83e46d0f8b6e839210e10508173094a433b79ae3c54851409b71f0408",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "a5a0de0b713a20a90601e0a8ff36ddea4be218e46a081f3690aedaa997e0d5e1",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/lib.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "a63bbabee26cdd1ef6992399d2cb045f63ca4d50aa2751d81e2aa4b94e09b8cf",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "a70b295760826be2c46fda2da12cb7d8e7f8a6c96786f1ab7b83ee70541bfadb",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/snapshot/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "a7bdb6d4c460013f91b1d40ae8e86e2c19f81640ee6ee6fac2c55c8017c15da5",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/log_segment/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "a7c073dae9e58cc64de59c077450ea3a8a471f3aa6fcd36e24106932f405b196",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/plans/ir/nodes.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "a7e7b8eb4462c2f6f23739c8012e61ea1a681649c275b914515ba13b8b5c3a81",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/lib.rs",
+      "count": 3
+    },
+    {
+      "fingerprint": "a8955cfb53ddeb254d32c8fb35e9e997d4e0d0db413b7a388dc10032424de799",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/expressions/scalars.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "a8b5c3debdbee139353e88984271f98707e50a9b30f5673a2dc5ecbd712fab97",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/deletion_vector_writer.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "aa03023ffd3d881e1c579a18257a590c747cc5a46928efc7404298461d40b523",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/schema/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "aadc8e109ef0552d36ce97f4616ba12ff5bb1c3f9dad0c862e168fd1ddba91b4",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "ab1a91cc3004804b2433e31df72cc224145b32cc91ede009778c6d34a6c583dd",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "aba62bd6fa286500c6b6d93907ffe253c9b055a4756c6f5420eb2f7f4d63025b",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "abb29dcabc95a8f3a4282ec6be5f00f48fde028a5ffb8305c52ff97633c6103b",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/schema/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "ac06d38136d2789fbf9257d2810c84b66046dd7d2a6e25978a8e1e17f27846e8",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "ac3e2dde45d739abe05916d58d9bb144c21f83dc10682e4b92565121f00dd8ce",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/tests/incremental_scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "acbcfdd6f1756a904aab4437ba40e580896a702a6e26b11fa7a673b87a9ca730",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "ad96098105ae4e2cca583444fcc31ee8db716bd9173ff6fcb1e4a720b5546f62",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/last_checkpoint_hint.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "ae2a7793a3e9ff5a38e6a73240b8e2f4fb2fe1787869f793995ea9e030559a4d",
+      "ruleId": "kernel-itertools-collect-vec",
+      "file": "kernel/src/history_manager/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "ae9dc874547c58f765ad1682a63c9d65796cf13ac005ccd57a7f1e7916dd265f",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "ffi/src/delta_types.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "aee281b35e79aeb382d302923cc226d2f69317d7f0106db4a0837193cd16d0d6",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/transaction/commit_info.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "af7e211c240bcadc4285bd33e0ab4dbf59f1b3224cd90e42ad45b57fdc5fde35",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/content_tree/stats.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "af88bb07465371a0466075e76206862f50fff39f0384c877d5e345e7e8ea97bd",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "b11e3cc2cce7297226c4d466b570a245f5b37a3b812089576538ce34ebc370ce",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/lib.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "b15d76b4f0cacf9fa7635900c80148fa26df44252392e0cd733dfb291122aa12",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/deletion_vector_writer.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "b2501acccacce622ad11db3e9f912907a6b9c3b6ae7c425b61f927f4204ee98e",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/expressions/struct_rows/engine_rows.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "b26abd3f962a8812cae783da0d361792dbe85d0e0176032977678ae48a359550",
+      "ruleId": "kernel-expression-arithmetic-operator",
+      "file": "kernel/src/expressions/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "b2c856678f07008e9dad5be2b6128310feff239de57b71a3d6b994a976371b96",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/scan/scan_plan/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "b3217e0c80b4d7a6303dc420eb5ff4313a823cdacec29ea8e11227e806e53563",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "b3de7a5c71d342f5e3ee3d60a4384c9bd2e9d68aba3481cbde08983d7aba1e71",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "b4101731e0aa8e24e08d30c1f184bd741859fd45f46da5a40ee50294d94feae3",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "b44dacd2c4da83c3efa0c1ff9e0054c123cf5a31731a5d60709763dc1cc3101a",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/transaction/update_table.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "b4a614b4c20173d791202ad8f4058ca8580da5b389863ae7273b101aeef64125",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/tests/integration/features/dv.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "b4f9881f25ce6a69016678f9dc751efa67a99eecbca3555af0ff3988ebe0191e",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "b59924f8eba862f914acb7a06a7eea11c36e2bad6a4b5564dc1a234684b698e2",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/tests/integration/parsed_partition_values.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "b59d989b0566506b89bd54b3c89292ec047a03960740f634bbe1d20789eabae6",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/snapshot/hint.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "b5a2c69f60593a0b0b9caf79d73d87c170d98a1bfa3e34f81c4a9c4b2aa34c9a",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/content_tree/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "b5e3f8f93f810c46ffd6ca43c3a3875ce8e5da47312c5423e3d5d23f43472c0f",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/engine_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "b657504b1fe078c05cb6a9404ba8f83dee026c9a2f34bd67690886e4bebf7bee",
+      "ruleId": "kernel-expression-column-macro",
+      "file": "kernel/tests/integration/parsed_partition_values.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "b6f294455623d05be95858b046c81a213e7694cebbfff5683a8d56a659622fa2",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/tests/integration/log/log_compaction.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "b79cfd1f384979196c3716339e433b28a859e2444f99fe172965f645c5dee991",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "b9367b04379a61bf8fed72cbb3cc2367b1d5b24bf830246aafb9eab8de4c2a27",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/expressions/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "b9f61cf5bede2d83216d7a380879692eb91cc42f6c0753a9c80ba7a6f8698538",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "ba621d9c3770923335e2f11cf641547314c07c6470e501b490c069b3a2893555",
+      "ruleId": "kernel-itertools-collect-vec",
+      "file": "kernel/tests/integration/log/v2_checkpoints.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "ba94437c1982c46d31a487ec86913b7740ddd0391c3eb91192cab3d3b9e33c95",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/lib.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "bac7062bd221d5edebb7a71229dc5b7d5dab4a486a21c263d116f27eed464085",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/tests/integration/features/row_tracking.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "baf91ad3839c5b8ea4c5688949b63378f8dca1d0e900542e46f5ed6efc224ffc",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/table_configuration.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "bb8204da593fd72b43abd266d0cfe322b78033d21c80cbfca216d0bd7eb4bfc5",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "bba326d484c04974b5eeffcfb0d85310eabaa5e7ccc1f4e6ec8d4fd058696975",
+      "ruleId": "kernel-expression-column-macro",
+      "file": "ffi/src/expressions/engine_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "bbacf5b8f041a8b8b23a8d19985e5d3dcd5c7d20e45b30b7b28d93c43b196a95",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "bc2731aa1c820d6fd2a73e1e78b8fec56ec440712a6dbeab66d5360a1584cca0",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "bc97ebcd0986a687b024ce841be1f8e606a23ef306d968fccc5e19877b8e281a",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "ffi/src/schema_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "bcfdbab1f9e09bfdc804bf77b3695c2ebd646bfceb9084047e2377371d4b4e3e",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/table_configuration.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "bd0f9d8e58fc34cdbfc60a365dfdf6a70e5ba9386fce604b0c6dcbdeebd8aa57",
+      "ruleId": "kernel-expression-column-name-macro",
+      "file": "kernel/src/plans/proto/convert.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "bd6ac020e6bcf5adcc7ec7ae0666b331e58ffe4971c90201729ea769b684d178",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/plans/proto/convert.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "bd81ebadc34940d052c77b1660ce2ff5114b53457595dc5a7dd5b02bc7a88776",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/transaction/create_table.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "bdc5c89bda356f8618bd219ac9724c0805afb19e71e6b02be768f4a20c9df2d4",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/tests/integration/metrics/checkpoint.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "bde76073dd5d2834e5ad98eb67f0b77908ab2b22197412eeb27d8f3219b57b9f",
+      "ruleId": "kernel-expression-column-name-macro",
+      "file": "kernel/src/schema/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "bde7c8c9bf9a130ce460fc7d515746a1a5c712a5812bf2546c875ebeeaf5587c",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/tests/integration/features/dv.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "be53e22b4c5014527dd826b4de618c5ac05e68ded04989a47b32c6e18e4e2fcc",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/metrics/frame_reporter.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "befa1012b6487894366f97a7e008e77831b197d9da030a97f897aeec2872c0b3",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/table_configuration.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "bf3212cde777dc893b696804a647155d4a8d7d6c1cfd62824b9bc101e9a45d8c",
+      "ruleId": "kernel-itertools-iterator-join",
+      "file": "kernel/src/error/delta_error.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "bf54d76d031225ddefb667c8dad07de7dabac633cac15c259950ff57c92d6054",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "bfa6191cff99cef947470fee087a48b9e4b0c41befd203ed14275e3f46bbee27",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/expressions/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "bfad19f6a195ffbaf571d9e2cb8d0d622838488ac01f905c60690abb3771b48f",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/transaction/imperative/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "c0b096cb1ff466c573968260e31f1fe6635f7e6b369fe576991dd589192b5d44",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/schema/file_utils.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "c0bf29da33a9be41e34ce0abdf9e562bf30e8fb6607612548af1c49bc3c3e49d",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/incremental_scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "c0d2f3ff3c1f092470756df2f0b7c5c927f85c7792959d6350cf0778c65f9fa6",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "c0e5b674035b4e5da3e97155b547a1ccd7a80c45d5990a288f03d0202f6aac58",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/engine/sync/parquet.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "c1d21d2f3a75caae3f863daa08e4ab9563764d0c72bb7ebbee14eb72172b4e3e",
+      "ruleId": "kernel-itertools-iterator-join",
+      "file": "ffi/src/ffi_tracing.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "c25ea0563a204073d28f3b50f5e0037250da3892cd6f550c368ea3d237b085a7",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/lib.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "c2b6cf05610f8247b68a88234c8c7743db821033bac106803dd363f28d115b07",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/snapshot/hint.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "c303149e57cb307519745906e70315d82c50d36735f026834c2854d7c3fc5531",
+      "ruleId": "kernel-itertools-collect-vec",
+      "file": "kernel/src/commit_range/builder.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "c3374278f8717bf93e8ac940021dfefc82ddaf75a90f0d961fa344608b4abf5a",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/table_configuration.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "c42466173d8acbd24603bf469dece6c9052dd09477342a9826a1dbb39456368c",
+      "ruleId": "kernel-itertools-iterator-join",
+      "file": "kernel/src/action_reconciliation/checkpoint_info.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "c54a726f42a5ac8b89b0ef3b196ea843994056c898133167f863efd142badaf6",
+      "ruleId": "kernel-itertools-iterator-join",
+      "file": "kernel/tests/integration/write/partitioned.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "c5a8082f771730204db7d26b45a20add4fb69028e92ec8dd4a0b27ef20ffadff",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/snapshot/reader/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "c5b4cdccf5aeb28cf25609a614e10459525216706362e159a30554f920a2b6cb",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/engine/sync/aggs.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "c5b60ac45d30f726204948eea5fcc866d27bd75fe861c4eb747fea3db4d86a8f",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "c68342602f5602e4f172eb23a60c1c65636a107889b85e1188b2a2a9b9bfaaa7",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/content_tree/reader.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "c6de91a4957574ccc93d8eb8a0e2e27982494d7275160c13f7a66496cf5e8982",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/expressions/sql.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "c7f12b1e491dff1f73f5b14a20b40b982fab84500ccc0b86f60c2a31d45ef096",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/plans/builder.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "c89a48964f2521f09b55d144e40bc775fd8b5b592c910b1ad8d64a7ed4ebbdc3",
+      "ruleId": "kernel-test-error-message-helper",
+      "file": "kernel/src/log_compaction/tests.rs",
+      "count": 3
+    },
+    {
+      "fingerprint": "c8a184f7f73aacd70d3f8cde6e15e508a9ab54d35e5c04bd893397adf0699fe6",
+      "ruleId": "kernel-test-get-column",
+      "file": "ffi/src/scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "c8e3794694da3c997827397f6d47833405f4facf4087ddfb8610f6f4105b11bf",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "c9379576f12535f8a225477dd42f113502a519c6d4b1de7c359da0bb4b4a7493",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "c9efe0d199fbbed18feb688c86af959f7936d185f31d06e3e43a1dec6e84bc83",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/commit_range/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "cb25e149891bf74067d28e0f1364669a86004d99c9831238c26dfa977dadefb3",
+      "ruleId": "kernel-itertools-collect-vec",
+      "file": "kernel/src/log_segment/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "cbb2cbf3d0173eeacf34007303d82bfe357bbea31b98520be279c019596f5f90",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/content_tree/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "cc0f76b0a651f478c796ca4fa25086962535624d711ae8c5b0053f38c85ee940",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "cc987c89091364c208eb9d81fb52b466d9530cef6ca65155c5a7ae0fab6bc3d4",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/log_compaction/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "cd81b41af692dce1dc03bf98145b3ae180372d4304ef89dc2eed24e82ff4f69b",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/lib.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "ce985af711e02ce9b48cb52b2ccd89790d6f08d2a240ffb6ead5b278004ecaa2",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/content_tree/stats.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "cf40ae1af626c288368a5b7b06358cacbbdd72817d3abe07eedf1cd0a164817f",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "cf433e239a255de7eec3271451ad935a4fc6bfdb189ba3b6d53354e08a9f00f0",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/content_tree/stats.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "cf4c253757f6e4d1addd2c7993fb4ce2787612127d9ab26d45fe7bea5b4eae6c",
+      "ruleId": "kernel-itertools-collect-vec",
+      "file": "kernel/src/scan/tests/adaptive_metadata.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "d021ab56b3cb36a6f7bb0ca62e40e64e45322805bc697d1ec9bacc0e2a11de4a",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/scan/scan_plan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "d107898fc20551913a928c2ce8a75253d0c0e2c5967804f9fbbeb77bb8405931",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/content_tree/stats.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "d14aef637dad320ec3addd6f08abc09608c130f7e43228095818852ce1c397f6",
+      "ruleId": "kernel-itertools-collect-vec",
+      "file": "kernel/tests/integration/write/remove_dv.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "d173da92bccf73ad6b22379895cb1c1c6423b3031855c7f210ebe00f7cad706f",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/engine_funcs.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "d2593ec51a1b5df9da7f578f55cb9bb8f60e587a3de0c1aa5a72a4d35c688ecf",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/engine/arrow_utils/file_type_validation.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "d2796169adb4b5b717c6c81478afc71b7151fdf9d0da9e2099126401fadbe44e",
+      "ruleId": "kernel-schema-datatype-box",
+      "file": "kernel/src/content_tree/stats.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "d37cae505ef5fd4bab46dd462b0062d905586b6ec97876b051875e2c329fb01a",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/engine_funcs.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "d413b13d823e508371987ae7fbd7842cdea31686010aa7eea5efcd05f38a84b0",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/table_configuration.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "d44a95267d5655b71d4edbb65a5a0bae2a0ca051b949251afbb268008d012e84",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "d53c4dc39bae82b604373d17b5e488264ff6448b65524ea7d700177a54a294db",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "d5db349665fb9e59b789c35b3be02ed950d659f4edca4c8fa8ce1f2b0b7d7356",
+      "ruleId": "kernel-test-get-column",
+      "file": "ffi/src/scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "d5ee2bf90966139bb7163c7cc09775b7dd68b88cbf9b5e72485b108192c48691",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/engine/sync/aggs.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "d6352dbbe8e43f23658232d34dfd5523fe7283823ebc41e4d12612d4de779026",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "d67d983df5a294ffad6f9c974477a7f5e77bafd0008205396a0be25c4db93038",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/tests/integration/features/dv.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "d6e4b282286a900e40b9aa6f6fe560e1aabe7239e230eda1a59250b487213c85",
+      "ruleId": "kernel-policy-enum-equality",
+      "file": "kernel/src/engine/ensure_data_types.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "d72d906b9d9c538f26a12b8504c0730a6b6143ca1f48dad4bfaf2a1a3db1f81c",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/table_configuration.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "d7c2d83981cc20db91dbbc386cb54359b57507e3a6c340f1623f2bc8a654e49e",
+      "ruleId": "kernel-test-get-column",
+      "file": "kernel/tests/integration/features/alter_table.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "d7e4fc78ed3b13cfb9378d8eb7146278637313bcdec8259c80180bf22944422c",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/plans/ir/operation.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "d860d9abdc3cff499841a865076ee028582049f94d2c056990a76c13408971df",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/scan/scan_plan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "d8eaed49d20e795d847150f6bb84aea7ef760dc2fe60a26e6dbb46c80c059ad2",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/engine_data.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "d93d42217e97d7c8d1aae76c0905ecbb5bb9f250c84d17ee9d833fa7147fdb7d",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/partition/serialization.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "da2b0d4a058dad92830847084910abdae8bb249ce44e0224ea36069e6a061836",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/plans/proto/convert.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "da2e94c78ffd07b5d9db638b9eabc52c38ad46745d8a8d229a2aa915cfd13488",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "ffi/src/snapshot/hint/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "da383b6452cd6b1a2795c1c3ee4f1a7ff8ba433a86b08dbed07c9c3918d685cb",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/tests/integration/parsed_partition_values.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "db49efb8472c95959fc67df19e1db28d098ebba33ceaba27010b41c6563aca8e",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "dc0efe74039aa4d4a9362452524f16b691a1adeb8fbf19e73d896bc6c64d118d",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/tests/integration/create_table/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "dc1af3b633c45ba70c61422d62d1e5d7c628e4bcc0239599cbda66e6bdad9099",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/scan/data_skipping.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "dc1f84ff584f8c79dbec99815c82ea4ec9ed8c940544974800c1109348ce9ff5",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/plans/builder.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "dc8bccb6c2d8aa47e0956e90610380d20f5e9095b5adf953a8efe607c3c5972f",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/commit_range/builder.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "dcdf07171c31e88b53a1f32db4965cc7dd2a2e05248f23467156f63e8f97bf60",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/plans/proto/convert.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "dd1769136419a48b1a9dc8327ca2016cf1278a5a047ed0e2a67b36fd6e5c9bdb",
+      "ruleId": "kernel-itertools-iterator-join",
+      "file": "kernel/src/log_segment/protocol_metadata_replay_amt_tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "dd5da1ac43af42a975b7792f623cd82dcac2e7f8b527c18029c588065a27bb30",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/engine/parquet_row_group_skipping.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "dd8f6ede98218b164dcea325d3b00ace2adf62345a6e1d57dc762eadb7cf6c74",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/log_compaction/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "dddcc63055937c7088ae0042fe6fe6ed3464eaf8cc14875c7c5750d6a2cc093d",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "de26e8b6997f072142f784d3400cf466bef0e3bbe8726bb88df932dba7b1b359",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/tests/integration/features/collations/passthrough.rs",
+      "count": 3
+    },
+    {
+      "fingerprint": "de5146b572293122391cdfea66f30931b2b4118a0b13b4ba4da4618518deb504",
+      "ruleId": "kernel-test-get-column",
+      "file": "kernel/tests/integration/features/alter_table.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "df3de35b5694a3d7590dbe6bf68879c9390f35b298ac2e537bd7f5bdd2f0a782",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/scan/transform_spec.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "dfc1b01e1109632911fbf241e18fccee7187ed309cb31e032f2b8803b15934d0",
+      "ruleId": "kernel-policy-result-iterator",
+      "file": "kernel/src/cancellation.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "dfcce1c168edcbf4e8790839d89a7b5b864f26e0f5538bfd5ac6f3e685e6a998",
+      "ruleId": "kernel-test-get-column",
+      "file": "ffi/src/scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "dff9cdddc90ba8ba801f55adb4121133a3ca7508368eae28095c78e830d38027",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 3
+    },
+    {
+      "fingerprint": "e02cf80a8bd4e1904b30f16b3251c6f5cede659e816e652045f9a48027f8e98d",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "e09b53f1b89db4c7100f6c4d3978955f0542bc797c9e7f88ef084d6bc85d06a6",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/lib.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "e12f92fc7e8fc1494e392b7eebcd89eee62a837f063ce2a49f56aeb6e7aebb29",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/crc/reader.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "e15b176ee3b3d84d2c295cc2f14643f980ea31e1216fd479009f748659aebcf3",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/test_ffi.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "e1b303d3155c24abd3799abf6c352aa62ba197e903b7dd1a1f1629362f5cf850",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/tests/integration/metrics/checkpoint.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "e263b5af566c648f23b133d80b98663be9cd6cab2458223f31ea1488d72eaa96",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "e2aeefdc45a0953442ca2687eb60554c8fd5f97a0f073b4b5e0626ef9fb3c58c",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "e31691ed24cdac3bf9ebd5a6ee68862fc8de83aa68d6a6d056ace78142ea66ae",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "e31bff63a4a8dd703d2afeec66db6456168854fa165502ef6aaf062b5dcf2deb",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/engine/sync/prefix_sum.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "e33f74339ab09ccb6b3861837565ec924f8f421ffea70fc264349fb419200db0",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/scan/data_skipping/stats_schema/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "e38eaf6ba75ef2e823f653854d2060f0b8b3a145513806562efe8168ffd81597",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "e3b0370d631cf0682eb234ae071e15de410165e67e1ba422386f447fb1bfc1a2",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "e4c94477864e48f05c9a6d399784e995a0e7a510a74589246578cc31fb6e6a07",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/last_checkpoint_hint.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "e4ce76e8d9eaa8b46844bc93b76b0fe1a504d5abc77d664c06f6193e50010eb2",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/deletion_vector_writer.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "e4e3a8508a6990d83809b128cca0faac4ef75278ed7eaf7e2dd242fe7546fffe",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/lib.rs",
+      "count": 3
+    },
+    {
+      "fingerprint": "e57ba6cd016f3333316c1a53af163f5e81fc1807cc3d45d3136101b3a9902468",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/expressions/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "e62a0db7344658d320a545cb011afa49b29f727dc94f8de83a12f1af7e8de569",
+      "ruleId": "kernel-itertools-iterator-join",
+      "file": "kernel/tests/integration/features/iceberg_compat.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "e65bd55f3ec306b2ec52304811b80f57316c84fd34b56b0c45a830f2a8d0fe0c",
+      "ruleId": "kernel-itertools-iterator-join",
+      "file": "kernel/tests/integration/read/user_defined.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "e6729a1ca0d0e79f59c61b0a32de3047ece641cc2bd6bad9b168d9b6773e10a3",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/tests/integration/write/remove_dv.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "e672f66591f6ef6dac960daf993818615eb338f623629f8c317f2b8f14f041fa",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/scan/scan_plan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "e67f3f5992a3e7b544d016dfac0ccc480e715615cb24a03307cdc1b44b91d4e7",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "e6cc30185250b75648334896184a65a345feb51c01cf179e2e3b6ed49537fa63",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/engine/sync/parquet.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "e6cf2d76261e1d20839c0d2d2ff882c458719a1dcffdb71ac97a6a7f11a866dd",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/expressions/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "e6e6f9ce75f47d28f8f713531bd2f2a780de90c1d826dc343e6baa19e0e1ff79",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/lib.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "e70ae35949bbde894f282ee65cfdad161878f7e32036a68474143ad96d2edd2f",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/tests/integration/log/log_compaction.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "e77502620c6dd8fa96a1539785f91c84b7c5127cdb08f3c71409a63718cdf5fb",
+      "ruleId": "kernel-itertools-collect-vec",
+      "file": "kernel/src/commit_range/builder.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "e7bae821bf0512a4b9c2cda46098348966fcd90e705161fc43d421a705d38f80",
+      "ruleId": "kernel-test-get-column",
+      "file": "kernel/src/log_reader/checkpoint_manifest.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "e7cbc8e9dfcc1a4912a4d1df842ca8ba4582044ddd322cc4c6ae2c909abb242c",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "e8c31da615463f59085ba84315b7274c927ad72fbc45f719fd9294ef0f47e5db",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/engine/parquet_file_type.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "e8f599a3eb512e2a05f837fc8179d0ae3877f3d39489bc08222688098a4fa9ea",
+      "ruleId": "kernel-expression-column-name-macro",
+      "file": "kernel/src/expressions/column_names.rs",
+      "count": 6
+    },
+    {
+      "fingerprint": "e98be595520a14be8e329915f9ad34dc481c28274ebf23dac21844ec2b269caf",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/snapshot/hint.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "ea36635beebd66d8a3d6d4bef011f8c9bec4f8d96b124324c0d140062416905e",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/engine/arrow_utils/file_type_validation.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "eae71f21101a42f02076ececee1aa61ee333784eec7f0569b1be64f1e067557e",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "eb5046977787b1125c32b6da583879089a0786f98fba63f021cd947c8964379e",
+      "ruleId": "kernel-itertools-collect-vec",
+      "file": "kernel/src/expressions/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "eba9b9b97685886fcb5a9914d2a27e0e2c3228d9900fababa9e67058b94d249a",
+      "ruleId": "kernel-itertools-collect-vec",
+      "file": "kernel/tests/integration/read/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "ebd78ad01e793d049d4197459b3c0382c340031a585d20d08c2134af788c2348",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/schema/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "ec3e14c27db810532b64f6944dfcb6ae2d0bc019d6d297d86e04fc4435214d77",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/snapshot/builder.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "ecb125858f0dd69c184b6da909489056f2753eb58d20cf32388cd68a894c307c",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/schema/file_utils.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "ecff624c0f88930d69461fa9e0b247dda2534cf9364ed9832920cfff8c450fe2",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/table_changes/log_replay/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "ed004cc298dd89ba6b84b4895bafc1124625d573c05786d9c60f876d4a57fd1c",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/deletion_vector_writer.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "ed492846cae52cafd0fd7366ad40350d15ebd51a2e3418de96dbfad3ca8d40e3",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 3
+    },
+    {
+      "fingerprint": "ed4c9a299c5e5369716fa70f51bde34f93b8a428dcceef3228fa063d035caafa",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/lib.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "ed5c626726fa52f1c0171b3cb4086bf73251ab2e32ad21b4e4f8751958b77deb",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "ed6b89ec8903522a97e96b49c84f2d66a34ce0110a727c0aad6bbdf1e6dc7e9b",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "ee17ae2b55c4ee8267208cd7a433611c030a3727358624cd9f506a32c671b327",
+      "ruleId": "kernel-test-get-column",
+      "file": "ffi/src/scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "ee183cc2450471085afb8fa4deaf38111ef37e82bef954f3c85f003b359ffed5",
+      "ruleId": "kernel-policy-result-iterator",
+      "file": "kernel/src/checkpoint/collation_stats.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "eec078c1d5d14fb2724269e9a3ab4033fddf7a856671c882e5f1e75ac33d1277",
+      "ruleId": "kernel-policy-result-alias",
+      "file": "kernel/src/transaction/commit_info.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "ef90616d30cc838191088f289e9556e2b9cb418828fc360076aa29b8261d9b0a",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "ffi/src/snapshot/hint/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "ef9e59371eeb8e0f2826c658d719419120392e76fb430babc0550fd885d3e06f",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "f036c798a586b6cd34663102062bbdb42af1756279818d9b7285c29e5d05ab49",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/engine_funcs.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "f08aff57cd0c24230b279684701d49b9016cb9a5a40a64e4a43495a0bf804deb",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "f0d3e31f212f56d611a9cba27d6262b8bd74a5a5bd5b15d1398d2df640ab0232",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/snapshot/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "f28862dbd9a0a579e6d8ec5a0e8ae85d590de56df8907c0c59919fd563226e1f",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "f28f822d85def9d0c29a435400cc713c3b8d0ea6cc7205d7c4740c346579b43d",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/transaction/write_context.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "f314bce3307f33b371a0eb2e7c87314f567aee92f5b32092d82374e6f067c5df",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/transforms/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "f318a848d33b98a4b5a303a200c2ca4df52270c6628ec67f24677f5a742ec16d",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "f4395003c17fb8351234d278348df92b90838ef9f6eb0b949478c4cde1dc973b",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/log_compaction/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "f465a2cde3f1c0c4bb631e904752fdece3505728d96a16eb6b66c5cf559bf031",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/transaction/update_table.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "f4ff6dbf9c3ebe0281a459599db9c15120159d6d6d977a215799d8f4d19bb236",
+      "ruleId": "kernel-itertools-iterator-join",
+      "file": "kernel/src/log_segment/crc_tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "f62b0187526c623e3446d0a413215e7e1df500bc0ea77e8ba8318f34e286a306",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/content_tree/test_utils.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "f6617337f0f0d4b6c5aba57405a4935998d3ac2862a45fc364cbf3030d84af52",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/test_ffi.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "f6b70ed66040ca985cb7f0acae2897d3786b8d1d7407f16beab67f99e183c2ae",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/schema_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "f6e9bcddb1fb33cb6402f3d91a3692348577bb76ab5f6f0c71553076f81df70f",
+      "ruleId": "kernel-expression-column-name-macro",
+      "file": "kernel/src/expressions/column_names.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "f70244a8cbc2208dcffefd609a548be721d761bf0075d109ec2a2b9b29664759",
+      "ruleId": "kernel-schema-literal",
+      "file": "kernel/src/content_tree/reader.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "f8a803515b411b0f9ac2b78c90bd6cb83f7f5c64e13688a46407b36bcd7ae640",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/tests/integration/metrics/checkpoint.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "f909a10ca3e993f4a2dbd6806db64f19cfa4b0e0e209826dfda2406e44f6d05d",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/plans/proto/convert.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "f93663714e0ff25db1c861c2a2ad7204eca5ca218eafe022ac03989d6f9e5376",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/actions/deletion_vector_writer.rs",
+      "count": 3
+    },
+    {
+      "fingerprint": "f96a21087f157fb2381f7ccc812bb07191ecd82f4a1dd75a3c817f7bd5610e95",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/table_changes.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "f9dfbedb4467040d843c4e8b2837d1a390b9601e904ccf79e025a3f358035d97",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/scan/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "fa35e8f520dd622b73d375bf3d4006fad1bf323767c54ea52788ad538b9f7af9",
+      "ruleId": "kernel-ffi-miri-ignored-unsafe",
+      "file": "ffi/src/transaction/mod.rs",
+      "count": 2
+    },
+    {
+      "fingerprint": "fa876fb4faf8020c6e57a41920efb9d89d2304a832e955b383c9822c86ce5e8a",
+      "ruleId": "kernel-expression-column-name-macro",
+      "file": "kernel/src/expressions/column_names.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "faed959d326934d13dc76d3e6aa10d540244e0a57e380b401ae11afef174471f",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "faf4def2d21c4cd8ac1f16abff34eb1585f1b29bda34c4eec2014273a9019f3d",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "fb1845f51d27b55938923725d669b0b0e9b655ea71076acbaa15152303badd25",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/tests/integration/common/write_utils.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "fb3914cd97e26a4c1eafd34c22b4cd31f48e9254eae51597c47864d947bd955b",
+      "ruleId": "kernel-ffi-no-reference-parameters",
+      "file": "ffi/src/expressions/kernel_visitor.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "fb78a8caf74e922f636bf91d8add37bf4ac4be5cfd5be6e0add017add74ecc0d",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/tests/integration/common/write_utils.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "fb7dbf4593400256aa0f414bc69b0566f1cf1ba50b28be6a140ba84b6d477c98",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/src/scan/data_skipping/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "fb9520235d116d14fd1b638f6bd0f0aacffae3015fb59039273ec49a66ed577e",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/snapshot/reader/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "fbdf0a69214326b11aa0bac659b5fb69186cea9b4fe054266c270edeb1947cf7",
+      "ruleId": "kernel-itertools-iterator-join",
+      "file": "kernel/tests/integration/features/iceberg_compat.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "fd3bdd9741b339b7a7b575949a9d82fc41fa3a0e9e3482019ab9d83ae743a253",
+      "ruleId": "kernel-itertools-try-collect",
+      "file": "kernel/tests/integration/write/clustered.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "fd7c92897c88e0f81b0b39e80494b90f4d6b12e117fca7954533d58b6f027425",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/log_compaction/tests.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "fe14809bef009de4a16e0046c52171346e09a1f6436137bf68f12523ad0733c5",
+      "ruleId": "kernel-itertools-collect-vec",
+      "file": "kernel/src/commit_range/builder.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "fe3f8d4da360784fbfb16efd3f88f9fd592e8da0242184ab4d499d6bc43cf342",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/lib.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "fef80415edb5db06f5bf127e8ded2e51e2a3afb361c2c1055e0f846495212480",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "kernel/src/schema/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "ff85e366e908bf4fa5cb74345a2c73a7296c9e344fe1de6cd7106e701a549587",
+      "ruleId": "kernel-policy-no-local-imports",
+      "file": "ffi/src/incremental_scan.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "ff9e65a8fb11d7b6e2d77d1029c1cc03b92a20fa2c382ae64e988e4134488534",
+      "ruleId": "kernel-policy-enum-equality",
+      "file": "kernel/src/transaction/builder/update_table.rs",
+      "count": 1
+    }
+  ]
+}

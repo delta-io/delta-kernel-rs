@@ -1,0 +1,11 @@
+id: kernel-ffi-no-reference-parameters
+valid:
+- 'pub extern "C" fn f(x: *const Thing) {}'
+- 'pub extern "C" fn f(x: Option<NonNull<Thing>>) {}'
+- 'fn f(x: &Thing) {}'
+- 'pub extern "C" fn f(x: *const Thing) { fn helper(y: &Thing) {} }'
+- 'pub extern "system" fn f(x: &Thing) {}'
+invalid:
+- 'pub unsafe extern "C" fn f(x: &Thing) {}'
+- 'pub extern "C" fn f(x: &mut Thing) {}'
+- 'pub extern "C" fn f(x: Option<&Thing>) {}'

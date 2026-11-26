@@ -1,0 +1,16 @@
+id: kernel-expression-column-name-macro
+snapshots:
+  ColumnName::new(["a"]):
+    fixed: column_name!("a")
+    labels:
+    - source: ColumnName::new(["a"])
+      style: primary
+      start: 0
+      end: 22
+  ColumnName::new(["stats", "numRecords"]):
+    fixed: column_name!("stats", "numRecords")
+    labels:
+    - source: ColumnName::new(["stats", "numRecords"])
+      style: primary
+      start: 0
+      end: 40

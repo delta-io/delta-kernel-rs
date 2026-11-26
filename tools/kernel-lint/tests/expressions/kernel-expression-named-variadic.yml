@@ -1,0 +1,8 @@
+id: kernel-expression-named-variadic
+valid:
+- Expression::variadic(op, values)
+- Expression::coalesce(values)
+- OtherExpression::variadic(VariadicExpressionOp::Coalesce, values)
+invalid:
+- Expression::variadic(VariadicExpressionOp::Coalesce, values)
+- Expression::variadic(VariadicExpressionOp::Array, values)

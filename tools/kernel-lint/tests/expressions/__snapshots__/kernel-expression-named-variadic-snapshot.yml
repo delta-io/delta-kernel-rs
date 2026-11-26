@@ -1,0 +1,16 @@
+id: kernel-expression-named-variadic
+snapshots:
+  Expression::variadic(VariadicExpressionOp::Array, values):
+    fixed: Expression::array(values)
+    labels:
+    - source: Expression::variadic(VariadicExpressionOp::Array, values)
+      style: primary
+      start: 0
+      end: 57
+  Expression::variadic(VariadicExpressionOp::Coalesce, values):
+    fixed: Expression::coalesce(values)
+    labels:
+    - source: Expression::variadic(VariadicExpressionOp::Coalesce, values)
+      style: primary
+      start: 0
+      end: 60

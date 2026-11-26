@@ -1,0 +1,13 @@
+id: kernel-policy-result-alias
+valid:
+- type R<T> = Result<T, OtherError>;
+- type R<T, E> = std::result::Result<T, E>;
+- type R<T> = KernelResult<T>;
+- type R<T> = Result<T, Error>;
+- let x = Result::Ok(value);
+- let x = Result::<u32, KernelError>::Ok(1);
+- let x = std::result::Result::<u32, KernelError>::Err(error);
+invalid:
+- fn f() -> Result<u32, KernelError> { work() }
+- type R<T> = std::result::Result<T, KernelError>;
+- 'struct Item<T> { value: Result<Vec<T>, KernelError> }'

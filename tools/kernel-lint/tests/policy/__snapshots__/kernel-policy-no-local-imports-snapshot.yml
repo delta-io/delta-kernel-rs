@@ -1,0 +1,32 @@
+id: kernel-policy-no-local-imports
+snapshots:
+  fn f() { use crate::Thing; go(); }:
+    labels:
+    - source: use crate::Thing;
+      style: primary
+      start: 9
+      end: 26
+    - source: fn f() { use crate::Thing; go(); }
+      style: secondary
+      start: 0
+      end: 34
+  fn f() { { use crate::Thing; go(); } }:
+    labels:
+    - source: use crate::Thing;
+      style: primary
+      start: 11
+      end: 28
+    - source: fn f() { { use crate::Thing; go(); } }
+      style: secondary
+      start: 0
+      end: 38
+  impl X { fn f() { use std::fmt::Debug; } }:
+    labels:
+    - source: use std::fmt::Debug;
+      style: primary
+      start: 18
+      end: 38
+    - source: fn f() { use std::fmt::Debug; }
+      style: secondary
+      start: 9
+      end: 40

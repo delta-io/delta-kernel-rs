@@ -1,0 +1,32 @@
+id: kernel-policy-enum-equality
+snapshots:
+  matches!(self, Self::Ready):
+    labels:
+    - source: matches!(self, Self::Ready)
+      style: primary
+      start: 0
+      end: 27
+  matches!(self.kind, Status::Ready):
+    labels:
+    - source: matches!(self.kind, Status::Ready)
+      style: primary
+      start: 0
+      end: 34
+  matches!(value, Ready,):
+    labels:
+    - source: matches!(value, Ready,)
+      style: primary
+      start: 0
+      end: 23
+  matches!(value, Status::Ready):
+    labels:
+    - source: matches!(value, Status::Ready)
+      style: primary
+      start: 0
+      end: 30
+  matches!(value.state, Ready):
+    labels:
+    - source: matches!(value.state, Ready)
+      style: primary
+      start: 0
+      end: 28

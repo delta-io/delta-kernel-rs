@@ -1,0 +1,9 @@
+id: kernel-policy-canonical-add-field
+language: Rust
+severity: warning
+message: Reuse actions::ADD_FIELD instead of rebuilding the canonical Add field.
+note: 'Review-only: resolve Kernel action names and confirm exact field nullability, metadata and schema. Keep constructor/invalid-schema
+  tests. Import ADD_FIELD at the correct scope before replacing.'
+rule:
+  pattern: StructField::nullable(ADD_NAME, Add::to_schema())
+fix: ADD_FIELD.clone()

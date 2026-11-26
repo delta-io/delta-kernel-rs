@@ -1,0 +1,14 @@
+id: kernel-itertools-exact-split-tuple
+snapshots:
+  'fn f(text: &str) { let [a, b] = text.split('':'').collect::<Vec<_>>()[..] else { return; }; }':
+    labels:
+    - source: let [a, b] = text.split(':').collect::<Vec<_>>()[..] else { return; };
+      style: primary
+      start: 19
+      end: 89
+  'fn f(text: &str) { let [authority, code] = text.split('':'').collect::<Vec<_>>()[..] else { return Err(error()); }; }':
+    labels:
+    - source: let [authority, code] = text.split(':').collect::<Vec<_>>()[..] else { return Err(error()); };
+      style: primary
+      start: 19
+      end: 113

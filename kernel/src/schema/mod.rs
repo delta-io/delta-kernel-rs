@@ -1928,7 +1928,7 @@ fn validate_crs(crs: &str) -> KernelResult<()> {
         KernelError::invalid_geo_params(format!("CRS '{crs}' must not contain a comma"))
     );
 
-    let [authority, code] = crs.split(':').collect::<Vec<_>>()[..] else {
+    let Some((authority, code)) = crs.split(':').collect_tuple() else {
         return Err(KernelError::invalid_geo_params(format!(
             "CRS '{crs}' must be in 'AUTHORITY:CODE' format"
         )));

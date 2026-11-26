@@ -1,0 +1,32 @@
+id: kernel-test-arrow-null-array
+language: Rust
+severity: warning
+message: Use new_null_array with the exact ArrowDataType for an all-null ArrayRef.
+note: Requires resolved primitive Arrow array and ArrayRef aliases. Suggest new_null_array(&ArrowDataType::<same
+  type>, len); preserve exact datatype, length and null representation. Decimal/timezone/nested/concrete-array consumers
+  are excluded. No automatic rewrite is offered.
+rule:
+  all:
+  - any:
+    - pattern: Arc::new($ARRAY::from(vec![None::<$VALUE>; $LEN])) as ArrayRef
+    - pattern: Arc::new($ARRAY::from(vec![None as Option<$VALUE>; $LEN])) as ArrayRef
+  - matches: test-scope
+utils:
+  test-scope:
+    any:
+    - inside:
+        kind: mod_item
+        regex: (?s)^(pub(?:\([^)]*\))?\s+)?mod\s+tests\b
+        stopBy: end
+    - inside:
+        kind: function_item
+        follows:
+          kind: attribute_item
+          regex: ^#\[(test|tokio::test|rstest::rstest)(\b|\()
+          stopBy:
+            not:
+              kind: attribute_item
+        stopBy: end
+constraints:
+  ARRAY:
+    regex: ^(BooleanArray|Int8Array|Int16Array|Int32Array|Int64Array|UInt8Array|UInt16Array|UInt32Array|UInt64Array|Float32Array|Float64Array|StringArray|BinaryArray)$

@@ -1,0 +1,18 @@
+id: kernel-policy-enum-equality
+valid:
+- matches!(value, Status::Ready if enabled)
+- matches!(value, Status::Ready | Status::Done)
+- matches!(value, Status::Ready(inner))
+- matches!(value, Status::Ready { value })
+- matches!(value, variant)
+- matches!(value, binding @ Status::Ready)
+- matches!(value, _)
+- matches!(value, None)
+- matches!(value, Option::None)
+- value == Status::Ready
+invalid:
+- matches!(value, Status::Ready)
+- matches!(self, Self::Ready)
+- matches!(self.kind, Status::Ready)
+- matches!(value.state, Ready)
+- matches!(value, Ready,)

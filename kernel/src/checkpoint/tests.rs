@@ -6,7 +6,7 @@ use serde_json::{Value, from_slice, json};
 use tempfile::tempdir;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use test_utils::assert_result_error_with_message;
-use test_utils::{TestAction, actions_to_string, add_commit, delta_path_for_version};
+use test_utils::{TestAction, actions_to_string, add_commit, delta_path_for_version, get_column};
 use url::Url;
 
 use crate::action_reconciliation::{
@@ -1309,23 +1309,13 @@ async fn test_stats_config_round_trip_partitioned(
     if struct2 {
         let mut found_add = false;
         for record_batch in &all_batches {
-            let add_col = record_batch
-                .column_by_name("add")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .unwrap();
+            let add_col = get_column!(record_batch, "add", StructArray);
             for row in 0..record_batch.num_rows() {
                 if !add_col.is_valid(row) {
                     continue;
                 }
                 found_add = true;
-                let pv_parsed = add_col
-                    .column_by_name("partitionValues_parsed")
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref::<StructArray>()
-                    .unwrap();
+                let pv_parsed = get_column!(add_col, "partitionValues_parsed", StructArray);
                 let category_col = pv_parsed
                     .column_by_name("category")
                     .expect("partitionValues_parsed should have category field");

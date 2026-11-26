@@ -1,0 +1,16 @@
+id: kernel-expression-predicate-constant
+snapshots:
+  Predicate::literal(false):
+    fixed: Predicate::FALSE
+    labels:
+    - source: Predicate::literal(false)
+      style: primary
+      start: 0
+      end: 25
+  Predicate::literal(true):
+    fixed: Predicate::TRUE
+    labels:
+    - source: Predicate::literal(true)
+      style: primary
+      start: 0
+      end: 24

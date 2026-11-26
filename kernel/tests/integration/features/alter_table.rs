@@ -786,8 +786,7 @@ async fn add_column_failures(
         .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .add_column(field)
         .build(engine.as_ref(), committer());
-    assert!(err.is_err());
-    assert!(err.unwrap_err().to_string().contains(error_contains));
+    assert_result_error_with_message(err, error_contains);
 
     Ok(())
 }
@@ -1443,8 +1442,7 @@ async fn set_nullable_nonexistent_column_fails() -> delta_kernel::Result<()> {
         .update_table(UpdateTableOperation::AlterTable, "test-engine", false)
         .set_nullable(column_name!("nonexistent"))
         .build(engine.as_ref(), committer());
-    assert!(err.is_err());
-    assert!(err.unwrap_err().to_string().contains("does not exist"));
+    assert_result_error_with_message(err, "does not exist");
 
     Ok(())
 }

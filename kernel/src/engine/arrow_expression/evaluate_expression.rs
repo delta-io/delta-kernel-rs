@@ -1348,6 +1348,7 @@ mod tests {
     use std::sync::Arc;
 
     use rstest::rstest;
+    use test_utils::get_column;
 
     use super::super::expected_timestamp_micros;
     use super::*;
@@ -1473,12 +1474,7 @@ mod tests {
         .unwrap();
 
         // Extract the original nested struct for comparison
-        let original_nested = nested_batch
-            .column_by_name("nested")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .unwrap();
+        let original_nested = get_column!(nested_batch, "nested", StructArray);
         let nested_result = result_nested
             .as_any()
             .downcast_ref::<StructArray>()
@@ -1596,12 +1592,7 @@ mod tests {
 
         // Verify the copy is identical to original nested struct
         let copy_result = result_copy.as_any().downcast_ref::<StructArray>().unwrap();
-        let original_nested = nested_batch
-            .column_by_name("nested")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .unwrap();
+        let original_nested = get_column!(nested_batch, "nested", StructArray);
 
         for i in 0..2 {
             assert_eq!(
@@ -1673,15 +1664,8 @@ mod tests {
             ExpressionStructPatchBuilder::new().insert_after("nonexistent", lit(1));
 
         let expr2 = Expr::struct_patch(insertion_patch).unwrap();
-        let result2 =
-            evaluate_expression(&expr2, &batch, Some(&DataType::from(output_schema.clone())));
-        assert!(result2.is_err());
-        assert!(
-            result2
-                .unwrap_err()
-                .to_string()
-                .contains("reference invalid input field names")
-        );
+        let result2 = evaluate_expression(&expr2, &batch, Some(&DataType::from(output_schema)));
+        assert_result_error_with_message(result2, "reference invalid input field names");
 
         // Test column count mismatch -- too many output schema fields
         let drop_patch = ExpressionStructPatchBuilder::new().drop("a");
@@ -1695,13 +1679,7 @@ mod tests {
         let expr3 = Expr::struct_patch(drop_patch).unwrap();
         let result3 =
             evaluate_expression(&expr3, &batch, Some(&DataType::from(wrong_output_schema)));
-        assert!(result3.is_err());
-        assert!(
-            result3
-                .unwrap_err()
-                .to_string()
-                .contains("Too many fields in output schema")
-        );
+        assert_result_error_with_message(result3, "Too many fields in output schema");
 
         // Test column count mismatch -- too few output schema fields
         let drop_patch = ExpressionStructPatchBuilder::new().drop("a");
@@ -1711,25 +1689,13 @@ mod tests {
         let expr3 = Expr::struct_patch(drop_patch).unwrap();
         let result3 =
             evaluate_expression(&expr3, &batch, Some(&DataType::from(wrong_output_schema)));
-        assert!(result3.is_err());
-        assert!(
-            result3
-                .unwrap_err()
-                .to_string()
-                .contains("Too few fields in output schema")
-        );
+        assert_result_error_with_message(result3, "Too few fields in output schema");
 
         // Test missing output schema
         let patch = ExpressionStructPatchBuilder::new();
         let expr4 = Expr::struct_patch(patch).unwrap();
         let result4 = evaluate_expression(&expr4, &batch, None);
-        assert!(result4.is_err());
-        assert!(
-            result4
-                .unwrap_err()
-                .to_string()
-                .contains("Data type is required")
-        );
+        assert_result_error_with_message(result4, "Data type is required");
     }
 
     #[test]

@@ -1,0 +1,8 @@
+id: kernel-expression-predicate-constant
+valid:
+- Predicate::literal(enabled)
+- Predicate::TRUE
+- Expression::literal(true)
+invalid:
+- Predicate::literal(true)
+- Predicate::literal(false)

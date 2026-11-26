@@ -1,0 +1,9 @@
+id: kernel-expression-arithmetic-operator
+valid:
+- Expression::binary(op, lit(1_i64), rhs)
+- Expression::binary(BinaryExpressionOp::Plus, lhs, rhs)
+- Expression::binary(BinaryExpressionOp::Plus, 1_i64, rhs)
+- lit(1_i64) + rhs
+invalid:
+- Expression::binary(BinaryExpressionOp::Plus, lit(4_i64), col!("row_index"))
+- Expression::binary(BinaryExpressionOp::Multiply, col!("x"), lit(2_i64))

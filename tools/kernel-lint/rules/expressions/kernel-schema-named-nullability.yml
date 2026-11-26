@@ -1,0 +1,23 @@
+id: kernel-schema-named-nullability
+language: Rust
+severity: warning
+message: Use StructField::nullable/not_null when nullability is a literal.
+note: Only Kernel StructField is intended. Preserve runtime nullability, metadata, argument order and
+  tests of StructField::new itself; imports may shadow StructField.
+rule:
+  pattern: StructField::new($NAME, $TYPE, $NULLABLE)
+constraints:
+  NULLABLE:
+    regex: ^(true|false)$
+transform:
+  FIRST:
+    replace:
+      source: $NULLABLE
+      replace: 'true'
+      by: nullable
+  METHOD:
+    replace:
+      source: $FIRST
+      replace: 'false'
+      by: not_null
+fix: StructField::$METHOD($NAME, $TYPE)

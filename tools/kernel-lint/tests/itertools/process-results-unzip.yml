@@ -1,0 +1,8 @@
+id: kernel-itertools-process-results-unzip
+valid:
+  - 'fn f() { input.process_results(|pairs| pairs.unzip())?; }'
+  - 'fn f() { let pairs = input.collect::<KernelResult<Vec<_>>>()?; save(&pairs); pairs.into_iter().unzip(); }'
+  - 'fn f() { input.collect::<Vec<_>>().into_iter().unzip(); }'
+invalid:
+  - 'fn f() { input.collect::<KernelResult<Vec<_>>>()?.into_iter().unzip(); }'
+  - 'fn f() { input.collect::<Result<Vec<_>, Error>>()?.into_iter().unzip(); }'

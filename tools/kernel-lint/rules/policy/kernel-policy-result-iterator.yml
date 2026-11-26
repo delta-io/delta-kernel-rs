@@ -1,0 +1,16 @@
+id: kernel-policy-result-iterator
+language: Rust
+severity: warning
+message: Prefer KernelResultIterator<T> for the equivalent KernelResult + Send iterator bound.
+note: The name KernelResult and its error parameter must resolve to Kernel defaults. Preserve lifetimes and extra
+  bounds; exclude marker definitions. No type resolution is performed.
+rule:
+  any:
+  - pattern:
+      context: 'fn marker<I: Iterator<Item = KernelResult<$ITEM>> + Send>() {}'
+      selector: trait_bounds
+  - pattern:
+      context: fn marker() -> impl Iterator<Item = KernelResult<$ITEM>> + Send { iter }
+      selector: bounded_type
+ignores:
+- kernel/src/error.rs

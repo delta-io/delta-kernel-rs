@@ -404,16 +404,18 @@ impl StateInfo {
                 table_configuration.logical_schema_ref(),
             )
             && logical_read_schema.metadata_columns().next().is_none();
-        let mut read_fields = Vec::with_capacity(if reuse_physical_schema {
+        let read_field_capacity = if reuse_physical_schema {
             0
         } else {
             logical_read_schema.num_fields()
-        });
-        let mut transform_spec = Vec::with_capacity(if reuse_physical_schema {
+        };
+        let mut read_fields = Vec::with_capacity(read_field_capacity);
+        let transform_capacity = if reuse_physical_schema {
             partition_columns.len()
         } else {
             logical_read_schema.num_fields()
-        });
+        };
+        let mut transform_spec = Vec::with_capacity(transform_capacity);
         let mut last_physical_field: Option<String> = None;
 
         let metadata_info = validate_metadata_columns(&logical_read_schema, table_configuration)?;

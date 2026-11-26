@@ -1,0 +1,21 @@
+id: kernel-ffi-miri-ignored-unsafe
+language: Rust
+severity: warning
+message: New unsafe code in a Miri-ignored test needs an explicitly reviewed Miri coverage path.
+note: Snapshot warning for the exact cfg_attr(miri, ignore) shape. The baseline ratchet can identify new matches;
+  this does not prove diff additions, indirect unsafe coverage or whether another Miri test covers the path. No
+  suppression/fix is introduced.
+rule:
+  all:
+  - kind: unsafe_block
+  - inside:
+      kind: function_item
+      follows:
+        kind: attribute_item
+        regex: ^#\[cfg_attr\(\s*miri\s*,\s*ignore\b
+        stopBy:
+          not:
+            kind: attribute_item
+      stopBy: end
+files:
+- ffi/**/*.rs

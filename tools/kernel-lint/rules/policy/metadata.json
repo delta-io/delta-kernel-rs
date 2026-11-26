@@ -1,0 +1,112 @@
+[
+  {
+    "id": "kernel-policy-no-local-imports",
+    "auditIds": [
+      "DOC04"
+    ],
+    "safeFix": false,
+    "limitation": "AST-only scope check. Moving an import may change trait resolution or collide with another name; review and move it manually. Macro token streams are not traversed as use declarations.",
+    "notes": "AST-only scope check. Moving an import may change trait resolution or collide with another name; review and move it manually. Macro token streams are not traversed as use declarations."
+  },
+  {
+    "id": "kernel-policy-no-control-flow-arguments",
+    "auditIds": [
+      "USER06"
+    ],
+    "safeFix": false,
+    "hasFix": false,
+    "enforcement": "structural-warning",
+    "limitation": "Syntax-only review candidate for if/if-let and match in direct call arguments, including parentheses, references and ? wrappers. Ancestor matching stops at all other expressions: closure/block arguments, receivers, branches, loops, binary/await/cast expressions and signature/type contexts are not traversed. A direct argument of an inner call inside a closure still diagnoses. Macro definitions/invocations, attributes, comments and strings are excluded. No automatic replacement: preserve earlier-argument order, conditional execution, ? propagation and temporary/drop behavior when introducing locals.",
+    "docs": "tools/kernel-lint/README.md#control-flow-in-call-arguments"
+  },
+  {
+    "id": "kernel-policy-result-iterator",
+    "auditIds": [
+      "DOC02"
+    ],
+    "safeFix": false,
+    "limitation": "The name KernelResult and its error parameter must resolve to Kernel defaults. Preserve lifetimes and extra bounds; exclude marker definitions. No type resolution is performed.",
+    "notes": "The name KernelResult and its error parameter must resolve to Kernel defaults. Preserve lifetimes and extra bounds; exclude marker definitions. No type resolution is performed."
+  },
+  {
+    "id": "kernel-test-commit-result-helper",
+    "auditIds": [
+      "DOC01"
+    ],
+    "safeFix": false,
+    "limitation": "Test-only structural candidate. Confirm Kernel CommitResult, helper availability and STATE: Debug; keep success-arm assertions, error-case tests and useful custom failure diagnostics.",
+    "notes": "Test-only structural candidate. Confirm Kernel CommitResult, helper availability and STATE: Debug; keep success-arm assertions, error-case tests and useful custom failure diagnostics."
+  },
+  {
+    "id": "kernel-policy-canonical-add-field",
+    "auditIds": [
+      "DOC03"
+    ],
+    "safeFix": false,
+    "limitation": "Review-only: resolve Kernel action names and confirm exact field nullability, metadata and schema. Keep constructor/invalid-schema tests. Import ADD_FIELD at the correct scope before replacing.",
+    "notes": "Review-only: resolve Kernel action names and confirm exact field nullability, metadata and schema. Keep constructor/invalid-schema tests. Import ADD_FIELD at the correct scope before replacing."
+  },
+  {
+    "id": "kernel-test-error-message-helper",
+    "auditIds": [
+      "manual_error_message_assert"
+    ],
+    "safeFix": false,
+    "limitation": "Consecutive test assertions with one shared binding and a literal/simple expected message only. Add the proper unit/integration helper import. Preserve is_err-only checks, exact/variant/multi-message checks and custom diagnostics. Warning spans the first statement; no automatic deletion/rewrite is offered.",
+    "notes": "Consecutive test assertions with one shared binding and a literal/simple expected message only. Add the proper unit/integration helper import. Preserve is_err-only checks, exact/variant/multi-message checks and custom diagnostics. Warning spans the first statement; no automatic deletion/rewrite is offered."
+  },
+  {
+    "id": "kernel-test-get-column",
+    "auditIds": [
+      "prefer_get_column_test_helper"
+    ],
+    "safeFix": false,
+    "limitation": "Test-only candidate requiring an Arrow RecordBatch/StructArray receiver and concrete array type. Keep typed/value/null/schema/order assertions after lookup and custom diagnostics. Name is constrained to a literal; verify the receiver/type and macro import before fixing.",
+    "notes": "Test-only candidate requiring an Arrow RecordBatch/StructArray receiver and concrete array type. Keep typed/value/null/schema/order assertions after lookup and custom diagnostics. Name is constrained to a literal; verify the receiver/type and macro import before fixing."
+  },
+  {
+    "id": "kernel-test-sorted-batch-helper",
+    "auditIds": [
+      "manual_sorted_batch_assert"
+    ],
+    "safeFix": false,
+    "limitation": "Review-only: this test function pretty-prints batches and normalizes a Vec of complete trim().lines() before sorting. Confirm the same table rendering and ignored row/batch order before using the shared macro. Expected lines must remain sorted separately. Keep typed/schema/null/order/batch-boundary assertions and custom filtered-row comparisons.",
+    "notes": "Review-only: this test function pretty-prints batches and normalizes a Vec of complete trim().lines() before sorting. Confirm the same table rendering and ignored row/batch order before using the shared macro. Expected lines must remain sorted separately. Keep typed/schema/null/order/batch-boundary assertions and custom filtered-row comparisons."
+  },
+  {
+    "id": "kernel-policy-opaque-engine-data",
+    "auditIds": [
+      "DOC12"
+    ],
+    "safeFix": false,
+    "limitation": "Path-scoped structural warning, not resolved type proof. Engine adapters and test utilities are excluded; review aliases and inline test scopes. Core code should use RowVisitor/GetData rather than expose concrete engine data.",
+    "notes": "Path-scoped structural warning, not resolved type proof. Engine adapters and test utilities are excluded; review aliases and inline test scopes. Core code should use RowVisitor/GetData rather than expose concrete engine data."
+  },
+  {
+    "id": "kernel-test-arrow-null-array",
+    "auditIds": [
+      "DOC14"
+    ],
+    "safeFix": false,
+    "limitation": "Requires resolved primitive Arrow array and ArrayRef aliases. Suggest new_null_array(&ArrowDataType::<same type>, len); preserve exact datatype, length and null representation. Decimal/timezone/nested/concrete-array consumers are excluded. No automatic rewrite is offered.",
+    "notes": "Requires resolved primitive Arrow array and ArrayRef aliases. Suggest new_null_array(&ArrowDataType::<same type>, len); preserve exact datatype, length and null representation. Decimal/timezone/nested/concrete-array consumers are excluded. No automatic rewrite is offered."
+  },
+  {
+    "id": "kernel-ffi-no-reference-parameters",
+    "auditIds": [
+      "DOC18"
+    ],
+    "safeFix": false,
+    "limitation": "Structural signature policy for ffi/src. Review only new APIs/diff; never auto-change existing ABI or ownership. Rust improper_ctypes checks are complementary and do not establish pointer validity/lifetimes.",
+    "notes": "Structural signature policy for ffi/src. Review only new APIs/diff; never auto-change existing ABI or ownership. Rust improper_ctypes checks are complementary and do not establish pointer validity/lifetimes."
+  },
+  {
+    "id": "kernel-ffi-miri-ignored-unsafe",
+    "auditIds": [
+      "DOC20"
+    ],
+    "safeFix": false,
+    "limitation": "Snapshot warning for the exact cfg_attr(miri, ignore) shape. The baseline ratchet can identify new matches; this does not prove diff additions, indirect unsafe coverage or whether another Miri test covers the path. No suppression/fix is introduced.",
+    "notes": "Snapshot warning for the exact cfg_attr(miri, ignore) shape. The baseline ratchet can identify new matches; this does not prove diff additions, indirect unsafe coverage or whether another Miri test covers the path. No suppression/fix is introduced."
+  }
+]

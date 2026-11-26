@@ -1,0 +1,9 @@
+id: kernel-expression-fluent-predicate
+valid:
+- Predicate::eq(lhs, rhs)
+- Predicate::eq(7_i64, rhs)
+- Predicate::and(col!("x"), rhs)
+- col!("x").eq(lit(7_i64))
+invalid:
+- Predicate::eq(col!("x"), lit(7_i64))
+- Predicate::lt(lit(1_i64), rhs)

@@ -1349,7 +1349,7 @@ mod file_tests {
             Arc::new(file) as ArrayRef,
         )]);
 
-        let batch = apply_schema(&data, &DataType::Struct(Box::new(schema))).unwrap();
+        let batch = apply_schema(&data, &DataType::from(schema)).unwrap();
 
         assert_canonical(batch.column(0).as_struct());
     }
@@ -1373,7 +1373,7 @@ mod file_tests {
             Arc::new(list) as ArrayRef,
         )]);
 
-        let batch = apply_schema(&data, &DataType::Struct(Box::new(schema))).unwrap();
+        let batch = apply_schema(&data, &DataType::from(schema)).unwrap();
 
         assert_canonical(batch.column(0).as_list::<i32>().values().as_struct());
     }
@@ -1418,7 +1418,7 @@ mod file_tests {
     fn test_apply_schema_to_file_in_map() {
         let (data, schema) = map_column(Arc::new(reversed_file()), DataType::file_type());
 
-        let batch = apply_schema(&data, &DataType::Struct(Box::new(schema))).unwrap();
+        let batch = apply_schema(&data, &DataType::from(schema)).unwrap();
 
         assert_canonical(batch.column(0).as_map().values().as_struct());
     }
@@ -1438,7 +1438,7 @@ mod file_tests {
             ArrayType::new(DataType::file_type(), true).into(),
         );
 
-        let batch = apply_schema(&data, &DataType::Struct(Box::new(schema))).unwrap();
+        let batch = apply_schema(&data, &DataType::from(schema)).unwrap();
 
         let list = batch.column(0).as_map().values().as_list::<i32>();
         assert_canonical(list.values().as_struct());

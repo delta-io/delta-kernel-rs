@@ -1953,9 +1953,7 @@ mod tests {
 
     #[test]
     fn from_binary_expression() {
-        let proto_expr::expression::Kind::Binary(binary) =
-            expr_kind_of(Expression::binary(BinaryExpressionOp::Plus, lit(1), lit(2)))
-        else {
+        let proto_expr::expression::Kind::Binary(binary) = expr_kind_of(lit(1) + lit(2)) else {
             panic!("expected a binary expression");
         };
         assert_eq!(binary.op, proto_expr::BinaryExpressionOp::Plus as i32);

@@ -131,6 +131,7 @@ mod tests {
     use std::sync::Arc;
 
     use tempfile::tempdir;
+    use test_utils::get_column;
     use url::Url;
 
     use super::*;
@@ -298,19 +299,9 @@ mod tests {
             ]
         );
         assert!(f.is_null(1));
-        let uri = f
-            .column_by_name("uri")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
+        let uri = get_column!(f, "uri", StringArray);
         assert_eq!(uri.value(0), "s3://b/a.png");
-        let size = f
-            .column_by_name("size")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
+        let size = get_column!(f, "size", Int64Array);
         assert_eq!(size.value(0), 10);
         for omitted in ["offset", "content_type", "checksum", "inline"] {
             assert_eq!(

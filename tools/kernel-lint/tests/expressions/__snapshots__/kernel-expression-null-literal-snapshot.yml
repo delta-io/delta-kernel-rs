@@ -1,0 +1,16 @@
+id: kernel-expression-null-literal
+snapshots:
+  Expression::literal(Scalar::Null(dtype)):
+    fixed: null_lit(dtype)
+    labels:
+    - source: Expression::literal(Scalar::Null(dtype))
+      style: primary
+      start: 0
+      end: 40
+  lit(Scalar::Null(DataType::LONG)):
+    fixed: null_lit(DataType::LONG)
+    labels:
+    - source: lit(Scalar::Null(DataType::LONG))
+      style: primary
+      start: 0
+      end: 33

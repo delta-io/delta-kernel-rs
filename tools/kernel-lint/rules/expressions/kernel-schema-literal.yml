@@ -1,0 +1,12 @@
+id: kernel-schema-literal
+language: Rust
+severity: info
+message: Consider schema! for an inline trusted schema literal.
+note: 'Review-only: preserve checked versus unchecked construction, field order and metadata; schema!
+  does not replace runtime validation. Macro interpolation and imports must be reviewed. Constructor/invalid-schema
+  tests are legitimate exceptions.'
+rule:
+  pattern: StructType::new_unchecked([StructField::$METHOD($NAME, $TYPE)])
+constraints:
+  METHOD:
+    regex: ^(nullable|not_null)$

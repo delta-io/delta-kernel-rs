@@ -1,0 +1,16 @@
+id: kernel-itertools-iterator-join
+language: Rust
+severity: info
+message: Join the iterator directly instead of collecting an otherwise unused Vec.
+note: Review string item types, Display equivalence, imports, allocation timing and error ordering. A string-literal separator excludes ordinary non-string slice joins. Known field_names clone chains have a separate rule.
+rule:
+  any:
+    - pattern: $ITER.collect::<Vec<_>>().join($SEP)
+    - pattern: $ITER.collect_vec().join($SEP)
+constraints:
+  SEP:
+    kind: string_literal
+  ITER:
+    not:
+      pattern: $SCHEMA.field_names().cloned()
+fix: $ITER.join($SEP)

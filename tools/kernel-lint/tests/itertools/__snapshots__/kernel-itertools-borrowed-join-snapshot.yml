@@ -1,0 +1,16 @@
+id: kernel-itertools-borrowed-join
+snapshots:
+  fn f() { schema.field_names().cloned().collect::<Vec<_>>().join(","); }:
+    fixed: fn f() { schema.field_names().join(","); }
+    labels:
+    - source: schema.field_names().cloned().collect::<Vec<_>>().join(",")
+      style: primary
+      start: 9
+      end: 68
+  fn f() { schema.field_names().cloned().collect_vec().join(", "); }:
+    fixed: fn f() { schema.field_names().join(", "); }
+    labels:
+    - source: schema.field_names().cloned().collect_vec().join(", ")
+      style: primary
+      start: 9
+      end: 63

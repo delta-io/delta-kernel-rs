@@ -1,0 +1,16 @@
+id: kernel-expression-lit
+snapshots:
+  Expression::literal(7_i64):
+    fixed: lit(7_i64)
+    labels:
+    - source: Expression::literal(7_i64)
+      style: primary
+      start: 0
+      end: 26
+  Expression::literal(value):
+    fixed: lit(value)
+    labels:
+    - source: Expression::literal(value)
+      style: primary
+      start: 0
+      end: 26
