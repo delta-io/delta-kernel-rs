@@ -2,6 +2,7 @@
 ///
 /// Not intended for use by normal code.
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -197,21 +198,81 @@ impl<T: ToNullableContainerType> GetNullableContainerStructField for Option<T> {
     }
 }
 
+/// Converts a decoded map with nullable values, dropping null entries.
+#[internal_api]
+pub(crate) trait FromNullableContainer: Sized {
+    type Nullable;
+
+    fn from_nullable(value: Self::Nullable) -> Self;
+}
+
+impl<K: Eq + Hash, V> FromNullableContainer for HashMap<K, V> {
+    type Nullable = HashMap<K, Option<V>>;
+
+    fn from_nullable(value: Self::Nullable) -> Self {
+        value
+            .into_iter()
+            .filter_map(|(key, value)| value.map(|value| (key, value)))
+            .collect()
+    }
+}
+
+impl<K: Eq + Hash, V> FromNullableContainer for Option<HashMap<K, V>> {
+    type Nullable = Option<HashMap<K, Option<V>>>;
+
+    fn from_nullable(value: Self::Nullable) -> Self {
+        value.map(HashMap::<K, V>::from_nullable)
+    }
+}
+
 /// Named fields consumed by the [`delta_kernel_derive::TryFromStructData`] macro.
 ///
 /// Field conversion errors acquire their path element as they unwind. Successful conversion does
 /// not allocate or maintain path state.
 #[internal_api]
 pub(crate) struct StructDataFields {
-    expected: SchemaRef,
+    expected: &'static SchemaRef,
     actual: SchemaRef,
     values: Vec<Option<Scalar>>,
 }
 
 impl StructDataFields {
+    /// Consumes the sole non-null variant, returning its expected-schema index, name, and value.
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn take_variant(&mut self) -> KernelResult<(usize, &'static str, Scalar)> {
+        let mut names = self
+            .actual
+            .fields()
+            .zip(&self.values)
+            .filter(|(_, value)| value.as_ref().is_some_and(|value| !value.is_null()))
+            .map(|(field, _)| field.name());
+        let name = match (names.next(), names.next()) {
+            (Some(name), None) => name,
+            (first, second) => {
+                let expected: Vec<_> = self.expected.fields().map(StructField::name).collect();
+                let actual: Vec<_> = first.into_iter().chain(second).chain(names).collect();
+                return Err(KernelError::scalar_conversion(
+                    format!("exactly one non-null variant among {expected:?}"),
+                    format!("active variants {actual:?}"),
+                ));
+            }
+        };
+        drop(names);
+        let (index, field) = self
+            .expected
+            .field_with_index(name)
+            .ok_or_else(|| KernelError::scalar_conversion("known variant field", name))?;
+        let name = field.name().as_str();
+        for field in self.expected.fields().filter(|field| field.name() != name) {
+            self.take_field::<Scalar>(field.name())?;
+        }
+        Ok((index, name, self.take_field(name)?))
+    }
+
     /// Creates a field decoder after checking that the value count matches both schemas.
     #[internal_api]
-    pub(crate) fn try_new(data: StructData, expected: SchemaRef) -> KernelResult<Self> {
+    pub(crate) fn try_new(data: StructData, expected: &'static SchemaRef) -> KernelResult<Self> {
         let (actual, values) = data.into_parts();
         require!(
             actual.num_fields() == values.len(),
@@ -234,12 +295,14 @@ impl StructDataFields {
         })
     }
 
-    /// Consumes the named field, checks its schema nullability, and decodes its value.
+    /// Consumes the named field, checks its schema nullability and a null scalar's exact data type,
+    /// and decodes its value.
     #[internal_api]
-    pub(crate) fn take_field<T: TryFrom<Scalar, Error = KernelError>>(
-        &mut self,
-        field_name: &str,
-    ) -> KernelResult<T> {
+    pub(crate) fn take_field<T>(&mut self, field_name: &str) -> KernelResult<T>
+    where
+        T: TryFrom<Scalar>,
+        KernelError: From<T::Error>,
+    {
         let expected = self.expected.field(field_name).ok_or_else(|| {
             KernelError::InternalError(format!(
                 "Derived schema does not contain generated field {field_name:?}"
@@ -275,7 +338,20 @@ impl StructDataFields {
             )
         );
 
-        T::try_from(value).map_err(|error| add_scalar_path_context(error, field_name))
+        if let Scalar::Null(actual_type) = &value {
+            require!(
+                actual_type == expected.data_type(),
+                add_scalar_path_context(
+                    KernelError::scalar_conversion(
+                        expected.data_type().kind_name(),
+                        actual_type.kind_name(),
+                    ),
+                    field_name,
+                )
+            );
+        }
+
+        T::try_from(value).map_err(|error| add_scalar_path_context(error.into(), field_name))
     }
 
     /// Verifies that every named field was consumed.
@@ -307,8 +383,66 @@ mod tests {
 
     use bytes::Bytes;
     use delta_kernel_derive::ToSchema;
+    use rstest::rstest;
 
-    use crate::schema::{ToSchema, schema};
+    use super::FromNullableContainer;
+    use crate::KernelResult;
+    use crate::expressions::Scalar;
+    use crate::schema::{DataType, MapType, ToSchema, schema};
+
+    fn project_nullable_map(
+        value: Scalar,
+        optional: bool,
+    ) -> KernelResult<Option<HashMap<String, String>>> {
+        if optional {
+            Ok(Option::<HashMap<String, String>>::from_nullable(
+                value.try_into()?,
+            ))
+        } else {
+            Ok(Some(HashMap::<String, String>::from_nullable(
+                value.try_into()?,
+            )))
+        }
+    }
+
+    #[rstest]
+    #[case::empty(HashMap::new(), HashMap::new())]
+    #[case::all_null(HashMap::from([("null".into(), None)]), HashMap::new())]
+    #[case::mixed(
+        HashMap::from([
+            ("null".into(), None),
+            ("empty".into(), Some("".into())),
+            ("value".into(), Some("kept".into())),
+        ]),
+        HashMap::from([("empty".into(), "".into()), ("value".into(), "kept".into())])
+    )]
+    fn nullable_container_projection_drops_only_null_entries(
+        #[case] values: HashMap<String, Option<String>>,
+        #[case] expected: HashMap<String, String>,
+        #[values(false, true)] optional: bool,
+    ) {
+        assert_eq!(
+            project_nullable_map(Scalar::from(values), optional).unwrap(),
+            Some(expected)
+        );
+    }
+
+    #[rstest]
+    #[case::matching_map(MapType::new(DataType::STRING, DataType::STRING, true).into(), true)]
+    #[case::non_nullable_values(MapType::new(DataType::STRING, DataType::STRING, false).into(), false)]
+    #[case::wrong_key(MapType::new(DataType::LONG, DataType::STRING, true).into(), false)]
+    #[case::wrong_value(MapType::new(DataType::STRING, DataType::LONG, true).into(), false)]
+    #[case::non_map(DataType::STRING, false)]
+    fn nullable_container_null_requires_optional_matching_map(
+        #[case] data_type: DataType,
+        #[case] matching: bool,
+        #[values(false, true)] optional: bool,
+    ) {
+        assert_eq!(
+            project_nullable_map(Scalar::Null(data_type), optional).ok(),
+            (optional && matching).then_some(None)
+        );
+    }
 
     #[derive(ToSchema)]
     struct AllPrimitivesNotNull {

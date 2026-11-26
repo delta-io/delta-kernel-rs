@@ -321,6 +321,35 @@ impl EngineData for ArrowEngineData {
         }
         true
     }
+
+    #[cfg(feature = "declarative-plans")]
+    fn is_null(&self, name: &ColumnName) -> KernelResult<Vec<bool>> {
+        let (first, rest) = name
+            .path()
+            .split_first()
+            .ok_or_else(|| KernelError::missing_column("Column path must not be empty"))?;
+        let column = self.data.column_by_name(first).ok_or_else(|| {
+            KernelError::missing_column(format!("Column {name}: field {first} not found"))
+        })?;
+        let (_, column) = rest.iter().try_fold(
+            (first, column),
+            |(parent, column), field| -> KernelResult<_> {
+                let nested = column.as_struct_opt().ok_or_else(|| {
+                    KernelError::unexpected_column_type(format!(
+                        "Column {name}: field {parent} is not a struct"
+                    ))
+                })?;
+                let column = nested.column_by_name(field).ok_or_else(|| {
+                    KernelError::missing_column(format!("Column {name}: field {field} not found"))
+                })?;
+                Ok((field, column))
+            },
+        )?;
+        Ok(match column.logical_nulls() {
+            Some(nulls) => nulls.iter().map(|valid| !valid).collect(),
+            None => vec![false; self.len()],
+        })
+    }
 }
 
 impl ArrowEngineData {
@@ -549,6 +578,8 @@ mod tests {
 
     use super::{ArrowEngineData, extract_record_batch};
     use crate::actions::{LOG_PROTOCOL_SCHEMA, Metadata, Protocol, get_commit_schema};
+    #[cfg(feature = "declarative-plans")]
+    use crate::arrow::array::new_null_array;
     use crate::arrow::array::types::{Int32Type, Int64Type};
     use crate::arrow::array::{
         Array, ArrayRef, AsArray, BinaryArray, BooleanArray, Int32Array, Int64Array,
@@ -1585,6 +1616,102 @@ mod tests {
         assert_eq!(result2.len(), 1);
         assert_eq!(result2.get("d"), Some(&"4".to_string()));
 
+        Ok(())
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    #[rstest]
+    #[case::primitive(
+        Arc::new(Int32Array::from(vec![Some(1), None, Some(2), None])),
+        [false, true, false, true]
+    )]
+    #[case::null(new_null_array(&ArrowDataType::Null, 4), [true; 4])]
+    #[case::ree(
+        Arc::new(RunArray::<Int64Type>::try_new(
+            &Int64Array::from(vec![2, 4]),
+            &Int32Array::from(vec![Some(1), None]),
+        ).unwrap()),
+        [false, false, true, true]
+    )]
+    fn test_is_null_logical_nulls(
+        #[case] column: ArrayRef,
+        #[case] expected: [bool; 4],
+        #[values(0, 1, 4)] offset: usize,
+        #[values(false, true)] nested: bool,
+    ) -> KernelResult<()> {
+        let (column, path, expected) = if nested {
+            let parent = StructArray::try_new(
+                vec![ArrowField::new("leaf", column.data_type().clone(), true)].into(),
+                vec![column],
+                Some(vec![false, true, false, true].into()),
+            )?;
+            (
+                Arc::new(parent) as ArrayRef,
+                ColumnName::new(["value", "leaf"]),
+                expected,
+            )
+        } else {
+            (column, column_name!("value"), expected)
+        };
+        let schema = ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            column.data_type().clone(),
+            true,
+        )]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![column])?;
+        let data = ArrowEngineData::new(batch.slice(offset, 4 - offset));
+        assert_eq!(data.is_null(&path)?, expected[offset..]);
+        Ok(())
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    #[rstest]
+    #[case::struct_column(&["nested"], Ok([true, false, false, false]))]
+    #[case::inner_struct(&["nested", "inner"], Ok([false, true, false, false]))]
+    #[case::leaf(&["nested", "inner", "leaf"], Ok([false, false, true, false]))]
+    #[case::literal_dot(&["a.b"], Ok([false, false, true, false]))]
+    #[case::empty_path(&[], Err("path must not be empty"))]
+    #[case::missing(&["missing"], Err("field missing not found"))]
+    #[case::dot_is_not_separator(&["a", "b"], Err("field a not found"))]
+    #[case::missing_below_null_outer(&["nested", "missing"], Err("field missing not found"))]
+    #[case::missing_below_null_inner(
+        &["nested", "inner", "missing"], Err("field missing not found")
+    )]
+    #[case::non_struct_below_null(
+        &["nested", "inner", "leaf", "child"], Err("field leaf is not a struct")
+    )]
+    #[case::null_non_struct(&["a.b", "child"], Err("field a.b is not a struct"))]
+    fn test_is_null_nested(
+        #[case] path: &[&str],
+        #[case] expected: Result<[bool; 4], &str>,
+        #[values(0, 1, 4)] offset: usize,
+    ) -> KernelResult<()> {
+        let leaf: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), Some(2), None, Some(4)]));
+        let inner = StructArray::try_new(
+            vec![ArrowField::new("leaf", ArrowDataType::Int32, true)].into(),
+            vec![Arc::clone(&leaf)],
+            Some(vec![true, false, true, true].into()),
+        )?;
+        let nested = StructArray::try_new(
+            vec![ArrowField::new("inner", inner.data_type().clone(), true)].into(),
+            vec![Arc::new(inner)],
+            Some(vec![false, true, true, true].into()),
+        )?;
+        let columns: Vec<ArrayRef> = vec![Arc::new(nested), leaf];
+        let fields: Vec<_> = ["nested", "a.b"]
+            .into_iter()
+            .zip(&columns)
+            .map(|(name, column)| ArrowField::new(name, column.data_type().clone(), true))
+            .collect();
+        let data = ArrowEngineData::new(
+            RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns)?
+                .slice(offset, 4 - offset),
+        );
+        let result = data.is_null(&ColumnName::new(path.iter().copied()));
+        match expected {
+            Ok(expected) => assert_eq!(result?, expected[offset..]),
+            Err(message) => assert_result_error_with_message(result, message),
+        }
         Ok(())
     }
 
