@@ -68,7 +68,8 @@ async fn geometry_bounds_reach_typed_scan_output_from_commits_and_checkpoints() 
     );
 }
 
-// Kernel writers reject geospatial tables, so build protocol-shaped read fixtures directly.
+// Kernel's checkpoint writer omits geometry bounds from `stats_parsed`, so build protocol-shaped
+// read fixtures directly.
 async fn setup_geometry_stats_table() -> (DelegatingEngine, String) {
     let table_root = String::from("memory:///");
     let store = Arc::new(InMemory::new());

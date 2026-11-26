@@ -13,6 +13,8 @@ mod domain_metadata;
 #[cfg(feature = "arrow-60")]
 mod file;
 mod generated_columns;
+#[cfg(feature = "geo-type-in-dev")]
+mod geospatial;
 mod ict;
 mod interval;
 mod nested_field_ids;
