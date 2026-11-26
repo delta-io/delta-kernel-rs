@@ -48,7 +48,7 @@ fn with_root_manifest_file_rejects_non_adaptive_table() -> Result<()> {
     let (_engine, txn, _tempdir) = create_existing_table_txn()?;
     let file = dummy_root_manifest_file_meta(&txn);
     assert_result_error_with_message(
-        txn.with_root_manifest_file(file),
+        txn.with_root_manifest_file(file, None),
         "adaptiveMetadata-preview",
     );
     Ok(())
@@ -59,7 +59,7 @@ fn validate_manifest_write_allows_root_manifest_on_adaptive_table() -> Result<()
     let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
     txn.effective_table_config = adaptive_table_config();
     let file = dummy_root_manifest_file_meta(&txn);
-    txn = txn.with_root_manifest_file(file)?;
+    txn = txn.with_root_manifest_file(file, None)?;
     txn.validate_manifest_write_semantics()?;
     Ok(())
 }
@@ -69,7 +69,7 @@ fn validate_manifest_write_rejects_root_manifest_with_file_actions() -> Result<(
     let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
     txn.effective_table_config = adaptive_table_config();
     let file = dummy_root_manifest_file_meta(&txn);
-    txn = txn.with_root_manifest_file(file)?;
+    txn = txn.with_root_manifest_file(file, None)?;
     add_dummy_file(&mut txn);
     assert_result_error_with_message(
         txn.validate_manifest_write_semantics(),
@@ -120,7 +120,7 @@ fn with_manifest_commit_rejects_when_root_manifest_staged() -> Result<()> {
     let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
     txn.effective_table_config = adaptive_table_config();
     let file = dummy_root_manifest_file_meta(&txn);
-    txn = txn.with_root_manifest_file(file)?;
+    txn = txn.with_root_manifest_file(file, None)?;
     assert_result_error_with_message(
         txn.with_manifest_commit(engine.as_ref()),
         "mutually exclusive",
@@ -134,7 +134,10 @@ fn with_root_manifest_file_rejects_when_manifest_commit_staged() -> Result<()> {
     txn.effective_table_config = adaptive_table_config();
     txn.with_manifest_commit(engine.as_ref())?;
     let file = dummy_root_manifest_file_meta(&txn);
-    assert_result_error_with_message(txn.with_root_manifest_file(file), "mutually exclusive");
+    assert_result_error_with_message(
+        txn.with_root_manifest_file(file, None),
+        "mutually exclusive",
+    );
     Ok(())
 }
 

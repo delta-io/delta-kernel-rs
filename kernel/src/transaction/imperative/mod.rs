@@ -370,7 +370,6 @@ impl<STATE> Transaction<STATE, Imperative> {
                 .evaluation_handler()
                 .create_many(LOG_TXN_SCHEMA.clone(), Vec::from_iter(rows))
         });
-        let commit_info_action = self.generate_commit_info(engine, kernel_commit_info);
         let protocol_action = protocol
             .map(|protocol| create_row(engine, LOG_PROTOCOL_SCHEMA.clone(), protocol.clone()))
             .transpose()?;
@@ -399,8 +398,12 @@ impl<STATE> Transaction<STATE, Imperative> {
         )?;
 
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        let checkpoint_action =
-            self.generate_checkpoint_action(engine, commit_version, &dm_changes)?;
+        let checkpoint_action = self.generate_checkpoint_action(
+            engine,
+            commit_version,
+            kernel_commit_info.in_commit_timestamp,
+            &dm_changes,
+        )?;
         #[cfg(feature = "adaptive-metadata-in-dev")]
         let checkpoint_action_data = checkpoint_action
             .clone()
@@ -408,6 +411,7 @@ impl<STATE> Transaction<STATE, Imperative> {
             .transpose()?;
         #[cfg(not(feature = "adaptive-metadata-in-dev"))]
         let checkpoint_action_data: Option<Box<dyn EngineData>> = None;
+        let commit_info_action = self.generate_commit_info(engine, kernel_commit_info);
 
         // CommitInfo must precede all other actions.
         let actions = iter::once(commit_info_action)

@@ -5,6 +5,8 @@ use delta_kernel::engine_data::FilteredEngineData;
 
 use super::committed::commit_result_to_committed_handle;
 use super::*;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::OptionalValue;
 use crate::delta_types::{FfiStringArray, FfiStringMap};
 
 /// A handle for an update-table transaction (`Transaction<UpdateTable>`).
@@ -635,7 +637,9 @@ fn with_row_tracking_high_water_mark_impl(
     Ok(Box::new(txn.with_row_tracking_high_water_mark(high_water_mark)?).into())
 }
 
-/// Stages `file` to be committed as this transaction's root manifest.
+/// Stages `file` to be committed as this transaction's root manifest. When `in_commit_timestamp`
+/// (milliseconds since the Unix epoch) is set, the commit uses it as its In-Commit Timestamp and
+/// fails if it is not later than the read snapshot's In-Commit Timestamp.
 ///
 /// # Safety
 ///
@@ -646,11 +650,12 @@ fn with_row_tracking_high_water_mark_impl(
 pub unsafe extern "C" fn update_table_txn_with_root_manifest_file(
     txn: Handle<ExclusiveUpdateTableTransaction>,
     file: &FileMeta,
+    in_commit_timestamp: OptionalValue<i64>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveUpdateTableTransaction>> {
     let txn = unsafe { txn.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    let result = with_root_manifest_file_impl(*txn, file);
+    let result = with_root_manifest_file_impl(*txn, file, in_commit_timestamp.into());
     unsafe { result.into_extern_result(&engine) }
 }
 
@@ -658,6 +663,7 @@ pub unsafe extern "C" fn update_table_txn_with_root_manifest_file(
 fn with_root_manifest_file_impl(
     txn: Transaction,
     file: &FileMeta,
+    in_commit_timestamp: Option<i64>,
 ) -> KernelResult<Handle<ExclusiveUpdateTableTransaction>> {
     let path: &str = unsafe { TryFromStringSlice::try_from_slice(&file.path) }?;
     let location = Url::parse(path)?;
@@ -670,7 +676,7 @@ fn with_root_manifest_file_impl(
         last_modified: file.last_modified,
         size,
     };
-    Ok(Box::new(txn.with_root_manifest_file(delta_file)?).into())
+    Ok(Box::new(txn.with_root_manifest_file(delta_file, in_commit_timestamp)?).into())
 }
 
 /// Add file metadata to the transaction for files that have been written. The metadata contains

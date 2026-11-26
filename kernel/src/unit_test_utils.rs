@@ -901,7 +901,7 @@ pub(crate) mod adaptive_metadata_fixtures {
             .build(engine)
             .unwrap();
         write_transaction(engine, snapshot)
-            .with_root_manifest_file(file)
+            .with_root_manifest_file(file, None)
             .unwrap()
             .commit(engine)
             .unwrap()

@@ -3663,16 +3663,19 @@ mod tests {
         }
     }
 
+    /// Creates an in-memory table that supports `adaptiveMetadata-preview` when `feature_enabled`,
+    /// and opens a write transaction on it through the FFI.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[rstest]
-    #[case::feature_enabled(true)]
-    #[case::feature_disabled(false)]
-    #[tokio::test]
-    async fn test_with_root_manifest_file_commit(
-        #[case] feature_enabled: bool,
-    ) -> KernelResult<()> {
-        let (store, _test_engine, table_url) =
-            test_utils::engine_store_setup("test_root_manifest_file", None);
+    async fn root_manifest_test_txn(
+        table_name: &str,
+        feature_enabled: bool,
+    ) -> KernelResult<(
+        DefaultEngine<TokioBackgroundExecutor>,
+        Url,
+        Handle<SharedExternEngine>,
+        Handle<ExclusiveUpdateTableTransaction>,
+    )> {
+        let (store, test_engine, table_url) = test_utils::engine_store_setup(table_name, None);
         let schema = schema_ref! { nullable "id": INTEGER };
         let mut reader_features = vec!["columnMapping", "deletionVectors"];
         let mut writer_features = vec![
@@ -3709,11 +3712,24 @@ mod tests {
                 KernelUpdateTableOperation::Write,
             )
         };
+        Ok((test_engine, table_url, engine, txn))
+    }
 
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::feature_enabled(true)]
+    #[case::feature_disabled(false)]
+    #[tokio::test]
+    async fn test_with_root_manifest_file_commit(
+        #[case] feature_enabled: bool,
+    ) -> KernelResult<()> {
+        let (_test_engine, table_url, engine, txn) =
+            root_manifest_test_txn("test_root_manifest_file", feature_enabled).await?;
         let manifest_path = table_url.join("metadata/root-v1.parquet")?.to_string();
         let file = root_manifest_file_meta(&manifest_path);
-        let staged =
-            unsafe { update_table_txn_with_root_manifest_file(txn, &file, engine.shallow_copy()) };
+        let staged = unsafe {
+            update_table_txn_with_root_manifest_file(txn, &file, None.into(), engine.shallow_copy())
+        };
 
         if feature_enabled {
             let txn = ok_or_panic(staged);
@@ -3730,6 +3746,42 @@ mod tests {
                 ),
             );
         }
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[tokio::test]
+    async fn test_with_root_manifest_file_sets_the_in_commit_timestamp() -> KernelResult<()> {
+        let (test_engine, table_url, engine, txn) =
+            root_manifest_test_txn("test_commit_timestamp", true).await?;
+        let previous_ict = Snapshot::builder_for(table_url.clone())
+            .build(&test_engine)
+            .expect("snapshot loads")
+            .reader()
+            .get_in_commit_timestamp(&test_engine)?
+            .expect("adaptiveMetadata tables record an In-Commit Timestamp");
+        // Far enough ahead that kernel would not pick the same value on its own.
+        let commit_timestamp = previous_ict + 1_000_000;
+        let manifest_path = table_url.join("metadata/root-v1.parquet")?.to_string();
+        let file = root_manifest_file_meta(&manifest_path);
+        let txn = ok_or_panic(unsafe {
+            update_table_txn_with_root_manifest_file(
+                txn,
+                &file,
+                Some(commit_timestamp).into(),
+                engine.shallow_copy(),
+            )
+        });
+        let committed = ok_or_panic(unsafe { update_table_txn_commit(txn, engine.shallow_copy()) });
+        assert_eq!(unsafe { version_and_free(committed) }, 1);
+        let ict = Snapshot::builder_for(table_url)
+            .build(&test_engine)
+            .expect("snapshot loads")
+            .reader()
+            .get_in_commit_timestamp(&test_engine)?;
+        assert_eq!(ict, Some(commit_timestamp));
 
         unsafe { free_engine(engine) };
         Ok(())
