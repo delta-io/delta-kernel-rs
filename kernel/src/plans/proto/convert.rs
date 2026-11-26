@@ -1379,7 +1379,7 @@ mod tests {
                     op: Operator::ScanParquet(ScanParquet {
                         files: vec![ScanFile::new(sample_file_meta())],
                         file_constant_columns: vec![],
-                        schema: schema.clone(),
+                        schema: schema,
                     }),
                     inputs: vec![],
                 },

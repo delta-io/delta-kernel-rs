@@ -180,8 +180,7 @@ mod test {
         #[case] expected_type: LogPathFileType,
     ) {
         let table_root = Url::from_str(table_root).unwrap();
-        let log_path =
-            LogPath::from_commit_filename(table_root.clone(), 10, filename, 1234, 1024).unwrap();
+        let log_path = LogPath::from_commit_filename(table_root, 10, filename, 1234, 1024).unwrap();
 
         let expected = FileMeta {
             location: Url::from_str(TABLE_ROOT)
@@ -249,7 +248,7 @@ mod test {
         let table_root = Url::from_str(table_root).unwrap();
         let filename = format!("00000000000000000010.{UUID}.json");
 
-        let log_path = LogPath::staged_commit(table_root.clone(), &filename, 1234, 1024)
+        let log_path = LogPath::staged_commit(table_root, &filename, 1234, 1024)
             .expect("Failed to create staged commit log path");
 
         let expected = FileMeta {

@@ -187,7 +187,7 @@ async fn write_state_and_commits_require_ack_only_on_tables_with_constraints(
     match op {
         GatedOp::CommitWithData => stage_one_file(&mut txn)?,
         GatedOp::RemoveOnlyCommit => {
-            let scan_files = get_scan_files(snapshot.clone(), engine.as_ref())?;
+            let scan_files = get_scan_files(snapshot, engine.as_ref())?;
             let found_files = !scan_files.is_empty();
             assert!(found_files);
             for scan_file in scan_files {

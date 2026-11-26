@@ -850,7 +850,7 @@ pub(crate) mod tests {
             "Expected UuidCheckpoint file type"
         );
 
-        let filename = log_path.filename.to_string();
+        let filename = log_path.filename;
         let filename_parts: Vec<&str> = filename.split('.').collect();
         assert_eq!(filename_parts.len(), 4);
         assert_eq!(filename_parts[0], "00000000000000000010");

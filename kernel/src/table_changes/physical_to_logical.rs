@@ -99,8 +99,7 @@ pub(crate) fn get_cdf_transform_expr(
     let transform_spec = state_info
         .transform_spec
         .as_ref()
-        .map(|ts| ts.as_ref())
-        .unwrap_or(&empty_spec);
+        .map_or(&empty_spec, AsRef::as_ref);
 
     // Return None for an empty transform spec to avoid unnecessary expression evaluation.
     if transform_spec.is_empty() {
@@ -377,7 +376,7 @@ mod tests {
         assert_eq!(result.fields().len(), 2); // No change
 
         // Test Remove file
-        let mut remove_file = scan_file.clone();
+        let mut remove_file = scan_file;
         remove_file.scan_type = CdfScanFileType::Remove;
         let result = scan_file_physical_schema(&remove_file, &physical_schema);
         assert_eq!(result.fields().len(), 2); // No change

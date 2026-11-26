@@ -274,9 +274,7 @@ mod tests {
     }
 
     fn opt_long(value: Option<i64>) -> Scalar {
-        value
-            .map(Scalar::Long)
-            .unwrap_or(Scalar::Null(DataType::LONG))
+        value.map_or(Scalar::Null(DataType::LONG), Scalar::Long)
     }
 
     /// Builds a write-metadata input batch from fully-populated `(path, size, num_records,
@@ -310,8 +308,7 @@ mod tests {
                     )
                     .unwrap();
                     vec![
-                        path.map(Scalar::from)
-                            .unwrap_or(Scalar::Null(DataType::STRING)),
+                        path.map_or(Scalar::Null(DataType::STRING), Scalar::from),
                         opt_long(size),
                         Scalar::Struct(stats),
                         opt_long(base_row_id),

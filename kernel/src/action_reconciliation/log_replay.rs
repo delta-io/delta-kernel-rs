@@ -1532,7 +1532,7 @@ mod tests {
     }
 
     #[test]
-    fn test_action_reconciliation_processor_error_propagation() -> KernelResult<()> {
+    fn test_action_reconciliation_processor_error_propagation() {
         // Test that errors from the visitor are properly propagated by the processor
         let json_strings: StringArray = vec![
             // This will create valid data that parses correctly
@@ -1552,7 +1552,5 @@ mod tests {
         let action_reconciliation_batch = result.unwrap();
         assert_eq!(action_reconciliation_batch.actions_count, 1);
         assert_eq!(action_reconciliation_batch.add_actions_count, 1);
-
-        Ok(())
     }
 }

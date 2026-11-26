@@ -916,7 +916,7 @@ mod apply_schema_validation_tests {
         let b_data = Int32Array::from(vec![4, 5, 6]);
 
         StructArray::try_new(
-            schema.fields.clone(),
+            schema.fields,
             vec![Arc::new(a_data), Arc::new(b_data)],
             None,
         )
@@ -951,7 +951,7 @@ mod apply_schema_validation_tests {
         let null_buffer = NullBuffer::new(BooleanBuffer::from(vec![true, false, true, false]));
 
         let struct_array = StructArray::try_new(
-            schema.fields.clone(),
+            schema.fields,
             vec![Arc::new(a_data), Arc::new(b_data)],
             Some(null_buffer),
         )

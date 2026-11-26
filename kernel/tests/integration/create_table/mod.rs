@@ -64,7 +64,7 @@ async fn test_create_simple_table() -> delta_kernel::Result<()> {
     };
 
     // Create table using new API
-    let _ = create_table(&table_path, schema.clone(), "DeltaKernel-RS/0.17.0", true)
+    let _ = create_table(&table_path, schema, "DeltaKernel-RS/0.17.0", true)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
@@ -283,13 +283,8 @@ async fn test_create_table_already_exists() -> delta_kernel::Result<()> {
     .commit(engine.as_ref())?;
 
     // Try to create again - should fail at build time (table already exists)
-    let result = create_table(
-        &table_path,
-        schema.clone(),
-        "UserManagementService/1.2.0",
-        true,
-    )
-    .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+    let result = create_table(&table_path, schema, "UserManagementService/1.2.0", true)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
 
     assert!(matches!(
         result,

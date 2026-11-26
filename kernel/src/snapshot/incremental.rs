@@ -943,7 +943,7 @@ mod tests {
         let log_tail = vec![parsed_path];
 
         let new_snapshot = Snapshot::try_new_from(
-            base_snapshot.clone(),
+            base_snapshot,
             log_tail,
             &engine,
             Some(2),
@@ -1017,7 +1017,7 @@ mod tests {
 
         // Test requesting older version - should error
         let older_version = Snapshot::try_new_from(
-            base_snapshot.clone(),
+            base_snapshot,
             vec![],
             &engine,
             Some(0),
@@ -1410,7 +1410,7 @@ mod tests {
             .build(ctx.engine.as_ref())?;
         assert_eq!(snapshot_v1.log_segment.checkpoint_version, None);
 
-        snapshot_v1.clone().checkpoint(ctx.engine.as_ref(), None)?;
+        snapshot_v1.checkpoint(ctx.engine.as_ref(), None)?;
 
         let fresh = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
         assert_eq!(fresh.version(), 1);
@@ -1470,7 +1470,7 @@ mod tests {
             .build(ctx.engine.as_ref())?;
         assert_eq!(snapshot_v1.log_segment.checkpoint_version, None);
 
-        snapshot_v1.clone().checkpoint(ctx.engine.as_ref(), None)?;
+        snapshot_v1.checkpoint(ctx.engine.as_ref(), None)?;
 
         let refreshed = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
         assert_eq!(refreshed.log_segment.checkpoint_version, Some(1));
@@ -1638,7 +1638,7 @@ mod tests {
             let base_snapshot = Snapshot::builder_for(table_root)
                 .at_version(0)
                 .build(&engine)?;
-            let snapshot = Snapshot::builder_from(base_snapshot.clone())
+            let snapshot = Snapshot::builder_from(base_snapshot)
                 .at_version(1)
                 .build(&engine)?;
             let expected = Snapshot::builder_for(table_root)

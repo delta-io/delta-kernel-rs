@@ -1,0 +1,3 @@
+matches-for-let-else = "AllTypes"
+avoid-breaking-exported-api = true
+absolute-paths-max-segments = 1

@@ -943,6 +943,7 @@ fn aligned_struct_expr(
 mod tests {
     use std::cell::RefCell;
 
+    use itertools::Itertools;
     use rstest::rstest;
 
     use super::*;
@@ -1292,10 +1293,8 @@ mod tests {
     #[test]
     fn stats_schema_variant_nested_in_struct() {
         let data = field_with_id("data", DataType::unshredded_variant(), false, 6);
-        let inner = StructType::new_unchecked([
-            field_with_id("id", DataType::LONG, false, 5),
-            data.clone(),
-        ]);
+        let inner =
+            StructType::new_unchecked([field_with_id("id", DataType::LONG, false, 5), data]);
         let schema = StructType::new_unchecked([field_with_id("record", inner.into(), false, 3)]);
 
         let stats = stats_schema(&schema).expect("stats_schema should succeed");
@@ -2145,9 +2144,7 @@ mod tests {
             self.visit(path)?;
             let scope = projection.map_or(String::new(), |scopes| {
                 let names = scopes.categories.map(|scope| {
-                    scope.map_or("-".to_string(), |s| {
-                        s.field_names().cloned().collect::<Vec<_>>().join(",")
-                    })
+                    scope.map_or_else(|| "-".to_string(), |s| s.field_names().join(","))
                 });
                 format!("[{}]", names.join("|"))
             });

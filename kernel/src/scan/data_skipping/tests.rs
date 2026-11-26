@@ -1082,7 +1082,7 @@ fn test_checkpoint_skipping_timestamp_adjustment(
     );
 
     // EQ: max stat leg should use adjusted literal
-    let pred = Pred::from_expr(expr!(col("ts_col") == lit(timestamp.clone())));
+    let pred = Pred::from_expr(expr!(col("ts_col") == lit(timestamp)));
     let stats = all_referenced_columns(&pred);
     let skipping_pred =
         as_checkpoint_skipping_predicate(&pred, &HashSet::new(), &HashSet::new(), &stats).unwrap();
@@ -1139,7 +1139,7 @@ fn test_timestamp_predicates_use_adjusted_max_stats(
     );
 
     // LE (col <= val) uses minValues only (no adjustment needed)
-    let pred = Pred::from_expr(expr!(col("ts_col") <= lit(timestamp.clone())));
+    let pred = Pred::from_expr(expr!(col("ts_col") <= lit(timestamp)));
     assert_eq!(
         as_data_skipping_predicate(&pred).unwrap().to_string(),
         "NOT(Column(stats_parsed.minValues.ts_col) > 1000000)"

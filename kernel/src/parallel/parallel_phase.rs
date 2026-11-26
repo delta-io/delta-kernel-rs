@@ -414,7 +414,6 @@ mod tests {
         let expected_paths = get_expected_paths(engine.as_ref(), &snapshot, predicate.clone())?;
 
         let scan = snapshot
-            .clone()
             .scan_builder()
             .fold_with(predicate, ScanBuilder::with_predicate)
             .build()?;
@@ -992,7 +991,7 @@ mod tests {
         let logging_test = LoggingTest::new();
 
         // Capture the dispatcher to share with spawned threads
-        let dispatcher = tracing::dispatcher::get_default(|d| d.clone());
+        let dispatcher = tracing::dispatcher::get_default(Clone::clone);
 
         verify_parallel_workflow(
             test_case.path,

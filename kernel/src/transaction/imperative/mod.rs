@@ -1289,7 +1289,7 @@ mod tests {
             nullable NUM_RECORDS: LONG,
             nullable NULL_COUNT: (value_struct_type.clone()),
             nullable MIN_VALUES: (value_struct_type.clone()),
-            nullable MAX_VALUES: (value_struct_type.clone()),
+            nullable MAX_VALUES: (value_struct_type),
         };
         let stats_type = DataType::from(stats_schema.clone());
         let schema = schema_ref! {
@@ -1316,7 +1316,7 @@ mod tests {
                     TestFileStats::None => Scalar::Null(stats_type.clone()),
                     TestFileStats::Present | TestFileStats::AllNull => {
                         let value_struct = |v: Option<i64>| {
-                            let scalar = v.map_or(Scalar::Null(DataType::LONG), |n| n.into());
+                            let scalar = v.map_or(Scalar::Null(DataType::LONG), Into::into);
                             Scalar::Struct(
                                 StructData::try_new(value_schema.clone(), vec![scalar]).unwrap(),
                             )

@@ -496,8 +496,7 @@ mod tests {
     fn dv_scalar(dv: &DeletionVectorDescriptor) -> Scalar {
         let offset = dv
             .offset
-            .map(Scalar::Integer)
-            .unwrap_or(Scalar::Null(DataType::INTEGER));
+            .map_or(Scalar::Null(DataType::INTEGER), Scalar::Integer);
         Scalar::Struct(
             StructData::try_new(
                 DeletionVectorDescriptor::schema_ref().clone(),
@@ -940,7 +939,7 @@ mod tests {
             storage_type: expected_storage_type,
             path_or_inline_dv: expected_path.to_string(),
             offset: offset.or(Some(1)),
-            ..original.clone()
+            ..original
         };
         assert_eq!(descriptor, expected);
         let unique_id = |dv: &DeletionVectorDescriptor| {
