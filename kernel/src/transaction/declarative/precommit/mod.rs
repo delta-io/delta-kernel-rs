@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 pub(super) use checks::{
     AddFileFieldsCheck, AppendOnlyCheck, ClusteringStatsCheck, NumRecordsCheck,
-    RemoveFileFieldsCheck,
+    PartitionValuesCheck, RemoveFileFieldsCheck,
 };
 use schemas::{
     ERROR_SCHEMA, ERROR_SUFFIX, INPUT_SCHEMA, IS_VALID_SUFFIX, RESULT_COLUMNS, RESULT_SCHEMA,
@@ -206,6 +206,7 @@ fn build_input(
     let add_row = Expression::struct_from([
         Expression::struct_from([
             col!("path"),
+            col!("partitionValues"),
             col!("size"),
             col!("modificationTime"),
             col!("stats"),
@@ -268,6 +269,7 @@ impl CheckResultVisitor<'_> {
             DataType::STRING => getter
                 .get_str(0, "check result")?
                 .map(|value| Scalar::String(value.to_owned())),
+            DataType::INTEGER => getter.get_int(0, "check result")?.map(Scalar::Integer),
             DataType::LONG => getter.get_long(0, "check result")?.map(Scalar::Long),
             DataType::BOOLEAN => getter.get_bool(0, "check result")?.map(Scalar::Boolean),
             _ => return Err(invalid_summary("Unsupported error-info field type")),

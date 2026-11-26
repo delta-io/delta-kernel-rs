@@ -13,16 +13,19 @@ use crate::arrow::array::types::*;
 use crate::arrow::array::{
     self as arrow_array, Array, ArrayBuilder, ArrayData, ArrayRef, AsArray, BooleanArray, Datum,
     LargeStringBuilder, ListArray, MapArray, MutableArrayData, NullBufferBuilder, RecordBatch,
-    StringArray, StringArrayType, StringViewBuilder, StructArray, make_array, new_null_array,
+    StringArray, StringArrayType, StringViewBuilder, StructArray, UInt32Array, make_array,
+    new_null_array,
 };
 use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
 use crate::arrow::compute::kernels::cast_utils::{Parser, string_to_datetime};
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
 use crate::arrow::compute::kernels::interleave::interleave;
+use crate::arrow::compute::kernels::length::length;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
 use crate::arrow::compute::{
     and_kleene, can_cast_types, cast, filter_record_batch, is_not_null, is_null, not, or_kleene,
+    take,
 };
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields, IntervalUnit,
@@ -321,6 +324,7 @@ pub fn evaluate_expression(
         (Unary(UnaryExpression { op, expr }), result_type) => {
             let output_type = match op {
                 ToJson { .. } | UriEncodeFileLocation => DataType::STRING,
+                MapLen => DataType::INTEGER,
             };
             if let Some(expected) = result_type
                 && *expected != output_type
@@ -342,6 +346,10 @@ pub fn evaluate_expression(
                     Ok(to_json_with_timestamp_formats(&input, formats)?)
                 }
                 UriEncodeFileLocation => map_changed_strings(&input, op, uri_encode_location),
+                MapLen => {
+                    as_map_array(&input, "MapLen")?;
+                    Ok(length(&input)?)
+                }
             }
         }
         (Binary(BinaryExpression { op, left, right }), _) => {
@@ -709,6 +717,108 @@ fn arrow_convert_to_non_view_type(vals: Arc<dyn Array>) -> KernelResult<Arc<dyn 
     }
 }
 
+/// Returns, for each row, whether the row's map contains the row's key.
+///
+/// `map` and `key` are columns with the same number of rows. Row `i` of the result is true when
+/// map `i` has key `i`, false otherwise, and NULL when the map or the key is NULL. For example,
+/// maps `[{a: 1, b: 2}, {a: 1}, NULL]` with keys `["b", "z", "a"]` give `[true, false, NULL]`.
+fn map_has_key(map: &ArrayRef, key: &ArrayRef) -> KernelResult<BooleanArray> {
+    let map = as_map_array(map, "MapHasKey")?;
+    check_map_has_key_inputs(map, key)?;
+
+    // Give every map entry the key of its row, so one comparison covers all entries.
+    let offsets = map.value_offsets();
+    let first_entry = offsets[0] as usize;
+    let entries_in_row = |row: usize| (offsets[row + 1] - offsets[row]) as usize;
+    let row_of_each_entry: UInt32Array = (0..map.len())
+        .flat_map(|row| std::iter::repeat_n(row as u32, entries_in_row(row)))
+        .collect();
+    // View layouts share their bytes, so `take` repeats each key without copying it per entry.
+    let entry_keys =
+        arrow_convert_to_view_type(map.keys().slice(first_entry, row_of_each_entry.len()))?;
+    let key = arrow_convert_to_view_type(key.clone())?;
+    let key_for_each_entry = take(key.as_ref(), &row_of_each_entry, None)?;
+
+    // Compare all entries at once, then check each row for at least one match.
+    let entry_matches = eq(&entry_keys, &key_for_each_entry)?;
+    let has_key = (0..map.len()).map(|row| {
+        if map.is_null(row) || key.is_null(row) {
+            return None;
+        }
+        let row_start = offsets[row] as usize - first_entry;
+        let row_matches = entry_matches.slice(row_start, entries_in_row(row));
+        Some(row_matches.true_count() > 0)
+    });
+    Ok(has_key.collect())
+}
+
+/// Checks that `map_has_key` can compare `key` with the keys of `map`.
+///
+/// `key` must have one row per map row and the same type as the map keys. String and binary keys
+/// may use a different Arrow layout than the map keys, such as `Utf8` against `Utf8View`. Maps
+/// with nested key types are rejected.
+fn check_map_has_key_inputs(map: &MapArray, key: &ArrayRef) -> KernelResult<()> {
+    if key.len() != map.len() {
+        return Err(KernelError::invalid_expression(format!(
+            "MapHasKey requires one key per map row, but got {} keys for {} rows",
+            key.len(),
+            map.len()
+        )));
+    }
+    let map_key_type = map.keys().data_type();
+    if map_key_type.is_nested() {
+        return Err(KernelError::invalid_expression(format!(
+            "MapHasKey does not support nested map key type {map_key_type:?}"
+        )));
+    }
+    if key.data_type() != map_key_type && !is_layout_only_difference(key.data_type(), map_key_type)
+    {
+        return Err(KernelError::invalid_expression(format!(
+            "MapHasKey requires a key of the map key type {map_key_type:?}, but got {:?}",
+            key.data_type()
+        )));
+    }
+    Ok(())
+}
+
+/// When the operand types differ, converts string and binary operands, including list elements, to
+/// view layouts. Casting a non-view layout to a view layout is faster than the reverse.
+fn align_comparison_operands(
+    left: ArrayRef,
+    right: ArrayRef,
+) -> KernelResult<(ArrayRef, ArrayRef)> {
+    if left.data_type() == right.data_type() {
+        return Ok((left, right));
+    }
+    Ok((
+        arrow_convert_to_view_type(left)?,
+        arrow_convert_to_view_type(right)?,
+    ))
+}
+
+/// True when both types are string layouts or both are binary layouts. A cast between them keeps
+/// every value.
+fn is_layout_only_difference(a: &ArrowDataType, b: &ArrowDataType) -> bool {
+    use ArrowDataType::*;
+    matches!(
+        (a, b),
+        (Utf8 | LargeUtf8 | Utf8View, Utf8 | LargeUtf8 | Utf8View)
+            | (
+                Binary | LargeBinary | BinaryView,
+                Binary | LargeBinary | BinaryView
+            )
+    )
+}
+
+fn as_map_array<'a>(array: &'a ArrayRef, op: &str) -> KernelResult<&'a MapArray> {
+    array.as_map_opt().ok_or_else(|| {
+        KernelError::invalid_expression(format!(
+            "{op} requires a map input, but got {:?}",
+            array.data_type()
+        ))
+    })
+}
+
 /// Converts Arrow string/binary arrays and their list elements to view representations.
 /// Other nested types are preserved.
 fn arrow_convert_to_view_type(vals: Arc<dyn Array>) -> KernelResult<Arc<dyn Array>> {
@@ -842,23 +952,17 @@ pub fn evaluate_predicate(
                 (Distinct, false) => distinct,
                 (Distinct, true) => not_distinct,
                 (In, _) => return Ok(maybe_inverted(Cow::Owned(eval_in()?))?),
+                (MapHasKey, _) => {
+                    let map = evaluate_expression(left, batch, None)?;
+                    let key = evaluate_expression(right, batch, None)?;
+                    return Ok(maybe_inverted(Cow::Owned(map_has_key(&map, &key)?))?);
+                }
             };
 
             let left = evaluate_expression(left, batch, None)?;
             let right = evaluate_expression(right, batch, None)?;
 
-            // If the types differ (e.g. one side is a view type and the other is not),
-            // normalize both to view types since benchamrking results show that casting from
-            // non-view to view type is faster than casting from view type to non-view
-            // type.
-            let (left, right) = if left.data_type() == right.data_type() {
-                (left, right)
-            } else {
-                (
-                    arrow_convert_to_view_type(left)?,
-                    arrow_convert_to_view_type(right)?,
-                )
-            };
+            let (left, right) = align_comparison_operands(left, right)?;
             Ok(eval_fn(&left, &right)?)
         }
         Junction(JunctionPredicate { op, preds }) => {
@@ -1222,10 +1326,7 @@ fn evaluate_map_to_struct(
     output_schema: &StructType,
     timestamp_timezone: TimestampTimezone,
 ) -> KernelResult<StructArray> {
-    let map_array = map_arr
-        .as_any()
-        .downcast_ref::<MapArray>()
-        .ok_or_else(|| KernelError::generic("MapToStruct requires a MapArray as input"))?;
+    let map_array = as_map_array(map_arr, "MapToStruct")?;
 
     let map_keys = map_array
         .keys()
@@ -1355,7 +1456,7 @@ mod tests {
         ArrayData as ArrowArrayData, ArrayRef, BinaryArray, BooleanArray, Date32Array,
         Float32Array, Float64Array, Int32Array, Int64Array, LargeStringArray, ListArray,
         MapBuilder, StringArray, StringBuilder, StringViewArray, StructArray,
-        TimestampMicrosecondArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray,
     };
     use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{
@@ -3349,6 +3450,220 @@ mod tests {
         assert_eq!(result.null_count(), len);
     }
 
+    /// Builds a batch with a map column `m` and a key column `k`:
+    ///
+    /// | row | `m`              | `k`    |
+    /// |-----|------------------|--------|
+    /// | 0   | `{a: 1, b: 2}`   | `a`    |
+    /// | 1   | `{}`             | NULL   |
+    /// | 2   | NULL             | `a`    |
+    /// | 3   | `{c: NULL}`      | `c`    |
+    fn create_accessor_map_batch() -> RecordBatch {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        builder.keys().append_value("a");
+        builder.values().append_value("1");
+        builder.keys().append_value("b");
+        builder.values().append_value("2");
+        builder.append(true).unwrap();
+        builder.append(true).unwrap();
+        builder.append(false).unwrap();
+        builder.keys().append_value("c");
+        builder.values().append_null();
+        builder.append(true).unwrap();
+        let map_array = builder.finish();
+
+        let keys = StringArray::from(vec![Some("a"), None, Some("a"), Some("c")]);
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("m", map_array.data_type().clone(), true),
+            ArrowField::new("k", ArrowDataType::Utf8, true),
+        ]);
+        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array), Arc::new(keys)]).unwrap()
+    }
+
+    fn create_map_batch(
+        keys: ArrayRef,
+        offsets: Vec<i32>,
+        valid: Option<Vec<bool>>,
+    ) -> RecordBatch {
+        let values: ArrayRef = Arc::new(Int32Array::from(vec![None::<i32>; keys.len()]));
+        let key_field = ArrowField::new("key", keys.data_type().clone(), false);
+        let value_field = ArrowField::new("value", ArrowDataType::Int32, true);
+        let entries = StructArray::from(vec![
+            (Arc::new(key_field), keys),
+            (Arc::new(value_field), values),
+        ]);
+        let entries_field = Arc::new(ArrowField::new(
+            "key_value",
+            entries.data_type().clone(),
+            false,
+        ));
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(offsets));
+        let nulls = valid.map(NullBuffer::from);
+        let map = MapArray::new(entries_field, offsets, entries, nulls, false);
+        let schema = ArrowSchema::new(vec![ArrowField::new("m", map.data_type().clone(), true)]);
+        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map)]).unwrap()
+    }
+
+    fn create_cast_key_map_batch(
+        source_type: ArrowDataType,
+        key_type: ArrowDataType,
+    ) -> RecordBatch {
+        let keys: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
+        let keys = cast(&cast(&keys, &source_type).unwrap(), &key_type).unwrap();
+        create_map_batch(keys, vec![0, 2, 2], None)
+    }
+
+    fn assert_invalid_expression<T: std::fmt::Debug>(result: &KernelResult<T>) {
+        let is_invalid_expression =
+            matches!(result, Err(KernelError::InvalidExpressionEvaluation(_)));
+        assert!(is_invalid_expression, "{result:?}");
+    }
+
+    fn create_nested_key_map_batch() -> RecordBatch {
+        let field = Arc::new(ArrowField::new("x", ArrowDataType::Int32, false));
+        let keys = StructArray::from(vec![(
+            field,
+            Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+        )]);
+        create_map_batch(Arc::new(keys), vec![0, 1], None)
+    }
+
+    #[rstest]
+    #[case::full_batch(create_accessor_map_batch(), vec![Some(2), Some(0), None, Some(1)])]
+    #[case::sliced_batch(create_accessor_map_batch().slice(1, 3), vec![Some(0), None, Some(1)])]
+    #[case::empty_batch(create_accessor_map_batch().slice(0, 0), vec![])]
+    #[case::null_map_owning_entries(
+        create_map_batch(Arc::new(StringArray::from(vec!["a", "b"])), vec![0, 1, 2], Some(vec![true, false])),
+        vec![Some(1), None],
+    )]
+    fn test_map_len(#[case] batch: RecordBatch, #[case] expected: Vec<Option<i32>>) {
+        let expr = Expr::map_len(col!("m"));
+        let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap();
+        let expected = Int32Array::from(expected);
+        assert_eq!(result.as_primitive::<Int32Type>(), &expected);
+    }
+
+    #[rstest]
+    #[case::non_integer_output(col!("m"), Some(DataType::LONG))]
+    #[case::non_map_input(col!("k"), None)]
+    fn test_map_len_rejects_invalid_inputs(
+        #[case] input: Expr,
+        #[case] result_type: Option<DataType>,
+    ) {
+        let batch = create_accessor_map_batch();
+        let expr = Expr::map_len(input);
+        let result = evaluate_expression(&expr, &batch, result_type.as_ref());
+        assert_invalid_expression(&result);
+    }
+
+    #[rstest]
+    #[case::present_key(lit("b"), vec![Some(true), Some(false), None, Some(false)])]
+    #[case::missing_key(lit("z"), vec![Some(false), Some(false), None, Some(false)])]
+    #[case::null_valued_entry(lit("c"), vec![Some(false), Some(false), None, Some(true)])]
+    #[case::null_key(null_lit(DataType::STRING), vec![None, None, None, None])]
+    #[case::column_key(col!("k"), vec![Some(true), None, None, Some(true)])]
+    fn test_map_has_key(
+        #[case] key: Expr,
+        #[case] expected: Vec<Option<bool>>,
+        #[values(false, true)] inverted: bool,
+    ) {
+        let batch = create_accessor_map_batch();
+        let pred = Pred::map_has_key(col!("m"), key);
+        let result = evaluate_predicate(&pred, &batch, inverted).unwrap();
+        let expected: BooleanArray = expected
+            .into_iter()
+            .map(|v| v.map(|b| b != inverted))
+            .collect();
+        assert_eq!(result, expected);
+    }
+
+    #[rstest]
+    #[case::sliced_batch(create_accessor_map_batch().slice(1, 3), col!("k"), vec![None, None, Some(true)])]
+    #[case::sliced_batch_after_entries(
+        create_map_batch(Arc::new(StringArray::from(vec!["a", "b", "c"])), vec![0, 1, 2, 3], None).slice(1, 2),
+        lit("c"),
+        vec![Some(false), Some(true)],
+    )]
+    #[case::empty_batch(create_accessor_map_batch().slice(0, 0), lit("a"), vec![])]
+    #[case::null_map_owning_entries(
+        create_map_batch(Arc::new(StringArray::from(vec!["a", "b"])), vec![0, 1, 2], Some(vec![true, false])),
+        lit("b"),
+        vec![Some(false), None],
+    )]
+    #[case::integer_keys(
+        create_map_batch(Arc::new(Int32Array::from(vec![1, 2])), vec![0, 2, 2], None),
+        lit(2_i32),
+        vec![Some(true), Some(false)],
+    )]
+    #[case::utf8_view_keys(
+        create_cast_key_map_batch(ArrowDataType::Utf8, ArrowDataType::Utf8View),
+        lit("b"),
+        vec![Some(true), Some(false)],
+    )]
+    #[case::utf8_view_keys_null_key(
+        create_cast_key_map_batch(ArrowDataType::Utf8, ArrowDataType::Utf8View),
+        null_lit(DataType::STRING),
+        vec![None, None],
+    )]
+    #[case::large_utf8_keys(
+        create_cast_key_map_batch(ArrowDataType::Utf8, ArrowDataType::LargeUtf8),
+        lit("b"),
+        vec![Some(true), Some(false)],
+    )]
+    #[case::large_utf8_keys_null_key(
+        create_cast_key_map_batch(ArrowDataType::Utf8, ArrowDataType::LargeUtf8),
+        null_lit(DataType::STRING),
+        vec![None, None],
+    )]
+    #[case::binary_view_keys(
+        create_cast_key_map_batch(ArrowDataType::Binary, ArrowDataType::BinaryView),
+        lit(Scalar::Binary(b"b".to_vec())),
+        vec![Some(true), Some(false)],
+    )]
+    #[case::large_binary_keys(
+        create_cast_key_map_batch(ArrowDataType::Binary, ArrowDataType::LargeBinary),
+        lit(Scalar::Binary(b"b".to_vec())),
+        vec![Some(true), Some(false)],
+    )]
+    fn test_map_has_key_layouts(
+        #[case] batch: RecordBatch,
+        #[case] key: Expr,
+        #[case] expected: Vec<Option<bool>>,
+    ) {
+        let pred = Pred::map_has_key(col!("m"), key);
+        let result = evaluate_predicate(&pred, &batch, false).unwrap();
+        let expected = BooleanArray::from(expected);
+        assert_eq!(result, expected);
+    }
+
+    #[rstest]
+    #[case::non_map_input(create_accessor_map_batch(), col!("k"), lit("a"))]
+    #[case::integer_key_for_string_keys(create_accessor_map_batch(), col!("m"), lit(1_i32))]
+    #[case::microsecond_key_for_millisecond_keys(
+        create_map_batch(Arc::new(TimestampMillisecondArray::from(vec![1])), vec![0, 1], None),
+        col!("m"),
+        lit(Scalar::TimestampNtz(1_500)),
+    )]
+    #[case::nested_map_keys(create_nested_key_map_batch(), col!("m"), lit(1_i32))]
+    fn test_map_has_key_rejects_invalid_inputs(
+        #[case] batch: RecordBatch,
+        #[case] map: Expr,
+        #[case] key: Expr,
+        #[values(false, true)] inverted: bool,
+    ) {
+        let pred = Pred::map_has_key(map, key);
+        let result = evaluate_predicate(&pred, &batch, inverted);
+        assert_invalid_expression(&result);
+    }
+
+    #[test]
+    fn test_map_has_key_rejects_key_length_mismatch() {
+        let batch = create_accessor_map_batch();
+        let key: ArrayRef = Arc::new(StringArray::from(vec!["a"]));
+        let result = map_has_key(batch.column(0), &key);
+        assert_invalid_expression(&result);
+    }
+
     // ==================== MapToStruct Tests ====================
 
     /// Helper: creates a RecordBatch with a `pv` column of type Map<String, String>.
@@ -3893,7 +4208,7 @@ mod tests {
         let result_type = DataType::from(output_schema);
         let expr = Expr::map_to_struct(col!("s"), MapToStructOptions::default());
         let result = evaluate_expression(&expr, &batch, Some(&result_type));
-        assert!(result.is_err());
+        assert_invalid_expression(&result);
     }
 
     /// An empty-string map value casts via `empty_string_partition_cast`: `""` for string, empty

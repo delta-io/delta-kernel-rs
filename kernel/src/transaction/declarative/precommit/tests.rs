@@ -1,4 +1,4 @@
-use StagedAction::{Add, AddWithStats, Remove};
+use StagedAction::{Add, AddWithPartitionValues, AddWithStats, Remove};
 use rstest::rstest;
 
 use super::*;
@@ -7,7 +7,7 @@ use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::sync::plan::SyncPlanExecutor;
 use crate::expressions::{col, lit};
 use crate::plans::{Operation, PlanExecutor, ScopedPlanExecutor};
-use crate::schema::{SchemaStructPatchBuilder, schema_ref};
+use crate::schema::{MapType, SchemaStructPatchBuilder, schema_ref};
 use crate::transaction::declarative::test_utils::{
     STATS_SCHEMA, StagedAction, Stats, fields_input, make_ref,
 };
@@ -19,7 +19,7 @@ fn run_checks(checks: CheckList, actions: &[StagedAction]) -> KernelResult<()> {
     for action in actions {
         let relation = make_ref(&executor, action)?;
         match action {
-            Add(..) | AddWithStats(..) => adds.push(relation),
+            Add(..) | AddWithStats(..) | AddWithPartitionValues(..) => adds.push(relation),
             Remove(..) => removes.push(relation),
         }
     }
@@ -169,6 +169,68 @@ fn clustering_statistics(
 }
 
 #[rstest]
+#[case::exact_match(&["p1", "p2"], &[AddWithPartitionValues("part",
+    Some(&[("p1", Some("a")), ("p2", Some("b"))]))], None)]
+#[case::reordered_keys(&["p1", "p2"], &[AddWithPartitionValues("part",
+    Some(&[("p2", Some("b")), ("p1", Some("a"))]))], None)]
+#[case::null_value_is_present(&["p1", "p2"], &[AddWithPartitionValues("part",
+    Some(&[("p1", Some("a")), ("p2", None)]))], None)]
+#[case::missing_key(&["p1", "p2"], &[AddWithPartitionValues("part",
+    Some(&[("p1", Some("a"))]))], Some("has 1 partitionValues keys"))]
+#[case::extra_key(&["p1"], &[AddWithPartitionValues("part",
+    Some(&[("p1", Some("a")), ("p2", Some("b"))]))], Some("has 2 partitionValues keys"))]
+#[case::wrong_key(&["p1", "p2"], &[AddWithPartitionValues("part",
+    Some(&[("p1", Some("a")), ("p3", Some("b"))]))], Some("columns [p1, p2]"))]
+#[case::duplicate_key(&["p1", "p2"], &[AddWithPartitionValues("part",
+    Some(&[("p1", Some("a")), ("p1", Some("b"))]))], Some("columns [p1, p2]"))]
+#[case::unpartitioned_empty_map(&[], &[Add(Some("part"), Some(1), Some(1))], None)]
+#[case::unpartitioned_non_empty_map(&[], &[AddWithPartitionValues("part",
+    Some(&[("stray", Some("x"))]))], Some("columns []"))]
+#[case::ignores_removes(&["p1"], &[Remove(Some("part"), Some(1))], None)]
+#[case::first_failure(&["p1"], &[
+    AddWithPartitionValues("good", Some(&[("p1", Some("a"))])),
+    AddWithPartitionValues("missing-key", Some(&[])),
+    AddWithPartitionValues("null-map", None),
+], Some("AddFile for 'missing-key' has 0 partitionValues keys"))]
+fn partition_values_match_partition_columns(
+    #[case] columns: &[&str],
+    #[case] actions: &[StagedAction],
+    #[case] expected_error: Option<&str>,
+) -> KernelResult<()> {
+    let check = PartitionValuesCheck::new(columns.iter().map(|column| column.to_string()))?;
+    let result = run_checks(vec![Box::new(check)], actions);
+    let Some(expected_error) = expected_error else {
+        return result;
+    };
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, KernelError::InvalidPartitionValues(_)),
+        "{error}"
+    );
+    assert!(error.to_string().contains(expected_error), "{error}");
+    Ok(())
+}
+
+#[rstest]
+#[case::partitioned(&["p1"], &[AddWithPartitionValues("part", None)])]
+#[case::unpartitioned(&[], &[AddWithPartitionValues("part", None)])]
+#[case::after_valid_add(&["p1"], &[
+    AddWithPartitionValues("good", Some(&[("p1", Some("a"))])),
+    AddWithPartitionValues("part", None),
+])]
+fn partition_values_map_is_required(
+    #[case] columns: &[&str],
+    #[case] actions: &[StagedAction],
+) -> KernelResult<()> {
+    let check = PartitionValuesCheck::new(columns.iter().map(|column| column.to_string()))?;
+    let result = run_checks(vec![Box::new(check)], actions);
+    assert_result(
+        result,
+        Some("AddFile for 'part' is missing required field 'partitionValues'"),
+    )
+}
+
+#[rstest]
 #[case::present(false, false, None)]
 #[case::first_column_missing(true, false, Some("physical.id"))]
 #[case::nested_column_missing(false, true, Some("physical.tag"))]
@@ -196,6 +258,7 @@ fn clustering_statistics_identify_failing_physical_column(
     };
     let source_schema = schema_ref! {
         nullable "path": STRING,
+        nullable "partitionValues": { STRING => nullable STRING },
         nullable "size": LONG,
         nullable "modificationTime": LONG,
         nullable "stats": (stats_schema.clone()),
@@ -218,6 +281,7 @@ fn clustering_statistics_identify_failing_physical_column(
     .project(
         Expression::struct_from([
             lit("part"),
+            null_lit(MapType::new(DataType::STRING, DataType::STRING, true)),
             lit(1i64),
             lit(1i64),
             Expression::struct_from([
@@ -306,6 +370,8 @@ fn common_input_schema_keeps_table_statistics_independently_of_checks() -> Kerne
 #[case::add_missing_size(true, SchemaStructPatchBuilder::new().drop("size"), "size")]
 #[case::add_missing_time(true, SchemaStructPatchBuilder::new().drop("modificationTime"),
     "modificationTime")]
+#[case::add_missing_partition_values(true, SchemaStructPatchBuilder::new().drop("partitionValues"),
+    "partitionValues")]
 #[case::add_missing_stats(true, SchemaStructPatchBuilder::new().drop("stats"), "stats")]
 #[case::add_missing_record_count(true,
     SchemaStructPatchBuilder::new().drop_at(["stats"], "numRecords"), "numRecords")]

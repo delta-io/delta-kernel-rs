@@ -80,6 +80,9 @@ void print_tree_helper(ExpressionItem ref, int depth) {
         case Distinct:
           printf("Distinct\n");
           break;
+        case MapHasKey:
+          printf("MapHasKey\n");
+          break;
       }
       print_expression_item_list(op->exprs, depth + 1);
       break;
@@ -283,6 +286,9 @@ void print_tree_helper(ExpressionItem ref, int depth) {
           break;
         case UriEncodeFileLocation:
           printf("UriEncodeFileLocation\n");
+          break;
+        case MapLen:
+          printf("MapLen\n");
           break;
       }
 

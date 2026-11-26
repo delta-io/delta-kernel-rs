@@ -108,8 +108,9 @@ pub enum UnaryPredicateOp {
 /// A binary predicate operator.
 ///
 /// The ordering and equality comparisons follow SQL three-valued logic, so a NULL operand yields
-/// NULL rather than `false`. [`Distinct`](Self::Distinct) and [`In`](Self::In) instead tolerate
-/// NULL and always answer `true` or `false`.
+/// NULL rather than `false`. [`MapHasKey`](Self::MapHasKey) also yields NULL for a NULL operand.
+/// [`Distinct`](Self::Distinct) and [`In`](Self::In) instead tolerate NULL and always answer
+/// `true` or `false`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BinaryPredicateOp {
     /// `left < right`.
@@ -138,6 +139,13 @@ pub enum BinaryPredicateOp {
     /// reason the operands sit this way around rather than the more familiar
     /// column-on-the-left form.
     In,
+    /// `MAP_HAS_KEY(map, key)`: `true` when the map contains `key` and `false` otherwise. The
+    /// left operand is a map and the right operand is a value of the map's key type. A NULL map or
+    /// a NULL key yields NULL. An entry whose value is NULL still counts as present.
+    ///
+    /// Map keys must have a non-nested type. Keys compare with the same equality as
+    /// [`Equal`](Self::Equal). A non-map left operand or a key of a different type is an error.
+    MapHasKey,
 }
 
 /// A unary expression operator.
@@ -196,6 +204,9 @@ pub enum UnaryExpressionOp {
     // TODO(#2423): decide whether this keeps percent-encoding non-ASCII if `add.path` stops doing
     // so.
     UriEncodeFileLocation,
+    /// `MAP_LEN(map)`: the number of entries in a map, as an INTEGER. A NULL map yields NULL. An
+    /// empty map yields `0`. A non-map input is an error.
+    MapLen,
 }
 
 impl UnaryExpressionOp {
@@ -698,11 +709,11 @@ pub enum Predicate {
 ////////////////////////////////////////////////////////////////////////
 
 impl BinaryPredicateOp {
-    /// True if this is a comparison for which NULL input always produces NULL output
+    /// True if this operator always produces NULL output for NULL input.
     pub(crate) fn is_null_intolerant(&self) -> bool {
         use BinaryPredicateOp::*;
         match self {
-            LessThan | GreaterThan | Equal => true,
+            LessThan | GreaterThan | Equal | MapHasKey => true,
             Distinct | In => false, // tolerates NULL input
         }
     }
@@ -1040,6 +1051,12 @@ impl Expression {
         Predicate::distinct(self, other)
     }
 
+    /// Create a new expression `MAP_LEN(self)`, the number of entries in a map.
+    /// See [`UnaryExpressionOp::MapLen`].
+    pub fn map_len(self) -> Self {
+        Self::unary(UnaryExpressionOp::MapLen, self)
+    }
+
     /// Creates a new unary expression
     pub fn unary(op: UnaryExpressionOp, expr: impl Into<Expression>) -> Self {
         Self::Unary(UnaryExpression::new(op, expr))
@@ -1219,6 +1236,12 @@ impl Predicate {
         Self::binary(BinaryPredicateOp::Distinct, a, b)
     }
 
+    /// Create a new predicate `MAP_HAS_KEY(map, key)`, true when `map` contains `key`.
+    /// See [`BinaryPredicateOp::MapHasKey`].
+    pub fn map_has_key(map: impl Into<Expression>, key: impl Into<Expression>) -> Self {
+        Self::binary(BinaryPredicateOp::MapHasKey, map, key)
+    }
+
     /// Create a new predicate `self AND other`
     pub fn and(a: impl Into<Self>, b: impl Into<Self>) -> Self {
         Self::and_from([a.into(), b.into()])
@@ -1313,6 +1336,7 @@ impl Display for UnaryExpressionOp {
         match self {
             ToJson { .. } => write!(f, "TO_JSON"),
             UriEncodeFileLocation => write!(f, "URI_ENCODE_FILE_LOCATION"),
+            MapLen => write!(f, "MAP_LEN"),
         }
     }
 }
@@ -1351,6 +1375,7 @@ impl Display for BinaryPredicateOp {
             // in our code we take care of this, but theirs might not ...
             Distinct => write!(f, "DISTINCT"),
             In => write!(f, "IN"),
+            MapHasKey => write!(f, "MAP_HAS_KEY"),
         }
     }
 }
@@ -1454,10 +1479,10 @@ impl Display for Predicate {
             BooleanExpression(expr) => write!(f, "{expr}"),
             Not(pred) => write!(f, "NOT({pred})"),
             Binary(BinaryPredicate {
-                op: BinaryPredicateOp::Distinct,
+                op: op @ (BinaryPredicateOp::Distinct | BinaryPredicateOp::MapHasKey),
                 left,
                 right,
-            }) => write!(f, "DISTINCT({left}, {right})"),
+            }) => write!(f, "{op}({left}, {right})"),
             Binary(BinaryPredicate { op, left, right }) => write!(f, "{left} {op} {right}"),
             Unary(UnaryPredicate { op, expr }) => match op {
                 UnaryPredicateOp::IsNull => write!(f, "{expr} IS NULL"),
@@ -1586,6 +1611,7 @@ mod tests {
                 ),
                 "TO_JSON(Column(x), full_precision_timestamps)",
             ),
+            (Expr::map_len(col!("m")), "MAP_LEN(Column(m))"),
             (
                 Expr::unary(UnaryExpressionOp::UriEncodeFileLocation, col!("x")),
                 "URI_ENCODE_FILE_LOCATION(Column(x))",
@@ -1672,6 +1698,14 @@ mod tests {
             (
                 Pred::not(Pred::has_uri_scheme(col!("x"))),
                 "NOT(HAS_URI_SCHEME(Column(x)))",
+            ),
+            (
+                Pred::map_has_key(col!("m"), lit("a")),
+                "MAP_HAS_KEY(Column(m), 'a')",
+            ),
+            (
+                Pred::not(Pred::map_has_key(col!("m"), lit("a"))),
+                "NOT(MAP_HAS_KEY(Column(m), 'a'))",
             ),
         ];
 

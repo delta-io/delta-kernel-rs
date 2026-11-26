@@ -5,8 +5,8 @@ use std::sync::LazyLock;
 use super::StagedDataCheck;
 use super::checks::{
     AddFileFieldsCheck, AddFileFieldsError, AppendOnlyCheck, AppendOnlyError, ClusteringStatsCheck,
-    ClusteringStatsError, NumRecordsCheck, NumRecordsError, RemoveFileFieldsCheck,
-    RemoveFileFieldsError,
+    ClusteringStatsError, NumRecordsCheck, NumRecordsError, PartitionValuesCheck,
+    PartitionValuesError, RemoveFileFieldsCheck, RemoveFileFieldsError,
 };
 use crate::schema::{
     ColumnNamesAndTypes, DataType, SchemaRef, StructField, StructType, ToSchema, lazy_schema_ref,
@@ -27,12 +27,14 @@ const CHECK_SCHEMAS: &[CheckSchema] = &[
     (AppendOnlyCheck::NAME, AppendOnlyError::to_schema),
     (NumRecordsCheck::NAME, NumRecordsError::to_schema),
     (ClusteringStatsCheck::NAME, ClusteringStatsError::to_schema),
+    (PartitionValuesCheck::NAME, PartitionValuesError::to_schema),
 ];
 
 /// Common action fields. Plan construction replaces `add.stats` with the table's statistics schema.
 pub(super) static INPUT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     nullable "add": {
         nullable "path": STRING,
+        nullable "partitionValues": { STRING => nullable STRING },
         nullable "size": LONG,
         nullable "modificationTime": LONG,
         nullable "stats": { nullable "numRecords": LONG },
