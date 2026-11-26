@@ -411,7 +411,10 @@ mod tests {
         assert_eq!(event.reason, expected);
         assert_eq!(
             events[0].to_string(),
-            format!("CrcReadFailure(reason={expected})")
+            format!(
+                "CrcReadFailure(operation_id={}, correlation_id=None, reason={expected})",
+                MetricId::nil()
+            )
         );
     }
 

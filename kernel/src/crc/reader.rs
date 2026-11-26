@@ -19,11 +19,24 @@ use crate::{Engine, KernelError, KernelResult};
 /// replay.
 ///
 /// Reports metrics: `CrcReadSuccess` or `CrcReadFailure`.
-#[instrument(name = CRC_READ_COMPLETED_SPAN, err(level = "warn"), skip_all, fields(report, enable_call_frame, bytes_read, failure_reason, operation_id = %context.operation_id, correlation_id = context.correlation_id.as_deref().unwrap_or(""), path = ?crc_path.location.location))]
+#[instrument(
+    name = CRC_READ_COMPLETED_SPAN,
+    err(level = "warn"),
+    skip_all,
+    fields(
+        report,
+        enable_call_frame,
+        bytes_read,
+        failure_reason,
+        operation_id = %metric_context.operation_id,
+        correlation_id = metric_context.correlation_id.as_deref().unwrap_or(""),
+        path = ?crc_path.location.location
+    )
+)]
 pub(crate) fn try_read_crc_file(
     engine: &dyn Engine,
     crc_path: &ParsedLogPath,
-    context: &SnapshotLoadMetricContext,
+    metric_context: &SnapshotLoadMetricContext,
 ) -> KernelResult<Crc> {
     let storage = engine.storage_handler();
     let url = crc_path.location.as_url().clone();
@@ -53,9 +66,9 @@ pub(crate) fn try_read_crc_file(
 pub(crate) fn read_crc_file_or_none(
     engine: &dyn Engine,
     crc_file: &ParsedLogPath,
-    context: &SnapshotLoadMetricContext,
+    metric_context: &SnapshotLoadMetricContext,
 ) -> KernelResult<Option<Arc<Crc>>> {
-    match try_read_crc_file(engine, crc_file, context) {
+    match try_read_crc_file(engine, crc_file, metric_context) {
         Ok(crc) => Ok(Some(Arc::new(crc))),
         Err(error) if matches!(error.without_backtrace(), KernelError::Cancelled) => Err(error),
         Err(_) => Ok(None),
@@ -90,7 +103,7 @@ mod tests {
     use crate::actions::{Format, Metadata, Protocol};
     use crate::engine::sync::SyncEngine;
     use crate::engine::{CancellableEngine, DelegatingEngine};
-    use crate::metrics::MetricEvent;
+    use crate::metrics::{MetricEvent, MetricId};
     use crate::path::ParsedLogPath;
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::recording_reads::RecordingReads;
@@ -348,7 +361,7 @@ mod tests {
 
     fn crc_read_context() -> SnapshotLoadMetricContext {
         SnapshotLoadMetricContext {
-            operation_id: crate::metrics::MetricId::new(),
+            operation_id: MetricId::new(),
             correlation_id: Some("snapshot-read".into()),
             ..SnapshotLoadMetricContext::for_test()
         }

@@ -10,15 +10,12 @@ use crate::{
     SharedExternEngine, SharedSnapshot, TryFromStringSlice, kernel_string_slice,
 };
 
-unsafe fn reader_for_request<'a>(
-    snapshot: &'a Snapshot,
-    correlation_id: &KernelStringSlice,
-) -> KernelResult<SnapshotReader<'a>> {
+fn reader_for_request(snapshot: &Snapshot, correlation_id: String) -> SnapshotReader<'_> {
     let reader = snapshot.reader();
-    if correlation_id.len == 0 {
-        Ok(reader)
+    if correlation_id.is_empty() {
+        reader
     } else {
-        Ok(reader.with_correlation_id(unsafe { correlation_id.try_to_string() }?))
+        reader.with_correlation_id(correlation_id)
     }
 }
 
@@ -69,7 +66,8 @@ pub unsafe extern "C" fn get_domain_metadata_with_correlation_id(
     correlation_id: KernelStringSlice,
 ) -> ExternResult<NullableCvoid> {
     let result = catch_panic(|| {
-        let reader = unsafe { reader_for_request(snapshot.as_ref(), &correlation_id) }?;
+        let correlation_id = unsafe { correlation_id.try_to_string() }?;
+        let reader = reader_for_request(unsafe { snapshot.as_ref() }, correlation_id);
         let engine = unsafe { engine.as_ref() };
         let domain = unsafe { String::try_from_slice(&domain) };
 
@@ -128,7 +126,8 @@ pub unsafe extern "C" fn snapshot_row_tracking_high_water_mark_with_correlation_
 ) -> ExternResult<OptionalValue<i64>> {
     let result = catch_panic(|| {
         let engine_ref = unsafe { engine.as_ref() };
-        let reader = unsafe { reader_for_request(snapshot.as_ref(), &correlation_id) }?;
+        let correlation_id = unsafe { correlation_id.try_to_string() }?;
+        let reader = reader_for_request(unsafe { snapshot.as_ref() }, correlation_id);
         reader
             .get_row_tracking_high_water_mark(engine_ref.engine().as_ref())
             .map(OptionalValue::from)
@@ -213,7 +212,8 @@ pub unsafe extern "C" fn visit_clustering_columns_with_correlation_id(
     correlation_id: KernelStringSlice,
 ) -> ExternResult<OptionalValue<usize>> {
     let result = catch_panic(|| {
-        let reader = unsafe { reader_for_request(snapshot.as_ref(), &correlation_id) }?;
+        let correlation_id = unsafe { correlation_id.try_to_string() }?;
+        let reader = reader_for_request(unsafe { snapshot.as_ref() }, correlation_id);
         let engine = unsafe { engine.as_ref() };
         visit_clustering_columns_impl(reader, engine, engine_context, visitor)
     });
@@ -292,7 +292,8 @@ pub unsafe extern "C" fn visit_domain_metadata_with_correlation_id(
     correlation_id: KernelStringSlice,
 ) -> ExternResult<bool> {
     let result = catch_panic(|| {
-        let reader = unsafe { reader_for_request(snapshot.as_ref(), &correlation_id) }?;
+        let correlation_id = unsafe { correlation_id.try_to_string() }?;
+        let reader = reader_for_request(unsafe { snapshot.as_ref() }, correlation_id);
         let engine = unsafe { engine.as_ref() };
 
         visit_domain_metadata_impl(reader, engine, engine_context, visitor)

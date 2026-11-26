@@ -446,13 +446,19 @@ impl LastCheckpointHint {
     #[instrument(
         name = LAST_CHECKPOINT_READ_SPAN,
         skip_all,
-        fields(report, outcome, enable_call_frame, operation_id = %context.operation_id, correlation_id = context.correlation_id.as_deref().unwrap_or("")),
+        fields(
+            report,
+            outcome,
+            enable_call_frame,
+            operation_id = %metric_context.operation_id,
+            correlation_id = metric_context.correlation_id.as_deref().unwrap_or("")
+        ),
         err
     )]
     pub(crate) fn try_read(
         storage: &dyn StorageHandler,
         log_root: &Url,
-        context: &SnapshotLoadMetricContext,
+        metric_context: &SnapshotLoadMetricContext,
     ) -> KernelResult<Option<LastCheckpointHint>> {
         let file_path = Self::path(log_root)?;
         let mut files = storage

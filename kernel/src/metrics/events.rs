@@ -379,7 +379,14 @@ impl fmt::Display for MetricEvent {
             Self::TransactionCommitSuccess(e) => e.fmt(f),
             Self::TransactionCommitFailure(e) => e.fmt(f),
             Self::DomainMetadataLoadSuccess(e) => e.fmt(f),
-            Self::DomainMetadataLoadFailure { .. } => f.write_str("DomainMetadataLoadFailure"),
+            Self::DomainMetadataLoadFailure {
+                operation_id,
+                correlation_id,
+            } => write!(
+                f,
+                "DomainMetadataLoadFailure(operation_id={operation_id}, \
+                 correlation_id={correlation_id:?})"
+            ),
             Self::SetTransactionLoadSuccess(e) => e.fmt(f),
             Self::SetTransactionLoadFailure => f.write_str("SetTransactionLoadFailure"),
             Self::CrcReadSuccess(e) => e.fmt(f),
@@ -1413,14 +1420,16 @@ impl DomainMetadataLoadSuccess {
 impl fmt::Display for DomainMetadataLoadSuccess {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
+            operation_id,
+            correlation_id,
             from_cache,
             num_domains_returned,
             duration,
-            ..
         } = self;
         write!(
             f,
-            "DomainMetadataLoadSuccess(duration={duration:?}, from_cache={from_cache}, \
+            "DomainMetadataLoadSuccess(operation_id={operation_id}, \
+             correlation_id={correlation_id:?}, duration={duration:?}, from_cache={from_cache}, \
              num_domains_returned={num_domains_returned})"
         )
     }
@@ -1532,13 +1541,15 @@ impl CrcReadSuccess {
 impl fmt::Display for CrcReadSuccess {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
+            operation_id,
+            correlation_id,
             duration,
             bytes_read,
-            ..
         } = self;
         write!(
             f,
-            "CrcReadSuccess(duration={duration:?}, bytes={bytes_read})"
+            "CrcReadSuccess(operation_id={operation_id}, correlation_id={correlation_id:?}, \
+             duration={duration:?}, bytes={bytes_read})"
         )
     }
 }
@@ -1575,7 +1586,16 @@ pub struct CrcReadFailure {
 
 impl fmt::Display for CrcReadFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "CrcReadFailure(reason={})", self.reason)
+        let Self {
+            operation_id,
+            correlation_id,
+            reason,
+        } = self;
+        write!(
+            f,
+            "CrcReadFailure(operation_id={operation_id}, correlation_id={correlation_id:?}, \
+             reason={reason})"
+        )
     }
 }
 
@@ -1657,11 +1677,15 @@ impl LastCheckpointReadCompleted {
 impl fmt::Display for LastCheckpointReadCompleted {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
-            outcome, duration, ..
+            operation_id,
+            correlation_id,
+            outcome,
+            duration,
         } = self;
         write!(
             f,
-            "LastCheckpointReadCompleted(outcome={outcome}, duration={duration:?})"
+            "LastCheckpointReadCompleted(operation_id={operation_id}, \
+             correlation_id={correlation_id:?}, outcome={outcome}, duration={duration:?})"
         )
     }
 }
@@ -2598,20 +2622,25 @@ mod tests {
     fn last_checkpoint_outcome_has_stable_label(
         #[case] label: &str,
         #[case] outcome: LastCheckpointReadOutcome,
+        #[values(None, Some("snapshot-request"))] correlation_id: Option<&str>,
     ) {
         let static_label: &'static str = outcome.into();
         assert_eq!(static_label, label);
         assert_eq!(label.parse::<LastCheckpointReadOutcome>().unwrap(), outcome);
+        let operation_id = MetricId::new();
         let mut event = MetricEvent::LastCheckpointReadCompleted(LastCheckpointReadCompleted {
-            operation_id: MetricId::new(),
-            correlation_id: None,
+            operation_id,
+            correlation_id: correlation_id.map(Arc::from),
             outcome,
             duration: Duration::ZERO,
         });
         event.set_duration_if_applicable(Duration::from_nanos(17));
         assert_eq!(
             event.to_string(),
-            format!("LastCheckpointReadCompleted(outcome={label}, duration=17ns)")
+            format!(
+                "LastCheckpointReadCompleted(operation_id={operation_id}, \
+                 correlation_id={correlation_id:?}, outcome={label}, duration=17ns)"
+            )
         );
         assert_eq!(
             event.record_u64("outcome", 1),
@@ -2625,6 +2654,37 @@ mod tests {
             event.record_str("failure_reason", "error"),
             Err(LastCheckpointReadCompleted::SPAN_NAME)
         );
+    }
+
+    #[rstest]
+    fn read_event_display_includes_ids(
+        #[values(None, Some("read-request"))] correlation_id: Option<&str>,
+    ) {
+        let operation_id = MetricId::new();
+        let crc = MetricEvent::CrcReadSuccess(CrcReadSuccess {
+            operation_id,
+            correlation_id: correlation_id.map(Arc::from),
+            bytes_read: 12,
+            duration: Duration::ZERO,
+        });
+        let domain = MetricEvent::DomainMetadataLoadSuccess(DomainMetadataLoadSuccess {
+            operation_id,
+            correlation_id: correlation_id.map(Arc::from),
+            from_cache: false,
+            num_domains_returned: 1,
+            duration: Duration::ZERO,
+        });
+        for (name, event) in [
+            ("CrcReadSuccess", crc.clone()),
+            ("CrcReadFailure", crc.into_failure()),
+            ("DomainMetadataLoadSuccess", domain.clone()),
+            ("DomainMetadataLoadFailure", domain.into_failure()),
+        ] {
+            let text = event.to_string();
+            let prefix =
+                format!("{name}(operation_id={operation_id}, correlation_id={correlation_id:?}");
+            assert!(text.starts_with(&prefix), "{text}");
+        }
     }
 
     #[test]
