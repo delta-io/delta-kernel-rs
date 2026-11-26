@@ -34,7 +34,9 @@ pub(crate) mod column_default;
 pub use column_default::ColumnDefault;
 pub(crate) use column_default::{try_collect_column_defaults, validate_column_defaults_metadata};
 pub(crate) mod compare;
-#[cfg(feature = "schema-diff")]
+#[cfg(all(feature = "schema-diff", feature = "internal-api"))]
+pub mod diff;
+#[cfg(all(feature = "schema-diff", not(feature = "internal-api")))]
 pub(crate) mod diff;
 pub(crate) mod generated_column;
 pub use generated_column::GeneratedColumn;
