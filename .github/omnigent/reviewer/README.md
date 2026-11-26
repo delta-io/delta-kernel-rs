@@ -471,9 +471,20 @@ are assembled in order, and sources are readable. They do not measure review qua
 ## Finding feedback
 
 Each published inline finding includes feedback instructions: react 👍 for helpful or 👎 for
-unhelpful or incorrect, or 👀 for out of scope. Feedback remains
-on the comment for manual review and prompt tuning; the workflow does not automatically consume
-these ratings or learn from them. The footer is excluded from exact finding deduplication.
+unhelpful or incorrect, or 👀 for out of scope. The footer is excluded from exact finding
+deduplication.
+
+The [AI Review Comment Resolver](../../workflows/ai-review-comment-resolver.yml) counts inline
+findings from `github-actions[bot]` and the bot configured in `OMNIGENT_BOT_LOGIN`. A finding
+counts as addressed once its thread is resolved and its original comment has one of those
+reactions. Set the repository Actions variable `AI_REVIEW_MIN_ADDRESSED_PERCENT` to an integer
+from 0 to 100. The default is 100%. The workflow passes when the addressed percentage meets
+the minimum or the PR has no matching findings.
+
+The workflow runs when a PR opens, reopens, becomes ready for review, or receives new
+commits. It prints the result in the job log. To refresh the result after the AI reviewer
+posts findings or someone updates their feedback, rerun the latest **AI Review Comment
+Resolver** run for the PR from the Actions tab.
 
 ## Tools
 

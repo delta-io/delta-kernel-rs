@@ -18,7 +18,7 @@
 # rename because the old login may later belong to someone else.
 # Optional named-bot comments:
 #   vars.OMNIGENT_BOT_APP_ID + secrets.OMNIGENT_BOT_APP_KEY
-#   vars.OMNIGENT_BOT_LOGIN  Exact GitHub App login used for history deduplication.
+#   vars.OMNIGENT_BOT_LOGIN  Exact GitHub App login used for history deduplication and finding feedback.
 #
 # Non-draft PRs from authors with write-or-higher permission or an allowlist entry are
 # reviewed on open, reopen, and ready-for-review transitions. Pushes do not trigger another
@@ -989,9 +989,9 @@ jobs:
           sys.path.insert(0, ".github/omnigent")
           from inline_review import inline_prompt_instructions
           from review_history import (
-              DEFAULT_TRUSTED_BOT_LOGINS,
               attach_inline_comment_sides,
               format_review_history,
+              trusted_review_bot_logins,
           )
           from child_task import (
               build_pr_data,
@@ -1029,9 +1029,9 @@ jobs:
           )
           attach_inline_comment_sides(history_document, review_comments)
           history_path.write_text(json.dumps(history_document))
-          trusted_bot_logins = list(DEFAULT_TRUSTED_BOT_LOGINS)
-          if omnigent_bot_login := os.environ.get("OMNIGENT_BOT_LOGIN", "").strip():
-              trusted_bot_logins.append(omnigent_bot_login)
+          trusted_bot_logins = sorted(
+              trusted_review_bot_logins(os.environ.get("OMNIGENT_BOT_LOGIN", ""))
+          )
           pathlib.Path("/tmp/trusted_bot_logins.json").write_text(
               json.dumps(trusted_bot_logins)
           )

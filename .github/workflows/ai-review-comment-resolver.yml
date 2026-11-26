@@ -1,0 +1,30 @@
+name: AI Review Comment Resolver
+run-name: "AI review feedback for PR #${{ github.event.pull_request.number }}"
+
+on:
+  pull_request_target:
+    # synchronize rechecks feedback when the PR head changes.
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  evaluate:
+    name: Evaluate AI review feedback
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # Run the resolver from the trusted base commit.
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check inline AI findings
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OMNIGENT_BOT_LOGIN: ${{ vars.OMNIGENT_BOT_LOGIN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          MIN_ADDRESSED_PERCENT: ${{ vars.AI_REVIEW_MIN_ADDRESSED_PERCENT || '100' }}
+        run: python3 .github/omnigent/review_feedback.py
