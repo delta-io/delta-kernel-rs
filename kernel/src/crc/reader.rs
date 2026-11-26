@@ -5,8 +5,8 @@ use std::sync::Arc;
 use tracing::instrument;
 
 use super::Crc;
-use crate::metrics::CrcReadFailureReason;
 use crate::metrics::events::CRC_READ_COMPLETED_SPAN;
+use crate::metrics::{CrcReadFailureReason, SnapshotLoadMetricContext};
 use crate::path::{AsUrl as _, ParsedLogPath};
 use crate::{Engine, KernelError, KernelResult};
 
@@ -19,10 +19,24 @@ use crate::{Engine, KernelError, KernelResult};
 /// replay.
 ///
 /// Reports metrics: `CrcReadSuccess` or `CrcReadFailure`.
-#[instrument(name = CRC_READ_COMPLETED_SPAN, err(level = "warn"), skip_all, fields(report, enable_call_frame, bytes_read, failure_reason, path = ?crc_path.location.location))]
+#[instrument(
+    name = CRC_READ_COMPLETED_SPAN,
+    err(level = "warn"),
+    skip_all,
+    fields(
+        report,
+        enable_call_frame,
+        bytes_read,
+        failure_reason,
+        operation_id = %metric_context.operation_id,
+        correlation_id = metric_context.correlation_id.as_deref().unwrap_or(""),
+        path = ?crc_path.location.location
+    )
+)]
 pub(crate) fn try_read_crc_file(
     engine: &dyn Engine,
     crc_path: &ParsedLogPath,
+    metric_context: &SnapshotLoadMetricContext,
 ) -> KernelResult<Crc> {
     let storage = engine.storage_handler();
     let url = crc_path.location.as_url().clone();
@@ -52,8 +66,9 @@ pub(crate) fn try_read_crc_file(
 pub(crate) fn read_crc_file_or_none(
     engine: &dyn Engine,
     crc_file: &ParsedLogPath,
+    metric_context: &SnapshotLoadMetricContext,
 ) -> KernelResult<Option<Arc<Crc>>> {
-    match try_read_crc_file(engine, crc_file) {
+    match try_read_crc_file(engine, crc_file, metric_context) {
         Ok(crc) => Ok(Some(Arc::new(crc))),
         Err(error) if matches!(error.without_backtrace(), KernelError::Cancelled) => Err(error),
         Err(_) => Ok(None),
@@ -88,7 +103,7 @@ mod tests {
     use crate::actions::{Format, Metadata, Protocol};
     use crate::engine::sync::SyncEngine;
     use crate::engine::{CancellableEngine, DelegatingEngine};
-    use crate::metrics::MetricEvent;
+    use crate::metrics::{MetricEvent, MetricId};
     use crate::path::ParsedLogPath;
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::recording_reads::RecordingReads;
@@ -121,7 +136,8 @@ mod tests {
             token.cancel();
         }
         let engine = CancellableEngine::new(&SyncEngine::new(), token);
-        let result = read_crc_file_or_none(&engine, &crc_path);
+        let context = crc_read_context();
+        let result = read_crc_file_or_none(&engine, &crc_path, &context);
         if cancelled {
             assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
         } else {
@@ -133,7 +149,7 @@ mod tests {
             expected_reason
         };
         if let Some(reason) = reason {
-            assert_failure_reason(&reporter, reason);
+            assert_failure_reason(&reporter, &context, reason);
         } else {
             assert!(matches!(
                 reporter.events().as_slice(),
@@ -151,8 +167,9 @@ mod tests {
         let table_root = test_table_root("./tests/data/crc-full/");
         let crc_path = ParsedLogPath::create_parsed_crc(&table_root, 0);
 
+        let context = crc_read_context();
         // Read and parse the CRC file
-        let crc = try_read_crc_file(&engine, &crc_path).unwrap();
+        let crc = try_read_crc_file(&engine, &crc_path, &context).unwrap();
 
         // Verify basic fields
         let stats = crc.file_stats().unwrap();
@@ -271,7 +288,9 @@ mod tests {
             .filter(|e| matches!(e, MetricEvent::CrcReadSuccess(_)))
             .collect();
         assert_eq!(crc_events.len(), 1);
-        assert!(matches!(&crc_events[0], MetricEvent::CrcReadSuccess(e) if e.bytes_read > 0));
+        assert!(
+            matches!(&crc_events[0], MetricEvent::CrcReadSuccess(e) if e.bytes_read > 0 && e.operation_id == context.operation_id && e.correlation_id == context.correlation_id)
+        );
     }
 
     #[rstest]
@@ -290,8 +309,13 @@ mod tests {
         let root = Url::parse("memory:///").unwrap();
         let crc_path = ParsedLogPath::create_parsed_crc(&root, 0);
 
-        assert!(read_crc_file_or_none(&engine, &crc_path).unwrap().is_none());
-        assert_failure_reason(&reporter, reason);
+        let context = crc_read_context();
+        assert!(
+            read_crc_file_or_none(&engine, &crc_path, &context)
+                .unwrap()
+                .is_none()
+        );
+        assert_failure_reason(&reporter, &context, reason);
     }
 
     #[rstest]
@@ -315,7 +339,8 @@ mod tests {
         let root = Url::parse("memory:///").unwrap();
         let crc_path = ParsedLogPath::create_parsed_crc(&root, 0);
 
-        let result = read_crc_file_or_none(&engine, &crc_path);
+        let context = crc_read_context();
+        let result = read_crc_file_or_none(&engine, &crc_path, &context);
         if reason == CrcReadFailureReason::Cancelled {
             let error = result.unwrap_err();
             assert!(matches!(error.without_backtrace(), KernelError::Cancelled));
@@ -323,7 +348,7 @@ mod tests {
         } else {
             assert!(result.unwrap().is_none());
         }
-        assert_failure_reason(&reporter, reason);
+        assert_failure_reason(&reporter, &context, reason);
     }
 
     fn crc_engine(behavior: ReadBehavior) -> DelegatingEngine {
@@ -334,10 +359,24 @@ mod tests {
         reads.engine()
     }
 
-    fn assert_failure_reason(reporter: &CapturingReporter, expected: CrcReadFailureReason) {
+    fn crc_read_context() -> SnapshotLoadMetricContext {
+        SnapshotLoadMetricContext {
+            operation_id: MetricId::new(),
+            correlation_id: Some("snapshot-read".into()),
+            ..SnapshotLoadMetricContext::for_test()
+        }
+    }
+
+    fn assert_failure_reason(
+        reporter: &CapturingReporter,
+        context: &SnapshotLoadMetricContext,
+        expected: CrcReadFailureReason,
+    ) {
         let events = reporter.events();
         assert!(
-            matches!(events.as_slice(), [MetricEvent::CrcReadFailure(event)] if event.reason == expected),
+            matches!(events.as_slice(), [MetricEvent::CrcReadFailure(event)] if event.reason == expected
+                && event.operation_id == context.operation_id
+                && event.correlation_id == context.correlation_id),
             "expected one CRC failure with reason {expected}: {events:?}"
         );
     }

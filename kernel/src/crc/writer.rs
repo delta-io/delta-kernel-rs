@@ -65,6 +65,7 @@ mod tests {
         DomainMetadataState, FileSizeHistogram, FileStats, FileStatsState, SetTransactionState,
     };
     use crate::engine::sync::SyncEngine;
+    use crate::metrics::SnapshotLoadMetricContext;
     use crate::path::{AsUrl, ParsedLogPath};
     use crate::table_features::TableFeature;
 
@@ -147,7 +148,8 @@ mod tests {
 
         try_write_crc_file(&engine, crc_path.location.as_url(), &crc).unwrap();
 
-        let read_back = try_read_crc_file(&engine, &crc_path).unwrap();
+        let read_back =
+            try_read_crc_file(&engine, &crc_path, &SnapshotLoadMetricContext::for_test()).unwrap();
         assert_eq!(read_back, crc);
         assert_eq!(read_back.version, version);
     }

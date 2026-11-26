@@ -1,5 +1,5 @@
 use delta_kernel::KernelResult;
-use delta_kernel::snapshot::Snapshot;
+use delta_kernel::snapshot::{Snapshot, SnapshotReader};
 
 use crate::error::{ExternResult, IntoExternResult};
 use crate::expressions::kernel_visitor::NullTypeTag;
@@ -9,6 +9,15 @@ use crate::{
     AllocateStringFn, ExternEngine, KernelStringSlice, NullableCvoid, OptionalValue,
     SharedExternEngine, SharedSnapshot, TryFromStringSlice, kernel_string_slice,
 };
+
+fn reader_for_request(snapshot: &Snapshot, correlation_id: String) -> SnapshotReader<'_> {
+    let reader = snapshot.reader();
+    if correlation_id.is_empty() {
+        reader
+    } else {
+        reader.with_correlation_id(correlation_id)
+    }
+}
 
 /// The row-tracking high-water mark before any fresh row IDs have been assigned.
 pub const ROW_TRACKING_INITIAL_HIGH_WATER_MARK: i64 = -1;
@@ -29,24 +38,51 @@ pub unsafe extern "C" fn get_domain_metadata(
     engine: Handle<SharedExternEngine>,
     allocate_fn: AllocateStringFn,
 ) -> ExternResult<NullableCvoid> {
+    unsafe {
+        get_domain_metadata_with_correlation_id(
+            snapshot,
+            domain,
+            engine,
+            allocate_fn,
+            KernelStringSlice::empty(),
+        )
+    }
+}
+
+/// Like [get_domain_metadata], with a caller-supplied request identifier for read metrics.
+///
+/// # Safety
+///
+/// The requirements of [get_domain_metadata] apply. A zero-length identifier is omitted and
+/// its pointer is ignored. A non-null pointer for a non-empty identifier must address its
+/// length in readable bytes for the call. Kernel copies the UTF-8 identifier and returns an
+/// error for invalid UTF-8 or a null pointer with nonzero length.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn get_domain_metadata_with_correlation_id(
+    snapshot: Handle<SharedSnapshot>,
+    domain: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+    allocate_fn: AllocateStringFn,
+    correlation_id: KernelStringSlice,
+) -> ExternResult<NullableCvoid> {
     let result = catch_panic(|| {
-        let snapshot = unsafe { snapshot.as_ref() };
+        let correlation_id = unsafe { correlation_id.try_to_string() }?;
+        let reader = reader_for_request(unsafe { snapshot.as_ref() }, correlation_id);
         let engine = unsafe { engine.as_ref() };
         let domain = unsafe { String::try_from_slice(&domain) };
 
-        get_domain_metadata_impl(snapshot, domain, engine, allocate_fn)
+        get_domain_metadata_impl(reader, domain, engine, allocate_fn)
     });
     unsafe { result.into_extern_result(&engine.as_ref()) }
 }
 
 fn get_domain_metadata_impl(
-    snapshot: &Snapshot,
+    reader: SnapshotReader<'_>,
     domain: KernelResult<String>,
     extern_engine: &dyn ExternEngine,
     allocate_fn: AllocateStringFn,
 ) -> KernelResult<NullableCvoid> {
-    Ok(snapshot
-        .reader()
+    Ok(reader
         .get_domain_metadata(&domain?, extern_engine.engine().as_ref())?
         .and_then(|config| allocate_fn(kernel_string_slice!(config))))
 }
@@ -66,11 +102,33 @@ pub unsafe extern "C" fn snapshot_row_tracking_high_water_mark(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<OptionalValue<i64>> {
+    unsafe {
+        snapshot_row_tracking_high_water_mark_with_correlation_id(
+            snapshot,
+            engine,
+            KernelStringSlice::empty(),
+        )
+    }
+}
+
+/// Like [snapshot_row_tracking_high_water_mark], with a caller-supplied request identifier for read
+/// metrics.
+///
+/// # Safety
+///
+/// The requirements of [snapshot_row_tracking_high_water_mark] apply. The correlation ID follows
+/// the slice contract of [get_domain_metadata_with_correlation_id].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snapshot_row_tracking_high_water_mark_with_correlation_id(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+    correlation_id: KernelStringSlice,
+) -> ExternResult<OptionalValue<i64>> {
     let result = catch_panic(|| {
         let engine_ref = unsafe { engine.as_ref() };
-        let snapshot = unsafe { snapshot.as_ref() };
-        snapshot
-            .reader()
+        let correlation_id = unsafe { correlation_id.try_to_string() }?;
+        let reader = reader_for_request(unsafe { snapshot.as_ref() }, correlation_id);
+        reader
             .get_row_tracking_high_water_mark(engine_ref.engine().as_ref())
             .map(OptionalValue::from)
     });
@@ -128,24 +186,47 @@ pub unsafe extern "C" fn visit_clustering_columns(
     engine_context: NullableCvoid,
     visitor: ClusteringColumnVisitor,
 ) -> ExternResult<OptionalValue<usize>> {
+    unsafe {
+        visit_clustering_columns_with_correlation_id(
+            snapshot,
+            engine,
+            engine_context,
+            visitor,
+            KernelStringSlice::empty(),
+        )
+    }
+}
+
+/// Like [visit_clustering_columns], with a caller-supplied request identifier for read metrics.
+///
+/// # Safety
+///
+/// The requirements of [visit_clustering_columns] apply. The correlation ID follows the
+/// slice contract of [get_domain_metadata_with_correlation_id].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visit_clustering_columns_with_correlation_id(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+    engine_context: NullableCvoid,
+    visitor: ClusteringColumnVisitor,
+    correlation_id: KernelStringSlice,
+) -> ExternResult<OptionalValue<usize>> {
     let result = catch_panic(|| {
-        let snapshot = unsafe { snapshot.as_ref() };
+        let correlation_id = unsafe { correlation_id.try_to_string() }?;
+        let reader = reader_for_request(unsafe { snapshot.as_ref() }, correlation_id);
         let engine = unsafe { engine.as_ref() };
-        visit_clustering_columns_impl(snapshot, engine, engine_context, visitor)
+        visit_clustering_columns_impl(reader, engine, engine_context, visitor)
     });
     unsafe { result.into_extern_result(&engine.as_ref()) }
 }
 
 fn visit_clustering_columns_impl(
-    snapshot: &Snapshot,
+    reader: SnapshotReader<'_>,
     extern_engine: &dyn ExternEngine,
     engine_context: NullableCvoid,
     visitor: ClusteringColumnVisitor,
 ) -> KernelResult<OptionalValue<usize>> {
-    let Some(infos) = snapshot
-        .reader()
-        .get_clustering_column_infos(extern_engine.engine().as_ref())?
-    else {
+    let Some(infos) = reader.get_clustering_column_infos(extern_engine.engine().as_ref())? else {
         return Ok(OptionalValue::None);
     };
     for info in &infos {
@@ -181,17 +262,47 @@ pub unsafe extern "C" fn visit_domain_metadata(
         configuration: KernelStringSlice,
     ),
 ) -> ExternResult<bool> {
+    unsafe {
+        visit_domain_metadata_with_correlation_id(
+            snapshot,
+            engine,
+            engine_context,
+            visitor,
+            KernelStringSlice::empty(),
+        )
+    }
+}
+
+/// Like [visit_domain_metadata], with a caller-supplied request identifier for read metrics.
+///
+/// # Safety
+///
+/// The requirements of [visit_domain_metadata] apply. The correlation ID follows the
+/// slice contract of [get_domain_metadata_with_correlation_id].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visit_domain_metadata_with_correlation_id(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+    engine_context: NullableCvoid,
+    visitor: extern "C" fn(
+        engine_context: NullableCvoid,
+        domain: KernelStringSlice,
+        configuration: KernelStringSlice,
+    ),
+    correlation_id: KernelStringSlice,
+) -> ExternResult<bool> {
     let result = catch_panic(|| {
-        let snapshot = unsafe { snapshot.as_ref() };
+        let correlation_id = unsafe { correlation_id.try_to_string() }?;
+        let reader = reader_for_request(unsafe { snapshot.as_ref() }, correlation_id);
         let engine = unsafe { engine.as_ref() };
 
-        visit_domain_metadata_impl(snapshot, engine, engine_context, visitor)
+        visit_domain_metadata_impl(reader, engine, engine_context, visitor)
     });
     unsafe { result.into_extern_result(&engine.as_ref()) }
 }
 
 fn visit_domain_metadata_impl(
-    snapshot: &Snapshot,
+    reader: SnapshotReader<'_>,
     extern_engine: &dyn ExternEngine,
     engine_context: NullableCvoid,
     visitor: extern "C" fn(
@@ -200,9 +311,7 @@ fn visit_domain_metadata_impl(
         value: KernelStringSlice,
     ),
 ) -> KernelResult<bool> {
-    let res = snapshot
-        .reader()
-        .get_all_domain_metadata(extern_engine.engine().as_ref())?;
+    let res = reader.get_all_domain_metadata(extern_engine.engine().as_ref())?;
     res.iter().for_each(|metadata| {
         let domain = &metadata.domain();
         let configuration = &metadata.configuration();
@@ -317,8 +426,38 @@ mod tests {
             .await
             .unwrap();
 
+        // Keep a second dispatcher registered so callsite interest is evaluated across
+        // dispatchers even when another test thread has no local subscriber.
+        let _dispatch = tracing::Dispatch::new(tracing_subscriber::registry());
+        let reporter = Arc::new(test_utils::CapturingReporter::default());
+        let _guard = crate::ffi_test_utils::install_thread_local_metrics_reporter(reporter.clone());
         let snapshot =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
+
+        let domain = "missing";
+        for request in ["first", "second", ""] {
+            let result = unsafe {
+                get_domain_metadata_with_correlation_id(
+                    snapshot.shallow_copy(),
+                    kernel_string_slice!(domain),
+                    engine.shallow_copy(),
+                    allocate_str,
+                    kernel_string_slice!(request),
+                )
+            };
+            assert!(ok_or_panic(result).is_none());
+        }
+        let reads: Vec<_> = reporter
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                delta_kernel::metrics::MetricEvent::DomainMetadataLoadSuccess(read) => {
+                    Some(read.correlation_id)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reads, [Some("first".into()), Some("second".into()), None]);
 
         let get_domain_metadata_helper = |domain: &str| unsafe {
             get_domain_metadata(

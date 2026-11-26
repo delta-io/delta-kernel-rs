@@ -391,7 +391,7 @@ impl MetricsReporter for CountingReporter {
                 self.domain_metadata_domains_returned
                     .add(e.num_domains_returned);
             }
-            MetricEvent::DomainMetadataLoadFailure => {
+            MetricEvent::DomainMetadataLoadFailure { .. } => {
                 self.domain_metadata_load_failures.inc();
             }
             MetricEvent::SetTransactionLoadSuccess(e) => {
@@ -489,6 +489,8 @@ mod tests {
         let reporter = CountingReporter::new();
         reporter.report(MetricEvent::LastCheckpointReadCompleted(
             delta_kernel::metrics::LastCheckpointReadCompleted {
+                operation_id: delta_kernel::metrics::MetricId::new(),
+                correlation_id: None,
                 outcome,
                 duration: dur(),
             },
@@ -651,10 +653,14 @@ mod tests {
     fn report_crc_read_completed_increments_crc_counters() {
         let reporter = CountingReporter::new();
         reporter.report(MetricEvent::CrcReadSuccess(CrcReadSuccess {
+            operation_id: delta_kernel::metrics::MetricId::new(),
+            correlation_id: None,
             duration: dur(),
             bytes_read: 512,
         }));
         reporter.report(MetricEvent::CrcReadSuccess(CrcReadSuccess {
+            operation_id: delta_kernel::metrics::MetricId::new(),
+            correlation_id: None,
             duration: dur(),
             bytes_read: 256,
         }));
@@ -667,6 +673,8 @@ mod tests {
         let reporter = CountingReporter::new();
         reporter.report(MetricEvent::DomainMetadataLoadSuccess(
             DomainMetadataLoadSuccess {
+                operation_id: delta_kernel::metrics::MetricId::new(),
+                correlation_id: None,
                 from_cache: true,
                 num_domains_returned: 3,
                 duration: dur(),
@@ -674,6 +682,8 @@ mod tests {
         ));
         reporter.report(MetricEvent::DomainMetadataLoadSuccess(
             DomainMetadataLoadSuccess {
+                operation_id: delta_kernel::metrics::MetricId::new(),
+                correlation_id: None,
                 from_cache: false,
                 num_domains_returned: 1,
                 duration: dur(),
@@ -814,11 +824,15 @@ mod tests {
             crc_versions_behind: Some(0),
         }));
         reporter.report(MetricEvent::CrcReadSuccess(CrcReadSuccess {
+            operation_id: delta_kernel::metrics::MetricId::new(),
+            correlation_id: None,
             duration: dur(),
             bytes_read: 512,
         }));
         reporter.report(MetricEvent::DomainMetadataLoadSuccess(
             DomainMetadataLoadSuccess {
+                operation_id: delta_kernel::metrics::MetricId::new(),
+                correlation_id: None,
                 from_cache: true,
                 num_domains_returned: 2,
                 duration: dur(),
@@ -895,7 +909,10 @@ mod tests {
     #[test]
     fn report_load_failures_increment_failure_counters() {
         let reporter = CountingReporter::new();
-        reporter.report(MetricEvent::DomainMetadataLoadFailure);
+        reporter.report(MetricEvent::DomainMetadataLoadFailure {
+            operation_id: delta_kernel::metrics::MetricId::new(),
+            correlation_id: None,
+        });
         reporter.report(MetricEvent::SetTransactionLoadFailure);
         assert_eq!(reporter.domain_metadata_load_failures.get(), 1);
         assert_eq!(reporter.set_transaction_load_failures.get(), 1);

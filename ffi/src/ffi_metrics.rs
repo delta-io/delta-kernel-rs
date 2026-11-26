@@ -519,9 +519,22 @@ impl From<kernel::CheckpointWriteStats> for CheckpointWriteStats {
     }
 }
 
+/// Identifiers of a failed domain metadata read.
+#[repr(C)]
+pub struct ReadFailure {
+    /// Unique ID for this domain metadata read.
+    pub operation_id: MetricId,
+    /// Caller-supplied request identifier. Empty when omitted.
+    pub correlation_id: KernelStringSlice,
+}
+
 /// A domain metadata load completed.
 #[repr(C)]
 pub struct DomainMetadataLoadSuccess {
+    /// Unique ID for this domain metadata read.
+    pub operation_id: MetricId,
+    /// Caller-supplied request identifier. Empty when omitted.
+    pub correlation_id: KernelStringSlice,
     pub from_cache: bool,
     pub num_domains_returned: u64,
     pub duration_ns: u64,
@@ -538,6 +551,10 @@ pub struct SetTransactionLoadSuccess {
 /// A CRC file was read and parsed successfully.
 #[repr(C)]
 pub struct CrcReadSuccess {
+    /// Operation ID of the snapshot build that requested this CRC.
+    pub operation_id: MetricId,
+    /// Caller-supplied request identifier. Empty when omitted.
+    pub correlation_id: KernelStringSlice,
     pub bytes_read: u64,
     pub duration_ns: u64,
 }
@@ -575,6 +592,10 @@ impl From<kernel::CrcReadFailureReason> for CrcReadFailureReason {
 /// A CRC file read or parse failed. Non-cancellation failures allow log replay.
 #[repr(C)]
 pub struct CrcReadFailure {
+    /// Operation ID of the snapshot build that requested this CRC.
+    pub operation_id: MetricId,
+    /// Caller-supplied request identifier. Empty when omitted.
+    pub correlation_id: KernelStringSlice,
     /// Why the CRC could not be used.
     pub reason: CrcReadFailureReason,
 }
@@ -644,6 +665,10 @@ pub struct LastCheckpointReadCompleted {
     /// Wall-clock time from entry through return, including parsing and validation, in
     /// nanoseconds.
     pub duration_ns: u64,
+    /// Id of the snapshot build that requested this read.
+    pub operation_id: MetricId,
+    /// Borrowed caller-supplied id, empty when absent.
+    pub correlation_id: KernelStringSlice,
 }
 
 /// A `JsonHandler::read_json_files` call completed.
@@ -718,7 +743,7 @@ pub enum MetricEvent {
     TransactionCommitSuccess(TransactionCommitSuccess),
     TransactionCommitFailure(TransactionCommitFailure),
     DomainMetadataLoadSuccess(DomainMetadataLoadSuccess),
-    DomainMetadataLoadFailure,
+    DomainMetadataLoadFailure(ReadFailure),
     SetTransactionLoadSuccess(SetTransactionLoadSuccess),
     SetTransactionLoadFailure,
     CrcReadSuccess(CrcReadSuccess),
@@ -905,15 +930,25 @@ impl MetricEvent {
                 reason: (*reason).into(),
             }),
             K::DomainMetadataLoadSuccess(kernel::DomainMetadataLoadSuccess {
+                operation_id,
+                correlation_id,
                 from_cache,
                 num_domains_returned,
                 duration,
             }) => Self::DomainMetadataLoadSuccess(DomainMetadataLoadSuccess {
+                operation_id: (*operation_id).into(),
+                correlation_id: correlation_id_slice(correlation_id.as_deref()),
                 from_cache: *from_cache,
                 num_domains_returned: *num_domains_returned,
                 duration_ns: duration_ns(*duration),
             }),
-            K::DomainMetadataLoadFailure => Self::DomainMetadataLoadFailure,
+            K::DomainMetadataLoadFailure {
+                operation_id,
+                correlation_id,
+            } => Self::DomainMetadataLoadFailure(ReadFailure {
+                operation_id: (*operation_id).into(),
+                correlation_id: correlation_id_slice(correlation_id.as_deref()),
+            }),
             K::SetTransactionLoadSuccess(kernel::SetTransactionLoadSuccess {
                 from_cache,
                 found,
@@ -925,21 +960,33 @@ impl MetricEvent {
             }),
             K::SetTransactionLoadFailure => Self::SetTransactionLoadFailure,
             K::CrcReadSuccess(kernel::CrcReadSuccess {
+                operation_id,
+                correlation_id,
                 bytes_read,
                 duration,
             }) => Self::CrcReadSuccess(CrcReadSuccess {
+                operation_id: (*operation_id).into(),
+                correlation_id: correlation_id_slice(correlation_id.as_deref()),
                 bytes_read: *bytes_read,
                 duration_ns: duration_ns(*duration),
             }),
-            K::CrcReadFailure(kernel::CrcReadFailure { reason }) => {
-                Self::CrcReadFailure(CrcReadFailure {
-                    reason: (*reason).into(),
-                })
-            }
+            K::CrcReadFailure(kernel::CrcReadFailure {
+                operation_id,
+                correlation_id,
+                reason,
+            }) => Self::CrcReadFailure(CrcReadFailure {
+                operation_id: (*operation_id).into(),
+                correlation_id: correlation_id_slice(correlation_id.as_deref()),
+                reason: (*reason).into(),
+            }),
             K::LastCheckpointReadCompleted(kernel::LastCheckpointReadCompleted {
+                operation_id,
+                correlation_id,
                 outcome,
                 duration,
             }) => Self::LastCheckpointReadCompleted(LastCheckpointReadCompleted {
+                operation_id: (*operation_id).into(),
+                correlation_id: correlation_id_slice(correlation_id.as_deref()),
                 outcome: (*outcome).into(),
                 duration_ns: duration_ns(*duration),
             }),
@@ -1099,7 +1146,11 @@ mod tests {
         #[case] reason: kernel::CrcReadFailureReason,
         #[case] expected: CrcReadFailureReason,
     ) {
-        let event = kernel::MetricEvent::CrcReadFailure(kernel::CrcReadFailure { reason });
+        let event = kernel::MetricEvent::CrcReadFailure(kernel::CrcReadFailure {
+            operation_id: kernel::MetricId::new(),
+            correlation_id: None,
+            reason,
+        });
         with_ffi_event(&event, |event| {
             let MetricEvent::CrcReadFailure(event) = event else {
                 panic!("expected CrcReadFailure");
@@ -1133,8 +1184,12 @@ mod tests {
         #[case] outcome: kernel::LastCheckpointReadOutcome,
         #[case] expected: LastCheckpointReadOutcome,
     ) {
+        let operation_id = kernel::MetricId::new();
         let event =
             kernel::MetricEvent::LastCheckpointReadCompleted(kernel::LastCheckpointReadCompleted {
+                operation_id,
+                correlation_id: Some("lookup".into()),
+
                 outcome,
                 duration: Duration::from_nanos(17),
             });
@@ -1144,6 +1199,71 @@ mod tests {
             };
             assert_eq!(event.outcome, expected);
             assert_eq!(event.duration_ns, 17);
+            assert_eq!(event.operation_id.bytes, operation_id.as_bytes());
+            let correlation: &str =
+                unsafe { TryFromStringSlice::try_from_slice(&event.correlation_id).unwrap() };
+            assert_eq!(correlation, "lookup");
+        });
+    }
+
+    #[rstest]
+    #[case::crc_success(true, false)]
+    #[case::crc_failure(true, true)]
+    #[case::domain_success(false, false)]
+    #[case::domain_failure(false, true)]
+    fn read_metric_conversion_preserves_identity(
+        #[case] crc: bool,
+        #[case] failed: bool,
+        #[values(Some("request"), None)] request: Option<&str>,
+    ) {
+        use kernel::MetricEvent as K;
+
+        let operation_id = kernel::MetricId::new();
+        let correlation_id = request.map(Into::into);
+        let event = match (crc, failed) {
+            (true, false) => K::CrcReadSuccess(kernel::CrcReadSuccess {
+                operation_id,
+                correlation_id,
+                bytes_read: 42,
+                duration: Duration::ZERO,
+            }),
+            (true, true) => K::CrcReadFailure(kernel::CrcReadFailure {
+                operation_id,
+                correlation_id,
+                reason: kernel::CrcReadFailureReason::Parsing,
+            }),
+            (false, false) => K::DomainMetadataLoadSuccess(kernel::DomainMetadataLoadSuccess {
+                operation_id,
+                correlation_id,
+                from_cache: false,
+                num_domains_returned: 0,
+                duration: Duration::ZERO,
+            }),
+            (false, true) => K::DomainMetadataLoadFailure {
+                operation_id,
+                correlation_id,
+            },
+        };
+        with_ffi_event(&event, |event| {
+            let (id, correlation) = match (crc, failed, event) {
+                (true, false, MetricEvent::CrcReadSuccess(read)) => {
+                    (read.operation_id, read.correlation_id)
+                }
+                (false, false, MetricEvent::DomainMetadataLoadSuccess(read)) => {
+                    (read.operation_id, read.correlation_id)
+                }
+                (true, true, MetricEvent::CrcReadFailure(read)) => {
+                    (read.operation_id, read.correlation_id)
+                }
+                (false, true, MetricEvent::DomainMetadataLoadFailure(read)) => {
+                    (read.operation_id, read.correlation_id)
+                }
+                _ => panic!("unexpected read metric"),
+            };
+            let correlation: &str =
+                unsafe { TryFromStringSlice::try_from_slice(&correlation).unwrap() };
+            assert_eq!(id.bytes, operation_id.as_bytes());
+            assert_eq!(correlation, request.unwrap_or_default());
         });
     }
 

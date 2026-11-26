@@ -59,8 +59,11 @@ pub mod commit_range;
 pub mod delta_types;
 mod domain_metadata;
 pub use domain_metadata::{
-    ROW_TRACKING_INITIAL_HIGH_WATER_MARK, get_domain_metadata,
-    snapshot_row_tracking_high_water_mark,
+    ClusteringColumnVisitor, ROW_TRACKING_INITIAL_HIGH_WATER_MARK, get_domain_metadata,
+    get_domain_metadata_with_correlation_id, snapshot_row_tracking_high_water_mark,
+    snapshot_row_tracking_high_water_mark_with_correlation_id, visit_clustering_columns,
+    visit_clustering_columns_with_correlation_id, visit_domain_metadata,
+    visit_domain_metadata_with_correlation_id,
 };
 pub mod engine_data;
 pub mod engine_funcs;
@@ -302,7 +305,6 @@ impl KernelStringSlice {
         Ok(value.to_string())
     }
 
-    #[cfg(feature = "tracing")]
     pub(crate) fn empty() -> Self {
         KernelStringSlice {
             ptr: NonNull::<u8>::dangling().as_ptr().cast(),

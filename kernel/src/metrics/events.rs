@@ -102,7 +102,12 @@ pub enum MetricEvent {
     TransactionCommitSuccess(TransactionCommitSuccess),
     TransactionCommitFailure(TransactionCommitFailure),
     DomainMetadataLoadSuccess(DomainMetadataLoadSuccess),
-    DomainMetadataLoadFailure,
+    DomainMetadataLoadFailure {
+        /// Unique ID for this domain metadata read.
+        operation_id: MetricId,
+        /// Caller-supplied request identifier.
+        correlation_id: Option<Arc<str>>,
+    },
     SetTransactionLoadSuccess(SetTransactionLoadSuccess),
     SetTransactionLoadFailure,
     CrcReadSuccess(CrcReadSuccess),
@@ -152,7 +157,7 @@ impl MetricEvent {
 
             // These failure events carry no duration.
             Self::TransactionCommitFailure(_)
-            | Self::DomainMetadataLoadFailure
+            | Self::DomainMetadataLoadFailure { .. }
             | Self::SetTransactionLoadFailure
             | Self::CrcReadFailure(_) => {}
 
@@ -188,7 +193,7 @@ impl MetricEvent {
             Self::ProtocolMetadataLoadFailure(_) => Err(ProtocolMetadataLoadSuccess::SPAN_NAME),
             Self::SnapshotBuildFailure(_) => Err(SnapshotBuildSuccess::SPAN_NAME),
             Self::TransactionCommitFailure(_) => Err(TransactionCommitSuccess::SPAN_NAME),
-            Self::DomainMetadataLoadFailure => Err(DomainMetadataLoadSuccess::SPAN_NAME),
+            Self::DomainMetadataLoadFailure { .. } => Err(DomainMetadataLoadSuccess::SPAN_NAME),
             Self::SetTransactionLoadFailure => Err(SetTransactionLoadSuccess::SPAN_NAME),
             Self::CrcReadFailure(_) => Err(CrcReadSuccess::SPAN_NAME),
             Self::CheckpointWriteFailure(_) => Err(CheckpointWriteSuccess::SPAN_NAME),
@@ -224,7 +229,7 @@ impl MetricEvent {
             Self::ProtocolMetadataLoadFailure(_) => Err(ProtocolMetadataLoadSuccess::SPAN_NAME),
             Self::SnapshotBuildFailure(_) => Err(SnapshotBuildSuccess::SPAN_NAME),
             Self::TransactionCommitFailure(_) => Err(TransactionCommitSuccess::SPAN_NAME),
-            Self::DomainMetadataLoadFailure => Err(DomainMetadataLoadSuccess::SPAN_NAME),
+            Self::DomainMetadataLoadFailure { .. } => Err(DomainMetadataLoadSuccess::SPAN_NAME),
             Self::SetTransactionLoadFailure => Err(SetTransactionLoadSuccess::SPAN_NAME),
             Self::CrcReadFailure(_) => Err(CrcReadSuccess::SPAN_NAME),
             Self::CheckpointWriteFailure(_) => Err(CheckpointWriteSuccess::SPAN_NAME),
@@ -237,9 +242,16 @@ impl MetricEvent {
             return e.record_str(name, value);
         }
         if name == "failure_reason" {
-            if matches!(self, Self::CrcReadSuccess(_) | Self::CrcReadFailure(_)) {
+            let crc_ids = match self {
+                Self::CrcReadSuccess(e) => Some((e.operation_id, e.correlation_id.take())),
+                Self::CrcReadFailure(e) => Some((e.operation_id, e.correlation_id.take())),
+                _ => None,
+            };
+            if let Some((operation_id, correlation_id)) = crc_ids {
                 let reason = value.parse::<CrcReadFailureReason>();
                 *self = Self::CrcReadFailure(CrcReadFailure {
+                    operation_id,
+                    correlation_id,
                     reason: reason.unwrap_or(CrcReadFailureReason::Error),
                 });
                 return reason.map(|_| ()).map_err(|_| CrcReadSuccess::SPAN_NAME);
@@ -302,9 +314,14 @@ impl MetricEvent {
                     reason: CommitFailureReason::Error,
                 })
             }
-            Self::DomainMetadataLoadSuccess(_) => Self::DomainMetadataLoadFailure,
+            Self::DomainMetadataLoadSuccess(e) => Self::DomainMetadataLoadFailure {
+                operation_id: e.operation_id,
+                correlation_id: e.correlation_id,
+            },
             Self::SetTransactionLoadSuccess(_) => Self::SetTransactionLoadFailure,
-            Self::CrcReadSuccess(_) => Self::CrcReadFailure(CrcReadFailure {
+            Self::CrcReadSuccess(e) => Self::CrcReadFailure(CrcReadFailure {
+                operation_id: e.operation_id,
+                correlation_id: e.correlation_id,
                 reason: CrcReadFailureReason::Error,
             }),
             Self::LastCheckpointReadCompleted(mut e) => {
@@ -334,7 +351,7 @@ impl MetricEvent {
             | Self::ProtocolMetadataLoadFailure(_)
             | Self::SnapshotBuildFailure(_)
             | Self::TransactionCommitFailure(_)
-            | Self::DomainMetadataLoadFailure
+            | Self::DomainMetadataLoadFailure { .. }
             | Self::SetTransactionLoadFailure
             | Self::CrcReadFailure(_)
             | Self::CheckpointWriteFailure(_)
@@ -362,7 +379,14 @@ impl fmt::Display for MetricEvent {
             Self::TransactionCommitSuccess(e) => e.fmt(f),
             Self::TransactionCommitFailure(e) => e.fmt(f),
             Self::DomainMetadataLoadSuccess(e) => e.fmt(f),
-            Self::DomainMetadataLoadFailure => f.write_str("DomainMetadataLoadFailure"),
+            Self::DomainMetadataLoadFailure {
+                operation_id,
+                correlation_id,
+            } => write!(
+                f,
+                "DomainMetadataLoadFailure(operation_id={operation_id}, \
+                 correlation_id={correlation_id:?})"
+            ),
             Self::SetTransactionLoadSuccess(e) => e.fmt(f),
             Self::SetTransactionLoadFailure => f.write_str("SetTransactionLoadFailure"),
             Self::CrcReadSuccess(e) => e.fmt(f),
@@ -1347,6 +1371,10 @@ pub(crate) const DOMAIN_METADATA_LOADED_SPAN: &str = "snap.get_domain_metadata";
 /// system (`delta.*`) domains such as clustering or row tracking.
 #[derive(Debug, Clone)]
 pub struct DomainMetadataLoadSuccess {
+    /// Unique ID for this domain metadata read.
+    pub operation_id: MetricId,
+    /// Caller-supplied request identifier.
+    pub correlation_id: Option<Arc<str>>,
     // === Set during span lifetime ===
     pub from_cache: bool,
     pub num_domains_returned: u64,
@@ -1358,8 +1386,10 @@ pub struct DomainMetadataLoadSuccess {
 impl DomainMetadataLoadSuccess {
     pub(crate) const SPAN_NAME: &'static str = DOMAIN_METADATA_LOADED_SPAN;
 
-    pub(crate) fn from_attrs(_attrs: &Attributes<'_>) -> Self {
+    pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
         Self {
+            operation_id: MetricId::from_attrs(attrs),
+            correlation_id: correlation_id_from_attrs(attrs),
             from_cache: false,
             num_domains_returned: 0,
             duration: Duration::default(),
@@ -1390,13 +1420,16 @@ impl DomainMetadataLoadSuccess {
 impl fmt::Display for DomainMetadataLoadSuccess {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
+            operation_id,
+            correlation_id,
             from_cache,
             num_domains_returned,
             duration,
         } = self;
         write!(
             f,
-            "DomainMetadataLoadSuccess(duration={duration:?}, from_cache={from_cache}, \
+            "DomainMetadataLoadSuccess(operation_id={operation_id}, \
+             correlation_id={correlation_id:?}, duration={duration:?}, from_cache={from_cache}, \
              num_domains_returned={num_domains_returned})"
         )
     }
@@ -1469,6 +1502,10 @@ pub(crate) const CRC_READ_COMPLETED_SPAN: &str = "crc_read_completed";
 /// A CRC file was read and parsed successfully. `bytes_read` is the raw byte count from storage.
 #[derive(Debug, Clone)]
 pub struct CrcReadSuccess {
+    /// Operation ID of the snapshot build that requested this CRC.
+    pub operation_id: MetricId,
+    /// Caller-supplied request identifier.
+    pub correlation_id: Option<Arc<str>>,
     // === Set during span lifetime ===
     pub bytes_read: u64,
 
@@ -1479,8 +1516,10 @@ pub struct CrcReadSuccess {
 impl CrcReadSuccess {
     pub(crate) const SPAN_NAME: &'static str = CRC_READ_COMPLETED_SPAN;
 
-    pub(crate) fn from_attrs(_attrs: &Attributes<'_>) -> Self {
+    pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
         Self {
+            operation_id: MetricId::from_attrs(attrs),
+            correlation_id: correlation_id_from_attrs(attrs),
             bytes_read: 0,
             duration: Duration::default(),
         }
@@ -1502,12 +1541,15 @@ impl CrcReadSuccess {
 impl fmt::Display for CrcReadSuccess {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
+            operation_id,
+            correlation_id,
             duration,
             bytes_read,
         } = self;
         write!(
             f,
-            "CrcReadSuccess(duration={duration:?}, bytes={bytes_read})"
+            "CrcReadSuccess(operation_id={operation_id}, correlation_id={correlation_id:?}, \
+             duration={duration:?}, bytes={bytes_read})"
         )
     }
 }
@@ -1534,13 +1576,26 @@ pub enum CrcReadFailureReason {
 /// An absent CRC in a log listing does not cause a read attempt or emit this event.
 #[derive(Debug, Clone)]
 pub struct CrcReadFailure {
+    /// Operation ID of the snapshot build that requested this CRC.
+    pub operation_id: MetricId,
+    /// Caller-supplied request identifier.
+    pub correlation_id: Option<Arc<str>>,
     /// The reason the CRC could not be used.
     pub reason: CrcReadFailureReason,
 }
 
 impl fmt::Display for CrcReadFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "CrcReadFailure(reason={})", self.reason)
+        let Self {
+            operation_id,
+            correlation_id,
+            reason,
+        } = self;
+        write!(
+            f,
+            "CrcReadFailure(operation_id={operation_id}, correlation_id={correlation_id:?}, \
+             reason={reason})"
+        )
     }
 }
 
@@ -1579,6 +1634,10 @@ pub enum LastCheckpointReadOutcome {
 /// and invalid hints normally allow the caller to fall back to listing the log.
 #[derive(Debug, Clone)]
 pub struct LastCheckpointReadCompleted {
+    /// Snapshot build that requested this hint.
+    pub operation_id: MetricId,
+    /// Opaque id supplied by the caller of the enclosing snapshot build.
+    pub correlation_id: Option<Arc<str>>,
     /// Result of reading and validating the hint.
     pub outcome: LastCheckpointReadOutcome,
     /// Wall-clock time from entry through return, including storage access, parsing, and
@@ -1589,8 +1648,10 @@ pub struct LastCheckpointReadCompleted {
 impl LastCheckpointReadCompleted {
     pub(crate) const SPAN_NAME: &'static str = LAST_CHECKPOINT_READ_SPAN;
 
-    pub(crate) fn from_attrs(_attrs: &Attributes<'_>) -> Self {
+    pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
         Self {
+            operation_id: MetricId::from_attrs(attrs),
+            correlation_id: correlation_id_from_attrs(attrs),
             outcome: LastCheckpointReadOutcome::Unknown,
             duration: Duration::ZERO,
         }
@@ -1615,10 +1676,16 @@ impl LastCheckpointReadCompleted {
 
 impl fmt::Display for LastCheckpointReadCompleted {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { outcome, duration } = self;
+        let Self {
+            operation_id,
+            correlation_id,
+            outcome,
+            duration,
+        } = self;
         write!(
             f,
-            "LastCheckpointReadCompleted(outcome={outcome}, duration={duration:?})"
+            "LastCheckpointReadCompleted(operation_id={operation_id}, \
+             correlation_id={correlation_id:?}, outcome={outcome}, duration={duration:?})"
         )
     }
 }
@@ -2555,18 +2622,25 @@ mod tests {
     fn last_checkpoint_outcome_has_stable_label(
         #[case] label: &str,
         #[case] outcome: LastCheckpointReadOutcome,
+        #[values(None, Some("snapshot-request"))] correlation_id: Option<&str>,
     ) {
         let static_label: &'static str = outcome.into();
         assert_eq!(static_label, label);
         assert_eq!(label.parse::<LastCheckpointReadOutcome>().unwrap(), outcome);
+        let operation_id = MetricId::new();
         let mut event = MetricEvent::LastCheckpointReadCompleted(LastCheckpointReadCompleted {
+            operation_id,
+            correlation_id: correlation_id.map(Arc::from),
             outcome,
             duration: Duration::ZERO,
         });
         event.set_duration_if_applicable(Duration::from_nanos(17));
         assert_eq!(
             event.to_string(),
-            format!("LastCheckpointReadCompleted(outcome={label}, duration=17ns)")
+            format!(
+                "LastCheckpointReadCompleted(operation_id={operation_id}, \
+                 correlation_id={correlation_id:?}, outcome={label}, duration=17ns)"
+            )
         );
         assert_eq!(
             event.record_u64("outcome", 1),
@@ -2580,6 +2654,37 @@ mod tests {
             event.record_str("failure_reason", "error"),
             Err(LastCheckpointReadCompleted::SPAN_NAME)
         );
+    }
+
+    #[rstest]
+    fn read_event_display_includes_ids(
+        #[values(None, Some("read-request"))] correlation_id: Option<&str>,
+    ) {
+        let operation_id = MetricId::new();
+        let crc = MetricEvent::CrcReadSuccess(CrcReadSuccess {
+            operation_id,
+            correlation_id: correlation_id.map(Arc::from),
+            bytes_read: 12,
+            duration: Duration::ZERO,
+        });
+        let domain = MetricEvent::DomainMetadataLoadSuccess(DomainMetadataLoadSuccess {
+            operation_id,
+            correlation_id: correlation_id.map(Arc::from),
+            from_cache: false,
+            num_domains_returned: 1,
+            duration: Duration::ZERO,
+        });
+        for (name, event) in [
+            ("CrcReadSuccess", crc.clone()),
+            ("CrcReadFailure", crc.into_failure()),
+            ("DomainMetadataLoadSuccess", domain.clone()),
+            ("DomainMetadataLoadFailure", domain.into_failure()),
+        ] {
+            let text = event.to_string();
+            let prefix =
+                format!("{name}(operation_id={operation_id}, correlation_id={correlation_id:?}");
+            assert!(text.starts_with(&prefix), "{text}");
+        }
     }
 
     #[test]

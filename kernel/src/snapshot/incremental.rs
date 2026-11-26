@@ -290,7 +290,7 @@ impl Snapshot {
         // matching the fresh path.
         let pm_start = std::time::Instant::now();
         let base_crc = combined_log_segment
-            .pick_latest_base_crc(engine, existing_snapshot.base_crc())
+            .pick_latest_base_crc(engine, existing_snapshot.base_crc(), metric_context)
             .inspect_err(|_| {
                 emit_protocol_metadata_load_failure(metric_context, pm_start.elapsed())
             })?;
@@ -2245,14 +2245,9 @@ mod tests {
         // The new log listing starts at v1, so the new log segment doesn't find 0.crc.
         // a) Only 0.crc exists: resolve_crc_file falls back to old segment's 0.crc.
         // b) Both 0.crc and 1.crc exist: resolve_crc_file picks up 1.crc.
-        let crc = json!({
-            "table_size_bytes": 100,
-            "num_files": 1,
-            "num_metadata": 1,
-            "num_protocol": 1,
-            "metadata": metadata,
-            "protocol": protocol(1, 1),
-        });
+        let mut crc = make_test_crc_json(100, 1);
+        crc["metadata"] = metadata["metaData"].clone();
+        crc["protocol"] = protocol(1, 1)["protocol"].clone();
 
         // put the old crc
         let path = delta_path_for_version(0, "crc");
@@ -2265,6 +2260,11 @@ mod tests {
         let base_snapshot = Snapshot::builder_for(table_root)
             .at_version(0)
             .build(&engine)?;
+
+        assert_eq!(
+            base_snapshot.crc_at_version().map(|crc| crc.version),
+            Some(0)
+        );
 
         // a) only 0.crc exists -- falls back to old segment's 0.crc
         let snapshot = Snapshot::builder_from(base_snapshot.clone())
@@ -2283,24 +2283,40 @@ mod tests {
 
         // b) both 0.crc and 1.crc exist; resolve_crc_file picks up 1.crc
         let path = delta_path_for_version(1, "crc");
-        let crc = json!({
-            "table_size_bytes": 100,
-            "num_files": 1,
-            "num_metadata": 1,
-            "num_protocol": 1,
-            "metadata": metadata,
-            "protocol": protocol(1, 2),
-        });
+        crc["protocol"] = protocol(1, 2)["protocol"].clone();
         store
             .put(&path, crc.to_string().into())
             .await
             .map_err(KernelError::from)?;
-        let snapshot = Snapshot::builder_from(base_snapshot.clone())
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        let snapshot = Snapshot::builder_from(base_snapshot)
             .at_version(1)
+            .with_correlation_id("incremental")
             .build(&engine)?;
         let expected = Snapshot::builder_for(table_root)
             .at_version(1)
+            .with_correlation_id("fresh")
             .build(&engine)?;
+        let events = reporter.events();
+        for request in ["incremental", "fresh"] {
+            let build = events
+                .iter()
+                .find_map(|event| match event {
+                    MetricEvent::SnapshotBuildSuccess(build)
+                        if build.correlation_id.as_deref() == Some(request) =>
+                    {
+                        Some(build)
+                    }
+                    _ => None,
+                })
+                .expect("snapshot build metric with caller correlation ID");
+            assert!(events.iter().any(|event| matches!(
+                event,
+                MetricEvent::CrcReadSuccess(crc)
+                    if crc.operation_id == build.operation_id && crc.correlation_id == build.correlation_id
+            )), "CRC read must have the build's IDs: {events:?}");
+        }
         assert_eq!(snapshot, expected);
         assert_eq!(
             snapshot
