@@ -554,18 +554,8 @@ fn incompatible_footer_types_yield_no_scalar(#[case] column: &str, #[case] data_
 
 #[rstest]
 fn invalid_utf8_footer_bounds_yield_no_string(#[values(false, true)] fixed_len: bool) {
-    let bytes = ByteArray::from(vec![0xff; 16]);
-    let stats = if fixed_len {
-        Statistics::fixed_len_byte_array(
-            Some(bytes.clone().into()),
-            Some(bytes.into()),
-            None,
-            Some(0),
-            false,
-        )
-    } else {
-        Statistics::byte_array(Some(bytes.clone()), Some(bytes), None, Some(0), false)
-    };
+    let bytes = [0xff; 16];
+    let stats = byte_array_stats(fixed_len, Some(&bytes[..]), Some(&bytes[..]), false);
     let column = annotated_chunk(
         stats.physical_type(),
         None,
@@ -575,6 +565,75 @@ fn invalid_utf8_footer_bounds_yield_no_string(#[values(false, true)] fixed_len: 
     );
     assert_eq!(extract_min_scalar(&DataType::STRING, &column), None);
     assert_eq!(extract_max_scalar(&DataType::STRING, &column), None);
+}
+
+#[rstest]
+#[case::both_bounds(Some("ab"), Some("ac"))]
+#[case::min_only(Some("ab"), None)]
+#[case::max_only(None, Some("ac"))]
+#[case::single_value(Some("ab"), Some("ab"))]
+fn byte_array_footer_bounds_yield_scalars_only_when_not_legacy(
+    #[case] min: Option<&str>,
+    #[case] max: Option<&str>,
+    #[values(false, true)] deprecated: bool,
+    #[values(DataType::STRING, DataType::BINARY)] data_type: DataType,
+    #[values(false, true)] fixed_len: bool,
+) {
+    let stats = byte_array_stats(
+        fixed_len,
+        min.map(str::as_bytes),
+        max.map(str::as_bytes),
+        deprecated,
+    );
+    let column = annotated_chunk(
+        stats.physical_type(),
+        None,
+        ConvertedType::NONE,
+        None,
+        stats,
+    );
+    let expected = |value: Option<&str>| -> Option<Scalar> {
+        let value = value.filter(|_| !deprecated)?;
+        Some(if data_type == DataType::STRING {
+            value.into()
+        } else {
+            value.as_bytes().into()
+        })
+    };
+    assert_eq!(extract_min_scalar(&data_type, &column), expected(min));
+    assert_eq!(extract_max_scalar(&data_type, &column), expected(max));
+}
+
+#[rstest]
+fn legacy_string_footer_bounds_do_not_prune_matching_groups(
+    #[values(false, true)] deprecated: bool,
+) {
+    let values: ArrayRef = Arc::new(StringArray::from(vec!["a", "ab", "a\u{e9}"]));
+    let builder = parquet_reader(write_row_groups(&["s"], [values]));
+    let row_group = builder.metadata().row_group(0);
+    let predicate = Predicate::gt(col!("s"), lit("ac"));
+    assert_eq!(
+        extract_max_scalar(&DataType::STRING, row_group.column(0)),
+        Some("a\u{e9}".into())
+    );
+    assert!(RowGroupFilter::apply(row_group, &predicate));
+
+    // Signed byte comparison ranks 0xC3 below 0x62, so a legacy writer records `ab` as the max.
+    // Trusted as written, those bounds prune the group and lose the `a\u{e9}` row; marked legacy,
+    // they are ignored and the group survives.
+    let stats = byte_array_stats(false, Some(&b"a"[..]), Some(&b"ab"[..]), deprecated);
+    let column = ColumnChunkMetaData::builder(row_group.column(0).column_descr_ptr())
+        .set_num_values(3)
+        .set_statistics(stats)
+        .build()
+        .unwrap();
+    let row_group = row_group
+        .clone()
+        .into_builder()
+        .set_column_metadata(vec![column])
+        .build()
+        .unwrap();
+    assert_eq!(RowGroupFilter::apply(&row_group, &predicate), deprecated);
 }
 
 #[rstest]
@@ -1370,6 +1429,28 @@ fn write_row_groups(col_path: &[&str], row_groups: impl IntoIterator<Item = Arra
         writer.flush().unwrap();
     }
     writer.unwrap().into_inner().unwrap().into()
+}
+
+/// `deprecated` marks the bounds as legacy `min`/`max` footer fields.
+fn byte_array_stats(
+    fixed_len: bool,
+    min: Option<&[u8]>,
+    max: Option<&[u8]>,
+    deprecated: bool,
+) -> Statistics {
+    let min = min.map(ByteArray::from);
+    let max = max.map(ByteArray::from);
+    if fixed_len {
+        Statistics::fixed_len_byte_array(
+            min.map(Into::into),
+            max.map(Into::into),
+            None,
+            Some(0),
+            deprecated,
+        )
+    } else {
+        Statistics::byte_array(min, max, None, Some(0), deprecated)
+    }
 }
 
 /// `decimal` is the legacy `(precision, scale)` pair; FIXED_LEN_BYTE_ARRAY columns are 16 bytes
