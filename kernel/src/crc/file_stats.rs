@@ -179,6 +179,12 @@ pub(crate) fn is_incremental_safe_operation(operation: &str) -> bool {
     FileStatsPolicy::for_operation(operation) != FileStatsPolicy::Unsupported
 }
 
+/// Returns `true` if `operation` writes new files with `dataChange=false` rather than
+/// re-adding existing files to update their metadata.
+pub(crate) fn rewrites_files_without_data_change(operation: &str) -> bool {
+    matches!(operation, "OPTIMIZE" | "RECOMPRESSION" | "REORG")
+}
+
 impl FileStatsDelta {
     /// Adds another delta's gross totals and net histogram, using matching bin boundaries.
     /// If either delta has no histogram, the combined delta has none.
