@@ -1094,7 +1094,7 @@ async fn test_update_deletion_vectors_adds_expected_entries() -> delta_kernel::R
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
     // Build scan and collect all scan metadata
-    let scan = snapshot.clone().scan_builder().build()?;
+    let scan = snapshot.scan_builder().build()?;
     let all_scan_metadata: Vec<_> = scan
         .scan_metadata(engine.as_ref())?
         .collect::<KernelResult<Vec<_>>>()?;

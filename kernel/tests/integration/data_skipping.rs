@@ -130,27 +130,29 @@ fn collect_scan_paths(
     }
 
     let mut paths: Vec<String> = Vec::new();
-    if use_parallel {
-        let mut sequential = scan.parallel_scan_metadata(engine.clone())?;
-        for sm in sequential.by_ref() {
-            paths = sm?.visit_scan_files(paths, push_path)?;
-        }
-        if let AfterSequentialScanMetadata::Parallel { state, files } = sequential.finish()? {
-            let state = Arc::from(state);
-            for file in files {
-                let parallel =
-                    ParallelScanMetadata::try_new(engine.clone(), Arc::clone(&state), vec![file])?;
-                for sm in parallel {
-                    paths = sm?.visit_scan_files(paths, push_path)?;
-                }
-            }
-            state.log_metrics();
-        }
-    } else {
+    if !use_parallel {
         for sm in scan.scan_metadata(engine.as_ref())? {
             paths = sm?.visit_scan_files(paths, push_path)?;
         }
+        return Ok(paths);
     }
+
+    let mut sequential = scan.parallel_scan_metadata(engine.clone())?;
+    for sm in sequential.by_ref() {
+        paths = sm?.visit_scan_files(paths, push_path)?;
+    }
+    let AfterSequentialScanMetadata::Parallel { state, files } = sequential.finish()? else {
+        return Ok(paths);
+    };
+    let state = Arc::from(state);
+    for file in files {
+        let parallel =
+            ParallelScanMetadata::try_new(engine.clone(), Arc::clone(&state), vec![file])?;
+        for sm in parallel {
+            paths = sm?.visit_scan_files(paths, push_path)?;
+        }
+    }
+    state.log_metrics();
     Ok(paths)
 }
 

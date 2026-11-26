@@ -2059,7 +2059,7 @@ mod tests {
         assert!(abs_path2.as_str().contains(&prefix));
 
         // Test that two paths with same prefix are different (unique UUIDs)
-        let dv_path3 = write_context.new_deletion_vector_path(prefix.clone());
+        let dv_path3 = write_context.new_deletion_vector_path(prefix);
         let abs_path3 = dv_path3.absolute_path()?;
         assert_ne!(abs_path2, abs_path3);
 
@@ -3084,13 +3084,12 @@ mod tests {
     }
 
     #[test]
-    fn test_blind_append_sets_commit_info_flag() -> KernelResult<()> {
+    fn test_blind_append_sets_commit_info_flag() {
         let commit_info = CommitInfo::new(1, None, None, None, true);
         assert_eq!(commit_info.is_blind_append, Some(true));
 
         let commit_info_false = CommitInfo::new(1, None, None, None, false);
         assert_eq!(commit_info_false.is_blind_append, None);
-        Ok(())
     }
 
     #[test]
@@ -3274,7 +3273,7 @@ mod tests {
         let handler = ArrowEvaluationHandler;
         let evaluator = handler.new_expression_evaluator(
             input_schema,
-            logical_to_physical_expression.clone(),
+            logical_to_physical_expression,
             physical_schema.clone().into(),
         )?;
         let result = evaluator.evaluate(data.as_ref())?;

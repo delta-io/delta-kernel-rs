@@ -1021,7 +1021,7 @@ impl From<&TableFeature> for TableFeature {
 
 /// Formats a slice of table features using Delta's standard serialization (camelCase).
 pub(crate) fn format_features(features: &[TableFeature]) -> String {
-    let feature_strings: Vec<&str> = features.iter().map(|f| f.as_ref()).collect_vec();
+    let feature_strings: Vec<&str> = features.iter().map(AsRef::as_ref).collect_vec();
     format!("[{}]", feature_strings.join(", "))
 }
 

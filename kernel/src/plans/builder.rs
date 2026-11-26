@@ -1263,7 +1263,7 @@ mod tests {
     /// An absent relation still carries its schema, and `build` materializes it as an empty
     /// `Values` node.
     #[test]
-    fn absent_carries_schema_and_builds_empty_values() -> KernelResult<()> {
+    fn absent_carries_schema_and_builds_empty_values() {
         let absent = absent_src();
         assert_eq!(absent.schema(), &id_schema());
         let plan = assert_plan(absent, &[(&[], "values")]);
@@ -1272,7 +1272,6 @@ mod tests {
         };
         assert!(values.rows.is_empty());
         assert_eq!(values.schema, id_schema());
-        Ok(())
     }
 
     /// `union_all` drops absent arms, so a lone present arm survives and is forwarded unchanged --

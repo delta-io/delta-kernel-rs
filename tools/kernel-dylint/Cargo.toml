@@ -1,0 +1,13 @@
+[package]
+name = "kernel_dylint"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+dylint_linting = "=6.4.0"
+
+[workspace]

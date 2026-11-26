@@ -211,7 +211,7 @@ mod tests {
         let mut f = File::create(path.clone())?;
         writeln!(f, "null")?;
         let url = Url::from_file_path(path).unwrap();
-        let file_slice = (url.clone(), None);
+        let file_slice = (url, None);
         let read = storage.read_files(vec![file_slice])?;
         let mut file_count = 0;
         let mut buf = BytesMut::with_capacity(16);

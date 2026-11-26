@@ -270,7 +270,7 @@ impl ParallelScanMetadata {
         iter: impl IntoIterator<Item = KernelResult<Box<dyn EngineData>>, IntoIter: Send + 'static>,
     ) -> Self {
         Self {
-            processor: ParallelPhase::new_from_iter(state.clone(), iter),
+            processor: ParallelPhase::new_from_iter(state, iter),
             // TODO: Associate the same scan ID from sequential phase to correlate phases
             span: info_span!("parallel_scan_metadata"),
         }

@@ -478,19 +478,16 @@ impl LogSegment {
             self.end_version,
             self.listed.ascending_commit_files.len(),
             self.checkpoint_version
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "none".into()),
+                .map_or_else(|| "none".into(), |v| v.to_string()),
             self.listed.checkpoint_parts.len(),
             self.listed.ascending_compaction_files.len(),
             self.listed
                 .latest_crc_file
                 .as_ref()
-                .map(|f| f.version.to_string())
-                .unwrap_or_else(|| "none".into()),
+                .map_or_else(|| "none".into(), |f| f.version.to_string()),
             self.listed
                 .max_published_version
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "none".into()),
+                .map_or_else(|| "none".into(), |v| v.to_string()),
         )
     }
 

@@ -57,7 +57,7 @@ async fn test_create_clustered_table(
     // Schema fields are all lowercase; normalization converts user casing to schema casing
     let expected_cols: Vec<ColumnName> = col_paths
         .iter()
-        .map(|p| ColumnName::new(p.iter().map(|s| s.to_lowercase()).collect::<Vec<_>>()))
+        .map(|p| ColumnName::new(p.iter().map(|s| s.to_lowercase())))
         .collect();
 
     let txn = create_table(&table_path, schema, "Test/1.0", true)

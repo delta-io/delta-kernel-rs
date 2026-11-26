@@ -968,7 +968,7 @@ mod tests {
 
                 for i in 0..row_count {
                     self.values
-                        .push(getter.get_binary(i, "data")?.map(|b| b.to_vec()));
+                        .push(getter.get_binary(i, "data")?.map(<[u8]>::to_vec));
                 }
                 Ok(())
             }
@@ -1030,7 +1030,7 @@ mod tests {
 
                 for i in 0..row_count {
                     self.values
-                        .push(getter.get_binary(i, "data")?.map(|b| b.to_vec()));
+                        .push(getter.get_binary(i, "data")?.map(<[u8]>::to_vec));
                 }
                 Ok(())
             }
@@ -1314,7 +1314,7 @@ mod tests {
                         getters[1].get_int(i, "i")?,
                         getters[2].get_long(i, "l")?,
                         getters[3].get_bool(i, "b")?,
-                        getters[4].get_binary(i, "bin")?.map(|b| b.to_vec()),
+                        getters[4].get_binary(i, "bin")?.map(<[u8]>::to_vec),
                     ));
                 }
                 Ok(())
@@ -1413,7 +1413,7 @@ mod tests {
     }
 
     #[test]
-    fn test_materialize_matches_get() -> KernelResult<()> {
+    fn test_materialize_matches_get() {
         // Create MapArray with various keys
         let map_array = create_map_array(vec![vec![
             ("key1", Some("value1")),
@@ -1432,11 +1432,10 @@ mod tests {
 
         // Verify count matches
         assert_eq!(materialized.len(), 3);
-        Ok(())
     }
 
     #[test]
-    fn test_materialize_handles_nulls() -> KernelResult<()> {
+    fn test_materialize_handles_nulls() {
         // Create MapArray with null values
         let map_array =
             create_map_array(vec![vec![("a", Some("1")), ("b", None), ("c", Some("3"))]]);
@@ -1449,11 +1448,10 @@ mod tests {
         assert_eq!(result.get("a"), Some(&"1".to_string()));
         assert_eq!(result.get("b"), None);
         assert_eq!(result.get("c"), Some(&"3".to_string()));
-        Ok(())
     }
 
     #[test]
-    fn test_materialize_empty_map() -> KernelResult<()> {
+    fn test_materialize_empty_map() {
         // Create MapArray with empty map
         let map_array = create_map_array(vec![vec![]]);
 
@@ -1461,11 +1459,10 @@ mod tests {
         let result = item.materialize();
 
         assert_eq!(result.len(), 0);
-        Ok(())
     }
 
     #[test]
-    fn test_materialize_multiple_rows() -> KernelResult<()> {
+    fn test_materialize_multiple_rows() {
         // Create MapArray with multiple rows
         let map_array = create_map_array(vec![
             vec![("a", Some("1")), ("b", Some("2"))],
@@ -1483,11 +1480,10 @@ mod tests {
         assert_eq!(result1.len(), 2);
         assert_eq!(result1.get("x"), Some(&"10".to_string()));
         assert_eq!(result1.get("y"), Some(&"20".to_string()));
-        Ok(())
     }
 
     #[test]
-    fn test_get_vs_materialize_consistency_with_duplicates() -> KernelResult<()> {
+    fn test_get_vs_materialize_consistency_with_duplicates() {
         // Test that materialize() handles duplicate keys correctly (last wins)
         // and that get() returns the same value as materialize() for duplicate keys
         let map_array = create_map_array(vec![vec![
@@ -1511,8 +1507,6 @@ mod tests {
         assert_eq!(item.get("a"), Some("5")); // Matches materialized
         assert_eq!(item.get("b"), Some("2"));
         assert_eq!(item.get("c"), Some("4"));
-
-        Ok(())
     }
 
     #[test]
@@ -1705,7 +1699,7 @@ mod tests {
             ) -> KernelResult<()> {
                 for i in 0..row_count {
                     self.values
-                        .push(getters[0].get_binary(i, "data")?.map(|b| b.to_vec()));
+                        .push(getters[0].get_binary(i, "data")?.map(<[u8]>::to_vec));
                 }
                 Ok(())
             }
@@ -1728,7 +1722,7 @@ mod tests {
         let field = Arc::new(ArrowField::new("item", ArrowDataType::Utf8, false));
         let offsets = ScalarBuffer::from(vec![0i32, 2]);
         let sizes = ScalarBuffer::from(vec![2i32, 1]);
-        let list_view = ListViewArray::new(field.clone(), offsets, sizes, values, None);
+        let list_view = ListViewArray::new(field, offsets, sizes, values, None);
 
         let batch = RecordBatch::try_new(
             Arc::new(ArrowSchema::new(vec![ArrowField::new(

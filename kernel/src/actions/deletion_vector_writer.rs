@@ -704,7 +704,7 @@ mod tests {
         let table_path = Url::parse("s3://my-bucket/delta_table/").unwrap();
         let prefix = String::from("dv");
 
-        let dv_path = DeletionVectorPath::new(table_path.clone(), prefix);
+        let dv_path = DeletionVectorPath::new(table_path, prefix);
 
         let write_result = DeletionVectorWriteResult {
             offset: 42,

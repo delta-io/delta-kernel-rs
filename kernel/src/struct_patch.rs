@@ -1051,7 +1051,7 @@ mod tests {
     }
 
     fn schema(names: &[&str]) -> StructType {
-        StructType::new_unchecked(names.iter().map(|name| field(*name)).collect::<Vec<_>>())
+        StructType::new_unchecked(names.iter().map(|name| field(*name)))
     }
 
     fn field_names(schema: &StructType) -> Vec<String> {

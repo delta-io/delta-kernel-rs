@@ -1603,7 +1603,7 @@ mod tests {
         let logical_schema = schema_ref! {};
         let state_info = Arc::new(StateInfo {
             logical_schema: logical_schema.clone(),
-            physical_schema: logical_schema.clone(),
+            physical_schema: logical_schema,
             physical_predicate: PhysicalPredicate::None,
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
@@ -1696,7 +1696,7 @@ mod tests {
     fn test_row_id_patch() {
         let schema: SchemaRef = schema_ref! { nullable "value": INTEGER };
         let state_info = get_state_info(
-            schema.clone(),
+            schema,
             vec![],
             None,
             ROW_TRACKING_FEATURES,
@@ -1833,8 +1833,8 @@ mod tests {
         let checkpoint_info = test_checkpoint_info();
         let mut processor = ScanLogReplayProcessor::new(
             &engine,
-            Arc::new(get_simple_state_info(schema.clone(), vec![]).unwrap()),
-            checkpoint_info.clone(),
+            Arc::new(get_simple_state_info(schema, vec![]).unwrap()),
+            checkpoint_info,
             ScanStatsOptions::default(),
             ScanPartitionValuesOptions::default(),
         )
@@ -1935,7 +1935,7 @@ mod tests {
         let predicate = Arc::new(Predicate::from_expr(expr!(col("id") == 10i32)));
         let state_info = Arc::new(
             get_state_info(
-                schema.clone(),
+                schema,
                 vec![],
                 Some(predicate.clone()),
                 &[], // no table features
@@ -1951,8 +1951,8 @@ mod tests {
         let checkpoint_info = test_checkpoint_info();
         let processor = ScanLogReplayProcessor::new(
             &engine,
-            state_info.clone(),
-            checkpoint_info.clone(),
+            state_info,
+            checkpoint_info,
             ScanStatsOptions::default(),
             ScanPartitionValuesOptions::default(),
         )
@@ -2073,8 +2073,8 @@ mod tests {
         let checkpoint_info = test_checkpoint_info();
         let processor = ScanLogReplayProcessor::new(
             &engine,
-            state_info.clone(),
-            checkpoint_info.clone(),
+            state_info,
+            checkpoint_info,
             ScanStatsOptions::default(),
             ScanPartitionValuesOptions::default(),
         )
@@ -2152,7 +2152,7 @@ mod tests {
         let processor = ScanLogReplayProcessor::new(
             &engine,
             state_info,
-            checkpoint_info.clone(),
+            checkpoint_info,
             ScanStatsOptions::default(),
             ScanPartitionValuesOptions::default(),
         )
@@ -2205,7 +2205,7 @@ mod tests {
         };
         let state_info = Arc::new(StateInfo {
             logical_schema: schema.clone(),
-            physical_schema: schema.clone(),
+            physical_schema: schema,
             physical_predicate: PhysicalPredicate::None,
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
@@ -2528,7 +2528,7 @@ mod tests {
                 .visit_scan_files(
                     Vec::new(),
                     |paths: &mut Vec<String>, scan_file: ScanFile| {
-                        paths.push(scan_file.path.to_string());
+                        paths.push(scan_file.path);
                     },
                 )
                 .unwrap();

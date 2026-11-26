@@ -1785,7 +1785,7 @@ async fn test_partial_dm_serves_hits_and_falls_through_for_misses() -> delta_ker
 
     // v1: post-commit chain accumulates DM into `Partial(map)`.
     let committed = begin_transaction_with(
-        snapshot_v0.clone(),
+        snapshot_v0,
         engine.as_ref(),
         delta_kernel::transaction::UpdateTableOperation::Write,
         "test-engine",
@@ -2022,7 +2022,6 @@ async fn test_partial_set_txn_serves_hits_and_falls_through_for_misses() -> delt
 
     // v2: commit with my-app=1; post-commit CRC accumulates into Partial.
     let committed = snapshot_v1_reloaded
-        .clone()
         .update_table(UpdateTableOperation::Write, "test-engine", true)
         .with_transaction_id("my-app", 1)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
@@ -2442,8 +2441,7 @@ async fn test_file_histogram_tracks_adds_and_removes_across_bins() -> delta_kern
         .array_windows()
         .enumerate()
         .find(|(_, [lo, hi])| large_size >= *lo && large_size < *hi)
-        .map(|(i, _)| i)
-        .unwrap_or(boundaries.len() - 1);
+        .map_or(boundaries.len() - 1, |(i, _)| i);
     assert_eq!(
         hist.file_counts()[large_bin],
         1,

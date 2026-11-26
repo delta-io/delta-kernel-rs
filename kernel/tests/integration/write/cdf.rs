@@ -349,50 +349,48 @@ async fn test_file_rewrite_validates_explicit_data_change(
         let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
         assert_eq!(fresh.version(), before.version());
         assert_eq!(fresh.schema(), before.schema());
-    } else {
-        let post = commit_result?.unwrap_post_commit_snapshot();
-        let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-        for snapshot in [post, fresh] {
-            assert_eq!(snapshot.version(), 2);
-            assert_eq!(snapshot.schema().contains("added"), schema_change);
-            let mut active_files = 0;
-            let mut existing_dv = None;
-            for files in get_scan_files(snapshot, engine.as_ref())? {
-                let batch = into_record_batch(files.apply_selection_vector()?);
-                active_files += batch.num_rows();
+        return Ok(());
+    }
 
-                let batch = StructArray::from(batch);
-                let paths: &StringArray = resolve_struct_field(&batch, &["path".into()]);
-                if let Some(row) = paths
-                    .iter()
-                    .position(|path| path == Some("existing.parquet"))
-                {
-                    let dv_paths: &StringArray = resolve_struct_field(
-                        &batch,
-                        &["deletionVector".into(), "pathOrInlineDv".into()],
-                    );
-                    let cardinalities: &Int64Array = resolve_struct_field(
-                        &batch,
-                        &["deletionVector".into(), "cardinality".into()],
-                    );
-                    existing_dv = Some((dv_paths.value(row).to_string(), cardinalities.value(row)));
-                }
-            }
-            assert_eq!(active_files, if use_dv { 2 } else { 1 });
-            assert_eq!(
-                existing_dv,
-                use_dv.then(|| ("memory:///dv.bin".to_string(), 1)),
-            );
+    let post = commit_result?.unwrap_post_commit_snapshot();
+    let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    for snapshot in [post, fresh] {
+        assert_eq!(snapshot.version(), 2);
+        assert_eq!(snapshot.schema().contains("added"), schema_change);
+        let mut active_files = 0;
+        let mut existing_dv = None;
+        for files in get_scan_files(snapshot, engine.as_ref())? {
+            let batch = into_record_batch(files.apply_selection_vector()?);
+            active_files += batch.num_rows();
+
+            let batch = StructArray::from(batch);
+            let paths: &StringArray = resolve_struct_field(&batch, &["path".into()]);
+            let Some(row) = paths
+                .iter()
+                .position(|path| path == Some("existing.parquet"))
+            else {
+                continue;
+            };
+            let dv_paths: &StringArray =
+                resolve_struct_field(&batch, &["deletionVector".into(), "pathOrInlineDv".into()]);
+            let cardinalities: &Int64Array =
+                resolve_struct_field(&batch, &["deletionVector".into(), "cardinality".into()]);
+            existing_dv = Some((dv_paths.value(row).to_string(), cardinalities.value(row)));
         }
-        for (kind, expected_count) in [("add", if use_dv { 2 } else { 1 }), ("remove", 1)] {
-            let actions = read_actions_from_commit(before.table_root(), 2, kind)?;
-            assert_eq!(actions.len(), expected_count);
-            assert!(
-                actions
-                    .iter()
-                    .all(|action| action["dataChange"] == data_change)
-            );
-        }
+        assert_eq!(active_files, if use_dv { 2 } else { 1 });
+        assert_eq!(
+            existing_dv,
+            use_dv.then(|| ("memory:///dv.bin".to_string(), 1)),
+        );
+    }
+    for (kind, expected_count) in [("add", if use_dv { 2 } else { 1 }), ("remove", 1)] {
+        let actions = read_actions_from_commit(before.table_root(), 2, kind)?;
+        assert_eq!(actions.len(), expected_count);
+        assert!(
+            actions
+                .iter()
+                .all(|action| action["dataChange"] == data_change)
+        );
     }
 
     Ok(())

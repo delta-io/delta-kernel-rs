@@ -586,17 +586,16 @@ impl TableConfiguration {
         let physical_columns = logical_columns
             .iter()
             .map(|logical_column| {
-                resolved_extras
-                    .get(logical_column)
-                    .cloned()
-                    .map(Ok)
-                    .unwrap_or_else(|| {
+                resolved_extras.get(logical_column).cloned().map_or_else(
+                    || {
                         get_any_level_column_physical_name(
                             &logical_schema,
                             logical_column,
                             column_mapping_mode,
                         )
-                    })
+                    },
+                    Ok,
+                )
             })
             .collect::<KernelResult<Vec<_>>>()?;
 
@@ -1335,9 +1334,7 @@ impl TableConfiguration {
 
     /// Helper to check if a feature is present in a feature list.
     fn has_feature(features: Option<&[TableFeature]>, feature: &TableFeature) -> bool {
-        features
-            .map(|features| features.contains(feature))
-            .unwrap_or(false)
+        features.is_some_and(|features| features.contains(feature))
     }
 
     /// Helper method to check if a feature is supported.

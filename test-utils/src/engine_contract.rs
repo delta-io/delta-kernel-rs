@@ -158,9 +158,8 @@ fn validate_checkpoint_schema(schema: &SchemaRef) {
     }
 
     let add_field = get_field(schema, "add");
-    let add_struct = match add_field.data_type() {
-        DataType::Struct(s) => s,
-        _ => panic!("'add' should be a struct"),
+    let DataType::Struct(add_struct) = add_field.data_type() else {
+        panic!("'add' should be a struct");
     };
     assert_eq!(
         get_field(add_struct, "path").data_type(),
@@ -179,14 +178,12 @@ fn validate_checkpoint_schema(schema: &SchemaRef) {
     );
 
     let metadata_field = get_field(schema, "metaData");
-    let metadata_struct = match metadata_field.data_type() {
-        DataType::Struct(s) => s,
-        _ => panic!("'metaData' should be a struct"),
+    let DataType::Struct(metadata_struct) = metadata_field.data_type() else {
+        panic!("'metaData' should be a struct");
     };
     let format_field = get_field(metadata_struct, "format");
-    let format_struct = match format_field.data_type() {
-        DataType::Struct(s) => s,
-        _ => panic!("'format' should be a struct"),
+    let DataType::Struct(format_struct) = format_field.data_type() else {
+        panic!("'format' should be a struct");
     };
     assert_eq!(
         get_field(format_struct, "provider").data_type(),
@@ -194,9 +191,8 @@ fn validate_checkpoint_schema(schema: &SchemaRef) {
     );
 
     let protocol_field = get_field(schema, "protocol");
-    let protocol_struct = match protocol_field.data_type() {
-        DataType::Struct(s) => s,
-        _ => panic!("'protocol' should be a struct"),
+    let DataType::Struct(protocol_struct) = protocol_field.data_type() else {
+        panic!("'protocol' should be a struct");
     };
     assert_eq!(
         get_field(protocol_struct, "minReaderVersion").data_type(),
