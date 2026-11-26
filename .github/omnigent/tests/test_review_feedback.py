@@ -2,13 +2,14 @@ import json
 import os
 import pathlib
 import sys
-import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from unittest.mock import patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from review_feedback import CHECK_NAME, MAX_LISTED_FINDINGS, evaluate_feedback, main
+from review_feedback import MAX_LISTED_FINDINGS, evaluate_feedback, main
 from review_publish import BOT_MARKER
 
 
@@ -55,8 +56,8 @@ class TestReviewFeedback(unittest.TestCase):
         passed, summary = evaluate_feedback(threads, 1)
         self.assertFalse(passed)
         self.assertIn("0 of 2", summary)
-        self.assertIn("#discussion_r1) — resolve the thread.", summary)
-        self.assertIn("#discussion_r2) — react with 👍, 👎, or 👀.", summary)
+        self.assertIn("#discussion_r1 — resolve the thread.", summary)
+        self.assertIn("#discussion_r2 — react with 👍, 👎, or 👀.", summary)
         self.assertTrue(evaluate_feedback(threads, 0)[0])
 
     def test_exact_percentage_boundary(self):
@@ -78,77 +79,51 @@ class TestReviewFeedback(unittest.TestCase):
         self.assertTrue(passed)
         self.assertIn("No inline AI review findings", summary)
 
-
     def test_outstanding_findings_summary_limits_links(self):
         findings = [thread(i, resolved=False) for i in range(MAX_LISTED_FINDINGS + 1)]
 
         passed, summary = evaluate_feedback(findings, 100)
 
         self.assertFalse(passed)
-        self.assertEqual(summary.count("[Inline finding]"), MAX_LISTED_FINDINGS)
+        self.assertEqual(summary.count("#discussion_r"), MAX_LISTED_FINDINGS)
         self.assertIn("resolve the thread and react with 👍, 👎, or 👀", summary)
         self.assertIn(f"Showing {MAX_LISTED_FINDINGS} of {len(findings)} findings", summary)
 
 
 class TestReviewFeedbackMain(unittest.TestCase):
-    def test_publishes_check_from_all_pages_including_configured_app(self):
-        repo = "delta-io/delta-kernel-rs"
+    def test_prints_results_for_all_pages_including_configured_app(self):
         app_bot = {"__typename": "Bot", "login": "omnigent-example[bot]"}
-        head_sha = "d" * 40
+        findings = (
+            thread(1, reactions=[("EYES", 1)]),
+            thread(2, author=app_bot, resolved=False),
+        )
         pages = [
-            {
-                "data": {
-                    "repository": {
-                        "pullRequest": {
-                            "headRefOid": head_sha,
-                            "reviewThreads": {"nodes": [finding]},
-                        }
-                    }
-                }
-            }
-            for finding in (
-                thread(1, reactions=[("EYES", 1)]),
-                thread(2, author=app_bot, resolved=False),
-            )
+            {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": [finding]}}}}}
+            for finding in findings
         ]
-        for minimum, conclusion in (("50", "success"), ("51", "failure")):
+        for minimum, expected_exit_code in (("50", 0), ("51", 1)):
+            env = {
+                "PR_NUMBER": "1",
+                "MIN_ADDRESSED_PERCENT": minimum,
+                "OMNIGENT_BOT_LOGIN": " Omnigent-Example[bot] ",
+                "GITHUB_REPOSITORY": "delta-io/delta-kernel-rs",
+            }
+            output = StringIO()
             with (
                 self.subTest(minimum=minimum),
-                tempfile.TemporaryDirectory() as directory,
+                patch.dict(os.environ, env),
+                patch("review_feedback.subprocess.run") as github,
+                redirect_stdout(output),
             ):
-                summary_path = pathlib.Path(directory) / "summary.md"
-                env = {
-                    "PR_NUMBER": "1",
-                    "MIN_ADDRESSED_PERCENT": minimum,
-                    "OMNIGENT_BOT_LOGIN": " Omnigent-Example[bot] ",
-                    "GITHUB_REPOSITORY": repo,
-                    "GITHUB_SERVER_URL": "https://github.com",
-                    "GITHUB_RUN_ID": "123",
-                    "GITHUB_STEP_SUMMARY": str(summary_path),
-                }
-                with (
-                    patch.dict(os.environ, env),
-                    patch("review_feedback.subprocess.check_output") as query,
-                    patch("review_feedback.subprocess.run") as publish,
-                ):
-                    query.return_value = json.dumps(pages).encode()
-                    self.assertIsNone(main())
-
-                query.assert_called_once()
+                github.return_value.stdout = json.dumps(pages).encode()
+                self.assertEqual(main(), expected_exit_code)
+                github.assert_called_once()
+                command = github.call_args.args[0]
+                self.assertEqual(command[:3], ["gh", "api", "graphql"])
                 for option in ("--paginate", "--slurp", "pr=1"):
-                    self.assertIn(option, query.call_args.args[0])
-                publish.assert_called_once()
-                self.assertIn(f"repos/{repo}/check-runs", publish.call_args.args[0])
-                self.assertTrue(publish.call_args.kwargs["check"])
-                check = json.loads(publish.call_args.kwargs["input"])
-                self.assertEqual(check["name"], CHECK_NAME)
-                self.assertEqual(check["head_sha"], head_sha)
-                self.assertEqual(check["conclusion"], conclusion)
-                self.assertIn("1 of 2 inline AI review findings", check["output"]["summary"])
-                self.assertIn("#discussion_r2", check["output"]["summary"])
-                self.assertEqual(
-                    summary_path.read_text(encoding="utf-8"), check["output"]["summary"] + "\n"
-                )
+                    self.assertIn(option, command)
+                self.assertIn("1 of 2 inline AI review findings", output.getvalue())
+                self.assertIn("#discussion_r2", output.getvalue())
 
     def test_invalid_input_stops_before_querying_github(self):
         for pr, minimum, error in (

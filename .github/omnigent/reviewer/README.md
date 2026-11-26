@@ -233,13 +233,13 @@ The [AI Review Comment Resolver](../../workflows/ai-review-comment-resolver.yml)
 findings from `github-actions[bot]` and the bot configured in `OMNIGENT_BOT_LOGIN`. A finding
 counts as addressed once its thread is resolved and its original comment has one of those
 reactions. Set the repository Actions variable `AI_REVIEW_MIN_ADDRESSED_PERCENT` to an integer
-from 0 to 100. The default is 100%. The PR check passes when the addressed percentage meets
+from 0 to 100. The default is 100%. The workflow passes when the addressed percentage meets
 the minimum or the PR has no matching findings.
 
-The resolver publishes the check when a PR opens or updates and after the AI review workflow
-posts inline findings. To refresh the result after resolving threads or adding reactions, run
-**AI Review Comment Resolver** from the Actions tab and enter the PR number. The workflow job
-reports whether publication succeeded. The PR check reports whether the threshold was met.
+The workflow runs when a PR opens, reopens, becomes ready for review, or receives new
+commits. It prints the result in the job log. To refresh the result after the AI reviewer
+posts findings or someone updates their feedback, rerun the latest **AI Review Comment
+Resolver** run for the PR from the Actions tab.
 
 ## Tools
 

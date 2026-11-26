@@ -18,7 +18,6 @@ REVIEW_THREADS_QUERY = """
 query($owner: String!, $repo: String!, $pr: Int!, $endCursor: String) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $pr) {
-      headRefOid
       reviewThreads(first: 100, after: $endCursor) {
         pageInfo { hasNextPage endCursor }
         nodes {
@@ -44,7 +43,6 @@ query($owner: String!, $repo: String!, $pr: Int!, $endCursor: String) {
 }
 """
 FEEDBACK_REACTIONS = {"THUMBS_UP", "THUMBS_DOWN", "EYES"}
-CHECK_NAME = "AI Review Comment Resolver"
 MAX_LISTED_FINDINGS = 20
 
 
@@ -79,7 +77,7 @@ def evaluate_feedback(
         if not has_feedback:
             missing.append("react with 👍, 👎, or 👀")
         if missing:
-            outstanding.append(f"- [Inline finding]({comment['url']}) — {' and '.join(missing)}.")
+            outstanding.append(f"- {comment['url']} — {' and '.join(missing)}.")
 
     if total == 0:
         return True, "No inline AI review findings from the configured review bots."
@@ -99,8 +97,8 @@ def evaluate_feedback(
     return passed, summary
 
 
-def main() -> None:
-    """Evaluate a PR and publish the result on its head commit."""
+def main() -> int:
+    """Print the review feedback and return the workflow exit status."""
     try:
         pr = int(os.environ["PR_NUMBER"])
         if pr < 1:
@@ -126,32 +124,13 @@ def main() -> None:
     ]
     pages = json.loads(subprocess.check_output(query))
     pull_requests = [page["data"]["repository"]["pullRequest"] for page in pages]
-    head_sha = pull_requests[0]["headRefOid"]
     threads = [thread for pull in pull_requests for thread in pull["reviewThreads"]["nodes"]]
     trusted_bot_logins = trusted_review_bot_logins(os.environ.get("OMNIGENT_BOT_LOGIN", ""))
     passed, summary = evaluate_feedback(threads, minimum_percent, trusted_bot_logins)
 
-    with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
-        handle.write(summary + "\n")
-    run_url = f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
-    title = (
-        "AI review feedback meets the minimum" if passed else "AI review feedback is incomplete"
-    )
-    check = {
-        "name": CHECK_NAME,
-        "head_sha": head_sha,
-        "details_url": run_url,
-        "status": "completed",
-        "conclusion": "success" if passed else "failure",
-        "output": {"title": title, "summary": summary},
-    }
-    subprocess.run(
-        ["gh", "api", "--method", "POST", f"repos/{repo}/check-runs", "--input", "-", "--silent"],
-        input=json.dumps(check),
-        text=True,
-        check=True,
-    )
+    print(summary)
+    return 0 if passed else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

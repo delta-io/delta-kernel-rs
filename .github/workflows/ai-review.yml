@@ -258,8 +258,6 @@ jobs:
       contents: read
       issues: write
       pull-requests: write
-    outputs:
-      inline_comments_posted: ${{ steps.publish-inline.outputs.posted }}
     steps:
       - name: Require GATEWAY_HOST for the egress allowlist
         env:
@@ -1456,7 +1454,6 @@ jobs:
           echo "Posted review comment."
 
       - name: Post inline review
-        id: publish-inline
         if: >-
           steps.review.outputs.review_text != '' &&
           needs.authorize.outputs.output_mode == 'inline'
@@ -1495,9 +1492,6 @@ jobs:
             echo "::warning::GitHub rejected the inline review; posting the collapsed review without inline comments."
             gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/inline-fallback.md
             exit 0
-          fi
-          if [ "$mapped_count" -gt 0 ]; then
-            echo 'posted=true' >> "$GITHUB_OUTPUT"
           fi
           printf 'Posted %s inline finding(s); %s remained in the collapsed review; %s exact duplicate(s) were suppressed.\n' \
             "$mapped_count" "$unmapped_count" "$duplicate_count"
@@ -1600,14 +1594,3 @@ jobs:
             printf 'Published neutral check as GitHub Actions for PR #%s at %s.\n' \
               "$PR_NUMBER" "$HEAD_SHA"
           fi
-
-  resolve-comments:
-    needs: [authorize, review]
-    if: needs.review.outputs.inline_comments_posted == 'true'
-    uses: ./.github/workflows/ai-review-comment-resolver.yml
-    permissions:
-      contents: read
-      pull-requests: read
-      checks: write
-    with:
-      pr: ${{ needs.authorize.outputs.pr_number }}
