@@ -69,25 +69,8 @@ def extract_marked_review(raw: str, marker: str) -> str:
     return reviews[-1]
 
 
-def format_review_body(review: str, run_url: str, *, collapsed: bool) -> str:
-    """Add the shared header and footer to a publishable review."""
-    if not run_url.startswith("https://github.com/"):
-        raise ValueError("run URL must be a GitHub HTTPS URL")
-
-    body = review.strip()
-    if collapsed:
-        body = f"<details><summary>Show review</summary>\n\n{body}\n\n</details>"
-    return (
-        f"{BOT_MARKER}\n"
-        f"{REVIEW_HEADER}\n\n"
-        f"{body}\n\n"
-        "---\n"
-        f"<sub>Automated review - [workflow run]({run_url})</sub>"
-    )
-
-
 def strip_review_body(body: str) -> str:
-    """Remove the wrapper added by :func:`format_review_body`."""
+    """Extract assessment text from main comments or wrapped review bodies."""
     body = body.strip()
     if body.startswith(BOT_MARKER):
         body = body[len(BOT_MARKER) :].lstrip()
@@ -96,7 +79,7 @@ def strip_review_body(body: str) -> str:
         body = body[len(REVIEW_HEADER) :].lstrip()
     elif re.match(rf"## (?:{re.escape(AI_REVIEW_TITLE)}|AI Review)(?: - [A-Z ]+)?\n", body):
         summary = re.search(
-            r"<details><summary>PR Summary</summary>\s*\n(.*?)\n\s*</details>",
+            r"<details><summary>(?:(?:PR|Assessment) )?Summary</summary>\s*\n(.*?)\n\s*</details>",
             body,
             re.DOTALL,
         )
@@ -171,7 +154,7 @@ def format_review_summary(
     if errors:
         parts.append("Publication incomplete: " + " ".join(dict.fromkeys(errors)))
     parts.append(
-        "<details><summary>PR Summary</summary>\n\n"
+        "<details><summary>Assessment Summary</summary>\n\n"
         + (overview.strip() or "See the full AI review in Checks.")
         + "\n\n</details>"
     )

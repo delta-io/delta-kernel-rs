@@ -1,4 +1,4 @@
-"""Select bounded prior AI reviews for finding deduplication."""
+"""Select bounded prior AI findings for reviewer context."""
 
 from __future__ import annotations
 
@@ -57,45 +57,6 @@ def format_review_history(
         chunks.append(chunk)
         remaining -= len(chunk)
     return "".join(chunks).strip()
-
-
-def previous_inline_comments(
-    document: Any,
-    trusted_bot_logins: Collection[str] = DEFAULT_TRUSTED_BOT_LOGINS,
-) -> list[dict[str, str | int]]:
-    """Return inline comments belonging to marked bot-authored reviews."""
-    comments: list[dict[str, str | int]] = []
-    for review in _review_nodes(document):
-        for comment in _trusted_inline_comments(review, trusted_bot_logins):
-            path = comment.get("path")
-            body = comment.get("body")
-            line = comment.get("line")
-            side = comment.get("side")
-            if not isinstance(line, int):
-                line = comment.get("originalLine")
-            if (
-                isinstance(path, str)
-                and isinstance(body, str)
-                and isinstance(line, int)
-                and side in {"LEFT", "RIGHT"}
-            ):
-                comments.append(
-                    {"path": path, "line": line, "side": side, "body": body}
-                )
-    return comments
-
-
-def is_duplicate_review(
-    review: str,
-    document: Any,
-    trusted_bot_logins: Collection[str] = DEFAULT_TRUSTED_BOT_LOGINS,
-) -> bool:
-    """Return whether the same complete review was already published by the bot."""
-    current = _normalize(_clean_published_body(review))
-    return bool(current) and any(
-        _normalize(entry) == current
-        for entry in _bot_review_bodies(document, trusted_bot_logins)
-    )
 
 
 def canonical_finding_body(body: str) -> str:
@@ -160,16 +121,6 @@ def _bot_review_entries(
         )
     entries.sort(key=lambda entry: entry[0], reverse=True)
     return [body for _, body in entries]
-
-
-def _bot_review_bodies(
-    document: Any, trusted_bot_logins: Collection[str]
-) -> list[str]:
-    bodies: list[str] = []
-    for entry in [*_issue_comment_nodes(document), *_review_nodes(document)]:
-        if _is_marked_bot_entry(entry, trusted_bot_logins):
-            bodies.append(_clean_published_body(entry["body"]))
-    return bodies
 
 
 def _trusted_inline_comments(

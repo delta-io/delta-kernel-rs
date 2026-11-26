@@ -80,9 +80,7 @@ toward silence), and write one orchestrator report with these sections:
    before including it; if unsure, drop it.
 2. **Non-blocking notes** -- Should Fix for a concrete advisory improvement, Nit for a smaller
    useful correction. Preserve the final severity after checking; both are nonblocking.
-3. **PR Summary** -- use a `## PR Summary` heading and one paragraph describing what the patch
-   changes, for a reader joining the PR.
-   Keep correction advice with its finding. Omit routine praise and inferred design approval.
+3. **Summary** -- one paragraph.
 Omit any empty section. Do NOT comment on style/formatting a linter catches,
 and do NOT restate the diff. "No blocking issues" is a fine review.
 
@@ -96,8 +94,8 @@ defects keep their severity and the disprove process. Include any reported gap i
 guidance in the Summary.
 
 Each finding must include:
-- a stable ID (`Blocker1`, `Blocker2`, ...; `ShouldFix1`, `ShouldFix2`, ...; `Nit1`, `Nit2`, ...),
-  with each finding beginning on its own `### <ID>` Markdown heading;
+- a stable ID (`Blocker1`, `ShouldFix1`, `Nit1`, ...), with numbering starting at 1 per severity;
+  use spaced Markdown headings such as `### Blocker 1`, `### Should Fix 1` and `### Nit 1`;
 - the file/line, diff hunk, or PR title/description section reference;
 - a first paragraph stating the concrete failure or maintenance cost;
 - `Explanation:` with the evidence and reasoning supporting that claim;
@@ -149,7 +147,7 @@ Failure code: dispatch_failed|reviewer_failed|disprove_failed|timeout|other
 Failed agents: comma-separated agent names, or none
 Do not downgrade a finding to bypass a failed gate.
 
-The workflow uses your PR summary and finding text to build GitHub comments and the AI Review
+The workflow uses your assessment summary and finding text to build GitHub comments and the AI Review
 Summary Check Run report. Python supplies the layout, counts and links described in README.md.
 Output ONLY the orchestrator report and any requested machine-readable block -- no narration and no
 status updates. Include reviewer attribution on findings as required above. Begin and end your

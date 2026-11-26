@@ -109,7 +109,7 @@ class FindingPublicationTest(unittest.TestCase):
         self.assertTrue(all(item["url"] for item in record["findings"]))
         main = github.issues[0]["body"]
         order = ["## 🤖 AI Review 🧐", "🛑 0 Blockers · 🔧 1 Should Fix · 💡 4 Nits",
-                 "<summary>PR Summary", "<summary>Review Summary", "<sub>Reviewed", "Full AI review"]
+                 "<summary>Assessment Summary", "<summary>Review Summary", "<sub>Reviewed", "Full AI review"]
         offsets = [main.index(part) for part in order]
         self.assertEqual(offsets, sorted(offsets))
         self.assertNotIn("\n---\n", main)
@@ -148,7 +148,51 @@ class FindingPublicationTest(unittest.TestCase):
 
         body = github.issues[0]["body"]
         self.assertIn("<!-- ai-review-main ", body)
-        self.assertEqual(strip_review_body(body), "Changes a call.")
+        for label in ("Assessment Summary", "PR Summary", "Summary"):
+            with self.subTest(label=label):
+                self.assertEqual(
+                    strip_review_body(body.replace("Assessment Summary", label)), "Changes a call."
+                )
+
+    def test_copied_markers_from_untrusted_authors_are_not_reused_or_updated(self):
+        authors = (
+            {"login": "contributor", "type": "User"},
+            {"login": "github-actions", "type": "User"},
+            {"login": "another-app[bot]", "type": "Bot"},
+        )
+        for author in authors:
+            with self.subTest(author=author):
+                github = FakeGitHub()
+                original = publish(github, [finding()])
+                copied_main = github.issues[0]
+                copied_finding = github.inline[0]
+                for comment in (copied_main, copied_finding):
+                    comment["user"] = author.copy()
+                github.writes.clear()
+
+                record = publish(github, [finding()])
+
+                self.assertTrue(record["complete"], record["errors"])
+                self.assertEqual(record["findings"][0]["delivery"], "new")
+                self.assertNotEqual(record["findings"][0]["url"], original["findings"][0]["url"])
+                self.assertNotEqual(record["main_url"], original["main_url"])
+                self.assertFalse(any(
+                    method == "PATCH" and path.endswith(f"/{copied_main['id']}")
+                    for method, path, _ in github.writes
+                ))
+
+    def test_left_findings_use_conversation_when_the_two_diff_sections_differ(self):
+        wider_diff = DIFF.replace("@@ -1,2 +1,2 @@", "@@ -1,3 +1,3 @@") + " more context\n"
+        for pr_change_patch, expected in ((DIFF, "inline"), (wider_diff, "conversation")):
+            with self.subTest(placement=expected):
+                github = FakeGitHub()
+                record = publish(
+                    github, [dict(finding(), side="LEFT")], pr_change_patch=pr_change_patch,
+                )
+
+                self.assertTrue(record["complete"], record["errors"])
+                self.assertEqual(record["findings"][0]["placement"], expected)
+                self.assertEqual(bool(github.inline), expected == "inline")
 
     def test_checks_use_the_same_final_structured_claim_as_the_thread(self):
         github = FakeGitHub()
@@ -161,15 +205,16 @@ class FindingPublicationTest(unittest.TestCase):
         self.assertIn("Final retained claim.", check)
         self.assertNotIn("Superseded prose claim.", check)
 
-    def test_fenced_summary_example_does_not_replace_the_pr_summary(self):
+    def test_fenced_summary_and_malformed_finding_examples_are_ignored(self):
         github = FakeGitHub()
         review = (
-            "### Nit1\nA retained claim.\n\n```markdown\n"
+            "### Nit1\nA retained claim.\n\n```markdown\n### Blocker0\nExample only.\n"
             "## PR Summary\nExample summary.\n```\n\n"
             "## PR Summary\nActual change summary."
         )
-        publish(github, [finding()], review=review)
+        record = publish(github, [finding()], review=review)
 
+        self.assertTrue(record["complete"], record["errors"])
         self.assertEqual(strip_review_body(github.issues[0]["body"]), "Actual change summary.")
 
     def test_publisher_cli_preserves_embedded_carriage_returns_in_both_diff_inputs(self):
@@ -225,6 +270,20 @@ class FindingPublicationTest(unittest.TestCase):
         record = publish(github, [{"id": "bad"}, finding()])
         self.assertFalse(record["complete"])
         self.assertEqual(len(github.inline), 1)
+        self.assertIn("Finding counts unavailable", github.issues[0]["body"])
+
+    def test_invalid_prose_id_reports_incomplete_publication_and_keeps_valid_sibling(self):
+        github = FakeGitHub()
+        review = "### Blocker0\nA malformed finding.\n\n## Summary\nReview assessment."
+
+        record = publish(github, [finding()], review=review)
+
+        self.assertFalse(record["complete"])
+        self.assertEqual(record["errors"], ["Invalid final finding heading: ### Blocker0."])
+        self.assertEqual([item["id"] for item in record["findings"]], ["Nit1"])
+        self.assertTrue(record["findings"][0]["url"])
+        self.assertIn("Publication incomplete:", github.issues[0]["body"])
+        self.assertIn("Invalid final finding heading: ### Blocker0.", github.issues[0]["body"])
         self.assertIn("Finding counts unavailable", github.issues[0]["body"])
 
     def test_invalid_locations_and_whitespace_ids_do_not_abort_valid_siblings(self):
@@ -373,17 +432,33 @@ class FindingPublicationTest(unittest.TestCase):
         self.assertIn("<sub>Raised by: docs-reviewer · Reviewed", comment)
         self.assertEqual(canonical_finding_body(comment), canonical_finding_body(body))
 
-    def test_pr_summary_legacy_summary_and_structured_only_check_text(self):
-        for heading in ("## PR Summary", "## Summary", "### Summary", "3. **Summary**"):
+    def test_summary_headings_and_structured_only_check_text(self):
+        for heading in ("## Assessment Summary", "## PR Summary", "## Summary",
+                        "### Summary", "3. **Summary**"):
             with self.subTest(heading=heading):
                 self.assertEqual(review_overview(f"### Nit1\nA claim.\n{heading}\nChange context."), "Change context.")
         entries, _ = collect_findings("## Summary\nContext.", [finding()])
-        self.assertIn("### Nit1", complete_review("## Summary\nContext.", entries))
+        self.assertIn("### Nit 1", complete_review("## Summary\nContext.", entries))
         body = format_review_summary(
             overview="Context.", head_sha=HEAD_SHA, findings=[], run_url=RUN_URL,
         )
         self.assertEqual(strip_review_body(body), "Context.")
         self.assertNotIn("<summary>Review Summary", body)
+
+    def test_readable_headings_keep_compact_metadata_ids(self):
+        for finding_id, heading in (("Blocker1", "Blocker 1"),
+                                    ("ShouldFix1", "Should Fix 1"), ("Nit1", "Nit 1")):
+            with self.subTest(finding_id=finding_id):
+                entries, errors = collect_findings(
+                    f"### {heading}\nA retained claim.\n\n## Summary\nAssessment.",
+                    [finding(finding_id)],
+                )
+
+                self.assertEqual(errors, [])
+                self.assertEqual([item["id"] for item in entries], [finding_id])
+                report = complete_review("## Summary\nAssessment.", entries)
+                self.assertIn("## Assessment Summary\n\nAssessment.", report)
+                self.assertIn(f"### {heading}\n\nA retained claim.", report)
 
     def test_legacy_unknown_severity_split_does_not_fabricate_zeroes(self):
         body = format_review_summary(

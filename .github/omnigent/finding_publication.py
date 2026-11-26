@@ -17,13 +17,16 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from inline_review import _diff_sections, diff_positions
+from inline_review import diff_positions, diff_sections
 from markdown_utils import markdown_lines
 from review_history import canonical_finding_body
-from review_publish import BOT_MARKER, format_finding, format_review_summary
+from review_publish import BOT_MARKER, finding_label, format_finding, format_review_summary
 
 _ID = re.compile(r"\[?(Blocker|Should\s*Fix|Nit)\s*([1-9][0-9]*)\]?", re.I)
 _HEADING = re.compile(r"^#{2,4}\s+(\[?(?:Blocker|Should\s*Fix|Nit)\s*[1-9][0-9]*\]?)(.*)$", re.I)
+_FINDING_LIKE_HEADING = re.compile(
+    r"^#{2,4}\s+\[?(?:Blocker|Should\s*Fix|Nit)(?=$|[^A-Za-z])", re.I
+)
 _FINDING_MARKER = re.compile(r"<!-- ai-review-finding (\{[^\n]*\}) -->")
 _MAIN_MARKER = re.compile(r"<!-- ai-review-main (\{[^\n]*\}) -->")
 
@@ -82,6 +85,8 @@ def collect_findings(review: str, structured: Any) -> tuple[list[dict[str, Any]]
     for index, (offset, line) in enumerate(boundaries):
         match = _HEADING.match(line)
         if match is None:
+            if _FINDING_LIKE_HEADING.match(line):
+                errors.append(f"Invalid final finding heading: {line.strip()}.")
             continue
         finding_id, severity = _identity(match[1])
         end = boundaries[index + 1][0] if index + 1 < len(boundaries) else len(review)
@@ -145,10 +150,13 @@ def collect_findings(review: str, structured: Any) -> tuple[list[dict[str, Any]]
 
 
 def review_overview(review: str) -> str:
-    """Extract the PR summary from the orchestrator report, ignoring fenced example headings."""
+    """Extract the assessment summary, ignoring fenced example headings."""
     boundaries = _review_sections(review)
     for index, (offset, line) in enumerate(boundaries):
-        if re.fullmatch(r"(?:#{1,4}\s+|\d+\.\s+\*\*)(?:PR )?Summary(?:\*\*)?\s*:?\s*", line):
+        if re.fullmatch(
+            r"(?:#{1,4}\s+|\d+\.\s+\*\*)(?:(?:PR|Assessment) )?Summary(?:\*\*)?\s*:?\s*",
+            line,
+        ):
             end = boundaries[index + 1][0] if index + 1 < len(boundaries) else len(review)
             return review[offset + len(line):end].strip()
     end = next((offset for offset, line in boundaries if _HEADING.match(line)
@@ -157,10 +165,12 @@ def review_overview(review: str) -> str:
 
 
 def complete_review(review: str, findings: list[dict[str, Any]]) -> str:
-    """Build the full Check Run review text from the PR summary and final findings."""
+    """Build the full Check Run review text from the assessment and final findings."""
     overview = review_overview(review)
-    parts = [f"## PR Summary\n\n{overview}"] if overview else []
-    parts.extend(f"### {finding['id']}\n\n{finding['body']}" for finding in findings)
+    parts = [f"## Assessment Summary\n\n{overview}"] if overview else []
+    parts.extend(
+        f"### {finding_label(finding['id'])[1:-1]}\n\n{finding['body']}" for finding in findings
+    )
     return "\n\n".join(parts).strip()
 
 
@@ -168,7 +178,8 @@ def _review_sections(review: str) -> list[tuple[int, str]]:
     return [
         (offset, line) for offset, line, fence in markdown_lines(review)
         if fence is None and re.match(
-            r"^(?:#{1,4}\s+|\d+\.\s+\*\*(?:Blocking issues|Non-blocking notes|(?:PR )?Summary))",
+            r"^(?:#{1,4}\s+|\d+\.\s+\*\*(?:Blocking issues|Non-blocking notes|"
+            r"(?:(?:PR|Assessment) )?Summary))",
             line,
         )
     ]
@@ -249,9 +260,9 @@ def publish_findings(
     pr_change_patch_positions = (
         diff_positions(pr_change_patch) if pr_change_patch is not None else github_pr_patch_positions
     )
-    github_pr_patch_sections = _diff_sections(github_pr_patch)
+    github_pr_patch_sections = diff_sections(github_pr_patch)
     pr_change_patch_sections = (
-        _diff_sections(pr_change_patch) if pr_change_patch is not None else github_pr_patch_sections
+        diff_sections(pr_change_patch) if pr_change_patch is not None else github_pr_patch_sections
     )
     for finding in findings:
         finding.update(head_sha=head_sha, url=None, delivery=None)

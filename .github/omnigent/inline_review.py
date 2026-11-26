@@ -1,53 +1,14 @@
-"""Build a SHA-bound GitHub review payload from validated AI findings."""
+"""Define the finding-output contract and parse review metadata and unified diffs."""
 
 from __future__ import annotations
 
-import argparse
 import json
 import re
-from collections import Counter
-from collections.abc import Collection
-from pathlib import Path
 from typing import Any
-
-from markdown_utils import markdown_lines
-from review_history import (
-    DEFAULT_TRUSTED_BOT_LOGINS,
-    canonical_finding_body,
-    is_duplicate_review,
-    previous_inline_comments,
-)
-from review_publish import FINDING_FEEDBACK_FOOTER
-from review_publish import format_review_body as _format_review_body
 
 INLINE_FINDING_FIELDS = ("id", "path", "line", "side", "body")
 INLINE_FINDING_SIDES = ("LEFT", "RIGHT")
-_FINDING_HEADING_MARKER = "###"
-_FINDING_HEADING_TEMPLATE = f"{_FINDING_HEADING_MARKER} <ID>"
-_REVIEW_SECTION_NAMES = ("Blocking issues", "Non-blocking notes", "Summary")
-_FINDING_ID = re.compile(r"(?:Blocker|ShouldFix|Nit)[1-9][0-9]*")
-_FINDING_HEADING = re.compile(
-    rf"^{re.escape(_FINDING_HEADING_MARKER)}\s+({_FINDING_ID.pattern})\b"
-)
-_SECTION_NAME_PATTERN = "|".join(re.escape(name) for name in _REVIEW_SECTION_NAMES)
-_SECTION_HEADING = re.compile(
-    rf"^(?:(?:##\s+)(?:{_SECTION_NAME_PATTERN})\s*:?|"
-    rf"(?:\d+\.\s+\*\*)(?:{_SECTION_NAME_PATTERN})\*\*\s*:?|"
-    rf"(?:{_SECTION_NAME_PATTERN})\s*:)\s*$",
-    re.IGNORECASE,
-)
-_FINDING_GROUP_NAME_PATTERN = "|".join(
-    re.escape(name) for name in _REVIEW_SECTION_NAMES[:2]
-)
-_FINDING_GROUP_HEADING = re.compile(
-    rf"^(?:(?:##\s+)(?:{_FINDING_GROUP_NAME_PATTERN})\s*:?|"
-    rf"(?:\d+\.\s+\*\*)(?:{_FINDING_GROUP_NAME_PATTERN})\*\*\s*:?|"
-    rf"(?:{_FINDING_GROUP_NAME_PATTERN})\s*:)\s*$",
-    re.IGNORECASE,
-)
-_HUNK_HEADER = re.compile(
-    r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@"
-)
+_HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
 def extract_inline_findings(
@@ -104,12 +65,12 @@ def inline_prompt_instructions(marker: str) -> str:
     )
     return f"""
 
-This review will also be published as GitHub inline comments. For a completed
+In PR comment modes, findings can appear inline or in the PR Conversation. For a completed
 review, use this complete response layout, with both the human-readable review
 and the machine-readable block inside the outer review markers:
 
 {review_start}
-<human-readable review, including ### <ID> findings and Summary>
+<human-readable review, including findings and Summary>
 {start}
 {example}
 {end}
@@ -119,14 +80,16 @@ Do not close the outer review before the machine-readable block. For a completed
 review, the outer review end marker must be the final line of your response.
 
 Include every final retained Blocker, Should Fix and Nit in this block. Use null
-for path, line and side when no usable changed line exists. Start every finding on its own Markdown
-heading matching `{_FINDING_HEADING_TEMPLATE}`, using the same ID in this block.
+for path, line and side when no usable changed line exists. Include each retained finding exactly
+once in the Markdown report and exactly once in the JSON block. Use Markdown headings
+`### Blocker 1`, `### Should Fix 1` or `### Nit 1`, numbering from 1 within each severity.
+Use compact JSON IDs such as `Blocker1`, `ShouldFix1` or `Nit1`; pair each Markdown finding
+with its JSON entry by severity and number.
 Keep the Summary to an overall assessment rather than repeating finding details.
-Use IDs matching `{_FINDING_ID.pattern}` (for example, `Blocker1`, `ShouldFix1` or `Nit1`) and
-do not add an entry for the Summary. Use the repository-relative path with no
+Do not add an entry for the Summary. Use the repository-relative path with no
 backticks. Use {INLINE_FINDING_SIDES[1]} and the head-file line
 number for additions or context; use {INLINE_FINDING_SIDES[0]} and the base-file
-line number only for deleted lines. The location must occur in the supplied
+line number only for deleted lines. Every non-null location must occur in the supplied
 unified diff. Use an empty findings list when there are no findings. Do not wrap
 the JSON in a Markdown code fence.
 """
@@ -186,241 +149,8 @@ def diff_positions(diff: str) -> set[tuple[str, int, str]]:
     return positions
 
 
-def build_review_payload(
-    *,
-    review: str,
-    findings: list[dict[str, Any]],
-    diff: str,
-    head_sha: str,
-    run_url: str,
-    history: Any = None,
-    trusted_bot_logins: Collection[str] = DEFAULT_TRUSTED_BOT_LOGINS,
-    review_diff: str | None = None,
-) -> tuple[dict[str, Any], list[str], list[str]]:
-    """Build a review using GitHub's ``diff`` for publication coordinates.
-
-    When supplied, ``review_diff`` restricts inline positions to the reviewed scope. LEFT positions
-    whose file sections differ between the two diffs remain in the body because their
-    base-file coordinates may refer to different code. Return the payload, unmapped IDs, and
-    duplicate IDs; raise ValueError for an invalid head SHA.
-    """
-    if re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
-        raise ValueError("head SHA must be a 40-character lowercase hex value")
-
-    allowed_positions = diff_positions(diff)
-    reviewed_positions = (
-        diff_positions(review_diff) if review_diff is not None else allowed_positions
-    )
-    github_sections = _diff_sections(diff)
-    review_sections = _diff_sections(review_diff) if review_diff is not None else github_sections
-    comments: list[dict[str, Any]] = []
-    unmapped: list[str] = []
-    duplicates: list[str] = []
-    seen_ids: set[str] = set()
-    headings = _review_boundaries(review)
-    review_ids = {
-        finding.group(1)
-        for _, line in headings
-        if (finding := _FINDING_HEADING.match(line)) is not None
-    }
-    prior_comments = {
-        (
-            comment["path"],
-            comment["line"],
-            comment["side"],
-            canonical_finding_body(comment["body"]),
-        )
-        for comment in previous_inline_comments(history, trusted_bot_logins)
-    }
-    omitted_ids: set[str] = set()
-
-    for index, finding in enumerate(findings, start=1):
-        try:
-            finding_id, path, line, side, body = _validate_finding(finding)
-        except ValueError:
-            unmapped.append(f"entry {index}")
-            continue
-        if finding_id in seen_ids:
-            unmapped.append(finding_id)
-            continue
-        seen_ids.add(finding_id)
-
-        if (
-            (path, line, side) not in allowed_positions
-            or (path, line, side) not in reviewed_positions
-            or (side == "LEFT" and review_sections.get(path) != github_sections.get(path))
-        ):
-            unmapped.append(finding_id)
-            continue
-        if (path, line, side, canonical_finding_body(body)) in prior_comments:
-            duplicates.append(finding_id)
-            if finding_id in review_ids:
-                omitted_ids.add(finding_id)
-            continue
-        if finding_id in review_ids:
-            omitted_ids.add(finding_id)
-        comments.append(
-            {
-                "path": path,
-                "line": line,
-                "side": side,
-                "body": f"**{finding_id}** {body}{FINDING_FEEDBACK_FOOTER}",
-            }
-        )
-
-    return (
-        {
-            "body": _format_review_body(
-                _remove_finding_sections(review, omitted_ids),
-                run_url,
-                collapsed=True,
-            ),
-            "commit_id": head_sha,
-            "event": "COMMENT",
-            "comments": comments,
-        },
-        unmapped,
-        duplicates,
-    )
-
-
-def _include_missing_finding_sections(review: str, findings: list[dict[str, Any]]) -> str:
-    """Give validated JSON-only findings prose sections before mapping or fallback."""
-    boundaries = _review_boundaries(review)
-    present_ids = {
-        finding.group(1)
-        for _, line in boundaries
-        if (finding := _FINDING_HEADING.match(line)) is not None
-    }
-    sections: list[str] = []
-    for finding in findings:
-        try:
-            finding_id, path, line, side, body = _validate_finding(finding)
-        except ValueError:
-            continue
-        if finding_id not in present_ids:
-            sections.append(f"### {finding_id}\n`{path}` ({side}, line {line})\n\n{body}")
-            present_ids.add(finding_id)
-    if not sections:
-        return review
-    insertion = boundaries[0][0] if boundaries else len(review)
-    return "\n\n".join(
-        part
-        for part in (review[:insertion].rstrip(), *sections, review[insertion:].lstrip())
-        if part
-    )
-
-
-def _remove_finding_sections(review: str, finding_ids: set[str]) -> str:
-    """Remove finding sections that are published inline or already present."""
-    if not finding_ids:
-        return review
-
-    headings, unclosed_fence_start, hidden_finding_offsets = _parse_review_boundaries(
-        review
-    )
-    finding_id_counts = Counter(
-        finding.group(1)
-        for _, line in headings
-        if (finding := _FINDING_HEADING.match(line)) is not None
-    )
-    ranges: list[tuple[int, int]] = []
-    for index, (start, line) in enumerate(headings):
-        finding = _FINDING_HEADING.match(line)
-        if finding is None or finding.group(1) not in finding_ids:
-            continue
-        if finding_id_counts[finding.group(1)] != 1:
-            continue
-        if index + 1 >= len(headings):
-            # Without a later boundary, finding prose cannot be separated from
-            # an unmarked summary. Keep both in the collapsed review.
-            continue
-        end = headings[index + 1][0]
-        if (
-            unclosed_fence_start is not None
-            and start < unclosed_fence_start < end
-        ):
-            # Once structure becomes ambiguous, preserving extra prose is safer than
-            # deleting a genuine later finding or the summary.
-            continue
-        if any(start < offset < end for offset in hidden_finding_offsets):
-            # A balanced fence can enclose a heading-like line that may instead
-            # be a malformed finding boundary. Preserve the ambiguous range.
-            continue
-        ranges.append((start, end))
-
-    for start, end in reversed(ranges):
-        review = review[:start] + review[end:]
-    return _remove_empty_finding_groups(review).strip()
-
-
-def _remove_empty_finding_groups(review: str) -> str:
-    """Remove finding-group headings that contain no remaining content."""
-    boundaries = _review_boundaries(review)
-    ranges: list[tuple[int, int]] = []
-    for index, (start, line) in enumerate(boundaries):
-        if _FINDING_GROUP_HEADING.match(line) is None:
-            continue
-        end = next(
-            (
-                boundary_start
-                for boundary_start, boundary_line in boundaries[index + 1 :]
-                if _SECTION_HEADING.match(boundary_line) is not None
-            ),
-            len(review),
-        )
-        if not review[start + len(line) : end].strip():
-            ranges.append((start, end))
-
-    for start, end in reversed(ranges):
-        review = review[:start] + review[end:]
-    return review
-
-
-def _review_boundaries(review: str) -> list[tuple[int, str]]:
-    """Return finding and section boundaries, ignoring balanced code fences."""
-    return _parse_review_boundaries(review)[0]
-
-
-def _parse_review_boundaries(
-    review: str,
-) -> tuple[list[tuple[int, str]], int | None, list[int]]:
-    """Return reliable boundaries plus locations made ambiguous by fences."""
-    headings: list[tuple[int, str]] = []
-    hidden_finding_offsets: list[int] = []
-    fence_start: int | None = None
-    for offset, line, fence_start in markdown_lines(review):
-        if _is_review_boundary(line):
-            if fence_start is None:
-                headings.append((offset, line))
-            elif _FINDING_HEADING.match(line) is not None:
-                hidden_finding_offsets.append(offset)
-    return headings, fence_start, hidden_finding_offsets
-
-
-def _is_review_boundary(line: str) -> bool:
-    return (
-        _FINDING_HEADING.match(line) is not None
-        or _SECTION_HEADING.match(line) is not None
-    )
-
-
-def should_skip_inline_review(
-    payload: dict[str, Any],
-    history: Any,
-    trusted_bot_logins: Collection[str] = DEFAULT_TRUSTED_BOT_LOGINS,
-) -> bool:
-    """Return whether a comment-free inline payload repeats a prior review body."""
-    comments = payload.get("comments")
-    body = payload.get("body")
-    return (
-        comments == []
-        and isinstance(body, str)
-        and is_duplicate_review(body, history, trusted_bot_logins)
-    )
-
-
-def _diff_sections(diff: str) -> dict[str, str]:
+def diff_sections(diff: str) -> dict[str, str]:
+    """Return each file's unified diff section, keyed by its review path."""
     sections = {}
     for section in re.split(r"(?=^diff --git )", diff, flags=re.MULTILINE):
         old = re.search(r"^--- (.+)$", section, re.MULTILINE)
@@ -447,114 +177,3 @@ def _inline_markers(marker: str) -> tuple[str, str]:
         f"<!-- AI_REVIEW_INLINE_START_{marker} -->",
         f"<!-- AI_REVIEW_INLINE_END_{marker} -->",
     )
-
-
-def _validate_finding(finding: Any) -> tuple[str, str, int, str, str]:
-    expected = set(INLINE_FINDING_FIELDS)
-    if not isinstance(finding, dict) or set(finding) != expected:
-        fields = ", ".join(INLINE_FINDING_FIELDS)
-        raise ValueError(f"each inline finding must contain exactly: {fields}")
-
-    finding_id = finding["id"]
-    path = finding["path"]
-    line = finding["line"]
-    side = finding["side"]
-    body = finding["body"]
-    if not isinstance(finding_id, str) or _FINDING_ID.fullmatch(finding_id) is None:
-        raise ValueError("inline finding ID must match Blocker1 or Nit1 form")
-    if (
-        not isinstance(path, str)
-        or not path
-        or len(path) > 500
-        or path.startswith("/")
-        or "\x00" in path
-        or ".." in Path(path).parts
-    ):
-        raise ValueError(f"inline finding {finding_id} has an invalid path")
-    if isinstance(line, bool) or not isinstance(line, int) or line < 1:
-        raise ValueError(f"inline finding {finding_id} has an invalid line")
-    if side not in INLINE_FINDING_SIDES:
-        raise ValueError(f"inline finding {finding_id} has an invalid side")
-    if not isinstance(body, str) or not body.strip() or len(body) > 10_000:
-        raise ValueError(f"inline finding {finding_id} has an invalid body")
-    if any(ord(char) < 32 and char not in "\n\t" for char in body):
-        raise ValueError(f"inline finding {finding_id} has control characters")
-    return finding_id, path, line, side, body.strip()
-
-
-def _load_history(path: Path) -> Any:
-    """Load review history, falling back to no history when it is unavailable."""
-    try:
-        return json.loads(path.read_text())
-    except (OSError, ValueError):
-        return {}
-
-
-def _load_trusted_bot_logins(path: Path) -> list[str]:
-    """Load the workflow-owned bot allowlist, rejecting malformed input."""
-    trusted_bot_logins = json.loads(path.read_text())
-    if not isinstance(trusted_bot_logins, list) or not all(
-        isinstance(login, str) for login in trusted_bot_logins
-    ):
-        raise ValueError("trusted bot logins must be a JSON array of strings")
-    return trusted_bot_logins
-
-
-def main() -> None:
-    """Build a GitHub review request from workflow-owned files."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--review", required=True, type=Path)
-    parser.add_argument("--findings", required=True, type=Path)
-    parser.add_argument("--diff", required=True, type=Path)
-    parser.add_argument("--review-diff", type=Path)
-    parser.add_argument("--fallback-output", type=Path)
-    parser.add_argument("--head-sha", required=True)
-    parser.add_argument("--run-url", required=True)
-    parser.add_argument("--history", required=True, type=Path)
-    parser.add_argument("--trusted-bot-logins", required=True, type=Path)
-    parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--unmapped-output", required=True, type=Path)
-    parser.add_argument("--duplicate-output", required=True, type=Path)
-    parser.add_argument("--skip-duplicate-review-output", required=True, type=Path)
-    args = parser.parse_args()
-
-    history = _load_history(args.history)
-    trusted_bot_logins = _load_trusted_bot_logins(args.trusted_bot_logins)
-    findings = json.loads(args.findings.read_text())
-    review = _include_missing_finding_sections(args.review.read_text(), findings)
-    payload, unmapped, duplicates = build_review_payload(
-        review=review,
-        findings=findings,
-        diff=args.diff.read_bytes().decode("utf-8", errors="replace"),
-        head_sha=args.head_sha,
-        run_url=args.run_url,
-        history=history,
-        trusted_bot_logins=trusted_bot_logins,
-        review_diff=(
-            args.review_diff.read_bytes().decode("utf-8", errors="replace")
-            if args.review_diff
-            else None
-        ),
-    )
-    args.output.write_text(json.dumps(payload))
-    if args.fallback_output:
-        args.fallback_output.write_text(
-            _format_review_body(
-                _remove_finding_sections(review, set(duplicates)), args.run_url, collapsed=True
-            )
-        )
-    args.unmapped_output.write_text("\n".join(unmapped) + ("\n" if unmapped else ""))
-    args.duplicate_output.write_text(
-        "\n".join(duplicates) + ("\n" if duplicates else "")
-    )
-    args.skip_duplicate_review_output.write_text(
-        (
-            "true\n"
-            if should_skip_inline_review(payload, history, trusted_bot_logins)
-            else "false\n"
-        )
-    )
-
-
-if __name__ == "__main__":
-    main()

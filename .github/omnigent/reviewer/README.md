@@ -316,7 +316,7 @@ navigation. A long stack header can therefore crowd out author-written text. A p
 | Inline review comment | A file/line comment starting a discussion thread in Files changed. |
 | Review body | Text submitted with a GitHub review, separate from its inline comments. The publication code creates individual comments without submitting a review body. |
 | PR Conversation comment | A top-level comment in the PR's Conversation timeline, without a file/line anchor. |
-| Main AI review comment | A Conversation comment with severity counts, the reviewed commit, a PR summary and links to finding comments. |
+| Main AI review comment | A Conversation comment with severity counts, the reviewed commit, an assessment summary and links to finding comments. |
 | Confirmed comment URL | A URL returned by GitHub or read from an existing trusted bot comment. It establishes that the comment exists. |
 | `AI Review Summary` Check Run | The commit-specific result in the PR's Checks tab, with GitHub conclusion `neutral`. |
 | Actions artifact | Downloadable files attached to a workflow run. |
@@ -349,19 +349,19 @@ PR change patch and shared PR task text with seven-day retention.
 | Runner file | Writer | Consumer and purpose |
 | --- | --- | --- |
 | `/tmp/pr_meta.json` | GitHub fetch step | Task builder and range resolver read original metadata/description and commit identities. |
-| `/tmp/pr_history.json` | History fetch step | History code prepares earlier AI review text and checks for exact repeats. |
+| `/tmp/pr_history.json` | History fetch step | History code prepares earlier AI review text for the orchestrator. |
 | `/tmp/pr_review_comments.json` | Review-comment fetch step | History code associates earlier inline comments with diff sides. |
-| `/tmp/pr_diff.txt` | Selected-range fetch | Task builder reads the PR change patch; inline code also checks locations against it. |
+| `/tmp/pr_diff.txt` | Selected-range fetch | Task builder reads the PR change patch; publication code also checks inline locations against it. |
 | `/tmp/github_pr_diff.txt` | Patch fetch | Publication code checks inline locations against GitHub's comparison; other modes reuse the PR change patch. |
 | `/tmp/orchestrator_task.md` | Task builder | Workflow passes the initial task text to `omnigent run -p`. |
 | `/tmp/child_task_pr_data.md` | Task builder | Dispatch hook appends shared PR task text to subagent assignments. |
 | `/tmp/child_task_root_guidance.md` | Task builder | Dispatch hook adds trusted root guidance for the two maintainer roles. |
 | `/tmp/review_raw_output.txt` | Model-run step | Validation step extracts the marked orchestrator report. |
-| `/tmp/review_output.txt` | Validation step | Comment, job-summary, artifact and Check Run steps read the extracted orchestrator report. |
+| `/tmp/review_output.txt` | Validation step | Publication reads the extracted orchestrator report; the Check Run uses it if the prepared check summary is unavailable. |
 | `/tmp/inline_findings.json` | Validation step | Publication code reads final findings and optional locations. |
 | `/tmp/publication_record.json` | Publication step | Records final findings, confirmed comment URLs and posting errors. |
 | `/tmp/review_output_complete.txt` | Publication step | Summary, artifact and Check Run outputs include all parsed final findings. |
-| `/tmp/check-summary.txt` | Publication step or diagnostic path | Check Run step reads the full report and posting results, resolver error or generic unavailable message. |
+| `/tmp/check-summary.txt` | Publication step or diagnostic path | Check Run reads the assessment and findings, resolver error or generic unavailable message. |
 
 ### Finding comments and confirmed comment URLs
 
@@ -388,7 +388,7 @@ comment; the Check Run does not add a separate comment-delivery summary.
 ### Main AI review comment format
 
 [`format_review_summary()`](../review_publish.py) is the single renderer for the main comment.
-The orchestrator supplies the PR summary and final finding text. Python supplies counts, links,
+The orchestrator supplies the assessment summary and final finding text. Python supplies counts, links,
 the reviewed commit and the layout below. Angle-bracket placeholders stand for generated text;
 hidden bot identifiers are omitted from this example.
 
@@ -397,9 +397,9 @@ hidden bot identifiers are omitted from this example.
 
 **🛑 2 Blockers · 🔧 1 Should Fix · 💡 2 Nits**
 
-<details><summary>PR Summary</summary>
+<details><summary>Assessment Summary</summary>
 
-<one paragraph explaining what the PR changes>
+<one paragraph giving an overall assessment without repeating finding details>
 
 </details>
 
