@@ -157,11 +157,9 @@ def format_review_summary(
     parts = [BOT_MARKER, f"## {AI_REVIEW_TITLE}", headline]
     if coverage is not None and not coverage.get("complete"):
         parts.append(
-            f"Patch truncated for subagents: {coverage.get('full_files', 0)} of "
-            f"{coverage.get('total_files', 0)} file patches fully included; "
-            f"{coverage.get('partial_files', 0)} partial and "
-            f"{coverage.get('omitted_files', 0)} omitted. "
-            f"[Diff details in Checks]({checks_url or run_url})."
+            "<details><summary>⚠️ Patch truncated for subagents</summary>\n\n"
+            + _format_patch_excerpt_details(coverage)
+            + "\n\n</details>"
         )
     if errors:
         parts.append("Publication incomplete: " + " ".join(dict.fromkeys(errors)))
@@ -186,18 +184,21 @@ def format_review_summary(
             + "\n".join(rows)
             + "\n\n</details>"
         )
-    checks_url = checks_url or run_url
-    parts.append(
-        f"<sub>Reviewed `{head_sha[:8]}` · [Full AI review → Checks]({checks_url})"
-        f" · [Workflow run]({run_url})</sub>"
-    )
+    footer = [f"Reviewed `{head_sha[:8]}`"]
+    if checks_url:
+        footer.append(f"[Full AI review]({checks_url})")
+    footer.append(f"[Workflow run]({run_url})")
+    parts.append("<sub>" + " · ".join(footer) + "</sub>")
     return "\n\n".join(parts)
 
 
 def format_diff_coverage(coverage: dict[str, Any]) -> str:
     """Describe the subagent patch excerpt's byte count and partly included or omitted file sections."""
+    return "## Subagent patch excerpt\n\n" + _format_patch_excerpt_details(coverage)
+
+
+def _format_patch_excerpt_details(coverage: dict[str, Any]) -> str:
     parts = [
-        "## Subagent patch excerpt",
         f"Reviewed range: `{coverage['base_sha']}...{coverage['head_sha']}`",
         f"Includes {coverage['excerpt_bytes']} of {coverage['total_bytes']} UTF-8 patch bytes.",
         f"File patches: {coverage['full_files']} fully included, "

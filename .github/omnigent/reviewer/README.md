@@ -313,10 +313,10 @@ The task builder applies no combined 120,000-byte limit to those messages. Role 
 tool definitions and later tool results are outside the initial task-message limits. Review-range
 selection reads the complete original PR description before excerpt preparation.
 
-If the subagent patch excerpt is truncated, the main AI review comment reports counts of fully
-included, partly included and omitted file patches, with a link to the details in Checks. The
-`AI Review Summary` Check Run and workflow log list partly included and omitted paths, selected
-commit SHAs and supplied/total bytes. An uncut patch adds no truncation notice.
+If the subagent patch excerpt is truncated, the main AI review comment adds a closed
+`⚠️ Patch truncated for subagents` disclosure. It contains the selected commit range, supplied/total
+bytes, file patch counts, and partly included or omitted paths. The `AI Review Summary` Check Run
+shows the same information, and the workflow log records it. An uncut patch adds no warning.
 
 The 120,000-byte guard protects the single `omnigent run -p` command argument. On Linux with
 4 KiB pages, one argument is limited to 131,072 bytes including its trailing NUL. Separate role
@@ -352,6 +352,8 @@ PR comments.
 
 When credentials and the reviewed PR head are available, the workflow attempts to create an
 `AI Review Summary` Check Run. It includes all parsed final findings when available.
+After GitHub returns its URL, the workflow updates the main comment's `Full AI review` footer
+link to open that specific Check Run.
 If review-range selection fails, it shows the resolver's error. Otherwise, it shows a
 generic unavailable message and a workflow-run link for diagnostics. Its GitHub conclusion is
 `neutral`; this does not mean the AI approved the PR.
@@ -375,6 +377,7 @@ PR change patch and shared PR task text with seven-day retention.
 | `/tmp/review_output.txt` | Validation step | Publication reads the extracted orchestrator report; the Check Run uses it if the prepared check summary is unavailable. |
 | `/tmp/inline_findings.json` | Validation step | Publication code reads final findings and optional locations. |
 | `/tmp/publication_record.json` | Publication step | Records final findings, confirmed comment URLs and posting errors. |
+| `/tmp/check-run-response.json` | Check step | Footer reads the returned Check Run URL. |
 | `/tmp/review_output_complete.txt` | Publication step | Summary, artifact and Check Run outputs include all parsed final findings. |
 | `/tmp/check-summary.txt` | Publication step or diagnostic path | Check Run reads the assessment and findings, resolver error or generic unavailable message. |
 
@@ -412,6 +415,19 @@ hidden bot identifiers are omitted from this example.
 
 **🛑 2 Blockers · 🔧 1 Should Fix · 💡 2 Nits**
 
+<details><summary>⚠️ Patch truncated for subagents</summary>
+
+Reviewed range: `<base SHA>...<head SHA>`
+
+Includes <included bytes> of <total bytes> UTF-8 patch bytes.
+
+File patches: <full count> fully included, <partial count> partial, <omitted count> omitted.
+
+- Partial: <code>"<partly included path>"</code>
+- Omitted: <code>"<omitted path>"</code>
+
+</details>
+
 <details><summary>Overall assessment</summary>
 
 <one paragraph giving an overall assessment without repeating finding details>
@@ -426,7 +442,7 @@ hidden bot identifiers are omitted from this example.
 
 </details>
 
-<sub>Reviewed `<short SHA>` · [Full AI review → Checks](<PR checks URL>)
+<sub>Reviewed `<short SHA>` · [Full AI review](<AI Review Summary Check Run URL>)
 · [Workflow run](<workflow run URL>)</sub>
 ```
 
@@ -435,6 +451,8 @@ It is absent when there are none. Nits count in the headline and have individual
 no rows in that disclosure. All disclosures start closed. A posting failure can replace the
 count line with `Finding counts unavailable.` and adds an explanation. The Check Run includes
 all final findings, including findings supplied only in structured model output.
+The patch warning appears only when the subagent patch excerpt is truncated. The `Full AI review`
+link appears after the workflow creates the Check Run; the workflow-run link is always present.
 
 ### Individual finding comment format
 

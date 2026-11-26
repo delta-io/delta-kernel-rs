@@ -211,7 +211,8 @@ def publish_findings(
     findings, errors = collect_findings(review, structured)
     record: dict[str, Any] = {
         "head_sha": head_sha, "run_url": run_url, "mode": mode, "findings": findings,
-        "errors": errors, "complete": False, "main_url": None, "coverage": coverage,
+        "errors": errors, "complete": False, "main_url": None, "main_comment_id": None,
+        "coverage": coverage,
     }
     if mode in {"summary", "artifact"}:
         for finding in findings:
@@ -260,6 +261,7 @@ def publish_findings(
             errors.append("The main comment write could not be confirmed.")
             return record
     record["main_url"] = _url(main)
+    record["main_comment_id"] = main["id"]
     github_pr_patch_positions = diff_positions(github_pr_patch)
     pr_change_patch_positions = (
         diff_positions(pr_change_patch) if pr_change_patch is not None else github_pr_patch_positions
@@ -328,18 +330,36 @@ def publish_findings(
             source_head_sha=head_sha,
         )
         (inline if can_inline else issues).append(destination)
-    summary = format_review_summary(
-        overview=review_overview(review), head_sha=head_sha, findings=findings,
-        run_url=run_url, errors=errors, counts_available=not errors,
-        checks_url=f"https://github.com/{repository}/pull/{pr_number}/checks", coverage=coverage,
-    )
-    final_body = summary.replace(BOT_MARKER, f"{BOT_MARKER}\n{main_marker}", 1)
     try:
-        github.write("PATCH", f"{prefix}/issues/comments/{main['id']}", {"body": final_body})
+        update_main_comment(github=github, repository=repository, review=review, record=record)
     except PublicationError:
         errors.append("The final main comment could not be confirmed.")
     record["complete"] = not errors and all(finding.get("url") for finding in findings)
     return record
+
+
+def update_main_comment(
+    *, github: Any, repository: str, review: str, record: dict[str, Any],
+    checks_url: str | None = None,
+) -> None:
+    """Update this run's main comment with confirmed findings and an optional Check Run URL.
+
+    The workflow supplies the URL after GitHub creates the Check Run. Records without a confirmed
+    main comment, including summary and artifact modes, do not cause a write.
+    """
+    if record.get("main_comment_id") is None:
+        return
+    summary = format_review_summary(
+        overview=review_overview(review), head_sha=record["head_sha"], findings=record["findings"],
+        run_url=record["run_url"], errors=record["errors"], counts_available=not record["errors"],
+        checks_url=checks_url, coverage=record.get("coverage"),
+    )
+    source = {"head_sha": record["head_sha"], "run_url": record["run_url"]}
+    main_marker = f"<!-- ai-review-main {json.dumps(source, sort_keys=True)} -->"
+    body = summary.replace(BOT_MARKER, f"{BOT_MARKER}\n{main_marker}", 1)
+    github.write(
+        "PATCH", f"repos/{repository}/issues/comments/{record['main_comment_id']}", {"body": body}
+    )
 
 
 def publication_check(review: str, record: dict[str, Any]) -> str:

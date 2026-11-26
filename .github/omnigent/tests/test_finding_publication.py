@@ -14,7 +14,7 @@ try:
     import finding_publication
     from finding_publication import (
         PublicationError, collect_findings, complete_review, publication_check,
-        publish_findings, review_overview,
+        publish_findings, review_overview, update_main_comment,
     )
     from review_history import canonical_finding_body
     from review_publish import BOT_MARKER, format_finding, format_review_summary, strip_review_body
@@ -23,6 +23,7 @@ finally:
 
 HEAD_SHA = "a" * 40
 RUN_URL = "https://github.com/example/project/actions/runs/1"
+CHECK_URL = "https://github.com/example/project/runs/123"
 DIFF = (
     "diff --git a/file.rs b/file.rs\n--- a/file.rs\n+++ b/file.rs\n"
     "@@ -1,2 +1,2 @@\n-old\n+new\n context\n"
@@ -107,6 +108,11 @@ class FindingPublicationTest(unittest.TestCase):
         self.assertEqual(len(github.inline), 2)
         self.assertEqual(len(github.issues), 4)
         self.assertTrue(all(item["url"] for item in record["findings"]))
+        self.assertNotIn("Full AI review", github.issues[0]["body"])
+        update_main_comment(
+            github=github, repository="example/project", review="## PR Summary\nChanges a call.",
+            record=record, checks_url=CHECK_URL,
+        )
         main = github.issues[0]["body"]
         order = ["## 🤖 AI Review 🧐", "🛑 0 Blockers · 🔧 1 Should Fix · 💡 4 Nits",
                  "<summary>Overall assessment", "<summary>Key findings", "<sub>Reviewed", "Full AI review"]
@@ -119,7 +125,8 @@ class FindingPublicationTest(unittest.TestCase):
         self.assertNotIn("VERDICT", main)
         self.assertEqual(main.count("[Should Fix 1]"), 1)
         self.assertNotIn("[Nit 1]", main)
-        self.assertIn("https://github.com/example/project/pull/1/checks", main)
+        self.assertIn(f"[Full AI review]({CHECK_URL})", main)
+        self.assertNotIn("https://github.com/example/project/pull/1/checks", main)
 
     def test_every_valid_anchor_is_posted_beyond_twelve_findings(self):
         github = FakeGitHub()
@@ -377,6 +384,10 @@ class FindingPublicationTest(unittest.TestCase):
             with self.subTest(mode=mode):
                 github = FakeGitHub()
                 record = publish(github, [finding()], mode=mode)
+                update_main_comment(
+                    github=github, repository="example/project", review="Context.",
+                    record=record, checks_url=CHECK_URL,
+                )
                 self.assertTrue(record["complete"])
                 self.assertEqual(github.writes, [])
                 self.assertEqual(record["findings"][0]["placement"], mode)
@@ -462,7 +473,7 @@ class FindingPublicationTest(unittest.TestCase):
                 self.assertIn("## Overall assessment\n\nAssessment.", report)
                 self.assertIn(f"### {heading}\n\nA retained claim.", report)
 
-    def test_cut_diff_shows_file_totals_and_keeps_missing_paths_in_checks(self):
+    def test_cut_diff_has_all_excerpt_details_inside_closed_warning_disclosure(self):
         coverage = {
             "base_sha": "b" * 40, "head_sha": HEAD_SHA,
             "total_bytes": 120_000, "excerpt_bytes": 100_000, "complete": False,
@@ -477,15 +488,21 @@ class FindingPublicationTest(unittest.TestCase):
         record = publish(github, [finding()], coverage=coverage)
         self.assertTrue(record["complete"])
         main = github.issues[0]["body"]
-        self.assertIn(
-            "Patch truncated for subagents: 1 of 3 file patches fully included; "
-            "1 partial and 1 omitted",
-            main,
-        )
+        warning = "<details><summary>⚠️ Patch truncated for subagents</summary>"
+        self.assertIn(warning, main)
+        self.assertNotIn("<details open", main)
+        details = main.split(warning, 1)[1].split("</details>", 1)[0].strip()
+        self.assertIn("Reviewed range: `" + coverage["base_sha"], details)
+        self.assertIn(HEAD_SHA, details)
+        self.assertIn("100000 of 120000", details)
+        self.assertIn("File patches: 1 fully included, 1 partial, 1 omitted.", details)
+        self.assertIn("partial.rs", details)
+        self.assertIn("missing.rs", details)
+        self.assertNotIn("Diff details in Checks", main)
         self.assertNotIn("Full Coverage", main)
         self.assertNotIn("Partial Coverage", main)
-        self.assertNotIn("missing.rs", main)
         check = publication_check("Context.", record)
+        self.assertEqual(details, check.split("## Subagent patch excerpt\n\n", 1)[1].strip())
         self.assertIn("100000 of 120000", check)
         self.assertIn("File patches: 1 fully included, 1 partial, 1 omitted.", check)
         self.assertIn("partial.rs", check)

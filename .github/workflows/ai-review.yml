@@ -1541,12 +1541,32 @@ jobs:
 
           if [ -n "$BOT_TOKEN" ] && \
              GH_TOKEN="$BOT_TOKEN" gh api --method POST "repos/${REPO}/check-runs" \
-               --input /tmp/check-run.json --silent; then
+               --input /tmp/check-run.json > /tmp/check-run-response.json; then
             printf 'Published neutral check as Omnigent App for PR #%s at %s.\n' \
               "$PR_NUMBER" "$HEAD_SHA"
           else
             gh api --method POST "repos/${REPO}/check-runs" \
-              --input /tmp/check-run.json --silent
+              --input /tmp/check-run.json > /tmp/check-run-response.json
             printf 'Published neutral check as GitHub Actions for PR #%s at %s.\n' \
               "$PR_NUMBER" "$HEAD_SHA"
+          fi
+
+          if [ -s /tmp/publication_record.json ] && [ -s /tmp/review_output.txt ]; then
+            GH_TOKEN="${BOT_TOKEN:-$GH_TOKEN}" python3 - <<'PYEOF'
+          import json
+          import os
+          import pathlib
+          import sys
+
+          sys.path.insert(0, ".github/omnigent")
+          from finding_publication import GitHub, update_main_comment
+
+          record = json.loads(pathlib.Path("/tmp/publication_record.json").read_text())
+          check = json.loads(pathlib.Path("/tmp/check-run-response.json").read_text())
+          update_main_comment(
+              github=GitHub(), repository=os.environ["REPO"],
+              review=pathlib.Path("/tmp/review_output.txt").read_text(), record=record,
+              checks_url=check["html_url"],
+          )
+          PYEOF
           fi
