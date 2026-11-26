@@ -220,7 +220,7 @@ fn take_number(chars: &mut CharStream<'_>) -> String {
         if let Some(sign) = chars.next_if(|c| *c == '+' || *c == '-') {
             out.push(sign);
         }
-        while let Some(c) = chars.next_if(|c| c.is_ascii_digit()) {
+        while let Some(c) = chars.next_if(char::is_ascii_digit) {
             out.push(c);
         }
     }

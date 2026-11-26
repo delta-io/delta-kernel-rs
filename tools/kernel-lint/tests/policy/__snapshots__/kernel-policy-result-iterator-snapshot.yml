@@ -1,0 +1,14 @@
+id: kernel-policy-result-iterator
+snapshots:
+  fn f() -> impl Iterator<Item = KernelResult<Row>> + Send { iter }:
+    labels:
+    - source: impl Iterator<Item = KernelResult<Row>> + Send
+      style: primary
+      start: 10
+      end: 56
+  'fn f<I: Iterator<Item = KernelResult<Row>> + Send>() {}':
+    labels:
+    - source: ': Iterator<Item = KernelResult<Row>> + Send'
+      style: primary
+      start: 6
+      end: 49

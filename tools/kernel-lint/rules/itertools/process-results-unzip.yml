@@ -1,0 +1,10 @@
+id: kernel-itertools-process-results-unzip
+language: Rust
+severity: info
+message: Consider process_results with unzip to avoid the temporary Vec of fallible pairs.
+note: unzip drains its input and observes the same first error, but allocation and partial-value Drop order can change. Review ownership, output type inference and the Itertools import; no automatic fix is provided.
+rule:
+  any:
+    - pattern: $ITER.collect::<KernelResult<Vec<_>>>()?.into_iter().unzip()
+    - pattern: $ITER.collect::<Result<Vec<_>, $ERROR>>()?.into_iter().unzip()
+    - pattern: $ITER.collect::<std::result::Result<Vec<_>, $ERROR>>()?.into_iter().unzip()

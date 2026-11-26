@@ -1,0 +1,26 @@
+id: kernel-test-error-message-helper
+valid:
+- '#[test]
+
+  fn checks() { assert!(r.is_err()); }'
+- '#[test]
+
+  fn checks() { assert!(r.is_err(), "case {name}"); assert!(r.unwrap_err().to_string().contains("bad")); }'
+- '#[test]
+
+  fn checks() { assert!(r.is_err()); log_case(); assert!(r.unwrap_err().to_string().contains("bad")); }'
+- '#[test]
+
+  fn checks() { assert!(r.is_err()); assert_eq!(r.unwrap_err().to_string(), "bad"); }'
+- '#[test]
+
+  fn checks() { assert!(r.is_err()); assert!(s.unwrap_err().to_string().contains("bad")); }'
+- '#[test]
+
+  fn checks() { assert!(r.is_err()); assert!(r.unwrap_err().to_string().contains(make_expected())); }'
+- fn production() { assert!(r.is_err()); assert!(r.unwrap_err().to_string().contains("bad")); }
+invalid:
+- '#[test]
+
+  fn checks() { assert!(r.is_err()); assert!(r.unwrap_err().to_string().contains("bad")); }'
+- mod tests { fn helper() { assert!(r.is_err()); assert!(r.unwrap_err().to_string().contains(expected)); } }

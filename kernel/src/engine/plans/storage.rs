@@ -152,7 +152,7 @@ mod tests {
             .put(&url, bytes::Bytes::from_static(b"hello"), false)
             .unwrap();
 
-        let files = vec![(url.clone(), None)];
+        let files = vec![(url, None)];
         let bytes: Vec<_> = storage.read_files(files).unwrap().try_collect().unwrap();
         assert_eq!(bytes.len(), 1);
         assert_eq!(bytes[0].as_ref(), b"hello");

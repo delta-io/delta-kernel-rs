@@ -23,6 +23,8 @@
 //!   null partition value.
 use std::collections::HashMap;
 
+use itertools::Itertools;
+
 use crate::expressions::Scalar;
 use crate::partition::serialization::would_serialize_to_null;
 use crate::schema::{DataType, StructType};
@@ -161,7 +163,6 @@ fn validate_keys(
     let expected_names = expected_keys
         .iter()
         .map(|expected| expected.input_name)
-        .collect::<Vec<_>>()
         .join(", ");
     let provided_names = partition_values.keys().cloned().collect::<Vec<_>>();
 

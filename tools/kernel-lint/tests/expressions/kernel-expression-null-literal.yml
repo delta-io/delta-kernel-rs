@@ -1,0 +1,8 @@
+id: kernel-expression-null-literal
+valid:
+- null_lit(DataType::LONG)
+- Scalar::Null(DataType::LONG)
+- lit(value)
+invalid:
+- lit(Scalar::Null(DataType::LONG))
+- Expression::literal(Scalar::Null(dtype))

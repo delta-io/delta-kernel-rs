@@ -1,0 +1,6 @@
+ruleDirs:
+  - tools/kernel-lint/rules
+testConfigs:
+  - testDir: tools/kernel-lint/tests/expressions
+  - testDir: tools/kernel-lint/tests/itertools
+  - testDir: tools/kernel-lint/tests/policy

@@ -195,7 +195,7 @@ mod tests {
             .with_metadata([(&owned, 1)])
             .add_metadata([(Cow::Borrowed(spelling), 2)])
             .add_metadata([(Cow::Owned(owned.clone()), 3)])
-            .add_metadata([(owned.clone().into_boxed_str(), 4)]);
+            .add_metadata([(owned.into_boxed_str(), 4)]);
         assert_eq!(field.metadata.len(), 1);
         assert_eq!(field.metadata.get(spelling), Some(&4.into()));
         let key = field.metadata.into_keys().next().unwrap();

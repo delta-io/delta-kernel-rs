@@ -1,0 +1,39 @@
+id: kernel-expression-named-predicate
+language: Rust
+severity: warning
+message: Use the named Kernel predicate constructor for a statically known operator.
+note: Resolve Kernel Predicate and BinaryPredicateOp. Named constructors delegate to these exact binary
+  operators. Dynamic ops and normalization-sensitive raw enum/junction rewrites are excluded; keep constructor
+  tests.
+rule:
+  pattern: Predicate::binary($OP, $LHS, $RHS)
+constraints:
+  OP:
+    regex: ^BinaryPredicateOp::(Equal|LessThan|GreaterThan|Distinct)$
+transform:
+  OP_NAME:
+    replace:
+      source: $OP
+      replace: '^BinaryPredicateOp::'
+      by: ''
+  EQ:
+    replace:
+      source: $OP_NAME
+      replace: ^Equal$
+      by: eq
+  LT:
+    replace:
+      source: $EQ
+      replace: ^LessThan$
+      by: lt
+  GT:
+    replace:
+      source: $LT
+      replace: ^GreaterThan$
+      by: gt
+  METHOD:
+    replace:
+      source: $GT
+      replace: ^Distinct$
+      by: distinct
+fix: Predicate::$METHOD($LHS, $RHS)

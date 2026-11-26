@@ -1,0 +1,11 @@
+id: kernel-itertools-try-collect
+valid:
+  - 'fn f() { let values = input.collect::<Vec<_>>(); }'
+  - 'fn f() { let values: Vec<_> = input.try_collect()?; }'
+  - 'fn f() { let count = input.collect::<KernelResult<HashSet<_>>>()?; }'
+  - 'fn f() { let mut out = Vec::new(); for item in input { log(item); out.push(item?); } }'
+invalid:
+  - 'fn f() { let values = input.collect::<KernelResult<Vec<_>>>()?; }'
+  - 'fn f() { let values = input.collect::<Result<Vec<_>, Error>>()?; }'
+  - 'fn f() { let values = input.collect::<std::result::Result<Vec<_>, Error>>()?; }'
+  - 'fn f() { let values = input.collect::<KernelResult<Vec<_>, OtherError>>()?; }'

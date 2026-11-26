@@ -1,0 +1,22 @@
+id: kernel-itertools-collect-vec
+language: Rust
+severity: info
+message: Use collect_vec for a necessary Vec when Itertools is already imported.
+note: First eliminate unnecessary materialization. This AST check requires a direct file-level Itertools import, but does not resolve custom collect methods or determine whether a Vec is needed.
+rule:
+  all:
+    - pattern: $ITER.collect::<Vec<_>>()
+    - inside:
+        kind: source_file
+        has:
+          any:
+            - pattern: use itertools::Itertools;
+            - pattern: use itertools::Itertools as _;
+        stopBy: end
+    - not:
+        inside:
+          any:
+            - pattern: $SOURCE.collect::<Vec<_>>().join($SEP)
+            - pattern: $SOURCE.split($SEP).collect::<Vec<_>>()[..]
+          stopBy: end
+fix: $ITER.collect_vec()

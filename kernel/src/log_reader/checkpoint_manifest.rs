@@ -45,7 +45,7 @@ impl CheckpointManifestReader {
         let actions = match manifest.extension.as_str() {
             "json" => engine.json_handler().read_json_files(
                 std::slice::from_ref(&manifest.location),
-                read_schema.clone(),
+                read_schema,
                 None,
             )?,
             "parquet" => engine.parquet_handler().read_parquet_files(

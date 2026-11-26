@@ -195,8 +195,7 @@ impl<'col> StatsColumnFilter<'col> {
     pub(crate) fn should_include_for_requested(&self) -> bool {
         self.requested_trie
             .as_ref()
-            .map(|trie| trie.contains_prefix_of(&self.path))
-            .unwrap_or(true)
+            .is_none_or(|trie| trie.contains_prefix_of(&self.path))
     }
 
     /// Returns true if the current path is a required column (e.g. clustering column).

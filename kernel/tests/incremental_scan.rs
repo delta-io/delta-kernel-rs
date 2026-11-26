@@ -110,7 +110,7 @@ async fn within_range_cancellation(
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string(vec![TestAction::Metadata]),
+        actions_to_string([TestAction::Metadata]),
     )
     .await?;
     let target_version = commits.len() as u64;
@@ -150,21 +150,21 @@ async fn picks_up_staged_commits_from_log_tail() -> Result<(), Box<dyn std::erro
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string_catalog_managed(vec![TestAction::Metadata]),
+        actions_to_string_catalog_managed([TestAction::Metadata]),
     )
     .await?;
     let staged1 = add_staged_commit(
         table_root,
         storage.as_ref(),
         1,
-        actions_to_string(vec![TestAction::Add("staged-1.parquet".to_string())]),
+        actions_to_string([TestAction::Add("staged-1.parquet".to_string())]),
     )
     .await?;
     let staged2 = add_staged_commit(
         table_root,
         storage.as_ref(),
         2,
-        actions_to_string(vec![TestAction::Add("staged-2.parquet".to_string())]),
+        actions_to_string([TestAction::Add("staged-2.parquet".to_string())]),
     )
     .await?;
 
@@ -215,7 +215,7 @@ async fn commit_with_no_live_adds(
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string(vec![TestAction::Metadata]),
+        actions_to_string([TestAction::Metadata]),
     )
     .await?;
     add_commit(
@@ -252,14 +252,14 @@ async fn next_returns_none_after_exhaustion() -> Result<(), Box<dyn std::error::
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string(vec![TestAction::Metadata]),
+        actions_to_string([TestAction::Metadata]),
     )
     .await?;
     add_commit(
         table_root,
         storage.as_ref(),
         1,
-        actions_to_string(vec![TestAction::Metadata]),
+        actions_to_string([TestAction::Metadata]),
     )
     .await?;
 
@@ -417,14 +417,14 @@ async fn missing_commit_file_surfaces_error_during_iteration()
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string(vec![TestAction::Metadata]),
+        actions_to_string([TestAction::Metadata]),
     )
     .await?;
     add_commit(
         table_root,
         storage.as_ref(),
         1,
-        actions_to_string(vec![TestAction::Add("a.parquet".to_string())]),
+        actions_to_string([TestAction::Add("a.parquet".to_string())]),
     )
     .await?;
 
@@ -443,9 +443,8 @@ async fn missing_commit_file_surfaces_error_during_iteration()
     let item = stream
         .next()
         .expect("stream should yield an error item before exhausting");
-    let err = match item {
-        Ok(_) => panic!("expected FileNotFound from the stream, got an Ok batch"),
-        Err(e) => e,
+    let Err(err) = item else {
+        panic!("expected FileNotFound from the stream, got an Ok batch")
     };
     assert!(
         matches!(err, delta_kernel::KernelError::FileNotFound(_)),
@@ -482,14 +481,14 @@ async fn rejects_invalid_base_version(
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string(vec![TestAction::Metadata]),
+        actions_to_string([TestAction::Metadata]),
     )
     .await?;
     add_commit(
         table_root,
         storage.as_ref(),
         1,
-        actions_to_string(vec![TestAction::Add("a.parquet".to_string())]),
+        actions_to_string([TestAction::Add("a.parquet".to_string())]),
     )
     .await?;
 
@@ -524,14 +523,14 @@ async fn compaction_file_in_range_is_ignored() -> Result<(), Box<dyn std::error:
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string(vec![TestAction::Metadata]),
+        actions_to_string([TestAction::Metadata]),
     )
     .await?;
     add_commit(
         table_root,
         storage.as_ref(),
         1,
-        actions_to_string(vec![
+        actions_to_string([
             TestAction::Add("A".to_string()),
             TestAction::Add("B".to_string()),
         ]),
@@ -541,14 +540,14 @@ async fn compaction_file_in_range_is_ignored() -> Result<(), Box<dyn std::error:
         table_root,
         storage.as_ref(),
         2,
-        actions_to_string(vec![TestAction::Remove("A".to_string())]),
+        actions_to_string([TestAction::Remove("A".to_string())]),
     )
     .await?;
     add_commit(
         table_root,
         storage.as_ref(),
         3,
-        actions_to_string(vec![TestAction::Add("C".to_string())]),
+        actions_to_string([TestAction::Add("C".to_string())]),
     )
     .await?;
 
@@ -586,14 +585,14 @@ async fn into_summary_returns_live_keys() -> Result<(), Box<dyn std::error::Erro
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string(vec![TestAction::Metadata]),
+        actions_to_string([TestAction::Metadata]),
     )
     .await?;
     add_commit(
         table_root,
         storage.as_ref(),
         1,
-        actions_to_string(vec![
+        actions_to_string([
             TestAction::Add("A".to_string()),
             TestAction::Add("B".to_string()),
         ]),
@@ -603,7 +602,7 @@ async fn into_summary_returns_live_keys() -> Result<(), Box<dyn std::error::Erro
         table_root,
         storage.as_ref(),
         2,
-        actions_to_string(vec![
+        actions_to_string([
             TestAction::Remove("A".to_string()),
             TestAction::Add("C".to_string()),
         ]),
@@ -642,28 +641,28 @@ async fn streaming_yields_batches_newest_first_skipping_cancelled_commits()
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string(vec![TestAction::Metadata]),
+        actions_to_string([TestAction::Metadata]),
     )
     .await?;
     add_commit(
         table_root,
         storage.as_ref(),
         1,
-        actions_to_string(vec![TestAction::Add("A".to_string())]),
+        actions_to_string([TestAction::Add("A".to_string())]),
     )
     .await?;
     add_commit(
         table_root,
         storage.as_ref(),
         2,
-        actions_to_string(vec![TestAction::Add("B".to_string())]),
+        actions_to_string([TestAction::Add("B".to_string())]),
     )
     .await?;
     add_commit(
         table_root,
         storage.as_ref(),
         3,
-        actions_to_string(vec![
+        actions_to_string([
             TestAction::Remove("A".to_string()),
             TestAction::Remove("B".to_string()),
         ]),
@@ -673,7 +672,7 @@ async fn streaming_yields_batches_newest_first_skipping_cancelled_commits()
         table_root,
         storage.as_ref(),
         4,
-        actions_to_string(vec![TestAction::Add("C".to_string())]),
+        actions_to_string([TestAction::Add("C".to_string())]),
     )
     .await?;
 
@@ -720,21 +719,21 @@ async fn mixed_intra_batch_selection_vector() -> Result<(), Box<dyn std::error::
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string(vec![TestAction::Metadata]),
+        actions_to_string([TestAction::Metadata]),
     )
     .await?;
     add_commit(
         table_root,
         storage.as_ref(),
         1,
-        actions_to_string(vec![TestAction::Add("A".to_string())]),
+        actions_to_string([TestAction::Add("A".to_string())]),
     )
     .await?;
     add_commit(
         table_root,
         storage.as_ref(),
         2,
-        actions_to_string(vec![
+        actions_to_string([
             TestAction::Add("B".to_string()),
             TestAction::Add("C".to_string()),
             TestAction::Add("D".to_string()),
@@ -745,7 +744,7 @@ async fn mixed_intra_batch_selection_vector() -> Result<(), Box<dyn std::error::
         table_root,
         storage.as_ref(),
         3,
-        actions_to_string(vec![
+        actions_to_string([
             TestAction::Remove("B".to_string()),
             TestAction::Remove("D".to_string()),
         ]),
@@ -949,13 +948,10 @@ async fn classifies_metadata_only_re_adds(
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string(vec![TestAction::Metadata]),
+        actions_to_string([TestAction::Metadata]),
     )
     .await?;
-    let actions: Vec<TestAction> = range_adds
-        .iter()
-        .map(|p| TestAction::Add(p.to_string()))
-        .collect();
+    let actions = range_adds.iter().map(|p| TestAction::Add(p.to_string()));
     add_commit(table_root, storage.as_ref(), 1, actions_to_string(actions)).await?;
 
     let target = Snapshot::builder_for(table_url)
@@ -988,14 +984,14 @@ async fn into_summary_after_manual_streaming_classifies_duplicates()
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string(vec![TestAction::Metadata]),
+        actions_to_string([TestAction::Metadata]),
     )
     .await?;
     add_commit(
         table_root,
         storage.as_ref(),
         1,
-        actions_to_string(vec![
+        actions_to_string([
             TestAction::Add("brand-new.parquet".to_string()),
             TestAction::Add("re-added.parquet".to_string()),
         ]),
@@ -1044,14 +1040,14 @@ async fn predicate_variants_match_iterator_variants() -> Result<(), Box<dyn std:
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string(vec![TestAction::Metadata]),
+        actions_to_string([TestAction::Metadata]),
     )
     .await?;
     add_commit(
         table_root,
         storage.as_ref(),
         1,
-        actions_to_string(vec![
+        actions_to_string([
             TestAction::Add("brand-new.parquet".to_string()),
             TestAction::Add("re-added.parquet".to_string()),
         ]),
@@ -1107,14 +1103,14 @@ async fn empty_base_keys_produces_no_duplicates() -> Result<(), Box<dyn std::err
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string(vec![TestAction::Metadata]),
+        actions_to_string([TestAction::Metadata]),
     )
     .await?;
     add_commit(
         table_root,
         storage.as_ref(),
         1,
-        actions_to_string(vec![
+        actions_to_string([
             TestAction::Add("a.parquet".to_string()),
             TestAction::Remove("gone.parquet".to_string()),
         ]),
@@ -1643,7 +1639,7 @@ async fn incremental_scan_from_cached_snapshot_matches_full_scan_with_timezone(
             .iter()
             .map(|file| file.path().to_string()),
     );
-    let expected: HashSet<_> = expected_paths.iter().map(|path| path.to_string()).collect();
+    let expected: HashSet<_> = expected_paths.iter().map(ToString::to_string).collect();
     assert_eq!(base_file_list, expected);
     assert_eq!(base_file_list, target_file_list);
     Ok(())
@@ -1724,7 +1720,7 @@ async fn pushdown_keeps_only_matching_added_files(
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string(vec![TestAction::Metadata]),
+        actions_to_string([TestAction::Metadata]),
     )
     .await?;
     // low: id in [0, 9]; mid: id in [10, 19]; high: id in [20, 30]. `id > 25` can only match
@@ -1767,7 +1763,7 @@ async fn added_file_without_stats_is_always_kept() -> Result<(), Box<dyn std::er
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string(vec![TestAction::Metadata]),
+        actions_to_string([TestAction::Metadata]),
     )
     .await?;
     // no_stats has no stats; in_range has id in [20, 30]. Both must survive `id > 25`:
@@ -1813,7 +1809,7 @@ async fn removes_are_never_filtered_by_predicate() -> Result<(), Box<dyn std::er
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string(vec![TestAction::Metadata]),
+        actions_to_string([TestAction::Metadata]),
     )
     .await?;
     // v1 adds gone.parquet (id in [0, 5], which `id > 25` would exclude).
@@ -1877,7 +1873,7 @@ async fn static_skip_all_and_tautology(
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string(vec![TestAction::Metadata]),
+        actions_to_string([TestAction::Metadata]),
     )
     .await?;
     // v1 adds two files and removes a third, so removes is non-empty regardless of the predicate.
@@ -1923,7 +1919,7 @@ async fn against_base_classification_composes_with_predicate()
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string(vec![TestAction::Metadata]),
+        actions_to_string([TestAction::Metadata]),
     )
     .await?;
     // matches.parquet (id in [20, 30]) survives `id > 25`; dropped.parquet (id in [0, 5]) does not.
@@ -1974,7 +1970,7 @@ async fn pruned_newest_add_suppresses_older_matching_duplicate()
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string(vec![TestAction::Metadata]),
+        actions_to_string([TestAction::Metadata]),
     )
     .await?;
     // v1: dupe.parquet with a range that WOULD match `id > 25`.
@@ -2026,7 +2022,7 @@ async fn unknown_column_predicate_fails_at_build() -> Result<(), Box<dyn std::er
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string(vec![TestAction::Metadata]),
+        actions_to_string([TestAction::Metadata]),
     )
     .await?;
     add_commit(
@@ -2068,7 +2064,7 @@ async fn partition_column_predicate_prunes_added_files() -> Result<(), Box<dyn s
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string_partitioned(vec![TestAction::Metadata]),
+        actions_to_string_partitioned([TestAction::Metadata]),
     )
     .await?;
     let v1 = [
@@ -2112,7 +2108,7 @@ async fn mixed_data_and_partition_predicate_prunes_on_both()
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string_partitioned(vec![TestAction::Metadata]),
+        actions_to_string_partitioned([TestAction::Metadata]),
     )
     .await?;
     // match: id in [20,30] and val=x. wrong_val: in-range id but val=y. wrong_id: val=x but
@@ -2250,7 +2246,7 @@ async fn column_free_predicate_keeps_all_added_files() -> Result<(), Box<dyn std
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string(vec![TestAction::Metadata]),
+        actions_to_string([TestAction::Metadata]),
     )
     .await?;
     let v1 = [

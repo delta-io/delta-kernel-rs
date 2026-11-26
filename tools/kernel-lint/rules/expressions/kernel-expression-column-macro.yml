@@ -1,0 +1,18 @@
+id: kernel-expression-column-macro
+language: Rust
+severity: warning
+message: Use col! for expression columns built from simple literal segments.
+note: Resolve Kernel Expression and import col. The macro splits dots in string literals, so a single
+  dotted constructor segment is excluded. Keep runtime/non-simple names and constructor tests.
+rule:
+  pattern: Expression::column($SEGMENTS)
+constraints:
+  SEGMENTS:
+    regex: ^\[\s*"[A-Za-z_][A-Za-z0-9_]*"(?:\s*,\s*"[A-Za-z_][A-Za-z0-9_]*")*\s*,?\s*\]$
+fix: col!($ARGS)
+transform:
+  ARGS:
+    replace:
+      source: $SEGMENTS
+      replace: ^\[([\s\S]*)\]$
+      by: $1

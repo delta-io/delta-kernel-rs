@@ -535,7 +535,7 @@ impl BuiltCrcTest {
             .fold_with(version, SnapshotBuilder::at_version)
             .build(&self.engine)
             .unwrap();
-        let label = version.map_or("latest".to_string(), |v| format!("v{v}"));
+        let label = version.map_or_else(|| "latest".to_string(), |v| format!("v{v}"));
         (snapshot, label)
     }
 

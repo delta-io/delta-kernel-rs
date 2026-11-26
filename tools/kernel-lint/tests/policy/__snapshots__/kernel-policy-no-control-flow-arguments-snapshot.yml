@@ -1,0 +1,212 @@
+id: kernel-policy-no-control-flow-arguments
+snapshots:
+  fn f() { consume(&(match input { Some(value) => value, None => 0 })); }:
+    labels:
+    - source: match input { Some(value) => value, None => 0 }
+      style: primary
+      start: 19
+      end: 66
+    - source: consume(&(match input { Some(value) => value, None => 0 }))
+      style: secondary
+      start: 9
+      end: 68
+    - source: (&(match input { Some(value) => value, None => 0 }))
+      style: secondary
+      start: 16
+      end: 68
+  fn f() { consume(((if condition { first() } else { second() }))); }:
+    labels:
+    - source: if condition { first() } else { second() }
+      style: primary
+      start: 19
+      end: 61
+    - source: consume(((if condition { first() } else { second() })))
+      style: secondary
+      start: 9
+      end: 64
+    - source: (((if condition { first() } else { second() })))
+      style: secondary
+      start: 16
+      end: 64
+  fn f() { consume((if condition { Ok(first()) } else { Err(error) })?); }:
+    labels:
+    - source: if condition { Ok(first()) } else { Err(error) }
+      style: primary
+      start: 18
+      end: 66
+    - source: consume((if condition { Ok(first()) } else { Err(error) })?)
+      style: secondary
+      start: 9
+      end: 69
+    - source: ((if condition { Ok(first()) } else { Err(error) })?)
+      style: secondary
+      start: 16
+      end: 69
+  fn f() { consume(first(), if condition { second() } else { third() }); }:
+    labels:
+    - source: if condition { second() } else { third() }
+      style: primary
+      start: 26
+      end: 68
+    - source: consume(first(), if condition { second() } else { third() })
+      style: secondary
+      start: 9
+      end: 69
+    - source: (first(), if condition { second() } else { third() })
+      style: secondary
+      start: 16
+      end: 69
+  fn f() { consume(if condition { first() } else { second() }); }:
+    labels:
+    - source: if condition { first() } else { second() }
+      style: primary
+      start: 17
+      end: 59
+    - source: consume(if condition { first() } else { second() })
+      style: secondary
+      start: 9
+      end: 60
+    - source: (if condition { first() } else { second() })
+      style: secondary
+      start: 16
+      end: 60
+  fn f() { consume(if condition { inner(match input { Some(value) => value, None => 0 }) } else { 0 }); }:
+    labels:
+    - source: if condition { inner(match input { Some(value) => value, None => 0 }) } else { 0 }
+      style: primary
+      start: 17
+      end: 99
+    - source: consume(if condition { inner(match input { Some(value) => value, None => 0 }) } else { 0 })
+      style: secondary
+      start: 9
+      end: 100
+    - source: (if condition { inner(match input { Some(value) => value, None => 0 }) } else { 0 })
+      style: secondary
+      start: 16
+      end: 100
+  fn f() { consume(if first { one() } else if second { two() } else { three() }); }:
+    labels:
+    - source: if first { one() } else if second { two() } else { three() }
+      style: primary
+      start: 17
+      end: 77
+    - source: consume(if first { one() } else if second { two() } else { three() })
+      style: secondary
+      start: 9
+      end: 78
+    - source: (if first { one() } else if second { two() } else { three() })
+      style: secondary
+      start: 16
+      end: 78
+  fn f() { consume(if let Some(value) = input { value } else { 0 }); }:
+    labels:
+    - source: if let Some(value) = input { value } else { 0 }
+      style: primary
+      start: 17
+      end: 64
+    - source: consume(if let Some(value) = input { value } else { 0 })
+      style: secondary
+      start: 9
+      end: 65
+    - source: (if let Some(value) = input { value } else { 0 })
+      style: secondary
+      start: 16
+      end: 65
+  fn f() { consume(match input { Some(value) => if condition { value } else { 0 }, None => 0 }); }:
+    labels:
+    - source: match input { Some(value) => if condition { value } else { 0 }, None => 0 }
+      style: primary
+      start: 17
+      end: 92
+    - source: consume(match input { Some(value) => if condition { value } else { 0 }, None => 0 })
+      style: secondary
+      start: 9
+      end: 93
+    - source: (match input { Some(value) => if condition { value } else { 0 }, None => 0 })
+      style: secondary
+      start: 16
+      end: 93
+  fn f() { consume(match input { Some(value) => value, None => 0 }); }:
+    labels:
+    - source: match input { Some(value) => value, None => 0 }
+      style: primary
+      start: 17
+      end: 64
+    - source: consume(match input { Some(value) => value, None => 0 })
+      style: secondary
+      start: 9
+      end: 65
+    - source: (match input { Some(value) => value, None => 0 })
+      style: secondary
+      start: 16
+      end: 65
+  fn f() { consume(|| inner(match input { Some(value) => value, None => 0 })); }:
+    labels:
+    - source: match input { Some(value) => value, None => 0 }
+      style: primary
+      start: 26
+      end: 73
+    - source: inner(match input { Some(value) => value, None => 0 })
+      style: secondary
+      start: 20
+      end: 74
+    - source: (match input { Some(value) => value, None => 0 })
+      style: secondary
+      start: 25
+      end: 74
+  fn f() { consume::<Type>(if condition { first() } else { second() }); }:
+    labels:
+    - source: if condition { first() } else { second() }
+      style: primary
+      start: 25
+      end: 67
+    - source: consume::<Type>(if condition { first() } else { second() })
+      style: secondary
+      start: 9
+      end: 68
+    - source: (if condition { first() } else { second() })
+      style: secondary
+      start: 24
+      end: 68
+  fn f() { object.method(if condition { first() } else { second() }); }:
+    labels:
+    - source: if condition { first() } else { second() }
+      style: primary
+      start: 23
+      end: 65
+    - source: object.method(if condition { first() } else { second() })
+      style: secondary
+      start: 9
+      end: 66
+    - source: (if condition { first() } else { second() })
+      style: secondary
+      start: 22
+      end: 66
+  fn f() { object.method::<Type>(match input { Some(value) => value, None => 0 }); }:
+    labels:
+    - source: match input { Some(value) => value, None => 0 }
+      style: primary
+      start: 31
+      end: 78
+    - source: object.method::<Type>(match input { Some(value) => value, None => 0 })
+      style: secondary
+      start: 9
+      end: 79
+    - source: (match input { Some(value) => value, None => 0 })
+      style: secondary
+      start: 30
+      end: 79
+  fn f() { outer(inner(match input { Some(value) => value, None => 0 })); }:
+    labels:
+    - source: match input { Some(value) => value, None => 0 }
+      style: primary
+      start: 21
+      end: 68
+    - source: inner(match input { Some(value) => value, None => 0 })
+      style: secondary
+      start: 15
+      end: 69
+    - source: (match input { Some(value) => value, None => 0 })
+      style: secondary
+      start: 20
+      end: 69

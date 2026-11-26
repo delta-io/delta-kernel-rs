@@ -581,8 +581,7 @@ async fn commit_rejects_add_with_invalid_partition_keys(
             AddFilePartitionKeyModify::Drop { key } => {
                 let key = logical_schema
                     .field(key)
-                    .map(|field| field.physical_name(mode))
-                    .unwrap_or(key);
+                    .map_or(key, |field| field.physical_name(mode));
                 AddFilePartitionKeyModify::Drop { key }
             }
             insertion => insertion,

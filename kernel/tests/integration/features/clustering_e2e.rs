@@ -13,7 +13,6 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::expressions::column_name;
 use delta_kernel::schema::schema_ref;
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::transaction::CommitResult;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use rstest::rstest;
@@ -53,13 +52,7 @@ async fn test_clustered_table_write_and_checkpoint(
         let table_url = delta_kernel::try_parse_uri(&table_path)?;
         Snapshot::builder_for(table_url).build(engine.as_ref())?
     } else {
-        match create_result {
-            CommitResult::Committed(committed) => committed
-                .post_commit_snapshot()
-                .expect("post-commit snapshot should exist")
-                .clone(),
-            other => panic!("Expected Committed, got: {other:?}"),
-        }
+        create_result.unwrap_post_commit_snapshot()
     };
 
     // First write: 3 rows

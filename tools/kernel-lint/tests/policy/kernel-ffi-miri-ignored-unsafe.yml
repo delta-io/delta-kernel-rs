@@ -1,0 +1,8 @@
+id: kernel-ffi-miri-ignored-unsafe
+valid:
+- '#[test] fn f() { unsafe { go(); } }'
+- '#[cfg_attr(miri, ignore)] #[test] fn f() { safe(); }'
+- '#[ignore] #[test] fn f() { unsafe { go(); } }'
+invalid:
+- '#[cfg_attr(miri, ignore)] #[test] fn f() { unsafe { go(); } }'
+- '#[test] #[cfg_attr(miri, ignore = "unsupported")] fn f() { unsafe { go(); } }'

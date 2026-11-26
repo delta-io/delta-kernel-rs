@@ -1,0 +1,44 @@
+id: kernel-test-commit-result-helper
+snapshots:
+  '#[cfg(test)] mod tests { fn helper() { let x = match result { CommitResult::Committed(x) => x, other => panic!("bad") }; } }':
+    labels:
+    - source: match result { CommitResult::Committed(x) => x, other => panic!("bad") }
+      style: primary
+      start: 47
+      end: 119
+    - source: mod tests { fn helper() { let x = match result { CommitResult::Committed(x) => x, other => panic!("bad") }; } }
+      style: secondary
+      start: 13
+      end: 124
+  ? |-
+    #[test]
+    fn checks() { let x = match result { CommitResult::Committed(x) => x, other => panic!("bad: {other:?}") }; }
+  : labels:
+    - source: 'match result { CommitResult::Committed(x) => x, other => panic!("bad: {other:?}") }'
+      style: primary
+      start: 30
+      end: 113
+    - source: '#[test]'
+      style: secondary
+      start: 0
+      end: 7
+    - source: 'fn checks() { let x = match result { CommitResult::Committed(x) => x, other => panic!("bad: {other:?}") }; }'
+      style: secondary
+      start: 8
+      end: 116
+  ? |-
+    #[test]
+    fn checks() { let x = match result { CommitResult::Committed(x) => x.post_commit_snapshot().expect("snapshot").clone(), other => panic!("bad") }; }
+  : labels:
+    - source: match result { CommitResult::Committed(x) => x.post_commit_snapshot().expect("snapshot").clone(), other => panic!("bad") }
+      style: primary
+      start: 30
+      end: 152
+    - source: '#[test]'
+      style: secondary
+      start: 0
+      end: 7
+    - source: fn checks() { let x = match result { CommitResult::Committed(x) => x.post_commit_snapshot().expect("snapshot").clone(), other => panic!("bad") }; }
+      style: secondary
+      start: 8
+      end: 155

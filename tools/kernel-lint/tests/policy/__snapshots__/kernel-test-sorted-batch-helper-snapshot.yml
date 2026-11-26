@@ -1,0 +1,52 @@
+id: kernel-test-sorted-batch-helper
+snapshots:
+  ? |-
+    #[test]
+    fn checks() { let x = pretty_format_batches(&batches).unwrap().to_string(); let mut rows: Vec<_> = x.trim().lines().collect(); rows.sort_unstable(); assert_eq!(rows, expected); }
+  : labels:
+    - source: pretty_format_batches(&batches)
+      style: primary
+      start: 30
+      end: 61
+    - source: 'let mut rows: Vec<_> = x.trim().lines().collect();'
+      style: secondary
+      start: 84
+      end: 134
+    - source: rows.sort_unstable()
+      style: secondary
+      start: 135
+      end: 155
+    - source: 'fn checks() { let x = pretty_format_batches(&batches).unwrap().to_string(); let mut rows: Vec<_> = x.trim().lines().collect(); rows.sort_unstable(); assert_eq!(rows, expected); }'
+      style: secondary
+      start: 8
+      end: 186
+    - source: '#[test]'
+      style: secondary
+      start: 0
+      end: 7
+    - source: 'fn checks() { let x = pretty_format_batches(&batches).unwrap().to_string(); let mut rows: Vec<_> = x.trim().lines().collect(); rows.sort_unstable(); assert_eq!(rows, expected); }'
+      style: secondary
+      start: 8
+      end: 186
+  ? 'mod tests { fn assert_batches_eq(batches: &[RecordBatch], expected: &str) { let x = pretty_format_batches(batches).unwrap().to_string(); let sort = |s: &str| { let mut lines: Vec<_> = s.trim().lines().collect(); lines.sort_unstable(); lines }; assert_eq!(sort(&x), sort(expected)); } }'
+  : labels:
+    - source: pretty_format_batches(batches)
+      style: primary
+      start: 84
+      end: 114
+    - source: 'let mut lines: Vec<_> = s.trim().lines().collect();'
+      style: secondary
+      start: 160
+      end: 211
+    - source: lines.sort_unstable()
+      style: secondary
+      start: 212
+      end: 233
+    - source: 'fn assert_batches_eq(batches: &[RecordBatch], expected: &str) { let x = pretty_format_batches(batches).unwrap().to_string(); let sort = |s: &str| { let mut lines: Vec<_> = s.trim().lines().collect(); lines.sort_unstable(); lines }; assert_eq!(sort(&x), sort(expected)); }'
+      style: secondary
+      start: 12
+      end: 283
+    - source: 'mod tests { fn assert_batches_eq(batches: &[RecordBatch], expected: &str) { let x = pretty_format_batches(batches).unwrap().to_string(); let sort = |s: &str| { let mut lines: Vec<_> = s.trim().lines().collect(); lines.sort_unstable(); lines }; assert_eq!(sort(&x), sort(expected)); } }'
+      style: secondary
+      start: 0
+      end: 285

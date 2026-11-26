@@ -1,0 +1,20 @@
+id: kernel-expression-lit
+language: Rust
+severity: warning
+message: Use the lit constructor for inline expression literals.
+note: Resolve Kernel Expression. The lit import is required; retain tests specifically exercising Expression::literal.
+  Typed nulls have a separate null_lit rule. The lit helper implementation is excluded to avoid introducing
+  recursion.
+rule:
+  all:
+  - pattern: Expression::literal($VALUE)
+  - not:
+      pattern: Expression::literal(Scalar::Null($TYPE))
+  - not:
+      inside:
+        kind: function_item
+        has:
+          field: name
+          regex: ^lit$
+        stopBy: end
+fix: lit($VALUE)

@@ -355,23 +355,26 @@ pub enum TestAction {
 
 // TODO: We need a better way to mock tables :)
 
-/// Convert a vector of actions into a newline delimited json string, with standard metadata
-pub fn actions_to_string(actions: Vec<TestAction>) -> String {
+/// Serializes actions in iteration order as newline-delimited JSON, with standard metadata.
+pub fn actions_to_string(actions: impl IntoIterator<Item = TestAction>) -> String {
     actions_to_string_with_metadata(actions, METADATA)
 }
 
-/// Convert a vector of actions into a newline delimited json string, with catalog-managed metadata
-pub fn actions_to_string_catalog_managed(actions: Vec<TestAction>) -> String {
+/// Serializes actions in iteration order as newline-delimited JSON, with catalog-managed metadata.
+pub fn actions_to_string_catalog_managed(actions: impl IntoIterator<Item = TestAction>) -> String {
     actions_to_string_with_metadata(actions, CATALOG_MANAGED_METADATA)
 }
 
-/// Convert a vector of actions into a newline delimited json string, with metadata including a
-/// partition column
-pub fn actions_to_string_partitioned(actions: Vec<TestAction>) -> String {
+/// Serializes actions in iteration order as newline-delimited JSON, with partition-column metadata.
+pub fn actions_to_string_partitioned(actions: impl IntoIterator<Item = TestAction>) -> String {
     actions_to_string_with_metadata(actions, METADATA_WITH_PARTITION_COLS)
 }
 
-pub fn actions_to_string_with_metadata(actions: Vec<TestAction>, metadata: &str) -> String {
+/// Serializes actions in iteration order as newline-delimited JSON, using the supplied metadata.
+pub fn actions_to_string_with_metadata(
+    actions: impl IntoIterator<Item = TestAction>,
+    metadata: &str,
+) -> String {
     actions
         .into_iter()
         .map(|test_action| match test_action {
@@ -1632,16 +1635,14 @@ pub fn assert_schema_has_field(schema: &delta_kernel::schema::StructType, path: 
 }
 
 pub fn assert_result_error_with_message<T, E: ToString>(res: KernelResult<T, E>, message: &str) {
-    match res {
-        Ok(_) => panic!("Expected error, but got Ok result"),
-        Err(error) => {
-            let error_str = error.to_string();
-            assert!(
-                error_str.contains(message),
-                "Error message does not contain the expected message.\nExpected message:\t{message}\nActual message:\t\t{error_str}"
-            );
-        }
-    }
+    let Err(error) = res else {
+        panic!("Expected error, but got Ok result");
+    };
+    let error_str = error.to_string();
+    assert!(
+        error_str.contains(message),
+        "Error message does not contain the expected message.\nExpected message:\t{message}\nActual message:\t\t{error_str}"
+    );
 }
 
 /// Collect `row_id` values from scan batches produced with a `MetadataColumnSpec::RowId` schema.
@@ -2046,14 +2047,13 @@ pub fn read_add_infos(snapshot: &Snapshot, engine: &impl Engine) -> KernelResult
         let actions_batch = batch_result?;
         let engine_data = ArrowEngineData::try_from_engine_data(actions_batch.actions)?;
         let record_batch = engine_data.record_batch();
-        let add_struct = match record_batch.schema().index_of("add").ok().and_then(|idx| {
+        let Some(add_struct) = record_batch.schema().index_of("add").ok().and_then(|idx| {
             record_batch
                 .column(idx)
                 .as_any()
                 .downcast_ref::<StructArray>()
-        }) {
-            Some(s) => s,
-            None => continue,
+        }) else {
+            continue;
         };
         let path_arr = add_struct
             .column_by_name("path")
@@ -2063,16 +2063,17 @@ pub fn read_add_infos(snapshot: &Snapshot, engine: &impl Engine) -> KernelResult
             .and_then(|c| c.as_any().downcast_ref::<StringArray>());
         let len = add_struct.len();
         for i in 0..len {
-            if let Some(path) = path_arr.and_then(|a| (!a.is_null(i)).then(|| a.value(i))) {
-                let stats = stats_arr
-                    .and_then(|a| (!a.is_null(i)).then(|| a.value(i)))
-                    .map(serde_json::from_str)
-                    .transpose()?;
-                actions.push(AddInfo {
-                    path: path.to_string(),
-                    stats,
-                });
-            }
+            let Some(path) = path_arr.and_then(|a| (!a.is_null(i)).then(|| a.value(i))) else {
+                continue;
+            };
+            let stats = stats_arr
+                .and_then(|a| (!a.is_null(i)).then(|| a.value(i)))
+                .map(serde_json::from_str)
+                .transpose()?;
+            actions.push(AddInfo {
+                path: path.to_string(),
+                stats,
+            });
         }
     }
     Ok(actions)
@@ -2265,9 +2266,8 @@ pub fn remove_all_and_get_remove_actions(
     for sm in all_scan_metadata {
         txn.remove_files(sm.scan_files);
     }
-    let committed = match txn.commit(engine)? {
-        CommitResult::Committed(c) => c,
-        _ => panic!("Transaction should be committed"),
+    let CommitResult::Committed(committed) = txn.commit(engine)? else {
+        panic!("Transaction should be committed");
     };
     Ok(read_actions_from_commit(
         table_url,

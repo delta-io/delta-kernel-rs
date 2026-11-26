@@ -1845,13 +1845,11 @@ mod tests {
 
             // UC committer returns success from our mock callback
             let committed = ok_or_panic(commit_result);
-            let post_commit_snapshot =
-                match unsafe { committed_transaction_post_commit_snapshot(&committed) } {
-                    OptionalValue::Some(snapshot) => snapshot,
-                    OptionalValue::None => {
-                        panic!("UC commit should produce a post-commit snapshot")
-                    }
-                };
+            let OptionalValue::Some(post_commit_snapshot) =
+                (unsafe { committed_transaction_post_commit_snapshot(&committed) })
+            else {
+                panic!("UC commit should produce a post-commit snapshot");
+            };
             assert_eq!(unsafe { version(post_commit_snapshot.shallow_copy()) }, 1);
 
             let publish_committer = unsafe {
@@ -4241,11 +4239,10 @@ mod tests {
 
         assert_eq!(unsafe { committed_transaction_version(&committed) }, 0);
 
-        let snap = match unsafe { committed_transaction_post_commit_snapshot(&committed) } {
-            OptionalValue::Some(snap) => snap,
-            OptionalValue::None => {
-                panic!("create_table commit should produce a post-commit snapshot")
-            }
+        let OptionalValue::Some(snap) =
+            (unsafe { committed_transaction_post_commit_snapshot(&committed) })
+        else {
+            panic!("create_table commit should produce a post-commit snapshot");
         };
         assert_eq!(unsafe { version(snap.shallow_copy()) }, 0);
 
@@ -4280,20 +4277,18 @@ mod tests {
         let v = unsafe { committed_transaction_version(&committed) };
         assert_eq!(v, 2);
 
-        let snap = match unsafe { committed_transaction_post_commit_snapshot(&committed) } {
-            OptionalValue::Some(snap) => snap,
-            OptionalValue::None => {
-                panic!("existing-table commit should produce a post-commit snapshot")
-            }
+        let OptionalValue::Some(snap) =
+            (unsafe { committed_transaction_post_commit_snapshot(&committed) })
+        else {
+            panic!("existing-table commit should produce a post-commit snapshot");
         };
         assert_eq!(unsafe { version(snap.shallow_copy()) }, v);
 
         // Calling the accessor a second time must yield an independent handle (Arc clone).
-        let snap2 = match unsafe { committed_transaction_post_commit_snapshot(&committed) } {
-            OptionalValue::Some(snap) => snap,
-            OptionalValue::None => {
-                panic!("existing-table commit should produce a second post-commit snapshot")
-            }
+        let OptionalValue::Some(snap2) =
+            (unsafe { committed_transaction_post_commit_snapshot(&committed) })
+        else {
+            panic!("existing-table commit should produce a second post-commit snapshot");
         };
         assert_eq!(unsafe { version(snap2.shallow_copy()) }, v);
 

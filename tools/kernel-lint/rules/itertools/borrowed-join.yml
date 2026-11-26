@@ -1,0 +1,13 @@
+id: kernel-itertools-borrowed-join
+language: Rust
+severity: info
+message: Join borrowed schema field names without cloning each name or collecting a temporary Vec.
+note: Confirm field_names resolves to Kernel StructType and returns borrowed Strings. This is a syntax-based suggestion, not proof about similarly named user APIs.
+rule:
+  any:
+    - pattern: $SCHEMA.field_names().cloned().collect::<Vec<_>>().join($SEP)
+    - pattern: $SCHEMA.field_names().cloned().collect_vec().join($SEP)
+constraints:
+  SEP:
+    kind: string_literal
+fix: $SCHEMA.field_names().join($SEP)

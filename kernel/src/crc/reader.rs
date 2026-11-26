@@ -61,11 +61,12 @@ pub(crate) fn read_crc_file_or_none(
 }
 
 fn record_storage_failure(error: &KernelError) {
-    record_failure_reason(match error.without_backtrace() {
+    let failure_reason = match error.without_backtrace() {
         KernelError::FileNotFound(_) => CrcReadFailureReason::NotFound,
         KernelError::Cancelled => CrcReadFailureReason::Cancelled,
         _ => CrcReadFailureReason::Error,
-    });
+    };
+    record_failure_reason(failure_reason);
 }
 
 fn record_failure_reason(reason: CrcReadFailureReason) {

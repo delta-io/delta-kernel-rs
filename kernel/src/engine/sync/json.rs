@@ -99,8 +99,7 @@ mod tests {
             ArrowDataType::Utf8,
             true,
         )]));
-        let batch =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(values))])?;
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values))])?;
         Ok(Box::new(ArrowEngineData::new(batch)))
     }
 
@@ -163,7 +162,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_empty_json_file_reports_zero_size() -> KernelResult<()> {
+    fn test_write_empty_json_file_reports_zero_size() {
         let test_dir = TempDir::new().unwrap();
         let path = test_dir.path().join("empty.json");
         let handler = SyncJsonHandler::new(None);
@@ -175,7 +174,6 @@ mod tests {
 
         assert_eq!(written_size, 0);
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
-        Ok(())
     }
 
     // TODO(#2618): Restore once the engine contract helpers move to test_utils and SyncEngine can

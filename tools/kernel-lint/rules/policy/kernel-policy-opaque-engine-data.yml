@@ -1,0 +1,38 @@
+id: kernel-policy-opaque-engine-data
+language: Rust
+severity: warning
+message: Keep EngineData opaque in core protocol code; use visitors rather than ArrowEngineData downcasts.
+note: Path-scoped structural warning, not resolved type proof. Engine adapters and test utilities are excluded;
+  review aliases and inline test scopes. Core code should use RowVisitor/GetData rather than expose concrete engine
+  data.
+rule:
+  all:
+  - any:
+    - pattern: $DATA.as_any().downcast_ref::<ArrowEngineData>()
+    - pattern: $DATA.as_any().downcast_mut::<ArrowEngineData>()
+  - not:
+      matches: test-scope
+utils:
+  test-scope:
+    any:
+    - inside:
+        kind: mod_item
+        regex: (?s)^(pub(?:\([^)]*\))?\s+)?mod\s+tests\b
+        stopBy: end
+    - inside:
+        kind: function_item
+        follows:
+          kind: attribute_item
+          regex: ^#\[(test|tokio::test|rstest::rstest)(\b|\()
+          stopBy:
+            not:
+              kind: attribute_item
+        stopBy: end
+files:
+- kernel/src/**/*.rs
+ignores:
+- kernel/src/engine/**
+- kernel/src/unit_test_utils.rs
+- kernel/src/**/test_utils.rs
+- kernel/src/**/tests.rs
+- kernel/src/**/tests/**

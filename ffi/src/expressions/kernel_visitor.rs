@@ -107,7 +107,7 @@ pub extern "C" fn visit_predicate_and(
     children: &mut EngineIterator,
 ) -> usize {
     let result = Predicate::and_from(
-        children.flat_map(|child| unwrap_kernel_predicate(state, child as usize)),
+        children.filter_map(|child| unwrap_kernel_predicate(state, child as usize)),
     );
     wrap_predicate(state, result)
 }
@@ -683,7 +683,7 @@ pub extern "C" fn visit_predicate_or(
 ) -> usize {
     let result = Predicate::junction(
         JunctionPredicateOp::Or,
-        children.flat_map(|child| unwrap_kernel_predicate(state, child as usize)),
+        children.filter_map(|child| unwrap_kernel_predicate(state, child as usize)),
     );
     wrap_predicate(state, result)
 }
@@ -694,7 +694,7 @@ pub extern "C" fn visit_expression_struct(
     children: &mut EngineIterator,
 ) -> usize {
     let exprs: Vec<Expression> = children
-        .flat_map(|child| unwrap_kernel_expression(state, child as usize))
+        .filter_map(|child| unwrap_kernel_expression(state, child as usize))
         .collect();
     wrap_expression(state, Expression::struct_from(exprs))
 }

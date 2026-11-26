@@ -3957,9 +3957,7 @@ mod tests {
         let small_schema = schema_ref! { nullable "a": INTEGER };
         let wide_schema = Arc::new(
             StructType::try_new(
-                (0..50)
-                    .map(|i| StructField::nullable(format!("field_{i:03}"), DataType::STRING))
-                    .collect::<Vec<_>>(),
+                (0..50).map(|i| StructField::nullable(format!("field_{i:03}"), DataType::STRING)),
             )
             .unwrap(),
         );

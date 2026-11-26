@@ -1,0 +1,20 @@
+id: kernel-test-sorted-batch-helper
+valid:
+- '#[test]
+
+  fn checks() { let x = pretty_format_batches(&batches).unwrap().to_string(); assert_eq!(x, expected); }'
+- '#[test]
+
+  fn checks() { let mut ids = ids; ids.sort_unstable(); assert_eq!(ids, expected); }'
+- fn production() { let x = pretty_format_batches(&batches); rows.sort_unstable(); }
+- '#[test] fn check() { let formatted = pretty_format_batches(&batches).unwrap().to_string(); let mut actual_rows:
+  Vec<_> = formatted.lines().filter(|line| line.starts_with("| value")).collect(); actual_rows.sort_unstable();
+  assert_eq!(actual_rows, expected_rows); }'
+invalid:
+- '#[test]
+
+  fn checks() { let x = pretty_format_batches(&batches).unwrap().to_string(); let mut rows: Vec<_> = x.trim().lines().collect();
+  rows.sort_unstable(); assert_eq!(rows, expected); }'
+- 'mod tests { fn assert_batches_eq(batches: &[RecordBatch], expected: &str) { let x = pretty_format_batches(batches).unwrap().to_string();
+  let sort = |s: &str| { let mut lines: Vec<_> = s.trim().lines().collect(); lines.sort_unstable(); lines }; assert_eq!(sort(&x),
+  sort(expected)); } }'

@@ -384,7 +384,7 @@ mod tests {
 
         let scan_file = get_scan_file(CdfScanFileType::Cdc, Default::default(), None);
 
-        let resolved = resolve_scan_file_dv(&engine, &table_root, scan_file.clone())
+        let resolved = resolve_scan_file_dv(&engine, &table_root, scan_file)
             .unwrap()
             .map(|file| (file.scan_file.scan_type, file.selection_vector))
             .collect_vec();
@@ -400,7 +400,7 @@ mod tests {
 
         let scan_file = get_scan_file(CdfScanFileType::Remove, Default::default(), None);
 
-        let resolved = resolve_scan_file_dv(&engine, &table_root, scan_file.clone())
+        let resolved = resolve_scan_file_dv(&engine, &table_root, scan_file)
             .unwrap()
             .map(|file| (file.scan_file.scan_type, file.selection_vector))
             .collect_vec();
@@ -415,7 +415,7 @@ mod tests {
 
         let scan_file = get_scan_file(CdfScanFileType::Add, Default::default(), None);
 
-        let resolved = resolve_scan_file_dv(&engine, &table_root, scan_file.clone())
+        let resolved = resolve_scan_file_dv(&engine, &table_root, scan_file)
             .unwrap()
             .map(|file| (file.scan_file.scan_type, file.selection_vector))
             .collect_vec();

@@ -55,12 +55,11 @@ async fn basic_snapshot_with_log_tail_staged_commits() -> Result<(), Box<dyn std
     // _delta_log/_staged_commits/1.uuid.json
     // _delta_log/_staged_commits/1.uuid.json // add an unused staged commit at version 1
     // _delta_log/_staged_commits/2.uuid.json
-    let actions = vec![TestAction::Metadata];
     add_commit(
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string_catalog_managed(actions),
+        actions_to_string_catalog_managed([TestAction::Metadata]),
     )
     .await?;
     let path1 = add_staged_commit(table_root, storage.as_ref(), 1, String::from("{}")).await?;
@@ -211,7 +210,7 @@ async fn timestamp_resolution_with_staged_commits() -> Result<(), Box<dyn std::e
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string_catalog_managed(vec![TestAction::Metadata]),
+        actions_to_string_catalog_managed([TestAction::Metadata]),
     )
     .await?;
     let path1 = add_staged_commit(table_root, storage.as_ref(), 1, staged_ict_body(ict_v1)).await?;
@@ -258,11 +257,11 @@ async fn basic_snapshot_with_log_tail() -> Result<(), Box<dyn std::error::Error>
     // _delta_log/0.json
     // _delta_log/1.json
     // _delta_log/2.json
-    let actions = vec![TestAction::Metadata];
+    let actions = [TestAction::Metadata];
     add_commit(table_root, storage.as_ref(), 0, actions_to_string(actions)).await?;
-    let actions = vec![TestAction::Add("file_1.parquet".to_string())];
+    let actions = [TestAction::Add("file_1.parquet".to_string())];
     add_commit(table_root, storage.as_ref(), 1, actions_to_string(actions)).await?;
-    let actions = vec![TestAction::Add("file_2.parquet".to_string())];
+    let actions = [TestAction::Add("file_2.parquet".to_string())];
     add_commit(table_root, storage.as_ref(), 2, actions_to_string(actions)).await?;
 
     // Create log_tail for commits 1, 2
@@ -285,11 +284,11 @@ async fn log_tail_behind_filesystem() -> Result<(), Box<dyn std::error::Error>> 
     let table_root = table_url.as_str();
 
     // Create commits 0, 1, 2 in storage
-    let actions = vec![TestAction::Metadata];
+    let actions = [TestAction::Metadata];
     add_commit(table_root, storage.as_ref(), 0, actions_to_string(actions)).await?;
-    let actions = vec![TestAction::Add("file_1.parquet".to_string())];
+    let actions = [TestAction::Add("file_1.parquet".to_string())];
     add_commit(table_root, storage.as_ref(), 1, actions_to_string(actions)).await?;
-    let actions = vec![TestAction::Add("file_2.parquet".to_string())];
+    let actions = [TestAction::Add("file_2.parquet".to_string())];
     add_commit(table_root, storage.as_ref(), 2, actions_to_string(actions)).await?;
 
     // log_tail BEHIND file system => must respect log_tail
@@ -323,17 +322,16 @@ async fn incremental_snapshot_skip_new_checkpoints_with_log_tail(
     let table_root = table_url.as_str();
 
     // commits 0, 1, 2 in storage (catalog-managed)
-    let actions = vec![TestAction::Metadata];
     add_commit(
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string_catalog_managed(actions),
+        actions_to_string_catalog_managed([TestAction::Metadata]),
     )
     .await?;
-    let actions = vec![TestAction::Add("file_1.parquet".to_string())];
+    let actions = [TestAction::Add("file_1.parquet".to_string())];
     add_commit(table_root, storage.as_ref(), 1, actions_to_string(actions)).await?;
-    let actions = vec![TestAction::Add("file_2.parquet".to_string())];
+    let actions = [TestAction::Add("file_2.parquet".to_string())];
     add_commit(table_root, storage.as_ref(), 2, actions_to_string(actions)).await?;
 
     let mut initial_snapshot = Snapshot::builder_for(table_root)
@@ -355,14 +353,14 @@ async fn incremental_snapshot_skip_new_checkpoints_with_log_tail(
     }
 
     // Add a published version 3 that the staged catalog commit will supersede.
-    let actions = vec![TestAction::Add("published_file_3.parquet".to_string())];
+    let actions = [TestAction::Add("published_file_3.parquet".to_string())];
     add_commit(table_root, storage.as_ref(), 3, actions_to_string(actions)).await?;
 
     // The catalog tail overrides the published version 3.
-    let actions = vec![TestAction::Add("file_3.parquet".to_string())];
+    let actions = [TestAction::Add("file_3.parquet".to_string())];
     let path3 =
         add_staged_commit(table_root, storage.as_ref(), 3, actions_to_string(actions)).await?;
-    let actions = vec![TestAction::Add("file_4.parquet".to_string())];
+    let actions = [TestAction::Add("file_4.parquet".to_string())];
     let path4 =
         add_staged_commit(table_root, storage.as_ref(), 4, actions_to_string(actions)).await?;
 
@@ -449,17 +447,16 @@ async fn incremental_snapshot_caps_at_max_catalog_version() -> Result<(), Box<dy
     let table_root = table_url.as_str();
 
     // commits 0, 1, 2 in storage (catalog-managed)
-    let actions = vec![TestAction::Metadata];
     add_commit(
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string_catalog_managed(actions),
+        actions_to_string_catalog_managed([TestAction::Metadata]),
     )
     .await?;
-    let actions = vec![TestAction::Add("file_1.parquet".to_string())];
+    let actions = [TestAction::Add("file_1.parquet".to_string())];
     add_commit(table_root, storage.as_ref(), 1, actions_to_string(actions)).await?;
-    let actions = vec![TestAction::Add("file_2.parquet".to_string())];
+    let actions = [TestAction::Add("file_2.parquet".to_string())];
     add_commit(table_root, storage.as_ref(), 2, actions_to_string(actions)).await?;
 
     // Simulate a request to the catalog which reports max_catalog_version = 2
@@ -474,7 +471,7 @@ async fn incremental_snapshot_caps_at_max_catalog_version() -> Result<(), Box<dy
 
     // Catalog reported v2 as the max ratified version. A moment later, v3 was
     // ratified and published to the log -- but the client is unaware of v3.
-    let actions = vec![TestAction::Add("file_3.parquet".to_string())];
+    let actions = [TestAction::Add("file_3.parquet".to_string())];
     add_commit(table_root, storage.as_ref(), 3, actions_to_string(actions)).await?;
 
     // Incremental update: catalog reported v2 as max, log_tail includes v2
@@ -499,15 +496,15 @@ async fn log_tail_exceeds_requested_version() -> Result<(), Box<dyn std::error::
     let table_root = table_url.as_str();
 
     // commits 0, 1, 2, 3, 4 in storage
-    let actions = vec![TestAction::Metadata];
+    let actions = [TestAction::Metadata];
     add_commit(table_root, storage.as_ref(), 0, actions_to_string(actions)).await?;
-    let actions = vec![TestAction::Add("file_1.parquet".to_string())];
+    let actions = [TestAction::Add("file_1.parquet".to_string())];
     add_commit(table_root, storage.as_ref(), 1, actions_to_string(actions)).await?;
-    let actions = vec![TestAction::Add("file_2.parquet".to_string())];
+    let actions = [TestAction::Add("file_2.parquet".to_string())];
     add_commit(table_root, storage.as_ref(), 2, actions_to_string(actions)).await?;
-    let actions = vec![TestAction::Add("file_3.parquet".to_string())];
+    let actions = [TestAction::Add("file_3.parquet".to_string())];
     add_commit(table_root, storage.as_ref(), 3, actions_to_string(actions)).await?;
-    let actions = vec![TestAction::Add("file_4.parquet".to_string())];
+    let actions = [TestAction::Add("file_4.parquet".to_string())];
     add_commit(table_root, storage.as_ref(), 4, actions_to_string(actions)).await?;
 
     // log tail goes up to version 4
@@ -535,15 +532,15 @@ async fn log_tail_behind_requested_version() -> Result<(), Box<dyn std::error::E
     let table_root = table_url.as_str();
 
     // create commits 0, 1, 2, 3, 4 in storage
-    let actions = vec![TestAction::Metadata];
+    let actions = [TestAction::Metadata];
     add_commit(table_root, storage.as_ref(), 0, actions_to_string(actions)).await?;
-    let actions = vec![TestAction::Add("file_1.parquet".to_string())];
+    let actions = [TestAction::Add("file_1.parquet".to_string())];
     add_commit(table_root, storage.as_ref(), 1, actions_to_string(actions)).await?;
-    let actions = vec![TestAction::Add("file_2.parquet".to_string())];
+    let actions = [TestAction::Add("file_2.parquet".to_string())];
     add_commit(table_root, storage.as_ref(), 2, actions_to_string(actions)).await?;
-    let actions = vec![TestAction::Add("file_3.parquet".to_string())];
+    let actions = [TestAction::Add("file_3.parquet".to_string())];
     add_commit(table_root, storage.as_ref(), 3, actions_to_string(actions)).await?;
-    let actions = vec![TestAction::Add("file_4.parquet".to_string())];
+    let actions = [TestAction::Add("file_4.parquet".to_string())];
     add_commit(table_root, storage.as_ref(), 4, actions_to_string(actions)).await?;
 
     // Log tail only goes up to version 2

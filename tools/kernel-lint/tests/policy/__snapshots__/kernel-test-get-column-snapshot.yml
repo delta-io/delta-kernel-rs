@@ -1,0 +1,32 @@
+id: kernel-test-get-column
+snapshots:
+  ? |-
+    #[test]
+    fn checks() { let x = batch.column_by_name("id").unwrap().as_any().downcast_ref::<StringArray>().unwrap(); }
+  : fixed: |-
+      #[test]
+      fn checks() { let x = test_utils::get_column!(batch, "id", StringArray); }
+    labels:
+    - source: batch.column_by_name("id").unwrap().as_any().downcast_ref::<StringArray>().unwrap()
+      style: primary
+      start: 30
+      end: 113
+    - source: '#[test]'
+      style: secondary
+      start: 0
+      end: 7
+    - source: fn checks() { let x = batch.column_by_name("id").unwrap().as_any().downcast_ref::<StringArray>().unwrap(); }
+      style: secondary
+      start: 8
+      end: 116
+  mod tests { fn helper() { let x = f.column_by_name("uri").unwrap().as_any().downcast_ref::<StringArray>().unwrap(); } }:
+    fixed: mod tests { fn helper() { let x = test_utils::get_column!(f, "uri", StringArray); } }
+    labels:
+    - source: f.column_by_name("uri").unwrap().as_any().downcast_ref::<StringArray>().unwrap()
+      style: primary
+      start: 34
+      end: 114
+    - source: mod tests { fn helper() { let x = f.column_by_name("uri").unwrap().as_any().downcast_ref::<StringArray>().unwrap(); } }
+      style: secondary
+      start: 0
+      end: 119

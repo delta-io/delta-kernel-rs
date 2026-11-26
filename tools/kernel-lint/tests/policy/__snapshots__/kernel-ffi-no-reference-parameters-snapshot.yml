@@ -1,0 +1,80 @@
+id: kernel-ffi-no-reference-parameters
+snapshots:
+  'pub extern "C" fn f(x: &mut Thing) {}':
+    labels:
+    - source: 'pub extern "C" fn f(x: &mut Thing) {}'
+      style: primary
+      start: 0
+      end: 37
+    - source: extern "C"
+      style: secondary
+      start: 4
+      end: 14
+    - source: extern "C"
+      style: secondary
+      start: 4
+      end: 14
+    - source: '&mut Thing'
+      style: secondary
+      start: 23
+      end: 33
+    - source: 'x: &mut Thing'
+      style: secondary
+      start: 20
+      end: 33
+    - source: '(x: &mut Thing)'
+      style: secondary
+      start: 19
+      end: 34
+  'pub extern "C" fn f(x: Option<&Thing>) {}':
+    labels:
+    - source: 'pub extern "C" fn f(x: Option<&Thing>) {}'
+      style: primary
+      start: 0
+      end: 41
+    - source: extern "C"
+      style: secondary
+      start: 4
+      end: 14
+    - source: extern "C"
+      style: secondary
+      start: 4
+      end: 14
+    - source: '&Thing'
+      style: secondary
+      start: 30
+      end: 36
+    - source: 'x: Option<&Thing>'
+      style: secondary
+      start: 20
+      end: 37
+    - source: '(x: Option<&Thing>)'
+      style: secondary
+      start: 19
+      end: 38
+  'pub unsafe extern "C" fn f(x: &Thing) {}':
+    labels:
+    - source: 'pub unsafe extern "C" fn f(x: &Thing) {}'
+      style: primary
+      start: 0
+      end: 40
+    - source: extern "C"
+      style: secondary
+      start: 11
+      end: 21
+    - source: unsafe extern "C"
+      style: secondary
+      start: 4
+      end: 21
+    - source: '&Thing'
+      style: secondary
+      start: 30
+      end: 36
+    - source: 'x: &Thing'
+      style: secondary
+      start: 27
+      end: 36
+    - source: '(x: &Thing)'
+      style: secondary
+      start: 26
+      end: 37

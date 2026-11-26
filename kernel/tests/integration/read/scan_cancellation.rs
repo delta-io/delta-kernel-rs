@@ -30,7 +30,7 @@ async fn json_only_table() -> KernelResult<(Arc<InMemory>, &'static str)> {
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string(vec![
+        actions_to_string([
             TestAction::Metadata,
             TestAction::AddWithSize(PARQUET_FILE1.to_string(), file_size),
         ]),
@@ -410,7 +410,7 @@ async fn snapshot_build_cancelled_during_listing() -> KernelResult<()> {
         .without_plan_executor();
 
     let result = Snapshot::builder_for(table_root)
-        .with_cancellation_token(token.clone() as CancellationTokenRef)
+        .with_cancellation_token(token as CancellationTokenRef)
         .build(&engine);
     assert!(
         matches!(

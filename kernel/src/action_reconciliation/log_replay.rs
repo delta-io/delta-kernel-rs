@@ -715,7 +715,9 @@ mod tests {
     use super::*;
     use crate::KernelError;
     use crate::arrow::array::StringArray;
-    use crate::unit_test_utils::{action_batch, parse_json_batch};
+    use crate::unit_test_utils::{
+        action_batch, assert_result_error_with_message, parse_json_batch,
+    };
 
     /// Helper function to create test batches from JSON strings
     fn create_batch(json_strings: Vec<&str>) -> KernelResult<ActionsBatch> {
@@ -1429,13 +1431,7 @@ mod tests {
         let getter = MockErrorGetData::default();
         let getters = vec![&getter as &dyn GetData<'_>; 5]; // Wrong count (should be 15)!
         let result = visitor.visit(1, &getters);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Wrong number of visitor getters")
-        );
+        assert_result_error_with_message(result, "Wrong number of visitor getters");
 
         // Test 2: Basic type mismatch errors using parameterized approach
         let test_cases = [
@@ -1522,17 +1518,11 @@ mod tests {
         getters.push(&error_mock); // remove.deletionTimestamp - ERROR!
         getters.extend(defaults2.iter().map(|g| g as &dyn GetData<'_>));
         let result = visitor.visit(1, &getters);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("deletionTimestamp is not of type i64")
-        );
+        assert_result_error_with_message(result, "deletionTimestamp is not of type i64");
     }
 
     #[test]
-    fn test_action_reconciliation_processor_error_propagation() -> KernelResult<()> {
+    fn test_action_reconciliation_processor_error_propagation() {
         // Test that errors from the visitor are properly propagated by the processor
         let json_strings: StringArray = vec![
             // This will create valid data that parses correctly
@@ -1552,7 +1542,5 @@ mod tests {
         let action_reconciliation_batch = result.unwrap();
         assert_eq!(action_reconciliation_batch.actions_count, 1);
         assert_eq!(action_reconciliation_batch.add_actions_count, 1);
-
-        Ok(())
     }
 }

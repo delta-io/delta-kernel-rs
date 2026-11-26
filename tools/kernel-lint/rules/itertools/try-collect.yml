@@ -1,0 +1,11 @@
+id: kernel-itertools-try-collect
+language: Rust
+severity: info
+message: Prefer itertools try_collect when collection and error types remain inferable.
+note: This is a review suggestion. Preserve eager first-error handling and use Itertools::try_collect(iter) if method syntax produces a name-collision warning. Do not add enough annotations to erase the simplification.
+rule:
+  any:
+    - pattern: $ITER.collect::<KernelResult<Vec<_>>>()
+    - pattern: $ITER.collect::<KernelResult<Vec<_>, $ERROR>>()
+    - pattern: $ITER.collect::<Result<Vec<_>, $ERROR>>()
+    - pattern: $ITER.collect::<std::result::Result<Vec<_>, $ERROR>>()

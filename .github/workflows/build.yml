@@ -114,6 +114,70 @@ jobs:
           --start-directory .github/omnigent/tests
           --pattern 'test_*.py'
 
+  kernel-custom-lints:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.0.0
+        with:
+          node-version: "22"
+      - name: Install structural lint runner
+        run: npm install --global @ast-grep/cli@0.37.0
+      - name: Test rule matching and replacements
+        run: python3 tools/kernel-lint/run.py test
+      - name: Test lint runner and baseline behavior
+        run: python3 -m unittest discover -s tools/kernel-lint -p 'test_*.py'
+      - name: Reject new structural lint findings
+        run: python3 tools/kernel-lint/run.py check --format github
+
+  kernel-dylint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: "4"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+      - name: Install pinned Dylint compiler
+        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+        with:
+          cache: false
+          toolchain: nightly-2026-07-20
+          components: rustc-dev, llvm-tools, rustfmt
+          rustflags: ""
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: v1-rust
+          key: kernel-dylint-nightly-2026-07-20
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - name: Install pinned Dylint tools
+        run: cargo +nightly-2026-07-20 install cargo-dylint dylint-link --version 6.4.0 --locked
+      - name: Test type-aware lint diagnostics
+        run: python3 tools/kernel-dylint/test.py
+      - name: Check Kernel constructor lints
+        env:
+          DYLINT_RUSTFLAGS: >-
+            -Dkernel_named_nullability -Dkernel_expression_literal
+            -Dkernel_null_literal -Dkernel_predicate_constant
+            -Akernel_vec_parameter_into_iterator -Akernel_data_type_parameter_into
+            -Akernel_prefer_guard_clause -Akernel_multiline_nested_calls
+        run: >-
+          cargo dylint --path tools/kernel-dylint --fail-on-no-libraries
+          -p delta_kernel -- --lib --all-features --locked
+
   format:
     runs-on: ubuntu-latest
     steps:
@@ -240,7 +304,7 @@ jobs:
           cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: build and lint with clippy
-        run: cargo clippy --locked --benches --tests --all-features -- -D warnings
+        run: cargo clippy-review
       - name: lint without default features - packages which depend on kernel with features enabled
         run: cargo clippy-no-default-kernel-dependents
       - name: check without default features - kernel

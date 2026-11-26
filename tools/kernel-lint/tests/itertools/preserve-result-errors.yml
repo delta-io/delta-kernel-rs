@@ -1,0 +1,12 @@
+id: kernel-itertools-preserve-result-errors
+valid:
+  - 'fn f() { input.filter_map(Option::flatten); }'
+  - 'fn f() { input.flatten(); }'
+  - 'fn f() { input.filter_map_ok(convert); }'
+  - 'fn f() { input.flatten_ok(); }'
+  - 'fn f() { input.map_ok(convert); }'
+invalid:
+  - 'fn f() { input.filter_map(Result::ok); }'
+  - 'fn f() { input.filter_map(std::result::Result::ok); }'
+  - 'fn f() { input.map(Result::ok).flatten(); }'
+  - 'fn f() { input.flat_map(std::result::Result::into_iter); }'

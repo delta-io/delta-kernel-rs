@@ -1,0 +1,16 @@
+id: kernel-expression-arithmetic-operator
+snapshots:
+  Expression::binary(BinaryExpressionOp::Multiply, col!("x"), lit(2_i64)):
+    fixed: (col!("x") * lit(2_i64))
+    labels:
+    - source: Expression::binary(BinaryExpressionOp::Multiply, col!("x"), lit(2_i64))
+      style: primary
+      start: 0
+      end: 71
+  Expression::binary(BinaryExpressionOp::Plus, lit(4_i64), col!("row_index")):
+    fixed: (lit(4_i64) + col!("row_index"))
+    labels:
+    - source: Expression::binary(BinaryExpressionOp::Plus, lit(4_i64), col!("row_index"))
+      style: primary
+      start: 0
+      end: 75

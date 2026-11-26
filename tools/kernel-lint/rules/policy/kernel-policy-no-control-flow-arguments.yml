@@ -1,0 +1,34 @@
+id: kernel-policy-no-control-flow-arguments
+language: Rust
+severity: warning
+message: Name the if/match result before the call, preserving argument order and conditional execution.
+note: A manual rewrite may need locals for earlier arguments. Preserve their evaluation order,
+  conditional execution, ? propagation, temporary lifetimes and drop order. Closure arguments,
+  block arguments, method receivers, macros and attributes are excluded. No automatic fix is provided.
+rule:
+  all:
+  - any:
+    - kind: if_expression
+    - kind: match_expression
+  - inside:
+      kind: arguments
+      inside:
+        kind: call_expression
+      stopBy:
+        not:
+          any:
+          - kind: parenthesized_expression
+          - kind: reference_expression
+          - kind: try_expression
+          - kind: arguments
+  - not:
+      inside:
+        any:
+        - kind: macro_definition
+        - kind: macro_invocation
+        - kind: attribute_item
+        - kind: inner_attribute_item
+        - kind: parameters
+        - kind: closure_parameters
+        - kind: type_parameters
+        stopBy: end

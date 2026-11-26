@@ -1,0 +1,9 @@
+id: kernel-expression-named-predicate
+valid:
+- Predicate::binary(op, lhs, rhs)
+- Predicate::eq(lhs, rhs)
+- OtherPredicate::binary(BinaryPredicateOp::Equal, lhs, rhs)
+invalid:
+- Predicate::binary(BinaryPredicateOp::Equal, lhs, rhs)
+- Predicate::binary(BinaryPredicateOp::LessThan, lhs, rhs)
+- Predicate::binary(BinaryPredicateOp::Distinct, lhs, rhs)

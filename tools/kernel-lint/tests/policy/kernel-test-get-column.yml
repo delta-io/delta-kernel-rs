@@ -1,0 +1,23 @@
+id: kernel-test-get-column
+valid:
+- '#[test]
+
+  fn checks() { let x = batch.column_by_name("id"); }'
+- '#[test]
+
+  fn checks() { let x = batch.column_by_name("id").unwrap().as_any().downcast_ref::<StringArray>(); }'
+- '#[test]
+
+  fn checks() { let x = batch.column_by_name(name()).unwrap().as_any().downcast_ref::<StringArray>().unwrap(); }'
+- '#[test]
+
+  fn checks() { let x = batch.column_by_name("id").expect("context").as_any().downcast_ref::<StringArray>().unwrap();
+  }'
+- fn production() { let x = batch.column_by_name("id").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+  }
+invalid:
+- '#[test]
+
+  fn checks() { let x = batch.column_by_name("id").unwrap().as_any().downcast_ref::<StringArray>().unwrap(); }'
+- mod tests { fn helper() { let x = f.column_by_name("uri").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+  } }

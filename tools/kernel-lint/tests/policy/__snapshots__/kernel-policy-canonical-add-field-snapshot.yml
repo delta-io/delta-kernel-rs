@@ -1,0 +1,16 @@
+id: kernel-policy-canonical-add-field
+snapshots:
+  StructField::nullable(ADD_NAME, Add::to_schema()):
+    fixed: ADD_FIELD.clone()
+    labels:
+    - source: StructField::nullable(ADD_NAME, Add::to_schema())
+      style: primary
+      start: 0
+      end: 49
+  fn f() { let x = StructField::nullable(ADD_NAME, Add::to_schema()); }:
+    fixed: fn f() { let x = ADD_FIELD.clone(); }
+    labels:
+    - source: StructField::nullable(ADD_NAME, Add::to_schema())
+      style: primary
+      start: 17
+      end: 66

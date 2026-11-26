@@ -1,0 +1,23 @@
+id: kernel-test-commit-result-helper
+valid:
+- '#[test]
+
+  fn checks() { let x = result.unwrap_committed(); }'
+- '#[test]
+
+  fn checks() { let x = match result { CommitResult::Committed(x) => { assert_eq!(x.version(), 1); x }, other =>
+  panic!("bad: {other:?}") }; }'
+- '#[test]
+
+  fn checks() { let x = match result { Other::Committed(x) => x, other => panic!("bad") }; }'
+- fn production() { let x = match result { CommitResult::Committed(x) => x, other => panic!("bad") }; }
+invalid:
+- '#[test]
+
+  fn checks() { let x = match result { CommitResult::Committed(x) => x, other => panic!("bad: {other:?}") }; }'
+- '#[test]
+
+  fn checks() { let x = match result { CommitResult::Committed(x) => x.post_commit_snapshot().expect("snapshot").clone(),
+  other => panic!("bad") }; }'
+- '#[cfg(test)] mod tests { fn helper() { let x = match result { CommitResult::Committed(x) => x, other => panic!("bad")
+  }; } }'

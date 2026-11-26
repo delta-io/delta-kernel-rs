@@ -901,7 +901,7 @@ fn timestamp_footer_stats_respect_annotations(
     );
     let (data_type, scalar) = timestamp_kind(timezone);
     let expected = expected.map(scalar);
-    assert_eq!(extract_min_scalar(&data_type, &column), expected.clone());
+    assert_eq!(extract_min_scalar(&data_type, &column), expected);
     assert_eq!(extract_max_scalar(&data_type, &column), expected);
 }
 
@@ -1581,7 +1581,7 @@ fn write_checkpoint_parquet(
             true,
         ));
         let part_col = Arc::new(StringArray::from(part_values.to_vec()));
-        let pv_struct = StructArray::from(vec![(part_col_field.clone(), part_col as _)]);
+        let pv_struct = StructArray::from(vec![(part_col_field, part_col as _)]);
         add_children.push((pv_parsed_field, Arc::new(pv_struct)));
     }
 

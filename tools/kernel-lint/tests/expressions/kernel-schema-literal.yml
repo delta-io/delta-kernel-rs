@@ -1,0 +1,9 @@
+id: kernel-schema-literal
+valid:
+- StructType::try_new([StructField::nullable("x", DataType::LONG)])
+- StructType::new_unchecked(fields)
+- StructType::new_unchecked([StructField::nullable("x", dtype).with_metadata(meta)])
+- 'schema! { nullable "x": LONG }'
+invalid:
+- StructType::new_unchecked([StructField::nullable("x", DataType::LONG)])
+- StructType::new_unchecked([StructField::not_null(NAME, dtype)])

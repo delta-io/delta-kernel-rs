@@ -162,6 +162,7 @@ mod tests {
     use super::*;
     use crate::expressions::column_name;
     use crate::schema::{DataType, StructField, schema};
+    use crate::unit_test_utils::assert_result_error_with_message;
 
     #[rstest::rstest]
     #[case::simple(
@@ -205,13 +206,7 @@ mod tests {
         let schema = schema! { not_null "id": INTEGER };
         let columns = vec![column_name!("nonexistent")];
         let result = validate_clustering_columns(&schema, &columns);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("not found in schema")
-        );
+        assert_result_error_with_message(result, "not found in schema");
     }
 
     #[test]
@@ -241,8 +236,7 @@ mod tests {
         // Clustering on an entire struct (not a leaf primitive) should fail
         let columns = vec![column_name!("parent")];
         let result = validate_clustering_columns(&schema, &columns);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unsupported type"));
+        assert_result_error_with_message(result, "unsupported type");
     }
 
     #[test]
@@ -252,13 +246,7 @@ mod tests {
         // Trying to traverse into a non-struct field should fail
         let columns = vec![column_name!("flat_col", "child")];
         let result = validate_clustering_columns(&schema, &columns);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("is not a struct or `file` type")
-        );
+        assert_result_error_with_message(result, "is not a struct or `file` type");
     }
 
     #[test]
@@ -270,13 +258,7 @@ mod tests {
         // Nested field that doesn't exist should fail
         let columns = vec![column_name!("parent", "nonexistent")];
         let result = validate_clustering_columns(&schema, &columns);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("not found in schema")
-        );
+        assert_result_error_with_message(result, "not found in schema");
     }
 
     #[test]
@@ -452,7 +434,6 @@ mod tests {
         // Create a ColumnName with empty path (can't easily express in rstest case)
         let columns: Vec<ColumnName> = vec![ColumnName::new(Vec::<String>::new())];
         let result = validate_clustering_columns(&schema, &columns);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("cannot be empty"));
+        assert_result_error_with_message(result, "cannot be empty");
     }
 }

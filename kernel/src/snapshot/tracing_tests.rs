@@ -76,8 +76,10 @@ fn trace_fields<'a>(traces: &'a CapturedTraces, span_name: &str) -> &'a TraceFie
     traces
         .iter()
         .find(|(name, _)| *name == span_name)
-        .map(|(_, fields)| fields)
-        .unwrap_or_else(|| panic!("expected trace for {span_name}"))
+        .map_or_else(
+            || panic!("expected trace for {span_name}"),
+            |(_, fields)| fields,
+        )
 }
 
 fn install_capture() -> (SnapshotTraceCaptureLayer, tracing::subscriber::DefaultGuard) {

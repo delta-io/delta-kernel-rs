@@ -1,0 +1,8 @@
+id: kernel-itertools-filter-map-ok
+language: Rust
+severity: info
+message: Prefer filter_map_ok for this match that maps successful items and retains each error.
+note: Review that Ok and Err resolve to Result, the mapping returns Option, the Itertools import is available, and moving the mapping function out of the per-item closure preserves captures and evaluation timing.
+rule:
+  pattern: '$ITER.filter_map(|$RESULT| match $RESULT { Ok($VALUE) => $MAPPER($VALUE).map(Ok), Err($ERROR) => Some(Err($ERROR)), })'
+fix: $ITER.filter_map_ok($MAPPER)

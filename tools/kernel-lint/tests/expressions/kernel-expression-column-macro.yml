@@ -1,0 +1,10 @@
+id: kernel-expression-column-macro
+valid:
+- Expression::column(["a.b"])
+- Expression::column([name])
+- Expression::column(["a b"])
+- col!("a", "b")
+- Expression::column([])
+invalid:
+- Expression::column(["a"])
+- Expression::column(["stats", "numRecords"])

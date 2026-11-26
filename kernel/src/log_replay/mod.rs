@@ -612,7 +612,7 @@ mod tests {
             let mut deduplicator = create_deduplicator(&mut seen, true);
 
             // Pre-existing key should be detected as duplicate
-            assert!(deduplicator.check_and_record_seen(pre_existing_key.clone()));
+            assert!(deduplicator.check_and_record_seen(pre_existing_key));
 
             // First time seeing keys, should return false and record them
             assert!(!deduplicator.check_and_record_seen(key1.clone()));
@@ -638,10 +638,10 @@ mod tests {
             // First time seeing new_key in checkpoint, should return false but NOT record it
             assert!(!deduplicator.check_and_record_seen(new_key.clone()));
             // Still returns false on second call (not recorded)
-            assert!(!deduplicator.check_and_record_seen(new_key.clone()));
+            assert!(!deduplicator.check_and_record_seen(new_key));
 
             // Existing keys from seen set should still be detected
-            assert!(deduplicator.check_and_record_seen(key1.clone()));
+            assert!(deduplicator.check_and_record_seen(key1));
         }
     }
 

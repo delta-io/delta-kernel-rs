@@ -153,7 +153,7 @@ fn manifest_commit_allows_checkpoint_covering_the_snapshot() -> Result<()> {
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     assert_eq!(snapshot.version(), 1);
     // Checkpoint version (1) >= snapshot version (1), so the guard passes.
-    ManifestCommitState::try_new(&engine, snapshot.clone(), 2, &adaptive_table_config())?;
+    ManifestCommitState::try_new(&engine, snapshot, 2, &adaptive_table_config())?;
     Ok(())
 }
 
@@ -178,8 +178,7 @@ fn manifest_commit_rejects_delta_commits_after_last_checkpoint() -> Result<()> {
     )?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     assert_eq!(snapshot.version(), 2);
-    let result =
-        ManifestCommitState::try_new(&engine, snapshot.clone(), 3, &adaptive_table_config());
+    let result = ManifestCommitState::try_new(&engine, snapshot, 3, &adaptive_table_config());
     assert_result_error_with_message(result, "does not currently support delta log commits");
     Ok(())
 }
@@ -193,7 +192,7 @@ fn new_leaf_node_writer_uses_effective_config_schema_not_snapshot() -> Result<()
     let (engine, table_root) = setup_table()?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let config = adaptive_table_config();
-    let state = ManifestCommitState::try_new(&engine, snapshot.clone(), 1, &config)?;
+    let state = ManifestCommitState::try_new(&engine, snapshot, 1, &config)?;
     let writer = state.new_leaf_node_writer(&engine);
     assert_eq!(writer.physical_schema(), &config.physical_schema());
     Ok(())

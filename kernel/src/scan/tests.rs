@@ -1109,7 +1109,7 @@ fn test_missing_column_row_group_skipping() {
         .with_predicate(predicate)
         .build()
         .unwrap();
-    let data: Vec<_> = scan.execute(engine.clone()).unwrap().try_collect().unwrap();
+    let data: Vec<_> = scan.execute(engine).unwrap().try_collect().unwrap();
     assert_eq!(data.len(), 1);
 
     // Predicate over a logically missing column fails the scan
@@ -2008,7 +2008,7 @@ fn scan_execute_passes_scan_file_modification_time_to_parquet_handler() {
     }
     recorder.take_reads();
 
-    let _: Vec<_> = scan.execute(engine.clone()).unwrap().try_collect().unwrap();
+    let _: Vec<_> = scan.execute(engine).unwrap().try_collect().unwrap();
     let reads = recorder.take_reads();
     let mut actual: Vec<_> = reads
         .into_iter()
@@ -2042,12 +2042,10 @@ fn test_checkpoint_stats_projection_matches_requested_output(
     #[case] skip_stats: bool,
 ) {
     let extracted = load_test_data("tests/data", table).ok();
-    let path = extracted
-        .as_ref()
-        .map(|dir| dir.path().join(table))
-        .unwrap_or_else(|| {
-            fs::canonicalize(PathBuf::from(format!("./tests/data/{table}/"))).unwrap()
-        });
+    let path = extracted.as_ref().map_or_else(
+        || fs::canonicalize(PathBuf::from(format!("./tests/data/{table}/"))).unwrap(),
+        |dir| dir.path().join(table),
+    );
     let url = Url::from_directory_path(path).unwrap();
     let sync = Arc::new(SyncEngine::new());
     let recorder = Arc::new(RecordingParquetHandler::new(sync.parquet_handler()));

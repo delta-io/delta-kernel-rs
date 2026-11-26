@@ -1,0 +1,48 @@
+id: kernel-test-arrow-null-array
+snapshots:
+  ? |-
+    #[test]
+    fn checks() { let x = Arc::new(BooleanArray::from(vec![None::<bool>; n])) as ArrayRef; }
+  : labels:
+    - source: Arc::new(BooleanArray::from(vec![None::<bool>; n])) as ArrayRef
+      style: primary
+      start: 30
+      end: 93
+    - source: '#[test]'
+      style: secondary
+      start: 0
+      end: 7
+    - source: fn checks() { let x = Arc::new(BooleanArray::from(vec![None::<bool>; n])) as ArrayRef; }
+      style: secondary
+      start: 8
+      end: 96
+  ? |-
+    #[test]
+    fn checks() { let x = Arc::new(Int32Array::from(vec![None::<i32>; n])) as ArrayRef; }
+  : labels:
+    - source: Arc::new(Int32Array::from(vec![None::<i32>; n])) as ArrayRef
+      style: primary
+      start: 30
+      end: 90
+    - source: '#[test]'
+      style: secondary
+      start: 0
+      end: 7
+    - source: fn checks() { let x = Arc::new(Int32Array::from(vec![None::<i32>; n])) as ArrayRef; }
+      style: secondary
+      start: 8
+      end: 93
+  '#[test] fn check() { let x = Arc::new(Int32Array::from(vec![None as Option<i32>; n])) as ArrayRef; }':
+    labels:
+    - source: Arc::new(Int32Array::from(vec![None as Option<i32>; n])) as ArrayRef
+      style: primary
+      start: 29
+      end: 97
+    - source: '#[test]'
+      style: secondary
+      start: 0
+      end: 7
+    - source: fn check() { let x = Arc::new(Int32Array::from(vec![None as Option<i32>; n])) as ArrayRef; }
+      style: secondary
+      start: 8
+      end: 100

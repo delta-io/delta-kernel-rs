@@ -1,0 +1,8 @@
+id: kernel-schema-named-nullability
+valid:
+- StructField::new(name, dtype, nullable)
+- StructField::nullable("id", DataType::LONG)
+- ArrowField::new("id", dtype, true)
+invalid:
+- StructField::new("id", DataType::LONG, true)
+- StructField::new(name, dtype, false)

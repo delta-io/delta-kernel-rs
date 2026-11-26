@@ -74,11 +74,9 @@ async fn test_checkpoint_non_kernel_written_table() {
     snapshot.checkpoint(engine.as_ref(), None).unwrap();
 
     // Read data after checkpoint
-    let snapshot_after = Snapshot::builder_for(url.clone())
-        .build(engine.as_ref())
-        .unwrap();
+    let snapshot_after = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
     let scan_after = snapshot_after.scan_builder().build().unwrap();
-    let batches_after = test_utils::read_scan(&scan_after, engine.clone()).unwrap();
+    let batches_after = test_utils::read_scan(&scan_after, engine).unwrap();
 
     // Verify data unchanged
     let formatted_before =
@@ -614,11 +612,7 @@ fn test_add_file_clustering_provider_on_unclustered_table(
             schema_ref! { nullable CLUSTERING_PROVIDER_NAME: STRING },
             vec![ArrayData::try_new(
                 ArrayType::new(DataType::STRING, true),
-                values.map(|value| {
-                    value
-                        .map(Scalar::from)
-                        .unwrap_or(Scalar::Null(DataType::STRING))
-                }),
+                values.map(|value| value.map_or(Scalar::Null(DataType::STRING), Scalar::from)),
             )?],
         )?;
     }

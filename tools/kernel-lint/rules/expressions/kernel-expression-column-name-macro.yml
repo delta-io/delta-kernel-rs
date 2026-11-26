@@ -1,0 +1,19 @@
+id: kernel-expression-column-name-macro
+language: Rust
+severity: warning
+message: Use column_name! for a literal sequence of simple column-name segments.
+note: Only simple string-literal segments are matched. A single dotted literal is not equivalent to the
+  macro splitting it. Resolve Kernel ColumnName and import column_name; runtime/constant segments are
+  deliberately not inferred.
+rule:
+  pattern: ColumnName::new($SEGMENTS)
+constraints:
+  SEGMENTS:
+    regex: ^\[\s*"[A-Za-z_][A-Za-z0-9_]*"(?:\s*,\s*"[A-Za-z_][A-Za-z0-9_]*")*\s*,?\s*\]$
+fix: column_name!($ARGS)
+transform:
+  ARGS:
+    replace:
+      source: $SEGMENTS
+      replace: ^\[([\s\S]*)\]$
+      by: $1

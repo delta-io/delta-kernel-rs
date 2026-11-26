@@ -1,0 +1,10 @@
+id: kernel-itertools-exact-split-tuple
+language: Rust
+severity: info
+message: Consider collect_tuple for this exact-two-part split instead of allocating a Vec only to match its arity.
+note: Confirm a finite pure string split and preserve exact arity, including rejection of extra delimiters. collect_tuple can stop consuming earlier on malformed inputs. A plain split_once would weaken the extra-delimiter check.
+rule:
+  pattern: 'let [$LEFT, $RIGHT] = $TEXT.split($SEP).collect::<Vec<_>>()[..] else { $$$BODY };'
+constraints:
+  SEP:
+    kind: char_literal

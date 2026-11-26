@@ -72,7 +72,7 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string(vec![
+        actions_to_string([
             TestAction::Metadata,
             TestAction::AddWithSize(PARQUET_FILE1.to_string(), file_size),
             TestAction::AddWithSize(PARQUET_FILE2.to_string(), file_size),
@@ -122,7 +122,7 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string(vec![
+        actions_to_string([
             TestAction::Metadata,
             TestAction::AddWithSize(PARQUET_FILE1.to_string(), file_size),
         ]),
@@ -132,7 +132,7 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
         table_root,
         storage.as_ref(),
         1,
-        actions_to_string(vec![TestAction::AddWithSize(
+        actions_to_string([TestAction::AddWithSize(
             PARQUET_FILE2.to_string(),
             file_size,
         )]),
@@ -182,7 +182,7 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string(vec![
+        actions_to_string([
             TestAction::Metadata,
             TestAction::AddWithSize(PARQUET_FILE1.to_string(), file_size),
         ]),
@@ -192,7 +192,7 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
         table_root,
         storage.as_ref(),
         1,
-        actions_to_string(vec![TestAction::AddWithSize(
+        actions_to_string([TestAction::AddWithSize(
             PARQUET_FILE2.to_string(),
             file_size,
         )]),
@@ -202,7 +202,7 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
         table_root,
         storage.as_ref(),
         2,
-        actions_to_string(vec![TestAction::RemoveWithSize(
+        actions_to_string([TestAction::RemoveWithSize(
             PARQUET_FILE2.to_string(),
             file_size,
         )]),
@@ -263,7 +263,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string(vec![
+        actions_to_string([
             TestAction::Metadata,
             TestAction::AddWithSize(PARQUET_FILE1.to_string(), file_size1),
         ]),
@@ -488,7 +488,7 @@ fn read_table_data(
     let scan = snapshot
         .scan_builder()
         .with_schema_opt(read_schema)
-        .with_predicate(predicate.clone())
+        .with_predicate(predicate)
         .build()?;
 
     sort_lines!(expected);
@@ -1885,7 +1885,7 @@ async fn test_row_index_metadata_column() -> Result<(), Box<dyn std::error::Erro
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string(vec![
+        actions_to_string([
             TestAction::Metadata,
             TestAction::AddWithSize(PARQUET_FILE1.to_string(), file_size1),
             TestAction::AddWithSize(PARQUET_FILE2.to_string(), file_size2),
@@ -1921,7 +1921,7 @@ async fn test_row_index_metadata_column() -> Result<(), Box<dyn std::error::Erro
 
     let mut file_count = 0;
     let expected_row_counts = [5, 3, 4];
-    let stream = scan.execute(engine.clone())?;
+    let stream = scan.execute(engine)?;
 
     for data in stream {
         let batch = into_record_batch(data?);
@@ -1983,7 +1983,7 @@ async fn test_file_path_metadata_column() -> Result<(), Box<dyn std::error::Erro
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string(vec![
+        actions_to_string([
             TestAction::Metadata,
             TestAction::AddWithSize(PARQUET_FILE1.to_string(), file_size1),
             TestAction::AddWithSize(PARQUET_FILE2.to_string(), file_size2),
@@ -2015,7 +2015,7 @@ async fn test_file_path_metadata_column() -> Result<(), Box<dyn std::error::Erro
     let mut file_count = 0;
     let expected_files = [PARQUET_FILE1, PARQUET_FILE2];
     let expected_row_counts = [3, 2];
-    let stream = scan.execute(engine.clone())?;
+    let stream = scan.execute(engine)?;
 
     for data in stream {
         let batch = into_record_batch(data?);
@@ -2080,7 +2080,7 @@ async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::E
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string(vec![
+        actions_to_string([
             TestAction::Metadata,
             TestAction::Add(PARQUET_FILE1.to_string()),
         ]),
@@ -2140,7 +2140,7 @@ async fn test_invalid_files_are_skipped() -> Result<(), Box<dyn std::error::Erro
         table_root,
         storage.as_ref(),
         0,
-        actions_to_string(vec![
+        actions_to_string([
             TestAction::Metadata,
             TestAction::Add(PARQUET_FILE1.to_string()),
             TestAction::Add(PARQUET_FILE2.to_string()),
