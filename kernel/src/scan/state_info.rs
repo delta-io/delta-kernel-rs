@@ -8,7 +8,7 @@ use tracing::{Level, debug, enabled, trace, warn};
 use url::Url;
 
 use crate::actions::NULL_COUNT;
-use crate::expressions::ColumnName;
+use crate::expressions::{ColumnName, UnaryExpressionOp};
 use crate::scan::field_classifiers::TransformFieldClassifier;
 use crate::scan::transform_spec::{FieldTransformSpec, TransformSpec};
 use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions, StructStats};
@@ -140,6 +140,9 @@ pub(crate) struct StateInfo {
     pub(crate) skip_row_transforms: bool,
     /// Table root for normalizing paths. `Some` iff adaptiveMetadata is enabled.
     pub(crate) dv_normalization_root: Option<Url>,
+    /// The operator that encodes this table's `stats_parsed` as JSON. See
+    /// [`TableConfiguration::stats_json_op`].
+    pub(crate) stats_json_op: UnaryExpressionOp,
 }
 
 /// Validating the metadata columns also extracts information needed to properly construct the full
@@ -673,6 +676,7 @@ impl StateInfo {
             is_catalog_managed: table_configuration.is_catalog_managed(),
             skip_row_transforms: false,
             dv_normalization_root: table_configuration.dv_normalization_root(),
+            stats_json_op: table_configuration.stats_json_op(),
         })
     }
 

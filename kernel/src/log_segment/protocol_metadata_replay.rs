@@ -9,7 +9,7 @@ use itertools::Itertools as _;
 use tracing::{info, instrument};
 use url::Url;
 
-use super::{LogSegment, checkpoint_action_projection_predicate};
+use super::{CheckpointReadOptions, LogSegment, checkpoint_action_projection_predicate};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use super::{
     last_manifest_commit_inconsistency, missing_pointed_checkpoint_action,
@@ -360,8 +360,12 @@ impl LogSegment {
         let commits = Self::read_commit_files(engine, &commit_files, commit_schema)?;
         // Let readers skip checkpoint data without a Protocol or Metadata.
         let checkpoint_predicate = checkpoint_action_projection_predicate(&checkpoint_schema);
+        let options = CheckpointReadOptions {
+            meta_predicate: checkpoint_predicate,
+            ..Default::default()
+        };
         let checkpoint = self
-            .create_checkpoint_stream(engine, checkpoint_schema, checkpoint_predicate, None, None)?
+            .create_checkpoint_stream(engine, checkpoint_schema, options)?
             .actions;
         let batches = commits
             .chain(checkpoint)
