@@ -150,6 +150,16 @@ class DiffCoverageTest(unittest.TestCase):
         self.assertIn('"late_child.rs"', parent)
         self.assertIn('"omitted.rs"', parent)
         self.assertNotIn("diff --git a/late_child.rs", parent)
+        notice = parent.split("## Patch excerpts\n", 1)[1].split("## PR Diff", 1)[0]
+        self.assertIn(
+            f"This orchestrator task message includes 80000 of {len(raw)} UTF-8 patch bytes.",
+            notice,
+        )
+        self.assertIn(
+            f"Reviewer and Checker task messages include 100000 of {len(raw)} "
+            "UTF-8 patch bytes in a separate excerpt.",
+            notice,
+        )
         self.assertLessEqual(len(parent.encode()), 120_000)
 
     def test_orchestrator_message_reserves_changed_paths_and_counts_utf8_bytes(self):
@@ -162,6 +172,38 @@ class DiffCoverageTest(unittest.TestCase):
         self.assertLessEqual(len(parent.encode()), 120_000)
         with self.assertRaisesRegex(ValueError, "task text without the patch"):
             diff_coverage.build_orchestrator_task_message("a" * 120_001, raw, coverage)
+
+        excerpt = parent.split("```diff\n", 1)[1].rsplit("\n```", 1)[0]
+        excerpt_bytes = len(excerpt.encode("utf-8"))
+        self.assertLess(excerpt_bytes, 80_000)
+        notice = parent.split("## Patch excerpts\n", 1)[1].split("## PR Diff", 1)[0]
+        self.assertIn(
+            f"This orchestrator task message includes {excerpt_bytes} of 100001 UTF-8 patch bytes.",
+            notice,
+        )
+        self.assertIn(
+            "Reviewer and Checker task messages include 100000 of 100001 "
+            "UTF-8 patch bytes in a separate excerpt.",
+            notice,
+        )
+
+    def test_orchestrator_rejects_task_text_that_leaves_no_room_for_excerpt_counts(self):
+        raw = file_diff()
+        coverage = diff_coverage.prepare_review_inputs(raw, "", BASE, HEAD)["coverage"]
+        with self.assertRaisesRegex(ValueError, "no room for patch excerpt byte counts"):
+            diff_coverage.build_orchestrator_task_message("a" * 120_000, raw, coverage)
+
+    def test_orchestrator_reports_zero_patch_bytes_when_only_metadata_and_notice_fit(self):
+        raw = file_diff(size=100_001)
+        coverage = diff_coverage.prepare_review_inputs(raw, "", BASE, HEAD)["coverage"]
+        message = diff_coverage.build_orchestrator_task_message(
+            "Instructions.", raw, coverage, limit=260
+        )
+        self.assertLessEqual(len(message.encode("utf-8")), 260)
+        self.assertIn(
+            "This orchestrator task message includes 0 of 100001 UTF-8 patch bytes.", message
+        )
+        self.assertNotIn("```diff", message)
 
     def test_huge_manifest_uses_paged_tool_and_all_paths_remain_retrievable(self):
         paths = [f"directory/{index:04d}/" + "x" * 170 + ".rs" for index in range(1300)]

@@ -157,8 +157,8 @@ def format_review_summary(
     parts = [BOT_MARKER, f"## {AI_REVIEW_TITLE}", headline]
     if coverage is not None and not coverage.get("complete"):
         parts.append(
-            f"Review input truncated: {coverage.get('full_files', 0)} of "
-            f"{coverage.get('total_files', 0)} file sections fully included; "
+            f"Patch truncated for subagents: {coverage.get('full_files', 0)} of "
+            f"{coverage.get('total_files', 0)} file patches fully included; "
             f"{coverage.get('partial_files', 0)} partial and "
             f"{coverage.get('omitted_files', 0)} omitted. "
             f"[Diff details in Checks]({checks_url or run_url})."
@@ -200,8 +200,8 @@ def format_diff_coverage(coverage: dict[str, Any]) -> str:
         "## Subagent patch excerpt",
         f"Reviewed range: `{coverage['base_sha']}...{coverage['head_sha']}`",
         f"Includes {coverage['excerpt_bytes']} of {coverage['total_bytes']} UTF-8 patch bytes; "
-        f"{coverage['full_files']} full, {coverage['partial_files']} partial, "
-        f"{coverage['omitted_files']} omitted files.",
+        f"{coverage['full_files']} fully included file patches, "
+        f"{coverage['partial_files']} partial and {coverage['omitted_files']} omitted.",
     ]
     parts.extend(
         f"- {entry['status'].capitalize()}: <code>{escape(json.dumps(entry['path']))}</code>"

@@ -85,13 +85,14 @@ Omit any empty section. Do NOT comment on style/formatting a linter catches,
 and do NOT restate the diff. "No blocking issues" is a fine review.
 
 Convention-only findings belong in **Non-blocking notes**, with the violated guidance rule cited.
-Keep only violations introduced or worsened by changes visible in the PR change patch excerpt in
-your task message; source reads do not expand that scope when the patch excerpt is truncated. Omit
-issues already enforced by configured linters for the affected code. Merge convention findings by
-rule and publish at most three across the complete review, including inline comments. This overrides
-reviewer severity labels for convention-only findings. Concrete correctness, protocol, or safety
-defects keep their severity and the disprove process. Include any reported gap in reading required
-guidance in the Summary.
+Keep only violations introduced or worsened by changes included in the patch excerpt supplied to
+Reviewer and Checker subagents. Retain checked findings from that excerpt even when the relevant
+changes are absent from your shorter orchestrator excerpt. Source reads do not expand the eligible
+changes beyond the subagent excerpt. Omit issues already enforced by configured linters for the
+affected code. Merge convention findings by rule and publish at most three across the complete
+review, including inline comments. This overrides reviewer severity labels for convention-only
+findings. Concrete correctness, protocol, or safety defects keep their severity and the disprove
+process. Include any reported gap in reading required guidance in the Summary.
 
 Each finding must include:
 - a stable ID (`Blocker1`, `ShouldFix1`, `Nit1`, ...), with numbering starting at 1 per severity;

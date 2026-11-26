@@ -1065,7 +1065,8 @@ jobs:
               "This PR is part of a stack. Review defects introduced by this child's changes. "
               "Changes inherited from ancestor PRs are context only. Check effects on unchanged "
               "callers and use source tools for surrounding context. Findings about code must "
-              "concern changes visible in the patch excerpt. "
+              "concern changes included in the patch excerpt supplied to Reviewer and Checker "
+              "subagents. "
               "The parent relationship is author supplied; the boundary comes from GitHub "
               "ancestry.\n\n"
               if review_base_sha != pr_metadata["base"]["sha"]

@@ -477,7 +477,11 @@ class FindingPublicationTest(unittest.TestCase):
         record = publish(github, [finding()], coverage=coverage)
         self.assertTrue(record["complete"])
         main = github.issues[0]["body"]
-        self.assertIn("1 of 3 file sections fully included; 1 partial and 1 omitted", main)
+        self.assertIn(
+            "Patch truncated for subagents: 1 of 3 file patches fully included; "
+            "1 partial and 1 omitted",
+            main,
+        )
         self.assertNotIn("Full Coverage", main)
         self.assertNotIn("Partial Coverage", main)
         self.assertNotIn("missing.rs", main)
@@ -489,7 +493,7 @@ class FindingPublicationTest(unittest.TestCase):
         coverage.update(complete=True)
         github = FakeGitHub()
         publish(github, [], coverage=coverage)
-        self.assertNotIn("Review input truncated", github.issues[0]["body"])
+        self.assertNotIn("Patch truncated for subagents", github.issues[0]["body"])
 
     def test_legacy_unknown_severity_split_does_not_fabricate_zeroes(self):
         body = format_review_summary(

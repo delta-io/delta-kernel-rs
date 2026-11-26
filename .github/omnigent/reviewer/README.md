@@ -280,8 +280,8 @@ check's instructions to refresh the description or synchronize the stack, then r
 A **patch excerpt** is the leading portion of the fetched PR change patch inserted into task
 messages. Selecting the commit range happens before applying the excerpt's byte limit.
 `pr_change_patch_bytes` in the workflow holds the fetched patch; `subagent_patch_excerpt_text`
-holds the excerpt included in subagent task messages. Neither a fetched patch nor a model's successful return proves every
-changed line was examined.
+holds the excerpt included in subagent task messages. Neither a fetched patch nor a model's
+successful return proves every changed line was examined.
 
 ## Input limits
 
@@ -300,20 +300,23 @@ its byte interval in `/tmp/diff_coverage.json`, marking each file section fully 
 included or omitted. These measurements describe the supplied patch excerpt; they do not prove
 which changed lines a model examined or whether it found every defect.
 
-`build_orchestrator_task_message()` reserves the other task-message text and complete changed-path
-list before adding the orchestrator's patch excerpt. If the path list cannot fit,
-`list_changed_paths` reads it in pages from `/tmp/ai_review_changed_paths.json`. A source-file read
-provides context without expanding the changed lines eligible for new findings.
+`build_orchestrator_task_message()` reserves the other task-message text, both excerpt byte counts
+and complete changed-path list before adding the orchestrator's patch excerpt. If the path list
+cannot fit, `list_changed_paths` reads it in pages from `/tmp/ai_review_changed_paths.json`.
+A source-file read provides context without expanding the changed lines eligible for new findings.
+
+The orchestrator retains checked findings from changes included in the subagent excerpt, even
+when those changes are absent from its own shorter excerpt.
 
 Subagent task messages contain assignments, shared PR task text and optional maintainer guidance.
 The task builder applies no combined 120,000-byte limit to those messages. Role instructions,
 tool definitions and later tool results are outside the initial task-message limits. Review-range
 selection reads the complete original PR description before excerpt preparation.
 
-If the subagent patch excerpt is truncated, the main AI review comment reports file counts between
-its reviewed-commit line and PR Summary. The `AI Review Summary` Check Run and workflow log list
-partly included and omitted paths, selected commit SHAs and supplied/total bytes. An uncut patch
-adds no truncation notice.
+If the subagent patch excerpt is truncated, the main AI review comment reports counts of fully
+included, partly included and omitted file patches, with a link to the details in Checks. The
+`AI Review Summary` Check Run and workflow log list partly included and omitted paths, selected
+commit SHAs and supplied/total bytes. An uncut patch adds no truncation notice.
 
 The 120,000-byte guard protects the single `omnigent run -p` command argument. On Linux with
 4 KiB pages, one argument is limited to 131,072 bytes including its trailing NUL. Separate role

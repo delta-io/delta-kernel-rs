@@ -79,38 +79,54 @@ def build_orchestrator_task_message(
     *,
     limit: int = MAX_ORCHESTRATOR_INITIAL_TASK_MESSAGE_BYTES,
 ) -> str:
-    """Build the initial orchestrator task message within its UTF-8 byte limit.
+    """Build the initial orchestrator task message with both patch excerpt byte counts.
 
     Keep run-specific instructions, PR metadata, the description and earlier AI review text in
     task_text_without_patch. If the complete changed-path list cannot fit, name the
     list_changed_paths tool so the orchestrator can read every path in pages. Role instructions,
     tool definitions and later tool results are outside the initial task message limit.
+    Reserve the byte-count notice before adding paths and patch text. Raise ValueError if the
+    fixed task text leaves no room for that notice within the UTF-8 byte limit.
     """
     prefix_bytes = len(task_text_without_patch.encode("utf-8"))
     if prefix_bytes > limit:
         raise ValueError(
             "orchestrator task text without the patch exceeds the initial-message byte limit"
         )
+    max_excerpt_bytes = min(MAX_ORCHESTRATOR_PATCH_EXCERPT_BYTES, len(pr_change_patch_bytes))
+    excerpt_notice = (
+        "\n\n## Patch excerpts\n"
+        f"This orchestrator task message includes {{included}} of {len(pr_change_patch_bytes)} "
+        "UTF-8 patch bytes.\n"
+        f"Reviewer and Checker task messages include {coverage['excerpt_bytes']} of "
+        f"{len(pr_change_patch_bytes)} UTF-8 patch bytes in a separate excerpt.\n"
+    )
+    reserved_bytes = prefix_bytes + len(
+        excerpt_notice.format(included=max_excerpt_bytes).encode("utf-8")
+    )
+    if reserved_bytes > limit:
+        raise ValueError("orchestrator task text leaves no room for patch excerpt byte counts")
     paths = "\n".join(
         json.dumps(section["path"], ensure_ascii=False) for section in coverage["files"]
     )
     manifest = f"\n\n## Complete scoped changed paths\n{paths}\n"
-    if prefix_bytes + len(manifest.encode("utf-8")) > limit:
+    if reserved_bytes + len(manifest.encode("utf-8")) > limit:
         manifest = (
             "\n\n## Complete scoped changed paths\n"
             "The full path list is available through list_changed_paths. "
             "Read every page using next_offset; this diff excerpt does not list every path.\n"
         )
-    if prefix_bytes + len(manifest.encode("utf-8")) > limit:
+    if reserved_bytes + len(manifest.encode("utf-8")) > limit:
         manifest = "\nlist_changed_paths"
-    if prefix_bytes + len(manifest.encode("utf-8")) > limit:
-        return task_text_without_patch
+    if reserved_bytes + len(manifest.encode("utf-8")) > limit:
+        return task_text_without_patch + excerpt_notice.format(included=0)
     head, tail = "\n## PR Diff\n\n```diff\n", "\n```\n"
-    remaining = limit - prefix_bytes - len((manifest + head + tail).encode("utf-8"))
+    remaining = limit - reserved_bytes - len((manifest + head + tail).encode("utf-8"))
     if remaining < 0:
-        return task_text_without_patch + manifest
-    excerpt = utf8_prefix(pr_change_patch_bytes, min(MAX_ORCHESTRATOR_PATCH_EXCERPT_BYTES, remaining))
-    return task_text_without_patch + manifest + head + excerpt + tail
+        return task_text_without_patch + manifest + excerpt_notice.format(included=0)
+    excerpt = utf8_prefix(pr_change_patch_bytes, min(max_excerpt_bytes, remaining))
+    notice = excerpt_notice.format(included=len(excerpt.encode("utf-8")))
+    return task_text_without_patch + manifest + notice + head + excerpt + tail
 
 
 def list_changed_paths(offset: int = 0, max_entries: int = 500) -> str:
@@ -147,14 +163,14 @@ def list_changed_paths(offset: int = 0, max_entries: int = 500) -> str:
     }, ensure_ascii=True)
 
 
-def strip_stack_header(pr_description_excerpt_text: str) -> str:
+def strip_stack_header(raw_pr_description: str) -> str:
     """Remove only a leading generated git-stack navigation block terminated by its divider."""
-    lines = pr_description_excerpt_text.splitlines(keepends=True)
+    lines = raw_pr_description.splitlines(keepends=True)
     first = 0
     while first < len(lines) and not lines[first].strip():
         first += 1
     if first == len(lines) or not _STACK_HEADING.fullmatch(lines[first].strip()):
-        return pr_description_excerpt_text
+        return raw_pr_description
     items = []
     has_generated_link = False
     has_incremental_link = False
@@ -166,7 +182,7 @@ def strip_stack_header(pr_description_excerpt_text: str) -> str:
         if re.fullmatch(r"\s*-{3,}\s*", line):
             if items and has_generated_link and (not has_unlinked_branch or has_incremental_link):
                 return "".join(lines[index + 1:]).lstrip("\r\n")
-            return pr_description_excerpt_text
+            return raw_pr_description
         if _INCREMENTAL_LINK.fullmatch(line):
             has_generated_link = True
             has_incremental_link = True
@@ -176,8 +192,8 @@ def strip_stack_header(pr_description_excerpt_text: str) -> str:
         elif re.fullmatch(r"[ \t]*[-*] stack/[^\s]+", line):
             has_unlinked_branch = True
         else:
-            return pr_description_excerpt_text
-    return pr_description_excerpt_text
+            return raw_pr_description
+    return raw_pr_description
 
 
 def utf8_prefix(data: bytes, limit: int) -> str:
