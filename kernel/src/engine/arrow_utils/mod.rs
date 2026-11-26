@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{Arc, LazyLock, OnceLock};
 
+use chrono::{DateTime, FixedOffset, Utc};
 use delta_kernel_derive::internal_api;
 use derive_more::Constructor;
 use itertools::Itertools;
@@ -17,12 +18,13 @@ use self::apply_schema::apply_schema_to_struct;
 use self::file_type_validation::validate_file_values_for_read;
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::{
-    Array as ArrowArray, ArrayRef as ArrowArrayRef, GenericListArray, GenericListViewArray,
-    MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StringArray, StructArray, make_array,
-    new_empty_array, new_null_array,
+    Array as ArrowArray, ArrayRef as ArrowArrayRef, BooleanArray, GenericListArray,
+    GenericListViewArray, MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StringArray,
+    StructArray, make_array, new_empty_array, new_null_array,
 };
 use crate::arrow::buffer::NullBuffer;
-use crate::arrow::compute::{CastOptions, cast_with_options};
+use crate::arrow::compute::kernels::cast_utils::string_to_datetime;
+use crate::arrow::compute::{CastOptions, cast_with_options, nullif};
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef as ArrowFieldRef,
     Fields as ArrowFields, Int64Type, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
@@ -1344,18 +1346,30 @@ pub(crate) fn parse_json_impl(
     parse_json_struct(json_strings, &schema, false).map(RecordBatch::from)
 }
 
-/// Parses JSON objects into a nullable struct column.
+/// Parses JSON objects into a nullable struct column. Unlike [`parse_json`], a row that fails to
+/// parse produces a NULL struct instead of failing the batch.
 ///
 /// See [`ParseJsonExpression`](crate::expressions::ParseJsonExpression) for NULL-input examples.
 ///
 /// # Errors
 ///
-/// Returns an error if the input is not a string array or the batch cannot be decoded.
+/// Returns an error if the input is not a string array.
 pub(crate) fn parse_json_to_struct(
     json_strings: &dyn ArrowArray,
     schema: SchemaRef,
 ) -> KernelResult<StructArray> {
-    parse_json_struct(json_strings, &schema, true)
+    let err = match parse_json_struct(json_strings, &schema, true) {
+        Ok(parsed) => return Ok(parsed),
+        Err(err) => err,
+    };
+    // arrow-json fails the whole batch on one bad row. Null the rows that fail on their own and
+    // parse the rest again, so only the failing rows lose their values.
+    trace!("Retrying JSON parsing row by row after: {err}");
+    let failed: BooleanArray = (0..json_strings.len())
+        .map(|row| Some(parse_json_struct(&json_strings.slice(row, 1), &schema, true).is_err()))
+        .collect();
+    let json_strings = nullif(json_strings, &failed)?;
+    parse_json_struct(json_strings.as_ref(), &schema, true)
 }
 
 /// Decodes one struct per string, validating required children only under present parents.
@@ -1387,6 +1401,7 @@ fn parse_json_struct(
             "Expected string array for JSON parsing, got {dt}"
         ))),
     }?;
+    let decoded = normalize_second_offsets(decoded, &ArrowDataType::Struct(target_fields.clone()))?;
     let parsed = cast_array_to_type(
         decoded,
         &ArrowDataType::Struct(target_fields),
@@ -1448,6 +1463,103 @@ fn decode_with_arrow_json<'a>(
     Err(KernelError::generic(
         "Malformed JSON: exited parse_json_impl without deserializing anything useful",
     ))
+}
+
+/// Rewrites `TIMESTAMP` strings that end in a `+HH:MM:SS` or `-HH:MM:SS` offset as the same
+/// instant in UTC, because Arrow's timestamp cast rejects offsets with seconds. Spark-based writers
+/// print them for instants before the session time zone adopted standard time, such as
+/// `-07:52:58` for `America/Los_Angeles` before 1883.
+///
+/// `decoded` is the struct [`StringifyFailureProneLeaves`] decoded, and `target` its final type.
+fn normalize_second_offsets(
+    decoded: ArrowArrayRef,
+    target: &ArrowDataType,
+) -> KernelResult<ArrowArrayRef> {
+    match (target, decoded.data_type()) {
+        (ArrowDataType::Struct(target_fields), ArrowDataType::Struct(_)) => {
+            let decoded_struct = decoded.as_struct();
+            let columns: Vec<_> = decoded_struct
+                .columns()
+                .iter()
+                .zip(target_fields)
+                .map(|(column, field)| normalize_second_offsets(column.clone(), field.data_type()))
+                .try_collect()?;
+            if columns
+                .iter()
+                .zip(decoded_struct.columns())
+                .all(|(new, old)| Arc::ptr_eq(new, old))
+            {
+                return Ok(decoded);
+            }
+            Ok(Arc::new(StructArray::try_new_with_length(
+                decoded_struct.fields().clone(),
+                columns,
+                decoded_struct.nulls().cloned(),
+                decoded_struct.len(),
+            )?))
+        }
+        (ArrowDataType::Timestamp(_, Some(_)), ArrowDataType::Utf8) => {
+            let strings = decoded.as_string::<i32>();
+            if !strings
+                .iter()
+                .flatten()
+                .any(|raw| parse_second_offset_timestamp(raw).is_some())
+            {
+                return Ok(decoded);
+            }
+            let normalized: StringArray = strings
+                .iter()
+                .map(|raw| {
+                    raw.map(|raw| match parse_second_offset_timestamp(raw) {
+                        Some(utc) => utc.format("%Y-%m-%dT%H:%M:%S%.fZ").to_string(),
+                        None => raw.to_string(),
+                    })
+                })
+                .collect();
+            Ok(Arc::new(normalized))
+        }
+        _ => Ok(decoded),
+    }
+}
+
+/// Parses a timestamp whose offset is exactly `+HH:MM:SS` or `-HH:MM:SS`.
+fn parse_second_offset_timestamp(raw: &str) -> Option<DateTime<Utc>> {
+    let split = raw.len().checked_sub("+HH:MM:SS".len())?;
+    let offset = parse_normalized_fixed_offset(raw.get(split..)?)?;
+    let local = string_to_datetime(&offset, raw.get(..split)?).ok()?;
+    Some(local.with_timezone(&Utc))
+}
+
+/// Parses a normalized `+HH:MM[:SS]` or `-HH:MM[:SS]` offset within the conventional `-18:00`
+/// through `+18:00` range.
+pub(crate) fn parse_normalized_fixed_offset(value: &str) -> Option<FixedOffset> {
+    let sign = match value.as_bytes().first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let mut components = value.get(1..)?.split(':');
+    let hours = parse_two_digits(components.next()?)?;
+    let minutes = parse_two_digits(components.next()?)?;
+    let seconds = components.next().map_or(Some(0), parse_two_digits)?;
+    if components.next().is_some()
+        || hours > 18
+        || minutes > 59
+        || seconds > 59
+        || (hours == 18 && (minutes != 0 || seconds != 0))
+    {
+        return None;
+    }
+    FixedOffset::east_opt(sign * (hours * 3_600 + minutes * 60 + seconds))
+}
+
+/// Parses exactly two ASCII decimal digits.
+fn parse_two_digits(value: &str) -> Option<i32> {
+    let [tens, ones] = value.as_bytes() else {
+        return None;
+    };
+    (tens.is_ascii_digit() && ones.is_ascii_digit())
+        .then(|| i32::from(*tens - b'0') * 10 + i32::from(*ones - b'0'))
 }
 
 /// Rewrites failure-prone primitives (`Timestamp`, `TimestampNtz`, `Date`, `Decimal`) to
@@ -1763,7 +1875,7 @@ mod tests {
     use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields, Int32Type,
-        Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
+        Schema as ArrowSchema, SchemaRef as ArrowSchemaRef, TimestampMicrosecondType,
     };
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::engine::arrow_data::ArrowEngineData;
@@ -2019,10 +2131,26 @@ mod tests {
     #[test]
     fn test_parse_json_impl_strict_leaf_errors_propagate() {
         // Type mismatches on strict (non-failure-prone) leaves still surface as batch-level
-        // errors, so the expression-level caller can fall back to its all-null backstop.
+        // errors; only `parse_json_to_struct` nulls the failing rows.
         let schema = schema_ref! { nullable "a": LONG };
         let input: Vec<Option<&str>> = vec![Some(r#"{"a": "not_a_number"}"#)];
         assert!(parse_json_impl(&StringArray::from(input), schema).is_err());
+    }
+
+    #[rstest]
+    #[case::negative("1883-11-18T12:00:00-07:52:58", "1883-11-18T19:52:58Z")]
+    #[case::positive("1800-01-01T00:53:28.5+00:53:28", "1800-01-01T00:00:00.5Z")]
+    #[case::space_separator("1800-01-01 00:53:28+00:53:28", "1800-01-01T00:00:00Z")]
+    #[case::minute_offset_unchanged("2024-01-01T00:00:00-08:00", "2024-01-01T08:00:00Z")]
+    fn test_parse_json_accepts_second_offsets(#[case] raw: &str, #[case] expected: &str) {
+        let schema = schema_ref! { nullable "ts": TIMESTAMP };
+        let json = format!(r#"{{"ts": "{raw}"}}"#);
+        let batch = parse_json_impl(&StringArray::from(vec![json.as_str()]), schema).unwrap();
+        let expected = string_to_datetime(&Utc, expected)
+            .unwrap()
+            .timestamp_micros();
+        let ts = batch.column(0).as_primitive::<TimestampMicrosecondType>();
+        assert_eq!(ts.value(0), expected);
     }
 
     // === Per-cell NULL on failure-prone leaf parse failures ===

@@ -469,12 +469,10 @@ pub struct CaseWhenExpression {
 ///
 /// # Default engine behavior
 ///
-/// `arrow-json`'s typed decoders reject a whole batch when one cell fails to parse. The default
-/// engine works around that for the leaf types that fail most often (timestamp, date, decimal) by
-/// decoding them as strings and safe-casting back, so a bad value in one of those degrades to a
-/// NULL for that field alone. Anything the workaround does not cover, namely structurally invalid
-/// JSON and a type mismatch on any other leaf, falls back to nulling the entire batch rather than
-/// the offending row.
+/// The default engine decodes timestamp, date and decimal leaves as strings and safe-casts them
+/// back, so a bad value in one of those degrades to a NULL for that field alone. A row that fails
+/// to decode for any other reason, such as structurally invalid JSON or a type mismatch on another
+/// leaf, produces a NULL struct without affecting the other rows.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ParseJsonExpression {
     /// The expression that evaluates to a STRING column containing JSON objects.
