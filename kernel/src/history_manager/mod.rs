@@ -1137,9 +1137,8 @@ mod tests {
         );
     }
 
-    /// Tests the fast path: when pre-ICT commits are cleaned up (e.g., via VACUUM), the first
-    /// commit in the log segment is at or after ICT enablement. All visible commits have ICT,
-    /// so we return ICTSearchStartingFrom(0) directly without binary search.
+    /// After cleanup removes the pre-ICT commits, every commit in the log segment has an
+    /// in-commit timestamp. The search can start at index zero.
     #[rstest::rstest]
     #[case::before_all(50)]
     #[case::at_ict_enablement(300)]

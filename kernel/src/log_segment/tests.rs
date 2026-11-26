@@ -63,6 +63,26 @@ use crate::{
     RowVisitor, StorageHandler, Version,
 };
 
+impl LogSegment {
+    /// Builds a test segment with an explicit hint and the default recovery policy.
+    pub(super) fn for_snapshot_impl(
+        storage: &dyn StorageHandler,
+        log_root: Url,
+        log_tail: Vec<ParsedLogPath>,
+        checkpoint_hint: Option<LastCheckpointHint>,
+        time_travel_version: Option<Version>,
+    ) -> Result<Self> {
+        Self::discover_for_snapshot(
+            storage,
+            log_root,
+            log_tail,
+            checkpoint_hint,
+            time_travel_version,
+            MissingCheckpointPolicy::Reject,
+        )
+    }
+}
+
 /// Processes sidecar files for the given checkpoint batch.
 ///
 /// This function extracts any sidecar file references from the provided batch.
@@ -741,8 +761,16 @@ async fn build_snapshot_with_correct_last_multipart_checkpoint() {
     assert_eq!(commit_files[1].version, 7);
 }
 
+#[rstest]
+#[case::strict_latest(MissingCheckpointPolicy::Reject, None)]
+#[case::strict_at_incomplete_checkpoint(MissingCheckpointPolicy::Reject, Some(5))]
+#[case::recover_at_incomplete_checkpoint(MissingCheckpointPolicy::Recover, Some(5))]
+#[case::recover_latest(MissingCheckpointPolicy::Recover, None)]
 #[tokio::test]
-async fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
+async fn build_snapshot_with_missing_checkpoint_part_from_hint(
+    #[case] policy: MissingCheckpointPolicy,
+    #[case] target: Option<Version>,
+) {
     let checkpoint_metadata = LastCheckpointHint {
         version: 5,
         size: 10,
@@ -770,17 +798,104 @@ async fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
     )
     .await;
 
-    let log_segment = LogSegment::for_snapshot_impl(
+    // At target 5 the incomplete multipart checkpoint is still the final filesystem group.
+    let log_segment = LogSegment::discover_for_snapshot(
         storage.as_ref(),
         log_root,
         vec![], // log_tail
         Some(checkpoint_metadata),
-        None,
+        target,
+        policy,
     );
-    assert_result_error_with_message(
-        log_segment,
-        "Invalid Checkpoint: Had a _last_checkpoint hint but didn't find any checkpoints",
+    match policy {
+        MissingCheckpointPolicy::Reject => assert_result_error_with_message(
+            log_segment,
+            "Invalid Checkpoint: Had a _last_checkpoint hint but didn't find any checkpoints",
+        ),
+        MissingCheckpointPolicy::Recover => {
+            let segment = log_segment.unwrap();
+            assert_eq!(segment.checkpoint_version, Some(3));
+            assert_eq!(
+                extract_commit_versions(&segment),
+                (4..=target.unwrap_or(7)).collect_vec()
+            );
+            assert_eq!(segment.last_checkpoint_version(), None);
+        }
+    }
+}
+
+#[rstest]
+#[case::prefix(None, &[1, 2, 3, 4], 0, None)]
+#[case::after_checkpoint(Some(1), &[3, 4], 2, Some("DELTA_TRUNCATED_TRANSACTION_LOG"))]
+#[case::interior(None, &[0, 1, 3, 4], 2, Some("DELTA_VERSIONS_NOT_CONTIGUOUS"))]
+#[case::endpoint(Some(1), &[2, 3], 4, None)]
+#[tokio::test]
+async fn missing_checkpoint_recovery_rejects_incomplete_history(
+    #[case] checkpoint: Option<Version>,
+    #[case] commits: &[Version],
+    #[case] missing: Version,
+    #[case] condition: Option<&str>,
+) {
+    let paths = commits
+        .iter()
+        .map(|v| delta_path_for_version(*v, "json"))
+        .chain(checkpoint.map(|v| delta_path_for_version(v, "checkpoint.parquet")))
+        .collect_vec();
+    let (storage, root) = build_log_with_paths_and_checkpoint(&paths, None).await;
+    let result = LogSegment::discover_for_snapshot(
+        storage.as_ref(),
+        root,
+        vec![],
+        Some(LastCheckpointHint {
+            version: 3,
+            ..Default::default()
+        }),
+        Some(4),
+        MissingCheckpointPolicy::Recover,
+    );
+    match (result.unwrap_err(), condition) {
+        (Error::Delta(error), Some(condition)) => {
+            assert_eq!(error.name(), condition);
+            assert!(
+                matches!(std::error::Error::source(&error).and_then(|e| e.downcast_ref::<KernelError>()), Some(KernelError::MissingVersion(v)) if *v == missing)
+            );
+        }
+        (Error::Kernel(error), None) => {
+            assert!(
+                matches!(error.without_backtrace(), KernelError::MissingVersion(v) if *v == missing)
+            );
+        }
+        (error, expected) => panic!("unexpected error {error:?} for {expected:?}"),
+    }
+}
+
+#[tokio::test]
+async fn missing_checkpoint_recovery_pins_latest_to_catalog_tail() {
+    let (storage, root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(5, "checkpoint.parquet"),
+            delta_path_for_version(6, "json"),
+        ],
+        None,
     )
+    .await;
+    let staged = create_log_path(&format!("memory:///{}", staged_commit_path_for_version(7)));
+    let segment = LogSegment::discover_for_snapshot(
+        storage.as_ref(),
+        root,
+        vec![staged.clone()],
+        Some(LastCheckpointHint {
+            version: 7,
+            ..Default::default()
+        }),
+        None,
+        MissingCheckpointPolicy::Recover,
+    )
+    .unwrap();
+    assert_eq!(segment.end_version, 7);
+    assert_eq!(segment.checkpoint_version, Some(5));
+    assert_eq!(segment.listed.ascending_commit_files.last(), Some(&staged));
+    assert!(segment.last_checkpoint_metadata.is_none());
 }
 
 /// v5 holds three complete checkpoints (classic, 2-part, 3-part), so the 3-part one always wins.
@@ -6127,6 +6242,8 @@ async fn amt_last_checkpoint_hint_bounds_listing(
     #[case] missing_commits: &[Version],
     #[case] end_version: Option<Version>,
     #[case] expected: KernelResult<(Option<Version>, Vec<Version>), &str>,
+    #[values(MissingCheckpointPolicy::Reject, MissingCheckpointPolicy::Recover)]
+    policy: MissingCheckpointPolicy,
 ) {
     let hint = LastCheckpointHint {
         version: 5,
@@ -6145,12 +6262,13 @@ async fn amt_last_checkpoint_hint_bounds_listing(
         .collect_vec();
     let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
 
-    let log_segment = LogSegment::for_snapshot_impl(
+    let log_segment = LogSegment::discover_for_snapshot(
         storage.as_ref(),
         log_root,
         vec![], // log_tail
         Some(hint),
         end_version,
+        policy,
     );
     match expected {
         Ok((checkpoint_version, commits)) => {

@@ -9,7 +9,7 @@ use crate::cancellation::CancellationTokenRef;
 use crate::engine::CancellableEngine;
 use crate::log_path::LogPath;
 use crate::log_segment::{LogSegment, validate_catalog_managed_log_tail};
-use crate::log_segment_files::CheckpointHandling;
+use crate::log_segment_files::{CheckpointHandling, MissingCheckpointPolicy};
 use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
 use crate::metrics::{MetricId, SnapshotLoadMetricContext, SnapshotLoadType};
 use crate::path::DELTA_LOG_DIR_WITH_SLASH;
@@ -50,6 +50,8 @@ pub struct SnapshotBuilder<Mode = FromTableRoot> {
     max_catalog_version: Option<Version>,
     incremental_replay: IncrementalReplay,
     checkpoint_handling: CheckpointHandling,
+    /// Permission to recover earlier history at a single-table location.
+    missing_checkpoint: MissingCheckpointPolicy,
     snapshot_hint: Option<Box<SnapshotHint>>,
     /// Kernel-minted id correlating this build's metric events with its child events.
     operation_id: MetricId,
@@ -77,6 +79,7 @@ impl<Mode> std::fmt::Debug for SnapshotBuilder<Mode> {
             .field("max_catalog_version", &self.max_catalog_version)
             .field("incremental_replay", &self.incremental_replay)
             .field("checkpoint_handling", &self.checkpoint_handling)
+            .field("missing_checkpoint", &self.missing_checkpoint)
             .field("snapshot_hint", &self.snapshot_hint)
             .field("operation_id", &self.operation_id)
             .field("correlation_id", &self.correlation_id)
@@ -147,12 +150,26 @@ impl SnapshotBuilder<FromTableRoot> {
             max_catalog_version: None,
             incremental_replay: IncrementalReplay::default(),
             checkpoint_handling: CheckpointHandling::Adopt,
+            missing_checkpoint: MissingCheckpointPolicy::Reject,
             snapshot_hint: None,
             operation_id: MetricId::new(),
             correlation_id: None,
             cancellation_token: None,
             mode: PhantomType::default(),
         }
+    }
+
+    /// Recover from a missing conventional checkpoint by replaying from an older complete
+    /// checkpoint or from commit zero. All intervening commits through the target must exist.
+    /// Without a requested version or catalog bound, recovery needs a storage or catalog commit
+    /// at or after the hinted version. From the first version in the catalog tail, only its
+    /// commits count.
+    ///
+    /// Enable this only when the storage location is dedicated to a single table history.
+    /// Kernel cannot distinguish commits left by a former table at a reused location.
+    pub fn recover_missing_checkpoint(mut self) -> Self {
+        self.missing_checkpoint = MissingCheckpointPolicy::Recover;
+        self
     }
 
     /// Supply complete snapshot state that Kernel can validate and construct without engine I/O.
@@ -191,6 +208,7 @@ impl SnapshotBuilder<FromSnapshot> {
             max_catalog_version: None,
             incremental_replay: IncrementalReplay::default(),
             checkpoint_handling: CheckpointHandling::Adopt,
+            missing_checkpoint: MissingCheckpointPolicy::Reject,
             snapshot_hint: None,
             operation_id: MetricId::new(),
             correlation_id: None,
@@ -386,6 +404,7 @@ impl<Mode> SnapshotBuilder<Mode> {
             max_catalog_version,
             incremental_replay,
             checkpoint_handling,
+            missing_checkpoint,
             snapshot_hint,
             operation_id,
             correlation_id,
@@ -424,9 +443,8 @@ impl<Mode> SnapshotBuilder<Mode> {
             // Pre-build validations for catalog-managed tables
             Self::validate_catalog_managed_build_inputs(version, max_catalog_version, &log_tail)?;
 
-            // Use time-travel version if set, otherwise fall back to max_catalog_version. Passing
-            // this as the version to LogSegment::for_snapshot does NOT skip the _last_checkpoint
-            // hint -- the hint is still used when its version <= effective_version.
+            // Time travel takes precedence over the catalog bound. Checkpoint discovery can use
+            // a hint at or below this version.
             let effective_version = version.or(max_catalog_version);
 
             // A snapshot is latest when no explicit time-travel version is requested, or when the
@@ -442,7 +460,7 @@ impl<Mode> SnapshotBuilder<Mode> {
                 );
                 let table_url = try_parse_uri(&table_root)
                     .map_err(|error| classify_table_root_error(&table_root, error))?;
-                let log_segment = LogSegment::for_snapshot(
+                let log_segment = LogSegment::load_for_snapshot(
                     engine.storage_handler().as_ref(),
                     table_url
                         .join(DELTA_LOG_DIR_WITH_SLASH)
@@ -450,6 +468,7 @@ impl<Mode> SnapshotBuilder<Mode> {
                     log_tail,
                     effective_version,
                     metric_context.clone(),
+                    missing_checkpoint,
                 )
                 .map_err(|error| {
                     classify_log_segment_error(&table_root, effective_version, error)

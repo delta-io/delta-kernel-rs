@@ -6,6 +6,8 @@ use url::Url;
 use super::*;
 use crate::engine::sync::SyncEngine;
 use crate::engine::{CancellableEngine, DelegatingEngine, RelaxedCounter};
+use crate::log_segment::LogSegment;
+use crate::metrics::SnapshotLoadMetricContext;
 use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path as ObjectPath;
@@ -141,6 +143,8 @@ fn assert_source(commit: &ParsedLogPath, expected_source: CommitSource) {
 /// and that listing terminates without consuming files past the version-named region.
 struct CountingStorageHandler {
     inner: Arc<dyn StorageHandler>,
+    /// Storage visible after the first listing when a test models concurrent changes.
+    subsequent: Option<Arc<dyn StorageHandler>>,
     list_from_count: RelaxedCounter,
     items_listed: Arc<RelaxedCounter>,
 }
@@ -149,6 +153,7 @@ impl CountingStorageHandler {
     fn new(inner: Arc<dyn StorageHandler>) -> Self {
         Self {
             inner,
+            subsequent: None,
             list_from_count: RelaxedCounter::default(),
             items_listed: Arc::new(RelaxedCounter::default()),
         }
@@ -171,7 +176,12 @@ impl StorageHandler for CountingStorageHandler {
     ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
         self.list_from_count.inc();
         let items_listed = self.items_listed.clone();
-        let iter = self.inner.list_from(path, end)?;
+        let storage = if self.call_count() == 1 {
+            &self.inner
+        } else {
+            self.subsequent.as_ref().unwrap_or(&self.inner)
+        };
+        let iter = storage.list_from(path, end)?;
         Ok(Box::new(iter.inspect(move |_| {
             items_listed.inc();
         })))
@@ -179,9 +189,13 @@ impl StorageHandler for CountingStorageHandler {
 
     fn read_files(
         &self,
-        _files: Vec<crate::FileSlice>,
+        files: Vec<crate::FileSlice>,
     ) -> KernelResult<Box<dyn KernelResultIterator<bytes::Bytes>>> {
-        panic!("read_files should not be called during listing");
+        assert!(
+            self.subsequent.is_some() && self.call_count() == 0,
+            "read_files should not be called during listing"
+        );
+        self.inner.read_files(files)
     }
 
     fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> KernelResult<()> {
@@ -1606,6 +1620,192 @@ async fn two_uuid_checkpoints_at_one_version_select_greater_filename() {
     );
 }
 
+#[rstest]
+#[case::checkpoint_reappears(true, true)]
+#[case::observed_tip_disappears(false, false)]
+#[tokio::test]
+async fn missing_checkpoint_recovery_validates_the_original_tip_and_drops_the_hint(
+    #[case] checkpoint_reappears: bool,
+    #[case] tip_survives: bool,
+) {
+    let (first, root) = create_storage(vec![(4, Commit, CommitSource::Filesystem)]).await;
+    let hint = LastCheckpointHint {
+        version: 3,
+        ..Default::default()
+    };
+    first
+        .put(
+            &LastCheckpointHint::path(&root).unwrap(),
+            hint.to_json_bytes().into(),
+            false,
+        )
+        .unwrap();
+    let mut second = vec![
+        (1, ClassicCheckpoint, CommitSource::Filesystem),
+        (2, Commit, CommitSource::Filesystem),
+        (3, Commit, CommitSource::Filesystem),
+    ];
+    if checkpoint_reappears {
+        second.push((3, ClassicCheckpoint, CommitSource::Filesystem));
+    }
+    if tip_survives {
+        second.push((4, Commit, CommitSource::Filesystem));
+        second.push((5, Commit, CommitSource::Filesystem));
+    }
+    let mut storage = CountingStorageHandler::new(first);
+    storage.subsequent = Some(create_storage(second).await.0);
+    let result = LogSegment::load_for_snapshot(
+        &storage,
+        root,
+        vec![],
+        None,
+        SnapshotLoadMetricContext::for_test(),
+        MissingCheckpointPolicy::Recover,
+    );
+    assert_eq!(storage.call_count(), 2);
+    if tip_survives {
+        let segment = result.unwrap();
+        assert_eq!(segment.end_version, 4);
+        assert_eq!(segment.checkpoint_version, Some(3));
+        assert!(segment.checkpoint_hint().is_none());
+    } else {
+        assert!(
+            matches!(result, Err(crate::Error::Kernel(e)) if matches!(e.without_backtrace(), KernelError::MissingVersion(4)))
+        );
+    }
+}
+
+#[rstest]
+#[case::first_window(1, 2)]
+#[case::second_window(BACKWARD_SCAN_WINDOW_SIZE + 1, 3)]
+#[tokio::test]
+async fn missing_checkpoint_recovery_stops_at_the_nearest_complete_checkpoint(
+    #[case] distance: Version,
+    #[case] expected_listings: u64,
+) {
+    let v = BACKWARD_SCAN_WINDOW_SIZE * 3;
+    let checkpoint = v - distance;
+    let mut files = (0..100)
+        .map(|i| (i, Commit, CommitSource::Filesystem))
+        .collect_vec();
+    files.push((checkpoint, ClassicCheckpoint, CommitSource::Filesystem));
+    files.extend((checkpoint + 1..=v + 1).map(|i| (i, Commit, CommitSource::Filesystem)));
+    let (storage, root) = create_storage(files).await;
+    let counted = CountingStorageHandler::new(storage);
+    let HintedListing::Recovered { files, target } = LogSegmentFiles::list_with_checkpoint_hint(
+        &LastCheckpointHint {
+            version: v,
+            ..Default::default()
+        },
+        &counted,
+        &root,
+        vec![],
+        None,
+        MissingCheckpointPolicy::Recover,
+    )
+    .unwrap() else {
+        panic!("expected an older checkpoint")
+    };
+    assert_eq!(target, v + 1);
+    assert_eq!(files.checkpoint_parts[0].version, checkpoint);
+    assert_eq!(counted.call_count(), expected_listings);
+    // The hinted listing sees two commits. Recovery reads the checkpoint and its commits once.
+    assert_eq!(counted.items_listed(), 2 + 1 + (target - checkpoint));
+}
+
+#[tokio::test]
+async fn latest_recovery_fails_after_one_listing_without_a_commit_at_or_after_the_hint() {
+    let log_files = (0..=8)
+        .map(|v| (v, Commit, CommitSource::Filesystem))
+        .collect();
+    let (storage, root) = create_storage(log_files).await;
+    let counted = CountingStorageHandler::new(storage);
+    let result = LogSegmentFiles::list_with_checkpoint_hint(
+        &LastCheckpointHint {
+            version: 10,
+            ..Default::default()
+        },
+        &counted,
+        &root,
+        vec![],
+        None,
+        MissingCheckpointPolicy::Recover,
+    );
+    assert!(
+        matches!(result, Err(e) if matches!(e.without_backtrace(), KernelError::InvalidCheckpoint(message)
+        if message == "Had a _last_checkpoint hint but didn't find any checkpoints"))
+    );
+    assert_eq!(counted.call_count(), 1);
+}
+
+#[rstest]
+#[case::large_gap(5, 1_000_000)]
+#[case::max_version(Version::MAX - 7, Version::MAX)]
+#[tokio::test]
+async fn backward_scan_bounds_sparse_listings(
+    #[case] checkpoint: Version,
+    #[case] target: Version,
+) {
+    let (storage, root) = create_storage(vec![(
+        checkpoint,
+        ClassicCheckpoint,
+        CommitSource::Filesystem,
+    )])
+    .await;
+    let counted = CountingStorageHandler::new(storage);
+    let tail = (checkpoint - 1..=checkpoint + 2)
+        .map(|v| make_parsed_log_path_with_source(v, StagedCommit, CommitSource::Catalog))
+        .collect();
+    let files =
+        LogSegmentFiles::list_with_backward_checkpoint_scan(&counted, &root, tail, target).unwrap();
+    assert!(counted.call_count() <= u64::BITS.into());
+    assert_eq!(counted.items_listed(), 1);
+    assert_eq!(files.checkpoint_parts[0].version, checkpoint);
+    assert_eq!(
+        files
+            .ascending_commit_files
+            .iter()
+            .map(|f| f.version)
+            .collect_vec(),
+        [checkpoint + 1, checkpoint + 2]
+    );
+}
+
+#[rstest]
+#[case::adjacent_window(BACKWARD_SCAN_WINDOW_SIZE)]
+#[case::several_windows(8 * BACKWARD_SCAN_WINDOW_SIZE)]
+#[tokio::test]
+async fn backward_scan_skips_old_history_across_catalog_only_windows(#[case] gap: Version) {
+    let checkpoint = BACKWARD_SCAN_WINDOW_SIZE * 4;
+    let target = checkpoint + gap;
+    let mut stored = (0..100)
+        .map(|v| (v, Commit, CommitSource::Filesystem))
+        .collect_vec();
+    stored.push((checkpoint, ClassicCheckpoint, CommitSource::Filesystem));
+    // Recursive listings can return a nested file whose basename falls outside the probe bounds.
+    let nested = format!(
+        "_delta_log/{:020}/18446744073709551615.json",
+        checkpoint - 1
+    );
+    let (storage, root) = create_storage_with_raw_paths(stored, &[&nested]).await;
+    let counted = CountingStorageHandler::new(storage);
+    let tail = (checkpoint + 1..=target)
+        .map(|v| make_parsed_log_path_with_source(v, StagedCommit, CommitSource::Catalog))
+        .collect();
+    let files =
+        LogSegmentFiles::list_with_backward_checkpoint_scan(&counted, &root, tail, target).unwrap();
+    // Each probe consumes at most one entry. None should enumerate the hundred old commits.
+    assert!(counted.call_count() <= 8);
+    assert!(counted.items_listed() <= counted.call_count() + 1);
+    assert_eq!(files.checkpoint_parts[0].version, checkpoint);
+    assert!(
+        files
+            .staged_commits()
+            .map(|file| file.version)
+            .eq(checkpoint + 1..=target)
+    );
+}
+
 /// v5 holds a complete 2-part checkpoint and two uuid-named ones, so listing selects uuid `bbbb`.
 /// Each case points the hint at a different candidate; only the one naming `bbbb` applies. Runs
 /// `applies_to` against listed paths rather than hand-built ones.
@@ -1634,6 +1834,9 @@ async fn two_uuid_checkpoints_at_one_version_select_greater_filename() {
 async fn last_checkpoint_hint_applies_iff_it_names_the_selected_checkpoint(
     #[case] hint: LastCheckpointHint,
     #[case] expect_hint_applies: bool,
+    #[values(MissingCheckpointPolicy::Reject, MissingCheckpointPolicy::Recover)]
+    policy: MissingCheckpointPolicy,
+    #[values(None, Some(5))] end_version: Option<Version>,
 ) {
     let winner = "00000000000000000005.checkpoint.bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb.parquet";
     let (storage, log_root) = create_storage_with_raw_paths(
@@ -1650,14 +1853,17 @@ async fn last_checkpoint_hint_applies_iff_it_names_the_selected_checkpoint(
     )
     .await;
 
-    let listed = LogSegmentFiles::list_with_checkpoint_hint(
+    let HintedListing::Listed(listed) = LogSegmentFiles::list_with_checkpoint_hint(
         &hint,
         storage.as_ref(),
         &log_root,
         vec![],
-        None,
+        end_version,
+        policy,
     )
-    .unwrap();
+    .unwrap() else {
+        panic!("complete checkpoint should be listed")
+    };
 
     // The winner is the same no matter what the hint names.
     assert_eq!(listed.checkpoint_parts.len(), 1);
