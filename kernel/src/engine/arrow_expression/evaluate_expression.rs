@@ -22,7 +22,8 @@ use crate::arrow::compute::kernels::comparison::in_list_utf8;
 use crate::arrow::compute::kernels::interleave::interleave;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
 use crate::arrow::compute::{
-    and_kleene, can_cast_types, cast, filter_record_batch, is_not_null, is_null, not, or_kleene,
+    CastOptions, and_kleene, can_cast_types, cast, cast_with_options, filter_record_batch,
+    is_not_null, is_null, not, or_kleene,
 };
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields, IntervalUnit,
@@ -39,11 +40,13 @@ use crate::engine::arrow_expression::opaque::{
 use crate::engine::arrow_utils::{list_type_with_element, parse_json_to_struct, prim_array_cmp};
 use crate::engine::ensure_data_types::{ValidationMode, ensure_data_types};
 use crate::error::{KernelError, KernelResult};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::expressions::MumblingBitmapContainsPredicate;
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, CaseWhenExpression,
-    Expression, ExpressionRef, ExpressionStructPatch, JunctionPredicate, JunctionPredicateOp,
-    OpaqueExpression, OpaquePredicate, Predicate, Scalar, UnaryExpression, UnaryExpressionOp,
-    UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
+    CastExpression, CastMode, Expression, ExpressionRef, ExpressionStructPatch, JunctionPredicate,
+    JunctionPredicateOp, OpaqueExpression, OpaquePredicate, Predicate, Scalar, UnaryExpression,
+    UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
 use crate::uri_reference::{scheme_len, uri_encode_location};
@@ -427,14 +430,7 @@ pub fn evaluate_expression(
         ))),
         (Cast(c), result_type) => {
             let input = evaluate_expression(&c.expr, batch, None)?;
-            let target = ArrowDataType::try_from_kernel(&c.target)?;
-            // Arrow errors (rather than nulls per-value) on a type pair it cannot cast; degrade
-            // that to an all-NULL column so an unsupported cast keeps the file.
-            let output = if can_cast_types(input.data_type(), &target) {
-                cast(&input, &target)?
-            } else {
-                new_null_array(&target, input.len())
-            };
+            let output = evaluate_cast(c, &input)?;
             validate_array_type(output, result_type)
         }
         (CaseWhen(case_when), result_type) => evaluate_case_when(case_when, batch, result_type),
@@ -639,6 +635,32 @@ fn evaluate_case_when(
 enum ViewCast {
     ToView,
     ToNonView,
+}
+
+/// Casts `input` to `cast_expr.target`, following its [`CastMode`].
+fn evaluate_cast(cast_expr: &CastExpression, input: &ArrayRef) -> KernelResult<ArrayRef> {
+    let target = ArrowDataType::try_from_kernel(&cast_expr.target)?;
+    match cast_expr.options.mode() {
+        // Arrow errors (rather than nulls per-value) on a type pair it cannot cast; degrade
+        // that to an all-NULL column so an unsupported cast keeps the file.
+        CastMode::Safe if !can_cast_types(input.data_type(), &target) => {
+            Ok(new_null_array(&target, input.len()))
+        }
+        CastMode::Safe => Ok(cast(input, &target)?),
+        CastMode::Strict => {
+            let options = CastOptions {
+                safe: false,
+                ..Default::default()
+            };
+            cast_with_options(input, &target, &options).map_err(|err| {
+                KernelError::invalid_expression(format!(
+                    "Strict cast of {} to {} failed: {err}",
+                    input.data_type(),
+                    cast_expr.target
+                ))
+            })
+        }
+    }
 }
 
 /// Casts list element types between view and non-view string/binary variants.
@@ -881,6 +903,11 @@ pub fn evaluate_predicate(
                 .reduce(|l, r| Ok(reducer(&l?, &r?)?))
                 .unwrap_or_else(|| Ok(BooleanArray::from(vec![default; batch.num_rows()])))
         }
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        MumblingBitmapContains(pred) => {
+            let contains = evaluate_mumbling_bitmap_contains(pred, batch)?;
+            Ok(if inverted { not(&contains)? } else { contains })
+        }
         Opaque(OpaquePredicate { op, exprs }) => {
             match op.any_ref().downcast_ref::<ArrowOpaquePredicateOpAdaptor>() {
                 Some(op) => op.eval_pred(exprs, batch, inverted),
@@ -982,6 +1009,24 @@ fn map_string_rows<'a, T>(
             "{op} requires a string input, got {other}"
         ))),
     }
+}
+
+/// Evaluates [`MumblingBitmapContainsPredicate`] for each row of `batch`.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn evaluate_mumbling_bitmap_contains(
+    pred: &MumblingBitmapContainsPredicate,
+    batch: &RecordBatch,
+) -> KernelResult<BooleanArray> {
+    let value_array = evaluate_expression(pred.value(), batch, Some(&DataType::LONG))?;
+    let values = value_array.as_primitive_opt::<Int64Type>().ok_or_else(|| {
+        KernelError::invalid_expression(format!(
+            "MUMBLING_BITMAP_CONTAINS value must be LONG, got {}",
+            value_array.data_type()
+        ))
+    })?;
+    let bitmap = pred.bitmap();
+    let contains = |value: i64| u32::try_from(value).is_ok_and(|pos| bitmap.contains(pos));
+    Ok(values.iter().map(|value| value.map(contains)).collect())
 }
 
 /// `chrono` formats for `TIMESTAMP_NTZ` and `TIMESTAMP` values in JSON stats.
@@ -1353,8 +1398,8 @@ mod tests {
     use super::*;
     use crate::arrow::array::{
         ArrayData as ArrowArrayData, ArrayRef, BinaryArray, BooleanArray, Date32Array,
-        Float32Array, Float64Array, Int32Array, Int64Array, LargeStringArray, ListArray,
-        MapBuilder, StringArray, StringBuilder, StringViewArray, StructArray,
+        DictionaryArray, Float32Array, Float64Array, Int32Array, Int64Array, LargeStringArray,
+        ListArray, MapBuilder, StringArray, StringBuilder, StringViewArray, StructArray,
         TimestampMicrosecondArray,
     };
     use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
@@ -1362,6 +1407,8 @@ mod tests {
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
         TimestampMicrosecondType,
     };
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::content_tree::mumbling::tests::encode_positions;
     use crate::engine::arrow_conversion::TryIntoKernel;
     use crate::expressions::{
         ArrayData, BinaryExpressionOp, BinaryPredicateOp, Expression as Expr,
@@ -2410,6 +2457,67 @@ mod tests {
         assert_result_error_with_message(
             evaluate_predicate(&pred, &batch, false),
             "Invalid right value for (NOT) IN comparison",
+        );
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn bitmap_values_batch() -> RecordBatch {
+        let positions = Int64Array::from(vec![
+            Some(0),
+            Some(1),
+            Some(2),
+            None,
+            Some(-1),
+            Some(1 << 33),
+        ]);
+        RecordBatch::try_from_iter([("pos", Arc::new(positions) as ArrayRef)]).unwrap()
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn bitmap_lookup(positions: &[u32], value: Expr) -> Pred {
+        Pred::try_mumbling_bitmap_contains(encode_positions(positions), value).unwrap()
+    }
+
+    /// NULL values stay NULL; values no bitmap can hold are never contained.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::contains_one(
+        false,
+        &[Some(false), Some(true), Some(false), None, Some(false), Some(false)]
+    )]
+    #[case::inverted(true, &[Some(true), Some(false), Some(true), None, Some(true), Some(true)])]
+    fn test_mumbling_bitmap_contains(#[case] inverted: bool, #[case] expected: &[Option<bool>]) {
+        let pred = bitmap_lookup(&[1], col!("pos"));
+        let result = evaluate_predicate(&pred, &bitmap_values_batch(), inverted).unwrap();
+        assert_eq!(result, BooleanArray::from(expected.to_vec()));
+    }
+
+    /// The largest position a bitmap can hold is found; positions beyond it are never contained.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::max_position_set(&[2_097_151], &[Some(true), Some(false), Some(false)])]
+    #[case::empty_bitmap(&[], &[Some(false); 3])]
+    fn test_mumbling_bitmap_contains_range_edges(
+        #[case] positions: &[u32],
+        #[case] expected: &[Option<bool>],
+    ) {
+        let values = Int64Array::from(vec![2_097_151, 2_097_152, i64::from(u32::MAX)]);
+        let batch = RecordBatch::try_from_iter([("pos", Arc::new(values) as ArrayRef)]).unwrap();
+        let pred = bitmap_lookup(positions, col!("pos"));
+        let result = evaluate_predicate(&pred, &batch, false).unwrap();
+        assert_eq!(result, BooleanArray::from(expected.to_vec()));
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_mumbling_bitmap_contains_rejects_non_long_value() {
+        assert_result_error_with_message(
+            evaluate_predicate(
+                &bitmap_lookup(&[1], lit(1i32)),
+                &bitmap_values_batch(),
+                false,
+            ),
+            "value must be LONG",
         );
     }
 
@@ -4659,19 +4767,162 @@ mod tests {
         assert!(evaluate_expression(&expr, &batch, Some(&DataType::DATE)).is_ok());
     }
 
-    #[test]
-    fn test_cast_unsupported_type_pair_yields_null() {
-        // Arrow has no cast from Boolean to Date; the cast degrades to an all-NULL column.
-        let schema = ArrowSchema::new(vec![ArrowField::new("flag", ArrowDataType::Boolean, true)]);
-        let flags = BooleanArray::from(vec![Some(true), Some(false)]);
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(flags)]).unwrap();
+    /// Runs a cast of column `c` in `mode` and returns the result.
+    fn cast_column(values: ArrayRef, target: DataType, mode: CastMode) -> KernelResult<ArrayRef> {
+        let batch = RecordBatch::try_from_iter([("c", values)]).unwrap();
+        let expr = Expr::Cast(CastExpression::new(col!("c"), target, mode));
+        evaluate_expression(&expr, &batch, None)
+    }
 
-        let expr = Expr::cast(col!("flag"), DataType::DATE);
-        let result = evaluate_expression(&expr, &batch, None).unwrap();
+    #[rstest]
+    #[case::safe(CastMode::Safe)]
+    #[case::strict(CastMode::Strict)]
+    fn test_cast_long_to_int_keeps_values_that_fit(#[case] mode: CastMode) {
+        let values = vec![
+            Some(1),
+            None,
+            Some(i64::from(i32::MAX)),
+            Some(i64::from(i32::MIN)),
+        ];
+        let result = cast_column(
+            Arc::new(Int64Array::from(values.clone())),
+            DataType::INTEGER,
+            mode,
+        )
+        .unwrap();
+        let expected: Vec<Option<i32>> = values.iter().map(|v| v.map(|v| v as i32)).collect();
+        assert_eq!(
+            result.as_primitive::<Int32Type>(),
+            &Int32Array::from(expected)
+        );
+    }
 
-        assert_eq!(result.len(), 2);
-        assert_eq!(result.null_count(), 2);
-        assert_eq!(result.data_type(), &ArrowDataType::Date32);
+    /// A safe cast nulls a value it cannot represent, while a strict cast fails and names it.
+    #[rstest]
+    #[case::overflow(
+        Arc::new(Int64Array::from(vec![Some(1), Some(i64::from(i32::MAX) + 1)])),
+        DataType::INTEGER,
+        1,
+        Some("2147483648")
+    )]
+    #[case::underflow(
+        Arc::new(Int64Array::from(vec![i64::from(i32::MIN) - 1])),
+        DataType::INTEGER,
+        1,
+        Some("-2147483649")
+    )]
+    #[case::unparseable_string(
+        Arc::new(StringArray::from(vec![Some("2025-04-11"), Some("not-a-date")])),
+        DataType::DATE,
+        1,
+        Some("not-a-date")
+    )]
+    #[case::empty_string(
+        Arc::new(StringArray::from(vec![""])),
+        DataType::INTEGER,
+        1,
+        Some("''")
+    )]
+    #[case::unsupported_pair(
+        Arc::new(BooleanArray::from(vec![Some(true), Some(false)])),
+        DataType::DATE,
+        2,
+        None
+    )]
+    fn test_cast_of_unrepresentable_value(
+        #[case] values: ArrayRef,
+        #[case] target: DataType,
+        #[case] safe_null_count: usize,
+        #[case] bad_value: Option<&str>,
+    ) {
+        let strict_error = format!("Strict cast of {} to {target} failed", values.data_type());
+        let safe = cast_column(values.clone(), target.clone(), CastMode::Safe).unwrap();
+        assert_eq!(safe.len(), values.len());
+        assert_eq!(safe.null_count(), safe_null_count);
+        assert_eq!(
+            safe.data_type(),
+            &ArrowDataType::try_from_kernel(&target).unwrap()
+        );
+        let err = cast_column(values, target, CastMode::Strict).unwrap_err();
+        assert!(
+            matches!(
+                err.without_backtrace(),
+                KernelError::InvalidExpressionEvaluation(_)
+            ),
+            "{err}"
+        );
+        let message = err.to_string();
+        assert!(message.contains(&strict_error), "{message}");
+        if let Some(bad_value) = bad_value {
+            assert!(message.contains(bad_value), "{message}");
+        }
+    }
+
+    const HIDDEN_OVERFLOW: i64 = i32::MAX as i64 + 1;
+
+    /// A struct whose second row is NULL but still stores an unrepresentable child value.
+    fn null_struct_row_over_overflow() -> ArrayRef {
+        let child: ArrayRef = Arc::new(Int64Array::from(vec![7, HIDDEN_OVERFLOW]));
+        let fields = Fields::from(vec![ArrowField::new("a", ArrowDataType::Int64, true)]);
+        let nulls = NullBuffer::from(vec![true, false]);
+        Arc::new(StructArray::try_new(fields, vec![child], Some(nulls)).unwrap())
+    }
+
+    /// A list sliced past the entry that holds an unrepresentable element.
+    fn list_sliced_past_overflow() -> ArrayRef {
+        let lists = [Some(vec![Some(HIDDEN_OVERFLOW)]), Some(vec![Some(1)])];
+        Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(lists).slice(1, 1))
+    }
+
+    /// A dictionary whose values include an unrepresentable one that no key references.
+    fn dictionary_with_unreferenced_overflow() -> ArrayRef {
+        let values = Arc::new(Int64Array::from(vec![1, HIDDEN_OVERFLOW]));
+        Arc::new(DictionaryArray::<Int32Type>::try_new(Int32Array::from(vec![0]), values).unwrap())
+    }
+
+    #[rstest]
+    #[case::under_null_struct_row(
+        null_struct_row_over_overflow(),
+        StructType::new_unchecked([StructField::nullable("a", DataType::INTEGER)]).into()
+    )]
+    #[case::outside_list_slice(
+        list_sliced_past_overflow(),
+        ArrayType::new(DataType::INTEGER, true).into()
+    )]
+    #[case::unreferenced_dictionary_value(
+        dictionary_with_unreferenced_overflow(),
+        DataType::INTEGER
+    )]
+    fn test_strict_cast_checks_stored_values(#[case] values: ArrayRef, #[case] target: DataType) {
+        assert!(cast_column(values.clone(), target.clone(), CastMode::Safe).is_ok());
+        assert_result_error_with_message(
+            cast_column(values, target, CastMode::Strict),
+            "2147483648",
+        );
+    }
+
+    /// A strict cast checks values inside a struct, and its error names the offending value.
+    #[rstest]
+    #[case::fits(7, Ok(7))]
+    #[case::overflow(i64::from(i32::MAX) + 1, Err("2147483648"))]
+    fn test_strict_cast_of_nested_value(#[case] value: i64, #[case] expected: Result<i32, &str>) {
+        let values: ArrayRef = Arc::new(StructArray::from(vec![(
+            Arc::new(ArrowField::new("a", ArrowDataType::Int64, true)),
+            Arc::new(Int64Array::from(vec![value])) as ArrayRef,
+        )]));
+        let target = StructType::new_unchecked([StructField::nullable("a", DataType::INTEGER)]);
+        let result = cast_column(values, target.into(), CastMode::Strict);
+        match expected {
+            Ok(expected) => assert_eq!(
+                result
+                    .unwrap()
+                    .as_struct()
+                    .column(0)
+                    .as_primitive::<Int32Type>(),
+                &Int32Array::from(vec![expected])
+            ),
+            Err(bad_value) => assert_result_error_with_message(result, bad_value),
+        }
     }
 
     fn case_when_batch() -> RecordBatch {
