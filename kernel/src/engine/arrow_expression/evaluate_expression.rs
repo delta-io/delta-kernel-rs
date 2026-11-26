@@ -995,11 +995,13 @@ struct TimestampFormats {
 /// `%.3f` truncates rather than rounds, and floors below the epoch. Reader subtracts .000999
 /// from the query value before comparing it to the max stat so it doesn't skip the wrong files.
 ///
-/// The `Z` is literal rather than `%:z`, which spells a zero offset `+00:00`. Both are valid ISO
-/// 8601, and writers differ: Spark-based writers print the session time zone's offset, which is
-/// not always zero. `Z` matches this crate's own partition-value serialization. Hardcoding it is
-/// correct only because the values are formatted in UTC: `arrow_conversion` accepts a
-/// timezone-annotated array only when the annotation is UTC.
+/// The Delta protocol does not specify how a timestamp stat is rendered, only that it is truncated
+/// to milliseconds. It recommends UTC ISO 8601 only for partition values, and writers differ:
+/// some print the session time zone's offset (e.g. `-08:00`), others print no offset.
+///
+/// We emit a literal `Z` (as for partition values) rather than `%:z`, which would spell `+00:00`.
+/// Hardcoding it is correct because the values are formatted in UTC: `arrow_conversion` accepts
+/// a timezone-annotated array only when the annotation is UTC.
 const STATS_TIMESTAMP_MILLIS_FORMATS: TimestampFormats = TimestampFormats {
     ntz: "%Y-%m-%dT%H:%M:%S%.3f",
     tz: "%Y-%m-%dT%H:%M:%S%.3fZ",
