@@ -1,4 +1,4 @@
-"""Tests for bounded previous-review selection and deduplication."""
+"""Tests for trusted previous-review context, side metadata, and finding normalization."""
 
 from __future__ import annotations
 
@@ -89,7 +89,6 @@ class ReviewHistoryTest(unittest.TestCase):
             module.format_review_history(document),
             "No previous AI review findings were found.",
         )
-        self.assertEqual(module.previous_inline_comments(document), [])
 
     def test_history_ignores_marker_from_untrusted_bot(self) -> None:
         module = _load_module()
@@ -99,8 +98,6 @@ class ReviewHistoryTest(unittest.TestCase):
             module.format_review_history(document),
             "No previous AI review findings were found.",
         )
-        self.assertEqual(module.previous_inline_comments(document), [])
-        self.assertFalse(module.is_duplicate_review("Old collapsed finding", document))
 
     def test_history_accepts_configured_bot_with_optional_suffix(self) -> None:
         module = _load_module()
@@ -111,37 +108,50 @@ class ReviewHistoryTest(unittest.TestCase):
             "Old collapsed finding",
             module.format_review_history(document, trusted_logins),
         )
-        self.assertEqual(
-            len(module.previous_inline_comments(document, trusted_logins)), 1
-        )
+        self.assertIn("Repeated finding", module.format_review_history(document, trusted_logins))
 
-    def test_inline_comments_are_available_for_exact_deduplication(self) -> None:
-        comments = _load_module().previous_inline_comments(_document())
-
-        self.assertEqual(
-            comments,
-            [
-                {
-                    "path": "kernel/src/example.rs",
-                    "line": 10,
-                    "side": "RIGHT",
-                    "body": "**Blocker1** Repeated finding.",
-                }
-            ],
-        )
-
-    def test_inline_comments_fall_back_to_original_line(self) -> None:
+    def test_marked_inline_finding_survives_an_unmarked_parent_review(self) -> None:
         module = _load_module()
         document = _document()
-        comment = document["data"]["repository"]["pullRequest"]["reviews"]["nodes"][0][
-            "comments"
-        ]["nodes"][0]
-        comment["line"] = None
+        pull_request = document["data"]["repository"]["pullRequest"]
+        pull_request["comments"]["nodes"].clear()
+        review = pull_request["reviews"]["nodes"][0]
+        review["body"] = ""
+        comment = review["comments"]["nodes"][0]
+        comment.update(
+            author={"__typename": "Bot", "login": "github-actions[bot]"},
+            body=f"{module.BOT_MARKER}\n**[Blocker 1]** Retained inline finding.",
+        )
 
-        self.assertEqual(module.previous_inline_comments(document)[0]["line"], 10)
+        history = module.format_review_history(document)
 
-        comment["originalLine"] = None
-        self.assertEqual(module.previous_inline_comments(document), [])
+        self.assertIn("Retained inline finding.", history)
+        self.assertIn("kernel/src/example.rs", history)
+
+    def test_inline_history_rejects_spoofed_child_authors(self) -> None:
+        module = _load_module()
+        for marked_parent, author_type, author_login in (
+            (False, "User", "github-actions"),
+            (False, "Bot", "untrusted-app"),
+            (True, "User", "github-actions"),
+            (True, "Bot", "untrusted-app"),
+        ):
+            with self.subTest(
+                marked_parent=marked_parent, author_type=author_type,
+                author_login=author_login,
+            ):
+                document = _document()
+                pull_request = document["data"]["repository"]["pullRequest"]
+                pull_request["comments"]["nodes"].clear()
+                review = pull_request["reviews"]["nodes"][0]
+                if not marked_parent:
+                    review["body"] = ""
+                review["comments"]["nodes"][0].update(
+                    author={"__typename": author_type, "login": author_login},
+                    body=f"{module.BOT_MARKER}\n**[Nit 1]** Spoofed inline finding.",
+                )
+
+                self.assertNotIn("Spoofed inline finding.", module.format_review_history(document))
 
     def test_inline_comment_sides_are_joined_from_rest_metadata(self) -> None:
         module = _load_module()
@@ -156,9 +166,9 @@ class ReviewHistoryTest(unittest.TestCase):
             [{"id": 101, "side": None, "original_side": "LEFT"}],
         )
 
-        self.assertEqual(module.previous_inline_comments(document)[0]["side"], "LEFT")
+        self.assertEqual(comment["side"], "LEFT")
 
-    def test_inline_dedup_fails_open_without_rest_side_metadata(self) -> None:
+    def test_missing_rest_side_metadata_preserves_history_without_inventing_side(self) -> None:
         module = _load_module()
         document = _document()
         comment = document["data"]["repository"]["pullRequest"]["reviews"]["nodes"][0][
@@ -168,7 +178,8 @@ class ReviewHistoryTest(unittest.TestCase):
 
         module.attach_inline_comment_sides(document, [])
 
-        self.assertEqual(module.previous_inline_comments(document), [])
+        self.assertNotIn("side", comment)
+        self.assertIn("Repeated finding", module.format_review_history(document))
 
     def test_inline_comment_sides_ignore_malformed_rest_metadata(self) -> None:
         module = _load_module()
@@ -188,7 +199,7 @@ class ReviewHistoryTest(unittest.TestCase):
 
                 module.attach_inline_comment_sides(document, rest_comments)
 
-                self.assertEqual(module.previous_inline_comments(document), [])
+                self.assertNotIn("side", comment)
 
     def test_empty_history_document_is_supported(self) -> None:
         module = _load_module()
@@ -197,8 +208,6 @@ class ReviewHistoryTest(unittest.TestCase):
             module.format_review_history({}),
             "No previous AI review findings were found.",
         )
-        self.assertEqual(module.previous_inline_comments({}), [])
-        self.assertFalse(module.is_duplicate_review("review", {}))
 
     def test_history_ignores_unmarked_bot_entries(self) -> None:
         module = _load_module()
@@ -211,7 +220,6 @@ class ReviewHistoryTest(unittest.TestCase):
             module.format_review_history(document),
             "No previous AI review findings were found.",
         )
-        self.assertEqual(module.previous_inline_comments(document), [])
 
     def test_finding_normalization_ignores_run_specific_id_and_whitespace(self) -> None:
         module = _load_module()
@@ -221,28 +229,22 @@ class ReviewHistoryTest(unittest.TestCase):
             module.canonical_finding_body("**Blocker1** Repeated finding."),
         )
 
-    def test_complete_review_deduplication_round_trips_publication_wrapper(self) -> None:
+    def test_history_reads_legacy_collapsed_review_wrapper(self) -> None:
         module = _load_module()
-        review_publish_path = Path(__file__).parents[1] / "review_publish.py"
-        spec = importlib.util.spec_from_file_location(
-            "review_publish", review_publish_path
-        )
-        assert spec is not None and spec.loader is not None
-        review_publish = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(review_publish)
         document = _document()
         document["data"]["repository"]["pullRequest"]["comments"]["nodes"][0][
             "body"
-        ] = review_publish.format_review_body(
-            "Old collapsed finding",
-            "https://github.com/delta-io/delta-kernel-rs/actions/runs/1",
-            collapsed=True,
+        ] = (
+            "<!-- ai-review-bot -->\n"
+            "## AI Review <sub>(draft - human review required)</sub>\n\n"
+            "<details><summary>Show review</summary>\n\n"
+            "Old collapsed finding\n\n</details>\n\n---\n"
+            "<sub>Automated review - [workflow run]"
+            "(https://github.com/delta-io/delta-kernel-rs/actions/runs/1)</sub>"
         )
 
-        self.assertTrue(module.is_duplicate_review("Old collapsed finding", document))
         self.assertIn("Old collapsed finding", module.format_review_history(document))
         self.assertNotIn("<details>", module.format_review_history(document))
-        self.assertFalse(module.is_duplicate_review("New finding", document))
 
     def test_history_is_newest_first_and_bounded(self) -> None:
         module = _load_module()

@@ -310,7 +310,7 @@ class ReviewScopeTest(unittest.TestCase):
         marker = "1" * 32
         review = "## Summary\nA child finding needs attention."
         for review_base in (GITHUB_BASE, PARENT):
-            for mode in ("artifact", "inline"):
+            for mode in ("artifact", "summary", "collapsed", "comment", "inline"):
                 with self.subTest(review_base=review_base, mode=mode):
                     with tempfile.TemporaryDirectory() as directory:
                         root = Path(directory)
@@ -318,8 +318,6 @@ class ReviewScopeTest(unittest.TestCase):
                             f"\n<!-- AI_REVIEW_INLINE_START_{marker} -->\n"
                             '{"findings":[]}\n'
                             f"<!-- AI_REVIEW_INLINE_END_{marker} -->"
-                            if mode == "inline"
-                            else ""
                         )
                         (root / "review_raw_output.txt").write_text(
                             f"<!-- AI_REVIEW_START_{marker} -->\n{review}{inline}\n"

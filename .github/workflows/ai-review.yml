@@ -904,15 +904,18 @@ jobs:
               repository(owner: $owner, name: $name) {
                 pullRequest(number: $number) {
                   comments(last: 30) {
-                    nodes { author { __typename login } body createdAt }
+                    nodes { id url author { __typename login } body createdAt }
                   }
                   reviews(last: 30) {
                     nodes {
+                      id
+                      url
+                      commit { oid }
                       author { __typename login }
                       body
                       submittedAt
                       comments(first: 50) {
-                        nodes { fullDatabaseId path line originalLine body }
+                        nodes { fullDatabaseId url author { __typename login } path line originalLine body }
                       }
                     }
                   }
@@ -964,14 +967,12 @@ jobs:
             -H "Accept: application/vnd.github.v3.diff" \
             > /tmp/pr_diff.txt
 
-          if [ "$OUTPUT_MODE" = "inline" ]; then
-            if [ "$review_base_sha" = "$base_sha" ]; then
-              cp /tmp/pr_diff.txt /tmp/github_pr_diff.txt
-            else
-              gh api "repos/${REPO}/compare/${base_sha}...${head_sha}" \
-                -H "Accept: application/vnd.github.v3.diff" \
-                > /tmp/github_pr_diff.txt
-            fi
+          if [ "$OUTPUT_MODE" != "inline" ] || [ "$review_base_sha" = "$base_sha" ]; then
+            cp /tmp/pr_diff.txt /tmp/github_pr_diff.txt
+          else
+            gh api "repos/${REPO}/compare/${base_sha}...${head_sha}" \
+              -H "Accept: application/vnd.github.v3.diff" \
+              > /tmp/github_pr_diff.txt
           fi
 
           echo "review_base_sha=$review_base_sha" >> "$GITHUB_OUTPUT"
@@ -1009,18 +1010,9 @@ jobs:
           # below that bound and count the entire initial task message in UTF-8 bytes.
           # Role instructions, tool definitions and later conversation are outside this cap.
           max_orchestrator_initial_task_message_bytes = 120_000
-          output_mode = os.environ["OUTPUT_MODE"]
           review_marker = os.environ["REVIEW_MARKER"]
           review_base_sha = os.environ["REVIEW_BASE_SHA"]
-          start_marker = f"<!-- AI_REVIEW_START_{review_marker} -->"
-          end_marker = f"<!-- AI_REVIEW_END_{review_marker} -->"
-          output_contract = (
-              f"Begin your response with the exact marker {start_marker} on its own "
-              f"line, then the review. End with the exact marker {end_marker} on its "
-              "own line."
-          )
-          if output_mode == "inline":
-              output_contract = inline_prompt_instructions(review_marker)
+          output_contract = inline_prompt_instructions(review_marker)
           pr_metadata = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
           history_path = pathlib.Path("/tmp/pr_history.json")
           history_document = json.loads(history_path.read_text())
@@ -1378,15 +1370,12 @@ jobs:
               print("::error::AI review contains unsupported control characters.")
               sys.exit(1)
 
-          if os.environ.get("OUTPUT_MODE") == "inline":
-              try:
-                  body, findings = extract_inline_findings(body, marker)
-              except ValueError as error:
-                  print(f"::error::AI inline review metadata is invalid: {error}.")
-                  sys.exit(1)
-              pathlib.Path("/tmp/inline_findings.json").write_text(
-                  json.dumps(findings)
-              )
+          try:
+              body, findings = extract_inline_findings(body, marker)
+          except ValueError as error:
+              print(f"::error::AI finding metadata is invalid: {error}.")
+              sys.exit(1)
+          pathlib.Path("/tmp/inline_findings.json").write_text(json.dumps(findings))
 
           review_base = os.environ["REVIEW_BASE_SHA"]
           head = os.environ["HEAD_SHA"]
@@ -1420,96 +1409,34 @@ jobs:
           client-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
           private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
 
-      - name: Post review comment
-        if: >-
-          steps.review.outputs.review_text != '' &&
-          (
-            needs.authorize.outputs.output_mode == 'collapsed' ||
-            needs.authorize.outputs.output_mode == 'comment'
-          )
+      - name: Publish review findings and summary
+        if: steps.review.outputs.review_text != ''
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
           OUTPUT_MODE: ${{ needs.authorize.outputs.output_mode }}
-          PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
-          REPO: ${{ github.repository }}
-          RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-        run: |
-          set -euo pipefail
-          python3 - <<'PYEOF'
-          import json
-          import os
-          import pathlib
-          import sys
-
-          sys.path.insert(0, ".github/omnigent")
-          from review_publish import format_review_body
-          from review_history import is_duplicate_review
-
-          review = pathlib.Path("/tmp/review_output.txt").read_text()
-          history = json.loads(pathlib.Path("/tmp/pr_history.json").read_text())
-          trusted_bot_logins = json.loads(
-              pathlib.Path("/tmp/trusted_bot_logins.json").read_text()
-          )
-          if is_duplicate_review(review, history, trusted_bot_logins):
-              pathlib.Path("/tmp/skip-duplicate-review").touch()
-              raise SystemExit
-          body = format_review_body(
-              review,
-              os.environ["RUN_URL"],
-              collapsed=os.environ["OUTPUT_MODE"] == "collapsed",
-          )
-          pathlib.Path("/tmp/comment.md").write_text(body + "\n")
-          PYEOF
-
-          if [ -f /tmp/skip-duplicate-review ]; then
-            echo "Skipped an exact duplicate review comment."
-            exit 0
-          fi
-          gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/comment.md
-          echo "Posted review comment."
-
-      - name: Post inline review
-        if: >-
-          steps.review.outputs.review_text != '' &&
-          needs.authorize.outputs.output_mode == 'inline'
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          # Each retained finding gets a changed-line thread or its own Conversation comment.
+          FINDING_PLACEMENT: inline-or-conversation
           HEAD_SHA: ${{ steps.context.outputs.head_sha }}
           PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
           REPO: ${{ github.repository }}
           RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         run: |
           set -euo pipefail
-          python3 .github/omnigent/inline_review.py \
+          python3 .github/omnigent/finding_publication.py \
             --review /tmp/review_output.txt \
             --findings /tmp/inline_findings.json \
-            --diff /tmp/github_pr_diff.txt \
-            --review-diff /tmp/pr_diff.txt \
-            --fallback-output /tmp/inline-fallback.md \
+            --github-pr-patch /tmp/github_pr_diff.txt \
+            --pr-change-patch /tmp/pr_diff.txt \
             --head-sha "$HEAD_SHA" \
             --run-url "$RUN_URL" \
-            --history /tmp/pr_history.json \
+            --repository "$REPO" \
+            --pr-number "$PR_NUMBER" \
+            --mode "$OUTPUT_MODE" \
+            --placement "$FINDING_PLACEMENT" \
             --trusted-bot-logins /tmp/trusted_bot_logins.json \
-            --output /tmp/inline-review.json \
-            --unmapped-output /tmp/unmapped-findings.txt \
-            --duplicate-output /tmp/duplicate-findings.txt \
-            --skip-duplicate-review-output /tmp/skip-duplicate-inline-review.txt
-
-          mapped_count="$(jq '.comments | length' /tmp/inline-review.json)"
-          unmapped_count="$(wc -l < /tmp/unmapped-findings.txt | tr -d ' ')"
-          duplicate_count="$(wc -l < /tmp/duplicate-findings.txt | tr -d ' ')"
-          if [ "$(cat /tmp/skip-duplicate-inline-review.txt)" = "true" ]; then
-            echo "Skipped an exact duplicate inline review body with no new comments."
-            exit 0
-          fi
-          if ! gh api --method POST "repos/${REPO}/pulls/${PR_NUMBER}/reviews" \
-            --input /tmp/inline-review.json --silent; then
-            echo "::warning::GitHub rejected the inline review; posting the collapsed review without inline comments."
-            gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/inline-fallback.md
-            exit 0
-          fi
-          printf 'Posted %s inline finding(s); %s remained in the collapsed review; %s exact duplicate(s) were suppressed.\n' \
-            "$mapped_count" "$unmapped_count" "$duplicate_count"
+            --output /tmp/publication_record.json \
+            --check-output /tmp/check-summary.txt \
+            --full-review-output /tmp/review_output_complete.txt
 
       - name: Publish review summary
         if: >-
@@ -1517,7 +1444,6 @@ jobs:
           needs.authorize.outputs.output_mode == 'summary'
         env:
           PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
-          REVIEW_TEXT: ${{ steps.review.outputs.review_text }}
         run: |
           set -euo pipefail
           {
@@ -1525,7 +1451,7 @@ jobs:
             echo ""
             echo "_Draft - human review required._"
             echo ""
-            echo "$REVIEW_TEXT"
+            cat /tmp/review_output_complete.txt
           } >> "$GITHUB_STEP_SUMMARY"
           echo "Published review to the workflow summary."
 
@@ -1537,7 +1463,8 @@ jobs:
         with:
           name: ai-review-${{ needs.authorize.outputs.pr_number }}-${{ github.run_id }}
           path: |
-            /tmp/review_output.txt
+            /tmp/review_output_complete.txt
+            /tmp/publication_record.json
             /tmp/pr_diff.txt
             /tmp/child_task_pr_data.md
           retention-days: 7
@@ -1562,7 +1489,10 @@ jobs:
 
           if [ "$REVIEW_READY" = "true" ]; then
             title="AI review completed"
-            summary_file=/tmp/review_output.txt
+            summary_file=/tmp/check-summary.txt
+            if [ ! -s "$summary_file" ]; then
+              summary_file=/tmp/review_output.txt
+            fi
           else
             title="AI review unavailable"
             summary_file=/tmp/check-summary.txt
