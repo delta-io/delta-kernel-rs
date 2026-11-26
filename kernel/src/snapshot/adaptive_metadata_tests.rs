@@ -8,15 +8,14 @@ use rstest::rstest;
 use url::Url;
 
 use crate::actions::{
-    CheckpointAction, ContentRoot, DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA, LOG_TXN_SCHEMA,
-    LastManifestCommit, SetTransaction,
+    CheckpointAction, ContentRoot, DomainMetadata, LastManifestCommit, SetTransaction,
 };
 use crate::engine::sync::SyncEngine;
 use crate::metrics::MeteredDeltaEngine;
 use crate::snapshot::builder::tests::measuring_reporter;
 use crate::unit_test_utils::adaptive_metadata_fixtures::{
     checkpoint_line, domain, domain_metadata_line, setup_adaptive_metadata_table, txn_line,
-    write_ict_commit, write_sidecar,
+    write_domain_metadata_sidecar, write_ict_commit, write_txn_sidecar,
 };
 use crate::unit_test_utils::is_io_event;
 use crate::{Snapshot, SnapshotRef, Version};
@@ -181,12 +180,11 @@ fn app_id_versions_come_from_checkpoint_action_and_later_commits(
         &before,
         |engine, table_root, snapshot| CheckpointAction {
             transactions: vec![txn("a", 1), txn("b", 2)],
-            txn_sidecars: vec![write_sidecar(
+            txn_sidecars: vec![write_txn_sidecar(
                 engine,
                 table_root,
                 "txn.parquet",
-                LOG_TXN_SCHEMA.clone(),
-                vec![txn("d", 4).into()],
+                [txn("d", 4)],
             )],
             ..checkpoint_action(snapshot)
         },
@@ -240,12 +238,11 @@ fn domain_metadata_comes_from_checkpoint_action_and_later_commits(
         &before,
         |engine, table_root, snapshot| CheckpointAction {
             domain_metadata: vec![domain("a", "a1"), domain("b", "b1")],
-            domain_metadata_sidecars: vec![write_sidecar(
+            domain_metadata_sidecars: vec![write_domain_metadata_sidecar(
                 engine,
                 table_root,
                 "domains.parquet",
-                LOG_DOMAIN_METADATA_SCHEMA.clone(),
-                vec![domain("d", "d1").into()],
+                [domain("d", "d1")],
             )],
             ..checkpoint_action(snapshot)
         },
