@@ -468,6 +468,185 @@ under `append_child_task_body`.
 The unit tests and the workflow's runtime probes check that instructions expand and load, tasks
 are assembled in order, and sources are readable. They do not measure review quality.
 
+## Testing Omnigent before merge
+
+Use a manual `workflow_dispatch` run to test changes to the workflow, reviewer instructions,
+Python helpers or dependency locks. Normal PR and `/review` events use the workflow on the default
+branch. Opening a PR for reviewer changes therefore does not exercise those changes.
+
+### Prerequisites and local checks
+
+- Use a GitHub account with write, maintain or admin permission on `delta-io/delta-kernel-rs`.
+  `AI_REVIEW_ALLOWLIST` does not authorize manual dispatches.
+- Publish the candidate to a temporary branch in `delta-io/delta-kernel-rs`. A branch that exists
+  only in a fork cannot be selected by a dispatch in the canonical repository. Maintainers must
+  inspect the candidate before running it with repository credentials.
+- The repository needs secrets `LLM_API_KEY` and `GATEWAY_BASE_URL`, plus variables `GATEWAY_HOST`,
+  `MODEL`, `CLAUDE_MAINTAINER_MODEL`, `CODEX_MAINTAINER_MODEL` and `DISPROVE_MODEL`.
+  `GATEWAY_HOST` is the bare gateway hostname used by the egress allowlist. A fork does not inherit
+  this configuration. Optional GitHub App settings are listed in the workflow header.
+- Choose a PR with a nonempty change to review. Coordinate with other testers: a newer review of
+  the same PR can cancel an earlier run, even when the workflow branches differ.
+
+From the candidate checkout, run the same Python checks as the `ai-review-config` CI job.
+That job uses Python 3.12 and `PyYAML==6.0.3`; install PyYAML in your Python environment first.
+
+```bash
+python3 -m unittest discover \
+  --start-directory .github/omnigent/tests --pattern 'test_*.py'
+```
+
+These tests do not call models. For a live test, commit the candidate first; the dispatched
+workflow cannot see uncommitted files. The commands below use Bash and an authenticated GitHub CLI.
+
+### Publish an isolated preview branch
+
+Select the CLI account explicitly. Set `AI_REVIEW_REMOTE` to the Git remote whose **push URL**
+points to `delta-io/delta-kernel-rs`. Git-over-SSH authentication is separate from the CLI account;
+verify that the remote uses an identity allowed to push workflow changes.
+
+```bash
+AI_REVIEW_ACCOUNT=your-maintainer-login
+AI_REVIEW_REPO=delta-io/delta-kernel-rs
+AI_REVIEW_REMOTE=upstream
+AI_REVIEW_PR=1234  # Replace with the PR to review.
+AI_REVIEW_SHA="$(git rev-parse HEAD)"
+AI_REVIEW_REF="ci/ai-review-preview-${AI_REVIEW_SHA:0:12}-$$"
+
+ai_review_gh() {
+  local ai_review_token
+  ai_review_token="$(gh auth token --user "$AI_REVIEW_ACCOUNT")" || return 1
+  if [ -z "$ai_review_token" ]; then
+    printf 'No token for %s\n' "$AI_REVIEW_ACCOUNT" >&2
+    return 1
+  fi
+  GH_TOKEN="$ai_review_token" gh "$@"
+}
+
+ai_review_gh api user --jq .login
+ai_review_gh api "repos/$AI_REVIEW_REPO" --jq .permissions
+git remote get-url --push "$AI_REVIEW_REMOTE"
+git status --short
+```
+
+Check the account, repository, remote and committed SHA before publishing. Use a new preview ref;
+if the selected name already exists, choose another. The empty expected value in this lease
+protects an existing ref from being moved to your candidate.
+
+```bash
+git push --force-with-lease="refs/heads/$AI_REVIEW_REF:" \
+  "$AI_REVIEW_REMOTE" "$AI_REVIEW_SHA:refs/heads/$AI_REVIEW_REF"
+
+test "$(ai_review_gh api \
+  "repos/$AI_REVIEW_REPO/git/ref/heads/$AI_REVIEW_REF" \
+  --jq .object.sha)" = "$AI_REVIEW_SHA"
+
+AI_REVIEW_PR_SHA="$(ai_review_gh api \
+  "repos/$AI_REVIEW_REPO/pulls/$AI_REVIEW_PR" --jq .head.sha)"
+```
+
+Keep the preview branch unchanged for the test. The workflow SHA selects executable code,
+instructions and dependencies; the target PR head selects source to review. The workflow reads
+that PR's current head during input collection, so a concurrent PR update can change the target
+from the SHA recorded above. The selected review base is a third SHA, resolved from PR metadata
+and stack ancestry; see [PR change patch and stacked PRs](#pr-change-patch-and-stacked-prs).
+
+### Dispatch and collect the result
+
+Artifact mode runs the model pipeline and spends model quota. It uploads reports and attempts to
+publish a neutral `AI Review Summary` Check Run on the target commit. It does not publish the
+normal finding comments or review body, so it does not test their placement on GitHub.
+
+```bash
+ai_review_gh workflow run ai-review.yml --repo "$AI_REVIEW_REPO" \
+  --ref "$AI_REVIEW_REF" -f pr="$AI_REVIEW_PR" -f output_mode=artifact
+
+ai_review_gh run list --repo "$AI_REVIEW_REPO" --workflow ai-review.yml \
+  --branch "$AI_REVIEW_REF" --event workflow_dispatch --limit 5 \
+  --json databaseId,headSha,url,status,conclusion
+```
+
+Select the new run whose `headSha` matches `AI_REVIEW_SHA`. It may take a moment to appear.
+Use that run ID for every subsequent command, rather than selecting the latest run again.
+
+```bash
+AI_REVIEW_RUN=123456789  # Replace with the matching run's databaseId.
+AI_REVIEW_EVIDENCE="$(mktemp -d)"
+
+ai_review_gh run watch "$AI_REVIEW_RUN" --repo "$AI_REVIEW_REPO" --exit-status
+ai_review_gh run view "$AI_REVIEW_RUN" --repo "$AI_REVIEW_REPO" \
+  --json url,event,headBranch,headSha,status,conclusion,jobs \
+  > "$AI_REVIEW_EVIDENCE/run.json"
+ai_review_gh run view "$AI_REVIEW_RUN" --repo "$AI_REVIEW_REPO" --log \
+  > "$AI_REVIEW_EVIDENCE/run.log"
+ai_review_gh run download "$AI_REVIEW_RUN" --repo "$AI_REVIEW_REPO" \
+  --name "ai-review-$AI_REVIEW_PR-$AI_REVIEW_RUN" \
+  --dir "$AI_REVIEW_EVIDENCE/report"
+```
+
+If the run fails, still collect its metadata and logs. A failed or skipped model step may leave no
+report artifact. Preserve evidence before the artifact retention period expires; see
+[GitHub comments, Checks and saved reports](#github-comments-checks-and-saved-reports).
+
+### Verify the run
+
+Check the following before reporting a live model test as passed:
+
+- The run event is `workflow_dispatch`, and its `headSha` and checkout log match the candidate
+  SHA. Read the actual `Head SHA` and `Review base SHA` in the downloaded `child_task_pr_data.md`.
+  If the PR changed during the run, update `AI_REVIEW_PR_SHA` to that actual head before querying
+  its checks. The scope-resolution log also explains the selected boundary.
+- `Install Omnigent`, `Validate AI reviewer runtime`, `Run AI review` and `Validate review output`
+  executed successfully. A green workflow with missing credentials or a replay that skips the
+  model step does not establish a live model test.
+- `review_output.txt` contains the validated report. Compare `pr_diff.txt` with
+  `child_task_pr_data.md` to check the supplied patch excerpt and its warnings. Apply the documented
+  [input limits](#input-limits); passing output validation does not prove full input coverage or
+  completion of every reviewer. Inspect any completion or coverage records the candidate emits.
+- The `AI Review Summary` Check Run belongs to the actual reviewed head and links to this workflow
+  run in its summary. It should contain the report, rather than an unavailable message. A neutral
+  conclusion alone does not establish success. Inspect the summary's workflow link as well as the
+  check URL when correlating runs.
+
+For example, list the target commit's checks with the actual reviewed SHA:
+
+```bash
+ai_review_gh api --paginate \
+  "repos/$AI_REVIEW_REPO/commits/$AI_REVIEW_PR_SHA/check-runs" \
+  --jq '.check_runs[] | select(.name == "AI Review Summary")'
+```
+
+In the PR description, record the workflow SHA, reviewed head, review base, run/artifact links,
+the behavior observed, and any skipped or incomplete checks. Distinguish a live model test from
+an offline replay of saved output. If code or instructions change afterward, state which revision
+ran live and how the remaining changes were verified.
+
+### Exercise the behavior being changed
+
+An ordinary artifact-mode run checks setup, model execution and report validation. Select other
+targets or modes when the change affects a different path:
+
+| Change | Additional validation |
+| --- | --- |
+| Inline or Conversation publication | Use a designated test PR and the relevant output mode when review/comment writes are intended. Verify the finding destinations, fallback behavior and duplicate suppression. |
+| Stack boundary selection | Use a child PR with a known immediate parent; confirm that the selected range excludes inherited changes. The scope tests also exercise ambiguous or missing ancestry. |
+| Ambiguous-stack diagnostics | Use the scope tests, or a designated test PR with ambiguous ancestry. Expect review-range resolution to fail before the model step and the Check Run to explain the boundary problem. |
+| Large inputs | Use a diff beyond the candidate's excerpt limit; verify the supplied bytes and truncation warning. Record partial coverage rather than claiming the whole diff was reviewed. |
+
+### Remove the preview branch
+
+After preserving the evidence and waiting for the run to finish, delete only the temporary ref
+created above. The exact-SHA lease rejects deletion if someone has moved it. Keep the PR branches,
+workflow run and downloaded reports.
+
+```bash
+git push --force-with-lease="refs/heads/$AI_REVIEW_REF:$AI_REVIEW_SHA" \
+  "$AI_REVIEW_REMOTE" ":refs/heads/$AI_REVIEW_REF"
+git ls-remote --exit-code --heads "$AI_REVIEW_REMOTE" "refs/heads/$AI_REVIEW_REF"
+```
+
+The final command should print no matching ref and exit with status 2.
+
 ## Finding feedback
 
 Each published inline finding includes feedback instructions: react 👍 for helpful or 👎 for
@@ -503,9 +682,9 @@ To change a version:
    allows, so the diff shows only what the change requires. Add `--upgrade` to refresh every
    pin, in a pull request of its own.
 3. Commit the `.in` and `.txt` files together.
-4. Run a review from the branch before merging. Automatic reviews use the reviewer on `main`,
-   so a pull request does not exercise its own lock. Push the branch to this repository, then
-   run `gh workflow run ai-review.yml --ref <branch> -f pr=<number> -f output_mode=artifact`.
+4. Follow [Testing Omnigent before merge](#testing-omnigent-before-merge) to run the candidate lock
+   from a preview branch and verify actual model execution. Automatic reviews use the default
+   branch's reviewer, so a pull request does not exercise its own lock.
 5. List the packages the lock adds and drops in the pull request description.
 
 `../package.json` and `../package-lock.json` pin the Claude Code and Codex CLIs.
