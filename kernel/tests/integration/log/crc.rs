@@ -1179,6 +1179,14 @@ async fn setup_incremental_below_checkpoint_base<E: TaskExecutor>(
         .at_version(3)
         .build(engine.as_ref())?;
 
+    assert_eq!(
+        base.crc_provenance(),
+        SnapshotCrcProvenance::Stale(CrcProvenance::File {
+            crc_version: 1,
+            on_disk_version: 1,
+        })
+    );
+
     // Checkpoint at v2, above the base's CRC@1 but below the base version.
     Snapshot::builder_for(table_path)
         .at_version(2)
@@ -1203,24 +1211,24 @@ async fn test_incremental_unlimited_skips_below_checkpoint_base() -> delta_kerne
         .build(engine.as_ref())?;
     assert_eq!(updated.version(), 3);
     assert_eq!(updated.log_segment().checkpoint_version, Some(2));
-
     assert_eq!(updated.crc_provenance(), SnapshotCrcProvenance::Absent);
 
     Ok(())
 }
 
-/// Regression (incremental write path): after an incremental update retains a base below a
-/// newly-listed checkpoint, `write_checksum` must skip that below-checkpoint base and resolve from
-/// the checkpoint root rather than erroring on the commits the checkpoint subsumed.
+/// Regression (incremental write path): after an incremental update drops the retained CRC below a
+/// newly-listed checkpoint, `write_checksum` must resolve from the checkpoint root rather than
+/// erroring on the commits the checkpoint subsumed.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_write_checksum_incremental_stale_base_below_new_checkpoint_resolves()
 -> delta_kernel::Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let base = setup_incremental_below_checkpoint_base(&engine, &table_path).await?;
 
-    // Disabled update keeps the below-checkpoint base@1 un-advanced on the combined segment.
+    // With replay disabled, the update drops the retained CRC@1 below checkpoint@2.
     let updated = Snapshot::builder_from(base).build(engine.as_ref())?;
     assert_eq!(updated.log_segment().checkpoint_version, Some(2));
+    assert_eq!(updated.crc_provenance(), SnapshotCrcProvenance::Absent);
 
     // Case 2 must skip the below-checkpoint base and resolve from the checkpoint root.
     assert_eq!(

@@ -105,11 +105,12 @@ pub struct FfiSnapshotHint {
     /// a zero-initialized field is an invalid `Some` payload.
     pub checkpoint_type: OptionalValue<FfiSelectedCheckpointType>,
     /// Optional CRC provenance. A current CRC must match the snapshot hint version. On import its
-    /// origin becomes `SnapshotHint` and any supplied disk version is preserved. Omitting the
-    /// status with a CRC leaves the disk version unspecified. Without a CRC, an omitted status or
-    /// `Absent` yields `Absent`, and `Unusable` preserves a reported failure. A snapshot hint
-    /// cannot carry a stale CRC. Set the tag to `NoneFfiSnapshotCrcProvenance` when omitting
-    /// status.
+    /// origin becomes `SnapshotHint`. A claimed disk version is preserved even if `log_paths`
+    /// omits the corresponding checksum file. Omitting the status with a CRC leaves its disk
+    /// version unspecified. Without a CRC, an omitted, `Absent`, or `Unusable` status yields a
+    /// snapshot hint with no CRC provenance. A snapshot hint cannot carry a stale CRC.
+    /// Set the tag to `NoneFfiSnapshotCrcProvenance` when omitting status.
+    /// Zero-initializing this field claims a file-backed CRC with both versions set to zero.
     pub crc_provenance: OptionalValue<FfiSnapshotCrcProvenance>,
 }
 
@@ -208,10 +209,9 @@ unsafe fn snapshot_builder_with_snapshot_hint_impl(
 /// Returns `UnsupportedError` when the builder was created by
 /// [`get_snapshot_builder_from`](crate::get_snapshot_builder_from). Returns
 /// `InvalidSnapshotHint` when a supplied field cannot be decoded, a log path is outside the
-/// table log root, or the CRC version or provenance contradicts the hint. Compacted paths are
-/// retained; the individual commits must also be supplied. Structural log-segment and
-/// table-configuration errors are returned when the builder is built. A failed call drops the
-/// builder.
+/// table log root, or the supplied provenance contradicts the CRC. Compacted paths are retained;
+/// the individual commits must also be supplied. Building the snapshot validates the log segment,
+/// table configuration, and CRC version against the hint. A failed call drops the builder.
 ///
 /// # Safety
 ///

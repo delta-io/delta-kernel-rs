@@ -151,6 +151,10 @@ impl CrcWithProvenance {
         &self.crc
     }
 
+    pub(crate) fn provenance(&self) -> CrcProvenance {
+        self.provenance
+    }
+
     pub(crate) fn into_parts(self) -> (Arc<Crc>, CrcProvenance) {
         (self.crc, self.provenance)
     }

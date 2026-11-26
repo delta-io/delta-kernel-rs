@@ -802,8 +802,9 @@ impl Snapshot {
     ///
     /// The hint preserves whether this snapshot was built as latest, not whether it is still
     /// latest. Missing checkpoint hints and CRCs at this snapshot's version remain absent.
-    /// Checksum provenance is preserved for exported CRCs. A snapshot hint that omits a stale CRC
-    /// reports [`SnapshotCrcProvenance::Absent`].
+    /// The hint carries the current in-memory CRC and its provenance when available. For a stale
+    /// CRC, an unusable candidate, or no CRC, it carries neither. A snapshot rebuilt from such a
+    /// hint reports [`SnapshotCrcProvenance::Absent`].
     /// Rebuild it with [`SnapshotBuilder::with_snapshot_hint`] for the same table root.
     ///
     /// Original commit and compaction paths are retained together.

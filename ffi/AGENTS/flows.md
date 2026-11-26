@@ -10,7 +10,7 @@ Key files and call sequences for the exported FFI flows. The boundary rules are 
   with their backing storage and conversions colocated
 - `src/snapshot/builder.rs` -- snapshot builders and their configuration
 - `src/snapshot/hint/` -- typed snapshot-hint input and callback export
-- `src/snapshot/snapshot_crc.rs` -- checksum provenance getter and value types
+- `src/snapshot/snapshot_crc.rs` -- checksum provenance value types and conversions
 - `src/handle.rs` -- opaque handle system for passing Rust objects across FFI
 - `src/column_default.rs` -- column-default (`allowColumnDefaults`) reads and the write-path ack
 - `src/scan.rs` -- scan FFI interface
@@ -59,14 +59,16 @@ when the callback returns; copy retained values during the callback. No hint han
 Supply the copied values through `snapshot_builder_with_snapshot_hint` when rebuilding a snapshot.
 The hint preserves build-time freshness, not current freshness, a matching checkpoint hint,
 the selected checkpoint type when known, and an at-version CRC. Stale CRCs are omitted.
-Checksum telemetry is preserved for an exported CRC. A snapshot hint without a CRC preserves an
-explicit `Unusable` observation and otherwise reports `Absent`, including when export omits a stale
-CRC. An imported CRC has `SnapshotHint` provenance. When its status was omitted, its disk version
-is unspecified. Installing the snapshot hint rejects an inconsistent claim. See `FfiSnapshotHint`
-for the claim rules.
+Checksum telemetry is preserved for an exported CRC. A snapshot hint without a CRC carries no
+provenance, including when export omits a stale CRC or the snapshot reported `Unusable`.
+A snapshot rebuilt at the hint version reports `Absent`. An imported CRC has `SnapshotHint` provenance.
+When its status was omitted, its disk version is unspecified. Installing the snapshot hint rejects
+an inconsistent claim. See `FfiSnapshotHint` for the claim rules.
 
 The `last_checkpoint` and `crc` fields in `FfiSnapshotHint` use borrowed nullable pointers.
 `checkpoint_type` and `crc_provenance` are inline `OptionalValue` fields.
+Set the `crc_provenance` tag to `NoneFfiSnapshotCrcProvenance` to omit it. A zero-initialized field
+claims a current CRC from a version-0 checksum file, with an in-memory CRC version of 0.
 An unknown checkpoint type does not mean no checkpoint was selected. A supplied type is advisory;
 naming and protocol take precedence, and checkpoint discovery replaces it with the observed type.
 
@@ -95,7 +97,8 @@ discovery. Otherwise it resolves the type through the same snapshot cache as
 `snapshot_checkpoint_info` and declarative scan planning.
 
 `snapshot_crc_provenance(snapshot, out)` copies the snapshot's `FfiSnapshotCrcProvenance` to caller-owned
-storage without engine I/O. Callers must allocate the complete tagged result and rebuild against\nthe matching generated header. `Current` and `Stale` carry the origin, in-memory CRC version and any
+storage without engine I/O. Callers must allocate the complete tagged result and rebuild against
+the matching generated header. `Current` and `Stale` carry the origin, in-memory CRC version and any
 known checksum-file version. Their version difference counts cumulative commits since that file.
 For `Stale`, subtract the CRC version from the snapshot version to obtain the remaining gap.
 `Absent` and `Unusable` carry no CRC. Status is independent of file-statistics completeness.

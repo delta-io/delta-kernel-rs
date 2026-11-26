@@ -2,7 +2,8 @@
 
 use delta_kernel::snapshot::{CrcProvenance, SnapshotCrcProvenance};
 
-use crate::{Handle, OptionalValue, SharedSnapshot};
+use crate::OptionalValue;
+pub use crate::snapshot_crc_provenance;
 
 /// The status of the CRC retained by a snapshot. See [`SnapshotCrcProvenance`].
 ///
@@ -61,19 +62,6 @@ pub enum FfiCrcProvenance {
         /// Checksum-file version, if known.
         on_disk_version: OptionalValue<u64>,
     },
-}
-
-/// Writes the snapshot-relative CRC provenance without engine I/O.
-///
-/// # Safety
-/// `snapshot` must remain valid for the call. `out` must be aligned and writable for one
-/// `FfiSnapshotCrcProvenance`. Its previous contents may be uninitialized.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn snapshot_crc_provenance(
-    snapshot: Handle<SharedSnapshot>,
-    out: *mut FfiSnapshotCrcProvenance,
-) {
-    unsafe { out.write(snapshot.as_ref().crc_provenance().into()) };
 }
 
 impl From<SnapshotCrcProvenance> for FfiSnapshotCrcProvenance {
@@ -196,16 +184,32 @@ mod tests {
         FfiCrcProvenance::SnapshotHint { crc_version: 3, on_disk_version: OptionalValue::None },
     )]
     #[case(
+        CrcProvenance::SnapshotHint { crc_version: 3, on_disk_version: Some(1) },
+        FfiCrcProvenance::SnapshotHint { crc_version: 3, on_disk_version: OptionalValue::Some(1) },
+    )]
+    #[case(
         CrcProvenance::CreateTable { crc_version: 3, on_disk_version: Some(0) },
         FfiCrcProvenance::CreateTable { crc_version: 3, on_disk_version: OptionalValue::Some(0) },
+    )]
+    #[case(
+        CrcProvenance::CreateTable { crc_version: 3, on_disk_version: None },
+        FfiCrcProvenance::CreateTable { crc_version: 3, on_disk_version: OptionalValue::None },
     )]
     #[case(
         CrcProvenance::Checkpoint { crc_version: 3, on_disk_version: Some(2) },
         FfiCrcProvenance::Checkpoint { crc_version: 3, on_disk_version: OptionalValue::Some(2) },
     )]
     #[case(
+        CrcProvenance::Checkpoint { crc_version: 3, on_disk_version: None },
+        FfiCrcProvenance::Checkpoint { crc_version: 3, on_disk_version: OptionalValue::None },
+    )]
+    #[case(
         CrcProvenance::CommitHistory { crc_version: 3, on_disk_version: None },
         FfiCrcProvenance::CommitHistory { crc_version: 3, on_disk_version: OptionalValue::None },
+    )]
+    #[case(
+        CrcProvenance::CommitHistory { crc_version: 3, on_disk_version: Some(1) },
+        FfiCrcProvenance::CommitHistory { crc_version: 3, on_disk_version: OptionalValue::Some(1) },
     )]
     fn provenance_conversion_preserves_variant_and_versions(
         #[case] provenance: CrcProvenance,

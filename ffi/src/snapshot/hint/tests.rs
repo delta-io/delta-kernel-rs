@@ -2477,28 +2477,26 @@ fn checksum_telemetry_round_trips_without_changing_hint_state(
             .as_ref()
             .unwrap()
             .crc_provenance(),
-        Some(status.unwrap_or(match crc_version {
-            Some(crc_version) => SnapshotCrcProvenance::Current(CrcProvenance::SnapshotHint {
-                crc_version,
-                on_disk_version: None,
-            }),
-            None => SnapshotCrcProvenance::Absent,
-        }))
+        crc_version.map(
+            |crc_version| status.unwrap_or(SnapshotCrcProvenance::Current(
+                CrcProvenance::SnapshotHint {
+                    crc_version,
+                    on_disk_version: None
+                },
+            ))
+        )
     );
     let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
     let rebuilt = rebuild_through_visitor(&snapshot, &engine);
     let mut observed = std::mem::MaybeUninit::uninit();
     unsafe { snapshot_crc_provenance(rebuilt.shallow_copy(), observed.as_mut_ptr()) };
 
-    // Then the rebuilt snapshot preserves CRC presence and any reported checksum-file failure.
+    // Then the rebuilt snapshot reports hint provenance for a supplied CRC and Absent otherwise.
     let expected = match crc_version {
         Some(version) => FfiSnapshotCrcProvenance::Current(FfiCrcProvenance::SnapshotHint {
             crc_version: version,
             on_disk_version: expected_disk.into(),
         }),
-        None if status == Some(SnapshotCrcProvenance::Unusable) => {
-            FfiSnapshotCrcProvenance::Unusable
-        }
         None => FfiSnapshotCrcProvenance::Absent,
     };
     assert_eq!(unsafe { observed.assume_init() }, expected);

@@ -20,11 +20,10 @@ pub enum SnapshotCrcProvenance {
     /// The in-memory CRC predates this snapshot and is available as a replay base.
     Stale(CrcProvenance),
     /// The snapshot holds no CRC and has no report of an unusable candidate. This includes a
-    /// listing with no eligible checksum file, a snapshot hint without a CRC or a failure claim,
+    /// listing with no eligible checksum file, a snapshot hint without a CRC,
     /// and a stale CRC discarded at a checkpoint.
     Absent,
-    /// A checksum candidate could not be read or validated, or a snapshot hint reported such a
-    /// failure, and no CRC was retained.
+    /// A checksum candidate could not be read or validated and no CRC was retained.
     Unusable,
 }
 
@@ -160,7 +159,7 @@ impl SnapshotCrc {
         }
     }
 
-    /// Omits stale CRCs when deriving snapshot hints and checkpoints.
+    /// Omits stale CRCs from the snapshot returned after checkpointing.
     pub(crate) fn only_current(&self) -> Self {
         match self.provenance {
             SnapshotCrcProvenance::Stale(_) => Self::ABSENT,

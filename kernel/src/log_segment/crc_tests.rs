@@ -1642,10 +1642,10 @@ async fn test_stale_crc_advanced_only_within_replay_budget(
     let hint = snapshot.to_snapshot_hint().unwrap();
     assert_eq!(
         hint.crc_provenance(),
-        Some(match expected_status {
-            SnapshotCrcProvenance::Stale(_) => SnapshotCrcProvenance::Absent,
-            other => other,
-        })
+        match expected_status {
+            SnapshotCrcProvenance::Current(_) => Some(expected_status),
+            _ => None,
+        }
     );
 
     // When the snapshot is rebuilt from its hint.
@@ -1663,8 +1663,7 @@ async fn test_stale_crc_advanced_only_within_replay_budget(
                     crc_version: p.crc_version(),
                     on_disk_version: p.on_disk_version(),
                 }),
-            SnapshotCrcProvenance::Stale(_) => SnapshotCrcProvenance::Absent,
-            absent => absent,
+            _ => SnapshotCrcProvenance::Absent,
         }
     );
 }
