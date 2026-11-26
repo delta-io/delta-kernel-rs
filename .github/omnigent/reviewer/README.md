@@ -397,13 +397,13 @@ hidden bot identifiers are omitted from this example.
 
 **🛑 2 Blockers · 🔧 1 Should Fix · 💡 2 Nits**
 
-<details><summary>Assessment Summary</summary>
+<details><summary>Overall assessment</summary>
 
 <one paragraph giving an overall assessment without repeating finding details>
 
 </details>
 
-<details><summary>Review Summary</summary>
+<details><summary>Key findings</summary>
 
 - **[Blocker 1]** [<one-line claim>](<finding comment URL>)
 - **[Blocker 2]** [<one-line claim>](<finding comment URL>)
@@ -415,7 +415,7 @@ hidden bot identifiers are omitted from this example.
 · [Workflow run](<workflow run URL>)</sub>
 ```
 
-`Review Summary` links every final Blocker and Should Fix finding, including reused comments.
+`Key findings` links every final Blocker and Should Fix finding, including reused comments.
 It is absent when there are none. Nits count in the headline and have individual comments, but
 no rows in that disclosure. All disclosures start closed. A posting failure can replace the
 count line with `Finding counts unavailable.` and adds an explanation. The Check Run includes
@@ -436,7 +436,7 @@ labels such as `[Should Fix 1]`.
 **Suggested fix:** <the proposed correction>
 
 ---
-<sub>Raised by: <reviewer names> · Reviewed `<short SHA>` · [AI Review](<main URL>)</sub><br>
+<sub>Raised by: <reviewer names> · Reviewed `<short SHA>` · [AI Review](<main URL>)</sub>
 <sub>Feedback: react 👍 if helpful, 👎 if unhelpful or incorrect, or 👀 if out of scope.</sub>
 ```
 

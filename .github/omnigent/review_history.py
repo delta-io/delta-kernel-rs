@@ -64,7 +64,7 @@ def canonical_finding_body(body: str) -> str:
     body = body.strip().removesuffix(FINDING_FEEDBACK_FOOTER)
     body = re.sub(
         r"\n+---\n<sub>(?:Raised by: [^\n]+ · )?Reviewed `[0-9a-f]+` · "
-        r"\[AI Review\]\([^\n]+\)</sub><br>\n<sub>Feedback: [^\n]+</sub>\s*$",
+        r"\[AI Review\]\([^\n]+\)</sub>(?:<br>)?\n<sub>Feedback: [^\n]+</sub>\s*$",
         "", body,
     )
     body = body.removeprefix(BOT_MARKER).lstrip()

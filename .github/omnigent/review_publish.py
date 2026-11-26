@@ -79,7 +79,8 @@ def strip_review_body(body: str) -> str:
         body = body[len(REVIEW_HEADER) :].lstrip()
     elif re.match(rf"## (?:{re.escape(AI_REVIEW_TITLE)}|AI Review)(?: - [A-Z ]+)?\n", body):
         summary = re.search(
-            r"<details><summary>(?:(?:PR|Assessment) )?Summary</summary>\s*\n(.*?)\n\s*</details>",
+            r"<details><summary>(?:Overall assessment|(?:(?:PR|Assessment) )?Summary)"
+            r"</summary>\s*\n(.*?)\n\s*</details>",
             body,
             re.DOTALL,
         )
@@ -131,7 +132,7 @@ def format_finding(
     raised_by = f"Raised by: {', '.join(attribution)} · " if attribution else ""
     return (
         f"{text}\n\n---\n"
-        f"<sub>{raised_by}Reviewed `{head_sha[:8]}` · [AI Review]({main_url})</sub><br>\n"
+        f"<sub>{raised_by}Reviewed `{head_sha[:8]}` · [AI Review]({main_url})</sub>\n"
         f"<sub>{FINDING_FEEDBACK_PROMPT}</sub>"
     )
 
@@ -154,7 +155,7 @@ def format_review_summary(
     if errors:
         parts.append("Publication incomplete: " + " ".join(dict.fromkeys(errors)))
     parts.append(
-        "<details><summary>Assessment Summary</summary>\n\n"
+        "<details><summary>Overall assessment</summary>\n\n"
         + (overview.strip() or "See the full AI review in Checks.")
         + "\n\n</details>"
     )
@@ -170,7 +171,7 @@ def format_review_summary(
         )
     if rows:
         parts.append(
-            "<details><summary>Review Summary</summary>\n\n"
+            "<details><summary>Key findings</summary>\n\n"
             + "\n".join(rows)
             + "\n\n</details>"
         )

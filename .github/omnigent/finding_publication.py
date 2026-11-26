@@ -154,7 +154,8 @@ def review_overview(review: str) -> str:
     boundaries = _review_sections(review)
     for index, (offset, line) in enumerate(boundaries):
         if re.fullmatch(
-            r"(?:#{1,4}\s+|\d+\.\s+\*\*)(?:(?:PR|Assessment) )?Summary(?:\*\*)?\s*:?\s*",
+            r"(?:#{1,4}\s+|\d+\.\s+\*\*)(?:Overall assessment|(?:(?:PR|Assessment) )?Summary)"
+            r"(?:\*\*)?\s*:?\s*",
             line,
         ):
             end = boundaries[index + 1][0] if index + 1 < len(boundaries) else len(review)
@@ -167,7 +168,7 @@ def review_overview(review: str) -> str:
 def complete_review(review: str, findings: list[dict[str, Any]]) -> str:
     """Build the full Check Run review text from the assessment and final findings."""
     overview = review_overview(review)
-    parts = [f"## Assessment Summary\n\n{overview}"] if overview else []
+    parts = [f"## Overall assessment\n\n{overview}"] if overview else []
     parts.extend(
         f"### {finding_label(finding['id'])[1:-1]}\n\n{finding['body']}" for finding in findings
     )
@@ -179,7 +180,7 @@ def _review_sections(review: str) -> list[tuple[int, str]]:
         (offset, line) for offset, line, fence in markdown_lines(review)
         if fence is None and re.match(
             r"^(?:#{1,4}\s+|\d+\.\s+\*\*(?:Blocking issues|Non-blocking notes|"
-            r"(?:(?:PR|Assessment) )?Summary))",
+            r"Overall assessment|(?:(?:PR|Assessment) )?Summary))",
             line,
         )
     ]

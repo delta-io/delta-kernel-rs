@@ -109,7 +109,7 @@ class FindingPublicationTest(unittest.TestCase):
         self.assertTrue(all(item["url"] for item in record["findings"]))
         main = github.issues[0]["body"]
         order = ["## 🤖 AI Review 🧐", "🛑 0 Blockers · 🔧 1 Should Fix · 💡 4 Nits",
-                 "<summary>Assessment Summary", "<summary>Review Summary", "<sub>Reviewed", "Full AI review"]
+                 "<summary>Overall assessment", "<summary>Key findings", "<sub>Reviewed", "Full AI review"]
         offsets = [main.index(part) for part in order]
         self.assertEqual(offsets, sorted(offsets))
         self.assertNotIn("\n---\n", main)
@@ -148,10 +148,10 @@ class FindingPublicationTest(unittest.TestCase):
 
         body = github.issues[0]["body"]
         self.assertIn("<!-- ai-review-main ", body)
-        for label in ("Assessment Summary", "PR Summary", "Summary"):
+        for label in ("Overall assessment", "Assessment Summary", "PR Summary", "Summary"):
             with self.subTest(label=label):
                 self.assertEqual(
-                    strip_review_body(body.replace("Assessment Summary", label)), "Changes a call."
+                    strip_review_body(body.replace("Overall assessment", label)), "Changes a call."
                 )
 
     def test_copied_markers_from_untrusted_authors_are_not_reused_or_updated(self):
@@ -421,8 +421,10 @@ class FindingPublicationTest(unittest.TestCase):
                 self.assertIn("Evidence.", comment)
                 self.assertIn("**Suggested fix:** use x.", comment)
                 self.assertIn("<sub>Raised by: protocol-reviewer · Reviewed", comment)
-                self.assertIn("</sub><br>\n<sub>Feedback:", comment)
+                self.assertIn("</sub>\n<sub>Feedback:", comment)
                 self.assertEqual(canonical_finding_body(comment), canonical_finding_body(body))
+                previous_footer = comment.replace("</sub>\n<sub>Feedback:", "</sub><br>\n<sub>Feedback:")
+                self.assertEqual(canonical_finding_body(previous_footer), canonical_finding_body(body))
 
     def test_finding_fields_inside_code_examples_are_not_reformatted_or_moved(self):
         example = "```text\nRaised by: example\nSuggested fix: example\n```"
@@ -433,8 +435,8 @@ class FindingPublicationTest(unittest.TestCase):
         self.assertEqual(canonical_finding_body(comment), canonical_finding_body(body))
 
     def test_summary_headings_and_structured_only_check_text(self):
-        for heading in ("## Assessment Summary", "## PR Summary", "## Summary",
-                        "### Summary", "3. **Summary**"):
+        for heading in ("## Overall assessment", "## Assessment Summary", "## PR Summary",
+                        "## Summary", "### Summary", "3. **Summary**", "3. **Overall assessment**"):
             with self.subTest(heading=heading):
                 self.assertEqual(review_overview(f"### Nit1\nA claim.\n{heading}\nChange context."), "Change context.")
         entries, _ = collect_findings("## Summary\nContext.", [finding()])
@@ -443,7 +445,7 @@ class FindingPublicationTest(unittest.TestCase):
             overview="Context.", head_sha=HEAD_SHA, findings=[], run_url=RUN_URL,
         )
         self.assertEqual(strip_review_body(body), "Context.")
-        self.assertNotIn("<summary>Review Summary", body)
+        self.assertNotIn("<summary>Key findings", body)
 
     def test_readable_headings_keep_compact_metadata_ids(self):
         for finding_id, heading in (("Blocker1", "Blocker 1"),
@@ -457,7 +459,7 @@ class FindingPublicationTest(unittest.TestCase):
                 self.assertEqual(errors, [])
                 self.assertEqual([item["id"] for item in entries], [finding_id])
                 report = complete_review("## Summary\nAssessment.", entries)
-                self.assertIn("## Assessment Summary\n\nAssessment.", report)
+                self.assertIn("## Overall assessment\n\nAssessment.", report)
                 self.assertIn(f"### {heading}\n\nA retained claim.", report)
 
     def test_legacy_unknown_severity_split_does_not_fabricate_zeroes(self):
