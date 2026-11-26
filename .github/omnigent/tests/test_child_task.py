@@ -143,7 +143,10 @@ class ReviewTaskTest(unittest.TestCase):
         policies = config["guardrails"]["policies"]
         self.assertEqual(
             list(policies),
-            ["spawn_bounds", "headless_subagent_purpose_guard", "append_child_task_body"],
+            [
+                "spawn_bounds", "headless_subagent_purpose_guard",
+                "record_review_evidence", "append_child_task_body",
+            ],
         )
         function = policies["append_child_task_body"]["function"]
         self.assertEqual(function["path"], "child_task.append_child_task_body")

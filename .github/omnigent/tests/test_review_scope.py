@@ -310,7 +310,7 @@ class ReviewScopeTest(unittest.TestCase):
         marker = "1" * 32
         review = "## Summary\nA child finding needs attention."
         for review_base in (GITHUB_BASE, PARENT):
-            for mode in ("artifact", "inline"):
+            for mode in ("artifact", "summary", "collapsed", "comment", "inline"):
                 with self.subTest(review_base=review_base, mode=mode):
                     with tempfile.TemporaryDirectory() as directory:
                         root = Path(directory)
@@ -318,8 +318,6 @@ class ReviewScopeTest(unittest.TestCase):
                             f"\n<!-- AI_REVIEW_INLINE_START_{marker} -->\n"
                             '{"findings":[]}\n'
                             f"<!-- AI_REVIEW_INLINE_END_{marker} -->"
-                            if mode == "inline"
-                            else ""
                         )
                         (root / "review_raw_output.txt").write_text(
                             f"<!-- AI_REVIEW_START_{marker} -->\n{review}{inline}\n"
@@ -371,8 +369,15 @@ class ReviewScopeTest(unittest.TestCase):
             ),
             (_stack_body("unlinked parent", PARENT), None),
         )
-        for body, review_base in cases:
-            with self.subTest(review_base=review_base), tempfile.TemporaryDirectory() as directory:
+        cases = [(body, base, False) for body, base in cases] + [
+            ("", GITHUB_BASE, True),
+            (_stack_body(f"[parent]({PR_URL}/1)", PARENT), PARENT, True),
+        ]
+        for body, review_base, large_diff in cases:
+            with (
+                self.subTest(review_base=review_base, large_diff=large_diff),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 temp = Path(directory)
                 guidance = temp / "guidance"
                 guidance.mkdir()
@@ -396,6 +401,11 @@ class ReviewScopeTest(unittest.TestCase):
                     "    diff = ('diff --git a/child.rs b/child.rs\\n'\n"
                     "            '--- a/child.rs\\n+++ b/child.rs\\n'\n"
                     "            '@@ -0,0 +1 @@\\n+child_change();')\n"
+                    f"    if {large_diff!r}:\n"
+                    "        diff += '\\n+' + 'x' * 89900 + '\\n'\n"
+                    "        diff += ('diff --git a/late_child.rs b/late_child.rs\\n'\n"
+                    "                 '--- a/late_child.rs\\n+++ b/late_child.rs\\n'\n"
+                    "                 '@@ -0,0 +1 @@\\n+late_child_change();\\n')\n"
                     f"    if '/compare/{GITHUB_BASE}...' in sys.argv[2]:\n"
                     "        diff += '\\n+ancestor_change();'\n"
                     "    print(diff)\n"
@@ -419,6 +429,13 @@ class ReviewScopeTest(unittest.TestCase):
                     capture_output=True,
                     text=True,
                 )
+                if large_diff and result.returncode == 0:
+                    build_orchestrator_task_message = (temp / "orchestrator_task.md").read_text()
+                    child_prompt = (temp / "child_task_pr_data.md").read_text()
+                    self.assertIn("late_child.rs", build_orchestrator_task_message)
+                    self.assertIn("late_child_change();", child_prompt)
+                    self.assertNotIn("late_child_change();", build_orchestrator_task_message)
+                    self.assertLessEqual(len(build_orchestrator_task_message.encode()), 120_000)
                 if review_base is None:
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn("::error::Cannot select", result.stdout)

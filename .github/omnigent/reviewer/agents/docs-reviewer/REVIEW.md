@@ -82,3 +82,5 @@ For each finding, provide:
 If everything looks good, say so explicitly — don't manufacture issues.
 
 ${ci_environment}
+
+${candidate_results}
