@@ -2,18 +2,26 @@
 
 use std::sync::Arc;
 
-use delta_kernel::KernelResult;
+use delta_kernel::arrow::array::Int32Array;
+use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::{ColumnName, column_name};
 use delta_kernel::schema::{DataType, StructField, StructType, schema_ref};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
+use delta_kernel::{KernelError, KernelResult};
 use rstest::rstest;
-use test_utils::{assert_result_error_with_message, test_table_setup};
+use serde_json::{Value, json};
+use test_utils::{
+    assert_result_error_with_message, insert_data, read_actions_from_commit, read_scan,
+    test_table_setup,
+};
 
 use super::simple_schema;
+use crate::common::write_utils::{get_simple_schema, simple_id_batch};
 
 /// Builds a schema that supports clustering at depths 1, 2, and 5:
 ///   { id: int, name: string, address: { city: string, zip: string },
@@ -39,6 +47,7 @@ fn clustering_test_schema() -> KernelResult<Arc<StructType>> {
 }
 
 #[rstest]
+#[case::empty(vec![])]
 #[case::top_level(vec![vec!["id"]])]
 #[case::nested_2(vec![vec!["address", "city"]])]
 #[case::mismatched_casing(vec![vec!["ID"]])]
@@ -94,6 +103,170 @@ async fn test_create_clustered_table(
         "Protocol should support clustering feature"
     );
 
+    Ok(())
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_clustering_metadata_extension_survives_create_and_append(
+    #[values("none", "name", "id")] cm_mode: &str,
+    #[values(false, true)] with_columns: bool,
+    #[values(false, true)] with_initial_data: bool,
+) -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = get_simple_schema();
+    let columns = if with_columns { vec!["id"] } else { vec![] };
+    let mut txn = create_table(&table_path, schema.clone(), "Test/1.0", true)
+        .with_table_properties([("delta.columnMapping.mode", cm_mode)])
+        .with_data_layout(DataLayout::clustered(columns))
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+
+    txn.transform_system_domain_metadata("delta.clustering", |configuration| {
+        let mut configuration: Value = serde_json::from_str(configuration)?;
+        configuration["connectorField"] = json!({"version": 1});
+        Ok(serde_json::to_string(&configuration)?)
+    })?;
+    txn.transform_system_domain_metadata("delta.clustering", |configuration| {
+        let mut configuration: Value = serde_json::from_str(configuration)?;
+        assert_eq!(configuration["connectorField"], json!({"version": 1}));
+        configuration["otherConnectorField"] = json!(true);
+        Ok(serde_json::to_string(&configuration)?)
+    })?;
+
+    if with_initial_data {
+        let batch = ArrowEngineData::new(simple_id_batch(&schema, vec![0]));
+        let context = txn.write_state()?.write_context_builder().build()?;
+        txn.add_files(engine.write_parquet(&batch, &context).await?);
+    }
+    let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    let expected_columns = snapshot
+        .reader()
+        .get_physical_clustering_columns(engine.as_ref())?;
+    assert_eq!(
+        expected_columns.as_ref().unwrap().len(),
+        usize::from(with_columns)
+    );
+    let domains = read_actions_from_commit(snapshot.table_root(), 0, "domainMetadata")?;
+    assert_eq!(domains.len(), 1);
+    assert_eq!(domains[0]["domain"], "delta.clustering");
+    let configuration: Value = serde_json::from_str(domains[0]["configuration"].as_str().unwrap())
+        .map_err(KernelError::from)?;
+    assert_eq!(configuration["connectorField"], json!({"version": 1}));
+    assert_eq!(configuration["otherConnectorField"], json!(true));
+
+    insert_data(
+        snapshot,
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .await?
+    .unwrap_committed();
+
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(snapshot.version(), 1);
+    assert_eq!(
+        snapshot
+            .reader()
+            .get_physical_clustering_columns(engine.as_ref())?,
+        expected_columns
+    );
+    let persisted = snapshot
+        .reader()
+        .get_domain_metadata_internal("delta.clustering", engine.as_ref())?
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&persisted).map_err(KernelError::from)?,
+        configuration
+    );
+    for feature in [TableFeature::ClusteredTable, TableFeature::DomainMetadata] {
+        assert!(
+            snapshot
+                .table_configuration()
+                .is_feature_supported(&feature)
+        );
+    }
+    let rows = if with_initial_data {
+        vec![0, 1, 2, 3]
+    } else {
+        vec![1, 2, 3]
+    };
+    let expected = pretty_format_batches(&[simple_id_batch(&snapshot.schema(), rows)])
+        .map_err(KernelError::from)?
+        .to_string();
+    let expected: Vec<_> = expected.lines().collect();
+    let batches = read_scan(&snapshot.scan_builder().build()?, engine)?;
+    assert_batches_sorted_eq!(expected, &batches);
+    Ok(())
+}
+
+#[rstest]
+#[case::unknown_domain(vec![], "delta.unknown", Some("{}"), "not supported")]
+#[case::user_domain(vec![], "app.config", Some("{}"), "not supported")]
+#[case::row_tracking_domain(vec![], "delta.rowTracking", Some("{}"), "not supported")]
+#[case::changed_columns(
+    vec![],
+    "delta.clustering",
+    Some(r#"{"clusteringColumns":[["id"]]}"#),
+    "cannot change clustering columns"
+)]
+#[case::missing_columns(vec![], "delta.clustering", Some("{}"), "missing field")]
+#[case::invalid_json(vec![], "delta.clustering", Some("invalid"), "expected value")]
+#[case::array_empty(vec![], "delta.clustering", Some("[[]]"), "JSON object")]
+#[case::array_nonempty(vec!["id"], "delta.clustering", Some(r#"[[["id"]]]"#), "JSON object")]
+#[case::callback_error(vec![], "delta.clustering", None, "extension failed")]
+#[test]
+fn test_system_domain_metadata_transform_failure_preserves_configuration(
+    #[case] columns: Vec<&str>,
+    #[case] domain: &str,
+    #[case] configuration: Option<&str>,
+    #[case] expected_error: &str,
+) -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let expected_configuration = json!({
+        "clusteringColumns": columns.iter().map(|column| vec![column]).collect::<Vec<_>>()
+    });
+    let mut txn = create_table(&table_path, get_simple_schema(), "Test/1.0", true)
+        .with_data_layout(DataLayout::clustered(columns))
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+    let mut callback_called = false;
+    let result = txn.transform_system_domain_metadata(domain, |_| {
+        callback_called = true;
+        configuration
+            .map(str::to_owned)
+            .ok_or_else(|| KernelError::generic("extension failed"))
+    });
+    assert_result_error_with_message(result, expected_error);
+    assert_eq!(callback_called, domain == "delta.clustering");
+
+    let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    let configuration = snapshot
+        .reader()
+        .get_domain_metadata_internal("delta.clustering", engine.as_ref())?
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&configuration).map_err(KernelError::from)?,
+        expected_configuration
+    );
+    Ok(())
+}
+
+#[test]
+fn test_system_domain_metadata_transform_requires_staged_clustering() -> delta_kernel::Result<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let mut txn = create_table(&table_path, get_simple_schema(), "Test/1.0", true)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
+    let result = txn.transform_system_domain_metadata("delta.clustering", |_| {
+        panic!("callback must not run without staged clustering")
+    });
+    assert_result_error_with_message(result, "not staged by Kernel");
+
+    let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+    assert!(
+        snapshot
+            .reader()
+            .get_domain_metadata_internal("delta.clustering", engine.as_ref())?
+            .is_none()
+    );
     Ok(())
 }
 

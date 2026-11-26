@@ -3806,6 +3806,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_table_with_clustering_column_paths(
         #[case] column_mapping: bool,
+        #[values(false, true)] empty_columns: bool,
     ) -> delta_kernel::Result<()> {
         let (store, test_engine, table_url) =
             test_utils::engine_store_setup("clustering_paths", None);
@@ -3854,7 +3855,11 @@ mod tests {
             ok_or_panic(unsafe {
                 create_table_txn_builder_with_clustering_columns(
                     Box::new(builder).into(),
-                    FfiColumnNameArray::new_unsafe(columns.as_slice()),
+                    if empty_columns {
+                        FfiColumnNameArray::empty()
+                    } else {
+                        FfiColumnNameArray::new_unsafe(columns.as_slice())
+                    },
                     engine.shallow_copy(),
                 )
             })
@@ -3865,18 +3870,22 @@ mod tests {
             .reader()
             .get_clustering_column_infos(&test_engine)?
             .unwrap();
-        assert_eq!(infos.len(), 3);
-        assert_eq!(
-            infos[0].logical_column,
-            ColumnName::new(["parent", "child"])
-        );
-        assert_eq!(infos[1].logical_column, ColumnName::new(["parent.child"]));
-        assert_eq!(
-            infos[2].logical_column,
-            ColumnName::new(["grandgrandparent", "grandparent", "parent", "child"])
-        );
-        assert_eq!(infos[0].data_type, DataType::STRING);
-        assert_eq!(infos[1].data_type, DataType::INTEGER);
+        if empty_columns {
+            assert!(infos.is_empty());
+        } else {
+            assert_eq!(infos.len(), 3);
+            assert_eq!(
+                infos[0].logical_column,
+                ColumnName::new(["parent", "child"])
+            );
+            assert_eq!(infos[1].logical_column, ColumnName::new(["parent.child"]));
+            assert_eq!(
+                infos[2].logical_column,
+                ColumnName::new(["grandgrandparent", "grandparent", "parent", "child"])
+            );
+            assert_eq!(infos[0].data_type, DataType::STRING);
+            assert_eq!(infos[1].data_type, DataType::INTEGER);
+        }
         for info in &infos {
             assert_eq!(info.physical_column != info.logical_column, column_mapping);
         }
@@ -3891,7 +3900,6 @@ mod tests {
     }
 
     #[rstest]
-    #[case::no_columns(vec![], "Clustering requires at least one column")]
     #[case::empty_path(vec![vec![]], "Column path cannot be empty")]
     #[case::empty_segment(vec![vec![""]], "field '' not found in schema")]
     #[case::missing_column(vec![vec!["missing"]], "field 'missing' not found in schema")]

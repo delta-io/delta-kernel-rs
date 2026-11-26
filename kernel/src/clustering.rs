@@ -65,13 +65,12 @@ pub(crate) struct ClusteringColumnInfo {
 /// This function performs comprehensive validation of clustering columns:
 ///
 /// **Structural validations:**
-/// 1. At least one column must be specified
-/// 2. No duplicate columns
+/// 1. No duplicate columns; an empty list is allowed
 ///
 /// **Schema validations:**
-/// 3. Column paths must resolve in the schema (including nested paths through structs and `file`
+/// 2. Column paths must resolve in the schema (including nested paths through structs and `file`
 ///    columns)
-/// 4. Leaf field must have a type eligible for min/max statistics. For `file` sub-fields,
+/// 3. Leaf field must have a type eligible for min/max statistics. For `file` sub-fields,
 ///    `checksum` and `inline` are rejected because they have only null-count statistics.
 ///
 /// Both top-level and nested columns are supported. For nested columns, all intermediate
@@ -85,13 +84,6 @@ pub(crate) fn validate_clustering_columns(
     columns: &[ColumnName],
 ) -> KernelResult<()> {
     use std::collections::HashSet;
-
-    // Structural validation: at least one column required
-    if columns.is_empty() {
-        return Err(KernelError::generic(
-            "Clustering requires at least one column",
-        ));
-    }
 
     // Validate each column and check for duplicates
     let mut seen = HashSet::new();
@@ -190,13 +182,14 @@ mod tests {
         assert_eq!(columns, expected_cols);
     }
 
-    #[test]
-    fn test_validate_clustering_columns_valid() {
+    #[rstest::rstest]
+    #[case::empty(vec![])]
+    #[case::single(vec![column_name!("id")])]
+    fn test_validate_clustering_columns_valid(#[case] columns: Vec<ColumnName>) {
         let schema = schema! {
             not_null "id": INTEGER,
             nullable "name": STRING,
         };
-        let columns = vec![column_name!("id")];
         assert!(validate_clustering_columns(&schema, &columns).is_ok());
     }
 
@@ -424,25 +417,16 @@ mod tests {
         assert!(validate_clustering_columns(&schema, &columns).is_ok());
     }
 
-    /// Test various structural validation error cases.
-    #[rstest::rstest]
-    #[case::empty_columns(vec![], "at least one column")]
-    #[case::duplicate_columns(vec!["id", "id"], "Duplicate clustering column")]
-    fn test_validate_clustering_structural_errors(
-        #[case] column_names: Vec<&str>,
-        #[case] expected_error: &str,
-    ) {
+    #[test]
+    fn test_validate_clustering_duplicate_columns_rejected() {
         let schema = schema! { not_null "id": INTEGER };
-        let columns: Vec<ColumnName> = column_names
-            .into_iter()
-            .map(|s| ColumnName::new([s]))
-            .collect();
-
+        let columns = vec![column_name!("id"), column_name!("id")];
         let result = validate_clustering_columns(&schema, &columns);
-        assert!(result.is_err());
         assert!(
-            result.unwrap_err().to_string().contains(expected_error),
-            "Expected error containing '{expected_error}'"
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Duplicate clustering column")
         );
     }
 
