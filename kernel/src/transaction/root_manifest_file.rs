@@ -1,12 +1,20 @@
 //! Commits a caller-supplied root manifest file as the table's content root.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
-use crate::actions::visitors::SetTransactionMap;
-use crate::actions::{CheckpointAction, ContentRoot, DomainMetadata, SetTransaction};
-use crate::crc::merge_domain_metadata;
+use crate::actions::set_transaction::scan_application_transactions;
+use crate::actions::{
+    CheckpointAction, ContentRoot, DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA, LOG_TXN_SCHEMA,
+    SetTransaction, Sidecar,
+};
+use crate::content_tree::read_non_add_actions;
+use crate::crc::{Crc, CrcDelta, DomainMetadataState, SetTransactionState, merge_domain_metadata};
 use crate::error::KernelError;
-use crate::log_segment::DomainMetadataMap;
-use crate::snapshot::SnapshotRef;
+use crate::log_segment::scan_domain_metadata_actions;
+use crate::path::LogRoot;
+use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::{Engine, FileMeta, KernelResult, Version, version_as_i64};
 
@@ -39,82 +47,269 @@ impl RootManifestFile {
         dm_changes: &[DomainMetadata],
         set_transactions: &[SetTransaction],
     ) -> KernelResult<CheckpointAction> {
-        let (mut domain_metadata, mut transactions) = self.scan_non_content_metadata(engine)?;
+        let snapshot = self.read_snapshot.as_ref();
+        let crc = snapshot.crc_at_version().map(Arc::as_ref);
+        let txns_in_crc = crc.is_some_and(SetTransaction::complete_in_crc);
+        let domains_in_crc = crc.is_some_and(DomainMetadata::complete_in_crc);
+        // The checkpoint action is only needed for a kind the CRC doesn't hold in full.
+        let (txn_base, domain_base) = if txns_in_crc && domains_in_crc {
+            (None, None)
+        } else {
+            let action = snapshot.latest_checkpoint_action(engine)?;
+            (
+                action.clone().filter(|_| !txns_in_crc),
+                action.filter(|_| !domains_in_crc),
+            )
+        };
+        let log_changes = match txn_base.as_deref().or(domain_base.as_deref()) {
+            Some(action) => changes_after_checkpoint_action(engine, snapshot, action)?,
+            None => CrcDelta::default(),
+        };
 
-        // Domains can be tombstoned, so merging applies removals. The transactions map is keyed by
-        // app id, so extend overwrites with the newest entry per app.
-        merge_domain_metadata(
-            &mut domain_metadata,
-            dm_changes
-                .iter()
-                .cloned()
-                .map(|dm| (dm.domain().to_string(), dm)),
-        );
-        transactions.extend(
-            set_transactions
-                .iter()
-                .cloned()
-                .map(|txn| (txn.app_id.clone(), txn)),
-        );
+        let log_root = LogRoot::new(snapshot.table_root().clone())?;
+        let (mut transactions, txn_sidecars) = checkpoint_entries(
+            engine,
+            snapshot,
+            txn_base.as_deref(),
+            &log_root,
+            log_changes.set_transactions,
+            set_transactions,
+        )?;
+        let (domain_metadata, domain_metadata_sidecars) = checkpoint_entries(
+            engine,
+            snapshot,
+            domain_base.as_deref(),
+            &log_root,
+            log_changes.domain_metadata,
+            dm_changes,
+        )?;
+        // TODO(#2866): prune expired txns in kept sidecars. Until then, whether an expired txn
+        // survives depends on whether it was inline or in a kept sidecar.
         let expiration_timestamp =
             calculate_transaction_expiration_timestamp(table_config.table_properties())?;
         transactions.retain(|_, txn| !txn.is_expired(expiration_timestamp));
 
-        let version = version_as_i64(commit_version)?;
+        let content_root_version = version_as_i64(commit_version)?;
         let size = i64::try_from(self.file.size)
             .map_err(|_| KernelError::generic("root manifest file size exceeds i64::MAX"))?;
-        let content_root = ContentRoot::new(self.file.location.to_string(), size, version);
-
-        Ok(CheckpointAction::new(
-            version,
-            content_root,
-            table_config.protocol().clone(),
-            table_config.metadata().clone(),
-            transactions.into_values().collect(),
-            domain_metadata.into_values().collect(),
-        ))
+        let path = self.file.location.to_string();
+        Ok(CheckpointAction {
+            version: commit_version,
+            content_root: ContentRoot::new(path, size, content_root_version),
+            protocol: table_config.protocol().clone(),
+            metadata: table_config.metadata().clone(),
+            transactions: transactions.into_values().collect(),
+            domain_metadata: domain_metadata.into_values().collect(),
+            txn_sidecars,
+            domain_metadata_sidecars,
+        })
     }
+}
 
-    /// Returns the read snapshot's active domain metadata and set transactions.
-    fn scan_non_content_metadata(
-        &self,
+/// A set transaction or domain metadata entry, which a checkpoint action stores inline or in
+/// sidecars.
+trait CheckpointActionEntry: Clone {
+    fn key(&self) -> &str;
+    fn inline(checkpoint: &CheckpointAction) -> &[Self];
+    fn sidecars(checkpoint: &CheckpointAction) -> &[Sidecar];
+    /// Whether `crc` holds every active entry of this type.
+    fn complete_in_crc(crc: &Crc) -> bool;
+    /// Returns every entry of this type in `checkpoint`, inline or in a sidecar.
+    fn read_from_action(
         engine: &dyn Engine,
-    ) -> KernelResult<(DomainMetadataMap, SetTransactionMap)> {
-        let snapshot = self.read_snapshot.as_ref();
-        let domain_metadata = snapshot
-            .reader()
-            .get_domain_metadatas_internal(engine, None)?;
-        let transactions = snapshot.get_app_id_versions(engine)?;
-        Ok((domain_metadata, transactions))
+        checkpoint: &CheckpointAction,
+        log_root: &LogRoot,
+    ) -> KernelResult<HashMap<String, Self>>;
+    /// Returns every active entry of this type at `snapshot`'s version.
+    fn read_from_snapshot(
+        snapshot: &Snapshot,
+        engine: &dyn Engine,
+    ) -> KernelResult<HashMap<String, Self>>;
+    /// Applies `changes` to `entries`, newest wins.
+    fn apply(entries: &mut HashMap<String, Self>, changes: HashMap<String, Self>);
+}
+
+impl CheckpointActionEntry for SetTransaction {
+    fn key(&self) -> &str {
+        &self.app_id
     }
+
+    fn inline(checkpoint: &CheckpointAction) -> &[Self] {
+        &checkpoint.transactions
+    }
+
+    fn sidecars(checkpoint: &CheckpointAction) -> &[Sidecar] {
+        &checkpoint.txn_sidecars
+    }
+
+    fn complete_in_crc(crc: &Crc) -> bool {
+        matches!(crc.set_transaction_state, SetTransactionState::Complete(_))
+    }
+
+    fn read_from_action(
+        engine: &dyn Engine,
+        checkpoint: &CheckpointAction,
+        log_root: &LogRoot,
+    ) -> KernelResult<HashMap<String, Self>> {
+        let actions = read_non_add_actions(engine, checkpoint, log_root, LOG_TXN_SCHEMA.clone())?;
+        scan_application_transactions(actions, None)
+    }
+
+    fn read_from_snapshot(
+        snapshot: &Snapshot,
+        engine: &dyn Engine,
+    ) -> KernelResult<HashMap<String, Self>> {
+        snapshot.get_app_id_versions(engine)
+    }
+
+    fn apply(entries: &mut HashMap<String, Self>, changes: HashMap<String, Self>) {
+        entries.extend(changes);
+    }
+}
+
+impl CheckpointActionEntry for DomainMetadata {
+    fn key(&self) -> &str {
+        self.domain()
+    }
+
+    fn inline(checkpoint: &CheckpointAction) -> &[Self] {
+        &checkpoint.domain_metadata
+    }
+
+    fn sidecars(checkpoint: &CheckpointAction) -> &[Sidecar] {
+        &checkpoint.domain_metadata_sidecars
+    }
+
+    fn complete_in_crc(crc: &Crc) -> bool {
+        matches!(crc.domain_metadata_state, DomainMetadataState::Complete(_))
+    }
+
+    fn read_from_action(
+        engine: &dyn Engine,
+        checkpoint: &CheckpointAction,
+        log_root: &LogRoot,
+    ) -> KernelResult<HashMap<String, Self>> {
+        let schema = LOG_DOMAIN_METADATA_SCHEMA.clone();
+        let actions = read_non_add_actions(engine, checkpoint, log_root, schema)?;
+        scan_domain_metadata_actions(actions, None)
+    }
+
+    fn read_from_snapshot(
+        snapshot: &Snapshot,
+        engine: &dyn Engine,
+    ) -> KernelResult<HashMap<String, Self>> {
+        snapshot
+            .reader()
+            .get_domain_metadatas_internal(engine, None)
+    }
+
+    // Domains can be tombstoned, so merging applies removals.
+    fn apply(entries: &mut HashMap<String, Self>, changes: HashMap<String, Self>) {
+        merge_domain_metadata(entries, changes);
+    }
+}
+
+/// Returns the set transaction and domain metadata changes in the log commits after `action`.
+fn changes_after_checkpoint_action(
+    engine: &dyn Engine,
+    snapshot: &Snapshot,
+    action: &CheckpointAction,
+) -> KernelResult<CrcDelta> {
+    let base = action.version();
+    if base == snapshot.version() {
+        return Ok(CrcDelta::default());
+    }
+    snapshot
+        .log_segment()
+        .build_crc_delta_from_base(engine, base, None)
+}
+
+/// Returns the `T` entries for the new checkpoint action, and the sidecars it keeps.
+///
+/// With a `base` checkpoint action, `log_changes` (the log commits after `base`) and then
+/// `txn_changes` are applied to it. Without one, `txn_changes` apply to the snapshot's state.
+fn checkpoint_entries<T: CheckpointActionEntry>(
+    engine: &dyn Engine,
+    snapshot: &Snapshot,
+    base: Option<&CheckpointAction>,
+    log_root: &LogRoot,
+    log_changes: HashMap<String, T>,
+    txn_changes: &[T],
+) -> KernelResult<(HashMap<String, T>, Vec<Sidecar>)> {
+    let Some(base) = base else {
+        // There's no base when no checkpoint action exists or the CRC holds this type in full. A
+        // complete CRC doesn't say what changed since the action, so keeping the action's sidecars
+        // would mean reading them to find touched entries.
+        let mut entries = T::read_from_snapshot(snapshot, engine)?;
+        T::apply(&mut entries, keyed(txn_changes).collect());
+        return Ok((entries, Vec::new()));
+    };
+    let mut changes = log_changes;
+    changes.extend(keyed(txn_changes));
+    fold_into_checkpoint_action(engine, base, log_root, changes)
+}
+
+/// Applies `changes` to `action`'s inline `T` entries, keeping its sidecars unless a change
+/// touches an entry stored in one.
+fn fold_into_checkpoint_action<T: CheckpointActionEntry>(
+    engine: &dyn Engine,
+    action: &CheckpointAction,
+    log_root: &LogRoot,
+    changes: HashMap<String, T>,
+) -> KernelResult<(HashMap<String, T>, Vec<Sidecar>)> {
+    // Readers keep the first occurrence of a key, so this must too.
+    let mut inline = HashMap::new();
+    for (key, entry) in keyed(T::inline(action)) {
+        inline.entry(key).or_insert(entry);
+    }
+    let sidecars = T::sidecars(action);
+    // Kernel can't rewrite a sidecar, so only a change to an entry stored in one forces reading
+    // the sidecars and moving them inline.
+    // TODO(#2866): rewrite only the affected sidecars.
+    let not_inline = || changes.keys().filter(|key| !inline.contains_key(*key));
+    if !sidecars.is_empty() && not_inline().next().is_some() {
+        let mut action_entries = T::read_from_action(engine, action, log_root)?;
+        if not_inline().any(|key| action_entries.contains_key(key)) {
+            T::apply(&mut action_entries, changes);
+            return Ok((action_entries, Vec::new()));
+        }
+    }
+    T::apply(&mut inline, changes);
+    Ok((inline, sidecars.to_vec()))
+}
+
+fn keyed<T: CheckpointActionEntry>(entries: &[T]) -> impl Iterator<Item = (String, T)> + '_ {
+    entries
+        .iter()
+        .map(|entry| (entry.key().to_string(), entry.clone()))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::fmt::Debug;
 
     use itertools::Itertools as _;
     use rstest::rstest;
     use serde_json::json;
+    use url::Url;
 
     use super::*;
-    use crate::actions::{
-        LOG_DOMAIN_METADATA_SCHEMA, LOG_TXN_SCHEMA, METADATA_NAME, PROTOCOL_NAME, get_commit_schema,
-    };
+    use crate::actions::{LastManifestCommit, METADATA_NAME, PROTOCOL_NAME, get_commit_schema};
     use crate::committer::FileSystemCommitter;
-    use crate::crc::{Crc, DomainMetadataState, SetTransactionState};
     use crate::engine::sync::SyncEngine;
     use crate::schema::schema_ref;
     use crate::snapshot::Snapshot;
+    use crate::transaction::Transaction;
     use crate::transaction::create_table::create_table;
     use crate::unit_test_utils::adaptive_metadata_fixtures::{
         adaptive_metadata_protocol_and_metadata, domain, domain_metadata_line,
         minimal_checkpoint_action, setup_table, txn_line, write_commit,
-        write_commit_after_manifest_commit, write_manifest_commit, write_sidecar,
+        write_commit_after_manifest_commit, write_domain_metadata_sidecar, write_manifest_commit,
+        write_txn_sidecar,
     };
     use crate::unit_test_utils::{
-        MockTableConfigurationBuilder, assert_result_error_with_message, parse_json_batch,
-        string_array_to_engine_data,
+        MockTableConfigurationBuilder, assert_result_error_with_message, commit_on_latest,
+        parse_json_batch, string_array_to_engine_data,
     };
     use crate::{KernelResult, Result, create_row};
 
@@ -216,10 +411,11 @@ mod tests {
 
     /// Commits a manifest whose checkpoint action holds domain `a` and txn `app-1`, then one log
     /// commit per entry in `log_domains` followed by one per entry in `log_txns`, and computes the
-    /// checkpoint action of the next root manifest commit.
+    /// checkpoint action of the next root manifest commit, which sets `set_transactions`.
     fn checkpoint_action_after(
         log_domains: Vec<DomainMetadata>,
         log_txns: Vec<SetTransaction>,
+        set_transactions: &[SetTransaction],
     ) -> Result<CheckpointAction> {
         let (engine, table_root) = setup_table()?;
         let mut checkpoint = minimal_checkpoint_action("metadata/root-v1.parquet", 1)?;
@@ -234,19 +430,60 @@ mod tests {
             let data = parse_json_batch(vec![line.as_str()].into());
             write_commit_after_manifest_commit(&engine, &table_root, version, 1, data)?;
         }
-        compute_at_latest(&engine, &table_root)
+        compute_at_latest(&engine, &table_root, &[], set_transactions)
     }
 
-    fn compute_at_latest(engine: &SyncEngine, table_root: &url::Url) -> Result<CheckpointAction> {
+    fn compute_at_latest(
+        engine: &SyncEngine,
+        table_root: &Url,
+        dm_changes: &[DomainMetadata],
+        set_transactions: &[SetTransaction],
+    ) -> Result<CheckpointAction> {
         let snapshot = Snapshot::builder_for(table_root.clone()).build(engine)?;
         let manifest = root_manifest(table_root, "metadata/root.parquet", 2048, snapshot.clone());
         Ok(manifest.compute_checkpoint_action(
             engine,
             snapshot.version() + 1,
             snapshot.table_configuration(),
-            &[],
-            &[],
+            dm_changes,
+            set_transactions,
         )?)
+    }
+
+    /// Adds `txns` and `domains` to `txn`, removing each domain tombstoned in `domains`.
+    fn set_entries(
+        mut txn: Transaction,
+        txns: &[SetTransaction],
+        domains: &[DomainMetadata],
+    ) -> Transaction {
+        for set_transaction in txns {
+            txn = txn.with_transaction_id(set_transaction.app_id.clone(), set_transaction.version);
+        }
+        for dm in domains {
+            let name = dm.domain().to_string();
+            txn = if dm.is_removed() {
+                txn.with_domain_metadata_removed(name)
+            } else {
+                txn.with_domain_metadata(name, dm.configuration().to_string())
+            };
+        }
+        txn
+    }
+
+    /// Commits `txns` and `domains` in one transaction on the latest snapshot, if there are any.
+    fn commit_transaction(
+        engine: &SyncEngine,
+        table_root: &Url,
+        txns: &[SetTransaction],
+        domains: &[DomainMetadata],
+    ) -> Result<()> {
+        if txns.is_empty() && domains.is_empty() {
+            return Ok(());
+        }
+        commit_on_latest(engine, table_root, |txn| {
+            Ok(set_entries(txn, txns, domains))
+        })?;
+        Ok(())
     }
 
     #[rstest]
@@ -299,7 +536,7 @@ mod tests {
         #[case] expected_domain_metadata: Vec<DomainMetadata>,
         #[case] expected_txns: Vec<SetTransaction>,
     ) -> Result<()> {
-        let mut checkpoint = checkpoint_action_after(log_domains, log_txns)?;
+        let mut checkpoint = checkpoint_action_after(log_domains, log_txns, &[])?;
         checkpoint
             .domain_metadata
             .sort_by(|a, b| a.domain().cmp(b.domain()));
@@ -308,6 +545,14 @@ mod tests {
             .sort_by(|a, b| a.app_id.cmp(&b.app_id));
         assert_eq!(checkpoint.domain_metadata, expected_domain_metadata);
         assert_eq!(checkpoint.transactions, expected_txns);
+        Ok(())
+    }
+
+    #[test]
+    fn compute_checkpoint_action_transaction_overrides_logged_txn() -> Result<()> {
+        let checkpoint =
+            checkpoint_action_after(vec![], vec![txn("app-1", 7)], &[txn("app-1", 9)])?;
+        assert_eq!(checkpoint.transactions, [txn("app-1", 9)]);
         Ok(())
     }
 
@@ -322,16 +567,16 @@ mod tests {
         #[case] expected_error: Option<&str>,
     ) -> Result<()> {
         let (engine, table_root) = setup_table()?;
-        let txn = |version| parse_json_batch(vec![txn_line("app", version).as_str()].into());
+        let txn_commit = |version| parse_json_batch(vec![txn_line("app", version).as_str()].into());
         let checkpoint = minimal_checkpoint_action("metadata/root-v2.parquet", 2)?;
-        write_commit(&engine, &table_root, 1, txn(1))?;
+        write_commit(&engine, &table_root, 1, txn_commit(1))?;
         if classic_version == 1 {
             Snapshot::builder_for(table_root.clone())
                 .build(&engine)?
                 .checkpoint(&engine, None)?;
         }
         write_manifest_commit(&engine, &table_root, 2, checkpoint.clone())?;
-        write_commit_after_manifest_commit(&engine, &table_root, 3, 2, txn(3))?;
+        write_commit_after_manifest_commit(&engine, &table_root, 3, 2, txn_commit(3))?;
         if classic_version == 3 {
             // Hand-written since kernel can't checkpoint AMT tables yet (#3683). P&M are in one row
             // because with a row per action, the parquet write fails on null non-nullable fields.
@@ -351,40 +596,98 @@ mod tests {
                 .parquet_handler()
                 .write_parquet_file(location, Box::new(std::iter::once(Ok(data))))?;
         }
-        write_commit_after_manifest_commit(&engine, &table_root, 4, 2, txn(4))?;
+        write_commit_after_manifest_commit(&engine, &table_root, 4, 2, txn_commit(4))?;
 
-        let result = compute_at_latest(&engine, &table_root);
+        let result = compute_at_latest(&engine, &table_root, &[], &[]);
         match expected_error {
             Some(message) => assert_result_error_with_message(result, message),
-            None => {
-                result?;
-            }
+            // The checkpoint action at version 2 holds no txns, so `app` comes from the commits
+            // after it.
+            None => assert_eq!(result?.transactions, [txn("app", 4)]),
         }
         Ok(())
     }
 
-    #[test]
-    fn compute_checkpoint_action_prunes_expired_transactions() -> Result<()> {
+    #[derive(Clone, Copy)]
+    enum ExpiredTxnSource {
+        LogCommit,
+        InlineInAction,
+        LogCommitAfterAction,
+        Sidecar,
+    }
+
+    // `expired-app` has expired and `live-app` never expires. A change to `live-app` moves its
+    // sidecar inline; a change to `new-app` keeps it, and txns in a kept sidecar are not pruned.
+    #[rstest]
+    #[case::log_commit(ExpiredTxnSource::LogCommit, None, &["live-app"], false)]
+    #[case::inline_in_action(ExpiredTxnSource::InlineInAction, None, &["live-app"], false)]
+    #[case::log_commit_after_action(
+        ExpiredTxnSource::LogCommitAfterAction,
+        None,
+        &["live-app"],
+        false
+    )]
+    #[case::sidecar_moved_inline(ExpiredTxnSource::Sidecar, Some("live-app"), &["live-app"], false)]
+    #[case::sidecar_kept(ExpiredTxnSource::Sidecar, Some("new-app"), &["new-app"], true)]
+    fn compute_checkpoint_action_prunes_expired_transactions(
+        #[case] source: ExpiredTxnSource,
+        #[case] changed: Option<&str>,
+        #[case] expected_inline: &[&str],
+        #[case] sidecar_kept: bool,
+    ) -> Result<()> {
         let (engine, table_root) = setup_table()?;
-        let expired = SetTransaction::new("app-1".to_string(), 5, Some(0));
-        write_commit(
-            &engine,
-            &table_root,
-            1,
-            create_row(&engine, LOG_TXN_SCHEMA.clone(), expired)?,
-        )?;
+        let expired = SetTransaction::new("expired-app".to_string(), 5, Some(0));
+        let live = txn("live-app", 5);
+        let txn_row = |txn| create_row(&engine, LOG_TXN_SCHEMA.clone(), txn);
+        let mut existing = minimal_checkpoint_action("metadata/root-v1.parquet", 1)?;
+        match source {
+            ExpiredTxnSource::LogCommit => {
+                write_commit(&engine, &table_root, 1, txn_row(expired)?)?;
+                write_commit(&engine, &table_root, 2, txn_row(live)?)?;
+            }
+            ExpiredTxnSource::InlineInAction => {
+                existing.transactions = vec![expired, live];
+                write_manifest_commit(&engine, &table_root, 1, existing.clone())?;
+            }
+            ExpiredTxnSource::LogCommitAfterAction => {
+                existing.transactions = vec![live];
+                write_manifest_commit(&engine, &table_root, 1, existing.clone())?;
+                write_commit_after_manifest_commit(&engine, &table_root, 2, 1, txn_row(expired)?)?;
+            }
+            ExpiredTxnSource::Sidecar => {
+                existing.txn_sidecars = vec![write_txn_sidecar(
+                    &engine,
+                    &table_root,
+                    "txn.parquet",
+                    [expired, live],
+                )];
+                write_manifest_commit(&engine, &table_root, 1, existing.clone())?;
+            }
+        }
 
         let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
-        let manifest = root_manifest(&table_root, "metadata/root-v2.parquet", 1024, snapshot);
+        let commit_version = snapshot.version() + 1;
+        let manifest = root_manifest(&table_root, "metadata/root-v3.parquet", 1024, snapshot);
         let table_config = MockTableConfigurationBuilder::new()
             .with_properties([(
                 "delta.setTransactionRetentionDuration",
                 "interval 60 seconds",
             )])
             .build();
+        let set_transactions: Vec<_> = changed.into_iter().map(|key| txn(key, 6)).collect();
+        let checkpoint = manifest.compute_checkpoint_action(
+            &engine,
+            commit_version,
+            &table_config,
+            &[],
+            &set_transactions,
+        )?;
 
-        let checkpoint = manifest.compute_checkpoint_action(&engine, 2, &table_config, &[], &[])?;
-        assert!(checkpoint.transactions.is_empty());
+        assert_eq!(sorted_keys(&checkpoint.transactions), expected_inline);
+        assert_eq!(
+            checkpoint.txn_sidecars,
+            kept_or_empty(&existing.txn_sidecars, sidecar_kept)
+        );
         Ok(())
     }
 
@@ -446,237 +749,348 @@ mod tests {
         Ok(())
     }
 
-    // A checkpoint holds complete state, so top-level entries from commits before it are ignored.
-    #[test]
-    fn scan_non_content_metadata_ignores_top_level_entries_before_checkpoint() -> Result<()> {
+    /// A sidecar whose file was never written, so reading it fails.
+    fn missing_sidecar(name: &str) -> Sidecar {
+        Sidecar::new(name.to_string(), 1024, 0, None)
+    }
+
+    fn kept_or_empty(sidecars: &[Sidecar], kept: bool) -> Vec<Sidecar> {
+        if kept { sidecars.to_vec() } else { vec![] }
+    }
+
+    fn sorted_keys<T: CheckpointActionEntry>(entries: &[T]) -> Vec<&str> {
+        entries.iter().map(|entry| entry.key()).sorted().collect()
+    }
+
+    /// Which kinds run a [`compute_checkpoint_action_reuses_or_inlines_sidecars`] row.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Changed {
+        Txns,
+        Domains,
+        Both,
+    }
+
+    /// A set transaction or domain metadata entry that a test can build, log and spill to a
+    /// sidecar. An entry's value is the txn version or the domain configuration.
+    trait TestEntry: CheckpointActionEntry {
+        const NAME: &'static str;
+        fn at(key: &str, value: i64) -> Self;
+        fn value(&self) -> i64;
+        fn line(&self) -> String;
+        fn write_sidecar(
+            engine: &SyncEngine,
+            table_root: &Url,
+            name: &str,
+            entries: Vec<Self>,
+        ) -> Sidecar;
+        fn set(checkpoint: &mut CheckpointAction, inline: Vec<Self>, sidecars: Vec<Sidecar>);
+    }
+
+    impl TestEntry for SetTransaction {
+        const NAME: &'static str = "txn";
+        fn at(key: &str, value: i64) -> Self {
+            txn(key, value)
+        }
+        fn value(&self) -> i64 {
+            self.version
+        }
+        fn line(&self) -> String {
+            txn_line(&self.app_id, self.version)
+        }
+        fn write_sidecar(
+            engine: &SyncEngine,
+            table_root: &Url,
+            name: &str,
+            entries: Vec<Self>,
+        ) -> Sidecar {
+            write_txn_sidecar(engine, table_root, name, entries)
+        }
+        fn set(checkpoint: &mut CheckpointAction, inline: Vec<Self>, sidecars: Vec<Sidecar>) {
+            checkpoint.transactions = inline;
+            checkpoint.txn_sidecars = sidecars;
+        }
+    }
+
+    impl TestEntry for DomainMetadata {
+        const NAME: &'static str = "domains";
+        fn at(key: &str, value: i64) -> Self {
+            domain(key, &value.to_string())
+        }
+        fn value(&self) -> i64 {
+            let configuration = self.configuration();
+            configuration.parse().unwrap_or_else(|_| {
+                panic!(
+                    "domain {} has non-integer configuration {configuration:?}",
+                    self.domain()
+                )
+            })
+        }
+        fn line(&self) -> String {
+            domain_metadata_line(self.clone())
+        }
+        fn write_sidecar(
+            engine: &SyncEngine,
+            table_root: &Url,
+            name: &str,
+            entries: Vec<Self>,
+        ) -> Sidecar {
+            write_domain_metadata_sidecar(engine, table_root, name, entries)
+        }
+        fn set(checkpoint: &mut CheckpointAction, inline: Vec<Self>, sidecars: Vec<Sidecar>) {
+            checkpoint.domain_metadata = inline;
+            checkpoint.domain_metadata_sidecars = sidecars;
+        }
+    }
+
+    /// One row of [`compute_checkpoint_action_reuses_or_inlines_sidecars`]: keys per source, and
+    /// the entries and sidecars expected after it.
+    #[derive(Clone, Copy)]
+    struct SidecarRow {
+        before: &'static [&'static str],
+        inline: &'static [&'static str],
+        sidecars: &'static [&'static [&'static str]],
+        logged: &'static [&'static str],
+        changed: &'static [&'static str],
+        expected_inline: &'static [(&'static str, i64)],
+        sidecars_kept: bool,
+        sidecars_read: bool,
+    }
+
+    // Each source writes a distinct value, so the assertions show which one won.
+    const BEFORE: i64 = 0;
+    const EXISTING: i64 = 1;
+    const LOGGED: i64 = 2;
+    const CHANGED: i64 = 3;
+
+    /// Used for a kind the case doesn't change: existing entries only.
+    const UNTOUCHED: SidecarRow = SidecarRow {
+        before: &[],
+        inline: &["untouched"],
+        sidecars: &[&["untouched-spilled"]],
+        logged: &[],
+        changed: &[],
+        expected_inline: &[("untouched", EXISTING)],
+        sidecars_kept: true,
+        sidecars_read: false,
+    };
+
+    /// The action most cases start from: `inline` inline and `kept`/`spilled` in one sidecar, with
+    /// nothing logged or changed.
+    const BASE: SidecarRow = SidecarRow {
+        before: &[],
+        inline: &["inline"],
+        sidecars: &[&["kept", "spilled"]],
+        logged: &[],
+        changed: &[],
+        expected_inline: &[("inline", EXISTING)],
+        sidecars_kept: true,
+        sidecars_read: false,
+    };
+
+    /// The `T` side of a row: the action's sidecars, the lines logged before the action, the
+    /// entries logged after it, and this transaction's changes. Sidecars that must not be read
+    /// point at files that were never written.
+    struct KindSetup<T> {
+        sidecars: Vec<Sidecar>,
+        before: Vec<String>,
+        logged: Vec<T>,
+        changes: Vec<T>,
+    }
+
+    impl SidecarRow {
+        fn setup<T: TestEntry>(
+            &self,
+            engine: &SyncEngine,
+            table_root: &Url,
+            checkpoint: &mut CheckpointAction,
+        ) -> KindSetup<T> {
+            let at = |keys: &[&str], value| keys.iter().map(|key| T::at(key, value)).collect_vec();
+            let sidecars = (self.sidecars.iter().enumerate())
+                .map(|(i, keys)| {
+                    let name = format!("{}-{i}.parquet", T::NAME);
+                    if self.sidecars_read {
+                        T::write_sidecar(engine, table_root, &name, at(keys, EXISTING))
+                    } else {
+                        missing_sidecar(&name)
+                    }
+                })
+                .collect_vec();
+            T::set(checkpoint, at(self.inline, EXISTING), sidecars.clone());
+            KindSetup {
+                sidecars,
+                before: at(self.before, BEFORE).iter().map(T::line).collect(),
+                logged: at(self.logged, LOGGED),
+                changes: at(self.changed, CHANGED),
+            }
+        }
+
+        /// Asserts `checkpoint` holds exactly the row's expected `T` entries inline, and keeps or
+        /// drops the sidecars as the row expects.
+        fn assert_entries<T: TestEntry>(
+            &self,
+            checkpoint: &CheckpointAction,
+            setup: &KindSetup<T>,
+        ) {
+            let inline = T::inline(checkpoint)
+                .iter()
+                .map(|entry| (entry.key(), entry.value()))
+                .sorted();
+            let expected = self.expected_inline.iter().copied().sorted();
+            assert_eq!(inline.collect_vec(), expected.collect_vec());
+            assert_eq!(
+                T::sidecars(checkpoint),
+                kept_or_empty(&setup.sidecars, self.sidecars_kept)
+            );
+        }
+    }
+
+    // A change is this transaction's change or a log commit after the action. Existing sidecars
+    // are kept unless a change touches a key stored in one; then every sidecar of that kind is
+    // read and its entries move inline. Sidecars are read only when a change touches a key that
+    // isn't inline. Each entry takes its newest value: this transaction's change, then a commit
+    // after the action, then the action itself; commits before the action are ignored.
+    #[rstest]
+    #[case::unchanged(BASE)]
+    #[case::inline_changed(SidecarRow {
+        changed: &["inline"], expected_inline: &[("inline", CHANGED)], ..BASE
+    })]
+    #[case::inline_logged(SidecarRow {
+        logged: &["inline"], expected_inline: &[("inline", LOGGED)], ..BASE
+    })]
+    #[case::transaction_overrides_log_commit(SidecarRow {
+        logged: &["inline"], changed: &["inline"], expected_inline: &[("inline", CHANGED)], ..BASE
+    })]
+    #[case::new_entry(SidecarRow {
+        changed: &["new"], expected_inline: &[("inline", EXISTING), ("new", CHANGED)],
+        sidecars_read: true, ..BASE
+    })]
+    #[case::logged_new_entry(SidecarRow {
+        logged: &["new"], expected_inline: &[("inline", EXISTING), ("new", LOGGED)],
+        sidecars_read: true, ..BASE
+    })]
+    #[case::sidecar_entry(SidecarRow {
+        changed: &["spilled"],
+        expected_inline: &[("inline", EXISTING), ("kept", EXISTING), ("spilled", CHANGED)],
+        sidecars_kept: false, sidecars_read: true, ..BASE
+    })]
+    #[case::logged_sidecar_entry(SidecarRow {
+        logged: &["spilled"],
+        expected_inline: &[("inline", EXISTING), ("kept", EXISTING), ("spilled", LOGGED)],
+        sidecars_kept: false, sidecars_read: true, ..BASE
+    })]
+    #[case::two_sidecars_kept(SidecarRow {
+        before: &[], inline: &[], sidecars: &[&["a"], &["b"]], logged: &[], changed: &["new"],
+        expected_inline: &[("new", CHANGED)], sidecars_kept: true, sidecars_read: true,
+    })]
+    #[case::one_of_two_sidecars_touched(SidecarRow {
+        before: &[], inline: &[], sidecars: &[&["a"], &["b"]], logged: &[], changed: &["b"],
+        expected_inline: &[("a", EXISTING), ("b", CHANGED)],
+        sidecars_kept: false, sidecars_read: true,
+    })]
+    #[case::logged_before_action(SidecarRow {
+        before: &["stale"], inline: &["inline"], sidecars: &[&["kept"]], logged: &["logged"],
+        changed: &[],
+        expected_inline: &[("inline", EXISTING), ("logged", LOGGED)],
+        sidecars_kept: true, sidecars_read: true,
+    })]
+    #[case::logged_before_action_at_tip(SidecarRow {
+        before: &["stale"], inline: &["inline"], sidecars: &[&["kept"]], logged: &[],
+        changed: &[],
+        expected_inline: &[("inline", EXISTING)], sidecars_kept: true, sidecars_read: false,
+    })]
+    #[case::empty_action_ignores_entries_before_it(SidecarRow {
+        before: &["dropped"], inline: &[], sidecars: &[], logged: &[], changed: &[],
+        expected_inline: &[], sidecars_kept: true, sidecars_read: false,
+    })]
+    fn compute_checkpoint_action_reuses_or_inlines_sidecars(
+        #[case] row: SidecarRow,
+        #[values(Changed::Txns, Changed::Domains, Changed::Both)] changed: Changed,
+    ) -> Result<()> {
         let (engine, table_root) = setup_table()?;
-        let write = |version, data| write_commit(&engine, &table_root, version, data);
+        // Entries logged before the action share one commit at version 1.
+        let manifest_version = if row.before.is_empty() { 1 } else { 2 };
+        let path = format!("metadata/root-v{manifest_version}.parquet");
+        let mut existing = minimal_checkpoint_action(&path, manifest_version)?;
+        let txn_row = if changed == Changed::Domains {
+            UNTOUCHED
+        } else {
+            row
+        };
+        let domain_row = if changed == Changed::Txns {
+            UNTOUCHED
+        } else {
+            row
+        };
+        let txns: KindSetup<SetTransaction> = txn_row.setup(&engine, &table_root, &mut existing);
+        let domains: KindSetup<DomainMetadata> =
+            domain_row.setup(&engine, &table_root, &mut existing);
+        if !row.before.is_empty() {
+            let before = txns.before.iter().chain(&domains.before);
+            let data = parse_json_batch(before.map(String::as_str).collect_vec().into());
+            write_commit(&engine, &table_root, 1, data)?;
+        }
+        write_manifest_commit(&engine, &table_root, manifest_version, existing)?;
+        commit_transaction(&engine, &table_root, &txns.logged, &domains.logged)?;
 
-        let stale_domain = DomainMetadata::new("stale.domain".to_string(), "{}".to_string());
-        write(
-            1,
-            create_row(&engine, LOG_DOMAIN_METADATA_SCHEMA.clone(), stale_domain)?,
-        )?;
-        let stale_transaction = SetTransaction::new("stale-app".to_string(), 5, None);
-        write(
-            2,
-            create_row(&engine, LOG_TXN_SCHEMA.clone(), stale_transaction)?,
-        )?;
-        let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
-        let checkpoint = CheckpointAction::new(
-            3,
-            ContentRoot::new("metadata/root-v3.parquet".to_string(), 1024, 3),
-            protocol,
-            metadata,
-            vec![SetTransaction::new("ckpt-app".to_string(), 1, None)],
-            vec![DomainMetadata::new(
-                "ckpt.domain".to_string(),
-                "{}".to_string(),
-            )],
-        );
-        write_manifest_commit(&engine, &table_root, 3, checkpoint)?;
+        let checkpoint = compute_at_latest(&engine, &table_root, &domains.changes, &txns.changes)?;
 
-        let manifest = root_manifest(
-            &table_root,
-            "metadata/root-v3.parquet",
-            1024,
-            Snapshot::builder_for(table_root.clone()).build(&engine)?,
-        );
-        let (domain_metadata, transactions) = manifest.scan_non_content_metadata(&engine)?;
-
-        assert_eq!(domain_metadata.keys().collect::<Vec<_>>(), ["ckpt.domain"]);
-        assert_eq!(transactions.keys().collect::<Vec<_>>(), ["ckpt-app"]);
+        txn_row.assert_entries(&checkpoint, &txns);
+        domain_row.assert_entries(&checkpoint, &domains);
         Ok(())
     }
 
-    // A domain and txn active in top-level commits, then dropped by omission in a later checkpoint
-    // (as an external writer would, with no tombstone), must not come back in the rebuilt
-    // checkpoint from those older log entries.
-    #[test]
-    fn compute_checkpoint_action_does_not_resurrect_entries_the_checkpoint_dropped() -> Result<()> {
-        let (engine, table_root) = setup_table()?;
-        let write = |version, data| write_commit(&engine, &table_root, version, data);
-
-        let domain_metadata = DomainMetadata::new("dropped.domain".to_string(), "{}".to_string());
-        write(
-            1,
-            create_row(&engine, LOG_DOMAIN_METADATA_SCHEMA.clone(), domain_metadata)?,
-        )?;
-        let transaction = SetTransaction::new("dropped-app".to_string(), 5, None);
-        write(2, create_row(&engine, LOG_TXN_SCHEMA.clone(), transaction)?)?;
-        // Complete checkpoint at the tip that omits both.
-        let existing = minimal_checkpoint_action("metadata/root-v3.parquet", 3)?;
-        write_manifest_commit(&engine, &table_root, 3, existing)?;
-
-        let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
-        assert_eq!(snapshot.version(), 3);
-        let manifest = root_manifest(
-            &table_root,
-            "metadata/root-v4.parquet",
-            2048,
-            snapshot.clone(),
-        );
-
-        let checkpoint = manifest.compute_checkpoint_action(
-            &engine,
-            4,
-            snapshot.table_configuration(),
-            &[],
-            &[],
-        )?;
-        assert!(checkpoint.domain_metadata.is_empty());
-        assert!(checkpoint.transactions.is_empty());
-        Ok(())
+    /// Asserts `checkpoint` holds exactly `inline_keys` of kind `T` inline, including every entry
+    /// in `changes`, and carries `existing`'s sidecars of that kind iff `sidecars_kept`.
+    fn assert_checkpoint_entries<'a, T: CheckpointActionEntry + PartialEq + Debug + 'a>(
+        checkpoint: &CheckpointAction,
+        existing: &CheckpointAction,
+        changes: impl IntoIterator<Item = &'a T>,
+        inline_keys: &[&str],
+        sidecars_kept: bool,
+    ) {
+        let inline = T::inline(checkpoint);
+        assert_eq!(sorted_keys(inline), inline_keys);
+        assert!(changes.into_iter().all(|entry| inline.contains(entry)));
+        let expected_sidecars = kept_or_empty(T::sidecars(existing), sidecars_kept);
+        assert_eq!(T::sidecars(checkpoint), expected_sidecars);
     }
 
-    // The existing checkpoint's txns and domain metadata spilled to sidecars are carried into the
-    // replacing checkpoint inline.
-    #[test]
-    fn compute_checkpoint_action_folds_a_checkpoint_that_spills_to_sidecars() -> Result<()> {
+    // The checkpoint action holds domain `inline` inline and `spilled` in a sidecar. Txns have no
+    // tombstones, so removals are only covered for domains.
+    #[rstest]
+    #[case::sidecar_entry_removed(
+        vec![DomainMetadata::remove("spilled".into(), "1".into())],
+        false
+    )]
+    #[case::new_entry_added_then_removed(
+        vec![domain("new", "1"), DomainMetadata::remove("new".into(), "1".into())],
+        true
+    )]
+    fn compute_checkpoint_action_applies_domain_removals_over_sidecars(
+        #[case] log_domains: Vec<DomainMetadata>,
+        #[case] sidecar_kept: bool,
+    ) -> Result<()> {
         let (engine, table_root) = setup_table()?;
-        let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
-        let mut existing = CheckpointAction::new(
-            1,
-            ContentRoot::new("metadata/root-v1.parquet".to_string(), 1024, 1),
-            protocol,
-            metadata,
-            vec![],
-            vec![],
-        );
-        let transaction = SetTransaction::new("app-1".to_string(), 5, None);
-        let domain = DomainMetadata::new("test.domain".to_string(), "{}".to_string());
-        existing.txn_sidecars = vec![write_sidecar(
-            &engine,
-            &table_root,
-            "txn.parquet",
-            LOG_TXN_SCHEMA.clone(),
-            vec![transaction.clone().into()],
-        )];
-        existing.domain_metadata_sidecars = vec![write_sidecar(
+        let mut existing = minimal_checkpoint_action("metadata/root-v1.parquet", 1)?;
+        existing.domain_metadata = vec![domain("inline", "1")];
+        existing.domain_metadata_sidecars = vec![write_domain_metadata_sidecar(
             &engine,
             &table_root,
             "domains.parquet",
-            LOG_DOMAIN_METADATA_SCHEMA.clone(),
-            vec![domain.clone().into()],
+            [domain("spilled", "1")],
         )];
-        write_manifest_commit(&engine, &table_root, 1, existing)?;
-
-        let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
-        let manifest = root_manifest(
-            &table_root,
-            "metadata/root-v2.parquet",
-            2048,
-            snapshot.clone(),
-        );
-
-        let checkpoint = manifest.compute_checkpoint_action(
-            &engine,
-            2,
-            snapshot.table_configuration(),
-            &[],
-            &[],
-        )?;
-        assert_eq!(checkpoint.transactions, [transaction]);
-        assert_eq!(checkpoint.domain_metadata, [domain]);
-        assert!(checkpoint.txn_sidecars.is_empty());
-        assert!(checkpoint.domain_metadata_sidecars.is_empty());
-        Ok(())
-    }
-
-    // An AMT table from v0 whose manifest commit at v1 carries the checkpoint action, followed by
-    // domain metadata and a transaction. Every commit records an In-Commit Timestamp and, from v1
-    // on, the `lastManifestCommit` that locates the checkpoint action, as an AMT writer does.
-    #[test]
-    fn scan_non_content_metadata_uses_crc_fast_path_with_existing_checkpoint() -> Result<()> {
-        let engine = SyncEngine::in_memory();
-        let table_root = url::Url::parse("memory:///").map_err(KernelError::from)?;
-        let (protocol, metadata) = adaptive_metadata_protocol_and_metadata();
-        let commit_info = |ict: i64, last_manifest_commit: Option<i64>| {
-            let mut commit_info = serde_json::json!({ "timestamp": ict, "inCommitTimestamp": ict });
-            if let Some(version) = last_manifest_commit {
-                commit_info["lastManifestCommit"] =
-                    serde_json::json!({ "version": version, "contentRootVersion": version });
-            }
-            serde_json::json!({ "commitInfo": commit_info })
-        };
-        let commits = [
-            vec![
-                commit_info(1, None),
-                serde_json::json!({ "protocol": protocol }),
-                serde_json::json!({ "metaData": metadata }),
-            ],
-            vec![
-                commit_info(2, Some(1)),
-                serde_json::json!({ "checkpoint": [
-                    { "checkpointMetadata": { "version": 1 } },
-                    { "contentRoot": {
-                        "path": "metadata/root-v1.parquet", "sizeInBytes": 1024, "version": 1,
-                    } },
-                    { "protocol": protocol },
-                    { "metaData": metadata },
-                ] }),
-            ],
-            vec![
-                commit_info(3, Some(1)),
-                serde_json::json!({ "domainMetadata": {
-                    "domain": "test.domain", "configuration": "{}", "removed": false,
-                } }),
-            ],
-            vec![
-                commit_info(4, Some(1)),
-                serde_json::json!({ "txn": { "appId": "app-1", "version": 5 } }),
-            ],
-        ];
-        let log_root = table_root.join("_delta_log/").map_err(KernelError::from)?;
-        for (version, actions) in commits.iter().enumerate() {
-            let lines = actions.iter().map(|action| action.to_string()).join("\n");
-            engine.storage_handler().put(
-                &log_root
-                    .join(&format!("{version:020}.json"))
-                    .map_err(KernelError::from)?,
-                lines.into(),
-                false,
-            )?;
+        write_manifest_commit(&engine, &table_root, 1, existing.clone())?;
+        for log_domain in log_domains {
+            commit_transaction(&engine, &table_root, &[], &[log_domain])?;
         }
 
-        let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
-        let (_, snapshot) = snapshot.write_checksum(&engine)?;
-        assert!(snapshot.crc_at_version().is_some());
+        let checkpoint = compute_at_latest(&engine, &table_root, &[], &[])?;
 
-        let manifest = root_manifest(&table_root, "metadata/root-v1.parquet", 1024, snapshot);
-        let (domain_metadata, transactions) = manifest.scan_non_content_metadata(&engine)?;
-
-        assert_eq!(domain_metadata.len(), 1);
-        assert!(domain_metadata.contains_key("test.domain"));
-        assert_eq!(transactions.len(), 1);
-        assert!(transactions.contains_key("app-1"));
-        Ok(())
-    }
-
-    #[test]
-    fn scan_non_content_metadata_uses_crc_fast_path() -> Result<()> {
-        let (engine, table_root) = setup_table()?;
-        let write = |version, data| write_commit(&engine, &table_root, version, data);
-
-        let domain_metadata = DomainMetadata::new("test.domain".to_string(), "{}".to_string());
-        write(
-            1,
-            create_row(&engine, LOG_DOMAIN_METADATA_SCHEMA.clone(), domain_metadata)?,
-        )?;
-        let transaction = SetTransaction::new("app-1".to_string(), 5, None);
-        write(2, create_row(&engine, LOG_TXN_SCHEMA.clone(), transaction)?)?;
-
-        let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
-        let (_, snapshot) = snapshot.write_checksum(&engine)?;
-        assert!(snapshot.crc_at_version().is_some());
-
-        let manifest = root_manifest(&table_root, "metadata/root-v1.parquet", 1024, snapshot);
-        let (domain_metadata, transactions) = manifest.scan_non_content_metadata(&engine)?;
-
-        assert_eq!(domain_metadata.len(), 1);
-        assert!(domain_metadata.contains_key("test.domain"));
-        assert_eq!(transactions.len(), 1);
-        assert!(transactions.contains_key("app-1"));
+        assert_eq!(checkpoint.domain_metadata, [domain("inline", "1")]);
+        assert_eq!(
+            checkpoint.domain_metadata_sidecars,
+            kept_or_empty(&existing.domain_metadata_sidecars, sidecar_kept)
+        );
         Ok(())
     }
 
@@ -732,47 +1146,236 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn scan_non_content_metadata_scans_past_a_partial_crc() -> Result<()> {
+    // With no checkpoint action to keep, the entries come from the snapshot, through a complete CRC
+    // or by scanning past a partial one.
+    #[rstest]
+    fn compute_checkpoint_action_reads_entries_without_a_checkpoint(
+        #[values(true, false)] crc_complete: bool,
+    ) -> Result<()> {
         let (engine, table_root) = setup_table()?;
         let write = |version, data| write_commit(&engine, &table_root, version, data);
 
         let domain_metadata = DomainMetadata::new("test.domain".to_string(), "{}".to_string());
         write(
             1,
-            create_row(&engine, LOG_DOMAIN_METADATA_SCHEMA.clone(), domain_metadata)?,
+            create_row(
+                &engine,
+                LOG_DOMAIN_METADATA_SCHEMA.clone(),
+                domain_metadata.clone(),
+            )?,
         )?;
         let transaction = SetTransaction::new("app-1".to_string(), 5, None);
-        write(2, create_row(&engine, LOG_TXN_SCHEMA.clone(), transaction)?)?;
+        write(
+            2,
+            create_row(&engine, LOG_TXN_SCHEMA.clone(), transaction.clone())?,
+        )?;
 
         let built = Snapshot::builder_for(table_root.clone()).build(&engine)?;
-        let crc = Arc::new(Crc {
-            version: built.version(),
-            set_transaction_state: SetTransactionState::Partial(Default::default()),
-            domain_metadata_state: DomainMetadataState::Partial(Default::default()),
-            ..Default::default()
-        });
-        let snapshot = Snapshot::new_with_crc(
-            built.log_segment().clone(),
-            built.table_configuration().clone(),
-            Some(crc),
-            true,
-            false,
-        )?;
+        let snapshot = if crc_complete {
+            built.write_checksum(&engine)?.1
+        } else {
+            let crc = Arc::new(Crc {
+                version: built.version(),
+                set_transaction_state: SetTransactionState::Partial(Default::default()),
+                domain_metadata_state: DomainMetadataState::Partial(Default::default()),
+                ..Default::default()
+            });
+            Arc::new(Snapshot::new_with_crc(
+                built.log_segment().clone(),
+                built.table_configuration().clone(),
+                Some(crc),
+                true,
+                false,
+            )?)
+        };
         assert!(snapshot.crc_at_version().is_some());
 
         let manifest = root_manifest(
             &table_root,
-            "metadata/root-v1.parquet",
+            "metadata/root-v3.parquet",
             1024,
-            Arc::new(snapshot),
+            snapshot.clone(),
         );
-        let (domain_metadata, transactions) = manifest.scan_non_content_metadata(&engine)?;
+        let checkpoint = manifest.compute_checkpoint_action(
+            &engine,
+            3,
+            snapshot.table_configuration(),
+            &[],
+            &[],
+        )?;
 
-        assert_eq!(domain_metadata.len(), 1);
-        assert!(domain_metadata.contains_key("test.domain"));
-        assert_eq!(transactions.len(), 1);
-        assert!(transactions.contains_key("app-1"));
+        assert_eq!(checkpoint.domain_metadata, [domain_metadata]);
+        assert_eq!(checkpoint.transactions, [transaction]);
+        Ok(())
+    }
+
+    // Readers keep the first occurrence of a duplicated key, so the new checkpoint action must
+    // too.
+    #[test]
+    fn compute_checkpoint_action_keeps_the_first_of_duplicate_inline_entries() -> Result<()> {
+        let (engine, table_root) = setup_table()?;
+        let mut existing = minimal_checkpoint_action("metadata/root-v1.parquet", 1)?;
+        existing.transactions = vec![txn("app", 10), txn("app", 5)];
+        existing.domain_metadata = vec![
+            domain("d", "active"),
+            DomainMetadata::remove("d".into(), "active".into()),
+        ];
+        write_manifest_commit(&engine, &table_root, 1, existing)?;
+        let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+        assert_eq!(
+            snapshot.get_app_id_versions(&engine)?["app"],
+            txn("app", 10)
+        );
+        let domains = snapshot
+            .reader()
+            .get_domain_metadatas_internal(&engine, None)?;
+        assert_eq!(domains["d"], domain("d", "active"));
+
+        let checkpoint = compute_at_latest(&engine, &table_root, &[], &[])?;
+
+        assert_eq!(checkpoint.transactions, [txn("app", 10)]);
+        assert_eq!(checkpoint.domain_metadata, [domain("d", "active")]);
+        Ok(())
+    }
+
+    // A type the CRC holds in full is written inline from the CRC, dropping that type's
+    // sidecars. A type it doesn't is folded from the checkpoint action and the log commits after
+    // it. Both sidecars point at unwritten files, so reading either fails.
+    #[rstest]
+    fn compute_checkpoint_action_uses_a_complete_crc_over_the_checkpoint_action(
+        #[values(true, false)] txns_complete: bool,
+        #[values(true, false)] domains_complete: bool,
+    ) -> Result<()> {
+        let (engine, table_root) = setup_table()?;
+        let mut existing = minimal_checkpoint_action("metadata/root-v1.parquet", 1)?;
+        existing.transactions = vec![txn("inline", 1)];
+        existing.domain_metadata = vec![domain("inline", "1")];
+        existing.txn_sidecars = vec![missing_sidecar("txn.parquet")];
+        existing.domain_metadata_sidecars = vec![missing_sidecar("domains.parquet")];
+        write_manifest_commit(&engine, &table_root, 1, existing.clone())?;
+        let (logged_txn, logged_domain) = (txn("inline", 2), domain("inline", "2"));
+        let logged = [
+            txn_line(&logged_txn.app_id, logged_txn.version),
+            domain_metadata_line(logged_domain.clone()),
+        ];
+        let data = parse_json_batch(logged.iter().map(String::as_str).collect_vec().into());
+        write_commit_after_manifest_commit(&engine, &table_root, 2, 1, data)?;
+
+        // The CRC holds `from-crc` instead of the action's entries, so the source is visible.
+        let built = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+        let crc = Crc {
+            version: built.version(),
+            protocol: built.table_configuration().protocol().clone(),
+            metadata: built.table_configuration().metadata().clone(),
+            set_transaction_state: match txns_complete {
+                true => SetTransactionState::Complete(HashMap::from([(
+                    "from-crc".to_string(),
+                    txn("from-crc", 1),
+                )])),
+                false => SetTransactionState::Partial(Default::default()),
+            },
+            domain_metadata_state: match domains_complete {
+                true => DomainMetadataState::Complete(HashMap::from([(
+                    "from-crc".to_string(),
+                    domain("from-crc", "1"),
+                )])),
+                false => DomainMetadataState::Partial(Default::default()),
+            },
+            last_manifest_commit_opt: Some(LastManifestCommit {
+                version: 1,
+                content_root_version: 1,
+            }),
+            ..Default::default()
+        };
+        let snapshot = Arc::new(Snapshot::new_with_crc(
+            built.log_segment().clone(),
+            built.table_configuration().clone(),
+            Some(Arc::new(crc)),
+            true,
+            false,
+        )?);
+        if txns_complete && domains_complete {
+            // Neither the checkpoint action nor the commits after it are needed, so any log read
+            // fails.
+            for version in 1..=built.version() {
+                let commit = table_root
+                    .join(&format!("_delta_log/{version:020}.json"))
+                    .map_err(KernelError::from)?;
+                engine.storage_handler().delete(&commit)?;
+            }
+        }
+        let commit_version = built.version() + 1;
+        let manifest = root_manifest(&table_root, "metadata/root-v4.parquet", 1024, snapshot);
+        let table_config = manifest.read_snapshot.table_configuration().clone();
+        let checkpoint =
+            manifest.compute_checkpoint_action(&engine, commit_version, &table_config, &[], &[])?;
+
+        // A type folded from the checkpoint action keeps its sidecars and takes the logged update.
+        let keys = |complete| if complete { ["from-crc"] } else { ["inline"] };
+        let txn_logged = (!txns_complete).then_some(&logged_txn);
+        let txn_keys = keys(txns_complete);
+        assert_checkpoint_entries(
+            &checkpoint,
+            &existing,
+            txn_logged,
+            &txn_keys,
+            !txns_complete,
+        );
+        let domain_logged = (!domains_complete).then_some(&logged_domain);
+        let domain_keys = keys(domains_complete);
+        assert_checkpoint_entries(
+            &checkpoint,
+            &existing,
+            domain_logged,
+            &domain_keys,
+            !domains_complete,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn committed_manifest_keeps_sidecars_that_the_next_snapshot_reads() -> Result<()> {
+        let (engine, table_root) = setup_table()?;
+        let mut existing = minimal_checkpoint_action("metadata/root-v1.parquet", 1)?;
+        existing.txn_sidecars = vec![write_txn_sidecar(
+            &engine,
+            &table_root,
+            "txn.parquet",
+            [txn("kept", 1)],
+        )];
+        existing.domain_metadata_sidecars = vec![write_domain_metadata_sidecar(
+            &engine,
+            &table_root,
+            "domains.parquet",
+            [domain("kept", "1")],
+        )];
+        write_manifest_commit(&engine, &table_root, 1, existing.clone())?;
+
+        let root_manifest = manifest_file(&format!("{table_root}metadata/root-v2.parquet"), 1024)?;
+        commit_on_latest(&engine, &table_root, |transaction| {
+            set_entries(transaction, &[txn("new", 2)], &[domain("new", "2")])
+                .with_root_manifest_file(root_manifest)
+        })?;
+
+        let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+        let checkpoint = snapshot
+            .latest_checkpoint_action(&engine)?
+            .expect("the commit is a manifest commit");
+        assert_eq!(checkpoint.txn_sidecars, existing.txn_sidecars);
+        assert_eq!(
+            checkpoint.domain_metadata_sidecars,
+            existing.domain_metadata_sidecars
+        );
+        let app_ids = snapshot.get_app_id_versions(&engine)?;
+        assert_eq!(
+            sorted_keys(&app_ids.into_values().collect_vec()),
+            ["kept", "new"]
+        );
+        let domains = snapshot
+            .reader()
+            .get_domain_metadatas_internal(&engine, None)?;
+        assert_eq!(domains["kept"], domain("kept", "1"));
+        assert_eq!(domains["new"], domain("new", "2"));
         Ok(())
     }
 }

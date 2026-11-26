@@ -36,7 +36,7 @@ use crate::{
     DeltaError, EngineData, Error, FileMeta, KernelError, KernelResult, Result, RowVisitor as _,
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::{Engine, Version, create_row};
+use crate::{Engine, Version, create_row, version_as_i64};
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SCHEMA_RECURSION_LIMIT: usize = 1000;
@@ -1539,6 +1539,8 @@ impl LastManifestCommit {
 /// which the checkpoint is complete. For manifest commits, the checkpoint action also contains
 /// the table protocol and metadata, making the commit self-contained with respect to P+M.
 ///
+/// Each app id and each domain appears at most once across the inline entries and the sidecars.
+///
 /// Example manifest-commit JSON:
 /// ```json
 /// { "checkpoint": [
@@ -1555,12 +1557,12 @@ impl LastManifestCommit {
 // Serde is hand-written (see below), not derived: the wire form is a JSON array of tagged element
 // objects (`[{"checkpointMetadata":..}, {"contentRoot":..}, ..]`), not a struct. This is the same
 // shape the EngineData path uses, so the `_last_checkpoint` hint (which serdes this action) and log
-// replay share the wire form and the enumerated invariants (required singletons, no duplicates,
-// known sidecar `type`, `contentRoot.version <= checkpointMetadata.version`). They intentionally
-// differ on unknown elements: log replay skips a future element kind for forward compatibility (see
-// `visitors::CheckpointElementVisitor::visit`), whereas the serde path fails closed on it (an
-// externally-tagged enum with no catch-all), so a hint carrying one is dropped and the reader falls
-// back to log replay. Used by the hint's `AmtCheckpoint.checkpoint` field.
+// replay share the wire form and the same checks (see `CheckpointAction::from_elements` and
+// `CheckpointAction::validate`). They intentionally differ on unknown elements: log replay skips a
+// future element kind for forward compatibility (see `visitors::CheckpointElementVisitor::visit`),
+// whereas the serde path fails closed on it (an externally-tagged enum with no catch-all), so a
+// hint carrying one is dropped and the reader falls back to log replay. Used by the hint's
+// `AmtCheckpoint.checkpoint` field.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[internal_api]
@@ -1568,7 +1570,7 @@ pub(crate) struct CheckpointAction {
     /// The table version up to which the checkpoint is complete, sourced from the wire
     /// `checkpointMetadata.version`. May be less than or equal to the commit version containing
     /// this checkpoint action, and is `>= content_root.version` (see [`ContentRoot::version`]).
-    pub(crate) version: i64,
+    pub(crate) version: Version,
     /// Reference to the root manifest file.
     pub(crate) content_root: ContentRoot,
     /// The table protocol at the checkpoint version.
@@ -1634,7 +1636,7 @@ impl Serialize for CheckpointAction {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> KernelResult<S::Ok, S::Error> {
         self.validate().map_err(serde::ser::Error::custom)?;
         let checkpoint_metadata = CheckpointMetadata {
-            version: self.version,
+            version: version_as_i64(self.version).map_err(serde::ser::Error::custom)?,
             tags: None,
         };
         let mut elements = vec![
@@ -1677,10 +1679,8 @@ impl Serialize for CheckpointAction {
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
 impl<'de> Deserialize<'de> for CheckpointAction {
-    /// Folds the array of tagged elements into a typed action, applying the same enumerated
-    /// checks as the EngineData [`visitors::CheckpointVisitor`]: required singletons, no
-    /// duplicates, known sidecar `type`, and the `contentRoot.version <=
-    /// checkpointMetadata.version` invariant. The one intended difference is unknown elements:
+    /// Folds the array of tagged elements into a typed action, applying the same checks as the
+    /// EngineData [`visitors::CheckpointVisitor`]. The one intended difference is unknown elements:
     /// this path fails closed on an unrecognized element key (see [`CheckpointActionElement`]),
     /// whereas the visitor skips it for forward compatibility.
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> KernelResult<Self, D::Error> {
@@ -1743,7 +1743,7 @@ impl CheckpointAction {
     fn try_into_scalar(self) -> KernelResult<Scalar> {
         self.validate()?;
         let checkpoint_metadata = CheckpointMetadata {
-            version: self.version,
+            version: version_as_i64(self.version)?,
             tags: None,
         };
         let mut elements = vec![
@@ -1798,7 +1798,7 @@ impl CheckpointAction {
     // sidecar format is defined.
     #[internal_api]
     pub(crate) fn new(
-        version: i64,
+        version: Version,
         content_root: ContentRoot,
         protocol: Protocol,
         metadata: Metadata,
@@ -1831,8 +1831,8 @@ impl CheckpointAction {
     /// `checkpoint` action are skipped, so `Ok(None)` means the batch had none at all.
     ///
     /// Returns an error if a `checkpoint` action is present but malformed: a required singleton
-    /// element is missing or repeated, an element or sidecar `type` is unrecognized, or
-    /// `contentRoot.version` exceeds `checkpointMetadata.version`.
+    /// element is missing or repeated, an element or sidecar `type` is unrecognized, a version is
+    /// negative, or `contentRoot.version` exceeds `checkpointMetadata.version`.
     #[internal_api]
     pub(crate) fn try_new_from_data(
         data: &dyn EngineData,
@@ -1865,9 +1865,11 @@ impl CheckpointAction {
         let mut domain_metadata_sidecars = Vec::new();
         for element in elements {
             match element {
-                CheckpointActionElement::CheckpointMetadata(cm) => {
-                    set_once(&mut version, cm.version, CHECKPOINT_METADATA_NAME)?
-                }
+                CheckpointActionElement::CheckpointMetadata(cm) => set_once(
+                    &mut version,
+                    Self::version_from_wire(cm.version)?,
+                    CHECKPOINT_METADATA_NAME,
+                )?,
                 CheckpointActionElement::ContentRoot(cr) => {
                     set_once(&mut content_root, cr, CONTENT_ROOT_NAME)?
                 }
@@ -1906,15 +1908,30 @@ impl CheckpointAction {
         Ok(action)
     }
 
-    /// Enforce the adaptiveMetadata invariant that `contentRoot.version` never exceeds the
-    /// checkpoint version. Called on both the parse and serialize paths so a `CheckpointAction`
-    /// can never be written in a shape the reader would reject.
+    /// Converts the wire `checkpointMetadata.version` (a LONG) to a [`Version`], failing if it is
+    /// negative.
+    fn version_from_wire(version: i64) -> KernelResult<Version> {
+        Version::try_from(version).map_err(|_| {
+            KernelError::generic(format!("checkpoint action version {version} is negative"))
+        })
+    }
+
+    /// Enforce the adaptiveMetadata invariant that `contentRoot.version` is non-negative and never
+    /// exceeds the checkpoint version. Called on both the parse and serialize paths so a
+    /// `CheckpointAction` can never be written in a shape the reader would reject.
     fn validate(&self) -> KernelResult<()> {
-        require!(
-            self.content_root.version <= self.version,
+        let content_root_version = Version::try_from(self.content_root.version).map_err(|_| {
             KernelError::generic(format!(
-                "checkpoint contentRoot.version {} exceeds checkpointMetadata.version {}",
-                self.content_root.version, self.version
+                "checkpoint contentRoot.version {} must be non-negative",
+                self.content_root.version
+            ))
+        })?;
+        require!(
+            content_root_version <= self.version,
+            KernelError::generic(format!(
+                "checkpoint contentRoot.version {content_root_version} exceeds \
+                 checkpointMetadata.version {}",
+                self.version
             ))
         );
         Ok(())
@@ -1934,7 +1951,7 @@ impl CheckpointAction {
 
     /// Get the checkpoint version.
     #[internal_api]
-    pub(crate) fn version(&self) -> i64 {
+    pub(crate) fn version(&self) -> Version {
         self.version
     }
 
@@ -3739,22 +3756,45 @@ mod tests {
         Ok(())
     }
 
-    // The `contentRoot.version <= checkpointMetadata.version` invariant is enforced on the
-    // serialize path too, not just when parsing. `content_root_version_too_high` in visitors.rs
-    // covers the parse-path guard; this covers the `validate()` call during scalar conversion.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[test]
-    fn test_checkpoint_action_scalar_rejects_invalid_content_root_version() {
-        let base = sample_checkpoint_action();
-        let action = CheckpointAction {
-            content_root: ContentRoot {
-                version: base.version + 1,
-                ..base.content_root
-            },
-            ..sample_checkpoint_action()
+    #[derive(Clone, Copy, Debug)]
+    enum Writer {
+        Scalar,
+        Serde,
+    }
+
+    // Both write paths validate before emitting, so an action the reader would reject is never
+    // written.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::content_root_too_high(
+        |action: &mut CheckpointAction| action.content_root.version = 43,
+        "exceeds checkpointMetadata.version"
+    )]
+    #[case::negative_content_root(
+        |action: &mut CheckpointAction| action.content_root.version = -1,
+        "must be non-negative"
+    )]
+    #[case::version_exceeds_i64(
+        |action: &mut CheckpointAction| action.version = Version::MAX,
+        "exceeds i64::MAX"
+    )]
+    fn test_checkpoint_action_writers_reject_invalid_versions(
+        #[values(Writer::Scalar, Writer::Serde)] writer: Writer,
+        #[case] invalidate: fn(&mut CheckpointAction),
+        #[case] expected_msg: &str,
+    ) {
+        let mut action = sample_checkpoint_action();
+        invalidate(&mut action);
+        let err = match writer {
+            Writer::Scalar => action
+                .try_into_scalar()
+                .map(|_| ())
+                .unwrap_err()
+                .to_string(),
+            Writer::Serde => serde_json::to_value(&action).unwrap_err().to_string(),
         };
-        let result = action.try_into_scalar();
-        assert_result_error_with_message(result, "exceeds checkpointMetadata.version");
+        assert!(err.contains(expected_msg), "{writer:?}: {err}");
     }
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -3894,28 +3934,6 @@ mod tests {
         assert_eq!(back, action);
     }
 
-    /// The `Serialize` path validates before emitting, mirroring `try_into_scalar`: an action whose
-    /// `contentRoot.version` exceeds the checkpoint version fails to serialize rather than writing
-    /// an out-of-spec array.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[test]
-    fn test_checkpoint_action_serde_rejects_invalid_content_root_version() {
-        let base = sample_checkpoint_action();
-        let action = CheckpointAction {
-            content_root: ContentRoot {
-                version: base.version + 1,
-                ..base.content_root
-            },
-            ..sample_checkpoint_action()
-        };
-        let err = serde_json::to_value(&action).expect_err("invalid action must not serialize");
-        assert!(
-            err.to_string()
-                .contains("exceeds checkpointMetadata.version"),
-            "expected content-root-version error, got: {err}"
-        );
-    }
-
     /// The synthesized `checkpointMetadata` element omits `tags` entirely (via
     /// `skip_serializing_if`) rather than emitting `"tags": null`, matching the EngineData wire
     /// form. The symmetric round-trip tests cannot observe this because both an absent key and an
@@ -3951,8 +3969,7 @@ mod tests {
 
     /// The serde fold applies the same enumerated checks as the EngineData `CheckpointVisitor`,
     /// with identical error messages (compare `test_parse_checkpoint_action_errors` in
-    /// `visitors.rs`): required singletons, no duplicates, known sidecar `type`, and the
-    /// `contentRoot.version` invariant. Unknown elements are the intended exception -- the
+    /// `visitors.rs`). Unknown elements are the intended exception -- the
     /// serde path fails closed on them while the visitor skips them -- and are not covered
     /// here.
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -3990,6 +4007,15 @@ mod tests {
         r#"{"contentRoot":{"path":"p","sizeInBytes":1,"version":99}}"#,
         checkpoint_serde_elements::PROTOCOL, checkpoint_serde_elements::METADATA,
     ], "checkpoint contentRoot.version 99 exceeds checkpointMetadata.version 42")]
+    #[case::negative_version(&[
+        r#"{"checkpointMetadata":{"version":-1}}"#, checkpoint_serde_elements::CONTENT_ROOT,
+        checkpoint_serde_elements::PROTOCOL, checkpoint_serde_elements::METADATA,
+    ], "checkpoint action version -1 is negative")]
+    #[case::negative_content_root_version(&[
+        checkpoint_serde_elements::CHECKPOINT_METADATA,
+        r#"{"contentRoot":{"path":"p","sizeInBytes":1,"version":-1}}"#,
+        checkpoint_serde_elements::PROTOCOL, checkpoint_serde_elements::METADATA,
+    ], "checkpoint contentRoot.version -1 must be non-negative")]
     fn test_checkpoint_action_serde_fold_errors(
         #[case] elements: &[&str],
         #[case] expected_msg: &str,

@@ -882,7 +882,7 @@ async fn test_lagging_checkpoint_action_defers_to_crc_pm() {
 async fn test_crc_seeded_replay_follows_pointer_to_checkpoint_action(
     #[case] v0: Vec<Value>,
     #[case] v1: Vec<Value>,
-    #[case] pointed_version: i64,
+    #[case] pointed_version: Version,
 ) {
     let config = &*POINTER_TEST_CONFIG;
     let test = CrcReadTest::new()
