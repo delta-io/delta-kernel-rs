@@ -1311,6 +1311,12 @@
       "count": 1
     },
     {
+      "fingerprint": "55545b7463d2b5455506c2596d50724c5f2e51bc3ff16b66e027e3134f1c0fed",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "ffi/src/ffi_metrics.rs",
+      "count": 1
+    },
+    {
       "fingerprint": "55bc3c8109e7e33750c14a928d8af541bb552bb8af89865f082d58bb50b2cd09",
       "ruleId": "kernel-policy-no-local-imports",
       "file": "kernel/src/engine/arrow_expression/evaluate_expression.rs",
@@ -2511,6 +2517,12 @@
       "count": 1
     },
     {
+      "fingerprint": "a9b819b39aab9d3f8a09af4027c90a4938ff58011a09f626be61f152cad9c2ee",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/src/scan/scan_plan/metadata_replay_base.rs",
+      "count": 1
+    },
+    {
       "fingerprint": "aa03023ffd3d881e1c579a18257a590c747cc5a46928efc7404298461d40b523",
       "ruleId": "kernel-policy-no-local-imports",
       "file": "kernel/src/schema/mod.rs",
@@ -2976,6 +2988,12 @@
       "fingerprint": "c9efe0d199fbbed18feb688c86af959f7936d185f31d06e3e43a1dec6e84bc83",
       "ruleId": "kernel-policy-no-control-flow-arguments",
       "file": "kernel/src/commit_range/mod.rs",
+      "count": 1
+    },
+    {
+      "fingerprint": "cadbc5c9518f1feed385147b5fd52b996910b283ee419699eeea2d8cd8580c96",
+      "ruleId": "kernel-policy-no-control-flow-arguments",
+      "file": "kernel/tests/integration/parsed_partition_values.rs",
       "count": 1
     },
     {
