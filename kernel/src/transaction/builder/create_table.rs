@@ -44,8 +44,9 @@ use crate::table_properties::{
     ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_ICEBERG_NATIVE_V4,
     ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
     MATERIALIZED_ROW_ID_COLUMN_NAME, ROW_TRACKING_SUSPENDED, TableProperties,
-    is_table_feature_signal_key, strip_table_feature_signal_prefix,
-    validate_and_normalize_property_batch_for_create, validate_log_and_deleted_file_retention,
+    canonicalize_property_batch_for_create, is_table_feature_signal_key,
+    strip_table_feature_signal_prefix, validate_log_and_deleted_file_retention,
+    validate_property_values_for_create,
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
@@ -774,44 +775,25 @@ fn validate_extract_table_features_and_properties(
     let mut reader_features = Vec::new();
     let mut writer_features = Vec::new();
 
-    // Partition properties into feature signals and regular properties
-    // Feature signals (delta.feature.X=supported) are processed but not stored in metadata
-    // Feature signals are removed from the properties map. Prefix match is case-insensitive so
-    // mixed-case keys do not fall through to property normalization.
-    let mut feature_signals = HashMap::new();
-    let mut batches = Vec::with_capacity(property_batches.len());
+    // Feature signals (delta.feature.X=supported) are not stored in metadata. Signals and
+    // properties are both canonicalized within each call, then merged in call order so a later
+    // call overrides an earlier one regardless of key spelling.
+    let mut feature_signals: HashMap<TableFeature, (String, String)> = HashMap::new();
+    let mut normalized = HashMap::new();
     for batch in property_batches {
         let (signals, properties): (Vec<_>, Vec<_>) = batch
             .into_iter()
             .partition(|(k, _)| is_table_feature_signal_key(k));
-        feature_signals.extend(signals);
-        batches.push(properties);
+        feature_signals.extend(canonicalize_feature_signals(signals)?);
+        normalized.extend(canonicalize_property_batch_for_create(properties)?);
     }
 
-    // Process and validate feature signals
-    for (key, value) in &feature_signals {
-        // Safe: we partitioned with is_table_feature_signal_key above
-        let Some(feature_name) = strip_table_feature_signal_prefix(key) else {
-            continue;
-        };
-
-        // Validate that the value is "supported"
+    for (feature, (key, value)) in feature_signals {
         if value != SET_TABLE_FEATURE_SUPPORTED_VALUE {
             return Err(KernelError::generic(format!(
                 "Invalid value '{value}' for '{key}'. Only '{SET_TABLE_FEATURE_SUPPORTED_VALUE}' is allowed."
             )));
         }
-
-        // Feature names are matched case-insensitively and resolve to the canonical feature.
-        let Some(feature) = ALLOWED_DELTA_FEATURES
-            .iter()
-            .find(|feature| feature.as_ref().eq_ignore_ascii_case(feature_name))
-            .cloned()
-        else {
-            return Err(KernelError::generic(format!(
-                "Enabling feature '{feature_name}' via '{key}' is not supported during CREATE TABLE"
-            )));
-        };
 
         // VariantShredding requires VariantType as a dependency
         if feature == TableFeature::VariantShredding {
@@ -822,16 +804,10 @@ fn validate_extract_table_features_and_properties(
             );
         }
 
-        // Add to appropriate feature lists based on feature type
         add_feature_to_lists(feature, &mut reader_features, &mut writer_features);
     }
 
-    // Canonicalize within each call, then merge in call order so a later call overrides an
-    // earlier one regardless of key spelling.
-    let mut normalized = HashMap::new();
-    for batch in batches {
-        normalized.extend(validate_and_normalize_property_batch_for_create(batch)?);
-    }
+    validate_property_values_for_create(&normalized)?;
     validate_log_and_deleted_file_retention(&normalized)?;
 
     Ok(ValidatedTableProperties {
@@ -839,6 +815,36 @@ fn validate_extract_table_features_and_properties(
         reader_features,
         writer_features,
     })
+}
+
+/// Resolves the `delta.feature.*` entries of one `with_table_properties` call to their canonical
+/// features. Prefix and feature name match case-insensitively, and two entries for the same
+/// feature in one call are rejected.
+fn canonicalize_feature_signals(
+    signals: Vec<(String, String)>,
+) -> KernelResult<HashMap<TableFeature, (String, String)>> {
+    let mut resolved = HashMap::new();
+    for (key, value) in signals {
+        let Some(feature_name) = strip_table_feature_signal_prefix(&key) else {
+            continue;
+        };
+        let Some(feature) = ALLOWED_DELTA_FEATURES
+            .iter()
+            .find(|feature| feature.as_ref().eq_ignore_ascii_case(feature_name))
+            .cloned()
+        else {
+            return Err(KernelError::generic(format!(
+                "Enabling feature '{feature_name}' via '{key}' is not supported during CREATE TABLE"
+            )));
+        };
+        if let Some((existing, _)) = resolved.insert(feature, (key.clone(), value)) {
+            return Err(KernelError::generic(format!(
+                "Conflicting spellings of feature signal '{existing}' and '{key}' in the same \
+                 request"
+            )));
+        }
+    }
+    Ok(resolved)
 }
 
 /// Builder for configuring a new Delta table.
@@ -1689,6 +1695,79 @@ mod tests {
                 ("delta.checkpointInterval".to_string(), "20".to_string()),
             ]]),
             "Conflicting spellings of table property 'delta.checkpointInterval'",
+        );
+    }
+
+    #[test]
+    fn test_create_later_call_replaces_invalid_value_from_earlier_call() {
+        let validated = validate_extract_table_features_and_properties(vec![
+            vec![(
+                "delta.parquet.compression.codec".to_string(),
+                "invalid".to_string(),
+            )],
+            vec![(
+                "DELTA.parquet.compression.codec".to_string(),
+                "snappy".to_string(),
+            )],
+        ])
+        .unwrap();
+        assert_eq!(
+            validated.properties["delta.parquet.compression.codec"],
+            "snappy"
+        );
+    }
+
+    #[test]
+    fn test_create_later_feature_signal_overrides_earlier_across_spellings() {
+        let validated = validate_extract_table_features_and_properties(vec![
+            vec![(
+                "DELTA.FEATURE.DELETIONVECTORS".to_string(),
+                "unsupported".to_string(),
+            )],
+            vec![(
+                "delta.feature.deletionVectors".to_string(),
+                "supported".to_string(),
+            )],
+        ])
+        .unwrap();
+        assert!(
+            validated
+                .writer_features
+                .contains(&TableFeature::DeletionVectors)
+        );
+    }
+
+    #[test]
+    fn test_create_rejects_invalid_feature_signal_value_in_final_call() {
+        assert_result_error_with_message(
+            validate_extract_table_features_and_properties(vec![
+                vec![(
+                    "delta.feature.deletionVectors".to_string(),
+                    "supported".to_string(),
+                )],
+                vec![(
+                    "DELTA.feature.DELETIONVECTORS".to_string(),
+                    "unsupported".to_string(),
+                )],
+            ]),
+            "Only 'supported' is allowed",
+        );
+    }
+
+    #[test]
+    fn test_create_rejects_conflicting_feature_signal_spellings_within_one_call() {
+        assert_result_error_with_message(
+            validate_extract_table_features_and_properties(vec![vec![
+                (
+                    "DELTA.FEATURE.DELETIONVECTORS".to_string(),
+                    "supported".to_string(),
+                ),
+                (
+                    "delta.feature.deletionVectors".to_string(),
+                    "supported".to_string(),
+                ),
+            ]]),
+            "Conflicting spellings of feature signal",
         );
     }
 

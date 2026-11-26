@@ -156,24 +156,39 @@ pub(crate) fn strip_table_feature_signal_prefix(key: &str) -> Option<&str> {
     is_table_feature_signal_key(key).then(|| &key[SET_TABLE_FEATURE_SUPPORTED_PREFIX.len()..])
 }
 
-/// Validates and normalizes one batch of CREATE properties (one `with_table_properties` call).
+/// Canonicalizes the keys of one batch of CREATE properties (one `with_table_properties` call)
+/// without validating values.
 ///
-/// Two entries for the same `delta.*` key (including exact duplicates and case variants) are
-/// rejected. Duplicate non-`delta.*` keys keep the last value. Callers merge batches in call order
-/// so a later batch overrides an earlier one for the same canonical key.
-pub(crate) fn validate_and_normalize_property_batch_for_create(
+/// Rejects keys CREATE may not set. Two entries for the same `delta.*` key (including exact
+/// duplicates and case variants) are rejected. Duplicate non-`delta.*` keys keep the last value.
+/// Callers merge batches in call order so a later batch overrides an earlier one for the same
+/// canonical key, then check the merged result with [`validate_property_values_for_create`].
+pub(crate) fn canonicalize_property_batch_for_create(
     batch: impl IntoIterator<Item = (String, String)>,
 ) -> KernelResult<HashMap<String, String>> {
-    normalize_property_batch(batch, PropertySetOperation::Create)
+    canonicalize_property_batch(batch, PropertySetOperation::Create)
 }
 
-/// Validates and normalizes one batch of UPDATE properties (one `with_table_properties_added`
-/// call), with the same duplicate handling and merge contract as
-/// [`validate_and_normalize_property_batch_for_create`].
-pub(crate) fn validate_and_normalize_property_batch_for_update(
+/// UPDATE variant of [`canonicalize_property_batch_for_create`] for one
+/// `with_table_properties_added` call.
+pub(crate) fn canonicalize_property_batch_for_update(
     batch: impl IntoIterator<Item = (String, String)>,
 ) -> KernelResult<HashMap<String, String>> {
-    normalize_property_batch(batch, PropertySetOperation::Update)
+    canonicalize_property_batch(batch, PropertySetOperation::Update)
+}
+
+/// Validates the values of merged, canonicalized CREATE properties.
+pub(crate) fn validate_property_values_for_create(
+    properties: &HashMap<String, String>,
+) -> KernelResult<()> {
+    validate_property_values(properties, PropertySetOperation::Create)
+}
+
+/// Validates the values of merged, canonicalized UPDATE properties.
+pub(crate) fn validate_property_values_for_update(
+    properties: &HashMap<String, String>,
+) -> KernelResult<()> {
+    validate_property_values(properties, PropertySetOperation::Update)
 }
 
 /// Rejects `table_properties` where log retention is shorter than deleted-file retention.
@@ -248,16 +263,10 @@ fn find_property_def(key: &str) -> Option<&'static TablePropertyDef> {
         .find(|def| key.eq_ignore_ascii_case(def.key))
 }
 
-fn validate_and_normalize_property(
-    key: impl Into<String>,
-    value: impl Into<String>,
-    operation: PropertySetOperation,
-) -> KernelResult<(String, String)> {
-    let key = key.into();
-    let value = value.into();
-
+/// Resolves `key` to its canonical spelling, rejecting `delta.*` keys that `operation` may not set.
+fn canonicalize_property_key(key: String, operation: PropertySetOperation) -> KernelResult<String> {
     if !is_delta_property_key(&key) {
-        return Ok((key, value));
+        return Ok(key);
     }
 
     if strip_check_constraint_prefix(&key.to_ascii_lowercase()).is_some() {
@@ -289,25 +298,68 @@ fn validate_and_normalize_property(
         });
     };
 
-    let validate = match (operation, def.access) {
+    value_validator(def, operation)
+        .map(|_| def.key.to_string())
+        .ok_or_else(|| operation.cannot_set(def.key))
+}
+
+/// Returns the value validator for `def` when `operation` may set it.
+fn value_validator(
+    def: &TablePropertyDef,
+    operation: PropertySetOperation,
+) -> Option<fn(&str) -> bool> {
+    match (operation, def.access) {
         (
             PropertySetOperation::Create,
             PropertyAccess::Editable(validate) | PropertyAccess::CreateOnly(validate),
         )
-        | (PropertySetOperation::Update, PropertyAccess::Editable(validate)) => validate,
-        _ => return Err(operation.cannot_set(def.key)),
-    };
-
-    if !validate(&value) {
-        return Err(operation.error(match operation {
-            PropertySetOperation::Create => format!("Invalid value '{value}' for '{}'", def.key),
-            PropertySetOperation::Update => {
-                format!("Invalid value '{value}' for table property '{}'", def.key)
-            }
-        }));
+        | (PropertySetOperation::Update, PropertyAccess::Editable(validate)) => Some(validate),
+        _ => None,
     }
+}
 
-    Ok((def.key.to_string(), value))
+/// Validates the value of an already canonical `key`. Non-`delta.*` keys accept any value.
+fn validate_property_value(
+    key: &str,
+    value: &str,
+    operation: PropertySetOperation,
+) -> KernelResult<()> {
+    if !is_delta_property_key(key) {
+        return Ok(());
+    }
+    let validate = find_property_def(key)
+        .and_then(|def| value_validator(def, operation))
+        .ok_or_else(|| operation.cannot_set(key))?;
+    if validate(value) {
+        return Ok(());
+    }
+    Err(operation.error(match operation {
+        PropertySetOperation::Create => format!("Invalid value '{value}' for '{key}'"),
+        PropertySetOperation::Update => {
+            format!("Invalid value '{value}' for table property '{key}'")
+        }
+    }))
+}
+
+fn validate_property_values(
+    properties: &HashMap<String, String>,
+    operation: PropertySetOperation,
+) -> KernelResult<()> {
+    properties
+        .iter()
+        .try_for_each(|(key, value)| validate_property_value(key, value, operation))
+}
+
+#[cfg(test)]
+fn validate_and_normalize_property(
+    key: impl Into<String>,
+    value: impl Into<String>,
+    operation: PropertySetOperation,
+) -> KernelResult<(String, String)> {
+    let key = canonicalize_property_key(key.into(), operation)?;
+    let value = value.into();
+    validate_property_value(&key, &value, operation)?;
+    Ok((key, value))
 }
 
 /// Validates and normalizes a single property for CREATE TABLE.
@@ -338,13 +390,13 @@ fn validate_and_normalize_property_for_update(
     validate_and_normalize_property(key, value, PropertySetOperation::Update)
 }
 
-fn normalize_property_batch(
+fn canonicalize_property_batch(
     batch: impl IntoIterator<Item = (String, String)>,
     operation: PropertySetOperation,
 ) -> KernelResult<HashMap<String, String>> {
     let mut normalized = HashMap::new();
     for (key, value) in batch {
-        let (canonical, value) = validate_and_normalize_property(key, value, operation)?;
+        let canonical = canonicalize_property_key(key, operation)?;
         if normalized.insert(canonical.clone(), value).is_some()
             && is_delta_property_key(&canonical)
         {
@@ -842,10 +894,10 @@ mod tests {
     }
 
     #[test]
-    fn batch_normalization_rejects_conflicting_delta_spellings_but_keeps_last_user_value() {
+    fn batch_canonicalization_rejects_conflicting_delta_spellings_but_keeps_last_user_value() {
         for operation in [
-            validate_and_normalize_property_batch_for_create,
-            validate_and_normalize_property_batch_for_update,
+            canonicalize_property_batch_for_create,
+            canonicalize_property_batch_for_update,
         ] {
             let error = operation([
                 ("DELTA.checkpointInterval".to_string(), "10".to_string()),
@@ -908,5 +960,15 @@ mod tests {
             ),
             "error={error}"
         );
+    }
+
+    #[test]
+    fn batch_canonicalization_defers_value_validation_to_merged_properties() {
+        let batch = [("delta.checkpointInterval".to_string(), "abc".to_string())];
+        let canonical = canonicalize_property_batch_for_create(batch.clone()).unwrap();
+        assert_eq!(canonical["delta.checkpointInterval"], "abc");
+        validate_property_values_for_create(&canonical).unwrap_err();
+        let canonical = canonicalize_property_batch_for_update(batch).unwrap();
+        validate_property_values_for_update(&canonical).unwrap_err();
     }
 }

@@ -17,8 +17,8 @@ use crate::table_features::{
     validate_iceberg_compat_if_needed,
 };
 use crate::table_properties::{
-    DELTA_PROPERTY_PREFIX, is_delta_property_key, validate_and_normalize_property_batch_for_update,
-    validate_retention_for_property_adds,
+    DELTA_PROPERTY_PREFIX, canonicalize_property_batch_for_update, is_delta_property_key,
+    validate_property_values_for_update, validate_retention_for_property_adds,
 };
 use crate::transaction::domain_metadata::validate_unique_domains;
 use crate::transaction::schema_evolution::{SchemaOperation, evolve_table_config};
@@ -603,9 +603,11 @@ fn validate_and_canonicalize_properties_added(
 ) -> KernelResult<HashMap<String, String>> {
     let mut validated = HashMap::new();
     for batch in properties_added {
-        let batch = validate_and_normalize_property_batch_for_update(batch.iter().cloned())?;
-        validated.extend(batch);
+        validated.extend(canonicalize_property_batch_for_update(
+            batch.iter().cloned(),
+        )?);
     }
+    validate_property_values_for_update(&validated)?;
     Ok(validated)
 }
 
@@ -1894,5 +1896,15 @@ mod tests {
             );
         }
         (engine, snapshot, tempdir)
+    }
+
+    #[test]
+    fn later_properties_added_call_replaces_invalid_value_from_earlier_call() {
+        let validated = super::validate_and_canonicalize_properties_added(&[
+            vec![("delta.checkpointInterval".to_string(), "abc".to_string())],
+            vec![("DELTA.checkpointInterval".to_string(), "20".to_string())],
+        ])
+        .unwrap();
+        assert_eq!(validated["delta.checkpointInterval"], "20");
     }
 }
