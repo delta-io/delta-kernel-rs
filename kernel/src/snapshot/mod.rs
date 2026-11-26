@@ -489,7 +489,6 @@ impl Snapshot {
                 schema.clone(),
                 schema,
                 None,
-                None,
             )?;
             return Ok(result.actions);
         }

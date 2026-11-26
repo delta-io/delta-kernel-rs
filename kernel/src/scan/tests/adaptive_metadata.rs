@@ -19,7 +19,7 @@ use crate::content_tree::test_utils::{
 use crate::content_tree::{ContentTreeNodeEntry, TrackingInfo, TrackingStatus};
 use crate::engine::arrow_data::EngineDataArrowExt as _;
 use crate::engine::sync::SyncEngine;
-use crate::expressions::{Predicate as Pred, Scalar, col, lit};
+use crate::expressions::{Expression, Predicate as Pred, Scalar, col, lit};
 use crate::scan::{Scan, ScanMetadata};
 use crate::schema::{SchemaRef, StructType, schema_ref};
 use crate::table_features::ColumnMappingMode;
@@ -320,12 +320,23 @@ fn data_skipping_prunes_commit_files_but_keeps_tree_files_without_stats() {
     assert_eq!(paths, strings(&["high.parquet", "tree.parquet"]));
 }
 
+/// How the table schema changes after the checkpoint action whose tree records the stats.
+#[derive(Debug, Clone, Copy)]
+enum SchemaChange {
+    Unchanged,
+    /// Drops `name`, keeping `id` and its field ID.
+    DropColumn,
+    /// Renames `id` to `renamed_id`, keeping its field ID and physical name.
+    RenameColumn,
+}
+
 /// Tree files are pruned by their `content_stats`, which are matched to the table's columns by
 /// field ID, so a schema change after the checkpoint action still prunes them.
 #[rstest]
-#[case::checkpoint_schema(false)]
-#[case::schema_changed_after_checkpoint(true)]
-fn data_skipping_prunes_tree_files_by_content_stats(#[case] change_schema: bool) {
+#[case::checkpoint_schema(SchemaChange::Unchanged)]
+#[case::column_dropped_after_checkpoint(SchemaChange::DropColumn)]
+#[case::column_renamed_after_checkpoint(SchemaChange::RenameColumn)]
+fn data_skipping_prunes_tree_files_by_content_stats(#[case] schema_change: SchemaChange) {
     let (engine, _) = setup_adaptive_metadata_table();
     let entries = [
         added_data_entry("low.parquet", 1, 1, 0, 0),
@@ -339,20 +350,30 @@ fn data_skipping_prunes_tree_files_by_content_stats(#[case] change_schema: bool)
     let location = table_root().join("metadata/root.parquet").unwrap();
     let root = write_manifest_with_stats(&engine, location, &entries, &x_full_stats(), stats);
     let mut version = commit_root_manifest_file(&engine, &table_root(), root);
-    if change_schema {
-        // Drops `name`, keeping `id` and its field ID.
-        let id = test_schema_flat_with_column_mapping()
-            .field("id")
-            .unwrap()
-            .clone();
-        let lines = protocol_and_metadata_lines(Arc::new(StructType::new_unchecked([id])), &[]);
+    let table_schema = test_schema_flat_with_column_mapping();
+    let id = table_schema.field("id").unwrap();
+    let (schema, column) = match schema_change {
+        SchemaChange::Unchanged => (None, "id"),
+        SchemaChange::DropColumn => (Some(StructType::new_unchecked([id.clone()])), "id"),
+        SchemaChange::RenameColumn => {
+            let fields = table_schema
+                .fields()
+                .map(|field| match field.name().as_str() {
+                    "id" => field.with_name("renamed_id"),
+                    _ => field.clone(),
+                });
+            (Some(StructType::new_unchecked(fields)), "renamed_id")
+        }
+    };
+    if let Some(schema) = schema {
+        let lines = protocol_and_metadata_lines(Arc::new(schema), &[]);
         let data = parse_json_batch(lines.lines().collect::<Vec<_>>().into());
         write_commit_after_manifest_commit(&engine, &table_root(), version + 1, version, data)
             .unwrap();
         version += 1;
     }
 
-    let predicate = Arc::new(Pred::gt(col!("id"), lit(100i64)));
+    let predicate = Arc::new(Pred::gt(Expression::column([column]), lit(100i64)));
     let scan = snapshot_at(&engine, version)
         .scan_builder()
         .with_predicate(predicate)

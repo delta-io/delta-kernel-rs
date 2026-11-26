@@ -689,12 +689,22 @@ impl<'a> StatsLeafVisitor<'a> for StatsSchemaCollector {
 
 // == AMT content_stats -> parsed Delta stats ==
 
-/// Builds the expression evaluating an AMT entry row to its Delta stats, a struct of type
-/// `delta_stats_schema`:
+/// The manifest of the content tree whose entries a [`parsed_stats_expression`] converts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ManifestLevel {
+    /// The root manifest, whose entries may be data files or references to leaf manifests.
+    Root,
+    /// A leaf manifest, which holds only data file entries, so the expression reads no
+    /// `contentType` or `manifestInfo`.
+    Leaf,
+}
+
+/// Builds the expression evaluating an AMT entry row of a `level` manifest to its Delta stats, a
+/// struct of type `delta_stats_schema`:
 ///
 /// ```text
 /// numRecords:  long               <- recordCount (data file entry)
-///                                    manifestInfo.*RowsCount summed (data manifest entry)
+///                                    manifestInfo.*RowsCount summed (root data manifest entry)
 /// nullCount:   {<table nesting>}  <- content_stats.<leaf>.null_value_count
 /// minValues:   {<table nesting>}  <- content_stats.<leaf>.lower_bound
 /// maxValues:   {<table nesting>}  <- content_stats.<leaf>.upper_bound
@@ -710,10 +720,11 @@ impl<'a> StatsLeafVisitor<'a> for StatsSchemaCollector {
 pub(crate) fn parsed_stats_expression(
     table_schema: &StructType,
     delta_stats_schema: &StructType,
+    level: ManifestLevel,
 ) -> KernelResult<Expression> {
     let scopes = CategoryScopes::from_delta_stats_schema(delta_stats_schema)?;
     let root = StatsLeafWalker::walk(table_schema, Some(scopes), &ParsedStatsExprBuilder)?;
-    assemble_parsed_stats_expr(root, delta_stats_schema, &scopes)
+    assemble_parsed_stats_expr(root, delta_stats_schema, &scopes, level)
 }
 
 /// A built child expression and the name of the output field it fills.
@@ -798,32 +809,36 @@ impl<'a> StatsLeafVisitor<'a> for ParsedStatsExprBuilder {
 }
 
 /// Assembles the top-level stats struct expression from the walk's `root` outputs, field for field
-/// with `delta_stats_schema`.
+/// with `delta_stats_schema`, for entries of a `level` manifest.
 fn assemble_parsed_stats_expr(
     root: Vec<StatsExprNode<'_>>,
     delta_stats_schema: &StructType,
     scopes: &CategoryScopes<'_>,
+    level: ManifestLevel,
 ) -> KernelResult<Expression> {
     let mut categories = combine_children(root, scopes, &[])?;
     let mut fields = Vec::new();
     for field in delta_stats_schema.fields() {
         let name = field.name().as_str();
         let expr = match name {
-            // A manifest entry's `recordCount` counts the entries of the manifest it references,
-            // not rows, so its rows come from `manifestInfo` instead.
-            NUM_RECORDS => Expression::case_when(
-                [
-                    (
-                        content_type_is(DataContentType::Data),
-                        Expression::column([RECORD_COUNT]),
-                    ),
-                    (
-                        content_type_is(DataContentType::DataManifest),
-                        manifest_row_count(),
-                    ),
-                ],
-                null_lit(DataType::LONG),
-            ),
+            NUM_RECORDS => match level {
+                // A manifest entry's `recordCount` counts the entries of the manifest it
+                // references, not rows, so its rows come from `manifestInfo` instead.
+                ManifestLevel::Root => Expression::case_when(
+                    [
+                        (
+                            content_type_is(DataContentType::Data),
+                            Expression::column([RECORD_COUNT]),
+                        ),
+                        (
+                            content_type_is(DataContentType::DataManifest),
+                            manifest_row_count(),
+                        ),
+                    ],
+                    null_lit(DataType::LONG),
+                ),
+                ManifestLevel::Leaf => Expression::column([RECORD_COUNT]),
+            },
             // Wide bounds are still valid for data skipping; readers just can't treat them as
             // exact. Write an explicit `false` because kernel still reads an absent `tightBounds`
             // as tight.
@@ -2277,21 +2292,18 @@ mod tests {
         )
     }
 
-    /// The input schema the conversion reads: `content_stats` read with [`projected_stats_schema`],
-    /// plus the entry's `recordCount`, `contentType`, and `manifestInfo` row counts.
-    fn parsed_stats_input_schema(table: &StructType, delta: &StructType) -> StructType {
-        StructType::new_unchecked([
-            StructField::nullable(
-                CONTENT_STATS_FIELD_NAME,
-                projected_stats_schema(table, delta).expect("projected schema"),
-            ),
-            StructField::nullable(RECORD_COUNT, DataType::LONG),
-            StructField::nullable(CONTENT_TYPE, DataType::INTEGER),
-            StructField::nullable(MANIFEST_INFO, manifest_row_counts_schema()),
-        ])
+    /// The entry a conversion test converts.
+    #[derive(Clone, Copy)]
+    enum TestEntry {
+        /// A data file entry of the root manifest.
+        RootData,
+        /// A data manifest entry of the root manifest, with these `manifestInfo` row counts.
+        RootDataManifest([i64; 5]),
+        /// A data file entry of a leaf manifest, read without `contentType` or `manifestInfo`.
+        LeafData,
     }
 
-    /// [`assert_parsed_stats_of`] for a data file entry.
+    /// [`assert_parsed_stats_of`] for a root data file entry.
     fn assert_parsed_stats(
         table: &StructType,
         delta: &StructType,
@@ -2300,7 +2312,7 @@ mod tests {
         expected_stats: Scalar,
     ) {
         assert_parsed_stats_of(
-            None,
+            TestEntry::RootData,
             table,
             delta,
             content_stats,
@@ -2309,43 +2321,60 @@ mod tests {
         );
     }
 
-    /// Converts a single input row and asserts the produced Delta stats equal `expected_stats`.
-    /// The row is a data manifest entry with `manifest_rows_counts` as its `manifestInfo` row
-    /// counts when given, else a data file entry. Uses the real evaluator end to end.
+    /// Converts `entry`, a single input row with `content_stats` read with
+    /// [`projected_stats_schema`], and asserts the produced Delta stats equal `expected_stats`.
+    /// Uses the real evaluator end to end.
     fn assert_parsed_stats_of(
-        manifest_rows_counts: Option<[i64; 5]>,
+        entry: TestEntry,
         table: &StructType,
         delta: &StructType,
         content_stats: Scalar,
         record_count: i64,
         expected_stats: Scalar,
     ) {
-        let input_schema = parsed_stats_input_schema(table, delta);
-        let (content_type, manifest_info) = match manifest_rows_counts {
-            Some(counts) => (
-                DataContentType::DataManifest,
-                struct_scalar(
+        let mut fields = vec![
+            StructField::nullable(
+                CONTENT_STATS_FIELD_NAME,
+                projected_stats_schema(table, delta).expect("projected schema"),
+            ),
+            StructField::nullable(RECORD_COUNT, DataType::LONG),
+        ];
+        let mut values = vec![content_stats, Scalar::Long(record_count)];
+        let root_fields = |content_type: DataContentType, manifest_info: Scalar| {
+            let fields = [
+                StructField::nullable(CONTENT_TYPE, DataType::INTEGER),
+                StructField::nullable(MANIFEST_INFO, manifest_row_counts_schema()),
+            ];
+            (
+                fields,
+                [Scalar::Integer(content_type as i32), manifest_info],
+            )
+        };
+        let level = match entry {
+            TestEntry::RootData => {
+                let null_info = Scalar::Null(manifest_row_counts_schema().into());
+                let (root_fields, root_values) = root_fields(DataContentType::Data, null_info);
+                fields.extend(root_fields);
+                values.extend(root_values);
+                ManifestLevel::Root
+            }
+            TestEntry::RootDataManifest(counts) => {
+                let info = struct_scalar(
                     &manifest_row_counts_schema(),
                     counts.map(Scalar::Long).to_vec(),
-                ),
-            ),
-            None => (
-                DataContentType::Data,
-                Scalar::Null(manifest_row_counts_schema().into()),
-            ),
+                );
+                let (root_fields, root_values) = root_fields(DataContentType::DataManifest, info);
+                fields.extend(root_fields);
+                values.extend(root_values);
+                ManifestLevel::Root
+            }
+            TestEntry::LeafData => ManifestLevel::Leaf,
         };
+        let input_schema = Arc::new(StructType::new_unchecked(fields));
         let engine = SyncEngine::new();
         let handler = engine.evaluation_handler();
         let input = handler
-            .create_many(
-                Arc::new(input_schema.clone()),
-                vec![vec![
-                    content_stats,
-                    Scalar::Long(record_count),
-                    Scalar::Integer(content_type as i32),
-                    manifest_info,
-                ]],
-            )
+            .create_many(input_schema.clone(), vec![values])
             .unwrap();
 
         let output_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
@@ -2356,9 +2385,13 @@ mod tests {
             .create_many(output_schema.clone(), vec![vec![expected_stats]])
             .unwrap();
 
-        let expr = Expression::struct_from([parsed_stats_expression(table, delta).unwrap()]);
+        let expr = parsed_stats_expression(table, delta, level).unwrap();
         let actual = handler
-            .new_expression_evaluator(Arc::new(input_schema), Arc::new(expr), output_schema.into())
+            .new_expression_evaluator(
+                input_schema,
+                Arc::new(Expression::struct_from([expr])),
+                output_schema.into(),
+            )
             .unwrap()
             .evaluate(input.as_ref())
             .unwrap();
@@ -2397,8 +2430,11 @@ mod tests {
         ])
     }
 
-    #[test]
-    fn parsed_stats_maps_categories_and_record_count() {
+    /// A data file entry's `recordCount` is its `numRecords`, whichever manifest holds it.
+    #[rstest]
+    fn parsed_stats_maps_categories_and_record_count(
+        #[values(TestEntry::RootData, TestEntry::LeafData)] entry: TestEntry,
+    ) {
         let table = StructType::new_unchecked([
             field_with_id("id", DataType::LONG, true, 0),
             field_with_id("score", DataType::LONG, true, 1),
@@ -2453,7 +2489,7 @@ mod tests {
             ],
         );
 
-        assert_parsed_stats(&table, &delta, content_stats, 100, expected);
+        assert_parsed_stats_of(entry, &table, &delta, content_stats, 100, expected);
     }
 
     /// A manifest entry's `recordCount` counts entries, not rows, so its `numRecords` sums the
@@ -2484,7 +2520,7 @@ mod tests {
         );
 
         assert_parsed_stats_of(
-            Some([1, 2, 3, 4, 5]),
+            TestEntry::RootDataManifest([1, 2, 3, 4, 5]),
             &table,
             &delta,
             content_stats,
@@ -2772,7 +2808,7 @@ mod tests {
             max_values: stat_cols(["id", "score"]),
         });
         assert_result_error_with_message(
-            parsed_stats_expression(&table, &delta),
+            parsed_stats_expression(&table, &delta, ManifestLevel::Root),
             "but the table walk produced",
         );
     }
