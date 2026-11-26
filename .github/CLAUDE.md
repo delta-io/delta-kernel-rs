@@ -5,7 +5,7 @@ Workflow-authoring rules for GitHub Actions.
 ## Test AI reviewer changes before merge
 
 For changes to `ai-review.yml`, reviewer Python helpers, role instructions or dependency locks,
-follow [Testing Omnigent before merge](omnigent/reviewer/README.md#testing-omnigent-before-merge).
+follow [Testing Omnigent before merge](omnigent/TESTING.md).
 It covers local checks, canonical-repository preview branches, manual dispatch, verification of
 the workflow and reviewed commit SHAs, output checks and cleanup. Normal PR and `/review` events
 use the default branch's reviewer, so they do not exercise the candidate reviewer changes.
