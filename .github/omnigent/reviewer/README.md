@@ -279,35 +279,50 @@ check's instructions to refresh the description or synchronize the stack, then r
 
 A **patch excerpt** is the leading portion of the fetched PR change patch inserted into task
 messages. Selecting the commit range happens before applying the excerpt's byte limit.
-`pr_change_patch_bytes` in the workflow holds the fetched patch; `pr_change_patch_excerpt_text`
-holds the decoded excerpt. Neither a fetched patch nor a model's successful return proves every
-changed line was examined.
+`pr_change_patch_bytes` in the workflow holds the fetched patch; `subagent_patch_excerpt_text`
+holds the excerpt included in subagent task messages. Neither a fetched patch nor a model's
+successful return proves every changed line was examined.
 
 ## Input limits
 
-The workflow applies these limits while preparing the initial task messages:
+[`diff_coverage.py`](../diff_coverage.py) prepares independent patch excerpts from the PR change
+patch. Byte limits measure UTF-8 text, not characters or model tokens.
 
-| Workflow local | What it limits | Value |
-| --- | --- | --- |
-| `max_patch_excerpt_bytes` | Raw PR change patch bytes, before decoding; the same excerpt is included in orchestrator and subagent task messages. | 80,000 bytes |
-| `max_orchestrator_initial_task_message_bytes` | The entire initial orchestrator task message, encoded as UTF-8. | 120,000 bytes |
-| `pr_description_excerpt_text` | The original PR description, before adding any truncation warning. | 4,096 Python characters |
+| Input | Limit | What the limit includes |
+|---|---|---|
+| Patch excerpt in each subagent task message, including the Checker | 100,000 bytes | Leading PR change patch bytes in Git's file order. |
+| Patch excerpt in the initial orchestrator task message | Up to 80,000 bytes | Patch text, reduced further when the complete initial task message has less room. |
+| Complete initial orchestrator task message | 120,000 bytes | Run-specific instructions, PR metadata, description excerpt, earlier AI review text, changed paths and patch excerpt. |
+| PR description excerpt | 8,192 bytes | Author text after recognized generated GitStack navigation is removed. |
 
-The patch excerpt omits the assignment and other PR data. Subagent task messages contain their
-assignments, shared PR task text and optional maintainer guidance; the task builder does not apply a
-combined 120,000-byte limit to those messages. Source-tool reads can return additional context
-later in the conversation.
+`prepare_review_inputs()` prepares the subagent patch excerpt. It records every changed path and
+its byte interval in `/tmp/diff_coverage.json`, marking each file section fully included, partly
+included or omitted. These measurements describe the supplied patch excerpt; they do not prove
+which changed lines a model examined or whether it found every defect.
+
+`build_orchestrator_task_message()` reserves the other task-message text, both excerpt byte counts
+and complete changed-path list before adding the orchestrator's patch excerpt. If the path list
+cannot fit, `list_changed_paths` reads it in pages from `/tmp/ai_review_changed_paths.json`.
+A source-file read provides context without expanding the changed lines eligible for new findings.
+
+The orchestrator retains checked findings from changes included in the subagent excerpt, even
+when those changes are absent from its own shorter excerpt.
+
+Subagent task messages contain assignments, shared PR task text and optional maintainer guidance.
+The task builder applies no combined 120,000-byte limit to those messages. Role instructions,
+tool definitions and later tool results are outside the initial task-message limits. Review-range
+selection reads the complete original PR description before excerpt preparation.
+
+If the subagent patch excerpt is truncated, the main AI review comment adds a closed
+`⚠️ Patch truncated for subagents` disclosure. It contains the selected commit range, supplied/total
+bytes, file patch counts, and partly included or omitted paths. The `AI Review Summary` Check Run
+shows the same information, and the workflow log records it. An uncut patch adds no warning.
 
 The 120,000-byte guard protects the single `omnigent run -p` command argument. On Linux with
 4 KiB pages, one argument is limited to 131,072 bytes including its trailing NUL. Separate role
 instructions, tool definitions and later conversation are outside this initial-message guard.
-It is not the model's context-window limit. The patch cap is an input-size policy, without a
+It is not the model's context-window limit. Patch excerpt limits are input-size policies, without a
 measured review-quality optimum established by this workflow.
-
-The workflow takes the description's first 4,096 characters without removing generated stack
-navigation. A long stack header can therefore crowd out author-written text. A patch exceeding
-80,000 bytes gets a truncation warning. If the orchestrator's initial task message exceeds
-120,000 UTF-8 bytes, the workflow stops before starting the orchestrator.
 
 ## GitHub comments, Checks and saved reports
 
@@ -337,6 +352,8 @@ PR comments.
 
 When credentials and the reviewed PR head are available, the workflow attempts to create an
 `AI Review Summary` Check Run. It includes all parsed final findings when available.
+After GitHub returns its URL, the workflow updates the main comment's `Full AI review` footer
+link to open that specific Check Run.
 If review-range selection fails, it shows the resolver's error. Otherwise, it shows a
 generic unavailable message and a workflow-run link for diagnostics. Its GitHub conclusion is
 `neutral`; this does not mean the AI approved the PR.
@@ -360,6 +377,7 @@ PR change patch and shared PR task text with seven-day retention.
 | `/tmp/review_output.txt` | Validation step | Publication reads the extracted orchestrator report; the Check Run uses it if the prepared check summary is unavailable. |
 | `/tmp/inline_findings.json` | Validation step | Publication code reads final findings and optional locations. |
 | `/tmp/publication_record.json` | Publication step | Records final findings, confirmed comment URLs and posting errors. |
+| `/tmp/check-run-response.json` | Check step | Footer reads the returned Check Run URL. |
 | `/tmp/review_output_complete.txt` | Publication step | Summary, artifact and Check Run outputs include all parsed final findings. |
 | `/tmp/check-summary.txt` | Publication step or diagnostic path | Check Run reads the assessment and findings, resolver error or generic unavailable message. |
 
@@ -397,6 +415,19 @@ hidden bot identifiers are omitted from this example.
 
 **🛑 2 Blockers · 🔧 1 Should Fix · 💡 2 Nits**
 
+<details><summary>⚠️ Patch truncated for subagents</summary>
+
+Reviewed range: `<base SHA>...<head SHA>`
+
+Includes <included bytes> of <total bytes> UTF-8 patch bytes.
+
+File patches: <full count> fully included, <partial count> partial, <omitted count> omitted.
+
+- Partial: <code>"<partly included path>"</code>
+- Omitted: <code>"<omitted path>"</code>
+
+</details>
+
 <details><summary>Overall assessment</summary>
 
 <one paragraph giving an overall assessment without repeating finding details>
@@ -411,7 +442,7 @@ hidden bot identifiers are omitted from this example.
 
 </details>
 
-<sub>Reviewed `<short SHA>` · [Full AI review → Checks](<PR checks URL>)
+<sub>Reviewed `<short SHA>` · [Full AI review](<AI Review Summary Check Run URL>)
 · [Workflow run](<workflow run URL>)</sub>
 ```
 
@@ -420,6 +451,8 @@ It is absent when there are none. Nits count in the headline and have individual
 no rows in that disclosure. All disclosures start closed. A posting failure can replace the
 count line with `Finding counts unavailable.` and adds an explanation. The Check Run includes
 all final findings, including findings supplied only in structured model output.
+The patch warning appears only when the subagent patch excerpt is truncated. The `Full AI review`
+link appears after the workflow creates the Check Run; the workflow-run link is always present.
 
 ### Individual finding comment format
 

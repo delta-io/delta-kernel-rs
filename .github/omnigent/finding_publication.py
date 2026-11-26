@@ -20,7 +20,9 @@ from typing import Any
 from inline_review import diff_positions, diff_sections
 from markdown_utils import markdown_lines
 from review_history import canonical_finding_body
-from review_publish import BOT_MARKER, finding_label, format_finding, format_review_summary
+from review_publish import (
+    BOT_MARKER, finding_label, format_diff_coverage, format_finding, format_review_summary,
+)
 
 _ID = re.compile(r"\[?(Blocker|Should\s*Fix|Nit)\s*([1-9][0-9]*)\]?", re.I)
 _HEADING = re.compile(r"^#{2,4}\s+(\[?(?:Blocker|Should\s*Fix|Nit)\s*[1-9][0-9]*\]?)(.*)$", re.I)
@@ -190,6 +192,7 @@ def publish_findings(
     *, github: Any, repository: str, pr_number: int, head_sha: str, run_url: str,
     review: str, structured: Any, github_pr_patch: str, pr_change_patch: str | None,
     trusted_bot_logins: list[str], mode: str = "inline", placement: str = "inline-or-conversation",
+    coverage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Post or reuse finding comments and update the main AI review comment for one commit.
 
@@ -208,7 +211,8 @@ def publish_findings(
     findings, errors = collect_findings(review, structured)
     record: dict[str, Any] = {
         "head_sha": head_sha, "run_url": run_url, "mode": mode, "findings": findings,
-        "errors": errors, "complete": False, "main_url": None,
+        "errors": errors, "complete": False, "main_url": None, "main_comment_id": None,
+        "coverage": coverage,
     }
     if mode in {"summary", "artifact"}:
         for finding in findings:
@@ -257,6 +261,7 @@ def publish_findings(
             errors.append("The main comment write could not be confirmed.")
             return record
     record["main_url"] = _url(main)
+    record["main_comment_id"] = main["id"]
     github_pr_patch_positions = diff_positions(github_pr_patch)
     pr_change_patch_positions = (
         diff_positions(pr_change_patch) if pr_change_patch is not None else github_pr_patch_positions
@@ -325,23 +330,44 @@ def publish_findings(
             source_head_sha=head_sha,
         )
         (inline if can_inline else issues).append(destination)
-    summary = format_review_summary(
-        overview=review_overview(review), head_sha=head_sha, findings=findings,
-        run_url=run_url, errors=errors, counts_available=not errors,
-        checks_url=f"https://github.com/{repository}/pull/{pr_number}/checks",
-    )
-    final_body = summary.replace(BOT_MARKER, f"{BOT_MARKER}\n{main_marker}", 1)
     try:
-        github.write("PATCH", f"{prefix}/issues/comments/{main['id']}", {"body": final_body})
+        update_main_comment(github=github, repository=repository, review=review, record=record)
     except PublicationError:
         errors.append("The final main comment could not be confirmed.")
     record["complete"] = not errors and all(finding.get("url") for finding in findings)
     return record
 
 
+def update_main_comment(
+    *, github: Any, repository: str, review: str, record: dict[str, Any],
+    checks_url: str | None = None,
+) -> None:
+    """Update this run's main comment with confirmed findings and an optional Check Run URL.
+
+    The workflow supplies the URL after GitHub creates the Check Run. Records without a confirmed
+    main comment, including summary and artifact modes, do not cause a write.
+    """
+    if record.get("main_comment_id") is None:
+        return
+    summary = format_review_summary(
+        overview=review_overview(review), head_sha=record["head_sha"], findings=record["findings"],
+        run_url=record["run_url"], errors=record["errors"], counts_available=not record["errors"],
+        checks_url=checks_url, coverage=record.get("coverage"),
+    )
+    source = {"head_sha": record["head_sha"], "run_url": record["run_url"]}
+    main_marker = f"<!-- ai-review-main {json.dumps(source, sort_keys=True)} -->"
+    body = summary.replace(BOT_MARKER, f"{BOT_MARKER}\n{main_marker}", 1)
+    github.write(
+        "PATCH", f"repos/{repository}/issues/comments/{record['main_comment_id']}", {"body": body}
+    )
+
+
 def publication_check(review: str, record: dict[str, Any]) -> str:
-    """Build the AI Review Summary Check Run report from all final findings."""
-    return complete_review(review, record["findings"]) + "\n"
+    """Build the AI Review Summary Check Run report from final findings and patch coverage."""
+    parts = [complete_review(review, record["findings"])]
+    if record.get("coverage") is not None:
+        parts.append(format_diff_coverage(record["coverage"]))
+    return "\n\n".join(parts) + "\n"
 
 
 def _identity(value: Any) -> tuple[str, str]:
@@ -422,6 +448,7 @@ def main() -> None:
     ):
         parser.add_argument(f"--{name}", type=Path, required=True)
     parser.add_argument("--pr-change-patch", type=Path)
+    parser.add_argument("--coverage", type=Path)
     for name in ("head-sha", "run-url", "repository", "mode"):
         parser.add_argument(f"--{name}", required=True)
     parser.add_argument("--pr-number", type=int, required=True)
@@ -442,6 +469,7 @@ def main() -> None:
         ),
         trusted_bot_logins=json.loads(args.trusted_bot_logins.read_text()),
         mode=args.mode, placement=args.placement,
+        coverage=json.loads(args.coverage.read_text()) if args.coverage else None,
     )
     args.output.write_text(json.dumps(record, indent=2) + "\n")
     for error in record["errors"]:

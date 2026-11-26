@@ -28,6 +28,7 @@ async: true
 cancellable: true
 timers: true
 
+# The workflow installs list_changed_paths in tools/python for local tool discovery.
 tools:
   # Reviewer sub-agents -- see agents/<name>/config.yaml. All are read-only
   # reviewers pointed at the same gateway as the orchestrator.
@@ -48,7 +49,7 @@ guardrails:
       function:
         path: omnigent.policies.builtins.orchestration.spawn_bounds
         arguments:
-          # Allow the full primary reviewer roster to start in one turn.
+          # Allow all configured Reviewer subagents to start in one turn.
           max_dispatches_per_turn: 6
           dispatch_tools: [sys_session_send]
     headless_subagent_purpose_guard:
