@@ -468,6 +468,11 @@ under `append_child_task_body`.
 The unit tests and the workflow's runtime probes check that instructions expand and load, tasks
 are assembled in order, and sources are readable. They do not measure review quality.
 
+## Testing Omnigent before merge
+
+Follow the [testing runbook](../TESTING.md) to choose a fixture, run local checks, dispatch the
+exact candidate revision, verify the selected output mode, and clean up the preview branch.
+
 ## Finding feedback
 
 Each published inline finding includes feedback instructions: react 👍 for helpful or 👎 for
@@ -503,9 +508,9 @@ To change a version:
    allows, so the diff shows only what the change requires. Add `--upgrade` to refresh every
    pin, in a pull request of its own.
 3. Commit the `.in` and `.txt` files together.
-4. Run a review from the branch before merging. Automatic reviews use the reviewer on `main`,
-   so a pull request does not exercise its own lock. Push the branch to this repository, then
-   run `gh workflow run ai-review.yml --ref <branch> -f pr=<number> -f output_mode=artifact`.
+4. Follow [Testing Omnigent before merge](../TESTING.md) to run the candidate lock
+   from a preview branch and verify actual model execution. Automatic reviews use the default
+   branch's reviewer, so a pull request does not exercise its own lock.
 5. List the packages the lock adds and drops in the pull request description.
 
 `../package.json` and `../package-lock.json` pin the Claude Code and Codex CLIs.
