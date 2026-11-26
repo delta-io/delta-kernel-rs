@@ -822,11 +822,16 @@ pub(crate) mod adaptive_metadata_fixtures {
         removes: &[&str],
     ) -> Version {
         let adds = (!adds.is_empty()).then(|| {
-            let batch = nullable_add_files(adds);
-            let batch = replace_column(&batch, "stats", one_record_stats(&batch));
-            Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>
+            Box::new(ArrowEngineData::new(add_files_metadata(adds))) as Box<dyn EngineData>
         });
         commit_file_changes(engine, table_root, adds, removes)
+    }
+
+    /// Add-file write metadata for a 1-byte file at each of `paths`, with the one-record stats row
+    /// tracking requires.
+    pub(crate) fn add_files_metadata(paths: &[&str]) -> RecordBatch {
+        let batch = nullable_add_files(paths);
+        replace_column(&batch, "stats", one_record_stats(&batch))
     }
 
     /// Like [`commit_files`], but adds the files `adds` describes, a batch of the transaction's

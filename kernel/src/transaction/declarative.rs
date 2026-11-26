@@ -25,6 +25,9 @@ impl<S> Transaction<S, Declarative> {
         self,
         _executor: &dyn ScopedPlanExecutor,
     ) -> KernelResult<CommitResult<S, Declarative>> {
+        // TODO(#4030): when implemented, replace each add's `modificationTime` with the commit's
+        // In-Commit Timestamp on adaptiveMetadata tables, as the imperative commit does;
+        // `add_files_schema` lets connectors leave it null there.
         Err(KernelError::unsupported(
             "Declarative transaction commits are not implemented",
         ))
