@@ -1,4 +1,5 @@
 use std::ffi::c_void;
+use std::sync::Arc;
 
 use delta_kernel::snapshot::SnapshotHintError;
 use delta_kernel::{Error, KernelError, KernelResult};
@@ -248,6 +249,26 @@ impl<T: ExternEngine + ?Sized> AllocateError for &T {
 
     unsafe fn allocate_kernel_error(&self, error: KernelError) -> *mut c_void {
         unsafe { self.error_allocator().allocate_kernel_error(error) }
+    }
+}
+
+impl<T: ExternEngine + ?Sized> AllocateError for Arc<T> {
+    unsafe fn allocate_error(&self, error: Error) -> *mut c_void {
+        unsafe { self.error_allocator().allocate_error(error) }
+    }
+
+    unsafe fn allocate_kernel_error(&self, error: KernelError) -> *mut c_void {
+        unsafe { self.error_allocator().allocate_kernel_error(error) }
+    }
+}
+
+impl AllocateError for &ErrorAllocators {
+    unsafe fn allocate_error(&self, error: Error) -> *mut c_void {
+        unsafe { ErrorAllocators::allocate_error(self, error) }
+    }
+
+    unsafe fn allocate_kernel_error(&self, error: KernelError) -> *mut c_void {
+        unsafe { ErrorAllocators::allocate_kernel_error(self, error) }
     }
 }
 

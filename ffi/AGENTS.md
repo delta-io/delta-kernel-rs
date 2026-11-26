@@ -576,14 +576,22 @@ whether the iterator can be retried or is poisoned. No callback may unwind acros
 #### Panic boundaries
 
 Every top-level `extern "C"` export returning `ExternResult` must wrap its entire operation in
-`crate::panic::catch_panic`. Only error allocator acquisition and lifetime retention belong before
-the catcher. Inside the inline closure, first convert consumed handles to Rust owners with
-`into_inner()`, then perform all parsing, validation, allocation, kernel/engine calls, mutation,
-serialization, and operation-local cleanup. Keep individual unsafe operations explicit.
+`crate::panic::catch_panic`, explicitly or through `#[ffi_export]`. The attribute preserves the C
+signature and catches the complete body; Rust infers its `Result` error type. Name the source with
+`error_allocator = engine` for a borrowed engine handle, `error_allocator = builder.engine` to
+retain an engine field from an opaque handle, or an explicit expression for a borrowed callback
+table. Acquisition runs once outside the catcher and retains the allocator through error
+conversion. Borrow caller-owned allocator tables; retain the engine when consuming its builder or
+iterator could release it.
+
+Only error allocator acquisition and lifetime retention belong before the catcher. Inside the
+body, first convert consumed handles to Rust owners with `into_inner()`, then perform all parsing,
+validation, allocation, kernel/engine calls, mutation, serialization, and operation-local cleanup.
+Keep individual unsafe operations explicit.
 
 The safe catcher returns a Rust `Result`; convert it through `IntoExternResult` in a separate
-`unsafe` block afterward. Reuse existing tracing and error allocation. Do not add boundary macros,
-panic hooks, or abort handling.
+`unsafe` block afterward; the attribute generates this conversion. Reuse existing tracing and
+error allocation. Do not add panic hooks or abort handling.
 
 Catching a panic does not roll back state. Discard failed work and reconcile uncertain commit
 outcomes before retrying.

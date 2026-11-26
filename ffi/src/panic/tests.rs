@@ -2,6 +2,7 @@ use std::panic::panic_any;
 use std::sync::Arc;
 
 use delta_kernel::{KernelError, KernelResult};
+use delta_kernel_ffi_macros::ffi_export;
 use rstest::rstest;
 
 use super::catch_panic;
@@ -57,6 +58,60 @@ fn preserves_results(#[case] input: KernelResult<usize>) {
     match expected {
         Ok(value) => assert_eq!(ok_or_panic(result), value),
         Err(message) => assert_error(result, FFIKernelError::MissingVersionError, &message),
+    }
+}
+
+const EXPORT_LINE: u32 = line!() + 3;
+
+#[ffi_export(error_allocator = &TEST_ERROR_ALLOCATORS)]
+unsafe extern "C" fn macro_result(outcome: u8) -> ExternResult<usize> {
+    match outcome {
+        0 => Ok(42),
+        1 => Err(KernelError::MissingVersion(7).into()),
+        2 => Err(delta_kernel::Error::from(
+            delta_kernel::DeltaError::for_test(
+                delta_kernel::DeltaErrorCondition::DeltaVersionsNotContiguous,
+                &["10,12", "10", "12", "12"],
+                None,
+            )
+            .unwrap(),
+        )),
+        _ => panic!("macro panic"),
+    }
+}
+
+#[rstest]
+#[case::success(0)]
+#[case::kernel_error(1)]
+#[case::delta_error(2)]
+#[case::panic(3)]
+fn macro_preserves_error_channels_and_location(#[case] outcome: u8) {
+    let result = unsafe { macro_result(outcome) };
+    if outcome == 0 {
+        assert_eq!(ok_or_panic(result), 42);
+        return;
+    }
+    let ExternResult::Err(error) = result else {
+        panic!("expected error");
+    };
+    let error = unsafe { recover_error(error) };
+    match outcome {
+        1 => assert_eq!(error.etype, FFIKernelError::MissingVersionError),
+        2 => assert_eq!(
+            error.condition.as_deref(),
+            Some("DELTA_VERSIONS_NOT_CONTIGUOUS")
+        ),
+        _ => {
+            assert_eq!(error.etype, FFIKernelError::InternalError);
+            assert!(
+                error
+                    .message
+                    .contains(&format!("{}:{EXPORT_LINE}:", file!())),
+                "{}",
+                error.message
+            );
+            assert!(error.message.contains("macro panic"));
+        }
     }
 }
 
