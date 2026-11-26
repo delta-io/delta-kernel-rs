@@ -161,6 +161,7 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
         Expr::opaque(OpaqueTestOp("foo".to_string()), vec![lit(42), lit(1.111)]),
         Expr::unknown("mystery"),
         Expr::unary(UnaryExpressionOp::UriEncodeFileLocation, col!("location")),
+        col!("m").map_len(),
         Expr::map_to_struct(col!("pv"), MapToStructOptions::default()),
         Expr::map_to_struct(
             col!("pv"),
@@ -227,6 +228,7 @@ pub unsafe extern "C" fn get_testing_kernel_predicate() -> Handle<SharedPredicat
         Pred::from_expr(expr!(or(5 == 10, 20 != 10))),
         Pred::from_expr(expr!(is_not_null(col("col")))),
         Pred::has_uri_scheme(col!("location")),
+        Pred::map_has_key(col!("m"), lit("k")),
         Pred::opaque(OpaqueTestOp("bar".to_string()), vec![lit(42), lit(1.111)]),
         Pred::unknown("intrigue"),
         Pred::from_expr(Expr::case_when(
