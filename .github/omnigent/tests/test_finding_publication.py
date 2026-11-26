@@ -487,6 +487,7 @@ class FindingPublicationTest(unittest.TestCase):
         self.assertNotIn("missing.rs", main)
         check = publication_check("Context.", record)
         self.assertIn("100000 of 120000", check)
+        self.assertIn("File patches: 1 fully included, 1 partial, 1 omitted.", check)
         self.assertIn("partial.rs", check)
         self.assertIn("missing.rs", check)
         self.assertIn(HEAD_SHA, check)

@@ -199,9 +199,9 @@ def format_diff_coverage(coverage: dict[str, Any]) -> str:
     parts = [
         "## Subagent patch excerpt",
         f"Reviewed range: `{coverage['base_sha']}...{coverage['head_sha']}`",
-        f"Includes {coverage['excerpt_bytes']} of {coverage['total_bytes']} UTF-8 patch bytes; "
-        f"{coverage['full_files']} fully included file patches, "
-        f"{coverage['partial_files']} partial and {coverage['omitted_files']} omitted.",
+        f"Includes {coverage['excerpt_bytes']} of {coverage['total_bytes']} UTF-8 patch bytes.",
+        f"File patches: {coverage['full_files']} fully included, "
+        f"{coverage['partial_files']} partial, {coverage['omitted_files']} omitted.",
     ]
     parts.extend(
         f"- {entry['status'].capitalize()}: <code>{escape(json.dumps(entry['path']))}</code>"
