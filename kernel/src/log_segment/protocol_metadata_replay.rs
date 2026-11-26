@@ -153,13 +153,36 @@ impl LogSegment {
     /// Replays the log segment for the latest Protocol and Metadata, each with its version, in one
     /// pass over the segment.
     fn replay_for_pm(&self, engine: &dyn Engine) -> KernelResult<PmCandidate> {
-        PmReader::for_engine(engine).replay(
+        let candidate = PmReader::for_engine(engine).replay(
             engine,
             self,
             #[cfg(feature = "adaptive-metadata-in-dev")]
             PmReplaySegment::WholeSegment,
             PmCandidate::default(),
-        )
+        )?;
+        Ok(self.seed_with_amt_base(candidate))
+    }
+
+    /// Seeds `candidate` with the protocol and metadata of the checkpoint action embedded in the
+    /// segment's AMT base, as a checkpoint file's actions would be. Say hint 5, manifest commit 8,
+    /// snapshot at 7: commits 6 and 7 are replayed, and the action at 5 supplies protocol and
+    /// metadata unless they change a newer value. The action itself is not captured: the snapshot
+    /// takes its latest checkpoint action from `lastManifestCommit` when it has one.
+    #[allow(unused_mut)]
+    fn seed_with_amt_base(&self, mut candidate: PmCandidate) -> PmCandidate {
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if let Some(action) = self.amt_base().and_then(|base| base.checkpoint_action) {
+            let version = action.version();
+            candidate.protocol = newer(
+                Some((version, action.protocol().clone())),
+                candidate.protocol,
+            );
+            candidate.metadata = newer(
+                Some((version, action.metadata().clone())),
+                candidate.metadata,
+            );
+        }
+        candidate
     }
 
     /// [`Self::replay_for_pm`] for a segment that no CRC or checkpoint file bounds, whose P&M may
@@ -172,27 +195,37 @@ impl LogSegment {
         {
             let reader = PmReader::for_engine(engine);
             if reader.reads_newest_commit_first(self) {
-                let newest_pm_candidate = reader.replay(
-                    engine,
-                    self,
-                    PmReplaySegment::NewestCommit,
-                    PmCandidate::default(),
-                )?;
-                if newest_pm_candidate.is_final_at(version_as_i64(self.end_version)?) {
-                    return Ok(newest_pm_candidate);
-                }
-                let Some(older) = PmReplaySegment::older_commits(self, &newest_pm_candidate)?
-                else {
-                    // Nothing older to read: the segment has no older commits, or the newest
-                    // commit's own checkpoint action has the P&M as of the commit before it. A P
-                    // or M that is still missing is reported upstream, by the snapshot build that
-                    // consumes this resolution.
-                    return Ok(newest_pm_candidate);
-                };
-                return reader.replay(engine, self, older, newest_pm_candidate);
+                let candidate = self.replay_newest_commit_first(engine, &reader)?;
+                return Ok(self.seed_with_amt_base(candidate));
             }
         }
         self.replay_for_pm(engine)
+    }
+
+    /// [`Self::replay_for_pm_with_unbounded_segment`] for a `reader` that reads the newest commit
+    /// first, then older commits only when the newest one leaves the P&M unresolved.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn replay_newest_commit_first(
+        &self,
+        engine: &dyn Engine,
+        reader: &PmReader,
+    ) -> KernelResult<PmCandidate> {
+        let newest_pm_candidate = reader.replay(
+            engine,
+            self,
+            PmReplaySegment::NewestCommit,
+            PmCandidate::default(),
+        )?;
+        if newest_pm_candidate.is_final_at(version_as_i64(self.end_version)?) {
+            return Ok(newest_pm_candidate);
+        }
+        let Some(older) = PmReplaySegment::older_commits(self, &newest_pm_candidate)? else {
+            // Nothing older to read: the segment has no older commits, or the newest commit's own
+            // checkpoint action has the P&M as of the commit before it. A P or M that is still
+            // missing is reported upstream, by the snapshot build that consumes this resolution.
+            return Ok(newest_pm_candidate);
+        };
+        reader.replay(engine, self, older, newest_pm_candidate)
     }
 
     /// Builds the declarative plan that selects the latest Protocol and Metadata actions. Under

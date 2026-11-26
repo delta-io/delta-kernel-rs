@@ -331,6 +331,12 @@ impl LastCheckpointHint {
             .map(|amt| amt.manifest_commit_version)
     }
 
+    /// The checkpoint action an AMT hint embeds, or `None` if it embeds none.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    pub(crate) fn amt_checkpoint_action(&self) -> Option<&CheckpointAction> {
+        self.amt_checkpoint.as_ref()?.checkpoint.as_ref()
+    }
+
     /// Whether this hint describes the checkpoint a log segment selected, given that segment's
     /// `checkpoint_parts`. Multiple checkpoints can share a version, so a matching version alone is
     /// not enough: the hint's own identity must equal the selected checkpoint's.
