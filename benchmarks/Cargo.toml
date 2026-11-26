@@ -21,7 +21,13 @@ tar = "0.4"
 ureq = { version = "3.1", default-features = false, features = ["native-tls", "gzip"] }
 
 [dependencies]
-delta_kernel = { path = "../kernel", features = ["default-engine-base", "internal-api"] }
+delta_kernel = { path = "../kernel", features = [
+    "default-engine-base",
+    "internal-api",
+    "test-utils",
+    "declarative-plans",
+    "vendored-protoc",
+] }
 delta_kernel_default_engine = { path = "../default-engine", features = ["rustls"] }
 delta_kernel_workloads = { path = "../workloads" }
 delta-kernel-unity-catalog = { path = "../delta-kernel-unity-catalog" }
@@ -37,6 +43,7 @@ url = { version = "2", features = ["serde"] }
 
 [dev-dependencies]
 criterion = "0.5"
+rstest = "0.23"
 tempfile = "3"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
 

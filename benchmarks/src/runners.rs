@@ -11,8 +11,10 @@
 use std::hint::black_box;
 use std::sync::Arc;
 
+use delta_kernel::engine::sync::SyncEngine;
 use delta_kernel::expressions::PredicateRef;
 use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::plans::Operation as PlanOperation;
 use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata, StatsOptions};
 use delta_kernel::{Engine, Snapshot};
 use delta_kernel_default_engine::DefaultEngine;
@@ -26,11 +28,15 @@ use unity_catalog_delta_client_api::Operation;
 use unity_catalog_delta_rest_client::{ClientConfig, UCDeltaTableClient};
 use url::Url;
 
-use crate::registry::{ParallelScan, ReadConfig};
+use crate::registry::{MetadataExecution, ParallelScan, ReadConfig};
 
 pub trait WorkloadRunner {
     fn execute(&self) -> Result<(), Box<dyn std::error::Error>>;
     fn name(&self) -> &str;
+    /// Whether the runner's engine reports the storage metrics used by the harness.
+    fn supports_io_profile(&self) -> bool {
+        true
+    }
 }
 
 /// Builds `{table}/{case}` from `table_info.name` and `case_name`.
@@ -228,7 +234,32 @@ impl ReadMetadataRunner {
         table_info: &TableInfo,
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let (engine, strategy) = resolve_snapshot_strategy(table_info, runtime.clone())?;
+        if config.metadata_execution != MetadataExecution::Imperative
+            && config.parallel_scan != ParallelScan::Disabled
+        {
+            return Err("synchronous metadata benchmarks require parallelScan disabled".into());
+        }
+        let (engine, strategy) = match config.metadata_execution {
+            MetadataExecution::Imperative => {
+                resolve_snapshot_strategy(table_info, runtime.clone())?
+            }
+            _ => {
+                // The eager test executor cannot drive cloud stores that require a Tokio reactor.
+                if table_info.catalog_info.is_some()
+                    || table_info.resolved_table_root().scheme() != "file"
+                {
+                    return Err(
+                        "synchronous metadata benchmarks require a local file:// table".into(),
+                    );
+                }
+                (
+                    Arc::new(SyncEngine::new()) as Arc<dyn Engine>,
+                    SnapshotStrategy::Standard {
+                        url: table_info.resolved_table_root(),
+                    },
+                )
+            }
+        };
         let snapshot =
             strategy.load_snapshot(engine.as_ref(), &runtime, read_spec.time_travel.as_ref())?;
 
@@ -273,6 +304,30 @@ impl ReadMetadataRunner {
         let metadata_iter = scan.scan_metadata(self.engine.as_ref())?;
         for result in metadata_iter {
             black_box(result?);
+        }
+        Ok(())
+    }
+
+    fn execute_declarative(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let scan = self
+            .snapshot
+            .clone()
+            .scan_builder()
+            .with_predicate(self.predicate.clone())
+            .with_stats(StatsOptions::all_struct())
+            .build()?;
+        let plan = scan.declarative_metadata_scan_plan(self.engine.as_ref())?;
+        if self.config.metadata_execution == MetadataExecution::DeclarativePlan {
+            black_box(plan);
+        } else if let Some(plan) = plan {
+            let batches = self
+                .engine
+                .require_plan_executor()?
+                .execute_op(PlanOperation::QueryPlan(plan))?
+                .into_data()?;
+            for batch in batches {
+                black_box(batch?);
+            }
         }
         Ok(())
     }
@@ -336,6 +391,12 @@ impl ReadMetadataRunner {
 
 impl WorkloadRunner for ReadMetadataRunner {
     fn execute(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if matches!(
+            self.config.metadata_execution,
+            MetadataExecution::DeclarativeSync | MetadataExecution::DeclarativePlan
+        ) {
+            return self.execute_declarative();
+        }
         match &self.config.parallel_scan {
             ParallelScan::Disabled => self.execute_serial(),
             ParallelScan::Enabled { .. } => self.execute_parallel(),
@@ -344,6 +405,10 @@ impl WorkloadRunner for ReadMetadataRunner {
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn supports_io_profile(&self) -> bool {
+        self.config.metadata_execution == MetadataExecution::Imperative
     }
 }
 
@@ -415,7 +480,10 @@ mod tests {
     use std::slice;
     use std::sync::LazyLock;
 
+    use delta_kernel::arrow::array::{Array, StringArray, StructArray};
+    use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
     use delta_kernel_workloads::models::{ReadSpec, Spec, TableInfo, TimeTravel, Workload};
+    use rstest::rstest;
 
     use super::*;
     use crate::registry::BenchRegistry;
@@ -476,6 +544,7 @@ mod tests {
         ReadConfig {
             name: "serial".to_string(),
             parallel_scan: ParallelScan::Disabled,
+            metadata_execution: MetadataExecution::Imperative,
         }
     }
 
@@ -483,6 +552,7 @@ mod tests {
         ReadConfig {
             name: "parallel2".to_string(),
             parallel_scan: ParallelScan::Enabled { num_threads: 2 },
+            metadata_execution: MetadataExecution::Imperative,
         }
     }
 
@@ -523,6 +593,130 @@ mod tests {
         .expect("setup should succeed");
         assert_eq!(runner.name(), "basic_partitioned/testCase/parallel2");
         assert!(runner.execute().is_ok());
+    }
+
+    #[rstest]
+    #[case(None, None)]
+    #[case(Some("letter = 'a'"), None)]
+    #[case(Some("number > 3"), None)]
+    #[case(Some("FALSE"), None)]
+    #[case(None, Some(0))]
+    fn synchronous_metadata_paths_match_imperative_files(
+        #[case] predicate: Option<&str>,
+        #[case] version: Option<i64>,
+    ) {
+        let spec = ReadSpec {
+            predicate: predicate.map(str::to_owned),
+            time_travel: version.map(|version| TimeTravel::Version { version }),
+            ..test_read_spec()
+        };
+        let runner = ReadMetadataRunner::setup(
+            "parity".into(),
+            &spec,
+            ReadConfig {
+                metadata_execution: MetadataExecution::DeclarativeSync,
+                ..serial_config()
+            },
+            &test_table_info(),
+            test_runtime(),
+        )
+        .unwrap();
+        let scan = runner
+            .snapshot
+            .clone()
+            .scan_builder()
+            .with_predicate(runner.predicate.clone())
+            .with_stats(StatsOptions::all_struct())
+            .build()
+            .unwrap();
+        let mut imperative_paths = vec![];
+        for metadata in scan.scan_metadata(runner.engine.as_ref()).unwrap() {
+            let batch = metadata
+                .unwrap()
+                .scan_files
+                .apply_selection_vector()
+                .unwrap()
+                .try_into_record_batch()
+                .unwrap();
+            let paths = batch["path"]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            imperative_paths.extend(paths.iter().map(|path| path.unwrap().to_owned()));
+        }
+        let mut declarative_paths = vec![];
+        if let Some(plan) = scan
+            .declarative_metadata_scan_plan(runner.engine.as_ref())
+            .unwrap()
+        {
+            let batches = runner
+                .engine
+                .require_plan_executor()
+                .unwrap()
+                .execute_op(PlanOperation::QueryPlan(plan))
+                .unwrap()
+                .into_data()
+                .unwrap();
+            for batch in batches {
+                let batch = batch.unwrap().try_into_record_batch().unwrap();
+                let adds = batch["add"].as_any().downcast_ref::<StructArray>().unwrap();
+                let paths = adds
+                    .column_by_name("path")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                declarative_paths.extend(paths.iter().map(|path| path.unwrap().to_owned()));
+            }
+        }
+        imperative_paths.sort();
+        declarative_paths.sort();
+        assert_eq!(declarative_paths, imperative_paths);
+        if predicate == Some("FALSE") {
+            assert!(declarative_paths.is_empty());
+        } else {
+            assert!(!declarative_paths.is_empty());
+        }
+        for execution in [
+            MetadataExecution::ImperativeSync,
+            MetadataExecution::DeclarativeSync,
+            MetadataExecution::DeclarativePlan,
+        ] {
+            let runner = ReadMetadataRunner::setup(
+                "repeat".into(),
+                &spec,
+                ReadConfig {
+                    metadata_execution: execution,
+                    ..serial_config()
+                },
+                &test_table_info(),
+                test_runtime(),
+            )
+            .unwrap();
+            runner.execute().unwrap();
+            runner.execute().unwrap();
+        }
+    }
+
+    #[test]
+    fn synchronous_metadata_rejects_cloud_before_resolving_credentials() {
+        let mut table_info = test_table_info();
+        table_info.table_path = Some(Url::parse("s3://bucket/table").unwrap());
+        let result = ReadMetadataRunner::setup(
+            "remote".into(),
+            &test_read_spec(),
+            ReadConfig {
+                metadata_execution: MetadataExecution::DeclarativeSync,
+                ..serial_config()
+            },
+            &table_info,
+            test_runtime(),
+        );
+        let error = result
+            .err()
+            .expect("cloud tables must be rejected")
+            .to_string();
+        assert!(error.contains("require a local file:// table"), "{error}");
     }
 
     fn test_snapshot_spec() -> SnapshotConstructionSpec {
@@ -587,7 +781,13 @@ mod tests {
         let read = registry.read_configs(&workload).unwrap();
         assert_eq!(
             read.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
-            vec!["serial", "parallel2"]
+            vec![
+                "serial",
+                "parallel2",
+                "imperativeSync",
+                "declarativeSync",
+                "declarativePlan"
+            ]
         );
     }
 

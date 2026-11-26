@@ -96,6 +96,13 @@ fn run_benchmark(c: &mut Criterion, runner: &dyn WorkloadRunner, reporter: &Coun
         b.iter(|| runner.execute().expect("Benchmark execution failed"))
     });
     if bench_ran.load(Ordering::Relaxed) {
+        if !runner.supports_io_profile() {
+            println!(
+                "\n  [io] {}: unavailable for synchronous test engine",
+                runner.name()
+            );
+            return;
+        }
         reporter.reset();
         runner.execute().expect("IO profiling iteration failed");
         reporter.print_summary(runner.name());
