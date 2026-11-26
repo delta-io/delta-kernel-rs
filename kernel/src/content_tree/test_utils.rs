@@ -53,7 +53,7 @@ pub(crate) fn added_data_entry(
             replaced_positions: None,
         },
         deletion_vector: None,
-        spec_id: Some(0),
+        spec_id: None,
         partition: None,
         sort_order_id: None,
         record_count: num_records,
