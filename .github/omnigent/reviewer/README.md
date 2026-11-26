@@ -51,6 +51,15 @@ Automatic reviews and `/review` comment runs use the tip of the repository's def
 whatever branch the pull request targets, and never the pull request's head. A manual dispatch
 uses the ref the dispatcher selects.
 
+## PR description input
+
+The "Collect PR data and build reviewer tasks" step in
+[`ai-review.yml`](../../workflows/ai-review.yml) includes the first 4,096 characters of the PR
+description and appends a truncation notice if more text was present. This is the reviewer's input
+budget, not a PR authoring requirement. Longer descriptions are allowed; text beyond the budget
+is omitted from the review task. When a description is marked as truncated, the reviewer
+instructions limit the review to visible claims and prohibit findings about missing information.
+
 ## Review scope for stacked PRs
 
 PR authors using git stack should keep the generated stack list in their PR description up to

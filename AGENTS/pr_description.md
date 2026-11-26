@@ -14,7 +14,8 @@ The file has two parts. Part 1, "About descriptions", is about the file and abou
 general: who reads them, what belongs in one, format rules, and the recipe agents follow. Part 2,
 "The template, section by section", walks `.github/PULL_REQUEST_TEMPLATE.md` top to bottom. Every
 heading in Part 2 quotes a template heading verbatim in backticks, for example "Section `## Why`",
-and gives the rule for that section, then good, medium, and bad examples with one line on why.
+and gives the rule for that section, then annotated good and bad examples, with medium examples
+where useful.
 
 All examples are text from merged PRs in this repository or paraphrases of patterns in them. They
 are inlined on purpose: read them here, do not go looking for the source PRs.
@@ -28,9 +29,9 @@ start, what was verified, what is out of scope.
 
 - The human reviewers. Two approvals are required, and reviewers cross-check the description
   against the code.
-- The CI AI reviewer. It receives the title and the body, treats every statement as a claim to
-  verify against the diff, and flags a description that misstates the change. It reads only the
-  first 4,096 characters of the body, so put the essentials first.
+- The [CI AI reviewer](../.github/omnigent/reviewer/README.md#pr-description-input).
+  It checks claims in the title and description against the diff and flags a description that
+  misstates the change.
 - `git log`. Merges are squash-only and the PR body becomes the commit message. Anything in the
   body at merge time is permanent, including stack banners and leftover template comments.
 
@@ -50,8 +51,10 @@ relationships a reviewer needs to understand; avoid a file inventory or a line-b
 
 ### Length and format
 
-- Aim for one screen. The CI reviewer reads the first 4,096 characters of the body.
-- ASCII only; the body check rejects other characters.
+- Put the motivation and key behavior first. Keep the description concise, with enough context for
+  reviewers to assess the change.
+- ASCII only; the [body validator](../.github/workflows/pr-body-validator.yml) rejects other
+  characters.
 - One line per paragraph and per list item. GitHub renders a single newline as a line break.
 - Delete template comments you did not use. They are sent to the CI reviewer and land in the
   commit message.
@@ -85,12 +88,14 @@ without the author's review.
 
 Pre-submit checklist:
 
+Check each section against [the section guidance](#part-2-the-template-section-by-section).
+
 - Required headings present: `## Why`, `## What changes`, and `## How do you know it works?`.
 - Optional sections deleted when empty.
-- Public API section present when the title has `!` or the label is `breaking-change`.
+- Public API section present for public API changes, including behavior changes.
+- Breaking changes called out clearly, with impact explained and `!` in the title.
 - Every test name in the testing section exists in the diff or the repository.
-- No banned phrases in testing: "all tests pass", "existing tests" without test names, "UTs".
-- ASCII only, one line per paragraph, under about 4,000 characters.
+- Follow [Length and format](#length-and-format).
 - Why states what happens today and what it costs; What changes states the behavior after.
 - Testing distinguishes coverage added from validation run, and states gaps.
 
@@ -117,7 +122,7 @@ Not: a restatement of the title, a pointer to another PR ("split out of #N"), or
 the mechanism. In the last 200 merged PRs, 62 openings said only what the PR does, 39 implied the
 cost without stating it, and 15 pointed at another PR instead of giving a reason.
 
-Good:
+**Good:**
 
 ```text
 `Snapshot::publish()` currently copies ratified staged commits to published Delta commit files,
@@ -148,7 +153,7 @@ complexity.
 ```
 The stale behavior and the complexity it leaves at every call site. (refactor, chore)
 
-Medium:
+**Medium:**
 
 ```text
 Snapshot hints now accept compacted log paths.
@@ -161,7 +166,7 @@ Add debug logging for snapshot construction so failures are easier to diagnose.
 ```
 A goal, not a gap. What is undiagnosable today, and what that costs, is missing.
 
-Bad:
+**Bad:**
 
 ```text
 Catch panics in the exported FFI functions with an inline closure.
@@ -188,7 +193,7 @@ independent problems, write one short block per problem: the problem, its cause,
 Not: a file list, a walk through the diff, or a line-by-line explanation; the diff and rustdoc do
 that.
 
-Good:
+**Good:**
 
 ```text
 `LogSegment::try_new` now drops log compactions that start at or before the checkpoint, matching
@@ -212,7 +217,7 @@ they need to publish ratified, unpublished commits before retrying ratification.
 ```
 The new behavior and what the caller can now do with it.
 
-Medium:
+**Medium:**
 
 ```text
 Expose a report method with statistics and partition options, timezone, collations, filter
@@ -221,7 +226,7 @@ presence, replay base and version, and selected commit bounds. Follow-up: #NNNN.
 A field inventory and a pointer. What a caller does with the report, and what it could not do
 before, is missing.
 
-Bad:
+**Bad:**
 
 ```text
 1. snapshot/builder.rs - add freshness flag
@@ -254,7 +259,7 @@ cover, action, or null mask changes. A short call tree or sequence diagram shows
 interact. Prose can explain either. Mark what changed and keep enough surrounding context to make
 the path understandable; avoid pasted function bodies and file inventories.
 
-Good, data flow (a fix to JSON parsing of NULL inputs):
+**Good, data flow (a fix to JSON parsing of NULL inputs):**
 
 ```text
 Input: a column of JSON strings (SQL NULL and '{}') and the target schema STRUCT<a: BIGINT>
@@ -263,19 +268,15 @@ evaluate_expression
     parse_json_to_struct
       parse_json_impl                    * a NULL input row now yields a NULL struct
 Output: one StructArray row per input row
-  Expression                            Before       After
-  ParseJson(NULL)                       {a: NULL}    NULL
-  ParseJson('{}')                       {a: NULL}    {a: NULL}
-  COALESCE(ParseJson(NULL), {a: 42})    {a: NULL}    {a: 42}
 ```
-The frames that changed are marked, and the table shows the data before and after at the output.
+The example identifies the input, the changed conversion, and the output.
 
 The same in three sentences: The `ParseJson` arm of `evaluate_expression` hands the JSON string
 column to `parse_json_to_struct`, which calls `parse_json_impl`. Before this PR a SQL NULL input
 produced the struct `{a: NULL}`; after it the same input produces a NULL struct, so
 `COALESCE(ParseJson(NULL), {a: 42})` returns `{a: 42}`. Stats parsing consumes this output.
 
-Good, placement (a fix in snapshot reuse):
+**Good, placement (a fix in snapshot reuse):**
 
 ```text
 Phase: snapshot load, reusing an existing snapshot
@@ -289,7 +290,7 @@ Consumer: the connector reads Snapshot::is_built_as_latest() on the returned sna
 ```
 Entry point, the one changed frame, and who reads the result.
 
-Bad:
+**Bad:**
 
 ```text
 0: delta_kernel::snapshot::incremental::Snapshot::try_new_from
@@ -300,25 +301,20 @@ Bad:
 A pasted stack trace. Nothing is marked, so the reviewer cannot tell what changed or what data
 reaches each frame.
 
-```text
-1. snapshot/builder.rs - add freshness flag
-2. snapshot/incremental.rs - recompute built_as_latest
-```
-A file list dressed as a flow. The numbers are a reading order, not a call order.
-
 ### Section `### This PR affects the following public APIs`
 
 Optional. Keep this heading text exactly; tooling looks for it. Delete the section if the PR
 changes no public API. For each change give three things: the exact type, method, or C symbol that
 changes; what callers do instead (replace a match, pass the new argument, regenerate bindings); and
 why the break is worth it. If old code still compiles but silently stops matching, say so. For an
-additive API, say in one clause why it is not breaking. A behavior change to an existing API with no
-signature change belongs here too. A breaking change needs `!` in the title; CI adds the
-`breaking-change` label from `cargo semver-checks`.
+additive API, say in one clause why it is not breaking. A behavior change to an existing public API
+belongs here even without a signature change. Other breaking behavior may be disclosed elsewhere
+in the description. A breaking change needs `!` in the title; CI adds the `breaking-change` label
+from `cargo semver-checks`.
 
 In the last 200 merged PRs, 25 of 48 breaking PRs gave the caller no migration step.
 
-Good:
+**Good:**
 
 ```text
 `CommitRangeBuilder::build` now takes `self` instead of `&self`, consuming the builder so its
@@ -349,7 +345,7 @@ this is not breaking.
 ```
 An additive change that says in one clause why it is safe.
 
-Medium:
+**Medium:**
 
 ```text
 `ScanMetadata` gains a private field, so code outside Kernel can no longer build it with a
@@ -363,7 +359,7 @@ previously got by default.
 ```
 The migration is given; the reason the default was removed is not.
 
-Bad:
+**Bad:**
 
 ```text
 New plan IR enum (`FirstNonNull` aggregate).
@@ -371,9 +367,9 @@ New plan IR enum (`FirstNonNull` aggregate).
 Names-only for a `feat!`. Nothing about how exhaustive matches or executors must handle it.
 
 ```text
-(Section absent. The body has a "Breaking:" list under What changes.)
+(A public API changed, but only a "Breaking:" list appears under What changes.)
 ```
-The break is described outside the section reviewers and tooling look for.
+The public API change is described outside the section reviewers and tooling look for.
 
 ```text
 <!-- Uncomment this section if there are any changes affecting public APIs ... -->
@@ -399,7 +395,7 @@ Forms that work:
 Keep the explanation focused on reasons and constraints. Implementation steps without their
 rationale and Impact/Benefit bullets that restate each other do not explain a design decision.
 
-Good:
+**Good:**
 
 ```text
 It is a predicate rather than a string-valued expression because no caller needs the scheme
@@ -419,7 +415,7 @@ jumping ahead of the rest of the ecosystem just to use them.
 ```
 A rejected option with its reason: why the version stops where it does.
 
-Medium:
+**Medium:**
 
 ```text
 Keeps the restriction added in the earlier PR rather than restoring the older behavior.
@@ -431,7 +427,7 @@ Removing properties is left to a separate PR (#NNNN).
 ```
 A scope cut with a pointer and no reason for the cut.
 
-Bad:
+**Bad:**
 
 ```text
 How a review commit range is selected:
@@ -440,25 +436,20 @@ How a review commit range is selected:
 ```
 Pseudo-code of the function under a design label. The function belongs in the source.
 
-```text
-The main implementation idea is that: (1) ..., (2) ..., (3) ...
-```
-Implementation steps presented as a decision. The diff shows them.
-
 ### Section `## How do you know it works?`
 
 Say which behaviors and edge cases you verified and what the results establish. Distinguish
-coverage added from validation actually run, and mention material failures or gaps. Include test
-names (backticked, so a reviewer can grep them) or reproduction steps when they help explain unusual
-validation or reproduce a relevant result. For each sentence ask: would this failure mean the change
-is wrong? If not, cut it.
+coverage added from validation actually run, and mention material failures or gaps. When naming a
+specific test or assertion, link to its source so reviewers can inspect the coverage. Include
+commands or reproduction steps when they help reproduce unusual validation or a relevant result.
+For each sentence ask: would this failure mean the change is wrong? If not, cut it.
 
-Not: routine check inventories, passing-test totals, commands, lint, CI status, or "all tests
-pass". "Existing tests" is acceptable only for a behavior-preserving refactor, and then name the
-tests that cover the changed path. In the last 200 merged PRs, 74 testing sections were a single
-line naming no behavior, and 26 more listed commands or counts.
+Not: routine check inventories, passing-test totals, routine command lists, lint, CI status, or
+"all tests pass". "Existing tests" is acceptable only for a behavior-preserving refactor, and then
+name the tests that cover the changed path. In the last 200 merged PRs, 74 testing sections were a
+single line naming no behavior, and 26 more listed commands or counts.
 
-Good:
+**Good:**
 
 ```text
 - `leaf_filter_reads_only_leaves_the_stats_cannot_rule_out`: a table of comparisons, junctions,
@@ -487,7 +478,7 @@ Not verified here: the speedup. CI on this PR has no cache to restore.
 ```
 An honest gap: the unchecked claim, and why it cannot be checked in this PR.
 
-Medium:
+**Medium:**
 
 ```text
 All 94 relevant tests pass. Cases covered: concurrent callers waiting on one load, cache reuse
@@ -501,7 +492,7 @@ The cases are specific, but the section leads with a count and never says what w
 ```
 Behaviors are there, but each bullet leads with a file name instead of the behavior.
 
-Bad:
+**Bad:**
 
 ```text
 All new and existing tests pass.
