@@ -166,6 +166,15 @@ fn encode_and_join(path: &str, table_root: &Url) -> KernelResult<Url> {
     })
 }
 
+/// Rejects an AMT location that is neither absolute nor table-relative (see
+/// [`validate_table_relative`]) or that has a `.` or `..` segment (see [`reject_dot_segments`]).
+pub(crate) fn validate_amt_location(location: &str) -> KernelResult<()> {
+    if scheme_len(location).is_none() {
+        validate_table_relative(location)?;
+    }
+    reject_dot_segments(location)
+}
+
 /// Rejects a `path` containing a `.` or `..` segment: the Iceberg V4 path spec does not support
 /// relative navigation, and URL parsing would otherwise silently collapse such segments.
 ///
