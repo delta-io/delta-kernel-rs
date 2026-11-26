@@ -161,8 +161,9 @@ impl SnapshotBuilder<FromTableRoot> {
 
     /// Recover from a missing conventional checkpoint by replaying from an older complete
     /// checkpoint or from commit zero. All intervening commits through the target must exist.
-    /// To recover without a requested version or catalog bound, the first listing must find
-    /// a commit at or after the missing checkpoint. Otherwise the build returns the hint error.
+    /// Without a requested version or catalog bound, recovery needs a storage or catalog commit
+    /// at or after the hinted version. From the first version in the catalog tail, only its
+    /// commits count.
     ///
     /// Enable this only when the storage location is dedicated to a single table history.
     /// Kernel cannot distinguish commits left by a former table at a reused location.

@@ -1714,7 +1714,7 @@ async fn missing_checkpoint_recovery_stops_at_the_nearest_complete_checkpoint(
 }
 
 #[tokio::test]
-async fn missing_checkpoint_recovery_without_a_visible_tip_fails_after_one_listing() {
+async fn latest_recovery_fails_after_one_listing_without_a_commit_at_or_after_the_hint() {
     let log_files = (0..=8)
         .map(|v| (v, Commit, CommitSource::Filesystem))
         .collect();

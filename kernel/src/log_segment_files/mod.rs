@@ -728,8 +728,8 @@ impl LogSegmentFiles {
             && acc.output.checkpoint_parts.is_empty()
             && find_complete_checkpoint_version(&acc.pending_checkpoint_parts).is_none()
         {
-            // For latest, freeze the first listing's tip before looking further back. Catalog
-            // commits take precedence from the first version in the tail onward.
+            // Without a version bound, pin the highest commit at or after the hint from this
+            // listing. From the first version in the catalog tail, only catalog commits count.
             let target = end_version.or_else(|| {
                 log_tail
                     .last()
