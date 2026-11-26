@@ -8,6 +8,7 @@ use crate::arrow::array::StringArray;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::sync::SyncEngine;
 use crate::engine::sync::json::SyncJsonHandler;
+use crate::expressions::UnaryExpressionOp;
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::CheckpointReadInfo;
 use crate::scan::log_replay::{ScanPartitionValuesOptions, ScanStatsOptions, scan_action_iter};
@@ -171,6 +172,7 @@ pub(crate) fn run_with_validate_callback<T: Clone>(
         is_catalog_managed: false,
         skip_row_transforms: false,
         dv_normalization_root: None,
+        stats_json_op: UnaryExpressionOp::TO_JSON,
     });
     let checkpoint_info = CheckpointReadInfo::without_stats_parsed();
     let (iter, _metrics) = scan_action_iter(

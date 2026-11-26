@@ -48,7 +48,7 @@ use crate::expressions::lit;
 use crate::incremental_scan::IncrementalScanBuilder;
 use crate::log_replay::ActionsBatch;
 #[cfg(feature = "adaptive-metadata-in-dev")]
-use crate::log_segment::LastManifestCommitResolution;
+use crate::log_segment::{CheckpointReadOptions, LastManifestCommitResolution};
 use crate::log_segment::{
     DomainMetadataMap, LogSegment, PmResolution, scan_domain_metadata_actions,
 };
@@ -488,7 +488,7 @@ impl Snapshot {
                 self.table_root(),
                 schema.clone(),
                 schema,
-                None,
+                CheckpointReadOptions::default(),
                 None,
             )?;
             return Ok(result.actions);
