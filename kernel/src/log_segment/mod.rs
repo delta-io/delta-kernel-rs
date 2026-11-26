@@ -27,6 +27,8 @@ use crate::checkpoint::collation_stats::{
 use crate::checkpoint::metrics::{CheckpointMetrics, CheckpointPhase};
 use crate::committer::CatalogCommit;
 #[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::content_tree::file_metadata::FileMetadataFieldIds;
+#[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::content_tree::{AmtStatsRequest, read_checkpoint_action};
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
@@ -1055,6 +1057,9 @@ impl LogSegment {
     /// schema the caller replays with. `amt_stats_request` reads it from the content tree's
     /// `content_stats` as `add.stats_parsed` (see [`AmtStatsRequest::for_checkpoint`]); without it,
     /// the tree's adds carry no stats.
+    ///
+    /// `file_metadata_ids` is the mapping to read file metadata fields with, or `None` to read the
+    /// mapping from the checkpoint action.
     #[cfg(feature = "adaptive-metadata-in-dev")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn read_actions_with_checkpoint_action(
@@ -1066,6 +1071,7 @@ impl LogSegment {
         checkpoint_read_schema: SchemaRef,
         stats_schema: Option<&StructType>,
         amt_stats_request: Option<AmtStatsRequest<'_>>,
+        file_metadata_ids: Option<FileMetadataFieldIds>,
     ) -> KernelResult<ActionsWithCheckpointInfo<Box<dyn KernelResultIterator<ActionsBatch>>>> {
         let version = Version::try_from(checkpoint.version())
             .ok()
@@ -1125,6 +1131,7 @@ impl LogSegment {
             &LogRoot::new(table_root.clone())?,
             checkpoint_read_schema.clone(),
             amt_stats_request.as_ref(),
+            file_metadata_ids,
         )
         .map_err(KernelError::generic_err)?;
         Ok(ActionsWithCheckpointInfo {

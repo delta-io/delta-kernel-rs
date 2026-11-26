@@ -8,6 +8,8 @@ use std::collections::HashMap;
 
 use tracing::warn;
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use super::FileMetadataFieldIdsState;
 use super::file_stats::FileStatsDelta;
 use super::{
     Crc, DomainMetadataState, FileSizeHistogram, FileStats, FileStatsState, SetTransactionState,
@@ -154,6 +156,11 @@ impl Crc {
         #[cfg(feature = "adaptive-metadata-in-dev")]
         {
             self.last_manifest_commit_opt = delta.last_manifest_commit;
+        }
+        // The delta carries no field ID mapping, so the mapping at `new_version` is unknown.
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        {
+            self.file_metadata_field_ids = FileMetadataFieldIdsState::Unknown;
         }
 
         self.file_stats_state = transition_file_stats(
@@ -527,6 +534,20 @@ mod tests {
         }
         .apply(delta, 1);
         assert_eq!(crc.in_commit_timestamp_opt, None);
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_apply_makes_file_metadata_field_ids_unknown() {
+        let crc = Crc {
+            file_metadata_field_ids: FileMetadataFieldIdsState::Unmapped,
+            ..base_crc()
+        }
+        .apply(add_files_delta(0, 0), 1);
+        assert_eq!(
+            crc.file_metadata_field_ids(),
+            FileMetadataFieldIdsState::Unknown
+        );
     }
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
