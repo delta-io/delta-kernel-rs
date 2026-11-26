@@ -10,6 +10,8 @@ use super::schema::primitive_type::Kind as PrimitiveTypeKind;
 use super::{
     expressions as proto_expr, operation as proto_op, plan as proto_plan, schema as proto_schema,
 };
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::expressions::MUMBLING_BITMAP_CONTAINS_NAME;
 use crate::expressions::{
     ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
     ColumnName, DecimalData, Expression, ExpressionFieldPatch, ExpressionStructPatch,
@@ -401,7 +403,7 @@ impl From<&Expression> for proto_expr::Expression {
                 }))
             }
             // No proto cast node yet; serialize as an opaque unknown.
-            Expression::Cast(cast) => Kind::Unknown(format!("cast_to_{}", cast.target)),
+            Expression::Cast(cast) => Kind::Unknown(cast.unknown_name()),
         };
         proto_expr::Expression { kind: Some(kind) }
     }
@@ -417,6 +419,11 @@ impl From<&Predicate> for proto_expr::Predicate {
             Predicate::Binary(binary) => Kind::Binary(Box::new(binary.into())),
             Predicate::Junction(junction) => Kind::Junction(junction.into()),
             Predicate::Opaque(opaque) => Kind::Opaque(opaque.into()),
+            // No proto node for Mumbling bitmap lookups; serialize as an opaque unknown.
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            Predicate::MumblingBitmapContains(_) => {
+                Kind::Unknown(MUMBLING_BITMAP_CONTAINS_NAME.to_string())
+            }
             Predicate::Unknown(name) => Kind::Unknown(name.clone()),
         };
         proto_expr::Predicate { kind: Some(kind) }
@@ -1119,6 +1126,8 @@ mod tests {
     #[cfg(feature = "geo-type-in-dev")]
     use super::EdgeAlgo;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::content_tree::mumbling::tests::encode_positions;
     use crate::expressions::{
         ArrayData, BinaryExpressionOp, BinaryPredicateOp, ColumnName, DecimalData, Expression,
         ExpressionStructPatchBuilder, JunctionPredicateOp, MapData, MapToStructOptions,
@@ -1136,6 +1145,9 @@ mod tests {
         Values, WriteJson, WriteParquet,
     };
     use crate::plans::ir::plan::{Plan, PlanNode};
+    use crate::plans::proto::expressions::expression::Kind as ExprKind;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::plans::proto::expressions::predicate::Kind as PredKind;
     use crate::plans::proto::{
         expressions as proto_expr, operation as proto_op, plan as proto_plan,
         schema as proto_schema,
@@ -1887,6 +1899,22 @@ mod tests {
     }
 
     #[rstest]
+    #[case::safe(Expression::cast(col!("n"), DataType::INTEGER), "cast_to_integer")]
+    #[case::strict(
+        Expression::cast_strict(col!("n"), DataType::INTEGER),
+        "strict_cast_to_integer"
+    )]
+    fn from_cast_expression_keeps_mode_in_unknown_name(
+        #[case] expr: Expression,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(
+            proto_expr::Expression::from(&expr).kind,
+            Some(ExprKind::Unknown(expected.to_string()))
+        );
+    }
+
+    #[rstest]
     #[case(Predicate::TRUE, "boolean_expression")]
     #[case(Predicate::from_expr(expr!(not(true))), "not")]
     #[case(Predicate::from_expr(expr!(is_null(1))), "unary")]
@@ -1906,6 +1934,17 @@ mod tests {
             Kind::Unknown(_) => "unknown",
         };
         assert_eq!(kind, expected);
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn from_mumbling_bitmap_contains_lowers_to_unknown() {
+        let pred =
+            Predicate::try_mumbling_bitmap_contains(encode_positions(&[1]), col!("value")).unwrap();
+        assert_eq!(
+            proto_expr::Predicate::from(&pred).kind,
+            Some(PredKind::Unknown("mumbling_bitmap_contains".to_string()))
+        );
     }
 
     #[test]
