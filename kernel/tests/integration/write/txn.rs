@@ -141,7 +141,8 @@ async fn test_write_txn_actions(
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},
                     "engineInfo": "default engine",
-                    "txnId": ZERO_UUID
+                    "txnId": ZERO_UUID,
+                    "dataChange": true
                 }
             }),
             json!({

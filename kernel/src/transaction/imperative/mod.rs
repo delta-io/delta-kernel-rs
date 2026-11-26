@@ -170,7 +170,8 @@ impl<STATE> Transaction<STATE, Imperative> {
     /// - `isBlindAppend`
     /// - `engineInfo`
     /// - `txnId`
-    /// - `dataChange` and `lastManifestCommit` (adaptiveMetadata)
+    /// - `dataChange`
+    /// - `lastManifestCommit` (adaptiveMetadata)
     ///
     /// Kernel merges the following field if it is set:
     ///

@@ -555,7 +555,8 @@ mod tests {
                         "operation": "WRITE",
                         "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                         "operationParameters": {},
-                        "txnId": ZERO_UUID
+                        "txnId": ZERO_UUID,
+                        "dataChange": false
                     }
                 }),
                 json!({

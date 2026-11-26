@@ -376,26 +376,6 @@ async fn test_commit_info_records_data_change_and_last_manifest_commit(
     Ok(())
 }
 
-#[tokio::test]
-async fn test_commit_info_omits_adaptive_metadata_fields_without_the_feature()
--> std::result::Result<(), Box<dyn std::error::Error>> {
-    let temp_dir = tempfile::tempdir()?;
-    let dir_url = Url::from_directory_path(temp_dir.path()).expect("valid directory url");
-    let (store, engine, table_url) =
-        engine_store_setup("commit_info_no_adaptive_metadata", Some(&dir_url));
-    let schema = schema_ref! { nullable "id": INTEGER };
-    create_table(store, table_url.clone(), schema, &[], true, vec![], vec![]).await?;
-
-    test_utils::load_and_begin_transaction(table_url.as_str(), &engine)?
-        .commit(&engine)?
-        .unwrap_committed();
-
-    let commit_info = commit_info_at(&table_url, 1)?;
-    assert!(commit_info.get("dataChange").is_none());
-    assert!(commit_info.get("lastManifestCommit").is_none());
-    Ok(())
-}
-
 /// Configures one transaction's builder.
 type Configure = fn(UpdateTableTransactionBuilder) -> UpdateTableTransactionBuilder;
 
