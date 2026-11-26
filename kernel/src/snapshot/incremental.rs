@@ -394,8 +394,14 @@ impl Snapshot {
 
         let listing_base_version = match checkpoint_handling {
             CheckpointHandling::Adopt => {
-                // Start listing just after the previous segment's checkpoint, if any.
-                existing_log_segment.checkpoint_version.unwrap_or(0)
+                // Start listing just after the previous segment's checkpoint, if any. An AMT hint's
+                // version counts as one: listing below it would adopt a checkpoint from before the
+                // table enabled AMT.
+                let checkpoint_version = existing_log_segment.checkpoint_version;
+                #[cfg(feature = "adaptive-metadata-in-dev")]
+                let checkpoint_version = checkpoint_version
+                    .or_else(|| existing_log_segment.amt_base().map(|base| base.version));
+                checkpoint_version.unwrap_or(0)
             }
             CheckpointHandling::Ignore => {
                 // TODO(#3269): If Ignore retains checkpoints, list from the existing checkpoint as
