@@ -2,6 +2,8 @@ use std::collections::HashSet;
 
 use super::{ExecutionMode, Transaction};
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::content_tree::file_metadata::ADAPTIVE_METADATA_DOMAIN_NAME;
 use crate::error::KernelError;
 use crate::row_tracking::{
     ROW_TRACKING_DOMAIN_NAME, ROW_TRACKING_INITIAL_HIGH_WATER_MARK, RowTrackingDomainMetadata,
@@ -47,7 +49,7 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
                 + self.user_domain_removals.len(),
         );
 
-        // Validate system-domain additions produced by create-table transforms.
+        // Validate system-generated domain additions.
         for dm in &self.system_domain_metadata_additions {
             let domain = dm.domain();
 
@@ -132,6 +134,8 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         // Map domain to its required feature
         let required_feature = match domain {
             ROW_TRACKING_DOMAIN_NAME => Some(TableFeature::RowTracking),
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            ADAPTIVE_METADATA_DOMAIN_NAME => Some(TableFeature::AdaptiveMetadataPreview),
             // Will be changed to a constant in a follow up clustering create table feature PR
             "delta.clustering" => Some(TableFeature::ClusteredTable),
             _ => {

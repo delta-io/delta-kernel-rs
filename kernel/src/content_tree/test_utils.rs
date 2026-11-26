@@ -5,17 +5,21 @@ use std::sync::Arc;
 
 use url::Url;
 
-use crate::actions::MAX_VALUES;
+use crate::actions::{DomainMetadata, MAX_VALUES};
 use crate::arrow::array::{AsArray as _, RecordBatch};
+use crate::content_tree::file_metadata::ADAPTIVE_METADATA_DOMAIN_NAME;
 /// Encodes manifest deletion vector positions as a Mumbling bitmap.
 pub(crate) use crate::content_tree::mumbling::tests::encode_positions as mumbling_bitmap;
-use crate::content_tree::stats::{field_with_id, projected_stats_schema, stats_schema};
+use crate::content_tree::stats::{
+    field_with_id, file_metadata_stats_field, projected_stats_schema, stats_schema,
+};
 use crate::content_tree::{
     AMT_FORMAT_VERSION, CONTENT_STATS_FIELD_NAME, ContentTreeNodeEntry, DataContentType,
     DataFileFormat, DeletionVectorInfo, ManifestInfo, TAGS, TrackingInfo, TrackingStatus,
 };
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use crate::expressions::{ArrayData, Scalar, StructData};
+use crate::scan::log_replay::CLUSTERING_PROVIDER_NAME;
 use crate::schema::{ArrayType, DataType, StructField, StructType, ToSchema as _, schema_ref};
 use crate::{Engine, EngineData, FileMeta};
 
@@ -210,6 +214,71 @@ pub(crate) fn x_stats(stats: &StructType, values: &[i64]) -> Scalar {
         )
         .unwrap(),
     )
+}
+
+/// Field ID the clusteringProvider tests map. Its stats struct is keyed at 30_000, so it cannot
+/// collide with the `x` leaf of [`x_full_stats`].
+pub(crate) const CLUSTERING_FIELD_ID: i32 = 100;
+
+/// The `#clusteringProvider` `content_stats` field of [`CLUSTERING_FIELD_ID`].
+pub(crate) fn clustering_field() -> StructField {
+    file_metadata_stats_field(CLUSTERING_PROVIDER_NAME, CLUSTERING_FIELD_ID).unwrap()
+}
+
+/// The `delta.adaptiveMetadata` domain mapping `clusteringProvider` to `field_id`.
+pub(crate) fn clustering_mapping_domain(field_id: i32) -> DomainMetadata {
+    let configuration =
+        format!(r#"{{"fileMetadataFieldIds":{{"clusteringProvider":{field_id}}}}}"#);
+    DomainMetadata::new(ADAPTIVE_METADATA_DOMAIN_NAME.to_string(), configuration)
+}
+
+/// The `content_stats` of [`x_full_stats`] followed by the mapped `clusteringProvider` field.
+pub(crate) fn content_stats_with_clustering() -> StructType {
+    StructType::new_unchecked(x_full_stats().fields().cloned().chain([clustering_field()]))
+}
+
+/// The `#clusteringProvider` struct value whose `lower_bound` is `lower_bound`.
+pub(crate) fn clustering_stats_value(lower_bound: Scalar) -> Scalar {
+    let DataType::Struct(stats) = clustering_field().data_type().clone() else {
+        panic!("file metadata stats must be a struct");
+    };
+    Scalar::Struct(
+        StructData::try_new(schema_ref! { ..(stats.fields()) }, vec![lower_bound]).unwrap(),
+    )
+}
+
+/// [`x_full_stats_value`] plus the mapped `clusteringProvider` stats struct, whose `lower_bound`
+/// is `lower_bound`.
+pub(crate) fn content_stats_value_with_clustering(lower_bound: Scalar) -> Scalar {
+    let Scalar::Struct(x) = x_full_stats_value() else {
+        panic!("content_stats must be a struct");
+    };
+    let values = x
+        .values()
+        .iter()
+        .cloned()
+        .chain([clustering_stats_value(lower_bound)])
+        .collect();
+    Scalar::Struct(StructData::try_new(content_stats_with_clustering().into(), values).unwrap())
+}
+
+/// The `content_stats` type holding only the `#clusteringProvider` field for `field_id`.
+pub(crate) fn clustering_only_stats_at(field_id: i32) -> StructType {
+    let field = file_metadata_stats_field(CLUSTERING_PROVIDER_NAME, field_id).unwrap();
+    StructType::new_unchecked([field])
+}
+
+/// A [`clustering_only_stats_at`] value whose `#clusteringProvider` `lower_bound` is
+/// `lower_bound`.
+pub(crate) fn clustering_only_stats_value_at(field_id: i32, lower_bound: Scalar) -> Scalar {
+    let field = file_metadata_stats_field(CLUSTERING_PROVIDER_NAME, field_id).unwrap();
+    let DataType::Struct(stats) = field.data_type().clone() else {
+        panic!("file metadata stats must be a struct");
+    };
+    let stats_value = Scalar::Struct(
+        StructData::try_new(schema_ref! { ..(stats.fields()) }, vec![lower_bound]).unwrap(),
+    );
+    Scalar::Struct(StructData::try_new(schema_ref! { (field) }, vec![stats_value]).unwrap())
 }
 
 /// A physical table schema whose only column `x` (field ID 1) is a LONG.
