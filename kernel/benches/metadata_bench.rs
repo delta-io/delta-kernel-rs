@@ -23,7 +23,8 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::try_parse_uri;
 use tempfile::TempDir;
-use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+use test_utils::delta_kernel_default_engine::storage::store_from_url;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::load_test_data;
 use url::Url;
@@ -31,34 +32,43 @@ use url::Url;
 // force scan metadata bench to use smaller sample size so test runs faster (100 -> 20)
 const SCAN_METADATA_BENCH_SAMPLE_SIZE: usize = 20;
 
-fn setup() -> (TempDir, Url, Arc<DefaultEngine<TokioBackgroundExecutor>>) {
+fn setup(
+    parallel_json_reads: bool,
+) -> (TempDir, Url, Arc<DefaultEngine<TokioMultiThreadExecutor>>) {
     // note this table _only_ has a _delta_log, no data files (can only do metadata reads)
     let table = "300k-add-files-100-col-partitioned";
     let tempdir = load_test_data("./tests/data", table).unwrap();
     let table_path = tempdir.path().join(table);
     let url = try_parse_uri(table_path.to_str().unwrap()).expect("Failed to parse table path");
-    // TODO: use multi-threaded executor
-    use test_utils::delta_kernel_default_engine::storage::store_from_url;
     let store = store_from_url(&url).expect("Failed to create store");
-    let engine = DefaultEngineBuilder::new(store).build();
+    let executor = Arc::new(
+        TokioMultiThreadExecutor::new_owned_runtime(None, None).expect("Failed to create runtime"),
+    );
+    let engine = DefaultEngineBuilder::new(store)
+        .with_task_executor(executor)
+        .with_parallel_json_reads(parallel_json_reads)
+        .build();
 
     (tempdir, url, Arc::new(engine))
 }
 
 fn create_snapshot_benchmark(c: &mut Criterion) {
-    let (_tempdir, url, engine) = setup();
-
-    c.bench_function("create_snapshot", |b| {
-        b.iter(|| {
-            Snapshot::builder_for(url.clone())
-                .build(engine.as_ref())
-                .expect("Failed to create snapshot")
-        })
-    });
+    let mut group = c.benchmark_group("create_snapshot");
+    for (id, parallel) in [("serial", false), ("parallel_files", true)] {
+        let (_tempdir, url, engine) = setup(parallel);
+        group.bench_function(id, |b| {
+            b.iter(|| {
+                Snapshot::builder_for(url.clone())
+                    .build(engine.as_ref())
+                    .expect("Failed to create snapshot")
+            })
+        });
+    }
+    group.finish();
 }
 
 fn scan_metadata_benchmark(c: &mut Criterion) {
-    let (_tempdir, url, engine) = setup();
+    let (_tempdir, url, engine) = setup(false);
 
     let snapshot = Snapshot::builder_for(url.clone())
         .build(engine.as_ref())

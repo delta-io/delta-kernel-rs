@@ -10,9 +10,12 @@
 //! A generic trait [TaskExecutor] can be implemented with your preferred async
 //! runtime. Behind the `tokio` feature flag, we provide a both a single-threaded
 //! and multi-threaded executor based on Tokio.
-use delta_kernel::KernelResult;
-use futures::Future;
-use futures::future::BoxFuture;
+use std::panic::AssertUnwindSafe;
+
+use delta_kernel::{KernelError, KernelResult};
+use futures::channel::oneshot;
+use futures::future::{AbortHandle, Abortable, BoxFuture};
+use futures::{Future, FutureExt};
 
 /// An executor that can be used to run async tasks. This is used by IO functions
 /// within the `DefaultEngine`.
@@ -40,6 +43,45 @@ pub trait TaskExecutor: Send + Sync + 'static {
     where
         F: Future<Output = ()> + Send + 'static;
 
+    /// Run a task whose output can be joined and whose work is cancelled when its handle is
+    /// dropped.
+    ///
+    /// Panics are reported as [`KernelError::JoinFailure`] when unwinding is enabled. Cancellation
+    /// takes effect when the executor next polls the task; it cannot interrupt synchronous work.
+    fn spawn_joinable<F, T>(&self, task: F) -> ScopedTask<T>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (sender, receiver) = oneshot::channel();
+        let (abort_handle, registration) = AbortHandle::new_pair();
+        let task = Abortable::new(
+            async move {
+                let result = AssertUnwindSafe(task)
+                    .catch_unwind()
+                    .await
+                    .map_err(|panic| {
+                        let message = panic
+                            .downcast_ref::<&str>()
+                            .copied()
+                            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                            .unwrap_or("task panicked with a non-string payload");
+                        KernelError::join_failure(std::io::Error::other(message.to_owned()))
+                    });
+                // The caller may have dropped the handle without joining.
+                let _ = sender.send(result);
+            },
+            registration,
+        );
+        self.spawn(async move {
+            let _ = task.await;
+        });
+        ScopedTask {
+            result: async move { receiver.await.map_err(KernelError::join_failure)? }.boxed(),
+            abort_handle,
+        }
+    }
+
     fn spawn_blocking<T, R>(&self, task: T) -> BoxFuture<'_, KernelResult<R>>
     where
         T: FnOnce() -> R + Send + 'static,
@@ -47,6 +89,26 @@ pub trait TaskExecutor: Send + Sync + 'static {
 
     /// Enter the runtime context of this executor.
     fn enter(&self) -> Self::Guard<'_>;
+}
+
+/// A joinable task that is cancelled on drop, including when its pending [`Self::join`] is dropped.
+#[must_use = "dropping the handle cancels the task"]
+pub struct ScopedTask<T> {
+    result: BoxFuture<'static, KernelResult<T>>,
+    abort_handle: AbortHandle,
+}
+
+impl<T> ScopedTask<T> {
+    /// Wait for the task's output, reporting a panic or executor shutdown as a join failure.
+    pub async fn join(mut self) -> KernelResult<T> {
+        self.result.as_mut().await
+    }
+}
+
+impl<T> Drop for ScopedTask<T> {
+    fn drop(&mut self) {
+        self.abort_handle.abort();
+    }
 }
 
 pub mod tokio {
@@ -171,7 +233,7 @@ pub mod tokio {
         where
             F: Future<Output = ()> + Send + 'static,
         {
-            self.send_future(Box::pin(task));
+            self.handle.spawn(task);
         }
 
         fn spawn_blocking<T, R>(&self, task: T) -> BoxFuture<'_, KernelResult<R>>
@@ -315,9 +377,87 @@ pub mod tokio {
     #[cfg(test)]
     mod test {
         use std::sync::mpsc::channel;
+        use std::time::Duration;
 
         use super::{TokioBackgroundExecutor, TokioMultiThreadExecutor};
         use crate::*;
+
+        #[rstest::rstest]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_joinable_tasks(#[values(false, true)] background: bool) {
+            if background {
+                assert_joinable_tasks(TokioBackgroundExecutor::new()).await;
+            } else {
+                assert_joinable_tasks(TokioMultiThreadExecutor::new(
+                    tokio::runtime::Handle::current(),
+                ))
+                .await;
+            }
+        }
+
+        async fn assert_joinable_tasks(executor: impl TaskExecutor) {
+            let executor = std::sync::Arc::new(executor);
+            assert_eq!(
+                executor.spawn_joinable(async { 42 }).join().await.unwrap(),
+                42
+            );
+            let result = executor
+                .spawn_joinable(async {
+                    KernelResult::<()>::Err(KernelError::generic("setup failed"))
+                })
+                .join()
+                .await
+                .unwrap();
+            assert!(result.unwrap_err().to_string().contains("setup failed"));
+
+            let error = executor
+                .spawn_joinable(async { panic!("decoding task panicked") })
+                .join()
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error.without_backtrace(),
+                KernelError::JoinFailure(_)
+            ));
+            assert!(error.to_string().contains("decoding task panicked"));
+
+            for drop_join in [false, true] {
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel::<()>();
+                let task = executor.spawn_joinable(async move {
+                    let _dropped = dropped_tx;
+                    started_tx.send(()).unwrap();
+                    std::future::pending::<()>().await;
+                });
+                tokio::time::timeout(Duration::from_secs(5), started_rx)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if drop_join {
+                    let mut join = Box::pin(task.join());
+                    assert!(futures::poll!(&mut join).is_pending());
+                    drop(join);
+                } else {
+                    drop(task);
+                }
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(5), dropped_rx)
+                        .await
+                        .unwrap()
+                        .is_err()
+                );
+            }
+
+            let spawning_executor = executor.clone();
+            let tasks = executor.block_on(async move {
+                (0..100)
+                    .map(|value| spawning_executor.spawn_joinable(async move { value }))
+                    .collect::<Vec<_>>()
+            });
+            for (expected, task) in tasks.into_iter().enumerate() {
+                assert_eq!(task.join().await.unwrap(), expected);
+            }
+        }
 
         async fn test_executor(executor: impl TaskExecutor) {
             // Can run a task

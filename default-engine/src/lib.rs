@@ -223,6 +223,8 @@ struct ReadIoConfig {
     buffer_size: Option<NonZero<usize>>,
     /// Maximum number of rows per yielded batch. See [`DefaultEngineBuilder::with_batch_size`].
     batch_size: Option<NonZero<usize>>,
+    /// See [`DefaultEngineBuilder::with_parallel_json_reads`].
+    parallel_json_reads: bool,
 }
 
 /// Represents the default [`TaskExecutor`]. The executor is created lazily to avoid unnecessary
@@ -281,6 +283,19 @@ impl<E> DefaultEngineBuilder<E> {
         self.io_config.batch_size = Some(batch_size);
         self
     }
+
+    /// Decode JSON files in independently scheduled tasks while preserving input order.
+    ///
+    /// Disabled by default. [`Self::with_buffer_size`] bounds the active files. Each file has a
+    /// one-batch output queue in addition to its current batch and decoder buffers.
+    ///
+    /// Tasks use the configured executor. Parallel decoding requires a multi-threaded executor such
+    /// as [`executor::tokio::TokioMultiThreadExecutor`]; the default background executor is
+    /// single-threaded.
+    pub fn with_parallel_json_reads(mut self, enabled: bool) -> Self {
+        self.io_config.parallel_json_reads = enabled;
+        self
+    }
 }
 
 impl<E: TaskExecutor> DefaultEngineBuilder<Arc<E>> {
@@ -316,7 +331,8 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         let batch_size = io_config.batch_size.unwrap_or(DEFAULT_READ_BATCH_SIZE);
         let json = DefaultJsonHandler::new(object_store.clone(), task_executor.clone())
             .with_buffer_size(buffer_size)
-            .with_batch_size(batch_size);
+            .with_batch_size(batch_size)
+            .with_parallel_json_reads(io_config.parallel_json_reads);
         let parquet = DefaultParquetHandler::new(object_store.clone(), task_executor.clone())
             .with_buffer_size(buffer_size)
             .with_batch_size(batch_size);
@@ -525,6 +541,7 @@ mod tests {
             .with_task_executor(executor)
             .with_buffer_size(NonZero::new(4).unwrap())
             .with_batch_size(NonZero::new(8).unwrap())
+            .with_parallel_json_reads(true)
             .build();
         test_arrow_engine(&engine, &url);
     }
