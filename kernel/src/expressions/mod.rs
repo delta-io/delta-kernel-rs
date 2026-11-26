@@ -446,10 +446,19 @@ pub struct CaseWhenExpression {
 /// inverse of [`UnaryExpressionOp::ToJson`] except for the sub-millisecond timestamp precision
 /// that operator discards unless `full_precision_timestamps` is set.
 ///
+/// Engines MUST parse conforming input correctly: what the Delta protocol allows and what writers
+/// emit, as listed under [Conforming values](#conforming-values). The result for any other input
+/// is unspecified, except that the failure rule below still holds. Engine settings such as the
+/// session time zone, ANSI mode or JSON options MUST NOT change the result.
+///
+/// Keys not in `output_schema` MUST be ignored, and a missing key reads as NULL. Field names match
+/// exactly; an engine MAY match them ASCII-case-insensitively, since Delta column names are unique
+/// regardless of case.
+///
 /// A SQL NULL input or the JSON literal `null` produces a NULL struct. Required fields are
 /// checked only for present objects.
 ///
-/// For `p = ParseJson(input)` with a nullable `a: BIGINT` and successful batch decoding:
+/// For `p = ParseJson(input)` with a nullable `a: BIGINT`:
 ///
 /// | Input          | `p`         | `p IS NULL` | `COALESCE(p, {a: 42})` |
 /// | -------------- | ----------- | ----------- | ---------------------- |
@@ -458,14 +467,35 @@ pub struct CaseWhenExpression {
 /// | `'{"a":null}'` | `{a: NULL}` | `false`     | `{a: NULL}`            |
 /// | `'{"a":1}'`    | `{a: 1}`    | `false`     | `{a: 1}`               |
 ///
-/// Unparseable input must degrade to NULL rather than fail the query, because kernel parses
+/// A row that fails to parse MUST NOT raise an error or affect other rows, because kernel parses
 /// `add.stats` with this operator and data skipping reads null stats as "include the file". The
-/// required part is that it does not error; whether an unparseable row comes back as a null struct
-/// or as a struct of null fields is unspecified, since data skipping treats the two alike.
+/// failing row becomes a NULL struct or a struct with NULLs at the failed fields, at the engine's
+/// choice, since data skipping treats the two alike.
 ///
 /// An empty string is not valid JSON here, so it is unparseable. This operator does not share
 /// [`MapToStructExpression`]'s empty-string-to-NULL behavior. It is SQL `from_json(json_expr,
 /// output_schema)` in a dialect whose `from_json` is permissive rather than strict.
+///
+/// # Conforming values
+///
+/// - `FLOAT` and `DOUBLE`: the strings `"NaN"`, `"Infinity"` and `"-Infinity"`, or a number token
+///   of at most 9 or 17 significant digits respectively, which reads back as the value it was
+///   printed from.
+/// - `DECIMAL`: a number token in plain or exponent form, or a numeric string, whose value is
+///   exactly representable at the declared precision and scale. `12.3` read as `DECIMAL(10,2)` is
+///   `12.30`.
+/// - `DATE`: `yyyy-MM-dd`.
+/// - `TIMESTAMP`: a date, `T` or a space, `HH:mm:ss`, an optional fraction of 1 to 9 digits whose
+///   digits past microseconds are floored, and an offset of `Z`, `+HH:MM`, `-HH:MM`, `+HH:MM:SS` or
+///   `-HH:MM:SS`. Writers print session-zone offsets, which have seconds for instants before the
+///   zone adopted standard time.
+/// - `TIMESTAMP_NTZ`: the same as `TIMESTAMP` without an offset.
+/// - `STRING`: any RFC 8259 string, including `\u` escapes and surrogate pairs, read without
+///   normalization or trimming.
+///
+/// Non-conforming input includes duplicate keys, integers that are out of range, fractional or
+/// quoted, longer float tokens, other NaN or infinity spellings, decimals that need rounding,
+/// unpaired surrogate escapes, and `TIMESTAMP` values without an offset.
 ///
 /// # Default engine behavior
 ///
