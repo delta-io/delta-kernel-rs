@@ -60,6 +60,8 @@ mod tests {
 
     use super::*;
     use crate::actions::{DomainMetadata, Metadata, Protocol, SetTransaction};
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::crc::FileMetadataFieldIdsState;
     use crate::crc::reader::try_read_crc_file;
     use crate::crc::{
         DomainMetadataState, FileSizeHistogram, FileStats, FileStatsState, SetTransactionState,
@@ -123,6 +125,8 @@ mod tests {
             in_commit_timestamp_opt: Some(ict),
             set_transaction_state: SetTransactionState::Complete(set_transactions),
             domain_metadata_state: DomainMetadataState::Complete(domain_metadata),
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            file_metadata_field_ids: FileMetadataFieldIdsState::Unmapped,
             ..Default::default()
         }
     }
