@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use delta_kernel_derive::internal_api;
 
-use super::{ExecutionMode, Transaction};
+use super::{CreateTable, ExecutionMode, Transaction};
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::clustering::{CLUSTERING_DOMAIN_NAME, parse_clustering_columns};
 use crate::error::KernelError;
@@ -12,13 +12,15 @@ use crate::row_tracking::{
 use crate::table_features::TableFeature;
 use crate::{Engine, KernelResult};
 
-impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
-    /// Transforms a system-domain configuration already staged by Kernel.
+impl<MODE: ExecutionMode> Transaction<CreateTable, MODE> {
+    /// Transforms the clustering-domain configuration staged for table creation.
     ///
-    /// The callback receives the current serialized configuration. This does not add domains or
-    /// read them from an existing table. Clustering column paths must remain unchanged; feature
-    /// and duplicate-domain checks still apply at commit. If the callback or validation fails,
-    /// the configuration is unchanged.
+    /// Only `delta.clustering` is supported. The callback must return a JSON object with the same
+    /// physical clustering column paths. If the callback or validation fails, the configuration
+    /// is unchanged.
+    ///
+    /// Extension fields are opaque to Kernel. Other writers may drop them when rewriting the
+    /// domain; the Delta protocol does not guarantee their preservation.
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[internal_api]
     pub(crate) fn transform_system_domain_metadata(
@@ -26,6 +28,11 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         domain: &str,
         transform: impl FnOnce(&str) -> KernelResult<String>,
     ) -> KernelResult<()> {
+        if domain != CLUSTERING_DOMAIN_NAME {
+            return Err(KernelError::unsupported(format!(
+                "System domain metadata transforms are not supported for '{domain}'"
+            )));
+        }
         let metadata = self
             .system_domain_metadata_additions
             .iter_mut()
@@ -34,9 +41,13 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
                 KernelError::generic(format!("System domain '{domain}' is not staged by Kernel"))
             })?;
         let configuration = transform(metadata.configuration())?;
-        if domain == CLUSTERING_DOMAIN_NAME
-            && parse_clustering_columns(&configuration)?
-                != parse_clustering_columns(metadata.configuration())?
+        if !serde_json::from_str::<serde_json::Value>(&configuration)?.is_object() {
+            return Err(KernelError::generic(
+                "System domain metadata configuration must be a JSON object",
+            ));
+        }
+        if parse_clustering_columns(&configuration)?
+            != parse_clustering_columns(metadata.configuration())?
         {
             return Err(KernelError::generic(
                 "System domain metadata transform cannot change clustering columns",
@@ -45,7 +56,9 @@ impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
         *metadata = DomainMetadata::new(domain.to_owned(), configuration);
         Ok(())
     }
+}
 
+impl<STATE, MODE: ExecutionMode> Transaction<STATE, MODE> {
     /// Validate domain metadata operations for both create-table and existing-table transactions.
     ///
     /// Enforces the following rules:
