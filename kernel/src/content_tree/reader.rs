@@ -530,7 +530,12 @@ impl EntryConverter {
             visitor.encoded_paths,
         )?);
         let augmented = entries.append_columns(ADD_HELPER_SCHEMA.clone(), helper_columns)?;
-        let actions = self.evaluator.evaluate(augmented.as_ref())?;
+        let actions = self.evaluator.evaluate(augmented.as_ref()).map_err(|e| {
+            KernelError::generic(format!(
+                "Failed to convert AMT entries to Add actions (deletion vector offset and size \
+                 must fit in an i32): {e}"
+            ))
+        })?;
         FilteredEngineData::try_new(actions, visitor.selection)
     }
 }
@@ -2857,6 +2862,24 @@ mod tests {
             ..test_dv_info()
         });
         assert_result_error_with_message(convert(&[entry]), "not a valid Iceberg blob size");
+    }
+
+    #[rstest]
+    fn out_of_range_deletion_vector_errors_even_when_dropped(
+        #[values(TrackingStatus::Added, TrackingStatus::Deleted)] status: TrackingStatus,
+    ) {
+        let mut entry = added_data_entry("data.parquet", 10, 5, 0, 1);
+        entry.tracking.status = status;
+        entry.deletion_vector = Some(DeletionVectorInfo {
+            offset: i64::from(i32::MAX) + 1,
+            ..test_dv_info()
+        });
+        let live = added_data_entry("live.parquet", 10, 5, 5, 1);
+        assert_result_error_with_message(
+            convert(&[entry, live]),
+            "deletion vector offset and size must fit in an i32): Invalid expression evaluation: \
+             Strict cast of Int64 to integer failed: Cast error: Can't cast value 2147483648",
+        );
     }
 
     #[test]

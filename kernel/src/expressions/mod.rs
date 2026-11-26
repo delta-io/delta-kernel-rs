@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
+use delta_kernel_derive::internal_api;
 use derive_more::From;
 use itertools::Itertools;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser};
@@ -483,14 +484,38 @@ pub struct ParseJsonExpression {
     pub output_schema: SchemaRef,
 }
 
-/// An expression that casts a child expression to a target type, following SQL `CAST` semantics: a
-/// value that cannot be represented in the target type evaluates to NULL rather than erroring.
+/// An expression that casts a child expression to a target type.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CastExpression {
     /// The expression whose value is cast.
     pub expr: Box<Expression>,
     /// The type the value is cast to.
     pub target: DataType,
+    /// How the cast behaves; see [`CastOptions`].
+    // Omitted when default so readers without `options` still accept safe casts.
+    #[serde(default, skip_serializing_if = "CastOptions::is_default")]
+    pub options: CastOptions,
+}
+
+/// Options that control how a [`CastExpression`] casts its input.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CastOptions {
+    #[serde(default, skip_serializing_if = "CastMode::is_safe")]
+    mode: CastMode,
+}
+
+/// How a [`CastExpression`] handles a value that cannot be represented in the target type, such as
+/// an integer that overflows or a string that does not parse.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CastMode {
+    /// The value becomes NULL, like SQL `TRY_CAST`.
+    #[default]
+    Safe,
+    /// Evaluation fails, like ANSI SQL `CAST`. A type pair the evaluator cannot cast also fails.
+    /// Nested and dictionary-encoded inputs are checked value by value as stored, so a value under
+    /// a NULL struct or list entry, outside an array slice, or unreferenced in a dictionary can
+    /// also fail the cast.
+    Strict,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -914,11 +939,48 @@ impl MapToStructExpression {
 }
 
 impl CastExpression {
-    pub(crate) fn new(expr: impl Into<Expression>, target: DataType) -> Self {
+    pub(crate) fn new(expr: impl Into<Expression>, target: DataType, mode: CastMode) -> Self {
         Self {
             expr: Box::new(expr.into()),
             target,
+            options: CastOptions::default().with_mode(mode),
         }
+    }
+
+    /// The name a cast is lowered to where a boundary has no cast node and must pass it as
+    /// [`Expression::Unknown`].
+    #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    pub(crate) fn unknown_name(&self) -> String {
+        let prefix = match self.options.mode() {
+            CastMode::Safe => "cast_to",
+            CastMode::Strict => "strict_cast_to",
+        };
+        format!("{prefix}_{}", self.target)
+    }
+}
+
+impl CastOptions {
+    /// Sets how the cast handles a value it cannot represent.
+    pub fn with_mode(mut self, mode: CastMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Returns how the cast handles a value it cannot represent.
+    pub fn mode(&self) -> CastMode {
+        self.mode
+    }
+
+    /// Returns whether no cast options are configured.
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+impl CastMode {
+    fn is_safe(&self) -> bool {
+        *self == CastMode::Safe
     }
 }
 
@@ -1121,10 +1183,16 @@ impl Expression {
         Self::MapToStruct(MapToStructExpression::new(map_expr, options))
     }
 
-    /// Creates a new cast of `expr` to `target`, following SQL `CAST` semantics (unrepresentable
-    /// values become NULL). See [`CastExpression`].
+    /// Creates a new cast of `expr` to `target` in which unrepresentable values become NULL. See
+    /// [`CastMode::Safe`].
     pub fn cast(expr: impl Into<Expression>, target: DataType) -> Self {
-        Self::Cast(CastExpression::new(expr, target))
+        Self::Cast(CastExpression::new(expr, target, CastMode::Safe))
+    }
+
+    /// Creates a new cast of `expr` to `target` that fails evaluation on an unrepresentable value.
+    /// See [`CastMode::Strict`].
+    pub fn cast_strict(expr: impl Into<Expression>, target: DataType) -> Self {
+        Self::Cast(CastExpression::new(expr, target, CastMode::Strict))
     }
 }
 
@@ -1442,7 +1510,10 @@ impl Display for Expression {
                 }
                 None => write!(f, "MAP_TO_STRUCT({})", m.map_expr),
             },
-            Cast(c) => write!(f, "CAST({} AS {})", c.expr, c.target),
+            Cast(c) => match c.options.mode() {
+                CastMode::Safe => write!(f, "CAST({} AS {})", c.expr, c.target),
+                CastMode::Strict => write!(f, "STRICT_CAST({} AS {})", c.expr, c.target),
+            },
         }
     }
 }
@@ -1589,6 +1660,10 @@ mod tests {
             (
                 Expr::unary(UnaryExpressionOp::UriEncodeFileLocation, col!("x")),
                 "URI_ENCODE_FILE_LOCATION(Column(x))",
+            ),
+            (
+                Expr::cast_strict(col!("x"), DataType::INTEGER),
+                "STRICT_CAST(Column(x) AS integer)",
             ),
             (
                 Expr::case_when([(col!("x").is_null(), lit(0))], col!("x")),
@@ -1839,8 +1914,16 @@ mod tests {
             Expression::cast(col!("part"), DataType::STRING),
             DataType::INTEGER,
         ))]
+        #[case::strict(Expression::cast_strict(col!("n"), DataType::INTEGER))]
         fn test_cast_expression_roundtrip(#[case] expr: Expression) {
             assert_roundtrip(&expr);
+        }
+
+        #[test]
+        fn test_safe_cast_serializes_without_options() {
+            let json =
+                serde_json::to_value(Expression::cast(col!("n"), DataType::INTEGER)).unwrap();
+            assert_eq!(json["Cast"].get("options"), None);
         }
 
         #[rstest::rstest]

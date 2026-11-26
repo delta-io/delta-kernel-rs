@@ -366,7 +366,11 @@ pub trait ExpressionTransform<'a> {
 
     /// Recursively transforms the child expression of a cast expression (unary).
     fn recurse_into_expr_cast(&mut self, expr: &'a CastExpression) -> Self::Output<CastExpression> {
-        let f = |child| CastExpression::new(child, expr.target.clone());
+        let f = |child: Expression| CastExpression {
+            expr: Box::new(child),
+            target: expr.target.clone(),
+            options: expr.options,
+        };
         map_owned_or_else(expr, self.transform_expr(&expr.expr), f)
     }
 
@@ -782,6 +786,9 @@ mod tests {
     )))]
     #[case::parse_json(|name: Option<&str>| name.map(|n| {
         Expr::ParseJson(ParseJsonExpression::new(Expr::column([n]), test_output_schema()))
+    }))]
+    #[case::strict_cast(|name: Option<&str>| name.map(|n| {
+        Expr::cast_strict(Expr::column([n]), DataType::INTEGER)
     }))]
     #[case::parse_json_no_match(|_| Some(Expr::ParseJson(
         ParseJsonExpression::new(col!("unchanged_col"), test_output_schema()),
