@@ -722,6 +722,35 @@ fn test_has_uri_scheme_is_never_evaluated_for_skipping(
     );
 }
 
+#[rstest::rstest]
+fn test_eval_binary_strict_cast_column_is_unknown(
+    #[values(true, false)] cast_on_left: bool,
+    #[values(
+        BinaryPredicateOp::LessThan,
+        BinaryPredicateOp::GreaterThan,
+        BinaryPredicateOp::Equal
+    )]
+    op: BinaryPredicateOp,
+) {
+    let filter = DefaultKernelPredicateEvaluator::from(Scalar::String("1".to_string()));
+    let strict = Expr::cast_strict(col!("x"), DataType::INTEGER);
+    let val = lit(10);
+    let (left, right) = if cast_on_left {
+        (&strict, &val)
+    } else {
+        (&val, &strict)
+    };
+    assert_eq!(filter.eval_pred_binary(op, left, right, false), None);
+}
+
+#[rstest::rstest]
+#[case::safe(Expr::cast(col!("x"), DataType::INTEGER), Some(Scalar::Integer(1)))]
+#[case::strict(Expr::cast_strict(col!("x"), DataType::INTEGER), None)]
+fn test_eval_expr_evaluates_only_safe_casts(#[case] expr: Expr, #[case] expected: Option<Scalar>) {
+    let filter = DefaultKernelPredicateEvaluator::from(Scalar::String("1".to_string()));
+    assert_eq!(filter.eval_expr(&expr), expected);
+}
+
 #[derive(Debug, PartialEq)]
 struct OpaqueLessThanOp;
 impl OpaqueLessThanOp {
