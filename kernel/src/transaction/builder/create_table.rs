@@ -31,26 +31,22 @@ use crate::schema::{
 };
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    ColumnMappingMode, IcebergCompatValidationContext, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
-    SET_TABLE_FEATURE_SUPPORTED_VALUE, TableFeature, V2_VALIDATOR, add_feature_to_lists,
-    assign_column_mapping_metadata, auto_enable_property_driven_features,
-    ensure_domain_metadata_dependency, find_max_column_id_in_schema,
-    get_any_level_column_physical_name, get_column_mapping_mode_from_properties,
-    schema_contains_timestamp_ntz, strip_stray_column_mapping_metadata,
-    validate_iceberg_compat_if_needed,
+    ColumnMappingMode, IcebergCompatValidationContext, SET_TABLE_FEATURE_SUPPORTED_VALUE,
+    TableFeature, V2_VALIDATOR, add_feature_to_lists, assign_column_mapping_metadata,
+    auto_enable_property_driven_features, ensure_domain_metadata_dependency,
+    find_max_column_id_in_schema, get_any_level_column_physical_name,
+    get_column_mapping_mode_from_properties, schema_contains_timestamp_ntz,
+    strip_stray_column_mapping_metadata, validate_iceberg_compat_if_needed,
 };
 use crate::table_properties::{
-    APPEND_ONLY, CHECKPOINT_INTERVAL, CHECKPOINT_POLICY, CHECKPOINT_WRITE_STATS_AS_JSON,
-    CHECKPOINT_WRITE_STATS_AS_STRUCT, COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE,
-    CheckpointPolicy, DATA_SKIPPING_NUM_INDEXED_COLS, DATA_SKIPPING_STATS_COLUMNS,
-    DELETED_FILE_RETENTION_DURATION, DELTA_PROPERTY_PREFIX, ENABLE_CHANGE_DATA_FEED,
-    ENABLE_DELETION_VECTORS, ENABLE_EXPIRED_LOG_CLEANUP, ENABLE_ICEBERG_COMPAT_V1,
+    CHECKPOINT_POLICY, COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, CheckpointPolicy,
+    ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS, ENABLE_ICEBERG_COMPAT_V1,
     ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_ICEBERG_NATIVE_V4,
-    ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING, ENABLE_TYPE_WIDENING, LOG_RETENTION_DURATION,
-    MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
-    PARQUET_COMPRESSION_CODEC, PARQUET_FORMAT_VERSION, ParquetCompressionCodec,
-    ROW_TRACKING_SUSPENDED, SET_TRANSACTION_RETENTION_DURATION, TableProperties,
-    strip_check_constraint_prefix,
+    ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
+    MATERIALIZED_ROW_ID_COLUMN_NAME, ROW_TRACKING_SUSPENDED, TableProperties,
+    canonicalize_property_batch_for_create, is_table_feature_signal_key,
+    strip_table_feature_signal_prefix, validate_log_and_deleted_file_retention,
+    validate_property_values_for_create,
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
@@ -107,51 +103,6 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     TableFeature::IcebergCompatV3,
     #[cfg(feature = "adaptive-metadata-in-dev")]
     TableFeature::IcebergNativeV4Preview,
-];
-
-/// The single allow-list of `delta.*` properties accepted during CREATE TABLE. Any `delta.*`
-/// key not present here is rejected.
-const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
-    // ColumnMapping mode property: triggers column mapping transform
-    COLUMN_MAPPING_MODE,
-    // InCommitTimestamp enablement property: triggers ICT auto-enablement
-    ENABLE_IN_COMMIT_TIMESTAMPS,
-    // Checkpoint stats format properties
-    CHECKPOINT_WRITE_STATS_AS_JSON,
-    CHECKPOINT_WRITE_STATS_AS_STRUCT,
-    // Data skipping stats configuration. Neither property enables a feature; both control
-    // the per-file stats schema the writer collects.
-    DATA_SKIPPING_NUM_INDEXED_COLS,
-    DATA_SKIPPING_STATS_COLUMNS,
-    // Property-driven feature enablement properties
-    ENABLE_DELETION_VECTORS,
-    ENABLE_CHANGE_DATA_FEED,
-    ENABLE_TYPE_WIDENING,
-    APPEND_ONLY,
-    ENABLE_ROW_TRACKING,
-    // Set transaction retention duration: controls expiration of txn identifiers
-    SET_TRANSACTION_RETENTION_DURATION,
-    // Parquet format version: controls the Parquet writer version for data files
-    PARQUET_FORMAT_VERSION,
-    // Advisory compression setting for the connector's Parquet writer.
-    PARQUET_COMPRESSION_CODEC,
-    // IcebergCompatV2 enablement: triggers auto-enablement of ColumnMapping.
-    ENABLE_ICEBERG_COMPAT_V2,
-    // IcebergCompatV3 enablement: triggers auto-enablement of ColumnMapping,
-    // RowTracking, DomainMetadata.
-    ENABLE_ICEBERG_COMPAT_V3,
-    // IcebergNativeV4 enablement: triggers auto-enablement of ColumnMapping (id), RowTracking,
-    // DeletionVectors, InCommitTimestamp, DomainMetadata, and adaptiveMetadata.
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    ENABLE_ICEBERG_NATIVE_V4,
-    // Log/checkpoint maintenance configs: stored verbatim, consumed by log cleanup / checkpoint
-    // scheduling.
-    LOG_RETENTION_DURATION,
-    DELETED_FILE_RETENTION_DURATION,
-    ENABLE_EXPIRED_LOG_CLEANUP,
-    CHECKPOINT_INTERVAL,
-    // Checkpoint policy: "v2" auto-enables the v2Checkpoint feature.
-    CHECKPOINT_POLICY,
 ];
 
 /// Ensures that no Delta table exists at the given path.
@@ -805,10 +756,11 @@ fn maybe_apply_column_mapping_for_table_create(
 ///
 /// This function:
 /// 1. Validates feature signals (`delta.feature.*`) against `ALLOWED_DELTA_FEATURES`
-/// 2. Validates delta property keys (`delta.*`) against `ALLOWED_DELTA_PROPERTIES` and checks
-///    compression codec values with the shared codec parser (case-insensitive, without trimming)
+/// 2. Validates remaining properties through the shared table-property registry (case-insensitive
+///    canonicalization and value checks)
 /// 3. Removes feature signals from properties (they shouldn't be stored in metadata)
 /// 4. Extracts reader/writer features from validated feature signals
+/// 5. Checks that log retention is at least deleted-file retention
 ///
 /// Non-delta properties (user/application properties) are always allowed.
 ///
@@ -818,40 +770,28 @@ fn maybe_apply_column_mapping_for_table_create(
 /// auto-enablement is handled separately by [`maybe_auto_enable_property_driven_features`]
 /// called after validation.
 fn validate_extract_table_features_and_properties(
-    properties: HashMap<String, String>,
+    property_batches: Vec<Vec<(String, String)>>,
 ) -> KernelResult<ValidatedTableProperties> {
     let mut reader_features = Vec::new();
     let mut writer_features = Vec::new();
 
-    // Partition properties into feature signals and regular properties
-    // Feature signals (delta.feature.X=supported) are processed but not stored in metadata
-    // Feature signals are removed from the properties map.
-    let (feature_signals, properties): (HashMap<_, _>, HashMap<_, _>) = properties
-        .into_iter()
-        .partition(|(k, _)| k.starts_with(SET_TABLE_FEATURE_SUPPORTED_PREFIX));
+    // Feature signals (delta.feature.X=supported) are not stored in metadata. Signals and
+    // properties are both canonicalized within each call, then merged in call order so a later
+    // call overrides an earlier one regardless of key spelling.
+    let mut feature_signals: HashMap<TableFeature, (String, String)> = HashMap::new();
+    let mut normalized = HashMap::new();
+    for batch in property_batches {
+        let (signals, properties): (Vec<_>, Vec<_>) = batch
+            .into_iter()
+            .partition(|(k, _)| is_table_feature_signal_key(k));
+        feature_signals.extend(canonicalize_feature_signals(signals)?);
+        normalized.extend(canonicalize_property_batch_for_create(properties)?);
+    }
 
-    // Process and validate feature signals
-    for (key, value) in &feature_signals {
-        // Safe: we partitioned for keys starting with this prefix above
-        let Some(feature_name) = key.strip_prefix(SET_TABLE_FEATURE_SUPPORTED_PREFIX) else {
-            continue;
-        };
-
-        // Validate that the value is "supported"
+    for (feature, (key, value)) in feature_signals {
         if value != SET_TABLE_FEATURE_SUPPORTED_VALUE {
             return Err(KernelError::generic(format!(
                 "Invalid value '{value}' for '{key}'. Only '{SET_TABLE_FEATURE_SUPPORTED_VALUE}' is allowed."
-            )));
-        }
-
-        // Parse feature name to TableFeature (unknown features become TableFeature::Unknown)
-        let feature: TableFeature = feature_name
-            .parse()
-            .unwrap_or_else(|_| TableFeature::Unknown(feature_name.to_string()));
-
-        if !ALLOWED_DELTA_FEATURES.contains(&feature) {
-            return Err(KernelError::generic(format!(
-                "Enabling feature '{feature_name}' via '{key}' is not supported during CREATE TABLE"
             )));
         }
 
@@ -864,37 +804,47 @@ fn validate_extract_table_features_and_properties(
             );
         }
 
-        // Add to appropriate feature lists based on feature type
         add_feature_to_lists(feature, &mut reader_features, &mut writer_features);
     }
 
-    // Validate remaining delta.* properties against the allow list
-    for (key, value) in &properties {
-        if strip_check_constraint_prefix(key).is_some() {
-            return Err(KernelError::generic(format!(
-                "Setting CHECK constraint property '{key}' is not supported during CREATE TABLE"
-            )));
-        }
-        if key.starts_with(DELTA_PROPERTY_PREFIX)
-            && !ALLOWED_DELTA_PROPERTIES.contains(&key.as_str())
-        {
-            return Err(KernelError::generic(format!(
-                "Setting delta property '{key}' is not supported during CREATE TABLE"
-            )));
-        }
-        if key == PARQUET_COMPRESSION_CODEC {
-            // Reject unsupported codecs at creation; snapshot parsing remains tolerant of them.
-            ParquetCompressionCodec::try_from(value.as_str()).map_err(|_| {
-                KernelError::generic(format!("Invalid value '{value}' for '{key}'"))
-            })?;
-        }
-    }
+    validate_property_values_for_create(&normalized)?;
+    validate_log_and_deleted_file_retention(&normalized)?;
 
     Ok(ValidatedTableProperties {
-        properties,
+        properties: normalized,
         reader_features,
         writer_features,
     })
+}
+
+/// Resolves the `delta.feature.*` entries of one `with_table_properties` call to their canonical
+/// features. Prefix and feature name match case-insensitively, and two entries for the same
+/// feature in one call are rejected.
+fn canonicalize_feature_signals(
+    signals: Vec<(String, String)>,
+) -> KernelResult<HashMap<TableFeature, (String, String)>> {
+    let mut resolved = HashMap::new();
+    for (key, value) in signals {
+        let Some(feature_name) = strip_table_feature_signal_prefix(&key) else {
+            continue;
+        };
+        let Some(feature) = ALLOWED_DELTA_FEATURES
+            .iter()
+            .find(|feature| feature.as_ref().eq_ignore_ascii_case(feature_name))
+            .cloned()
+        else {
+            return Err(KernelError::generic(format!(
+                "Enabling feature '{feature_name}' via '{key}' is not supported during CREATE TABLE"
+            )));
+        };
+        if let Some((existing, _)) = resolved.insert(feature, (key.clone(), value)) {
+            return Err(KernelError::generic(format!(
+                "Conflicting spellings of feature signal '{existing}' and '{key}' in the same \
+                 request"
+            )));
+        }
+    }
+    Ok(resolved)
 }
 
 /// Builder for configuring a new Delta table.
@@ -912,7 +862,8 @@ pub type CreateTableTransactionBuilder<MODE = Imperative> = TransactionBuilder<C
 pub struct CreateTableBuilderState {
     path: String,
     schema: SchemaRef,
-    table_properties: HashMap<String, String>,
+    /// One entry per `with_table_properties` call, in call order.
+    table_properties: Vec<Vec<(String, String)>>,
     data_layout: DataLayout,
 }
 
@@ -933,7 +884,7 @@ impl TransactionBuilder<CreateTable> {
             local_state: CreateTableBuilderState {
                 path: path.as_ref().to_string(),
                 schema,
-                table_properties: HashMap::new(),
+                table_properties: Vec::new(),
                 data_layout: DataLayout::None,
             },
             _mode: PhantomData,
@@ -950,7 +901,9 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
     /// listed in `ALLOWED_DELTA_FEATURES`.
     ///
     /// This method can be called multiple times. If a property key already exists from a
-    /// previous call, the new value will overwrite the old one.
+    /// previous call, the new value will overwrite the old one. For `delta.*` keys this holds
+    /// across spellings (`DELTA.checkpointInterval` overrides `delta.checkpointInterval`). Within a
+    /// single call, two entries for the same `delta.*` key are rejected at [`build()`].
     ///
     /// # Arguments
     ///
@@ -981,9 +934,13 @@ impl<MODE: ExecutionMode> TransactionBuilder<CreateTable, MODE> {
         K: Into<String>,
         V: Into<String>,
     {
-        self.local_state
-            .table_properties
-            .extend(properties.into_iter().map(|(k, v)| (k.into(), v.into())));
+        let batch: Vec<(String, String)> = properties
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect();
+        if !batch.is_empty() {
+            self.local_state.table_properties.push(batch);
+        }
         self
     }
 
@@ -1269,8 +1226,11 @@ mod tests {
     };
     use crate::table_features::FeatureType;
     use crate::table_properties::{
-        COLUMN_MAPPING_MAX_COLUMN_ID, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
-        ENABLE_ICEBERG_COMPAT_V3, PARQUET_FORMAT_VERSION,
+        APPEND_ONLY, CHECKPOINT_INTERVAL, CHECKPOINT_POLICY, COLUMN_MAPPING_MAX_COLUMN_ID,
+        DATA_SKIPPING_NUM_INDEXED_COLS, DATA_SKIPPING_STATS_COLUMNS,
+        DELETED_FILE_RETENTION_DURATION, ENABLE_EXPIRED_LOG_CLEANUP, ENABLE_ICEBERG_COMPAT_V1,
+        ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_TYPE_WIDENING,
+        LOG_RETENTION_DURATION, PARQUET_FORMAT_VERSION,
     };
     use crate::transforms::SchemaTransform;
     use crate::unit_test_utils::{
@@ -1278,6 +1238,13 @@ mod tests {
         field_with_generation_expression, install_thread_local_metrics_reporter,
     };
     use crate::{Error, KernelError, Result};
+
+    /// Validates `properties` as a single `with_table_properties` call.
+    fn validate_properties(
+        properties: HashMap<String, String>,
+    ) -> KernelResult<ValidatedTableProperties> {
+        validate_extract_table_features_and_properties(vec![properties.into_iter().collect()])
+    }
 
     fn test_schema() -> SchemaRef {
         schema_ref! { not_null "id": INTEGER }
@@ -1488,8 +1455,8 @@ mod tests {
                 .with_table_properties([("key1", "value1")]);
 
         assert_eq!(
-            builder.local_state.table_properties.get("key1"),
-            Some(&"value1".to_string())
+            builder.local_state.table_properties,
+            vec![vec![("key1".to_string(), "value1".to_string())]]
         );
     }
 
@@ -1503,12 +1470,11 @@ mod tests {
                 .with_table_properties([("key2", "value2")]);
 
         assert_eq!(
-            builder.local_state.table_properties.get("key1"),
-            Some(&"value1".to_string())
-        );
-        assert_eq!(
-            builder.local_state.table_properties.get("key2"),
-            Some(&"value2".to_string())
+            builder.local_state.table_properties,
+            vec![
+                vec![("key1".to_string(), "value1".to_string())],
+                vec![("key2".to_string(), "value2".to_string())],
+            ]
         );
     }
 
@@ -1519,7 +1485,7 @@ mod tests {
     #[case::bare_prefix("delta.constraints.")]
     fn create_table_rejects_check_constraint_properties(#[case] key: &str) {
         let properties = HashMap::from([(key.to_string(), "amount > 0".to_string())]);
-        let result = validate_extract_table_features_and_properties(properties);
+        let result = validate_properties(properties);
         assert_result_error_with_message(result, "Setting CHECK constraint property");
     }
 
@@ -1551,7 +1517,7 @@ mod tests {
     fn test_validate_supported_properties() {
         // Empty properties are allowed
         let properties = HashMap::new();
-        let result = validate_extract_table_features_and_properties(properties);
+        let result = validate_properties(properties);
         assert!(result.is_ok());
         let validated = result.unwrap();
         assert!(validated.properties.is_empty());
@@ -1562,7 +1528,7 @@ mod tests {
         let mut properties = HashMap::new();
         properties.insert("myapp.version".to_string(), "1.0".to_string());
         properties.insert("custom.setting".to_string(), "value".to_string());
-        let result = validate_extract_table_features_and_properties(properties);
+        let result = validate_properties(properties);
         assert!(result.is_ok());
         let validated = result.unwrap();
         assert_eq!(validated.properties.len(), 2);
@@ -1580,7 +1546,7 @@ mod tests {
     fn test_parquet_format_version_accepted() {
         let properties =
             HashMap::from([(PARQUET_FORMAT_VERSION.to_string(), "2.12.0".to_string())]);
-        let validated = validate_extract_table_features_and_properties(properties).unwrap();
+        let validated = validate_properties(properties).unwrap();
         assert_eq!(
             validated.properties.get(PARQUET_FORMAT_VERSION),
             Some(&"2.12.0".to_string()),
@@ -1596,7 +1562,7 @@ mod tests {
     #[case::stats_columns_single(DATA_SKIPPING_STATS_COLUMNS, "a")]
     fn test_data_skipping_properties_accepted(#[case] key: &str, #[case] value: &str) {
         let properties = HashMap::from([(key.to_string(), value.to_string())]);
-        let validated = validate_extract_table_features_and_properties(properties).unwrap();
+        let validated = validate_properties(properties).unwrap();
         assert_eq!(validated.properties.get(key), Some(&value.to_string()));
         assert!(validated.reader_features.is_empty());
         assert!(validated.writer_features.is_empty());
@@ -1618,7 +1584,7 @@ mod tests {
             (ENABLE_EXPIRED_LOG_CLEANUP.to_string(), "true".to_string()),
             (CHECKPOINT_INTERVAL.to_string(), "10".to_string()),
         ]);
-        let validated = validate_extract_table_features_and_properties(properties).unwrap();
+        let validated = validate_properties(properties).unwrap();
         assert_eq!(
             validated.properties.get(LOG_RETENTION_DURATION),
             Some(&"interval 30 days".to_string()),
@@ -1650,7 +1616,7 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
+        let mut validated = validate_properties(properties).unwrap();
 
         maybe_enable_v2_checkpoint_for_policy(&mut validated);
 
@@ -1670,12 +1636,206 @@ mod tests {
     }
 
     #[test]
+    fn test_create_canonicalizes_case_insensitive_delta_keys() {
+        let properties =
+            HashMap::from([("DELTA.checkpointInterval".to_string(), "10".to_string())]);
+        let validated = validate_properties(properties).unwrap();
+        assert_eq!(
+            validated.properties.get(CHECKPOINT_INTERVAL),
+            Some(&"10".to_string())
+        );
+        assert!(
+            !validated
+                .properties
+                .contains_key("DELTA.checkpointInterval")
+        );
+    }
+
+    #[rstest]
+    #[case::mixed_prefix("DELTA.feature.deletionVectors")]
+    #[case::upper_suffix("delta.feature.DELETIONVECTORS")]
+    #[case::all_upper("DELTA.FEATURE.DELETIONVECTORS")]
+    fn test_create_accepts_mixed_case_feature_signal(#[case] key: &str) {
+        let properties = HashMap::from([(key.to_string(), "supported".to_string())]);
+        let validated = validate_properties(properties).unwrap();
+        assert!(
+            validated
+                .reader_features
+                .contains(&TableFeature::DeletionVectors)
+        );
+        assert!(
+            validated
+                .writer_features
+                .contains(&TableFeature::DeletionVectors)
+        );
+        assert!(
+            !validated
+                .properties
+                .keys()
+                .any(|stored| stored.eq_ignore_ascii_case(key))
+        );
+    }
+
+    #[test]
+    fn test_create_later_call_overrides_earlier_call_across_key_spellings() {
+        let validated = validate_extract_table_features_and_properties(vec![
+            vec![("DELTA.checkpointInterval".to_string(), "10".to_string())],
+            vec![("delta.checkpointInterval".to_string(), "20".to_string())],
+        ])
+        .unwrap();
+        assert_eq!(validated.properties[CHECKPOINT_INTERVAL], "20");
+        assert_eq!(validated.properties.len(), 1);
+    }
+
+    #[test]
+    fn test_create_rejects_conflicting_spellings_within_one_call() {
+        assert_result_error_with_message(
+            validate_extract_table_features_and_properties(vec![vec![
+                ("DELTA.checkpointInterval".to_string(), "10".to_string()),
+                ("delta.checkpointInterval".to_string(), "20".to_string()),
+            ]]),
+            "Conflicting spellings of table property 'delta.checkpointInterval'",
+        );
+    }
+
+    #[test]
+    fn test_create_later_call_replaces_invalid_value_from_earlier_call() {
+        let validated = validate_extract_table_features_and_properties(vec![
+            vec![(
+                "delta.parquet.compression.codec".to_string(),
+                "invalid".to_string(),
+            )],
+            vec![(
+                "DELTA.parquet.compression.codec".to_string(),
+                "snappy".to_string(),
+            )],
+        ])
+        .unwrap();
+        assert_eq!(
+            validated.properties["delta.parquet.compression.codec"],
+            "snappy"
+        );
+    }
+
+    #[test]
+    fn test_create_later_feature_signal_overrides_earlier_across_spellings() {
+        let validated = validate_extract_table_features_and_properties(vec![
+            vec![(
+                "DELTA.FEATURE.DELETIONVECTORS".to_string(),
+                "unsupported".to_string(),
+            )],
+            vec![(
+                "delta.feature.deletionVectors".to_string(),
+                "supported".to_string(),
+            )],
+        ])
+        .unwrap();
+        assert!(
+            validated
+                .writer_features
+                .contains(&TableFeature::DeletionVectors)
+        );
+    }
+
+    #[test]
+    fn test_create_rejects_invalid_feature_signal_value_in_final_call() {
+        assert_result_error_with_message(
+            validate_extract_table_features_and_properties(vec![
+                vec![(
+                    "delta.feature.deletionVectors".to_string(),
+                    "supported".to_string(),
+                )],
+                vec![(
+                    "DELTA.feature.DELETIONVECTORS".to_string(),
+                    "unsupported".to_string(),
+                )],
+            ]),
+            "Only 'supported' is allowed",
+        );
+    }
+
+    #[test]
+    fn test_create_rejects_conflicting_feature_signal_spellings_within_one_call() {
+        assert_result_error_with_message(
+            validate_extract_table_features_and_properties(vec![vec![
+                (
+                    "DELTA.FEATURE.DELETIONVECTORS".to_string(),
+                    "supported".to_string(),
+                ),
+                (
+                    "delta.feature.deletionVectors".to_string(),
+                    "supported".to_string(),
+                ),
+            ]]),
+            "Conflicting spellings of feature signal",
+        );
+    }
+
+    #[rstest]
+    #[case::compound_deleted(
+        DELETED_FILE_RETENTION_DURATION,
+        "interval 7 days 24 hours",
+        "Invalid value 'interval 7 days 24 hours' for 'delta.deletedFileRetentionDuration'"
+    )]
+    #[case::trailing_garbage(
+        LOG_RETENTION_DURATION,
+        "interval 30 days foo",
+        "Invalid value 'interval 30 days foo' for 'delta.logRetentionDuration'"
+    )]
+    fn test_create_rejects_non_single_component_intervals(
+        #[case] key: &str,
+        #[case] value: &str,
+        #[case] expected: &str,
+    ) {
+        assert_result_error_with_message(
+            validate_properties(HashMap::from([(key.to_string(), value.to_string())])),
+            expected,
+        );
+    }
+
+    #[test]
+    fn test_create_rejects_invalid_property_values() {
+        assert_result_error_with_message(
+            validate_properties(HashMap::from([(
+                CHECKPOINT_INTERVAL.to_string(),
+                "abc".to_string(),
+            )])),
+            "Invalid value 'abc' for 'delta.checkpointInterval'",
+        );
+    }
+
+    #[test]
+    fn test_create_rejects_incompatible_retention_durations() {
+        let result = validate_properties(HashMap::from([
+            (
+                LOG_RETENTION_DURATION.to_string(),
+                "interval 1 days".to_string(),
+            ),
+            (
+                DELETED_FILE_RETENTION_DURATION.to_string(),
+                "interval 7 days".to_string(),
+            ),
+        ]));
+        let Err(error) = result else {
+            panic!("expected retention compatibility error");
+        };
+        assert!(
+            matches!(
+                &error,
+                KernelError::Generic(message)
+                if message.contains("needs to be greater than or equal to")
+            ),
+            "error={error}"
+        );
+    }
+
+    #[test]
     fn test_validate_unsupported_properties() {
         // Delta properties not on allow list are rejected
         let mut properties = HashMap::new();
         properties.insert(ENABLE_ICEBERG_COMPAT_V1.to_string(), "true".to_string());
         assert_result_error_with_message(
-            validate_extract_table_features_and_properties(properties),
+            validate_properties(properties),
             "Setting delta property 'delta.enableIcebergCompatV1' is not supported",
         );
 
@@ -1685,7 +1845,7 @@ mod tests {
             "supported".to_string(),
         )]);
         assert_result_error_with_message(
-            validate_extract_table_features_and_properties(properties),
+            validate_properties(properties),
             "Enabling feature 'identityColumns' via 'delta.feature.identityColumns' is not supported",
         );
 
@@ -1695,7 +1855,7 @@ mod tests {
             "supported".to_string(),
         )]);
         assert_result_error_with_message(
-            validate_extract_table_features_and_properties(properties),
+            validate_properties(properties),
             "Enabling feature 'clustering' via 'delta.feature.clustering' is not supported",
         );
 
@@ -1704,7 +1864,7 @@ mod tests {
         properties.insert("myapp.version".to_string(), "1.0".to_string());
         properties.insert(ENABLE_ICEBERG_COMPAT_V1.to_string(), "true".to_string());
         assert_result_error_with_message(
-            validate_extract_table_features_and_properties(properties),
+            validate_properties(properties),
             "Setting delta property 'delta.enableIcebergCompatV1' is not supported",
         );
     }
@@ -1972,7 +2132,7 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
+        let mut validated = validate_properties(properties).unwrap();
 
         maybe_auto_enable_property_driven_features(&mut validated);
 
@@ -2012,7 +2172,7 @@ mod tests {
     fn test_feature_signal_accepted(#[case] feature: TableFeature, #[case] feature_name: &str) {
         let key = format!("delta.feature.{feature_name}");
         let properties = HashMap::from([(key, "supported".to_string())]);
-        let validated = validate_extract_table_features_and_properties(properties).unwrap();
+        let validated = validate_properties(properties).unwrap();
 
         assert!(
             validated.properties.is_empty(),
@@ -2049,7 +2209,7 @@ mod tests {
         let key = format!("delta.feature.{feature_name}");
         let properties = HashMap::from([(key.clone(), "supported".to_string())]);
         assert_result_error_with_message(
-            validate_extract_table_features_and_properties(properties),
+            validate_properties(properties),
             &format!(
                 "Enabling feature '{feature_name}' via '{key}' is not supported during CREATE TABLE"
             ),
@@ -2062,7 +2222,7 @@ mod tests {
             "delta.feature.variantShredding".to_string(),
             "supported".to_string(),
         )]);
-        let validated = validate_extract_table_features_and_properties(properties).unwrap();
+        let validated = validate_properties(properties).unwrap();
 
         assert!(
             validated
@@ -2282,7 +2442,7 @@ mod tests {
             "delta.feature.catalogManaged".to_string(),
             "supported".to_string(),
         )]);
-        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
+        let mut validated = validate_properties(properties).unwrap();
         maybe_auto_enable_property_driven_features(&mut validated);
         maybe_enable_ict_for_catalog_managed(&mut validated).unwrap();
 
@@ -2311,7 +2471,7 @@ mod tests {
                 "true".to_string(),
             ),
         ]);
-        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
+        let mut validated = validate_properties(properties).unwrap();
         maybe_auto_enable_property_driven_features(&mut validated);
         maybe_enable_ict_for_catalog_managed(&mut validated).unwrap();
 
@@ -2339,7 +2499,7 @@ mod tests {
         #[case] properties: HashMap<String, String>,
         #[case] expect_enablement_property: bool,
     ) {
-        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
+        let mut validated = validate_properties(properties).unwrap();
         maybe_auto_enable_property_driven_features(&mut validated);
 
         assert!(
@@ -2361,6 +2521,51 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
+    #[case::deletion_vectors(
+        "DELTA.enableDeletionVectors",
+        "true",
+        ENABLE_DELETION_VECTORS,
+        TableFeature::DeletionVectors
+    )]
+    #[case::column_mapping(
+        "DELTA.columnMapping.mode",
+        "name",
+        COLUMN_MAPPING_MODE,
+        TableFeature::ColumnMapping
+    )]
+    #[case::row_tracking(
+        "DELTA.enableRowTracking",
+        "true",
+        ENABLE_ROW_TRACKING,
+        TableFeature::RowTracking
+    )]
+    fn test_create_mixed_case_enablement_adds_protocol_feature(
+        #[case] input_key: &str,
+        #[case] value: &str,
+        #[case] canonical_key: &str,
+        #[case] feature: TableFeature,
+    ) {
+        let mut validated =
+            validate_properties(HashMap::from([(input_key.to_string(), value.to_string())]))
+                .unwrap();
+        maybe_auto_enable_property_driven_features(&mut validated);
+
+        assert!(
+            validated.reader_features.contains(&feature)
+                || validated.writer_features.contains(&feature),
+            "expected {feature:?} after mixed-case enablement"
+        );
+        assert_eq!(
+            validated.properties.get(canonical_key).map(String::as_str),
+            Some(value)
+        );
+        assert!(
+            !validated.properties.contains_key(input_key),
+            "non-canonical key must not be stored"
+        );
+    }
+
     #[test]
     fn test_catalog_managed_with_ict_false_fails() {
         let properties = HashMap::from([
@@ -2373,7 +2578,7 @@ mod tests {
                 "false".to_string(),
             ),
         ]);
-        let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
+        let mut validated = validate_properties(properties).unwrap();
         maybe_auto_enable_property_driven_features(&mut validated);
         let err = maybe_enable_ict_for_catalog_managed(&mut validated).unwrap_err();
         assert!(
@@ -2459,7 +2664,7 @@ mod tests {
         for (k, v) in extra_props {
             props.insert(k.to_string(), v.to_string());
         }
-        let mut validated = validate_extract_table_features_and_properties(props).unwrap();
+        let mut validated = validate_properties(props).unwrap();
 
         // === V3 dependency defaults ===
         maybe_enable_iceberg_compat_v3_dependencies(&mut validated).unwrap();
@@ -2613,7 +2818,7 @@ mod tests {
         // `top` and `inner` StructFields, so feeding it through the V3 create path must
         // surface the pre-population error.
         let schema = Arc::new(build_complex_nested_kernel_schema(nested_ids_meta_key));
-        let mut validated = validate_extract_table_features_and_properties(HashMap::from([(
+        let mut validated = validate_properties(HashMap::from([(
             ENABLE_ICEBERG_COMPAT_V3.to_string(),
             "true".to_string(),
         )]))
@@ -2632,7 +2837,7 @@ mod tests {
     #[test]
     fn test_create_table_v3_supported_but_not_enabled_skips_nested_ids() {
         let schema = build_iceberg_compat_test_schema();
-        let mut validated = validate_extract_table_features_and_properties(HashMap::from([
+        let mut validated = validate_properties(HashMap::from([
             (
                 "delta.feature.icebergCompatV3".to_string(),
                 "supported".to_string(),
@@ -2672,7 +2877,7 @@ mod tests {
         let schema = build_iceberg_compat_test_schema();
         let props: HashMap<String, String> =
             HashMap::from([(ENABLE_ICEBERG_COMPAT_V2.to_string(), "true".to_string())]);
-        let mut validated = validate_extract_table_features_and_properties(props).unwrap();
+        let mut validated = validate_properties(props).unwrap();
 
         maybe_enable_iceberg_compat_v2_dependencies(&mut validated).unwrap();
         assert_eq!(
