@@ -12,9 +12,8 @@ use crate::schema::validation::validate_schema;
 use crate::schema::{ColumnMetadataKey, DataType, SchemaRef, StructField, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    ColumnMappingMode, TableFeature, find_max_column_id_in_schema,
-    schema_has_column_mapping_metadata, strip_stray_column_mapping_metadata,
-    try_assign_flat_column_mapping_info, validate_column_mapping_id,
+    ColumnMappingMode, TableFeature, effective_max_column_id, schema_has_column_mapping_metadata,
+    strip_stray_column_mapping_metadata, try_assign_flat_column_mapping_info,
 };
 use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
 use crate::transforms::{SchemaTransform, transform_output_type};
@@ -134,26 +133,7 @@ pub(crate) fn apply_schema_operations(
 ) -> KernelResult<SchemaEvolutionResult> {
     let cm_enabled = column_mapping_mode != ColumnMappingMode::None;
 
-    // Reject a persisted seed that already violates the protocol's 32-bit non-negative bound
-    // before it propagates into the allocator. A negative or above-i32::MAX seed almost
-    // certainly indicates a non-conforming writer; bail out rather than silently letting the
-    // allocator either trip the per-field validator on every preserved sibling or produce
-    // out-of-range fresh ids.
-    if let Some(seed) = current_max_column_id {
-        validate_column_mapping_id(seed).map_err(|e| {
-            KernelError::invalid_protocol(format!(
-                "Table property `delta.columnMapping.maxColumnId`: {e}"
-            ))
-        })?;
-    }
-
-    // When column mapping is enabled and the property is set, defensively take the max with
-    // the schema's actual max in case a non-conforming writer left the property stale.
-    let mut max_id = if cm_enabled {
-        current_max_column_id.map(|cfg| cfg.max(find_max_column_id_in_schema(&schema).unwrap_or(0)))
-    } else {
-        current_max_column_id
-    };
+    let mut max_id = effective_max_column_id(&schema, column_mapping_mode, current_max_column_id)?;
 
     for op in operations {
         let mut root = DataType::from(schema);
@@ -189,10 +169,10 @@ pub(crate) fn apply_schema_operations(
                 // Preserving them can reuse a dropped column's historical identity.
                 let field = if cm_enabled {
                     let id = max_id.as_mut().ok_or_else(|| {
-                        KernelError::invalid_protocol(
-                            "Column mapping is enabled but delta.columnMapping.maxColumnId \
-                             is not set in table properties",
-                        )
+                        KernelError::invalid_protocol(format!(
+                            "Column mapping is enabled but {COLUMN_MAPPING_MAX_COLUMN_ID} \
+                             is not set in table properties"
+                        ))
                     })?;
                     // ALTER TABLE doesn't support icebergCompatV3 yet, so the new field never
                     // gets `delta.columnMapping.nested.ids` here. Tracking issue:
@@ -232,8 +212,9 @@ pub(crate) fn apply_schema_operations(
 
     validate_schema(&schema, column_mapping_mode, cdf_enabled)?;
 
-    // `max_id` is only ever incremented by `try_assign_flat_column_mapping_info`. If it grew,
-    // the new value must be persisted; if it went backwards, that's a bug.
+    // `max_id` starts at the persisted seed, raised to the schema's largest id when the seed was
+    // stale, and grows in `try_assign_flat_column_mapping_info`. If it grew, the new value must
+    // be persisted; if it went backwards, that's a bug.
     let new_max_column_id = match max_id.cmp(&current_max_column_id) {
         Ordering::Greater => max_id,
         Ordering::Equal => None,
@@ -313,6 +294,7 @@ mod tests {
         ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec, MetadataValue,
         StructField, StructType, schema,
     };
+    use crate::table_features::find_max_column_id_in_schema;
 
     fn simple_schema() -> StructType {
         schema! {
@@ -1038,15 +1020,11 @@ mod tests {
         assert_eq!(result.new_max_column_id, Some(8));
     }
 
-    /// A persisted `delta.columnMapping.maxColumnId` above the protocol's 32-bit cap is
-    /// rejected before evolution starts, so the allocator never sees an out-of-range seed.
-    /// `i64::MAX` and `i32::MAX + 1` both cross the bound; the negative case ensures the
-    /// `0..=MAX_COLUMN_MAPPING_ID` range is closed on the low end too.
-    #[rstest]
-    #[case::above_protocol_max(i32::MAX as i64 + 1)]
-    #[case::i64_max(i64::MAX)]
-    #[case::negative(-1)]
-    fn alter_with_out_of_range_persisted_max_column_id_is_rejected(#[case] seed: i64) {
+    /// A persisted `delta.columnMapping.maxColumnId` outside the 32-bit id range is rejected
+    /// before evolution starts. The range cases are covered by `effective_max_column_id`.
+    #[test]
+    fn alter_with_out_of_range_persisted_max_column_id_is_rejected() {
+        let seed = i32::MAX as i64 + 1;
         let ops = vec![SchemaOperation::add_column(
             None,
             StructField::nullable("anything", DataType::INTEGER),

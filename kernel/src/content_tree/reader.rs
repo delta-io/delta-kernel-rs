@@ -26,14 +26,18 @@ use crate::cancellation::CancellationTokenRef;
 use crate::content_tree::dv_conversion::{
     ADD_DV_HELPER_SCHEMA, AddDeletionVectorColumns, add_deletion_vector_expression,
 };
+use crate::content_tree::file_metadata::FileMetadataFieldIds;
 use crate::content_tree::mumbling::MumblingBitmap;
-use crate::content_tree::stats::{parsed_stats_expression, projected_stats_schema};
+use crate::content_tree::stats::{
+    file_metadata_stats_field, parsed_stats_expression, projected_stats_schema,
+};
 use crate::content_tree::{
-    AMT_FORMAT_VERSION, COLUMN_FILES, CONTENT_TYPE, ColumnFile, ContentTreeNodeEntry,
-    DV_INFO_COLUMNS, DataContentType, DataFileFormat, FILE_FORMAT, FILE_SIZE_IN_BYTES,
-    FIRST_ROW_ID, FORMAT_VERSION, LOCATION, MANIFEST_DV, MANIFEST_INFO, MODIFIED_SNAPSHOT_ID,
-    PARTITION_SPEC_ID, RECORD_COUNT, SEQUENCE_NUMBER, TAGS, TRACKING, TRACKING_COLUMNS,
-    TRACKING_STATUS, TrackingInfo, TrackingStatus, struct_expr_from_schema,
+    AMT_FORMAT_VERSION, COLUMN_FILES, CONTENT_STATS_FIELD_NAME, CONTENT_TYPE, ColumnFile,
+    ContentTreeNodeEntry, DV_INFO_COLUMNS, DataContentType, DataFileFormat, FILE_FORMAT,
+    FILE_SIZE_IN_BYTES, FIRST_ROW_ID, FORMAT_VERSION, LOCATION, LOWER_BOUND, MANIFEST_DV,
+    MANIFEST_INFO, MODIFIED_SNAPSHOT_ID, PARTITION_SPEC_ID, RECORD_COUNT, SEQUENCE_NUMBER, TAGS,
+    TRACKING, TRACKING_COLUMNS, TRACKING_STATUS, TrackingInfo, TrackingStatus,
+    struct_expr_from_schema,
 };
 use crate::engine_data::{
     EngineData, FilteredEngineData, GetData, RowVisitor, StructList, TypedGetData as _,
@@ -44,8 +48,9 @@ use crate::expressions::{
 };
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::log_replay::{
-    BASE_ROW_ID_NAME, DATA_CHANGE_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, DELETION_VECTOR_NAME,
-    MODIFICATION_TIME_NAME, PARTITION_VALUES_NAME, PATH_NAME, SIZE_NAME, TAGS_NAME,
+    BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME, DATA_CHANGE_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME,
+    DELETION_VECTOR_NAME, MODIFICATION_TIME_NAME, PARTITION_VALUES_NAME, PATH_NAME, SIZE_NAME,
+    TAGS_NAME,
 };
 use crate::schema::{
     ArrayType, ColumnNamesAndTypes, DataType, MapType, MetadataColumnSpec, SchemaRef, StructField,
@@ -137,6 +142,9 @@ pub(crate) struct ReadContext {
     /// The Delta stats to emit as `Add.stats_parsed`, or `None` to emit no `stats_parsed`. Must
     /// be built for the checkpoint being read.
     pub(crate) stats: Option<StatsRead>,
+    /// The file metadata fields to restore from `content_stats`. The caller supplies the mapping
+    /// because the reader does not look up the table's configuration.
+    pub(crate) file_metadata: FileMetadataRead,
 }
 
 impl ReadContext {
@@ -159,9 +167,56 @@ impl ReadContext {
         StructType::new_unchecked(ADD_SCHEMA.fields().cloned().chain(stats_parsed))
     }
 
-    /// The `content_stats` to read from the manifests, or `None` to read none.
+    /// The `content_stats` to read from the manifests, or `None` to read none: the Delta stats
+    /// columns followed by the file metadata fields.
     fn content_stats(&self) -> Option<StructType> {
-        self.stats.as_ref()?.content_stats.clone()
+        let delta = self
+            .stats
+            .as_ref()
+            .and_then(|stats| stats.content_stats.as_ref());
+        let fields: Vec<StructField> = delta
+            .into_iter()
+            .chain([&self.file_metadata.content_stats])
+            .flat_map(|stats| stats.fields().cloned())
+            .collect();
+        (!fields.is_empty()).then(|| StructType::new_unchecked(fields))
+    }
+}
+
+/// The file metadata fields a read restores from `content_stats`. Built only by
+/// [`Self::try_new`], which validates the mapped IDs.
+pub(crate) struct FileMetadataRead {
+    /// The `content_stats` fields holding the mapped values; empty when no field is mapped.
+    content_stats: StructType,
+    /// Reads `add.clusteringProvider`, or `None` when the table does not map it.
+    clustering_provider: Option<Expression>,
+}
+
+impl FileMetadataRead {
+    /// Plans reading the file metadata fields mapped by `ids`.
+    ///
+    /// # Errors
+    /// Returns an `invalid_checkpoint` error if a mapped ID is not a data field ID, naming the
+    /// field and the ID.
+    pub(crate) fn try_new(ids: FileMetadataFieldIds) -> KernelResult<Self> {
+        let clustering_field = ids
+            .clustering_provider
+            .map(|id| {
+                file_metadata_stats_field(CLUSTERING_PROVIDER_NAME, id).ok_or_else(|| {
+                    KernelError::invalid_checkpoint(format!(
+                        "fileMetadataFieldIds.{CLUSTERING_PROVIDER_NAME} must be a data field \
+                         ID, found {id}"
+                    ))
+                })
+            })
+            .transpose()?;
+        let clustering_provider = clustering_field
+            .as_ref()
+            .map(|field| Expression::column([CONTENT_STATS_FIELD_NAME, field.name(), LOWER_BOUND]));
+        Ok(Self {
+            content_stats: StructType::new_unchecked(clustering_field),
+            clustering_provider,
+        })
     }
 }
 
@@ -930,7 +985,7 @@ fn build_entry_to_add_expression(
     )?));
 
     // `struct_expr_from_schema` fills every unmatched (nullable) field with a typed null, so
-    // `stats` and `clusteringProvider` fall through to null.
+    // `stats` and an unmapped `clusteringProvider` fall through to null.
     let add = struct_expr_from_schema(&ctx.action_schema(), |name| {
         Some(match name {
             n if n == PATH_NAME => Expression::coalesce([
@@ -949,6 +1004,7 @@ fn build_entry_to_add_expression(
             n if n == BASE_ROW_ID_NAME => sources.base_row_id.clone(),
             n if n == DEFAULT_ROW_COMMIT_VERSION_NAME => sources.default_row_commit_version.clone(),
             n if n == STATS_PARSED => ctx.stats.as_ref()?.expression.as_ref().clone(),
+            n if n == CLUSTERING_PROVIDER_NAME => ctx.file_metadata.clustering_provider.clone()?,
             _ => return None,
         })
     })?;
@@ -1400,9 +1456,10 @@ mod tests {
     use crate::arrow::compute::concat_batches;
     use crate::arrow::datatypes::Int64Type;
     use crate::content_tree::dv_conversion::extract_deletion_vector_content;
-    use crate::content_tree::stats::field_with_id;
+    use crate::content_tree::stats::{MAX_DATA_FIELD_ID, field_with_id};
     use crate::content_tree::test_utils::{
-        action_paths, added_data_entry, data_manifest_entry, entry_batch, entry_batch_with_stats,
+        CLUSTERING_FIELD_ID, action_paths, added_data_entry, content_stats_value_with_clustering,
+        content_stats_with_clustering, data_manifest_entry, entry_batch, entry_batch_with_stats,
         mumbling_bitmap, struct_batch, test_dv_info, with_field, write_manifest,
         write_manifest_with_stats, write_manifest_without_tags, x_full_stats, x_full_stats_value,
         x_stats, x_upper_bound_stats,
@@ -1430,7 +1487,12 @@ mod tests {
             modification_time: 1234,
             data_change: false,
             stats: None,
+            file_metadata: no_file_metadata(),
         }
+    }
+
+    fn no_file_metadata() -> FileMetadataRead {
+        FileMetadataRead::try_new(FileMetadataFieldIds::default()).unwrap()
     }
 
     /// Builds a root converter and runs it over a single batch.
@@ -1478,15 +1540,10 @@ mod tests {
         }
     }
 
-    /// The expected `{ add: Add }` row for one surviving entry, mirroring
-    /// [`build_entry_to_add_expression`].
-    fn expected_add_row(
-        path: &str,
-        size: i64,
-        base_row_id: i64,
-        commit_version: i64,
-    ) -> Vec<Scalar> {
-        let add = StructData::try_new(
+    /// The expected `add` struct for one surviving entry, mirroring
+    /// [`build_entry_to_add_expression`]. Its `clusteringProvider` is null.
+    fn expected_add(path: &str, size: i64, base_row_id: i64, commit_version: i64) -> StructData {
+        StructData::try_new(
             Add::schema_ref().clone(),
             vec![
                 Scalar::from(path),
@@ -1509,8 +1566,22 @@ mod tests {
                 null_of("backReference"),
             ],
         )
-        .unwrap();
-        vec![Scalar::Struct(add)]
+        .unwrap()
+    }
+
+    /// The expected `{ add: Add }` row for one surviving entry; see [`expected_add`].
+    fn expected_add_row(
+        path: &str,
+        size: i64,
+        base_row_id: i64,
+        commit_version: i64,
+    ) -> Vec<Scalar> {
+        vec![Scalar::Struct(expected_add(
+            path,
+            size,
+            base_row_id,
+            commit_version,
+        ))]
     }
 
     /// A typed null [`Scalar`] for the named `Add` field, so expected values match the schema types
@@ -1823,11 +1894,18 @@ mod tests {
 
     /// Reads `checkpoint`'s content tree, returning each batch's selected `Add` rows.
     fn read_tree(engine: &dyn Engine, checkpoint: &CheckpointAction) -> Result<Vec<RecordBatch>> {
-        Ok(
-            read_add_actions_from_amt(engine, checkpoint, &read_ctx(), None)?
-                .map(|batch| filtered_to_batch(batch?).try_into_record_batch())
-                .collect::<KernelResult<_>>()?,
-        )
+        read_tree_with(engine, checkpoint, &read_ctx())
+    }
+
+    /// Like [`read_tree`], reading against `ctx`.
+    fn read_tree_with(
+        engine: &dyn Engine,
+        checkpoint: &CheckpointAction,
+        ctx: &ReadContext,
+    ) -> Result<Vec<RecordBatch>> {
+        Ok(read_add_actions_from_amt(engine, checkpoint, ctx, None)?
+            .map(|batch| filtered_to_batch(batch?).try_into_record_batch())
+            .collect::<KernelResult<_>>()?)
     }
 
     /// The expected `Add` batch for `rows` of `(path, size, baseRowId, defaultRowCommitVersion)`.
@@ -1868,19 +1946,29 @@ mod tests {
     }
 
     /// Requested Delta stats are read from the root and leaf manifests' `content_stats`, keyed by
-    /// the field IDs of the checkpoint's own schema, and emitted as `Add.stats_parsed`.
+    /// the field IDs of the checkpoint's own schema, and emitted as `Add.stats_parsed`. A mapped
+    /// `clusteringProvider` is restored from its `content_stats` entry.
     #[rstest]
-    fn read_add_actions_from_amt_emits_requested_stats_parsed(
+    fn read_add_actions_from_amt_emits_requested_stats_and_clustering_provider(
         #[values(false, true)] with_stats: bool,
+        #[values(false, true)] with_clustering: bool,
     ) {
         let engine = SyncEngine::in_memory();
         // The manifests record `x_full_stats_value` for a LONG leaf with field ID 1, which the
         // checkpoint's schema (see `checkpoint_action_with_root`) maps to its `id` column,
         // physically `phys_id`.
+        let (stats_type, stats_value) = if with_clustering {
+            (
+                content_stats_with_clustering(),
+                content_stats_value_with_clustering(Scalar::from(LIQUID)),
+            )
+        } else {
+            (x_full_stats(), x_full_stats_value())
+        };
         let write = |path: &str, entries: &[ContentTreeNodeEntry]| {
             let location = table_root().join(path).unwrap();
-            let stats = entries.iter().map(|_| x_full_stats_value()).collect();
-            write_manifest_with_stats(&engine, location, entries, &x_full_stats(), stats)
+            let stats = entries.iter().map(|_| stats_value.clone()).collect();
+            write_manifest_with_stats(&engine, location, entries, &stats_type, stats)
         };
         let leaf_path = "metadata/leaf.parquet";
         let leaf_file = write(
@@ -1905,55 +1993,54 @@ mod tests {
         let request = AmtStatsRequest::new(&stats_schema, None, &HashSet::new());
         let ctx = ReadContext {
             stats: with_stats.then(|| StatsRead::try_new(&checkpoint, &request).unwrap()),
+            file_metadata: if with_clustering {
+                clustering_mapping()
+            } else {
+                no_file_metadata()
+            },
             ..read_ctx()
         };
-
-        let actual: Vec<_> = read_add_actions_from_amt(&engine, &checkpoint, &ctx, None)
-            .unwrap()
-            .map(|batch| {
-                filtered_to_batch(batch.unwrap())
-                    .try_into_record_batch()
-                    .unwrap()
-            })
-            .collect();
+        let actual = read_tree_with(&engine, &checkpoint, &ctx).unwrap();
 
         // `id` ranges over `[1, 9]` with no nulls in every file.
         let expected_adds = |(path, size, base_row_id, version, num_records)| {
-            let row = expected_add_row(path, size, base_row_id, version);
-            let row = match (row.as_slice(), with_stats) {
-                ([Scalar::Struct(add)], true) => {
-                    let phys_id = |value: i64| {
-                        let field = StructField::nullable("phys_id", DataType::LONG);
-                        Scalar::Struct(
-                            StructData::try_new(schema_ref! { (field) }, vec![value.into()])
-                                .unwrap(),
-                        )
-                    };
-                    let values = vec![
-                        Scalar::Long(num_records),
-                        phys_id(0),
-                        phys_id(1),
-                        phys_id(9),
-                        Scalar::Boolean(false),
-                    ];
-                    let stats =
-                        StructData::try_new(schema_ref! { ..(stats_schema.fields()) }, values);
-                    let field = StructField::nullable(STATS_PARSED, stats_schema.clone());
-                    let add = StructData::try_new(
-                        schema_ref! { ..(add.fields()), (field) },
-                        add.values()
-                            .iter()
-                            .cloned()
-                            .chain([stats.unwrap().into()])
-                            .collect(),
-                    );
-                    vec![Scalar::Struct(add.unwrap())]
-                }
-                _ => row,
+            let add = expected_add(path, size, base_row_id, version);
+            let add = if with_clustering {
+                with_field(&add, &[CLUSTERING_PROVIDER_NAME], Scalar::from(LIQUID))
+            } else {
+                add
+            };
+            let add = if with_stats {
+                let phys_id = |value: i64| {
+                    let field = StructField::nullable("phys_id", DataType::LONG);
+                    Scalar::Struct(
+                        StructData::try_new(schema_ref! { (field) }, vec![value.into()]).unwrap(),
+                    )
+                };
+                let values = vec![
+                    Scalar::Long(num_records),
+                    phys_id(0),
+                    phys_id(1),
+                    phys_id(9),
+                    Scalar::Boolean(false),
+                ];
+                let stats = StructData::try_new(schema_ref! { ..(stats_schema.fields()) }, values);
+                let field = StructField::nullable(STATS_PARSED, stats_schema.clone());
+                StructData::try_new(
+                    schema_ref! { ..(add.fields()), (field) },
+                    add.values()
+                        .iter()
+                        .cloned()
+                        .chain([stats.unwrap().into()])
+                        .collect(),
+                )
+                .unwrap()
+            } else {
+                add
             };
             engine
                 .evaluation_handler()
-                .create_many(ctx.add_schema(), vec![row])
+                .create_many(ctx.add_schema(), vec![vec![Scalar::Struct(add)]])
                 .unwrap()
                 .try_into_record_batch()
                 .unwrap()
@@ -1963,6 +2050,72 @@ mod tests {
             expected_adds(("a.parquet", 100, 1000, 5, 10)),
         ];
         assert_eq!(actual, expected);
+    }
+
+    const LIQUID: &str = "liquid";
+
+    fn clustering_mapping() -> FileMetadataRead {
+        FileMetadataRead::try_new(FileMetadataFieldIds {
+            clustering_provider: Some(CLUSTERING_FIELD_ID),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn file_metadata_read_rejects_non_data_field_id() {
+        let ids = FileMetadataFieldIds {
+            clustering_provider: Some(-1),
+        };
+        assert_result_error_with_message(
+            FileMetadataRead::try_new(ids),
+            "fileMetadataFieldIds.clusteringProvider must be a data field ID, found -1",
+        );
+    }
+
+    #[test]
+    fn file_metadata_read_accepts_largest_data_field_id() {
+        let ids = FileMetadataFieldIds {
+            clustering_provider: Some(MAX_DATA_FIELD_ID),
+        };
+        assert!(FileMetadataRead::try_new(ids).is_ok());
+    }
+
+    /// A mapped `clusteringProvider` reads as null when the entry has no value for it. That holds
+    /// when the stats struct is absent from the file, its `lower_bound` is null, or the whole
+    /// `content_stats` is null.
+    #[rstest]
+    #[case::struct_absent_from_file(x_full_stats(), x_full_stats_value())]
+    #[case::null_lower_bound(
+        content_stats_with_clustering(),
+        content_stats_value_with_clustering(Scalar::Null(DataType::STRING))
+    )]
+    #[case::null_content_stats(
+        content_stats_with_clustering(),
+        Scalar::Null(DataType::Struct(Box::new(content_stats_with_clustering())))
+    )]
+    fn read_add_actions_from_amt_reads_null_clustering_provider(
+        #[case] content_stats: StructType,
+        #[case] stats: Scalar,
+    ) {
+        let engine = SyncEngine::in_memory();
+        let root = write_manifest_with_stats(
+            &engine,
+            table_root().join(ROOT_PATH).unwrap(),
+            &[added_data_entry("a.parquet", 100, 10, 0, 5)],
+            &content_stats,
+            vec![stats],
+        );
+        let checkpoint = checkpoint_action_with_root(ROOT_PATH, root.size as i64, 1).unwrap();
+        let ctx = ReadContext {
+            file_metadata: clustering_mapping(),
+            ..read_ctx()
+        };
+
+        let actual = read_tree_with(&engine, &checkpoint, &ctx).unwrap();
+        assert_eq!(
+            actual,
+            vec![expected_adds(&engine, &[("a.parquet", 100, 0, 5)])]
+        );
     }
 
     /// A live entry's deletion vector reaches its `Add` as a descriptor for the writer's DV file:

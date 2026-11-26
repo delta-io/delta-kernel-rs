@@ -1638,6 +1638,7 @@ impl Scan {
                     checkpoint_schema,
                     physical_stats_read_schema,
                     amt_stats_request,
+                    self.snapshot.file_metadata_ids_from_crc(),
                 );
         }
         // Checkpoints already represent reconciled state, so scans project only Add actions. This
