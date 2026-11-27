@@ -4,11 +4,12 @@ use itertools::Itertools;
 
 use crate::action_reconciliation::ActionReconciliationIterator;
 use crate::actions::{ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
+use crate::checkpoint::metrics::{CheckpointMetrics, CheckpointPhase};
 use crate::engine_data::filter_by_predicate;
 use crate::expressions::{
-    col, null_lit, Expression, ExpressionStructPatchBuilder, Predicate, Scalar, StructData,
+    Expression, ExpressionStructPatchBuilder, Predicate, Scalar, StructData, col, expr, null_lit,
 };
-use crate::schema::{try_schema, DataType, SchemaRef, StructField};
+use crate::schema::{DataType, SchemaRef, StructField, schema_ref, try_schema};
 use crate::{
     Engine, EngineData, EvaluationHandler, ExpressionEvaluator, FileMeta, KernelError,
     KernelResult, PredicateEvaluator,
@@ -53,7 +54,7 @@ pub(super) fn create_sidecar_action_batch(
             sidecar_field.data_type()
         )));
     };
-    let sidecar_fields: Vec<StructField> = sidecar_struct.fields().cloned().collect();
+    let sidecar_schema = schema_ref! { ..(sidecar_struct.fields()) };
     // Per-row data template (follows checkpoint data schema, all fields null). Each sidecar row is
     // built by cloning this and populating only the `sidecar` field.
     let null_template: Vec<Scalar> = checkpoint_data_fields
@@ -67,9 +68,9 @@ pub(super) fn create_sidecar_action_batch(
         .map(|(filename, meta)| -> KernelResult<Vec<Scalar>> {
             let size_in_bytes = meta.size_as_i64()?;
 
-            // Sidecar struct values, ordered to match `sidecar_fields`.
-            let values: Vec<Scalar> = sidecar_fields
-                .iter()
+            // Sidecar struct values, ordered to match `sidecar_schema`.
+            let values: Vec<Scalar> = sidecar_schema
+                .fields()
                 .map(|field| match field.name().as_str() {
                     // Per the protocol, implementations are encouraged to store only
                     // the file's name for the `path` field.
@@ -89,7 +90,7 @@ pub(super) fn create_sidecar_action_batch(
 
             let mut row = null_template.clone();
             row[sidecar_col_idx] =
-                Scalar::Struct(StructData::try_new(sidecar_fields.clone(), values)?);
+                Scalar::Struct(StructData::try_new(Arc::clone(&sidecar_schema), values)?);
             Ok(row)
         })
         .try_collect()?;
@@ -150,6 +151,7 @@ pub(super) struct SidecarSplitter {
     non_file_action_batches: Vec<Box<dyn EngineData>>,
     /// Set to `true` when the inner `checkpoint_data_iter` is exhausted.
     exhausted: bool,
+    metrics: CheckpointMetrics,
 }
 
 impl SidecarSplitter {
@@ -157,6 +159,7 @@ impl SidecarSplitter {
         checkpoint_data_iterator: ActionReconciliationIterator,
         eval_handler: &dyn EvaluationHandler,
         checkpoint_data_schema: SchemaRef,
+        metrics: CheckpointMetrics,
     ) -> KernelResult<Self> {
         // Derive sidecar output schema from the checkpoint data schema (add + remove only).
         let add_field = checkpoint_data_schema.field(ADD_NAME).ok_or_else(|| {
@@ -195,8 +198,8 @@ impl SidecarSplitter {
         let file_actions_null_row_filter = eval_handler.new_predicate_evaluator(
             sidecar_output_schema,
             Arc::new(Predicate::or(
-                Predicate::is_not_null(col!(ADD_NAME)),
-                Predicate::is_not_null(col!(REMOVE_NAME)),
+                col!(ADD_NAME).is_not_null(),
+                col!(REMOVE_NAME).is_not_null(),
             )),
         )?;
 
@@ -218,7 +221,7 @@ impl SidecarSplitter {
                 checkpoint_data_schema
                     .fields()
                     .filter(|f| f.name != ADD_NAME && f.name != REMOVE_NAME)
-                    .map(|f| Expression::column([&f.name]).is_not_null()),
+                    .map(|f| Predicate::from_expr(expr!(is_not_null(path(&f.name))))),
             );
             eval_handler.new_predicate_evaluator(checkpoint_data_schema, Arc::new(predicate))?
         };
@@ -235,6 +238,7 @@ impl SidecarSplitter {
             },
             non_file_action_batches: Vec::new(),
             exhausted: false,
+            metrics,
         })
     }
 
@@ -245,11 +249,13 @@ impl SidecarSplitter {
         checkpoint_data_iterator: ActionReconciliationIterator,
         eval_handler: &dyn EvaluationHandler,
         checkpoint_data_schema: SchemaRef,
+        metrics: CheckpointMetrics,
     ) -> KernelResult<Arc<Mutex<Self>>> {
         Self::new(
             checkpoint_data_iterator,
             eval_handler,
             checkpoint_data_schema,
+            metrics,
         )
         .map(|s| Arc::new(Mutex::new(s)))
     }
@@ -272,10 +278,14 @@ impl SidecarSplitter {
                 self.exhausted = true;
                 None
             })?;
-            let batch = match result.and_then(|f| f.apply_selection_vector()) {
+            let batch = match result.and_then(|f| {
+                let _timer = self.metrics.start(CheckpointPhase::OutputPreparation);
+                f.apply_selection_vector()
+            }) {
                 Ok(b) => b,
                 Err(e) => return Some(Err(e)),
             };
+            let _timer = self.metrics.start(CheckpointPhase::OutputPreparation);
             let non_file_actions_batch = match self.non_file_actions_picker.pick(batch.as_ref()) {
                 Ok(b) => b,
                 Err(e) => return Some(Err(e)),
@@ -335,7 +345,7 @@ impl Iterator for SingleSidecarDataIterator {
             Err(e) => {
                 return Some(Err(KernelError::internal_error(format!(
                     "sidecar splitter lock poisoned: {e}"
-                ))))
+                ))));
             }
         };
         match splitter.next_file_actions_batch() {

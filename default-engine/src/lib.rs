@@ -60,8 +60,8 @@ mod stats_verifier_tests;
 pub(crate) fn stream_future_to_cancellable_iter<U: Send + 'static, E: executor::TaskExecutor>(
     task_executor: Arc<E>,
     stream_future: impl Future<Output = KernelResult<BoxStream<'static, KernelResult<U>>>>
-        + Send
-        + 'static,
+    + Send
+    + 'static,
     cancellation_token: Option<CancellationTokenRef>,
 ) -> KernelResult<Box<dyn KernelResultIterator<U>>> {
     let Some(token) = cancellation_token else {
@@ -467,6 +467,15 @@ mod tests {
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let object_store = Arc::new(LocalFileSystem::new());
         let engine = DefaultEngineBuilder::new(object_store).build();
+        test_arrow_engine(&engine, &url);
+    }
+
+    #[test]
+    fn test_default_engine_in_memory() {
+        use delta_kernel::object_store::memory::InMemory;
+
+        let url = Url::parse("memory:///").unwrap();
+        let engine = DefaultEngineBuilder::new(Arc::new(InMemory::new())).build();
         test_arrow_engine(&engine, &url);
     }
 

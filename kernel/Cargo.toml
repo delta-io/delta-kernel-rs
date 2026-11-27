@@ -10,7 +10,8 @@ readme.workspace = true
 version.workspace = true
 # exclude golden tests + golden test data since they push us over 10MB crate size limit
 # also exlude tests/data since similarly this has large test tables we don't need to ship
-exclude = ["tests/golden_tables.rs", "tests/golden_data/", "tests/data/"]
+# and error_catalog/, the maintenance-only input to `cargo xtask generate-delta-error-conditions`
+exclude = ["tests/golden_tables.rs", "tests/golden_data/", "tests/data/", "error_catalog/"]
 rust-version.workspace = true
 
 [package.metadata.docs.rs]
@@ -21,9 +22,8 @@ all-features = true
 pre-release-replacements = [
   { file = "../README.md", search = "delta_kernel = \"[a-z0-9\\.-]+\"", replace = "delta_kernel = \"{{version}}\"" },
   { file = "../README.md", search = "version = \"[a-z0-9\\.-]+\"", replace = "version = \"{{version}}\"" },
-  # Keep the separate DataFusion workspace's lockfile in sync with cargo-release version bumps.
-  { file = "../datafusion-executor/Cargo.lock", search = "(name = \"delta_kernel\"\\r?\\nversion = \")[a-z0-9\\.+-]+\"", replace = "${1}{{version}}\"", exactly = 1 },
-  { file = "../datafusion-executor/Cargo.lock", search = "(name = \"delta_kernel_derive\"\\r?\\nversion = \")[a-z0-9\\.+-]+\"", replace = "${1}{{version}}\"", exactly = 1 },
+  { file = "../docs/user-guide/src/getting_started/installation.md", search = "delta_kernel = \"[a-z0-9\\.-]+\"", replace = "delta_kernel = \"{{version}}\"" },
+  { file = "../docs/user-guide/src/getting_started/installation.md", search = "delta_kernel = \\{ version = \"[a-z0-9\\.-]+\"", replace = "delta_kernel = { version = \"{{version}}\"" },
 ]
 pre-release-hook = [
   "../release.sh",
@@ -50,7 +50,9 @@ percent-encoding = "2"
 rand = "0.9"
 roaring = "0.11.2"
 serde = { version = "1", features = ["derive", "rc"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["unbounded_depth"] }
+serde_stacker = "0.1"
+stacker = "0.1"
 strum = { version = "0.28", features = ["derive"] }
 thiserror = "2"
 prost = { version = "0.13", optional = true }
@@ -125,7 +127,7 @@ declarative-plans = ["internal-api", "dep:prost", "dep:prost-build"]
 vendored-protoc = ["dep:protoc-bin-vendored"]
 
 # Experimental, temporary feature flag guarding the in-progress CHECK constraints support (see
-# `check-constraints-in-dev` in AGENTS.md). TODO(#2896): remove once full support ships.
+# `docs/user-guide/src/writing/check_constraints.md`). TODO(#2896): remove once full support ships.
 check-constraints-in-dev = []
 # Experimental, temporary, test-only feature flag guarding the in-progress adaptiveMetadata
 # (Iceberg V4 adaptive metadata tree) work. TODO(#2866): remove once full support ships.

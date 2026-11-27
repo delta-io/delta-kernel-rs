@@ -14,18 +14,18 @@ use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as
 use delta_kernel::engine::arrow_conversion::TryIntoKernel as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::{FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
-use delta_kernel::expressions::{column_name, ColumnName};
+use delta_kernel::expressions::{ColumnName, column_name};
 use delta_kernel::object_store::path::Path;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
 use delta_kernel::schema::{
-    schema_ref, ColumnMetadataKey, DataType, MetadataColumnSpec, PrimitiveType, SchemaRef,
-    StructField, StructType,
+    ColumnMetadataKey, DataType, MetadataColumnSpec, PrimitiveType, SchemaRef, StructField,
+    StructType, schema_ref,
 };
 use delta_kernel::{Engine, EngineData, FileMeta, JsonHandler, KernelResult, ParquetHandler};
 use itertools::Itertools;
-use tempfile::{tempdir, NamedTempFile};
+use tempfile::{NamedTempFile, tempdir};
 use url::Url;
 
 use crate::delta_path_for_version;
@@ -481,7 +481,11 @@ fn test_list_from_should_sort_and_filter(
     let storage = engine.storage_handler();
 
     let test_url = base_url.join(expected_names[0].as_ref()).unwrap();
-    let files: Vec<_> = storage.list_from(&test_url).unwrap().try_collect().unwrap();
+    let files: Vec<_> = storage
+        .list_from(&test_url, None)
+        .unwrap()
+        .try_collect()
+        .unwrap();
     assert_eq!(files.len(), expected_names.len() - 1);
     for (file, expected) in files.iter().zip(expected_names.iter().skip(1)) {
         assert_eq!(file.location, base_url.join(expected.as_ref()).unwrap());
@@ -490,15 +494,36 @@ fn test_list_from_should_sort_and_filter(
     let test_url = base_url
         .join(delta_path_for_version(0, "json").as_ref())
         .unwrap();
-    let files: Vec<_> = storage.list_from(&test_url).unwrap().try_collect().unwrap();
+    let files: Vec<_> = storage
+        .list_from(&test_url, None)
+        .unwrap()
+        .try_collect()
+        .unwrap();
     assert_eq!(files.len(), expected_names.len());
 
     let test_url = base_url.join("_delta_log/").unwrap();
-    let files: Vec<_> = storage.list_from(&test_url).unwrap().try_collect().unwrap();
+    let files: Vec<_> = storage
+        .list_from(&test_url, None)
+        .unwrap()
+        .try_collect()
+        .unwrap();
     assert_eq!(files.len(), expected_names.len());
     for (file, expected) in files.iter().zip(expected_names.iter()) {
         assert_eq!(file.location, base_url.join(expected.as_ref()).unwrap());
     }
+
+    // Exclusive end equal to an existing name drops that name and everything after it.
+    let end = base_url.join(expected_names[1].as_ref()).unwrap();
+    let bounded: Vec<_> = storage
+        .list_from(&test_url, Some(&end))
+        .unwrap()
+        .try_collect()
+        .unwrap();
+    assert_eq!(bounded.len(), 1);
+    assert_eq!(
+        bounded[0].location,
+        base_url.join(expected_names[0].as_ref()).unwrap()
+    );
 }
 
 fn get_arrow_data() -> Box<dyn EngineData> {

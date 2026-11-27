@@ -4,11 +4,11 @@ use std::ffi::c_void;
 
 use delta_kernel::expressions::{
     ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
-    ColumnName, Expression, ExpressionRef, ExpressionStructPatch, JunctionPredicate,
-    JunctionPredicateOp, MapData, MapToStructExpression, OpaqueExpression, OpaqueExpressionOpRef,
-    OpaquePredicate, OpaquePredicateOpRef, ParseJsonExpression, Predicate, Scalar, StructData,
-    UnaryExpression, UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression,
-    VariadicExpressionOp,
+    CaseWhenExpression, ColumnName, Expression, ExpressionRef, ExpressionStructPatch,
+    JunctionPredicate, JunctionPredicateOp, MapData, MapToStructExpression, OpaqueExpression,
+    OpaqueExpressionOpRef, OpaquePredicate, OpaquePredicateOpRef, ParseJsonExpression, Predicate,
+    Scalar, StructData, UnaryExpression, UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp,
+    VariadicExpression, VariadicExpressionOp,
 };
 
 use super::kernel_visitor::NullTypeTag;
@@ -17,7 +17,7 @@ use crate::expressions::{
     SharedPredicate,
 };
 use crate::handle::Handle;
-use crate::{kernel_string_slice, KernelStringSlice, SharedSchema};
+use crate::{KernelStringSlice, SharedSchema, kernel_string_slice};
 
 type VisitLiteralFn<T> = extern "C" fn(data: *mut c_void, sibling_list_id: usize, value: T);
 type VisitUnaryFn = extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
@@ -26,6 +26,12 @@ type VisitVariadicFn =
     extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
 type VisitJunctionFn =
     extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
+type VisitToJsonFn = extern "C" fn(
+    data: *mut c_void,
+    sibling_list_id: usize,
+    child_list_id: usize,
+    full_precision_timestamps: bool,
+);
 type VisitParseJsonFn = extern "C" fn(
     data: *mut c_void,
     sibling_list_id: usize,
@@ -171,15 +177,25 @@ pub struct EngineExpressionVisitor {
     /// Visits a `is_null` expression belonging to the list identified by `sibling_list_id`.
     /// The sub-expression will be in a _one_ item list identified by `child_list_id`
     pub visit_is_null: VisitUnaryFn,
+    /// Visits a `has_uri_scheme` predicate belonging to the list identified by `sibling_list_id`.
+    /// The sub-expression will be in a _one_ item list identified by `child_list_id`.
+    /// See [`UnaryPredicateOp::HasUriScheme`] for the semantics the implementation must follow.
+    pub visit_has_uri_scheme: VisitUnaryFn,
     /// Visits the `ToJson` unary operator belonging to the list identified by `sibling_list_id`.
     /// The sub-expression will be in a _one_ item list identified by `child_list_id`.
     /// See [`UnaryExpressionOp::ToJson`] for the encoding the implementation must produce; in
-    /// particular, timestamps carry exactly three fractional digits, truncated.
-    pub visit_to_json: VisitUnaryFn,
+    /// particular, timestamps carry exactly three fractional digits, truncated, unless
+    /// `full_precision_timestamps` is set, in which case they carry all six microsecond digits.
+    pub visit_to_json: VisitToJsonFn,
+    /// Visits the `UriEncodeFileLocation` unary operator belonging to the list identified by
+    /// `sibling_list_id`. The sub-expression will be in a _one_ item list identified by
+    /// `child_list_id`. See [`UnaryExpressionOp::UriEncodeFileLocation`] for the encoding the
+    /// implementation must produce.
+    pub visit_uri_encode_file_location: VisitUnaryFn,
     /// Visits the `ParseJson` expression belonging to the list identified by `sibling_list_id`.
     /// The sub-expression (JSON string) will be in a _one_ item list identified by
     /// `child_list_id`. The `output_schema` handle specifies the schema to parse the JSON
-    /// into.
+    /// into. See [`ParseJsonExpression`] for NULL-input and parse-failure semantics.
     pub visit_parse_json: VisitParseJsonFn,
     /// Visits a `MapToStruct` expression. The sub-expression is in the one-item list identified by
     /// `child_list_id`. `options` and its contents are borrowed for the duration of the callback.
@@ -281,6 +297,17 @@ pub struct EngineExpressionVisitor {
     /// list identified by `sibling_list_id`.
     pub visit_unknown:
         extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
+    /// Visits a CASE WHEN expression belonging to the list identified by `sibling_list_id`.
+    /// Conditions (predicates) and results (expressions) are in separate lists identified by
+    /// `condition_list_id` and `result_list_id`, with matching order and length.
+    /// `else_list_id` identifies a list containing exactly one fallback expression.
+    pub visit_case_when: extern "C" fn(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        condition_list_id: usize,
+        result_list_id: usize,
+        else_list_id: usize,
+    ),
 }
 
 /// Visit the expression of the passed [`SharedExpression`] Handle using the provided `visitor`.
@@ -292,12 +319,13 @@ pub struct EngineExpressionVisitor {
 /// # Safety
 ///
 /// The caller must pass a valid SharedExpression Handle and expression visitor
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_expression(
     expression: &Handle<SharedExpression>,
     visitor: &mut EngineExpressionVisitor,
 ) -> usize {
-    visit_expression_internal(expression.as_ref(), visitor)
+    let expression = unsafe { expression.as_ref() };
+    visit_expression_internal(expression, visitor)
 }
 
 /// Visit the expression of the passed [`Expression`] pointer using the provided `visitor`.  See the
@@ -308,7 +336,7 @@ pub unsafe extern "C" fn visit_expression(
 /// # Safety
 ///
 /// The caller must pass a valid Expression pointer and expression visitor
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_expression_ref(
     expression: &Expression,
     visitor: &mut EngineExpressionVisitor,
@@ -325,12 +353,13 @@ pub unsafe extern "C" fn visit_expression_ref(
 /// # Safety
 ///
 /// The caller must pass a valid SharedPredicate Handle and expression visitor
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_predicate(
     predicate: &Handle<SharedPredicate>,
     visitor: &mut EngineExpressionVisitor,
 ) -> usize {
-    visit_predicate_internal(predicate.as_ref(), visitor)
+    let predicate = unsafe { predicate.as_ref() };
+    visit_predicate_internal(predicate, visitor)
 }
 
 /// Visit the predicate of the passed [`Predicate`] pointer using the provided `visitor`.  See the
@@ -341,7 +370,7 @@ pub unsafe extern "C" fn visit_predicate(
 /// # Safety
 ///
 /// The caller must pass a valid Predicate pointer and expression visitor
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visit_predicate_ref(
     predicate: &Predicate,
     visitor: &mut EngineExpressionVisitor,
@@ -396,7 +425,7 @@ fn visit_expression_struct_literal(
 ) {
     let child_value_list_id = call!(visitor, make_field_list, struct_data.fields().len());
     let child_field_list_id = call!(visitor, make_field_list, struct_data.fields().len());
-    for (field, value) in struct_data.fields().iter().zip(struct_data.values()) {
+    for (field, value) in struct_data.fields().zip(struct_data.values()) {
         let field_name = field.name();
         call!(
             visitor,
@@ -621,7 +650,7 @@ fn visit_expression_scalar(
                 visitor,
                 visit_literal_interval_year_month,
                 sibling_list_id,
-                *val
+                val.months()
             )
         }
         Scalar::IntervalDayTime(val) => {
@@ -629,7 +658,7 @@ fn visit_expression_scalar(
                 visitor,
                 visit_literal_interval_day_time,
                 sibling_list_id,
-                *val
+                val.micros()
             )
         }
         Scalar::Struct(struct_data) => {
@@ -656,10 +685,22 @@ fn visit_expression_impl(
         Expression::Unary(UnaryExpression { op, expr }) => {
             let child_list_id = call!(visitor, make_field_list, 1);
             visit_expression_impl(visitor, expr, child_list_id);
-            let visit_fn = match op {
-                UnaryExpressionOp::ToJson => visitor.visit_to_json,
-            };
-            visit_fn(visitor.data, sibling_list_id, child_list_id);
+            match op {
+                UnaryExpressionOp::ToJson {
+                    full_precision_timestamps,
+                } => (visitor.visit_to_json)(
+                    visitor.data,
+                    sibling_list_id,
+                    child_list_id,
+                    *full_precision_timestamps,
+                ),
+                UnaryExpressionOp::UriEncodeFileLocation => (visitor
+                    .visit_uri_encode_file_location)(
+                    visitor.data,
+                    sibling_list_id,
+                    child_list_id,
+                ),
+            }
         }
         Expression::Binary(BinaryExpression { op, left, right }) => {
             let child_list_id = call!(visitor, make_field_list, 2);
@@ -683,6 +724,27 @@ fn visit_expression_impl(
                 VariadicExpressionOp::Array => visitor.visit_array,
             };
             visit_fn(visitor.data, sibling_list_id, child_list_id);
+        }
+        Expression::CaseWhen(CaseWhenExpression {
+            branches,
+            else_expr,
+        }) => {
+            let condition_list_id = call!(visitor, make_field_list, branches.len());
+            let result_list_id = call!(visitor, make_field_list, branches.len());
+            let else_list_id = call!(visitor, make_field_list, 1);
+            for (condition, result) in branches {
+                visit_predicate_impl(visitor, condition, condition_list_id);
+                visit_expression_impl(visitor, result, result_list_id);
+            }
+            visit_expression_impl(visitor, else_expr, else_list_id);
+            call!(
+                visitor,
+                visit_case_when,
+                sibling_list_id,
+                condition_list_id,
+                result_list_id,
+                else_list_id
+            );
         }
         Expression::Opaque(OpaqueExpression { op, exprs }) => {
             visit_expression_opaque(visitor, op, exprs, sibling_list_id)
@@ -741,6 +803,7 @@ fn visit_predicate_impl(
             visit_expression_impl(visitor, expr, child_list_id);
             let visit_fn = match op {
                 UnaryPredicateOp::IsNull => visitor.visit_is_null,
+                UnaryPredicateOp::HasUriScheme => visitor.visit_has_uri_scheme,
             };
             visit_fn(visitor.data, sibling_list_id, child_list_id);
         }
@@ -784,12 +847,13 @@ fn visit_predicate_internal(predicate: &Predicate, visitor: &mut EngineExpressio
 
 #[cfg(test)]
 mod tests {
-    use delta_kernel::expressions::{lit, Expression, MapToStructOptions, Scalar};
+    use delta_kernel::expressions::{Expression, MapToStructOptions, Scalar, lit};
+    use delta_kernel::schema::{IntervalDayToSecondType, IntervalYearToMonthType};
     use rstest::rstest;
 
     use super::*;
-    use crate::expressions::FfiMapToStructOptions;
     use crate::TryFromStringSlice;
+    use crate::expressions::FfiMapToStructOptions;
 
     #[derive(Debug, PartialEq, Eq)]
     enum LiteralEvent {
@@ -924,7 +988,9 @@ mod tests {
     ignore_fn!(ignore_struct_literal, usize, usize);
     ignore_fn!(ignore_child_list, usize);
     ignore_fn!(ignore_map_literal, usize, usize);
+    ignore_fn!(ignore_case_when, usize, usize, usize);
     ignore_fn!(ignore_null, u8, u8, u8);
+    ignore_fn!(ignore_to_json, usize, bool);
     ignore_fn!(ignore_parse_json, usize, Handle<SharedSchema>);
     ignore_fn!(ignore_struct_patch, usize, usize, usize, usize);
     ignore_fn!(ignore_field_patch, KernelStringSlice, usize, bool, bool);
@@ -958,7 +1024,9 @@ mod tests {
             visit_or: ignore_child_list,
             visit_not: ignore_child_list,
             visit_is_null: ignore_child_list,
-            visit_to_json: ignore_child_list,
+            visit_has_uri_scheme: ignore_child_list,
+            visit_to_json: ignore_to_json,
+            visit_uri_encode_file_location: ignore_child_list,
             visit_parse_json: ignore_parse_json,
             visit_map_to_struct,
             visit_lt: ignore_child_list,
@@ -979,6 +1047,7 @@ mod tests {
             visit_opaque_expr: ignore_opaque_expr,
             visit_opaque_pred: ignore_opaque_pred,
             visit_unknown: visit_unknown_name,
+            visit_case_when: ignore_case_when,
         }
     }
 
@@ -1002,35 +1071,51 @@ mod tests {
 
     #[rstest]
     #[case(
-        lit(Scalar::IntervalYearMonth(26)),
+        lit(Scalar::interval_year_month(26, IntervalYearToMonthType::IntervalYearToMonth).unwrap()),
         LiteralEvent::IntervalYearMonth { sibling_list_id: 0, value: 26 }
     )]
     #[case(
-        lit(Scalar::IntervalDayTime(987_654)),
+        lit(Scalar::interval_year_month(24, IntervalYearToMonthType::IntervalYear).unwrap()),
+        LiteralEvent::IntervalYearMonth { sibling_list_id: 0, value: 24 }
+    )]
+    #[case(
+        lit(Scalar::interval_year_month(26, IntervalYearToMonthType::IntervalMonth).unwrap()),
+        LiteralEvent::IntervalYearMonth { sibling_list_id: 0, value: 26 }
+    )]
+    #[case(
+        lit(Scalar::interval_day_time(987_654, IntervalDayToSecondType::IntervalDayToSecond).unwrap()),
         LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: 987_654 }
     )]
     #[case(
-        lit(Scalar::IntervalYearMonth(-13)),
+        lit(Scalar::interval_day_time(86_400_000_000, IntervalDayToSecondType::IntervalDay).unwrap()),
+        LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: 86_400_000_000 }
+    )]
+    #[case(
+        lit(Scalar::interval_day_time(93_780_000_000, IntervalDayToSecondType::IntervalHourToMinute).unwrap()),
+        LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: 93_780_000_000 }
+    )]
+    #[case(
+        lit(Scalar::interval_year_month(-13, IntervalYearToMonthType::IntervalYearToMonth).unwrap()),
         LiteralEvent::IntervalYearMonth { sibling_list_id: 0, value: -13 }
     )]
     #[case(
-        lit(Scalar::IntervalYearMonth(i32::MIN)),
+        lit(Scalar::interval_year_month(i32::MIN, IntervalYearToMonthType::IntervalYearToMonth).unwrap()),
         LiteralEvent::IntervalYearMonth { sibling_list_id: 0, value: i32::MIN }
     )]
     #[case(
-        lit(Scalar::IntervalYearMonth(i32::MAX)),
+        lit(Scalar::interval_year_month(i32::MAX, IntervalYearToMonthType::IntervalYearToMonth).unwrap()),
         LiteralEvent::IntervalYearMonth { sibling_list_id: 0, value: i32::MAX }
     )]
     #[case(
-        lit(Scalar::IntervalDayTime(-86_400_000_000)),
+        lit(Scalar::interval_day_time(-86_400_000_000, IntervalDayToSecondType::IntervalDayToSecond).unwrap()),
         LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: -86_400_000_000 }
     )]
     #[case(
-        lit(Scalar::IntervalDayTime(i64::MIN)),
+        lit(Scalar::interval_day_time(i64::MIN, IntervalDayToSecondType::IntervalDayToSecond).unwrap()),
         LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: i64::MIN }
     )]
     #[case(
-        lit(Scalar::IntervalDayTime(i64::MAX)),
+        lit(Scalar::interval_day_time(i64::MAX, IntervalDayToSecondType::IntervalDayToSecond).unwrap()),
         LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: i64::MAX }
     )]
     fn visit_expression_uses_interval_literal_callbacks(

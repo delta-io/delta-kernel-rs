@@ -1,0 +1,13 @@
+version: 0
+
+id: test-partitioned-cm-none
+name: None
+description: None
+format_provider: parquet
+format_options:
+schema_string: {"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}},{"name":"category","type":"string","nullable":true,"metadata":{}}]}
+partition_columns:
+  category
+created_time: 1677811175819
+configuration:
+  delta.columnMapping.mode: none

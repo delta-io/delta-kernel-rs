@@ -8,25 +8,25 @@ use std::sync::{Arc, LazyLock};
 use itertools::Itertools;
 use tracing::info;
 
-use crate::actions::visitors::{visit_deletion_vector_at, InCommitTimestampVisitor};
+use crate::actions::visitors::{InCommitTimestampVisitor, visit_deletion_vector_at};
 use crate::actions::{
-    Metadata, Protocol, ADD_FIELD, CDC_FIELD, COMMIT_INFO_NAME, METADATA_FIELD, PROTOCOL_FIELD,
+    ADD_FIELD, CDC_FIELD, COMMIT_INFO_NAME, METADATA_FIELD, Metadata, PROTOCOL_FIELD, Protocol,
     REMOVE_FIELD,
 };
 use crate::engine_data::{GetData, TypedGetData};
-use crate::expressions::{column_name, ColumnName, MapToStructOptions};
+use crate::expressions::{ColumnName, MapToStructOptions, column_name};
 use crate::path::{AsUrl, ParsedLogPath};
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::state::DvInfo;
-use crate::schema::{schema_ref, ColumnNamesAndTypes, DataType, MetadataColumnSpec, SchemaRef};
-use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
+use crate::schema::{ColumnNamesAndTypes, DataType, MetadataColumnSpec, SchemaRef, schema_ref};
 use crate::table_changes::CdfMode;
+use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::{format_features, Operation, TableFeature};
+use crate::table_features::{Operation, TableFeature, format_features};
 use crate::utils::require;
 use crate::{
-    Engine, EngineData, ExpressionEvaluator, FileDataReadResultIterator, KernelError, KernelResult,
-    KernelResultIterator, PredicateRef, RowVisitor,
+    Engine, EngineData, Error, ExpressionEvaluator, FileDataReadResultIterator, KernelError,
+    KernelResult, KernelResultIterator, PredicateRef, Result, RowVisitor,
 };
 
 #[cfg(test)]
@@ -52,13 +52,17 @@ pub(crate) struct TableChangesScanMetadata {
 ///
 /// Note: The [`ParsedLogPath`]s in the `commit_files` iterator must be ordered, contiguous
 /// (JSON) commit files.
-pub(crate) fn table_changes_action_iter(
+pub(crate) fn table_changes_action_iter<I>(
     engine: Arc<dyn Engine>,
     start_table_configuration: &TableConfiguration,
-    commit_files: impl IntoIterator<Item = ParsedLogPath, IntoIter: Send>,
+    commit_files: I,
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
-) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata>> {
+) -> Result<impl Iterator<Item = Result<TableChangesScanMetadata>> + Send + use<I>>
+where
+    I: IntoIterator<Item = ParsedLogPath>,
+    I::IntoIter: Send,
+{
     // The data-reading (`execute`) path always uses change-data-file semantics.
     table_changes_action_iter_with_mode(
         engine,
@@ -75,14 +79,18 @@ pub(crate) fn table_changes_action_iter(
 /// [`CdfMode::ChangeDataFeed`] uses `AddCDCFile` actions because they contain changes recorded by
 /// the writer. [`CdfMode::RowTracking`] ignores those actions and reconstructs changes from
 /// row lineage in the data files referenced by `add` and `remove` actions.
-pub(crate) fn table_changes_action_iter_with_mode(
+pub(crate) fn table_changes_action_iter_with_mode<I>(
     engine: Arc<dyn Engine>,
     start_table_configuration: &TableConfiguration,
-    commit_files: impl IntoIterator<Item = ParsedLogPath, IntoIter: Send>,
+    commit_files: I,
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
     mode: CdfMode,
-) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata>> {
+) -> Result<impl Iterator<Item = Result<TableChangesScanMetadata>> + Send + use<I>>
+where
+    I: IntoIterator<Item = ParsedLogPath>,
+    I::IntoIter: Send,
+{
     let prepare_schema = replay_schema(PreparePhaseVisitor::schema())?;
     let scan_schema = replay_schema(CommitScanProcessor::schema())?;
 
@@ -169,13 +177,13 @@ struct TableChangesReplay {
 }
 
 impl TableChangesReplay {
-    fn try_next(&mut self) -> KernelResult<Option<TableChangesScanMetadata>> {
+    fn try_next(&mut self) -> Result<Option<TableChangesScanMetadata>> {
         loop {
             if let Some((index, processor)) = &self.current_scan {
                 if let Some(batch) = self.scan_reader.next_batch_for_commit(*index)? {
-                    return processor
-                        .scan_batch(batch.as_ref(), self.filter.as_ref())
-                        .map(Some);
+                    return Ok(Some(
+                        processor.scan_batch(batch.as_ref(), self.filter.as_ref())?,
+                    ));
                 }
                 self.current_scan = None;
             }
@@ -383,7 +391,7 @@ impl LogReplayScanner {
         action_batches: impl KernelResultIterator<Box<dyn EngineData>>,
         table_schema: &SchemaRef,
         mode: CdfMode,
-    ) -> KernelResult<Self> {
+    ) -> Result<Self> {
         let mut in_commit_timestamp_opt = None;
         let mut remove_dvs = HashMap::default();
         let mut add_paths = HashSet::default();
@@ -414,10 +422,12 @@ impl LogReplayScanner {
                 // Compatibility is evaluated against the end version's logical schema.
                 require!(
                     mode.schemas_compatible(&schema, table_schema.as_ref()),
-                    KernelError::change_data_feed_incompatible_schema_at_version(
-                        table_schema,
-                        &schema,
-                        commit_file.version
+                    Error::Kernel(
+                        KernelError::change_data_feed_incompatible_schema_at_version(
+                            table_schema,
+                            &schema,
+                            commit_file.version
+                        )
                     )
                 );
             }
@@ -434,8 +444,7 @@ impl LogReplayScanner {
                 let writer_features_str = table_configuration
                     .protocol()
                     .writer_features()
-                    .map(format_features)
-                    .unwrap_or_else(|| "[]".to_string());
+                    .map_or_else(|| "[]".to_string(), format_features);
 
                 info!(
                     version = commit_file.version,
@@ -453,14 +462,19 @@ impl LogReplayScanner {
             if has_metadata_update {
                 require!(
                     table_configuration.is_feature_enabled(&mode.required_feature()),
-                    mode.feature_disabled_error(commit_file.version)
+                    Error::Kernel(mode.feature_disabled_error(commit_file.version))
                 );
             }
 
             if has_protocol_update {
                 table_configuration
                     .ensure_operation_supported(Operation::Cdf)
-                    .map_err(|e| mode.protocol_support_error(e, commit_file.version))?;
+                    .map_err(|e| match e {
+                        Error::Kernel(e) => {
+                            mode.protocol_support_error(e, commit_file.version).into()
+                        }
+                        other => other,
+                    })?;
             }
         }
         // We resolve the remove deletion vector map after visiting the entire commit.
@@ -477,10 +491,10 @@ impl LogReplayScanner {
         let timestamp = if table_configuration.is_feature_enabled(&TableFeature::InCommitTimestamp)
         {
             let Some(in_commit_timestamp) = in_commit_timestamp_opt else {
-                return Err(KernelError::generic(format!(
+                return Err(Error::Kernel(KernelError::generic(format!(
                     "In-commit timestamp is enabled but not found in commit at version {}",
                     commit_file.version
-                )));
+                ))));
             };
             in_commit_timestamp
         } else {

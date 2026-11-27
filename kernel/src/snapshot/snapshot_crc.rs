@@ -15,7 +15,7 @@ use crate::{KernelError, KernelResult, Version};
 /// - stale (older): kept only as a base for [`Self::base`], never served as authoritative.
 ///
 /// [`Snapshot`]: super::Snapshot
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct SnapshotCrc {
     crc: Option<Arc<Crc>>,
     snapshot_version: Version,

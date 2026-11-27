@@ -1,8 +1,8 @@
 # Altering a table
 
-To add a column to an existing Delta table, you configure an existing-table transaction with one
-or more schema operations and commit it. A standalone ALTER commit updates the table's schema
-without rewriting data files. The same builder also supports schema evolution alongside a write.
+To change an existing Delta table's schema or table properties, you configure an existing-table
+transaction and commit it. A standalone ALTER commit updates metadata without rewriting data files.
+The same builder also supports schema evolution and property updates alongside a write.
 
 Before reading this page, make sure you understand
 [Creating a Table](./create_table.md) and
@@ -10,8 +10,9 @@ Before reading this page, make sure you understand
 
 ## ALTER TABLE versus schema evolution
 
-Use **ALTER TABLE** for a standalone, metadata-only schema change. For example, you can add a nullable
-column without writing or removing data files.
+Use **ALTER TABLE** for a standalone, metadata-only change. For example, you can add a nullable
+column or set table properties without writing or removing data files.
+`UpdateTableOperation::AlterTable` records `ALTER TABLE` as the operation.
 
 Use **SCHEMA EVOLUTION** to change the schema while writing or rewriting data files in the same
 transaction. For example, you can add a nullable column and append rows containing values for that
@@ -23,13 +24,13 @@ Pass it explicitly when you construct the builder. The table shows typical workf
 | Transaction Component | ALTER TABLE | SCHEMA EVOLUTION |
 |--------|------------------------|---------------------------------|
 | Operation | `UpdateTableOperation::AlterTable` | The data operation, such as `UpdateTableOperation::Write` |
-| Schema operations | Required | Queued alongside the data operation |
+| Schema or property changes | At least one required | Optional, queued alongside the data operation |
 | Data-file changes | None staged | Staged on the built transaction |
 | `data_change` constructor argument | `false` | `true` if records change; `false` otherwise |
 
-Both workflows use `UpdateTableTransactionBuilder`. You queue all schema operations before `build()`;
-Kernel validates and applies them during `build()`. For schema evolution, you stage data-file changes
-on the returned `Transaction`, whose `WriteState` uses the evolved schema.
+Both workflows use `UpdateTableTransactionBuilder`. You queue schema operations and property updates
+before `build()`; Kernel validates and applies them during `build()`. For schema evolution, you
+stage data-file changes on the returned `Transaction`, whose `WriteState` uses the evolved schema.
 
 `ALTER TABLE` requires `dataChange = false`. Kernel checks this at `build()` and retains a defensive
 check at `commit()`. Commit validation also rejects staged file additions, removals, and
@@ -66,8 +67,8 @@ column. The flow is:
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::schema::{DataType, StructField};
 # use delta_kernel::transaction::{CommitResult, UpdateTableOperation};
-# use delta_kernel::{KernelResult, Snapshot};
-# fn example() -> KernelResult<()> {
+# use delta_kernel::Snapshot;
+# fn example() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 // 1. Load a snapshot of the existing table.
@@ -113,8 +114,8 @@ commit. See [Check constraints](./check_constraints.md) for the acknowledgement.
 
 > [!NOTE]
 > Kernel rejects schema changes at `build()` when `icebergCompatV2`, `icebergCompatV3`, or
-> `allowColumnDefaults` is enabled. This restriction applies to both workflows, regardless of the
-> transaction operation or `dataChange` value.
+> `allowColumnDefaults` is enabled, or when the table has generated columns. This restriction
+> applies to both workflows, regardless of the transaction operation or `dataChange` value.
 
 ## Chaining multiple operations
 
@@ -131,9 +132,49 @@ let result = snapshot
     .commit(&engine)?;
 ```
 
-Building an `UpdateTableOperation::AlterTable` transaction without adding a schema operation returns an
-error. The unified builder performs this check at runtime because other operations may combine
-schema evolution with data-file actions.
+Building an `UpdateTableOperation::AlterTable` transaction without a schema operation or property
+update returns an error. The unified builder performs this check at runtime because other
+operations may combine schema evolution with data-file actions.
+
+## Setting table properties
+
+Call `with_table_properties_added` to merge key/value pairs into the table's metadata configuration.
+Ordinary application properties (keys that do not start with `delta.`) are stored with their
+original casing. Recognized config-only `delta.*` keys, such as `delta.checkpointInterval`,
+`delta.logRetentionDuration`, `delta.setTransactionRetentionDuration`, or
+`delta.parquet.format.version`, are matched case-insensitively, rewritten to their canonical form,
+and value-validated. Repeated calls merge. Two entries for the same `delta.*` key in one call
+(including exact duplicates and case variants) are rejected.
+
+Feature-enabling properties (for example `delta.enableChangeDataFeed`), `delta.feature.*` signals,
+unknown `delta.*` keys, and CHECK constraints are rejected. Setting properties does not change the
+protocol. Re-setting a property to its current value still counts as an `ALTER TABLE` change.
+
+```rust,ignore
+let result = snapshot
+    .update_table(UpdateTableOperation::AlterTable, "my-app/1.0", /* data_change */ false)
+    .with_table_properties_added([
+        ("app.owner", "analytics"),
+        ("delta.checkpointInterval", "10"),
+    ])
+    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .commit(&engine)?;
+```
+
+Call `with_table_properties_removed` to drop application properties. Only non-`delta.*` keys may be
+removed; removing a missing key is not an error. Adding and removing the same key in one
+transaction is rejected.
+
+```rust,ignore
+let result = snapshot
+    .update_table(UpdateTableOperation::AlterTable, "my-app/1.0", /* data_change */ false)
+    .with_table_properties_removed(["app.owner"])
+    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .commit(&engine)?;
+```
+
+You can combine property updates with schema operations in one `ALTER TABLE` commit, or set
+properties on a data-changing write.
 
 ## Evolving a schema while writing
 

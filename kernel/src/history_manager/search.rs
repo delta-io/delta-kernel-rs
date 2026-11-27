@@ -47,10 +47,10 @@ impl Bound {
 pub(crate) enum SearchError<T: Error> {
     /// Error that occurs when a search goes out of range. The meaning of "out of range" depends on
     /// the search [`Bound`]:
-    /// - If the search bound is [`Bound::LeastUpper`], then no element was greater than or equal
-    ///   to the provided key.
-    /// - If the search bound is [`Bound::GreatestLower`], then no element was less than or equal
-    ///   to the provided key.
+    /// - If the search bound is [`Bound::LeastUpper`], then no element was greater than or equal to
+    ///   the provided key.
+    /// - If the search bound is [`Bound::GreatestLower`], then no element was less than or equal to
+    ///   the provided key.
     OutOfRange,
     /// Error that occurs when the `key_fn` fails when retrieving the key in
     /// [`binary_search_by_key_with_bounds`]. The error that occurred in the `key_fn` is returned

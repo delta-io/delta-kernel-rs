@@ -5,22 +5,32 @@ use std::convert::Infallible;
 use std::num::ParseIntError;
 use std::str::Utf8Error;
 
+use crate::Version;
 #[cfg(feature = "default-engine-base")]
 use crate::arrow::error::ArrowError;
 #[cfg(feature = "default-engine-base")]
 use crate::object_store;
 use crate::schema::{DataType, StructType};
 use crate::table_properties::ParseIntervalError;
-use crate::Version;
+
+mod delta_error;
+mod delta_error_condition;
+
+pub use delta_error::{DeltaError, DeltaErrorParameter};
+pub use delta_error_condition::DeltaErrorCondition;
 
 /// An error returned by a Delta Kernel operation.
 #[derive(Debug, thiserror::Error)]
-// TODO(#2630): Remove non_exhaustive once Delta and Engine variants are introduced.
+// TODO(#2630): Remove non_exhaustive once the Engine variant is introduced.
 #[non_exhaustive]
 pub enum Error {
+    /// A stable, user-facing Delta failure.
+    #[error(transparent)]
+    Delta(#[from] DeltaError),
+
     /// A failure represented by a kernel implementation error.
     #[error(transparent)]
-    Kernel(KernelError),
+    Kernel(#[from] KernelError),
 }
 
 /// Details of a failed conversion from a scalar into a Rust value.
@@ -93,10 +103,13 @@ pub(crate) fn add_scalar_path_context(
     }
 }
 
+/// An owned, thread-safe error used as a diagnostic source.
+pub type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
 /// A result whose error is the top-level [`Error`].
-// Note: `delta_kernel::Result` is currently unused as part of the error migration tracked in:
-// https://github.com/delta-io/delta-kernel-rs/issues/3421.
-// First usages will come when the first `KernelError` is migrated to a `DeltaError`.
+///
+/// APIs that can fail with a [`DeltaError`] return this type. Other kernel APIs return
+/// [`KernelResult`]; `?` converts their errors into [`Error::Kernel`].
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// A result whose error defaults to [`KernelError`].
@@ -145,18 +158,10 @@ pub enum SnapshotHintError {
         /// The version described by the snapshot hint.
         hint: Version,
     },
-    /// A hint marked latest conflicts with a later catalog-ratified version.
-    #[error(
-        "Invalid snapshot hint: version {hint} is marked latest but max catalog version is {max_catalog_version}"
-    )]
-    LatestVersionConflict {
-        /// The version described by the snapshot hint.
-        hint: Version,
-        /// The latest version ratified by the catalog.
-        max_catalog_version: Version,
-    },
-    /// The supplied log files contain log compaction files, which snapshot hints do not support.
-    #[error("Invalid snapshot hint: log compaction files are not supported")]
+    /// Retained for compatibility. Snapshot construction accepts log compaction files and does
+    /// not return this variant.
+    #[deprecated(note = "snapshot hints support log compaction; this error is not returned")]
+    #[error("Invalid snapshot hint: deprecated log compaction error")]
     LogCompaction,
     /// A supplied log file is not beneath the table's `_delta_log` root.
     #[error("Invalid snapshot hint: log path '{path}' is not beneath log root '{log_root}'")]
@@ -183,9 +188,7 @@ pub enum SnapshotHintError {
     #[error("Invalid snapshot hint: snapshot history does not start at version 0")]
     MissingHistoryAnchor,
     /// The supplied CRC describes a different table version.
-    #[error(
-        "Invalid snapshot hint: CRC version {crc} does not match snapshot hint version {hint}"
-    )]
+    #[error("Invalid snapshot hint: CRC version {crc} does not match snapshot hint version {hint}")]
     CrcVersion {
         /// The version described by the CRC.
         crc: Version,
@@ -219,10 +222,7 @@ impl From<SnapshotHintError> for KernelError {
 #[non_exhaustive]
 #[derive(thiserror::Error, Debug)]
 pub enum KernelError {
-    /// This is an error that includes a backtrace. To have a particular type of error include such
-    /// backtrace (when RUST_BACKTRACE=1), annotate the error with `#[error(transparent)]` and then
-    /// add the error type and enum variant to the `from_with_backtrace!` macro invocation
-    /// below. See IOError for an example.
+    /// An error paired with a backtrace captured by [`KernelError::with_backtrace`].
     #[error("{source}\n{backtrace}")]
     Backtraced {
         source: Box<Self>,
@@ -261,7 +261,7 @@ pub enum KernelError {
     #[error("Generic error: {source}")]
     GenericError {
         /// Source error
-        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+        source: BoxedError,
     },
 
     /// An error involving the maximum catalog-ratified version when building a snapshot.
@@ -421,6 +421,24 @@ pub enum KernelError {
     #[error("Invalid decimal: {0}")]
     InvalidDecimal(String),
 
+    /// Interval value cannot be represented by its declared qualifier
+    #[error("Invalid interval: {0}")]
+    InvalidInterval(String),
+
+    /// The `uri` of a `file` value has a form that kernel doesn't resolve; see
+    /// [`resolve_file_uri`](crate::resolve_file_uri).
+    #[error("Unsupported file uri: {0}")]
+    UnsupportedFileUri(String),
+
+    /// Kernel cannot create a location for a new file that a `file` value references, because the
+    /// table's write location or the requested extension is unsupported; see
+    /// [`BoundWriteContext::new_referenced_file_path`].
+    ///
+    /// [`BoundWriteContext::new_referenced_file_path`]:
+    ///     crate::transaction::BoundWriteContext::new_referenced_file_path
+    #[error("Cannot create a referenced file path: {0}")]
+    UnsupportedReferencedFilePath(String),
+
     /// Invalid CRS or other parameter for a Geometry / Geography type
     #[error("Invalid geo parameters: {0}")]
     InvalidGeoParams(String),
@@ -502,7 +520,9 @@ pub enum KernelError {
     LogHistory(#[from] Box<crate::history_manager::error::LogHistoryError>),
 
     #[cfg(feature = "declarative-plans")]
-    #[error("Declarative plan execution yielded the incorrect type: expected PlanResult::{expected}, got PlanResult::{actual}")]
+    #[error(
+        "Declarative plan execution yielded the incorrect type: expected PlanResult::{expected}, got PlanResult::{actual}"
+    )]
     PlanResultTypeMismatch {
         expected: &'static str,
         actual: &'static str,
@@ -529,7 +549,7 @@ impl KernelError {
         Self::CheckpointWrite(msg.to_string())
     }
 
-    pub fn generic_err(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+    pub fn generic_err(source: impl Into<BoxedError>) -> Self {
         Self::GenericError {
             source: source.into(),
         }
@@ -569,6 +589,21 @@ impl KernelError {
     }
     pub fn invalid_decimal(msg: impl ToString) -> Self {
         Self::InvalidDecimal(msg.to_string())
+    }
+    /// Creates an InvalidInterval error. The message explains why the interval value cannot be
+    /// represented by its qualifier.
+    pub fn invalid_interval(msg: impl ToString) -> Self {
+        Self::InvalidInterval(msg.to_string())
+    }
+    /// Creates an UnsupportedFileUri error. The message names the `uri` and why it is not
+    /// supported.
+    pub fn unsupported_file_uri(msg: impl ToString) -> Self {
+        Self::UnsupportedFileUri(msg.to_string())
+    }
+    /// Creates an UnsupportedReferencedFilePath error. The message says whether the write location
+    /// or the extension is invalid or unsupported, and why.
+    pub fn unsupported_referenced_file_path(msg: impl ToString) -> Self {
+        Self::UnsupportedReferencedFilePath(msg.to_string())
     }
     #[cfg(feature = "geo-type-in-dev")]
     pub fn invalid_geo_params(msg: impl ToString) -> Self {
@@ -658,7 +693,9 @@ impl KernelError {
         }
     }
 
-    // Capture a backtrace when the error is constructed.
+    /// Captures a backtrace when enabled by Rust's backtrace environment settings.
+    ///
+    /// See [`Backtrace::capture`] for configuration and platform support.
     #[must_use]
     pub fn with_backtrace(self) -> Self {
         let backtrace = Backtrace::capture();

@@ -59,6 +59,38 @@
 //!
 //! [`Scan::declarative_metadata_scan_plan`]: crate::scan::Scan::declarative_metadata_scan_plan
 //!
+//! Data results can be collected into Rust types that implement `ToSchema` and
+//! `TryFrom<StructData, Error = KernelError>`, either manually or with these derives:
+//!
+//! ```rust
+//! use delta_kernel::delta_kernel_derive::{ToSchema, TryFromStructData};
+//! # use delta_kernel::plans::{Plan, PlanExecutor, PlanExecutorExt};
+//! # use delta_kernel::KernelResult;
+//!
+//! #[derive(ToSchema, TryFromStructData)]
+//! struct Row {
+//!     id: i64,
+//! }
+//!
+//! # fn one_row(executor: &dyn PlanExecutor, plan: Plan) -> KernelResult<()> {
+//! let row: Row = executor.execute_plan_into(plan)?;
+//! # Ok(())
+//! # }
+//! # fn multiple(executor: &dyn PlanExecutor, plan: Plan) -> KernelResult<()> {
+//! let rows: Vec<Row> = executor.execute_plan_into(plan)?;
+//! # Ok(())
+//! # }
+//! # fn optional(executor: &dyn PlanExecutor, plan: Plan) -> KernelResult<()> {
+//! let row: Option<Row> = executor.execute_plan_into(plan)?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! These conversions decode batches in order and stop at the first error. Converting to a struct
+//! requires exactly one total row; `Option<T>` permits zero or one. Both decode at most two rows.
+//! The plan output schema must exactly match the requested schema, including field nullability
+//! and metadata. Callers must project out unwanted fields.
+//!
 //! # Where to look
 //!
 //! - [`PlanBuilder`] builds plans through a fluent, schema-validating API, each method documenting
@@ -69,6 +101,11 @@
 //!   the type and null semantics an executor must match.
 //!
 //! This module is opt-in behind the `declarative-plans` feature flag.
+
+use std::sync::LazyLock;
+
+use url::Url;
+
 mod builder;
 pub mod ir;
 pub mod proto;
@@ -79,9 +116,29 @@ pub use ir::nodes::{RelationId, RelationRef};
 pub use ir::plan::Plan;
 pub use ir::{IoOperation, Operation};
 
+use crate::engine_data::TypedGetData as _;
+use crate::expressions::struct_rows::engine_rows;
+use crate::expressions::{ColumnName, TryFromStructRows, column_name};
+use crate::schema::{DataType, ToSchema};
 use crate::{
-    AsAny, EngineData, FileMeta, KernelError, KernelResult, KernelResultIterator, ParquetFooter,
+    AsAny, EngineData, FileMeta, GetData, KernelError, KernelResult, KernelResultIterator,
+    ParquetFooter, RowVisitor as _,
 };
+
+/// Execution capabilities declared by a [`PlanExecutor`].
+///
+/// Kernel uses this declaration to select between declarative and imperative execution. It does
+/// not restrict handler I/O or explicitly requested plan execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanExecutorCapabilities {
+    /// Supports I/O operations and general relational plans.
+    Full,
+    /// Supports I/O operations and file-scan plans.
+    ///
+    /// This includes single-node JSON and Parquet scans and empty [`ir::nodes::Values`] plans
+    /// produced for empty reads.
+    IoOnly,
+}
 
 /// Provides the ability to execute declarative plans to the Delta Kernel.
 ///
@@ -91,6 +148,19 @@ pub trait PlanExecutor: AsAny {
     /// Executes the given declarative plan and returns the result.
     fn execute_op(&self, op: Operation) -> KernelResult<PlanResult>;
 
+    /// Returns the executor's declared capabilities.
+    ///
+    /// Defaults to [`PlanExecutorCapabilities::Full`]. The returned value must remain constant
+    /// throughout the executor's lifetime.
+    fn capabilities(&self) -> PlanExecutorCapabilities {
+        PlanExecutorCapabilities::Full
+    }
+
+    /// Executes a query plan through [`Self::execute_op`].
+    fn execute_plan(&self, plan: Plan) -> KernelResult<PlanResult> {
+        self.execute_op(Operation::QueryPlan(plan))
+    }
+
     /// Reads a parquet file's footer (schema and, in future, row-group stats) via a
     /// [`IoOperation::ParquetFooter`] op.
     fn read_parquet_footer(&self, file: FileMeta) -> KernelResult<ParquetFooter> {
@@ -98,6 +168,42 @@ pub trait PlanExecutor: AsAny {
             .into_parquet_footer()
     }
 }
+
+/// Executes plans as typed Rust values for kernel consumers.
+///
+/// Use this extension with concrete executors or [`dyn PlanExecutor`](PlanExecutor) to decode
+/// terminal rows without writing visitors or getters. The output type supplies the schema,
+/// decoder, and row count requirements. The plan schema must match the requested type.
+pub trait PlanExecutorExt: PlanExecutor {
+    /// Executes a plan for a kernel consumer and decodes its terminal rows into the requested type.
+    ///
+    /// A row requires exactly one result; an optional row allows at most one; vectors accept any
+    /// count. Batches are decoded in order, stopping at the first error. A row or optional row
+    /// decodes at most two rows; later batches may remain unread. The plan's schema must equal the
+    /// requested schema, including field nullability and metadata.
+    ///
+    /// Supports numbers, booleans, strings, binary, dates, string lists, and string maps.
+    /// List elements and map values must be non-nullable in the schema, even for empty streams.
+    /// String-list source schemas must declare non-null elements; batches are also checked.
+    /// Required nulls and null string-list elements return errors. Null map entries are dropped;
+    /// duplicate-key results are unspecified. Other collections, decimals, and timestamps are
+    /// unsupported, including for empty streams.
+    fn execute_plan_into<T: TryFromStructRows>(&self, plan: Plan) -> KernelResult<T> {
+        let schema = <T::Row as ToSchema>::schema_ref();
+        for field in schema.fields() {
+            engine_rows::ensure_supported(field)?;
+        }
+        if &plan.schema != schema {
+            return Err(KernelError::invalid_struct_data(format!(
+                "Plan output schema does not match requested schema.\nExpected:\n{schema}\nActual:\n{}",
+                plan.schema
+            )));
+        }
+        T::collect_batches(self.execute_plan(plan)?.into_data()?)
+    }
+}
+
+impl<E: PlanExecutor + ?Sized> PlanExecutorExt for E {}
 
 /// A [`PlanExecutor`] that can retain relations within its own lifetime.
 ///
@@ -200,5 +306,114 @@ impl PlanResult {
     /// one.
     fn type_mismatch(&self, expected: &'static str) -> KernelError {
         KernelError::plan_result_type_mismatch(expected, self.variant_name())
+    }
+}
+
+/// Decodes a file write's single metadata row, consuming the full stream.
+pub(crate) fn file_meta_from_batches(
+    batches: impl KernelResultIterator<Box<dyn EngineData>>,
+) -> KernelResult<FileMeta> {
+    let mut visitor = FileMetaVisitor::default();
+    for batch in batches {
+        let batch = batch?;
+        if !batch.is_empty() {
+            visitor.visit_rows_of(batch.as_ref())?;
+        }
+    }
+    visitor
+        .file_meta
+        .ok_or_else(|| KernelError::generic("Write returned no file metadata"))
+}
+
+#[derive(Default)]
+struct FileMetaVisitor {
+    file_meta: Option<FileMeta>,
+}
+
+impl crate::RowVisitor for FileMetaVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES: LazyLock<[ColumnName; 3]> = LazyLock::new(|| {
+            [
+                column_name!("location"),
+                column_name!("size"),
+                column_name!("last_modified"),
+            ]
+        });
+        static TYPES: [DataType; 3] = [DataType::STRING, DataType::LONG, DataType::LONG];
+        (&*NAMES, &TYPES)
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> KernelResult<()> {
+        for row in 0..row_count {
+            if self.file_meta.is_some() {
+                return Err(KernelError::internal_error(
+                    "Write returned multiple file metadata rows",
+                ));
+            }
+            let location: String = getters[0].get(row, "location")?;
+            let location = Url::parse(&location).map_err(|err| {
+                KernelError::internal_error(format!("Invalid written file URL: {err}"))
+            })?;
+            let size: i64 = getters[1].get(row, "size")?;
+            let size = u64::try_from(size)
+                .map_err(|_| KernelError::internal_error("Write returned negative file size"))?;
+            let last_modified: i64 = getters[2].get(row, "last_modified")?;
+            self.file_meta = Some(FileMeta::new(location, last_modified, size));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+    use crate::Engine;
+    use crate::engine::sync::SyncEngine;
+    use crate::plans::ir::nodes::FILE_META_SCHEMA;
+
+    #[rstest]
+    #[case::valid("memory:///file", 12, vec![0, 1, 0], true)]
+    #[case::empty_file("memory:///file", 0, vec![1], true)]
+    #[case::empty("memory:///file", 12, vec![], false)]
+    #[case::multiple("memory:///file", 12, vec![2], false)]
+    #[case::multiple_batches("memory:///file", 12, vec![1, 1], false)]
+    #[case::negative_size("memory:///file", -1, vec![1], false)]
+    #[case::invalid_url("invalid URL", 12, vec![1], false)]
+    fn written_file_metadata(
+        #[case] path: &str,
+        #[case] size: i64,
+        #[case] rows_per_batch: Vec<usize>,
+        #[case] valid: bool,
+        #[values(false, true)] late_error: bool,
+    ) -> KernelResult<()> {
+        let evaluation = SyncEngine::new().evaluation_handler();
+        let values = vec![path.into(), size.into(), 7i64.into()];
+        let batches = rows_per_batch.into_iter().map(move |rows| {
+            evaluation.create_many(FILE_META_SCHEMA.clone(), vec![values.clone(); rows])
+        });
+        let result = file_meta_from_batches(
+            batches.chain(late_error.then(|| Err(KernelError::generic("late result error")))),
+        );
+        if valid && !late_error {
+            assert_eq!(result?, FileMeta::new(Url::parse(path)?, 7, size as u64));
+        } else {
+            assert!(result.is_err());
+        }
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::unit(PlanResult::Unit)]
+    #[case::listing(PlanResult::FileMeta(Box::new(std::iter::empty())))]
+    fn written_file_metadata_rejects_other_results(#[case] result: PlanResult) {
+        assert!(matches!(
+            result.into_data().and_then(file_meta_from_batches),
+            Err(KernelError::PlanResultTypeMismatch {
+                expected: "Data",
+                ..
+            })
+        ));
     }
 }

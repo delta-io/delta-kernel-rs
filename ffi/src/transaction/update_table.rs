@@ -1,9 +1,11 @@
 //! Existing-table transaction FFI lifecycle.
 
+use delta_kernel::Result;
 use delta_kernel::engine_data::FilteredEngineData;
 
 use super::committed::commit_result_to_committed_handle;
 use super::*;
+use crate::delta_types::{FfiStringArray, FfiStringMap};
 
 /// A handle for an update-table transaction (`Transaction<UpdateTable>`).
 ///
@@ -35,7 +37,7 @@ pub struct ExclusiveUpdateTableTransactionBuilder;
 /// `snapshot`, `engine_info`, and `engine` must be valid and are borrowed for this call.
 /// `operation` must contain a valid [`KernelUpdateTableOperation`] discriminant. Any
 /// other tag is undefined behavior.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn new_update_table_txn_builder(
     snapshot: Handle<SharedSnapshot>,
     operation: KernelUpdateTableOperation,
@@ -46,12 +48,11 @@ pub unsafe extern "C" fn new_update_table_txn_builder(
     let engine = unsafe { engine.as_ref() };
     let engine_info: KernelResult<String> =
         unsafe { TryFromStringSlice::try_from_slice(&engine_info) };
-    engine_info
-        .map(|engine_info| {
-            let snapshot = unsafe { snapshot.clone_as_arc() };
-            Box::new(snapshot.update_table(operation.into(), engine_info, data_change)).into()
-        })
-        .into_extern_result(&engine)
+    let result = engine_info.map(|engine_info| {
+        let snapshot = unsafe { snapshot.clone_as_arc() };
+        Box::new(snapshot.update_table(operation.into(), engine_info, data_change)).into()
+    });
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Creates a builder with a connector-defined `operation` name and connector `engine_info`.
@@ -65,7 +66,7 @@ pub unsafe extern "C" fn new_update_table_txn_builder(
 ///
 /// `snapshot`, `operation`, `engine_info`, and `engine` must be valid and are borrowed for this
 /// call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn new_update_table_txn_builder_with_custom_operation(
     snapshot: Handle<SharedSnapshot>,
     operation: KernelStringSlice,
@@ -77,18 +78,17 @@ pub unsafe extern "C" fn new_update_table_txn_builder_with_custom_operation(
     let operation: KernelResult<String> = unsafe { TryFromStringSlice::try_from_slice(&operation) };
     let engine_info: KernelResult<String> =
         unsafe { TryFromStringSlice::try_from_slice(&engine_info) };
-    operation
-        .and_then(|operation| {
-            let engine_info = engine_info?;
-            let snapshot = unsafe { snapshot.clone_as_arc() };
-            Ok(Box::new(snapshot.update_table(
-                UpdateTableOperation::Custom(operation),
-                engine_info,
-                data_change,
-            ))
-            .into())
-        })
-        .into_extern_result(&engine)
+    let result = operation.and_then(|operation| {
+        let engine_info = engine_info?;
+        let snapshot = unsafe { snapshot.clone_as_arc() };
+        Ok(Box::new(snapshot.update_table(
+            UpdateTableOperation::Custom(operation),
+            engine_info,
+            data_change,
+        ))
+        .into())
+    });
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Builds an update-table transaction with the default filesystem committer.
@@ -99,19 +99,19 @@ pub unsafe extern "C" fn new_update_table_txn_builder_with_custom_operation(
 ///
 /// Both handles must be valid. This call borrows `engine` and unconditionally consumes `builder`,
 /// including on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_builder_build(
     builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveUpdateTableTransaction>> {
     let builder = unsafe { *builder.into_inner() };
     let extern_engine = unsafe { engine.as_ref() };
-    update_table_txn_builder_build_with_committer_impl(
+    let result = update_table_txn_builder_build_with_committer_impl(
         builder,
         extern_engine,
         Box::new(FileSystemCommitter::new()),
-    )
-    .into_extern_result(&extern_engine)
+    );
+    unsafe { result.into_extern_result(&extern_engine) }
 }
 
 /// Builds an update-table transaction with a custom committer.
@@ -123,7 +123,7 @@ pub unsafe extern "C" fn update_table_txn_builder_build(
 /// `builder`, `engine`, and `committer` must be valid handles. This call borrows `engine` and
 /// unconditionally consumes both `builder` and `committer`, including when building returns an
 /// error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_builder_build_with_committer(
     builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
     engine: Handle<SharedExternEngine>,
@@ -132,15 +132,15 @@ pub unsafe extern "C" fn update_table_txn_builder_build_with_committer(
     let builder = unsafe { *builder.into_inner() };
     let engine = unsafe { engine.as_ref() };
     let committer = unsafe { committer.into_inner() };
-    update_table_txn_builder_build_with_committer_impl(builder, engine, committer)
-        .into_extern_result(&engine)
+    let result = update_table_txn_builder_build_with_committer_impl(builder, engine, committer);
+    unsafe { result.into_extern_result(&engine) }
 }
 
 fn update_table_txn_builder_build_with_committer_impl(
     builder: UpdateTableTransactionBuilder,
     extern_engine: &dyn ExternEngine,
     committer: Box<dyn Committer>,
-) -> KernelResult<Handle<ExclusiveUpdateTableTransaction>> {
+) -> Result<Handle<ExclusiveUpdateTableTransaction>> {
     let engine = extern_engine.engine();
     let transaction = builder.build(engine.as_ref(), committer);
     Ok(Box::new(transaction?).into())
@@ -151,11 +151,11 @@ fn update_table_txn_builder_build_with_committer_impl(
 /// # Safety
 ///
 /// `builder` must be a valid handle and is consumed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_update_table_txn_builder(
     builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
 ) {
-    builder.drop_handle();
+    unsafe { builder.drop_handle() }
 }
 
 /// Attaches a correlation identifier to update transaction metric events.
@@ -166,7 +166,7 @@ pub unsafe extern "C" fn free_update_table_txn_builder(
 ///
 /// All handles and `correlation_id` must be valid. This call borrows `engine` and `correlation_id`
 /// and unconditionally consumes `builder`, including on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_builder_with_correlation_id(
     builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
     correlation_id: KernelStringSlice,
@@ -176,9 +176,8 @@ pub unsafe extern "C" fn update_table_txn_builder_with_correlation_id(
     let engine = unsafe { engine.as_ref() };
     let correlation_id: KernelResult<String> =
         unsafe { TryFromStringSlice::try_from_slice(&correlation_id) };
-    correlation_id
-        .map(|id| Box::new(builder.with_correlation_id(id)).into())
-        .into_extern_result(&engine)
+    let result = correlation_id.map(|id| Box::new(builder.with_correlation_id(id)).into());
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Replaces the operation parameters recorded in `commitInfo`.
@@ -191,7 +190,7 @@ pub unsafe extern "C" fn update_table_txn_builder_with_correlation_id(
 ///
 /// All handles and nested map pointers must be valid. This call borrows `engine` and `parameters`
 /// and unconditionally consumes `builder`, including on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_builder_with_operation_parameters(
     builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
     parameters: &FfiNullableStringMap,
@@ -199,15 +198,15 @@ pub unsafe extern "C" fn update_table_txn_builder_with_operation_parameters(
 ) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
     let builder = unsafe { *builder.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    unsafe {
+    let result = unsafe {
         apply_nullable_string_map(
             builder,
             parameters,
             UpdateTableTransactionBuilder::with_operation_parameters,
         )
     }
-    .map(|builder| Box::new(builder).into())
-    .into_extern_result(&engine)
+    .map(|builder| Box::new(builder).into());
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Replaces the operation metrics recorded in `commitInfo` before writes begin.
@@ -220,7 +219,7 @@ pub unsafe extern "C" fn update_table_txn_builder_with_operation_parameters(
 ///
 /// All handles and nested map pointers must be valid. This call borrows `engine` and `metrics`
 /// and unconditionally consumes `builder`, including on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_builder_with_operation_metrics(
     builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
     metrics: &FfiNullableStringMap,
@@ -228,15 +227,15 @@ pub unsafe extern "C" fn update_table_txn_builder_with_operation_metrics(
 ) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
     let builder = unsafe { *builder.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    unsafe {
+    let result = unsafe {
         apply_nullable_string_map(
             builder,
             metrics,
             UpdateTableTransactionBuilder::with_operation_metrics,
         )
     }
-    .map(|builder| Box::new(builder).into())
-    .into_extern_result(&engine)
+    .map(|builder| Box::new(builder).into());
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Supplies one connector-defined `commitInfo` row to the update builder.
@@ -248,7 +247,7 @@ pub unsafe extern "C" fn update_table_txn_builder_with_operation_metrics(
 ///
 /// All handles and `schema` must be valid. This call borrows `engine` and `schema` and
 /// unconditionally consumes both `builder` and `commit_info`, including on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_builder_with_commit_info(
     builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
     commit_info: Handle<ExclusiveEngineData>,
@@ -258,7 +257,7 @@ pub unsafe extern "C" fn update_table_txn_builder_with_commit_info(
     let builder = unsafe { *builder.into_inner() };
     let commit_info = unsafe { commit_info.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    unsafe {
+    let result = unsafe {
         apply_commit_info(
             builder,
             commit_info,
@@ -266,8 +265,8 @@ pub unsafe extern "C" fn update_table_txn_builder_with_commit_info(
             UpdateTableTransactionBuilder::with_commit_info,
         )
     }
-    .map(|builder| Box::new(builder).into())
-    .into_extern_result(&engine)
+    .map(|builder| Box::new(builder).into());
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Adds user-controlled domain metadata to the update builder.
@@ -278,7 +277,7 @@ pub unsafe extern "C" fn update_table_txn_builder_with_commit_info(
 ///
 /// All handles and strings must be valid. This call borrows `engine`, `domain`, and `configuration`
 /// and unconditionally consumes `builder`, including on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_builder_with_domain_metadata(
     builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
     domain: KernelStringSlice,
@@ -294,10 +293,9 @@ pub unsafe extern "C" fn update_table_txn_builder_with_domain_metadata(
             configuration,
             UpdateTableTransactionBuilder::with_domain_metadata,
         )
-    };
-    result
-        .map(|builder| Box::new(builder).into())
-        .into_extern_result(&engine)
+    }
+    .map(|builder| Box::new(builder).into());
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Adds a nullable top-level field described by a single-field engine schema.
@@ -306,7 +304,7 @@ pub unsafe extern "C" fn update_table_txn_builder_with_domain_metadata(
 ///
 /// All handles and `field` must be valid. This call borrows `engine` and `field` and
 /// unconditionally consumes `builder`, including on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_builder_add_column(
     builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
     field: &EngineSchema,
@@ -314,9 +312,8 @@ pub unsafe extern "C" fn update_table_txn_builder_add_column(
 ) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
     let builder = unsafe { *builder.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    decode_single_field(field)
-        .map(|field| Box::new(builder.add_column(field)).into())
-        .into_extern_result(&engine)
+    let result = decode_single_field(field).map(|field| Box::new(builder.add_column(field)).into());
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Adds a nullable field beneath a nested parent path.
@@ -325,7 +322,7 @@ pub unsafe extern "C" fn update_table_txn_builder_add_column(
 ///
 /// All handles and nested pointers must be valid. This call borrows `engine`, `parent`, and `field`
 /// and unconditionally consumes `builder`, including on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_builder_add_column_at(
     builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
     parent: &FfiColumnName,
@@ -335,10 +332,10 @@ pub unsafe extern "C" fn update_table_txn_builder_add_column_at(
     let builder = unsafe { *builder.into_inner() };
     let engine = unsafe { engine.as_ref() };
     let parent = unsafe { parent.try_to_column_name() };
-    parent
+    let result = parent
         .and_then(|parent| decode_single_field(field).map(|field| (parent, field)))
-        .map(|(parent, field)| Box::new(builder.add_column_at(parent, field)).into())
-        .into_extern_result(&engine)
+        .map(|(parent, field)| Box::new(builder.add_column_at(parent, field)).into());
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Changes the field at a possibly nested path from non-nullable to nullable.
@@ -347,7 +344,7 @@ pub unsafe extern "C" fn update_table_txn_builder_add_column_at(
 ///
 /// All handles and nested pointers must be valid. This call borrows `engine` and `column` and
 /// unconditionally consumes `builder`, including on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_builder_set_nullable(
     builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
     column: &FfiColumnName,
@@ -355,9 +352,54 @@ pub unsafe extern "C" fn update_table_txn_builder_set_nullable(
 ) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
     let builder = unsafe { *builder.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    unsafe { column.try_to_column_name() }
-        .map(|column| Box::new(builder.set_nullable(column)).into())
-        .into_extern_result(&engine)
+    let result = unsafe { column.try_to_column_name() }
+        .map(|column| Box::new(builder.set_nullable(column)).into());
+    unsafe { result.into_extern_result(&engine) }
+}
+
+/// Adds or updates requested table properties from a borrowed string map. Repeated calls merge.
+///
+/// Copies keys and values before returning a replacement builder. Returns decoding errors here;
+/// property and final-state validation runs at build.
+///
+/// # Safety
+///
+/// All handles and nested string slices must be valid for this call. Borrows `properties` and
+/// `engine`, and unconditionally consumes `builder`, including on errors.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn update_table_txn_builder_with_table_properties_added(
+    builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
+    properties: &FfiStringMap,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
+    let builder = unsafe { *builder.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    let result = unsafe { properties.try_to_hash_map() }
+        .map(|properties| Box::new(builder.with_table_properties_added(properties)).into());
+    unsafe { result.into_extern_result(&engine) }
+}
+
+/// Adds requested table-property removals from a borrowed string array. Repeated calls accumulate
+/// keys.
+///
+/// Copies keys before returning a replacement builder, or a decoding error. Build rejects Delta
+/// property removals and overlap with additions. An absent ordinary key is a successful no-op.
+///
+/// # Safety
+///
+/// All handles and nested string slices must be valid for this call. Borrows `keys` and `engine`
+/// and unconditionally consumes `builder`, including on errors.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn update_table_txn_builder_with_table_properties_removed(
+    builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
+    keys: FfiStringArray,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveUpdateTableTransactionBuilder>> {
+    let builder = unsafe { *builder.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    let result = unsafe { keys.try_to_strings() }
+        .map(|keys| Box::new(builder.with_table_properties_removed(keys)).into());
+    unsafe { result.into_extern_result(&engine) }
 }
 
 fn decode_single_field(schema: &EngineSchema) -> KernelResult<delta_kernel::schema::StructField> {
@@ -385,7 +427,7 @@ fn decode_single_field(schema: &EngineSchema) -> KernelResult<delta_kernel::sche
 /// `txn` and `engine` must be [valid][Handle#Validity] handles, and `app_id` must be a valid string
 /// slice. This call borrows `engine` and `app_id` for the call and unconditionally consumes `txn`,
 /// including on error. The caller must commit or free the returned handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_with_transaction_id(
     txn: Handle<ExclusiveUpdateTableTransaction>,
     app_id: KernelStringSlice,
@@ -395,9 +437,8 @@ pub unsafe extern "C" fn update_table_txn_with_transaction_id(
     let txn = unsafe { *txn.into_inner() };
     let engine = unsafe { engine.as_ref() };
     let app_id: KernelResult<String> = unsafe { TryFromStringSlice::try_from_slice(&app_id) };
-    app_id
-        .map(|app_id| Box::new(txn.with_transaction_id(app_id, version)).into())
-        .into_extern_result(&engine)
+    let result = app_id.map(|app_id| Box::new(txn.with_transaction_id(app_id, version)).into());
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Replaces operation metrics after writing and before commit.
@@ -409,7 +450,7 @@ pub unsafe extern "C" fn update_table_txn_with_transaction_id(
 ///
 /// All handles and nested map pointers must be valid. This call borrows `engine` and `metrics`
 /// and unconditionally consumes `txn`, including on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_with_operation_metrics(
     txn: Handle<ExclusiveUpdateTableTransaction>,
     metrics: &FfiNullableStringMap,
@@ -417,9 +458,10 @@ pub unsafe extern "C" fn update_table_txn_with_operation_metrics(
 ) -> ExternResult<Handle<ExclusiveUpdateTableTransaction>> {
     let txn = unsafe { *txn.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    unsafe { apply_nullable_string_map(txn, metrics, Transaction::with_operation_metrics) }
-        .map(|txn| Box::new(txn).into())
-        .into_extern_result(&engine)
+    let result =
+        unsafe { apply_nullable_string_map(txn, metrics, Transaction::with_operation_metrics) }
+            .map(|txn| Box::new(txn).into());
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Replaces the connector-defined `commitInfo` row after writing and before commit.
@@ -431,7 +473,7 @@ pub unsafe extern "C" fn update_table_txn_with_operation_metrics(
 ///
 /// All handles and `schema` must be valid. This call borrows `engine` and `schema` and
 /// unconditionally consumes both `txn` and `commit_info`, including on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_with_commit_info(
     txn: Handle<ExclusiveUpdateTableTransaction>,
     commit_info: Handle<ExclusiveEngineData>,
@@ -441,9 +483,10 @@ pub unsafe extern "C" fn update_table_txn_with_commit_info(
     let txn = unsafe { *txn.into_inner() };
     let commit_info = unsafe { commit_info.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    unsafe { apply_commit_info(txn, commit_info, schema, Transaction::with_commit_info) }
-        .map(|txn| Box::new(txn).into())
-        .into_extern_result(&engine)
+    let result =
+        unsafe { apply_commit_info(txn, commit_info, schema, Transaction::with_commit_info) }
+            .map(|txn| Box::new(txn).into());
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Free an existing-table transaction handle without committing.
@@ -451,9 +494,9 @@ pub unsafe extern "C" fn update_table_txn_with_commit_info(
 /// # Safety
 ///
 /// `txn` must be a valid handle and is consumed. Do not use or free it again.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_update_table_txn(txn: Handle<ExclusiveUpdateTableTransaction>) {
-    txn.drop_handle();
+    unsafe { txn.drop_handle() }
 }
 
 /// Operations with stable Delta history names.
@@ -467,6 +510,7 @@ pub enum KernelUpdateTableOperation {
     Update = 4,
     Merge = 5,
     Optimize = 6,
+    Reorg = 7,
 }
 
 impl From<KernelUpdateTableOperation> for UpdateTableOperation {
@@ -479,6 +523,7 @@ impl From<KernelUpdateTableOperation> for UpdateTableOperation {
             KernelUpdateTableOperation::Update => Self::Update,
             KernelUpdateTableOperation::Merge => Self::Merge,
             KernelUpdateTableOperation::Optimize => Self::Optimize,
+            KernelUpdateTableOperation::Reorg => Self::Reorg,
         }
     }
 }
@@ -497,7 +542,7 @@ impl From<KernelUpdateTableOperation> for UpdateTableOperation {
 ///
 /// All handles and strings must be valid. This call borrows `engine`, `domain`, and `configuration`
 /// and unconditionally consumes `txn`, including on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_with_domain_metadata(
     txn: Handle<ExclusiveUpdateTableTransaction>,
     domain: KernelStringSlice,
@@ -506,7 +551,7 @@ pub unsafe extern "C" fn update_table_txn_with_domain_metadata(
 ) -> ExternResult<Handle<ExclusiveUpdateTableTransaction>> {
     let txn = unsafe { *txn.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    unsafe {
+    let result = unsafe {
         apply_domain_metadata(
             txn,
             domain,
@@ -514,8 +559,8 @@ pub unsafe extern "C" fn update_table_txn_with_domain_metadata(
             Transaction::with_domain_metadata,
         )
     }
-    .map(|txn| Box::new(txn).into())
-    .into_extern_result(&engine)
+    .map(|txn| Box::new(txn).into());
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Stages a domain-metadata tombstone that preserves the previous configuration.
@@ -524,7 +569,7 @@ pub unsafe extern "C" fn update_table_txn_with_domain_metadata(
 ///
 /// All handles and `domain` must be valid. This call borrows `engine` and `domain` and
 /// unconditionally consumes `txn`, including on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_with_domain_metadata_removed(
     txn: Handle<ExclusiveUpdateTableTransaction>,
     domain: KernelStringSlice,
@@ -533,9 +578,8 @@ pub unsafe extern "C" fn update_table_txn_with_domain_metadata_removed(
     let txn = unsafe { *txn.into_inner() };
     let engine = unsafe { engine.as_ref() };
     let domain: KernelResult<String> = unsafe { TryFromStringSlice::try_from_slice(&domain) };
-    domain
-        .map(|domain| Box::new(txn.with_domain_metadata_removed(domain)).into())
-        .into_extern_result(&engine)
+    let result = domain.map(|domain| Box::new(txn.with_domain_metadata_removed(domain)).into());
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Adds a domain-metadata removal to the builder.
@@ -544,7 +588,7 @@ pub unsafe extern "C" fn update_table_txn_with_domain_metadata_removed(
 ///
 /// All handles and `domain` must be valid. This call borrows `engine` and `domain` and
 /// unconditionally consumes `builder`, including on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_builder_with_domain_metadata_removed(
     builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
     domain: KernelStringSlice,
@@ -553,9 +597,8 @@ pub unsafe extern "C" fn update_table_txn_builder_with_domain_metadata_removed(
     let builder = unsafe { *builder.into_inner() };
     let engine = unsafe { engine.as_ref() };
     let domain: KernelResult<String> = unsafe { TryFromStringSlice::try_from_slice(&domain) };
-    domain
-        .map(|domain| Box::new(builder.with_domain_metadata_removed(domain)).into())
-        .into_extern_result(&engine)
+    let result = domain.map(|domain| Box::new(builder.with_domain_metadata_removed(domain)).into());
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Set an explicit row-tracking high-water mark for this transaction.
@@ -573,7 +616,7 @@ pub unsafe extern "C" fn update_table_txn_builder_with_domain_metadata_removed(
 ///
 /// Both handles must be valid. This call borrows `engine` and unconditionally consumes `txn`,
 /// including on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_with_row_tracking_high_water_mark(
     txn: Handle<ExclusiveUpdateTableTransaction>,
     high_water_mark: i64,
@@ -581,7 +624,8 @@ pub unsafe extern "C" fn update_table_txn_with_row_tracking_high_water_mark(
 ) -> ExternResult<Handle<ExclusiveUpdateTableTransaction>> {
     let txn = unsafe { txn.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    with_row_tracking_high_water_mark_impl(*txn, high_water_mark).into_extern_result(&engine)
+    let result = with_row_tracking_high_water_mark_impl(*txn, high_water_mark);
+    unsafe { result.into_extern_result(&engine) }
 }
 
 fn with_row_tracking_high_water_mark_impl(
@@ -598,7 +642,7 @@ fn with_row_tracking_high_water_mark_impl(
 /// All handles, `file`, and its nested path slice must be valid. This call borrows `engine` and
 /// `file` and unconditionally consumes `txn`, including on error.
 #[cfg(feature = "adaptive-metadata-in-dev")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_with_root_manifest_file(
     txn: Handle<ExclusiveUpdateTableTransaction>,
     file: &FileMeta,
@@ -606,7 +650,8 @@ pub unsafe extern "C" fn update_table_txn_with_root_manifest_file(
 ) -> ExternResult<Handle<ExclusiveUpdateTableTransaction>> {
     let txn = unsafe { txn.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    with_root_manifest_file_impl(*txn, file).into_extern_result(&engine)
+    let result = with_root_manifest_file_impl(*txn, file);
+    unsafe { result.into_extern_result(&engine) }
 }
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -635,7 +680,7 @@ fn with_root_manifest_file_impl(
 /// # Safety
 ///
 /// Both handles must be valid. This call mutably borrows `txn` and consumes `write_metadata`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_add_files(
     mut txn: Handle<ExclusiveUpdateTableTransaction>,
     write_metadata: Handle<ExclusiveEngineData>,
@@ -659,7 +704,7 @@ pub unsafe extern "C" fn update_table_txn_add_files(
 /// All handles must be valid. This call mutably borrows `txn`, borrows `engine` and the selection
 /// vector, and unconditionally consumes `data`, including on error. When `selection_vector` is
 /// non-null and `selection_vector_len` is nonzero, it must address that many readable bytes.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_remove_files(
     mut txn: Handle<ExclusiveUpdateTableTransaction>,
     data: Handle<ExclusiveEngineData>,
@@ -681,7 +726,7 @@ pub unsafe extern "C" fn update_table_txn_remove_files(
         txn.remove_files(filtered);
         Ok(true)
     })();
-    result.into_extern_result(&engine)
+    unsafe { result.into_extern_result(&engine) }
 }
 
 /// Marks the update as a blind append assertion.
@@ -689,7 +734,7 @@ pub unsafe extern "C" fn update_table_txn_remove_files(
 /// # Safety
 ///
 /// `builder` must be valid and is consumed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_builder_with_blind_append(
     builder: Handle<ExclusiveUpdateTableTransactionBuilder>,
 ) -> Handle<ExclusiveUpdateTableTransactionBuilder> {
@@ -708,7 +753,7 @@ pub unsafe extern "C" fn update_table_txn_builder_with_blind_append(
 ///
 /// Both handles must be valid. This call borrows `engine` and unconditionally consumes `txn`,
 /// including on error. Do not use or free `txn` afterward.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn update_table_txn_commit(
     txn: Handle<ExclusiveUpdateTableTransaction>,
     engine: Handle<SharedExternEngine>,
@@ -716,6 +761,6 @@ pub unsafe extern "C" fn update_table_txn_commit(
     let txn = unsafe { txn.into_inner() };
     let extern_engine = unsafe { engine.as_ref() };
     let engine = extern_engine.engine();
-    commit_result_to_committed_handle(txn.commit(engine.as_ref()))
-        .into_extern_result(&extern_engine)
+    let result = commit_result_to_committed_handle(txn.commit(engine.as_ref()));
+    unsafe { result.into_extern_result(&extern_engine) }
 }

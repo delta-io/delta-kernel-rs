@@ -39,9 +39,9 @@ pub use filesystem::FileSystemCommitter;
 pub use publish_types::{CatalogCommit, PublishMetadata};
 
 #[cfg(feature = "declarative-plans")]
-use crate::plans::{RelationRef, ScopedPlanExecutor};
-#[cfg(feature = "declarative-plans")]
 use crate::KernelError;
+#[cfg(feature = "declarative-plans")]
+use crate::plans::{RelationRef, ScopedPlanExecutor};
 use crate::{Engine, FilteredEngineData, KernelResult, KernelResultIterator};
 
 /// A Committer is the system by which transactions are committed to a table. Transactions are
@@ -117,6 +117,9 @@ pub trait Committer: Send {
     /// - This method must ensure that all catalog commits are published to the Delta log up to and
     ///   including the snapshot version specified in [`PublishMetadata`]
     /// - Commits must be published in order: version V-1 must be published before version V
+    /// - Publishing the same commits again must be safe, including after a successful call.
+    /// - On success, published files must be visible to the supplied engine's
+    ///   [`StorageHandler::head`](crate::StorageHandler::head).
     ///
     /// # Catalog-specific semantics
     ///

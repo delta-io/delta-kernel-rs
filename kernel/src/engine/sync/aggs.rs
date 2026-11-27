@@ -7,7 +7,7 @@ use std::sync::Arc;
 use itertools::Itertools;
 
 use super::plan::encode_keys_as_rows;
-use crate::arrow::array::{new_null_array, Array, ArrayRef, Int64Array, RecordBatch};
+use crate::arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, new_null_array};
 use crate::arrow::compute::interleave;
 use crate::arrow::datatypes::DataType as ArrowDataType;
 use crate::arrow::row::OwnedRow;
@@ -38,8 +38,9 @@ trait BoundAggregate {
 }
 
 /// Evaluates an [`Aggregate`].
-/// Currently supports Min, Max, Sum, Count, CountStar, MinNonNullBy, and MaxNonNullBy. Comparison
-/// and arithmetic operands are LONG-only; Count accepts an arbitrary column or `COUNT(*)`.
+/// `MIN`, `MAX`, and `SUM` require LONG operands. `MIN_NON_NULL_BY` and `MAX_NON_NULL_BY`
+/// require LONG keys, but accept any value and sentinel type. `COUNT` and `FIRST_NON_NULL`
+/// accept any operand type, including structs.
 pub(super) fn eval_aggregate(
     aggregate: &Aggregate,
     input: &[RecordBatch],
@@ -119,8 +120,64 @@ fn bind_aggregate(agg: &Agg, output_type: &DataType) -> KernelResult<Box<dyn Bou
         Agg::Sum(value) => LongAccumulatorAgg::try_new(value, output_type, LongAccumulator::Sum),
         Agg::Count(value) => CountAgg::try_new(Some(value), output_type),
         Agg::CountStar => CountAgg::try_new(None, output_type),
+        Agg::FirstNonNull(column) => Ok(Box::new(FirstNonNullAgg::try_new(column, output_type)?)),
         Agg::MinNonNullBy(ops) => NonNullByAgg::try_new(ops, output_type, Comparison::Min),
         Agg::MaxNonNullBy(ops) => NonNullByAgg::try_new(ops, output_type, Comparison::Max),
+    }
+}
+
+struct FirstNonNullAgg {
+    column: ColumnName,
+    output_type: ArrowDataType,
+}
+
+impl FirstNonNullAgg {
+    fn try_new(column: &ColumnName, output_type: &DataType) -> KernelResult<Self> {
+        Ok(Self {
+            column: column.clone(),
+            output_type: output_type.try_into_arrow()?,
+        })
+    }
+}
+
+struct FirstNonNullState(Option<InputRow>);
+
+impl BoundAggregate for FirstNonNullAgg {
+    fn init_state(&self) -> Box<dyn Any> {
+        Box::new(FirstNonNullState(None))
+    }
+
+    fn prepare<'a>(&'a self, batch: &'a RecordBatch) -> KernelResult<Box<dyn AggUpdater + 'a>> {
+        Ok(Box::new(FirstNonNullUpdater(extract_column(
+            batch,
+            &self.column,
+        )?)))
+    }
+
+    fn finalize(&self, states: &[&dyn Any], input: &[RecordBatch]) -> KernelResult<ArrayRef> {
+        let mut arrays = extract_column_values(input, &self.column)?;
+        arrays.push(new_null_array(&self.output_type, 1));
+        let null_row = (input.len(), 0);
+        let rows: Vec<_> = states
+            .iter()
+            .map(|state| -> KernelResult<_> {
+                let state = downcast_state::<FirstNonNullState>(*state)?;
+                Ok(state.0.unwrap_or(null_row))
+            })
+            .try_collect()?;
+        interleave_column_values(&arrays, &rows)
+    }
+}
+
+struct FirstNonNullUpdater(ArrayRef);
+
+impl AggUpdater for FirstNonNullUpdater {
+    fn update(&self, state: &mut dyn Any, row: InputRow) -> KernelResult<()> {
+        let state = downcast_state_mut::<FirstNonNullState>(state)?;
+        if state.0.is_none() && self.0.is_valid(row.1) {
+            state.0 = Some(row);
+        }
+        Ok(())
     }
 }
 
@@ -178,7 +235,7 @@ impl BoundAggregate for LongAccumulatorAgg {
 
     fn prepare<'a>(&'a self, batch: &'a RecordBatch) -> KernelResult<Box<dyn AggUpdater + 'a>> {
         Ok(Box::new(LongAccumulatorUpdater {
-            values: extract_long_column(batch, &self.value)?,
+            values: super::extract_long_column(batch, &self.value)?,
             op: self.op,
         }))
     }
@@ -311,7 +368,7 @@ impl BoundAggregate for NonNullByAgg {
     fn prepare<'a>(&'a self, batch: &'a RecordBatch) -> KernelResult<Box<dyn AggUpdater + 'a>> {
         Ok(Box::new(NonNullByUpdater {
             null_sentinels: extract_column_ref(batch, &self.null_sentinel)?,
-            keys: extract_long_column(batch, &self.key)?,
+            keys: super::extract_long_column(batch, &self.key)?,
             comparison: self.comparison,
         }))
     }
@@ -354,18 +411,6 @@ impl AggUpdater for NonNullByUpdater<'_> {
     }
 }
 
-fn extract_long_column<'a>(
-    batch: &'a RecordBatch,
-    name: &ColumnName,
-) -> KernelResult<&'a Int64Array> {
-    let array = extract_column_ref(batch, name)?;
-    array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-        KernelError::unsupported(format!(
-            "SyncPlanExecutor aggregate operand `{name}` has non-LONG type"
-        ))
-    })
-}
-
 fn downcast_state<T: 'static>(state: &dyn Any) -> KernelResult<&T> {
     state.downcast_ref().ok_or_else(|| {
         KernelError::generic(format!(
@@ -386,26 +431,161 @@ fn downcast_state_mut<T: 'static>(state: &mut dyn Any) -> KernelResult<&mut T> {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+    use test_utils::{assert_batches_sorted_eq, sort_lines};
+
     use super::*;
     use crate::arrow::array::{BooleanArray, StringArray, StructArray};
+    use crate::arrow::buffer::NullBuffer;
     use crate::arrow::datatypes::Field;
-    use crate::arrow::util::pretty::pretty_format_batches;
     use crate::expressions::column_name;
     use crate::schema::schema_ref;
 
-    /// Asserts `batches` pretty-print equal to `expected`, sorting data rows so HashMap group order
-    /// does not matter. `expected` is the full pretty table (header, body, footer).
-    fn assert_batches_eq(batches: &[RecordBatch], expected: &str) {
-        let formatted = pretty_format_batches(batches).unwrap().to_string();
-        let sort_body = |s: &str| -> String {
-            let mut lines: Vec<_> = s.trim().lines().map(str::to_string).collect();
-            let len = lines.len();
-            if len > 3 {
-                lines[2..len - 1].sort_unstable();
-            }
-            lines.join("\n")
+    #[rstest]
+    #[case(vec![], None)]
+    #[case(vec![None, None], None)]
+    #[case(vec![None, Some("first"), Some("later")], Some("first"))]
+    fn first_non_null_scalar(
+        #[case] values: Vec<Option<&str>>,
+        #[case] expected: Option<&str>,
+    ) -> KernelResult<()> {
+        let input = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(StringArray::from(values)) as ArrayRef,
+        )])?;
+        let aggregate = Aggregate::ungrouped(schema_ref! { nullable "value": STRING })
+            .first_non_null(column_name!("value"))
+            .build()?;
+        assert!(
+            aggregate
+                .schema
+                .field_at(&column_name!("value"))?
+                .is_nullable()
+        );
+        let output = eval_aggregate(&aggregate, &[input])?;
+        let values = output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(values.iter().collect::<Vec<_>>(), [expected]);
+        Ok(())
+    }
+
+    // Test that first_non_null works on structs (and preserves nested child fields' nullability).
+    //
+    // Input:
+    //     - batch 1: [NULL struct] (child buffers contain "hidden" value)
+    //     - batch 2: [{path: NULL or "missing-size", size: NULL}, {path: "later", size: 10}]
+    // Expected Output:
+    //     - [{path: NULL or "missing-size", size: NULL}]
+    #[rstest]
+    fn first_non_null_on_struct_field(
+        #[values(false, true)] all_children_null: bool,
+    ) -> KernelResult<()> {
+        let fields: crate::arrow::datatypes::Fields = vec![
+            Arc::new(Field::new("path", ArrowDataType::Utf8, true)),
+            Arc::new(Field::new("size", ArrowDataType::Int64, true)),
+        ]
+        .into();
+        let make_batch =
+            |paths: Vec<Option<&str>>, sizes: Vec<Option<i64>>, validity: Vec<bool>| {
+                let sample = StructArray::new(
+                    fields.clone(),
+                    vec![
+                        Arc::new(StringArray::from(paths)),
+                        Arc::new(Int64Array::from(sizes)),
+                    ],
+                    Some(NullBuffer::from(validity)),
+                );
+                RecordBatch::try_from_iter([("sample", Arc::new(sample) as ArrayRef)])
+            };
+        let aggregate = Aggregate::ungrouped(schema_ref! {
+            nullable "sample": { nullable "path": STRING, nullable "size": LONG },
+        })
+        .first_non_null(column_name!("sample"))
+        .build()?;
+        let output = {
+            let inputs = vec![
+                make_batch(vec![Some("hidden")], vec![Some(100)], vec![false])?,
+                make_batch(
+                    vec![
+                        if all_children_null {
+                            None
+                        } else {
+                            Some("missing-size")
+                        },
+                        Some("later"),
+                    ],
+                    vec![None, Some(10)],
+                    vec![true, true],
+                )?,
+            ];
+            eval_aggregate(&aggregate, &inputs)?
         };
-        assert_eq!(sort_body(&formatted), sort_body(expected));
+        let expected = if all_children_null {
+            "\
++------------------+
+| sample           |
++------------------+
+| {path: , size: } |
++------------------+"
+        } else {
+            "\
++------------------------------+
+| sample                       |
++------------------------------+
+| {path: missing-size, size: } |
++------------------------------+"
+        };
+        assert_batches_eq(&output, expected);
+        Ok(())
+    }
+
+    // Test that first_non_null keeps separate group states across batches.
+    //
+    // Input:
+    //     - batch 1: [(a, NULL), (b, NULL)]
+    //     - batch 2: [(a, NULL), (b, "later")]
+    // Expected Output:
+    //     - [(a, NULL), (b, "later")]
+    #[test]
+    fn grouped_first_non_null_selects_across_batches() -> KernelResult<()> {
+        let batch = |groups: Vec<&str>, values: Vec<Option<&str>>| {
+            RecordBatch::try_from_iter([
+                ("group", Arc::new(StringArray::from(groups)) as ArrayRef),
+                ("value", Arc::new(StringArray::from(values)) as ArrayRef),
+            ])
+        };
+        let input = [
+            batch(vec!["a", "b"], vec![None, None])?,
+            batch(vec!["a", "b"], vec![None, Some("later")])?,
+        ];
+        let aggregate = Aggregate::group_by(
+            schema_ref! { not_null "group": STRING, nullable "value": STRING },
+            [column_name!("group")],
+        )
+        .first_non_null(column_name!("value"))
+        .build()?;
+
+        assert_batches_eq(
+            &eval_aggregate(&aggregate, &input)?,
+            "\
++-------+-------+
+| group | value |
++-------+-------+
+| a     |       |
+| b     | later |
++-------+-------+",
+        );
+        Ok(())
+    }
+
+    /// Checks a table-formatted expectation without depending on HashMap group order.
+    fn assert_batches_eq(batches: &[RecordBatch], expected: &str) {
+        let mut expected_lines: Vec<_> = expected.trim().lines().collect();
+        sort_lines!(expected_lines);
+        assert_batches_sorted_eq!(expected_lines, batches);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 use url::Url;
 
-use super::Crc;
+use super::{Crc, FileStatsState};
 use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
 use crate::utils::require;
 use crate::{Engine, KernelError, KernelResult};
@@ -10,7 +10,8 @@ use crate::{Engine, KernelError, KernelResult};
 /// Serialize and write a CRC file to storage.
 ///
 /// Serializes the [`Crc`] to JSON via serde and writes the raw bytes using the storage
-/// handler. Returns [`KernelError::ChecksumWriteUnsupported`] if:
+/// handler. Returns the serialized byte count on success. Returns
+/// [`KernelError::ChecksumWriteUnsupported`] if:
 /// - `file_stats_state` is not `Complete` (only `Complete` CRCs have a well-defined on-disk
 ///   representation); or
 /// - `delta.enableInCommitTimestamps` is `true` but `inCommitTimestampOpt` is absent.
@@ -18,13 +19,16 @@ use crate::{Engine, KernelError, KernelResult};
 /// Per the Delta protocol, writers MUST NOT overwrite existing CRC files, so this always
 /// writes with `overwrite = false`. If the file already exists, returns
 /// `Err(KernelError::FileAlreadyExists)`.
-pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> KernelResult<()> {
+pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> KernelResult<u64> {
     require!(
         crc.file_stats_state.is_complete(),
-        KernelError::ChecksumWriteUnsupported(format!(
-            "Cannot write CRC file with {:?} file stats",
-            crc.file_stats_state
-        ))
+        KernelError::ChecksumWriteUnsupported(match &crc.file_stats_state {
+            FileStatsState::Indeterminate {
+                unsupported_operation: Some(operation),
+            } =>
+                format!("Cannot write CRC file incrementally: unsupported operation {operation:?}"),
+            _ => "Cannot write CRC file with Indeterminate file stats".to_string(),
+        })
     );
     // If ICT is enabled, the CRC must carry an ICT value.
     let ict_enabled = crc
@@ -41,15 +45,16 @@ pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> 
         )
     );
     let data = serde_json::to_vec(crc)?;
+    let bytes_written = data.len() as u64;
     engine
         .storage_handler()
-        .put(path, data.into(), false /* overwrite */)
+        .put(path, data.into(), false /* overwrite */)?;
+    Ok(bytes_written)
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Arc;
 
     use rstest::rstest;
 
@@ -60,12 +65,11 @@ mod tests {
         DomainMetadataState, FileSizeHistogram, FileStats, FileStatsState, SetTransactionState,
     };
     use crate::engine::sync::SyncEngine;
-    use crate::object_store::memory::InMemory;
     use crate::path::{AsUrl, ParsedLogPath};
     use crate::table_features::TableFeature;
 
     fn writer_test_env(version: u64) -> (SyncEngine, ParsedLogPath) {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let table_root = Url::parse("memory:///test_table/").unwrap();
         let crc_path = ParsedLogPath::create_parsed_crc(&table_root, version);
         (engine, crc_path)
@@ -236,15 +240,25 @@ mod tests {
         assert!(matches!(result, Err(KernelError::FileAlreadyExists(_))));
     }
 
-    #[test]
-    fn test_write_rejects_indeterminate_file_stats_with_checksum_write_unsupported() {
+    #[rstest]
+    fn test_write_rejects_indeterminate_file_stats_with_checksum_write_unsupported(
+        #[values(None, Some("UNKNOWN"))] unsupported_operation: Option<&str>,
+    ) {
         let (engine, crc_path) = writer_test_env(0);
         let mut crc = test_crc(/* ict_supported */ true, /* ict_enabled */ true);
-        crc.file_stats_state = FileStatsState::Indeterminate;
+        crc.file_stats_state = FileStatsState::Indeterminate {
+            unsupported_operation: unsupported_operation.map(str::to_owned),
+        };
         let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc);
+        let expected = match unsupported_operation {
+            Some(operation) => {
+                format!("Cannot write CRC file incrementally: unsupported operation {operation:?}")
+            }
+            None => "Cannot write CRC file with Indeterminate file stats".to_string(),
+        };
         assert!(matches!(
             result,
-            Err(KernelError::ChecksumWriteUnsupported(_))
+            Err(KernelError::ChecksumWriteUnsupported(message)) if message == expected
         ));
     }
 

@@ -4,11 +4,15 @@ mod append;
 mod cdf;
 #[cfg(feature = "check-constraints-in-dev")]
 mod check_constraints;
+mod checkpoint_protection;
 mod clustered;
 mod column_defaults;
 mod column_mapping;
 mod commit_info;
 mod domain_metadata;
+#[cfg(feature = "arrow-60")]
+mod file;
+mod generated_columns;
 mod ict;
 mod interval;
 mod nested_field_ids;

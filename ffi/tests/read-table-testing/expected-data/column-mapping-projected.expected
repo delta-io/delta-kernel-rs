@@ -1,32 +1,12 @@
-Reading table at ../../../../acceptance/tests/dat/out/reader_tests/generated/column_mapping/delta/
+Reading table at ../../../../acceptance/workloads/column_mapping_rename_column/delta/
 version: 3
 
 Schema:
-├─ letter: string (column mapping id: 1)
-├─ new_int: long (column mapping id: 2)
-└─ date: date (column mapping id: 3)
+├─ id: integer (column mapping id: 1)
+└─ new_name: string (column mapping id: 2)
 
-letter:  [
-  "a",
-  "b",
-  "a",
-  "a",
-  "a",
-  "a",
-  "b",
-  "a",
-  "a",
-  "a"
-]
-new_int:  [
-  25,
-  228,
-  692,
-  604,
-  95,
-  25,
-  228,
-  692,
-  604,
-  95
+new_name:  [
+  "charlie",
+  "alice",
+  "bob"
 ]

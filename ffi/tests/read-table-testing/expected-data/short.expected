@@ -1,0 +1,11 @@
+Reading table at ../../../../acceptance/workloads/reads_short_boundaries/delta/
+version: 1
+
+Schema:
+└─ s: short
+
+s:  [
+  -32768,
+  0,
+  32767
+]

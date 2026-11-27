@@ -2,9 +2,12 @@ spec_version: 1
 name: architecture-reviewer
 description: 'Reviews the SHAPE of a change: abstractions, API surface, bloat.'
 skills: none
+tool_groups:
+  projects: false
 executor:
   type: omnigent
   model: default
+  reasoning_effort: medium
   config:
     harness: claude-sdk
 instructions: REVIEW.md

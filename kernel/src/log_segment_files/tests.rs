@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use rstest::rstest;
@@ -6,11 +5,10 @@ use url::Url;
 
 use super::*;
 use crate::engine::sync::SyncEngine;
-use crate::engine::test_delegating::DelegatingEngine;
-use crate::engine::CancellableEngine;
+use crate::engine::{CancellableEngine, DelegatingEngine, RelaxedCounter};
+use crate::object_store::ObjectStoreExt as _;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path as ObjectPath;
-use crate::object_store::ObjectStoreExt as _;
 use crate::path::tests::multipart_checkpoint_name;
 use crate::unit_test_utils::TestCancellationToken;
 use crate::{Engine as _, FileMeta, KernelResultIterator, StorageHandler};
@@ -143,35 +141,39 @@ fn assert_source(commit: &ParsedLogPath, expected_source: CommitSource) {
 /// and that listing terminates without consuming files past the version-named region.
 struct CountingStorageHandler {
     inner: Arc<dyn StorageHandler>,
-    list_from_count: AtomicU32,
-    items_listed: Arc<AtomicU32>,
+    list_from_count: RelaxedCounter,
+    items_listed: Arc<RelaxedCounter>,
 }
 
 impl CountingStorageHandler {
     fn new(inner: Arc<dyn StorageHandler>) -> Self {
         Self {
             inner,
-            list_from_count: AtomicU32::new(0),
-            items_listed: Arc::new(AtomicU32::new(0)),
+            list_from_count: RelaxedCounter::default(),
+            items_listed: Arc::new(RelaxedCounter::default()),
         }
     }
 
-    fn call_count(&self) -> u32 {
-        self.list_from_count.load(Ordering::Relaxed)
+    fn call_count(&self) -> u64 {
+        self.list_from_count.get()
     }
 
-    fn items_listed(&self) -> u32 {
-        self.items_listed.load(Ordering::Relaxed)
+    fn items_listed(&self) -> u64 {
+        self.items_listed.get()
     }
 }
 
 impl StorageHandler for CountingStorageHandler {
-    fn list_from(&self, path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
-        self.list_from_count.fetch_add(1, Ordering::Relaxed);
+    fn list_from(
+        &self,
+        path: &Url,
+        end: Option<&Url>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+        self.list_from_count.inc();
         let items_listed = self.items_listed.clone();
-        let iter = self.inner.list_from(path)?;
+        let iter = self.inner.list_from(path, end)?;
         Ok(Box::new(iter.inspect(move |_| {
-            items_listed.fetch_add(1, Ordering::Relaxed);
+            items_listed.inc();
         })))
     }
 
@@ -357,7 +359,11 @@ fn test_log_tail_covers_entire_range_empty_filesystem() {
     // have nothing — e.g. a purely catalog-managed table.
     struct EmptyStorageHandler;
     impl StorageHandler for EmptyStorageHandler {
-        fn list_from(&self, _path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+        fn list_from(
+            &self,
+            _path: &Url,
+            _end: Option<&Url>,
+        ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
             Ok(Box::new(std::iter::empty()))
         }
         fn read_files(
@@ -478,8 +484,7 @@ async fn test_listing_stops_at_first_staged_commit_without_consuming_the_rest() 
         (1, LogPathFileType::Commit, CommitSource::Filesystem),
         (2, LogPathFileType::Commit, CommitSource::Filesystem),
     ];
-    // Staged commits sort after every version-named file ('_' > '9'), so a sorted listing
-    // reaches them only after all relevant files. None should be consumed beyond the first.
+    // `_staged_commits/` sorts after `':'`, so unbounded listing never yields those files.
     log_files
         .extend((0..100).map(|v| (v, LogPathFileType::StagedCommit, CommitSource::Filesystem)));
 
@@ -492,14 +497,11 @@ async fn test_listing_stops_at_first_staged_commit_without_consuming_the_rest() 
     assert_eq!(commits.len(), 3);
     assert_eq!(latest_commit.unwrap().version, 2);
     assert_eq!(max_pub, Some(2));
-    // 3 commits plus the single staged commit that stops the listing
-    assert_eq!(storage.items_listed(), 4);
+    assert_eq!(storage.items_listed(), 3);
 }
 
-// Any path past the version-named region stops the listing, not just `_staged_commits/`:
-// checkpoint sidecars under `_sidecars/` and non-underscore names whose first byte sorts
-// past '9' (e.g. 'Z'). Both sentinels sort before `_staged_commits/`, so no staged commit
-// is ever consumed.
+// Paths past the version-named region (`_sidecars/`, `'Z'`, …) sort after `':'`, so unbounded
+// listing never yields them. Both also sort before `_staged_commits/`.
 #[rstest]
 #[case::sidecar("_delta_log/_sidecars/016ae953-37a9-438e-8683-9a9a4a79a395.parquet")]
 #[case::non_underscore_sentinel("_delta_log/Zsentinel")]
@@ -521,14 +523,12 @@ async fn test_listing_stops_at_first_non_version_named_path(#[case] sentinel_pat
     assert_eq!(commits.len(), 3);
     assert_eq!(latest_commit.unwrap().version, 2);
     assert_eq!(max_pub, Some(2));
-    // 3 commits plus the sentinel that stops the listing
-    assert_eq!(storage.items_listed(), 4);
+    assert_eq!(storage.items_listed(), 3);
 }
 
 #[tokio::test]
 async fn test_listing_stops_at_last_checkpoint_marker() {
-    // In a real table `_last_checkpoint` sorts before `_staged_commits/` ('_la' < '_st'), so
-    // it is the path that stops the listing.
+    // `_last_checkpoint` sorts after `':'` and before `_staged_commits/` (`_la` < `_st`).
     let mut log_files = vec![
         (0, LogPathFileType::Commit, CommitSource::Filesystem),
         (1, LogPathFileType::Commit, CommitSource::Filesystem),
@@ -556,9 +556,32 @@ async fn test_listing_stops_at_last_checkpoint_marker() {
     assert_eq!(latest_crc.unwrap().version, 2);
     assert_eq!(latest_commit.unwrap().version, 2);
     assert_eq!(max_pub, Some(2));
-    // 5 version-named files plus the `_last_checkpoint` that stops the listing; no staged
-    // commit is ever consumed
-    assert_eq!(storage.items_listed(), 6);
+    // 3 commits + checkpoint + crc; `_last_checkpoint` and staged commits are past `':'`
+    assert_eq!(storage.items_listed(), 5);
+}
+
+#[tokio::test]
+async fn test_listing_with_end_version_does_not_consume_later_commits() {
+    let log_files = vec![
+        (0, LogPathFileType::Commit, CommitSource::Filesystem),
+        (1, LogPathFileType::Commit, CommitSource::Filesystem),
+        (2, LogPathFileType::Commit, CommitSource::Filesystem),
+        (3, LogPathFileType::Commit, CommitSource::Filesystem),
+        (4, LogPathFileType::Commit, CommitSource::Filesystem),
+    ];
+
+    let (storage, log_root) = create_storage(log_files).await;
+    let storage = CountingStorageHandler::new(storage);
+
+    let (commits, _, _, _, latest_commit, max_pub) =
+        list_and_destructure(&storage, &log_root, vec![], None, Some(2));
+
+    assert_eq!(commits.len(), 3);
+    assert_eq!(commits[2].version, 2);
+    assert_eq!(latest_commit.unwrap().version, 2);
+    assert_eq!(max_pub, Some(2));
+    // versions 0-2 only; later commits are past `{end+1:020}`
+    assert_eq!(storage.items_listed(), 3);
 }
 
 #[tokio::test]
@@ -669,7 +692,7 @@ async fn backward_scan_single_checkpoint_cases(
     #[case] checkpoint_version: Option<u64>,
     #[case] expected_commits: impl Iterator<Item = u64>,
     #[case] expected_checkpoint: Option<u64>,
-    #[case] expected_listings: u32,
+    #[case] expected_listings: u64,
 ) {
     let mut log_files: Vec<(Version, LogPathFileType, CommitSource)> = (0u64..=1005)
         .map(|v| (v, LogPathFileType::Commit, CommitSource::Filesystem))
@@ -700,11 +723,13 @@ async fn backward_scan_single_checkpoint_cases(
         assert_eq!(result.checkpoint_parts[0].version, cp_version);
     }
 
-    assert!(result
-        .ascending_commit_files
-        .iter()
-        .map(|f| f.version)
-        .eq(expected_commits));
+    assert!(
+        result
+            .ascending_commit_files
+            .iter()
+            .map(|f| f.version)
+            .eq(expected_commits)
+    );
 }
 
 /// end_version=3000. Window 2 contains an incomplete 2-of-2 multipart checkpoint (only
@@ -716,8 +741,8 @@ async fn backward_scan_single_checkpoint_cases(
 /// Window 1 [2001, 3001): commits v2001..=v3000, no checkpoint -> continue
 /// Window 2 [1001, 2001): commits v1001..=v2000, v1500 (1-of-2 parts) incomplete -> continue
 /// Window 3 [1, 1001):    commits v1..=v1000, v500 (complete) -> checkpoint found -> break
-fn files_incomplete_in_second_window_complete_in_third_window(
-) -> Vec<(Version, LogPathFileType, CommitSource)> {
+fn files_incomplete_in_second_window_complete_in_third_window()
+-> Vec<(Version, LogPathFileType, CommitSource)> {
     let mut log_files: Vec<(Version, LogPathFileType, CommitSource)> = (0u64..=3000)
         .map(|v| (v, LogPathFileType::Commit, CommitSource::Filesystem))
         .collect();
@@ -772,7 +797,7 @@ fn multipart_checkpoint_files() -> Vec<(Version, LogPathFileType, CommitSource)>
 }
 
 struct BackwardScanExpected {
-    listings: u32,
+    listings: u64,
     checkpoint_parts: usize,
     checkpoint_version: Version,
     commit_count: usize,
@@ -820,10 +845,12 @@ async fn backward_scan_multipart_checkpoint_cases(
 
     assert_eq!(counter.call_count(), expected_listings);
     assert_eq!(result.checkpoint_parts.len(), expected_checkpoint_parts);
-    assert!(result
-        .checkpoint_parts
-        .iter()
-        .all(|p| p.version == expected_checkpoint_version));
+    assert!(
+        result
+            .checkpoint_parts
+            .iter()
+            .all(|p| p.version == expected_checkpoint_version)
+    );
     assert_eq!(result.ascending_commit_files.len(), expected_commit_count);
     assert_eq!(
         result.ascending_commit_files.first().unwrap().version,
@@ -1771,15 +1798,19 @@ fn find_complete_checkpoint_version_same_version_cases(
 struct FiniteListingHandler {
     log_root: Url,
     count: usize,
-    items_pulled: Arc<AtomicU32>,
+    items_pulled: Arc<RelaxedCounter>,
 }
 
 impl StorageHandler for FiniteListingHandler {
-    fn list_from(&self, _path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+    fn list_from(
+        &self,
+        _path: &Url,
+        _end: Option<&Url>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
         let log_root = self.log_root.clone();
         let pulled = self.items_pulled.clone();
         let iter = (0..self.count as u64).map(move |version| {
-            pulled.fetch_add(1, Ordering::Relaxed);
+            pulled.inc();
             Ok(FileMeta::new(
                 log_root.join(&format!("{version:020}.json"))?,
                 version as i64,
@@ -1815,9 +1846,9 @@ impl StorageHandler for FiniteListingHandler {
 
 // Builds a `FiniteListingHandler` over `memory:///_delta_log/` yielding `count` paths, returning
 // the log root and the shared pull counter alongside it.
-fn finite_listing_handler(count: usize) -> (Url, Arc<AtomicU32>, FiniteListingHandler) {
+fn finite_listing_handler(count: usize) -> (Url, Arc<RelaxedCounter>, FiniteListingHandler) {
     let log_root = Url::parse("memory:///_delta_log/").unwrap();
-    let pulled = Arc::new(AtomicU32::new(0));
+    let pulled = Arc::new(RelaxedCounter::default());
     let storage = FiniteListingHandler {
         log_root: log_root.clone(),
         count,
@@ -1842,7 +1873,7 @@ fn precancelled_token_stops_listing_before_any_storage_call() {
         Version::MAX,
     );
     assert!(matches!(result, Err(KernelError::Cancelled)));
-    assert_eq!(pulled.load(Ordering::Relaxed), 0);
+    assert_eq!(pulled.get(), 0);
 }
 
 // The default `list_from_with_cancellation` adapter surfaces cancellation through the log-file
@@ -1866,7 +1897,28 @@ fn mid_listing_cancellation_yields_terminal_error_not_silent_truncation() {
 
     assert!(matches!(iter.next(), Some(Err(KernelError::Cancelled))));
     // The listing stopped early rather than draining all 100 entries.
-    assert!(pulled.load(Ordering::Relaxed) < 100);
+    assert!(pulled.get() < 100);
+}
+
+#[rstest]
+#[case::unbounded(Version::MAX, "memory:///_delta_log/:", "9", "_")]
+#[case::finite(
+    2,
+    "memory:///_delta_log/00000000000000000003",
+    "00000000000000000002.json",
+    "00000000000000000003.json"
+)]
+fn delta_log_listing_end_is_exclusive_url(
+    #[case] end_version: Version,
+    #[case] expected: &str,
+    #[case] before: &str,
+    #[case] after: &str,
+) {
+    let log_root = Url::parse("memory:///_delta_log/").unwrap();
+    let end = super::delta_log_listing_end(&log_root, end_version).unwrap();
+    assert_eq!(end.as_str(), expected);
+    assert!(log_root.join(before).unwrap().as_str() < end.as_str());
+    assert!(end.as_str() < log_root.join(after).unwrap().as_str());
 }
 
 // With no token the listing is unchanged, so cancellation support is strictly opt-in.

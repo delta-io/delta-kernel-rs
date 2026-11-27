@@ -2,13 +2,17 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use derive_more::Constructor;
-use futures::StreamExt as _;
+use futures::future::ready;
+use futures::{StreamExt as _, TryStreamExt as _};
 use url::Url;
 
 use super::{put_bytes, resolve_scope};
 use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
-use crate::{FileMeta, FileSlice, KernelError, KernelResult, KernelResultIterator, StorageHandler};
+use crate::{
+    FileMeta, FileSlice, KernelError, KernelResult, KernelResultIterator, StorageHandler,
+    keep_listing,
+};
 
 #[derive(Constructor)]
 pub(crate) struct SyncStorageHandler {
@@ -29,13 +33,17 @@ impl SyncStorageHandler {
 // It relies on the default `*_with_cancellation` methods to check before delegation and before
 // pulling the resulting in-memory iterator.
 impl StorageHandler for SyncStorageHandler {
-    fn list_from(&self, url_path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
-        let (store, base_url, offset) = resolve_scope(self.store.as_ref(), url_path)?;
+    fn list_from(
+        &self,
+        path: &Url,
+        end: Option<&Url>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
+        let (store, base_url, offset) = resolve_scope(self.store.as_ref(), path)?;
 
         // For directory URLs, prefix == offset and the offset acts as a lower bound that still
         // includes everything underneath (since `dir/a` > `dir` lexicographically). For file
         // URLs, the prefix is the parent directory and the offset filters out files at-or-below.
-        let prefix = if url_path.path().ends_with('/') {
+        let prefix = if path.path().ends_with('/') {
             offset.clone()
         } else {
             let mut parts: Vec<_> = offset.parts().collect();
@@ -43,18 +51,11 @@ impl StorageHandler for SyncStorageHandler {
             Path::from_iter(parts)
         };
 
-        // LocalFileSystem and InMemory do not return sorted listings, so we collect and sort
-        // to give callers a deterministic order.
-        let mut metas: Vec<_> = futures::executor::block_on(
-            store
-                .list_with_offset(Some(&prefix), &offset)
-                .collect::<Vec<_>>(),
-        )
-        .into_iter()
-        .collect::<KernelResult<_, _>>()?;
-        metas.sort_unstable_by(|a, b| a.location.cmp(&b.location));
-
-        let iter = metas.into_iter().map(move |meta| {
+        // LocalFileSystem and InMemory do not return sorted listings. Convert to FileMeta, drop
+        // entries at or after `end`, then sort so protocol subdirs are not part of the sort.
+        let metas = store.list_with_offset(Some(&prefix), &offset);
+        let metas = metas.map(move |meta| {
+            let meta = meta?;
             let location = base_url
                 .join(meta.location.as_ref())
                 .map_err(|e| KernelError::generic(format!("Failed to construct URL: {e}")))?;
@@ -64,7 +65,13 @@ impl StorageHandler for SyncStorageHandler {
                 size: meta.size,
             })
         });
-        Ok(Box::new(iter))
+        let mut items: Vec<FileMeta> = futures::executor::block_on(
+            metas
+                .filter(move |item| ready(keep_listing(item, end)))
+                .try_collect(),
+        )?;
+        items.sort_unstable();
+        Ok(Box::new(items.into_iter().map(Ok)))
     }
 
     fn read_files(
@@ -122,8 +129,8 @@ mod tests {
     use url::Url;
 
     use super::SyncStorageHandler;
-    use crate::object_store::memory::InMemory;
     use crate::object_store::ObjectStoreExt as _;
+    use crate::object_store::memory::InMemory;
     use crate::utils::current_time_duration;
     use crate::{KernelError, StorageHandler};
 
@@ -146,7 +153,7 @@ mod tests {
 
         let url_path = tmp_dir.path().join(get_json_filename(0));
         let url = Url::from_file_path(url_path).unwrap();
-        let files: Vec<_> = storage.list_from(&url)?.try_collect()?;
+        let files: Vec<_> = storage.list_from(&url, None)?.try_collect()?;
 
         assert!(!files.is_empty());
         for meta in files.iter() {
@@ -169,7 +176,7 @@ mod tests {
         }
         let url_path = tmp_dir.path().join(get_json_filename(1));
         let url = Url::from_file_path(url_path).unwrap();
-        let list = storage.list_from(&url)?;
+        let list = storage.list_from(&url, None)?;
         let mut file_count = 0;
         for (i, file) in list.enumerate() {
             // i+1 in index because we started at 0001 in the listing
@@ -184,13 +191,13 @@ mod tests {
         // Listing a directory URL: the URL must end with `/` so list_from recognizes it as a
         // directory rather than as a file whose parent should be listed.
         let url = Url::from_directory_path(tmp_dir.path()).unwrap();
-        let list = storage.list_from(&url)?;
+        let list = storage.list_from(&url, None)?;
         file_count = list.count();
         assert_eq!(file_count, 3);
 
         let url_path = tmp_dir.path().join(format!("{:020}", 1));
         let url = Url::from_file_path(url_path).unwrap();
-        let list = storage.list_from(&url)?;
+        let list = storage.list_from(&url, None)?;
         file_count = list.count();
         assert_eq!(file_count, 2);
         Ok(())
@@ -242,7 +249,7 @@ mod tests {
         let storage = SyncStorageHandler::new(Some(store));
         let url = Url::parse("memory:///a/").unwrap();
         let listed: Vec<_> = storage
-            .list_from(&url)
+            .list_from(&url, None)
             .unwrap()
             .map(Result::unwrap)
             .collect();

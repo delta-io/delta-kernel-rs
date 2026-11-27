@@ -554,14 +554,16 @@ mod tests {
         }
 
         // One of each type is allowed.
-        assert!(UpdateTableRequest::new(
-            vec![
-                DeltaTableRequirement::AssertTableUuid { uuid: "a".into() },
-                DeltaTableRequirement::AssertEtag { etag: "e1".into() },
-            ],
-            vec![],
-        )
-        .is_ok());
+        assert!(
+            UpdateTableRequest::new(
+                vec![
+                    DeltaTableRequirement::AssertTableUuid { uuid: "a".into() },
+                    DeltaTableRequirement::AssertEtag { etag: "e1".into() },
+                ],
+                vec![],
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -599,18 +601,20 @@ mod tests {
         );
 
         // A single AddCommit alongside the other singletons is accepted.
-        assert!(UpdateTableRequest::new(
-            vec![],
-            vec![
-                DeltaTableUpdate::AddCommit {
-                    commit: sample_commit(),
-                },
-                DeltaTableUpdate::SetLatestBackfilledVersion {
-                    latest_published_version: 3,
-                },
-            ],
-        )
-        .is_ok());
+        assert!(
+            UpdateTableRequest::new(
+                vec![],
+                vec![
+                    DeltaTableUpdate::AddCommit {
+                        commit: sample_commit(),
+                    },
+                    DeltaTableUpdate::SetLatestBackfilledVersion {
+                        latest_published_version: 3,
+                    },
+                ],
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -731,9 +735,11 @@ mod tests {
         assert_eq!(v["protocol"]["min-reader-version"], 3);
         assert_eq!(v["properties"]["delta.appendOnly"], "true");
         assert!(v["properties"].get("delta.minReaderVersion").is_none());
-        assert!(v["properties"]
-            .get("delta.feature.catalogManaged")
-            .is_none());
+        assert!(
+            v["properties"]
+                .get("delta.feature.catalogManaged")
+                .is_none()
+        );
         // Empty domain metadata is omitted from the wire body.
         assert!(v.get("domain-metadata").is_none());
     }

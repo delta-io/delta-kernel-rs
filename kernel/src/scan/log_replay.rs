@@ -10,12 +10,14 @@ use url::Url;
 use super::data_skipping::DataSkippingFilter;
 use super::metrics::ScanMetrics;
 use super::state_info::{ResolvedPhysicalStatsSchemas, StateInfo};
-use super::{map_to_struct_options, PhysicalPredicate, ScanMetadata, COMMIT_READ_SCHEMA};
+use super::{
+    COMMIT_READ_SCHEMA, ParsedColumnSource, PhysicalPredicate, ScanMetadata, map_to_struct_options,
+};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
-    col, column_expr_ref, column_name, null_lit, ColumnName, Expression, ExpressionRef, Predicate,
-    PredicateRef, UnaryExpressionOp,
+    ColumnName, Expression, ExpressionRef, PredicateRef, UnaryExpressionOp, col, column_expr_ref,
+    column_name, expr, null_lit,
 };
 use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator, FileActionInfo};
 use crate::log_replay::{
@@ -24,15 +26,15 @@ use crate::log_replay::{
 };
 use crate::log_segment::CheckpointReadInfo;
 use crate::scan::transform_spec::{
-    get_transform_expr, parse_partition_values, FileRowTrackingMetadata, TransformSpec,
+    FileRowTrackingMetadata, TransformSpec, get_transform_expr, parse_partition_values,
 };
 use crate::schema::{
-    lazy_schema_ref, ColumnNamesAndTypes, DataType, MapType, SchemaRef, SchemaStructPatchBuilder,
-    StructField, StructType, ToSchema as _,
+    ColumnNamesAndTypes, DataType, MapType, SchemaRef, SchemaStructPatchBuilder, StructField,
+    StructType, ToSchema as _, lazy_schema_ref,
 };
-use crate::struct_patch::{project_struct_preserving_nulls, ProjectionStructPatchBuilder};
+use crate::struct_patch::{ProjectionStructPatchBuilder, project_struct_preserving_nulls};
 use crate::table_features::ColumnMappingMode;
-use crate::utils::{require, FoldWithOption as _};
+use crate::utils::{FoldWithOption as _, require};
 use crate::{Engine, ExpressionEvaluator, KernelError, KernelResult, KernelResultIterator};
 
 /// Read-time stats toggles consumed by [`ScanLogReplayProcessor`].
@@ -187,6 +189,10 @@ pub struct ScanLogReplayProcessor {
     stats_options: ScanStatsOptions,
     /// Read-time partition value options.
     partition_values_options: ScanPartitionValuesOptions,
+    /// Source of `partitionValues_parsed` in checkpoint batches. `None` when the scan does not
+    /// emit the column, for either batch type. Commit batches report `Derived` whenever the column
+    /// is emitted, because JSON commits carry only the string map.
+    checkpoint_partition_values_source: Option<ParsedColumnSource>,
     /// Information about checkpoint reading for stats optimization
     checkpoint_info: CheckpointReadInfo,
     /// Metrics related to the scan
@@ -294,6 +300,15 @@ impl ScanLogReplayProcessor {
                 None
             };
 
+        let checkpoint_source = if has_partition_values_parsed {
+            ParsedColumnSource::Checkpoint
+        } else {
+            ParsedColumnSource::Derived
+        };
+        let checkpoint_partition_values_source = partition_schema_for_transform
+            .is_some()
+            .then_some(checkpoint_source);
+
         let output_schema = scan_row_schema_with_parsed_columns(
             stats_schema_for_transform.clone(),
             partition_schema_for_transform.clone(),
@@ -323,7 +338,7 @@ impl ScanLogReplayProcessor {
                 column_expr_ref!("partitionValues_parsed"),
                 // The transform flattens `add.*` to top-level columns, so `path` is non-null
                 // exactly for Add rows.
-                Arc::new(Predicate::is_not_null(col!("path")).into()),
+                Arc::new(expr!(is_not_null(col("path")))),
                 output_schema.clone(),
                 &state_info.eligible_physical_stats_columns,
                 Some(metrics.clone()),
@@ -365,6 +380,7 @@ impl ScanLogReplayProcessor {
             state_info,
             stats_options,
             partition_values_options,
+            checkpoint_partition_values_source,
             checkpoint_info,
             metrics,
         })
@@ -511,6 +527,17 @@ impl ScanLogReplayProcessor {
             internal_state.stats_options,
             internal_state.partition_values_options,
         )
+    }
+
+    /// The source of `partitionValues_parsed` in the batch type being processed.
+    fn partition_values_source(&self, is_log_batch: bool) -> Option<ParsedColumnSource> {
+        if is_log_batch {
+            self.checkpoint_partition_values_source
+                .is_some()
+                .then_some(ParsedColumnSource::Derived)
+        } else {
+            self.checkpoint_partition_values_source
+        }
     }
 
     fn transform_and_data_skip(
@@ -812,14 +839,16 @@ pub(crate) static FILE_CONSTANT_VALUES_NAME: &str = "fileConstantValues";
 pub(crate) static PATH_NAME: &str = "path";
 pub(crate) static BASE_ROW_ID_NAME: &str = "baseRowId";
 pub(crate) static DEFAULT_ROW_COMMIT_VERSION_NAME: &str = "defaultRowCommitVersion";
-pub(crate) static CLUSTERING_PROVIDER_NAME: &str = "clusteringProvider";
+pub const CLUSTERING_PROVIDER_NAME: &str = "clusteringProvider";
 pub(crate) static PARTITION_VALUES_NAME: &str = "partitionValues";
 pub(crate) static SIZE_NAME: &str = "size";
 #[cfg(feature = "adaptive-metadata-in-dev")]
 pub(crate) static MODIFICATION_TIME_NAME: &str = "modificationTime";
 #[cfg(feature = "adaptive-metadata-in-dev")]
 pub(crate) static DATA_CHANGE_NAME: &str = "dataChange";
-pub(crate) static TAGS_NAME: &str = "tags";
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) static DELETION_VECTOR_NAME: &str = "deletionVector";
+pub const TAGS_NAME: &str = "tags";
 pub(crate) static STATS_NAME: &str = "stats";
 pub(crate) static STATS_PARSED_NAME: &str = "stats_parsed";
 #[internal_api]
@@ -951,7 +980,7 @@ fn get_add_transform_expr(
         // serializing stats_parsed so ScanFile.stats is populated either way.
         Arc::new(Expression::coalesce([
             col!("add.stats"),
-            Expression::unary(UnaryExpressionOp::ToJson, col!("add.stats_parsed")),
+            Expression::unary(UnaryExpressionOp::TO_JSON, col!("add.stats_parsed")),
         ]))
     } else if has_stats_parsed {
         // The compatible checkpoint projection can omit add.stats when JSON output is disabled.
@@ -1123,8 +1152,12 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
         };
         self.record_selected_add_files(&final_selection, &active_add_file_sizes)?;
         let transformed_actions = self.project_stats_output(transformed_actions)?;
-        let scan_metadata =
-            ScanMetadata::try_new(transformed_actions, final_selection, row_transform_exprs)?;
+        let scan_metadata = ScanMetadata::try_new(
+            transformed_actions,
+            final_selection,
+            row_transform_exprs,
+            self.partition_values_source(is_log_batch),
+        )?;
         self.metrics
             .update_peak_hash_set_size(self.seen_file_keys.len());
         Ok(scan_metadata)
@@ -1231,8 +1264,12 @@ impl ScanLogReplayProcessor {
         };
         self.record_selected_add_files(&final_selection, &active_add_file_sizes)?;
         let transformed_actions = self.project_stats_output(transformed_actions)?;
-        let scan_metadata =
-            ScanMetadata::try_new(transformed_actions, final_selection, row_transform_exprs)?;
+        let scan_metadata = ScanMetadata::try_new(
+            transformed_actions,
+            final_selection,
+            row_transform_exprs,
+            self.partition_values_source(is_log_batch),
+        )?;
         self.metrics
             .update_peak_hash_set_size(self.seen_file_keys.len());
         Ok(scan_metadata)
@@ -1261,14 +1298,20 @@ impl ScanLogReplayProcessor {
 ///
 /// Note: The iterator of [`ActionsBatch`]s ('action_iter' parameter) must be sorted by the order of
 /// the actions in the log from most recent to least recent.
-pub(crate) fn scan_action_iter(
+pub(crate) fn scan_action_iter<I>(
     engine: &dyn Engine,
-    action_iter: impl KernelResultIterator<ActionsBatch>,
+    action_iter: I,
     state_info: Arc<StateInfo>,
     checkpoint_info: CheckpointReadInfo,
     stats_options: ScanStatsOptions,
     partition_values_options: ScanPartitionValuesOptions,
-) -> KernelResult<(impl KernelResultIterator<ScanMetadata>, Arc<ScanMetrics>)> {
+) -> KernelResult<(
+    impl KernelResultIterator<ScanMetadata> + use<I>,
+    Arc<ScanMetrics>,
+)>
+where
+    I: KernelResultIterator<ActionsBatch>,
+{
     let mut processor = ScanLogReplayProcessor::new(
         engine,
         state_info,
@@ -1286,25 +1329,25 @@ pub(crate) fn scan_action_iter(
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use rstest::rstest;
     use url::Url;
 
     use super::{
-        get_add_transform_expr, scan_action_iter, InternalScanState, ScanLogReplayProcessor,
-        ScanPartitionValuesOptions, ScanStatsOptions, SerializableScanState,
+        InternalScanState, ParsedColumnSource, ScanLogReplayProcessor, ScanPartitionValuesOptions,
+        ScanStatsOptions, SerializableScanState, get_add_transform_expr, scan_action_iter,
     };
+    use crate::arrow::array::StringArray;
     use crate::arrow::array::cast::AsArray;
     use crate::arrow::array::types::TimestampMicrosecondType;
-    use crate::arrow::array::StringArray;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{
-        col, column_name, lit, null_lit, BinaryExpressionOp, Expression, OpaquePredicateOp,
-        Predicate, Scalar, ScalarExpressionEvaluator, UnaryExpressionOp,
+        BinaryExpressionOp, Expression, OpaquePredicateOp, Predicate, Scalar,
+        ScalarExpressionEvaluator, UnaryExpressionOp, col, column_name, expr, lit, null_lit,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -1314,22 +1357,24 @@ mod tests {
     use crate::log_segment::CheckpointReadInfo;
     use crate::metrics::{MetricId, ScanType};
     use crate::scan::state::ScanFile;
-    use crate::scan::state_info::tests::{
-        assert_transform_spec, get_simple_state_info, get_state_info, get_state_info_with_stats,
-        RowTrackingState, ROW_TRACKING_FEATURES,
-    };
     use crate::scan::state_info::StateInfo;
+    use crate::scan::state_info::tests::{
+        ROW_TRACKING_FEATURES, RowTrackingState, assert_transform_spec, get_simple_state_info,
+        get_state_info, get_state_info_with_options, get_state_info_with_stats,
+    };
     use crate::scan::test_utils::{
         add_batch_for_row_tracking, add_batch_simple, add_batch_with_partition_col,
         add_batch_with_remove, add_batch_with_remove_and_partition, run_with_validate_callback,
     };
-    use crate::scan::{PhysicalPredicate, StatsOptions, COMMIT_READ_SCHEMA};
-    use crate::schema::{schema_ref, DataType, MetadataColumnSpec, SchemaRef};
+    use crate::scan::{
+        COMMIT_READ_SCHEMA, PartitionValuesOptions, PhysicalPredicate, StatsOptions,
+    };
+    use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, schema_ref};
     use crate::table_features::ColumnMappingMode;
     use crate::unit_test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use crate::{
         Engine, EngineData, Expression as Expr, ExpressionEvaluator, ExpressionRef, KernelError,
-        KernelResult,
+        KernelResult, Result,
     };
 
     /// Test evaluator that fails once before delegating, exposing both timed transform attempts.
@@ -1379,6 +1424,61 @@ mod tests {
 
     fn test_checkpoint_info() -> CheckpointReadInfo {
         CheckpointReadInfo::without_stats_parsed()
+    }
+
+    #[rstest]
+    #[case::native(true, ParsedColumnSource::Checkpoint)]
+    #[case::no_native(false, ParsedColumnSource::Derived)]
+    fn serialization_preserves_partition_values_source(
+        #[case] has_partition_values_parsed: bool,
+        #[case] expected_checkpoint_source: ParsedColumnSource,
+    ) {
+        let engine = SyncEngine::new();
+        let schema: SchemaRef = schema_ref! {
+            nullable "value": INTEGER,
+            nullable "date": DATE,
+        };
+        let state_info = get_state_info_with_options(
+            schema,
+            vec!["date".to_string()],
+            None,
+            &[],
+            HashMap::new(),
+            vec![],
+            StatsOptions::default(),
+            PartitionValuesOptions::with_struct(),
+        )
+        .unwrap();
+        let checkpoint_info = CheckpointReadInfo {
+            has_partition_values_parsed,
+            ..test_checkpoint_info()
+        };
+        let processor = ScanLogReplayProcessor::new(
+            &engine,
+            Arc::new(state_info),
+            checkpoint_info,
+            ScanStatsOptions::default(),
+            ScanPartitionValuesOptions {
+                parsed_struct: true,
+                timestamp_timezone: None,
+            },
+        )
+        .unwrap();
+
+        let deserialized = ScanLogReplayProcessor::from_serializable_state(
+            &engine,
+            processor.into_serializable_state().unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            deserialized.partition_values_source(false /* is_log_batch */),
+            Some(expected_checkpoint_source)
+        );
+        assert_eq!(
+            deserialized.partition_values_source(true /* is_log_batch */),
+            Some(ParsedColumnSource::Derived)
+        );
     }
 
     /// A minimal opaque predicate op for testing serialization behavior
@@ -1671,9 +1771,7 @@ mod tests {
     #[case::supported_not_enabled(RowTrackingState::SupportedNotEnabled)]
     #[case::enabled(RowTrackingState::Enabled)]
     #[case::suspended(RowTrackingState::Suspended)]
-    fn test_row_commit_version_patch(
-        #[case] row_tracking_state: RowTrackingState,
-    ) -> KernelResult<()> {
+    fn test_row_commit_version_patch(#[case] row_tracking_state: RowTrackingState) -> Result<()> {
         let schema: SchemaRef = schema_ref! { nullable "value": INTEGER };
         let state_info = get_state_info(
             schema,
@@ -1715,10 +1813,10 @@ mod tests {
                 .expect("Should have row_commit_version_col patch");
             assert_eq!(
                 row_commit_version_patch.insertions,
-                [Arc::new(Expr::coalesce([
-                    col!("row_commit_version_col"),
-                    lit(5i64),
-                ]))]
+                [Arc::new(expr!(coalesce(
+                    col("row_commit_version_col"),
+                    5i64
+                )))]
             );
         }
         Ok(())
@@ -1785,7 +1883,7 @@ mod tests {
             nullable "id": INTEGER,
             nullable "name": STRING,
         };
-        let predicate = Arc::new(Predicate::gt(col!("id"), lit(0i32)));
+        let predicate = Arc::new(Predicate::from_expr(expr!(col("id") > 0i32)));
         let state_info = Arc::new(
             get_state_info_with_stats(
                 schema,
@@ -1834,7 +1932,7 @@ mod tests {
             nullable "id": INTEGER,
             nullable "value": STRING,
         };
-        let predicate = Arc::new(crate::expressions::Predicate::eq(col!("id"), lit(10i32)));
+        let predicate = Arc::new(Predicate::from_expr(expr!(col("id") == 10i32)));
         let state_info = Arc::new(
             get_state_info(
                 schema.clone(),
@@ -1875,14 +1973,16 @@ mod tests {
     }
 
     #[test]
-    fn test_serialization_with_timezone() -> KernelResult<()> {
+    fn test_serialization_with_timezone() -> Result<()> {
         let engine = SyncEngine::new();
         let schema = schema_ref! {
             nullable "ts": TIMESTAMP,
             nullable "value": INTEGER,
         };
         // Keep timestamps after 2024-01-15 16:00 UTC.
-        let predicate = Arc::new(col!("ts").gt(lit(Scalar::Timestamp(1_705_334_400_000_000))));
+        let predicate = Arc::new(Predicate::from_expr(expr!(
+            col("ts") > lit(Scalar::Timestamp(1_705_334_400_000_000))
+        )));
         let mut state_info = get_state_info(
             schema,
             vec!["ts".to_string()],
@@ -2186,11 +2286,12 @@ mod tests {
             .unwrap();
         let mut blob: serde_json::Value =
             serde_json::from_slice(&state.internal_state_blob).unwrap();
-        assert!(blob
-            .as_object_mut()
-            .unwrap()
-            .remove("dv_normalization_root")
-            .is_some());
+        assert!(
+            blob.as_object_mut()
+                .unwrap()
+                .remove("dv_normalization_root")
+                .is_some()
+        );
         state.internal_state_blob = serde_json::to_vec(&blob).unwrap();
         let deserialized = ScanLogReplayProcessor::from_serializable_state(&engine, state).unwrap();
         assert_eq!(deserialized.state_info.dv_normalization_root, None);
@@ -2365,22 +2466,22 @@ mod tests {
     #[case::stats_only(
         schema_ref! { nullable "value": INTEGER },
         vec![],
-        Arc::new(col!("value").gt(lit(5i32))),
+        Arc::new(Predicate::from_expr(expr!(col("value") > 5i32))),
         false, // use batch without partition column
     )]
     #[case::partition_predicate(
         schema_ref! { nullable "value": INTEGER, nullable "date": DATE },
         vec!["date".to_string()],
-        Arc::new(col!("date").eq(lit(Scalar::Date(17_510)))),
+        Arc::new(Predicate::from_expr(expr!(col("date") == lit(Scalar::Date(17_510))))),
         true, // use batch with partition column
     )]
     #[case::mixed_stats_and_partition(
         schema_ref! { nullable "value": INTEGER, nullable "date": DATE },
         vec!["date".to_string()],
-        Arc::new(Predicate::and(
-            col!("value").gt(lit(5i32)),
-            col!("date").eq(lit(Scalar::Date(17_510))),
-        )),
+        Arc::new(Predicate::from_expr(expr!(and(
+            col("value") > 5i32,
+            col("date") == lit(Scalar::Date(17_510)),
+        )))),
         true, // use batch with partition column
     )]
     fn data_skipping_does_not_prune_remove_actions(
@@ -2450,11 +2551,18 @@ mod tests {
     fn count_to_json(expr: &Expression) -> usize {
         match expr {
             Expression::Unary(u) => {
-                let here = (u.op == UnaryExpressionOp::ToJson) as usize;
+                let here = matches!(u.op, UnaryExpressionOp::ToJson { .. }) as usize;
                 here + count_to_json(&u.expr)
             }
             Expression::Binary(b) => count_to_json(&b.left) + count_to_json(&b.right),
             Expression::Variadic(v) => v.exprs.iter().map(|e| count_to_json(e)).sum(),
+            Expression::CaseWhen(c) => {
+                c.branches
+                    .iter()
+                    .map(|(_, result)| count_to_json(result))
+                    .sum::<usize>()
+                    + count_to_json(&c.else_expr)
+            }
             Expression::Struct(fields, nullability) => {
                 fields.iter().map(|e| count_to_json(e)).sum::<usize>()
                     + nullability.as_ref().map_or(0, |e| count_to_json(e))

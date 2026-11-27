@@ -1,34 +1,27 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-#[cfg(test)]
 use derive_more::Constructor;
-#[cfg(test)]
 use url::Url;
 
-use super::get_bytes;
-#[cfg(test)]
-use super::{put_bytes, read_files_arrow};
+use super::{get_bytes, put_bytes, read_files_arrow};
 use crate::engine::arrow_conversion::TryFromArrow as _;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
-    fixup_parquet_read, ordering_needs_row_indexes, parquet_read_plan, RowIndexBuilder,
+    RowIndexBuilder, fixup_parquet_read, ordering_needs_row_indexes, parquet_read_plan,
+    to_parquet_bytes,
 };
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
-use crate::engine::reader_options;
-#[cfg(test)]
-use crate::engine::writer_options;
+use crate::engine::{reader_options, writer_options};
 use crate::object_store::DynObjectStore;
 use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
-#[cfg(test)]
-use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::schema::{SchemaRef, StructType};
 use crate::utils::FoldWithOption as _;
-#[cfg(test)]
-use crate::{EngineData, FileDataReadResultIterator, FileSize, ParquetHandler};
-use crate::{FileMeta, KernelResult, KernelResultIterator, ParquetFooter, PredicateRef};
+use crate::{
+    EngineData, FileDataReadResultIterator, FileMeta, FileSize, KernelResult, KernelResultIterator,
+    ParquetFooter, ParquetHandler, PredicateRef,
+};
 
-#[cfg(test)]
 #[derive(Constructor)]
 pub(crate) struct SyncParquetHandler {
     store: Option<Arc<DynObjectStore>>,
@@ -65,7 +58,6 @@ pub(super) fn try_create_from_parquet(
     }))
 }
 
-#[cfg(test)]
 impl ParquetHandler for SyncParquetHandler {
     fn read_parquet_files(
         &self,
@@ -103,20 +95,14 @@ impl ParquetHandler for SyncParquetHandler {
         let first_arrow = ArrowEngineData::try_from_engine_data(first_batch)?;
         let first_record_batch: crate::arrow::array::RecordBatch = (*first_arrow).into();
 
-        let mut buf = Vec::new();
-        let mut writer = ArrowWriter::try_new_with_options(
-            &mut buf,
+        let buf = to_parquet_bytes(
             first_record_batch.schema(),
             writer_options(),
+            std::iter::once(Ok(first_record_batch)).chain(data.map(|result| {
+                let arrow_data = ArrowEngineData::try_from_engine_data(result?)?;
+                Ok((*arrow_data).into())
+            })),
         )?;
-        writer.write(&first_record_batch)?;
-        for result in data {
-            let engine_data = result?;
-            let arrow_data = ArrowEngineData::try_from_engine_data(engine_data)?;
-            let batch: crate::arrow::array::RecordBatch = (*arrow_data).into();
-            writer.write(&batch)?;
-        }
-        writer.close()?; // writer must be closed to write the footer
         let size_in_bytes = buf.len() as u64;
 
         put_bytes(self.store.as_ref(), &location, buf.into(), true)?;
@@ -148,9 +134,10 @@ mod tests {
     use url::Url;
 
     use super::*;
+    use crate::EngineData;
     use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
     use crate::engine::arrow_conversion::TryIntoKernel as _;
-    use crate::EngineData;
+    use crate::parquet::arrow::arrow_writer::ArrowWriter;
 
     fn test_data_iter() -> Box<dyn KernelResultIterator<Box<dyn EngineData>>> {
         let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(

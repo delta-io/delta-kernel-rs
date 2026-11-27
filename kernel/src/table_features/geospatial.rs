@@ -3,7 +3,7 @@
 use super::TableFeature;
 use crate::schema::{PrimitiveType, Schema};
 use crate::table_configuration::TableConfiguration;
-use crate::transforms::{transform_output_type, SchemaTransform};
+use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::utils::require;
 use crate::{KernelError, KernelResult};
 
@@ -31,7 +31,8 @@ impl<'a> SchemaTransform<'a> for UsesGeo {
 pub(crate) fn validate_geospatial_feature_support(tc: &TableConfiguration) -> KernelResult<()> {
     if schema_contains_geospatial(&tc.logical_schema()) {
         require!(
-            tc.protocol().has_table_feature(&TableFeature::GeospatialType),
+            tc.protocol()
+                .has_table_feature(&TableFeature::GeospatialType),
             KernelError::unsupported(
                 "Table contains geometry or geography columns but does not have the required 'geospatial' feature in reader and writer features"
             )
@@ -47,7 +48,7 @@ mod tests {
     use super::*;
     use crate::actions::Protocol;
     use crate::schema::{
-        schema, ArrayType, DataType, EdgeInterpolationAlgorithm, MapType, StructType,
+        ArrayType, DataType, EdgeInterpolationAlgorithm, MapType, StructType, schema,
     };
     use crate::unit_test_utils::{assert_schema_feature_validation, geography_type, geometry_type};
 
