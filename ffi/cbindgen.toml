@@ -15,7 +15,7 @@ cpp_compat = true
 "feature = default-engine-base" = "DEFINE_DEFAULT_ENGINE_BASE"
 
 [export]
-include = ["ErrorAllocators"]
+include = ["ErrorAllocators", "FfiSchemaChangeKind"]
 
 [export.mangle]
 remove_underscores = true

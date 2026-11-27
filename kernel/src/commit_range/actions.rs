@@ -164,52 +164,24 @@ impl CommitAction {
         Ok(ict_visitor.in_commit_timestamp)
     }
 
-    /// Resolve and store the effective commit timestamp from the effective `(Protocol, Metadata)`
-    /// and the extracted in-commit timestamp, following the in-commit timestamp protocol rules.
-    ///
-    /// When the configuration is known and ICT is enabled, commits at or after the enablement
-    /// version use the in-commit timestamp (erroring if absent, which the protocol forbids);
-    /// commits before it use `last_modified timestamp`. When the configuration is unknown (protocol
-    /// or metadata not yet observed), this is best-effort: the in-commit timestamp if present,
-    /// else `last_modified timestamp`.
+    /// Resolve and store the effective commit timestamp. See [`resolve_commit_timestamp`].
     fn resolve_timestamp(
         &mut self,
         table_config: &Option<TableConfiguration>,
         extracted_ict: Option<i64>,
     ) -> KernelResult<()> {
-        let version = self.version();
-        self.timestamp = match table_config {
-            Some(table_config) => {
-                let ict_applies = match table_config.in_commit_timestamp_enablement()? {
-                    InCommitTimestampEnablement::NotEnabled => false,
-                    InCommitTimestampEnablement::Enabled { enablement: None } => true,
-                    InCommitTimestampEnablement::Enabled {
-                        enablement: Some((enablement_version, _)),
-                    } => version >= enablement_version,
-                };
-                if ict_applies {
-                    extracted_ict.ok_or_else(|| {
-                        with_version_context(version, KernelError::generic(
-                            "in-commit timestamp is enabled but missing ICT timestamp field in commit"
-                        ))
-                    })?
-                } else {
-                    self.log_path.location.last_modified
-                }
-            }
-            None => extracted_ict.unwrap_or(self.log_path.location.last_modified),
-        };
+        self.timestamp = resolve_commit_timestamp(
+            self.version(),
+            self.log_path.location.last_modified,
+            table_config.as_ref(),
+            extracted_ict,
+        )?;
         Ok(())
     }
 
-    /// Validate that the kernel can read this commit, given the prebuilt effective `table_config`
-    /// (present iff both protocol and metadata are known at this commit).
+    /// Validate that the kernel can read this commit. See [`ensure_commit_readable`].
     fn protocol_validation(&self, table_config: &Option<TableConfiguration>) -> Result<()> {
-        match (table_config, &self.protocol) {
-            (Some(table_config), _) => table_config.ensure_operation_supported(Operation::Scan),
-            (None, Some(protocol)) => Ok(ensure_table_can_be_read(protocol)?),
-            (None, None) => Ok(()),
-        }
+        ensure_commit_readable(table_config.as_ref(), self.protocol.as_ref())
     }
 
     /// Return an iterator over the commit's action batches projected to the
@@ -223,5 +195,55 @@ impl CommitAction {
             self.read_schema.clone(),
             None,
         )
+    }
+}
+
+/// Resolves a commit's timestamp from the effective table configuration and the commit's
+/// in-commit timestamp, following the in-commit timestamp protocol rules.
+///
+/// When the configuration is known and ICT is enabled, commits at or after the enablement
+/// version use the in-commit timestamp (erroring if absent, which the protocol forbids);
+/// commits before it use `last_modified`. When the configuration is unknown (protocol or
+/// metadata not yet observed), this is best-effort: the in-commit timestamp if present, else
+/// `last_modified`.
+pub(super) fn resolve_commit_timestamp(
+    version: Version,
+    last_modified: i64,
+    table_config: Option<&TableConfiguration>,
+    extracted_ict: Option<i64>,
+) -> KernelResult<i64> {
+    let Some(table_config) = table_config else {
+        return Ok(extracted_ict.unwrap_or(last_modified));
+    };
+    let ict_applies = match table_config.in_commit_timestamp_enablement()? {
+        InCommitTimestampEnablement::NotEnabled => false,
+        InCommitTimestampEnablement::Enabled { enablement: None } => true,
+        InCommitTimestampEnablement::Enabled {
+            enablement: Some((enablement_version, _)),
+        } => version >= enablement_version,
+    };
+    if !ict_applies {
+        return Ok(last_modified);
+    }
+    extracted_ict.ok_or_else(|| {
+        with_version_context(
+            version,
+            KernelError::generic(
+                "in-commit timestamp is enabled but missing ICT timestamp field in commit",
+            ),
+        )
+    })
+}
+
+/// Validates that the kernel can read a commit, given its effective `table_config` (present iff
+/// both protocol and metadata are known at the commit) and effective `protocol`.
+pub(super) fn ensure_commit_readable(
+    table_config: Option<&TableConfiguration>,
+    protocol: Option<&Protocol>,
+) -> Result<()> {
+    match (table_config, protocol) {
+        (Some(table_config), _) => table_config.ensure_operation_supported(Operation::Scan),
+        (None, Some(protocol)) => Ok(ensure_table_can_be_read(protocol)?),
+        (None, None) => Ok(()),
     }
 }
